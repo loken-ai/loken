@@ -1,0 +1,50 @@
+Write a Python function that computes the nth Fibonacci number using memoization.
+Explain how a hash table resolves collisions with open addressing versus chaining.
+The quick brown fox jumps over the lazy dog near the riverbank at dawn.
+Describe the difference between TCP and UDP and when you would choose each.
+def quicksort(arr): if len(arr) <= 1: return arr; pivot = arr[len(arr)//2]
+In machine learning, gradient descent minimizes a loss function by iteratively
+Summarize the causes of the French Revolution in three concise sentences.
+What are the trade-offs between microservices and a monolithic architecture?
+The mitochondria is the powerhouse of the cell, generating ATP through respiration.
+Implement a binary search tree insertion in Rust with a recursive helper.
+Once upon a time, in a small village nestled between two mountains, there lived
+How does the transformer attention mechanism compute query, key, and value projections?
+Explain why floating point addition is not associative with a concrete example.
+The recipe calls for two cups of flour, one egg, and a tablespoon of butter.
+Write a SQL query that returns the top five customers by total order value.
+Climate change is driven primarily by greenhouse gas emissions from fossil fuels.
+Given a linked list, write a function to detect whether it contains a cycle.
+The stock market reacted sharply to the central bank's interest rate decision.
+Describe how virtual memory uses paging to map logical to physical addresses.
+She walked into the room, paused, and realized everything had changed since
+What is the time complexity of merge sort, and why is it stable?
+A balanced diet includes proteins, carbohydrates, fats, vitamins, and minerals.
+Explain the concept of ownership and borrowing in the Rust programming language.
+The ancient Roman aqueducts transported water across vast distances using gravity.
+Write a JavaScript function that debounces a callback with a configurable delay.
+Photosynthesis converts carbon dioxide and water into glucose using sunlight.
+How do you prevent SQL injection when building queries from user input?
+The detective examined the clues carefully, noting the broken window and muddy
+Compare and contrast supervised, unsupervised, and reinforcement learning.
+Implement a least-recently-used cache with O(1) get and put operations.
+The orchestra tuned their instruments as the conductor raised his baton slowly.
+Explain how DNS resolves a domain name into an IP address step by step.
+Write a regular expression that matches a valid email address.
+Quantum entanglement links two particles so that measuring one affects the other.
+What design patterns are commonly used to decouple components in large systems?
+The river wound through the valley, reflecting the orange glow of the setting sun.
+Describe the CAP theorem and its implications for distributed databases.
+Write a function to reverse the words in a sentence without using built-in split.
+Inflation erodes purchasing power when the money supply grows faster than output.
+How does a garbage collector identify and reclaim unreachable objects in memory?
+The children built a sandcastle on the beach while the waves crept slowly closer.
+Explain the difference between process and thread, and when to use each.
+A neural network learns by adjusting weights to reduce prediction error over epochs.
+Write a Go program that reads lines from standard input and counts word frequency.
+The philosopher argued that knowledge requires justified true belief, but Gettier
+Describe how RSA encryption uses public and private keys for secure communication.
+The chef seasoned the soup, tasted it, and added a pinch more salt before serving.
+What is the difference between eventual consistency and strong consistency?
+Implement breadth-first search on an undirected graph using a queue.
+The spacecraft adjusted its trajectory, firing thrusters to enter a stable orbit.

@@ -1,0 +1,61 @@
+# Files an external scanner still attributes, whatever the local measurement says.
+#
+# `measure.py` compares normalised lines and needs them identical; a scanner that fingerprints
+# snippets recognises a copy that was reformatted, renamed or re-indented. The two disagree by
+# a lot - whisper/model.rs measured 7.9% here and 53% there on 2026-08-26 - and NOTICE must
+# follow the larger number, or the gate retires attributions that are still owed.
+#
+# A row here keeps its NOTICE entry alive past the local floor. It leaves when the external
+# scan stops naming the file, not when the local measure loses sight of it.
+#
+# path	scanner	share	scanned	upstream
+cuda/mmq_gguf/mmq_gguf.cuh	SCANOSS	58%	2026-08-29	src/ggml-cuda/mmq.cuh (ggerganov/ggml, MIT) - see THE ONE THAT DID NOT MOVE, below
+#
+# THE ONE THAT DID NOT MOVE, AND WHY WE STOPPED.
+#
+#   cuda/mmq_gguf/mmq_gguf.cuh went 56% -> 58% ACROSS two restructurings that genuinely changed
+#   its decomposition: a data table replaced three switches, two walk helpers replaced ten
+#   hand-written dots, policy structs replaced per-format algebra, member templates replaced
+#   function-pointer traits. The score rose because a fingerprint scanner follows the expression
+#   token stream, not function boundaries - every hex mask, shift count and QI* constant
+#   survived while the file got shorter, so the ratio worsened. Every matched pair has the same
+#   span length on both sides: aligned windows, because the bit-unpacking order IS the format's
+#   order and cannot be permuted.
+#
+#   The largest range, our 1402-1821, is the K-quant loaders: the 0x0F0F0F0F and 0x30303030
+#   masks, __vsubss4(_, 0x20202020), the six-bit scale unpack, the qh shift tables. That is the
+#   GGUF K-quant bit specification. Driving it from a runtime table would erase the masks and
+#   cost the unrolling, the register-resident scales and the compile-time addressing - a real
+#   regression on the kernel every text prefill runs through, for points on a meter.
+#
+#   Recorded as convergent design over a published format, not residual copying.
+#
+ THE ONE LICENCE QUESTION THIS RAISED, SETTLED BY COMPARISON.
+#
+#   cuda/marlin/marlin_dtypes.cuh matched aphrodite-engine at 85%, which is AGPL-3.0, and that
+#   would be the licence of anything linking it. Compared line by line against vLLM's copy
+#   (csrc/libtorch_stable/quantization/marlin/marlin_dtypes.cuh, Apache-2.0): ours is a strict
+#   SUBSET of it. Every line we carry is in vLLM's, differing only in the include paths and the
+#   namespace macro, both ours; vLLM's continues with a bfloat16 specialisation we do not have.
+#   Nothing in our copy is absent from the Apache-2.0 original, so there is no aphrodite work
+#   in it - the scanner found the same upstream lines inside a fork that relicensed its own.
+#   Attributed to vLLM, Apache-2.0. Re-check if the file ever grows content vLLM lacks.
+#
+# Named by the same scan and deliberately NOT here, with the reason:
+#
+#   src/inference/model/reranker/mod.rs   the prompt Qwen3-Reranker was trained against. Change
+#                                         a word and the model stops answering yes or no. It is
+#                                         the checkpoint's specification, not a borrowed text.
+#   src/inference/media/audio_io.rs       the 44-byte canonical PCM WAV header, in the order
+#                                         RIFF fixes. Two writers of it cannot differ.
+#   src/inference/cuda/nvrtc_compat.h     the standard fixed-width integer names, which NVRTC
+#                                         does not bring its own header for.
+#   src/inference/cache/turboquant/rng.rs SplitMix64. Its three constants and two shift counts
+#                                         ARE the algorithm, the way a hash function's are: an
+#                                         implementation that differs is not SplitMix64. The
+#                                         reference is public domain. Matched against a copy in
+#                                         another project, not taken from it. The alternative is
+#                                         inventing a generator to avoid a named one, which is a
+#                                         worse generator chosen to please a scanner.
+#   src/tensor/quantized/storage.rs       matched against a GloVe word-vector data file. A
+#                                         collision with a blob of numbers, not a lineage.
