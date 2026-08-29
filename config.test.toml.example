@@ -1,0 +1,14 @@
+# Dedicated configuration for tests + dev/parity bins (separate from the
+# production config.toml). Holds the model directories the oracle-validated
+# #[ignore] tests and the *_parity / awq / qwen35 dev bins resolve against, so
+# no absolute path is hardcoded in source. Copy to config.test.toml and edit.
+#
+# Reuses the same Config schema as config.toml; only the
+# model dirs matter here. The [inference] section is required by the schema  - 
+# a dummy model_id is fine.
+
+ollama_models_dir = '/path/to/ollama/models'
+huggingface_models_dir = '/path/to/huggingface/models'
+
+[inference]
+model_id = "test"

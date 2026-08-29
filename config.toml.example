@@ -1,0 +1,29 @@
+# Model directories: omit to use OS defaults
+#   Linux:   ~/.ollama/models, ~/.cache/huggingface/hub
+#   Windows: %USERPROFILE%\.ollama\models, %APPDATA%\huggingface\hub
+# Uncomment to override:
+# ollama_models_dir = '/path/to/ollama/models'
+# huggingface_models_dir = '/path/to/huggingface/models'
+
+[server]
+host = "127.0.0.1"
+port = 11435
+
+[inference]
+# The model loaded when a request does not name one. Set it to a tag you actually have  - 
+# `loken list` prints them. Nothing is downloaded to satisfy this.
+model_id = "qwen3:0.6b"
+max_tokens = 2048
+context_length = 4096
+temperature = 0.15
+top_p = 0.9
+top_k = 50
+seed = 42
+max_gpu_memory_fraction = 0.9
+use_quantized_gpu = true
+cpu_threads = 0
+
+# Skip the OpenCL layer path. This is a test-mode switch: it exists so a run can be pinned to
+# CUDA or the host while something is being bisected. Leave it off unless you are doing that  - 
+# on, an Intel Arc card silently stops being used.
+disable_arc_layers = false

@@ -1,0 +1,57 @@
+# Cargo build configuration for loken.
+
+[build]
+# `jobs` is deliberately unset: cargo defaults to the number of cores present, which is the
+# right answer on a machine we know nothing about.
+
+# `-C target-cpu=native` lets the quantized matmul use whatever SIMD this machine has, which is
+# what you want when you build the engine where it will run - and wrong the moment you copy the
+# binary elsewhere, because the AVX-512 path it enables faults on a host without it. Drop it for
+# a portable build.
+#
+# mold is deliberately NOT forced. Under the release profile's thin LTO the linker, not the
+# compiler, is the bottleneck of a rebuild, so mold is worth installing and changes nothing about
+# the code generated. But a linker the reader may not have turns the first command in the README
+# into a build failure. Opt in per-build instead:
+#
+#   RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build --release
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[env]
+# NVCC_CCBIN: set via environment or setup_env.bat on Windows (not here,
+# because Cargo's [env] section doesn't support platform conditions and
+# would incorrectly apply the Windows MSVC path on Linux).
+
+# Optional: Enable specific CUDA architectures for faster compilation
+# Uncomment and adjust based on your GPU:
+# CUDA_ARCHITECTURES = "75;86;89"  # 75=RTX 20xx, 86=RTX 30xx, 89=RTX 40xx
+
+[profile.dev]
+# Faster debug builds, where the dependency graph dominates compile time.
+opt-level = 1
+debug = true
+
+[profile.release]
+# Maximum optimization for inference performance
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# NO `panic = "abort"`. The router installs a CatchPanicLayer so that a panic inside a
+# request becomes a 500 for that caller and nothing else. Under `abort` that layer can
+# never fire - abort does not unwind - so one bad index anywhere in a handler took the
+# whole server down, with every other client's in-flight work. The setting arrived in a
+# commit about the todo list, not from a measurement, and the cost of unwinding is cold
+# landing pads that a compute-bound server never executes.
+# The gate `the_release_profile_must_unwind_so_a_panic_stays_in_its_request` fails if it
+# comes back.
+strip = false  # Keep symbols for debugging
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false

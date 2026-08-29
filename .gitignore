@@ -1,0 +1,70 @@
+# Build artifacts. Both spellings: `target` on its own so a symlink pointing at a build
+# directory on another volume is not tracked as a link.
+/target
+target
+*.pdb
+*.exe
+__pycache__/
+
+# Local configuration: machine-specific model directories and server settings. Copy the
+# .example files to start.
+config.toml
+config.test.toml
+.env
+.env.local
+
+# Model weights and the caches they are downloaded into. Nothing here is ours to redistribute,
+# and a single checkpoint outweighs the entire source tree.
+*.gguf
+*.safetensors
+*.bin
+models/*/
+!models/.gitkeep
+models/manifest.json
+test_model_cache/
+
+# Working files: scratch notes, logs, and the per-run bench artifacts, whose numbers describe
+# one machine at one moment and should be regenerated rather than committed.
+results/
+!results/.gitkeep
+*.log
+tmp/
+local/
+nohup.out
+core.*
+perf.data*
+
+# Generated media. This engine's whole purpose is producing images, audio, video and MIDI  - 
+# so the one thing it must not do is commit them. The brand lives in the .github repository,
+# which generates it; a second copy here would drift from the one that is generated.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.mp4
+*.webm
+*.mid
+*.midi
+
+# EAGLE training corpora. They were assembled from this project's own working documents  - 
+# task descriptions, development notes, commit text - mixed with generic prose, and they are
+# training INPUT rather than source. A reader has no use for them and they would publish a
+# megabyte of internal notes. Keep them locally; the scripts that consume them say where.
+scripts/eagle/corpus_*.txt
+scripts/eagle/longctx.txt
+
+# The oracle binary is built from a llama.cpp checkout the reader supplies; the vectors it
+# emits ARE committed, so the parity tests run without that checkout present.
+scripts/oracle/gguf_quant_oracle
+scripts/oracle/*.o
+
+# Editor and tooling state.
+*~
+*.swp
+*.swo
