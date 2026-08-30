@@ -52,7 +52,7 @@ Each node needs a `[cluster]` block in its own `config.toml`; everything else it
 [cluster]
 name = "home"                       # nodes announcing another name are ignored
 node_id = ""                        # empty = the hostname
-advertise = "http://192.0.2.10:11435"   # how peers reach THIS node
+advertise = "http://192.0.2.10:11435"    # how peers reach THIS node
 join = []                           # seeds, for peers multicast cannot reach
 ```
 
@@ -63,10 +63,8 @@ cluster without being usable by it - correct behind NAT, wrong if you meant to s
 On one network nothing else is needed: the nodes hear each other. Across subnets, put each
 other's addresses in `join`; discovery adds to that list rather than replacing it.
 
-Two things to expect on a fresh node. The first request pays a one-off NVRTC compilation of the
-CUDA kernels before any token appears - the model load itself is seconds, the JIT is not. And
-two instances on one host cannot both bind the discovery port, by design: the second falls back
-to seeds, so give it the first one's address in `join` when running both on one machine.
+One thing to expect on a fresh node: the first request pays a one-off NVRTC compilation of the
+CUDA kernels before any token appears. The model load itself is seconds; the JIT is not.
 
 `GET /api/cluster/state` shows what a node publishes about itself; `POST /api/cluster/prefix`
 asks it how much of a given prompt it already holds.

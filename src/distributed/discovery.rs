@@ -133,11 +133,59 @@ impl PeerBook {
 
 /// Bind a socket that both announces and listens on the group.
 ///
-/// `SO_REUSEADDR` is not set here and that is deliberate: two loken daemons instances on ONE host
-/// binding the same discovery port would each hear half the announcements, which looks like an
-/// intermittent network fault. Failing to bind says plainly that one is already running.
+/// `SO_REUSEADDR` is set. It was not, on the grounds that two daemons sharing the port would
+/// each hear half the announcements - which is true of unicast and not of multicast: measured
+/// with two listeners and six datagrams, both received all six. What refusing the bind actually
+/// prevented was a passive observer on the same host, and a second daemon for testing.
 pub fn bind_discovery(interface: Ipv4Addr) -> io::Result<UdpSocket> {
-    let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT))?;
+    let sock = {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        // Set before the bind, which is the only moment it has any effect.
+        let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let on: libc::c_int = 1;
+        let set = |opt| unsafe {
+            libc::setsockopt(
+                raw,
+                libc::SOL_SOCKET,
+                opt,
+                std::ptr::addr_of!(on).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if set(libc::SO_REUSEADDR) < 0 || set(libc::SO_REUSEPORT) < 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(raw) };
+            return Err(e);
+        }
+        let s = unsafe { std::net::UdpSocket::from_raw_fd(raw) };
+        let addr: std::net::SocketAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT).into();
+        let sa: libc::sockaddr_in = match addr {
+            std::net::SocketAddr::V4(v4) => libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr { s_addr: u32::from(*v4.ip()).to_be() },
+                sin_zero: [0; 8],
+            },
+            _ => unreachable!("bound to an IPv4 address"),
+        };
+        let fd = s.into_raw_fd();
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                std::ptr::addr_of!(sa).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        unsafe { UdpSocket::from_raw_fd(fd) }
+    };
     sock.join_multicast_v4(&DISCOVERY_GROUP, &interface)?;
     // Without a timeout the listening loop cannot notice a shutdown request.
     sock.set_read_timeout(Some(Duration::from_millis(500)))?;
