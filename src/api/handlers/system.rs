@@ -435,13 +435,25 @@ pub(crate) async fn list_devices(
             .flatten()
             .unwrap_or_default();
 
+        // NVML answers for a card; the host answers for itself. Reporting null here left the
+        // CPU row with no free memory at all, which a reader has to take either as unmeasured
+        // or as a full machine.
+        let free_bytes = match d.device_type {
+            crate::distributed::DeviceType::Cuda => live.free,
+            _ => {
+                let mut sys = sysinfo::System::new();
+                sys.refresh_memory();
+                Some(sys.available_memory())
+            }
+        };
+
         serde_json::json!({
             "id": d.id,
             "type": d.device_type.to_string(),
             "name": d.name,
             "memory_gb": d.memory_gb(),
             "memory_bytes": d.memory_bytes,
-            "free_bytes": live.free,
+            "free_bytes": free_bytes,
             "utilization_gpu_percent": live.util_gpu_pct,
             "utilization_memory_percent": live.util_mem_pct,
             "temperature_c": live.temp_c,
