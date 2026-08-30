@@ -1550,8 +1550,7 @@ impl LlmEngine {
                 0.0
             };
             crate::distributed::rate_meter::record_generation(
-                &metered_model, prefill_tok_s, decode_tok_s,
-                crate::distributed::rate_meter::in_flight());
+                &metered_model, prefill_tok_s, decode_tok_s, eval_count as u64);
             // The acceptance rate is the only number that says whether speculation is
             // paying for itself. This path was counting it and throwing it away, so a
             // drafter that had stopped helping would have looked exactly like one that
