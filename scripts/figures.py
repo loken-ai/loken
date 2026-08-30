@@ -74,7 +74,12 @@ def bar_chart(rows, path):
     """
     data = sorted(rows.items(), key=lambda kv: -(kv[1][1] / kv[1][0]))
     top = max(max(v) for v in rows.values())
-    row_h, bar_h, gap, label_w, pad = 46, 15, 4, 150, 16
+    row_h, bar_h, gap, pad = 46, 15, 4, 16
+    # Derived from the longest name rather than fixed: a constant clipped
+    # `nemotron-3-nano:latest` to `emotron-3-nano:latest`, and a chart that eats a character
+    # is worse than one that is a little wide. 6.6px per character at 12.5px is measured on
+    # the sans stack below, with room for the gap to the axis.
+    label_w = int(max(len(m) for m in rows) * 6.6) + 16
     chart_w = 420
     width = label_w + chart_w + 70
     height = pad * 2 + 34 + row_h * len(data) + 30
@@ -84,7 +89,7 @@ def bar_chart(rows, path):
 
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        f'viewBox="0 0 {width} {height}" font-family="ui-sans-serif,system-ui,sans-serif">',
+        f'viewBox="0 0 {width} {height}" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">',
         # Mid-tones legible on a white page and on a dark one, and redefined when the viewer
         # says which it is. A figure that only reads on one background is half a figure.
         "<style>"

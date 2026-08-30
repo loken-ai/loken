@@ -3,9 +3,9 @@
 digraph pipeline {
   rankdir=TB;
   bgcolor="transparent";
-  node [fontname="ui-monospace,SFMono-Regular,monospace", fontsize=10, shape=box, style=rounded,
+  node [fontname="DejaVu Sans Mono, Liberation Mono, Menlo, monospace", fontsize=10, shape=box, style=rounded,
         color="#8c959f", fontcolor="#24292f", penwidth=1.2, height=.38];
-  edge [color="#8c959f", fontname="ui-sans-serif,system-ui,sans-serif", fontsize=9,
+  edge [color="#8c959f", fontname="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif", fontsize=9,
         fontcolor="#57606a", arrowsize=.7];
 
   start [label="fetch(i) for i in 0..stages-1", shape=plaintext, fontcolor="#57606a"];

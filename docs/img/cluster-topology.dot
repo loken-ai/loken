@@ -3,9 +3,9 @@
 digraph cluster {
   rankdir=TB;
   bgcolor="transparent";
-  node [fontname="ui-sans-serif,system-ui,sans-serif", fontsize=11, shape=box, style=rounded,
+  node [fontname="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif", fontsize=11, shape=box, style=rounded,
         color="#8c959f", fontcolor="#57606a", penwidth=1.2, height=.42];
-  edge [color="#8c959f", fontname="ui-sans-serif,system-ui,sans-serif", fontsize=9,
+  edge [color="#8c959f", fontname="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif", fontsize=9,
         fontcolor="#57606a", arrowsize=.7];
 
   client [label="client", shape=plaintext, fontcolor="#57606a"];
