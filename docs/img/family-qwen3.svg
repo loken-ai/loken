@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="734" height="436" viewBox="0 0 734 436" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<style>.t{fill:#57606a;font-size:10.5px}.m{fill:#24292f;font-size:11px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
+<text class="h" x="210" y="22">QWEN3 - DECODE TOK/S, 10 WIDEST GAPS OF 19 COMPARABLE CELLS, 23 MEASURED</text>
+<line class="ax" x1="210" y1="38" x2="210" y2="420"/>
+<text class="m" x="200" y="56" text-anchor="end">qwen3:0.6b 16384 short S GPU</text>
+<rect class="o" x="210" y="44" width="324.2" height="11" rx="2"/>
+<rect class="l" x="210" y="58" width="411.0" height="11" rx="2"/>
+<text class="t" x="540.1664233576643" y="54">529</text>
+<text class="t" x="626.9868613138685" y="70">670  (+27%)</text>
+<text class="m" x="200" y="90" text-anchor="end">qwen3:0.6b 4096 medium S GPU</text>
+<rect class="o" x="210" y="78" width="364.4" height="11" rx="2"/>
+<rect class="l" x="210" y="92" width="416.4" height="11" rx="2"/>
+<text class="t" x="580.4496350364964" y="88">594</text>
+<text class="t" x="632.3824817518248" y="104">679  (+14%)</text>
+<text class="m" x="200" y="124" text-anchor="end">qwen3:0.6b 4096 medium NS GPU</text>
+<rect class="o" x="210" y="112" width="368.3" height="11" rx="2"/>
+<rect class="l" x="210" y="126" width="420.0" height="11" rx="2"/>
+<text class="t" x="584.3124087591241" y="122">601</text>
+<text class="t" x="636.0" y="138">685  (+14%)</text>
+<text class="m" x="200" y="158" text-anchor="end">qwen3:0.6b 4096 short NS GPU</text>
+<rect class="o" x="210" y="146" width="367.0" height="11" rx="2"/>
+<rect class="l" x="210" y="160" width="415.2" height="11" rx="2"/>
+<text class="t" x="583.0248175182483" y="156">599</text>
+<text class="t" x="631.2175182481752" y="172">677  (+13%)</text>
+<text class="m" x="200" y="192" text-anchor="end">qwen3:0.6b 4096 short S GPU</text>
+<rect class="o" x="210" y="180" width="370.2" height="11" rx="2"/>
+<rect class="l" x="210" y="194" width="413.6" height="11" rx="2"/>
+<text class="t" x="586.2131386861313" y="190">604</text>
+<text class="t" x="629.5620437956204" y="206">674  (+12%)</text>
+<text class="m" x="200" y="226" text-anchor="end">qwen3:8b 4096 short S CPU</text>
+<rect class="o" x="210" y="214" width="2.8" height="11" rx="2"/>
+<rect class="l" x="210" y="228" width="3.1" height="11" rx="2"/>
+<text class="t" x="218.8204379562044" y="224">5</text>
+<text class="t" x="219.06569343065692" y="240">5  (+9%)</text>
+<text class="m" x="200" y="260" text-anchor="end">qwen3:0.6b 16384 long S GPU</text>
+<rect class="o" x="210" y="248" width="367.3" height="11" rx="2"/>
+<rect class="l" x="210" y="262" width="396.4" height="11" rx="2"/>
+<text class="t" x="583.3313868613138" y="258">599</text>
+<text class="t" x="612.3941605839416" y="274">646  (+8%)</text>
+<text class="m" x="200" y="294" text-anchor="end">qwen3:0.6b 32768 long S GPU</text>
+<rect class="o" x="210" y="282" width="370.6" height="11" rx="2"/>
+<rect class="l" x="210" y="296" width="399.7" height="11" rx="2"/>
+<text class="t" x="586.5810218978102" y="292">604</text>
+<text class="t" x="615.7051094890511" y="308">652  (+8%)</text>
+<text class="m" x="200" y="328" text-anchor="end">qwen3:8b 16384 short S GPU</text>
+<rect class="o" x="210" y="316" width="85.2" height="11" rx="2"/>
+<rect class="l" x="210" y="330" width="91.7" height="11" rx="2"/>
+<text class="t" x="301.16496350364963" y="326">139</text>
+<text class="t" x="307.7255474452555" y="342">150  (+8%)</text>
+<text class="m" x="200" y="362" text-anchor="end">qwen3:1.7b 4096 short S GPU</text>
+<rect class="o" x="210" y="350" width="250.0" height="11" rx="2"/>
+<rect class="l" x="210" y="364" width="262.3" height="11" rx="2"/>
+<text class="t" x="465.9766423357664" y="360">408</text>
+<text class="t" x="478.3007299270073" y="376">428  (+5%)</text>
+<text class="h" x="210" y="422">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
+</svg>

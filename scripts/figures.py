@@ -66,7 +66,7 @@ def comparison_table(rows):
     return "\n".join(lines)
 
 
-def bar_chart(rows, path):
+def bar_chart(rows, path, header=None):
     """Paired bars, one model per row, widest scale set by the fastest engine.
 
     Hand-written rather than plotted by a library: the repository adds a dependency only for a
@@ -74,17 +74,18 @@ def bar_chart(rows, path):
     """
     data = sorted(rows.items(), key=lambda kv: -(kv[1][1] / kv[1][0]))
     top = max(max(v) for v in rows.values())
-    row_h, bar_h, gap, pad = 46, 15, 4, 16
-    # Derived from the longest name rather than fixed: a constant clipped
-    # `nemotron-3-nano:latest` to `emotron-3-nano:latest`, and a chart that eats a character
-    # is worse than one that is a little wide. 6.6px per character at 12.5px is measured on
-    # the sans stack below, with room for the gap to the axis.
-    label_w = int(max(len(m) for m in rows) * 6.6) + 16
+    row_h, bar_h, gap, pad = 34, 11, 3, 16
+    # Both margins follow the text they hold. Fixed, they clipped
+    # `nemotron-3-nano:latest` to `emotron-3-nano:latest` on the left and `674 (+12%)` to
+    # `674 (+12%` on the right. 7.4px per character is what the sans stack below takes at
+    # 12.5px, plus the gap to the axis and a margin so nothing starts at zero.
+    label_w = int(max(len(m) for m in rows) * 6.5) + 22
     chart_w = 420
-    # Wide enough for the header too: it is longer than the bars whenever the caveat grows,
-    # and a title that runs off the edge is a title nobody finished reading.
-    header = f"DECODE TOK/S, ONE CARD, {RUN_DATE}, OUT OF DATE"
-    width = max(label_w + chart_w + 70, label_w + int(len(header) * 6.4) + 16)
+    value_w = (
+        max(len(f"{l:.0f}  ({(l / o - 1) * 100:+.0f}%)") for o, l in rows.values()) * 7 + 12
+    )
+    header = header or f"DECODE TOK/S, ONE CARD, {RUN_DATE}"
+    width = max(label_w + chart_w + value_w, label_w + int(len(header) * 7.0) + 20)
     height = pad * 2 + 34 + row_h * len(data) + 30
 
     def bar(x, y, w, h, cls):
@@ -96,8 +97,8 @@ def bar_chart(rows, path):
         # Mid-tones legible on a white page and on a dark one, and redefined when the viewer
         # says which it is. A figure that only reads on one background is half a figure.
         "<style>"
-        ".t{fill:#57606a;font-size:12px}"
-        ".m{fill:#24292f;font-size:12.5px}"
+        ".t{fill:#57606a;font-size:10.5px}"
+        ".m{fill:#24292f;font-size:11px}"
         ".h{fill:#57606a;font-size:11px;letter-spacing:.06em}"
         ".o{fill:#8c959f}"
         ".l{fill:#2da44e}"
@@ -114,11 +115,11 @@ def bar_chart(rows, path):
     svg.append(f'<line class="ax" x1="{label_w}" y1="{y0}" x2="{label_w}" y2="{height - pad}"/>')
     for i, (model, (ollama, loken)) in enumerate(data):
         y = y0 + i * row_h + 6
-        svg.append(f'<text class="m" x="{label_w - 10}" y="{y + 15}" text-anchor="end">{model}</text>')
+        svg.append(f'<text class="m" x="{label_w - 10}" y="{y + 12}" text-anchor="end">{model}</text>')
         svg.append(bar(label_w, y, ollama / top * chart_w, bar_h, "o"))
         svg.append(bar(label_w, y + bar_h + gap, loken / top * chart_w, bar_h, "l"))
         svg.append(
-            f'<text class="t" x="{label_w + ollama / top * chart_w + 6}" y="{y + 12}">'
+            f'<text class="t" x="{label_w + ollama / top * chart_w + 6}" y="{y + 10}">'
             f"{ollama:.0f}</text>"
         )
         delta = (loken / ollama - 1) * 100
@@ -132,6 +133,89 @@ def bar_chart(rows, path):
     )
     svg.append("</svg>")
     path.write_text("\n".join(svg) + "\n")
+
+
+def section_cells():
+    """Every comparable cell, grouped by the section it sits under.
+
+    A cell is (model, ctx, prompt, mode, device) on a date, and it is comparable when both
+    engines produced a decode rate for it. Returns per section the comparable cells and how
+    many cells the section holds in total, because a figure that silently drops most of its
+    data is worse than no figure - the first attempt charted 5 sections out of 20 and showed
+    one slice of each.
+    """
+    clean = lambda s: re.sub(r"[*\s  ]", "", s)
+    section, cells, total = None, {}, {}
+    for line in (ROOT / "docs" / "BENCHMARKS.md").read_text().splitlines():
+        if line.startswith("### "):
+            section = line[4:].strip()
+            cells.setdefault(section, {})
+            total.setdefault(section, set())
+            continue
+        if section is None or not line.startswith("| ") or line.startswith("| Model"):
+            continue
+        c = [x.strip() for x in line.strip().strip("|").split("|")]
+        if len(c) < 15:
+            continue
+        key = (c[0], c[1], c[2], c[3], c[4], c[14][:10])
+        total[section].add(key)
+        try:
+            decode = float(clean(c[7]))
+        except ValueError:
+            continue
+        cells[section].setdefault(key, {})[clean(c[5])] = decode
+    out = {}
+    for sec, found in cells.items():
+        pairs = {
+            f"{m} {ctx} {prompt} {'S' if mode == 'stream' else 'NS'} {dev}": (
+                e["Ollama0.32.6"],
+                e["loken0.1.0"],
+            )
+            for (m, ctx, prompt, mode, dev, _), e in found.items()
+            if "Ollama0.32.6" in e and "loken0.1.0" in e
+        }
+        if pairs:
+            out[sec] = (pairs, len(total[sec]))
+    return out
+
+
+def section_charts():
+    """One figure per section, one bar pair per comparable cell.
+
+    Anything no longer produced is removed first: a generated file left behind after the rule
+    that made it changed keeps being embedded under a caption that stopped describing it.
+    """
+    for stale in IMG.glob("family-*.svg"):
+        stale.unlink()
+    made = []
+    for sec, (pairs, total) in sorted(section_cells().items()):
+        # Ten cells, by RELATIVE gap - an absolute one would rank a 70B model's 1-against-2
+        # tok/s below a 1B model's noise. Each model's widest gap is taken first, then the
+        # widest remaining: ranking on the gap alone gave six bars of one checkpoint at
+        # +167, +167, +167, +166, +164, +162 percent, which is one fact drawn six times while
+        # the other models in the section went unshown.
+        gap = lambda kv: -abs(kv[1][1] / kv[1][0] - 1)
+        ranked = sorted(pairs.items(), key=gap)
+        widest_per_model, spare = {}, []
+        for label, values in ranked:
+            model = label.split(" ", 1)[0]
+            if model in widest_per_model:
+                spare.append((label, values))
+            else:
+                widest_per_model[model] = (label, values)
+        shown = dict(list(widest_per_model.values())[:10])
+        for label, values in spare[: max(0, 10 - len(shown))]:
+            shown[label] = values
+        shown = dict(sorted(shown.items(), key=gap))
+        header = f"{sec.upper()} - DECODE TOK/S, {len(shown)}"
+        if len(shown) < len(pairs):
+            header += f" WIDEST GAPS OF {len(pairs)} COMPARABLE"
+        else:
+            header += f" COMPARABLE"
+        header += f" CELLS, {total} MEASURED"
+        bar_chart(shown, IMG / f"family-{sec}.svg", header=header)
+        made.append(sec)
+    return made
 
 
 def render_dot(name):
@@ -156,6 +240,7 @@ def main():
     for name in ("cluster-topology", "marlin-pipeline"):
         if (IMG / f"{name}.dot").exists():
             render_dot(name)
+    print(f"section charts: {len(section_charts())}")
 
     # The table lives between markers so the page carries one copy of these numbers, not a
     # transcription of them.

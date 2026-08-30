@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="767" height="436" viewBox="0 0 767 436" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<style>.t{fill:#57606a;font-size:10.5px}.m{fill:#24292f;font-size:11px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
+<text class="h" x="243" y="22">QWEN2 - DECODE TOK/S, 10 WIDEST GAPS OF 25 COMPARABLE CELLS, 27 MEASURED</text>
+<line class="ax" x1="243" y1="38" x2="243" y2="420"/>
+<text class="m" x="233" y="56" text-anchor="end">deepcoder:14b 131072 short S GPU</text>
+<rect class="o" x="243" y="44" width="5.0" height="11" rx="2"/>
+<rect class="l" x="243" y="58" width="91.4" height="11" rx="2"/>
+<text class="t" x="254.01628664495115" y="54">4</text>
+<text class="t" x="340.43322475570034" y="70">80  (+1723%)</text>
+<text class="m" x="233" y="90" text-anchor="end">deepseek-r1:32b 131072 short S GPU</text>
+<rect class="o" x="243" y="78" width="2.7" height="11" rx="2"/>
+<rect class="l" x="243" y="92" width="46.2" height="11" rx="2"/>
+<text class="t" x="251.73615635179152" y="88">2</text>
+<text class="t" x="295.1726384364821" y="104">40  (+1588%)</text>
+<text class="m" x="233" y="124" text-anchor="end">deepseek-r1:32b 4096 short NS GPU</text>
+<rect class="o" x="243" y="112" width="29.6" height="11" rx="2"/>
+<rect class="l" x="243" y="126" width="46.7" height="11" rx="2"/>
+<text class="t" x="278.6416938110749" y="122">26</text>
+<text class="t" x="295.742671009772" y="138">41  (+58%)</text>
+<text class="m" x="233" y="158" text-anchor="end">deepseek-r1:32b 4096 short S GPU</text>
+<rect class="o" x="243" y="146" width="29.4" height="11" rx="2"/>
+<rect class="l" x="243" y="160" width="46.3" height="11" rx="2"/>
+<text class="t" x="278.41368078175896" y="156">26</text>
+<text class="t" x="295.2866449511401" y="172">41  (+57%)</text>
+<text class="m" x="233" y="192" text-anchor="end">deepseek-r1:32b 4096 medium S GPU</text>
+<rect class="o" x="243" y="180" width="29.5" height="11" rx="2"/>
+<rect class="l" x="243" y="194" width="46.2" height="11" rx="2"/>
+<text class="t" x="278.52768729641696" y="190">26</text>
+<text class="t" x="295.1726384364821" y="206">40  (+56%)</text>
+<text class="m" x="233" y="226" text-anchor="end">deepseek-r1:32b 4096 medium NS GPU</text>
+<rect class="o" x="243" y="214" width="29.8" height="11" rx="2"/>
+<rect class="l" x="243" y="228" width="46.5" height="11" rx="2"/>
+<text class="t" x="278.7557003257329" y="224">26</text>
+<text class="t" x="295.51465798045604" y="240">41  (+56%)</text>
+<text class="m" x="233" y="260" text-anchor="end">deepseek-r1:32b 4096 long NS GPU</text>
+<rect class="o" x="243" y="248" width="29.5" height="11" rx="2"/>
+<rect class="l" x="243" y="262" width="45.3" height="11" rx="2"/>
+<text class="t" x="278.52768729641696" y="258">26</text>
+<text class="t" x="294.26058631921825" y="274">40  (+53%)</text>
+<text class="m" x="233" y="294" text-anchor="end">deepseek-r1:32b 4096 long S GPU</text>
+<rect class="o" x="243" y="282" width="29.3" height="11" rx="2"/>
+<rect class="l" x="243" y="296" width="44.8" height="11" rx="2"/>
+<text class="t" x="278.29967426710095" y="292">26</text>
+<text class="t" x="293.8045602605863" y="308">39  (+53%)</text>
+<text class="m" x="233" y="328" text-anchor="end">qwen2.5:0.5b 4096 short S GPU</text>
+<rect class="o" x="243" y="316" width="344.3" height="11" rx="2"/>
+<rect class="l" x="243" y="330" width="420.0" height="11" rx="2"/>
+<text class="t" x="593.299674267101" y="326">302</text>
+<text class="t" x="669.0" y="342">368  (+22%)</text>
+<text class="m" x="233" y="362" text-anchor="end">deepcoder:latest 4096 short S GPU</text>
+<rect class="o" x="243" y="350" width="84.8" height="11" rx="2"/>
+<rect class="l" x="243" y="364" width="98.0" height="11" rx="2"/>
+<text class="t" x="333.82084690553745" y="360">74</text>
+<text class="t" x="347.0456026058632" y="376">86  (+16%)</text>
+<text class="h" x="243" y="422">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
+</svg>

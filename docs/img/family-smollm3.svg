@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="745" height="334" viewBox="0 0 745 334" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<style>.t{fill:#57606a;font-size:10.5px}.m{fill:#24292f;font-size:11px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
+<text class="h" x="236" y="22">SMOLLM3 - DECODE TOK/S, 7 COMPARABLE CELLS, 7 MEASURED</text>
+<line class="ax" x1="236" y1="38" x2="236" y2="318"/>
+<text class="m" x="226" y="56" text-anchor="end">smollm3:latest 4096 medium NS GPU</text>
+<rect class="o" x="236" y="44" width="369.1" height="11" rx="2"/>
+<rect class="l" x="236" y="58" width="419.5" height="11" rx="2"/>
+<text class="t" x="611.1111996811478" y="54">220</text>
+<text class="t" x="661.4978078915902" y="70">251  (+14%)</text>
+<text class="m" x="226" y="90" text-anchor="end">smollm3:latest 4096 short S GPU</text>
+<rect class="o" x="236" y="78" width="370.8" height="11" rx="2"/>
+<rect class="l" x="236" y="92" width="420.0" height="11" rx="2"/>
+<text class="t" x="612.7851733758469" y="88">222</text>
+<text class="t" x="662.0" y="104">251  (+13%)</text>
+<text class="m" x="226" y="124" text-anchor="end">smollm3:latest 4096 medium S GPU</text>
+<rect class="o" x="236" y="112" width="368.6" height="11" rx="2"/>
+<rect class="l" x="236" y="126" width="413.3" height="11" rx="2"/>
+<text class="t" x="610.6090075727382" y="122">220</text>
+<text class="t" x="655.3041052212036" y="138">247  (+12%)</text>
+<text class="m" x="226" y="158" text-anchor="end">smollm3:latest 4096 short NS GPU</text>
+<rect class="o" x="236" y="146" width="378.2" height="11" rx="2"/>
+<rect class="l" x="236" y="160" width="419.2" height="11" rx="2"/>
+<text class="t" x="620.150657632523" y="156">226</text>
+<text class="t" x="661.1630131526504" y="172">250  (+11%)</text>
+<text class="m" x="226" y="192" text-anchor="end">smollm3:latest 4096 long NS GPU</text>
+<rect class="o" x="236" y="180" width="369.1" height="11" rx="2"/>
+<rect class="l" x="236" y="194" width="396.7" height="11" rx="2"/>
+<text class="t" x="611.1111996811478" y="190">220</text>
+<text class="t" x="638.7317656436828" y="206">237  (+7%)</text>
+<text class="m" x="226" y="226" text-anchor="end">smollm3:latest 4096 long S GPU</text>
+<rect class="o" x="236" y="214" width="372.8" height="11" rx="2"/>
+<rect class="l" x="236" y="228" width="391.4" height="11" rx="2"/>
+<text class="t" x="614.7939418094859" y="224">223</text>
+<text class="t" x="633.3750498206457" y="240">234  (+5%)</text>
+<text class="m" x="226" y="260" text-anchor="end">smollm3:latest 4096 short S CPU</text>
+<rect class="o" x="236" y="248" width="18.4" height="11" rx="2"/>
+<rect class="l" x="236" y="262" width="17.7" height="11" rx="2"/>
+<text class="t" x="260.41371064168993" y="258">11</text>
+<text class="t" x="259.7441211638103" y="274">11  (-4%)</text>
+<text class="h" x="236" y="320">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
+</svg>

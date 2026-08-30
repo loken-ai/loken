@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="758" height="232" viewBox="0 0 758 232" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<style>.t{fill:#57606a;font-size:10.5px}.m{fill:#24292f;font-size:11px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
+<text class="h" x="249" y="22">PHI2 - DECODE TOK/S, 4 COMPARABLE CELLS, 5 MEASURED</text>
+<line class="ax" x1="249" y1="38" x2="249" y2="216"/>
+<text class="m" x="239" y="56" text-anchor="end">moondream:latest 4096 short S GPU</text>
+<rect class="o" x="249" y="44" width="306.3" height="11" rx="2"/>
+<rect class="l" x="249" y="58" width="409.8" height="11" rx="2"/>
+<text class="t" x="561.3173076923077" y="54">455</text>
+<text class="t" x="664.8365384615385" y="70">609  (+34%)</text>
+<text class="m" x="239" y="90" text-anchor="end">moondream:latest 4096 medium NS GPU</text>
+<rect class="o" x="249" y="78" width="317.2" height="11" rx="2"/>
+<rect class="l" x="249" y="92" width="420.0" height="11" rx="2"/>
+<text class="t" x="572.1538461538462" y="88">471</text>
+<text class="t" x="675.0" y="104">624  (+32%)</text>
+<text class="m" x="239" y="124" text-anchor="end">moondream:latest 4096 short NS GPU</text>
+<rect class="o" x="249" y="112" width="315.8" height="11" rx="2"/>
+<rect class="l" x="249" y="126" width="415.9" height="11" rx="2"/>
+<text class="t" x="570.8076923076924" y="122">469</text>
+<text class="t" x="670.8942307692307" y="138">618  (+32%)</text>
+<text class="m" x="239" y="158" text-anchor="end">moondream:latest 4096 medium S GPU</text>
+<rect class="o" x="249" y="146" width="307.4" height="11" rx="2"/>
+<rect class="l" x="249" y="160" width="394.0" height="11" rx="2"/>
+<text class="t" x="562.3942307692307" y="156">457</text>
+<text class="t" x="648.9519230769231" y="172">585  (+28%)</text>
+<text class="h" x="249" y="218">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
+</svg>
