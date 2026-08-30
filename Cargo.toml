@@ -144,6 +144,11 @@ midi = ["audio"]    # rendered to sound through the audio stack
 # Enable CUDA support (requires CUDA toolkit 11.x or 12.x installation)
 # Install CUDA from: https://developer.nvidia.com/cuda-downloads
 cuda = ["dep:cudarc"]
+# A GET /metrics scrape endpoint. Off by default: the published default binds localhost and
+# does not authenticate, and compiling a scrape endpoint in regardless would widen that
+# surface without anyone asking. When on it sits behind the same authentication as every
+# other route.
+metrics = []
 # Enable GGUF format support (for Ollama models)
 # Enable SYCL support (Intel Arc/Xe)
 # Enable OpenCL backend for Intel Arc / AMD GPU inference via OpenCL kernels

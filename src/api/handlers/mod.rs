@@ -71,6 +71,8 @@ mod openai;
 mod prompt_format;
 #[cfg(feature = "audio")]
 mod separate;
+#[cfg(feature = "metrics")]
+mod metrics;
 mod system;
 
 pub(crate) use anthropic_api::*;
@@ -1439,6 +1441,12 @@ impl APIServer {
             .layer(PropagateRequestIdLayer::x_request_id())
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(TraceLayer::new_for_http());
+
+        // The scrape endpoint, when the feature asks for it. Folded in as a rebinding for the
+        // same reason as the media families below: a chained builder cannot carry a cfg on one
+        // link, and a build without it answers 404 rather than existing and refusing.
+        #[cfg(feature = "metrics")]
+        let router = router.route("/metrics", axum::routing::get(metrics::metrics));
 
         // Audio routes. A chained builder cannot carry a cfg on one link,
         // so the family folds in as a rebinding: absent from a build without it,
