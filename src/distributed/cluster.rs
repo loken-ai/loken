@@ -56,6 +56,22 @@ impl ClusterConfig {
     }
 }
 
+/// One peer as this node sees it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerView {
+    pub node_id: NodeId,
+    /// Where this node would send a hand-over. `None` for a peer heard of but never addressed.
+    pub endpoint: Option<String>,
+    pub alive: bool,
+    /// Suspicion from the failure detector. `None` before enough gossip rounds to judge.
+    pub phi: Option<f64>,
+    /// Round trip measured on the gossip request itself, not on a separate ping: pricing a
+    /// hand-over against a latency nobody pays would describe a different network.
+    pub rtt_ms: Option<f64>,
+    pub is_self: bool,
+    pub state: NodeState,
+}
+
 /// What the router decided, and why - the reason belongs in the evidence report.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
@@ -188,6 +204,53 @@ impl Cluster {
     /// where it landed, whatever the arithmetic now says: two nodes that each prefer the other
     /// would otherwise pass it back and forth until a timeout, and a hang is a far worse
     /// failure than a slightly suboptimal placement.
+    /// What this node believes about every peer it knows: where it is, whether it is alive,
+    /// how suspicious its silence looks, and what it last said about itself.
+    ///
+    /// A node publishes its own state on `/api/cluster/state`, which lets an observer see what
+    /// it can reach. This is the other half: what each node can reach. A partition where two
+    /// nodes each see the observer but not each other is invisible without it.
+    pub fn peer_view(&self, now_ms: u64) -> Vec<PeerView> {
+        let members = self.members.lock().unwrap_or_else(|e| e.into_inner());
+        let urls = self.urls.lock().unwrap_or_else(|e| e.into_inner());
+        let rtt = self.rtt_ms.lock().unwrap_or_else(|e| e.into_inner());
+        let alive: std::collections::HashSet<NodeId> = members.alive(now_ms).into_iter().collect();
+        // This node belongs in its own answer. It only enters the member table when a routing
+        // decision puts it there, so a node that has served nothing would describe its peers
+        // and omit itself - and an observer cannot tell that from a node that is not in the
+        // cluster at all.
+        let mut out: Vec<PeerView> = std::iter::once((
+            &self.config.node_id,
+            &self.local_state(),
+        ))
+        .filter(|(n, _)| members.state_of(n).is_none())
+        .map(|(node, state)| PeerView {
+            node_id: node.clone(),
+            // The address peers were given lives in the runtime that announces it, not in
+            // this table. An observer reaching this endpoint already knows where it is.
+            endpoint: None,
+            alive: true,
+            phi: None,
+            rtt_ms: Some(0.0),
+            is_self: true,
+            state: (*state).clone(),
+        })
+        .chain(members
+            .known()
+            .map(|(node, state)| PeerView {
+                node_id: node.clone(),
+                endpoint: urls.get(node).cloned(),
+                alive: alive.contains(node),
+                phi: members.phi(node, now_ms),
+                rtt_ms: rtt.get(node).copied(),
+                is_self: *node == self.config.node_id,
+                state: state.clone(),
+            }))
+            .collect();
+        out.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        out
+    }
+
     pub fn decide(
         &self,
         req: &RequestShape,
@@ -198,14 +261,39 @@ impl Cluster {
         // in its own cache, so the question travels instead of a hashing convention.
         cached: &std::collections::HashMap<NodeId, u32>,
     ) -> Decision {
-        // Every verdict says why, at debug, one line per request: a decision to stay home
-        // looks exactly like a healthy cluster until it explains itself.
+        // Every verdict says why, one line per request: a decision to stay home looks exactly
+        // like a healthy cluster until it explains itself. At info, beside the hand-over it is
+        // the counterpart of, so the default filter shows both halves of the choice.
         let verdict = self.decide_inner(req, now_ms, already_forwarded, cached);
         if let Decision::Local { reason } = &verdict {
-            tracing::debug!("cluster: serving locally: {reason}");
+            tracing::info!("cluster: serving locally: {reason}");
         }
         verdict
     }
+
+    /// What each node is worth for one model: its rates for THAT model where it has measured
+    /// them, its aggregate otherwise.
+    ///
+    /// The fallback is not a free pass: a node that has never run the model also reports
+    /// `needs_load`, so it is priced for the fetch as well.
+    fn rates_for(&self, model: &str) -> HashMap<NodeId, NodeRates> {
+        let flat = self.rates.lock().unwrap_or_else(|e| e.into_inner());
+        let per = self
+            .rates_by_model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        flat.iter()
+            .map(|(node, agg)| {
+                let r = per
+                    .get(node)
+                    .and_then(|m| m.get(model))
+                    .copied()
+                    .unwrap_or(*agg);
+                (node.clone(), r)
+            })
+            .collect()
+    }
+
 
     fn decide_inner(
         &self,
@@ -236,23 +324,7 @@ impl Cluster {
         // Rates for THIS model where a node has measured it, its aggregate otherwise. The
         // fallback is not a free pass: a node that has never run the model also reports
         // needs_load, so it is priced for the fetch as well.
-        let rates: HashMap<NodeId, NodeRates> = {
-            let flat = self.rates.lock().unwrap_or_else(|e| e.into_inner());
-            let per = self
-                .rates_by_model
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            flat.iter()
-                .map(|(node, agg)| {
-                    let r = per
-                        .get(node)
-                        .and_then(|m| m.get(&req.model))
-                        .copied()
-                        .unwrap_or(*agg);
-                    (node.clone(), r)
-                })
-                .collect()
-        };
+        let rates = self.rates_for(&req.model);
         let rtt = self.rtt_ms.lock().unwrap_or_else(|e| e.into_inner());
 
         // A peer that just failed a hand-over is not a candidate until its penalty expires.
@@ -318,13 +390,10 @@ impl Cluster {
                 reason: "no peer published anything usable".into(),
             };
         };
-        if best.node == self.config.node_id {
-            return Decision::Local {
-                reason: "this node is the best estimate".into(),
-            };
-        }
-
-        // How long serving it here would take, for the speedup comparison.
+        // How long serving it here would take. Computed before the winner is known, because
+        // it is what every other estimate is worth comparing against - including when the
+        // winner IS this node, which is the case a breakdown emitted only on hand-over can
+        // never show.
         let here = members
             .state_of(&self.config.node_id)
             .cloned()
@@ -338,6 +407,20 @@ impl Cluster {
             0.0,
             cached.get(&self.config.node_id).copied().unwrap_or(0),
         );
+        tracing::debug!(
+            "cluster: best={} {:.0}ms vs here {:.0}ms | here {} | best {}",
+            best.node,
+            best.completion_ms,
+            local.completion_ms,
+            local.terms,
+            best.terms
+        );
+
+        if best.node == self.config.node_id {
+            return Decision::Local {
+                reason: "this node is the best estimate".into(),
+            };
+        }
 
         let speedup = if best.completion_ms > 0.0 {
             local.completion_ms / best.completion_ms

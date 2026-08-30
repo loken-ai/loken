@@ -44,6 +44,67 @@ pub struct NodeEstimate {
     pub prefix_hits: usize,
     /// True when the node must load the model before it can start.
     pub needs_load: bool,
+    /// The four milliseconds that add up to `completion_ms`, and the published state they came
+    /// from. A ratio between two nodes is unreadable without them: one term can swamp the
+    /// others and the total says only that it did.
+    pub terms: EstimateTerms,
+}
+
+/// Every quantity that went into one estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EstimateTerms {
+    pub prefill_ms: f64,
+    pub decode_ms: f64,
+    pub load_ms: f64,
+    pub rtt_ms: f64,
+    /// Which of the three queue models priced it.
+    pub model: QueueModel,
+    pub busy: u32,
+    pub lanes: u32,
+    pub agg_tok_per_s: f64,
+    pub prefill_tok_per_s: f64,
+    pub decode_tok_per_s: f64,
+}
+
+/// How the wait ahead of a request was priced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QueueModel {
+    /// The node published a measured sustained throughput; everything in flight shares it.
+    Batching,
+    /// No sustained measurement, but a known admission width: whole rounds of service ahead.
+    Lanes,
+    /// Neither. A fraction of the node, which cannot express a queue.
+    #[default]
+    Share,
+}
+
+impl std::fmt::Display for QueueModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Batching => "batching",
+            Self::Lanes => "lanes",
+            Self::Share => "share",
+        })
+    }
+}
+
+impl std::fmt::Display for EstimateTerms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} prefill={:.0}ms decode={:.0}ms load={:.0}ms rtt={:.0}ms              busy={} lanes={} agg={:.0} pf={:.0} dec={:.0}",
+            self.model,
+            self.prefill_ms,
+            self.decode_ms,
+            self.load_ms,
+            self.rtt_ms,
+            self.busy,
+            self.lanes,
+            self.agg_tok_per_s,
+            self.prefill_tok_per_s,
+            self.decode_tok_per_s
+        )
+    }
 }
 
 /// Rates a node publishes about itself, measured by that node rather than assumed here.
@@ -117,20 +178,25 @@ pub fn estimate(
     // measured at 24 in flight on a 724 tok/s node, per-request rate fell to a third while
     // the share model still called it nearly free. Peers from an older build publish no
     // lanes and keep the share model.
-    let (prefill_ms, decode_ms) = if rates.agg_tok_per_s > 0.0 {
+    let (model, prefill_ms, decode_ms) = if rates.agg_tok_per_s > 0.0 {
         // The batching model, when the node has measured itself: everything in flight shares
         // one sustained throughput, so a new request finishes after (busy + 1) requests'
         // worth of tokens have flowed. This is what the width models below approximate -
         // measured, it needs no lane count at all.
         let decode =
             f64::from(req.max_tokens) * f64::from(state.busy + 1) / rates.agg_tok_per_s * 1000.0;
-        (to_prefill / rates.prefill_tok_per_s * 1000.0, decode)
+        (
+            QueueModel::Batching,
+            to_prefill / rates.prefill_tok_per_s * 1000.0,
+            decode,
+        )
     } else if state.lanes > 0 {
         let rounds_ahead = (state.busy / state.lanes) as f64;
-        (rounds_ahead * service_ms, service_ms)
+        (QueueModel::Lanes, rounds_ahead * service_ms, service_ms)
     } else {
         let share = (1.0 - state.load as f64).max(0.05);
         (
+            QueueModel::Share,
             to_prefill / (rates.prefill_tok_per_s * share) * 1000.0,
             f64::from(req.max_tokens) / (rates.decode_tok_per_s * share) * 1000.0,
         )
@@ -147,6 +213,18 @@ pub fn estimate(
         completion_ms: prefill_ms + decode_ms + load_ms + rtt_ms,
         prefix_hits: hits,
         needs_load,
+        terms: EstimateTerms {
+            prefill_ms,
+            decode_ms,
+            load_ms,
+            rtt_ms,
+            model,
+            busy: state.busy,
+            lanes: state.lanes,
+            agg_tok_per_s: rates.agg_tok_per_s,
+            prefill_tok_per_s: rates.prefill_tok_per_s,
+            decode_tok_per_s: rates.decode_tok_per_s,
+        },
     }
 }
 

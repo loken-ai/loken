@@ -496,6 +496,27 @@ pub(crate) async fn list_devices(
     })))
 }
 
+/// What this node believes about its peers (GET /api/cluster/peers).
+///
+/// `/api/cluster/state` answers "what am I"; this answers "who do I see". Only the pair makes
+/// an asymmetric partition visible: a node every observer can reach may still be unable to
+/// reach its neighbour.
+///
+/// As cheap and side-effect free as the state endpoint, and for the same reason - the gossip
+/// round trip is what prices a hand-over, so anything slow here biases routing.
+pub(crate) async fn cluster_peers(
+    State(state): State<APIServer>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(cluster) = state.cluster_handle() else {
+        return Ok(Json(serde_json::json!({ "clustered": false, "peers": [] })));
+    };
+    let now = crate::distributed::cluster_runtime::now_ms(state.cluster_started());
+    Ok(Json(serde_json::json!({
+        "clustered": true,
+        "peers": cluster.peer_view(now),
+    })))
+}
+
 /// Get distributed inference statistics
 pub(crate) async fn distributed_stats(
     State(_state): State<APIServer>,

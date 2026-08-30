@@ -25,7 +25,7 @@ pub type NodeId = String;
 
 /// What a node publishes about itself. Gossip carries this; the detector only cares that it
 /// arrived, but the routing table needs the contents.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct NodeState {
     /// Devices it can place work on, as the local probe describes them.
     pub devices: Vec<String>,
@@ -198,6 +198,13 @@ impl Membership {
     }
 
     /// What a live node published.
+    /// Every node this table has ever heard from, alive or not. Eviction removes a node from
+    /// routing; it stays here until `forget_dead` drops it, which is what lets an observer see
+    /// a node go quiet rather than simply vanish.
+    pub fn known(&self) -> impl Iterator<Item = (&NodeId, &NodeState)> {
+        self.states.iter()
+    }
+
     pub fn state_of(&self, node: &NodeId) -> Option<&NodeState> {
         self.states.get(node)
     }

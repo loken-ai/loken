@@ -19,10 +19,12 @@ pipeline stages across nodes has a planner but no data path - nothing executes s
 the model does not fit on at least one node, the cluster cannot serve it.
 
 **One module to stay away from.** `DistributedEngine`, in `src/inference/serve/distributed_engine.rs`,
-is a scaffold: it exposes an API for distributing execution across nodes that is not implemented
-and is not on any serving path. Do not build against it. The collective operations beneath it
-(`all_reduce`, `all_gather`, `all_to_all`, `barrier`) are exact for a single rank and return an
-explicit error above one, rather than a plausible-looking result nobody computed.
+is a scaffold: it exposes an API for distributing execution across nodes that is not implemented.
+No generation goes through it. Two status endpoints do - `/api/distributed/stats` and
+`/api/distributed/recommend` build one per call to read a device inventory - so treat those two
+as reporting, not as a path to build on. The collective operations beneath it (`all_reduce`,
+`all_gather`, `all_to_all`, `barrier`) are exact for a single rank and return an explicit error
+above one, rather than a plausible-looking result nobody computed.
 
 What runs: `discovery.rs` (multicast announce + seed union), `membership.rs` (phi-accrual, with
 an `acceptable_pause_ms` a metronomic node cannot trip), `routing.rs` (completion-time estimate
@@ -283,6 +285,13 @@ failure, and slow-start reentry.
 whose prefix is cached on exactly one live node routes there, unless that node's load exceeds
 the configured margin.
 
+The figure the whole comparison rests on is each node's sustained throughput, and it is measured
+over a window - tokens emitted divided by the time taken - never as a per-request rate times a
+width. Where generations are serialised behind the model lock, one request runs at full speed
+while the others wait, so that product counts waiting requests as concurrent ones. Measured on
+two nodes of equal capacity it published 13338 tok/s for a machine emitting 623, and the router
+kept 22 requests out of 24 that it should have shared.
+
 ### Deterministic recovery
 
 A request already carries its own seed and the native sampler seeds its
@@ -354,8 +363,10 @@ min_speedup = 1.15
 ```
 
 `recovery = "replay"` is the default because it demands nothing of the infrastructure.
-`min_speedup` mirrors the equivalent threshold used by the speculative-decoding decision, and has
-no effect yet: nothing splits a model across nodes today, so there is no plan for it to refuse.
+`min_speedup` mirrors the equivalent threshold used by the speculative-decoding decision, and
+governs every hand-over: a peer that is not this much faster keeps the request where it is. It
+is also what a hand-over sequence converges to, since each one charges the peer a queue it has
+not reported yet - so the threshold, not the capacity gap, is where sharing stops.
 
 ## Non-goals
 

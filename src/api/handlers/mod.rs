@@ -678,7 +678,16 @@ impl APIServer {
                 (g.in_flight + g.queue_depth) as u32 + crate::distributed::rate_meter::in_flight()
             },
             lanes: self.request_gate.capacity() as u32,
-            devices: Vec::new(),
+            // Probed once at startup and held by the manager, so publishing costs a lock
+            // rather than an NVML pass per gossip round.
+            devices: self
+                .gpu_manager
+                .as_ref()
+                .map(|g| {
+                    use crate::gpu::GPUManagerInterface;
+                    g.get_devices().iter().map(|d| d.name()).collect()
+                })
+                .unwrap_or_default(),
             prefix_blocks: Vec::new(),
             // Measured on this node's own work. Zero until something has run here, which a
             // peer reads as unknown and prices pessimistically - a node has to earn its
@@ -1322,6 +1331,7 @@ impl APIServer {
             .route("/api/distributed/devices", axum::routing::get(list_devices))
             .route("/api/cluster/state", axum::routing::get(cluster_state))
             .route("/api/cluster/prefix", axum::routing::post(cluster_prefix))
+            .route("/api/cluster/peers", axum::routing::get(cluster_peers))
             .route(
                 "/api/distributed/stats",
                 axum::routing::get(distributed_stats),
