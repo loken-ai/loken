@@ -7,7 +7,7 @@ models on a USB disk reading at 460 MB/s.
 
 ## Decode rate vs ollama
 
-**Superseded, and kept as evidence rather than as a claim.** These rows were measured on
+**Out of date, and kept as evidence rather than as a claim.** These rows were measured on
 2026-08-27, during a phase of very active development: kernels, placement and the rate meter
 have all changed since. A fresh campaign is needed before any of this is quoted. Conditions
 were one card for both engines, idle machine, cold, greedy, streamed, short prompt, 4096 ctx,

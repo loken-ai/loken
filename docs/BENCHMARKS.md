@@ -1,6 +1,6 @@
 # Benchmarks
 
-> **Every figure on this page is superseded.** They were taken during a phase of very active
+> **Every figure on this page is out of date.** They were taken during a phase of very active
 > development - kernels, placement and the rate meter all changed under them - so a row says
 > what one build did on one day, not what this engine does. A fresh campaign is needed before
 > any of it is quoted. The rows are kept because a dated measurement is still evidence of what

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="651" height="418" viewBox="0 0 651 418" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
 <style>.t{fill:#57606a;font-size:12px}.m{fill:#24292f;font-size:12.5px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
-<text class="h" x="161" y="22">DECODE TOK/S, ONE CARD, 2026-08-27 - SUPERSEDED</text>
+<text class="h" x="161" y="22">DECODE TOK/S, ONE CARD, 2026-08-27, OUT OF DATE</text>
 <line class="ax" x1="161" y1="38" x2="161" y2="402"/>
 <text class="m" x="151" y="59" text-anchor="end">gpt-oss:20b</text>
 <rect class="o" x="161" y="44" width="113.7" height="15" rx="2"/>

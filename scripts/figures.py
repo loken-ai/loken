@@ -81,7 +81,10 @@ def bar_chart(rows, path):
     # the sans stack below, with room for the gap to the axis.
     label_w = int(max(len(m) for m in rows) * 6.6) + 16
     chart_w = 420
-    width = label_w + chart_w + 70
+    # Wide enough for the header too: it is longer than the bars whenever the caveat grows,
+    # and a title that runs off the edge is a title nobody finished reading.
+    header = f"DECODE TOK/S, ONE CARD, {RUN_DATE}, OUT OF DATE"
+    width = max(label_w + chart_w + 70, label_w + int(len(header) * 6.4) + 16)
     height = pad * 2 + 34 + row_h * len(data) + 30
 
     def bar(x, y, w, h, cls):
@@ -103,10 +106,9 @@ def bar_chart(rows, path):
         ".t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}"
         ".ax{stroke:#30363d}}"
         "</style>",
-        # The date is on the figure because these numbers are superseded, and a chart
+        # The date is on the figure because these numbers are old and untrusted, and a chart
         # travels away from the paragraph that says so.
-        f'<text class="h" x="{label_w}" y="{pad + 6}">DECODE TOK/S, ONE CARD, '
-        f'{RUN_DATE} - SUPERSEDED</text>',
+        f'<text class="h" x="{label_w}" y="{pad + 6}">{header}</text>',
     ]
     y0 = pad + 22
     svg.append(f'<line class="ax" x1="{label_w}" y1="{y0}" x2="{label_w}" y2="{height - pad}"/>')

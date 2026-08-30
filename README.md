@@ -79,7 +79,7 @@ listens on anything but localhost.
 
 - [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) - measurements against other engines and the
   protocol that makes the comparison fair, including the cells where this engine loses. Every
-  figure there is superseded: it was taken during a phase of very active development and a
+  figure there is out of date: it was taken during a phase of very active development and a
   fresh campaign is needed before any of it is quoted
 - [`docs/CLUSTER.md`](docs/CLUSTER.md) - spreading work across more than one machine
 - [`docs/STATUS.md`](docs/STATUS.md) - **what is measured, what is known to be slower, what is
