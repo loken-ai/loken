@@ -1,0 +1,25 @@
+// Rendered by scripts/figures.py. The loop back to wait_for_stage is the whole point of the
+// figure: the tile being read is complete while the tile after it is still arriving.
+digraph pipeline {
+  rankdir=TB;
+  bgcolor="transparent";
+  node [fontname="ui-monospace,SFMono-Regular,monospace", fontsize=10, shape=box, style=rounded,
+        color="#8c959f", fontcolor="#24292f", penwidth=1.2, height=.38];
+  edge [color="#8c959f", fontname="ui-sans-serif,system-ui,sans-serif", fontsize=9,
+        fontcolor="#57606a", arrowsize=.7];
+
+  start [label="fetch(i) for i in 0..stages-1", shape=plaintext, fontcolor="#57606a"];
+  wait  [label="wait_for_stage()", color="#2da44e", fontcolor="#2da44e"];
+  reg   [label="fetch_to_registers(k+1)"];
+  glob  [label="if k == last: fetch(pipe)"];
+  mma   [label="matmul(k)"];
+  adv   [label="advance pipe", shape=plaintext, fontcolor="#57606a"];
+
+  start -> wait [label=" start_pipes "];
+  wait  -> reg  [label=" cp_async_wait<stages-2> "];
+  reg   -> glob [label=" next k, from shared "];
+  glob  -> mma  [label=" next tile, from global "];
+  mma   -> adv  [label=" for k in 0..b_sh_wr_iters "];
+  adv   -> wait [label=" and round again ", constraint=false, color="#2da44e",
+                 fontcolor="#2da44e"];
+}

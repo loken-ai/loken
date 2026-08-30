@@ -77,8 +77,10 @@ listens on anything but localhost.
 
 ## Documentation
 
-- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) - measurements against other engines, and the
-  protocol that makes the comparison fair, including the cells where this engine loses
+- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) - measurements against other engines and the
+  protocol that makes the comparison fair, including the cells where this engine loses. Every
+  figure there is superseded: it was taken during a phase of very active development and a
+  fresh campaign is needed before any of it is quoted
 - [`docs/CLUSTER.md`](docs/CLUSTER.md) - spreading work across more than one machine
 - [`docs/STATUS.md`](docs/STATUS.md) - **what is measured, what is known to be slower, what is
   written but not wired, and what has never run.** Read this one before deciding whether the

@@ -53,16 +53,8 @@ counterpart in `marlin.rs`. `repack_matches_reference_dequant` is the test that 
 Global memory is far enough away that a tile must be in flight several iterations before it is
 needed. The kernel keeps `stages = 4` tiles of `A` and `B` in shared memory at once:
 
-```
-        fetch(i)      for i in 0..stages-1        <- start_pipes
-   +--> wait_for_stage()                          <- cp_async_wait<stages-2>
-   |        for k in 0..b_sh_wr_iters:
-   |            fetch_to_registers(k+1)           <- next k's fragments, from shared
-   |            if k == b_sh_wr_iters-1:
-   |                fetch(pipe)                   <- next tile, from global
-   |            matmul(k)                         <- this k's mma
-   +----   advance pipe
-```
+![The four-stage cp.async pipeline](../../docs/img/marlin-pipeline.svg)
+
 
 `cp_async_wait<stages-2>` is the whole trick: it waits until all but the last two groups have
 landed, which means the tile being read is complete while the tile after it is still arriving.

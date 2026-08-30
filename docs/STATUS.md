@@ -7,20 +7,34 @@ models on a USB disk reading at 460 MB/s.
 
 ## Decode rate vs ollama
 
-One card for both engines, idle machine, cold, greedy, streamed, short prompt, 4096 ctx, best of
-three. Tokens/s:
+**Superseded, and kept as evidence rather than as a claim.** These rows were measured on
+2026-08-27, during a phase of very active development: kernels, placement and the rate meter
+have all changed since. A fresh campaign is needed before any of this is quoted. Conditions
+were one card for both engines, idle machine, cold, greedy, streamed, short prompt, 4096 ctx,
+best of three, decode tokens/s.
 
+![Decode rate against ollama](img/decode-vs-ollama.svg)
+
+<!-- table:decode -->
 | model | ollama | loken | |
 |---|---:|---:|---|
-| llama3.2:1b | 299.8 | **451.6** | +51% |
-| gpt-oss:20b | 132.0 | **206.4** | +56% |
-| qwen3:1.7b | 420.0 | **428.8** | +2% |
-| granite3-moe:1b | 327.5 | **328.6** | - |
-| olmoe | **496.2** | 444.6 | **-10%** |
+| gpt-oss:20b | 131.5 | **206.5** | +57% |
+| llama3.2:1b | 297.7 | **450.1** | +51% |
+| qwen2.5:0.5b | 302.0 | **368.4** | +22% |
+| nemotron-3-nano:latest | 133.5 | **144.5** | +8% |
+| qwen3:1.7b | 407.7 | **427.8** | +5% |
+| olmoe:latest | **485.7** | 438.7 | **-10%** |
+| granite3-moe:1b | **373.2** | 323.4 | **-13%** |
+<!-- /table:decode -->
 
-olmoe is a loss. Eight of those ten points predate this year's kernel work - a build from before
-it measured 455.2 - so it is a standing deficit, unexplained. granite3-moe is also a mixture and
-sits at parity, which is the clue nobody has followed.
+Both mixtures lose. olmoe by 10 percent, granite3-moe by 13, and eight of olmoe's ten points
+predate this year's kernel work - a build from before it measured 455.2 - so its deficit is
+standing and unexplained. That two mixtures and no dense model lose is the clue nobody has
+followed.
+
+The table and the figure are regenerated together from `docs/BENCHMARKS.md` by
+`scripts/figures.py`. They were transcribed by hand once, and the page ended up quoting a
+parity for granite3-moe that appears nowhere in the measurements.
 
 ## Placement, measured separately
 

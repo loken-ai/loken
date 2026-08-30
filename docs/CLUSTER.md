@@ -132,24 +132,8 @@ no cluster flag. A node joins by way of the `[cluster]` block of its `config.tom
 `name` decides which cluster it belongs to, `advertise` how peers reach it, and `join` lists the
 seeds for peers multicast cannot reach.
 
-```
-                       client
-                          |
-                          v
-              +-----------------------+   control plane: SWIM gossip,
-              |        router         |   phi-accrual detector, and an
-              +-----------------------+   eventually-consistent table
-                 |         |         |
-       +---------+         |         +---------+
-       v                   v                   v
- +-----------+       +-----------+       +-----------+
- |  node A   |       |  node B   |       |  node C   |   full replica
- |   TP=2    |       |   TP=2    |       |   CPU     |
- +-----------+       +-----------+       +-----------+
+![Cluster topology](img/cluster-topology.svg)
 
- A model is sharded across nodes only when no single node holds it, and only
- where the measured link cost says it pays.
-```
 
 **No consensus protocol, initially.** In replicated mode the routing table need not be
 linearizable: routing to a dead node costs a retry, not a corruption. SWIM gossip with a
