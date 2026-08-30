@@ -876,7 +876,7 @@ fn gguf_container_bytes_are_what_the_reader_expects() {
         dtype: GgmlDType::F32,
         data: data.clone(),
     }];
-    let name = format!("llmuse-gguf-layout-{}.gguf", std::process::id());
+    let name = format!("loken-gguf-layout-{}.gguf", std::process::id());
     let path = std::env::temp_dir().join(name);
     write_gguf(&path, &entries).unwrap();
     let raw = std::fs::read(&path).unwrap();

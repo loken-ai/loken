@@ -877,8 +877,8 @@ pub(crate) async fn ollama_generate(
     // Read BEFORE any decision: the marker is what stops two nodes that each prefer the
     // other from passing a request back and forth until something times out, and a hang is
     // a far worse failure than an imperfect placement.
-    let already_forwarded = headers.contains_key(crate::distributed::cluster::FORWARDED_HEADER)
-        || headers.contains_key(crate::distributed::cluster::FORWARDED_HEADER_LEGACY);
+    let already_forwarded =
+        headers.contains_key(crate::distributed::cluster::FORWARDED_HEADER);
     // Counted from the first instant, so concurrent arrivals see each other in `busy` when
     // they decide - the admission gate never sees this path, and a count taken any later
     // publishes an idle node under any load. Released explicitly on hand-over: a forwarded

@@ -489,12 +489,6 @@ impl Cluster {
 /// Header marking a request that has already been handed over once - the loop guard.
 pub const FORWARDED_HEADER: &str = "x-loken-forwarded";
 
-/// The spelling used before the project was renamed. Still recognised on the way IN, so a
-/// cluster whose nodes are upgraded one at a time does not lose its loop guard halfway
-/// through: an old node forwarding to a new one would otherwise look like a fresh request
-/// and could be handed straight back.
-pub const FORWARDED_HEADER_LEGACY: &str = "x-llmuse-forwarded";
-
 #[cfg(test)]
 mod tests {
     use super::*;
