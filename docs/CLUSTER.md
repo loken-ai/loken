@@ -9,14 +9,24 @@ declared**. No operator is asked what their network is. The cluster finds out.
 **Replicated serving works end to end.** A node discovers its peers, gossips what it holds and
 what it measures, and either serves a request or forwards it whole and relays the stream back.
 
-**What works today:** peer discovery and membership, failure detection with eviction, whole-request
-forwarding with the response streamed back to the client, cache-aware node selection, deterministic
-recovery when a node dies mid-generation, the binary transport between nodes, the tiered KV pool,
-and cluster-wide energy reporting.
+**What works today:** peer discovery and membership, failure detection with eviction,
+whole-request forwarding with the response streamed back to the client, node selection priced
+on rates each node measures from its own completed work, and cluster-wide energy reporting.
+
+**What is written and reached by nothing:** the binary transport between nodes, the tiered KV
+pool, the deterministic resume point, the link-cost matrix, the pipeline cut planner, the layer
+scheduler and the per-request evidence record. Each is complete and judged by its own tests,
+and no other module calls it. That list is not a reading of the code:
+`distributed::wiring_gate` records the state of every module in that directory and fails both
+when one is finally reached and when one that was reached falls silent.
 
 **What does not work:** serving a model that no single node can hold. Cutting a model into
-pipeline stages across nodes has a planner but no data path - nothing executes such a plan. If
-the model does not fit on at least one node, the cluster cannot serve it.
+pipeline stages across nodes has a planner but no data path - nothing executes such a plan, and
+the cross-host call refuses loudly rather than returning a placeholder. If the model does not
+fit on at least one node, the cluster cannot serve it.
+
+Everything below this section describes the design, including the half that is not built. Read
+it as the shape the work is taking, not as a description of what a node does today.
 
 **One module to stay away from.** `DistributedEngine`, in `src/inference/serve/distributed_engine.rs`,
 is a scaffold: it exposes an API for distributing execution across nodes that is not implemented.

@@ -57,11 +57,46 @@ arithmetic.
   background repack finishes.
 - **Load time is your disk.** 24 GB over USB: 52 s reading, 6 s to the cards.
 
+## The cluster
+
+Two halves live in [`CLUSTER.md`](CLUSTER.md), and only one of them runs.
+
+**Replicated serving runs.** Any node is an entry point and an entry point holds nothing: a
+client talks to whichever node it knows, that node forwards the whole HTTP request to the best
+holder and relays the stream back. Membership is SWIM gossip with a phi-accrual detector,
+seeded by multicast announcement or by a `join` list. `/api/cluster/state`, `/api/cluster/peers`
+and `/api/cluster/prefix` report it. No consensus protocol: routing to a dead node costs a
+retry, not a corruption.
+
+A hand-over is priced on rates each node measures from its own completed generations, never
+from hardware nameplates - what a card could do is not what this build achieves on this model
+at this quantisation.
+
+**Sharding does not.** Pipeline parallelism across hosts, the binary data plane it needs, the
+link-cost matrix, the tiered KV, the resume path and the layer scheduler are all written and
+reached by nothing. That is not a claim from reading: `distributed::wiring_gate` records the
+state of every module in that directory and fails both when one of them is finally reached and
+when one that was reached falls silent. Cross-host layer execution refuses loudly rather than
+returning a placeholder.
+
+**One defect found, and its fix unverified at two nodes.** A node published a capacity derived
+from one generation's decode rate multiplied by its lane count, while its generations serialise
+behind the model lock. Two comparable machines therefore priced each other an order of
+magnitude apart, and the cluster handed over a few requests where it should have split the work
+roughly in half. The meter now publishes what a window of real completions produced. The second
+machine left the bench before the fix could be measured, so **the two-node gain is currently
+unmeasured** - the correction is judged by trace replay, not by a cluster.
+
+**Open.** A peer that has never answered is priced from a floor rather than from its catalogue,
+so a cold node looks worse than an idle one that holds nothing. And a replica set keyed on a
+placeholder digest - what models cached from Hugging Face carry - groups every such model into
+one set.
+
 ## Written, wired to nothing
 
-- **Layer scheduler** (`src/distributed/layer_scheduler.rs`) - one caller: itself. The
-  distributed engine builds its plan by hand. Judged over 21 placement and 119 naming cases, with
-  two perturbations proving the judge can fail.
+- **Layer scheduler** (`src/distributed/layer_scheduler.rs`) - one caller: itself, since the
+  engine that used to build a plan by hand was removed. Judged over 21 placement and 119 naming
+  cases, with two perturbations proving the judge can fail.
 - **Reserve pass** (`src/tensor/dry.rs`) - runs the forward on a device that allocates nothing,
   to replace the per-model formulas. Called from one site, in Z-Image. Every language-model
   placement is still budgeted by formula.
