@@ -33,27 +33,47 @@ pub use protocol::{DeviceInfo, LayerRequest, LayerResponse, ServerRegistration, 
 
 /// Which of these modules anything outside itself actually reaches.
 ///
-/// Seven of them are reachable only from their own tests: nothing in the serving path
+/// Nine of them are reachable only from their own tests: nothing in the serving path
 /// constructs a `LinkMatrix`, asks `cut_plan` for a plan, or opens a `WireLink`. A test suite
 /// makes a module look alive - `link_matrix` has four tests and its `derive_costs` is called
 /// by two of them, so `cost()` returns `Some` there and `None` everywhere else.
 ///
 /// They are kept rather than deleted: they are the groundwork of the cluster-routing work,
-/// not abandoned code. What they must not do is look wired. This gate names them, and fails
-/// in BOTH directions - a new module that nothing reaches, or one of these finally reached  - 
-/// so the list stays a statement about today rather than a comment that was true once.
+/// not abandoned code. What they must not do is look wired.
+///
+/// The table below states, for every module here, whether anything outside it reaches it, and
+/// the gate fails in BOTH directions: one of these finally reached, or one that was reached
+/// falling silent. The second direction is what makes the list a statement about today - a
+/// module can be orphaned by a deletion somewhere else entirely, and nothing else would say
+/// so.
 #[cfg(test)]
 mod wiring_gate {
-    /// One distinctive public name per module: generic ones (`plan`, `Tier`, `Segment`)
-    /// collide with unrelated code and would report a module as wired when it is not.
-    const REACHED_BY: [(&str, &str); 7] = [
-        ("cut_plan", "CutPlan"),
-        ("evidence", "RequestEvidence"),
-        ("kv_tiers", "TieredKv"),
-        ("link_matrix", "LinkMatrix"),
-        ("replay", "ResumePoint"),
-        ("wire_link", "WireLink"),
-        ("wire_mux", "MuxLink"),
+    /// Every module here, one distinctive public name for it, and whether the serving path
+    /// reaches it. Generic names (`plan`, `Tier`, `Segment`) collide with unrelated code and
+    /// would report a module as wired when it is not.
+    ///
+    /// One table, not two: a module that appears in neither list is the case a pair of tables
+    /// lets through.
+    const MODULES: [(&str, &str, bool); 19] = [
+        ("cluster", "distributed::cluster::", true),
+        ("cluster_runtime", "cluster_runtime::", true),
+        ("cut_plan", "CutPlan", false),
+        ("device_manager", "DeviceManager", true),
+        ("discovery", "discovery::bind_discovery", true),
+        ("evidence", "RequestEvidence", false),
+        ("kv_tiers", "TieredKv", false),
+        ("layer_scheduler", "LayerScheduler", false),
+        ("link_matrix", "LinkMatrix", false),
+        ("membership", "membership::", true),
+        ("network", "NetworkClient", false),
+        ("protocol", "protocol::", true),
+        ("rate_meter", "rate_meter::", true),
+        ("replay", "ResumePoint", false),
+        ("routing", "routing::", true),
+        ("wire", "WireFrame", false),
+        ("wire_link", "WireLink", false),
+        ("wire_mux", "MuxLink", false),
+        ("mod", "", true),
     ];
 
     fn sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
@@ -91,23 +111,49 @@ mod wiring_gate {
             files.len()
         );
 
-        let mut wired = Vec::new();
-        for (module, marker) in REACHED_BY {
+        // Every module in this directory is in the table, or the table is not about today.
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/distributed");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&here)
+            .expect("read distributed/")
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension().is_some_and(|x| x == "rs"))
+                    .then(|| p.file_stem()?.to_str().map(str::to_string))
+                    .flatten()
+            })
+            .collect();
+        on_disk.sort();
+        let mut listed: Vec<String> = MODULES.iter().map(|(m, _, _)| m.to_string()).collect();
+        listed.sort();
+        assert_eq!(on_disk, listed, "the table and the directory disagree");
+
+        let mut wrong = Vec::new();
+        for (module, marker, expected) in MODULES {
+            if marker.is_empty() {
+                continue;
+            }
             let own = format!("distributed/{module}.rs");
-            // This file is skipped too: the table below names all seven, so a gate that
-            // searched it would find every module reaching itself through its own record.
-            if files.iter().any(|(p, t)| {
+            // This file is skipped too: the table names every module, so a gate that searched
+            // it would find each one reaching itself through its own record.
+            let reached = files.iter().any(|(p, t)| {
                 !p.ends_with(&own) && !p.ends_with("distributed/mod.rs") && t.contains(marker)
-            }) {
-                wired.push(module);
+            });
+            if reached != expected {
+                wrong.push(format!(
+                    "{module}: recorded as {}, is {}",
+                    if expected { "reached" } else { "unreached" },
+                    if reached { "reached" } else { "unreached" }
+                ));
             }
         }
 
         assert!(
-            wired.is_empty(),
-            "these are recorded as reachable only from their own tests, and something now \
-             reaches them: {wired:?}. That is good news - take them off the list in this \
-             module's header and out of REACHED_BY."
+            wrong.is_empty(),
+            "the record no longer describes the code. A module that became reachable is good \
+             news - flip its flag. One that fell silent was orphaned by a change elsewhere, \
+             and is the case this direction exists for:\n{}",
+            wrong.join("\n")
         );
     }
 }
