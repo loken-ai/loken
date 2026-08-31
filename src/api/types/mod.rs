@@ -1590,12 +1590,31 @@ pub struct SwapModelResponse {
 /// Layer swap request (POST /api/layers/swap)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapLayerRequest {
-    /// Model ID to modify
+    /// Model to change. Must already be loaded: this replaces weights in place rather than
+    /// arranging for a load.
     pub model: String,
-    /// Layer indices to swap (0-based)
-    pub layer_indices: Vec<usize>,
-    /// Source model to copy layers from
-    pub source_model: String,
+    /// The adapter set the model should carry after the call. An empty list detaches
+    /// everything and returns every projection to the checkpoint.
+    ///
+    /// It is a set, not a delta: the same request always leaves the same model, whatever was
+    /// attached before, so a client does not have to track what it asked for last time.
+    #[serde(default)]
+    pub adapters: Vec<SwapAdapter>,
+}
+
+/// One adapter and how strongly to apply it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SwapAdapter {
+    /// Name resolved inside the configured adapter directory.
+    pub name: String,
+    /// Multiplies the adapter's own alpha/rank scale. 1.0 applies it as trained; 0 is a
+    /// request to disable it, and is refused rather than attached as a block of zeros.
+    #[serde(default = "one")]
+    pub strength: f32,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 // ============================================================================

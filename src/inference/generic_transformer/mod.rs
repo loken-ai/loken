@@ -342,6 +342,9 @@ pub struct GenericHeteroTransformer {
     config: Arc<GenericTransformerConfig>,
     embeddings: Embedding, // GPU 0 if table < 1 GB, else CPU
     layers: Vec<GenericTransformerLayer>,
+    /// Adapters attached after the load, in the order they were applied. Empty is the
+    /// checkpoint as it was read.
+    adapters: Vec<String>,
     layer_devs: Vec<LayerDevice>, // parallel to `layers`
     output_norm: WeightedNorm,    // CPU or CUDA - RmsNorm or LayerNorm-with-bias
     output_proj: crate::tensor::quantized::QMatMul, // CPU fallback

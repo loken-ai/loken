@@ -2551,6 +2551,7 @@ impl GenericHeteroTransformer {
         }
 
         let model = Self {
+            adapters: Vec::new(),
             config,
             embeddings,
             layers,
@@ -2821,6 +2822,7 @@ impl GenericHeteroTransformer {
 
         let sliding_window = config.sliding_window;
         Ok(Self {
+            adapters: Vec::new(),
             config,
             embeddings,
             layers,

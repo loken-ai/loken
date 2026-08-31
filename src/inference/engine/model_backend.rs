@@ -263,6 +263,25 @@ pub(crate) trait ModelBackend: Send {
     /// Trim every layer's KV cache to `new_len` valid positions. Used by
     /// speculative decoding to discard rejected draft K/V on partial
     /// acceptance. Variants without trim support no-op (session reuse no-ops).
+    /// Adapters attached to this model right now, in the order they were applied.
+    fn adapters(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Replace the attached adapter set without reloading the checkpoint. An empty list
+    /// detaches everything.
+    ///
+    /// The default refuses rather than succeeding silently: a family that cannot carry an
+    /// adapter and answers "done" would leave a caller believing its fine-tune was live.
+    fn set_adapters(
+        &mut self,
+        _wanted: &[(String, f32)],
+    ) -> crate::tensor::Result<crate::inference::load::lora::AdapterReport> {
+        Err(crate::tensor::Error(
+            "this model family cannot carry adapters".into(),
+        ))
+    }
+
     fn trim_kv(&mut self, _new_len: usize) {}
 
     /// Roll every per-layer KV cache back to `keep` valid positions, discarding
@@ -779,6 +798,17 @@ impl ModelBackend for MoondreamBackend {
 }
 
 impl ModelBackend for GenericBackend {
+    fn adapters(&self) -> Vec<String> {
+        self.0.adapters().to_vec()
+    }
+
+    fn set_adapters(
+        &mut self,
+        wanted: &[(String, f32)],
+    ) -> crate::tensor::Result<crate::inference::load::lora::AdapterReport> {
+        self.0.set_adapters(wanted)
+    }
+
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
         self.0.forward(x, index_pos)
     }

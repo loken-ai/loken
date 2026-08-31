@@ -46,6 +46,116 @@ impl GenericHeteroTransformer {
         &self.layers
     }
 
+    /// Adapter names live on the model right now, in the order they were applied.
+    pub fn adapters(&self) -> &[String] {
+        &self.adapters
+    }
+
+    /// Replace the attached adapter set, in place, without reloading the checkpoint.
+    ///
+    /// An empty list detaches everything and returns every projection to the file it was read
+    /// from. Mutation stays inside this type on purpose: `layers` hands out shared references
+    /// so that no caller can reorder the layers or swap a cache from under the plan that
+    /// placed them, and an adapter walk needs none of that.
+    ///
+    /// Applied all-or-nothing. A file that resolves but matches nothing leaves the model on
+    /// its base weights and says so, because an adapter on some projections and not others is
+    /// worse than one that did not apply.
+    pub fn set_adapters(&mut self, wanted: &[(String, f32)]) -> Result<crate::inference::load::lora::AdapterReport> {
+        use crate::inference::load::lora::{transformer_keys, AdapterReport, LoraFile};
+        use crate::tensor::Error;
+
+        for layer in self.layers.iter_mut() {
+            for p in [
+                layer.attn_q.as_mut(),
+                layer.attn_k.as_mut(),
+                layer.attn_v.as_mut(),
+                layer.attn_qkv.as_mut(),
+                layer.ffn_gate.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                p.clear_lora();
+            }
+            layer.attn_output.clear_lora();
+            layer.ffn_up.clear_lora();
+            layer.ffn_down.clear_lora();
+        }
+        self.adapters.clear();
+        if wanted.is_empty() {
+            return Ok(AdapterReport::default());
+        }
+
+        // Read on the host, then move each delta to the card its projection sits on: a split
+        // model holds layer 0 and layer 30 on different devices.
+        let mut files = Vec::with_capacity(wanted.len());
+        for (name, strength) in wanted {
+            let path = crate::inference::load::lora::resolve(name).map_err(Error)?;
+            let file = LoraFile::load(&path.to_string_lossy(), &Device::Cpu)?;
+            if file.is_empty() {
+                return Err(Error(format!("adapter {name} holds no usable pair")));
+            }
+            files.push((name.clone(), *strength, file));
+        }
+
+        let mut report = AdapterReport::default();
+        let mut matched_entries = 0usize;
+        for (name, strength, file) in &files {
+            let mut hits = 0usize;
+            for (i, layer) in self.layers.iter_mut().enumerate() {
+                // Fused QKV is deliberately absent: an adapter names q, k and v separately and
+                // splitting a fused weight to take them is a different piece of work.
+                let sites: [(&str, Option<&mut super::projection::QMatMul>); 7] = [
+                    ("self_attn.q_proj", layer.attn_q.as_mut()),
+                    ("self_attn.k_proj", layer.attn_k.as_mut()),
+                    ("self_attn.v_proj", layer.attn_v.as_mut()),
+                    ("self_attn.o_proj", Some(&mut layer.attn_output)),
+                    ("mlp.gate_proj", layer.ffn_gate.as_mut()),
+                    ("mlp.up_proj", Some(&mut layer.ffn_up)),
+                    ("mlp.down_proj", Some(&mut layer.ffn_down)),
+                ];
+                for (projection, slot) in sites {
+                    let Some(weight) = slot else { continue };
+                    let mut delta = None;
+                    for key in transformer_keys(i, projection) {
+                        if let Some(d) = file.delta_for_key(&key, *strength)? {
+                            delta = Some(d);
+                            break;
+                        }
+                    }
+                    let Some(delta) = delta else { continue };
+                    let device = weight.device();
+                    let moved = crate::tensor::lora::LoraDelta {
+                        down: delta.down.to_device(&device)?,
+                        up: delta.up.to_device(&device)?,
+                        scale: delta.scale,
+                    };
+                    weight.add_lora(moved)?;
+                    hits += 1;
+                }
+            }
+            if hits == 0 {
+                let held = self.adapters.clone();
+                self.set_adapters(&[])?;
+                let _ = held;
+                return Err(Error(format!(
+                    "adapter {name} matched no projection on this checkpoint"
+                )));
+            }
+            matched_entries += hits;
+            report.attached.push(name.clone());
+            self.adapters.push(name.clone());
+        }
+        report.projections = matched_entries;
+        report.unmatched = files
+            .iter()
+            .map(|(_, _, f)| f.entry_count())
+            .sum::<usize>()
+            .saturating_sub(matched_entries);
+        Ok(report)
+    }
+
     /// Build a [seq_q, seq_kv] causal mask where row `i` represents token
     /// at absolute position `index_pos + i` and column `j` represents KV
     /// position `j` (which spans the full history including the new

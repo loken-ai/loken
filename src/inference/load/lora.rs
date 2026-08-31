@@ -550,3 +550,68 @@ mod consistency_tests {
         );
     }
 }
+
+/// What attaching a set of adapters did.
+///
+/// `skipped` is not a detail: an adapter trained for a projection this checkpoint fuses, or
+/// for a layer count it does not have, matches nothing - and a caller told only "attached"
+/// would believe it took effect.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AdapterReport {
+    /// Adapter names now live on the model, in the order they were applied.
+    pub attached: Vec<String>,
+    /// Projections that took a delta.
+    pub projections: usize,
+    /// Entries in the files that matched no projection.
+    pub unmatched: usize,
+}
+
+/// The names a PEFT adapter may use for one projection of one transformer layer.
+///
+/// Three prefixes are in circulation for the same tensor: PEFT wraps the model twice when it
+/// saves from a `PeftModel`, once when it saves from the inner model, and a hand-written
+/// adapter often carries neither. Trying all three is cheaper than making a user rename their
+/// file, and they cannot collide - each is a strict prefix of a full key.
+pub fn transformer_keys(layer: usize, projection: &str) -> [String; 3] {
+    [
+        format!("base_model.model.model.layers.{layer}.{projection}"),
+        format!("base_model.model.layers.{layer}.{projection}"),
+        format!("model.layers.{layer}.{projection}"),
+    ]
+}
+
+/// How many entries a file holds, for reporting what matched nothing.
+impl LoraFile {
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod transformer_key_tests {
+    use super::transformer_keys;
+
+    /// The three prefixes PEFT writes for the same tensor, exactly. A typo here means an
+    /// adapter loads, matches nothing, and is reported as attached to zero projections - which
+    /// reads to a user as "my fine-tune does nothing".
+    #[test]
+    fn the_three_prefixes_are_what_peft_writes() {
+        let keys = transformer_keys(7, "self_attn.q_proj");
+        assert_eq!(keys[0], "base_model.model.model.layers.7.self_attn.q_proj");
+        assert_eq!(keys[1], "base_model.model.layers.7.self_attn.q_proj");
+        assert_eq!(keys[2], "model.layers.7.self_attn.q_proj");
+    }
+
+    /// Two layers never produce the same key, or an adapter for layer 1 would land on layer 11.
+    #[test]
+    fn no_two_layers_share_a_key() {
+        let mut seen = std::collections::HashSet::new();
+        for layer in 0..64 {
+            for p in ["self_attn.q_proj", "mlp.down_proj"] {
+                for key in transformer_keys(layer, p) {
+                    assert!(seen.insert(key.clone()), "{key} produced twice");
+                }
+            }
+        }
+    }
+}

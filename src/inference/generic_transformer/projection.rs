@@ -644,6 +644,19 @@ impl QMatMul {
         }
     }
 
+    /// The device this weight sits on.
+    ///
+    /// A model split across cards holds each layer on its own, so an adapter has to be moved
+    /// to the weight it corrects before it can be attached to it.
+    pub fn device(&self) -> Device {
+        match &self.inner {
+            QMatMulKind::Gguf(crate::tensor::quantized::QMatMul::QTensor(t)) => t.device().clone(),
+            QMatMulKind::Gguf(crate::tensor::quantized::QMatMul::Tensor(t)) => t.device().clone(),
+            QMatMulKind::Awq(w) => w.qweight.device().clone(),
+            _ => Device::Cpu,
+        }
+    }
+
     /// Borrow the underlying QTensor if this matmul stores its weight as
     /// quantized GGUF data. Returns None for AWQ or dequantized weights.
     pub fn qtensor(&self) -> Option<&std::sync::Arc<crate::tensor::quantized::QTensor>> {

@@ -473,6 +473,35 @@ impl LlmEngine {
     }
 
     /// Get the last error message from model loading
+    /// Adapters attached to the loaded model, or nothing when none is loaded.
+    pub async fn adapters(&self) -> Vec<String> {
+        let guard = self.model_state.lock().await;
+        guard.as_ref().map(|s| s.model.adapters()).unwrap_or_default()
+    }
+
+    /// Replace the attached adapter set on the loaded model. Empty detaches everything.
+    ///
+    /// Runs on a blocking thread and holds the model lock, which is the same lock a generate
+    /// takes: a swap therefore waits for the token in flight instead of rewriting weights
+    /// under it. Sessions are dropped, because a KV cache holds the answers of the weights
+    /// that produced it and keeping it would mix two models in one conversation.
+    pub async fn set_adapters(
+        &self,
+        wanted: &[(String, f32)],
+    ) -> Result<crate::inference::load::lora::AdapterReport, String> {
+        let model_state = self.model_state.clone();
+        let wanted: Vec<(String, f32)> = wanted.to_vec();
+        let report = tokio::task::spawn_blocking(move || {
+            let mut guard = model_state.blocking_lock();
+            let state = guard.as_mut().ok_or_else(|| "no model loaded".to_string())?;
+            state.model.set_adapters(&wanted).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        self.sessions.lock().await.clear();
+        Ok(report)
+    }
+
     /// How many sessions hold a KV cache on this engine right now.
     ///
     /// What "busy" means for a node: a session is a conversation whose prefix is resident, so

@@ -596,19 +596,36 @@ pub(crate) async fn distributed_stats(
 pub(crate) async fn recommended_model(
     State(state): State<APIServer>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut free_bytes = 0u64;
+    let (mut free_bytes, mut total_bytes) = (0u64, 0u64);
     if let Some(gm) = state.gpu_manager.as_ref() {
         for d in gm.get_devices() {
             if let Ok(info) = d.memory_info() {
                 free_bytes += info.free;
+                total_bytes += info.total;
             }
         }
     }
 
-    // Every load pays a fixed overhead that no formula predicts from the weights - CUDA
-    // contexts, the cuBLAS workspace, preloaded module images. Advising up to the last free
-    // byte would recommend a model that cannot be loaded.
-    let budget = free_bytes.saturating_sub(crate::inference::place::runtime_demand::FIXED_LOAD_OVERHEAD_BYTES);
+    // Every load pays an overhead no formula predicts from the weights - CUDA contexts, the
+    // cuBLAS workspace, preloaded module images - and advising up to the last free byte would
+    // recommend a model that cannot be loaded.
+    //
+    // It is measured rather than written down: what the cards hold, less the weights of what
+    // is resident, is what this machine is paying for its loads right now. With nothing
+    // loaded there is nothing to measure, and the answer says so instead of charging a number
+    // from another machine.
+    let engines = state.engines.read().await;
+    let mut resident_weights = 0u64;
+    for entry in engines.iter() {
+        resident_weights += entry.engine.get_model_size().await;
+    }
+    let resident_count = engines.len();
+    drop(engines);
+
+    let overhead = (resident_count > 0)
+        .then(|| total_bytes.saturating_sub(free_bytes).saturating_sub(resident_weights))
+        .map(|paid| paid / resident_count as u64);
+    let budget = free_bytes.saturating_sub(overhead.unwrap_or(0));
 
     let catalogue = state
         .model_manager
@@ -627,8 +644,10 @@ pub(crate) async fn recommended_model(
         })),
         "fits_now": fits,
         "catalogue": catalogue.len(),
-        // Named rather than left to be inferred from the gap between the two figures.
-        "reserved_per_load_bytes": crate::inference::place::runtime_demand::FIXED_LOAD_OVERHEAD_BYTES,
+        // Named rather than left to be inferred from the gap between the two figures, and
+        // null rather than zero when no load has happened for it to be measured on.
+        "measured_load_overhead_bytes": overhead,
+        "measured_over_loads": resident_count,
     })))
 }
 
@@ -760,36 +779,57 @@ pub(crate) async fn swap_model_handler(
     }
 }
 
-/// Swap layers handler (POST /api/layers/swap)
+/// Attach or detach adapters on a loaded model, without reloading it (POST /api/layers/swap).
 ///
-/// Not yet implemented - returns 501. Real implementation would
-/// require extending the LayerExecutor trait for weight replacement,
-/// MultiDeviceWrapper per-layer swap methods, and LoRA/adapter
-/// loading + merging. Returning 200 OK with `status: "not_implemented"`
-/// in the body misleads clients that branch on HTTP status - most
-/// SDKs treat 2xx as success and ship code that proceeds as if
-/// the swap landed.
+/// The body carries the set the model should end up with, so the same request always leaves
+/// the same model however many times it is sent.
+///
+/// It waits for the token in flight: the swap takes the model lock a generate holds, rather
+/// than rewriting weights under a running decode. Sessions are dropped by the swap - a KV
+/// cache holds the answers of the weights that filled it.
 pub(crate) async fn swap_layers_handler(
-    State(_state): State<APIServer>,
+    State(state): State<APIServer>,
     Json(request): Json<SwapLayerRequest>,
 ) -> Result<Response, ApiError> {
-    info!(
-        "Layer swap request (not implemented): model={}, layers={:?}, source={}",
-        request.model, request.layer_indices, request.source_model
-    );
-    // Validate inputs even though we'll 501 - keeps the security
-    // screen consistent across surfaces (path traversal, empty model).
     validate_model_id(&request.model)?;
-    validate_model_id(&request.source_model)?;
+    for adapter in &request.adapters {
+        // Adapter names index a directory, so they go through the same screen as a model id.
+        validate_model_id(&adapter.name)?;
+    }
 
-    let body = Json(serde_json::json!({
-        "error": {
-            "message": "layer swapping is not implemented; would enable hot-swap of LoRA adapters / fine-tuned layers without model reload",
-            "type": "not_implemented",
-            "code": "feature_unavailable",
-        }
-    }));
-    Ok((StatusCode::NOT_IMPLEMENTED, body).into_response())
+    let engines = state.engines.read().await;
+    let Some(entry) = engines.iter().find(|e| e.model_id == request.model) else {
+        return Err(ApiError::NotFound(format!(
+            "{} is not loaded; adapters attach to a resident model",
+            request.model
+        )));
+    };
+    let engine = entry.engine.clone();
+    drop(engines);
+
+    let wanted: Vec<(String, f32)> = request
+        .adapters
+        .iter()
+        .map(|a| (a.name.clone(), a.strength))
+        .collect();
+
+    info!(
+        "adapter swap on {}: {} requested",
+        request.model,
+        wanted.len()
+    );
+    let report = engine
+        .set_adapters(&wanted)
+        .await
+        .map_err(ApiError::Validation)?;
+
+    Ok(Json(serde_json::json!({
+        "model": request.model,
+        "attached": report.attached,
+        "projections_adapted": report.projections,
+        "entries_unmatched": report.unmatched,
+    }))
+    .into_response())
 }
 
 #[cfg(test)]
