@@ -184,7 +184,58 @@ if __name__ == "__main__":
         print("WARNING - the table mixes %d builds of the engine:" % len(builds), file=sys.stderr)
         for b, names in sorted(builds.items(), key=lambda x: (x[0] is None, x[0])):
             print("  build %s : %d cells (%s...)" % (b, len(names), names[0]), file=sys.stderr)
-    p = pathlib.Path(md); s = p.read_text()
-    head = s[:s.index("| Model")]
-    p.write_text(head + table(cells(load_all(res))) + "\n")
-    print(table(cells(load_all(res))))
+    # Rows go back into the sections they came from.
+    #
+    # This used to keep everything before the first "| Model" and replace the rest with one
+    # flat table, which erased the per-architecture split and left nineteen of the twenty
+    # figures pointing at nothing - once per measured cell, silently, for a whole campaign.
+    #
+    # Membership is read from the document rather than from a table kept here: which model
+    # belongs to which family is already written, once, in the file being rewritten.
+    p = pathlib.Path(md)
+    doc = p.read_text()
+    all_rows = cells(load_all(res))
+
+    lines = doc.splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("### ")]
+    if not starts:
+        # No sections: the flat form, kept working rather than turned into an error.
+        head = doc[:doc.index("| Model")]
+        p.write_text(head + table(all_rows) + "\n")
+        print(table(all_rows))
+        raise SystemExit(0)
+
+    bounds = starts + [len(lines)]
+    preamble = "\n".join(lines[:starts[0]])
+    placed, out = set(), [preamble]
+    for a, b in zip(starts, bounds[1:]):
+        block = lines[a:b]
+        # Everything down to the header row is the section's own: its title, its prose, its
+        # figure. Only the rows are regenerated.
+        keep = []
+        models = []
+        for ln in block:
+            if ln.startswith("| Model") or ln.startswith("|---"):
+                continue
+            if ln.startswith("| "):
+                models.append(ln.split("|")[1].strip())
+                continue
+            keep.append(ln)
+        while keep and not keep[-1].strip():
+            keep.pop()
+        mine = [r for r in all_rows if r[0].strip() in set(models)]
+        placed.update(r[0].strip() for r in mine)
+        out.append("\n".join(keep) + "\n\n" + table(mine))
+
+    orphans = [r for r in all_rows if r[0].strip() not in placed]
+    if orphans:
+        # Named and shown rather than dropped: a model measured into no section would
+        # otherwise vanish from the report while its result file sat in results/.
+        names = sorted({r[0].strip() for r in orphans})
+        print("WARNING - %d model(s) belong to no section, filed at the end: %s"
+              % (len(names), ", ".join(names)), file=sys.stderr)
+        out.append("### unfiled\n\nMeasured, and not yet placed in a family section.\n\n"
+                   + table(orphans))
+
+    p.write_text("\n\n".join(out) + "\n")
+    print(table(all_rows))
