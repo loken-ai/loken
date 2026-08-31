@@ -58,6 +58,17 @@ pub struct MeasuredReserve {
     pub reference_tokens: usize,
 }
 
+/// What a load costs on a card before a single weight lands on it.
+///
+/// CUDA contexts, the cuBLAS workspace and the preloaded module images. Measured at 893 and
+/// 867 MiB on two models differing twofold in weights, so it is fixed rather than
+/// proportional - which is why it is a plain number here and not a [`MeasuredReserve`], whose
+/// whole purpose is to scale.
+///
+/// The placement planner does not charge it yet; anything that answers "would this fit" must,
+/// or it advises loading a model that cannot be loaded.
+pub const FIXED_LOAD_OVERHEAD_BYTES: u64 = 896 << 20;
+
 /// Scale a measured reserve to the request in front of us.
 ///
 /// Linear in tokens: the scratch is dominated by token-major buffers, whose size is

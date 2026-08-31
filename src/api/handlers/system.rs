@@ -2,7 +2,6 @@
 //! config, layer perf, inflight status and speculative-draft attach.
 
 use super::*;
-use crate::inference::serve::distributed_engine::DistributedEngine;
 
 pub(crate) async fn health_check(
     state: axum::extract::State<APIServer>,
@@ -529,51 +528,121 @@ pub(crate) async fn cluster_peers(
     })))
 }
 
-/// Get distributed inference statistics
+/// What this node has to execute with, and what is running on it.
+///
+/// Read from the state the server already holds. It used to build a `DistributedEngine` and
+/// run device detection per request, which probes every card on an HTTP call - and two of the
+/// four numbers it returned came from that throwaway engine, so `active_sessions` and
+/// `remote_servers` were always zero however busy the node was.
 pub(crate) async fn distributed_stats(
-    State(_state): State<APIServer>,
+    State(state): State<APIServer>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    info!("Getting distributed stats");
+    let mut devices = 0usize;
+    let mut total_bytes = 0u64;
+    let mut free_bytes = 0u64;
+    if let Some(gm) = state.gpu_manager.as_ref() {
+        for d in gm.get_devices() {
+            devices += 1;
+            if let Ok(info) = d.memory_info() {
+                total_bytes += info.total;
+                free_bytes += info.free;
+            }
+        }
+    }
 
-    // Create a temporary distributed engine
-    let mut engine = DistributedEngine::new();
-    engine
-        .initialize()
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to initialize engine: {}", e)))?;
+    let engines = state.engines.read().await;
+    let mut resident = Vec::with_capacity(engines.len());
+    let mut sessions = 0usize;
+    for entry in engines.iter() {
+        let live = entry.engine.session_count().await;
+        sessions += live;
+        resident.push(serde_json::json!({
+            "model": entry.model_id,
+            "sessions": live,
+        }));
+    }
+    drop(engines);
 
-    let stats = engine.get_stats().await;
-    let memory = engine.memory_summary().await;
+    // Peers, from the membership the node already maintains. A cluster of one reports zero
+    // rather than counting itself: the question is who else could take work.
+    let (peers_alive, peers_known) = match state.cluster_handle() {
+        Some(cluster) => {
+            let now = crate::distributed::cluster_runtime::now_ms(state.cluster_started());
+            let view = cluster.peer_view(now);
+            let known = view.iter().filter(|p| !p.is_self).count();
+            let alive = view.iter().filter(|p| !p.is_self && p.alive).count();
+            (alive, known)
+        }
+        None => (0, 0),
+    };
 
     Ok(Json(serde_json::json!({
-        "total_devices": stats.total_devices,
-        "total_memory_gb": stats.total_memory_gb,
-        "active_sessions": stats.active_sessions,
-        "remote_servers": stats.remote_servers,
-        "memory_summary": memory
+        "total_devices": devices,
+        "total_memory_gb": total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        "free_memory_gb": free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        "active_sessions": sessions,
+        "loaded_models": resident,
+        "peers_alive": peers_alive,
+        "peers_known": peers_known,
+        "clustered": state.cluster_handle().is_some(),
     })))
 }
 
-/// Get recommended model size for current hardware
+/// The largest model on this machine that would fit in what is free right now.
+///
+/// Answered from the catalogue rather than from a ladder of sizes. A table mapping "80 GB or
+/// more" to the string "70B" advises about models the machine may not hold and cannot account
+/// for quantisation, which is most of what decides whether a checkpoint fits.
 pub(crate) async fn recommended_model(
-    State(_state): State<APIServer>,
+    State(state): State<APIServer>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    info!("Getting recommended model size");
+    let mut free_bytes = 0u64;
+    if let Some(gm) = state.gpu_manager.as_ref() {
+        for d in gm.get_devices() {
+            if let Ok(info) = d.memory_info() {
+                free_bytes += info.free;
+            }
+        }
+    }
 
-    // Create a temporary distributed engine
-    let mut engine = DistributedEngine::new();
-    engine
-        .initialize()
+    // Every load pays a fixed overhead that no formula predicts from the weights - CUDA
+    // contexts, the cuBLAS workspace, preloaded module images. Advising up to the last free
+    // byte would recommend a model that cannot be loaded.
+    let budget = free_bytes.saturating_sub(crate::inference::place::runtime_demand::FIXED_LOAD_OVERHEAD_BYTES);
+
+    let catalogue = state
+        .model_manager
+        .list_models()
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to initialize engine: {}", e)))?;
-
-    let recommended = engine.recommended_model_size().await;
-    let memory = engine.memory_summary().await;
+        .map_err(|e| ApiError::Internal(format!("listing models: {e}")))?;
+    let sized: Vec<(String, u64)> = catalogue.iter().map(|m| (m.id.clone(), m.size)).collect();
+    let (best, fits) = largest_that_fits(&sized, budget);
 
     Ok(Json(serde_json::json!({
-        "recommended_model_size": recommended,
-        "memory_summary": memory
+        "free_memory_gb": free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        "budget_gb": budget as f64 / (1024.0 * 1024.0 * 1024.0),
+        "recommended": best.map(|(id, size)| serde_json::json!({
+            "model": id,
+            "size_gb": *size as f64 / (1024.0 * 1024.0 * 1024.0),
+        })),
+        "fits_now": fits,
+        "catalogue": catalogue.len(),
+        // Named rather than left to be inferred from the gap between the two figures.
+        "reserved_per_load_bytes": crate::inference::place::runtime_demand::FIXED_LOAD_OVERHEAD_BYTES,
     })))
+}
+
+/// The biggest entry that fits a budget, and how many do.
+///
+/// Ties go to the name that sorts first, so two builds of one machine answer the same thing;
+/// a catalogue walk in directory order would not.
+fn largest_that_fits(catalogue: &[(String, u64)], budget: u64) -> (Option<&(String, u64)>, usize) {
+    let fits: Vec<&(String, u64)> = catalogue.iter().filter(|(_, size)| *size <= budget).collect();
+    let best = fits
+        .iter()
+        .copied()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)));
+    (best, fits.len())
 }
 
 // ============================================================================
@@ -849,4 +918,43 @@ pub(crate) async fn cluster_prefix(
         .unwrap_or_default();
     let cached = state.cached_prompt_tokens(model, prompt).await.unwrap_or(0);
     Ok(Json(serde_json::json!({ "cached_tokens": cached })))
+}
+
+#[cfg(test)]
+mod recommendation_tests {
+    use super::largest_that_fits;
+
+    fn catalogue() -> Vec<(String, u64)> {
+        vec![
+            ("small:1b".to_string(), 1 << 30),
+            ("mid:8b".to_string(), 5 << 30),
+            ("big:70b".to_string(), 40 << 30),
+        ]
+    }
+
+    /// The largest that fits, not the largest there is.
+    #[test]
+    fn the_recommendation_is_bounded_by_the_budget() {
+        let c = catalogue();
+        let (best, fits) = largest_that_fits(&c, 6 << 30);
+        assert_eq!(best.map(|(id, _)| id.as_str()), Some("mid:8b"));
+        assert_eq!(fits, 2);
+    }
+
+    /// A machine with nothing free recommends nothing, rather than the smallest thing on disk.
+    #[test]
+    fn nothing_fits_is_an_answer() {
+        let c = catalogue();
+        let (best, fits) = largest_that_fits(&c, 0);
+        assert!(best.is_none());
+        assert_eq!(fits, 0);
+    }
+
+    /// Two entries of one size resolve the same way every time.
+    #[test]
+    fn a_tie_is_broken_by_name() {
+        let c = vec![("b:1".to_string(), 1 << 30), ("a:1".to_string(), 1 << 30)];
+        let (best, _) = largest_that_fits(&c, 2 << 30);
+        assert_eq!(best.map(|(id, _)| id.as_str()), Some("a:1"));
+    }
 }

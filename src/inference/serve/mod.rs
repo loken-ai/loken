@@ -8,7 +8,6 @@ pub mod batched_forward;
 pub mod cancel;
 pub mod continuous_batch;
 pub mod continuous_serve;
-pub mod distributed_engine;
 pub mod eagle;
 pub mod pipeline;
 pub mod progress;

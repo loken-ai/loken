@@ -473,6 +473,14 @@ impl LlmEngine {
     }
 
     /// Get the last error message from model loading
+    /// How many sessions hold a KV cache on this engine right now.
+    ///
+    /// What "busy" means for a node: a session is a conversation whose prefix is resident, so
+    /// this is the state a router would lose by sending the next turn elsewhere.
+    pub async fn session_count(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
     pub async fn get_last_error(&self) -> Option<String> {
         let err = self.last_error.lock().await;
         err.clone()
