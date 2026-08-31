@@ -12,7 +12,7 @@
 
 use crate::tensor::quantized::QTensor;
 use crate::tensor::Module;
-use crate::tensor::{DType, Device, Result, Tensor};
+use crate::tensor::{DType, Device, Error, Result, Tensor};
 
 /// Slot type for the Marlin W4A16 layer. Arc'd so `Clone` shares the
 /// device-resident repacked weights; a unit stub keeps the field (and the
@@ -402,6 +402,10 @@ enum QMatMulKind {
 #[derive(Debug, Clone)]
 pub struct QMatMul {
     inner: QMatMulKind,
+    /// Adapters attached after the checkpoint was read, and their fusion into one pair.
+    /// Empty is the weight exactly as the file wrote it.
+    lora: Vec<crate::tensor::lora::LoraDelta>,
+    lora_fused: Option<(Tensor, Tensor)>,
 }
 
 impl QMatMul {
@@ -409,6 +413,8 @@ impl QMatMul {
         let inner = crate::tensor::quantized::QMatMul::from_qtensor(qtensor)?;
         Ok(Self {
             inner: QMatMulKind::Gguf(inner),
+            lora: Vec::new(),
+            lora_fused: None,
         })
     }
 
@@ -493,6 +499,8 @@ impl QMatMul {
         }
         Self {
             inner: QMatMulKind::Awq(std::sync::Arc::new(w)),
+            lora: Vec::new(),
+            lora_fused: None,
         }
     }
 
@@ -500,6 +508,12 @@ impl QMatMul {
     /// QMatMul's slice path. `Ok(false)` for AWQ / unsupported -> caller falls
     /// back to the Tensor `forward`.
     pub fn forward_slice_cpu(&self, x: &[f32], out: &mut [f32]) -> Result<bool> {
+        // An attached adapter is not part of the quantised weight, so this path cannot
+        // produce it. Declining sends the caller to `forward`, which applies it; running
+        // here would return the base weight's answer and call it the adapted one.
+        if self.lora_fused.is_some() {
+            return Ok(false);
+        }
         match &self.inner {
             QMatMulKind::Gguf(inner) => inner.forward_slice_cpu(x, out),
             _ => Ok(false),
@@ -519,6 +533,9 @@ impl QMatMul {
     ) -> Result<bool> {
         let mut inners = Vec::with_capacity(mats.len());
         for m in mats {
+            if m.lora_fused.is_some() {
+                return Ok(false);
+            }
             match &m.inner {
                 QMatMulKind::Gguf(inner) => inners.push(inner),
                 _ => return Ok(false),
@@ -530,6 +547,11 @@ impl QMatMul {
     /// Raw CPU quantized weight `(dtype, k, n, bytes)` for fused multi-projection
     /// regions (same gate as `forward_slice_cpu`). `None` off the CPU fast path.
     pub fn cpu_raw(&self) -> Option<(crate::tensor::quantized::GgmlDType, usize, usize, &[u8])> {
+        // Same reason as the slice path: a caller reading the raw weight would compute
+        // without the adapter and never know it was there.
+        if self.lora_fused.is_some() {
+            return None;
+        }
         match &self.inner {
             QMatMulKind::Gguf(inner) => inner.cpu_raw(),
             _ => None,
@@ -544,8 +566,69 @@ impl QMatMul {
         }
     }
 
-    #[inline(always)]
+    /// The projection, plus any adapter attached to it.
+    ///
+    /// Wrapping the base rather than editing it: the quantised forward has several return
+    /// paths - a CPU k-quant one and more than one CUDA kernel - and adding the delta at each
+    /// is how a family silently ends up without its adapter.
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let base = self.forward_base(xs)?;
+        let Some((down, up)) = &self.lora_fused else {
+            return Ok(base);
+        };
+        let xdims = xs.dims().to_vec();
+        let k = *xdims
+            .last()
+            .ok_or_else(|| Error("lora: rank-0 input".into()))?;
+        let rows = xs.elem_count() / k;
+        // The adapters are dense f32 while the activation may be a half carrier, so the
+        // conversion happens for THIS term only - the quantised path is untouched.
+        let xf = xs
+            .to_dtype(crate::tensor::DType::F32)?
+            .reshape(vec![1, rows, k])?;
+        let acc = xf.matmul(down)?.matmul(up)?;
+        let mut odims = xdims;
+        *odims.last_mut().unwrap() = up.dims()[2];
+        base.add(&acc.reshape(odims)?.to_dtype(base.dtype())?)
+    }
+
+    /// Attach a low-rank correction on top of this projection.
+    ///
+    /// `down` is `[in, r]` and `up` is `[r, out]`. The shapes are checked against each other
+    /// and, where the weight can say what it is, against the weight.
+    pub fn add_lora(&mut self, delta: crate::tensor::lora::LoraDelta) -> Result<()> {
+        let (din, r) = delta.down.shape().dims2()?;
+        let (r2, dout) = delta.up.shape().dims2()?;
+        if r != r2 {
+            return Err(Error(format!("lora: down rank {r} against up rank {r2}")));
+        }
+        let n = self.out_dim();
+        if n != 0 && dout != n {
+            return Err(Error(format!(
+                "lora: up projects to {dout} on a weight producing {n}"
+            )));
+        }
+        self.lora.push(delta);
+        self.lora_fused = crate::tensor::lora::fuse_loras(&self.lora, din, dout);
+        if self.lora_fused.is_none() {
+            self.lora.clear();
+            return Err(Error("lora: adapters did not fuse".into()));
+        }
+        Ok(())
+    }
+
+    /// Drop every attached adapter, returning this projection to the checkpoint.
+    pub fn clear_lora(&mut self) {
+        self.lora.clear();
+        self.lora_fused = None;
+    }
+
+    pub fn lora_count(&self) -> usize {
+        self.lora.len()
+    }
+
+    #[inline(always)]
+    fn forward_base(&self, xs: &Tensor) -> Result<Tensor> {
         match &self.inner {
             // Q4_K IMMA M=8 fast path was wired here briefly - REVERTED (5x slower
             // for typical QKV/out_proj shapes; the per-call quantize + extra launch
@@ -716,5 +799,125 @@ mod marlin_parity {
             eprintln!("K={k} N={n}, {rows} rows: the INT4 GEMM agrees with the host");
         }
         }
+    }
+}
+
+#[cfg(test)]
+mod lora_tests {
+    use super::*;
+    use crate::tensor::lora::LoraDelta;
+    use crate::tensor::quantized::{GgmlDType, QTensor};
+
+    fn weight(k: usize, n: usize) -> QMatMul {
+        let w = Tensor::from_vec_f32(
+            (0..n * k).map(|i| ((i % 17) as f32 - 8.0) / 16.0).collect(),
+            vec![n, k],
+        )
+        .expect("weight");
+        let q = QTensor::quantize(&w, GgmlDType::Q8_0).expect("quantize");
+        QMatMul::from_qtensor(q).expect("matmul")
+    }
+
+    /// An attached adapter changes the answer, and dropping it restores the checkpoint's
+    /// exactly. Without the second half a no-op attach would pass the first.
+    #[test]
+    fn an_adapter_changes_the_answer_and_detaching_restores_it() {
+        let (k, n, r) = (64usize, 32usize, 4usize);
+        let mut w = weight(k, n);
+        let x = Tensor::from_vec_f32(
+            (0..2 * k).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect(),
+            vec![2, k],
+        )
+        .expect("x");
+        let base = w.forward(&x).expect("base").to_vec_f32();
+
+        w.add_lora(LoraDelta {
+            down: Tensor::from_vec_f32((0..k * r).map(|i| ((i % 5) as f32 - 2.0) / 10.0).collect(), vec![k, r])
+                .expect("down"),
+            up: Tensor::from_vec_f32((0..r * n).map(|i| ((i % 3) as f32 - 1.0) / 10.0).collect(), vec![r, n])
+                .expect("up"),
+            scale: 1.0,
+        })
+        .expect("attach");
+        assert_eq!(w.lora_count(), 1);
+        let adapted = w.forward(&x).expect("adapted").to_vec_f32();
+        let moved = base
+            .iter()
+            .zip(&adapted)
+            .filter(|(b, a)| (*b - *a).abs() > 1e-6)
+            .count();
+        assert!(moved > 0, "the adapter changed nothing");
+
+        w.clear_lora();
+        assert_eq!(w.lora_count(), 0);
+        let restored = w.forward(&x).expect("restored").to_vec_f32();
+        for (b, r) in base.iter().zip(&restored) {
+            assert_eq!(b, r, "detaching must return the checkpoint's own answer");
+        }
+    }
+
+    /// An adapter at strength zero is a request to disable it, and must leave the weight
+    /// bit-identical rather than adding a zero block.
+    #[test]
+    fn an_adapter_at_zero_strength_is_not_applied() {
+        let (k, n, r) = (32usize, 16usize, 2usize);
+        let mut w = weight(k, n);
+        let x = Tensor::from_vec_f32(
+            (0..1 * k).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect(),
+            vec![1, k],
+        )
+        .expect("x");
+        let base = w.forward(&x).expect("base").to_vec_f32();
+        let err = w
+            .add_lora(LoraDelta {
+                down: Tensor::from_vec_f32((0..k * r).map(|i| ((i % 5) as f32 - 2.0) / 10.0).collect(), vec![k, r])
+                .expect("down"),
+                up: Tensor::from_vec_f32((0..r * n).map(|i| ((i % 3) as f32 - 1.0) / 10.0).collect(), vec![r, n])
+                .expect("up"),
+                scale: 0.0,
+            })
+            .is_err();
+        assert!(err, "nothing live to fuse is refused rather than half-applied");
+        for (b, a) in base.iter().zip(&w.forward(&x).expect("after").to_vec_f32()) {
+            assert_eq!(b, a);
+        }
+    }
+
+    /// A shape that cannot belong to this projection is refused, rather than fused into
+    /// something that would fail much later inside a matmul.
+    #[test]
+    fn a_delta_of_the_wrong_shape_is_refused() {
+        let mut w = weight(64, 32);
+        let bad = w.add_lora(LoraDelta {
+            down: Tensor::from_vec_f32(vec![0.1; 64 * 4], vec![64, 4]).expect("down"),
+            up: Tensor::from_vec_f32(vec![0.1; 4 * 48], vec![4, 48]).expect("up"),
+            scale: 1.0,
+        });
+        assert!(bad.is_err(), "48 outputs on a 32-output weight was accepted");
+        assert_eq!(w.lora_count(), 0);
+    }
+
+    /// The zero-allocation CPU decode path cannot see an adapter, so it must decline once one
+    /// is attached. Returning its answer would silently be the base weight's.
+    #[test]
+    fn the_slice_path_declines_once_an_adapter_is_attached() {
+        let (k, n, r) = (64usize, 32usize, 4usize);
+        let mut w = weight(k, n);
+        let x = vec![0.1f32; k];
+        let mut out = vec![0f32; n];
+        assert!(
+            w.forward_slice_cpu(&x, &mut out).expect("slice"),
+            "the fast path must handle a plain weight, or this test proves nothing"
+        );
+        w.add_lora(LoraDelta {
+            down: Tensor::from_vec_f32((0..k * r).map(|i| ((i % 5) as f32 - 2.0) / 10.0).collect(), vec![k, r])
+                .expect("down"),
+            up: Tensor::from_vec_f32((0..r * n).map(|i| ((i % 3) as f32 - 1.0) / 10.0).collect(), vec![r, n])
+                .expect("up"),
+            scale: 1.0,
+        })
+        .expect("attach");
+        assert!(!w.forward_slice_cpu(&x, &mut out).expect("slice"));
+        assert!(w.cpu_raw().is_none(), "the raw weight would omit the adapter");
     }
 }
