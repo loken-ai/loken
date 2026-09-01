@@ -142,6 +142,25 @@ measured, and says how many of the section's cells that is.
 
 
 
+
+
+
+
+
+## Reading the prefill column
+
+On a short prompt it does not compare the engines. The short prompt is 15 tokens, and each
+engine reports a prefill rate from its own timer: on gpt-oss:20b ollama reported 652 tok/s
+where its own time to first token implies 35, and this engine reported 49 373 where its time to
+first token implies 728. Both exclude more than they include at that length, and they exclude
+different things.
+
+Time to first token is the honest figure for short prompts - 20.6 ms against 429.6 on that
+cell. The prefill column becomes a comparison again at the medium and long prompt lengths,
+where the work outgrows what either timer leaves out.
+
+
+
 ### ernie4_5
 
 ![ernie4_5](img/family-ernie4_5.svg)
@@ -229,21 +248,21 @@ measured, and says how many of the section's cells that is.
 
 ![gptoss](img/family-gptoss.svg)
 
-| Model       | Ctx  | Prompt | Mode       | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms  | J/req   | J/token   | Δ decode   | Δ energy    | Date             |
-|-------------|------|--------|------------|--------|-----------------|---------------|--------------|---------|---------|---------|-----------|------------|-------------|------------------|
-| gpt-oss:20b | 4096 | long   | non-stream | GPU    | Ollama 0.32.6   | 15 571.4      | 131.7        | 128     | 3 620   | 359     | 2.802     |            |             | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | long   | non-stream | GPU    | **loken 0.1.0** | **555 945.1** | **195.0**    | **128** | **919** | **172** | **1.344** | **+48.1%** | **+108.5%** | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | long   | stream     | GPU    | Ollama 0.32.6   | 15 731.1      | 130.4        | 128     | 3 627   | 369     | 2.880     |            |             | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **173 878.9** | **189.7**    | **128** | **929** | **172** | **1.343** | **+45.5%** | **+114.4%** | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 1 668.9       | 131.2        | 128     | 3 617   | 355     | 2.772     |            |             | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **90 783.2**  | **199.5**    | **128** | **818** | **145** | **1.136** | **+52.1%** | **+144.1%** | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 1 664.4       | 130.0        | 128     | 3 590   | 355     | 2.771     |            |             | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **59 658.7**  | **197.5**    | **128** | **825** | **143** | **1.116** | **+51.9%** | **+148.3%** | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 640.1         | 132.5        | 128     | 3 526   | 361     | 2.820     |            |             | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **27 976.9**  | **198.8**    | **128** | **822** | **139** | **1.087** | **+50.1%** | **+159.4%** | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 461.9         | 94.1         | 128     | 4 472   |  -      |  -        |            |             | 2026-09-01 09:56 |
-| gpt-oss:20b | 4096 | short  | stream     | GPU    | vLLM 0.22.0     |  -            | 146.9        | 128     | 887     | 189     | 1.476     |            |             | 2026-08-10 07:13 |
-| gpt-oss:20b | 4096 | short  | stream     | GPU    | **loken 0.1.0** | **17 015.8**  | **211.9**    | **128** | **826** | ** - ** | ** - **   | **+44.2%** |             | 2026-09-01 09:56 |
+| Model       | Ctx  | Prompt | Mode       | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms  | J/req   | J/token   | Δ decode    | Δ energy    | Date             |
+|-------------|------|--------|------------|--------|-----------------|---------------|--------------|---------|---------|---------|-----------|-------------|-------------|------------------|
+| gpt-oss:20b | 4096 | long   | non-stream | GPU    | Ollama 0.32.6   | 15 571.4      | 131.7        | 128     | 3 620   | 359     | 2.802     |             |             | 2026-08-18 01:14 |
+| gpt-oss:20b | 4096 | long   | non-stream | GPU    | **loken 0.1.0** | **555 945.1** | **195.0**    | **128** | **919** | **172** | **1.344** | **+48.1%**  | **+108.5%** | 2026-08-18 01:14 |
+| gpt-oss:20b | 4096 | long   | stream     | GPU    | Ollama 0.32.6   | 15 731.1      | 130.4        | 128     | 3 627   | 369     | 2.880     |             |             | 2026-08-18 01:14 |
+| gpt-oss:20b | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **173 878.9** | **189.7**    | **128** | **929** | **172** | **1.343** | **+45.5%**  | **+114.4%** | 2026-08-18 01:14 |
+| gpt-oss:20b | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 1 668.9       | 131.2        | 128     | 3 617   | 355     | 2.772     |             |             | 2026-08-18 01:14 |
+| gpt-oss:20b | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **90 783.2**  | **199.5**    | **128** | **818** | **145** | **1.136** | **+52.1%**  | **+144.1%** | 2026-08-18 01:14 |
+| gpt-oss:20b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 1 664.4       | 130.0        | 128     | 3 590   | 355     | 2.771     |             |             | 2026-08-18 01:14 |
+| gpt-oss:20b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **59 658.7**  | **197.5**    | **128** | **825** | **143** | **1.116** | **+51.9%**  | **+148.3%** | 2026-08-18 01:14 |
+| gpt-oss:20b | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 456.7         | 52.7         | 128     | 4 385   |  -      |  -        |             |             | 2026-09-01 11:34 |
+| gpt-oss:20b | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **39 356.6**  | **175.1**    | **128** | **809** | ** - ** | ** - **   | **+232.2%** |             | 2026-09-01 11:34 |
+| gpt-oss:20b | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 461.9         | 94.1         | 128     | 4 472   |  -      |  -        |             |             | 2026-09-01 09:56 |
+| gpt-oss:20b | 4096 | short  | stream     | GPU    | vLLM 0.22.0     |  -            | 146.9        | 128     | 887     | 189     | 1.476     |             |             | 2026-08-10 07:13 |
+| gpt-oss:20b | 4096 | short  | stream     | GPU    | **loken 0.1.0** | **17 015.8**  | **211.9**    | **128** | **826** | ** - ** | ** - **   | **+44.2%**  |             | 2026-09-01 09:56 |
 
 ### granite
 
@@ -259,8 +278,8 @@ measured, and says how many of the section's cells that is.
 | granite3.1-dense:2b | 4096  | medium | non-stream | GPU    | **loken 0.1.0** | **4 100.7**   | **296.8**    | **128** | **497**    | **99**  | **0.771** | **+1.2%**  | **+94.6%**  | 2026-08-18 01:14 |
 | granite3.1-dense:2b | 4096  | medium | stream     | GPU    | Ollama 0.32.6   | 9 397.9       | 290.7        | 128     | 1 818      | 193     | 1.508     |            |             | 2026-08-18 01:14 |
 | granite3.1-dense:2b | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **3 530.3**   | **292.3**    | **128** | **484**    | **108** | **0.847** | **+0.6%**  | **+78.0%**  | 2026-08-18 01:14 |
-| granite3.1-dense:2b | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   | 3 229.6       | 294.2        | 128     | 1 905      | 197     | 1.538     |            |             | 2026-08-18 01:14 |
-| granite3.1-dense:2b | 4096  | short  | non-stream | GPU    | **loken 0.1.0** | **892.5**     | **299.0**    | **128** | **492**    | **107** | **0.839** | **+1.6%**  | **+83.3%**  | 2026-08-18 01:14 |
+| granite3.1-dense:2b | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   | 2 563.6       | 143.2        | 128     | 1 891      |  -      |  -        |            |             | 2026-09-01 11:36 |
+| granite3.1-dense:2b | 4096  | short  | non-stream | GPU    | **loken 0.1.0** | **1 108.9**   | **248.8**    | **128** | **522**    | ** - ** | ** - **   | **+73.7%** |             | 2026-09-01 11:36 |
 | granite3.1-dense:2b | 4096  | short  | stream     | CPU    | Ollama 0.32.6   | 606.7         | 13.3         | 128     | 11 258     | 418     | 3.263     |            |             | 2026-08-18 01:14 |
 | granite3.1-dense:2b | 4096  | short  | stream     | CPU    | **loken 0.1.0** | **149.2**     | **12.2**     | **128** | **10 850** | **501** | **3.917** | -8.3%      | -16.7%      | 2026-08-18 01:14 |
 | granite3.1-dense:2b | 4096  | short  | stream     | GPU    | Ollama 0.32.6   | 2 541.6       | 223.8        | 128     | 1 886      |  -      |  -        |            |             | 2026-09-01 09:58 |
@@ -284,8 +303,8 @@ measured, and says how many of the section's cells that is.
 | granite3-moe:1b | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **341.3**     | **369.0**    | **128** | **656**   | **65**  | **0.507** | **+1.6%**  | **+176.3%** | 2026-08-18 01:14 |
 | granite3-moe:1b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 11 039.6      | 370.9        | 128     | 417       |  -      |  -        |            |             | 2026-08-27 20:06 |
 | granite3-moe:1b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **2 174.9**   | **323.9**    | **128** | **422**   | ** - ** | ** - **   | -12.7%     |             | 2026-08-27 20:06 |
-| granite3-moe:1b | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 3 280.6       | 341.9        | 128     | 2 468     | 187     | 1.464     |            |             | 2026-08-18 01:14 |
-| granite3-moe:1b | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **189.4**     | **403.6**    | **128** | **582**   | **55**  | **0.428** | **+18.0%** | **+242.2%** | 2026-08-18 01:14 |
+| granite3-moe:1b | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 3 202.4       | 258.0        | 128     | 511       |  -      |  -        |            |             | 2026-09-01 11:35 |
+| granite3-moe:1b | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **824.4**     | **274.3**    | **128** | **474**   | ** - ** | ** - **   | **+6.3%**  |             | 2026-09-01 11:35 |
 | granite3-moe:1b | 4096 | short  | stream     | CPU    | Ollama 0.32.6   | 2 464.5       | 68.7         | 128     | 3 165     | 152     | 1.184     |            |             | 2026-08-18 01:14 |
 | granite3-moe:1b | 4096 | short  | stream     | CPU    | **loken 0.1.0** | **133.2**     | **55.7**     | **128** | **2 593** | **158** | **1.234** | -18.9%     | -4.1%       | 2026-08-18 01:14 |
 | granite3-moe:1b | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 3 262.5       | 333.8        | 128     | 516       |  -      |  -        |            |             | 2026-09-01 09:57 |
@@ -295,20 +314,20 @@ measured, and says how many of the section's cells that is.
 
 ![lfm2](img/family-lfm2.svg)
 
-| Model                  | Ctx  | Prompt | Mode       | Device | Engine          | Prefill tok/s   | Decode tok/s | Tokens  | E2E ms  | J/req   | J/token   | Δ decode   | Δ energy    | Date             |
-|------------------------|------|--------|------------|--------|-----------------|-----------------|--------------|---------|---------|---------|-----------|------------|-------------|------------------|
-| lfm2.5-thinking:latest | 4096 | long   | non-stream | GPU    | Ollama 0.32.6   | 59 674.8        | 533.2        | 128     | 1 790   | 165     | 1.285     |            |             | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | long   | non-stream | GPU    | **loken 0.1.0** | **1 066 715.1** | **660.0**    | **128** | **355** | **55**  | **0.428** | **+23.8%** | **+200.2%** | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | long   | stream     | GPU    | Ollama 0.32.6   | 59 376.1        | 529.3        | 128     | 1 851   | 165     | 1.290     |            |             | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **214 095.4**   | **653.6**    | **128** | **350** | **50**  | **0.393** | **+23.5%** | **+228.3%** | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 9 832.1         | 501.5        | 128     | 1 852   | 166     | 1.297     |            |             | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **32 654.0**    | **630.6**    | **128** | **345** | **50**  | **0.391** | **+25.7%** | **+231.6%** | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 10 056.2        | 500.3        | 128     | 1 841   | 161     | 1.258     |            |             | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **68 776.3**    | **662.7**    | **128** | **335** | **60**  | **0.466** | **+32.5%** | **+169.9%** | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 3 500.7         | 504.4        | 128     | 1 943   | 172     | 1.343     |            |             | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **57 332.3**    | **635.4**    | **128** | **341** | **53**  | **0.418** | **+26.0%** | **+221.7%** | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 2 848.9         | 393.7        | 128     | 1 679   |  -      |  -        |            |             | 2026-09-01 09:59 |
-| lfm2.5-thinking:latest | 4096 | short  | stream     | GPU    | **loken 0.1.0** | **29 101.6**    | **636.3**    | **128** | **440** | ** - ** | ** - **   | **+61.6%** |             | 2026-09-01 09:59 |
+| Model                  | Ctx  | Prompt | Mode       | Device | Engine          | Prefill tok/s   | Decode tok/s | Tokens  | E2E ms  | J/req   | J/token   | Δ decode    | Δ energy    | Date             |
+|------------------------|------|--------|------------|--------|-----------------|-----------------|--------------|---------|---------|---------|-----------|-------------|-------------|------------------|
+| lfm2.5-thinking:latest | 4096 | long   | non-stream | GPU    | Ollama 0.32.6   | 59 674.8        | 533.2        | 128     | 1 790   | 165     | 1.285     |             |             | 2026-08-18 01:14 |
+| lfm2.5-thinking:latest | 4096 | long   | non-stream | GPU    | **loken 0.1.0** | **1 066 715.1** | **660.0**    | **128** | **355** | **55**  | **0.428** | **+23.8%**  | **+200.2%** | 2026-08-18 01:14 |
+| lfm2.5-thinking:latest | 4096 | long   | stream     | GPU    | Ollama 0.32.6   | 59 376.1        | 529.3        | 128     | 1 851   | 165     | 1.290     |             |             | 2026-08-18 01:14 |
+| lfm2.5-thinking:latest | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **214 095.4**   | **653.6**    | **128** | **350** | **50**  | **0.393** | **+23.5%**  | **+228.3%** | 2026-08-18 01:14 |
+| lfm2.5-thinking:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 9 832.1         | 501.5        | 128     | 1 852   | 166     | 1.297     |             |             | 2026-08-18 01:14 |
+| lfm2.5-thinking:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **32 654.0**    | **630.6**    | **128** | **345** | **50**  | **0.391** | **+25.7%**  | **+231.6%** | 2026-08-18 01:14 |
+| lfm2.5-thinking:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 10 056.2        | 500.3        | 128     | 1 841   | 161     | 1.258     |             |             | 2026-08-18 01:14 |
+| lfm2.5-thinking:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **68 776.3**    | **662.7**    | **128** | **335** | **60**  | **0.466** | **+32.5%**  | **+169.9%** | 2026-08-18 01:14 |
+| lfm2.5-thinking:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 2 821.0         | 215.5        | 128     | 1 672   |  -      |  -        |             |             | 2026-09-01 11:37 |
+| lfm2.5-thinking:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **56 031.6**    | **442.8**    | **128** | **402** | ** - ** | ** - **   | **+105.4%** |             | 2026-09-01 11:37 |
+| lfm2.5-thinking:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 2 848.9         | 393.7        | 128     | 1 679   |  -      |  -        |             |             | 2026-09-01 09:59 |
+| lfm2.5-thinking:latest | 4096 | short  | stream     | GPU    | **loken 0.1.0** | **29 101.6**    | **636.3**    | **128** | **440** | ** - ** | ** - **   | **+61.6%**  |             | 2026-09-01 09:59 |
 
 ### lfm2moe
 
@@ -324,8 +343,8 @@ measured, and says how many of the section's cells that is.
 | lfm2:latest | 4096  | medium | non-stream | GPU    | **loken 0.1.0** | **81 337.3**  | **312.2**    | **128** | **596**    | **92**  | **0.717** |            |             | 2026-08-18 01:14 |
 | lfm2:latest | 4096  | medium | stream     | GPU    | Ollama 0.32.6   |  -            |  -           | 33      |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
 | lfm2:latest | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **49 241.3**  | **310.0**    | **128** | **588**    | **88**  | **0.691** |            |             | 2026-08-18 01:14 |
-| lfm2:latest | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   |  -            |  -           | 128     |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
-| lfm2:latest | 4096  | short  | non-stream | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
+| lfm2:latest | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   |  -            |  -           | 128     |  -         |  -      |  -        | incoherent |             | 2026-09-01 11:39 |
+| lfm2:latest | 4096  | short  | non-stream | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-09-01 11:39 |
 | lfm2:latest | 4096  | short  | stream     | CPU    | Ollama 0.32.6   | 140.4         | 14.4         | 128     | 13 330     | 477     | 3.724     |            |             | 2026-08-18 01:14 |
 | lfm2:latest | 4096  | short  | stream     | CPU    | **loken 0.1.0** | **730.7**     | **14.0**     | **128** | **12 797** | **572** | **4.472** | -3.4%      | -16.7%      | 2026-08-18 01:14 |
 | lfm2:latest | 4096  | short  | stream     | GPU    | Ollama 0.32.6   |  -            |  -           | 128     |  -         |  -      |  -        | incoherent |             | 2026-09-01 10:00 |
