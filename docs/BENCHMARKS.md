@@ -155,9 +155,23 @@ where its own time to first token implies 35, and this engine reported 49 373 wh
 first token implies 728. Both exclude more than they include at that length, and they exclude
 different things.
 
-Time to first token is the honest figure for short prompts - 20.6 ms against 429.6 on that
-cell. The prefill column becomes a comparison again at the medium and long prompt lengths,
-where the work outgrows what either timer leaves out.
+It does not recover at the medium prompt either. Over the first four models measured there,
+each engine's self-reported rate against what its own time to first token implies:
+
+| model | ollama says | ollama's TTFT implies | this engine says | its TTFT implies |
+|---|---:|---:|---:|---:|
+| deepcoder:14b | 2 304 | 205 | 1 635 | 831 |
+| deepseek-r1:32b | 1 131 | 201 | 585 | 478 |
+| deepseek-r1:70b-q3ks | 298 | 91 | 252 | 230 |
+| deepseek-r1:70b | 67 | 46 | 21 | 21 |
+
+On three of the four the column reverses the verdict: it reads as an ollama win while the time
+to first token is two to four times better here. Read the TTFT column instead. The prefill
+figures are each engine's own bookkeeping, and only the times are measured by the bench.
+
+
+
+
 
 
 
@@ -387,8 +401,8 @@ where the work outgrows what either timer leaves out.
 | deepseek-r1:70b      | 4096   | long   | stream     | GPU    | **loken 0.1.0** | **188.8**     | **1.6**      | **128** | **90 756** | **6 958** | **54.360** | **+5.3%**   | **+4.5%**   | 2026-08-18 01:14 |
 | deepseek-r1:70b      | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 51.1          | 1.5          | 128     | 89 035     | 7 009     | 54.759     |             |             | 2026-08-18 01:14 |
 | deepseek-r1:70b      | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **37.5**      | **1.4**      | **128** | **99 722** | **7 674** | **59.953** | -7.8%       | -8.7%       | 2026-08-18 01:14 |
-| deepseek-r1:70b      | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 51.1          | 1.5          | 128     | 88 449     | 6 961     | 54.386     |             |             | 2026-08-18 01:14 |
-| deepseek-r1:70b      | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **38.2**      | **1.5**      | **128** | **95 625** | **7 382** | **57.674** | -5.7%       | -5.7%       | 2026-08-18 01:14 |
+| deepseek-r1:70b      | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 51.4          | 1.6          | 128     | 88 181     |  -        |  -         |             |             | 2026-09-01 12:32 |
+| deepseek-r1:70b      | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **14.5**      | **1.5**      | **128** | **96 647** | ** - **   | ** - **    | -6.0%       |             | 2026-09-01 12:32 |
 | deepseek-r1:70b      | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 20.4          | 1.5          | 128     | 88 064     |  -        |  -         |             |             | 2026-09-01 10:54 |
 | deepseek-r1:70b      | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **8.7**       | **1.4**      | **128** | **95 279** | ** - **   | ** - **    | -7.2%       |             | 2026-09-01 10:54 |
 | deepseek-r1:70b      | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 20.3          | 1.5          | 128     | 88 302     |  -        |  -         |             |             | 2026-09-01 09:15 |
@@ -401,8 +415,8 @@ where the work outgrows what either timer leaves out.
 | deepseek-r1:70b-q3ks | 4096   | long   | stream     | GPU    | **loken 0.1.0** | **269.9**     | **17.8**     | **128** | **8 005**  | **2 545** | **19.882** | **+162.5%** | **+25.0%**  | 2026-08-18 01:14 |
 | deepseek-r1:70b-q3ks | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 225.4         | 7.0          | 128     | 23 345     | 3 088     | 24.121     |             |             | 2026-08-18 01:14 |
 | deepseek-r1:70b-q3ks | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **237.7**     | **18.6**     | **128** | **7 318**  | **2 352** | **18.374** | **+165.4%** | **+31.3%**  | 2026-08-18 01:14 |
-| deepseek-r1:70b-q3ks | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 226.8         | 6.9          | 128     | 23 345     | 3 074     | 24.015     |             |             | 2026-08-18 01:14 |
-| deepseek-r1:70b-q3ks | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **245.6**     | **18.4**     | **128** | **7 292**  | **2 378** | **18.579** | **+165.1%** | **+29.3%**  | 2026-08-18 01:14 |
+| deepseek-r1:70b-q3ks | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 227.1         | 6.9          | 128     | 23 352     |  -        |  -         |             |             | 2026-09-01 12:37 |
+| deepseek-r1:70b-q3ks | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **179.4**     | **21.1**     | **128** | **6 493**  | ** - **   | ** - **    | **+204.8%** |             | 2026-09-01 12:37 |
 | deepseek-r1:70b-q3ks | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 85.7          | 5.9          | 128     | 23 310     |  -        |  -         |             |             | 2026-09-01 10:58 |
 | deepseek-r1:70b-q3ks | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **101.8**     | **20.2**     | **128** | **6 367**  | ** - **   | ** - **    | **+243.5%** |             | 2026-09-01 10:58 |
 | deepseek-r1:70b-q3ks | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 86.0          | 6.9          | 128     | 23 287     |  -        |  -         |             |             | 2026-09-01 09:20 |
@@ -613,8 +627,8 @@ where the work outgrows what either timer leaves out.
 | deepseek-r1:32b  | 4096   | long   | stream     | GPU    | **loken 0.1.0** | **591.0**     | **39.3**     | **128** | **3 881**  | **1 087** | **8.491**  | **+52.9%**   | **+21.2%**  | 2026-08-18 01:14 |
 | deepseek-r1:32b  | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 898.0         | 26.1         | 128     | 8 053      | 1 281     | 10.008     |              |             | 2026-08-18 01:14 |
 | deepseek-r1:32b  | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **506.0**     | **40.8**     | **128** | **3 424**  | **993**   | **7.760**  | **+56.6%**   | **+29.0%**  | 2026-08-18 01:14 |
-| deepseek-r1:32b  | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 900.4         | 25.9         | 128     | 8 122      | 1 293     | 10.099     |              |             | 2026-08-18 01:14 |
-| deepseek-r1:32b  | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **524.6**     | **40.5**     | **128** | **3 439**  | **991**   | **7.741**  | **+56.4%**   | **+30.5%**  | 2026-08-18 01:14 |
+| deepseek-r1:32b  | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 893.8         | 25.9         | 128     | 8 158      |  -        |  -         |              |             | 2026-09-01 12:19 |
+| deepseek-r1:32b  | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **397.3**     | **40.8**     | **128** | **3 473**  | ** - **   | ** - **    | **+57.7%**   |             | 2026-09-01 12:19 |
 | deepseek-r1:32b  | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 317.6         | 19.6         | 128     | 8 267      |  -        |  -         |              |             | 2026-09-01 10:41 |
 | deepseek-r1:32b  | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **230.7**     | **38.4**     | **128** | **3 364**  | ** - **   | ** - **    | **+96.2%**   |             | 2026-09-01 10:41 |
 | deepseek-r1:32b  | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 335.8         | 25.8         | 128     | 8 179      |  -        |  -         |              |             | 2026-09-01 09:01 |
