@@ -196,6 +196,40 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ### ernie4_5
 
 ![ernie4_5](img/family-ernie4_5.svg)
@@ -208,8 +242,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | ernie4-5:latest | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **187 373.1** | **512.7**    | **98**  | **245**   | **32**  | **0.327** |             |          | 2026-08-18 01:14 |
 | ernie4-5:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 13 799.7      | 458.7        | 22      | 1 199     | 93      | 4.209     |             |          | 2026-08-18 01:14 |
 | ernie4-5:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **51 462.4**  | **580.3**    | **128** | **263**   | **38**  | **0.295** |             |          | 2026-08-18 01:14 |
-| ernie4-5:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 14 202.6      | 470.3        | 22      | 1 200     | 93      | 4.237     |             |          | 2026-08-18 01:14 |
-| ernie4-5:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **46 364.9**  | **529.5**    | **128** | **283**   | **38**  | **0.301** |             |          | 2026-08-18 01:14 |
+| ernie4-5:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 11 943.1      | 405.6        | 80      | 1 501     |  -      |  -        |             |          | 2026-09-01 12:52 |
+| ernie4-5:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **9 633.0**   | **570.7**    | **128** | **287**   | ** - ** | ** - **   |             |          | 2026-09-01 12:52 |
 | ernie4-5:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 4 151.8       | 226.2        | 128     | 1 588     |  -      |  -        |             |          | 2026-09-01 11:13 |
 | ernie4-5:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **6 060.6**   | **496.0**    | **128** | **264**   | ** - ** | ** - **   | **+119.3%** |          | 2026-09-01 11:13 |
 | ernie4-5:latest | 4096 | short  | stream     | CPU    | Ollama 0.32.6   | 3 766.7       | 52.7         | 128     | 3 614     | 165     | 1.286     |             |          | 2026-08-18 01:14 |
@@ -229,8 +263,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | gemma4:12b    | 4096  | long   | stream     | GPU    | **loken 0.1.0** | **12 532.8**  | **72.9**     | **128** | **1 822**  | **422** | **3.296** | **+1.1%**   | **+40.3%**  | 2026-08-18 01:14 |
 | gemma4:12b    | 4096  | medium | non-stream | GPU    | Ollama 0.32.6   |  -            |  -           | 128     |  -         |  -      |  -        | incoherent  |             | 2026-08-18 01:14 |
 | gemma4:12b    | 4096  | medium | non-stream | GPU    | **loken 0.1.0** | **2 242.0**   | **79.6**     | **128** | **1 661**  | **393** | **3.070** |             |             | 2026-08-18 01:14 |
-| gemma4:12b    | 4096  | medium | stream     | GPU    | Ollama 0.32.6   |  -            |  -           | 128     |  -         |  -      |  -        | incoherent  |             | 2026-08-18 01:14 |
-| gemma4:12b    | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **1 488.6**   | **77.5**     | **128** | **1 703**  | **393** | **3.069** |             |             | 2026-08-18 01:14 |
+| gemma4:12b    | 4096  | medium | stream     | GPU    | Ollama 0.32.6   |  -            |  -           | 74      |  -         |  -      |  -        | incoherent  |             | 2026-09-01 12:54 |
+| gemma4:12b    | 4096  | medium | stream     | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent  |             | 2026-09-01 12:54 |
 | gemma4:12b    | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   | 288.1         | 22.4         | 61      | 3 886      |  -      |  -        |             |             | 2026-09-01 11:16 |
 | gemma4:12b    | 4096  | short  | non-stream | GPU    | **loken 0.1.0** | **517.3**     | **71.8**     | **128** | **1 784**  | ** - ** | ** - **   |             |             | 2026-09-01 11:16 |
 | gemma4:12b    | 4096  | short  | stream     | GPU    | Ollama 0.32.6   | 289.3         | 42.6         | 61      | 5 331      |  -      |  -        |             |             | 2026-09-01 09:37 |
@@ -241,8 +275,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | gemma4:26b    | 4096  | long   | stream     | GPU    | **loken 0.1.0** | **1 173.7**   | **85.8**     | **128** | **1 803**  | **274** | **2.137** | -11.7%      | **+77.2%**  | 2026-08-18 01:14 |
 | gemma4:26b    | 4096  | medium | non-stream | GPU    | Ollama 0.32.6   |  -            |  -           | 128     |  -         |  -      |  -        | incoherent  |             | 2026-08-18 01:14 |
 | gemma4:26b    | 4096  | medium | non-stream | GPU    | **loken 0.1.0** | **524.4**     | **91.3**     | **128** | **1 570**  | **230** | **1.795** |             |             | 2026-08-18 01:14 |
-| gemma4:26b    | 4096  | medium | stream     | GPU    | Ollama 0.32.6   |  -            |  -           | 128     |  -         |  -      |  -        | incoherent  |             | 2026-08-18 01:14 |
-| gemma4:26b    | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **573.6**     | **89.6**     | **128** | **1 607**  | **229** | **1.789** |             |             | 2026-08-18 01:14 |
+| gemma4:26b    | 4096  | medium | stream     | GPU    | Ollama 0.32.6   |  -            |  -           | 128     |  -         |  -      |  -        | incoherent  |             | 2026-09-01 12:57 |
+| gemma4:26b    | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **469.9**     | **95.4**     | **128** | **1 565**  | ** - ** | ** - **   |             |             | 2026-09-01 12:57 |
 | gemma4:26b    | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   | 84.5          | 11.4         | 128     | 4 582      |  -      |  -        |             |             | 2026-09-01 11:18 |
 | gemma4:26b    | 4096  | short  | non-stream | GPU    | **loken 0.1.0** | **307.8**     | **88.4**     | **128** | **1 463**  | ** - ** | ** - **   | **+676.5%** |             | 2026-09-01 11:18 |
 | gemma4:26b    | 4096  | short  | stream     | GPU    | Ollama 0.32.6   | 5.1           | 101.3        | 93      | 5 661      |  -      |  -        |             |             | 2026-09-01 09:40 |
@@ -253,8 +287,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | gemma4:31b    | 4096  | long   | stream     | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent  |             | 2026-08-18 01:14 |
 | gemma4:31b    | 4096  | medium | non-stream | GPU    | Ollama 0.32.6   |  -            |  -           |  -      | 5 810      |  -      |  -        |             |             | 2026-08-18 01:14 |
 | gemma4:31b    | 4096  | medium | non-stream | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent  |             | 2026-08-18 01:14 |
-| gemma4:31b    | 4096  | medium | stream     | GPU    | Ollama 0.32.6   |  -            | 25.5         | 48      | 5 817      | 689     | 14.352    |             |             | 2026-08-18 01:14 |
-| gemma4:31b    | 4096  | medium | stream     | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent  |             | 2026-08-18 01:14 |
+| gemma4:31b    | 4096  | medium | stream     | GPU    | Ollama 0.32.6   |  -            | 25.4         | 48      | 5 908      |  -      |  -        |             |             | 2026-09-01 12:59 |
+| gemma4:31b    | 4096  | medium | stream     | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent  |             | 2026-09-01 12:59 |
 | gemma4:31b    | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   | 76.1          | 8.3          | 128     | 7 646      |  -      |  -        |             |             | 2026-09-01 11:21 |
 | gemma4:31b    | 4096  | short  | non-stream | GPU    | **loken 0.1.0** | **194.1**     | **23.9**     | **128** | **5 370**  | ** - ** | ** - **   | **+188.0%** |             | 2026-09-01 11:21 |
 | gemma4:31b    | 4096  | short  | stream     | GPU    | Ollama 0.32.6   | 83.3          | 25.7         | 96      | 7 652      |  -      |  -        |             |             | 2026-09-01 09:42 |
@@ -264,8 +298,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | gemma4:latest | 4096  | long   | stream     | GPU    | **loken 0.1.0** | **17 599.2**  | **128.9**    | **128** | **1 064**  | **194** | **1.515** | **+11.8%**  | **+104.4%** | 2026-08-18 01:14 |
 | gemma4:latest | 4096  | medium | non-stream | GPU    | Ollama 0.32.6   | 1 749.3       | 118.2        | 128     | 3 926      | 355     | 2.776     |             |             | 2026-08-18 01:14 |
 | gemma4:latest | 4096  | medium | non-stream | GPU    | **loken 0.1.0** | **1 776.1**   | **123.5**    | **9**   | **127**    | **17**  | **1.927** |             |             | 2026-08-18 01:14 |
-| gemma4:latest | 4096  | medium | stream     | GPU    | Ollama 0.32.6   | 1 763.2       | 118.6        | 128     | 3 753      | 379     | 2.961     |             |             | 2026-08-18 01:14 |
-| gemma4:latest | 4096  | medium | stream     | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent  |             | 2026-08-18 01:14 |
+| gemma4:latest | 4096  | medium | stream     | GPU    | Ollama 0.32.6   | 1 332.9       | 90.2         | 128     | 3 965      |  -      |  -        |             |             | 2026-09-01 13:01 |
+| gemma4:latest | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **876.9**     | **127.1**    | **128** | **1 113**  | ** - ** | ** - **   | **+40.9%**  |             | 2026-09-01 13:01 |
 | gemma4:latest | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   | 487.4         | 50.1         | 128     | 3 965      |  -      |  -        |             |             | 2026-09-01 11:22 |
 | gemma4:latest | 4096  | short  | non-stream | GPU    | **loken 0.1.0** | **439.9**     | **121.8**    | **128** | **1 051**  | ** - ** | ** - **   | **+142.9%** |             | 2026-09-01 11:22 |
 | gemma4:latest | 4096  | short  | stream     | CPU    | Ollama 0.32.6   | 82.9          | 7.0          | 128     | 21 777     | 765     | 5.980     |             |             | 2026-08-18 01:14 |
@@ -291,8 +325,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | gpt-oss:20b | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **173 878.9** | **189.7**    | **128** | **929** | **172** | **1.343** | **+45.5%**  | **+114.4%** | 2026-08-18 01:14 |
 | gpt-oss:20b | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 1 668.9       | 131.2        | 128     | 3 617   | 355     | 2.772     |             |             | 2026-08-18 01:14 |
 | gpt-oss:20b | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **90 783.2**  | **199.5**    | **128** | **818** | **145** | **1.136** | **+52.1%**  | **+144.1%** | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 1 664.4       | 130.0        | 128     | 3 590   | 355     | 2.771     |             |             | 2026-08-18 01:14 |
-| gpt-oss:20b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **59 658.7**  | **197.5**    | **128** | **825** | **143** | **1.116** | **+51.9%**  | **+148.3%** | 2026-08-18 01:14 |
+| gpt-oss:20b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 1 238.5       | 93.5         | 128     | 4 434   |  -      |  -        |             |             | 2026-09-01 13:13 |
+| gpt-oss:20b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **43 843.2**  | **212.4**    | **128** | **831** | ** - ** | ** - **   | **+127.3%** |             | 2026-09-01 13:13 |
 | gpt-oss:20b | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 456.7         | 52.7         | 128     | 4 385   |  -      |  -        |             |             | 2026-09-01 11:34 |
 | gpt-oss:20b | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **39 356.6**  | **175.1**    | **128** | **809** | ** - ** | ** - **   | **+232.2%** |             | 2026-09-01 11:34 |
 | gpt-oss:20b | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 461.9         | 94.1         | 128     | 4 472   |  -      |  -        |             |             | 2026-09-01 09:56 |
@@ -311,8 +345,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | granite3.1-dense:2b | 4096  | long   | stream     | GPU    | **loken 0.1.0** | **20 648.2**  | **268.3**    | **128** | **533**    | **113** | **0.885** | -6.7%      | **+79.4%**  | 2026-08-18 01:14 |
 | granite3.1-dense:2b | 4096  | medium | non-stream | GPU    | Ollama 0.32.6   | 9 262.4       | 293.2        | 128     | 1 815      | 192     | 1.500     |            |             | 2026-08-18 01:14 |
 | granite3.1-dense:2b | 4096  | medium | non-stream | GPU    | **loken 0.1.0** | **4 100.7**   | **296.8**    | **128** | **497**    | **99**  | **0.771** | **+1.2%**  | **+94.6%**  | 2026-08-18 01:14 |
-| granite3.1-dense:2b | 4096  | medium | stream     | GPU    | Ollama 0.32.6   | 9 397.9       | 290.7        | 128     | 1 818      | 193     | 1.508     |            |             | 2026-08-18 01:14 |
-| granite3.1-dense:2b | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **3 530.3**   | **292.3**    | **128** | **484**    | **108** | **0.847** | **+0.6%**  | **+78.0%**  | 2026-08-18 01:14 |
+| granite3.1-dense:2b | 4096  | medium | stream     | GPU    | Ollama 0.32.6   | 7 354.5       | 223.8        | 128     | 1 918      |  -      |  -        |            |             | 2026-09-01 13:14 |
+| granite3.1-dense:2b | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **1 868.8**   | **277.1**    | **128** | **519**    | ** - ** | ** - **   | **+23.8%** |             | 2026-09-01 13:14 |
 | granite3.1-dense:2b | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   | 2 563.6       | 143.2        | 128     | 1 891      |  -      |  -        |            |             | 2026-09-01 11:36 |
 | granite3.1-dense:2b | 4096  | short  | non-stream | GPU    | **loken 0.1.0** | **1 108.9**   | **248.8**    | **128** | **522**    | ** - ** | ** - **   | **+73.7%** |             | 2026-09-01 11:36 |
 | granite3.1-dense:2b | 4096  | short  | stream     | CPU    | Ollama 0.32.6   | 606.7         | 13.3         | 128     | 11 258     | 418     | 3.263     |            |             | 2026-08-18 01:14 |
@@ -336,8 +370,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | granite3-moe:1b | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **524.0**     | **363.4**    | **128** | **992**   | **91**  | **0.713** | **+17.4%** | **+108.4%** | 2026-08-18 01:14 |
 | granite3-moe:1b | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 9 978.4       | 363.2        | 128     | 2 411     | 179     | 1.399     |            |             | 2026-08-18 01:14 |
 | granite3-moe:1b | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **341.3**     | **369.0**    | **128** | **656**   | **65**  | **0.507** | **+1.6%**  | **+176.3%** | 2026-08-18 01:14 |
-| granite3-moe:1b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 11 039.6      | 370.9        | 128     | 417       |  -      |  -        |            |             | 2026-08-27 20:06 |
-| granite3-moe:1b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **2 174.9**   | **323.9**    | **128** | **422**   | ** - ** | ** - **   | -12.7%     |             | 2026-08-27 20:06 |
+| granite3-moe:1b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 9 088.8       | 331.3        | 128     | 512       |  -      |  -        |            |             | 2026-09-01 13:14 |
+| granite3-moe:1b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **1 272.6**   | **320.1**    | **128** | **505**   | ** - ** | ** - **   | -3.4%      |             | 2026-09-01 13:14 |
 | granite3-moe:1b | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 3 202.4       | 258.0        | 128     | 511       |  -      |  -        |            |             | 2026-09-01 11:35 |
 | granite3-moe:1b | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **824.4**     | **274.3**    | **128** | **474**   | ** - ** | ** - **   | **+6.3%**  |             | 2026-09-01 11:35 |
 | granite3-moe:1b | 4096 | short  | stream     | CPU    | Ollama 0.32.6   | 2 464.5       | 68.7         | 128     | 3 165     | 152     | 1.184     |            |             | 2026-08-18 01:14 |
@@ -357,8 +391,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | lfm2.5-thinking:latest | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **214 095.4**   | **653.6**    | **128** | **350** | **50**  | **0.393** | **+23.5%**  | **+228.3%** | 2026-08-18 01:14 |
 | lfm2.5-thinking:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 9 832.1         | 501.5        | 128     | 1 852   | 166     | 1.297     |             |             | 2026-08-18 01:14 |
 | lfm2.5-thinking:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **32 654.0**    | **630.6**    | **128** | **345** | **50**  | **0.391** | **+25.7%**  | **+231.6%** | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 10 056.2        | 500.3        | 128     | 1 841   | 161     | 1.258     |             |             | 2026-08-18 01:14 |
-| lfm2.5-thinking:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **68 776.3**    | **662.7**    | **128** | **335** | **60**  | **0.466** | **+32.5%**  | **+169.9%** | 2026-08-18 01:14 |
+| lfm2.5-thinking:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 7 839.8         | 396.0        | 128     | 1 713   |  -      |  -        |             |             | 2026-09-01 13:15 |
+| lfm2.5-thinking:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **86 908.3**    | **668.5**    | **128** | **414** | ** - ** | ** - **   | **+68.8%**  |             | 2026-09-01 13:15 |
 | lfm2.5-thinking:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 2 821.0         | 215.5        | 128     | 1 672   |  -      |  -        |             |             | 2026-09-01 11:37 |
 | lfm2.5-thinking:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **56 031.6**    | **442.8**    | **128** | **402** | ** - ** | ** - **   | **+105.4%** |             | 2026-09-01 11:37 |
 | lfm2.5-thinking:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 2 848.9         | 393.7        | 128     | 1 679   |  -      |  -        |             |             | 2026-09-01 09:59 |
@@ -376,8 +410,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | lfm2:latest | 4096  | long   | stream     | GPU    | **loken 0.1.0** | **346 867.9** | **304.7**    | **128** | **668**    | **117** | **0.912** | **+2.4%**  | **+116.5%** | 2026-08-18 01:14 |
 | lfm2:latest | 4096  | medium | non-stream | GPU    | Ollama 0.32.6   |  -            |  -           |  -      |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
 | lfm2:latest | 4096  | medium | non-stream | GPU    | **loken 0.1.0** | **81 337.3**  | **312.2**    | **128** | **596**    | **92**  | **0.717** |            |             | 2026-08-18 01:14 |
-| lfm2:latest | 4096  | medium | stream     | GPU    | Ollama 0.32.6   |  -            |  -           | 33      |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
-| lfm2:latest | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **49 241.3**  | **310.0**    | **128** | **588**    | **88**  | **0.691** |            |             | 2026-08-18 01:14 |
+| lfm2:latest | 4096  | medium | stream     | GPU    | Ollama 0.32.6   | 2 922.4       | 233.5        | 128     | 3 125      |  -      |  -        |            |             | 2026-09-01 13:17 |
+| lfm2:latest | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **53 764.4**  | **238.1**    | **4**   | **226**    | ** - ** | ** - **   |            |             | 2026-09-01 13:17 |
 | lfm2:latest | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   |  -            |  -           | 128     |  -         |  -      |  -        | incoherent |             | 2026-09-01 11:39 |
 | lfm2:latest | 4096  | short  | non-stream | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-09-01 11:39 |
 | lfm2:latest | 4096  | short  | stream     | CPU    | Ollama 0.32.6   | 140.4         | 14.4         | 128     | 13 330     | 477     | 3.724     |            |             | 2026-08-18 01:14 |
@@ -424,8 +458,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | devstral:24b         | 4096   | long   | non-stream | GPU    | Ollama 0.32.6   | 7 753.5       |  -           | 1       | 2 347      | 174       |  -         | no answer   |             | 2026-08-18 01:14 |
 | devstral:24b         | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 1 774.6       | 52.4         | 128     | 4 734      | 797       | 6.228      |             |             | 2026-08-18 01:14 |
 | devstral:24b         | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **1 097.4**   | **53.3**     | **128** | **2 512**  | **660**   | **5.157**  | **+1.7%**   | **+20.8%**  | 2026-08-18 01:14 |
-| devstral:24b         | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 1 767.8       | 52.0         | 128     | 4 709      | 810       | 6.328      |             |             | 2026-08-18 01:14 |
-| devstral:24b         | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **1 271.4**   | **52.9**     | **128** | **2 513**  | **673**   | **5.257**  | **+1.6%**   | **+20.4%**  | 2026-08-18 01:14 |
+| devstral:24b         | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 1 269.8       | 36.2         | 128     | 6 240      |  -        |  -         |             |             | 2026-09-01 12:51 |
+| devstral:24b         | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **759.8**     | **52.1**     | **128** | **2 564**  | ** - **   | ** - **    | **+43.9%**  |             | 2026-09-01 12:51 |
 | devstral:24b         | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 459.1         | 26.5         | 128     | 6 244      |  -        |  -         |             |             | 2026-09-01 11:13 |
 | devstral:24b         | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **408.3**     | **49.3**     | **128** | **2 598**  | ** - **   | ** - **    | **+86.2%**  |             | 2026-09-01 11:13 |
 | devstral:24b         | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 459.0         | 36.3         | 128     | 6 288      |  -        |  -         |             |             | 2026-09-01 09:34 |
@@ -435,8 +469,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | falcon3:latest       | 4096   | long   | stream     | GPU    | Ollama 0.32.6   | 54 055.3      | 267.1        | 128     | 2 283      | 198       | 1.546      |             |             | 2026-08-18 01:14 |
 | falcon3:latest       | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 8 134.7       | 276.5        | 128     | 2 181      | 194       | 1.513      |             |             | 2026-08-18 01:14 |
 | falcon3:latest       | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **8 007.8**   | **411.3**    | **128** | **360**    | **75**    | **0.583**  | **+48.8%**  | **+159.3%** | 2026-08-18 01:14 |
-| falcon3:latest       | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 8 244.8       | 275.4        | 128     | 2 219      | 201       | 1.574      |             |             | 2026-08-18 01:14 |
-| falcon3:latest       | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **6 153.3**   | **391.4**    | **128** | **372**    | **79**    | **0.617**  | **+42.1%**  | **+155.3%** | 2026-08-18 01:14 |
+| falcon3:latest       | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 6 238.4       | 211.0        | 128     | 2 113      |  -        |  -         |             |             | 2026-09-01 12:53 |
+| falcon3:latest       | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **1 618.0**   | **389.5**    | **128** | **394**    | ** - **   | ** - **    | **+84.6%**  |             | 2026-09-01 12:53 |
 | falcon3:latest       | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 2 229.4       | 120.8        | 128     | 2 117      |  -        |  -         |             |             | 2026-09-01 11:14 |
 | falcon3:latest       | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **915.0**     | **342.4**    | **128** | **378**    | ** - **   | ** - **    | **+183.6%** |             | 2026-09-01 11:14 |
 | falcon3:latest       | 4096   | short  | stream     | CPU    | Ollama 0.32.6   | 1 035.9       | 14.8         | 21      | 3 106      | 151       | 7.206      |             |             | 2026-08-18 01:14 |
@@ -449,8 +483,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | llama3.2:1b          | 4096   | long   | stream     | GPU    | **loken 0.1.0** | **40 994.5**  | **463.1**    | **128** | **328**    | **54**    | **0.420**  | **+46.2%**  | **+268.9%** | 2026-08-18 01:14 |
 | llama3.2:1b          | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 8 892.5       | 310.7        | 128     | 2 199      | 191       | 1.495      |             |             | 2026-08-18 01:14 |
 | llama3.2:1b          | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **6 384.6**   | **454.5**    | **128** | **327**    | **60**    | **0.467**  | **+46.3%**  | **+220.1%** | 2026-08-18 01:14 |
-| llama3.2:1b          | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 8 861.9       | 308.9        | 128     | 2 195      | 197       | 1.536      |             |             | 2026-08-18 01:14 |
-| llama3.2:1b          | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **3 701.6**   | **449.6**    | **128** | **336**    | **55**    | **0.427**  | **+45.5%**  | **+259.7%** | 2026-08-18 01:14 |
+| llama3.2:1b          | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 6 612.9       | 237.5        | 128     | 2 166      |  -        |  -         |             |             | 2026-09-01 13:18 |
+| llama3.2:1b          | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **1 980.5**   | **447.5**    | **128** | **346**    | ** - **   | ** - **    | **+88.4%**  |             | 2026-09-01 13:18 |
 | llama3.2:1b          | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 2 382.3       | 116.2        | 128     | 2 187      |  -        |  -         |             |             | 2026-09-01 11:40 |
 | llama3.2:1b          | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **808.5**     | **376.7**    | **128** | **344**    | ** - **   | ** - **    | **+224.1%** |             | 2026-09-01 11:40 |
 | llama3.2:1b          | 4096   | short  | stream     | CPU    | Ollama 0.32.6   | 538.1         | 16.6         | 128     | 9 415      | 357       | 2.791      |             |             | 2026-08-18 01:14 |
@@ -461,8 +495,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | magistral:latest     | 4096   | long   | non-stream | GPU    | Ollama 0.32.6   | 7 722.8       |  -           | 1       | 2 377      | 180       |  -         | no answer   |             | 2026-08-18 01:14 |
 | magistral:latest     | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 1 774.3       | 52.4         | 128     | 4 760      | 823       | 6.430      |             |             | 2026-08-18 01:14 |
 | magistral:latest     | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **1 110.6**   | **53.8**     | **128** | **2 549**  | **661**   | **5.165**  | **+2.8%**   | **+24.5%**  | 2026-08-18 01:14 |
-| magistral:latest     | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 1 769.2       | 51.9         | 128     | 4 744      | 822       | 6.420      |             |             | 2026-08-18 01:14 |
-| magistral:latest     | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **1 064.8**   | **53.3**     | **128** | **2 546**  | **656**   | **5.129**  | **+2.7%**   | **+25.2%**  | 2026-08-18 01:14 |
+| magistral:latest     | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 1 218.9       | 36.3         | 128     | 6 296      |  -        |  -         |             |             | 2026-09-01 13:20 |
+| magistral:latest     | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **1 130.1**   | **53.3**     | **128** | **2 500**  | ** - **   | ** - **    | **+46.8%**  |             | 2026-09-01 13:20 |
 | magistral:latest     | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 419.9         | 26.3         | 128     | 6 422      |  -        |  -         |             |             | 2026-09-01 11:42 |
 | magistral:latest     | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **407.2**     | **49.6**     | **128** | **2 585**  | ** - **   | ** - **    | **+88.6%**  |             | 2026-09-01 11:42 |
 | magistral:latest     | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 427.9         | 36.3         | 128     | 6 343      |  -        |  -         |             |             | 2026-09-01 10:03 |
@@ -473,8 +507,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | mistral-nemo:latest  | 4096   | long   | stream     | GPU    | **loken 0.1.0** | **20 034.2**  | **106.3**    | **128** | **1 300**  | **305**   | **2.379**  | **+10.8%**  | **+40.6%**  | 2026-08-18 01:14 |
 | mistral-nemo:latest  | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 3 007.5       | 95.2         | 128     | 3 215      | 429       | 3.353      |             |             | 2026-08-18 01:14 |
 | mistral-nemo:latest  | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **3 071.3**   | **103.9**    | **128** | **1 294**  | **298**   | **2.329**  | **+9.2%**   | **+43.9%**  | 2026-08-18 01:14 |
-| mistral-nemo:latest  | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 2 933.6       | 94.6         | 128     | 3 232      | 426       | 3.328      |             |             | 2026-08-18 01:14 |
-| mistral-nemo:latest  | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **3 755.7**   | **103.1**    | **128** | **1 303**  | **299**   | **2.338**  | **+9.0%**   | **+42.3%**  | 2026-08-18 01:14 |
+| mistral-nemo:latest  | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 2 186.8       | 67.9         | 128     | 4 009      |  -        |  -         |             |             | 2026-09-01 13:21 |
+| mistral-nemo:latest  | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **1 591.6**   | **100.9**    | **128** | **1 359**  | ** - **   | ** - **    | **+48.7%**  |             | 2026-09-01 13:21 |
 | mistral-nemo:latest  | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 792.3         | 45.9         | 128     | 3 998      |  -        |  -         |             |             | 2026-09-01 11:43 |
 | mistral-nemo:latest  | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **313.7**     | **95.1**     | **128** | **1 349**  | ** - **   | ** - **    | **+107.3%** |             | 2026-09-01 11:43 |
 | mistral-nemo:latest  | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 713.5         | 68.1         | 128     | 5 862      |  -        |  -         |             |             | 2026-09-01 10:05 |
@@ -492,8 +526,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | devstral-small-2:latest | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **973.6**     | **56.8**     | **128** | **2 649** | **764** | **5.970** | **+198.7%** | **+40.2%** | 2026-08-18 01:14 |
 | devstral-small-2:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 670.4         | 19.6         | 128     | 9 382     | 1 036   | 8.091     |             |            | 2026-08-18 01:14 |
 | devstral-small-2:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **942.2**     | **59.4**     | **128** | **2 350** | **696** | **5.440** | **+202.4%** | **+48.7%** | 2026-08-18 01:14 |
-| devstral-small-2:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 665.6         | 19.4         | 128     | 9 412     | 1 034   | 8.076     |             |            | 2026-08-18 01:14 |
-| devstral-small-2:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **1 305.3**   | **58.7**     | **128** | **2 360** | **705** | **5.504** | **+202.9%** | **+46.7%** | 2026-08-18 01:14 |
+| devstral-small-2:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 1 140.5       | 35.2         | 128     | 6 593     |  -      |  -        |             |            | 2026-09-01 12:39 |
+| devstral-small-2:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **622.8**     | **59.3**     | **128** | **2 411** | ** - ** | ** - **   | **+68.2%**  |            | 2026-09-01 12:39 |
 | devstral-small-2:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 403.0         | 25.6         | 128     | 6 571     |  -      |  -        |             |            | 2026-09-01 11:00 |
 | devstral-small-2:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **301.3**     | **54.8**     | **128** | **2 368** | ** - ** | ** - **   | **+113.9%** |            | 2026-09-01 11:00 |
 | devstral-small-2:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 410.3         | 35.4         | 128     | 6 556     |  -      |  -        |             |            | 2026-09-01 09:22 |
@@ -504,8 +538,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | mistral-small3.2:latest | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **972.7**     | **57.1**     | **128** | **2 583** | **753** | **5.881** | **+188.9%** | **+35.9%** | 2026-08-18 01:14 |
 | mistral-small3.2:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 677.9         | 19.8         | 128     | 9 380     | 1 022   | 7.981     |             |            | 2026-08-18 01:14 |
 | mistral-small3.2:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **927.0**     | **59.2**     | **128** | **2 367** | **702** | **5.484** | **+198.4%** | **+45.5%** | 2026-08-18 01:14 |
-| mistral-small3.2:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 680.2         | 19.8         | 128     | 9 285     | 1 021   | 7.979     |             |            | 2026-08-18 01:14 |
-| mistral-small3.2:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **839.5**     | **58.8**     | **128** | **2 370** | **698** | **5.454** | **+196.7%** | **+46.3%** | 2026-08-18 01:14 |
+| mistral-small3.2:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 1 195.7       | 36.3         | 128     | 6 424     |  -      |  -        |             |            | 2026-09-01 13:23 |
+| mistral-small3.2:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **618.8**     | **59.2**     | **128** | **2 470** | ** - ** | ** - **   | **+63.1%**  |            | 2026-09-01 13:23 |
 | mistral-small3.2:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 459.8         | 26.0         | 128     | 6 429     |  -      |  -        |             |            | 2026-09-01 11:45 |
 | mistral-small3.2:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **249.2**     | **54.6**     | **128** | **2 372** | ** - ** | ** - **   | **+110.5%** |            | 2026-09-01 11:45 |
 | mistral-small3.2:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 434.8         | 36.3         | 128     | 6 459     |  -      |  -        |             |            | 2026-09-01 10:07 |
@@ -523,8 +557,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | nemotron-3-nano:latest | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **218 674.2** | **119.1**    | **128** | **1 532** | **238** | **1.858** | -10.9%     | **+86.8%**  | 2026-08-18 01:14 |
 | nemotron-3-nano:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 600.2         | 136.0        | 128     | 4 767     | 443     | 3.460     |            |             | 2026-08-18 01:14 |
 | nemotron-3-nano:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **68 273.2**  | **122.7**    | **128** | **1 415** | **202** | **1.575** | -9.8%      | **+119.7%** | 2026-08-18 01:14 |
-| nemotron-3-nano:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 607.0         | 135.2        | 128     | 4 763     | 441     | 3.443     |            |             | 2026-08-18 01:14 |
-| nemotron-3-nano:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **57 503.3**  | **119.4**    | **128** | **1 432** | **210** | **1.639** | -11.7%     | **+110.0%** | 2026-08-18 01:14 |
+| nemotron-3-nano:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 604.8         | 136.0        | 128     | 4 713     |  -      |  -        |            |             | 2026-09-01 13:26 |
+| nemotron-3-nano:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **18 725.6**  | **144.4**    | **128** | **1 199** | ** - ** | ** - **   | **+6.2%**  |             | 2026-09-01 13:26 |
 | nemotron-3-nano:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 210.9         | 70.3         | 128     | 4 742     |  -      |  -        |            |             | 2026-09-01 11:48 |
 | nemotron-3-nano:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **17 399.8**  | **120.1**    | **128** | **1 211** | ** - ** | ** - **   | **+70.7%** |             | 2026-09-01 11:48 |
 | nemotron-3-nano:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 207.2         | 133.2        | 128     | 4 724     |  -      |  -        |            |             | 2026-09-01 10:10 |
@@ -542,8 +576,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | olmo2:7b | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **28 548.3**  | **115.6**    | **128** | **1 168**  | **271** | **2.118** | -14.1%     | **+31.3%** | 2026-08-18 01:14 |
 | olmo2:7b | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 4 137.9       | 139.9        | 128     | 2 824      | 345     | 2.692     |            |            | 2026-08-18 01:14 |
 | olmo2:7b | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **3 314.2**   | **133.7**    | **128** | **1 030**  | **244** | **1.908** | -4.4%      | **+41.1%** | 2026-08-18 01:14 |
-| olmo2:7b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 4 119.3       | 138.5        | 128     | 2 871      | 356     | 2.779     |            |            | 2026-08-18 01:14 |
-| olmo2:7b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **5 447.3**   | **132.5**    | **128** | **1 023**  | **247** | **1.931** | -4.4%      | **+43.9%** | 2026-08-18 01:14 |
+| olmo2:7b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 2 949.3       | 100.7        | 128     | 1 442      |  -      |  -        |            |            | 2026-09-01 13:27 |
+| olmo2:7b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **1 878.7**   | **134.2**    | **128** | **1 038**  | ** - ** | ** - **   | **+33.3%** |            | 2026-09-01 13:27 |
 | olmo2:7b | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 1 056.8       | 89.2         | 128     | 1 436      |  -      |  -        |            |            | 2026-09-01 11:49 |
 | olmo2:7b | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **716.7**     | **126.3**    | **128** | **1 017**  | ** - ** | ** - **   | **+41.6%** |            | 2026-09-01 11:49 |
 | olmo2:7b | 4096 | short  | stream     | CPU    | Ollama 0.32.6   | 202.1         | 5.2          | 128     | 27 396     | 978     | 7.638     |            |            | 2026-08-18 01:14 |
@@ -563,8 +597,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | olmoe:latest | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **230.8**     | **417.1**    | **128** | **3 079** | **235** | **1.837** | -12.9%     | -24.3%   | 2026-08-18 01:14 |
 | olmoe:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 13 403.6      | 495.6        | 128     | 2 033     | 171     | 1.338     |            |          | 2026-08-18 01:14 |
 | olmoe:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **115.3**     | **471.2**    | **127** | **2 793** | **200** | **1.569** | -4.9%      | -14.3%   | 2026-08-18 01:14 |
-| olmoe:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 13 295.7      | 498.2        | 128     | 374       |  -      |  -        |            |          | 2026-08-27 20:06 |
-| olmoe:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **1 275.9**   | **441.4**    | **122** | **319**   | ** - ** | ** - **   |            |          | 2026-08-27 20:06 |
+| olmoe:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 10 655.9      | 390.2        | 128     | 443       |  -      |  -        |            |          | 2026-09-01 13:29 |
+| olmoe:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **1 148.9**   | **428.9**    | **128** | **410**   | ** - ** | ** - **   | **+9.9%**  |          | 2026-09-01 13:29 |
 | olmoe:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 3 651.5       | 296.4        | 128     | 436       |  -      |  -        |            |          | 2026-09-01 11:50 |
 | olmoe:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **590.4**     | **312.1**    | **128** | **458**   | ** - ** | ** - **   | **+5.3%**  |          | 2026-09-01 11:50 |
 | olmoe:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 3 628.7       | 389.0        | 128     | 422       |  -      |  -        |            |          | 2026-09-01 10:12 |
@@ -579,8 +613,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | moondream:latest | 4096 | long   | non-stream | GPU    | Ollama 0.32.6   | 35 453.0      |  -           | 1       | 1 614   | 119     |  -        | no answer  |             | 2026-08-18 01:14 |
 | moondream:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 13 143.8      | 471.2        | 128     | 1 923   | 166     | 1.295     |            |             | 2026-08-18 01:14 |
 | moondream:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **4 265.2**   | **624.0**    | **128** | **270** | **46**  | **0.360** | **+32.4%** | **+259.6%** | 2026-08-18 01:14 |
-| moondream:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 12 904.2      | 456.7        | 128     | 1 951   | 173     | 1.350     |            |             | 2026-08-18 01:14 |
-| moondream:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **1 200.5**   | **585.3**    | **128** | **292** | **50**  | **0.392** | **+28.1%** | **+244.2%** | 2026-08-18 01:14 |
+| moondream:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 10 354.2      | 370.2        | 128     | 450     |  -      |  -        |            |             | 2026-09-01 13:24 |
+| moondream:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **3 543.0**   | **591.5**    | **128** | **250** | ** - ** | ** - **   | **+59.8%** |             | 2026-09-01 13:24 |
 | moondream:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 3 658.1       | 289.7        | 128     | 443     |  -      |  -        |            |             | 2026-09-01 11:46 |
 | moondream:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **1 399.5**   | **508.6**    | **128** | **254** | ** - ** | ** - **   | **+75.5%** |             | 2026-09-01 11:46 |
 | moondream:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 3 604.0       | 370.9        | 128     | 447     |  -      |  -        |            |             | 2026-09-01 10:08 |
@@ -598,9 +632,9 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | deepcoder:14b    | 4096   | long   | stream     | GPU    | Ollama 0.32.6   | 11 553.8      | 75.0         | 128     | 3 664      | 563       | 4.400      |              |             | 2026-08-18 01:14 |
 | deepcoder:14b    | 4096   | long   | stream     | GPU    | vLLM 0.22.0     |  -            | 84.9         | 128     | 1 571      | 346       | 2.706      |              |             | 2026-08-18 01:14 |
 | deepcoder:14b    | 4096   | long   | stream     | GPU    | **loken 0.1.0** | **12 567.4**  | **77.2**     | **128** | **1 725**  | **434**   | **3.387**  | -9.2%        | -20.1%      | 2026-08-18 01:14 |
-| deepcoder:14b    | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 2 388.2       | 75.0         | 128     | 3 631      | 546       | 4.269      |              |             | 2026-08-18 01:14 |
-| deepcoder:14b    | 4096   | medium | non-stream | GPU    | vLLM 0.22.0     |  -            | 81.0         | 128     | 1 584      | 333       | 2.605      |              |             | 2026-08-18 01:14 |
-| deepcoder:14b    | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **1 854.1**   | **82.6**     | **128** | **1 611**  | **404**   | **3.153**  | **+2.0%**    | -17.4%      | 2026-08-18 01:14 |
+| deepcoder:14b    | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 1 707.8       | 37.7         | 128     | 4 596      |  -        |  -         |              |             | 2026-09-01 13:55 |
+| deepcoder:14b    | 4096   | medium | non-stream | GPU    | vLLM 0.22.0     |  -            | 82.4         | 128     | 1 555      |  -        |  -         |              |             | 2026-09-01 13:55 |
+| deepcoder:14b    | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **1 309.1**   | **77.3**     | **128** | **1 658**  | ** - **   | ** - **    | -6.2%        |             | 2026-09-01 13:55 |
 | deepcoder:14b    | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 1 709.3       | 52.9         | 128     | 4 636      |  -        |  -         |              |             | 2026-09-01 12:17 |
 | deepcoder:14b    | 4096   | medium | stream     | GPU    | vLLM 0.22.0     |  -            | 85.0         | 128     | 1 550      |  -        |  -         |              |             | 2026-09-01 12:17 |
 | deepcoder:14b    | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **1 239.0**   | **80.4**     | **128** | **1 668**  | ** - **   | ** - **    | -5.5%        |             | 2026-09-01 12:17 |
@@ -625,8 +659,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | deepseek-r1:32b  | 4096   | long   | non-stream | GPU    | **loken 0.1.0** | **615.7**     | **39.7**     | **128** | **3 743**  | **1 062** | **8.299**  | **+53.4%**   | **+23.1%**  | 2026-08-18 01:14 |
 | deepseek-r1:32b  | 4096   | long   | stream     | GPU    | Ollama 0.32.6   | 4 224.7       | 25.7         | 128     | 8 263      | 1 318     | 10.293     |              |             | 2026-08-18 01:14 |
 | deepseek-r1:32b  | 4096   | long   | stream     | GPU    | **loken 0.1.0** | **591.0**     | **39.3**     | **128** | **3 881**  | **1 087** | **8.491**  | **+52.9%**   | **+21.2%**  | 2026-08-18 01:14 |
-| deepseek-r1:32b  | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 898.0         | 26.1         | 128     | 8 053      | 1 281     | 10.008     |              |             | 2026-08-18 01:14 |
-| deepseek-r1:32b  | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **506.0**     | **40.8**     | **128** | **3 424**  | **993**   | **7.760**  | **+56.6%**   | **+29.0%**  | 2026-08-18 01:14 |
+| deepseek-r1:32b  | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 864.6         | 19.7         | 128     | 8 089      |  -        |  -         |              |             | 2026-09-01 13:57 |
+| deepseek-r1:32b  | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **352.2**     | **37.5**     | **128** | **3 452**  | ** - **   | ** - **    | **+90.4%**   |             | 2026-09-01 13:57 |
 | deepseek-r1:32b  | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 893.8         | 25.9         | 128     | 8 158      |  -        |  -         |              |             | 2026-09-01 12:19 |
 | deepseek-r1:32b  | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **397.3**     | **40.8**     | **128** | **3 473**  | ** - **   | ** - **    | **+57.7%**   |             | 2026-09-01 12:19 |
 | deepseek-r1:32b  | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 317.6         | 19.6         | 128     | 8 267      |  -        |  -         |              |             | 2026-09-01 10:41 |
@@ -642,8 +676,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | qwen2.5:0.5b     | 4096   | long   | stream     | GPU    | **loken 0.1.0** | **34 434.4**  | **363.4**    | **128** | **393**    | **53**    | **0.415**  | -2.6%        | **+190.5%** | 2026-08-18 01:14 |
 | qwen2.5:0.5b     | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 9 940.0       | 368.1        | 128     | 2 031      | 154       | 1.204      |              |             | 2026-08-18 01:14 |
 | qwen2.5:0.5b     | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **3 510.8**   | **378.6**    | **128** | **392**    | **47**    | **0.366**  | **+2.9%**    | **+229.1%** | 2026-08-18 01:14 |
-| qwen2.5:0.5b     | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 10 082.4      | 371.9        | 128     | 2 038      | 153       | 1.195      |              |             | 2026-08-18 01:14 |
-| qwen2.5:0.5b     | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **2 512.4**   | **387.1**    | **128** | **383**    | **51**    | **0.397**  | **+4.1%**    | **+200.8%** | 2026-08-18 01:14 |
+| qwen2.5:0.5b     | 4096   | medium | stream     | GPU    | Ollama 0.32.6   | 8 215.8       | 317.3        | 128     | 1 927      |  -        |  -         |              |             | 2026-09-01 13:29 |
+| qwen2.5:0.5b     | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **2 008.6**   | **365.2**    | **128** | **414**    | ** - **   | ** - **    | **+15.1%**   |             | 2026-09-01 13:29 |
 | qwen2.5:0.5b     | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 2 854.2       | 153.4        | 128     | 1 951      |  -        |  -         |              |             | 2026-09-01 11:51 |
 | qwen2.5:0.5b     | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **1 298.3**   | **332.6**    | **128** | **390**    | ** - **   | ** - **    | **+116.7%**  |             | 2026-09-01 11:51 |
 | qwen2.5:0.5b     | 4096   | short  | stream     | CPU    | Ollama 0.32.6   | 1 594.1       | 49.7         | 35      | 2 181      | 121       | 3.433      |              |             | 2026-08-18 01:14 |
@@ -664,8 +698,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | qwen3:0.6b   | 4096  | long   | stream     | GPU    | **loken 0.1.0** | **24 191.2**  | **649.5**    | **128** | **268**    | **35**  | **0.276** |             |             | 2026-08-18 01:14 |
 | qwen3:0.6b   | 4096  | medium | non-stream | GPU    | Ollama 0.32.6   | 15 632.2      | 600.7        | 128     | 1 882      | 145     | 1.133     |             |             | 2026-08-18 01:14 |
 | qwen3:0.6b   | 4096  | medium | non-stream | GPU    | **loken 0.1.0** | **3 528.5**   | **685.0**    | **128** | **269**    | **37**  | **0.289** | **+14.0%**  | **+292.0%** | 2026-08-18 01:14 |
-| qwen3:0.6b   | 4096  | medium | stream     | GPU    | Ollama 0.32.6   | 15 411.6      | 594.4        | 128     | 1 963      | 156     | 1.219     |             |             | 2026-08-18 01:14 |
-| qwen3:0.6b   | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **3 864.7**   | **679.1**    | **128** | **260**    | **40**  | **0.316** | **+14.2%**  | **+285.6%** | 2026-08-18 01:14 |
+| qwen3:0.6b   | 4096  | medium | stream     | GPU    | Ollama 0.32.6   | 12 016.5      | 455.9        | 128     | 1 766      |  -      |  -        |             |             | 2026-09-01 13:44 |
+| qwen3:0.6b   | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **1 759.8**   | **718.1**    | **128** | **265**    | ** - ** | ** - **   | **+57.5%**  |             | 2026-09-01 13:44 |
 | qwen3:0.6b   | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   | 4 336.4       | 190.0        | 128     | 1 792      |  -      |  -        |             |             | 2026-09-01 12:06 |
 | qwen3:0.6b   | 4096  | short  | non-stream | GPU    | **loken 0.1.0** | **671.3**     | **500.5**    | **128** | **268**    | ** - ** | ** - **   | **+163.4%** |             | 2026-09-01 12:06 |
 | qwen3:0.6b   | 4096  | short  | stream     | CPU    | Ollama 0.32.6   | 1 154.6       | 45.6         | 128     | 4 286      | 186     | 1.451     |             |             | 2026-08-18 01:14 |
@@ -690,9 +724,9 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | qwen3:8b     | 4096  | medium | non-stream | GPU    | Ollama 0.32.6   | 4 006.3       | 139.5        | 128     | 3 004      | 369     | 2.886     |             |             | 2026-08-18 01:14 |
 | qwen3:8b     | 4096  | medium | non-stream | GPU    | vLLM 0.22.0     |  -            | 133.0        | 128     | 966        | 200     | 1.559     |             |             | 2026-08-18 01:14 |
 | qwen3:8b     | 4096  | medium | non-stream | GPU    | **loken 0.1.0** | **4 068.9**   | **139.4**    | **128** | **989**    | **239** | **1.868** | -0.1%       | -16.5%      | 2026-08-18 01:14 |
-| qwen3:8b     | 4096  | medium | stream     | GPU    | Ollama 0.32.6   | 4 012.6       | 139.1        | 128     | 2 922      | 366     | 2.858     |             |             | 2026-08-18 01:14 |
-| qwen3:8b     | 4096  | medium | stream     | GPU    | vLLM 0.22.0     |  -            | 139.7        | 128     | 1 012      | 204     | 1.592     |             |             | 2026-08-18 01:14 |
-| qwen3:8b     | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **3 845.2**   | **138.4**    | **128** | **984**    | **240** | **1.879** | -1.0%       | -15.3%      | 2026-08-18 01:14 |
+| qwen3:8b     | 4096  | medium | stream     | GPU    | Ollama 0.32.6   | 2 827.9       | 96.7         | 128     | 3 241      |  -      |  -        |             |             | 2026-09-01 13:46 |
+| qwen3:8b     | 4096  | medium | stream     | GPU    | vLLM 0.22.0     |  -            | 139.6        | 128     | 970        |  -      |  -        |             |             | 2026-09-01 13:46 |
+| qwen3:8b     | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **1 226.4**   | **138.7**    | **128** | **1 014**  | ** - ** | ** - **   | -0.6%       |             | 2026-09-01 13:46 |
 | qwen3:8b     | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   | 1 033.8       | 63.3         | 128     | 3 185      |  -      |  -        |             |             | 2026-09-01 12:08 |
 | qwen3:8b     | 4096  | short  | non-stream | GPU    | vLLM 0.22.0     |  -            | 133.8        | 128     | 959        |  -      |  -        |             |             | 2026-09-01 12:08 |
 | qwen3:8b     | 4096  | short  | non-stream | GPU    | **loken 0.1.0** | **698.4**     | **137.5**    | **128** | **933**    | ** - ** | ** - **   | **+2.8%**   |             | 2026-09-01 12:08 |
@@ -721,8 +755,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | qwen3.5:latest | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **230 400.8** | **111.9**    | **128** | **1 331** | **287** | **2.243** | **+9.1%**   | **+55.2%** | 2026-08-18 01:14 |
 | qwen3.5:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 747.0         | 104.3        | 128     | 3 954     | 449     | 3.508     |             |            | 2026-08-18 01:14 |
 | qwen3.5:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **70 159.8**  | **120.6**    | **128** | **1 225** | **272** | **2.121** | **+15.6%**  | **+65.4%** | 2026-08-18 01:14 |
-| qwen3.5:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 704.8         | 104.4        | 128     | 3 895     | 452     | 3.528     |             |            | 2026-08-18 01:14 |
-| qwen3.5:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **5 343.4**   | **119.6**    | **128** | **1 269** | **267** | **2.083** | **+14.5%**  | **+69.4%** | 2026-08-18 01:14 |
+| qwen3.5:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 572.7         | 76.3         | 128     | 4 281     |  -      |  -        |             |            | 2026-09-01 13:43 |
+| qwen3.5:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **43 852.0**  | **123.7**    | **128** | **1 287** | ** - ** | ** - **   | **+62.2%**  |            | 2026-09-01 13:43 |
 | qwen3.5:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 198.6         | 45.5         | 128     | 4 292     |  -      |  -        |             |            | 2026-09-01 12:05 |
 | qwen3.5:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **38 476.4**  | **107.3**    | **128** | **1 272** | ** - ** | ** - **   | **+135.7%** |            | 2026-09-01 12:05 |
 | qwen3.5:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 213.8         | 75.2         | 128     | 4 250     |  -      |  -        |             |            | 2026-09-01 10:25 |
@@ -740,8 +774,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | qwen3.5:35b | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **212 543.3** | **90.0**     | **128** | **1 895** | **260** | **2.031** | -21.6%     | **+455.4%** | 2026-08-18 01:14 |
 | qwen3.5:35b | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 475.8         | 112.1        | 128     | 22 151    | 1 426   | 11.141    |            |             | 2026-08-18 01:14 |
 | qwen3.5:35b | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **52 192.0**  | **90.9**     | **128** | **1 736** | **231** | **1.806** | -18.9%     | **+517.0%** | 2026-08-18 01:14 |
-| qwen3.5:35b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 481.9         | 113.1        | 128     | 22 665    | 1 457   | 11.386    |            |             | 2026-08-18 01:14 |
-| qwen3.5:35b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **45 239.8**  | **91.8**     | **128** | **1 776** | **235** | **1.833** | -18.8%     | **+521.0%** | 2026-08-18 01:14 |
+| qwen3.5:35b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 481.7         | 113.0        | 128     | 20 424    |  -      |  -        |            |             | 2026-09-01 13:42 |
+| qwen3.5:35b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **35 323.6**  | **133.2**    | **128** | **1 366** | ** - ** | ** - **   | **+17.8%** |             | 2026-09-01 13:42 |
 | qwen3.5:35b | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 166.6         | 55.9         | 128     | 20 500    |  -      |  -        |            |             | 2026-09-01 12:03 |
 | qwen3.5:35b | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **20 501.2**  | **108.7**    | **128** | **1 325** | ** - ** | ** - **   | **+94.4%** |             | 2026-09-01 12:03 |
 | qwen3.5:35b | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 165.6         | 114.1        | 128     | 5 100     |  -      |  -        |            |             | 2026-09-01 10:24 |
@@ -762,9 +796,9 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | qwen3-coder:30b | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 4 119.2       | 145.5        | 128     | 4 160     | 401     | 3.132     |            |          | 2026-08-18 01:14 |
 | qwen3-coder:30b | 4096 | medium | non-stream | GPU    | vLLM 0.22.0     |  -            | 122.4        | 128     | 1 047     | 178     | 1.389     |            |          | 2026-08-18 01:14 |
 | qwen3-coder:30b | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **766.0**     | **144.6**    | **128** | **1 334** | **183** | **1.426** | -0.6%      | -2.6%    | 2026-08-18 01:14 |
-| qwen3-coder:30b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 4 154.1       | 146.9        | 128     | 4 004     | 380     | 2.970     |            |          | 2026-08-18 01:14 |
-| qwen3-coder:30b | 4096 | medium | stream     | GPU    | vLLM 0.22.0     |  -            | 129.1        | 128     | 1 051     | 174     | 1.361     |            |          | 2026-08-18 01:14 |
-| qwen3-coder:30b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **626.3**     | **145.1**    | **128** | **1 329** | **186** | **1.452** | -1.2%      | -6.2%    | 2026-08-18 01:14 |
+| qwen3-coder:30b | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 4 133.8       | 146.5        | 128     | 3 988     |  -      |  -        |            |          | 2026-09-01 13:38 |
+| qwen3-coder:30b | 4096 | medium | stream     | GPU    | vLLM 0.22.0     |  -            | 138.7        | 128     | 995       |  -      |  -        |            |          | 2026-09-01 13:38 |
+| qwen3-coder:30b | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **383.8**     | **177.4**    | **128** | **1 211** | ** - ** | ** - **   | **+21.1%** |          | 2026-09-01 13:38 |
 | qwen3-coder:30b | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 1 435.7       | 85.9         | 128     | 3 943     |  -      |  -        |            |          | 2026-09-01 12:00 |
 | qwen3-coder:30b | 4096 | short  | non-stream | GPU    | vLLM 0.22.0     |  -            | 129.7        | 128     | 996       |  -      |  -        |            |          | 2026-09-01 12:00 |
 | qwen3-coder:30b | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **248.7**     | **134.8**    | **128** | **1 170** | ** - ** | ** - **   | **+3.9%**  |          | 2026-09-01 12:00 |
@@ -784,8 +818,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | qwen3-coder-next:latest | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **5 049.3**   | **5.7**      | **128** | **102 055** | **4 526** | **35.357** | -78.6%   | -79.8%   | 2026-08-18 01:14 |
 | qwen3-coder-next:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 211.1         | 28.2         | 128     | 10 761      | 850       | 6.638      |          |          | 2026-08-18 01:14 |
 | qwen3-coder-next:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **312.9**     | **5.7**      | **128** | **91 632**  | **4 050** | **31.641** | -79.6%   | -79.0%   | 2026-08-18 01:14 |
-| qwen3-coder-next:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 215.4         | 28.3         | 128     | 10 669      | 847       | 6.619      |          |          | 2026-08-18 01:14 |
-| qwen3-coder-next:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **495.4**     | **5.9**      | **128** | **82 882**  | **3 809** | **29.761** | -79.2%   | -77.8%   | 2026-08-18 01:14 |
+| qwen3-coder-next:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 215.2         | 28.4         | 128     | 10 639      |  -        |  -         |          |          | 2026-09-01 13:34 |
+| qwen3-coder-next:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **1 011.2**   | **9.1**      | **128** | **23 020**  | ** - **   | ** - **    | -68.1%   |          | 2026-09-01 13:34 |
 | qwen3-coder-next:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 81.9          | 19.4         | 128     | 10 435      |  -        |  -         |          |          | 2026-09-01 11:56 |
 | qwen3-coder-next:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **409.3**     | **9.1**      | **128** | **23 265**  | ** - **   | ** - **    | -53.0%   |          | 2026-09-01 11:56 |
 | qwen3-coder-next:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 80.1          | 28.1         | 128     | 10 488      |  -        |  -         |          |          | 2026-09-01 10:17 |
@@ -796,8 +830,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | qwen3next:latest        | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **5 519.9**   | **6.3**      | **128** | **68 790**  | **3 339** | **26.088** | -79.0%   | -74.4%   | 2026-08-18 01:14 |
 | qwen3next:latest        | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 224.9         | 23.2         | 128     | 16 220      | 1 196     | 9.348      |          |          | 2026-08-18 01:14 |
 | qwen3next:latest        | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **1 050.9**   | **6.4**      | **128** | **64 210**  | **3 113** | **24.319** | -72.6%   | -61.6%   | 2026-08-18 01:14 |
-| qwen3next:latest        | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 230.0         | 33.1         | 128     | 9 879       | 788       | 6.153      |          |          | 2026-08-18 01:14 |
-| qwen3next:latest        | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **856.1**     | **6.7**      | **128** | **67 547**  | **3 182** | **24.856** | -79.9%   | -75.2%   | 2026-08-18 01:14 |
+| qwen3next:latest        | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 228.8         | 32.5         | 128     | 9 935       |  -        |  -         |          |          | 2026-09-01 13:51 |
+| qwen3next:latest        | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **1 201.3**   | **9.5**      | **128** | **23 900**  | ** - **   | ** - **    | -70.7%   |          | 2026-09-01 13:51 |
 | qwen3next:latest        | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 86.4          | 22.2         | 128     | 9 696       |  -        |  -         |          |          | 2026-09-01 12:13 |
 | qwen3next:latest        | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **318.9**     | **9.6**      | **128** | **21 282**  | ** - **   | ** - **    | -56.6%   |          | 2026-09-01 12:13 |
 | qwen3next:latest        | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 86.4          | 32.9         | 128     | 9 659       |  -        |  -         |          |          | 2026-09-01 10:34 |
@@ -815,8 +849,8 @@ figures are each engine's own bookkeeping, and only the times are measured by th
 | smollm3:latest | 4096 | long   | stream     | GPU    | **loken 0.1.0** | **27 845.1**  | **233.8**    | **128** | **657**    | **133** | **1.037** | **+5.0%**   | **+93.5%**  | 2026-08-18 01:14 |
 | smollm3:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 6 320.1       | 220.5        | 128     | 2 496      | 249     | 1.946     |             |             | 2026-08-18 01:14 |
 | smollm3:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **5 361.0**   | **250.6**    | **128** | **616**    | **116** | **0.910** | **+13.7%**  | **+113.9%** | 2026-08-18 01:14 |
-| smollm3:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 6 243.0       | 220.2        | 128     | 2 507      | 248     | 1.941     |             |             | 2026-08-18 01:14 |
-| smollm3:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **3 044.6**   | **246.9**    | **128** | **636**    | **123** | **0.965** | **+12.1%**  | **+101.2%** | 2026-08-18 01:14 |
+| smollm3:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 4 768.2       | 169.6        | 128     | 2 500      |  -      |  -        |             |             | 2026-09-01 13:52 |
+| smollm3:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **915.8**     | **251.8**    | **128** | **616**    | ** - ** | ** - **   | **+48.5%**  |             | 2026-09-01 13:52 |
 | smollm3:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 1 676.7       | 96.3         | 128     | 2 461      |  -      |  -        |             |             | 2026-09-01 12:14 |
 | smollm3:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **350.8**     | **214.0**    | **128** | **610**    | ** - ** | ** - **   | **+122.2%** |             | 2026-09-01 12:14 |
 | smollm3:latest | 4096 | short  | stream     | CPU    | Ollama 0.32.6   | 693.1         | 11.0         | 128     | 13 711     | 504     | 3.935     |             |             | 2026-08-18 01:14 |
