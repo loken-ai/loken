@@ -105,6 +105,13 @@ measured, and says how many of the section's cells that is.
 
 
 
+
+
+
+
+
+
+
 ### ernie4_5
 
 ![ernie4_5](img/family-ernie4_5.svg)
@@ -291,8 +298,8 @@ measured, and says how many of the section's cells that is.
 | lfm2:latest | 4096  | short  | non-stream | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
 | lfm2:latest | 4096  | short  | stream     | CPU    | Ollama 0.32.6   | 140.4         | 14.4         | 128     | 13 330     | 477     | 3.724     |            |             | 2026-08-18 01:14 |
 | lfm2:latest | 4096  | short  | stream     | CPU    | **loken 0.1.0** | **730.7**     | **14.0**     | **128** | **12 797** | **572** | **4.472** | -3.4%      | -16.7%      | 2026-08-18 01:14 |
-| lfm2:latest | 4096  | short  | stream     | GPU    | Ollama 0.32.6   |  -            |  -           | 128     |  -         |  -      |  -        | incoherent |             | 2026-08-27 06:49 |
-| lfm2:latest | 4096  | short  | stream     | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-08-27 06:49 |
+| lfm2:latest | 4096  | short  | stream     | GPU    | Ollama 0.32.6   |  -            |  -           | 128     |  -         |  -      |  -        | incoherent |             | 2026-09-01 10:00 |
+| lfm2:latest | 4096  | short  | stream     | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-09-01 10:00 |
 | lfm2:latest | 16384 | long   | stream     | GPU    | Ollama 0.32.6   | 23 402.9      | 297.3        | 128     | 2 672      | 242     | 1.894     |            |             | 2026-08-18 01:14 |
 | lfm2:latest | 16384 | long   | stream     | GPU    | **loken 0.1.0** | **355 793.0** | **307.0**    | **128** | **655**    | **111** | **0.869** | **+3.3%**  | **+117.9%** | 2026-08-18 01:14 |
 | lfm2:latest | 32768 | long   | stream     | GPU    | Ollama 0.32.6   | 23 412.8      | 297.3        | 128     | 2 659      | 242     | 1.888     |            |             | 2026-08-18 01:14 |
@@ -364,9 +371,9 @@ measured, and says how many of the section's cells that is.
 | llama3.2:1b          | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **1 518.0**   | **452.0**    | **128** | **332**    | **52**    | **0.408**  | **+49.4%**  | **+288.9%** | 2026-08-18 01:14 |
 | llama3.2:1b          | 4096   | short  | stream     | CPU    | Ollama 0.32.6   | 538.1         | 16.6         | 128     | 9 415      | 357       | 2.791      |             |             | 2026-08-18 01:14 |
 | llama3.2:1b          | 4096   | short  | stream     | CPU    | **loken 0.1.0** | **327.6**     | **15.9**     | **128** | **8 239**  | **414**   | **3.235**  | -3.8%       | -13.7%      | 2026-08-18 01:14 |
-| llama3.2:1b          | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 2 389.6       | 228.1        | 128     | 2 146      |  -        |  -         |             |             | 2026-08-31 23:38 |
+| llama3.2:1b          | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 2 400.0       | 232.2        | 128     | 2 157      |  -        |  -         |             |             | 2026-09-01 10:01 |
 | llama3.2:1b          | 4096   | short  | stream     | GPU    | vLLM 0.22.0     |  -            | 292.6        | 128     | 446        | 88        | 0.685      |             |             | 2026-08-10 07:11 |
-| llama3.2:1b          | 4096   | short  | stream     | GPU    | **loken 0.1.0** | **303.3**     | **451.0**    | **128** | **363**    | ** - **   | ** - **    | **+54.1%**  |             | 2026-08-31 23:38 |
+| llama3.2:1b          | 4096   | short  | stream     | GPU    | **loken 0.1.0** | **737.8**     | **451.0**    | **128** | **344**    | ** - **   | ** - **    | **+54.1%**  |             | 2026-09-01 10:01 |
 | magistral:latest     | 4096   | long   | non-stream | GPU    | Ollama 0.32.6   | 7 722.8       |  -           | 1       | 2 377      | 180       |  -         | no answer   |             | 2026-08-18 01:14 |
 | magistral:latest     | 4096   | medium | non-stream | GPU    | Ollama 0.32.6   | 1 774.3       | 52.4         | 128     | 4 760      | 823       | 6.430      |             |             | 2026-08-18 01:14 |
 | magistral:latest     | 4096   | medium | non-stream | GPU    | **loken 0.1.0** | **1 110.6**   | **53.8**     | **128** | **2 549**  | **661**   | **5.165**  | **+2.8%**   | **+24.5%**  | 2026-08-18 01:14 |
@@ -374,8 +381,8 @@ measured, and says how many of the section's cells that is.
 | magistral:latest     | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **1 064.8**   | **53.3**     | **128** | **2 546**  | **656**   | **5.129**  | **+2.7%**   | **+25.2%**  | 2026-08-18 01:14 |
 | magistral:latest     | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 636.5         | 52.6         | 128     | 4 801      | 814       | 6.362      |             |             | 2026-08-18 01:14 |
 | magistral:latest     | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **477.4**     | **52.6**     | **128** | **2 583**  | **677**   | **5.288**  | **+0.1%**   | **+20.3%**  | 2026-08-18 01:14 |
-| magistral:latest     | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 631.9         | 52.2         | 128     | 4 729      | 807       | 6.305      |             |             | 2026-08-18 01:14 |
-| magistral:latest     | 4096   | short  | stream     | GPU    | **loken 0.1.0** | **226.8**     | **49.2**     | **128** | **2 823**  | **705**   | **5.510**  | -5.9%       | **+14.4%**  | 2026-08-18 01:14 |
+| magistral:latest     | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 427.9         | 36.3         | 128     | 6 343      |  -        |  -         |             |             | 2026-09-01 10:03 |
+| magistral:latest     | 4096   | short  | stream     | GPU    | **loken 0.1.0** | **322.3**     | **51.3**     | **128** | **2 605**  | ** - **   | ** - **    | **+41.5%**  |             | 2026-09-01 10:03 |
 | mistral-nemo:latest  | 4096   | long   | non-stream | GPU    | Ollama 0.32.6   | 15 103.7      | 96.6         | 128     | 3 214      | 428       | 3.340      |             |             | 2026-08-18 01:14 |
 | mistral-nemo:latest  | 4096   | long   | non-stream | GPU    | **loken 0.1.0** | **20 996.2**  | **107.2**    | **128** | **1 270**  | **296**   | **2.312**  | **+11.0%**  | **+44.5%**  | 2026-08-18 01:14 |
 | mistral-nemo:latest  | 4096   | long   | stream     | GPU    | Ollama 0.32.6   | 15 153.6      | 95.9         | 128     | 3 306      | 428       | 3.345      |             |             | 2026-08-18 01:14 |
@@ -386,8 +393,8 @@ measured, and says how many of the section's cells that is.
 | mistral-nemo:latest  | 4096   | medium | stream     | GPU    | **loken 0.1.0** | **3 755.7**   | **103.1**    | **128** | **1 303**  | **299**   | **2.338**  | **+9.0%**   | **+42.3%**  | 2026-08-18 01:14 |
 | mistral-nemo:latest  | 4096   | short  | non-stream | GPU    | Ollama 0.32.6   | 1 062.6       | 96.5         | 128     | 3 231      | 422       | 3.300      |             |             | 2026-08-18 01:14 |
 | mistral-nemo:latest  | 4096   | short  | non-stream | GPU    | **loken 0.1.0** | **682.6**     | **104.1**    | **128** | **1 298**  | **297**   | **2.320**  | **+7.9%**   | **+42.2%**  | 2026-08-18 01:14 |
-| mistral-nemo:latest  | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 1 035.5       | 95.8         | 128     | 3 228      | 423       | 3.306      |             |             | 2026-08-18 01:14 |
-| mistral-nemo:latest  | 4096   | short  | stream     | GPU    | **loken 0.1.0** | **1 014.9**   | **103.1**    | **128** | **1 320**  | **303**   | **2.368**  | **+7.6%**   | **+39.6%**  | 2026-08-18 01:14 |
+| mistral-nemo:latest  | 4096   | short  | stream     | GPU    | Ollama 0.32.6   | 713.5         | 68.1         | 128     | 5 862      |  -        |  -         |             |             | 2026-09-01 10:05 |
+| mistral-nemo:latest  | 4096   | short  | stream     | GPU    | **loken 0.1.0** | **262.8**     | **102.2**    | **128** | **1 356**  | ** - **   | ** - **    | **+50.0%**  |             | 2026-09-01 10:05 |
 
 ### mistral3
 
@@ -417,8 +424,8 @@ measured, and says how many of the section's cells that is.
 | mistral-small3.2:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **839.5**     | **58.8**     | **128** | **2 370** | **698** | **5.454** | **+196.7%** | **+46.3%** | 2026-08-18 01:14 |
 | mistral-small3.2:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 250.7         | 20.0         | 128     | 9 363     | 1 018   | 7.956     |             |            | 2026-08-18 01:14 |
 | mistral-small3.2:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **558.6**     | **59.7**     | **128** | **2 343** | **688** | **5.378** | **+198.9%** | **+47.9%** | 2026-08-18 01:14 |
-| mistral-small3.2:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 252.0         | 19.8         | 128     | 9 212     | 1 026   | 8.018     |             |            | 2026-08-18 01:14 |
-| mistral-small3.2:latest | 4096 | short  | stream     | GPU    | **loken 0.1.0** | **597.2**     | **59.1**     | **128** | **2 341** | **680** | **5.313** | **+198.1%** | **+50.9%** | 2026-08-18 01:14 |
+| mistral-small3.2:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 434.8         | 36.3         | 128     | 6 459     |  -      |  -        |             |            | 2026-09-01 10:07 |
+| mistral-small3.2:latest | 4096 | short  | stream     | GPU    | **loken 0.1.0** | **300.5**     | **59.4**     | **128** | **2 388** | ** - ** | ** - **   | **+63.9%**  |            | 2026-09-01 10:07 |
 
 ### nemotron_h_moe
 
@@ -483,17 +490,17 @@ measured, and says how many of the section's cells that is.
 
 ![phi2](img/family-phi2.svg)
 
-| Model            | Ctx  | Prompt | Mode       | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms  | J/req  | J/token   | Δ decode   | Δ energy    | Date             |
-|------------------|------|--------|------------|--------|-----------------|---------------|--------------|---------|---------|--------|-----------|------------|-------------|------------------|
-| moondream:latest | 4096 | long   | non-stream | GPU    | Ollama 0.32.6   | 35 453.0      |  -           | 1       | 1 614   | 119    |  -        | no answer  |             | 2026-08-18 01:14 |
-| moondream:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 13 143.8      | 471.2        | 128     | 1 923   | 166    | 1.295     |            |             | 2026-08-18 01:14 |
-| moondream:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **4 265.2**   | **624.0**    | **128** | **270** | **46** | **0.360** | **+32.4%** | **+259.6%** | 2026-08-18 01:14 |
-| moondream:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 12 904.2      | 456.7        | 128     | 1 951   | 173    | 1.350     |            |             | 2026-08-18 01:14 |
-| moondream:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **1 200.5**   | **585.3**    | **128** | **292** | **50** | **0.392** | **+28.1%** | **+244.2%** | 2026-08-18 01:14 |
-| moondream:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 4 379.8       | 469.2        | 128     | 1 917   | 173    | 1.348     |            |             | 2026-08-18 01:14 |
-| moondream:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **1 840.9**   | **617.9**    | **128** | **261** | **50** | **0.387** | **+31.7%** | **+248.4%** | 2026-08-18 01:14 |
-| moondream:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 4 553.1       | 455.1        | 128     | 1 952   | 171    | 1.340     |            |             | 2026-08-18 01:14 |
-| moondream:latest | 4096 | short  | stream     | GPU    | **loken 0.1.0** | **2 006.2**   | **608.9**    | **128** | **257** | **39** | **0.305** | **+33.8%** | **+339.5%** | 2026-08-18 01:14 |
+| Model            | Ctx  | Prompt | Mode       | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms  | J/req   | J/token   | Δ decode   | Δ energy    | Date             |
+|------------------|------|--------|------------|--------|-----------------|---------------|--------------|---------|---------|---------|-----------|------------|-------------|------------------|
+| moondream:latest | 4096 | long   | non-stream | GPU    | Ollama 0.32.6   | 35 453.0      |  -           | 1       | 1 614   | 119     |  -        | no answer  |             | 2026-08-18 01:14 |
+| moondream:latest | 4096 | medium | non-stream | GPU    | Ollama 0.32.6   | 13 143.8      | 471.2        | 128     | 1 923   | 166     | 1.295     |            |             | 2026-08-18 01:14 |
+| moondream:latest | 4096 | medium | non-stream | GPU    | **loken 0.1.0** | **4 265.2**   | **624.0**    | **128** | **270** | **46**  | **0.360** | **+32.4%** | **+259.6%** | 2026-08-18 01:14 |
+| moondream:latest | 4096 | medium | stream     | GPU    | Ollama 0.32.6   | 12 904.2      | 456.7        | 128     | 1 951   | 173     | 1.350     |            |             | 2026-08-18 01:14 |
+| moondream:latest | 4096 | medium | stream     | GPU    | **loken 0.1.0** | **1 200.5**   | **585.3**    | **128** | **292** | **50**  | **0.392** | **+28.1%** | **+244.2%** | 2026-08-18 01:14 |
+| moondream:latest | 4096 | short  | non-stream | GPU    | Ollama 0.32.6   | 4 379.8       | 469.2        | 128     | 1 917   | 173     | 1.348     |            |             | 2026-08-18 01:14 |
+| moondream:latest | 4096 | short  | non-stream | GPU    | **loken 0.1.0** | **1 840.9**   | **617.9**    | **128** | **261** | **50**  | **0.387** | **+31.7%** | **+248.4%** | 2026-08-18 01:14 |
+| moondream:latest | 4096 | short  | stream     | GPU    | Ollama 0.32.6   | 3 604.0       | 370.9        | 128     | 447     |  -      |  -        |            |             | 2026-09-01 10:08 |
+| moondream:latest | 4096 | short  | stream     | GPU    | **loken 0.1.0** | **1 647.6**   | **598.1**    | **128** | **245** | ** - ** | ** - **   | **+61.2%** |             | 2026-09-01 10:08 |
 
 ### qwen2
 
