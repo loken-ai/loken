@@ -96,6 +96,10 @@ measured, and says how many of the section's cells that is.
 
 
 
+
+
+
+
 ### ernie4_5
 
 ![ernie4_5](img/family-ernie4_5.svg)
@@ -145,8 +149,8 @@ measured, and says how many of the section's cells that is.
 | gemma4:26b    | 4096  | medium | stream     | GPU    | **loken 0.1.0** | **573.6**     | **89.6**     | **128** | **1 607**  | **229** | **1.789** |            |             | 2026-08-18 01:14 |
 | gemma4:26b    | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   | 65.7          | 102.8        | 128     | 4 600      | 946     | 7.389     |            |             | 2026-08-18 01:14 |
 | gemma4:26b    | 4096  | short  | non-stream | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
-| gemma4:26b    | 4096  | short  | stream     | GPU    | Ollama 0.32.6   | 71.3          | 101.5        | 93      | 4 561      | 351     | 3.759     |            |             | 2026-08-18 01:14 |
-| gemma4:26b    | 4096  | short  | stream     | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
+| gemma4:26b    | 4096  | short  | stream     | GPU    | Ollama 0.32.6   | 5.1           | 101.3        | 93      | 5 661      |  -      |  -        |            |             | 2026-09-01 09:40 |
+| gemma4:26b    | 4096  | short  | stream     | GPU    | **loken 0.1.0** | **245.5**     | **95.5**     | **128** | **1 519**  | ** - ** | ** - **   |            |             | 2026-09-01 09:40 |
 | gemma4:31b    | 4096  | long   | non-stream | GPU    | Ollama 0.32.6   |  -            |  -           |  -      |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
 | gemma4:31b    | 4096  | long   | non-stream | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
 | gemma4:31b    | 4096  | long   | stream     | GPU    | Ollama 0.32.6   |  -            |  -           | 44      |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
@@ -157,8 +161,8 @@ measured, and says how many of the section's cells that is.
 | gemma4:31b    | 4096  | medium | stream     | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
 | gemma4:31b    | 4096  | short  | non-stream | GPU    | Ollama 0.32.6   | 75.7          | 25.8         | 128     | 7 679      | 1 822   | 14.232    |            |             | 2026-08-18 01:14 |
 | gemma4:31b    | 4096  | short  | non-stream | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
-| gemma4:31b    | 4096  | short  | stream     | GPU    | Ollama 0.32.6   | 68.7          | 25.5         | 96      | 7 806      | 1 069   | 11.138    |            |             | 2026-08-18 01:14 |
-| gemma4:31b    | 4096  | short  | stream     | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
+| gemma4:31b    | 4096  | short  | stream     | GPU    | Ollama 0.32.6   | 83.3          | 25.7         | 96      | 7 652      |  -      |  -        |            |             | 2026-09-01 09:42 |
+| gemma4:31b    | 4096  | short  | stream     | GPU    | **loken 0.1.0** | **193.8**     | **24.4**     | **128** | **5 407**  | ** - ** | ** - **   |            |             | 2026-09-01 09:42 |
 | gemma4:latest | 4096  | long   | non-stream | GPU    | Ollama 0.32.6   | 8 157.1       | 115.9        | 128     | 3 841      | 380     | 2.968     |            |             | 2026-08-18 01:14 |
 | gemma4:latest | 4096  | long   | stream     | GPU    | Ollama 0.32.6   | 8 168.3       | 115.3        | 128     | 3 973      | 396     | 3.096     |            |             | 2026-08-18 01:14 |
 | gemma4:latest | 4096  | long   | stream     | GPU    | **loken 0.1.0** | **17 599.2**  | **128.9**    | **128** | **1 064**  | **194** | **1.515** | **+11.8%** | **+104.4%** | 2026-08-18 01:14 |
@@ -170,8 +174,8 @@ measured, and says how many of the section's cells that is.
 | gemma4:latest | 4096  | short  | non-stream | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
 | gemma4:latest | 4096  | short  | stream     | CPU    | Ollama 0.32.6   | 82.9          | 7.0          | 128     | 21 777     | 765     | 5.980     |            |             | 2026-08-18 01:14 |
 | gemma4:latest | 4096  | short  | stream     | CPU    | **loken 0.1.0** | **79.9**      | **6.7**      | **128** | **19 608** | **652** | **5.090** | -4.6%      | **+17.5%**  | 2026-08-18 01:14 |
-| gemma4:latest | 4096  | short  | stream     | GPU    | Ollama 0.32.6   | 653.0         | 119.4        | 128     | 3 782      | 387     | 3.024     |            |             | 2026-08-18 01:14 |
-| gemma4:latest | 4096  | short  | stream     | GPU    | **loken 0.1.0** |  -            |  -           | **128** |  -         |  -      |  -        | incoherent |             | 2026-08-18 01:14 |
+| gemma4:latest | 4096  | short  | stream     | GPU    | Ollama 0.32.6   | 488.7         | 91.1         | 128     | 3 981      |  -      |  -        |            |             | 2026-09-01 09:44 |
+| gemma4:latest | 4096  | short  | stream     | GPU    | **loken 0.1.0** | **544.6**     | **128.4**    | **128** | **1 081**  | ** - ** | ** - **   | **+40.9%** |             | 2026-09-01 09:44 |
 | gemma4:latest | 16384 | long   | stream     | GPU    | Ollama 0.32.6   | 8 418.1       | 119.0        | 128     | 3 811      | 349     | 2.726     |            |             | 2026-08-18 01:14 |
 | gemma4:latest | 16384 | long   | stream     | GPU    | **loken 0.1.0** | **14 816.7**  | **124.8**    | **128** | **1 124**  | **194** | **1.515** | **+4.9%**  | **+79.9%**  | 2026-08-18 01:14 |
 | gemma4:latest | 16384 | short  | stream     | GPU    | Ollama 0.32.6   | 976.8         | 118.7        | 128     | 3 806      | 345     | 2.697     |            |             | 2026-08-18 01:14 |
