@@ -23,6 +23,26 @@ RETIRED_TARGETS = {"llmuse": "loken", "llmserver": "loken"}
 COLS = ["Model", "Ctx", "Prompt", "Mode", "Device", "Engine", "Prefill tok/s", "Decode tok/s", "Tokens",
         "E2E ms", "J/req", "J/token", "Δ decode", "Δ energy", "Date"]
 
+def measured_prefill(r, st):
+    """Prompt tokens divided by the measured time to first token, or nothing.
+
+    Blank rather than falling back to the engine's own figure: a column holding two
+    definitions is the defect this replaces, not a lesser version of it.
+    """
+    # The MEDIAN, where every other figure here takes the mean: the first iteration of a
+    # cell is a cold load, and its time to first token is seconds where the warm ones are
+    # milliseconds. Averaged in, it put ollama's prefill at 4 tok/s on a cell where it does
+    # 642. Decode tolerates the mean because it does not carry that outlier.
+    v = st.get("TTFT")
+    ttft = v.get("p50") if isinstance(v, dict) else v
+    if not ttft:
+        return None
+    toks = next((i.get("prompt_tokens") for i in (r.get("iterations") or [])
+                 if i.get("prompt_tokens")), None)
+    if not toks or ttft <= 0:
+        return None
+    return toks / (ttft / 1000.0)
+
 def stat(st, name):
     """The harness's own aggregate, so the report never defines a second one."""
     v = st.get(name)
@@ -47,7 +67,15 @@ def rows(path, mode, device):
         target = r["target"].lower()
         target = RETIRED_TARGETS.get(target, target)
         out.setdefault((r["model"], r["num_ctx"], r.get("prompt", "short"), mode, device), {})[target] = {
-            "prefill": stat(st, "Prompt tok/s"),
+            # Prompt tokens over the time the bench itself measured to the first one.
+            #
+            # NOT each engine's own prompt_tok_s, which is that engine's timer minus whatever
+            # it does not count, and the engines do not leave out the same things: on a
+            # 15-token prompt ollama reported 652 tok/s where its own time to first token
+            # implies 35, and this engine 49 373 where its own implies 728. Published side by
+            # side those reversed the verdict on three cells of four. One definition, measured
+            # here, or the column is not a comparison.
+            "prefill": measured_prefill(r, st),
             "decode":  stat(st, "Completion tok/s"),
             "e2e":     stat(st, "E2E latency"),
             # What the whole request cost. The per-token rate divides this by a token

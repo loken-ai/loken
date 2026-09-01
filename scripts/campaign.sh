@@ -9,7 +9,11 @@ set -u
 # elsewhere it picks up another config, hence another VRAM budget and another placement, and
 # reports that as a result rather than as an error. Derived from this script's own location, so
 # neither renaming the checkout nor going through the campaign.sh symlink changes what runs.
-cd "$(dirname "$(readlink -f "$0")")/.."
+# Resolved BEFORE the cd: $0 is a relative path when the harness invokes this through the
+# symlink at the workspace root, so resolving it afterwards answers in the new directory and
+# every path derived from it lands one level off.
+HERE="$(dirname "$(readlink -f "$0")")"
+cd "$HERE/.."
 S="${CAMPAIGN_SCRATCH:-$(mktemp -d -t loken-campaign-XXXXXX)}"
 CTX=${CTX:-4096}
 # The sweep has four dimensions, not one: prompt length, context window, streaming and
@@ -20,7 +24,15 @@ MODE=${MODE:-gpu}
 # place a model the way it would in production. Pinning one card measures a machine
 # nobody runs.
 PIN=${PIN:-}
-./assert-binary-current.sh || exit 1
+# Resolved from this script, like the working directory above: the guard sits beside the
+# checkouts, one level up from the tree being measured. A bare relative path looked for it in
+# the tree instead, and every cell of a full matrix exited on "no such file".
+GUARD="$HERE/../../assert-binary-current.sh"
+if [ ! -x "$GUARD" ]; then
+    echo "no binary-currency guard at $GUARD - refusing to measure unguarded" >&2
+    exit 1
+fi
+"$GUARD" || exit 1
 for m in "$@"; do
     tag=$(echo "$m" | tr ':/' '__')
     suffix=""; [ "$MODE" = cpu ] && suffix="_cpu"
