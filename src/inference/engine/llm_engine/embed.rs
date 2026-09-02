@@ -17,7 +17,7 @@ impl LlmEngine {
         input: &str,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         // Route through the ALREADY-LOADED model (last-token hidden + L2 norm), exactly
-        // as rerank routes through its logits. Works with any dense llama-arch GGUF  - 
+        // as rerank routes through its logits. Works with any dense llama-arch GGUF  -
         // an embedding model (qwen3-embedding, e5-mistral, ...) or a chat model as a
         // fallback. Replaces the old separate ACE-Step-encoder-only path that failed on
         // standard GGUFs with `no tensor layers.0.input_layernorm.weight`.

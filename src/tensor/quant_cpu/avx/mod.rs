@@ -120,7 +120,7 @@ pub(crate) unsafe fn join_halves(high: __m128i, low: __m128i) -> __m256i {
 // computed, not tabulated: the pattern IS the sub-block size, and a literal
 // table would state it a second time in a form nothing checks.
 
-/// Selector `i` puts i8 scales `2i` and `2i+1` in front of eight bytes each  - 
+/// Selector `i` puts i8 scales `2i` and `2i+1` in front of eight bytes each  -
 /// q6_K, whose sub-block is 16 values and whose scales are still i8.
 #[inline(always)]
 pub(crate) unsafe fn scale_pair_over_8_bytes(i: usize) -> __m128i {

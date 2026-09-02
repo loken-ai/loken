@@ -291,7 +291,7 @@ impl GenericTransformerLayer {
                 raw_up
             };
             // GELU path: fused_split_gelu_mul reads the packed [B, T, 2N]
-            // matmul output directly and emits [B, T, N] in one kernel  - 
+            // matmul output directly and emits [B, T, N] in one kernel  -
             // no `narrow -> contiguous -> narrow -> contiguous -> fused_gelu_mul`
             // chain (the two narrow-then-contiguous copies were ~2
             // launches per layer of pure data-shuffle).
@@ -460,7 +460,7 @@ impl GenericTransformerLayer {
                     // Measured: the substrate kernel
                     // commit 651de9e1 shipped a BF16-output variant of
                     // the fused (gate+up+silu) Q4_K kernel. Engine path
-                    // widened to BF16 and tested on deepcoder long  - 
+                    // widened to BF16 and tested on deepcoder long  -
                     // regressed 78.3->76.6 tok/s (-2.2 %). The BF16
                     // input -> Q8_1 quantize step is measurably slower
                     // than F32 -> Q8_1, and the downstream cast that was

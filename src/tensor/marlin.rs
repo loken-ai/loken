@@ -604,7 +604,7 @@ mod tests {
     /// difference is zero.
     ///
     /// Nothing cancels between the two sides. The reference does not share a rounded quantity
-    /// with the kernel - it starts from `q`, `z` and `s` and reconstructs the weight itself  - 
+    /// with the kernel - it starts from `q`, `z` and `s` and reconstructs the weight itself  -
     /// and each of those varies enough to be judged: `z` differs per column and per group, so
     /// a kernel that dropped the zero point would fail; `s` takes three different values, so a
     /// kernel that read a neighbouring group's scale would disagree on two columns in three;
@@ -629,7 +629,9 @@ mod tests {
     impl AwqLinear {
         fn generate(k: usize, n: usize, group_size: usize, seed: u32) -> Self {
             let groups = k / group_size;
-            let q: Vec<u8> = (0..k * n).map(|i| (hash(i, seed) >> 17) as u8 & 0xF).collect();
+            let q: Vec<u8> = (0..k * n)
+                .map(|i| (hash(i, seed) >> 17) as u8 & 0xF)
+                .collect();
             let z: Vec<u8> = (0..groups * n)
                 .map(|i| (hash(i + k * n, seed) >> 19) as u8 & 0xF)
                 .collect();
@@ -680,9 +682,15 @@ mod tests {
         }
 
         fn upload(&self, dev: &std::sync::Arc<crate::tensor::cuda::CudaDevice>) -> MarlinAwqLayer {
-            let r =
-                repack_awq_to_marlin(&self.qweight, &self.qzeros, &self.s, self.k, self.n, self.group_size)
-                    .expect("repack");
+            let r = repack_awq_to_marlin(
+                &self.qweight,
+                &self.qzeros,
+                &self.s,
+                self.k,
+                self.n,
+                self.group_size,
+            )
+            .expect("repack");
             MarlinAwqLayer::new(dev, &r).expect("upload")
         }
 

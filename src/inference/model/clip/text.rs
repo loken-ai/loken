@@ -9,10 +9,10 @@
 //! [`Transformer::hidden_state`] stops short of the last layers and skips the final norm,
 //! which is what SDXL conditions on.
 
-use crate::tensor::Module;
-use crate::tensor::layer::{embedding, layer_norm, linear, Embedding, LayerNorm, Mlp};
 use crate::inference::model::attention::{Kv, Mask, MultiHeadAttention};
+use crate::tensor::layer::{embedding, layer_norm, linear, Embedding, LayerNorm, Mlp};
 use crate::tensor::ops::Activation;
+use crate::tensor::Module;
 use crate::tensor::VarBuilder;
 use crate::tensor::{self, Tensor};
 

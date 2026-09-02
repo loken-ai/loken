@@ -623,7 +623,11 @@ pub(crate) async fn recommended_model(
     drop(engines);
 
     let overhead = (resident_count > 0)
-        .then(|| total_bytes.saturating_sub(free_bytes).saturating_sub(resident_weights))
+        .then(|| {
+            total_bytes
+                .saturating_sub(free_bytes)
+                .saturating_sub(resident_weights)
+        })
         .map(|paid| paid / resident_count as u64);
     let budget = free_bytes.saturating_sub(overhead.unwrap_or(0));
 
@@ -656,7 +660,10 @@ pub(crate) async fn recommended_model(
 /// Ties go to the name that sorts first, so two builds of one machine answer the same thing;
 /// a catalogue walk in directory order would not.
 fn largest_that_fits(catalogue: &[(String, u64)], budget: u64) -> (Option<&(String, u64)>, usize) {
-    let fits: Vec<&(String, u64)> = catalogue.iter().filter(|(_, size)| *size <= budget).collect();
+    let fits: Vec<&(String, u64)> = catalogue
+        .iter()
+        .filter(|(_, size)| *size <= budget)
+        .collect();
     let best = fits
         .iter()
         .copied()

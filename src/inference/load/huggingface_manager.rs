@@ -66,7 +66,7 @@ fn resolve_hub_dir(dir: PathBuf) -> PathBuf {
 /// branch lives at `refs/main`; some repos (PR previews, alternative
 /// branches) only have `refs/refs/pr/<n>` or other custom paths. As a
 /// final fallback, when refs are missing entirely but there's exactly
-/// one snapshot directory whose name is a 40-char git SHA, use that  - 
+/// one snapshot directory whose name is a 40-char git SHA, use that  -
 /// covers the case where the refs subtree was lost in a file move but
 /// snapshots survived.
 fn pick_revision(model_dir: &std::path::Path) -> Option<String> {

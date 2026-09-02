@@ -5,7 +5,7 @@
 use super::*;
 
 /// Every kernel this file launches is built on the `m16n8k32` integer MMA, which arrived with
-/// Ampere. A Turing card has no code for any of them, so the answer here is "not this path"  - 
+/// Ampere. A Turing card has no code for any of them, so the answer here is "not this path"  -
 /// exactly as for an unsupported dtype, and never a launch that would fail.
 fn card_has_the_instruction(input: &Tensor) -> bool {
     input

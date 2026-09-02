@@ -145,7 +145,7 @@ pub struct GenericTransformerLayer {
     /// Per-layer constant norm weights/biases as f32 (lazily built once,
     /// reused every token - removes ~5 `to_vec1` allocs/layer/token).
     pub cpu_norm_cache: Option<crate::inference::kernel::cpu_decode_exec::DecodeNormCache>,
-    /// Optional Q4_0-quantized KV cache (KIVI-style, per-channel K)  - 
+    /// Optional Q4_0-quantized KV cache (KIVI-style, per-channel K)  -
     /// populated when `config.kv_quant == Q4` and device is CUDA. Halves
     /// KV vs Q8 / quarters vs F16. Decode path uses
     /// `attn_scores`+`attn_output` directly; prefill / multi-token paths
@@ -428,4 +428,3 @@ impl std::fmt::Debug for GenericHeteroTransformer {
 }
 
 unsafe impl Send for GenericHeteroTransformer {}
-

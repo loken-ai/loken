@@ -494,8 +494,8 @@ mod tests {
                 .map(|i| ((i + step * 7) as f32 * 0.13).cos() - 0.3)
                 .collect();
             let before = sample.clone();
-            let dt = (sched.sigmas[sched.step_index() + 1] - sched.sigmas[sched.step_index()])
-                as f32;
+            let dt =
+                (sched.sigmas[sched.step_index() + 1] - sched.sigmas[sched.step_index()]) as f32;
 
             let out = sched
                 .step(

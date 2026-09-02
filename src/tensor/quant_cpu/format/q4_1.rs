@@ -2,7 +2,7 @@
 //!
 //! `y = q . d + m`. Where q4_0 centres the codes on zero and pays for it with a bias, this
 //! one carries the block's minimum explicitly, so the sixteen codes span `[min, max]` however
-//! that interval sits. It costs two more bytes per block and reconstructs a one-sided block  - 
+//! that interval sits. It costs two more bytes per block and reconstructs a one-sided block  -
 //! the output of a ReLU, say - far better, because none of its range is spent below zero.
 //!
 //! Same nibble packing as q4_0: byte `j` holds value `j` low and value `j + 16` high.

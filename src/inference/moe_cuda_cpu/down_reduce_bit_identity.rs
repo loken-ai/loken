@@ -282,12 +282,7 @@ fn fused_matches_twophase(
     .expect("fused produced output");
 
     let d = maxabs(&twophase, &fused);
-    assert_eq!(
-        d,
-        0.0,
-        "{} maxabs(twophase,fused)={d}",
-        case.label()
-    );
+    assert_eq!(d, 0.0, "{} maxabs(twophase,fused)={d}", case.label());
 }
 
 #[test]
@@ -311,8 +306,7 @@ fn q6k_decode_gemv_matches_reference() {
     for &(n, tk, e) in &[(1usize, 8usize, 32usize), (2, 4, 8), (3, 4, 8), (7, 2, 4)] {
         for &res in &[false, true] {
             for &(hidden, k) in &[(512usize, 512usize), (1024, 512), (256, 256)] {
-                let case =
-                    Case::build(&mut keep, GgmlDType::Q6K, n, tk, e, hidden, k, res);
+                let case = Case::build(&mut keep, GgmlDType::Q6K, n, tk, e, hidden, k, res);
                 let twophase = case.twophase();
                 let gemv = fused_down_reduce_q6k_gemv(
                     &case.input,

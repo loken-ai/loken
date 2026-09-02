@@ -222,7 +222,7 @@ pub(crate) trait ModelBackend: Send {
                 }
                 Err(e) if is_cuda_oom(&e) && !asked_for_room => {
                     // The ladder has bottomed out: at the minimum chunk the activation peak is
-                    // small, so a card that still cannot serve it is full of something else  - 
+                    // small, so a card that still cannot serve it is full of something else  -
                     // an idle model from another engine, most often. Every other engine asks
                     // the pressure protocol for room before giving up; this path never did,
                     // and surfaced the OOM to the caller instead while gigabytes sat reclaimable
@@ -1477,7 +1477,10 @@ mod prefill_chunk_memo_tests {
         let before = crate::inference::place::vram_manager::residency_epoch();
         crate::inference::place::vram_manager::residency_changed();
         let after = crate::inference::place::vram_manager::residency_epoch();
-        assert_ne!(before, after, "the memo key never changes, so it never invalidates");
+        assert_ne!(
+            before, after,
+            "the memo key never changes, so it never invalidates"
+        );
     }
 
     /// Two calls with no residency change in between agree. Without the memo they would too,

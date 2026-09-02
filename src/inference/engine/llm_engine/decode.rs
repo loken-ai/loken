@@ -139,7 +139,7 @@ pub(super) fn gpu_sample_returning_tensor(
 /// Runs the full gptoss/lfm2 capture recipe: adaptive capture arena
 /// (seed 16 MB, double on overflow, ceiling = free VRAM - 1/8), capture
 /// on the MODEL's stream, 0-node defense, node-type histogram, and
-/// resource pre-upload. Returns `Some((graph, logits_ref))` on success  - 
+/// resource pre-upload. Returns `Some((graph, logits_ref))` on success  -
 /// note a capture only RECORDS: the logits buffer has NOT been written
 /// for this token; the caller must `graph.launch()` once and run
 /// probation validation before sampling.
@@ -210,7 +210,7 @@ pub(super) fn capture_decode_graph(
                 if overflow > 0 {
                     // The forward spilled past the arena into real
                     // allocations (-> MEM_ALLOC nodes that relocate on
-                    // replay). Discard this graph, grow, recapture  - 
+                    // replay). Discard this graph, grow, recapture  -
                     // unless already at the VRAM ceiling.
                     drop(g);
                     model.clear_graph_transients();

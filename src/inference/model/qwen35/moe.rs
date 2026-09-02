@@ -238,7 +238,7 @@ fn build_rope(
 
 /// mRoPE-2D cos/sin from per-token 3D positions `(t,h,w)`. For qwen3-vl IMROPE
 /// (`mrope_interleaved=true`, sections `[11,11,10]` over the 32 freq pairs of
-/// rope_dim=64), freq pair `j` rotates by position component `[t,h,w][j%3]`  - 
+/// rope_dim=64), freq pair `j` rotates by position component `[t,h,w][j%3]`  -
 /// the bounds in ggml's is_imrope branch collapse to exactly this j%3 rule for
 /// these section sizes. For text tokens `t==h==w` this is bit-identical to
 /// `build_rope` (which is why the text path already works). Returns
@@ -1067,7 +1067,7 @@ impl Qwen35DeltaNet {
                 None => ((alpha.broadcast_add(&self.dt_bias)?.exp()? + 1.0)?).log()?,
             };
             // g = ssm_a . softplus(alpha+dt) ; decay = exp(g) in (0,1).
-            // GGUF `ssm_a` is ALREADY -exp(A_log) (all-negative, like nemotron)  - 
+            // GGUF `ssm_a` is ALREADY -exp(A_log) (all-negative, like nemotron)  -
             // multiply directly, do NOT apply -exp() again.
             let gdecay = self.a_log.broadcast_mul(&sp)?.exp()?; // [b, n_v]
             let beta = crate::tensor::ops::sigmoid(&b_t.to_dtype(DType::F32)?)?; // [b, n_v]
@@ -2038,7 +2038,8 @@ impl Qwen35MoeModel {
         }
         let x = x.i((.., seq - 1, ..))?.to_device(&self.head_dev)?;
         let x = self.norm.forward(&x.to_dtype(DType::F32)?)?;
-        self.lm_head.forward(&x.to_dtype(self.dtype)?)?
+        self.lm_head
+            .forward(&x.to_dtype(self.dtype)?)?
             .to_dtype(DType::F32)
     }
 
@@ -2074,7 +2075,8 @@ impl Qwen35MoeModel {
         }
         let x = x.i((.., seq - 1, ..))?.to_device(&self.head_dev)?;
         let x = self.norm.forward(&x.to_dtype(DType::F32)?)?;
-        self.lm_head.forward(&x.to_dtype(self.dtype)?)?
+        self.lm_head
+            .forward(&x.to_dtype(self.dtype)?)?
             .to_dtype(DType::F32)
     }
 }
@@ -2083,7 +2085,7 @@ impl Qwen35MoeModel {
 mod tests {
     use super::*;
 
-    // mRoPE with t==h==w must be bit-identical to the 1D scalar build_rope  - 
+    // mRoPE with t==h==w must be bit-identical to the 1D scalar build_rope  -
     // this is the invariant that makes the (already-correct) text path a
     // regression guard for the IMROPE interleave rule used by vision.
     #[test]

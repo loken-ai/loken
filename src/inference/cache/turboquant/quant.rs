@@ -161,9 +161,11 @@ pub fn quantise_run(values: &[f32], values_per_group: usize, scheme: Scheme) -> 
                     indices.extend(std::iter::repeat(0u8).take(group.len()));
                 } else {
                     let inv = 1.0 / s;
-                    indices.extend(group.iter().map(|x| {
-                        (((x - z) * inv).round()).clamp(0.0, 7.0) as u8
-                    }));
+                    indices.extend(
+                        group
+                            .iter()
+                            .map(|x| (((x - z) * inv).round()).clamp(0.0, 7.0) as u8),
+                    );
                 }
             }
         }
@@ -213,7 +215,7 @@ mod tests {
 
     #[test]
     fn turboquant_symmetric_scheme_hits_the_codebook_distortion_on_gaussian_data() {
-        // THE PIPELINE VALIDATION. Feed the quantiser exactly what the theory assumes  - 
+        // THE PIPELINE VALIDATION. Feed the quantiser exactly what the theory assumes  -
         // i.i.d. N(0, 1), already Gaussian, no rotation involved - and it must land on the
         // distortion the solver computed for itself: 0.034548, or 14.62 dB. Scaling,
         // packing and code assignment are all in the path, so if any of them is wrong this
@@ -223,7 +225,7 @@ mod tests {
         // scale per group, which is extra side information the Lloyd-Max analysis does not
         // have: a group that happened to draw small values gets a smaller scale and finer
         // resolution. So small groups legitimately beat the fixed-scale figure, and only
-        // the large-group limit - where the per-group RMS converges to the global one  - 
+        // the large-group limit - where the per-group RMS converges to the global one  -
         // is comparable with it. That limit is the check; the trend towards it is what
         // says the gain at small groups is adaptive scaling and not a leak.
         let values = gaussian_sample(1 << 18, 0xBEEF);

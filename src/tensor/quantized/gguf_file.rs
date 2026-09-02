@@ -6,8 +6,8 @@ use std::io::{Read, Seek, SeekFrom};
 // De-wrapped surface (compat->native): the GGUF reader takes/returns the
 // concrete native `Device`/`Error`/`Result` (and `Tensor`, already native
 // via the quantized module).
-use crate::tensor::{Device, Error, Result};
 use self::layout::{read_string, read_u32, read_u64, value_type};
+use crate::tensor::{Device, Error, Result};
 
 /// The GGUF container layout: the single declaration the reader in this module
 /// and the writer in [`crate::tensor::gguf_write`] both consume.
@@ -590,7 +590,7 @@ pub struct Content {
 impl Content {
     /// The directory entry for `name`, or the one error a missing tensor gives.
     ///
-    /// Every read path starts here - through the mapping, through a reader, or host-side  - 
+    /// Every read path starts here - through the mapping, through a reader, or host-side  -
     /// so a caller that asks for a name the file does not carry cannot tell which path it
     /// took from the message, there being nothing to tell apart.
     fn info(&self, name: &str) -> Result<&TensorInfo> {

@@ -501,7 +501,7 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     let by_len = seq_kv_hint.div_ceil(8);
     let nsplit: usize = base.max(by_len).clamp(8, 256).min(seq_kv_hint.max(1));
     // Plain partial (NOT `_pf_`): nsys A/B (qwen3:0.6b, kv≈1.1-1.4K)
-    // measured the software-pipelined variant SLOWER (17.1 vs 16.3 µs/layer)  - 
+    // measured the software-pipelined variant SLOWER (17.1 vs 16.3 µs/layer)  -
     // the +2xHD_BLOCKS registers cost more occupancy than the hidden load
     // latency buys. WIDE combine: one block per (head, 32-dim slice), so the
     // combine keeps up with the chunk-8 nsplit (see kernel comment).
@@ -525,7 +525,7 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
         .map_err(|e| anyhow!("load kernel {combine_name}: {e}"))?;
 
     // Allocate partials at the CONSTANT upper bound (not the runtime nsplit) so the
-    // per-decode-token alloc size never changes as seq_kv (hence nsplit) grows  - 
+    // per-decode-token alloc size never changes as seq_kv (hence nsplit) grows  -
     // the async mempool then reuses one block instead of fragmenting. The kernels
     // index by the runtime `nsplit` (<= MAX_NSPLIT), using only the live prefix.
     const MAX_NSPLIT: usize = 256;

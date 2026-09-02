@@ -6,7 +6,7 @@
 //! forms) and a linear-interpolation resampler with `align_corners=False`
 //! (half-sample-offset) semantics.
 //!
-//! Dev bins under `bin/*.rs` intentionally keep their own tiny local copies  - 
+//! Dev bins under `bin/*.rs` intentionally keep their own tiny local copies  -
 //! they are standalone and some are feature-gated.
 
 use crate::tensor::{Error, Result};

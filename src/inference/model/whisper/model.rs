@@ -13,7 +13,10 @@
 use crate::inference::model::attention::{Kv, Mask, MultiHeadAttention};
 use crate::inference::model::block::CrossAttentionBlock;
 use crate::inference::model::whisper::Config;
-use crate::tensor::layer::{conv1d, embedding, layer_norm, linear, linear_no_bias, same_length_1d, Conv1d, Conv1dConfig, Embedding, LayerNorm};
+use crate::tensor::layer::{
+    conv1d, embedding, layer_norm, linear, linear_no_bias, same_length_1d, Conv1d, Conv1dConfig,
+    Embedding, LayerNorm,
+};
 use crate::tensor::ops::Activation;
 use crate::tensor::VarBuilder;
 use crate::tensor::{Device, Result, Tensor};
@@ -47,7 +50,12 @@ fn attention(n_state: usize, n_head: usize, kv: Kv, vb: VarBuilder) -> Result<Mu
 fn block(n_state: usize, n_head: usize, ca: bool, vb: VarBuilder) -> Result<CrossAttentionBlock> {
     let self_attn = attention(n_state, n_head, Kv::Growing(None), vb.pp("self_attn"))?;
     let cross_attn = match ca {
-        true => Some(attention(n_state, n_head, Kv::Fixed(None), vb.pp("encoder_attn"))?),
+        true => Some(attention(
+            n_state,
+            n_head,
+            Kv::Fixed(None),
+            vb.pp("encoder_attn"),
+        )?),
         false => None,
     };
     CrossAttentionBlock::new(
@@ -293,19 +301,29 @@ mod tests {
         // Every tensor gets its own seed, so a projection read into the wrong slot shows.
         let mut attention_at = |map: &mut HashMap<String, Tensor>, p: &str, base: usize| {
             for (i, name) in ["q_proj", "v_proj", "out_proj"].iter().enumerate() {
-                map.insert(format!("{p}.{name}.weight"), mat(base + i * 2, n_state, n_state));
+                map.insert(
+                    format!("{p}.{name}.weight"),
+                    mat(base + i * 2, n_state, n_state),
+                );
                 map.insert(format!("{p}.{name}.bias"), vec(base + i * 2 + 1, n_state));
             }
             // The key projection is the one without a bias.
-            map.insert(format!("{p}.k_proj.weight"), mat(base + 7, n_state, n_state));
+            map.insert(
+                format!("{p}.k_proj.weight"),
+                mat(base + 7, n_state, n_state),
+            );
         };
         attention_at(&mut map, "self_attn", 1);
         if cross {
             attention_at(&mut map, "encoder_attn", 20);
         }
-        for (i, p) in ["self_attn_layer_norm", "encoder_attn_layer_norm", "final_layer_norm"]
-            .iter()
-            .enumerate()
+        for (i, p) in [
+            "self_attn_layer_norm",
+            "encoder_attn_layer_norm",
+            "final_layer_norm",
+        ]
+        .iter()
+        .enumerate()
         {
             map.insert(format!("{p}.weight"), vec(40 + i * 2, n_state));
             map.insert(format!("{p}.bias"), vec(41 + i * 2, n_state));
@@ -351,9 +369,7 @@ mod tests {
 
         let mut whole = block(n_state, n_head, true, vb.clone()).unwrap();
         whole.clear();
-        let at_once = whole
-            .forward(&xs, Some(&xa), Mask::Table(&mask))
-            .unwrap();
+        let at_once = whole.forward(&xs, Some(&xa), Mask::Table(&mask)).unwrap();
 
         let mut stepped = block(n_state, n_head, true, vb).unwrap();
         let mut rows = Vec::new();
@@ -372,11 +388,18 @@ mod tests {
         let step_by_step = Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1).unwrap();
 
         let a = at_once.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = step_by_step.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = step_by_step
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         let gap = a
             .iter()
             .zip(&b)
             .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
-        assert!(gap < 1e-4, "stepped and whole-prefix decoding differ by {gap}");
+        assert!(
+            gap < 1e-4,
+            "stepped and whole-prefix decoding differ by {gap}"
+        );
     }
 }

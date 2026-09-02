@@ -438,7 +438,10 @@ fn the_wide_rmsnorm_matches_the_narrow_one_bit_for_bit() {
     let (one, _) = crate::tensor::cuda::rms_norm_launch(1, COLS);
     let (many_k, _) = crate::tensor::cuda::rms_norm_launch(ROWS, COLS);
     assert_eq!(one, "fused_rmsnorm_wide_f32");
-    assert_ne!(one, many_k, "both shapes now take {one}: this compares nothing");
+    assert_ne!(
+        one, many_k,
+        "both shapes now take {one}: this compares nothing"
+    );
     let row = data(COLS, 21);
     let w = data(COLS, 22);
     let weight = |g: &crate::tensor::Device| {
@@ -496,7 +499,10 @@ fn the_wide_add_rmsnorm_matches_the_narrow_one_bit_for_bit() {
     let (one, _) = crate::tensor::cuda::add_rms_norm_launch(1, COLS);
     let (many_k, _) = crate::tensor::cuda::add_rms_norm_launch(ROWS, COLS);
     assert_eq!(one, "fused_add_rmsnorm_dual_wide_f32");
-    assert_ne!(one, many_k, "both shapes now take {one}: this compares nothing");
+    assert_ne!(
+        one, many_k,
+        "both shapes now take {one}: this compares nothing"
+    );
 
     let row = data(COLS, 23);
     let res = data(COLS, 24);
@@ -517,13 +523,8 @@ fn the_wide_add_rmsnorm_matches_the_narrow_one_bit_for_bit() {
         .unwrap();
     let (ws, wn) = fused_add_rmsnorm_dual(&on_gpu(&row, 1), &on_gpu(&res, 1), &weight, 1e-6)
         .expect("wide launch");
-    let (ns, nn) = fused_add_rmsnorm_dual(
-        &on_gpu(&row, ROWS),
-        &on_gpu(&res, ROWS),
-        &weight,
-        1e-6,
-    )
-    .expect("narrow launch");
+    let (ns, nn) = fused_add_rmsnorm_dual(&on_gpu(&row, ROWS), &on_gpu(&res, ROWS), &weight, 1e-6)
+        .expect("narrow launch");
     for (what, wide, narrow) in [
         ("sum", ws.to_vec_f32(), ns.to_vec_f32()),
         ("norm", wn.to_vec_f32(), nn.to_vec_f32()),

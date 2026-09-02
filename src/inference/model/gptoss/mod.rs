@@ -537,7 +537,7 @@ impl GptOssAttn {
         // layer at seq==1 sees only the last `window` cached positions, and a
         // full layer sees them all - in BOTH cases every remaining position is
         // causally valid, so no additive mask is needed. Narrow K/V to the last
-        // `window` rows for windowed layers (O(window) instead of O(kv_len)  - 
+        // `window` rows for windowed layers (O(window) instead of O(kv_len)  -
         // half the gpt-oss layers, window=128, at 2.5K that's ~20x less score
         // work + KV read per token). Mirrors the GPU `kv_start` pointer bump.
         // Prefill (seq>1) keeps the full cache + build_mask.
@@ -867,7 +867,7 @@ fn gptoss_graph_enabled() -> bool {
     //    F32 `hidden_buf` (copy_f32_dev) and forward_inner's `x_in` starts the
     //    captured forward from it (eager path passes None -> byte-identical).
     //  • native-substrate replay ILLEGAL_ADDRESS: two captured-H2D/host-bounce
-    //    hazards, both fixed at the substrate level  - 
+    //    hazards, both fixed at the substrate level  -
     //      (a) permute/broadcast kernels uploaded their dim/stride meta arrays
     //          per call from TEMPORARY host Vecs; a captured H2D memcpy node
     //          re-reads that freed host memory on replay -> garbage strides ->
@@ -921,7 +921,7 @@ impl GptOssModel {
         }
 
         let embed_dev = devices[0].clone();
-        // Embedding table in the working dtype (BF16 = 2 bytes, same as F16  - 
+        // Embedding table in the working dtype (BF16 = 2 bytes, same as F16  -
         // ~1.1 GB; gpt-oss is BF16-native so its norms/biases are BF16 too).
         let embed_t = content
             .tensor(reader, "token_embd.weight", &Device::Cpu)?

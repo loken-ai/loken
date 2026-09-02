@@ -676,7 +676,7 @@ impl GenericTransformerLayer {
             let up_states = self.ffn_up.forward(&x_norm)?;
             // Read the packed [.., 2N] matmul output directly (same as the
             // non-graph path in layer_ffn.rs): the narrow->fused_silu_mul chain
-            // materialized both halves via 2 device copies per layer  - 
+            // materialized both halves via 2 device copies per layer  -
             // nsys (qwen3:0.6b decode) showed them as 2x
             // native_slice_u8 + silu_mul ≈ 2 µs/layer vs 1 fused kernel.
             #[cfg(feature = "cuda")]
@@ -1520,7 +1520,7 @@ impl GenericTransformerLayer {
         // applies to phi2-class single-token decode on CUDA with Q4_K
         // weights.
         //
-        // Wired but DISABLED: produces NaN sampling weights  - 
+        // Wired but DISABLED: produces NaN sampling weights  -
         // suspect a layout/scaling mismatch between standalone
         // quantize_q8_1_pub and what attn_qkv expected from
         // QMatMul.forward. Foundation infrastructure (try_phi2_shared_q8_1_qkv
@@ -1977,7 +1977,7 @@ impl GenericTransformerLayer {
                 } else {
                     raw_gate
                 };
-                // GELU-gated multiplication with per-layer input  - 
+                // GELU-gated multiplication with per-layer input  -
                 // fused single-launch (gelu(tanh) * mul) replaces 2 ops.
                 #[cfg(feature = "cuda")]
                 let raw_gelu =
@@ -2028,7 +2028,7 @@ impl GenericTransformerLayer {
                 // OOM at large T).
                 // When both PLE-fuse-conditions AND `ple_output_scale` are
                 // present (the common gemma4 case for layers 0..N-1), fold
-                // the trailing broadcast_mul into the same kernel pass  - 
+                // the trailing broadcast_mul into the same kernel pass  -
                 // saves one more launch per layer x 30 layers = 30 more
                 // launches/token. Otherwise fall back to the rmsnorm+add
                 // 2-op fuse (which itself wins over the 3-launch unfused

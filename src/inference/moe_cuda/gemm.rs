@@ -17,7 +17,7 @@ use half::{bf16, f16};
 
 /// The weight formats the expert kernels serve, and the number each is known by.
 ///
-/// `cuda/moe/moe_gguf.cu` dispatches on that number and its table is these same eight rows  - 
+/// `cuda/moe/moe_gguf.cu` dispatches on that number and its table is these same eight rows  -
 /// the entry points used to carry a copy each, differing by a row or two, which is how a
 /// format came to be accepted here and unhandled there.
 const EXPERT_QUANT_CODES: [(GgmlDType, i32); 8] = [
@@ -206,7 +206,7 @@ pub fn moe_gemm_gguf(
     let dev = input.device().as_cuda_device()?;
     let gguf_dtype = gguf_quant_code(weights.dtype(), ENTRY)?;
     // MXFP4 experts have no WMMA prefill kernel; route prefill through the
-    // (row-per-warp) mmvq path too. Correct numerics, slightly slower prefill  - 
+    // (row-per-warp) mmvq path too. Correct numerics, slightly slower prefill  -
     // acceptable since decode is the bottleneck and prefill is infrequent.
     // The WMMA prefill kernel needs bf16 fragments, which are Ampere and above; below that
     // the family ships no code at all, so a Turing card takes the mmvq path for prefill too.

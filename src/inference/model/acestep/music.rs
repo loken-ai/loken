@@ -7,7 +7,7 @@
 //!
 //! Usage:   acestep_render [prompt.toml]        (default: ./acestep_prompt.toml)
 //!
-//! Style MORPH: with several `[[styles]]`, the styles transition fluidly WITHIN one track  - 
+//! Style MORPH: with several `[[styles]]`, the styles transition fluidly WITHIN one track  -
 //! `generate_cfg_morph` emits ONE continuous autoregressive code stream whose conditioning
 //! caption changes between sections (each section re-prefills [new caption + the codes so far]
 //! and continues), so the model keeps its own musical line while drifting the style. That single

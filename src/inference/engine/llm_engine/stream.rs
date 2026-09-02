@@ -238,7 +238,7 @@ impl LlmEngine {
                     )));
                     return;
                 }
-                // qwen35-VL keeps its image as a single in-prompt sentinel token  - 
+                // qwen35-VL keeps its image as a single in-prompt sentinel token  -
                 // clamp around it (the generic BOS+tail clamp would drop it).
                 let qwen35_sentinel = if state.qwen35_image.is_some() {
                     state.model.qwen35_image_token()
@@ -899,7 +899,7 @@ impl LlmEngine {
 
                 // Incremental decode (2-token sliding window,
                 // decode_step::incremental_chunk_text). The original
-                // implementation called `tokenizer.decode(ALL)` every iter  - 
+                // implementation called `tokenizer.decode(ALL)` every iter  -
                 // O(N) per call -> O(N²) over the stream. For 64 tokens that's
                 // ~2080 token-decode operations; on moondream stream-mode this
                 // CPU work added ~80ms of overhead (~50% of total wall),
@@ -1226,7 +1226,7 @@ impl LlmEngine {
                             compute_ns += t.elapsed().as_nanos() as u64;
                         }
                         // Stream accepted tokens with incremental
-                        // 2-token sliding decode (matches stream_token  - 
+                        // 2-token sliding decode (matches stream_token  -
                         // avoids O(N²) cumulative decode for moondream's
                         // PLD-heavy vision path).
                         for &tok in &accepted_tokens {
@@ -2024,7 +2024,7 @@ impl LlmEngine {
             // Snapshot the cache-representative token sequence so the next request
             // can skip redundant prefill: under the explicit session_id when present,
             // AND under GLOBAL_PROMPT_CACHE_KEY (mirroring the single resident KV) so a
-            // sessionless request can prefix-reuse it (ollama parity). In-memory only  - 
+            // sessionless request can prefix-reuse it (ollama parity). In-memory only  -
             // never persisted (see project_prompt_cache_privacy). The GLOBAL mirror is
             // skipped when LOKEN_NO_GLOBAL_PROMPT_CACHE=1 (multi-tenant privacy).
             {

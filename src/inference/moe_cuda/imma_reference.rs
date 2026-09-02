@@ -73,7 +73,11 @@ impl Bits {
 /// exactly `127 . 2⁻⁶`, and the block's sum is a multiple of `2⁻⁶` below 2¹¹ of them - which is
 /// the range f16 holds without rounding.
 fn exact_q8_1_rows(rows: usize, k: usize, seed: u64) -> Vec<f32> {
-    assert_eq!(k % BLOCK, 0, "an activation row is a whole number of blocks");
+    assert_eq!(
+        k % BLOCK,
+        0,
+        "an activation row is a whole number of blocks"
+    );
     let mut bits = Bits::new(seed);
     let mut out = vec![0.0f32; rows * k];
     for row in 0..rows {
@@ -97,7 +101,7 @@ fn exact_q8_1_rows(rows: usize, k: usize, seed: u64) -> Vec<f32> {
 
 /// An expert stack of dense weights, before quantisation.
 ///
-/// The per-row scale varies so that the superblocks do not all land on the same Q4_K footing  - 
+/// The per-row scale varies so that the superblocks do not all land on the same Q4_K footing  -
 /// a stack of uniform magnitude would exercise one scale and call it the format.
 fn expert_stack(experts: usize, rows: usize, k: usize, seed: u64) -> Vec<f32> {
     let mut bits = Bits::new(seed);
@@ -391,8 +395,8 @@ impl DownCase {
                 want[at] += scale * dot;
                 // The kernel folds each pair in with an atomicAdd, so the scatter costs one
                 // more rounding per contributor on top of the dot product's own.
-                bound[at] += scale.abs()
-                    * (slack + HALF_ULP_F32 * ((self.topk + 1) as f64) * dot.abs());
+                bound[at] +=
+                    scale.abs() * (slack + HALF_ULP_F32 * ((self.topk + 1) as f64) * dot.abs());
             }
         }
         (want, bound)

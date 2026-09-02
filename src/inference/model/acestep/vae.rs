@@ -119,7 +119,7 @@ pub fn conv_transpose1d_gemm_f32(
 
 /// Snake activation (Oobleck VAE), CPU f32, in place. Matches the substrate's CUDA
 /// `native_snake1d_f32`: `y = x + inv_alpha[c].sin(alpha[c].x)²`, per channel. The
-/// params are pre-computed at load (`alpha = exp(α)`, `inv_alpha = 1/exp(β)`  - 
+/// params are pre-computed at load (`alpha = exp(α)`, `inv_alpha = 1/exp(β)`  -
 /// oracle `vae_load_snake`/`vae_load_snake_inv`). `x`: `[C.T]` row-major (C outer);
 /// `alpha`/`inv_alpha`: `[C]`.
 pub fn snake1d_f32(x: &mut [f32], alpha: &[f32], inv_alpha: &[f32], c: usize, t: usize) {
@@ -691,7 +691,7 @@ impl OobleckDecoder {
     }
 
     /// Decode a latent `[c_latent.t_latent]` (channel-major) -> audio `[c_audio.t_audio]`.
-    /// `t_audio = t_latent . Πstride` (1920x for the production config). NOTE: untiled  - 
+    /// `t_audio = t_latent . Πstride` (1920x for the production config). NOTE: untiled  -
     /// production must tile (chunk 1024 / overlap 64) for ~500K-sample widths.
     pub fn decode(
         &self,
@@ -849,7 +849,7 @@ impl EncBlockW {
 
 /// Full Oobleck ENCODER: conv1 -> 5xblock (downsampling) -> snake -> conv2 -> take the 64
 /// mean channels of the 128-ch output. The inverse of [`OobleckDecoder`]; downsamples by
-/// Πstride (1920x for the 48 kHz config). Runs on CPU (the well-tested F32 conv1d path)  - 
+/// Πstride (1920x for the 48 kHz config). Runs on CPU (the well-tested F32 conv1d path)  -
 /// encode is one-shot, not in a hot loop.
 pub struct OobleckEncoder {
     pub conv1: ConvW,
@@ -1183,7 +1183,7 @@ mod tests {
 
     /// PROBE (ignored; needs the real GGUF on disk). Resolves the substrate's
     /// GGUF dim ordering (ggml-ne vs row-major) for conv/convT weights and
-    /// confirms the decoder tensor inventory + that BF16 dequantizes finite  - 
+    /// confirms the decoder tensor inventory + that BF16 dequantizes finite  -
     /// the facts the from_gguf arranger needs. Run:
     ///   cargo test --release --lib inference::model::acestep::vae::tests::probe_vae_gguf -- --ignored --nocapture
     #[test]

@@ -195,7 +195,7 @@ fn head_rms_cpu(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
 fn head_rms_fused(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
     if x.device().is_cuda() {
         // F16-stream fast path: reuse fused_rmsnorm_f16 (F16 in/out, F32-internal
-        // accumulate, F32 weight) which normalizes over the last dim (= head_dim)  - 
+        // accumulate, F32 weight) which normalizes over the last dim (= head_dim)  -
         // identical RMS math but WITHOUT the F16->F32 + F32->F16 cast pair that
         // wrapped the F32 head_rmsnorm kernel. lfm2 decode is launch-bound (nsys
         // ~68% util); QK-norm fires 2x/attn-layer so this drops ~40

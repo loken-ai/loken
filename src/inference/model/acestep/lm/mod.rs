@@ -172,7 +172,7 @@ struct DevScratch {
 /// last dim as a matmul (the native reduce has no CUDA kernel - it would round-trip
 /// to host; per rowxlayerxtoken that flood pegs a host core).
 fn rms_norm_t(x: &Tensor, w: &Tensor, ones: &Tensor, eps: f32) -> Result<Tensor> {
-    // The native substrate now has a FUSED rms_norm CUDA kernel (cuda::rms_norm_f32)  - 
+    // The native substrate now has a FUSED rms_norm CUDA kernel (cuda::rms_norm_f32)  -
     // numerically the same `x/rms(x).w` as the old matmul(ones) reduction, but ONE kernel
     // instead of matmul+affine+sqrt+recip+broadcastx2. Kills ~128 matmul launches/code on the
     // launch-bound audio-LM decode (nsys: 2.89M cuLaunchKernel). `ones` is now unused.

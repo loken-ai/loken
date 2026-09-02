@@ -47,7 +47,7 @@ pub(crate) const GLOBAL_PROMPT_CACHE_KEY: &str = "__loken_global_resident_kv__";
 
 /// Smallest prefill compute-batch the OOM-adaptive prefill will fall back to
 /// before giving up on the GPU path. At 32 tokens the per-forward activation
-/// peak (`32 x widest_ffn x f32`) is ~16x smaller than the 512-token default  - 
+/// peak (`32 x widest_ffn x f32`) is ~16x smaller than the 512-token default  -
 /// enough to fit in the few hundred MB of headroom that a near-full 2-GPU TP
 /// model (deepseek-r1:32b) or a co-resident MoE (gemma4:26b) leaves after the
 /// weights + KV cache. Going below 32 buys little (the attention scores tensor
@@ -476,7 +476,10 @@ impl LlmEngine {
     /// Adapters attached to the loaded model, or nothing when none is loaded.
     pub async fn adapters(&self) -> Vec<String> {
         let guard = self.model_state.lock().await;
-        guard.as_ref().map(|s| s.model.adapters()).unwrap_or_default()
+        guard
+            .as_ref()
+            .map(|s| s.model.adapters())
+            .unwrap_or_default()
     }
 
     /// Replace the attached adapter set on the loaded model. Empty detaches everything.
@@ -493,7 +496,9 @@ impl LlmEngine {
         let wanted: Vec<(String, f32)> = wanted.to_vec();
         let report = tokio::task::spawn_blocking(move || {
             let mut guard = model_state.blocking_lock();
-            let state = guard.as_mut().ok_or_else(|| "no model loaded".to_string())?;
+            let state = guard
+                .as_mut()
+                .ok_or_else(|| "no model loaded".to_string())?;
             state.model.set_adapters(&wanted).map_err(|e| e.to_string())
         })
         .await

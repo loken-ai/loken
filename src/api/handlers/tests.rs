@@ -263,7 +263,7 @@ fn non_chat_pipeline_component_routes_helpfully() {
     let t5 = non_chat_pipeline_component("google/t5-v1_1-xxl").unwrap();
     assert!(t5.contains("T5"), "got: {t5}");
 
-    // Whisper is NOT rejected here on the Ollama /api/chat path  - 
+    // Whisper is NOT rejected here on the Ollama /api/chat path  -
     // it routes to handle_chat_asr (which decodes attached audio
     // from images[] and returns the transcript). The OpenAI-shape
     // chat_completion / text_completions handlers still 400 on

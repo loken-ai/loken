@@ -19,7 +19,12 @@ impl Conv1dConfig {
     ///
     /// Only the padding is nothing. The other three are counts, and a convolution that stepped,
     /// spread or grouped by zero would not be a convolution at all.
-    const PLAIN: Self = Self { padding: 0, stride: 1, dilation: 1, groups: 1 };
+    const PLAIN: Self = Self {
+        padding: 0,
+        stride: 1,
+        dilation: 1,
+        groups: 1,
+    };
 }
 
 impl Default for Conv1dConfig {
@@ -99,8 +104,18 @@ impl Default for Conv2dConfig {
     /// Both axes take the one-dimensional quadruple. There is one set of these numbers in the
     /// module, not two tables that have to be kept in agreement.
     fn default() -> Self {
-        let Conv1dConfig { padding, stride, dilation, groups } = Conv1dConfig::PLAIN;
-        Self { padding, stride, dilation, groups }
+        let Conv1dConfig {
+            padding,
+            stride,
+            dilation,
+            groups,
+        } = Conv1dConfig::PLAIN;
+        Self {
+            padding,
+            stride,
+            dilation,
+            groups,
+        }
     }
 }
 

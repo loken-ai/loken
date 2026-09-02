@@ -12,12 +12,12 @@
 //! is the delay pattern the codec was trained with.
 
 use crate::inference::codec::dac;
+use crate::inference::model::attention::{Kv, Mask, MultiHeadAttention};
+use crate::inference::model::block::CrossAttentionBlock;
 use crate::inference::model::t5::encoder as t5;
 use crate::inference::sample::token_sampling::LogitsProcessor;
 use crate::tensor::layer::{embedding, layer_norm, linear, linear_no_bias};
 use crate::tensor::layer::{Embedding, LayerNorm, Linear};
-use crate::inference::model::attention::{Kv, Mask, MultiHeadAttention};
-use crate::inference::model::block::CrossAttentionBlock;
 use crate::tensor::ops::Activation;
 use crate::tensor::VarBuilder;
 use crate::tensor::{IndexOp, Result, Tensor};
@@ -99,7 +99,7 @@ fn attention(
 
 /// One decoder layer, read off the names parler's checkpoint uses.
 ///
-/// The decoder attends to its own past a step at a time, and to the text encoder's output  - 
+/// The decoder attends to its own past a step at a time, and to the text encoder's output  -
 /// which does not change across a generation - through a projection taken once. Neither
 /// feed-forward projection carries a bias, and the activation between them is the config's.
 fn layer(cfg: &DecoderConfig, vb: VarBuilder) -> Result<CrossAttentionBlock> {
@@ -107,7 +107,12 @@ fn layer(cfg: &DecoderConfig, vb: VarBuilder) -> Result<CrossAttentionBlock> {
     let kv_heads_cross = cfg.num_cross_attention_key_value_heads.unwrap_or(kv_heads);
     CrossAttentionBlock::new(
         attention(cfg, kv_heads, Kv::Growing(None), vb.pp("self_attn"))?,
-        Some(attention(cfg, kv_heads_cross, Kv::Fixed(None), vb.pp("encoder_attn"))?),
+        Some(attention(
+            cfg,
+            kv_heads_cross,
+            Kv::Fixed(None),
+            vb.pp("encoder_attn"),
+        )?),
         cfg.hidden_size,
         cfg.ffn_dim,
         1e-5,

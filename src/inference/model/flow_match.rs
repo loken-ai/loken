@@ -88,7 +88,7 @@ pub fn ramp_stop(from: f64, to: f64, span: usize, i: usize) -> f64 {
 /// The stops of a straight descent from `top` to zero: `steps + 1` of them, ending at 0.
 ///
 /// This is [`ramp_stop`]'s line with the far end pinned to zero, and it is spelled out here
-/// rather than deferred to it. The two agree to about a part in 10^16 and NOT to the last bit  - 
+/// rather than deferred to it. The two agree to about a part in 10^16 and NOT to the last bit  -
 /// `top` scaled by a whole number of steps, against `top` scaled by one minus a fraction, round
 /// apart - and a stop that moves in its last bit is a different denoise step, so a family keeps
 /// the spelling its checkpoint was rendered against. The test below holds them apart on purpose.
@@ -128,7 +128,7 @@ pub fn steps(schedule: &[f64]) -> impl Iterator<Item = (f64, f64)> + '_ {
 
 /// One Euler step: the sample moved by the velocity times the distance crossed.
 ///
-/// `dt` is signed and negative in every schedule here - a step walks DOWN toward zero noise  - 
+/// `dt` is signed and negative in every schedule here - a step walks DOWN toward zero noise  -
 /// and it is applied at the sample's own precision, which is what the model predicted in.
 pub fn euler_step(sample: &Tensor, velocity: &Tensor, dt: f64) -> Result<Tensor> {
     sample + (velocity * dt)
@@ -180,7 +180,10 @@ mod tests {
         }
         for step in 0..=10 {
             let t = step as f64 / 10.0;
-            assert!((static_shift(1.0, t) - t).abs() < 1e-12, "a push of one moved {t}");
+            assert!(
+                (static_shift(1.0, t) - t).abs() < 1e-12,
+                "a push of one moved {t}"
+            );
         }
     }
 
@@ -201,7 +204,10 @@ mod tests {
         // A push of one is the identity in both directions.
         for step in 0..=10 {
             let t = step as f64 / 10.0;
-            assert!((static_unshift(1.0, t) - t).abs() < 1e-12, "a push of one moved {t}");
+            assert!(
+                (static_unshift(1.0, t) - t).abs() < 1e-12,
+                "a push of one moved {t}"
+            );
         }
         // A push of zero collapses every position onto zero, so nothing can undo it - and at
         // the top of the schedule it is worse than that: the quotient is zero over zero. Since
@@ -209,9 +215,16 @@ mod tests {
         // which is why the schedule guards on a positive push before asking for an inverse.
         for step in 1..10 {
             let t = step as f64 / 10.0;
-            assert_eq!(static_shift(0.0, t), 0.0, "a push of zero should collapse {t}");
+            assert_eq!(
+                static_shift(0.0, t),
+                0.0,
+                "a push of zero should collapse {t}"
+            );
         }
-        assert!(static_shift(0.0, 1.0).is_nan(), "zero over zero at the top of the schedule");
+        assert!(
+            static_shift(0.0, 1.0).is_nan(),
+            "zero over zero at the top of the schedule"
+        );
         // The singularity of the inverse sits above one for every push that bends, so no
         // position on a schedule can reach it.
         for shift in [1.5f64, 3.0, 7.0] {

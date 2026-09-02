@@ -24,7 +24,7 @@ const QK: usize = 32; // q8_0 block size
 /// AVX2 sign-extends 8 i8 -> i32 -> f32 and FMAs 8 lanes at a time; the per-key
 /// accumulation order into `o` is preserved (vectorised across the 32 block dims,
 /// not across keys), so it matches the scalar reduction. `o.len() == qs.len()`,
-/// a multiple of 8 (QK=32). Mirrors `cpu_f16_kv::f16_axpy` for the q8_0 store  - 
+/// a multiple of 8 (QK=32). Mirrors `cpu_f16_kv::f16_axpy` for the q8_0 store  -
 /// the decode-attention PV was the scalar long-ctx hotspot (per-token i8->f32).
 #[inline]
 fn q8_pv_axpy(scale: f32, qs: &[i8], o: &mut [f32]) {
@@ -518,7 +518,7 @@ mod tests {
     }
 
     // Causality: in a 2-token multi-attention, query 0 (valid window = 1) must
-    // be bit-identical to single-token attention over a cache holding ONLY t0  - 
+    // be bit-identical to single-token attention over a cache holding ONLY t0  -
     // i.e. it cannot see t1.
     #[test]
     fn multi_query0_is_causal() {

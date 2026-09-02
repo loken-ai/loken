@@ -91,8 +91,13 @@ struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     fn new(dim: usize, max_seq_len: usize, dev: &Device) -> Result<Self> {
-        let (cos, sin) =
-            crate::inference::model::rope::precomput_freqs_cis_yarn(dim, 10000.0, None, max_seq_len, dev)?;
+        let (cos, sin) = crate::inference::model::rope::precomput_freqs_cis_yarn(
+            dim,
+            10000.0,
+            None,
+            max_seq_len,
+            dev,
+        )?;
         Ok(Self { sin, cos })
     }
 

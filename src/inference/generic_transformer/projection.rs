@@ -723,94 +723,94 @@ mod marlin_parity {
         // and hands it to the next through the lock. The narrow shape alone left that
         // arithmetic - the largest single passage still taken from upstream - unjudged.
         for &(k, n, gs) in &[(256usize, 128usize, 128usize), (1024, 16384, 128)] {
-        let mix = |i: usize, salt: u32| -> u32 {
-            (i as u32)
-                .wrapping_mul(2_246_822_519)
-                .wrapping_add(salt)
-                .rotate_left(13)
-        };
-        // Eight output nibbles per i32, so the packed rows are N/8 wide.
-        let qweight: Vec<i32> = (0..k * (n / 8))
-            .map(|i| mix(i, 374_761_393) as i32)
-            .collect();
-        let qzeros: Vec<i32> = (0..(k / gs) * (n / 8))
-            .map(|i| (mix(i, 668_265_263) & 0x7777_7777) as i32)
-            .collect();
-        // Scales small enough that a product of 256 terms stays well inside f16.
-        let scales: Vec<f32> = (0..(k / gs) * n)
-            .map(|i| ((mix(i, 2_654_435_761) >> 20) as f32 / 4096.0) * 0.02 + 0.001)
-            .collect();
-
-        let build = |device: &Device| -> AwqWeight {
-            let qw = Tensor::from_vec(qweight.clone(), vec![k, n / 8], device).unwrap();
-            let qz = Tensor::from_vec(qzeros.clone(), vec![k / gs, n / 8], device).unwrap();
-            let sc = Tensor::from_vec_f32(scales.clone(), vec![k / gs, n])
-                .unwrap()
-                .to_dtype(DType::F16)
-                .unwrap()
-                .to_device(device)
-                .unwrap();
-            AwqWeight {
-                qweight: qw,
-                qzeros: qz,
-                scales: sc,
-                bias: None,
-                k,
-                n,
-                group_size: gs,
-                repacked: std::sync::OnceLock::new(),
-                marlin: std::sync::OnceLock::new(),
-            }
-        };
-
-        // The layer has to exist before the comparison means anything: `build_marlin` declines
-        // on an unsupported shape or when VRAM is tight, and a declined build would leave this
-        // comparing the dp4a path against the host and calling it Marlin coverage.
-        let on_gpu = QMatMul::from_awq(build(&gpu));
-        let marlin_built = match &on_gpu.inner {
-            QMatMulKind::Awq(w) => matches!(w.marlin.get(), Some(Some(_))),
-            _ => false,
-        };
-        assert!(
-            marlin_built,
-            "the Marlin layer was not built for K={k} N={n} group={gs}, so this test would \
-             cover the dp4a path instead"
-        );
-        let on_cpu = QMatMul::from_awq(build(&Device::Cpu));
-
-        for rows in [1usize, 8, 64] {
-            let xv: Vec<f32> = (0..rows * k)
-                .map(|i| ((i % 71) as f32) * 0.013 - 0.45)
+            let mix = |i: usize, salt: u32| -> u32 {
+                (i as u32)
+                    .wrapping_mul(2_246_822_519)
+                    .wrapping_add(salt)
+                    .rotate_left(13)
+            };
+            // Eight output nibbles per i32, so the packed rows are N/8 wide.
+            let qweight: Vec<i32> = (0..k * (n / 8))
+                .map(|i| mix(i, 374_761_393) as i32)
                 .collect();
-            let x_gpu = Tensor::from_vec_f32(xv.clone(), vec![rows, k])
-                .unwrap()
-                .to_dtype(DType::F16)
-                .unwrap()
-                .to_device(&gpu)
-                .unwrap();
-            let x_cpu = Tensor::from_vec_f32(xv, vec![rows, k]).unwrap();
+            let qzeros: Vec<i32> = (0..(k / gs) * (n / 8))
+                .map(|i| (mix(i, 668_265_263) & 0x7777_7777) as i32)
+                .collect();
+            // Scales small enough that a product of 256 terms stays well inside f16.
+            let scales: Vec<f32> = (0..(k / gs) * n)
+                .map(|i| ((mix(i, 2_654_435_761) >> 20) as f32 / 4096.0) * 0.02 + 0.001)
+                .collect();
 
-            let got = on_gpu.forward(&x_gpu).unwrap().to_vec_f32();
-            // CPU-FALLBACK-OK: not a fallback - this IS the judge. The host path is what
-            // the device result is being compared against, so running it is the point.
-            let want = on_cpu.forward(&x_cpu).unwrap().to_vec_f32();
-            assert_eq!(got.len(), rows * n, "rows={rows}: wrong output length");
+            let build = |device: &Device| -> AwqWeight {
+                let qw = Tensor::from_vec(qweight.clone(), vec![k, n / 8], device).unwrap();
+                let qz = Tensor::from_vec(qzeros.clone(), vec![k / gs, n / 8], device).unwrap();
+                let sc = Tensor::from_vec_f32(scales.clone(), vec![k / gs, n])
+                    .unwrap()
+                    .to_dtype(DType::F16)
+                    .unwrap()
+                    .to_device(device)
+                    .unwrap();
+                AwqWeight {
+                    qweight: qw,
+                    qzeros: qz,
+                    scales: sc,
+                    bias: None,
+                    k,
+                    n,
+                    group_size: gs,
+                    repacked: std::sync::OnceLock::new(),
+                    marlin: std::sync::OnceLock::new(),
+                }
+            };
 
-            // The row's own largest output is the scale: a column that cancelled to near zero
-            // cannot be held to a relative bound, and the GPU path carries f16.
-            for r in 0..rows {
-                let scale = (0..n).map(|c| want[r * n + c].abs()).fold(0f32, f32::max) as f64;
-                for c in 0..n {
-                    let (a, b) = (got[r * n + c] as f64, want[r * n + c] as f64);
-                    assert!(
+            // The layer has to exist before the comparison means anything: `build_marlin` declines
+            // on an unsupported shape or when VRAM is tight, and a declined build would leave this
+            // comparing the dp4a path against the host and calling it Marlin coverage.
+            let on_gpu = QMatMul::from_awq(build(&gpu));
+            let marlin_built = match &on_gpu.inner {
+                QMatMulKind::Awq(w) => matches!(w.marlin.get(), Some(Some(_))),
+                _ => false,
+            };
+            assert!(
+                marlin_built,
+                "the Marlin layer was not built for K={k} N={n} group={gs}, so this test would \
+             cover the dp4a path instead"
+            );
+            let on_cpu = QMatMul::from_awq(build(&Device::Cpu));
+
+            for rows in [1usize, 8, 64] {
+                let xv: Vec<f32> = (0..rows * k)
+                    .map(|i| ((i % 71) as f32) * 0.013 - 0.45)
+                    .collect();
+                let x_gpu = Tensor::from_vec_f32(xv.clone(), vec![rows, k])
+                    .unwrap()
+                    .to_dtype(DType::F16)
+                    .unwrap()
+                    .to_device(&gpu)
+                    .unwrap();
+                let x_cpu = Tensor::from_vec_f32(xv, vec![rows, k]).unwrap();
+
+                let got = on_gpu.forward(&x_gpu).unwrap().to_vec_f32();
+                // CPU-FALLBACK-OK: not a fallback - this IS the judge. The host path is what
+                // the device result is being compared against, so running it is the point.
+                let want = on_cpu.forward(&x_cpu).unwrap().to_vec_f32();
+                assert_eq!(got.len(), rows * n, "rows={rows}: wrong output length");
+
+                // The row's own largest output is the scale: a column that cancelled to near zero
+                // cannot be held to a relative bound, and the GPU path carries f16.
+                for r in 0..rows {
+                    let scale = (0..n).map(|c| want[r * n + c].abs()).fold(0f32, f32::max) as f64;
+                    for c in 0..n {
+                        let (a, b) = (got[r * n + c] as f64, want[r * n + c] as f64);
+                        assert!(
                         (a - b).abs() <= 8e-3 * scale,
                         "rows={rows} r={r} col {c}: gpu {a} against the host's {b} on the same \
                          packed weights (row scale {scale})"
                     );
+                    }
                 }
+                eprintln!("K={k} N={n}, {rows} rows: the INT4 GEMM agrees with the host");
             }
-            eprintln!("K={k} N={n}, {rows} rows: the INT4 GEMM agrees with the host");
-        }
         }
     }
 }
@@ -845,10 +845,16 @@ mod lora_tests {
         let base = w.forward(&x).expect("base").to_vec_f32();
 
         w.add_lora(LoraDelta {
-            down: Tensor::from_vec_f32((0..k * r).map(|i| ((i % 5) as f32 - 2.0) / 10.0).collect(), vec![k, r])
-                .expect("down"),
-            up: Tensor::from_vec_f32((0..r * n).map(|i| ((i % 3) as f32 - 1.0) / 10.0).collect(), vec![r, n])
-                .expect("up"),
+            down: Tensor::from_vec_f32(
+                (0..k * r).map(|i| ((i % 5) as f32 - 2.0) / 10.0).collect(),
+                vec![k, r],
+            )
+            .expect("down"),
+            up: Tensor::from_vec_f32(
+                (0..r * n).map(|i| ((i % 3) as f32 - 1.0) / 10.0).collect(),
+                vec![r, n],
+            )
+            .expect("up"),
             scale: 1.0,
         })
         .expect("attach");
@@ -883,14 +889,23 @@ mod lora_tests {
         let base = w.forward(&x).expect("base").to_vec_f32();
         let err = w
             .add_lora(LoraDelta {
-                down: Tensor::from_vec_f32((0..k * r).map(|i| ((i % 5) as f32 - 2.0) / 10.0).collect(), vec![k, r])
+                down: Tensor::from_vec_f32(
+                    (0..k * r).map(|i| ((i % 5) as f32 - 2.0) / 10.0).collect(),
+                    vec![k, r],
+                )
                 .expect("down"),
-                up: Tensor::from_vec_f32((0..r * n).map(|i| ((i % 3) as f32 - 1.0) / 10.0).collect(), vec![r, n])
+                up: Tensor::from_vec_f32(
+                    (0..r * n).map(|i| ((i % 3) as f32 - 1.0) / 10.0).collect(),
+                    vec![r, n],
+                )
                 .expect("up"),
                 scale: 0.0,
             })
             .is_err();
-        assert!(err, "nothing live to fuse is refused rather than half-applied");
+        assert!(
+            err,
+            "nothing live to fuse is refused rather than half-applied"
+        );
         for (b, a) in base.iter().zip(&w.forward(&x).expect("after").to_vec_f32()) {
             assert_eq!(b, a);
         }
@@ -906,7 +921,10 @@ mod lora_tests {
             up: Tensor::from_vec_f32(vec![0.1; 4 * 48], vec![4, 48]).expect("up"),
             scale: 1.0,
         });
-        assert!(bad.is_err(), "48 outputs on a 32-output weight was accepted");
+        assert!(
+            bad.is_err(),
+            "48 outputs on a 32-output weight was accepted"
+        );
         assert_eq!(w.lora_count(), 0);
     }
 
@@ -923,14 +941,23 @@ mod lora_tests {
             "the fast path must handle a plain weight, or this test proves nothing"
         );
         w.add_lora(LoraDelta {
-            down: Tensor::from_vec_f32((0..k * r).map(|i| ((i % 5) as f32 - 2.0) / 10.0).collect(), vec![k, r])
-                .expect("down"),
-            up: Tensor::from_vec_f32((0..r * n).map(|i| ((i % 3) as f32 - 1.0) / 10.0).collect(), vec![r, n])
-                .expect("up"),
+            down: Tensor::from_vec_f32(
+                (0..k * r).map(|i| ((i % 5) as f32 - 2.0) / 10.0).collect(),
+                vec![k, r],
+            )
+            .expect("down"),
+            up: Tensor::from_vec_f32(
+                (0..r * n).map(|i| ((i % 3) as f32 - 1.0) / 10.0).collect(),
+                vec![r, n],
+            )
+            .expect("up"),
             scale: 1.0,
         })
         .expect("attach");
         assert!(!w.forward_slice_cpu(&x, &mut out).expect("slice"));
-        assert!(w.cpu_raw().is_none(), "the raw weight would omit the adapter");
+        assert!(
+            w.cpu_raw().is_none(),
+            "the raw weight would omit the adapter"
+        );
     }
 }

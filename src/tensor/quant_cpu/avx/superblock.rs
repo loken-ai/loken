@@ -141,7 +141,7 @@ pub(crate) fn vec_dot_q2k_q8k(xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
 /// Three bits per value: two in `qs`, the third in a `hmask` bitplane, and
 /// sixteen signed 6-bit scales biased by 32.
 ///
-/// The third bit carries -4 when CLEAR, so the kernel builds it INVERTED  - 
+/// The third bit carries -4 when CLEAR, so the kernel builds it INVERTED  -
 /// `hmask` complemented gives a 0-or-1 that, shifted left by two, is the amount
 /// to subtract. Low part and high part go through `maddubs` separately and the
 /// difference is taken in i16, which keeps both operands unsigned where the

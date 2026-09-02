@@ -7,7 +7,7 @@
 use super::*;
 
 impl Tensor {
-    /// Per-channel bias over `[b, c, ...spatial]` (the conv-bias pattern  - 
+    /// Per-channel bias over `[b, c, ...spatial]` (the conv-bias pattern  -
     /// the channel axis is dim 1, which tail-aligned broadcast can't express).
     pub fn add_channel_bias(&self, bias: &Self) -> Result<Self> {
         let dims = self.dims().to_vec();

@@ -237,7 +237,7 @@ mod tests {
         let (t, c) = (32usize, 128usize);
         let latent = vec![0.05f32; c * t]; // channel-major [c,t]
                                            // NOTE: `decode()` (untiled) derives t_audio from the actual output. `decode_chunked`
-                                           // hardcodes UP=1920 (ACE-Step's 48kHz upsample) and can't yet tile EzAudio's 480x  - 
+                                           // hardcodes UP=1920 (ACE-Step's 48kHz upsample) and can't yet tile EzAudio's 480x  -
                                            // parameterizing the chunk upsample ratio is a Stage-4 follow-up for long-form decode.
         let (audio, c_out, t_audio) = dec.decode(&latent, c, t).unwrap();
         assert_eq!(c_out, 1, "EzAudio VAE is mono");

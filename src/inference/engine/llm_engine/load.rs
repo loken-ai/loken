@@ -364,7 +364,7 @@ pub(super) fn try_wrap_with_vision(
     // text model does NOT have LAYERS on (its pool isn't competing
     // with the text-model KV cache + activations). Fix:
     // was using `cuda_device_ordinals()` which returns ALL detected
-    // GPUs in the model's device map (not just placed-on ones)  - 
+    // GPUs in the model's device map (not just placed-on ones)  -
     // for moondream's text-model-on-GPU-0 + GPU-1-detected case, the
     // "find different GPU" search returned None and the fallback
     // landed CLIP back on GPU 0, OOMing on first request. The

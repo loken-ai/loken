@@ -99,7 +99,7 @@ pub struct GenericLayerFlags {
     /// post-attn_norm input; their outputs are summed into the residual.
     /// Detected by absence of a separate `blk.0.ffn_norm.weight` tensor.
     pub parallel_attn: bool,
-    /// Phi2 / NeoX: input layer norm has both `.weight` and `.bias`  - 
+    /// Phi2 / NeoX: input layer norm has both `.weight` and `.bias`  -
     /// it's a full LayerNorm (subtract mean, divide std, scale, shift),
     /// NOT an RMSNorm. Detected by `blk.0.attn_norm.bias` presence.
     pub layer_norm_with_bias: bool,

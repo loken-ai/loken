@@ -140,11 +140,7 @@ impl VoxtralAudio {
         let (c2b, _) = dqd("a.conv1d.2.bias")?;
         let conv1w = Tensor::from_vec_f32(c1w, (c1d[0], c1d[1], c1d[2]))?.to_device(dev)?;
         let conv2w = Tensor::from_vec_f32(c2w, (c2d[0], c2d[1], c2d[2]))?.to_device(dev)?;
-        let conv1 = Conv1d::new(
-            conv1w,
-            Some(t1(c1b)?),
-            same_length_1d(3, 1),
-        );
+        let conv1 = Conv1d::new(conv1w, Some(t1(c1b)?), same_length_1d(3, 1));
         let conv2 = Conv1d::new(
             conv2w,
             Some(t1(c2b)?),

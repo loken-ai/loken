@@ -225,7 +225,7 @@ pub fn matmul_q4k_repacked_tiled_prequant(
     // Two costs shape the inner kernel, both measured on the isolated kernel:
     //  - The per-column scale/min vectors are widened out of the packed 6-bit
     //    scales by scalar inserts. They depend only on the weight group, so
-    //    they are built once per group here and reused by every row tile  - 
+    //    they are built once per group here and reused by every row tile  -
     //    worthwhile as soon as a group has several tiles to amortize them over.
     //  - Inside a tile the integer partials are accumulated one row at a time.
     //    Holding all rows' partials at once exceeds the architectural vector

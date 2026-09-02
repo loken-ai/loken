@@ -180,7 +180,6 @@ const REPACKED: &[GgmlDType] = &[
     GgmlDType::MxFp4,
 ];
 
-
 /// GGUF blobs from the local model store, smallest first.
 fn find_ggufs() -> Vec<std::path::PathBuf> {
     let dir = crate::config::Config::load_test()
@@ -423,7 +422,7 @@ fn q5_0_gpu_mmvq_matches_oracle() {
 }
 
 /// risk #7): the CPU QKernelMatMul must run the lifted k_quants
-/// dot engine (NOT the dequant-f32 fallback) for the served dtypes  - 
+/// dot engine (NOT the dequant-f32 fallback) for the served dtypes  -
 /// Q4K/Q6K/Q8_0/MxFp4 - and stay inside the quantization-error envelope
 /// of an f64 reference matmul over the dequantized weights. Synthetic
 /// weights, no model store needed.
@@ -918,7 +917,11 @@ fn gguf_container_bytes_are_what_the_reader_expects() {
     assert_eq!(info.offset, 0);
     assert_eq!(info.size_in_bytes(), data.len());
     let host = content.host_tensor(&mut cursor, "a").unwrap();
-    assert_eq!(host.data(), &data[..], "tensor bytes survive the round trip");
+    assert_eq!(
+        host.data(),
+        &data[..],
+        "tensor bytes survive the round trip"
+    );
 }
 
 // -- A quantised forward on a device that allocates nothing -------------------
@@ -936,7 +939,9 @@ fn a_counted_quantized_matmul_answers_the_shape_the_real_one_does() {
     use super::{GgmlDType, QKernelMatMul, QTensor};
     use crate::tensor::{DType, Device, Tensor};
     let (n, k) = (64usize, 256usize);
-    let vals: Vec<f32> = (0..n * k).map(|i| ((i % 53) as f32 - 26.0) / 11.0).collect();
+    let vals: Vec<f32> = (0..n * k)
+        .map(|i| ((i % 53) as f32 - 26.0) / 11.0)
+        .collect();
     let w = Tensor::from_vec(vals, (n, k), &Device::Cpu).unwrap();
     let q = QTensor::quantize_onto(&w, GgmlDType::Q4K, &Device::Cpu).unwrap();
     let blocks = q.native_qtensor().clone();
@@ -1115,7 +1120,12 @@ fn what_a_gguf_load_and_one_forward_would_cost_a_card() {
     use std::collections::HashMap;
 
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
-    for tag in ["qwen3:1.7b", "granite3-moe:1b", "olmoe:latest", "llama3.2:1b"] {
+    for tag in [
+        "qwen3:1.7b",
+        "granite3-moe:1b",
+        "olmoe:latest",
+        "llama3.2:1b",
+    ] {
         let Some(path) = ollama_blob(tag) else {
             eprintln!("{tag:<18} no weights on disk - skipped");
             continue;

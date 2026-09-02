@@ -30,7 +30,10 @@ use std::sync::Arc;
 /// the run is green without having compared anything - which is the more dangerous of the two
 /// and the reason neither is silent. `what` names the coverage the caller is losing.
 fn ampere_card(what: &str) -> Option<Device> {
-    let Some(dev) = crate::tensor::cuda::CudaDevice::new(0).ok().map(Device::Cuda) else {
+    let Some(dev) = crate::tensor::cuda::CudaDevice::new(0)
+        .ok()
+        .map(Device::Cuda)
+    else {
         eprintln!("no CUDA device; {what} NOT covered by this run");
         return None;
     };

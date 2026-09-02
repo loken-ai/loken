@@ -130,7 +130,7 @@ struct Attn {
     /// the rms_qmatmul fused kernel (which calls `device_ptr()` on the
     /// QTensor) can be invoked without going through QMatMul.
     /// Fused Q+K weight, used when V's quantization differs from Q/K's
-    /// (common in K-quants where V is stored at higher precision  - 
+    /// (common in K-quants where V is stored at higher precision  -
     /// e.g. Q4_K_M has Q,K=Q4K and V=Q6K). Reduces 3 launches/layer to
     /// 2. Mutually exclusive with wqkv.
     wqk: Option<crate::tensor::quantized::QMatMul>,
@@ -903,7 +903,7 @@ impl Attn {
             let out = att.matmul(&v)?;
             out.reshape((1, self.n_head, 1, self.head_dim))?
         } else {
-            // Multi-token (prefill / PLD verify): masked softmax(Q.K^T).V  - 
+            // Multi-token (prefill / PLD verify): masked softmax(Q.K^T).V  -
             // the verified path on this model.
             let per_query_head =
                 |t: Tensor| -> Result<Tensor> { repeat_kv(t, self.num_kv_groups)?.contiguous() };

@@ -6,6 +6,9 @@
 //! moved to codec/, media/, token/ and sample/, because every family draws on those.
 
 pub mod acestep;
+/// The attention every encoder-decoder in the tree runs.
+pub mod attention;
+pub mod block;
 pub mod boogu;
 pub mod clip;
 pub mod embedding;
@@ -22,6 +25,8 @@ pub mod moondream;
 pub mod nemotron_h;
 #[cfg(feature = "audio")]
 pub mod parler;
+/// Cutting an image into patches, and putting it back.
+pub mod patches;
 #[cfg(feature = "audio")]
 pub mod piper;
 pub mod pixtral;
@@ -33,6 +38,7 @@ pub mod qwen35;
 pub mod qwen3vl;
 pub mod qwen_image;
 pub mod reranker;
+pub mod rope;
 pub mod sdxl;
 #[cfg(feature = "audio")]
 pub mod stable_audio;
@@ -44,12 +50,6 @@ pub mod umt5;
 pub mod vae_blocks;
 /// The block every vision tower in the tree is made of.
 pub mod vit;
-/// Cutting an image into patches, and putting it back.
-pub mod patches;
-/// The attention every encoder-decoder in the tree runs.
-pub mod attention;
-pub mod block;
-pub mod rope;
 pub mod voxtral;
 pub mod wan;
 #[cfg(feature = "audio")]

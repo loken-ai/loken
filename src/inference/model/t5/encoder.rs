@@ -4,18 +4,18 @@
 //! PHASE-5 MIGRATED: loads and computes on the
 //! NATIVE substrate. The stack runs at the builder's dtype/device (BF16 on GPU
 //! for flux's T5-xxl - bf16 is required, its FF activations overflow f16;
-//! F32 for parler). The embedding table is kept on HOST F32 (CPU lookup  - 
+//! F32 for parler). The embedding table is kept on HOST F32 (CPU lookup  -
 //! avoids bouncing a 250MB table off the GPU every forward) and the looked-up
 //! rows move to the stack's device. T5 numerics preserved: the norm is an
 //! rms_norm, NO 1/sqrt(d) attention scaling (T5 convention), relative-position
 //! bias computed once at block 0 (F32, on-device) and threaded through.
 //! Public boundary speaks the facade `Tensor` until the flip.
 
+use crate::inference::model::attention::{Kv, Mask, MultiHeadAttention};
 use crate::tensor::layer as nl;
 use crate::tensor::layer::{Embedding, Linear, Mlp, RmsNorm};
 use crate::tensor::ops::Activation;
 use crate::tensor::Module;
-use crate::inference::model::attention::{Kv, Mask, MultiHeadAttention};
 use crate::tensor::VarBuilder;
 use crate::tensor::{self, DType, Device, Tensor};
 use serde::Deserialize;
@@ -119,7 +119,7 @@ pub struct Config {
     pub decoder_start_token_id: Option<usize>,
 }
 
-/// The normalisation this family puts before every sub-layer: RMS - no mean subtraction  - 
+/// The normalisation this family puts before every sub-layer: RMS - no mean subtraction  -
 /// over `d_model`, with the epsilon the config states.
 fn norm(cfg: &Config, vb: &VarBuilder) -> tensor::Result<RmsNorm> {
     nl::rms_norm(cfg.d_model, cfg.layer_norm_epsilon as f32, vb)

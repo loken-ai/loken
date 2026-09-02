@@ -422,7 +422,10 @@ impl CudaDevice {
     ) -> Result<CudaFunc> {
         // The module is compiled on the first call for this device and cached under
         // `module_name`; every later call for the same PTX only looks the function up.
-        let func = self.0.custom_fn(module_name, ptx, fn_name).map_err(|e| Error::msg(e.0))?;
+        let func = self
+            .0
+            .custom_fn(module_name, ptx, fn_name)
+            .map_err(|e| Error::msg(e.0))?;
         Ok(CudaFunc {
             func,
             stream: self.0.stream().clone(),

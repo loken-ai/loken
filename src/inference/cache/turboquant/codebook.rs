@@ -51,7 +51,7 @@ const MAX_ITERATIONS: usize = 1000;
 /// Two regimes, because one series cannot cover both: the Maclaurin series is exact-ish
 /// and cheap while `|x|` is small, and loses digits to cancellation as `|x|` grows; the
 /// continued fraction for the complementary function takes over where the series gives up.
-/// The Lloyd-Max boundaries all sit below `|x| = 2`, so the series is what actually runs  - 
+/// The Lloyd-Max boundaries all sit below `|x| = 2`, so the series is what actually runs  -
 /// the tail branch is here so that the function is a function rather than a special case,
 /// and a test pins the two against each other where they meet.
 fn erf(x: f64) -> f64 {
@@ -330,7 +330,10 @@ mod tests {
             "distortion {d} is not the known optimum"
         );
         let snr_db = -10.0 * d.log10();
-        assert!((14.2..15.0).contains(&snr_db), "SNR {snr_db} dB out of range");
+        assert!(
+            (14.2..15.0).contains(&snr_db),
+            "SNR {snr_db} dB out of range"
+        );
 
         // Printed, not just asserted: the eight numbers are the module's one piece of
         // published data and a reader should be able to see them without a debugger.
@@ -374,7 +377,11 @@ mod tests {
     fn turboquant_codebook_round_trips_its_own_levels() {
         let cb = LloydMaxCodebook::gaussian_3bit();
         for i in 0..LEVELS as u8 {
-            assert_eq!(cb.index_of(cb.dequantise(i)), i, "level {i} did not map back");
+            assert_eq!(
+                cb.index_of(cb.dequantise(i)),
+                i,
+                "level {i} did not map back"
+            );
         }
         // Anything past the outer levels saturates rather than wrapping.
         assert_eq!(cb.index_of(1e9), (LEVELS - 1) as u8);

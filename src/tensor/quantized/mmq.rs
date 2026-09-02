@@ -11,7 +11,7 @@ pub(super) struct MmqWorkspace {
     pub(super) main: Option<cudarc::driver::CudaSlice<u8>>,
     pub(super) fixup: Option<cudarc::driver::CudaSlice<u8>>,
     /// Marks the last work enqueued against these buffers, so the next taker can queue
-    /// behind it. There is ONE workspace per device and any number of streams on a device  - 
+    /// behind it. There is ONE workspace per device and any number of streams on a device  -
     /// an LLM and an image engine sharing a card, two requests in flight - and the mutex
     /// below only orders the *host*, which stops mattering the moment a launch returns.
     pub(super) last_use: Option<cudarc::driver::CudaEvent>,

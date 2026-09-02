@@ -56,7 +56,7 @@ fn expert_cache() -> &'static Mutex<HashMap<(usize, Vec<usize>), Option<Arc<Vec<
 
 /// Drop all cached per-expert `QMatMul`s. MUST be called on model unload: the
 /// views hold their parent expert tensor alive (Arc), so a stale entry pins
-/// the previous model's full expert stack in memory for the process lifetime  - 
+/// the previous model's full expert stack in memory for the process lifetime  -
 /// one model-sized leak per reload.
 pub fn clear_expert_cache() {
     expert_cache()
@@ -82,7 +82,7 @@ pub fn clear_expert_cache() {
 // resident expert memory, the cost of the ~2x prefill weight-reuse).
 //
 // Keyed by the tensor's IDENTITY, not its address. An entry here is a copy and holds nothing
-// of the parent, so the parent can be dropped and its address handed to the next allocation  - 
+// of the parent, so the parent can be dropped and its address handed to the next allocation  -
 // which would then be answered with the previous tensor's repack, silently. The identity only
 // counts up, so a stale entry is a leak until `clear_expert_cache`, never a wrong answer.
 #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
@@ -92,7 +92,7 @@ type Q6Kx8 = crate::tensor::quant_cpu::repack_q6k::BlockQ6Kx8;
 
 // One entry per stack, and the entry owns the build. The table's lock guards only the table,
 // so it is dropped before the build starts and a repack never blocks an unrelated stack; the
-// entry's own lock is what makes the build single-flight. A second caller for the same stack  - 
+// entry's own lock is what makes the build single-flight. A second caller for the same stack  -
 // a request arriving while the load-time warm is still running - waits on that entry and is
 // handed the same result, instead of repacking the stack a second time beside it. The two
 // locks are only ever taken in this order and the build takes no other lock, so there is no

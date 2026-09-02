@@ -619,7 +619,7 @@ mod tests {
         // name like "q2_then_q4" (contrived) hits Q2 first because the
         // q2 check fires before q4. Pin this so a future refactor to
         // a HashMap doesn't silently change priority.
-        // (Real-world this matters for the suffixed-name lookup  - 
+        // (Real-world this matters for the suffixed-name lookup  -
         // "q2_k" must hit Q2, not fall through to anything else.)
         assert_eq!(
             QuantizationType::from_gguf_name("q2_k"),
@@ -663,7 +663,7 @@ mod tests {
     // there is not observable from a type check: the same signature returns a
     // different plan, and a different plan is either an out-of-memory at load or
     // layers silently moved to the host. The two functions below state the rule
-    // twice - once as the two-pass device walk, once as it is implemented now  - 
+    // twice - once as the two-pass device walk, once as it is implemented now  -
     // and `placements_agree_over_the_case_table` asserts the two answers are the
     // same object over a table of cases chosen so that each degree of freedom of
     // the rule (device count, budget, layer count, ordering) is exercised.

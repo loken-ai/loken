@@ -254,7 +254,7 @@ impl PagedKvAllocator {
 
     /// Append `add` decoded tokens to `seq`, growing its block table on block
     /// boundaries. Returns the per-token `slot_mapping` (flat KV slot index =
-    /// physical_block * block_size + offset) for the appended tokens, in order  - 
+    /// physical_block * block_size + offset) for the appended tokens, in order  -
     /// exactly what the KV-write kernel needs.
     pub fn append(&mut self, seq: SeqId, add: usize) -> Result<Vec<usize>, AllocErr> {
         // Pre-check growth so we never half-grow (scheduler relies on atomicity).
@@ -1025,7 +1025,7 @@ mod tests {
         a.free(3).unwrap();
         a.free(7).unwrap();
         assert_eq!(a.free_blocks(), 2);
-        // two freed (non-adjacent) blocks fully satisfy a new 2-block sequence  - 
+        // two freed (non-adjacent) blocks fully satisfy a new 2-block sequence  -
         // no contiguity needed (the whole point of paging).
         a.allocate(99, 5).unwrap();
         assert_eq!(a.free_blocks(), 0);

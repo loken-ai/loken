@@ -123,9 +123,8 @@ impl GenericHeteroTransformer {
                 // 26.6 tok/s vs 142.4 graph-off = 5.3x SLOWER (split-path
                 // capture/replay overhead). Even with correct output it would
                 // never be enabled. Do NOT re-attempt gemma4 graph mode.
-                return (!phi2_dev_pos).then_some(
-                    "Q8 KV cache on an arch that measured slower captured than eager",
-                );
+                return (!phi2_dev_pos)
+                    .then_some("Q8 KV cache on an arch that measured slower captured than eager");
             }
             // gemma4 HD=512 still blocked.
             // F-dtype-only path: graph-safe ONLY when head_dim <= 256.
@@ -242,7 +241,7 @@ impl GenericHeteroTransformer {
             return Err(why);
         }
         // Engine-site capture MECHANICS restored (gptoss
-        // treatment, proven end-to-end on the Q4-KV dev-pos path  - 
+        // treatment, proven end-to-end on the Q4-KV dev-pos path  -
         // deepcoder KV=q4 captures 1636 nodes, 0 MEM_ALLOC/MEM_FREE,
         // replays coherently and token-matches the Q8 eager reference):
         //  1. capture happens on the MODEL's stream (`model_cuda_stream`,

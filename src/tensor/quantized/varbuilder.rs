@@ -210,16 +210,9 @@ impl QVarBuilder {
     /// would otherwise run for real - a vocabulary-sized table is gigabytes of host
     /// f32 - to produce values a dry run has no use for, and a dry run allocates
     /// nothing ANYWHERE, host included.
-    fn dense_on(
-        qt: &QHostTensor,
-        device: &crate::tensor::Device,
-    ) -> Result<crate::tensor::Tensor> {
+    fn dense_on(qt: &QHostTensor, device: &crate::tensor::Device) -> Result<crate::tensor::Tensor> {
         if device.is_dry() {
-            return crate::tensor::Tensor::dry(
-                device,
-                crate::tensor::DType::F32,
-                qt.dims.clone(),
-            );
+            return crate::tensor::Tensor::dry(device, crate::tensor::DType::F32, qt.dims.clone());
         }
         let data = qt.dequantize_f32()?;
         crate::tensor::Tensor::from_vec_f32(data, qt.dims.clone())?.to_device(device)

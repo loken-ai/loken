@@ -179,7 +179,7 @@ pub struct DitLinear {
 
 /// A quantized Linear `[out,in]`: the GGUF blocks stay quantized on the weight's
 /// device and dequantize on-the-fly in the matmul kernel (the generic hetero
-/// path, like the LM/Flux DiT). Used for the per-block attention/FFN linears  - 
+/// path, like the LM/Flux DiT). Used for the per-block attention/FFN linears  -
 /// the model's parameter mass - so a 4B-class DiT keeps its compact (≈Q8) device
 /// footprint instead of a 4x F32 blow-up. Bias is `None` for these (bias=false),
 /// ACE-Step publishes its adapters as `a [rank, in]` and `b [out, rank]`, applied with
@@ -837,7 +837,7 @@ impl DitModel {
         let (k, v) = (repeat_kv(k, nrep)?, repeat_kv(v, nrep)?);
         let scale = 1.0f32 / (d as f32).sqrt();
         // Time-varying style morph: an additive cross-attn bias `[s, enc_s]` so query frame `si`
-        // (continuous style position p = si/s.N) attends mostly to its region's style enc tokens  - 
+        // (continuous style position p = si/s.N) attends mostly to its region's style enc tokens  -
         // bias = LOG.(w-1), w = triangular weight of that token's style at p (1 at the region
         // centre, ramping to 0.5 at a boundary -> adjacent styles blend smoothly). None = unchanged.
         let xmask = match &self.xattn_morph {
@@ -1090,7 +1090,7 @@ impl DitModel {
 
     /// One DiT block, fully on-device. The AdaLN-single vectors are derived on the GPU
     /// (`scale_shift_table + tproj`, sliced into the six [1,H] rows) instead of the eager
-    /// path's per-block `scale_shift_table` device->host readback + host `adaln_split`  - 
+    /// path's per-block `scale_shift_table` device->host readback + host `adaln_split`  -
     /// removing a forced sync per block. `tproj` is a per-step [6,H] device tensor.
     /// Bit-identical to [`layer_forward`] (same kernels/values).
     fn layer_forward_fast(

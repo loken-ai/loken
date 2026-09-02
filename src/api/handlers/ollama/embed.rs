@@ -556,7 +556,7 @@ pub(crate) async fn ollama_push_model(
 /// when the data is on disk) and POST would write to a parallel
 /// `sha256:hex` path that the rest of the manager wouldn't find.
 ///
-/// Caller MUST ensure `validate_blob_digest` accepted the input first  - 
+/// Caller MUST ensure `validate_blob_digest` accepted the input first  -
 /// the function relies on the structure (one of two prefixes, exactly
 /// 64 hex chars after).
 pub(super) fn normalize_blob_digest(digest: &str) -> String {

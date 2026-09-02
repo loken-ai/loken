@@ -535,8 +535,11 @@ fn gguf_facts(
             _ => None,
         })
         .or(params);
-    let mut info: serde_json::Map<String, serde_json::Value> =
-        content.metadata.iter().map(|(k, v)| (k.clone(), json(v))).collect();
+    let mut info: serde_json::Map<String, serde_json::Value> = content
+        .metadata
+        .iter()
+        .map(|(k, v)| (k.clone(), json(v)))
+        .collect();
     if let Some(n) = params {
         info.entry("general.parameter_count".to_string())
             .or_insert_with(|| serde_json::Value::from(n));
@@ -1082,14 +1085,17 @@ pub(crate) async fn ollama_show_model(
             let field = |key: &str| -> Option<String> {
                 cfg.as_ref()?.get(key)?.as_str().map(str::to_string)
             };
-            let families = cfg.as_ref().and_then(|c| c.get("model_families")).and_then(|v| {
-                let names: Vec<String> = v
-                    .as_array()?
-                    .iter()
-                    .filter_map(|f| f.as_str().map(str::to_string))
-                    .collect();
-                (!names.is_empty()).then_some(names)
-            });
+            let families = cfg
+                .as_ref()
+                .and_then(|c| c.get("model_families"))
+                .and_then(|v| {
+                    let names: Vec<String> = v
+                        .as_array()?
+                        .iter()
+                        .filter_map(|f| f.as_str().map(str::to_string))
+                        .collect();
+                    (!names.is_empty()).then_some(names)
+                });
             Ok(Json(OllamaShowResponse {
                 license: state.read_manifest_layer(&model_name, "license"),
                 modelfile: None,

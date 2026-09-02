@@ -113,7 +113,8 @@ impl GenericTransformerLayer {
             } else {
                 1000000.0f32
             };
-            let freqs: Vec<f32> = crate::inference::model::rope::inverse_frequencies(self.head_dim, base);
+            let freqs: Vec<f32> =
+                crate::inference::model::rope::inverse_frequencies(self.head_dim, base);
             let freqs = Tensor::new(freqs, &cos.device())?.unsqueeze(0)?;
             let freqs = freqs.broadcast_mul(&inv_factors)?;
             let pos_f32 = Tensor::arange(index_pos as f32, (index_pos + seq_len) as f32)?
@@ -599,9 +600,9 @@ impl GenericTransformerLayer {
                     // scores by its `scale` arg - so we must pass q_scale=1.0
                     // when Q is pre-scaled (with_norm + no_norm full_rope) and
                     // pass q_scale when Q is NOT pre-scaled (partial_rope).
-                    // Mismatch -> double-scale (with_norm/no_norm-full-rope  - 
+                    // Mismatch -> double-scale (with_norm/no_norm-full-rope  -
                     // softmax crushes flat, deepcoder/devstral hd=128 garbage,
-                    // fixed by commit dc6f67b) or zero-scale (partial_rope  - 
+                    // fixed by commit dc6f67b) or zero-scale (partial_rope  -
                     // softmax too sharp, moondream emits fragments).
                     let mut q_was_pre_scaled = true;
                     let (q_h, k_h, v_h) = if want_apq_with_norm {
@@ -717,7 +718,7 @@ impl GenericTransformerLayer {
                     // The 2-kernel chain has ~4x more warps active concurrently
                     // (attn_scores_graph parallelises over both seq and kv_head)
                     // which compensates for the launch overhead + scores buffer
-                    // alloc. v3 fused path is permanently OFF in production  - 
+                    // alloc. v3 fused path is permanently OFF in production  -
                     // 2-kernel chain wins by 2 % on moondream.
                     let try_fused = false;
                     // SPLIT-K flash-decode (diagnostic A/B, gated OFF by default).
@@ -742,7 +743,7 @@ impl GenericTransformerLayer {
                     // So AUTO-ENABLE it for GQA (n_q_per_kv>1, hd∈{64,128}). MHA
                     // (moondream, n_q_per_kv=1) stays OFF: re-measured on
                     // the real vision-caption workload (short KV) it is pure noise
-                    // (short -0.4%, medium +1%, long +1.8%, all within ±9 stddev)  - 
+                    // (short -0.4%, medium +1%, long +1.8%, all within ±9 stddev)  -
                     // the old "+4%" only appeared at long KV, which captioning never
                     // reaches, so there is nothing for the KV-chunk split to divide.
                     // On any kernel error the match below falls back to the chain.
@@ -1320,7 +1321,7 @@ impl GenericTransformerLayer {
                 // score/output matmuls read half the HBM bytes (the dominant
                 // long-context decode cost). Projections/norms/RoPE stay F32;
                 // only the cached K/V (and the attention matmuls reading them,
-                // via the dtype-agnostic standard_attention) drop to F16  - 
+                // via the dtype-agnostic standard_attention) drop to F16  -
                 // exactly ollama's F16 KV, well above the Q8 K-norm noise floor.
                 let k16 = if k.dtype() == crate::tensor::DType::F16 {
                     k
@@ -1407,7 +1408,7 @@ impl GenericTransformerLayer {
         // x dtype_bytes per layer.
         //
         // dropped the `use_graph_ops` gate FOR PHI2 ONLY so
-        // moondream / plain phi2 (blocked on graph capture by // / ) can still route Q8 KV through the dev_pos kernels  - 
+        // moondream / plain phi2 (blocked on graph capture by // / ) can still route Q8 KV through the dev_pos kernels  -
         // the only Q8 attn kernels that fit phi2's hd=64 register
         // budget. `cur_pos_dev` is lazily primed when None so non-graph
         // callers don't need to know about graph-mode plumbing.

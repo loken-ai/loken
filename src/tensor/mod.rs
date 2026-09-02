@@ -145,7 +145,7 @@ pub mod bounce {
     }
 }
 
-/// Error type for the native substrate. Message-based like the current one  - 
+/// Error type for the native substrate. Message-based like the current one  -
 /// op kernels attach context at the call site.
 #[derive(Debug)]
 pub struct Error(pub String);

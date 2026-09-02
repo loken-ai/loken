@@ -365,7 +365,7 @@ fn compile_mmq_kernels() {
     ];
     println!("cargo:rerun-if-changed=cuda/mmq_gguf");
 
-    // The instance files are heavy template expansions (~20s each)  - 
+    // The instance files are heavy template expansions (~20s each)  -
     // compile them in parallel.
     let handles: Vec<std::thread::JoinHandle<PathBuf>> = sources
         .iter()

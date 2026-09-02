@@ -2,7 +2,7 @@
 //!
 //! `y = q . d` over thirty-two values, plus a second scale `s = d . Σq`. That sum exists
 //! because a weight format reconstructing as `q.d + m` needs `m . Σ activations` to finish its
-//! dot product, and computing it here - once, where the codes are already in registers  - 
+//! dot product, and computing it here - once, where the codes are already in registers  -
 //! spares q4_1, q5_1 and their kernels a second pass over the block.
 
 use super::*;

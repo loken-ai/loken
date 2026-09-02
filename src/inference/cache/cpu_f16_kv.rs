@@ -247,7 +247,7 @@ impl CpuF16Kv {
     }
 
     /// As `attention`, plus gpt-oss learned per-head **attention sinks**: a raw
-    /// (unscaled) logit `sinks[qh]` folded into the softmax denominator only  - 
+    /// (unscaled) logit `sinks[qh]` folded into the softmax denominator only  -
     /// it shifts the stabilizing max and adds `exp(sink-m)` to the denom, but
     /// contributes 0 to the V accumulation (no key/value row). Matches
     /// `softmax_last_dim_with_sinks` / ggml `ggml_soft_max_add_sinks`. `sinks`
@@ -281,7 +281,7 @@ impl CpuF16Kv {
         // Run the scan on the SAME spin-pool the FFN GEMVs use, not on rayon.
         // Two live pools fight for the cores: a decode token crosses this scan
         // once per attention layer, and each crossing woke rayon's cold workers
-        // and work-stole while the gemv-pool's own workers were still spinning  - 
+        // and work-stole while the gemv-pool's own workers were still spinning  -
         // `perf` on a decode showed rayon's steal/wait_until_cold/join plus the
         // kernel's schedule/yield paths, and NO attention symbol at all. One pool
         // for the whole layer is ggml's model. Same partition, same math.

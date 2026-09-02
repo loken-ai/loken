@@ -40,7 +40,7 @@ pub use llm_engine::LlmEngine;
 #[cfg(feature = "audio")]
 pub use tts_engine::{TtsEngine, TtsSynthParams};
 
-/// Centralised engine-failure logger. Every engine error path  - 
+/// Centralised engine-failure logger. Every engine error path  -
 /// text-gen, image-gen, audio (ASR), TTS - funnels through here so
 /// a 5xx-shaped response, an SSE error event, or a swallowed
 /// channel error all surface in the server log with consistent

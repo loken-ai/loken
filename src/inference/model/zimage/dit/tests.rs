@@ -910,7 +910,7 @@ fn timestep_embedding_matches_facade() {
 
 /// The grid is its own definition: row `f*H*W + h*W + w` holds `(t0+f, y0+h, x0+w)`.
 ///
-/// The rotary tables are pinned instead of derived, because what they encode is a CHOICE  - 
+/// The rotary tables are pinned instead of derived, because what they encode is a CHOICE  -
 /// which half of the head dimension each axis owns, and whether a pair is adjacent or split
 /// across halves - and a test that re-derived that choice would agree with any convention the
 /// implementation happened to adopt. Regenerate with the ignored `print_fixtures`.
@@ -1198,7 +1198,7 @@ fn a_patched_pair_of_frames_returns_to_itself_too() {
     );
 
     // No round trip is asserted here, and that is a statement about the code rather than
-    // about the test: `unpatchify` does not invert `patchify` when the frame patch is 2  - 
+    // about the test: `unpatchify` does not invert `patchify` when the frame patch is 2  -
     // measured at 142 of 144 values, and identically in the port this replaced, so it is
     // inherited rather than introduced. Nothing shipped reaches it: `all_f_patch_size` is
     // `[1]` for every Z-Image configuration, which is the single-frame path above.

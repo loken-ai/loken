@@ -191,7 +191,7 @@ pub(crate) async fn chat_completion(
     // TTS via the OpenAI shape: the canonical OpenAI endpoint for text
     // -to-speech is /v1/audio/speech. /api/chat (the Ollama shape) has
     // its own handle_chat_tts that embeds audio in message.audios, but
-    // chat-completion responses don't have a documented audios field  - 
+    // chat-completion responses don't have a documented audios field  -
     // direct callers to the right endpoint instead of fabricating one
     // and risking silent SDK breakage.
     if crate::api::handlers::family::is_tts(&model_name) {
@@ -321,7 +321,7 @@ pub(crate) async fn chat_completion(
     // and additive treatment matches how OpenAI's reference samplers
     // compose the two penalties. The sum is clamped to the same
     // [-2, 2] band each individual penalty was validated against,
-    // matching the /v1/completions path's behaviour (line 4029)  - 
+    // matching the /v1/completions path's behaviour (line 4029)  -
     // otherwise both at +2 would yield `repeat_penalty = 5.0`,
     // which is well outside the engine's expected range.
     let oa_pen = (request.frequency_penalty.unwrap_or(0.0)
@@ -376,7 +376,7 @@ pub(crate) async fn chat_completion(
         // finish_reason="length" once it produces the cap-th token.
         let max_tokens_cap = request.max_tokens;
         // Estimate prompt token count once for the trailing usage chunk
-        // (when stream_options.include_usage=true). Cheap heuristic  - 
+        // (when stream_options.include_usage=true). Cheap heuristic  -
         // engine doesn't expose the real tokenizer count in this path.
         let prompt_tokens = estimate_token_count(&prompt) as i32;
         // Echo the client's `service_tier` request into each chunk
@@ -633,7 +633,7 @@ pub(crate) async fn chat_completion(
                 Err(e) => {
                     // Engine error during generation: return 500 with
                     // the OpenAI error envelope rather than a 200 OK
-                    // whose assistant content is the error string  - 
+                    // whose assistant content is the error string  -
                     // SDK clients otherwise treat it as model output.
                     error!("Generation error (OpenAI chat completion): {}", e);
                     return Err(ApiError::Internal(format!("generate: {e}")));
@@ -798,7 +798,7 @@ pub(crate) async fn text_completions(
 ) -> Result<Response, ApiError> {
     let model = text_field(&body, "model");
     // Empty / whitespace-only / oversized / path-traversal model IDs are
-    // all rejected by `validate_model_id` below with the same 400 envelope  - 
+    // all rejected by `validate_model_id` below with the same 400 envelope  -
     // no separate early check needed.
     // OpenAI accepts string OR array-of-strings for `prompt`. Multi-prompt
     // batches map to n independent generations - we don't yet support
@@ -943,7 +943,7 @@ pub(crate) async fn text_completions(
                 "`max_tokens` must be >= 1; got {mt}"
             )));
         }
-        // Same upper bound as ChatCompletionRequest::max_tokens  - 
+        // Same upper bound as ChatCompletionRequest::max_tokens  -
         // largest practical decode budget across the perimeter
         // (128K-context models). Caps a `max_tokens: i64::MAX` request
         // that would otherwise spin the decode loop forever.
@@ -1477,7 +1477,7 @@ pub(crate) async fn openai_list_models(
 /// `multimodal_entry_is_loaded` so the (family, id) -> bool table
 /// can be unit-tested without standing up an engine state.
 ///
-/// image_engine.loaded_family() returns "flux" or "zimage"  - 
+/// image_engine.loaded_family() returns "flux" or "zimage"  -
 /// coarser than the per-id catalog (flux-schnell, z-image-turbo)
 /// since the engine only tracks family-level state. We currently
 /// only ship one checkpoint per family server-side, so the

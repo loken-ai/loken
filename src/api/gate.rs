@@ -460,7 +460,7 @@ mod tests {
         assert_eq!(ids, vec![2, 1, 4, 5, 3], "got: {ids:?}");
         // The aggregate counters must also be right.
         assert_eq!(snap.in_flight, 0, "no real permits taken in this test");
-        // queue_depth comes from the BinaryHeap, not from tracked  - 
+        // queue_depth comes from the BinaryHeap, not from tracked  -
         // tests above already pin that; here we just verify the
         // bucket counters match the queued tracked entries' priorities.
         // (queued_* fields read from waiters, not tracked - empty here.)

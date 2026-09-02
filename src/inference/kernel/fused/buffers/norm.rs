@@ -756,7 +756,7 @@ pub fn fused_penalty_argmax_u32_with_device(
 /// - `seq_kv_dev`: device `i32` storing `current_seq_len - 1` (matches Q8 convention)
 /// - `scale`: typically `1.0 / sqrt(head_dim)`
 ///
-/// Returns `[1, n_q_heads, 1, 512]` F32. NOT thread-safe across streams  - 
+/// Returns `[1, n_q_heads, 1, 512]` F32. NOT thread-safe across streams  -
 /// caller must ensure exclusive access during graph capture.
 #[allow(clippy::too_many_arguments)]
 pub fn fused_attn_decode_f32_hd512(

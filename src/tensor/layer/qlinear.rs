@@ -2,7 +2,7 @@
 //!
 //! The order is **weight, then adapter, then bias**, matching [`layer::Linear`]. It is not
 //! arbitrary: all three arrangements compute `Wx + b + delta`, but float addition is not
-//! associative, so a projection that adds them in another order disagrees in the last bits  - 
+//! associative, so a projection that adds them in another order disagrees in the last bits  -
 //! and over the depth of a transformer that is enough to move a sampled token.
 //!
 //! Adapters are kept beside the weight, never merged into it. Merging into a quantised weight
@@ -354,11 +354,10 @@ mod tests {
 // Builders over a quantised weight store.
 //
 // The compat loader offers these and `QVarBuilder` did not, which is why the files that need
-// them stayed on it. They are thin - `get_f32` already fetches and dequantises in one step  - 
+// them stayed on it. They are thin - `get_f32` already fetches and dequantises in one step  -
 // and thin is the point: what kept those files where they were was an absent name, not an
 // absent capability.
 // ---------------------------------------------------------------------------
-
 
 /// Widen, activate, narrow, over quantised weights.
 ///

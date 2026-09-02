@@ -120,7 +120,7 @@ pub fn matmul_scalar(
     }
 }
 
-/// Decode one Q8_0 weight block: load the 4 element-groups (no nibble decode  - 
+/// Decode one Q8_0 weight block: load the 4 element-groups (no nibble decode  -
 /// weights are already i8), blend into the `{0,1,4,5}`/`{2,3,6,7}` arrangement,
 /// apply the sp1/sp2 shuffles, load the 8 f16 column scales. Returns the same
 /// shape `accum_4rows` consumes.

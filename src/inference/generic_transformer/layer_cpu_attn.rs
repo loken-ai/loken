@@ -494,7 +494,7 @@ impl GenericTransformerLayer {
             // For n_rep == 1 (e.g. phi2/moondream where n_head=n_kv_head):
             // skip the reshape (it'd be a no-op) - just matmul directly.
             //
-            // Extension: was gated on `n_rep > 1` only  - 
+            // Extension: was gated on `n_rep > 1` only  -
             // missed the n_rep=1 case (phi2). Adding the n_rep==1 path
             // saves one launch per layer per token on phi2 decode.
             let (b, _n_head, _one, d) = q.dims4()?;

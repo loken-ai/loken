@@ -73,10 +73,7 @@ pub struct LayerReport {
 /// Round a run through f16 - the incumbent cache's own storage, and therefore the floor
 /// any quantised column is trying to approach.
 fn through_f16(values: &[f32]) -> Vec<f32> {
-    values
-        .iter()
-        .map(|x| f16::from_f32(*x).to_f32())
-        .collect()
+    values.iter().map(|x| f16::from_f32(*x).to_f32()).collect()
 }
 
 /// Round a run through Q4_0 blocks of 32 consecutive values.
@@ -392,10 +389,7 @@ pub fn evaluate_layer(
     }
     // The variant the first round of measurement asked for: the incumbent's per-channel
     // grouping at three bits, with the rotation and without it.
-    for (label, rot) in [
-        ("rot3 kivi", Some(&rotation)),
-        ("raw3 kivi", None),
-    ] {
+    for (label, rot) in [("rot3 kivi", Some(&rotation)), ("raw3 kivi", None)] {
         let (back, bits) = through_kivi_3bit(k, n_kv_heads, tokens, head_dim, g, rot);
         k_cols.push(Column {
             label,
@@ -422,7 +416,7 @@ pub fn evaluate_layer(
     });
     // V's KIVI grouping is the per-token one it already had: a group is a run of channels
     // inside a single token, which is the layout the Q4_0 V column uses too. So these two
-    // columns already are "3-bit under KIVI grouping", with the rotation and without it  - 
+    // columns already are "3-bit under KIVI grouping", with the rotation and without it  -
     // labelled to say so, because "asym" named the codebook and not the grouping, and the
     // grouping is the thing under test.
     {
@@ -483,7 +477,9 @@ pub fn format_table(reports: &[LayerReport]) -> String {
 
     for which in ["K", "V"] {
         let cols = half(head, which);
-        s.push_str(&format!("\n{which}  relative error  (bits/value in brackets)\n"));
+        s.push_str(&format!(
+            "\n{which}  relative error  (bits/value in brackets)\n"
+        ));
         s.push_str(&format!("{:>5}", "layer"));
         for c in cols {
             s.push_str(&format!("  {:>13}", c.label));
@@ -575,7 +571,10 @@ mod tests {
         let v = gaussian_sample(h * t * d, 7);
         let r = evaluate_layer(0, &k, &v, h, t, d, g);
         let by = |cols: &Vec<Column>, label: &str| {
-            cols.iter().find(|c| c.label == label).unwrap().relative_error
+            cols.iter()
+                .find(|c| c.label == label)
+                .unwrap()
+                .relative_error
         };
         let rot = by(&r.k, "rot3 rms");
         let raw_rms = by(&r.k, "raw3 rms");
@@ -649,7 +648,10 @@ mod tests {
         let v = gaussian_sample(h * t * d, 7);
         let r = evaluate_layer(0, &k, &v, h, t, d, g);
         let by = |cols: &Vec<Column>, label: &str| {
-            cols.iter().find(|c| c.label == label).unwrap().relative_error
+            cols.iter()
+                .find(|c| c.label == label)
+                .unwrap()
+                .relative_error
         };
         let kivi = by(&r.k, "raw3 kivi");
         let per_channel = by(&r.k, "raw3 absmax");
@@ -660,7 +662,10 @@ mod tests {
         // And the two per-channel columns must cost the same, or the comparison is a bit
         // rate comparison wearing an accuracy label.
         let bits = |cols: &Vec<Column>, label: &str| {
-            cols.iter().find(|c| c.label == label).unwrap().bits_per_value
+            cols.iter()
+                .find(|c| c.label == label)
+                .unwrap()
+                .bits_per_value
         };
         assert_eq!(bits(&r.k, "raw3 kivi"), bits(&r.k, "rot3 kivi"));
         assert_eq!(bits(&r.k, "raw3 kivi"), bits(&r.k, "raw3 absmax"));

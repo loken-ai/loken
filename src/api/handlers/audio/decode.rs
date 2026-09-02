@@ -402,7 +402,7 @@ pub(super) fn resample_to_16k(
     // Drain remaining < chunk_size frames + flush latency tail.
     // First call: pass the residual. Subsequent calls: pass None to
     // pump rubato's internal buffer. process_partial_into_buffer still
-    // allocates a temp zero-padded input vec internally each call  - 
+    // allocates a temp zero-padded input vec internally each call  -
     // unavoidable without re-implementing the partial path - but is
     // bounded to O(out_delay / out_chunk) calls, not O(src.len() /
     // in_chunk), so the bulk of allocations are gone.

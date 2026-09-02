@@ -6,8 +6,8 @@
 //! device, outputs return on the caller's input device).
 
 // Re-exported: FLUX.2 and SDXL load this same autoencoder through this module.
-pub use crate::inference::model::vae_blocks::{Decoder, Encoder};
 use crate::inference::model::vae_blocks::{AttnNaming, Naming, ProjectionKind, Shape};
+pub use crate::inference::model::vae_blocks::{Decoder, Encoder};
 use crate::tensor::layer::{conv2d, group_norm, linear, Conv2d, Conv2dConfig, GroupNorm, Linear};
 use crate::tensor::DType;
 use crate::tensor::VarBuilder;
@@ -563,7 +563,10 @@ mod decode_reference {
         let energy = v.iter().map(|x| f64::from(x * x)).sum::<f64>() / v.len() as f64;
         let lo = v.iter().fold(f32::INFINITY, |m, x| m.min(*x));
         let hi = v.iter().fold(f32::NEG_INFINITY, |m, x| m.max(*x));
-        println!("dims={:?} mean={mean:.9} energy={energy:.9} min={lo:.6} max={hi:.6}", out.dims());
+        println!(
+            "dims={:?} mean={mean:.9} energy={energy:.9} min={lo:.6} max={hi:.6}",
+            out.dims()
+        );
         assert_eq!(out.dims(), &[1, 3, 128, 128]);
         // Taken from this decoder before the encoder and decoder were rebuilt from a shared
         // description. A tensor read into the wrong slot moves these long before it produces

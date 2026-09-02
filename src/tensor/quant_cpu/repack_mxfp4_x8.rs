@@ -80,7 +80,7 @@ pub fn quantize_act(lhs: &[f32], m: usize, k: usize) -> Vec<BlockQ8_0x4> {
     ];
     // Quantize on the shared spin-pool (one row-group per chunk) instead of
     // serially on the caller thread. This ran serial inside every Q8_0 matmul
-    // while the pool's workers busy-waited at the previous matmul's barrier  - 
+    // while the pool's workers busy-waited at the previous matmul's barrier  -
     // the Q4_K/Q8K activation quantize is already pooled; this aligns Q8_0.
     let out_ptr = super::SendMutPtr(out.as_mut_ptr());
     super::gemv_pool::pool().run(mgroups, &|mg| {

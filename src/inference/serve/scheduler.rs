@@ -16,7 +16,7 @@
 //! Pure orchestration logic (no model, no GPU) -> deterministic and unit-tested
 //! cold. Admission never half-allocates (the paged allocator's `can_append`
 //! gates every step), so a decode step always completes; under block pressure a
-//! running sequence is PREEMPTED (its blocks freed, requeued for recompute  - 
+//! running sequence is PREEMPTED (its blocks freed, requeued for recompute  -
 //! vLLM's default recovery), guaranteeing forward progress.
 
 use crate::inference::cache::paged_kv::{PagedKvAllocator, SeqId};

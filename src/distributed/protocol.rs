@@ -462,7 +462,11 @@ mod tests {
             estimated_latency_ms: 0.0,
         });
         assert_eq!(plan.server_for_layer(0), Some("x"));
-        assert_eq!(plan.server_for_layer(99), None, "out-of-range layer -> None");
+        assert_eq!(
+            plan.server_for_layer(99),
+            None,
+            "out-of-range layer -> None"
+        );
         assert_eq!(plan.server_for_layer(3), None, "unassigned layer -> None");
     }
 

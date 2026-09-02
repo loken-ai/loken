@@ -273,11 +273,7 @@ impl QKernelMatMul {
         // decoding a weight into a host vector to answer a question about placement is
         // the one allocation a dry run promises not to make.
         let wt = if x.device().is_dry() {
-            crate::tensor::Tensor::dry(
-                &x.device(),
-                crate::tensor::DType::F32,
-                (self.n, self.k),
-            )?
+            crate::tensor::Tensor::dry(&x.device(), crate::tensor::DType::F32, (self.n, self.k))?
         } else {
             let w = self.host.dequantize_f32()?; // flat [n.k], weight rows [n, k]
             crate::tensor::Tensor::from_vec_f32(w, (self.n, self.k))?.to_device(&x.device())?
@@ -558,7 +554,7 @@ impl QKernelMatMul {
                 .unwrap_or(false);
             // CPU Q4_0 decode (rows<4): the per-column dot re-streams the
             // activation and serialises on one fmadd chain; the row-grouped
-            // repack amortises both 8-way (the measured mistral-nemo CPU gap  - 
+            // repack amortises both 8-way (the measured mistral-nemo CPU gap  -
             // Q4_0 was the only quant without an amortised decode path).
             let nb40 = self.k / 32;
             let q4_0_decode = self.dtype == GgmlDType::Q4_0
@@ -786,13 +782,13 @@ impl QKernelMatMul {
                         | crate::tensor::DType::BF16
                 )
             {
-                // hot decode path (rows=1) + small batches (rows 2..=8  - 
+                // hot decode path (rows=1) + small batches (rows 2..=8  -
                 // forward_all/PLD/short prefill): production batched MMVQ,
                 // the same dispatch boundary as the fork's fast_mmvq
                 // (MMVQ_MAX_BATCH=8). MMQ only beyond that, like the facade.
                 // Activation dtype dispatch mirrors fast_mmvq::try_fwd:
                 // F32/F16/BF16 each quantize directly and produce output in
-                // the SAME dtype (f16-carrier models - qwen3.5 DeltaNet  - 
+                // the SAME dtype (f16-carrier models - qwen3.5 DeltaNet  -
                 // stay in half end-to-end, no f32 detour).
                 let tag = self.kernel_tag()?;
                 match xdt {

@@ -722,7 +722,7 @@ pub fn enumerate_opencl_devices() -> Vec<opencl3::types::cl_device_id> {
 ///
 /// Z-Image's q/k normalisation reuses this kernel over a row length of `head_dim` rather
 /// than `dim`, treating a `[seq, heads.head_dim]` buffer as `seq.heads` short rows. That
-/// reinterpretation is the whole of the fix, and it is a property of the kernel's indexing  - 
+/// reinterpretation is the whole of the fix, and it is a property of the kernel's indexing  -
 /// so it is checked here, on the card, rather than inferred from reading it.
 ///
 /// Needs an OpenCL device. On the Arc laptop: `RUSTICL_ENABLE=iris`, or rusticl reports no

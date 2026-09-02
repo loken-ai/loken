@@ -297,7 +297,7 @@ impl MoeWeights {
         // when shape is outside the single-block limit (hidden > 16384)
         // or the gate_inp weight isn't a QTensor.
         let logits_f32 = if self.router_prenormed {
-            // Standard MoE (granitemoe): `xs` is already the ffn_norm'd hidden  - 
+            // Standard MoE (granitemoe): `xs` is already the ffn_norm'd hidden  -
             // route it straight through gate_inp (no internal rms_norm / scale).
             self.gate_inp
                 .forward(&xs)?

@@ -190,7 +190,7 @@ impl LlmEngine {
         // correctness.
         // Spec-decode: capture a cheap Arc-clone engine; the drafter is loaded
         // lazily INSIDE the blocking decode closure via block_on (the drafter load is
-        // async + !Send, so it can't be awaited in this Send-required handler future  - 
+        // async + !Send, so it can't be awaited in this Send-required handler future  -
         // block_on on the spawn_blocking thread sidesteps that). Output correctness is
         // guaranteed by the UNCHANGED target verify; the drafter only proposes.
         let spec_engine = self.clone_for_spec();
@@ -1875,7 +1875,7 @@ impl LlmEngine {
             let mut pos = prompt_tokens.len();
 
             let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
-            // Cumulative-decode bookkeeping for grammar streaming  - 
+            // Cumulative-decode bookkeeping for grammar streaming  -
             // see stream_token in the unified loop for rationale.
             let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
             let mut sent_text_len: usize = 0;

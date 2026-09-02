@@ -61,7 +61,10 @@ impl GenericHeteroTransformer {
     /// Applied all-or-nothing. A file that resolves but matches nothing leaves the model on
     /// its base weights and says so, because an adapter on some projections and not others is
     /// worse than one that did not apply.
-    pub fn set_adapters(&mut self, wanted: &[(String, f32)]) -> Result<crate::inference::load::lora::AdapterReport> {
+    pub fn set_adapters(
+        &mut self,
+        wanted: &[(String, f32)],
+    ) -> Result<crate::inference::load::lora::AdapterReport> {
         use crate::inference::load::lora::{transformer_keys, AdapterReport, LoraFile};
         use crate::tensor::Error;
 
@@ -354,7 +357,7 @@ impl GenericHeteroTransformer {
         logits.broadcast_add(&b)
     }
 
-    /// The device batched_paged_decode runs on (weights/embeddings device)  - 
+    /// The device batched_paged_decode runs on (weights/embeddings device)  -
     /// callers size the paged KV stores on it.
     /// Device where the transformer layers run (where paged KV stores must live).
     /// For GPU models the embedding TABLE often stays on CPU (large vocab) while
@@ -1590,7 +1593,7 @@ impl GenericHeteroTransformer {
                         // layers are about to perform, so the mask width equals
                         // the K length the attention will see:
                         //  - the prefill attention resets the cache at index_pos==0
-                        //    (first chunk), so the pre-append length is 0 there  - 
+                        //    (first chunk), so the pre-append length is 0 there  -
                         //    NOT the stale current_seq_len left by a prior request.
                         //  - otherwise it's the cache's current length, and the
                         //    slide keeps the last `w` keys before appending.

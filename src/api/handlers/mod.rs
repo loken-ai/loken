@@ -61,14 +61,14 @@ mod anthropic_api;
 mod audio;
 #[cfg(feature = "image")]
 pub(crate) mod media;
+#[cfg(feature = "metrics")]
+mod metrics;
 mod model_manager;
 mod ollama;
 mod openai;
 mod prompt_format;
 #[cfg(feature = "audio")]
 mod separate;
-#[cfg(feature = "metrics")]
-mod metrics;
 mod system;
 
 pub(crate) use anthropic_api::*;
@@ -974,9 +974,10 @@ impl APIServer {
         let ollama = crate::inference::load::ollama_manager::OllamaManager::new(PathBuf::from(
             &self.ollama_models_dir,
         ));
-        let manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(ollama.get_model_path(&name, tag)?).ok()?)
-                .ok()?;
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(ollama.get_model_path(&name, tag)?).ok()?,
+        )
+        .ok()?;
         let digest = manifest.get("config")?.get("digest")?.as_str()?;
         let blob = PathBuf::from(&self.ollama_models_dir)
             .join("blobs")
@@ -993,11 +994,15 @@ impl APIServer {
         let ollama = crate::inference::load::ollama_manager::OllamaManager::new(PathBuf::from(
             &self.ollama_models_dir,
         ));
-        let manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(ollama.get_model_path(&name, tag)?).ok()?)
-                .ok()?;
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(ollama.get_model_path(&name, tag)?).ok()?,
+        )
+        .ok()?;
         for layer in manifest.get("layers")?.as_array()? {
-            let media = layer.get("mediaType").and_then(|v| v.as_str()).unwrap_or("");
+            let media = layer
+                .get("mediaType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if media.rsplit('.').next() == Some(kind) {
                 let digest = layer.get("digest").and_then(|v| v.as_str())?;
                 return Some(
@@ -1105,7 +1110,7 @@ impl APIServer {
         }
     }
 
-    /// True when the model accepts image input (has a vision projector)  - 
+    /// True when the model accepts image input (has a vision projector)  -
     /// Stage C capability probe, done WITHOUT loading the model. Ollama
     /// packages the vision tower as a separate manifest layer
     /// (`application/vnd.ollama.image.projector`), so a manifest scan is an

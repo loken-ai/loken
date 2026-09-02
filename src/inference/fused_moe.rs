@@ -595,7 +595,7 @@ impl FusedMoeGGUF {
         let (topk_w, topk_ids) = self.top_k(&routing)?;
 
         // Per-expert quantized matmuls (built once, cached). When present we run
-        // a fused quantized GEMV over only the selected experts' GGUF blocks  - 
+        // a fused quantized GEMV over only the selected experts' GGUF blocks  -
         // the same thing Ollama does - instead of dequantizing the entire expert
         // stack to F32 every token (the ~100x CPU-MoE slowdown). `None` means the
         // quant type has no CPU dot path: fall back to dequantize-then-matmul.

@@ -381,7 +381,11 @@ impl Model {
             AUDIO_CHANNELS,
             vb.pp("decoder"),
         )?;
-        Ok(Self { quantizer, decoder, device })
+        Ok(Self {
+            quantizer,
+            decoder,
+            device,
+        })
     }
 
     /// Audio codes `[1, n_codebooks, seq]` (any integer dtype, facade) ->

@@ -91,7 +91,6 @@ fn rope_tables(hd: usize, base: f32, dev: &Device) -> Result<(Tensor, Tensor)> {
     Ok((ang.cos()?, ang.sin()?))
 }
 
-
 /// Per-draft KV cache for the head's single attention layer. One per in-flight
 /// draft (the head itself is stateless/shared). Holds [n_kv, T, head_dim].
 #[derive(Default)]

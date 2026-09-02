@@ -39,7 +39,10 @@ pub fn hadamard_block_len(n: usize) -> usize {
 /// why the public entry points carry the `1/sqrt(m)` scaling.
 fn wht_unnormalised(v: &mut [f32]) {
     let m = v.len();
-    debug_assert!(m.is_power_of_two(), "WHT block length must be a power of two");
+    debug_assert!(
+        m.is_power_of_two(),
+        "WHT block length must be a power of two"
+    );
     let mut h = 1;
     while h < m {
         let mut i = 0;

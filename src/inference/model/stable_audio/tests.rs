@@ -156,8 +156,7 @@ fn dit_matches_torch() {
     let cross_v = read_dump(&dir, "dit_cross.f32");
     let s = cross_v.len() / DIT_COND_DIM;
     let cross = Tensor::from_vec_f32(cross_v, (s, DIT_COND_DIM)).unwrap();
-    let glob =
-        Tensor::from_vec_f32(read_dump(&dir, "dit_global.f32"), (1usize, DIT_DIM)).unwrap();
+    let glob = Tensor::from_vec_f32(read_dump(&dir, "dit_global.f32"), (1usize, DIT_DIM)).unwrap();
     let out = from_tc(&dit.forward(&x, 0.5, &cross, &glob).unwrap());
     let reference = read_dump(&dir, "dit_ref_out.f32");
     let d = Divergence::of(&out, &reference, 1e-3, f64::INFINITY);
@@ -180,8 +179,7 @@ fn sampler_matches_torch() {
     let cross_v = read_dump(&dir, "dit_cross.f32");
     let s = cross_v.len() / DIT_COND_DIM;
     let cross = Tensor::from_vec_f32(cross_v, (s, DIT_COND_DIM)).unwrap();
-    let glob =
-        Tensor::from_vec_f32(read_dump(&dir, "dit_global.f32"), (1usize, DIT_DIM)).unwrap();
+    let glob = Tensor::from_vec_f32(read_dump(&dir, "dit_global.f32"), (1usize, DIT_DIM)).unwrap();
 
     let sigmas = sigmas_polyexponential(8, 0.3, 500.0, 1.0);
     let ref_sigmas = read_dump(&dir, "smp_sigmas.f32");

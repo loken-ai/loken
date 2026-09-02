@@ -1225,7 +1225,7 @@ mod tiered_tests {
 /// Process-global VRAM-degradation level for the ACE-Step render. Zero on the
 /// no-pressure path (placement unchanged -> numerics bit-identical). A render stage
 /// that hits CUDA OOM under memory pressure (e.g. a concurrent VRAM consumer) bumps
-/// this so the NEXT (re)placement reserves more headroom or falls back to CPU  - 
+/// this so the NEXT (re)placement reserves more headroom or falls back to CPU  -
 /// graceful degradation instead of a crash. Read by `probe_under_pressure` (shared by
 /// the LM / DiT / VAE placement probes). This is automatic internal state, not an
 /// env-var knob.

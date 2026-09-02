@@ -241,7 +241,12 @@ impl OllamaManager {
                     }
                     let pub_name = pub_path.file_name().unwrap_or_default().to_string_lossy();
                     let manifest_path = pub_path.join(name).join(tag);
-                    debug!("      -> {}/{}: {}", pub_name, name, manifest_path.display());
+                    debug!(
+                        "      -> {}/{}: {}",
+                        pub_name,
+                        name,
+                        manifest_path.display()
+                    );
                     if manifest_path.exists() {
                         debug!("        ✓ FOUND in '{}'", pub_name);
                         return Some(manifest_path);

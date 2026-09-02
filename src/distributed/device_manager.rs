@@ -204,7 +204,9 @@ impl ComputeDevice {
                 // the OpenCL backend, not through a SYCL one, because there is no SYCL one.
                 DeviceAvailability::Unavailable {
                     reason: UnavailableReason::BackendNotSupported,
-                    suggestion: "No SYCL backend in this build; an Arc card is served through OpenCL.".to_string(),
+                    suggestion:
+                        "No SYCL backend in this build; an Arc card is served through OpenCL."
+                            .to_string(),
                 }
             }
 

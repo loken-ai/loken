@@ -81,7 +81,12 @@ impl CpuStorage {
 ///
 /// On the matmul spin-pool rather than rayon: on half-precision models this cast runs once per
 /// elementwise op, and rayon's idle workers steal-spin through the matmul pool.
-fn widen<T: Copy + Send + Sync>(v: &[T], par: usize, chunk: usize, to_f32: fn(T) -> f32) -> Vec<f32> {
+fn widen<T: Copy + Send + Sync>(
+    v: &[T],
+    par: usize,
+    chunk: usize,
+    to_f32: fn(T) -> f32,
+) -> Vec<f32> {
     if v.len() < par {
         return v.iter().map(|x| to_f32(*x)).collect();
     }

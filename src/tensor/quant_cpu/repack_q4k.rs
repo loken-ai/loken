@@ -357,7 +357,7 @@ pub unsafe fn gemm_group_avx2(b: &[BlockQ4Kx8], acts: &[&[BlockQ8K]], nb: usize,
         }
         for r in 0..mt {
             let act = &acts[r][l];
-            // Fold the two i32 partials per column and reorder to c0..c7  - 
+            // Fold the two i32 partials per column and reorder to c0..c7  -
             // the one cross-lane step of the whole super-block, needed only
             // because the float scale below is per column.
             let paired = _mm256_hadd_epi32(isum_a[r], isum_b[r]);

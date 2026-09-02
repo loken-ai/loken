@@ -506,7 +506,7 @@ mod block_dequant_parity {
         //
         // These carry a different bound because they carry a different arithmetic: the kernels
         // multiply and subtract in HALF while the host codec works in f32, so the two cannot
-        // agree past what eleven mantissa bits allow. The bound is derived and not fitted  - 
+        // agree past what eleven mantissa bits allow. The bound is derived and not fitted  -
         // four roundings (`dall*sc`, `dmin*m`, the product, the subtraction), each worth at
         // most half an ULP of an operand no larger than the block's range. A misread bit
         // position moves a value by a whole scale, thousands of ULPs, so this still says no.
@@ -533,13 +533,18 @@ mod block_dequant_parity {
 
             let range = want.iter().fold(0f32, |m, v| m.max(v.abs()));
             let allowed = 4.0 * HALF_STEP * range;
-            let (worst, at) = got.iter().zip(&want).enumerate().fold(
-                (0f32, 0usize),
-                |(w, at), (i, (g, k))| {
-                    let e = (g - k).abs();
-                    if e > w { (e, i) } else { (w, at) }
-                },
-            );
+            let (worst, at) =
+                got.iter()
+                    .zip(&want)
+                    .enumerate()
+                    .fold((0f32, 0usize), |(w, at), (i, (g, k))| {
+                        let e = (g - k).abs();
+                        if e > w {
+                            (e, i)
+                        } else {
+                            (w, at)
+                        }
+                    });
             assert!(
                 worst <= allowed,
                 "{dtype:?}: worst disagreement {worst:e} at [{at}] (superblock {}, position {}), \

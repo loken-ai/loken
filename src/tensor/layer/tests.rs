@@ -64,7 +64,7 @@ mod tests {
         }
     }
 
-    /// `from_transposed(W^T)` must run the exact same forward as `new(W)`  - 
+    /// `from_transposed(W^T)` must run the exact same forward as `new(W)`  -
     /// the host-staged big-checkpoint load path depends on it.
     #[test]
     fn linear_from_transposed_matches_new() {

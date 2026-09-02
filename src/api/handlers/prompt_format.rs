@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn prompt_already_templated_rejects_mismatched_family() {
-        // Template fingerprint matches ChatML but prompt has gemma markers  - 
+        // Template fingerprint matches ChatML but prompt has gemma markers  -
         // we should NOT report "already templated" because re-applying ChatML
         // is still required.
         assert!(!prompt_already_templated(
@@ -804,7 +804,7 @@ mod tests {
 
     #[test]
     fn format_chat_prompt_handles_unknown_role_via_tag_prefix() {
-        // tool / function-call role: should NOT be silently dropped  - 
+        // tool / function-call role: should NOT be silently dropped  -
         // wrap as a tagged user turn so the content reaches the model.
         let messages = vec![
             msg("user", "use the calculator"),

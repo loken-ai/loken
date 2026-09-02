@@ -161,12 +161,15 @@ pub fn bind_discovery(interface: Ipv4Addr) -> io::Result<UdpSocket> {
             return Err(e);
         }
         let s = unsafe { std::net::UdpSocket::from_raw_fd(raw) };
-        let addr: std::net::SocketAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT).into();
+        let addr: std::net::SocketAddr =
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT).into();
         let sa: libc::sockaddr_in = match addr {
             std::net::SocketAddr::V4(v4) => libc::sockaddr_in {
                 sin_family: libc::AF_INET as libc::sa_family_t,
                 sin_port: v4.port().to_be(),
-                sin_addr: libc::in_addr { s_addr: u32::from(*v4.ip()).to_be() },
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(*v4.ip()).to_be(),
+                },
                 sin_zero: [0; 8],
             },
             _ => unreachable!("bound to an IPv4 address"),

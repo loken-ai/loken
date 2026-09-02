@@ -777,7 +777,7 @@ fn decode_segment(
         let (_, seq_len, _) = ys.shape().dims3()?;
         // On iter 0 with metrics collection + a `<|nospeech|>` token,
         // also project position 0 (right after SOT) for no_speech_prob.
-        // Sampling always uses the last position. Logits land on HOST  - 
+        // Sampling always uses the last position. Logits land on HOST  -
         // suppress-mask, softmax and argmax all run on the Vec<f32>.
         let collect = params.timestamps || params.collect_metrics;
         let want_no_speech_at_i0 = i == 0 && collect && s.control.no_speech.is_some();
@@ -809,7 +809,7 @@ fn decode_segment(
             host_argmax(&logits)
         };
         // Log-probability of the sampled token. Only collected when
-        // timestamps mode is on OR the caller flagged collect_metrics  - 
+        // timestamps mode is on OR the caller flagged collect_metrics  -
         // text/json formats skip it.
         if collect {
             logprobs.push(host_log_softmax_at(&logits, next_token as usize));
@@ -928,7 +928,11 @@ fn parse_timestamp_segments(
     // measuring how far it compresses and averaging its logprobs is the same work whether
     // a closing timestamp was there or the chunk simply ran out, and `what` names which of
     // the two failed when the tokenizer refuses the span.
-    let build = |start: f32, end: f32, inner: Vec<u32>, avg_logprob: f32, what: &str|
+    let build = |start: f32,
+                 end: f32,
+                 inner: Vec<u32>,
+                 avg_logprob: f32,
+                 what: &str|
      -> AnyResult<WhisperSegment> {
         let text = s
             .tokenizer
@@ -1163,7 +1167,7 @@ struct StdRng;
 impl StdRng {
     fn weighted_sample(&mut self, weights: &[f32]) -> u32 {
         // Deterministic argmax fallback when temperature pretends to be > 0
-        // but the caller hasn't supplied a real RNG. For ASR this is fine  - 
+        // but the caller hasn't supplied a real RNG. For ASR this is fine  -
         // greedy is the default, and the temperature path is only exercised
         // by the upstream confidence-based fallback logic which we don't
         // run in the v1 transcribe pipeline.

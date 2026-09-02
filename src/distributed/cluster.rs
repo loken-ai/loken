@@ -219,25 +219,20 @@ impl Cluster {
         // decision puts it there, so a node that has served nothing would describe its peers
         // and omit itself - and an observer cannot tell that from a node that is not in the
         // cluster at all.
-        let mut out: Vec<PeerView> = std::iter::once((
-            &self.config.node_id,
-            &self.local_state(),
-        ))
-        .filter(|(n, _)| members.state_of(n).is_none())
-        .map(|(node, state)| PeerView {
-            node_id: node.clone(),
-            // The address peers were given lives in the runtime that announces it, not in
-            // this table. An observer reaching this endpoint already knows where it is.
-            endpoint: None,
-            alive: true,
-            phi: None,
-            rtt_ms: Some(0.0),
-            is_self: true,
-            state: (*state).clone(),
-        })
-        .chain(members
-            .known()
+        let mut out: Vec<PeerView> = std::iter::once((&self.config.node_id, &self.local_state()))
+            .filter(|(n, _)| members.state_of(n).is_none())
             .map(|(node, state)| PeerView {
+                node_id: node.clone(),
+                // The address peers were given lives in the runtime that announces it, not in
+                // this table. An observer reaching this endpoint already knows where it is.
+                endpoint: None,
+                alive: true,
+                phi: None,
+                rtt_ms: Some(0.0),
+                is_self: true,
+                state: (*state).clone(),
+            })
+            .chain(members.known().map(|(node, state)| PeerView {
                 node_id: node.clone(),
                 endpoint: urls.get(node).cloned(),
                 alive: alive.contains(node),
@@ -293,7 +288,6 @@ impl Cluster {
             })
             .collect()
     }
-
 
     fn decide_inner(
         &self,

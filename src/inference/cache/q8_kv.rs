@@ -28,7 +28,10 @@ use anyhow::{anyhow, Result};
 /// kernels below take a device pointer with their own strides, so what they want is the rows
 /// packed and nothing else.
 fn step_rows_f32(t: &Tensor) -> Result<Tensor> {
-    Ok(t.squeeze(2)?.squeeze(0)?.to_dtype(DType::F32)?.contiguous()?)
+    Ok(t.squeeze(2)?
+        .squeeze(0)?
+        .to_dtype(DType::F32)?
+        .contiguous()?)
 }
 
 /// The same step as one flat run, for the kernels that index it themselves.

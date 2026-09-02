@@ -1039,7 +1039,7 @@ pub fn plan_layer_devices(
     // attention scores [chunk, kv_len], MoE expert activations and the growing
     // KV cache all allocate on the layer's device. `reserve_bytes` is the
     // model's PRECISE runtime peak (KV at context + cuBLAS workspace + one
-    // prefill-chunk activation) - the same figure the dense planner trusts  - 
+    // prefill-chunk activation) - the same figure the dense planner trusts  -
     // not a blanket margin, so low-KV hybrids (mostly SSM/conv layers, few
     // attention layers) pack the fast GPU much fuller instead of stranding ~1 GB.
     // Any residual prefill OOM from packing tight is caught by the adaptive

@@ -497,7 +497,7 @@ pub(crate) async fn conversation_handler(
             }
             // Use the model's real chat template (read from the Ollama
             // manifest) so we don't leak generic [INST] scaffolding. Fall
-            // back to a name-inferred template when the manifest omits one  - 
+            // back to a name-inferred template when the manifest omits one  -
             // same chain as /api/chat. Without this, moondream (whose
             // manifest template isn't always reachable) gets the [INST]
             // default and its base-phi2 LM emits gibberish ("!!! ") instead

@@ -318,7 +318,7 @@ static PREFILL_POOL: OnceLock<Pool> = OnceLock::new();
 
 /// Pool sized to LOGICAL cores (SMT siblings included), for the compute-bound
 /// tiled prefill GEMMs on the fat K-quant weight matrices. Those hide memory
-/// latency behind ALU work, so a second worker per core lifts throughput  - 
+/// latency behind ALU work, so a second worker per core lifts throughput  -
 /// unlike the bandwidth-bound decode GEMV, which the physical-sized [`pool`]
 /// serves (SMT there only burns package power). Prefill and decode run in
 /// separate phases, so the idle pool's workers park; only one is hot at a time.

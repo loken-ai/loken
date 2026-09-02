@@ -492,7 +492,7 @@ impl BatchedModel for GhBatched {
 #[cfg(feature = "cuda")]
 impl GhBatched {
     /// Batched decode via a captured CUDA graph: capture once per (B, ctx-cap
-    /// bucket), then replay (just refresh the stable input buffers + launch)  - 
+    /// bucket), then replay (just refresh the stable input buffers + launch)  -
     /// removing the ~per-step kernel-launch overhead that caps the eager path.
     /// Returns logits `[B, vocab]` in a persistent buffer.
     fn decode_graph(

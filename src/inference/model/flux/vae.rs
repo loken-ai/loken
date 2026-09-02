@@ -309,7 +309,10 @@ mod decode_reference {
             .get_hf_models_dir()
             .join("hub");
         let Some(ae_file) = glob_one(&hub, "ae.safetensors") else {
-            println!("no ae.safetensors under {}; this run judges nothing", hub.display());
+            println!(
+                "no ae.safetensors under {}; this run judges nothing",
+                hub.display()
+            );
             return;
         };
         let dev = tensor::Device::Cpu;
@@ -335,7 +338,10 @@ mod decode_reference {
         let energy = v.iter().map(|x| f64::from(x * x)).sum::<f64>() / v.len() as f64;
         let lo = v.iter().fold(f32::INFINITY, |m, x| m.min(*x));
         let hi = v.iter().fold(f32::NEG_INFINITY, |m, x| m.max(*x));
-        println!("dims={:?} mean={mean:.9} energy={energy:.9} min={lo:.6} max={hi:.6}", out.dims());
+        println!(
+            "dims={:?} mean={mean:.9} energy={energy:.9} min={lo:.6} max={hi:.6}",
+            out.dims()
+        );
         assert_eq!(out.dims(), &[1, 3, 128, 128]);
         // Taken from this decoder before its middle attention became the shared one. The
         // Z-Image decoder answers the same to every digit - it is this autoencoder, under

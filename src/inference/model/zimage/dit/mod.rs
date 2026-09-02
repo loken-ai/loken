@@ -1385,7 +1385,7 @@ struct RopeMaskCache {
 
 /// Z-Image Transformer 2D model. Of the facade's PerImageCache only the
 /// shape-dependent RoPE/mask bundle is cached (`rope_cache`); the caption
-/// embedding + context refiner are recomputed per forward (negligible  - 
+/// embedding + context refiner are recomputed per forward (negligible  -
 /// they run on the ~30-token caption, not the image sequence).
 pub struct ZImageTransformer2DModel {
     t_embedder: TimestepEmbedder,
@@ -1628,7 +1628,7 @@ impl ZImageTransformer2DModel {
             x = layer.forward(&x, Some(&x_attn_mask), &x_cos, &x_sin, Some(&adaln_input))?;
         }
 
-        // 8. Context refiner (caption, no modulation; recomputed per step  - 
+        // 8. Context refiner (caption, no modulation; recomputed per step  -
         // the facade hoists this into its per-image cache)
         let mut cap = cap_embedded;
         for layer in &self.context_refiner {

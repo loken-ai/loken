@@ -150,7 +150,7 @@ macro_rules! map_cpu2 {
     };
 }
 
-/// View CPU storage as raw bytes (plain-old-data slices; little-endian host  - 
+/// View CPU storage as raw bytes (plain-old-data slices; little-endian host  -
 /// matches `cpu_storage_from_bytes` below).
 fn cpu_storage_bytes(c: &CpuStorage) -> &[u8] {
     fn b<T>(v: &[T]) -> &[u8] {

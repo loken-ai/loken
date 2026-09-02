@@ -15,7 +15,10 @@ use crate::tensor::{Result, Tensor};
 /// on every side is exactly what the edges need for the output to keep the input's size. Every
 /// convolution in this file that is not a channel mixing wants that.
 fn conv3x3(from: usize, to: usize, vb: &VarBuilder, name: &str) -> Result<Conv2d> {
-    let keep_size = Conv2dConfig { padding: 1, ..Default::default() };
+    let keep_size = Conv2dConfig {
+        padding: 1,
+        ..Default::default()
+    };
     conv2d(from, to, 3, keep_size, &vb.pp(name))
 }
 
@@ -83,7 +86,10 @@ impl Downsample2d {
     pub fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
         // Stride two, and no padding of the convolution's own: the forward pads by hand,
         // because where the missing row and column go is the whole point.
-        let halve = Conv2dConfig { stride: 2, ..Default::default() };
+        let halve = Conv2dConfig {
+            stride: 2,
+            ..Default::default()
+        };
         Ok(Self {
             conv: conv2d(channels, channels, 3, halve, &vb.pp("conv"))?,
         })
@@ -143,9 +149,7 @@ impl Projection {
     fn load(kind: ProjectionKind, channels: usize, vb: &VarBuilder, name: &str) -> Result<Self> {
         Ok(match kind {
             ProjectionKind::Conv1x1 => Projection::Conv(conv1x1(channels, channels, vb, name)?),
-            ProjectionKind::Linear => {
-                Projection::Linear(linear(channels, channels, &vb.pp(name))?)
-            }
+            ProjectionKind::Linear => Projection::Linear(linear(channels, channels, &vb.pp(name))?),
         })
     }
 
@@ -367,10 +371,13 @@ impl Encoder {
             .iter()
             .enumerate()
             .map(|(i, &out)| {
-                let from = if i == 0 { shape.stem } else { shape.stages[i - 1] };
+                let from = if i == 0 {
+                    shape.stem
+                } else {
+                    shape.stages[i - 1]
+                };
                 let vb = vb_down.pp(i);
-                let blocks =
-                    Stage::load(from, out, shape.blocks_per_stage, shape, names, &vb)?;
+                let blocks = Stage::load(from, out, shape.blocks_per_stage, shape, names, &vb)?;
                 // Every stage but the last halves the grid on its way out.
                 let down = if i + 1 < shape.stages.len() {
                     Some(Downsample2d::new(out, vb.pp(names.downsample))?)
@@ -400,8 +407,7 @@ impl Encoder {
             h = stage.forward(&h)?;
         }
         let h = self.mid.forward(&h)?;
-        self.conv_out
-            .forward(&self.norm_out.forward(&h)?.silu()?)
+        self.conv_out.forward(&self.norm_out.forward(&h)?.silu()?)
     }
 }
 
@@ -431,8 +437,7 @@ impl Decoder {
                     k
                 };
                 let vb = vb_up.pp(index);
-                let blocks =
-                    Stage::load(from, out, shape.blocks_per_stage + 1, shape, names, &vb)?;
+                let blocks = Stage::load(from, out, shape.blocks_per_stage + 1, shape, names, &vb)?;
                 // Every stage but the last doubles the grid on its way out.
                 let up = if k + 1 < n {
                     Some(Upsample2d::new(out, vb.pp(names.upsample))?)
@@ -460,7 +465,6 @@ impl Decoder {
         for stage in &self.stages {
             h = stage.forward(&h)?;
         }
-        self.conv_out
-            .forward(&self.norm_out.forward(&h)?.silu()?)
+        self.conv_out.forward(&self.norm_out.forward(&h)?.silu()?)
     }
 }

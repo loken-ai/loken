@@ -89,7 +89,7 @@ pub fn mvq_via_pre_quantized_q8_1(
     // launcher hardcoding 2 for b_size=1 while the kernel expects 8 for the
     // qk=32 dtypes (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0) made the shared-memory
     // reduction read 6 never-written warp slots (uninitialized -> scattered
-    // NaN) AND skip 3/4 of the k-blocks (blocks_per_iter is compile-time)  - 
+    // NaN) AND skip 3/4 of the k-blocks (blocks_per_iter is compile-time)  -
     // root cause of the MIDI-LLM (Q8_0 lm_head) GPU collapse.
     // K-quants (qk=256 -> 2 warps) always matched, which is why
     // every served Q6_K/Q4_K head was fine.

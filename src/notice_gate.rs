@@ -40,8 +40,8 @@ mod tests {
     /// retire those entries would have the gate deleting attributions that are still owed,
     /// which is the opposite of what it exists for.
     fn externally_attested() -> Vec<(String, f64)> {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/provenance/externally_attested.tsv");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/provenance/externally_attested.tsv");
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("the external attestation keeps NOTICE.md honest past the local floor: {path:?}: {e}")
         });
@@ -255,7 +255,9 @@ mod tests {
                 checked += 1;
                 let local = manifest.get(file).map_or(0.0, |(p, _)| *p);
                 let owed = external.max(local);
-                let said = cells[2].strip_suffix('%').and_then(|p| p.parse::<f64>().ok());
+                let said = cells[2]
+                    .strip_suffix('%')
+                    .and_then(|p| p.parse::<f64>().ok());
                 if said.is_none_or(|v| (v - owed).abs() > 1.0) {
                     wrong.push(format!(
                         "{file}: NOTICE says {}, the larger of the two measurements is {owed:.0}%                          (local {local:.1}%, external {external}%)",

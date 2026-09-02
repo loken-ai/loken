@@ -323,10 +323,7 @@ mod repeat_kv_tests {
             .flat_map(|h| std::iter::repeat_n(h, rep))
             .collect();
         let selected = xs
-            .index_select(
-                &Tensor::from_vec_u32(ids, vec![kv * rep]).unwrap(),
-                1,
-            )
+            .index_select(&Tensor::from_vec_u32(ids, vec![kv * rep]).unwrap(), 1)
             .unwrap();
 
         let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();

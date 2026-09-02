@@ -11,10 +11,10 @@
 //! and the two loaders are left doing the only thing that genuinely differs between them:
 //! reading names out of a file.
 
-use crate::tensor::Module;
 use crate::tensor::layer::qlinear::{QLinear, QMlp};
 use crate::tensor::layer::LayerNorm;
 use crate::tensor::ops::Activation;
+use crate::tensor::Module;
 use crate::tensor::{Result, Tensor};
 
 /// Q, K and V, however the checkpoint stores them.

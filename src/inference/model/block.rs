@@ -78,7 +78,9 @@ impl CrossAttentionBlock {
         encoder_xs: Option<&Tensor>,
         mask: Mask,
     ) -> Result<Tensor> {
-        let attended = self.self_attn.forward(&self.self_norm.forward(xs)?, None, mask)?;
+        let attended = self
+            .self_attn
+            .forward(&self.self_norm.forward(xs)?, None, mask)?;
         let mut xs = xs.add(&attended)?;
         if let Some((attn, norm)) = &mut self.cross {
             let crossed = attn.forward(&norm.forward(&xs)?, encoder_xs, Mask::All)?;

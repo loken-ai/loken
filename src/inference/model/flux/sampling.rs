@@ -44,7 +44,12 @@ pub fn get_noise(
     // The VAE divides each side by eight and the packing by another two, so a latent side is
     // the image's rounded up to a whole patch and cut by eight.
     flow_match::gaussian_latent(
-        (num_samples, 16, height.div_ceil(16) * 2, width.div_ceil(16) * 2),
+        (
+            num_samples,
+            16,
+            height.div_ceil(16) * 2,
+            width.div_ceil(16) * 2,
+        ),
         device,
     )
 }
@@ -275,7 +280,7 @@ pub fn denoise_kontext<M: WithForward>(
 // steps, where a per-step cast allocated fresh storage every step and forced a miss.
 //
 // They ask for [`WithForward`] like the loops above, so a placement that spans several devices
-// reaches them too: what these add - a state cast once, step reuse, an inpaint mask, regions  - 
+// reaches them too: what these add - a state cast once, step reuse, an inpaint mask, regions  -
 // is a property of the LOOP and not of where the blocks sit.
 // ---------------------------------------------------------------------------
 

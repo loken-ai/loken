@@ -821,8 +821,8 @@ fn build_generic_layer(
         // divert cover any genuine pressure. So the loader spills/grows rather
         // than OOMing.
         kv_cache: {
-            use crate::inference::engine::llm_engine::KvQuant;
             use crate::inference::cache::KV_WORKING_WINDOW_TOKENS as LAZY_KV_INITIAL_CAP;
+            use crate::inference::engine::llm_engine::KvQuant;
             let full = config.effective_max_context().max(512);
             let init_cap = if matches!(config.kv_quant, KvQuant::Off) {
                 full.min(LAZY_KV_INITIAL_CAP)
@@ -2354,7 +2354,7 @@ impl GenericHeteroTransformer {
         // last layer's GPU first (closest - no cross-GPU hop), then any OTHER
         // CUDA device. The fallback to a SECOND GPU is what saves large-vocab
         // models on a tight primary GPU: devstral (vocab 131072, 24B) fills
-        // GPU0, so its lm_head OOM'd there and fell back to a CPU lm_head  - 
+        // GPU0, so its lm_head OOM'd there and fell back to a CPU lm_head  -
         // stalling decode to ~35-48% GPU util (-60% vs ollama). An idle GPU1
         // hosts the ~0.5 GB quantized projection instead; the per-token hidden
         // [hidden] cross-GPU hop is negligible vs a CPU 5120x131072 matmul.
@@ -2615,7 +2615,8 @@ impl GenericHeteroTransformer {
                 std::thread::scope(|scope| {
                     for _ in 0..workers {
                         scope.spawn(|| loop {
-                            let Some(stack) = host_prefill_stacks.get(next.fetch_add(1, Ordering::Relaxed))
+                            let Some(stack) =
+                                host_prefill_stacks.get(next.fetch_add(1, Ordering::Relaxed))
                             else {
                                 break;
                             };

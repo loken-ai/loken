@@ -462,7 +462,7 @@ pub struct OllamaGenerateResponse {
     /// Reason request ended: "stop", "load", "unload" (or null if streaming/not done)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done_reason: Option<String>,
-    // Same `skip_serializing_if = is_none` sweep as OllamaChatResponse  - 
+    // Same `skip_serializing_if = is_none` sweep as OllamaChatResponse  -
     // keeps load/unload + intermediate-stream responses lean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<Vec<i32>>,
@@ -1208,7 +1208,7 @@ pub struct ChunkDelta {
     pub content: Option<String>,
     /// Streaming tool-call deltas. We buffer each tool region and emit one
     /// complete delta per call (id + name + full arguments), which is a
-    /// valid degenerate case of OpenAI's incremental tool-call streaming  - 
+    /// valid degenerate case of OpenAI's incremental tool-call streaming  -
     /// clients accumulate deltas keyed by `index`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,

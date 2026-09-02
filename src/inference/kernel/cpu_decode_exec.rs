@@ -17,7 +17,7 @@
 /// Per-layer constant decode parameters, materialised as plain `f32` slices
 /// once on the first decode token and reused thereafter. The norm weights and
 /// QKV/qk-norm biases never change, but reading them straight off the quantized
-/// `WeightedNorm`/bias tensors needs a `to_vec1` allocation+copy each call  - 
+/// `WeightedNorm`/bias tensors needs a `to_vec1` allocation+copy each call  -
 /// ~5 per layer x n_layers per token of pure repeated conversion. Caching them
 /// makes the decode path genuinely zero-alloc.
 pub struct DecodeNormCache {

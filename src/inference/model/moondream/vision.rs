@@ -175,11 +175,7 @@ impl MoondreamVisionEncoder {
                 },
                 at("attn_out")?,
                 ln2,
-                QMlp::new(
-                    at("ffn_down")?,
-                    Activation::GeluPytorchTanh,
-                    at("ffn_up")?,
-                ),
+                QMlp::new(at("ffn_down")?, Activation::GeluPytorchTanh, at("ffn_up")?),
                 EMBED_DIM,
                 NUM_HEADS,
             )?);

@@ -41,7 +41,7 @@ impl Tensor {
         })
     }
 
-    /// Materialize `self` broadcast to `shape` (the packed substrate copies  - 
+    /// Materialize `self` broadcast to `shape` (the packed substrate copies  -
     /// no stride views).
     pub fn broadcast_as<S: Into<Shape>>(&self, shape: S) -> Result<Self> {
         let target = shape.into();
@@ -540,7 +540,7 @@ impl Tensor {
                     for o in 0..outer {
                         let db = (o * dst_d + offset) * inner;
                         let sb = o * n;
-                        // SAFETY: in-place write through the shared storage  - 
+                        // SAFETY: in-place write through the shared storage  -
                         // bounds checked above, src/dst storages distinct, no
                         // live typed borrow of the destination region; the
                         // single-writer requirement is documented on the fn.

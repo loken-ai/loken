@@ -123,7 +123,7 @@ fn sdpa_fixed_tile(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     // Query-tiling: the full [.., seq, seq] score matrix is the peak
     // activation and OOMs at 1024² (seq≈4608 -> the scores
     // tensor alone is ~1.6 GB). Each query's softmax is independent, so
-    // processing queries in tiles caps the peak at [.., TILE, seq]  - 
+    // processing queries in tiles caps the peak at [.., TILE, seq]  -
     // BIT-EXACT (identical per-query math). Only kicks in for large images;
     // <=512² (seq≲1300) runs the single-shot path unchanged.
     const TILE: usize = 512;
@@ -1764,8 +1764,8 @@ impl crate::inference::model::flux::sampling::WithForward for HeteroFlux {
         };
         let mut txt = cached_or(&self.txt_in_cache, &txt_key, || txt.apply(&self.txt_in))?;
         let mut img = img.apply(&self.img_in)?;
-        let vec_ = timestep_embedding(&timesteps, common::SCALAR_EMBED, dtype)?
-            .apply(&self.time_in)?;
+        let vec_ =
+            timestep_embedding(&timesteps, common::SCALAR_EMBED, dtype)?.apply(&self.time_in)?;
         let vec_ = match (
             self.guidance_in.as_ref(),
             guidance.as_ref(),

@@ -62,7 +62,7 @@ pub fn set_i32_inplace(t: &Tensor, val: i32) -> Result<()> {
     Ok(())
 }
 
-/// Device-to-device copy of one u32 (the new token id) from `src` into `dst`  - 
+/// Device-to-device copy of one u32 (the new token id) from `src` into `dst`  -
 /// no host roundtrip/sync. Both u32 device tensors (uses element 0 of each).
 pub fn copy_u32_dev(src: &Tensor, dst: &Tensor) -> Result<()> {
     use crate::tensor::cuda_ext::DevicePtr;

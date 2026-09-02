@@ -166,7 +166,13 @@ pub mod audio {
         filters: &[f32],
         framing: Framing,
     ) -> Vec<f32> {
-        let Framing { fft_size, fft_step, n_len, n_mel, n_threads } = framing;
+        let Framing {
+            fft_size,
+            fft_step,
+            n_len,
+            n_mel,
+            n_threads,
+        } = framing;
         let bins = 1 + fft_size / 2;
         let mut frame = vec![0.0f32; fft_size];
         let mut mel = vec![0.0f32; n_len * n_mel];
@@ -184,7 +190,9 @@ pub mod audio {
             // Power, then folded onto the positive frequencies: bin j and bin n-j are the same
             // frequency seen from either side, and the filterbank expects their sum.
             let mut power: Vec<f32> = (0..fft_size)
-                .map(|j| spectrum[2 * j] * spectrum[2 * j] + spectrum[2 * j + 1] * spectrum[2 * j + 1])
+                .map(|j| {
+                    spectrum[2 * j] * spectrum[2 * j] + spectrum[2 * j + 1] * spectrum[2 * j + 1]
+                })
                 .collect();
             for j in 1..fft_size / 2 {
                 power[j] += power[fft_size - j];
@@ -224,9 +232,7 @@ pub mod audio {
         // The periodic Hann window: it reaches zero at both ends, so consecutive frames overlap
         // without the seam between them showing up as a frequency of its own.
         let hann: Vec<f32> = (0..fft_size)
-            .map(|i| {
-                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / fft_size as f32).cos())
-            })
+            .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / fft_size as f32).cos()))
             .collect();
 
         // The encoder reads a fixed number of frames, so the waveform is padded out to a whole
@@ -245,14 +251,23 @@ pub mod audio {
         // The window and both inputs are read by every worker and written by none, so one owner
         // each and a handle per worker.
         let (hann, samples, filters) = (Arc::new(hann), Arc::new(samples), Arc::new(filters));
-        let framing = Framing { fft_size, fft_step, n_len, n_mel, n_threads };
+        let framing = Framing {
+            fft_size,
+            fft_step,
+            n_len,
+            n_mel,
+            n_threads,
+        };
         let per_thread = thread::scope(|s| {
             // Every worker is started before any is waited on; joining as they are made would
             // run them one after another.
             let mut workers = Vec::with_capacity(n_threads);
             for ith in 0..n_threads {
-                let (hann, samples, filters) =
-                    (Arc::clone(&hann), Arc::clone(&samples), Arc::clone(&filters));
+                let (hann, samples, filters) = (
+                    Arc::clone(&hann),
+                    Arc::clone(&samples),
+                    Arc::clone(&filters),
+                );
                 workers.push(s.spawn(move || {
                     mel_of_every_nth_frame(ith, &hann, &samples, &filters, framing)
                 }));
@@ -349,8 +364,7 @@ mod audio_tests {
             for k in 0..n {
                 let (mut re, mut im) = (0.0f64, 0.0f64);
                 for (j, &v) in frame.iter().enumerate() {
-                    let angle =
-                        2.0 * std::f64::consts::PI * k as f64 * j as f64 / n as f64;
+                    let angle = 2.0 * std::f64::consts::PI * k as f64 * j as f64 / n as f64;
                     re += v as f64 * angle.cos();
                     im -= v as f64 * angle.sin();
                 }
@@ -361,10 +375,7 @@ mod audio_tests {
             let got = audio::transform_for_test(&frame);
             let scale = want.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!(
-                    (g - w).abs() / scale < 2e-5,
-                    "n={n}, term {i}: {g} vs {w}"
-                );
+                assert!((g - w).abs() / scale < 2e-5, "n={n}, term {i}: {g} vs {w}");
             }
         }
     }
@@ -379,9 +390,14 @@ mod audio_tests {
         let n_mel = 20usize;
         let bins = 1 + N_FFT / 2;
         let samples = waveform(SAMPLE_RATE / 4);
-        let mel = audio::log_mel_spectrogram_(&samples, &filters(n_mel, bins), N_FFT, HOP_LENGTH, n_mel);
+        let mel =
+            audio::log_mel_spectrogram_(&samples, &filters(n_mel, bins), N_FFT, HOP_LENGTH, n_mel);
 
-        assert_eq!(mel.len() % n_mel, 0, "the spectrogram is not a whole number of bands");
+        assert_eq!(
+            mel.len() % n_mel,
+            0,
+            "the spectrogram is not a whole number of bands"
+        );
         let frames = mel.len() / n_mel;
         assert!(frames > 0);
         assert!(
@@ -390,9 +406,11 @@ mod audio_tests {
         );
         // Eight decades, divided by four: whatever the filterbank's absolute scale, the
         // spectrogram the encoder sees spans exactly two.
-        let (lo, hi) = mel.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(l, h), &v| {
-            (l.min(v), h.max(v))
-        });
+        let (lo, hi) = mel
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(l, h), &v| {
+                (l.min(v), h.max(v))
+            });
         assert!(
             hi - lo <= 2.0 + 1e-5,
             "the spectrogram spans {} rather than the two decades the floor allows",
@@ -402,9 +420,7 @@ mod audio_tests {
         // Average each band over the frames that carry signal, and find the loudest.
         let voiced = frames.min(samples.len() / HOP_LENGTH);
         let band_level: Vec<f32> = (0..n_mel)
-            .map(|b| {
-                (0..voiced).map(|f| mel[b * frames + f]).sum::<f32>() / voiced.max(1) as f32
-            })
+            .map(|b| (0..voiced).map(|f| mel[b * frames + f]).sum::<f32>() / voiced.max(1) as f32)
             .collect();
         let loudest = band_level
             .iter()
@@ -419,4 +435,3 @@ mod audio_tests {
         );
     }
 }
-

@@ -111,7 +111,15 @@ impl MultiHeadAttention {
     }
 
     /// Attend, given the three operands already in heads, and put the result back in rows.
-    fn attend(&self, q: &Tensor, k: Tensor, v: Tensor, b: usize, tgt: usize, mask: Mask) -> Result<Tensor> {
+    fn attend(
+        &self,
+        q: &Tensor,
+        k: Tensor,
+        v: Tensor,
+        b: usize,
+        tgt: usize,
+        mask: Mask,
+    ) -> Result<Tensor> {
         let groups = self.heads / self.kv_heads;
         let (k, v) = (
             repeat_kv(k, groups)?.contiguous()?,
@@ -163,9 +171,7 @@ impl MultiHeadAttention {
                 let kept = match past {
                     // The heads axis is 1 and the positions axis is 2: the new step goes after
                     // the ones already seen, not beside them.
-                    Some((pk, pv)) => {
-                        (Tensor::cat(&[&pk, &nk], 2)?, Tensor::cat(&[&pv, &nv], 2)?)
-                    }
+                    Some((pk, pv)) => (Tensor::cat(&[&pk, &nk], 2)?, Tensor::cat(&[&pv, &nv], 2)?),
                     None => (nk, nv),
                 };
                 self.kv = Kv::Growing(Some(kept.clone()));
@@ -180,7 +186,12 @@ impl MultiHeadAttention {
     /// A stack that is always handed its whole sequence - an encoder, or a text tower run once
     /// per prompt - has no state to carry, and asking it for a mutable borrow it does not need
     /// would spread through every layer above it.
-    pub fn forward_stateless(&self, xs: &Tensor, source: Option<&Tensor>, mask: Mask) -> Result<Tensor> {
+    pub fn forward_stateless(
+        &self,
+        xs: &Tensor,
+        source: Option<&Tensor>,
+        mask: Mask,
+    ) -> Result<Tensor> {
         if !matches!(self.kv, Kv::None) {
             crate::tensor::bail!(
                 "forward_stateless on an attention that keeps a cache: what it kept would be \
@@ -288,7 +299,10 @@ mod tests {
         let stepped = Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1).unwrap();
 
         let gap = worst(&whole, &stepped);
-        assert!(gap < 1e-5, "cached and whole-sequence attention differ by {gap}");
+        assert!(
+            gap < 1e-5,
+            "cached and whole-sequence attention differ by {gap}"
+        );
     }
 
     /// A kept cross-attention is a recomputed one.
@@ -299,7 +313,9 @@ mod tests {
     #[test]
     fn keeping_the_encoder_projection_answers_what_recomputing_it_does() {
         let (width, heads, n, src_len) = (16usize, 4usize, 3usize, 6usize);
-        let xs = deterministic((n, width), 11).reshape((1, n, width)).unwrap();
+        let xs = deterministic((n, width), 11)
+            .reshape((1, n, width))
+            .unwrap();
         let source = deterministic((src_len, width), 13)
             .reshape((1, src_len, width))
             .unwrap();
@@ -310,7 +326,10 @@ mod tests {
             let a = kept.forward(&xs, Some(&source), Mask::All).unwrap();
             let b = fresh.forward(&xs, Some(&source), Mask::All).unwrap();
             let gap = worst(&a, &b);
-            assert!(gap < 1e-6, "round {round}: kept and recomputed differ by {gap}");
+            assert!(
+                gap < 1e-6,
+                "round {round}: kept and recomputed differ by {gap}"
+            );
         }
     }
 
@@ -322,13 +341,18 @@ mod tests {
     #[test]
     fn grouped_heads_read_the_key_head_they_are_grouped_under() {
         let (width, heads, kv_heads, n) = (16usize, 4usize, 2usize, 5usize);
-        let xs = deterministic((n, width), 17).reshape((1, n, width)).unwrap();
+        let xs = deterministic((n, width), 17)
+            .reshape((1, n, width))
+            .unwrap();
 
         let mut grouped = build(width, heads, kv_heads, Kv::None);
         let first = grouped.forward(&xs, None, Mask::Causal).unwrap();
         // Run it twice: nothing is kept, so the second answer must be the first.
         let again = grouped.forward(&xs, None, Mask::Causal).unwrap();
-        assert!(worst(&first, &again) < 1e-7, "an uncached attention is not a function");
+        assert!(
+            worst(&first, &again) < 1e-7,
+            "an uncached attention is not a function"
+        );
         assert_eq!(first.dims(), &[1, n, width]);
     }
 
@@ -336,13 +360,18 @@ mod tests {
     #[test]
     fn clearing_makes_the_next_generation_start_over() {
         let (width, heads, n) = (16usize, 4usize, 4usize);
-        let xs = deterministic((n, width), 23).reshape((1, n, width)).unwrap();
+        let xs = deterministic((n, width), 23)
+            .reshape((1, n, width))
+            .unwrap();
 
         let mut attn = build(width, heads, heads, Kv::Growing(None));
         let first = attn.forward(&xs, None, Mask::Causal).unwrap();
         attn.clear();
         let second = attn.forward(&xs, None, Mask::Causal).unwrap();
         let gap = worst(&first, &second);
-        assert!(gap < 1e-7, "after clearing, the same input gave a different answer by {gap}");
+        assert!(
+            gap < 1e-7,
+            "after clearing, the same input gave a different answer by {gap}"
+        );
     }
 }
