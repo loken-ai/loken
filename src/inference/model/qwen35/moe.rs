@@ -762,11 +762,35 @@ impl Qwen35DeltaNet {
                 z_proj,
                 ba_proj,
             } => {
-                // ssm_ba rows = [b(beta, n_v) | a(alpha/dt, n_v)] -> same (a, b) order
-                // the recurrence expects (alpha then beta).
+                // The fused `ssm_ba` is NOT two contiguous halves. Its rows are one group
+                // per K-head, and within each group the beta values precede the alpha ones:
+                // read as [n_k, 2 * n_v / n_k], beta is the first n_v/n_k of the last axis
+                // and alpha the rest. Taking [beta(n_v) | alpha(n_v)] instead pairs each
+                // gate with the wrong head - the recurrence still runs, and the answer stays
+                // fluent while being wrong, which is why it survived a coherence gate.
+                //
+                // The dense members of this family ship separate `ssm_alpha`/`ssm_beta`
+                // tensors and take the Split arm above, which is why only the models with a
+                // fused projection were affected.
+                let nk = self.n_k_heads;
+                let per = nv / nk.max(1);
                 let ba = ba_proj.forward(x)?;
-                let b = ba.narrow(D::Minus1, 0, nv)?.contiguous()?;
-                let a = ba.narrow(D::Minus1, nv, nv)?.contiguous()?;
+                let mut lead = ba.dims().to_vec();
+                lead.pop();
+                let mut grouped = lead.clone();
+                grouped.push(nk);
+                grouped.push(2 * per);
+                let ba = ba.reshape(grouped)?;
+                let mut flat = lead;
+                flat.push(nv);
+                let b = ba
+                    .narrow(D::Minus1, 0, per)?
+                    .contiguous()?
+                    .reshape(flat.clone())?;
+                let a = ba
+                    .narrow(D::Minus1, per, per)?
+                    .contiguous()?
+                    .reshape(flat)?;
                 Ok((in_qkv.forward(x)?, z_proj.forward(x)?, a, b))
             }
         }
