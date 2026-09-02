@@ -236,8 +236,14 @@ if __name__ == "__main__":
     bounds = starts + [len(lines)]
     preamble = "\n".join(lines[:starts[0]])
     placed, out = set(), [preamble]
+    # There is one unfiled section, never a new one per unclassified model. Its blocks are
+    # collected here and re-emitted once at the end: a section whose only membership rule is
+    # "no family claimed it" cannot claim a model the next run measures, so appending grew a
+    # section per cell.
     for a, b in zip(starts, bounds[1:]):
         block = lines[a:b]
+        if block[0].strip() == "### unfiled":
+            continue
         # Everything down to the header row is the section's own: its title, its prose, its
         # figure. Only the rows are regenerated.
         keep = []
