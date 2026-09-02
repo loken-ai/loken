@@ -1640,6 +1640,8 @@ pub struct Qwen35MoeModel {
     layers: Vec<Layer>,
     norm: crate::tensor::layer::RmsNorm,
     lm_head: QMatMul,
+    /// Where `norm` and `lm_head` live, which is not always the last layer's device.
+    head_dev: Device,
     dtype: DType,
     rope_dim: usize,
     rope_freq_base: f32,
@@ -1806,15 +1808,39 @@ impl Qwen35MoeModel {
             });
         }
         let last = dev_for(cfg.n_layers - 1);
-        let norm = crate::tensor::layer::RmsNorm::new(
-            ld_f32(content, reader, "output_norm.weight", last)?,
-            cfg.rms_eps as f32,
-        );
-        let lm_head = match load_q8(content, reader, "output.weight", last, mm) {
-            Ok(t) => QMatMul::from_qtensor(t)?,
-            Err(_) => {
-                QMatMul::from_qtensor(load_q8(content, reader, "token_embd.weight", last, mm)?)?
+        // The head is read in FULL for every token, so it is the last tensor that belongs on
+        // the host. Following the last layer put it there on any spilled model, which traded
+        // an 8 KB hidden-state transfer for a ~500 MB host read per token - fitted at ~103 ms
+        // of fixed per-token cost on qwen3.5:35b, against ~10.6 ms for each layer that spills.
+        // Only the spilled case changes: while the last layer is on a card, the head stays
+        // with it and nothing moves.
+        let head_dev = if last.is_cpu() {
+            devices.iter().find(|d| d.is_cuda()).unwrap_or(last)
+        } else {
+            last
+        };
+        let mut load_head = |d: &Device| -> Result<(crate::tensor::layer::RmsNorm, QMatMul)> {
+            let norm = crate::tensor::layer::RmsNorm::new(
+                ld_f32(content, reader, "output_norm.weight", d)?,
+                cfg.rms_eps as f32,
+            );
+            let head = match load_q8(content, reader, "output.weight", d, mm) {
+                Ok(t) => QMatMul::from_qtensor(t)?,
+                Err(_) => {
+                    QMatMul::from_qtensor(load_q8(content, reader, "token_embd.weight", d, mm)?)?
+                }
+            };
+            Ok((norm, head))
+        };
+        // The planner budgeted the layers, not the head, so the card it prefers may have no
+        // room left. A failure there is not fatal - it is the old placement.
+        let (head_dev, (norm, lm_head)) = match load_head(head_dev) {
+            Ok(v) => (head_dev.clone(), v),
+            Err(e) if !std::ptr::eq(head_dev, last) => {
+                tracing::warn!("qwen35moe: head does not fit the fastest card ({e}); keeping it with the last layer");
+                (last.clone(), load_head(last)?)
             }
+            Err(e) => return Err(e),
         };
         // Vision ViT - only if the GGUF carries it (multimodal qwen3.5). Pinned
         // to GPU 0 (embed_dev); it's small (~0.5 GB F16) vs the 23 GB text model.
@@ -1845,6 +1871,7 @@ impl Qwen35MoeModel {
             layers,
             norm,
             lm_head,
+            head_dev,
             dtype,
             rope_dim: cfg.rope_dim,
             rope_freq_base: cfg.rope_freq_base,
@@ -2009,9 +2036,10 @@ impl Qwen35MoeModel {
             let h = layer.ffn.forward(&h)?;
             x = (residual + h)?;
         }
+        let x = x.i((.., seq - 1, ..))?.to_device(&self.head_dev)?;
         let x = self.norm.forward(&x.to_dtype(DType::F32)?)?;
-        let x = x.i((.., seq - 1, ..))?.to_dtype(self.dtype)?;
-        self.lm_head.forward(&x)?.to_dtype(DType::F32)
+        self.lm_head.forward(&x.to_dtype(self.dtype)?)?
+            .to_dtype(DType::F32)
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, input_pos: usize) -> Result<Tensor> {
@@ -2044,9 +2072,10 @@ impl Qwen35MoeModel {
             let h = layer.ffn.forward(&h)?;
             x = (residual + h)?;
         }
+        let x = x.i((.., seq - 1, ..))?.to_device(&self.head_dev)?;
         let x = self.norm.forward(&x.to_dtype(DType::F32)?)?;
-        let x = x.i((.., seq - 1, ..))?.to_dtype(self.dtype)?;
-        self.lm_head.forward(&x)?.to_dtype(DType::F32)
+        self.lm_head.forward(&x.to_dtype(self.dtype)?)?
+            .to_dtype(DType::F32)
     }
 }
 
