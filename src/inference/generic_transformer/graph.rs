@@ -17,20 +17,25 @@ impl GenericHeteroTransformer {
     /// crashes with ILLEGAL_ADDRESS. The fix is structural (Q4/Q8 caches
     /// would need a device-side position tensor too), so for now we
     /// gate auto-on on F-dtype-only or dual-populate layers.
-    pub fn kv_state_graph_safe(&self) -> bool {
-        self.layers.iter().all(|l| {
+    /// Why graph capture is refused, or `None` when nothing refuses it.
+    ///
+    /// The reason names the branch that fired. One canned string used to stand for all of
+    /// them and blamed an HD=512 F-dtype layer for every refusal - including models whose
+    /// head_dim is 128, where it sent a root-cause after a layer that does not exist.
+    pub fn kv_state_graph_block(&self) -> Option<&'static str> {
+        self.layers.iter().find_map(|l| {
             // Q4 KV cache: append/flush/attention all run through
             // device-pos kernels in graph mode. `update_graph_state`
             // primes `cur_pos_dev` before each token, so this is safe.
             if l.has_q4_cache() {
-                return true;
+                return None;
             }
             // Dual-populate donors keep F-dtype populated alongside the
             // quantized cache. The graph_ops branch in `forward_attn`
             // takes the F-dtype path with scatter_set onto `graph_kv_pos`,
             // which is graph-safe by construction.
             if l.populate_dual_kv {
-                return true;
+                return None;
             }
             // Q8 KV cache: graph wiring is in tree and coherent
             // (commit 2c7fa3d, fresh-alloc dev_pos pattern matching Q4)
@@ -104,7 +109,7 @@ impl GenericHeteroTransformer {
                 let phi2_dev_pos =
                     self.config.flags.parallel_attn && self.config.flags.layer_norm_with_bias;
                 if self.q8_graph_small_dense_ok() {
-                    return true;
+                    return None;
                 }
                 // gemma4 graph mode: the capture crash is solved (capture
                 // arena), but the split path (prepare_kv/compute_from_kv)
@@ -118,7 +123,9 @@ impl GenericHeteroTransformer {
                 // 26.6 tok/s vs 142.4 graph-off = 5.3x SLOWER (split-path
                 // capture/replay overhead). Even with correct output it would
                 // never be enabled. Do NOT re-attempt gemma4 graph mode.
-                return phi2_dev_pos;
+                return (!phi2_dev_pos).then_some(
+                    "Q8 KV cache on an arch that measured slower captured than eager",
+                );
             }
             // gemma4 HD=512 still blocked.
             // F-dtype-only path: graph-safe ONLY when head_dim <= 256.
@@ -136,8 +143,12 @@ impl GenericHeteroTransformer {
             // the split-path numerical divergence (see Q8 branch above)
             // blocks shipping. DEFINITIVELY DEAD: graph-on is 5.3x SLOWER
             // than non-graph decode for gemma4 (measured). Do NOT re-attempt.
-            l.head_dim <= 256
+            (l.head_dim > 256).then_some("F-dtype KV cache with head_dim above 256")
         })
+    }
+
+    pub fn kv_state_graph_safe(&self) -> bool {
+        self.kv_state_graph_block().is_none()
     }
 
     /// Combined gate the engine reads to decide whether to auto-on
@@ -227,8 +238,8 @@ impl GenericHeteroTransformer {
     /// than logged here so the caller decides where it surfaces; `graph_capture_auto_on`
     /// keeps the boolean contract for existing callers.
     pub fn graph_capture_decision(&self) -> std::result::Result<(), &'static str> {
-        if !self.kv_state_graph_safe() {
-            return Err("KV state not graph-safe (HD=512 F-dtype layer)");
+        if let Some(why) = self.kv_state_graph_block() {
+            return Err(why);
         }
         // Engine-site capture MECHANICS restored (gptoss
         // treatment, proven end-to-end on the Q4-KV dev-pos path  - 
