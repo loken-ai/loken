@@ -156,6 +156,8 @@ impl LlmEngine {
                 let fsz = state.file_size;
                 cb_maybe_wrap(&mut state);
                 let mut guard = model_state.blocking_lock();
+                // Free VRAM just changed by the size of a model.
+                crate::inference::place::vram_manager::residency_changed();
                 *guard = Some(state);
                 drop(guard);
                 let mut size_guard = cached_model_size.blocking_lock();
@@ -1607,6 +1609,8 @@ impl LlmEngine {
             // continuous-batch worker (no-op for ineligible/CPU models).
             cb_maybe_wrap(&mut new_state);
             let mut guard = model_state.blocking_lock();
+            // Free VRAM just changed by the size of a model.
+            crate::inference::place::vram_manager::residency_changed();
             *guard = Some(new_state);
             drop(guard);  // Release lock early
 

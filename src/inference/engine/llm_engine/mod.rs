@@ -729,6 +729,7 @@ pub fn trim_cuda_pools() {
 
 #[cfg(feature = "cuda")]
 pub fn release_cuda_pools() {
+    crate::inference::place::vram_manager::residency_changed();
     // Drop big static workspaces from the upstream fast MMVQ/MMQ paths
     // BEFORE trimming the mempool - otherwise the held CudaSlices keep
     // their backing memory pinned in the pool and trim does nothing

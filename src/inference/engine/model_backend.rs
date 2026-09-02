@@ -66,7 +66,29 @@ pub(crate) fn group_layers_by_device(
 /// that remainder into one pass; larger remainders amortise so it is neutral.
 /// Bit-identical (chunk size never changes the logits). `widest_ffn == 0`
 /// (unknown) keeps the 512 default. The OOM ladder still halves from here.
+/// Memoised against the residency epoch. The answer is a four-rung ladder over the free
+/// VRAM, so it cannot change between two requests that load nothing - but it was recomputed
+/// per request, and each recomputation probed both cards with a stability loop AND trimmed
+/// the memory pools. Measured at four device probes per `/api/generate`, on every model.
+static CHUNK_MEMO: std::sync::Mutex<Option<(u64, usize, usize)>> = std::sync::Mutex::new(None);
+
 pub(crate) fn adaptive_prefill_chunk(widest_ffn: usize) -> usize {
+    let epoch = crate::inference::place::vram_manager::residency_epoch();
+    if let Ok(memo) = CHUNK_MEMO.lock() {
+        if let Some((e, ffn, chunk)) = *memo {
+            if e == epoch && ffn == widest_ffn {
+                return chunk;
+            }
+        }
+    }
+    let chunk = adaptive_prefill_chunk_uncached(widest_ffn);
+    if let Ok(mut memo) = CHUNK_MEMO.lock() {
+        *memo = Some((epoch, widest_ffn, chunk));
+    }
+    chunk
+}
+
+fn adaptive_prefill_chunk_uncached(widest_ffn: usize) -> usize {
     if widest_ffn == 0 {
         return PREFILL_CHUNK_TOKENS;
     }
@@ -1443,4 +1465,27 @@ impl ModelBackend for TakenBackend {
         ))
     }
     take_generic_passthrough!();
+}
+
+#[cfg(test)]
+mod prefill_chunk_memo_tests {
+    /// A residency change must discard the memo, or a chunk sized against an empty card
+    /// survives into a full one - which is the failure the adaptive sizing exists to prevent.
+    /// Judged on the epoch alone, so it needs no GPU: the memo key is (epoch, widest_ffn).
+    #[test]
+    fn a_residency_change_moves_the_epoch() {
+        let before = crate::inference::place::vram_manager::residency_epoch();
+        crate::inference::place::vram_manager::residency_changed();
+        let after = crate::inference::place::vram_manager::residency_epoch();
+        assert_ne!(before, after, "the memo key never changes, so it never invalidates");
+    }
+
+    /// Two calls with no residency change in between agree. Without the memo they would too,
+    /// but each would have re-probed both cards and trimmed the pools to say so.
+    #[test]
+    fn the_answer_is_stable_while_residency_is() {
+        let a = super::adaptive_prefill_chunk(14336);
+        let b = super::adaptive_prefill_chunk(14336);
+        assert_eq!(a, b);
+    }
 }

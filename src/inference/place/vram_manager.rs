@@ -95,6 +95,22 @@ pub fn probe(reserve: u64) -> Vec<(usize, u64, crate::tensor::Device)> {
 /// Lives HERE, not in each engine: three engines had grown their own copy of this
 /// sum, two of them named the same thing. Three copies of one definition is three
 /// chances for them to disagree about what "free" means.
+/// Bumped whenever what the cards hold changes: a model loaded, a model unloaded, the pools
+/// returned. Readings derived from free VRAM are cached against it, because `free_total`
+/// trims the pools before it measures - so asking it per request does not merely read a
+/// counter, it hands memory back to the driver that the next forward has to take again.
+static RESIDENCY_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Call after anything that changes residency. Cheap, and wrong only in the safe direction:
+/// an extra bump costs one re-probe, a missing one serves a stale figure.
+pub fn residency_changed() {
+    RESIDENCY_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn residency_epoch() -> u64 {
+    RESIDENCY_EPOCH.load(Ordering::Relaxed)
+}
+
 pub fn free_total() -> u64 {
     probe(0).into_iter().map(|(_, free, _)| free).sum()
 }

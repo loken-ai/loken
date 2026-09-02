@@ -176,6 +176,7 @@ costs about what the token does.
 
 
 
+
 ### ernie4_5
 
 ![ernie4_5](img/family-ernie4_5.svg)
@@ -271,11 +272,11 @@ costs about what the token does.
 
 ![qwen2](img/family-qwen2.svg)
 
-| Model         | Ctx  | Prompt | Mode   | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms    | J/req   | J/token | Δ decode | Δ energy | Date             |
-|---------------|------|--------|--------|--------|-----------------|---------------|--------------|---------|-----------|---------|---------|----------|----------|------------------|
-| deepcoder:14b | 4096 | short  | stream | GPU    | Ollama 0.32.6   | 73.9          | 52.6         | 128     | 4 605     |  -      |  -      |          |          | 2026-09-02 00:38 |
-| deepcoder:14b | 4096 | short  | stream | GPU    | vLLM 0.22.0     | 840.8         | 85.1         | 128     | 1 555     |  -      |  -      |          |          | 2026-09-02 00:38 |
-| deepcoder:14b | 4096 | short  | stream | GPU    | **loken 0.1.0** | **367.7**     | **78.1**     | **128** | **1 710** | ** - ** | ** - ** | -8.1%    |          | 2026-09-02 00:38 |
+| Model         | Ctx  | Prompt | Mode   | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms    | J/req   | J/token   | Δ decode | Δ energy | Date             |
+|---------------|------|--------|--------|--------|-----------------|---------------|--------------|---------|-----------|---------|-----------|----------|----------|------------------|
+| deepcoder:14b | 4096 | short  | stream | GPU    | Ollama 0.32.6   | 71.7          | 52.6         | 128     | 4 688     | 646     | 5.046     |          |          | 2026-09-02 05:27 |
+| deepcoder:14b | 4096 | short  | stream | GPU    | vLLM 0.22.0     | 847.8         | 85.0         | 128     | 1 555     | 330     | 2.575     |          |          | 2026-09-02 05:27 |
+| deepcoder:14b | 4096 | short  | stream | GPU    | **loken 0.1.0** | **226.1**     | **82.4**     | **128** | **1 624** | **414** | **3.237** | -3.1%    | -20.4%   | 2026-09-02 05:27 |
 
 ### qwen3
 
@@ -318,75 +319,3 @@ costs about what the token does.
 
 | Model | Ctx | Prompt | Mode | Device | Engine | Prefill tok/s | Decode tok/s | Tokens | E2E ms | J/req | J/token | Δ decode | Δ energy | Date |
 |-------|-----|--------|------|--------|--------|---------------|--------------|--------|--------|-------|---------|----------|----------|------|
-
-### unfiled
-
-Measured, and not yet placed in a family section.
-
-| Model           | Ctx  | Prompt | Mode   | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms    | J/req   | J/token | Δ decode   | Δ energy | Date             |
-|-----------------|------|--------|--------|--------|-----------------|---------------|--------------|---------|-----------|---------|---------|------------|----------|------------------|
-| deepseek-r1:32b | 4096 | short  | stream | GPU    | Ollama 0.32.6   | 64.2          | 25.8         | 128     | 8 171     |  -      |  -      |            |          | 2026-09-02 00:41 |
-| deepseek-r1:32b | 4096 | short  | stream | GPU    | **loken 0.1.0** | **195.8**     | **41.0**     | **128** | **3 451** | ** - ** | ** - ** | **+58.7%** |          | 2026-09-02 00:41 |
-
-### unfiled
-
-Measured, and not yet placed in a family section.
-
-| Model           | Ctx  | Prompt | Mode   | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms     | J/req   | J/token | Δ decode | Δ energy | Date             |
-|-----------------|------|--------|--------|--------|-----------------|---------------|--------------|---------|------------|---------|---------|----------|----------|------------------|
-| deepseek-r1:70b | 4096 | short  | stream | GPU    | Ollama 0.32.6   | 17.4          | 1.6          | 128     | 87 654     |  -      |  -      |          |          | 2026-09-02 00:53 |
-| deepseek-r1:70b | 4096 | short  | stream | GPU    | **loken 0.1.0** | **12.1**      | **1.5**      | **128** | **91 440** | ** - ** | ** - ** | -1.7%    |          | 2026-09-02 00:53 |
-
-### unfiled
-
-Measured, and not yet placed in a family section.
-
-| Model                | Ctx  | Prompt | Mode   | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms    | J/req   | J/token | Δ decode    | Δ energy | Date             |
-|----------------------|------|--------|--------|--------|-----------------|---------------|--------------|---------|-----------|---------|---------|-------------|----------|------------------|
-| deepseek-r1:70b-q3ks | 4096 | short  | stream | GPU    | Ollama 0.32.6   | 41.4          | 6.9          | 128     | 23 278    |  -      |  -      |             |          | 2026-09-02 00:57 |
-| deepseek-r1:70b-q3ks | 4096 | short  | stream | GPU    | **loken 0.1.0** | **135.8**     | **21.2**     | **128** | **6 401** | ** - ** | ** - ** | **+206.5%** |          | 2026-09-02 00:57 |
-
-### unfiled
-
-Measured, and not yet placed in a family section.
-
-| Model                   | Ctx  | Prompt | Mode   | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms    | J/req   | J/token | Δ decode   | Δ energy | Date             |
-|-------------------------|------|--------|--------|--------|-----------------|---------------|--------------|---------|-----------|---------|---------|------------|----------|------------------|
-| devstral-small-2:latest | 4096 | short  | stream | GPU    | Ollama 0.32.6   | 55.7          | 35.4         | 128     | 6 566     |  -      |  -      |            |          | 2026-09-02 00:59 |
-| devstral-small-2:latest | 4096 | short  | stream | GPU    | **loken 0.1.0** | **314.7**     | **59.6**     | **128** | **2 380** | ** - ** | ** - ** | **+68.3%** |          | 2026-09-02 00:59 |
-
-### unfiled
-
-Measured, and not yet placed in a family section.
-
-| Model        | Ctx  | Prompt | Mode   | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms    | J/req   | J/token | Δ decode   | Δ energy | Date             |
-|--------------|------|--------|--------|--------|-----------------|---------------|--------------|---------|-----------|---------|---------|------------|----------|------------------|
-| devstral:24b | 4096 | short  | stream | GPU    | Ollama 0.32.6   | 60.9          | 36.3         | 128     | 6 238     |  -      |  -      |            |          | 2026-09-02 01:12 |
-| devstral:24b | 4096 | short  | stream | GPU    | **loken 0.1.0** | **296.4**     | **50.8**     | **128** | **2 622** | ** - ** | ** - ** | **+40.1%** |          | 2026-09-02 01:12 |
-
-### unfiled
-
-Measured, and not yet placed in a family section.
-
-| Model           | Ctx  | Prompt | Mode   | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms  | J/req   | J/token | Δ decode   | Δ energy | Date             |
-|-----------------|------|--------|--------|--------|-----------------|---------------|--------------|---------|---------|---------|---------|------------|----------|------------------|
-| ernie4-5:latest | 4096 | short  | stream | GPU    | Ollama 0.32.6   | 157.6         | 418.2        | 128     | 1 567   |  -      |  -      |            |          | 2026-09-02 01:12 |
-| ernie4-5:latest | 4096 | short  | stream | GPU    | **loken 0.1.0** | **1 141.9**   | **582.0**    | **128** | **281** | ** - ** | ** - ** | **+39.2%** |          | 2026-09-02 01:12 |
-
-### unfiled
-
-Measured, and not yet placed in a family section.
-
-| Model          | Ctx  | Prompt | Mode   | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms  | J/req   | J/token | Δ decode   | Δ energy | Date             |
-|----------------|------|--------|--------|--------|-----------------|---------------|--------------|---------|---------|---------|---------|------------|----------|------------------|
-| falcon3:latest | 4096 | short  | stream | GPU    | Ollama 0.32.6   | 100.0         | 210.9        | 128     | 2 111   |  -      |  -      |            |          | 2026-09-02 01:13 |
-| falcon3:latest | 4096 | short  | stream | GPU    | **loken 0.1.0** | **498.7**     | **391.7**    | **128** | **384** | ** - ** | ** - ** | **+85.8%** |          | 2026-09-02 01:13 |
-
-### unfiled
-
-Measured, and not yet placed in a family section.
-
-| Model      | Ctx  | Prompt | Mode   | Device | Engine          | Prefill tok/s | Decode tok/s | Tokens  | E2E ms    | J/req   | J/token | Δ decode | Δ energy | Date             |
-|------------|------|--------|--------|--------|-----------------|---------------|--------------|---------|-----------|---------|---------|----------|----------|------------------|
-| gemma4:12b | 4096 | short  | stream | GPU    | Ollama 0.32.6   | 29.7          | 54.4         | 61      | 3 860     |  -      |  -      |          |          | 2026-09-02 01:15 |
-| gemma4:12b | 4096 | short  | stream | GPU    | **loken 0.1.0** | **177.3**     | **71.8**     | **128** | **1 845** | ** - ** | ** - ** |          |          | 2026-09-02 01:15 |

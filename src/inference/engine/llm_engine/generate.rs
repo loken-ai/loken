@@ -12,6 +12,7 @@ impl LlmEngine {
         let mut state = self.model_state.lock().await;
         if let Some(model) = state.take() {
             info!("🔌 Unloading model: {}", model.name);
+            crate::inference::place::vram_manager::residency_changed();
         }
         // THE PROMPT CACHE DESCRIBES A KV THAT NO LONGER EXISTS.
         //
