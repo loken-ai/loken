@@ -414,6 +414,70 @@ fn rms_norm_matches_oracle() {
     close(&n.to_vec_f32(), &want, 1e-5);
 }
 
+/// The wide RMSNorm kernel against the narrow one, at the width a decode step uses.
+///
+/// The oracle above runs 32 columns, below the 256 the wide kernel needs, so it judged the
+/// narrow kernel only - the whole suite did, and every decode takes the wide one.
+///
+/// The dispatch picks by shape: one row takes the wide kernel, sixty-five the narrow one. So
+/// the same row is fed to both. They share an accumulation order and the claim is bit
+/// identity, so that is what is asserted - a tolerance here would pass a kernel that reduces
+/// in a different order. The reference check that follows keeps two kernels agreeing on a
+/// wrong answer from reading as a pass.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_wide_rmsnorm_matches_the_narrow_one_bit_for_bit() {
+    let Ok(dev) = crate::tensor::cuda::CudaDevice::get(0) else {
+        return;
+    };
+    let gpu = crate::tensor::Device::Cuda(dev);
+    const COLS: usize = 5120;
+    const ROWS: usize = 65;
+    // Without this the test would compare a kernel to itself the day the threshold moves,
+    // and pass while judging nothing.
+    let (one, _) = crate::tensor::cuda::rms_norm_launch(1, COLS);
+    let (many_k, _) = crate::tensor::cuda::rms_norm_launch(ROWS, COLS);
+    assert_eq!(one, "fused_rmsnorm_wide_f32");
+    assert_ne!(one, many_k, "both shapes now take {one}: this compares nothing");
+    let row = data(COLS, 21);
+    let w = data(COLS, 22);
+    let weight = |g: &crate::tensor::Device| {
+        Tensor::from_vec_f32(w.clone(), vec![COLS])
+            .unwrap()
+            .to_device(g)
+            .unwrap()
+    };
+    let wide = Tensor::from_vec_f32(row.clone(), vec![1, COLS])
+        .unwrap()
+        .to_device(&gpu)
+        .unwrap()
+        .rms_norm(&weight(&gpu), 1e-6)
+        .unwrap()
+        .to_vec_f32();
+    let mut many = Vec::with_capacity(ROWS * COLS);
+    for _ in 0..ROWS {
+        many.extend_from_slice(&row);
+    }
+    let narrow = Tensor::from_vec_f32(many, vec![ROWS, COLS])
+        .unwrap()
+        .to_device(&gpu)
+        .unwrap()
+        .rms_norm(&weight(&gpu), 1e-6)
+        .unwrap()
+        .to_vec_f32();
+    assert_eq!(wide.len(), COLS);
+    for c in 0..COLS {
+        assert_eq!(
+            wide[c].to_bits(),
+            narrow[c].to_bits(),
+            "column {c}: wide {} vs narrow {}",
+            wide[c],
+            narrow[c]
+        );
+    }
+    close(&wide, &ref_rms_norm(&row, &w, 1, COLS, 1e-6), 1e-4);
+}
+
 #[test]
 fn activations_match_oracle() {
     let x = data(2 * 37, 16);

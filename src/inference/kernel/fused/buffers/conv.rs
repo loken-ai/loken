@@ -890,18 +890,7 @@ pub fn fused_rmsnorm_f32(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor
 
     let cuda_dev = x.device().as_cuda_device()?;
     let ptx = get_ptx(&cuda_dev)?;
-    // Wide-block path for the few-rows (decode / small-batch verify) case:
-    // with one block per row, a 256-thread block under-fills the SM and the
-    // narrow kernel reads the row from global memory twice - measured ~3x
-    // the per-row latency of the staged wide variant. Large-rows launches
-    // keep the narrow kernel (one small block per row scales across SMs).
-    // Both kernels share the exact same accumulation order -> bit-identical.
-    let wide = rows <= 64 && cols >= 256 && cols * 4 + 1024 <= 48 * 1024;
-    let kname = if wide {
-        "fused_rmsnorm_wide_f32"
-    } else {
-        "fused_rmsnorm_f32"
-    };
+    let (kname, cfg) = crate::tensor::cuda::rms_norm_launch(rows, cols);
     let func = cuda_dev.get_or_load_custom_func(kname, "loken_fused", ptx)?;
 
     let (x_store, x_layout) = x.storage_and_layout();
@@ -917,20 +906,6 @@ pub fn fused_rmsnorm_f32(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor
         let w_slice = ws.as_cuda_slice::<f32>()?;
         let o_slice = os.as_cuda_slice::<f32>()?;
         let x_view = x_slice.slice(x_layout.start_offset()..);
-        let cfg = if wide {
-            crate::tensor::cuda_ext::LaunchConfig {
-                grid_dim: (rows as u32, 1, 1),
-                block_dim: ((cols as u32).next_power_of_two().clamp(256, 1024), 1, 1),
-                shared_mem_bytes: (cols as u32) * 4,
-            }
-        } else {
-            let block = 256u32.min(cols as u32).max(1).next_power_of_two();
-            crate::tensor::cuda_ext::LaunchConfig {
-                grid_dim: (rows as u32, 1, 1),
-                block_dim: (block, 1, 1),
-                shared_mem_bytes: block * 4,
-            }
-        };
         let cols_i32 = cols as i32;
         let mut builder = func.builder();
         builder.arg(&x_view);

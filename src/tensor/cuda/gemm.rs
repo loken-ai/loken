@@ -266,6 +266,37 @@ pub(super) fn row_block(cols: usize) -> u32 {
     256u32.min(cols as u32).max(1).next_power_of_two()
 }
 
+/// Which RMSNorm kernel a launch of this shape takes, and how it is configured.
+///
+/// Declared once. The decode path launches through `rms_norm_f32` below and the tensor path
+/// through the fused buffers; only the second knew the wide kernel existed, so every decode
+/// ran the narrow one and read its row from global memory twice.
+///
+/// Few rows means one block per row leaves the SM mostly idle. The wide variant stages the
+/// row into shared memory with the full block and keeps the narrow kernel's exact
+/// accumulation order, so the two produce bit-identical output.
+pub fn rms_norm_launch(rows: usize, cols: usize) -> (&'static str, LaunchConfig) {
+    if rows <= 64 && cols >= 256 && cols * 4 + 1024 <= 48 * 1024 {
+        return (
+            "fused_rmsnorm_wide_f32",
+            LaunchConfig {
+                grid_dim: (rows as u32, 1, 1),
+                block_dim: ((cols as u32).next_power_of_two().clamp(256, 1024), 1, 1),
+                shared_mem_bytes: (cols as u32) * 4,
+            },
+        );
+    }
+    let block = row_block(cols);
+    (
+        "fused_rmsnorm_f32",
+        LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: block * 4,
+        },
+    )
+}
+
 /// `fused_rmsnorm_f32` on a [rows, cols] device buffer.
 pub fn rms_norm_f32(
     dev: &CudaDevice,
@@ -275,17 +306,12 @@ pub fn rms_norm_f32(
     cols: usize,
     eps: f32,
 ) -> Result<CudaSlice<f32>> {
-    let func = dev.fused_fn("fused_rmsnorm_f32")?;
+    let (kname, cfg) = rms_norm_launch(rows, cols);
+    let func = dev.fused_fn(kname)?;
     let stream = dev.stream();
     let out = with_oom_retry(dev, "rms_norm", || unsafe {
         stream.alloc::<f32>(rows * cols)
     })?;
-    let block = row_block(cols);
-    let cfg = LaunchConfig {
-        grid_dim: (rows as u32, 1, 1),
-        block_dim: (block, 1, 1),
-        shared_mem_bytes: block * 4,
-    };
     let cols_i32 = cols as i32;
     let mut b = stream.launch_builder(&func);
     b.arg(x);
