@@ -541,6 +541,52 @@ extern "C" __global__ void fused_add_rmsnorm_dual_f32(
     }
 }
 
+// Wide-block variant of fused_add_rmsnorm_dual_f32 for the few-rows decode case. The
+// narrow kernel writes the summed row to global memory and READS IT BACK for the normalize
+// pass; this one stages it in shared memory and reads that instead, while still writing
+// sum_out because it is an output. The squared-sum keeps the narrow kernel's exact 256-lane
+// strided accumulation and 256-entry tree, so the two are bit-identical.
+// Caller guarantees: cols >= 256 and cols*4 fits the dynamic-smem budget.
+extern "C" __global__ void fused_add_rmsnorm_dual_wide_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ residual,
+    const float* __restrict__ weight,
+    float* __restrict__ sum_out,
+    float* __restrict__ norm_out,
+    const float eps,
+    const int cols
+) {
+    int row = blockIdx.x;
+    extern __shared__ float ssum_ardw[];   // [cols] staged sum
+    __shared__ float stree_ardw[256];
+    int offset = row * cols;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float val = x[offset + i] + residual[offset + i];
+        ssum_ardw[i] = val;
+        sum_out[offset + i] = val;
+    }
+    __syncthreads();
+    if (threadIdx.x < 256) {
+        // Same per-lane sequential order as the narrow kernel (stride 256).
+        float thread_sum = 0.0f;
+        for (int i = threadIdx.x; i < cols; i += 256) {
+            float v = ssum_ardw[i];
+            thread_sum += v * v;
+        }
+        stree_ardw[threadIdx.x] = thread_sum;
+    }
+    __syncthreads();
+    // Same binary-tree combine as the narrow kernel (blockDim.x there = 256).
+    for (int s = 128; s > 0; s >>= 1) {
+        if (threadIdx.x < s) stree_ardw[threadIdx.x] += stree_ardw[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(stree_ardw[0] / (float)cols + eps);
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        norm_out[offset + i] = ssum_ardw[i] * rms * weight[i];
+    }
+}
+
 // Fused dual RmsNorm + add residual:
 //   out[r,c] = rmsnorm(a[r,:], w1)[c] + rmsnorm(b[r,:], w2)[c] + c_in[r,c]
 // Replaces 4 launches for the gemma4-MoE post-FFN combine:

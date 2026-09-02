@@ -478,6 +478,75 @@ fn the_wide_rmsnorm_matches_the_narrow_one_bit_for_bit() {
     close(&wide, &ref_rms_norm(&row, &w, 1, COLS, 1e-6), 1e-4);
 }
 
+/// The wide add+RMSNorm kernel against the narrow one, both outputs.
+///
+/// The narrow kernel writes the summed row to global memory and reads it back to normalise;
+/// the wide one keeps it in shared memory. Both outputs are compared, because a staging bug
+/// could leave `sum_out` right and `norm_out` wrong, or the reverse.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_wide_add_rmsnorm_matches_the_narrow_one_bit_for_bit() {
+    use crate::inference::kernel::fused::fused_add_rmsnorm_dual;
+    let Ok(dev) = crate::tensor::cuda::CudaDevice::get(0) else {
+        return;
+    };
+    let gpu = crate::tensor::Device::Cuda(dev);
+    const COLS: usize = 5120;
+    const ROWS: usize = 65;
+    let (one, _) = crate::tensor::cuda::add_rms_norm_launch(1, COLS);
+    let (many_k, _) = crate::tensor::cuda::add_rms_norm_launch(ROWS, COLS);
+    assert_eq!(one, "fused_add_rmsnorm_dual_wide_f32");
+    assert_ne!(one, many_k, "both shapes now take {one}: this compares nothing");
+
+    let row = data(COLS, 23);
+    let res = data(COLS, 24);
+    let w = data(COLS, 25);
+    let on_gpu = |v: &Vec<f32>, rows: usize| {
+        let mut all = Vec::with_capacity(rows * COLS);
+        for _ in 0..rows {
+            all.extend_from_slice(v);
+        }
+        Tensor::from_vec_f32(all, vec![rows, COLS])
+            .unwrap()
+            .to_device(&gpu)
+            .unwrap()
+    };
+    let weight = Tensor::from_vec_f32(w.clone(), vec![COLS])
+        .unwrap()
+        .to_device(&gpu)
+        .unwrap();
+    let (ws, wn) = fused_add_rmsnorm_dual(&on_gpu(&row, 1), &on_gpu(&res, 1), &weight, 1e-6)
+        .expect("wide launch");
+    let (ns, nn) = fused_add_rmsnorm_dual(
+        &on_gpu(&row, ROWS),
+        &on_gpu(&res, ROWS),
+        &weight,
+        1e-6,
+    )
+    .expect("narrow launch");
+    for (what, wide, narrow) in [
+        ("sum", ws.to_vec_f32(), ns.to_vec_f32()),
+        ("norm", wn.to_vec_f32(), nn.to_vec_f32()),
+    ] {
+        assert_eq!(wide.len(), COLS);
+        for c in 0..COLS {
+            assert_eq!(
+                wide[c].to_bits(),
+                narrow[c].to_bits(),
+                "{what} column {c}: wide {} vs narrow {}",
+                wide[c],
+                narrow[c]
+            );
+        }
+    }
+    let summed: Vec<f32> = row.iter().zip(&res).map(|(a, b)| a + b).collect();
+    close(
+        &wn.to_vec_f32(),
+        &ref_rms_norm(&summed, &w, 1, COLS, 1e-6),
+        1e-4,
+    );
+}
+
 #[test]
 fn activations_match_oracle() {
     let x = data(2 * 37, 16);

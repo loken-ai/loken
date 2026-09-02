@@ -275,26 +275,48 @@ pub(super) fn row_block(cols: usize) -> u32 {
 /// Few rows means one block per row leaves the SM mostly idle. The wide variant stages the
 /// row into shared memory with the full block and keeps the narrow kernel's exact
 /// accumulation order, so the two produce bit-identical output.
-pub fn rms_norm_launch(rows: usize, cols: usize) -> (&'static str, LaunchConfig) {
-    if rows <= 64 && cols >= 256 && cols * 4 + 1024 <= 48 * 1024 {
-        return (
-            "fused_rmsnorm_wide_f32",
-            LaunchConfig {
-                grid_dim: (rows as u32, 1, 1),
-                block_dim: ((cols as u32).next_power_of_two().clamp(256, 1024), 1, 1),
-                shared_mem_bytes: (cols as u32) * 4,
-            },
-        );
+pub fn wide_row_block(rows: usize, cols: usize) -> bool {
+    rows <= 64 && cols >= 256 && cols * 4 + 1024 <= 48 * 1024
+}
+
+/// The launch geometry a row-per-block norm takes, wide or narrow.
+pub fn row_norm_cfg(rows: usize, cols: usize, wide: bool) -> LaunchConfig {
+    let (block, smem) = if wide {
+        (
+            (cols as u32).next_power_of_two().clamp(256, 1024),
+            (cols as u32) * 4,
+        )
+    } else {
+        let b = row_block(cols);
+        (b, b * 4)
+    };
+    LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: smem,
     }
-    let block = row_block(cols);
-    (
-        "fused_rmsnorm_f32",
-        LaunchConfig {
-            grid_dim: (rows as u32, 1, 1),
-            block_dim: (block, 1, 1),
-            shared_mem_bytes: block * 4,
-        },
-    )
+}
+
+pub fn rms_norm_launch(rows: usize, cols: usize) -> (&'static str, LaunchConfig) {
+    let wide = wide_row_block(rows, cols);
+    let name = if wide {
+        "fused_rmsnorm_wide_f32"
+    } else {
+        "fused_rmsnorm_f32"
+    };
+    (name, row_norm_cfg(rows, cols, wide))
+}
+
+/// The same choice for the add+norm kernel, which reads its summed row back from global
+/// memory in the narrow form.
+pub fn add_rms_norm_launch(rows: usize, cols: usize) -> (&'static str, LaunchConfig) {
+    let wide = wide_row_block(rows, cols);
+    let name = if wide {
+        "fused_add_rmsnorm_dual_wide_f32"
+    } else {
+        "fused_add_rmsnorm_dual_f32"
+    };
+    (name, row_norm_cfg(rows, cols, wide))
 }
 
 /// `fused_rmsnorm_f32` on a [rows, cols] device buffer.

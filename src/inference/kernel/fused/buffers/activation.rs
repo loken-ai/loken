@@ -282,6 +282,7 @@ pub fn prewarm_fused_kernels(cuda_dev: &crate::tensor::cuda_ext::RawCudaDevice) 
         "fused_split_silu_mul_f32",
         "fused_add_rmsnorm_dual_f32",
         "fused_rmsnorm_wide_f32",
+        "fused_add_rmsnorm_dual_wide_f32",
         "fused_dual_rmsnorm_add_f32",
         "fused_gemma4_post_add_norm_f32",
         "fused_rmsnorm_then_add_f32",

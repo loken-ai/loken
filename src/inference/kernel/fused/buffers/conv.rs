@@ -727,8 +727,8 @@ pub fn fused_add_rmsnorm_dual(
 
     let cuda_dev = x.device().as_cuda_device()?;
     let ptx = get_ptx(&cuda_dev)?;
-    let func =
-        cuda_dev.get_or_load_custom_func("fused_add_rmsnorm_dual_f32", "loken_fused", ptx)?;
+    let (kname, cfg) = crate::tensor::cuda::add_rms_norm_launch(rows, cols);
+    let func = cuda_dev.get_or_load_custom_func(kname, "loken_fused", ptx)?;
 
     let (x_store, x_layout) = x.storage_and_layout();
     let (r_store, r_layout) = residual.storage_and_layout();
@@ -751,13 +751,6 @@ pub fn fused_add_rmsnorm_dual(
         let n_slice = ns.as_cuda_slice::<f32>()?;
         let x_view = x_slice.slice(x_layout.start_offset()..);
         let r_view = r_slice.slice(r_layout.start_offset()..);
-
-        let block = 256u32.min(cols as u32).next_power_of_two();
-        let cfg = crate::tensor::cuda_ext::LaunchConfig {
-            grid_dim: (rows as u32, 1, 1),
-            block_dim: (block, 1, 1),
-            shared_mem_bytes: block * 4,
-        };
 
         let cols_i32 = cols as i32;
         let mut builder = func.builder();
