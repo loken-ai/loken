@@ -118,6 +118,41 @@ def arch_of(tag):
             _ARCH_CACHE[tag] = None
     return _ARCH_CACHE[tag]
 
+def looks_looping(text):
+    """A loop that emits no whitespace, which the harness's gate cannot see.
+
+    Every check in assay's `looks_degenerate` splits on whitespace first, so a 128-token
+    answer that is one enormous word - "arousingerser_er_er_er...", "misterer/misterer/" -
+    has fewer than twelve units and is declared fine. Both engines produced exactly that on
+    gemma4:26b and both passed.
+
+    Same reasoning as the harness's phrase check, one level down: distinct character windows
+    over total lands near 1.0 for prose and collapses toward k/n for anything cycling with
+    period k, whatever k is. Judged here as well as there so that every cell in the report -
+    including those measured before the rule existed - is judged by one rule.
+    """
+    t = "".join(text.split())
+    if len(t) < 40:
+        return False
+    # A long cycle: distinct windows over total collapses toward k/n whatever the period k is.
+    w = [t[i:i + 8] for i in range(len(t) - 7)]
+    if len(set(w)) / len(w) < 0.5:
+        return True
+    # A sane opening followed by a looping tail keeps that share high, because the head
+    # supplies the distinct windows - the same escape the harness found at word level. What
+    # gives it away is one short pattern repeating back to back over much of the answer.
+    for k in range(2, 17):
+        i = 0
+        while i + k <= len(t):
+            reps = 1
+            while t[i + reps * k: i + (reps + 1) * k] == t[i:i + k]:
+                reps += 1
+            if reps >= 3 and reps * k * 10 >= len(t) * 3:
+                return True
+            i += 1
+    return False
+
+
 def stat(st, name):
     """The harness's own aggregate, so the report never defines a second one."""
     v = st.get(name)
@@ -180,6 +215,7 @@ def rows(path, mode, device):
             # tokens and was tabled as -70% against ollama's prose - so the verdict has
             # to travel with the numbers, or the table states a speed for nothing.
             "coh":     r.get("coherence_pass"),
+            "preview": r.get("first_response_preview") or "",
         }
     return out
 
@@ -203,7 +239,7 @@ def cells(merged):
         # result. Excluding it from the comparison matters in both directions: as the
         # reference it would flatter us, and as our own cell it would publish a delta
         # against work nobody did.
-        ok = lambda v: v.get("coh") is not False
+        ok = lambda v: v.get("coh") is not False and not looks_looping(v.get("preview", ""))
         others = [v["decode"] for k, v in by.items()
                   if k in ("ollama", "vllm") and v["decode"] and same(v) and ok(v)]
         # Comparable only when both sides counted the same domains: a total over the cards
