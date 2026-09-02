@@ -150,6 +150,14 @@ def looks_looping(text):
             if reps >= 3 and reps * k * 10 >= len(t) * 3:
                 return True
             i += 1
+    # NEAR-repetition, which neither check above can see because nothing repeats exactly:
+    # "Once up to once, Once up once, Once up once. Once said that once upon a day." Every
+    # window differs slightly and no run is byte-identical, but the vocabulary has collapsed.
+    # Measured on this campaign's own previews: prose runs 0.75 to 1.00 distinct words, the
+    # answers that are visibly circling run 0.33 to 0.45. The line is drawn between them.
+    words = re.findall(r"[a-z0-9']+", text.lower())
+    if len(words) >= 16 and len(set(words)) / len(words) < 0.55:
+        return True
     return False
 
 
