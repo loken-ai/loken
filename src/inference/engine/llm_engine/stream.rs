@@ -674,11 +674,11 @@ impl LlmEngine {
                     }
                 };
                 debug!("STREAMING PREFILL: Forward pass complete");
-                prefill_end = Some(std::time::Instant::now());
-                // Start the first compute window. The work after prefill
-                // (sampling first token + reaching the loop) counts as
-                // compute; stream_token's blocking_send is excluded.
-                iter_compute_start = Some(std::time::Instant::now());
+                // The first compute window is NOT opened here. Sampling the first token and
+                // reaching the loop happen before that token reaches the client, so charging
+                // them to decode made the published decode rate slower than the one a client
+                // observes - impossible, and the reason it was found. That work belongs to
+                // prefill, which closes at the top of the loop where its token exists.
                 // Vision prefill writes BOS + image_embeds (typically
                 // 729 patches for moondream) ahead of the text tokens
                 // into the KV cache. Add the prefix length to `pos`
@@ -964,8 +964,12 @@ impl LlmEngine {
             let mut next_token_dev: Option<Tensor> = None;
 
             'stream_loop: while next_token != eos_token_id && token_count < max_tokens {
-                // Close the compute window from the previous iter's
-                // forward+sample (or prefill, on first iter).
+                // Prefill ends where its token exists, not where its forward pass returned.
+                if prefill_end.is_none() {
+                    prefill_end = Some(std::time::Instant::now());
+                }
+                // Close the compute window from the previous iter's forward+sample. There is
+                // none to close on the first iteration: prefill produced that token.
                 if let Some(t) = iter_compute_start.take() {
                     compute_ns += t.elapsed().as_nanos() as u64;
                 }

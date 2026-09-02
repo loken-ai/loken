@@ -1455,6 +1455,15 @@ impl LlmEngine {
                 }
             }
 
+            // Taken here, where the last token exists, and not after the epilogue below.
+            //
+            // It used to be read forty lines further down, past the graph teardown and two
+            // logging blocks, so eval_duration carried work that produced no token and the
+            // rate we publish came out slower than the rate a client observes - which is
+            // impossible, and is what made it visible: a client cannot receive tokens faster
+            // than the server makes them.
+            let decode_elapsed = gen_start.elapsed();
+
             // End-of-request graph teardown. The captured graph + its
             // arena-backed transients must not outlive the request: the next
             // request re-captures with a FRESH arena (begin_capture_arena
@@ -1493,7 +1502,7 @@ impl LlmEngine {
                     pld_stats_accepted, pld_stats_drafted, accept_rate * 100.0);
             }
 
-            let eval_duration = gen_start.elapsed().as_nanos() as u64;
+            let eval_duration = decode_elapsed.as_nanos() as u64;
             let eval_count = generated.len() as u64;
 
             // Mirror the resident KV (prompt + generated) under the GLOBAL key so
