@@ -180,6 +180,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            // Before anything else can touch rayon. Whoever builds the global pool first wins,
+            // and until now that was never this call: it sat at the top of the first model
+            // load, found the pool already up, and warned into a log nobody reads while every
+            // host kernel ran on one thread per logical core instead of per physical one.
+            loken::inference::engine::llm_engine::configure_thread_pool(
+                config.inference.cpu_threads.unwrap_or(0),
+            );
+
             if let Some(dir) = models_dir.as_ref() {
                 config.ollama_models_dir = Some(dir.clone());
             }

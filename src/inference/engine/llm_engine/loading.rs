@@ -6,6 +6,63 @@
 
 use super::*;
 
+/// Size the rayon pool the host kernels run on, once per process.
+///
+/// Called from `main` before anything else can touch rayon. It used to sit at the top of the
+/// first model load, and by then something had already built the global pool - so
+/// `build_global` failed on every start since at least 2026-08-27, the warning was the only
+/// trace, and every host kernel ran on rayon's default of one thread per LOGICAL core. On a
+/// non-hybrid SMT part that is two siblings contending for one core's execution units and L1,
+/// which is what the count below exists to avoid.
+pub fn configure_thread_pool(cpu_threads: usize) {
+    RAYON_INIT.call_once(|| {
+            // Detect hybrid CPU topology - if P/E cores are
+            // distinguishable, pin worker threads to P-cores via
+            // start_handler so E-cores don't steal cycles during
+            // prefill. Falls back to all-cores on non-hybrid
+            // hardware or when detection fails.
+            let topo = crate::cpu::detect_cpu_topology();
+            let p_cores: Vec<usize> = topo.get_inference_cores();
+            let n = if cpu_threads == 0 {
+                // Hybrid: use P-core count, not physical-core total
+                // (otherwise the worker pool spills onto E-cores).
+                // Non-hybrid: physical cores (skip HT siblings).
+                if topo.is_hybrid && !p_cores.is_empty() {
+                    p_cores.len()
+                } else {
+                    num_cpus::get_physical()
+                }
+            } else {
+                cpu_threads
+            };
+            let p_cores_for_pin = p_cores.clone();
+            // Pin to P-cores only on HYBRID CPUs (to keep workers off the
+            // slow E-cores). On non-hybrid SMT, hard-pinning measured worse
+            // package energy than leaving the scheduler to spread the
+            // physical-core-count pool itself (it idles memory-stalled
+            // workers so cores drop P-state); count is the lever, not pin.
+            let pin_workers = topo.is_hybrid && !p_cores.is_empty();
+            let mut builder = rayon::ThreadPoolBuilder::new().num_threads(n);
+            if pin_workers {
+                // Cycle assignments across the P-core list so each
+                // rayon worker thread gets pinned to a distinct P-core
+                // (modulo when n > p_cores.len(), but that's an
+                // explicit cpu_threads override).
+                builder = builder.start_handler(move |worker_id| {
+                    let core_idx = p_cores_for_pin[worker_id % p_cores_for_pin.len()];
+                    let _ = crate::cpu::set_thread_affinity(&[core_idx]);
+                });
+            }
+            if let Err(e) = builder.build_global() {
+                warn!("⚠️  Failed to configure rayon thread pool: {}", e);
+            } else if pin_workers {
+                info!("🔧 Rayon thread pool: {} workers pinned to P-cores", n);
+            } else {
+                debug!("🔧 Rayon thread pool initialized: {} threads", n);
+            }
+    });
+}
+
 impl LlmEngine {
     /// Load a model from disk with real GGUF parsing and weight loading
     pub async fn load_model(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -86,53 +143,6 @@ impl LlmEngine {
         // Load model in blocking thread since GGUF parsing and weight loading are CPU-intensive
         let result = tokio::task::spawn_blocking(move || -> AnyResult<()> {
             crate::inference::place::device_probe::debug_vram_by_card("closure-start");
-            // Initialize rayon global thread pool once (uses cpu_threads config)
-            RAYON_INIT.call_once(|| {
-                // Detect hybrid CPU topology - if P/E cores are
-                // distinguishable, pin worker threads to P-cores via
-                // start_handler so E-cores don't steal cycles during
-                // prefill. Falls back to all-cores on non-hybrid
-                // hardware or when detection fails.
-                let topo = crate::cpu::detect_cpu_topology();
-                let p_cores: Vec<usize> = topo.get_inference_cores();
-                let n = if cpu_threads == 0 {
-                    // Hybrid: use P-core count, not physical-core total
-                    // (otherwise the worker pool spills onto E-cores).
-                    // Non-hybrid: physical cores (skip HT siblings).
-                    if topo.is_hybrid && !p_cores.is_empty() {
-                        p_cores.len()
-                    } else {
-                        num_cpus::get_physical()
-                    }
-                } else {
-                    cpu_threads
-                };
-                let p_cores_for_pin = p_cores.clone();
-                // Pin to P-cores only on HYBRID CPUs (to keep workers off the
-                // slow E-cores). On non-hybrid SMT, hard-pinning measured worse
-                // package energy than leaving the scheduler to spread the
-                // physical-core-count pool itself (it idles memory-stalled
-                // workers so cores drop P-state); count is the lever, not pin.
-                let pin_workers = topo.is_hybrid && !p_cores.is_empty();
-                let mut builder = rayon::ThreadPoolBuilder::new().num_threads(n);
-                if pin_workers {
-                    // Cycle assignments across the P-core list so each
-                    // rayon worker thread gets pinned to a distinct P-core
-                    // (modulo when n > p_cores.len(), but that's an
-                    // explicit cpu_threads override).
-                    builder = builder.start_handler(move |worker_id| {
-                        let core_idx = p_cores_for_pin[worker_id % p_cores_for_pin.len()];
-                        let _ = crate::cpu::set_thread_affinity(&[core_idx]);
-                    });
-                }
-                if let Err(e) = builder.build_global() {
-                    warn!("⚠️  Failed to configure rayon thread pool: {}", e);
-                } else if pin_workers {
-                    info!("🔧 Rayon thread pool: {} workers pinned to P-cores", n);
-                } else {
-                    debug!("🔧 Rayon thread pool initialized: {} threads", n);
-                }
-            });
 
             // --- 0. AWQ (HF safetensors) early path ---
             // If the resolved path is an AWQ checkpoint dir, load it via the
