@@ -1243,6 +1243,10 @@ pub struct Qwen35Moe {
     down_shexp: QMatMul,
     n_expert_used: usize,
     dtype: DType,
+    /// Where the three `ffn_*_exps` tensors live, which is not always the layer's device.
+    /// They are ~97% of a mixture's weight and only `n_expert_used` of them are read per
+    /// token, so they are what a spill should take first.
+    exps_dev: Device,
 }
 impl Qwen35Moe {
     pub fn load<R: Read + Seek>(
@@ -1252,6 +1256,7 @@ impl Qwen35Moe {
         cfg: &Qwen35Config,
         dtype: DType,
         device: &Device,
+        exps_device: &Device,
         mm: Mm<'_>,
     ) -> Result<Self> {
         let p = format!("blk.{layer}");
@@ -1287,21 +1292,21 @@ impl Qwen35Moe {
                 c,
                 r,
                 &format!("{p}.ffn_gate_exps.weight"),
-                device,
+                exps_device,
                 mm,
             )?),
             up_exps: Arc::new(load_q8(
                 c,
                 r,
                 &format!("{p}.ffn_up_exps.weight"),
-                device,
+                exps_device,
                 mm,
             )?),
             down_exps: Arc::new(load_q8(
                 c,
                 r,
                 &format!("{p}.ffn_down_exps.weight"),
-                device,
+                exps_device,
                 mm,
             )?),
             gateup_shexp,
@@ -1314,6 +1319,7 @@ impl Qwen35Moe {
             )?)?,
             n_expert_used: cfg.n_expert_used,
             dtype,
+            exps_dev: exps_device.clone(),
         })
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -1327,6 +1333,13 @@ impl Qwen35Moe {
         // reject CPU tensors - branch to the moe_cpu twins (nemotron_h/lfm2_moe
         // pattern). Without this qwen3.5:35b CPU returned 0 tokens (500 error).
         let on_cuda = xs.device().is_cuda();
+        // The expert weights may not sit where the rest of the layer does. Router and top-k
+        // stay with the input - they are tiny and read every token - and only the expert
+        // GEMMs follow the weights. What crosses is the hidden state and the two index
+        // vectors: 8 KB at decode, against the alternative of running the whole layer,
+        // attention included, wherever the experts happened to land.
+        let exps_cross = !self.exps_dev.same_device(&xs.device());
+        let on_exps_cuda = self.exps_dev.is_cuda();
         // router logits + shared-expert scalar gate in one gemv ([n, n_expert+1]).
         let router_out = self.router.forward(&xs)?;
         let logits = router_out
@@ -1342,19 +1355,32 @@ impl Qwen35Moe {
             crate::inference::moe_cpu::topk_softmax(&logits, self.n_expert_used, true)?
         };
         let topk_flat = topk_ids.flatten_all()?;
-        // Decode: one-warp argsort (bit-identical to sort_last_dim); tensor-op fallback for prefill.
+        // The expert side of the layer, which is the only part that follows the weights.
+        // `xs` itself must NOT be moved: the shared expert below reads it, and it lives
+        // with the rest of the layer.
+        let (xs_e, topk_w_e, topk_flat_e) = if exps_cross {
+            (
+                xs.to_device(&self.exps_dev)?,
+                topk_w.to_device(&self.exps_dev)?,
+                topk_flat.to_device(&self.exps_dev)?,
+            )
+        } else {
+            (xs.clone(), topk_w.clone(), topk_flat.clone())
+        };
+        // Decode: one-warp argsort (bit-identical to sort_last_dim); tensor-op fallback for
+        // prefill. Sorted where the experts are: the ids index their GEMMs.
         let (expert_ids, sorted_token_ids) =
-            match crate::inference::moe_cuda::argsort_small_u32(&topk_flat)? {
+            match crate::inference::moe_cuda::argsort_small_u32(&topk_flat_e)? {
                 Some(out) => out,
-                None => topk_flat.sort_last_dim(true)?,
+                None => topk_flat_e.sort_last_dim(true)?,
             };
         // Decode (seq==1): ONE fused kernel does gate GEMM + up GEMM + silu.mul
         // (quantizes the input to q8_1 once). Prefill keeps the wmma 2-GEMM path.
         // CPU branches to the moe_cpu twins (see on_cuda above).
         let h = if seq == 1 {
-            if on_cuda {
+            if on_exps_cuda {
                 moe::moe_gemm_gguf_gate_up_silu_mul(
-                    &xs,
+                    &xs_e,
                     &self.gate_exps,
                     &self.up_exps,
                     &sorted_token_ids,
@@ -1363,7 +1389,7 @@ impl Qwen35Moe {
                 )?
             } else {
                 crate::inference::moe_cpu::moe_gemm_gguf_gate_up_silu_mul(
-                    &xs,
+                    &xs_e,
                     &self.gate_exps,
                     &self.up_exps,
                     &sorted_token_ids,
@@ -1372,10 +1398,10 @@ impl Qwen35Moe {
                 )?
             }
         } else {
-            let (gate, up) = if on_cuda {
+            let (gate, up) = if on_exps_cuda {
                 (
                     crate::inference::moe_cuda::moe_gemm_gguf(
-                        &xs,
+                        &xs_e,
                         &self.gate_exps,
                         &None,
                         &sorted_token_ids,
@@ -1385,7 +1411,7 @@ impl Qwen35Moe {
                         self.dtype,
                     )?,
                     crate::inference::moe_cuda::moe_gemm_gguf(
-                        &xs,
+                        &xs_e,
                         &self.up_exps,
                         &None,
                         &sorted_token_ids,
@@ -1398,7 +1424,7 @@ impl Qwen35Moe {
             } else {
                 (
                     crate::inference::moe_cpu::moe_gemm_gguf(
-                        &xs,
+                        &xs_e,
                         &self.gate_exps,
                         &None,
                         &sorted_token_ids,
@@ -1408,7 +1434,7 @@ impl Qwen35Moe {
                         self.dtype,
                     )?,
                     crate::inference::moe_cpu::moe_gemm_gguf(
-                        &xs,
+                        &xs_e,
                         &self.up_exps,
                         &None,
                         &sorted_token_ids,
@@ -1421,13 +1447,13 @@ impl Qwen35Moe {
             };
             (crate::tensor::ops::silu(&gate)? * up)?
         };
-        let routed = if on_cuda {
+        let routed = if on_exps_cuda {
             crate::inference::moe_cuda::moe_gemm_gguf_down_reduce(
                 &h,
                 &self.down_exps,
                 &sorted_token_ids,
                 &expert_ids,
-                &topk_w,
+                &topk_w_e,
                 self.n_expert_used,
                 n_tokens,
                 None,
@@ -1439,12 +1465,17 @@ impl Qwen35Moe {
                 &self.down_exps,
                 &sorted_token_ids,
                 &expert_ids,
-                &topk_w,
+                &topk_w_e,
                 self.n_expert_used,
                 n_tokens,
                 None,
                 None,
             )?
+        };
+        let routed = if exps_cross {
+            routed.to_device(&x.device())?
+        } else {
+            routed
         };
         // shared expert: SwiGLU * sigmoid(scalar_gate). silu(g).u via one F16
         // launch (F32-internal -> bit-identical to silu(g.f32).u.f32 -> f16), saving
@@ -1724,15 +1755,124 @@ impl Qwen35MoeModel {
         // fast GPU packs to its true budget instead of being under-filled.
         let layer_sizes =
             crate::inference::model::nemotron_h::layer_byte_sizes(content, cfg.n_layers);
+        // A mixture's expert weights are ~97% of its bytes and only `n_expert_used` of them
+        // are read per token; everything else in the layer is read for EVERY token. Sizing
+        // the plan by the total puts both on the same side of a spill, so a model that does
+        // not fit sent whole layers to the host - qwen3next ran 21 of its 48 layers there,
+        // attention and DeltaNet included, and decoded at 15 tok/s where ollama did 33.
+        //
+        // So the layers are planned on what they cost per token, and the expert weights are
+        // placed afterwards into whatever VRAM is left. When even the hot part does not fit,
+        // nothing is gained by the split and the original whole-layer plan is kept.
+        let expert_sizes: Vec<u64> = (0..cfg.n_layers)
+            .map(|i| {
+                ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                    .iter()
+                    .filter_map(|n| content.tensor_infos.get(&format!("blk.{i}.{n}.weight")))
+                    .map(|t| t.size_in_bytes() as u64)
+                    .sum()
+            })
+            .collect();
+        let experts_total: u64 = expert_sizes.iter().sum();
+        let hot_sizes: Vec<u64> = layer_sizes
+            .iter()
+            .zip(&expert_sizes)
+            .map(|(t, e)| t.saturating_sub(*e))
+            .collect();
+        let hot_total = file_size.saturating_sub(experts_total);
+        // CUDA budgets only. When the model does not fit, the caller appends the host as an
+        // extra device whose budget is the whole file - "hold whatever spills over" - so a
+        // sum over `gpu_avail` answers that everything fits and the split never arms.
+        let vram: u64 = devices
+            .iter()
+            .zip(gpu_avail.iter())
+            .filter(|(d, _)| d.is_cuda())
+            .map(|(_, a)| *a)
+            .sum::<u64>()
+            .saturating_sub(reserve_bytes);
+        let split_experts = experts_total > 0 && file_size > vram && hot_total <= vram;
+        tracing::info!(
+            "qwen35moe placement: file {:.1} GB, experts {:.1} GB, hot {:.1} GB, vram {:.1} GB -> split_experts={split_experts}",
+            file_size as f64 / 1e9,
+            experts_total as f64 / 1e9,
+            hot_total as f64 / 1e9,
+            vram as f64 / 1e9
+        );
+        let sizes_for_plan: &[u64] = if split_experts {
+            &hot_sizes
+        } else {
+            &layer_sizes
+        };
         let plan = crate::inference::model::nemotron_h::plan_layer_devices(
             cfg.n_layers,
             n_dev,
-            file_size,
+            if split_experts { hot_total } else { file_size },
             gpu_avail,
-            &layer_sizes,
+            sizes_for_plan,
             reserve_bytes,
         );
         let dev_for = |l: usize| -> &Device { &devices[plan[l].min(n_dev - 1)] };
+        // Experts into what the hot parts left, in layer order; the rest to the host. Layer
+        // order rather than largest-first so a prefix of the network keeps its experts
+        // resident, which is what the router hits most often on a short prompt.
+        let cpu_dev = Device::Cpu;
+        let exps_plan: Vec<Option<usize>> = if split_experts {
+            // Only the cards have a budget to fill; the host entry is the overflow, not a
+            // target to pack into.
+            let mut budget: Vec<u64> = devices
+                .iter()
+                .zip(gpu_avail.iter())
+                .map(|(d, a)| {
+                    if d.is_cuda() {
+                        a.saturating_sub(reserve_bytes / n_dev.max(1) as u64)
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            for i in 0..cfg.n_layers {
+                let d = plan[i].min(n_dev - 1);
+                if d < budget.len() {
+                    budget[d] = budget[d].saturating_sub(hot_sizes[i]);
+                }
+            }
+            // The layer's own card first - its hidden state is already there - then any other
+            // card with room. The hot parts are so small that the planner puts them all on
+            // one card, and honouring that here left the second card empty and two thirds of
+            // the experts on the host for no reason. A cross-card expert costs one hop of a
+            // few kilobytes; a host expert costs the weights.
+            (0..cfg.n_layers)
+                .map(|i| {
+                    let own = plan[i].min(n_dev - 1);
+                    let pick = std::iter::once(own)
+                        .chain((0..budget.len()).filter(|d| *d != own))
+                        .find(|d| budget[*d] >= expert_sizes[i]);
+                    if let Some(d) = pick {
+                        budget[d] -= expert_sizes[i];
+                    }
+                    pick
+                })
+                .collect()
+        } else {
+            (0..cfg.n_layers)
+                .map(|i| Some(plan[i].min(n_dev - 1)))
+                .collect()
+        };
+        let exps_dev_for = |l: usize| -> &Device {
+            match exps_plan[l] {
+                Some(d) => &devices[d],
+                None => &cpu_dev,
+            }
+        };
+        if split_experts {
+            let on_gpu = exps_plan.iter().filter(|e| e.is_some()).count();
+            tracing::info!(
+                "qwen35moe: hot {:.1} GB on GPU, experts {:.1} GB - {on_gpu}/{} layers resident",
+                hot_total as f64 / 1e9,
+                experts_total as f64 / 1e9,
+                cfg.n_layers
+            );
+        }
         let max_seq = cfg.context_length.min(32768).max(8192);
         let mut rope = Vec::with_capacity(n_dev);
         for d in devices {
@@ -1793,7 +1933,14 @@ impl Qwen35MoeModel {
                 .contains_key(&format!("blk.{i}.ffn_gate_inp.weight"))
             {
                 Ffn::Moe(Qwen35Moe::load(
-                    content, reader, i, &cfg, dtype, device, mm,
+                    content,
+                    reader,
+                    i,
+                    &cfg,
+                    dtype,
+                    device,
+                    exps_dev_for(i),
+                    mm,
                 )?)
             } else {
                 Ffn::Dense(Qwen35Dense::load(content, reader, i, dtype, device, mm)?)
