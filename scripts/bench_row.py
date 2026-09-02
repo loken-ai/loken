@@ -1,6 +1,6 @@
 """Turn bench JSONs into the report's table, aligned, with nothing retyped."""
 import re
-import json, pathlib, sys
+import json, os, pathlib, struct, sys
 
 import subprocess
 def _ollama_version():
@@ -42,6 +42,81 @@ def measured_prefill(r, st):
     if not toks or ttft <= 0:
         return None
     return toks / (ttft / 1000.0)
+
+# Which family a model belongs to is a property of the model file - `general.architecture`
+# in its GGUF - not of the rows a previous run happened to leave behind. Reading it from the
+# document works only while the document already has rows: emptying it to re-measure left
+# every model unfiled, twenty family sections without a single row, and their twenty figures
+# pointing at nothing - the defect those sections were built to remove.
+
+_ARCH_CACHE = {}
+
+
+def _gguf_architecture(blob):
+    """`general.architecture` from a GGUF header, reading only what it takes to find it."""
+    with open(blob, "rb") as f:
+        if f.read(4) != b"GGUF":
+            return None
+        struct.unpack("<I", f.read(4))[0]                    # version
+        struct.unpack("<Q", f.read(8))[0]                    # tensor count
+        n_kv = struct.unpack("<Q", f.read(8))[0]
+        rd = lambda n: f.read(n)
+        def s():
+            return rd(struct.unpack("<Q", rd(8))[0]).decode("utf-8", "replace")
+        SCALAR = {0:1, 1:1, 2:2, 3:2, 4:4, 5:4, 6:4, 7:1, 10:8, 11:8, 12:8}
+        def skip(t):
+            if t == 8:
+                s()
+            elif t == 9:
+                et = struct.unpack("<I", rd(4))[0]
+                n = struct.unpack("<Q", rd(8))[0]
+                for _ in range(n):
+                    skip(et)
+            else:
+                rd(SCALAR[t])
+        for _ in range(n_kv):
+            key = s()
+            t = struct.unpack("<I", rd(4))[0]
+            if key == "general.architecture" and t == 8:
+                return s()
+            skip(t)
+    return None
+
+def architecture_of(tag, store):
+    """The architecture an ollama tag declares, or None when it cannot be resolved."""
+    name, _, ver = tag.partition(":")
+    ver = ver or "latest"
+    ns = "library"
+    if "/" in name:
+        ns, name = name.split("/", 1)
+    man = pathlib.Path(store) / "manifests" / "registry.ollama.ai" / ns / name / ver
+    if not man.is_file():
+        return None
+    try:
+        layers = json.load(open(man)).get("layers", [])
+    except Exception:
+        return None
+    for l in layers:
+        if l.get("mediaType", "").endswith(".image.model"):
+            digest = l["digest"].replace(":", "-")
+            blob = pathlib.Path(store) / "blobs" / digest
+            if blob.is_file():
+                try:
+                    return _gguf_architecture(blob)
+                except Exception:
+                    return None
+    return None
+
+def arch_of(tag):
+    """Cached, and silent about what it cannot resolve: a locally requantised tag has no
+    manifest, and the membership read from the document still covers it."""
+    if tag not in _ARCH_CACHE:
+        store = os.environ.get("OLLAMA_MODELS", "/usr/share/ollama/.ollama/models/")
+        try:
+            _ARCH_CACHE[tag] = architecture_of(tag, store)
+        except Exception:
+            _ARCH_CACHE[tag] = None
+    return _ARCH_CACHE[tag]
 
 def stat(st, name):
     """The harness's own aggregate, so the report never defines a second one."""
@@ -277,7 +352,10 @@ if __name__ == "__main__":
             keep.append(ln)
         while keep and not keep[-1].strip():
             keep.pop()
-        mine = [r for r in all_rows if r[0].strip() in set(models)]
+        title = block[0].strip()[4:].strip()
+        named = set(models)
+        mine = [r for r in all_rows
+                if r[0].strip() in named or arch_of(r[0].strip()) == title]
         placed.update(r[0].strip() for r in mine)
         out.append("\n".join(keep) + "\n\n" + table(mine))
 
