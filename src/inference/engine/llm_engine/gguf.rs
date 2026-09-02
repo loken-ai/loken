@@ -48,6 +48,7 @@ pub(super) fn count_gguf_tokens(ct: &gguf_file::Content) -> Option<u32> {
 pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Tokenizer> {
     use ahash::AHashMap;
     use tokenizers::models::bpe::BPE;
+    use tokenizers::models::unigram::Unigram;
 
     let tokenizer_model =
         get_gguf_string(content, "tokenizer.ggml.model").unwrap_or_else(|| "llama".to_string());
@@ -114,6 +115,30 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
     };
     debug!("📚 Extracted {} BPE tokens from GGUF metadata ({} special-typed slots routed to added_tokens)",
         vocab.len(), vocab_skipped);
+
+    // The same pieces IN ID ORDER, and their scores. A Unigram vocabulary is addressed by
+    // position, so it needs the list rather than the map the BPE path builds.
+    let all_tokens: Vec<String> = match content.metadata.get("tokenizer.ggml.tokens") {
+        Some(gguf_file::Value::Array(arr)) => arr
+            .iter()
+            .map(|v| match v {
+                gguf_file::Value::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let scores: Vec<f64> = match content.metadata.get("tokenizer.ggml.scores") {
+        Some(gguf_file::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| match v {
+                gguf_file::Value::F32(f) => Some(f64::from(*f)),
+                gguf_file::Value::F64(f) => Some(*f),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
 
     // Extract BPE merge rules (space-separated pairs like "Ġ t")
     let merges: Vec<(String, String)> = match content.metadata.get("tokenizer.ggml.merges") {
@@ -187,13 +212,45 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
             | "tekken"
     );
 
-    let bpe = BPE::builder()
-        .vocab_and_merges(vocab, merges)
-        .ignore_merges(ignore_merges)
-        .build()
-        .map_err(|e| anyhow!("BPE build failed: {e}"))?;
-
-    let mut tokenizer = Tokenizer::new(bpe);
+    // What the metadata holds decides the model kind, not what the file calls itself. A GGUF
+    // declaring the llama (SentencePiece) tokenizer carries piece SCORES and no merges: it is
+    // a Unigram model. Building a BPE from it anyway yields a merge table of length zero, and
+    // a BPE with no merges emits ONE TOKEN PER CHARACTER, with no error raised anywhere.
+    //
+    // ernie4-5 was benchmarked that way on 2026-09-02: a 13-word prompt became 60 tokens, and
+    // the model, fed single characters, answered "a man named 0x7465653b" where ollama
+    // answered prose. The rate measured on that answer was published as a 124% decode win.
+    // A vocabulary that can build neither model is now refused rather than approximated.
+    let mut tokenizer = if !merges.is_empty() {
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, merges)
+            .ignore_merges(ignore_merges)
+            .build()
+            .map_err(|e| anyhow!("BPE build failed: {e}"))?;
+        Tokenizer::new(bpe)
+    } else if !all_tokens.is_empty() && scores.len() == all_tokens.len() {
+        // Unigram addresses pieces BY POSITION, so every slot is kept here - including the
+        // type-5 placeholders the BPE path drops. Dropping one would shift the id of every
+        // piece after it, which mis-decodes the whole vocabulary and says nothing about it.
+        let unk_id = token_types.iter().position(|t| *t == 2);
+        let scored: Vec<(String, f64)> = all_tokens.iter().cloned().zip(scores).collect();
+        let unigram = Unigram::from(scored, unk_id, /*byte_fallback=*/ true)
+            .map_err(|e| anyhow!("Unigram build failed: {e}"))?;
+        debug!(
+            "📚 Built a Unigram tokenizer from {} scored pieces (unk={:?})",
+            all_tokens.len(),
+            unk_id
+        );
+        Tokenizer::new(unigram)
+    } else {
+        return Err(anyhow!(
+            "tokenizer '{}' has no merges and no usable score table ({} pieces, {} scores): a \
+             BPE built from this would emit one token per character",
+            tokenizer_model,
+            all_tokens.len(),
+            scores.len()
+        ));
+    };
 
     // Apply pre-tokenizer and decoder pipeline to properly handle special tokens
     // This is critical for correct text output (Ġ->space, Ċ->newline)
@@ -572,5 +629,95 @@ mod apply_repeat_penalty_tests {
         assert_eq!(got[0], 0.5, "in-range token penalised");
         assert_eq!(got[1], 0.5, "in-range token penalised");
         // No panic from the 9999 sentinel.
+    }
+}
+
+#[cfg(test)]
+mod spm_vocabulary_tests {
+    /// Open ernie4-5 from the local store, or say nothing. It is the only model in the
+    /// bench set whose GGUF declares the llama tokenizer WITHOUT merges, which is the
+    /// shape these tests are about.
+    fn ernie() -> Option<tokenizers::Tokenizer> {
+        let store = std::env::var("OLLAMA_MODELS")
+            .unwrap_or_else(|_| "/usr/share/ollama/.ollama/models/".to_string());
+        let man = std::path::Path::new(&store)
+            .join("manifests/registry.ollama.ai/library/ernie4-5/latest");
+        let text = std::fs::read_to_string(&man).ok()?;
+        let digest = text
+            .split('"')
+            .find(|s| s.starts_with("sha256:") && s.len() > 20)
+            .map(|s| s.replace(':', "-"))?;
+        let blob = std::path::Path::new(&store).join("blobs").join(digest);
+        let mut f = std::fs::File::open(&blob).ok()?;
+        let content = crate::tensor::quantized::gguf_file::Content::read(&mut f).ok()?;
+        super::build_tokenizer_from_gguf(&content).ok()
+    }
+
+    /// The defect this file was changed for. A scored vocabulary with no merges used to
+    /// build a BPE whose merge table was empty, and such a BPE segments every prompt into
+    /// single characters - so a 58-character prompt became 60 tokens, the model saw
+    /// letters instead of words, and the campaign published the rate it measured on the
+    /// answer. Counting tokens is enough to catch it, and costs no forward pass.
+    #[test]
+    fn a_scored_vocabulary_segments_into_words_not_characters() {
+        let Some(tok) = ernie() else {
+            return; // the model is not on this machine
+        };
+        let prompt = "Once upon a time, in a kingdom far far away, there lived a";
+        let ids = tok.encode(prompt, false).expect("encode");
+        let n = ids.get_ids().len();
+        assert!(
+            n < prompt.chars().count() / 2,
+            "{n} tokens for {} characters - the merge-less BPE is back",
+            prompt.chars().count()
+        );
+    }
+
+    /// Byte-fallback pieces must assemble into the bytes they name rather than reach the
+    /// output as text. This was first suspected of causing the hex above; it was not, and
+    /// the test stays because it pins the decoder that would produce exactly that if it
+    /// ever regressed.
+    #[test]
+    fn a_run_of_byte_tokens_decodes_to_its_bytes() {
+        let Some(tok) = ernie() else {
+            return;
+        };
+        let ids: Vec<u32> = ["<0x74>", "<0x65>", "<0x65>", "<0x3b>"]
+            .iter()
+            .map(|p| tok.token_to_id(p).unwrap_or_else(|| panic!("no piece {p}")))
+            .collect();
+        let out = tok.decode(&ids, false).expect("decode");
+        assert_eq!(out, "tee;", "byte-fallback run rendered as {out:?}");
+    }
+
+    /// The streaming path emits one chunk per token from a two-token window. Around a run
+    /// of byte pieces that window could in principle split a character, so the assembled
+    /// stream is compared against the batch decode of the same ids.
+    #[test]
+    fn a_mixed_sequence_assembles_the_same_way_it_decodes() {
+        let Some(tok) = ernie() else {
+            return;
+        };
+        let mut ids: Vec<u32> = tok
+            .encode("man named", false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        for p in ["<0x0A>", "<0x74>", "<0x65>", "<0x65>", "<0x3b>"] {
+            ids.push(tok.token_to_id(p).unwrap_or_else(|| panic!("no piece {p}")));
+        }
+        ids.extend_from_slice(tok.encode(",", false).expect("encode").get_ids());
+
+        let whole = tok.decode(&ids, true).expect("decode");
+        let mut streamed = String::new();
+        for n in 1..=ids.len() {
+            streamed.push_str(
+                &crate::inference::engine::decode_step::incremental_chunk_text(&tok, &ids[..n]),
+            );
+        }
+        assert_eq!(
+            streamed, whole,
+            "streaming assembly diverges from batch decode"
+        );
     }
 }
