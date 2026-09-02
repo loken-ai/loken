@@ -167,6 +167,24 @@ def stat(st, name):
     if v is None: return None
     return v.get("mean", v.get("value")) if isinstance(v, dict) else v
 
+def stat_warm(st, name):
+    """The median, for a figure whose first iteration is a cold load.
+
+    The same rule `measured_prefill` applies, for the same reason, against an assumption
+    stated there that does not hold: decode was taken as the mean because it was thought
+    not to carry the cold outlier. On a large mixture it does. qwen3next measured
+    3.8, 15.2, 15.2 tok/s - stddev 6.6 on a mean of 11.4 - and the table published 11.4
+    for a model that decodes at 15.2, a quarter of its rate spent on a warm-up the other
+    engine does not pay in the same cell.
+
+    Every cell whose iterations are flat is unchanged, which is all of them but the
+    mixtures too large to hold: on those the mean measures the repack, not the engine.
+    """
+    v = st.get(name)
+    if v is None: return None
+    if not isinstance(v, dict): return v
+    return v.get("p50", v.get("mean", v.get("value")))
+
 def energy_stat(st, prefix):
     """The energy aggregate, and the domains it counted.
 
@@ -179,7 +197,14 @@ def energy_stat(st, prefix):
     if len(hits) != 1:
         return None, None
     dom = hits[0][len(prefix):].strip().strip("[]") or None
-    return stat(st, hits[0]), dom
+    # The median, for the reason `stat_warm` gives: the first iteration pays for loading
+    # the weights, and that energy lands in the same per-token average as the decode it
+    # is not part of. It inflates BOTH engines and not by the same factor - on qwen3:0.6b
+    # ollama's mean is 2.4x its median and this engine's 1.24x - so the delta it produced
+    # was not a smaller version of the truth but a different number: +383.6% published
+    # where the steady state is +150%. A claim that flatters us by construction is the one
+    # to remove first.
+    return stat_warm(st, hits[0]), dom
 
 def rows(path, mode, device):
     d = json.load(open(path)); out = {}
@@ -209,7 +234,7 @@ def rows(path, mode, device):
             # side those reversed the verdict on three cells of four. One definition, measured
             # here, or the column is not a comparison.
             "prefill": measured_prefill(r, st),
-            "decode":  stat(st, "Completion tok/s"),
+            "decode":  stat_warm(st, "Completion tok/s"),
             "e2e":     stat(st, "E2E latency"),
             # What the whole request cost. The per-token rate divides this by a token
             # count that is fixed per cell, so the two say the same thing at one size and
