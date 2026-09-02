@@ -1340,6 +1340,10 @@ impl ModelBackend for Qwen35MoeBackend {
         self.0.forward(x, index_pos)
     }
 
+    fn device_layer_distribution(&self) -> Vec<(String, usize, u32, u32)> {
+        group_layers_by_device(self.0.layer_device_locations())
+    }
+
     fn snapshot_prefix(&mut self, prompt: &[u32], logits: &Tensor) -> crate::tensor::Result<()> {
         self.0.snapshot_prefix(prompt, logits)
     }

@@ -1657,7 +1657,18 @@ pub struct Qwen35MoeModel {
 impl Qwen35MoeModel {
     /// Snapshot the full per-layer state (recurrent + KV) as of position
     /// `prompt.len()`, with the prefill's last-position `logits`, for later
-    /// exact-prefix reuse. Call AFTER prefilling [0, prompt.len()).
+    /// exact-prefix reuse. Call AFTER prefilling [0, prompt.len()).    /// Where each layer actually lives, in layer order. Each layer keeps the device it was
+    /// loaded onto, so this reads the placement back rather than recomputing the split.
+    ///
+    /// Without it this family fell through to the single-entry fallback in
+    /// `get_layer_distribution`, which reports EVERY layer on the primary device: a spilled
+    /// 48 GB model was published as 48 layers on the CPU while both cards held 13 GB each.
+    /// A placement report that cannot be trusted is worse than none - it is what a diagnosis
+    /// of the spill starts from.
+    pub fn layer_device_locations(&self) -> Vec<crate::tensor::DeviceLocation> {
+        self.layers.iter().map(|l| l.device.location()).collect()
+    }
+
     pub fn snapshot_prefix(&mut self, prompt: &[u32], logits: &Tensor) -> Result<()> {
         let mut layers = Vec::with_capacity(self.layers.len());
         for l in &self.layers {
