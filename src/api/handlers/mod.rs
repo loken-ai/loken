@@ -27,10 +27,6 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 
 use crate::api::types::*;
-use crate::distributed::{
-    log_distribution_plan, log_loaded_models, DeviceDistribution, DeviceType,
-    LoadedModelInfo as DistLoadedModelInfo,
-};
 use crate::gpu::{GPUManagerImpl, GPUManagerInterface};
 #[cfg(feature = "audio")]
 use crate::inference::engine::audio_engine::{
