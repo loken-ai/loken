@@ -63,8 +63,12 @@ def main(results_dir, brief=False):
     # reported "six degenerate models" when five were ours and the sixth was ollama's.
     ours = {tuple(r[:5]) for r in rows if "loken" in r[5] and r[12] == "incoherent"}
     peers = {tuple(r[:5]) for r in rows if "loken" not in r[5] and r[12] == "incoherent"}
+    # A cell where BOTH answers collapsed accuses neither engine: it is the model, or the
+    # prompt it was given. Counting it as ours read as a defect of ours - gemma4:26b, where
+    # ollama looped on "er_er_er" and we looped on "misterer/".
+    both = ours & peers
     won = tied = lost_energy = lost_decode = 0
-    bad_ours = bad_peer = uneven = 0
+    bad_ours = bad_peer = bad_both = uneven = 0
     losses = []
     for r in rows:
         if "loken" not in r[5]:
@@ -72,7 +76,9 @@ def main(results_dir, brief=False):
         d, e = pct(r[12]), pct(r[13])
         if d is None or e is None:
             key = tuple(r[:5])
-            if key in ours:
+            if key in both:
+                bad_both += 1
+            elif key in ours:
                 bad_ours += 1
             elif key in peers:
                 bad_peer += 1
@@ -99,7 +105,8 @@ def main(results_dir, brief=False):
         age = "" if not v or v[0] == v[1] else f"   [{v[0]}/{v[1]} from the current binary]"
         print(f"  goal: {won}/{total} cells win on BOTH axes"
               f"   ({lost_decode} throughput, {lost_energy} energy"
-              f" | blank: {bad_ours} ours, {bad_peer} peer, {uneven} uneven tokens){age}")
+              f" | blank: {bad_ours} ours, {bad_peer} peer, {bad_both} both,"
+              f" {uneven} uneven tokens){age}")
         return 0 if total and won == total else 1
     v = vintage(results_dir)
     if v and v[0] != v[1]:
@@ -111,6 +118,7 @@ def main(results_dir, brief=False):
     print(f"  lost on throughput      {lost_decode}")
     print(f"  blank, our answer       {bad_ours}   (degenerate: the cell is a defect)")
     print(f"  blank, peer answer      {bad_peer}   (degenerate: not a free win)")
+    print(f"  blank, both answers     {bad_both}   (degenerate on both: the model or the prompt)")
     print(f"  blank, uneven tokens    {uneven}")
     if losses:
         print("\n  les 12 ecarts les plus grands:")
