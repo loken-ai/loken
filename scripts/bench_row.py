@@ -49,6 +49,20 @@ def stat(st, name):
     if v is None: return None
     return v.get("mean", v.get("value")) if isinstance(v, dict) else v
 
+def energy_stat(st, prefix):
+    """The energy aggregate, and the domains it counted.
+
+    The label carries its domains - "Energy J/tok [gpu]" - because a total over the cards
+    alone and one that also counted the host are not the same measurement. Read by prefix,
+    so a machine that gains a readable RAPL counter does not silently blank the column; and
+    refused when several keys match rather than picking one of them.
+    """
+    hits = [k for k in st if k.startswith(prefix)]
+    if len(hits) != 1:
+        return None, None
+    dom = hits[0][len(prefix):].strip().strip("[]") or None
+    return stat(st, hits[0]), dom
+
 def rows(path, mode, device):
     d = json.load(open(path)); out = {}
     # A run that was stopped before it measured anything writes the file with no results.
@@ -58,7 +72,8 @@ def rows(path, mode, device):
         return {}
     for r in d["results"]:
         st = r["stats"]
-        jtok, ntok = stat(st, "Energy J/tok"), stat(st, "Tokens generated")
+        jtok, jdom = energy_stat(st, "Energy J/tok")
+        ntok = stat(st, "Tokens generated")
         # The prompt is part of the key: two cells that differ only by it are two
         # measurements, and merging them silently keeps whichever was read last.
         # The device belongs in the key for the same reason the mode and the prompt do:
@@ -83,6 +98,7 @@ def rows(path, mode, device):
             # only the absolute one stays comparable when the size changes.
             "jreq":    (jtok * ntok) if (jtok and ntok) else None,
             "j":       jtok,
+            "jdom":    jdom,
             "ntok":    ntok,
             # Whether the answer was an answer. A degenerate cell produces a perfectly
             # ordinary-looking rate - gemma4:31b emitted "--- --- ---" for its full 128
@@ -115,8 +131,12 @@ def cells(merged):
         ok = lambda v: v.get("coh") is not False
         others = [v["decode"] for k, v in by.items()
                   if k in ("ollama", "vllm") and v["decode"] and same(v) and ok(v)]
+        # Comparable only when both sides counted the same domains: a total over the cards
+        # alone against one that also counted the host is not a delta.
+        mydom = by.get("loken", {}).get("jdom")
         othere = [v["jreq"] for k, v in by.items()
-                  if k in ("ollama", "vllm") and v["jreq"] and same(v) and ok(v)]
+                  if k in ("ollama", "vllm") and v["jreq"] and same(v) and ok(v)
+                  and v.get("jdom") == mydom]
         order = sorted(e for e in by if e.startswith("ollama@"))
         for eng in order + ["ollama", "vllm", "loken"]:
             if eng not in by: continue
