@@ -45,10 +45,42 @@ pub(super) fn count_gguf_tokens(ct: &gguf_file::Content) -> Option<u32> {
 /// Build a tokenizers::Tokenizer from GGUF embedded vocab metadata.
 /// Ollama models never ship tokenizer.json - the full vocab and merges
 /// are always embedded in the GGUF file under tokenizer.ggml.* keys.
+/// Build BPE merge rules for a SentencePiece vocabulary that ships none.
+///
+/// One rule per way a piece splits into two pieces the vocabulary also holds, ordered by
+/// the score of the piece being formed - which is the order llama.cpp's priority queue
+/// pops in, and therefore the order that reproduces its segmentation. Splits of one piece
+/// are kept in id order among themselves, so the table is deterministic.
+fn synthesise_spm_merges(
+    tokens: &[String],
+    scores: &[f64],
+    vocab: &ahash::AHashMap<String, u32>,
+) -> Vec<(String, String)> {
+    let mut rules: Vec<(f64, u32, u32, &str, &str)> = Vec::new();
+    for (i, piece) in tokens.iter().enumerate() {
+        if piece.chars().count() < 2 || !vocab.contains_key(piece.as_str()) {
+            continue;
+        }
+        let score = scores[i];
+        let start = rules.len();
+        for (b, _) in piece.char_indices().skip(1) {
+            let (l, r) = piece.split_at(b);
+            if let (Some(&li), Some(&ri)) = (vocab.get(l), vocab.get(r)) {
+                rules.push((score, li, ri, l, r));
+            }
+        }
+        rules[start..].sort_by_key(|(_, li, ri, _, _)| (*li, *ri));
+    }
+    rules.sort_by(|a, b| b.0.total_cmp(&a.0));
+    rules
+        .into_iter()
+        .map(|(_, _, _, l, r)| (l.to_string(), r.to_string()))
+        .collect()
+}
+
 pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Tokenizer> {
     use ahash::AHashMap;
     use tokenizers::models::bpe::BPE;
-    use tokenizers::models::unigram::Unigram;
 
     let tokenizer_model =
         get_gguf_string(content, "tokenizer.ggml.model").unwrap_or_else(|| "llama".to_string());
@@ -229,19 +261,35 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
             .map_err(|e| anyhow!("BPE build failed: {e}"))?;
         Tokenizer::new(bpe)
     } else if !all_tokens.is_empty() && scores.len() == all_tokens.len() {
-        // Unigram addresses pieces BY POSITION, so every slot is kept here - including the
-        // type-5 placeholders the BPE path drops. Dropping one would shift the id of every
-        // piece after it, which mis-decodes the whole vocabulary and says nothing about it.
-        let unk_id = token_types.iter().position(|t| *t == 2);
-        let scored: Vec<(String, f64)> = all_tokens.iter().cloned().zip(scores).collect();
-        let unigram = Unigram::from(scored, unk_id, /*byte_fallback=*/ true)
-            .map_err(|e| anyhow!("Unigram build failed: {e}"))?;
+        // A Viterbi over these scores is the wrong reading of them. What a GGUF stores for
+        // this family are not log-probabilities: ernie4-5 ranges from -253912 to 0 with a
+        // median of -48287, and summing values on that scale favours two common pieces over
+        // one rare piece. Segmenting a 13-word prompt that way gives 27 tokens where ollama
+        // gives 16, which inflates every prefill rate measured against it.
+        //
+        // llama.cpp merges adjacent pairs instead, best score first. That is BPE with the
+        // merge order taken from the merged piece's score rather than from a rank, so the
+        // merge table is synthesised from the vocabulary itself and the ordinary BPE path
+        // runs unchanged.
+        let synthesised = synthesise_spm_merges(&all_tokens, &scores, &vocab);
+        if synthesised.is_empty() {
+            return Err(anyhow!(
+                "tokenizer '{}' has scores but no piece splits into two pieces it also holds",
+                tokenizer_model
+            ));
+        }
         debug!(
-            "📚 Built a Unigram tokenizer from {} scored pieces (unk={:?})",
-            all_tokens.len(),
-            unk_id
+            "🔗 Synthesised {} merge rules from {} scored pieces",
+            synthesised.len(),
+            all_tokens.len()
         );
-        Tokenizer::new(unigram)
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, synthesised)
+            .byte_fallback(true)
+            .fuse_unk(true)
+            .build()
+            .map_err(|e| anyhow!("BPE build from synthesised merges failed: {e}"))?;
+        Tokenizer::new(bpe)
     } else {
         return Err(anyhow!(
             "tokenizer '{}' has no merges and no usable score table ({} pieces, {} scores): a \
@@ -666,10 +714,12 @@ mod spm_vocabulary_tests {
         let prompt = "Once upon a time, in a kingdom far far away, there lived a";
         let ids = tok.encode(prompt, false).expect("encode");
         let n = ids.get_ids().len();
+        // ollama segments this prompt into 16. The bound is loose enough not to break on
+        // a tie-break difference and tight enough to fail the two readings that were wrong:
+        // 60 tokens from the merge-less BPE, 28 from a Viterbi over the scores.
         assert!(
-            n < prompt.chars().count() / 2,
-            "{n} tokens for {} characters - the merge-less BPE is back",
-            prompt.chars().count()
+            n <= 20,
+            "{n} tokens for a 13-word prompt - ollama produces 16"
         );
     }
 
