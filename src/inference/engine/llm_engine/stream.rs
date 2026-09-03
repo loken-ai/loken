@@ -2131,17 +2131,31 @@ impl LlmEngine {
         Some(reusable_prefix(&s.tokens, &tokens, s.kv_len))
     }
 
+    /// What has to agree between a target and its drafter: the id of every ordinary piece.
+    /// Nothing else. A drafter never tokenises text - it is fed the target's ids and answers
+    /// with ids - so the merges, the pre-tokeniser and the BOS/EOS post-processing are the
+    /// target's business alone, and the added tokens are where a distil renames its controls:
+    /// deepseek-r1:70b and llama3.2:1b share 128000 of 128256 pieces, and the 256 they do not
+    /// are `<|begin_of_text|>`, `<think>` and their kind, which no drafter proposes from prose.
+    /// Hashing the whole file refused that pair as a different vocabulary. The caller still
+    /// requires equal vocab sizes, so an id that exists on one side only cannot pass.
     pub async fn tokenizer_fingerprint(&self) -> Option<u64> {
         let guard = self.model_state.lock().await;
         let state = guard.as_ref()?;
-        // tokenizer.to_string is stable: serializes via serde_json with the
-        // same structure each time.
-        let s = state.tokenizer.to_string(false).ok()?;
+        let tok = &state.tokenizer;
+        let added: std::collections::HashSet<u32> =
+            tok.get_added_tokens_decoder().keys().copied().collect();
+        let mut pieces: Vec<(u32, String)> = tok
+            .get_vocab(false)
+            .into_iter()
+            .filter(|(_, id)| !added.contains(id))
+            .map(|(piece, id)| (id, piece))
+            .collect();
+        pieces.sort_unstable();
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&s, &mut h);
+        std::hash::Hash::hash(&pieces, &mut h);
         Some(std::hash::Hasher::finish(&h))
     }
-
     /// Snapshot of the loaded model's vocab size - used by the spec
     /// decode caller to pre-size logits buffers and verify dim parity.
     pub async fn vocab_size(&self) -> Option<usize> {
