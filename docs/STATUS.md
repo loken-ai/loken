@@ -50,9 +50,13 @@ card, and the 390-against-496 penalty an earlier revision of this page reported 
 For a model that fits on neither card the question is different, and the answer is the bus.
 deepseek-r1:70b at Q4_K_M holds 26 of its 80 layers on the host, every one of them read in
 full per token at ~36 GB/s, which is what this machine's DRAM gives: 1.51 tok/s here, 1.55
-under ollama, both engines pinned to the same ceiling. The way out of that cell is a variant
-that fits, not a faster host path - the FFN-at-Q3 requantisation the store already names but
-never received weights.
+under ollama, both engines pinned to the same ceiling. There is no faster host path. There are
+two ways out. A variant that fits - the FFN-at-Q3 requantisation the store already names but
+never received weights. And a drafter: on that same cell, llama3.2:1b proposing and the 70B
+verifying, `[inference] draft_model` gives 2.21 tok/s at 41.0 J/token against 1.49 and 51.8
+alone, same answer token for token, with only 18% of drafts accepted - a better-matched
+drafter would do better. That is a different configuration from "loken", and a table that
+quotes it has to say so in the row.
 
 The first table is the kernels. This one is the placement. Only the first says anything about
 arithmetic.
@@ -158,3 +162,8 @@ largest matched range is the GGUF k-quant bit specification, which any correct r
 
 The 870 MiB nobody budgets, and the reserve pass reaching language models. Each has a
 measurement waiting. olmoe's deficit is closed: it was the harness, not the engine.
+
+Two speculative loops. The plain stream carries one, gated per step by a calibrator; the
+attach endpoint and a configured drafter drive another, `generate_stream_with_draft`. On the
+same target and drafter the first gave 1.68 tok/s and the second 2.21. One of them should go,
+and the measurement says which.
