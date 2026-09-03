@@ -106,7 +106,16 @@ arithmetic.
   the next. Dropped per layer, the cell measures 2.25 three times. What remains: the load
   still peaks at 49 GB of cache and pushes ~10 GB to zram in one burst, pages touched before
   the layer build; the token embedding dequantised to F32 on the host (4 GB for a 0.6 GB Q4_K
-  table); and the file pages of host layers once their repack exists.
+  table); the file pages of host layers once their repack exists; and, the largest, the fused
+  weights. A layer's q/k/v and gate/up are concatenated on the host into one tensor each and
+  uploaded, and `QStorage::from_data` keeps an OWNED copy of the concatenated bytes beside the
+  card's - ~320 MB a layer, ~17 GB for the 54 card-resident layers of the 70B, read by no CUDA
+  path. That is the single anonymous block the memory map showed. The loader also uploads
+  every card layer twice: once as it is read, once padded when its matmul is built from the
+  host bytes again, which is why the file is fully cached before the first layer is built. A
+  padded copy taken device-to-device, a concat done on the card, and a host copy kept only
+  where a CPU path will read it would remove the block, the second upload and the cache
+  peak together.
 - **Load time is your disk.** 24 GB over USB: 52 s reading, 6 s to the cards.
 
 ## The cluster
