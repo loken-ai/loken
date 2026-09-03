@@ -173,6 +173,12 @@ pub struct InferenceConfig {
     pub dtype: crate::tensor::DType,
     /// GPU device index
     pub device_index: Option<usize>,
+    /// A smaller model that proposes tokens for this one to verify, by tag. None = no
+    /// drafter. Worth setting only where verifying costs far more than drafting: a model
+    /// that spills to the host, where each token reads gigabytes over the bus.
+    pub draft_model: Option<String>,
+    /// Card the drafter loads on. Defaults to 0; it is placed whole on that one card.
+    pub draft_device_index: Option<usize>,
     /// Max GPU memory fraction (0.0-1.0)
     pub max_gpu_memory_fraction: f64,
     /// Force GPU layers count
@@ -254,6 +260,8 @@ impl Default for InferenceConfig {
             seed: 42,
             dtype: crate::tensor::DType::F16,
             device_index: None,
+            draft_model: None,
+            draft_device_index: None,
             max_gpu_memory_fraction: 0.9,
             force_gpu_layers: None,
             use_quantized_gpu: true,

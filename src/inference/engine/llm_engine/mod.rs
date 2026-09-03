@@ -216,7 +216,7 @@ pub struct LlmEngine {
     /// in one forward (reads target weights ONCE) - amortizes the weight-GEMV
     /// DRAM wall (perf-confirmed 83% of CPU decode). Boxed to break the recursive
     /// type; `Arc<Mutex>` so the lazy load is interior-mutable behind `&self`.
-    draft_engine: Arc<Mutex<Option<Box<LlmEngine>>>>,
+    draft_engine: Arc<Mutex<Option<Arc<LlmEngine>>>>,
     last_error: Arc<Mutex<Option<String>>>,
     cached_model_size: Arc<Mutex<u64>>,
     /// Session-persistent KV cache tracking. A single model has a single live
@@ -307,7 +307,7 @@ impl LlmEngine {
     /// code continuations, and this returns a drafter again when a regime with a measured net
     /// win is identified. The earlier "+45%" was a sibling pure-CPU build, not a result.
     fn spec_draft_model_id(&self) -> Option<String> {
-        None
+        self.config.draft_model.clone()
     }
 
     /// Spec-decode: lazily load the nested drafter engine (once). The drafter
@@ -327,14 +327,33 @@ impl LlmEngine {
         }
         let mut dcfg = self.config.clone();
         dcfg.model_id = drafter_id.clone();
+        // The drafter is one small model on one card, never a drafter of its own - the
+        // target's config would otherwise make it spill like the target and load a drafter
+        // for the drafter.
+        dcfg.device_index = Some(self.config.draft_device_index.unwrap_or(0));
+        dcfg.disable_arc_layers = true;
+        dcfg.draft_model = None;
         let nested = LlmEngine::with_config(dcfg);
         match nested.load_model().await {
             Ok(()) => {
+                // Same check the attach endpoint makes: the drafter answers in the target's
+                // ids, so every ordinary piece has to sit at the same id on both sides.
+                let same = self.tokenizer_fingerprint().await
+                    == nested.tokenizer_fingerprint().await
+                    && self.vocab_size().await == nested.vocab_size().await;
+                if !same {
+                    warn!(
+                        "spec-decode: drafter '{}' does not share the vocabulary of '{}'; spec-decode OFF",
+                        drafter_id, self.config.model_id
+                    );
+                    let _ = nested.unload().await;
+                    return false;
+                }
                 info!(
                     "🜂 spec-decode: drafter '{}' loaded for target '{}'",
                     drafter_id, self.config.model_id
                 );
-                *self.draft_engine.lock().await = Some(Box::new(nested));
+                *self.draft_engine.lock().await = Some(Arc::new(nested));
                 true
             }
             Err(e) => {
@@ -347,6 +366,25 @@ impl LlmEngine {
         }
     }
 
+    /// The drafter this engine's configuration names, loaded on first use, as a handle the
+    /// request path can drive the way it drives an attached one. Two speculative loops exist:
+    /// the one inside the plain stream, gated per step by a calibrator, and
+    /// `generate_stream_with_draft`, which is what the attach endpoint uses. Measured on
+    /// deepseek-r1:70b spilling 26 layers to the host with llama3.2:1b drafting, the first gave
+    /// 1.68 tok/s and the second 2.30 against 1.49 alone. A drafter from the configuration
+    /// should get the loop that pays.
+    pub fn has_config_drafter(&self) -> bool {
+        self.config.draft_model.is_some()
+    }
+    /// The loaded handle, or None until `ensure_draft_loaded` has run. Loading is not done
+    /// here: `load_model` is awaited from blocking threads everywhere else, and awaiting it
+    /// inside an axum handler makes that handler's future non-Send.
+    pub async fn config_drafter(&self) -> Option<Arc<LlmEngine>> {
+        if self.config.draft_model.is_none() {
+            return None;
+        }
+        self.draft_engine.lock().await.as_ref().cloned()
+    }
     /// Spec-decode: roll the drafter's KV cache back to `len` tokens (after a
     /// partial-accept reject), keeping it in lockstep with the verified target.
     pub fn draft_trim_kv(&self, len: usize) {

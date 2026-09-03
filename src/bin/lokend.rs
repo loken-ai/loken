@@ -165,6 +165,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             top_k: Some(50),
                             seed: Some(42),
                             device_index: None,
+                            draft_model: None,
+                            draft_device_index: None,
                             max_gpu_memory_fraction: Some(0.9),
                             force_gpu_layers: None,
                             use_quantized_gpu: Some(false),

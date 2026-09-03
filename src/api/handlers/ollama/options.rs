@@ -1213,12 +1213,30 @@ pub(crate) async fn ollama_generate(
     // generate_stream otherwise.
     let draft_pair: Option<(Arc<LlmEngine>, usize)> =
         if !is_fim && params.grammar.is_none() && (params.temperature.unwrap_or(1.0) == 0.0) {
-            let engines = state.engines.read().await;
-            engines
-                .iter()
-                .find(|e| e.model_id == model_name)
-                .and_then(|e| e.draft.as_ref())
-                .map(|d| (d.engine.clone(), d.k))
+            let attached = {
+                let engines = state.engines.read().await;
+                engines
+                    .iter()
+                    .find(|e| e.model_id == model_name)
+                    .and_then(|e| e.draft.as_ref())
+                    .map(|d| (d.engine.clone(), d.k))
+            };
+            // A drafter named in the configuration takes the same path as an attached one,
+            // with the attach endpoint's default k.
+            match attached {
+                Some(p) => Some(p),
+                None if engine.has_config_drafter() => {
+                    // Loaded on a blocking thread, the way the plain paths do it: the load
+                    // future is not Send and cannot be awaited from this handler.
+                    let e = engine.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        tokio::runtime::Handle::current().block_on(e.ensure_draft_loaded())
+                    })
+                    .await;
+                    engine.config_drafter().await.map(|d| (d, 4))
+                }
+                None => None,
+            }
         } else {
             None
         };
