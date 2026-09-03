@@ -185,10 +185,13 @@ impl LlmEngine {
                 })?;
             // Arc so loaders can hand out zero-copy file views: a view
             // holds an Arc clone, keeping the mapping alive past this scope.
-            // WillNeed prefetches the mapping sequentially in the background  - 
-            // without it the first decode pays random page-in faults per
-            // weight read (~half speed until every page has been touched).
-            let _ = mmap.advise(memmap2::Advice::WillNeed);
+            // No blanket WillNeed here. It prefetched the WHOLE file into the page cache
+            // before anything was placed, so a model that spills had its GPU-resident 28 GB
+            // cached for nothing next to the host layers it actually reads - on a 64 GB box
+            // that put 16 GB of the process into swap during the very decode being timed.
+            // The advice is given per layer once placement is known, see
+            // `advise_pages_by_placement` below: WillNeed for what the host will read every
+            // token, DontNeed for what the cards already hold.
             let mmap = std::sync::Arc::new(mmap);
             crate::inference::place::device_probe::debug_vram_by_card("after-mmap-parse");
             let mmap_bytes: &[u8] = &mmap[..];
@@ -206,6 +209,22 @@ impl LlmEngine {
             // zero-copy views (no host copy, the Arc pins the mmap) instead of copying
             // each tensor into owned host bytes - faster load + less committed RAM.
             content.mmap_owner = Some(mmap.clone() as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+            // Captured now: `content` is consumed by one of the loader arms below, and the
+            // page advice can only be given once every layer has a device.
+            let layer_page_ranges: Vec<(usize, usize, usize)> = content
+                .tensor_infos
+                .iter()
+                .filter_map(|(name, info)| {
+                    let rest = name.strip_prefix("blk.")?;
+                    let dot = rest.find('.')?;
+                    let layer = rest[..dot].parse::<usize>().ok()?;
+                    Some((
+                        layer,
+                        (content.tensor_data_offset + info.offset) as usize,
+                        info.size_in_bytes(),
+                    ))
+                })
+                .collect();
             debug!("✓ GGUF header parsed in {:.1}ms", mmap_parse_t.elapsed().as_secs_f64() * 1000.0);
             debug!("✅ GGUF header parsed successfully");
 
@@ -1565,6 +1584,7 @@ impl LlmEngine {
             debug!("✓ Weights loaded from mmap in {:.1}ms", weights_t.elapsed().as_secs_f64() * 1000.0);
 
             debug!("✓ Model weights loaded");
+            advise_pages_by_placement(&mmap, &layer_page_ranges, &model.device_layer_distribution());
 
             // --- 5.5 Initialize layer performance tracking ---
             use crate::inference::place::layer_perf;
@@ -1728,4 +1748,67 @@ impl LlmEngine {
 
         Ok(())
     }
+}
+
+/// Tell the kernel which of the file's pages still matter, now that every layer has a device.
+///
+/// Every weight was read once to be placed. A layer that landed on a card is finished with
+/// the file - its bytes live in VRAM and the page cache copy is dead weight that the kernel
+/// keeps hot anyway, because a mapped page counts as in use. A layer that stayed on the host
+/// is the opposite: it is read in full on every token, and a page that is not resident by
+/// then is a fault in the middle of a decode step.
+///
+/// So: DontNeed on the card-resident layers, WillNeed on the host-resident ones. Both are
+/// advice about residency, not about data - a DontNeed page that is touched again simply
+/// comes back from the file - so a wrong guess costs a refault, never a wrong weight. Only
+/// `blk.N.*` tensors are covered: embeddings and the output head are placed elsewhere and
+/// are small next to the layers.
+fn advise_pages_by_placement(
+    mmap: &std::sync::Arc<memmap2::Mmap>,
+    ranges: &[(usize, usize, usize)],
+    dist: &[(String, usize, u32, u32)],
+) {
+    if dist.is_empty() {
+        return; // this backend did not say where its layers are; leave the cache alone
+    }
+    let on_host = |layer: usize| -> Option<bool> {
+        dist.iter()
+            .find(|(_, _, a, b)| (*a as usize) <= layer && layer <= (*b as usize))
+            .map(|(kind, _, _, _)| kind == "CPU")
+    };
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+    let total = mmap.len();
+    let (mut kept, mut dropped, mut n_kept, mut n_dropped) = (0u64, 0u64, 0usize, 0usize);
+    for &(layer, start, len) in ranges {
+        let Some(host) = on_host(layer) else {
+            continue;
+        };
+        // Page-aligned outward: a partial page shared with a neighbour is only ever
+        // advised, so widening the range costs at most one refault of that neighbour.
+        let a = start / page * page;
+        let b = (start + len).div_ceil(page) * page;
+        let b = b.min(total);
+        if a >= b {
+            continue;
+        }
+        if host {
+            let _ = mmap.advise_range(memmap2::Advice::WillNeed, a, b - a);
+            kept += len as u64;
+            n_kept += 1;
+        } else {
+            // DontNeed is the "unchecked" advice because it discards a private or anonymous
+            // mapping's contents. This one is a read-only shared file mapping: the page
+            // comes back from the file, unchanged, if it is ever read again.
+            let _ = unsafe {
+                mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, a, b - a)
+            };
+            dropped += len as u64;
+            n_dropped += 1;
+        }
+    }
+    info!(
+        "📄 page cache after placement: {:.1} GB released ({n_dropped} tensors on the cards), {:.1} GB kept ({n_kept} on the host)",
+        dropped as f64 / 1e9,
+        kept as f64 / 1e9
+    );
 }
