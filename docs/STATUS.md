@@ -1,6 +1,6 @@
 # Status
 
-What is measured, what is slower, what has never run. Revised 2026-08-29.
+What is measured, what is slower, what has never run. Revised 2026-09-03.
 
 Every figure comes from one machine: RTX 5070 Ti + RTX 5060 Ti (16 GB each), Linux, CUDA 13.3,
 models on a USB disk reading at 460 MB/s.
@@ -27,10 +27,14 @@ best of three, decode tokens/s.
 | granite3-moe:1b | **373.2** | 323.4 | **-13%** |
 <!-- /table:decode -->
 
-Both mixtures lose. olmoe by 10 percent, granite3-moe by 13, and eight of olmoe's ten points
-predate this year's kernel work - a build from before it measured 455.2 - so its deficit is
-standing and unexplained. That two mixtures and no dense model lose is the clue nobody has
-followed.
+The two mixtures that lose here do not lose. Both rows came from a harness that had moved
+into its own repository and started the engine without its configuration; measured configured
+on 2026-09-02, olmoe is +17.4% and granite3-moe +0.2%. The clue was real, though, and pointed
+elsewhere: the mixtures that do lose are the ones too large for the cards. A layer was placed
+whole, so a spilled mixture ran attention on the host for the sake of expert weights that are
+97% of its bytes and read a few at a time. Spilling the experts and keeping everything else on
+the cards took qwen3next from 15.6 to 34.7 tok/s against ollama's 33, and qwen3-coder-next from
+10.7 to 30.8 against 26-28. A mixture that already fits is untouched by it.
 
 The table and the figure are regenerated together from `docs/BENCHMARKS.md` by
 `scripts/figures.py`. They were transcribed by hand once, and the page ended up quoting a
@@ -38,12 +42,17 @@ parity for granite3-moe that appears nowhere in the measurements.
 
 ## Placement, measured separately
 
-Given both cards, ollama splits models that fit on one:
+Given both cards, ollama splits models that fit on one; this engine keeps them on the fast
+card, and pays nothing for having the second one present. Measured 2026-09-03, olmoe: 464 tok/s
+on card 0 alone, 462 with both cards visible, 252 on card 1 alone - the placer picks the fast
+card, and the 390-against-496 penalty an earlier revision of this page reported is gone.
 
-| model | ollama, 2 cards | loken, 2 cards |
-|---|---:|---:|
-| olmoe | 390.4 | **447.7** |
-| llama3.2:1b | 231.3 | **453.2** |
+For a model that fits on neither card the question is different, and the answer is the bus.
+deepseek-r1:70b at Q4_K_M holds 26 of its 80 layers on the host, every one of them read in
+full per token at ~36 GB/s, which is what this machine's DRAM gives: 1.51 tok/s here, 1.55
+under ollama, both engines pinned to the same ceiling. The way out of that cell is a variant
+that fits, not a faster host path - the FFN-at-Q3 requantisation the store already names but
+never received weights.
 
 The first table is the kernels. This one is the placement. Only the first says anything about
 arithmetic.
@@ -54,7 +63,17 @@ arithmetic.
   Fixed, not proportional - 893 and 867 MiB on models differing 2x in weights. The placement
   planner does not know about it.
 - **First answer after load is slower.** A mixture pays ~0.5 s if a request arrives before the
-  background repack finishes.
+  background repack finishes - when it fits. A spilled one pays far more: qwen3next decodes its
+  first request at 2.0 tok/s and the next at 34.7. The benchmark table takes the median over
+  its iterations, so that cost no longer reaches a published rate; a user's first answer still
+  pays it.
+- **A spilled model was double-held in host RAM.** The file was prefetched whole before
+  placement, so the 28 GB already on the cards stayed cached beside the 14 GB the host actually
+  reads, and a 64 GB box swapped 16 GB during the decode being timed. The advice now follows
+  the plan - DontNeed for what the cards hold, WillNeed for what the host reads - and the
+  process keeps its resident pages. What remains resident and could go: the token embedding
+  dequantised to F32 on the host (4 GB for a 0.6 GB Q4_K table), and the file pages of host
+  layers once their repack exists.
 - **Load time is your disk.** 24 GB over USB: 52 s reading, 6 s to the cards.
 
 ## The cluster
@@ -137,5 +156,5 @@ largest matched range is the GGUF k-quant bit specification, which any correct r
 
 ## Open
 
-olmoe's deficit, the 870 MiB nobody budgets, and the reserve pass reaching language models. Each
-has a measurement waiting.
+The 870 MiB nobody budgets, and the reserve pass reaching language models. Each has a
+measurement waiting. olmoe's deficit is closed: it was the harness, not the engine.

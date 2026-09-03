@@ -165,6 +165,15 @@ own bookkeeping and the third by the clock would compare the bookkeeping. Cells 
 itself, recorded so the two can be seen to disagree - at 2 ms a token the client's read loop
 costs about what the token does.
 
+**Both rates, and the joules, are medians over the iterations of a cell.** The first
+iteration of a cell is a cold load. Prefill took the median for that reason from the start;
+decode and energy took the mean, on the assumption that they did not carry the outlier. On a
+mixture too large to hold they do: qwen3next measured 3.8, 15.2, 15.2 tok/s and the mean
+published 11.4 for a model that decodes at 15.2. Energy was worse and flattered this engine -
+the first iteration's joules include loading the weights, and both engines inflate, not by the
+same factor: qwen3:0.6b published +383.6% where the steady state is +149.9%. Cells whose
+iterations are flat are unchanged by the median, which is every cell but the large mixtures.
+
 
 
 
