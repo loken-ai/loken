@@ -61,7 +61,11 @@ def main(results_dir, brief=False):
     # win - qwen3:0.6b on the raw code-review prompt, where ollama emitted nothing but code
     # fences and we answered. Counting both as "incomparable" hides the difference, and I
     # reported "six degenerate models" when five were ours and the sixth was ollama's.
-    ours = {tuple(r[:5]) for r in rows if "loken" in r[5] and r[12] == "incoherent"}
+    # A variant of this engine - the same binary plus a drafter, labelled "loken 0.1.0 + x" -
+    # is a documented extra, not the engine being scored. It shares the cell key with the plain
+    # row and would otherwise count twice for one cell.
+    plain = lambda label: "loken" in label and " + " not in label
+    ours = {tuple(r[:5]) for r in rows if plain(r[5]) and r[12] == "incoherent"}
     peers = {tuple(r[:5]) for r in rows if "loken" not in r[5] and r[12] == "incoherent"}
     # A cell where BOTH answers collapsed accuses neither engine: it is the model, or the
     # prompt it was given. Counting it as ours read as a defect of ours - gemma4:26b, where
@@ -71,7 +75,7 @@ def main(results_dir, brief=False):
     bad_ours = bad_peer = bad_both = uneven = 0
     losses = []
     for r in rows:
-        if "loken" not in r[5]:
+        if not plain(r[5]):
             continue
         d, e = pct(r[12]), pct(r[13])
         if d is None or e is None:

@@ -38,6 +38,21 @@ for m in "$@"; do
     suffix=""; [ "$MODE" = cpu ] && suffix="_cpu"
     psuf=""; [ "$PROMPTS" != short ] && psuf="_$(echo "$PROMPTS" | tr ,  _)"
     mode="stream"; [ "${STREAM:-1}" = 1 ] || mode="non-stream"
+    # A variant arm measures the same engine in another configuration - a drafter named in
+    # a config.toml kept OUTSIDE the tree, see LOKEN_CWD - and writes its own file, so the
+    # plain row is never overwritten. Streamed only: the drafter serves the stream path, and
+    # a non-stream cell would be measured without it while carrying its label.
+    if [ -n "${VARIANT:-}" ]; then
+        [ "${STREAM:-1}" = 1 ] || { echo "VARIANT=$VARIANT n'a de sens qu'en stream"; exit 1; }
+        [ -n "${LOKEN_CWD:-}" ] && [ -f "$LOKEN_CWD/config.toml" ] || { echo "VARIANT=$VARIANT: LOKEN_CWD doit designer un dossier avec config.toml"; exit 1; }
+        drafter=$(sed -nE 's/^draft_model *= *"([^"]+)".*/\1/p' "$LOKEN_CWD/config.toml" | head -1)
+        [ -n "$drafter" ] || { echo "VARIANT=$VARIANT: pas de draft_model dans $LOKEN_CWD/config.toml"; exit 1; }
+        export LOKEN_ONLY=1 LOKEN_CWD
+        VARIANT_ARGS=(--loken-label "LOKEN+$drafter")
+        suffix="${suffix}_${VARIANT}"
+    else
+        VARIANT_ARGS=()
+    fi
     OUT="results/${tag}_${CTX}_${mode}${psuf}${suffix}.json"
     # A tag the store does not hold makes the bench client pull it from the network.
     # That is right for a workstation and wrong for a measurement: it fetched gigabytes
@@ -105,7 +120,7 @@ except Exception: print('')" 2>/dev/null)" = "$BINT" ]; then
         VLLM_SERVE="$VLLM_SERVE" \
         timeout --kill-after=60 "$CELL_CAP" \
         scripts/fair_bench.sh --models "$m" --prompts "$PROMPTS" --num-ctx "$CTX" \
-        --max-tokens ${MAXTOK:-128} --iterations 3 2>&1 | tee "$S/run_${tag}_${CTX}${psuf}${suffix}.log" | tail -4
+        --max-tokens ${MAXTOK:-128} --iterations 3 "${VARIANT_ARGS[@]}" 2>&1 | tee "$S/run_${tag}_${CTX}${psuf}${suffix}.log" | tail -4
     # Captured before anything else runs: PIPESTATUS holds the last pipeline only, and
     # the test that reads it is itself a command.
     rc=${PIPESTATUS[0]}

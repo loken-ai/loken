@@ -36,6 +36,16 @@ for ctx in 4096 131072; do
     done
   done
 done
+# The variant arm: the models named in ~/bench-logs/models-draft.txt, measured again with the
+# drafter that ~/bench-logs/config-draft/config.toml names. Streamed only, the drafter serving
+# only that path; 4096 only, where the spill that makes a drafter pay was measured.
+if [ -s ~/bench-logs/models-draft.txt ] && [ -f ~/bench-logs/config-draft/config.toml ]; then
+  MD=$(tr '\n' ' ' < ~/bench-logs/models-draft.txt)
+  for pr in short medium long; do
+    echo "########## GPU ctx=4096 prompts=$pr stream=1 VARIANT=draft"
+    VARIANT=draft LOKEN_CWD=~/bench-logs/config-draft CTX=4096 PROMPTS=$pr STREAM=1 ./campaign.sh $MD || failed=$((failed + 1))
+  done
+fi
 for ctx in 4096 131072; do
   for pr in short medium long; do
     echo "########## CPU ctx=$ctx prompts=$pr"

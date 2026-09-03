@@ -16,6 +16,17 @@ def _ollama_version():
 
 VERS = {"ollama": _ollama_version(), "loken": "loken 0.1.0", "vllm": "vLLM 0.22.0"}
 
+def engine_label(target):
+    """The Engine column for a target. A variant of this engine is measured under the label
+    "LOKEN+<drafter>" - the same binary with a drafter named in its configuration - and is
+    shown as "loken 0.1.0 + <drafter>" so a row can hold both without the two being confused,
+    and so the scoreboard can tell them apart by the " + "."""
+    if target in VERS:
+        return VERS[target]
+    if target.startswith("loken+"):
+        return VERS["loken"] + " + " + target[len("loken+"):]
+    return target
+
 # Results measured before the project was renamed carry the old target name. They are the same
 # engine and the same campaign, so they are folded in rather than dropped - reading only the
 # current name would empty most of the table without saying anything was missing.
@@ -282,10 +293,11 @@ def cells(merged):
                   if k in ("ollama", "vllm") and v["jreq"] and same(v) and ok(v)
                   and v.get("jdom") == mydom]
         order = sorted(e for e in by if e.startswith("ollama@"))
-        for eng in order + ["ollama", "vllm", "loken"]:
+        variants = sorted(e for e in by if e.startswith("loken+"))
+        for eng in order + ["ollama", "vllm", "loken"] + variants:
             if eng not in by: continue
             v = by[eng]; dd = de = ""
-            if eng == "loken" and ok(v):
+            if eng.startswith("loken") and ok(v):
                 if others and v["decode"]:
                     p = (v["decode"] / max(others) - 1) * 100
                     dd = f"**{p:+.1f}%**" if p > 0 else f"{p:+.1f}%"
@@ -293,7 +305,7 @@ def cells(merged):
                 if othere and v["jreq"]:
                     p = (min(othere) / v["jreq"] - 1) * 100
                     de = f"**{p:+.1f}%**" if p > 0 else f"{p:+.1f}%"
-            b = (lambda x: f"**{x}**") if eng == "loken" else (lambda x: x)
+            b = (lambda x: f"**{x}**") if eng.startswith("loken") else (lambda x: x)
             if not any(v[k] is not None for k in ("prefill", "decode", "ntok", "e2e", "jreq")):
                 # Nothing was measured, so there is no row. An all-dash line reads as a cell
                 # that was tried and yielded something unprintable, which is not what it means
@@ -304,7 +316,7 @@ def cells(merged):
             if not ok(v):
                 # The rates are withheld rather than shown with a caveat: a number in a
                 # performance column is read as performance, whatever sits beside it.
-                out.append([model, str(ctx), prompt, mode, device, b(VERS[eng]), " - ", " - ",
+                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng)), " - ", " - ",
                             b(fmt(v["ntok"], 0)), " - ", " - ", " - ", "incoherent", "", v.get("day", "")])
                 continue
             if v["ntok"] is not None and v["ntok"] <= 1:
@@ -313,11 +325,11 @@ def cells(merged):
                 # tokens per second against a competitor, three times over, in cells where
                 # our own was empty. A cell that produced no answer says so. What the request
                 # itself cost still stands, because that part really was measured.
-                out.append([model, str(ctx), prompt, mode, device, b(VERS[eng]), b(fmt(v["prefill"])),
+                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng)), b(fmt(v["prefill"])),
                             " - ", b(fmt(v["ntok"], 0)), b(fmt(v["e2e"], 0)), b(fmt(v["jreq"], 0)),
                             " - ", "no answer", "", v.get("day", "")])
                 continue
-            out.append([model, str(ctx), prompt, mode, device, b(VERS[eng]), b(fmt(v["prefill"])),
+            out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng)), b(fmt(v["prefill"])),
                         b(fmt(v["decode"])), b(fmt(v["ntok"], 0)), b(fmt(v["e2e"], 0)),
                         b(fmt(v["jreq"], 0)), b(fmt(v["j"], 3)), dd, de, v.get("day", "")])
     return out
