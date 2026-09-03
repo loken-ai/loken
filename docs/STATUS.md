@@ -7,24 +7,49 @@ models on a USB disk reading at 460 MB/s.
 
 ## Decode rate vs ollama
 
-**Out of date, and kept as evidence rather than as a claim.** These rows were measured on
-2026-08-27, during a phase of very active development: kernels, placement and the rate meter
-have all changed since. A fresh campaign is needed before any of this is quoted. Conditions
-were one card for both engines, idle machine, cold, greedy, streamed, short prompt, 4096 ctx,
-best of three, decode tokens/s.
+Measured by the campaign of 2026-09-03 on the binary this page describes, and regenerated
+from `docs/BENCHMARKS.md` by `scripts/figures.py` as the campaign advances. Conditions: both
+cards available to every engine, idle machine, greedy, streamed, short prompt, 4096 ctx,
+median of three iterations, decode tokens/s. The earlier table on this page came from a
+one-card probe of 2026-08-27 taken between kernel changes; it is superseded, not corrected.
 
 ![Decode rate against ollama](img/decode-vs-ollama.svg)
 
 <!-- table:decode -->
 | model | ollama | loken | |
 |---|---:|---:|---|
-| gpt-oss:20b | 131.5 | **206.5** | +57% |
-| llama3.2:1b | 297.7 | **450.1** | +51% |
-| qwen2.5:0.5b | 302.0 | **368.4** | +22% |
-| nemotron-3-nano:latest | 133.5 | **144.5** | +8% |
-| qwen3:1.7b | 407.7 | **427.8** | +5% |
-| olmoe:latest | **485.7** | 438.7 | **-10%** |
-| granite3-moe:1b | **373.2** | 323.4 | **-13%** |
+| deepseek-r1:70b-q3ks | 6.9 | **21.3** | +209% |
+| gpt-oss:20b | 94.6 | **211.8** | +124% |
+| llama3.2:1b | 232.7 | **466.6** | +101% |
+| falcon3:latest | 211.5 | **403.9** | +91% |
+| devstral-small-2:latest | 35.5 | **59.9** | +69% |
+| lfm2.5-thinking:latest | 397.6 | **666.9** | +68% |
+| qwen3.5:latest | 75.4 | **126.3** | +68% |
+| mistral-small3.2:latest | 36.3 | **59.8** | +65% |
+| deepseek-r1:32b | 25.9 | **41.2** | +59% |
+| moondream:latest | 374.5 | **589.0** | +57% |
+| mistral-nemo:latest | 68.2 | **107.2** | +57% |
+| qwen3:8b | 97.5 | **153.1** | +57% |
+| smollm3:latest | 172.0 | **266.8** | +55% |
+| deepcoder:14b | 53.0 | **81.7** | +54% |
+| qwen3:0.6b | 485.9 | **720.9** | +48% |
+| gemma4:latest | 91.4 | **133.1** | +46% |
+| magistral:latest | 36.3 | **52.5** | +45% |
+| ernie4-5:latest | 419.0 | **600.4** | +43% |
+| devstral:24b | 36.3 | **52.0** | +43% |
+| olmo2:7b | 101.0 | **137.6** | +36% |
+| gemma4:12b | 54.6 | **73.9** | +35% |
+| granite3.1-dense:2b | 224.6 | **293.1** | +30% |
+| qwen2.5:0.5b | 306.5 | **382.2** | +25% |
+| qwen3-coder:30b | 148.3 | **184.8** | +25% |
+| olmoe:latest | 389.1 | **455.1** | +17% |
+| qwen3.5:35b | 115.0 | **132.9** | +16% |
+| nemotron-3-nano:latest | 133.9 | **149.8** | +12% |
+| qwen3-coder-next:latest | 27.9 | **30.2** | +8% |
+| qwen3next:latest | 32.8 | **33.8** | +3% |
+| gemma4:31b | **25.7** | 24.9 | **-3%** |
+| granite3-moe:1b | **339.1** | 323.0 | **-5%** |
+| deepseek-r1:70b | **1.6** | 1.5 | **-6%** |
 <!-- /table:decode -->
 
 The two mixtures that lose here do not lose. Both rows came from a harness that had moved

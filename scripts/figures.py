@@ -19,10 +19,33 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 IMG = ROOT / "docs" / "img"
 
-# The run every figure describes: one card for both engines, streamed, short prompt.
-RUN_DATE = "2026-08-27"
+# The run every figure describes: streamed, short prompt, and the LATEST campaign day that
+# measured both engines on it. Derived rather than written down: the date used to be a
+# constant here, and the figures kept describing a run from a fortnight before the table
+# they sat next to. RUN_DATE=YYYY-MM-DD in the environment pins another day; RUN_CARDS names
+# the card policy in the chart header, both cards being what a campaign runs with.
+import os
 PROMPT = "short"
 MODE = "stream"
+RUN_CARDS = os.environ.get("RUN_CARDS", "both cards")
+
+
+def latest_run_date():
+    """The most recent date on which a short/stream row exists for both engines."""
+    clean = lambda s: re.sub(r"[*\s  ]", "", s)
+    seen = {}
+    for line in (ROOT / "docs" / "BENCHMARKS.md").read_text().splitlines():
+        if not line.startswith("| ") or line.startswith("|--"):
+            continue
+        c = [x.strip() for x in line.strip().strip("|").split("|")]
+        if len(c) < 15 or c[0] == "Model" or c[2] != PROMPT or c[3] != MODE:
+            continue
+        seen.setdefault(c[14][:10], set()).add(clean(c[5]))
+    days = [d for d, engs in seen.items() if "Ollama0.32.6" in engs and "loken0.1.0" in engs]
+    return max(days) if days else ""
+
+
+RUN_DATE = os.environ.get("RUN_DATE") or latest_run_date()
 
 
 def bench_rows():
@@ -84,7 +107,7 @@ def bar_chart(rows, path, header=None):
     value_w = (
         max(len(f"{l:.0f}  ({(l / o - 1) * 100:+.0f}%)") for o, l in rows.values()) * 7 + 12
     )
-    header = header or f"DECODE TOK/S, ONE CARD, {RUN_DATE}"
+    header = header or f"DECODE TOK/S, {RUN_CARDS.upper()}, {RUN_DATE}"
     width = max(label_w + chart_w + value_w, label_w + int(len(header) * 7.0) + 20)
     height = pad * 2 + 34 + row_h * len(data) + 30
 
