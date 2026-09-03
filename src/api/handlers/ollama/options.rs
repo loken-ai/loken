@@ -1228,6 +1228,7 @@ pub(crate) async fn ollama_generate(
         let gate_guard = gate_guard_owned;
         // Spec-decode streaming path: used when a draft is attached.
         if let Some((draft_engine, k)) = draft_pair {
+            let engine_for_stats = engine.clone();
             match engine
                 .generate_stream_with_draft(
                     effective_prompt.clone(),
@@ -1270,13 +1271,28 @@ pub(crate) async fn ollama_generate(
                                 }
                             }
                         }
-                        let total_duration = start_time.elapsed().as_nanos() as u64;
-                        let prompt_eval_count = estimate_token_count(&prompt_clone);
-                        // chunk_count is the exact emitted-token count; using
-                        // estimate_token_count(accumulated_text) was returning
-                        // ~1 because chunks arrive as words with no spaces
-                        // between them (split_whitespace counts 1 word).
-                        let eval_count = chunk_count as u64;
+                        // The draft loop publishes the same statistics as the plain stream.
+                        // The fallbacks are what this message used to carry on its own:
+                        // chunk_count is the exact emitted-token count (an estimate over the
+                        // accumulated text returned ~1, chunks being words with no spaces).
+                        let stats = engine_for_stats.take_last_stream_stats();
+                        let (eval_count, eval_duration, prompt_eval_count, prompt_eval_duration, total_duration) =
+                            match stats {
+                                Some(s) => (
+                                    s.eval_count,
+                                    s.eval_duration_ns,
+                                    s.prompt_eval_count,
+                                    s.prompt_eval_duration_ns,
+                                    s.total_duration_ns,
+                                ),
+                                None => (
+                                    chunk_count as u64,
+                                    0,
+                                    estimate_token_count(&prompt_clone),
+                                    0,
+                                    start_time.elapsed().as_nanos() as u64,
+                                ),
+                            };
                         let final_chunk = serde_json::json!({
                             "model": model_name_clone,
                             "created_at": chrono::Utc::now().to_rfc3339(),
@@ -1284,7 +1300,9 @@ pub(crate) async fn ollama_generate(
                             "done": true,
                             "total_duration": total_duration,
                             "prompt_eval_count": prompt_eval_count,
-                            "eval_count": eval_count
+                            "prompt_eval_duration": prompt_eval_duration,
+                            "eval_count": eval_count,
+                            "eval_duration": eval_duration
                         });
                         let mut line = final_chunk.to_string();
                         line.push('\n');

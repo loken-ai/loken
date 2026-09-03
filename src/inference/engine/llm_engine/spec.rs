@@ -123,6 +123,7 @@ impl LlmEngine {
             // holds [0, prompt_len). cur_token is sampled but NOT yet in
             // target's KV - it'll be fed back as the first verify input on
             // the next cycle.
+            let t_start = std::time::Instant::now();
             let mut target_pos = prompt_len;
             let cur_token_init = match target_engine
                 .spec_prefill(&prompt_tokens)
@@ -148,6 +149,10 @@ impl LlmEngine {
                 c
             };
             let _ = tx.send(Ok(init_chunk)).await;
+            // Prefill is over once the first token is out; everything after is decode, the
+            // same cut the plain stream makes, so the two paths report the same quantity.
+            let prefill_ns = t_start.elapsed().as_nanos() as u64;
+            let t_decode = std::time::Instant::now();
 
             // Prefill draft: same prompt batched. Its KV ends at prompt_len
             // too. cur_token is NOT pre-fed to draft - the spec loop's first
@@ -341,6 +346,19 @@ impl LlmEngine {
                 // draft_step will feed it naturally.
             }
 
+            // Same statistics the plain stream publishes, so a client - and the bench - reads a
+            // real eval_duration and prompt_eval_count from this path too. It used to publish
+            // neither: the done message carried a total and an estimated prompt count, and
+            // "0 tok/s" for a stream that had just decoded at 2.3.
+            if let Ok(mut slot) = target_engine.stream_stats_slot().lock() {
+                *slot = Some(super::StreamStats {
+                    eval_count: emitted as u64,
+                    eval_duration_ns: t_decode.elapsed().as_nanos() as u64,
+                    prompt_eval_count: prompt_len as u64,
+                    prompt_eval_duration_ns: prefill_ns,
+                    total_duration_ns: t_start.elapsed().as_nanos() as u64,
+                });
+            }
             tracing::info!(
                 "🎯 Spec decode done: drafted={} accepted={} ({}%) emitted={}",
                 spec_drafts,
