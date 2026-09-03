@@ -1956,6 +1956,11 @@ impl Qwen35MoeModel {
                     device.location()
                 );
             }
+            // Same release as the generic loader: once a layer and its experts are on the
+            // cards, the file pages behind them only crowd out the host layers' working set.
+            if device.is_cuda() && exps_dev_for(i).is_cuda() {
+                content.release_layer_pages(i);
+            }
             layers.push(Layer {
                 attn_norm,
                 post_norm,

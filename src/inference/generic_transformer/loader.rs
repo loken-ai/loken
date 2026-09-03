@@ -2251,6 +2251,7 @@ impl GenericHeteroTransformer {
             let (cos, sin) = rope_cache
                 .get(&rope_key)
                 .ok_or_else(|| crate::tensor::Error::msg(format!("RoPE cache miss: {rope_key}")))?;
+            let layer_idx = raw.layer_idx;
             let layer = build_generic_layer(
                 raw,
                 device,
@@ -2260,6 +2261,12 @@ impl GenericHeteroTransformer {
                 sin,
                 rope_freq_factors.as_ref(),
             )?;
+            // The layer's bytes are on the card now; the file pages that carried them are
+            // dead weight, and on a spilled model they are what pushes the host layers'
+            // working set into swap before decode even starts.
+            if matches!(dev_enum, LayerDevice::Cuda(_)) {
+                content.release_layer_pages(layer_idx);
+            }
             Ok((layer, dev_enum))
         };
         let built: Vec<(GenericTransformerLayer, LayerDevice)> = if distinct_gpus.len() <= 1 {

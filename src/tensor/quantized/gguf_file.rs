@@ -635,6 +635,43 @@ impl Content {
         )
     }
 
+    /// Drop the page-cache residency of one layer's tensors, once they live on a card.
+    ///
+    /// Loading reads the file front to back, and every byte read stays cached until the
+    /// kernel needs the room. On a machine whose RAM is smaller than the file that room is
+    /// found by swapping the process's own anonymous memory - its repacked host layers, its
+    /// embeddings - which then comes back page by page, mid-decode, from a compressed swap.
+    /// Measured on a 42.5 GB model over 64 GB of RAM: 12 GB of the process pushed to zram
+    /// during the load, and the same cell decoding anywhere between 1.5 and 2.2 tok/s from one
+    /// run to the next depending on what had been pushed. Released here, layer by layer as
+    /// each one is uploaded, the cache never holds more than a layer beyond what the host will
+    /// actually read. Advice only: a page dropped and touched again comes back from the file.
+    pub fn release_layer_pages(&self, layer: usize) {
+        let Some(owner) = self.mmap_owner.as_ref() else {
+            return;
+        };
+        let Some(mmap) = owner.downcast_ref::<memmap2::Mmap>() else {
+            return;
+        };
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        let prefix = format!("blk.{layer}.");
+        let total = mmap.len();
+        for (name, info) in self.tensor_infos.iter() {
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let start = (self.tensor_data_offset + info.offset) as usize;
+            let a = start / page * page;
+            let b = (start + info.size_in_bytes()).div_ceil(page) * page;
+            let b = b.min(total);
+            if a < b {
+                // Read-only shared file mapping: DontNeed discards residency, never data.
+                let _ = unsafe {
+                    mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, a, b - a)
+                };
+            }
+        }
+    }
     /// Parse a GGUF v2/v3 header: magic, metadata KVs, tensor
     /// directory (dims un-reversed to row-major), aligned data offset.
     pub fn read<R: Read + Seek>(r: &mut R) -> Result<Self> {
