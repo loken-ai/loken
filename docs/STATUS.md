@@ -74,10 +74,14 @@ arithmetic.
 - **A spilled model was double-held in host RAM.** The file was prefetched whole before
   placement, so the 28 GB already on the cards stayed cached beside the 14 GB the host actually
   reads, and a 64 GB box swapped 16 GB during the decode being timed. The advice now follows
-  the plan - DontNeed for what the cards hold, WillNeed for what the host reads - and the
-  process keeps its resident pages. What remains resident and could go: the token embedding
-  dequantised to F32 on the host (4 GB for a 0.6 GB Q4_K table), and the file pages of host
-  layers once their repack exists.
+  the plan - DontNeed for what the cards hold, WillNeed for what the host reads - and each
+  layer's pages are dropped the moment it lands on a card, because waiting for the end of the
+  load was already too late: the cache had reached 44 GB and 12-15 GB of the process had gone
+  to zram, and the same cell then decoded anywhere between 1.5 and 2.2 tok/s from one run to
+  the next. Dropped per layer, the cell measures 2.25 three times. What remains: the load
+  still peaks at 49 GB of cache and pushes ~10 GB to zram in one burst, pages touched before
+  the layer build; the token embedding dequantised to F32 on the host (4 GB for a 0.6 GB Q4_K
+  table); and the file pages of host layers once their repack exists.
 - **Load time is your disk.** 24 GB over USB: 52 s reading, 6 s to the cards.
 
 ## The cluster
