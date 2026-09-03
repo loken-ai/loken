@@ -192,6 +192,11 @@ largest matched range is the GGUF k-quant bit specification, which any correct r
 The 870 MiB nobody budgets, and the reserve pass reaching language models. Each has a
 measurement waiting. olmoe's deficit is closed: it was the harness, not the engine.
 
+granite3-moe:1b loses 1-5% streamed and wins 7-20% not streamed, on six runs across three
+days. At ~3 ms a token the stream's per-token cost - the chunk, its JSON, the client's read
+loop - is the same order as the token, and that is where the gap lives, not in the kernels.
+The non-stream row is the arithmetic; the stream row is the transport.
+
 Two speculative loops. The plain stream carries one, gated per step by a calibrator; the
 attach endpoint and a configured drafter drive another, `generate_stream_with_draft`. On the
 same target and drafter the first gave 1.68 tok/s and the second 2.21. One of them should go,
