@@ -385,3 +385,91 @@ pub(crate) async fn anthropic_messages(
         }
     }
 }
+
+/// `POST /v1/messages/count_tokens`: the prompt a request would prefill, counted by
+/// the model's own tokenizer once the model is loaded, estimated before.
+pub(crate) async fn anthropic_count_tokens(
+    State(state): State<APIServer>,
+    payload: Result<
+        Json<crate::api::anthropic::AnthropicMessagesRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    use axum::http::StatusCode;
+    let req = match payload {
+        Ok(Json(r)) => r,
+        Err(e) => {
+            return anthropic_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                e.body_text(),
+            );
+        }
+    };
+    if let Err(e) = validate_model_id(&req.model) {
+        return anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("{e:?}"),
+        );
+    }
+    let model_name = normalize_model_id(&req.model);
+    let chat_template = state
+        .read_chat_template(&model_name)
+        .or_else(|| infer_template_from_model_name(&model_name));
+    let tools_active = req.tools_enabled();
+    let tool_format =
+        crate::api::tool_calls::detect_tool_format(chat_template.as_deref(), &model_name);
+    let tool_directive = crate::api::tool_calls::tool_choice_directive(req.tool_choice.as_ref());
+    let (messages, tools) = req.into_internal();
+    let prompt = if tools_active {
+        let flat = crate::api::tool_calls::flatten_messages(
+            &messages,
+            tool_format,
+            &tools,
+            tool_directive.as_deref(),
+        );
+        format_chat_prompt(&flat, chat_template.as_deref())
+    } else {
+        format_chat_prompt(&messages, chat_template.as_deref())
+    };
+    let counted = match state.get_engine(&model_name).await {
+        Ok(engine) => engine.count_tokens(&prompt).await,
+        Err(_) => None,
+    };
+    let input_tokens = counted.unwrap_or_else(|| estimate_token_count(&prompt) as usize);
+    Json(serde_json::json!({ "input_tokens": input_tokens })).into_response()
+}
+
+/// `GET /v1/models` in the shape of the client asking: an `anthropic-version` header
+/// gets the Messages API's list, anyone else OpenAI's.
+pub(crate) async fn list_models_by_dialect(
+    State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !headers.contains_key("anthropic-version") {
+        return super::openai::openai_list_models(State(state)).await;
+    }
+    let mut data: Vec<serde_json::Value> = Vec::new();
+    if let Ok(mut models) = state.model_manager.list_models().await {
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        let listed = chrono::Utc::now().to_rfc3339();
+        for m in models {
+            data.push(serde_json::json!({
+                "type": "model",
+                "id": m.id,
+                "display_name": m.id,
+                "created_at": listed,
+            }));
+        }
+    }
+    let first = data.first().and_then(|m| m["id"].as_str().map(str::to_string));
+    let last = data.last().and_then(|m| m["id"].as_str().map(str::to_string));
+    Json(serde_json::json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first,
+        "last_id": last,
+    }))
+    .into_response()
+}

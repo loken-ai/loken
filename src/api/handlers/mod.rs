@@ -487,16 +487,15 @@ async fn throttled(
     }
     // 429 with Retry-After: a client that is told to back off can, and one that is
     // simply refused will hammer.
+    let dialect = Dialect::of(&req);
     (
         axum::http::StatusCode::TOO_MANY_REQUESTS,
         [(axum::http::header::RETRY_AFTER, "1")],
-        axum::Json(serde_json::json!({
-            "error": {
-                "message": "rate limit exceeded",
-                "type": "rate_limit_error",
-                "code": "too_many_requests"
-            }
-        })),
+        axum::Json(dialect.error_body(
+            "rate_limit_error",
+            "too_many_requests",
+            "rate limit exceeded",
+        )),
     )
         .into_response()
 }
@@ -533,17 +532,16 @@ async fn require_api_key(
         })
         .or_else(|| req.headers().get("x-api-key").and_then(|v| v.to_str().ok()))
         .map(str::to_string);
+    let dialect = Dialect::of(&req);
     match presented {
         Some(key) if auth.accepts(&key) => throttled(&auth, &key, req, next).await,
         _ => (
             axum::http::StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({
-                "error": {
-                    "message": "missing or invalid API key",
-                    "type": "invalid_request_error",
-                    "code": "unauthorized"
-                }
-            })),
+            axum::Json(dialect.error_body(
+                "authentication_error",
+                "unauthorized",
+                "missing or invalid API key",
+            )),
         )
             .into_response(),
     }
@@ -1299,7 +1297,7 @@ impl APIServer {
             // OpenAI-compatible model index. Lists locally available
             // LLM checkpoints plus the multimodal models the server
             // can spin up (whisper ASR, parler-tts, flux/z-image).
-            .route("/v1/models", axum::routing::get(openai_list_models))
+            .route("/v1/models", axum::routing::get(list_models_by_dialect))
             // OpenAI's "retrieve model" - single-entry lookup by id.
             // SDKs call this to confirm a model is available before
             // sending a generation.
@@ -1317,6 +1315,10 @@ impl APIServer {
             // engine + tool-calling plumbing as the OpenAI path, request/
             // response translated to/from Anthropic content blocks.
             .route("/v1/messages", axum::routing::post(anthropic_messages))
+            .route(
+                "/v1/messages/count_tokens",
+                axum::routing::post(anthropic_count_tokens),
+            )
             // Legacy text-completion endpoint (OpenAI 0.27-era). Many
             // older SDKs (LangChain default, llamaindex) still call it.
             // Internally just a thin shim: prompt passes through raw
@@ -1439,6 +1441,7 @@ impl APIServer {
             // outer, Set inner - so on request flow Set runs first
             // (mints the ID), then Propagate snapshots it for the
             // response.
+            .layer(axum::middleware::from_fn(mirror_request_id))
             .layer(PropagateRequestIdLayer::x_request_id())
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(TraceLayer::new_for_http());
@@ -1716,6 +1719,15 @@ fn available_endpoints_list() -> serde_json::Value {
 
 async fn handle_404(uri: axum::http::Uri) -> impl IntoResponse {
     warn!("⚠️  404 Not Found: {} - endpoint does not exist", uri);
+    if uri.path().starts_with("/v1/messages") {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(crate::api::anthropic::AnthropicError::new(
+                "not_found_error",
+                format!("Endpoint not found: {uri}"),
+            )),
+        );
+    }
 
     let mut body = openai_error_body(StatusCode::NOT_FOUND, format!("Endpoint not found: {uri}"));
     // Augment the OpenAI error envelope with a discoverability hint
@@ -2036,4 +2048,54 @@ mod relay_terminator_tests {
             .windows(super::TERMINAL_MARKER.len())
             .any(|w| w == super::TERMINAL_MARKER));
     }
+}
+
+/// The wire dialect a request speaks, for the envelope of an error raised before any
+/// handler: the Messages API's under its path or its version header, OpenAI's else.
+#[derive(Clone, Copy)]
+enum Dialect {
+    OpenAi,
+    Anthropic,
+}
+
+impl Dialect {
+    fn of(req: &axum::extract::Request) -> Self {
+        if req.uri().path().starts_with("/v1/messages") || req.headers().contains_key("anthropic-version")
+        {
+            Self::Anthropic
+        } else {
+            Self::OpenAi
+        }
+    }
+
+    fn error_body(self, anthropic_type: &str, openai_code: &str, message: &str) -> serde_json::Value {
+        match self {
+            Self::Anthropic => serde_json::json!({
+                "type": "error",
+                "error": {"type": anthropic_type, "message": message}
+            }),
+            Self::OpenAi => serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": if openai_code == "unauthorized" { "invalid_request_error" } else { anthropic_type },
+                    "code": openai_code
+                }
+            }),
+        }
+    }
+}
+
+/// Anthropic SDKs read the request id from `request-id`; the id minted as
+/// `x-request-id` is mirrored there.
+async fn mirror_request_id(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let id = req.headers().get("x-request-id").cloned();
+    let mut res = next.run(req).await;
+    if let Some(id) = id {
+        res.headers_mut()
+            .insert(axum::http::HeaderName::from_static("request-id"), id);
+    }
+    res
 }

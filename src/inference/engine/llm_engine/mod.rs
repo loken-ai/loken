@@ -667,6 +667,18 @@ impl LlmEngine {
         result.map_err(std::convert::Into::into)
     }
 
+    /// Tokens the loaded model's tokenizer makes of `text`, `None` with no model loaded.
+    pub async fn count_tokens(&self, text: &str) -> Option<usize> {
+        let guard = self.model_state.lock().await;
+        let state = guard.as_ref()?;
+        state
+            .tokenizer
+            .encode(text, true)
+            .ok()
+            .map(|e| e.get_ids().len())
+    }
+
+
     /// Clear any stored image embeddings
     pub async fn clear_images(&self) {
         let mut guard = self.model_state.lock().await;
