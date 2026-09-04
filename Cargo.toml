@@ -65,6 +65,7 @@ base64 = "0.22"
 
 # Audio (whisper ASR) - WAV decoding + mel-filter byte parsing + resampling
 hound = "3.5"
+rusty_mp3 = "0.7"
 byteorder = "1.5"
 rubato = "0.16"
 # Decode MP3/FLAC/OGG-Vorbis input on the ASR endpoints. WAV stays on

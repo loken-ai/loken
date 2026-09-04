@@ -1519,6 +1519,33 @@ pub(super) fn pcm_to_wav_bytes(pcm: &[f32], sample_rate: u32) -> anyhow::Result<
     Ok(out)
 }
 
+/// Constant bitrate of the MP3 the speech endpoint returns; the encoder snaps it to the
+/// nearest value the MPEG version of the checkpoint's sample rate allows.
+const MP3_BITRATE_KBPS: u32 = 96;
+
+/// Mono f32 samples as one MP3 stream: the whole tail padded, the info header in front.
+/// A sample rate no MPEG version carries (anything but 8 to 48 kHz on the standard
+/// ladder) is refused by the encoder, and the refusal reaches the client.
+pub(super) fn pcm_to_mp3_bytes(pcm: &[f32], sample_rate: u32) -> anyhow::Result<Vec<u8>> {
+    let mut enc = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
+        bitrate_kbps: MP3_BITRATE_KBPS,
+        vbr_quality: None,
+    });
+    enc.push_pcm_f32(pcm, 1, sample_rate)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    enc.finish();
+    let mut out = Vec::with_capacity(pcm.len() / 8);
+    loop {
+        match enc.next_packet() {
+            Ok(packet) => out.extend_from_slice(&packet),
+            Err(rusty_mp3::error::Error::Eof) => break,
+            Err(rusty_mp3::error::Error::Again) => break,
+            Err(e) => return Err(anyhow::anyhow!("{e}")),
+        }
+    }
+    Ok(out)
+}
+
 pub(super) fn pcm_to_raw_le_bytes(pcm: &[f32]) -> Vec<u8> {
     let mut out = vec![0u8; pcm.len() * 2];
     write_i16_le_into(&mut out, pcm);
@@ -1648,15 +1675,14 @@ pub(crate) async fn audio_speech(
         .map(str::to_lowercase)
         .unwrap_or_else(|| "wav".to_string());
     match response_format.as_str() {
-        "wav" | "pcm" => {}
-        // mp3/opus/aac/flac would require pulling in an encoder; not yet
-        // supported. Surface a clear error rather than producing the
-        // wrong content-type.
+        "wav" | "pcm" | "mp3" => {}
+        // opus/aac/flac would each need an encoder of their own; a clear error
+        // beats the wrong content-type.
         other => {
             return err_resp(
                 axum::http::StatusCode::BAD_REQUEST,
                 format!(
-                    "response_format '{other}' not supported; use 'wav' or 'pcm' (rate follows the loaded checkpoint - mini-v1 ships 44.1 kHz, large-v1 24 kHz)"
+                    "response_format '{other}' not supported; use 'wav', 'pcm' or 'mp3' (rate follows the loaded checkpoint - mini-v1 ships 44.1 kHz, large-v1 24 kHz)"
                 ),
             );
         }
@@ -1848,6 +1874,15 @@ pub(crate) async fn audio_speech(
             format!("audio/L16; rate={}; channels=1", result.sample_rate),
             "pcm",
         ),
+        "mp3" => match pcm_to_mp3_bytes(&result.pcm, result.sample_rate) {
+            Ok(bytes) => (bytes, "audio/mpeg".to_string(), "mp3"),
+            Err(e) => {
+                return err_resp(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!("mp3 encode: {e}"),
+                )
+            }
+        },
         _ => match pcm_to_wav_bytes(&result.pcm, result.sample_rate) {
             Ok(bytes) => (bytes, "audio/wav".to_string(), "wav"),
             Err(e) => {
@@ -2086,12 +2121,18 @@ pub(super) async fn tts_stream_response(
         .loaded_sample_rate()
         .await
         .unwrap_or(crate::inference::engine::tts_engine::TTS_SAMPLE_RATE);
-    let content_type = if format == "pcm" {
+    let content_type = if format == "mp3" {
+        "audio/mpeg".to_string()
+    } else if format == "pcm" {
         format!("audio/L16; rate={sample_rate}; channels=1")
     } else {
         "audio/wav".to_string()
     };
-    let ext = if format == "pcm" { "pcm" } else { "wav" };
+    let ext = match format.as_str() {
+        "pcm" => "pcm",
+        "mp3" => "mp3",
+        _ => "wav",
+    };
     let cd = format!("inline; filename=\"speech.{ext}\"");
 
     let sentence_count = sentences.len();
@@ -2127,7 +2168,19 @@ pub(super) async fn tts_stream_response(
                     } else {
                         apply_speed_linear(&r.pcm, speed)
                     };
-                    let bytes = pcm_to_raw_le_bytes(&pcm);
+                    // One MP3 stream per sentence: its frames leave as soon as the
+                    // sentence is synthesised, and decoders take the streams back to back.
+                    let bytes = if format == "mp3" {
+                        match pcm_to_mp3_bytes(&pcm, sample_rate) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                tracing::error!("TTS streaming: mp3 encode: {e}");
+                                break;
+                            }
+                        }
+                    } else {
+                        pcm_to_raw_le_bytes(&pcm)
+                    };
                     bytes_total += bytes.len();
                     yield Ok(bytes);
                 }
