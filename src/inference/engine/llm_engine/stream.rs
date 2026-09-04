@@ -326,7 +326,10 @@ impl LlmEngine {
                     // Vision prefix-KV reuse: match by image_hash + common text.
                     let sess_guard = sessions.blocking_lock();
                     let mut best: Option<(&str, usize, usize)> = None;
-                    for (sid, sess) in sess_guard.iter() {
+                    for (sid, sess) in sess_guard
+                        .iter()
+                        .filter(|(sid, _)| sid.as_str() == GLOBAL_PROMPT_CACHE_KEY)
+                    {
                         if sess.model_name != state.name {
                             continue;
                         }
@@ -415,11 +418,17 @@ impl LlmEngine {
                     )
                 } else {
                     let sess_guard = sessions.blocking_lock();
-                    // Find the best (id, common_len) over all sessions on
-                    // this model, prioritizing the request's own session_id
-                    // when its match length ties.
+                    // One KV is resident, and the entry under GLOBAL_PROMPT_CACHE_KEY
+                    // is the sequence it holds. Every other session entry is token
+                    // bookkeeping only: matching the prompt against it and trimming
+                    // the resident KV to that length would serve another session's
+                    // KV under this prompt's tokens. So the match is made against the
+                    // resident entry alone, capped by what is actually in the cache.
                     let mut best: Option<(&str, usize, usize)> = None; // (sid, common, t_len)
-                    for (sid, sess) in sess_guard.iter() {
+                    for (sid, sess) in sess_guard
+                        .iter()
+                        .filter(|(sid, _)| sid.as_str() == GLOBAL_PROMPT_CACHE_KEY)
+                    {
                         if sess.model_name != state.name {
                             continue;
                         }
@@ -428,7 +437,8 @@ impl LlmEngine {
                             .iter()
                             .zip(prompt_tokens.iter())
                             .take_while(|(a, b)| a == b)
-                            .count();
+                            .count()
+                            .min(sess.kv_len);
                         if common == 0 {
                             continue;
                         }
@@ -2082,6 +2092,7 @@ impl LlmEngine {
                             },
                         );
                     }
+
                 }
             }
         });
