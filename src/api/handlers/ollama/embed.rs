@@ -270,7 +270,6 @@ pub(crate) async fn ollama_copy_model(
         ));
     }
 
-    // model_manager.copy_model is currently a no-op (directory-based
     // approach - users manage their own ollama dirs). Without an
     // explicit existence check, /api/copy would return 200 OK even
     // when the source doesn't exist locally - misleading clients

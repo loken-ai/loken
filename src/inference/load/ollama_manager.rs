@@ -417,17 +417,78 @@ impl OllamaManager {
         Ok(())
     }
 
+    /// Where the manifest of `name:tag` lives: `library/<name>/<tag>` for a bare name,
+    /// the name's own path for `namespace/name`.
+    fn manifest_path(&self, name: &str, tag: &str) -> PathBuf {
+        let mut path = self
+            .models_dir
+            .join("manifests")
+            .join("registry.ollama.ai");
+        if name.contains('/') {
+            for part in name.split('/') {
+                path = path.join(part);
+            }
+        } else {
+            path = path.join("library").join(name);
+        }
+        path.join(tag)
+    }
+
+    /// Copies a model under another name: one manifest more, the blobs shared.
+    pub fn copy_model(&self, name: &str, tag: &str, to_name: &str, to_tag: &str) -> Result<()> {
+        let from = self.manifest_path(name, tag);
+        if !from.exists() {
+            return Err(anyhow!("Model not found: {}:{}", name, tag));
+        }
+        let to = self.manifest_path(to_name, to_tag);
+        if let Some(dir) = to.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::copy(&from, &to)?;
+        info!("Copied {}:{} to {}:{}", name, tag, to_name, to_tag);
+        Ok(())
+    }
+
+    /// Removes every blob no manifest names any more; returns how many.
+    pub fn prune_blobs(&self) -> Result<usize> {
+        let manifests = self.models_dir.join("manifests");
+        let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack = vec![manifests];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(m) = self.read_manifest(&path) {
+                    named.insert(m.config.digest.replace(':', "-"));
+                    for layer in m.layers.unwrap_or_default() {
+                        named.insert(layer.digest.replace(':', "-"));
+                    }
+                }
+            }
+        }
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(self.models_dir.join("blobs"))?.flatten() {
+            let path = entry.path();
+            let Some(file) = path.file_name().and_then(|f| f.to_str()) else {
+                continue;
+            };
+            if file.starts_with("sha256-") && !named.contains(file) {
+                std::fs::remove_file(&path)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Delete a model
     pub fn delete_model(&self, name: &str, tag: &str) -> Result<()> {
         info!("Deleting Ollama model: {}:{}", name, tag);
 
-        let manifest_path = self
-            .models_dir
-            .join("manifests")
-            .join("registry.ollama.ai")
-            .join("library")
-            .join(name)
-            .join(tag);
+        let manifest_path = self.manifest_path(name, tag);
 
         if manifest_path.exists() {
             std::fs::remove_file(&manifest_path)?;

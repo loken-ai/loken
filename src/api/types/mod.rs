@@ -709,6 +709,8 @@ pub struct OllamaShowResponse {
 /// Ollama delete request (DELETE /api/delete)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaDeleteRequest {
+    /// `model` is what current clients send; `name` what earlier ones did.
+    #[serde(alias = "model")]
     pub name: String,
 }
 

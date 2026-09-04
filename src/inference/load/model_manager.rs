@@ -415,18 +415,18 @@ impl ModelManager {
         }
     }
 
-    /// Delete a model - simplified for directory-based approach
+    /// Removes a model from the store: its manifest and the blobs nothing else names
+    /// for an Ollama model, its directory for a Hugging Face one.
     pub async fn delete_model(&self, model_id: &str) -> Result<()> {
-        if let Some(path) = self.get_model_path(model_id) {
-            if path.exists() {
-                // In directory-based approach, we don't delete - users manage their own directories
-                info!(
-                    "Model directory {} would be deleted (directory-based approach)",
-                    path.display()
-                );
+        let (name, tag) = split_name_tag(model_id);
+        match self.ollama_manager.delete_model(name, tag) {
+            Ok(()) => {
+                let pruned = self.ollama_manager.prune_blobs()?;
+                info!("Deleted {model_id}: {pruned} blob(s) no manifest named any more removed");
+                Ok(())
             }
+            Err(_) => self.huggingface_manager.delete_model(model_id),
         }
-        Ok(())
     }
 
     /// Repair a broken model - simplified for directory-based approach
@@ -453,11 +453,11 @@ impl ModelManager {
         Ok(metadata)
     }
 
-    /// Copy a model - simplified for directory-based approach
+    /// Copies an Ollama model under another name.
     pub async fn copy_model(&self, source: &str, destination: &str) -> Result<()> {
-        info!("Copying model from {} to {}", source, destination);
-        // In directory-based approach, copy is manual - just return success
-        Ok(())
+        let (name, tag) = split_name_tag(source);
+        let (to_name, to_tag) = split_name_tag(destination);
+        self.ollama_manager.copy_model(name, tag, to_name, to_tag)
     }
 
     /// Get model size estimate - only supports ollama and huggingface sources
@@ -491,3 +491,12 @@ impl ModelManager {
 // Re-export the metadata types for use in other modules
 pub use crate::inference::load::huggingface_manager::HuggingFaceModelMetadata;
 pub use crate::inference::load::ollama_manager::OllamaModelMetadata;
+
+
+/// `name:tag`, `latest` when no tag is given.
+fn split_name_tag(model_id: &str) -> (&str, &str) {
+    match model_id.rsplit_once(':') {
+        Some((name, tag)) if !tag.contains('/') => (name, tag),
+        _ => (model_id, "latest"),
+    }
+}

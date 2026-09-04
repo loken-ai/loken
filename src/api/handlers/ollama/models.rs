@@ -950,8 +950,6 @@ pub(crate) async fn ollama_delete_model(
         }
     }
 
-    // Delete from disk. NOTE: model_manager.delete_model is currently
-    // a no-op (directory-based approach) - but route the Err arm
     // through ApiError::Internal so any future real deletion failures
     // are reported as 500 instead of mislabelled as 404 (the error
     // wouldn't be "model not found", it'd be "I/O / permission".
