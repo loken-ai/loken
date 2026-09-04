@@ -2058,4 +2058,6 @@ pub(crate) async fn openai_embeddings(
 }
 
 #[cfg(test)]
+mod responses;
+pub(crate) use responses::*;
 mod tests;

@@ -1310,6 +1310,11 @@ impl APIServer {
                 axum::routing::post(chat_completion),
             )
             .route("/v1/chat/completions", axum::routing::post(chat_completion))
+            .route("/v1/responses", axum::routing::post(openai_responses))
+            .route(
+                "/v1/responses/{id}",
+                axum::routing::get(openai_get_response).delete(openai_delete_response),
+            )
             // Anthropic Messages API shim - lets Claude Code and other
             // Anthropic-protocol clients use loken natively. Same
             // engine + tool-calling plumbing as the OpenAI path, request/
