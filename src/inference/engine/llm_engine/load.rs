@@ -681,6 +681,7 @@ pub(crate) fn kv_reuse_start(
     prompt_tokens: &[u32],
     disabled: bool,
     shift: bool,
+    disk: Option<(&crate::inference::cache::kv_disk::KvDiskStore, usize)>,
 ) -> usize {
     let mut reuse = if disabled || !model.supports_trim_kv() {
         None
@@ -700,6 +701,84 @@ pub(crate) fn kv_reuse_start(
     // close. Rounding down makes the warm tail exactly cold's tail chunks - a fixed
     // remainder was measured insufficient, since any shape difference reassociates.
     let chunk = crate::inference::engine::model_backend::adaptive_prefill_chunk(model.widest_ffn());
+    // A snapshot of another conversation that shares more of this prompt than the
+    // resident KV does becomes the resident: the resident sequence itself was copied
+    // aside when its request ended, so nothing is lost by the swap.
+    if !disabled && model.supports_trim_kv() {
+        let cur_keep = reuse
+            .map(|c| chunk_aligned_keep(c, prompt_tokens.len(), chunk))
+            .unwrap_or(0);
+        if let Some((index, snap_common)) = model.best_kv_snapshot(prompt_tokens) {
+            if chunk_aligned_keep(snap_common, prompt_tokens.len(), chunk) > cur_keep {
+                match model.restore_kv_snapshot(index) {
+                    Ok((tokens, kv_len)) => {
+                        let mut g = sessions.blocking_lock();
+                        g.insert(
+                            GLOBAL_PROMPT_CACHE_KEY.to_string(),
+                            SessionState {
+                                tokens,
+                                model_name: model_name.to_string(),
+                                image_hash: None,
+                                image_prefix_len: 0,
+                                kv_len,
+                            },
+                        );
+                        tracing::info!(
+                            "kv snapshot restored: {snap_common} tokens shared with the prompt, {kv_len} resident"
+                        );
+                        reuse = Some(snap_common);
+                    }
+                    Err(e) => tracing::warn!("kv snapshot restore failed: {e}; resident KV kept"),
+                }
+            }
+        }
+    }
+    // Then the disk: a sequence written after an earlier request, or an earlier run,
+    // that covers more of the prompt than anything in memory. Its blocks come back as
+    // a snapshot, which is restored like the others.
+    if let (Some((store, cap)), false) = (disk, disabled) {
+        if let Some((n_layers, _, _)) = model.kv_layout() {
+            let cur_keep = reuse
+                .map(|c| chunk_aligned_keep(c, prompt_tokens.len(), chunk))
+                .unwrap_or(0);
+            let layout = kv_layout_id(model);
+            if let Some((mi, covered)) = store.best(model_name, layout, prompt_tokens) {
+                if chunk_aligned_keep(covered, prompt_tokens.len(), chunk) > cur_keep {
+                    let blocks = covered / store.block_tokens();
+                    let loaded = store
+                        .load(mi, blocks, n_layers)
+                        .map_err(|e| crate::tensor::Error::msg(e.to_string()))
+                        .and_then(|rows| {
+                            model.import_kv_snapshot(prompt_tokens[..covered].to_vec(), covered, rows, cap)
+                        })
+                        .and_then(|()| {
+                            let (index, _) = model
+                                .best_kv_snapshot(prompt_tokens)
+                                .ok_or_else(|| crate::tensor::Error::msg("kv disk: imported snapshot not found".to_string()))?;
+                            model.restore_kv_snapshot(index)
+                        });
+                    match loaded {
+                        Ok((tokens, kv_len)) => {
+                            let mut g = sessions.blocking_lock();
+                            g.insert(
+                                GLOBAL_PROMPT_CACHE_KEY.to_string(),
+                                SessionState {
+                                    tokens,
+                                    model_name: model_name.to_string(),
+                                    image_hash: None,
+                                    image_prefix_len: 0,
+                                    kv_len,
+                                },
+                            );
+                            tracing::info!("kv disk: {covered} tokens of the prompt restored from disk");
+                            reuse = Some(covered);
+                        }
+                        Err(e) => tracing::warn!("kv disk restore failed: {e}; resident KV kept"),
+                    }
+                }
+            }
+        }
+    }
     // A prompt clamped to the window keeps its first token and its tail; once a
     // conversation outgrows the window the common prefix with the resident sequence
     // is that first token alone, and every turn re-prefills the whole window. The tail
@@ -750,6 +829,42 @@ pub(crate) fn kv_reuse_start(
         model.trim_kv(keep);
     }
     keep
+}
+
+/// What identifies a KV layout on disk: the row geometry. Two builds of one model with
+/// the same geometry read each other's blocks; a different quantisation of the weights
+/// changes the values, not the layout, and the model name keeps those apart.
+pub(crate) fn kv_layout_id(model: &dyn crate::inference::engine::model_backend::ModelBackend) -> u64 {
+    match model.kv_layout() {
+        Some((layers, n_kv, hd)) => ((layers as u64) << 40) | ((n_kv as u64) << 20) | hd as u64,
+        None => 0,
+    }
+}
+
+/// Writes the snapshot just taken for `tokens` to the disk tier, block by block.
+pub(crate) fn persist_kv_snapshot(
+    store: &crate::inference::cache::kv_disk::KvDiskStore,
+    model: &dyn crate::inference::engine::model_backend::ModelBackend,
+    model_name: &str,
+    tokens: &[u32],
+) {
+    let Some((index, common)) = model.best_kv_snapshot(tokens) else {
+        return;
+    };
+    let Some((_, kv_len)) = model.kv_snapshot_ref(index) else {
+        return;
+    };
+    if common < kv_len.min(tokens.len()) {
+        return; // the table holds another sequence; nothing of this one to write
+    }
+    let layout = kv_layout_id(model);
+    if let Err(e) = store.persist(model_name, layout, tokens, kv_len, |from, to| {
+        model
+            .export_kv_rows(index, from, to)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }) {
+        tracing::warn!("kv disk persist failed: {e}");
+    }
 }
 
 /// Head a clamped prompt keeps, the same one `clamp_prompt_to_window` keeps.

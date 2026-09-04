@@ -183,6 +183,18 @@ pub struct InferenceConfig {
     /// window (`kv_reuse_start`). Off by default: the shifted keys are re-phased, not
     /// recomputed, so a warm run is no longer the cold run bit for bit.
     pub kv_shift_reuse: bool,
+    /// Resident sequences kept aside after a request, each a full copy of the KV, so a
+    /// later request on another conversation resumes from its own KV instead of
+    /// prefilling. 0 keeps the single resident KV. Costs one KV per entry, where the
+    /// layers live.
+    pub kv_snapshots: usize,
+    /// Directory of the disk tier under the snapshots: blocks of Q8_0 KV shared between
+    /// sequences by prefix, one manifest per sequence. `None` keeps snapshots in memory
+    /// only. Needs `kv_snapshots > 0`.
+    pub kv_disk_dir: Option<String>,
+    /// Bytes the disk tier may hold, in GiB; 0 for no limit. Least recently used
+    /// sequences go first.
+    pub kv_disk_budget_gb: f64,
     /// Max GPU memory fraction (0.0-1.0)
     pub max_gpu_memory_fraction: f64,
     /// Force GPU layers count
@@ -267,6 +279,9 @@ impl Default for InferenceConfig {
             draft_model: None,
             draft_device_index: None,
             kv_shift_reuse: false,
+            kv_snapshots: 0,
+            kv_disk_dir: None,
+            kv_disk_budget_gb: 0.0,
             max_gpu_memory_fraction: 0.9,
             force_gpu_layers: None,
             use_quantized_gpu: true,

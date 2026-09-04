@@ -148,6 +148,8 @@ impl LlmEngine {
         let session_id = params.session_id.clone();
         let config = self.config.clone();
         let kv_shift_reuse = config.kv_shift_reuse;
+        let kv_snapshots = config.kv_snapshots;
+        let kv_disk = self.kv_disk.clone();
         let prompt = prompt.to_string();
         // Buffer-size 4096 (vs prior 64): with the prior buffer, after
         // 64 chunks the engine's `blocking_send` blocks waiting for the
@@ -415,6 +417,7 @@ impl LlmEngine {
                         &prompt_tokens,
                         false,
                         kv_shift_reuse,
+                        kv_disk.as_deref().map(|d| (d, kv_snapshots)),
                     )
                 } else {
                     let sess_guard = sessions.blocking_lock();
@@ -2084,7 +2087,7 @@ impl LlmEngine {
                         sess_guard.insert(
                             GLOBAL_PROMPT_CACHE_KEY.to_string(),
                             SessionState {
-                                tokens: full,
+                                tokens: full.clone(),
                                 model_name,
                                 kv_len: pos,
                                 image_hash,
@@ -2092,7 +2095,22 @@ impl LlmEngine {
                             },
                         );
                     }
-
+                    // Never two locks at once: the sessions table is released before the
+                    // model is taken.
+                    drop(sess_guard);
+                    if kv_snapshots > 0 && image_hash.is_none() {
+                        let mut g = model_state.blocking_lock();
+                        if let Some(s) = g.as_mut() {
+                            match s.model.snapshot_kv(full.clone(), pos, kv_snapshots) {
+                                Err(e) => tracing::warn!("kv snapshot skipped: {e}"),
+                                Ok(()) => {
+                                    if let Some(store) = kv_disk.as_deref() {
+                                        persist_kv_snapshot(store, s.model.as_ref(), &s.name, &full);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         });

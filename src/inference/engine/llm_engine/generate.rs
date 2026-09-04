@@ -183,6 +183,8 @@ impl LlmEngine {
         let model_state = self.model_state.clone();
         let config = self.config.clone();
         let kv_shift_reuse = config.kv_shift_reuse;
+        let kv_snapshots = config.kv_snapshots;
+        let kv_disk = self.kv_disk.clone();
         let prompt = prompt.to_string();
         // Spec-decode: load the drafter, when one is configured, before the
         // blocking decode; capture a cheap Arc-clone engine for use inside. Output
@@ -304,6 +306,7 @@ impl LlmEngine {
                     &prompt_tokens,
                     disabled,
                     kv_shift_reuse,
+                    kv_disk.as_deref().map(|d| (d, kv_snapshots)),
                 )
             };
 
@@ -1524,12 +1527,23 @@ impl LlmEngine {
                 full.extend_from_slice(&generated);
                 let mut g = sessions.blocking_lock();
                 g.insert(GLOBAL_PROMPT_CACHE_KEY.to_string(), SessionState {
-                    tokens: full,
+                    tokens: full.clone(),
                     model_name: state.name.clone(),
                     image_hash: None,
                     image_prefix_len: 0,
                     kv_len: pos,
                 });
+                drop(g);
+                if kv_snapshots > 0 {
+                    match state.model.snapshot_kv(full.clone(), pos, kv_snapshots) {
+                        Err(e) => tracing::warn!("kv snapshot skipped: {e}"),
+                        Ok(()) => {
+                            if let Some(store) = kv_disk.as_deref() {
+                                persist_kv_snapshot(store, state.model.as_ref(), &state.name, &full);
+                            }
+                        }
+                    }
+                }
             }
 
             // Decode output tokens

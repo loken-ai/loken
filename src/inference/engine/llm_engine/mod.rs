@@ -217,6 +217,8 @@ pub struct LlmEngine {
     /// DRAM wall (perf-confirmed 83% of CPU decode). Boxed to break the recursive
     /// type; `Arc<Mutex>` so the lazy load is interior-mutable behind `&self`.
     draft_engine: Arc<Mutex<Option<Arc<LlmEngine>>>>,
+    /// The disk tier under the KV snapshots, when the configuration names a directory.
+    kv_disk: Option<Arc<crate::inference::cache::kv_disk::KvDiskStore>>,
     last_error: Arc<Mutex<Option<String>>>,
     cached_model_size: Arc<Mutex<u64>>,
     /// Session-persistent KV cache tracking. A single model has a single live
@@ -239,6 +241,7 @@ impl InferenceEngine for LlmEngine {
             config: InferenceConfig::default(),
             model_state: Arc::new(Mutex::new(None)),
             draft_engine: Arc::new(Mutex::new(None)),
+            kv_disk: None,
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -274,6 +277,7 @@ impl LlmEngine {
             config,
             model_state: Arc::new(Mutex::new(None)),
             draft_engine: Arc::new(Mutex::new(None)),
+            kv_disk: open_kv_disk(&config),
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1072,3 +1076,33 @@ pub use loading::configure_thread_pool;
 mod query;
 mod spec;
 mod stream;
+
+/// Blocks of the disk tier: long enough that a block file is a sequential read, short
+/// enough that a prompt loses little to alignment.
+const KV_DISK_BLOCK_TOKENS: usize = 256;
+
+fn open_kv_disk(
+    config: &InferenceConfig,
+) -> Option<Arc<crate::inference::cache::kv_disk::KvDiskStore>> {
+    let dir = config.kv_disk_dir.as_ref()?;
+    if config.kv_snapshots == 0 {
+        tracing::warn!("kv_disk_dir set but kv_snapshots is 0: the disk tier stays closed");
+        return None;
+    }
+    let budget = (config.kv_disk_budget_gb.max(0.0) * (1u64 << 30) as f64) as u64;
+    match crate::inference::cache::kv_disk::KvDiskStore::open(
+        std::path::PathBuf::from(dir),
+        budget,
+        KV_DISK_BLOCK_TOKENS,
+    ) {
+        Ok(store) => {
+            let (n, bytes) = store.stats();
+            tracing::info!("kv disk tier open at {dir}: {n} sequences, {} MiB", bytes >> 20);
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            tracing::warn!("kv disk tier at {dir} unavailable: {e}");
+            None
+        }
+    }
+}

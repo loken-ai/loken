@@ -2585,6 +2585,8 @@ impl GenericHeteroTransformer {
             graph_alive_tensors_model: Vec::new(),
             graph_state_groups: None,
             workspace_pre_grown: false,
+            kv_snapshots: Vec::new(),
+            kv_snapshot_tick: 0,
         };
 
         // A SiLU MoE runs its prefill experts on the host, and that loop reads its weights
@@ -2860,6 +2862,8 @@ impl GenericHeteroTransformer {
             graph_alive_tensors_model: Vec::new(),
             graph_state_groups: None,
             workspace_pre_grown: false,
+            kv_snapshots: Vec::new(),
+            kv_snapshot_tick: 0,
         })
     }
 }

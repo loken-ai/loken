@@ -21,6 +21,7 @@ pub const KV_WORKING_WINDOW_TOKENS: usize = 4096;
 pub mod cpu_f16_kv;
 pub mod cpu_q8_kv;
 pub mod hf;
+pub mod kv_disk;
 pub mod paged_attention;
 pub mod paged_kv;
 #[cfg(feature = "cuda")]

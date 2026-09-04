@@ -407,6 +407,24 @@ pub struct GenericHeteroTransformer {
     ///  tracks whether fast_mmvq workspace has been
     /// pre-grown to max model size. Set on first update_graph_state call.
     workspace_pre_grown: bool,
+    /// Resident sequences copied aside after a request (`snapshot_kv`), most recently
+    /// used last by `tick`; empty unless the configuration asks for them.
+    kv_snapshots: Vec<KvSnapshot>,
+    kv_snapshot_tick: u64,
+}
+
+/// A resident sequence copied aside: its tokens and every layer's KV, taken after a
+/// request so a later one can resume from it instead of prefilling.
+pub struct KvSnapshot {
+    pub tokens: Vec<u32>,
+    pub kv_len: usize,
+    pub(crate) layers: Vec<LayerKvSnapshot>,
+    pub(crate) tick: u64,
+}
+
+pub(crate) struct LayerKvSnapshot {
+    pub(crate) spec: Option<crate::inference::serve::spec_kv_cache::SpecKvSnapshot>,
+    pub(crate) cpu_f16: Option<crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
 }
 
 #[derive(Debug, Clone)]

@@ -127,6 +127,10 @@ fn adaptive_prefill_chunk_uncached(widest_ffn: usize) -> usize {
     }
 }
 
+/// One layer of exported KV rows per entry: `(k, v)` as f32, or `None` where the
+/// layer keeps no cache.
+pub(crate) type KvRows = Vec<Option<(Vec<f32>, Vec<f32>)>>;
+
 pub(crate) trait ModelBackend: Send {
     // --- Core forwards --------------------------------------------------
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor>;
@@ -334,6 +338,49 @@ pub(crate) trait ModelBackend: Send {
     }
     fn supports_shift_kv(&self) -> bool {
         false
+    }
+
+    /// Snapshots of the resident KV (`GenericHeteroTransformer::snapshot_kv`): copy the
+    /// resident sequence aside, find the snapshot sharing the most of a prompt, make one
+    /// resident again. Defaults: none kept, none found.
+    fn snapshot_kv(&mut self, _tokens: Vec<u32>, _kv_len: usize, _cap: usize) -> crate::tensor::Result<()> {
+        Ok(())
+    }
+    fn best_kv_snapshot(&self, _prompt: &[u32]) -> Option<(usize, usize)> {
+        None
+    }
+    fn restore_kv_snapshot(&mut self, _index: usize) -> crate::tensor::Result<(Vec<u32>, usize)> {
+        Err(crate::tensor::Error::msg(
+            "kv snapshots: unsupported backend".to_string(),
+        ))
+    }
+
+    /// The disk tier's view of the snapshots: geometry, a snapshot's tokens, its rows out
+    /// as host f32, and a snapshot rebuilt from such rows.
+    fn kv_layout(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
+    fn kv_snapshot_ref(&self, _index: usize) -> Option<(&[u32], usize)> {
+        None
+    }
+    fn export_kv_rows(
+        &self,
+        _index: usize,
+        _from: usize,
+        _to: usize,
+    ) -> crate::tensor::Result<KvRows> {
+        Err(crate::tensor::Error::msg(
+            "kv snapshots: unsupported backend".to_string(),
+        ))
+    }
+    fn import_kv_snapshot(
+        &mut self,
+        _tokens: Vec<u32>,
+        _kv_len: usize,
+        _rows: Vec<Option<(Vec<f32>, Vec<f32>)>>,
+        _cap: usize,
+    ) -> crate::tensor::Result<()> {
+        Ok(())
     }
 
     /// Tokens the KV cache actually holds, when the backend can say.
@@ -876,6 +923,40 @@ impl ModelBackend for GenericBackend {
     }
     fn supports_shift_kv(&self) -> bool {
         true
+    }
+
+    fn snapshot_kv(&mut self, tokens: Vec<u32>, kv_len: usize, cap: usize) -> crate::tensor::Result<()> {
+        self.0.snapshot_kv(tokens, kv_len, cap)
+    }
+    fn best_kv_snapshot(&self, prompt: &[u32]) -> Option<(usize, usize)> {
+        self.0.best_kv_snapshot(prompt)
+    }
+    fn restore_kv_snapshot(&mut self, index: usize) -> crate::tensor::Result<(Vec<u32>, usize)> {
+        self.0.restore_kv_snapshot(index)
+    }
+
+    fn kv_layout(&self) -> Option<(usize, usize, usize)> {
+        Some(self.0.kv_layout())
+    }
+    fn kv_snapshot_ref(&self, index: usize) -> Option<(&[u32], usize)> {
+        self.0.kv_snapshot_ref(index)
+    }
+    fn export_kv_rows(
+        &self,
+        index: usize,
+        from: usize,
+        to: usize,
+    ) -> crate::tensor::Result<KvRows> {
+        self.0.export_kv_rows(index, from, to)
+    }
+    fn import_kv_snapshot(
+        &mut self,
+        tokens: Vec<u32>,
+        kv_len: usize,
+        rows: Vec<Option<(Vec<f32>, Vec<f32>)>>,
+        cap: usize,
+    ) -> crate::tensor::Result<()> {
+        self.0.import_kv_snapshot(tokens, kv_len, rows, cap)
     }
 
     fn supports_trim_kv(&self) -> bool {

@@ -1495,6 +1495,201 @@ impl GenericHeteroTransformer {
         Ok(())
     }
 
+    /// Snapshots cover the F-dtype device cache and the host f16 cache. A quantised cache
+    /// has no copy constructor, so a model built with one keeps a single resident KV.
+    pub fn supports_kv_snapshots(&self) -> bool {
+        self.layers.iter().all(|l| {
+            let quantised = l.cpu_q8_kv.is_some();
+            #[cfg(feature = "cuda")]
+            let quantised = quantised || l.q8_kv_cache.is_some() || l.q4_kv_cache.is_some();
+            !quantised
+        })
+    }
+
+    /// Copies the resident KV aside under `tokens`, keeping at most `cap` snapshots: the
+    /// one this sequence extends is replaced, else at capacity the least recently used.
+    /// A copy that fails, for lack of memory, drops every snapshot and returns the error;
+    /// the request that produced the KV is not at stake.
+    pub fn snapshot_kv(
+        &mut self,
+        tokens: Vec<u32>,
+        kv_len: usize,
+        cap: usize,
+    ) -> crate::tensor::Result<()> {
+        if cap == 0 || !self.supports_kv_snapshots() {
+            self.kv_snapshots.clear();
+            return Ok(());
+        }
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for l in &self.layers {
+            let spec = match l.kv_cache.snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    self.kv_snapshots.clear();
+                    return Err(e);
+                }
+            };
+            layers.push(super::LayerKvSnapshot {
+                spec,
+                cpu_f16: l.cpu_f16_kv.clone(),
+            });
+        }
+        self.kv_snapshot_tick += 1;
+        let snap = super::KvSnapshot {
+            tokens,
+            kv_len,
+            layers,
+            tick: self.kv_snapshot_tick,
+        };
+        let existing: Vec<(&[u32], u64)> = self
+            .kv_snapshots
+            .iter()
+            .map(|s| (s.tokens.as_slice(), s.tick))
+            .collect();
+        match snapshot_slot(&existing, &snap.tokens, cap) {
+            Some(i) => self.kv_snapshots[i] = snap,
+            None => self.kv_snapshots.push(snap),
+        }
+        Ok(())
+    }
+
+    /// The snapshot sharing the longest prefix with `prompt`, as `(index, common)`,
+    /// `common` never past what the snapshot holds in its KV.
+    pub fn best_kv_snapshot(&self, prompt: &[u32]) -> Option<(usize, usize)> {
+        self.kv_snapshots
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, common_prefix(&s.tokens, prompt).min(s.kv_len)))
+            .filter(|(_, c)| *c > 0)
+            .max_by_key(|(_, c)| *c)
+    }
+
+    /// Makes snapshot `index` the resident KV; returns its tokens and KV length. The
+    /// captured decode graph is dropped, as after any change of resident sequence.
+    pub fn restore_kv_snapshot(&mut self, index: usize) -> crate::tensor::Result<(Vec<u32>, usize)> {
+        let Self {
+            layers,
+            kv_snapshots,
+            ..
+        } = self;
+        let snap = &kv_snapshots[index];
+        for (l, s) in layers.iter_mut().zip(&snap.layers) {
+            match &s.spec {
+                Some(spec) => l.kv_cache.restore(spec)?,
+                None => l.kv_cache.trim_to(0),
+            }
+            l.cpu_f16_kv = s.cpu_f16.clone();
+        }
+        let out = (snap.tokens.clone(), snap.kv_len);
+        self.kv_snapshot_tick += 1;
+        self.kv_snapshots[index].tick = self.kv_snapshot_tick;
+        self.invalidate_graph_state();
+        Ok(out)
+    }
+
+    /// `(layers, n_kv, head_dim)`: what a KV row of this model is made of.
+    pub fn kv_layout(&self) -> (usize, usize, usize) {
+        let l = &self.layers[0];
+        (self.layers.len(), l.n_kv_head, l.head_dim)
+    }
+
+    /// Tokens and KV length of snapshot `index`.
+    pub fn kv_snapshot_ref(&self, index: usize) -> Option<(&[u32], usize)> {
+        self.kv_snapshots.get(index).map(|s| (s.tokens.as_slice(), s.kv_len))
+    }
+
+    /// Every layer's rows for tokens `[from, to)` of snapshot `index`, host f32, or
+    /// `None` for a layer that keeps no KV of its own.
+    pub fn export_kv_rows(
+        &self,
+        index: usize,
+        from: usize,
+        to: usize,
+    ) -> crate::tensor::Result<crate::inference::engine::model_backend::KvRows> {
+        let snap = self
+            .kv_snapshots
+            .get(index)
+            .ok_or_else(|| crate::tensor::Error::msg(format!("kv snapshot {index} gone")))?;
+        snap.layers
+            .iter()
+            .map(|l| {
+                if let Some(spec) = &l.spec {
+                    spec.host_rows(from, to).map(Some)
+                } else if let Some(c) = &l.cpu_f16 {
+                    Ok(Some(c.host_rows(from, to)))
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect()
+    }
+
+    /// A snapshot rebuilt from host rows, each layer's placed where that layer keeps
+    /// its KV today, entered in the table under `tokens`.
+    pub fn import_kv_snapshot(
+        &mut self,
+        tokens: Vec<u32>,
+        kv_len: usize,
+        rows: Vec<Option<(Vec<f32>, Vec<f32>)>>,
+        cap: usize,
+    ) -> crate::tensor::Result<()> {
+        if cap == 0 || !self.supports_kv_snapshots() {
+            return Ok(());
+        }
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for (l, r) in self.layers.iter().zip(rows) {
+            let Some((k, v)) = r else {
+                layers.push(super::LayerKvSnapshot {
+                    spec: None,
+                    cpu_f16: None,
+                });
+                continue;
+            };
+            let (n_kv, hd) = (l.n_kv_head, l.head_dim);
+            let n = k.len() / (n_kv * hd);
+            if let Some(buf) = l.kv_cache.k_buffer() {
+                let spec = crate::inference::serve::spec_kv_cache::SpecKvSnapshot::from_host_rows(
+                    &buf, &k, &v, n, n_kv, hd,
+                )?;
+                layers.push(super::LayerKvSnapshot {
+                    spec: Some(spec),
+                    cpu_f16: None,
+                });
+            } else if let Some(c) = &l.cpu_f16_kv {
+                let mut fresh = c.like();
+                let row = n_kv * hd;
+                for t in 0..n {
+                    fresh.append(&k[t * row..(t + 1) * row], &v[t * row..(t + 1) * row])?;
+                }
+                layers.push(super::LayerKvSnapshot {
+                    spec: None,
+                    cpu_f16: Some(fresh),
+                });
+            } else {
+                return Err(crate::tensor::Error::msg(
+                    "kv snapshot import: a layer has no cache to place rows in".to_string(),
+                ));
+            }
+        }
+        self.kv_snapshot_tick += 1;
+        let snap = super::KvSnapshot {
+            tokens,
+            kv_len,
+            layers,
+            tick: self.kv_snapshot_tick,
+        };
+        let existing: Vec<(&[u32], u64)> = self
+            .kv_snapshots
+            .iter()
+            .map(|s| (s.tokens.as_slice(), s.tick))
+            .collect();
+        match snapshot_slot(&existing, &snap.tokens, cap) {
+            Some(i) => self.kv_snapshots[i] = snap,
+            None => self.kv_snapshots.push(snap),
+        }
+        Ok(())
+    }
+
     /// Trim every layer's KV cache to `new_len` valid positions.
     ///
     /// Used by speculative decoding to rewind after partial acceptance: the
@@ -1852,5 +2047,53 @@ impl GenericHeteroTransformer {
             })
             .collect::<Result<_>>()?;
         self.compute_all_from_kv(&hidden, &all_q)
+    }
+}
+
+/// Which snapshot a new one replaces: the one whose tokens it extends or shortens (the
+/// same conversation, one turn on), else, at capacity, the least recently used; `None`
+/// appends.
+pub(crate) fn snapshot_slot(existing: &[(&[u32], u64)], tokens: &[u32], cap: usize) -> Option<usize> {
+    if let Some((i, _)) = existing
+        .iter()
+        .enumerate()
+        .find(|(_, (t, _))| tokens.starts_with(t) || t.starts_with(tokens))
+    {
+        return Some(i);
+    }
+    if existing.len() < cap {
+        return None;
+    }
+    existing
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (_, tick))| *tick)
+        .map(|(i, _)| i)
+}
+
+fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+#[cfg(test)]
+mod kv_snapshot_tests {
+    use super::snapshot_slot;
+
+    #[test]
+    fn a_grown_conversation_replaces_its_own_snapshot() {
+        let a = [1u32, 2, 3];
+        let b = [9u32, 8];
+        let existing = [(&a[..], 1u64), (&b[..], 2u64)];
+        assert_eq!(snapshot_slot(&existing, &[1, 2, 3, 4, 5], 2), Some(0));
+        assert_eq!(snapshot_slot(&existing, &[9], 2), Some(1));
+    }
+
+    #[test]
+    fn a_new_conversation_appends_then_evicts_the_least_recent() {
+        let a = [1u32, 2, 3];
+        let b = [9u32, 8];
+        let existing = [(&a[..], 5u64), (&b[..], 2u64)];
+        assert_eq!(snapshot_slot(&existing, &[7, 7], 3), None);
+        assert_eq!(snapshot_slot(&existing, &[7, 7], 2), Some(1));
     }
 }

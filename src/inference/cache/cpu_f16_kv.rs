@@ -270,6 +270,26 @@ impl CpuF16Kv {
         Ok(())
     }
 
+    /// Tokens `[from, to)` as f32 rows, token-major `[n, n_kv, head_dim]`, K then V.
+    pub fn host_rows(&self, from: usize, to: usize) -> (Vec<f32>, Vec<f32>) {
+        let hd = self.head_dim;
+        let n = to - from;
+        let mut k = Vec::with_capacity(n * self.n_kv_head * hd);
+        let mut v = Vec::with_capacity(n * self.n_kv_head * hd);
+        for t in from..to {
+            for h in 0..self.n_kv_head {
+                k.extend(self.k[h][t * hd..(t + 1) * hd].iter().map(|x| x.to_f32()));
+                v.extend(self.v[h][t * hd..(t + 1) * hd].iter().map(|x| x.to_f32()));
+            }
+        }
+        (k, v)
+    }
+
+    /// An empty cache with this one's geometry, to be filled by `append`.
+    pub fn like(&self) -> Self {
+        Self::new(self.n_head, self.n_kv_head, self.head_dim, self.window)
+    }
+
     /// Export the full K/V history as flat f16 in `[n_kv_head, seq, head_dim]`
     /// row-major order (each head's rows are stored contiguously already).
     /// Used to rebuild an F-dtype tensor cache on demand (rare multi-token

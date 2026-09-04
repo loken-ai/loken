@@ -5,7 +5,7 @@
 
 #[cfg(feature = "cuda")]
 use crate::tensor::cuda_ext::CudaSlice;
-use crate::tensor::{Result, Tensor};
+use crate::tensor::{DType, Device, Result, Tensor};
 
 /// A pre-allocated, trimmable KV cache.
 ///
@@ -13,6 +13,66 @@ use crate::tensor::{Result, Tensor};
 /// Pre-allocates for max_seq_len and uses in-place writes (slice_set) for O(1) append.
 /// Trimming via `trim_to()` just updates the sequence length counter (O(1)).
 #[derive(Debug)]
+/// A sequence's K and V copied out of a `SpecKvCache`: a real copy, so the live
+/// buffers can move on.
+pub struct SpecKvSnapshot {
+    k: Tensor,
+    v: Tensor,
+    len: usize,
+}
+
+impl SpecKvSnapshot {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Tokens `[from, to)` as host f32 rows, token-major `[n, n_kv, head_dim]`, K then V.
+    pub fn host_rows(&self, from: usize, to: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let n = to - from;
+        let rows = |t: &Tensor| -> Result<Vec<f32>> {
+            let t = if t.dims().len() == 4 {
+                t.narrow(2, from, n)?.permute((0, 2, 1, 3))?
+            } else {
+                t.narrow(1, from, n)?
+            };
+            t.contiguous()?
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()
+        };
+        Ok((rows(&self.k)?, rows(&self.v)?))
+    }
+
+    /// A snapshot built from host rows, shaped and placed like `like`'s buffers.
+    pub fn from_host_rows(
+        like: &Tensor,
+        k: &[f32],
+        v: &[f32],
+        n: usize,
+        n_kv: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        let build = |rows: &[f32]| -> Result<Tensor> {
+            let t = Tensor::from_slice(rows, (1, n, n_kv, head_dim), &Device::Cpu)?;
+            let t = if like.dims().len() == 4 {
+                t.permute((0, 2, 1, 3))?.contiguous()?
+            } else {
+                t.reshape((1, n, n_kv * head_dim))?
+            };
+            t.to_dtype(like.dtype())?.to_device(&like.device())
+        };
+        Ok(Self {
+            k: build(k)?,
+            v: build(v)?,
+            len: n,
+        })
+    }
+}
+
 pub struct SpecKvCache {
     k: Option<Tensor>,      // Pre-allocated [1, n_kv_heads, max_seq_len, head_dim]
     v: Option<Tensor>,      // Pre-allocated [1, n_kv_heads, max_seq_len, head_dim]
@@ -217,6 +277,28 @@ impl SpecKvCache {
         }
         self.current_seq_len = len - discard;
         Ok(())
+    }
+
+    /// Copies the `[0, len)` entries out. `None` on an empty cache: the layer keeps its
+    /// KV in another store, and there is nothing to bring back.
+    pub fn snapshot(&self) -> Result<Option<SpecKvSnapshot>> {
+        let len = self.current_seq_len;
+        let (Some(k), Some(v)) = (self.k.as_ref(), self.v.as_ref()) else {
+            return Ok(None);
+        };
+        if len == 0 {
+            return Ok(None);
+        }
+        let dim = self.dim;
+        let k = k.narrow(dim, 0, len)?.contiguous()?.affine(1.0, 0.0)?;
+        let v = v.narrow(dim, 0, len)?.contiguous()?.affine(1.0, 0.0)?;
+        Ok(Some(SpecKvSnapshot { k, v, len }))
+    }
+
+    /// Makes a snapshot the whole content of the cache.
+    pub fn restore(&mut self, snap: &SpecKvSnapshot) -> Result<()> {
+        self.current_seq_len = 0;
+        self.append(&snap.k, &snap.v).map(|_| ())
     }
 
     /// Trim the KV cache to a specific sequence length.
