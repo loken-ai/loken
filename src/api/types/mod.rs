@@ -730,6 +730,7 @@ impl ImageContent {}
 
 /// Chat message (compatible with both Ollama and OpenAI)
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[serde(try_from = "MessageWire")]
 pub struct Message {
     #[validate(length(min = 1))]
     pub role: String,
@@ -740,7 +741,6 @@ pub struct Message {
     /// instead of 422'ing; the `min=1` length check was dropped for the
     /// same reason. Empty content is harmless downstream - the chat
     /// formatters just emit the role markers.
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub content: String,
     /// Images for vision models (base64-encoded strings, Ollama format).
     /// Per-message cap of 16 matches the handler-side guard (fbe25c5).
@@ -771,6 +771,98 @@ pub struct Message {
     /// messages (legacy OpenAI function-calling shape).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+/// A message as OpenAI clients send it: `content` is a string, null, or an array of
+/// parts (`text`, `image_url`). Parts are folded into `Message`: the texts joined, the
+/// images carried as base64. What is not carried is refused rather than dropped, so a
+/// client learns at once that a remote image or an audio part reached a server that
+/// does not take them.
+#[derive(Deserialize)]
+struct MessageWire {
+    role: String,
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    images: Option<Vec<String>>,
+    #[serde(default)]
+    audios: Option<Vec<String>>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Text and base64 images of a `content` value.
+fn fold_content_parts(v: Option<serde_json::Value>) -> Result<(String, Vec<String>), String> {
+    use serde_json::Value;
+    let parts = match v {
+        None | Some(Value::Null) => return Ok((String::new(), Vec::new())),
+        Some(Value::String(s)) => return Ok((s, Vec::new())),
+        Some(Value::Array(parts)) => parts,
+        Some(_) => return Err("`content` must be a string or an array of parts".to_string()),
+    };
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for part in parts {
+        let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "text" => {
+                let t = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or("a `text` part needs a `text` string")?;
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(t);
+            }
+            "image_url" => {
+                let url = match part.get("image_url") {
+                    Some(Value::String(u)) => u.as_str(),
+                    Some(Value::Object(o)) => o.get("url").and_then(Value::as_str).unwrap_or(""),
+                    _ => "",
+                };
+                let Some(b64) = data_url_base64(url) else {
+                    return Err(
+                        "`image_url` must be a data: URL carrying base64; remote images are not fetched"
+                            .to_string(),
+                    );
+                };
+                images.push(b64.to_string());
+            }
+            other => return Err(format!("unsupported content part type '{other}'")),
+        }
+    }
+    Ok((text, images))
+}
+
+/// The base64 payload of a `data:<type>;base64,<payload>` URL.
+pub(crate) fn data_url_base64(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    meta.ends_with(";base64").then_some(payload)
+}
+
+impl TryFrom<MessageWire> for Message {
+    type Error = String;
+    fn try_from(w: MessageWire) -> Result<Self, String> {
+        let (content, mut images) = fold_content_parts(w.content)?;
+        if let Some(more) = w.images {
+            images.extend(more);
+        }
+        Ok(Self {
+            role: w.role,
+            content,
+            images: (!images.is_empty()).then_some(images),
+            audios: w.audios,
+            tool_calls: w.tool_calls,
+            tool_call_id: w.tool_call_id,
+            name: w.name,
+        })
+    }
 }
 
 impl Message {

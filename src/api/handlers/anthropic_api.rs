@@ -148,6 +148,23 @@ pub(crate) async fn anthropic_messages(
             );
         }
     };
+    // The last user turn's images go to the vision encoder; none clears what an earlier
+    // request left there. After the gate: both take the model lock.
+    let images: Vec<String> = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.images.clone())
+        .unwrap_or_default();
+    if images.is_empty() {
+        engine.clear_images().await;
+    } else if let Err(e) = engine.set_images(&images).await {
+        return anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("images: {e}"),
+        );
+    }
 
     if !stream {
         let _g = gate_guard;

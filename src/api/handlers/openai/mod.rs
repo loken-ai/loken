@@ -374,6 +374,20 @@ pub(crate) async fn chat_completion(
         .await?;
         // Cap captured so the stream closure can report
         // finish_reason="length" once it produces the cap-th token.
+        // The last user turn's images go to the vision encoder; none clears what an
+        // earlier request left there. After the gate: both take the model lock.
+        let images: Vec<String> = request
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| m.images.clone())
+            .unwrap_or_default();
+        if images.is_empty() {
+            engine.clear_images().await;
+        } else if let Err(e) = engine.set_images(&images).await {
+            return Err(ApiError::Validation(format!("images: {e}")));
+        }
         let max_tokens_cap = request.max_tokens;
         // Estimate prompt token count once for the trailing usage chunk
         // (when stream_options.include_usage=true). Cheap heuristic  -
@@ -601,6 +615,20 @@ pub(crate) async fn chat_completion(
         )
         .await?;
         // Non-streaming response
+        // The last user turn's images go to the vision encoder; none clears what an
+        // earlier request left there. After the gate: both take the model lock.
+        let images: Vec<String> = request
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| m.images.clone())
+            .unwrap_or_default();
+        if images.is_empty() {
+            engine.clear_images().await;
+        } else if let Err(e) = engine.set_images(&images).await {
+            return Err(ApiError::Validation(format!("images: {e}")));
+        }
         let requested_max_tokens = params.max_tokens;
         // `mut` bindings with `None` defaults trigger an
         // "assigned-never-read" warning because the only path that

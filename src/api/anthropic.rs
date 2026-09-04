@@ -55,14 +55,14 @@ impl AnthropicSystem {
 }
 
 /// A message's `content`: a bare string or an array of typed blocks.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AnthropicMessageContent {
     Text(String),
     Blocks(Vec<Value>),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicMessage {
     pub role: String,
     pub content: AnthropicMessageContent,
