@@ -179,6 +179,46 @@ impl SpecKvCache {
         Some((k, v))
     }
 
+    /// Context shift: drops positions `[from - discard, from)` and pulls `[from, len)`
+    /// down by `discard`, passing the moved keys through `rotate` so their phase matches
+    /// the new positions. Refused on a windowed cache, where after a slide the buffer
+    /// index is no longer the position. An empty cache is left alone: the layer keeps
+    /// its KV in another store.
+    pub fn shift_tail(
+        &mut self,
+        from: usize,
+        discard: usize,
+        rotate: &mut dyn FnMut(&Tensor) -> Result<Tensor>,
+    ) -> Result<()> {
+        let len = self.current_seq_len;
+        if len == 0 {
+            return Ok(());
+        }
+        if self.window.is_some() {
+            return Err(crate::tensor::Error::msg(
+                "KvCache.shift_tail: windowed cache".to_string(),
+            ));
+        }
+        if discard == 0 || from > len || discard > from {
+            return Err(crate::tensor::Error::msg(format!(
+                "KvCache.shift_tail: from {from} discard {discard} len {len}"
+            )));
+        }
+        let n = len - from;
+        if n > 0 {
+            let dim = self.dim;
+            let kb = self.k.as_mut().unwrap();
+            let vb = self.v.as_mut().unwrap();
+            let k_tail = kb.narrow(dim, from, n)?.contiguous()?;
+            let v_tail = vb.narrow(dim, from, n)?.contiguous()?;
+            let k_tail = rotate(&k_tail)?;
+            kb.slice_set(&k_tail, dim, from - discard)?;
+            vb.slice_set(&v_tail, dim, from - discard)?;
+        }
+        self.current_seq_len = len - discard;
+        Ok(())
+    }
+
     /// Trim the KV cache to a specific sequence length.
     /// This is O(1): only updates current_seq_len counter.
     pub fn trim_to(&mut self, seq_len: usize) {

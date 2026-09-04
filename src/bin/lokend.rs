@@ -167,6 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             device_index: None,
                             draft_model: None,
                             draft_device_index: None,
+                            kv_shift_reuse: false,
                             max_gpu_memory_fraction: Some(0.9),
                             force_gpu_layers: None,
                             use_quantized_gpu: Some(false),

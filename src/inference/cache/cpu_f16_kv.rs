@@ -191,6 +191,51 @@ impl CpuF16Kv {
         self.window
     }
 
+    /// Context shift: drops positions `[from - discard, from)` and pulls `[from, len)`
+    /// down by `discard`, re-phasing the moved keys with `rot` (`None` on a NoPE layer).
+    /// An empty cache is left alone: the layer keeps its KV in another store.
+    pub fn shift_tail(
+        &mut self,
+        from: usize,
+        discard: usize,
+        rot: Option<&crate::inference::model::rope::RopeDelta>,
+    ) -> Result<()> {
+        if self.seq == 0 {
+            return Ok(());
+        }
+        if discard == 0 || from > self.seq || discard > from {
+            return Err(crate::tensor::Error::msg(format!(
+                "CpuF16Kv::shift_tail: from {from} discard {discard} len {}",
+                self.seq
+            )));
+        }
+        let hd = self.head_dim;
+        let n = self.seq - from;
+        let mut row = vec![0f32; hd];
+        for h in 0..self.n_kv_head {
+            for t in 0..n {
+                let src = (from + t) * hd;
+                let dst = (from - discard + t) * hd;
+                if let Some(rot) = rot {
+                    for (j, x) in self.k[h][src..src + hd].iter().enumerate() {
+                        row[j] = x.to_f32();
+                    }
+                    rot.apply(&mut row);
+                    for (j, x) in row.iter().enumerate() {
+                        self.k[h][dst + j] = f16::from_f32(*x);
+                    }
+                } else {
+                    self.k[h].copy_within(src..src + hd, dst);
+                }
+                self.v[h].copy_within(src..src + hd, dst);
+            }
+            self.k[h].truncate((self.seq - discard) * hd);
+            self.v[h].truncate((self.seq - discard) * hd);
+        }
+        self.seq -= discard;
+        Ok(())
+    }
+
     /// Roll the cache back to `new_len` tokens (speculative-decode reject).
     /// Each token stored `head_dim` f16 per kv-head (windowing is read-time, so
     /// storage holds every token). Without this, multi-token verify appends

@@ -66,70 +66,34 @@ impl GenericTransformerLayer {
         }
     }
 
+    /// This layer's rotary tables, for a rotation done outside the forward pass.
+    pub(crate) fn rope_table(&self) -> crate::inference::model::rope::RopeTable {
+        crate::inference::model::rope::RopeTable {
+            cos: self.cos.clone(),
+            sin: self.sin.clone(),
+            freq_factors: self.rope_freq_factors.clone(),
+            factored_freqs: self.rope_factored_freqs.clone(),
+            head_dim: self.head_dim,
+            rope_dim: self.rope_dim,
+            no_rope: self.no_rope,
+            interleaved: self.flags.use_rope_i,
+        }
+    }
+
     #[inline]
     pub(super) fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         if self.no_rope {
             return Ok(x.clone());
         } // SmolLM3 NoPE layer
         let (_b, _h, seq_len, _d) = x.dims4()?;
-        let mut cos = self.cos.narrow(0, index_pos, seq_len)?;
-        let mut sin = self.sin.narrow(0, index_pos, seq_len)?;
-
-        // Multi-GPU safety: transfer cos/sin to x's device if mismatched
-        if !cos.device().same_device(&x.device()) {
+        if !self.cos.device().same_device(&x.device()) {
             tracing::warn!(
                 "RoPE runtime device mismatch: x on {:?}, cos on {:?} - transferring",
                 x.device(),
-                cos.device()
+                self.cos.device()
             );
-            cos = cos.to_device(&x.device())?;
-            sin = sin.to_device(&x.device())?;
         }
-
-        // Gemma4 global layers: apply per-dimension frequency factors (proportional RoPE)
-        // freq_factors divide theta, which effectively scales cos/sin for each dim pair.
-        // cos_new[i] = cos(pos * theta_i / factor_i), sin_new[i] = sin(pos * theta_i / factor_i)
-        // We recompute cos/sin with the factored frequencies.
-        if let Some(stored_freqs) = self.rope_factored_freqs.as_ref() {
-            // Stored `(freqs / factors)` shape [1, d/2]. Skip the per-token
-            // Tensor::new + recip + broadcast_mul. Just apply position.
-            let stored_freqs = if stored_freqs.device().same_device(&cos.device()) {
-                stored_freqs.clone()
-            } else {
-                stored_freqs.to_device(&cos.device())?
-            };
-            let pos_f32 = Tensor::arange(index_pos as f32, (index_pos + seq_len) as f32)?
-                .to_device(&cos.device())?
-                .unsqueeze(1)?; // [seq, 1]
-            let angles = pos_f32.broadcast_mul(&stored_freqs)?; // [seq, d/2]
-            cos = angles.cos()?;
-            sin = angles.sin()?;
-        } else if let Some(ref factors) = self.rope_freq_factors {
-            // Fallback path (factors length didn't match d/2): full per-token recompute.
-            let factors = factors.to_device(&cos.device())?;
-            let inv_factors = factors.recip()?.unsqueeze(0)?;
-            let base = if self.rope_dim > 0 {
-                10000.0f32
-            } else {
-                1000000.0f32
-            };
-            let freqs: Vec<f32> =
-                crate::inference::model::rope::inverse_frequencies(self.head_dim, base);
-            let freqs = Tensor::new(freqs, &cos.device())?.unsqueeze(0)?;
-            let freqs = freqs.broadcast_mul(&inv_factors)?;
-            let pos_f32 = Tensor::arange(index_pos as f32, (index_pos + seq_len) as f32)?
-                .to_device(&cos.device())?
-                .unsqueeze(1)?;
-            let angles = pos_f32.broadcast_mul(&freqs)?;
-            cos = angles.cos()?;
-            sin = angles.sin()?;
-        }
-
-        // NOTE: no `x.contiguous()` - narrow views flow zero-copy into the
-        // fused rope launcher (offset-aware via `Layout::start_offset`); the
-        // CPU path materializes through the accessor at the same cost as the
-        // old copy.
-        // Select RoPE variant: interleaved (Llama/Mistral) vs non-interleaved (all others)
+        let (cos, sin) = self.rope_table().rows(index_pos, seq_len, &x.device())?;
         let apply_rope = if self.flags.use_rope_i {
             crate::tensor::ops::rope_i
         } else {

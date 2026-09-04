@@ -77,6 +77,8 @@ pub struct InferenceConfigToml {
     pub device_index: Option<usize>,
     pub draft_model: Option<String>,
     pub draft_device_index: Option<usize>,
+    #[serde(default)]
+    pub kv_shift_reuse: bool,
     pub max_gpu_memory_fraction: Option<f64>,
 
     // Performance settings
@@ -257,6 +259,7 @@ impl Config {
             device_index: toml_config.device_index,
             draft_model: toml_config.draft_model.clone(),
             draft_device_index: toml_config.draft_device_index,
+            kv_shift_reuse: toml_config.kv_shift_reuse,
             max_gpu_memory_fraction: toml_config.max_gpu_memory_fraction.unwrap_or(0.9),
 
             // Performance settings
@@ -359,6 +362,7 @@ impl Config {
                 device_index: None,
                 draft_model: None,
                 draft_device_index: None,
+                kv_shift_reuse: false,
                 max_gpu_memory_fraction: None,
                 force_gpu_layers: None,
                 use_quantized_gpu: None,

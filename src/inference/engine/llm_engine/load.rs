@@ -680,8 +680,9 @@ pub(crate) fn kv_reuse_start(
     model_name: &str,
     prompt_tokens: &[u32],
     disabled: bool,
+    shift: bool,
 ) -> usize {
-    let reuse = if disabled || !model.supports_trim_kv() {
+    let mut reuse = if disabled || !model.supports_trim_kv() {
         None
     } else {
         let g = sessions.blocking_lock();
@@ -698,19 +699,98 @@ pub(crate) fn kv_reuse_start(
     // reassociated arithmetic flips greedy argmax wherever the top two candidates are
     // close. Rounding down makes the warm tail exactly cold's tail chunks - a fixed
     // remainder was measured insufficient, since any shape difference reassociates.
-    let keep = reuse
-        .map(|common| {
-            chunk_aligned_keep(
-                common,
-                prompt_tokens.len(),
-                crate::inference::engine::model_backend::adaptive_prefill_chunk(model.widest_ffn()),
-            )
-        })
-        .unwrap_or(0);
+    let chunk = crate::inference::engine::model_backend::adaptive_prefill_chunk(model.widest_ffn());
+    // A prompt clamped to the window keeps its first token and its tail; once a
+    // conversation outgrows the window the common prefix with the resident sequence
+    // is that first token alone, and every turn re-prefills the whole window. The tail
+    // is still resident, at positions `discard` further on: shift it down and prefill
+    // only what is new. The shifted keys are re-phased, not recomputed, so the result
+    // is not the cold run's bit for bit; the option says the caller accepts that, and
+    // with it the chunk grid below: a shifted tail is kept whole, since rounding it to
+    // a grid that can exceed the window would keep nothing.
+    let mut shifted: Option<usize> = None;
+    if shift && model.supports_shift_kv() && reuse.is_some_and(|c| c < chunk) {
+        let mut g = sessions.blocking_lock();
+        if let Some(s) = g.get_mut(GLOBAL_PROMPT_CACHE_KEY) {
+            if let Some((discard, reused)) = shift_reuse_plan(
+                &s.tokens,
+                prompt_tokens,
+                s.kv_len,
+                SHIFT_KEEP,
+                SHIFT_PROBE,
+                SHIFT_PROBE,
+            ) {
+                match model.shift_kv_tail(SHIFT_KEEP + discard, discard) {
+                    Ok(()) => {
+                        s.tokens.drain(SHIFT_KEEP..SHIFT_KEEP + discard);
+                        s.kv_len = s.kv_len.saturating_sub(discard);
+                        tracing::info!(
+                            "context shift: dropped {discard} tokens after the first {SHIFT_KEEP}, {reused} reused"
+                        );
+                        shifted = Some(SHIFT_KEEP + reused);
+                    }
+                    Err(e) => {
+                        tracing::warn!("context shift refused: {e}; cold prefill");
+                        model.trim_kv(0);
+                        s.tokens.clear();
+                        s.kv_len = 0;
+                        reuse = None;
+                    }
+                }
+            }
+        }
+    }
+    let keep = match shifted {
+        Some(kept) => kept.min(prompt_tokens.len().saturating_sub(1)),
+        None => reuse
+            .map(|common| chunk_aligned_keep(common, prompt_tokens.len(), chunk))
+            .unwrap_or(0),
+    };
     if model.supports_trim_kv() {
         model.trim_kv(keep);
     }
     keep
+}
+
+/// Head a clamped prompt keeps, the same one `clamp_prompt_to_window` keeps.
+const SHIFT_KEEP: usize = 1;
+/// Tokens compared to locate the prompt's tail in the resident sequence before the
+/// match is extended; long enough that chat text does not repeat it by chance.
+const SHIFT_PROBE: usize = 64;
+
+/// Where a clamped prompt's tail sits in the resident sequence: `(discard, reused)` such
+/// that `cached[n_keep + discard..][..reused] == prompt[n_keep..][..reused]`, found by
+/// matching a `probe`-token window then extending it. `None` when the heads differ, the
+/// window occurs nowhere after the head, or the match is shorter than `min_reuse`.
+pub(crate) fn shift_reuse_plan(
+    cached: &[u32],
+    prompt: &[u32],
+    kv_len: usize,
+    n_keep: usize,
+    probe: usize,
+    min_reuse: usize,
+) -> Option<(usize, usize)> {
+    let cached = &cached[..kv_len.min(cached.len())];
+    if cached.len() <= n_keep || prompt.len() <= n_keep || cached[..n_keep] != prompt[..n_keep] {
+        return None;
+    }
+    let head = &prompt[n_keep..];
+    let body = &cached[n_keep..];
+    let probe = probe.min(head.len());
+    if probe == 0 || body.len() < probe + 1 {
+        return None;
+    }
+    for discard in 1..=body.len() - probe {
+        if body[discard..discard + probe] == head[..probe] {
+            let reused = body[discard..]
+                .iter()
+                .zip(head)
+                .take_while(|(a, b)| a == b)
+                .count();
+            return (reused >= min_reuse).then_some((discard, reused));
+        }
+    }
+    None
 }
 
 /// The largest reusable prefix that sits on a cold-run chunk boundary, always leaving at
@@ -731,6 +811,54 @@ pub(crate) fn reusable_prefix(cached: &[u32], prompt: &[u32], kv_len: usize) -> 
 
 #[cfg(test)]
 mod prompt_cache_reuse_tests {
+    use super::shift_reuse_plan;
+
+    #[test]
+    fn shift_plan_finds_the_tail_of_a_grown_conversation() {
+        // Resident: BOS then 1..=100. The next turn was clamped to BOS + the last 60
+        // of the old window + 10 new tokens: 40 tokens fell out after the head.
+        let cached: Vec<u32> = std::iter::once(0).chain(1..=100).collect();
+        let prompt: Vec<u32> = std::iter::once(0).chain(41..=110).collect();
+        assert_eq!(
+            shift_reuse_plan(&cached, &prompt, cached.len(), 1, 8, 16),
+            Some((40, 60))
+        );
+    }
+
+    #[test]
+    fn shift_plan_refuses_a_different_head_or_an_absent_tail() {
+        let cached: Vec<u32> = std::iter::once(0).chain(1..=100).collect();
+        let other_head: Vec<u32> = std::iter::once(7).chain(41..=110).collect();
+        assert_eq!(
+            shift_reuse_plan(&cached, &other_head, cached.len(), 1, 8, 16),
+            None
+        );
+        let elsewhere: Vec<u32> = std::iter::once(0).chain(500..=560).collect();
+        assert_eq!(
+            shift_reuse_plan(&cached, &elsewhere, cached.len(), 1, 8, 16),
+            None
+        );
+    }
+
+    #[test]
+    fn shift_plan_wants_a_match_worth_a_chunk_and_honours_kv_len() {
+        let cached: Vec<u32> = std::iter::once(0).chain(1..=100).collect();
+        let short: Vec<u32> = std::iter::once(0)
+            .chain(91..=100)
+            .chain(200..=230)
+            .collect();
+        assert_eq!(
+            shift_reuse_plan(&cached, &short, cached.len(), 1, 8, 16),
+            None
+        );
+        // Only 50 tokens are in the KV: the match cannot extend past them.
+        let prompt: Vec<u32> = std::iter::once(0).chain(21..=110).collect();
+        assert_eq!(
+            shift_reuse_plan(&cached, &prompt, 51, 1, 8, 16),
+            Some((20, 30))
+        );
+    }
+
     use super::{chunk_aligned_keep, reusable_prefix};
 
     /// Reuse snaps DOWN to the chunk grid of a cold prefill: the warm tail must be the

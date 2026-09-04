@@ -182,6 +182,7 @@ impl LlmEngine {
         }
         let model_state = self.model_state.clone();
         let config = self.config.clone();
+        let kv_shift_reuse = config.kv_shift_reuse;
         let prompt = prompt.to_string();
         // Spec-decode: load the drafter, when one is configured, before the
         // blocking decode; capture a cheap Arc-clone engine for use inside. Output
@@ -296,7 +297,14 @@ impl LlmEngine {
                     || state.qwen35_image.is_some();
                 let disabled = is_vision_req
                     || false;
-                kv_reuse_start(state.model.as_mut(), &sessions, &state.name, &prompt_tokens, disabled)
+                kv_reuse_start(
+                    state.model.as_mut(),
+                    &sessions,
+                    &state.name,
+                    &prompt_tokens,
+                    disabled,
+                    kv_shift_reuse,
+                )
             };
 
             // MAKE THE CACHE ENTRY HONEST NOW, NOT WHEN THE REQUEST FINISHES.

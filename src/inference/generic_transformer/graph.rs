@@ -1454,6 +1454,47 @@ impl GenericHeteroTransformer {
         Ok(self.graph_logits_buffer.as_ref().unwrap().clone())
     }
 
+    /// Context shift: drops positions `[from - discard, from)` of every layer's cache and
+    /// pulls the tail down by `discard`, re-phasing the stored keys for their new
+    /// positions. Refused before touching anything on a layer whose cache cannot move in
+    /// place: a Q4 cache (a block groups 32 positions of one channel) or a sliding
+    /// window (after a slide the buffer index is no longer the position). An `Err` from
+    /// a cache leaves the layers in no common state; the caller resets.
+    pub fn shift_kv_tail(&mut self, from: usize, discard: usize) -> crate::tensor::Result<()> {
+        for layer in &self.layers {
+            if layer.sliding_window.is_some() {
+                return Err(crate::tensor::Error::msg(
+                    "context shift: sliding-window layer".to_string(),
+                ));
+            }
+            #[cfg(feature = "cuda")]
+            if layer.q4_kv_cache.is_some() {
+                return Err(crate::tensor::Error::msg(
+                    "context shift: Q4 KV cache".to_string(),
+                ));
+            }
+        }
+        let delta = -(discard as i64);
+        for layer in &mut self.layers {
+            let table = layer.rope_table();
+            let host = table.delta_host(delta)?;
+            let mut rotate = |k: &crate::tensor::Tensor| table.rotate_keys_by(k, delta);
+            layer.kv_cache.shift_tail(from, discard, &mut rotate)?;
+            #[cfg(feature = "cuda")]
+            if let Some(c) = layer.q8_kv_cache.as_mut() {
+                c.shift_tail(from, discard, &mut rotate)
+                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+            }
+            if let Some(c) = layer.cpu_q8_kv.as_mut() {
+                c.shift_tail(from, discard, host.as_ref())?;
+            }
+            if let Some(c) = layer.cpu_f16_kv.as_mut() {
+                c.shift_tail(from, discard, host.as_ref())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Trim every layer's KV cache to `new_len` valid positions.
     ///
     /// Used by speculative decoding to rewind after partial acceptance: the

@@ -147,6 +147,7 @@ impl LlmEngine {
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
         let config = self.config.clone();
+        let kv_shift_reuse = config.kv_shift_reuse;
         let prompt = prompt.to_string();
         // Buffer-size 4096 (vs prior 64): with the prior buffer, after
         // 64 chunks the engine's `blocking_send` blocks waiting for the
@@ -410,6 +411,7 @@ impl LlmEngine {
                         &state.name,
                         &prompt_tokens,
                         false,
+                        kv_shift_reuse,
                     )
                 } else {
                     let sess_guard = sessions.blocking_lock();

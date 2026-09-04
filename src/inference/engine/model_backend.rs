@@ -324,6 +324,18 @@ pub(crate) trait ModelBackend: Send {
         false
     }
 
+    /// Context shift: drop positions `[from - discard, from)` and pull the tail down by
+    /// `discard`, keys re-phased (`GenericHeteroTransformer::shift_kv_tail`). On `Err`
+    /// the caches are in no defined state and the caller must `trim_kv(0)`.
+    fn shift_kv_tail(&mut self, _from: usize, _discard: usize) -> crate::tensor::Result<()> {
+        Err(crate::tensor::Error::msg(
+            "context shift: unsupported backend".to_string(),
+        ))
+    }
+    fn supports_shift_kv(&self) -> bool {
+        false
+    }
+
     /// Tokens the KV cache actually holds, when the backend can say.
     ///
     /// A caller that needs a POSITION must ask here rather than track one
@@ -859,6 +871,13 @@ impl ModelBackend for GenericBackend {
         self.0.kv_len()
     }
 
+    fn shift_kv_tail(&mut self, from: usize, discard: usize) -> crate::tensor::Result<()> {
+        self.0.shift_kv_tail(from, discard)
+    }
+    fn supports_shift_kv(&self) -> bool {
+        true
+    }
+
     fn supports_trim_kv(&self) -> bool {
         // Routed mixtures were excluded because the top-k choice follows the GEMM
         // shape, and a warm re-prefill used shapes a cold run never had - measured
@@ -1032,6 +1051,13 @@ impl ModelBackend for GenericVisionBackend {
 
     fn reset_kv_from(&mut self, keep: usize) {
         self.text.trim_kv(keep)
+    }
+
+    fn shift_kv_tail(&mut self, from: usize, discard: usize) -> crate::tensor::Result<()> {
+        self.text.shift_kv_tail(from, discard)
+    }
+    fn supports_shift_kv(&self) -> bool {
+        true
     }
 
     fn supports_trim_kv(&self) -> bool {

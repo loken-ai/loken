@@ -13,7 +13,9 @@
 //! reads them directly; no transpose (we use a PV reduction instead of a
 //! second `mul_mat`, which would need V stored transposed - strided to append).
 
-use crate::tensor::quant_cpu::{cast_blocks, from_float_bytes, matmul_bytes, BlockQ8_0};
+use crate::tensor::quant_cpu::{
+    cast_blocks, from_float_bytes, matmul_bytes, to_float_bytes, BlockQ8_0,
+};
 use crate::tensor::quantized::GgmlDType;
 use crate::tensor::Result;
 use rayon::prelude::*;
@@ -100,6 +102,48 @@ impl CpuQ8Kv {
     }
     pub fn is_empty(&self) -> bool {
         self.seq == 0
+    }
+
+    /// Context shift: drops positions `[from - discard, from)` and pulls `[from, len)`
+    /// down by `discard`, re-phasing the moved keys with `rot` (`None` on a NoPE layer)
+    /// through one dequantise/requantise per moved token. An empty cache is left alone.
+    pub fn shift_tail(
+        &mut self,
+        from: usize,
+        discard: usize,
+        rot: Option<&crate::inference::model::rope::RopeDelta>,
+    ) -> Result<()> {
+        if self.seq == 0 {
+            return Ok(());
+        }
+        if discard == 0 || from > self.seq || discard > from {
+            return Err(crate::tensor::Error::msg(format!(
+                "CpuQ8Kv::shift_tail: from {from} discard {discard} len {}",
+                self.seq
+            )));
+        }
+        let per_tok = self.nb * (2 + QK);
+        let n = self.seq - from;
+        let mut row = vec![0f32; self.head_dim];
+        for h in 0..self.n_kv_head {
+            for t in 0..n {
+                let src = (from + t) * per_tok;
+                let dst = (from - discard + t) * per_tok;
+                if let Some(rot) = rot {
+                    to_float_bytes(GgmlDType::Q8_0, &self.k[h][src..src + per_tok], &mut row)?;
+                    rot.apply(&mut row);
+                    let bytes = from_float_bytes(GgmlDType::Q8_0, &row)?;
+                    self.k[h][dst..dst + per_tok].copy_from_slice(&bytes);
+                } else {
+                    self.k[h].copy_within(src..src + per_tok, dst);
+                }
+                self.v[h].copy_within(src..src + per_tok, dst);
+            }
+            self.k[h].truncate((self.seq - discard) * per_tok);
+            self.v[h].truncate((self.seq - discard) * per_tok);
+        }
+        self.seq -= discard;
+        Ok(())
     }
 
     /// Roll the cache back to `new_len` tokens (speculative-decode reject of

@@ -402,6 +402,41 @@ impl Q8KvCache {
 
     // (see earlier `reset()` definition - also clears cur_pos_dev for graph mode)
 
+    /// Context shift: drops positions `[from - discard, from)` and pulls `[from, len)`
+    /// down by `discard`, re-phasing the moved keys with `rotate`. Goes through a full
+    /// dequantisation and one requantisation of the tail; an empty cache is left alone.
+    pub fn shift_tail(
+        &mut self,
+        from: usize,
+        discard: usize,
+        rotate: &mut dyn FnMut(&Tensor) -> crate::tensor::Result<Tensor>,
+    ) -> Result<()> {
+        let len = self.current_seq_len;
+        if len == 0 {
+            return Ok(());
+        }
+        if discard == 0 || from > len || discard > from {
+            return Err(anyhow!(
+                "Q8KvCache::shift_tail: from {from} discard {discard} len {len}"
+            ));
+        }
+        let n = len - from;
+        if n == 0 {
+            self.trim_to(len - discard);
+            return Ok(());
+        }
+        let (k, v) = self.dequantize_kv(DType::F32)?;
+        let k_tail = k.narrow(2, from, n)?.contiguous()?;
+        let v_tail = v.narrow(2, from, n)?.contiguous()?;
+        let k_tail = rotate(&k_tail).map_err(|e| anyhow!("Q8KvCache::shift_tail: {e}"))?;
+        if from == discard {
+            self.reset();
+        } else {
+            self.trim_to(from - discard);
+        }
+        self.append(&k_tail, &v_tail)
+    }
+
     /// Shorten the cache to `new_len` tokens, keeping every piece of state that
     /// describes its length in agreement.
     ///

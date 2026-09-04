@@ -179,6 +179,10 @@ pub struct InferenceConfig {
     pub draft_model: Option<String>,
     /// Card the drafter loads on. Defaults to 0; it is placed whole on that one card.
     pub draft_device_index: Option<usize>,
+    /// Reuse the resident KV across a context shift once a conversation outgrows the
+    /// window (`kv_reuse_start`). Off by default: the shifted keys are re-phased, not
+    /// recomputed, so a warm run is no longer the cold run bit for bit.
+    pub kv_shift_reuse: bool,
     /// Max GPU memory fraction (0.0-1.0)
     pub max_gpu_memory_fraction: f64,
     /// Force GPU layers count
@@ -262,6 +266,7 @@ impl Default for InferenceConfig {
             device_index: None,
             draft_model: None,
             draft_device_index: None,
+            kv_shift_reuse: false,
             max_gpu_memory_fraction: 0.9,
             force_gpu_layers: None,
             use_quantized_gpu: true,

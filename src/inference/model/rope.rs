@@ -149,3 +149,171 @@ pub fn precomput_freqs_cis_yarn(
     let angles = positions.matmul(&frequencies)?;
     Ok((angles.cos()?, angles.sin()?))
 }
+
+/// One rotary phase per rotary pair, on the host: what carries a stored key from
+/// position `p` to `p + delta`.
+pub struct RopeDelta {
+    pub cos: Vec<f32>,
+    pub sin: Vec<f32>,
+    pub interleaved: bool,
+}
+
+impl RopeDelta {
+    /// Rotates the rotary channels of one key row in place; channels past
+    /// `2 * cos.len()` are not rotary and stay as they are.
+    pub fn apply(&self, row: &mut [f32]) {
+        let half = self.cos.len();
+        for j in 0..half {
+            let (a, b) = if self.interleaved {
+                (2 * j, 2 * j + 1)
+            } else {
+                (j, j + half)
+            };
+            let (x, y) = (row[a], row[b]);
+            let (c, s) = (self.cos[j], self.sin[j]);
+            row[a] = x * c - y * s;
+            row[b] = x * s + y * c;
+        }
+    }
+}
+
+/// A layer's rotary tables with the parameters that select rows in them: the one
+/// place that knows how a position becomes a phase for that layer.
+pub struct RopeTable {
+    pub cos: crate::tensor::Tensor,
+    pub sin: crate::tensor::Tensor,
+    pub freq_factors: Option<crate::tensor::Tensor>,
+    pub factored_freqs: Option<crate::tensor::Tensor>,
+    pub head_dim: usize,
+    pub rope_dim: usize,
+    pub no_rope: bool,
+    pub interleaved: bool,
+}
+
+impl RopeTable {
+    /// cos/sin rows for positions `[index_pos, index_pos + seq_len)`, each
+    /// `[seq_len, d/2]` on `device`.
+    pub fn rows(
+        &self,
+        index_pos: usize,
+        seq_len: usize,
+        device: &crate::tensor::Device,
+    ) -> crate::tensor::Result<(crate::tensor::Tensor, crate::tensor::Tensor)> {
+        use crate::tensor::Tensor;
+        let mut cos = self.cos.narrow(0, index_pos, seq_len)?;
+        let mut sin = self.sin.narrow(0, index_pos, seq_len)?;
+        if !cos.device().same_device(device) {
+            cos = cos.to_device(device)?;
+            sin = sin.to_device(device)?;
+        }
+        if let Some(stored) = self.factored_freqs.as_ref() {
+            let stored = if stored.device().same_device(device) {
+                stored.clone()
+            } else {
+                stored.to_device(device)?
+            };
+            let pos = Tensor::arange(index_pos as f32, (index_pos + seq_len) as f32)?
+                .to_device(device)?
+                .unsqueeze(1)?; // [seq, 1]
+            let angles = pos.broadcast_mul(&stored)?; // [seq, d/2]
+            cos = angles.cos()?;
+            sin = angles.sin()?;
+        } else if let Some(factors) = self.freq_factors.as_ref() {
+            let factors = factors.to_device(device)?;
+            let inv_factors = factors.recip()?.unsqueeze(0)?;
+            let base = if self.rope_dim > 0 {
+                10000.0f32
+            } else {
+                1000000.0f32
+            };
+            let freqs: Vec<f32> = inverse_frequencies(self.head_dim, base);
+            let freqs = Tensor::new(freqs, device)?.unsqueeze(0)?;
+            let freqs = freqs.broadcast_mul(&inv_factors)?;
+            let pos = Tensor::arange(index_pos as f32, (index_pos + seq_len) as f32)?
+                .to_device(device)?
+                .unsqueeze(1)?;
+            let angles = pos.broadcast_mul(&freqs)?;
+            cos = angles.cos()?;
+            sin = angles.sin()?;
+        }
+        Ok((cos, sin))
+    }
+
+    /// The phase that carries a stored key from `p` to `p + delta`: one row `[1, d/2]`
+    /// of cos and sin in F32. Row `|delta|` of the table divided by row 0, because a
+    /// scaled table stores `m * cos` and the stored key already carries `m`; the sign
+    /// of `delta` lives in sin. `None` on a NoPE layer.
+    pub fn delta_rows(
+        &self,
+        delta: i64,
+        device: &crate::tensor::Device,
+    ) -> crate::tensor::Result<Option<(crate::tensor::Tensor, crate::tensor::Tensor)>> {
+        use crate::tensor::DType;
+        if self.no_rope {
+            return Ok(None);
+        }
+        let mag = delta.unsigned_abs() as usize;
+        let (cos, sin) = self.rows(mag, 1, device)?;
+        let (scale, _) = self.rows(0, 1, device)?;
+        let scale = scale.to_dtype(DType::F32)?;
+        let cos = cos.to_dtype(DType::F32)?.broadcast_div(&scale)?;
+        let mut sin = sin.to_dtype(DType::F32)?.broadcast_div(&scale)?;
+        if delta < 0 {
+            sin = sin.neg()?;
+        }
+        Ok(Some((cos, sin)))
+    }
+
+    /// Rotates stored keys `k` (`[1, n_kv, n, head_dim]`, any float dtype) by the phase
+    /// of `delta` positions; the non-rotary channels and a NoPE layer pass through.
+    pub fn rotate_keys_by(
+        &self,
+        k: &crate::tensor::Tensor,
+        delta: i64,
+    ) -> crate::tensor::Result<crate::tensor::Tensor> {
+        use crate::tensor::{DType, Tensor, D};
+        let Some((cos, sin)) = self.delta_rows(delta, &k.device())? else {
+            return Ok(k.clone());
+        };
+        let (_b, _h, n, d) = k.dims4()?;
+        let half = cos.dim(1)?;
+        let cos = cos.expand((n, half))?.contiguous()?;
+        let sin = sin.expand((n, half))?.contiguous()?;
+        let dtype = k.dtype();
+        let x = if dtype == DType::F32 {
+            k.clone()
+        } else {
+            k.to_dtype(DType::F32)?
+        };
+        let apply = if self.interleaved {
+            crate::tensor::ops::rope_i
+        } else {
+            crate::tensor::ops::rope
+        };
+        let rot = 2 * half;
+        let out = if rot < d {
+            let x_rot = x.narrow(D::Minus1, 0, rot)?.contiguous()?;
+            let x_pass = x.narrow(D::Minus1, rot, d - rot)?;
+            Tensor::cat(&[&apply(&x_rot, &cos, &sin)?, &x_pass], D::Minus1)?.contiguous()?
+        } else {
+            apply(&x, &cos, &sin)?
+        };
+        if dtype == DType::F32 {
+            Ok(out)
+        } else {
+            out.to_dtype(dtype)
+        }
+    }
+
+    /// The same phase on the host, for the CPU caches.
+    pub fn delta_host(&self, delta: i64) -> crate::tensor::Result<Option<RopeDelta>> {
+        let Some((cos, sin)) = self.delta_rows(delta, &crate::tensor::Device::Cpu)? else {
+            return Ok(None);
+        };
+        Ok(Some(RopeDelta {
+            cos: cos.flatten_all()?.to_vec1_f32()?,
+            sin: sin.flatten_all()?.to_vec1_f32()?,
+            interleaved: self.interleaved,
+        }))
+    }
+}
