@@ -40,6 +40,12 @@ pub enum ToolFormat {
     /// Bare JSON `{"name":..,"parameters":{..}}`, optionally prefixed by
     /// `<|python_tag|>` - Llama 3.1 / 3.2.
     Llama3,
+    /// `<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>{..}<|call|>`
+    /// - gpt-oss, the harmony format.
+    Harmony,
+    /// `<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME` then a
+    /// ```json block, closed by `<｜tool▁call▁end｜><｜tool▁calls▁end｜>` - DeepSeek V3 / R1.
+    DeepSeek,
 }
 
 impl ToolFormat {
@@ -57,6 +63,8 @@ impl ToolFormat {
             // streaming trigger and rely on the end-of-stream parse to
             // catch tag-less JSON.
             ToolFormat::Llama3 => &["<|python_tag|>"],
+            ToolFormat::Harmony => &["<|channel|>commentary"],
+            ToolFormat::DeepSeek => &[DS_CALLS_BEGIN],
         }
     }
 }
@@ -79,6 +87,12 @@ pub fn should_inject_tools(tools: Option<&Vec<Tool>>, tool_choice: Option<&Value
 /// model name. Mirrors the family detection in `format_chat_prompt`.
 pub fn detect_tool_format(template: Option<&str>, model_name: &str) -> ToolFormat {
     if let Some(t) = template {
+        if t.contains("<|channel|>") {
+            return ToolFormat::Harmony;
+        }
+        if t.contains(DS_CALLS_BEGIN) || t.contains("<｜tool▁call▁begin｜>") {
+            return ToolFormat::DeepSeek;
+        }
         if t.contains("[TOOL_CALLS]") || t.contains("[AVAILABLE_TOOLS]") {
             return ToolFormat::Mistral;
         }
@@ -97,7 +111,11 @@ pub fn detect_tool_format(template: Option<&str>, model_name: &str) -> ToolForma
         }
     }
     let m = model_name.to_ascii_lowercase();
-    if m.contains("mistral")
+    if m.contains("gpt-oss") {
+        ToolFormat::Harmony
+    } else if m.contains("deepseek") {
+        ToolFormat::DeepSeek
+    } else if m.contains("mistral")
         || m.contains("mixtral")
         || m.contains("devstral")
         || m.contains("codestral")
@@ -208,6 +226,23 @@ function, respond with a JSON object of the form {{\"name\": <function-name>, \
 object per function call. Available functions:\n{tools}",
             tools = tools_as_json_lines(tools)
         ),
+        ToolFormat::Harmony => format!(
+            "# Tools\n\n## functions\n\nnamespace functions {{\n{tools}\n}}\n\nTo call a \
+function, write on the commentary channel: <|channel|>commentary \
+to=functions.<function-name> <|constrain|>json<|message|><args-json-object><|call|>",
+            tools = tools_as_json_lines(tools)
+        ),
+        ToolFormat::DeepSeek => format!(
+            "You have access to the following functions:\n{tools}\n\nTo call one or more \
+functions, write exactly: {begin_all}{begin}function{sep}<function-name>\n```json\n\
+<args-json-object>\n```{end}{end_all}",
+            tools = tools_as_json_lines(tools),
+            begin_all = DS_CALLS_BEGIN,
+            begin = DS_CALL_BEGIN,
+            sep = DS_SEP,
+            end = DS_CALL_END,
+            end_all = DS_CALLS_END,
+        ),
     }
 }
 
@@ -241,6 +276,16 @@ fn render_assistant_tool_calls(format: ToolFormat, calls: &[ToolCall]) -> String
                     "{{\"name\": \"{name}\", \"parameters\": {args}}}\n"
                 ));
             }
+            ToolFormat::Harmony => {
+                out.push_str(&format!(
+                    "<|channel|>commentary to=functions.{name} <|constrain|>json<|message|>{args}<|call|>\n"
+                ));
+            }
+            ToolFormat::DeepSeek => {
+                out.push_str(&format!(
+                    "{DS_CALLS_BEGIN}{DS_CALL_BEGIN}function{DS_SEP}{name}\n```json\n{args}\n```{DS_CALL_END}{DS_CALLS_END}\n"
+                ));
+            }
         }
     }
     out
@@ -253,6 +298,10 @@ fn render_tool_result(format: ToolFormat, content: &str) -> String {
         ToolFormat::Hermes => format!("<tool_response>\n{content}\n</tool_response>"),
         ToolFormat::Mistral => format!("[TOOL_RESULTS] {content} [/TOOL_RESULTS]"),
         ToolFormat::Llama3 => content.to_string(),
+        ToolFormat::Harmony => {
+            format!("<|start|>functions to=assistant<|channel|>commentary<|message|>{content}<|end|>")
+        }
+        ToolFormat::DeepSeek => format!("<｜tool▁output▁begin｜>{content}<｜tool▁output▁end｜>"),
     }
 }
 
@@ -375,6 +424,106 @@ pub fn parse_tool_calls(format: ToolFormat, raw: &str) -> ToolParseResult {
         ToolFormat::Hermes => parse_hermes(raw),
         ToolFormat::Mistral => parse_mistral(raw),
         ToolFormat::Llama3 => parse_llama3(raw),
+        ToolFormat::Harmony => parse_harmony(raw),
+        ToolFormat::DeepSeek => parse_deepseek(raw),
+    }
+}
+
+const DS_CALLS_BEGIN: &str = "<｜tool▁calls▁begin｜>";
+const DS_CALLS_END: &str = "<｜tool▁calls▁end｜>";
+const DS_CALL_BEGIN: &str = "<｜tool▁call▁begin｜>";
+const DS_CALL_END: &str = "<｜tool▁call▁end｜>";
+const DS_SEP: &str = "<｜tool▁sep｜>";
+
+/// The arguments of a call as JSON, whether the model wrote them bare or fenced.
+fn call_arguments(fragment: &str) -> Value {
+    let t = fragment.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(t) {
+        return v;
+    }
+    first_json_object(t)
+        .and_then(|span| serde_json::from_str::<Value>(span).ok())
+        .unwrap_or(Value::Object(Default::default()))
+}
+
+/// gpt-oss: every `to=functions.NAME` header opens a call whose arguments follow
+/// `<|message|>` up to `<|call|>`; the channel header itself is not content.
+fn parse_harmony(raw: &str) -> ToolParseResult {
+    const TO: &str = "to=functions.";
+    const MSG: &str = "<|message|>";
+    const CALL: &str = "<|call|>";
+    if !raw.contains(TO) {
+        return scan_bare_json_calls(raw);
+    }
+    let mut calls = Vec::new();
+    let mut content = String::new();
+    let mut rest = raw;
+    while let Some(i) = rest.find(TO) {
+        let head = rest[..i].rfind("<|channel|>").unwrap_or(i);
+        content.push_str(&rest[..head]);
+        let after = &rest[i + TO.len()..];
+        let name_end = after
+            .find(|c: char| c.is_whitespace() || c == '<')
+            .unwrap_or(after.len());
+        let name = &after[..name_end];
+        let Some(m) = after.find(MSG) else {
+            rest = "";
+            break;
+        };
+        let body = &after[m + MSG.len()..];
+        let (json, consumed) = match body.find(CALL) {
+            Some(c) => (&body[..c], m + MSG.len() + c + CALL.len()),
+            None => (body, after.len()),
+        };
+        calls.push(make_call(name, &call_arguments(json)));
+        rest = &after[consumed.min(after.len())..];
+    }
+    content.push_str(rest);
+    ToolParseResult {
+        content: content.trim().to_string(),
+        calls,
+    }
+}
+
+/// DeepSeek: the calls sit between the begin/end markers, each naming its function
+/// after the separator and carrying its arguments in a fenced JSON block.
+fn parse_deepseek(raw: &str) -> ToolParseResult {
+    if !raw.contains(DS_CALL_BEGIN) {
+        return scan_bare_json_calls(raw);
+    }
+    let start = raw.find(DS_CALLS_BEGIN).or_else(|| raw.find(DS_CALL_BEGIN)).unwrap_or(0);
+    let mut content = raw[..start].to_string();
+    let after_all = raw
+        .find(DS_CALLS_END)
+        .map(|e| &raw[e + DS_CALLS_END.len()..])
+        .unwrap_or("");
+    content.push_str(after_all);
+    let mut calls = Vec::new();
+    let mut rest = &raw[start..];
+    while let Some(b) = rest.find(DS_CALL_BEGIN) {
+        let seg = &rest[b + DS_CALL_BEGIN.len()..];
+        let (seg, next) = match seg.find(DS_CALL_END) {
+            Some(e) => (&seg[..e], b + DS_CALL_BEGIN.len() + e + DS_CALL_END.len()),
+            None => (seg, rest.len()),
+        };
+        if let Some(sep) = seg.find(DS_SEP) {
+            let named = &seg[sep + DS_SEP.len()..];
+            let name_end = named.find('\n').unwrap_or(named.len());
+            let name = named[..name_end].trim();
+            let args = named[name_end..]
+                .trim()
+                .trim_start_matches("```json")
+                .trim_start_matches("```")
+                .trim_end_matches("```");
+            if !name.is_empty() {
+                calls.push(make_call(name, &call_arguments(args)));
+            }
+        }
+        rest = &rest[next.min(rest.len())..];
+    }
+    ToolParseResult {
+        content: content.trim().to_string(),
+        calls,
     }
 }
 
@@ -1012,5 +1161,27 @@ mod tests {
         assert!(out
             .iter()
             .any(|m| m.role == "tool" && m.content.contains("<tool_response>")));
+    }
+
+    #[test]
+    fn parse_harmony_call_and_content() {
+        let raw = "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"city\": \"Paris\"}<|call|>";
+        let r = parse_tool_calls(ToolFormat::Harmony, raw);
+        assert_eq!(r.calls.len(), 1);
+        let f = r.calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "get_weather");
+        assert!(f.arguments.as_deref().unwrap().contains("Paris"));
+        assert_eq!(r.content, "");
+        assert_eq!(detect_tool_format(None, "gpt-oss:20b"), ToolFormat::Harmony);
+    }
+
+    #[test]
+    fn parse_deepseek_fenced_call() {
+        let raw = "Let me check.<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+        let r = parse_tool_calls(ToolFormat::DeepSeek, raw);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0].function.as_ref().unwrap().name, "get_weather");
+        assert_eq!(r.content, "Let me check.");
+        assert_eq!(detect_tool_format(None, "deepseek-r1:70b"), ToolFormat::DeepSeek);
     }
 }
