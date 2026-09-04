@@ -292,8 +292,12 @@ fn tool_input(func: &super::types::ToolCallFunction) -> Value {
 }
 
 /// Build the Anthropic content-block array from parsed text + tool calls.
-fn content_blocks(text: &str, calls: &[ToolCall]) -> Vec<Value> {
+fn content_blocks(thinking: Option<&str>, text: &str, calls: &[ToolCall]) -> Vec<Value> {
     let mut blocks = Vec::new();
+    // A local model signs nothing: the signature is present, and empty.
+    if let Some(t) = thinking {
+        blocks.push(json!({"type": "thinking", "thinking": t, "signature": ""}));
+    }
     if !text.is_empty() {
         blocks.push(json!({"type": "text", "text": text}));
     }
@@ -348,6 +352,7 @@ fn message_object(
 pub fn build_response(
     id: &str,
     model: &str,
+    thinking: Option<&str>,
     text: &str,
     calls: &[ToolCall],
     input_tokens: i32,
@@ -358,7 +363,7 @@ pub fn build_response(
     message_object(
         id,
         model,
-        json!(content_blocks(text, calls)),
+        json!(content_blocks(thinking, text, calls)),
         json!(stop_reason(used_tools, hit_max)),
         input_tokens,
         output_tokens,
@@ -385,6 +390,32 @@ pub mod sse {
         })
     }
 
+    pub fn thinking_block_start(index: usize) -> Value {
+        json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "thinking", "thinking": ""}
+        })
+    }
+    pub fn thinking_delta(index: usize, text: &str) -> Value {
+        json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "thinking_delta", "thinking": text}
+        })
+    }
+    /// Closes a thinking block the way the official API does, with a signature; a
+    /// local model has none to give.
+    pub fn signature_delta(index: usize) -> Value {
+        json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "signature_delta", "signature": ""}
+        })
+    }
+    pub fn error(kind: &str, message: &str) -> Value {
+        json!({"type": "error", "error": {"type": kind, "message": message}})
+    }
     pub fn text_delta(index: usize, text: &str) -> Value {
         json!({
             "type": "content_block_delta",
@@ -531,7 +562,7 @@ mod tests {
                 arguments: Some("{\"x\":1}".into()),
             }),
         }];
-        let v = build_response("msg_1", "m", "", &calls, 5, 7, false);
+        let v = build_response("msg_1", "m", None, "", &calls, 5, 7, false);
         assert_eq!(v["stop_reason"], "tool_use");
         let blocks = v["content"].as_array().unwrap();
         assert_eq!(blocks[0]["type"], "tool_use");
@@ -540,7 +571,7 @@ mod tests {
 
     #[test]
     fn response_text_only() {
-        let v = build_response("msg_1", "m", "hello", &[], 3, 2, false);
+        let v = build_response("msg_1", "m", None, "hello", &[], 3, 2, false);
         assert_eq!(v["stop_reason"], "end_turn");
         assert_eq!(v["content"][0]["text"], "hello");
     }

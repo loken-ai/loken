@@ -437,6 +437,7 @@ pub(crate) async fn chat_completion(
                     } else {
                         None
                     };
+                    let mut splitter = crate::api::thinking::ThinkSplit::new();
 
                     while let Some(result) = rx.recv().await {
                         match result {
@@ -445,27 +446,31 @@ pub(crate) async fn chat_completion(
                                     first_token_at = Some(std::time::Instant::now());
                                 }
                                 token_count += 1;
-                                // Scanner returns only the content safe to
-                                // stream now (holds back partial markers /
-                                // the whole tool region); without tools the
-                                // text passes through verbatim.
-                                let emit = match tool_scanner.as_mut() {
-                                    Some(sc) => sc.push(&chunk_text),
-                                    None => chunk_text,
-                                };
-                                if emit.is_empty() {
-                                    continue;
+                                for seg in splitter.push(&chunk_text) {
+                                    let delta = match seg {
+                                        crate::api::thinking::Segment::Thinking(t) => ChunkDelta::reasoning(t),
+                                        crate::api::thinking::Segment::Content(c) => {
+                                            let emit = match tool_scanner.as_mut() {
+                                                Some(sc) => sc.push(&c),
+                                                None => c,
+                                            };
+                                            if emit.is_empty() {
+                                                continue;
+                                            }
+                                            ChunkDelta::content(emit)
+                                        }
+                                    };
+                                    let mut chunk = ChatCompletionChunk::new_delta_at(
+                                        &completion_id,
+                                        &model_name_clone,
+                                        created_at,
+                                        0,
+                                        delta,
+                                        None,
+                                    );
+                                    chunk.service_tier = service_tier.clone();
+                                    yield Ok(Event::default().data(to_json_string!(&chunk)));
                                 }
-                                let mut chunk = ChatCompletionChunk::new_delta_at(
-                                    &completion_id,
-                                    &model_name_clone,
-                                    created_at,
-                                    0,
-                                    ChunkDelta::content(emit),
-                                    None,
-                                );
-                                chunk.service_tier = service_tier.clone();
-                                yield Ok(Event::default().data(to_json_string!(&chunk)));
                             }
                             Err(e) => {
                                 // Surface the error as the terminal
@@ -501,6 +506,31 @@ pub(crate) async fn chat_completion(
                     // structured calls and emit them as a single delta
                     // before the terminal chunk. finish_reason flips to
                     // "tool_calls" when the model invoked functions.
+                    for seg in splitter.finish() {
+                        let delta = match seg {
+                            crate::api::thinking::Segment::Thinking(t) => ChunkDelta::reasoning(t),
+                            crate::api::thinking::Segment::Content(c) => {
+                                let emit = match tool_scanner.as_mut() {
+                                    Some(sc) => sc.push(&c),
+                                    None => c,
+                                };
+                                if emit.is_empty() {
+                                    continue;
+                                }
+                                ChunkDelta::content(emit)
+                            }
+                        };
+                        let mut chunk = ChatCompletionChunk::new_delta_at(
+                            &completion_id,
+                            &model_name_clone,
+                            created_at,
+                            0,
+                            delta,
+                            None,
+                        );
+                        chunk.service_tier = service_tier.clone();
+                        yield Ok(Event::default().data(to_json_string!(&chunk)));
+                    }
                     let tool_calls = tool_scanner
                         .as_ref()
                         .map(|sc| sc.finalize())
@@ -672,6 +702,7 @@ pub(crate) async fn chat_completion(
         // model output into structured tool_calls and switch finish_reason
         // to "tool_calls" (OpenAI's contract). Plain answers (no markers)
         // pass through unchanged.
+        let (reasoning, content) = crate::api::thinking::split_thinking(&content);
         let (message, finish_reason) = if tools_active {
             let parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &content);
             if parsed.calls.is_empty() {
@@ -691,6 +722,8 @@ pub(crate) async fn chat_completion(
                 finish_reason,
             )
         };
+        let mut message = message;
+        message.reasoning_content = reasoning;
         let finish_for_log = finish_reason.clone();
         let mut response = ChatCompletionResponse::new(
             format!("chatcmpl-{}", uuid::Uuid::new_v4()),

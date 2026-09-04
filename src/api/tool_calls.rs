@@ -975,6 +975,8 @@ mod tests {
             content: String::new(),
             images: None,
             audios: None,
+            thinking: None,
+            reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
                 r#type: "function".into(),
@@ -991,6 +993,8 @@ mod tests {
             content: "42".into(),
             images: None,
             audios: None,
+            thinking: None,
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some("call_1".into()),
             name: None,

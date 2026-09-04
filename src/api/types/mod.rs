@@ -742,6 +742,12 @@ pub struct Message {
     /// same reason. Empty content is harmless downstream - the chat
     /// formatters just emit the role markers.
     pub content: String,
+    /// The model's reasoning, in the field the Ollama surface returns it in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// The same reasoning, in the field the OpenAI surface returns it in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Images for vision models (base64-encoded strings, Ollama format).
     /// Per-message cap of 16 matches the handler-side guard (fbe25c5).
     /// Vision encoder cost is O(images x tokens_per_image); typical use
@@ -783,6 +789,10 @@ struct MessageWire {
     role: String,
     #[serde(default)]
     content: Option<serde_json::Value>,
+    #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     images: Option<Vec<String>>,
     #[serde(default)]
@@ -856,6 +866,8 @@ impl TryFrom<MessageWire> for Message {
         Ok(Self {
             role: w.role,
             content,
+            thinking: w.thinking,
+            reasoning_content: w.reasoning_content,
             images: (!images.is_empty()).then_some(images),
             audios: w.audios,
             tool_calls: w.tool_calls,
@@ -870,6 +882,8 @@ impl Message {
         Self {
             role,
             content,
+            thinking: None,
+            reasoning_content: None,
             images: None,
             audios: None,
             tool_calls: None,
@@ -885,6 +899,8 @@ impl Message {
         Self {
             role: "assistant".to_string(),
             content,
+            thinking: None,
+            reasoning_content: None,
             images: None,
             audios: None,
             tool_calls: Some(tool_calls),
@@ -1311,6 +1327,9 @@ pub struct ChunkDelta {
     /// Token content (may be empty string, absent only if role-only chunk)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// The model's reasoning, streamed apart from the answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Streaming tool-call deltas. We buffer each tool region and emit one
     /// complete delta per call (id + name + full arguments), which is a
     /// valid degenerate case of OpenAI's incremental tool-call streaming  -
@@ -1348,6 +1367,7 @@ impl ChunkDelta {
             role: Some(role.to_string()),
             content: None,
             tool_calls: None,
+            reasoning_content: None,
         }
     }
     /// Content-only delta.
@@ -1356,14 +1376,24 @@ impl ChunkDelta {
             role: None,
             content: Some(text),
             tool_calls: None,
+            reasoning_content: None,
         }
     }
     /// Empty delta (used by finish-reason-only chunks).
+    pub fn reasoning(text: String) -> Self {
+        Self {
+            role: None,
+            content: None,
+            tool_calls: None,
+            reasoning_content: Some(text),
+        }
+    }
     pub fn empty() -> Self {
         Self {
             role: None,
             content: None,
             tool_calls: None,
+            reasoning_content: None,
         }
     }
     /// Tool-call-only delta.
@@ -1372,6 +1402,7 @@ impl ChunkDelta {
             role: None,
             content: None,
             tool_calls: Some(calls),
+            reasoning_content: None,
         }
     }
 }

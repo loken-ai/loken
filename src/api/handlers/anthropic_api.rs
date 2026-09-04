@@ -170,18 +170,20 @@ pub(crate) async fn anthropic_messages(
         let _g = gate_guard;
         match engine.generate(&prompt, params).await {
             Ok(result) => {
+                let (thinking, answer) = crate::api::thinking::split_thinking(&result.text);
                 let (text, calls) = if tools_active {
                     let parsed =
-                        crate::api::tool_calls::parse_tool_calls(tool_format, &result.text);
+                        crate::api::tool_calls::parse_tool_calls(tool_format, &answer);
                     (parsed.content, parsed.calls)
                 } else {
-                    (result.text.clone(), Vec::new())
+                    (answer.clone(), Vec::new())
                 };
                 let hit_max = (result.eval_count as usize) >= max_tokens && calls.is_empty();
                 let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
                 let body = anthropic::build_response(
                     &id,
                     &model_for_resp,
+                    thinking.as_deref(),
                     &text,
                     &calls,
                     result.prompt_eval_count as i32,
@@ -210,61 +212,143 @@ pub(crate) async fn anthropic_messages(
                         .event("message_start")
                         .data(anthropic::sse::message_start(&id, &model_clone, input_tokens).to_string()));
                     yield Ok(Event::default()
-                        .event("content_block_start")
-                        .data(anthropic::sse::text_block_start(0).to_string()));
-                    yield Ok(Event::default()
                         .event("ping")
                         .data(anthropic::sse::ping().to_string()));
-
                     let mut scanner = if tools_active {
                         Some(crate::api::tool_calls::StreamToolScanner::new(tool_format))
                     } else {
                         None
                     };
+                    // Blocks are numbered as they open: a thinking block first when the
+                    // model reasons, then the text, then the tool uses.
+                    let mut splitter = crate::api::thinking::ThinkSplit::new();
+                    let mut next_idx = 0usize;
+                    let mut think_idx: Option<usize> = None;
+                    let mut text_idx: Option<usize> = None;
                     let mut output_tokens = 0i32;
-
-                    while let Some(result) = rx.recv().await {
-                        match result {
-                            Ok(tok) => {
-                                output_tokens += 1;
-                                let emit = match scanner.as_mut() {
-                                    Some(s) => s.push(&tok),
-                                    None => tok,
-                                };
-                                if !emit.is_empty() {
+                    let mut segments: Vec<crate::api::thinking::Segment> = Vec::new();
+                    let mut ended = false;
+                    loop {
+                        if segments.is_empty() {
+                            if ended {
+                                break;
+                            }
+                            match rx.recv().await {
+                                Some(Ok(tok)) => {
+                                    output_tokens += 1;
+                                    segments = splitter.push(&tok);
+                                    segments.reverse();
+                                }
+                                Some(Err(e)) => {
                                     yield Ok(Event::default()
-                                        .event("content_block_delta")
-                                        .data(anthropic::sse::text_delta(0, &emit).to_string()));
+                                        .event("error")
+                                        .data(anthropic::sse::error("api_error", &format!("generate: {e}")).to_string()));
+                                    break;
+                                }
+                                None => {
+                                    ended = true;
+                                    segments = splitter.finish();
+                                    segments.reverse();
                                 }
                             }
-                            Err(_) => break,
+                            continue;
+                        }
+                        let Some(seg) = segments.pop() else { continue };
+                        match seg {
+                            crate::api::thinking::Segment::Thinking(t) => {
+                                if think_idx.is_none() {
+                                    think_idx = Some(next_idx);
+                                    next_idx += 1;
+                                    yield Ok(Event::default()
+                                        .event("content_block_start")
+                                        .data(anthropic::sse::thinking_block_start(next_idx - 1).to_string()));
+                                }
+                                yield Ok(Event::default()
+                                    .event("content_block_delta")
+                                    .data(anthropic::sse::thinking_delta(think_idx.unwrap_or(0), &t).to_string()));
+                            }
+                            crate::api::thinking::Segment::Content(c) => {
+                                let emit = match scanner.as_mut() {
+                                    Some(sc) => sc.push(&c),
+                                    None => c,
+                                };
+                                if emit.is_empty() {
+                                    continue;
+                                }
+                                if text_idx.is_none() {
+                                    if let Some(ti) = think_idx {
+                                        yield Ok(Event::default()
+                                            .event("content_block_delta")
+                                            .data(anthropic::sse::signature_delta(ti).to_string()));
+                                        yield Ok(Event::default()
+                                            .event("content_block_stop")
+                                            .data(anthropic::sse::block_stop(ti).to_string()));
+                                    }
+                                    text_idx = Some(next_idx);
+                                    next_idx += 1;
+                                    yield Ok(Event::default()
+                                        .event("content_block_start")
+                                        .data(anthropic::sse::text_block_start(next_idx - 1).to_string()));
+                                }
+                                yield Ok(Event::default()
+                                    .event("content_block_delta")
+                                    .data(anthropic::sse::text_delta(text_idx.unwrap_or(0), &emit).to_string()));
+                            }
                         }
                     }
-
-                    // Resolve tool calls; if none, flush any withheld
-                    // buffer (bare-JSON false trigger) into the text block
-                    // before closing it.
                     let calls = scanner.as_ref().map(|s| s.finalize()).unwrap_or_default();
                     let used_tools = !calls.is_empty();
-                    if !used_tools {
-                        if let Some(tail) = scanner
-                            .as_ref()
-                            .map(|s| s.unstreamed())
-                            .filter(|t| !t.is_empty())
-                        {
+                    let tail = if used_tools {
+                        None
+                    } else {
+                        scanner.as_ref().map(|s| s.unstreamed()).filter(|t| !t.is_empty())
+                    };
+                    if tail.is_some() && text_idx.is_none() {
+                        if let Some(ti) = think_idx {
                             yield Ok(Event::default()
                                 .event("content_block_delta")
-                                .data(anthropic::sse::text_delta(0, tail).to_string()));
+                                .data(anthropic::sse::signature_delta(ti).to_string()));
+                            yield Ok(Event::default()
+                                .event("content_block_stop")
+                                .data(anthropic::sse::block_stop(ti).to_string()));
+                        }
+                        text_idx = Some(next_idx);
+                        next_idx += 1;
+                        yield Ok(Event::default()
+                            .event("content_block_start")
+                            .data(anthropic::sse::text_block_start(next_idx - 1).to_string()));
+                    }
+                    if let Some(t) = tail {
+                        yield Ok(Event::default()
+                            .event("content_block_delta")
+                            .data(anthropic::sse::text_delta(text_idx.unwrap_or(0), t).to_string()));
+                    }
+                    match (think_idx, text_idx) {
+                        (Some(ti), None) => {
+                            yield Ok(Event::default()
+                                .event("content_block_delta")
+                                .data(anthropic::sse::signature_delta(ti).to_string()));
+                            yield Ok(Event::default()
+                                .event("content_block_stop")
+                                .data(anthropic::sse::block_stop(ti).to_string()));
+                        }
+                        (_, Some(xi)) => {
+                            yield Ok(Event::default()
+                                .event("content_block_stop")
+                                .data(anthropic::sse::block_stop(xi).to_string()));
+                        }
+                        (None, None) => {
+                            // Nothing streamed: an empty text block keeps the message well formed.
+                            yield Ok(Event::default()
+                                .event("content_block_start")
+                                .data(anthropic::sse::text_block_start(next_idx).to_string()));
+                            yield Ok(Event::default()
+                                .event("content_block_stop")
+                                .data(anthropic::sse::block_stop(next_idx).to_string()));
+                            next_idx += 1;
                         }
                     }
-
-                    // Close the text block.
-                    yield Ok(Event::default()
-                        .event("content_block_stop")
-                        .data(anthropic::sse::block_stop(0).to_string()));
-
-                    // Emit any tool calls as tool_use blocks (index 1+).
-                    let mut idx = 1usize;
+                    let mut idx = next_idx;
                     for c in &calls {
                         yield Ok(Event::default()
                             .event("content_block_start")
