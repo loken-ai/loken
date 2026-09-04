@@ -1272,7 +1272,7 @@ impl APIServer {
             .route("/api/draft/status", axum::routing::get(draft_status))
             .route("/api/copy", axum::routing::post(ollama_copy_model))
             .route("/api/embed", axum::routing::post(ollama_embed))
-            .route("/api/embeddings", axum::routing::post(ollama_embed))
+            .route("/api/embeddings", axum::routing::post(ollama_embeddings_legacy))
             // OpenAI-shaped embeddings - same engine plumbing as
             // /api/embed, response reshaped to the `{object:"list",
             // data:[{embedding,index,object:"embedding"}],usage:{...}}`

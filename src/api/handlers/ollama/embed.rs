@@ -684,3 +684,37 @@ pub(crate) async fn ollama_create_blob(
 
     Ok(StatusCode::CREATED)
 }
+
+/// The request shape of `POST /api/embeddings`, the endpoint that preceded `/api/embed`
+/// and that the LangChain and LlamaIndex integrations still call: one `prompt`, one
+/// `embedding` back.
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct OllamaLegacyEmbeddingsRequest {
+    pub model: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub options: Option<serde_json::Value>,
+    #[serde(default)]
+    pub keep_alive: Option<serde_json::Value>,
+}
+
+pub(crate) async fn ollama_embeddings_legacy(
+    State(state): State<APIServer>,
+    Json(request): Json<OllamaLegacyEmbeddingsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if request.prompt.trim().is_empty() {
+        // Ollama answers an empty prompt with an empty vector, and so does this.
+        return Ok(Json(serde_json::json!({ "embedding": [] })));
+    }
+    let modern: OllamaEmbedRequest = serde_json::from_value(serde_json::json!({
+        "model": request.model,
+        "input": request.prompt,
+        "options": request.options,
+        "keep_alive": request.keep_alive,
+    }))
+    .map_err(|e| ApiError::Validation(format!("embeddings: {e}")))?;
+    let Json(mut response) = ollama_embed(State(state), Json(modern)).await?;
+    let embedding = response.embeddings.pop().unwrap_or_default();
+    Ok(Json(serde_json::json!({ "embedding": embedding })))
+}
