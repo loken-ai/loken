@@ -918,6 +918,11 @@ pub struct ChatCompletionRequest {
     /// engine's `for _ in 0..max_tokens` loop never terminates.
     #[validate(range(min = 1, max = 131072))]
     pub max_tokens: Option<usize>,
+    /// The cap current OpenAI clients send instead of `max_tokens`; the two are
+    /// read through `completion_cap`, this one first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1, max = 131072))]
+    pub max_completion_tokens: Option<usize>,
     pub stream: Option<bool>,
     /// OpenAI-compatible session identifier. When the same id is sent on
     /// consecutive turns, the KV cache is reused and only new tokens get
@@ -1013,6 +1018,14 @@ pub struct ChatCompletionRequest {
     /// names don't require a struct change.
     #[serde(default)]
     pub service_tier: Option<String>,
+}
+
+impl ChatCompletionRequest {
+    /// The completion cap a request asks for, `max_completion_tokens` before the
+    /// `max_tokens` it superseded.
+    pub fn completion_cap(&self) -> Option<usize> {
+        self.max_completion_tokens.or(self.max_tokens)
+    }
 }
 
 /// OpenAI's `stop` field accepts either a single string or an array.

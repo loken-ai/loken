@@ -342,7 +342,7 @@ pub(crate) async fn chat_completion(
     // request.stop / request.user.
     let params = GenerationParams {
         prefix_tokens: None,
-        max_tokens: request.max_tokens,
+        max_tokens: request.completion_cap(),
         temperature: request.temperature,
         top_p: request.top_p,
         top_k: None,
@@ -388,7 +388,7 @@ pub(crate) async fn chat_completion(
         } else if let Err(e) = engine.set_images(&images).await {
             return Err(ApiError::Validation(format!("images: {e}")));
         }
-        let max_tokens_cap = request.max_tokens;
+        let max_tokens_cap = request.completion_cap();
         // Estimate prompt token count once for the trailing usage chunk
         // (when stream_options.include_usage=true). Cheap heuristic  -
         // engine doesn't expose the real tokenizer count in this path.
