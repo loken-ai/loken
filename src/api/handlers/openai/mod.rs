@@ -351,11 +351,15 @@ pub(crate) async fn chat_completion(
         format_chat_prompt(&request.messages, chat_template.as_deref())
     };
     let mut prompt = prompt;
-    if matches!(
-        request.reasoning_effort.as_deref().map(str::to_ascii_lowercase).as_deref(),
-        Some("none") | Some("minimal")
-    ) {
-        super::prompt_format::apply_thinking_preference(&mut prompt, Some("disabled"));
+    // `none` and `minimal` switch thinking off where a template allows it; the levels
+    // reach a model that reads them (gpt-oss), and leave the others as they are.
+    if let Some(effort) = request.reasoning_effort.as_deref().map(str::to_ascii_lowercase) {
+        let pref = match effort.as_str() {
+            "none" | "minimal" => "disabled",
+            "low" | "medium" | "high" => effort.as_str(),
+            _ => "enabled",
+        };
+        super::prompt_format::apply_thinking_preference(&mut prompt, Some(pref));
     }
     let single_tool_call = request.parallel_tool_calls == Some(false);
 

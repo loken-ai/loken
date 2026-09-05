@@ -347,6 +347,13 @@ impl OllamaChatResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct OllamaGenerateRequest {
     pub model: String,
+    /// System prompt, rendered as the model's system turn as Ollama renders it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    /// A per-request template: Jinja, or the Go form Ollama modelfiles use, of which
+    /// the `.System`, `.Prompt`, `.Response` fields and `if`/`else`/`end` are rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
     /// Cap matches handler-side guard at 256 KiB chars (~64k tokens at
     /// ~4 chars/token). Comfortable within any practical context the
     /// perimeter models support. validate(length) is byte-based on

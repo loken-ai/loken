@@ -110,9 +110,97 @@ pub(crate) fn infer_template_from_model_name(model_id: &str) -> Option<String> {
 /// honour the same request field, and the one that did not was silently reasoning anyway.
 pub(crate) fn apply_thinking_preference(prompt: &mut String, thinking: Option<&str>) {
     const OPENER: &str = "<|im_start|>assistant\n";
+    const HARMONY_SYSTEM: &str = "<|start|>system<|message|>";
+    // gpt-oss reads its effort from a `Reasoning:` line of the system turn and cannot
+    // stop reasoning altogether: `disabled` becomes its lowest level.
+    if let Some(at) = prompt.find(HARMONY_SYSTEM) {
+        let level = match thinking {
+            Some("low") | Some("medium") | Some("high") => thinking,
+            Some("disabled") | Some("none") | Some("minimal") => Some("low"),
+            _ => None,
+        };
+        if let Some(level) = level {
+            let line = format!("Reasoning: {level}");
+            let head = at + HARMONY_SYSTEM.len();
+            if let Some(rel) = prompt[head..].find("Reasoning: ") {
+                let start = head + rel;
+                let end = prompt[start..]
+                    .find('\n')
+                    .map(|n| start + n)
+                    .unwrap_or(prompt.len());
+                prompt.replace_range(start..end, &line);
+            } else {
+                prompt.insert_str(head, &format!("{line}\n"));
+            }
+        }
+        return;
+    }
     if thinking == Some("disabled") && prompt.ends_with(OPENER) {
         prompt.push_str("<think>\n\n</think>\n\n");
     }
+}
+
+/// Renders the Go template of an Ollama modelfile for one exchange: the `.System`,
+/// `.Prompt` and `.Response` fields, `if`/`else`/`end` on them, and the `-` trims.
+/// `None` for any other construct - `range`, `with`, `.Messages`, functions - which a
+/// caller then answers with the model's own template.
+pub(crate) fn render_go_template(tmpl: &str, system: Option<&str>, prompt: &str) -> Option<String> {
+    let field = |name: &str| -> Option<&str> {
+        match name {
+            ".System" => Some(system.unwrap_or("")),
+            ".Prompt" => Some(prompt),
+            ".Response" => Some(""),
+            _ => None,
+        }
+    };
+    let mut out = String::new();
+    // Each `if` pushes whether its branch is live; `else` flips it; `end` pops.
+    let mut live: Vec<bool> = Vec::new();
+    let mut trim_next = false;
+    let mut rest = tmpl;
+    loop {
+        let Some(open) = rest.find("{{") else {
+            let tail = if trim_next { rest.trim_start() } else { rest };
+            if live.iter().all(|&l| l) {
+                out.push_str(tail);
+            }
+            break;
+        };
+        let text = &rest[..open];
+        let text = if trim_next { text.trim_start() } else { text };
+        let after = &rest[open + 2..];
+        let close = after.find("}}")?;
+        let mut action = after[..close].trim();
+        let trim_before = action.starts_with('-');
+        trim_next = action.ends_with('-');
+        action = action.trim_start_matches('-').trim_end_matches('-').trim();
+        let text = if trim_before { text.trim_end() } else { text };
+        if live.iter().all(|&l| l) {
+            out.push_str(text);
+        }
+        let emitting = live.iter().all(|&l| l);
+        if let Some(cond) = action.strip_prefix("if ") {
+            let value = field(cond.trim())?;
+            live.push(!value.is_empty());
+        } else if action == "else" {
+            let last = live.last_mut()?;
+            *last = !*last;
+        } else if action == "end" {
+            live.pop()?;
+        } else if action.starts_with('.') {
+            let value = field(action)?;
+            if emitting {
+                out.push_str(value);
+            }
+        } else {
+            return None;
+        }
+        rest = &after[close + 2..];
+    }
+    if !live.is_empty() {
+        return None;
+    }
+    Some(out)
 }
 
 /// Renders a Jinja chat template - the one the weights file carries under
@@ -845,5 +933,35 @@ mod tests {
         assert!(pick("deepseek-r1:32b").contains("<｜User｜>"));
         // Unknown model -> None.
         assert!(infer_template_from_model_name("mystery-model").is_none());
+    }
+}
+
+#[cfg(test)]
+mod go_template_tests {
+    use super::*;
+
+    #[test]
+    fn renders_the_common_ollama_shape() {
+        let t = "{{ if .System }}<|im_start|>system\n{{ .System }}<|im_end|>\n{{ end }}<|im_start|>user\n{{ .Prompt }}<|im_end|>\n<|im_start|>assistant\n{{ .Response }}";
+        assert_eq!(
+            render_go_template(t, Some("be brief"), "hi").unwrap(),
+            "<|im_start|>system\nbe brief<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert_eq!(
+            render_go_template(t, None, "hi").unwrap(),
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert!(render_go_template("{{ range .Messages }}x{{ end }}", None, "hi").is_none());
+    }
+
+    #[test]
+    fn harmony_effort_is_written_into_the_system_turn() {
+        let mut p = "<|start|>system<|message|>You are ChatGPT.\nReasoning: medium\n<|end|>".to_string();
+        apply_thinking_preference(&mut p, Some("high"));
+        assert!(p.contains("Reasoning: high"));
+        assert!(!p.contains("Reasoning: medium"));
+        let mut q = "<|start|>system<|message|>You are ChatGPT.<|end|>".to_string();
+        apply_thinking_preference(&mut q, Some("disabled"));
+        assert!(q.starts_with("<|start|>system<|message|>Reasoning: low\n"));
     }
 }

@@ -874,7 +874,24 @@ pub(crate) async fn ollama_chat(
 /// asked "how much of this prompt do you hold" has to tokenise the SAME text the generation path
 /// would, or the two sequences differ from their first token and the honest answer is always
 /// zero - which is what the endpoint reported until this was pulled out of the handler.
-pub(crate) async fn templated_prompt(state: &APIServer, model_name: &str, prompt: &str) -> String {
+pub(crate) async fn templated_prompt(
+    state: &APIServer,
+    model_name: &str,
+    prompt: &str,
+    system: Option<&str>,
+    template: Option<&str>,
+) -> String {
+    // A template given with the request comes first: Jinja rendered as such, the Go
+    // form rendered for this one exchange, anything else falling through to the model's.
+    if let Some(t) = template.filter(|t| !t.trim().is_empty()) {
+        let msgs = generate_messages(system, prompt);
+        if t.contains("{%") {
+            return format_chat_prompt(&msgs, Some(t));
+        }
+        if let Some(rendered) = super::super::prompt_format::render_go_template(t, system, prompt) {
+            return rendered;
+        }
+    }
     let cached = {
         let engines = state.engines.read().await;
         engines
@@ -904,8 +921,7 @@ pub(crate) async fn templated_prompt(state: &APIServer, model_name: &str, prompt
     let chat_template = chat_template.or_else(|| infer_template_from_model_name(model_name));
     match chat_template.as_deref() {
         Some(tmpl) if !prompt_already_templated(prompt, tmpl) => {
-            let msg = Message::new("user".to_string(), prompt.to_string());
-            let wrapped = format_chat_prompt(&[msg], Some(tmpl));
+            let wrapped = format_chat_prompt(&generate_messages(system, prompt), Some(tmpl));
             debug!(
                 "Generate: applied chat template ({} -> {} chars)",
                 prompt.len(),
@@ -915,6 +931,16 @@ pub(crate) async fn templated_prompt(state: &APIServer, model_name: &str, prompt
         }
         _ => prompt.to_string(),
     }
+}
+
+/// The one exchange `/api/generate` renders: an optional system turn and the prompt.
+fn generate_messages(system: Option<&str>, prompt: &str) -> Vec<Message> {
+    let mut msgs = Vec::with_capacity(2);
+    if let Some(sys) = system.filter(|s| !s.trim().is_empty()) {
+        msgs.push(Message::new("system".to_string(), sys.to_string()));
+    }
+    msgs.push(Message::new("user".to_string(), prompt.to_string()));
+    msgs
 }
 
 pub(crate) async fn ollama_generate(
@@ -1173,7 +1199,14 @@ pub(crate) async fn ollama_generate(
         if raw_mode || request.prompt.is_empty() {
             request.prompt.clone()
         } else {
-            templated_prompt(&state, &model_name, &request.prompt).await
+            templated_prompt(
+                &state,
+                &model_name,
+                &request.prompt,
+                request.system.as_deref(),
+                request.template.as_deref(),
+            )
+            .await
         }
     };
     // The same request field the chat endpoint honours: a caller asking for no reasoning
