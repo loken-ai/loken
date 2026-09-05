@@ -2097,10 +2097,15 @@ async fn mirror_request_id(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let id = req.headers().get("x-request-id").cloned();
+    let version = req.headers().get("anthropic-version").cloned();
     let mut res = next.run(req).await;
     if let Some(id) = id {
         res.headers_mut()
             .insert(axum::http::HeaderName::from_static("request-id"), id);
+    }
+    if let Some(v) = version {
+        res.headers_mut()
+            .insert(axum::http::HeaderName::from_static("anthropic-version"), v);
     }
     res
 }

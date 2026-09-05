@@ -95,8 +95,55 @@ pub(crate) async fn anthropic_messages(
         crate::api::tool_calls::detect_tool_format(chat_template.as_deref(), &model_name);
     let tool_directive = crate::api::tool_calls::tool_choice_directive(req.tool_choice.as_ref());
     let model_for_resp = model_name.clone();
+    let top_k = req.top_k;
+    let seed = req.seed;
+    let thinking_on = req
+        .thinking
+        .as_ref()
+        .and_then(|t| t.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("enabled");
+    let single_tool_call = req
+        .tool_choice
+        .as_ref()
+        .and_then(|c| c.get("disable_parallel_tool_use"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    // A required call (`any`, or one named function) constrains the generation to the
+    // call object itself; a structured output constrains it to the client's schema.
+    let forced_call: Option<Option<String>> = match req
+        .tool_choice
+        .as_ref()
+        .and_then(|c| c.get("type"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("any") => Some(None),
+        Some("tool") => Some(
+            req.tool_choice
+                .as_ref()
+                .and_then(|c| c.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        ),
+        _ => None,
+    };
+    let output_schema = req
+        .output_format
+        .as_ref()
+        .filter(|f| f.get("type").and_then(serde_json::Value::as_str) == Some("json_schema"))
+        .and_then(|f| f.get("schema").cloned());
 
     let (messages, tools) = req.into_internal();
+    let grammar = if let Some(schema) = output_schema {
+        Some(format!("json_schema:{schema}"))
+    } else if let (Some(only), true) = (forced_call.as_ref(), tools_active) {
+        Some(format!(
+            "json_schema:{}",
+            crate::api::tool_calls::forced_call_schema(&tools, only.as_deref())
+        ))
+    } else {
+        None
+    };
     let prompt = if tools_active {
         let flat = crate::api::tool_calls::flatten_messages(
             &messages,
@@ -108,6 +155,10 @@ pub(crate) async fn anthropic_messages(
     } else {
         format_chat_prompt(&messages, chat_template.as_deref())
     };
+    let mut prompt = prompt;
+    if !thinking_on {
+        super::prompt_format::apply_thinking_preference(&mut prompt, Some("disabled"));
+    }
     debug!("Anthropic /v1/messages: model={model_name} stream={stream} tools={tools_active} prompt_chars={}", prompt.len());
 
     let params = GenerationParams {
@@ -115,15 +166,15 @@ pub(crate) async fn anthropic_messages(
         max_tokens: Some(max_tokens),
         temperature,
         top_p,
-        top_k: None,
-        seed: None,
+        top_k: top_k.map(|k| k as _),
+        seed: seed.map(|s| s as _),
         stop_sequences,
         early_exit_threshold: None,
         repeat_penalty: None,
         repeat_last_n: None,
         context_length: None,
         session_id: None,
-        grammar: None,
+        grammar,
     };
 
     let gate_guard = match state
@@ -172,8 +223,11 @@ pub(crate) async fn anthropic_messages(
             Ok(result) => {
                 let (thinking, answer) = crate::api::thinking::split_thinking(&result.text);
                 let (text, calls) = if tools_active {
-                    let parsed =
+                    let mut parsed =
                         crate::api::tool_calls::parse_tool_calls(tool_format, &answer);
+                    if single_tool_call {
+                        parsed.calls.truncate(1);
+                    }
                     (parsed.content, parsed.calls)
                 } else {
                     (answer.clone(), Vec::new())
@@ -199,7 +253,11 @@ pub(crate) async fn anthropic_messages(
             ),
         }
     } else {
-        let input_tokens = estimate_token_count(&prompt) as i32;
+        let input_tokens = engine
+            .count_tokens(&prompt)
+            .await
+            .map(|n| n as i32)
+            .unwrap_or_else(|| estimate_token_count(&prompt) as i32);
         match engine.generate_stream(&prompt, params).await {
             Ok(mut rx) => {
                 let model_clone = model_for_resp.clone();
@@ -296,7 +354,10 @@ pub(crate) async fn anthropic_messages(
                             }
                         }
                     }
-                    let calls = scanner.as_ref().map(|s| s.finalize()).unwrap_or_default();
+                    let mut calls = scanner.as_ref().map(|s| s.finalize()).unwrap_or_default();
+                    if single_tool_call {
+                        calls.truncate(1);
+                    }
                     let used_tools = !calls.is_empty();
                     let tail = if used_tools {
                         None

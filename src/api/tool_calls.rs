@@ -419,7 +419,40 @@ fn call_from_object(obj: &Value) -> Option<ToolCall> {
 
 /// Parse a completed generation for tool calls in the given family.
 /// Returns the residual natural-language content and any calls found.
+/// A JSON schema for one call object, `{"name", "arguments"}`, to constrain a
+/// generation to a call when the client requires one (`tool_choice` required, any, or a
+/// named function). The bare object is what every format's parser falls back to.
+pub fn forced_call_schema(tools: &[Tool], only: Option<&str>) -> Value {
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t.function.as_ref().map(|f| f.name.as_str()))
+        .filter(|n| only.is_none_or(|o| o == *n))
+        .collect();
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "enum": names},
+            "arguments": {"type": "object"}
+        },
+        "required": ["name", "arguments"],
+        "additionalProperties": false
+    })
+}
+
 pub fn parse_tool_calls(format: ToolFormat, raw: &str) -> ToolParseResult {
+    let parsed = parse_tool_calls_native(format, raw);
+    if parsed.calls.is_empty() && raw.trim_start().starts_with('{') {
+        // A constrained generation answers with the bare call object, whatever
+        // the model's own syntax.
+        let bare = scan_bare_json_calls(raw);
+        if !bare.calls.is_empty() {
+            return bare;
+        }
+    }
+    parsed
+}
+
+fn parse_tool_calls_native(format: ToolFormat, raw: &str) -> ToolParseResult {
     match format {
         ToolFormat::Hermes => parse_hermes(raw),
         ToolFormat::Mistral => parse_mistral(raw),

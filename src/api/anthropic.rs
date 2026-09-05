@@ -102,6 +102,18 @@ pub struct AnthropicMessagesRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub metadata: Option<Value>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// `{type: "enabled", budget_tokens}`; absent or disabled, a reasoning model is told
+    /// not to think. The budget is not enforced: a local model's reasoning has no cap
+    /// of its own.
+    #[serde(default)]
+    pub thinking: Option<Value>,
+    /// Structured output: `{type: "json_schema", schema}` constrains the answer.
+    #[serde(default)]
+    pub output_format: Option<Value>,
 }
 
 /// One block of a message's content array, after extraction.

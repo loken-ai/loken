@@ -619,10 +619,16 @@ impl OllamaListModelsResponse {
 }
 
 /// Ollama pull request (POST /api/pull)
+fn pull_stream_default() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaPullRequest {
+    #[serde(alias = "model")]
     pub name: String,
-    #[serde(default)]
+    /// Progress frames by default, as Ollama streams them; `false` answers once.
+    #[serde(default = "pull_stream_default")]
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub insecure: Option<bool>,
@@ -1824,6 +1830,12 @@ pub struct OllamaPushRequest {
 pub struct OllamaEmbedRequest {
     pub model: String,
     pub input: serde_json::Value, // Can be string or array of strings
+    /// Cut each input to the model's context (the default) or refuse one that exceeds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncate: Option<bool>,
+    /// Keep only the leading dimensions of each vector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<serde_json::Value>,
     #[serde(
