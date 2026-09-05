@@ -645,6 +645,8 @@ pub(crate) async fn ollama_chat(
                         None
                     };
                     let mut splitter = crate::api::thinking::ThinkSplit::new();
+                    let mut thought = false;
+                    let mut thinking_ns: Option<u64> = None;
 
                     while let Some(result) = rx.recv().await {
                         match result {
@@ -654,9 +656,13 @@ pub(crate) async fn ollama_chat(
                                 for seg in splitter.push(&chunk) {
                                     let message = match seg {
                                         crate::api::thinking::Segment::Thinking(t) => {
+                                            thought = true;
                                             serde_json::json!({"role": "assistant", "content": "", "thinking": t})
                                         }
                                         crate::api::thinking::Segment::Content(c) => {
+                                            if thought && thinking_ns.is_none() {
+                                                thinking_ns = Some(start_time.elapsed().as_nanos() as u64);
+                                            }
                                             let emit = match tool_scanner.as_mut() {
                                                 Some(sc) => sc.push(&c),
                                                 None => c,
@@ -793,6 +799,7 @@ pub(crate) async fn ollama_chat(
                             "created_at": chrono::Utc::now().to_rfc3339(),
                             "message": message,
                             "done": true,
+                            "thinking_duration": thinking_ns,
                             "done_reason": done_reason,
                             "total_duration": total_duration,
                             "load_duration": load_duration,
@@ -852,8 +859,16 @@ pub(crate) async fn ollama_chat(
                     )
                 };
                 let mut msg = msg;
+                let thinking_duration = thinking_share_ns(
+                    &engine,
+                    chat_thinking.as_deref(),
+                    result.eval_count,
+                    result.eval_duration,
+                )
+                .await;
                 msg.thinking = chat_thinking;
                 let mut response = OllamaChatResponse::new(model_name, msg);
+                response.thinking_duration = thinking_duration;
                 // "length" when we hit max_tokens, "stop" otherwise  -
                 // mirrors the streaming-path fix in a338be1.
                 let done_reason = result.finish_reason.ollama();
@@ -1371,20 +1386,40 @@ pub(crate) async fn ollama_generate(
                         let _gate_held = gate_guard;
                         let mut accumulated_text = String::new();
                         let mut chunk_count: usize = 0;
+                        let mut splitter = crate::api::thinking::ThinkSplit::new();
+                        let mut thought = false;
+                        let mut thinking_ns: Option<u64> = None;
                         while let Some(result) = rx.recv().await {
                             match result {
                                 Ok(chunk) => {
                                     accumulated_text.push_str(&chunk);
                                     chunk_count += 1;
-                                    let response_chunk = serde_json::json!({
-                                        "model": model_name_clone,
-                                        "created_at": chrono::Utc::now().to_rfc3339(),
-                                        "response": chunk,
-                                        "done": false
-                                    });
-                                    let mut line = response_chunk.to_string();
-                                    line.push('\n');
-                                    yield Ok::<_, std::io::Error>(axum::body::Bytes::from(line));
+                                    for seg in splitter.push(&chunk) {
+                                        let (response, thinking) = match seg {
+                                            crate::api::thinking::Segment::Thinking(t) => {
+                                                thought = true;
+                                                (String::new(), Some(t))
+                                            }
+                                            crate::api::thinking::Segment::Content(c) => {
+                                                if thought && thinking_ns.is_none() {
+                                                    thinking_ns = Some(start_time.elapsed().as_nanos() as u64);
+                                                }
+                                                (c, None)
+                                            }
+                                        };
+                                        let mut response_chunk = serde_json::json!({
+                                            "model": model_name_clone,
+                                            "created_at": chrono::Utc::now().to_rfc3339(),
+                                            "response": response,
+                                            "done": false
+                                        });
+                                        if let Some(t) = thinking {
+                                            response_chunk["thinking"] = serde_json::Value::String(t);
+                                        }
+                                        let mut line = response_chunk.to_string();
+                                        line.push('\n');
+                                        yield Ok::<_, std::io::Error>(axum::body::Bytes::from(line));
+                                    }
                                 }
                                 Err(e) => {
                                     error!("Spec-decode stream chunk error: {}", e);
@@ -1400,12 +1435,30 @@ pub(crate) async fn ollama_generate(
                         // The fallbacks are what this message used to carry on its own:
                         // chunk_count is the exact emitted-token count (an estimate over the
                         // accumulated text returned ~1, chunks being words with no spaces).
+                        for seg in splitter.finish() {
+                            let (response, thinking) = match seg {
+                                crate::api::thinking::Segment::Thinking(t) => (String::new(), Some(t)),
+                                crate::api::thinking::Segment::Content(c) => (c, None),
+                            };
+                            let mut frame = serde_json::json!({
+                                "model": model_name_clone,
+                                "created_at": chrono::Utc::now().to_rfc3339(),
+                                "response": response,
+                                "done": false
+                            });
+                            if let Some(t) = thinking {
+                                frame["thinking"] = serde_json::Value::String(t);
+                            }
+                            let mut line = frame.to_string();
+                            line.push('\n');
+                            yield Ok::<_, std::io::Error>(axum::body::Bytes::from(line));
+                        }
                         let stats = engine_for_stats.take_last_stream_stats();
                         let (done_from_engine, context_tokens) = match stats.as_ref() {
                             Some(s) => (Some(s.finish_reason.ollama()), s.context_tokens.clone()),
                             None => (None, Vec::new()),
                         };
-                        let done_reason = done_from_engine.unwrap_or(done_reason);
+                        let done_reason = done_from_engine.unwrap_or("stop");
                         let (eval_count, eval_duration, prompt_eval_count, prompt_eval_duration, total_duration) =
                             match stats {
                                 Some(s) => (
@@ -1428,6 +1481,7 @@ pub(crate) async fn ollama_generate(
                             "created_at": chrono::Utc::now().to_rfc3339(),
                             "response": "",
                             "done": true,
+                            "thinking_duration": thinking_ns,
                             "done_reason": done_reason,
                             "context": context_tokens,
                             "total_duration": total_duration,
@@ -1471,6 +1525,8 @@ pub(crate) async fn ollama_generate(
                 let stream = async_stream::stream! {
                     let _gate_held = gate_guard; // released when stream ends
                     let mut splitter = crate::api::thinking::ThinkSplit::new();
+                    let mut thought = false;
+                    let mut thinking_ns: Option<u64> = None;
                     let mut accumulated_text = String::new();
                     let mut chunk_count: usize = 0;
                     let mut errored = false;
@@ -1481,8 +1537,16 @@ pub(crate) async fn ollama_generate(
                                 chunk_count += 1;
                                 for seg in splitter.push(&chunk) {
                                     let (response, thinking) = match seg {
-                                        crate::api::thinking::Segment::Thinking(t) => (String::new(), Some(t)),
-                                        crate::api::thinking::Segment::Content(c) => (c, None),
+                                        crate::api::thinking::Segment::Thinking(t) => {
+                                            thought = true;
+                                            (String::new(), Some(t))
+                                        }
+                                        crate::api::thinking::Segment::Content(c) => {
+                                            if thought && thinking_ns.is_none() {
+                                                thinking_ns = Some(start_time.elapsed().as_nanos() as u64);
+                                            }
+                                            (c, None)
+                                        }
                                     };
                                     let mut response_chunk = serde_json::json!({
                                         "model": model_name_clone,
@@ -1574,6 +1638,7 @@ pub(crate) async fn ollama_generate(
                             "created_at": chrono::Utc::now().to_rfc3339(),
                             "response": "",
                             "done": true,
+                            "thinking_duration": thinking_ns,
                             "context": context_tokens,
                             "done_reason": done_reason,
                             "total_duration": total_duration,
@@ -1611,6 +1676,8 @@ pub(crate) async fn ollama_generate(
 
                 let (thinking, answer) = crate::api::thinking::split_thinking(&result.text);
                 let mut response = OllamaGenerateResponse::new(model_name, answer);
+                response.thinking_duration =
+                    thinking_share_ns(&engine, thinking.as_deref(), result.eval_count, result.eval_duration).await;
                 response.thinking = thinking;
                 let done_reason = result.finish_reason.ollama();
                 response.done_reason = Some(done_reason.to_string());
@@ -1637,4 +1704,20 @@ pub(crate) async fn ollama_generate(
             }
         }
     }
+}
+
+/// The share of a whole generation's decode time that went to the reasoning, by its
+/// share of the tokens: a whole answer arrives at once, so the boundary is not timed.
+async fn thinking_share_ns(
+    engine: &std::sync::Arc<LlmEngine>,
+    thinking: Option<&str>,
+    eval_count: u64,
+    eval_duration: u64,
+) -> Option<u64> {
+    let text = thinking?;
+    let thought = engine.count_tokens(text).await? as u64;
+    if eval_count == 0 {
+        return None;
+    }
+    Some(eval_duration.saturating_mul(thought.min(eval_count)) / eval_count)
 }
