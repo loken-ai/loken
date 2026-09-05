@@ -453,6 +453,11 @@ impl ModelManager {
         Ok(metadata)
     }
 
+    /// The Ollama store, for the endpoints that build models from blobs.
+    pub fn ollama(&self) -> &OllamaManager {
+        &self.ollama_manager
+    }
+
     /// Copies an Ollama model under another name.
     pub async fn copy_model(&self, source: &str, destination: &str) -> Result<()> {
         let (name, tag) = split_name_tag(source);

@@ -1804,7 +1804,23 @@ pub struct OllamaCopyRequest {
 /// validator crate without spinning up an axum router.
 #[derive(Debug, Clone, Serialize, Deserialize, validator::Validate)]
 pub struct OllamaCreateRequest {
+    /// `model` is what current clients send; `name` what earlier ones did.
+    #[serde(alias = "model")]
     pub name: String,
+    /// Blobs uploaded through `/api/blobs`, by file name and digest: the model's
+    /// weights and, optionally, a projector.
+    #[serde(default)]
+    pub files: Option<std::collections::HashMap<String, String>>,
+    /// Adapter blobs, by file name and digest.
+    #[serde(default)]
+    pub adapters: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    /// Conversation turns to build in; accepted and stored with the model's config.
+    #[serde(default)]
+    pub messages: Option<Vec<Message>>,
     /// Base model to derive from
     #[serde(default)]
     pub from: Option<String>,
