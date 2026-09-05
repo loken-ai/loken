@@ -182,6 +182,8 @@ pub(crate) async fn anthropic_messages(
         context_length: None,
         session_id: None,
         grammar,
+        logit_bias: None,
+        top_logprobs: None,
     };
 
     let gate_guard = match state

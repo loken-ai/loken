@@ -169,6 +169,8 @@ pub(super) fn extract_generation_options(options: Option<&serde_json::Value>) ->
 
     GenerationParams {
         prefix_tokens: None,
+        logit_bias: None,
+        top_logprobs: None,
         max_tokens: options
             .get("num_predict")
             .and_then(serde_json::Value::as_u64)
@@ -414,6 +416,12 @@ pub(crate) async fn ollama_chat(
 
     // Extract generation options
     let mut params = extract_generation_options(request.options.as_ref());
+    params.top_logprobs = if request.logprobs == Some(true) {
+        Some(request.top_logprobs.unwrap_or(0).min(20))
+    } else {
+        None
+    };
+    let wants_logprobs = request.logprobs == Some(true);
     // Ollama's `format` field: `"json"` -> json_object grammar; a JSON
     // Schema object -> strict json_schema grammar. Bridges Ollama's
     // structured-output knob to the same llguidance path the OpenAI
@@ -421,14 +429,6 @@ pub(crate) async fn ollama_chat(
     // precedence so explicit overrides via the options bag still win.
     if params.grammar.is_none() {
         params.grammar = ollama_format_to_grammar(request.format.as_ref());
-        if params.grammar.is_none() && tools_active {
-            if let (Some(only), Some(tools)) = (forced_call.as_ref(), request.tools.as_ref()) {
-                params.grammar = Some(format!(
-                    "json_schema:{}",
-                    crate::api::tool_calls::forced_call_schema(tools, only.as_deref())
-                ));
-            }
-        }
     }
 
     // Per-request kv_quant override (reload if the loaded engine differs).
@@ -517,6 +517,16 @@ pub(crate) async fn ollama_chat(
         }
         _ => None,
     };
+    // `required` or a named function: the call object is the grammar, unless the
+    // caller's `format` already set one.
+    if params.grammar.is_none() && tools_active {
+        if let (Some(only), Some(tools)) = (forced_call.as_ref(), request.tools.as_ref()) {
+            params.grammar = Some(format!(
+                "json_schema:{}",
+                crate::api::tool_calls::forced_call_schema(tools, only.as_deref())
+            ));
+        }
+    }
     let tool_format =
         crate::api::tool_calls::detect_tool_format(chat_template.as_deref(), &model_name);
     // qwen35moe (Qwen3-VL): the simple ChatML formatter doesn't render the
@@ -677,12 +687,18 @@ pub(crate) async fn ollama_chat(
                                             serde_json::json!({"role": "assistant", "content": emit})
                                         }
                                     };
-                                    let response_chunk = serde_json::json!({
+                                    let mut response_chunk = serde_json::json!({
                                         "model": model_name_clone,
                                         "created_at": chrono::Utc::now().to_rfc3339(),
                                         "message": message,
                                         "done": false
                                     });
+                                    if wants_logprobs {
+                                        let drawn = engine_for_stats.take_logprobs();
+                                        if !drawn.is_empty() {
+                                            response_chunk["logprobs"] = ollama_logprobs(&drawn);
+                                        }
+                                    }
                                     let mut line = response_chunk.to_string();
                                     line.push('\n');
                                     yield Ok::<_, std::io::Error>(axum::body::Bytes::from(line));
@@ -835,7 +851,7 @@ pub(crate) async fn ollama_chat(
         let energy = crate::energy_report::begin();
 
         let _cancel = engine.cancel_guard();
-        match engine.generate(&prompt, params).await {
+        match engine.generate(&prompt, params).await.map_err(|e| e.to_string()) {
             Ok(result) => {
                 crate::energy_report::end(energy, "text", "[/api/chat]");
                 let total_duration = start.elapsed().as_nanos() as u64;
@@ -873,6 +889,9 @@ pub(crate) async fn ollama_chat(
                 .await;
                 msg.thinking = chat_thinking;
                 let mut response = OllamaChatResponse::new(model_name, msg);
+                if !result.logprobs.is_empty() {
+                    response.logprobs = Some(ollama_logprobs(&result.logprobs));
+                }
                 response.thinking_duration = thinking_duration;
                 // "length" when we hit max_tokens, "stop" otherwise  -
                 // mirrors the streaming-path fix in a338be1.
@@ -1246,6 +1265,12 @@ pub(crate) async fn ollama_generate(
 
     // Extract generation options
     let mut params = extract_generation_options(request.options.as_ref());
+    params.top_logprobs = if request.logprobs == Some(true) {
+        Some(request.top_logprobs.unwrap_or(0).min(20))
+    } else {
+        None
+    };
+    let wants_logprobs = request.logprobs == Some(true);
     // Ollama continuation: the context a previous reply returned is the token prefix
     // this generation resumes from - replayed as tokens, never re-detokenised.
     if let Some(ctx) = request.context.as_ref() {
@@ -1418,6 +1443,12 @@ pub(crate) async fn ollama_generate(
                                             "response": response,
                                             "done": false
                                         });
+                                        if wants_logprobs {
+                                            let drawn = engine_for_stats.take_logprobs();
+                                            if !drawn.is_empty() {
+                                                response_chunk["logprobs"] = ollama_logprobs(&drawn);
+                                            }
+                                        }
                                         if let Some(t) = thinking {
                                             response_chunk["thinking"] = serde_json::Value::String(t);
                                         }
@@ -1559,6 +1590,12 @@ pub(crate) async fn ollama_generate(
                                         "response": response,
                                         "done": false
                                     });
+                                    if wants_logprobs {
+                                        let drawn = engine_for_stats.take_logprobs();
+                                        if !drawn.is_empty() {
+                                            response_chunk["logprobs"] = ollama_logprobs(&drawn);
+                                        }
+                                    }
                                     if let Some(t) = thinking {
                                         response_chunk["thinking"] = serde_json::Value::String(t);
                                     }
@@ -1675,13 +1712,16 @@ pub(crate) async fn ollama_generate(
         let energy = crate::energy_report::begin();
 
         let _cancel = engine.cancel_guard();
-        match engine.generate(&effective_prompt, params).await {
+        match engine.generate(&effective_prompt, params).await.map_err(|e| e.to_string()) {
             Ok(result) => {
                 crate::energy_report::end(energy, "text", "[/api/generate]");
                 let total_duration = start.elapsed().as_nanos() as u64;
 
                 let (thinking, answer) = crate::api::thinking::split_thinking(&result.text);
                 let mut response = OllamaGenerateResponse::new(model_name, answer);
+                if !result.logprobs.is_empty() {
+                    response.logprobs = Some(ollama_logprobs(&result.logprobs));
+                }
                 response.thinking_duration =
                     thinking_share_ns(&engine, thinking.as_deref(), result.eval_count, result.eval_duration).await;
                 response.thinking = thinking;

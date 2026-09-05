@@ -5,7 +5,8 @@
 //! here, which is the reach they had when they sat beside their callers.
 
 use super::*;
-use super::params::FinishReason;
+use super::params::{FinishReason, TokenLogprob};
+use crate::inference::engine::decode_step::record_logprobs;
 
 impl LlmEngine {
     /// Unload the current model
@@ -181,6 +182,7 @@ impl LlmEngine {
                 eval_duration: t0.elapsed().saturating_sub(ttft).as_nanos() as u64,
                 cached_prompt_tokens: 0,
                 finish_reason: FinishReason::Eos,
+                logprobs: Vec::new(),
             });
         }
         let model_state = self.model_state.clone();
@@ -358,6 +360,9 @@ impl LlmEngine {
 
             // Build logits processor with resolved parameters
             let mut logits_processor = resolved.make_logits_processor();
+            logits_processor.set_logit_bias(params.logit_bias.clone());
+            logits_processor.set_top_logprobs(params.top_logprobs);
+            let mut logprob_acc: Vec<TokenLogprob> = Vec::new();
 
             // Track recent tokens for repetition penalty
             let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
@@ -493,6 +498,7 @@ impl LlmEngine {
             }
             let logits = apply_repeat_penalty(&logits.squeeze(0)?, &recent_tokens, repeat_penalty, repeat_last_n)?;
             let mut next_token = logits_processor.sample(&logits)?;
+            record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
 
             let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
@@ -763,6 +769,7 @@ impl LlmEngine {
                         };
                         let logits = apply_repeat_penalty(&logits.squeeze(0)?, &recent_tokens, repeat_penalty, repeat_last_n)?;
                         next_token = logits_processor.sample(&logits)?;
+                        record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
 
                         let spec_ms = t_spec.elapsed().as_secs_f64() * 1000.0;
                         let tokens_produced = accepted + 1; // accepted drafts + 1 verify
@@ -1056,6 +1063,7 @@ impl LlmEngine {
                                                     &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                                                     temperature, top_k, &mut logits_processor,
                                                 )?;
+                                                record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                                 continue;
                                             }
                                         }
@@ -1077,6 +1085,7 @@ impl LlmEngine {
                                     &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                                     temperature, top_k, &mut logits_processor,
                                 )?;
+                                record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                 continue;
                             }
                             Err(e) => {
@@ -1127,6 +1136,7 @@ impl LlmEngine {
                             &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                             temperature, top_k, &mut logits_processor,
                         )?;
+                        record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                         continue;
                     }
 
@@ -1223,6 +1233,7 @@ impl LlmEngine {
                                                             &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                                                             temperature, top_k, &mut logits_processor,
                                                         )?;
+                                                        record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                                         graph_logits = Some(logits);
                                                         cuda_graph = Some(g);
                                                         continue;
@@ -1237,6 +1248,7 @@ impl LlmEngine {
                                                         &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                                                         temperature, top_k, &mut logits_processor,
                                                     )?;
+                                                    record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                                     state.model.invalidate_graph_state();
                                                     ctx.free_capture_arena();
                                                     continue;
@@ -1252,6 +1264,7 @@ impl LlmEngine {
                                                         &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                                                         temperature, top_k, &mut logits_processor,
                                                     )?;
+                                                    record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                                     graph_logits = Some(logits);
                                                     cuda_graph = Some(g);
                                                     continue;
@@ -1273,6 +1286,7 @@ impl LlmEngine {
                                                 &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                                                 temperature, top_k, &mut logits_processor,
                                             )?;
+                                            record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                             state.model.invalidate_graph_state();
                                             ctx.free_capture_arena();
                                             continue;
@@ -1297,6 +1311,7 @@ impl LlmEngine {
                                         &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                                         temperature, top_k, &mut logits_processor,
                                     )?;
+                                    record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                     state.model.invalidate_graph_state();
                                     ctx.free_capture_arena();
                                     continue;
@@ -1623,6 +1638,7 @@ impl LlmEngine {
                 eval_duration,
                 cached_prompt_tokens: cache_session_start as u64,
                 finish_reason,
+                logprobs: logprob_acc,
             })
         }).await
             .map_err(|e| format!("spawn_blocking error: {e}").into());
@@ -1695,6 +1711,9 @@ impl LlmEngine {
 
             let sampling = build_sampling_from(temperature, top_p, top_k);
             let mut logits_processor = LogitsProcessor::from_sampling(seed, sampling);
+            logits_processor.set_logit_bias(params.logit_bias.clone());
+            logits_processor.set_top_logprobs(params.top_logprobs);
+            let mut logprob_acc: Vec<TokenLogprob> = Vec::new();
 
             state
                 .model
@@ -1751,6 +1770,7 @@ impl LlmEngine {
 
                 let logits_t = Tensor::from_vec(logits_vec, (state.vocab_size,), &Device::Cpu)?;
                 let next_token = logits_processor.sample(&logits_t)?;
+                record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
 
                 let commit = constraint
                     .commit_token(Some(next_token))
@@ -1799,6 +1819,7 @@ impl LlmEngine {
                 } else {
                     FinishReason::Eos
                 },
+                logprobs: logprob_acc,
                 eval_count: generated_tokens.len() as u64,
                 eval_duration,
             })
@@ -1833,6 +1854,7 @@ impl LlmEngine {
         let config = self.config.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(64);
 
+        let logprob_queue = self.logprob_queue.clone();
         std::thread::spawn(move || {
             let mut guard = model_state.blocking_lock();
             let state = match guard.as_mut() {
@@ -1903,6 +1925,9 @@ impl LlmEngine {
 
             let sampling = build_sampling_from(temperature, top_p, top_k);
             let mut logits_processor = LogitsProcessor::from_sampling(seed, sampling);
+            logits_processor.set_logit_bias(params.logit_bias.clone());
+            logits_processor.set_top_logprobs(params.top_logprobs);
+            let mut logprob_acc: Vec<TokenLogprob> = Vec::new();
 
             state
                 .model
@@ -1994,6 +2019,12 @@ impl LlmEngine {
                         return;
                     }
                 };
+                record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
+                if !logprob_acc.is_empty() {
+                    if let Ok(mut q) = logprob_queue.lock() {
+                        q.append(&mut logprob_acc);
+                    }
+                }
 
                 let commit = match constraint.commit_token(Some(next_token)) {
                     Ok(c) => c,

@@ -231,6 +231,8 @@ pub(super) async fn classify_route_llm(
         max_tokens: Some(4),
         temperature: Some(0.0),
         grammar: Some(ROUTER_GRAMMAR.to_string()),
+        logit_bias: None,
+        top_logprobs: None,
         ..Default::default()
     };
     let out = engine.generate(&prompt, params).await.ok()?;

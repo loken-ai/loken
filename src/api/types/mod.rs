@@ -209,6 +209,11 @@ fn default_stream_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct OllamaChatRequest {
     pub model: String,
+    /// Report each token's log-probability, with `top_logprobs` alternatives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<usize>,
     /// Same 4096-entry cap + per-Message nested validation as
     /// ChatCompletionRequest.messages (231b3a4). Recursively validates
     /// each Message (role/content min length, images max length).
@@ -272,6 +277,9 @@ impl OllamaChatRequest {
             thinking: None,
             think: None,
             tools: None,
+            logprobs: None,
+            top_logprobs: None,
+            tool_choice: None,
         }
     }
 }
@@ -283,6 +291,9 @@ pub struct OllamaChatResponse {
     pub created_at: String,
     pub message: Message,
     pub done: bool,
+    /// Per token, when the request asked for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<serde_json::Value>,
     /// Reason request ended: "stop", "load", "unload" (or null if streaming/not done)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done_reason: Option<String>,
@@ -336,6 +347,7 @@ impl OllamaChatResponse {
             eval_duration: None,
             thinking: None,
             thinking_duration: None,
+            logprobs: None,
             structured_output: None,
             tool_calls: None,
             vision_processed: None,
@@ -347,6 +359,11 @@ impl OllamaChatResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct OllamaGenerateRequest {
     pub model: String,
+    /// Report each token's log-probability, with `top_logprobs` alternatives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<usize>,
     /// System prompt, rendered as the model's system turn as Ollama renders it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
@@ -459,6 +476,10 @@ impl OllamaGenerateRequest {
             raw: None,
             context: None,
             suffix: None,
+            logprobs: None,
+            top_logprobs: None,
+            system: None,
+            template: None,
         }
     }
 }
@@ -470,6 +491,9 @@ pub struct OllamaGenerateResponse {
     pub created_at: String,
     pub response: String,
     pub done: bool,
+    /// Per token, when the request asked for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<serde_json::Value>,
     /// Reason request ended: "stop", "load", "unload" (or null if streaming/not done)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done_reason: Option<String>,
@@ -532,6 +556,7 @@ impl OllamaGenerateResponse {
             eval_duration: None,
             thinking: None,
             thinking_duration: None,
+            logprobs: None,
             structured_output: None,
             tool_calls: None,
             vision_processed: None,
@@ -964,6 +989,9 @@ pub struct ChatCompletionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(range(min = 1, max = 131072))]
     pub max_completion_tokens: Option<usize>,
+    /// Token id (as a string, as OpenAI keys it) to a bias added to its logit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     /// OpenAI's reasoning effort; `none` and `minimal` switch a reasoning model's
     /// thinking off, the other levels leave it on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1126,6 +1154,10 @@ impl ChatCompletionRequest {
             tool_choice: None,
             parallel_tool_calls: None,
             service_tier: None,
+            max_completion_tokens: None,
+            logit_bias: None,
+            reasoning_effort: None,
+            modalities: None,
         }
     }
 

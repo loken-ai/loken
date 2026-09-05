@@ -323,3 +323,21 @@ pub(crate) fn spec_draft_lockstep(
         spec_engine.draft_trim_kv(new_pos);
     }
 }
+
+/// Moves the sampler's last log-probabilities, if it kept any, into `sink`, decoded.
+pub(crate) fn record_logprobs(
+    tokenizer: &Tokenizer,
+    logits_processor: &mut LogitsProcessor,
+    sink: &mut Vec<crate::inference::engine::llm_engine::TokenLogprob>,
+) {
+    let Some(lp) = logits_processor.take_last_logprobs() else {
+        return;
+    };
+    let piece = |id: u32| tokenizer.decode(&[id], false).unwrap_or_default();
+    sink.push(crate::inference::engine::llm_engine::TokenLogprob {
+        token: lp.token,
+        text: piece(lp.token),
+        logprob: lp.logprob,
+        top: lp.top.into_iter().map(|(id, l)| (id, piece(id), l)).collect(),
+    });
+}

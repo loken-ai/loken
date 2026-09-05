@@ -187,15 +187,10 @@ pub(crate) async fn chat_completion(
         out["usage"]["total_tokens"] = serde_json::json!(prompt_tokens + completion_tokens);
         return Ok(Json(out).into_response());
     }
-    if request.logprobs == Some(true) {
-        return Err(ApiError::Validation(
-            "`logprobs: true` not supported on this server; omit or pass false".into(),
-        ));
-    }
     if let Some(k) = request.top_logprobs {
-        if k > 0 {
+        if k > 20 {
             return Err(ApiError::Validation(format!(
-                "`top_logprobs` = {k} not supported on this server; omit or pass 0"
+                "`top_logprobs` = {k}; the cap is 20"
             )));
         }
     }
@@ -422,6 +417,16 @@ pub(crate) async fn chat_completion(
         context_length: None, // OpenAI endpoint doesn't expose num_ctx
         session_id: request.user.take(),
         grammar,
+        logit_bias: request.logit_bias.as_ref().map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| k.parse::<u32>().ok().map(|id| (id, *v)))
+                .collect()
+        }),
+        top_logprobs: if request.logprobs == Some(true) {
+            Some(request.top_logprobs.unwrap_or(0))
+        } else {
+            None
+        },
     };
 
     // OpenAI's chat-completion request struct doesn't expose a priority
@@ -466,6 +471,7 @@ pub(crate) async fn chat_completion(
             .unwrap_or_else(|| "default".to_string());
         // Streaming response using SSE (OpenAI-compatible format)
         let engine_for_stats = engine.clone();
+        let wants_logprobs = request.logprobs == Some(true);
         match engine.generate_stream(&prompt, params.clone()).await {
             Ok(mut rx) => {
                 let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -538,6 +544,16 @@ pub(crate) async fn chat_completion(
                                         None,
                                     );
                                     chunk.service_tier = service_tier.clone();
+                                    if wants_logprobs {
+                                        let drawn = engine_for_stats.take_logprobs();
+                                        if !drawn.is_empty() {
+                                            if let Some(c) = chunk.choices.first_mut() {
+                                                c.logprobs = Some(serde_json::json!({
+                                                    "content": openai_logprobs_content(&drawn)
+                                                }));
+                                            }
+                                        }
+                                    }
                                     yield Ok(Event::default().data(to_json_string!(&chunk)));
                                 }
                             }
@@ -754,10 +770,12 @@ pub(crate) async fn chat_completion(
         // before the read sites, so the compiler's still happy.
         let timing_prefill_ms: Option<f64>;
         let timing_decode_ms: Option<f64>;
-        let (content, finish_reason, completion_tokens, prompt_tokens) =
             let _cancel = engine.cancel_guard();
+        let mut result_logprobs: Vec<crate::inference::engine::llm_engine::TokenLogprob> = Vec::new();
+        let (content, finish_reason, completion_tokens, prompt_tokens) =
             match engine.generate(&prompt, params).await {
                 Ok(result) => {
+                    result_logprobs = result.logprobs.clone();
                     // OpenAI's `finish_reason`: `length` when we hit
                     // max_tokens, `stop` when the model emitted an EOS
                     // token / stop sequence. Inferred from eval_count vs
@@ -813,10 +831,16 @@ pub(crate) async fn chat_completion(
         let mut message = message;
         message.reasoning_content = reasoning.clone();
         let finish_for_log = finish_reason.clone();
+        let mut choice = Choice::new(0, message, finish_reason);
+        if !result_logprobs.is_empty() {
+            choice.logprobs = Some(serde_json::json!({
+                "content": openai_logprobs_content(&result_logprobs)
+            }));
+        }
         let mut response = ChatCompletionResponse::new(
             format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             model_name,
-            vec![Choice::new(0, message, finish_reason)],
+            vec![choice],
             Usage::new(prompt_tokens, completion_tokens),
         );
         if let Some(r) = reasoning.as_deref() {
@@ -1056,20 +1080,12 @@ pub(crate) async fn text_completions(
     // 400 instead of returning `logprobs: null` to clients expecting
     // populated data - the latter looks like a silent compute miss.
     // Accept the explicit `logprobs: null` / 0 forms (no-op).
-    if let Some(lp) = body.get("logprobs") {
-        let asked_for_logprobs = match lp {
-            serde_json::Value::Null => false,
-            serde_json::Value::Number(n) => n.as_u64().map(|v| v > 0).unwrap_or(false),
-            serde_json::Value::Bool(b) => *b,
-            _ => true,
-        };
-        if asked_for_logprobs {
-            return Err(ApiError::Validation(
-                "`logprobs` is not supported on this server; pass null/0/false or omit the field"
-                    .to_string(),
-            ));
-        }
-    }
+    // `logprobs: n` asks for each token's log-probability with `n` alternatives.
+    let completion_logprobs: Option<usize> = match body.get("logprobs") {
+        Some(serde_json::Value::Number(n)) => n.as_u64().map(|v| v.min(20) as usize),
+        Some(serde_json::Value::Bool(true)) => Some(0),
+        _ => None,
+    };
     // Same fail-fast for `best_of` (sample N, return top 1) - would
     // require Nx decode + ranking. Default 1 / null is fine; > 1 is
     // rejected so clients don't think they're getting best-of-N output
@@ -1315,6 +1331,8 @@ pub(crate) async fn text_completions(
         // but several SDKs send it on /v1/completions too. Wire it to the
         // same grammar engine so structured outputs work either way.
         grammar: response_format_to_grammar(body.get("response_format")),
+        logit_bias: None,
+        top_logprobs: completion_logprobs,
     };
     // OpenAI's frequency/presence penalties - same additive mapping
     // as the chat-completions handler. Out-of-range values are
@@ -1366,6 +1384,7 @@ pub(crate) async fn text_completions(
         let mn = model_name.clone();
         let stream_started = std::time::Instant::now();
         let mut echo_pending = echo_text.clone();
+        let mut text_offset = echo_text.len();
         let stream = async_stream::stream! {
             let _gate_held = gate_guard;
             let mut rx = rx;
@@ -1391,7 +1410,20 @@ pub(crate) async fn text_completions(
                                     t
                                 },
                                 "index": 0,
-                                "logprobs": serde_json::Value::Null,
+                                "logprobs": {
+                                    let drawn = if completion_logprobs.is_some() {
+                                        engine_for_stats.take_logprobs()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let v = if drawn.is_empty() {
+                                        serde_json::Value::Null
+                                    } else {
+                                        completions_logprobs(&drawn, text_offset)
+                                    };
+                                    text_offset += text.len();
+                                    v
+                                },
                                 "finish_reason": serde_json::Value::Null,
                             }],
                         });
@@ -1497,7 +1529,11 @@ pub(crate) async fn text_completions(
         "choices": [{
             "text": format!("{echo_text}{}", result.text),
             "index": 0,
-            "logprobs": serde_json::Value::Null,
+            "logprobs": if result.logprobs.is_empty() {
+                serde_json::Value::Null
+            } else {
+                completions_logprobs(&result.logprobs, echo_text.len())
+            },
             "finish_reason": finish,
         }],
         "usage": {

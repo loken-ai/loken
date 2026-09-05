@@ -229,6 +229,9 @@ pub struct LlmEngine {
     /// generation loops read it between tokens. One request runs at a time on an
     /// engine, so one flag is enough.
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Log-probabilities of the tokens a stream has drawn and not yet handed out; the
+    /// handler drains it after each chunk.
+    logprob_queue: Arc<std::sync::Mutex<Vec<TokenLogprob>>>,
     last_error: Arc<Mutex<Option<String>>>,
     cached_model_size: Arc<Mutex<u64>>,
     /// Session-persistent KV cache tracking. A single model has a single live
@@ -253,6 +256,7 @@ impl InferenceEngine for LlmEngine {
             draft_engine: Arc::new(Mutex::new(None)),
             kv_disk: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            logprob_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -285,11 +289,12 @@ impl LlmEngine {
     /// Create new engine with config
     pub fn with_config(config: InferenceConfig) -> Self {
         Self {
+            kv_disk: open_kv_disk(&config),
             config,
             model_state: Arc::new(Mutex::new(None)),
             draft_engine: Arc::new(Mutex::new(None)),
-            kv_disk: open_kv_disk(&config),
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            logprob_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -688,6 +693,15 @@ impl LlmEngine {
             self.config.context_length,
             None,
         ))
+    }
+
+
+    /// The log-probabilities a stream has drawn since the last call.
+    pub fn take_logprobs(&self) -> Vec<TokenLogprob> {
+        self.logprob_queue
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
     }
 
 

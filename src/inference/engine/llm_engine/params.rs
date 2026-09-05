@@ -338,6 +338,16 @@ impl FinishReason {
     }
 }
 
+/// One generated token's log-probability, with the alternatives asked for, each
+/// decoded so a surface can print it.
+#[derive(Debug, Clone)]
+pub struct TokenLogprob {
+    pub token: u32,
+    pub text: String,
+    pub logprob: f32,
+    pub top: Vec<(u32, String, f32)>,
+}
+
 /// Result of a generation call, including timing and token count metrics.
 #[derive(Debug, Clone)]
 pub struct GenerationResult {
@@ -362,6 +372,8 @@ pub struct GenerationResult {
     /// Prompt tokens served from the resident KV rather than prefilled.
     pub cached_prompt_tokens: u64,
     pub finish_reason: FinishReason,
+    /// Per generated token, when `top_logprobs` asked for them.
+    pub logprobs: Vec<TokenLogprob>,
 }
 
 /// Per-request generation parameters that override InferenceConfig defaults
@@ -408,6 +420,11 @@ pub struct GenerationParams {
     /// path that masks logits with the parser's allowed-token bitset before
     /// every sample. Speculative/PLD paths are bypassed.
     pub grammar: Option<String>,
+    /// Added to the named tokens' logits before every draw; `-inf` bans a token.
+    pub logit_bias: Option<std::collections::HashMap<u32, f32>>,
+    /// Report each drawn token's log-probability with this many alternatives; `Some(0)`
+    /// reports the drawn token alone. Costs a host copy of the logits per token.
+    pub top_logprobs: Option<usize>,
 }
 
 // The per-architecture dispatch enum (`ModelVariant`) was replaced by the

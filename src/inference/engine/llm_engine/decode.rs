@@ -53,8 +53,15 @@ pub(crate) fn gpu_sample(
     repeat_last_n: usize,
     _temperature: f32,
     _top_k: usize,
-    _logits_processor: &mut crate::inference::sample::token_sampling::LogitsProcessor,
+    logits_processor: &mut crate::inference::sample::token_sampling::LogitsProcessor,
 ) -> crate::tensor::Result<u32> {
+    // A bias or a log-probability request is served on the host, where the sampler
+    // reads the whole row; the device argmax knows neither.
+    if logits_processor.needs_host() {
+        let cpu = logits.to_device(&Device::Cpu)?;
+        let cpu = apply_repeat_penalty(&cpu, recent_tokens, repeat_penalty, repeat_last_n)?;
+        return logits_processor.sample(&cpu);
+    }
     // Fused repeat penalty + argmax in a single CUDA kernel (1 launch vs 6+)
     #[cfg(feature = "cuda")]
     if logits.device().is_cuda() {

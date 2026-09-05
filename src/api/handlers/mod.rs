@@ -2109,3 +2109,50 @@ async fn mirror_request_id(
     }
     res
 }
+
+/// OpenAI's `logprobs.content[]` entries for chat completions.
+pub(crate) fn openai_logprobs_content(
+    lps: &[crate::inference::engine::llm_engine::TokenLogprob],
+) -> serde_json::Value {
+    serde_json::json!(lps
+        .iter()
+        .map(|lp| {
+            serde_json::json!({
+                "token": lp.text,
+                "logprob": lp.logprob,
+                "bytes": lp.text.as_bytes(),
+                "top_logprobs": lp.top.iter().map(|(_, t, l)| serde_json::json!({
+                    "token": t, "logprob": l, "bytes": t.as_bytes()
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
+/// Ollama's `logprobs[]` entries, the same shape.
+pub(crate) fn ollama_logprobs(
+    lps: &[crate::inference::engine::llm_engine::TokenLogprob],
+) -> serde_json::Value {
+    openai_logprobs_content(lps)
+}
+
+/// The legacy completions shape: parallel arrays.
+pub(crate) fn completions_logprobs(
+    lps: &[crate::inference::engine::llm_engine::TokenLogprob],
+    offset_base: usize,
+) -> serde_json::Value {
+    let mut offset = offset_base;
+    let mut offsets = Vec::with_capacity(lps.len());
+    for lp in lps {
+        offsets.push(offset);
+        offset += lp.text.len();
+    }
+    serde_json::json!({
+        "tokens": lps.iter().map(|lp| lp.text.clone()).collect::<Vec<_>>(),
+        "token_logprobs": lps.iter().map(|lp| lp.logprob).collect::<Vec<_>>(),
+        "top_logprobs": lps.iter().map(|lp| {
+            lp.top.iter().map(|(_, t, l)| (t.clone(), *l)).collect::<std::collections::BTreeMap<_, _>>()
+        }).collect::<Vec<_>>(),
+        "text_offset": offsets,
+    })
+}

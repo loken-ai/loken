@@ -5,7 +5,8 @@
 //! here, which is the reach they had when they sat beside their callers.
 
 use super::*;
-use super::params::FinishReason;
+use super::params::{FinishReason, TokenLogprob};
+use crate::inference::engine::decode_step::record_logprobs;
 
 impl LlmEngine {
     /// Generate stream - returns channel receiver for streaming tokens with real model inference
@@ -145,6 +146,7 @@ impl LlmEngine {
         }
 
         let model_state = self.model_state.clone();
+        let logprob_queue = self.logprob_queue.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
         let config = self.config.clone();
@@ -194,6 +196,10 @@ impl LlmEngine {
             // block builds it and a third time where the block resolves it, the same list
             // said the same thing three times - and a knob added to it reached the decode
             // loop only if all three were remembered.
+            // Log-probabilities gathered between two chunks, and the prompt tokens the
+            // session cache already held: both outlive the prefill block.
+            let mut logprob_buf: Vec<TokenLogprob> = Vec::new();
+            let reused_prompt_tokens: usize;
             let (
                 mut next_token,
                 mut pos,
@@ -518,6 +524,7 @@ impl LlmEngine {
                         }
                     }
                 };
+                reused_prompt_tokens = session_start;
                 if session_start > 0 {
                     debug!(
                         "♻️  Session reuse: skipping prefill of {} tokens, \
@@ -735,6 +742,9 @@ impl LlmEngine {
                     }
                 };
                 let mut logits_processor = resolved.make_logits_processor();
+                logits_processor.set_logit_bias(params.logit_bias.clone());
+                logits_processor.set_top_logprobs(params.top_logprobs);
+                logprob_buf.clear();
                 let penalized = match apply_repeat_penalty(
                     &squeezed,
                     &prompt_tokens,
@@ -756,6 +766,7 @@ impl LlmEngine {
                         return;
                     }
                 };
+                record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_buf);
                 // The id itself is content; that prefill produced one is not.
                 debug!("STREAMING PREFILL: first token sampled");
 
@@ -980,6 +991,11 @@ impl LlmEngine {
             let mut next_token_dev: Option<Tensor> = None;
 
             'stream_loop: while next_token != eos_token_id && token_count < max_tokens {
+                if !logprob_buf.is_empty() {
+                    if let Ok(mut q) = logprob_queue.lock() {
+                        q.append(&mut logprob_buf);
+                    }
+                }
                 // Prefill ends where its token exists, not where its forward pass returned.
                 if prefill_end.is_none() {
                     prefill_end = Some(std::time::Instant::now());
@@ -1350,7 +1366,7 @@ impl LlmEngine {
                                         return;
                                     }
                                 };
-                                if temperature == 0.0 {
+                                if temperature == 0.0 && !logits_processor.needs_host() {
                                     match gpu_sample_returning_tensor(
                                         &logits_1d,
                                         &recent_tokens,
@@ -1609,6 +1625,7 @@ impl LlmEngine {
                         // reachable) - fall through to the eager path.
                         break 'graph_blk None;
                     };
+                    record_logprobs(&stream_tokenizer, &mut logits_processor, &mut logprob_buf);
                     #[cfg(feature = "cuda")]
                     if let Some((tok, dev_tok)) = graph_step {
                         next_token = tok;
@@ -2027,6 +2044,11 @@ impl LlmEngine {
                 None => 0u64,
             };
             if let Ok(mut slot) = stream_stats_slot.lock() {
+                if !logprob_buf.is_empty() {
+                    if let Ok(mut q) = logprob_queue.lock() {
+                        q.append(&mut logprob_buf);
+                    }
+                }
                 let finish_reason = if let Some(hit) = stop_tracker.matched() {
                     FinishReason::StopSequence(hit.to_string())
                 } else if next_token == eos_token_id {
@@ -2039,10 +2061,10 @@ impl LlmEngine {
                 *slot = Some(StreamStats {
                     eval_count: token_count as u64,
                     eval_duration_ns: compute_ns,
-                    prompt_eval_count: prompt_tokens.len().saturating_sub(session_start) as u64,
+                    prompt_eval_count: prompt_tokens.len().saturating_sub(reused_prompt_tokens) as u64,
                     prompt_eval_duration_ns,
                     total_duration_ns,
-                    cached_prompt_tokens: session_start as u64,
+                    cached_prompt_tokens: reused_prompt_tokens as u64,
                     finish_reason,
                     context_tokens: {
                         let mut full = prompt_tokens.clone();
