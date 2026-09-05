@@ -107,6 +107,7 @@ impl Client {
         let request = OllamaShowRequest {
             model: model_name.to_string(),
             name: String::new(),
+            verbose: false,
         };
 
         let response = self.http_client.post(&url).json(&request).send().await?;

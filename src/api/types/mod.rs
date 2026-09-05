@@ -545,6 +545,8 @@ impl OllamaGenerateResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaModel {
     pub name: String,
+    /// The same identifier under the key current clients read.
+    pub model: String,
     pub modified_at: String,
     pub size: u64,
     #[serde(default)]
@@ -576,6 +578,7 @@ impl OllamaModel {
         Self {
             capabilities: Vec::new(),
             defaults: None,
+            model: name.clone(),
             name,
             modified_at,
             size,
@@ -689,6 +692,9 @@ pub struct OllamaShowRequest {
     /// Deprecated field for model name (use model instead)
     #[serde(default)]
     pub name: String,
+    /// With it, `model_info` carries the tokenizer's vocabulary arrays too.
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 /// Ollama show model response

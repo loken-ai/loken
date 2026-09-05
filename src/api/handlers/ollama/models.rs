@@ -71,12 +71,29 @@ pub(crate) async fn ollama_list_models(
                         ModelSource::HuggingFace => "safetensors",
                         _ => "gguf",
                     };
+                    // What the checkpoint says about itself, read from its header, then
+                    // the name and the byte size where it says nothing.
+                    let (arch, quant, declared) = match source {
+                        ModelSource::Ollama => state
+                            .manifest_layer_path(&m.id, "model")
+                            .map(|w| {
+                                let (_, arch, quant, declared) = gguf_facts(&w);
+                                (arch, quant, declared)
+                            })
+                            .unwrap_or((None, None, None)),
+                        _ => (None, None, None),
+                    };
+                    let family = arch
+                        .clone()
+                        .unwrap_or_else(|| infer_model_family(&m.id).to_string());
                     let details = OllamaModelDetails {
                         format: format_str.to_string(),
-                        family: infer_model_family(&m.id).to_string(),
-                        families: None,
-                        parameter_size: estimate_parameter_size(m.size, format_str),
-                        quantization_level: None,
+                        families: Some(vec![family.clone()]),
+                        family,
+                        parameter_size: declared
+                            .map(format_parameter_count)
+                            .unwrap_or_else(|| estimate_parameter_size(m.size, format_str)),
+                        quantization_level: quant,
                     };
                     {
                         let mut om = OllamaModel::new(m.id.clone(), m.size, m.downloaded_at)
@@ -1094,10 +1111,43 @@ pub(crate) async fn ollama_show_model(
                         .collect();
                     (!names.is_empty()).then_some(names)
                 });
+            let license = state.read_manifest_layer(&model_name, "license");
+            let parameters = state.read_model_parameters(&model_name);
+            let system = state.read_manifest_layer(&model_name, "system");
+            // A Modelfile that would rebuild this model from its own blobs: what
+            // `ollama show --modelfile` prints.
+            let modelfile = {
+                let mut mf = format!("FROM {}\n", weights.display());
+                if let Some(t) = template.as_deref() {
+                    mf.push_str(&format!("TEMPLATE \"\"\"{t}\"\"\"\n"));
+                }
+                if let Some(sys) = system.as_deref() {
+                    mf.push_str(&format!("SYSTEM \"\"\"{sys}\"\"\"\n"));
+                }
+                if let Some(p) = parameters.as_deref() {
+                    mf.push_str(p);
+                    if !p.ends_with('\n') {
+                        mf.push('\n');
+                    }
+                }
+                if let Some(l) = license.as_deref() {
+                    mf.push_str(&format!("LICENSE \"\"\"{l}\"\"\"\n"));
+                }
+                Some(mf)
+            };
+            // The vocabulary arrays weigh megabytes; Ollama sends them only when asked.
+            let model_info = if request.verbose {
+                model_info
+            } else {
+                model_info.map(|mut m| {
+                    m.retain(|k, v| !(k.starts_with("tokenizer.ggml.") && v.is_array()));
+                    m
+                })
+            };
             Ok(Json(OllamaShowResponse {
-                license: state.read_manifest_layer(&model_name, "license"),
-                modelfile: None,
-                parameters: state.read_model_parameters(&model_name),
+                license,
+                modelfile,
+                parameters,
                 template,
                 details: Some(OllamaModelDetails {
                     format: field("model_format").unwrap_or_else(|| format_str.to_string()),
