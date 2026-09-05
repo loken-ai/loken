@@ -374,6 +374,7 @@ pub(crate) fn composite_preserved(
 /// plus our extensions `strength` (0..1) and `seed` (u64).
 pub(crate) async fn images_edits(
     state: axum::extract::State<APIServer>,
+    headers: axum::http::HeaderMap,
     mut multipart: axum::extract::Multipart,
 ) -> axum::response::Response {
     // One media job at a time: two diffusion engines cannot share these cards,
@@ -397,6 +398,7 @@ pub(crate) async fn images_edits(
     let mut negative_prompt: Option<String> = None;
     let mut model_name: Option<String> = None;
     let mut size: Option<String> = None;
+    let mut style: Option<String> = None;
     let mut response_format = "url".to_string();
     let mut n: u32 = 1;
     let mut strength: Option<f64> = None;
@@ -532,7 +534,10 @@ pub(crate) async fn images_edits(
                 }
             }
             // Accept but ignore - OpenAI SDK compat shim.
-            "style" | "user" => {
+            "style" => {
+                style = field.text().await.ok();
+            }
+            "user" => {
                 let _ = field.bytes().await;
             }
             // `mask` is the inpainting mask in OpenAI's spec - only
@@ -574,6 +579,7 @@ pub(crate) async fn images_edits(
         }
     }
 
+    let prompt = prompt.map(|p| super::super::openai::with_style(p, style.as_deref()));
     let prompt = match prompt {
         Some(p) if !p.trim().is_empty() => p,
         _ => {
@@ -853,6 +859,10 @@ pub(crate) async fn images_edits(
         );
     }
 
+    let data = match super::super::openai::images_as_urls(&state, &headers, response_format == "url", data) {
+        Ok(d) => d,
+        Err(e) => return e.into_response(),
+    };
     let body = Json(serde_json::json!({
         "created": chrono::Utc::now().timestamp(),
         "data": data,
@@ -867,6 +877,7 @@ pub(crate) async fn images_edits(
 /// and lower default strength (0.4) so output stays close to the input.
 pub(crate) async fn images_variations(
     state: axum::extract::State<APIServer>,
+    headers: axum::http::HeaderMap,
     mut multipart: axum::extract::Multipart,
 ) -> axum::response::Response {
     // One media job at a time: two diffusion engines cannot share these cards,
@@ -1192,6 +1203,10 @@ pub(crate) async fn images_variations(
         );
     }
 
+    let data = match super::super::openai::images_as_urls(&state, &headers, response_format == "url", data) {
+        Ok(d) => d,
+        Err(e) => return e.into_response(),
+    };
     let body = Json(serde_json::json!({
         "created": chrono::Utc::now().timestamp(),
         "data": data,

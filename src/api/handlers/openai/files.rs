@@ -612,3 +612,62 @@ pub(crate) async fn moderations(
     }
     Ok(Json(json!({"id": new_id("modr"), "model": model, "results": results})).into_response())
 }
+
+/// Turns `b64_json` image entries into stored files served by URL, when the request
+/// asked for `url`. The URL is built on the request's `Host`, or on `public_url` when
+/// the configuration names one.
+pub(crate) fn images_as_urls(
+    state: &APIServer,
+    headers: &axum::http::HeaderMap,
+    wanted: bool,
+    data: Vec<Value>,
+) -> Result<Vec<Value>, ApiError> {
+    if !wanted {
+        return Ok(data);
+    }
+    let base = state
+        .default_inference_config
+        .public_url
+        .clone()
+        .or_else(|| {
+            headers
+                .get(axum::http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| format!("http://{h}"))
+        })
+        .unwrap_or_default();
+    let mut out = Vec::with_capacity(data.len());
+    for mut entry in data {
+        let Some(b64) = entry.get("b64_json").and_then(Value::as_str) else {
+            out.push(entry);
+            continue;
+        };
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| ApiError::Internal(format!("image: {e}")))?;
+        let ext = match entry.get("content_type").and_then(Value::as_str) {
+            Some("image/jpeg") => "jpg",
+            Some("image/webp") => "webp",
+            Some("image/gif") => "gif",
+            _ => "png",
+        };
+        let record = store_file(state, &format!("image.{ext}"), "generated", &bytes)?;
+        let id = record.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        if let Some(obj) = entry.as_object_mut() {
+            obj.remove("b64_json");
+            obj.insert("url".to_string(), json!(format!("{base}/v1/files/{id}/content")));
+        }
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+/// OpenAI's `style` as words the generator reads, appended to the prompt.
+pub(crate) fn with_style(prompt: String, style: Option<&str>) -> String {
+    match style.map(str::to_ascii_lowercase).as_deref() {
+        Some("vivid") => format!("{prompt}, vivid, dramatic lighting, saturated color"),
+        Some("natural") => format!("{prompt}, natural, realistic, understated"),
+        _ => prompt,
+    }
+}

@@ -757,6 +757,7 @@ pub(crate) async fn video_generations(
 
 pub(crate) async fn images_generations(
     state: axum::extract::State<APIServer>,
+    headers: axum::http::HeaderMap,
     body: Json<serde_json::Value>,
 ) -> axum::response::Response {
     // One media job at a time: two diffusion engines cannot share these cards,
@@ -1023,7 +1024,7 @@ pub(crate) async fn images_generations(
         use axum::response::sse::{Event, Sse};
 
         let engine = state.image_engine.clone();
-        let prompt = req.prompt.clone();
+        let prompt = super::super::openai::with_style(req.prompt.clone(), req.style.as_deref());
         let base = base_params.clone();
         let out_format_stream = req
             .output_format
@@ -1314,6 +1315,10 @@ pub(crate) async fn images_generations(
         );
     }
 
+    let data = match super::super::openai::images_as_urls(&state, &headers, req.response_format.as_deref().unwrap_or("url") == "url", data) {
+        Ok(d) => d,
+        Err(e) => return e.into_response(),
+    };
     let mut body_v = serde_json::json!({
         "created": chrono::Utc::now().timestamp(),
         "data": data,

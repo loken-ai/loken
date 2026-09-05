@@ -200,6 +200,9 @@ pub struct InferenceConfig {
     pub files_dir: Option<String>,
     /// The model `/v1/moderations` asks to judge; `None` answers 501.
     pub moderation_model: Option<String>,
+    /// The origin clients reach this server at, for the URLs it hands out; `None` uses
+    /// the request\'s `Host`.
+    pub public_url: Option<String>,
     /// Max GPU memory fraction (0.0-1.0)
     pub max_gpu_memory_fraction: f64,
     /// Force GPU layers count
@@ -289,6 +292,7 @@ impl Default for InferenceConfig {
             kv_disk_budget_gb: 0.0,
             files_dir: None,
             moderation_model: None,
+            public_url: None,
             max_gpu_memory_fraction: 0.9,
             force_gpu_layers: None,
             use_quantized_gpu: true,
