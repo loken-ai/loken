@@ -941,6 +941,13 @@ pub struct ChatCompletionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(range(min = 1, max = 131072))]
     pub max_completion_tokens: Option<usize>,
+    /// OpenAI's reasoning effort; `none` and `minimal` switch a reasoning model's
+    /// thinking off, the other levels leave it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Output modalities; only text is produced here, audio is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<Vec<String>>,
     pub stream: Option<bool>,
     /// OpenAI-compatible session identifier. When the same id is sent on
     /// consecutive turns, the KV cache is reused and only new tokens get

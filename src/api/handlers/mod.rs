@@ -1302,8 +1302,8 @@ impl APIServer {
             // SDKs call this to confirm a model is available before
             // sending a generation.
             .route(
-                "/v1/models/{model_id}",
-                axum::routing::get(openai_retrieve_model),
+                "/v1/models/{*model_id}",
+                axum::routing::get(openai_retrieve_model).delete(openai_delete_model),
             )
             .route(
                 "/api/chat/completions",

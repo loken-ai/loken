@@ -132,17 +132,61 @@ pub(crate) async fn chat_completion(
         if n == 0 {
             return Err(ApiError::Validation("`n` must be >= 1".into()));
         }
-        if n > 1 {
-            return Err(ApiError::Validation(format!(
-                "`n` = {n} not supported; only n=1 is generated per request - issue {n} requests in parallel for distinct samples"
-            )));
-        }
     }
 
     // Reject explicit logprobs requests up front - the sampler doesn't
     // expose per-token top-K softmax data, and silently returning
     // `logprobs: null` to callers expecting populated values is the
     // worst kind of bug to debug. Mirrors the /v1/completions guard.
+    if let Some(m) = request.modalities.as_ref() {
+        if m.iter().any(|x| x.eq_ignore_ascii_case("audio")) {
+            return Err(ApiError::Validation(
+                "`modalities` with audio is not produced here; use /v1/audio/speech".into(),
+            ));
+        }
+    }
+    // `n` > 1 is n completions of the same request, each with its own seed,
+    // gathered into one response; a stream carries one completion.
+    if let Some(n) = request.n.filter(|&n| n > 1) {
+        if request.stream.unwrap_or(false) {
+            return Err(ApiError::Validation(
+                "`n` > 1 is not supported with `stream`".into(),
+            ));
+        }
+        let mut merged: Option<serde_json::Value> = None;
+        let mut choices = Vec::new();
+        let mut completion_tokens = 0i64;
+        for i in 0..n {
+            let mut one = request.clone();
+            one.n = Some(1);
+            one.seed = one.seed.map(|s| s.wrapping_add(i as u64));
+            let resp = Box::pin(chat_completion(State(state.clone()), OpenAIJson(one))).await?;
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .map_err(|e| ApiError::Internal(format!("n: {e}")))?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| ApiError::Internal(format!("n: {e}")))?;
+            if let Some(c) = v.pointer("/choices/0") {
+                let mut c = c.clone();
+                c["index"] = serde_json::json!(i);
+                choices.push(c);
+            }
+            completion_tokens += v
+                .pointer("/usage/completion_tokens")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            merged.get_or_insert(v);
+        }
+        let mut out = merged.unwrap_or_else(|| serde_json::json!({}));
+        out["choices"] = serde_json::Value::Array(choices);
+        let prompt_tokens = out
+            .pointer("/usage/prompt_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        out["usage"]["completion_tokens"] = serde_json::json!(completion_tokens);
+        out["usage"]["total_tokens"] = serde_json::json!(prompt_tokens + completion_tokens);
+        return Ok(Json(out).into_response());
+    }
     if request.logprobs == Some(true) {
         return Err(ApiError::Validation(
             "`logprobs: true` not supported on this server; omit or pass false".into(),
@@ -306,6 +350,14 @@ pub(crate) async fn chat_completion(
     } else {
         format_chat_prompt(&request.messages, chat_template.as_deref())
     };
+    let mut prompt = prompt;
+    if matches!(
+        request.reasoning_effort.as_deref().map(str::to_ascii_lowercase).as_deref(),
+        Some("none") | Some("minimal")
+    ) {
+        super::prompt_format::apply_thinking_preference(&mut prompt, Some("disabled"));
+    }
+    let single_tool_call = request.parallel_tool_calls == Some(false);
 
     // OpenAI's `response_format` -> llguidance grammar spec.
     // Accepted shapes:
@@ -531,10 +583,13 @@ pub(crate) async fn chat_completion(
                         chunk.service_tier = service_tier.clone();
                         yield Ok(Event::default().data(to_json_string!(&chunk)));
                     }
-                    let tool_calls = tool_scanner
+                    let mut tool_calls = tool_scanner
                         .as_ref()
                         .map(|sc| sc.finalize())
                         .unwrap_or_default();
+                    if single_tool_call {
+                        tool_calls.truncate(1);
+                    }
                     let used_tools = !tool_calls.is_empty();
                     if !errored {
                         if used_tools {
@@ -704,7 +759,10 @@ pub(crate) async fn chat_completion(
         // pass through unchanged.
         let (reasoning, content) = crate::api::thinking::split_thinking(&content);
         let (message, finish_reason) = if tools_active {
-            let parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &content);
+            let mut parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &content);
+            if single_tool_call {
+                parsed.calls.truncate(1);
+            }
             if parsed.calls.is_empty() {
                 (
                     Message::new("assistant".to_string(), content),
@@ -1974,6 +2032,13 @@ pub(crate) async fn openai_embeddings(
         return e.into_response();
     }
     let model_name = normalize_model_id(&model);
+    // Loads on demand, as the chat and completion endpoints do.
+    let keep_alive = state.get_effective_keep_alive(None);
+    if let Err(e) = state.ensure_loaded(&model_name, keep_alive).await {
+        return Err(ApiError::NotFound(format!(
+            "model '{model_name}' could not be loaded: {e}"
+        )));
+    }
     let engine = match state.get_engine(&model_name).await {
         Ok(e) => e,
         Err(_) => {
@@ -2061,3 +2126,29 @@ pub(crate) async fn openai_embeddings(
 mod responses;
 pub(crate) use responses::*;
 mod tests;
+
+/// `DELETE /v1/models/{id}`: unloads the model if it is resident and removes it from
+/// the store, the way `/api/delete` does.
+pub(crate) async fn openai_delete_model(
+    State(state): State<APIServer>,
+    axum::extract::Path(model_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_model_id(&model_id)?;
+    let name = normalize_model_id(&model_id);
+    {
+        let mut engines = state.engines.write().await;
+        if let Some(pos) = engines.iter().position(|e| e.model_id == name) {
+            let entry = engines.remove(pos);
+            if let Some(handle) = entry.expire_handle {
+                handle.abort();
+            }
+            let _ = entry.engine.unload().await;
+        }
+    }
+    state
+        .model_manager
+        .delete_model(&name)
+        .await
+        .map_err(|e| ApiError::NotFound(format!("model '{model_id}': {e}")))?;
+    Ok(Json(serde_json::json!({"id": model_id, "object": "model", "deleted": true})))
+}
