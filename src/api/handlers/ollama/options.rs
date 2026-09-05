@@ -552,7 +552,11 @@ pub(crate) async fn ollama_chat(
                 tools,
                 tool_directive.as_deref(),
             );
-        format_chat_prompt(&flattened, chat_template.as_deref())
+        if template_takes_tools(chat_template.as_deref()) {
+            format_chat_prompt_with_tools(&eff_messages, chat_template.as_deref(), tools)
+        } else {
+            format_chat_prompt(&flattened, chat_template.as_deref())
+        }
     } else {
         format_chat_prompt(&eff_messages, chat_template.as_deref())
     };

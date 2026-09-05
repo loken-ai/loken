@@ -346,7 +346,15 @@ pub(crate) async fn chat_completion(
             tools,
             directive.as_deref(),
         );
-        format_chat_prompt(&flattened, chat_template.as_deref())
+        if template_takes_tools(chat_template.as_deref()) {
+            format_chat_prompt_with_tools(
+                &request.messages,
+                chat_template.as_deref(),
+                request.tools.as_deref().unwrap_or(&[]),
+            )
+        } else {
+            format_chat_prompt(&flattened, chat_template.as_deref())
+        }
     } else {
         format_chat_prompt(&request.messages, chat_template.as_deref())
     };

@@ -217,17 +217,60 @@ fn render_jinja_template(
     tmpl: &str,
     messages: &[Message],
     add_generation_prompt: bool,
+    tools: Option<&[Tool]>,
 ) -> Option<String> {
     use minijinja::{context, Environment, Value};
+    // Messages go in whole: a tool-using template reads `tool_calls`, `tool_call_id`
+    // and `name` off them, with the call's arguments as an object, the way the
+    // upstream templates were written against.
     let msgs: Vec<Value> = messages
         .iter()
         .map(|m| {
-            Value::from_serialize(std::collections::BTreeMap::from([
-                ("role", m.role.clone()),
-                ("content", m.content.clone()),
-            ]))
+            let mut obj = serde_json::json!({"role": m.role, "content": m.content});
+            if let Some(calls) = m.tool_calls.as_ref() {
+                let calls: Vec<serde_json::Value> = calls
+                    .iter()
+                    .map(|c| {
+                        let name = c.function.as_ref().map(|f| f.name.clone()).unwrap_or_default();
+                        let raw = c.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
+                        let arguments = serde_json::from_str::<serde_json::Value>(&raw)
+                            .unwrap_or(serde_json::Value::String(raw));
+                        serde_json::json!({
+                            "id": c.id,
+                            "type": c.r#type,
+                            "function": {"name": name, "arguments": arguments},
+                            "name": name,
+                            "arguments": arguments,
+                        })
+                    })
+                    .collect();
+                obj["tool_calls"] = serde_json::Value::Array(calls);
+            }
+            if let Some(id) = m.tool_call_id.as_ref() {
+                obj["tool_call_id"] = serde_json::json!(id);
+            }
+            if let Some(n) = m.name.as_ref() {
+                obj["name"] = serde_json::json!(n);
+            }
+            Value::from_serialize(obj)
         })
         .collect();
+    let tools_value: Option<Value> = tools.map(|t| {
+        Value::from_serialize(
+            t.iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": tool.r#type,
+                        "function": {
+                            "name": tool.function.as_ref().map(|f| f.name.clone()),
+                            "description": tool.function.as_ref().and_then(|f| f.description.clone()),
+                            "parameters": tool.function.as_ref().and_then(|f| f.parameters.clone()),
+                        }
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
     let mut env = Environment::new();
     // Chat templates call this to reject malformed conversations. Without it the
     // render fails outright, so map it to an error the caller turns into a
@@ -279,6 +322,7 @@ fn render_jinja_template(
     match t.render(context! {
         messages => msgs,
         add_generation_prompt => add_generation_prompt,
+        tools => tools_value,
     }) {
         Ok(r) => Some(r),
         Err(e) => {
@@ -298,6 +342,28 @@ fn render_jinja_template(
 
 /// Detects the template format from characteristic tokens and applies it.
 /// Falls back to a generic Llama-style format if no template is provided.
+/// Whether a Jinja template renders tools itself, so a conversation with tools can be
+/// given to it whole instead of flattened into text.
+pub(crate) fn template_takes_tools(template: Option<&str>) -> bool {
+    template.is_some_and(|t| t.contains("{%") && t.contains("tools"))
+}
+
+/// `format_chat_prompt` with the tools handed to a template that renders them.
+pub(crate) fn format_chat_prompt_with_tools(
+    messages: &[Message],
+    template: Option<&str>,
+    tools: &[Tool],
+) -> String {
+    if let Some(tmpl) = template {
+        if template_takes_tools(Some(tmpl)) {
+            if let Some(rendered) = render_jinja_template(tmpl, messages, true, Some(tools)) {
+                return rendered;
+            }
+        }
+    }
+    format_chat_prompt(messages, template)
+}
+
 pub(crate) fn format_chat_prompt(messages: &[Message], template: Option<&str>) -> String {
     // Extract system prompt and last user message for legacy templates
     let system = messages
@@ -318,7 +384,7 @@ pub(crate) fn format_chat_prompt(messages: &[Message], template: Option<&str>) -
         // Jinja has statement blocks, the Go templates a distributor wraps its
         // models in do not.
         if tmpl.contains("{%") {
-            if let Some(rendered) = render_jinja_template(tmpl, messages, true) {
+            if let Some(rendered) = render_jinja_template(tmpl, messages, true, None) {
                 return rendered;
             }
         }

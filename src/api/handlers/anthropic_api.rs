@@ -154,7 +154,11 @@ pub(crate) async fn anthropic_messages(
             &tools,
             tool_directive.as_deref(),
         );
-        format_chat_prompt(&flat, chat_template.as_deref())
+        if template_takes_tools(chat_template.as_deref()) {
+            format_chat_prompt_with_tools(&messages, chat_template.as_deref(), &tools)
+        } else {
+            format_chat_prompt(&flat, chat_template.as_deref())
+        }
     } else {
         format_chat_prompt(&messages, chat_template.as_deref())
     };
@@ -520,7 +524,11 @@ pub(crate) async fn anthropic_count_tokens(
             &tools,
             tool_directive.as_deref(),
         );
-        format_chat_prompt(&flat, chat_template.as_deref())
+        if template_takes_tools(chat_template.as_deref()) {
+            format_chat_prompt_with_tools(&messages, chat_template.as_deref(), &tools)
+        } else {
+            format_chat_prompt(&flat, chat_template.as_deref())
+        }
     } else {
         format_chat_prompt(&messages, chat_template.as_deref())
     };
