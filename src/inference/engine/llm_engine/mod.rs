@@ -225,6 +225,10 @@ pub struct LlmEngine {
     draft_engine: Arc<Mutex<Option<Arc<LlmEngine>>>>,
     /// The disk tier under the KV snapshots, when the configuration names a directory.
     kv_disk: Option<Arc<crate::inference::cache::kv_disk::KvDiskStore>>,
+    /// Raised by a `CancelGuard` when the request that holds it goes away; the
+    /// generation loops read it between tokens. One request runs at a time on an
+    /// engine, so one flag is enough.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     cached_model_size: Arc<Mutex<u64>>,
     /// Session-persistent KV cache tracking. A single model has a single live
@@ -248,6 +252,7 @@ impl InferenceEngine for LlmEngine {
             model_state: Arc::new(Mutex::new(None)),
             draft_engine: Arc::new(Mutex::new(None)),
             kv_disk: None,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -284,6 +289,7 @@ impl LlmEngine {
             model_state: Arc::new(Mutex::new(None)),
             draft_engine: Arc::new(Mutex::new(None)),
             kv_disk: open_kv_disk(&config),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -682,6 +688,20 @@ impl LlmEngine {
             self.config.context_length,
             None,
         ))
+    }
+
+
+    /// Arms cancellation for the request about to run: the guard lowers the flag now
+    /// and raises it when dropped, which is what happens to a handler's future when
+    /// its client disconnects. A whole-answer generation then stops at its next token.
+    pub fn cancel_guard(&self) -> CancelGuard {
+        self.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        CancelGuard(self.cancel.clone())
+    }
+
+    /// Whether the current request's client has gone.
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
     }
 
 
@@ -1134,5 +1154,14 @@ fn open_kv_disk(
             tracing::warn!("kv disk tier at {dir} unavailable: {e}");
             None
         }
+    }
+}
+
+/// See `LlmEngine::cancel_guard`.
+pub struct CancelGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }

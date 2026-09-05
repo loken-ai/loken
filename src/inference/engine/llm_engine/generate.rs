@@ -184,6 +184,7 @@ impl LlmEngine {
             });
         }
         let model_state = self.model_state.clone();
+        let cancel = self.cancel.clone();
         let config = self.config.clone();
         let kv_shift_reuse = config.kv_shift_reuse;
         let kv_snapshots = config.kv_snapshots;
@@ -646,7 +647,8 @@ impl LlmEngine {
             let mut decode_diag_first_call = true;
             while next_token != state.eos_token_id
                 && !state.eos_token_ids_extra.contains(&next_token)
-                && generated.len() < max_tokens {
+                && generated.len() < max_tokens
+                && !cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 generated.push(next_token);
                 recent_tokens.push(next_token);
                 if pld_enabled { pld_cache.push(next_token); }
@@ -1597,7 +1599,9 @@ impl LlmEngine {
                 );
             }
 
-            let finish_reason = if let Some(hit) = stop_tracker.matched() {
+            let finish_reason = if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                FinishReason::Disconnect
+            } else if let Some(hit) = stop_tracker.matched() {
                 FinishReason::StopSequence(hit.to_string())
             } else if next_token == state.eos_token_id
                 || state.eos_token_ids_extra.contains(&next_token)
@@ -1643,6 +1647,7 @@ impl LlmEngine {
         let model_state = self.model_state.clone();
         let config = self.config.clone();
 
+        let cancel = self.cancel.clone();
         let inner = tokio::task::spawn_blocking(move || -> AnyResult<GenerationResult> {
             let mut guard = model_state.blocking_lock();
             let state = guard
@@ -1712,6 +1717,9 @@ impl LlmEngine {
             let decode_start = std::time::Instant::now();
 
             for step in 0..max_tokens {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let logits_cpu = match logits.device() {
                     Device::Cpu => logits.clone(),
                     _ => logits.to_device(&Device::Cpu)?,

@@ -222,6 +222,7 @@ pub(crate) async fn anthropic_messages(
 
     if !stream {
         let _g = gate_guard;
+        let _cancel = engine.cancel_guard();
         match engine.generate(&prompt, params).await {
             Ok(result) => {
                 let (thinking, answer) = crate::api::thinking::split_thinking(&result.text);

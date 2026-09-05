@@ -830,6 +830,7 @@ pub(crate) async fn ollama_chat(
         let _gate_guard = chat_gate_guard;
         let energy = crate::energy_report::begin();
 
+        let _cancel = engine.cancel_guard();
         match engine.generate(&prompt, params).await {
             Ok(result) => {
                 crate::energy_report::end(energy, "text", "[/api/chat]");
@@ -1669,6 +1670,7 @@ pub(crate) async fn ollama_generate(
         let _gate_guard = gate_guard_owned;
         let energy = crate::energy_report::begin();
 
+        let _cancel = engine.cancel_guard();
         match engine.generate(&effective_prompt, params).await {
             Ok(result) => {
                 crate::energy_report::end(energy, "text", "[/api/generate]");

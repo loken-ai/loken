@@ -730,6 +730,7 @@ pub(crate) async fn chat_completion(
         let timing_prefill_ms: Option<f64>;
         let timing_decode_ms: Option<f64>;
         let (content, finish_reason, completion_tokens, prompt_tokens) =
+            let _cancel = engine.cancel_guard();
             match engine.generate(&prompt, params).await {
                 Ok(result) => {
                     // OpenAI's `finish_reason`: `length` when we hit
@@ -1389,6 +1390,7 @@ pub(crate) async fn text_completions(
     } else {
         Some(acquire_gate(&state, oai_priority, model_name.clone(), "/v1/completions").await?)
     };
+    let _cancel = engine.cancel_guard();
     let result = engine
         .generate(&prompt, params)
         .await
