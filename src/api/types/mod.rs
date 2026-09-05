@@ -254,6 +254,10 @@ pub struct OllamaChatRequest {
     /// Tools available for the model to call (function calling)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+    /// OpenAI's `tool_choice`, taken here too: `none`, `auto`, `required`, or one
+    /// named function.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 impl OllamaChatRequest {

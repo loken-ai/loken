@@ -138,6 +138,36 @@ fn tool_result_text(content: &Value) -> String {
 
 impl AnthropicMessagesRequest {
     /// Effective max_tokens (Anthropic field, defaulting when absent).
+    /// The first content block this server cannot take, with the reason: an image
+    /// given by URL (nothing is fetched from here) or a document (nothing reads PDFs).
+    pub fn unsupported_input(&self) -> Option<String> {
+        let messages = serde_json::to_value(&self.messages).ok()?;
+        for m in messages.as_array()? {
+            let Some(blocks) = m.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for b in blocks {
+                match b.get("type").and_then(Value::as_str) {
+                    Some("image")
+                        if b.pointer("/source/type").and_then(Value::as_str) == Some("url") =>
+                    {
+                        return Some(
+                            "image blocks given by URL are not fetched; send the image as base64"
+                                .to_string(),
+                        );
+                    }
+                    Some("document") => {
+                        return Some(
+                            "document blocks are not read; send the document's text".to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
     pub fn effective_max_tokens(&self) -> usize {
         self.max_tokens.unwrap_or(2048)
     }

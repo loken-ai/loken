@@ -50,6 +50,9 @@ pub(crate) async fn anthropic_messages(
         );
     }
     let model_name = normalize_model_id(&req.model);
+    if let Some(why) = req.unsupported_input() {
+        return anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", why);
+    }
 
     if let Some(hint) = non_chat_pipeline_component(&model_name) {
         return anthropic_error_response(

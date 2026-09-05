@@ -421,6 +421,14 @@ pub(crate) async fn ollama_chat(
     // precedence so explicit overrides via the options bag still win.
     if params.grammar.is_none() {
         params.grammar = ollama_format_to_grammar(request.format.as_ref());
+        if params.grammar.is_none() && tools_active {
+            if let (Some(only), Some(tools)) = (forced_call.as_ref(), request.tools.as_ref()) {
+                params.grammar = Some(format!(
+                    "json_schema:{}",
+                    crate::api::tool_calls::forced_call_schema(tools, only.as_deref())
+                ));
+            }
+        }
     }
 
     // Per-request kv_quant override (reload if the loaded engine differs).
@@ -488,7 +496,27 @@ pub(crate) async fn ollama_chat(
     // tool definitions + round-trip prior calls/results into the prompt
     // and remember the family so the response can be parsed back out.
     // Ollama has no `tool_choice`, so injection is gated only on presence.
-    let tools_active = crate::api::tool_calls::should_inject_tools(request.tools.as_ref(), None);
+    let tools_active = crate::api::tool_calls::should_inject_tools(
+        request.tools.as_ref(),
+        request.tool_choice.as_ref(),
+    );
+    let tool_directive =
+        crate::api::tool_calls::tool_choice_directive(request.tool_choice.as_ref());
+    // `required` or a named function constrains the generation to the call object.
+    let forced_call: Option<Option<String>> = match request.tool_choice.as_ref() {
+        Some(serde_json::Value::String(s)) if s == "required" => Some(None),
+        Some(serde_json::Value::Object(o))
+            if o.get("type").and_then(serde_json::Value::as_str) == Some("function") =>
+        {
+            Some(
+                o.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            )
+        }
+        _ => None,
+    };
     let tool_format =
         crate::api::tool_calls::detect_tool_format(chat_template.as_deref(), &model_name);
     // qwen35moe (Qwen3-VL): the simple ChatML formatter doesn't render the
@@ -518,7 +546,12 @@ pub(crate) async fn ollama_chat(
         let tools = request.tools.as_ref().unwrap();
         // Ollama has no tool_choice field -> no forcing directive.
         let flattened =
-            crate::api::tool_calls::flatten_messages(&eff_messages, tool_format, tools, None);
+            crate::api::tool_calls::flatten_messages(
+                &eff_messages,
+                tool_format,
+                tools,
+                tool_directive.as_deref(),
+            );
         format_chat_prompt(&flattened, chat_template.as_deref())
     } else {
         format_chat_prompt(&eff_messages, chat_template.as_deref())
@@ -933,7 +966,7 @@ pub(crate) async fn ollama_generate(
                     .as_ref()
                     .and_then(|o| o.get("num_predict"))
                     .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(128) as u32,
+                    .unwrap_or(state.default_inference_config.max_tokens as u64) as u32,
             };
             let now = crate::distributed::cluster_runtime::now_ms(state.cluster_started());
             // This node has to sit in its own routing table, described exactly as peers
