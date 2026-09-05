@@ -495,6 +495,7 @@ pub(crate) async fn chat_completion(
                         None
                     };
                     let mut splitter = crate::api::thinking::ThinkSplit::new();
+                    let mut reasoning_acc = String::new();
 
                     while let Some(result) = rx.recv().await {
                         match result {
@@ -505,7 +506,10 @@ pub(crate) async fn chat_completion(
                                 token_count += 1;
                                 for seg in splitter.push(&chunk_text) {
                                     let delta = match seg {
-                                        crate::api::thinking::Segment::Thinking(t) => ChunkDelta::reasoning(t),
+                                        crate::api::thinking::Segment::Thinking(t) => {
+                                            reasoning_acc.push_str(&t);
+                                            ChunkDelta::reasoning(t)
+                                        }
                                         crate::api::thinking::Segment::Content(c) => {
                                             let emit = match tool_scanner.as_mut() {
                                                 Some(sc) => sc.push(&c),
@@ -662,11 +666,24 @@ pub(crate) async fn chat_completion(
                     // protocol error, so default-off is the safer
                     // behaviour.
                     if include_usage {
+                        let (in_tokens, out_tokens) = match stats.as_ref() {
+                            Some(s) => ((s.prompt_eval_count + s.cached_prompt_tokens) as i32, s.eval_count as i32),
+                            None => (prompt_tokens, token_count),
+                        };
+                        let mut usage = Usage::new(in_tokens, out_tokens);
+                        if !reasoning_acc.is_empty() {
+                            if let (Some(n), Some(d)) = (
+                                engine_for_stats.count_tokens(&reasoning_acc).await,
+                                usage.completion_tokens_details.as_mut(),
+                            ) {
+                                d.reasoning_tokens = n as i32;
+                            }
+                        }
                         let mut usage_chunk = ChatCompletionChunk::new_final_at(
                             &completion_id,
                             &model_name_clone,
                             created_at,
-                            Usage::new(prompt_tokens, token_count),
+                            usage,
                         );
                         usage_chunk.service_tier = service_tier.clone();
                         yield Ok(Event::default().data(to_json_string!(&usage_chunk)));
@@ -786,7 +803,7 @@ pub(crate) async fn chat_completion(
             )
         };
         let mut message = message;
-        message.reasoning_content = reasoning;
+        message.reasoning_content = reasoning.clone();
         let finish_for_log = finish_reason.clone();
         let mut response = ChatCompletionResponse::new(
             format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -794,6 +811,14 @@ pub(crate) async fn chat_completion(
             vec![Choice::new(0, message, finish_reason)],
             Usage::new(prompt_tokens, completion_tokens),
         );
+        if let Some(r) = reasoning.as_deref() {
+            if let (Some(n), Some(d)) = (
+                engine.count_tokens(r).await,
+                response.usage.completion_tokens_details.as_mut(),
+            ) {
+                d.reasoning_tokens = n as i32;
+            }
+        }
         // Echo the client's `service_tier` request back so SDKs that
         // round-trip the value see what they asked for. Falls back to
         // "default" when unset, matching OpenAI's behaviour for free-
@@ -921,6 +946,47 @@ pub(crate) async fn text_completions(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let model = text_field(&body, "model");
+    // Several prompts are several completions, one per prompt, gathered into one
+    // response with their indexes; a stream carries one prompt.
+    if let Some(arr) = body.get("prompt").and_then(serde_json::Value::as_array) {
+        if arr.len() > 1 {
+            if body.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+                return Err(ApiError::Validation(
+                    "an array `prompt` is not supported with `stream`; send one prompt per stream".into(),
+                ));
+            }
+            let mut merged: Option<serde_json::Value> = None;
+            let mut choices = Vec::new();
+            let mut prompt_tokens = 0i64;
+            let mut completion_tokens = 0i64;
+            for (i, one) in arr.iter().enumerate() {
+                let mut single = body.clone();
+                single["prompt"] = one.clone();
+                let resp = Box::pin(text_completions(State(state.clone()), Json(single))).await?;
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .map_err(|e| ApiError::Internal(format!("prompts: {e}")))?;
+                let v: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| ApiError::Internal(format!("prompts: {e}")))?;
+                if let Some(c) = v.pointer("/choices/0") {
+                    let mut c = c.clone();
+                    c["index"] = serde_json::json!(i);
+                    choices.push(c);
+                }
+                prompt_tokens += v.pointer("/usage/prompt_tokens").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                completion_tokens += v.pointer("/usage/completion_tokens").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                merged.get_or_insert(v);
+            }
+            let mut out = merged.unwrap_or_else(|| serde_json::json!({}));
+            out["choices"] = serde_json::Value::Array(choices);
+            out["usage"] = serde_json::json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            });
+            return Ok(Json(out).into_response());
+        }
+    }
     // Empty / whitespace-only / oversized / path-traversal model IDs are
     // all rejected by `validate_model_id` below with the same 400 envelope  -
     // no separate early check needed.
@@ -1011,15 +1077,27 @@ pub(crate) async fn text_completions(
     // explicitly rather than silently dropping the prompt-prefix
     // (clients consuming `choices[0].text` would then see the model
     // continuation without the prompt and might mis-parse it).
-    if body
+    // `echo` puts the prompt back in front of the completion, in the first chunk of a
+    // stream; `suffix` makes a fill-in-the-middle request, rendered with the sentinels
+    // the coder models read, as `/api/generate` does.
+    let echo = body
         .get("echo")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(ApiError::Validation(
-            "`echo: true` is not supported on this server; prepend the prompt client-side if needed".into(),
-        ));
-    }
+        .unwrap_or(false);
+    let prompt = match body.get("suffix").and_then(serde_json::Value::as_str) {
+        Some(suffix) if !suffix.is_empty() => {
+            format!("<|fim_prefix|>{prompt}<|fim_suffix|>{suffix}<|fim_middle|>")
+        }
+        _ => prompt,
+    };
+    let echo_text = if echo {
+        body.get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    } else {
+        String::new()
+    };
     // Cap the OpenAI `user` field - same rationale as the chat path
     // (folded into session_id / KV-cache key, must not be unbounded).
     validate_user_id(body.get("user").and_then(|v| v.as_str()))?;
@@ -1279,6 +1357,7 @@ pub(crate) async fn text_completions(
         let cid = completion_id.clone();
         let mn = model_name.clone();
         let stream_started = std::time::Instant::now();
+        let mut echo_pending = echo_text.clone();
         let stream = async_stream::stream! {
             let _gate_held = gate_guard;
             let mut rx = rx;
@@ -1298,7 +1377,11 @@ pub(crate) async fn text_completions(
                             "created": created,
                             "model": mn,
                             "choices": [{
-                                "text": text,
+                                "text": {
+                                    let t = format!("{echo_pending}{text}");
+                                    echo_pending.clear();
+                                    t
+                                },
                                 "index": 0,
                                 "logprobs": serde_json::Value::Null,
                                 "finish_reason": serde_json::Value::Null,
@@ -1404,7 +1487,7 @@ pub(crate) async fn text_completions(
         "created": created,
         "model": model_name,
         "choices": [{
-            "text": result.text,
+            "text": format!("{echo_text}{}", result.text),
             "index": 0,
             "logprobs": serde_json::Value::Null,
             "finish_reason": finish,
