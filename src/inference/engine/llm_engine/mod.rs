@@ -204,6 +204,12 @@ pub struct StreamStats {
     pub prompt_eval_count: u64,
     pub prompt_eval_duration_ns: u64,
     pub total_duration_ns: u64,
+    /// Prompt tokens served from the resident KV rather than prefilled.
+    pub cached_prompt_tokens: u64,
+    pub finish_reason: FinishReason,
+    /// The whole sequence, prompt and completion, for Ollama's `context`; empty on
+    /// the paths that do not keep it.
+    pub context_tokens: Vec<u32>,
 }
 
 pub struct LlmEngine {

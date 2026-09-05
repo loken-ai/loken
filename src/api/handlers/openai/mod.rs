@@ -457,6 +457,7 @@ pub(crate) async fn chat_completion(
             .clone()
             .unwrap_or_else(|| "default".to_string());
         // Streaming response using SSE (OpenAI-compatible format)
+        let engine_for_stats = engine.clone();
         match engine.generate_stream(&prompt, params.clone()).await {
             Ok(mut rx) => {
                 let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -630,8 +631,11 @@ pub(crate) async fn chat_completion(
                             yield Ok(Event::default().data(to_json_string!(&chunk)));
                         }
                     }
+                    let stats = engine_for_stats.take_last_stream_stats();
                     let finish_reason = if used_tools {
                         "tool_calls"
+                    } else if let Some(s) = stats.as_ref() {
+                        s.finish_reason.openai()
                     } else {
                         match max_tokens_cap {
                             Some(cap) if (token_count as usize) >= cap => "length",
@@ -718,7 +722,6 @@ pub(crate) async fn chat_completion(
         } else if let Err(e) = engine.set_images(&images).await {
             return Err(ApiError::Validation(format!("images: {e}")));
         }
-        let requested_max_tokens = params.max_tokens;
         // `mut` bindings with `None` defaults trigger an
         // "assigned-never-read" warning because the only path that
         // reads timing is the Ok arm (which always overwrites).
@@ -733,10 +736,7 @@ pub(crate) async fn chat_completion(
                     // max_tokens, `stop` when the model emitted an EOS
                     // token / stop sequence. Inferred from eval_count vs
                     // the request cap.
-                    let reason = match requested_max_tokens {
-                        Some(cap) if (result.eval_count as usize) >= cap => "length",
-                        _ => "stop",
-                    };
+                    let reason = result.finish_reason.openai();
                     // Convert nanos -> ms for Server-Timing header below.
                     timing_prefill_ms = Some(result.prompt_eval_duration as f64 / 1_000_000.0);
                     timing_decode_ms = Some(result.eval_duration as f64 / 1_000_000.0);
@@ -1271,6 +1271,7 @@ pub(crate) async fn text_completions(
         // cap (was hardcoded "stop" regardless).
         let max_tokens_cap = params.max_tokens;
         let rx = engine
+            let engine_for_stats = engine.clone();
             .generate_stream(&prompt, params.clone())
             .await
             .map_err(|e| ApiError::Internal(format!("generate_stream: {e}")))?;
@@ -1332,9 +1333,12 @@ pub(crate) async fn text_completions(
                 // Match the non-stream path's `finish_reason` logic:
                 // "length" when we produced exactly `max_tokens`,
                 // "stop" otherwise (EOS / stop sequence / natural end).
-                let finish_reason = match max_tokens_cap {
-                    Some(cap) if (tokens as usize) >= cap => "length",
-                    _ => "stop",
+                let finish_reason = match engine_for_stats.take_last_stream_stats() {
+                    Some(st) => st.finish_reason.openai(),
+                    None => match max_tokens_cap {
+                        Some(cap) if (tokens as usize) >= cap => "length",
+                        _ => "stop",
+                    },
                 };
                 let stop = serde_json::json!({
                     "id": cid,
@@ -1385,15 +1389,11 @@ pub(crate) async fn text_completions(
     } else {
         Some(acquire_gate(&state, oai_priority, model_name.clone(), "/v1/completions").await?)
     };
-    let requested_max = params.max_tokens;
     let result = engine
         .generate(&prompt, params)
         .await
         .map_err(|e| ApiError::Internal(format!("generate: {e}")))?;
-    let finish = match requested_max {
-        Some(cap) if (result.eval_count as usize) >= cap => "length",
-        _ => "stop",
-    };
+    let finish = result.finish_reason.openai();
     let prefill_ms = result.prompt_eval_duration as f64 / 1_000_000.0;
     let decode_ms = result.eval_duration as f64 / 1_000_000.0;
     let response = serde_json::json!({

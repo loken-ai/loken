@@ -633,6 +633,7 @@ pub(crate) async fn ollama_chat(
                 let model_name_clone = model_name.clone();
                 let start_time = std::time::Instant::now();
                 let prompt_clone = prompt.clone();
+                let engine_for_stats = engine.clone();
                 let stream = async_stream::stream! {
                     let _gate_held = gate_guard;
                     let mut accumulated_text = String::new();
@@ -719,12 +720,31 @@ pub(crate) async fn ollama_chat(
                             line.push('\n');
                             yield Ok::<_, std::io::Error>(axum::body::Bytes::from(line));
                         }
-                        let total_duration = start_time.elapsed().as_nanos() as u64;
-                        let prompt_eval_count = estimate_token_count(&prompt_clone);
-                        // chunk_count is the exact emitted-token count;
-                        // estimate_token_count(accumulated_text) returned ~1
-                        // because chunks arrive without inter-token spaces.
-                        let eval_count = chunk_count as u64;
+                        let wall_total_ns = start_time.elapsed().as_nanos() as u64;
+                        let stats = engine_for_stats.take_last_stream_stats();
+                        let (
+                            eval_count, eval_duration, prompt_eval_count,
+                            prompt_eval_duration, total_duration, done_from_engine,
+                        ) = match stats {
+                            Some(s) => (
+                                s.eval_count,
+                                s.eval_duration_ns,
+                                s.prompt_eval_count,
+                                s.prompt_eval_duration_ns,
+                                s.total_duration_ns,
+                                Some(s.finish_reason.ollama()),
+                            ),
+                            None => (
+                                chunk_count as u64,
+                                wall_total_ns,
+                                estimate_token_count(&prompt_clone),
+                                0u64,
+                                wall_total_ns,
+                                None,
+                            ),
+                        };
+                        let load_duration =
+                            total_duration.saturating_sub(prompt_eval_duration + eval_duration);
                         // `done_reason`: "length" when chunk_count
                         // (≈ tokens emitted) reached the requested cap,
                         // "stop" otherwise. Same semantics as /v1/*
@@ -756,14 +776,10 @@ pub(crate) async fn ollama_chat(
                                 yield Ok::<_, std::io::Error>(axum::body::Bytes::from(l));
                             }
                         }
-                        let done_reason = if used_tools {
-                            "stop"
-                        } else {
-                            match max_tokens_cap {
-                                Some(cap) if chunk_count >= cap => "length",
-                                _ => "stop",
-                            }
-                        };
+                        let done_reason = done_from_engine.unwrap_or(match max_tokens_cap {
+                            Some(cap) if chunk_count >= cap => "length",
+                            _ => "stop",
+                        });
                         let mut message = serde_json::json!({
                             "role": "assistant",
                             "content": ""
@@ -779,9 +795,11 @@ pub(crate) async fn ollama_chat(
                             "done": true,
                             "done_reason": done_reason,
                             "total_duration": total_duration,
+                            "load_duration": load_duration,
                             "prompt_eval_count": prompt_eval_count,
+                            "prompt_eval_duration": prompt_eval_duration,
                             "eval_count": eval_count,
-                            "eval_duration": total_duration
+                            "eval_duration": eval_duration
                         });
                         let mut line = final_chunk.to_string();
                         line.push('\n');
@@ -803,7 +821,6 @@ pub(crate) async fn ollama_chat(
         // Use non-streaming generation
         let start = std::time::Instant::now();
         let _gate_guard = chat_gate_guard;
-        let max_tokens_cap_chat = params.max_tokens;
         let energy = crate::energy_report::begin();
 
         match engine.generate(&prompt, params).await {
@@ -839,14 +856,7 @@ pub(crate) async fn ollama_chat(
                 let mut response = OllamaChatResponse::new(model_name, msg);
                 // "length" when we hit max_tokens, "stop" otherwise  -
                 // mirrors the streaming-path fix in a338be1.
-                let done_reason = if tool_called {
-                    "stop"
-                } else {
-                    match max_tokens_cap_chat {
-                        Some(cap) if (result.eval_count as usize) >= cap => "length",
-                        _ => "stop",
-                    }
-                };
+                let done_reason = result.finish_reason.ollama();
                 response.done_reason = Some(done_reason.to_string());
                 response.total_duration = Some(total_duration);
                 response.load_duration = Some(
@@ -1391,6 +1401,11 @@ pub(crate) async fn ollama_generate(
                         // chunk_count is the exact emitted-token count (an estimate over the
                         // accumulated text returned ~1, chunks being words with no spaces).
                         let stats = engine_for_stats.take_last_stream_stats();
+                        let (done_from_engine, context_tokens) = match stats.as_ref() {
+                            Some(s) => (Some(s.finish_reason.ollama()), s.context_tokens.clone()),
+                            None => (None, Vec::new()),
+                        };
+                        let done_reason = done_from_engine.unwrap_or(done_reason);
                         let (eval_count, eval_duration, prompt_eval_count, prompt_eval_duration, total_duration) =
                             match stats {
                                 Some(s) => (
@@ -1413,6 +1428,8 @@ pub(crate) async fn ollama_generate(
                             "created_at": chrono::Utc::now().to_rfc3339(),
                             "response": "",
                             "done": true,
+                            "done_reason": done_reason,
+                            "context": context_tokens,
                             "total_duration": total_duration,
                             "prompt_eval_count": prompt_eval_count,
                             "prompt_eval_duration": prompt_eval_duration,
@@ -1528,6 +1545,11 @@ pub(crate) async fn ollama_generate(
                         // reads as slower for reasons that have nothing to do with the
                         // engine. Every Ollama-compatible client expects these fields.
                         let stats = engine_for_stats.take_last_stream_stats();
+                        let (done_from_engine, context_tokens) = match stats.as_ref() {
+                            Some(s) => (Some(s.finish_reason.ollama()), s.context_tokens.clone()),
+                            None => (None, Vec::new()),
+                        };
+                        let done_reason = done_from_engine.unwrap_or(done_reason);
                         let (
                             eval_count, eval_duration, prompt_eval_count,
                             prompt_eval_duration, total_duration,
@@ -1552,6 +1574,7 @@ pub(crate) async fn ollama_generate(
                             "created_at": chrono::Utc::now().to_rfc3339(),
                             "response": "",
                             "done": true,
+                            "context": context_tokens,
                             "done_reason": done_reason,
                             "total_duration": total_duration,
                             "prompt_eval_count": prompt_eval_count,
@@ -1579,7 +1602,6 @@ pub(crate) async fn ollama_generate(
         // Use non-streaming generation
         let start = std::time::Instant::now();
         let _gate_guard = gate_guard_owned;
-        let max_tokens_cap_gen_nonstream = params.max_tokens;
         let energy = crate::energy_report::begin();
 
         match engine.generate(&effective_prompt, params).await {
@@ -1590,10 +1612,7 @@ pub(crate) async fn ollama_generate(
                 let (thinking, answer) = crate::api::thinking::split_thinking(&result.text);
                 let mut response = OllamaGenerateResponse::new(model_name, answer);
                 response.thinking = thinking;
-                let done_reason = match max_tokens_cap_gen_nonstream {
-                    Some(cap) if (result.eval_count as usize) >= cap => "length",
-                    _ => "stop",
-                };
+                let done_reason = result.finish_reason.ollama();
                 response.done_reason = Some(done_reason.to_string());
                 response.total_duration = Some(total_duration);
                 response.load_duration = Some(

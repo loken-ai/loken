@@ -86,6 +86,7 @@ impl ResolvedGenParams {
 pub(crate) struct StopTracker {
     max_len: usize,
     buf: String,
+    hit: Option<String>,
 }
 
 impl StopTracker {
@@ -93,6 +94,7 @@ impl StopTracker {
         Self {
             max_len: stop_sequences.iter().map(String::len).max().unwrap_or(0),
             buf: String::new(),
+            hit: None,
         }
     }
 
@@ -110,9 +112,17 @@ impl StopTracker {
             let trim_at = self.buf.len() - self.max_len * 2;
             self.buf.drain(..trim_at);
         }
-        stop_sequences
-            .iter()
-            .any(|s| self.buf.ends_with(s.as_str()))
+        match stop_sequences.iter().find(|s| self.buf.ends_with(s.as_str())) {
+            Some(s) => {
+                self.hit = Some(s.clone());
+                true
+            }
+            None => false,
+        }
+    }
+    /// The stop sequence that ended the generation, once one has.
+    pub(crate) fn matched(&self) -> Option<&str> {
+        self.hit.as_deref()
     }
 }
 

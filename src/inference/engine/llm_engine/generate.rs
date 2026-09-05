@@ -5,6 +5,7 @@
 //! here, which is the reach they had when they sat beside their callers.
 
 use super::*;
+use super::params::FinishReason;
 
 impl LlmEngine {
     /// Unload the current model
@@ -178,6 +179,8 @@ impl LlmEngine {
                 prompt_eval_duration: ttft.as_nanos() as u64,
                 eval_count: chunks,
                 eval_duration: t0.elapsed().saturating_sub(ttft).as_nanos() as u64,
+                cached_prompt_tokens: 0,
+                finish_reason: FinishReason::Eos,
             });
         }
         let model_state = self.model_state.clone();
@@ -363,7 +366,7 @@ impl LlmEngine {
 
 
             // Batched prefill (all prompt tokens in one forward pass)
-            let prompt_token_count = prompt_tokens.len() as u64;
+            let prompt_token_count = prompt_tokens.len().saturating_sub(cache_session_start) as u64;
             let prefill_start = std::time::Instant::now();
             // Prefill only the divergent suffix when the global cache reused a
             // prefix (cache_session_start>0, text path). Vision/no-cache -> start=0 ->
@@ -1594,6 +1597,15 @@ impl LlmEngine {
                 );
             }
 
+            let finish_reason = if let Some(hit) = stop_tracker.matched() {
+                FinishReason::StopSequence(hit.to_string())
+            } else if next_token == state.eos_token_id
+                || state.eos_token_ids_extra.contains(&next_token)
+            {
+                FinishReason::Eos
+            } else {
+                FinishReason::MaxTokens
+            };
             Ok(GenerationResult {
                 text,
                 tokens: {
@@ -1605,6 +1617,8 @@ impl LlmEngine {
                 prompt_eval_duration,
                 eval_count,
                 eval_duration,
+                cached_prompt_tokens: cache_session_start as u64,
+                finish_reason,
             })
         }).await
             .map_err(|e| format!("spawn_blocking error: {e}").into());
@@ -1694,6 +1708,7 @@ impl LlmEngine {
 
             let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
             let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+            let mut grammar_stopped = false;
             let decode_start = std::time::Instant::now();
 
             for step in 0..max_tokens {
@@ -1714,6 +1729,7 @@ impl LlmEngine {
                     .compute_mask()
                     .map_err(|e| anyhow!("compute_mask: {e}"))?;
                 if res.is_stop() {
+                    grammar_stopped = true;
                     debug!("Grammar reached stop state at step {}", step);
                     break;
                 }
@@ -1767,6 +1783,14 @@ impl LlmEngine {
                 },
                 prompt_eval_count: prompt_tokens.len() as u64,
                 prompt_eval_duration,
+                cached_prompt_tokens: 0,
+                finish_reason: if grammar_stopped {
+                    FinishReason::Grammar
+                } else if generated_tokens.len() >= max_tokens {
+                    FinishReason::MaxTokens
+                } else {
+                    FinishReason::Eos
+                },
                 eval_count: generated_tokens.len() as u64,
                 eval_duration,
             })

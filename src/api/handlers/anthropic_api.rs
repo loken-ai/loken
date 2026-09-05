@@ -235,7 +235,8 @@ pub(crate) async fn anthropic_messages(
                 } else {
                     (answer.clone(), Vec::new())
                 };
-                let hit_max = (result.eval_count as usize) >= max_tokens && calls.is_empty();
+                let (stop_kind, stop_seq) = result.finish_reason.anthropic();
+                let hit_max = stop_kind == "max_tokens" && calls.is_empty();
                 let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
                 let body = anthropic::build_response(
                     &id,
@@ -243,9 +244,12 @@ pub(crate) async fn anthropic_messages(
                     thinking.as_deref(),
                     &text,
                     &calls,
-                    result.prompt_eval_count as i32,
+                    (result.prompt_eval_count + result.cached_prompt_tokens) as i32,
                     result.eval_count as i32,
                     hit_max,
+                    stop_seq,
+                    result.cached_prompt_tokens as i32,
+                    result.prompt_eval_count as i32,
                 );
                 (StatusCode::OK, Json(body)).into_response()
             }
@@ -261,6 +265,7 @@ pub(crate) async fn anthropic_messages(
             .await
             .map(|n| n as i32)
             .unwrap_or_else(|| estimate_token_count(&prompt) as i32);
+        let engine_for_stats = engine.clone();
         match engine.generate_stream(&prompt, params).await {
             Ok(mut rx) => {
                 let model_clone = model_for_resp.clone();
@@ -429,10 +434,31 @@ pub(crate) async fn anthropic_messages(
                         idx += 1;
                     }
 
-                    let hit_max = (output_tokens as usize) >= max_tokens && !used_tools;
+                    let stats = engine_for_stats.take_last_stream_stats();
+                    let (stop_seq, hit_max, in_tokens, cache_read, cache_creation) = match stats.as_ref() {
+                        Some(s) => {
+                            let (kind, seq) = s.finish_reason.anthropic();
+                            (
+                                seq.map(str::to_string),
+                                kind == "max_tokens" && !used_tools,
+                                (s.prompt_eval_count + s.cached_prompt_tokens) as i32,
+                                s.cached_prompt_tokens as i32,
+                                s.prompt_eval_count as i32,
+                            )
+                        }
+                        None => (None, (output_tokens as usize) >= max_tokens && !used_tools, input_tokens, 0, 0),
+                    };
                     yield Ok(Event::default()
                         .event("message_delta")
-                        .data(anthropic::sse::message_delta(used_tools, hit_max, output_tokens).to_string()));
+                        .data(anthropic::sse::message_delta(
+                            used_tools,
+                            hit_max,
+                            stop_seq.as_deref(),
+                            output_tokens,
+                            in_tokens,
+                            cache_read,
+                            cache_creation,
+                        ).to_string()));
                     yield Ok(Event::default()
                         .event("message_stop")
                         .data(anthropic::sse::message_stop().to_string()));

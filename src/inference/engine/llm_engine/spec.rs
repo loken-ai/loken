@@ -180,6 +180,7 @@ impl LlmEngine {
             let mut stop_suffix = String::new();
             let stop_seqs = params.stop_sequences.clone();
 
+            let mut stop_hit: Option<String> = None;
             'outer: while emitted < max_tokens && last_tok != eos {
                 // -- Draft phase: K candidate tokens
                 let mut drafts: Vec<u32> = Vec::with_capacity(k);
@@ -264,7 +265,8 @@ impl LlmEngine {
                             let cut = stop_suffix.len() - max_stop_len * 2;
                             stop_suffix = stop_suffix[cut..].to_string();
                         }
-                        if stop_seqs.iter().any(|s| stop_suffix.ends_with(s.as_str())) {
+                        if let Some(hit) = stop_seqs.iter().find(|s| stop_suffix.ends_with(s.as_str())) {
+                            stop_hit = Some(hit.clone());
                             let _ = tx.send(Ok(dec)).await;
                             break 'outer;
                         }
@@ -331,7 +333,8 @@ impl LlmEngine {
                         let cut = stop_suffix.len() - max_stop_len * 2;
                         stop_suffix = stop_suffix[cut..].to_string();
                     }
-                    if stop_seqs.iter().any(|s| stop_suffix.ends_with(s.as_str())) {
+                    if let Some(hit) = stop_seqs.iter().find(|s| stop_suffix.ends_with(s.as_str())) {
+                            stop_hit = Some(hit.clone());
                         let _ = tx.send(Ok(dec)).await;
                         break 'outer;
                     }
@@ -357,6 +360,14 @@ impl LlmEngine {
                     prompt_eval_count: prompt_len as u64,
                     prompt_eval_duration_ns: prefill_ns,
                     total_duration_ns: t_start.elapsed().as_nanos() as u64,
+                    cached_prompt_tokens: 0,
+                    finish_reason: match &stop_hit {
+                        Some(hit) => super::params::FinishReason::StopSequence(hit.clone()),
+                        None if last_tok == eos => super::params::FinishReason::Eos,
+                        None if emitted >= max_tokens => super::params::FinishReason::MaxTokens,
+                        None => super::params::FinishReason::Disconnect,
+                    },
+                    context_tokens: Vec::new(),
                 });
             }
             tracing::info!(

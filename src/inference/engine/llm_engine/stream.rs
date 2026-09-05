@@ -5,6 +5,7 @@
 //! here, which is the reach they had when they sat beside their callers.
 
 use super::*;
+use super::params::FinishReason;
 
 impl LlmEngine {
     /// Generate stream - returns channel receiver for streaming tokens with real model inference
@@ -2026,12 +2027,28 @@ impl LlmEngine {
                 None => 0u64,
             };
             if let Ok(mut slot) = stream_stats_slot.lock() {
+                let finish_reason = if let Some(hit) = stop_tracker.matched() {
+                    FinishReason::StopSequence(hit.to_string())
+                } else if next_token == eos_token_id {
+                    FinishReason::Eos
+                } else if token_count >= max_tokens {
+                    FinishReason::MaxTokens
+                } else {
+                    FinishReason::Disconnect
+                };
                 *slot = Some(StreamStats {
                     eval_count: token_count as u64,
                     eval_duration_ns: compute_ns,
-                    prompt_eval_count: prompt_tokens.len() as u64,
+                    prompt_eval_count: prompt_tokens.len().saturating_sub(session_start) as u64,
                     prompt_eval_duration_ns,
                     total_duration_ns,
+                    cached_prompt_tokens: session_start as u64,
+                    finish_reason,
+                    context_tokens: {
+                        let mut full = prompt_tokens.clone();
+                        full.extend_from_slice(&generated_token_ids);
+                        full
+                    },
                 });
             }
 

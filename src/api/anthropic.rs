@@ -372,8 +372,11 @@ fn message_object(
     model: &str,
     content: Value,
     stop_reason: Value,
+    stop_sequence: Option<&str>,
     input_tokens: i32,
     output_tokens: i32,
+    cache_read: i32,
+    cache_creation: i32,
 ) -> Value {
     json!({
         "id": id,
@@ -382,15 +385,19 @@ fn message_object(
         "model": model,
         "content": content,
         "stop_reason": stop_reason,
-        "stop_sequence": Value::Null,
+        "stop_sequence": stop_sequence,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_creation,
         },
     })
 }
 
 /// Build the non-streaming Anthropic Messages response body.
+/// `stop_sequence` names the sequence that ended the answer, when one did; the cache
+/// counts say how much of the prompt the resident KV served and how much was prefilled.
 pub fn build_response(
     id: &str,
     model: &str,
@@ -400,15 +407,25 @@ pub fn build_response(
     input_tokens: i32,
     output_tokens: i32,
     hit_max: bool,
+    stop_sequence: Option<&str>,
+    cache_read: i32,
+    cache_creation: i32,
 ) -> Value {
     let used_tools = !calls.is_empty();
+    let reason = match stop_sequence {
+        Some(_) if !used_tools => "stop_sequence",
+        _ => stop_reason(used_tools, hit_max),
+    };
     message_object(
         id,
         model,
         json!(content_blocks(thinking, text, calls)),
-        json!(stop_reason(used_tools, hit_max)),
+        json!(reason),
+        stop_sequence.filter(|_| !used_tools),
         input_tokens,
         output_tokens,
+        cache_read,
+        cache_creation,
     )
 }
 
@@ -420,7 +437,7 @@ pub mod sse {
     pub fn message_start(id: &str, model: &str, input_tokens: i32) -> Value {
         json!({
             "type": "message_start",
-            "message": message_object(id, model, json!([]), Value::Null, input_tokens, 0),
+            "message": message_object(id, model, json!([]), Value::Null, None, input_tokens, 0, 0, 0),
         })
     }
 
@@ -490,11 +507,28 @@ pub mod sse {
         json!({"type": "content_block_stop", "index": index})
     }
 
-    pub fn message_delta(used_tools: bool, hit_max: bool, output_tokens: i32) -> Value {
+    pub fn message_delta(
+        used_tools: bool,
+        hit_max: bool,
+        stop_sequence: Option<&str>,
+        output_tokens: i32,
+        input_tokens: i32,
+        cache_read: i32,
+        cache_creation: i32,
+    ) -> Value {
+        let reason = match stop_sequence {
+            Some(_) if !used_tools => "stop_sequence",
+            _ => stop_reason(used_tools, hit_max),
+        };
         json!({
             "type": "message_delta",
-            "delta": {"stop_reason": stop_reason(used_tools, hit_max), "stop_sequence": Value::Null},
-            "usage": {"output_tokens": output_tokens}
+            "delta": {"stop_reason": reason, "stop_sequence": stop_sequence.filter(|_| !used_tools)},
+            "usage": {
+                "output_tokens": output_tokens,
+                "input_tokens": input_tokens,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": cache_creation,
+            }
         })
     }
 
@@ -604,7 +638,7 @@ mod tests {
                 arguments: Some("{\"x\":1}".into()),
             }),
         }];
-        let v = build_response("msg_1", "m", None, "", &calls, 5, 7, false);
+        let v = build_response("msg_1", "m", None, "", &calls, 5, 7, false, None, 0, 0);
         assert_eq!(v["stop_reason"], "tool_use");
         let blocks = v["content"].as_array().unwrap();
         assert_eq!(blocks[0]["type"], "tool_use");
@@ -613,7 +647,7 @@ mod tests {
 
     #[test]
     fn response_text_only() {
-        let v = build_response("msg_1", "m", None, "hello", &[], 3, 2, false);
+        let v = build_response("msg_1", "m", None, "hello", &[], 3, 2, false, None, 0, 0);
         assert_eq!(v["stop_reason"], "end_turn");
         assert_eq!(v["content"][0]["text"], "hello");
     }

@@ -298,6 +298,46 @@ impl Default for InferenceConfig {
     }
 }
 
+/// Why a generation ended, as the engine saw it end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The model emitted an end-of-sequence token.
+    Eos,
+    /// The token cap was reached.
+    MaxTokens,
+    /// One of the request's stop sequences was matched: this one.
+    StopSequence(String),
+    /// The grammar admitted no further token.
+    Grammar,
+    /// The client went away before the end.
+    Disconnect,
+}
+
+impl FinishReason {
+    /// Ollama's `done_reason`.
+    pub fn ollama(&self) -> &'static str {
+        match self {
+            FinishReason::MaxTokens => "length",
+            _ => "stop",
+        }
+    }
+    /// OpenAI's `finish_reason`.
+    pub fn openai(&self) -> &'static str {
+        match self {
+            FinishReason::MaxTokens => "length",
+            _ => "stop",
+        }
+    }
+    /// Anthropic's `stop_reason` and, for a stop sequence, the sequence.
+    pub fn anthropic(&self) -> (&'static str, Option<&str>) {
+        match self {
+            FinishReason::MaxTokens => ("max_tokens", None),
+            FinishReason::StopSequence(s) => ("stop_sequence", Some(s.as_str())),
+            _ => ("end_turn", None),
+        }
+    }
+}
+
 /// Result of a generation call, including timing and token count metrics.
 #[derive(Debug, Clone)]
 pub struct GenerationResult {
@@ -319,6 +359,9 @@ pub struct GenerationResult {
     pub eval_count: u64,
     /// Time spent generating tokens (nanoseconds), excludes prompt eval
     pub eval_duration: u64,
+    /// Prompt tokens served from the resident KV rather than prefilled.
+    pub cached_prompt_tokens: u64,
+    pub finish_reason: FinishReason,
 }
 
 /// Per-request generation parameters that override InferenceConfig defaults
