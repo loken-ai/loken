@@ -195,6 +195,11 @@ pub struct InferenceConfig {
     /// Bytes the disk tier may hold, in GiB; 0 for no limit. Least recently used
     /// sequences go first.
     pub kv_disk_budget_gb: f64,
+    /// Where `/v1/files` keeps uploads and batch outputs; `None` uses `files/` beside
+    /// the model store.
+    pub files_dir: Option<String>,
+    /// The model `/v1/moderations` asks to judge; `None` answers 501.
+    pub moderation_model: Option<String>,
     /// Max GPU memory fraction (0.0-1.0)
     pub max_gpu_memory_fraction: f64,
     /// Force GPU layers count
@@ -282,6 +287,8 @@ impl Default for InferenceConfig {
             kv_snapshots: 0,
             kv_disk_dir: None,
             kv_disk_budget_gb: 0.0,
+            files_dir: None,
+            moderation_model: None,
             max_gpu_memory_fraction: 0.9,
             force_gpu_layers: None,
             use_quantized_gpu: true,

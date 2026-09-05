@@ -423,7 +423,7 @@ pub(crate) async fn chat_completion(
                 .collect()
         }),
         top_logprobs: if request.logprobs == Some(true) {
-            Some(request.top_logprobs.unwrap_or(0))
+            Some(request.top_logprobs.unwrap_or(0) as usize)
         } else {
             None
         },
@@ -770,8 +770,8 @@ pub(crate) async fn chat_completion(
         // before the read sites, so the compiler's still happy.
         let timing_prefill_ms: Option<f64>;
         let timing_decode_ms: Option<f64>;
-            let _cancel = engine.cancel_guard();
-        let mut result_logprobs: Vec<crate::inference::engine::llm_engine::TokenLogprob> = Vec::new();
+        let _cancel = engine.cancel_guard();
+        let result_logprobs: Vec<crate::inference::engine::llm_engine::TokenLogprob>;
         let (content, finish_reason, completion_tokens, prompt_tokens) =
             match engine.generate(&prompt, params).await {
                 Ok(result) => {
@@ -1375,8 +1375,8 @@ pub(crate) async fn text_completions(
         // chunk can report `finish_reason: "length"` when we hit the
         // cap (was hardcoded "stop" regardless).
         let max_tokens_cap = params.max_tokens;
+        let engine_for_stats = engine.clone();
         let rx = engine
-            let engine_for_stats = engine.clone();
             .generate_stream(&prompt, params.clone())
             .await
             .map_err(|e| ApiError::Internal(format!("generate_stream: {e}")))?;
@@ -1398,32 +1398,28 @@ pub(crate) async fn text_completions(
                             first_token_at = Some(std::time::Instant::now());
                         }
                         tokens += 1;
+                        let piece = format!("{echo_pending}{text}");
+                        echo_pending.clear();
+                        let drawn = if completion_logprobs.is_some() {
+                            engine_for_stats.take_logprobs()
+                        } else {
+                            Vec::new()
+                        };
+                        let logprobs_value = if drawn.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            completions_logprobs(&drawn, text_offset)
+                        };
+                        text_offset += text.len();
                         let chunk = serde_json::json!({
                             "id": cid,
                             "object": "text_completion",
                             "created": created,
                             "model": mn,
                             "choices": [{
-                                "text": {
-                                    let t = format!("{echo_pending}{text}");
-                                    echo_pending.clear();
-                                    t
-                                },
+                                "text": piece,
                                 "index": 0,
-                                "logprobs": {
-                                    let drawn = if completion_logprobs.is_some() {
-                                        engine_for_stats.take_logprobs()
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    let v = if drawn.is_empty() {
-                                        serde_json::Value::Null
-                                    } else {
-                                        completions_logprobs(&drawn, text_offset)
-                                    };
-                                    text_offset += text.len();
-                                    v
-                                },
+                                "logprobs": logprobs_value,
                                 "finish_reason": serde_json::Value::Null,
                             }],
                         });
@@ -2168,9 +2164,8 @@ pub(crate) async fn openai_embeddings(
     // Loads on demand, as the chat and completion endpoints do.
     let keep_alive = state.get_effective_keep_alive(None);
     if let Err(e) = state.ensure_loaded(&model_name, keep_alive).await {
-        return Err(ApiError::NotFound(format!(
-            "model '{model_name}' could not be loaded: {e}"
-        )));
+        return ApiError::NotFound(format!("model '{model_name}' could not be loaded: {e}"))
+            .into_response();
     }
     let engine = match state.get_engine(&model_name).await {
         Ok(e) => e,
@@ -2255,9 +2250,11 @@ pub(crate) async fn openai_embeddings(
     (headers, body).into_response()
 }
 
-#[cfg(test)]
+mod files;
+pub(crate) use files::*;
 mod responses;
 pub(crate) use responses::*;
+#[cfg(test)]
 mod tests;
 
 /// `DELETE /v1/models/{id}`: unloads the model if it is resident and removes it from

@@ -85,6 +85,10 @@ pub struct InferenceConfigToml {
     pub kv_disk_dir: Option<String>,
     #[serde(default)]
     pub kv_disk_budget_gb: f64,
+    #[serde(default)]
+    pub files_dir: Option<String>,
+    #[serde(default)]
+    pub moderation_model: Option<String>,
     pub max_gpu_memory_fraction: Option<f64>,
 
     // Performance settings
@@ -269,6 +273,8 @@ impl Config {
             kv_snapshots: toml_config.kv_snapshots,
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
             kv_disk_budget_gb: toml_config.kv_disk_budget_gb,
+            files_dir: toml_config.files_dir.clone(),
+            moderation_model: toml_config.moderation_model.clone(),
             max_gpu_memory_fraction: toml_config.max_gpu_memory_fraction.unwrap_or(0.9),
 
             // Performance settings
@@ -375,6 +381,8 @@ impl Config {
                 kv_snapshots: 0,
                 kv_disk_dir: None,
                 kv_disk_budget_gb: 0.0,
+                files_dir: None,
+                moderation_model: None,
                 max_gpu_memory_fraction: None,
                 force_gpu_layers: None,
                 use_quantized_gpu: None,

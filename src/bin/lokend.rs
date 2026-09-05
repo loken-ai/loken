@@ -171,6 +171,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             kv_snapshots: 0,
                             kv_disk_dir: None,
                             kv_disk_budget_gb: 0.0,
+                            files_dir: None,
+                            moderation_model: None,
                             max_gpu_memory_fraction: Some(0.9),
                             force_gpu_layers: None,
                             use_quantized_gpu: Some(false),

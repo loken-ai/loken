@@ -1311,6 +1311,16 @@ impl APIServer {
             )
             .route("/v1/chat/completions", axum::routing::post(chat_completion))
             .route("/v1/responses", axum::routing::post(openai_responses))
+            .route("/v1/files", axum::routing::post(files_upload).get(files_list))
+            .route(
+                "/v1/files/{id}",
+                axum::routing::get(files_get).delete(files_delete),
+            )
+            .route("/v1/files/{id}/content", axum::routing::get(files_content))
+            .route("/v1/batches", axum::routing::post(batches_create).get(batches_list))
+            .route("/v1/batches/{id}", axum::routing::get(batches_get))
+            .route("/v1/batches/{id}/cancel", axum::routing::post(batches_cancel))
+            .route("/v1/moderations", axum::routing::post(moderations))
             .route(
                 "/v1/responses/{id}",
                 axum::routing::get(openai_get_response).delete(openai_delete_response),
@@ -1323,6 +1333,19 @@ impl APIServer {
             .route(
                 "/v1/messages/count_tokens",
                 axum::routing::post(anthropic_count_tokens),
+            )
+            .route(
+                "/v1/messages/batches",
+                axum::routing::post(anthropic_batches_create).get(anthropic_batches_list),
+            )
+            .route("/v1/messages/batches/{id}", axum::routing::get(anthropic_batches_get))
+            .route(
+                "/v1/messages/batches/{id}/cancel",
+                axum::routing::post(anthropic_batches_cancel),
+            )
+            .route(
+                "/v1/messages/batches/{id}/results",
+                axum::routing::get(anthropic_batches_results),
             )
             // Legacy text-completion endpoint (OpenAI 0.27-era). Many
             // older SDKs (LangChain default, llamaindex) still call it.
