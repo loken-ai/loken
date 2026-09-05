@@ -47,9 +47,15 @@ pub(crate) async fn list_models(
 }
 
 /// Version (GET /api/version) - Ollama-compatible
+/// The Ollama API level this server implements. Clients gate features on this
+/// number, so it names the Ollama release whose API is served, not this crate's
+/// version, which travels in the `Server` header and `/health`.
+pub(crate) const OLLAMA_API_VERSION: &str = "0.15.0";
+
 pub(crate) async fn ollama_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION")
+        "version": OLLAMA_API_VERSION,
+        "loken": env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -380,6 +386,21 @@ pub(crate) async fn ollama_embed(
     }
     // Get loaded engine
     let engine = state.get_engine(&model_name).await?;
+    if request.truncate == Some(false) {
+        // Without truncation an input past the context is a client error, as Ollama
+        // reports it; with it (the default) the engine cuts the input to the window.
+        for (idx, text) in inputs.iter().enumerate() {
+            if let Some(n) = engine.count_tokens(text).await {
+                if let Some(window) = engine.context_window().await {
+                    if n > window {
+                        return Err(ApiError::Validation(format!(
+                            "'input[{idx}]' is {n} tokens, past the context of {window}, and truncate is false"
+                        )));
+                    }
+                }
+            }
+        }
+    }
 
     // Reset expiration timer on use (like Ollama)
     state.reset_expiration(&model_name).await;
@@ -407,6 +428,17 @@ pub(crate) async fn ollama_embed(
     // spaces and over-estimates for code).
     let prompt_eval_count: u64 = inputs.iter().map(|s| estimate_token_count(s)).sum();
 
+    // `dimensions` keeps the leading coordinates, as OpenAI's `dimensions` does.
+    let embeddings: Vec<Vec<f32>> = match request.dimensions {
+        Some(d) if d > 0 => embeddings
+            .into_iter()
+            .map(|mut v| {
+                v.truncate(d);
+                v
+            })
+            .collect(),
+        _ => embeddings,
+    };
     Ok(Json(OllamaEmbedResponse {
         model: model_name,
         embeddings,

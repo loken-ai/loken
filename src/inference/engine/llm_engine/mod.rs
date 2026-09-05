@@ -667,6 +667,18 @@ impl LlmEngine {
         result.map_err(std::convert::Into::into)
     }
 
+    /// The context the loaded model is served with, `None` with no model loaded.
+    pub async fn context_window(&self) -> Option<usize> {
+        let guard = self.model_state.lock().await;
+        let state = guard.as_ref()?;
+        Some(params::effective_kv_window(
+            state.context_length,
+            self.config.context_length,
+            None,
+        ))
+    }
+
+
     /// Tokens the loaded model's tokenizer makes of `text`, `None` with no model loaded.
     pub async fn count_tokens(&self, text: &str) -> Option<usize> {
         let guard = self.model_state.lock().await;
