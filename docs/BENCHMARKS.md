@@ -24,6 +24,12 @@ The GPU cells at 4096 and the short prompt at 131072 were measured by the build 
 (`9f6e6fe`). Two commits separate them: `7ae8c54` releases a layer's file pages while the
 model loads, which touches the cold first iteration the medians drop; `9f6e6fe` reuses the
 resident KV once a conversation outgrows its window, which no cell here does.
+
+`Ctx` is the window each engine was asked to reserve, not a window the prompt fills: the
+longest prompt is about 300 tokens. Ollama allocates the whole window up front, and at 131072
+that sends layers of the larger models to the host; this engine plans its quantised cache at
+4096 tokens and grows it on demand, so it reserved less. The 131072 column compares those two
+policies on short prompts, not two engines at a full context.
 Engines run alone, others stopped, cards back at idle - a peer process changes where a model
 lands. Ollama runs without Vulkan, `num_gpu 0` for CPU rows.
 
