@@ -397,7 +397,9 @@ if __name__ == "__main__":
     # Membership is read from the document rather than from a table kept here: which model
     # belongs to which family is already written, once, in the file being rewritten.
     p = pathlib.Path(md)
-    doc = p.read_text()
+    # Blank runs are folded before the split: the preamble used to keep its trailing blank
+    # lines and the join added one more, so the document grew a line per measured cell.
+    doc = re.sub(r"\n{3,}", "\n\n", p.read_text())
     all_rows = cells(load_all(res))
 
     lines = doc.splitlines()
@@ -410,7 +412,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     bounds = starts + [len(lines)]
-    preamble = "\n".join(lines[:starts[0]])
+    preamble = "\n".join(lines[:starts[0]]).rstrip("\n")
     placed, out = set(), [preamble]
     # There is one unfiled section, never a new one per unclassified model. Its blocks are
     # collected here and re-emitted once at the end: a section whose only membership rule is
