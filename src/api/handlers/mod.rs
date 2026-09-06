@@ -5,7 +5,7 @@
 //! Supports Ollama-compatible API format.
 
 use axum::{
-    extract::{rejection::JsonRejection, FromRequest, Path, Query, Request, State},
+    extract::{FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -1781,15 +1781,63 @@ impl<S, T> FromRequest<S> for OpenAIJson<T>
 where
     S: Send + Sync,
     T: serde::de::DeserializeOwned,
-    Json<T>: FromRequest<S, Rejection = JsonRejection>,
 {
     type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match Json::<T>::from_request(req, state).await {
-            Ok(Json(body)) => Ok(Self(body)),
-            Err(rej) => Err(ApiError::Validation(rej.body_text())),
-        }
+        lenient_json(req, state).await.map(Self).map_err(ApiError::Validation)
+    }
+}
+
+/// The body as JSON whatever `Content-Type` says: a `curl -d` sends a form type, and
+/// the servers these surfaces stand in for read the body all the same.
+pub(crate) async fn lenient_json<S: Send + Sync, T: serde::de::DeserializeOwned>(
+    req: Request,
+    state: &S,
+) -> Result<T, String> {
+    let bytes = axum::body::Bytes::from_request(req, state)
+        .await
+        .map_err(|e| e.body_text())?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("invalid JSON body: {e}"))
+}
+
+/// `axum::Json` for the Messages API: any content type, and a rejection in the Anthropic
+/// error envelope with status 400.
+pub struct AnthropicJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for AnthropicJson<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        lenient_json(req, state).await.map(Self).map_err(|msg| {
+            anthropic_api::anthropic_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                msg,
+            )
+        })
+    }
+}
+
+/// `axum::Json` for the Ollama surface: any content type, and a rejection in Ollama's
+/// `{"error": ...}` shape with status 400.
+pub struct OllamaJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for OllamaJson<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        lenient_json(req, state).await.map(Self).map_err(|msg| {
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg}))).into_response()
+        })
     }
 }
 

@@ -510,7 +510,7 @@ async fn keep_alive_zero_does_not_claim_an_unload_it_did_not_do() {
     let resp = ollama_generate(
         axum::extract::State(state),
         axum::http::HeaderMap::new(),
-        Json(request),
+        OllamaJson(request),
     )
     .await
     .expect("an unload of a model that is not loaded is not an error");

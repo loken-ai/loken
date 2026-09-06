@@ -227,7 +227,7 @@ pub(super) fn extract_generation_options(options: Option<&serde_json::Value>) ->
 /// Chat (POST /api/chat) - Ollama format
 pub(crate) async fn ollama_chat(
     State(state): State<APIServer>,
-    Json(request): Json<OllamaChatRequest>,
+    OllamaJson(request): OllamaJson<OllamaChatRequest>,
 ) -> Result<Response, ApiError> {
     validate_model_id(&request.model)?;
     // Type-level validators on OllamaChatRequest enforce:
@@ -995,7 +995,7 @@ fn generate_messages(system: Option<&str>, prompt: &str) -> Vec<Message> {
 pub(crate) async fn ollama_generate(
     State(state): State<APIServer>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<OllamaGenerateRequest>,
+    OllamaJson(request): OllamaJson<OllamaGenerateRequest>,
 ) -> Result<Response, ApiError> {
     validate_model_id(&request.model)?;
     // Type-level validators on OllamaGenerateRequest enforce:

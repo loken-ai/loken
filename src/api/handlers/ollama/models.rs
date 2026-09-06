@@ -751,7 +751,7 @@ pub(super) fn classify_pull_error(model_name: &str, msg: &str) -> ApiError {
 
 pub(crate) async fn ollama_pull_model(
     State(state): State<APIServer>,
-    Json(request): Json<OllamaPullRequest>,
+    OllamaJson(request): OllamaJson<OllamaPullRequest>,
 ) -> Result<Response, ApiError> {
     validate_model_id(&request.name)?;
     let model_name = normalize_model_id(&request.name);
@@ -938,7 +938,7 @@ pub(crate) async fn ollama_pull_model(
 /// Delete model (DELETE /api/delete) - Ollama format
 pub(crate) async fn ollama_delete_model(
     State(state): State<APIServer>,
-    Json(request): Json<OllamaDeleteRequest>,
+    OllamaJson(request): OllamaJson<OllamaDeleteRequest>,
 ) -> Result<StatusCode, ApiError> {
     validate_model_id(&request.name)?;
     // Normalize model ID
@@ -986,7 +986,7 @@ pub(crate) async fn ollama_delete_model(
 /// Show model info (POST /api/show) - Ollama format
 pub(crate) async fn ollama_show_model(
     State(state): State<APIServer>,
-    Json(request): Json<OllamaShowRequest>,
+    OllamaJson(request): OllamaJson<OllamaShowRequest>,
 ) -> Result<Json<OllamaShowResponse>, ApiError> {
     // Resolve model name: prefer 'model' field, fall back to 'name' field
     // (matches official Ollama API behavior). Use trim()-based emptiness

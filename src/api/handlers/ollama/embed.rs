@@ -259,7 +259,7 @@ pub(crate) async fn ollama_ps(
 /// Copy model (POST /api/copy) - Ollama-compatible
 pub(crate) async fn ollama_copy_model(
     State(state): State<APIServer>,
-    Json(request): Json<OllamaCopyRequest>,
+    OllamaJson(request): OllamaJson<OllamaCopyRequest>,
 ) -> Result<StatusCode, ApiError> {
     // Empty / whitespace-only / traversal patterns all rejected by
     // validate_model_id (post 52abf6b). The earlier explicit
@@ -319,7 +319,7 @@ pub(crate) async fn ollama_copy_model(
 /// Generate embeddings (POST /api/embed) - Ollama-compatible
 pub(crate) async fn ollama_embed(
     State(state): State<APIServer>,
-    Json(request): Json<OllamaEmbedRequest>,
+    OllamaJson(request): OllamaJson<OllamaEmbedRequest>,
 ) -> Result<Json<OllamaEmbedResponse>, ApiError> {
     validate_model_id(&request.model)?;
     let model_name = normalize_model_id(&request.model);
@@ -452,7 +452,7 @@ pub(crate) async fn ollama_embed(
 /// Creates a model configuration (Modelfile-like) by writing metadata.
 pub(crate) async fn ollama_create_model(
     State(state): State<APIServer>,
-    Json(request): Json<OllamaCreateRequest>,
+    OllamaJson(request): OllamaJson<OllamaCreateRequest>,
 ) -> Result<Response, ApiError> {
     // Type-level length caps on system + modelfile (declared on the struct;
     // see b9d05fa / 0ce73c8). validate_request humanizes the error envelope
@@ -664,7 +664,7 @@ fn create_status_response(stream: bool, model_name: &str, steps: &[&str]) -> Res
 /// Push model (POST /api/push) - Ollama-compatible
 /// Returns 403 Forbidden: loken does not support pushing models to a registry.
 pub(crate) async fn ollama_push_model(
-    Json(request): Json<OllamaPushRequest>,
+    OllamaJson(request): OllamaJson<OllamaPushRequest>,
 ) -> Result<Response, ApiError> {
     // Reject malformed names (path traversal, oversize, NULs) up front
     // - even on a 403, echoing an unvalidated name back into logs is
@@ -832,7 +832,7 @@ pub(crate) struct OllamaLegacyEmbeddingsRequest {
 
 pub(crate) async fn ollama_embeddings_legacy(
     State(state): State<APIServer>,
-    Json(request): Json<OllamaLegacyEmbeddingsRequest>,
+    OllamaJson(request): OllamaJson<OllamaLegacyEmbeddingsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if request.prompt.trim().is_empty() {
         // Ollama answers an empty prompt with an empty vector, and so does this.
@@ -845,7 +845,7 @@ pub(crate) async fn ollama_embeddings_legacy(
         "keep_alive": request.keep_alive,
     }))
     .map_err(|e| ApiError::Validation(format!("embeddings: {e}")))?;
-    let Json(mut response) = ollama_embed(State(state), Json(modern)).await?;
+    let Json(mut response) = ollama_embed(State(state), OllamaJson(modern)).await?;
     let embedding = response.embeddings.pop().unwrap_or_default();
     Ok(Json(serde_json::json!({ "embedding": embedding })))
 }

@@ -414,7 +414,7 @@ pub(crate) async fn anthropic_batches_create(
             let params = r.get("params").cloned().unwrap_or(Value::Null);
             let result = match serde_json::from_value::<crate::api::anthropic::AnthropicMessagesRequest>(params) {
                 Ok(req) => {
-                    let resp = super::super::anthropic_api::anthropic_messages(State(runner_state.clone()), Ok(Json(req))).await;
+                    let resp = super::super::anthropic_api::anthropic_messages(State(runner_state.clone()), AnthropicJson(req)).await;
                     let status = resp.status().as_u16();
                     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap_or_default();
                     let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);

@@ -23,24 +23,11 @@ pub(crate) fn anthropic_error_response(
 /// Anthropic SSE event protocol.
 pub(crate) async fn anthropic_messages(
     State(state): State<APIServer>,
-    payload: Result<
-        Json<crate::api::anthropic::AnthropicMessagesRequest>,
-        axum::extract::rejection::JsonRejection,
-    >,
+    AnthropicJson(req): AnthropicJson<crate::api::anthropic::AnthropicMessagesRequest>,
 ) -> Response {
     use crate::api::anthropic;
     use axum::http::StatusCode;
 
-    let req = match payload {
-        Ok(Json(r)) => r,
-        Err(e) => {
-            return anthropic_error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                e.body_text(),
-            );
-        }
-    };
 
     if let Err(e) = validate_model_id(&req.model) {
         return anthropic_error_response(
@@ -487,22 +474,9 @@ pub(crate) async fn anthropic_messages(
 /// the model's own tokenizer once the model is loaded, estimated before.
 pub(crate) async fn anthropic_count_tokens(
     State(state): State<APIServer>,
-    payload: Result<
-        Json<crate::api::anthropic::AnthropicMessagesRequest>,
-        axum::extract::rejection::JsonRejection,
-    >,
+    AnthropicJson(req): AnthropicJson<crate::api::anthropic::AnthropicMessagesRequest>,
 ) -> Response {
     use axum::http::StatusCode;
-    let req = match payload {
-        Ok(Json(r)) => r,
-        Err(e) => {
-            return anthropic_error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                e.body_text(),
-            );
-        }
-    };
     if let Err(e) = validate_model_id(&req.model) {
         return anthropic_error_response(
             StatusCode::BAD_REQUEST,
