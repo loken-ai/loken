@@ -213,6 +213,77 @@ pub(crate) fn render_go_template(tmpl: &str, system: Option<&str>, prompt: &str)
 /// format nobody had fingerprinted closed their turn after a dozen tokens: we
 /// held the right template and rendered something else. Evaluating it removes
 /// the whole class instead of adding one more fingerprint per model that fails.
+/// The Python string methods chat templates call on `message.content` and friends -
+/// `startswith`, `split`, `rstrip` - which the template language does not carry. A
+/// template that cannot call them renders nothing, and the model silently receives an
+/// approximation of its own format.
+fn python_string_methods(
+    _state: &minijinja::State,
+    value: &minijinja::Value,
+    method: &str,
+    args: &[minijinja::Value],
+) -> Result<minijinja::Value, minijinja::Error> {
+    use minijinja::{Error, ErrorKind, Value};
+    let Some(s) = value.as_str() else {
+        return Err(Error::new(
+            ErrorKind::UnknownMethod,
+            format!("{} has no method named {method}", value.kind()),
+        ));
+    };
+    let text = |i: usize| -> Result<&str, Error> {
+        args.get(i).and_then(Value::as_str).ok_or_else(|| {
+            Error::new(
+                ErrorKind::MissingArgument,
+                format!("{method}: argument {} must be a string", i + 1),
+            )
+        })
+    };
+    let chars = |i: usize| args.get(i).and_then(Value::as_str);
+    // Python strips whitespace without an argument, any of the given characters with one.
+    let cut = |c: char| match chars(0) {
+        Some(set) => set.contains(c),
+        None => c.is_whitespace(),
+    };
+    Ok(match method {
+        "startswith" => Value::from(s.starts_with(text(0)?)),
+        "endswith" => Value::from(s.ends_with(text(0)?)),
+        "strip" => Value::from(s.trim_matches(cut)),
+        "lstrip" => Value::from(s.trim_start_matches(cut)),
+        "rstrip" => Value::from(s.trim_end_matches(cut)),
+        "lower" => Value::from(s.to_lowercase()),
+        "upper" => Value::from(s.to_uppercase()),
+        "replace" => Value::from(s.replace(text(0)?, text(1)?)),
+        "find" => Value::from(s.find(text(0)?).map(|i| i as i64).unwrap_or(-1)),
+        "count" => Value::from(s.matches(text(0)?).count()),
+        "split" => {
+            let limit = args.get(1).and_then(|v| i64::try_from(v.clone()).ok());
+            let parts: Vec<Value> = match (chars(0), limit) {
+                (Some(sep), Some(n)) if n >= 0 => {
+                    s.splitn(n as usize + 1, sep).map(Value::from).collect()
+                }
+                (Some(sep), _) => s.split(sep).map(Value::from).collect(),
+                (None, _) => s.split_whitespace().map(Value::from).collect(),
+            };
+            Value::from(parts)
+        }
+        "join" => {
+            let items: Result<Vec<String>, Error> = args
+                .first()
+                .ok_or_else(|| Error::new(ErrorKind::MissingArgument, "join: nothing to join"))?
+                .try_iter()?
+                .map(|v| Ok(v.to_string()))
+                .collect();
+            Value::from(items?.join(s))
+        }
+        _ => {
+            return Err(Error::new(
+                ErrorKind::UnknownMethod,
+                format!("string has no method named {method}"),
+            ))
+        }
+    })
+}
+
 fn render_jinja_template(
     tmpl: &str,
     messages: &[Message],
@@ -272,6 +343,7 @@ fn render_jinja_template(
         )
     });
     let mut env = Environment::new();
+    env.set_unknown_method_callback(python_string_methods);
     // Chat templates call this to reject malformed conversations. Without it the
     // render fails outright, so map it to an error the caller turns into a
     // fallback rather than a panic.
@@ -696,6 +768,22 @@ fn format_deepseek(messages: &[Message]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn templates_can_call_python_string_methods() {
+        let mut env = minijinja::Environment::new();
+        env.set_unknown_method_callback(super::python_string_methods);
+        let render = |src: &str| env.render_str(src, minijinja::context! {}).unwrap();
+        assert_eq!(render("{{ '<tool_response>x'.startswith('<tool_response>') }}"), "True");
+        assert_eq!(render("{{ 'a</think>b'.split('</think>') | last }}"), "b");
+        assert_eq!(render("{{ 'a</think>b</think>c'.split('</think>', 1) | length }}"), "2");
+        assert_eq!(render("{{ ' x \n'.rstrip() }}|{{ 'xxy'.lstrip('x') }}"), " x|y");
+        assert_eq!(render("{{ 'A b'.lower() }} {{ 'a-b'.replace('-', '+') }}"), "a b a+b");
+        assert_eq!(render("{{ ', '.join(['a', 'b']) }} {{ 'abc'.find('c') }}"), "a, b 2");
+        assert!(env
+            .render_str("{{ 'x'.casefold() }}", minijinja::context! {})
+            .is_err());
+    }
+
     use super::*;
 
     #[test]
