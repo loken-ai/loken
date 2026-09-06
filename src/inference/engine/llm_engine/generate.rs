@@ -190,6 +190,8 @@ impl LlmEngine {
         let config = self.config.clone();
         let kv_shift_reuse = config.kv_shift_reuse;
         let kv_snapshots = config.kv_snapshots;
+        let kv_snapshot_budget =
+            (config.kv_snapshot_budget_gb.max(0.0) * (1u64 << 30) as f64) as u64;
         let kv_disk = self.kv_disk.clone();
         let prompt = prompt.to_string();
         // Spec-decode: load the drafter, when one is configured, before the
@@ -1555,11 +1557,11 @@ impl LlmEngine {
                 });
                 drop(g);
                 if kv_snapshots > 0 {
-                    match state.model.snapshot_kv(full.clone(), pos, kv_snapshots) {
+                    match state.model.snapshot_kv(full.clone(), pos, kv_snapshots, kv_snapshot_budget) {
                         Err(e) => tracing::warn!("kv snapshot skipped: {e}"),
                         Ok(()) => {
-                            if let Some(store) = kv_disk.as_deref() {
-                                persist_kv_snapshot(store, state.model.as_ref(), &state.name, &full);
+                            if let Some(store) = kv_disk.clone() {
+                                spawn_persist(model_state.clone(), store, full.clone());
                             }
                         }
                     }

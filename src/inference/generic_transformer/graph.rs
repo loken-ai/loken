@@ -1518,6 +1518,7 @@ impl GenericHeteroTransformer {
         tokens: Vec<u32>,
         kv_len: usize,
         cap: usize,
+        budget_bytes: u64,
     ) -> crate::tensor::Result<()> {
         if cap == 0 || !self.supports_kv_snapshots() {
             self.kv_snapshots.clear();
@@ -1557,7 +1558,57 @@ impl GenericHeteroTransformer {
             Some(i) => self.kv_snapshots[i] = snap,
             None => self.kv_snapshots.push(snap),
         }
+        self.enforce_kv_snapshot_budget(budget_bytes);
         Ok(())
+    }
+
+    /// Keeps the snapshots within a device-memory budget, dropping the least recently
+    /// used until they fit. A budget of zero is derived: the free device memory plus what
+    /// the snapshots already hold, less the working window the cache may still grow by.
+    fn enforce_kv_snapshot_budget(&mut self, budget_bytes: u64) {
+        let held: u64 = self.kv_snapshots.iter().map(KvSnapshot::device_bytes).sum();
+        let budget = if budget_bytes > 0 {
+            budget_bytes
+        } else {
+            let (layers, n_kv, hd) = self.kv_layout();
+            let window_bytes = (layers * 2 * n_kv * hd
+                * crate::inference::cache::KV_WORKING_WINDOW_TOKENS
+                * crate::tensor::DType::F16.size_in_bytes()) as u64;
+            match self.free_device_memory() {
+                Some(free) => (free + held).saturating_sub(window_bytes),
+                None => return,
+            }
+        };
+        let mut held = held;
+        while held > budget && self.kv_snapshots.len() > 1 {
+            let i = self
+                .kv_snapshots
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.tick)
+                .map(|(i, _)| i)
+                .unwrap();
+            held -= self.kv_snapshots[i].device_bytes();
+            self.kv_snapshots.swap_remove(i);
+        }
+        if held > budget {
+            tracing::debug!("kv snapshot dropped: {held} bytes exceed the {budget} byte budget alone");
+            self.kv_snapshots.clear();
+        }
+    }
+
+    /// Free memory on the device holding the first layer, when it is a card.
+    fn free_device_memory(&self) -> Option<u64> {
+        #[cfg(feature = "cuda")]
+        {
+            let dev = self.layers.first()?.cos.device();
+            if dev.is_cuda() {
+                return crate::tensor::cuda_ext::mem_get_info(&dev)
+                    .ok()
+                    .map(|(free, _)| free as u64);
+            }
+        }
+        None
     }
 
     /// The snapshot sharing the longest prefix with `prompt`, as `(index, common)`,
@@ -1787,6 +1838,7 @@ impl GenericHeteroTransformer {
             Some(i) => self.kv_snapshots[i] = snap,
             None => self.kv_snapshots.push(snap),
         }
+        self.enforce_kv_snapshot_budget(0);
         Ok(())
     }
 

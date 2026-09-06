@@ -171,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             kv_snapshots: 0,
                             kv_disk_dir: None,
                             kv_disk_budget_gb: 0.0,
+                            kv_snapshot_budget_gb: 0.0,
                             files_dir: None,
                             moderation_model: None,
                             public_url: None,

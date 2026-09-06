@@ -42,6 +42,9 @@ pub struct KvDiskStore {
     dir: PathBuf,
     budget: u64,
     block_tokens: usize,
+    /// Persists run on their own threads; one at a time per store, or the garbage
+    /// collector of one would sweep the blocks another is still writing.
+    persist_lock: Mutex<()>,
     index: Mutex<Vec<Manifest>>,
 }
 
@@ -119,6 +122,7 @@ impl KvDiskStore {
             dir,
             budget,
             block_tokens,
+            persist_lock: Mutex::new(()),
             index: Mutex::new(index),
         })
     }
@@ -164,6 +168,23 @@ impl KvDiskStore {
         self.index.lock().ok().and_then(|g| g.get(index).map(|m| m.kv_dtype)).unwrap_or(0)
     }
 
+    /// The block-aligned prefix a persist of `kv_len` tokens would cover.
+    pub fn covered_len(&self, tokens_len: usize, kv_len: usize) -> usize {
+        kv_len.min(tokens_len) / self.block_tokens * self.block_tokens
+    }
+
+    /// The blocks of a prefix not yet on disk, as `(index, from, to)` spans, so a caller
+    /// can copy only those out before writing. A chain shares its head with any earlier
+    /// persist of the same conversation, which is why most turns leave one block to do.
+    pub fn missing_blocks(&self, model: &str, layout: u64, tokens: &[u32], covered: usize) -> Vec<(usize, usize, usize)> {
+        block_chain(model, layout, &tokens[..covered.min(tokens.len())], self.block_tokens)
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| std::fs::metadata(self.block_path(**h)).is_err())
+            .map(|(b, _)| (b, b * self.block_tokens, (b + 1) * self.block_tokens))
+            .collect()
+    }
+
     /// The token prefix length a manifest covers.
     pub fn manifest_covered(&self, index: usize) -> usize {
         self.index.lock().ok().and_then(|g| g.get(index).map(|m| m.covered)).unwrap_or(0)
@@ -194,6 +215,7 @@ impl KvDiskStore {
         window: &[LayerRows],
         mut rows: impl FnMut(usize, usize) -> Result<Vec<LayerRows>>,
     ) -> Result<()> {
+        let _serial = self.persist_lock.lock().map_err(|_| anyhow!("kv disk persist lock poisoned"))?;
         let covered = kv_len.min(tokens.len()) / self.block_tokens * self.block_tokens;
         if covered == 0 {
             return Ok(());
@@ -363,6 +385,9 @@ impl KvDiskStore {
         named.extend(g.iter().filter_map(|m| m.window_blob));
         for entry in std::fs::read_dir(self.dir.join("blocks"))? {
             let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                continue; // a block still being written by a persist
+            }
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             match u64::from_str_radix(stem, 16) {
                 Ok(h) if named.contains(&h) => {}

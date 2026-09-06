@@ -846,43 +846,89 @@ pub(crate) fn kv_layout_id(model: &dyn crate::inference::engine::model_backend::
 }
 
 /// Writes the snapshot just taken for `tokens` to the disk tier, block by block.
-pub(crate) fn persist_kv_snapshot(
-    store: &crate::inference::cache::kv_disk::KvDiskStore,
+/// Writes the snapshot that holds `tokens` to the disk tier, off the request path. A
+/// thread takes the model lock once, copies out only the blocks not yet on disk, most
+/// turns one, and writes with the lock released; a response never waits on the copies or
+/// the writes, and requests wait at most that one copy.
+pub(crate) fn spawn_persist(
+    model_state: std::sync::Arc<tokio::sync::Mutex<Option<LoadedModelState>>>,
+    store: std::sync::Arc<crate::inference::cache::kv_disk::KvDiskStore>,
+    tokens: Vec<u32>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("kv-disk-persist".to_string())
+        .spawn(move || persist_kv_snapshot(&model_state, &store, &tokens));
+    if let Err(e) = spawned {
+        tracing::warn!("kv disk persist thread: {e}");
+    }
+}
+
+/// Finds the snapshot holding `tokens` whole: its index and resident length.
+fn snapshot_index_for(
     model: &dyn crate::inference::engine::model_backend::ModelBackend,
-    model_name: &str,
+    tokens: &[u32],
+) -> Option<(usize, usize)> {
+    let (index, common) = model.best_kv_snapshot(tokens)?;
+    let (_, kv_len) = model.kv_snapshot_ref(index)?;
+    if common < kv_len.min(tokens.len()) {
+        return None; // the table holds another sequence; nothing of this one to write
+    }
+    Some((index, kv_len))
+}
+
+fn persist_kv_snapshot(
+    model_state: &tokio::sync::Mutex<Option<LoadedModelState>>,
+    store: &crate::inference::cache::kv_disk::KvDiskStore,
     tokens: &[u32],
 ) {
-    let Some((index, common)) = model.best_kv_snapshot(tokens) else {
-        return;
-    };
-    let Some((_, kv_len)) = model.kv_snapshot_ref(index) else {
-        return;
-    };
-    if common < kv_len.min(tokens.len()) {
-        return; // the table holds another sequence; nothing of this one to write
-    }
-    let layout = kv_layout_id(model);
-    let kv_dtype = model.kv_snapshot_dtype(index).unwrap_or(0);
-    // Windowed layers (their captured length is below kv_len) travel in a side blob,
-    // trimmed to the block-aligned prefix the global layers share.
-    let covered = (kv_len.min(tokens.len()) / store.block_tokens()) * store.block_tokens();
-    let window = match model.export_window_rows(index, covered) {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!("kv disk: window rows export failed: {e}; not persisted");
-            return;
+    // Under the lock: the snapshot's facts and the rows of the blocks still to write.
+    let (model_name, layout, kv_len, kv_dtype, window, staged) = {
+        let g = model_state.blocking_lock();
+        let Some(state) = g.as_ref() else { return };
+        let model = state.model.as_ref();
+        let Some((index, kv_len)) = snapshot_index_for(model, tokens) else { return };
+        let covered = store.covered_len(tokens.len(), kv_len);
+        let layout = kv_layout_id(model);
+        let window = match model.export_window_rows(index, covered) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("kv disk: window rows export failed: {e}; not persisted");
+                return;
+            }
+        };
+        let mut staged = std::collections::HashMap::new();
+        for (b, from, to) in store.missing_blocks(&state.name, layout, tokens, covered) {
+            match model.export_kv_rows(index, from, to) {
+                Ok(rows) => {
+                    staged.insert(b, rows);
+                }
+                Err(e) => {
+                    tracing::warn!("kv disk: block export failed: {e}; not persisted");
+                    return;
+                }
+            }
         }
+        (
+            state.name.clone(),
+            layout,
+            kv_len,
+            model.kv_snapshot_dtype(index).unwrap_or(0),
+            window,
+            staged,
+        )
     };
-    if let Err(e) = store.persist(model_name, layout, tokens, kv_len, kv_dtype, &window, |from, to| {
-        model
-            .export_kv_rows(index, from, to)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-    }) {
+    // Lock released: the writes.
+    let mut staged = staged;
+    let result = store.persist(&model_name, layout, tokens, kv_len, kv_dtype, &window, |from, _to| {
+        staged
+            .remove(&(from / store.block_tokens()))
+            .ok_or_else(|| anyhow::anyhow!("kv disk: block at {from} was not staged"))
+    });
+    if let Err(e) = result {
         tracing::warn!("kv disk persist failed: {e}");
     }
 }
 
-/// Head a clamped prompt keeps, the same one `clamp_prompt_to_window` keeps.
 const SHIFT_KEEP: usize = 1;
 /// Tokens compared to locate the prompt's tail in the resident sequence before the
 /// match is extended; long enough that chat text does not repeat it by chance.

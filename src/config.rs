@@ -86,6 +86,8 @@ pub struct InferenceConfigToml {
     #[serde(default)]
     pub kv_disk_budget_gb: f64,
     #[serde(default)]
+    pub kv_snapshot_budget_gb: f64,
+    #[serde(default)]
     pub files_dir: Option<String>,
     #[serde(default)]
     pub moderation_model: Option<String>,
@@ -275,6 +277,7 @@ impl Config {
             kv_snapshots: toml_config.kv_snapshots,
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
             kv_disk_budget_gb: toml_config.kv_disk_budget_gb,
+            kv_snapshot_budget_gb: toml_config.kv_snapshot_budget_gb,
             files_dir: toml_config.files_dir.clone(),
             moderation_model: toml_config.moderation_model.clone(),
             public_url: toml_config.public_url.clone(),
@@ -384,6 +387,7 @@ impl Config {
                 kv_snapshots: 0,
                 kv_disk_dir: None,
                 kv_disk_budget_gb: 0.0,
+                kv_snapshot_budget_gb: 0.0,
                 files_dir: None,
                 moderation_model: None,
                 public_url: None,

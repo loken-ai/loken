@@ -195,6 +195,9 @@ pub struct InferenceConfig {
     /// Bytes the disk tier may hold, in GiB; 0 for no limit. Least recently used
     /// sequences go first.
     pub kv_disk_budget_gb: f64,
+    /// Device memory the in-memory KV snapshots may hold, in GiB; 0 derives it from the
+    /// free memory at snapshot time, leaving the cache its working window.
+    pub kv_snapshot_budget_gb: f64,
     /// Where `/v1/files` keeps uploads and batch outputs; `None` uses `files/` beside
     /// the model store.
     pub files_dir: Option<String>,
@@ -290,6 +293,7 @@ impl Default for InferenceConfig {
             kv_snapshots: 0,
             kv_disk_dir: None,
             kv_disk_budget_gb: 0.0,
+            kv_snapshot_budget_gb: 0.0,
             files_dir: None,
             moderation_model: None,
             public_url: None,

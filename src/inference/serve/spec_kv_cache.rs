@@ -33,6 +33,11 @@ impl SpecKvSnapshot {
     pub fn dtype(&self) -> DType {
         self.k.dtype()
     }
+    /// Device memory the stored K and V occupy.
+    pub fn device_bytes(&self) -> u64 {
+        let per = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        per(&self.k) + per(&self.v)
+    }
     /// The stored K and V, `[1, n_kv, len, head_dim]`, for re-appending into a cache.
     pub fn kv(&self) -> (&Tensor, &Tensor) {
         (&self.k, &self.v)

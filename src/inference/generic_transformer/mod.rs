@@ -422,6 +422,16 @@ pub struct KvSnapshot {
     pub(crate) tick: u64,
 }
 
+impl KvSnapshot {
+    /// Device memory this snapshot holds across its layers (host copies are not counted).
+    pub fn device_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter_map(|l| l.spec.as_ref().map(|s| s.device_bytes()))
+            .sum()
+    }
+}
+
 pub(crate) struct LayerKvSnapshot {
     pub(crate) spec: Option<crate::inference::serve::spec_kv_cache::SpecKvSnapshot>,
     pub(crate) cpu_f16: Option<crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
