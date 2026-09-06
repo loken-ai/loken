@@ -366,6 +366,17 @@ impl APIServer {
     /// unload and reload with the new mode. No-op if the engine already
     /// matches, or if it's not currently loaded (caller gets the usual
     /// "not loaded" error from `get_engine` afterward).
+    /// The context length a model's GGUF header declares, read without loading it.
+    fn declared_context(&self, model_id: &str) -> Option<usize> {
+        let path = self.manifest_layer_path(model_id, "model")?;
+        let (meta, _, _, _) = super::ollama::gguf_facts(&path);
+        let meta = meta?;
+        let arch = meta.get("general.architecture")?.as_str()?.to_string();
+        meta.get(&format!("{arch}.context_length"))?
+            .as_u64()
+            .map(|v| v as usize)
+    }
+
     /// A request's `num_ctx` above the context the engine was configured with reloads it
     /// at that context, as Ollama does; the loader still bounds it by what the model
     /// declares and what the cards hold.
@@ -380,6 +391,12 @@ impl APIServer {
                 Some(entry) => (entry.engine.config().context_length, entry.keep_alive_minutes),
                 None => return Ok(()),
             }
+        };
+        // The model cannot open a window past what its checkpoint declares, so a larger
+        // request is clamped there before it can cost a reload that would change nothing.
+        let want = match self.declared_context(model_id) {
+            Some(declared) => want.min(declared),
+            None => want,
         };
         if want <= current {
             return Ok(());

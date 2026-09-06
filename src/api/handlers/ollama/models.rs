@@ -459,7 +459,7 @@ fn gguf_file_type_name(id: u64) -> Option<&'static str> {
 /// tensors are stored under, and how many parameters it holds.
 ///
 /// Reads the header, not the weights.
-pub(super) fn gguf_facts(
+pub(crate) fn gguf_facts(
     path: &std::path::Path,
 ) -> (
     Option<serde_json::Map<String, serde_json::Value>>,
