@@ -749,7 +749,8 @@ pub(crate) fn kv_reuse_start(
                         .load(mi, blocks, n_layers)
                         .map_err(|e| crate::tensor::Error::msg(e.to_string()))
                         .and_then(|rows| {
-                            model.import_kv_snapshot(prompt_tokens[..covered].to_vec(), covered, rows, cap)
+                            let dt = store.manifest_kv_dtype(mi);
+                            model.import_kv_snapshot(prompt_tokens[..covered].to_vec(), covered, rows, cap, dt)
                         })
                         .and_then(|()| {
                             let (index, _) = model
@@ -857,8 +858,16 @@ pub(crate) fn persist_kv_snapshot(
     if common < kv_len.min(tokens.len()) {
         return; // the table holds another sequence; nothing of this one to write
     }
+    // A windowed (SWA) model keeps only a recent window in some layers, not the whole
+    // prefix, so its snapshot cannot be laid out as a token-prefix of uniform-length
+    // blocks. Persist only when every layer holds the same [0, kv_len] prefix.
+    if model.kv_snapshot_uniform_len(index) != Some(kv_len) {
+        tracing::debug!("kv disk: snapshot is not prefix-uniform (windowed layers); not persisted");
+        return;
+    }
     let layout = kv_layout_id(model);
-    if let Err(e) = store.persist(model_name, layout, tokens, kv_len, |from, to| {
+    let kv_dtype = model.kv_snapshot_dtype(index).unwrap_or(0);
+    if let Err(e) = store.persist(model_name, layout, tokens, kv_len, kv_dtype, |from, to| {
         model
             .export_kv_rows(index, from, to)
             .map_err(|e| anyhow::anyhow!("{e}"))

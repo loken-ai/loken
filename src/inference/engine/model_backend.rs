@@ -351,6 +351,12 @@ pub(crate) trait ModelBackend: Send {
     fn snapshot_kv(&mut self, _tokens: Vec<u32>, _kv_len: usize, _cap: usize) -> crate::tensor::Result<()> {
         Ok(())
     }
+    fn kv_snapshot_uniform_len(&self, _index: usize) -> Option<usize> {
+        None
+    }
+    fn kv_snapshot_dtype(&self, _index: usize) -> Option<u8> {
+        None
+    }
     fn best_kv_snapshot(&self, _prompt: &[u32]) -> Option<(usize, usize)> {
         None
     }
@@ -384,6 +390,7 @@ pub(crate) trait ModelBackend: Send {
         _kv_len: usize,
         _rows: Vec<Option<(Vec<f32>, Vec<f32>)>>,
         _cap: usize,
+        _dtype_code: u8,
     ) -> crate::tensor::Result<()> {
         Ok(())
     }
@@ -940,6 +947,9 @@ impl ModelBackend for GenericBackend {
     fn best_kv_snapshot(&self, prompt: &[u32]) -> Option<(usize, usize)> {
         self.0.best_kv_snapshot(prompt)
     }
+    fn kv_snapshot_uniform_len(&self, index: usize) -> Option<usize> {
+        self.0.kv_snapshot_uniform_len(index)
+    }
     fn restore_kv_snapshot(&mut self, index: usize) -> crate::tensor::Result<(Vec<u32>, usize)> {
         self.0.restore_kv_snapshot(index)
     }
@@ -964,8 +974,12 @@ impl ModelBackend for GenericBackend {
         kv_len: usize,
         rows: Vec<Option<(Vec<f32>, Vec<f32>)>>,
         cap: usize,
+        dtype_code: u8,
     ) -> crate::tensor::Result<()> {
-        self.0.import_kv_snapshot(tokens, kv_len, rows, cap)
+        self.0.import_kv_snapshot(tokens, kv_len, rows, cap, dtype_code)
+    }
+    fn kv_snapshot_dtype(&self, index: usize) -> Option<u8> {
+        self.0.kv_snapshot_dtype(index)
     }
 
     fn supports_trim_kv(&self) -> bool {

@@ -1503,12 +1503,10 @@ impl GenericHeteroTransformer {
     /// Snapshots cover the F-dtype device cache and the host f16 cache. A quantised cache
     /// has no copy constructor, so a model built with one keeps a single resident KV.
     pub fn supports_kv_snapshots(&self) -> bool {
-        self.layers.iter().all(|l| {
-            let quantised = l.cpu_q8_kv.is_some();
-            #[cfg(feature = "cuda")]
-            let quantised = quantised || l.q8_kv_cache.is_some() || l.q4_kv_cache.is_some();
-            !quantised
-        })
+        // A quantised layer (Q8/Q4 on the card) is captured by dequantising to F16 and
+        // restored by re-appending, which stays on the same quant grid. The host q8 cache
+        // has no such round-trip and still bars snapshots.
+        self.layers.iter().all(|l| l.cpu_q8_kv.is_none())
     }
 
     /// Copies the resident KV aside under `tokens`, keeping at most `cap` snapshots: the
@@ -1527,6 +1525,10 @@ impl GenericHeteroTransformer {
         }
         let mut layers = Vec::with_capacity(self.layers.len());
         for l in &self.layers {
+            if let Some(snap) = quantised_layer_snapshot(l)? {
+                layers.push(snap);
+                continue;
+            }
             let spec = match l.kv_cache.snapshot() {
                 Ok(s) => s,
                 Err(e) => {
@@ -1579,6 +1581,9 @@ impl GenericHeteroTransformer {
         } = self;
         let snap = &kv_snapshots[index];
         for (l, s) in layers.iter_mut().zip(&snap.layers) {
+            if restore_quantised_layer(l, s)? {
+                continue;
+            }
             match &s.spec {
                 Some(spec) => l.kv_cache.restore(spec)?,
                 None => l.kv_cache.trim_to(0),
@@ -1605,6 +1610,42 @@ impl GenericHeteroTransformer {
 
     /// Every layer's rows for tokens `[from, to)` of snapshot `index`, host f32, or
     /// `None` for a layer that keeps no KV of its own.
+    /// The KV element dtype of a snapshot (0 = F16, 1 = F32, 2 = BF16), read from its
+    /// first layer. The disk manifest records it so a cold import rebuilds tensors the
+    /// cache accepts.
+    pub fn kv_snapshot_dtype(&self, index: usize) -> Option<u8> {
+        let snap = self.kv_snapshots.get(index)?;
+        let dt = snap.layers.iter().find_map(|l| l.spec.as_ref().map(|s| s.dtype()))?;
+        Some(match dt {
+            crate::tensor::DType::F16 => 0,
+            crate::tensor::DType::F32 => 1,
+            crate::tensor::DType::BF16 => 2,
+            _ => 0,
+        })
+    }
+
+    /// The prefix length every layer of a snapshot holds in full, when they agree.
+    /// A windowed (SWA) layer keeps only its recent window, not the whole prefix, so
+    /// its captured length is shorter; the disk tier, which stores blocks of a token
+    /// prefix, cannot represent that and must skip such a snapshot.
+    pub fn kv_snapshot_uniform_len(&self, index: usize) -> Option<usize> {
+        let snap = self.kv_snapshots.get(index)?;
+        let mut len: Option<usize> = None;
+        for l in &snap.layers {
+            let n = match (&l.spec, &l.cpu_f16) {
+                (Some(spec), _) => spec.len(),
+                (None, Some(c)) => c.len(),
+                (None, None) => return None,
+            };
+            match len {
+                None => len = Some(n),
+                Some(prev) if prev == n => {}
+                Some(_) => return None,
+            }
+        }
+        len.filter(|&n| n == snap.kv_len)
+    }
+
     pub fn export_kv_rows(
         &self,
         index: usize,
@@ -1637,7 +1678,13 @@ impl GenericHeteroTransformer {
         kv_len: usize,
         rows: Vec<Option<(Vec<f32>, Vec<f32>)>>,
         cap: usize,
+        dtype_code: u8,
     ) -> crate::tensor::Result<()> {
+        let kv_dtype = match dtype_code {
+            1 => crate::tensor::DType::F32,
+            2 => crate::tensor::DType::BF16,
+            _ => crate::tensor::DType::F16,
+        };
         if cap == 0 || !self.supports_kv_snapshots() {
             return Ok(());
         }
@@ -1652,7 +1699,21 @@ impl GenericHeteroTransformer {
             };
             let (n_kv, hd) = (l.n_kv_head, l.head_dim);
             let n = k.len() / (n_kv * hd);
-            if let Some(buf) = l.kv_cache.k_buffer() {
+            // A GPU layer keeps its KV in the spec cache. On a cold server the buffer is
+            // not allocated yet, so there is no tensor to copy the device and dtype from:
+            // build a like tensor on the layer's own device (F-dtype KV is F16).
+            let spec_like = if let Some(buf) = l.kv_cache.k_buffer() {
+                Some(buf)
+            } else if l.cpu_f16_kv.is_none() {
+                Some(crate::tensor::Tensor::zeros_on(
+                    (1, 1, 1, 1),
+                    kv_dtype,
+                    &l.cos.device(),
+                )?)
+            } else {
+                None
+            };
+            if let Some(buf) = spec_like {
                 let spec = crate::inference::serve::spec_kv_cache::SpecKvSnapshot::from_host_rows(
                     &buf, &k, &v, n, n_kv, hd,
                 )?;
@@ -2101,4 +2162,67 @@ mod kv_snapshot_tests {
         assert_eq!(snapshot_slot(&existing, &[7, 7], 3), None);
         assert_eq!(snapshot_slot(&existing, &[7, 7], 2), Some(1));
     }
+}
+
+/// Capture a quantised layer's KV as a snapshot: dequantise the resident cache to F16
+/// tensors `[1, n_kv, len, head_dim]`. Returns `None` for a non-quantised layer, whose
+/// spec cache the caller snapshots directly. Restoring re-appends onto the same quant
+/// grid, so it adds no loss beyond what the cache already carries.
+fn quantised_layer_snapshot(
+    l: &GenericTransformerLayer,
+) -> crate::tensor::Result<Option<super::LayerKvSnapshot>> {
+    #[cfg(feature = "cuda")]
+    {
+        if let Some(q) = l.q8_kv_cache.as_ref() {
+            if q.current_seq_len() > 0 {
+                let (k, v) = q.dequantize_kv(crate::tensor::DType::F16).map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+                let spec = crate::inference::serve::spec_kv_cache::SpecKvSnapshot::from_kv_tensors(
+                    k, v, q.current_seq_len(),
+                );
+                return Ok(Some(super::LayerKvSnapshot { spec: Some(spec), cpu_f16: None }));
+            }
+            return Ok(Some(super::LayerKvSnapshot { spec: None, cpu_f16: None }));
+        }
+        if let Some(q) = l.q4_kv_cache.as_ref() {
+            if q.current_seq_len() > 0 {
+                let (k, v) = q.dequantize_kv(crate::tensor::DType::F16).map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+                let spec = crate::inference::serve::spec_kv_cache::SpecKvSnapshot::from_kv_tensors(
+                    k, v, q.current_seq_len(),
+                );
+                return Ok(Some(super::LayerKvSnapshot { spec: Some(spec), cpu_f16: None }));
+            }
+            return Ok(Some(super::LayerKvSnapshot { spec: None, cpu_f16: None }));
+        }
+    }
+    let _ = l;
+    Ok(None)
+}
+
+/// Restore a snapshot layer into a quantised cache by re-appending its dequantised K/V.
+/// Returns `false` for a non-quantised layer, left to the spec path.
+fn restore_quantised_layer(
+    l: &mut GenericTransformerLayer,
+    s: &super::LayerKvSnapshot,
+) -> crate::tensor::Result<bool> {
+    #[cfg(feature = "cuda")]
+    {
+        if let Some(q) = l.q8_kv_cache.as_mut() {
+            q.reset();
+            if let Some(spec) = &s.spec {
+                let (k, v) = spec.kv();
+                q.append(k, v).map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+            }
+            return Ok(true);
+        }
+        if let Some(q) = l.q4_kv_cache.as_mut() {
+            q.reset();
+            if let Some(spec) = &s.spec {
+                let (k, v) = spec.kv();
+                q.append(k, v).map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+            }
+            return Ok(true);
+        }
+    }
+    let _ = (l, s);
+    Ok(false)
 }

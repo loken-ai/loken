@@ -27,6 +27,11 @@ pub struct Manifest {
     pub blocks: Vec<u64>,
     pub bytes: u64,
     pub last_used: u64,
+    /// KV element dtype code (0 = F16, 1 = F32, 2 = BF16). A cold import rebuilds tensors
+    /// the model's cache accepts; the dtype is only known while a model is warm, so it is
+    /// recorded here. Absent in manifests written before this field: default 0 (F16).
+    #[serde(default)]
+    pub kv_dtype: u8,
 }
 
 pub struct KvDiskStore {
@@ -150,6 +155,11 @@ impl KvDiskStore {
     }
 
     /// The tokens a manifest covers, to seed the resident entry on a restore.
+    /// The KV dtype code recorded for a manifest.
+    pub fn manifest_kv_dtype(&self, index: usize) -> u8 {
+        self.index.lock().ok().and_then(|g| g.get(index).map(|m| m.kv_dtype)).unwrap_or(0)
+    }
+
     pub fn manifest_tokens(&self, index: usize) -> Option<(Vec<u32>, usize)> {
         let mut g = self.index.lock().ok()?;
         let m = g.get_mut(index)?;
@@ -165,6 +175,7 @@ impl KvDiskStore {
         layout: u64,
         tokens: &[u32],
         kv_len: usize,
+        kv_dtype: u8,
         mut rows: impl FnMut(usize, usize) -> Result<Vec<LayerRows>>,
     ) -> Result<()> {
         let covered = kv_len.min(tokens.len()) / self.block_tokens * self.block_tokens;
@@ -191,6 +202,7 @@ impl KvDiskStore {
             blocks: chain,
             bytes,
             last_used: now_secs(),
+            kv_dtype,
         };
         let path = self.manifest_path(&manifest);
         let json = serde_json::to_vec(&manifest)?;
@@ -385,7 +397,7 @@ mod tests {
         let hd = 32;
         let row = |t: usize| -> Vec<f32> { (0..n_kv * hd).map(|i| (t * 100 + i) as f32 / 7.0).collect() };
         store
-            .persist("m", 1, &tokens, tokens.len(), |from, to| {
+            .persist("m", 1, &tokens, tokens.len(), 0, |from, to| {
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 for t in from..to {

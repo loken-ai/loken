@@ -28,6 +28,20 @@ impl SpecKvSnapshot {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+    /// The element dtype of the stored K/V, so a disk manifest can record it and a cold
+    /// import rebuild tensors the cache will accept.
+    pub fn dtype(&self) -> DType {
+        self.k.dtype()
+    }
+    /// The stored K and V, `[1, n_kv, len, head_dim]`, for re-appending into a cache.
+    pub fn kv(&self) -> (&Tensor, &Tensor) {
+        (&self.k, &self.v)
+    }
+    /// A snapshot holding already-built device tensors `[1, n_kv, len, head_dim]`, as a
+    /// quantised cache hands back when dequantised.
+    pub fn from_kv_tensors(k: Tensor, v: Tensor, len: usize) -> Self {
+        Self { k, v, len }
+    }
 
     /// Tokens `[from, to)` as host f32 rows, token-major `[n, n_kv, head_dim]`, K then V.
     pub fn host_rows(&self, from: usize, to: usize) -> Result<(Vec<f32>, Vec<f32>)> {
