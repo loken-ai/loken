@@ -5,8 +5,6 @@
 //! its blocks. Writes happen after a response; reads bring back only the blocks a prompt
 //! covers.
 
-use crate::tensor::quant_cpu::{from_float_bytes, to_float_bytes};
-use crate::tensor::quantized::GgmlDType;
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -210,7 +208,7 @@ impl KvDiskStore {
             }
             let from = b * self.block_tokens;
             let layers = rows(from, from + self.block_tokens)?;
-            bytes += self.write_block(&path, &layers)?;
+            bytes += self.write_block(&path, &layers, kv_dtype)?;
         }
         // Windowed layers, if any, go in a per-manifest side blob keyed off the prefix.
         let window_blob = if window.iter().any(Option::is_some) {
@@ -220,7 +218,7 @@ impl KvDiskStore {
                 .collect::<Vec<u8>>());
             let path = self.block_path(wh);
             if std::fs::metadata(&path).is_err() {
-                bytes += self.write_block(&path, window)?;
+                bytes += self.write_block(&path, window, kv_dtype)?;
             }
             Some(wh)
         } else {
@@ -255,31 +253,10 @@ impl KvDiskStore {
         self.collect_garbage()
     }
 
-    fn write_block(&self, path: &Path, layers: &[LayerRows]) -> Result<u64> {
-        let mut blobs: Vec<(String, Vec<u8>, Vec<usize>)> = Vec::new();
-        for (l, rows) in layers.iter().enumerate() {
-            let Some((k, v)) = rows else { continue };
-            for (name, data) in [("k", k), ("v", v)] {
-                let q = from_float_bytes(GgmlDType::Q8_0, data)?;
-                blobs.push((format!("{name}.{l}"), q, vec![data.len()]));
-            }
-        }
-        let views: Vec<(String, safetensors::tensor::TensorView)> = blobs
-            .iter()
-            .map(|(name, q, shape)| {
-                // The shape names the f32 count the blob holds, the dtype its packing.
-                let view = safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::U8,
-                    vec![shape[0] / 32, 34],
-                    q,
-                )
-                .map_err(|e| anyhow!("kv disk: {e}"))?;
-                Ok((name.clone(), view))
-            })
-            .collect::<Result<_>>()?;
+    fn write_block(&self, path: &Path, layers: &[LayerRows], dtype_code: u8) -> Result<u64> {
+        let data = encode_block(layers, dtype_code)?;
         let tmp = path.with_extension("tmp");
         {
-            let data = safetensors::serialize(views, None).map_err(|e| anyhow!("kv disk: {e}"))?;
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&data)?;
             release_written(&f);
@@ -334,11 +311,7 @@ impl KvDiskStore {
             let (Ok(k), Ok(v)) = (st.tensor(&format!("k.{l}")), st.tensor(&format!("v.{l}"))) else {
                 continue;
             };
-            let n = k.shape()[0] * 32;
-            let mut kf = vec![0f32; n];
-            let mut vf = vec![0f32; n];
-            to_float_bytes(GgmlDType::Q8_0, k.data(), &mut kf)?;
-            to_float_bytes(GgmlDType::Q8_0, v.data(), &mut vf)?;
+            let (kf, vf) = (block_rows(&k), block_rows(&v));
             match slot {
                 Some((ok, ov)) => {
                     ok.extend_from_slice(&kf);
@@ -431,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn a_block_round_trips_through_q8_and_the_store_finds_its_prefix() {
+    fn a_block_round_trips_and_the_store_finds_its_prefix() {
         let dir = std::env::temp_dir().join(format!("loken-kv-disk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = KvDiskStore::open(dir.clone(), 0, 4).unwrap();
@@ -440,7 +413,7 @@ mod tests {
         let hd = 32;
         let row = |t: usize| -> Vec<f32> { (0..n_kv * hd).map(|i| (t * 100 + i) as f32 / 7.0).collect() };
         store
-            .persist("m", 1, &tokens, tokens.len(), 0, &[], |from, to| {
+            .persist("m", 1, &tokens, tokens.len(), 1, &[], |from, to| {
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 for t in from..to {
@@ -459,10 +432,93 @@ mod tests {
         let (k, _v) = rows[0].as_ref().unwrap();
         assert_eq!(k.len(), 8 * n_kv * hd);
         let want = row(5);
-        for (a, b) in k[5 * hd..6 * hd].iter().zip(&want) {
-            assert!((a - b).abs() <= b.abs() / 100.0 + 0.02, "{a} vs {b}");
-        }
+        assert_eq!(&k[5 * hd..6 * hd], &want[..], "rows must come back bit-exact");
         assert!(store.best("m", 2, &prompt).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f32_and_f16_rows_round_trip_exactly() {
+        // F32 rows (dtype code 1) come back bit-for-bit; F16 rows (code 0) come back
+        // exactly when the values are F16-representable, as a dequantised cache's are.
+        let dir = std::env::temp_dir().join(format!("loken-kv-exact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = KvDiskStore::open(dir.clone(), 0, 4).unwrap();
+        let hd = 32usize;
+        let k: Vec<f32> = (0..4 * hd).map(|i| (i as f32) * 0.31830988 - 3.7).collect();
+        let v: Vec<f32> = (0..4 * hd).map(|i| 1.0 / (i as f32 + 2.0)).collect();
+        let path = store.block_path(42);
+        store.write_block(&path, &[Some((k.clone(), v.clone()))], 1).unwrap();
+        let mut out: Vec<LayerRows> = vec![None];
+        store.read_block(&path, &mut out, 1).unwrap();
+        let (rk, rv) = out[0].as_ref().unwrap();
+        assert_eq!(rk, &k, "F32 K not bit-exact");
+        assert_eq!(rv, &v, "F32 V not bit-exact");
+
+        // F16 path: half-representable values survive exactly.
+        let kf16: Vec<f32> = (0..4 * hd)
+            .map(|i| half::f16::from_f32(i as f32 * 0.5 - 8.0).to_f32())
+            .collect();
+        let p16 = store.block_path(43);
+        store.write_block(&p16, &[Some((kf16.clone(), kf16.clone()))], 0).unwrap();
+        let mut o16: Vec<LayerRows> = vec![None];
+        store.read_block(&p16, &mut o16, 1).unwrap();
+        assert_eq!(&o16[0].as_ref().unwrap().0, &kf16, "F16 not exact for representable values");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A block: each layer's rows at their native dtype (F16 for a dtype code of 0, F32
+/// otherwise), which is exact for the values a snapshot holds, as a plain safetensors
+/// file the reader maps. Not compressed: F16 KV rows are close to incompressible, and
+/// deflating them measured a tenth of the write rate for a tenth of the space.
+fn encode_block(layers: &[LayerRows], dtype_code: u8) -> Result<Vec<u8>> {
+    use safetensors::Dtype;
+    let f16 = dtype_code == 0;
+    let mut owned: Vec<(String, Vec<u8>, usize)> = Vec::new();
+    for (l, rows) in layers.iter().enumerate() {
+        let Some((k, v)) = rows else { continue };
+        for (name, data) in [("k", k), ("v", v)] {
+            let bytes = if f16 {
+                let halves: Vec<half::f16> = data.iter().map(|&x| half::f16::from_f32(x)).collect();
+                let mut b = Vec::with_capacity(halves.len() * 2);
+                for h in halves {
+                    b.extend_from_slice(&h.to_le_bytes());
+                }
+                b
+            } else {
+                let mut b = Vec::with_capacity(data.len() * 4);
+                for &x in data {
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                b
+            };
+            owned.push((format!("{name}.{l}"), bytes, data.len()));
+        }
+    }
+    let dt = if f16 { Dtype::F16 } else { Dtype::F32 };
+    let views: Vec<(String, safetensors::tensor::TensorView)> = owned
+        .iter()
+        .map(|(name, b, n)| {
+            let view = safetensors::tensor::TensorView::new(dt, vec![*n], b)
+                .map_err(|e| anyhow!("kv disk: {e}"))?;
+            Ok((name.clone(), view))
+        })
+        .collect::<Result<_>>()?;
+    safetensors::serialize(views, None).map_err(|e| anyhow!("kv disk: {e}"))
+}
+
+/// A layer's tensor of a block back to f32 rows.
+fn block_rows(view: &safetensors::tensor::TensorView) -> Vec<f32> {
+    let data = view.data();
+    match view.dtype() {
+        safetensors::Dtype::F16 => data
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        _ => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
     }
 }
