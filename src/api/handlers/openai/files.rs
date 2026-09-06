@@ -147,7 +147,15 @@ pub(crate) async fn files_content(
         .ok_or_else(|| ApiError::NotFound(format!("file '{id}' not found")))?;
     let bytes = read_file_bytes(&state, &id)
         .ok_or_else(|| ApiError::NotFound(format!("file '{id}' has no content")))?;
-    let name = record.get("filename").and_then(Value::as_str).unwrap_or("file");
+    // The upload named the file; a header must not carry quotes, separators or control
+    // characters from it, so the name is reduced to a safe charset before it is echoed.
+    let raw = record.get("filename").and_then(Value::as_str).unwrap_or("file");
+    let safe: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(128)
+        .collect();
+    let name = if safe.is_empty() { "file" } else { safe.as_str() };
     let mime = match name.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",
@@ -185,6 +193,34 @@ pub(crate) async fn files_delete(
 struct Batch {
     object: Value,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The most requests one batch may hold: the limit the Batch API documents, so a client
+/// written against it never trips here first.
+const BATCH_MAX_REQUESTS: usize = 50_000;
+/// How long a finished batch stays listable: the API's 24-hour completion window.
+const BATCH_RETENTION_SECS: i64 = 24 * 60 * 60;
+
+/// Drops finished batches past the retention window so the table cannot grow forever.
+fn evict_finished_batches() {
+    let cutoff = now() - BATCH_RETENTION_SECS;
+    if let Ok(mut g) = batches().lock() {
+        g.retain(|_, b| {
+            let done = matches!(
+                b.object.get("status").and_then(Value::as_str),
+                Some("completed") | Some("cancelled") | Some("failed")
+            ) || b.object.get("processing_status").and_then(Value::as_str) == Some("ended");
+            // OpenAI batches stamp an epoch, Messages batches an RFC 3339 string.
+            let created = match b.object.get("created_at") {
+                Some(Value::Number(n)) => n.as_i64().unwrap_or(i64::MAX),
+                Some(Value::String(t)) => chrono::DateTime::parse_from_rfc3339(t)
+                    .map(|d| d.timestamp())
+                    .unwrap_or(i64::MAX),
+                _ => i64::MAX,
+            };
+            !(done && created < cutoff)
+        });
+    }
 }
 
 fn batches() -> &'static Mutex<HashMap<String, Batch>> {
@@ -255,6 +291,13 @@ pub(crate) async fn batches_create(
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str::<Value>(l).unwrap_or_else(|e| json!({"parse_error": e.to_string()})))
         .collect();
+    if lines.len() > BATCH_MAX_REQUESTS {
+        return Err(ApiError::Validation(format!(
+            "batch holds {} requests; at most {BATCH_MAX_REQUESTS} are served",
+            lines.len()
+        )));
+    }
+    evict_finished_batches();
     let id = new_id("batch");
     let object = json!({
         "id": id,
@@ -630,9 +673,17 @@ pub(crate) fn images_as_urls(
         .public_url
         .clone()
         .or_else(|| {
+            // `Host` is client-supplied. Without a configured `public_url` it is the only
+            // origin to hand back, so it is accepted only when it looks like a host and
+            // port, never as arbitrary text that would land in every URL of the answer.
             headers
                 .get(axum::http::header::HOST)
                 .and_then(|h| h.to_str().ok())
+                .filter(|h| {
+                    !h.is_empty()
+                        && h.len() <= 255
+                        && h.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+                })
                 .map(|h| format!("http://{h}"))
         })
         .unwrap_or_default();
