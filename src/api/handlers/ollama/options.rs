@@ -439,6 +439,18 @@ pub(crate) async fn ollama_chat(
             )));
         }
     }
+    if let Some(want) = request
+        .options
+        .as_ref()
+        .and_then(|o| o.get("num_ctx"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        if let Err(e) = state.ensure_engine_context(&model_name, want as usize).await {
+            return Err(ApiError::Internal(format!(
+                "num_ctx reload for '{model_name}': {e}"
+            )));
+        }
+    }
 
     // Auto-load on first use (Ollama-compatible).
     let keep_alive_minutes_chat = state.get_effective_keep_alive(request.keep_alive.as_deref());
@@ -1184,6 +1196,18 @@ pub(crate) async fn ollama_generate(
         if let Err(e) = state.ensure_engine_kv_quant(&model_name, want).await {
             return Err(ApiError::Internal(format!(
                 "kv_quant reload for '{model_name}': {e}"
+            )));
+        }
+    }
+    if let Some(want) = request
+        .options
+        .as_ref()
+        .and_then(|o| o.get("num_ctx"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        if let Err(e) = state.ensure_engine_context(&model_name, want as usize).await {
+            return Err(ApiError::Internal(format!(
+                "num_ctx reload for '{model_name}': {e}"
             )));
         }
     }

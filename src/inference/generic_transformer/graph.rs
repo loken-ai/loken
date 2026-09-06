@@ -4,6 +4,11 @@
 use super::*;
 
 impl GenericHeteroTransformer {
+    /// Tokens the KV cache accepts: the ceiling it grows to, or was allocated at.
+    pub fn kv_capacity(&self) -> usize {
+        self.config.effective_max_context()
+    }
+
     /// Whether this model's KV-cache state is safe under CUDA graph
     /// capture/replay. The graph_ops branch in `forward_attn` writes K/V
     /// into the F-dtype `kv_cache` (k_buffer / v_buffer) using

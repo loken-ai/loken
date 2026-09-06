@@ -1447,9 +1447,16 @@ impl LlmEngine {
                     // The plan above chose this context because the cards can hold it; the
                     // cache must be allocated at that size or the plan promised room the
                     // allocation then takes back.
-                    let effective_ctx = user_context_length
-                        .min(context_length)
-                        .min(ctx_for_planning as usize);
+                    // A quantised cache was planned at its initial cap and grows on demand, so
+                    // its ceiling is the configured context; an F-dtype cache is allocated in
+                    // full at the context the plan chose.
+                    let effective_ctx = if matches!(kv_quant, KvQuant::Q4 | KvQuant::Q8) {
+                        user_context_length.min(context_length)
+                    } else {
+                        user_context_length
+                            .min(context_length)
+                            .min(ctx_for_planning as usize)
+                    };
                     // Adaptive OOM-recovery ladder. The plan above places
                     // optimistically - with no fictional activation margin,
                     // a model whose weights fit one card lands single-GPU
@@ -1610,7 +1617,11 @@ impl LlmEngine {
                 hidden_size,
                 num_heads,
                 vocab_size,
-                context_length,
+                // The window a request may open: what the cache was allocated for, which
+                // the placement plan may have set below the configured context.
+                context_length: model
+                    .kv_capacity()
+                    .map_or(context_length, |c| c.min(context_length)),
                 eos_token_id,
                 #[cfg(feature = "cuda")]
                 moondream_graph: None,

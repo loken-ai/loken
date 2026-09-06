@@ -132,6 +132,11 @@ fn adaptive_prefill_chunk_uncached(widest_ffn: usize) -> usize {
 pub(crate) type KvRows = Vec<Option<(Vec<f32>, Vec<f32>)>>;
 
 pub(crate) trait ModelBackend: Send {
+    /// Tokens the KV cache accepts, when the backend allocates one up front.
+    fn kv_capacity(&self) -> Option<usize> {
+        None
+    }
+
     // --- Core forwards --------------------------------------------------
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor>;
 
@@ -879,6 +884,10 @@ impl ModelBackend for MoondreamBackend {
 }
 
 impl ModelBackend for GenericBackend {
+    fn kv_capacity(&self) -> Option<usize> {
+        Some(self.0.kv_capacity())
+    }
+
     fn adapters(&self) -> Vec<String> {
         self.0.adapters().to_vec()
     }
@@ -1114,6 +1123,10 @@ impl ModelBackend for GenericBackend {
 }
 
 impl ModelBackend for GenericVisionBackend {
+    fn kv_capacity(&self) -> Option<usize> {
+        Some(self.text.kv_capacity())
+    }
+
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
         self.text.forward(x, index_pos)
     }

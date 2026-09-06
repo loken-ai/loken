@@ -366,6 +366,49 @@ impl APIServer {
     /// unload and reload with the new mode. No-op if the engine already
     /// matches, or if it's not currently loaded (caller gets the usual
     /// "not loaded" error from `get_engine` afterward).
+    /// A request's `num_ctx` above the context the engine was configured with reloads it
+    /// at that context, as Ollama does; the loader still bounds it by what the model
+    /// declares and what the cards hold.
+    pub(crate) async fn ensure_engine_context(
+        &self,
+        model_id: &str,
+        want: usize,
+    ) -> Result<(), ApiError> {
+        let (current, had_keep_alive) = {
+            let engines = self.engines.read().await;
+            match engines.iter().find(|e| e.model_id == model_id) {
+                Some(entry) => (entry.engine.config().context_length, entry.keep_alive_minutes),
+                None => return Ok(()),
+            }
+        };
+        if want <= current {
+            return Ok(());
+        }
+        info!("num_ctx {want} above the configured context {current} for {model_id} - reloading model");
+        self.unload_model(model_id).await.ok();
+
+        let mut config = self.config_for_model(model_id);
+        config.context_length = want;
+        let engine = Arc::new(LlmEngine::with_config(config));
+        engine
+            .load_model()
+            .await
+            .map_err(|e| ApiError::Internal(format!("Reload with num_ctx={want} failed: {e}")))?;
+
+        let keep_alive = had_keep_alive.unwrap_or(self.default_keep_alive);
+        let expire_handle = if keep_alive > 0 {
+            Some(self.schedule_expiration(model_id.to_string(), keep_alive))
+        } else {
+            None
+        };
+        let mut engines = self.engines.write().await;
+        let mut entry = LoadedModelEntry::new(model_id.to_string(), engine, Some(keep_alive));
+        entry.expire_handle = expire_handle;
+        engines.push(entry);
+        info!("Model {model_id} reloaded with num_ctx={want}");
+        Ok(())
+    }
+
     pub(crate) async fn ensure_engine_kv_quant(
         &self,
         model_id: &str,
