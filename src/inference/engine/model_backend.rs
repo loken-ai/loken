@@ -384,6 +384,9 @@ pub(crate) trait ModelBackend: Send {
             "kv snapshots: unsupported backend".to_string(),
         ))
     }
+    fn export_window_rows(&self, _index: usize, _covered: usize) -> crate::tensor::Result<KvRows> {
+        Ok(Vec::new())
+    }
     fn import_kv_snapshot(
         &mut self,
         _tokens: Vec<u32>,
@@ -967,6 +970,9 @@ impl ModelBackend for GenericBackend {
         to: usize,
     ) -> crate::tensor::Result<KvRows> {
         self.0.export_kv_rows(index, from, to)
+    }
+    fn export_window_rows(&self, index: usize, covered: usize) -> crate::tensor::Result<KvRows> {
+        self.0.export_window_rows(index, covered)
     }
     fn import_kv_snapshot(
         &mut self,

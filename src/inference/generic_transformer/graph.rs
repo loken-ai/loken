@@ -1656,16 +1656,50 @@ impl GenericHeteroTransformer {
             .kv_snapshots
             .get(index)
             .ok_or_else(|| crate::tensor::Error::msg(format!("kv snapshot {index} gone")))?;
+        let kv_len = snap.kv_len;
         snap.layers
             .iter()
             .map(|l| {
-                if let Some(spec) = &l.spec {
-                    spec.host_rows(from, to).map(Some)
-                } else if let Some(c) = &l.cpu_f16 {
-                    Ok(Some(c.host_rows(from, to)))
-                } else {
-                    Ok(None)
+                // Only layers that hold the whole [0, kv_len] prefix go in the shared,
+                // content-addressed block chain. A windowed layer holds a suffix whose
+                // extent depends on the full sequence, not on this block's tokens, so it
+                // could not share a block hash without corrupting it; it travels in the
+                // manifest's own window blob instead.
+                match (&l.spec, &l.cpu_f16) {
+                    (Some(spec), _) if spec.len() == kv_len => spec.host_rows(from, to).map(Some),
+                    (None, Some(c)) if c.len() == kv_len => Ok(Some(c.host_rows(from, to))),
+                    _ => Ok(None),
                 }
+            })
+            .collect()
+    }
+
+    /// The windowed layers' rows for a snapshot, trimmed to end at `covered` (the
+    /// block-aligned prefix the global layers share), so both describe the same length.
+    /// Global layers return `None`; they live in the block chain.
+    pub fn export_window_rows(
+        &self,
+        index: usize,
+        covered: usize,
+    ) -> crate::tensor::Result<crate::inference::engine::model_backend::KvRows> {
+        let snap = self
+            .kv_snapshots
+            .get(index)
+            .ok_or_else(|| crate::tensor::Error::msg(format!("kv snapshot {index} gone")))?;
+        let kv_len = snap.kv_len;
+        let drop = kv_len.saturating_sub(covered);
+        snap.layers
+            .iter()
+            .map(|l| match (&l.spec, &l.cpu_f16) {
+                (Some(spec), _) if spec.len() < kv_len => {
+                    let keep = spec.len().saturating_sub(drop);
+                    spec.host_rows(0, keep).map(Some)
+                }
+                (None, Some(c)) if c.len() < kv_len => {
+                    let keep = c.len().saturating_sub(drop);
+                    Ok(Some(c.host_rows(0, keep)))
+                }
+                _ => Ok(None),
             })
             .collect()
     }

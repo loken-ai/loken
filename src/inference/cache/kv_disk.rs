@@ -32,6 +32,12 @@ pub struct Manifest {
     /// recorded here. Absent in manifests written before this field: default 0 (F16).
     #[serde(default)]
     pub kv_dtype: u8,
+    /// Hash of the side blob holding this snapshot's windowed layers, when it has any.
+    /// A windowed layer's rows depend on the whole sequence, not on a token block, so
+    /// they cannot share the content-addressed chain; the blob is per-manifest and reused
+    /// only when the whole prefix matches. Absent in older manifests.
+    #[serde(default)]
+    pub window_blob: Option<u64>,
 }
 
 pub struct KvDiskStore {
@@ -160,6 +166,16 @@ impl KvDiskStore {
         self.index.lock().ok().and_then(|g| g.get(index).map(|m| m.kv_dtype)).unwrap_or(0)
     }
 
+    /// The token prefix length a manifest covers.
+    pub fn manifest_covered(&self, index: usize) -> usize {
+        self.index.lock().ok().and_then(|g| g.get(index).map(|m| m.covered)).unwrap_or(0)
+    }
+
+    /// Whether a manifest carries a windowed-layer side blob (reusable only whole).
+    pub fn manifest_windowed(&self, index: usize) -> bool {
+        self.index.lock().ok().and_then(|g| g.get(index).map(|m| m.window_blob.is_some())).unwrap_or(false)
+    }
+
     pub fn manifest_tokens(&self, index: usize) -> Option<(Vec<u32>, usize)> {
         let mut g = self.index.lock().ok()?;
         let m = g.get_mut(index)?;
@@ -169,6 +185,7 @@ impl KvDiskStore {
 
     /// Writes the full blocks of a sequence that are not on disk yet, then its
     /// manifest; `rows(from, to)` supplies every layer's rows for one block.
+    #[allow(clippy::too_many_arguments)]
     pub fn persist(
         &self,
         model: &str,
@@ -176,6 +193,7 @@ impl KvDiskStore {
         tokens: &[u32],
         kv_len: usize,
         kv_dtype: u8,
+        window: &[LayerRows],
         mut rows: impl FnMut(usize, usize) -> Result<Vec<LayerRows>>,
     ) -> Result<()> {
         let covered = kv_len.min(tokens.len()) / self.block_tokens * self.block_tokens;
@@ -194,6 +212,20 @@ impl KvDiskStore {
             let layers = rows(from, from + self.block_tokens)?;
             bytes += self.write_block(&path, &layers)?;
         }
+        // Windowed layers, if any, go in a per-manifest side blob keyed off the prefix.
+        let window_blob = if window.iter().any(Option::is_some) {
+            let wh = fnv1a(layout ^ 0x77, &tokens[..covered.min(tokens.len())]
+                .iter()
+                .flat_map(|t| t.to_le_bytes())
+                .collect::<Vec<u8>>());
+            let path = self.block_path(wh);
+            if std::fs::metadata(&path).is_err() {
+                bytes += self.write_block(&path, window)?;
+            }
+            Some(wh)
+        } else {
+            None
+        };
         let manifest = Manifest {
             model: model.to_string(),
             layout,
@@ -203,6 +235,7 @@ impl KvDiskStore {
             bytes,
             last_used: now_secs(),
             kv_dtype,
+            window_blob,
         };
         let path = self.manifest_path(&manifest);
         let json = serde_json::to_vec(&manifest)?;
@@ -269,6 +302,10 @@ impl KvDiskStore {
                 .copied()
                 .collect()
         };
+        let window_blob = {
+            let g = self.index.lock().map_err(|_| anyhow!("kv disk index poisoned"))?;
+            g.get(index).and_then(|m| m.window_blob)
+        };
         let mut out: Vec<LayerRows> = (0..n_layers).map(|_| None).collect();
         for hash in &chain {
             let path = self.block_path(*hash);
@@ -280,6 +317,11 @@ impl KvDiskStore {
                     return Err(e);
                 }
             }
+        }
+        // Windowed layers come from the side blob, filling the slots the blocks left empty.
+        if let Some(wh) = window_blob {
+            let path = self.block_path(wh);
+            self.read_block(&path, &mut out, n_layers)?;
         }
         Ok(out)
     }
@@ -330,7 +372,7 @@ impl KvDiskStore {
             let mut keep = Vec::new();
             for m in g.drain(..) {
                 let mut fresh = 0u64;
-                for h in &m.blocks {
+                for h in m.blocks.iter().chain(m.window_blob.iter()) {
                     if named.insert(*h) {
                         fresh += std::fs::metadata(self.block_path(*h)).map(|x| x.len()).unwrap_or(0);
                     }
@@ -344,7 +386,8 @@ impl KvDiskStore {
             }
             *g = keep;
         }
-        let named: HashSet<u64> = g.iter().flat_map(|m| m.blocks.iter().copied()).collect();
+        let mut named: HashSet<u64> = g.iter().flat_map(|m| m.blocks.iter().copied()).collect();
+        named.extend(g.iter().filter_map(|m| m.window_blob));
         for entry in std::fs::read_dir(self.dir.join("blocks"))? {
             let path = entry?.path();
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -397,7 +440,7 @@ mod tests {
         let hd = 32;
         let row = |t: usize| -> Vec<f32> { (0..n_kv * hd).map(|i| (t * 100 + i) as f32 / 7.0).collect() };
         store
-            .persist("m", 1, &tokens, tokens.len(), 0, |from, to| {
+            .persist("m", 1, &tokens, tokens.len(), 0, &[], |from, to| {
                 let mut k = Vec::new();
                 let mut v = Vec::new();
                 for t in from..to {

@@ -743,7 +743,10 @@ pub(crate) fn kv_reuse_start(
                 .unwrap_or(0);
             let layout = kv_layout_id(model);
             if let Some((mi, covered)) = store.best(model_name, layout, prompt_tokens) {
-                if chunk_aligned_keep(covered, prompt_tokens.len(), chunk) > cur_keep {
+                // A windowed manifest's side blob describes one exact prefix length; reuse
+                // it only when the whole prefix matches, never a shorter shared run.
+                let windowed_ok = !store.manifest_windowed(mi) || covered == store.manifest_covered(mi);
+                if windowed_ok && chunk_aligned_keep(covered, prompt_tokens.len(), chunk) > cur_keep {
                     let blocks = covered / store.block_tokens();
                     let loaded = store
                         .load(mi, blocks, n_layers)
@@ -858,16 +861,19 @@ pub(crate) fn persist_kv_snapshot(
     if common < kv_len.min(tokens.len()) {
         return; // the table holds another sequence; nothing of this one to write
     }
-    // A windowed (SWA) model keeps only a recent window in some layers, not the whole
-    // prefix, so its snapshot cannot be laid out as a token-prefix of uniform-length
-    // blocks. Persist only when every layer holds the same [0, kv_len] prefix.
-    if model.kv_snapshot_uniform_len(index) != Some(kv_len) {
-        tracing::debug!("kv disk: snapshot is not prefix-uniform (windowed layers); not persisted");
-        return;
-    }
     let layout = kv_layout_id(model);
     let kv_dtype = model.kv_snapshot_dtype(index).unwrap_or(0);
-    if let Err(e) = store.persist(model_name, layout, tokens, kv_len, kv_dtype, |from, to| {
+    // Windowed layers (their captured length is below kv_len) travel in a side blob,
+    // trimmed to the block-aligned prefix the global layers share.
+    let covered = (kv_len.min(tokens.len()) / store.block_tokens()) * store.block_tokens();
+    let window = match model.export_window_rows(index, covered) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("kv disk: window rows export failed: {e}; not persisted");
+            return;
+        }
+    };
+    if let Err(e) = store.persist(model_name, layout, tokens, kv_len, kv_dtype, &window, |from, to| {
         model
             .export_kv_rows(index, from, to)
             .map_err(|e| anyhow::anyhow!("{e}"))
