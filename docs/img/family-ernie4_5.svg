@@ -1,41 +1,56 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="752" height="334" viewBox="0 0 752 334" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="794" height="436" viewBox="0 0 794 436" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
 <style>.t{fill:#57606a;font-size:10.5px}.m{fill:#24292f;font-size:11px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
-<text class="h" x="243" y="22">ERNIE4_5 - DECODE TOK/S, 7 COMPARABLE CELLS, 7 MEASURED</text>
-<line class="ax" x1="243" y1="38" x2="243" y2="318"/>
-<text class="m" x="233" y="56" text-anchor="end">ernie4-5:latest 4096 medium NS GPU</text>
-<rect class="o" x="243" y="44" width="332.0" height="11" rx="2"/>
-<rect class="l" x="243" y="58" width="420.0" height="11" rx="2"/>
-<text class="t" x="580.9903498190591" y="54">459</text>
-<text class="t" x="669.0" y="70">580  (+27%)</text>
-<text class="m" x="233" y="90" text-anchor="end">ernie4-5:latest 4096 medium S GPU</text>
-<rect class="o" x="243" y="78" width="340.4" height="11" rx="2"/>
-<rect class="l" x="243" y="92" width="383.2" height="11" rx="2"/>
-<text class="t" x="589.3860072376358" y="88">470</text>
-<text class="t" x="632.232810615199" y="104">530  (+13%)</text>
-<text class="m" x="233" y="124" text-anchor="end">ernie4-5:latest 4096 long NS GPU</text>
-<rect class="o" x="243" y="112" width="348.3" height="11" rx="2"/>
-<rect class="l" x="243" y="126" width="376.1" height="11" rx="2"/>
-<text class="t" x="597.2750301568154" y="122">481</text>
-<text class="t" x="625.139927623643" y="138">520  (+8%)</text>
-<text class="m" x="233" y="158" text-anchor="end">ernie4-5:latest 4096 long S GPU</text>
-<rect class="o" x="243" y="146" width="349.6" height="11" rx="2"/>
-<rect class="l" x="243" y="160" width="371.1" height="11" rx="2"/>
-<text class="t" x="598.577804583836" y="156">483</text>
-<text class="t" x="620.0735826296743" y="172">513  (+6%)</text>
-<text class="m" x="233" y="192" text-anchor="end">ernie4-5:latest 4096 short S GPU</text>
-<rect class="o" x="243" y="180" width="366.1" height="11" rx="2"/>
-<rect class="l" x="243" y="194" width="386.3" height="11" rx="2"/>
-<text class="t" x="615.0796139927625" y="190">506</text>
-<text class="t" x="635.3449939686369" y="206">534  (+6%)</text>
-<text class="m" x="233" y="226" text-anchor="end">ernie4-5:latest 4096 short NS GPU</text>
-<rect class="o" x="243" y="214" width="361.9" height="11" rx="2"/>
-<rect class="l" x="243" y="228" width="377.5" height="11" rx="2"/>
-<text class="t" x="610.8817852834741" y="224">500</text>
-<text class="t" x="626.5150784077202" y="240">522  (+4%)</text>
-<text class="m" x="233" y="260" text-anchor="end">ernie4-5:latest 4096 short S CPU</text>
-<rect class="o" x="243" y="248" width="38.1" height="11" rx="2"/>
-<rect class="l" x="243" y="262" width="36.3" height="11" rx="2"/>
-<text class="t" x="287.14234016887815" y="258">53</text>
-<text class="t" x="285.3329312424608" y="274">50  (-5%)</text>
-<text class="h" x="243" y="320">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
+<text class="h" x="249" y="22">ERNIE4_5 - DECODE TOK/S, 10 WIDEST GAPS OF 18 COMPARABLE CELLS, 18 MEASURED</text>
+<line class="ax" x1="249" y1="38" x2="249" y2="420"/>
+<text class="m" x="239" y="56" text-anchor="end">ernie4-5:latest 131072 long NS GPU</text>
+<rect class="o" x="249" y="44" width="217.8" height="11" rx="2"/>
+<rect class="l" x="249" y="58" width="371.7" height="11" rx="2"/>
+<text class="t" x="472.75202780996517" y="54">313</text>
+<text class="t" x="626.7497103128621" y="70">535  (+71%)</text>
+<text class="m" x="239" y="90" text-anchor="end">ernie4-5:latest 4096 long NS GPU</text>
+<rect class="o" x="249" y="78" width="218.4" height="11" rx="2"/>
+<rect class="l" x="249" y="92" width="357.6" height="11" rx="2"/>
+<text class="t" x="473.4472769409038" y="88">314</text>
+<text class="t" x="612.6361529548087" y="104">514  (+64%)</text>
+<text class="m" x="239" y="124" text-anchor="end">ernie4-5:latest 4096 short NS GPU</text>
+<rect class="o" x="249" y="112" width="220.3" height="11" rx="2"/>
+<rect class="l" x="249" y="126" width="335.8" height="11" rx="2"/>
+<text class="t" x="475.25492468134416" y="122">317</text>
+<text class="t" x="590.8053302433372" y="138">483  (+52%)</text>
+<text class="m" x="239" y="158" text-anchor="end">ernie4-5:latest 131072 long S GPU</text>
+<rect class="o" x="249" y="146" width="281.4" height="11" rx="2"/>
+<rect class="l" x="249" y="160" width="416.4" height="11" rx="2"/>
+<text class="t" x="536.4368482039397" y="156">405</text>
+<text class="t" x="671.3847045191194" y="172">599  (+48%)</text>
+<text class="m" x="239" y="192" text-anchor="end">ernie4-5:latest 131072 short NS GPU</text>
+<rect class="o" x="249" y="180" width="223.5" height="11" rx="2"/>
+<rect class="l" x="249" y="194" width="322.8" height="11" rx="2"/>
+<text class="t" x="478.5225955967555" y="190">322</text>
+<text class="t" x="577.8041714947856" y="206">464  (+44%)</text>
+<text class="m" x="239" y="226" text-anchor="end">ernie4-5:latest 131072 short S GPU</text>
+<rect class="o" x="249" y="214" width="291.1" height="11" rx="2"/>
+<rect class="l" x="249" y="228" width="420.0" height="11" rx="2"/>
+<text class="t" x="546.100811123986" y="224">419</text>
+<text class="t" x="675.0" y="240">604  (+44%)</text>
+<text class="m" x="239" y="260" text-anchor="end">ernie4-5:latest 4096 short S GPU</text>
+<rect class="o" x="249" y="248" width="291.3" height="11" rx="2"/>
+<rect class="l" x="249" y="262" width="417.4" height="11" rx="2"/>
+<text class="t" x="546.3093858632676" y="258">419</text>
+<text class="t" x="672.4275782155272" y="274">600  (+43%)</text>
+<text class="m" x="239" y="294" text-anchor="end">ernie4-5:latest 4096 medium S GPU</text>
+<rect class="o" x="249" y="282" width="292.1" height="11" rx="2"/>
+<rect class="l" x="249" y="296" width="408.3" height="11" rx="2"/>
+<text class="t" x="547.0741599073001" y="292">420</text>
+<text class="t" x="663.3198146002317" y="308">587  (+40%)</text>
+<text class="m" x="239" y="328" text-anchor="end">ernie4-5:latest 131072 medium S GPU</text>
+<rect class="o" x="249" y="316" width="291.9" height="11" rx="2"/>
+<rect class="l" x="249" y="330" width="401.2" height="11" rx="2"/>
+<text class="t" x="546.9351100811123" y="326">420</text>
+<text class="t" x="656.2282734646582" y="342">577  (+37%)</text>
+<text class="m" x="239" y="362" text-anchor="end">ernie4-5:latest 4096 long S GPU</text>
+<rect class="o" x="249" y="350" width="282.5" height="11" rx="2"/>
+<rect class="l" x="249" y="364" width="379.5" height="11" rx="2"/>
+<text class="t" x="537.4797219003476" y="360">406</text>
+<text class="t" x="634.5365005793742" y="376">546  (+34%)</text>
+<text class="h" x="249" y="422">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
 </svg>

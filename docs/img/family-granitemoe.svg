@@ -1,41 +1,56 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="752" height="334" viewBox="0 0 752 334" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="815" height="436" viewBox="0 0 815 436" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
 <style>.t{fill:#57606a;font-size:10.5px}.m{fill:#24292f;font-size:11px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
-<text class="h" x="243" y="22">GRANITEMOE - DECODE TOK/S, 7 COMPARABLE CELLS, 7 MEASURED</text>
-<line class="ax" x1="243" y1="38" x2="243" y2="318"/>
-<text class="m" x="233" y="56" text-anchor="end">granite3-moe:1b 4096 short NS GPU</text>
-<rect class="o" x="243" y="44" width="355.8" height="11" rx="2"/>
-<rect class="l" x="243" y="58" width="420.0" height="11" rx="2"/>
-<text class="t" x="604.792864222002" y="54">342</text>
-<text class="t" x="669.0" y="70">404  (+18%)</text>
-<text class="m" x="233" y="90" text-anchor="end">granite3-moe:1b 4096 long S GPU</text>
-<rect class="o" x="243" y="78" width="322.1" height="11" rx="2"/>
-<rect class="l" x="243" y="92" width="378.2" height="11" rx="2"/>
-<text class="t" x="571.0763131813676" y="88">310</text>
-<text class="t" x="627.1665014866203" y="104">363  (+17%)</text>
-<text class="m" x="233" y="124" text-anchor="end">granite3-moe:1b 4096 long NS GPU</text>
-<rect class="o" x="243" y="112" width="330.3" height="11" rx="2"/>
-<rect class="l" x="243" y="126" width="383.4" height="11" rx="2"/>
-<text class="t" x="579.2973240832507" y="122">317</text>
-<text class="t" x="632.3696729435085" y="138">368  (+16%)</text>
-<text class="m" x="233" y="158" text-anchor="end">granite3-moe:1b 4096 medium NS GPU</text>
-<rect class="o" x="243" y="146" width="378.0" height="11" rx="2"/>
-<rect class="l" x="243" y="160" width="384.0" height="11" rx="2"/>
-<text class="t" x="626.9583746283449" y="156">363</text>
-<text class="t" x="632.994053518335" y="172">369  (+2%)</text>
-<text class="m" x="233" y="192" text-anchor="end">granite3-moe:1b 4096 medium S GPU</text>
-<rect class="o" x="243" y="180" width="386.0" height="11" rx="2"/>
-<rect class="l" x="243" y="194" width="337.1" height="11" rx="2"/>
-<text class="t" x="634.9712586719525" y="190">371</text>
-<text class="t" x="586.0614469772052" y="206">324  (-13%)</text>
-<text class="m" x="233" y="226" text-anchor="end">granite3-moe:1b 4096 short S GPU</text>
-<rect class="o" x="243" y="214" width="388.4" height="11" rx="2"/>
-<rect class="l" x="243" y="228" width="336.5" height="11" rx="2"/>
-<text class="t" x="637.3647175421208" y="224">373</text>
-<text class="t" x="585.5411298315163" y="240">323  (-13%)</text>
-<text class="m" x="233" y="260" text-anchor="end">granite3-moe:1b 4096 short S CPU</text>
-<rect class="o" x="243" y="248" width="71.5" height="11" rx="2"/>
-<rect class="l" x="243" y="262" width="58.0" height="11" rx="2"/>
-<text class="t" x="320.4915758176412" y="258">69</text>
-<text class="t" x="306.9633300297324" y="274">56  (-19%)</text>
-<text class="h" x="243" y="320">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
+<text class="h" x="256" y="22">GRANITEMOE - DECODE TOK/S, 10 WIDEST GAPS OF 18 COMPARABLE CELLS, 18 MEASURED</text>
+<line class="ax" x1="256" y1="38" x2="256" y2="420"/>
+<text class="m" x="246" y="56" text-anchor="end">granite3-moe:1b 4096 short NS GPU</text>
+<rect class="o" x="256" y="44" width="349.8" height="11" rx="2"/>
+<rect class="l" x="256" y="58" width="420.0" height="11" rx="2"/>
+<text class="t" x="611.7592997811817" y="54">266</text>
+<text class="t" x="682.0" y="70">320  (+20%)</text>
+<text class="m" x="246" y="90" text-anchor="end">granite3-moe:1b 131072 medium NS GPU</text>
+<rect class="o" x="256" y="78" width="355.8" height="11" rx="2"/>
+<rect class="l" x="256" y="92" width="398.3" height="11" rx="2"/>
+<text class="t" x="617.7986870897155" y="88">271</text>
+<text class="t" x="660.3369803063458" y="104">303  (+12%)</text>
+<text class="m" x="246" y="124" text-anchor="end">granite3-moe:1b 4096 medium NS GPU</text>
+<rect class="o" x="256" y="112" width="354.7" height="11" rx="2"/>
+<rect class="l" x="256" y="126" width="382.7" height="11" rx="2"/>
+<text class="t" x="616.7483588621444" y="122">270</text>
+<text class="t" x="644.7133479212255" y="138">292  (+8%)</text>
+<text class="m" x="246" y="158" text-anchor="end">granite3-moe:1b 131072 short S CPU</text>
+<rect class="o" x="256" y="146" width="95.8" height="11" rx="2"/>
+<rect class="l" x="256" y="160" width="78.8" height="11" rx="2"/>
+<text class="t" x="357.8424507658643" y="156">73</text>
+<text class="t" x="340.7746170678337" y="172">60  (-18%)</text>
+<text class="m" x="246" y="192" text-anchor="end">granite3-moe:1b 4096 short S CPU</text>
+<rect class="o" x="256" y="180" width="95.4" height="11" rx="2"/>
+<rect class="l" x="256" y="194" width="78.4" height="11" rx="2"/>
+<text class="t" x="357.4485776805252" y="190">73</text>
+<text class="t" x="340.38074398249455" y="206">60  (-18%)</text>
+<text class="m" x="246" y="226" text-anchor="end">granite3-moe:1b 4096 medium S CPU</text>
+<rect class="o" x="256" y="214" width="94.3" height="11" rx="2"/>
+<rect class="l" x="256" y="228" width="76.8" height="11" rx="2"/>
+<text class="t" x="356.26695842450766" y="224">72</text>
+<text class="t" x="338.80525164113783" y="240">58  (-19%)</text>
+<text class="m" x="246" y="260" text-anchor="end">granite3-moe:1b 131072 medium S CPU</text>
+<rect class="o" x="256" y="248" width="94.4" height="11" rx="2"/>
+<rect class="l" x="256" y="262" width="76.7" height="11" rx="2"/>
+<text class="t" x="356.3982494529541" y="258">72</text>
+<text class="t" x="338.6739606126915" y="274">58  (-19%)</text>
+<text class="m" x="246" y="294" text-anchor="end">granite3-moe:1b 4096 long S CPU</text>
+<rect class="o" x="256" y="282" width="90.3" height="11" rx="2"/>
+<rect class="l" x="256" y="296" width="66.6" height="11" rx="2"/>
+<text class="t" x="352.328227571116" y="292">69</text>
+<text class="t" x="328.5645514223195" y="308">51  (-26%)</text>
+<text class="m" x="246" y="328" text-anchor="end">granite3-moe:1b 131072 long S CPU</text>
+<rect class="o" x="256" y="316" width="90.5" height="11" rx="2"/>
+<rect class="l" x="256" y="330" width="66.4" height="11" rx="2"/>
+<text class="t" x="352.4595185995624" y="326">69</text>
+<text class="t" x="328.43326039387307" y="342">51  (-27%)</text>
+<text class="m" x="246" y="362" text-anchor="end">granite3-moe:1b 131072 long S GPU</text>
+<rect class="o" x="256" y="350" width="366.7" height="11" rx="2"/>
+<rect class="l" x="256" y="364" width="232.1" height="11" rx="2"/>
+<text class="t" x="628.6958424507659" y="360">279</text>
+<text class="t" x="494.1225382932166" y="376">177  (-37%)</text>
+<text class="h" x="256" y="422">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
 </svg>

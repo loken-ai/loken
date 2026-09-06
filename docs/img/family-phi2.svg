@@ -1,26 +1,56 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="758" height="232" viewBox="0 0 758 232" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="779" height="436" viewBox="0 0 779 436" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
 <style>.t{fill:#57606a;font-size:10.5px}.m{fill:#24292f;font-size:11px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
-<text class="h" x="249" y="22">PHI2 - DECODE TOK/S, 4 COMPARABLE CELLS, 5 MEASURED</text>
-<line class="ax" x1="249" y1="38" x2="249" y2="216"/>
-<text class="m" x="239" y="56" text-anchor="end">moondream:latest 4096 short S GPU</text>
-<rect class="o" x="249" y="44" width="306.3" height="11" rx="2"/>
-<rect class="l" x="249" y="58" width="409.8" height="11" rx="2"/>
-<text class="t" x="561.3173076923077" y="54">455</text>
-<text class="t" x="664.8365384615385" y="70">609  (+34%)</text>
-<text class="m" x="239" y="90" text-anchor="end">moondream:latest 4096 medium NS GPU</text>
-<rect class="o" x="249" y="78" width="317.2" height="11" rx="2"/>
-<rect class="l" x="249" y="92" width="420.0" height="11" rx="2"/>
-<text class="t" x="572.1538461538462" y="88">471</text>
-<text class="t" x="675.0" y="104">624  (+32%)</text>
-<text class="m" x="239" y="124" text-anchor="end">moondream:latest 4096 short NS GPU</text>
-<rect class="o" x="249" y="112" width="315.8" height="11" rx="2"/>
-<rect class="l" x="249" y="126" width="415.9" height="11" rx="2"/>
-<text class="t" x="570.8076923076924" y="122">469</text>
-<text class="t" x="670.8942307692307" y="138">618  (+32%)</text>
-<text class="m" x="239" y="158" text-anchor="end">moondream:latest 4096 medium S GPU</text>
-<rect class="o" x="249" y="146" width="307.4" height="11" rx="2"/>
-<rect class="l" x="249" y="160" width="394.0" height="11" rx="2"/>
-<text class="t" x="562.3942307692307" y="156">457</text>
-<text class="t" x="648.9519230769231" y="172">585  (+28%)</text>
-<text class="h" x="249" y="218">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
+<text class="h" x="262" y="22">PHI2 - DECODE TOK/S, 10 WIDEST GAPS OF 12 COMPARABLE CELLS, 14 MEASURED</text>
+<line class="ax" x1="262" y1="38" x2="262" y2="420"/>
+<text class="m" x="252" y="56" text-anchor="end">moondream:latest 131072 short NS GPU</text>
+<rect class="o" x="262" y="44" width="142.7" height="11" rx="2"/>
+<rect class="l" x="262" y="58" width="383.5" height="11" rx="2"/>
+<text class="t" x="410.7124715076522" y="54">209</text>
+<text class="t" x="651.4842070986649" y="70">561  (+169%)</text>
+<text class="m" x="252" y="90" text-anchor="end">moondream:latest 131072 medium NS GPU</text>
+<rect class="o" x="262" y="78" width="188.9" height="11" rx="2"/>
+<rect class="l" x="262" y="92" width="370.0" height="11" rx="2"/>
+<text class="t" x="456.93845652881794" y="88">276</text>
+<text class="t" x="638.013025073266" y="104">541  (+96%)</text>
+<text class="m" x="252" y="124" text-anchor="end">moondream:latest 4096 short NS GPU</text>
+<rect class="o" x="262" y="112" width="209.5" height="11" rx="2"/>
+<rect class="l" x="262" y="126" width="375.4" height="11" rx="2"/>
+<text class="t" x="477.4529469228264" y="122">306</text>
+<text class="t" x="643.415174210355" y="138">549  (+79%)</text>
+<text class="m" x="252" y="158" text-anchor="end">moondream:latest 4096 medium NS GPU</text>
+<rect class="o" x="262" y="146" width="188.7" height="11" rx="2"/>
+<rect class="l" x="262" y="160" width="325.0" height="11" rx="2"/>
+<text class="t" x="456.7333116248779" y="156">276</text>
+<text class="t" x="593.0179094757408" y="172">475  (+72%)</text>
+<text class="m" x="252" y="192" text-anchor="end">moondream:latest 131072 short S GPU</text>
+<rect class="o" x="262" y="180" width="254.9" height="11" rx="2"/>
+<rect class="l" x="262" y="194" width="420.0" height="11" rx="2"/>
+<text class="t" x="522.9267339628785" y="190">373</text>
+<text class="t" x="688.0" y="206">614  (+65%)</text>
+<text class="m" x="252" y="226" text-anchor="end">moondream:latest 131072 medium S GPU</text>
+<rect class="o" x="262" y="214" width="253.5" height="11" rx="2"/>
+<rect class="l" x="262" y="228" width="415.1" height="11" rx="2"/>
+<text class="t" x="521.490719635298" y="224">371</text>
+<text class="t" x="683.076522305438" y="240">607  (+64%)</text>
+<text class="m" x="252" y="260" text-anchor="end">moondream:latest 4096 medium S GPU</text>
+<rect class="o" x="262" y="248" width="253.4" height="11" rx="2"/>
+<rect class="l" x="262" y="262" width="414.3" height="11" rx="2"/>
+<text class="t" x="521.4223380006513" y="258">371</text>
+<text class="t" x="682.2559426896776" y="274">606  (+63%)</text>
+<text class="m" x="252" y="294" text-anchor="end">moondream:latest 4096 short S GPU</text>
+<rect class="o" x="262" y="282" width="256.1" height="11" rx="2"/>
+<rect class="l" x="262" y="296" width="402.8" height="11" rx="2"/>
+<text class="t" x="524.0892217518724" y="292">374</text>
+<text class="t" x="670.7678280690329" y="308">589  (+57%)</text>
+<text class="m" x="252" y="328" text-anchor="end">moondream:latest 4096 medium S CPU</text>
+<rect class="o" x="262" y="316" width="18.9" height="11" rx="2"/>
+<rect class="l" x="262" y="330" width="14.2" height="11" rx="2"/>
+<text class="t" x="286.8733311624878" y="326">28</text>
+<text class="t" x="282.2233800065125" y="342">21  (-25%)</text>
+<text class="m" x="252" y="362" text-anchor="end">moondream:latest 131072 medium S CPU</text>
+<rect class="o" x="262" y="350" width="18.9" height="11" rx="2"/>
+<rect class="l" x="262" y="364" width="14.2" height="11" rx="2"/>
+<text class="t" x="286.8733311624878" y="360">28</text>
+<text class="t" x="282.1549983718658" y="376">21  (-25%)</text>
+<text class="h" x="262" y="422">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
 </svg>

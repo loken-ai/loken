@@ -18,38 +18,36 @@ one-card probe of 2026-08-27 taken between kernel changes; it is superseded, not
 <!-- table:decode -->
 | model | ollama | loken | |
 |---|---:|---:|---|
-| deepseek-r1:70b-q3ks | 6.9 | **21.3** | +209% |
-| gpt-oss:20b | 94.6 | **211.8** | +124% |
-| llama3.2:1b | 232.7 | **466.6** | +101% |
-| falcon3:latest | 211.5 | **403.9** | +91% |
-| devstral-small-2:latest | 35.5 | **59.9** | +69% |
-| lfm2.5-thinking:latest | 397.6 | **666.9** | +68% |
-| qwen3.5:latest | 75.4 | **126.3** | +68% |
-| mistral-small3.2:latest | 36.3 | **59.8** | +65% |
-| deepseek-r1:32b | 25.9 | **41.2** | +59% |
-| moondream:latest | 374.5 | **589.0** | +57% |
-| mistral-nemo:latest | 68.2 | **107.2** | +57% |
-| qwen3:8b | 97.5 | **153.1** | +57% |
-| smollm3:latest | 172.0 | **266.8** | +55% |
-| deepcoder:14b | 53.0 | **81.7** | +54% |
-| qwen3:0.6b | 485.9 | **720.9** | +48% |
-| gemma4:latest | 91.4 | **133.1** | +46% |
-| magistral:latest | 36.3 | **52.5** | +45% |
-| ernie4-5:latest | 419.0 | **600.4** | +43% |
-| devstral:24b | 36.3 | **52.0** | +43% |
-| olmo2:7b | 101.0 | **137.6** | +36% |
-| gemma4:12b | 54.6 | **73.9** | +35% |
-| granite3.1-dense:2b | 224.6 | **293.1** | +30% |
-| qwen2.5:0.5b | 306.5 | **382.2** | +25% |
-| qwen3-coder:30b | 148.3 | **184.8** | +25% |
-| olmoe:latest | 389.1 | **455.1** | +17% |
-| qwen3.5:35b | 115.0 | **132.9** | +16% |
-| nemotron-3-nano:latest | 133.9 | **149.8** | +12% |
-| qwen3-coder-next:latest | 27.9 | **30.2** | +8% |
-| qwen3next:latest | 32.8 | **33.8** | +3% |
-| gemma4:31b | **25.7** | 24.9 | **-3%** |
-| granite3-moe:1b | **339.1** | 323.0 | **-5%** |
-| deepseek-r1:70b | **1.6** | 1.5 | **-6%** |
+| gpt-oss:20b | 6.1 | **7.5** | +23% |
+| qwen3:8b | 4.5 | **4.8** | +7% |
+| deepcoder:14b | 2.6 | **2.7** | +4% |
+| lfm2.5-thinking:latest | 30.1 | **30.5** | +1% |
+| llama3.2:1b | 16.5 | **16.7** | +1% |
+| gemma4:31b | 1.2 | 1.2 | - |
+| devstral:24b | 1.6 | 1.6 | - |
+| magistral:latest | 1.6 | 1.6 | - |
+| mistral-nemo:latest | 3.5 | 3.5 | - |
+| devstral-small-2:latest | 1.6 | 1.6 | - |
+| mistral-small3.2:latest | 1.6 | 1.6 | - |
+| deepseek-r1:32b | 1.2 | 1.2 | - |
+| qwen2.5:0.5b | **53.1** | 52.4 | **-1%** |
+| gemma4:latest | **7.2** | 7.1 | **-1%** |
+| qwen3:0.6b | **49.2** | 48.5 | **-1%** |
+| falcon3:latest | **14.5** | 14.2 | **-2%** |
+| qwen3.5:latest | **4.3** | 4.2 | **-2%** |
+| gemma4:12b | **3.0** | 2.9 | **-3%** |
+| ernie4-5:latest | **56.5** | 54.5 | **-4%** |
+| qwen3-coder:30b | **11.0** | 10.6 | **-4%** |
+| granite3.1-dense:2b | **14.0** | 13.3 | **-5%** |
+| nemotron-3-nano:latest | **8.4** | 7.9 | **-6%** |
+| smollm3:latest | **11.5** | 10.8 | **-6%** |
+| olmoe:latest | **28.5** | 26.5 | **-7%** |
+| qwen3.5:35b | **9.4** | 8.7 | **-7%** |
+| olmo2:7b | **5.3** | 4.8 | **-9%** |
+| qwen3-coder-next:latest | **7.6** | 6.7 | **-12%** |
+| qwen3next:latest | **7.6** | 6.7 | **-12%** |
+| granite3-moe:1b | **73.0** | 60.0 | **-18%** |
+| moondream:latest | **27.9** | 21.1 | **-24%** |
 <!-- /table:decode -->
 
 The two mixtures that lose here do not lose. Both rows came from a harness that had moved

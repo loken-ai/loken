@@ -1,51 +1,56 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="771" height="402" viewBox="0 0 771 402" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="436" viewBox="0 0 820 436" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
 <style>.t{fill:#57606a;font-size:10.5px}.m{fill:#24292f;font-size:11px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
-<text class="h" x="269" y="22">GRANITE - DECODE TOK/S, 9 COMPARABLE CELLS, 9 MEASURED</text>
-<line class="ax" x1="269" y1="38" x2="269" y2="386"/>
-<text class="m" x="259" y="56" text-anchor="end">granite3.1-dense:2b 4096 short S GPU</text>
-<rect class="o" x="269" y="44" width="405.7" height="11" rx="2"/>
-<rect class="l" x="269" y="58" width="417.2" height="11" rx="2"/>
-<text class="t" x="680.6722408026756" y="54">289</text>
-<text class="t" x="692.190635451505" y="70">297  (+3%)</text>
-<text class="m" x="259" y="90" text-anchor="end">granite3.1-dense:2b 4096 short NS GPU</text>
-<rect class="o" x="269" y="78" width="413.3" height="11" rx="2"/>
-<rect class="l" x="269" y="92" width="420.0" height="11" rx="2"/>
-<text class="t" x="688.257525083612" y="88">294</text>
-<text class="t" x="695.0" y="104">299  (+2%)</text>
-<text class="m" x="259" y="124" text-anchor="end">granite3.1-dense:2b 4096 medium NS GPU</text>
-<rect class="o" x="269" y="112" width="411.9" height="11" rx="2"/>
-<rect class="l" x="269" y="126" width="416.9" height="11" rx="2"/>
-<text class="t" x="686.8528428093646" y="122">293</text>
-<text class="t" x="691.9096989966555" y="138">297  (+1%)</text>
-<text class="m" x="259" y="158" text-anchor="end">granite3.1-dense:2b 4096 medium S GPU</text>
-<rect class="o" x="269" y="146" width="408.3" height="11" rx="2"/>
-<rect class="l" x="269" y="160" width="410.6" height="11" rx="2"/>
-<text class="t" x="683.3411371237457" y="156">291</text>
-<text class="t" x="685.5886287625418" y="172">292  (+1%)</text>
-<text class="m" x="259" y="192" text-anchor="end">granite3.1-dense:2b 4096 long NS GPU</text>
-<rect class="o" x="269" y="180" width="404.8" height="11" rx="2"/>
-<rect class="l" x="269" y="194" width="380.8" height="11" rx="2"/>
-<text class="t" x="679.8294314381271" y="190">288</text>
-<text class="t" x="655.8093645484951" y="206">271  (-6%)</text>
-<text class="m" x="259" y="226" text-anchor="end">granite3.1-dense:2b 4096 long S GPU</text>
-<rect class="o" x="269" y="214" width="403.7" height="11" rx="2"/>
-<rect class="l" x="269" y="228" width="376.9" height="11" rx="2"/>
-<text class="t" x="678.7056856187291" y="224">287</text>
-<text class="t" x="651.876254180602" y="240">268  (-7%)</text>
-<text class="m" x="259" y="260" text-anchor="end">granite3.1-dense:2b 16384 long S GPU</text>
-<rect class="o" x="269" y="248" width="405.5" height="11" rx="2"/>
-<rect class="l" x="269" y="262" width="376.0" height="11" rx="2"/>
-<text class="t" x="680.5317725752508" y="258">289</text>
-<text class="t" x="651.0334448160536" y="274">268  (-7%)</text>
-<text class="m" x="259" y="294" text-anchor="end">granite3.1-dense:2b 32768 long S GPU</text>
-<rect class="o" x="269" y="282" width="404.5" height="11" rx="2"/>
-<rect class="l" x="269" y="296" width="374.8" height="11" rx="2"/>
-<text class="t" x="679.5484949832776" y="292">288</text>
-<text class="t" x="649.7692307692307" y="308">267  (-7%)</text>
-<text class="m" x="259" y="328" text-anchor="end">granite3.1-dense:2b 4096 short S CPU</text>
-<rect class="o" x="269" y="316" width="18.7" height="11" rx="2"/>
-<rect class="l" x="269" y="330" width="17.1" height="11" rx="2"/>
-<text class="t" x="293.68227424749165" y="326">13</text>
-<text class="t" x="292.1371237458194" y="342">12  (-8%)</text>
-<text class="h" x="269" y="388">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
+<text class="h" x="282" y="22">GRANITE - DECODE TOK/S, 10 WIDEST GAPS OF 18 COMPARABLE CELLS, 18 MEASURED</text>
+<line class="ax" x1="282" y1="38" x2="282" y2="420"/>
+<text class="m" x="272" y="56" text-anchor="end">granite3.1-dense:2b 131072 long S GPU</text>
+<rect class="o" x="282" y="44" width="250.6" height="11" rx="2"/>
+<rect class="l" x="282" y="58" width="352.5" height="11" rx="2"/>
+<text class="t" x="538.6243602865916" y="54">175</text>
+<text class="t" x="640.5076765609007" y="70">246  (+41%)</text>
+<text class="m" x="272" y="90" text-anchor="end">granite3.1-dense:2b 4096 medium NS GPU</text>
+<rect class="o" x="282" y="78" width="288.2" height="11" rx="2"/>
+<rect class="l" x="282" y="92" width="391.6" height="11" rx="2"/>
+<text class="t" x="576.1678607983623" y="88">201</text>
+<text class="t" x="679.627430910952" y="104">273  (+36%)</text>
+<text class="m" x="272" y="124" text-anchor="end">granite3.1-dense:2b 131072 short NS GPU</text>
+<rect class="o" x="282" y="112" width="282.0" height="11" rx="2"/>
+<rect class="l" x="282" y="126" width="376.3" height="11" rx="2"/>
+<text class="t" x="570.0061412487205" y="122">197</text>
+<text class="t" x="664.2947799385875" y="138">263  (+33%)</text>
+<text class="m" x="272" y="158" text-anchor="end">granite3.1-dense:2b 4096 short S GPU</text>
+<rect class="o" x="282" y="146" width="321.8" height="11" rx="2"/>
+<rect class="l" x="282" y="160" width="420.0" height="11" rx="2"/>
+<text class="t" x="609.8423746161719" y="156">225</text>
+<text class="t" x="708.0" y="172">293  (+30%)</text>
+<text class="m" x="272" y="192" text-anchor="end">granite3.1-dense:2b 131072 short S GPU</text>
+<rect class="o" x="282" y="180" width="321.8" height="11" rx="2"/>
+<rect class="l" x="282" y="194" width="419.4" height="11" rx="2"/>
+<text class="t" x="609.8423746161719" y="190">225</text>
+<text class="t" x="707.4268167860798" y="206">293  (+30%)</text>
+<text class="m" x="272" y="226" text-anchor="end">granite3.1-dense:2b 4096 short NS GPU</text>
+<rect class="o" x="282" y="214" width="288.5" height="11" rx="2"/>
+<rect class="l" x="282" y="228" width="375.9" height="11" rx="2"/>
+<text class="t" x="576.4544524053224" y="224">201</text>
+<text class="t" x="663.8648925281474" y="240">262  (+30%)</text>
+<text class="m" x="272" y="260" text-anchor="end">granite3.1-dense:2b 131072 medium NS GPU</text>
+<rect class="o" x="282" y="248" width="286.2" height="11" rx="2"/>
+<rect class="l" x="282" y="262" width="372.1" height="11" rx="2"/>
+<text class="t" x="574.1617195496417" y="258">200</text>
+<text class="t" x="660.1392016376662" y="274">260  (+30%)</text>
+<text class="m" x="272" y="294" text-anchor="end">granite3.1-dense:2b 131072 long NS GPU</text>
+<rect class="o" x="282" y="282" width="279.4" height="11" rx="2"/>
+<rect class="l" x="282" y="296" width="362.5" height="11" rx="2"/>
+<text class="t" x="567.4268167860798" y="292">195</text>
+<text class="t" x="650.5383828045035" y="308">253  (+30%)</text>
+<text class="m" x="272" y="328" text-anchor="end">granite3.1-dense:2b 4096 medium S GPU</text>
+<rect class="o" x="282" y="316" width="321.3" height="11" rx="2"/>
+<rect class="l" x="282" y="330" width="415.8" height="11" rx="2"/>
+<text class="t" x="609.2691914022517" y="326">224</text>
+<text class="t" x="703.8444216990788" y="342">290  (+29%)</text>
+<text class="m" x="272" y="362" text-anchor="end">granite3.1-dense:2b 131072 medium S GPU</text>
+<rect class="o" x="282" y="350" width="320.7" height="11" rx="2"/>
+<rect class="l" x="282" y="364" width="415.0" height="11" rx="2"/>
+<text class="t" x="608.6960081883317" y="360">224</text>
+<text class="t" x="702.9846468781985" y="376">290  (+29%)</text>
+<text class="h" x="282" y="422">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
 </svg>

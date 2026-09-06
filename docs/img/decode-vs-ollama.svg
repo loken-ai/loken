@@ -1,166 +1,156 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="687" height="1184" viewBox="0 0 687 1184" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="673" height="1116" viewBox="0 0 673 1116" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
 <style>.t{fill:#57606a;font-size:10.5px}.m{fill:#24292f;font-size:11px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
-<text class="h" x="171" y="22">DECODE TOK/S, BOTH CARDS, 2026-09-03</text>
-<line class="ax" x1="171" y1="38" x2="171" y2="1168"/>
-<text class="m" x="161" y="56" text-anchor="end">deepseek-r1:70b-q3ks</text>
-<rect class="o" x="171" y="44" width="4.0" height="11" rx="2"/>
-<rect class="l" x="171" y="58" width="12.4" height="11" rx="2"/>
-<text class="t" x="181.01997503121098" y="54">7</text>
-<text class="t" x="189.4094881398252" y="70">21  (+209%)</text>
-<text class="m" x="161" y="90" text-anchor="end">gpt-oss:20b</text>
-<rect class="o" x="171" y="78" width="55.1" height="11" rx="2"/>
-<rect class="l" x="171" y="92" width="123.4" height="11" rx="2"/>
-<text class="t" x="232.11444028297961" y="88">95</text>
-<text class="t" x="300.3957553058677" y="104">212  (+124%)</text>
-<text class="m" x="161" y="124" text-anchor="end">llama3.2:1b</text>
-<rect class="o" x="171" y="112" width="135.6" height="11" rx="2"/>
-<rect class="l" x="171" y="126" width="271.8" height="11" rx="2"/>
-<text class="t" x="312.572201414898" y="122">233</text>
-<text class="t" x="448.8435289221806" y="138">467  (+101%)</text>
-<text class="m" x="161" y="158" text-anchor="end">falcon3:latest</text>
-<rect class="o" x="171" y="146" width="123.2" height="11" rx="2"/>
-<rect class="l" x="171" y="160" width="235.3" height="11" rx="2"/>
-<text class="t" x="300.2209737827715" y="156">212</text>
-<text class="t" x="412.3141905950895" y="172">404  (+91%)</text>
-<text class="m" x="161" y="192" text-anchor="end">devstral-small-2:latest</text>
-<rect class="o" x="171" y="180" width="20.7" height="11" rx="2"/>
-<rect class="l" x="171" y="194" width="34.9" height="11" rx="2"/>
-<text class="t" x="197.68248023304204" y="190">36</text>
-<text class="t" x="211.89804411152727" y="206">60  (+69%)</text>
-<text class="m" x="161" y="226" text-anchor="end">lfm2.5-thinking:latest</text>
-<rect class="o" x="171" y="214" width="231.6" height="11" rx="2"/>
-<rect class="l" x="171" y="228" width="388.5" height="11" rx="2"/>
-<text class="t" x="408.64377861007074" y="224">398</text>
-<text class="t" x="565.5393258426966" y="240">667  (+68%)</text>
-<text class="m" x="161" y="260" text-anchor="end">qwen3.5:latest</text>
-<rect class="o" x="171" y="248" width="43.9" height="11" rx="2"/>
-<rect class="l" x="171" y="262" width="73.6" height="11" rx="2"/>
-<text class="t" x="220.9284228048273" y="258">75</text>
-<text class="t" x="250.58302122347067" y="274">126  (+68%)</text>
-<text class="m" x="161" y="294" text-anchor="end">mistral-small3.2:latest</text>
-<rect class="o" x="171" y="282" width="21.1" height="11" rx="2"/>
-<rect class="l" x="171" y="296" width="34.8" height="11" rx="2"/>
-<text class="t" x="198.1485642946317" y="292">36</text>
-<text class="t" x="211.83978360382855" y="308">60  (+65%)</text>
-<text class="m" x="161" y="328" text-anchor="end">deepseek-r1:32b</text>
-<rect class="o" x="171" y="316" width="15.1" height="11" rx="2"/>
-<rect class="l" x="171" y="330" width="24.0" height="11" rx="2"/>
-<text class="t" x="192.08947149396587" y="326">26</text>
-<text class="t" x="201.0033291718685" y="342">41  (+59%)</text>
-<text class="m" x="161" y="362" text-anchor="end">moondream:latest</text>
-<rect class="o" x="171" y="350" width="218.2" height="11" rx="2"/>
-<rect class="l" x="171" y="364" width="343.2" height="11" rx="2"/>
-<text class="t" x="395.18560133166875" y="360">374</text>
-<text class="t" x="520.1543903454016" y="376">589  (+57%)</text>
-<text class="m" x="161" y="396" text-anchor="end">mistral-nemo:latest</text>
-<rect class="o" x="171" y="384" width="39.7" height="11" rx="2"/>
-<rect class="l" x="171" y="398" width="62.5" height="11" rx="2"/>
-<text class="t" x="216.73366625052017" y="394">68</text>
-<text class="t" x="239.45526425301705" y="410">107  (+57%)</text>
-<text class="m" x="161" y="430" text-anchor="end">qwen3:8b</text>
-<rect class="o" x="171" y="418" width="56.8" height="11" rx="2"/>
-<rect class="l" x="171" y="432" width="89.2" height="11" rx="2"/>
-<text class="t" x="233.8039950062422" y="428">98</text>
-<text class="t" x="266.19683728672493" y="444">153  (+57%)</text>
-<text class="m" x="161" y="464" text-anchor="end">smollm3:latest</text>
-<rect class="o" x="171" y="452" width="100.2" height="11" rx="2"/>
-<rect class="l" x="171" y="466" width="155.4" height="11" rx="2"/>
-<text class="t" x="277.2080732417811" y="462">172</text>
-<text class="t" x="332.43903454015816" y="478">267  (+55%)</text>
-<text class="m" x="161" y="498" text-anchor="end">deepcoder:14b</text>
-<rect class="o" x="171" y="486" width="30.9" height="11" rx="2"/>
-<rect class="l" x="171" y="500" width="47.6" height="11" rx="2"/>
-<text class="t" x="207.87806908031627" y="496">53</text>
-<text class="t" x="224.59883478984602" y="512">82  (+54%)</text>
+<text class="h" x="171" y="22">DECODE TOK/S, BOTH CARDS, 2026-09-05</text>
+<line class="ax" x1="171" y1="38" x2="171" y2="1100"/>
+<text class="m" x="161" y="56" text-anchor="end">gpt-oss:20b</text>
+<rect class="o" x="171" y="44" width="35.1" height="11" rx="2"/>
+<rect class="l" x="171" y="58" width="43.2" height="11" rx="2"/>
+<text class="t" x="212.0958904109589" y="54">6</text>
+<text class="t" x="220.15068493150685" y="70">8  (+23%)</text>
+<text class="m" x="161" y="90" text-anchor="end">qwen3:8b</text>
+<rect class="o" x="171" y="78" width="25.9" height="11" rx="2"/>
+<rect class="l" x="171" y="92" width="27.6" height="11" rx="2"/>
+<text class="t" x="202.8904109589041" y="88">4</text>
+<text class="t" x="204.6164383561644" y="104">5  (+7%)</text>
+<text class="m" x="161" y="124" text-anchor="end">deepcoder:14b</text>
+<rect class="o" x="171" y="112" width="15.0" height="11" rx="2"/>
+<rect class="l" x="171" y="126" width="15.5" height="11" rx="2"/>
+<text class="t" x="191.95890410958904" y="122">3</text>
+<text class="t" x="192.53424657534248" y="138">3  (+4%)</text>
+<text class="m" x="161" y="158" text-anchor="end">lfm2.5-thinking:latest</text>
+<rect class="o" x="171" y="146" width="173.2" height="11" rx="2"/>
+<rect class="l" x="171" y="160" width="175.5" height="11" rx="2"/>
+<text class="t" x="350.17808219178085" y="156">30</text>
+<text class="t" x="352.47945205479454" y="172">30  (+1%)</text>
+<text class="m" x="161" y="192" text-anchor="end">llama3.2:1b</text>
+<rect class="o" x="171" y="180" width="94.9" height="11" rx="2"/>
+<rect class="l" x="171" y="194" width="96.1" height="11" rx="2"/>
+<text class="t" x="271.93150684931504" y="190">16</text>
+<text class="t" x="273.0821917808219" y="206">17  (+1%)</text>
+<text class="m" x="161" y="226" text-anchor="end">gemma4:31b</text>
+<rect class="o" x="171" y="214" width="6.9" height="11" rx="2"/>
+<rect class="l" x="171" y="228" width="6.9" height="11" rx="2"/>
+<text class="t" x="183.9041095890411" y="224">1</text>
+<text class="t" x="183.9041095890411" y="240">1  (+0%)</text>
+<text class="m" x="161" y="260" text-anchor="end">devstral:24b</text>
+<rect class="o" x="171" y="248" width="9.2" height="11" rx="2"/>
+<rect class="l" x="171" y="262" width="9.2" height="11" rx="2"/>
+<text class="t" x="186.2054794520548" y="258">2</text>
+<text class="t" x="186.2054794520548" y="274">2  (+0%)</text>
+<text class="m" x="161" y="294" text-anchor="end">magistral:latest</text>
+<rect class="o" x="171" y="282" width="9.2" height="11" rx="2"/>
+<rect class="l" x="171" y="296" width="9.2" height="11" rx="2"/>
+<text class="t" x="186.2054794520548" y="292">2</text>
+<text class="t" x="186.2054794520548" y="308">2  (+0%)</text>
+<text class="m" x="161" y="328" text-anchor="end">mistral-nemo:latest</text>
+<rect class="o" x="171" y="316" width="20.1" height="11" rx="2"/>
+<rect class="l" x="171" y="330" width="20.1" height="11" rx="2"/>
+<text class="t" x="197.13698630136986" y="326">4</text>
+<text class="t" x="197.13698630136986" y="342">4  (+0%)</text>
+<text class="m" x="161" y="362" text-anchor="end">devstral-small-2:latest</text>
+<rect class="o" x="171" y="350" width="9.2" height="11" rx="2"/>
+<rect class="l" x="171" y="364" width="9.2" height="11" rx="2"/>
+<text class="t" x="186.2054794520548" y="360">2</text>
+<text class="t" x="186.2054794520548" y="376">2  (+0%)</text>
+<text class="m" x="161" y="396" text-anchor="end">mistral-small3.2:latest</text>
+<rect class="o" x="171" y="384" width="9.2" height="11" rx="2"/>
+<rect class="l" x="171" y="398" width="9.2" height="11" rx="2"/>
+<text class="t" x="186.2054794520548" y="394">2</text>
+<text class="t" x="186.2054794520548" y="410">2  (+0%)</text>
+<text class="m" x="161" y="430" text-anchor="end">deepseek-r1:32b</text>
+<rect class="o" x="171" y="418" width="6.9" height="11" rx="2"/>
+<rect class="l" x="171" y="432" width="6.9" height="11" rx="2"/>
+<text class="t" x="183.9041095890411" y="428">1</text>
+<text class="t" x="183.9041095890411" y="444">1  (+0%)</text>
+<text class="m" x="161" y="464" text-anchor="end">qwen2.5:0.5b</text>
+<rect class="o" x="171" y="452" width="305.5" height="11" rx="2"/>
+<rect class="l" x="171" y="466" width="301.5" height="11" rx="2"/>
+<text class="t" x="482.5068493150685" y="462">53</text>
+<text class="t" x="478.4794520547945" y="478">52  (-1%)</text>
+<text class="m" x="161" y="498" text-anchor="end">gemma4:latest</text>
+<rect class="o" x="171" y="486" width="41.4" height="11" rx="2"/>
+<rect class="l" x="171" y="500" width="40.8" height="11" rx="2"/>
+<text class="t" x="218.4246575342466" y="496">7</text>
+<text class="t" x="217.84931506849315" y="512">7  (-1%)</text>
 <text class="m" x="161" y="532" text-anchor="end">qwen3:0.6b</text>
 <rect class="o" x="171" y="520" width="283.1" height="11" rx="2"/>
-<rect class="l" x="171" y="534" width="420.0" height="11" rx="2"/>
-<text class="t" x="460.0878069080316" y="530">486</text>
-<text class="t" x="597.0" y="546">721  (+48%)</text>
-<text class="m" x="161" y="566" text-anchor="end">gemma4:latest</text>
-<rect class="o" x="171" y="554" width="53.3" height="11" rx="2"/>
-<rect class="l" x="171" y="568" width="77.5" height="11" rx="2"/>
-<text class="t" x="230.25010403662088" y="564">91</text>
-<text class="t" x="254.54473574698295" y="580">133  (+46%)</text>
-<text class="m" x="161" y="600" text-anchor="end">magistral:latest</text>
-<rect class="o" x="171" y="588" width="21.1" height="11" rx="2"/>
-<rect class="l" x="171" y="602" width="30.6" height="11" rx="2"/>
-<text class="t" x="198.1485642946317" y="598">36</text>
-<text class="t" x="207.58676654182273" y="614">52  (+45%)</text>
-<text class="m" x="161" y="634" text-anchor="end">ernie4-5:latest</text>
-<rect class="o" x="171" y="622" width="244.1" height="11" rx="2"/>
-<rect class="l" x="171" y="636" width="349.8" height="11" rx="2"/>
-<text class="t" x="421.1115272575946" y="632">419</text>
-<text class="t" x="526.7960882230545" y="648">600  (+43%)</text>
-<text class="m" x="161" y="668" text-anchor="end">devstral:24b</text>
-<rect class="o" x="171" y="656" width="21.1" height="11" rx="2"/>
-<rect class="l" x="171" y="670" width="30.3" height="11" rx="2"/>
-<text class="t" x="198.1485642946317" y="666">36</text>
-<text class="t" x="207.2954640033292" y="682">52  (+43%)</text>
-<text class="m" x="161" y="702" text-anchor="end">olmo2:7b</text>
-<rect class="o" x="171" y="690" width="58.8" height="11" rx="2"/>
-<rect class="l" x="171" y="704" width="80.2" height="11" rx="2"/>
-<text class="t" x="235.84311277569705" y="700">101</text>
-<text class="t" x="257.16645859342486" y="716">138  (+36%)</text>
-<text class="m" x="161" y="736" text-anchor="end">gemma4:12b</text>
-<rect class="o" x="171" y="724" width="31.8" height="11" rx="2"/>
-<rect class="l" x="171" y="738" width="43.1" height="11" rx="2"/>
-<text class="t" x="208.81023720349563" y="734">55</text>
-<text class="t" x="220.05451518934666" y="750">74  (+35%)</text>
-<text class="m" x="161" y="770" text-anchor="end">granite3.1-dense:2b</text>
-<rect class="o" x="171" y="758" width="130.9" height="11" rx="2"/>
-<rect class="l" x="171" y="772" width="170.8" height="11" rx="2"/>
-<text class="t" x="307.85310029130255" y="768">225</text>
-<text class="t" x="347.7615480649189" y="784">293  (+30%)</text>
-<text class="m" x="161" y="804" text-anchor="end">qwen2.5:0.5b</text>
-<rect class="o" x="171" y="792" width="178.6" height="11" rx="2"/>
-<rect class="l" x="171" y="806" width="222.7" height="11" rx="2"/>
-<text class="t" x="355.568456096546" y="802">306</text>
-<text class="t" x="399.67166042446945" y="818">382  (+25%)</text>
-<text class="m" x="161" y="838" text-anchor="end">qwen3-coder:30b</text>
-<rect class="o" x="171" y="826" width="86.4" height="11" rx="2"/>
-<rect class="l" x="171" y="840" width="107.7" height="11" rx="2"/>
-<text class="t" x="263.40033291718686" y="836">148</text>
-<text class="t" x="284.665418227216" y="852">185  (+25%)</text>
-<text class="m" x="161" y="872" text-anchor="end">olmoe:latest</text>
-<rect class="o" x="171" y="860" width="226.7" height="11" rx="2"/>
-<rect class="l" x="171" y="874" width="265.1" height="11" rx="2"/>
-<text class="t" x="403.6916354556804" y="870">389</text>
-<text class="t" x="442.143570536829" y="886">455  (+17%)</text>
-<text class="m" x="161" y="906" text-anchor="end">qwen3.5:35b</text>
-<rect class="o" x="171" y="894" width="67.0" height="11" rx="2"/>
-<rect class="l" x="171" y="908" width="77.4" height="11" rx="2"/>
-<text class="t" x="243.99958385351644" y="904">115</text>
-<text class="t" x="254.4282147315855" y="920">133  (+16%)</text>
-<text class="m" x="161" y="940" text-anchor="end">nemotron-3-nano:latest</text>
-<rect class="o" x="171" y="928" width="78.0" height="11" rx="2"/>
-<rect class="l" x="171" y="942" width="87.3" height="11" rx="2"/>
-<text class="t" x="255.01081980857262" y="938">134</text>
-<text class="t" x="264.2742405326675" y="954">150  (+12%)</text>
-<text class="m" x="161" y="974" text-anchor="end">qwen3-coder-next:latest</text>
-<rect class="o" x="171" y="962" width="16.3" height="11" rx="2"/>
-<rect class="l" x="171" y="976" width="17.6" height="11" rx="2"/>
-<text class="t" x="193.25468164794006" y="972">28</text>
-<text class="t" x="194.5946733250104" y="988">30  (+8%)</text>
-<text class="m" x="161" y="1008" text-anchor="end">qwen3next:latest</text>
-<rect class="o" x="171" y="996" width="19.1" height="11" rx="2"/>
-<rect class="l" x="171" y="1010" width="19.7" height="11" rx="2"/>
-<text class="t" x="196.10944652517685" y="1006">33</text>
-<text class="t" x="196.69205160216396" y="1022">34  (+3%)</text>
-<text class="m" x="161" y="1042" text-anchor="end">gemma4:31b</text>
-<rect class="o" x="171" y="1030" width="15.0" height="11" rx="2"/>
-<rect class="l" x="171" y="1044" width="14.5" height="11" rx="2"/>
-<text class="t" x="191.97295047856846" y="1040">26</text>
-<text class="t" x="191.50686641697877" y="1056">25  (-3%)</text>
-<text class="m" x="161" y="1076" text-anchor="end">granite3-moe:1b</text>
-<rect class="o" x="171" y="1064" width="197.6" height="11" rx="2"/>
-<rect class="l" x="171" y="1078" width="188.2" height="11" rx="2"/>
-<text class="t" x="374.5613816063254" y="1074">339</text>
-<text class="t" x="365.1814398668331" y="1090">323  (-5%)</text>
-<text class="m" x="161" y="1110" text-anchor="end">deepseek-r1:70b</text>
-<rect class="o" x="171" y="1098" width="1.0" height="11" rx="2"/>
-<rect class="l" x="171" y="1112" width="1.0" height="11" rx="2"/>
-<text class="t" x="177.93216812317937" y="1108">2</text>
-<text class="t" x="177.87390761548065" y="1124">2  (-6%)</text>
-<text class="h" x="171" y="1170">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
+<rect class="l" x="171" y="534" width="279.0" height="11" rx="2"/>
+<text class="t" x="460.06849315068496" y="530">49</text>
+<text class="t" x="456.04109589041093" y="546">48  (-1%)</text>
+<text class="m" x="161" y="566" text-anchor="end">falcon3:latest</text>
+<rect class="o" x="171" y="554" width="83.4" height="11" rx="2"/>
+<rect class="l" x="171" y="568" width="81.7" height="11" rx="2"/>
+<text class="t" x="260.4246575342466" y="564">14</text>
+<text class="t" x="258.6986301369863" y="580">14  (-2%)</text>
+<text class="m" x="161" y="600" text-anchor="end">qwen3.5:latest</text>
+<rect class="o" x="171" y="588" width="24.7" height="11" rx="2"/>
+<rect class="l" x="171" y="602" width="24.2" height="11" rx="2"/>
+<text class="t" x="201.73972602739727" y="598">4</text>
+<text class="t" x="201.16438356164383" y="614">4  (-2%)</text>
+<text class="m" x="161" y="634" text-anchor="end">gemma4:12b</text>
+<rect class="o" x="171" y="622" width="17.3" height="11" rx="2"/>
+<rect class="l" x="171" y="636" width="16.7" height="11" rx="2"/>
+<text class="t" x="194.26027397260273" y="632">3</text>
+<text class="t" x="193.68493150684932" y="648">3  (-3%)</text>
+<text class="m" x="161" y="668" text-anchor="end">ernie4-5:latest</text>
+<rect class="o" x="171" y="656" width="325.1" height="11" rx="2"/>
+<rect class="l" x="171" y="670" width="313.6" height="11" rx="2"/>
+<text class="t" x="502.0684931506849" y="666">56</text>
+<text class="t" x="490.56164383561645" y="682">54  (-4%)</text>
+<text class="m" x="161" y="702" text-anchor="end">qwen3-coder:30b</text>
+<rect class="o" x="171" y="690" width="63.3" height="11" rx="2"/>
+<rect class="l" x="171" y="704" width="61.0" height="11" rx="2"/>
+<text class="t" x="240.2876712328767" y="700">11</text>
+<text class="t" x="237.986301369863" y="716">11  (-4%)</text>
+<text class="m" x="161" y="736" text-anchor="end">granite3.1-dense:2b</text>
+<rect class="o" x="171" y="724" width="80.5" height="11" rx="2"/>
+<rect class="l" x="171" y="738" width="76.5" height="11" rx="2"/>
+<text class="t" x="257.54794520547944" y="734">14</text>
+<text class="t" x="253.52054794520546" y="750">13  (-5%)</text>
+<text class="m" x="161" y="770" text-anchor="end">nemotron-3-nano:latest</text>
+<rect class="o" x="171" y="758" width="48.3" height="11" rx="2"/>
+<rect class="l" x="171" y="772" width="45.5" height="11" rx="2"/>
+<text class="t" x="225.32876712328766" y="768">8</text>
+<text class="t" x="222.45205479452056" y="784">8  (-6%)</text>
+<text class="m" x="161" y="804" text-anchor="end">smollm3:latest</text>
+<rect class="o" x="171" y="792" width="66.2" height="11" rx="2"/>
+<rect class="l" x="171" y="806" width="62.1" height="11" rx="2"/>
+<text class="t" x="243.16438356164383" y="802">12</text>
+<text class="t" x="239.13698630136986" y="818">11  (-6%)</text>
+<text class="m" x="161" y="838" text-anchor="end">olmoe:latest</text>
+<rect class="o" x="171" y="826" width="164.0" height="11" rx="2"/>
+<rect class="l" x="171" y="840" width="152.5" height="11" rx="2"/>
+<text class="t" x="340.972602739726" y="836">28</text>
+<text class="t" x="329.4657534246576" y="852">26  (-7%)</text>
+<text class="m" x="161" y="872" text-anchor="end">qwen3.5:35b</text>
+<rect class="o" x="171" y="860" width="54.1" height="11" rx="2"/>
+<rect class="l" x="171" y="874" width="50.1" height="11" rx="2"/>
+<text class="t" x="231.08219178082192" y="870">9</text>
+<text class="t" x="227.05479452054794" y="886">9  (-7%)</text>
+<text class="m" x="161" y="906" text-anchor="end">olmo2:7b</text>
+<rect class="o" x="171" y="894" width="30.5" height="11" rx="2"/>
+<rect class="l" x="171" y="908" width="27.6" height="11" rx="2"/>
+<text class="t" x="207.4931506849315" y="904">5</text>
+<text class="t" x="204.6164383561644" y="920">5  (-9%)</text>
+<text class="m" x="161" y="940" text-anchor="end">qwen3-coder-next:latest</text>
+<rect class="o" x="171" y="928" width="43.7" height="11" rx="2"/>
+<rect class="l" x="171" y="942" width="38.5" height="11" rx="2"/>
+<text class="t" x="220.72602739726028" y="938">8</text>
+<text class="t" x="215.54794520547944" y="954">7  (-12%)</text>
+<text class="m" x="161" y="974" text-anchor="end">qwen3next:latest</text>
+<rect class="o" x="171" y="962" width="43.7" height="11" rx="2"/>
+<rect class="l" x="171" y="976" width="38.5" height="11" rx="2"/>
+<text class="t" x="220.72602739726028" y="972">8</text>
+<text class="t" x="215.54794520547944" y="988">7  (-12%)</text>
+<text class="m" x="161" y="1008" text-anchor="end">granite3-moe:1b</text>
+<rect class="o" x="171" y="996" width="420.0" height="11" rx="2"/>
+<rect class="l" x="171" y="1010" width="345.2" height="11" rx="2"/>
+<text class="t" x="597.0" y="1006">73</text>
+<text class="t" x="522.2054794520548" y="1022">60  (-18%)</text>
+<text class="m" x="161" y="1042" text-anchor="end">moondream:latest</text>
+<rect class="o" x="171" y="1030" width="160.5" height="11" rx="2"/>
+<rect class="l" x="171" y="1044" width="121.4" height="11" rx="2"/>
+<text class="t" x="337.52054794520546" y="1040">28</text>
+<text class="t" x="298.3972602739726" y="1056">21  (-24%)</text>
+<text class="h" x="171" y="1102">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
 </svg>

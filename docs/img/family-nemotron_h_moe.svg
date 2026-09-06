@@ -1,36 +1,56 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="797" height="300" viewBox="0 0 797 300" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="888" height="436" viewBox="0 0 888 436" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
 <style>.t{fill:#57606a;font-size:10.5px}.m{fill:#24292f;font-size:11px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
-<text class="h" x="288" y="22">NEMOTRON_H_MOE - DECODE TOK/S, 6 COMPARABLE CELLS, 6 MEASURED</text>
-<line class="ax" x1="288" y1="38" x2="288" y2="284"/>
-<text class="m" x="278" y="56" text-anchor="end">nemotron-3-nano:latest 4096 short S GPU</text>
-<rect class="o" x="288" y="44" width="388.0" height="11" rx="2"/>
-<rect class="l" x="288" y="58" width="420.0" height="11" rx="2"/>
-<text class="t" x="682.0276816608997" y="54">134</text>
-<text class="t" x="714.0" y="70">144  (+8%)</text>
-<text class="m" x="278" y="90" text-anchor="end">nemotron-3-nano:latest 4096 medium NS GPU</text>
-<rect class="o" x="288" y="78" width="395.3" height="11" rx="2"/>
-<rect class="l" x="288" y="92" width="356.6" height="11" rx="2"/>
-<text class="t" x="689.2941176470588" y="88">136</text>
-<text class="t" x="650.6366782006921" y="104">123  (-10%)</text>
-<text class="m" x="278" y="124" text-anchor="end">nemotron-3-nano:latest 4096 short NS GPU</text>
-<rect class="o" x="288" y="112" width="391.5" height="11" rx="2"/>
-<rect class="l" x="288" y="126" width="353.1" height="11" rx="2"/>
-<text class="t" x="685.5155709342561" y="122">135</text>
-<text class="t" x="647.1487889273357" y="138">122  (-10%)</text>
-<text class="m" x="278" y="158" text-anchor="end">nemotron-3-nano:latest 4096 long S GPU</text>
-<rect class="o" x="288" y="146" width="388.3" height="11" rx="2"/>
-<rect class="l" x="288" y="160" width="346.2" height="11" rx="2"/>
-<text class="t" x="682.3183391003461" y="156">134</text>
-<text class="t" x="640.1730103806228" y="172">119  (-11%)</text>
-<text class="m" x="278" y="192" text-anchor="end">nemotron-3-nano:latest 4096 medium S GPU</text>
-<rect class="o" x="288" y="180" width="393.0" height="11" rx="2"/>
-<rect class="l" x="288" y="194" width="347.0" height="11" rx="2"/>
-<text class="t" x="686.9688581314879" y="190">135</text>
-<text class="t" x="641.0449826989619" y="206">119  (-12%)</text>
-<text class="m" x="278" y="226" text-anchor="end">nemotron-3-nano:latest 4096 long NS GPU</text>
-<rect class="o" x="288" y="214" width="391.5" height="11" rx="2"/>
-<rect class="l" x="288" y="228" width="343.6" height="11" rx="2"/>
-<text class="t" x="685.5155709342561" y="224">135</text>
-<text class="t" x="637.5570934256056" y="240">118  (-12%)</text>
-<text class="h" x="288" y="286">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
+<text class="h" x="301" y="22">NEMOTRON_H_MOE - DECODE TOK/S, 10 WIDEST GAPS OF 18 COMPARABLE CELLS, 18 MEASURED</text>
+<line class="ax" x1="301" y1="38" x2="301" y2="420"/>
+<text class="m" x="291" y="56" text-anchor="end">nemotron-3-nano:latest 131072 short NS GPU</text>
+<rect class="o" x="301" y="44" width="200.9" height="11" rx="2"/>
+<rect class="l" x="301" y="58" width="418.6" height="11" rx="2"/>
+<text class="t" x="507.9422694094227" y="54">72</text>
+<text class="t" x="725.606502986065" y="70">150  (+108%)</text>
+<text class="m" x="291" y="90" text-anchor="end">nemotron-3-nano:latest 4096 short NS GPU</text>
+<rect class="o" x="301" y="78" width="282.0" height="11" rx="2"/>
+<rect class="l" x="301" y="92" width="420.0" height="11" rx="2"/>
+<text class="t" x="589.043795620438" y="88">101</text>
+<text class="t" x="727.0" y="104">151  (+49%)</text>
+<text class="m" x="291" y="124" text-anchor="end">nemotron-3-nano:latest 131072 long NS GPU</text>
+<rect class="o" x="301" y="112" width="284.6" height="11" rx="2"/>
+<rect class="l" x="301" y="126" width="416.4" height="11" rx="2"/>
+<text class="t" x="591.552090245521" y="122">102</text>
+<text class="t" x="723.3769077637692" y="138">149  (+46%)</text>
+<text class="m" x="291" y="158" text-anchor="end">nemotron-3-nano:latest 131072 medium NS GPU</text>
+<rect class="o" x="301" y="146" width="285.9" height="11" rx="2"/>
+<rect class="l" x="301" y="160" width="415.0" height="11" rx="2"/>
+<text class="t" x="592.9455872594558" y="156">103</text>
+<text class="t" x="721.9834107498341" y="172">149  (+45%)</text>
+<text class="m" x="291" y="192" text-anchor="end">nemotron-3-nano:latest 4096 medium NS GPU</text>
+<rect class="o" x="301" y="180" width="287.3" height="11" rx="2"/>
+<rect class="l" x="301" y="194" width="415.8" height="11" rx="2"/>
+<text class="t" x="594.3390842733909" y="190">103</text>
+<text class="t" x="722.8195089581951" y="206">149  (+45%)</text>
+<text class="m" x="291" y="226" text-anchor="end">nemotron-3-nano:latest 4096 long NS GPU</text>
+<rect class="o" x="301" y="214" width="289.8" height="11" rx="2"/>
+<rect class="l" x="301" y="228" width="400.2" height="11" rx="2"/>
+<text class="t" x="596.8473788984738" y="224">104</text>
+<text class="t" x="707.2123424021235" y="240">144  (+38%)</text>
+<text class="m" x="291" y="260" text-anchor="end">nemotron-3-nano:latest 131072 short S GPU</text>
+<rect class="o" x="301" y="248" width="373.7" height="11" rx="2"/>
+<rect class="l" x="301" y="262" width="419.4" height="11" rx="2"/>
+<text class="t" x="680.735899137359" y="258">134</text>
+<text class="t" x="726.4426011944261" y="274">150  (+12%)</text>
+<text class="m" x="291" y="294" text-anchor="end">nemotron-3-nano:latest 4096 short S GPU</text>
+<rect class="o" x="301" y="282" width="373.2" height="11" rx="2"/>
+<rect class="l" x="301" y="296" width="417.5" height="11" rx="2"/>
+<text class="t" x="680.178500331785" y="292">134</text>
+<text class="t" x="724.491705374917" y="308">150  (+12%)</text>
+<text class="m" x="291" y="328" text-anchor="end">nemotron-3-nano:latest 4096 medium S GPU</text>
+<rect class="o" x="301" y="316" width="379.3" height="11" rx="2"/>
+<rect class="l" x="301" y="330" width="418.9" height="11" rx="2"/>
+<text class="t" x="686.3098871930989" y="326">136</text>
+<text class="t" x="725.8852023888521" y="342">150  (+10%)</text>
+<text class="m" x="291" y="362" text-anchor="end">nemotron-3-nano:latest 4096 long S GPU</text>
+<rect class="o" x="301" y="350" width="377.1" height="11" rx="2"/>
+<rect class="l" x="301" y="364" width="415.8" height="11" rx="2"/>
+<text class="t" x="684.080291970803" y="360">135</text>
+<text class="t" x="722.8195089581951" y="376">149  (+10%)</text>
+<text class="h" x="301" y="422">GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>
 </svg>
