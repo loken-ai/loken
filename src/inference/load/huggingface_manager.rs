@@ -317,16 +317,30 @@ impl HuggingFaceManager {
         }
 
         // Try flat layout: model_id is a GGUF filename
-        let gguf_path = if model_id.ends_with(".gguf") {
-            self.models_dir.join(model_id)
+        // A bare name arrives as `name:latest` from the Ollama-style normalisation; the
+        // file on disk carries no tag.
+        let bare = model_id.strip_suffix(":latest").unwrap_or(model_id);
+        let gguf_path = if bare.ends_with(".gguf") {
+            self.models_dir.join(bare)
         } else {
-            self.models_dir.join(format!("{}.gguf", model_id))
+            self.models_dir.join(format!("{}.gguf", bare))
         };
         if gguf_path.exists() {
             return Some(gguf_path);
         }
 
         // Try matching by stem (e.g. "repo/stem" -> "stem.gguf")
+        // The configured directory may be an HF_HOME whose `hub/` this manager resolved to;
+        // a file dropped at the configured root is found as well.
+        if self.models_dir.file_name().and_then(|n| n.to_str()) == Some("hub") {
+            if let Some(root) = self.models_dir.parent() {
+                let at_root = root.join(gguf_path.file_name().unwrap_or_default());
+                if at_root.exists() {
+                    return Some(at_root);
+                }
+            }
+        }
+
         if model_id.contains('/') {
             if let Some(stem) = model_id.rsplit('/').next() {
                 let gguf_path = self.models_dir.join(format!("{}.gguf", stem));
@@ -777,5 +791,31 @@ mod tests {
         assert_eq!(models.len(), 1, "should find the t5 model");
         assert_eq!(models[0].model_id, "google/t5-v1_1-xxl");
         assert_eq!(models[0].revision, sha);
+    }
+}
+
+#[cfg(test)]
+mod gguf_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_gguf_name_is_found_with_or_without_the_tag() {
+        let dir = std::env::temp_dir().join(format!("loken-hf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.gguf"), b"GGUF").unwrap();
+        let m = HuggingFaceManager::new(dir.clone());
+        assert_eq!(m.get_model_path("x"), Some(dir.join("x.gguf")));
+        assert_eq!(m.get_model_path("x:latest"), Some(dir.join("x.gguf")));
+        assert_eq!(m.get_model_path("x.gguf"), Some(dir.join("x.gguf")));
+        assert_eq!(m.get_model_path("x.gguf:latest"), Some(dir.join("x.gguf")));
+        assert_eq!(m.get_model_path("y:latest"), None);
+        // An HF_HOME layout: the manager resolves to `hub/`, a file at the root still counts.
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join("hub")).unwrap();
+        std::fs::write(home.join("z.gguf"), b"GGUF").unwrap();
+        let m = HuggingFaceManager::new(home.clone());
+        assert_eq!(m.get_model_path("z"), Some(home.join("z.gguf")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
