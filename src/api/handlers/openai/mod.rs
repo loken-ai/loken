@@ -2252,6 +2252,8 @@ pub(crate) async fn openai_embeddings(
 
 mod files;
 pub(crate) use files::*;
+mod moderation;
+pub(crate) use moderation::*;
 mod responses;
 pub(crate) use responses::*;
 #[cfg(test)]

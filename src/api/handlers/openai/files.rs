@@ -25,7 +25,7 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn new_id(prefix: &str) -> String {
+pub(super) fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
 }
 
@@ -569,92 +569,6 @@ pub(crate) async fn anthropic_batches_results(
 }
 
 // --------------------------------------------------------------- moderations
-
-const MODERATION_CATEGORIES: [&str; 13] = [
-    "harassment",
-    "harassment/threatening",
-    "hate",
-    "hate/threatening",
-    "illicit",
-    "illicit/violent",
-    "self-harm",
-    "self-harm/intent",
-    "self-harm/instructions",
-    "sexual",
-    "sexual/minors",
-    "violence",
-    "violence/graphic",
-];
-
-/// `POST /v1/moderations`: each input judged by the configured moderation model, which
-/// answers the category flags as JSON under a grammar. Without one, 501 and the key
-/// to set.
-pub(crate) async fn moderations(
-    State(state): State<APIServer>,
-    Json(body): Json<Value>,
-) -> Result<Response, ApiError> {
-    let Some(model) = state
-        .default_inference_config
-        .moderation_model
-        .clone()
-        .or_else(|| body.get("model").and_then(Value::as_str).map(str::to_string))
-    else {
-        return Ok((
-            StatusCode::NOT_IMPLEMENTED,
-            Json(openai_error_body(
-                StatusCode::NOT_IMPLEMENTED,
-                "no moderation model is configured; set `[inference] moderation_model` to the model that judges, or pass `model`".to_string(),
-            )),
-        )
-            .into_response());
-    };
-    let inputs: Vec<String> = match body.get("input") {
-        Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
-        _ => return Err(ApiError::Validation("`input` must be a string or an array of strings".into())),
-    };
-    let schema = json!({
-        "type": "object",
-        "properties": MODERATION_CATEGORIES.iter().map(|c| (c.to_string(), json!({"type": "number", "minimum": 0, "maximum": 1}))).collect::<serde_json::Map<_, _>>(),
-        "required": MODERATION_CATEGORIES,
-        "additionalProperties": false
-    });
-    let mut results = Vec::new();
-    for text in inputs {
-        let req: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": format!("You are a content moderation classifier. For the user's text, give for each category a score from 0 to 1, the probability that the text belongs to it. Categories: {}. Answer with the JSON object only.", MODERATION_CATEGORIES.join(", "))},
-                {"role": "user", "content": text}
-            ],
-            "temperature": 0,
-            "max_completion_tokens": 400,
-            "response_format": {"type": "json_schema", "json_schema": {"name": "moderation", "schema": schema}}
-        }))
-        .map_err(|e| ApiError::Internal(format!("moderation: {e}")))?;
-        let resp = Box::pin(chat_completion(State(state.clone()), OpenAIJson(req))).await?;
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .map_err(|e| ApiError::Internal(format!("moderation: {e}")))?;
-        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        let answer = v
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-            .unwrap_or(json!({}));
-        let scores: serde_json::Map<String, Value> = MODERATION_CATEGORIES
-            .iter()
-            .map(|c| (c.to_string(), json!(answer.get(*c).and_then(Value::as_f64).unwrap_or(0.0))))
-            .collect();
-        let categories: serde_json::Map<String, Value> = scores
-            .iter()
-            .map(|(k, v)| (k.clone(), json!(v.as_f64().unwrap_or(0.0) >= 0.5)))
-            .collect();
-        let flagged = categories.values().any(|v| v.as_bool().unwrap_or(false));
-        results.push(json!({"flagged": flagged, "categories": categories, "category_scores": scores}));
-    }
-    Ok(Json(json!({"id": new_id("modr"), "model": model, "results": results})).into_response())
-}
 
 /// Turns `b64_json` image entries into stored files served by URL, when the request
 /// asked for `url`. The URL is built on the request's `Host`, or on `public_url` when
