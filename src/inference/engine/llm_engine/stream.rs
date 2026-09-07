@@ -68,6 +68,9 @@ impl LlmEngine {
         std::thread::spawn(move || {
             let mut gen: Vec<u32> = Vec::new();
             let mut emitted = String::new();
+            // A Harmony vocabulary keeps its channel tokens in the text, for the API to
+            // split the analysis from the answer; any other drops its special tokens.
+            let skip_special = tokenizer.token_to_id("<|channel|>").is_none();
             loop {
                 match cb_rx.recv() {
                     Ok(CbToken::Tok(t)) => {
@@ -75,7 +78,7 @@ impl LlmEngine {
                             break;
                         }
                         gen.push(t);
-                        let full = match tokenizer.decode(&gen, true) {
+                        let full = match tokenizer.decode(&gen, skip_special) {
                             Ok(s) => s,
                             Err(_) => continue,
                         };
@@ -900,6 +903,9 @@ impl LlmEngine {
                     }
                 }
             };
+            // A Harmony vocabulary keeps its channel tokens in the text, for the API to
+            // split the analysis from the answer; any other drops its special tokens.
+            let skip_special_tokens = stream_tokenizer.token_to_id("<|channel|>").is_none();
 
             // Helper: decode a token to text and send the DIFF to the streaming channel.
             // Returns false if client disconnected or stop sequence matched.
@@ -1824,7 +1830,7 @@ impl LlmEngine {
                             }
                             generated_token_ids.push(tok);
                             let cumulative = stream_tokenizer
-                                .decode(&generated_token_ids, true)
+                                .decode(&generated_token_ids, skip_special_tokens)
                                 .unwrap_or_default();
                             let chunk_text = if cumulative.len() >= sent_text_len {
                                 // Char-boundary-safe delta: a multi-token commit (PLD /

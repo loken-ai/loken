@@ -4,6 +4,18 @@
 
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
+/// gpt-oss reasons on Harmony's `analysis` channel and answers on `final`; the engine
+/// keeps its channel tokens in the text so they can be read here. The answer's own
+/// opening and the trailing end-of-turn tokens carry nothing and are dropped.
+const OPEN_HARMONY: &str = "<|channel|>analysis<|message|>";
+const CLOSE_HARMONY: &str = "<|end|>";
+const HARMONY_NOISE: [&str; 5] = [
+    "<|start|>assistant<|channel|>final<|message|>",
+    "<|channel|>final<|message|>",
+    "<|start|>assistant",
+    "<|return|>",
+    "<|end|>",
+];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Segment {
@@ -16,6 +28,8 @@ pub enum Segment {
 #[derive(Default)]
 pub struct ThinkSplit {
     inside: bool,
+    /// Whether the open block is a Harmony `analysis` channel rather than `<think>`.
+    harmony: bool,
     pending: String,
     content_started: bool,
 }
@@ -29,16 +43,34 @@ impl ThinkSplit {
         self.pending.push_str(chunk);
         let mut out = Vec::new();
         loop {
-            let tag = if self.inside { CLOSE } else { OPEN };
-            match self.pending.find(tag) {
-                Some(i) => {
+            // The tags that may come next: a close of the open family while inside,
+            // either open otherwise. The earliest one in the buffer wins.
+            let candidates: &[&str] = if self.inside {
+                if self.harmony { &[CLOSE_HARMONY] } else { &[CLOSE] }
+            } else {
+                &[OPEN, OPEN_HARMONY]
+            };
+            let hit = candidates
+                .iter()
+                .filter_map(|t| self.pending.find(t).map(|i| (i, *t)))
+                .min_by_key(|(i, _)| *i);
+            match hit {
+                Some((i, tag)) => {
                     let before = self.pending[..i].to_string();
                     self.pending = self.pending[i + tag.len()..].to_string();
                     self.emit(&mut out, before);
+                    if !self.inside {
+                        self.harmony = tag == OPEN_HARMONY;
+                    }
                     self.inside = !self.inside;
                 }
                 None => {
-                    let keep = partial_tag_suffix(&self.pending, tag);
+                    let keep = candidates
+                        .iter()
+                        .chain(HARMONY_NOISE.iter())
+                        .map(|t| partial_tag_suffix(&self.pending, t))
+                        .max()
+                        .unwrap_or(0);
                     let cut = self.pending.len() - keep;
                     let release = self.pending[..cut].to_string();
                     self.pending = self.pending[cut..].to_string();
@@ -66,6 +98,10 @@ impl ThinkSplit {
             out.push(Segment::Thinking(text));
             return;
         }
+        let text = strip_harmony_noise(&text);
+        if text.is_empty() {
+            return;
+        }
         // The blank line a model leaves between its reasoning and its answer belongs
         // to neither.
         let text = if self.content_started {
@@ -83,6 +119,16 @@ impl ThinkSplit {
 }
 
 /// How many trailing bytes of `s` could be the start of `tag`.
+/// Removes Harmony's turn tokens from an answer: the `final` channel opening, a
+/// `<|start|>assistant` before it, and the end-of-turn tokens.
+fn strip_harmony_noise(text: &str) -> String {
+    let mut t = text.to_string();
+    for n in HARMONY_NOISE {
+        t = t.replace(n, "");
+    }
+    t
+}
+
 fn partial_tag_suffix(s: &str, tag: &str) -> usize {
     let max = (tag.len() - 1).min(s.len());
     (1..=max)
@@ -111,6 +157,35 @@ pub fn split_thinking(text: &str) -> (Option<String>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harmony_channels_split_like_think_tags() {
+        let (thinking, content) = split_thinking(
+            "<|channel|>analysis<|message|>We must classify.<|end|><|start|>assistant<|channel|>final<|message|>{\"violations\": []}<|return|>",
+        );
+        assert_eq!(thinking.as_deref(), Some("We must classify."));
+        assert_eq!(content, "{\"violations\": []}");
+    }
+
+    #[test]
+    fn harmony_answer_without_analysis_is_plain_content() {
+        let (thinking, content) = split_thinking("<|channel|>final<|message|>Hello.<|return|>");
+        assert_eq!(thinking, None);
+        assert_eq!(content, "Hello.");
+    }
+
+    #[test]
+    fn harmony_markers_survive_a_chunk_boundary() {
+        let mut s = ThinkSplit::new();
+        let mut segs = s.push("<|channel|>anal");
+        segs.extend(s.push("ysis<|message|>think<|en"));
+        segs.extend(s.push("d|><|start|>assistant<|channel|>final<|message|>answer"));
+        segs.extend(s.finish());
+        let thinking: String = segs.iter().filter_map(|x| match x { Segment::Thinking(t) => Some(t.as_str()), _ => None }).collect();
+        let content: String = segs.iter().filter_map(|x| match x { Segment::Content(t) => Some(t.as_str()), _ => None }).collect();
+        assert_eq!(thinking, "think");
+        assert_eq!(content, "answer");
+    }
 
     #[test]
     fn whole_text_splits_reasoning_from_answer() {

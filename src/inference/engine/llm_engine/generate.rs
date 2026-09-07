@@ -1571,7 +1571,10 @@ impl LlmEngine {
             // Decode output tokens
             // Token ids decode straight back to the text, so they are content too.
             debug!("Generated {} tokens", generated.len());
-            let text = state.tokenizer.decode(&generated, true)
+            // A Harmony vocabulary keeps its channel tokens in the text, for the API to
+            // split the analysis from the answer; any other drops its special tokens.
+            let skip_special = state.tokenizer.token_to_id("<|channel|>").is_none();
+            let text = state.tokenizer.decode(&generated, skip_special)
                 .map_err(|e| anyhow!("Decode error: {}", e))?;
 
             debug!("Decoded {} chars", text.len());
