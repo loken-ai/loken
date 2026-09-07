@@ -687,15 +687,15 @@ mod spm_vocabulary_tests {
     /// shape these tests are about.
     fn ernie() -> Option<tokenizers::Tokenizer> {
         let store = std::env::var("OLLAMA_MODELS")
-            .unwrap_or_else(|_| "/usr/share/ollama/.ollama/models/".to_string());
-        let man = std::path::Path::new(&store)
-            .join("manifests/registry.ollama.ai/library/ernie4-5/latest");
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate::config::Config::default_ollama_models_dir());
+        let man = store.join("manifests/registry.ollama.ai/library/ernie4-5/latest");
         let text = std::fs::read_to_string(&man).ok()?;
         let digest = text
             .split('"')
             .find(|s| s.starts_with("sha256:") && s.len() > 20)
             .map(|s| s.replace(':', "-"))?;
-        let blob = std::path::Path::new(&store).join("blobs").join(digest);
+        let blob = store.join("blobs").join(digest);
         let mut f = std::fs::File::open(&blob).ok()?;
         let content = crate::tensor::quantized::gguf_file::Content::read(&mut f).ok()?;
         super::build_tokenizer_from_gguf(&content).ok()

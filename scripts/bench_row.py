@@ -122,7 +122,7 @@ def arch_of(tag):
     """Cached, and silent about what it cannot resolve: a locally requantised tag has no
     manifest, and the membership read from the document still covers it."""
     if tag not in _ARCH_CACHE:
-        store = os.environ.get("OLLAMA_MODELS", "/usr/share/ollama/.ollama/models/")
+        store = os.environ.get("OLLAMA_MODELS", os.path.expanduser("~/.ollama/models"))
         try:
             _ARCH_CACHE[tag] = architecture_of(tag, store)
         except Exception:
