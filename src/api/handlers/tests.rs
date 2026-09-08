@@ -591,3 +591,13 @@ fn a_normalised_id_still_matches_its_untagged_resident() {
         "Qwen/Qwen-Image"
     );
 }
+
+#[test]
+fn only_a_streamed_answer_is_watched_for_its_end() {
+    use serde_json::json;
+    assert!(super::OLLAMA_CHAT.streams(&json!({})));
+    assert!(!super::OLLAMA_GENERATE.streams(&json!({"stream": false})));
+    assert!(!super::OPENAI_CHAT.streams(&json!({})));
+    assert!(super::OPENAI_COMPLETIONS.streams(&json!({"stream": true})));
+    assert!(!super::MESSAGES.streams(&json!({"max_tokens": 8})));
+}

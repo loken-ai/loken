@@ -290,32 +290,50 @@ pub(crate) struct Relay {
     pub path: &'static str,
     pub marker: &'static [u8],
     pub closing: &'static str,
+    /// Whether a request that does not say streams, which the Ollama routes do and the
+    /// OpenAI and Messages routes do not.
+    pub streams_by_default: bool,
+}
+
+impl Relay {
+    /// Whether this request's answer arrives as a stream, which is the only shape that can end
+    /// without its terminal chunk and needs one added.
+    fn streams(&self, body: &serde_json::Value) -> bool {
+        body.get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(self.streams_by_default)
+    }
 }
 
 pub(crate) const OLLAMA_GENERATE: Relay = Relay {
     path: "/api/generate",
     marker: TERMINAL_MARKER,
     closing: "{\"response\":\"\",\"done\":true,\"done_reason\":\"peer_failed\",\"error\":\"the node serving this request stopped before finishing it\"}\n",
+    streams_by_default: true,
 };
 pub(crate) const OLLAMA_CHAT: Relay = Relay {
     path: "/api/chat",
     marker: TERMINAL_MARKER,
     closing: "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"peer_failed\",\"error\":\"the node serving this request stopped before finishing it\"}\n",
+    streams_by_default: true,
 };
 pub(crate) const OPENAI_CHAT: Relay = Relay {
     path: "/v1/chat/completions",
     marker: b"[DONE]",
     closing: "data: {\"error\":{\"message\":\"the node serving this request stopped before finishing it\",\"type\":\"peer_failed\"}}\n\ndata: [DONE]\n\n",
+    streams_by_default: false,
 };
 pub(crate) const OPENAI_COMPLETIONS: Relay = Relay {
     path: "/v1/completions",
     marker: b"[DONE]",
     closing: "data: {\"error\":{\"message\":\"the node serving this request stopped before finishing it\",\"type\":\"peer_failed\"}}\n\ndata: [DONE]\n\n",
+    streams_by_default: false,
 };
 pub(crate) const MESSAGES: Relay = Relay {
     path: "/v1/messages",
     marker: b"message_stop",
     closing: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"peer_failed\",\"message\":\"the node serving this request stopped before finishing it\"}}\n\n",
+    streams_by_default: false,
 };
 
 /// Hand a request to the peer best placed for it, or say that it stays here. `prompt` is
@@ -381,6 +399,16 @@ pub(crate) async fn forward_to_peer(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    if !relay.streams(body) {
+        // A whole body is passed on as it comes; cut short, it fails to parse, which is the
+        // error the client sees.
+        return Ok((
+            code,
+            [(axum::http::header::CONTENT_TYPE, content_type)],
+            axum::body::Body::from_stream(resp.bytes_stream()),
+        )
+            .into_response());
+    }
     // Each chunk is handed on the moment it arrives. What the relay must add is an ending:
     // when the serving node dies mid-generation the body simply stops, with no error and no
     // terminal chunk, and a client reading to end-of-stream cannot tell that from a finished
