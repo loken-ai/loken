@@ -177,7 +177,7 @@ impl SentencePiece {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "audio"))]
 mod tests {
     //! The ignored cases here need real weights, a device, or a reference dump on
     //! this machine; nothing about them is automatic. Run one by name with

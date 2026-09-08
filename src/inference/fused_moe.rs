@@ -363,7 +363,7 @@ impl FusedMoeGGUF {
         {
             // A build with no kernels compiled in has nothing below this point; the device
             // test above has already sent every call to the host path.
-            return self.forward_cpu(&xs, block, residual, original_dtype);
+            self.forward_cpu(&xs, block, residual, original_dtype)
         }
         #[cfg(feature = "cuda")]
         {

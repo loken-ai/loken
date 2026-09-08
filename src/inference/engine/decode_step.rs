@@ -163,8 +163,6 @@ pub(crate) fn sample_row_sync(
     recent_tokens: &[u32],
     repeat_penalty: f32,
     repeat_last_n: usize,
-    temperature: f32,
-    top_k: usize,
     logits_processor: &mut LogitsProcessor,
 ) -> crate::tensor::Result<u32> {
     if row.device().is_cuda() {
@@ -173,8 +171,6 @@ pub(crate) fn sample_row_sync(
             recent_tokens,
             repeat_penalty,
             repeat_last_n,
-            temperature,
-            top_k,
             logits_processor,
         )
     } else {

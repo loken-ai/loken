@@ -613,6 +613,7 @@ mod gpu_tile_tests {
     // GPU parity of the tiled SDPA at the exact Wan video shape (queries > QUERY_TILE, 4-D
     // batched, CUDA). The CPU test cannot catch CUDA-kernel stride behavior. Run:
     //   cargo test -p loken --profile fast gpu_sdpa_tile_parity -- --ignored --nocapture
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
     fn gpu_sdpa_tile_parity() {
@@ -760,6 +761,7 @@ mod flash_headroom {
     //!   cargo test -p loken --release flash_headroom -- --ignored --nocapture
     use crate::tensor::{Device, Tensor};
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
     fn tiled_scores_versus_flash_at_the_wan_shape() {
@@ -906,6 +908,7 @@ mod flash_dit_tests {
     /// Against the tiled path, which is the reference this has to reproduce. Not bit-exact:
     /// the online softmax sums in a different order and the accumulator is rescaled as it
     /// goes, so the comparison is a relative error over the whole output.
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
     fn it_matches_the_tiled_path() {
@@ -955,6 +958,7 @@ mod flash_dit_tests {
     }
 
     /// And is it worth having. Both video shapes, against the path in production.
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
     fn it_is_faster_at_the_video_shapes() {

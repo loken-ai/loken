@@ -1949,8 +1949,6 @@ impl LlmEngine {
                                         &recent_tokens,
                                         repeat_penalty,
                                         repeat_last_n,
-                                        temperature,
-                                        top_k,
                                         &mut logits_processor,
                                     ) {
                                         Ok(t) => (t, None),

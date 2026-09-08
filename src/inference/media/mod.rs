@@ -2,7 +2,6 @@
 //!
 //! `crate::inference::media::<part>`
 
-#[cfg(feature = "audio")]
 pub mod audio_io;
 #[cfg(feature = "image")]
 pub mod gif;

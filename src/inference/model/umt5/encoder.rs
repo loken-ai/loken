@@ -329,6 +329,7 @@ mod tests {
     /// returns 100% NaN -> NaN latents -> saturated white frames. The GPU
     /// path must run BF16 (f32's exponent, same footprint). Asserts zero NaN
     /// and closeness to the F32 CPU reference.
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "loads the 11 GB umT5 on GPU"]
     fn umt5_gpu_bf16_matches_cpu_f32() {

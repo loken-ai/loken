@@ -282,6 +282,7 @@ fn qmatmul_matches_oracle() {
 /// garbage logits -> garbage tokens from otherwise-correct hidden states.
 /// Q5_0 mmvq was proven correct at K=896; Q8_0 at K=896 was NOT tested.
 /// Compares the GPU GEMV to an f64 reference on a SUBSET of output rows.
+#[cfg(feature = "cuda")]
 #[test]
 fn q8_0_gpu_mmvq_parity_k896() {
     use crate::tensor::{cuda::CudaDevice, Device, Tensor};
@@ -353,6 +354,7 @@ fn q8_0_gpu_mmvq_parity_k896() {
 /// isolates whether the Q5_0 decode mmvq kernel itself is wrong (vs an
 /// attention/hidden=896 issue) by comparing the GPU GEMV to an f64 reference
 /// over the dequantized weight, on a real Q5_0 weight (K=896 from the model).
+#[cfg(feature = "cuda")]
 #[test]
 fn q5_0_gpu_mmvq_matches_oracle() {
     use crate::tensor::{cuda::CudaDevice, Device, Tensor};
@@ -503,6 +505,7 @@ fn cpu_qmatmul_vec_dot_matches_oracle() {
 /// right thing to pin - it is the served path - but it means this cannot be used to prove a
 /// particular file is correct. The kernel names are built with `format!`, so grep cannot
 /// answer that question either.
+#[cfg(feature = "cuda")]
 #[test]
 fn every_gpu_mmvq_format_matches_the_weights_it_holds() {
     use crate::tensor::{cuda::CudaDevice, quant_cpu, Device, Tensor};
@@ -687,6 +690,7 @@ fn every_cpu_repack_gemm_matches_the_gemv_on_the_same_weights() {
 /// left is two int8 activation quantisations of the same values. The two must land within a
 /// thousandth or so of the row's own scale. On sm_120 the tiled family is the MMA path, which
 /// no test reached before this one.
+#[cfg(feature = "cuda")]
 #[test]
 fn the_gpu_tiled_matmul_agrees_with_the_mat_vec_on_the_same_weights() {
     use crate::tensor::{cuda::CudaDevice, quant_cpu, Device, Tensor};
@@ -767,6 +771,7 @@ fn the_gpu_tiled_matmul_agrees_with_the_mat_vec_on_the_same_weights() {
 /// looked unused, would surface on a user's first quantised attention rather than here. The
 /// names are gathered from the source rather than listed again, because a second list is the
 /// thing that goes stale.
+#[cfg(feature = "cuda")]
 #[test]
 fn every_kernel_name_the_quantised_module_is_asked_for_resolves() {
     use crate::tensor::cuda::CudaDevice;

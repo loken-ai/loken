@@ -656,6 +656,7 @@ impl LlmEngine {
                 // new_with_stream (non-default). Default stream + tracking
                 // disabled is captureable in cudaStreamCaptureModeRelaxed,
                 // which the engine uses for CUDA graph capture.
+                #[cfg_attr(not(feature = "cuda"), allow(clippy::map_identity))]
                 let dev_result: crate::tensor::Result<Device> = crate::tensor::Device::new_cuda(gpu_idx)
                     .map(|d| {
                         #[cfg(feature = "cuda")]

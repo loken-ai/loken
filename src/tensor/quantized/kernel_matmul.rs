@@ -7,15 +7,19 @@
 //! makes the whole chain safe: a workspace that cannot be allocated degrades instead of
 //! failing the request.
 
+#[cfg(feature = "cuda")]
 use super::mmq::{mmq_launcher, mmq_qk, mmq_quantize_launcher, mmq_supports, MMQ_WORKSPACES};
 use super::*;
 
 mod cpu;
+#[cfg(feature = "cuda")]
 mod kat;
 mod mmq;
 mod repack;
 
+#[cfg(feature = "cuda")]
 use kat::kat_bad;
+#[cfg(feature = "cuda")]
 pub use kat::kernel_known_answer_test;
 
 /// Quantized matmul over the production kernels: holds the GGML block

@@ -2520,9 +2520,12 @@ impl GenericHeteroTransformer {
                 .into_iter()
                 .flatten()
             {
+                #[cfg(feature = "cuda")]
                 if let Device::Cuda(cd) = d {
                     keep.insert(cd.ordinal());
                 }
+                #[cfg(not(feature = "cuda"))]
+                let _ = d;
             }
             cuda_devices
                 .iter()
@@ -2534,6 +2537,9 @@ impl GenericHeteroTransformer {
             .iter()
             .filter(|(i, _)| !retained.contains_key(i))
         {
+            #[cfg(not(feature = "cuda"))]
+            let _ = (idx, d);
+            #[cfg(feature = "cuda")]
             if let Device::Cuda(cd) = d {
                 tracing::debug!(
                     "cuda ctx: dropping idle gpu{idx} handle, strong_count={} (>1 means another \

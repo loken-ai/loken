@@ -725,6 +725,7 @@ mod tests {
     ///
     /// The band is deliberately wide: this catches "nothing" and "absurd", not a
     /// percentage. A tight bound would be the hard-coded constant again.
+    #[cfg(feature = "image")]
     #[test]
     fn every_family_asks_for_a_plausible_amount() {
         use crate::inference::engine::image_engine;

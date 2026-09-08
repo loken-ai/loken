@@ -303,7 +303,7 @@ impl MoeWeights {
                 .forward(&xs)?
                 .to_dtype(crate::tensor::DType::F32)?
         } else {
-            let _v = {
+            {
                 #[cfg(feature = "cuda")]
                 {
                     if attn_f32.device().is_cuda()
@@ -336,8 +336,7 @@ impl MoeWeights {
                     crate::tensor::ops::rms_norm(&attn_f32, &self.gate_inp_scale, rms_eps)?;
                 let logits = self.gate_inp.forward(&normed)?;
                 logits.to_dtype(crate::tensor::DType::F32)
-            })?;
-            _v
+            })?
         };
 
         // Measured directly, not as a residual: a residual absorbs the synchronisations

@@ -621,7 +621,7 @@ pub(crate) fn infer_model_family(model_id: &str) -> &'static str {
     // before the generic "qwen" arm so it resolves to the image family (and so
     // /api/show + /api/tags don't advertise chat/embedding on it).
     // BEFORE any `flux` test: "flux2-klein" contains "flux".
-    else if crate::inference::engine::flux2_engine::is_flux2_model(&lower) {
+    else if is_flux2_model(&lower) {
         "flux2"
     } else if lower.contains("qwen-image")
         || lower.contains("qwen_image")
@@ -1173,5 +1173,18 @@ pub(crate) async fn ollama_show_model(
                 )))
             }
         }
+    }
+}
+
+/// Flux 2 checkpoints are told apart by the image engine, when it is compiled.
+fn is_flux2_model(lower: &str) -> bool {
+    #[cfg(feature = "image")]
+    {
+        crate::inference::engine::flux2_engine::is_flux2_model(lower)
+    }
+    #[cfg(not(feature = "image"))]
+    {
+        let _ = lower;
+        false
     }
 }

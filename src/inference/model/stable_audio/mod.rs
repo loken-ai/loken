@@ -985,14 +985,20 @@ struct FullPrecisionGuard(bool);
 
 impl FullPrecisionGuard {
     fn pin() -> Self {
-        let was = crate::tensor::cuda::gemm_reduced_precision_f32();
-        crate::tensor::cuda::set_gemm_reduced_precision_f32(false);
-        Self(was)
+        #[cfg(feature = "cuda")]
+        {
+            let was = crate::tensor::cuda::gemm_reduced_precision_f32();
+            crate::tensor::cuda::set_gemm_reduced_precision_f32(false);
+            Self(was)
+        }
+        #[cfg(not(feature = "cuda"))]
+        Self(false)
     }
 }
 
 impl Drop for FullPrecisionGuard {
     fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
         crate::tensor::cuda::set_gemm_reduced_precision_f32(self.0);
     }
 }
@@ -1338,6 +1344,7 @@ mod forward_determinism {
 
     /// Ten forwards of the REAL DiT on one input: the count of distinct outputs is the
     /// race detector the op-level harness could not be (every op alone was clean).
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "hardware probe: needs the stable-audio weights and a CUDA card"]
     fn ten_identical_forwards_one_output() {

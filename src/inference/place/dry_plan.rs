@@ -480,6 +480,7 @@ mod tests {
     /// card in probe order whose free VRAM holds the weights plus the request's
     /// reserve, undivided". Measured, the same request picks the same card - so
     /// nothing moves the day the measurement starts deciding.
+    #[cfg(feature = "image")]
     #[test]
     fn at_512_square_the_fixed_point_picks_what_the_loader_picks_today() {
         let cards = [(0usize, gb(16.5)), (1usize, gb(16.5))];

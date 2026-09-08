@@ -413,6 +413,7 @@ fn the_fixed_point_splits_the_real_checkpoint_when_no_card_holds_it() {
 /// cargo test --release -p loken --lib -- --ignored --nocapture \
 ///     zimage_native::tests::the_1536_decision_on_the_real_checkpoint
 /// ```
+#[cfg(feature = "image")]
 #[test]
 #[ignore = "needs the local Z-Image-Turbo snapshot"]
 fn the_1536_decision_on_the_real_checkpoint() {

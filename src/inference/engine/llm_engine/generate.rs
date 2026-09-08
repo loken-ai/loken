@@ -353,7 +353,7 @@ impl LlmEngine {
             // allocated KV cap (Q8 append fails there -> degenerate output).
             let resolved = resolve_gen_params(&params, &config, effective_context, prompt_tokens.len() + vision_extra);
             let ResolvedGenParams {
-                max_tokens, temperature, top_k, repeat_penalty, repeat_last_n, ..
+                max_tokens, repeat_penalty, repeat_last_n, ..
             } = resolved;
             // Clone the device so subsequent state.forward (mutable borrow)
             // doesn't conflict with the previous immutable borrow.
@@ -1067,7 +1067,7 @@ impl LlmEngine {
                                                 let logits_1d = eag.squeeze(0)?;
                                                 next_token = gpu_sample(
                                                     &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
-                                                    temperature, top_k, &mut logits_processor,
+                                                    &mut logits_processor,
                                                 )?;
                                                 record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                                 continue;
@@ -1089,7 +1089,7 @@ impl LlmEngine {
                                 let logits_1d = logits_ref.squeeze(0)?;
                                 next_token = gpu_sample(
                                     &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
-                                    temperature, top_k, &mut logits_processor,
+                                    &mut logits_processor,
                                 )?;
                                 record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                 continue;
@@ -1140,7 +1140,7 @@ impl LlmEngine {
                         let logits_1d = logits.squeeze(0)?;
                         next_token = gpu_sample(
                             &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
-                            temperature, top_k, &mut logits_processor,
+                            &mut logits_processor,
                         )?;
                         record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                         continue;
@@ -1237,7 +1237,7 @@ impl LlmEngine {
                                                         let logits_1d = logits.squeeze(0)?;
                                                         next_token = gpu_sample(
                                                             &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
-                                                            temperature, top_k, &mut logits_processor,
+                                                            &mut logits_processor,
                                                         )?;
                                                         record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                                         graph_logits = Some(logits);
@@ -1252,7 +1252,7 @@ impl LlmEngine {
                                                     let logits_1d = eag.squeeze(0)?;
                                                     next_token = gpu_sample(
                                                         &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
-                                                        temperature, top_k, &mut logits_processor,
+                                                        &mut logits_processor,
                                                     )?;
                                                     record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                                     state.model.invalidate_graph_state();
@@ -1268,7 +1268,7 @@ impl LlmEngine {
                                                     let logits_1d = logits.squeeze(0)?;
                                                     next_token = gpu_sample(
                                                         &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
-                                                        temperature, top_k, &mut logits_processor,
+                                                        &mut logits_processor,
                                                     )?;
                                                     record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                                     graph_logits = Some(logits);
@@ -1290,7 +1290,7 @@ impl LlmEngine {
                                             let logits_1d = logits.squeeze(0)?;
                                             next_token = gpu_sample(
                                                 &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
-                                                temperature, top_k, &mut logits_processor,
+                                                &mut logits_processor,
                                             )?;
                                             record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                             state.model.invalidate_graph_state();
@@ -1315,7 +1315,7 @@ impl LlmEngine {
                                     let logits_1d = logits.squeeze(0)?;
                                     next_token = gpu_sample(
                                         &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
-                                        temperature, top_k, &mut logits_processor,
+                                        &mut logits_processor,
                                     )?;
                                     record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                     state.model.invalidate_graph_state();
@@ -1434,7 +1434,7 @@ impl LlmEngine {
                             &mut |row, recent| {
                                 sample_row_sync(
                                     row, recent, repeat_penalty, repeat_last_n,
-                                    temperature, top_k, &mut logits_processor,
+                                    &mut logits_processor,
                                 ).map(|t| (t, None))
                             },
                         )?;
@@ -1484,7 +1484,7 @@ impl LlmEngine {
                         let logits_1d = logits.squeeze(0)?;
                         next_token = sample_row_sync(
                             &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
-                            temperature, top_k, &mut logits_processor,
+                            &mut logits_processor,
                         )?;
                         // next_token will be pushed to pld_cache at the start
                         // of the next outer-loop iteration (symmetric with

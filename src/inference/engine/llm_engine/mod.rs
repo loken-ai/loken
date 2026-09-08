@@ -1,4 +1,3 @@
-#[cfg(feature = "cuda")]
 use crate::inference::engine::decode_step::{
     incremental_chunk_text, pld_verify_commit, pld_window_update, resolve_gen_params,
     sample_row_sync, spec_draft_lockstep, ResolvedGenParams, StopTracker,

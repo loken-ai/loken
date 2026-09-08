@@ -10,6 +10,14 @@
 //! at sorted position j (token = idx / topk), and `expert_ids[j]` is its expert
 //! (the ids are sorted, so each expert occupies a contiguous run).
 
+/// Without a card no expert kernel serves any dtype, so every mixture takes the host path.
+#[cfg(not(feature = "cuda"))]
+pub mod gemm {
+    pub fn expert_kernels_serve(_dtype: crate::tensor::quantized::GgmlDType) -> bool {
+        false
+    }
+}
+
 use crate::tensor::quantized::{GgmlDType, QMatMul, QTensor};
 use crate::tensor::{DType, IndexOp, Result, Tensor, D};
 use std::collections::HashMap;

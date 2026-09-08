@@ -142,7 +142,7 @@ pub(super) use vectorised::{vec_dot_bf16, vec_dot_f16, vec_dot_f32};
     target_feature = "avx2"
 )))]
 mod scalar_only {
-    use super::{bf16, f16};
+    use half::{bf16, f16};
 
     macro_rules! carrier {
         ($name:ident, $ty:ty, $widen:expr) => {

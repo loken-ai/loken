@@ -9,6 +9,28 @@
 //! The default build pulls in CUDA + OpenCL via the corresponding cargo
 //! features. The `cpu` feature carves out a CPU-only build.
 
+// Tensor shapes are written `[b, h, d]` throughout the documentation, which rustdoc would
+// read as links; the crate's own items are documented from wherever they are reachable.
+#![allow(
+    rustdoc::broken_intra_doc_links,
+    rustdoc::private_intra_doc_links,
+    rustdoc::redundant_explicit_links,
+    rustdoc::invalid_html_tags
+)]
+// The host build compiles the shapes of the device path, so what the device path alone
+// reads is left in place rather than gated site by site. The default build denies all of it.
+#![cfg_attr(
+    not(feature = "cuda"),
+    allow(
+        unused_variables,
+        unused_imports,
+        unused_mut,
+        unused_assignments,
+        unused_macros,
+        dead_code,
+        unreachable_code
+    )
+)]
 // Shapes this code takes on purpose, so the lint gate can deny everything else: kernel
 // launchers and forwards take every dimension as an argument, hot loops index several
 // arrays by one position, enums carry a resident tensor beside a small variant, a

@@ -16,6 +16,7 @@ pub mod ezaudio;
 /// What every flow-matching sampler does to its time axis.
 pub mod flow_match;
 pub mod flux;
+#[cfg(feature = "image")]
 pub mod flux2;
 pub mod gptoss;
 pub mod kyutai;

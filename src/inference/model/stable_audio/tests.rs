@@ -460,6 +460,7 @@ fn render_long_clip_no_oom() {
 /// almost all remaining VRAM on its device and render a clip whose decode
 /// transients exceed what is left. The op-level nets must degrade
 /// (reclaim/retry, then CPU bounce) instead of failing the render.
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore]
 fn render_under_vram_pressure_no_oom() {

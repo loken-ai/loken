@@ -898,6 +898,7 @@ mod tests {
     /// ASR engines and not the TTS one, so `keep_alive:0` against a resident parler-tts
     /// answered `done_reason:"unload"` and freed nothing - 4.5 GB that pushed the next
     /// image render's DiT onto the slower card, for a 1.7x loss nothing reported.
+    #[cfg(feature = "audio")]
     #[test]
     fn a_resident_tts_checkpoint_is_named_by_the_ids_a_client_has_for_it() {
         assert!(ResidentEngine::ALL.contains(&ResidentEngine::Tts));
@@ -965,7 +966,12 @@ mod tests {
         // The engines on the walk. A reclaimer the VRAM manager knows by some other route
         // is deliberately absent: this walk is what a named unload iterates, and it cannot
         // name an engine it does not know exists.
-        for name in ["llm", "image", "tts", "stable-audio"] {
+        let mut expected = vec!["llm"];
+        #[cfg(feature = "image")]
+        expected.push("image");
+        #[cfg(feature = "audio")]
+        expected.extend(["tts", "stable-audio"]);
+        for name in expected {
             assert!(
                 seen.contains(name),
                 "the pressure protocol addresses '{name}', which is not on the walk"

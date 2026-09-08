@@ -840,6 +840,7 @@ impl GenericTransformerLayer {
                 // this whole Q8/fused decode region only activates with a Q8 KV
                 // cache, which is CUDA-only, so it's unreachable under --features cpu.
                 #[cfg(not(feature = "cuda"))]
+                #[allow(clippy::diverging_sub_expression)]
                 let (q_h, k_h, v_h): (Tensor, Tensor, Tensor) =
                     unreachable!("fused F-dtype decode (attn_post_qkv_decode) is CUDA-only");
                 #[cfg(feature = "cuda")]

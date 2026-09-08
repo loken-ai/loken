@@ -51,8 +51,6 @@ pub(crate) fn gpu_sample(
     recent_tokens: &[u32],
     repeat_penalty: f32,
     repeat_last_n: usize,
-    _temperature: f32,
-    _top_k: usize,
     logits_processor: &mut crate::inference::sample::token_sampling::LogitsProcessor,
 ) -> crate::tensor::Result<u32> {
     // A bias or a log-probability request is served on the host, where the sampler

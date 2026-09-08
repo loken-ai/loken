@@ -87,10 +87,13 @@ pub fn pad_to(x: usize, q: usize) -> usize {
     x.div_ceil(q) * q
 }
 
+#[cfg(feature = "cuda")]
 pub use cuda_storage::QCudaStorage;
 pub use dtype::GgmlDType;
 pub use host::QHostTensor;
-pub use kernel_matmul::{kernel_known_answer_test, QKernelMatMul};
+#[cfg(feature = "cuda")]
+pub use kernel_matmul::kernel_known_answer_test;
+pub use kernel_matmul::QKernelMatMul;
 pub use matmul::QMatMul;
 #[cfg(feature = "cuda")]
 pub use mmq::release_mmq_workspaces;
