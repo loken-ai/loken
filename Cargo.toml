@@ -187,3 +187,9 @@ path = "src/bin/lokend.rs"
 name = "loken"
 path = "src/bin/loken.rs"
 
+# What a runner builds the tests with: no optimisation and line tables only, since the suite
+# runs in seconds and the compile is what a run waits on.
+[profile.ci]
+inherits = "dev"
+opt-level = 0
+debug = "line-tables-only"

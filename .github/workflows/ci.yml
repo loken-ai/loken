@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # The native test suite runs weekly; a push runs it on the portable binary only.
+    - cron: "0 6 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,9 +38,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --no-default-features --features cpu --all-targets -- -D warnings
 
-      # Tests that need a card say so and pass, so this covers everything else.
+      # Tests that need a card say so and pass, so this covers everything else. The `ci`
+      # profile trades run time for compile time: the suite runs in seconds either way.
       - name: Tests
-        run: cargo test --no-default-features --features cpu
+        run: cargo test --profile ci --no-default-features --features cpu
 
       # A link to a type that has been renamed is a broken link, and nobody notices
       # until someone reads the documentation.
@@ -59,7 +63,8 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --no-default-features --features cpu --all-targets -- -D warnings
-      - run: cargo test --no-default-features --features cpu
+      - if: github.event_name == 'schedule'
+        run: cargo test --profile ci --no-default-features --features cpu
 
   features:
     name: ${{ matrix.features }}
