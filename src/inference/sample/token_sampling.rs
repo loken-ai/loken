@@ -166,7 +166,10 @@ impl LogitsProcessor {
             };
             self.last_logprobs = Some(SampledLogprobs {
                 token,
-                logprob: v.get(token as usize).map(|l| l - lse).unwrap_or(f32::NEG_INFINITY),
+                logprob: v
+                    .get(token as usize)
+                    .map(|l| l - lse)
+                    .unwrap_or(f32::NEG_INFINITY),
                 top,
             });
         }

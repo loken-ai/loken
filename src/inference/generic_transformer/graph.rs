@@ -1571,7 +1571,10 @@ impl GenericHeteroTransformer {
             budget_bytes
         } else {
             let (layers, n_kv, hd) = self.kv_layout();
-            let window_bytes = (layers * 2 * n_kv * hd
+            let window_bytes = (layers
+                * 2
+                * n_kv
+                * hd
                 * crate::inference::cache::KV_WORKING_WINDOW_TOKENS
                 * crate::tensor::DType::F16.size_in_bytes()) as u64;
             match self.free_device_memory() {
@@ -1592,7 +1595,9 @@ impl GenericHeteroTransformer {
             self.kv_snapshots.swap_remove(i);
         }
         if held > budget {
-            tracing::debug!("kv snapshot dropped: {held} bytes exceed the {budget} byte budget alone");
+            tracing::debug!(
+                "kv snapshot dropped: {held} bytes exceed the {budget} byte budget alone"
+            );
             self.kv_snapshots.clear();
         }
     }
@@ -1624,7 +1629,10 @@ impl GenericHeteroTransformer {
 
     /// Makes snapshot `index` the resident KV; returns its tokens and KV length. The
     /// captured decode graph is dropped, as after any change of resident sequence.
-    pub fn restore_kv_snapshot(&mut self, index: usize) -> crate::tensor::Result<(Vec<u32>, usize)> {
+    pub fn restore_kv_snapshot(
+        &mut self,
+        index: usize,
+    ) -> crate::tensor::Result<(Vec<u32>, usize)> {
         let Self {
             layers,
             kv_snapshots,
@@ -1656,7 +1664,9 @@ impl GenericHeteroTransformer {
 
     /// Tokens and KV length of snapshot `index`.
     pub fn kv_snapshot_ref(&self, index: usize) -> Option<(&[u32], usize)> {
-        self.kv_snapshots.get(index).map(|s| (s.tokens.as_slice(), s.kv_len))
+        self.kv_snapshots
+            .get(index)
+            .map(|s| (s.tokens.as_slice(), s.kv_len))
     }
 
     /// Every layer's rows for tokens `[from, to)` of snapshot `index`, host f32, or
@@ -1666,7 +1676,10 @@ impl GenericHeteroTransformer {
     /// cache accepts.
     pub fn kv_snapshot_dtype(&self, index: usize) -> Option<u8> {
         let snap = self.kv_snapshots.get(index)?;
-        let dt = snap.layers.iter().find_map(|l| l.spec.as_ref().map(|s| s.dtype()))?;
+        let dt = snap
+            .layers
+            .iter()
+            .find_map(|l| l.spec.as_ref().map(|s| s.dtype()))?;
         Some(match dt {
             crate::tensor::DType::F16 => 0,
             crate::tensor::DType::F32 => 1,
@@ -2205,7 +2218,11 @@ impl GenericHeteroTransformer {
 /// Which snapshot a new one replaces: the one whose tokens it extends or shortens (the
 /// same conversation, one turn on), else, at capacity, the least recently used; `None`
 /// appends.
-pub(crate) fn snapshot_slot(existing: &[(&[u32], u64)], tokens: &[u32], cap: usize) -> Option<usize> {
+pub(crate) fn snapshot_slot(
+    existing: &[(&[u32], u64)],
+    tokens: &[u32],
+    cap: usize,
+) -> Option<usize> {
     if let Some((i, _)) = existing
         .iter()
         .enumerate()
@@ -2261,23 +2278,43 @@ fn quantised_layer_snapshot(
     {
         if let Some(q) = l.q8_kv_cache.as_ref() {
             if q.current_seq_len() > 0 {
-                let (k, v) = q.dequantize_kv(crate::tensor::DType::F16).map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+                let (k, v) = q
+                    .dequantize_kv(crate::tensor::DType::F16)
+                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
                 let spec = crate::inference::serve::spec_kv_cache::SpecKvSnapshot::from_kv_tensors(
-                    k, v, q.current_seq_len(),
+                    k,
+                    v,
+                    q.current_seq_len(),
                 );
-                return Ok(Some(super::LayerKvSnapshot { spec: Some(spec), cpu_f16: None }));
+                return Ok(Some(super::LayerKvSnapshot {
+                    spec: Some(spec),
+                    cpu_f16: None,
+                }));
             }
-            return Ok(Some(super::LayerKvSnapshot { spec: None, cpu_f16: None }));
+            return Ok(Some(super::LayerKvSnapshot {
+                spec: None,
+                cpu_f16: None,
+            }));
         }
         if let Some(q) = l.q4_kv_cache.as_ref() {
             if q.current_seq_len() > 0 {
-                let (k, v) = q.dequantize_kv(crate::tensor::DType::F16).map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+                let (k, v) = q
+                    .dequantize_kv(crate::tensor::DType::F16)
+                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
                 let spec = crate::inference::serve::spec_kv_cache::SpecKvSnapshot::from_kv_tensors(
-                    k, v, q.current_seq_len(),
+                    k,
+                    v,
+                    q.current_seq_len(),
                 );
-                return Ok(Some(super::LayerKvSnapshot { spec: Some(spec), cpu_f16: None }));
+                return Ok(Some(super::LayerKvSnapshot {
+                    spec: Some(spec),
+                    cpu_f16: None,
+                }));
             }
-            return Ok(Some(super::LayerKvSnapshot { spec: None, cpu_f16: None }));
+            return Ok(Some(super::LayerKvSnapshot {
+                spec: None,
+                cpu_f16: None,
+            }));
         }
     }
     let _ = l;
@@ -2296,7 +2333,8 @@ fn restore_quantised_layer(
             q.reset();
             if let Some(spec) = &s.spec {
                 let (k, v) = spec.kv();
-                q.append(k, v).map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+                q.append(k, v)
+                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
             }
             return Ok(true);
         }
@@ -2304,7 +2342,8 @@ fn restore_quantised_layer(
             q.reset();
             if let Some(spec) = &s.spec {
                 let (k, v) = spec.kv();
-                q.append(k, v).map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+                q.append(k, v)
+                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
             }
             return Ok(true);
         }

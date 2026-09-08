@@ -265,7 +265,9 @@ impl LlmEngine {
                             let cut = stop_suffix.len() - max_stop_len * 2;
                             stop_suffix = stop_suffix[cut..].to_string();
                         }
-                        if let Some(hit) = stop_seqs.iter().find(|s| stop_suffix.ends_with(s.as_str())) {
+                        if let Some(hit) =
+                            stop_seqs.iter().find(|s| stop_suffix.ends_with(s.as_str()))
+                        {
                             stop_hit = Some(hit.clone());
                             let _ = tx.send(Ok(dec)).await;
                             break 'outer;
@@ -333,8 +335,9 @@ impl LlmEngine {
                         let cut = stop_suffix.len() - max_stop_len * 2;
                         stop_suffix = stop_suffix[cut..].to_string();
                     }
-                    if let Some(hit) = stop_seqs.iter().find(|s| stop_suffix.ends_with(s.as_str())) {
-                            stop_hit = Some(hit.clone());
+                    if let Some(hit) = stop_seqs.iter().find(|s| stop_suffix.ends_with(s.as_str()))
+                    {
+                        stop_hit = Some(hit.clone());
                         let _ = tx.send(Ok(dec)).await;
                         break 'outer;
                     }

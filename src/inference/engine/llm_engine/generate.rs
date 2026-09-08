@@ -4,8 +4,8 @@
 //! same impl - only the file changed. Methods that were private are `pub(super)`
 //! here, which is the reach they had when they sat beside their callers.
 
-use super::*;
 use super::params::{FinishReason, TokenLogprob};
+use super::*;
 use crate::inference::engine::decode_step::record_logprobs;
 
 impl LlmEngine {

@@ -388,7 +388,10 @@ impl APIServer {
         let (current, had_keep_alive) = {
             let engines = self.engines.read().await;
             match engines.iter().find(|e| e.model_id == model_id) {
-                Some(entry) => (entry.engine.config().context_length, entry.keep_alive_minutes),
+                Some(entry) => (
+                    entry.engine.config().context_length,
+                    entry.keep_alive_minutes,
+                ),
                 None => return Ok(()),
             }
         };

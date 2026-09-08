@@ -420,10 +420,7 @@ impl OllamaManager {
     /// Where the manifest of `name:tag` lives: `library/<name>/<tag>` for a bare name,
     /// the name's own path for `namespace/name`.
     pub fn manifest_path(&self, name: &str, tag: &str) -> PathBuf {
-        let mut path = self
-            .models_dir
-            .join("manifests")
-            .join("registry.ollama.ai");
+        let mut path = self.models_dir.join("manifests").join("registry.ollama.ai");
         if name.contains('/') {
             for part in name.split('/') {
                 path = path.join(part);
@@ -453,7 +450,12 @@ impl OllamaManager {
     }
 
     /// Writes a manifest for `name:tag` from its JSON.
-    pub fn write_manifest(&self, name: &str, tag: &str, manifest: &serde_json::Value) -> Result<()> {
+    pub fn write_manifest(
+        &self,
+        name: &str,
+        tag: &str,
+        manifest: &serde_json::Value,
+    ) -> Result<()> {
         let path = self.manifest_path(name, tag);
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;

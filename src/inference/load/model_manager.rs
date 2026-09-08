@@ -497,7 +497,6 @@ impl ModelManager {
 pub use crate::inference::load::huggingface_manager::HuggingFaceModelMetadata;
 pub use crate::inference::load::ollama_manager::OllamaModelMetadata;
 
-
 /// `name:tag`, `latest` when no tag is given.
 fn split_name_tag(model_id: &str) -> (&str, &str) {
     match model_id.rsplit_once(':') {

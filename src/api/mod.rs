@@ -28,8 +28,8 @@ pub mod image_paths {
 }
 mod anthropic;
 mod client;
-mod tool_calls;
 pub(crate) mod thinking;
+mod tool_calls;
 
 // Production features. Internal to the crate - none of these
 // types are surfaced through loken::api re-exports today, so the

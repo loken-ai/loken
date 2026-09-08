@@ -299,7 +299,9 @@ fn render_tool_result(format: ToolFormat, content: &str) -> String {
         ToolFormat::Mistral => format!("[TOOL_RESULTS] {content} [/TOOL_RESULTS]"),
         ToolFormat::Llama3 => content.to_string(),
         ToolFormat::Harmony => {
-            format!("<|start|>functions to=assistant<|channel|>commentary<|message|>{content}<|end|>")
+            format!(
+                "<|start|>functions to=assistant<|channel|>commentary<|message|>{content}<|end|>"
+            )
         }
         ToolFormat::DeepSeek => format!("<｜tool▁output▁begin｜>{content}<｜tool▁output▁end｜>"),
     }
@@ -524,7 +526,10 @@ fn parse_deepseek(raw: &str) -> ToolParseResult {
     if !raw.contains(DS_CALL_BEGIN) {
         return scan_bare_json_calls(raw);
     }
-    let start = raw.find(DS_CALLS_BEGIN).or_else(|| raw.find(DS_CALL_BEGIN)).unwrap_or(0);
+    let start = raw
+        .find(DS_CALLS_BEGIN)
+        .or_else(|| raw.find(DS_CALL_BEGIN))
+        .unwrap_or(0);
     let mut content = raw[..start].to_string();
     let after_all = raw
         .find(DS_CALLS_END)
@@ -1215,6 +1220,9 @@ mod tests {
         assert_eq!(r.calls.len(), 1);
         assert_eq!(r.calls[0].function.as_ref().unwrap().name, "get_weather");
         assert_eq!(r.content, "Let me check.");
-        assert_eq!(detect_tool_format(None, "deepseek-r1:70b"), ToolFormat::DeepSeek);
+        assert_eq!(
+            detect_tool_format(None, "deepseek-r1:70b"),
+            ToolFormat::DeepSeek
+        );
     }
 }

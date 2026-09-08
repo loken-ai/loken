@@ -445,7 +445,10 @@ pub(crate) async fn ollama_chat(
         .and_then(|o| o.get("num_ctx"))
         .and_then(serde_json::Value::as_u64)
     {
-        if let Err(e) = state.ensure_engine_context(&model_name, want as usize).await {
+        if let Err(e) = state
+            .ensure_engine_context(&model_name, want as usize)
+            .await
+        {
             return Err(ApiError::Internal(format!(
                 "num_ctx reload for '{model_name}': {e}"
             )));
@@ -567,13 +570,12 @@ pub(crate) async fn ollama_chat(
     let mut prompt = if tools_active {
         let tools = request.tools.as_ref().unwrap();
         // Ollama has no tool_choice field -> no forcing directive.
-        let flattened =
-            crate::api::tool_calls::flatten_messages(
-                &eff_messages,
-                tool_format,
-                tools,
-                tool_directive.as_deref(),
-            );
+        let flattened = crate::api::tool_calls::flatten_messages(
+            &eff_messages,
+            tool_format,
+            tools,
+            tool_directive.as_deref(),
+        );
         if template_takes_tools(chat_template.as_deref()) {
             format_chat_prompt_with_tools(&eff_messages, chat_template.as_deref(), tools)
         } else {
@@ -863,7 +865,11 @@ pub(crate) async fn ollama_chat(
         let energy = crate::energy_report::begin();
 
         let _cancel = engine.cancel_guard();
-        match engine.generate(&prompt, params).await.map_err(|e| e.to_string()) {
+        match engine
+            .generate(&prompt, params)
+            .await
+            .map_err(|e| e.to_string())
+        {
             Ok(result) => {
                 crate::energy_report::end(energy, "text", "[/api/chat]");
                 let total_duration = start.elapsed().as_nanos() as u64;
@@ -873,8 +879,7 @@ pub(crate) async fn ollama_chat(
                 // message.tool_calls). Plain answers pass through.
                 let (chat_thinking, chat_body) = crate::api::thinking::split_thinking(&result.text);
                 let (msg, tool_called) = if tools_active {
-                    let parsed =
-                        crate::api::tool_calls::parse_tool_calls(tool_format, &chat_body);
+                    let parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &chat_body);
                     if parsed.calls.is_empty() {
                         (
                             Message::new("assistant".to_string(), chat_body.clone()),
@@ -1053,7 +1058,8 @@ pub(crate) async fn ollama_generate(
                     .as_ref()
                     .and_then(|o| o.get("num_predict"))
                     .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(state.default_inference_config.max_tokens as u64) as u32,
+                    .unwrap_or(state.default_inference_config.max_tokens as u64)
+                    as u32,
             };
             let now = crate::distributed::cluster_runtime::now_ms(state.cluster_started());
             // This node has to sit in its own routing table, described exactly as peers
@@ -1205,7 +1211,10 @@ pub(crate) async fn ollama_generate(
         .and_then(|o| o.get("num_ctx"))
         .and_then(serde_json::Value::as_u64)
     {
-        if let Err(e) = state.ensure_engine_context(&model_name, want as usize).await {
+        if let Err(e) = state
+            .ensure_engine_context(&model_name, want as usize)
+            .await
+        {
             return Err(ApiError::Internal(format!(
                 "num_ctx reload for '{model_name}': {e}"
             )));
@@ -1736,7 +1745,11 @@ pub(crate) async fn ollama_generate(
         let energy = crate::energy_report::begin();
 
         let _cancel = engine.cancel_guard();
-        match engine.generate(&effective_prompt, params).await.map_err(|e| e.to_string()) {
+        match engine
+            .generate(&effective_prompt, params)
+            .await
+            .map_err(|e| e.to_string())
+        {
             Ok(result) => {
                 crate::energy_report::end(energy, "text", "[/api/generate]");
                 let total_duration = start.elapsed().as_nanos() as u64;
@@ -1746,8 +1759,13 @@ pub(crate) async fn ollama_generate(
                 if !result.logprobs.is_empty() {
                     response.logprobs = Some(ollama_logprobs(&result.logprobs));
                 }
-                response.thinking_duration =
-                    thinking_share_ns(&engine, thinking.as_deref(), result.eval_count, result.eval_duration).await;
+                response.thinking_duration = thinking_share_ns(
+                    &engine,
+                    thinking.as_deref(),
+                    result.eval_count,
+                    result.eval_duration,
+                )
+                .await;
                 response.thinking = thinking;
                 let done_reason = result.finish_reason.ollama();
                 response.done_reason = Some(done_reason.to_string());

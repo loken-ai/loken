@@ -47,7 +47,8 @@ pub(crate) fn store_file(
     let dir = files_dir(state);
     std::fs::create_dir_all(&dir).map_err(|e| ApiError::Internal(format!("files: {e}")))?;
     let id = new_id("file");
-    std::fs::write(blob_path(&dir, &id), bytes).map_err(|e| ApiError::Internal(format!("files: {e}")))?;
+    std::fs::write(blob_path(&dir, &id), bytes)
+        .map_err(|e| ApiError::Internal(format!("files: {e}")))?;
     let record = json!({
         "id": id,
         "object": "file",
@@ -149,14 +150,26 @@ pub(crate) async fn files_content(
         .ok_or_else(|| ApiError::NotFound(format!("file '{id}' has no content")))?;
     // The upload named the file; a header must not carry quotes, separators or control
     // characters from it, so the name is reduced to a safe charset before it is echoed.
-    let raw = record.get("filename").and_then(Value::as_str).unwrap_or("file");
+    let raw = record
+        .get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or("file");
     let safe: String = raw
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         .take(128)
         .collect();
-    let name = if safe.is_empty() { "file" } else { safe.as_str() };
-    let mime = match name.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
+    let name = if safe.is_empty() {
+        "file"
+    } else {
+        safe.as_str()
+    };
+    let mime = match name
+        .rsplit('.')
+        .next()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("webp") => "image/webp",
@@ -170,7 +183,10 @@ pub(crate) async fn files_content(
     };
     Ok(Response::builder()
         .header("content-type", mime)
-        .header("content-disposition", format!("attachment; filename=\"{name}\""))
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{name}\""),
+        )
         .body(axum::body::Body::from(bytes))
         .unwrap())
 }
@@ -209,7 +225,8 @@ fn evict_finished_batches() {
             let done = matches!(
                 b.object.get("status").and_then(Value::as_str),
                 Some("completed") | Some("cancelled") | Some("failed")
-            ) || b.object.get("processing_status").and_then(Value::as_str) == Some("ended");
+            ) || b.object.get("processing_status").and_then(Value::as_str)
+                == Some("ended");
             // OpenAI batches stamp an epoch, Messages batches an RFC 3339 string.
             let created = match b.object.get("created_at") {
                 Some(Value::Number(n)) => n.as_i64().unwrap_or(i64::MAX),
@@ -250,12 +267,16 @@ async fn run_batch_line(state: APIServer, url: &str, body: Value) -> (u16, Value
         "/v1/completions" => text_completions(State(state), Json(body)).await,
         "/v1/responses" => openai_responses(State(state), OpenAIJson(body)).await,
         "/v1/embeddings" => Ok(openai_embeddings(State(state), Json(body)).await),
-        other => Err(ApiError::Validation(format!("batch endpoint '{other}' is not served"))),
+        other => Err(ApiError::Validation(format!(
+            "batch endpoint '{other}' is not served"
+        ))),
     };
     match resp {
         Ok(r) => {
             let status = r.status().as_u16();
-            let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap_or_default();
+            let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
             let body = serde_json::from_slice::<Value>(&bytes)
                 .unwrap_or_else(|_| json!(String::from_utf8_lossy(&bytes)));
             (status, body)
@@ -263,8 +284,13 @@ async fn run_batch_line(state: APIServer, url: &str, body: Value) -> (u16, Value
         Err(e) => {
             let r = e.into_response();
             let status = r.status().as_u16();
-            let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap_or_default();
-            (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+            let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
         }
     }
 }
@@ -289,7 +315,10 @@ pub(crate) async fn batches_create(
     let lines: Vec<Value> = String::from_utf8_lossy(&input)
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str::<Value>(l).unwrap_or_else(|e| json!({"parse_error": e.to_string()})))
+        .map(|l| {
+            serde_json::from_str::<Value>(l)
+                .unwrap_or_else(|e| json!({"parse_error": e.to_string()}))
+        })
         .collect();
     if lines.len() > BATCH_MAX_REQUESTS {
         return Err(ApiError::Validation(format!(
@@ -316,7 +345,13 @@ pub(crate) async fn batches_create(
     });
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let Ok(mut g) = batches().lock() {
-        g.insert(id.clone(), Batch { object: object.clone(), cancel: cancel.clone() });
+        g.insert(
+            id.clone(),
+            Batch {
+                object: object.clone(),
+                cancel: cancel.clone(),
+            },
+        );
     }
     let runner_state = state.clone();
     let runner_id = id.clone();
@@ -358,18 +393,36 @@ pub(crate) async fn batches_create(
                 o["request_counts"]["failed"] = json!(failed);
             });
         }
-        let output = store_file(&runner_state, "batch_output.jsonl", "batch_output", out.as_bytes()).ok();
+        let output = store_file(
+            &runner_state,
+            "batch_output.jsonl",
+            "batch_output",
+            out.as_bytes(),
+        )
+        .ok();
         let errors = if errs.is_empty() {
             None
         } else {
-            store_file(&runner_state, "batch_errors.jsonl", "batch_output", errs.as_bytes()).ok()
+            store_file(
+                &runner_state,
+                "batch_errors.jsonl",
+                "batch_output",
+                errs.as_bytes(),
+            )
+            .ok()
         };
         let cancelled = cancel.load(std::sync::atomic::Ordering::Relaxed);
         batch_update(&runner_id, |o| {
             o["status"] = json!(if cancelled { "cancelled" } else { "completed" });
             o["completed_at"] = json!(now());
-            o["output_file_id"] = output.as_ref().and_then(|f| f.get("id").cloned()).unwrap_or(Value::Null);
-            o["error_file_id"] = errors.as_ref().and_then(|f| f.get("id").cloned()).unwrap_or(Value::Null);
+            o["output_file_id"] = output
+                .as_ref()
+                .and_then(|f| f.get("id").cloned())
+                .unwrap_or(Value::Null);
+            o["error_file_id"] = errors
+                .as_ref()
+                .and_then(|f| f.get("id").cloned())
+                .unwrap_or(Value::Null);
         });
     });
     Ok(Json(object))
@@ -402,7 +455,9 @@ pub(crate) async fn batches_cancel(
             o["status"] = json!("cancelling");
         }
     });
-    Ok(Json(batch_get(&id).map(|b| b.object).unwrap_or(Value::Null)))
+    Ok(Json(
+        batch_get(&id).map(|b| b.object).unwrap_or(Value::Null),
+    ))
 }
 
 // ------------------------------------------------- Anthropic message batches
@@ -438,7 +493,13 @@ pub(crate) async fn anthropic_batches_create(
     });
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let Ok(mut g) = batches().lock() {
-        g.insert(id.clone(), Batch { object: object.clone(), cancel: cancel.clone() });
+        g.insert(
+            id.clone(),
+            Batch {
+                object: object.clone(),
+                cancel: cancel.clone(),
+            },
+        );
     }
     let runner_state = state.clone();
     let runner_id = id.clone();
@@ -450,16 +511,27 @@ pub(crate) async fn anthropic_batches_create(
             let custom_id = r.get("custom_id").cloned().unwrap_or(Value::Null);
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 canceled += 1;
-                out.push_str(&json!({"custom_id": custom_id, "result": {"type": "canceled"}}).to_string());
+                out.push_str(
+                    &json!({"custom_id": custom_id, "result": {"type": "canceled"}}).to_string(),
+                );
                 out.push('\n');
                 continue;
             }
             let params = r.get("params").cloned().unwrap_or(Value::Null);
-            let result = match serde_json::from_value::<crate::api::anthropic::AnthropicMessagesRequest>(params) {
+            let result = match serde_json::from_value::<
+                crate::api::anthropic::AnthropicMessagesRequest,
+            >(params)
+            {
                 Ok(req) => {
-                    let resp = super::super::anthropic_api::anthropic_messages(State(runner_state.clone()), AnthropicJson(req)).await;
+                    let resp = super::super::anthropic_api::anthropic_messages(
+                        State(runner_state.clone()),
+                        AnthropicJson(req),
+                    )
+                    .await;
                     let status = resp.status().as_u16();
-                    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap_or_default();
+                    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                        .await
+                        .unwrap_or_default();
                     let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
                     if (200..300).contains(&status) {
                         succeeded += 1;
@@ -480,7 +552,13 @@ pub(crate) async fn anthropic_batches_create(
                 o["request_counts"] = json!({"processing": total - succeeded - errored - canceled, "succeeded": succeeded, "errored": errored, "canceled": canceled, "expired": 0});
             });
         }
-        let results = store_file(&runner_state, "batch_results.jsonl", "batch_output", out.as_bytes()).ok();
+        let results = store_file(
+            &runner_state,
+            "batch_results.jsonl",
+            "batch_output",
+            out.as_bytes(),
+        )
+        .ok();
         batch_update(&runner_id, |o| {
             o["processing_status"] = json!("ended");
             o["ended_at"] = json!(chrono::Utc::now().to_rfc3339());
@@ -509,9 +587,16 @@ pub(crate) async fn anthropic_batches_get(
 pub(crate) async fn anthropic_batches_list() -> Json<Value> {
     let data: Vec<Value> = batches()
         .lock()
-        .map(|g| g.values().filter(|b| b.object["type"] == "message_batch").map(|b| b.object.clone()).collect())
+        .map(|g| {
+            g.values()
+                .filter(|b| b.object["type"] == "message_batch")
+                .map(|b| b.object.clone())
+                .collect()
+        })
         .unwrap_or_default();
-    Json(json!({"data": data, "has_more": false, "first_id": data.first().and_then(|v| v.get("id").cloned()), "last_id": data.last().and_then(|v| v.get("id").cloned())}))
+    Json(
+        json!({"data": data, "has_more": false, "first_id": data.first().and_then(|v| v.get("id").cloned()), "last_id": data.last().and_then(|v| v.get("id").cloned())}),
+    )
 }
 
 pub(crate) async fn anthropic_batches_cancel(
@@ -596,7 +681,9 @@ pub(crate) fn images_as_urls(
                 .filter(|h| {
                     !h.is_empty()
                         && h.len() <= 255
-                        && h.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+                        && h.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')
+                        })
                 })
                 .map(|h| format!("http://{h}"))
         })
@@ -618,10 +705,17 @@ pub(crate) fn images_as_urls(
             _ => "png",
         };
         let record = store_file(state, &format!("image.{ext}"), "generated", &bytes)?;
-        let id = record.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let id = record
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if let Some(obj) = entry.as_object_mut() {
             obj.remove("b64_json");
-            obj.insert("url".to_string(), json!(format!("{base}/v1/files/{id}/content")));
+            obj.insert(
+                "url".to_string(),
+                json!(format!("{base}/v1/files/{id}/content")),
+            );
         }
         out.push(entry);
     }

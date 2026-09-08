@@ -1315,7 +1315,12 @@ pub(crate) async fn images_generations(
         );
     }
 
-    let data = match super::super::openai::images_as_urls(&state, &headers, req.response_format.as_deref().unwrap_or("url") == "url", data) {
+    let data = match super::super::openai::images_as_urls(
+        &state,
+        &headers,
+        req.response_format.as_deref().unwrap_or("url") == "url",
+        data,
+    ) {
         Ok(d) => d,
         Err(e) => return e.into_response(),
     };

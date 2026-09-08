@@ -348,7 +348,13 @@ pub(crate) trait ModelBackend: Send {
     /// Snapshots of the resident KV (`GenericHeteroTransformer::snapshot_kv`): copy the
     /// resident sequence aside, find the snapshot sharing the most of a prompt, make one
     /// resident again. Defaults: none kept, none found.
-    fn snapshot_kv(&mut self, _tokens: Vec<u32>, _kv_len: usize, _cap: usize, _budget_bytes: u64) -> crate::tensor::Result<()> {
+    fn snapshot_kv(
+        &mut self,
+        _tokens: Vec<u32>,
+        _kv_len: usize,
+        _cap: usize,
+        _budget_bytes: u64,
+    ) -> crate::tensor::Result<()> {
         Ok(())
     }
     fn kv_snapshot_uniform_len(&self, _index: usize) -> Option<usize> {
@@ -944,7 +950,13 @@ impl ModelBackend for GenericBackend {
         true
     }
 
-    fn snapshot_kv(&mut self, tokens: Vec<u32>, kv_len: usize, cap: usize, budget_bytes: u64) -> crate::tensor::Result<()> {
+    fn snapshot_kv(
+        &mut self,
+        tokens: Vec<u32>,
+        kv_len: usize,
+        cap: usize,
+        budget_bytes: u64,
+    ) -> crate::tensor::Result<()> {
         self.0.snapshot_kv(tokens, kv_len, cap, budget_bytes)
     }
     fn best_kv_snapshot(&self, prompt: &[u32]) -> Option<(usize, usize)> {
@@ -982,7 +994,8 @@ impl ModelBackend for GenericBackend {
         cap: usize,
         dtype_code: u8,
     ) -> crate::tensor::Result<()> {
-        self.0.import_kv_snapshot(tokens, kv_len, rows, cap, dtype_code)
+        self.0
+            .import_kv_snapshot(tokens, kv_len, rows, cap, dtype_code)
     }
     fn kv_snapshot_dtype(&self, index: usize) -> Option<u8> {
         self.0.kv_snapshot_dtype(index)

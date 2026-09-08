@@ -302,8 +302,16 @@ fn render_jinja_template(
                 let calls: Vec<serde_json::Value> = calls
                     .iter()
                     .map(|c| {
-                        let name = c.function.as_ref().map(|f| f.name.clone()).unwrap_or_default();
-                        let raw = c.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
+                        let name = c
+                            .function
+                            .as_ref()
+                            .map(|f| f.name.clone())
+                            .unwrap_or_default();
+                        let raw = c
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.arguments.clone())
+                            .unwrap_or_default();
                         let arguments = serde_json::from_str::<serde_json::Value>(&raw)
                             .unwrap_or(serde_json::Value::String(raw));
                         serde_json::json!({
@@ -773,12 +781,27 @@ mod tests {
         let mut env = minijinja::Environment::new();
         env.set_unknown_method_callback(super::python_string_methods);
         let render = |src: &str| env.render_str(src, minijinja::context! {}).unwrap();
-        assert_eq!(render("{{ '<tool_response>x'.startswith('<tool_response>') }}"), "True");
+        assert_eq!(
+            render("{{ '<tool_response>x'.startswith('<tool_response>') }}"),
+            "True"
+        );
         assert_eq!(render("{{ 'a</think>b'.split('</think>') | last }}"), "b");
-        assert_eq!(render("{{ 'a</think>b</think>c'.split('</think>', 1) | length }}"), "2");
-        assert_eq!(render("{{ ' x \n'.rstrip() }}|{{ 'xxy'.lstrip('x') }}"), " x|y");
-        assert_eq!(render("{{ 'A b'.lower() }} {{ 'a-b'.replace('-', '+') }}"), "a b a+b");
-        assert_eq!(render("{{ ', '.join(['a', 'b']) }} {{ 'abc'.find('c') }}"), "a, b 2");
+        assert_eq!(
+            render("{{ 'a</think>b</think>c'.split('</think>', 1) | length }}"),
+            "2"
+        );
+        assert_eq!(
+            render("{{ ' x \n'.rstrip() }}|{{ 'xxy'.lstrip('x') }}"),
+            " x|y"
+        );
+        assert_eq!(
+            render("{{ 'A b'.lower() }} {{ 'a-b'.replace('-', '+') }}"),
+            "a b a+b"
+        );
+        assert_eq!(
+            render("{{ ', '.join(['a', 'b']) }} {{ 'abc'.find('c') }}"),
+            "a, b 2"
+        );
         assert!(env
             .render_str("{{ 'x'.casefold() }}", minijinja::context! {})
             .is_err());
@@ -1110,7 +1133,8 @@ mod go_template_tests {
 
     #[test]
     fn harmony_effort_is_written_into_the_system_turn() {
-        let mut p = "<|start|>system<|message|>You are ChatGPT.\nReasoning: medium\n<|end|>".to_string();
+        let mut p =
+            "<|start|>system<|message|>You are ChatGPT.\nReasoning: medium\n<|end|>".to_string();
         apply_thinking_preference(&mut p, Some("high"));
         assert!(p.contains("Reasoning: high"));
         assert!(!p.contains("Reasoning: medium"));

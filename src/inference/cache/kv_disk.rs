@@ -113,7 +113,10 @@ impl KvDiskStore {
             {
                 Ok(m) => index.push(m),
                 Err(e) => {
-                    tracing::warn!("kv disk: manifest {} unreadable ({e}); removed", path.display());
+                    tracing::warn!(
+                        "kv disk: manifest {} unreadable ({e}); removed",
+                        path.display()
+                    );
                     let _ = std::fs::remove_file(&path);
                 }
             }
@@ -132,7 +135,9 @@ impl KvDiskStore {
     }
 
     fn block_path(&self, hash: u64) -> PathBuf {
-        self.dir.join("blocks").join(format!("{hash:016x}.safetensors"))
+        self.dir
+            .join("blocks")
+            .join(format!("{hash:016x}.safetensors"))
     }
 
     fn manifest_path(&self, m: &Manifest) -> PathBuf {
@@ -165,7 +170,11 @@ impl KvDiskStore {
     /// The tokens a manifest covers, to seed the resident entry on a restore.
     /// The KV dtype code recorded for a manifest.
     pub fn manifest_kv_dtype(&self, index: usize) -> u8 {
-        self.index.lock().ok().and_then(|g| g.get(index).map(|m| m.kv_dtype)).unwrap_or(0)
+        self.index
+            .lock()
+            .ok()
+            .and_then(|g| g.get(index).map(|m| m.kv_dtype))
+            .unwrap_or(0)
     }
 
     /// The block-aligned prefix a persist of `kv_len` tokens would cover.
@@ -176,23 +185,42 @@ impl KvDiskStore {
     /// The blocks of a prefix not yet on disk, as `(index, from, to)` spans, so a caller
     /// can copy only those out before writing. A chain shares its head with any earlier
     /// persist of the same conversation, which is why most turns leave one block to do.
-    pub fn missing_blocks(&self, model: &str, layout: u64, tokens: &[u32], covered: usize) -> Vec<(usize, usize, usize)> {
-        block_chain(model, layout, &tokens[..covered.min(tokens.len())], self.block_tokens)
-            .iter()
-            .enumerate()
-            .filter(|(_, h)| std::fs::metadata(self.block_path(**h)).is_err())
-            .map(|(b, _)| (b, b * self.block_tokens, (b + 1) * self.block_tokens))
-            .collect()
+    pub fn missing_blocks(
+        &self,
+        model: &str,
+        layout: u64,
+        tokens: &[u32],
+        covered: usize,
+    ) -> Vec<(usize, usize, usize)> {
+        block_chain(
+            model,
+            layout,
+            &tokens[..covered.min(tokens.len())],
+            self.block_tokens,
+        )
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| std::fs::metadata(self.block_path(**h)).is_err())
+        .map(|(b, _)| (b, b * self.block_tokens, (b + 1) * self.block_tokens))
+        .collect()
     }
 
     /// The token prefix length a manifest covers.
     pub fn manifest_covered(&self, index: usize) -> usize {
-        self.index.lock().ok().and_then(|g| g.get(index).map(|m| m.covered)).unwrap_or(0)
+        self.index
+            .lock()
+            .ok()
+            .and_then(|g| g.get(index).map(|m| m.covered))
+            .unwrap_or(0)
     }
 
     /// Whether a manifest carries a windowed-layer side blob (reusable only whole).
     pub fn manifest_windowed(&self, index: usize) -> bool {
-        self.index.lock().ok().and_then(|g| g.get(index).map(|m| m.window_blob.is_some())).unwrap_or(false)
+        self.index
+            .lock()
+            .ok()
+            .and_then(|g| g.get(index).map(|m| m.window_blob.is_some()))
+            .unwrap_or(false)
     }
 
     pub fn manifest_tokens(&self, index: usize) -> Option<(Vec<u32>, usize)> {
@@ -215,7 +243,10 @@ impl KvDiskStore {
         window: &[LayerRows],
         mut rows: impl FnMut(usize, usize) -> Result<Vec<LayerRows>>,
     ) -> Result<()> {
-        let _serial = self.persist_lock.lock().map_err(|_| anyhow!("kv disk persist lock poisoned"))?;
+        let _serial = self
+            .persist_lock
+            .lock()
+            .map_err(|_| anyhow!("kv disk persist lock poisoned"))?;
         let covered = kv_len.min(tokens.len()) / self.block_tokens * self.block_tokens;
         if covered == 0 {
             return Ok(());
@@ -234,10 +265,13 @@ impl KvDiskStore {
         }
         // Windowed layers, if any, go in a per-manifest side blob keyed off the prefix.
         let window_blob = if window.iter().any(Option::is_some) {
-            let wh = fnv1a(layout ^ 0x77, &tokens[..covered.min(tokens.len())]
-                .iter()
-                .flat_map(|t| t.to_le_bytes())
-                .collect::<Vec<u8>>());
+            let wh = fnv1a(
+                layout ^ 0x77,
+                &tokens[..covered.min(tokens.len())]
+                    .iter()
+                    .flat_map(|t| t.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            );
             let path = self.block_path(wh);
             if std::fs::metadata(&path).is_err() {
                 bytes += self.write_block(&path, window, kv_dtype)?;
@@ -261,7 +295,10 @@ impl KvDiskStore {
         let json = serde_json::to_vec(&manifest)?;
         std::fs::write(&path, json).with_context(|| path.display().to_string())?;
         {
-            let mut g = self.index.lock().map_err(|_| anyhow!("kv disk index poisoned"))?;
+            let mut g = self
+                .index
+                .lock()
+                .map_err(|_| anyhow!("kv disk index poisoned"))?;
             // A manifest whose blocks this one extends is the same conversation, one turn on.
             g.retain(|m| {
                 !(m.model == manifest.model
@@ -292,7 +329,10 @@ impl KvDiskStore {
     /// is removed with its manifests, so the next attempt prefills.
     pub fn load(&self, index: usize, blocks: usize, n_layers: usize) -> Result<Vec<LayerRows>> {
         let chain: Vec<u64> = {
-            let g = self.index.lock().map_err(|_| anyhow!("kv disk index poisoned"))?;
+            let g = self
+                .index
+                .lock()
+                .map_err(|_| anyhow!("kv disk index poisoned"))?;
             g.get(index)
                 .ok_or_else(|| anyhow!("kv disk: manifest {index} gone"))?
                 .blocks
@@ -302,7 +342,10 @@ impl KvDiskStore {
                 .collect()
         };
         let window_blob = {
-            let g = self.index.lock().map_err(|_| anyhow!("kv disk index poisoned"))?;
+            let g = self
+                .index
+                .lock()
+                .map_err(|_| anyhow!("kv disk index poisoned"))?;
             g.get(index).and_then(|m| m.window_blob)
         };
         let mut out: Vec<LayerRows> = (0..n_layers).map(|_| None).collect();
@@ -311,7 +354,10 @@ impl KvDiskStore {
             match self.read_block(&path, &mut out, n_layers) {
                 Ok(()) => {}
                 Err(e) => {
-                    tracing::warn!("kv disk: block {} unreadable ({e}); dropped", path.display());
+                    tracing::warn!(
+                        "kv disk: block {} unreadable ({e}); dropped",
+                        path.display()
+                    );
                     self.forget_block(*hash);
                     return Err(e);
                 }
@@ -330,7 +376,8 @@ impl KvDiskStore {
         let map = unsafe { memmap2::Mmap::map(&file)? };
         let st = safetensors::SafeTensors::deserialize(&map).map_err(|e| anyhow!("{e}"))?;
         for (l, slot) in out.iter_mut().enumerate().take(n_layers) {
-            let (Ok(k), Ok(v)) = (st.tensor(&format!("k.{l}")), st.tensor(&format!("v.{l}"))) else {
+            let (Ok(k), Ok(v)) = (st.tensor(&format!("k.{l}")), st.tensor(&format!("v.{l}")))
+            else {
                 continue;
             };
             let (kf, vf) = (block_rows(&k), block_rows(&v));
@@ -348,7 +395,8 @@ impl KvDiskStore {
     fn forget_block(&self, hash: u64) {
         let _ = std::fs::remove_file(self.block_path(hash));
         if let Ok(mut g) = self.index.lock() {
-            let (gone, kept): (Vec<_>, Vec<_>) = g.drain(..).partition(|m| m.blocks.contains(&hash));
+            let (gone, kept): (Vec<_>, Vec<_>) =
+                g.drain(..).partition(|m| m.blocks.contains(&hash));
             *g = kept;
             for m in gone {
                 let _ = std::fs::remove_file(self.manifest_path(&m));
@@ -359,7 +407,10 @@ impl KvDiskStore {
     /// Drops the least recently used manifests until the store fits its budget, then
     /// every block no manifest names.
     fn collect_garbage(&self) -> Result<()> {
-        let mut g = self.index.lock().map_err(|_| anyhow!("kv disk index poisoned"))?;
+        let mut g = self
+            .index
+            .lock()
+            .map_err(|_| anyhow!("kv disk index poisoned"))?;
         if self.budget > 0 {
             g.sort_by_key(|m| std::cmp::Reverse(m.last_used));
             let mut named: HashSet<u64> = HashSet::new();
@@ -369,7 +420,9 @@ impl KvDiskStore {
                 let mut fresh = 0u64;
                 for h in m.blocks.iter().chain(m.window_blob.iter()) {
                     if named.insert(*h) {
-                        fresh += std::fs::metadata(self.block_path(*h)).map(|x| x.len()).unwrap_or(0);
+                        fresh += std::fs::metadata(self.block_path(*h))
+                            .map(|x| x.len())
+                            .unwrap_or(0);
                     }
                 }
                 if total + fresh > self.budget && !keep.is_empty() {
@@ -405,7 +458,14 @@ impl KvDiskStore {
         let named: HashMap<u64, u64> = g
             .iter()
             .flat_map(|m| m.blocks.iter().copied())
-            .map(|h| (h, std::fs::metadata(self.block_path(h)).map(|x| x.len()).unwrap_or(0)))
+            .map(|h| {
+                (
+                    h,
+                    std::fs::metadata(self.block_path(h))
+                        .map(|x| x.len())
+                        .unwrap_or(0),
+                )
+            })
             .collect();
         (g.len(), named.values().sum())
     }
@@ -436,7 +496,8 @@ mod tests {
         let tokens: Vec<u32> = (0..10).collect();
         let n_kv = 1;
         let hd = 32;
-        let row = |t: usize| -> Vec<f32> { (0..n_kv * hd).map(|i| (t * 100 + i) as f32 / 7.0).collect() };
+        let row =
+            |t: usize| -> Vec<f32> { (0..n_kv * hd).map(|i| (t * 100 + i) as f32 / 7.0).collect() };
         store
             .persist("m", 1, &tokens, tokens.len(), 1, &[], |from, to| {
                 let mut k = Vec::new();
@@ -457,7 +518,11 @@ mod tests {
         let (k, _v) = rows[0].as_ref().unwrap();
         assert_eq!(k.len(), 8 * n_kv * hd);
         let want = row(5);
-        assert_eq!(&k[5 * hd..6 * hd], &want[..], "rows must come back bit-exact");
+        assert_eq!(
+            &k[5 * hd..6 * hd],
+            &want[..],
+            "rows must come back bit-exact"
+        );
         assert!(store.best("m", 2, &prompt).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -473,7 +538,9 @@ mod tests {
         let k: Vec<f32> = (0..4 * hd).map(|i| (i as f32) * 0.31830988 - 3.7).collect();
         let v: Vec<f32> = (0..4 * hd).map(|i| 1.0 / (i as f32 + 2.0)).collect();
         let path = store.block_path(42);
-        store.write_block(&path, &[Some((k.clone(), v.clone()))], 1).unwrap();
+        store
+            .write_block(&path, &[Some((k.clone(), v.clone()))], 1)
+            .unwrap();
         let mut out: Vec<LayerRows> = vec![None];
         store.read_block(&path, &mut out, 1).unwrap();
         let (rk, rv) = out[0].as_ref().unwrap();
@@ -485,10 +552,16 @@ mod tests {
             .map(|i| half::f16::from_f32(i as f32 * 0.5 - 8.0).to_f32())
             .collect();
         let p16 = store.block_path(43);
-        store.write_block(&p16, &[Some((kf16.clone(), kf16.clone()))], 0).unwrap();
+        store
+            .write_block(&p16, &[Some((kf16.clone(), kf16.clone()))], 0)
+            .unwrap();
         let mut o16: Vec<LayerRows> = vec![None];
         store.read_block(&p16, &mut o16, 1).unwrap();
-        assert_eq!(&o16[0].as_ref().unwrap().0, &kf16, "F16 not exact for representable values");
+        assert_eq!(
+            &o16[0].as_ref().unwrap().0,
+            &kf16,
+            "F16 not exact for representable values"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

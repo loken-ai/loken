@@ -28,7 +28,6 @@ pub(crate) async fn anthropic_messages(
     use crate::api::anthropic;
     use axum::http::StatusCode;
 
-
     if let Err(e) = validate_model_id(&req.model) {
         return anthropic_error_response(
             StatusCode::BAD_REQUEST,
@@ -220,8 +219,7 @@ pub(crate) async fn anthropic_messages(
             Ok(result) => {
                 let (thinking, answer) = crate::api::thinking::split_thinking(&result.text);
                 let (text, calls) = if tools_active {
-                    let mut parsed =
-                        crate::api::tool_calls::parse_tool_calls(tool_format, &answer);
+                    let mut parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &answer);
                     if single_tool_call {
                         parsed.calls.truncate(1);
                     }
@@ -538,8 +536,12 @@ pub(crate) async fn list_models_by_dialect(
             }));
         }
     }
-    let first = data.first().and_then(|m| m["id"].as_str().map(str::to_string));
-    let last = data.last().and_then(|m| m["id"].as_str().map(str::to_string));
+    let first = data
+        .first()
+        .and_then(|m| m["id"].as_str().map(str::to_string));
+    let last = data
+        .last()
+        .and_then(|m| m["id"].as_str().map(str::to_string));
     Json(serde_json::json!({
         "data": data,
         "has_more": false,

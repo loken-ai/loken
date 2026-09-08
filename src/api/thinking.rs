@@ -46,7 +46,11 @@ impl ThinkSplit {
             // The tags that may come next: a close of the open family while inside,
             // either open otherwise. The earliest one in the buffer wins.
             let candidates: &[&str] = if self.inside {
-                if self.harmony { &[CLOSE_HARMONY] } else { &[CLOSE] }
+                if self.harmony {
+                    &[CLOSE_HARMONY]
+                } else {
+                    &[CLOSE]
+                }
             } else {
                 &[OPEN, OPEN_HARMONY]
             };
@@ -181,8 +185,20 @@ mod tests {
         segs.extend(s.push("ysis<|message|>think<|en"));
         segs.extend(s.push("d|><|start|>assistant<|channel|>final<|message|>answer"));
         segs.extend(s.finish());
-        let thinking: String = segs.iter().filter_map(|x| match x { Segment::Thinking(t) => Some(t.as_str()), _ => None }).collect();
-        let content: String = segs.iter().filter_map(|x| match x { Segment::Content(t) => Some(t.as_str()), _ => None }).collect();
+        let thinking: String = segs
+            .iter()
+            .filter_map(|x| match x {
+                Segment::Thinking(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let content: String = segs
+            .iter()
+            .filter_map(|x| match x {
+                Segment::Content(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(thinking, "think");
         assert_eq!(content, "answer");
     }
@@ -194,7 +210,10 @@ mod tests {
             (Some("plan".to_string()), "answer".to_string())
         );
         assert_eq!(split_thinking("just text"), (None, "just text".to_string()));
-        assert_eq!(split_thinking("<think>\n\n</think>\n\nhi"), (None, "hi".to_string()));
+        assert_eq!(
+            split_thinking("<think>\n\n</think>\n\nhi"),
+            (None, "hi".to_string())
+        );
     }
 
     #[test]

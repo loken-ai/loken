@@ -4,8 +4,8 @@
 //! same impl - only the file changed. Methods that were private are `pub(super)`
 //! here, which is the reach they had when they sat beside their callers.
 
-use super::*;
 use super::params::{FinishReason, TokenLogprob};
+use super::*;
 use crate::inference::engine::decode_step::record_logprobs;
 
 impl LlmEngine {
@@ -2069,7 +2069,8 @@ impl LlmEngine {
                 *slot = Some(StreamStats {
                     eval_count: token_count as u64,
                     eval_duration_ns: compute_ns,
-                    prompt_eval_count: prompt_tokens.len().saturating_sub(reused_prompt_tokens) as u64,
+                    prompt_eval_count: prompt_tokens.len().saturating_sub(reused_prompt_tokens)
+                        as u64,
                     prompt_eval_duration_ns,
                     total_duration_ns,
                     cached_prompt_tokens: reused_prompt_tokens as u64,
@@ -2148,7 +2149,12 @@ impl LlmEngine {
                     if kv_snapshots > 0 && image_hash.is_none() {
                         let mut g = model_state.blocking_lock();
                         if let Some(s) = g.as_mut() {
-                            match s.model.snapshot_kv(full.clone(), pos, kv_snapshots, kv_snapshot_budget) {
+                            match s.model.snapshot_kv(
+                                full.clone(),
+                                pos,
+                                kv_snapshots,
+                                kv_snapshot_budget,
+                            ) {
                                 Err(e) => tracing::warn!("kv snapshot skipped: {e}"),
                                 Ok(()) => {
                                     if let Some(store) = kv_disk.clone() {

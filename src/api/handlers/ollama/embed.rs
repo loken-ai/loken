@@ -479,14 +479,20 @@ pub(crate) async fn ollama_create_model(
     }
     let model_name = normalize_model_id(&request.name);
     info!("Create model request: {}", model_name);
-    if request.quantize.as_deref().is_some_and(|q| !q.trim().is_empty()) {
+    if request
+        .quantize
+        .as_deref()
+        .is_some_and(|q| !q.trim().is_empty())
+    {
         return Err(ApiError::Validation(
-            "`quantize` is not done here: pull the tag that carries the quantisation you want".into(),
+            "`quantize` is not done here: pull the tag that carries the quantisation you want"
+                .into(),
         ));
     }
     if request.adapters.as_ref().is_some_and(|a| !a.is_empty()) {
         return Err(ApiError::Validation(
-            "`adapters` are not built into a model here; load a LoRA through the adapters API".into(),
+            "`adapters` are not built into a model here; load a LoRA through the adapters API"
+                .into(),
         ));
     }
     // A model built from uploaded blobs: a manifest naming the weights, and the
@@ -500,14 +506,18 @@ pub(crate) async fn ollama_create_model(
         let mut layers: Vec<serde_json::Value> = Vec::new();
         let mut weights: Option<std::path::PathBuf> = None;
         for (file, digest) in files {
-            let hex = digest
-                .strip_prefix("sha256:")
-                .ok_or_else(|| ApiError::Validation(format!("`files.{file}`: digest must be sha256:<hex>")))?;
+            let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
+                ApiError::Validation(format!("`files.{file}`: digest must be sha256:<hex>"))
+            })?;
             let path = store.blobs_dir().join(format!("sha256-{hex}"));
             let size = std::fs::metadata(&path)
-                .map_err(|_| ApiError::NotFound(format!("`files.{file}`: blob {digest} is not uploaded")))?
+                .map_err(|_| {
+                    ApiError::NotFound(format!("`files.{file}`: blob {digest} is not uploaded"))
+                })?
                 .len();
-            let kind = if file.to_ascii_lowercase().contains("mmproj") || file.to_ascii_lowercase().contains("projector") {
+            let kind = if file.to_ascii_lowercase().contains("mmproj")
+                || file.to_ascii_lowercase().contains("projector")
+            {
                 "projector"
             } else {
                 "model"
@@ -521,7 +531,8 @@ pub(crate) async fn ollama_create_model(
                 "size": size,
             }));
         }
-        let weights = weights.ok_or_else(|| ApiError::Validation("`files` names no model weights".into()))?;
+        let weights =
+            weights.ok_or_else(|| ApiError::Validation("`files` names no model weights".into()))?;
         let mut text_layer = |kind: &str, content: Option<&str>| -> Result<(), ApiError> {
             if let Some(c) = content.filter(|c| !c.is_empty()) {
                 let (digest, size) = store
@@ -569,7 +580,11 @@ pub(crate) async fn ollama_create_model(
         store
             .write_manifest(&name, &tag, &manifest)
             .map_err(|e| ApiError::Internal(format!("manifest: {e}")))?;
-        return Ok(create_status_response(request.stream, &model_name, &["writing manifest"]));
+        return Ok(create_status_response(
+            request.stream,
+            &model_name,
+            &["writing manifest"],
+        ));
     }
 
     // If 'from' is specified, copy the base model first
@@ -635,7 +650,11 @@ pub(crate) async fn ollama_create_model(
         }
     }
 
-    let steps = if base_model.is_some() { &["using existing layer", "writing manifest"][..] } else { &["writing manifest"][..] };
+    let steps = if base_model.is_some() {
+        &["using existing layer", "writing manifest"][..]
+    } else {
+        &["writing manifest"][..]
+    };
     Ok(create_status_response(request.stream, &model_name, steps))
 }
 
@@ -647,7 +666,9 @@ fn create_status_response(stream: bool, model_name: &str, steps: &[&str]) -> Res
         return Json(serde_json::json!({ "status": "success" })).into_response();
     }
     let mut body = String::new();
-    body.push_str(&serde_json::json!({ "status": format!("creating model '{model_name}'") }).to_string());
+    body.push_str(
+        &serde_json::json!({ "status": format!("creating model '{model_name}'") }).to_string(),
+    );
     body.push('\n');
     for step in steps {
         body.push_str(&serde_json::json!({ "status": step }).to_string());

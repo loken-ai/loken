@@ -859,7 +859,12 @@ pub(crate) async fn images_edits(
         );
     }
 
-    let data = match super::super::openai::images_as_urls(&state, &headers, response_format == "url", data) {
+    let data = match super::super::openai::images_as_urls(
+        &state,
+        &headers,
+        response_format == "url",
+        data,
+    ) {
         Ok(d) => d,
         Err(e) => return e.into_response(),
     };
@@ -1203,7 +1208,12 @@ pub(crate) async fn images_variations(
         );
     }
 
-    let data = match super::super::openai::images_as_urls(&state, &headers, response_format == "url", data) {
+    let data = match super::super::openai::images_as_urls(
+        &state,
+        &headers,
+        response_format == "url",
+        data,
+    ) {
         Ok(d) => d,
         Err(e) => return e.into_response(),
     };

@@ -112,7 +112,10 @@ impl StopTracker {
             let trim_at = self.buf.len() - self.max_len * 2;
             self.buf.drain(..trim_at);
         }
-        match stop_sequences.iter().find(|s| self.buf.ends_with(s.as_str())) {
+        match stop_sequences
+            .iter()
+            .find(|s| self.buf.ends_with(s.as_str()))
+        {
             Some(s) => {
                 self.hit = Some(s.clone());
                 true
@@ -338,6 +341,10 @@ pub(crate) fn record_logprobs(
         token: lp.token,
         text: piece(lp.token),
         logprob: lp.logprob,
-        top: lp.top.into_iter().map(|(id, l)| (id, piece(id), l)).collect(),
+        top: lp
+            .top
+            .into_iter()
+            .map(|(id, l)| (id, piece(id), l))
+            .collect(),
     });
 }

@@ -102,7 +102,10 @@ fn lower_input(req: &Value) -> Result<Vec<Value>, String> {
         Some(Value::String(s)) => messages.push(json!({"role": "user", "content": s})),
         Some(Value::Array(items)) => {
             for item in items {
-                let kind = item.get("type").and_then(Value::as_str).unwrap_or("message");
+                let kind = item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message");
                 match kind {
                     "message" => {
                         let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -126,7 +129,9 @@ fn lower_input(req: &Value) -> Result<Vec<Value>, String> {
                             .map(|calls| calls.push(call.clone()))
                             .is_some();
                         if !merged {
-                            messages.push(json!({"role": "assistant", "content": "", "tool_calls": [call]}));
+                            messages.push(
+                                json!({"role": "assistant", "content": "", "tool_calls": [call]}),
+                            );
                         }
                     }
                     "function_call_output" => {
@@ -252,8 +257,14 @@ fn output_items(message: &Value) -> Vec<Value> {
 }
 
 fn usage_object(usage: Option<&Value>) -> Value {
-    let input = usage.and_then(|u| u.get("prompt_tokens")).and_then(Value::as_i64).unwrap_or(0);
-    let output = usage.and_then(|u| u.get("completion_tokens")).and_then(Value::as_i64).unwrap_or(0);
+    let input = usage
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output = usage
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     json!({
         "input_tokens": input,
         "input_tokens_details": {"cached_tokens": 0},
@@ -351,9 +362,15 @@ pub(crate) async fn openai_responses(
             .map_err(|e| ApiError::Internal(format!("responses: {e}")))?;
         let completion: Value = serde_json::from_slice(&bytes)
             .map_err(|e| ApiError::Internal(format!("responses: {e}")))?;
-        let choice = completion.pointer("/choices/0").cloned().unwrap_or(Value::Null);
+        let choice = completion
+            .pointer("/choices/0")
+            .cloned()
+            .unwrap_or(Value::Null);
         let message = choice.get("message").cloned().unwrap_or(Value::Null);
-        let finish = choice.get("finish_reason").and_then(Value::as_str).unwrap_or("stop");
+        let finish = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("stop");
         let (status, incomplete) = if finish == "length" {
             ("incomplete", Some("max_output_tokens"))
         } else {
@@ -558,7 +575,10 @@ mod tests {
     #[test]
     fn flat_tools_nest_and_unknown_kinds_are_refused() {
         let ok = json!({"tools": [{"type": "function", "name": "f", "parameters": {}}]});
-        assert_eq!(lower_tools(&ok).unwrap().unwrap()[0]["function"]["name"], "f");
+        assert_eq!(
+            lower_tools(&ok).unwrap().unwrap()[0]["function"]["name"],
+            "f"
+        );
         let no = json!({"tools": [{"type": "web_search"}]});
         assert!(lower_tools(&no).is_err());
     }

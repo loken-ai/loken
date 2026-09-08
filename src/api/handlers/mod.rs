@@ -571,7 +571,8 @@ impl APIServer {
         // The template first: the session holds the tokens the generation path prefilled, and
         // that path templates the prompt unless the caller asked for raw. Comparing against the
         // bare text diverges at token zero and answers zero forever.
-        let templated = super::handlers::ollama::templated_prompt(self, model, prompt, None, None).await;
+        let templated =
+            super::handlers::ollama::templated_prompt(self, model, prompt, None, None).await;
         let engines = self.engines.read().await;
         let entry = engines.iter().find(|e| e.model_id == model)?;
         entry.engine.cached_prompt_tokens(model, &templated).await
@@ -1272,7 +1273,10 @@ impl APIServer {
             .route("/api/draft/status", axum::routing::get(draft_status))
             .route("/api/copy", axum::routing::post(ollama_copy_model))
             .route("/api/embed", axum::routing::post(ollama_embed))
-            .route("/api/embeddings", axum::routing::post(ollama_embeddings_legacy))
+            .route(
+                "/api/embeddings",
+                axum::routing::post(ollama_embeddings_legacy),
+            )
             // OpenAI-shaped embeddings - same engine plumbing as
             // /api/embed, response reshaped to the `{object:"list",
             // data:[{embedding,index,object:"embedding"}],usage:{...}}`
@@ -1311,15 +1315,24 @@ impl APIServer {
             )
             .route("/v1/chat/completions", axum::routing::post(chat_completion))
             .route("/v1/responses", axum::routing::post(openai_responses))
-            .route("/v1/files", axum::routing::post(files_upload).get(files_list))
+            .route(
+                "/v1/files",
+                axum::routing::post(files_upload).get(files_list),
+            )
             .route(
                 "/v1/files/{id}",
                 axum::routing::get(files_get).delete(files_delete),
             )
             .route("/v1/files/{id}/content", axum::routing::get(files_content))
-            .route("/v1/batches", axum::routing::post(batches_create).get(batches_list))
+            .route(
+                "/v1/batches",
+                axum::routing::post(batches_create).get(batches_list),
+            )
             .route("/v1/batches/{id}", axum::routing::get(batches_get))
-            .route("/v1/batches/{id}/cancel", axum::routing::post(batches_cancel))
+            .route(
+                "/v1/batches/{id}/cancel",
+                axum::routing::post(batches_cancel),
+            )
             .route("/v1/moderations", axum::routing::post(moderations))
             .route(
                 "/v1/responses/{id}",
@@ -1338,7 +1351,10 @@ impl APIServer {
                 "/v1/messages/batches",
                 axum::routing::post(anthropic_batches_create).get(anthropic_batches_list),
             )
-            .route("/v1/messages/batches/{id}", axum::routing::get(anthropic_batches_get))
+            .route(
+                "/v1/messages/batches/{id}",
+                axum::routing::get(anthropic_batches_get),
+            )
             .route(
                 "/v1/messages/batches/{id}/cancel",
                 axum::routing::post(anthropic_batches_cancel),
@@ -1785,7 +1801,10 @@ where
     type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        lenient_json(req, state).await.map(Self).map_err(ApiError::Validation)
+        lenient_json(req, state)
+            .await
+            .map(Self)
+            .map_err(ApiError::Validation)
     }
 }
 
@@ -1836,7 +1855,11 @@ where
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         lenient_json(req, state).await.map(Self).map_err(|msg| {
-            (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg}))).into_response()
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": msg})),
+            )
+                .into_response()
         })
     }
 }
@@ -2136,7 +2159,8 @@ enum Dialect {
 
 impl Dialect {
     fn of(req: &axum::extract::Request) -> Self {
-        if req.uri().path().starts_with("/v1/messages") || req.headers().contains_key("anthropic-version")
+        if req.uri().path().starts_with("/v1/messages")
+            || req.headers().contains_key("anthropic-version")
         {
             Self::Anthropic
         } else {
@@ -2144,7 +2168,12 @@ impl Dialect {
         }
     }
 
-    fn error_body(self, anthropic_type: &str, openai_code: &str, message: &str) -> serde_json::Value {
+    fn error_body(
+        self,
+        anthropic_type: &str,
+        openai_code: &str,
+        message: &str,
+    ) -> serde_json::Value {
         match self {
             Self::Anthropic => serde_json::json!({
                 "type": "error",

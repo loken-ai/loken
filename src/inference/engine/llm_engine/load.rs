@@ -745,20 +745,31 @@ pub(crate) fn kv_reuse_start(
             if let Some((mi, covered)) = store.best(model_name, layout, prompt_tokens) {
                 // A windowed manifest's side blob describes one exact prefix length; reuse
                 // it only when the whole prefix matches, never a shorter shared run.
-                let windowed_ok = !store.manifest_windowed(mi) || covered == store.manifest_covered(mi);
-                if windowed_ok && chunk_aligned_keep(covered, prompt_tokens.len(), chunk) > cur_keep {
+                let windowed_ok =
+                    !store.manifest_windowed(mi) || covered == store.manifest_covered(mi);
+                if windowed_ok && chunk_aligned_keep(covered, prompt_tokens.len(), chunk) > cur_keep
+                {
                     let blocks = covered / store.block_tokens();
                     let loaded = store
                         .load(mi, blocks, n_layers)
                         .map_err(|e| crate::tensor::Error::msg(e.to_string()))
                         .and_then(|rows| {
                             let dt = store.manifest_kv_dtype(mi);
-                            model.import_kv_snapshot(prompt_tokens[..covered].to_vec(), covered, rows, cap, dt)
+                            model.import_kv_snapshot(
+                                prompt_tokens[..covered].to_vec(),
+                                covered,
+                                rows,
+                                cap,
+                                dt,
+                            )
                         })
                         .and_then(|()| {
-                            let (index, _) = model
-                                .best_kv_snapshot(prompt_tokens)
-                                .ok_or_else(|| crate::tensor::Error::msg("kv disk: imported snapshot not found".to_string()))?;
+                            let (index, _) =
+                                model.best_kv_snapshot(prompt_tokens).ok_or_else(|| {
+                                    crate::tensor::Error::msg(
+                                        "kv disk: imported snapshot not found".to_string(),
+                                    )
+                                })?;
                             model.restore_kv_snapshot(index)
                         });
                     match loaded {
@@ -774,7 +785,9 @@ pub(crate) fn kv_reuse_start(
                                     kv_len,
                                 },
                             );
-                            tracing::info!("kv disk: {covered} tokens of the prompt restored from disk");
+                            tracing::info!(
+                                "kv disk: {covered} tokens of the prompt restored from disk"
+                            );
                             reuse = Some(covered);
                         }
                         Err(e) => tracing::warn!("kv disk restore failed: {e}; resident KV kept"),
@@ -838,7 +851,9 @@ pub(crate) fn kv_reuse_start(
 /// What identifies a KV layout on disk: the row geometry. Two builds of one model with
 /// the same geometry read each other's blocks; a different quantisation of the weights
 /// changes the values, not the layout, and the model name keeps those apart.
-pub(crate) fn kv_layout_id(model: &dyn crate::inference::engine::model_backend::ModelBackend) -> u64 {
+pub(crate) fn kv_layout_id(
+    model: &dyn crate::inference::engine::model_backend::ModelBackend,
+) -> u64 {
     match model.kv_layout() {
         Some((layers, n_kv, hd)) => ((layers as u64) << 40) | ((n_kv as u64) << 20) | hd as u64,
         None => 0,
@@ -886,7 +901,9 @@ fn persist_kv_snapshot(
         let g = model_state.blocking_lock();
         let Some(state) = g.as_ref() else { return };
         let model = state.model.as_ref();
-        let Some((index, kv_len)) = snapshot_index_for(model, tokens) else { return };
+        let Some((index, kv_len)) = snapshot_index_for(model, tokens) else {
+            return;
+        };
         let covered = store.covered_len(tokens.len(), kv_len);
         let layout = kv_layout_id(model);
         let window = match model.export_window_rows(index, covered) {
@@ -919,11 +936,19 @@ fn persist_kv_snapshot(
     };
     // Lock released: the writes.
     let mut staged = staged;
-    let result = store.persist(&model_name, layout, tokens, kv_len, kv_dtype, &window, |from, _to| {
-        staged
-            .remove(&(from / store.block_tokens()))
-            .ok_or_else(|| anyhow::anyhow!("kv disk: block at {from} was not staged"))
-    });
+    let result = store.persist(
+        &model_name,
+        layout,
+        tokens,
+        kv_len,
+        kv_dtype,
+        &window,
+        |from, _to| {
+            staged
+                .remove(&(from / store.block_tokens()))
+                .ok_or_else(|| anyhow::anyhow!("kv disk: block at {from} was not staged"))
+        },
+    );
     if let Err(e) = result {
         tracing::warn!("kv disk persist failed: {e}");
     }

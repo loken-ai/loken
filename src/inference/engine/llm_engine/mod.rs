@@ -695,7 +695,6 @@ impl LlmEngine {
         ))
     }
 
-
     /// The log-probabilities a stream has drawn since the last call.
     pub fn take_logprobs(&self) -> Vec<TokenLogprob> {
         self.logprob_queue
@@ -704,12 +703,12 @@ impl LlmEngine {
             .unwrap_or_default()
     }
 
-
     /// Arms cancellation for the request about to run: the guard lowers the flag now
     /// and raises it when dropped, which is what happens to a handler's future when
     /// its client disconnects. A whole-answer generation then stops at its next token.
     pub fn cancel_guard(&self) -> CancelGuard {
-        self.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         CancelGuard(self.cancel.clone())
     }
 
@@ -717,7 +716,6 @@ impl LlmEngine {
     pub fn cancelled(&self) -> bool {
         self.cancel.load(std::sync::atomic::Ordering::Relaxed)
     }
-
 
     /// Tokens the loaded model's tokenizer makes of `text`, `None` with no model loaded.
     pub async fn count_tokens(&self, text: &str) -> Option<usize> {
@@ -729,7 +727,6 @@ impl LlmEngine {
             .ok()
             .map(|e| e.get_ids().len())
     }
-
 
     /// Clear any stored image embeddings
     pub async fn clear_images(&self) {
@@ -1161,7 +1158,10 @@ fn open_kv_disk(
     ) {
         Ok(store) => {
             let (n, bytes) = store.stats();
-            tracing::info!("kv disk tier open at {dir}: {n} sequences, {} MiB", bytes >> 20);
+            tracing::info!(
+                "kv disk tier open at {dir}: {n} sequences, {} MiB",
+                bytes >> 20
+            );
             Some(Arc::new(store))
         }
         Err(e) => {

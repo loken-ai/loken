@@ -231,7 +231,11 @@ const GUARD_HAZARDS: [(&str, &str, &[&str]); 13] = [
     ("S6", "Specialized Advice", &[]),
     ("S7", "Privacy", &[]),
     ("S8", "Intellectual Property", &[]),
-    ("S9", "Indiscriminate Weapons", &["violence", "illicit/violent"]),
+    (
+        "S9",
+        "Indiscriminate Weapons",
+        &["violence", "illicit/violent"],
+    ),
     ("S10", "Hate", &["hate"]),
     ("S11", "Self-Harm", &["self-harm"]),
     ("S12", "Sexual Content", &["sexual"]),
@@ -277,15 +281,27 @@ fn parse_guard(answer: &str) -> (bool, Vec<String>) {
     (true, codes)
 }
 
-async fn judge_llama_guard(state: &APIServer, model: &str, text: &str) -> Result<Judgement, ApiError> {
+async fn judge_llama_guard(
+    state: &APIServer,
+    model: &str,
+    text: &str,
+) -> Result<Judgement, ApiError> {
     let (answer, top) = ask_raw(state, model, guard_prompt(text), 16).await?;
     let (flagged, codes) = parse_guard(&answer);
     let p_unsafe = if top.is_empty() {
-        if flagged { 1.0 } else { 0.0 }
+        if flagged {
+            1.0
+        } else {
+            0.0
+        }
     } else {
         first_token_probability(&top, "unsafe", "safe")
     };
-    let mut j = Judgement { flagged, unsafe_probability: p_unsafe, ..Default::default() };
+    let mut j = Judgement {
+        flagged,
+        unsafe_probability: p_unsafe,
+        ..Default::default()
+    };
     for code in &codes {
         if let Some((_, _, cats)) = GUARD_HAZARDS.iter().find(|(c, _, _)| c == code) {
             for c in cats.iter() {
@@ -313,7 +329,11 @@ fn shieldstral_prompt(query: &str, text: &str) -> String {
 
 /// One gate question over every category, then one question per category when the gate
 /// says yes: a safe input costs one pass instead of fourteen.
-async fn judge_shieldstral(state: &APIServer, model: &str, text: &str) -> Result<Judgement, ApiError> {
+async fn judge_shieldstral(
+    state: &APIServer,
+    model: &str,
+    text: &str,
+) -> Result<Judgement, ApiError> {
     let all: String = CATEGORY_DEFINITIONS
         .iter()
         .map(|(_, d)| format!("- {d}"))
@@ -322,14 +342,19 @@ async fn judge_shieldstral(state: &APIServer, model: &str, text: &str) -> Result
     let gate = format!("Does this content do any of the following?\n{all}");
     let (_, top) = ask_raw(state, model, shieldstral_prompt(&gate, text), 1).await?;
     let p_any = first_token_probability(&top, "yes", "no");
-    let mut j = Judgement { flagged: p_any >= FLAG_THRESHOLD, unsafe_probability: p_any, ..Default::default() };
+    let mut j = Judgement {
+        flagged: p_any >= FLAG_THRESHOLD,
+        unsafe_probability: p_any,
+        ..Default::default()
+    };
     if !j.flagged {
         return Ok(j);
     }
     for (cat, def) in CATEGORY_DEFINITIONS {
         let q = format!("Does this content {def}?");
         let (_, top) = ask_raw(state, model, shieldstral_prompt(&q, text), 1).await?;
-        j.scores.insert(cat, first_token_probability(&top, "yes", "no"));
+        j.scores
+            .insert(cat, first_token_probability(&top, "yes", "no"));
     }
     Ok(j)
 }
@@ -362,7 +387,11 @@ fn shieldgemma_principle(name: &str, text: &str) -> String {
     format!("* \"{name}\": {text}")
 }
 
-async fn judge_shieldgemma(state: &APIServer, model: &str, text: &str) -> Result<Judgement, ApiError> {
+async fn judge_shieldgemma(
+    state: &APIServer,
+    model: &str,
+    text: &str,
+) -> Result<Judgement, ApiError> {
     let all: String = SHIELDGEMMA_PRINCIPLES
         .iter()
         .map(|(n, t, _)| shieldgemma_principle(n, t))
@@ -370,12 +399,22 @@ async fn judge_shieldgemma(state: &APIServer, model: &str, text: &str) -> Result
         .join("\n");
     let (_, top) = ask_raw(state, model, shieldgemma_prompt(text, &all), 1).await?;
     let p_any = first_token_probability(&top, "yes", "no");
-    let mut j = Judgement { flagged: p_any >= FLAG_THRESHOLD, unsafe_probability: p_any, ..Default::default() };
+    let mut j = Judgement {
+        flagged: p_any >= FLAG_THRESHOLD,
+        unsafe_probability: p_any,
+        ..Default::default()
+    };
     if !j.flagged {
         return Ok(j);
     }
     for (name, principle, cats) in SHIELDGEMMA_PRINCIPLES {
-        let (_, top) = ask_raw(state, model, shieldgemma_prompt(text, &shieldgemma_principle(name, principle)), 1).await?;
+        let (_, top) = ask_raw(
+            state,
+            model,
+            shieldgemma_prompt(text, &shieldgemma_principle(name, principle)),
+            1,
+        )
+        .await?;
         let p = first_token_probability(&top, "yes", "no");
         if p >= FLAG_THRESHOLD {
             j.hazards.push(name.to_string());
@@ -414,7 +453,11 @@ fn granite_prompt(text: &str, definition: &str) -> String {
 async fn judge_granite(state: &APIServer, model: &str, text: &str) -> Result<Judgement, ApiError> {
     let (_, top) = ask_raw(state, model, granite_prompt(text, GRANITE_RISKS[0].1), 1).await?;
     let p_harm = first_token_probability(&top, "yes", "no");
-    let mut j = Judgement { flagged: p_harm >= FLAG_THRESHOLD, unsafe_probability: p_harm, ..Default::default() };
+    let mut j = Judgement {
+        flagged: p_harm >= FLAG_THRESHOLD,
+        unsafe_probability: p_harm,
+        ..Default::default()
+    };
     if !j.flagged {
         return Ok(j);
     }
@@ -454,10 +497,16 @@ fn safeguard_policy() -> String {
 /// The verdict is the last JSON object of the answer: a reasoning model may think aloud
 /// before it, and that thinking can itself quote an object.
 fn parse_violations(answer: &str) -> Vec<String> {
-    let Some(end) = answer.rfind('}') else { return Vec::new() };
+    let Some(end) = answer.rfind('}') else {
+        return Vec::new();
+    };
     let head = &answer[..=end];
-    let Some(start) = head.rfind('{') else { return Vec::new() };
-    let Ok(v) = serde_json::from_str::<Value>(&head[start..]) else { return Vec::new() };
+    let Some(start) = head.rfind('{') else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&head[start..]) else {
+        return Vec::new();
+    };
     v.get("violations")
         .and_then(Value::as_array)
         .map(|a| {
@@ -470,10 +519,18 @@ fn parse_violations(answer: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn judge_safeguard(state: &APIServer, model: &str, text: &str) -> Result<Judgement, ApiError> {
+async fn judge_safeguard(
+    state: &APIServer,
+    model: &str,
+    text: &str,
+) -> Result<Judgement, ApiError> {
     let (answer, _) = ask_chat(state, model, &safeguard_policy(), text, 256, Some("low")).await?;
     let hits = parse_violations(&answer);
-    let mut j = Judgement { flagged: !hits.is_empty(), unsafe_probability: if hits.is_empty() { 0.0 } else { 1.0 }, ..Default::default() };
+    let mut j = Judgement {
+        flagged: !hits.is_empty(),
+        unsafe_probability: if hits.is_empty() { 0.0 } else { 1.0 },
+        ..Default::default()
+    };
     for h in &hits {
         if let Some(c) = MODERATION_CATEGORIES.iter().find(|c| **c == h.as_str()) {
             j.scores.insert(c, 1.0);
@@ -502,8 +559,15 @@ pub(crate) async fn moderations(
     };
     let inputs: Vec<String> = match body.get("input") {
         Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
-        _ => return Err(ApiError::Validation("`input` must be a string or an array of strings".into())),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => {
+            return Err(ApiError::Validation(
+                "`input` must be a string or an array of strings".into(),
+            ))
+        }
     };
     let mut results = Vec::new();
     for text in inputs {
@@ -516,11 +580,21 @@ pub(crate) async fn moderations(
         };
         let categories: serde_json::Map<String, Value> = MODERATION_CATEGORIES
             .iter()
-            .map(|c| (c.to_string(), json!(j.scores.get(c).is_some_and(|p| *p >= FLAG_THRESHOLD))))
+            .map(|c| {
+                (
+                    c.to_string(),
+                    json!(j.scores.get(c).is_some_and(|p| *p >= FLAG_THRESHOLD)),
+                )
+            })
             .collect();
         let scores: serde_json::Map<String, Value> = MODERATION_CATEGORIES
             .iter()
-            .map(|c| (c.to_string(), json!(j.scores.get(c).copied().unwrap_or(0.0))))
+            .map(|c| {
+                (
+                    c.to_string(),
+                    json!(j.scores.get(c).copied().unwrap_or(0.0)),
+                )
+            })
             .collect();
         let flagged = j.flagged || categories.values().any(|v| v.as_bool().unwrap_or(false));
         results.push(json!({
@@ -543,7 +617,10 @@ pub(crate) async fn moderations(
 fn not_implemented(message: &str) -> Response {
     (
         StatusCode::NOT_IMPLEMENTED,
-        Json(openai_error_body(StatusCode::NOT_IMPLEMENTED, message.to_string())),
+        Json(openai_error_body(
+            StatusCode::NOT_IMPLEMENTED,
+            message.to_string(),
+        )),
     )
         .into_response()
 }
@@ -557,15 +634,24 @@ mod tests {
         assert_eq!(Family::of("llama-guard3:8b"), Some(Family::LlamaGuard));
         assert_eq!(Family::of("shieldstral-q4_k_m"), Some(Family::Shieldstral));
         assert_eq!(Family::of("shieldgemma:2b"), Some(Family::ShieldGemma));
-        assert_eq!(Family::of("granite3-guardian:2b"), Some(Family::GraniteGuardian));
-        assert_eq!(Family::of("gpt-oss-safeguard:20b"), Some(Family::GptOssSafeguard));
+        assert_eq!(
+            Family::of("granite3-guardian:2b"),
+            Some(Family::GraniteGuardian)
+        );
+        assert_eq!(
+            Family::of("gpt-oss-safeguard:20b"),
+            Some(Family::GptOssSafeguard)
+        );
         assert_eq!(Family::of("qwen3:8b"), None);
     }
 
     #[test]
     fn llama_guard_answers_are_read() {
         assert_eq!(parse_guard("safe"), (false, vec![]));
-        assert_eq!(parse_guard("unsafe\nS1,S10"), (true, vec!["S1".into(), "S10".into()]));
+        assert_eq!(
+            parse_guard("unsafe\nS1,S10"),
+            (true, vec!["S1".into(), "S10".into()])
+        );
         assert_eq!(parse_guard("unsafe\nS99, s2 "), (true, vec!["S2".into()]));
         for (_, _, cs) in GUARD_HAZARDS {
             for c in cs.iter() {
@@ -587,7 +673,10 @@ mod tests {
 
     #[test]
     fn safeguard_violations_are_read_from_json_only() {
-        assert_eq!(parse_violations("{\"violations\": [\"hate\", \"nonsense\"]}"), vec!["hate".to_string()]);
+        assert_eq!(
+            parse_violations("{\"violations\": [\"hate\", \"nonsense\"]}"),
+            vec!["hate".to_string()]
+        );
         assert!(parse_violations("I think this is fine.").is_empty());
         assert_eq!(
             parse_violations("Thus {\"violations\": [\"hate\"]}. Check again.assistantfinal {\"violations\": [\"violence\"]}"),

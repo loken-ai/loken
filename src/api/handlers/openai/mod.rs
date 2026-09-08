@@ -356,7 +356,11 @@ pub(crate) async fn chat_completion(
     let mut prompt = prompt;
     // `none` and `minimal` switch thinking off where a template allows it; the levels
     // reach a model that reads them (gpt-oss), and leave the others as they are.
-    if let Some(effort) = request.reasoning_effort.as_deref().map(str::to_ascii_lowercase) {
+    if let Some(effort) = request
+        .reasoning_effort
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+    {
         let pref = match effort.as_str() {
             "none" | "minimal" => "disabled",
             "low" | "medium" | "high" => effort.as_str(),
@@ -982,9 +986,14 @@ pub(crate) async fn text_completions(
     // response with their indexes; a stream carries one prompt.
     if let Some(arr) = body.get("prompt").and_then(serde_json::Value::as_array) {
         if arr.len() > 1 {
-            if body.get("stream").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+            if body
+                .get("stream")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
                 return Err(ApiError::Validation(
-                    "an array `prompt` is not supported with `stream`; send one prompt per stream".into(),
+                    "an array `prompt` is not supported with `stream`; send one prompt per stream"
+                        .into(),
                 ));
             }
             let mut merged: Option<serde_json::Value> = None;
@@ -1005,8 +1014,14 @@ pub(crate) async fn text_completions(
                     c["index"] = serde_json::json!(i);
                     choices.push(c);
                 }
-                prompt_tokens += v.pointer("/usage/prompt_tokens").and_then(serde_json::Value::as_i64).unwrap_or(0);
-                completion_tokens += v.pointer("/usage/completion_tokens").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                prompt_tokens += v
+                    .pointer("/usage/prompt_tokens")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                completion_tokens += v
+                    .pointer("/usage/completion_tokens")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
                 merged.get_or_insert(v);
             }
             let mut out = merged.unwrap_or_else(|| serde_json::json!({}));
@@ -2282,5 +2297,7 @@ pub(crate) async fn openai_delete_model(
         .delete_model(&name)
         .await
         .map_err(|e| ApiError::NotFound(format!("model '{model_id}': {e}")))?;
-    Ok(Json(serde_json::json!({"id": model_id, "object": "model", "deleted": true})))
+    Ok(Json(
+        serde_json::json!({"id": model_id, "object": "model", "deleted": true}),
+    ))
 }
