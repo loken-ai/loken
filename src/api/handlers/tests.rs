@@ -676,3 +676,31 @@ fn a_media_relay_passes_the_peer_answer_through() {
     assert!(super::VIDEO.closing.is_empty());
     assert!(!super::CONVERSATION.streams(&serde_json::json!({})));
 }
+
+#[test]
+fn a_repository_without_weights_is_not_advertised() {
+    use crate::inference::load::model_manager::ModelMetadata;
+    let entry = |source: &str, files: &[&str]| ModelMetadata {
+        id: "x".into(),
+        name: "x".into(),
+        size: 0,
+        downloaded_at: String::new(),
+        files: files.iter().map(|f| f.to_string()).collect(),
+        source: source.into(),
+        digest: String::new(),
+    };
+    assert!(!super::holds_weights(&entry(
+        "huggingface",
+        &["config.json", "README.md"]
+    )));
+    assert!(!super::holds_weights(&entry("huggingface", &[])));
+    assert!(super::holds_weights(&entry(
+        "huggingface",
+        &["config.json", "model-00001.safetensors"]
+    )));
+    assert!(super::holds_weights(&entry(
+        "huggingface",
+        &["/store/stable-audio/model.safetensors"]
+    )));
+    assert!(super::holds_weights(&entry("ollama", &[])));
+}

@@ -743,6 +743,21 @@ fn upload_body_limit() -> axum::extract::DefaultBodyLimit {
     axum::extract::DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)
 }
 
+/// The extensions a checkpoint's weights come in.
+const WEIGHT_EXTENSIONS: [&str; 6] = [".gguf", ".safetensors", ".bin", ".pt", ".pth", ".ckpt"];
+
+/// Whether a listed model has weights to load. A Hugging Face repository whose snapshot
+/// holds only its configuration is listed, and advertised to peers it was a model that
+/// answered every request with not found. Ollama entries are always whole: a manifest
+/// names blobs the pull verified.
+pub(crate) fn holds_weights(model: &crate::inference::load::model_manager::ModelMetadata) -> bool {
+    model.source != "huggingface"
+        || model.files.iter().any(|f| {
+            let lower = f.to_ascii_lowercase();
+            WEIGHT_EXTENSIONS.iter().any(|e| lower.ends_with(e))
+        })
+}
+
 impl APIServer {
     /// The cluster handle, if this node joined one.
     /// Read the catalogue once, before the node answers: every listing after this finds the
@@ -827,7 +842,19 @@ impl APIServer {
                 // every sound turn to a node that had no sound model either.
                 #[cfg(feature = "media")]
                 ollama::inject_local_boogu(self, &mut models);
-                models.into_iter().map(|m| m.id).collect()
+                let listed = models.len();
+                let list: Vec<String> = models
+                    .into_iter()
+                    .filter(holds_weights)
+                    .map(|m| m.id)
+                    .collect();
+                if list.len() < listed {
+                    tracing::debug!(
+                        "cluster: {} listed models have no weight file and are not advertised",
+                        listed - list.len()
+                    );
+                }
+                list
             }
             Err(e) => {
                 tracing::warn!("cluster: cannot list local models ({e}); publishing no catalogue");
