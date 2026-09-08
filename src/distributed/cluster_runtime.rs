@@ -224,9 +224,26 @@ pub async fn forward_generate(
     ),
     String,
 > {
+    forward_request(url, "/api/generate", body).await
+}
+
+/// Post a request body to `path` on a peer, marked as forwarded so the peer serves it
+/// rather than handing it on again.
+pub async fn forward_request(
+    url: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<
+    (
+        reqwest::StatusCode,
+        reqwest::header::HeaderMap,
+        reqwest::Response,
+    ),
+    String,
+> {
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{}/api/generate", url.trim_end_matches('/')))
+        .post(format!("{}{path}", url.trim_end_matches('/')))
         .header(FORWARDED_HEADER, "1")
         .json(body)
         .send()

@@ -283,14 +283,97 @@ pub struct APIServer {
 /// produces cannot contain it, because a quote inside a JSON string arrives escaped.
 const TERMINAL_MARKER: &[u8] = b"\"done\":true";
 
+/// How one surface's request travels to a peer: the route it is posted to, the bytes that
+/// mark a finished answer on that surface, and the chunk that ends a stream the peer
+/// never finished.
+pub(crate) struct Relay {
+    pub path: &'static str,
+    pub marker: &'static [u8],
+    pub closing: &'static str,
+}
+
+pub(crate) const OLLAMA_GENERATE: Relay = Relay {
+    path: "/api/generate",
+    marker: TERMINAL_MARKER,
+    closing: "{\"response\":\"\",\"done\":true,\"done_reason\":\"peer_failed\",\"error\":\"the node serving this request stopped before finishing it\"}\n",
+};
+pub(crate) const OLLAMA_CHAT: Relay = Relay {
+    path: "/api/chat",
+    marker: TERMINAL_MARKER,
+    closing: "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"peer_failed\",\"error\":\"the node serving this request stopped before finishing it\"}\n",
+};
+pub(crate) const OPENAI_CHAT: Relay = Relay {
+    path: "/v1/chat/completions",
+    marker: b"[DONE]",
+    closing: "data: {\"error\":{\"message\":\"the node serving this request stopped before finishing it\",\"type\":\"peer_failed\"}}\n\ndata: [DONE]\n\n",
+};
+pub(crate) const OPENAI_COMPLETIONS: Relay = Relay {
+    path: "/v1/completions",
+    marker: b"[DONE]",
+    closing: "data: {\"error\":{\"message\":\"the node serving this request stopped before finishing it\",\"type\":\"peer_failed\"}}\n\ndata: [DONE]\n\n",
+};
+pub(crate) const MESSAGES: Relay = Relay {
+    path: "/v1/messages",
+    marker: b"message_stop",
+    closing: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"peer_failed\",\"message\":\"the node serving this request stopped before finishing it\"}}\n\n",
+};
+
+/// Hand a request to the peer best placed for it, or say that it stays here. `prompt` is
+/// the text the peers are asked about, so the one holding its prefix is priced for it. A
+/// request that already travelled once stays where it landed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn route_to_holder(
+    state: &APIServer,
+    headers: &axum::http::HeaderMap,
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+    relay: &Relay,
+    body: &serde_json::Value,
+) -> Option<axum::response::Response> {
+    let cluster = state.cluster_handle()?;
+    let already_forwarded = headers.contains_key(crate::distributed::cluster::FORWARDED_HEADER);
+    let shape = crate::distributed::routing::RequestShape {
+        model: model.to_string(),
+        // Bytes over four is a rough token count, and rough is enough: every candidate is
+        // priced on the same prompt, so an estimate biases them identically.
+        prompt_tokens: (prompt.len() / 4).max(1) as u32,
+        max_tokens,
+    };
+    let now = crate::distributed::cluster_runtime::now_ms(state.cluster_started());
+    // This node sits in its own routing table, described as its peers describe it.
+    cluster.publish_local(state.local_node_state().await);
+    // Only the node owning a model can tokenise for it and look in its own cache, so the
+    // question travels; a peer that does not answer is priced as holding none of the prompt.
+    let cached = cluster.ask_peers_what_they_hold(model, prompt, now).await;
+    let crate::distributed::cluster::Decision::Forward { peer, url, reason } =
+        cluster.decide(&shape, now, already_forwarded, &cached)
+    else {
+        return None;
+    };
+    tracing::info!("forwarding to {peer}: {reason}");
+    match forward_to_peer(&url, relay, body).await {
+        Ok(relayed) => Some(relayed),
+        // The peer never got as far as answering; nothing has reached the client, so the
+        // request is served here rather than failed with someone else's outage.
+        Err(e) => {
+            tracing::warn!("cluster: hand-over to {peer} failed ({e}) - serving here instead");
+            cluster.note_handover_failed(&peer, now);
+            None
+        }
+    }
+}
+
 pub(crate) async fn forward_to_peer(
     url: &str,
+    relay: &Relay,
     body: &serde_json::Value,
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::IntoResponse;
-    let (status, headers, resp) = crate::distributed::cluster_runtime::forward_generate(url, body)
-        .await
-        .map_err(ApiError::Internal)?;
+    let (status, headers, resp) =
+        crate::distributed::cluster_runtime::forward_request(url, relay.path, body)
+            .await
+            .map_err(ApiError::Internal)?;
     let code = axum::http::StatusCode::from_u16(status.as_u16())
         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
     let content_type = headers
@@ -308,18 +391,17 @@ pub(crate) async fn forward_to_peer(
     // forge it, since any such text is escaped on its way into the JSON string.
     let saw_end = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watching = saw_end.clone();
+    let closing = relay.closing;
     // A transport error has to END this stream, not travel down it. Forwarded, it aborts the
     // body where it stands and nothing chained after is ever polled - which is exactly how the
     // first version of this closing chunk came to be silently dropped.
     let upstream = futures::StreamExt::take_while(resp.bytes_stream(), |item| {
         futures::future::ready(item.is_ok())
     });
+    let marker = relay.marker;
     let stream = futures::StreamExt::map(upstream, move |chunk| {
         if let Ok(bytes) = &chunk {
-            if bytes
-                .windows(TERMINAL_MARKER.len())
-                .any(|w| w == TERMINAL_MARKER)
-            {
+            if bytes.windows(marker.len()).any(|w| w == marker) {
                 watching.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
@@ -328,21 +410,12 @@ pub(crate) async fn forward_to_peer(
     // Runs only after the body above has ended, which is what lets it read the flag.
     let closing = futures::StreamExt::filter_map(
         futures::stream::once(async move { saw_end.load(std::sync::atomic::Ordering::Relaxed) }),
-        |ended| async move {
+        move |ended| async move {
             if ended {
                 return None;
             }
             tracing::warn!("cluster: the peer serving this request stopped before finishing it");
-            Some(Ok::<_, reqwest::Error>(axum::body::Bytes::from(
-                serde_json::json!({
-                    "response": "",
-                    "done": true,
-                    "done_reason": "peer_failed",
-                    "error": "the node serving this request stopped before finishing it",
-                })
-                .to_string()
-                    + "\n",
-            )))
+            Some(Ok::<_, reqwest::Error>(axum::body::Bytes::from(closing)))
         },
     );
     let mut response =

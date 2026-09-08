@@ -261,10 +261,14 @@ fn batch_update(id: &str, f: impl FnOnce(&mut Value)) {
 async fn run_batch_line(state: APIServer, url: &str, body: Value) -> (u16, Value) {
     let resp: Result<Response, ApiError> = match url {
         "/v1/chat/completions" => match serde_json::from_value::<ChatCompletionRequest>(body) {
-            Ok(req) => chat_completion(State(state), OpenAIJson(req)).await,
+            Ok(req) => {
+                chat_completion(State(state), axum::http::HeaderMap::new(), OpenAIJson(req)).await
+            }
             Err(e) => Err(ApiError::Validation(e.to_string())),
         },
-        "/v1/completions" => text_completions(State(state), Json(body)).await,
+        "/v1/completions" => {
+            text_completions(State(state), axum::http::HeaderMap::new(), Json(body)).await
+        }
         "/v1/responses" => openai_responses(State(state), OpenAIJson(body)).await,
         "/v1/embeddings" => Ok(openai_embeddings(State(state), Json(body)).await),
         other => Err(ApiError::Validation(format!(
@@ -525,6 +529,7 @@ pub(crate) async fn anthropic_batches_create(
                 Ok(req) => {
                     let resp = super::super::anthropic_api::anthropic_messages(
                         State(runner_state.clone()),
+                        axum::http::HeaderMap::new(),
                         AnthropicJson(req),
                     )
                     .await;

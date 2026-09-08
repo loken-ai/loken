@@ -49,6 +49,7 @@ fn decode_rate_suffix(first_token_at: Option<std::time::Instant>, tokens: u64) -
 /// Chat completion (OpenAI-compatible format)
 pub(crate) async fn chat_completion(
     State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
     OpenAIJson(mut request): OpenAIJson<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     validate_request(&request)?;
@@ -160,7 +161,12 @@ pub(crate) async fn chat_completion(
             let mut one = request.clone();
             one.n = Some(1);
             one.seed = one.seed.map(|s| s.wrapping_add(i as u64));
-            let resp = Box::pin(chat_completion(State(state.clone()), OpenAIJson(one))).await?;
+            let resp = Box::pin(chat_completion(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                OpenAIJson(one),
+            ))
+            .await?;
             let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .map_err(|e| ApiError::Internal(format!("n: {e}")))?;
@@ -215,6 +221,28 @@ pub(crate) async fn chat_completion(
     validate_model_id(&request.model)?;
     // Normalize model ID
     let model_name = normalize_model_id(&request.model);
+    // The conversation goes where the model is.
+    if let Ok(body) = serde_json::to_value(&request) {
+        let prompt_text = body["messages"].to_string();
+        let max_tokens = body["max_completion_tokens"]
+            .as_u64()
+            .or_else(|| body["max_tokens"].as_u64())
+            .unwrap_or(state.default_inference_config.max_tokens as u64)
+            as u32;
+        if let Some(relayed) = super::route_to_holder(
+            &state,
+            &headers,
+            &model_name,
+            &prompt_text,
+            max_tokens,
+            &super::OPENAI_CHAT,
+            &body,
+        )
+        .await
+        {
+            return Ok(relayed);
+        }
+    }
 
     // Reject non-decoder pipeline components (CLIP, T5, whisper, parler)
     // before they reach the text engine, matching the /api/chat and
@@ -979,9 +1007,32 @@ pub(crate) fn ollama_format_to_grammar(format: Option<&serde_json::Value>) -> Op
 /// not the chat object form (`choices[*].message.content`).
 pub(crate) async fn text_completions(
     State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let model = text_field(&body, "model");
+    // The completion goes where the model is.
+    {
+        let model_name = crate::api::handlers::normalize_model_id(&model);
+        let prompt_text = body["prompt"].to_string();
+        let max_tokens = body["max_tokens"]
+            .as_u64()
+            .unwrap_or(state.default_inference_config.max_tokens as u64)
+            as u32;
+        if let Some(relayed) = super::route_to_holder(
+            &state,
+            &headers,
+            &model_name,
+            &prompt_text,
+            max_tokens,
+            &super::OPENAI_COMPLETIONS,
+            &body,
+        )
+        .await
+        {
+            return Ok(relayed);
+        }
+    }
     // Several prompts are several completions, one per prompt, gathered into one
     // response with their indexes; a stream carries one prompt.
     if let Some(arr) = body.get("prompt").and_then(serde_json::Value::as_array) {
@@ -1003,7 +1054,12 @@ pub(crate) async fn text_completions(
             for (i, one) in arr.iter().enumerate() {
                 let mut single = body.clone();
                 single["prompt"] = one.clone();
-                let resp = Box::pin(text_completions(State(state.clone()), Json(single))).await?;
+                let resp = Box::pin(text_completions(
+                    State(state.clone()),
+                    headers.clone(),
+                    Json(single),
+                ))
+                .await?;
                 let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
                     .await
                     .map_err(|e| ApiError::Internal(format!("prompts: {e}")))?;

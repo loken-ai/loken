@@ -227,6 +227,7 @@ pub(super) fn extract_generation_options(options: Option<&serde_json::Value>) ->
 /// Chat (POST /api/chat) - Ollama format
 pub(crate) async fn ollama_chat(
     State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
     OllamaJson(request): OllamaJson<OllamaChatRequest>,
 ) -> Result<Response, ApiError> {
     validate_model_id(&request.model)?;
@@ -240,6 +241,42 @@ pub(crate) async fn ollama_chat(
     validate_ollama_options(request.options.as_ref())?;
     // Normalize model ID
     let model_name = normalize_model_id(&request.model);
+    // A conversation, or a load instruction for a model held elsewhere, goes where the
+    // model is; an empty conversation for a model held here stays here.
+    let prompt_text: String = request
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    {
+        let local_state = state.local_node_state().await;
+        let served_here = crate::distributed::routing::can_serve(&local_state, &model_name);
+        if !request.messages.is_empty() || !served_here {
+            let max_tokens = request
+                .options
+                .as_ref()
+                .and_then(|o| o.get("num_predict"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(state.default_inference_config.max_tokens as u64)
+                as u32;
+            let body = serde_json::to_value(&request)
+                .map_err(|e| ApiError::Internal(format!("forward: {e}")))?;
+            if let Some(relayed) = crate::api::handlers::route_to_holder(
+                &state,
+                &headers,
+                &model_name,
+                &prompt_text,
+                max_tokens,
+                &crate::api::handlers::OLLAMA_CHAT,
+                &body,
+            )
+            .await
+            {
+                return Ok(relayed);
+            }
+        }
+    }
     info!(
         "💬 Chat request for model: {} (normalized from: {}), stream: {}",
         model_name, request.model, request.stream
@@ -1033,69 +1070,48 @@ pub(crate) async fn ollama_generate(
     // Read BEFORE any decision: the marker is what stops two nodes that each prefer the
     // other from passing a request back and forth until something times out, and a hang is
     // a far worse failure than an imperfect placement.
-    let already_forwarded = headers.contains_key(crate::distributed::cluster::FORWARDED_HEADER);
     // Counted from the first instant, so concurrent arrivals see each other in `busy` when
     // they decide - the admission gate never sees this path, and a count taken any later
     // publishes an idle node under any load. Released explicitly on hand-over: a forwarded
     // request is the peer's work, not ours.
     let inflight_guard = crate::distributed::rate_meter::InFlight::enter();
     if let Some(cluster) = state.cluster_handle() {
-        // An empty prompt is a load or unload instruction addressed to THIS node. Forwarding
-        // it would make a peer load a model the caller asked this one to hold.
-        if !request.prompt.is_empty() {
-            let shape = crate::distributed::routing::RequestShape {
-                model: model_name.clone(),
-                // Bytes over four is a rough token count, and rough is enough: it is
-                // compared against what a peer says it holds, and both sides describe the
-                // SAME prompt, so an estimate biases every candidate identically.
-                prompt_tokens: (request.prompt.len() / 4).max(1) as u32,
-                // `options` is free-form JSON here, so the field is read by name rather
-                // than through a struct. A missing or malformed value falls back to the
-                // same default the generation path uses, so the estimate matches what will
-                // actually run.
-                max_tokens: request
-                    .options
-                    .as_ref()
-                    .and_then(|o| o.get("num_predict"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(state.default_inference_config.max_tokens as u64)
-                    as u32,
-            };
-            let now = crate::distributed::cluster_runtime::now_ms(state.cluster_started());
-            // This node has to sit in its own routing table, described exactly as peers
-            // describe it. Without this it is compared as a default state - nothing resident,
-            // no catalogue, no load - so it judges itself by facts that are not its own.
-            cluster.publish_local(state.local_node_state().await);
-            // Ask the peers, rather than guess for them: only the node owning a model can
-            // tokenise for it and look in its own cache, so the question travels and no
-            // hashing convention has to be shared. A peer that does not answer is priced as
-            // holding none of the prompt - the safe direction.
-            let cached = cluster
-                .ask_peers_what_they_hold(&model_name, &request.prompt, now)
-                .await;
-            if let crate::distributed::cluster::Decision::Forward { peer, url, reason } =
-                cluster.decide(&shape, now, already_forwarded, &cached)
+        // An empty prompt is a load or unload instruction addressed to THIS node, and stays
+        // here as long as this node holds the model. A model it does not hold can only be
+        // loaded where it is, so that instruction travels to a holder like a generation.
+        let local_state = state.local_node_state().await;
+        let served_here = crate::distributed::routing::can_serve(&local_state, &model_name);
+        if !request.prompt.is_empty() || !served_here {
+            // `options` is free-form JSON here, so the cap is read by name; a missing value
+            // falls back to the default the generation path uses.
+            let max_tokens = request
+                .options
+                .as_ref()
+                .and_then(|o| o.get("num_predict"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(state.default_inference_config.max_tokens as u64)
+                as u32;
+            // The request is re-serialised from the parsed form rather than relayed as raw
+            // bytes. Both nodes run the same build, so a field one understands the other
+            // does too.
+            let body = serde_json::to_value(&request)
+                .map_err(|e| ApiError::Internal(format!("forward: {e}")))?;
+            if let Some(relayed) = crate::api::handlers::route_to_holder(
+                &state,
+                &headers,
+                &model_name,
+                &request.prompt,
+                max_tokens,
+                &crate::api::handlers::OLLAMA_GENERATE,
+                &body,
+            )
+            .await
             {
-                info!("🔀 forwarding to {peer}: {reason}");
-                // The request is re-serialised from the parsed form rather than relayed as
-                // raw bytes. Both nodes run the same build, so a field one understands the
-                // other does too; a mixed-version cluster would need the raw body kept.
-                let body = serde_json::to_value(&request)
-                    .map_err(|e| ApiError::Internal(format!("forward: {e}")))?;
                 drop(inflight_guard);
-                match crate::api::handlers::forward_to_peer(&url, &body).await {
-                    Ok(relayed) => return Ok(relayed),
-                    // The peer never got as far as answering. Nothing has been sent to the
-                    // client yet, so the request can still be served here - failing it would
-                    // hand the caller someone else's outage. Once bytes are flowing the choice
-                    // is gone, which is why this is decided before the body starts.
-                    Err(e) => {
-                        warn!("cluster: hand-over to {peer} failed ({e}) - serving here instead");
-                        cluster.note_handover_failed(&peer, now);
-                    }
-                }
+                return Ok(relayed);
             }
         }
+        let _ = cluster;
     }
     info!(
         "📤 Generate request for model: {} (normalized from: {}), stream: {}",

@@ -23,6 +23,7 @@ pub(crate) fn anthropic_error_response(
 /// Anthropic SSE event protocol.
 pub(crate) async fn anthropic_messages(
     State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
     AnthropicJson(req): AnthropicJson<crate::api::anthropic::AnthropicMessagesRequest>,
 ) -> Response {
     use crate::api::anthropic;
@@ -36,6 +37,26 @@ pub(crate) async fn anthropic_messages(
         );
     }
     let model_name = normalize_model_id(&req.model);
+    // The conversation goes where the model is.
+    if let Ok(body) = serde_json::to_value(&req) {
+        let prompt_text = body["messages"].to_string();
+        let max_tokens = req
+            .max_tokens
+            .unwrap_or(state.default_inference_config.max_tokens) as u32;
+        if let Some(relayed) = super::route_to_holder(
+            &state,
+            &headers,
+            &model_name,
+            &prompt_text,
+            max_tokens,
+            &super::MESSAGES,
+            &body,
+        )
+        .await
+        {
+            return relayed;
+        }
+    }
     if let Some(why) = req.unsupported_input() {
         return anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", why);
     }

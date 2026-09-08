@@ -351,7 +351,12 @@ pub(crate) async fn openai_responses(
     let id = new_id("resp");
     let created = chrono::Utc::now().timestamp();
     let history = messages.clone();
-    let inner = chat_completion(State(state), OpenAIJson(chat_req)).await?;
+    let inner = chat_completion(
+        State(state),
+        axum::http::HeaderMap::new(),
+        OpenAIJson(chat_req),
+    )
+    .await?;
     if !inner.status().is_success() {
         return Ok(inner);
     }

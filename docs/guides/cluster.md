@@ -1,7 +1,9 @@
 # Two machines
 
 Every node runs the same daemon and any node is an entry point: a request arrives anywhere, the
-node forwards it whole to the best holder and relays the stream back. Each node needs a
+node forwards it whole to the best holder and relays the stream back. This holds for every
+surface that names a model: Ollama generate and chat, OpenAI chat and completions, and the
+Messages API. A request that only loads a model goes to a node that has it. Each node needs a
 `[cluster]` block; the rest is discovered.
 
 ```toml

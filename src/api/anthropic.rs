@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// `system` accepts either a bare string or an array of text blocks.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AnthropicSystem {
     Text(String),
@@ -69,7 +69,7 @@ pub struct AnthropicMessage {
 }
 
 /// Anthropic tool definition: `{name, description, input_schema}`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicTool {
     pub name: String,
     #[serde(default)]
@@ -78,7 +78,7 @@ pub struct AnthropicTool {
     pub input_schema: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicMessagesRequest {
     pub model: String,
     pub messages: Vec<AnthropicMessage>,

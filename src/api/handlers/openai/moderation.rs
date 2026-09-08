@@ -119,7 +119,12 @@ async fn ask_raw(
         "temperature": 0,
         "logprobs": FIRST_TOKEN_ALTERNATIVES,
     });
-    let resp = Box::pin(text_completions(State(state.clone()), Json(req))).await?;
+    let resp = Box::pin(text_completions(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(req),
+    ))
+    .await?;
     let v = body_json(resp).await?;
     let text = v
         .pointer("/choices/0/text")
@@ -164,7 +169,12 @@ async fn ask_chat(
     }
     let req: ChatCompletionRequest =
         serde_json::from_value(req).map_err(|e| ApiError::Internal(format!("moderation: {e}")))?;
-    let resp = Box::pin(chat_completion(State(state.clone()), OpenAIJson(req))).await?;
+    let resp = Box::pin(chat_completion(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        OpenAIJson(req),
+    ))
+    .await?;
     let v = body_json(resp).await?;
     let text = v
         .pointer("/choices/0/message/content")
