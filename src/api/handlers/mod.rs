@@ -545,6 +545,17 @@ async fn require_api_key(
     }
 }
 
+/// Bytes a JSON request may carry: images and audio travel base64 inside it.
+const JSON_BODY_LIMIT: usize = 256 * 1024 * 1024;
+/// Bytes an upload may carry: a model blob, a file, or a multipart request whose parts
+/// each have their own cap. It stays clear of the sum of those caps, because one request
+/// can carry several: an edit sends a source image, a mask and a reference face.
+const UPLOAD_BODY_LIMIT: usize = 4 * 1024 * 1024 * 1024;
+
+fn upload_body_limit() -> axum::extract::DefaultBodyLimit {
+    axum::extract::DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)
+}
+
 impl APIServer {
     /// The cluster handle, if this node joined one.
     pub(crate) fn cluster_handle(&self) -> Option<&Arc<crate::distributed::cluster::Cluster>> {
@@ -1286,7 +1297,9 @@ impl APIServer {
             .route("/api/push", axum::routing::post(ollama_push_model))
             .route(
                 "/api/blobs/{digest}",
-                axum::routing::head(ollama_head_blob).post(ollama_create_blob),
+                axum::routing::head(ollama_head_blob)
+                    .post(ollama_create_blob)
+                    .layer(upload_body_limit()),
             )
             // Custom endpoints
             .route("/api/models/loaded", axum::routing::get(list_loaded_models))
@@ -1315,7 +1328,9 @@ impl APIServer {
             .route("/v1/responses", axum::routing::post(openai_responses))
             .route(
                 "/v1/files",
-                axum::routing::post(files_upload).get(files_list),
+                axum::routing::post(files_upload)
+                    .get(files_list)
+                    .layer(upload_body_limit()),
             )
             .route(
                 "/v1/files/{id}",
@@ -1426,12 +1441,11 @@ impl APIServer {
                 axum::http::StatusCode::REQUEST_TIMEOUT,
                 std::time::Duration::from_secs(6 * 3600),
             ))
-            // Audio + image multipart uploads dwarf axum's default 2 MB body limit. This
-            // has to stay clear of the sum of the per-asset caps, because one request can
-            // carry several: an edit sends a source image, a mask and a reference face,
-            // and a montage sends a whole set. Sizing it to a single asset is what made
-            // the server refuse ordinary material.
-            .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024 * 1024))
+            // Every other route reads a JSON body into memory before it answers, so the
+            // ceiling is what a request carrying several base64 images or a clip's
+            // conditioning frame needs. Weights, file uploads and multipart media take
+            // `upload_body_limit` on their own routes.
+            .layer(axum::extract::DefaultBodyLimit::max(JSON_BODY_LIMIT))
             // AUTHENTICATION. Applied to everything the router serves except the
             // health endpoints, which a load balancer has to reach unauthenticated.
             // Off unless the config turns it on, so an existing local install is
@@ -1508,11 +1522,11 @@ impl APIServer {
             // openai/whisper-small), `language`, `temperature`.
             .route(
                 "/v1/audio/transcriptions",
-                axum::routing::post(audio_transcriptions),
+                axum::routing::post(audio_transcriptions).layer(upload_body_limit()),
             )
             .route(
                 "/v1/audio/translations",
-                axum::routing::post(audio_translations),
+                axum::routing::post(audio_translations).layer(upload_body_limit()),
             )
             // OpenAI-compatible TTS. JSON body: { "model": "...",
             //   "input": "text to speak", "voice": "alloy|echo|...",
@@ -1526,7 +1540,7 @@ impl APIServer {
             // input exactly, because the accompaniment IS the mix minus the vocal.
             .route(
                 "/v1/audio/separate",
-                axum::routing::post(separate::audio_separate),
+                axum::routing::post(separate::audio_separate).layer(upload_body_limit()),
             )
             // List the supported TTS voice presets and the description
             // each one maps to. Helps clients discover voices without
@@ -1560,14 +1574,17 @@ impl APIServer {
             // OpenAI-compatible image edit (img2img). Multipart form:
             //   `image` (PNG/JPEG bytes), `prompt`, `model`, `n`, `size`,
             //   `response_format`, plus extension fields `strength`/`seed`.
-            .route("/v1/images/edits", axum::routing::post(images_edits))
+            .route(
+                "/v1/images/edits",
+                axum::routing::post(images_edits).layer(upload_body_limit()),
+            )
             // OpenAI-compatible image variations. Multipart form:
             //   `image` (PNG/JPEG), optional `model`, `n`, `size`,
             //   `response_format`, plus extension fields `strength`/`seed`.
             // Internally a no-prompt img2img run.
             .route(
                 "/v1/images/variations",
-                axum::routing::post(images_variations),
+                axum::routing::post(images_variations).layer(upload_body_limit()),
             );
 
         // Video routes. A chained builder cannot carry a cfg on one link,
