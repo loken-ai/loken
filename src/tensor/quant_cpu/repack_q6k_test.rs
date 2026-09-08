@@ -23,6 +23,7 @@ fn prng() -> impl FnMut() -> f32 {
 
 // The repacked Q6_K GEMV oracle must match the production per-column
 // vec_dot_q6k_q8k: same activation, same dequant, only the layout differs.
+#[cfg(target_feature = "avx2")]
 #[test]
 fn repacked_q6k_gemv_matches_vec_dot() {
     let k = 512usize; // 2 superblocks

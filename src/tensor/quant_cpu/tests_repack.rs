@@ -545,6 +545,7 @@ pub(super) fn q8_0_x8_avx2_matches_scalar() {
 }
 
 #[cfg(test)]
+#[cfg(target_feature = "avx2")]
 #[test]
 pub(super) fn repacked_q5k_matches_vec_dot_and_oracle() {
     let (n, nb) = (16usize, 4usize);

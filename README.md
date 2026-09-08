@@ -67,7 +67,9 @@ cargo build --release --no-default-features --features cpu,media  # and every me
 
 `image`, `audio`, `video` and `midi` can each be added on their own. `.cargo/config.toml`
 builds for the host CPU so the quantized kernels can use whatever SIMD it has - which makes
-the binary non-portable, so drop that flag if you are building for another machine.
+the binary non-portable, so drop that flag if you are building for another machine. The host
+path needs AVX2 either way: a build for a CPU without it compiles, and refuses the quantized
+matmuls at run time.
 
 ## Running it on a network
 

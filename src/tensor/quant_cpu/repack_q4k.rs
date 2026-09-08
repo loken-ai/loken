@@ -1152,6 +1152,7 @@ pub unsafe fn gemv_group_avx2_plain(b: &[BlockQ4Kx8], a: &[BlockQ8K], nb: usize,
     _mm256_storeu_ps(out.as_mut_ptr(), _mm256_sub_ps(acc_row, acc_min_rows));
 }
 
+#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
 pub unsafe fn gemv_group_avx2_v2(b: &[BlockQ4Kx8], a: &[BlockQ8K], nb: usize, out: &mut [f32]) {
     let m4b = _mm256_set1_epi8(0x0F);
     let deltamask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);

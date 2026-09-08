@@ -61,7 +61,7 @@ impl QKernelMatMul {
         #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
         {
             let _ = (x, mats, outs);
-            return Ok(false);
+            Ok(false)
         }
         #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
         {

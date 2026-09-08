@@ -1664,6 +1664,7 @@ fn fused_down_reduce_q6k_gemv(
     )?))
 }
 
+#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
 fn fused_down_reduce_q4k_gemv_v2(
     input: &Tensor,
     weights: &Arc<QTensor>,

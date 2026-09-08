@@ -283,6 +283,7 @@ pub(super) fn repacked_q4_0_gemv_matches_vec_dot() {
 }
 
 #[cfg(test)]
+#[cfg(target_feature = "avx2")]
 #[test]
 pub(super) fn repacked_q5_0_matches_vec_dot_and_oracle() {
     let (n, nb) = (16usize, 4usize);
@@ -420,6 +421,7 @@ pub(super) fn q5_0_full_matmul_matches_reference() {
 }
 
 #[cfg(test)]
+#[cfg(target_feature = "avx2")]
 #[test]
 pub(super) fn repacked_q8_0_matches_vec_dot_and_oracle() {
     let (n, nb) = (16usize, 4usize);

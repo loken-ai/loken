@@ -12,6 +12,10 @@ env:
 
 # A runner has no CUDA toolkit and no card, so every job here builds the host path. The
 # device backends are exercised on the machines that have them; see docs/BENCHMARKS.md.
+#
+# RUSTFLAGS set here replaces the rustflags of .cargo/config.toml, so the jobs below build
+# the portable x86-64 binary, without the SIMD paths a native build takes. The `native`
+# job puts them back to cover those paths too.
 jobs:
   check:
     name: host build
@@ -41,6 +45,20 @@ jobs:
         run: cargo doc --no-deps --no-default-features --features cpu
         env:
           RUSTDOCFLAGS: -D warnings
+
+  native:
+    name: host build, native SIMD
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings -C target-cpu=native
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --no-default-features --features cpu --all-targets -- -D warnings
+      - run: cargo test --no-default-features --features cpu
 
   features:
     name: ${{ matrix.features }}

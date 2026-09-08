@@ -428,6 +428,7 @@ fn q5_0_gpu_mmvq_matches_oracle() {
 /// Q4K/Q6K/Q8_0/MxFp4 - and stay inside the quantization-error envelope
 /// of an f64 reference matmul over the dequantized weights. Synthetic
 /// weights, no model store needed.
+#[cfg(target_feature = "avx2")]
 #[test]
 fn cpu_qmatmul_vec_dot_matches_oracle() {
     use crate::tensor::{quant_cpu, Device, Tensor};
@@ -939,6 +940,7 @@ fn gguf_container_bytes_are_what_the_reader_expects() {
 /// becomes the second description of the forward that this mechanism exists to remove.
 /// Every activation dtype the real path serves is run twice here, once computing and
 /// once counting.
+#[cfg(target_feature = "avx2")]
 #[test]
 fn a_counted_quantized_matmul_answers_the_shape_the_real_one_does() {
     use super::{GgmlDType, QKernelMatMul, QTensor};

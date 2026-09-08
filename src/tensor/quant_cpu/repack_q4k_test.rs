@@ -188,6 +188,7 @@ fn repacked_q4k_gemm_matches_scalar_oracle() {
 // The repacked Q4_K GEMV (scalar + AVX2) must match the production
 // per-column vec_dot_q4k_q8k within k_quants tolerance (same Q8_K
 // activation, same dequant math, only the block layout differs).
+#[cfg(target_feature = "avx2")]
 #[test]
 fn repacked_q4k_gemv_matches_vec_dot() {
     let k = 512usize; // 2 superblocks
