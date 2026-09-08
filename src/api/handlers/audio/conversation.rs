@@ -246,10 +246,9 @@ pub(super) async fn classify_route_llm(
     } else {
         ConvRoute::Chat
     };
-    info!(
-        "🧭 smart-routing: '{}' -> {label}",
-        snippet.chars().take(60).collect::<String>()
-    );
+    // The user's words never reach the log; the length is what a reader needs.
+    let chars = snippet.chars().count();
+    info!("🧭 smart-routing: {chars} chars -> {label}");
     Some(route)
 }
 

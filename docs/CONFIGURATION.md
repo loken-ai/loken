@@ -8,6 +8,9 @@ The daemon reads `config.toml` from its working directory, then from beside the 
 Every key below is optional except `[inference] model_id`. A key left out takes the default
 shown.
 
+Logs carry lengths and counts, never a prompt, a message, a transcript or a generated text,
+at any level.
+
 ## Top level
 
 | Key | Default | What it does |

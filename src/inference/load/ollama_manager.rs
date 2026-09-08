@@ -547,8 +547,9 @@ impl OllamaManager {
     fn read_manifest(&self, path: &PathBuf) -> Result<OllamaManifest> {
         let content = std::fs::read_to_string(path)?;
         debug!(
-            "Manifest file content (first 200 chars): {}",
-            &content.chars().take(200).collect::<String>()
+            "Manifest file read: {} bytes at {}",
+            content.len(),
+            path.display()
         );
         match serde_json::from_str::<OllamaManifest>(&content) {
             Ok(manifest) => {

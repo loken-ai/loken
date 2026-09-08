@@ -642,7 +642,7 @@ pub(crate) async fn ollama_chat(
         info!("Chat: top_p override: {:?}", params.top_p);
     }
     if !params.stop_sequences.is_empty() {
-        info!("Chat: stop sequences: {:?}", params.stop_sequences);
+        info!("Chat: {} stop sequence(s)", params.stop_sequences.len());
     }
 
     // Resolve priority for the gate. Chat has no `suffix` FIM auto-promote
@@ -1362,7 +1362,7 @@ pub(crate) async fn ollama_generate(
         info!("Generate: top_p override: {:?}", params.top_p);
     }
     if !params.stop_sequences.is_empty() {
-        info!("Generate: stop sequences: {:?}", params.stop_sequences);
+        info!("Generate: {} stop sequence(s)", params.stop_sequences.len());
     }
 
     // Resolve request priority: FIM auto-promotes to Fim; explicit

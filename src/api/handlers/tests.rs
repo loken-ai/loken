@@ -601,3 +601,59 @@ fn only_a_streamed_answer_is_watched_for_its_end() {
     assert!(super::OPENAI_COMPLETIONS.streams(&json!({"stream": true})));
     assert!(!super::MESSAGES.streams(&json!({"max_tokens": 8})));
 }
+
+/// A log line carries lengths and counts, never what a user wrote or a model answered.
+#[test]
+fn no_log_line_carries_user_text() {
+    fn visit(dir: &std::path::Path, hits: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, hits);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            for (offset, _) in source.match_indices('!') {
+                let head = &source[..offset];
+                let Some(name) = head
+                    .rsplit(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                else {
+                    continue;
+                };
+                if !matches!(name, "info" | "warn" | "debug" | "trace" | "error") {
+                    continue;
+                }
+                let tail = &source[offset..];
+                let Some(end) = tail.find(");") else { continue };
+                let call = &tail[..end];
+                let suspect = [
+                    "snippet",
+                    "user_text",
+                    ".prompt,",
+                    ".prompt)",
+                    "prompt.chars",
+                    "text.chars",
+                    "content.chars",
+                    "stop_sequences)",
+                    "messages)",
+                    ".content)",
+                    "transcript,",
+                ];
+                if suspect.iter().any(|s| call.contains(s)) {
+                    let line = head.matches('\n').count() + 1;
+                    hits.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    visit(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut hits,
+    );
+    assert!(hits.is_empty(), "log lines carrying user text: {hits:?}");
+}

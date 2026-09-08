@@ -1323,9 +1323,9 @@ pub(crate) async fn text_completions(
         )));
     }
 
+    let prompt_chars = prompt.chars().count();
     info!(
         "Text completion request: model={model_name} stream={stream} prompt_chars={prompt_chars}{normalized}",
-        prompt_chars = prompt.chars().count(),
         normalized = if model != model_name {
             format!(" (from {model})")
         } else {
