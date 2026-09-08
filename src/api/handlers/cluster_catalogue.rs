@@ -8,9 +8,10 @@ use super::APIServer;
 use crate::api::types::{OllamaListModelsResponse, OllamaModel};
 use crate::distributed::cluster::FORWARDED_HEADER;
 
-/// How long a peer has to answer for its catalogue. A peer that takes longer is left out of
-/// this answer rather than delaying it; the next call asks again.
-const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a peer has to answer for its catalogue: a first listing reads every header of a
+/// large store. A peer that takes longer is left out of this answer rather than delaying it;
+/// the next call asks again.
+const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The models alive peers hold, each carrying the id of the node that holds it. Empty when
 /// the node is not clustered, and when the request came from a peer asking for this node's own

@@ -77,10 +77,7 @@ pub(crate) async fn ollama_list_models(
                     let (arch, quant, declared) = match source {
                         ModelSource::Ollama => state
                             .manifest_layer_path(&m.id, "model")
-                            .map(|w| {
-                                let (_, arch, quant, declared) = gguf_facts(&w);
-                                (arch, quant, declared)
-                            })
+                            .map(|w| header_facts(&w))
                             .unwrap_or((None, None, None)),
                         _ => (None, None, None),
                     };
@@ -458,6 +455,37 @@ fn gguf_file_type_name(id: u64) -> Option<&'static str> {
         38 => "MXFP4",
         _ => return None,
     })
+}
+
+/// The architecture, quantisation label and parameter count a checkpoint declares, read once
+/// per file: a header carries the whole vocabulary, and a catalogue of many models read on
+/// every listing is what made the list take seconds. A file that changed size or date is
+/// read again.
+pub(crate) fn header_facts(
+    path: &std::path::Path,
+) -> (Option<String>, Option<String>, Option<u64>) {
+    type Facts = (Option<String>, Option<String>, Option<u64>);
+    type Stamp = (u64, Option<std::time::SystemTime>);
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (Stamp, Facts)>>,
+    > = std::sync::OnceLock::new();
+    let stamp: Stamp = match std::fs::metadata(path) {
+        Ok(m) => (m.len(), m.modified().ok()),
+        Err(_) => return (None, None, None),
+    };
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some((seen, facts)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(path) {
+        if *seen == stamp {
+            return facts.clone();
+        }
+    }
+    let (_, arch, quant, declared) = gguf_facts(path);
+    let facts = (arch, quant, declared);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf(), (stamp, facts.clone()));
+    facts
 }
 
 /// What a checkpoint says about itself: its metadata as JSON, its architecture, the label its
