@@ -205,8 +205,13 @@ impl TtsEngine {
         }
     }
 
+    /// Whether a model is resident. A state under a lock is a model being loaded or at
+    /// work, which counts as present.
     pub async fn is_loaded(&self) -> bool {
-        self.model_state.lock().await.is_some()
+        match self.model_state.try_lock() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => true,
+        }
     }
 
     /// GPU bytes the resident voice model took, measured across its load.

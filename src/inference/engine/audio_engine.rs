@@ -205,6 +205,8 @@ pub struct AudioModelInfo {
 pub struct AudioEngine {
     model_state: Arc<Mutex<Option<WhisperModelState>>>,
     name: Arc<Mutex<Option<String>>>,
+    /// "CUDA" or "CPU", kept apart from the state so a listing never waits on a transcription.
+    device_kind: Arc<Mutex<Option<String>>>,
     resident_bytes: Arc<Mutex<u64>>,
 }
 
@@ -213,12 +215,18 @@ impl AudioEngine {
         Self {
             model_state: Arc::new(Mutex::new(None)),
             name: Arc::new(Mutex::new(None)),
+            device_kind: Arc::new(Mutex::new(None)),
             resident_bytes: Arc::new(Mutex::new(0)),
         }
     }
 
+    /// Whether a model is resident. A state under a lock is a model being loaded or at
+    /// work, which counts as present.
     pub async fn is_loaded(&self) -> bool {
-        self.model_state.lock().await.is_some()
+        match self.model_state.try_lock() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => true,
+        }
     }
 
     pub async fn get_loaded_model_info(&self) -> Option<AudioModelInfo> {
@@ -235,13 +243,7 @@ impl AudioEngine {
     /// right device badge. pick_device prefers CUDA0 but we read the
     /// actual loaded state in case the load path fell back to CPU.
     pub async fn loaded_device(&self) -> Option<String> {
-        self.model_state.lock().await.as_ref().map(|s| {
-            if s.device.is_cuda() {
-                "CUDA".to_string()
-            } else {
-                "CPU".to_string()
-            }
-        })
+        self.device_kind.lock().await.clone()
     }
 
     /// Currently-loaded HF repo id, or `None` when no model is loaded.
@@ -254,6 +256,7 @@ impl AudioEngine {
         if guard.take().is_some() {
             let mut name_guard = self.name.lock().await;
             let name = name_guard.take().unwrap_or_else(|| "<unknown>".to_string());
+            *self.device_kind.lock().await = None;
             info!("Unloaded audio model: {name}");
         }
     }
@@ -275,9 +278,15 @@ impl AudioEngine {
         .map_err(|e| anyhow!("whisper load join: {e}"))??;
 
         let free_after_load = crate::inference::place::vram_manager::free_total();
+        let kind = if state.device.is_cuda() {
+            "CUDA"
+        } else {
+            "CPU"
+        };
         let mut guard = self.model_state.lock().await;
         *guard = Some(state);
         *self.name.lock().await = Some(model_id);
+        *self.device_kind.lock().await = Some(kind.to_string());
         *self.resident_bytes.lock().await = free_before_load.saturating_sub(free_after_load);
         Ok(())
     }

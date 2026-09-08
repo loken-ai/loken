@@ -67,9 +67,103 @@ fn spread_over_plan(plan: &HeteroPlan, resident_bytes: u64) -> Vec<ImageLayerDis
         .collect()
 }
 
+/// What the resident model looks like from outside, kept beside the state so that a
+/// listing never waits on a render.
+///
+/// The state's lock is held for the whole of a load's last step and for the whole of a
+/// render, and a health probe or a model listing arriving meanwhile used to wait it out -
+/// minutes, on a slow render - and be reported as an outage. This copy is refreshed
+/// whenever the state is read or a render begins, and cleared on unload.
+#[derive(Clone)]
+pub(crate) struct Presence {
+    pub family: &'static str,
+    pub info: ImageModelInfo,
+}
+
+pub(crate) type PresenceCell = Arc<std::sync::Mutex<Option<Presence>>>;
+
 /// Image generation engine (separate from text LlmEngine)
 pub struct ImageEngine {
     model_state: Arc<Mutex<Option<LoadedImageModelState>>>,
+    presence: PresenceCell,
+}
+
+/// Record what `state` is, for the readers that must not wait on its lock.
+pub(crate) fn remember(presence: &PresenceCell, state: &LoadedImageModelState) {
+    *presence.lock().unwrap_or_else(|e| e.into_inner()) = Some(describe(state));
+}
+
+fn family_of(state: &LoadedImageModelState) -> &'static str {
+    match state.model {
+        LoadedImageModel::Flux(_) => "flux",
+        LoadedImageModel::ZImage(_) => "zimage",
+        LoadedImageModel::QwenImage(_) => "qwen-image",
+        LoadedImageModel::Flux2(_) => "flux2",
+        LoadedImageModel::Boogu(_) => "boogu",
+        LoadedImageModel::Sdxl(_) => "sdxl",
+    }
+}
+
+/// Name, family and layer placement of a resident model.
+fn describe(state: &LoadedImageModelState) -> Presence {
+    let (model_type, total_layers, layer_distribution) = match &state.model {
+        LoadedImageModel::Flux(flux) => match &flux.flux {
+            FluxVariant::Whole(_) => {
+                let total = 57u32;
+                let dist = all_on_one_device(state, total);
+                ("Flux Schnell".into(), total, dist)
+            }
+            FluxVariant::Hetero(hetero) => {
+                let total = hetero.plan.total_layers as u32;
+                let dist = spread_over_plan(&hetero.plan, state.resident_bytes);
+                ("Flux Schnell".into(), total, dist)
+            }
+        },
+        LoadedImageModel::ZImage(zimg) => match &zimg.transformer {
+            ZImageVariant::Single(_) | ZImageVariant::NativeSingle(_) => {
+                let total = 34u32;
+                let dist = all_on_one_device(state, total);
+                ("Z-Image".into(), total, dist)
+            }
+            ZImageVariant::Hetero(hetero) => {
+                let total = hetero.plan.total_layers as u32;
+                let dist = spread_over_plan(&hetero.plan, state.resident_bytes);
+                ("Z-Image".into(), total, dist)
+            }
+        },
+        LoadedImageModel::QwenImage(_) => {
+            let total = 60u32;
+            let dist = all_on_one_device(state, total);
+            ("Qwen-Image".into(), total, dist)
+        }
+        LoadedImageModel::Flux2(f2) => {
+            // 5 dual-stream + 20 parallel single blocks.
+            let cfg = f2.config();
+            let total = (cfg.num_layers + cfg.num_single_layers) as u32;
+            let dist = all_on_one_device(state, total);
+            ("FLUX.2 Klein".into(), total, dist)
+        }
+        LoadedImageModel::Boogu(_) => {
+            let total = 40u32;
+            let dist = all_on_one_device(state, total);
+            ("Boogu-Image".into(), total, dist)
+        }
+        LoadedImageModel::Sdxl(_) => {
+            // 9 input levels + 3 middle + 9 output, on one device.
+            let total = 21u32;
+            let dist = all_on_one_device(state, total);
+            ("SDXL".into(), total, dist)
+        }
+    };
+    Presence {
+        family: family_of(state),
+        info: ImageModelInfo {
+            name: state.name.clone(),
+            model_type,
+            total_layers,
+            layer_distribution,
+        },
+    }
 }
 
 impl Default for ImageEngine {
@@ -82,7 +176,27 @@ impl ImageEngine {
     pub fn new() -> Self {
         Self {
             model_state: Arc::new(Mutex::new(None)),
+            presence: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// The presence cell, for the paths that hold the state's lock for long.
+    pub(crate) fn presence_cell(&self) -> PresenceCell {
+        self.presence.clone()
+    }
+
+    /// What is resident, without waiting: read from the state when it is free, from the
+    /// last description of it when a load or a render holds it.
+    fn presence(&self) -> Option<Presence> {
+        if let Ok(guard) = self.model_state.try_lock() {
+            let described = guard.as_ref().map(describe);
+            *self.presence.lock().unwrap_or_else(|e| e.into_inner()) = described.clone();
+            return described;
+        }
+        self.presence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Check if an image model is loaded

@@ -195,6 +195,7 @@ impl ImageEngine {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let model_state = self.model_state.clone();
+        let presence = self.presence_cell();
         let prompt = prompt.to_string();
         // Channel size sized to a comfortable HD-mode (Z-Image 18 steps,
         // Flux schnell HD 8 steps) plus a buffer for late receivers.
@@ -212,6 +213,7 @@ impl ImageEngine {
                     return;
                 }
             };
+            super::remember(&presence, state);
 
             if let Some(seed) = params.seed {
                 if let Err(e) = state.device.set_seed(seed) {
