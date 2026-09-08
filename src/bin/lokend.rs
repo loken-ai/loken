@@ -492,6 +492,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      [server] host, or put it behind something that authenticates."
                 );
             }
+            // The catalogue is read before the port opens, so the first listing, a peer's
+            // included, answers from memory.
+            let (read, took) = api_server.warm_catalogue().await;
+            info!(
+                "catalogue: {read} checkpoint headers read in {} ms",
+                took.as_millis()
+            );
+
             let listener = tokio::net::TcpListener::bind(format!("{host}:{}", port))
                 .await?
                 .tap_io(|stream| {

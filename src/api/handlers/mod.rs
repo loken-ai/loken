@@ -559,6 +559,21 @@ fn upload_body_limit() -> axum::extract::DefaultBodyLimit {
 
 impl APIServer {
     /// The cluster handle, if this node joined one.
+    /// Read the catalogue once, before the node answers: every listing after this finds the
+    /// header facts in memory.
+    pub async fn warm_catalogue(&self) -> (usize, std::time::Duration) {
+        let started = std::time::Instant::now();
+        let models = self.model_manager.list_models().await.unwrap_or_default();
+        let mut read = 0usize;
+        for m in &models {
+            if let Some(weights) = self.manifest_layer_path(&m.id, "model") {
+                let _ = ollama::header_facts(&weights);
+                read += 1;
+            }
+        }
+        (read, started.elapsed())
+    }
+
     pub(crate) fn cluster_handle(&self) -> Option<&Arc<crate::distributed::cluster::Cluster>> {
         self.cluster.as_ref()
     }

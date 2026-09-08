@@ -479,8 +479,17 @@ pub(crate) fn header_facts(
             return facts.clone();
         }
     }
-    let (_, arch, quant, declared) = gguf_facts(path);
-    let facts = (arch, quant, declared);
+    let read = crate::tensor::quantized::gguf_file::read_facts(path).unwrap_or_else(|e| {
+        warn!("no facts from {}: {e}", path.display());
+        Default::default()
+    });
+    let facts = (
+        read.architecture,
+        read.file_type
+            .and_then(gguf_file_type_name)
+            .map(str::to_string),
+        read.parameter_count,
+    );
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())

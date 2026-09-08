@@ -14,7 +14,7 @@ Every route but `/health` demands a key when `[server] require_auth` is on, as
 |---|---|
 | `GET /` | Liveness, as Ollama answers it. |
 | `GET /api/version` | The Ollama API level served, with the crate version beside it. |
-| `GET /api/tags` | The models on this machine, with the architecture, quantisation and parameter count each header declares. In a cluster, the models the peers hold follow, each under `node`; a request naming one is forwarded there. |
+| `GET /api/tags` | The models on this machine, with the architecture, quantisation and parameter count each header declares, read once before the port opens and again only for a file that changed. In a cluster, the models the peers hold follow, each under `node`; a request naming one is forwarded there. |
 | `POST /api/show` | A model's details, with the Modelfile synthesised from its own blobs. `verbose` adds the vocabulary arrays. |
 | `GET /api/ps` | The models resident in memory. |
 | `POST /api/pull` | Fetch a model. Streams progress unless `stream: false`. |

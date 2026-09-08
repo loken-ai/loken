@@ -535,6 +535,93 @@ pub fn read_mapped_file(file: &std::fs::File) -> Result<Content> {
 /// Header-only parse for metadata probes. The explicit entry point that states no
 /// tensor payload will be read, so the call does not look like the dropped-mmap
 /// defect the invariant gate hunts for.
+/// What a catalogue needs from a header: the architecture, the file type and the parameter
+/// count the file declares, read without the vocabulary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeaderFacts {
+    pub architecture: Option<String>,
+    pub file_type: Option<u64>,
+    pub parameter_count: Option<u64>,
+}
+
+/// Read the facts a catalogue lists, stopping at the first tokenizer key. The general keys
+/// come first in a GGUF and the vocabulary arrays after them, so a few kilobytes are read
+/// where the whole header runs to tens of megabytes; a key that only follows the vocabulary
+/// stays unread and reports as absent.
+pub fn read_facts<P: AsRef<std::path::Path>>(path: P) -> Result<HeaderFacts> {
+    let path = path.as_ref();
+    let f =
+        std::fs::File::open(path).map_err(|e| Error(format!("open {}: {e}", path.display())))?;
+    let mut r = std::io::BufReader::new(f);
+    read_facts_from(&mut r)
+}
+
+fn read_facts_from<R: Read + Seek>(r: &mut R) -> Result<HeaderFacts> {
+    use layout::value_type;
+    use std::io::SeekFrom;
+    let [magic, version, _tensor_count, kv_count] = layout::read_scalars(r, &layout::FILE_HEADER)?;
+    if magic != u64::from(layout::MAGIC) {
+        return Err(Error(format!("not a GGUF file (magic {magic:#x})")));
+    }
+    VersionedMagic::from_u32(version as u32)?;
+    fn scalar_len(t: u32) -> Option<u64> {
+        Some(match t {
+            value_type::U8 | value_type::I8 | value_type::BOOL => 1,
+            value_type::U16 | value_type::I16 => 2,
+            value_type::U32 | value_type::I32 | value_type::F32 => 4,
+            value_type::U64 | value_type::I64 | value_type::F64 => 8,
+            _ => return None,
+        })
+    }
+    fn skip<R: Read + Seek>(r: &mut R, t: u32) -> Result<()> {
+        if let Some(n) = scalar_len(t) {
+            r.seek(SeekFrom::Current(n as i64))
+                .map_err(|e| Error(format!("gguf: {e}")))?;
+            return Ok(());
+        }
+        match t {
+            value_type::STRING => {
+                let n = layout::read_u64(r)?;
+                r.seek(SeekFrom::Current(n as i64))
+                    .map_err(|e| Error(format!("gguf: {e}")))?;
+            }
+            value_type::ARRAY => {
+                let elem = layout::read_u32(r)?;
+                let count = layout::read_u64(r)?;
+                if let Some(n) = scalar_len(elem) {
+                    r.seek(SeekFrom::Current((n * count) as i64))
+                        .map_err(|e| Error(format!("gguf: {e}")))?;
+                } else {
+                    for _ in 0..count {
+                        skip(r, elem)?;
+                    }
+                }
+            }
+            other => return Err(Error(format!("gguf: unknown value type {other}"))),
+        }
+        Ok(())
+    }
+    let mut facts = HeaderFacts::default();
+    for _ in 0..kv_count {
+        let key = layout::read_string(r)?;
+        let vtype = layout::read_u32(r)?;
+        if key.starts_with("tokenizer.") {
+            break;
+        }
+        match key.as_str() {
+            "general.architecture" => {
+                facts.architecture = read_value(r, vtype)?.to_string().ok().cloned()
+            }
+            "general.file_type" => facts.file_type = read_value(r, vtype)?.to_u64().ok(),
+            "general.parameter_count" => {
+                facts.parameter_count = read_value(r, vtype)?.to_u64().ok()
+            }
+            _ => skip(r, vtype)?,
+        }
+    }
+    Ok(facts)
+}
+
 pub fn open_header<P: AsRef<std::path::Path>>(path: P) -> Result<Content> {
     let path = path.as_ref();
     let mut f =
@@ -754,5 +841,84 @@ impl Content {
             dims: info.shape.dims().to_vec(),
             id: crate::tensor::quantized::host::next_tensor_id(),
         })
+    }
+}
+
+#[cfg(test)]
+mod facts_tests {
+    use super::*;
+
+    fn kv_string(key: &str, value: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend((key.len() as u64).to_le_bytes());
+        b.extend(key.as_bytes());
+        b.extend(layout::value_type::STRING.to_le_bytes());
+        b.extend((value.len() as u64).to_le_bytes());
+        b.extend(value.as_bytes());
+        b
+    }
+    fn kv_u32(key: &str, value: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend((key.len() as u64).to_le_bytes());
+        b.extend(key.as_bytes());
+        b.extend(layout::value_type::U32.to_le_bytes());
+        b.extend(value.to_le_bytes());
+        b
+    }
+    fn kv_strings(key: &str, values: &[&str]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend((key.len() as u64).to_le_bytes());
+        b.extend(key.as_bytes());
+        b.extend(layout::value_type::ARRAY.to_le_bytes());
+        b.extend(layout::value_type::STRING.to_le_bytes());
+        b.extend((values.len() as u64).to_le_bytes());
+        for v in values {
+            b.extend((v.len() as u64).to_le_bytes());
+            b.extend(v.as_bytes());
+        }
+        b
+    }
+    fn header(kvs: &[Vec<u8>]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend(layout::MAGIC_BYTES);
+        b.extend(3u32.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        b.extend((kvs.len() as u64).to_le_bytes());
+        for kv in kvs {
+            b.extend(kv);
+        }
+        b
+    }
+
+    /// The facts are read from the keys before the vocabulary, arrays in between are
+    /// skipped, and nothing after the first tokenizer key is read.
+    #[test]
+    fn the_facts_come_from_the_keys_before_the_vocabulary() {
+        let bytes = header(&[
+            kv_string("general.architecture", "llama"),
+            kv_strings("general.tags", &["chat", "code"]),
+            kv_u32("general.file_type", 15),
+            kv_strings("tokenizer.ggml.tokens", &["a", "b", "c"]),
+            kv_u32("general.parameter_count", 7),
+        ]);
+        let facts = read_facts_from(&mut std::io::Cursor::new(bytes)).expect("parses");
+        assert_eq!(facts.architecture.as_deref(), Some("llama"));
+        assert_eq!(facts.file_type, Some(15));
+        assert_eq!(
+            facts.parameter_count, None,
+            "a key after the vocabulary stays unread"
+        );
+    }
+
+    /// A declared count before the vocabulary is read.
+    #[test]
+    fn a_declared_count_is_read() {
+        let bytes = header(&[
+            kv_string("general.architecture", "qwen3"),
+            kv_u32("general.parameter_count", 600_000_000),
+            kv_strings("tokenizer.ggml.tokens", &["a"]),
+        ]);
+        let facts = read_facts_from(&mut std::io::Cursor::new(bytes)).expect("parses");
+        assert_eq!(facts.parameter_count, Some(600_000_000));
     }
 }
