@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning nobody has to act on is a warning everybody learns to scroll past.
+  RUSTFLAGS: -D warnings
+
+# A runner has no CUDA toolkit and no card, so every job here builds the host path. The
+# device backends are exercised on the machines that have them; see docs/BENCHMARKS.md.
+jobs:
+  check:
+    name: host build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --no-default-features --features cpu --all-targets -- -D warnings
+
+      # Tests that need a card say so and pass, so this covers everything else.
+      - name: Tests
+        run: cargo test --no-default-features --features cpu
+
+      # A link to a type that has been renamed is a broken link, and nobody notices
+      # until someone reads the documentation.
+      - name: Docs
+        run: cargo doc --no-deps --no-default-features --features cpu
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  features:
+    name: ${{ matrix.features }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each media family and the scrape endpoint sit behind a feature. Without this a
+        # combination only gets compiled when someone remembers to try it.
+        features: ["cpu,media", "cpu,metrics", "cpu,image", "cpu,audio"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --no-default-features --features ${{ matrix.features }} --all-targets
+
+  standalone:
+    name: no path dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The org keeps one repository per binary. A `path = "..."` added in a hurry would
+      # quietly couple two repositories that are meant to be buildable on their own.
+      - name: Reject path dependencies
+        run: |
+          if grep -nE '^\s*[A-Za-z0-9_-]+\s*=.*\bpath\s*=' Cargo.toml; then
+            echo "::error::this crate must build on its own - no path dependencies"
+            exit 1
+          fi
+
+  audit:
+    name: dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check

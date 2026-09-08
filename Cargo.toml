@@ -22,7 +22,7 @@ serde_qs = "0.13"
 uuid = { version = "1.0", features = ["v4", "serde", "fast-rng"] }
 
 # Validation
-validator = { version = "0.18", features = ["derive"] }
+validator = { version = "0.20", features = ["derive"] }
 
 # Logging
 tracing = "0.1"
@@ -90,7 +90,7 @@ nvml-wrapper = "0.12"
 # clone has, and `cargo build` failing on a manifest error is a bad first impression. To work on
 # the patches locally, add a `[patch]` override to your own .cargo/config.toml - that keeps the
 # convenience out of the file everybody gets.
-cudarc = { git = "https://github.com/loken-ai/cudarc.git", rev = "d307a98", package = "cudarc", optional = true, default-features = false, features = [
+cudarc = { version = "0.19", git = "https://github.com/loken-ai/cudarc.git", rev = "d307a98", package = "cudarc", optional = true, default-features = false, features = [
     "std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "f8",
     "cuda-version-from-build-system", "dynamic-linking", "nccl",
 ] }
