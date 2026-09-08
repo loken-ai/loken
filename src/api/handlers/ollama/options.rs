@@ -1492,7 +1492,7 @@ pub(crate) async fn ollama_generate(
                                 }
                                 Err(e) => {
                                     error!("Spec-decode stream chunk error: {}", e);
-                                    let err_chunk = serde_json::json!({"error": format!("{}", e)});
+                                    let err_chunk = serde_json::json!({"error": e.to_string()});
                                     let mut line = err_chunk.to_string();
                                     line.push('\n');
                                     yield Ok::<_, std::io::Error>(axum::body::Bytes::from(line));

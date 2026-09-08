@@ -24,6 +24,8 @@ use super::rng::split_mix_64;
 /// power-of-two divisor and each block is transformed on its own. The result is still
 /// orthogonal - a block-diagonal of orthogonal blocks is orthogonal - it simply spreads an
 /// outlier over `m` coordinates rather than over `n`.
+// The named method is newer than the oldest toolchain this tree is built with.
+#[allow(clippy::manual_isolate_lowest_one)]
 pub fn hadamard_block_len(n: usize) -> usize {
     if n == 0 {
         return 0;

@@ -37,6 +37,10 @@
 // clamp on a bound that may be NaN must not panic, reference constants are written at
 // their published precision, and a test spells its formula out in full.
 #![allow(
+    // Named by a clippy this tree is not always built with; the older one must not complain
+    // about the name, and `as_chunks` changes nothing the chunked loops rely on.
+    unknown_lints,
+    clippy::chunks_exact_to_as_chunks,
     clippy::excessive_precision,
     clippy::identity_op,
     clippy::manual_range_contains,
