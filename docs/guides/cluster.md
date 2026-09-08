@@ -21,7 +21,9 @@ curl -s localhost:11435/api/cluster/peers
 ```
 
 lists who this node sees, with liveness and the measured round trip; `/api/cluster/state` is
-what it publishes about itself.
+what it publishes about itself. `/api/tags` on any node lists the whole cluster's models, the
+ones held elsewhere under the node that holds them, so a client sees one catalogue whichever
+node it talks to.
 
 ## What runs and what does not
 

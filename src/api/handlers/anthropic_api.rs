@@ -521,13 +521,15 @@ pub(crate) async fn list_models_by_dialect(
     headers: axum::http::HeaderMap,
 ) -> Response {
     if !headers.contains_key("anthropic-version") {
-        return super::openai::openai_list_models(State(state)).await;
+        return super::openai::openai_list_models(State(state), headers).await;
     }
     let mut data: Vec<serde_json::Value> = Vec::new();
+    let listed = chrono::Utc::now().to_rfc3339();
+    let mut local: Vec<String> = Vec::new();
     if let Ok(mut models) = state.model_manager.list_models().await {
         models.sort_by(|a, b| a.id.cmp(&b.id));
-        let listed = chrono::Utc::now().to_rfc3339();
         for m in models {
+            local.push(m.id.clone());
             data.push(serde_json::json!({
                 "type": "model",
                 "id": m.id,
@@ -535,6 +537,19 @@ pub(crate) async fn list_models_by_dialect(
                 "created_at": listed,
             }));
         }
+    }
+    // What the peers hold and this node does not; a request naming one is forwarded.
+    let peers = super::cluster_catalogue::peer_models(&state, &headers).await;
+    for m in super::cluster_catalogue::merge(Vec::new(), peers) {
+        if local.contains(&m.name) {
+            continue;
+        }
+        data.push(serde_json::json!({
+            "type": "model",
+            "id": m.name,
+            "display_name": m.name,
+            "created_at": listed,
+        }));
     }
     let first = data
         .first()

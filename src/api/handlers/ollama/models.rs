@@ -40,6 +40,7 @@ pub(super) fn parse_modelfile_from(modelfile: &str) -> Option<&str> {
 /// List models (GET /api/tags) - Ollama format
 pub(crate) async fn ollama_list_models(
     State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<OllamaListModelsResponse>, ApiError> {
     info!("📋 GET /api/tags - Listing models (Ollama format)");
 
@@ -107,8 +108,13 @@ pub(crate) async fn ollama_list_models(
                 })
                 .collect();
 
+            // What the peers hold and this node does not: a request for one of those is
+            // forwarded, so the list names them under the node that holds them.
+            let peers =
+                crate::api::handlers::cluster_catalogue::peer_models(&state, &headers).await;
+            let all = crate::api::handlers::cluster_catalogue::merge(ollama_models, peers);
             info!("   ✅ List complete");
-            Ok(Json(OllamaListModelsResponse::new(ollama_models)))
+            Ok(Json(OllamaListModelsResponse::new(all)))
         }
         Err(e) => {
             error!("   ❌ Failed to list models: {}", e);

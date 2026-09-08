@@ -14,7 +14,7 @@ Every route but `/health` demands a key when `[server] require_auth` is on, as
 |---|---|
 | `GET /` | Liveness, as Ollama answers it. |
 | `GET /api/version` | The Ollama API level served, with the crate version beside it. |
-| `GET /api/tags` | The models on this machine, with the architecture, quantisation and parameter count each header declares. |
+| `GET /api/tags` | The models on this machine, with the architecture, quantisation and parameter count each header declares. In a cluster, the models the peers hold follow, each under `node`; a request naming one is forwarded there. |
 | `POST /api/show` | A model's details, with the Modelfile synthesised from its own blobs. `verbose` adds the vocabulary arrays. |
 | `GET /api/ps` | The models resident in memory. |
 | `POST /api/pull` | Fetch a model. Streams progress unless `stream: false`. |
@@ -39,7 +39,7 @@ Every route but `/health` demands a key when `[server] require_auth` is on, as
 | `POST /v1/responses` | The Responses API, lowered to a chat completion and lifted back into output items. `GET` and `DELETE /v1/responses/{id}` read and drop a stored response; `previous_response_id` continues one. |
 | `POST /v1/embeddings` | Embeddings, loading the model on demand. |
 | `POST /v1/rerank`, `POST /rerank` | Score documents against a query with a cross-encoder. |
-| `GET /v1/models` | The models on this machine. Answers in the Messages API's shape to a client sending its version header. |
+| `GET /v1/models` | The models on this machine, then those the peers hold with the holder as `owned_by`. Answers in the Messages API's shape to a client sending its version header. |
 | `GET /v1/models/{id}`, `DELETE /v1/models/{id}` | One model, ids with slashes included. |
 | `POST /v1/moderations` | Category scores from the configured classifier, with the family's own labels under `hazards`. 501 until `moderation_model` is set. |
 

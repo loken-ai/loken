@@ -569,6 +569,10 @@ pub struct OllamaModel {
     /// Model source
     #[serde(default = "default_model_source_str")]
     pub source: String,
+    /// The node that holds the model when it is not this one: a request naming it is
+    /// forwarded there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
     /// What this model can DO ("chat", "txt2img", "img2img", "edit", "sfx",
     /// "music", "video", "tts", "asr", "embedding", ...). The server is the
     /// single authority; clients build their pickers from this instead of
@@ -598,6 +602,7 @@ impl OllamaModel {
             digest: String::new(),
             details: None,
             source: "ollama".to_string(),
+            node: None,
         }
     }
 

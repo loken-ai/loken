@@ -59,6 +59,7 @@ macro_rules! to_json_string {
 mod anthropic_api;
 #[cfg(feature = "audio")]
 mod audio;
+mod cluster_catalogue;
 #[cfg(feature = "image")]
 pub(crate) mod media;
 #[cfg(feature = "metrics")]

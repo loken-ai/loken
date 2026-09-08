@@ -1672,6 +1672,7 @@ fn hf_cache_has_model(repo: &str) -> bool {
 /// the multimodal entries.
 pub(crate) async fn openai_list_models(
     state: axum::extract::State<APIServer>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let now = chrono::Utc::now().timestamp();
@@ -1712,6 +1713,31 @@ pub(crate) async fn openai_list_models(
                 "is_loaded": is_loaded,
             }));
         }
+    }
+
+    // What the peers hold and this node does not, owned by the node that holds it: a
+    // request naming one is forwarded there.
+    let local: std::collections::HashSet<String> = data
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .collect();
+    let peers = super::cluster_catalogue::peer_models(&state, &headers).await;
+    for m in super::cluster_catalogue::merge(Vec::new(), peers) {
+        if local.contains(&m.name) {
+            continue;
+        }
+        let created = chrono::DateTime::parse_from_rfc3339(&m.modified_at)
+            .map(|t| t.timestamp())
+            .unwrap_or(now);
+        data.push(serde_json::json!({
+            "id": m.name,
+            "object": "model",
+            "created": created,
+            "owned_by": m.node.unwrap_or_default(),
+            "kind": "chat",
+            "size_bytes": m.size,
+            "is_loaded": false,
+        }));
     }
 
     // Multimodal entries the OpenAI-shaped endpoints can dispatch to.
