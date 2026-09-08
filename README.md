@@ -97,6 +97,13 @@ listens on anything but localhost: `require_auth`, `api_keys` and `rate_limit_pe
 [`SECURITY.md`](SECURITY.md) - reporting a vulnerability, and what the unauthenticated default
 assumes.
 
+## History
+
+The git history was rewritten before publication. The project began as experiments early in
+2026; what is published starts on 2026-08-30 with the tree as it stood then, laid out as
+chapters, and carries the work from that point on. The earlier commits are not part of this
+repository.
+
 ## Licence
 
 MIT OR Apache-2.0, at your option. Third-party attributions are in [`NOTICE.md`](NOTICE.md).
