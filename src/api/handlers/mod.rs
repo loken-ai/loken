@@ -483,9 +483,10 @@ pub(crate) async fn forward_to_peer(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    if relay.marker.is_empty() || !relay.streams(body) {
+    if relay.marker.is_empty() || !relay.streams(body) || !status.is_success() {
         // A whole body is passed on as it comes; cut short, it fails to parse, which is the
-        // error the client sees. A relay without a marker has no ending to restore either.
+        // error the client sees. A relay without a marker has no ending to restore either,
+        // and a refusal from the peer is one JSON body, not a stream that could stop early.
         return Ok((
             code,
             [(axum::http::header::CONTENT_TYPE, content_type)],
