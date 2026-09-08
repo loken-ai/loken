@@ -820,7 +820,14 @@ impl APIServer {
             // included. `name` is a display label with the tag dropped, so every quantisation
             // of one model collapses to the same string and matches no request at all - a
             // catalogue that looks full and answers nothing.
-            Ok(models) => models.into_iter().map(|m| m.id).collect(),
+            Ok(mut models) => {
+                // The media families found on disk are part of what this node serves,
+                // exactly as the tags route lists them; a catalogue without them sent
+                // every sound turn to a node that had no sound model either.
+                #[cfg(feature = "media")]
+                ollama::inject_local_boogu(self, &mut models);
+                models.into_iter().map(|m| m.id).collect()
+            }
             Err(e) => {
                 tracing::warn!("cluster: cannot list local models ({e}); publishing no catalogue");
                 return None;

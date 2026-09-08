@@ -130,7 +130,7 @@ pub(crate) async fn ollama_list_models(
 /// subdir (not HF-cache `models--*` format), so the standard managers don't discover it; the GUI's
 /// dynamic image-model dropdown filters /api/tags by `details.family`, so it needs a listing. Adds
 /// a synthetic `boogu` entry only when the DiT checkpoint is actually present on disk.
-pub(super) fn inject_local_boogu(
+pub(crate) fn inject_local_boogu(
     state: &APIServer,
     models: &mut Vec<crate::inference::load::model_manager::ModelMetadata>,
 ) {
