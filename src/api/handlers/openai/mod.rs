@@ -1750,6 +1750,8 @@ pub(crate) async fn openai_list_models(
     // RFC3339 download timestamp into a unix `created` so the field
     // matches what most SDKs expect (file age, not request time).
     if let Ok(mut models) = state.model_manager.list_models().await {
+        // A repository without weights is not a model a client can ask for.
+        models.retain(crate::api::handlers::holds_weights);
         // Stable alphabetical order so SDK UIs render the catalog
         // consistently across calls (filesystem walk order is
         // platform-dependent).
