@@ -501,7 +501,7 @@ pub(crate) fn is_image_gen_model(model_name: &str) -> bool {
 /// enum makes this table exhaustive: a family added without a budget of its own does
 /// not compile, and an unwired family is refused by name in `image_family_loader`
 /// before any reserve is computed.
-pub(super) fn family_hot_bytes(hf_models_dir: &str, loader: ImageLoader, model_name: &str) -> u64 {
+pub(crate) fn family_hot_bytes(hf_models_dir: &str, loader: ImageLoader, model_name: &str) -> u64 {
     match loader {
         ImageLoader::Boogu => {
             crate::inference::engine::boogu_engine::hot_component_bytes(hf_models_dir)
@@ -547,7 +547,7 @@ pub(super) fn family_hot_bytes(hf_models_dir: &str, loader: ImageLoader, model_n
 /// this replaces handed every unbudgeted family the FLUX reserve, which is a placement
 /// decision made on another model's architecture. Exhaustive now - a new family cannot
 /// reach the planner without stating what one of its generations needs.
-pub(super) fn family_runtime_bytes(
+pub(crate) fn family_runtime_bytes(
     hf_models_dir: &str,
     loader: ImageLoader,
     model_name: &str,

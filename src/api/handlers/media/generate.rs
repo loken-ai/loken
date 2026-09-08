@@ -46,6 +46,50 @@ pub(super) fn is_vram_exhaustion(e: &(dyn std::error::Error + Send + Sync)) -> b
 /// actually free - a split or a spill, which is slow but finishes. One retry only: if
 /// the second attempt also runs out, the pressure is not transient and the error is
 /// the honest answer.
+/// Whether this node has the weights `model_name` resolves to.
+pub(crate) fn image_served_here(state: &APIServer, model_name: &str) -> bool {
+    requested_checkpoint(&state.huggingface_models_dir, model_name).is_some()
+}
+
+/// Whether one card of this node holds the family's hot component and this request's
+/// scratch whole: the same figure the admission below asks the pressure protocol for.
+/// A model that only fits split against the host is one a peer with a larger card
+/// should take.
+pub(crate) fn image_fits_a_card(
+    state: &APIServer,
+    model_name: &str,
+    geom: crate::inference::place::runtime_demand::RequestGeometry,
+) -> bool {
+    let Ok(loader) = image_family_loader(image_family(model_name)) else {
+        return true;
+    };
+    let hot = family_hot_bytes(&state.huggingface_models_dir, loader, model_name)
+        + family_runtime_bytes(&state.huggingface_models_dir, loader, model_name, geom);
+    let largest = crate::inference::place::device_probe::probe_cuda_gpus(
+        state.default_inference_config.max_gpu_memory_fraction,
+    )
+    .iter()
+    .map(|g| g.available)
+    .max()
+    .unwrap_or(0);
+    largest >= hot
+}
+
+/// Whether a peer's catalogue holds a checkpoint of the same image family as
+/// `model_name`. Requests name a family by alias as often as by checkpoint, and the
+/// catalogue lists checkpoints, so the family is what the two have in common.
+pub(crate) fn serves_image_family(
+    peer: &crate::distributed::membership::NodeState,
+    model_name: &str,
+) -> bool {
+    let family = image_family(model_name);
+    peer.serves.as_ref().is_some_and(|catalogue| {
+        catalogue
+            .iter()
+            .any(|m| is_image_gen_model(m) && image_family(m) == family)
+    })
+}
+
 pub(super) async fn generate_image_resilient(
     state: &APIServer,
     model_name: &str,

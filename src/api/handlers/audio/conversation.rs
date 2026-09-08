@@ -388,6 +388,7 @@ pub(super) async fn conversation_image_stream(
 /// POST /conversation - see the block comment above.
 pub(crate) async fn conversation_handler(
     State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> axum::response::Response {
     let messages: Vec<crate::api::types::Message> = match serde_json::from_value(
@@ -436,6 +437,35 @@ pub(crate) async fn conversation_handler(
         } else {
             (rule_route, "rules")
         };
+
+    // An image turn goes to the node that holds the family on a card that fits it, the
+    // way a direct image request does; the peer classifies the turn again and renders.
+    #[cfg(feature = "image")]
+    if route == ConvRoute::ImageGen {
+        let model = s("image_model").unwrap_or_else(|| "z-image".to_string());
+        let fits = match crate::api::handlers::media::image_model_defaults(&model) {
+            Ok(d) => crate::api::handlers::media::image_fits_a_card(
+                &state,
+                &model,
+                crate::inference::place::runtime_demand::RequestGeometry::new(d.size, d.size),
+            ),
+            Err(_) => true,
+        };
+        if let Some(relayed) = crate::api::handlers::route_media_to_holder(
+            &state,
+            &headers,
+            &model,
+            crate::api::handlers::media::image_served_here(&state, &model),
+            fits,
+            |peer| crate::api::handlers::media::serves_image_family(peer, &model),
+            &crate::api::handlers::CONVERSATION,
+            &req,
+        )
+        .await
+        {
+            return relayed;
+        }
+    }
 
     // Warm-touch the conversation's whole working set so LRU keeps it
     // resident across turns. `cid` also echoes into the response.

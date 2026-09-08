@@ -84,12 +84,38 @@ pub(super) fn encode_mp4(
 #[cfg(feature = "video")]
 pub(crate) async fn video_generations(
     state: axum::extract::State<APIServer>,
+    headers: axum::http::HeaderMap,
     body: Json<serde_json::Value>,
 ) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // The job goes to a node whose catalogue holds the model when this one's does not.
+    {
+        let model = body
+            .0
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("wan")
+            .to_string();
+        let served_here =
+            crate::distributed::routing::can_serve(&state.local_node_state().await, &model);
+        if let Some(relayed) = super::super::route_media_to_holder(
+            &state,
+            &headers,
+            &model,
+            served_here,
+            true,
+            |peer| crate::distributed::routing::can_serve(peer, &model),
+            &super::super::VIDEO,
+            &body.0,
+        )
+        .await
+        {
+            return relayed;
+        }
+    }
     // One media job at a time: two diffusion engines cannot share these cards,
     // and letting them try is what produced the OOM storm (see `media_gate`).
     let _media_guard = state.media_lock().await;
-    use axum::response::IntoResponse;
     let err_resp = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {
         (code, Json(openai_error_body(code, msg))).into_response()
     };
@@ -758,9 +784,6 @@ pub(crate) async fn images_generations(
     headers: axum::http::HeaderMap,
     body: Json<serde_json::Value>,
 ) -> axum::response::Response {
-    // One media job at a time: two diffusion engines cannot share these cards,
-    // and letting them try is what produced the OOM storm (see `media_gate`).
-    let _media_guard = state.media_lock().await;
     use axum::response::IntoResponse;
 
     let err_resp = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {
@@ -819,6 +842,25 @@ pub(crate) async fn images_generations(
     } else {
         (defaults.size, defaults.size)
     };
+    // The job goes where the family is held and a card holds it whole.
+    let geom = crate::inference::place::runtime_demand::RequestGeometry::new(width, height);
+    if let Some(relayed) = super::super::route_media_to_holder(
+        &state,
+        &headers,
+        &model_name,
+        super::image_served_here(&state, &model_name),
+        super::image_fits_a_card(&state, &model_name, geom),
+        |peer| super::serves_image_family(peer, &model_name),
+        &super::super::IMAGES,
+        &body.0,
+    )
+    .await
+    {
+        return relayed;
+    }
+    // One media job at a time: two diffusion engines cannot share these cards,
+    // and letting them try is what produced the OOM storm (see `media_gate`).
+    let _media_guard = state.media_lock().await;
 
     // FLUX Kontext is a dev-family (guidance-distilled) editor: it needs many more steps
     // than schnell (4) for a faithful, sharp edit, and a lower guidance. Override the flux

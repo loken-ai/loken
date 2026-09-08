@@ -657,3 +657,22 @@ fn no_log_line_carries_user_text() {
     );
     assert!(hits.is_empty(), "log lines carrying user text: {hits:?}");
 }
+
+#[cfg(feature = "image")]
+#[test]
+fn a_peer_holds_an_image_family_under_any_checkpoint_name() {
+    use crate::distributed::membership::NodeState;
+    let mut peer = NodeState::default();
+    assert!(!super::media::serves_image_family(&peer, "z-image"));
+    peer.serves = Some(vec!["qwen3:8b".into(), "Tongyi-MAI/Z-Image-Turbo".into()]);
+    assert!(super::media::serves_image_family(&peer, "z-image"));
+    assert!(!super::media::serves_image_family(&peer, "flux-schnell"));
+    assert!(!super::media::serves_image_family(&peer, "qwen3:8b"));
+}
+
+#[test]
+fn a_media_relay_passes_the_peer_answer_through() {
+    assert!(super::IMAGES.marker.is_empty());
+    assert!(super::VIDEO.closing.is_empty());
+    assert!(!super::CONVERSATION.streams(&serde_json::json!({})));
+}

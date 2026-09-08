@@ -336,6 +336,84 @@ pub(crate) const MESSAGES: Relay = Relay {
     streams_by_default: false,
 };
 
+/// Media answers are whole bodies or event streams with no terminal chunk to restore, so
+/// these relays pass what the peer sends and nothing more.
+pub(crate) const IMAGES: Relay = Relay {
+    path: "/v1/images/generations",
+    marker: b"",
+    closing: "",
+    streams_by_default: false,
+};
+pub(crate) const VIDEO: Relay = Relay {
+    path: "/v1/video/generations",
+    marker: b"",
+    closing: "",
+    streams_by_default: false,
+};
+pub(crate) const CONVERSATION: Relay = Relay {
+    path: "/conversation",
+    marker: b"",
+    closing: "",
+    streams_by_default: false,
+};
+
+/// Send a media request to a node that holds the model and can run it, when this node
+/// cannot: it lacks the weights, or no card of its own holds the model whole.
+///
+/// The text router prices candidates by throughput; a media job has no such figure, so
+/// the least loaded live peer that holds the family takes it. A node with no such peer
+/// keeps the request and is bound by its own host-memory admission.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn route_media_to_holder(
+    state: &APIServer,
+    headers: &axum::http::HeaderMap,
+    model: &str,
+    served_here: bool,
+    fits_here: bool,
+    holds: impl Fn(&crate::distributed::membership::NodeState) -> bool,
+    relay: &Relay,
+    body: &serde_json::Value,
+) -> Option<axum::response::Response> {
+    let cluster = state.cluster_handle()?;
+    if headers.contains_key(crate::distributed::cluster::FORWARDED_HEADER)
+        || (served_here && fits_here)
+    {
+        return None;
+    }
+    let now = crate::distributed::cluster_runtime::now_ms(state.cluster_started());
+    cluster.publish_local(state.local_node_state().await);
+    let mut peers: Vec<_> = cluster
+        .peer_view(now)
+        .into_iter()
+        .filter(|p| !p.is_self && p.alive && p.endpoint.is_some() && holds(&p.state))
+        .collect();
+    peers.sort_by(|a, b| {
+        a.state
+            .load
+            .partial_cmp(&b.state.load)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let peer = peers.into_iter().next()?;
+    let url = peer.endpoint.clone()?;
+    let reason = if served_here {
+        "no card of this node holds it whole"
+    } else {
+        "it is not in this node's catalogue"
+    };
+    tracing::info!("forwarding to {}: {model}, {reason}", peer.node_id);
+    match forward_to_peer(&url, relay, body).await {
+        Ok(relayed) => Some(relayed),
+        Err(e) => {
+            tracing::warn!(
+                "cluster: hand-over to {} failed ({e}) - serving here instead",
+                peer.node_id
+            );
+            cluster.note_handover_failed(&peer.node_id, now);
+            None
+        }
+    }
+}
+
 /// Hand a request to the peer best placed for it, or say that it stays here. `prompt` is
 /// the text the peers are asked about, so the one holding its prefix is priced for it. A
 /// request that already travelled once stays where it landed.
@@ -399,9 +477,9 @@ pub(crate) async fn forward_to_peer(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    if !relay.streams(body) {
+    if relay.marker.is_empty() || !relay.streams(body) {
         // A whole body is passed on as it comes; cut short, it fails to parse, which is the
-        // error the client sees.
+        // error the client sees. A relay without a marker has no ending to restore either.
         return Ok((
             code,
             [(axum::http::header::CONTENT_TYPE, content_type)],
