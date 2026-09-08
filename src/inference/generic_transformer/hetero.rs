@@ -492,7 +492,6 @@ impl GenericHeteroTransformer {
     /// kernel replaces later). Bit-faithful to the per-seq decode -> batch-invariant
     /// by construction (each sequence reads only its own block table). `stores`
     /// has one [`crate::inference::cache::paged_kv::PagedKvStore`] per layer (shared block tables).
-    #[allow(clippy::too_many_arguments)]
     pub fn batched_paged_decode(
         &self,
         tokens: &[u32],
@@ -855,7 +854,6 @@ impl GenericHeteroTransformer {
     /// write index `widx` `[b,feat]`). No `from_vec` inside -> safe to wrap in a CUDA
     /// graph (the caller refreshes those buffers OUTSIDE capture, then replays).
     /// Returns logits `[b, vocab]`.
-    #[allow(clippy::too_many_arguments)]
     pub fn decode_layers_gpu(
         &self,
         x: &Tensor,
@@ -1071,7 +1069,6 @@ impl GenericHeteroTransformer {
     /// support + compute dtype as `batched_paged_decode`. This is the TTFT lever
     /// for continuous-batch serving - without it each request pays T serial
     /// memory-bound single-token forwards before its first token.
-    #[allow(clippy::too_many_arguments)]
     pub fn paged_prefill_seq(
         &self,
         tokens: &[u32],
@@ -1214,7 +1211,6 @@ impl GenericHeteroTransformer {
     /// `paged_prefill_seq` over the whole prompt (validated) but skips the prefix's
     /// projections + FFN (the multi-turn / shared-system-prompt win). `cached_len`
     /// must be block-aligned (a whole number of cached blocks).
-    #[allow(clippy::too_many_arguments)]
     pub fn paged_prefill_seq_cached(
         &self,
         tokens: &[u32],

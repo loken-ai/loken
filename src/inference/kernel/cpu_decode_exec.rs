@@ -118,7 +118,7 @@ pub(crate) mod simd {
         let log2ef = _mm256_set1_ps(std::f32::consts::LOG2_E);
         let half = _mm256_set1_ps(0.5);
         let one = _mm256_set1_ps(1.0);
-        let c1 = _mm256_set1_ps(0.693_359_38);
+        let c1 = _mm256_set1_ps(0.693_359_4);
         let c2 = _mm256_set1_ps(-2.121_944_4e-4);
 
         let mut x = _mm256_min_ps(hi, _mm256_max_ps(lo, x));
@@ -134,7 +134,7 @@ pub(crate) mod simd {
         y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(8.333_452e-3));
         y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(4.166_579_6e-2));
         y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.666_666_5e-1));
-        y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(5.000_000_1e-1));
+        y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(5e-1));
         y = _mm256_fmadd_ps(y, z, x);
         y = _mm256_add_ps(y, one);
         // build 2^fx by injecting the exponent bits
@@ -219,7 +219,7 @@ pub(crate) mod simd {
     unsafe fn gelu_core(gate: *const f32, up: *const f32, out: *mut f32, n: usize) {
         let one = _mm256_set1_ps(1.0);
         let neg = _mm256_set1_ps(-1.0);
-        let c2 = _mm256_set1_ps(1.595_769_1); // 2*sqrt(2/pi)
+        let c2 = _mm256_set1_ps(1.595_769); // 2*sqrt(2/pi)
         let a = _mm256_set1_ps(0.044715);
         let mut i = 0;
         while i + 8 <= n {
@@ -235,7 +235,7 @@ pub(crate) mod simd {
         }
         while i < n {
             let g = *gate.add(i);
-            let s = 1.0 / (1.0 + (-(1.595_769_1 * (g + 0.044715 * g * g * g))).exp());
+            let s = 1.0 / (1.0 + (-(1.595_769 * (g + 0.044715 * g * g * g))).exp());
             *out.add(i) = g * s * *up.add(i);
             i += 1;
         }
@@ -399,7 +399,7 @@ pub fn rms_norm_slice(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
     unsafe {
-        return simd::rms_norm(x, w, eps, out);
+        simd::rms_norm(x, w, eps, out)
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     {
@@ -422,7 +422,7 @@ pub fn silu_mul_slice(gate: &[f32], up: &[f32], out: &mut [f32]) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
     unsafe {
-        return simd::silu_mul(gate, up, out);
+        simd::silu_mul(gate, up, out)
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     for i in 0..n {
@@ -440,7 +440,7 @@ pub fn gelu_mul_slice(gate: &[f32], up: &[f32], out: &mut [f32]) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
     unsafe {
-        return simd::gelu_mul(gate, up, out);
+        simd::gelu_mul(gate, up, out)
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     {
@@ -460,7 +460,7 @@ pub fn gelu_mul_inplace(g: &mut [f32], ple: &[f32]) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
     unsafe {
-        return simd::gelu_mul_inplace(g, ple);
+        simd::gelu_mul_inplace(g, ple)
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     {
@@ -512,7 +512,7 @@ pub fn exp_sub_max_sum(x: &mut [f32], max: f32) -> f32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
     unsafe {
-        return simd::exp_sub_max_sum(x, max);
+        simd::exp_sub_max_sum(x, max)
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     {
@@ -538,7 +538,7 @@ pub fn rope_neox_slice(x: &mut [f32], cos: &[f32], sin: &[f32], n_heads: usize, 
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
     unsafe {
-        return simd::rope_neox(x, cos, sin, n_heads, head_dim);
+        simd::rope_neox(x, cos, sin, n_heads, head_dim)
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     for h in 0..n_heads {
@@ -562,7 +562,7 @@ pub fn argmax_f32(v: &[f32]) -> u32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
     unsafe {
-        return simd::argmax(v);
+        simd::argmax(v)
     }
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     {

@@ -97,13 +97,13 @@ struct CapturedDecode {
 const CB_GRAPH_BUCKET: usize = 256;
 
 fn argmax_row(logits: &Tensor, row: usize) -> crate::tensor::Result<u32> {
-    Ok(logits
+    logits
         .narrow(0, row, 1)?
         .flatten_all()?
         .to_dtype(DType::F32)?
         .argmax(D::Minus1)?
         .to_dtype(DType::U32)?
-        .to_scalar::<u32>()?)
+        .to_scalar::<u32>()
 }
 
 /// Select one token from `logits` row `row` under per-request sampling controls.
@@ -409,8 +409,7 @@ impl BatchedModel for GhBatched {
                     {
                         use rayon::prelude::*;
                         let k = s0.top_k.unwrap();
-                        let (temp, rp, top_p) =
-                            (s0.temperature, s0.repeat_penalty as f32, s0.top_p);
+                        let (temp, rp, top_p) = (s0.temperature, s0.repeat_penalty, s0.top_p);
                         let (mut prows, mut ptoks) = (Vec::new(), Vec::new());
                         if rp > 1.0 {
                             for (j, &i) in dec.iter().enumerate() {
@@ -533,27 +532,27 @@ impl GhBatched {
         let toks_v: Vec<u32> = toks
             .iter()
             .copied()
-            .chain(std::iter::repeat(toks[0]).take(pad))
+            .chain(std::iter::repeat_n(toks[0], pad))
             .collect();
         let pos_v: Vec<usize> = pos
             .iter()
             .copied()
-            .chain(std::iter::repeat(pos[0]).take(pad))
+            .chain(std::iter::repeat_n(pos[0], pad))
             .collect();
         let slots_v: Vec<usize> = slots
             .iter()
             .copied()
-            .chain(std::iter::repeat(slots[0]).take(pad))
+            .chain(std::iter::repeat_n(slots[0], pad))
             .collect();
         let ctx_v: Vec<usize> = ctx
             .iter()
             .copied()
-            .chain(std::iter::repeat(ctx[0]).take(pad))
+            .chain(std::iter::repeat_n(ctx[0], pad))
             .collect();
         let bts_v: Vec<Vec<u32>> = bts
             .iter()
             .cloned()
-            .chain(std::iter::repeat(bts[0].clone()).take(pad))
+            .chain(std::iter::repeat_n(bts[0].clone(), pad))
             .collect();
         let (toks, pos, slots, bts, ctx) = (
             &toks_v[..],
@@ -786,7 +785,6 @@ impl ContinuousServer {
     /// Spawn the worker. `model` is moved in and owned for the worker's lifetime;
     /// `eos` terminates a sequence; `num_blocks`/`block_size` size the paged KV
     /// pool; `max_running` caps the concurrent decode batch width.
-    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         model: Arc<GenericHeteroTransformer>,
         eos: u32,

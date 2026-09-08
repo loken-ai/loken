@@ -436,7 +436,6 @@ impl EzAudioDiT {
     /// timestep conditioning `[1, H]` (drives the per-block SOLA low-rank term); `ctx`
     /// the embedded text `[Sc, H]`; `rope` the shared self-attn cos/sin. `skip` is the
     /// saved early-block output for an `out_block` (`None` for in/mid).
-    #[allow(clippy::too_many_arguments)]
     fn block_forward(
         &self,
         b: &Block,

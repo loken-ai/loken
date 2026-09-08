@@ -368,7 +368,7 @@ pub fn fused_gelu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
                 .zip(g.par_iter().zip(u.par_iter()))
                 .for_each(|(o, (&v, &uu))| {
                     let gelu =
-                        0.5 * v * (1.0 + (0.797_884_56_f32 * (v + 0.044715 * v * v * v)).tanh());
+                        0.5 * v * (1.0 + (0.797_884_6_f32 * (v + 0.044715 * v * v * v)).tanh());
                     *o = gelu * uu;
                 });
             return Tensor::from_vec(out, gate.shape(), &gate.device());
@@ -791,15 +791,15 @@ pub fn fused_rmsnorm_then_add(
 ) -> Result<Tensor> {
     if !x.device().runs_as_card() {
         let norm = crate::tensor::ops::rms_norm(x, weight, eps)?;
-        return Ok((norm + residual)?);
+        return norm + residual;
     }
     if x.dtype() != DType::F32 || residual.dtype() != DType::F32 || weight.dtype() != DType::F32 {
         let norm = crate::tensor::ops::rms_norm(x, weight, eps)?;
-        return Ok((norm + residual)?);
+        return norm + residual;
     }
     if x.shape() != residual.shape() {
         let norm = crate::tensor::ops::rms_norm(x, weight, eps)?;
-        return Ok(norm.broadcast_add(residual)?);
+        return norm.broadcast_add(residual);
     }
 
     let x = x.contiguous()?;

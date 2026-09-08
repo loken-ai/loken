@@ -276,7 +276,6 @@ impl SdxlPipeline {
     }
 
     /// Generate one image. Returns interleaved RGB8 of `width * height`.
-    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
         prompt: &str,
@@ -476,7 +475,6 @@ impl SdxlPipeline {
     /// source is exactly what those early steps fix.
     ///
     /// `init` is interleaved RGB8 at `width * height`.
-    #[allow(clippy::too_many_arguments)]
     pub fn generate_img2img(
         &self,
         prompt: &str,
@@ -504,7 +502,6 @@ impl SdxlPipeline {
     }
 
     /// The one sampling loop, from noise or from an image.
-    #[allow(clippy::too_many_arguments)]
     fn render(
         &self,
         prompt: &str,

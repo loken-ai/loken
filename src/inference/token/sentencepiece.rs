@@ -146,10 +146,9 @@ impl SentencePiece {
             }
             // Always allow a single-char step (byte-fallback) so a path exists.
             let cand = best[i].0 + unk_penalty;
-            if cand > best[i + 1].0 || (!matched && best[i + 1].0 == NEG) {
-                if cand > best[i + 1].0 {
-                    best[i + 1] = (cand, i, None);
-                }
+            if (cand > best[i + 1].0 || (!matched && best[i + 1].0 == NEG)) && cand > best[i + 1].0
+            {
+                best[i + 1] = (cand, i, None);
             }
         }
         // Backtrack.

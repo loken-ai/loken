@@ -212,7 +212,6 @@ impl AwqWeight {
         let c = layer
             .forward_view(&ndev, &view, tokens)
             .map_err(|e| crate::tensor::Error::msg(format!("awq marlin: {}", e.0)))?;
-        drop(view);
         let y = cuda_ext::tensor_from_f16_slice(c, (tokens, self.n), &dev)?.to_dtype(DType::F32)?;
         let y = self.add_bias(y)?;
         y.reshape(out_shape)
@@ -433,15 +432,18 @@ impl QMatMul {
         // Marlin W4A16: also eager-built per `awq_marlin_policy` - the
         // tensor-core small-M GEMM that removes the speculative-verify cliff.
         #[cfg(feature = "cuda")]
-        if w.qweight.device().is_cuda() && w.k % 8 == 0 && w.k % w.group_size.max(1) == 0 {
+        if w.qweight.device().is_cuda()
+            && w.k.is_multiple_of(8)
+            && w.k.is_multiple_of(w.group_size.max(1))
+        {
             match w.host_tensors() {
                 Ok((qw, qz, sc)) => {
                     use crate::tensor::marlin;
                     let policy = awq_marlin_policy();
                     let mut marlin_built = false;
                     if policy != AwqMarlinPolicy::Off
-                        && w.k % marlin::MARLIN_TILE == 0
-                        && w.n % marlin::MIN_THREAD_N == 0
+                        && w.k.is_multiple_of(marlin::MARLIN_TILE)
+                        && w.n.is_multiple_of(marlin::MIN_THREAD_N)
                         && w.group_size == marlin::MARLIN_GROUP_SIZE
                     {
                         // In dual mode the Marlin copy is the second layout ->

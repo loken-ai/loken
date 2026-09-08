@@ -23,7 +23,6 @@ use crate::tensor::KvCache;
 use crate::tensor::{DType, Device, IndexOp, Result, Tensor, D};
 use std::io::{Read, Seek};
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub struct GptOssConfig {
@@ -518,7 +517,6 @@ impl GptOssAttn {
     /// Attention core on materialized K/V `[b, n_kv_head, kv_len, hd]`: fused
     /// flash decode when applicable, else the masked GQA matmul chain, then the
     /// output projection. (Prefill and non-CUDA decode path.)
-    #[allow(clippy::too_many_arguments)]
     fn attend(
         &self,
         q: &Tensor,
@@ -690,8 +688,8 @@ impl GptOssLayer {
         };
         let is_prefill = x.dim(1)? > 1;
         // FusedMoeGGUF folds the post-FFN residual into its down-projection.
-        let out = self.moe.forward_with_residual(&hn, &x, is_prefill);
-        out
+
+        self.moe.forward_with_residual(&hn, &x, is_prefill)
     }
 }
 
@@ -1225,8 +1223,8 @@ impl GptOssModel {
         }
         let x = self.norm.forward(&x.to_dtype(DType::F32)?)?; // F32 final norm
         let x = x.i((.., seq - 1, ..))?.to_dtype(self.dtype)?; // last token, back to BF16 for lm_head
-        let logits = self.lm_head.forward(&x)?.to_dtype(DType::F32);
-        logits
+
+        self.lm_head.forward(&x)?.to_dtype(DType::F32)
     }
 
     /// CUDA-graph decode (single-GPU, env-gated). Captured once after a few warmup

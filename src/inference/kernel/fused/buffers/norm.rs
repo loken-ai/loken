@@ -758,7 +758,6 @@ pub fn fused_penalty_argmax_u32_with_device(
 ///
 /// Returns `[1, n_q_heads, 1, 512]` F32. NOT thread-safe across streams  -
 /// caller must ensure exclusive access during graph capture.
-#[allow(clippy::too_many_arguments)]
 pub fn fused_attn_decode_f32_hd512(
     q: &Tensor,
     k: &Tensor,
@@ -879,7 +878,6 @@ pub fn fused_attn_decode_f32_hd512(
 /// for the partial pass (good occupancy at long KV, unlike the 8-block single-
 /// pass kernel) + a per-head combine. Same args/contract. Closes the gemma4
 /// global-hd512 long-ctx loss where the single-block kernel loses to cuBLAS.
-#[allow(clippy::too_many_arguments)]
 pub fn fused_attn_decode_f32_hd512_splitk(
     q: &Tensor,
     k: &Tensor,
@@ -917,7 +915,7 @@ pub fn fused_attn_decode_f32_hd512_splitk(
     // splits of ~45 positions each, idling 82 % of every block's threads.
     // Floor of 4 keeps enough blocks (4.n_heads) to fill the SMs at short KV;
     // cap of 64 bounds the partials buffer + combine cost at very long KV.
-    let nsplit: usize = ((max_kv_padded + 255) / 256).clamp(4, 64);
+    let nsplit: usize = max_kv_padded.div_ceil(256).clamp(4, 64);
 
     let cuda_dev = q.device().as_cuda_device()?;
     let ptx = get_ptx(&cuda_dev)?;

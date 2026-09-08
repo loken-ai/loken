@@ -104,7 +104,6 @@ pub fn sdpa(
 ///
 /// Callers that need bit-exact F32 - parity harnesses, CPU paths, anything comparing against
 /// a reference dump - must keep using [`sdpa`].
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn sdpa_tc(
     q: &Tensor,
     k: &Tensor,
@@ -300,7 +299,6 @@ pub(crate) fn query_tile_for(seq: usize) -> usize {
 /// bit-exactness unit test can force the tiled path on tiny inputs). When
 /// `Sq <= tile` the single-pass path runs unchanged (bit-identical, zero
 /// overhead for decode / short-sequence callers).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn sdpa_tiled(
     q: &Tensor,
     k: &Tensor,
@@ -321,7 +319,6 @@ pub(crate) fn sdpa_tiled(
 /// class of DiT attention that is the difference between a memory-bound F32 GEMM and
 /// the tensor-core path - attention measured 71% of a 1024^2 edit's forward time.
 /// Callers that need bit-exact F32 (parity harnesses, CPU paths) pass false.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn sdpa_tiled_dt(
     q: &Tensor,
     k: &Tensor,

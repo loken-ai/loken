@@ -223,7 +223,7 @@ impl EagleHead {
         let srow = self.sin.narrow(0, pos, seq)?;
         let rope_fn = self.rope_fn();
         let rope = |t: &Tensor| -> Result<Tensor> {
-            Ok(rope_fn(&t.unsqueeze(0)?.contiguous()?, &crow, &srow)?.squeeze(0)?)
+            rope_fn(&t.unsqueeze(0)?.contiguous()?, &crow, &srow)?.squeeze(0)
         };
         let q = rope(&q)?; // [nh, seq, hd]
         let k = rope(&k)?;
@@ -290,7 +290,7 @@ impl EagleHead {
         let srow = self.sin.narrow(0, pos, 1)?;
         let rope_fn = self.rope_fn();
         let rope = |t: &Tensor| -> Result<Tensor> {
-            Ok(rope_fn(&t.unsqueeze(0)?.contiguous()?, &crow, &srow)?.squeeze(0)?)
+            rope_fn(&t.unsqueeze(0)?.contiguous()?, &crow, &srow)?.squeeze(0)
         };
         let q = rope(&q)?; // [nh, 1, hd]
         let k = rope(&k)?; // [nkv, 1, hd]
@@ -416,7 +416,7 @@ impl EagleDecoder {
 /// to plain decode. Returns `(committed, n_accepted)` with `n_accepted + 1` tokens.
 pub fn verify_accept(drafts: &[u32], target_next: &[u32]) -> (Vec<u32>, usize) {
     let k = drafts.len();
-    debug_assert!(target_next.len() >= k + 1, "need K+1 target greedy tokens");
+    debug_assert!(target_next.len() > k, "need K+1 target greedy tokens");
     let mut n = 0;
     while n < k && drafts[n] == target_next[n] {
         n += 1;

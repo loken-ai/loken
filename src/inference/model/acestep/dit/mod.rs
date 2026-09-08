@@ -281,7 +281,7 @@ fn dit_load_t(
         .to_dtype(CDType::F32)?;
     let dims = dq.dims().to_vec();
     let v = dq.flatten_all()?.to_vec1::<f32>()?;
-    Ok(Tensor::from_vec_f32(v, dims)?.to_device(device)?)
+    Tensor::from_vec_f32(v, dims)?.to_device(device)
 }
 
 fn dit_lin(

@@ -50,7 +50,6 @@ fn q8_pv_axpy(scale: f32, qs: &[i8], o: &mut [f32]) {
             *po.add(c) += scale * (*pq.add(c)) as f32;
             c += 1;
         }
-        return;
     }
     #[cfg(not(target_feature = "avx2"))]
     {
@@ -73,7 +72,7 @@ pub struct CpuQ8Kv {
 impl CpuQ8Kv {
     pub fn new(n_head: usize, n_kv_head: usize, head_dim: usize) -> Self {
         assert!(
-            head_dim % QK == 0,
+            head_dim.is_multiple_of(QK),
             "head_dim {head_dim} must be a multiple of {QK}"
         );
         Self {
@@ -368,7 +367,7 @@ impl CpuQ8Kv {
         // 3. grouped PV: read each V row ONCE per kv-head group, chunked over ctx
         //    to fill cores. Partial acc per (kv-head, chunk), [n_rep*hd].
         let nb = self.nb;
-        let nchunk = ((rayon::current_num_threads() + nkv - 1) / nkv).max(1);
+        let nchunk = rayon::current_num_threads().div_ceil(nkv).max(1);
         let cs = seq.div_ceil(nchunk);
         let partials: Vec<Vec<f32>> = (0..nkv * nchunk)
             .into_par_iter()

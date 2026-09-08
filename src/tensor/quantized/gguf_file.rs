@@ -410,7 +410,7 @@ impl TensorInfo {
             .read_exact(&mut raw)
             .map_err(|e| Error::msg(format!("gguf tensor read: {e}")))?;
         let qt = QHostTensor::from_bytes(&raw, self.ggml_dtype, self.shape.dims().to_vec())?;
-        Ok(QTensor::from_native(Arc::new(qt), device)?)
+        QTensor::from_native(Arc::new(qt), device)
     }
 
     /// Zero-copy read from an mmap'd file: slice the tensor bytes DIRECTLY
@@ -472,11 +472,11 @@ impl TensorInfo {
                     dims.clone(),
                 )
             } {
-                return Ok(QTensor::from_native(Arc::new(qt), device)?);
+                return QTensor::from_native(Arc::new(qt), device);
             }
         }
         let qt = QHostTensor::from_bytes(raw, self.ggml_dtype, dims)?;
-        Ok(QTensor::from_native(Arc::new(qt), device)?)
+        QTensor::from_native(Arc::new(qt), device)
     }
 }
 

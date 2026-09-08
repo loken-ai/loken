@@ -75,7 +75,7 @@ pub(crate) fn reset_adaptive_prefill_chunk() {
 mod params;
 pub use params::*;
 mod load;
-pub use load::*;
+pub(crate) use load::*;
 
 impl LoadedModelState {
     /// QuantizedMoondream-aware forward: uses captured CUDA graph for
@@ -401,9 +401,7 @@ impl LlmEngine {
     /// here: `load_model` is awaited from blocking threads everywhere else, and awaiting it
     /// inside an axum handler makes that handler's future non-Send.
     pub async fn config_drafter(&self) -> Option<Arc<LlmEngine>> {
-        if self.config.draft_model.is_none() {
-            return None;
-        }
+        self.config.draft_model.as_ref()?;
         self.draft_engine.lock().await.as_ref().cloned()
     }
     /// Spec-decode: roll the drafter's KV cache back to `len` tokens (after a
@@ -411,7 +409,7 @@ impl LlmEngine {
     pub fn draft_trim_kv(&self, len: usize) {
         if let Some(d) = self.draft_engine.blocking_lock().as_ref() {
             if let Some(s) = d.model_state.blocking_lock().as_mut() {
-                let _ = s.model.trim_kv(len);
+                s.model.trim_kv(len);
             }
         }
     }
@@ -450,7 +448,6 @@ impl LlmEngine {
     /// `recent_tokens` extended with the tokens drafted so far (draft[0..i]), which
     /// is precisely the window the target sees at verify position i (the spec cycle
     /// does not touch recent_tokens between draft and verify). penalty<=1.0 -> no-op.
-    #[allow(clippy::too_many_arguments)]
     pub fn draft_k(
         &self,
         first_token: u32,
@@ -739,7 +736,7 @@ impl LlmEngine {
 mod gguf;
 pub use gguf::*;
 mod decode;
-pub use decode::*;
+pub(crate) use decode::*;
 /// The shape of the model currently loaded: what the checkpoint declares about its
 /// own geometry, which the planner and the API both ask for.
 #[derive(Debug, Clone)]

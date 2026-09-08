@@ -389,7 +389,7 @@ impl KyutaiMimiEncoder {
     pub fn encode(&self, wav: &[f32]) -> Result<Tensor> {
         const FRAME: usize = 1920;
         let mut samples = wav.to_vec();
-        if samples.len() % FRAME != 0 {
+        if !samples.len().is_multiple_of(FRAME) {
             samples.resize(samples.len().div_ceil(FRAME) * FRAME, 0.0);
         }
         let l = samples.len();

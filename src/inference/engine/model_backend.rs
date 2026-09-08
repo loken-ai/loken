@@ -357,9 +357,6 @@ pub(crate) trait ModelBackend: Send {
     ) -> crate::tensor::Result<()> {
         Ok(())
     }
-    fn kv_snapshot_uniform_len(&self, _index: usize) -> Option<usize> {
-        None
-    }
     fn kv_snapshot_dtype(&self, _index: usize) -> Option<u8> {
         None
     }
@@ -448,11 +445,6 @@ pub(crate) trait ModelBackend: Send {
 
     // --- CUDA-graph decode path -----------------------------------------
 
-    /// Padded forward for CUDA graph mode (fixed-size attention buffers).
-    fn forward_padded(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.forward(x, index_pos)
-    }
-
     /// Split step 1: QKV + RoPE + KV write (outside graph).
     fn prepare_all_kv(
         &mut self,
@@ -460,22 +452,6 @@ pub(crate) trait ModelBackend: Send {
         _index_pos: usize,
     ) -> crate::tensor::Result<(Tensor, Vec<Tensor>)> {
         crate::tensor::bail!("prepare_all_kv only for GenericHetero / GenericHeteroVision")
-    }
-
-    /// Split step 2: attention + FFN + output (inside graph).
-    fn compute_all_from_kv(
-        &mut self,
-        _hidden: &Tensor,
-        _all_q: &[Tensor],
-    ) -> crate::tensor::Result<Tensor> {
-        crate::tensor::bail!("compute_all_from_kv only for GenericHetero / GenericHeteroVision")
-    }
-
-    /// Graph-compatible decode forward (single-token, single CUDA device).
-    /// Caller must have called `update_graph_state(pos)` immediately prior.
-    /// Only implemented for `GenericHetero`; other variants fall back.
-    fn forward_graph(&mut self, _x: &Tensor) -> crate::tensor::Result<Tensor> {
-        crate::tensor::bail!("forward_graph only for GenericHetero / GenericHeteroVision")
     }
 
     /// Refresh graph-compatible state (rope buffers + padded mask) for `pos`.
@@ -962,9 +938,6 @@ impl ModelBackend for GenericBackend {
     fn best_kv_snapshot(&self, prompt: &[u32]) -> Option<(usize, usize)> {
         self.0.best_kv_snapshot(prompt)
     }
-    fn kv_snapshot_uniform_len(&self, index: usize) -> Option<usize> {
-        self.0.kv_snapshot_uniform_len(index)
-    }
     fn restore_kv_snapshot(&mut self, index: usize) -> crate::tensor::Result<(Vec<u32>, usize)> {
         self.0.restore_kv_snapshot(index)
     }
@@ -1042,28 +1015,12 @@ impl ModelBackend for GenericBackend {
         true
     }
 
-    fn forward_padded(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.0.forward_padded(x, index_pos)
-    }
-
     fn prepare_all_kv(
         &mut self,
         x: &Tensor,
         index_pos: usize,
     ) -> crate::tensor::Result<(Tensor, Vec<Tensor>)> {
         self.0.prepare_all_kv(x, index_pos)
-    }
-
-    fn compute_all_from_kv(
-        &mut self,
-        hidden: &Tensor,
-        all_q: &[Tensor],
-    ) -> crate::tensor::Result<Tensor> {
-        self.0.compute_all_from_kv(hidden, all_q)
-    }
-
-    fn forward_graph(&mut self, x: &Tensor) -> crate::tensor::Result<Tensor> {
-        self.0.forward_graph(x)
     }
 
     fn update_graph_state(&mut self, pos: usize) -> crate::tensor::Result<()> {
@@ -1200,28 +1157,12 @@ impl ModelBackend for GenericVisionBackend {
     // repeating tokens emerges (e.g. structured-output VLM).
     // (supports_pld stays at the default `false`.)
 
-    fn forward_padded(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.text.forward_padded(x, index_pos)
-    }
-
     fn prepare_all_kv(
         &mut self,
         x: &Tensor,
         index_pos: usize,
     ) -> crate::tensor::Result<(Tensor, Vec<Tensor>)> {
         self.text.prepare_all_kv(x, index_pos)
-    }
-
-    fn compute_all_from_kv(
-        &mut self,
-        hidden: &Tensor,
-        all_q: &[Tensor],
-    ) -> crate::tensor::Result<Tensor> {
-        self.text.compute_all_from_kv(hidden, all_q)
-    }
-
-    fn forward_graph(&mut self, x: &Tensor) -> crate::tensor::Result<Tensor> {
-        self.text.forward_graph(x)
     }
 
     fn update_graph_state(&mut self, pos: usize) -> crate::tensor::Result<()> {
@@ -1551,7 +1492,7 @@ impl ModelBackend for Qwen35MoeBackend {
         let mut expanded = false;
         for &t in prompt_tokens {
             if t == img_tok && !expanded {
-                ids.extend(std::iter::repeat(img_tok).take(n_merged));
+                ids.extend(std::iter::repeat_n(img_tok, n_merged));
                 expanded = true;
             } else {
                 ids.push(t);

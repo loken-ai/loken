@@ -136,7 +136,6 @@ pub fn mvq_via_pre_quantized_q8_1(
 ///
 /// Same row-width / k-alignment constraint as `quantize_q8_0_f32_into_offset`
 /// (k must be a multiple of MATRIX_ROW_PADDING). Single-row decode only.
-#[allow(clippy::too_many_arguments)]
 pub fn quantize_q8_0_f32_dev_slot(
     src: &CudaView<f32>,
     dst: &mut CudaSlice<u8>,
@@ -286,7 +285,6 @@ pub fn quantize_q8_0_f32_into_offset(
 /// Backwards-compat unscaled form: callers should prefer
 /// [`attn_score_q8_0_q8_1_gqa_scaled`] to fold the 1/sqrt(d) scale into the
 /// kernel and skip the post-matmul affine launch.
-#[allow(clippy::too_many_arguments)]
 pub fn attn_score_q8_0_q8_1_gqa(
     k_blob: &CudaSlice<u8>,
     q_f32: &CudaView<f32>,
@@ -319,7 +317,6 @@ pub fn attn_score_q8_0_q8_1_gqa(
 ///
 /// Returns scores `[n_q_heads, max_seq_padded]` F32. Callers MUST keep
 /// `max_seq_padded` constant across all calls in one captured graph.
-#[allow(clippy::too_many_arguments)]
 pub fn attn_score_q8_0_f32_dev_pos(
     k_blob: &CudaSlice<u8>,
     q_f32: &CudaView<f32>,
@@ -402,7 +399,6 @@ pub fn attn_score_q8_0_f32_dev_pos(
 /// direction - so we can't reuse the standard `mul_mat_vec_q` kernels
 /// (which reduce along the block axis). Each lane owns one head_dim output
 /// and sweeps seq_kv internally.
-#[allow(clippy::too_many_arguments)]
 pub fn attn_output_q8_0_f32_gqa(
     v_blob: &CudaSlice<u8>,
     probs_f32: &CudaView<f32>,
@@ -488,7 +484,6 @@ pub fn attn_output_q8_0_f32_gqa(
 ///     when graph capture mode allocates them with stable addresses.
 ///
 /// Returns `[n_q_heads, head_dim]` F32.
-#[allow(clippy::too_many_arguments)]
 pub fn attn_output_q8_0_f32_dev_pos(
     v_blob: &CudaSlice<u8>,
     probs_f32: &CudaView<f32>,
@@ -576,7 +571,6 @@ pub fn attn_output_q8_0_f32_dev_pos(
 /// the last `window` keys (gemma4 SWA; the score kernel -INF'd the rest).
 ///
 /// Returns `[n_q_heads, head_dim]` F32.
-#[allow(clippy::too_many_arguments)]
 pub fn attn_softmax_output_q8_0_f32_dev_pos(
     v_blob: &CudaSlice<u8>,
     scores_f32: &CudaView<f32>,

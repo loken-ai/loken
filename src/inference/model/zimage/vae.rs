@@ -8,7 +8,6 @@
 // Re-exported: FLUX.2 and SDXL load this same autoencoder through this module.
 use crate::inference::model::vae_blocks::{AttnNaming, Naming, ProjectionKind, Shape};
 pub use crate::inference::model::vae_blocks::{Decoder, Encoder};
-use crate::tensor::layer::{conv2d, group_norm, linear, Conv2d, Conv2dConfig, GroupNorm, Linear};
 use crate::tensor::DType;
 use crate::tensor::VarBuilder;
 use crate::tensor::{Device, Result, Tensor};

@@ -154,11 +154,11 @@ fn load_q8<R: Read + Seek>(
                 return Ok(qt);
             }
         }
-        return Ok(c.tensor(r, name, d)?);
+        return c.tensor(r, name, d);
     }
     let cpu = c.tensor(r, name, &crate::tensor::Device::Cpu)?;
     let f = cpu.dequantize(&crate::tensor::Device::Cpu)?;
-    Ok(QTensor::quantize_onto(&f, GgmlDType::Q8_0, d)?)
+    QTensor::quantize_onto(&f, GgmlDType::Q8_0, d)
 }
 fn ld_f32<R: Read + Seek>(
     c: &gguf_file::Content,
@@ -166,7 +166,7 @@ fn ld_f32<R: Read + Seek>(
     name: &str,
     d: &Device,
 ) -> Result<Tensor> {
-    Ok(c.tensor(r, name, d)?.dequantize(d)?.to_dtype(DType::F32)?)
+    c.tensor(r, name, d)?.dequantize(d)?.to_dtype(DType::F32)
 }
 
 use crate::tensor::layer::Linear;
@@ -271,7 +271,7 @@ impl NemotronMoeBlock {
                 let mut topk_w = probs.gather(&topk_ids, D::Minus1)?; // [n_tok,k]
                 if self.weights_norm {
                     let s0 = topk_w.sum_keepdim(D::Minus1)?;
-                    let floor = Tensor::full(6.103515625e-5_f32, s0.dims(), &s0.device())?;
+                    let floor = Tensor::full(6.103_515_6e-5_f32, s0.dims(), &s0.device())?;
                     let s = s0.maximum(&floor)?;
                     topk_w = topk_w.broadcast_div(&s)?;
                 }
@@ -824,7 +824,7 @@ impl NemotronSsmBlock {
         if proj_all.is_some() {
             // Batched out_proj: ONE GEMM over [b, seq, d_inner] vs `seq` GEMVs.
             let y_all = Tensor::cat(&ys.iter().collect::<Vec<_>>(), 1)?.to_dtype(xs.dtype())?; // [b, seq, d_inner]
-            return Ok(self.out_proj.forward(&y_all)?); // [b, seq, d_model]
+            return self.out_proj.forward(&y_all); // [b, seq, d_model]
         }
         // Decode (seq==1): skip the cat copy - return the single step directly.
         if outs.len() == 1 {
@@ -935,7 +935,7 @@ impl NemotronSsmBlock {
             }
         }
         let y = Tensor::from_vec(y_all, (1, seq, di), &xs.device())?.to_dtype(xs.dtype())?;
-        Ok(self.out_proj.forward(&y)?)
+        self.out_proj.forward(&y)
     }
 }
 
@@ -1276,7 +1276,7 @@ impl NemotronHModel {
                 }
                 NemotronBlock::Moe(b) => (2u8, b.forward(&h)?),
             };
-            let (k, h) = kind;
+            let (_k, h) = kind;
             x = (residual + h)?;
         }
         let x = self.norm.forward(&x.to_dtype(DType::F32)?)?;
@@ -1294,6 +1294,7 @@ impl NemotronHModel {
 /// chunk of size L and carries the state across chunks for the O(seq.L) form.
 /// All tensors F32. x:[seq,nh,hd] b/c:[seq,ng,ds] dt:[seq,nh] a:[nh]. Returns y:[seq,nh,hd]
 /// (the Σ_s h.C term, no D-skip - matches `ssm_step`'s output).
+#[cfg(test)]
 fn ssd_quadratic(
     x: &Tensor,
     b: &Tensor,
@@ -1339,7 +1340,7 @@ fn ssd_quadratic(
     let dx = x.broadcast_mul(&dt.reshape((seq, nh, 1))?)?; // [seq, nh, hd]
     let dx_h = dx.transpose(0, 1)?.contiguous()?; // [nh, seq, hd]
     let y = w.matmul(&dx_h)?; // [nh, seq, hd]
-    Ok(y.transpose(0, 1)?.contiguous()?) // [seq, nh, hd]
+    y.transpose(0, 1)?.contiguous() // [seq, nh, hd]
 }
 
 /// Full SSD chunked scan: O(seq.L) parallel form of the Mamba2 recurrence. Splits
@@ -1347,6 +1348,7 @@ fn ssd_quadratic(
 /// plus the contribution of the carried state, and updates the state for the next
 /// chunk. Bit-parity (≈1e-3) with the sequential `ssm_step` recurrence (h_in=0 at
 /// chunk 0). Returns y:[seq,nh,hd] (Σ_s h.C, no D-skip). F32.
+#[cfg(test)]
 fn ssd_chunk_scan(
     x: &Tensor,
     b: &Tensor,

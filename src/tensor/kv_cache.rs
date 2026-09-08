@@ -6,7 +6,7 @@
 //! once per growth and nothing per step; the second pays a copy of the whole cache per step but
 //! never reserves what it will not use. A test below holds them against each other.
 
-use super::{Device, Error, Result, Tensor};
+use super::{Error, Result, Tensor};
 
 /// One growing buffer along one axis.
 ///
@@ -292,6 +292,7 @@ impl ConcatKvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::Device;
 
     fn step(seq: usize, dim_size: usize, value: f32) -> Tensor {
         let v: Vec<f32> = (0..seq * dim_size)

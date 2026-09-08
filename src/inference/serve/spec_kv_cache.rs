@@ -193,6 +193,9 @@ impl SpecKvCache {
         pos: usize,
         dev: &crate::tensor::cuda_ext::RawCudaDevice,
     ) -> Result<&CudaSlice<i32>> {
+        // Checked then unwrapped rather than matched: a borrow returned from a match arm
+        // would still be live at the assignment below, which the borrow checker refuses.
+        #[allow(clippy::unnecessary_unwrap)]
         if self.seq_kv_dev_value == Some(pos) && self.seq_kv_dev.is_some() {
             return Ok(self.seq_kv_dev.as_ref().unwrap());
         }

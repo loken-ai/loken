@@ -4,7 +4,6 @@
 
 use super::*;
 
-#[allow(clippy::too_many_arguments)]
 pub fn attn_output_q4_0_f32_gqa(
     v_blob: &CudaSlice<u8>,
     probs_f32: &CudaView<f32>,
@@ -58,7 +57,7 @@ pub fn attn_output_q4_0_f32_gqa(
             .map_err(|e| anyhow!("load kernel: {e}"))?;
 
         let seq_per_split: usize = 256;
-        let s = (seq_kv + seq_per_split - 1) / seq_per_split;
+        let s = seq_kv.div_ceil(seq_per_split);
 
         const SPLITK_WARPS_PER_BLOCK: u32 = 8;
         let cfg = LaunchConfig {
@@ -138,7 +137,6 @@ pub fn attn_output_q4_0_f32_gqa(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn attn_output_q4_0_f32_dev_pos(
     v_blob: &CudaSlice<u8>,
     probs_f32: &CudaView<f32>,
@@ -223,7 +221,6 @@ pub fn attn_output_q4_0_f32_dev_pos(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn attn_softmax_output_q4_0_f32_gqa(
     v_blob: &CudaSlice<u8>,
     scores_f32: &CudaView<f32>,
@@ -309,7 +306,6 @@ pub fn attn_softmax_output_q4_0_f32_gqa(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn attn_fused_q8_decode_dev_pos(
     k_blob: &CudaSlice<u8>,
     v_blob: &CudaSlice<u8>,
@@ -370,7 +366,6 @@ pub fn attn_fused_q8_decode_dev_pos(
 /// (`[n_q_heads, head_dim]` F32) but far more parallel - built to beat the
 /// 2-kernel score+softmax_output chain on long-KV decode. `NSPLIT` MUST equal
 /// `FLASH_SPLITK_NSPLIT` in cuda/quantized.cu (16).
-#[allow(clippy::too_many_arguments)]
 pub fn attn_flash_splitk_q8_decode_dev_pos(
     k_blob: &CudaSlice<u8>,
     v_blob: &CudaSlice<u8>,
@@ -450,7 +445,6 @@ pub fn attn_flash_splitk_q8_decode_dev_pos(
 /// round-trip, NSPLITx more blocks than the single-warp-per-head fused path).
 /// The combine kernel is the same per-query-head merge as the MHA variant.
 /// `q_f32` is `[n_q_heads, head_dim]` (n_q_heads = n_kv_heads x n_q_per_kv).
-#[allow(clippy::too_many_arguments)]
 pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     k_blob: &CudaSlice<u8>,
     v_blob: &CudaSlice<u8>,
@@ -578,7 +572,6 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
 /// attn_softmax_output chain - no HBM scores round-trip, adaptive nsplit for
 /// occupancy. seq_kv is a host int (Q4 path is not graph-captured). Reuses the
 /// runtime-nsplit gqa combine. `q_f32` is `[n_q_heads, head_dim]`.
-#[allow(clippy::too_many_arguments)]
 pub fn attn_flash_splitk_q4_gqa_decode(
     k_blocks: &CudaSlice<u8>,
     k_residual: &CudaSlice<f16>,
@@ -681,7 +674,6 @@ pub fn attn_flash_splitk_q4_gqa_decode(
 /// attn_score(->HBM scores)+attn_softmax_output chain on the qwen3 Q4 path.
 /// Mirrors `attn_flash_splitk_q8_gqa_decode_dev_pos` (adaptive nsplit, constant
 /// MAX_NSPLIT partials alloc, shared runtime-nsplit combine).
-#[allow(clippy::too_many_arguments)]
 pub fn attn_flash_splitk_q4_gqa_decode_dev_pos(
     k_blocks: &CudaSlice<u8>,
     k_residual: &CudaSlice<f16>,
@@ -782,7 +774,6 @@ pub fn attn_flash_splitk_q4_gqa_decode_dev_pos(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn dequantize_q8_0_blob_f16(
     data: &CudaSlice<u8>,
     elem_count: usize,
@@ -830,7 +821,6 @@ pub fn mvq_plain_any_via_shared_q8_1(
 }
 
 /// Stream-explicit form of [`mvq_plain_any_via_shared_q8_1`].
-#[allow(clippy::too_many_arguments)]
 pub fn mvq_plain_any_via_shared_q8_1_on_stream(
     qstor: &crate::tensor::quantized::QCudaStorage,
     q8_1_buf: &CudaSlice<u8>,

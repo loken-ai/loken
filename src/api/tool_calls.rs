@@ -900,8 +900,8 @@ impl StreamToolScanner {
         out
     }
 
-    /// True once the stream has entered a tool-call region (the caller
-    /// should stop emitting content deltas and prepare for tool_calls).
+    /// True once the stream has entered a tool-call region.
+    #[cfg(test)]
     pub fn in_tool_region(&self) -> bool {
         self.in_tool_region
     }

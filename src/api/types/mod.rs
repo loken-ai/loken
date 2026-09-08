@@ -59,18 +59,6 @@ where
     })
 }
 
-/// Map a JSON string or `null`/absent into a `String`, with null/absent
-/// becoming `""`. Lets assistant turns that only carry `tool_calls` (and
-/// send `content: null`, per the OpenAI tool-calling contract) deserialize
-/// instead of failing on the non-optional `content: String` field.
-fn deserialize_nullable_string<'de, D>(d: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let v = Option::<String>::deserialize(d)?;
-    Ok(v.unwrap_or_default())
-}
-
 /// Ollama 0.5+ accepts `thinking: true|false` (bool) AND
 /// `thinking: "enabled"|"disabled"` (string) for thinking-model
 /// preferences. Plain `Option<String>` would 422 the bool form.
@@ -765,18 +753,6 @@ pub struct OllamaDeleteRequest {
 // ============================================================================
 // Common Types (used by both Ollama and OpenAI-compatible APIs)
 // ============================================================================
-
-/// Image content for multimodal messages (vision models)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImageContent {
-    /// URL to the image (can be HTTP URL or data:image/... URI)
-    pub url: String,
-    /// Optional base64-encoded image data (for inline images)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base64: Option<String>,
-}
-
-impl ImageContent {}
 
 /// Chat message (compatible with both Ollama and OpenAI)
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
@@ -1608,19 +1584,6 @@ impl ListModelsResponse {
     }
 }
 
-/// Get model request
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
-pub struct GetModelRequest {
-    #[validate(length(min = 1))]
-    pub name: String,
-}
-
-impl GetModelRequest {
-    pub fn new(name: String) -> Self {
-        Self { name }
-    }
-}
-
 /// Get model response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetModelResponse {
@@ -1628,31 +1591,6 @@ pub struct GetModelResponse {
 }
 
 impl GetModelResponse {
-    pub fn new(message: String) -> Self {
-        Self { message }
-    }
-}
-
-/// Delete model request
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
-pub struct DeleteModelRequest {
-    #[validate(length(min = 1))]
-    pub name: String,
-}
-
-impl DeleteModelRequest {
-    pub fn new(name: String) -> Self {
-        Self { name }
-    }
-}
-
-/// Delete model response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteModelResponse {
-    pub message: String,
-}
-
-impl DeleteModelResponse {
     pub fn new(message: String) -> Self {
         Self { message }
     }

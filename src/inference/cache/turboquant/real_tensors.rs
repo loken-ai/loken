@@ -291,7 +291,7 @@ fn turboquant_real_cache_tensors_decide_the_scheme() {
     // Two group sizes, because the eight-value packing group is the layout unit and not a
     // sensible scale unit: at g = 8 the side information alone costs more than the codes.
     for group in [8usize, 32, 64] {
-        if head_dim % group != 0 {
+        if !head_dim.is_multiple_of(group) {
             continue;
         }
         let reports: Vec<LayerReport> = captured

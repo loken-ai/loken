@@ -398,8 +398,6 @@ impl AuthGate {
         let limiter = (per_minute > 0).then(|| {
             Arc::new(crate::api::rate_limiter::RateLimiter::new(
                 crate::api::rate_limiter::RateLimitConfig {
-                    max_requests: per_minute,
-                    window: std::time::Duration::from_secs(60),
                     burst_capacity: burst.max(1),
                     refill_rate: per_minute as f64 / 60.0,
                 },

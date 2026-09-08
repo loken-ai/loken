@@ -74,9 +74,9 @@ pub fn build_vbset(ck: &str, devices: &[Device]) -> Result<VbSet> {
     let mut vbs: VbSet = std::collections::HashMap::new();
     for d in devices {
         let k = dev_key(d);
-        if !vbs.contains_key(&k) {
+        if let std::collections::hash_map::Entry::Vacant(e) = vbs.entry(k) {
             let vb = unsafe { VarBuilder::from_files(&[ck], DType::F32, d)? };
-            vbs.insert(k, vb);
+            e.insert(vb);
         }
     }
     Ok(vbs)

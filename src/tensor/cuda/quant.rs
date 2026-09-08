@@ -259,7 +259,6 @@ pub fn mmvq_bf16(
     mmvq_t::<half::bf16>(dev, tag, "bf16", weight_blob, q8_1, k, n, b_size, false)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn mmvq_t<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
     dev: &CudaDevice,
     tag: &str,
@@ -275,7 +274,7 @@ pub(super) fn mmvq_t<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
     if b_size == 0 || b_size > 8 {
         return Err(Error(format!("mmvq: b_size {b_size} not in 1..=8")));
     }
-    if smallk && (b_size != 1 || n % 4 != 0) {
+    if smallk && (b_size != 1 || !n.is_multiple_of(4)) {
         return Err(Error(format!(
             "mmvq smallk requires b_size==1 && n%4==0 (got b_size={b_size}, n={n})"
         )));

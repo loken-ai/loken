@@ -389,7 +389,7 @@ mod cuda {
         storage: CudaStorage,
         shape: S,
     ) -> Result<Tensor> {
-        Ok(tensor::Tensor::from_storage_arc(storage.storage, shape)?)
+        tensor::Tensor::from_storage_arc(storage.storage, shape)
     }
 
     /// The raw row-padded quantized weight blob of a CUDA `QTensor`, for

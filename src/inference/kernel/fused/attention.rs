@@ -9,7 +9,6 @@ use super::*;
 /// `[b,max_blocks]` + `seq_lens` `[b]` (both i32, read on-device -> graph-safe).
 /// Returns `[b,n_head,hd]` f16. The paged gather + attention are fused (no
 /// index_select, which would bake its index at capture).
-#[allow(clippy::too_many_arguments)]
 pub fn paged_flash_decode(
     q: &Tensor,
     kp: &Tensor,
@@ -28,9 +27,8 @@ pub fn paged_flash_decode(
     use crate::tensor::StorageView::Cuda as C;
     use core::ffi::c_void;
     if !q.device().is_cuda()
-        || head_dim % 32 != 0
-        || head_dim < 32
-        || head_dim > 256
+        || !head_dim.is_multiple_of(32)
+        || !(32..=256).contains(&head_dim)
         || q.dtype() != DType::F16
         || kp.dtype() != DType::F16
     {
@@ -303,7 +301,6 @@ pub fn flash_dit_bf16(
 /// attends key j iff `j <= abs_i && (window <= 0 || j + window >= abs_i)`. Returns
 /// `[b, n_head, seq_q, hd]` F16, or `None` (-> caller's chain fallback) when the
 /// shapes/dtype/device/head_dim are unsupported.
-#[allow(clippy::too_many_arguments)]
 pub fn flash_prefill_f16(
     q: &Tensor,
     k: &Tensor,
@@ -328,7 +325,7 @@ pub fn flash_prefill_f16(
         || nkv != n_kv
         || bk != b
         || n_kv == 0
-        || n_head % n_kv != 0
+        || !n_head.is_multiple_of(n_kv)
         || seq_q < 1
         || seq_kv < seq_q
     {
@@ -470,7 +467,6 @@ pub fn paged_kv_write(
 /// [b, n_kv, kv_len, hd] F16 (may be the strided KV-cache narrow); `mask`:
 /// `[kv_len]` F32 additive or None; `sinks`: [n_head] F32. Returns `[b, n_head, hd]`
 /// F16. Returns `None` (caller falls back) unless CUDA + hd==64 + contiguous hd.
-#[allow(clippy::too_many_arguments)]
 pub fn gptoss_flash_decode(
     q: &Tensor,
     k: &Tensor,
@@ -498,7 +494,6 @@ pub fn gptoss_flash_decode(
 /// 0 to the softmax, so skipping the scan is mathematically identical and
 /// O(w) instead of O(kv_len). `mask`, if given, is `[kv_len-kv_start]` F32
 /// covering only the scanned rows.
-#[allow(clippy::too_many_arguments)]
 pub fn gptoss_flash_decode_win(
     q: &Tensor,
     k: &Tensor,

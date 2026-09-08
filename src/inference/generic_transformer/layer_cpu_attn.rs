@@ -20,9 +20,9 @@ impl GenericTransformerLayer {
         // other dense GQA arches use the Q8 store.
         let is_gemma = self.attn_v_norm_ones.is_some();
         let eligible = !is_shared
-            && self.head_dim % 32 == 0
+            && self.head_dim.is_multiple_of(32)
             && self.n_kv_head > 0
-            && self.n_head % self.n_kv_head == 0
+            && self.n_head.is_multiple_of(self.n_kv_head)
             && matches!(k.device(), crate::tensor::Device::Cpu);
         if !eligible {
             return;
@@ -188,7 +188,7 @@ impl GenericTransformerLayer {
             // here via the F16C fused online-softmax (half the KV bytes, windowed,
             // no scores-tensor materialise). Falls back if not populated.
             if self.cpu_q8_kv.is_none() {
-                if let Some(c) = self.cpu_f16_kv.as_ref().filter(|c| c.len() > 0) {
+                if let Some(c) = self.cpu_f16_kv.as_ref().filter(|c| !c.is_empty()) {
                     let qf = q
                         .to_dtype(crate::tensor::DType::F32)?
                         .flatten_all()?
@@ -208,7 +208,7 @@ impl GenericTransformerLayer {
                 return Ok(None);
             }
             let cache = match self.cpu_q8_kv.as_ref() {
-                Some(c) if c.len() > 0 => c,
+                Some(c) if !c.is_empty() => c,
                 _ => return Ok(None),
             };
             let qf = q
@@ -273,7 +273,7 @@ impl GenericTransformerLayer {
         // donor store's window exactly (bulletproof vs mismatched donor type).
         let my_window = self.sliding_window.filter(|&w| w > 0);
         let cache = match donor_f16 {
-            Some(c) if c.len() > 0 && c.window() == my_window => c,
+            Some(c) if !c.is_empty() && c.window() == my_window => c,
             _ => return Ok(None),
         };
         let hd = self.head_dim;
@@ -323,7 +323,6 @@ impl GenericTransformerLayer {
                 *acc.get_unchecked_mut(c) += p * *v.get_unchecked(c);
                 c += 1;
             }
-            return;
         }
         #[cfg(not(target_feature = "avx2"))]
         for i in 0..n {
@@ -359,7 +358,7 @@ impl GenericTransformerLayer {
                 sum += *pa.add(c) * *pb.add(c);
                 c += 1;
             }
-            return sum;
+            sum
         }
         #[cfg(not(target_feature = "avx2"))]
         {

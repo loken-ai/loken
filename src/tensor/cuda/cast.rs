@@ -175,12 +175,10 @@ matmul_nn_impl!(
     }
 );
 
-/// im2col (1-D) for one (batch, group) slab; returns [c_in_g*k, l_out].
-#[allow(clippy::too_many_arguments)]
+// im2col (1-D) for one (batch, group) slab; returns [c_in_g*k, l_out].
 /// Column window [lo_off, lo_off+lo_len) of the im2col matrix, so the
 /// transient stays bounded regardless of sequence length (a 47 s audio
 /// decode would otherwise need a multi-GB col buffer in one piece).
-#[allow(clippy::too_many_arguments)]
 pub fn im2col1d_f32(
     dev: &CudaDevice,
     x: &cudarc::driver::CudaView<f32>,
@@ -226,7 +224,6 @@ pub fn im2col1d_f32(
 /// `[c_in, l]`; `w_f16` the F16 kernel flattened `[c_out, c_in*k]`; returns the
 /// F32 output `[c_out, l_out]`. F32 accumulation holds as long as the global
 /// reduced-precision-f16 switch is off (its default).
-#[allow(clippy::too_many_arguments)]
 pub fn conv1d_im2col_f16(
     dev: &CudaDevice,
     x: &cudarc::driver::CudaView<f32>,
@@ -256,7 +253,6 @@ pub fn conv1d_im2col_f16(
 /// output `[c_out, l_out]`. The GEMM accumulates in F32 (COMPUTE_32F) unless the
 /// global reduced-precision-f16 switch is on, so audio precision holds while the
 /// `c_in` reduction runs on tensor cores instead of the serial gather kernel.
-#[allow(clippy::too_many_arguments)]
 pub fn convt1d_gemm_f16(
     dev: &CudaDevice,
     x: &CudaSlice<f32>,
@@ -298,7 +294,6 @@ pub fn convt1d_gemm_f16(
 }
 
 /// im2col (2-D) for one (batch, group) slab; returns [c_in_g*kh*kw, h_out*w_out].
-#[allow(clippy::too_many_arguments)]
 pub fn im2col2d_f32(
     dev: &CudaDevice,
     x: &cudarc::driver::CudaView<f32>,
@@ -349,7 +344,6 @@ pub fn im2col2d_f32(
 /// Fused MoE gate+up+SiLU.mul (the production decode MoE kernel) on native
 /// buffers. `x` [m, k] f32; gate/up blobs = [e, n, k] GGML blocks;
 /// sorted/expert ids per the routing contract. Returns [m*topk, n].
-#[allow(clippy::too_many_arguments)]
 pub fn moe_gate_up_silu_mul(
     dev: &CudaDevice,
     x: &CudaSlice<f32>,

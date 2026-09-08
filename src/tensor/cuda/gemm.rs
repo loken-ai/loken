@@ -52,7 +52,6 @@ pub fn matmul_f32_tf32(
     matmul_f32_inner(dev, a, b, batch, m, k, n, true)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn matmul_f32_inner(
     dev: &CudaDevice,
     a: &CudaSlice<f32>,

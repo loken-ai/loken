@@ -388,10 +388,14 @@ impl LlmEngine {
             let (vision_prefix_len, mut logits, qwen35_pos) = if let Some((ref px, (gh, gw))) = qwen35_img {
                 let (lg, next_pos) = state.model.forward_qwen35_image(&prompt_tokens, px, gh, gw, device)?;
                 (None, lg, Some(next_pos))
-            } else if state.model.is_pixtral_vision() && state.image_embeds.is_some() {
+            } else if let Some(image_embeds) = state
+                .image_embeds
+                .as_ref()
+                .filter(|_| state.model.is_pixtral_vision())
+            {
                 // Pixtral: embeds spliced INSIDE the prompt ([INST] img [IMG_END] text);
                 // the method returns the true total length -> decode position.
-                let image_embeds = state.image_embeds.as_ref().unwrap().clone();
+                let image_embeds = image_embeds.clone();
                 let (lg, total) = state.model.forward_pixtral_spliced(&prompt_tokens, &image_embeds, device)?;
                 (None, lg, Some(total))
             } else {
@@ -1585,7 +1589,7 @@ impl LlmEngine {
                     info!("🧮 cpu work: {:.2} GMAC/token, {:.1} MB/token, {} calls/token",
                         macs as f64 / 1e9 / eval_count as f64,
                         bytes as f64 / 1e6 / eval_count as f64,
-                        calls / eval_count.max(1) as u64);
+                        calls / eval_count.max(1));
                 }
             }
             let decode_tok_s = if eval_duration > 0 {
@@ -1607,7 +1611,7 @@ impl LlmEngine {
                 0.0
             };
             crate::distributed::rate_meter::record_generation(
-                &metered_model, prefill_tok_s, decode_tok_s, eval_count as u64);
+                &metered_model, prefill_tok_s, decode_tok_s, eval_count);
             // The acceptance rate is the only number that says whether speculation is
             // paying for itself. This path was counting it and throwing it away, so a
             // drafter that had stopped helping would have looked exactly like one that

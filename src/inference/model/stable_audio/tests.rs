@@ -40,11 +40,6 @@ fn from_tc(x: &Tensor) -> Vec<f32> {
     ct.to_vec_f32()
 }
 
-/// Root-mean-square level of a clip: what tells rendered audio from silence.
-fn rms(pcm: &[f32]) -> f64 {
-    (pcm.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / pcm.len().max(1) as f64).sqrt()
-}
-
 /// How far an output sits from its reference, by every measure these tests judge on.
 ///
 /// Scaffolding, not judgement: it measures and never decides. Each test states its own
@@ -54,37 +49,27 @@ fn rms(pcm: &[f32]) -> f64 {
 struct Divergence {
     max_abs: f64,
     max_rel: f64,
-    /// The worst relative gap among the samples that are ALSO absolutely off by more than
-    /// `mixed_floor`. A reference value near zero cannot carry a relative bound on its own,
-    /// and a sample that is off in only one of the two senses is noise, not divergence.
-    worst_mixed: f64,
     /// Signal power over error power, in dB: the aggregate a per-sample maximum cannot see.
     snr_db: f64,
 }
 
 impl Divergence {
-    /// `rel_floor` bounds the denominator of the relative gap; `mixed_floor` is the absolute
-    /// gap a sample must also exceed before it counts towards `worst_mixed`. Pass
-    /// `f64::INFINITY` for the latter when a test does not use that criterion.
-    fn of(ours: &[f32], reference: &[f32], rel_floor: f64, mixed_floor: f64) -> Self {
+    /// `rel_floor` bounds the denominator of the relative gap.
+    fn of(ours: &[f32], reference: &[f32], rel_floor: f64) -> Self {
         assert_eq!(ours.len(), reference.len(), "shape mismatch");
-        let (mut max_abs, mut max_rel, mut worst_mixed) = (0f64, 0f64, 0f64);
+        let (mut max_abs, mut max_rel) = (0f64, 0f64);
         let (mut err_pow, mut sig_pow) = (0f64, 0f64);
         for (o, r) in ours.iter().zip(reference) {
             let d = (*o as f64 - *r as f64).abs();
             let rel = d / (r.abs() as f64).max(rel_floor);
             max_abs = max_abs.max(d);
             max_rel = max_rel.max(rel);
-            if d > mixed_floor {
-                worst_mixed = worst_mixed.max(rel);
-            }
             err_pow += d * d;
             sig_pow += (*r as f64) * (*r as f64);
         }
         Self {
             max_abs,
             max_rel,
-            worst_mixed,
             snr_db: 10.0 * (sig_pow / err_pow.max(1e-30)).log10(),
         }
     }
@@ -113,7 +98,7 @@ fn t5_base_encoder_matches_torch() {
     assert_eq!(ids, ref_ids, "tokenizer ids diverge from torch");
     let enc = T5Encoder::from_dir(&t5_dir).unwrap();
     let out = enc.encode(&ids).unwrap().to_vec_f32();
-    let d = Divergence::of(&out, &reference, 1e-3, f64::INFINITY);
+    let d = Divergence::of(&out, &reference, 1e-3);
     eprintln!(
         "t5-base parity: max_rel {:.3e} | max_abs {:.3e}",
         d.max_rel, d.max_abs
@@ -141,7 +126,7 @@ fn dit_matches_torch() {
     ] {
         let nc = SaoNumberConditioner::load(&ckpt, which, &dev).unwrap();
         let ours = nc.forward(val).unwrap().to_vec_f32();
-        let d = Divergence::of(&ours, &read_dump(&dir, file), 1e-3, f64::INFINITY);
+        let d = Divergence::of(&ours, &read_dump(&dir, file), 1e-3);
         eprintln!("{which} embed max_abs = {:.3e}", d.max_abs);
         assert!(
             d.max_abs < 1e-5,
@@ -159,7 +144,7 @@ fn dit_matches_torch() {
     let glob = Tensor::from_vec_f32(read_dump(&dir, "dit_global.f32"), (1usize, DIT_DIM)).unwrap();
     let out = from_tc(&dit.forward(&x, 0.5, &cross, &glob).unwrap());
     let reference = read_dump(&dir, "dit_ref_out.f32");
-    let d = Divergence::of(&out, &reference, 1e-3, f64::INFINITY);
+    let d = Divergence::of(&out, &reference, 1e-3);
     eprintln!(
         "dit parity: max_rel {:.3e} | max_abs {:.3e} | SNR {:.1} dB",
         d.max_rel, d.max_abs, d.snr_db
@@ -197,7 +182,7 @@ fn sampler_matches_torch() {
     .unwrap();
     let out = from_tc(&out);
     let reference = read_dump(&dir, "smp_ref_out.f32");
-    let d = Divergence::of(&out, &reference, 1e-3, f64::INFINITY);
+    let d = Divergence::of(&out, &reference, 1e-3);
     eprintln!(
         "sampler parity: max_abs {:.3e} | SNR {:.1} dB",
         d.max_abs, d.snr_db

@@ -360,11 +360,8 @@ impl Qwen3VlTextEncoder {
         let mut rope: HashMap<DeviceLocation, (NT, NT)> = HashMap::new();
         for l in &self.layers {
             let loc = l.device.location();
-            if !rope.contains_key(&loc) {
-                rope.insert(
-                    loc,
-                    (cos_cpu.to_device(&l.device)?, sin_cpu.to_device(&l.device)?),
-                );
+            if let std::collections::hash_map::Entry::Vacant(e) = rope.entry(loc) {
+                e.insert((cos_cpu.to_device(&l.device)?, sin_cpu.to_device(&l.device)?));
             }
         }
         // One mask carrying BOTH conditions: a key is visible when it is not in the future AND
@@ -384,8 +381,8 @@ impl Qwen3VlTextEncoder {
                 let mut per_dev = HashMap::new();
                 for l in &self.layers {
                     let loc = l.device.location();
-                    if !per_dev.contains_key(&loc) {
-                        per_dev.insert(loc, cpu.to_device(&l.device)?);
+                    if let std::collections::hash_map::Entry::Vacant(e) = per_dev.entry(loc) {
+                        e.insert(cpu.to_device(&l.device)?);
                     }
                 }
                 Some(per_dev)

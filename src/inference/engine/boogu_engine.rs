@@ -408,7 +408,7 @@ pub fn generate(
         .unsqueeze(0)?
         .to_device(&state.vae_facade_dev)
         .map_err(|e| anyhow!("Boogu latent->facade: {e}"))?;
-    let img = match state.vae.decode_tiled(&lat, 64, 8) {
+    let img = match state.vae.decode_tiled(lat, 64, 8) {
         Ok(img) => img,
         Err(e) => {
             tracing::warn!("Boogu VAE GPU decode failed ({e}); falling back to CPU VAE");
@@ -418,7 +418,7 @@ pub fn generate(
                 .map_err(|e| anyhow!("Boogu latent->CPU facade: {e}"))?;
             state
                 .vae_cpu
-                .decode(&lat_cpu)
+                .decode(lat_cpu)
                 .map_err(|e| anyhow!("Boogu VAE CPU decode: {e}"))?
         }
     };

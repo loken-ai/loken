@@ -117,7 +117,7 @@ pub fn batched_argmax(logits: &Tensor) -> Result<Vec<u32>> {
     }
     let out_storage = CudaStorage::wrap_cuda_slice(out, dev.clone());
     let t = tensor_from_cuda_storage(out_storage, (n_rows,))?;
-    Ok(t.to_vec1::<u32>()?)
+    t.to_vec1::<u32>()
 }
 
 /// Batched top-k + softmax-denominator front-end for the CB sampled path. Per row returns

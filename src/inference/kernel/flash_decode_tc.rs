@@ -57,7 +57,6 @@ fn pick_nsplit(seq_kv: usize) -> usize {
 /// `q_f16`: device f16 `[n_q_heads*qlen, head_dim]` row-major (the model's Q for
 /// this layer; for qlen=1 it is the plain `[n_q_heads, head_dim]` decode Q).
 /// Returns f16 `[n_q_heads*qlen, head_dim]` attention output (same row order).
-#[allow(clippy::too_many_arguments)]
 pub fn flash_decode_tc_q8_gqa(
     k_q8: &CudaSlice<u8>,
     v_q8: &CudaSlice<u8>,

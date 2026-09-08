@@ -1693,7 +1693,6 @@ impl crate::inference::model::flux::sampling::WithForward for HeteroFlux {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         img: &Tensor,
@@ -2107,7 +2106,6 @@ mod attention_tiling_tests {
 mod fixed_tile_tests {
     use super::*;
     use crate::inference::model::flux::common::EmbedNd;
-    use crate::tensor::Module as _;
 
     fn data(n: usize, seed: u32) -> Vec<f32> {
         let mut st = seed.wrapping_mul(2654435761).wrapping_add(12345);

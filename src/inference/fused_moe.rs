@@ -161,7 +161,6 @@ impl ExpertPlan {
 
     /// Gate GEMM, up GEMM, per-expert bias and the clamped SwiGLU in one launch (gpt-oss).
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     fn gate_up_swiglu_oai(
         &self,
         input: &Tensor,
@@ -651,7 +650,7 @@ impl FusedMoeGGUF {
                     GU_US.fetch_add(tg.duration_since(ts).as_micros() as u64, Ordering::Relaxed);
                     DOWN_US.fetch_add(tg.elapsed().as_micros() as u64, Ordering::Relaxed);
                     let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n % 100 == 0 {
+                    if n.is_multiple_of(100) {
                         tracing::info!(
                             "🟩 GH_PROF moe (sum µs over {n} calls): sort={} gate_up={} down_reduce={}",
                             SORT_US.load(Ordering::Relaxed), GU_US.load(Ordering::Relaxed),

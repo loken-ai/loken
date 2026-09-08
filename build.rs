@@ -99,15 +99,6 @@ fn main() {
 /// explicit list of REAL architectures (`code=sm_80,sm_86,sm_89,sm_90,sm_120a`), each
 /// compiled and verified - not one low PTX standing in for all of them. A kernel that
 /// is absent fails loudly; a kernel that JITs into wrong results does not.
-/// Compile the query-head-packed tensor-core flash-DECODE kernel (task ,
-/// cuda/flashdecode_tc/) into a static lib. Uses nvcuda::wmma m16n8k16 HMMA +
-/// cp.async-class staging, so it needs real per-arch SASS (compute>=90a suffix,
-/// like the Marlin build) - the PTX-only compute_80 IMMA build cannot host the
-/// 16x16x16 f16 MMA forward-JIT cleanly on sm_120. Falls back to a compute_90a
-/// PTX when no GPU is visible at build time. Driven via `extern "C"` from
-/// inference::flash_decode_tc.
-#[cfg(feature = "cuda")]
-
 /// The gencode flags every kernel family ships with: each REAL architecture the fleet can
 /// hold, as SASS, plus the arch-specific 'a' variants where the ISA needs them. One arch -
 /// the build machine's - is how a binary stops being copyable: SASS for sm_120a neither runs
@@ -155,6 +146,13 @@ fn gencodes_from(floor: u32) -> Vec<String> {
         .collect()
 }
 
+/// Compile the query-head-packed tensor-core flash-DECODE kernel (cuda/flashdecode_tc/,
+/// see there) into a static lib. Uses nvcuda::wmma m16n8k16 HMMA +
+/// cp.async-class staging, so it needs real per-arch SASS (compute>=90a suffix,
+/// like the Marlin build) - the PTX-only compute_80 IMMA build cannot host the
+/// 16x16x16 f16 MMA forward-JIT cleanly on sm_120. Falls back to a compute_90a
+/// PTX when no GPU is visible at build time. Driven via `extern "C"` from
+/// inference::flash_decode_tc.
 #[cfg(feature = "cuda")]
 fn compile_flashdecode_tc_kernels() {
     use std::path::PathBuf;

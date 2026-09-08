@@ -1021,7 +1021,6 @@ pub fn render(
 /// Audio-to-audio: like [`render`], but the diffusion starts from the encoded
 /// `init` audio (interleaved stereo 44.1 kHz) noised to `noise_level` (the
 /// schedule's sigma_max - ~1 keeps the source close, ~10+ reinterprets it).
-#[allow(clippy::too_many_arguments)]
 pub fn render_with_init(
     prompt: &str,
     negative_prompt: &str,

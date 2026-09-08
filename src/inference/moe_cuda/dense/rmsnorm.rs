@@ -266,10 +266,7 @@ pub fn head_rmsnorm(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
             stream,
         );
     }
-    Ok(tensor_from_cuda_storage(
-        CudaStorage::wrap_cuda_slice(y_slice, dev.clone()),
-        (n, d),
-    )?)
+    tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(y_slice, dev.clone()), (n, d))
 }
 
 /// Fused L2-norm + GQA tile for DeltaNet q/k. `x` [seq, kg, kd] (f32, CUDA,
@@ -306,10 +303,10 @@ pub fn l2norm_gqa(x: &Tensor, kg: usize, kd: usize, rep: usize, eps: f32) -> Res
             stream,
         );
     }
-    Ok(tensor_from_cuda_storage(
+    tensor_from_cuda_storage(
         CudaStorage::wrap_cuda_slice(y_slice, dev.clone()),
         (seq, vg, kd),
-    )?)
+    )
 }
 
 /// Fused RMS-norm (BF16 input) + quantized matmul, single-token decode.
@@ -387,5 +384,5 @@ pub fn rms_norm_then_qmatmul_bf16(
         qstor, &y_q8_1, hidden, out_rows, 1,
     )
     .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-    Ok(tensor_from_cuda_storage(out_storage, (1, 1, out_rows))?)
+    tensor_from_cuda_storage(out_storage, (1, 1, out_rows))
 }

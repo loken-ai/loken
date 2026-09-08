@@ -557,7 +557,7 @@ impl MelBandRoformer {
                 }
             }
         }
-        if let Some(tp) = taps.as_deref_mut() {
+        if let Some(tp) = taps {
             tp.mask_avg = Some(acc.clone());
         }
 

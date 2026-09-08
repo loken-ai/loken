@@ -290,7 +290,7 @@ impl KyutaiDepformer {
         input_tokens: &[u32],
     ) -> Result<Vec<f32>> {
         let l = input_tokens.len();
-        assert!(l >= 1 && l <= DEP_Q);
+        assert!((1..=DEP_Q).contains(&l));
         let tout = transformer_out.reshape((1, MAIN_DIM))?;
         let mut rows: Vec<Tensor> = Vec::with_capacity(l);
         for (cb, &tok) in input_tokens.iter().enumerate() {

@@ -1,6 +1,8 @@
 //! Layer scheduler for distributed inference
 //!
 //! Implements optimal layer assignment across heterogeneous devices and servers
+// Written and reached by nothing yet; docs/STATUS.md lists it under that heading.
+#![allow(dead_code)]
 
 use crate::distributed::device_manager::{ComputeDevice, DeviceManager, DeviceType};
 use crate::distributed::protocol::{DeviceInfo, DistributionPlan};
@@ -288,7 +290,7 @@ impl LayerScheduler {
         }
 
         // Sort by priority (highest first)
-        devices.sort_by(|a, b| b.0.priority.cmp(&a.0.priority));
+        devices.sort_by_key(|d| std::cmp::Reverse(d.0.priority));
 
         devices
     }
@@ -693,8 +695,8 @@ mod tests {
             .filter(|(d, _)| d.device_type == DeviceType::Cpu && d.availability.is_available())
             .collect();
 
-        gpu_devices.sort_by(|a, b| b.0.priority.cmp(&a.0.priority));
-        cpu_devices.sort_by(|a, b| b.0.priority.cmp(&a.0.priority));
+        gpu_devices.sort_by_key(|d| std::cmp::Reverse(d.0.priority));
+        cpu_devices.sort_by_key(|d| std::cmp::Reverse(d.0.priority));
 
         /// One pass over a pool of devices, each taking as many consecutive
         /// layers as its budget divided by the per-layer weight allows.
@@ -1061,15 +1063,7 @@ mod tests {
         let model_lower = model_id.to_lowercase();
         let quant_factor = quant.bytes_per_param() / 2.0;
 
-        if model_lower.contains("devstral") {
-            let memory_per_layer_fp16 = 1536 * 1024 * 1024;
-            (
-                40,
-                (memory_per_layer_fp16 as f32 * quant_factor) as u64,
-                5120,
-                32,
-            )
-        } else if model_lower.contains("24b") {
+        if model_lower.contains("devstral") || model_lower.contains("24b") {
             let memory_per_layer_fp16 = 1536 * 1024 * 1024;
             (
                 40,

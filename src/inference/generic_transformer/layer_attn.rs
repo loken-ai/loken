@@ -111,7 +111,7 @@ impl GenericTransformerLayer {
             let x_rot = apply_rope(&x_rot, &cos, &sin)?;
             Tensor::cat(&[&x_rot, &x_pass], crate::tensor::D::Minus1)?.contiguous()
         } else {
-            apply_rope(&x, &cos, &sin)
+            apply_rope(x, &cos, &sin)
         }
     }
 
@@ -728,13 +728,9 @@ impl GenericTransformerLayer {
                     // tokens -INF'd + skipped) - bounds the scan at 512 instead of the
                     // full growing KV (the 2.5K collapse) AND matches gemma4's trained
                     // windowed attention. window=0 everywhere else = bit-identical.
-                    let swa_window = self.sliding_window.and_then(|w| {
-                        if w > 0 && cache.current_seq_len() > w {
-                            Some(w)
-                        } else {
-                            None
-                        }
-                    });
+                    let swa_window = self
+                        .sliding_window
+                        .filter(|&w| w > 0 && cache.current_seq_len() > w);
                     let y_q8 = if let Some(window) = swa_window {
                         let scores = cache.attn_scores_graph(&q, window).map_err(|e| {
                             crate::tensor::Error::msg(format!("Q8 SWA attn_scores_graph: {e}"))
@@ -1866,7 +1862,7 @@ impl GenericTransformerLayer {
             let raw_att = q.matmul_t(&k)?;
             let att = crate::tensor::ops::softmax_scaled_masked(&raw_att, scale, mask)?
                 .to_dtype(v.dtype())?;
-            return Ok(att.matmul(&v.contiguous()?)?);
+            return att.matmul(&v.contiguous()?);
         }
         let raw_att = q.matmul_t(&k)?.affine(scale as f32, 0.0)?;
         let att = if q.dims()[2] == 1 {

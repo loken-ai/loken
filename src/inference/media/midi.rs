@@ -287,16 +287,15 @@ fn write_smf(notes: &[Note]) -> Vec<u8> {
     let mut chan: HashMap<u32, u8> = HashMap::new();
     let mut mi = 0usize;
     for n in notes {
-        if !chan.contains_key(&n.instr) {
-            let c = if n.instr == 128 {
+        chan.entry(n.instr).or_insert_with(|| {
+            if n.instr == 128 {
                 9
             } else {
                 let c = MELODIC[mi.min(14)];
                 mi += 1;
                 c
-            };
-            chan.insert(n.instr, c);
-        }
+            }
+        });
     }
     // Per-channel absolute events: (tick, status, data1, data2).
     let mut per_ch: HashMap<u8, Vec<(u32, u8, u8, u8)>> = HashMap::new();

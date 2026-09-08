@@ -305,9 +305,6 @@ mod tests {
             !is_shape_like(&[64], &vec![1.0; 64]),
             "too many to be a shape"
         );
-        assert!(
-            !is_shape_like(&[3, 3], &vec![1.0; 9]),
-            "a 2-D tensor is data"
-        );
+        assert!(!is_shape_like(&[3, 3], &[1.0; 9]), "a 2-D tensor is data");
     }
 }

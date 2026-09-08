@@ -311,7 +311,6 @@ pub fn calculate_shift(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor;
 
     fn turbo_ladder(steps: usize) -> FlowMatchEulerDiscreteScheduler {
         let mut s = FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());

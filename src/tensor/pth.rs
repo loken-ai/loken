@@ -144,6 +144,9 @@ impl Zip {
 /// its effect on the stack, and its arguments matter only while that opcode executes.
 /// Dropping them from the type would make the parser lie about what a pickle stream holds.
 #[derive(Debug, Clone)]
+// A pickle stream is parsed whole; the fields no consumer reads keep the parser
+// shaped like the format.
+#[allow(dead_code)]
 enum Obj {
     Class(String, String), // module, class
     Int(i64),

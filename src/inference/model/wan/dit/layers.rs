@@ -20,7 +20,7 @@ pub(super) fn wan_load_t(
         .to_dtype(CDType::F32)?;
     let dims = dq.dims().to_vec();
     let v = dq.flatten_all()?.to_vec1::<f32>()?;
-    Ok(Tensor::from_vec_f32(v, dims)?.to_device(device)?)
+    Tensor::from_vec_f32(v, dims)?.to_device(device)
 }
 
 /// Build a quantized `WanLinear` for the 14B path: Q8 weight `[out,in]` on `dev` (via the
@@ -186,12 +186,12 @@ pub struct RefFrame<'a> {
 /// Conditioning channels an image-to-video input carries alongside the noise.
 pub(super) const I2V_COND_CH: usize = I2V_IN_CH - OUT_CH; // 20 = 4 mask + 16 latent
 
-/// The Wan DiT (velocity-field predictor).
+// The Wan DiT (velocity-field predictor).
 
-/// Activation bytes of one denoise forward at `tokens` sequence length: ~12 concurrently-live
-/// `[tokens, dim]` F32 buffers (hidden, residual, q/k/v, attention out, ffn gate/up and their
-/// contiguous copies) plus the tiled-attention scores+softmax `[tile, tokens, heads]` (tile =
-/// the shared sdpa QUERY_TILE). Structural counts from the forward, scaled by the REQUEST.
+// Activation bytes of one denoise forward at `tokens` sequence length: ~12 concurrently-live
+// `[tokens, dim]` F32 buffers (hidden, residual, q/k/v, attention out, ffn gate/up and their
+// contiguous copies) plus the tiled-attention scores+softmax `[tile, tokens, heads]` (tile =
+// the shared sdpa QUERY_TILE). Structural counts from the forward, scaled by the REQUEST.
 
 /// Total GPU demand of the HOT component (DiT) for a clip of `tokens` patch tokens: checkpoint
 /// bytes + the request-derived activation bytes. What the pressure protocol needs BEFORE load.
@@ -1152,7 +1152,6 @@ impl WanDit {
     /// block's learned modulation); `x` `[S,dim]`; `ctx` `[TEXT_LEN,dim]`. The activation +
     /// context/rope tables are staged onto the block's device (a no-op on a single card; the
     /// host->device hop of `x` is what makes the 14B multi-GPU layer split work).
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn block_forward(
         &self,
         blk: &WanBlock,
@@ -1377,7 +1376,6 @@ impl WanDit {
     /// `on_window` is called after each window finishes. A long clip is many windows inside
     /// ONE sampler step, and a step of a 14B model can run for minutes: without this, the
     /// only thing a client hears between steps is silence, which reads exactly like a hang.
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_windowed(
         &self,
         latent: &[f32],
@@ -1471,7 +1469,6 @@ impl WanDit {
     /// taken. The block loop is where that time is actually spent, so that is where the
     /// question has to be asked. The check itself is an atomic load per block, against a
     /// block that is billions of operations.
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_cancellable(
         &self,
         latent: &[f32],

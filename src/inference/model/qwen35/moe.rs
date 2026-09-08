@@ -69,7 +69,6 @@ fn load_fused_proj<R: Read + Seek>(
     names: &[String],
     d: &Device,
 ) -> Result<Option<QMatMul>> {
-    use crate::tensor::quantized::GgmlDType;
     let mut dt = None;
     let mut k = None;
     for n in names {
@@ -2232,7 +2231,7 @@ impl Qwen35MoeModel {
             x = (residual + h)?;
             let residual = x.clone();
             let h = norm_fwd(&layer.post_norm, &x, layer.rms_eps)?;
-            let t1 = std::time::Instant::now();
+            let _t1 = std::time::Instant::now();
             let h = layer.ffn.forward(&h)?;
             x = (residual + h)?;
         }

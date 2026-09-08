@@ -1463,7 +1463,6 @@ pub fn to_float_bytes(dtype: GgmlDType, bytes: &[u8], ys: &mut [f32]) -> Result<
 /// aligned chunking), same per-column `dot`, the caller's own norm / activation-mul
 /// closures on identical inputs, and the same multiply-then-add residual sequence.
 /// Returns Ok(false) when shapes/dtypes fall outside the supported fast path.
-#[allow(clippy::too_many_arguments)]
 pub fn ffn_swiglu_coop(
     x: &mut [f32],
     gate: Option<(GgmlDType, usize, usize, &[u8])>,

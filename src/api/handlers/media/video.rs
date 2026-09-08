@@ -56,9 +56,10 @@ pub(super) fn encode_mp4(
         .stderr(Stdio::null())
         .spawn()?;
     {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "ffmpeg stdin unavailable")
-        })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("ffmpeg stdin unavailable"))?;
         for fr in frames {
             stdin.write_all(fr)?;
         }
@@ -67,10 +68,7 @@ pub(super) fn encode_mp4(
     let status = child.wait()?;
     if !status.success() {
         let _ = std::fs::remove_file(&out);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("ffmpeg exited {status}"),
-        ));
+        return Err(std::io::Error::other(format!("ffmpeg exited {status}")));
     }
     let bytes = std::fs::read(&out)?;
     let _ = std::fs::remove_file(&out);

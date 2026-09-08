@@ -178,7 +178,6 @@ fn bias_arg(bias: Option<&Tensor>, what: &str) -> Result<(Option<Tensor>, *const
 
 /// MoE expert GEMM over GGUF-quantized weights (decode mmvq / prefill WMMA).
 /// Batched GGUF-quantised GEMM, one matmul per expert over a shared activation.
-#[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_gguf(
     input: &Tensor,
     weights: &crate::tensor::quantized::QTensor,
@@ -408,7 +407,6 @@ pub fn moe_gemm_gguf_gate_up_gelu_mul_concat(
 
 /// Fused MoE down-projection + top-k reduction (optionally folding a residual
 /// add).
-#[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_gguf_down_reduce(
     input: &Tensor,
     weights: &crate::tensor::quantized::QTensor,

@@ -54,7 +54,7 @@ pub fn get_awq_gemv_ptx(dev: &CudaDevice) -> Result<&'static str> {
         }
         return Ok(p);
     }
-    let compiled: String = (|| {
+    let compiled: String = {
         let opts = cudarc::nvrtc::safe::CompileOptions {
             include_paths: cuda_include_paths(),
             arch,
@@ -75,7 +75,7 @@ pub fn get_awq_gemv_ptx(dev: &CudaDevice) -> Result<&'static str> {
                 String::new()
             }
         }
-    })();
+    };
     let leaked: &'static str = Box::leak(compiled.into_boxed_str());
     g.insert(key, leaked);
     let ptx = leaked;

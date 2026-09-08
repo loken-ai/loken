@@ -8,7 +8,6 @@ use super::*;
 /// <= 256 (each warp lane owns head_dim/32 dims). Same contract as
 /// `gptoss_flash_decode`; `sinks` optional (None -> empty-seeded softmax). Returns
 /// `[b, n_head, hd]` F16, or None (caller falls back) unless CUDA + F16 + hd ok.
-#[allow(clippy::too_many_arguments)]
 pub fn flash_decode(
     q: &Tensor,
     k: &Tensor,
@@ -26,9 +25,8 @@ pub fn flash_decode(
     use crate::tensor::StorageView::Cuda as C;
     use core::ffi::c_void;
     if !q.device().is_cuda()
-        || head_dim % 32 != 0
-        || head_dim < 32
-        || head_dim > 256
+        || !head_dim.is_multiple_of(32)
+        || !(32..=256).contains(&head_dim)
         || q.dtype() != DType::F16
         || k.dtype() != DType::F16
         || v.dtype() != DType::F16

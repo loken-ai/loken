@@ -602,7 +602,6 @@ impl Qwen3Lm {
     /// reads the FIXED `narrow(2,0,cap)` view (constant shape). Math is identical to
     /// `attn_row` (masked-out positions contribute 0 after softmax).
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     fn attn_row_capped(
         &self,
         q_r: &Tensor,
@@ -649,7 +648,6 @@ impl Qwen3Lm {
     /// `attn_row_capped` with the per-row device buffers (`cos`/`sin`/`widx`/`mask`),
     /// so the whole op sequence is fixed-shape and graph-capturable.
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     fn decode_layer_graph(
         &self,
         l: &LmLayer,
@@ -710,7 +708,6 @@ impl Qwen3Lm {
     /// the final norm -> hidden `[2,1,H]`. The `kc`/`vc` per-layer KV buffers must be
     /// pre-allocated (the prefill path does this) before this runs under capture.
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     fn forward_graph(
         &self,
         x: &Tensor,
@@ -1283,7 +1280,6 @@ impl Qwen3Lm {
     /// combines `logit = uncond + cfg.(cond - uncond)` per step before sampling. CFG is
     /// what makes the model actually follow the lyrics (cond-only renders instrumental).
     /// `cfg_scale <= 1.0` falls back to cond-only.
-    #[allow(clippy::too_many_arguments)]
     pub fn generate_cfg(
         &mut self,
         uncond: &mut Qwen3Lm,
@@ -1352,7 +1348,6 @@ impl Qwen3Lm {
     /// Prefill is per-row (forward_into_kv, identical math); only the decode loop is batched.
     /// Bit-identical to `generate_cfg` for the same seed (asserted by the cfg_batched_matches_serial
     /// A/B). `cfg_scale <= 1.0` -> cond-only `generate`.
-    #[allow(clippy::too_many_arguments)]
     pub fn generate_cfg_batched(
         &mut self,
         tok: &tokenizers::Tokenizer,
@@ -1502,7 +1497,6 @@ impl Qwen3Lm {
     /// musical continuity while the new caption drifts the style, so the styles transition
     /// FLUIDLY within one stream (not a concatenation / cross-fade of independent clips). One
     /// continuous code stream -> one detok->DiT->VAE render. CFG as in `generate_cfg`.
-    #[allow(clippy::too_many_arguments)]
     pub fn generate_cfg_morph(
         &mut self,
         uncond: &mut Qwen3Lm,

@@ -185,12 +185,11 @@ pub fn moe_q4k_imma_m8_gate_up_gelu_mul_concat(
         );
     }
     let storage = CudaStorage::wrap_cuda_slice(output, dev.clone());
-    Ok(tensor_from_cuda_storage(storage, (size_m, size_n))?)
+    tensor_from_cuda_storage(storage, (size_m, size_n))
 }
 
 /// Fused MoE down Q4_K IMMA M=8 GEMM + top-k reduction (optional residual add).
 /// Q4_K IMMA down projection at M=8, reducing the per-expert results into one row.
-#[allow(clippy::too_many_arguments)]
 pub fn moe_q4k_imma_m8_down_reduce(
     input: &Tensor,
     weights: &crate::tensor::quantized::QTensor,
@@ -292,7 +291,7 @@ pub fn moe_q4k_imma_m8_down_reduce(
         );
     }
     let storage = CudaStorage::wrap_cuda_slice(out_alloc, dev.clone());
-    Ok(tensor_from_cuda_storage(storage, (n_real_tokens, hidden))?)
+    tensor_from_cuda_storage(storage, (n_real_tokens, hidden))
 }
 
 /// Dense (non-MoE) Q4_K IMMA M=8 gate/up GEMM with silu(gate)*up.
@@ -374,5 +373,5 @@ pub(super) fn dense_q4k_imma_m8_act_mul(
         );
     }
     let storage = CudaStorage::wrap_cuda_slice(output, dev.clone());
-    Ok(tensor_from_cuda_storage(storage, (size_m, size_n))?)
+    tensor_from_cuda_storage(storage, (size_m, size_n))
 }

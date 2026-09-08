@@ -9,9 +9,7 @@
 
 // Split-out files reach these through `use super::*`.
 use super::lora::{fuse_loras, LoraDelta};
-use super::safetensors_io::{self, SafeTensorsLoader};
-use super::{ops, DType, Device, Dim, Error, Result, Shape, Tensor, VarBuilder, D};
-use std::sync::Arc;
+use super::{DType, Device, Dim, Error, Result, Tensor, VarBuilder, D};
 
 mod conv;
 mod embedding;

@@ -878,7 +878,7 @@ pub(crate) async fn ollama_chat(
                 // structured tool_calls (Ollama surfaces these on
                 // message.tool_calls). Plain answers pass through.
                 let (chat_thinking, chat_body) = crate::api::thinking::split_thinking(&result.text);
-                let (msg, tool_called) = if tools_active {
+                let (msg, _tool_called) = if tools_active {
                     let parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &chat_body);
                     if parsed.calls.is_empty() {
                         (

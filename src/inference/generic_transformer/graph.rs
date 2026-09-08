@@ -1190,7 +1190,7 @@ impl GenericHeteroTransformer {
         let normed =
             crate::tensor::ops::rms_norm(&last_f32, norm_w, self.config.rms_norm_eps as f32)?;
         let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
-        let mut logits = normed_f16.matmul_t(&proj)?;
+        let mut logits = normed_f16.matmul_t(proj)?;
         logits = logits.to_dtype(crate::tensor::DType::F32)?;
         if let Some(scale) = self.config.logit_scale {
             logits = (logits / scale)?;
@@ -1431,7 +1431,7 @@ impl GenericHeteroTransformer {
             let normed =
                 crate::tensor::ops::rms_norm(&last_f32, norm_w, self.config.rms_norm_eps as f32)?;
             let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
-            normed_f16.matmul_t(&proj)?
+            normed_f16.matmul_t(proj)?
         };
         logits = self.apply_output_bias(logits)?;
         logits = logits.to_dtype(crate::tensor::DType::F32)?;
@@ -2208,7 +2208,7 @@ impl GenericHeteroTransformer {
                             "compute_all_from_kv_captured: layer has no graph_q_buffer",
                         )
                     })
-                    .map(|t| t.clone())
+                    .cloned()
             })
             .collect::<Result<_>>()?;
         self.compute_all_from_kv(&hidden, &all_q)

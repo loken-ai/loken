@@ -84,7 +84,7 @@ pub fn wan_checkpoint_in(dir: &std::path::Path, want: &str) -> Option<std::path:
 pub fn wan_checkpoint_tag(stem: &str) -> String {
     let lower = stem.to_ascii_lowercase();
     let raw: Vec<&str> = lower
-        .split(|c: char| matches!(c, '.' | '_' | '-' | ':'))
+        .split(['.', '_', '-', ':'])
         .filter(|t| !t.is_empty())
         .collect();
     // Rejoin a parameter count that a separator split in two: a bare number immediately
@@ -340,21 +340,22 @@ pub(super) const PATCH_H: usize = 2;
 pub(super) const PATCH_W: usize = 2;
 pub(super) const ROPE_THETA: f64 = 10000.0;
 
-/// The shared projection, which holds the published orientation and multiplies with the N-T
-/// flag: this checkpoint's weights are half-precision and already on the device, so turning
-/// them would materialise an F32 cast and a transposed copy per tensor.
+// The shared projection, which holds the published orientation and multiplies with the N-T
+// flag: this checkpoint's weights are half-precision and already on the device, so turning
+// them would materialise an F32 cast and a transposed copy per tensor.
 
-/// A quantized Linear `[out,in]` (Q8_0 GGUF) + OPTIONAL F32 bias. The weight stays quantized
-/// on its device and dequantizes on-the-fly inside `QMatMul::forward` (the same on-device
-/// pattern as the ACE-Step DiT); the bias (a separate `.bias` GGUF tensor, F32) is added
-/// after the matmul. Used for the 14B path's parameter mass so a 14B-class DiT keeps its
-/// compact (~Q8) device footprint instead of a 4x F32 blow-up.
 // MEASURED, and it is why this projection keeps the block-quant kernel: routing it through
 // `forward_dequant_gpu` - dequantize the weight on the device, then one BF16 tensor-core GEMM,
 // which is what the image DiTs do for wide activations - is a 2.9x REGRESSION here, 28.3 s/step
 // becoming 81.1 s. At this model's weight sizes the dequant costs more per call than the
 // block-quant kernel saves, even at twenty thousand rows. Do not switch it without an A/B on a
 // 14B checkpoint. `Weight::Quant` is exactly that kernel.
+
+// A quantized Linear `[out,in]` (Q8_0 GGUF) + OPTIONAL F32 bias. The weight stays quantized
+// on its device and dequantizes on-the-fly inside `QMatMul::forward` (the same on-device
+// pattern as the ACE-Step DiT); the bias (a separate `.bias` GGUF tensor, F32) is added
+// after the matmul. Used for the 14B path's parameter mass so a 14B-class DiT keeps its
+// compact (~Q8) device footprint instead of a 4x F32 blow-up.
 
 /// One block linear: dense (1.3B safetensors) or quantized (14B GGUF). The forward math is
 /// IDENTICAL across variants - only the underlying matmul op differs.

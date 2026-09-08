@@ -4,8 +4,8 @@
 //! `use super::*` keeps the names its items referred to before the split in reach.
 
 use super::prefix::Prefix;
-use super::safetensors_io::{self, SafeTensorsLoader};
-use super::{DType, Device, Error, Result, Shape, Tensor};
+use super::safetensors_io::SafeTensorsLoader;
+use super::{DType, Device, Error, Result, Tensor};
 use std::sync::Arc;
 
 /// Where a builder reads weights from.

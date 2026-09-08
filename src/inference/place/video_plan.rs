@@ -13,19 +13,15 @@
 /// How good, against how long to wait. The only dial worth showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Quality {
     /// Fewest passes at a modest frame, for looking at an idea.
     Draft,
     /// What a distilled checkpoint is meant for.
+    #[default]
     Standard,
     /// More passes and a larger frame, when the result is the point.
     Fine,
-}
-
-impl Default for Quality {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 /// The settings a render will use, and what it is expected to cost.

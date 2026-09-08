@@ -72,9 +72,7 @@ fn gemm_f16w_matches_upcast_path() -> Result<()> {
     ];
     for &(bsz, m, k, n) in cases {
         let mk = |len: usize, s: f32| -> Vec<f32> {
-            (0..len)
-                .map(|i| ((i as f32 * s).sin() * 3.0) as f32)
-                .collect()
+            (0..len).map(|i| (i as f32 * s).sin() * 3.0).collect()
         };
         let a = Tensor::from_vec_f32(mk(bsz * m * k, 0.37), (bsz, m, k))?.to_dtype(DType::F16)?;
         let b = Tensor::from_vec_f32(mk(bsz * k * n, 0.11), (bsz, k, n))?.to_dtype(DType::F16)?;

@@ -13,7 +13,7 @@
 
 use crate::tensor::layer::Linear;
 use crate::tensor::ops::repeat_kv;
-use crate::tensor::{Module, Result, Tensor};
+use crate::tensor::{Result, Tensor};
 
 /// What an attention keeps between calls.
 #[derive(Debug, Clone)]
@@ -64,7 +64,6 @@ pub struct MultiHeadAttention {
 impl MultiHeadAttention {
     /// `width` is the query width; `kv_heads` may be fewer than `heads`, in which case each
     /// key head is read by `heads / kv_heads` query heads.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         q: Linear,
         k: Linear,
@@ -75,10 +74,10 @@ impl MultiHeadAttention {
         kv_heads: usize,
         kv: Kv,
     ) -> Result<Self> {
-        if heads == 0 || width % heads != 0 {
+        if heads == 0 || !width.is_multiple_of(heads) {
             crate::tensor::bail!("an attention of width {width} cannot have {heads} heads");
         }
-        if kv_heads == 0 || heads % kv_heads != 0 {
+        if kv_heads == 0 || !heads.is_multiple_of(kv_heads) {
             crate::tensor::bail!("{heads} query heads cannot be grouped over {kv_heads} key heads");
         }
         let head_dim = width / heads;

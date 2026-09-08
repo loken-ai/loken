@@ -150,7 +150,6 @@ fn assemble_input(
 /// the noise seed; `mask_val` the UDiT mask-channel value (the flagged "generate all"
 /// selector - 1.0 = fully masked/generate, the MAE convention). Components are loaded here
 /// (free-VRAM-gated placement is internal to each loader).
-#[allow(clippy::too_many_arguments)]
 pub fn render(
     prompt: &str,
     seconds: f32,
@@ -173,7 +172,6 @@ pub fn render(
 }
 
 /// [`render`] with a per-denoise-step progress callback `(done, total)`.
-#[allow(clippy::too_many_arguments)]
 pub fn render_with_progress(
     prompt: &str,
     seconds: f32,

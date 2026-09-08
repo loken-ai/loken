@@ -71,9 +71,9 @@ impl LlmEngine {
             // A Harmony vocabulary keeps its channel tokens in the text, for the API to
             // split the analysis from the answer; any other drops its special tokens.
             let skip_special = tokenizer.token_to_id("<|channel|>").is_none();
-            loop {
-                match cb_rx.recv() {
-                    Ok(CbToken::Tok(t)) => {
+            while let Ok(CbToken::Tok(t)) = cb_rx.recv() {
+                {
+                    {
                         if eos_set.contains(&t) {
                             break;
                         }
@@ -103,7 +103,6 @@ impl LlmEngine {
                             break;
                         }
                     }
-                    Ok(CbToken::Done(_)) | Err(_) => break,
                 }
             }
         });
@@ -806,7 +805,7 @@ impl LlmEngine {
             let ResolvedGenParams {
                 max_tokens,
                 temperature,
-                top_k,
+                top_k: _,
                 repeat_penalty,
                 repeat_last_n,
                 ..

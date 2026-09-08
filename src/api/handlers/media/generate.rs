@@ -446,7 +446,7 @@ pub(crate) async fn handle_image_generation(
             return Err(ApiError::Validation(e));
         }
     }
-    let defaults = image_model_defaults(&model_name).map_err(ApiError::Validation)?;
+    let defaults = image_model_defaults(model_name).map_err(ApiError::Validation)?;
     let default_steps: u64 = defaults.steps as u64;
     let default_guidance: f64 = defaults.guidance;
     let default_size: u64 = defaults.size as u64;

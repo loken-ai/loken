@@ -166,7 +166,7 @@ pub struct Dcw {
 /// `[Tl.C]` with `Tl=(T+1)/2` (odd T zero-pads the last high index). `1/√2` normalized.
 fn haar_fwd(src: &[f32], t: usize, c: usize) -> (Vec<f32>, Vec<f32>) {
     let inv = std::f32::consts::FRAC_1_SQRT_2;
-    let tl = (t + 1) / 2;
+    let tl = t.div_ceil(2);
     let (mut lo, mut hi) = (vec![0f32; tl * c], vec![0f32; tl * c]);
     for til in 0..tl {
         let (i0, i1) = (2 * til, 2 * til + 1);
@@ -188,7 +188,7 @@ fn haar_fwd(src: &[f32], t: usize, c: usize) -> (Vec<f32>, Vec<f32>) {
 /// Inverse Haar IDWT -> `out [T,C]` frame-major (the exact inverse of [`haar_fwd`]).
 fn haar_inv(lo: &[f32], hi: &[f32], t: usize, c: usize, out: &mut [f32]) {
     let inv = std::f32::consts::FRAC_1_SQRT_2;
-    let tl = (t + 1) / 2;
+    let tl = t.div_ceil(2);
     for til in 0..tl {
         let (i0, i1) = (2 * til, 2 * til + 1);
         for ci in 0..c {

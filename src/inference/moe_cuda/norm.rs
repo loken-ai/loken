@@ -152,5 +152,5 @@ pub fn rms_norm_then_qmatmul(
         qstor, &y_q8_1, hidden, out_rows, 1,
     )
     .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-    Ok(tensor_from_cuda_storage(out_storage, (1, 1, out_rows))?)
+    tensor_from_cuda_storage(out_storage, (1, 1, out_rows))
 }

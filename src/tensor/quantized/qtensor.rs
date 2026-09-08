@@ -7,7 +7,6 @@ use super::*;
 
 /// Facade-shaped quantized tensor: host blocks ([`QHostTensor`]) + the
 /// device-resident blob + a lazily-built [`QKernelMatMul`] sharing that blob.
-
 pub struct QTensor {
     inner: Arc<QHostTensor>,
     shape: Shape,
@@ -210,7 +209,6 @@ impl QTensor {
 
 /// legacy-shaped quantized matmul enum (frozen sites construct/match all
 /// three variants).
-
 impl QTensor {
     /// Build one from raw GGML block bytes. The legacy container loader's entry point; the
     /// bytes are a block layout, so there is nothing to parse beyond knowing the dtype.

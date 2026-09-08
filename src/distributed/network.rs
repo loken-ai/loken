@@ -1,6 +1,8 @@
 //! Network communication for distributed inference
 //!
 //! Provides client and server components for layer-to-layer communication
+// Written and reached by nothing yet; docs/STATUS.md lists it under that heading.
+#![allow(dead_code)]
 
 use crate::distributed::protocol::{
     DeviceInfo, Heartbeat, LayerRequest, LayerResponse, ServerRegistration,

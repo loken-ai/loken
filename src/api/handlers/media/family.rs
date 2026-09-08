@@ -28,6 +28,7 @@ pub fn image_family(model_name: &str) -> &'static str {
 /// `every_advertised_family_routes_to_its_own_loader` walks it, so a family added to
 /// the classifiers without a loader fails a test instead of rendering through whatever
 /// the fallback arm happened to be.
+#[cfg(test)]
 pub(crate) const IMAGE_FAMILIES: &[&str] =
     &["sdxl", "boogu", "qwen-image", "zimage", "flux2", "flux"];
 

@@ -29,7 +29,6 @@ struct Case {
 }
 
 impl Case {
-    #[allow(clippy::too_many_arguments)]
     fn build(
         keep: &mut Vec<Arc<QTensor>>,
         dtype: GgmlDType,
@@ -229,7 +228,6 @@ fn maxabs(a: &Tensor, b: &Tensor) -> f32 {
 }
 
 /// The tiled fused reduce against the baseline, on one case.
-#[allow(clippy::too_many_arguments)]
 fn fused_matches_twophase(
     keep: &mut Vec<Arc<QTensor>>,
     dtype: GgmlDType,

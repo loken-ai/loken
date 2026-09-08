@@ -60,7 +60,7 @@ pub(crate) fn f16_dot(q: &[f32], k: &[f16]) -> f32 {
             sum += *pq.add(c) * (*k.as_ptr().add(c)).to_f32();
             c += 1;
         }
-        return sum;
+        sum
     }
     #[cfg(not(target_feature = "avx2"))]
     {
@@ -95,7 +95,6 @@ pub(crate) fn f16_axpy(p: f32, v: &[f16], o: &mut [f32]) {
             *po.add(c) += p * (*v.as_ptr().add(c)).to_f32();
             c += 1;
         }
-        return;
     }
     #[cfg(not(target_feature = "avx2"))]
     {
@@ -128,7 +127,6 @@ fn extend_f16(dst: &mut Vec<f16>, src: &[f32]) {
             *(dst.as_mut_ptr().add(base + c)) = f16::from_f32(src[c]);
             c += 1;
         }
-        return;
     }
     #[cfg(not(target_feature = "avx2"))]
     {
@@ -423,7 +421,8 @@ mod tests {
             ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
         };
         let seq = 20usize;
-        let window = Some(6usize);
+        let win = 6usize;
+        let window = Some(win);
         let mut kv = CpuF16Kv::new(nh, nkv, hd, window);
         let mut all_k = vec![]; // [seq][nkv*hd]
         let mut all_v = vec![];
@@ -441,7 +440,7 @@ mod tests {
 
         // naive reference (f16 round-trip K/V to match precision)
         let n_rep = nh / nkv;
-        let t0 = seq - window.unwrap();
+        let t0 = seq - win;
         let mut want = vec![0f32; nh * hd];
         for qh in 0..nh {
             let kvh = qh / n_rep;

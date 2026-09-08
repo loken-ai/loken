@@ -125,7 +125,6 @@ impl ImageEngine {
     /// readers several call levels down. Every safetensors tensor of every component
     /// is read through one function that consults the published token, so the grain is
     /// one tensor - see `cancel::scoped` and `SafeTensorsLoader::load`.
-    #[allow(clippy::too_many_arguments)]
     pub async fn load_sdxl_cancellable(
         &self,
         checkpoint: std::path::PathBuf,
@@ -887,7 +886,7 @@ impl ImageEngine {
                 crate::tensor::VarBuilder::from_files(
                     &te_files_str,
                     te_ndtype,
-                    &te_ndevice,
+                    te_ndevice,
                 )
             }
             .map_err(|e| anyhow!("z-image TE native weights: {e}"))?;
@@ -959,7 +958,7 @@ impl ImageEngine {
                         crate::tensor::VarBuilder::from_files(
                             &tf_files_str,
                             crate::tensor::DType::BF16,
-                            &ndev,
+                            ndev,
                         )
                     }
                     .map_err(|e| anyhow!("{e}"))?;
@@ -1327,7 +1326,7 @@ impl ImageEngine {
                 crate::tensor::VarBuilder::from_files(
                     &[vae_path.to_str().unwrap()],
                     crate::tensor::DType::F32,
-                    &n_vae_device,
+                    n_vae_device,
                 )?
             };
             let vae = crate::inference::model::zimage::vae::AutoEncoderKL::new(&vae_config, vae_vb).map_err(|e| {

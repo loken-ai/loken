@@ -125,7 +125,6 @@ fn outputs_q_in_f32(
 /// `q_scale` is multiplied into Q only - the caller passes `1/sqrt(head_dim)` to fold the
 /// attention scale in here and spare a downstream affine. `rope_cos` / `rope_sin` are the full
 /// `[max_seq, hd/2]` tables: the kernel picks its row from `rope_pos`, so no offset is needed.
-#[allow(clippy::too_many_arguments)]
 pub fn attn_post_qkv_decode(
     qkv: &Tensor,
     q_norm_w: &Tensor,
@@ -212,7 +211,6 @@ pub fn attn_post_qkv_decode(
 
 /// [`attn_post_qkv_decode`] with Q and V returned in F32, to feed the Q4 KV-cache quantise
 /// without an extra cast launch.
-#[allow(clippy::too_many_arguments)]
 pub fn attn_post_qkv_decode_qf32(
     qkv: &Tensor,
     q_norm_w: &Tensor,
@@ -290,7 +288,6 @@ pub fn attn_post_qkv_decode_qf32(
 }
 
 /// [`attn_post_qkv_decode_qf32`] for the architectures that carry no Q/K norm.
-#[allow(clippy::too_many_arguments)]
 pub fn attn_post_qkv_decode_qf32_no_norm(
     qkv: &Tensor,
     rope_cos: &Tensor,
@@ -354,7 +351,6 @@ pub fn attn_post_qkv_decode_qf32_no_norm(
 
 /// [`attn_post_qkv_decode_qf32_no_norm`] where RoPE turns only the first `rope_dim` of each
 /// head and the rest of the head passes through.
-#[allow(clippy::too_many_arguments)]
 pub fn attn_post_qkv_decode_qf32_no_norm_partial_rope(
     qkv: &Tensor,
     rope_cos: &Tensor,

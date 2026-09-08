@@ -305,10 +305,7 @@ pub fn zgate_rmsnorm(o: &Tensor, z: &Tensor, norm_w: &Tensor, eps: f32) -> Resul
             stream,
         );
     }
-    Ok(tensor_from_cuda_storage(
-        CudaStorage::wrap_cuda_slice(y_slice, dev.clone()),
-        (n, d),
-    )?)
+    tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(y_slice, dev.clone()), (n, d))
 }
 
 /// Fused DeltaNet gating. `alpha`,`beta_in` [N, H]; `a_log`,`dt_bias` [H]

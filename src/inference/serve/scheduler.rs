@@ -428,7 +428,7 @@ mod tests {
         let p = s.schedule();
         assert!(!p.preempted.is_empty() || p.decodes.len() <= 2);
         // The system makes progress (at least one decode) and never panics.
-        assert!(p.decodes.len() >= 1);
+        assert!(!p.decodes.is_empty());
     }
 
     #[test]

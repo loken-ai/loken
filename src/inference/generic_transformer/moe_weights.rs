@@ -528,7 +528,7 @@ impl MoeWeights {
             let _ = xs.device().synchronize();
             crate::inference::place::layer_perf::stages::add(6, t.elapsed().as_micros() as u64);
         }
-        let t_dn = st.then(|| std::time::Instant::now());
+        let t_dn = st.then(std::time::Instant::now);
         // Down + topk-weighted reduce. For Q4_K MoE prefill the IMMA M=8
         // down kernel (same pattern as gate||up) takes over from dp4a.
         let down_q4k_aligned = self.down_exps.dtype() == crate::tensor::quantized::GgmlDType::Q4K

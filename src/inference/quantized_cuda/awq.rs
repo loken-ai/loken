@@ -305,7 +305,7 @@ pub(crate) fn get_quantized_ptx_for_ordinal(ordinal: usize) -> Result<&'static s
         }
         return Ok(p);
     }
-    let compiled: String = (|| {
+    let compiled: String = {
         let opts = cudarc::nvrtc::safe::CompileOptions {
             include_paths: cuda_include_paths(),
             arch,
@@ -333,7 +333,7 @@ pub(crate) fn get_quantized_ptx_for_ordinal(ordinal: usize) -> Result<&'static s
                 String::new()
             }
         }
-    })();
+    };
     let leaked: &'static str = Box::leak(compiled.into_boxed_str());
     g.insert(key, leaked);
     let ptx = leaked;
@@ -357,7 +357,7 @@ pub(super) const Q8_0_BLOCK_SIZE: usize = crate::tensor::quantized::GgmlDType::Q
 pub(super) const Q8_0_TYPE_SIZE: usize = crate::tensor::quantized::GgmlDType::Q8_0.type_size();
 
 pub fn ceil_div(p: usize, q: usize) -> usize {
-    (p + q - 1) / q
+    p.div_ceil(q)
 }
 /// `p` rounded up to a whole number of `q`s.
 pub fn pad(p: usize, q: usize) -> usize {
@@ -547,7 +547,6 @@ pub(super) fn adaptive_block_grid_x(
 ///.
 /// the kernel from loken's NVRTC-compiled module instead of the tensor-op
 /// PTX blob.
-#[allow(clippy::too_many_arguments)]
 pub fn quantize_q8_0_kv_paired_into_offset(
     src_k: &CudaView<f32>,
     src_v: &CudaView<f32>,
@@ -647,7 +646,6 @@ pub(super) fn quantize_q8_1(
 /// a Q8_0 K cache, with Q quantized to Q8_1 on the fly. Returns the scores as a
 /// A `CudaStorage` (shape `[n_q_heads, n_kv]`), driven from
 /// cuda.rs; loads from the loken_quantized module.
-#[allow(clippy::too_many_arguments)]
 pub fn attn_score_q8_0_q8_1_gqa_scaled(
     k_blob: &CudaSlice<u8>,
     q_f32: &CudaView<f32>,
@@ -718,7 +716,6 @@ pub fn attn_score_q8_0_q8_1_gqa_scaled(
 /// GQA Q8-attention output: softmax(scores) . V over a Q8_0 V cache, fused into
 /// one launch. Returns the per-head outputs as a facade `CudaStorage` (shape
 /// `[n_q_heads, head_dim]`).
-#[allow(clippy::too_many_arguments)]
 pub fn attn_softmax_output_q8_0_f32_gqa(
     v_blob: &CudaSlice<u8>,
     scores_f32: &CudaView<f32>,
@@ -781,7 +778,6 @@ pub fn attn_softmax_output_q8_0_f32_gqa(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn attn_score_q4_0_f32_kivi(
     k_blocks: &CudaSlice<u8>,
     k_residual: &CudaSlice<f16>,
@@ -839,7 +835,7 @@ pub fn attn_score_q4_0_f32_kivi(
     let cfg = warp_block_launch(
         (total_blocks as u32, n_kv_heads as u32, 1),
         n_warps,
-        (n_warps * WARP_SIZE as u32 * 4) as u32,
+        n_warps * WARP_SIZE as u32 * 4,
     );
 
     let dst = unsafe { dev.alloc::<f32>(n_q_heads * seq_kv)? };
@@ -859,7 +855,6 @@ pub fn attn_score_q4_0_f32_kivi(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn attn_score_q4_0_f32_kivi_dev_pos(
     k_blocks: &CudaSlice<u8>,
     k_residual: &CudaSlice<f16>,
@@ -919,7 +914,7 @@ pub fn attn_score_q4_0_f32_kivi_dev_pos(
     let cfg = warp_block_launch(
         (max_blocks as u32, n_kv_heads as u32, 1),
         n_warps,
-        (n_warps * WARP_SIZE as u32 * 4) as u32,
+        n_warps * WARP_SIZE as u32 * 4,
     );
     // Fresh allocation each call - under CUDA graph capture mode the
     // async pool returns the same address for identically-sized allocs,

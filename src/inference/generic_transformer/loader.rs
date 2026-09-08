@@ -774,7 +774,7 @@ fn build_generic_layer(
         attn_output,
         attn_output_bias,
         // SmolLM3 NoPE: RoPE is skipped on every 4th layer ((idx+1)%4==0).
-        no_rope: config.arch == "smollm3" && (raw.layer_idx + 1) % 4 == 0,
+        no_rope: config.arch == "smollm3" && (raw.layer_idx + 1).is_multiple_of(4),
         attn_norm,
         attn_norm_weight_f32,
         post_attn_norm,
@@ -1084,7 +1084,6 @@ fn build_generic_layer(
 /// and `standard_attention` - which works with any `QMatMul` - runs), f16 norms,
 /// F32 biases. All CUDA-graph buffers None; KV cache is F16 SpecKvCache
 /// (kv_quant=Off for this first cut).
-#[allow(clippy::too_many_arguments)]
 fn build_awq_layer(
     st: &crate::tensor::safetensors::MmapedSafetensors,
     layer_idx: usize,
@@ -2623,20 +2622,19 @@ impl GenericHeteroTransformer {
                 let failed = AtomicBool::new(false);
                 std::thread::scope(|scope| {
                     for _ in 0..workers {
-                        scope.spawn(|| loop {
-                            let Some(stack) =
+                        scope.spawn(|| {
+                            while let Some(stack) =
                                 host_prefill_stacks.get(next.fetch_add(1, Ordering::Relaxed))
-                            else {
-                                break;
-                            };
-                            if let Err(e) = host_moe::prewarm_expert_repack(stack) {
-                                // The first prefill builds whatever is missing, so a failure
-                                // here costs time and never an answer - said once for the
-                                // warm, not once per worker and not once per stack.
-                                if !failed.swap(true, Ordering::Relaxed) {
-                                    tracing::warn!("expert repack warm stopped: {e}");
+                            {
+                                if let Err(e) = host_moe::prewarm_expert_repack(stack) {
+                                    // The first prefill builds whatever is missing, so a failure
+                                    // here costs time and never an answer - said once for the
+                                    // warm, not once per worker and not once per stack.
+                                    if !failed.swap(true, Ordering::Relaxed) {
+                                        tracing::warn!("expert repack warm stopped: {e}");
+                                    }
+                                    break;
                                 }
-                                break;
                             }
                         });
                     }

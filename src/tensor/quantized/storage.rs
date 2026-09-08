@@ -3,7 +3,6 @@
 use super::*;
 
 /// Facade-shaped quantized storage enum (`QStorage::Cuda(s)` matches).
-
 pub enum QStorage {
     /// Host blocks (the native QTensor keeps them; no payload needed by
     /// any frozen match site - they all bind the Cuda arm).

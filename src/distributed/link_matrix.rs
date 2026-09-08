@@ -86,6 +86,7 @@ impl LinkMatrix {
     /// Without peer-to-peer a cross-device move is device -> host -> device, so it is bounded by
     /// the SLOWER of the two links. That bound is symmetric, which the test below relies on: a
     /// matrix that disagrees with itself across the diagonal is measuring noise, not a fabric.
+    #[cfg(test)]
     fn derive_costs(&mut self) {
         let ids: Vec<usize> = self.links.keys().copied().collect();
         for &a in &ids {

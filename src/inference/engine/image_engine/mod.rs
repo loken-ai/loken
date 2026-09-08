@@ -340,7 +340,7 @@ fn encode_flux_text(
         } else {
             crate::tensor::DType::F32
         };
-        let vb = unsafe { crate::tensor::VarBuilder::from_files(&[&path], ndtype, &ndev) }
+        let vb = unsafe { crate::tensor::VarBuilder::from_files(&[&path], ndtype, ndev) }
             .map_err(|e| anyhow!("T5 rebuild: {e}"))?;
         state.t5_model = Some(
             crate::inference::model::t5::encoder::T5EncoderModel::load(vb, &cfg)
@@ -460,7 +460,6 @@ fn set_flux_loras(
 /// Empty when no region was asked for, which is the path that must stay exactly as it
 /// was: one forward per step, no extra encode, no behaviour change for every render
 /// that does not use this.
-#[allow(clippy::too_many_arguments)]
 fn build_flux_regions(
     flux_state: &mut FluxModelState,
     device: &Device,
@@ -1119,10 +1118,11 @@ fn generate_flux_image_stream(
                     .to_dtype(DType::F32)?
                     .to_device(&Device::Cpu)?;
             drop(denoised);
-            (
-                flux_state.ae_cpu.as_ref().unwrap().decode(&unpacked)?,
-                "CPU",
-            )
+            let ae = flux_state
+                .ae_cpu
+                .as_ref()
+                .ok_or_else(|| crate::tensor::Error::msg("the CPU VAE is not resident"))?;
+            (ae.decode(&unpacked)?, "CPU")
         }
     };
     let img_cpu = decoded_to_cpu_u8(decoded)?;
@@ -1761,7 +1761,7 @@ fn generate_zimage(
         // The img2img schedule: build for steps/denoise and keep the TAIL rather than
         // rescaling, so the run is the caller's step count starting
         // at the requested noise level, on the model's own schedule shape.
-        scheduler.set_timesteps_denoised(num_steps, Some(mu), strength as f64);
+        scheduler.set_timesteps_denoised(num_steps, Some(mu), strength);
         let start = 0usize;
         let sigma_start = scheduler.current_sigma();
         info!("Z-Image img2img: start_step={start}/{num_steps} sigma={sigma_start:.4}",);

@@ -110,7 +110,7 @@ pub(super) fn find_local_flux_gguf(hf_models_dir: &str, model_name: &str) -> Opt
                 let tag = p
                     .file_stem()
                     .and_then(|s| s.to_str())
-                    .map(|s| ray_variant_tag(s))
+                    .map(ray_variant_tag)
                     .unwrap_or_default();
                 is_st && tag == want
             })
@@ -276,7 +276,7 @@ pub(crate) fn ray_variant_tag(stem: &str) -> String {
                 && t[1..].chars().next().is_some_and(|c| c.is_ascii_digit()))
     }
     stem.to_ascii_lowercase()
-        .split(|c: char| matches!(c, '.' | '_' | '-' | ':'))
+        .split(['.', '_', '-', ':'])
         .filter(|t| !dropped(t))
         .collect::<Vec<_>>()
         .join("-")

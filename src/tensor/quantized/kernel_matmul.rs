@@ -23,7 +23,6 @@ pub use kat::kernel_known_answer_test;
 /// hot path) run the mmvq GEMV, batches the tiled MMQ; on CPU (or for
 /// unsupported quant types) a lazily-dequantized F32 matmul serves as the
 /// correctness path.
-
 pub struct QKernelMatMul {
     /// Low-rank adapters applied ON TOP of the quantised weight.
     ///
@@ -437,10 +436,10 @@ impl QKernelMatMul {
         let xf = x
             .to_dtype(crate::tensor::DType::F32)?
             .reshape(vec![1, rows, k])?;
-        let acc = Some(xf.matmul(down)?.matmul(up)?);
+        let acc = xf.matmul(down)?.matmul(up)?;
         let mut odims = xdims;
         *odims.last_mut().unwrap() = self.n;
-        let delta = acc.unwrap().reshape(odims)?.to_dtype(base.dtype())?;
+        let delta = acc.reshape(odims)?.to_dtype(base.dtype())?;
         base.add(&delta)
     }
 
@@ -493,7 +492,7 @@ impl QKernelMatMul {
         // facade flip would regress CPU/hybrid decode 10-100x).
         if matches!(self.device, crate::tensor::Device::Cpu)
             && crate::tensor::quant_cpu::supports(self.dtype)
-            && self.k % self.dtype.block_size() == 0
+            && self.k.is_multiple_of(self.dtype.block_size())
         {
             // Output carries the INPUT's dtype (
             // same as the CUDA branches below): a half-carrier model's
@@ -545,8 +544,8 @@ impl QKernelMatMul {
             // Q4_K serves EVERY row count from the unified repack (M=1 interleaved
             // GEMV, M>=2 tiled GEMM) - the in-place storage path.
             let q4k_prefill = self.dtype == GgmlDType::Q4K
-                && self.n % 8 == 0
-                && self.k % 256 == 0
+                && self.n.is_multiple_of(8)
+                && self.k.is_multiple_of(256)
                 && crate::tensor::quant_cpu::cast_blocks::<crate::tensor::quant_cpu::BlockQ4K>(
                     self.host.data(),
                 )
@@ -559,8 +558,8 @@ impl QKernelMatMul {
             let nb40 = self.k / 32;
             let q4_0_decode = self.dtype == GgmlDType::Q4_0
                 && rows < 4
-                && self.n % 8 == 0
-                && self.k % 32 == 0
+                && self.n.is_multiple_of(8)
+                && self.k.is_multiple_of(32)
                 && crate::tensor::quant_cpu::cast_blocks::<crate::tensor::quant_cpu::BlockQ4_0>(
                     self.host.data(),
                 )
@@ -571,8 +570,8 @@ impl QKernelMatMul {
             // once per prompt row. Decode (rows<4) keeps the row-grouped GEMV.
             let q4_0_prefill = self.dtype == GgmlDType::Q4_0
                 && rows >= 4
-                && self.n % 8 == 0
-                && self.k % 32 == 0
+                && self.n.is_multiple_of(8)
+                && self.k.is_multiple_of(32)
                 && crate::tensor::quant_cpu::cast_blocks::<crate::tensor::quant_cpu::BlockQ4_0>(
                     self.host.data(),
                 )
@@ -583,8 +582,8 @@ impl QKernelMatMul {
             // each weight once per prompt row, the bulk of its prefill cost.
             let q6k_prefill = self.dtype == GgmlDType::Q6K
                 && rows >= 4
-                && self.n % 8 == 0
-                && self.k % 256 == 0
+                && self.n.is_multiple_of(8)
+                && self.k.is_multiple_of(256)
                 && crate::tensor::quant_cpu::cast_blocks::<crate::tensor::quant_cpu::BlockQ6K>(
                     self.host.data(),
                 )
@@ -595,8 +594,8 @@ impl QKernelMatMul {
             // a 32-weight block, so the high-bit decode is paid far more often).
             let q5_0_prefill = self.dtype == GgmlDType::Q5_0
                 && rows >= 4
-                && self.n % 8 == 0
-                && self.k % 32 == 0
+                && self.n.is_multiple_of(8)
+                && self.k.is_multiple_of(32)
                 && crate::tensor::quant_cpu::cast_blocks::<crate::tensor::quant_cpu::BlockQ5_0>(
                     self.host.data(),
                 )
@@ -604,8 +603,8 @@ impl QKernelMatMul {
                 .unwrap_or(false);
             let q5k_prefill = self.dtype == GgmlDType::Q5K
                 && rows >= 4
-                && self.n % 8 == 0
-                && self.k % 256 == 0
+                && self.n.is_multiple_of(8)
+                && self.k.is_multiple_of(256)
                 && crate::tensor::quant_cpu::cast_blocks::<crate::tensor::quant_cpu::BlockQ5K>(
                     self.host.data(),
                 )
@@ -616,8 +615,8 @@ impl QKernelMatMul {
             // 1-byte weight block once per prompt row.
             let q8_0_prefill = self.dtype == GgmlDType::Q8_0
                 && rows >= 4
-                && self.n % 8 == 0
-                && self.k % 32 == 0
+                && self.n.is_multiple_of(8)
+                && self.k.is_multiple_of(32)
                 && crate::tensor::quant_cpu::cast_blocks::<crate::tensor::quant_cpu::BlockQ8_0>(
                     self.host.data(),
                 )
@@ -628,8 +627,8 @@ impl QKernelMatMul {
             // every 4-bit E2M1 block once per prompt row, the bulk of prefill cost.
             let mxfp4_prefill = self.dtype == GgmlDType::MxFp4
                 && rows >= 4
-                && self.n % 8 == 0
-                && self.k % 32 == 0
+                && self.n.is_multiple_of(8)
+                && self.k.is_multiple_of(32)
                 && crate::tensor::quant_cpu::cast_blocks::<crate::tensor::quant_cpu::BlockMxFp4>(
                     self.host.data(),
                 )
@@ -770,7 +769,7 @@ impl QKernelMatMul {
             // MMVQ. But ONLY drop to 5 when MMQ can actually run this quant - else
             // rows 6-8 would fall through to the slow dequant-F32 path, so keep the
             // old MMVQ-through-8 boundary for non-MMQ quants (no regression).
-            let mmq_capable = mmq_supports(self.dtype) && self.k % mmq_qk(self.dtype) == 0;
+            let mmq_capable = mmq_supports(self.dtype) && self.k.is_multiple_of(mmq_qk(self.dtype));
             let mmvq_max = if mmq_capable { 5 } else { 8 };
             if (1..=mmvq_max).contains(&rows)
                 && !kat_bad(&KAT_BAD_MMVQ, qdev.ordinal())
@@ -810,7 +809,7 @@ impl QKernelMatMul {
                             _ => None,
                         };
                         let smallk = rows == 1
-                            && self.n % 4 == 0
+                            && self.n.is_multiple_of(4)
                             && smallk_vdr.is_some_and(|vdr| (k as i32 / 256) < 4 * vdr);
                         let y = crate::tensor::cuda::mmvq_f32(
                             qdev, tag, blob, &q81, k, self.n, rows, smallk,
@@ -839,7 +838,7 @@ impl QKernelMatMul {
                             _ => None,
                         };
                         let smallk = rows == 1
-                            && self.n % 4 == 0
+                            && self.n.is_multiple_of(4)
                             && smallk_vdr.is_some_and(|vdr| (k as i32 / 256) < 4 * vdr);
                         let y = crate::tensor::cuda::mmvq_f16(
                             qdev, tag, blob, &q81, k, self.n, rows, smallk,
@@ -877,7 +876,7 @@ impl QKernelMatMul {
             // like the fork's fast_mmq::try_fwd.
             if rows > 1
                 && mmq_supports(self.dtype)
-                && self.k % mmq_qk(self.dtype) == 0
+                && self.k.is_multiple_of(mmq_qk(self.dtype))
                 && !kat_bad(&KAT_BAD_MMQ, qdev.ordinal())
             {
                 if matches!(xdt, crate::tensor::DType::F16 | crate::tensor::DType::BF16) {
@@ -989,8 +988,8 @@ impl QKernelMatMul {
     pub(crate) fn q4k_x8(&self) -> Option<&Vec<crate::tensor::quant_cpu::repack_q4k::BlockQ4Kx8>> {
         if self.dtype != GgmlDType::Q4K
             || !matches!(self.device, crate::tensor::Device::Cpu)
-            || self.n % 8 != 0
-            || self.k % 256 != 0
+            || !self.n.is_multiple_of(8)
+            || !self.k.is_multiple_of(256)
         {
             return None;
         }
@@ -1029,7 +1028,7 @@ impl QKernelMatMul {
             || self.k != up.k
             || self.n != up.n
             || !crate::tensor::quant_cpu::supports(self.dtype)
-            || self.k % self.dtype.block_size() != 0
+            || !self.k.is_multiple_of(self.dtype.block_size())
             || x.dtype() != crate::tensor::DType::F16
         {
             return Ok(None);
@@ -1141,7 +1140,7 @@ impl QKernelMatMul {
                     _ => None,
                 };
                 let smallk = rows == 1
-                    && self.n % 4 == 0
+                    && self.n.is_multiple_of(4)
                     && smallk_vdr.is_some_and(|vdr| (k as i32 / 256) < 4 * vdr);
                 let y =
                     crate::tensor::cuda::mmvq_f16(qdev, tag, blob, &q81, k, self.n, rows, smallk)?;

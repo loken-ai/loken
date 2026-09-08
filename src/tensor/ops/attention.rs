@@ -336,7 +336,7 @@ mod repeat_kv_tests {
         let want = flat(&xs);
         for h in 0..kv {
             for r in 0..rep {
-                let out = ((0 * kv + h) * rep + r) * seq * hd;
+                let out = (h * rep + r) * seq * hd;
                 let src = h * seq * hd;
                 assert_eq!(
                     got[out..out + seq * hd],

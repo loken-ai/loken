@@ -1,15 +1,15 @@
-/// An operation that copies to the host with no device path takes the WHOLE forward
-/// with it, because everything computed afterwards stays where the tensor landed.
-///
-/// This is a gate, not a style check, and it has now cost two measured incidents in
-/// one network. `conv_transpose2d` and `max_pool2d` each bounced unconditionally, and
-/// between them they kept the face-swap generator on a single CPU core - 1.86 s a
-/// face, with the card the loader had chosen sitting idle and the log reporting the
-/// weights placed on it. Nothing failed: the arithmetic was right, so every test
-/// passed. Only a CPU-time measurement against wall time showed it.
-///
-/// The rule: in this file, an op that can take a tensor off the device must have a
-/// device path, or say here why it does not. Adding a name below is a decision to be
+// An operation that copies to the host with no device path takes the WHOLE forward
+// with it, because everything computed afterwards stays where the tensor landed.
+//
+// This is a gate, not a style check, and it has now cost two measured incidents in
+// one network. `conv_transpose2d` and `max_pool2d` each bounced unconditionally, and
+// between them they kept the face-swap generator on a single CPU core - 1.86 s a
+// face, with the card the loader had chosen sitting idle and the log reporting the
+// weights placed on it. Nothing failed: the arithmetic was right, so every test
+// passed. Only a CPU-time measurement against wall time showed it.
+//
+// The rule: in this file, an op that can take a tensor off the device must have a
+// device path, or say here why it does not. Adding a name below is a decision to be
 
 /// Every line of the `Tensor` impl, whichever file of `tensor/` it now sits in.
 fn tensor_module_source() -> String {

@@ -5,7 +5,6 @@
 use super::*;
 
 /// Direct transposed 1-D conv for one batch slab (dilation 1, groups 1).
-#[allow(clippy::too_many_arguments)]
 pub fn convt1d_f32(
     dev: &CudaDevice,
     x: &cudarc::driver::CudaView<f32>,
@@ -48,7 +47,6 @@ pub fn convt1d_f32(
 }
 
 /// GroupNorm on [b, c, spatial]: one block per (batch, group) slab.
-#[allow(clippy::too_many_arguments)]
 pub fn group_norm_f32(
     dev: &CudaDevice,
     x: &CudaSlice<f32>,
@@ -165,7 +163,6 @@ pub fn permute_storage(
 }
 
 /// RoPE on [bh, seq, d] with [seq, d/2] cos/sin tables.
-#[allow(clippy::too_many_arguments)]
 pub fn rope_f32(
     dev: &CudaDevice,
     x: &CudaSlice<f32>,

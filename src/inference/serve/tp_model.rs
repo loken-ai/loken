@@ -383,9 +383,8 @@ impl TpQwen2 {
             if let Some((k, v)) = c.as_ref() {
                 let cur = k.dim(1).unwrap_or(0);
                 if n < cur {
-                    match (k.narrow(1, 0, n), v.narrow(1, 0, n)) {
-                        (Ok(kt), Ok(vt)) => *c = Some((kt, vt)),
-                        _ => {}
+                    if let (Ok(kt), Ok(vt)) = (k.narrow(1, 0, n), v.narrow(1, 0, n)) {
+                        *c = Some((kt, vt))
                     }
                 }
             }

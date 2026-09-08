@@ -29,7 +29,7 @@ pub(crate) fn alloc_err(ctx: &str, e: cudarc::driver::DriverError) -> Error {
 mod device;
 pub use device::*;
 mod storage;
-pub use storage::*;
+pub(crate) use storage::*;
 mod elementwise;
 pub use elementwise::*;
 mod index;

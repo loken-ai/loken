@@ -10,7 +10,6 @@ use super::*;
 /// The blob is `Arc`-shared so a weight's `QMatMul` kernels and its
 /// `storage()` projection reuse ONE padded upload (no double VRAM).
 #[cfg(feature = "cuda")]
-
 pub struct QCudaStorage {
     pub(crate) blob: Arc<cudarc::driver::CudaSlice<u8>>,
     /// Unpadded byte length of the block data.

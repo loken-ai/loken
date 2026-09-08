@@ -4,14 +4,14 @@
 use super::*;
 
 mod models;
-pub use models::*;
+pub(crate) use models::*;
 mod options;
-pub use options::*;
+pub(crate) use options::*;
 mod chat;
 mod load;
-pub use chat::*;
+pub(crate) use chat::*;
 mod embed;
-pub use embed::*;
+pub(crate) use embed::*;
 
 #[cfg(test)]
 mod tests;

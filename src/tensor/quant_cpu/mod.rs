@@ -27,13 +27,12 @@
 use super::quantized::GgmlDType;
 use super::Error;
 use super::Result;
-use byteorder::{ByteOrder, LittleEndian};
 use half::{bf16, f16, slice::HalfFloatSliceExt};
 use rayon::prelude::*;
 
 // ===========================================================================
 mod scale;
-pub use scale::*;
+use scale::*;
 mod blocks;
 pub mod format;
 // The block types keep the paths their callers already use: `quant_cpu::BlockQ4K`

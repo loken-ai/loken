@@ -35,7 +35,6 @@ pub fn gptoss_flash_decode(
     Ok(None)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn gptoss_flash_decode_win(
     _q: &Tensor,
     _k: &Tensor,
@@ -152,7 +151,6 @@ pub fn fused_softmax_sinks(
     Ok(None)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn paged_flash_decode(
     _q: &Tensor,
     _kp: &Tensor,

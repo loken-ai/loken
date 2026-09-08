@@ -13,7 +13,6 @@
 
 use crate::tensor::layer::qlinear::{QLinear, QMlp};
 use crate::tensor::layer::LayerNorm;
-use crate::tensor::ops::Activation;
 use crate::tensor::Module;
 use crate::tensor::{Result, Tensor};
 
@@ -81,7 +80,6 @@ pub struct VitBlock {
 impl VitBlock {
     /// `heads` divides the width; `head_dim` follows from it and is kept rather than recomputed
     /// per forward.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         norm1: LayerNorm,
         qkv: Qkv,
@@ -91,7 +89,7 @@ impl VitBlock {
         width: usize,
         heads: usize,
     ) -> Result<Self> {
-        if heads == 0 || width % heads != 0 {
+        if heads == 0 || !width.is_multiple_of(heads) {
             crate::tensor::bail!("a ViT block of width {width} cannot have {heads} heads");
         }
         Ok(Self {

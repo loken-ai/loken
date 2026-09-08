@@ -1228,7 +1228,6 @@ const PATCHED_PAIR_HEAD: [f32; 16] = [
 /// Normalisation with no learned scale or shift, against its own definition.
 #[test]
 fn layer_norm_with_no_affine_is_its_formula() {
-    use crate::tensor::Module as _;
     let (b, l, d) = (2usize, 3usize, 16usize);
     let vals = data(b * l * d, 61);
     let t = Tensor::from_vec_f32(vals.clone(), vec![b, l, d]).unwrap();

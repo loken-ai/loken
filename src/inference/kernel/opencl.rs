@@ -808,7 +808,7 @@ mod rms_norm_on_device {
         for &dev in &devices {
             use std::ptr::null_mut;
             let p = OpenCLPipelines::new(dev).expect("pipelines");
-            let mut upload = |v: &[f32]| -> Buffer<f32> {
+            let upload = |v: &[f32]| -> Buffer<f32> {
                 let mut b = unsafe {
                     Buffer::<f32>::create(&p.context, CL_MEM_READ_WRITE, v.len(), null_mut())
                 }

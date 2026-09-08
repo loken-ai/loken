@@ -14,8 +14,6 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use half::{bf16, f16};
-
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[cfg(target_feature = "avx2")]
 mod vectorised {

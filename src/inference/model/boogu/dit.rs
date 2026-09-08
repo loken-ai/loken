@@ -1031,17 +1031,14 @@ impl BooguTransformer2DModel {
         let mut rope: HashMap<DeviceLocation, (NT, NT, NT, NT, NT)> = HashMap::new();
         for dev in &devs {
             let loc = dev.location();
-            if !rope.contains_key(&loc) {
-                rope.insert(
-                    loc,
-                    (
-                        temb.to_device(dev)?,
-                        joint_cpu.0.to_device(dev)?,
-                        joint_cpu.1.to_device(dev)?,
-                        img_cpu.0.to_device(dev)?,
-                        img_cpu.1.to_device(dev)?,
-                    ),
-                );
+            if let std::collections::hash_map::Entry::Vacant(e) = rope.entry(loc) {
+                e.insert((
+                    temb.to_device(dev)?,
+                    joint_cpu.0.to_device(dev)?,
+                    joint_cpu.1.to_device(dev)?,
+                    img_cpu.0.to_device(dev)?,
+                    img_cpu.1.to_device(dev)?,
+                ));
             }
         }
         let (temb_i, _, _, img_i_cos, img_i_sin) = &rope[&idev.location()];
@@ -1104,7 +1101,6 @@ impl BooguTransformer2DModel {
 /// Patchify `x [C, H, W]` (padded to `H_pad/W_pad`) into `[(H_pad/p)*(W_pad/p), p*p*C]`
 /// with the reference `b c (h p1) (w p2) -> b (h w) (p1 p2 c)` channel ordering
 /// (`c` fastest). Padded positions read zeros.
-#[allow(clippy::too_many_arguments)]
 fn patchify(
     x: &[f32],
     c: usize,
@@ -1140,7 +1136,6 @@ fn patchify(
 
 /// Inverse of `patchify`: `[(H_pad/p)*(W_pad/p), p*p*C] -> [C, H, W]` (cropped from the
 /// padded grid), the reference `b (h w) (p1 p2 c) -> b c (h p1) (w p2)`.
-#[allow(clippy::too_many_arguments)]
 fn depatchify(
     hidden: &[f32],
     c: usize,

@@ -486,7 +486,7 @@ fn load_parler_blocking(model_id: &str) -> AnyResult<TtsModelState> {
     // parler's T5 runs on the native substrate (F32, matching the model dtype).
     let t5_ndevice = &device.clone();
     let t5_vb = unsafe {
-        crate::tensor::VarBuilder::from_files(&weights_path, crate::tensor::DType::F32, &t5_ndevice)
+        crate::tensor::VarBuilder::from_files(&weights_path, crate::tensor::DType::F32, t5_ndevice)
     }
     .map_err(|e| anyhow!("parler t5 native weights: {e}"))?;
     let model = ParlerModel::new(&config, vb, t5_vb).context("load parler-tts weights")?;

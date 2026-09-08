@@ -272,7 +272,7 @@ pub(super) static COMPILED_PTX: OnceLock<
 ///
 /// Idempotent. Safe to call multiple times.
 pub fn prewarm_fused_kernels(cuda_dev: &crate::tensor::cuda_ext::RawCudaDevice) -> Result<()> {
-    let ptx = get_ptx(&cuda_dev)?;
+    let ptx = get_ptx(cuda_dev)?;
     // Touching get_or_load_custom_func once per kernel name forces the
     // module into the device's custom_modules cache.
     let names = [

@@ -406,7 +406,6 @@ pub fn render(
 }
 
 /// Like [`render`], plus a phase reporter `progress(phase, done, total)` for streaming UIs.
-#[allow(clippy::too_many_arguments)]
 pub fn render_with_progress(
     prompt: &str,
     out_frames: usize,
@@ -458,7 +457,6 @@ impl WanSampler {
 }
 
 /// [`render_with_progress`] with an explicit sampler.
-#[allow(clippy::too_many_arguments)]
 pub fn render_sampled(
     prompt: &str,
     out_frames: usize,
@@ -512,7 +510,6 @@ pub fn render_many(
 }
 
 /// Like [`render_many`], plus a phase reporter `progress(phase, done, total)`.
-#[allow(clippy::too_many_arguments)]
 pub fn render_many_with_progress(
     prompts: &[String],
     out_frames: usize,
@@ -584,7 +581,6 @@ fn resize_rgb_to(rgb: &[u8], sw: usize, sh: usize, w: usize, h: usize) -> Vec<f3
 ///
 /// Chunk 0 produces the whole window; every later one regenerates the frame it continues
 /// and contributes the rest.
-#[allow(clippy::too_many_arguments)]
 fn denoise_i2v_chunks(
     dit: &WanDit,
     clip: &[f32],
@@ -774,7 +770,6 @@ fn i2v_cond20(ref_latent: &[f32], empty_latent: &[f32], frames: usize, plane: us
 }
 
 /// Like [`render_many_with_progress`], with an explicit [`WanSampler`].
-#[allow(clippy::too_many_arguments)]
 pub fn render_many_sampled(
     prompts: &[String],
     out_frames: usize,
@@ -800,7 +795,7 @@ pub fn render_many_sampled(
     start_image: Option<(&[u8], usize, usize)>,
 ) -> Result<Vec<WanFrames>> {
     use crate::tensor::Error;
-    if height % 16 != 0 || width % 16 != 0 {
+    if !height.is_multiple_of(16) || !width.is_multiple_of(16) {
         return Err(Error("wan: height/width must be multiples of 16".into()));
     }
     if prompts.is_empty() {
@@ -1284,17 +1279,14 @@ pub fn render_many_sampled(
                 .map(|(_, free, _)| free)
                 .unwrap_or(0);
             if free_now >= (vae_act + vae_weights) * 2 {
-                match dec_cpu.to_device(&vae_device) {
-                    Ok(d) => {
-                        eprintln!(
-                            "[ace-wan-vae] {:.1} GB free again on {vae_device:?} - moving the \
+                // A failed move leaves the decoder on the CPU until the next clip.
+                if let Ok(d) = dec_cpu.to_device(&vae_device) {
+                    eprintln!(
+                        "[ace-wan-vae] {:.1} GB free again on {vae_device:?} - moving the \
                              decoder back to the GPU",
-                            free_now as f64 / 1e9
-                        );
-                        dec_gpu = Some(d);
-                    }
-                    // Still no good: stay on the CPU and try again next clip.
-                    Err(_) => {}
+                        free_now as f64 / 1e9
+                    );
+                    dec_gpu = Some(d);
                 }
             }
         }
@@ -1604,7 +1596,7 @@ mod shift_tests {
 mod progress_total_tests {
     use crate::inference::model::wan::dit::WanDit;
 
-    /// The two paths walk different units, and a progress total that counts the wrong one
+    // The two paths walk different units, and a progress total that counts the wrong one
 
     /// The window count must rise with the clip. A count that saturates makes a long
     /// render look nearly finished from the moment it starts.

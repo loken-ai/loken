@@ -100,7 +100,9 @@ pub struct AnthropicMessagesRequest {
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default)]
     pub stream: Option<bool>,
+    /// Accepted so a request carrying it is not refused; nothing here reads it.
     #[serde(default)]
+    #[allow(dead_code)]
     pub metadata: Option<Value>,
     #[serde(default)]
     pub top_k: Option<u32>,

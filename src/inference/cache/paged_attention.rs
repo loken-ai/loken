@@ -200,7 +200,7 @@ pub fn paged_attn_decode_seq_tensor(
         let vv = v.narrow(1, kvh, 1)?.reshape(&[ctx, hd][..])?.contiguous()?; // [ctx, hd]
         let scores = qg
             .matmul(&kk.transpose(0, 1)?.contiguous()?)?
-            .affine(scale as f32, 0.0)?; // [g, ctx]
+            .affine(scale, 0.0)?; // [g, ctx]
         let p = softmax_last_dim(&scores)?; // [g, ctx]
         outs.push(p.matmul(&vv)?); // [g, hd]
     }
@@ -234,7 +234,7 @@ pub fn paged_attn_decode_batched_tensor(
     // scores [B,nkv,g,ctx] = qg @ kt^T
     let scores = qg
         .matmul(&kt.transpose(2, 3)?.contiguous()?)?
-        .affine(scale as f32, 0.0)?;
+        .affine(scale, 0.0)?;
     let p = softmax_last_dim(&scores)?; // [B,nkv,g,ctx]
     let out = p.matmul(&vt)?; // [B,nkv,g,hd]
     out.reshape(&[b, nh, hd][..])
@@ -281,7 +281,7 @@ pub fn paged_attn_decode_ragged_tensor(
     let vt = v.transpose(1, 2)?.contiguous()?;
     let scores = qg
         .matmul(&kt.transpose(2, 3)?.contiguous()?)?
-        .affine(scale as f32, 0.0)?; // [B,nkv,g,max_ctx]
+        .affine(scale, 0.0)?; // [B,nkv,g,max_ctx]
     let scores = scores.broadcast_add(mask)?;
     let p = softmax_last_dim(&scores)?;
     let out = p.matmul(&vt)?; // [B,nkv,g,hd]
@@ -326,7 +326,7 @@ pub fn paged_prefill_attn_tensor(
                                                                // scores [g,T,T] = qg @ kk^T
         let scores = qg
             .broadcast_matmul(&kk.transpose(0, 1)?.contiguous()?)?
-            .affine(scale as f32, 0.0)?;
+            .affine(scale, 0.0)?;
         let scores = scores.broadcast_add(&mask)?;
         let p = softmax_last_dim(&scores)?; // [g,T,T]
         outs.push(p.broadcast_matmul(&vv)?); // [g,T,hd]
@@ -383,7 +383,7 @@ pub fn paged_prefill_attn_suffix(
         let vv = vh.narrow(0, kvh, 1)?.reshape(&[t, hd][..])?; // [t, hd]
         let scores = qg
             .broadcast_matmul(&kk.transpose(0, 1)?.contiguous()?)?
-            .affine(scale as f32, 0.0)?; // [g,tsfx,t]
+            .affine(scale, 0.0)?; // [g,tsfx,t]
         let scores = scores.broadcast_add(&mask)?;
         let p = softmax_last_dim(&scores)?;
         outs.push(p.broadcast_matmul(&vv)?); // [g, tsfx, hd]

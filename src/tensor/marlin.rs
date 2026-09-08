@@ -184,12 +184,12 @@ pub fn repack_awq_to_marlin(
             "marlin repack: group_size {group_size} unsupported (only {MARLIN_GROUP_SIZE} compiled)"
         )));
     }
-    if k % MARLIN_TILE != 0 || k % group_size != 0 {
+    if !k.is_multiple_of(MARLIN_TILE) || !k.is_multiple_of(group_size) {
         return Err(Error(format!(
             "marlin repack: K={k} not a multiple of 16/group"
         )));
     }
-    if n % MIN_THREAD_N != 0 {
+    if !n.is_multiple_of(MIN_THREAD_N) {
         return Err(Error(format!(
             "marlin repack: N={n} not a multiple of {MIN_THREAD_N}"
         )));
@@ -528,7 +528,7 @@ mod tests {
             seen[p] = true;
         }
         let sp = scale_perm_grouped();
-        let mut seen = vec![false; 64];
+        let mut seen = [false; 64];
         for &p in &sp {
             assert!(p < 64 && !seen[p], "scale perm not a permutation");
             seen[p] = true;

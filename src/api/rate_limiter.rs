@@ -19,21 +19,15 @@ use tokio::sync::RwLock;
 /// How fast a client may go, and how much it may save up.
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
-    /// Sustained rate, per `window`.
-    pub max_requests: usize,
-    /// The period `max_requests` is expressed over.
-    pub window: Duration,
     /// The most a quiet client may accumulate.
     pub burst_capacity: usize,
-    /// Tokens per second, derived from `max_requests` over `window`.
+    /// Tokens per second: the sustained rate.
     pub refill_rate: f64,
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            max_requests: 100,
-            window: Duration::from_secs(60),
             burst_capacity: 10,
             refill_rate: 1.0,
         }
@@ -134,7 +128,6 @@ mod tests {
         let limiter = RateLimiter::new(RateLimitConfig {
             burst_capacity: 3,
             refill_rate: 1.0,
-            ..Default::default()
         });
 
         for i in 0..3 {
@@ -154,7 +147,6 @@ mod tests {
         let limiter = RateLimiter::new(RateLimitConfig {
             burst_capacity: 1,
             refill_rate: 0.0,
-            ..Default::default()
         });
         assert!(limiter.check_rate_limit("noisy").await);
         assert!(!limiter.check_rate_limit("noisy").await);

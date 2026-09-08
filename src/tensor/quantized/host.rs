@@ -160,7 +160,7 @@ impl QHostTensor {
         let ptr = unsafe { base.add(byte_offset) };
         // 8 covers every block type's alignment (see AlignedBytes); f32/Q8K
         // need 4, f16-headed blocks 2.
-        if (ptr as usize) % 8 != 0 {
+        if !(ptr as usize).is_multiple_of(8) {
             return Err(Error(format!(
                 "QHostTensor::view: pointer {ptr:?} not 8-byte aligned for {dtype:?}"
             )));

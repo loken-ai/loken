@@ -539,7 +539,6 @@ pub fn load(
 /// prompt, and its clean VAE latent tokens are CONCATENATED after the noise
 /// tokens (one (2, gh, gw) RoPE grid; only the noise half is denoised). This
 /// is NOT img2img: from-noise + concat is how the edit model was trained.
-#[allow(clippy::too_many_arguments)]
 pub fn generate_edit(
     state: &QwenImageModelState,
     prompt: &str,
@@ -758,7 +757,6 @@ pub fn generate_edit(
 
 /// Generate one image. `width`/`height` are pixels (multiples of 16 recommended), `num_steps` the
 /// flow-match Euler steps, `guidance` the CFG scale, `seed` the noise seed.
-#[allow(clippy::too_many_arguments)]
 pub fn generate(
     state: &QwenImageModelState,
     prompt: &str,

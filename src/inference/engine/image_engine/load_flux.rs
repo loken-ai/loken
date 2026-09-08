@@ -399,14 +399,14 @@ impl ImageEngine {
                                 crate::inference::load::fp8_scaled::load_qvarbuilder_cancellable(
                                     &[&flux_model_file],
                                     crate::tensor::quantized::GgmlDType::Q8_0,
-                                    &ndev,
+                                    ndev,
                                     cancel.as_ref(),
                                 )
                             }
                             .map_err(|e| anyhow::anyhow!("{e}"))?
                         } else {
                             crate::inference::cache::qvb::from_gguf_cached(
-                                &flux_model_file, &ndev,
+                                &flux_model_file, ndev,
                             ).map_err(|e| anyhow::anyhow!("{e}"))?
                         };
                         let nflux = HeteroFlux::whole(&flux_cfg, nvb)
@@ -436,7 +436,7 @@ impl ImageEngine {
                                     crate::inference::load::fp8_scaled::load_qvarbuilder_cancellable(
                                         &[&flux_model_file],
                                         crate::tensor::quantized::GgmlDType::Q8_0,
-                                        &ndev,
+                                        ndev,
                                         cancel.as_ref(),
                                     )
                                 }
@@ -467,10 +467,7 @@ impl ImageEngine {
                             let after: u64 = crate::inference::place::vram_manager::probe(0)
                                 .into_iter()
                                 .find(|(_, _, d)| {
-                                    Ok::<bool, crate::tensor::Error>(
-                                        crate::tensor::Device::same_device(d, &device),
-                                    )
-                                        .unwrap_or(false)
+                                    crate::tensor::Device::same_device(d, &device)
                                 })
                                 .map(|(_, free, _)| free)
                                 .unwrap_or(0);
@@ -881,9 +878,9 @@ impl ImageEngine {
             let n_vae_device = &vae_device.clone();
             let ae_vb = unsafe {
                 crate::tensor::VarBuilder::from_files(
-                    &[ae_model_file.clone()],
+                    std::slice::from_ref(&ae_model_file),
                     crate::tensor::DType::F32,
-                    &n_vae_device,
+                    n_vae_device,
                 )?
             };
             let ae_cfg = crate::inference::model::flux::vae::Config::schnell();

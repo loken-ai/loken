@@ -275,7 +275,6 @@ fn usage_object(usage: Option<&Value>) -> Value {
 }
 
 /// The response object, with `status` and `output` as far as they are known.
-#[allow(clippy::too_many_arguments)]
 fn response_object(
     id: &str,
     created: i64,

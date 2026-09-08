@@ -134,9 +134,7 @@ fn process(step: usize, st: &mut State, sampled: i64) -> i64 {
     if token != NEW_WORD && token != PAD {
         token = PAD;
     }
-    if !st.queued.is_empty() {
-        token = PAD;
-    } else if st.forced_padding > 0 {
+    if !st.queued.is_empty() || st.forced_padding > 0 {
         token = PAD;
     } else if st.remaining_padding <= 0 {
         token = NEW_WORD;
@@ -233,7 +231,6 @@ impl Sampler {
 
 /// Full generation: `entries` (from the text/tokenizer front-end), a `voice` tensor
 /// `[512, T]`, and a `cfg_coef` conditioning value -> 24 kHz mono waveform.
-#[allow(clippy::too_many_arguments)]
 pub fn generate(
     lm: &KyutaiLm,
     depformer: &KyutaiDepformer,
@@ -254,7 +251,7 @@ pub fn generate(
     // cyclic cache [N_CB, CT]
     let mut cache = vec![vec![UNGENERATED; CT]; N_CB];
     let initial: Vec<i64> = std::iter::once(TEXT_INITIAL)
-        .chain(std::iter::repeat(AUDIO_INITIAL).take(DEP_Q))
+        .chain(std::iter::repeat_n(AUDIO_INITIAL, DEP_Q))
         .collect();
 
     let mut frames: Vec<[i64; N_CB]> = Vec::new();

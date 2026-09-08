@@ -237,13 +237,13 @@ pub fn swiglu_oai(
             let gi = g[idx] + gb.as_ref().map_or(0.0, |b| b[i]);
             let ui = u[idx] + ub.as_ref().map_or(0.0, |b| b[i]);
             // x = min(gi, l): affine(-1,l) -> relu -> affine(-1,l).
-            let t = (-1.0f32 * gi + l).max(0.0);
-            let x = -1.0f32 * t + l;
+            let t = (-gi + l).max(0.0);
+            let x = -t + l;
             // gg = min(max(ui, -l), l): the four affine/relu steps of the chain.
             let s = (1.0f32 * ui + l).max(0.0);
             let s = 1.0f32 * s + (-l);
-            let s = (-1.0f32 * s + l).max(0.0);
-            let gg = -1.0f32 * s + l;
+            let s = (-s + l).max(0.0);
+            let gg = -s + l;
             // act = x * sigmoid(alpha.x); sigmoid = 1/(exp(-.)+1).
             let xa = a * x;
             let sig = 1.0f32 / ((-xa).exp() + 1.0);

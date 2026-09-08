@@ -252,7 +252,7 @@ impl Q8KvCache {
         // slot). Round up to STEP-aligned bucket so the stride only changes
         // every 256 tokens, not every token.
         let used = (self.current_seq_len + 1).min(self.current_capacity);
-        let rounded = ((used + STEP - 1) / STEP) * STEP;
+        let rounded = used.div_ceil(STEP) * STEP;
         let cap_aligned = (self.current_capacity + Q8_0_BLOCK_SIZE - 1) & !(Q8_0_BLOCK_SIZE - 1);
         rounded.min(cap_aligned).min(CAP).max(STEP)
     }
@@ -1237,7 +1237,6 @@ impl Q8KvCache {
     ///
     /// Restricted to n_q_per_kv = 1 (phi2 / no GQA). HD ∈ {64, 128}.
     /// Returns out `[1, n_q_heads, 1, head_dim]` F32.
-    #[allow(clippy::too_many_arguments)]
     pub fn attn_fused_decode_graph(&self, q: &Tensor, scale: f32) -> Result<Tensor> {
         use crate::inference::quantized_cuda::attn_fused_q8_decode_dev_pos;
 
@@ -1326,7 +1325,7 @@ impl Q8KvCache {
             ));
         }
         let n_q_heads = dims[1];
-        if self.n_kv_heads == 0 || n_q_heads % self.n_kv_heads != 0 {
+        if self.n_kv_heads == 0 || !n_q_heads.is_multiple_of(self.n_kv_heads) {
             return Err(anyhow!(
                 "Q8KvCache::attn_flash_splitk_decode_graph: n_q_heads {} not a multiple of n_kv_heads {}",
                 n_q_heads, self.n_kv_heads
@@ -1412,7 +1411,7 @@ impl Q8KvCache {
             ));
         }
         let n_q_heads = dims[1];
-        if self.n_kv_heads == 0 || n_q_heads % self.n_kv_heads != 0 {
+        if self.n_kv_heads == 0 || !n_q_heads.is_multiple_of(self.n_kv_heads) {
             return Err(anyhow!(
                 "Q8KvCache::attn_flash_tc_decode_graph: n_q_heads {} not a multiple of n_kv_heads {}",
                 n_q_heads, self.n_kv_heads

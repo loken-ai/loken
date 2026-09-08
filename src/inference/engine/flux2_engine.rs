@@ -271,7 +271,6 @@ pub fn load(
 /// (`is_distilled: true`), its pipeline never builds an unconditional branch, and the DiT takes
 /// no guidance embedding (`guidance_embeds: false`). Running a CFG pair here would double the
 /// cost to steer against a branch the weights already fold in.
-#[allow(clippy::too_many_arguments)]
 pub fn generate(
     state: &Flux2ModelState,
     prompt: &str,

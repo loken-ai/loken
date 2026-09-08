@@ -72,7 +72,7 @@ pub(super) fn piper_voice_name(model_name: &str) -> Option<String> {
         .rsplit('/')
         .next()
         .unwrap_or(model_name)
-        .trim_start_matches(|c| c == '/');
+        .trim_start_matches('/');
     let voice = if let Some(stripped) = voice
         .strip_prefix("piper-")
         .or_else(|| voice.strip_prefix("Piper-"))

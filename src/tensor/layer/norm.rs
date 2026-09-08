@@ -61,7 +61,7 @@ impl RmsNorm {
     /// saves nothing and costs precision on every element that passes through.
     pub fn from_qtensor(weight: crate::tensor::quantized::QTensor, eps: f64) -> Result<Self> {
         let dev = weight.device();
-        Ok(Self::new(weight.dequantize(&dev)?, eps as f32))
+        Ok(Self::new(weight.dequantize(dev)?, eps as f32))
     }
     pub fn new(weight: Tensor, eps: f32) -> Self {
         Self { weight, eps }

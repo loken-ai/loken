@@ -17,7 +17,6 @@ use crate::tensor::{Device, Result, Tensor};
 
 /// The transformer interface [`denoise`] drives: one velocity prediction per step.
 pub trait WithForward {
-    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         img: &Tensor,
@@ -192,7 +191,6 @@ fn cancel_err() -> crate::tensor::Error {
     crate::tensor::Error::msg("flux: generation cancelled")
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn denoise<M: WithForward>(
     model: &mut M,
     img: &Tensor,
@@ -236,7 +234,6 @@ pub fn pack_context(latent: &Tensor) -> Result<(Tensor, Tensor)> {
 /// tokens are concatenated as a fixed condition each step - the transformer attends over both,
 /// but only the noise portion integrates the predicted velocity. Returns the denoised noise
 /// latent, unpacked and VAE-decoded downstream exactly like text->image.
-#[allow(clippy::too_many_arguments)]
 pub fn denoise_kontext<M: WithForward>(
     model: &mut M,
     noise: &Tensor,
@@ -514,7 +511,6 @@ impl Region {
 /// decides what to do with the noise grid alone, and here the forward sees noise and a fixed
 /// reference concatenated. Passing them through would apply a mask, or a reuse threshold, to
 /// a tensor that is half reference image.
-#[allow(clippy::too_many_arguments)]
 pub fn denoise_kontext_native<M: WithForward>(
     model: &M,
     state: &NativeState,
@@ -596,7 +592,6 @@ pub fn region_weights(
 /// [`denoise`] from a state cast once, with no per-step dtype cast in the loop.
 ///
 /// `on_step(i)` fires after step `i`, zero-based, for progress reporting.
-#[allow(clippy::too_many_arguments)]
 pub fn denoise_native<M: WithForward>(
     model: &M,
     state: &NativeState,

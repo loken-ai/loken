@@ -52,7 +52,6 @@ impl OclWeight {
 /// F32 bias buffer on OpenCL device
 struct F32Buf {
     buf: Buffer<u8>, // Raw F32 bytes on GPU
-    dim: usize,
 }
 
 /// A linear layer: quantized or F32 weight + optional bias
@@ -70,7 +69,6 @@ struct OclLayerNorm {
 /// RmsNorm weights (for QK norm)
 struct OclRmsNorm {
     scale: F32Buf,
-    dim: usize,
 }
 
 /// QK normalization (query_norm + key_norm)
@@ -300,10 +298,7 @@ fn upload_f32(data: &[f32], pipelines: &OpenCLPipelines) -> Result<F32Buf> {
         pipelines
             .queue
             .enqueue_write_buffer(&mut buf, CL_BLOCKING, 0, bytes, &[])?;
-        Ok(F32Buf {
-            buf,
-            dim: data.len(),
-        })
+        Ok(F32Buf { buf })
     }
 }
 
@@ -406,7 +401,7 @@ fn load_rms_norm(
     content: &crate::tensor::quantized::gguf_file::Content,
     reader: &mut std::io::Cursor<&[u8]>,
     name: &str,
-    dim: usize,
+    _dim: usize,
     pipelines: &OpenCLPipelines,
 ) -> Result<OclRmsNorm> {
     let qt = content.tensor(reader, name, &crate::tensor::Device::Cpu)?;
@@ -415,7 +410,7 @@ fn load_rms_norm(
         .flatten_all()?
         .to_vec1::<f32>()?;
     let scale = upload_f32(&f32_data, pipelines)?;
-    Ok(OclRmsNorm { scale, dim })
+    Ok(OclRmsNorm { scale })
 }
 
 // ==================== Block Loading ====================

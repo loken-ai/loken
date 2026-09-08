@@ -44,7 +44,7 @@ pub fn slice_qtensor_cols(
 ) -> Result<Arc<QTensor>> {
     let dims = qt.shape().dims().to_vec();
     let (out, inn) = (dims[0], dims[1]);
-    debug_assert!(c0 % QK_K == 0 && c1 % QK_K == 0 && c1 <= inn && c0 < c1);
+    debug_assert!(c0.is_multiple_of(QK_K) && c1.is_multiple_of(QK_K) && c1 <= inn && c0 < c1);
     let bytes = qt.data()?;
     let row_bytes = bytes.len() / out;
     let block_bytes = row_bytes / (inn / QK_K);
@@ -439,10 +439,8 @@ fn wrap_cuda_f32(
     dev: &Device,
     shape: crate::tensor::Shape,
 ) -> Result<Tensor> {
-    Ok(
-        crate::tensor::cuda_ext::tensor_from_f32_slice(slice, shape, dev)
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
-    )
+    crate::tensor::cuda_ext::tensor_from_f32_slice(slice, shape, dev)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[cfg(test)]

@@ -208,7 +208,7 @@ pub fn prewarm_expert_repack(weights: &Arc<QTensor>) -> Result<()> {
         let dims = weights.shape().dims();
         // [experts, rows, k] - the shape every repack call site reads, and the two
         // divisibilities the repacked layout needs.
-        if dims.len() != 3 || dims[1] % 8 != 0 || dims[2] % 256 != 0 {
+        if dims.len() != 3 || !dims[1].is_multiple_of(8) || !dims[2].is_multiple_of(256) {
             return Ok(());
         }
         let (e_count, rows, bpr) = (dims[0], dims[1], dims[2] / 256);
@@ -448,8 +448,10 @@ fn fused_gate_up_silu_t<T: crate::tensor::quant_cpu::BlockFormat>(
     n: usize,
     k: usize,
 ) -> Result<Option<Tensor>> {
-    if k % T::BLOCK_LEN != 0
-        || k % <T::ActivationBlock as crate::tensor::quant_cpu::BlockFormat>::BLOCK_LEN != 0
+    if !k.is_multiple_of(T::BLOCK_LEN)
+        || !k.is_multiple_of(
+            <T::ActivationBlock as crate::tensor::quant_cpu::BlockFormat>::BLOCK_LEN,
+        )
     {
         return Ok(None);
     }
@@ -520,7 +522,7 @@ fn fused_gate_up_silu_q4k_tiled(
 ) -> Result<Option<Tensor>> {
     use crate::tensor::quant_cpu::BlockFormat;
     use crate::tensor::quant_cpu::{gemv_pool, repack_q4k, BlockQ8K};
-    if n % 8 != 0 || k % 256 != 0 {
+    if !n.is_multiple_of(8) || !k.is_multiple_of(256) {
         return Ok(None);
     }
     let m = sti.len();
@@ -605,7 +607,7 @@ fn fused_gate_up_silu_q4k_gemv_v2(
 ) -> Result<Option<Tensor>> {
     use crate::tensor::quant_cpu::BlockFormat;
     use crate::tensor::quant_cpu::{gemv_pool, repack_q4k, BlockQ8K};
-    if n % 8 != 0 || k % 256 != 0 {
+    if !n.is_multiple_of(8) || !k.is_multiple_of(256) {
         return Ok(None);
     }
     let m = sti.len();
@@ -678,7 +680,7 @@ fn fused_gate_up_silu_fused_q4k_gemv_v2(
 ) -> Result<Option<Tensor>> {
     use crate::tensor::quant_cpu::BlockFormat;
     use crate::tensor::quant_cpu::{gemv_pool, repack_q4k, BlockQ8K};
-    if n % 8 != 0 || k % 256 != 0 {
+    if !n.is_multiple_of(8) || !k.is_multiple_of(256) {
         return Ok(None);
     }
     let m = sti.len();
@@ -751,7 +753,7 @@ fn fused_gate_up_silu_fused_cpu(
     use crate::tensor::quantized::GgmlDType;
     let dt = gate_up_weights.dtype();
     let dims = gate_up_weights.shape().dims();
-    if dims.len() != 3 || dims[1] % 2 != 0 {
+    if dims.len() != 3 || !dims[1].is_multiple_of(2) {
         return Ok(None);
     }
     let (n, k) = (dims[1] / 2, dims[2]);
@@ -792,7 +794,9 @@ fn fused_gate_up_silu_fused_t<T: crate::tensor::quant_cpu::BlockFormat>(
     k: usize,
 ) -> Result<Option<Tensor>> {
     use crate::tensor::quant_cpu::BlockFormat;
-    if k % T::BLOCK_LEN != 0 || k % <T::ActivationBlock as BlockFormat>::BLOCK_LEN != 0 {
+    if !k.is_multiple_of(T::BLOCK_LEN)
+        || !k.is_multiple_of(<T::ActivationBlock as BlockFormat>::BLOCK_LEN)
+    {
         return Ok(None);
     }
     let m = sti.len();
@@ -871,7 +875,6 @@ pub fn moe_gemm_gguf_gate_up_silu_mul_fused(
 }
 
 /// Biased clamped-SwiGLU-OAI variant of the fused gate+up path (gpt-oss).
-#[allow(clippy::too_many_arguments)]
 fn fused_gate_up_oai_t<T: crate::tensor::quant_cpu::BlockFormat>(
     input: &Tensor,
     gate_weights: &Arc<QTensor>,
@@ -887,7 +890,9 @@ fn fused_gate_up_oai_t<T: crate::tensor::quant_cpu::BlockFormat>(
     limit: f32,
 ) -> Result<Option<Tensor>> {
     use crate::tensor::quant_cpu::BlockFormat;
-    if k % T::BLOCK_LEN != 0 || k % <T::ActivationBlock as BlockFormat>::BLOCK_LEN != 0 {
+    if !k.is_multiple_of(T::BLOCK_LEN)
+        || !k.is_multiple_of(<T::ActivationBlock as BlockFormat>::BLOCK_LEN)
+    {
         return Ok(None);
     }
     let m = sti.len();
@@ -1085,7 +1090,6 @@ fn fused_up_relu2_cpu(
               Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn fused_up_relu2_t<T: crate::tensor::quant_cpu::BlockFormat>(
     input: &Tensor,
     weights: &Arc<QTensor>,
@@ -1095,8 +1099,10 @@ fn fused_up_relu2_t<T: crate::tensor::quant_cpu::BlockFormat>(
     n: usize,
     k: usize,
 ) -> Result<Option<Tensor>> {
-    if k % T::BLOCK_LEN != 0
-        || k % <T::ActivationBlock as crate::tensor::quant_cpu::BlockFormat>::BLOCK_LEN != 0
+    if !k.is_multiple_of(T::BLOCK_LEN)
+        || !k.is_multiple_of(
+            <T::ActivationBlock as crate::tensor::quant_cpu::BlockFormat>::BLOCK_LEN,
+        )
     {
         return Ok(None);
     }
@@ -1209,7 +1215,6 @@ pub fn moe_gemm_gguf(
 /// output is quantized ONCE, then one rayon region over (token, hidden_row)
 /// outputs - each job sums tw[j].dot(down[e_j][row], h_q[j]) over the
 /// token's slots, on top of the residual. `Ok(None)` -> caller falls back.
-#[allow(clippy::too_many_arguments)]
 fn fused_down_reduce_cpu(
     input: &Tensor,
     weights: &Arc<QTensor>,
@@ -1313,7 +1318,6 @@ fn fused_down_reduce_cpu(
               Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn fused_down_reduce_t<T: crate::tensor::quant_cpu::BlockFormat>(
     input: &Tensor,
     weights: &Arc<QTensor>,
@@ -1327,7 +1331,9 @@ fn fused_down_reduce_t<T: crate::tensor::quant_cpu::BlockFormat>(
     k: usize,
 ) -> Result<Option<Tensor>> {
     use crate::tensor::quant_cpu::BlockFormat;
-    if k % T::BLOCK_LEN != 0 || k % <T::ActivationBlock as BlockFormat>::BLOCK_LEN != 0 {
+    if !k.is_multiple_of(T::BLOCK_LEN)
+        || !k.is_multiple_of(<T::ActivationBlock as BlockFormat>::BLOCK_LEN)
+    {
         return Ok(None);
     }
     let m = sti.len();
@@ -1387,7 +1393,6 @@ fn fused_down_reduce_t<T: crate::tensor::quant_cpu::BlockFormat>(
 /// in ascending-slot (== per-column `slots_of`) order - bit-identical to a separate
 /// reduce, with the `dscaled` (m*hidden f32) round-trip removed. `hq` quantized once.
 #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[allow(clippy::too_many_arguments)]
 fn fused_down_reduce_q6k_tiled(
     input: &Tensor,
     weights: &Arc<QTensor>,
@@ -1402,7 +1407,7 @@ fn fused_down_reduce_q6k_tiled(
 ) -> Result<Option<Tensor>> {
     use crate::tensor::quant_cpu::BlockFormat;
     use crate::tensor::quant_cpu::{gemv_pool, repack_q6k, BlockQ8K};
-    if hidden % 8 != 0 || k % 256 != 0 {
+    if !hidden.is_multiple_of(8) || !k.is_multiple_of(256) {
         return Ok(None);
     }
     let bpr = k / 256;
@@ -1479,7 +1484,6 @@ fn fused_down_reduce_q6k_tiled(
 /// `fused_down_reduce_q6k_tiled` (some lfm2moe layers ship a Q4_K `ffn_down`
 /// stack rather than Q6_K), using the Q4_K repack + tiled GEMM.
 #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[allow(clippy::too_many_arguments)]
 fn fused_down_reduce_q4k_tiled(
     input: &Tensor,
     weights: &Arc<QTensor>,
@@ -1494,7 +1498,7 @@ fn fused_down_reduce_q4k_tiled(
 ) -> Result<Option<Tensor>> {
     use crate::tensor::quant_cpu::BlockFormat;
     use crate::tensor::quant_cpu::{gemv_pool, repack_q4k, BlockQ8K};
-    if hidden % 8 != 0 || k % 256 != 0 {
+    if !hidden.is_multiple_of(8) || !k.is_multiple_of(256) {
         return Ok(None);
     }
     let bpr = k / 256;
@@ -1569,7 +1573,6 @@ fn fused_down_reduce_q4k_tiled(
 /// of output columns and accumulates every expert's tw*dot into them serially -
 /// no cross-expert write race, ONE pool.run. Bit-identical to the per-column path.
 #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[allow(clippy::too_many_arguments)]
 /// Decode down-projection + topk reduce for Q6K expert stacks: the ffn_down
 /// of several MoE arches ships Q6K, which previously fell to the GENERIC
 /// per-output-element path (closure dispatch per element, on rayon - fighting
@@ -1577,7 +1580,6 @@ fn fused_down_reduce_q4k_tiled(
 /// 8-column groups on the gemv pool, with the oracle-validated
 /// `repack_q6k::gemm_group_avx2` kernel run as a single-row tile.
 #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[allow(clippy::too_many_arguments)]
 fn fused_down_reduce_q6k_gemv(
     input: &Tensor,
     weights: &Arc<QTensor>,
@@ -1592,7 +1594,7 @@ fn fused_down_reduce_q6k_gemv(
 ) -> Result<Option<Tensor>> {
     use crate::tensor::quant_cpu::BlockFormat;
     use crate::tensor::quant_cpu::{gemv_pool, repack_q6k, BlockQ8K};
-    if hidden % 8 != 0 || k % 256 != 0 {
+    if !hidden.is_multiple_of(8) || !k.is_multiple_of(256) {
         return Ok(None);
     }
     let bpr = k / 256;
@@ -1668,7 +1670,7 @@ fn fused_down_reduce_q4k_gemv_v2(
 ) -> Result<Option<Tensor>> {
     use crate::tensor::quant_cpu::BlockFormat;
     use crate::tensor::quant_cpu::{gemv_pool, repack_q4k, BlockQ8K};
-    if hidden % 8 != 0 || k % 256 != 0 {
+    if !hidden.is_multiple_of(8) || !k.is_multiple_of(256) {
         return Ok(None);
     }
     let bpr = k / 256;
@@ -1839,7 +1841,6 @@ pub fn add_rms_norm(a: &Tensor, b: &Tensor, gamma: &Tensor, eps: f32) -> Result<
     Ok((xs, normed))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn attn_post_qkv_decode(
     _qkv: &Tensor,
     _q_norm_w: &Tensor,
@@ -1860,7 +1861,6 @@ pub fn attn_post_qkv_decode(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn attn_post_qkv_decode_qf32(
     _qkv: &Tensor,
     _q_norm_w: &Tensor,

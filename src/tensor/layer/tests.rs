@@ -1,6 +1,7 @@
 //! The nn layer's tests, split out with the items they exercise.
 
 use super::*;
+use crate::tensor::safetensors_io::SafeTensorsLoader;
 
 mod tests {
     use super::*;
@@ -92,7 +93,7 @@ mod tests {
     #[test]
     fn varbuilder_walks_real_file() {
         // reuse any HF safetensors; just verify prefix walking + shape check
-        let Some(path) = super::super::safetensors_io::tests_helper_find() else {
+        let Some(path) = crate::tensor::safetensors_io::tests_helper_find() else {
             return;
         };
         let vb = unsafe { VarBuilder::from_files(&[&path], DType::F32, &Device::Cpu) }.unwrap();

@@ -239,8 +239,6 @@ pub struct KindMetric {
     pub format: String,
 }
 
-static DECLARED_KINDS: OnceLock<RwLock<Vec<KindDescriptor>>> = OnceLock::new();
-
 macro_rules! registry {
     ($(#[$doc:meta])* $slot:ident, $reg:ident, $get:ident, $t:ident) => {
         static $slot: OnceLock<RwLock<Option<Arc<dyn $t>>>> = OnceLock::new();

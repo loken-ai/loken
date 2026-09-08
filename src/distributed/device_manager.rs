@@ -238,45 +238,6 @@ impl ComputeDevice {
         }
     }
 
-    /// Check if SYCL runtime is available for Intel Arc.
-    /// Detects a oneAPI installation, for the SYCL path.
-    /// The crate-level `#![allow(dead_code)]` at the top of this file
-    /// already suppresses the unused-fn warning, no per-fn attr needed.)
-    fn check_sycl_runtime() -> bool {
-        // Check for oneAPI environment variables or libraries
-        #[cfg(target_os = "windows")]
-        {
-            // Check for SYCL environment variable or DLL
-            let has_env = std::env::var("ONEAPI_DEVICE_SELECTOR").is_ok()
-                || std::env::var("GGML_SYCL_DEVICE").is_ok()
-                || std::env::var("SYCL_DEVICE_FILTER").is_ok();
-
-            // Check for sycl.dll in system
-            let has_sycl_dll = std::fs::metadata("C:\\Windows\\System32\\sycl.dll").is_ok()
-                || std::fs::metadata("C:\\Windows\\System32\\sycl6.dll").is_ok();
-
-            // Check for oneAPI installation
-            let has_oneapi = std::fs::metadata("C:\\Program Files (x86)\\Intel\\oneAPI").is_ok()
-                || std::env::var("ONEAPI_ROOT").is_ok();
-
-            if has_env || has_sycl_dll || has_oneapi {
-                info!(
-                    "SYCL runtime detected for Intel Arc (env={}, dll={}, oneapi={})",
-                    has_env, has_sycl_dll, has_oneapi
-                );
-                true
-            } else {
-                false
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            std::env::var("ONEAPI_DEVICE_SELECTOR").is_ok()
-                || std::env::var("GGML_SYCL_DEVICE").is_ok()
-                || std::env::var("SYCL_DEVICE_FILTER").is_ok()
-        }
-    }
-
     /// Calculate device priority for layer assignment
     fn calculate_priority(device_type: &DeviceType) -> u8 {
         match device_type {
@@ -336,7 +297,6 @@ impl ComputeDevice {
 /// Device manager for heterogeneous compute
 pub struct DeviceManager {
     devices: Vec<ComputeDevice>,
-    local_rank: usize,
 }
 
 impl DeviceManager {
@@ -344,7 +304,6 @@ impl DeviceManager {
     pub fn new() -> Self {
         Self {
             devices: Vec::new(),
-            local_rank: 0,
         }
     }
 
@@ -888,7 +847,7 @@ impl HardwareTopology {
 
         // Local devices - sorted by priority
         let mut local_sorted = self.local_devices.clone();
-        local_sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
+        local_sorted.sort_by_key(|d| std::cmp::Reverse(d.priority));
 
         // Count available/unavailable
         let mut available_count = 0;

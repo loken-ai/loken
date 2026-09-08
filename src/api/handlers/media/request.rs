@@ -81,6 +81,7 @@ pub(super) struct OpenAIImageRequest {
     /// compatibility but not yet used; could feed into per-user
     /// rate-limit / quota plumbing later.
     #[serde(default)]
+    #[allow(dead_code)]
     pub(super) user: Option<String>,
     /// When true, switch to Server-Sent Events (`text/event-stream`)
     /// and emit per-step progress events. Final event carries the

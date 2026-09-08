@@ -11,10 +11,9 @@
 use crate::inference::model::vae_blocks::{
     AttnNaming, Decoder, Encoder, Naming, ProjectionKind, Shape,
 };
-use crate::tensor::layer::{conv2d, group_norm, Conv2d, Conv2dConfig, GroupNorm};
 use crate::tensor::DType;
 use crate::tensor::VarBuilder;
-use crate::tensor::{self, Device, Result, Tensor};
+use crate::tensor::{Device, Result, Tensor};
 
 /// This family's autoencoder: the shape the shared encoder and decoder are built from, plus
 /// the affine that takes a latent into the range the transformer was trained on.
@@ -216,6 +215,7 @@ mod tests {
     //! this machine; nothing about them is automatic. Run one by name with
     //!   cargo test --release -p loken --lib NAME -- --ignored --nocapture
     use super::*;
+    use crate::tensor;
 
     /// The decode must produce a VARYING image at every resolution.
     ///
@@ -301,6 +301,7 @@ mod decode_reference {
     //! anyone would question.
     use super::tests::glob_one;
     use super::*;
+    use crate::tensor;
 
     #[test]
     #[ignore = "needs the FLUX schnell ae.safetensors under the configured models dir"]

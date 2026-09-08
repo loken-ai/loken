@@ -299,7 +299,7 @@ mod tests {
         };
 
         // Every tensor gets its own seed, so a projection read into the wrong slot shows.
-        let mut attention_at = |map: &mut HashMap<String, Tensor>, p: &str, base: usize| {
+        let attention_at = |map: &mut HashMap<String, Tensor>, p: &str, base: usize| {
             for (i, name) in ["q_proj", "v_proj", "out_proj"].iter().enumerate() {
                 map.insert(
                     format!("{p}.{name}.weight"),

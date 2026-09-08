@@ -312,7 +312,7 @@ impl MimiDecoder {
         x = causal_conv1d(&x, &self.conv_in.w, self.conv_in.b.as_ref(), 1, 1, 1)?;
         for (convtr, res) in &self.up {
             x = elu(&x)?;
-            let stride = (convtr.w.shape().dims3()?.2 + 1) / 2; // k = 2*stride
+            let stride = convtr.w.shape().dims3()?.2.div_ceil(2); // k = 2*stride
             x = causal_convtr1d(&x, &convtr.w, convtr.b.as_ref(), stride, 1)?;
             x = res.forward(&x)?;
         }
@@ -400,7 +400,7 @@ impl MimiEncoder {
             let k = w.shape().dims3()?.2;
             let pad = k - 16; // (k-1)+1-stride, stride=16
             let first = x.narrow(2, 0, 1)?; // [1,C,1]
-            let reps: Vec<&Tensor> = std::iter::repeat(&first).take(pad).collect();
+            let reps: Vec<&Tensor> = std::iter::repeat_n(&first, pad).collect();
             let mut parts = reps;
             parts.push(x);
             let xp = Tensor::cat(&parts, 2)?;
@@ -1109,7 +1109,7 @@ mod tests {
         let wav = m
             .synthesize_text(&sp, "Hello, this is a test.", Some(&voice), None, 7)
             .unwrap();
-        assert!(!wav.is_empty() && wav.len() % 1920 == 0);
+        assert!(!wav.is_empty() && wav.len().is_multiple_of(1920));
         assert!(wav.iter().all(|v| v.is_finite()));
         let peak = wav.iter().fold(0f32, |a, &v| a.max(v.abs()));
         // Write a WAV next to the target dir for manual listening / inspection.

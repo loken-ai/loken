@@ -106,7 +106,7 @@ pub struct MusicConfig {
     #[serde(default = "d_gi")]
     guidance_interval: f32,
     /// >0 linearly decays the guidance scale `dit_cfg`->`min_guidance_scale` across the
-    /// window. 0 (default) = constant `dit_cfg` inside the window.
+    /// > window. 0 (default) = constant `dit_cfg` inside the window.
     #[serde(default)]
     guidance_interval_decay: f32,
     /// Floor the guidance decay reaches at the end of the window (reference 3.0).

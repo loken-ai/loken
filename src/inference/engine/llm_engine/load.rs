@@ -62,7 +62,6 @@ pub(super) fn load_generic_on_cpu(
 /// `calculate_with_kv` place fewer layers on the GPUs and spill the
 /// remainder to CPU, yielding a genuine GPU0(+GPU1)+CPU hybrid that fits.
 /// Only the all-CPU plan is the true last resort.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn load_generic_hybrid_or_cpu(
     mmap_bytes: &[u8],
     // Threaded alongside the bytes for the same reason as in `load_generic_on_cpu`: a
@@ -465,7 +464,7 @@ pub(super) fn try_spawn_continuous(
         .as_cuda_device()
         .ok()
         .and_then(|cd| cd.cuda_stream().context().mem_get_info().ok())
-        .map(|(f, _)| f as usize)
+        .map(|(f, _)| f)
         .unwrap_or(0);
     // Reserve for activations + cuBLAS workspace (~1.5 GB) AND the shared CUDA-
     // graph capture arena (~2 GB) so the KV pool doesn't starve the arena (an
@@ -578,7 +577,7 @@ pub(super) struct MoondreamGraphState {
     pub(super) graph: crate::tensor::cuda_ext::CudaGraph,
 }
 
-pub(super) struct LoadedModelState {
+pub(crate) struct LoadedModelState {
     pub(super) name: String,
     pub(super) num_layers: usize,
     pub(super) hidden_size: usize,

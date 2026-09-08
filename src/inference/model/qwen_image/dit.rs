@@ -696,17 +696,14 @@ impl Model {
             std::collections::HashMap::new();
         for b in &self.blocks {
             let loc = b.device.location();
-            if !cache.contains_key(&loc) {
-                cache.insert(
-                    loc,
-                    (
-                        temb_in.to_device(&b.device)?,
-                        ic0.to_device(&b.device)?,
-                        is0.to_device(&b.device)?,
-                        tc0.to_device(&b.device)?,
-                        ts0.to_device(&b.device)?,
-                    ),
-                );
+            if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(loc) {
+                e.insert((
+                    temb_in.to_device(&b.device)?,
+                    ic0.to_device(&b.device)?,
+                    is0.to_device(&b.device)?,
+                    tc0.to_device(&b.device)?,
+                    ts0.to_device(&b.device)?,
+                ));
             }
         }
         // Walk the blocks; move BOTH streams to a block's device only when it differs (single-device
@@ -751,7 +748,6 @@ use crate::tensor::quantized::QVarBuilder;
 impl Block {
     /// Load a block from the GGUF: quantized linears (QKernelMatMul, kept quantized on-device) +
     /// dequantized biases + norm gammas. Reuses the exact names validated by `load_f32`.
-    #[allow(clippy::too_many_arguments)]
     pub fn load_gguf(
         vb: &QVarBuilder,
         device: &crate::tensor::Device,

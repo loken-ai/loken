@@ -215,7 +215,6 @@ impl GenericTransformerLayer {
             alt_stream,
         )
         .map_err(|e| crate::tensor::Error::msg(format!("alt-full quantize: {e}")))?;
-        drop(act_view);
         drop(act_sl);
 
         let ffn_down_arc = self
@@ -483,7 +482,7 @@ impl GenericTransformerLayer {
                                 use crate::tensor::quantized::QStorage;
                                 let g_stor = gqt.storage();
                                 let u_stor = uqt.storage();
-                                match (&*g_stor, &*u_stor) {
+                                match (g_stor, u_stor) {
                                     (QStorage::Cuda(gcuda), QStorage::Cuda(ucuda)) => {
                                         let x_storage_layout = x.storage_and_layout();
                                         let (x_storage, x_layout) =
@@ -540,7 +539,7 @@ impl GenericTransformerLayer {
                                 use crate::tensor::quantized::QStorage;
                                 let g_stor = gqt.storage();
                                 let u_stor = uqt.storage();
-                                match (&*g_stor, &*u_stor) {
+                                match (g_stor, u_stor) {
                                     (QStorage::Cuda(gcuda), QStorage::Cuda(ucuda)) => {
                                         // try_fused_gelu accepts F32 + BF16 natively
                                         // BUT BF16 quantize is measurably slower than

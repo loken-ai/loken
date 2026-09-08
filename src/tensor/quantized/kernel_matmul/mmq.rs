@@ -84,11 +84,11 @@ impl QKernelMatMul {
             stream.alloc::<f32>(self.n * rows)
         })?;
 
-        let x_ptr = x_slice.device_ptr(&stream).0 as *const std::ffi::c_void;
-        let ws_ptr = ws.device_ptr(&stream).0 as *mut std::ffi::c_void;
-        let fixup_ptr = fixup.device_ptr(&stream).0 as *mut std::ffi::c_void;
-        let w_ptr = blob.device_ptr(&stream).0 as *const std::ffi::c_void;
-        let out_ptr = out.device_ptr(&stream).0 as *mut std::ffi::c_void;
+        let x_ptr = x_slice.device_ptr(stream).0 as *const std::ffi::c_void;
+        let ws_ptr = ws.device_ptr(stream).0 as *mut std::ffi::c_void;
+        let fixup_ptr = fixup.device_ptr(stream).0 as *mut std::ffi::c_void;
+        let w_ptr = blob.device_ptr(stream).0 as *const std::ffi::c_void;
+        let out_ptr = out.device_ptr(stream).0 as *mut std::ffi::c_void;
 
         unsafe {
             let quantize = mmq_quantize_launcher(self.dtype)?;
@@ -132,7 +132,7 @@ impl QKernelMatMul {
             Some(e) => e,
             None => dev.new_event()?,
         };
-        ev.record(&stream)
+        ev.record(stream)
             .map_err(|e| Error(format!("mmq workspace mark: {e}")))?;
         slot.last_use = Some(ev);
 

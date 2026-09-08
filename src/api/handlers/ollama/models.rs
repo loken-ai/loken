@@ -167,7 +167,6 @@ pub(super) fn inject_local_boogu(
             crate::inference::model::ezaudio::vae::ezaudio_pt("ckpts/s3/ezaudio_s3_l.pt"),
         );
         for v in ["turbo", "sft", "base", "xl-turbo", "xl-sft", "xl-base"] {
-            let gguf = format!("acestep-v15-{}-Q8_0.gguf", v.replace("xl-", "xl-"));
             let gguf = match v {
                 "turbo" => "acestep-v15-turbo-Q8_0.gguf".to_string(),
                 "sft" => "acestep-v15-sft-Q8_0.gguf".to_string(),
@@ -175,7 +174,7 @@ pub(super) fn inject_local_boogu(
                 "xl-turbo" => "acestep-v15-xl-turbo-Q8_0.gguf".to_string(),
                 "xl-sft" => "acestep-v15-xl-sft-Q8_0.gguf".to_string(),
                 "xl-base" => "acestep-v15-xl-base-Q8_0.gguf".to_string(),
-                _ => gguf,
+                _ => format!("acestep-v15-{v}-Q8_0.gguf"),
             };
             push(
                 &format!("ace-step-{v}"),
@@ -622,16 +621,7 @@ pub(crate) fn infer_model_family(model_id: &str) -> &'static str {
     // before the generic "qwen" arm so it resolves to the image family (and so
     // /api/show + /api/tags don't advertise chat/embedding on it).
     // BEFORE any `flux` test: "flux2-klein" contains "flux".
-    else if {
-        #[cfg(feature = "image")]
-        {
-            crate::inference::engine::flux2_engine::is_flux2_model(&lower)
-        }
-        #[cfg(not(feature = "image"))]
-        {
-            false
-        }
-    } {
+    else if crate::inference::engine::flux2_engine::is_flux2_model(&lower) {
         "flux2"
     } else if lower.contains("qwen-image")
         || lower.contains("qwen_image")

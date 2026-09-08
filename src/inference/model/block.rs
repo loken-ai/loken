@@ -33,7 +33,6 @@ impl CrossAttentionBlock {
     ///
     /// `cross_attn` is `None` in an encoder, where there is nothing else to attend to - and its
     /// normalisation is then not read either, because the checkpoint does not carry one.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         self_attn: MultiHeadAttention,
         cross_attn: Option<MultiHeadAttention>,

@@ -158,7 +158,6 @@ pub(crate) fn incremental_chunk_text(tokenizer: &Tokenizer, generated_token_ids:
 
 /// Sample one logits row: fused GPU penalty+argmax when the row lives on
 /// CUDA, otherwise the host repeat-penalty + `LogitsProcessor` path.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn sample_row_sync(
     row: &Tensor,
     recent_tokens: &[u32],
@@ -219,7 +218,6 @@ pub(crate) struct PldCommitOutcome {
 /// max_tokens` - `committed_base` is the count of already-emitted tokens NOT
 /// included in `committed_out` (0 for the non-stream path, `token_count` for
 /// the stream path).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn pld_verify_commit(
     logits: &Tensor,
     draft: &[u32],

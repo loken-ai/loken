@@ -232,7 +232,6 @@ impl KvDiskStore {
 
     /// Writes the full blocks of a sequence that are not on disk yet, then its
     /// manifest; `rows(from, to)` supplies every layer's rows for one block.
-    #[allow(clippy::too_many_arguments)]
     pub fn persist(
         &self,
         model: &str,
@@ -535,7 +534,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let store = KvDiskStore::open(dir.clone(), 0, 4).unwrap();
         let hd = 32usize;
-        let k: Vec<f32> = (0..4 * hd).map(|i| (i as f32) * 0.31830988 - 3.7).collect();
+        let k: Vec<f32> = (0..4 * hd).map(|i| (i as f32) * 0.317 - 3.7).collect();
         let v: Vec<f32> = (0..4 * hd).map(|i| 1.0 / (i as f32 + 2.0)).collect();
         let path = store.block_path(42);
         store

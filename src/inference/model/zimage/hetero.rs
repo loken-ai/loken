@@ -113,10 +113,7 @@ struct HeteroZImagePerImageCache {
     // Pre-run context_refiner output - deterministic per image because
     // adaln_input is None for context-refiner blocks.
     cap_refined: Tensor,
-    cap_cos: Tensor,
-    cap_sin: Tensor,
     x_attn_mask: Tensor,
-    cap_attn_mask: Tensor,
     unified_cos: Tensor,
     unified_sin: Tensor,
     unified_attn_mask: Tensor,
@@ -496,7 +493,7 @@ impl HeteroZImage {
         // None to skip it without losing correctness.
         let mask_has_padding = {
             let v: Vec<u8> = cap_attn_mask.flatten_all()?.to_vec1::<u8>()?;
-            v.iter().any(|&x| x == 0)
+            v.contains(&0)
         };
 
         // 8 (hoisted). context_refiner is deterministic when adaln_input
@@ -533,10 +530,7 @@ impl HeteroZImage {
             x_cos,
             x_sin,
             cap_refined,
-            cap_cos,
-            cap_sin,
             x_attn_mask,
-            cap_attn_mask,
             unified_cos,
             unified_sin,
             unified_attn_mask,

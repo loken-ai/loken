@@ -838,8 +838,7 @@ mod tests {
             max_range_uj: 1_000_000_000,
             kind: RaplKind::Dram,
         }];
-        let (_pkg, dram) =
-            rapl_delta_j(&dom, &vec![Some(1_000_000u128)], &vec![Some(3_000_000u128)]);
+        let (_pkg, dram) = rapl_delta_j(&dom, &[Some(1_000_000u128)], &[Some(3_000_000u128)]);
         // 2_000_000 µJ = 2.0 J
         assert!((dram - 2.0).abs() < 1e-9);
     }

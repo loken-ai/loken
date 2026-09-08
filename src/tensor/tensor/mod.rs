@@ -173,7 +173,7 @@ fn cpu_storage_bytes(c: &CpuStorage) -> &[u8] {
 /// Rebuild typed CPU storage from raw little-endian bytes.
 fn cpu_storage_from_bytes(dtype: DType, bytes: &[u8]) -> Result<CpuStorage> {
     let es = dtype.size_in_bytes();
-    if bytes.len() % es != 0 {
+    if !bytes.len().is_multiple_of(es) {
         return Err(Error(format!(
             "storage_from_bytes: {} bytes not a multiple of {es}",
             bytes.len()

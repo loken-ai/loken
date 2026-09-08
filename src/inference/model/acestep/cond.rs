@@ -249,7 +249,7 @@ impl CondModel {
     /// Text path: `text_hidden [S,1024]` -> text_projector Linear (no bias) -> `[S,2048]`.
     pub fn text_forward(&self, text_hidden: &[f32], s: usize) -> crate::tensor::Result<Vec<f32>> {
         let x = Tensor::from_vec_f32(text_hidden.to_vec(), (s, 1024))?.to_device(&self.device)?;
-        Ok(self.text_proj.forward(&x)?.flatten_all()?.to_vec1_f32()?)
+        self.text_proj.forward(&x)?.flatten_all()?.to_vec1_f32()
     }
 
     /// Timbre path: `timbre_feats [S_ref,64]` -> embed Linear(64->2048)+bias -> 4L ->

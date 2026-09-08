@@ -120,7 +120,6 @@ pub fn copy_f32_dev(src: &Tensor, dst: &Tensor) -> Result<()> {
 /// over the FULL ring buffer kbuf/vbuf [b,n_kv,kv_max,hd] - so a captured graph
 /// attends the correct growing count on replay. q [b,n_head,hd] F16. No sinks/
 /// mask. Returns [b,n_head,hd] F16, or None unless CUDA + F16 + hd ok.
-#[allow(clippy::too_many_arguments)]
 pub fn flash_decode_devkvlen(
     q: &Tensor,
     kbuf: &Tensor,
@@ -138,9 +137,8 @@ pub fn flash_decode_devkvlen(
     use crate::tensor::StorageView::Cuda as C;
     use core::ffi::c_void;
     if !q.device().is_cuda()
-        || head_dim % 32 != 0
-        || head_dim < 32
-        || head_dim > 256
+        || !head_dim.is_multiple_of(32)
+        || !(32..=256).contains(&head_dim)
         || q.dtype() != DType::F16
         || kbuf.dtype() != DType::F16
         || vbuf.dtype() != DType::F16

@@ -653,7 +653,7 @@ impl Tensor {
     pub fn chunk<I: Dim>(&self, n: usize, dim: I) -> Result<Vec<Self>> {
         let d = dim.to_index(&self.shape, "chunk")?;
         let size = self.dims()[d];
-        if size % n != 0 {
+        if !size.is_multiple_of(n) {
             return Err(Error(format!(
                 "chunk: dim {d} of {size} not divisible by {n}"
             )));
@@ -852,7 +852,7 @@ impl Tensor {
         let k = weight
             .index_select(&idx, 2)?
             .index_select(&idx, 3)?
-            .permute(&[1, 0, 2, 3])?
+            .permute([1, 0, 2, 3])?
             .contiguous()?;
 
         Ok(Some(x.conv2d(&k, kh - 1 - padding, 1, 1, 1)?))

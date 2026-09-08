@@ -560,8 +560,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(0);
         }
     }
-
-    Ok(())
 }
 
 /// Resolves once a stop was asked for AND nothing is being served any more.
@@ -700,6 +698,17 @@ impl StopSignals {
     }
 }
 
+/// The machine's name, or a fallback. Used as the node id when none is configured, so a
+/// cluster of three machines needs no per-machine configuration at all.
+fn hostname_or(fallback: &str) -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,15 +761,4 @@ mod tests {
             }
         }
     }
-}
-
-/// The machine's name, or a fallback. Used as the node id when none is configured, so a
-/// cluster of three machines needs no per-machine configuration at all.
-fn hostname_or(fallback: &str) -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .unwrap_or_else(|| fallback.to_string())
 }

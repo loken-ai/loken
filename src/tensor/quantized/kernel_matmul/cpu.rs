@@ -10,7 +10,7 @@ impl QKernelMatMul {
     pub fn forward_slice_cpu(&self, x: &[f32], out: &mut [f32]) -> Result<bool> {
         if !matches!(self.device, crate::tensor::Device::Cpu)
             || !crate::tensor::quant_cpu::supports(self.dtype)
-            || self.k % self.dtype.block_size() != 0
+            || !self.k.is_multiple_of(self.dtype.block_size())
         {
             return Ok(false);
         }
@@ -69,7 +69,7 @@ impl QKernelMatMul {
                 return Ok(false);
             }
             let k = mats[0].k;
-            if k % crate::tensor::quant_cpu::QK_K != 0 {
+            if !k.is_multiple_of(crate::tensor::quant_cpu::QK_K) {
                 return Ok(false);
             }
             let mut packs = Vec::with_capacity(mats.len());
@@ -98,7 +98,7 @@ impl QKernelMatMul {
     pub fn cpu_raw(&self) -> Option<(GgmlDType, usize, usize, &[u8])> {
         if matches!(self.device, crate::tensor::Device::Cpu)
             && crate::tensor::quant_cpu::supports(self.dtype)
-            && self.k % self.dtype.block_size() == 0
+            && self.k.is_multiple_of(self.dtype.block_size())
         {
             Some((self.dtype, self.k, self.n, self.host.data()))
         } else {

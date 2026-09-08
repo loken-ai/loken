@@ -12,8 +12,6 @@
 //!   [`fit_unsigned_scale`]   the SECOND stage: the scales themselves, quantised in turn
 //!   [`magnitude_weights`] what a value counts for when no importance matrix says
 
-use super::*;
-
 pub(super) fn nearest_int(v: f32) -> i32 {
     v.round() as i32
 }

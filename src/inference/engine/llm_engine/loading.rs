@@ -123,7 +123,7 @@ impl LlmEngine {
 
         let device_index = self.config.device_index;
         let max_gpu_memory_fraction = self.config.max_gpu_memory_fraction;
-        let cpu_threads = self.config.cpu_threads;
+        let _cpu_threads = self.config.cpu_threads;
         let disable_arc_layers = self.config.disable_arc_layers;
         // `--cpu` serve flag forces the same all-CPU placement as the
         // disable_cuda config (empty cuda_devices -> every layer on CPU).
@@ -920,7 +920,7 @@ impl LlmEngine {
                         match crate::inference::model::gptoss::GptOssModel::from_gguf(
                             &content_fresh, &mut reader, &gpu_list, dtype, Some(&mmap),
                         ) {
-                            Ok(mut m) => {
+                            Ok(m) => {
                                 info!("✅ gptoss loaded on {} GPU(s)", gpu_list.len());
                                 // Diagnostic: probe whether the decode forward
                                 // captures + replays as a CUDA graph (settles the

@@ -508,14 +508,14 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
             if let Some(bos_str) = bos_str {
                 use tokenizers::processors::template::TemplateProcessing;
                 let built = (|| -> AnyResult<TemplateProcessing> {
-                    Ok(TemplateProcessing::builder()
+                    TemplateProcessing::builder()
                         .try_single(format!("{bos_str}:0 $A:0"))
                         .map_err(|e| anyhow!("{e}"))?
                         .try_pair(format!("{bos_str}:0 $A:0 $B:1"))
                         .map_err(|e| anyhow!("{e}"))?
                         .special_tokens(vec![(bos_str.clone(), *bos_id)])
                         .build()
-                        .map_err(|e| anyhow!("{e}"))?)
+                        .map_err(|e| anyhow!("{e}"))
                 })();
                 match built {
                     Ok(post) => {

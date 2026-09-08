@@ -124,7 +124,6 @@ pub(crate) fn apply_rope(x: &Tensor, freq_cis: &Tensor) -> Result<Tensor> {
 /// image gen the same `freq_cis` tensor flows through every attention()
 /// call across every block. With ~57 blocks x ~4 slice ops on pe per
 /// step in Flux schnell, this saves ~228 per-step Tensor_ allocations.
-
 pub(crate) fn rope_split_cached(freq_cis: &Tensor) -> Result<(Tensor, Tensor)> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -230,18 +229,13 @@ pub(crate) fn timestep_freqs_cached(dev: &crate::tensor::Device, half: usize) ->
 
 #[derive(Debug, Clone)]
 pub struct EmbedNd {
-    dim: usize,
     theta: usize,
     axes_dim: Vec<usize>,
 }
 
 impl EmbedNd {
-    pub fn new(dim: usize, theta: usize, axes_dim: Vec<usize>) -> Self {
-        Self {
-            dim,
-            theta,
-            axes_dim,
-        }
+    pub fn new(_dim: usize, theta: usize, axes_dim: Vec<usize>) -> Self {
+        Self { theta, axes_dim }
     }
 }
 
@@ -356,7 +350,7 @@ pub(crate) fn vec_silu_cached(vec_: &Tensor) -> Result<Tensor> {
 
 /// One modulation: three vectors out of the conditioning.
 #[derive(Debug)]
-pub(crate) struct Modulation1 {
+pub struct Modulation1 {
     pub lin: QLinear,
 }
 
@@ -375,7 +369,7 @@ impl Modulation1 {
 
 /// Two modulations from one projection - a block that modulates before and after its branch.
 #[derive(Debug)]
-pub(crate) struct Modulation2 {
+pub struct Modulation2 {
     pub lin: QLinear,
 }
 
@@ -419,10 +413,6 @@ impl MlpEmbedder {
             in_layer: linear_b(in_sz, h_sz, true, &vb.pp("in_layer"))?,
             out_layer: linear_b(h_sz, h_sz, true, &vb.pp("out_layer"))?,
         })
-    }
-
-    pub(crate) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.out_layer.forward(&self.in_layer.forward(xs)?.silu()?)
     }
 }
 
@@ -474,7 +464,7 @@ pub(crate) fn qk_norm(dim: usize, vb: &QVarBuilder) -> Result<QkNorm> {
 }
 
 #[derive(Debug)]
-pub(crate) struct SelfAttention {
+pub struct SelfAttention {
     pub qkv: QLinear,
     pub norm: QkNorm,
     pub proj: QLinear,
@@ -482,35 +472,6 @@ pub(crate) struct SelfAttention {
 }
 
 impl SelfAttention {
-    pub(crate) fn apply_lora(
-        &mut self,
-        file: &crate::inference::load::lora::LoraFile,
-        strength: f32,
-        path: &str,
-        alt: (&str, usize),
-    ) -> Result<usize> {
-        // XLabs keys the two streams as `processor.{qkv,proj}_lora{1,2}` on the BLOCK,
-        // where 1 is the image stream and 2 the text one - hence the caller passing the
-        // block path and stream index rather than this module's own path.
-        let (blk, n) = alt;
-        Ok(self.qkv.apply_flux_lora(
-            file,
-            strength,
-            &format!("{path}.qkv"),
-            Some(&format!("{blk}.processor.qkv_lora{n}")),
-        )? + self.proj.apply_flux_lora(
-            file,
-            strength,
-            &format!("{path}.proj"),
-            Some(&format!("{blk}.processor.proj_lora{n}")),
-        )?)
-    }
-
-    pub(crate) fn clear_lora(&mut self) {
-        self.qkv.clear_lora();
-        self.proj.clear_lora();
-    }
-
     pub(crate) fn new(
         dim: usize,
         num_heads: usize,

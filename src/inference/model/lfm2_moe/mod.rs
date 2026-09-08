@@ -21,7 +21,6 @@ use crate::tensor::quantized::{gguf_file, QMatMul, QTensor};
 use crate::tensor::{DType, Device, IndexOp, Result, Tensor, D};
 use std::io::{Read, Seek};
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 fn lfm2_devpos_enabled() -> bool {
     false
@@ -262,7 +261,6 @@ pub struct Lfm2Attn {
 }
 
 impl Lfm2Attn {
-    #[allow(clippy::too_many_arguments)]
     pub fn load<R: Read + Seek>(
         c: &gguf_file::Content,
         r: &mut R,
@@ -525,7 +523,7 @@ impl Lfm2Attn {
             // Decode (seq==1): device-kv_len flash-decode over the FULL ring buffer
             // - kv_len = *pos_dev+1 read on device, so a captured graph attends the
             // correct growing count on replay (the host-narrow below would freeze).
-            if seq == 1 && self.head_dim % 32 == 0 {
+            if seq == 1 && self.head_dim.is_multiple_of(32) {
                 let scale = 1.0 / (self.head_dim as f64).sqrt();
                 if let Some(o) = crate::inference::kernel::fused::flash_decode_devkvlen(
                     &q.reshape((b, self.n_head, self.head_dim))?,
@@ -939,7 +937,7 @@ fn route(
         // broadcast_maximum host round-trip (3 PCIe transfers per token - measured as a
         // -30% decode regression on lfm2). Exact for s<=c; <=1 ulp for s>c (router-weight
         // normalization floor, far below the f16 expert-compute noise).
-        const C: f32 = 6.103515625e-5;
+        const C: f32 = 6.103_515_6e-5;
         let s = s.affine(1.0, -C)?.relu()?.affine(1.0, C)?;
         topk_w = topk_w.broadcast_div(&s)?;
     }

@@ -417,11 +417,8 @@ impl Qwen2TextEncoder {
             std::collections::HashMap::new();
         for l in &self.layers {
             let loc = l.device.location();
-            if !rope.contains_key(&loc) {
-                rope.insert(
-                    loc,
-                    (cos0.to_device(&l.device)?, sin0.to_device(&l.device)?),
-                );
+            if let std::collections::hash_map::Entry::Vacant(e) = rope.entry(loc) {
+                e.insert((cos0.to_device(&l.device)?, sin0.to_device(&l.device)?));
             }
         }
         // Walk layers; move `hid` to a layer's device only when it differs (single-device plan ->

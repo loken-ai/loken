@@ -74,8 +74,8 @@ const MMVQ_CU: &str = include_str!("../cuda/mmvq_gguf.cu");
 static MMVQ_PTX: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, &'static str>>> =
     OnceLock::new();
 
-/// NVRTC-compile the relocated mmvq_gguf.cu (cached). Returns the PTX.
-/// pub(crate): the native tensor substrate loads the same PTX (tensor).
+// NVRTC-compile the relocated mmvq_gguf.cu (cached). Returns the PTX.
+// pub(crate): the native tensor substrate loads the same PTX (tensor).
 
 /// The `--gpu-architecture` NVRTC compiles for: the LOWEST compute capability among the
 /// cards actually present, so one PTX serves a mixed machine and JITs upward.
@@ -161,7 +161,7 @@ pub(crate) fn get_mmvq_ptx_for_ordinal(ordinal: usize) -> Result<&'static str> {
         }
         return Ok(p);
     }
-    let compiled: String = (|| {
+    let compiled: String = {
         let opts = cudarc::nvrtc::safe::CompileOptions {
             include_paths: cuda_include_paths(),
             arch,
@@ -182,7 +182,7 @@ pub(crate) fn get_mmvq_ptx_for_ordinal(ordinal: usize) -> Result<&'static str> {
                 String::new()
             }
         }
-    })();
+    };
     let leaked: &'static str = Box::leak(compiled.into_boxed_str());
     g.insert(key, leaked);
     let ptx = leaked;

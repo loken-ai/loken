@@ -100,7 +100,7 @@ impl GroupQuantised {
 /// not divide would silently give its last group a scale computed from padding.
 pub fn quantise_run(values: &[f32], values_per_group: usize, scheme: Scheme) -> GroupQuantised {
     assert!(
-        values_per_group % GROUP_VALUES == 0 && values_per_group > 0,
+        values_per_group.is_multiple_of(GROUP_VALUES) && values_per_group > 0,
         "a group is a whole number of {GROUP_VALUES}-value packing groups"
     );
     assert_eq!(
@@ -139,7 +139,7 @@ pub fn quantise_run(values: &[f32], values_per_group: usize, scheme: Scheme) -> 
                     // A dead group: every value is zero, so every code is the one nearest
                     // zero and the scale multiplies it away regardless.
                     let zero_code = codebook.index_of(0.0);
-                    indices.extend(std::iter::repeat(zero_code).take(group.len()));
+                    indices.extend(std::iter::repeat_n(zero_code, group.len()));
                 } else {
                     let inv = 1.0 / s;
                     indices.extend(group.iter().map(|x| codebook.index_of(x * inv)));
@@ -158,7 +158,7 @@ pub fn quantise_run(values: &[f32], values_per_group: usize, scheme: Scheme) -> 
                 zeros.push(zero);
                 let (z, s) = (zero.to_f32(), scale.to_f32());
                 if s <= 0.0 || !s.is_finite() {
-                    indices.extend(std::iter::repeat(0u8).take(group.len()));
+                    indices.extend(std::iter::repeat_n(0u8, group.len()));
                 } else {
                     let inv = 1.0 / s;
                     indices.extend(

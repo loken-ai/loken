@@ -273,7 +273,6 @@ pub struct DoubleBlock {
 }
 
 impl DoubleBlock {
-    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         img: &NT,
