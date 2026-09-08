@@ -199,9 +199,13 @@ impl ImageEngine {
             .clone()
     }
 
-    /// Check if an image model is loaded
+    /// Whether a model is resident. A state under a lock is a model being loaded or
+    /// rendering, which counts as present.
     pub async fn is_loaded(&self) -> bool {
-        self.model_state.lock().await.is_some()
+        match self.model_state.try_lock() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => true,
+        }
     }
 
     /// Lightweight family identifier for the loaded checkpoint. Returns
@@ -209,75 +213,12 @@ impl ImageEngine {
     /// Used by /v1/models to surface `is_loaded` per multimodal entry
     /// without taking the heavyweight `get_loaded_model_info()` path.
     pub async fn loaded_family(&self) -> Option<&'static str> {
-        match self.model_state.lock().await.as_ref()?.model {
-            LoadedImageModel::Flux(_) => Some("flux"),
-            LoadedImageModel::ZImage(_) => Some("zimage"),
-            LoadedImageModel::QwenImage(_) => Some("qwen-image"),
-            LoadedImageModel::Flux2(_) => Some("flux2"),
-            LoadedImageModel::Boogu(_) => Some("boogu"),
-            LoadedImageModel::Sdxl(_) => Some("sdxl"),
-        }
+        self.presence().map(|p| p.family)
     }
 
     /// Get info about the loaded image model (name, device, layer distribution)
     pub async fn get_loaded_model_info(&self) -> Option<ImageModelInfo> {
-        let guard = self.model_state.lock().await;
-        let state = guard.as_ref()?;
-        let (model_type, total_layers, layer_distribution) = match &state.model {
-            LoadedImageModel::Flux(flux) => match &flux.flux {
-                FluxVariant::Whole(_) => {
-                    let total = 57u32;
-                    let dist = all_on_one_device(state, total);
-                    ("Flux Schnell".into(), total, dist)
-                }
-                FluxVariant::Hetero(hetero) => {
-                    let total = hetero.plan.total_layers as u32;
-                    let dist = spread_over_plan(&hetero.plan, state.resident_bytes);
-                    ("Flux Schnell".into(), total, dist)
-                }
-            },
-            LoadedImageModel::ZImage(zimg) => match &zimg.transformer {
-                ZImageVariant::Single(_) | ZImageVariant::NativeSingle(_) => {
-                    let total = 34u32;
-                    let dist = all_on_one_device(state, total);
-                    ("Z-Image".into(), total, dist)
-                }
-                ZImageVariant::Hetero(hetero) => {
-                    let total = hetero.plan.total_layers as u32;
-                    let dist = spread_over_plan(&hetero.plan, state.resident_bytes);
-                    ("Z-Image".into(), total, dist)
-                }
-            },
-            LoadedImageModel::QwenImage(_) => {
-                let total = 60u32;
-                let dist = all_on_one_device(state, total);
-                ("Qwen-Image".into(), total, dist)
-            }
-            LoadedImageModel::Flux2(f2) => {
-                // 5 dual-stream + 20 parallel single blocks.
-                let cfg = f2.config();
-                let total = (cfg.num_layers + cfg.num_single_layers) as u32;
-                let dist = all_on_one_device(state, total);
-                ("FLUX.2 Klein".into(), total, dist)
-            }
-            LoadedImageModel::Boogu(_) => {
-                let total = 40u32;
-                let dist = all_on_one_device(state, total);
-                ("Boogu-Image".into(), total, dist)
-            }
-            LoadedImageModel::Sdxl(_) => {
-                // 9 input levels + 3 middle + 9 output, on one device.
-                let total = 21u32;
-                let dist = all_on_one_device(state, total);
-                ("SDXL".into(), total, dist)
-            }
-        };
-        Some(ImageModelInfo {
-            name: state.name.clone(),
-            model_type,
-            total_layers,
-            layer_distribution,
-        })
+        self.presence().map(|p| p.info)
     }
 }
 
