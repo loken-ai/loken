@@ -71,6 +71,14 @@ impl MuxLink {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&h.request_id);
+                    // The request leaves the count before its caller can see the reply, so
+                    // a caller that has its answer is never still counted as waiting.
+                    {
+                        let (lock, cv) = &w.gate;
+                        let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        *n = n.saturating_sub(1);
+                        cv.notify_one();
+                    }
                     match tx {
                         Some(tx) => {
                             let _ = tx.send(Ok((h, p)));
@@ -84,20 +92,16 @@ impl MuxLink {
                             );
                         }
                     }
-                    let (lock, cv) = &w.gate;
-                    let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    *n = n.saturating_sub(1);
-                    cv.notify_one();
                 }
                 Err(e) => {
                     // The link died. Everyone still waiting has to learn it, or they wait for
                     // a reply that can no longer come - a hang instead of an error.
                     let mut map = w.map.lock().unwrap_or_else(|e| e.into_inner());
+                    let (lock, cv) = &w.gate;
+                    *lock.lock().unwrap_or_else(|e| e.into_inner()) = 0;
                     for (_, tx) in map.drain() {
                         let _ = tx.send(Err(io::Error::new(e.kind(), e.to_string())));
                     }
-                    let (lock, cv) = &w.gate;
-                    *lock.lock().unwrap_or_else(|e| e.into_inner()) = 0;
                     cv.notify_all();
                     return;
                 }
