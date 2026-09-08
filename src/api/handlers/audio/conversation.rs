@@ -467,6 +467,42 @@ pub(crate) async fn conversation_handler(
         }
     }
 
+    // A sound turn goes to a node whose catalogue holds a sound model when this one's
+    // does not; a speech turn naming a model likewise. The peer classifies the turn again.
+    {
+        use crate::distributed::routing::can_serve;
+        let holds = |n: &crate::distributed::membership::NodeState, model: &str| match model {
+            "" => can_serve(n, "stable-audio") || can_serve(n, "ezaudio"),
+            named => can_serve(n, named),
+        };
+        let wanted: Option<String> = match route {
+            ConvRoute::SoundGen => Some(String::new()),
+            ConvRoute::Tts => s("tts_model"),
+            _ => None,
+        };
+        if let Some(model) = wanted {
+            let local = state.local_node_state().await;
+            if let Some(relayed) = crate::api::handlers::route_media_to_holder(
+                &state,
+                &headers,
+                if model.is_empty() {
+                    "a sound model"
+                } else {
+                    &model
+                },
+                holds(&local, &model),
+                true,
+                |peer| holds(peer, &model),
+                &crate::api::handlers::CONVERSATION,
+                &req,
+            )
+            .await
+            {
+                return relayed;
+            }
+        }
+    }
+
     // Warm-touch the conversation's whole working set so LRU keeps it
     // resident across turns. `cid` also echoes into the response.
     let cid = conversation_id.clone().unwrap_or_default();

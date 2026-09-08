@@ -626,9 +626,41 @@ fn error_event(message: String) -> String {
 
 pub(crate) async fn audio_generations(
     _state: axum::extract::State<APIServer>,
+    headers: axum::http::HeaderMap,
     body: Json<serde_json::Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    // The job goes to a node whose catalogue holds the model when this one's does not.
+    {
+        use crate::distributed::routing::can_serve;
+        let requested = str_field(&body.0, "model").to_ascii_lowercase();
+        let holds = |n: &crate::distributed::membership::NodeState| {
+            if requested.is_empty() {
+                can_serve(n, "stable-audio") || can_serve(n, "ezaudio")
+            } else {
+                can_serve(n, &requested)
+            }
+        };
+        let served_here = holds(&_state.local_node_state().await);
+        if let Some(relayed) = crate::api::handlers::route_media_to_holder(
+            &_state,
+            &headers,
+            if requested.is_empty() {
+                "a sound model"
+            } else {
+                &requested
+            },
+            served_here,
+            true,
+            holds,
+            &crate::api::handlers::AUDIO_GENERATIONS,
+            &body.0,
+        )
+        .await
+        {
+            return relayed;
+        }
+    }
     let err_resp = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {
         (code, Json(openai_error_body(code, msg))).into_response()
     };
