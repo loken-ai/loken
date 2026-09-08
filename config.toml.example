@@ -8,6 +8,13 @@
 [server]
 host = "127.0.0.1"
 port = 11435
+# The address is the security boundary. Before the daemon listens on anything but localhost,
+# turn authentication and a rate limit on:
+# require_auth = true
+# api_keys = ["change-me"]          # sent as `Authorization: Bearer <key>` or `X-API-Key`
+# allowed_origins = []              # browser origins allowed once auth is on
+# rate_limit_per_minute = 0         # per client, 0 = unlimited
+# rate_limit_burst = 10
 
 [inference]
 # The model loaded when a request does not name one. Set it to a tag you actually have  - 
@@ -27,3 +34,38 @@ cpu_threads = 0
 # CUDA or the host while something is being bisected. Leave it off unless you are doing that  - 
 # on, an Intel Arc card silently stops being used.
 disable_arc_layers = false
+
+# KV cache storage: "off", "q8" or "q4". Read at load time only.
+# kv_quant = "off"
+# Paged KV and batched decode for several concurrent clients, cards only.
+# continuous_batching = false
+
+# A smaller model that proposes tokens the loaded model verifies. Pays where verification
+# is far dearer than drafting, such as a model spilling to the host.
+# draft_model = "llama3.2:1b"
+# draft_device_index = 0
+
+# KV reuse across requests. Snapshots keep one KV copy per resident conversation, where the
+# layers live; the disk tier makes them survive a restart. Both off by default.
+# kv_shift_reuse = false            # keep the resident tail once a conversation outgrows the window
+# kv_snapshots = 0                  # conversations kept aside, 0 = the single resident KV
+# kv_snapshot_budget_gb = 0         # device memory the snapshots may hold, 0 = derived from what is free
+# kv_disk_dir = "/var/lib/loken/kv" # needs kv_snapshots > 0
+# kv_disk_budget_gb = 0             # 0 = no limit
+
+# Files, moderation and the URLs handed out.
+# files_dir = "/var/lib/loken/files"   # uploads and batch outputs, default: files/ beside the model store
+# moderation_model = "llama-guard3:1b" # Llama Guard, Shieldstral, ShieldGemma, Granite Guardian or gpt-oss Safeguard
+# public_url = "https://loken.example.org" # the origin clients reach this server at, default: the request's Host
+
+# [energy]
+# enabled = true
+# carbon_intensity = 50             # gCO2eq per kWh
+# cpu_tdp_w = 0                     # host estimate when RAPL is unreadable, 0 = measured domains only
+# water_l_per_kwh = 1.8
+
+# Clustering: see docs/CLUSTER.md. Absent, the node runs alone.
+# [cluster]
+# name = "home"
+# advertise = "http://192.0.2.10:11435"
+# join = []

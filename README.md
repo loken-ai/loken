@@ -6,7 +6,7 @@
 
 A local inference server for language **and** generative-media models, written in Rust. One
 process serves chat, images, audio, speech, transcription and video, over an
-OpenAI-compatible API and an Ollama-compatible one.
+OpenAI-compatible API, an Ollama-compatible one and the Messages API.
 
 ```sh
 cp config.toml.example config.toml   # the daemon reads this from its working directory
@@ -73,10 +73,13 @@ the binary non-portable, so drop that flag if you are building for another machi
 
 The server **has no authentication and no rate limit unless you configure them**, and its API
 can delete models. That suits one person on one machine. Turn both on in `config.toml` before it
-listens on anything but localhost.
+listens on anything but localhost: `require_auth`, `api_keys` and `rate_limit_per_minute` under
+`[server]`.
 
 ## Documentation
 
+- [`docs/API.md`](docs/API.md) - every route on the three surfaces, and what each takes
+- [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) - every key of `config.toml` and its default
 - [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) - measurements against other engines and the
   protocol that makes the comparison fair, including the cells where this engine loses. Every
   figure there is out of date: it was taken during a phase of very active development and a

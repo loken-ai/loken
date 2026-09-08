@@ -188,9 +188,9 @@ pub struct InferenceConfig {
     /// prefilling. 0 keeps the single resident KV. Costs one KV per entry, where the
     /// layers live.
     pub kv_snapshots: usize,
-    /// Directory of the disk tier under the snapshots: blocks of Q8_0 KV shared between
-    /// sequences by prefix, one manifest per sequence. `None` keeps snapshots in memory
-    /// only. Needs `kv_snapshots > 0`.
+    /// Directory of the disk tier under the snapshots: token blocks of KV at the cache's
+    /// own dtype, shared between sequences by prefix, one manifest per sequence. `None`
+    /// keeps snapshots in memory only. Needs `kv_snapshots > 0`.
     pub kv_disk_dir: Option<String>,
     /// Bytes the disk tier may hold, in GiB; 0 for no limit. Least recently used
     /// sequences go first.
