@@ -8,9 +8,7 @@ file opens from disk with no server and no network.
 import json, glob, os, sys, datetime, pathlib
 
 # Derived from where this script sits, so it renders the same tree whatever the caller's
-# working directory is. It used to default to "llmuse/results", which resolved only when run
-# from the directory above the repository - the bench calls it from inside, and the figure
-# had not been regenerated since.
+# working directory is.
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RESULTS = sys.argv[1] if len(sys.argv) > 1 else str(ROOT / "results")
 OUT = sys.argv[2] if len(sys.argv) > 2 else str(ROOT / "docs" / "bench.html")
@@ -34,7 +32,7 @@ for p in sorted(glob.glob(os.path.join(RESULTS, "*.json"))):
             jtok=round(st.get("Energy J/tok", {}).get("mean", 0), 3),
             when=when))
 
-TEMPLATE = r"""<title>llmuse — banc de mesure</title>
+TEMPLATE = r"""<title>loken benchmark</title>
 <style>
 :root{--ink:#14181d;--soft:#5b6672;--line:#dfe3e8;--bg:#f7f8fa;--card:#fff;
  --win:#1f7a52;--loss:#a8323c;--grid:#e8ebef;--accent:#2f5fd0;--par:#9aa4b0}
@@ -74,13 +72,13 @@ th:first-child,td:first-child{text-align:left}
 th{color:var(--soft);font-weight:600}
 .note{margin-top:22px;color:var(--soft);font-size:12.5px;border-top:1px solid var(--line);padding-top:13px}
 </style><div class="wrap">
-<h1>llmuse contre ollama</h1>
-<p class="sub">Chaque point est un modèle. La diagonale est l'égalité : au-dessus, llmuse devance ollama. Les deux axes sont logarithmiques, l'échelle couvrant un facteur cent entre le plus petit et le plus gros modèle.</p>
+<h1>loken against ollama</h1>
+<p class="sub">Each point is a model. The diagonal is parity: above it, loken is ahead of ollama. Both axes are logarithmic, the scale spanning a factor of a hundred between the smallest and the largest model.</p>
 <div class="bar" id="bar"></div>
-<div class="plot"><svg id="svg" viewBox="0 0 760 480" role="img" aria-label="Nuage de points"></svg></div>
+<div class="plot"><svg id="svg" viewBox="0 0 760 480" role="img" aria-label="Scatter plot"></svg></div>
 <p class="count" id="count"></p>
 <div class="card" id="card"></div>
-<p class="note">Le mode énergie compare les joules par token, axes inversés pour que « au-dessus de la diagonale » signifie toujours llmuse devant. Les modèles dont les deux moteurs n'ont pas produit le même nombre de tokens sont écartés du mode énergie : une moyenne sur des réponses de longueurs différentes ne compare rien.</p>
+<p class="note">The energy mode compares joules per token, axes inverted so that "above the diagonal" still means loken ahead. Models whose two engines did not produce the same number of tokens are left out of the energy mode: a mean over answers of different lengths compares nothing.</p>
 </div>
 <script>
 const DATA=__DATA__;
@@ -94,7 +92,7 @@ function pairs(){
   }
   const out=[];
   for(const [model,by] of Object.entries(m)){
-    const l=by.llmuse,o=by.ollama; if(!l||!o)continue;
+    const l=by.loken,o=by.ollama; if(!l||!o)continue;
     const same=Math.abs(l.tokens-o.tokens)<=0.02*Math.max(l.tokens,1);
     if(S.metric==='debit') out.push({model,l,o,x:o.decode,y:l.decode,same});
     else if(same&&l.jtok>0&&o.jtok>0) out.push({model,l,o,x:1/o.jtok,y:1/l.jtok,same});
@@ -123,10 +121,10 @@ function draw(){
     g+=`<text x="${L-8}" y="${sy(t)+4}" text-anchor="end">${t<1?t:Math.round(t)}</text>`;
   }
   g+=`<line x1="${sx(lo)}" y1="${sy(lo)}" x2="${sx(hi)}" y2="${sy(hi)}" stroke="var(--par)" stroke-dasharray="5 4"/>`;
-  g+=`<text x="${W-R-6}" y="${sy(hi)+52}" text-anchor="end" fill="var(--par)">egalite</text>`;
-  const unit=S.metric==='debit'?'tok/s':'tokens par joule';
-  g+=`<text x="${(L+W-R)/2}" y="${H-6}" text-anchor="middle">ollama — ${unit}</text>`;
-  g+=`<text transform="translate(14,${(T+H-B)/2}) rotate(-90)" text-anchor="middle">llmuse — ${unit}</text>`;
+  g+=`<text x="${W-R-6}" y="${sy(hi)+52}" text-anchor="end" fill="var(--par)">parity</text>`;
+  const unit=S.metric==='debit'?'tok/s':'tokens per joule';
+  g+=`<text x="${(L+W-R)/2}" y="${H-6}" text-anchor="middle">ollama - ${unit}</text>`;
+  g+=`<text transform="translate(14,${(T+H-B)/2}) rotate(-90)" text-anchor="middle">loken - ${unit}</text>`;
   P.sort((a,b)=>a.x-b.x).forEach((p,i)=>{
     const win=p.y>p.x, c=win?'var(--win)':'var(--loss)';
     g+=`<g class="dot" tabindex="0" data-m="${p.model}" role="button" aria-label="${p.model}">
@@ -135,17 +133,17 @@ function draw(){
   });
   svg.innerHTML=g;
   const w=P.filter(p=>p.y>p.x).length;
-  document.getElementById('count').textContent=`${P.length} modeles — ${w} au-dessus de la diagonale, ${P.length-w} en dessous`;
+  document.getElementById('count').textContent=`${P.length} models - ${w} above the diagonal, ${P.length-w} below`;
 }
 function show(model){
   const p=pairs().find(x=>x.model===model); if(!p)return;
   const c=document.getElementById('card');
   c.className='card on';
   c.innerHTML=`<h2>${p.model}</h2><table>
-   <tr><th>moteur</th><th>decode tok/s</th><th>prefill tok/s</th><th>tokens</th><th>E2E ms</th><th>J/token</th><th>mesure</th></tr>
-   <tr><td>ollama</td><td>${p.o.decode}</td><td>${p.o.prefill||'—'}</td><td>${p.o.tokens}</td><td>${p.o.e2e}</td><td>${p.o.jtok||'—'}</td><td>${p.o.when}</td></tr>
-   <tr><td>llmuse</td><td>${p.l.decode}</td><td>${p.l.prefill||'—'}</td><td>${p.l.tokens}</td><td>${p.l.e2e}</td><td>${p.l.jtok||'—'}</td><td>${p.l.when}</td></tr></table>`
-   +(p.same?'':'<p style="color:var(--soft);margin:8px 0 0">Nombres de tokens differents : l\'ecart d\'energie n\'est pas comparable.</p>');
+   <tr><th>engine</th><th>decode tok/s</th><th>prefill tok/s</th><th>tokens</th><th>E2E ms</th><th>J/token</th><th>measured</th></tr>
+   <tr><td>ollama</td><td>${p.o.decode}</td><td>${p.o.prefill||'-'}</td><td>${p.o.tokens}</td><td>${p.o.e2e}</td><td>${p.o.jtok||'-'}</td><td>${p.o.when}</td></tr>
+   <tr><td>loken</td><td>${p.l.decode}</td><td>${p.l.prefill||'-'}</td><td>${p.l.tokens}</td><td>${p.l.e2e}</td><td>${p.l.jtok||'-'}</td><td>${p.l.when}</td></tr></table>`
+   +(p.same?'':'<p style="color:var(--soft);margin:8px 0 0">Different token counts: the energy gap is not comparable.</p>');
 }
 document.addEventListener('click',e=>{
   const b=e.target.closest('button[data-k]'); if(b){S[b.dataset.k]=b.dataset.v;document.getElementById('card').className='card';draw();return;}
@@ -158,4 +156,4 @@ draw();
 </script>"""
 pathlib.Path(OUT).parent.mkdir(parents=True, exist_ok=True)
 pathlib.Path(OUT).write_text(TEMPLATE.replace("__DATA__", json.dumps(rows)))
-print(f"{OUT}: {len(rows)} mesures, {len({r['model'] for r in rows})} modeles")
+print(f"{OUT}: {len(rows)} measurements, {len({r['model'] for r in rows})} models")
