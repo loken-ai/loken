@@ -33,6 +33,13 @@ fn host_ram_safety_headroom_bytes() -> u64 {
     sys.total_memory() / 4
 }
 
+/// What a component may take on the host right now without pushing the machine into
+/// swap: the available RAM less the safety headroom. Every CPU fallback is admitted
+/// against this, the same figure the hetero planner budgets its CPU segment with.
+pub fn host_spill_budget_bytes() -> u64 {
+    available_host_ram_bytes().saturating_sub(host_ram_safety_headroom_bytes())
+}
+
 // LayerExecutor (stub) removed - the module's real value is the
 // DeviceKind / DevicePlan / HeteroPlan / HeteroSegment types and
 // the create_causal_mask helper, all of which are used widely. The

@@ -11,6 +11,11 @@ shown.
 Logs carry lengths and counts, never a prompt, a message, a transcript or a generated text,
 at any level.
 
+A component that falls back to the host is admitted against the memory the host can give
+without swapping, a quarter of it kept as headroom. Past that, the request is refused with the
+figures rather than run in swap. A health probe or a model listing never waits on a load or a
+render: it reports what was last known.
+
 ## Top level
 
 | Key | Default | What it does |

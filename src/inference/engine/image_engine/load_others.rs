@@ -816,6 +816,22 @@ impl ImageEngine {
                 None => Device::Cpu,
             };
             let te_dtype = DType::F32;
+            // The host path holds the encoder in F32, twice its measured BF16 footprint,
+            // and is admitted against what the host can give without swapping. Refused
+            // here, the request fails in a second; admitted, it ran for an hour in swap.
+            if !te_device.is_cuda() {
+                let need = te_est_bytes.saturating_mul(2);
+                let budget = crate::inference::place::layer_executor::host_spill_budget_bytes();
+                if need > budget {
+                    return Err(anyhow::anyhow!(
+                        "Z-Image text encoder needs {:.1} GB of host memory on the CPU path and \
+                         {:.1} GB can be given without swapping; a node with a card that holds \
+                         it, or more free host memory, is needed",
+                        need as f64 / 1e9,
+                        budget as f64 / 1e9
+                    ));
+                }
+            }
             let te_str = if te_device.is_cuda() { "GPU" } else { "CPU" };
 
             // Primary device for embeddings/final layer. Mutable because the
@@ -1037,6 +1053,25 @@ impl ImageEngine {
                         headroom,
                     ),
                 };
+                // The planner caps its host segment at what the host can give and warns
+                // when the blocks exceed it; here that is a refusal, since a segment past
+                // the budget is a load that finishes in swap.
+                for seg in &plan.segments {
+                    if !matches!(seg.kind, crate::inference::place::layer_executor::DeviceKind::Cpu) {
+                        continue;
+                    }
+                    let blocks = seg.layer_end.saturating_sub(seg.layer_start) as u64;
+                    let need = blocks.saturating_mul(transformer_size_est / total_main_layers.max(1) as u64);
+                    if need > seg.free_memory_bytes {
+                        return Err(anyhow::anyhow!(
+                            "Z-Image would place {blocks} blocks ({:.1} GB) on the host and {:.1} GB \
+                             can be given without swapping; a node with a card that holds them is \
+                             needed",
+                            need as f64 / 1e9,
+                            seg.free_memory_bytes as f64 / 1e9
+                        ));
+                    }
+                }
                 // The stem - the embedders, the refiners and the way back out - is built
                 // on the primary device, and the measurement charged it to the card the
                 // plan STARTS on. If those are not the same card the budget is a fiction,
