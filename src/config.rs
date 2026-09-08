@@ -537,15 +537,14 @@ pub fn hf_models_dir() -> PathBuf {
 #[cfg(test)]
 mod store_tests {
     #[test]
-    fn the_installed_stores_are_what_every_loader_reads() {
+    fn the_first_installed_stores_are_what_every_loader_reads() {
+        // Another test in this process may have built a server first; whichever stores
+        // were installed first are the ones every later reader sees.
         super::install_stores("/stores/ollama", "/stores/hf");
-        assert_eq!(
-            super::ollama_models_dir().to_string_lossy(),
-            "/stores/ollama"
-        );
-        assert_eq!(super::hf_models_dir().to_string_lossy(), "/stores/hf");
-        // A second server keeps the first stores.
-        super::install_stores("/other", "/other");
-        assert_eq!(super::hf_models_dir().to_string_lossy(), "/stores/hf");
+        let (ollama, hf) = (super::ollama_models_dir(), super::hf_models_dir());
+        assert!(!ollama.as_os_str().is_empty() && !hf.as_os_str().is_empty());
+        super::install_stores("/other/ollama", "/other/hf");
+        assert_eq!(super::ollama_models_dir(), ollama);
+        assert_eq!(super::hf_models_dir(), hf);
     }
 }
