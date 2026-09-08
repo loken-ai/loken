@@ -500,3 +500,52 @@ mod tests {
         assert!(matches!(inferred.kv_quant, KvQuant::Q8));
     }
 }
+
+/// The stores the running daemon was configured with, installed once at start.
+///
+/// A loader that resolves a checkpoint without a server handle - the sound, video and
+/// music pipelines among them - reads these, so that every family looks in the store the
+/// configuration names. Without them, one such loader read the test configuration and
+/// looked for weights in a store the daemon was never given.
+static STORES: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+
+/// Record the Ollama and Hugging Face stores of this process. The first call wins; a
+/// server built twice in one process, as tests do, keeps the first.
+pub fn install_stores(ollama: &str, huggingface: &str) {
+    let _ = STORES.set((PathBuf::from(ollama), PathBuf::from(huggingface)));
+}
+
+fn stores() -> (PathBuf, PathBuf) {
+    if let Some(installed) = STORES.get() {
+        return installed.clone();
+    }
+    let cfg = Config::load_default().unwrap_or_else(|_| Config::load_test());
+    (cfg.get_ollama_models_dir(), cfg.get_hf_models_dir())
+}
+
+/// The Ollama store of this process: installed, else the default configuration, else the
+/// test one.
+pub fn ollama_models_dir() -> PathBuf {
+    stores().0
+}
+
+/// The Hugging Face store of this process, resolved like [`ollama_models_dir`].
+pub fn hf_models_dir() -> PathBuf {
+    stores().1
+}
+
+#[cfg(test)]
+mod store_tests {
+    #[test]
+    fn the_installed_stores_are_what_every_loader_reads() {
+        super::install_stores("/stores/ollama", "/stores/hf");
+        assert_eq!(
+            super::ollama_models_dir().to_string_lossy(),
+            "/stores/ollama"
+        );
+        assert_eq!(super::hf_models_dir().to_string_lossy(), "/stores/hf");
+        // A second server keeps the first stores.
+        super::install_stores("/other", "/other");
+        assert_eq!(super::hf_models_dir().to_string_lossy(), "/stores/hf");
+    }
+}

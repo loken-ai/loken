@@ -15,9 +15,7 @@ use std::path::{Path, PathBuf};
 /// The cache proper lives under `hub/`, but a checkpoint published outside the hub layout -
 /// a plain subdirectory of loose safetensors - is resolved from here.
 pub fn models_dir() -> String {
-    crate::config::Config::load_default()
-        .unwrap_or_else(|_| crate::config::Config::load_test())
-        .get_hf_models_dir()
+    crate::config::hf_models_dir()
         .to_string_lossy()
         .into_owned()
 }
@@ -28,9 +26,7 @@ pub fn models_dir() -> String {
 /// written in the wild, so both are accepted and normalised here rather than at each
 /// of the call sites.
 pub fn hub() -> PathBuf {
-    let cfg = crate::config::Config::load_default()
-        .unwrap_or_else(|_| crate::config::Config::load_test());
-    let dir = cfg.get_hf_models_dir();
+    let dir = crate::config::hf_models_dir();
     if dir.file_name().is_some_and(|n| n == "hub") {
         dir
     } else {

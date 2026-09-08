@@ -1025,8 +1025,7 @@ pub fn render_many_sampled(
         // ported for Qwen-Image-Edit's reference latents and keyed to that file. Same VAE,
         // same latent space, different container - handing it the decoder's path fails on
         // the header, which is what it did the first time.
-        let enc_path = crate::config::Config::load_test()
-            .get_hf_models_dir()
+        let enc_path = crate::config::hf_models_dir()
             .join("qwen-image-vae")
             .join("wan_keyed.safetensors");
         let t_enc = std::time::Instant::now();

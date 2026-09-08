@@ -820,7 +820,7 @@ const MAX_LATENT_T: usize = 1024;
 
 /// Resolve the stable-audio model directory from the configured HF models dir.
 pub fn model_dir() -> Option<std::path::PathBuf> {
-    let hf = crate::config::Config::load_test().get_hf_models_dir();
+    let hf = crate::config::hf_models_dir();
     let base = if hf.file_name().is_some_and(|n| n == "hub") {
         hf.parent().map(|p| p.to_path_buf()).unwrap_or(hf)
     } else {

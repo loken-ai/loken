@@ -350,6 +350,12 @@ pub(crate) const VIDEO: Relay = Relay {
     closing: "",
     streams_by_default: false,
 };
+pub(crate) const AUDIO_GENERATIONS: Relay = Relay {
+    path: "/v1/audio/generations",
+    marker: b"",
+    closing: "",
+    streams_by_default: false,
+};
 pub(crate) const CONVERSATION: Relay = Relay {
     path: "/conversation",
     marker: b"",
@@ -966,6 +972,7 @@ impl APIServer {
         inference_config: InferenceConfig,
         keep_alive_minutes: i64,
     ) -> Self {
+        crate::config::install_stores(&ollama_models_dir, &huggingface_models_dir);
         let model_manager = Arc::new(ModelManager::new(
             &ollama_models_dir,
             &huggingface_models_dir,

@@ -335,8 +335,7 @@ impl SdxlPipeline {
         if self.controlnet.is_none() {
             // Resolved from the shared config, like every other model file - the
             // engine does not carry the directory and should not have to.
-            let path = crate::config::Config::load_test()
-                .get_hf_models_dir()
+            let path = crate::config::hf_models_dir()
                 .join(crate::inference::model::sdxl::controlnet::OPENPOSE_SDXL);
             if !path.exists() {
                 return Err(crate::tensor::Error(format!(

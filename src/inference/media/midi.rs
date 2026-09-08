@@ -55,9 +55,7 @@ pub fn render_midi(
     let model_path = if mp.is_absolute() || mp.exists() {
         mp.to_path_buf()
     } else {
-        Config::load_test()
-            .get_ollama_models_dir()
-            .join(model.trim())
+        crate::config::ollama_models_dir().join(model.trim())
     };
 
     let dev = Device::Cpu;
