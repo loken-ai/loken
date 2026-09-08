@@ -564,14 +564,15 @@ impl APIServer {
     pub async fn warm_catalogue(&self) -> (usize, std::time::Duration) {
         let started = std::time::Instant::now();
         let models = self.model_manager.list_models().await.unwrap_or_default();
-        let mut read = 0usize;
+        let mut seen = std::collections::HashSet::new();
         for m in &models {
             if let Some(weights) = self.manifest_layer_path(&m.id, "model") {
                 let _ = ollama::header_facts(&weights);
-                read += 1;
+                seen.insert(weights);
             }
         }
-        (read, started.elapsed())
+        ollama::retain_facts(&seen);
+        (seen.len(), started.elapsed())
     }
 
     pub(crate) fn cluster_handle(&self) -> Option<&Arc<crate::distributed::cluster::Cluster>> {

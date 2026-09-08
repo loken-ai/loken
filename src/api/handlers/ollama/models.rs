@@ -54,6 +54,11 @@ pub(crate) async fn ollama_list_models(
             info!("   Found {} model(s)", count);
             // Stable alphabetical order (mirror 6615f9a on /v1/models).
             models.sort_by(|a, b| a.id.cmp(&b.id));
+            let seen: std::collections::HashSet<std::path::PathBuf> = models
+                .iter()
+                .filter_map(|m| state.manifest_layer_path(&m.id, "model"))
+                .collect();
+            retain_facts(&seen);
 
             let ollama_models: Vec<OllamaModel> = models
                 .into_iter()
@@ -457,23 +462,34 @@ fn gguf_file_type_name(id: u64) -> Option<&'static str> {
     })
 }
 
+type Facts = (Option<String>, Option<String>, Option<u64>);
+type Stamp = (u64, Option<std::time::SystemTime>);
+type FactsCache = std::collections::HashMap<std::path::PathBuf, (Stamp, Facts)>;
+static CACHE: std::sync::OnceLock<std::sync::Mutex<FactsCache>> = std::sync::OnceLock::new();
+
+fn facts_cache() -> &'static std::sync::Mutex<FactsCache> {
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Forget the facts of every file a listing no longer sees, so a removed model leaves no
+/// entry behind.
+pub(crate) fn retain_facts(seen: &std::collections::HashSet<std::path::PathBuf>) {
+    facts_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|path, _| seen.contains(path));
+}
+
 /// The architecture, quantisation label and parameter count a checkpoint declares, read once
 /// per file: a header carries the whole vocabulary, and a catalogue of many models read on
 /// every listing is what made the list take seconds. A file that changed size or date is
 /// read again.
-pub(crate) fn header_facts(
-    path: &std::path::Path,
-) -> (Option<String>, Option<String>, Option<u64>) {
-    type Facts = (Option<String>, Option<String>, Option<u64>);
-    type Stamp = (u64, Option<std::time::SystemTime>);
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (Stamp, Facts)>>,
-    > = std::sync::OnceLock::new();
+pub(crate) fn header_facts(path: &std::path::Path) -> Facts {
     let stamp: Stamp = match std::fs::metadata(path) {
         Ok(m) => (m.len(), m.modified().ok()),
         Err(_) => return (None, None, None),
     };
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache = facts_cache();
     if let Some((seen, facts)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(path) {
         if *seen == stamp {
             return facts.clone();
