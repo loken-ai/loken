@@ -1670,6 +1670,9 @@ pub struct LoadedModelInfo {
     /// Layer distribution across devices (for multi-device models)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layer_distribution: Option<Vec<LayerDistribution>>,
+    /// The window the model is loaded with, for engines that have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u32>,
 }
 
 impl ListLoadedModelsResponse {

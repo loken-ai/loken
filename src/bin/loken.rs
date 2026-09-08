@@ -99,6 +99,131 @@ enum Commands {
 
     /// Show what is currently loaded in memory
     Ps,
+
+    /// Start a coding agent on this daemon: claude or cline
+    Launch {
+        /// The agent to start
+        #[arg(value_parser = ["claude", "cline"])]
+        tool: String,
+
+        /// Model the agent talks to; the one loaded model when there is exactly one
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Write the agent's configuration and stop
+        #[arg(long)]
+        config: bool,
+
+        /// Arguments handed to the agent, after --
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+}
+
+/// The model a launched agent talks to, with the window it is loaded with when it is: the one
+/// asked for, else the one loaded model, else the one model held.
+async fn launch_model(
+    client: &Client,
+    asked: Option<String>,
+) -> Result<(String, Option<u32>), String> {
+    let loaded = client
+        .list_loaded_models()
+        .await
+        .map_err(|e| format!("cannot ask the daemon what is loaded: {e}"))?;
+    let window = |name: &str| {
+        loaded
+            .models
+            .iter()
+            .find(|m| m.model == name)
+            .and_then(|m| m.context_length)
+    };
+    if let Some(model) = asked {
+        let window = window(&model);
+        return Ok((model, window));
+    }
+    if let [one] = loaded.models.as_slice() {
+        return Ok((one.model.clone(), one.context_length));
+    }
+    let held = client
+        .list_models()
+        .await
+        .map_err(|e| format!("cannot list the daemon's models: {e}"))?;
+    if let [one] = held.models.as_slice() {
+        return Ok((one.name.clone(), None));
+    }
+    let names: Vec<&str> = if loaded.models.is_empty() {
+        held.models.iter().map(|m| m.name.as_str()).collect()
+    } else {
+        loaded.models.iter().map(|m| m.model.as_str()).collect()
+    };
+    let has = match names.len() {
+        0 => "no model".to_string(),
+        n if n > NAMES_SHOWN => format!("{n} models; loken list shows them"),
+        _ => names.join(", "),
+    };
+    Err(format!("pass --model; the daemon has {has}"))
+}
+
+/// How many candidate models an error names before pointing at the list.
+const NAMES_SHOWN: usize = 8;
+
+/// Configure the agent, then hand the terminal to it unless only the configuration was asked.
+async fn launch(
+    client: &Client,
+    server: &str,
+    tool: &str,
+    model: Option<String>,
+    config_only: bool,
+    extra: Vec<String>,
+) -> Result<i32, String> {
+    use loken::api::launch::{self as setup, Tool};
+    let tool = Tool::parse(tool).ok_or_else(|| format!("unknown agent {tool}"))?;
+    let (model, window) = launch_model(client, model).await?;
+    let api_key = std::env::var("LOKEN_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
+    let launch = setup::Launch::new(server, &model, api_key).with_context(window);
+
+    let mut command = std::process::Command::new(tool.binary());
+    match tool {
+        Tool::Claude => {
+            let env = setup::claude_env(&launch);
+            if config_only {
+                for (name, value) in &env {
+                    println!("export {name}={value:?}");
+                }
+                println!(
+                    "{} {}",
+                    tool.binary(),
+                    setup::claude_args(&launch).join(" ")
+                );
+                return Ok(0);
+            }
+            command.envs(env).args(setup::claude_args(&launch));
+        }
+        Tool::Cline => {
+            let home = dirs::home_dir().ok_or("no home directory")?;
+            for path in setup::write_cline(&home, &launch).map_err(|e| e.to_string())? {
+                println!("wrote {}", path.display());
+            }
+            if config_only {
+                return Ok(0);
+            }
+        }
+    }
+    match window {
+        Some(window) => println!("{} on {model} at {server}, window {window}", tool.binary()),
+        None => println!("{} on {model} at {server}", tool.binary()),
+    }
+    match command.args(extra).status() {
+        Ok(status) => Ok(status.code().unwrap_or(1)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "{} is not installed. Install it with:\n  {}",
+            tool.binary(),
+            tool.install_hint()
+        )),
+        Err(e) => Err(format!("cannot start {}: {e}", tool.binary())),
+    }
 }
 
 #[tokio::main]
@@ -415,6 +540,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+
+        Commands::Launch {
+            tool,
+            model,
+            config,
+            args,
+        } => match launch(&client, &server_addr, &tool, model, config, args).await {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
     }
 
     Ok(())
@@ -469,5 +607,23 @@ mod tests {
             }
             _ => panic!("Expected Chat command"),
         }
+    }
+
+    #[test]
+    fn launch_takes_the_agent_a_model_and_its_own_arguments() {
+        let cli = Cli::parse_from([
+            "loken", "launch", "claude", "-m", "qwen3:8b", "--", "-p", "hi",
+        ]);
+        match cli.command {
+            Commands::Launch {
+                tool, model, args, ..
+            } => {
+                assert_eq!(tool, "claude");
+                assert_eq!(model, Some("qwen3:8b".to_string()));
+                assert_eq!(args, ["-p", "hi"]);
+            }
+            _ => panic!("Expected Launch command"),
+        }
+        assert!(Cli::try_parse_from(["loken", "launch", "codex"]).is_err());
     }
 }

@@ -36,6 +36,7 @@ pub(crate) async fn list_loaded_models(
             size_bytes: Some(model_size),
             num_layers,
             layer_distribution,
+            context_length: Some(state.default_inference_config.context_length as u32),
         });
     }
 
@@ -65,6 +66,7 @@ pub(crate) async fn list_loaded_models(
             size_bytes: None,
             num_layers: Some(img_info.total_layers),
             layer_distribution: Some(layer_distribution),
+            context_length: None,
         });
     }
 
@@ -86,6 +88,7 @@ pub(crate) async fn list_loaded_models(
             size_bytes: None,
             num_layers: None,
             layer_distribution: None,
+            context_length: None,
         });
     }
 
@@ -109,6 +112,7 @@ pub(crate) async fn list_loaded_models(
             size_bytes: None,
             num_layers: None,
             layer_distribution: None,
+            context_length: None,
         });
     }
 

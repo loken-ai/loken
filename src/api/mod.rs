@@ -28,6 +28,7 @@ pub mod image_paths {
 }
 mod anthropic;
 mod client;
+pub mod launch;
 pub(crate) mod thinking;
 mod tool_calls;
 

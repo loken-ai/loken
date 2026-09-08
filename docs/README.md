@@ -24,6 +24,7 @@ Read in this order.
 |---|---|
 | [`guides/openai-sdk.md`](guides/openai-sdk.md) | Serve a chat model to an OpenAI client |
 | [`guides/ollama-clients.md`](guides/ollama-clients.md) | Point an Ollama client at loken |
+| [`guides/agents.md`](guides/agents.md) | Run Claude Code or Cline on loken |
 | [`guides/images.md`](guides/images.md) | Generate an image |
 | [`guides/speech.md`](guides/speech.md) | Transcribe and synthesise speech |
 | [`guides/drafter.md`](guides/drafter.md) | Speed up a model that spills to the host with a drafter |

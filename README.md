@@ -34,6 +34,7 @@ configure one.
 |---|---|---|---|
 | Chat and completion, streamed or whole | `/v1/chat/completions`, `/v1/completions`, `/api/chat`, `/api/generate`, `/v1/messages` | `model_id`, `context_length` | Measured against ollama, [STATUS](docs/STATUS.md#decode-rate-vs-ollama) |
 | Responses API | `/v1/responses` | | Runs |
+| Coding agents on the daemon | `loken launch claude`, `loken launch cline` | | Runs, [guide](docs/guides/agents.md) |
 | Tools, JSON schema, grammar-constrained output | the chat routes, `tool_choice`, `response_format` | | Runs |
 | Reasoning apart from the answer, Harmony included | the chat routes, `think`, `reasoning_effort` | | Runs |
 | Vision and speech in a chat turn | the chat routes, image and audio content | | Runs |
