@@ -55,7 +55,7 @@ pub struct Launch {
     pub model: String,
     /// The key the daemon expects, when it requires one.
     pub api_key: Option<String>,
-    /// The window the daemon loads the model with, when known.
+    /// The window the checkpoint declares, when known.
     pub context: Option<u32>,
 }
 
@@ -77,7 +77,7 @@ impl Launch {
 
 /// The environment Claude Code reads: the Messages API endpoint, the credential, the model
 /// behind every tier so that no request leaves for the vendor, and the window it compacts
-/// within when the daemon told it.
+/// within when the checkpoint declares one.
 pub fn claude_env(launch: &Launch) -> Vec<(String, String)> {
     let token = launch
         .api_key

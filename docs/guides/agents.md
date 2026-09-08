@@ -20,7 +20,7 @@ loken launch claude -- -p "explain this repository"
 
 | Agent | Where it reads | What is set |
 |---|---|---|
-| Claude Code | the environment of the process | `ANTHROPIC_BASE_URL` on the daemon, `ANTHROPIC_AUTH_TOKEN`, an empty `ANTHROPIC_API_KEY`, the model behind every tier: opus, sonnet, haiku and subagents, and the window the model is loaded with, so the session compacts within it |
+| Claude Code | the environment of the process | `ANTHROPIC_BASE_URL` on the daemon, `ANTHROPIC_AUTH_TOKEN`, an empty `ANTHROPIC_API_KEY`, the model behind every tier: opus, sonnet, haiku and subagents, and the window the checkpoint declares, so the session compacts within it |
 | Cline | `~/.cline/data/settings/providers.json` and `~/.cline/data/globalState.json` | the Ollama provider on the daemon for both modes, the model, the welcome screen behind. The previous file stays next to it as `.bak` |
 
 `--config` writes or prints the configuration and stops, so the agent can be started by hand or

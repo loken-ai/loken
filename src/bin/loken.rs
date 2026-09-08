@@ -120,36 +120,25 @@ enum Commands {
     },
 }
 
-/// The model a launched agent talks to, with the window it is loaded with when it is: the one
-/// asked for, else the one loaded model, else the one model held.
-async fn launch_model(
-    client: &Client,
-    asked: Option<String>,
-) -> Result<(String, Option<u32>), String> {
+/// The model a launched agent talks to: the one asked for, else the one loaded model, else
+/// the one model held.
+async fn launch_model(client: &Client, asked: Option<String>) -> Result<String, String> {
+    if let Some(model) = asked {
+        return Ok(model);
+    }
     let loaded = client
         .list_loaded_models()
         .await
         .map_err(|e| format!("cannot ask the daemon what is loaded: {e}"))?;
-    let window = |name: &str| {
-        loaded
-            .models
-            .iter()
-            .find(|m| m.model == name)
-            .and_then(|m| m.context_length)
-    };
-    if let Some(model) = asked {
-        let window = window(&model);
-        return Ok((model, window));
-    }
     if let [one] = loaded.models.as_slice() {
-        return Ok((one.model.clone(), one.context_length));
+        return Ok(one.model.clone());
     }
     let held = client
         .list_models()
         .await
         .map_err(|e| format!("cannot list the daemon's models: {e}"))?;
     if let [one] = held.models.as_slice() {
-        return Ok((one.name.clone(), None));
+        return Ok(one.name.clone());
     }
     let names: Vec<&str> = if loaded.models.is_empty() {
         held.models.iter().map(|m| m.name.as_str()).collect()
@@ -167,6 +156,17 @@ async fn launch_model(
 /// How many candidate models an error names before pointing at the list.
 const NAMES_SHOWN: usize = 8;
 
+/// The window the checkpoint declares, which is the most the daemon grants a request.
+async fn declared_window(client: &Client, model: &str) -> Option<u32> {
+    let shown = client.show_model(model).await.ok()?;
+    shown
+        .model_info?
+        .iter()
+        .find(|(key, _)| key.ends_with(".context_length"))
+        .and_then(|(_, value)| value.as_u64())
+        .map(|n| n as u32)
+}
+
 /// Configure the agent, then hand the terminal to it unless only the configuration was asked.
 async fn launch(
     client: &Client,
@@ -178,7 +178,8 @@ async fn launch(
 ) -> Result<i32, String> {
     use loken::api::launch::{self as setup, Tool};
     let tool = Tool::parse(tool).ok_or_else(|| format!("unknown agent {tool}"))?;
-    let (model, window) = launch_model(client, model).await?;
+    let model = launch_model(client, model).await?;
+    let window = declared_window(client, &model).await;
     let api_key = std::env::var("LOKEN_API_KEY")
         .ok()
         .filter(|k| !k.is_empty());
