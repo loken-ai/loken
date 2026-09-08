@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
   schedule:
     # The native test suite runs weekly; a push runs it on the portable binary only.
     - cron: "0 6 * * 1"
