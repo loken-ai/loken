@@ -232,14 +232,27 @@ impl Cluster {
                 is_self: true,
                 state: (*state).clone(),
             })
-            .chain(members.known().map(|(node, state)| PeerView {
-                node_id: node.clone(),
-                endpoint: urls.get(node).cloned(),
-                alive: alive.contains(node),
-                phi: members.phi(node, now_ms),
-                rtt_ms: rtt.get(node).copied(),
-                is_self: *node == self.config.node_id,
-                state: state.clone(),
+            .chain(members.known().map(|(node, state)| {
+                // Once a decision has put this node in the table, its entry ages like a
+                // peer's between decisions; the node answering this request is alive.
+                let is_self = *node == self.config.node_id;
+                PeerView {
+                    node_id: node.clone(),
+                    endpoint: urls.get(node).cloned(),
+                    alive: is_self || alive.contains(node),
+                    phi: if is_self {
+                        None
+                    } else {
+                        members.phi(node, now_ms)
+                    },
+                    rtt_ms: if is_self {
+                        Some(0.0)
+                    } else {
+                        rtt.get(node).copied()
+                    },
+                    is_self,
+                    state: state.clone(),
+                }
             }))
             .collect();
         out.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -335,14 +348,21 @@ impl Cluster {
         // node priced itself at the unknown-peer floor and handed over work it would have
         // finished eighty times faster - the exact mirror of the bug where it never handed
         // over at all.
+        // This node's own state, known first-hand. Read before any decision that assumes a
+        // local option exists: a node without the weights has none.
+        let here = members
+            .state_of(&self.config.node_id)
+            .cloned()
+            .unwrap_or_default();
         let mut rates = rates;
         if !rates.contains_key(&self.config.node_id) {
             let own = super::rate_meter::snapshot(&req.model);
-            if own.decode_tok_per_s <= 0.0 {
+            if own.decode_tok_per_s <= 0.0 && super::routing::can_serve(&here, &req.model) {
                 // Bootstrap: with neither a measurement nor a hardware prior this node
                 // cannot compare itself to anyone - priced at the unknown floor it would
                 // forward everything and never measure itself. The first request stays
-                // home and becomes the meter.
+                // home and becomes the meter. Only where home can serve it at all: a model
+                // this node does not hold has no meter to become.
                 return Decision::Local {
                     reason: "no local price for this model yet".into(),
                 };
@@ -388,10 +408,6 @@ impl Cluster {
         // it is what every other estimate is worth comparing against - including when the
         // winner IS this node, which is the case a breakdown emitted only on hand-over can
         // never show.
-        let here = members
-            .state_of(&self.config.node_id)
-            .cloned()
-            .unwrap_or_default();
         let local_rates = rates.get(&self.config.node_id).copied().unwrap_or_default();
         let local = super::routing::estimate(
             &self.config.node_id,
@@ -544,6 +560,46 @@ mod tests {
             c.decide(&shape(), 0, false, &nothing_cached()),
             Decision::Local { .. }
         ));
+    }
+
+    /// A node that does not hold the weights has nothing to keep at home: before it has
+    /// priced itself, it still hands the request to the peer that serves the model.
+    #[test]
+    fn a_node_without_the_weights_hands_over_before_it_has_a_price() {
+        let c = Cluster::new(cfg(&["http://b:11435"]));
+        c.publish_local(NodeState {
+            serves: Some(vec!["other:1b".into()]),
+            ..Default::default()
+        });
+        c.observe_peer(
+            &"b".into(),
+            "http://b:11435",
+            0,
+            free(),
+            quick(),
+            HashMap::new(),
+            1.0,
+        );
+        match c.decide(&shape(), 0, false, &nothing_cached()) {
+            Decision::Forward { peer, .. } => assert_eq!(peer, "b"),
+            d => panic!("expected a hand-over, got {d:?}"),
+        }
+    }
+
+    /// The node answering a peers query is alive by definition, however long ago a routing
+    /// decision last refreshed its own entry in the table.
+    #[test]
+    fn the_node_itself_stays_alive_in_its_own_peers_view() {
+        let c = Cluster::new(cfg(&["http://b:11435"]));
+        c.publish_local(free());
+        let _ = c.decide(&shape(), 0, false, &nothing_cached());
+        let much_later = 600_000;
+        let me = c
+            .peer_view(much_later)
+            .into_iter()
+            .find(|p| p.is_self)
+            .expect("the node lists itself");
+        assert!(me.alive, "the answering node reported itself dead");
     }
 
     /// The hand-over: this node is saturated, a peer is free, and the request goes there.
