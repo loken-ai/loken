@@ -155,6 +155,8 @@ pub(crate) async fn audio_separate(state: State<APIServer>, mut multipart: Multi
     let dir = state.huggingface_models_dir.clone();
     let started = std::time::Instant::now();
     // Decode, separate and mix down are all blocking compute.
+    // One media job at a time: the separation takes a card for its windows.
+    let _media_guard = state.media_lock_for(SEPARATION_MODEL, "separation").await;
     let done = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>, f32), String> {
         let (left, right) = decode_to_stereo_44k(&bytes)?;
         let frames = left.len();

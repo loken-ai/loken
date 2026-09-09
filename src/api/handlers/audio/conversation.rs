@@ -321,8 +321,12 @@ pub(super) async fn conversation_image_stream(
     };
     let geom = crate::inference::place::runtime_demand::RequestGeometry::new(side, side);
     let subject = image_subject(&user_text);
+    // One media job at a time, and this render listed for as long as it runs: the guard
+    // moves into the stream, which is what renders after this call returns.
+    let media_guard = state.media_lock_for(&model, "image").await;
 
     let stream = async_stream::stream! {
+        let _media_guard = media_guard;
         let (load_tx, mut load_rx) =
             tokio::sync::mpsc::channel::<ImageEngineLoadingProgress>(32);
         let load_state = state.clone();
@@ -617,6 +621,7 @@ pub(crate) async fn conversation_handler(
                 );
             }
             let subject = image_subject(&user_text);
+            let _media_guard = state.media_lock_for(&model, "image").await;
             match state
                 .image_engine
                 .generate_image(&subject, ImageGenParams::default())
@@ -668,6 +673,7 @@ pub(crate) async fn conversation_handler(
                 );
             }
             let text = tts_text(&user_text, &messages);
+            let _job = state.media_note(model.as_deref().unwrap_or("speech"), "speech");
             match state
                 .tts_engine
                 .synthesize(text.clone(), TtsSynthParams::default())
@@ -696,11 +702,14 @@ pub(crate) async fn conversation_handler(
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(1);
             let subj = subject.clone();
+            let media_guard = state.media_lock_for("stable-audio", "sound").await;
+            let place_fn = media_guard.reporter().placement_fn();
             // A dropped request must stop the sampler: it runs in spawn_blocking,
             // so the step hook is the only place it can observe the cancellation.
             let cancel = crate::inference::serve::cancel::CancelToken::new();
             let guard = crate::inference::serve::cancel::CancelGuard::new(cancel.clone());
             let rendered = tokio::task::spawn_blocking(move || {
+                let _placed = crate::inference::serve::progress::placement::publish(place_fn);
                 match crate::inference::model::stable_audio::render(
                     &subj,
                     "",
@@ -789,6 +798,7 @@ pub(crate) async fn voice_handler(
         collect_metrics: false,
         initial_prompt: None,
     };
+    let asr_job = state.media_note(&asr_model, "transcription");
     let (transcript, detected_lang) =
         match state.audio_engine.transcribe(samples, sr, asr_params).await {
             Ok(r) => (r.text.trim().to_string(), r.language),
@@ -801,6 +811,7 @@ pub(crate) async fn voice_handler(
         };
 
     // -- 2. LLM reply (transcript folded into the shared history) ---------
+    drop(asr_job);
     let model = s("model").unwrap_or_else(|| state.default_inference_config.model_id.clone());
     let max_tokens = req
         .get("max_tokens")
@@ -874,6 +885,7 @@ pub(crate) async fn voice_handler(
     // fail to, on a string match that has nothing to do with what was asked.
     let postprocess = base_voice.is_some();
     if let Some(base) = base_voice {
+        let _job = state.media_note(&base, "speech");
         if let Err(e) = ensure_tts_model_loaded(&state, Some(&base)).await {
             return conv_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
