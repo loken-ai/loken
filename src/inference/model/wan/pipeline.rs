@@ -142,6 +142,28 @@ static WAN_VAE_CPU_CACHE: std::sync::OnceLock<
     std::sync::Mutex<Option<std::sync::Arc<crate::inference::model::wan::vae::WanVaeDecoder>>>,
 > = std::sync::OnceLock::new();
 
+/// What the video pipeline keeps between renders, on the host, and where: the text
+/// encoder's half-precision staging and the decoder's CPU copy. Empty when nothing is
+/// cached or a render holds the cache.
+pub fn host_parts() -> crate::inference::serve::progress::placement::Parts {
+    let mut parts = Vec::new();
+    if let Some(m) = UMT5_CPU_CACHE.get() {
+        if let Ok(g) = m.try_lock() {
+            if let Some(enc) = g.as_ref() {
+                parts.push(("text-encoder host staging".to_string(), enc.placement()));
+            }
+        }
+    }
+    if let Some(m) = WAN_VAE_CPU_CACHE.get() {
+        if let Ok(g) = m.try_lock() {
+            if let Some(dec) = g.as_ref() {
+                parts.push(("vae host staging".to_string(), dec.placement()));
+            }
+        }
+    }
+    parts
+}
+
 /// Register the umT5 f16 host staging with the host-cache registry so RAM-pressured CPU
 /// plans can drop it (it re-parses on the next video render). try_lock: never drop while a
 /// render holds it.
@@ -323,6 +345,8 @@ fn encode_all(
             Err(e) => return Err(e),
         }
     };
+    let _enc_part =
+        crate::inference::serve::progress::placement::part("text-encoder", &enc.placement());
     let load_s = t0.elapsed().as_secs_f32();
     let placed = enc.device();
     let t1 = std::time::Instant::now(); // encode-forward only (load excluded)
@@ -860,6 +884,7 @@ pub fn render_many_sampled(
         );
     }
     let dit = WanDit::load_variant(variant, peak_tokens, checkpoint, progress)?;
+    let dit_part = crate::inference::serve::progress::placement::part("dit", &dit.placement());
     eprintln!(
         "[wan] DiT ({variant:?}) loaded in {:.1}s",
         t1.elapsed().as_secs_f32()
@@ -964,6 +989,14 @@ pub fn render_many_sampled(
             Err(e) => return Err(e),
         }
     };
+    // The decoder's part follows the decoder: on a card, on the host, back on a card.
+    let mut _dec_part = crate::inference::serve::progress::placement::part(
+        "vae",
+        &dec_gpu
+            .as_ref()
+            .map(|d| d.placement())
+            .unwrap_or_else(|| dec_cpu.placement()),
+    );
 
     let n_lat = LATENT_CH * f_lat * hl * wl;
 
@@ -1013,8 +1046,11 @@ pub fn render_many_sampled(
             clip_path.to_str().unwrap_or_default(),
             &one_shot,
         )?;
+        let tower_part =
+            crate::inference::serve::progress::placement::part("clip", &tower.placement());
         let clip = tower.embed_image(rgb, iw, ih)?.flatten_all()?.to_vec_f32();
         drop(tower);
+        drop(tower_part);
         eprintln!(
             "[wan] start-frame CLIP on {one_shot:?} in {:.1}s",
             t_clip.elapsed().as_secs_f32()
@@ -1041,6 +1077,8 @@ pub fn render_many_sampled(
             enc_path.to_str().unwrap_or_default(),
             &enc_dev,
         )?;
+        let enc_part =
+            crate::inference::serve::progress::placement::part("vae-encoder", &enc.placement());
         let px = resize_rgb_to(rgb, iw, ih, width, height);
         let img = Tensor::from_vec_f32(px, (3, 1, height, width))?.to_device(&enc_dev)?;
         let z = enc.encode(&img)?; // [16, 1, hl, wl]
@@ -1054,6 +1092,7 @@ pub fn render_many_sampled(
             .to_device(&enc_dev)?;
         let z_black = enc.encode(&pad)?;
         drop(enc);
+        drop(enc_part);
         eprintln!(
             "[wan] start-frame VAE encode on {enc_dev:?} in {:.1}s",
             t_enc.elapsed().as_secs_f32()
@@ -1285,6 +1324,8 @@ pub fn render_many_sampled(
                              decoder back to the GPU",
                         free_now as f64 / 1e9
                     );
+                    _dec_part =
+                        crate::inference::serve::progress::placement::part("vae", &d.placement());
                     dec_gpu = Some(d);
                 }
             }
@@ -1314,6 +1355,10 @@ pub fn render_many_sampled(
                         // permanent decision: the check at the top of the loop moves the
                         // decoder back as soon as the card has room again.
                         dec_gpu = None;
+                        _dec_part = crate::inference::serve::progress::placement::part(
+                            "vae",
+                            &dec_cpu.placement(),
+                        );
                         dec_cpu.decode_reporting(&latent, cancel, Some(on_dec))?
                     }
                     Err(e) => return Err(e),
@@ -1331,7 +1376,7 @@ pub fn render_many_sampled(
         clips.push(frames);
     }
     drop(dit);
-    crate::inference::serve::progress::placement::gone("dit");
+    drop(dit_part);
     Ok(clips)
 }
 

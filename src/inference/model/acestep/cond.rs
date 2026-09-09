@@ -391,3 +391,13 @@ mod tests {
         assert!(c > 0.999, "full cond cosine {c} too low");
     }
 }
+
+impl CondModel {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(
+            &self.device,
+            self.lyric_layers.len() + self.timbre_layers.len(),
+        )
+    }
+}

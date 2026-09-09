@@ -874,6 +874,23 @@ fn resident_slot() -> &'static std::sync::Mutex<Option<std::sync::Arc<SaoResiden
     SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// The parts of the resident pipeline and where each sits; none when nothing is resident.
+pub fn resident_parts() -> Option<crate::inference::serve::progress::placement::Parts> {
+    let slot = resident_slot().try_lock().ok()?;
+    let r = slot.as_ref()?;
+    let mut parts = vec![
+        ("text-encoder".to_string(), r.t5.placement()),
+        ("dit".to_string(), r.dit.placement()),
+        ("vae".to_string(), r.decoder.placement()),
+    ];
+    if let Ok(enc) = r.encoder.try_lock() {
+        if let Some(enc) = enc.as_ref() {
+            parts.push(("vae-encoder".to_string(), enc.placement()));
+        }
+    }
+    Some(parts)
+}
+
 /// Is the pipeline resident right now?
 ///
 /// The unload contract has to be able to ask before it answers: a request naming
@@ -1468,3 +1485,33 @@ mod op_determinism {
 
 #[cfg(test)]
 mod tests;
+
+impl OobleckDecoder {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(
+            &self.head.weight.device(),
+            self.blocks.len(),
+        )
+    }
+}
+
+impl OobleckEncoder {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(
+            &self.head.weight.device(),
+            self.blocks.len(),
+        )
+    }
+}
+
+impl SaoDit {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::runs(
+            self.block_devices.iter().map(|d| d.location()),
+            0,
+        )
+    }
+}

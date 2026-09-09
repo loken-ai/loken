@@ -537,13 +537,6 @@ impl WanDit {
                 device: dv,
             });
         }
-        crate::inference::serve::progress::placement::note(
-            "dit",
-            &crate::inference::serve::progress::placement::runs(
-                blocks.iter().map(|b| b.device.location()),
-                weights / N_LAYERS as u64,
-            ),
-        );
         Ok(WanDit {
             patch_w,
             patch_b: f16("patch_embedding.bias")?,
@@ -800,13 +793,6 @@ impl WanDit {
         } else {
             None
         };
-        crate::inference::serve::progress::placement::note(
-            "dit",
-            &crate::inference::serve::progress::placement::runs(
-                blocks.iter().map(|b| b.device.location()),
-                model_size / N_LAYERS as u64,
-            ),
-        );
         Ok(WanDit {
             patch_w: wan_load_t(&device, &c, &mut f, "patch_embedding.weight")?
                 .reshape((DIM, in_ch, PATCH_H, PATCH_W))?,
@@ -2079,5 +2065,15 @@ mod i2v_distill_tests {
             wan_distilled_defaults(Path::new("/m/Wan.I2V.14b.Q8_0.gguf")),
             None
         );
+    }
+}
+
+impl WanDit {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::runs(
+            self.blocks.iter().map(|b| b.device.location()),
+            0,
+        )
     }
 }

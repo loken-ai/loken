@@ -502,3 +502,10 @@ mod causal_mask_tests {
         Ok(())
     }
 }
+
+impl Decoder {
+    /// How many blocks the decoder stacks.
+    pub fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+}

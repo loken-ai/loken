@@ -296,3 +296,13 @@ impl HeliumTransformer {
         Ok(h)
     }
 }
+
+impl HeliumTransformer {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::runs(
+            self.layers.iter().map(|l| l.device.location()),
+            0,
+        )
+    }
+}

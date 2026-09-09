@@ -327,3 +327,10 @@ mod tests {
         );
     }
 }
+
+impl ClipVisionH {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(&self.device, self.layers.len())
+    }
+}

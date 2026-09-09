@@ -470,6 +470,7 @@ pub fn render_with_progress(
             cfg.ref_audio_strength
         );
         let enc = OobleckEncoder::from_gguf(&vae_g, 1e-12)?;
+        let _enc_part = ph::placement::part("vae-encoder", &enc.placement());
         let (lat, _c, t_ref) = enc.encode_chunked(&stereo, 2, frames, 512, 64)?;
         println!("[acestep_render] audio2audio: ref latent {t_ref} frames");
         Some((lat, t_ref))
@@ -492,6 +493,7 @@ pub fn render_with_progress(
             }
         }
         let tok = TokEncoder::from_gguf(&dit_g)?;
+        let _tok_part = ph::placement::part("tokenizer", &tok.placement());
         let codes = tok.encode(&fm, *t_ref, &vec![0f32; 5 * 64])?;
         println!(
             "[acestep_render] {task}: {} FSQ codes from the reference (LM skipped)",
@@ -524,6 +526,7 @@ pub fn render_with_progress(
         oom_retry("LM", || -> Result<_, DynErr> {
             let lm_tok = acestep_tokenizer(&lm_g)?;
             let mut lm = Qwen3Lm::from_gguf(&lm_g)?;
+            let lm_part = ph::placement::part("lm", &lm.placement());
             lm.top_k = cfg.top_k;
             // Batched CFG: ONE instance carries cond+uncond as a 2-row batch -> each weight read once.
             // audio2audio pins the length to the reference (max=min=forced_codes) so t matches t_ref.
@@ -546,7 +549,7 @@ pub fn render_with_progress(
                 progress,
             )?;
             drop(lm);
-            ph::placement::gone("lm");
+            drop(lm_part);
             Ok(codes)
         })?
     };
@@ -587,6 +590,7 @@ pub fn render_with_progress(
     // 2) detok -> context (one continuous timeline). OOM-backstopped.
     let context = oom_retry("detok", || -> Result<_, DynErr> {
         let detok = DetokModel::from_gguf(&dit_g)?;
+        let _detok_part = ph::placement::part("detokenizer", &detok.placement());
         Ok(build_context(&detok.decode(&codes)?, t, t, &[]))
     })?;
 
@@ -622,12 +626,15 @@ pub fn render_with_progress(
                 .to_vec()
         };
         let te = TextEncoder::from_gguf(&emb_g)?;
+        let _te_part = ph::placement::part("text-encoder", &te.placement());
         let lyric_embed = te.embed_lookup(&lyric_ids)?;
         let cond = CondModel::from_gguf(&dit_g)?;
+        let _cond_part = ph::placement::part("condition", &cond.placement());
         // Placed for THIS clip: the denoiser attends over the whole latent timeline, so
         // `t` is what decides whether a card can hold the render. A fixed reserve would be
         // the right answer for exactly one length.
         let mut dit = DitModel::from_gguf_for(&dit_g, t)?;
+        let dit_part = ph::placement::part("dit", &dit.placement());
         if !cfg.adapter.trim().is_empty() {
             let n = dit.apply_lora(cfg.adapter.trim(), cfg.adapter_scale)?;
             println!(
@@ -930,7 +937,7 @@ pub fn render_with_progress(
             t1.elapsed().as_secs_f32()
         );
         drop(dit);
-        ph::placement::gone("dit");
+        drop(dit_part);
         Ok(latent)
     })?;
 
@@ -954,6 +961,7 @@ pub fn render_with_progress(
         };
         ph::try_note(progress, ph::phase::DECODE, 0, t)?;
         let vae = OobleckDecoder::from_gguf(&vae_g, 1e-12)?;
+        let vae_part = ph::placement::part("vae", &vae.placement());
         let t2 = std::time::Instant::now();
         // The decode walks the latent in chunks and says where it is at each one; a
         // cancelled render stops at the next chunk.
@@ -972,7 +980,7 @@ pub fn render_with_progress(
         )?;
         println!("[acestep_render] VAE: {:.1}s", t2.elapsed().as_secs_f32());
         drop(vae);
-        ph::placement::gone("vae");
+        drop(vae_part);
         Ok(r)
     })?;
     // Clean the tail: the VAE emits a steady low-level noise floor even after the music

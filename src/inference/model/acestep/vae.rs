@@ -681,13 +681,6 @@ impl OobleckDecoder {
         }
         let snake_final = vae_load_snake(&content, &mut file, "decoder.snake1", &dev)?;
         let conv2 = vae_load_conv(&content, &mut file, "decoder.conv2", false, eps, &dev)?;
-        crate::inference::serve::progress::placement::note(
-            "vae",
-            &crate::inference::serve::progress::placement::runs(
-                blocks.iter().map(|_| dev.location()),
-                model_size / blocks.len().max(1) as u64,
-            ),
-        );
         Ok(OobleckDecoder {
             conv1,
             blocks,
@@ -1709,5 +1702,19 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+impl OobleckDecoder {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(&self.device, self.blocks.len())
+    }
+}
+
+impl OobleckEncoder {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(&self.device, self.blocks.len())
     }
 }

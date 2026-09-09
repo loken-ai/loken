@@ -216,3 +216,10 @@ mod tests {
         assert!(c > 0.999, "text encoder cosine {c} too low");
     }
 }
+
+impl TextEncoder {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(&self.device, self.layers.len())
+    }
+}

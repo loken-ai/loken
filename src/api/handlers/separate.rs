@@ -26,13 +26,21 @@ use crate::inference::codec::melband::{MelBandRoformer, SAMPLE_RATE};
 ///
 /// Loaded once and kept: the checkpoint is hundreds of megabytes and a per-request
 /// load would dominate the separation itself.
+// Only a SUCCESS is remembered. `get_or_init` over a `Result` caches the failure too,
+// so a first request made before the weights were installed made every later request
+// fail for the life of the process - telling the user to install what they had just
+// installed. An error now propagates without being written down.
+static NET: std::sync::OnceLock<MelBandRoformer> = std::sync::OnceLock::new();
+
+/// The catalogue name of the separation model.
+pub(crate) const SEPARATION_MODEL: &str = "melband-roformer";
+
+/// Where the resident separation model sits; none when it has not been loaded.
+pub(crate) fn resident_parts() -> Option<crate::inference::serve::progress::placement::Parts> {
+    NET.get().map(|net| vec![(String::new(), net.placement())])
+}
+
 fn model(hf_models_dir: &str) -> Result<&'static MelBandRoformer, String> {
-    use std::sync::OnceLock;
-    // Only a SUCCESS is remembered. `get_or_init` over a `Result` caches the failure too,
-    // so a first request made before the weights were installed made every later request
-    // fail for the life of the process - telling the user to install what they had just
-    // installed. An error now propagates without being written down.
-    static NET: OnceLock<MelBandRoformer> = OnceLock::new();
     if let Some(m) = NET.get() {
         return Ok(m);
     }

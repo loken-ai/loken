@@ -224,6 +224,50 @@ pub mod placement {
         note(part, &[]);
     }
 
+    /// The placed parts of a model, each named, in the order they were loaded.
+    pub type Parts = Vec<(String, Vec<Placed>)>;
+
+    /// A part of a render that is placed for as long as this guard lives: reported to the
+    /// reporter in force when it is made, withdrawn from the same reporter when dropped.
+    /// Held beside the model it describes, so the two go together.
+    #[must_use = "the part is reported gone when the guard drops"]
+    pub struct Part {
+        name: String,
+        reporter: Option<SharedPlacementFn>,
+    }
+
+    impl Part {
+        pub fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    impl Drop for Part {
+        fn drop(&mut self) {
+            if let Some(f) = &self.reporter {
+                f(&self.name, &[]);
+            }
+        }
+    }
+
+    /// Report `part` as placed on `runs` until the returned guard drops.
+    pub fn part(name: &str, runs: &[Placed]) -> Part {
+        let reporter = current();
+        if let Some(f) = &reporter {
+            f(name, runs);
+        }
+        Part {
+            name: name.to_string(),
+            reporter,
+        }
+    }
+
+    /// A model that sits whole on one device, counted as `blocks` layers there, one when
+    /// it has no block structure to count.
+    pub fn whole(device: &crate::tensor::Device, blocks: usize) -> Vec<Placed> {
+        runs(std::iter::repeat_n(device.location(), blocks.max(1)), 0)
+    }
+
     /// The runs of a model whose layers sit on `devices`, in layer order, each layer
     /// weighing `bytes_per_layer`.
     pub fn runs(
@@ -280,6 +324,27 @@ pub mod placement {
                     },
                 ]
             );
+        }
+
+        #[test]
+        fn a_part_is_withdrawn_from_its_own_reporter_when_dropped() {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = seen.clone();
+            let guard = {
+                let _scope = publish(Arc::new(move |part: &str, runs: &[Placed]| {
+                    sink.lock().unwrap().push((part.to_string(), runs.len()));
+                }));
+                part("dit", &whole(&crate::tensor::Device::Cpu, 24))
+            };
+            assert_eq!(guard.name(), "dit");
+            // The reporter is no longer in force on this thread; the guard still knows it.
+            drop(guard);
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![("dit".to_string(), 1), ("dit".to_string(), 0)]
+            );
+            assert_eq!(whole(&crate::tensor::Device::Cpu, 0).len(), 1);
+            assert_eq!(whole(&crate::tensor::Device::Cpu, 5)[0].layer_end, 5);
         }
 
         #[test]

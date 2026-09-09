@@ -403,3 +403,17 @@ mod tests {
         );
     }
 }
+
+impl AudioEncoder {
+    /// How many blocks the encoder stacks.
+    pub fn n_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
+impl TextDecoder {
+    /// How many blocks the decoder stacks.
+    pub fn n_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+}

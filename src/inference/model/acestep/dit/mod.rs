@@ -512,13 +512,6 @@ impl DitModel {
                 device: ld,
             });
         }
-        crate::inference::serve::progress::placement::note(
-            "dit",
-            &crate::inference::serve::progress::placement::runs(
-                layers.iter().map(|l| l.device.location()),
-                model_size / n_layers.max(1) as u64,
-            ),
-        );
         Ok(DitModel {
             proj_in: dit_lin(&device, &c, &mut f, "decoder.proj_in.1", true)?,
             cond_emb: dit_lin(&device, &c, &mut f, "decoder.condition_embedder", true)?,
@@ -1392,3 +1385,13 @@ impl DitModel {
 
 #[cfg(test)]
 mod tests;
+
+impl DitModel {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::runs(
+            self.layers.iter().map(|l| l.device.location()),
+            0,
+        )
+    }
+}

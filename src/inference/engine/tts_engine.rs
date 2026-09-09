@@ -250,6 +250,28 @@ impl TtsEngine {
             })
     }
 
+    /// The parts of the resident model and where each sits; none when nothing is loaded
+    /// or the model is at work under its lock.
+    pub fn parts(&self) -> Option<crate::inference::serve::progress::placement::Parts> {
+        use crate::inference::serve::progress::placement::whole;
+        let guard = self.model_state.try_lock().ok()?;
+        let state = guard.as_ref()?;
+        let part = |name: &str, runs| (name.to_string(), runs);
+        Some(match &state.backend {
+            Backend::Parler(p) => vec![
+                part("text-encoder", whole(&state.device, 1)),
+                part("decoder", whole(&state.device, p.model.decoder.n_layers())),
+            ],
+            Backend::Piper(voice) => vec![part("", voice.placement())],
+            Backend::PocketTts(p) => vec![part("flow-lm", p.model.placement())],
+            Backend::Kyutai(k) => vec![
+                part("lm", k.lm.placement()),
+                part("depformer", k.depformer.placement()),
+                part("mimi", k.mimi.placement()),
+            ],
+        })
+    }
+
     pub async fn unload(&self) {
         let mut g = self.model_state.lock().await;
         if g.is_some() {

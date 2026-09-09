@@ -737,3 +737,13 @@ mod tests {
         );
     }
 }
+
+impl EzAudioDiT {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::runs(
+            self.block_devices.iter().map(|d| d.location()),
+            0,
+        )
+    }
+}

@@ -507,13 +507,6 @@ impl Qwen3Lm {
             .narrow(0, cand_base, vocab - cand_base)?
             .contiguous()?;
         let norm_t = norm_t("model.norm.weight".to_string(), h, vec![1, 1, h], &primary)?;
-        crate::inference::serve::progress::placement::note(
-            "lm",
-            &crate::inference::serve::progress::placement::runs(
-                layers.iter().map(|l| l.device.location()),
-                model_size / n_layers.max(1) as u64,
-            ),
-        );
         Ok(Qwen3Lm {
             embed,
             embed_audio,
@@ -2001,5 +1994,15 @@ mod demand_tests {
         let demand = super::placement_demand(path.to_str().unwrap());
         assert!(demand > 4096 + super::kv_bytes_per_layer());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+impl Qwen3Lm {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::runs(
+            self.layers.iter().map(|l| l.device.location()),
+            0,
+        )
     }
 }

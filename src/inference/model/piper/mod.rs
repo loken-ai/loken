@@ -843,6 +843,11 @@ pub struct PiperVoice {
 }
 
 impl PiperVoice {
+    /// Where the voice's model sits.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        self.model.placement()
+    }
+
     pub fn load(onnx_path: &std::path::Path, dev: &Device) -> Result<Self> {
         let model = PiperModel::load(onnx_path, dev)?;
         let json_path = format!("{}.json", onnx_path.display());
@@ -1307,5 +1312,12 @@ mod french_fallback_tests {
     fn a_lookalike_prefix_does_not_count() {
         assert!(!voice_is_french("fra"));
         assert!(!voice_is_french("frisian"));
+    }
+}
+
+impl PiperModel {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(&self.device, self.enc.layers.len())
     }
 }

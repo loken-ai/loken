@@ -796,3 +796,60 @@ async fn the_media_gate_outlives_the_handler_that_took_it() {
     drop(second);
     assert!(state.media_jobs().is_empty());
 }
+
+#[test]
+fn a_model_is_listed_once_per_placed_part_with_its_layers() {
+    use crate::inference::serve::progress::placement::{runs, whole};
+    use crate::tensor::{Device, DeviceLocation};
+    let mut out = Vec::new();
+    let parts = vec![
+        (
+            "lm".to_string(),
+            runs(
+                [
+                    DeviceLocation::Cuda { gpu_id: 0 },
+                    DeviceLocation::Cuda { gpu_id: 1 },
+                    DeviceLocation::Cuda { gpu_id: 1 },
+                ],
+                4,
+            ),
+        ),
+        ("mimi".to_string(), whole(&Device::Cpu, 2)),
+    ];
+    super::ollama::push_parts(&mut out, "kyutai", "loaded", None, Some(7), &parts);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].model, "kyutai (lm)");
+    assert_eq!(out[0].num_layers, Some(3));
+    assert_eq!(out[0].device.as_deref(), Some("CUDA"));
+    assert_eq!(out[0].size_bytes, Some(12));
+    let dist = out[0].layer_distribution.as_ref().unwrap();
+    assert_eq!(
+        (dist[0].device_id, dist[0].layer_start, dist[0].layer_end),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        (dist[1].device_id, dist[1].layer_start, dist[1].layer_end),
+        (1, 1, 2)
+    );
+    assert_eq!(out[1].model, "kyutai (mimi)");
+    assert_eq!(out[1].device.as_deref(), Some("CPU"));
+    // Bytes the parts do not know fall back to what the engine measured.
+    assert_eq!(out[1].size_bytes, Some(7));
+
+    // A part with no name is the model itself; no part at all is the status alone.
+    let mut out = Vec::new();
+    super::ollama::push_parts(
+        &mut out,
+        "piper",
+        "loaded",
+        None,
+        None,
+        &[(String::new(), whole(&Device::Cpu, 6))],
+    );
+    assert_eq!(out[0].model, "piper");
+    assert_eq!(out[0].num_layers, Some(6));
+    let mut out = Vec::new();
+    super::ollama::push_parts(&mut out, "ace-step", "rendering sound", None, None, &[]);
+    assert_eq!(out[0].status, "rendering sound");
+    assert!(out[0].layer_distribution.is_none());
+}

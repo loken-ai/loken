@@ -70,97 +70,83 @@ pub(crate) async fn list_loaded_models(
         });
     }
 
-    // Include whisper (ASR) if loaded - surfaces in the GUI's
-    // Hardware tab so the user can see VRAM is held by the audio
-    // engine, not just text/image engines. Reads the actual loaded
-    // device kind so a CPU-only fallback also reports correctly.
+    // The transcription model, its two towers by device.
     #[cfg(feature = "audio")]
     if let Some(asr_info) = state.audio_engine.get_loaded_model_info().await {
-        let device = state
-            .audio_engine
-            .loaded_device()
-            .await
-            .unwrap_or_else(|| "CUDA".to_string());
-        loaded_models.push(LoadedModelInfo {
-            model: asr_info.name,
-            status: "loaded".to_string(),
-            device: Some(device),
-            size_bytes: None,
-            num_layers: None,
-            layer_distribution: None,
-            context_length: None,
-        });
+        let parts = state.audio_engine.parts().unwrap_or_default();
+        let device = state.audio_engine.loaded_device().await;
+        push_parts(
+            &mut loaded_models,
+            &asr_info.name,
+            "loaded",
+            device,
+            Some(asr_info.resident_bytes),
+            &parts,
+        );
     }
 
-    // Include parler-tts (or whatever TTS checkpoint is warm) if
-    // loaded. The TtsEngine doesn't expose a topology - just the
-    // name + device kind - but listing it here is enough for the
-    // GUI's Hardware tab "Loaded Models" panel. Parler-tts actually
-    // runs on CUDA (load_parler_blocking calls pick_device which
-    // prefers CUDA0), not CPU as previously hard-coded.
+    // The voice model, by part: a backend has one to three.
     #[cfg(feature = "audio")]
     if let Some(tts_name) = state.tts_engine.loaded_name().await {
-        let device = state
-            .tts_engine
-            .loaded_device()
-            .await
-            .unwrap_or_else(|| "CPU".to_string());
-        loaded_models.push(LoadedModelInfo {
-            model: tts_name,
-            status: "loaded".to_string(),
-            device: Some(device),
-            size_bytes: None,
-            num_layers: None,
-            layer_distribution: None,
-            context_length: None,
-        });
+        let parts = state.tts_engine.parts().unwrap_or_default();
+        let device = state.tts_engine.loaded_device().await;
+        let size = state.tts_engine.resident_bytes().await;
+        push_parts(
+            &mut loaded_models,
+            &tts_name,
+            "loaded",
+            device,
+            (size > 0).then_some(size),
+            &parts,
+        );
+    }
+
+    // The sound pipeline kept between renders.
+    #[cfg(feature = "audio")]
+    if let Some(parts) = crate::inference::model::stable_audio::resident_parts() {
+        push_parts(
+            &mut loaded_models,
+            "stable-audio",
+            "loaded",
+            None,
+            None,
+            &parts,
+        );
+    }
+
+    // The separation model, kept once loaded.
+    #[cfg(feature = "audio")]
+    if let Some(parts) = crate::api::handlers::separate::resident_parts() {
+        push_parts(
+            &mut loaded_models,
+            crate::api::handlers::separate::SEPARATION_MODEL,
+            "loaded",
+            None,
+            None,
+            &parts,
+        );
+    }
+
+    // What the video pipeline stages on the host between renders.
+    #[cfg(feature = "video")]
+    {
+        let parts = crate::inference::model::wan::pipeline::host_parts();
+        if !parts.is_empty() {
+            push_parts(&mut loaded_models, "wan", "loaded", None, None, &parts);
+        }
     }
 
     // What renders now, by the name the request gave: one entry per loaded part with its
     // layers by device, or the bare job while nothing is loaded yet.
     for job in state.media_jobs() {
-        let status = job.status();
-        if job.parts.is_empty() {
-            loaded_models.push(LoadedModelInfo {
-                status,
-                model: job.model,
-                device: None,
-                size_bytes: None,
-                num_layers: None,
-                layer_distribution: None,
-                context_length: None,
-            });
-            continue;
-        }
-        for (part, runs) in &job.parts {
-            let layer_distribution: Vec<crate::api::types::LayerDistribution> = runs
-                .iter()
-                .map(|r| {
-                    let (device_type, device_id) = match r.device {
-                        crate::tensor::DeviceLocation::Cpu => ("CPU".to_string(), 0),
-                        crate::tensor::DeviceLocation::Cuda { gpu_id } => {
-                            ("CUDA".to_string(), gpu_id)
-                        }
-                    };
-                    crate::api::types::LayerDistribution {
-                        device_type,
-                        device_id,
-                        layer_start: r.layer_start as u32,
-                        layer_end: r.layer_end.saturating_sub(1) as u32,
-                        memory_bytes: r.bytes,
-                    }
-                })
-                .collect();
-            loaded_models.push(LoadedModelInfo {
-                status: status.clone(),
-                model: format!("{} ({part})", job.model),
-                device: layer_distribution.first().map(|d| d.device_type.clone()),
-                size_bytes: Some(runs.iter().map(|r| r.bytes).sum()),
-                num_layers: Some(runs.iter().map(|r| r.layer_end).max().unwrap_or(0) as u32),
-                layer_distribution: Some(layer_distribution),
-                context_length: None,
-            });
-        }
+        push_parts(
+            &mut loaded_models,
+            &job.model,
+            &job.status(),
+            None,
+            None,
+            &job.parts,
+        );
     }
 
     // Stable alphabetical order for catalog parity with /api/ps,
@@ -260,5 +246,69 @@ pub(crate) async fn repair_model(
             error!("   ❌ Repair failed: {}", e);
             Err(ApiError::Internal(format!("Failed to repair model: {}", e)))
         }
+    }
+}
+
+/// One listing entry per placed part of `model`, named `model (part)`, with the part's
+/// layers by device; a part with no name is the model itself. A model with no parts yet
+/// is one entry with its status alone, so a render that has loaded nothing is still
+/// listed.
+pub(crate) fn push_parts(
+    out: &mut Vec<LoadedModelInfo>,
+    model: &str,
+    status: &str,
+    device: Option<String>,
+    size_bytes: Option<u64>,
+    parts: &[(
+        String,
+        Vec<crate::inference::serve::progress::placement::Placed>,
+    )],
+) {
+    if parts.is_empty() {
+        out.push(LoadedModelInfo {
+            model: model.to_string(),
+            status: status.to_string(),
+            device,
+            size_bytes,
+            num_layers: None,
+            layer_distribution: None,
+            context_length: None,
+        });
+        return;
+    }
+    for (part, runs) in parts {
+        let layer_distribution: Vec<crate::api::types::LayerDistribution> = runs
+            .iter()
+            .map(|r| {
+                let (device_type, device_id) = match r.device {
+                    crate::tensor::DeviceLocation::Cpu => ("CPU".to_string(), 0),
+                    crate::tensor::DeviceLocation::Cuda { gpu_id } => ("CUDA".to_string(), gpu_id),
+                };
+                crate::api::types::LayerDistribution {
+                    device_type,
+                    device_id,
+                    layer_start: r.layer_start as u32,
+                    layer_end: r.layer_end.saturating_sub(1) as u32,
+                    memory_bytes: r.bytes,
+                }
+            })
+            .collect();
+        let bytes: u64 = runs.iter().map(|r| r.bytes).sum();
+        out.push(LoadedModelInfo {
+            model: if part.is_empty() {
+                model.to_string()
+            } else {
+                format!("{model} ({part})")
+            },
+            status: status.to_string(),
+            device: layer_distribution
+                .first()
+                .map(|d| d.device_type.clone())
+                .or_else(|| device.clone()),
+            size_bytes: if bytes > 0 { Some(bytes) } else { size_bytes },
+            num_layers: Some(runs.iter().map(|r| r.layer_end).max().unwrap_or(0) as u32),
+            layer_distribution: Some(layer_distribution),
+            context_length: None,
+        });
     }
 }

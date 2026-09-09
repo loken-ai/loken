@@ -493,3 +493,23 @@ mod tests {
         assert!(cos > 0.999, "detok cosine {cos} too low");
     }
 }
+
+impl DetokModel {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(
+            &self.stack.device,
+            self.stack.layers.len(),
+        )
+    }
+}
+
+impl TokEncoder {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(
+            &self.stack.device,
+            self.stack.layers.len(),
+        )
+    }
+}

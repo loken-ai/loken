@@ -190,6 +190,8 @@ pub fn render_with_progress(
     //    used to be pinned to "", so a caller's negative prompt reached here and did nothing.
     let t5_dir = flan_t5_dir();
     let t5 = T5Encoder::from_dir(&t5_dir)?;
+    let t5_part =
+        crate::inference::serve::progress::placement::part("text-encoder", &t5.placement());
     let ctx_cond = t5.encode(&t5_tokenize(&t5_dir, prompt)?)?;
     let use_cfg = cfg > 1.0;
     let ctx_uncond = if use_cfg {
@@ -198,9 +200,11 @@ pub fn render_with_progress(
         None
     };
     drop(t5);
+    drop(t5_part);
 
     // 2) DiT.
     let dit = EzAudioDiT::load_s3_large()?;
+    let _dit_part = crate::inference::serve::progress::placement::part("dit", &dit.placement());
 
     // 3) init latent ~ N(0,1) [128, T] channel-major (LCG + Box-Muller, seed-driven).
     let mut rng = seed.max(1);
@@ -295,6 +299,7 @@ pub fn render_with_progress(
             .ok_or_else(|| crate::tensor::Error("ezaudio: bad VAE path".into()))?,
         1e-12,
     )?;
+    let _vae_part = crate::inference::serve::progress::placement::part("vae", &vae.placement());
     let t1 = std::time::Instant::now();
     let (audio, c_out, t_audio) = vae.decode_chunked(&latent, LATENT_CH, t, 192, 64)?;
     eprintln!(

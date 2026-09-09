@@ -1161,3 +1161,24 @@ mod tests {
         assert!(wav.iter().all(|v| v.is_finite()), "no NaN/Inf in output");
     }
 }
+
+impl PocketTts {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(&self.device, self.xf.len())
+    }
+}
+
+impl MimiDecoder {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(&self.device, self.xf.len())
+    }
+}
+
+impl MimiEncoder {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(&self.device, self.xf.len())
+    }
+}

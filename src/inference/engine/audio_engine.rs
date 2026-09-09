@@ -251,6 +251,24 @@ impl AudioEngine {
         self.name.lock().await.clone()
     }
 
+    /// The two towers of the resident model and where they sit; none when nothing is
+    /// loaded or the model is at work under its lock.
+    pub fn parts(&self) -> Option<crate::inference::serve::progress::placement::Parts> {
+        use crate::inference::serve::progress::placement::whole;
+        let guard = self.model_state.try_lock().ok()?;
+        let state = guard.as_ref()?;
+        Some(vec![
+            (
+                "encoder".to_string(),
+                whole(&state.device, state.model.encoder.n_blocks()),
+            ),
+            (
+                "decoder".to_string(),
+                whole(&state.device, state.model.decoder.n_blocks()),
+            ),
+        ])
+    }
+
     pub async fn unload(&self) {
         let mut guard = self.model_state.lock().await;
         if guard.take().is_some() {

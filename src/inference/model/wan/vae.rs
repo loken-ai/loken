@@ -1327,3 +1327,20 @@ mod decode_cost_probe {
         }
     }
 }
+
+impl WanVaeDecoder {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(&self.device(), self.upsamples.len())
+    }
+}
+
+impl WanVaeEncoder {
+    /// Where this model's layers sit, by device.
+    pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
+        crate::inference::serve::progress::placement::whole(
+            &self.mean.device(),
+            self.downsamples.len(),
+        )
+    }
+}
