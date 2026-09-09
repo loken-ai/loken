@@ -543,6 +543,7 @@ pub fn render_with_progress(
                 cfg.temperature,
                 cfg.top_p,
                 cfg.cfg_scale,
+                progress,
             )?;
             drop(lm);
             Ok(codes)
@@ -952,14 +953,11 @@ pub fn render_with_progress(
         ph::try_note(progress, ph::phase::DECODE, 0, t)?;
         let vae = OobleckDecoder::from_gguf(&vae_g, 1e-12)?;
         let t2 = std::time::Instant::now();
-        // The decode walks the latent in chunks and now says where it is. Reported through
-        // a plain closure because the try-form can refuse (a cancelled render), and a
-        // decoder has no business unwinding on a progress report - the refusal is honoured
-        // at the next step boundary instead.
-        let on_chunk = |done: usize, total: usize| {
-            let _ = ph::try_note(progress, ph::phase::DECODE, done, total);
-        };
-        let on_chunk: &dyn Fn(usize, usize) = &on_chunk;
+        // The decode walks the latent in chunks and says where it is at each one; a
+        // cancelled render stops at the next chunk.
+        let on_chunk =
+            |done: usize, total: usize| ph::try_note(progress, ph::phase::DECODE, done, total);
+        let on_chunk: &dyn Fn(usize, usize) -> crate::tensor::Result<()> = &on_chunk;
         // The chunk and its overlap are the window the decode's reserve was sized on, so
         // they are read from the same place rather than typed twice.
         let r = vae.decode_chunked_reporting(

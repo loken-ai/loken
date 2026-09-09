@@ -454,6 +454,8 @@ impl Qwen3Lm {
                 l,
                 n_layers,
             );
+            // A load whose listener has gone stops at the next block.
+            crate::inference::serve::cancel::scoped::bail()?;
             let p = format!("model.layers.{l}");
             let ldev = layer_device(l);
             let qm = |nm: &str, ind: usize, outd: usize| -> Result<QKernelMatMul> {
@@ -1432,6 +1434,7 @@ impl Qwen3Lm {
                 caption,
                 lyrics,
                 cot_yaml,
+        progress: Option<&crate::inference::serve::progress::ProgressTryFn<'_>>,
                 max_codes,
                 seed,
                 temperature,
@@ -1495,6 +1498,13 @@ impl Qwen3Lm {
             // both sequences feed the SAME chosen token; the hidden state stays on-device.
             let hidden = {
                 #[cfg(feature = "cuda")]
+            // Every code is a point where a gone listener stops the decode.
+            crate::inference::serve::progress::try_note(
+                progress,
+                crate::inference::serve::progress::phase::CODES,
+                codes.len(),
+                max_codes,
+            )?;
                 {
                     if use_graph {
                         match self.forward_b2_graph(chosen, &mut kv) {

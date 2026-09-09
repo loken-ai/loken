@@ -46,6 +46,8 @@ pub mod phase {
     pub const LOAD_MODEL: &str = "load-model";
     /// The sampling loop - the only phase that has ever had a step count.
     pub const DENOISE: &str = "denoise";
+    /// The audio codes a language model decodes before a denoiser renders them.
+    pub const CODES: &str = "codes";
     /// Turning text into speech, counted in the units the caller can see: a chunk of the
     /// text it sent, not a decoder step it has no way to relate to what it asked for.
     pub const SYNTHESIZE: &str = "synthesize";

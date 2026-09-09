@@ -737,7 +737,7 @@ impl OobleckDecoder {
         t: usize,
         chunk: usize,
         overlap: usize,
-        on_chunk: Option<&dyn Fn(usize, usize)>,
+        on_chunk: Option<&dyn Fn(usize, usize) -> crate::tensor::Result<()>>,
     ) -> crate::tensor::Result<(Vec<f32>, usize, usize)> {
         let mut ch = chunk.max(16);
         loop {
@@ -772,7 +772,7 @@ impl OobleckDecoder {
         t: usize,
         chunk: usize,
         overlap: usize,
-        on_chunk: Option<&dyn Fn(usize, usize)>,
+        on_chunk: Option<&dyn Fn(usize, usize) -> crate::tensor::Result<()>>,
     ) -> crate::tensor::Result<(Vec<f32>, usize, usize)> {
         // Total upsample ratio = product of the decoder block strides (ACE-Step 48kHz
         // [10,6,4,4,2]=1920; EzAudio 24kHz [10,6,4,2]=480). Derive it from the loaded
@@ -795,7 +795,7 @@ impl OobleckDecoder {
             // count was there - it just never left the function, and a decode that takes
             // minutes then shows a bare phase name, which reads as a hang.
             if let Some(f) = on_chunk {
-                f(s, t);
+                f(s, t)?;
             }
             let e = (s + chunk).min(t);
             let a = s.saturating_sub(overlap);

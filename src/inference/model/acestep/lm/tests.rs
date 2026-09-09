@@ -35,7 +35,7 @@ fn cfg_batched_matches_serial() {
     // batched (one instance)
     let batched = {
         let mut lm = super::Qwen3Lm::from_gguf(gp).unwrap();
-        lm.generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0)
+        lm.generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0, None)
             .unwrap()
     };
     println!(
@@ -183,7 +183,7 @@ fn cross_card_matches_single_card() {
             "the whole model is expected to fit one card here"
         );
         lm.set_graph(false);
-        lm.generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0)
+        lm.generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0, None)
             .unwrap()
     };
     let split = {
@@ -191,7 +191,7 @@ fn cross_card_matches_single_card() {
         let mut lm =
             super::Qwen3Lm::from_gguf_placed(gp, Some(&[(0, half), (1, u64::MAX / 4)])).unwrap();
         assert!(!lm.on_one_card(), "the budget was meant to split the model");
-        lm.generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0)
+        lm.generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0, None)
             .unwrap()
     };
     let nmatch = whole.iter().zip(&split).take_while(|(a, b)| a == b).count();
@@ -223,11 +223,11 @@ fn graph_matches_eager() {
     );
     let mut lm = super::Qwen3Lm::from_gguf(gp).unwrap();
     let graph = lm
-        .generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0)
+        .generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0, None)
         .unwrap();
     lm.set_graph(false);
     let eager = lm
-        .generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0)
+        .generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0, None)
         .unwrap();
     let nmatch = graph.iter().zip(&eager).take_while(|(a, b)| a == b).count();
     println!(

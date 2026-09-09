@@ -465,6 +465,7 @@ impl DitModel {
                 l,
                 n_layers,
             );
+            crate::inference::serve::cancel::scoped::bail()?;
             let p = format!("decoder.layers.{l}");
             let ld = layer_device(l);
             // Quantized per-block linear `[out,in]` on the block's device (bias=false).
