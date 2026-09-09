@@ -65,14 +65,7 @@ pub(crate) fn image_fits_a_card(
     };
     let hot = family_hot_bytes(&state.huggingface_models_dir, loader, model_name)
         + family_runtime_bytes(&state.huggingface_models_dir, loader, model_name, geom);
-    let largest = crate::inference::place::device_probe::probe_cuda_gpus(
-        state.default_inference_config.max_gpu_memory_fraction,
-    )
-    .iter()
-    .map(|g| g.available)
-    .max()
-    .unwrap_or(0);
-    largest >= hot
+    state.card_holds(hot)
 }
 
 /// Whether a peer's catalogue holds a checkpoint of the same image family as

@@ -103,6 +103,28 @@ pub(crate) fn serves_transcription(node: &NodeState, requested: &str) -> bool {
     catalogue_has(node, |entry| transcription_entry_matches(entry, requested))
 }
 
+/// Bytes a whole-model load takes on a card for each byte of its checkpoint: the voice
+/// and transcription engines load in F32 from F16 or BF16 files.
+const WHOLE_LOAD_FACTOR: u64 = 2;
+
+/// The runtime room a whole-model load keeps beside its weights.
+pub(crate) const WHOLE_LOAD_RESERVE: u64 = 512 << 20;
+
+/// What a whole-model load of a checkpoint of `size` bytes asks a card for.
+pub(crate) fn whole_load_demand(size: u64) -> u64 {
+    size.saturating_mul(WHOLE_LOAD_FACTOR) + WHOLE_LOAD_RESERVE
+}
+
+/// The size the listing records for the first entry `matches`, from the same listing
+/// the tags route serves. `None` when nothing listed matches.
+pub(crate) async fn listed_size(
+    state: &crate::api::handlers::APIServer,
+    matches: impl Fn(&str) -> bool,
+) -> Option<u64> {
+    let models = state.model_manager.list_models().await.ok()?;
+    models.iter().find(|m| matches(&m.id)).map(|m| m.size)
+}
+
 /// The `model` text field of an upload, read from the body as it arrived. An upload is
 /// parsed once here to decide where it goes, and again by the route that runs it.
 pub(crate) async fn upload_model(
@@ -196,6 +218,12 @@ mod tests {
             "openai/whisper-medium",
             "whisper-small"
         ));
+    }
+
+    #[test]
+    fn a_whole_load_asks_for_more_than_its_file() {
+        assert!(whole_load_demand(1 << 30) > (1 << 30) * WHOLE_LOAD_FACTOR);
+        assert_eq!(whole_load_demand(0), WHOLE_LOAD_RESERVE);
     }
 
     #[test]

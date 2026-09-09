@@ -684,6 +684,30 @@ pub(crate) async fn audio_generations(
             crate::inference::model::acestep::lm::placement_demand(lm.to_str().unwrap_or(""))
                 .max(sz("acestep-v15-turbo-Q8_0.gguf"))
         };
+        // A node whose cards cannot hold the render whole hands it to a peer that holds
+        // the model, before reclaiming anything here.
+        let requested = crate::api::handlers::catalogue::sound_entry(&body.0);
+        let holds = |n: &crate::distributed::membership::NodeState| {
+            crate::api::handlers::catalogue::serves_sound(n, &requested)
+        };
+        if let Some(relayed) = crate::api::handlers::route_media_to_holder(
+            &_state,
+            &headers,
+            if requested.is_empty() {
+                "a sound model"
+            } else {
+                &requested
+            },
+            true,
+            _state.card_holds(hot),
+            holds,
+            &crate::api::handlers::AUDIO_GENERATIONS,
+            &body.0,
+        )
+        .await
+        {
+            return relayed;
+        }
         crate::inference::place::vram_manager::ensure_gpu_headroom("music", hot, 2 << 30).await;
     }
 
@@ -1702,6 +1726,38 @@ pub(crate) async fn audio_speech(
         {
             return relayed;
         }
+    }
+    // The voice loads whole on one card: an idle resident is reclaimed to make room, and a
+    // node whose cards cannot hold it hands the request to a peer that has the voice.
+    if let Some(wanted) = requested_model.as_deref() {
+        use crate::api::handlers::catalogue;
+        let demand =
+            catalogue::listed_size(&state, |id| catalogue::speech_entry_matches(id, wanted))
+                .await
+                .map(catalogue::whole_load_demand)
+                .unwrap_or(0);
+        let holds =
+            |n: &crate::distributed::membership::NodeState| catalogue::serves_speech(n, wanted);
+        if let Some(relayed) = crate::api::handlers::route_media_to_holder(
+            &state,
+            &headers,
+            wanted,
+            true,
+            state.card_holds(demand),
+            holds,
+            &crate::api::handlers::AUDIO_SPEECH,
+            &body.0,
+        )
+        .await
+        {
+            return relayed;
+        }
+        crate::inference::place::vram_manager::ensure_gpu_headroom(
+            "tts",
+            demand,
+            catalogue::WHOLE_LOAD_RESERVE,
+        )
+        .await;
     }
     let _job = state.media_note(requested_model.as_deref().unwrap_or("speech"), "speech");
 

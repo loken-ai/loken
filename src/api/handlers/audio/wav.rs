@@ -242,6 +242,38 @@ async fn decode_where_the_model_is(
     {
         return relayed;
     }
+    // The model loads whole on one card: an idle resident is reclaimed to make room, and a
+    // node whose cards cannot hold it hands the upload to a peer that has the model.
+    let demand = catalogue::listed_size(&state, |id| {
+        catalogue::transcription_entry_matches(id, &requested)
+    })
+    .await
+    .map(catalogue::whole_load_demand)
+    .unwrap_or(0);
+    if let Some(relayed) = crate::api::handlers::route_upload_to_holder(
+        &state,
+        &headers,
+        if requested.is_empty() {
+            "whisper"
+        } else {
+            &requested
+        },
+        true,
+        state.card_holds(demand),
+        holds,
+        path,
+        &body,
+    )
+    .await
+    {
+        return relayed;
+    }
+    crate::inference::place::vram_manager::ensure_gpu_headroom(
+        "asr",
+        demand,
+        catalogue::WHOLE_LOAD_RESERVE,
+    )
+    .await;
     let _job = state.media_note(
         if requested.is_empty() {
             "whisper"

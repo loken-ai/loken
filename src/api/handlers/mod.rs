@@ -1282,6 +1282,20 @@ impl APIServer {
         }
     }
 
+    /// Whether one card of this node has `bytes` of room under the configured fraction.
+    /// A model that only fits split against the host is one a peer with a larger card
+    /// should take, so every family's hand-over asks this with its own demand.
+    pub(crate) fn card_holds(&self, bytes: u64) -> bool {
+        crate::inference::place::device_probe::probe_cuda_gpus(
+            self.default_inference_config.max_gpu_memory_fraction,
+        )
+        .iter()
+        .map(|g| g.available)
+        .max()
+        .unwrap_or(0)
+            >= bytes
+    }
+
     /// The media jobs running now.
     pub(crate) fn media_jobs(&self) -> Vec<MediaJob> {
         self.media_jobs

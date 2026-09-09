@@ -646,6 +646,21 @@ pub(crate) async fn conversation_handler(
         }
         ConvRoute::Tts => {
             let model = s("tts_model");
+            if let Some(wanted) = model.as_deref() {
+                use crate::api::handlers::catalogue;
+                let demand = catalogue::listed_size(&state, |id| {
+                    catalogue::speech_entry_matches(id, wanted)
+                })
+                .await
+                .map(catalogue::whole_load_demand)
+                .unwrap_or(0);
+                crate::inference::place::vram_manager::ensure_gpu_headroom(
+                    "tts",
+                    demand,
+                    catalogue::WHOLE_LOAD_RESERVE,
+                )
+                .await;
+            }
             if let Err(e) = ensure_tts_model_loaded(&state, model.as_deref()).await {
                 return conv_err(
                     StatusCode::INTERNAL_SERVER_ERROR,

@@ -115,7 +115,7 @@ pub(crate) async fn video_generations(
     }
     // One media job at a time: two diffusion engines cannot share these cards,
     // and letting them try is what produced the OOM storm (see `media_gate`).
-    let _media_guard = state
+    let mut _media_guard = state
         .media_lock_for(
             body.0
                 .get("model")
@@ -514,6 +514,29 @@ pub(crate) async fn video_generations(
             .map(|m| m.len())
             .unwrap_or(0);
         let hot = dit_hot.max(vae_hot);
+        // A node whose cards cannot hold the render whole hands it to a peer that holds
+        // the model; the gate is released first so the relay blocks no other render here.
+        if !state.card_holds(hot) {
+            let holds = |n: &crate::distributed::membership::NodeState| {
+                crate::distributed::routing::can_serve(n, &model_name)
+            };
+            drop(_media_guard);
+            if let Some(relayed) = super::super::route_media_to_holder(
+                &state,
+                &headers,
+                &model_name,
+                true,
+                false,
+                holds,
+                &super::super::VIDEO,
+                &b,
+            )
+            .await
+            {
+                return relayed;
+            }
+            _media_guard = state.media_lock_for(&model_name, "video").await;
+        }
         crate::inference::place::vram_manager::ensure_gpu_headroom("video", hot, 0).await;
     }
 
