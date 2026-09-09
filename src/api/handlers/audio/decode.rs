@@ -889,6 +889,12 @@ pub(crate) async fn audio_generations(
         let cancel_m = crate::inference::serve::cancel::CancelToken::new();
         let guard_m = crate::inference::serve::cancel::CancelGuard::new(cancel_m.clone());
         let load_tx = tx.clone();
+        // The job record follows the render: every count and every placed part lands in
+        // it, which is what a listing of this node shows while the render runs.
+        let record = _media_guard.reporter();
+        let load_record = record.clone();
+        let place_fn = record.placement_fn();
+        let cancel_load = cancel_m.clone();
         let handle = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
             let mcfg: crate::inference::model::acestep::music::MusicConfig =
                 serde_json::from_value(cfg_json).map_err(|e| format!("bad config: {e}"))?;
@@ -899,6 +905,7 @@ pub(crate) async fn audio_generations(
             let _counts = crate::inference::serve::progress::scoped::publish(
                 crate::inference::serve::progress::per_percent(std::sync::Arc::new(
                     move |phase: &str, done: usize, total: usize| {
+                        load_record.note(phase, done, total);
                         // Dropped rather than queued when the client is behind: a stale count
                         // is worth nothing, and blocking the loader to deliver one would make
                         // the load slower.
@@ -906,7 +913,11 @@ pub(crate) async fn audio_generations(
                     },
                 )),
             );
+            let _placed = crate::inference::serve::progress::placement::publish(place_fn);
+            // A weight reader that sees the token stops a load nobody waits for.
+            let _stop = crate::inference::serve::cancel::scoped::publish(&cancel_load);
             let cb = move |phase: &str, step: usize, total: usize| {
+                record.note(phase, step, total);
                 let _ = tx.blocking_send((phase.to_string(), step, total));
                 cancel_m.bail()
             };
@@ -918,6 +929,9 @@ pub(crate) async fn audio_generations(
         let stream = async_stream::stream! {
             // Lives with the stream, not the handler call - see the stable-audio branch.
             let _cancel_guard = guard_m;
+            // So does the media gate and the job record: the render runs on past the
+            // handler, and both must last as long as it does.
+            let _media_guard = _media_guard;
             yield Ok::<_, axum::Error>(Event::default().data(
                 serde_json::json!({"status": "started", "model": model_s}).to_string()));
             while let Some((phase, step, total)) = rx.recv().await {
@@ -994,12 +1008,15 @@ pub(crate) async fn audio_generations(
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, usize, usize)>(64);
         let energy = crate::energy_report::begin();
         let load_tx = tx.clone();
+        let record = _media_guard.reporter();
+        let load_record = record.clone();
         let handle = tokio::task::spawn_blocking(move || -> Result<(Vec<f32>, u32), String> {
             // Same as the music branch: the sampler counts its own steps, this counts the
             // weights read before the first one exists to count.
             let _counts = crate::inference::serve::progress::scoped::publish(
                 crate::inference::serve::progress::per_percent(std::sync::Arc::new(
                     move |phase: &str, done: usize, total: usize| {
+                        load_record.note(phase, done, total);
                         let _ = load_tx.try_send((phase.to_string(), done, total));
                     },
                 )),
@@ -1013,6 +1030,7 @@ pub(crate) async fn audio_generations(
                 seed,
                 sao_init_s.as_ref().map(|(pcm, lvl)| (pcm.as_slice(), *lvl)),
                 |phase: &str, step, total| {
+                    record.note(phase, step, total);
                     let _ = tx.blocking_send((phase.to_string(), step, total));
                     cancel_s.bail()
                 },
@@ -1024,6 +1042,7 @@ pub(crate) async fn audio_generations(
             // The guard must live as long as the STREAM, not the handler call: it
             // is what turns "the client stopped reading" into a stopped sampler.
             let _cancel_guard = guard_s;
+            let _media_guard = _media_guard;
             yield Ok::<_, axum::Error>(Event::default().data(
                 serde_json::json!({"status": "started", "model": model_s}).to_string()));
             while let Some((phase, step, total)) = rx.recv().await {
@@ -1112,10 +1131,26 @@ pub(crate) async fn audio_generations(
         let (out_path, cfg_json) =
             acestep_render_config(&b, &prompt, seconds, steps, cfg, seed, loop_mode);
         let out_read = out_path.clone();
+        let record = _media_guard.reporter();
+        let load_record = record.clone();
+        let place_fn = record.placement_fn();
         let res = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
             let mcfg: crate::inference::model::acestep::music::MusicConfig =
                 serde_json::from_value(cfg_json).map_err(|e| format!("bad config: {e}"))?;
-            crate::inference::model::acestep::music::render(&mcfg).map_err(|e| e.to_string())?;
+            let _counts = crate::inference::serve::progress::scoped::publish(
+                crate::inference::serve::progress::per_percent(std::sync::Arc::new(
+                    move |phase: &str, done: usize, total: usize| {
+                        load_record.note(phase, done, total)
+                    },
+                )),
+            );
+            let _placed = crate::inference::serve::progress::placement::publish(place_fn);
+            let cb = move |phase: &str, step: usize, total: usize| {
+                record.note(phase, step, total);
+                Ok(())
+            };
+            crate::inference::model::acestep::music::render_with_progress(&mcfg, Some(&cb))
+                .map_err(|e| e.to_string())?;
             std::fs::read(&out_read).map_err(|e| format!("read rendered wav: {e}"))
         })
         .await;

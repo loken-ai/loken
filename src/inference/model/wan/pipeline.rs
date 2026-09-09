@@ -1330,6 +1330,8 @@ pub fn render_many_sampled(
         );
         clips.push(frames);
     }
+    drop(dit);
+    crate::inference::serve::progress::placement::gone("dit");
     Ok(clips)
 }
 

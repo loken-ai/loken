@@ -719,3 +719,80 @@ fn a_media_job_is_listed_while_its_note_lives() {
     jobs.end(second);
     assert!(jobs.running().is_empty());
 }
+
+#[test]
+fn a_media_job_carries_its_phase_and_its_placed_parts() {
+    use crate::inference::serve::progress::placement::{runs, Placed};
+    use crate::tensor::DeviceLocation;
+    let mut jobs = super::MediaJobs::default();
+    let id = jobs.start("ace-step", "sound");
+    assert_eq!(jobs.running()[0].status(), "rendering sound");
+    jobs.progress(id, "codes", 12, 300);
+    assert_eq!(jobs.running()[0].status(), "rendering sound: codes 12/300");
+
+    let lm = runs(
+        [
+            DeviceLocation::Cuda { gpu_id: 0 },
+            DeviceLocation::Cuda { gpu_id: 1 },
+        ],
+        8,
+    );
+    jobs.place(id, "lm", &lm);
+    jobs.place(id, "vae", &runs([DeviceLocation::Cpu], 4));
+    let parts = &jobs.running()[0].parts;
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].0, "lm");
+    assert_eq!(parts[0].1, lm);
+    assert_eq!(
+        parts[1].1,
+        vec![Placed {
+            device: DeviceLocation::Cpu,
+            layer_start: 0,
+            layer_end: 1,
+            bytes: 4
+        }]
+    );
+
+    // A part placed again replaces itself; an empty placement removes it.
+    jobs.place(id, "lm", &runs([DeviceLocation::Cpu], 8));
+    assert_eq!(jobs.running()[0].parts.len(), 2);
+    assert_eq!(jobs.running()[0].parts[1].0, "lm");
+    jobs.place(id, "lm", &[]);
+    assert_eq!(jobs.running()[0].parts.len(), 1);
+    jobs.place(id, "vae", &[]);
+    assert!(jobs.running()[0].parts.is_empty());
+}
+
+/// The gate a render takes travels with the render: a second render waits on it
+/// after the first handler has returned, until the first render is over.
+#[tokio::test]
+async fn the_media_gate_outlives_the_handler_that_took_it() {
+    let state = super::APIServer::new(String::new(), String::new());
+    let first = state.media_lock_for("ace-step", "sound").await;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    // What a streamed handler does: return, with the guard moved into the work.
+    let render = tokio::spawn(async move {
+        let _held = first;
+        let _ = done_rx.await;
+    });
+    assert_eq!(state.media_jobs().len(), 1);
+    let second = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        state.media_lock_for("flux", "image"),
+    )
+    .await;
+    assert!(second.is_err(), "a second render started beside the first");
+    let _ = done_tx.send(());
+    render.await.unwrap();
+    let second = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        state.media_lock_for("flux", "image"),
+    )
+    .await
+    .expect("the gate is free once the first render is over");
+    let jobs = state.media_jobs();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].model, "flux");
+    drop(second);
+    assert!(state.media_jobs().is_empty());
+}

@@ -85,7 +85,7 @@ block or an image by URL, is refused with the reason.
 |---|---|
 | `GET /health` | Uptime and time. The one route exempt from authentication. |
 | `GET /metrics` | OpenMetrics, with the `metrics` feature only: uptime, resident models, gate depth, in-flight generations, decode rates, devices, energy totals. |
-| `GET /api/models`, `GET /api/models/loaded` | The catalogue, and what is resident with its placement per device. |
+| `GET /api/models`, `GET /api/models/loaded` | The catalogue, and what is resident with its placement per device. A render in progress is listed too, one entry per part it has loaded, named `model (part)`, with the part's layers per device and a `status` of the form `rendering sound: codes 12/300`; before its first part loads, the render is one entry with the status alone. |
 | `POST /api/models/validate`, `POST /api/models/repair` | Check a model's files, and fetch what is missing. |
 | `POST /api/swap` | Replace the resident model. |
 | `POST /api/layers/swap` | Attach or detach adapters on a loaded model without reloading it. The body is the set the model should end up with. |

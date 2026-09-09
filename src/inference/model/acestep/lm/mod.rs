@@ -507,6 +507,13 @@ impl Qwen3Lm {
             .narrow(0, cand_base, vocab - cand_base)?
             .contiguous()?;
         let norm_t = norm_t("model.norm.weight".to_string(), h, vec![1, 1, h], &primary)?;
+        crate::inference::serve::progress::placement::note(
+            "lm",
+            &crate::inference::serve::progress::placement::runs(
+                layers.iter().map(|l| l.device.location()),
+                model_size / n_layers.max(1) as u64,
+            ),
+        );
         Ok(Qwen3Lm {
             embed,
             embed_audio,
@@ -1427,6 +1434,7 @@ impl Qwen3Lm {
         temperature: f32,
         top_p: f32,
         cfg_scale: f32,
+        progress: Option<&crate::inference::serve::progress::ProgressTryFn<'_>>,
     ) -> Result<Vec<u32>> {
         if cfg_scale <= 1.0 {
             return self.generate(
@@ -1434,7 +1442,6 @@ impl Qwen3Lm {
                 caption,
                 lyrics,
                 cot_yaml,
-        progress: Option<&crate::inference::serve::progress::ProgressTryFn<'_>>,
                 max_codes,
                 seed,
                 temperature,
@@ -1491,13 +1498,6 @@ impl Qwen3Lm {
                 break;
             }
             codes.push(chosen - AUDIO_CODE_BASE);
-            if codes.len() >= max_codes {
-                break;
-            }
-            let _pf = std::time::Instant::now();
-            // both sequences feed the SAME chosen token; the hidden state stays on-device.
-            let hidden = {
-                #[cfg(feature = "cuda")]
             // Every code is a point where a gone listener stops the decode.
             crate::inference::serve::progress::try_note(
                 progress,
@@ -1505,6 +1505,13 @@ impl Qwen3Lm {
                 codes.len(),
                 max_codes,
             )?;
+            if codes.len() >= max_codes {
+                break;
+            }
+            let _pf = std::time::Instant::now();
+            // both sequences feed the SAME chosen token; the hidden state stays on-device.
+            let hidden = {
+                #[cfg(feature = "cuda")]
                 {
                     if use_graph {
                         match self.forward_b2_graph(chosen, &mut kv) {

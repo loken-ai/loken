@@ -219,11 +219,34 @@ fn estimate_token_count(text: &str) -> u64 {
 /// every peer look as though it had just spoken.
 static CLUSTER_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
-/// One media job: a render, a voice or a transcription, named by the model it runs.
+/// One media job: a render, a voice or a transcription, named by the model it runs, with
+/// the phase it is in and how far along.
 #[derive(Debug, Clone)]
 pub(crate) struct MediaJob {
     pub model: String,
     pub kind: &'static str,
+    pub phase: String,
+    pub step: usize,
+    pub total: usize,
+    /// The parts of the render that are loaded now, each with its layers by device.
+    pub parts: Vec<(
+        String,
+        Vec<crate::inference::serve::progress::placement::Placed>,
+    )>,
+}
+
+impl MediaJob {
+    /// What a listing says of the job.
+    pub fn status(&self) -> String {
+        if self.total > 0 {
+            format!(
+                "rendering {}: {} {}/{}",
+                self.kind, self.phase, self.step, self.total
+            )
+        } else {
+            format!("rendering {}", self.kind)
+        }
+    }
 }
 
 /// The media jobs running now, each under an id its guard removes.
@@ -241,9 +264,35 @@ impl MediaJobs {
             MediaJob {
                 model: model.to_string(),
                 kind,
+                phase: String::new(),
+                step: 0,
+                total: 0,
+                parts: Vec::new(),
             },
         ));
         self.next
+    }
+
+    fn place(
+        &mut self,
+        id: u64,
+        part: &str,
+        runs: &[crate::inference::serve::progress::placement::Placed],
+    ) {
+        if let Some((_, job)) = self.jobs.iter_mut().find(|(job, _)| *job == id) {
+            job.parts.retain(|(name, _)| name != part);
+            if !runs.is_empty() {
+                job.parts.push((part.to_string(), runs.to_vec()));
+            }
+        }
+    }
+
+    fn progress(&mut self, id: u64, phase: &str, step: usize, total: usize) {
+        if let Some((_, job)) = self.jobs.iter_mut().find(|(job, _)| *job == id) {
+            job.phase = phase.to_string();
+            job.step = step;
+            job.total = total;
+        }
     }
 
     fn end(&mut self, id: u64) {
@@ -261,6 +310,17 @@ pub(crate) struct MediaNote {
     id: u64,
 }
 
+impl MediaNote {
+    /// A handle that reports the job's progress and outlives nothing: the record ends
+    /// with the note, whatever a reporter still held does nothing.
+    pub(crate) fn reporter(&self) -> MediaProgress {
+        MediaProgress {
+            jobs: self.jobs.clone(),
+            id: self.id,
+        }
+    }
+}
+
 impl Drop for MediaNote {
     fn drop(&mut self) {
         self.jobs
@@ -270,10 +330,53 @@ impl Drop for MediaNote {
     }
 }
 
-/// The media gate held for one render, with the render recorded while it is held.
-pub(crate) struct MediaGuard<'a> {
-    _gate: tokio::sync::MutexGuard<'a, ()>,
-    _job: MediaNote,
+/// Reports where a media job is; cloned into the thread that renders.
+#[derive(Clone)]
+pub(crate) struct MediaProgress {
+    jobs: Arc<std::sync::Mutex<MediaJobs>>,
+    id: u64,
+}
+
+impl MediaProgress {
+    pub(crate) fn note(&self, phase: &str, step: usize, total: usize) {
+        self.jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .progress(self.id, phase, step, total);
+    }
+
+    pub(crate) fn place(
+        &self,
+        part: &str,
+        runs: &[crate::inference::serve::progress::placement::Placed],
+    ) {
+        self.jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .place(self.id, part, runs);
+    }
+
+    /// The reporter as the render thread publishes it, for the parts to find.
+    pub(crate) fn placement_fn(
+        &self,
+    ) -> crate::inference::serve::progress::placement::SharedPlacementFn {
+        let me = self.clone();
+        Arc::new(move |part: &str, runs: &[_]| me.place(part, runs))
+    }
+}
+
+/// The media gate held for one render, with the render recorded while it is held. It
+/// owns the gate rather than borrowing it, so a render that runs on past the handler,
+/// as a streamed one does, carries it along and gives it back when the render ends.
+pub(crate) struct MediaGuard {
+    _gate: tokio::sync::OwnedMutexGuard<()>,
+    job: MediaNote,
+}
+
+impl MediaGuard {
+    pub(crate) fn reporter(&self) -> MediaProgress {
+        self.job.reporter()
+    }
 }
 
 #[derive(Clone)]
@@ -1256,11 +1359,11 @@ impl APIServer {
     /// Held for the whole request; LLM generations are deliberately not gated.
     /// Take the media gate for a render of `model`, recorded as a running job for as long
     /// as the guard lives.
-    pub(crate) async fn media_lock_for(&self, model: &str, kind: &'static str) -> MediaGuard<'_> {
-        let gate = self.media_gate.lock().await;
+    pub(crate) async fn media_lock_for(&self, model: &str, kind: &'static str) -> MediaGuard {
+        let gate = self.media_gate.clone().lock_owned().await;
         MediaGuard {
             _gate: gate,
-            _job: self.media_note(model, kind),
+            job: self.media_note(model, kind),
         }
     }
 

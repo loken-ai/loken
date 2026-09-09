@@ -162,6 +162,146 @@ pub mod scoped {
     }
 }
 
+/// Where the parts of a render sit while it runs.
+///
+/// A render loads several models in turn, each placed on its own, and a listing that
+/// only names the render says nothing of which card holds what. Each part reports its
+/// layers by device here as it loads, and reports itself gone when it is dropped, so the
+/// node can publish the same layer map for a render that it publishes for a text model.
+pub mod placement {
+    use crate::tensor::DeviceLocation;
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    /// One run of consecutive layers on one device; `layer_end` is EXCLUSIVE.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Placed {
+        pub device: DeviceLocation,
+        pub layer_start: usize,
+        pub layer_end: usize,
+        pub bytes: u64,
+    }
+
+    /// Called with a part's name and its runs; an empty slice says the part is gone.
+    pub type SharedPlacementFn = Arc<dyn Fn(&str, &[Placed]) + Send + Sync>;
+
+    thread_local! {
+        static CURRENT: RefCell<Option<SharedPlacementFn>> = const { RefCell::new(None) };
+    }
+
+    /// Restores the previous reporter when dropped, including on an unwind, for the same
+    /// reason as [`super::scoped::Scope`]: the thread is pooled and handed to the next job.
+    pub struct Scope {
+        prev: Option<SharedPlacementFn>,
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            CURRENT.with(|c| *c.borrow_mut() = self.prev.take());
+        }
+    }
+
+    #[must_use = "the reporter is published only while the guard is alive"]
+    pub fn publish(report: SharedPlacementFn) -> Scope {
+        Scope {
+            prev: CURRENT.with(|c| c.borrow_mut().replace(report)),
+        }
+    }
+
+    fn current() -> Option<SharedPlacementFn> {
+        CURRENT.with(|c| c.borrow().clone())
+    }
+
+    /// Report where `part` sits; nothing when no reporter is published.
+    pub fn note(part: &str, runs: &[Placed]) {
+        if let Some(f) = current() {
+            f(part, runs);
+        }
+    }
+
+    /// Report that `part` has been dropped.
+    pub fn gone(part: &str) {
+        note(part, &[]);
+    }
+
+    /// The runs of a model whose layers sit on `devices`, in layer order, each layer
+    /// weighing `bytes_per_layer`.
+    pub fn runs(
+        devices: impl IntoIterator<Item = DeviceLocation>,
+        bytes_per_layer: u64,
+    ) -> Vec<Placed> {
+        let mut out: Vec<Placed> = Vec::new();
+        for (i, device) in devices.into_iter().enumerate() {
+            match out.last_mut() {
+                Some(last) if last.device == device && last.layer_end == i => {
+                    last.layer_end = i + 1;
+                    last.bytes += bytes_per_layer;
+                }
+                _ => out.push(Placed {
+                    device,
+                    layer_start: i,
+                    layer_end: i + 1,
+                    bytes: bytes_per_layer,
+                }),
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn runs_merge_consecutive_layers_on_one_device() {
+            let a = DeviceLocation::Cuda { gpu_id: 0 };
+            let b = DeviceLocation::Cuda { gpu_id: 1 };
+            let runs = runs([a, a, b, b, b, DeviceLocation::Cpu], 10);
+            assert_eq!(
+                runs,
+                vec![
+                    Placed {
+                        device: a,
+                        layer_start: 0,
+                        layer_end: 2,
+                        bytes: 20
+                    },
+                    Placed {
+                        device: b,
+                        layer_start: 2,
+                        layer_end: 5,
+                        bytes: 30
+                    },
+                    Placed {
+                        device: DeviceLocation::Cpu,
+                        layer_start: 5,
+                        layer_end: 6,
+                        bytes: 10
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn a_note_reaches_the_published_reporter_and_no_further() {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = seen.clone();
+            {
+                let _scope = publish(Arc::new(move |part: &str, runs: &[Placed]| {
+                    sink.lock().unwrap().push((part.to_string(), runs.len()));
+                }));
+                note("lm", &runs([DeviceLocation::Cpu], 1));
+                gone("lm");
+            }
+            note("dit", &runs([DeviceLocation::Cpu], 1));
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![("lm".to_string(), 1), ("lm".to_string(), 0)]
+            );
+        }
+    }
+}
+
 /// A reporter that can also STOP the work: an error returned from it cancels the render.
 ///
 /// Separate from [`ProgressFn`] rather than folded into it, because most engines have

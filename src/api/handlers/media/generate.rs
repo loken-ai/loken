@@ -593,6 +593,9 @@ pub(crate) async fn handle_image_generation(
         );
 
         let stream = async_stream::stream! {
+            // The media gate and the job record last as long as the render: the handler
+            // returns with the response built, the stream is what renders.
+            let _media_guard = _media_guard;
             // Phase 1: get the model up, REPORTING - the single family-aware entry point,
             // which also owns the unload-on-family-switch, the headroom protocol and the
             // load retry cascade this route never had.

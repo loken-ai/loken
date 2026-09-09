@@ -546,6 +546,7 @@ pub fn render_with_progress(
                 progress,
             )?;
             drop(lm);
+            ph::placement::gone("lm");
             Ok(codes)
         })?
     };
@@ -929,6 +930,7 @@ pub fn render_with_progress(
             t1.elapsed().as_secs_f32()
         );
         drop(dit);
+        ph::placement::gone("dit");
         Ok(latent)
     })?;
 
@@ -969,6 +971,8 @@ pub fn render_with_progress(
             Some(on_chunk),
         )?;
         println!("[acestep_render] VAE: {:.1}s", t2.elapsed().as_secs_f32());
+        drop(vae);
+        ph::placement::gone("vae");
         Ok(r)
     })?;
     // Clean the tail: the VAE emits a steady low-level noise floor even after the music

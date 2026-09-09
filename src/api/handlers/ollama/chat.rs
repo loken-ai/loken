@@ -116,17 +116,51 @@ pub(crate) async fn list_loaded_models(
         });
     }
 
-    // What renders now, by the name the request gave; a media job holds no layers.
+    // What renders now, by the name the request gave: one entry per loaded part with its
+    // layers by device, or the bare job while nothing is loaded yet.
     for job in state.media_jobs() {
-        loaded_models.push(LoadedModelInfo {
-            model: job.model,
-            status: format!("rendering {}", job.kind),
-            device: None,
-            size_bytes: None,
-            num_layers: None,
-            layer_distribution: None,
-            context_length: None,
-        });
+        let status = job.status();
+        if job.parts.is_empty() {
+            loaded_models.push(LoadedModelInfo {
+                status,
+                model: job.model,
+                device: None,
+                size_bytes: None,
+                num_layers: None,
+                layer_distribution: None,
+                context_length: None,
+            });
+            continue;
+        }
+        for (part, runs) in &job.parts {
+            let layer_distribution: Vec<crate::api::types::LayerDistribution> = runs
+                .iter()
+                .map(|r| {
+                    let (device_type, device_id) = match r.device {
+                        crate::tensor::DeviceLocation::Cpu => ("CPU".to_string(), 0),
+                        crate::tensor::DeviceLocation::Cuda { gpu_id } => {
+                            ("CUDA".to_string(), gpu_id)
+                        }
+                    };
+                    crate::api::types::LayerDistribution {
+                        device_type,
+                        device_id,
+                        layer_start: r.layer_start as u32,
+                        layer_end: r.layer_end.saturating_sub(1) as u32,
+                        memory_bytes: r.bytes,
+                    }
+                })
+                .collect();
+            loaded_models.push(LoadedModelInfo {
+                status: status.clone(),
+                model: format!("{} ({part})", job.model),
+                device: layer_distribution.first().map(|d| d.device_type.clone()),
+                size_bytes: Some(runs.iter().map(|r| r.bytes).sum()),
+                num_layers: Some(runs.iter().map(|r| r.layer_end).max().unwrap_or(0) as u32),
+                layer_distribution: Some(layer_distribution),
+                context_length: None,
+            });
+        }
     }
 
     // Stable alphabetical order for catalog parity with /api/ps,

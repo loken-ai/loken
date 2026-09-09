@@ -564,8 +564,13 @@ pub(crate) async fn video_generations(
         let reg = crate::inference::serve::cancel::registry::Entry::new(&render_id, &cancel);
         let id_for_event = render_id.clone();
         let energy = crate::energy_report::begin();
+        // The job record follows the render: every count and every placed part lands in
+        // it, which is what a listing of this node shows while the render runs.
+        let record = _media_guard.reporter();
+        let place_fn = record.placement_fn();
         let handle = tokio::task::spawn_blocking(
             move || -> Result<(Vec<u8>, &'static str, usize, usize, usize), String> {
+                let _placed = crate::inference::serve::progress::placement::publish(place_fn);
                 // Progress across ALL scenes: each scene's denoise calls the cb once
                 // per step, so a monotone call counter over scenes*steps tracks the
                 // montage as one bar.
@@ -580,6 +585,7 @@ pub(crate) async fn video_generations(
                 // name however much it knew: minutes of the word "Decoding" and nothing
                 // else. A phase knows its own position; a relay's job is to relay it.
                 let cb = move |phase: &str, done: usize, total: usize| {
+                    record.note(phase, done, total);
                     let _ = tx.blocking_send((phase.to_string(), done, total));
                 };
                 let clips = crate::inference::model::wan::pipeline::render_many_sampled(
@@ -653,6 +659,10 @@ pub(crate) async fn video_generations(
             // response is built, and an entry scoped to it would be dropped before the render
             // took a single step, publishing an identifier already unknown.
             let _reg = reg;
+            // The media gate and the job record last as long as the render, for the same
+            // reason: dropped with the handler they would let a second render start on the
+            // same cards, and list this node as idle while it renders.
+            let _media_guard = _media_guard;
             yield Ok::<_, axum::Error>(Event::default().data(
                 serde_json::json!({"status": "started", "model": model_s, "total": steps,
                                    "id": id_for_event}).to_string()));
@@ -712,8 +722,12 @@ pub(crate) async fn video_generations(
     let negative_plain = negative_prompt.clone();
     let ckpt_plain = wan_ckpt.clone();
     let start_image_p = start_image.clone();
+    let record = _media_guard.reporter();
+    let place_fn = record.placement_fn();
     let res = tokio::task::spawn_blocking(
         move || -> Result<(Vec<u8>, &'static str, usize, usize, usize), String> {
+            let _placed = crate::inference::serve::progress::placement::publish(place_fn);
+            let cb = move |phase: &str, done: usize, total: usize| record.note(phase, done, total);
             let clips = crate::inference::model::wan::pipeline::render_many_sampled(
                 &prompt_v,
                 frames,
@@ -724,7 +738,7 @@ pub(crate) async fn video_generations(
                 seed,
                 variant,
                 sampler,
-                None,
+                Some(&cb),
                 Some(&cancel_render),
                 &negative_plain,
                 Some(&ckpt_plain),
