@@ -239,22 +239,42 @@ pub(crate) async fn draft_status(State(state): State<APIServer>) -> Json<serde_j
     Json(serde_json::json!({"pairs": pairs}))
 }
 
-/// Per-layer inference perf snapshot. The global tracker is updated
-/// in-band during forward passes (z-image-turbo, flux-schnell, and
-/// LlmEngine's per-layer LayerTimer hooks). Empty if no model has
-/// run yet; the GUI's Hardware tab uses this for its
-/// per-layer panel.
+/// Where a decode step's time goes, by layer: what issuing each layer costs on the
+/// calling thread, which is what tells a layer that dispatches to a card from one that
+/// runs on the host. Recorded only while measurement is on, since the stage timers it
+/// shares the switch with synchronise with the device.
 ///
-/// Query params (all optional):
-///   - `model=<name>` - case-sensitive exact match on model_name.
-///   - `sort=tps` - tokens-per-second descending (slowest-first
-///     analysis when reading from the bottom); any other value
-///     keeps the natural layer_idx order, which is the typical UI
-///     default.
+/// `?enable=1` switches measurement on and zeroes the counters, `?enable=0` switches it
+/// off; the reply says whether it is on. Layers recorded without a model name belong to
+/// the resident text model, and are named after it here so a reader never sees a blank.
+/// `model=<name>` keeps one model's layers, `sort=tps` orders them fastest first.
 pub(crate) async fn layer_performance_endpoint(
+    State(state): State<APIServer>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let metrics = crate::inference::place::layer_perf::global_tracker().get_metrics();
+    use crate::inference::place::layer_perf::{global_tracker, stages};
+    match params.get("enable").map(String::as_str) {
+        Some("1") => {
+            global_tracker().reset();
+            stages::reset();
+            stages::set_enabled(true);
+        }
+        Some("0") => stages::set_enabled(false),
+        _ => {}
+    }
+    let resident = state
+        .engines
+        .read()
+        .await
+        .first()
+        .map(|e| e.model_id.clone())
+        .unwrap_or_default();
+    let mut metrics = global_tracker().get_metrics();
+    for l in &mut metrics {
+        if l.model_name.is_empty() {
+            l.model_name = resident.clone();
+        }
+    }
     let mut filtered: Vec<_> = match params.get("model") {
         Some(name) => metrics
             .into_iter()
@@ -269,7 +289,10 @@ pub(crate) async fn layer_performance_endpoint(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
-    Json(serde_json::json!({ "layers": layers_to_json(&filtered) }))
+    Json(serde_json::json!({
+        "measuring": stages::enabled(),
+        "layers": layers_to_json(&filtered),
+    }))
 }
 
 /// Where a decode step's time goes, by stage.
