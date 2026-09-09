@@ -2031,8 +2031,31 @@ pub(crate) async fn openai_retrieve_model(
 /// return_documents?}`.
 pub(crate) async fn openai_rerank(
     State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
+    // The request goes to a node whose catalogue holds the model when this one's does not.
+    {
+        let model = normalize_model_id(&text_field(&body, "model"));
+        let holds = |n: &crate::distributed::membership::NodeState| {
+            crate::distributed::routing::can_serve(n, &model)
+        };
+        let served_here = holds(&state.local_node_state().await);
+        if let Some(relayed) = super::route_media_to_holder(
+            &state,
+            &headers,
+            &model,
+            served_here,
+            true,
+            holds,
+            &super::RERANK,
+            &body,
+        )
+        .await
+        {
+            return relayed;
+        }
+    }
     use axum::response::IntoResponse;
     let err = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {
         (code, Json(openai_error_body(code, msg))).into_response()
@@ -2151,8 +2174,31 @@ pub(crate) async fn openai_rerank(
 /// directly.
 pub(crate) async fn openai_embeddings(
     State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
+    // The request goes to a node whose catalogue holds the model when this one's does not.
+    {
+        let model = normalize_model_id(&text_field(&body, "model"));
+        let holds = |n: &crate::distributed::membership::NodeState| {
+            crate::distributed::routing::can_serve(n, &model)
+        };
+        let served_here = holds(&state.local_node_state().await);
+        if let Some(relayed) = super::route_media_to_holder(
+            &state,
+            &headers,
+            &model,
+            served_here,
+            true,
+            holds,
+            &super::EMBEDDINGS,
+            &body,
+        )
+        .await
+        {
+            return relayed;
+        }
+    }
     use axum::response::IntoResponse;
 
     let err = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {

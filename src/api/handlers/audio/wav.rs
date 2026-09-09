@@ -194,9 +194,66 @@ pub(crate) async fn handle_chat_asr(
 ///   * `response_format` - `json` (default), `text`, or `verbose_json`.
 pub(crate) async fn audio_transcriptions(
     state: axum::extract::State<APIServer>,
-    multipart: axum::extract::Multipart,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
 ) -> axum::response::Response {
-    audio_decode_endpoint(state, multipart, WhisperTask::Transcribe).await
+    decode_where_the_model_is(
+        state,
+        headers,
+        body,
+        WhisperTask::Transcribe,
+        "/v1/audio/transcriptions",
+    )
+    .await
+}
+
+/// An upload goes to a node whose catalogue holds the transcription model when this
+/// one's does not; otherwise it is decoded here.
+async fn decode_where_the_model_is(
+    state: axum::extract::State<APIServer>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+    task: WhisperTask,
+    path: &str,
+) -> axum::response::Response {
+    use crate::api::handlers::catalogue;
+    let requested = catalogue::upload_model(&headers, &body)
+        .await
+        .unwrap_or_default();
+    let holds = |n: &crate::distributed::membership::NodeState| {
+        catalogue::serves_transcription(n, &requested)
+    };
+    let served_here = holds(&state.local_node_state().await);
+    if let Some(relayed) = crate::api::handlers::route_upload_to_holder(
+        &state,
+        &headers,
+        if requested.is_empty() {
+            "whisper"
+        } else {
+            &requested
+        },
+        served_here,
+        true,
+        holds,
+        path,
+        &body,
+    )
+    .await
+    {
+        return relayed;
+    }
+    match catalogue::upload_multipart(&headers, body).await {
+        Ok(multipart) => audio_decode_endpoint(state, multipart, task).await,
+        Err(e) => {
+            use axum::response::IntoResponse;
+            let code = axum::http::StatusCode::BAD_REQUEST;
+            (
+                code,
+                Json(crate::api::handlers::openai::openai_error_body(code, e)),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// OpenAI-compatible `/v1/audio/translations`. Same multipart contract as
@@ -204,7 +261,15 @@ pub(crate) async fn audio_transcriptions(
 /// English output regardless of source language.
 pub(crate) async fn audio_translations(
     state: axum::extract::State<APIServer>,
-    multipart: axum::extract::Multipart,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
 ) -> axum::response::Response {
-    audio_decode_endpoint(state, multipart, WhisperTask::Translate).await
+    decode_where_the_model_is(
+        state,
+        headers,
+        body,
+        WhisperTask::Translate,
+        "/v1/audio/translations",
+    )
+    .await
 }

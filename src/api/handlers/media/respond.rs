@@ -372,15 +372,65 @@ pub(crate) fn composite_preserved(
 /// OpenAI-compatible `/v1/images/edits`. Multipart form: `image` (PNG/JPEG
 /// bytes), `prompt`, optional `model`, `n`, `size`, `response_format`,
 /// plus our extensions `strength` (0..1) and `seed` (u64).
+/// An image upload goes to a node that holds the family on a card that fits it, the way a
+/// generation does; otherwise its multipart reader is handed back to the route.
+async fn image_upload_where_the_model_is(
+    state: &APIServer,
+    headers: &axum::http::HeaderMap,
+    body: axum::body::Bytes,
+    path: &str,
+) -> Result<axum::extract::Multipart, axum::response::Response> {
+    use crate::api::handlers::catalogue;
+    use axum::response::IntoResponse;
+    let model_name = catalogue::upload_model(headers, &body)
+        .await
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "z-image".to_string());
+    let fits = match image_model_defaults(&model_name) {
+        Ok(d) => super::image_fits_a_card(
+            state,
+            &model_name,
+            crate::inference::place::runtime_demand::RequestGeometry::new(d.size, d.size),
+        ),
+        Err(_) => true,
+    };
+    if let Some(relayed) = crate::api::handlers::route_upload_to_holder(
+        state,
+        headers,
+        &model_name,
+        super::image_served_here(state, &model_name),
+        fits,
+        |peer| super::serves_image_family(peer, &model_name),
+        path,
+        &body,
+    )
+    .await
+    {
+        return Err(relayed);
+    }
+    catalogue::upload_multipart(headers, body)
+        .await
+        .map_err(|e| {
+            let code = axum::http::StatusCode::BAD_REQUEST;
+            (code, Json(openai_error_body(code, e))).into_response()
+        })
+}
+
 pub(crate) async fn images_edits(
     state: axum::extract::State<APIServer>,
     headers: axum::http::HeaderMap,
-    mut multipart: axum::extract::Multipart,
+    body: axum::body::Bytes,
 ) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // The job goes where the family is held and a card holds it whole.
+    let mut multipart =
+        match image_upload_where_the_model_is(&state, &headers, body, "/v1/images/edits").await {
+            Ok(multipart) => multipart,
+            Err(answer) => return answer,
+        };
     // One media job at a time: two diffusion engines cannot share these cards,
     // and letting them try is what produced the OOM storm (see `media_gate`).
     let _media_guard = state.media_lock().await;
-    use axum::response::IntoResponse;
     use base64::Engine as _;
 
     let err_resp = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {
@@ -883,12 +933,24 @@ pub(crate) async fn images_edits(
 pub(crate) async fn images_variations(
     state: axum::extract::State<APIServer>,
     headers: axum::http::HeaderMap,
-    mut multipart: axum::extract::Multipart,
+    body: axum::body::Bytes,
 ) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // The job goes where the family is held and a card holds it whole.
+    let mut multipart = match image_upload_where_the_model_is(
+        &state,
+        &headers,
+        body,
+        "/v1/images/variations",
+    )
+    .await
+    {
+        Ok(multipart) => multipart,
+        Err(answer) => return answer,
+    };
     // One media job at a time: two diffusion engines cannot share these cards,
     // and letting them try is what produced the OOM storm (see `media_gate`).
     let _media_guard = state.media_lock().await;
-    use axum::response::IntoResponse;
     use base64::Engine as _;
 
     let err_resp = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {

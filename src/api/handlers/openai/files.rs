@@ -270,7 +270,9 @@ async fn run_batch_line(state: APIServer, url: &str, body: Value) -> (u16, Value
             text_completions(State(state), axum::http::HeaderMap::new(), Json(body)).await
         }
         "/v1/responses" => openai_responses(State(state), OpenAIJson(body)).await,
-        "/v1/embeddings" => Ok(openai_embeddings(State(state), Json(body)).await),
+        "/v1/embeddings" => {
+            Ok(openai_embeddings(State(state), axum::http::HeaderMap::new(), Json(body)).await)
+        }
         other => Err(ApiError::Validation(format!(
             "batch endpoint '{other}' is not served"
         ))),

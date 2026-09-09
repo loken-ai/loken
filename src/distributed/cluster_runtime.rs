@@ -252,6 +252,32 @@ pub async fn forward_request(
     Ok((resp.status(), resp.headers().clone(), resp))
 }
 
+/// Post a body as it arrived, with its content type: the shape a multipart upload keeps.
+pub async fn forward_request_bytes(
+    url: &str,
+    path: &str,
+    content_type: &str,
+    body: axum::body::Bytes,
+) -> Result<
+    (
+        reqwest::StatusCode,
+        reqwest::header::HeaderMap,
+        reqwest::Response,
+    ),
+    String,
+> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}{path}", url.trim_end_matches('/')))
+        .header(FORWARDED_HEADER, "1")
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("forward to {url}: {e}"))?;
+    Ok((resp.status(), resp.headers().clone(), resp))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -59,6 +59,7 @@ macro_rules! to_json_string {
 mod anthropic_api;
 #[cfg(feature = "audio")]
 mod audio;
+mod catalogue;
 mod cluster_catalogue;
 #[cfg(feature = "image")]
 pub(crate) mod media;
@@ -356,6 +357,36 @@ pub(crate) const AUDIO_GENERATIONS: Relay = Relay {
     closing: "",
     streams_by_default: false,
 };
+pub(crate) const AUDIO_SPEECH: Relay = Relay {
+    path: "/v1/audio/speech",
+    marker: b"",
+    closing: "",
+    streams_by_default: false,
+};
+pub(crate) const EMBEDDINGS: Relay = Relay {
+    path: "/v1/embeddings",
+    marker: b"",
+    closing: "",
+    streams_by_default: false,
+};
+pub(crate) const OLLAMA_EMBED: Relay = Relay {
+    path: "/api/embed",
+    marker: b"",
+    closing: "",
+    streams_by_default: false,
+};
+pub(crate) const OLLAMA_EMBEDDINGS: Relay = Relay {
+    path: "/api/embeddings",
+    marker: b"",
+    closing: "",
+    streams_by_default: false,
+};
+pub(crate) const RERANK: Relay = Relay {
+    path: "/v1/rerank",
+    marker: b"",
+    closing: "",
+    streams_by_default: false,
+};
 pub(crate) const CONVERSATION: Relay = Relay {
     path: "/conversation",
     marker: b"",
@@ -363,31 +394,30 @@ pub(crate) const CONVERSATION: Relay = Relay {
     streams_by_default: false,
 };
 
-/// Send a media request to a node that holds the model and can run it, when this node
-/// cannot: it lacks the weights, or no card of its own holds the model whole.
-///
-/// The text router prices candidates by throughput; a media job has no such figure, so
-/// the least loaded live peer that holds the family takes it. A node with no such peer
-/// keeps the request and is bound by its own host-memory admission.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn route_media_to_holder(
+/// The peer a media request goes to when this node cannot run it: it lacks the weights, or
+/// no card of its own holds the model whole. The least loaded live peer that holds the
+/// model takes it; a node with no such peer keeps the request and is bound by its own
+/// host-memory admission. `None` when the request stays here.
+fn media_holder(
     state: &APIServer,
     headers: &axum::http::HeaderMap,
     model: &str,
     served_here: bool,
     fits_here: bool,
     holds: impl Fn(&crate::distributed::membership::NodeState) -> bool,
-    relay: &Relay,
-    body: &serde_json::Value,
-) -> Option<axum::response::Response> {
-    let cluster = state.cluster_handle()?;
+) -> Option<(
+    std::sync::Arc<crate::distributed::cluster::Cluster>,
+    String,
+    String,
+    u64,
+)> {
+    let cluster = state.cluster_handle()?.clone();
     if headers.contains_key(crate::distributed::cluster::FORWARDED_HEADER)
         || (served_here && fits_here)
     {
         return None;
     }
     let now = crate::distributed::cluster_runtime::now_ms(state.cluster_started());
-    cluster.publish_local(state.local_node_state().await);
     let mut peers: Vec<_> = cluster
         .peer_view(now)
         .into_iter()
@@ -407,22 +437,95 @@ pub(crate) async fn route_media_to_holder(
         "it is not in this node's catalogue"
     };
     tracing::info!("forwarding to {}: {model}, {reason}", peer.node_id);
+    Some((cluster, peer.node_id.to_string(), url, now))
+}
+
+/// Send a JSON media request to the node that can run it. See [`media_holder`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn route_media_to_holder(
+    state: &APIServer,
+    headers: &axum::http::HeaderMap,
+    model: &str,
+    served_here: bool,
+    fits_here: bool,
+    holds: impl Fn(&crate::distributed::membership::NodeState) -> bool,
+    relay: &Relay,
+    body: &serde_json::Value,
+) -> Option<axum::response::Response> {
+    cluster_handle_publish(state).await;
+    let (cluster, peer, url, now) =
+        media_holder(state, headers, model, served_here, fits_here, holds)?;
     match forward_to_peer(&url, relay, body).await {
         Ok(relayed) => Some(relayed),
         Err(e) => {
-            tracing::warn!(
-                "cluster: hand-over to {} failed ({e}) - serving here instead",
-                peer.node_id
-            );
-            cluster.note_handover_failed(&peer.node_id, now);
+            tracing::warn!("cluster: hand-over to {peer} failed ({e}) - serving here instead");
+            cluster.note_handover_failed(&peer, now);
             None
         }
     }
 }
 
-/// Hand a request to the peer best placed for it, or say that it stays here. `prompt` is
-/// the text the peers are asked about, so the one holding its prefix is priced for it. A
-/// request that already travelled once stays where it landed.
+/// Send an upload to the node that can run it, as it arrived. See [`media_holder`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn route_upload_to_holder(
+    state: &APIServer,
+    headers: &axum::http::HeaderMap,
+    model: &str,
+    served_here: bool,
+    fits_here: bool,
+    holds: impl Fn(&crate::distributed::membership::NodeState) -> bool,
+    path: &str,
+    body: &axum::body::Bytes,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse;
+    cluster_handle_publish(state).await;
+    let (cluster, peer, url, now) =
+        media_holder(state, headers, model, served_here, fits_here, holds)?;
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    match crate::distributed::cluster_runtime::forward_request_bytes(
+        &url,
+        path,
+        &content_type,
+        body.clone(),
+    )
+    .await
+    {
+        Ok((status, peer_headers, resp)) => {
+            let code = axum::http::StatusCode::from_u16(status.as_u16())
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let answer_type = peer_headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            Some(
+                (
+                    code,
+                    [(axum::http::header::CONTENT_TYPE, answer_type)],
+                    axum::body::Body::from_stream(resp.bytes_stream()),
+                )
+                    .into_response(),
+            )
+        }
+        Err(e) => {
+            tracing::warn!("cluster: hand-over to {peer} failed ({e}) - serving here instead");
+            cluster.note_handover_failed(&peer, now);
+            None
+        }
+    }
+}
+
+/// This node sits in its own routing table, described as its peers describe it.
+async fn cluster_handle_publish(state: &APIServer) {
+    if let Some(cluster) = state.cluster_handle() {
+        cluster.publish_local(state.local_node_state().await);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn route_to_holder(
     state: &APIServer,
@@ -1519,10 +1622,10 @@ impl APIServer {
             .route("/api/draft/detach", axum::routing::post(draft_detach))
             .route("/api/draft/status", axum::routing::get(draft_status))
             .route("/api/copy", axum::routing::post(ollama_copy_model))
-            .route("/api/embed", axum::routing::post(ollama_embed))
+            .route("/api/embed", axum::routing::post(ollama_embed_routed))
             .route(
                 "/api/embeddings",
-                axum::routing::post(ollama_embeddings_legacy),
+                axum::routing::post(ollama_embeddings_legacy_routed),
             )
             // OpenAI-shaped embeddings - same engine plumbing as
             // /api/embed, response reshaped to the `{object:"list",

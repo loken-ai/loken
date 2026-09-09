@@ -1345,6 +1345,7 @@ async fn the_speech_event_stream_names_its_phase_before_it_has_anything_to_send(
     );
     let resp = audio_speech(
         axum::extract::State(state),
+        axum::http::HeaderMap::new(),
         Json(serde_json::json!({
             "input": "Hello there.",
             "model": "piper/no-such-voice-here",

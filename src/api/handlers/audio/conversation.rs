@@ -471,13 +471,15 @@ pub(crate) async fn conversation_handler(
     // does not; a speech turn naming a model likewise. The peer classifies the turn again.
     {
         use crate::distributed::routing::can_serve;
-        let holds = |n: &crate::distributed::membership::NodeState, model: &str| match model {
-            "" => can_serve(n, "stable-audio") || can_serve(n, "ezaudio"),
-            named => can_serve(n, named),
+        let holds = |n: &crate::distributed::membership::NodeState, model: &str| match route {
+            ConvRoute::SoundGen => crate::api::handlers::catalogue::serves_sound(n, model),
+            ConvRoute::Tts => crate::api::handlers::catalogue::serves_speech(n, model),
+            _ => can_serve(n, model),
         };
         let wanted: Option<String> = match route {
             ConvRoute::SoundGen => Some(String::new()),
             ConvRoute::Tts => s("tts_model"),
+            ConvRoute::Chat | ConvRoute::Vision => s("model"),
             _ => None,
         };
         if let Some(model) = wanted {

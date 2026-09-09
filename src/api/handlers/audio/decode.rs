@@ -624,24 +624,6 @@ fn error_event(message: String) -> String {
     serde_json::json!({"status": "error", "error": message}).to_string()
 }
 
-/// The catalogue entry a generation request asks for. ACE-Step is one name in the request
-/// and one entry per DiT checkpoint in the catalogue, so the variant joins the name.
-pub(crate) fn catalogue_name(body: &serde_json::Value) -> String {
-    let requested = str_field(body, "model").to_ascii_lowercase();
-    if requested != "ace-step" && requested != "acestep" {
-        return requested;
-    }
-    let variant = match str_field(body, "dit_model").to_ascii_lowercase().as_str() {
-        "sft" => "sft",
-        "base" => "base",
-        "xl-turbo" => "xl-turbo",
-        "xl-sft" | "xl" => "xl-sft",
-        "xl-base" => "xl-base",
-        _ => "turbo",
-    };
-    format!("ace-step-{variant}")
-}
-
 pub(crate) async fn audio_generations(
     _state: axum::extract::State<APIServer>,
     headers: axum::http::HeaderMap,
@@ -650,14 +632,9 @@ pub(crate) async fn audio_generations(
     use axum::response::IntoResponse;
     // The job goes to a node whose catalogue holds the model when this one's does not.
     {
-        use crate::distributed::routing::can_serve;
-        let requested = catalogue_name(&body.0);
+        let requested = crate::api::handlers::catalogue::sound_entry(&body.0);
         let holds = |n: &crate::distributed::membership::NodeState| {
-            if requested.is_empty() {
-                can_serve(n, "stable-audio") || can_serve(n, "ezaudio")
-            } else {
-                can_serve(n, &requested)
-            }
+            crate::api::handlers::catalogue::serves_sound(n, &requested)
         };
         let served_here = holds(&_state.local_node_state().await);
         if let Some(relayed) = crate::api::handlers::route_media_to_holder(
@@ -1646,6 +1623,7 @@ pub(super) fn apply_speed_linear(pcm: &[f32], speed: f32) -> Vec<f32> {
 
 pub(crate) async fn audio_speech(
     state: axum::extract::State<APIServer>,
+    headers: axum::http::HeaderMap,
     body: Json<serde_json::Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -1696,6 +1674,27 @@ pub(crate) async fn audio_speech(
         }
         _ => req.model.clone(),
     };
+    // The voice goes to a node whose catalogue holds its backend when this one's does not.
+    if let Some(wanted) = requested_model.as_deref() {
+        let holds = |n: &crate::distributed::membership::NodeState| {
+            crate::api::handlers::catalogue::serves_speech(n, wanted)
+        };
+        let served_here = holds(&state.local_node_state().await);
+        if let Some(relayed) = crate::api::handlers::route_media_to_holder(
+            &state,
+            &headers,
+            wanted,
+            served_here,
+            true,
+            holds,
+            &crate::api::handlers::AUDIO_SPEECH,
+            &body.0,
+        )
+        .await
+        {
+            return relayed;
+        }
+    }
 
     // Validate `voice` against the documented preset list - unless
     // the caller is overriding via our `voice_description` extension,

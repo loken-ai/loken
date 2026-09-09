@@ -840,7 +840,7 @@ pub(crate) async fn ollama_create_blob(
 /// The request shape of `POST /api/embeddings`, the endpoint that preceded `/api/embed`
 /// and that the LangChain and LlamaIndex integrations still call: one `prompt`, one
 /// `embedding` back.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct OllamaLegacyEmbeddingsRequest {
     pub model: String,
     #[serde(default)]
@@ -869,4 +869,76 @@ pub(crate) async fn ollama_embeddings_legacy(
     let Json(mut response) = ollama_embed(State(state), OllamaJson(modern)).await?;
     let embedding = response.embeddings.pop().unwrap_or_default();
     Ok(Json(serde_json::json!({ "embedding": embedding })))
+}
+
+/// The embedding routes as served: a request whose model this node's catalogue lacks goes
+/// to a peer that holds it, as it is; the rest is answered here.
+async fn embed_where_the_model_is<R: serde::Serialize>(
+    state: &APIServer,
+    headers: &axum::http::HeaderMap,
+    model: &str,
+    relay: &crate::api::handlers::Relay,
+    request: &R,
+) -> Option<axum::response::Response> {
+    let body = serde_json::to_value(request).ok()?;
+    let model = normalize_model_id(model);
+    let holds = |n: &crate::distributed::membership::NodeState| {
+        crate::distributed::routing::can_serve(n, &model)
+    };
+    let served_here = holds(&state.local_node_state().await);
+    crate::api::handlers::route_media_to_holder(
+        state,
+        headers,
+        &model,
+        served_here,
+        true,
+        holds,
+        relay,
+        &body,
+    )
+    .await
+}
+
+pub(crate) async fn ollama_embed_routed(
+    State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
+    OllamaJson(request): OllamaJson<OllamaEmbedRequest>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    if let Some(relayed) = embed_where_the_model_is(
+        &state,
+        &headers,
+        &request.model,
+        &crate::api::handlers::OLLAMA_EMBED,
+        &request,
+    )
+    .await
+    {
+        return Ok(relayed);
+    }
+    Ok(ollama_embed(State(state), OllamaJson(request))
+        .await?
+        .into_response())
+}
+
+pub(crate) async fn ollama_embeddings_legacy_routed(
+    State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
+    OllamaJson(request): OllamaJson<OllamaLegacyEmbeddingsRequest>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    if let Some(relayed) = embed_where_the_model_is(
+        &state,
+        &headers,
+        &request.model,
+        &crate::api::handlers::OLLAMA_EMBEDDINGS,
+        &request,
+    )
+    .await
+    {
+        return Ok(relayed);
+    }
+    Ok(ollama_embeddings_legacy(State(state), OllamaJson(request))
+        .await?
+        .into_response())
 }
