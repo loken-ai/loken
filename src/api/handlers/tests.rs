@@ -704,3 +704,18 @@ fn a_repository_without_weights_is_not_advertised() {
     )));
     assert!(super::holds_weights(&entry("ollama", &[])));
 }
+
+#[test]
+fn a_media_job_is_listed_while_its_note_lives() {
+    let mut jobs = super::MediaJobs::default();
+    let first = jobs.start("ace-step-turbo", "sound");
+    let second = jobs.start("kyutai", "speech");
+    assert_eq!(jobs.running().len(), 2);
+    jobs.end(first);
+    let left = jobs.running();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].model, "kyutai");
+    assert_eq!(left[0].kind, "speech");
+    jobs.end(second);
+    assert!(jobs.running().is_empty());
+}

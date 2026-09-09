@@ -116,6 +116,19 @@ pub(crate) async fn list_loaded_models(
         });
     }
 
+    // What renders now, by the name the request gave; a media job holds no layers.
+    for job in state.media_jobs() {
+        loaded_models.push(LoadedModelInfo {
+            model: job.model,
+            status: format!("rendering {}", job.kind),
+            device: None,
+            size_bytes: None,
+            num_layers: None,
+            layer_distribution: None,
+            context_length: None,
+        });
+    }
+
     // Stable alphabetical order for catalog parity with /api/ps,
     // /api/tags, /api/models, and /v1/models. Without this the
     // order is text-engine-insertion -> image -> whisper -> parler,

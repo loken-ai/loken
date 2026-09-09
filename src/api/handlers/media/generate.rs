@@ -469,7 +469,7 @@ pub(crate) async fn handle_image_generation(
 ) -> Result<Response, ApiError> {
     // One media job at a time: two diffusion engines cannot share these cards,
     // and letting them try is what produced the OOM storm (see `media_gate`).
-    let _media_guard = state.media_lock().await;
+    let _media_guard = state.media_lock_for(model_name, "image").await;
 
     // Extract image generation params from options
     let options = request.options.as_ref();

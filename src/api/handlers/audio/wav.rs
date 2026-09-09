@@ -242,6 +242,14 @@ async fn decode_where_the_model_is(
     {
         return relayed;
     }
+    let _job = state.media_note(
+        if requested.is_empty() {
+            "whisper"
+        } else {
+            &requested
+        },
+        "transcription",
+    );
     match catalogue::upload_multipart(&headers, body).await {
         Ok(multipart) => audio_decode_endpoint(state, multipart, task).await,
         Err(e) => {

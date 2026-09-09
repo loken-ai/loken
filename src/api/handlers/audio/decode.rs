@@ -698,6 +698,9 @@ pub(crate) async fn audio_generations(
     let lower = model.to_lowercase();
     let is_music = lower.contains("ace") || lower.contains("music");
     let is_sao = lower.contains("stable-audio") || lower.contains("stable_audio");
+    // One media job at a time, this one included: a music render shares the cards with
+    // the image and video engines.
+    let _media_guard = _state.media_lock_for(&model, "sound").await;
     // Music (ACE-Step) proves 6+ minute tracks; EzAudio SFX is trained on ~10 s
     // clips and its latent is seconds*50 frames - a shared 600 s clamp would let
     // an SFX request allocate a 30k-frame latent for guaranteed-garbage output.
@@ -1695,6 +1698,7 @@ pub(crate) async fn audio_speech(
             return relayed;
         }
     }
+    let _job = state.media_note(requested_model.as_deref().unwrap_or("speech"), "speech");
 
     // Validate `voice` against the documented preset list - unless
     // the caller is overriding via our `voice_description` extension,

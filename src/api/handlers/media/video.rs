@@ -115,7 +115,15 @@ pub(crate) async fn video_generations(
     }
     // One media job at a time: two diffusion engines cannot share these cards,
     // and letting them try is what produced the OOM storm (see `media_gate`).
-    let _media_guard = state.media_lock().await;
+    let _media_guard = state
+        .media_lock_for(
+            body.0
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("wan"),
+            "video",
+        )
+        .await;
     let err_resp = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {
         (code, Json(openai_error_body(code, msg))).into_response()
     };
@@ -860,7 +868,7 @@ pub(crate) async fn images_generations(
     }
     // One media job at a time: two diffusion engines cannot share these cards,
     // and letting them try is what produced the OOM storm (see `media_gate`).
-    let _media_guard = state.media_lock().await;
+    let _media_guard = state.media_lock_for(&model_name, "image").await;
 
     // FLUX Kontext is a dev-family (guidance-distilled) editor: it needs many more steps
     // than schnell (4) for a faithful, sharp edit, and a lower guidance. Override the flux

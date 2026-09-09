@@ -219,6 +219,63 @@ fn estimate_token_count(text: &str) -> u64 {
 /// every peer look as though it had just spoken.
 static CLUSTER_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
+/// One media job: a render, a voice or a transcription, named by the model it runs.
+#[derive(Debug, Clone)]
+pub(crate) struct MediaJob {
+    pub model: String,
+    pub kind: &'static str,
+}
+
+/// The media jobs running now, each under an id its guard removes.
+#[derive(Default)]
+pub(crate) struct MediaJobs {
+    next: u64,
+    jobs: Vec<(u64, MediaJob)>,
+}
+
+impl MediaJobs {
+    fn start(&mut self, model: &str, kind: &'static str) -> u64 {
+        self.next += 1;
+        self.jobs.push((
+            self.next,
+            MediaJob {
+                model: model.to_string(),
+                kind,
+            },
+        ));
+        self.next
+    }
+
+    fn end(&mut self, id: u64) {
+        self.jobs.retain(|(job, _)| *job != id);
+    }
+
+    fn running(&self) -> Vec<MediaJob> {
+        self.jobs.iter().map(|(_, job)| job.clone()).collect()
+    }
+}
+
+/// A recorded media job; dropping it ends the record.
+pub(crate) struct MediaNote {
+    jobs: Arc<std::sync::Mutex<MediaJobs>>,
+    id: u64,
+}
+
+impl Drop for MediaNote {
+    fn drop(&mut self) {
+        self.jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .end(self.id);
+    }
+}
+
+/// The media gate held for one render, with the render recorded while it is held.
+pub(crate) struct MediaGuard<'a> {
+    _gate: tokio::sync::MutexGuard<'a, ()>,
+    _job: MediaNote,
+}
+
 #[derive(Clone)]
 pub struct APIServer {
     ollama_models_dir: String,
@@ -259,6 +316,9 @@ pub struct APIServer {
     /// inside a worker). LLM generations are NOT gated here - they compete for VRAM
     /// through the reclaim protocol instead, so chat stays responsive during a render.
     media_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The media jobs running now, by name and kind: what a listing shows as rendering
+    /// and what the cluster counts as busy, since none of them crosses the request gate.
+    media_jobs: Arc<std::sync::Mutex<MediaJobs>>,
     /// API keys accepted when authentication is required. Empty + required = every
     /// request is refused, which is the safe direction for a misconfiguration.
     auth: Arc<AuthGate>,
@@ -1012,16 +1072,19 @@ impl APIServer {
             // reading it sees what this node feels rather than a count it cannot interpret.
             load: {
                 let g = self.request_gate.snapshot().await;
-                let busy = (g.in_flight + g.queue_depth) as f32;
+                let busy = (g.in_flight + g.queue_depth + self.media_jobs().len()) as f32;
                 (busy / self.request_gate.capacity().max(1) as f32).min(1.0)
             },
             // The raw queue alongside the fraction: routing prices the WAIT as rounds of
             // service, and only a count over a width can say how many rounds there are.
             // The generate path never crosses the admission gate, so the gate alone reads
             // idle under any load; the meter's own counter is where generations actually run.
+            // A media job never crosses the gate either; it counts as one busy unit.
             busy: {
                 let g = self.request_gate.snapshot().await;
-                (g.in_flight + g.queue_depth) as u32 + crate::distributed::rate_meter::in_flight()
+                (g.in_flight + g.queue_depth) as u32
+                    + crate::distributed::rate_meter::in_flight()
+                    + self.media_jobs().len() as u32
             },
             lanes: self.request_gate.capacity() as u32,
             // Probed once at startup and held by the manager, so publishing costs a lock
@@ -1147,6 +1210,7 @@ impl APIServer {
             request_gate,
             loading_locks: Arc::new(RwLock::new(std::collections::HashMap::new())),
             media_gate: Arc::new(tokio::sync::Mutex::new(())),
+            media_jobs: Arc::new(std::sync::Mutex::new(MediaJobs::default())),
             // Defaults to off; `configure_auth` applies the config at startup.
             auth: Arc::new(AuthGate::new(false, &[], &[], 0, 10)),
             // Off until the binary joins one; `attach_cluster` is what turns it on.
@@ -1192,6 +1256,38 @@ impl APIServer {
     /// Held for the whole request; LLM generations are deliberately not gated.
     pub(crate) async fn media_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.media_gate.lock().await
+    }
+
+    /// Take the media gate for a render of `model`, recorded as a running job for as long
+    /// as the guard lives.
+    pub(crate) async fn media_lock_for(&self, model: &str, kind: &'static str) -> MediaGuard<'_> {
+        let gate = self.media_gate.lock().await;
+        MediaGuard {
+            _gate: gate,
+            _job: self.media_note(model, kind),
+        }
+    }
+
+    /// Record a media job that runs outside the gate - a voice, a transcription - for as
+    /// long as the note lives.
+    pub(crate) fn media_note(&self, model: &str, kind: &'static str) -> MediaNote {
+        let id = self
+            .media_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .start(model, kind);
+        MediaNote {
+            jobs: self.media_jobs.clone(),
+            id,
+        }
+    }
+
+    /// The media jobs running now.
+    pub(crate) fn media_jobs(&self) -> Vec<MediaJob> {
+        self.media_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running()
     }
 
     /// Acquire the per-model load lock. Held for the duration of a single

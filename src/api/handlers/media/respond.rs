@@ -379,7 +379,7 @@ async fn image_upload_where_the_model_is(
     headers: &axum::http::HeaderMap,
     body: axum::body::Bytes,
     path: &str,
-) -> Result<axum::extract::Multipart, axum::response::Response> {
+) -> Result<(axum::extract::Multipart, String), axum::response::Response> {
     use crate::api::handlers::catalogue;
     use axum::response::IntoResponse;
     let model_name = catalogue::upload_model(headers, &body)
@@ -408,12 +408,13 @@ async fn image_upload_where_the_model_is(
     {
         return Err(relayed);
     }
-    catalogue::upload_multipart(headers, body)
+    let multipart = catalogue::upload_multipart(headers, body)
         .await
         .map_err(|e| {
             let code = axum::http::StatusCode::BAD_REQUEST;
             (code, Json(openai_error_body(code, e))).into_response()
-        })
+        })?;
+    Ok((multipart, model_name))
 }
 
 pub(crate) async fn images_edits(
@@ -423,14 +424,14 @@ pub(crate) async fn images_edits(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     // The job goes where the family is held and a card holds it whole.
-    let mut multipart =
+    let (mut multipart, upload_model) =
         match image_upload_where_the_model_is(&state, &headers, body, "/v1/images/edits").await {
-            Ok(multipart) => multipart,
+            Ok(parsed) => parsed,
             Err(answer) => return answer,
         };
     // One media job at a time: two diffusion engines cannot share these cards,
     // and letting them try is what produced the OOM storm (see `media_gate`).
-    let _media_guard = state.media_lock().await;
+    let _media_guard = state.media_lock_for(&upload_model, "image edit").await;
     use base64::Engine as _;
 
     let err_resp = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {
@@ -937,7 +938,7 @@ pub(crate) async fn images_variations(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     // The job goes where the family is held and a card holds it whole.
-    let mut multipart = match image_upload_where_the_model_is(
+    let (mut multipart, upload_model) = match image_upload_where_the_model_is(
         &state,
         &headers,
         body,
@@ -945,12 +946,12 @@ pub(crate) async fn images_variations(
     )
     .await
     {
-        Ok(multipart) => multipart,
+        Ok(parsed) => parsed,
         Err(answer) => return answer,
     };
     // One media job at a time: two diffusion engines cannot share these cards,
     // and letting them try is what produced the OOM storm (see `media_gate`).
-    let _media_guard = state.media_lock().await;
+    let _media_guard = state.media_lock_for(&upload_model, "image variation").await;
     use base64::Engine as _;
 
     let err_resp = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {
