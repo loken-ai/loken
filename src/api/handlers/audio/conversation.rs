@@ -604,6 +604,9 @@ pub(crate) async fn conversation_handler(
         #[cfg(feature = "image")]
         ConvRoute::ImageGen => {
             let model = s("image_model").unwrap_or_else(|| "z-image".to_string());
+            // One media job at a time, and this turn listed from its load on: the
+            // load is most of the wait, and a listing that misses it says idle.
+            let _media_guard = state.media_lock_for(&model, "image").await;
             // This route names no size, so it renders at the family default -
             // which is what the placement must reserve scratch for.
             let side = match crate::api::handlers::media::image_model_defaults(&model) {
@@ -623,7 +626,6 @@ pub(crate) async fn conversation_handler(
                 );
             }
             let subject = image_subject(&user_text);
-            let _media_guard = state.media_lock_for(&model, "image").await;
             match state
                 .image_engine
                 .generate_image(&subject, ImageGenParams::default())
