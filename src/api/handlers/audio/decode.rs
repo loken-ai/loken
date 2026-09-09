@@ -677,7 +677,12 @@ pub(crate) async fn audio_generations(
                     .map(|m| m.len())
                     .unwrap_or(0)
             };
-            sz("acestep-5Hz-lm-4B-Q8_0.gguf").max(sz("acestep-v15-turbo-Q8_0.gguf"))
+            // The language model whole, with its KV cache and step reserve, or the
+            // denoiser's weights: whichever is larger is what a card must hold.
+            let lm =
+                crate::inference::model::acestep::fsq::acestep_gguf("acestep-5Hz-lm-4B-Q8_0.gguf");
+            crate::inference::model::acestep::lm::placement_demand(lm.to_str().unwrap_or(""))
+                .max(sz("acestep-v15-turbo-Q8_0.gguf"))
         };
         crate::inference::place::vram_manager::ensure_gpu_headroom("music", hot, 2 << 30).await;
     }

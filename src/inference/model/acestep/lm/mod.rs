@@ -282,11 +282,36 @@ const GRAPH_BUCKET: usize = 256;
 /// the sampler.
 const CFG_ROWS: usize = 2;
 
+/// The checkpoint's geometry: width, heads, KV heads, head size, feed-forward width,
+/// layers and vocabulary.
+const LM_GEOMETRY: (usize, usize, usize, usize, usize, usize, usize) =
+    (2560, 32, 8, 128, 9728, 36, 217204);
+
+/// The context the KV cache is reserved for.
+const LM_KV_HORIZON: u64 = 8192;
+
+/// F32 KV bytes one layer holds over the reserve horizon.
+fn kv_bytes_per_layer() -> u64 {
+    let (_, _, nkv, d, _, _, _) = LM_GEOMETRY;
+    2 * nkv as u64 * d as u64 * LM_KV_HORIZON * 4
+}
+
+/// What a card must hold to run the language model whole: the weights, the KV cache the
+/// plan reserves for every layer, and the step reserve. This is the figure the pressure
+/// protocol has to ask for; the weights alone let a card pass that then spilled a third
+/// of the layers onto the host.
+pub fn placement_demand(path: &str) -> u64 {
+    let (h, _, _, _, ffn, n_layers, _) = LM_GEOMETRY;
+    let weights = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    weights
+        + n_layers as u64 * kv_bytes_per_layer()
+        + crate::inference::place::audio_demand::lm_reserve(n_layers, h, ffn, CFG_ROWS)
+}
+
 impl Qwen3Lm {
     /// Load the 4B LM (Q8 weights kept quantized) from its GGUF.
     pub fn from_gguf(path: &str) -> Result<Self> {
-        let (h, nh, nkv, d, ffn, n_layers, vocab) =
-            (2560usize, 32, 8, 128, 9728usize, 36usize, 217204usize);
+        let (h, nh, nkv, d, ffn, n_layers, vocab) = LM_GEOMETRY;
         // Standard placement (same mechanism as every other model): build a HeteroPlan
         // from the real free VRAM (pack-first on the fastest GPU, else greedy split,
         // remainder -> CPU) instead of an ad-hoc all-on-GPU0. The per-layer activation is
@@ -300,16 +325,15 @@ impl Qwen3Lm {
                 "ace-step LM: cannot size the checkpoint {path}: {e}"
             ))
         })?;
-        let max_ctx = 8192u64; // KV reserve horizon
-        let kv_per_layer = 2 * nkv as u64 * d as u64 * max_ctx * 4; // F32 KV
-                                                                    // Headroom left free on each card after weights+KV: covers the decode graph
-                                                                    // arena + transient scratch AND a moderate concurrent VRAM consumer, so
-                                                                    // placement spills to CPU/another GPU before a post-probe alloc can OOM
-                                                                    // mid-render. Sized from the step this checkpoint will actually capture rather
-                                                                    // than fixed - the arena has to hold every layer's transients at once, so a deeper
-                                                                    // or wider checkpoint needs proportionally more and used to be handed the same
-                                                                    // figure as the one the reserve was validated on. Ample-VRAM placement at that
-                                                                    // reference geometry is unchanged (the model still packs on GPU0).
+        let kv_per_layer = kv_bytes_per_layer(); // F32 KV over the reserve horizon
+                                                 // Headroom left free on each card after weights+KV: covers the decode graph
+                                                 // arena + transient scratch AND a moderate concurrent VRAM consumer, so
+                                                 // placement spills to CPU/another GPU before a post-probe alloc can OOM
+                                                 // mid-render. Sized from the step this checkpoint will actually capture rather
+                                                 // than fixed - the arena has to hold every layer's transients at once, so a deeper
+                                                 // or wider checkpoint needs proportionally more and used to be handed the same
+                                                 // figure as the one the reserve was validated on. Ample-VRAM placement at that
+                                                 // reference geometry is unchanged (the model still packs on GPU0).
         let reserve: u64 =
             crate::inference::place::audio_demand::lm_reserve(n_layers, h, ffn, CFG_ROWS);
         let mut cudas = crate::inference::place::vram_manager::probe_under_pressure(reserve);
@@ -1906,3 +1930,19 @@ fn sample_audio_cfg(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod demand_tests {
+    /// A card that holds the weights alone does not hold the model: the KV cache and the
+    /// step reserve come with them, so the demand is always more than the file.
+    #[test]
+    fn the_placement_demand_exceeds_the_weights() {
+        let dir = std::env::temp_dir().join(format!("ace-lm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lm.gguf");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let demand = super::placement_demand(path.to_str().unwrap());
+        assert!(demand > 4096 + super::kv_bytes_per_layer());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
