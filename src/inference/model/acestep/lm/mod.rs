@@ -72,6 +72,9 @@ pub struct Qwen3Lm {
     v_cache: Vec<Option<Tensor>>,
     cached: usize,
     device: Device,
+    /// Whether the captured decode graph may be used; the eager path is the reference
+    /// the graph is measured against, and a test turns the graph off to compare them.
+    graph_enabled: bool,
     // Reusable per-device decode scratch (interior-mutable: the hot decode path
     // borrows `&self`). Built lazily on first use per device, then reused for the
     // whole stream - removes the per-row/per-layer/per-token host Vec build +
@@ -311,6 +314,13 @@ pub fn placement_demand(path: &str) -> u64 {
 impl Qwen3Lm {
     /// Load the 4B LM (Q8 weights kept quantized) from its GGUF.
     pub fn from_gguf(path: &str) -> Result<Self> {
+        Self::from_gguf_placed(path, None)
+    }
+
+    /// Load with the cards' room given rather than probed: `budget` names the bytes each
+    /// card may take, in the order the plan packs them. The tests place a model across
+    /// two cards on purpose with it; a render never passes one.
+    pub fn from_gguf_placed(path: &str, budget: Option<&[(usize, u64)]>) -> Result<Self> {
         let (h, nh, nkv, d, ffn, n_layers, vocab) = LM_GEOMETRY;
         // Standard placement (same mechanism as every other model): build a HeteroPlan
         // from the real free VRAM (pack-first on the fastest GPU, else greedy split,
@@ -336,14 +346,19 @@ impl Qwen3Lm {
                                                  // reference geometry is unchanged (the model still packs on GPU0).
         let reserve: u64 =
             crate::inference::place::audio_demand::lm_reserve(n_layers, h, ffn, CFG_ROWS);
-        let mut cudas = crate::inference::place::vram_manager::probe_under_pressure(reserve);
-        // SINGLE-CUDA(+CPU) plans only: neither the decode graph (single-device arena) nor the
-        // eager per-layer path produces correct output when layers span TWO cuda cards today
-        // (graph capture aborts on the cross-device scatter_set; eager runs but yields no
-        // valid codes). Keep the fastest card, spill the remainder to CPU - the historically
-        // validated topology - until the cross-CUDA decode is actually implemented+validated.
-        cudas.truncate(1);
-        let cuda_budget: Vec<(usize, u64)> = cudas.iter().map(|(i, f, _)| (*i, *f)).collect();
+        let cudas = crate::inference::place::vram_manager::probe_under_pressure(reserve);
+        // Every card takes part: the plan packs the fastest first, spills to the next, and
+        // puts on the host only what no card holds. The captured decode graph runs on one
+        // card; a plan that spans several takes the eager per-layer path, which moves the
+        // activation to each layer's card, as `cross_card_matches_single_card` verifies.
+        let cuda_budget: Vec<(usize, u64)> = match budget {
+            Some(given) => given
+                .iter()
+                .filter(|(i, _)| cudas.iter().any(|(c, _, _)| c == i))
+                .copied()
+                .collect(),
+            None => cudas.iter().map(|(i, f, _)| (*i, *f)).collect(),
+        };
         let plan = HeteroPlan::calculate_with_kv_reserve(
             // The budgets below ALREADY exclude the reserve: `probe_under_pressure` probes through
             // `probe_cuda_devices`, which returns `stable_free - reserve`. Passing it again here
@@ -395,9 +410,21 @@ impl Qwen3Lm {
         // capture-clean. The whole ace-lm pipeline runs serially on each device's
         // primary stream, so manual cross-stream sync is not needed (same contract as
         // the LLM graph-decode paths). acestep-only - does not touch LLM placement.
+        // Only a model whole on one card captures a graph. Across cards the per-tensor
+        // events are what order a copy from one card to the next; without them a layer
+        // reads an activation the other card is still writing, and the decode diverges
+        // from the second token on.
+        let cuda_segments = plan
+            .segments
+            .iter()
+            .filter(|s| matches!(s.kind, DeviceKind::Cuda(_)))
+            .count();
         #[cfg(feature = "cuda")]
         for (_, _, dv) in &cudas {
             if let Device::Cuda(c) = dv {
+                if cuda_segments > 1 {
+                    continue;
+                }
                 unsafe {
                     c.context().disable_event_tracking();
                 }
@@ -487,6 +514,7 @@ impl Qwen3Lm {
             v_cache: (0..n_layers).map(|_| None).collect(),
             cached: 0,
             scratch: RefCell::new(Vec::new()),
+            graph_enabled: true,
             device: primary,
             hidden: h,
             n_head: nh,
@@ -540,6 +568,18 @@ impl Qwen3Lm {
 
     /// The reusable rms-norm reduction vector `ones[n,1]` on `dev` (cached per n),
     /// so `rms_norm_t` never allocates a fresh ones-vector per call.
+    /// Allow or forbid the captured decode graph; off, every step takes the eager path.
+    pub fn set_graph(&mut self, on: bool) {
+        self.graph_enabled = on;
+    }
+
+    /// Whether every layer sits on the primary card, which is what the captured decode
+    /// graph needs: its arena and its scatter live on one device.
+    fn on_one_card(&self) -> bool {
+        let key = dev_key(&self.device);
+        self.layers.iter().all(|l| dev_key(&l.device) == key)
+    }
+
     fn ones_for(&self, n: usize, dev: &Device) -> Result<Tensor> {
         let key = dev_key(dev);
         {
@@ -1424,7 +1464,7 @@ impl Qwen3Lm {
         // kernel-launch flood that pegs a host core (36 layers x 2 CFG rows x ~15 ops).
         // Any capture or replay error falls back to eager for the rest of the run.
         #[cfg(feature = "cuda")]
-        let mut use_graph = self.device.is_cuda();
+        let mut use_graph = self.device.is_cuda() && self.on_one_card() && self.graph_enabled;
         let _prof = std::env::var("ACE_LM_PROF").is_ok();
         let (mut _t_s, mut _t_f, mut _t_l) = (0f64, 0f64, 0f64);
         loop {

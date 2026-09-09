@@ -11,7 +11,6 @@ use std::io::Cursor;
 use memmap2::Mmap;
 
 use crate::cli::DynErr;
-use crate::config::Config;
 use crate::inference::engine::llm_engine::{build_tokenizer_from_gguf, KvQuant};
 use crate::inference::generic_transformer::GenericHeteroTransformer;
 use crate::inference::place::layer_executor::HeteroPlan;

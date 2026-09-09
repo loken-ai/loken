@@ -1254,10 +1254,6 @@ impl APIServer {
 
     /// Serialize one media job (load + generate) against every other media job.
     /// Held for the whole request; LLM generations are deliberately not gated.
-    pub(crate) async fn media_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.media_gate.lock().await
-    }
-
     /// Take the media gate for a render of `model`, recorded as a running job for as long
     /// as the guard lives.
     pub(crate) async fn media_lock_for(&self, model: &str, kind: &'static str) -> MediaGuard<'_> {

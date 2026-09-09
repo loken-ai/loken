@@ -158,3 +158,177 @@ fn validate_lm_prefill_vs_oracle() {
     assert!(cos > 0.999, "LM logits cosine {cos} too low");
     assert!(rank < 8, "my top token outside oracle top-8 (rank {rank})");
 }
+
+// A plan that spans two cards must decode the same codes as the whole model on one card,
+// on the eager path both: the graph replays the eager step and is compared to it by
+// `graph_matches_eager`.
+// the eager per-layer path moves the activation to each layer's card, and nothing else
+// may differ. The split is forced with an explicit budget that leaves the first card room
+// for roughly half the layers.
+#[test]
+#[ignore = "needs LM GGUF (config.test HF hub); two GPUs"]
+fn cross_card_matches_single_card() {
+    let g = crate::inference::model::acestep::fsq::acestep_gguf("acestep-5Hz-lm-4B-Q8_0.gguf");
+    let gp = g.to_str().unwrap();
+    let tok = super::acestep_tokenizer(gp).unwrap();
+    let cot = super::build_cot_yaml(120, "energetic EDM, 120 BPM", 8, "", "en", "4");
+    let (cap, lyr) = (
+        "energetic EDM, four-on-the-floor, bright synths, 120 BPM",
+        "We run all night,\nthe city lights.",
+    );
+    let whole = {
+        let mut lm = super::Qwen3Lm::from_gguf(gp).unwrap();
+        assert!(
+            lm.on_one_card(),
+            "the whole model is expected to fit one card here"
+        );
+        lm.set_graph(false);
+        lm.generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0)
+            .unwrap()
+    };
+    let split = {
+        let half = super::placement_demand(gp) / 2;
+        let mut lm =
+            super::Qwen3Lm::from_gguf_placed(gp, Some(&[(0, half), (1, u64::MAX / 4)])).unwrap();
+        assert!(!lm.on_one_card(), "the budget was meant to split the model");
+        lm.generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0)
+            .unwrap()
+    };
+    let nmatch = whole.iter().zip(&split).take_while(|(a, b)| a == b).count();
+    println!(
+        "matching prefix = {nmatch}/{}",
+        whole.len().min(split.len())
+    );
+    assert_eq!(
+        whole, split,
+        "the split decode diverged (first diff at {nmatch})"
+    );
+}
+
+// The captured graph replays the eager step: the codes it decodes must be the eager ones.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs LM GGUF (config.test HF hub); GPU"]
+fn graph_matches_eager() {
+    let g = crate::inference::model::acestep::fsq::acestep_gguf("acestep-5Hz-lm-4B-Q8_0.gguf");
+    let gp = g.to_str().unwrap();
+    let tok = super::acestep_tokenizer(gp).unwrap();
+    let cot = super::build_cot_yaml(120, "energetic EDM, 120 BPM", 8, "", "en", "4");
+    let (cap, lyr) = (
+        "energetic EDM, four-on-the-floor, bright synths, 120 BPM",
+        "We run all night,\nthe city lights.",
+    );
+    let mut lm = super::Qwen3Lm::from_gguf(gp).unwrap();
+    let graph = lm
+        .generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0)
+        .unwrap();
+    lm.set_graph(false);
+    let eager = lm
+        .generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0)
+        .unwrap();
+    let nmatch = graph.iter().zip(&eager).take_while(|(a, b)| a == b).count();
+    println!(
+        "matching prefix = {nmatch}/{}",
+        graph.len().min(eager.len())
+    );
+    assert_eq!(
+        graph, eager,
+        "the graph diverged from eager (first diff at {nmatch})"
+    );
+}
+
+// The capped attention against the plain one on synthetic rows: the same query, the
+// same cache filled to the same position, the write and the read through each path.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs LM GGUF (config.test HF hub); GPU"]
+fn capped_attention_matches_plain() {
+    use crate::tensor::{DType, Tensor};
+    let g = crate::inference::model::acestep::fsq::acestep_gguf("acestep-5Hz-lm-4B-Q8_0.gguf");
+    let gp = g.to_str().unwrap();
+    let lm = super::Qwen3Lm::from_gguf(gp).unwrap();
+    let (nh, nkv, d) = (lm.n_head, lm.n_kv, lm.head_dim);
+    let dev = lm.device.clone();
+    let mut seed = 7u64;
+    let mut rand = |n: usize, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                ((seed % 20001) as f32 / 10000.0 - 1.0) * scale
+            })
+            .collect()
+    };
+    let mut worst = 0f32;
+    for trial in 0..24 {
+        let scale = [0.5f32, 2.0, 8.0, 32.0][trial % 4];
+        let pos = 7 + trial % 5;
+        let cap = super::GRAPH_BUCKET;
+        let mut kc: Option<Tensor> =
+            Some(Tensor::zeros_on(vec![1, nkv, super::MAX_SEQ, d], DType::F32, &dev).unwrap());
+        let mut vc: Option<Tensor> =
+            Some(Tensor::zeros_on(vec![1, nkv, super::MAX_SEQ, d], DType::F32, &dev).unwrap());
+        let kc2 = Tensor::zeros_on(vec![1, nkv, super::MAX_SEQ, d], DType::F32, &dev).unwrap();
+        let vc2 = Tensor::zeros_on(vec![1, nkv, super::MAX_SEQ, d], DType::F32, &dev).unwrap();
+        for p in 0..pos {
+            let k = Tensor::from_vec_f32(rand(nkv * d, scale), vec![1, nkv, 1, d])
+                .unwrap()
+                .to_device(&dev)
+                .unwrap();
+            let v = Tensor::from_vec_f32(rand(nkv * d, 1.0), vec![1, nkv, 1, d])
+                .unwrap()
+                .to_device(&dev)
+                .unwrap();
+            kc.as_ref().unwrap().slice_set(&k, 2, p).unwrap();
+            vc.as_ref().unwrap().slice_set(&v, 2, p).unwrap();
+            kc2.slice_set(&k, 2, p).unwrap();
+            vc2.slice_set(&v, 2, p).unwrap();
+        }
+        let q = Tensor::from_vec_f32(rand(nh * d, scale), vec![1, nh, 1, d])
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let k_new = Tensor::from_vec_f32(rand(nkv * d, scale), vec![1, nkv, 1, d])
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let v_new = Tensor::from_vec_f32(rand(nkv * d, 1.0), vec![1, nkv, 1, d])
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let plain = lm
+            .attn_row(&q, &k_new, &v_new, pos, &mut kc, &mut vc)
+            .unwrap()
+            .to_vec_f32();
+        let widx = Tensor::from_vec_i64(vec![pos as i64; nkv * d], vec![1, nkv, 1, d])
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let mask: Vec<f32> = (0..cap)
+            .map(|j| if j > pos { f32::NEG_INFINITY } else { 0.0 })
+            .collect();
+        let mask = Tensor::from_vec_f32(mask, vec![1, 1, 1, cap])
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let capped = lm
+            .attn_row_capped(&q, &k_new, &v_new, &widx, &mask, cap, &kc2, &vc2)
+            .unwrap()
+            .to_vec_f32();
+        let diff = plain
+            .iter()
+            .zip(&capped)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let size = plain.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        println!(
+            "trial {trial:2} scale {scale:5} pos {pos}: max abs diff {diff:e} (size {size:e})"
+        );
+        worst = worst.max(diff);
+    }
+    assert!(
+        worst < 1e-4,
+        "the capped attention differs from the plain one by {worst:e}"
+    );
+}
