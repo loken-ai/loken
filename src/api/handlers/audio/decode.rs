@@ -624,6 +624,24 @@ fn error_event(message: String) -> String {
     serde_json::json!({"status": "error", "error": message}).to_string()
 }
 
+/// The catalogue entry a generation request asks for. ACE-Step is one name in the request
+/// and one entry per DiT checkpoint in the catalogue, so the variant joins the name.
+pub(crate) fn catalogue_name(body: &serde_json::Value) -> String {
+    let requested = str_field(body, "model").to_ascii_lowercase();
+    if requested != "ace-step" && requested != "acestep" {
+        return requested;
+    }
+    let variant = match str_field(body, "dit_model").to_ascii_lowercase().as_str() {
+        "sft" => "sft",
+        "base" => "base",
+        "xl-turbo" => "xl-turbo",
+        "xl-sft" | "xl" => "xl-sft",
+        "xl-base" => "xl-base",
+        _ => "turbo",
+    };
+    format!("ace-step-{variant}")
+}
+
 pub(crate) async fn audio_generations(
     _state: axum::extract::State<APIServer>,
     headers: axum::http::HeaderMap,
@@ -633,7 +651,7 @@ pub(crate) async fn audio_generations(
     // The job goes to a node whose catalogue holds the model when this one's does not.
     {
         use crate::distributed::routing::can_serve;
-        let requested = str_field(&body.0, "model").to_ascii_lowercase();
+        let requested = catalogue_name(&body.0);
         let holds = |n: &crate::distributed::membership::NodeState| {
             if requested.is_empty() {
                 can_serve(n, "stable-audio") || can_serve(n, "ezaudio")

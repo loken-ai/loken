@@ -704,3 +704,21 @@ fn a_repository_without_weights_is_not_advertised() {
     )));
     assert!(super::holds_weights(&entry("ollama", &[])));
 }
+
+#[cfg(feature = "audio")]
+#[test]
+fn a_music_request_names_the_catalogue_entry_of_its_checkpoint() {
+    use serde_json::json;
+    let name = super::audio::catalogue_name;
+    assert_eq!(
+        name(&json!({"model": "ace-step", "dit_model": "xl-sft"})),
+        "ace-step-xl-sft"
+    );
+    assert_eq!(
+        name(&json!({"model": "acestep", "dit_model": "xl"})),
+        "ace-step-xl-sft"
+    );
+    assert_eq!(name(&json!({"model": "ace-step"})), "ace-step-turbo");
+    assert_eq!(name(&json!({"model": "stable-audio"})), "stable-audio");
+    assert_eq!(name(&json!({})), "");
+}
