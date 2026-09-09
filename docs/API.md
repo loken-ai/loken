@@ -67,6 +67,8 @@ models as unknown.
 | `POST /v1/video/generations` | `video` | Text- and image-conditioned clips. `POST /api/video/plan` says what a clip of a given length will cost before rendering it. |
 | `GET /v1/renders`, `POST /v1/renders/{id}/cancel` | `image` | Renders in flight, and cancelling one. |
 
+A streamed render on any of these routes sends events with `status`, `phase`, `phase_label`, `step`, `total` and `elapsed_ms`, and every event carries `node`: the name of the node that renders, so a client behind a hand-over sees where its work is, or null when the server runs alone.
+
 ## Messages API surface
 
 | Route | What it does |

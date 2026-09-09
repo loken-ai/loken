@@ -594,15 +594,28 @@ fn trimmed_field(b: &serde_json::Value, keys: &[&str]) -> String {
 }
 
 /// The progress event every render route emits while it works.
-fn rendering_event(phase: &str, step: usize, total: usize, since: std::time::Instant) -> String {
+fn rendering_event(
+    phase: &str,
+    step: usize,
+    total: usize,
+    since: std::time::Instant,
+    node: Option<&str>,
+) -> String {
     serde_json::json!({
         "status": "rendering",
         "phase": phase,
         "phase_label": crate::inference::serve::progress::label(phase),
         "step": step, "total": total,
         "elapsed_ms": since.elapsed().as_millis() as u64,
+        "node": node,
     })
     .to_string()
+}
+
+/// The first event of a streamed render: the model, and the node that renders it, null
+/// when this one runs alone.
+fn started_event(model: &str, node: Option<&str>) -> String {
+    serde_json::json!({"status": "started", "model": model, "node": node}).to_string()
 }
 
 /// The terminal event: one clip, how long it took, and what it cost when that could be
@@ -925,6 +938,7 @@ pub(crate) async fn audio_generations(
                 .map_err(|e| e.to_string())?;
             std::fs::read(&out_read).map_err(|e| format!("read rendered wav: {e}"))
         });
+        let node_s = _state.node_name();
         let t0m = std::time::Instant::now();
         let stream = async_stream::stream! {
             // Lives with the stream, not the handler call - see the stable-audio branch.
@@ -932,10 +946,9 @@ pub(crate) async fn audio_generations(
             // So does the media gate and the job record: the render runs on past the
             // handler, and both must last as long as it does.
             let _media_guard = _media_guard;
-            yield Ok::<_, axum::Error>(Event::default().data(
-                serde_json::json!({"status": "started", "model": model_s}).to_string()));
+            yield Ok::<_, axum::Error>(Event::default().data(started_event(&model_s, node_s.as_deref())));
             while let Some((phase, step, total)) = rx.recv().await {
-                yield Ok(Event::default().data(rendering_event(&phase, step, total, t0m)));
+                yield Ok(Event::default().data(rendering_event(&phase, step, total, t0m, node_s.as_deref())));
             }
             let result = handle.await;
             _cancel_guard.disarm();
@@ -1037,16 +1050,16 @@ pub(crate) async fn audio_generations(
             )
             .map_err(|e| e.to_string())
         });
+        let node_s = _state.node_name();
         let t0m = std::time::Instant::now();
         let stream = async_stream::stream! {
             // The guard must live as long as the STREAM, not the handler call: it
             // is what turns "the client stopped reading" into a stopped sampler.
             let _cancel_guard = guard_s;
             let _media_guard = _media_guard;
-            yield Ok::<_, axum::Error>(Event::default().data(
-                serde_json::json!({"status": "started", "model": model_s}).to_string()));
+            yield Ok::<_, axum::Error>(Event::default().data(started_event(&model_s, node_s.as_deref())));
             while let Some((phase, step, total)) = rx.recv().await {
-                yield Ok(Event::default().data(rendering_event(&phase, step, total, t0m)));
+                yield Ok(Event::default().data(rendering_event(&phase, step, total, t0m, node_s.as_deref())));
             }
             let rendered = handle.await;
             _cancel_guard.disarm();
@@ -1100,12 +1113,12 @@ pub(crate) async fn audio_generations(
             .map(|(pcm, _)| pcm)
             .map_err(|e| e.to_string())
         });
+        let node_s = _state.node_name();
         let t0m = std::time::Instant::now();
         let stream = async_stream::stream! {
-            yield Ok::<_, axum::Error>(Event::default().data(
-                serde_json::json!({"status": "started", "model": model_s}).to_string()));
+            yield Ok::<_, axum::Error>(Event::default().data(started_event(&model_s, node_s.as_deref())));
             while let Some((phase, step, total)) = rx.recv().await {
-                yield Ok(Event::default().data(rendering_event(&phase, step, total, t0m)));
+                yield Ok(Event::default().data(rendering_event(&phase, step, total, t0m, node_s.as_deref())));
             }
             match handle.await {
                 Ok(Ok(pcm)) => {
@@ -2387,7 +2400,10 @@ pub(super) fn tts_events_response(
     let cancel = crate::inference::serve::cancel::CancelToken::new();
     let id_for_event = render_id.clone();
     let t0 = std::time::Instant::now();
-    let ev = |v: serde_json::Value| {
+    // Every event names the node that speaks, null when it runs alone.
+    let node = state.node_name();
+    let ev = move |mut v: serde_json::Value| {
+        v["node"] = serde_json::json!(node);
         Ok::<Event, std::convert::Infallible>(Event::default().data(v.to_string()))
     };
 

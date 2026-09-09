@@ -587,6 +587,7 @@ pub(crate) async fn handle_image_generation(
         // For re-planning a render that runs out of VRAM: this route names no size,
         // so it renders at the family default and reserves for that.
         let stream_state = state.clone();
+        let node_s = state.node_name();
         let stream_geom = crate::inference::place::runtime_demand::RequestGeometry::new(
             defaults.size,
             defaults.size,
@@ -622,6 +623,7 @@ pub(crate) async fn handle_image_generation(
                                 "created_at": chrono::Utc::now().to_rfc3339(),
                                 "response": msg,
                                 "done": false,
+                                "node": node_s,
                             });
                             yield Ok::<_, axum::Error>(Event::default().data(chunk.to_string()));
                         }
@@ -696,6 +698,7 @@ pub(crate) async fn handle_image_generation(
                                     "done": false,
                                     "completed": completed,
                                     "total": total,
+                                    "node": node_s,
                                 });
                                 yield Ok(Event::default().data(chunk.to_string()));
                             }

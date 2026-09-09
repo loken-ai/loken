@@ -649,6 +649,7 @@ pub(crate) async fn video_generations(
             },
         );
         let t0 = std::time::Instant::now();
+        let node_s = state.node_name();
         let stream = async_stream::stream! {
             // Owned by the STREAM future: dropped when the SSE client disconnects (or the
             // stream ends), firing the render's cancel token. Disarmed on normal completion
@@ -665,7 +666,7 @@ pub(crate) async fn video_generations(
             let _media_guard = _media_guard;
             yield Ok::<_, axum::Error>(Event::default().data(
                 serde_json::json!({"status": "started", "model": model_s, "total": steps,
-                                   "id": id_for_event}).to_string()));
+                                   "id": id_for_event, "node": node_s}).to_string()));
             while let Some((phase, step, total)) = rx.recv().await {
                 // `phase` is new; `step`/`total` keep their meaning, so a client that
                 // only reads those is unaffected and simply learns nothing new.
@@ -675,6 +676,7 @@ pub(crate) async fn video_generations(
                     "phase_label": crate::inference::serve::progress::label(&phase),
                     "step": step, "total": total,
                     "elapsed_ms": t0.elapsed().as_millis() as u64,
+                    "node": node_s,
                 }).to_string()));
             }
             match handle.await {

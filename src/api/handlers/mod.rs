@@ -1395,6 +1395,15 @@ impl APIServer {
             >= bytes
     }
 
+    /// How this node is named to its peers; none when it runs alone. Stamped on every
+    /// event a render streams, so a client behind a hand-over knows where the work is.
+    pub(crate) fn node_name(&self) -> Option<String> {
+        self.cluster
+            .as_ref()
+            .map(|c| c.config.node_id.clone())
+            .filter(|n| !n.is_empty())
+    }
+
     /// The media jobs running now.
     pub(crate) fn media_jobs(&self) -> Vec<MediaJob> {
         self.media_jobs
