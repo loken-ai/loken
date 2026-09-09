@@ -624,6 +624,25 @@ pub enum Headroom {
     /// CUDA exists but stayed full for the whole wait: every card is held by work
     /// that is IN FLIGHT, so nothing could be reclaimed.
     Busy,
+    /// The cards of this machine, all of them empty, would not hold it: a matter of
+    /// capacity, not occupancy, so there is no gap to wait for. The caller's plan
+    /// spills to the host.
+    Spills,
+}
+
+/// What every card of this machine holds together, bytes.
+pub fn total_gpu_capacity() -> u64 {
+    #[cfg(feature = "cuda")]
+    {
+        crate::inference::place::device_probe::probe_cuda_gpus(1.0)
+            .iter()
+            .map(|g| g.total)
+            .sum()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0
+    }
 }
 
 /// [`ensure_gpu_headroom`] with a bounded wait.
@@ -674,12 +693,26 @@ pub async fn ensure_gpu_headroom_within(
     // wrong: a request arriving while another generation holds VRAM then fails
     // outright rather than taking its turn.
     let deadline = std::time::Instant::now() + max_wait;
+    if hot_bytes > total_gpu_capacity() {
+        tracing::info!(
+            "vram_manager: '{caller}' needs {:.1} GB and the cards hold {:.1} GB together; \
+             the plan spills to the host",
+            hot_bytes as f64 / 1e9,
+            total_gpu_capacity() as f64 / 1e9
+        );
+        return Headroom::Spills;
+    }
     if hot_bytes > largest_gpu_capacity() {
         let mut announced = false;
         loop {
             let total = combined_free();
             if total >= hot_bytes {
                 return spans_devices("larger than any single card", total);
+            }
+            // Idle residents of other engines are what stands between the cards and the
+            // render; they are reclaimed before any waiting, as on a single card.
+            if reclaim_idle_for(caller).await > 0 {
+                continue;
             }
             if std::time::Instant::now() >= deadline {
                 return Headroom::Busy;
@@ -732,6 +765,40 @@ pub async fn ensure_gpu_headroom_within(
 /// reclaimers remain. Returns true when a card has room; false means the caller's plan should
 /// spill (hetero split / CPU) - which its OOM cascade already handles, so this can never
 /// hard-fail a request.
+/// Reclaim every idle resident of another engine, least recently used first, until one
+/// gives something back. Returns the bytes freed, zero when nothing could be.
+async fn reclaim_idle_for(caller: &'static str) -> u64 {
+    let order: Vec<&'static str> = {
+        let map = reclaimers().lock().unwrap_or_else(|e| e.into_inner());
+        let mut v: Vec<(&'static str, u64)> = map
+            .iter()
+            .filter(|(n, _)| **n != caller)
+            .map(|(n, r)| (*n, r.last_used.load(Ordering::Relaxed)))
+            .collect();
+        v.sort_by_key(|(_, t)| *t);
+        v.into_iter().map(|(n, _)| n).collect()
+    };
+    for name in order {
+        let fut = {
+            let map = reclaimers().lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(name) {
+                Some(r) => (r.hook)(),
+                None => continue,
+            }
+        };
+        let freed = fut.await;
+        #[cfg(feature = "cuda")]
+        crate::inference::engine::llm_engine::release_cuda_pools();
+        if freed > 0 {
+            tracing::info!(
+                "vram_manager: reclaimed idle '{name}' ({freed} component(s)) for {caller}'s hot component"
+            );
+            return freed;
+        }
+    }
+    0
+}
+
 pub async fn ensure_gpu_headroom(caller: &'static str, hot_bytes: u64, reserve: u64) -> bool {
     let fits = |probe: &[(usize, u64, crate::tensor::Device)]| {
         probe.iter().any(|(_, free, _)| *free >= hot_bytes)

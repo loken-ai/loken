@@ -360,6 +360,15 @@ pub(crate) async fn ensure_image_model_loaded_reporting(
         {
             // No CUDA at all: the CPU path is the intended one here.
             Headroom::Ready | Headroom::NoGpu => {}
+            // No card of this machine holds it at any occupancy: the plan spills to the
+            // host and the listing says so, rather than a wait that no gap can end.
+            Headroom::Spills => {
+                tracing::info!(
+                    "image: no card of this machine holds {model_name} ({:.1} GB); the plan \
+                     spills to the host",
+                    hot as f64 / 1e9
+                );
+            }
             Headroom::Busy => {
                 return Err(format!(
                     "every GPU is busy with an in-flight generation and {model_name} needs                      {:.1} GB; retry in a moment (loading it on the CPU instead would not                      finish within the request timeout)",
