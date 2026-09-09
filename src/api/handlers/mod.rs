@@ -571,6 +571,7 @@ fn media_holder(
     model: &str,
     served_here: bool,
     fits_here: bool,
+    demand: u64,
     holds: impl Fn(&crate::distributed::membership::NodeState) -> bool,
 ) -> Option<(
     std::sync::Arc<crate::distributed::cluster::Cluster>,
@@ -585,10 +586,18 @@ fn media_holder(
         return None;
     }
     let now = crate::distributed::cluster_runtime::now_ms(state.cluster_started());
+    // A peer that holds the model in its catalogue but on no card of its size would take
+    // the render to its host: that is the render this node was trying not to run.
     let mut peers: Vec<_> = cluster
         .peer_view(now)
         .into_iter()
-        .filter(|p| !p.is_self && p.alive && p.endpoint.is_some() && holds(&p.state))
+        .filter(|p| {
+            !p.is_self
+                && p.alive
+                && p.endpoint.is_some()
+                && holds(&p.state)
+                && p.state.card_may_hold(demand)
+        })
         .collect();
     peers.sort_by(|a, b| {
         a.state
@@ -615,13 +624,14 @@ pub(crate) async fn route_media_to_holder(
     model: &str,
     served_here: bool,
     fits_here: bool,
+    demand: u64,
     holds: impl Fn(&crate::distributed::membership::NodeState) -> bool,
     relay: &Relay,
     body: &serde_json::Value,
 ) -> Option<axum::response::Response> {
     cluster_handle_publish(state).await;
     let (cluster, peer, url, now) =
-        media_holder(state, headers, model, served_here, fits_here, holds)?;
+        media_holder(state, headers, model, served_here, fits_here, demand, holds)?;
     match forward_to_peer(&url, relay, body).await {
         Ok(relayed) => Some(relayed),
         Err(e) => {
@@ -640,6 +650,7 @@ pub(crate) async fn route_upload_to_holder(
     model: &str,
     served_here: bool,
     fits_here: bool,
+    demand: u64,
     holds: impl Fn(&crate::distributed::membership::NodeState) -> bool,
     path: &str,
     body: &axum::body::Bytes,
@@ -647,7 +658,7 @@ pub(crate) async fn route_upload_to_holder(
     use axum::response::IntoResponse;
     cluster_handle_publish(state).await;
     let (cluster, peer, url, now) =
-        media_holder(state, headers, model, served_here, fits_here, holds)?;
+        media_holder(state, headers, model, served_here, fits_here, demand, holds)?;
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -1205,6 +1216,7 @@ impl APIServer {
                 })
                 .unwrap_or_default(),
             prefix_blocks: Vec::new(),
+            cards: self.usable_cards(),
             // Measured on this node's own work. Zero until something has run here, which a
             // peer reads as unknown and prices pessimistically - a node has to earn its
             // reputation rather than be granted one from a nameplate.
@@ -1388,6 +1400,21 @@ impl APIServer {
     /// Whether one card of this node has `bytes` of room under the configured fraction.
     /// A model that only fits split against the host is one a peer with a larger card
     /// should take, so every family's hand-over asks this with its own demand.
+    /// What each card admits as a whole load under the configured fraction, probed once:
+    /// a card's size does not change, and the gossip round must not pay an NVML pass.
+    pub(crate) fn usable_cards(&self) -> Vec<u64> {
+        static CARDS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+        CARDS
+            .get_or_init(|| {
+                let fraction = self.default_inference_config.max_gpu_memory_fraction;
+                crate::inference::place::device_probe::probe_cuda_gpus(1.0)
+                    .iter()
+                    .map(|g| (g.total as f64 * fraction) as u64)
+                    .collect()
+            })
+            .clone()
+    }
+
     pub(crate) fn card_holds(&self, bytes: u64) -> bool {
         crate::inference::place::device_probe::probe_cuda_gpus(
             self.default_inference_config.max_gpu_memory_fraction,

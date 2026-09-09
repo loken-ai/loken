@@ -447,20 +447,21 @@ pub(crate) async fn conversation_handler(
     #[cfg(feature = "image")]
     if route == ConvRoute::ImageGen {
         let model = s("image_model").unwrap_or_else(|| "z-image".to_string());
-        let fits = match crate::api::handlers::media::image_model_defaults(&model) {
-            Ok(d) => crate::api::handlers::media::image_fits_a_card(
+        let hot = match crate::api::handlers::media::image_model_defaults(&model) {
+            Ok(d) => crate::api::handlers::media::image_hot_bytes(
                 &state,
                 &model,
                 crate::inference::place::runtime_demand::RequestGeometry::new(d.size, d.size),
             ),
-            Err(_) => true,
+            Err(_) => 0,
         };
         if let Some(relayed) = crate::api::handlers::route_media_to_holder(
             &state,
             &headers,
             &model,
-            crate::api::handlers::media::image_served_here(&state, &model),
-            fits,
+            crate::api::handlers::media::image_served_here(&state, &model).await,
+            state.card_holds(hot),
+            hot,
             |peer| crate::api::handlers::media::serves_image_family(peer, &model),
             &crate::api::handlers::CONVERSATION,
             &req,
@@ -498,6 +499,7 @@ pub(crate) async fn conversation_handler(
                 },
                 holds(&local, &model),
                 true,
+                0,
                 |peer| holds(peer, &model),
                 &crate::api::handlers::CONVERSATION,
                 &req,

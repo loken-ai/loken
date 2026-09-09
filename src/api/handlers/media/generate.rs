@@ -47,25 +47,25 @@ pub(super) fn is_vram_exhaustion(e: &(dyn std::error::Error + Send + Sync)) -> b
 /// the second attempt also runs out, the pressure is not transient and the error is
 /// the honest answer.
 /// Whether this node has the weights `model_name` resolves to.
-pub(crate) fn image_served_here(state: &APIServer, model_name: &str) -> bool {
-    requested_checkpoint(&state.huggingface_models_dir, model_name).is_some()
+/// Whether this node's catalogue holds the family, judged by the same rule a peer is
+/// judged by. Judged by a checkpoint finder instead, a node that served the family from
+/// a hub directory answered no and handed its own renders to a smaller peer.
+pub(crate) async fn image_served_here(state: &APIServer, model_name: &str) -> bool {
+    serves_image_family(&state.local_node_state().await, model_name)
 }
 
-/// Whether one card of this node holds the family's hot component and this request's
-/// scratch whole: the same figure the admission below asks the pressure protocol for.
-/// A model that only fits split against the host is one a peer with a larger card
-/// should take.
-pub(crate) fn image_fits_a_card(
+/// What the family's hot component and this request's scratch take on one card: the
+/// figure the fit is judged by here, and the demand a peer's cards are judged by.
+pub(crate) fn image_hot_bytes(
     state: &APIServer,
     model_name: &str,
     geom: crate::inference::place::runtime_demand::RequestGeometry,
-) -> bool {
+) -> u64 {
     let Ok(loader) = image_family_loader(image_family(model_name)) else {
-        return true;
+        return 0;
     };
-    let hot = family_hot_bytes(&state.huggingface_models_dir, loader, model_name)
-        + family_runtime_bytes(&state.huggingface_models_dir, loader, model_name, geom);
-    state.card_holds(hot)
+    family_hot_bytes(&state.huggingface_models_dir, loader, model_name)
+        + family_runtime_bytes(&state.huggingface_models_dir, loader, model_name, geom)
 }
 
 /// Whether a peer's catalogue holds a checkpoint of the same image family as

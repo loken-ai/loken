@@ -892,6 +892,7 @@ async fn embed_where_the_model_is<R: serde::Serialize>(
         &model,
         served_here,
         true,
+        0,
         holds,
         relay,
         &body,

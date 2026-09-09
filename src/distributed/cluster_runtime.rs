@@ -41,6 +41,9 @@ pub struct PeerReport {
     pub lanes: u32,
     pub devices: Vec<String>,
     pub prefix_blocks: Vec<u64>,
+    /// What each card admits as a whole load, bytes; absent from an older build.
+    #[serde(default)]
+    pub cards: Vec<u64>,
     pub prefill_tok_per_s: f64,
     pub decode_tok_per_s: f64,
     pub model_load_s: f64,
@@ -77,6 +80,7 @@ impl PeerReport {
             serves: self.serves,
             link_gbps: Default::default(),
             prefix_blocks: self.prefix_blocks,
+            cards: self.cards,
         };
         (self.node_id, state, rates)
     }
@@ -295,6 +299,7 @@ mod tests {
             lanes: 0,
             devices: vec![],
             prefix_blocks: vec![],
+            cards: Vec::new(),
             prefill_tok_per_s: 0.0,
             decode_tok_per_s: 0.0,
             model_load_s: 0.0,
@@ -320,6 +325,7 @@ mod tests {
             lanes: 0,
             devices: vec!["cuda:0".into()],
             prefix_blocks: vec![1, 2, 3],
+            cards: Vec::new(),
             prefill_tok_per_s: 1800.0,
             decode_tok_per_s: 72.0,
             model_load_s: 18.0,
@@ -356,6 +362,7 @@ mod tests {
             lanes: 0,
             devices: vec![],
             prefix_blocks: vec![],
+            cards: Vec::new(),
             prefill_tok_per_s: 1.0,
             decode_tok_per_s: 2.0,
             model_load_s: 3.0,
@@ -365,5 +372,25 @@ mod tests {
         let back: PeerReport = serde_json::from_str(&s).unwrap();
         assert_eq!(back.node_id, "a");
         assert!((back.decode_tok_per_s - 2.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod card_wire_tests {
+    use super::PeerReport;
+
+    #[test]
+    fn a_report_from_an_older_build_carries_no_cards() {
+        let old = r#"{"node_id":"a","models":[],"serves":null,"load":0.0,"busy":0,"lanes":1,
+            "devices":[],"prefix_blocks":[],"prefill_tok_per_s":0.0,"decode_tok_per_s":0.0,
+            "model_load_s":0.0,"rates_by_model":{}}"#;
+        let report: PeerReport = serde_json::from_str(old).unwrap();
+        let (_, state, _) = report.split();
+        assert!(state.cards.is_empty());
+        let new = r#"{"node_id":"a","models":[],"serves":null,"load":0.0,"busy":0,"lanes":1,
+            "devices":[],"prefix_blocks":[],"cards":[17000000000],"prefill_tok_per_s":0.0,
+            "decode_tok_per_s":0.0,"model_load_s":0.0,"rates_by_model":{}}"#;
+        let report: PeerReport = serde_json::from_str(new).unwrap();
+        assert_eq!(report.split().1.cards, vec![17_000_000_000]);
     }
 }

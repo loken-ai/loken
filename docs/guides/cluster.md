@@ -7,11 +7,15 @@ Messages API. A request that only loads a model goes to a node that has it. Ever
 route that loads a model consults the cluster too: image generation, edits and variations,
 video, sound and music, speech, transcription and translation, embeddings, reranking, and
 each turn of the conversation route. A node without the weights, or without a card that
-holds the model whole, hands the request to the least loaded peer that has them, and an
-upload travels as it arrived. Each family asks with its own demand: an image family's hot
-component and scratch, the music model with its cache and reserve, a video denoiser at the
-requested frames, a voice or a transcription model loaded whole. A node that keeps a request
-reclaims an idle resident before it loads. Each node needs a `[cluster]` block; the rest is
+holds the model whole, hands the request to the least loaded peer that has them and whose
+cards admit the demand, and an upload travels as it arrived. Each node publishes what each
+of its cards admits as a whole load, so a hand-over never sends a render to a smaller card.
+Each family asks with its own demand: an image family's hot component and scratch, the
+music model with its cache and reserve, a video denoiser at the requested frames, a voice
+or a transcription model loaded whole. A node that keeps a request reclaims an idle
+resident before it loads, and a request no peer can take runs here: split across the
+cards when they hold it together, spilling to the host when they do not, and the
+loaded-models listing says which. Each node needs a `[cluster]` block; the rest is
 discovered.
 
 ```toml

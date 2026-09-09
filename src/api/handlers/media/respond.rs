@@ -386,20 +386,21 @@ async fn image_upload_where_the_model_is(
         .await
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| "z-image".to_string());
-    let fits = match image_model_defaults(&model_name) {
-        Ok(d) => super::image_fits_a_card(
+    let hot = match image_model_defaults(&model_name) {
+        Ok(d) => super::image_hot_bytes(
             state,
             &model_name,
             crate::inference::place::runtime_demand::RequestGeometry::new(d.size, d.size),
         ),
-        Err(_) => true,
+        Err(_) => 0,
     };
     if let Some(relayed) = crate::api::handlers::route_upload_to_holder(
         state,
         headers,
         &model_name,
-        super::image_served_here(state, &model_name),
-        fits,
+        super::image_served_here(state, &model_name).await,
+        state.card_holds(hot),
+        hot,
         |peer| super::serves_image_family(peer, &model_name),
         path,
         &body,

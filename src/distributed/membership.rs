@@ -53,6 +53,17 @@ pub struct NodeState {
     pub link_gbps: HashMap<NodeId, f64>,
     /// Prefix block hashes it holds, so a request can be routed to where its prefix already is.
     pub prefix_blocks: Vec<u64>,
+    /// What each of its cards admits as a whole load, in bytes, under its own memory
+    /// fraction. Empty means the node never said - an older build - and a hand-over
+    /// then cannot tell whether the peer holds a render, which reads as "it may".
+    pub cards: Vec<u64>,
+}
+
+impl NodeState {
+    /// Whether one card of this node admits `bytes` whole, or it never said.
+    pub fn card_may_hold(&self, bytes: u64) -> bool {
+        self.cards.is_empty() || self.cards.iter().any(|c| *c >= bytes)
+    }
 }
 
 /// Suspicion that one node has failed, learned from its own rhythm.
@@ -378,8 +389,27 @@ mod tests {
             serves: Some(vec!["gemma4:12b".into(), "qwen3:8b".into()]),
             link_gbps: link,
             prefix_blocks: vec![0xABCD, 0x1234],
+            cards: vec![16 << 30],
         };
         m.observe(&"a".to_string(), 0, state.clone());
         assert_eq!(m.state_of(&"a".to_string()), Some(&state));
+    }
+}
+
+#[cfg(test)]
+mod card_tests {
+    use super::NodeState;
+
+    #[test]
+    fn a_peer_holds_a_demand_on_one_of_its_cards_or_never_said() {
+        let peer = NodeState {
+            cards: vec![8 << 30, 16 << 30],
+            ..Default::default()
+        };
+        assert!(peer.card_may_hold(12 << 30));
+        assert!(!peer.card_may_hold(20 << 30));
+        // An older build publishes no cards; silence is not a refusal.
+        let silent = NodeState::default();
+        assert!(silent.card_may_hold(20 << 30));
     }
 }
