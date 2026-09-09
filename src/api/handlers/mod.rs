@@ -327,6 +327,10 @@ impl Drop for MediaNote {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .end(self.id);
+        // What the job freed goes back to the driver now, so the free figures this node
+        // publishes between jobs are what a card really has, on its own probe as on a
+        // peer's listing. Left in the pool, a finished render read as a full card.
+        crate::inference::engine::llm_engine::trim_cuda_pools();
     }
 }
 

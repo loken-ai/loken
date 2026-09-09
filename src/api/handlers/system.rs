@@ -342,6 +342,13 @@ pub(crate) async fn list_devices(
     // auto-refresh polls this every 2s. INFO would flood the server
     // log with ~7.5 listing lines / minute of zero-value noise.
     debug!("Listing compute devices with availability status");
+    // Between jobs the pool holds nothing anyone is using; returned to the driver before
+    // the probe, so the figures read here are what a card really has. Not while work
+    // runs: the pool's blocks are then the next step's, and taking them would only make
+    // the step allocate them again.
+    if !_state.work_in_flight().await {
+        crate::inference::engine::llm_engine::trim_cuda_pools();
+    }
 
     use crate::distributed::DeviceManager;
 
