@@ -9,8 +9,13 @@
     clippy::redundant_closure
 )]
 
+// Everything below is behind `target_feature = "avx2"`, so on a build without it
+// there is nothing here to name.
+#[cfg_attr(not(target_feature = "avx2"), allow(unused_imports))]
 use super::*;
 
+// Feeds the AVX2 kernels below and nothing else.
+#[cfg(target_feature = "avx2")]
 fn prng() -> impl FnMut() -> f32 {
     let mut s = 0x0FED_CBA9_8765_4321u64;
     move || {

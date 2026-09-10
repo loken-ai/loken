@@ -1178,6 +1178,9 @@ verify_block_sizes!(
 
 #[cfg(test)]
 mod mxfp4_avx_test {
+    // Everything below is behind `target_feature = "avx2"`, so on a build without it
+    // there is nothing here to name.
+    #[cfg_attr(not(target_feature = "avx2"), allow(unused_imports))]
     use super::*;
 
     // The native AVX2 MXFP4xQ8_0 dot must match the scalar dequant-then-dot.
@@ -1237,11 +1240,16 @@ mod repack_q4k_plain_bench {
     //! The ignored cases here need real weights, a device, or a reference dump on
     //! this machine; nothing about them is automatic. Run one by name with
     //!   cargo test --release -p loken --lib NAME -- --ignored --nocapture
+    // The only case here is behind `target_feature = "avx2"`, so on a build without it
+    // there is nothing here to name.
+    #[cfg_attr(not(target_feature = "avx2"), allow(unused_imports))]
     use super::*;
 
     /// Single-thread cost of the plain-scales GEMV vs the packed v2 (run with
     /// --release --include-ignored): quantifies the scalar scale-extraction
     /// overhead that the unified in-place layout would pay at M=1.
+    // Times two AVX2 kernels against each other; there is nothing to time without them.
+    #[cfg(target_feature = "avx2")]
     #[test]
     #[ignore]
     pub(super) fn bench_plain_vs_v2() {

@@ -331,6 +331,9 @@ impl GenericTransformerLayer {
     }
 
     fn fdot(a: &[f32], b: &[f32]) -> f32 {
+        // The scalar fallback iterates rather than indexes, so the length is the wide
+        // path's alone.
+        #[cfg(target_feature = "avx2")]
         let n = a.len();
         #[cfg(target_feature = "avx2")]
         unsafe {
