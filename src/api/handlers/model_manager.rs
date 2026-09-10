@@ -385,11 +385,12 @@ impl APIServer {
         model_id: &str,
         want: usize,
     ) -> Result<(), ApiError> {
-        let (current, had_keep_alive) = {
+        let (current, current_quant, had_keep_alive) = {
             let engines = self.engines.read().await;
             match engines.iter().find(|e| e.model_id == model_id) {
                 Some(entry) => (
                     entry.engine.config().context_length,
+                    entry.engine.config().kv_quant,
                     entry.keep_alive_minutes,
                 ),
                 None => return Ok(()),
@@ -407,8 +408,12 @@ impl APIServer {
         info!("num_ctx {want} above the configured context {current} for {model_id} - reloading model");
         self.unload_model(model_id).await.ok();
 
+        // Rebuilt from the file's defaults, so anything the engine in place was asked
+        // for has to be carried over: a widening that reset the cache format would
+        // silently double what the wider window costs.
         let mut config = self.config_for_model(model_id);
         config.context_length = want;
+        config.kv_quant = current_quant;
         let engine = Arc::new(LlmEngine::with_config(config));
         // A window is clamped by what the checkpoint declares, not by what the cards can
         // hold, so a request can ask for a KV cache that does not fit. The model has
@@ -420,6 +425,7 @@ impl APIServer {
         if let Some(e) = failure {
             let mut back = self.config_for_model(model_id);
             back.context_length = current;
+            back.kv_quant = current_quant;
             let restored = Arc::new(LlmEngine::with_config(back));
             if restored.load_model().await.is_ok() {
                 let keep_alive = had_keep_alive.unwrap_or(self.default_keep_alive);
@@ -458,11 +464,13 @@ impl APIServer {
         model_id: &str,
         want: crate::inference::engine::llm_engine::KvQuant,
     ) -> Result<(), ApiError> {
-        let (current_matches, had_keep_alive) = {
+        let (current_matches, current_context, current_quant, had_keep_alive) = {
             let engines = self.engines.read().await;
             match engines.iter().find(|e| e.model_id == model_id) {
                 Some(entry) => (
                     entry.engine.config().kv_quant == want,
+                    entry.engine.config().context_length,
+                    entry.engine.config().kv_quant,
                     entry.keep_alive_minutes,
                 ),
                 None => return Ok(()),
@@ -478,12 +486,39 @@ impl APIServer {
         );
         self.unload_model(model_id).await.ok();
 
+        // Rebuilt from the file's defaults, so a window this model was already widened
+        // to has to be carried over: without it, changing the cache format put the model
+        // back on the configured window and every client sizing prompts to the wider one
+        // had them cut from the front.
         let mut config = self.config_for_model(model_id);
         config.kv_quant = want;
+        config.context_length = current_context;
         let engine = Arc::new(LlmEngine::with_config(config));
-        engine.load_model().await.map_err(|e| {
-            ApiError::Internal(format!("Reload with kv_quant={:?} failed: {}", want, e))
-        })?;
+        // The model is already unloaded here: a format that will not load must not leave
+        // the node serving nothing. Kept as text because the loader's error is not `Send`.
+        let failure = engine.load_model().await.err().map(|e| e.to_string());
+        if let Some(e) = failure {
+            let mut back = self.config_for_model(model_id);
+            back.context_length = current_context;
+            back.kv_quant = current_quant;
+            let restored = Arc::new(LlmEngine::with_config(back));
+            if restored.load_model().await.is_ok() {
+                let keep_alive = had_keep_alive.unwrap_or(self.default_keep_alive);
+                let expire_handle = if keep_alive > 0 {
+                    Some(self.schedule_expiration(model_id.to_string(), keep_alive))
+                } else {
+                    None
+                };
+                let mut engines = self.engines.write().await;
+                let mut entry =
+                    LoadedModelEntry::new(model_id.to_string(), restored, Some(keep_alive));
+                entry.expire_handle = expire_handle;
+                engines.push(entry);
+            }
+            return Err(ApiError::Internal(format!(
+                "Reload with kv_quant={want:?} failed: {e}"
+            )));
+        }
 
         let keep_alive = had_keep_alive.unwrap_or(self.default_keep_alive);
         let expire_handle = if keep_alive > 0 {
