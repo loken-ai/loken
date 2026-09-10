@@ -461,9 +461,11 @@ pub(crate) async fn chat_completion(
         },
     };
 
-    // OpenAI's chat-completion request struct doesn't expose a priority
-    // field, so just default to Interactive here.
-    let oai_priority = crate::api::gate::Priority::Interactive;
+    // The body has no field for this, so it is read from the headers: a client with
+    // background work needs a way to say so on the route it speaks, and a client that
+    // says nothing is interactive.
+    let oai_priority = crate::api::gate::Priority::from_headers(&headers)
+        .unwrap_or(crate::api::gate::Priority::Interactive);
 
     if stream {
         let gate_guard = acquire_gate(
@@ -1427,7 +1429,8 @@ pub(crate) async fn text_completions(
         params
     };
 
-    let oai_priority = crate::api::gate::Priority::Interactive;
+    let oai_priority = crate::api::gate::Priority::from_headers(&headers)
+        .unwrap_or(crate::api::gate::Priority::Interactive);
     let completion_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
     // Estimator-based prompt token count, used by the streaming usage

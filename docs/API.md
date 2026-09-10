@@ -93,7 +93,7 @@ block or an image by URL, is refused with the reason.
 | `POST /api/swap` | Replace the resident model. |
 | `POST /api/layers/swap` | Attach or detach adapters on a loaded model without reloading it. The body is the set the model should end up with. |
 | `POST /api/draft/attach`, `POST /api/draft/detach`, `GET /api/draft/status` | Speculative decoding for the resident model, after a tokenizer compatibility check. |
-| `GET /api/inflight` | Requests in flight and queued, by priority. |
+| `GET /api/inflight` | Requests in flight and queued, by priority. Ollama-shaped routes take `options.priority`; the OpenAI-compatible ones take an `x-loken-priority` header of `batch`, `interactive` or `fim`, since their body is a shape other servers parse. A client that says nothing is interactive, and `batch` yields the cards to whoever is waiting. |
 | `GET /api/layer_perf`, `GET /api/stage_perf` | Where a decode step's time goes, per layer and per stage. Both are recorded only while measurement is on: `?enable=1` on either switches it on and zeroes the counters, `?enable=0` switches it off, and each reply says whether it is on. It costs a device synchronisation per stage, which is why it is off by default. A layer's figure is what issuing it costs the calling thread, which is what tells a layer on a card from one on the host. |
 | `GET /api/distributed/devices` | The compute devices and their state. |
 | `GET /api/distributed/stats`, `GET /api/distributed/recommend` | What this node runs with, and the largest model in the catalogue that fits what is free. |

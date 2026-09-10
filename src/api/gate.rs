@@ -33,6 +33,21 @@ pub enum Priority {
 }
 
 impl Priority {
+    /// The priority a request declares in its headers, if it declares one.
+    ///
+    /// The OpenAI-compatible body has no field for this and adding one would put a
+    /// private extension in a shape other servers parse. A header carries a transport
+    /// hint without touching the schema, and a client that does not send it is
+    /// interactive, which is what a client that has not thought about it should be.
+    pub const HEADER: &'static str = "x-loken-priority";
+
+    pub fn from_headers(headers: &axum::http::HeaderMap) -> Option<Self> {
+        headers
+            .get(Self::HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(Self::parse)
+    }
+
     /// Parse from an Ollama `options.priority` string. Unknown values map
     /// to None so the caller can fall back to a default.
     pub fn parse(s: &str) -> Option<Self> {
@@ -581,5 +596,29 @@ mod tests {
             let _ = h.await;
         }
         assert_eq!(order.lock().unwrap().clone(), vec![0, 1, 2, 3, 4]);
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::Priority;
+
+    /// A client with background work says so in a header, because the body it sends is a
+    /// shape other servers parse and a private field there would not be understood.
+    #[test]
+    fn the_header_says_what_the_body_cannot() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(Priority::from_headers(&headers), None);
+
+        headers.insert(Priority::HEADER, "batch".parse().unwrap());
+        assert_eq!(Priority::from_headers(&headers), Some(Priority::Batch));
+
+        headers.insert(Priority::HEADER, "LOW".parse().unwrap());
+        assert_eq!(Priority::from_headers(&headers), Some(Priority::Batch));
+
+        // A value nobody defined is not a priority, and answering None lets the caller
+        // fall back rather than take a guess as an instruction.
+        headers.insert(Priority::HEADER, "whenever".parse().unwrap());
+        assert_eq!(Priority::from_headers(&headers), None);
     }
 }
