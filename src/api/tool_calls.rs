@@ -735,12 +735,14 @@ fn parse_xml_call(fragment: &str) -> Option<ToolCall> {
 fn unframe(value: &str) -> String {
     let value = value.strip_prefix('\n').unwrap_or(value);
     let value = value.strip_suffix('\n').unwrap_or(value);
-    if value.contains('\n') {
+    // What the value says, with the model's own blank lines at the end set aside. If
+    // that is one line, the blank lines were formatting: no path, pattern or number ends
+    // in whitespace on purpose.
+    let body = value.trim_end_matches('\n');
+    if body.contains('\n') {
         return value.to_string();
     }
-    // One line: what follows it is the model's own blank lines, and no single-line
-    // argument - a path, a pattern, a number - ends in whitespace on purpose.
-    value.trim_end().to_string()
+    body.trim_end().to_string()
 }
 
 /// A parameter value as JSON when it reads as JSON, and as a string otherwise.
