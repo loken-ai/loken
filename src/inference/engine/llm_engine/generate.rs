@@ -318,6 +318,9 @@ impl LlmEngine {
                 )
             };
 
+            let cache_session_start =
+                honest_reuse_start(state.model.as_mut(), cache_session_start);
+
             // MAKE THE CACHE ENTRY HONEST NOW, NOT WHEN THE REQUEST FINISHES.
             //
             // The entry is only rewritten after a generation completes. A request that

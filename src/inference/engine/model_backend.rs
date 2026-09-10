@@ -1344,6 +1344,10 @@ impl ModelBackend for QwenMoEMultiBackend {
         self.0.trim_kv(new_len)
     }
 
+    fn kv_len(&self) -> Option<usize> {
+        self.0.kv_len()
+    }
+
     fn reset_kv_from(&mut self, keep: usize) {
         self.0.trim_kv(keep)
     }

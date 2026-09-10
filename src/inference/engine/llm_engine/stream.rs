@@ -528,6 +528,7 @@ impl LlmEngine {
                         }
                     }
                 };
+                let session_start = honest_reuse_start(state.model.as_mut(), session_start);
                 reused_prompt_tokens = session_start;
                 if session_start > 0 {
                     debug!(

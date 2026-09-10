@@ -673,6 +673,60 @@ pub(crate) struct SessionState {
 /// The rule, stated once: cut the KV to exactly what is being reused, and always leave at
 /// least one token for the forward to run on. Every case follows - no entry gives 0, a
 /// full match gives len-1, a partial or extending match gives the shared prefix.
+/// The reuse offset the cache can actually honour, having been asked.
+///
+/// The offset above it comes from a table describing the resident KV. The two can
+/// disagree: a trim that failed, a cache reset nothing wrote down, a request that trimmed
+/// and never finished. Prefilling at an offset the cache does not hold builds the
+/// attention mask for a context that is not there - the forward dies on a shape mismatch,
+/// or, when the gap is small enough to broadcast, the model reads rows belonging to
+/// another prompt and answers with text that is almost right.
+///
+/// Short means the cache is a shorter prefix of the same tokens, which is sound to
+/// continue from. Long means the trim did not take, so the rows past the offset belong to
+/// a prompt this one does not share, and the only safe answer is to start cold. A backend
+/// that does not report a length is left alone.
+pub(crate) fn honest_reuse_start(
+    model: &mut dyn crate::inference::engine::model_backend::ModelBackend,
+    want: usize,
+) -> usize {
+    match reuse_verdict(model.kv_len(), want) {
+        Reuse::AsAsked(n) => n,
+        Reuse::Shorten(n) => {
+            tracing::warn!(
+                "prefix reuse offset {want} is past what the cache holds ({n}); \
+                 prefilling from there instead"
+            );
+            n
+        }
+        Reuse::Cold(held) => {
+            tracing::warn!(
+                "cache still holds {held} rows after a trim to {want}; starting cold \
+                 rather than reading rows this prompt does not share"
+            );
+            model.reset_kv_from(0);
+            0
+        }
+    }
+}
+
+/// What to do about an offset and the cache that is supposed to honour it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Reuse {
+    AsAsked(usize),
+    Shorten(usize),
+    Cold(usize),
+}
+
+pub(crate) fn reuse_verdict(held: Option<usize>, want: usize) -> Reuse {
+    match held {
+        None => Reuse::AsAsked(want),
+        Some(held) if held == want => Reuse::AsAsked(want),
+        Some(held) if held < want => Reuse::Shorten(held),
+        Some(held) => Reuse::Cold(held),
+    }
+}
+
 pub(crate) fn kv_reuse_start(
     model: &mut dyn crate::inference::engine::model_backend::ModelBackend,
     sessions: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, SessionState>>>,
@@ -1104,5 +1158,36 @@ mod prompt_cache_reuse_tests {
     #[test]
     fn an_empty_cache_reuses_nothing() {
         assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 2, 3], 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::{reuse_verdict, Reuse};
+
+    /// A backend that does not report a length is left alone: nothing is known, and
+    /// guessing would be worse than the offset the caller already computed.
+    #[test]
+    fn a_cache_that_says_nothing_is_taken_at_its_word() {
+        assert_eq!(reuse_verdict(None, 500), Reuse::AsAsked(500));
+    }
+
+    /// Short means the cache is a shorter prefix of the same tokens, which is sound to
+    /// continue from. This is the shape that used to kill the forward.
+    #[test]
+    fn an_offset_past_the_last_row_comes_back_to_it() {
+        assert_eq!(reuse_verdict(Some(347), 577), Reuse::Shorten(347));
+    }
+
+    /// Long means the trim did not take, so the rows past the offset belong to a prompt
+    /// this one does not share and none of them may be read.
+    #[test]
+    fn a_trim_that_did_not_take_starts_cold() {
+        assert_eq!(reuse_verdict(Some(900), 577), Reuse::Cold(900));
+    }
+
+    #[test]
+    fn a_cache_that_matches_is_used_as_asked() {
+        assert_eq!(reuse_verdict(Some(577), 577), Reuse::AsAsked(577));
     }
 }

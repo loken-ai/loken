@@ -1891,12 +1891,32 @@ impl MultiDeviceQwen3MoE {
         self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
     }
 
+    /// How many positions the KV cache actually holds.
+    ///
+    /// Asked rather than remembered: a trim can fail, a cache can be reset by something
+    /// that did not write the bookkeeping down, and a prefill that starts past the last
+    /// row builds its attention mask for a context the cache does not have.
+    pub fn kv_len(&self) -> Option<usize> {
+        let layer = self.layers.first()?;
+        let mut n = layer.attn.kv_cache.current_seq_len();
+        if let Some(c) = layer.attn.cpu_f16_kv.as_ref() {
+            n = n.max(c.len());
+        }
+        Some(n)
+    }
+
     /// Trim every layer's KV cache to `new_len` valid positions. Used by
     /// session-persistent KV to rewind the cache to the longest common
     /// prefix between the previous and current prompt.
     pub fn trim_kv(&mut self, new_len: usize) {
-        for layer in self.layers.iter_mut() {
-            let _ = layer.attn.kv_cache.trim_to(new_len);
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            // Named rather than dropped: a trim that did not take leaves the cache longer
+            // than the offset the caller is about to prefill at, and the mask then covers
+            // rows this prompt does not share. The caller checks the length afterwards,
+            // and this says which layer to look at.
+            if let Err(e) = layer.attn.kv_cache.trim_to(new_len) {
+                tracing::warn!("KV trim to {new_len} failed on layer {i}: {e}");
+            }
             if let Some(c) = layer.attn.cpu_f16_kv.as_mut() {
                 c.trim_to(new_len);
             }
