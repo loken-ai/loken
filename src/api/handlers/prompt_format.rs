@@ -836,6 +836,29 @@ mod tests {
     /// The constructs the Qwen3-Coder template is built out of. Each one of these
     /// failing sent the model a reconstruction of its own format, with the tool block
     /// missing, and the only symptom was an agent that never called a tool.
+    /// Templates close a run of tool messages by looking at the neighbours of the one
+    /// they are on. Without those the render fails on every turn that carries a tool
+    /// result, which is every turn an agent takes after its first.
+    #[test]
+    fn a_template_can_see_the_messages_either_side() {
+        let env = minijinja::Environment::new();
+        let ctx = minijinja::context! {
+            msgs => minijinja::Value::from_serialize(serde_json::json!([
+                {"role": "user"}, {"role": "tool"}, {"role": "tool"}, {"role": "user"},
+            ])),
+        };
+        let out = env
+            .render_str(
+                "{% for m in msgs %}{% if not loop.last and loop.nextitem.role != 'tool' \
+                 %}|{% endif %}{% endfor %}",
+                ctx,
+            )
+            .expect("loop.nextitem is there");
+        // One separator, after the last of the two tool messages: that is where the run
+        // of them ends, which is the whole reason the template looks at the neighbour.
+        assert_eq!(out, "|");
+    }
+
     #[test]
     fn templates_can_walk_a_tool_schema() {
         let mut env = minijinja::Environment::new();

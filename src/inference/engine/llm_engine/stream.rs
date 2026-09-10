@@ -71,37 +71,62 @@ impl LlmEngine {
             // A Harmony vocabulary keeps its channel tokens in the text, for the API to
             // split the analysis from the answer; any other drops its special tokens.
             let skip_special = tokenizer.token_to_id("<|channel|>").is_none();
+            // What is safe to send, given every token but the last.
+            //
+            // Detokenisation is not monotonic: the last token's rendering can change when
+            // the next one arrives - a character whose bytes span two tokens, a merge
+            // that reflows the space before it - so the text grown from a whole decode
+            // can fail to extend what was already sent. Skipping the token then, which is
+            // what this did, dropped it from the answer for good and left every later
+            // comparison measured against a prefix that no longer existed: characters
+            // vanished from the middle of words, and a resync repeated the ones around
+            // them. Holding the last token back costs one token of latency and makes the
+            // stream and the finished answer the same text.
+            let settled = |gen: &[u32]| -> Option<String> {
+                let keep = gen.len().checked_sub(1)?;
+                tokenizer.decode(&gen[..keep], skip_special).ok()
+            };
+            let mut stopped_early = false;
             while let Ok(CbToken::Tok(t)) = cb_rx.recv() {
+                if eos_set.contains(&t) {
+                    break;
+                }
+                gen.push(t);
+                let Some(text) = settled(&gen) else { continue };
+                if text.len() <= emitted.len() || !text.starts_with(&emitted) {
+                    continue;
+                }
+                // Stop sequence: emit text up to it, then finish.
+                if let Some(pos) = stops
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| text.find(s.as_str()))
+                    .min()
                 {
-                    {
-                        if eos_set.contains(&t) {
-                            break;
-                        }
-                        gen.push(t);
-                        let full = match tokenizer.decode(&gen, skip_special) {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        };
-                        if full.len() <= emitted.len() || !full.starts_with(&emitted) {
-                            continue;
-                        }
-                        // Stop sequence: emit text up to it, then finish.
-                        if let Some(pos) = stops
-                            .iter()
-                            .filter(|s| !s.is_empty())
-                            .filter_map(|s| full.find(s.as_str()))
-                            .min()
-                        {
-                            if pos > emitted.len() {
-                                let _ = tx.blocking_send(Ok(full[emitted.len()..pos].to_string()));
-                            }
-                            break;
-                        }
-                        let delta = full[emitted.len()..].to_string();
-                        emitted = full;
-                        if tx.blocking_send(Ok(delta)).is_err() {
-                            break;
-                        }
+                    if pos > emitted.len() {
+                        let _ = tx.blocking_send(Ok(text[emitted.len()..pos].to_string()));
+                    }
+                    stopped_early = true;
+                    break;
+                }
+                let delta = text[emitted.len()..].to_string();
+                emitted = text;
+                if tx.blocking_send(Ok(delta)).is_err() {
+                    stopped_early = true;
+                    break;
+                }
+            }
+            // The token that was being held back, and anything the last decode reflowed.
+            if !stopped_early {
+                if let Ok(full) = tokenizer.decode(&gen, skip_special) {
+                    let cut = stops
+                        .iter()
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|s| full.find(s.as_str()))
+                        .min()
+                        .unwrap_or(full.len());
+                    if full.starts_with(&emitted) && cut > emitted.len() {
+                        let _ = tx.blocking_send(Ok(full[emitted.len()..cut].to_string()));
                     }
                 }
             }
