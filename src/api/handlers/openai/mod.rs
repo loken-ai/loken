@@ -358,6 +358,12 @@ pub(crate) async fn chat_completion(
     // Reset expiration timer on use (like Ollama)
     state.reset_expiration(&model_name).await;
 
+    // What the model is actually served with, echoed back in the same header the request
+    // may have asked in. A client that asks and is quietly clamped - by the checkpoint or
+    // by what the cards hold - would otherwise size its prompts for a window it never got,
+    // and the server would truncate them from the front without either side saying so.
+    let served_window = engine.context_window().await;
+
     // Build prompt using model-specific chat template. When tools are
     // active, rewrite the message list to inject the tool definitions and
     // round-trip any prior tool calls/results in the model's native marker
@@ -773,9 +779,17 @@ pub(crate) async fn chat_completion(
                     yield Ok(Event::default().data("[DONE]"));
                 };
 
-                Ok(Sse::new(stream)
+                let mut response = Sse::new(stream)
                     .keep_alive(KeepAlive::default())
-                    .into_response())
+                    .into_response();
+                if let Some(n) = served_window {
+                    if let Ok(hv) = axum::http::HeaderValue::from_str(&n.to_string()) {
+                        response
+                            .headers_mut()
+                            .insert(crate::api::gate::Window::HEADER, hv);
+                    }
+                }
+                Ok(response)
             }
             Err(e) => {
                 error!(
@@ -935,6 +949,11 @@ pub(crate) async fn chat_completion(
             );
             if let Ok(hv) = axum::http::HeaderValue::from_str(&v) {
                 headers.insert("server-timing", hv);
+            }
+        }
+        if let Some(n) = served_window {
+            if let Ok(hv) = axum::http::HeaderValue::from_str(&n.to_string()) {
+                headers.insert(crate::api::gate::Window::HEADER, hv);
             }
         }
         Ok((headers, Json(response)).into_response())
