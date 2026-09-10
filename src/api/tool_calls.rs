@@ -706,12 +706,8 @@ fn parse_xml_call(fragment: &str) -> Option<ToolCall> {
             Some(j) => (&value_area[..j], key_end + 1 + j + P_CLOSE.len()),
             None => (value_area, after.len()),
         };
-        // The template puts a newline after the tag and before the closing one; the value
-        // is what lies between, and nothing else about its whitespace is ours to change.
-        let value = value.strip_prefix('\n').unwrap_or(value);
-        let value = value.strip_suffix('\n').unwrap_or(value);
         if !key.is_empty() {
-            args.insert(key, json_or_string(value));
+            args.insert(key, json_or_string(&unframe(value)));
         }
         let step = i + P_OPEN.len() + consumed;
         if step >= rest.len() {
@@ -728,6 +724,23 @@ fn parse_xml_call(fragment: &str) -> Option<ToolCall> {
             arguments: Some(Value::Object(args).to_string()),
         }),
     })
+}
+
+/// A parameter value with the framing the template put around it taken back off.
+///
+/// The tag is followed by a newline and the closing tag preceded by one, so a value on
+/// one line arrives wrapped in them. A value that spans lines keeps every line it has:
+/// the framing is one newline at each end and nothing more, because the value may be the
+/// contents of a file.
+fn unframe(value: &str) -> String {
+    let value = value.strip_prefix('\n').unwrap_or(value);
+    let value = value.strip_suffix('\n').unwrap_or(value);
+    if value.contains('\n') {
+        return value.to_string();
+    }
+    // One line: what follows it is the model's own blank lines, and no single-line
+    // argument - a path, a pattern, a number - ends in whitespace on purpose.
+    value.trim_end().to_string()
 }
 
 /// A parameter value as JSON when it reads as JSON, and as a string otherwise.
@@ -1117,6 +1130,25 @@ mod tests {
             serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
         assert_eq!(args["edits"][0]["a"], 1);
         assert_eq!(args["old"], "  fn main() {");
+    }
+
+    /// The model writes its own blank lines before the closing tag. A one-line argument
+    /// is a path or a pattern and never ends in whitespace on purpose; a value that
+    /// spans lines may be the contents of a file and keeps every line it has.
+    #[test]
+    fn parse_qwen_xml_takes_the_framing_back_off() {
+        let raw = concat!(
+            "<function=write_file>\n",
+            "<parameter=path>\nsrc/brew.rs\n\n</parameter>\n",
+            "<parameter=content>\nline one\n\nline three\n</parameter>\n",
+            "</function>"
+        );
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        let f = r.calls[0].function.as_ref().unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["path"], "src/brew.rs");
+        assert_eq!(args["content"], "line one\n\nline three");
     }
 
     /// The wrapper is dropped about as often as it is written, and the element on its

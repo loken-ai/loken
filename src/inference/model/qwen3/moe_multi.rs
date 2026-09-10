@@ -1897,10 +1897,21 @@ impl MultiDeviceQwen3MoE {
     /// that did not write the bookkeeping down, and a prefill that starts past the last
     /// row builds its attention mask for a context the cache does not have.
     pub fn kv_len(&self) -> Option<usize> {
+        // Every cache a layer can be using, because only one of them is populated and
+        // reading the wrong one reports an empty cache for a full model. The list is the
+        // same one `trim_kv` walks, and has to stay that way.
         let layer = self.layers.first()?;
         let mut n = layer.attn.kv_cache.current_seq_len();
         if let Some(c) = layer.attn.cpu_f16_kv.as_ref() {
             n = n.max(c.len());
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(c) = layer.attn.q8_kv_cache.as_ref() {
+            n = n.max(c.current_seq_len());
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(c) = layer.attn.q4_kv_cache.as_ref() {
+            n = n.max(c.current_seq_len());
         }
         Some(n)
     }
