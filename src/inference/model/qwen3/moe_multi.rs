@@ -57,24 +57,31 @@ impl RotaryEmbedding {
         dev: &crate::tensor::Device,
     ) -> crate::tensor::Result<Self> {
         // The table is the outer product of the positions with the angular frequencies: one
-        // row per position, one column per pair of a head's dimensions. Both factors are held
-        // at the stream's own width, which is the width the inline-RoPE kernels read.
+        // row per position, one column per pair of a head's dimensions.
+        //
+        // Built in single precision and narrowed only at the end. A position is an integer,
+        // and half precision stops representing every integer at 2048: position 2049 becomes
+        // 2048 and 2051 becomes 2052, so from there on pairs of neighbouring tokens are given
+        // the same rotation and the attention stops being able to tell them apart. What comes
+        // out is a model that is fluent and has started to misspell. The sines and cosines
+        // themselves live in [-1, 1], where the narrow type has precision to spare, so the
+        // cast belongs after the trigonometry rather than before it.
         let angular = crate::inference::model::rope::inverse_frequencies_f64(head_dim, rope_theta);
         let pairs = angular.len();
-        let angular = Tensor::from_vec(angular, (1, pairs), dev)?.to_dtype(dtype)?;
-        // Shaped as a column while it is still a host row - a reshape moves nothing - then
-        // carried over and narrowed to the stream's width, which is where the cast belongs.
+        let angular = Tensor::from_vec(angular, (1, pairs), dev)?.to_dtype(DType::F32)?;
         let positions = Tensor::arange(0f32, max_position_embeddings as f32)?
             .reshape((max_position_embeddings, 1))?
-            .to_device(dev)?
-            .to_dtype(dtype)?;
+            .to_device(dev)?;
         let angles = positions.matmul(&angular)?;
-        let (sin, cos) = (angles.sin()?, angles.cos()?);
+        let (sin_f, cos_f) = (angles.sin()?, angles.cos()?);
+        // The host copies are taken before the cast: the CPU decode path has no reason to
+        // read back a narrowed number when the wide one is in hand.
+        let (cos_f32, sin_f32) = (host_f32(&cos_f)?, host_f32(&sin_f)?);
         Ok(Self {
-            cos_f32: host_f32(&cos)?,
-            sin_f32: host_f32(&sin)?,
-            sin,
-            cos,
+            cos_f32,
+            sin_f32,
+            sin: sin_f.to_dtype(dtype)?,
+            cos: cos_f.to_dtype(dtype)?,
             half_d: head_dim / 2,
         })
     }
@@ -1967,5 +1974,30 @@ impl MultiDeviceQwen3MoE {
             kv_quant,
             max_kv_seq_len,
         )
+    }
+}
+
+#[cfg(test)]
+mod rope_tests {
+    use crate::tensor::{DType, Device};
+
+    /// A position is an integer, and half precision stops representing every integer at
+    /// 2048: 2049 lands on 2048 and 2051 on 2052. Building the angle table at that width
+    /// gave neighbouring tokens the same rotation, and the model, unable to tell them
+    /// apart, stayed fluent and started to misspell.
+    #[test]
+    fn positions_past_the_half_precision_limit_still_differ() {
+        let dev = Device::Cpu;
+        let rope = super::RotaryEmbedding::new(DType::F16, 64, 4096, 10_000_000.0, &dev)
+            .expect("rope table");
+        let half = 32usize;
+        let row = |p: usize| -> Vec<f32> { rope.cos_f32[p * half..(p + 1) * half].to_vec() };
+        for p in [2049usize, 2051, 3001] {
+            assert_ne!(
+                row(p),
+                row(p - 1),
+                "position {p} rotates exactly like the one before it"
+            );
+        }
     }
 }
