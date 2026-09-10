@@ -223,6 +223,50 @@ pub(crate) fn render_go_template(tmpl: &str, system: Option<&str>, prompt: &str)
 /// `get` on the tool schemas they are handed. minijinja has none of them, so a template
 /// that walks a schema renders nothing and the model receives a reconstruction of its own
 /// format instead.
+/// JSON written the way the reference implementation writes it: a space after every
+/// separator. That is what the templates were authored against, and compact output
+/// tokenises the whole tool block differently.
+fn spaced_json(v: &minijinja::Value) -> Result<String, minijinja::Error> {
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, SpacedJson);
+    serde::Serialize::serialize(v, &mut ser).map_err(|e| {
+        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+    })?;
+    String::from_utf8(out)
+        .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
+}
+
+/// A space after every separator, and nothing else changed.
+struct SpacedJson;
+
+impl serde_json::ser::Formatter for SpacedJson {
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b": ")
+    }
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            w.write_all(b", ")
+        }
+    }
+}
+
 fn python_mapping_methods(
     value: &minijinja::Value,
     method: &str,
@@ -406,11 +450,7 @@ fn render_jinja_template(
     // it the tool block renders nothing.
     env.add_filter(
         "tojson",
-        |v: minijinja::Value| -> Result<String, minijinja::Error> {
-            serde_json::to_string(&v).map_err(|e| {
-                minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
-            })
-        },
+        |v: minijinja::Value| -> Result<String, minijinja::Error> { spaced_json(&v) },
     );
     env.add_function("strftime_now", |fmt: String| -> String {
         // The templates use it to stamp a date into the system prompt. The exact
@@ -865,11 +905,7 @@ mod tests {
         env.set_unknown_method_callback(super::python_string_methods);
         env.add_filter(
             "tojson",
-            |v: minijinja::Value| -> Result<String, minijinja::Error> {
-                serde_json::to_string(&v).map_err(|e| {
-                    minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
-                })
-            },
+            |v: minijinja::Value| -> Result<String, minijinja::Error> { spaced_json(&v) },
         );
         let ctx = minijinja::context! {
             d => minijinja::Value::from_serialize(serde_json::json!({"a": 1, "b": 2})),
@@ -885,7 +921,9 @@ mod tests {
             render("{{ d.get('a') }}|{{ d.get('z', 'none') }}"),
             "1|none"
         );
-        assert_eq!(render("{{ d | tojson }}"), r#"{"a":1,"b":2}"#);
+        // Spaced exactly as the reference implementation writes it: the templates were
+        // authored against that, and compact output tokenises the tool block differently.
+        assert_eq!(render("{{ d | tojson }}"), r#"{"a": 1, "b": 2}"#);
     }
 
     /// A conversation with no tools has to walk past the template's own guard. minijinja
