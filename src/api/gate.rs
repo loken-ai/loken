@@ -60,6 +60,31 @@ impl Priority {
     }
 }
 
+/// The context window a request asks the model to be served with.
+///
+/// The Ollama surface says this in `options.num_ctx`; the OpenAI-compatible body has
+/// nowhere to say it, and adding a field would put a private extension in a shape other
+/// servers parse. So it travels as a header, like the priority beside it. A client that
+/// does not send one is served with the configured window.
+///
+/// Without it an OpenAI client cannot reach past the server-wide default, whatever the
+/// model can do: an agent talking to a node configured for a small model was reading
+/// files a few hundred characters at a time and had no way to say otherwise.
+pub struct Window;
+
+impl Window {
+    pub const HEADER: &'static str = "x-loken-num-ctx";
+
+    /// The window a request declares in its headers, if it declares one.
+    pub fn from_headers(headers: &axum::http::HeaderMap) -> Option<usize> {
+        headers
+            .get(Self::HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+    }
+}
+
 /// FIFO-within-priority waiter on the gate.
 struct Waiter {
     priority: Priority,
@@ -352,6 +377,20 @@ impl Drop for RequestGuard {
 
 #[cfg(test)]
 mod tests {
+    /// The window a client asks for, and what an absent or unusable header means.
+    #[test]
+    fn the_window_is_read_from_the_header_it_travels_in() {
+        let mut h = axum::http::HeaderMap::new();
+        assert_eq!(Window::from_headers(&h), None);
+        h.insert(Window::HEADER, "32768".parse().unwrap());
+        assert_eq!(Window::from_headers(&h), Some(32768));
+        // A window of zero is not a window; the configured one stands.
+        h.insert(Window::HEADER, "0".parse().unwrap());
+        assert_eq!(Window::from_headers(&h), None);
+        h.insert(Window::HEADER, "lots".parse().unwrap());
+        assert_eq!(Window::from_headers(&h), None);
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

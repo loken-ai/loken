@@ -335,6 +335,17 @@ pub(crate) async fn chat_completion(
             "Model '{model_name}' could not be loaded: {e}"
         )));
     }
+    // A window asked for in the headers, applied the way `options.num_ctx` is on the
+    // Ollama route: above what the engine holds it reloads at that context, and the
+    // loader still bounds it by what the checkpoint declares.
+    if let Some(want) = crate::api::gate::Window::from_headers(&headers) {
+        if let Err(e) = state.ensure_engine_context(&model_name, want).await {
+            return Err(ApiError::Internal(format!(
+                "{} {want} for '{model_name}': {e}",
+                crate::api::gate::Window::HEADER
+            )));
+        }
+    }
     let engine = match state.get_engine(&model_name).await {
         Ok(engine) => engine,
         Err(_) => {
@@ -1353,6 +1364,16 @@ pub(crate) async fn text_completions(
         return Err(ApiError::NotFound(format!(
             "Model '{model_name}' could not be loaded: {e}"
         )));
+    }
+    // A window asked for in the headers, as on the chat route: completions are the
+    // editor's route, and an editor that sends a long prefix needs the same say.
+    if let Some(want) = crate::api::gate::Window::from_headers(&headers) {
+        if let Err(e) = state.ensure_engine_context(&model_name, want).await {
+            return Err(ApiError::Internal(format!(
+                "{} {want} for '{model_name}': {e}",
+                crate::api::gate::Window::HEADER
+            )));
+        }
     }
     let engine = match state.get_engine(&model_name).await {
         Ok(e) => e,
