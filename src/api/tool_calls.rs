@@ -615,10 +615,92 @@ fn parse_json_call_object(fragment: &str) -> Option<ToolCall> {
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
         return call_from_object(&v);
     }
+    // Qwen3-Coder puts XML inside the same tags, and its own template tells it to. The
+    // family is ChatML either way, so the two syntaxes are told apart here rather than by
+    // a separate format: one has a JSON object in it, the other has a function element.
+    if let Some(call) = parse_xml_call(trimmed) {
+        return Some(call);
+    }
     // Fall back to extracting the first balanced {...} span.
     let span = first_json_object(trimmed)?;
     let v: Value = serde_json::from_str(span).ok()?;
     call_from_object(&v)
+}
+
+/// One `<function=NAME><parameter=KEY>value</parameter></function>` element.
+///
+/// Values arrive as text on their own lines. A value that reads as JSON is taken as JSON,
+/// because that is how the template writes an object or a list back into the prompt;
+/// anything else stays a string. Without the tool's schema to consult there is no better
+/// rule, and a path or a pattern never reads as JSON.
+fn parse_xml_call(fragment: &str) -> Option<ToolCall> {
+    const FN_OPEN: &str = "<function=";
+    const FN_CLOSE: &str = "</function>";
+    const P_OPEN: &str = "<parameter=";
+    const P_CLOSE: &str = "</parameter>";
+
+    let start = fragment.find(FN_OPEN)? + FN_OPEN.len();
+    let rest = &fragment[start..];
+    let name_end = rest.find('>')?;
+    let name = rest[..name_end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let body = &rest[name_end + 1..];
+    let body = match body.find(FN_CLOSE) {
+        Some(i) => &body[..i],
+        None => body,
+    };
+
+    let mut args = serde_json::Map::new();
+    let mut rest = body;
+    while let Some(i) = rest.find(P_OPEN) {
+        let after = &rest[i + P_OPEN.len()..];
+        let Some(key_end) = after.find('>') else {
+            break;
+        };
+        let key = after[..key_end].trim().to_string();
+        let value_area = &after[key_end + 1..];
+        let (value, consumed) = match value_area.find(P_CLOSE) {
+            Some(j) => (&value_area[..j], key_end + 1 + j + P_CLOSE.len()),
+            None => (value_area, after.len()),
+        };
+        // The template puts a newline after the tag and before the closing one; the value
+        // is what lies between, and nothing else about its whitespace is ours to change.
+        let value = value.strip_prefix('\n').unwrap_or(value);
+        let value = value.strip_suffix('\n').unwrap_or(value);
+        if !key.is_empty() {
+            args.insert(key, json_or_string(value));
+        }
+        let step = i + P_OPEN.len() + consumed;
+        if step >= rest.len() {
+            break;
+        }
+        rest = &rest[step..];
+    }
+
+    Some(ToolCall {
+        id: new_call_id(),
+        r#type: "function".to_string(),
+        function: Some(ToolCallFunction {
+            name: name.to_string(),
+            arguments: Some(Value::Object(args).to_string()),
+        }),
+    })
+}
+
+/// A parameter value as JSON when it reads as JSON, and as a string otherwise.
+fn json_or_string(value: &str) -> Value {
+    let trimmed = value.trim();
+    let looks_structured = trimmed.starts_with(['{', '[', '-'])
+        || trimmed.starts_with(|c: char| c.is_ascii_digit())
+        || matches!(trimmed, "true" | "false" | "null");
+    if looks_structured {
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            return v;
+        }
+    }
+    Value::String(value.to_string())
 }
 
 /// Mistral: `[TOOL_CALLS]` followed by a JSON array (or a single object)
@@ -953,6 +1035,66 @@ mod tests {
         );
         assert_eq!(detect_tool_format(None, "llama-3.1-8b"), ToolFormat::Llama3);
         assert_eq!(detect_tool_format(None, "qwen3-coder"), ToolFormat::Hermes);
+    }
+
+    /// Qwen3-Coder's own template tells it to answer in XML inside the same tags every
+    /// ChatML model uses. Parsed as JSON it yielded nothing, so the model looked like one
+    /// that never calls a tool.
+    #[test]
+    fn parse_qwen_xml_call() {
+        let raw = concat!(
+            "I will read it.\n",
+            "<tool_call>\n<function=read_file>\n",
+            "<parameter=path>\nsrc/brew.rs\n</parameter>\n",
+            "<parameter=start_line>\n2\n</parameter>\n",
+            "</function>\n</tool_call>"
+        );
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        assert_eq!(r.calls.len(), 1);
+        let f = r.calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "read_file");
+        let args: serde_json::Value =
+            serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["path"], "src/brew.rs");
+        assert_eq!(args["start_line"], 2);
+        assert_eq!(r.content, "I will read it.");
+    }
+
+    /// A value that is an object or a list is written back as JSON by the template, so it
+    /// comes back as one. Anything else stays the text it was, spaces and all.
+    #[test]
+    fn parse_qwen_xml_values_keep_their_shape() {
+        let raw = concat!(
+            "<tool_call>\n<function=edit>\n",
+            "<parameter=edits>\n[{\"a\":1}]\n</parameter>\n",
+            "<parameter=old>\n  fn main() {\n</parameter>\n",
+            "</function>\n</tool_call>"
+        );
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        let f = r.calls[0].function.as_ref().unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["edits"][0]["a"], 1);
+        assert_eq!(args["old"], "  fn main() {");
+    }
+
+    /// Two calls in a row, the shape an agent turn takes when it reads two files.
+    #[test]
+    fn parse_qwen_xml_two_calls() {
+        let raw = concat!(
+            "<tool_call>\n<function=read_file>\n",
+            "<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>\n",
+            "<tool_call>\n<function=read_file>\n",
+            "<parameter=path>\nb.txt\n</parameter>\n</function>\n</tool_call>"
+        );
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        assert_eq!(r.calls.len(), 2);
+        for (call, want) in r.calls.iter().zip(["a.txt", "b.txt"]) {
+            let f = call.function.as_ref().unwrap();
+            let args: serde_json::Value =
+                serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
+            assert_eq!(args["path"], want);
+        }
     }
 
     #[test]
