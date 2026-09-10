@@ -733,12 +733,21 @@ fn parse_xml_call(fragment: &str) -> Option<ToolCall> {
 /// the framing is one newline at each end and nothing more, because the value may be the
 /// contents of a file.
 fn unframe(value: &str) -> String {
-    let value = value.strip_prefix('\n').unwrap_or(value);
-    let value = value.strip_suffix('\n').unwrap_or(value);
+    // Either shape of newline: a model that writes the tag on its own line may end that
+    // line the way its training data did, and a path carrying a carriage return is a path
+    // no tool can open.
+    let value = value
+        .strip_prefix("\r\n")
+        .or_else(|| value.strip_prefix('\n'))
+        .unwrap_or(value);
+    let value = value
+        .strip_suffix("\r\n")
+        .or_else(|| value.strip_suffix('\n'))
+        .unwrap_or(value);
     // What the value says, with the model's own blank lines at the end set aside. If
     // that is one line, the blank lines were formatting: no path, pattern or number ends
     // in whitespace on purpose.
-    let body = value.trim_end_matches('\n');
+    let body = value.trim_end_matches(['\n', '\r']);
     if body.contains('\n') {
         return value.to_string();
     }
@@ -1132,6 +1141,19 @@ mod tests {
             serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
         assert_eq!(args["edits"][0]["a"], 1);
         assert_eq!(args["old"], "  fn main() {");
+    }
+
+    /// A model that writes the tag on its own line may end that line the way its training
+    /// data did. A path carrying a carriage return is a path no tool can open.
+    #[test]
+    fn parse_qwen_xml_survives_a_carriage_return() {
+        let raw =
+            "<function=read_file>\r\n<parameter=path>\r\nCargo.toml\r\n</parameter>\r\n</function>";
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        let f = r.calls[0].function.as_ref().unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["path"], "Cargo.toml");
     }
 
     /// The model writes its own blank lines before the closing tag. A one-line argument
