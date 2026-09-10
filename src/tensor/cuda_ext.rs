@@ -260,13 +260,18 @@ mod cuda {
     }
 
     /// Reduced-precision GEMM switch, plumbed into the substrate's cuBLAS
-    /// wrappers: TF32 for F32, reduced-precision accumulation for F16/BF16
-    /// (all default-off) - the model-load throughput switch the engine flips
-    /// on CUDA devices.
+    /// wrappers: TF32 for F32 and 16BF accumulation for BF16, both default-off.
+    ///
+    /// F16 is deliberately left alone. Accumulating an F16 GEMM in F16 overflows the
+    /// wide attention matmuls: the image path's own note says it turns a VAE mid block
+    /// into NaN and a black image, and on a text model it loses the tail of an attention
+    /// sum over a long context, which reads as a model that has started to misspell. The
+    /// switch is process-wide and no caller ever puts it back, so one render would have
+    /// carried that into every generation after it.
     pub fn set_gemm_reduced_precision(enable: bool) {
         tensor::cuda::set_gemm_reduced_precision_f32(enable);
-        tensor::cuda::set_gemm_reduced_precision_f16(enable);
         tensor::cuda::set_gemm_reduced_precision_bf16(enable);
+        tensor::cuda::set_gemm_reduced_precision_f16(false);
     }
 
     /// Drop the per-ordinal device registry. Each entry holds an
@@ -481,5 +486,20 @@ mod cuda {
             let (free, total) = mem_get_info(&dev).unwrap();
             assert!(total > 0 && free <= total);
         }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod precision_tests {
+    /// The switch is process-wide and nothing puts it back, so a render must not be able
+    /// to leave every later generation accumulating its attention sums in half precision.
+    #[test]
+    fn a_render_never_turns_on_half_precision_accumulation() {
+        super::cuda::set_gemm_reduced_precision(true);
+        assert!(crate::tensor::cuda::gemm_reduced_precision_f32());
+        assert!(crate::tensor::cuda::gemm_reduced_precision_bf16());
+        assert!(!crate::tensor::cuda::gemm_reduced_precision_f16());
+        super::cuda::set_gemm_reduced_precision(false);
+        assert!(!crate::tensor::cuda::gemm_reduced_precision_f16());
     }
 }

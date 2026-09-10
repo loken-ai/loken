@@ -81,11 +81,8 @@ impl ImageEngine {
                 .unwrap_or(Device::Cpu);
 
             // Enable TF32/reduced-precision for TensorCore acceleration (~10-15% matmul speedup).
-            // F16 stays at COMPUTE_32F: enabling F16 accumulation makes the VAE mid AttnBlock
-            // (4096x512 x 512x4096 matmul) overflow -> NaN -> all-black image. F32 (TF32) and
-            // BF16 reduced precision are safe - wide enough exponent to accumulate 512 products.
-            // The reference also promotes F16 attention to F32 in the VAE attention
-            // path; this flag stays off so cuBLAS itself doesn't fall back to 16F accumulation.
+            // F32 (TF32) and BF16 reduced precision are safe here - wide enough exponent to
+            // accumulate 512 products. F16 is left at COMPUTE_32F by the switch itself.
             if device.is_cuda() {
                 crate::tensor::cuda_ext::set_gemm_reduced_precision(true);
             }
