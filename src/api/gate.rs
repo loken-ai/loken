@@ -85,6 +85,36 @@ impl Window {
     }
 }
 
+/// How a request asks for the key-value cache to be stored.
+///
+/// The Ollama surface says this in `options.kv_quant`; the OpenAI-compatible body has
+/// nowhere to say it, so it travels as a header like the window and the priority beside
+/// it. It is what makes a long window affordable: the cache is linear in the window, and
+/// halving each entry is the difference between a context that fits on the cards and one
+/// that does not.
+pub struct KvFormat;
+
+impl KvFormat {
+    pub const HEADER: &'static str = "x-loken-kv-quant";
+
+    /// The format a request declares in its headers, if it declares one.
+    ///
+    /// The same words the Ollama option takes, so one client speaking either surface
+    /// spells it one way.
+    pub fn from_headers(
+        headers: &axum::http::HeaderMap,
+    ) -> Option<crate::inference::engine::llm_engine::KvQuant> {
+        use crate::inference::engine::llm_engine::KvQuant;
+        let s = headers.get(Self::HEADER)?.to_str().ok()?;
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "f16" | "f32" => Some(KvQuant::Off),
+            "q8" | "q8_0" => Some(KvQuant::Q8),
+            "q4" | "q4_0" => Some(KvQuant::Q4),
+            _ => None,
+        }
+    }
+}
+
 /// FIFO-within-priority waiter on the gate.
 struct Waiter {
     priority: Priority,
@@ -377,6 +407,22 @@ impl Drop for RequestGuard {
 
 #[cfg(test)]
 mod tests {
+    /// The cache format a client asks for, in the words the Ollama option takes.
+    #[test]
+    fn the_cache_format_is_read_from_the_header_it_travels_in() {
+        use crate::inference::engine::llm_engine::KvQuant;
+        let mut h = axum::http::HeaderMap::new();
+        assert_eq!(KvFormat::from_headers(&h), None);
+        h.insert(KvFormat::HEADER, "q8".parse().unwrap());
+        assert_eq!(KvFormat::from_headers(&h), Some(KvQuant::Q8));
+        h.insert(KvFormat::HEADER, "Q4_0".parse().unwrap());
+        assert_eq!(KvFormat::from_headers(&h), Some(KvQuant::Q4));
+        h.insert(KvFormat::HEADER, "f16".parse().unwrap());
+        assert_eq!(KvFormat::from_headers(&h), Some(KvQuant::Off));
+        h.insert(KvFormat::HEADER, "sometimes".parse().unwrap());
+        assert_eq!(KvFormat::from_headers(&h), None);
+    }
+
     /// The window a client asks for, and what an absent or unusable header means.
     #[test]
     fn the_window_is_read_from_the_header_it_travels_in() {

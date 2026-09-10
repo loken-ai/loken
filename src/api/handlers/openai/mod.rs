@@ -338,6 +338,16 @@ pub(crate) async fn chat_completion(
     // A window asked for in the headers, applied the way `options.num_ctx` is on the
     // Ollama route: above what the engine holds it reloads at that context, and the
     // loader still bounds it by what the checkpoint declares.
+    // Asked before the window is, where both are asked: the cache format decides what a
+    // window costs, and settling it second would size the cache twice.
+    if let Some(want) = crate::api::gate::KvFormat::from_headers(&headers) {
+        if let Err(e) = state.ensure_engine_kv_quant(&model_name, want).await {
+            return Err(ApiError::Internal(format!(
+                "{} for '{model_name}': {e}",
+                crate::api::gate::KvFormat::HEADER
+            )));
+        }
+    }
     if let Some(want) = crate::api::gate::Window::from_headers(&headers) {
         if let Err(e) = state.ensure_engine_context(&model_name, want).await {
             return Err(ApiError::Internal(format!(
@@ -1386,6 +1396,16 @@ pub(crate) async fn text_completions(
     }
     // A window asked for in the headers, as on the chat route: completions are the
     // editor's route, and an editor that sends a long prefix needs the same say.
+    // Asked before the window is, where both are asked: the cache format decides what a
+    // window costs, and settling it second would size the cache twice.
+    if let Some(want) = crate::api::gate::KvFormat::from_headers(&headers) {
+        if let Err(e) = state.ensure_engine_kv_quant(&model_name, want).await {
+            return Err(ApiError::Internal(format!(
+                "{} for '{model_name}': {e}",
+                crate::api::gate::KvFormat::HEADER
+            )));
+        }
+    }
     if let Some(want) = crate::api::gate::Window::from_headers(&headers) {
         if let Err(e) = state.ensure_engine_context(&model_name, want).await {
             return Err(ApiError::Internal(format!(
