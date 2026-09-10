@@ -410,10 +410,34 @@ impl APIServer {
         let mut config = self.config_for_model(model_id);
         config.context_length = want;
         let engine = Arc::new(LlmEngine::with_config(config));
-        engine
-            .load_model()
-            .await
-            .map_err(|e| ApiError::Internal(format!("Reload with num_ctx={want} failed: {e}")))?;
+        // A window is clamped by what the checkpoint declares, not by what the cards can
+        // hold, so a request can ask for a KV cache that does not fit. The model has
+        // already been unloaded by this point: without putting it back, one such request
+        // leaves the node serving nothing until somebody asks for the model again.
+        // Kept as text from the start: the loader's error is not `Send`, and holding it
+        // across the reload below would make this whole future unspawnable.
+        let failure = engine.load_model().await.err().map(|e| e.to_string());
+        if let Some(e) = failure {
+            let mut back = self.config_for_model(model_id);
+            back.context_length = current;
+            let restored = Arc::new(LlmEngine::with_config(back));
+            if restored.load_model().await.is_ok() {
+                let keep_alive = had_keep_alive.unwrap_or(self.default_keep_alive);
+                let expire_handle = if keep_alive > 0 {
+                    Some(self.schedule_expiration(model_id.to_string(), keep_alive))
+                } else {
+                    None
+                };
+                let mut engines = self.engines.write().await;
+                let mut entry =
+                    LoadedModelEntry::new(model_id.to_string(), restored, Some(keep_alive));
+                entry.expire_handle = expire_handle;
+                engines.push(entry);
+            }
+            return Err(ApiError::Internal(format!(
+                "Reload with num_ctx={want} failed: {e}"
+            )));
+        }
 
         let keep_alive = had_keep_alive.unwrap_or(self.default_keep_alive);
         let expire_handle = if keep_alive > 0 {
