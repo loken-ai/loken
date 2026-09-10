@@ -95,6 +95,10 @@ pub(crate) async fn ollama_ps(
 
     for entry in engines.iter() {
         let model_size = entry.engine.get_model_size().await;
+        // The window this engine serves, not the server-wide default: a client that
+        // sizes its prompts on this listing was being told the default configured for
+        // whatever model the config file names.
+        let context_length = entry.engine.context_window().await.unwrap_or(0);
         let _device_name = entry.engine.get_device_name().await;
 
         // Get digest from model manager, or use a placeholder.
@@ -154,7 +158,7 @@ pub(crate) async fn ollama_ps(
             details,
             expires_at,
             size_vram,
-            context_length: state.default_inference_config.context_length as i32,
+            context_length: context_length as i32,
         });
     }
 

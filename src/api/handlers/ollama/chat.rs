@@ -21,6 +21,10 @@ pub(crate) async fn list_loaded_models(
     for entry in engines.iter() {
         let device_name = entry.engine.get_device_name().await;
         let model_size = entry.engine.get_model_size().await;
+        // The window this engine serves, not the server-wide default. A client that
+        // sizes its prompts on the listing was being told the default configured for
+        // whatever model the file names, whatever model it asked about.
+        let context_length = entry.engine.context_window().await;
 
         // Build layer distribution from the actual loaded model state
         let layer_dist_info = entry.engine.get_layer_distribution().await;
@@ -36,7 +40,7 @@ pub(crate) async fn list_loaded_models(
             size_bytes: Some(model_size),
             num_layers,
             layer_distribution,
-            context_length: Some(state.default_inference_config.context_length as u32),
+            context_length: context_length.map(|n| n as u32),
         });
     }
 
