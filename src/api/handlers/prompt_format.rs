@@ -217,6 +217,52 @@ pub(crate) fn render_go_template(tmpl: &str, system: Option<&str>, prompt: &str)
 /// `startswith`, `split`, `rstrip` - which the template language does not carry. A
 /// template that cannot call them renders nothing, and the model silently receives an
 /// approximation of its own format.
+/// The dict methods a chat template reaches for, on anything that is not a string.
+///
+/// Templates are written against Python dicts and call `keys`, `values`, `items` and
+/// `get` on the tool schemas they are handed. minijinja has none of them, so a template
+/// that walks a schema renders nothing and the model receives a reconstruction of its own
+/// format instead.
+fn python_mapping_methods(
+    value: &minijinja::Value,
+    method: &str,
+    args: &[minijinja::Value],
+) -> Result<minijinja::Value, minijinja::Error> {
+    use minijinja::{Error, ErrorKind, Value};
+    let pairs = || -> Result<Vec<(Value, Value)>, Error> {
+        let mut out = Vec::new();
+        for key in value.try_iter()? {
+            let item = value.get_item(&key)?;
+            out.push((key, item));
+        }
+        Ok(out)
+    };
+    Ok(match method {
+        "keys" => Value::from(value.try_iter()?.collect::<Vec<_>>()),
+        "values" => Value::from(pairs()?.into_iter().map(|(_, v)| v).collect::<Vec<_>>()),
+        "items" => Value::from(
+            pairs()?
+                .into_iter()
+                .map(|(k, v)| Value::from(vec![k, v]))
+                .collect::<Vec<_>>(),
+        ),
+        // Python returns the default, or None, rather than raising.
+        "get" => {
+            let key = args.first().cloned().unwrap_or_default();
+            match value.get_item(&key) {
+                Ok(v) if !v.is_undefined() => v,
+                _ => args.get(1).cloned().unwrap_or_default(),
+            }
+        }
+        _ => {
+            return Err(Error::new(
+                ErrorKind::UnknownMethod,
+                format!("{} has no method named {method}", value.kind()),
+            ))
+        }
+    })
+}
+
 fn python_string_methods(
     _state: &minijinja::State,
     value: &minijinja::Value,
@@ -225,10 +271,7 @@ fn python_string_methods(
 ) -> Result<minijinja::Value, minijinja::Error> {
     use minijinja::{Error, ErrorKind, Value};
     let Some(s) = value.as_str() else {
-        return Err(Error::new(
-            ErrorKind::UnknownMethod,
-            format!("{} has no method named {method}", value.kind()),
-        ));
+        return python_mapping_methods(value, method, args);
     };
     let text = |i: usize| -> Result<&str, Error> {
         args.get(i).and_then(Value::as_str).ok_or_else(|| {
@@ -359,6 +402,16 @@ fn render_jinja_template(
     // ship. Each was named by the fallback log rather than guessed: a template
     // that cannot call them renders nothing and the model silently receives an
     // approximation of its own format.
+    // Templates serialise a schema fragment straight into the prompt with it. Without
+    // it the tool block renders nothing.
+    env.add_filter(
+        "tojson",
+        |v: minijinja::Value| -> Result<String, minijinja::Error> {
+            serde_json::to_string(&v).map_err(|e| {
+                minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+            })
+        },
+    );
     env.add_function("strftime_now", |fmt: String| -> String {
         // The templates use it to stamp a date into the system prompt. The exact
         // day does not change the model's behaviour, and reading the clock here
@@ -399,6 +452,10 @@ fn render_jinja_template(
             return None;
         }
     };
+    // Undefined rather than none when there are no tools. Every template guards with
+    // `if not tools is defined`, and a none that is defined walks straight past that
+    // guard into `tools | length`, which is where the render dies.
+    let tools_value = tools_value.unwrap_or(Value::UNDEFINED);
     match t.render(context! {
         messages => msgs,
         add_generation_prompt => add_generation_prompt,
@@ -776,6 +833,54 @@ fn format_deepseek(messages: &[Message]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The constructs the Qwen3-Coder template is built out of. Each one of these
+    /// failing sent the model a reconstruction of its own format, with the tool block
+    /// missing, and the only symptom was an agent that never called a tool.
+    #[test]
+    fn templates_can_walk_a_tool_schema() {
+        let mut env = minijinja::Environment::new();
+        env.set_unknown_method_callback(super::python_string_methods);
+        env.add_filter(
+            "tojson",
+            |v: minijinja::Value| -> Result<String, minijinja::Error> {
+                serde_json::to_string(&v).map_err(|e| {
+                    minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+                })
+            },
+        );
+        let ctx = minijinja::context! {
+            d => minijinja::Value::from_serialize(serde_json::json!({"a": 1, "b": 2})),
+        };
+        let render = |src: &str| env.render_str(src, ctx.clone()).unwrap();
+        assert_eq!(render("{{ d.keys() | list | join(',') }}"), "a,b");
+        assert_eq!(render("{{ d.values() | list | join(',') }}"), "1,2");
+        assert_eq!(
+            render("{% for k, v in d.items() %}{{ k }}={{ v }};{% endfor %}"),
+            "a=1;b=2;"
+        );
+        assert_eq!(
+            render("{{ d.get('a') }}|{{ d.get('z', 'none') }}"),
+            "1|none"
+        );
+        assert_eq!(render("{{ d | tojson }}"), r#"{"a":1,"b":2}"#);
+    }
+
+    /// A conversation with no tools has to walk past the template's own guard. minijinja
+    /// counts a none as defined, so passing one there skips the guard and dies on the
+    /// length test the guard exists to prevent.
+    #[test]
+    fn a_template_with_no_tools_takes_the_empty_path() {
+        let msgs = [crate::api::types::Message::new(
+            "user".to_string(),
+            "hello".to_string(),
+        )];
+        let tmpl = "{%- if not tools is defined %}{%- set tools = [] %}{%- endif %}\
+                    {%- if tools is iterable and tools | length > 0 %}TOOLS\
+                    {%- else %}NONE{%- endif %}{{ messages[0].content }}";
+        let out = super::render_jinja_template(tmpl, &msgs, false, None);
+        assert_eq!(out.as_deref(), Some("NONEhello"));
+    }
+
     #[test]
     fn templates_can_call_python_string_methods() {
         let mut env = minijinja::Environment::new();
