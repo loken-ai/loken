@@ -55,7 +55,10 @@ impl ToolFormat {
     /// scan can hold back the maximal partial prefix.
     fn start_markers(self) -> &'static [&'static str] {
         match self {
-            ToolFormat::Hermes => &["<tool_call>"],
+            // ChatML covers two syntaxes. Qwen3-Coder writes a function element, with
+            // or without the wrapper around it, and a stream that does not stop at the
+            // element sends the call to the user as prose.
+            ToolFormat::Hermes => &["<tool_call>", "<function="],
             ToolFormat::Mistral => &["[TOOL_CALLS]"],
             // Llama emits bare JSON; `<|python_tag|>` is the only
             // unambiguous start marker. Bare-JSON detection mid-stream is
@@ -575,6 +578,12 @@ fn parse_hermes(raw: &str) -> ToolParseResult {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
     if !raw.contains(OPEN) {
+        // Qwen3-Coder drops the wrapper about as often as it writes it, and the function
+        // element on its own is just as unambiguous.
+        let bare = parse_bare_xml_calls(raw);
+        if !bare.calls.is_empty() {
+            return bare;
+        }
         return scan_bare_json_calls(raw);
     }
     let mut calls = Vec::new();
@@ -625,6 +634,38 @@ fn parse_json_call_object(fragment: &str) -> Option<ToolCall> {
     let span = first_json_object(trimmed)?;
     let v: Value = serde_json::from_str(span).ok()?;
     call_from_object(&v)
+}
+
+/// Function elements written without the `<tool_call>` wrapper around them.
+fn parse_bare_xml_calls(raw: &str) -> ToolParseResult {
+    const FN_OPEN: &str = "<function=";
+    const FN_CLOSE: &str = "</function>";
+    let mut calls = Vec::new();
+    let mut content = String::new();
+    let mut rest = raw;
+    while let Some(i) = rest.find(FN_OPEN) {
+        content.push_str(&rest[..i]);
+        let after = &rest[i..];
+        let (element, consumed) = match after.find(FN_CLOSE) {
+            Some(j) => (&after[..j + FN_CLOSE.len()], i + j + FN_CLOSE.len()),
+            None => (after, raw.len()),
+        };
+        match parse_xml_call(element) {
+            Some(call) => calls.push(call),
+            // Not a call after all: leave the text where it was.
+            None => content.push_str(element),
+        }
+        if consumed >= rest.len() {
+            rest = "";
+            break;
+        }
+        rest = &rest[consumed..];
+    }
+    content.push_str(rest);
+    ToolParseResult {
+        content: content.trim().to_string(),
+        calls,
+    }
 }
 
 /// One `<function=NAME><parameter=KEY>value</parameter></function>` element.
@@ -1076,6 +1117,21 @@ mod tests {
             serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
         assert_eq!(args["edits"][0]["a"], 1);
         assert_eq!(args["old"], "  fn main() {");
+    }
+
+    /// The wrapper is dropped about as often as it is written, and the element on its
+    /// own says the same thing.
+    #[test]
+    fn parse_qwen_xml_without_the_wrapper() {
+        let raw = concat!(
+            "I will read it.\n<function=read_file>\n",
+            "<parameter=path>\nsrc/brew.rs\n</parameter>\n</function>"
+        );
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        assert_eq!(r.calls.len(), 1);
+        let f = r.calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "read_file");
+        assert_eq!(r.content, "I will read it.");
     }
 
     /// Two calls in a row, the shape an agent turn takes when it reads two files.
