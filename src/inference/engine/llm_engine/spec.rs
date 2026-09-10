@@ -140,11 +140,10 @@ impl LlmEngine {
             generated_token_ids.push(cur_token_init);
             let init_chunk = {
                 let cumulative = decode_all(&target_engine, &generated_token_ids).await;
-                let c = if cumulative.len() >= sent_text_len {
-                    char_safe_suffix(&cumulative, sent_text_len)
-                } else {
-                    cumulative.clone()
-                };
+                // Clamped rather than restarted: a decode that came out shorter than what
+                // has been sent is a character whose bytes are not all in yet, and
+                // resending the whole answer so far put the text out twice.
+                let c = char_safe_suffix(&cumulative, sent_text_len.min(cumulative.len()));
                 sent_text_len = cumulative.len();
                 c
             };
@@ -253,11 +252,10 @@ impl LlmEngine {
                 for i in 0..accepted {
                     generated_token_ids.push(drafts[i]);
                     let cumulative = decode_all(&target_engine, &generated_token_ids).await;
-                    let dec = if cumulative.len() >= sent_text_len {
-                        char_safe_suffix(&cumulative, sent_text_len)
-                    } else {
-                        cumulative.clone()
-                    };
+                    // Clamped rather than restarted: a decode that came out shorter than what
+                    // has been sent is a character whose bytes are not all in yet, and
+                    // resending the whole answer so far put the text out twice.
+                    let dec = char_safe_suffix(&cumulative, sent_text_len.min(cumulative.len()));
                     sent_text_len = cumulative.len();
                     if max_stop_len > 0 {
                         stop_suffix.push_str(&dec);
@@ -323,11 +321,10 @@ impl LlmEngine {
                 // Emit the bonus token (cumulative-decode for leading spaces).
                 generated_token_ids.push(bonus);
                 let cumulative = decode_all(&target_engine, &generated_token_ids).await;
-                let dec = if cumulative.len() >= sent_text_len {
-                    char_safe_suffix(&cumulative, sent_text_len)
-                } else {
-                    cumulative.clone()
-                };
+                // Clamped rather than restarted: a decode that came out shorter than what
+                // has been sent is a character whose bytes are not all in yet, and
+                // resending the whole answer so far put the text out twice.
+                let dec = char_safe_suffix(&cumulative, sent_text_len.min(cumulative.len()));
                 sent_text_len = cumulative.len();
                 if max_stop_len > 0 {
                     stop_suffix.push_str(&dec);
