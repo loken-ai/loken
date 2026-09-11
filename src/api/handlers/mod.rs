@@ -722,6 +722,10 @@ pub(crate) async fn route_to_holder(
         // priced on the same prompt, so an estimate biases them identically.
         prompt_tokens: (prompt.len() / 4).max(1) as u32,
         max_tokens,
+        yields: matches!(
+            crate::api::gate::Priority::from_headers(headers),
+            Some(crate::api::gate::Priority::Batch)
+        ),
     };
     let now = crate::distributed::cluster_runtime::now_ms(state.cluster_started());
     // This node sits in its own routing table, described as its peers describe it.

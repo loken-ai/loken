@@ -31,6 +31,14 @@ pub struct RequestShape {
     pub prompt_tokens: u32,
     /// Tokens to generate.
     pub max_tokens: u32,
+    /// Whether this request has declared that it yields to interactive work.
+    ///
+    /// A model holds one key-value cache, so whichever request runs last owns it. Work
+    /// that yields is optional work, and serving it beside a conversation costs that
+    /// conversation its cache: the next turn re-reads a prompt it had already paid for.
+    /// The estimate cannot see that cost - it prices this request alone - so it is a fact
+    /// about the request rather than a term in the arithmetic.
+    pub yields: bool,
 }
 
 /// What a node is worth for one request, all of it derived from published state.
@@ -317,6 +325,7 @@ mod tests {
             model: "qwen3:8b".into(),
             prompt_tokens,
             max_tokens: 128,
+            yields: false,
         }
     }
 

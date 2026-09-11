@@ -343,6 +343,47 @@ impl Cluster {
             pen.keys().cloned().collect()
         };
 
+        // Work that yields goes to a peer that can take it, even a slower one. A model
+        // holds one key-value cache, so whichever request ran last owns it: serving
+        // optional work here costs the conversation this node is holding its cache, and
+        // the next turn of that conversation re-reads a prompt it had already paid for.
+        // That cost falls on a different request than the one being priced, so no estimate
+        // can see it - only the fact that this request said it yields. Decided before the
+        // estimates for that reason, and not at all when there is nowhere to send it.
+        if req.yields {
+            let alive_now: std::collections::HashSet<NodeId> =
+                members.alive(now_ms).into_iter().collect();
+            let urls = self.urls.lock().unwrap_or_else(|e| e.into_inner());
+            // The nearest peer that can serve it, by the same measurements the estimates
+            // use; slower than here is the point, not an objection.
+            let mut candidates: Vec<(&NodeId, f64)> = members
+                .known()
+                .filter(|(node, state)| {
+                    **node != self.config.node_id
+                        && !barred.contains(*node)
+                        && alive_now.contains(*node)
+                        && super::routing::can_serve(state, &req.model)
+                        && urls.contains_key(*node)
+                })
+                .map(|(node, _)| (node, rtt.get(node).copied().unwrap_or(f64::MAX)))
+                .collect();
+            candidates.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(b.0))
+            });
+            if let Some((peer, _)) = candidates.first() {
+                let peer = (*peer).clone();
+                if let Some(url) = urls.get(&peer).cloned() {
+                    return Decision::Forward {
+                        peer,
+                        url,
+                        reason: "work that yields, kept off the node holding a conversation".into(),
+                    };
+                }
+            }
+        }
+
         // The local node judges itself by its own meter, not by the pessimistic default: the
         // rates map is filled by gossip, and gossip only ever describes PEERS. Left out, this
         // node priced itself at the unknown-peer floor and handed over work it would have
@@ -508,6 +549,7 @@ mod tests {
             model: "qwen3:8b".into(),
             prompt_tokens: 64,
             max_tokens: 128,
+            yields: false,
         }
     }
 
@@ -545,6 +587,65 @@ mod tests {
             model_load_s: 20.0,
             agg_tok_per_s: 0.0,
         }
+    }
+
+    /// Work that yields goes to a peer even when this node would serve it faster.
+    ///
+    /// A model holds one key-value cache, so whichever request ran last owns it. Optional
+    /// work served beside a conversation costs that conversation its cache, and the next
+    /// turn re-reads a prompt it had already paid for - measured at over two minutes
+    /// against one second. The cost falls on a different request than the one being
+    /// priced, so the estimate cannot see it and the decision is made on the declaration.
+    #[test]
+    fn work_that_yields_is_kept_off_the_node_holding_a_conversation() {
+        let c = Cluster::new(cfg(&["http://b:11435"]));
+        c.publish_local(free());
+        // A peer that is slower on every measurement, and still the right place for this.
+        c.observe_peer(
+            &"b".into(),
+            "http://b:11435",
+            0,
+            free(),
+            NodeRates {
+                prefill_tok_per_s: 50.0,
+                decode_tok_per_s: 2.0,
+                model_load_s: 20.0,
+                agg_tok_per_s: 0.0,
+            },
+            HashMap::new(),
+            1.0,
+        );
+        let yielding = RequestShape {
+            yields: true,
+            ..shape()
+        };
+        match c.decide(&yielding, 0, false, &nothing_cached()) {
+            Decision::Forward { peer, .. } => assert_eq!(peer, "b"),
+            other => panic!("yielding work stayed home: {other:?}"),
+        }
+        // The same request that does not yield is priced as it always was.
+        assert!(matches!(
+            c.decide(&shape(), 0, false, &nothing_cached()),
+            Decision::Local { .. }
+        ));
+    }
+
+    /// With nowhere to send it, work that yields is still work: it runs here.
+    #[test]
+    fn work_that_yields_with_no_peer_is_served_here() {
+        let c = Cluster::new(ClusterConfig {
+            node_id: "self".into(),
+            ..Default::default()
+        });
+        c.publish_local(free());
+        let yielding = RequestShape {
+            yields: true,
+            ..shape()
+        };
+        assert!(matches!(
+            c.decide(&yielding, 0, false, &nothing_cached()),
+            Decision::Local { .. }
+        ));
     }
 
     /// A node with no peers must behave exactly as it did before any of this existed. The
