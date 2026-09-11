@@ -1486,6 +1486,25 @@ impl APIServer {
     /// engines. Caller-supplied `keep_alive_minutes` controls the
     /// expiration timer.
     async fn ensure_loaded(&self, model_id: &str, keep_alive_minutes: i64) -> Result<(), String> {
+        self.ensure_loaded_with_window(model_id, keep_alive_minutes, None)
+            .await
+    }
+
+    /// Load `model_id` if it is not loaded, opening the context a request asked for.
+    ///
+    /// The window only reaches the engine that widens an already-loaded model, so a
+    /// request that arrived first loaded at the configured context and then paid a second
+    /// load to widen it - two passes over the weights of a large model before it answered
+    /// anything. Given here, the first load is the only load.
+    ///
+    /// Bounded by what the checkpoint declares, as the widening path is: a model cannot
+    /// open a window past its own.
+    async fn ensure_loaded_with_window(
+        &self,
+        model_id: &str,
+        keep_alive_minutes: i64,
+        window: Option<usize>,
+    ) -> Result<(), String> {
         // Fast path: already loaded.
         if self.get_engine(model_id).await.is_ok() {
             return Ok(());
@@ -1503,7 +1522,16 @@ impl APIServer {
         // force the next HeteroPlan into CPU fallback.
         self.evict_to_make_room(model_id).await;
 
-        let config = self.config_for_model(model_id);
+        let mut config = self.config_for_model(model_id);
+        if let Some(want) = window {
+            let want = match self.declared_context(model_id) {
+                Some(declared) => want.min(declared),
+                None => want,
+            };
+            if want > config.context_length {
+                config.context_length = want;
+            }
+        }
         // Pressure protocol: idle MEDIA residents (image/video/TTS engines) hold
         // VRAM this LLM may need. Same rule as the media loads in reverse -
         // hetero placement first, reclaim only when the model would not fit a
@@ -1539,7 +1567,7 @@ impl APIServer {
         #[cfg(feature = "audio")]
         crate::inference::place::vram_manager::vram_degrade_reset();
         const LOAD_ATTEMPTS: usize = 3;
-        let mut engine = Arc::new(LlmEngine::with_config(self.config_for_model(model_id)));
+        let mut engine = Arc::new(LlmEngine::with_config(config.clone()));
         let mut last_err = String::new();
         for attempt in 1..=LOAD_ATTEMPTS {
             match engine.load_model().await {
@@ -1559,7 +1587,7 @@ impl APIServer {
                         "llm: {model_id} ran out of VRAM loading ({last_err}) - pressure now \
                          {level}, re-planning further off the GPU rather than failing"
                     );
-                    engine = Arc::new(LlmEngine::with_config(self.config_for_model(model_id)));
+                    engine = Arc::new(LlmEngine::with_config(config.clone()));
                 }
             }
         }

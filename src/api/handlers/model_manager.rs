@@ -382,7 +382,7 @@ impl APIServer {
     /// matches, or if it's not currently loaded (caller gets the usual
     /// "not loaded" error from `get_engine` afterward).
     /// The context length a model's GGUF header declares, read without loading it.
-    fn declared_context(&self, model_id: &str) -> Option<usize> {
+    pub(crate) fn declared_context(&self, model_id: &str) -> Option<usize> {
         let path = self.manifest_layer_path(model_id, "model")?;
         let (meta, _, _, _) = super::ollama::gguf_facts(&path);
         let meta = meta?;

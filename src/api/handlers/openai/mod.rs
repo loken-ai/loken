@@ -316,8 +316,14 @@ pub(crate) async fn chat_completion(
     // first request breaks them. Falls through to the 404 below only if
     // the model genuinely can't be loaded (missing weights, bad arch).
     let keep_alive_minutes_oai = state.get_effective_keep_alive(None);
+    // The window this request asked for, where it asked: a model loaded without it would
+    // be loaded again a moment later to widen it.
     if let Err(e) = state
-        .ensure_loaded(&model_name, keep_alive_minutes_oai)
+        .ensure_loaded_with_window(
+            &model_name,
+            keep_alive_minutes_oai,
+            crate::api::gate::Window::from_headers(&headers),
+        )
         .await
     {
         // A model that exists and did not fit is not a model that does not exist. This
