@@ -353,7 +353,6 @@ impl Cluster {
         if req.yields {
             let alive_now: std::collections::HashSet<NodeId> =
                 members.alive(now_ms).into_iter().collect();
-            let urls = self.urls.lock().unwrap_or_else(|e| e.into_inner());
             // The nearest peer that can serve it, by the same measurements the estimates
             // use; slower than here is the point, not an objection.
             let mut candidates: Vec<(&NodeId, f64)> = members
@@ -363,7 +362,6 @@ impl Cluster {
                         && !barred.contains(*node)
                         && alive_now.contains(*node)
                         && super::routing::can_serve(state, &req.model)
-                        && urls.contains_key(*node)
                 })
                 .map(|(node, _)| (node, rtt.get(node).copied().unwrap_or(f64::MAX)))
                 .collect();
@@ -372,15 +370,21 @@ impl Cluster {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.0.cmp(b.0))
             });
-            if let Some((peer, _)) = candidates.first() {
-                let peer = (*peer).clone();
-                if let Some(url) = urls.get(&peer).cloned() {
-                    return Decision::Forward {
-                        peer,
-                        url,
-                        reason: "work that yields, kept off the node holding a conversation".into(),
-                    };
-                }
+            // The addresses, once the candidates are settled. Held no longer than the
+            // lookup: this table and the member table are taken in that order everywhere,
+            // and a request that took them the other way round stopped the node.
+            let addressed = {
+                let urls = self.urls.lock().unwrap_or_else(|e| e.into_inner());
+                candidates
+                    .iter()
+                    .find_map(|(node, _)| urls.get(*node).cloned().map(|u| ((*node).clone(), u)))
+            };
+            if let Some((peer, url)) = addressed {
+                return Decision::Forward {
+                    peer,
+                    url,
+                    reason: "work that yields, kept off the node holding a conversation".into(),
+                };
             }
         }
 
@@ -865,8 +869,13 @@ impl Cluster {
             return out;
         }
         let targets: Vec<(NodeId, String)> = {
-            let urls = self.urls.lock().unwrap_or_else(|e| e.into_inner());
+            // Members before addresses, as everywhere else that needs both. Taken the
+            // other way round here, this and a routing decision each held what the other
+            // was waiting for, and two requests arriving together stopped the node: one
+            // was asking the peers what they held, the other was deciding where to send
+            // work, and neither could finish.
             let members = self.members.lock().unwrap_or_else(|e| e.into_inner());
+            let urls = self.urls.lock().unwrap_or_else(|e| e.into_inner());
             members
                 .alive(now_ms)
                 .into_iter()
