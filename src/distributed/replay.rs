@@ -53,10 +53,27 @@ pub struct ResumePoint {
     pub weights_digest: String,
 }
 
+/// Whether a digest identifies no particular bytes.
+///
+/// Empty, or all zeros under any prefix: both are what a catalogue writes when it has nothing
+/// to say, and neither is evidence that two nodes hold the same weights.
+fn names_nothing(digest: &str) -> bool {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest).trim();
+    hex.is_empty() || hex.chars().all(|c| c == '0')
+}
+
 impl ResumePoint {
     /// Whether `node_digest` may continue this generation.
+    ///
+    /// An unknown digest is refused rather than matched. Models cached from Hugging Face carry
+    /// a placeholder of all zeros - there is no single file hash for a directory of shards - so
+    /// two unrelated checkpoints compare equal under it, and a replay would continue on other
+    /// bytes under the same name. That is the one outcome this check exists to prevent, so the
+    /// placeholder fails it on both sides.
     pub fn may_resume_on(&self, node_digest: &str) -> bool {
-        self.weights_digest == node_digest
+        !names_nothing(&self.weights_digest)
+            && !names_nothing(node_digest)
+            && self.weights_digest == node_digest
     }
 }
 
@@ -142,6 +159,34 @@ mod tests {
         shuffled.sort_by_key(|(p, _)| *p);
         let out: Vec<u32> = shuffled.into_iter().map(|(_, t)| t).collect();
         assert_eq!(out, in_order);
+    }
+
+    /// A digest that names nothing is not evidence of anything. Models cached from Hugging
+    /// Face all carry the same placeholder, so matching on it would let a generation continue
+    /// on unrelated weights - the failure this check exists to prevent, reached through the
+    /// check itself.
+    #[test]
+    fn replay_refuses_a_digest_that_names_nothing() {
+        let unknown = "sha256:0000000000000000000000000000000000000000";
+        let r = ResumePoint {
+            request_seed: 1,
+            tokens: vec![1, 2, 3],
+            position: 3,
+            weights_digest: unknown.into(),
+        };
+        assert!(!r.may_resume_on(unknown), "two unknowns are not a match");
+        assert!(!r.may_resume_on("sha256:aaaa"));
+        // And a known point refuses an unknown replica.
+        let known = ResumePoint {
+            weights_digest: "sha256:aaaa".into(),
+            ..r
+        };
+        assert!(!known.may_resume_on(unknown));
+        assert!(known.may_resume_on("sha256:aaaa"));
+        // Empty says nothing either.
+        assert!(names_nothing(""));
+        assert!(names_nothing("0000"));
+        assert!(!names_nothing("sha256:00a0"));
     }
 
     /// Replay must refuse a replica whose weights differ, however it is named. Continuing a
