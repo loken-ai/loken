@@ -2,6 +2,30 @@
 // This script runs during the cargo build process when the cuda feature is enabled
 
 fn main() {
+    // The commit these bytes came from, stamped at build time so a running server can say
+    // which build is answering. A version number alone cannot tell two builds of one release
+    // apart, which is exactly what a benchmark row has to do. Read here rather than at run
+    // time: a deployed binary has no checkout beside it.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        // A branch moves under a fixed HEAD, so the ref it names is what has to be watched.
+        if let Some(reference) = head.strip_prefix("ref: ").map(str::trim) {
+            println!("cargo:rerun-if-changed=.git/{reference}");
+        }
+    }
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short=9", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        // A source tarball has no repository, and saying so is better than an empty string
+        // that reads as a build nobody stamped.
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=LOKEN_COMMIT={commit}");
+
     println!("cargo:rerun-if-changed=src/inference/sampling_kernels.cu");
     println!("cargo:rerun-if-changed=src/inference/sampling_kernels.h");
 

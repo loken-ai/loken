@@ -56,6 +56,10 @@ pub(crate) async fn ollama_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "version": OLLAMA_API_VERSION,
         "loken": env!("CARGO_PKG_VERSION"),
+        // Which build, not just which release: two binaries of one version answer
+        // differently, and a measurement that cannot name the build cannot be compared
+        // with another. "unknown" when built from a tarball with no repository.
+        "commit": env!("LOKEN_COMMIT"),
     }))
 }
 
