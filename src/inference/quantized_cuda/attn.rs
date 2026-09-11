@@ -952,3 +952,104 @@ pub fn quantize_q8_1_mmvq_multirow_f32(
         .map_err(|e| anyhow!("launch mmvq_gguf_quantize_q8_1_f32 (multirow): {e}"))?;
     Ok(())
 }
+
+/// The softmax of one band of attention scores, in one pass.
+///
+/// `scores` is the band as the matmul left it, half precision and contiguous, read as
+/// `rows x cols`. `run_max` is each row's largest score from the bands before this one, so
+/// that the weights come out on the scale the caller accumulates at; the first band passes
+/// negative infinity. Returns the weights, again half precision and the same shape, with
+/// each row's new maximum and the sum of its weights.
+///
+/// The causal mask is an index comparison here rather than a tensor: `c0 + j` is the key a
+/// column stands for, and `past + row % seq` is the last key that row may see.
+///
+/// `Err` for anything not on this path; the caller keeps the operations it would otherwise
+/// have chained.
+pub fn band_softmax_f16(
+    scores: &crate::tensor::Tensor,
+    run_max: &crate::tensor::Tensor,
+    rows: usize,
+    cols: usize,
+    seq: usize,
+    past: usize,
+    c0: usize,
+) -> Result<(
+    crate::tensor::Tensor,
+    crate::tensor::Tensor,
+    crate::tensor::Tensor,
+)> {
+    use crate::tensor::cuda_ext::tensor_from_cuda_storage;
+    use crate::tensor::{DType, StorageView};
+    if scores.dtype() != DType::F16 {
+        anyhow::bail!("band_softmax_f16: scores must be F16");
+    }
+    if run_max.dtype() != DType::F32 || run_max.elem_count() != rows {
+        anyhow::bail!("band_softmax_f16: run_max must be {rows} F32 values");
+    }
+    if scores.elem_count() != rows * cols || seq == 0 {
+        anyhow::bail!("band_softmax_f16: {rows} x {cols} does not match the scores");
+    }
+    let dev = scores.device().as_cuda_device()?;
+    let whole = |t: &crate::tensor::Tensor| {
+        let (_, layout) = t.storage_and_layout();
+        let (from, to) = layout.contiguous_offsets();
+        layout.start_offset() == 0 && from == 0 && to == t.elem_count()
+    };
+    if !whole(scores) || !whole(run_max) {
+        anyhow::bail!("band_softmax_f16: scores and run_max must be contiguous from their start");
+    }
+    let (scores_storage, _) = scores.storage_and_layout();
+    let (run_max_storage, _) = run_max.storage_and_layout();
+    let scores_slice = match &*scores_storage {
+        StorageView::Cuda(c) => c.as_cuda_slice::<half::f16>()?.slice(..),
+        _ => anyhow::bail!("band_softmax_f16: scores must be on CUDA"),
+    };
+    let run_max_slice = match &*run_max_storage {
+        StorageView::Cuda(c) => c.as_cuda_slice::<f32>()?.slice(..),
+        _ => anyhow::bail!("band_softmax_f16: run_max must be on CUDA"),
+    };
+
+    let ptx = get_quantized_ptx(&dev)?;
+    let func = dev
+        .get_or_load_custom_func("band_softmax_f16", "loken_quantized", ptx)
+        .map_err(|e| anyhow!("load kernel band_softmax_f16: {e}"))?;
+    let weights = unsafe { dev.alloc::<half::f16>(rows * cols)? };
+    let new_max = unsafe { dev.alloc::<f32>(rows)? };
+    let band_sum = unsafe { dev.alloc::<f32>(rows)? };
+
+    // One block per row, so a row's two reductions stay inside one block.
+    const THREADS: u32 = 256;
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = func.builder();
+    b.arg(&scores_slice);
+    b.arg(&run_max_slice);
+    b.arg(&weights);
+    b.arg(&new_max);
+    b.arg(&band_sum);
+    barg!(
+        b,
+        rows as i32,
+        cols as i32,
+        seq as i32,
+        past as i32,
+        c0 as i32
+    );
+    unsafe { b.launch(cfg) }.map_err(|e| anyhow!("launch band_softmax_f16: {e}"))?;
+
+    let shape = scores.dims().to_vec();
+    let weights =
+        tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(weights, dev.clone()), shape)
+            .map_err(|e| anyhow!("band_softmax_f16 weights: {e}"))?;
+    let new_max =
+        tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(new_max, dev.clone()), rows)
+            .map_err(|e| anyhow!("band_softmax_f16 max: {e}"))?;
+    let band_sum =
+        tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(band_sum, dev.clone()), rows)
+            .map_err(|e| anyhow!("band_softmax_f16 sum: {e}"))?;
+    Ok((weights, new_max, band_sum))
+}

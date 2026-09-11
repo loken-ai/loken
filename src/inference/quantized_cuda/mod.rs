@@ -56,6 +56,7 @@ const QUANTIZED_HELPERS_CU: &str = include_str!("../cuda/quantized/helpers.cu");
 const QUANTIZED_KV_CU: &str = include_str!("../cuda/quantized/kv_quantize.cu");
 const QUANTIZED_ATTENTION_CU: &str = include_str!("../cuda/quantized/attention.cu");
 const QUANTIZED_FLASH_CU: &str = include_str!("../cuda/quantized/flash_splitk.cu");
+const QUANTIZED_BAND_SOFTMAX_CU: &str = include_str!("../cuda/quantized/band_softmax.cu");
 const QUANTIZED_SAMPLING_CU: &str = include_str!("../cuda/quantized/sampling.cu");
 /// NVRTC compatibility shim (stdint types + INFINITY/NAN), prepended to the
 /// kernel source so the `.cu` stays free of compiler-workaround cruft.
@@ -198,6 +199,9 @@ mod awq;
 pub use awq::*;
 mod attn;
 pub use attn::*;
+
+#[cfg(test)]
+mod band_softmax_parity;
 mod quantize;
 pub use quantize::*;
 

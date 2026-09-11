@@ -297,6 +297,44 @@ fn causal_band_mask(
     Tensor::from_vec(mask, (seq, band), device)
 }
 
+/// The card's one-pass band softmax, where it can serve this shape.
+///
+/// `None` when there is no CUDA, the scores are not half precision, or the tensors are not
+/// laid out the way it reads them. The caller then chains the separate operations, which
+/// answer the same and read the band several times over.
+fn fused_band_softmax(
+    scores: &Tensor,
+    run_max: &Tensor,
+    rows: usize,
+    width: usize,
+    seq: usize,
+    past: usize,
+    c0: usize,
+) -> Option<(Tensor, Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    {
+        let (kv_rows, _) = (scores.dim(1).ok()?, ());
+        match crate::inference::quantized_cuda::band_softmax_f16(
+            scores, run_max, rows, width, seq, past, c0,
+        ) {
+            Ok((weights, top, sum)) => Some((
+                weights,
+                top.reshape((1, kv_rows, seq, 1)).ok()?,
+                sum.reshape((1, kv_rows, seq, 1)).ok()?,
+            )),
+            Err(e) => {
+                tracing::debug!("band softmax unavailable, chaining the operations: {e}");
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (scores, run_max, rows, width, seq, past, c0);
+        None
+    }
+}
+
 /// Causal attention over a prefill chunk, one band of keys at a time.
 ///
 /// `softmax(QK^T + mask)V` written so that no tensor in it grows with the context. That
@@ -328,8 +366,12 @@ pub fn banded_causal_attention(
     let band = score_band(kv_heads * rows, kv_len);
     let groups = rows / seq.max(1);
 
+    // Each row's largest score so far and the weight it was accumulated at. Kept as
+    // tensors rather than numbers because every row carries its own.
+    let rows_total = kv_heads * groups * seq;
     let mut acc: Option<Tensor> = None;
-    let mut run_max: Option<Tensor> = None;
+    let mut run_max =
+        Tensor::from_vec(vec![f32::NEG_INFINITY; rows_total], rows_total, &q.device())?;
     let mut run_sum: Option<Tensor> = None;
     let mut c0 = 0usize;
     while c0 < kv_len {
@@ -341,55 +383,63 @@ pub fn banded_causal_attention(
         let width = band.min(kv_len - c0);
         let scores = q
             .matmul(&k.narrow(2, c0, width)?.transpose(2, 3)?)?
-            .reshape((1, kv_heads * groups, seq, width))?
-            .to_dtype(DType::F32)?;
-        // Masked only where the band crosses the diagonal. A band every row can see in
-        // full needs no mask, which is most of them at a long context, and building one
-        // there would be building a tensor of zeros.
-        let scores = if c0 + width <= past + 1 {
-            scores
-        } else {
-            scores.broadcast_add(&causal_band_mask(seq, past, c0, width, &scores.device())?)?
+            .reshape((1, kv_heads * groups, seq, width))?;
+
+        // One pass over the band where the card has a kernel for it: widen, mask, reduce,
+        // shift, exponentiate, sum and narrow are six passes over a tensor the size of the
+        // band when written separately, which is three times what the matmuls around them
+        // cost.
+        let fused = fused_band_softmax(&scores, &run_max, rows_total, width, seq, past, c0);
+        let (weights, top, band_sum) = match fused {
+            Some(answer) => answer,
+            None => {
+                let scores = scores.to_dtype(DType::F32)?;
+                // Masked only where the band crosses the diagonal. A band every row can
+                // see in full needs no mask, which is most of them at a long context, and
+                // building one there would be building a tensor of zeros.
+                let scores = if c0 + width <= past + 1 {
+                    scores
+                } else {
+                    scores.broadcast_add(&causal_band_mask(
+                        seq,
+                        past,
+                        c0,
+                        width,
+                        &scores.device(),
+                    )?)?
+                };
+                let top = scores.max_keepdim(D::Minus1)?.maximum(&run_max.reshape((
+                    1,
+                    kv_heads * groups,
+                    seq,
+                    1,
+                ))?)?;
+                let weights = scores.broadcast_sub(&top)?.exp()?;
+                let band_sum = weights.sum_keepdim(D::Minus1)?;
+                (weights.to_dtype(v.dtype())?, top, band_sum)
+            }
         };
-        let top = scores.max_keepdim(D::Minus1)?;
-        let top = match &run_max {
-            None => top,
-            Some(m) => m.maximum(&top)?,
-        };
-        let weights = scores.broadcast_sub(&top)?.exp()?;
-        let band_sum = weights.sum_keepdim(D::Minus1)?;
+
         let band_ctx = weights
-            .to_dtype(v.dtype())?
             .contiguous()?
             .reshape((1, kv_heads, rows, width))?
             .matmul(&v.narrow(2, c0, width)?)?
             .reshape((1, kv_heads * groups, seq, head_dim))?
             .to_dtype(DType::F32)?;
-        match run_max.take() {
-            // The first band: nothing to rescale, and every row sees key 0, so its
-            // maximum is a real number that the bands after it can be compared against.
-            None => {
-                acc = Some(band_ctx);
-                run_sum = Some(band_sum);
-            }
-            Some(previous) => {
-                let rescale = previous.broadcast_sub(&top)?.exp()?;
-                run_sum = Some(
-                    (run_sum
-                        .take()
-                        .expect("a sum accompanies every maximum")
-                        .broadcast_mul(&rescale)?
-                        + band_sum)?,
-                );
-                acc = Some(
-                    (acc.take()
-                        .expect("an accumulator accompanies every maximum")
-                        .broadcast_mul(&rescale)?
-                        + band_ctx)?,
-                );
-            }
-        }
-        run_max = Some(top);
+        let previous = run_max.reshape((1, kv_heads * groups, seq, 1))?;
+        // The first band leaves nothing to rescale: every row sees key zero, so its
+        // maximum is a real number and the ones after it can be compared against it, and
+        // the rescale from negative infinity is zero.
+        let rescale = previous.broadcast_sub(&top)?.exp()?;
+        run_sum = Some(match run_sum.take() {
+            None => band_sum,
+            Some(sum) => (sum.broadcast_mul(&rescale)? + band_sum)?,
+        });
+        acc = Some(match acc.take() {
+            None => band_ctx,
+            Some(a) => (a.broadcast_mul(&rescale)? + band_ctx)?,
+        });
+        run_max = top.reshape(rows_total)?;
         c0 += width;
     }
     acc.expect("a chunk always sees its own first key")

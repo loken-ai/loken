@@ -317,7 +317,7 @@ pub(crate) fn get_quantized_ptx_for_ordinal(ordinal: usize) -> Result<&'static s
         let src = format!(
             "{NVRTC_COMPAT_H}\n{GGUF_BLOCKS_CUH}\n{QUANTIZED_HELPERS_CU}\n\
              {QUANTIZED_KV_CU}\n{QUANTIZED_ATTENTION_CU}\n\
-             {QUANTIZED_FLASH_CU}\n{QUANTIZED_SAMPLING_CU}"
+             {QUANTIZED_FLASH_CU}\n{QUANTIZED_BAND_SOFTMAX_CU}\n{QUANTIZED_SAMPLING_CU}"
         );
         match cudarc::nvrtc::safe::compile_ptx_with_opts(src, opts) {
             Ok(ptx) => {
