@@ -323,7 +323,17 @@ fn fused_band_softmax(
                 sum.reshape((1, kv_rows, seq, 1)).ok()?,
             )),
             Err(e) => {
-                tracing::debug!("band softmax unavailable, chaining the operations: {e}");
+                // Once, and loudly enough to be seen: the chained operations answer the
+                // same but read the band several times over, and a prefill that quietly
+                // became half as fast because a shape stopped matching is the kind of
+                // silence that takes a day to find.
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::warn!(
+                        "band softmax kernel not used, chaining the operations instead \
+                         (prefill will be slower): {e}"
+                    );
+                });
                 None
             }
         }
