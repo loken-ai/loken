@@ -19,7 +19,6 @@ use crate::tensor::layer::Embedding;
 use crate::tensor::layer::Linear;
 use crate::tensor::layer::RmsNorm;
 use crate::tensor::ops::host_f32;
-use crate::tensor::ops::repeat_kv;
 use crate::tensor::ops::Activation;
 use crate::tensor::quantized::{gguf_file, QTensor};
 use crate::tensor::ConcatKvCache;
@@ -184,8 +183,8 @@ struct Attn {
 }
 
 impl Attn {
-    fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, input_pos: usize) -> Result<Tensor> {
-        self.forward_inner(x, mask, input_pos)
+    fn forward(&mut self, x: &Tensor, input_pos: usize) -> Result<Tensor> {
+        self.forward_inner(x, input_pos)
     }
 
     /// CPU decode phase-2 fusion: pure-Rust mirror of
@@ -243,12 +242,7 @@ impl Attn {
         (qo, ko, vo)
     }
 
-    fn forward_inner(
-        &mut self,
-        x: &Tensor,
-        mask: Option<&Tensor>,
-        input_pos: usize,
-    ) -> Result<Tensor> {
+    fn forward_inner(&mut self, x: &Tensor, input_pos: usize) -> Result<Tensor> {
         let (_b, seq, _) = x.dims3()?;
         let in_dtype = x.dtype();
 
@@ -409,7 +403,7 @@ impl Attn {
 
         if fused_done {
             // Skip directly to KV-cache append + attention computation.
-            return self.attention_after_qkv(q, k, v, mask, input_pos, in_dtype, seq, true);
+            return self.attention_after_qkv(q, k, v, input_pos, in_dtype, seq, true);
         }
 
         let (q, k, v) = if let Some(wqkv) = self.wqkv.as_ref() {
@@ -503,7 +497,7 @@ impl Attn {
         // Slow path falls through here to KV-append + attention math.
         // Fused fast path (above) jumps directly to attention_after_qkv.
         // Slow path produces non-pre-scaled Q.
-        self.attention_after_qkv(q, k, v, mask, input_pos, in_dtype, seq, false)
+        self.attention_after_qkv(q, k, v, input_pos, in_dtype, seq, false)
     }
 
     fn attention_after_qkv(
@@ -511,13 +505,12 @@ impl Attn {
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        mask: Option<&Tensor>,
         _input_pos: usize,
         in_dtype: DType,
         seq: usize,
         q_pre_scaled: bool,
     ) -> Result<Tensor> {
-        self.attention_after_qkv_inner(q, k, v, mask, _input_pos, in_dtype, seq, q_pre_scaled)
+        self.attention_after_qkv_inner(q, k, v, _input_pos, in_dtype, seq, q_pre_scaled)
     }
 
     fn attention_after_qkv_inner(
@@ -525,7 +518,6 @@ impl Attn {
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        mask: Option<&Tensor>,
         _input_pos: usize,
         in_dtype: DType,
         seq: usize,
@@ -910,21 +902,45 @@ impl Attn {
             let out = att.matmul(&v)?;
             out.reshape((1, self.n_head, 1, self.head_dim))?
         } else {
-            // Multi-token (prefill / PLD verify): masked softmax(Q.K^T).V  -
-            // the verified path on this model.
-            let per_query_head =
-                |t: Tensor| -> Result<Tensor> { repeat_kv(t, self.num_kv_groups)?.contiguous() };
-            let (k, v) = (per_query_head(k)?, per_query_head(v)?);
-            let scores = q.matmul(&k.transpose(2, 3)?)?;
-            let scores = (scores * (1.0 / (self.head_dim as f64).sqrt()))?;
-            // The mask is additive and arrives at the stream's width; the scores are at the
-            // matmul's, and a cast to a width a tensor already has costs nothing.
-            let scores = match mask {
-                Some(m) => scores.broadcast_add(&m.to_dtype(scores.dtype())?)?,
-                None => scores,
+            // Multi-token (prefill / PLD verify): causal attention over the key and value
+            // heads as they are stored, one band of keys at a time.
+            //
+            // Query head `h * n_rep + r` reads kv head `h`, so the heads sharing a kv head
+            // are already neighbours: viewing Q as `[1, kv_heads, n_rep * seq, d]` puts
+            // each group's queries in one matrix and one matmul against the stored K
+            // answers all of them. Expanding K and V to one copy per query head instead -
+            // what `repeat_kv` does, and it has to materialise them - was the largest
+            // allocation in the layer.
+            //
+            // The band is the reason this is written out rather than left as
+            // softmax(QK^T)V: that form holds a score for every query against every key at
+            // once, so its memory grows with the context and a long one cannot be served
+            // at all. Accumulating band by band, carrying each row's running maximum and
+            // sum and rescaling what is already accumulated when the maximum moves, gives
+            // the same result out of memory that grows with the band instead.
+            //
+            // The scale goes on Q rather than on the scores for the same reason: Q is
+            // seq x d and the scores are seq x kv_len.
+            let n_rep = self.num_kv_groups;
+            let hd = self.head_dim;
+            let q = if q_pre_scaled {
+                q
+            } else {
+                (q * (1.0 / (hd as f64).sqrt()))?
             };
-            let probs = crate::tensor::ops::softmax_last_dim(&scores)?;
-            probs.matmul(&v)?
+            let kv_len = k.dim(2)?;
+            let qg = q
+                .contiguous()?
+                .reshape((1, self.n_kv_head, n_rep * seq, hd))?;
+            let ctx = crate::tensor::ops::banded_causal_attention(
+                &qg,
+                &k.contiguous()?,
+                &v.contiguous()?,
+                seq,
+                kv_len.saturating_sub(seq),
+            )?
+            .reshape((1, self.n_head, seq, hd))?;
+            ctx.to_dtype(q.dtype())?
         };
         let reshaped = ctx
             .transpose(1, 2)?
@@ -990,7 +1006,6 @@ pub struct MultiDeviceQwen3MoE {
     norm: RmsNorm,
     output: crate::tensor::quantized::QMatMul,
     output_device: Device,
-    dtype: DType,
 }
 
 fn load_tensor<R: Read + Seek>(
@@ -1137,20 +1152,6 @@ fn load_rmsnorm<R: Read + Seek>(
 ) -> Result<RmsNorm> {
     let qt = load_tensor(content, reader, name, device)?;
     RmsNorm::from_qtensor(qt, eps)
-}
-
-fn build_causal_mask(
-    b: usize,
-    tgt: usize,
-    offset: usize,
-    dtype: DType,
-    device: &Device,
-) -> Result<Tensor> {
-    let minf = f32::NEG_INFINITY;
-    let mask: Vec<f32> = (0..tgt)
-        .flat_map(|i| (0..(tgt + offset)).map(move |j| if j > i + offset { minf } else { 0f32 }))
-        .collect();
-    Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), device)?.to_dtype(dtype)
 }
 
 impl MultiDeviceQwen3MoE {
@@ -1682,11 +1683,8 @@ impl MultiDeviceQwen3MoE {
             norm,
             output,
             output_device,
-            dtype,
         })
     }
-
-    // (causal mask helper moved to a free fn to avoid borrow conflict with layer iteration)
 
     /// Embed the ids and run every layer, carrying the hidden state across a device boundary
     /// whenever the next layer lives on another card. Returns it on the output device.
@@ -1702,10 +1700,9 @@ impl MultiDeviceQwen3MoE {
             x.to_device(&self.embed_device)?
         };
         let mut xs = self.tok_embeddings.forward(&x_emb)?;
-        let (b, l) = x_emb.dims2()?;
+        let (_b, l) = x_emb.dims2()?;
 
         let mut current_dev = self.embed_device.clone();
-        let mut mask_cache: Option<(String, Tensor)> = None;
 
         // Per-stage forward profiling - disabled in production.
         let profile = std::env::var("GH_PROF").is_ok();
@@ -1722,19 +1719,13 @@ impl MultiDeviceQwen3MoE {
                 xs = xs.to_device(&layer.device)?;
                 current_dev = layer.device.clone();
             }
-            // Build mask on this device if needed (single-token decode skips)
-            let mask_opt = if l == 1 {
-                None
-            } else {
-                let key = format!("{:?}", layer.device.location());
-                if mask_cache.as_ref().map(|(k, _)| k.as_str()) != Some(key.as_str()) {
-                    mask_cache = Some((
-                        key,
-                        build_causal_mask(b, l, offset, self.dtype, &layer.device)?,
-                    ));
-                }
-                Some(mask_cache.as_ref().unwrap().1.clone())
-            };
+            // A prompt is read many tokens at a time, an answer one at a time, and the
+            // two take different paths through the attention below. Where a whole-context
+            // causal mask used to stand for this, the attention derives what a row may
+            // see from its own position: the mask said the same thing in a square the
+            // size of the conversation, built on the host and copied to the card on every
+            // pass.
+            let is_prefill = l != 1;
 
             let residual = xs.clone();
 
@@ -1754,7 +1745,7 @@ impl MultiDeviceQwen3MoE {
             } else {
                 None
             };
-            let attn_out = layer.attn.forward(&x_normed, mask_opt.as_ref(), offset)?;
+            let attn_out = layer.attn.forward(&x_normed, offset)?;
             if let Some(t) = t1 {
                 let _ = layer.device.synchronize();
                 t_attn_us += t.elapsed().as_micros();
@@ -1824,7 +1815,7 @@ impl MultiDeviceQwen3MoE {
             };
             xs = layer
                 .mlp
-                .forward_with_residual(&x_normed, &residual, mask_opt.is_some())?;
+                .forward_with_residual(&x_normed, &residual, is_prefill)?;
             if let Some(t) = t4 {
                 let _ = layer.device.synchronize();
                 t_mlp_us += t.elapsed().as_micros();

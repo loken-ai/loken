@@ -248,6 +248,155 @@ pub fn heads_first(t: Tensor, heads: usize, head_dim: usize) -> Result<Tensor> {
     split.transpose(1, 2)?.contiguous()
 }
 
+/// How many keys one band of a banded attention covers.
+///
+/// The scores of a band are `rows x band` at full width, and that tensor is the whole
+/// reason a long context could not be served: held over the entire context it grows
+/// without bound, held over a band it does not. So the band is chosen to keep it near a
+/// fixed size rather than to be a round number, and never wider than the context itself.
+///
+/// Wide enough that the matmul it feeds is worth launching: below a few hundred keys the
+/// launch costs more than the work it does.
+fn score_band(rows: usize, kv_len: usize) -> usize {
+    /// What one band's scores may occupy.
+    const MOST_BYTES: usize = 64 << 20;
+    const NARROWEST: usize = 256;
+    const WIDEST: usize = 8192;
+    let per_key = rows.max(1) * std::mem::size_of::<f32>();
+    (MOST_BYTES / per_key.max(1))
+        .clamp(NARROWEST, WIDEST)
+        .min(kv_len.max(1))
+}
+
+/// The additive causal mask for one band of keys: `[seq, band]`, zero where a query row
+/// may look and negative infinity where it may not.
+///
+/// Built for the band rather than for the context. A whole-context mask is a square in the
+/// length of the conversation, assembled on the host and copied to the card on every pass,
+/// and at a long context that copy outweighs the weights of a layer - to say something
+/// about the shape of the attention that carries no information at all.
+fn causal_band_mask(
+    seq: usize,
+    past: usize,
+    c0: usize,
+    band: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mask: Vec<f32> = (0..seq)
+        .flat_map(|p| {
+            let last = past + p;
+            (0..band).map(move |j| {
+                if c0 + j > last {
+                    f32::NEG_INFINITY
+                } else {
+                    0f32
+                }
+            })
+        })
+        .collect();
+    Tensor::from_vec(mask, (seq, band), device)
+}
+
+/// Causal attention over a prefill chunk, one band of keys at a time.
+///
+/// `softmax(QK^T + mask)V` written so that no tensor in it grows with the context. That
+/// form holds a score for every query against every key at once, and at a long context
+/// that tensor is the largest allocation in the layer by far - large enough that the card
+/// runs out of memory and the engine answers by shrinking a prefill chunk that was never
+/// what made it too big. Accumulating band by band, carrying each row's running maximum
+/// and sum and rescaling what is already accumulated whenever the maximum moves, gives the
+/// same answer out of memory that grows with the band instead.
+///
+/// `q` is `[1, kv_heads, groups * seq, head_dim]` and `k`/`v` are `[1, kv_heads, kv,
+/// head_dim]` - the grouped-query layout, which lets one matmul answer every query head
+/// that shares a key head without copying K and V once per query head. The scale belongs
+/// on `q` before the call: it is `seq x head_dim` where the scores are `seq x kv`.
+///
+/// The result is `[1, kv_heads, groups * seq, head_dim]` in `f32`, and is not bit-identical
+/// to the unbanded form: the running rescale sums in a different order, and it keeps the
+/// weights at full width where the unbanded chain rounds them to the value dtype before the
+/// product with V - so this is the more accurate of the two.
+pub fn banded_causal_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seq: usize,
+    past: usize,
+) -> Result<Tensor> {
+    let (_, kv_heads, rows, head_dim) = q.dims4()?;
+    let kv_len = k.dim(2)?;
+    let band = score_band(kv_heads * rows, kv_len);
+    let groups = rows / seq.max(1);
+
+    let mut acc: Option<Tensor> = None;
+    let mut run_max: Option<Tensor> = None;
+    let mut run_sum: Option<Tensor> = None;
+    let mut c0 = 0usize;
+    while c0 < kv_len {
+        // Every row of this chunk is causally before this band, and so before every band
+        // after it.
+        if c0 + 1 > past + seq {
+            break;
+        }
+        let width = band.min(kv_len - c0);
+        let scores = q
+            .matmul(&k.narrow(2, c0, width)?.transpose(2, 3)?)?
+            .reshape((1, kv_heads * groups, seq, width))?
+            .to_dtype(DType::F32)?;
+        // Masked only where the band crosses the diagonal. A band every row can see in
+        // full needs no mask, which is most of them at a long context, and building one
+        // there would be building a tensor of zeros.
+        let scores = if c0 + width <= past + 1 {
+            scores
+        } else {
+            scores.broadcast_add(&causal_band_mask(seq, past, c0, width, &scores.device())?)?
+        };
+        let top = scores.max_keepdim(D::Minus1)?;
+        let top = match &run_max {
+            None => top,
+            Some(m) => m.maximum(&top)?,
+        };
+        let weights = scores.broadcast_sub(&top)?.exp()?;
+        let band_sum = weights.sum_keepdim(D::Minus1)?;
+        let band_ctx = weights
+            .to_dtype(v.dtype())?
+            .contiguous()?
+            .reshape((1, kv_heads, rows, width))?
+            .matmul(&v.narrow(2, c0, width)?)?
+            .reshape((1, kv_heads * groups, seq, head_dim))?
+            .to_dtype(DType::F32)?;
+        match run_max.take() {
+            // The first band: nothing to rescale, and every row sees key 0, so its
+            // maximum is a real number that the bands after it can be compared against.
+            None => {
+                acc = Some(band_ctx);
+                run_sum = Some(band_sum);
+            }
+            Some(previous) => {
+                let rescale = previous.broadcast_sub(&top)?.exp()?;
+                run_sum = Some(
+                    (run_sum
+                        .take()
+                        .expect("a sum accompanies every maximum")
+                        .broadcast_mul(&rescale)?
+                        + band_sum)?,
+                );
+                acc = Some(
+                    (acc.take()
+                        .expect("an accumulator accompanies every maximum")
+                        .broadcast_mul(&rescale)?
+                        + band_ctx)?,
+                );
+            }
+        }
+        run_max = Some(top);
+        c0 += width;
+    }
+    acc.expect("a chunk always sees its own first key")
+        .broadcast_div(&run_sum.expect("a sum accompanies every accumulator"))?
+        .reshape((1, kv_heads, rows, head_dim))
+}
+
 /// Give every query group its own copy of the key or value head it reads.
 ///
 /// `[b, kv_heads, seq, head_dim]` in, `[b, kv_heads * n_rep, seq, head_dim]` out, with query
@@ -299,6 +448,130 @@ pub fn causal_mask(seq: usize, masked: f32, device: &Device) -> Result<Tensor> {
 mod repeat_kv_tests {
     use super::*;
     use crate::tensor::Device;
+
+    /// A banded attention answers what the whole-context form answers.
+    ///
+    /// The banded form never holds a score for every query against every key, which is
+    /// what lets a long context be served at all, but it only earns that by giving the
+    /// same answer. The running maximum and the rescale are where it would not: a band
+    /// whose maximum exceeds the running one has to correct everything accumulated before
+    /// it, and getting that wrong is a plausible-looking answer rather than an error.
+    ///
+    /// So it is compared against `softmax(QK^T + mask)V` computed in one piece, on a
+    /// context wide enough to need several bands and values spread widely enough that the
+    /// maximum really does move between them.
+    #[test]
+    fn a_banded_attention_answers_what_the_whole_context_answers() {
+        let (kv_heads, groups, seq, past, hd) = (2usize, 3usize, 6usize, 11usize, 4usize);
+        let rows = groups * seq;
+        let kv = past + seq;
+        let mk = |n: usize, shape: (usize, usize, usize, usize), spread: f32| {
+            let v: Vec<f32> = (0..n).map(|i| (i as f32 * 0.7).sin() * spread).collect();
+            Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
+        };
+        // Spread wide enough that each band's maximum differs from the one before it,
+        // which is the case the rescale exists for.
+        let q = mk(kv_heads * rows * hd, (1, kv_heads, rows, hd), 6.0);
+        let k = mk(kv_heads * kv * hd, (1, kv_heads, kv, hd), 6.0);
+        let v = mk(kv_heads * kv * hd, (1, kv_heads, kv, hd), 2.0);
+
+        let banded = banded_causal_attention(&q, &k, &v, seq, past).unwrap();
+
+        // The whole-context form, on the same grouped layout.
+        let scores = q
+            .matmul(&k.transpose(2, 3).unwrap())
+            .unwrap()
+            .reshape((1, kv_heads * groups, seq, kv))
+            .unwrap();
+        let mask: Vec<f32> = (0..seq)
+            .flat_map(|p| {
+                (0..kv).map(move |j| {
+                    if j > past + p {
+                        f32::NEG_INFINITY
+                    } else {
+                        0f32
+                    }
+                })
+            })
+            .collect();
+        let mask = Tensor::from_vec(mask, (seq, kv), &Device::Cpu).unwrap();
+        let whole = softmax_last_dim(&scores.broadcast_add(&mask).unwrap())
+            .unwrap()
+            .reshape((1, kv_heads, rows, kv))
+            .unwrap()
+            .matmul(&v)
+            .unwrap();
+
+        let a: Vec<f32> = banded.flatten_all().unwrap().to_vec1().unwrap();
+        let b: Vec<f32> = whole.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(a.len(), b.len());
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!((x - y).abs() < 1e-4, "element {i}: {x} vs {y}");
+        }
+    }
+
+    /// A band never covers more than the context, and never so little that the launch
+    /// costs more than the work.
+    #[test]
+    fn the_band_stays_between_its_bounds() {
+        assert_eq!(score_band(64, 100), 100);
+        assert!(score_band(64, 1_000_000) <= 8192);
+        // A great many rows still get a band worth launching a matmul for.
+        assert!(score_band(1_000_000, 1_000_000) >= 256);
+    }
+
+    /// Grouping the queries answers the same attention as copying the keys.
+    ///
+    /// A grouped-query prefill can be written either way: expand K and V so every query
+    /// head has its own copy, or view Q so the heads sharing a kv head sit in one matrix
+    /// and matmul against K as stored. The second allocates `n_rep` times less and is what
+    /// the prefill path uses, but it is only correct because query head `h * n_rep + r`
+    /// reads kv head `h` - a layout a reshape gets silently wrong if it ever changes.
+    ///
+    /// So the two are compared element by element on distinct values, with the softmax
+    /// left out: it is over the key axis, which neither arrangement moves.
+    #[test]
+    fn grouping_the_queries_answers_what_copying_the_keys_does() {
+        let (kv, rep, seq, kv_len, hd) = (3usize, 4usize, 5usize, 7usize, 6usize);
+        let heads = kv * rep;
+        let mk = |n: usize, shape: (usize, usize, usize, usize)| {
+            let v: Vec<f32> = (0..n).map(|i| ((i * 37) % 23) as f32 - 11.0).collect();
+            Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
+        };
+        let q = mk(heads * seq * hd, (1, heads, seq, hd));
+        let k = mk(kv * kv_len * hd, (1, kv, kv_len, hd));
+        let v = mk(kv * kv_len * hd, (1, kv, kv_len, hd));
+
+        // Copying the keys: one K and V per query head.
+        let ke = repeat_kv(k.clone(), rep).unwrap().contiguous().unwrap();
+        let ve = repeat_kv(v.clone(), rep).unwrap().contiguous().unwrap();
+        let copied = q
+            .matmul(&ke.transpose(2, 3).unwrap())
+            .unwrap()
+            .matmul(&ve)
+            .unwrap();
+
+        // Grouping the queries: K and V as stored.
+        let qg = q.reshape((1, kv, rep * seq, hd)).unwrap();
+        let scores = qg.matmul(&k.transpose(2, 3).unwrap()).unwrap();
+        // Back to one row per query head, as the mask and the softmax need it, and
+        // grouped again for the value matmul - the round trip the prefill path makes.
+        let scores = scores.reshape((1, heads, seq, kv_len)).unwrap();
+        let grouped = scores
+            .reshape((1, kv, rep * seq, kv_len))
+            .unwrap()
+            .matmul(&v)
+            .unwrap()
+            .reshape((1, heads, seq, hd))
+            .unwrap();
+
+        let a: Vec<f32> = copied.flatten_all().unwrap().to_vec1().unwrap();
+        let b: Vec<f32> = grouped.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(a.len(), b.len());
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!((x - y).abs() < 1e-3, "element {i}: {x} vs {y}");
+        }
+    }
 
     /// The three ways this was written across the tree are one function.
     ///
