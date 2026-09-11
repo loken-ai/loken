@@ -347,6 +347,21 @@ impl APIServer {
     }
 
     /// Get or load an engine for a model
+    /// Whether a conversation's prefix is resident for `model_id` right now.
+    ///
+    /// False when the model is not loaded at all: there is nothing to lose, so nothing to
+    /// protect. Asked without loading anything, because the answer decides whether to do
+    /// the work rather than how.
+    pub(crate) async fn holds_a_conversation(&self, model_id: &str) -> bool {
+        let engines = self.engines.read().await;
+        let Some(entry) = engines.iter().find(|e| e.model_id == model_id) else {
+            return false;
+        };
+        let engine = entry.engine.clone();
+        drop(engines);
+        engine.holds_a_conversation().await
+    }
+
     pub(crate) async fn get_engine(&self, model_id: &str) -> Result<Arc<LlmEngine>, ApiError> {
         // Check if engine already loaded (by original ID)
         {

@@ -570,6 +570,19 @@ impl LlmEngine {
         self.sessions.lock().await.len()
     }
 
+    /// Whether a conversation's prefix is resident in the key-value cache right now.
+    ///
+    /// One cache per model, so whichever request runs next owns it. A request that has
+    /// declared it yields to interactive work is asking not to be the one that takes it,
+    /// and this is what there is to take.
+    pub async fn holds_a_conversation(&self) -> bool {
+        self.sessions
+            .lock()
+            .await
+            .get(GLOBAL_PROMPT_CACHE_KEY)
+            .is_some_and(|s| !s.tokens.is_empty())
+    }
+
     pub async fn get_last_error(&self) -> Option<String> {
         let err = self.last_error.lock().await;
         err.clone()

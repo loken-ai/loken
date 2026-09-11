@@ -733,9 +733,30 @@ pub(crate) async fn route_to_holder(
     // Only the node owning a model can tokenise for it and look in its own cache, so the
     // question travels; a peer that does not answer is priced as holding none of the prompt.
     let cached = cluster.ask_peers_what_they_hold(model, prompt, now).await;
-    let crate::distributed::cluster::Decision::Forward { peer, url, reason } =
-        cluster.decide(&shape, now, already_forwarded, &cached)
-    else {
+    let decision = cluster.decide(&shape, now, already_forwarded, &cached);
+    let crate::distributed::cluster::Decision::Forward { peer, url, reason } = decision else {
+        // Nowhere to send it, and it said it yields. A model holds one key-value cache, so
+        // running this here would hand it the cache a conversation is sitting on and make
+        // that conversation's next turn re-read a prompt it had already paid for. Yielding
+        // means not being the request that does that, so it is declined rather than served
+        // at somebody else's expense - and a client that fills idle time with optional
+        // work is expected to abandon it.
+        if shape.yields && state.holds_a_conversation(model).await {
+            tracing::info!(
+                "cluster: declining work that yields: nowhere to place it and a conversation is resident"
+            );
+            // A conflict with what this node is holding, not a node in trouble: the
+            // difference decides whether a client retries, and retrying changes nothing
+            // until the conversation ends.
+            return Some(
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    "this node is holding a conversation and has nowhere to place work that \
+                     yields; ask without the batch priority to take the cache anyway",
+                )
+                    .into_response(),
+            );
+        }
         return None;
     };
     tracing::info!("forwarding to {peer}: {reason}");
