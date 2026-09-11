@@ -263,6 +263,20 @@ pub mod stages {
     /// The stages that partition a layer-call. The two inside `experts` are excluded, or
     /// the shares would add up to more than the whole.
     pub const PARTITION: usize = 6;
+
+    /// The stages by name, so a caller says which one it is timing rather than counting
+    /// the table. A number written at the call site is a number that stops matching the
+    /// table the first time a stage is inserted.
+    pub const ATTN_NORM: usize = 0;
+    pub const ATTN: usize = 1;
+    pub const ATTN_RES: usize = 2;
+    pub const ROUTER: usize = 3;
+    pub const EXPERTS: usize = 4;
+    pub const FFN_RES: usize = 5;
+    pub const GATE_UP: usize = 6;
+    pub const DOWN: usize = 7;
+    pub const EXPERT_CALL: usize = 8;
+    pub const TOPK: usize = 9;
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static SUMS: [AtomicU64; 10] = [
         AtomicU64::new(0),

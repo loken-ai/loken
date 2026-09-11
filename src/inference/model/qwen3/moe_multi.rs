@@ -1704,8 +1704,14 @@ impl MultiDeviceQwen3MoE {
 
         let mut current_dev = self.embed_device.clone();
 
-        // Per-stage forward profiling - disabled in production.
-        let profile = std::env::var("GH_PROF").is_ok();
+        // Per-stage forward profiling. Two things ask for it and both need the same
+        // synchronised boundaries, so it is measured once: the environment variable prints
+        // a line when the forward ends, and the endpoint accumulates across requests.
+        // Feeding only the first left `/api/stage_perf` answering zero for this model
+        // rather than saying it could not see it.
+        use crate::inference::place::layer_perf::stages;
+        let printing = std::env::var("GH_PROF").is_ok();
+        let profile = printing || stages::enabled();
         let mut t_attn_norm_us: u128 = 0;
         let mut t_attn_us: u128 = 0;
         let mut t_attn_res_us: u128 = 0;
@@ -1738,7 +1744,9 @@ impl MultiDeviceQwen3MoE {
             let x_normed = layer.attn_norm.forward(&xs)?;
             if let Some(t) = t0 {
                 let _ = layer.device.synchronize();
-                t_attn_norm_us += t.elapsed().as_micros();
+                let took = t.elapsed().as_micros();
+                t_attn_norm_us += took;
+                stages::add(stages::ATTN_NORM, took as u64);
             }
             let t1 = if profile {
                 Some(std::time::Instant::now())
@@ -1748,7 +1756,9 @@ impl MultiDeviceQwen3MoE {
             let attn_out = layer.attn.forward(&x_normed, offset)?;
             if let Some(t) = t1 {
                 let _ = layer.device.synchronize();
-                t_attn_us += t.elapsed().as_micros();
+                let took = t.elapsed().as_micros();
+                t_attn_us += took;
+                stages::add(stages::ATTN, took as u64);
             }
 
             let t2 = if profile {
@@ -1791,7 +1801,9 @@ impl MultiDeviceQwen3MoE {
             xs = xs_new;
             if let Some(t) = t2 {
                 let _ = layer.device.synchronize();
-                t_attn_res_us += t.elapsed().as_micros();
+                let took = t.elapsed().as_micros();
+                t_attn_res_us += took;
+                stages::add(stages::ATTN_RES, took as u64);
             }
 
             let residual = xs.clone();
@@ -1818,11 +1830,14 @@ impl MultiDeviceQwen3MoE {
                 .forward_with_residual(&x_normed, &residual, is_prefill)?;
             if let Some(t) = t4 {
                 let _ = layer.device.synchronize();
-                t_mlp_us += t.elapsed().as_micros();
+                let took = t.elapsed().as_micros();
+                t_mlp_us += took;
+                stages::add(stages::EXPERTS, took as u64);
             }
             // ffn_res launch is now folded into mlp; not separately timed.
         }
-        if profile {
+        stages::count_call();
+        if printing {
             tracing::info!(
                 "📊 PROFILE_FWD per-token (sum across {} layers, µs): attn_norm={} attn={} attn_res={} ffn_norm={} mlp={} ffn_res={} TOTAL={}",
                 self.layers.len(),

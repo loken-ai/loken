@@ -408,10 +408,22 @@ impl FusedMoeGGUF {
             let plan = ExpertPlan::group(&topk_ids, self.num_experts_per_tok)?;
             if let Some(t0) = route_t0 {
                 let _ = xs.device().synchronize();
-                crate::inference::place::layer_perf::stages::note_router_us(
-                    t0.elapsed().as_micros() as u64,
+                let took = t0.elapsed().as_micros() as u64;
+                // Both readers: the thread-local one a caller subtracts from its own block
+                // time, and the table the endpoint reports.
+                crate::inference::place::layer_perf::stages::note_router_us(took);
+                crate::inference::place::layer_perf::stages::add(
+                    crate::inference::place::layer_perf::stages::ROUTER,
+                    took,
                 );
             }
+            // The two projections the expert block is made of, timed apart: which of them
+            // a long prompt is spent in is not a thing to reason about from the outside.
+            let timing = crate::inference::place::layer_perf::stages::enabled();
+            let gate_up_t0 = timing.then(|| {
+                let _ = xs.device().synchronize();
+                std::time::Instant::now()
+            });
 
             // How the gate and up projections reach the GLU:
             //   1. one launch that writes what the two combine into - needs the two stacks
@@ -501,6 +513,15 @@ impl FusedMoeGGUF {
                 }
             };
 
+            if let Some(t0) = gate_up_t0 {
+                let _ = xs.device().synchronize();
+                crate::inference::place::layer_perf::stages::add(
+                    crate::inference::place::layer_perf::stages::GATE_UP,
+                    t0.elapsed().as_micros() as u64,
+                );
+            }
+            let down_t0 = timing.then(std::time::Instant::now);
+
             // Down projection and the scatter-add in one launch: the [M.topk, hidden]
             // per-(token, expert) intermediate is never written and the sum over a token's
             // experts is the kernel's own atomicAdd, which leaves the output already one row
@@ -512,6 +533,13 @@ impl FusedMoeGGUF {
                 .map(|r| r.reshape((num_tokens, hidden_dim)))
                 .transpose()?;
             let ys = self.down_reduce(&plan, &down_inputs, &topk_weights, residual.as_ref())?;
+            if let Some(t0) = down_t0 {
+                let _ = xs.device().synchronize();
+                crate::inference::place::layer_perf::stages::add(
+                    crate::inference::place::layer_perf::stages::DOWN,
+                    t0.elapsed().as_micros() as u64,
+                );
+            }
             ys.to_dtype(original_dtype)?.reshape(block)
         } // end #[cfg(feature="cuda")]
     }
