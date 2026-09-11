@@ -750,11 +750,20 @@ pub(crate) async fn chat_completion(
                     // Older SDKs treat an unexpected chunk as a hard
                     // protocol error, so default-off is the safer
                     // behaviour.
+                    // What the engine actually read, where it said; the word-count
+                    // estimate only where it did not. Both the usage chunk and the log
+                    // line below take this figure: reporting the estimate in the log made
+                    // every streamed request look slower per token than it was, by
+                    // whatever margin the estimate was wrong - on source code, nearly
+                    // double.
+                    let (in_tokens, out_tokens) = match stats.as_ref() {
+                        Some(s) => (
+                            (s.prompt_eval_count + s.cached_prompt_tokens) as i32,
+                            s.eval_count as i32,
+                        ),
+                        None => (prompt_tokens, token_count),
+                    };
                     if include_usage {
-                        let (in_tokens, out_tokens) = match stats.as_ref() {
-                            Some(s) => ((s.prompt_eval_count + s.cached_prompt_tokens) as i32, s.eval_count as i32),
-                            None => (prompt_tokens, token_count),
-                        };
                         let mut usage = Usage::new(in_tokens, out_tokens);
                         if !reasoning_acc.is_empty() {
                             if let (Some(n), Some(d)) = (
@@ -783,7 +792,7 @@ pub(crate) async fn chat_completion(
                     let ttft_ms = time_to_first_token_ms(stream_started, first_token_at);
                     let rate = decode_rate_suffix(first_token_at, token_count as u64);
                     tracing::info!(
-                        "Chat completion stream: prompt_tokens={prompt_tokens} completion_tokens={token_count} finish={finish_reason} ttft={ttft_ms}ms total={total_ms}ms{rate}"
+                        "Chat completion stream: prompt_tokens={in_tokens} completion_tokens={out_tokens} finish={finish_reason} ttft={ttft_ms}ms total={total_ms}ms{rate}"
                     );
                     // Terminal marker
                     yield Ok(Event::default().data("[DONE]"));
