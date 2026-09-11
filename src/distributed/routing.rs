@@ -272,7 +272,26 @@ pub fn choose(
         if !can_serve(state, &req.model) {
             continue;
         }
-        let r = rates.get(&node).copied().unwrap_or_default();
+        // A peer that has published no rates is priced at the pessimistic default. That is
+        // right for a node nothing is known about and wrong for one holding this model right
+        // now: it sits at the floor, loses every comparison because of it, and so never runs
+        // the request that would have measured it. The local node has had a bootstrap rule
+        // for exactly this shape of deadlock - its first request stays home and becomes the
+        // meter - and this is the peer's half of it: a resident, unmeasured peer is assumed
+        // no better and no worse than this node until its own report says otherwise.
+        //
+        // The prior is a measurement, of us. Nothing is inferred from what a card is called:
+        // what a card could do is not what a build achieves on a model, and a nameplate prior
+        // would put that fiction into the routing table.
+        let r = match rates.get(&node) {
+            Some(measured) => *measured,
+            // Resident and unmeasured: borrow our own price.
+            None if state.models.iter().any(|m| m == &req.model) => {
+                rates.get(local).copied().unwrap_or_default()
+            }
+            // Not resident either: it has proved nothing and pays the fetch at the floor.
+            None => NodeRates::default(),
+        };
         let hop = if &node == local {
             0.0
         } else {
@@ -443,6 +462,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got.node, "a", "half-loaded and quick beats idle and slow");
+    }
+
+    /// A peer holding the model, never measured, used to sit at the floor - fifty tokens a
+    /// second of prefill, five of decode - so it lost every comparison, and losing every
+    /// comparison is how it never ran the request that would have measured it. The floor is
+    /// for a node nothing is known about, not for one whose weights are resident.
+    #[test]
+    fn a_resident_peer_with_no_measurement_is_priced_like_us() {
+        let m = members(&[
+            ("a", node(&["qwen3:8b"], 0.9, &[])),
+            ("b", node(&["qwen3:8b"], 0.0, &[])),
+        ]);
+        // Only this node has ever been measured. The peer holds the model and is idle.
+        let rates = HashMap::from([("a".to_string(), fast())]);
+        let rtt = HashMap::from([("b".to_string(), 1.0)]);
+        let got = choose(
+            &"a".to_string(),
+            &m,
+            0,
+            &rates,
+            &rtt,
+            &req(64),
+            &HashMap::new(),
+            &no_bar(),
+            &none_sent(),
+        )
+        .unwrap();
+        assert_eq!(
+            got.node, "b",
+            "an idle peer holding the model lost to a saturated local node, on a floor it was never measured against"
+        );
+    }
+
+    /// The floor still stands where it was meant to. A peer that does not hold the weights
+    /// has proved nothing, and it pays for the fetch at the pessimistic rate.
+    #[test]
+    fn an_unmeasured_peer_without_the_weights_keeps_the_floor() {
+        let m = members(&[
+            ("a", node(&["qwen3:8b"], 0.9, &[])),
+            ("b", node(&[], 0.0, &[])),
+        ]);
+        let rates = HashMap::from([("a".to_string(), fast())]);
+        let rtt = HashMap::from([("b".to_string(), 1.0)]);
+        let got = choose(
+            &"a".to_string(),
+            &m,
+            0,
+            &rates,
+            &rtt,
+            &req(64),
+            &HashMap::new(),
+            &no_bar(),
+            &none_sent(),
+        )
+        .unwrap();
+        assert_eq!(
+            got.node, "a",
+            "a peer with neither a measurement nor the weights must not win on our price"
+        );
     }
 
     /// And the case that keeps a request at home: a LONG prefix is already here.
