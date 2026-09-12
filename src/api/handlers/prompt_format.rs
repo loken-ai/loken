@@ -236,6 +236,26 @@ fn spaced_json(v: &minijinja::Value) -> Result<String, minijinja::Error> {
         .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
 }
 
+/// `tojson(indent=n)`, which the tool templates use to lay a schema out readably.
+///
+/// The filter took no keyword arguments, so every template that asked for an indent died on
+/// "too many arguments" and the model was handed a reconstructed format instead of the one it
+/// declares - visible only as a warning in the log. Four of the models here do that:
+/// falcon3, granite3-moe, granite3.1-dense and llama3.2.
+fn indented_json(v: &minijinja::Value, indent: usize) -> Result<String, minijinja::Error> {
+    let pad = " ".repeat(indent);
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(
+        &mut out,
+        serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes()),
+    );
+    serde::Serialize::serialize(v, &mut ser).map_err(|e| {
+        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+    })?;
+    String::from_utf8(out)
+        .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
+}
+
 /// A space after every separator, and nothing else changed.
 struct SpacedJson;
 
@@ -450,7 +470,14 @@ fn render_jinja_template(
     // it the tool block renders nothing.
     env.add_filter(
         "tojson",
-        |v: minijinja::Value| -> Result<String, minijinja::Error> { spaced_json(&v) },
+        |v: minijinja::Value, opts: minijinja::value::Kwargs| -> Result<String, minijinja::Error> {
+            let indent: Option<usize> = opts.get("indent")?;
+            opts.assert_all_used()?;
+            match indent {
+                Some(n) => indented_json(&v, n),
+                None => spaced_json(&v),
+            }
+        },
     );
     env.add_function("strftime_now", |fmt: String| -> String {
         // The templates use it to stamp a date into the system prompt. The exact
@@ -496,10 +523,21 @@ fn render_jinja_template(
     // `if not tools is defined`, and a none that is defined walks straight past that
     // guard into `tools | length`, which is where the render dies.
     let tools_value = tools_value.unwrap_or(Value::UNDEFINED);
+    // A tool turn is not a reasoning turn. Reasoning templates close an empty thinking
+    // block when `enable_thinking` is false, and leave the model free to open one of its
+    // own when the variable is undefined - which is what happened: qwen3 opened a block,
+    // put its tool call inside it, and the call went to the thinking field where the tool
+    // parser does not look. Undefined without tools, so a plain conversation still reasons.
+    let enable_thinking = if tools.is_some() {
+        Value::from(false)
+    } else {
+        Value::UNDEFINED
+    };
     match t.render(context! {
         messages => msgs,
         add_generation_prompt => add_generation_prompt,
         tools => tools_value,
+        enable_thinking => enable_thinking,
     }) {
         Ok(r) => Some(r),
         Err(e) => {
@@ -1047,6 +1085,32 @@ mod tests {
         // chat_template: `<|turn>{role}\n{content}<turn|>\n` + `<|turn>model\n`.
         let out = format_gemma_harmony(&[msg("user", "What is 2+2?")]);
         assert_eq!(out, "<|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n");
+    }
+
+    /// Both call shapes have to render. The filter took no keyword arguments, so a template
+    /// asking for `tojson(indent=4)` failed its whole render and the model was handed a
+    /// reconstructed format instead of the one it declares - falcon3, granite3-moe,
+    /// granite3.1-dense and llama3.2 all do that. The no-keyword form is pinned beside it
+    /// because accepting keywords must not break the templates that pass none.
+    #[test]
+    fn tojson_renders_with_and_without_an_indent_keyword() {
+        let msgs = vec![msg("user", "hi")];
+        let plain = super::render_jinja_template("{{ messages | tojson }}", &msgs, false, None)
+            .expect("tojson with no keyword failed to render");
+        assert!(plain.contains("\"role\""), "got: {plain}");
+
+        let indented =
+            super::render_jinja_template("{{ messages | tojson(indent=4) }}", &msgs, false, None)
+                .expect("tojson(indent=4) failed to render");
+        assert!(
+            indented.contains("\n    "),
+            "indent not applied: {indented}"
+        );
+
+        // granite3.1-dense calls it both ways in one template, empty parentheses included.
+        let empty = super::render_jinja_template("{{ messages | tojson() }}", &msgs, false, None)
+            .expect("tojson() with empty parentheses failed to render");
+        assert!(empty.contains("\"role\""), "got: {empty}");
     }
 
     #[test]

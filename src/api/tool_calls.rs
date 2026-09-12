@@ -600,8 +600,17 @@ fn parse_hermes(raw: &str) -> ToolParseResult {
             // No closing tag: take the remainder.
             None => (after_open, raw.len()),
         };
-        if let Some(call) = parse_json_call_object(inner) {
-            calls.push(call);
+        // granite writes every call of a turn as one JSON array inside a single pair of
+        // tags. That is valid JSON that is not an object, and the single-object path
+        // returned nothing for it: a call the model had made correctly was dropped on
+        // its shape, and the user saw the tags as text.
+        match serde_json::from_str::<Value>(inner.trim()) {
+            Ok(Value::Array(items)) => calls.extend(items.iter().filter_map(call_from_object)),
+            _ => {
+                if let Some(call) = parse_json_call_object(inner) {
+                    calls.push(call);
+                }
+            }
         }
         if consumed >= rest.len() {
             rest = "";
@@ -1234,6 +1243,25 @@ mod tests {
         let r = parse_tool_calls(ToolFormat::Hermes, raw);
         assert_eq!(r.calls.len(), 1);
         assert_eq!(r.calls[0].function.as_ref().unwrap().name, "a");
+    }
+
+    /// granite3.1-dense, verbatim: every call of the turn in one JSON array, and no closing
+    /// tag because the model reached its end token right after. Valid JSON that is not an
+    /// object used to short-circuit to nothing, so a call the model had made correctly was
+    /// dropped on its shape and the user saw the tags as text.
+    #[test]
+    fn parse_hermes_array_of_calls() {
+        let raw = "<tool_call>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}]";
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        assert_eq!(r.calls.len(), 1);
+        let f = r.calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "get_weather");
+        assert_eq!(f.arguments.as_deref().unwrap(), "{\"city\":\"Paris\"}");
+        // Two calls in one array stay two calls.
+        let raw = "<tool_call>[{\"name\":\"a\",\"arguments\":{}},{\"name\":\"b\",\"arguments\":{\"x\":1}}]</tool_call>";
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        assert_eq!(r.calls.len(), 2);
+        assert_eq!(r.calls[1].function.as_ref().unwrap().name, "b");
     }
 
     #[test]
