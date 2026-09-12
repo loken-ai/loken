@@ -136,14 +136,22 @@ impl StopTracker {
 /// Metaspace/SentencePiece tokenizers. Decode `[prev_token, this_token]` and
 /// subtract `[prev_token]` to get just this token's contribution - preserves
 /// the space/metaspace boundary at O(1) work per iter.
-pub(crate) fn incremental_chunk_text(tokenizer: &Tokenizer, generated_token_ids: &[u32]) -> String {
+/// `skip_special` travels with the caller rather than being assumed here. It used to be
+/// hardcoded, so a vocabulary whose channel tokens must reach the reader lost them on the
+/// streamed path while keeping them on the whole-response one: the same answer arrived clean
+/// when returned in one piece and carried a bare channel name when streamed.
+pub(crate) fn incremental_chunk_text(
+    tokenizer: &Tokenizer,
+    generated_token_ids: &[u32],
+    skip_special: bool,
+) -> String {
     let n = generated_token_ids.len();
     if n >= 2 {
         let two_text = tokenizer
-            .decode(&generated_token_ids[n - 2..], true)
+            .decode(&generated_token_ids[n - 2..], skip_special)
             .unwrap_or_default();
         let one_text = tokenizer
-            .decode(&generated_token_ids[n - 2..n - 1], true)
+            .decode(&generated_token_ids[n - 2..n - 1], skip_special)
             .unwrap_or_default();
         two_text
             .strip_prefix(one_text.as_str())
@@ -151,7 +159,7 @@ pub(crate) fn incremental_chunk_text(tokenizer: &Tokenizer, generated_token_ids:
             .unwrap_or(two_text)
     } else {
         tokenizer
-            .decode(generated_token_ids, true)
+            .decode(generated_token_ids, skip_special)
             .unwrap_or_default()
     }
 }

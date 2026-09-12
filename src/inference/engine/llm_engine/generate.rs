@@ -1580,7 +1580,9 @@ impl LlmEngine {
             debug!("Generated {} tokens", generated.len());
             // A Harmony vocabulary keeps its channel tokens in the text, for the API to
             // split the analysis from the answer; any other drops its special tokens.
-            let skip_special = state.tokenizer.token_to_id("<|channel|>").is_none();
+            let skip_special = !crate::api::thinking::CHANNEL_OPENERS
+                .iter()
+                .any(|m| state.tokenizer.token_to_id(m).is_some());
             let text = state.tokenizer.decode(&generated, skip_special)
                 .map_err(|e| anyhow!("Decode error: {}", e))?;
 

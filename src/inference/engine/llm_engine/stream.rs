@@ -70,7 +70,9 @@ impl LlmEngine {
             let mut emitted = String::new();
             // A Harmony vocabulary keeps its channel tokens in the text, for the API to
             // split the analysis from the answer; any other drops its special tokens.
-            let skip_special = tokenizer.token_to_id("<|channel|>").is_none();
+            let skip_special = !crate::api::thinking::CHANNEL_OPENERS
+                .iter()
+                .any(|m| tokenizer.token_to_id(m).is_some());
             // What is safe to send, given every token but the last.
             //
             // Detokenisation is not monotonic: the last token's rendering can change when
@@ -930,7 +932,9 @@ impl LlmEngine {
             };
             // A Harmony vocabulary keeps its channel tokens in the text, for the API to
             // split the analysis from the answer; any other drops its special tokens.
-            let skip_special_tokens = stream_tokenizer.token_to_id("<|channel|>").is_none();
+            let skip_special_tokens = !crate::api::thinking::CHANNEL_OPENERS
+                .iter()
+                .any(|m| stream_tokenizer.token_to_id(m).is_some());
 
             // Helper: decode a token to text and send the DIFF to the streaming channel.
             // Returns false if client disconnected or stop sequence matched.
@@ -964,7 +968,8 @@ impl LlmEngine {
                 // ~2080 token-decode operations; on moondream stream-mode this
                 // CPU work added ~80ms of overhead (~50% of total wall),
                 // making stream tok/s look ~30pp worse than non-stream tok/s.
-                let chunk_text = incremental_chunk_text(tokenizer, generated_token_ids);
+                let chunk_text =
+                    incremental_chunk_text(tokenizer, generated_token_ids, skip_special_tokens);
                 *sent_text_len += chunk_text.len();
 
                 if *token_count < 10 {
@@ -1300,8 +1305,11 @@ impl LlmEngine {
                             }
                             generated_token_ids.push(tok);
 
-                            let chunk_text =
-                                incremental_chunk_text(&stream_tokenizer, &generated_token_ids);
+                            let chunk_text = incremental_chunk_text(
+                                &stream_tokenizer,
+                                &generated_token_ids,
+                                skip_special_tokens,
+                            );
                             sent_text_len += chunk_text.len();
 
                             if stop_tracker.is_active() {

@@ -9,6 +9,21 @@ const CLOSE: &str = "</think>";
 /// opening and the trailing end-of-turn tokens carry nothing and are dropped.
 const OPEN_HARMONY: &str = "<|channel|>analysis<|message|>";
 const CLOSE_HARMONY: &str = "<|end|>";
+/// gemma4 reasons on a channel too, but names its tags asymmetrically: `<|channel>` opens
+/// and `<channel|>` closes, with the reasoning channel called `thought`. A build trained on
+/// it opens the channel itself, so without this the channel's NAME reaches the reader as the
+/// first word of the answer while the tags around it are dropped as special tokens.
+/// The newline is part of the opener, not of the reasoning: it is where the channel's name
+/// ends and its message begins, as `<|message|>` is for Harmony. Without it the thinking
+/// segment starts with a stray newline, which the whole-text path trims away and the
+/// streaming path faithfully emits.
+const OPEN_GEMMA: &str = "<|channel>thought\n";
+const CLOSE_GEMMA: &str = "<channel|>";
+/// The channel openers whose presence in a vocabulary means the engine must keep its special
+/// tokens in the decoded text, so the split below can find them. Named once because the same
+/// test is made at every decode site, and a lookup that knew only the first spelling is what
+/// let a bare `thought` reach users of gemma4.
+pub(crate) const CHANNEL_OPENERS: [&str; 2] = ["<|channel|>", "<|channel>"];
 const HARMONY_NOISE: [&str; 5] = [
     "<|start|>assistant<|channel|>final<|message|>",
     "<|channel|>final<|message|>",
@@ -28,8 +43,9 @@ pub enum Segment {
 #[derive(Default)]
 pub struct ThinkSplit {
     inside: bool,
-    /// Whether the open block is a Harmony `analysis` channel rather than `<think>`.
-    harmony: bool,
+    /// The tag that closes the block now open, empty when none is. Three families share this
+    /// splitter and a flag cannot name three.
+    close: &'static str,
     pending: String,
     content_started: bool,
 }
@@ -45,14 +61,11 @@ impl ThinkSplit {
         loop {
             // The tags that may come next: a close of the open family while inside,
             // either open otherwise. The earliest one in the buffer wins.
+            let closing = [self.close];
             let candidates: &[&str] = if self.inside {
-                if self.harmony {
-                    &[CLOSE_HARMONY]
-                } else {
-                    &[CLOSE]
-                }
+                &closing
             } else {
-                &[OPEN, OPEN_HARMONY]
+                &[OPEN, OPEN_HARMONY, OPEN_GEMMA]
             };
             let hit = candidates
                 .iter()
@@ -64,7 +77,13 @@ impl ThinkSplit {
                     self.pending = self.pending[i + tag.len()..].to_string();
                     self.emit(&mut out, before);
                     if !self.inside {
-                        self.harmony = tag == OPEN_HARMONY;
+                        self.close = if tag == OPEN_HARMONY {
+                            CLOSE_HARMONY
+                        } else if tag == OPEN_GEMMA {
+                            CLOSE_GEMMA
+                        } else {
+                            CLOSE
+                        };
                     }
                     self.inside = !self.inside;
                 }
@@ -241,5 +260,46 @@ mod tests {
         let mut segs = s.push("a < b");
         segs.extend(s.finish());
         assert_eq!(segs, vec![Segment::Content("a < b".into())]);
+    }
+
+    /// gemma4:31b and :26b open a thought channel of their own and close it empty. The tags
+    /// are special tokens and were dropped on decode, so the channel's name was left behind
+    /// and every answer began with the word `thought`.
+    #[test]
+    fn a_gemma_thought_channel_never_reaches_the_answer() {
+        let (thinking, content) =
+            split_thinking("<|channel>thought\n<channel|>A CSV file is plain text.");
+        assert_eq!(thinking, None);
+        assert_eq!(content, "A CSV file is plain text.");
+
+        let (thinking, content) =
+            split_thinking("<|channel>thought\nweigh it up<channel|>the answer");
+        assert_eq!(thinking.as_deref(), Some("weigh it up"));
+        assert_eq!(content, "the answer");
+    }
+
+    #[test]
+    fn gemma_channel_tags_survive_a_chunk_boundary() {
+        let mut s = ThinkSplit::new();
+        let mut segs = s.push("<|chan");
+        segs.extend(s.push("nel>thought\nplan<chan"));
+        segs.extend(s.push("nel|>answer"));
+        segs.extend(s.finish());
+        let thinking: String = segs
+            .iter()
+            .filter_map(|x| match x {
+                Segment::Thinking(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let content: String = segs
+            .iter()
+            .filter_map(|x| match x {
+                Segment::Content(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "plan");
+        assert_eq!(content, "answer");
     }
 }

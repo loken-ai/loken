@@ -762,12 +762,55 @@ mod spm_vocabulary_tests {
         let mut streamed = String::new();
         for n in 1..=ids.len() {
             streamed.push_str(
-                &crate::inference::engine::decode_step::incremental_chunk_text(&tok, &ids[..n]),
+                &crate::inference::engine::decode_step::incremental_chunk_text(
+                    &tok,
+                    &ids[..n],
+                    true,
+                ),
             );
         }
         assert_eq!(
             streamed, whole,
             "streaming assembly diverges from batch decode"
         );
+    }
+
+    /// The incremental decode must honour the flag it is handed rather than assume one.
+    /// It hardcoded "skip the special tokens", so a vocabulary whose channel tokens have to
+    /// reach the reader kept them when the answer came back whole and lost them when it was
+    /// streamed: the same reply arrived clean in one piece and with a bare channel name
+    /// token by token. Asserting against the batch decode for BOTH values needs no knowledge
+    /// of which pieces this vocabulary marks special - under the hardcoded flag the second
+    /// pass simply could not agree.
+    #[test]
+    fn the_incremental_decode_honours_the_skip_flag_it_is_given() {
+        let Some(tok) = ernie() else {
+            return;
+        };
+        let mut ids: Vec<u32> = tok
+            .encode("man named", false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        for p in ["<0x0A>", "<0x74>", "<0x65>", "<0x3b>"] {
+            ids.push(tok.token_to_id(p).unwrap_or_else(|| panic!("no piece {p}")));
+        }
+        for skip in [true, false] {
+            let whole = tok.decode(&ids, skip).expect("decode");
+            let mut streamed = String::new();
+            for n in 1..=ids.len() {
+                streamed.push_str(
+                    &crate::inference::engine::decode_step::incremental_chunk_text(
+                        &tok,
+                        &ids[..n],
+                        skip,
+                    ),
+                );
+            }
+            assert_eq!(
+                streamed, whole,
+                "streaming assembly diverges from batch decode with skip_special={skip}"
+            );
+        }
     }
 }
