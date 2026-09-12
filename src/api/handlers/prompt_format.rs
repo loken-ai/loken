@@ -256,6 +256,33 @@ fn indented_json(v: &minijinja::Value, indent: usize) -> Result<String, minijinj
         .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))
 }
 
+/// Removes the `{% generation %}` ... `{% endgeneration %}` pair, a Hugging Face extension
+/// that marks the assistant's span so training can mask it. The pair renders to nothing,
+/// and minijinja has no such tag: a template that carries it - smollm3 does - did not parse
+/// at all, and the model was handed a reconstructed format with only a warning to show for
+/// it. The reference renderer treats the pair as transparent, and so does this.
+fn strip_generation_tags(tmpl: &str) -> String {
+    let mut out = String::with_capacity(tmpl.len());
+    let mut rest = tmpl;
+    while let Some(start) = rest.find("{%") {
+        let Some(len) = rest[start..].find("%}") else {
+            break;
+        };
+        let tag = &rest[start..start + len + 2];
+        let inner = tag
+            .trim_start_matches("{%")
+            .trim_end_matches("%}")
+            .trim_matches(|c: char| c == '-' || c.is_whitespace());
+        out.push_str(&rest[..start]);
+        if inner != "generation" && inner != "endgeneration" {
+            out.push_str(tag);
+        }
+        rest = &rest[start + len + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A space after every separator, and nothing else changed.
 struct SpacedJson;
 
@@ -398,6 +425,9 @@ fn render_jinja_template(
     tools: Option<&[Tool]>,
 ) -> Option<String> {
     use minijinja::{context, Environment, Value};
+    // Declared before the environment so the borrow outlives every use of it.
+    let stripped = strip_generation_tags(tmpl);
+    let tmpl: &str = &stripped;
     // Messages go in whole: a tool-using template reads `tool_calls`, `tool_call_id`
     // and `name` off them, with the call's arguments as an object, the way the
     // upstream templates were written against.
@@ -1111,6 +1141,121 @@ mod tests {
         let empty = super::render_jinja_template("{{ messages | tojson() }}", &msgs, false, None)
             .expect("tojson() with empty parentheses failed to render");
         assert!(empty.contains("\"role\""), "got: {empty}");
+    }
+
+    /// The Hugging Face span markers render to nothing and must not reach minijinja, which
+    /// has no such statement. Whitespace-control variants included, and nothing else touched.
+    #[test]
+    fn generation_markers_are_removed_before_parsing() {
+        let src = "a{% generation %}b{%- endgeneration -%}c{% if x %}d{% endif %}";
+        assert_eq!(
+            super::strip_generation_tags(src),
+            "abc{% if x %}d{% endif %}"
+        );
+        // The shape smollm3 uses: the marker on its own line inside the assistant branch of
+        // the message loop, whitespace control on the neighbours.
+        let src = "{%- for message in messages -%}{%- if message.role == \"assistant\" -%}\n        {% generation %}\n        {%- if r -%}x{%- endif -%}\n        {% endgeneration %}\n    {%- endif -%}{%- endfor -%}";
+        let out = super::render_jinja_template(src, &[msg("assistant", "hi")], false, None);
+        assert!(out.is_some(), "a template carrying the markers must parse");
+    }
+
+    /// Every Jinja template a model on this machine declares has to render, with and
+    /// without tools. One that fails is replaced by a reconstructed format with nothing but
+    /// a warning to show for it, which is how `tojson(indent=4)` left four models receiving
+    /// something other than the format they declare, unnoticed for months. The template is
+    /// read the way the server reads it, and the test skips itself without the store, like
+    /// the tokenizer fixtures do.
+    #[test]
+    fn every_declared_template_renders_with_and_without_tools() {
+        let store = std::env::var("OLLAMA_MODELS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate::config::Config::default_ollama_models_dir());
+        let Ok(repos) = std::fs::read_dir(store.join("manifests/registry.ollama.ai/library"))
+        else {
+            return;
+        };
+        let tool: Tool = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        }))
+        .expect("a tool");
+        let msgs = vec![msg("user", "hi")];
+        // A template may require an input a bare question does not carry: shieldgemma
+        // concatenates the policy it takes from the system prompt and fails without one,
+        // by design. So a template fails only when it renders under neither shape.
+        let with_system = vec![msg("system", "Be brief."), msg("user", "hi")];
+        let mut failures = Vec::new();
+        for repo in repos.flatten() {
+            let Ok(tags) = std::fs::read_dir(repo.path()) else {
+                continue;
+            };
+            for tag in tags.flatten() {
+                let name = format!(
+                    "{}:{}",
+                    repo.file_name().to_string_lossy(),
+                    tag.file_name().to_string_lossy()
+                );
+                let Some(tmpl) = declared_jinja_template(&store, &tag.path()) else {
+                    continue;
+                };
+                let renders = |tools: Option<&[Tool]>| {
+                    super::render_jinja_template(&tmpl, &msgs, true, tools).is_some()
+                        || super::render_jinja_template(&tmpl, &with_system, true, tools).is_some()
+                };
+                if !renders(None) {
+                    failures.push(format!("{name} without tools"));
+                }
+                if tmpl.contains("tools") && !renders(Some(std::slice::from_ref(&tool))) {
+                    failures.push(format!("{name} with tools"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "templates that fall back to a reconstructed format:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
+    /// The Jinja template a model's weights carry, resolved as the server resolves it: the
+    /// last model layer of the manifest, its header only, the `tokenizer.chat_template` key.
+    fn declared_jinja_template(
+        store: &std::path::Path,
+        manifest: &std::path::Path,
+    ) -> Option<String> {
+        let text = std::fs::read_to_string(manifest).ok()?;
+        let mf: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let digest = mf
+            .get("layers")?
+            .as_array()?
+            .iter()
+            .rev()
+            .find(|l| {
+                l.get("mediaType")
+                    .and_then(|m| m.as_str())
+                    .is_some_and(|m| m.contains("model"))
+            })?
+            .get("digest")?
+            .as_str()?
+            .replace(':', "-");
+        let header =
+            crate::tensor::quantized::gguf_file::open_header(store.join("blobs").join(digest))
+                .ok()?;
+        let tmpl = header
+            .metadata
+            .get("tokenizer.chat_template")?
+            .to_string()
+            .ok()
+            .cloned()?;
+        tmpl.contains("{%").then_some(tmpl)
     }
 
     #[test]
