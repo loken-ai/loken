@@ -437,7 +437,15 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
                         }),
                         _ => None,
                     } {
-                        special_tokens.push(tokenizers::AddedToken::from(token_str, true));
+                        // A marker the API layer parses out of the answer is registered NOT
+                        // special, so it survives a decode that skips the rest. Marking it
+                        // like any other control token dropped it before `ThinkSplit` could
+                        // find a delimiter, and a reasoning model then delivered its chain
+                        // of thought as the answer.
+                        let parsed_by_the_api =
+                            crate::api::thinking::SPLIT_MARKERS.contains(&token_str.as_str());
+                        special_tokens
+                            .push(tokenizers::AddedToken::from(token_str, !parsed_by_the_api));
                     }
                 }
             }

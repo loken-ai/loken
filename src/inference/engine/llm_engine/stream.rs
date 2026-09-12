@@ -70,9 +70,9 @@ impl LlmEngine {
             let mut emitted = String::new();
             // A Harmony vocabulary keeps its channel tokens in the text, for the API to
             // split the analysis from the answer; any other drops its special tokens.
-            let skip_special = !crate::api::thinking::CHANNEL_OPENERS
-                .iter()
-                .any(|m| tokenizer.token_to_id(m).is_some());
+            // The markers the API parses are exempted when the vocabulary is loaded, so the
+            // rest of the control tokens are always dropped here.
+            let skip_special = true;
             // What is safe to send, given every token but the last.
             //
             // Detokenisation is not monotonic: the last token's rendering can change when
@@ -932,9 +932,9 @@ impl LlmEngine {
             };
             // A Harmony vocabulary keeps its channel tokens in the text, for the API to
             // split the analysis from the answer; any other drops its special tokens.
-            let skip_special_tokens = !crate::api::thinking::CHANNEL_OPENERS
-                .iter()
-                .any(|m| stream_tokenizer.token_to_id(m).is_some());
+            // The markers the API parses are exempted when the vocabulary is loaded, so the
+            // rest of the control tokens are always dropped here.
+            let skip_special_tokens = true;
 
             // Helper: decode a token to text and send the DIFF to the streaming channel.
             // Returns false if client disconnected or stop sequence matched.

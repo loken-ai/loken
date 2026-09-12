@@ -19,11 +19,27 @@ const CLOSE_HARMONY: &str = "<|end|>";
 /// streaming path faithfully emits.
 const OPEN_GEMMA: &str = "<|channel>thought\n";
 const CLOSE_GEMMA: &str = "<channel|>";
-/// The channel openers whose presence in a vocabulary means the engine must keep its special
-/// tokens in the decoded text, so the split below can find them. Named once because the same
-/// test is made at every decode site, and a lookup that knew only the first spelling is what
-/// let a bare `thought` reach users of gemma4.
-pub(crate) const CHANNEL_OPENERS: [&str; 2] = ["<|channel|>", "<|channel>"];
+/// Every marker this module parses out of an answer, as a vocabulary spells them. A token
+/// listed here is registered NOT special when the model loads, so it survives a decode that
+/// still skips everything else: the splitter needs its delimiters, the reader must not see
+/// the rest of the control vocabulary.
+///
+/// Asking instead whether a vocabulary "uses channels" was the wrong question, and it missed
+/// every model that reasons with `<think>`. Those tags are user-defined tokens, so they were
+/// dropped before the split could see them, and the whole qwen3, qwen3.5, deepseek-r1,
+/// deepcoder, smollm3 and lfm2 line delivered its chain of thought as the answer with the
+/// thinking field left empty.
+pub(crate) const SPLIT_MARKERS: [&str; 9] = [
+    "<think>",
+    "</think>",
+    "<|channel|>",
+    "<|message|>",
+    "<|end|>",
+    "<|return|>",
+    "<|start|>",
+    "<|channel>",
+    "<channel|>",
+];
 const HARMONY_NOISE: [&str; 5] = [
     "<|start|>assistant<|channel|>final<|message|>",
     "<|channel|>final<|message|>",
