@@ -693,6 +693,62 @@ mod spm_vocabulary_tests {
     /// Open ernie4-5 from the local store, or say nothing. It is the only model in the
     /// bench set whose GGUF declares the llama tokenizer WITHOUT merges, which is the
     /// shape these tests are about.
+    /// The markers the API parses must come back out of a decode that skips the rest of
+    /// the control vocabulary. qwen3 marks its think tags as user-defined tokens, the same
+    /// class as its turn markers, and they were dropped with them: every model that reasons
+    /// with them delivered its chain of thought as the answer. Checked on the real vocabulary
+    /// rather than on a string handed to the splitter, which is the test that could not see
+    /// this.
+    #[test]
+    fn think_tags_survive_a_decode_that_skips_special_tokens() {
+        let Some(tok) = qwen3_small() else {
+            return;
+        };
+        let think = tok.token_to_id("<think>").expect("qwen3 has <think>");
+        let close = tok.token_to_id("</think>").expect("qwen3 has </think>");
+        let turn = tok
+            .token_to_id("<|im_start|>")
+            .expect("qwen3 has <|im_start|>");
+        let mut ids = vec![turn, think];
+        ids.extend(tok.encode("hi", false).expect("encode").get_ids());
+        ids.push(close);
+        let out = tok.decode(&ids, true).expect("decode");
+        assert!(out.starts_with("<think>"), "opener dropped: {out:?}");
+        assert!(out.ends_with("</think>"), "closer dropped: {out:?}");
+        assert!(
+            !out.contains("<|im_start|>"),
+            "a turn marker reached the text: {out:?}"
+        );
+    }
+
+    /// The smallest qwen3 in the store: a vocabulary whose reasoning delimiters are
+    /// user-defined tokens. The model layer is taken from the manifest by media type, not
+    /// by position, because the first digest in a manifest need not be the weights.
+    fn qwen3_small() -> Option<tokenizers::Tokenizer> {
+        let store = std::env::var("OLLAMA_MODELS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate::config::Config::default_ollama_models_dir());
+        let man = store.join("manifests/registry.ollama.ai/library/qwen3/0.6b");
+        let mf: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(man).ok()?).ok()?;
+        let digest = mf
+            .get("layers")?
+            .as_array()?
+            .iter()
+            .rev()
+            .find(|l| {
+                l.get("mediaType")
+                    .and_then(|m| m.as_str())
+                    .is_some_and(|m| m.contains("model"))
+            })?
+            .get("digest")?
+            .as_str()?
+            .replace(':', "-");
+        let mut f = std::fs::File::open(store.join("blobs").join(digest)).ok()?;
+        let content = crate::tensor::quantized::gguf_file::Content::read(&mut f).ok()?;
+        super::build_tokenizer_from_gguf(&content).ok()
+    }
+
     fn ernie() -> Option<tokenizers::Tokenizer> {
         let store = std::env::var("OLLAMA_MODELS")
             .map(std::path::PathBuf::from)
