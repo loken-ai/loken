@@ -1064,6 +1064,50 @@ pub(crate) fn holds_weights(model: &crate::inference::load::model_manager::Model
         })
 }
 
+/// Whether the text loader could open a listed Hugging Face model. It reads GGUF and AWQ
+/// checkpoints and nothing else, while the cache holds every repository ever fetched: a
+/// plain safetensors checkpoint of a causal language model was advertised in the catalogue
+/// and failed at load with "model file not found". The judgement is the loader's own - a
+/// GGUF among the files, or the same AWQ test it makes - so the two cannot drift apart.
+/// Anything that is not a causal language model is left to the engine that loads it.
+pub(crate) fn text_loader_can_open(
+    hf_dir: &str,
+    model: &crate::inference::load::model_manager::ModelMetadata,
+) -> bool {
+    if model.source != "huggingface" {
+        return true;
+    }
+    let manager =
+        crate::inference::load::huggingface_manager::HuggingFaceManager::new(PathBuf::from(hf_dir));
+    let Some(path) = manager.get_model_path(&model.id) else {
+        return true;
+    };
+    if path.is_file() {
+        return true;
+    }
+    let Ok(config) = std::fs::read_to_string(path.join("config.json")) else {
+        return true;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config) else {
+        return true;
+    };
+    let causal = config
+        .get("architectures")
+        .and_then(|a| a.as_array())
+        .is_some_and(|a| {
+            a.iter()
+                .any(|v| v.as_str().is_some_and(|s| s.ends_with("ForCausalLM")))
+        });
+    if !causal {
+        return true;
+    }
+    model
+        .files
+        .iter()
+        .any(|f| f.to_ascii_lowercase().ends_with(".gguf"))
+        || crate::inference::load::awq_loader::find_awq_model_dir(&path.to_string_lossy()).is_some()
+}
+
 impl APIServer {
     /// The cluster handle, if this node joined one.
     /// Read the catalogue once, before the node answers: every listing after this finds the
@@ -1149,9 +1193,12 @@ impl APIServer {
                 #[cfg(feature = "media")]
                 ollama::inject_local_boogu(self, &mut models);
                 let listed = models.len();
+                // A peer sent a request for a model this node lists and cannot load
+                // would fail it; what is advertised is what can be served.
+                let hf_dir = self.huggingface_models_dir.clone();
                 let list: Vec<String> = models
                     .into_iter()
-                    .filter(holds_weights)
+                    .filter(|m| holds_weights(m) && text_loader_can_open(&hf_dir, m))
                     .map(|m| m.id)
                     .collect();
                 if list.len() < listed {

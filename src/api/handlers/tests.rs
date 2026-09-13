@@ -705,6 +705,65 @@ fn a_repository_without_weights_is_not_advertised() {
     assert!(super::holds_weights(&entry("ollama", &[])));
 }
 
+/// The catalogue must not advertise a causal language model the text loader cannot open.
+/// A plain safetensors checkpoint of one was listed and failed at load with "model file
+/// not found"; an AWQ checkpoint loads; a model that is not a causal LM belongs to another
+/// engine and is listed as before. Judged on the real cache under HF_HOME, and skipped
+/// without one, like the tokenizer fixtures.
+#[test]
+fn a_causal_lm_the_text_loader_cannot_open_is_not_advertised() {
+    use crate::inference::load::model_manager::ModelMetadata;
+    let Ok(hf) = std::env::var("HF_HOME") else {
+        return;
+    };
+    let entry = |id: &str, files: &[&str]| ModelMetadata {
+        id: id.into(),
+        name: id.into(),
+        size: 0,
+        downloaded_at: String::new(),
+        files: files.iter().map(|f| f.to_string()).collect(),
+        source: "huggingface".into(),
+        digest: String::new(),
+    };
+    let present = |id: &str| {
+        crate::inference::load::huggingface_manager::HuggingFaceManager::new(
+            std::path::PathBuf::from(&hf),
+        )
+        .get_model_path(id)
+        .is_some()
+    };
+    if present("Qwen/Qwen2.5-0.5B-Instruct") {
+        assert!(!super::text_loader_can_open(
+            &hf,
+            &entry(
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                &["config.json", "model.safetensors"]
+            )
+        ));
+    }
+    if present("Qwen/Qwen3-8B-AWQ") {
+        assert!(super::text_loader_can_open(
+            &hf,
+            &entry(
+                "Qwen/Qwen3-8B-AWQ",
+                &["config.json", "model-00001-of-00002.safetensors"]
+            )
+        ));
+    }
+    if present("openai/whisper-small") {
+        assert!(super::text_loader_can_open(
+            &hf,
+            &entry(
+                "openai/whisper-small",
+                &["config.json", "model.safetensors"]
+            )
+        ));
+    }
+    let mut ollama = entry("qwen3:0.6b", &[]);
+    ollama.source = "ollama".into();
+    assert!(super::text_loader_can_open(&hf, &ollama));
+}
+
 #[test]
 fn a_media_job_is_listed_while_its_note_lives() {
     let mut jobs = super::MediaJobs::default();
