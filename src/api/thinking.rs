@@ -67,8 +67,16 @@ pub struct ThinkSplit {
 }
 
 impl ThinkSplit {
-    pub fn new() -> Self {
-        Self::default()
+    /// A splitter for an answer whose prompt already opened the thinking block. Some
+    /// templates write the opener into the generation prompt when reasoning is on - qwen3.5
+    /// does - so the model's text starts inside a block it never opens itself, and a splitter
+    /// that waits for the opener reads the whole reasoning as the answer.
+    pub fn opened(by_prompt: bool) -> Self {
+        Self {
+            inside: by_prompt,
+            close: if by_prompt { CLOSE } else { "" },
+            ..Self::default()
+        }
     }
 
     pub fn push(&mut self, chunk: &str) -> Vec<Segment> {
@@ -176,9 +184,21 @@ fn partial_tag_suffix(s: &str, tag: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// The whole-text form: the reasoning, if any, and the answer.
-pub fn split_thinking(text: &str) -> (Option<String>, String) {
-    let mut split = ThinkSplit::new();
+/// Whether a rendered prompt ends inside a thinking block: an opener with no closer after
+/// it. A template that pre-closes the block, as qwen3 does when reasoning is off, does not
+/// count, and neither does one that leaves the opener to the model.
+pub fn prompt_opens_thinking(prompt: &str) -> bool {
+    match (prompt.rfind(OPEN), prompt.rfind(CLOSE)) {
+        (Some(open), Some(close)) => open > close,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// The whole-text form: the reasoning, if any, and the answer. `by_prompt` is true when the
+/// rendered prompt already opened the thinking block, so the answer starts inside it.
+pub fn split_thinking_opened(by_prompt: bool, text: &str) -> (Option<String>, String) {
+    let mut split = ThinkSplit::opened(by_prompt);
     let mut segments = split.push(text);
     segments.extend(split.finish());
     let mut thinking = String::new();
@@ -199,7 +219,7 @@ mod tests {
 
     #[test]
     fn harmony_channels_split_like_think_tags() {
-        let (thinking, content) = split_thinking(
+        let (thinking, content) = split_thinking_opened(false,
             "<|channel|>analysis<|message|>We must classify.<|end|><|start|>assistant<|channel|>final<|message|>{\"violations\": []}<|return|>",
         );
         assert_eq!(thinking.as_deref(), Some("We must classify."));
@@ -208,14 +228,15 @@ mod tests {
 
     #[test]
     fn harmony_answer_without_analysis_is_plain_content() {
-        let (thinking, content) = split_thinking("<|channel|>final<|message|>Hello.<|return|>");
+        let (thinking, content) =
+            split_thinking_opened(false, "<|channel|>final<|message|>Hello.<|return|>");
         assert_eq!(thinking, None);
         assert_eq!(content, "Hello.");
     }
 
     #[test]
     fn harmony_markers_survive_a_chunk_boundary() {
-        let mut s = ThinkSplit::new();
+        let mut s = ThinkSplit::opened(false);
         let mut segs = s.push("<|channel|>anal");
         segs.extend(s.push("ysis<|message|>think<|en"));
         segs.extend(s.push("d|><|start|>assistant<|channel|>final<|message|>answer"));
@@ -241,19 +262,22 @@ mod tests {
     #[test]
     fn whole_text_splits_reasoning_from_answer() {
         assert_eq!(
-            split_thinking("<think>\nplan\n</think>\n\nanswer"),
+            split_thinking_opened(false, "<think>\nplan\n</think>\n\nanswer"),
             (Some("plan".to_string()), "answer".to_string())
         );
-        assert_eq!(split_thinking("just text"), (None, "just text".to_string()));
         assert_eq!(
-            split_thinking("<think>\n\n</think>\n\nhi"),
+            split_thinking_opened(false, "just text"),
+            (None, "just text".to_string())
+        );
+        assert_eq!(
+            split_thinking_opened(false, "<think>\n\n</think>\n\nhi"),
             (None, "hi".to_string())
         );
     }
 
     #[test]
     fn a_tag_cut_across_chunks_is_read_whole() {
-        let mut s = ThinkSplit::new();
+        let mut s = ThinkSplit::opened(false);
         let mut segs = Vec::new();
         for c in ["<thi", "nk>ab", "c</th", "ink>\nhello", " world"] {
             segs.extend(s.push(c));
@@ -272,7 +296,7 @@ mod tests {
 
     #[test]
     fn a_lone_angle_bracket_is_content_not_a_tag() {
-        let mut s = ThinkSplit::new();
+        let mut s = ThinkSplit::opened(false);
         let mut segs = s.push("a < b");
         segs.extend(s.finish());
         assert_eq!(segs, vec![Segment::Content("a < b".into())]);
@@ -283,20 +307,22 @@ mod tests {
     /// and every answer began with the word `thought`.
     #[test]
     fn a_gemma_thought_channel_never_reaches_the_answer() {
-        let (thinking, content) =
-            split_thinking("<|channel>thought\n<channel|>A CSV file is plain text.");
+        let (thinking, content) = split_thinking_opened(
+            false,
+            "<|channel>thought\n<channel|>A CSV file is plain text.",
+        );
         assert_eq!(thinking, None);
         assert_eq!(content, "A CSV file is plain text.");
 
         let (thinking, content) =
-            split_thinking("<|channel>thought\nweigh it up<channel|>the answer");
+            split_thinking_opened(false, "<|channel>thought\nweigh it up<channel|>the answer");
         assert_eq!(thinking.as_deref(), Some("weigh it up"));
         assert_eq!(content, "the answer");
     }
 
     #[test]
     fn gemma_channel_tags_survive_a_chunk_boundary() {
-        let mut s = ThinkSplit::new();
+        let mut s = ThinkSplit::opened(false);
         let mut segs = s.push("<|chan");
         segs.extend(s.push("nel>thought\nplan<chan"));
         segs.extend(s.push("nel|>answer"));
@@ -317,5 +343,34 @@ mod tests {
             .collect();
         assert_eq!(thinking, "plan");
         assert_eq!(content, "answer");
+    }
+
+    /// qwen3.5 writes the opener into the generation prompt when reasoning is on, so the
+    /// model's text starts inside the block. A splitter that waited for the opener read the
+    /// whole reasoning as the answer and left the thinking field empty.
+    #[test]
+    fn a_block_the_prompt_opened_is_still_reasoning() {
+        assert!(prompt_opens_thinking("<|im_start|>assistant\n<think>\n"));
+        assert!(!prompt_opens_thinking(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ));
+        assert!(!prompt_opens_thinking("<|im_start|>assistant\n"));
+        assert_eq!(
+            split_thinking_opened(true, "weigh it up\n</think>\n\nthe answer"),
+            (Some("weigh it up".to_string()), "the answer".to_string())
+        );
+        // Without an opener in the prompt the same text is an answer, tag and all.
+        let (thinking, _) = split_thinking_opened(false, "weigh it up\n</think>\n\nthe answer");
+        assert_eq!(thinking, None);
+        // Streamed: the first chunk is already reasoning.
+        let mut s = ThinkSplit::opened(true);
+        let mut segs = s.push("weigh it");
+        segs.extend(s.push(" up</think>answer"));
+        segs.extend(s.finish());
+        assert_eq!(segs[0], Segment::Thinking("weigh it".into()));
+        assert!(
+            segs.contains(&Segment::Content("answer".into())),
+            "{segs:?}"
+        );
     }
 }

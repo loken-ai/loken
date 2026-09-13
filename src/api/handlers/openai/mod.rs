@@ -429,6 +429,8 @@ pub(crate) async fn chat_completion(
         };
         super::prompt_format::apply_thinking_preference(&mut prompt, Some(pref));
     }
+    // Whether the template already opened the thinking block; the splitter must know.
+    let thinking_opened = crate::api::thinking::prompt_opens_thinking(&prompt);
     let single_tool_call = request.parallel_tool_calls == Some(false);
 
     // OpenAI's `response_format` -> llguidance grammar spec.
@@ -575,7 +577,7 @@ pub(crate) async fn chat_completion(
                     } else {
                         None
                     };
-                    let mut splitter = crate::api::thinking::ThinkSplit::new();
+                    let mut splitter = crate::api::thinking::ThinkSplit::opened(thinking_opened);
                     let mut reasoning_acc = String::new();
 
                     while let Some(result) = rx.recv().await {
@@ -889,7 +891,8 @@ pub(crate) async fn chat_completion(
         // model output into structured tool_calls and switch finish_reason
         // to "tool_calls" (OpenAI's contract). Plain answers (no markers)
         // pass through unchanged.
-        let (reasoning, content) = crate::api::thinking::split_thinking(&content);
+        let (reasoning, content) =
+            crate::api::thinking::split_thinking_opened(thinking_opened, &content);
         let (message, finish_reason) = if tools_active {
             let mut parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &content);
             if single_tool_call {
@@ -1829,7 +1832,11 @@ pub(crate) async fn openai_list_models(
     // matches what most SDKs expect (file age, not request time).
     if let Ok(mut models) = state.model_manager.list_models().await {
         // A repository without weights is not a model a client can ask for.
-        models.retain(crate::api::handlers::holds_weights);
+        // And not one the text loader would refuse at load time.
+        models.retain(|m| {
+            crate::api::handlers::holds_weights(m)
+                && crate::api::handlers::text_loader_can_open(&state.huggingface_models_dir, m)
+        });
         // Stable alphabetical order so SDK UIs render the catalog
         // consistently across calls (filesystem walk order is
         // platform-dependent).

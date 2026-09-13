@@ -173,6 +173,8 @@ pub(crate) async fn anthropic_messages(
     if !thinking_on {
         super::prompt_format::apply_thinking_preference(&mut prompt, Some("disabled"));
     }
+    // Whether the template already opened the thinking block; the splitter must know.
+    let thinking_opened = crate::api::thinking::prompt_opens_thinking(&prompt);
     debug!("Anthropic /v1/messages: model={model_name} stream={stream} tools={tools_active} prompt_chars={}", prompt.len());
 
     let params = GenerationParams {
@@ -238,7 +240,8 @@ pub(crate) async fn anthropic_messages(
         let _cancel = engine.cancel_guard();
         match engine.generate(&prompt, params).await {
             Ok(result) => {
-                let (thinking, answer) = crate::api::thinking::split_thinking(&result.text);
+                let (thinking, answer) =
+                    crate::api::thinking::split_thinking_opened(thinking_opened, &result.text);
                 let (text, calls) = if tools_active {
                     let mut parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &answer);
                     if single_tool_call {
@@ -300,7 +303,7 @@ pub(crate) async fn anthropic_messages(
                     };
                     // Blocks are numbered as they open: a thinking block first when the
                     // model reasons, then the text, then the tool uses.
-                    let mut splitter = crate::api::thinking::ThinkSplit::new();
+                    let mut splitter = crate::api::thinking::ThinkSplit::opened(thinking_opened);
                     let mut next_idx = 0usize;
                     let mut think_idx: Option<usize> = None;
                     let mut text_idx: Option<usize> = None;

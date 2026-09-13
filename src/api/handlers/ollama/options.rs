@@ -628,6 +628,8 @@ pub(crate) async fn ollama_chat(
     // answers directly. Only applied when the rendered prompt actually ends
     // with the ChatML opener, so non-reasoning templates are untouched.
     apply_thinking_preference(&mut prompt, request.thinking_preference());
+    // Whether the template already opened the thinking block; the splitter must know.
+    let thinking_opened = crate::api::thinking::prompt_opens_thinking(&prompt);
     // Length only: the prompt itself is user content and is never written to a log.
     debug!("Chat prompt: {} chars", prompt.len());
 
@@ -709,7 +711,7 @@ pub(crate) async fn ollama_chat(
                     } else {
                         None
                     };
-                    let mut splitter = crate::api::thinking::ThinkSplit::new();
+                    let mut splitter = crate::api::thinking::ThinkSplit::opened(thinking_opened);
                     let mut thought = false;
                     let mut thinking_ns: Option<u64> = None;
 
@@ -914,7 +916,8 @@ pub(crate) async fn ollama_chat(
                 // Tool calling: lift markers out of the output into
                 // structured tool_calls (Ollama surfaces these on
                 // message.tool_calls). Plain answers pass through.
-                let (chat_thinking, chat_body) = crate::api::thinking::split_thinking(&result.text);
+                let (chat_thinking, chat_body) =
+                    crate::api::thinking::split_thinking_opened(thinking_opened, &result.text);
                 let (msg, _tool_called) = if tools_active {
                     let parsed = crate::api::tool_calls::parse_tool_calls(tool_format, &chat_body);
                     if parsed.calls.is_empty() {
@@ -1311,6 +1314,7 @@ pub(crate) async fn ollama_generate(
     // gets none here too.
     let mut effective_prompt = effective_prompt;
     apply_thinking_preference(&mut effective_prompt, request.thinking_preference());
+    let thinking_opened = crate::api::thinking::prompt_opens_thinking(&effective_prompt);
 
     // Extract generation options
     let mut params = extract_generation_options(request.options.as_ref());
@@ -1465,7 +1469,7 @@ pub(crate) async fn ollama_generate(
                         let _gate_held = gate_guard;
                         let mut accumulated_text = String::new();
                         let mut chunk_count: usize = 0;
-                        let mut splitter = crate::api::thinking::ThinkSplit::new();
+                        let mut splitter = crate::api::thinking::ThinkSplit::opened(thinking_opened);
                         let mut thought = false;
                         let mut thinking_ns: Option<u64> = None;
                         while let Some(result) = rx.recv().await {
@@ -1609,7 +1613,7 @@ pub(crate) async fn ollama_generate(
                 let engine_for_stats = engine.clone();
                 let stream = async_stream::stream! {
                     let _gate_held = gate_guard; // released when stream ends
-                    let mut splitter = crate::api::thinking::ThinkSplit::new();
+                    let mut splitter = crate::api::thinking::ThinkSplit::opened(thinking_opened);
                     let mut thought = false;
                     let mut thinking_ns: Option<u64> = None;
                     let mut accumulated_text = String::new();
@@ -1770,7 +1774,8 @@ pub(crate) async fn ollama_generate(
                 crate::energy_report::end(energy, "text", "[/api/generate]");
                 let total_duration = start.elapsed().as_nanos() as u64;
 
-                let (thinking, answer) = crate::api::thinking::split_thinking(&result.text);
+                let (thinking, answer) =
+                    crate::api::thinking::split_thinking_opened(thinking_opened, &result.text);
                 let mut response = OllamaGenerateResponse::new(model_name, answer);
                 if !result.logprobs.is_empty() {
                     response.logprobs = Some(ollama_logprobs(&result.logprobs));
