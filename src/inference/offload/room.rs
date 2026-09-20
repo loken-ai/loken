@@ -86,14 +86,25 @@ fn rooms() -> &'static Mutex<HashMap<usize, &'static Mutex<Room>>> {
 /// the `working` room the placement's steps need; an opening after the first answers the same
 /// room, whatever figures it brings.
 pub fn open(ordinal: usize, total: usize, working: usize) -> &'static Mutex<Room> {
-    rooms().lock().unwrap().entry(ordinal).or_insert_with(|| {
+    let slot = *rooms().lock().unwrap().entry(ordinal).or_insert_with(|| {
         Box::leak(Box::new(Mutex::new(Room {
             taken: 0,
-            ceiling: total.saturating_sub(working),
-            working,
+            ceiling: 0,
+            working: 0,
             reserved: 0,
         })))
-    })
+    });
+    // A fresh placement supersedes any earlier one on this device: its cards were dropped and
+    // their memory freed, so the accounting starts over. Kept, it would still count weights that
+    // no longer sit there and push a re-opened placement's always-read path onto the host. Called
+    // once per device before any weight is taken, so the reset never lands mid-placement.
+    *slot.lock().unwrap() = Room {
+        taken: 0,
+        ceiling: total.saturating_sub(working),
+        working,
+        reserved: 0,
+    };
+    slot
 }
 
 #[cfg(test)]
