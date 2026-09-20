@@ -218,25 +218,28 @@ fn compile_flashdecode_tc_kernels() {
         // a block-wide K/V tile instead of a per-warp one.
         ("cuda/flash_dit_bf16.cu", "flash_dit_bf16.o", &dit_gencodes),
     ];
+    let src_newest = kernel_src_newest();
     let mut objs = Vec::new();
     for (src, obj_name, gencodes) in srcs {
         let obj = out_dir.join(obj_name);
-        let status = Command::new(&nvcc)
-            .args([
-                "-c",
-                src,
-                "-o",
-                obj.to_str().unwrap(),
-                "-O3",
-                "--expt-relaxed-constexpr",
-                "-std=c++17",
-                "-Xcompiler",
-                "-fPIC",
-            ])
-            .args(gencodes)
-            .status()
-            .unwrap_or_else(|e| panic!("failed to run nvcc for {src}: {e}"));
-        assert!(status.success(), "nvcc failed for {src}");
+        if !obj_fresh(&obj, src_newest) {
+            let status = Command::new(&nvcc)
+                .args([
+                    "-c",
+                    src,
+                    "-o",
+                    obj.to_str().unwrap(),
+                    "-O3",
+                    "--expt-relaxed-constexpr",
+                    "-std=c++17",
+                    "-Xcompiler",
+                    "-fPIC",
+                ])
+                .args(gencodes)
+                .status()
+                .unwrap_or_else(|e| panic!("failed to run nvcc for {src}: {e}"));
+            assert!(status.success(), "nvcc failed for {src}");
+        }
         objs.push(obj);
     }
 
@@ -286,6 +289,7 @@ fn compile_marlin_kernels() {
     ];
     println!("cargo:rerun-if-changed=cuda/marlin");
 
+    let src_newest = kernel_src_newest();
     // Each unit is a heavy template expansion - compile in parallel.
     let handles: Vec<std::thread::JoinHandle<PathBuf>> = sources
         .iter()
@@ -301,29 +305,31 @@ fn compile_marlin_kernels() {
                     .to_str()
                     .unwrap();
                 let obj = out_dir.join(format!("{stem}.o"));
-                let status = Command::new(&nvcc)
-                    .args(&gencode_list)
-                    .args([
-                        "-c",
-                        &src,
-                        "-o",
-                        obj.to_str().unwrap(),
-                        "-O3",
-                        "--expt-relaxed-constexpr",
-                        // The launcher references __global__ template
-                        // instantiations living in the sibling units; this
-                        // restores cross-TU resolution (same flag vLLM uses
-                        // for its marlin build).
-                        "-static-global-template-stub=false",
-                        "-std=c++17",
-                        "-I",
-                        "cuda/marlin",
-                        "-Xcompiler",
-                        "-fPIC",
-                    ])
-                    .status()
-                    .unwrap_or_else(|e| panic!("failed to run nvcc for {src}: {e}"));
-                assert!(status.success(), "nvcc failed for {src}");
+                if !obj_fresh(&obj, src_newest) {
+                    let status = Command::new(&nvcc)
+                        .args(&gencode_list)
+                        .args([
+                            "-c",
+                            &src,
+                            "-o",
+                            obj.to_str().unwrap(),
+                            "-O3",
+                            "--expt-relaxed-constexpr",
+                            // The launcher references __global__ template
+                            // instantiations living in the sibling units; this
+                            // restores cross-TU resolution (same flag vLLM uses
+                            // for its marlin build).
+                            "-static-global-template-stub=false",
+                            "-std=c++17",
+                            "-I",
+                            "cuda/marlin",
+                            "-Xcompiler",
+                            "-fPIC",
+                        ])
+                        .status()
+                        .unwrap_or_else(|e| panic!("failed to run nvcc for {src}: {e}"));
+                    assert!(status.success(), "nvcc failed for {src}");
+                }
                 obj
             })
         })
@@ -387,6 +393,7 @@ fn compile_mmq_kernels() {
     ];
     println!("cargo:rerun-if-changed=cuda/mmq_gguf");
 
+    let src_newest = kernel_src_newest();
     // The instance files are heavy template expansions (~20s each)  -
     // compile them in parallel.
     let handles: Vec<std::thread::JoinHandle<PathBuf>> = sources
@@ -403,22 +410,24 @@ fn compile_mmq_kernels() {
                     .to_str()
                     .unwrap();
                 let obj = out_dir.join(format!("{stem}.o"));
-                let status = Command::new(&nvcc)
-                    .args(&gencode_list)
-                    .args([
-                        "-c",
-                        &src,
-                        "-o",
-                        obj.to_str().unwrap(),
-                        "-O3",
-                        "--expt-relaxed-constexpr",
-                        "-std=c++17",
-                        "-Xcompiler",
-                        "-fPIC",
-                    ])
-                    .status()
-                    .unwrap_or_else(|e| panic!("failed to run nvcc for {src}: {e}"));
-                assert!(status.success(), "nvcc failed for {src}");
+                if !obj_fresh(&obj, src_newest) {
+                    let status = Command::new(&nvcc)
+                        .args(&gencode_list)
+                        .args([
+                            "-c",
+                            &src,
+                            "-o",
+                            obj.to_str().unwrap(),
+                            "-O3",
+                            "--expt-relaxed-constexpr",
+                            "-std=c++17",
+                            "-Xcompiler",
+                            "-fPIC",
+                        ])
+                        .status()
+                        .unwrap_or_else(|e| panic!("failed to run nvcc for {src}: {e}"));
+                    assert!(status.success(), "nvcc failed for {src}");
+                }
                 obj
             })
         })
@@ -504,6 +513,7 @@ fn compile_imma_kernels() {
         .map(|s| (*s, portable_gencodes()))
         .chain(ampere_only.iter().map(|s| (*s, gencodes_from(800))))
         .collect();
+    let src_newest = kernel_src_newest();
     let handles: Vec<std::thread::JoinHandle<PathBuf>> = work
         .into_iter()
         .map(|(src, gencodes)| {
@@ -517,24 +527,26 @@ fn compile_imma_kernels() {
                     .to_str()
                     .unwrap();
                 let obj = out_dir.join(format!("{stem}.o"));
-                let status = Command::new(&nvcc)
-                    .args(&gencodes)
-                    .args([
-                        "-c",
-                        src,
-                        "-o",
-                        obj.to_str().unwrap(),
-                        "-O3",
-                        "--use_fast_math",
-                        "-std=c++17",
-                        "-I",
-                        "cuda/moe",
-                        "-Xcompiler",
-                        "-fPIC",
-                    ])
-                    .status()
-                    .unwrap_or_else(|e| panic!("failed to run nvcc for {src}: {e}"));
-                assert!(status.success(), "nvcc failed for {src}");
+                if !obj_fresh(&obj, src_newest) {
+                    let status = Command::new(&nvcc)
+                        .args(&gencodes)
+                        .args([
+                            "-c",
+                            src,
+                            "-o",
+                            obj.to_str().unwrap(),
+                            "-O3",
+                            "--use_fast_math",
+                            "-std=c++17",
+                            "-I",
+                            "cuda/moe",
+                            "-Xcompiler",
+                            "-fPIC",
+                        ])
+                        .status()
+                        .unwrap_or_else(|e| panic!("failed to run nvcc for {src}: {e}"));
+                    assert!(status.success(), "nvcc failed for {src}");
+                }
                 obj
             })
         })
@@ -558,4 +570,49 @@ fn compile_imma_kernels() {
     println!("cargo:rustc-link-lib=static=loken_imma");
     println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
     println!("cargo:rustc-link-lib=cudart");
+}
+
+/// Newest modification time among the CUDA kernel sources and this script. A build script
+/// re-runs whenever a watched path changes, a moved git ref included, so nvcc is skipped for
+/// an object already newer than every source: a commit, rebase or checkout no longer
+/// recompiles a kernel whose text did not move.
+#[cfg(feature = "cuda")]
+fn kernel_src_newest() -> std::time::SystemTime {
+    fn walk(p: &std::path::Path, acc: &mut std::time::SystemTime) {
+        let Ok(md) = std::fs::symlink_metadata(p) else {
+            return;
+        };
+        if let Ok(m) = md.modified() {
+            if m > *acc {
+                *acc = m;
+            }
+        }
+        if md.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(p) {
+                for e in rd.flatten() {
+                    walk(&e.path(), acc);
+                }
+            }
+        }
+    }
+    let mut acc = std::time::SystemTime::UNIX_EPOCH;
+    for root in [
+        "cuda",
+        "src/inference/sampling_kernels.cu",
+        "src/inference/sampling_kernels.h",
+        "build.rs",
+    ] {
+        walk(std::path::Path::new(root), &mut acc);
+    }
+    acc
+}
+
+/// Whether `obj` exists and is at least as new as every kernel source, so recompiling it would
+/// reproduce the same bytes.
+#[cfg(feature = "cuda")]
+fn obj_fresh(obj: &std::path::Path, src_newest: std::time::SystemTime) -> bool {
+    std::fs::metadata(obj)
+        .and_then(|m| m.modified())
+        .map(|m| m >= src_newest)
+        .unwrap_or(false)
 }
