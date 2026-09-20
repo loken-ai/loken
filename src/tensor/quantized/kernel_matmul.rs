@@ -23,6 +23,7 @@ use kat::kat_bad;
 /// The most rows one launch of the matvec kernels takes for a `[.., k]` weight of `dtype`:
 /// the crossover past which the tiled GEMM's weight reuse wins, where that GEMM can run this
 /// storage, and the matvec family's own bound where it cannot.
+#[cfg(feature = "cuda")]
 pub fn matvec_rows(dtype: GgmlDType, k: usize) -> usize {
     if mmq_supports(dtype) && k.is_multiple_of(mmq_qk(dtype)) {
         5

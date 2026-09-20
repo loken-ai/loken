@@ -548,7 +548,7 @@ pub fn convert(
             };
             let elems: usize = shape.iter().product();
             let large = shape.len() == 2 && elems >= 1 << 20;
-            let dtype = if large && shape[1] % formats.always_read.block_size() == 0 {
+            let dtype = if large && shape[1].is_multiple_of(formats.always_read.block_size()) {
                 formats.always_read
             } else {
                 GgmlDType::F32

@@ -58,6 +58,7 @@ mod cuda_storage;
 mod dtype;
 mod host;
 mod kernel_matmul;
+#[cfg(feature = "cuda")]
 pub use kernel_matmul::matvec_rows;
 mod matmul;
 mod mmq;

@@ -302,7 +302,7 @@ pub fn quantize_factored_with<T: BlockFormat>(
     product: &MatMul,
 ) -> Result<()> {
     let width = T::BLOCK_LEN;
-    if cols % width != 0 || w.len() != rows * cols {
+    if !cols.is_multiple_of(width) || w.len() != rows * cols {
         return Err(Error(format!(
             "compensate: {rows} by {cols} does not tile into blocks of {width}"
         )));
