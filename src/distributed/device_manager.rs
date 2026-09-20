@@ -9,7 +9,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use std::collections::HashMap;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Horizontal line for logging
 const HLINE: &str = "------------------------------------------------------------";
@@ -309,7 +309,7 @@ impl DeviceManager {
 
     /// Detect all available devices
     pub fn detect_devices(&mut self) -> Result<()> {
-        info!("Detecting compute devices...");
+        debug!("Detecting compute devices...");
 
         // Detect CUDA devices
         self.detect_cuda_devices()?;
@@ -320,9 +320,9 @@ impl DeviceManager {
         // Always add CPU as fallback
         self.add_cpu_device();
 
-        info!("Detected {} compute device(s)", self.devices.len());
+        debug!("Detected {} compute device(s)", self.devices.len());
         for device in &self.devices {
-            info!("  {}", device.status_summary());
+            debug!("  {}", device.status_summary());
         }
 
         Ok(())
@@ -647,7 +647,7 @@ impl DeviceManager {
             format!("CPU ({} cores)", num_cpus::get()),
             sys_mem,
         );
-        info!(
+        debug!(
             "Added CPU device with {:.1} GB system memory",
             device.memory_gb()
         );

@@ -144,8 +144,60 @@ fn physical_core_leaders(total_cores: usize) -> Vec<usize> {
     leaders
 }
 
+/// A kernel cpulist ("0-11", "0,2,4-7"), as the logical CPUs it names.
+fn parse_cpulist(list: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                    cpus.extend(a..=b);
+                }
+            }
+            None => {
+                if let Ok(c) = part.parse::<usize>() {
+                    cpus.push(c);
+                }
+            }
+        }
+    }
+    cpus
+}
+
+/// The P and E cores as the kernel declares them (`/sys/devices/cpu_core/cpus` and
+/// `/sys/devices/cpu_atom/cpus`, present on hybrid parts), `None` where it declares nothing.
+/// The frequency tiers are only a stand-in for this: the favoured cores of a part boost a step
+/// above their siblings, and a tier read from `cpuinfo_max_freq` then holds two of the twelve.
+fn declared_hybrid_cores(total_cores: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+    let read = |kind: &str| {
+        std::fs::read_to_string(format!("/sys/devices/{kind}/cpus"))
+            .ok()
+            .map(|l| parse_cpulist(&l))
+    };
+    let cores = read("cpu_core")?;
+    let atoms = read("cpu_atom").unwrap_or_default();
+    if cores.is_empty() || cores.iter().chain(&atoms).any(|&c| c >= total_cores) {
+        return None;
+    }
+    Some((cores, atoms))
+}
+
 fn detect_linux_topology(total_cores: usize) -> Option<CpuTopology> {
     use std::collections::BTreeMap;
+    if let Some((cores, atoms)) = declared_hybrid_cores(total_cores) {
+        let leaders = physical_core_leaders(total_cores);
+        let is_leader = |c: &usize| leaders.is_empty() || leaders.contains(c);
+        let mut p_cores: Vec<usize> = cores.into_iter().filter(is_leader).collect();
+        let mut e_cores: Vec<usize> = atoms.into_iter().filter(is_leader).collect();
+        p_cores.sort_unstable();
+        e_cores.sort_unstable();
+        return Some(CpuTopology {
+            total_cores,
+            is_hybrid: !e_cores.is_empty(),
+            p_cores,
+            e_cores,
+        });
+    }
     let mut by_freq: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
     for cpu in 0..total_cores {
         let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq");
@@ -380,5 +432,14 @@ mod tests {
         assert_ne!(CoreType::Performance, CoreType::Efficiency);
         assert_ne!(CoreType::Performance, CoreType::Unknown);
         assert_ne!(CoreType::Efficiency, CoreType::Unknown);
+    }
+
+    /// A cpulist names ranges and single CPUs; the kernel's lists for a hybrid part are what
+    /// `declared_hybrid_cores` reads.
+    #[test]
+    fn cpulists_are_read_as_the_kernel_writes_them() {
+        assert_eq!(parse_cpulist("0-11\n"), (0..=11).collect::<Vec<_>>());
+        assert_eq!(parse_cpulist("0,2,4-6"), vec![0, 2, 4, 5, 6]);
+        assert!(parse_cpulist("").is_empty());
     }
 }
