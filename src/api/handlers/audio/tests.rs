@@ -1421,3 +1421,25 @@ async fn the_speech_event_stream_names_its_phase_before_it_has_anything_to_send(
         "a failed synthesis must not carry a clip: {text}"
     );
 }
+
+/// The loaded Parler model answers to its alias, its bare name and its full id alike; another
+/// Parler model or another backend's voice makes it reload.
+#[test]
+fn a_loaded_parler_model_answers_to_its_aliases() {
+    use super::decode::parler_needs_reload;
+    let cur = Some("parler-tts/parler-tts-mini-v1");
+    for same in [
+        Some("tts-1"),
+        Some("parler-tts-mini-v1"),
+        Some("parler-tts/parler-tts-mini-v1"),
+        None,
+    ] {
+        assert!(
+            !parler_needs_reload(cur, same),
+            "{same:?} reloaded the loaded model"
+        );
+    }
+    assert!(parler_needs_reload(cur, Some("tts-1-hd")));
+    assert!(parler_needs_reload(Some("piper/en_US-amy"), Some("tts-1")));
+    assert!(!parler_needs_reload(None, Some("tts-1")));
+}

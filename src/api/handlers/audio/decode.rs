@@ -642,6 +642,8 @@ pub(crate) async fn audio_generations(
     headers: axum::http::HeaderMap,
     body: Json<serde_json::Value>,
 ) -> axum::response::Response {
+    // Counted where it runs, like a generation: a node speaking is not an idle node.
+    let _inflight = crate::distributed::rate_meter::InFlight::enter();
     use axum::response::IntoResponse;
     // The job goes to a node whose catalogue holds the model when this one's does not.
     {
@@ -1708,6 +1710,8 @@ pub(crate) async fn audio_speech(
     headers: axum::http::HeaderMap,
     body: Json<serde_json::Value>,
 ) -> axum::response::Response {
+    // Counted where it runs, like a generation: a node speaking is not an idle node.
+    let _inflight = crate::distributed::rate_meter::InFlight::enter();
     use axum::response::IntoResponse;
 
     let err_resp = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {
@@ -2101,6 +2105,25 @@ pub(super) async fn ensure_tts_model_loaded(
 /// The watch is what a STREAMING route forwards to its client. Without one the loaders
 /// publish no reporter, so every tensor count is dropped on the floor, which is why this
 /// route used to answer a cold checkpoint with a minute of silence.
+/// Whether a Parler request for `requested` (an alias, a bare name or the full repo id) is
+/// served by the TTS already loaded as `loaded`. The names go through the engine's own id
+/// resolution, the same the model manager applies, so an alias never reloads the model it names.
+pub(super) fn parler_needs_reload(loaded: Option<&str>, requested: Option<&str>) -> bool {
+    use crate::inference::engine::tts_engine::resolve_tts_model_id;
+    match loaded {
+        None => false,
+        // A Piper, pocket-tts or kyutai voice loaded gives way to a Parler request.
+        Some(cur)
+            if cur.starts_with("piper/")
+                || cur.starts_with("pocket-tts")
+                || cur.starts_with("kyutai") =>
+        {
+            true
+        }
+        Some(cur) => resolve_tts_model_id(requested) != resolve_tts_model_id(Some(cur)),
+    }
+}
+
 pub(super) async fn ensure_tts_model_loaded_reporting(
     state: &APIServer,
     requested: Option<&str>,
@@ -2176,22 +2199,7 @@ pub(super) async fn ensure_tts_model_loaded_reporting(
     }
 
     let loaded = state.tts_engine.loaded_name().await;
-    let needs_reload = match (loaded.as_deref(), requested) {
-        (Some(cur), Some(req)) => {
-            // Normalize: compare on the suffix after `/` so bare names
-            // ("parler-tts-mini-v1") match the canonical
-            // ("parler-tts/parler-tts-mini-v1").
-            let cur_tail = cur.rsplit('/').next().unwrap_or(cur);
-            let req_tail = req.rsplit('/').next().unwrap_or(req);
-            cur_tail != req_tail
-        }
-        // Switching from a Piper/pocket-tts/kyutai voice to a Parler request -> reload.
-        (Some(cur), None) => {
-            cur.starts_with("piper/") || cur.starts_with("pocket-tts") || cur.starts_with("kyutai")
-        }
-        _ => false,
-    };
-    if needs_reload {
+    if parler_needs_reload(loaded.as_deref(), requested) {
         state.tts_engine.unload().await;
     }
     if !state.tts_engine.is_loaded().await {

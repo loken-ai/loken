@@ -9,6 +9,7 @@ pub(super) async fn audio_decode_endpoint(
     mut multipart: axum::extract::Multipart,
     task: WhisperTask,
 ) -> axum::response::Response {
+    let _inflight = crate::distributed::rate_meter::InFlight::enter();
     use axum::response::IntoResponse;
 
     let mut file_bytes: Option<Vec<u8>> = None;
