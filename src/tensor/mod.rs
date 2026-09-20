@@ -6,6 +6,7 @@
 //! There is one implementation and one path to it. Every type is spelled one way here: two
 //! spellings for the same thing let three pairs of DIFFERENT types share a name unnoticed.
 
+pub mod blockscaled;
 mod cpu_storage;
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -16,6 +17,7 @@ pub mod gguf_write;
 pub mod heap;
 pub mod kernel_ffi;
 pub mod lora;
+pub mod mapped;
 pub mod marlin;
 pub mod ops;
 /// Bit-exact parity of the quantised block formats against ggml's own scalar
@@ -23,8 +25,6 @@ pub mod ops;
 #[cfg(test)]
 mod oracle_parity;
 pub mod pth;
-pub mod blockscaled;
-pub mod mapped;
 pub mod quant_cpu;
 /// GGUF/quantized tensor types (QTensor/QMatMul/QStorage/GgmlDType/gguf_file/...),
 /// re-exported as `crate::tensor::quantized`.

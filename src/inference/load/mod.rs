@@ -4,10 +4,10 @@
 //! Callers name a module through this directory - `crate::inference::load::<module>` - so the path says which
 //! part of the system a file belongs to, which is the whole reason the directory exists.
 pub mod awq;
+pub mod awq_loader;
 pub mod calibrated;
 pub mod calibration;
 pub mod compensate;
-pub mod awq_loader;
 pub mod fp8_scaled;
 pub mod huggingface_manager;
 pub mod model_manager;

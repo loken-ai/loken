@@ -60,8 +60,8 @@ mod anthropic_api;
 #[cfg(feature = "audio")]
 mod audio;
 mod catalogue;
-mod convert;
 mod cluster_catalogue;
+mod convert;
 #[cfg(feature = "image")]
 pub(crate) mod media;
 #[cfg(feature = "metrics")]
@@ -2006,7 +2006,10 @@ impl APIServer {
             .route("/v1/rerank", axum::routing::post(openai_rerank))
             .route("/rerank", axum::routing::post(openai_rerank))
             .route("/api/create", axum::routing::post(ollama_create_model))
-            .route("/api/calibrate", axum::routing::post(convert::calibrate_model))
+            .route(
+                "/api/calibrate",
+                axum::routing::post(convert::calibrate_model),
+            )
             .route("/api/convert", axum::routing::post(convert::convert_model))
             .route("/api/push", axum::routing::post(ollama_push_model))
             .route(

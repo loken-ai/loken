@@ -276,7 +276,11 @@ mod tests {
             v[7] = 4.0;
             Tensor::from_vec(v, (16,), &Device::Cpu).unwrap()
         };
-        assert_eq!(p.sample(&eos_led).unwrap(), 1, "unguarded greedy takes the stop");
+        assert_eq!(
+            p.sample(&eos_led).unwrap(),
+            1,
+            "unguarded greedy takes the stop"
+        );
         assert_eq!(
             p.sample_avoiding(&eos_led, &stops).unwrap(),
             7,
