@@ -452,6 +452,14 @@ impl DeepseekV41Model {
         } else {
             (budget / cfg.n_layers as u64 / expert_bytes) as usize
         };
+        tracing::info!(
+            "expert host tier: {slots} slots/layer of {} routed ({} MB each); budget {} MB = available {} MB - reserve {} MB",
+            cfg.n_routed_experts,
+            expert_bytes / 1_000_000,
+            budget / 1_000_000,
+            sys.available_memory() / 1_000_000,
+            reserve / 1_000_000
+        );
         self.set_expert_cache(slots);
         Ok(slots)
     }
