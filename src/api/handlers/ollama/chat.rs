@@ -153,6 +153,28 @@ pub(crate) async fn list_loaded_models(
         );
     }
 
+    // Models whose load is in flight: absent from `engines` until it finishes, but a client
+    // watching the cluster should see the load happening, not a gap, and least of all a big
+    // model that reads as simply not there for the ten-plus seconds it takes to warm the cards.
+    let loading: Vec<String> = state
+        .loading
+        .lock()
+        .map(|set| set.iter().cloned().collect())
+        .unwrap_or_default();
+    for model in loading {
+        if !loaded_models.iter().any(|m| m.model == model) {
+            loaded_models.push(LoadedModelInfo {
+                model,
+                status: "loading".to_string(),
+                device: None,
+                size_bytes: None,
+                num_layers: None,
+                layer_distribution: None,
+                context_length: None,
+            });
+        }
+    }
+
     // Stable alphabetical order for catalog parity with /api/ps,
     // /api/tags, /api/models, and /v1/models. Without this the
     // order is text-engine-insertion -> image -> whisper -> parler,

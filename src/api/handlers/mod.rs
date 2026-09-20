@@ -416,6 +416,11 @@ pub struct APIServer {
     /// and the engines vec ends up with two entries for the same model
     /// (each holding its own ~20 GB of weight tensors).
     loading_locks: Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Models whose load is in flight right now: inserted before `load_model` and cleared when
+    /// it returns, so a client listing loaded models sees the load happening rather than a gap
+    /// where the model is neither absent nor present. A sync mutex, so the RAII guard that
+    /// clears it runs in `Drop`.
+    loading: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// ONE media job at a time (image / video / audio generation, including its
     /// model load). Media engines each want most of a card; running two at once
     /// cannot fit by construction, and doing it anyway produced the OOM storm that
@@ -1400,6 +1405,7 @@ impl APIServer {
             tts_engine: Arc::new(crate::inference::engine::TtsEngine::new()),
             request_gate,
             loading_locks: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            loading: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             media_gate: Arc::new(tokio::sync::Mutex::new(())),
             media_jobs: Arc::new(std::sync::Mutex::new(MediaJobs::default())),
             // Defaults to off; `configure_auth` applies the config at startup.
@@ -1563,6 +1569,27 @@ impl APIServer {
         if self.get_engine(model_id).await.is_ok() {
             return Ok(());
         }
+        // Announce the load so a client listing models sees it in flight rather than a gap; the
+        // guard clears it whichever way this function returns, error included.
+        struct LoadingGuard {
+            set: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+            model_id: String,
+        }
+        impl Drop for LoadingGuard {
+            fn drop(&mut self) {
+                if let Ok(mut set) = self.set.lock() {
+                    set.remove(&self.model_id);
+                }
+            }
+        }
+        self.loading
+            .lock()
+            .unwrap()
+            .insert(model_id.to_string());
+        let _loading = LoadingGuard {
+            set: self.loading.clone(),
+            model_id: model_id.to_string(),
+        };
         // Auto-evict LRU models if we'd exceed the loaded-models cap.
         // Generic across all architectures: any prior engine with its
         // weights still on GPU steals VRAM from the new model and may
