@@ -1613,6 +1613,24 @@ mod tests {
     }
 
     #[test]
+    fn stream_generic_tool_calls_block() {
+        // A client's own <tool_calls> block, streamed, with a delta boundary inside the marker:
+        // the content before it streams, the block buffers, and finalize lifts the call whatever
+        // family was detected (deepseek here). This is the path a coding agent actually uses.
+        let mut sc = StreamToolScanner::new(ToolFormat::DeepSeekDsml);
+        assert_eq!(
+            sc.push("I'll explore the repo.\n<tool"),
+            "I'll explore the repo.\n"
+        );
+        assert_eq!(sc.push("_calls>\n"), "");
+        assert!(sc.in_tool_region());
+        let _ = sc.push("{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_calls>");
+        let calls = sc.finalize();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.as_ref().unwrap().name, "bash");
+    }
+
+    #[test]
     fn flatten_injects_system() {
         let msgs = vec![Message::new("user".into(), "hi".into())];
         let out = flatten_messages(&msgs, ToolFormat::Hermes, &[tool("f")], None);
