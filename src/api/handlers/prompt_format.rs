@@ -1517,4 +1517,65 @@ mod go_template_tests {
         apply_thinking_preference(&mut q, Some("disabled"));
         assert!(q.starts_with("<|start|>system<|message|>Reasoning: low\n"));
     }
+
+    /// The DeepSeek V4.1 template against what the checkpoint's own encoder renders for the
+    /// same conversations: a system turn then a user, two turns of history, and both with
+    /// thinking on, where the encoder leads with its default reasoning effort and opens the
+    /// last assistant turn instead of closing it.
+    #[test]
+    fn the_deepseek_v41_template_renders_as_the_checkpoint_encoder_does() {
+        use crate::inference::model::deepseek_v41::convert::CHAT_TEMPLATE;
+        let msg = |role: &str, content: &str| {
+            crate::api::types::Message::new(role.to_string(), content.to_string())
+        };
+        const BOS: &str = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>";
+        const EOS: &str = "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>";
+        const SYS: &str = "<\u{ff5c}System\u{ff5c}>";
+        const USER: &str = "<\u{ff5c}User\u{ff5c}>";
+        const ASSISTANT: &str = "<\u{ff5c}Assistant\u{ff5c}>";
+        const EFFORT: &str = "Reasoning Effort: 75 (range 1-100, the higher the value, the \
+                              more thorough the reasoning)\n\n";
+        let out = format_chat_prompt(
+            &[msg("system", "Be brief."), msg("user", "Hi")],
+            Some(CHAT_TEMPLATE),
+        );
+        assert_eq!(
+            out,
+            format!("{BOS}{SYS}Be brief.{USER}Hi{ASSISTANT}</think>")
+        );
+        let turns = [
+            msg("user", "Hi"),
+            msg("assistant", "Hello."),
+            msg("user", "Bye"),
+        ];
+        let out = format_chat_prompt(&turns, Some(CHAT_TEMPLATE));
+        assert_eq!(
+            out,
+            format!("{BOS}{USER}Hi{ASSISTANT}</think>Hello.{EOS}{USER}Bye{ASSISTANT}</think>")
+        );
+        let thinking = |msgs: &[crate::api::types::Message]| {
+            let msgs: Vec<serde_json::Value> = msgs
+                .iter()
+                .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+                .collect();
+            minijinja::Environment::new()
+                .render_str(
+                    CHAT_TEMPLATE,
+                    minijinja::context! {
+                        messages => minijinja::Value::from_serialize(&msgs),
+                        add_generation_prompt => true,
+                        enable_thinking => true,
+                    },
+                )
+                .expect("the template renders with thinking on")
+        };
+        assert_eq!(
+            thinking(&[msg("user", "Hi")]),
+            format!("{BOS}{SYS}{EFFORT}{USER}Hi{ASSISTANT}<think>")
+        );
+        assert_eq!(
+            thinking(&turns),
+            format!("{BOS}{SYS}{EFFORT}{USER}Hi{ASSISTANT}</think>Hello.{EOS}{USER}Bye{ASSISTANT}<think>")
+        );
+    }
 }

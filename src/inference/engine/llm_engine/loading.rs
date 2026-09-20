@@ -144,6 +144,22 @@ impl LlmEngine {
         let result = tokio::task::spawn_blocking(move || -> AnyResult<()> {
             crate::inference::place::device_probe::debug_vram_by_card("closure-start");
 
+            // --- 0a. A checkpoint directory the deepseek_v41 source serves ---
+            if model_file.is_dir()
+                && checkpoint_model_type(&model_file).as_deref() == Some("deepseek_v41")
+            {
+                let state =
+                    load_deepseek_v41_checkpoint(&model_file, &model_id_clone, user_context_length)?;
+                let fsz = state.file_size;
+                let mut guard = model_state.blocking_lock();
+                crate::inference::place::vram_manager::residency_changed();
+                *guard = Some(state);
+                drop(guard);
+                let mut size_guard = cached_model_size.blocking_lock();
+                *size_guard = fsz;
+                return Ok(());
+            }
+
             // --- 0. AWQ (HF safetensors) early path ---
             // If the resolved path is an AWQ checkpoint dir, load it via the
             // dedicated loader and store the state directly - bypassing the
@@ -231,13 +247,44 @@ impl LlmEngine {
             // --- 2. Extract metadata ---
             let arch = get_gguf_string(&content, "general.architecture")
                 .unwrap_or_else(|| "llama".to_string());
+            // A file may carry neither the key nor a vocabulary; the embedding's row count is
+            // the vocabulary whatever the converter wrote. In a split model the embedding may
+            // sit in another part, so the parts are consulted as one.
             let vocab_size = get_gguf_u32(&content, &format!("{arch}.vocab_size"))
                 .or_else(|| count_gguf_tokens(&content))
+                .or_else(|| {
+                    use crate::tensor::quantized::gguf_source::{GgufMeta, SplitGguf};
+                    let names = ["token_embd", "token_embd.weight"];
+                    let local = names
+                        .iter()
+                        .find_map(|n| content.tensor_infos.get(*n))
+                        .and_then(|i| i.shape.dims().first().copied());
+                    local
+                        .or_else(|| {
+                            let split = SplitGguf::open(&model_file).ok()?;
+                            names
+                                .iter()
+                                .find_map(|n| split.info(n))
+                                .and_then(|i| i.shape.dims().first().copied())
+                        })
+                        .map(|v| v as u32)
+                })
                 .unwrap_or(32000) as usize;
             let context_length = get_gguf_u32(&content, &format!("{arch}.context_length"))
                 .unwrap_or(4096) as usize;
+            // A file without tokenizer metadata may still ship its tokenizer files alongside;
+            // they name the end-of-sequence token and carry its id.
             let eos_token_id = get_gguf_u32(&content, "tokenizer.ggml.eos_token_id")
-                .unwrap_or(2);
+                .or_else(|| super::gguf::sidecar_token_id(&model_file, "eos_token"))
+                .unwrap_or_else(|| {
+                    // A guess, and one that generation runs past: said out loud rather than
+                    // discovered from answers that never stop.
+                    warn!(
+                        "the file names no end-of-sequence token (tokenizer.ggml.eos_token_id) \
+                         and no tokenizer_config.json sits beside it; assuming id 2"
+                    );
+                    2
+                });
             // Some models advertise multiple EOS-equivalent token IDs.
             // Gemma4: [1, 106, 50] - 1 is the canonical EOS, 106 & 50
             // are chat turn-end markers. Without honoring all three the
@@ -478,7 +525,13 @@ impl LlmEngine {
                     .map(|p| p.join("tokenizer.json"))
                     .filter(|p| p.exists());
 
-                if let Some(path) = tokenizer_path {
+                // A file converted here carries its checkpoint's own tokenizer, whole: nothing to
+                // rebuild, and no sidecar to find.
+                if let Some(json) = get_gguf_string(&content, super::gguf::EMBEDDED_TOKENIZER_KEY) {
+                    debug!("📖 Loading the tokenizer the file carries");
+                    Tokenizer::from_bytes(json.as_bytes())
+                        .map_err(|e| anyhow!("Failed to load the file's tokenizer: {e}"))?
+                } else if let Some(path) = tokenizer_path {
                     debug!("📖 Loading tokenizer from: {}", path.display());
                     Tokenizer::from_file(&path)
                         .map_err(|e| anyhow!("Failed to load tokenizer from {}: {e}", path.display()))?
@@ -1068,6 +1121,46 @@ impl LlmEngine {
                         }
                         Err(e) => return Err(anyhow!("lfm2moe load failed: {e}")),
                     }
+                }
+                "deepseek4" | "deepseek41" | "deepseek_v41" => {
+                    // The CPU port: latent MQA, CSA2 bands, hyper-connections, and a MoE whose
+                    // routed experts are read in place from the mapping by the quantised dot
+                    // engine. The model may ship as one file or a split set; every part is
+                    // mapped and stays the tensor source, so only the always-resident path is
+                    // committed and the page cache holds whichever experts the prompts route to.
+                    use crate::inference::model::deepseek_v41::{
+                        model::DeepseekV41Model, DeepseekV41Config,
+                    };
+                    let source = crate::tensor::quantized::gguf_source::SplitGguf::open(&model_file)
+                        .map_err(|e| anyhow!("deepseek_v41: open parts: {e}"))?;
+                    let cfg = DeepseekV41Config::from_meta(&source)?;
+                    let model = DeepseekV41Model::load(&source, &cfg)
+                        .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
+                    // Without a kept tier the page cache is the only cache, and a prompt's
+                    // prefill sweeps every expert through it: the decode that follows starts
+                    // with the early layers evicted. The tier keeps each layer's most routed
+                    // experts within what the host memory allows.
+                    let slots = model
+                        .size_expert_cache_to_memory(&cfg)
+                        .map_err(|e| anyhow!("deepseek_v41: {e}"))?;
+                    info!(
+                        "✅ deepseek_v41 loaded on CPU from {} part(s) ({} layers, {} routed + {} \
+                         shared experts, {} kept per layer)",
+                        source.parts().len(),
+                        cfg.n_layers,
+                        cfg.n_routed_experts,
+                        cfg.n_shared_experts,
+                        slots,
+                    );
+                    Box::new(crate::inference::engine::model_backend::DeepseekV41Backend::new(
+                        model,
+                        cfg.moe_inter_dim,
+                        if user_context_length > 0 {
+                            user_context_length
+                        } else {
+                            4096
+                        },
+                    ))
                 }
                 "qwen35moe" | "qwen35" | "qwen3next" => {
                     // The dense qwen35 belongs here, not on the generic arm: the family's

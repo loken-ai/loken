@@ -208,6 +208,108 @@ pub(super) fn resolve_awq_repo(model_id: &str, roots: &[PathBuf]) -> Option<Stri
     None
 }
 
+/// `model_type` of the checkpoint directory's own `config.json`, `None` when it has none.
+pub(super) fn checkpoint_model_type(dir: &std::path::Path) -> Option<String> {
+    let txt = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    v.get("model_type")?.as_str().map(|s| s.to_string())
+}
+
+/// The released DeepSeek V4.1 checkpoint - safetensors shards, `config.json`,
+/// `inference/config.json`, `tokenizer.json` - loaded on the CPU through the deepseek_v41
+/// source: the always-resident path dequantised to f32, the routed experts read in place, the
+/// engram layers on when the tokenizer lets their hash layout be derived.
+pub(super) fn load_deepseek_v41_checkpoint(
+    dir: &std::path::Path,
+    model_id: &str,
+    user_context_length: usize,
+) -> AnyResult<LoadedModelState> {
+    use crate::inference::model::deepseek_v41::engram::EngramConfig;
+    use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
+    use crate::inference::model::deepseek_v41::safetensors_source::SafeTensorsSource;
+    use crate::inference::model::deepseek_v41::{token_map, DeepseekV41Config};
+
+    let t0 = std::time::Instant::now();
+    let source = SafeTensorsSource::open(dir).map_err(|e| anyhow!("deepseek_v41: {e}"))?;
+    let tokenizer_path = dir.join("tokenizer.json");
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow!("{}: {e}", tokenizer_path.display()))?;
+    let engram = match token_map::build_from_file(&tokenizer_path) {
+        Ok((map, _)) => EngramConfig::derive(&source.inference_config, map),
+        Err(e) => {
+            warn!("deepseek_v41: no engram, the token map could not be built: {e}");
+            None
+        }
+    };
+    if engram.is_none() {
+        warn!("deepseek_v41: running without the engram layers");
+    }
+    let cfg = DeepseekV41Config::from_reference_config(&source.inference_config, engram)
+        .map_err(|e| anyhow!("deepseek_v41: {e}"))?;
+    let model = DeepseekV41Model::load(&source, &cfg)
+        .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
+    // The pinned expert tier takes what memory is left once the page cache can hold the
+    // always-read path and one token's worth of routed experts beside it.
+    let slots = model
+        .size_expert_cache_to_memory(&cfg)
+        .map_err(|e| anyhow!("deepseek_v41: {e}"))?;
+    let expert_bytes = model
+        .expert_bytes()
+        .map_err(|e| anyhow!("deepseek_v41: {e}"))? as u64;
+    let file_size: u64 = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    let eos_token_id = super::gguf::sidecar_token_id(&dir.join("config.json"), "eos_token")
+        .ok_or_else(|| anyhow!("deepseek_v41: no eos_token in tokenizer_config.json"))?;
+    let context_length = if user_context_length > 0 {
+        user_context_length
+    } else {
+        4096
+    };
+    info!(
+        "✅ deepseek_v41 loaded on CPU from {} in {:.1}s ({} layers, {} routed + {} shared experts, engram {}, {} experts pinned per layer of {} MB)",
+        dir.display(),
+        t0.elapsed().as_secs_f32(),
+        cfg.n_layers,
+        cfg.n_routed_experts,
+        cfg.n_shared_experts,
+        if cfg.engram.is_some() { "on" } else { "off" },
+        slots,
+        expert_bytes / 1_000_000,
+    );
+    let backend: BoxedModelBackend = Box::new(
+        crate::inference::engine::model_backend::DeepseekV41Backend::new(
+            model,
+            cfg.moe_inter_dim,
+            context_length,
+        ),
+    );
+    Ok(LoadedModelState {
+        name: model_id.to_string(),
+        num_layers: cfg.n_layers,
+        hidden_size: cfg.d_model,
+        num_heads: cfg.n_head,
+        vocab_size: cfg.vocab_size,
+        context_length,
+        eos_token_id,
+        #[cfg(feature = "cuda")]
+        moondream_graph: None,
+        moondream_decode_count: 0,
+        eos_token_ids_extra: Vec::new(),
+        file_size,
+        model: backend,
+        tokenizer,
+        device: Device::Cpu,
+        image_embeds: None,
+        qwen35_image: None,
+        image_embed_cache: None,
+        grammar_factory: std::sync::OnceLock::new(),
+    })
+}
+
 /// Read the EOS token id(s) for an AWQ checkpoint from generation_config.json
 /// (falling back to config.json). `eos_token_id` may be a scalar or an array.
 #[cfg(feature = "cuda")]

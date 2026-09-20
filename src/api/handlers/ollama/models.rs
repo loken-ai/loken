@@ -50,12 +50,9 @@ pub(crate) async fn ollama_list_models(
         Ok(mut models) => {
             #[cfg(feature = "media")]
             inject_local_boogu(&state, &mut models);
-            // A repository without weights is not a model a client can ask for.
-            // And not one the text loader would refuse at load time.
-            models.retain(|m| {
-                crate::api::handlers::holds_weights(m)
-                    && crate::api::handlers::text_loader_can_open(&state.huggingface_models_dir, m)
-            });
+            // Only models this node can actually load: present weights, and a format the text
+            // loader reads. A manifest that names a deleted blob is not one a client can ask for.
+            models.retain(|m| state.serves_weights(m));
             let count = models.len();
             info!("   Found {} model(s)", count);
             // Stable alphabetical order (mirror 6615f9a on /v1/models).

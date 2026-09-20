@@ -787,6 +787,68 @@ pub(crate) struct QwenMoEMultiBackend(
 /// sliding-window + NEOX RoPE. Single-device for now. (CUDA-only: MoE GEMM.)
 pub(crate) struct GptOssBackend(pub crate::inference::model::gptoss::GptOssModel);
 
+/// deepseek_v41: latent MQA, CSA2 bands, hyper-connections, and a MoE whose routed experts stream
+/// from the mmap through a hot cache. CPU, one sequence at a time. The engine's `forward` is
+/// decode-driven: every token of `x` is fed through the per-layer caches at its position, and the
+/// last token's next-token logits come back. Position 0 starts a fresh sequence; any other
+/// position must be exactly where the cache stands, since the caches only append.
+pub(crate) struct DeepseekV41Backend {
+    model: crate::inference::model::deepseek_v41::model::DeepseekV41Model,
+    state: crate::inference::model::deepseek_v41::cache::DecodeState,
+    widest_ffn: usize,
+    /// The engine's streamed placement, opened once: the cards keep what they are given across
+    /// prompts and tokens, so a placement opened per prompt would give that away at every
+    /// prompt. `None` on the host alone.
+    streamed: Option<crate::inference::offload::streamed::Streamed>,
+}
+
+impl DeepseekV41Backend {
+    pub(crate) fn new(
+        model: crate::inference::model::deepseek_v41::model::DeepseekV41Model,
+        widest_ffn: usize,
+        context_length: usize,
+    ) -> Self {
+        use crate::inference::offload::streamed::{Demand, Streamed};
+        let state = model.new_decode_state();
+        let fetch = |layer: usize, id: usize| model.expert_store(layer)?.fetch(id).ok();
+        let streamed = Streamed::open(&Demand {
+            always_read: model.resident_path_bytes(),
+            transient: model.transient_bytes(context_length),
+            concurrency: model.n_activated(),
+            prior: model.hot_experts(),
+            fetch: &fetch,
+        });
+        Self {
+            model,
+            state,
+            widest_ffn,
+            streamed,
+        }
+    }
+
+    /// The whole prompt in one prefill, its heavy steps on the cards when there are any.
+    fn prefill(&mut self, ids: &[u32]) -> crate::tensor::Result<Tensor> {
+        let Self {
+            model,
+            state,
+            streamed,
+            ..
+        } = self;
+        match streamed {
+            Some(s) => {
+                // The routed experts of a layer spread over the lanes, for a prompt's batch and
+                // for the tokens that follow alike: the lanes keep what they are given, and a
+                // decode reads the same experts the prompt just routed to.
+                model.offload_experts(Some(s.lanes.clone()));
+                crate::inference::offload::with_offload(s.offload.clone(), || {
+                    model.prefill_into(ids, state)
+                })
+            }
+            None => model.prefill_into(ids, state),
+        }
+    }
+}
+
 /// nemotron_h_moe: hybrid Mamba2 + attention + non-gated MoE, multi-device.
 pub(crate) struct NemotronHBackend(pub crate::inference::model::nemotron_h::NemotronHModel);
 
@@ -1428,6 +1490,73 @@ impl ModelBackend for Lfm2MoeBackend {
 
     fn try_restore_prefix(&mut self, prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
         self.0.try_restore_prefix(prompt)
+    }
+
+    take_generic_passthrough!();
+}
+
+impl ModelBackend for DeepseekV41Backend {
+    fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
+        let ids = x.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+        if index_pos == 0 {
+            self.state = self.model.new_decode_state();
+        }
+        if self.state.pos != index_pos {
+            return Err(crate::tensor::Error::msg(format!(
+                "deepseek_v41: forward at position {index_pos} but the cache stands at {}",
+                self.state.pos
+            )));
+        }
+        // A prompt that starts a sequence runs as one prefill over all its tokens, which leaves the
+        // caches where feeding them one at a time would; the tokens that follow are decoded.
+        if index_pos == 0 && ids.len() > 1 {
+            return self.prefill(&ids);
+        }
+        // The always-read weights answer a token from the card they were left on: the host reads
+        // them at its memory's speed, the card at its own, and a decode reads every one of them
+        // at every token. The routed experts stay here - there are hundreds of gigabytes of
+        // them and each is read once.
+        let mut last = None;
+        let Self {
+            model,
+            state,
+            streamed,
+            ..
+        } = self;
+        match streamed {
+            Some(s) => {
+                model.offload_experts(Some(s.lanes.clone()));
+                for &t in &ids {
+                    last = Some(crate::inference::offload::with_offload(
+                        s.offload.clone(),
+                        || model.forward_decode(t, state),
+                    )?);
+                }
+            }
+            None => {
+                for &t in &ids {
+                    last = Some(model.forward_decode(t, state)?);
+                }
+            }
+        }
+        last.ok_or_else(|| crate::tensor::Error::msg("deepseek_v41: forward of an empty input"))
+    }
+
+    fn widest_ffn(&self) -> usize {
+        self.widest_ffn
+    }
+
+    fn reset_kv_from(&mut self, keep: usize) {
+        // The caches only append, so the one prefix that can be kept is the empty one; anything
+        // else is left in place and the next forward's position check reports it.
+        if keep == 0 {
+            self.state = self.model.new_decode_state();
+        }
+    }
+
+    fn device_layer_distribution(&self) -> Vec<(String, usize, u32, u32)> {
+        let n = self.model.n_layers() as u32;
+        vec![("cpu".to_string(), 0, 0, n.saturating_sub(1))]
     }
 
     take_generic_passthrough!();
