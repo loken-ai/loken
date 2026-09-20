@@ -11,6 +11,7 @@ pub mod attention;
 pub mod block;
 pub mod boogu;
 pub mod clip;
+pub mod deepseek_v41;
 pub mod embedding;
 pub mod ezaudio;
 /// What every flow-matching sampler does to its time axis.
