@@ -33,6 +33,7 @@ pub mod kernel;
 pub mod load;
 pub mod media;
 pub mod model;
+pub mod offload;
 pub mod place;
 pub mod sample;
 pub mod serve;

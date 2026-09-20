@@ -150,6 +150,10 @@ pub fn plan_layers(
 /// Never a blind `CUDA:0` - the cards are probed, ranked by throughput, and read through
 /// the pressure ladder, so a placement that has already failed once is not planned again.
 pub fn place_whole(model_size: u64, reserve: u64) -> Device {
+    // What the pools hold back from earlier work is this process's to give: released before
+    // the cards are read, so the free figure is what a placement can actually have. A step
+    // running meanwhile allocates its blocks again, which is all the trim costs it.
+    crate::inference::engine::llm_engine::trim_cuda_pools();
     crate::inference::place::vram_manager::probe_under_pressure(reserve)
         .iter()
         .find(|(_, free, _)| *free >= model_size)

@@ -23,6 +23,8 @@ pub mod ops;
 #[cfg(test)]
 mod oracle_parity;
 pub mod pth;
+pub mod blockscaled;
+pub mod mapped;
 pub mod quant_cpu;
 /// GGUF/quantized tensor types (QTensor/QMatMul/QStorage/GgmlDType/gguf_file/...),
 /// re-exported as `crate::tensor::quantized`.
