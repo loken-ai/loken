@@ -503,9 +503,70 @@ pub fn forced_call_schema(tools: &[Tool], only: Option<&str>) -> Value {
     })
 }
 
+/// The generic `<tool_calls>{json}</tool_calls>` block an agent can instruct a model to emit in
+/// its own tool syntax, whatever family loken detected. It matches no family marker, so without
+/// this it leaks into the answer as text - which is exactly what a client that carries its own
+/// tool prompt (Cline, e.g.) produced. Runs only after the native parse found nothing, so a
+/// model speaking its detected family is never overridden. The inner text is one call object,
+/// an array of them, or several objects in a row.
+fn parse_generic_tool_calls_block(raw: &str) -> ToolParseResult {
+    const OPEN: &str = "<tool_calls>";
+    const CLOSE: &str = "</tool_calls>";
+    if !raw.contains(OPEN) {
+        return ToolParseResult {
+            content: raw.to_string(),
+            calls: Vec::new(),
+        };
+    }
+    let mut calls = Vec::new();
+    let mut content = String::new();
+    let mut rest = raw;
+    while let Some(open_idx) = rest.find(OPEN) {
+        content.push_str(&rest[..open_idx]);
+        let after_open = &rest[open_idx + OPEN.len()..];
+        let (inner, consumed) = match after_open.find(CLOSE) {
+            Some(close_idx) => (
+                &after_open[..close_idx],
+                open_idx + OPEN.len() + close_idx + CLOSE.len(),
+            ),
+            // No closing tag - the stream ended inside the block; take the remainder.
+            None => (after_open, rest.len()),
+        };
+        match serde_json::from_str::<Value>(inner.trim()) {
+            Ok(Value::Array(items)) => calls.extend(items.iter().filter_map(call_from_object)),
+            Ok(obj @ Value::Object(_)) => {
+                if let Some(call) = call_from_object(&obj) {
+                    calls.push(call);
+                }
+            }
+            // Several objects one after another, which is how more than one call renders in a
+            // single block; a whole-value parse fails on that, so scan for the bare objects.
+            _ => calls.extend(scan_bare_json_calls(inner).calls),
+        }
+        if consumed >= rest.len() {
+            rest = "";
+            break;
+        }
+        rest = &rest[consumed..];
+    }
+    content.push_str(rest);
+    ToolParseResult {
+        content: content.trim().to_string(),
+        calls,
+    }
+}
+
 pub fn parse_tool_calls(format: ToolFormat, raw: &str) -> ToolParseResult {
     let parsed = parse_tool_calls_native(format, raw);
-    if parsed.calls.is_empty() && raw.trim_start().starts_with('{') {
+    if !parsed.calls.is_empty() {
+        return parsed;
+    }
+    // The generic wrapper a client's own tool prompt can induce, caught before it leaks as text.
+    let generic = parse_generic_tool_calls_block(raw);
+    if !generic.calls.is_empty() {
+        return generic;
+    }
+    if raw.trim_start().starts_with('{') {
         // A constrained generation answers with the bare call object, whatever
         // the model's own syntax.
         let bare = scan_bare_json_calls(raw);
@@ -1157,10 +1218,16 @@ pub struct StreamToolScanner {
 /// fire, `finalize` finds no call and the caller flushes `unstreamed`.
 const BARE_JSON_MARKER: &str = "{\"name\"";
 
+/// The generic `<tool_calls>` wrapper a client's own tool prompt can induce, so the scanner
+/// buffers the whole block instead of streaming its prefix as prose; `finalize` then routes it
+/// through `parse_tool_calls`, where the generic parser lifts the calls.
+const GENERIC_TOOLCALLS_MARKER: &str = "<tool_calls>";
+
 impl StreamToolScanner {
     pub fn new(format: ToolFormat) -> Self {
         let mut markers: Vec<&'static str> = format.start_markers().to_vec();
         markers.push(BARE_JSON_MARKER);
+        markers.push(GENERIC_TOOLCALLS_MARKER);
         Self {
             format,
             buf: String::new(),
@@ -1685,5 +1752,24 @@ mod tests {
         // The tools prompt shows the model the DSML block to emit.
         let p = build_tool_system_prompt_base(ToolFormat::DeepSeekDsml, &[]);
         assert!(p.contains("<｜DSML｜ calls>"));
+    }
+
+    #[test]
+    fn parse_generic_tool_calls_block_from_a_client_prompt() {
+        // A client (Cline) instructs the model in its own <tool_calls>{json}</tool_calls>
+        // syntax, which matches no family marker; the fallback lifts it whatever format the
+        // model was detected as, instead of leaking the block as text.
+        let raw = "I'll explore the repo.\n<tool_calls>\n\
+{\"name\":\"bash\",\"arguments\":{\"command\":\"ls -la /repo 2>/dev/null || ls -la .\",\
+\"description\":\"List repository root\"}}\n\
+</tool_calls>";
+        let r = parse_tool_calls(ToolFormat::DeepSeekDsml, raw);
+        assert_eq!(r.content, "I'll explore the repo.");
+        assert_eq!(r.calls.len(), 1);
+        let f = r.calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "bash");
+        let args: serde_json::Value =
+            serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["command"], "ls -la /repo 2>/dev/null || ls -la .");
     }
 }
