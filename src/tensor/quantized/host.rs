@@ -12,9 +12,12 @@ use super::*;
 // dot dispatch), MMQ FFI boundary, and the GGUF `QVarBuilder`.
 // ------------------------------------------------------------
 
-/// Owned block bytes with 8-byte alignment (>= every GGML block's alignment:
-/// BlockQ8K holds f32/i16, the rest f16/u8), so `quant_cpu::cast_blocks` is
-/// always valid on owned storage. Backed by a `Vec<u64>`.
+/// The alignment every block cast and every view needs: at least every GGML block's own
+/// (BlockQ8K holds f32/i16, the rest f16/u8).
+pub const BLOCK_ALIGN: usize = 8;
+
+/// Owned block bytes at `BLOCK_ALIGN`, so `quant_cpu::cast_blocks` is always valid on owned
+/// storage. Backed by a `Vec<u64>`.
 #[derive(Clone)]
 pub(super) struct AlignedBytes {
     buf: Vec<u64>,
@@ -158,11 +161,10 @@ impl QHostTensor {
             )));
         }
         let ptr = unsafe { base.add(byte_offset) };
-        // 8 covers every block type's alignment (see AlignedBytes); f32/Q8K
-        // need 4, f16-headed blocks 2.
-        if !(ptr as usize).is_multiple_of(8) {
+        // f32/Q8K need 4, f16-headed blocks 2; BLOCK_ALIGN covers them all.
+        if !(ptr as usize).is_multiple_of(BLOCK_ALIGN) {
             return Err(Error(format!(
-                "QHostTensor::view: pointer {ptr:?} not 8-byte aligned for {dtype:?}"
+                "QHostTensor::view: pointer {ptr:?} not {BLOCK_ALIGN}-byte aligned for {dtype:?}"
             )));
         }
         Ok(Self {

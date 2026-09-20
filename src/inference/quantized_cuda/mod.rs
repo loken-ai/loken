@@ -58,6 +58,8 @@ const QUANTIZED_ATTENTION_CU: &str = include_str!("../cuda/quantized/attention.c
 const QUANTIZED_FLASH_CU: &str = include_str!("../cuda/quantized/flash_splitk.cu");
 const QUANTIZED_BAND_SOFTMAX_CU: &str = include_str!("../cuda/quantized/band_softmax.cu");
 const QUANTIZED_SAMPLING_CU: &str = include_str!("../cuda/quantized/sampling.cu");
+/// Requantisation quantize kernels (f32 -> GGUF blocks on device).
+const QUANTIZED_REQUANT_CU: &str = include_str!("../cuda/quantized/requant.cu");
 /// NVRTC compatibility shim (stdint types + INFINITY/NAN), prepended to the
 /// kernel source so the `.cu` stays free of compiler-workaround cruft.
 const NVRTC_COMPAT_H: &str = include_str!("../cuda/nvrtc_compat.h");

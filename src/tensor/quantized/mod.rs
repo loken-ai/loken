@@ -58,6 +58,7 @@ mod cuda_storage;
 mod dtype;
 mod host;
 mod kernel_matmul;
+pub use kernel_matmul::matvec_rows;
 mod matmul;
 mod mmq;
 mod qtensor;
@@ -66,6 +67,7 @@ mod varbuilder;
 
 /// The GGUF container: a from-scratch reader for v2 and v3 headers.
 pub mod gguf_file;
+pub mod gguf_source;
 
 /// The fused gate-and-up Q4_K decode entries, over the NVRTC-compiled mat-vec kernels.
 #[cfg(feature = "cuda")]
@@ -90,7 +92,7 @@ pub fn pad_to(x: usize, q: usize) -> usize {
 #[cfg(feature = "cuda")]
 pub use cuda_storage::QCudaStorage;
 pub use dtype::GgmlDType;
-pub use host::QHostTensor;
+pub use host::{QHostTensor, BLOCK_ALIGN};
 #[cfg(feature = "cuda")]
 pub use kernel_matmul::kernel_known_answer_test;
 pub use kernel_matmul::QKernelMatMul;

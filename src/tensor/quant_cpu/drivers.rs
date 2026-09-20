@@ -1421,16 +1421,23 @@ macro_rules! with_blocks {
                 type $T = BlockMxFp4;
                 $body
             }
+            GgmlDType::Iq2Xxs => {
+                type $T = BlockIq2Xxs;
+                $body
+            }
             // Q8_1 is an activation-side format (no `dequantize`, never a GGUF
             // weight dtype) - not routable as a weight.
             GgmlDType::Q8_1 => Err(Error("quant_cpu: Q8_1 has no weight-side path".into())),
+            GgmlDType::I8 => Err(Error(
+                "quant_cpu: i8 carries raw bytes, not a computable format".into(),
+            )),
         }
     };
 }
 
 /// Dtypes the engine can serve as a WEIGHT (dot matmul + dequantize).
 pub fn supports(dtype: GgmlDType) -> bool {
-    !matches!(dtype, GgmlDType::Q8_1)
+    !matches!(dtype, GgmlDType::Q8_1 | GgmlDType::I8)
 }
 
 /// Dequantize raw block bytes into `ys` (must be exactly elem_count long).

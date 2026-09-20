@@ -126,6 +126,9 @@ pub struct CudaDevice {
     /// The full relocated quantized.cu module (KV-staging quantize kernels +
     /// dequant; compat shim).
     pub(super) quantized_module: OnceLock<Arc<CudaModule>>,
+    /// The quantized module's functions already looked up, by name: a lookup takes the context and
+    /// a driver call, and a kernel launched per projection would pay it every time.
+    pub(super) quantized_fns: std::sync::Mutex<std::collections::HashMap<String, CudaFunction>>,
     /// Device attributes for the tiled quantized-matmul dispatch.
     pub(super) mmq_info: OnceLock<MmqDeviceInfo>,
     /// Generic NVRTC custom-module cache keyed by module name (compat
@@ -217,6 +220,7 @@ impl CudaDevice {
             blas: OnceLock::new(),
             mmvq_module: OnceLock::new(),
             quantized_module: OnceLock::new(),
+            quantized_fns: std::sync::Mutex::new(std::collections::HashMap::new()),
             mmq_info: OnceLock::new(),
             custom_modules: std::sync::Mutex::new(std::collections::HashMap::new()),
             alt_stream: OnceLock::new(),
@@ -491,11 +495,20 @@ impl CudaDevice {
                 .map_err(|e| Error(format!("quantized module load: {e}")))?;
             let _ = self.quantized_module.set(module);
         }
-        self.quantized_module
+        if let Some(f) = self.quantized_fns.lock().unwrap().get(name) {
+            return Ok(f.clone());
+        }
+        let f = self
+            .quantized_module
             .get()
             .unwrap()
             .load_function(name)
-            .map_err(|e| Error(format!("quantized fn `{name}`: {e}")))
+            .map_err(|e| Error(format!("quantized fn `{name}`: {e}")))?;
+        self.quantized_fns
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), f.clone());
+        Ok(f)
     }
 
     /// The device's cached secondary ("alt") stream for overlap work.

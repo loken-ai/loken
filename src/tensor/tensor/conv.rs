@@ -123,7 +123,7 @@ impl Tensor {
 
     /// Borrow contiguous CPU f32 data without copying (quantized-matmul
     /// decode fast path); errors on device tensors / other dtypes.
-    pub(in crate::tensor) fn cpu_f32_data(&self) -> Result<&[f32]> {
+    pub(crate) fn cpu_f32_data(&self) -> Result<&[f32]> {
         self.f32_data()
     }
 

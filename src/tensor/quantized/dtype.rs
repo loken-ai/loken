@@ -80,7 +80,11 @@ ggml_dtypes! {
     Q5K                  = 13, 256, 176, "q5_K";
     Q6K                  = 14, 256, 210, "q6_K";
     Q8K                  = 15, 256, 292, "q8_K";
+    Iq2Xxs               = 16, 256, 66, "iq2_xxs";
     BF16                 = 30, 1, 2, "bf16";
+    /// Raw bytes, no arithmetic: what a tensor carries when the file holds a layout only its own
+    /// reader understands - the released fp8 engram rows and their e8m0 scales.
+    I8                   = 24, 1, 1, "i8";
     /// OCP MXFP4: E2M1 codes against one E8M0 block scale - the format gpt-oss ships in.
     MxFp4                = 39, 32, 17, "mxfp4";
 }

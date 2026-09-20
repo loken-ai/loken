@@ -19,6 +19,17 @@ mod repack;
 
 #[cfg(feature = "cuda")]
 use kat::kat_bad;
+
+/// The most rows one launch of the matvec kernels takes for a `[.., k]` weight of `dtype`:
+/// the crossover past which the tiled GEMM's weight reuse wins, where that GEMM can run this
+/// storage, and the matvec family's own bound where it cannot.
+pub fn matvec_rows(dtype: GgmlDType, k: usize) -> usize {
+    if mmq_supports(dtype) && k.is_multiple_of(mmq_qk(dtype)) {
+        5
+    } else {
+        8
+    }
+}
 #[cfg(feature = "cuda")]
 pub use kat::kernel_known_answer_test;
 
@@ -773,8 +784,7 @@ impl QKernelMatMul {
             // MMVQ. But ONLY drop to 5 when MMQ can actually run this quant - else
             // rows 6-8 would fall through to the slow dequant-F32 path, so keep the
             // old MMVQ-through-8 boundary for non-MMQ quants (no regression).
-            let mmq_capable = mmq_supports(self.dtype) && self.k.is_multiple_of(mmq_qk(self.dtype));
-            let mmvq_max = if mmq_capable { 5 } else { 8 };
+            let mmvq_max = matvec_rows(self.dtype, self.k);
             if (1..=mmvq_max).contains(&rows)
                 && !kat_bad(&KAT_BAD_MMVQ, qdev.ordinal())
                 && self.kernel_tag().is_ok()

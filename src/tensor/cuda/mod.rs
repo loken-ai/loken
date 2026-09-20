@@ -42,6 +42,8 @@ mod gemm;
 pub use gemm::*;
 mod quant;
 pub use quant::*;
+mod correct;
+pub use correct::*;
 mod cast;
 pub use cast::*;
 

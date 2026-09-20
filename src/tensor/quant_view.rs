@@ -139,6 +139,43 @@ pub fn expert_view(
     crate::tensor::quantized::QTensor::from_native(Arc::new(nqt), &crate::tensor::Device::Cpu)
 }
 
+/// Zero-copy facade view of rows `[start, start + count)` of a CPU `[R, C]` quantised tensor.
+pub fn rows_view(
+    parent: &Arc<crate::tensor::quantized::QTensor>,
+    start: usize,
+    count: usize,
+) -> crate::tensor::Result<crate::tensor::quantized::QTensor> {
+    let native = parent.native_qtensor();
+    let [n_rows, c] = native.dims[..] else {
+        return Err(crate::tensor::Error::msg(format!(
+            "rows_view: parent must be 2-D [R,C], got {:?}",
+            native.dims
+        )));
+    };
+    if start + count > n_rows || count == 0 {
+        return Err(crate::tensor::Error::msg(format!(
+            "rows_view: rows {start}+{count} out of {n_rows}"
+        )));
+    }
+    let dtype = native.dtype;
+    let row_bytes = (c / dtype.block_size()) * dtype.type_size();
+    let base = native.data().as_ptr();
+    // SAFETY: `start + count <= n_rows` was checked and the parent holds `n_rows * row_bytes`
+    // bytes, so the range lies inside its allocation; the facade parent pins those bytes.
+    let nqt = unsafe {
+        nquant::QHostTensor::view(
+            Arc::new(parent.clone()) as Arc<dyn std::any::Any + Send + Sync>,
+            base,
+            start * row_bytes,
+            count * row_bytes,
+            dtype,
+            vec![count, c],
+        )
+    }
+    .map_err(|e| crate::tensor::Error::msg(e.0))?;
+    crate::tensor::quantized::QTensor::from_native(Arc::new(nqt), &crate::tensor::Device::Cpu)
+}
+
 /// `native_expert_view` with an explicit owner to pin.
 fn native_expert_view_pinning(
     parent: &Arc<nquant::QHostTensor>,
