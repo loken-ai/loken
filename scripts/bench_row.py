@@ -322,7 +322,9 @@ def cells(merged):
                 if othere and v["jreq"]:
                     p = (min(othere) / v["jreq"] - 1) * 100
                     de = f"**{p:+.1f}%**" if p > 0 else f"{p:+.1f}%"
-            b = (lambda x: f"**{x}**") if eng.startswith("loken") else (lambda x: x)
+            # Bold a loken cell to set our rows apart, but never an empty one: `**` around a
+            # spaced dash (`** - **`) is not valid emphasis and shows the asterisks verbatim.
+            b = lambda x: f"**{x}**" if eng.startswith("loken") and str(x).strip() not in ("-", "") else str(x)
             if v.get("impossible") or v.get("failed"):
                 # The engine was given the model and could not run it, or ran it and kept no
                 # iteration: the row says which, since a comparison that leaves a cell out reads
