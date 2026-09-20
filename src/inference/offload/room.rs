@@ -107,6 +107,20 @@ pub fn open(ordinal: usize, total: usize, working: usize) -> &'static Mutex<Room
     slot
 }
 
+/// Per device that has a room, the bytes the placement keeps on it right now: `(ordinal,
+/// taken)`, ordinal ascending. A streamed model reports this as what is resident on each card,
+/// against the host that streams the rest; without it a reader sees only the model's logical
+/// base and reads a card-resident model as living on the CPU.
+pub fn residency() -> Vec<(usize, usize)> {
+    let map = rooms().lock().unwrap();
+    let mut out: Vec<(usize, usize)> = map
+        .iter()
+        .map(|(&ordinal, room)| (ordinal, room.lock().unwrap().taken()))
+        .collect();
+    out.sort_by_key(|&(ordinal, _)| ordinal);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

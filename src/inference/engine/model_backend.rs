@@ -567,6 +567,14 @@ pub(crate) trait ModelBackend: Send {
         Vec::new()
     }
 
+    /// For a placement that streams its weights from the host and keeps a resident set on the
+    /// cards, the bytes resident on each card: `(ordinal, bytes)`. `None` for a model whose
+    /// layers have fixed device homes, which `device_layer_distribution` already reports. This
+    /// is what keeps a card-resident streamed model from being drawn as living on the CPU.
+    fn card_residency(&self) -> Option<Vec<(usize, u64)>> {
+        None
+    }
+
     // --- Vision ---------------------------------------------------------
 
     /// Whether this model is a vision model (accepts images)
@@ -1557,6 +1565,19 @@ impl ModelBackend for DeepseekV41Backend {
     fn device_layer_distribution(&self) -> Vec<(String, usize, u32, u32)> {
         let n = self.model.n_layers() as u32;
         vec![("cpu".to_string(), 0, 0, n.saturating_sub(1))]
+    }
+
+    fn card_residency(&self) -> Option<Vec<(usize, u64)>> {
+        // Only a streamed placement keeps weights on the cards; run on the host alone (--cpu,
+        // or past the pressure ladder) and there is nothing resident to report, so the layer
+        // map stands.
+        self.streamed.as_ref()?;
+        Some(
+            crate::inference::offload::room::residency()
+                .into_iter()
+                .map(|(ordinal, bytes)| (ordinal, bytes as u64))
+                .collect(),
+        )
     }
 
     take_generic_passthrough!();

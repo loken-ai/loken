@@ -255,6 +255,24 @@ impl LlmEngine {
         let state = self.model_state.lock().await;
         state.as_ref().map(|s| {
             let total = s.num_layers;
+            // A streamed placement keeps the weights every token reads, and as many routed
+            // experts as fit, resident on the cards, and streams the rest from the host. Its
+            // layers have no fixed device, so the honest report is the bytes resident on each
+            // card - not a layer map that reads as the whole model living on the CPU. The host
+            // remainder is left off: naming it as a device holding layers is what produced the
+            // "everything on the CPU" misread in the first place.
+            if let Some(cards) = s.model.card_residency() {
+                if !cards.is_empty() {
+                    let last = (total.saturating_sub(1)) as u32;
+                    let distributions: Vec<LayerDistribution> = cards
+                        .into_iter()
+                        .map(|(ordinal, bytes)| {
+                            LayerDistribution::new("CUDA".to_string(), ordinal, 0, last, bytes)
+                        })
+                        .collect();
+                    return (total, distributions);
+                }
+            }
             // Prefer the model's REAL per-layer device map (the multi-GPU /
             // CPU hetero split). Previously this reported EVERY layer on the
             // primary device (`s.device`), so the GUI topology showed a
