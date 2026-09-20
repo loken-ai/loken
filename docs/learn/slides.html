@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The fundamentals of inference</title>
+<style>
+:root{--ink:#14181d;--soft:#5b6672;--line:#dfe3e8;--bg:#f7f8fa;--card:#fff;--accent:#2f5fd0;--warn:#a8323c}
+@media(prefers-color-scheme:dark){:root{--ink:#e6eaef;--soft:#98a3b0;--line:#2a3038;--bg:#12151a;--card:#191d23;--accent:#7aa2f7;--warn:#e5707c}}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);
+ font:clamp(15px,1.6vw,22px)/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+section{display:none;min-height:100vh;padding:5vh 8vw;flex-direction:column;justify-content:center}
+section.on{display:flex}
+h1{font-size:2.2em;margin:0 0 .2em;letter-spacing:-.02em}
+h2{font-size:1.5em;margin:0 0 .5em;letter-spacing:-.01em}
+.k{color:var(--soft);font-size:.75em;letter-spacing:.08em;text-transform:uppercase;margin-bottom:1em}
+p{margin:.3em 0;max-width:60ch}
+ul{margin:.3em 0;padding-left:1.2em;max-width:62ch}
+li{margin:.25em 0}
+table{border-collapse:collapse;margin:.6em 0;font-size:.85em;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:.3em .9em .3em 0;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--soft);font-weight:600}
+td.n,th.n{text-align:right}
+img{max-width:100%;height:auto;display:block;margin:.5em 0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:.4em}
+code{font:.9em ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--card);border:1px solid var(--line);border-radius:4px;padding:0 .25em}
+.big{font-size:2.6em;font-weight:700;letter-spacing:-.02em;line-height:1.1;margin:.2em 0}
+.soft{color:var(--soft)}
+.warn{color:var(--warn)}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:2em}
+@media(max-width:700px){.two{grid-template-columns:1fr}}
+#nav{position:fixed;right:1em;bottom:.8em;color:var(--soft);font-size:.7em}
+@media print{
+ section{display:flex;min-height:auto;page-break-after:always;padding:2em}
+ #nav{display:none}
+}
+</style>
+</head>
+<body>
+
+<section>
+<div class="k">loken / docs / learn</div>
+<h1>The fundamentals of inference</h1>
+<p class="soft">Ten lessons, as experimented in one engine over nine months. Each slide states one
+thing; the lesson it comes from carries the files, the method and the exercise.</p>
+<p class="soft">Arrow keys to move. Every figure carries the date and the machine it came from.</p>
+</section>
+
+<section>
+<div class="k">One request</div>
+<h2>From text to JSON, and back</h2>
+<img src="../img/learn-pipeline.svg" alt="The pipeline of one request">
+<p>The model is the middle: prefill, decode, sample. The two ends do no arithmetic, and that
+is where the defects were.</p>
+</section>
+
+<section>
+<div class="k">Lesson 1</div>
+<h2>Text becomes ids, ids become text</h2>
+<ul>
+<li>A tokenizer is a fixed table of about 150 000 strings and a cutting rule (byte-pair merges,
+or a unigram model). It ships with the checkpoint.</li>
+<li>Special tokens have ids and no text: turn markers, the start of a reasoning block. Whether a
+decoder shows or drops them is a decision.</li>
+<li>A chat template, a small Jinja program in the checkpoint, turns messages into the one string
+the model was trained on.</li>
+<li>On the way back the text is split into answer, reasoning and tool call. None of it is
+arithmetic, and it can fail without an error.</li>
+</ul>
+</section>
+
+<section>
+<div class="k">Lesson 1, measured (2026-09-12)</div>
+<h2>Four defects, none in the arithmetic</h2>
+<table>
+<tr><th>Defect</th><th>Reach</th></tr>
+<tr><td>a bare <code>thought</code> at the head of every answer</td><td>gemma4 31b, 26b</td></tr>
+<tr><td>reasoning delivered as the answer, <code>thinking</code> empty</td><td>19 of 44 models scanned</td></tr>
+<tr><td>the template failed to render; a fallback rendered instead</td><td>falcon3, granite, llama3.2</td></tr>
+<tr><td>a tool call lost</td><td>qwen3, granite</td></tr>
+</table>
+<p>None moved a token rate. The campaigns measured speed and a coherence gate on the first
+120 characters. A warning was logged on every failed render.</p>
+<p class="warn">These warnings failed no test.</p>
+</section>
+
+<section>
+<div class="k">Lesson 2</div>
+<h2>What a model file holds</h2>
+<ul>
+<li>A GGUF is a header, metadata pairs (architecture, layer count, trained context, the whole
+tokenizer), one descriptor per tensor, then the aligned payload.</li>
+<li>Nothing is copied at open: the file is memory-mapped, and its
+pages are read on demand.</li>
+<li>qwen3:0.6b: 751 632 384 parameters, 28 layers, width 1024, trained at 40 960 tokens, 522 MB
+resident at Q4_K_M, which is 5.6 bits a parameter.</li>
+</ul>
+<p class="soft">Measured 2026-09-08: 44 headers total 326 MB, 197 MB of it vocabularies, 11 s to
+read. Stopping at the first <code>tokenizer.*</code> key: under 8 KB a file, 2 ms for all 44.</p>
+</section>
+
+<section>
+<div class="k">Lesson 3</div>
+<h2>Fewer bits per weight</h2>
+<table>
+<tr><th>Format</th><th>Block</th><th class="n">Bytes</th><th class="n">Bits a weight</th></tr>
+<tr><td>Q4_0</td><td>32 values, one 16-bit scale</td><td class="n">18</td><td class="n">4.5</td></tr>
+<tr><td>Q8_0</td><td>32 values, one 16-bit scale</td><td class="n">34</td><td class="n">8.5</td></tr>
+<tr><td>Q4_K</td><td>256 values, 8 sub-scales and minimums</td><td class="n">144</td><td class="n">4.5</td></tr>
+<tr><td>Q6_K</td><td>256 values, 16 sub-scales</td><td class="n">210</td><td class="n">6.56</td></tr>
+<tr><td>IQ2_XXS</td><td>256 values as codebook indices</td><td class="n">66</td><td class="n">2.06</td></tr>
+<tr><td>fp8, fp4</td><td>the checkpoint's own tile scales</td><td class="n"></td><td class="n">8, 4</td></tr>
+</table>
+<p>The decision in every format is the scale: the block's extreme over the top level is a
+starting point, and every quantiser searches for one that loses less. The matmul then works
+in integers: activations at eight bits, integer dot products, two scales applied at the end.</p>
+</section>
+
+<section>
+<div class="k">Lesson 3, measured (2026-09-13 to 16)</div>
+<h2>Judge by the output, verify against the source</h2>
+<ul>
+<li>Re-quantising on the card: the speed came from parallelism, not the card. A card-made
+file has a stable digest distinct from the host-made one, by design (reduction order).</li>
+<li>A better file than the published ones at the same size for the 552B mixture: KL 0.139
+against 0.169, top-1 0.717 against 0.674. The lever was error compensation, a third off the
+gate and up error.</li>
+<li>A published file whose attention had lost its fp8 scales (cosine 0.39): no engine could
+make it speak. A converter that wrote codes column-wise, verified against the cache that
+already carried the defect.</li>
+</ul>
+</section>
+
+<section>
+<div class="k">Lesson 4</div>
+<h2>One layer, then forty of them</h2>
+<img src="../img/learn-layer.svg" alt="One decoder layer">
+</section>
+
+<section>
+<div class="k">Lesson 4, measured (2026-09-12 to 14)</div>
+<h2>Judging a port</h2>
+<ul>
+<li>The authors' reference, unmodified, on the CPU: its kernel module shadowed by a pure-torch
+one. Each phase dumps its vectors; a test replays the phase.</li>
+<li>Two pitfalls, finite and wrong: a rotary table cast to fp32 loses its imaginary half; a
+lazy closure served every expert from the last layer.</li>
+<li>A mixture routes per token: one borderline token flips to another expert and moves the
+block's relative L2 from 1e-2 to 6e-2 while cosine stays at 0.998. Gate on cosine plus a
+bounded count of divergent tokens; gate the pre-routing stages tightly on their own.</li>
+</ul>
+</section>
+
+<section>
+<div class="k">Lesson 5</div>
+<h2>Two regimes, one model</h2>
+<img src="../img/learn-prefill-decode.svg" alt="Prefill against decode">
+<p>qwen3:0.6b on an RTX 5070 Ti: 1 782 tokens prefilled in 50 ms; about 730 tokens a second
+decoded. A 70B with 26 of 80 layers on the host: 1.5 a second, the host's 36 GB/s.</p>
+</section>
+
+<section>
+<div class="k">Lesson 5, measured (2026-09-11, qwen3-coder 30b-a3b)</div>
+<h2>Where a long prefill's time goes</h2>
+<table>
+<tr><th>build</th><th>prefill(n), ms</th><th>131 072 tokens</th></tr>
+<tr><td>before</td><td><code>1.369 n + 1.655e-4 n^2</code></td><td>50.4 min</td></tr>
+<tr><td>after</td><td><code>1.372 n + 2.048e-5 n^2</code></td><td>8.9 min</td></tr>
+</table>
+<p>Attention band by band with a running maximum, six passes fused into one, the host-built
+causal mask gone. The linear term did not move: experts 76%, attention 21%, router 1.6%.</p>
+<p class="soft">Rejected the same day: a scalar flash-attention kernel (83.6 s against 26.8),
+prefill through the tensor-core expert path, a chunk of 2 048. And the streamed log had
+counted the prompt in words: every streamed figure read twice as slow.</p>
+</section>
+
+<section>
+<div class="k">Lesson 6</div>
+<h2>What the model remembers between tokens</h2>
+<img src="../img/learn-kv-tiers.svg" alt="Where a conversation's KV lives">
+<p>qwen3:0.6b keeps 112 KB a token at F16; a 4 096-token window is 460 MB, close to the
+weights. The cache is state, and a server that keeps it prefills only what is new.</p>
+</section>
+
+<section>
+<div class="k">Lesson 6, measured (2026-09-06 and 11)</div>
+<h2>What the cache holds between steps</h2>
+<ul>
+<li>Snapshots: an alternated turn prefills 1 100 tokens instead of 5 195 on gemma4; Q8 restores
+bit-identical, Q4 within one step; the disk tier survives a restart.</li>
+<li>Three bits through a Hadamard rotation: beats F16, loses to the 4-bit cache already here
+by under 0.5%. Measured and refused.</li>
+<li>One live cache per model: an agent's background read on the same model re-prefilled every
+step, 137 s where a reuse costs 1.2 s.</li>
+<li>A window too small is slower: 301 s at 32 768 tokens against 24 s at 131 072.</li>
+</ul>
+</section>
+
+<section>
+<div class="k">Lesson 7</div>
+<h2>From logits to a token</h2>
+<ul>
+<li>Temperature, then the candidate cut (top-k, top-p, min-p), a repetition penalty, a bias,
+then one draw. Greedy is the case with one candidate.</li>
+<li>Constrained decoding is a mask on the row: a schema says which tokens may continue.</li>
+<li>Determinism is a property of the whole path. Greedy on the same logits gives the same
+token; the same logits need the same arithmetic in the same order.</li>
+</ul>
+<p class="soft">Reuse of a cached prefix is rounded down to a prefill chunk for that reason: off
+a boundary the tail runs shapes the cold run never used, and a near-tie flips.</p>
+</section>
+
+<section>
+<div class="k">Lesson 7, measured (2026-09-12)</div>
+<h2>A greedy decode that did not repeat itself</h2>
+<p class="big">128, 80, 80</p>
+<p>Three iterations of one greedy cell on one engine. The campaign published a mean of 96
+tokens against 128 and blanked the comparison, which was right. A decode that should repeat exactly showed a spread wide enough to notice.</p>
+</section>
+
+<section>
+<div class="k">Lesson 8</div>
+<h2>More than one token per weight read</h2>
+<ul>
+<li>A drafter proposes k tokens; the target verifies them in one pass that reads the weights
+once. The first disagreement is replaced, the rest dropped; the output is the target's own.</li>
+<li>Drafts from a small model of the same family, from a trained head on the target's hidden
+state (EAGLE), or from the prompt's own n-grams.</li>
+<li>It pays where verification is far cheaper than generation: a model that spills crosses the
+bus once for k tokens. On a model that fits, verification costs what drafting saves.</li>
+</ul>
+</section>
+
+<section>
+<div class="k">Lesson 8, measured (2026-09-03)</div>
+<h2>One pair, on a spilled target</h2>
+<p class="big">1.49 to 2.21 tok/s</p>
+<p>deepseek-r1:70b with 26 of 80 layers on the host, llama3.2:1b drafting: 41.0 J a token
+against 51.8, the same answer token for token, 18% of drafts accepted. A better-matched
+drafter would accept more.</p>
+<p class="soft">Two speculative loops exist, 1.68 against 2.21 on the same pair. One should go;
+the measurement says which.</p>
+</section>
+
+<section>
+<div class="k">Lesson 9</div>
+<h2>Fitting a model on the machine you have</h2>
+<img src="../img/learn-placement.svg" alt="Two ways to spill a mixture">
+</section>
+
+<section>
+<div class="k">Lesson 9, measured</div>
+<h2>Cards, host, disk, the other machine</h2>
+<ul>
+<li>Spill the experts, not the layer (2026-09-03): qwen3next 15.6 to 34.7 tok/s, ollama at 33.
+Experts are 97% of a mixture's bytes and a token touches a few.</li>
+<li>A 552B mixture on a 440 MB/s USB disk (2026-09-14 to 17): 32% of a token's experts were the
+previous token's; a managed hot tier bought 2% of the time, the kernel's page cache already
+does it; <code>MADV_RANDOM</code> cut the read rate from 342 to 46 MB/s; a 1 024-token prompt
+reads 141.6 GB in 348 s against a 320 s disk floor.</li>
+<li>Two nodes (2026-09-13): 554 requests served locally, 0 forwarded. The router was right; the
+fast card drains its queue faster than a hop.</li>
+</ul>
+</section>
+
+<section>
+<div class="k">Lesson 10</div>
+<h2>Measuring without fooling yourself</h2>
+<ul>
+<li>Measure from the client, the same way for every engine. The engines' own prefill rates
+reversed three cells of four (652 reported where 35 was implied).</li>
+<li>Take the median. A mean over three iterations, one of them the cold load, published 11.4
+for a model that decodes at 15.2.</li>
+<li>Publish the token count beside the rate. Say which build, machine and day.</li>
+<li>Profile a representative slice before a run of hours. Let nothing else run: a build on
+twenty threads took a cell from 2.15 to 1.58 tok/s.</li>
+<li>Read the whole answer: a gate on 120 characters scored 0.870 on an answer that scores 0.139.</li>
+</ul>
+</section>
+
+<section>
+<div class="k">The thread</div>
+<h2>Every defect was invisible to the measurement in place</h2>
+<div class="two">
+<ul>
+<li>a coherence gate that read 120 characters</li>
+<li>a prompt counted in words</li>
+<li>a token rate, where the answer was in the wrong field</li>
+</ul>
+<ul>
+<li>a sweep under eviction pressure</li>
+<li>a verification against a cache that already carried the defect</li>
+<li>a warning nobody acted on</li>
+</ul>
+</div>
+<p>The fix each time was a measurement that could see the defect, not a faster kernel.</p>
+</section>
+
+<section>
+<div class="k">Where to read next</div>
+<h2>The lessons, and what they point to</h2>
+<ul>
+<li><code>docs/learn/</code>: the ten lessons, each with its files and its exercise.</li>
+<li><code>docs/STATUS.md</code>: what is measured, what is slower, what is written and wired to nothing.</li>
+<li><code>docs/BENCHMARKS.md</code>: the protocol, and why the two rate columns are the client's.</li>
+<li><code>docs/CLUSTER.md</code>: the cost model across machines.</li>
+<li><code>cuda/marlin/DESIGN.md</code>: a 4-bit tensor-core GEMM, explained as a design.</li>
+</ul>
+</section>
+
+<div id="nav"></div>
+<script>
+(function(){
+  var s=document.querySelectorAll('section'),n=s.length,i=0,nav=document.getElementById('nav');
+  function show(k){i=Math.max(0,Math.min(n-1,k));for(var j=0;j<n;j++)s[j].className=j===i?'on':'';
+    nav.textContent=(i+1)+' / '+n;if(location.hash!=='#'+(i+1))history.replaceState(null,'','#'+(i+1));window.scrollTo(0,0);}
+  function fromHash(){var h=parseInt(location.hash.slice(1),10);show(isNaN(h)?0:h-1);}
+  document.addEventListener('keydown',function(e){
+    if(e.key==='ArrowRight'||e.key==='PageDown'||e.key===' ')show(i+1);
+    else if(e.key==='ArrowLeft'||e.key==='PageUp')show(i-1);
+    else if(e.key==='Home')show(0);else if(e.key==='End')show(n-1);else return;e.preventDefault();});
+  document.addEventListener('click',function(e){if(e.target.closest('a'))return;show(e.clientX>innerWidth/2?i+1:i-1);});
+  window.addEventListener('hashchange',fromHash);fromHash();
+})();
+</script>
+</body>
+</html>
