@@ -136,6 +136,22 @@ impl LogitsProcessor {
         Ok(candidates[drawn] as u32)
     }
 
+    /// Sample a token that is never one of `stops`, by suppressing those ids to negative
+    /// infinity before sampling. A request that asked for output must not return an empty
+    /// answer because the model's first token would be an end-of-sequence token - which a base
+    /// model does for a prompt it reads as already complete, such as a raw document. Used for
+    /// the first token when tokens were asked for; later tokens stop on those ids as usual.
+    pub fn sample_avoiding(&mut self, logits: &Tensor, stops: &[u32]) -> Result<u32> {
+        let mut v = logits.to_device(&Device::Cpu)?.to_vec_f32();
+        for &s in stops {
+            if let Some(l) = v.get_mut(s as usize) {
+                *l = f32::NEG_INFINITY;
+            }
+        }
+        let masked = Tensor::from_vec(v, logits.shape(), &Device::Cpu)?;
+        self.sample(&masked)
+    }
+
     /// Draws the next token on the host, after the bias, and keeps the draw's
     /// log-probabilities when they were asked for.
     pub fn sample(&mut self, logits: &Tensor) -> Result<u32> {
@@ -232,5 +248,41 @@ impl LogitsProcessor {
                 Ok(candidates[drawn] as u32)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request that asked for tokens must not return an empty answer when the greedy first
+    /// token is a stop token: the guard suppresses the stops and takes the runner-up, and it
+    /// leaves an ordinary first token untouched.
+    #[test]
+    fn sample_avoiding_never_returns_a_stop_token() {
+        let logits = |top: usize| {
+            let mut v = vec![0.0f32; 16];
+            v[1] = 5.0; // a stop token is the greedy argmax
+            v[7] = 4.0; // the runner-up
+            v[top] = 9.0; // whichever token this run makes the leader
+            Tensor::from_vec(v, (16,), &Device::Cpu).unwrap()
+        };
+        let stops = [1u32, 2];
+        // Greedy: unguarded picks the stop, the guard picks the runner-up.
+        let mut p = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let eos_led = {
+            let mut v = vec![0.0f32; 16];
+            v[1] = 9.0;
+            v[7] = 4.0;
+            Tensor::from_vec(v, (16,), &Device::Cpu).unwrap()
+        };
+        assert_eq!(p.sample(&eos_led).unwrap(), 1, "unguarded greedy takes the stop");
+        assert_eq!(
+            p.sample_avoiding(&eos_led, &stops).unwrap(),
+            7,
+            "the guard takes the runner-up, never the stop"
+        );
+        // A non-stop leader is returned unchanged by the guard.
+        assert_eq!(p.sample_avoiding(&logits(9), &stops).unwrap(), 9);
     }
 }

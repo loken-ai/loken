@@ -507,6 +507,19 @@ impl LlmEngine {
             }
             let logits = apply_repeat_penalty(&logits.squeeze(0)?, &recent_tokens, repeat_penalty, repeat_last_n)?;
             let mut next_token = logits_processor.sample(&logits)?;
+            // A request that asked for tokens must never return an empty answer. When the greedy
+            // first token is an end-of-sequence token - which a base model does for a prompt it
+            // reads as already complete, such as a raw document - that one draw is taken again
+            // with every end-of-sequence token suppressed, so at least one token is produced.
+            // On the architecture-neutral sampling path, so it holds for every model.
+            if max_tokens >= 1
+                && (next_token == state.eos_token_id
+                    || state.eos_token_ids_extra.contains(&next_token))
+            {
+                let mut stops = state.eos_token_ids_extra.clone();
+                stops.push(state.eos_token_id);
+                next_token = logits_processor.sample_avoiding(&logits, &stops)?;
+            }
             record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
 
             let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
