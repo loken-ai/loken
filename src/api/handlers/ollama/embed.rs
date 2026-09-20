@@ -487,15 +487,180 @@ pub(crate) async fn ollama_create_model(
     }
     let model_name = normalize_model_id(&request.name);
     info!("Create model request: {}", model_name);
-    if request
+    if let Some(qname) = request
         .quantize
         .as_deref()
-        .is_some_and(|q| !q.trim().is_empty())
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
     {
-        return Err(ApiError::Validation(
-            "`quantize` is not done here: pull the tag that carries the quantisation you want"
-                .into(),
+        use crate::inference::load::requantize;
+        let from = request.from.as_deref().ok_or_else(|| {
+            ApiError::Validation("`quantize` needs `from`: the tag to requantise".into())
+        })?;
+        // `quantize: "keep"` leaves every unruled tensor at its source type and applies only the
+        // per-tensor overrides - what recreating a tag off a mixed base (Q4_K_M) needs, since a
+        // uniform base would flatten and shrink the tensors the mix kept at higher precision.
+        let base =
+            if qname.eq_ignore_ascii_case("keep") {
+                None
+            } else {
+                Some(requantize::parse_dtype(qname).ok_or_else(|| {
+                    ApiError::Validation(format!("unknown quantize type '{qname}'"))
+                })?)
+            };
+        let mut rules = Vec::new();
+        if let Some(tt) = request.tensor_types.as_ref() {
+            for (component, ty) in tt {
+                let dtype = requantize::parse_dtype(ty).ok_or_else(|| {
+                    ApiError::Validation(format!("unknown type '{ty}' for tensor '{component}'"))
+                })?;
+                rules.push(requantize::TensorRule {
+                    component: component.clone(),
+                    dtype,
+                });
+            }
+        }
+        let src_blob = state
+            .manifest_layer_path(from, "model")
+            .filter(|p| p.exists())
+            .ok_or_else(|| {
+                ApiError::Validation(format!("`from` '{from}' has no model weights on disk"))
+            })?;
+        // Carry the source's own format through unless the request overrides it: a requantised
+        // model served with anything but its declared template stops after a dozen tokens.
+        let template = request
+            .template
+            .clone()
+            .or_else(|| state.read_manifest_layer(from, "template"));
+        let license = request
+            .license
+            .clone()
+            .or_else(|| state.read_manifest_layer(from, "license"));
+        let params = request
+            .parameters
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap_or_default())
+            .or_else(|| state.read_manifest_layer(from, "params"));
+        let system = request.system.clone();
+
+        let manager = state.model_manager.clone();
+        let blobs_dir = manager.ollama().blobs_dir();
+        std::fs::create_dir_all(&blobs_dir)
+            .map_err(|e| ApiError::Internal(format!("blobs dir: {e}")))?;
+        // A unique temp per request, so two concurrent requants of the same source do not write
+        // the same working file.
+        let work = blobs_dir.join(format!(
+            ".requant-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
         ));
+
+        // Requantising a 70B is minutes of CPU that must not be tied to the client's socket: a
+        // client that times out and disconnects would otherwise cancel the work with no blob
+        // written (the failure the two fabricated-digest ffnq3 tags came from). So the work runs
+        // in a detached task that streams NDJSON progress; if the client goes, the send fails and
+        // is ignored and the requant still finishes and writes its manifest.
+        enum Msg {
+            Progress(usize, usize),
+            Done,
+            Err(String),
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let model_name_owned = model_name.clone();
+        let (src2, work2, work_cleanup) = (src_blob.clone(), work.clone(), work.clone());
+        tokio::spawn(async move {
+            let tx_worker = tx.clone();
+            let res = tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
+                let prog_tx = tx_worker.clone();
+                let progress = move |done, total| {
+                    let _ = prog_tx.send(Msg::Progress(done, total));
+                };
+                requantize::requantize_gguf(&src2, &work2, base, &rules, &progress)
+                    .map_err(|e| e.to_string())?;
+
+                store_gguf_as_model(
+                    manager.ollama(),
+                    &work2,
+                    &model_name_owned,
+                    [
+                        template.as_deref(),
+                        system.as_deref(),
+                        license.as_deref(),
+                        params.as_deref(),
+                    ],
+                )
+            })
+            .await;
+            let msg = match res {
+                Ok(Ok(())) => Msg::Done,
+                Ok(Err(e)) => {
+                    let _ = std::fs::remove_file(&work_cleanup);
+                    Msg::Err(e)
+                }
+                Err(join) => {
+                    let _ = std::fs::remove_file(&work_cleanup);
+                    Msg::Err(format!("requant task: {join}"))
+                }
+            };
+            let _ = tx.send(msg);
+        });
+
+        if request.stream {
+            let name_line = model_name.clone();
+            let body = async_stream::stream! {
+                let first = serde_json::json!({ "status": format!("creating model '{name_line}'") }).to_string() + "\n";
+                yield Ok::<_, std::io::Error>(axum::body::Bytes::from(first));
+                // Throttle: a large model has hundreds of tensors; emit at most ~1% steps.
+                let mut last_emitted = 0usize;
+                while let Some(m) = rx.recv().await {
+                    match m {
+                        Msg::Progress(done, total) => {
+                            let step = (total / 100).max(1);
+                            if done == total || done >= last_emitted + step {
+                                last_emitted = done;
+                                let line = serde_json::json!({
+                                    "status": "quantizing tensors",
+                                    "completed": done,
+                                    "total": total,
+                                }).to_string() + "\n";
+                                yield Ok(axum::body::Bytes::from(line));
+                            }
+                        }
+                        Msg::Done => {
+                            let m = serde_json::json!({ "status": "writing manifest" }).to_string() + "\n";
+                            yield Ok(axum::body::Bytes::from(m));
+                            let ok = serde_json::json!({ "status": "success" }).to_string() + "\n";
+                            yield Ok(axum::body::Bytes::from(ok));
+                        }
+                        Msg::Err(e) => {
+                            let err = serde_json::json!({ "status": "error", "error": e }).to_string() + "\n";
+                            yield Ok(axum::body::Bytes::from(err));
+                        }
+                    }
+                }
+            };
+            return Ok(Response::builder()
+                .header("content-type", "application/x-ndjson")
+                .body(axum::body::Body::from_stream(body))
+                .unwrap());
+        }
+
+        // Non-streaming: the work still runs detached (so a disconnect does not cancel it), but
+        // the client asked to wait, so drain to the terminal message and answer once.
+        let mut outcome: std::result::Result<(), String> = Err("requant produced no result".into());
+        while let Some(m) = rx.recv().await {
+            match m {
+                Msg::Done => outcome = Ok(()),
+                Msg::Err(e) => outcome = Err(e),
+                Msg::Progress(_, _) => {}
+            }
+        }
+        outcome.map_err(|e| ApiError::Internal(format!("requantise: {e}")))?;
+        use axum::response::IntoResponse;
+        return Ok(Json(serde_json::json!({ "status": "success" })).into_response());
     }
     if request.adapters.as_ref().is_some_and(|a| !a.is_empty()) {
         return Err(ApiError::Validation(
@@ -950,4 +1115,97 @@ pub(crate) async fn ollama_embeddings_legacy_routed(
     Ok(ollama_embeddings_legacy(State(state), OllamaJson(request))
         .await?
         .into_response())
+}
+
+/// Name the GGUF written at `work` as model `model_name` in `store`: the file becomes a blob under
+/// the sha256 of what was actually written, and a manifest points at it with any text layers -
+/// template, system, license, params, in that order - so the model loads like any other.
+pub(crate) fn store_gguf_as_model(
+    store: &crate::inference::load::ollama_manager::OllamaManager,
+    work: &std::path::Path,
+    model_name: &str,
+    [template, system, license, params]: [Option<&str>; 4],
+) -> std::result::Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut fh = std::fs::File::open(work).map_err(|e| e.to_string())?;
+    std::io::copy(&mut fh, &mut hasher).map_err(|e| e.to_string())?;
+    let hex = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    store_gguf_with_digest(
+        store,
+        work,
+        &hex,
+        model_name,
+        [template, system, license, params],
+    )
+}
+
+/// `store_gguf_as_model` for a file whose SHA-256 is already known, as lowercase hex - one hashed
+/// while it was written, which is not read again.
+pub(crate) fn store_gguf_with_digest(
+    store: &crate::inference::load::ollama_manager::OllamaManager,
+    work: &std::path::Path,
+    hex: &str,
+    model_name: &str,
+    [template, system, license, params]: [Option<&str>; 4],
+) -> std::result::Result<(), String> {
+    let size = std::fs::metadata(work).map_err(|e| e.to_string())?.len();
+
+    let out_blob = store.blobs_dir().join(format!("sha256-{hex}"));
+    std::fs::rename(work, &out_blob).map_err(|e| e.to_string())?;
+
+    let mut layers = vec![serde_json::json!({
+        "mediaType": "application/vnd.ollama.image.model",
+        "digest": format!("sha256:{hex}"),
+        "size": size,
+    })];
+    let mut text_layer = |kind: &str, content: Option<&str>| -> std::result::Result<(), String> {
+        if let Some(c) = content.filter(|c| !c.is_empty()) {
+            let (digest, sz) = store.write_blob(c.as_bytes()).map_err(|e| e.to_string())?;
+            layers.push(serde_json::json!({
+                "mediaType": format!("application/vnd.ollama.image.{kind}"),
+                "digest": digest,
+                "size": sz,
+            }));
+        }
+        Ok(())
+    };
+    text_layer("template", template)?;
+    text_layer("system", system)?;
+    text_layer("license", license)?;
+    text_layer("params", params)?;
+    let (_, arch, quant, declared) = super::models::gguf_facts(&out_blob);
+    let config = serde_json::json!({
+        "model_format": "gguf",
+        "model_family": arch.clone().unwrap_or_default(),
+        "model_families": arch.map(|a| vec![a]).unwrap_or_default(),
+        "model_type": declared.map(super::models::format_parameter_count).unwrap_or_default(),
+        "file_type": quant.unwrap_or_default(),
+        "architecture": "amd64",
+        "os": "linux",
+    });
+    let (cfg_digest, cfg_size) = store
+        .write_blob(&serde_json::to_vec(&config).unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {
+            "mediaType": "application/vnd.docker.container.image.v1+json",
+            "digest": cfg_digest,
+            "size": cfg_size,
+        },
+        "layers": layers,
+    });
+    let (name, tag) = match model_name.rsplit_once(':') {
+        Some((n, t)) => (n.to_string(), t.to_string()),
+        None => (model_name.to_string(), "latest".to_string()),
+    };
+    store
+        .write_manifest(&name, &tag, &manifest)
+        .map_err(|e| e.to_string())
 }

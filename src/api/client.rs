@@ -162,6 +162,29 @@ impl Client {
         Ok(response)
     }
 
+    /// POST `body` to `path` and return the response to read as it streams: for the daemon's long
+    /// detached jobs, whose progress arrives over hours, so no timeout applies to reading it.
+    pub async fn post_streaming(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, ClientError> {
+        let url = format!("{}{}", self.base_url, path);
+        let client = HttpClient::builder()
+            .build()
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        let response = client.post(&url).json(body).send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(ClientError::Http(format!(
+                "Request failed with status {}: {}",
+                status, text
+            )));
+        }
+        Ok(response)
+    }
+
     /// Generate text using Ollama API (POST /api/generate)
     pub async fn generate(
         &self,

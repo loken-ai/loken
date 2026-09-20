@@ -100,6 +100,58 @@ enum Commands {
     /// Show what is currently loaded in memory
     Ps,
 
+    /// Have the daemon record what a checkpoint's experts see over some texts, for `convert`
+    Calibrate {
+        /// The released checkpoint, by its Hugging Face id
+        model: String,
+        /// The record's name, which `convert` refers to
+        #[arg(short, long)]
+        name: String,
+        /// Texts to calibrate on, read here and sent to the daemon
+        #[arg(short, long, required = true)]
+        text: Vec<std::path::PathBuf>,
+        /// Tokens per excerpt
+        #[arg(long)]
+        excerpt: Option<usize>,
+        /// Tokens in all
+        #[arg(long)]
+        tokens: Option<usize>,
+        /// Rows each projection keeps for the error correction; by default every row, while they fit
+        #[arg(long)]
+        rows: Option<usize>,
+    },
+
+    /// Have the daemon write a calibrated GGUF of a checkpoint and name it as a model
+    Convert {
+        /// The released checkpoint, by its Hugging Face id
+        model: String,
+        /// The calibration record, by the name `calibrate` gave it
+        #[arg(short, long)]
+        calibration: String,
+        /// The model to create, name:tag
+        #[arg(short, long)]
+        name: String,
+        /// Format of the routed experts' gate and up projections
+        #[arg(long)]
+        gate_up: Option<String>,
+        /// Format of the routed experts' down projection
+        #[arg(long)]
+        down: Option<String>,
+        /// Format of every large weight a token always reads: attention, shared expert,
+        /// embeddings, head
+        #[arg(long)]
+        always_read: Option<String>,
+        /// Rows a projection needs before its error is carried across columns
+        #[arg(long)]
+        min_rows: Option<usize>,
+        /// The ridge on the calibration moment, as a multiple of its mean diagonal
+        #[arg(long)]
+        damping: Option<f32>,
+        /// Only these layers, first:last, for a partial file that checks the recipe first
+        #[arg(long)]
+        layers: Option<String>,
+    },
+
     /// Start a coding agent on this daemon: claude or cline
     Launch {
         /// The agent to start
@@ -227,6 +279,37 @@ async fn launch(
     }
 }
 
+/// Print a daemon job's NDJSON progress as it arrives, one line per step of the status or of a
+/// hundredth of its count, and fail on the job's own error.
+async fn follow(mut response: reqwest::Response) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut pending, mut last_status, mut last_step) = (String::new(), String::new(), usize::MAX);
+    while let Some(chunk) = response.chunk().await? {
+        pending.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(end) = pending.find('\n') {
+            let line: String = pending.drain(..=end).collect();
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            let status = v["status"].as_str().unwrap_or_default().to_string();
+            if status == "error" {
+                return Err(v["error"].as_str().unwrap_or("the job failed").into());
+            }
+            match (v["completed"].as_u64(), v["total"].as_u64()) {
+                (Some(done), Some(total)) if total > 0 => {
+                    let step = (done * 100 / total) as usize;
+                    if status != last_status || step != last_step {
+                        println!("{status}: {done}/{total}");
+                        last_step = step;
+                    }
+                }
+                _ => println!("{status}"),
+            }
+            last_status = status;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -254,6 +337,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(cli.server);
 
     match cli.command {
+        Commands::Calibrate {
+            model,
+            name,
+            text,
+            excerpt,
+            tokens,
+            rows,
+        } => {
+            let mut texts = Vec::with_capacity(text.len());
+            for path in &text {
+                texts.push(
+                    std::fs::read_to_string(path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?,
+                );
+            }
+            let body = serde_json::json!({
+                "model": model, "name": name, "texts": texts,
+                "excerpt": excerpt, "tokens": tokens, "rows": rows,
+            });
+            follow(client.post_streaming("/api/calibrate", &body).await?).await?;
+        }
+        Commands::Convert {
+            model,
+            calibration,
+            name,
+            gate_up,
+            down,
+            always_read,
+            min_rows,
+            damping,
+            layers,
+        } => {
+            let body = serde_json::json!({
+                "model": model, "calibration": calibration, "name": name,
+                "gate_up": gate_up, "down": down, "always_read": always_read, "min_rows": min_rows,
+                "damping": damping, "layers": layers,
+            });
+            follow(client.post_streaming("/api/convert", &body).await?).await?;
+        }
         Commands::Pull { model, source } => {
             let source = source.unwrap_or_else(|| {
                 // Auto-detect based on format: contains "/" = huggingface, else = ollama

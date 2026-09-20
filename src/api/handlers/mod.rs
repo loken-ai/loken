@@ -60,6 +60,7 @@ mod anthropic_api;
 #[cfg(feature = "audio")]
 mod audio;
 mod catalogue;
+mod convert;
 mod cluster_catalogue;
 #[cfg(feature = "image")]
 pub(crate) mod media;
@@ -1052,10 +1053,10 @@ fn upload_body_limit() -> axum::extract::DefaultBodyLimit {
 /// The extensions a checkpoint's weights come in.
 const WEIGHT_EXTENSIONS: [&str; 6] = [".gguf", ".safetensors", ".bin", ".pt", ".pth", ".ckpt"];
 
-/// Whether a listed model has weights to load. A Hugging Face repository whose snapshot
-/// holds only its configuration is listed, and advertised to peers it was a model that
-/// answered every request with not found. Ollama entries are always whole: a manifest
-/// names blobs the pull verified.
+/// Whether a listed model names weights at all. A Hugging Face repository whose snapshot holds
+/// only its configuration is not one: it answered every request with not found. This is the
+/// cheap, path-free half of the test; whether those weights are actually present and loadable
+/// is `APIServer::serves_weights`, which reads the filesystem.
 pub(crate) fn holds_weights(model: &crate::inference::load::model_manager::ModelMetadata) -> bool {
     model.source != "huggingface"
         || model.files.iter().any(|f| {
@@ -1195,10 +1196,9 @@ impl APIServer {
                 let listed = models.len();
                 // A peer sent a request for a model this node lists and cannot load
                 // would fail it; what is advertised is what can be served.
-                let hf_dir = self.huggingface_models_dir.clone();
                 let list: Vec<String> = models
                     .into_iter()
-                    .filter(|m| holds_weights(m) && text_loader_can_open(&hf_dir, m))
+                    .filter(|m| self.serves_weights(m))
                     .map(|m| m.id)
                     .collect();
                 if list.len() < listed {
@@ -1684,6 +1684,28 @@ impl APIServer {
     }
 
     /// A blob from the model's manifest, by layer kind (`model`, `params`, `license`, `template`).
+    /// Whether this node can actually load a listed model, not merely that a manifest names its
+    /// weights. Extends `holds_weights` with the two cases a listing otherwise promised and could
+    /// not keep: a Hugging Face causal LM the text loader does not read (see
+    /// `text_loader_can_open`), and an Ollama manifest whose model blob was deleted to free space
+    /// while the manifest stayed behind - `deepseek-r1:70b-ffnq3` did exactly that. An Ollama
+    /// layout that does not resolve to a model blob is left alone rather than guessed wrong.
+    pub(crate) fn serves_weights(
+        &self,
+        model: &crate::inference::load::model_manager::ModelMetadata,
+    ) -> bool {
+        if !holds_weights(model) {
+            return false;
+        }
+        if model.source == "huggingface" {
+            return text_loader_can_open(&self.huggingface_models_dir, model);
+        }
+        match self.manifest_layer_path(&model.id, "model") {
+            Some(blob) => blob.exists(),
+            None => true,
+        }
+    }
+
     fn manifest_layer_path(&self, model_id: &str, kind: &str) -> Option<PathBuf> {
         let (name, tag) = match model_id.split_once(':') {
             Some((n, t)) => (n.to_lowercase(), t),
@@ -1984,6 +2006,8 @@ impl APIServer {
             .route("/v1/rerank", axum::routing::post(openai_rerank))
             .route("/rerank", axum::routing::post(openai_rerank))
             .route("/api/create", axum::routing::post(ollama_create_model))
+            .route("/api/calibrate", axum::routing::post(convert::calibrate_model))
+            .route("/api/convert", axum::routing::post(convert::convert_model))
             .route("/api/push", axum::routing::post(ollama_push_model))
             .route(
                 "/api/blobs/{digest}",

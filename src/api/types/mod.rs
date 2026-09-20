@@ -1824,6 +1824,12 @@ pub struct OllamaCreateRequest {
     /// Quantization level
     #[serde(default)]
     pub quantize: Option<String>,
+    /// Per-tensor quantisation overrides for a requantising create: a tensor name component
+    /// (`ffn_down`, `attn_v`, ...) to a ggml type (`q3_K`). `quantize` sets the base type; a
+    /// tensor named here takes its own type instead. A loken extension to Ollama's whole-model
+    /// `quantize`, so per-tensor recipes (FFN a step lower, attention kept) need no external tool.
+    #[serde(default)]
+    pub tensor_types: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Ollama push model request (POST /api/push)

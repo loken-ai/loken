@@ -1831,12 +1831,9 @@ pub(crate) async fn openai_list_models(
     // RFC3339 download timestamp into a unix `created` so the field
     // matches what most SDKs expect (file age, not request time).
     if let Ok(mut models) = state.model_manager.list_models().await {
-        // A repository without weights is not a model a client can ask for.
-        // And not one the text loader would refuse at load time.
-        models.retain(|m| {
-            crate::api::handlers::holds_weights(m)
-                && crate::api::handlers::text_loader_can_open(&state.huggingface_models_dir, m)
-        });
+        // Only models this node can actually load: present weights, and a format the text
+        // loader reads. A manifest that names a deleted blob is not one a client can ask for.
+        models.retain(|m| state.serves_weights(m));
         // Stable alphabetical order so SDK UIs render the catalog
         // consistently across calls (filesystem walk order is
         // platform-dependent).
