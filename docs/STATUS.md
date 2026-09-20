@@ -50,18 +50,13 @@ one-card probe of 2026-08-27 taken between kernel changes; it is superseded, not
 | moondream:latest | **27.9** | 21.1 | **-24%** |
 <!-- /table:decode -->
 
-The two mixtures that lose here do not lose. Both rows came from a harness that had moved
-into its own repository and started the engine without its configuration; measured configured
-on 2026-09-02, olmoe is +17.4% and granite3-moe +0.2%. The clue was real, though, and pointed
-elsewhere: the mixtures that do lose are the ones too large for the cards. A layer was placed
-whole, so a spilled mixture ran attention on the host for the sake of expert weights that are
-97% of its bytes and read a few at a time. Spilling the experts and keeping everything else on
-the cards took qwen3next from 15.6 to 34.7 tok/s against ollama's 33, and qwen3-coder-next from
-10.7 to 30.8 against 26-28. A mixture that already fits is untouched by it.
-
-The table and the figure are regenerated together from `docs/BENCHMARKS.md` by
-`scripts/figures.py`. They were transcribed by hand once, and the page ended up quoting a
-parity for granite3-moe that appears nowhere in the measurements.
+The two mixtures that lose here came from a harness that had moved into its own repository and
+started the engine without its configuration; measured configured on 2026-09-02, olmoe is
++17.4% and granite3-moe +0.2%. The mixtures that do lose are the ones too large for the cards.
+A layer was placed whole, so a spilled mixture ran attention on the host for the sake of expert
+weights that are 97% of its bytes and read a few at a time. Spilling the experts and keeping
+everything else on the cards took qwen3next from 15.6 to 34.7 tok/s against ollama's 33, and
+qwen3-coder-next from 10.7 to 30.8 against 26-28. A mixture that already fits is untouched by it.
 
 ## Placement, measured separately
 
@@ -70,19 +65,15 @@ card, and pays nothing for having the second one present. Measured 2026-09-03, o
 on card 0 alone, 462 with both cards visible, 252 on card 1 alone - the placer picks the fast
 card, and the 390-against-496 penalty an earlier revision of this page reported is gone.
 
-For a model that fits on neither card the question is different, and the answer is the bus.
-deepseek-r1:70b at Q4_K_M holds 26 of its 80 layers on the host, every one of them read in
-full per token at ~36 GB/s, which is what this machine's DRAM gives: 1.51 tok/s here, 1.55
-under ollama, both engines pinned to the same ceiling. There is no faster host path. There are
-two ways out. A variant that fits - the FFN-at-Q3 requantisation the store already names but
-never received weights. And a drafter: on that same cell, llama3.2:1b proposing and the 70B
+For a model that fits on neither card the limit is the bus. deepseek-r1:70b at Q4_K_M holds
+26 of its 80 layers on the host, every one read in full per token at ~36 GB/s, this machine's
+DRAM ceiling: 1.51 tok/s here, 1.55 under ollama, both pinned to it. There is no faster host
+path. Two ways out. A variant that fits: the FFN-at-Q3 requantisation the store already names
+but never received weights. And a drafter: on that same cell, llama3.2:1b proposing and the 70B
 verifying, `[inference] draft_model` gives 2.21 tok/s at 41.0 J/token against 1.49 and 51.8
 alone, same answer token for token, with only 18% of drafts accepted - a better-matched
 drafter would do better. That is a different configuration from "loken", and a table that
 quotes it has to say so in the row.
-
-The first table is the kernels. This one is the placement. Only the first says anything about
-arithmetic.
 
 ## Context shift
 
@@ -223,7 +214,6 @@ measurement waiting. olmoe's deficit is closed: it was the harness, not the engi
 granite3-moe:1b loses 1-5% streamed and wins 7-20% not streamed, on six runs across three
 days. At ~3 ms a token the stream's per-token cost - the chunk, its JSON, the client's read
 loop - is the same order as the token, and that is where the gap lives, not in the kernels.
-The non-stream row is the arithmetic; the stream row is the transport.
 
 Two speculative loops. The plain stream carries one, gated per step by a calibrator; the
 attach endpoint and a configured drafter drive another, `generate_stream_with_draft`. On the

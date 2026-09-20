@@ -1,30 +1,26 @@
 # What a model file holds
 
-A checkpoint is a few hundred tensors and a few hundred metadata entries, in a container
-that lets a server read the entries without reading the tensors. This lesson is the
-container, and why the catalogue never opens more than a few kilobytes of it.
+A checkpoint is a few hundred tensors and a few hundred metadata entries, in a container that
+lets a server read the entries without reading the tensors. That is why the catalogue never
+opens more than a few kilobytes of it.
 
 ## The idea
 
-A **GGUF** file starts with a magic, a version and two counts: how many metadata pairs, how
-many tensors. Then the metadata, key by key: the architecture name, the layer count, the
-context length the model was trained for, the head counts, the rotary base, and the whole
-tokenizer (vocabulary, merges, scores, token types, chat template). Then one descriptor per
-tensor: its name, its dimensions (stored innermost first, so a reader reverses them), its
-element type and its offset. Then the payload, aligned to `general.alignment` (32 by
-default), one tensor after another.
-
-The element type is where the bytes go. F16 costs two bytes a weight; the block formats of
-lesson 3 cost between two and eight bits. A file's `general.file_type` names the mix it was
-packed with (Q4_K_M is a mix: most matrices at 4.5 bits, a few at 6.5).
-
-**safetensors** is the same idea with a JSON header: names, dtypes, shapes, offsets, then the
-bytes. It is the format Hugging Face checkpoints ship in, one or many files with an index.
-
-Nothing is copied at open. The file is **memory-mapped**: a tensor is a view at an offset,
-the operating system pages bytes in when they are first touched and keeps them in its page
-cache while memory allows. A model "loaded" on a card was read from that mapping and
-uploaded; a layer left on the host is read from it on every token.
+- **GGUF**: a magic, a version, two counts (metadata pairs, tensors). Then metadata key by
+  key: architecture name, layer count, trained context length, head counts, rotary base, and
+  the whole tokenizer (vocabulary, merges, scores, token types, chat template). Then one
+  descriptor per tensor: name, dimensions (stored innermost first, so a reader reverses them),
+  element type, offset. Then the payload, aligned to `general.alignment` (32 by default), one
+  tensor after another.
+- **Element type**: where the bytes go. F16 costs two bytes a weight; lesson 3's block
+  formats cost between two and eight bits. `general.file_type` names the mix a file was packed
+  with (Q4_K_M: most matrices at 4.5 bits, a few at 6.5).
+- **safetensors**: the same idea with a JSON header: names, dtypes, shapes, offsets, then the
+  bytes. The format Hugging Face checkpoints ship in, one or many files with an index.
+- **Memory-mapped**: nothing is copied at open. A tensor is a view at an offset; the operating
+  system pages bytes in when they are first touched and keeps them in its page cache while
+  memory allows. A model "loaded" on a card was read from that mapping and uploaded; a layer
+  left on the host is read from it on every token.
 
 Orders of magnitude on qwen3:0.6b: 751 632 384 parameters, 28 layers, an embedding width of
 1024, a trained context of 40 960 tokens, and 522 MB resident at Q4_K_M, which is 5.6 bits

@@ -31,8 +31,7 @@ Claude Code presents and the key in Cline's provider file.
 
 ## Choosing a model
 
-A coding agent sends long prompts with tools. A model that follows tool calls and a context of
-at least 32k tokens are the floor; `context_length` in the daemon's configuration sets the
-window a model is loaded with.
+A model that follows tool calls and a context of at least 32k tokens are the floor;
+`context_length` in the daemon's configuration sets the window a model is loaded with.
 Claude Code speaks the Messages API and Cline the Ollama API, so any chat model the daemon
 serves works for both, and on a cluster the request goes to the node that holds it.

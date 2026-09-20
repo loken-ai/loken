@@ -5,23 +5,27 @@ measurement in place could not see.
 
 ## The idea
 
-A token rate is a ratio, and both halves of it can be wrong. The numerator: which tokens
-were counted (the prompt as the tokenizer sees it, or as a word count estimates it), over
-what span (from the first generated token, or from the request), by whom (the client's
-clock, or the engine's own bookkeeping, which leaves out whatever it does not time). The
-denominator: how many tokens the model actually produced, since a model that stops at
-thirty tokens is averaged over thirty steps and carries the request's fixed cost.
+- **A rate is a ratio**, and both halves can be wrong. The numerator: which tokens were
+  counted (the prompt as the tokenizer sees it, or as a word count estimates it), over what
+  span (from the first generated token, or from the request), by whom (the client's clock, or
+  the engine's own bookkeeping, which leaves out whatever it does not time). The denominator:
+  how many tokens the model actually produced, since a model that stops at thirty tokens is
+  averaged over thirty steps and carries the request's fixed cost.
+- **The conditions**: a cold first iteration, a machine doing something else, a model that had
+  to be evicted to make room for the next, a prompt sent raw where the model expects its
+  template. Then the summary: a mean over three iterations one of which loaded the model. And
+  the question no rate answers: was the output any good, or a loop the gate did not read far
+  enough to see.
 
-Then the conditions: a cold first iteration, a machine doing something else, a model that
-had to be evicted to make room for the next, a prompt sent raw where the model expects its
-template. Then the summary: a mean over three iterations one of which loaded the model. And
-then the question no rate answers: was the output any good, or a loop the gate did not read
-far enough to see.
+The discipline that came out of nine months of this:
 
-The discipline that came out of nine months of this is short. Measure from the client, the
-same way for every engine. Take the median. Publish the token count beside the rate. Say
-which build, which machine, which day. Profile a representative slice before a run of hours.
-Let nothing else run. And treat a log line as a smell, not as a test.
+- Measure from the client, the same way for every engine.
+- Take the median.
+- Publish the token count beside the rate.
+- Say which build, which machine, which day.
+- Profile a representative slice before a run of hours.
+- Let nothing else run.
+- Treat a log line as a smell, not as a test.
 
 ## In loken
 

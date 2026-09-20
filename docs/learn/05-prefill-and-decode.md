@@ -8,24 +8,23 @@ server does is arranging for each to hit its bound.
 
 ![Prefill against decode](../img/learn-prefill-decode.svg)
 
-**Prefill** takes the n prompt tokens through every layer in one pass. Each projection is a
-matrix times a matrix of n rows: every weight byte read serves n tokens, so the arithmetic
-per byte is high and the pass is bound by how fast the card multiplies. Attention adds a
-term that grows with n squared, since every token scores against every earlier one; at long
-prompts that term is where the time goes.
-
-**Decode** generates one token per pass. Each projection is a matrix times one row: every
-weight byte read serves one token, so the pass is bound by how fast the bytes arrive, and
-the token rate is close to memory bandwidth over model bytes. A model that fits on a card
-reads at the card's rate; a layer left on the host reads at the host's, an order of
-magnitude slower; a layer streamed from disk reads at the disk's, another order below.
-
-Two consequences shape a server. Prefill is cut into **chunks** so its activations fit
-beside the weights (a chunk's peak scales with chunk length times the widest feed-forward),
-which also lets a long prompt yield to other requests. And since a decode step reads the
-weights anyway, several sequences can share the read: a **scheduler** decides at every step
-which requests prefill and which decode, admits new ones when cache blocks free, and
-preempts under pressure, so the card is never idle while a slow request finishes.
+- **Prefill** takes the n prompt tokens through every layer in one pass. Each projection is a
+  matrix times a matrix of n rows: every weight byte read serves n tokens, so the arithmetic
+  per byte is high and the pass is bound by how fast the card multiplies. Attention adds a
+  term that grows with n squared, since every token scores against every earlier one; at long
+  prompts that term is where the time goes.
+- **Decode** generates one token per pass. Each projection is a matrix times one row: every
+  weight byte read serves one token, so the pass is bound by how fast the bytes arrive, and
+  the token rate is close to memory bandwidth over model bytes. A model that fits on a card
+  reads at the card's rate; a layer left on the host reads at the host's, an order of
+  magnitude slower; a layer streamed from disk reads at the disk's, another order below.
+- **Chunks** cut prefill so its activations fit beside the weights (a chunk's peak scales with
+  chunk length times the widest feed-forward), which also lets a long prompt yield to other
+  requests.
+- **Scheduler**: since a decode step reads the weights anyway, several sequences can share the
+  read: it decides at every step which requests prefill and which decode, admits new ones when
+  cache blocks free, and preempts under pressure, so the card is never idle while a slow
+  request finishes.
 
 Orders of magnitude on this machine: qwen3:0.6b prefills 1 782 tokens in 50 ms and decodes
 at about 730 tokens a second on an RTX 5070 Ti; its 522 MB read at that rate is well under

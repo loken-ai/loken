@@ -6,11 +6,6 @@ code in these modules is this project's; each row names the reference it was val
 against. Borrowed code - files that still share measured body lines with an upstream - is
 listed in `NOTICE.md` instead, driven by `scripts/provenance/manifest.tsv`.
 
-A model checkpoint dictates its own architecture: the tensor names, the shapes and the order of
-operations are fixed by the file, and an implementation that departs from them does not load at
-all. The modules below implement those architectures. Each names the reference it was written
-against, and the code is this project's.
-
 If you maintain one of the projects named here and read this as under-crediting your work, open
 an issue and it will be corrected.
 

@@ -85,9 +85,8 @@ Toolchains, features, the daemon's flags and what to do when a build or a load f
 ## Running it on a network
 
 The server **has no authentication and no rate limit unless you configure them**, and its API
-can delete models. That suits one person on one machine. Turn both on in `config.toml` before it
-listens on anything but localhost: `require_auth`, `api_keys` and `rate_limit_per_minute` under
-`[server]`.
+can delete models. Turn both on in `config.toml` before it listens on anything but localhost:
+`require_auth`, `api_keys` and `rate_limit_per_minute` under `[server]`.
 
 ## Documentation
 

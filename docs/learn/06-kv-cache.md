@@ -30,10 +30,12 @@ designs:
 
 ![Where a conversation's KV lives](../img/learn-kv-tiers.svg)
 
-Two rules follow. A model has **one live cache**, and two conversations served in
-alternation evict each other unless a snapshot holds the other. And a window **too small**
-is slower than a large one: compaction rewrites the history from near its start, and a
-rewritten prefix matches nothing that is held.
+Two rules follow:
+
+- **One live cache** per model, so two conversations served in alternation evict each other
+  unless a snapshot holds the other.
+- **A window too small** is slower than a large one: compaction rewrites the history from
+  near its start, and a rewritten prefix matches nothing that is held.
 
 ## In loken
 

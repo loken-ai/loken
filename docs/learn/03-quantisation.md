@@ -1,41 +1,37 @@
 # Fewer bits per weight, and what it costs
 
-Decode is bound by bytes, so the bytes a weight occupies are the rate. Quantisation is the
-trade of precision for bytes, and this lesson is how the trade is made, how it is judged,
-and where it went wrong.
+Decode is bound by bytes, so the bytes a weight occupies are the rate. Quantisation trades
+precision for bytes; this lesson is how the trade is made, how it is judged, and where it went
+wrong.
 
 ## The idea
 
-A trained weight is a float. Stored in sixteen bits it costs two bytes; a 70B model then
-costs 140 GB, which no pair of consumer cards holds. **Block quantisation** stores a group
-of consecutive weights as small integers plus one scale: the block's values are divided by
-the scale, rounded, and packed. Q4_0 packs 32 values at four bits each behind one 16-bit
-scale, 18 bytes for 32 weights, 4.5 bits a weight. Q8_0 spends eight bits, 8.5 a weight.
-The **k-quants** nest the idea: Q4_K holds 256 values in eight sub-blocks, each with its own
-6-bit scale and minimum under one 16-bit super-scale, 144 bytes for 256, 4.5 bits a weight
-with a better fit; Q6_K sits at 6.56. Below three bits a plain grid loses too much, and
-IQ2_XXS stores an index into a fixed codebook of eight-value patterns instead, 2.06 bits a
-weight. Checkpoints trained in fp8 or fp4 ship their own block scales, one per 32 by 32
-tile, which a reader applies rather than recomputes.
-
-The decision inside every format is the scale. The obvious choice, the block's extreme
-value over the largest level, is right only when the extreme is worth as much as the rest,
-and it rarely is: every quantiser here starts from that answer and searches for one that
-loses less. **Calibration** goes further and asks a corpus which weights matter, so the
-search can weight its error by an importance value per column; **error compensation**
-carries the rounding error of one block into the columns quantised after it, the way
-GPTQ does.
-
-The matmul then has two ways to use such a block. Dequantise to float and multiply, which
-is simple and moves twice the bytes; or multiply in the quantised domain: the activation is
-quantised to eight bits per block too, the products are integer dot products (a SIMD
-multiply-add of unsigned by signed bytes on AVX2, an integer tensor-core instruction on a
-card), and the two scales are applied once at the end. The second is what makes a 4-bit
-model fast.
-
-Judging a quantisation is two questions: how well the blocks reconstruct the original
-matrix, and how far the model's output moves (KL divergence and top-1 agreement against the
-unquantised model on held-out text). The second is the one that counts.
+- **Block quantisation**: a trained weight is a float. Stored in sixteen bits it costs two
+  bytes; a 70B model then costs 140 GB, which no pair of consumer cards holds. Block
+  quantisation stores a group of consecutive weights as small integers plus one scale: the
+  block's values are divided by the scale, rounded, and packed. Q4_0 packs 32 values at four
+  bits each behind one 16-bit scale, 18 bytes for 32 weights, 4.5 bits a weight. Q8_0 spends
+  eight bits, 8.5 a weight.
+- **k-quants** nest the idea: Q4_K holds 256 values in eight sub-blocks, each with its own
+  6-bit scale and minimum under one 16-bit super-scale, 144 bytes for 256, 4.5 bits a weight
+  with a better fit; Q6_K sits at 6.56. Below three bits a plain grid loses too much, and
+  IQ2_XXS stores an index into a fixed codebook of eight-value patterns instead, 2.06 bits a
+  weight. Checkpoints trained in fp8 or fp4 ship their own block scales, one per 32 by 32
+  tile, which a reader applies rather than recomputes.
+- **The scale**: the decision inside every format. The obvious choice, the block's extreme
+  value over the largest level, is right only when the extreme is worth as much as the rest,
+  and it rarely is: every quantiser here starts from that answer and searches for one that
+  loses less. **Calibration** asks a corpus which weights matter, so the search can weight its
+  error by an importance value per column; **error compensation** carries the rounding error
+  of one block into the columns quantised after it, the way GPTQ does.
+- **The matmul**: two ways to use a block. Dequantise to float and multiply, which is simple
+  and moves twice the bytes; or multiply in the quantised domain: the activation is quantised
+  to eight bits per block too, the products are integer dot products (a SIMD multiply-add of
+  unsigned by signed bytes on AVX2, an integer tensor-core instruction on a card), and the two
+  scales are applied once at the end. The second is what makes a 4-bit model fast.
+- **Judging** is two questions: how well the blocks reconstruct the original matrix, and how
+  far the model's output moves (KL divergence and top-1 agreement against the unquantised
+  model on held-out text). The second is the one that counts.
 
 ## In loken
 

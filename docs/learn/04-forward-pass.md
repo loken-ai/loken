@@ -1,8 +1,8 @@
 # One layer, then forty of them
 
-A transformer is one block repeated. Once the block is clear, the whole model is that block
-applied twenty-eight or ninety-two times, and the questions of the next lessons (what is
-read per token, what is kept between tokens) fall out of it.
+A transformer is one block repeated. The whole model is that block applied twenty-eight or
+ninety-two times, and the next lessons (what is read per token, what is kept between tokens)
+fall out of it.
 
 ## The idea
 

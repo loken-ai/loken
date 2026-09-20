@@ -2,7 +2,7 @@
 
 Serving one model across many machines: high throughput, tolerant of a node
 dying mid-generation, and - like the single-node placement rule it extends - **measured, not
-declared**. No operator is asked what their network is. The cluster finds out.
+declared**. No operator is asked what their network is; the cluster measures it.
 
 ## Where it stands today
 
@@ -25,8 +25,8 @@ pipeline stages across nodes has a planner but no data path - nothing executes s
 the cross-host call refuses loudly rather than returning a placeholder. If the model does not
 fit on at least one node, the cluster cannot serve it.
 
-Everything below this section describes the design, including the half that is not built. Read
-it as the shape the work is taking, not as a description of what a node does today.
+Everything below describes the design, including the half not built: the shape the work is
+taking, not what a node does today.
 
 **One module to stay away from.** `DistributedEngine`, in `src/inference/serve/distributed_engine.rs`,
 is a scaffold: it exposes an API for distributing execution across nodes that is not implemented.
@@ -44,13 +44,12 @@ per node), `cluster.rs` + `cluster_runtime.rs` (the decision, the gossip loop, t
 NVML, so it reads the same on Linux and Windows), `cut_plan.rs`, `kv_tiers.rs`, `replay.rs`
 (position-seeded sampling), `evidence.rs`.
 
-Two properties worth stating because they are what make a cluster usable rather than merely
-present. A node holding **no weights at all** serves anything the cluster can serve - it
+Two properties. A node holding **no weights at all** serves anything the cluster can serve - it
 forwards. And a peer that dies stops receiving requests without any request hanging on it: the
 detector evicts it and the arithmetic simply stops finding it.
 
-The single-node substrate underneath is sound and the cluster is built **on** it, not beside
-it: `continuous_serve.rs` (continuous batching over paged KV with CUDA graphs),
+The cluster is built **on** the single-node substrate: `continuous_serve.rs` (continuous
+batching over paged KV with CUDA graphs),
 `tp_decode.rs` (TP=2, validated bit-exact across the PCIe pair), `dry_plan.rs` (placement
 measured by walking the forward without allocating).
 
@@ -73,8 +72,8 @@ cluster without being usable by it - correct behind NAT, wrong if you meant to s
 On one network nothing else is needed: the nodes hear each other. Across subnets, put each
 other's addresses in `join`; discovery adds to that list rather than replacing it.
 
-One thing to expect on a fresh node: the first request pays a one-off NVRTC compilation of the
-CUDA kernels before any token appears. The model load itself is seconds; the JIT is not.
+On a fresh node the first request pays a one-off NVRTC compilation of the CUDA kernels before
+any token appears. The model load itself is seconds; the JIT is not.
 
 `GET /api/cluster/state` shows what a node publishes about itself; `POST /api/cluster/prefix`
 asks it how much of a given prompt it already holds.
@@ -92,15 +91,13 @@ human-readable reason - including when the answer is no:
 
 > `Devices too balanced: verify=12ms vs draft=9ms (need >1.5x ratio)`
 
-A cluster planner that required its fabric to be declared would be a regression against both.
 Where the single-node plan asks each card what it can hold, the cluster plan asks each **link**
 what it can carry, and decides from the answer.
 
 ## The cost model
 
-Start from the cheapest thing the cluster can do, because it sets the bar every other
-topology has to clear. For a 1000-token prompt and 500 generated tokens, over a link of
-round-trip time `RTT`:
+The cheapest thing the cluster can do sets the bar every other topology has to clear. For a
+1000-token prompt and 500 generated tokens, over a link of round-trip time `RTT`:
 
 | mode | exchanges | bytes on the wire | added latency |
 |---|---|---|---|
@@ -109,9 +106,9 @@ round-trip time `RTT`:
 | tensor parallel (TP) | 2 per layer **per token** | ~260 MB | 32 000 x RTT |
 
 Three orders of magnitude separate offloading a whole request from splitting a model across
-the same link. So the planner's question is not *how do I split this model* - it is **is there
-any reason not to send the entire request to one node?** Splitting is the fallback when no
-single node holds the model. It is never the goal.
+the same link. So the planner's question is whether any reason
+stops it from sending the entire request to one node. Splitting is the fallback when no
+single node holds the model.
 
 Per generated token, for the split modes:
 
@@ -125,20 +122,16 @@ all-reduced, while column->row pairs need no exchange (`tp_decode.rs`). PP excha
 activation per node boundary: `[1, hidden]` in f16 is 8 KiB at hidden=4096, so the cost is
 latency, not bandwidth.
 
-Two orders of magnitude separate them, which usually makes the verdict obvious - TP inside a
-node, PP between nodes. **Usually is not always.** Over NVLink or RDMA the RTT falls far
-enough that inter-node TP becomes profitable again. A fixed rule would forbid that case; a
-measured decision finds it, and says why it took it.
+Two orders of magnitude separate them: TP inside a node, PP between nodes. Over NVLink or RDMA
+the RTT falls far enough that inter-node TP becomes profitable again.
 
-These formulas are the planner's objective function. They are not the planner's conclusion.
+These formulas are the planner's objective function, not its conclusion.
 
 ## Architecture
 
 One binary, `lokend`, with the role composed by configuration rather than chosen by a flag.
 `lokend serve` takes `--port`, `--models-dir`, `--verbose`, `--keep-alive` and `--cpu`; there is
-no cluster flag. A node joins by way of the `[cluster]` block of its `config.toml` shown above  - 
-`name` decides which cluster it belongs to, `advertise` how peers reach it, and `join` lists the
-seeds for peers multicast cannot reach.
+no cluster flag. A node joins by way of the `[cluster]` block of its `config.toml` shown above.
 
 ![Cluster topology](img/cluster-topology.svg)
 
@@ -179,7 +172,7 @@ layout, and the downloader already fetches in parallel. A joining node can there
 holds a digest and pull from the fastest one rather than from upstream - and the link cost
 matrix says which peer that is. Peer-to-peer weight distribution is nearly free here.
 
-**What a replica actually is.** This one is correctness, not convenience. Two nodes announcing
+**What a replica actually is.** Two nodes announcing
 `qwen3:8b` must hold *the same bytes*: otherwise the same request answered by either returns
 different text, and deterministic recovery collapses - replaying on another node
 with the same seed would produce a different continuation.
@@ -200,12 +193,12 @@ All of them are in the tree.
 
 ### Node discovery
 
-`join` is a seed list, not discovery: on its own it works only when every address is known in
-advance and rewritten whenever a machine moves. For a handful of machines on one network, coming
-and going, that is the wrong shape - so a node also announces itself on a multicast group and
-listens for the others. Multicast rather than broadcast: broadcast reaches every host on the segment whether it cares
-or not and is filtered on many networks, while a group is scoped and joined only by those
-interested. The announcement carries a node id and an endpoint, and nothing else.
+`join` is a seed list, not discovery: it works only when every address is known in advance and
+rewritten whenever a machine moves. So a node also announces itself on a multicast group and
+listens for the others. Multicast rather than broadcast: broadcast reaches every host on the
+segment whether it cares or not and is filtered on many networks, while a group is scoped and
+joined only by those interested. The announcement carries a node id and an endpoint, and nothing
+else.
 
 Two hazards, both silent when they happen:
 
@@ -327,8 +320,7 @@ served it. Nobody publishes this at cluster scale, and the measurement grows mor
 with node count, not less.
 
 Chaos benches: kill a node mid-run and record p99, error rate, tokens lost, reconvergence
-time. Which topology the cluster chose, and why, belongs in the report - a benchmark that does
-not say what it measured is not reproducible.
+time. Which topology the cluster chose, and why, belongs in the report.
 
 ## Configuration
 

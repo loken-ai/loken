@@ -13,8 +13,8 @@ target disagrees with is replaced by the target's choice, and everything after i
 dropped. What survives is exactly what the target would have generated on its own, token for
 token under greedy decoding, so the output is unchanged.
 
-The gain is the number of accepted drafts per pass, and the cost is the drafting plus a
-verification pass slightly heavier than a plain step. Three sources of drafts:
+The gain is accepted drafts per pass; the cost is drafting plus a verification pass slightly
+heavier than a plain step. Three sources of drafts:
 
 - a **separate small model** of the same family, with the same vocabulary;
 - a **trained head** on the target's own last hidden state (EAGLE), a few percent of a layer,

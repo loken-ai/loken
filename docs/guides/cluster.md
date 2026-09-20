@@ -1,22 +1,27 @@
 # Two machines
 
 Every node runs the same daemon and any node is an entry point: a request arrives anywhere, the
-node forwards it whole to the best holder and relays the stream back. This holds for every
-surface that names a model: Ollama generate and chat, OpenAI chat and completions, and the
-Messages API. A request that only loads a model goes to a node that has it. Every other
-route that loads a model consults the cluster too: image generation, edits and variations,
-video, sound and music, speech, transcription and translation, embeddings, reranking, and
-each turn of the conversation route. A node without the weights, or without a card that
-holds the model whole, hands the request to the least loaded peer that has them and whose
-cards admit the demand, and an upload travels as it arrived. Each node publishes what each
-of its cards admits as a whole load, so a hand-over never sends a render to a smaller card.
-Each family asks with its own demand: an image family's hot component and scratch, the
-music model with its cache and reserve, a video denoiser at the requested frames, a voice
-or a transcription model loaded whole. A node that keeps a request reclaims an idle
-resident before it loads, and a request no peer can take runs here: split across the
-cards when they hold it together, spilling to the host when they do not, and the
-loaded-models listing says which. Each node needs a `[cluster]` block; the rest is
-discovered.
+node forwards it whole to the best holder and relays the stream back.
+
+- Every surface that names a model forwards: Ollama generate and chat, OpenAI chat and
+  completions, the Messages API.
+- A request that only loads a model goes to a node that has it. Every other route that loads a
+  model consults the cluster too: image generation, edits and variations, video, sound and
+  music, speech, transcription and translation, embeddings, reranking, and each turn of the
+  conversation route.
+- A node without the weights, or without a card that holds the model whole, hands the request to
+  the least loaded peer that has them and whose cards admit the demand; an upload travels as it
+  arrived.
+- Each node publishes what each of its cards admits as a whole load, so a hand-over never sends a
+  render to a smaller card.
+- Each family asks with its own demand: an image family's hot component and scratch, the music
+  model with its cache and reserve, a video denoiser at the requested frames, a voice or a
+  transcription model loaded whole.
+- A node that keeps a request reclaims an idle resident before it loads; a request no peer can
+  take runs here, split across the cards when they hold it together, spilling to the host when
+  they do not, and the loaded-models listing says which.
+
+Each node needs a `[cluster]` block; the rest is discovered.
 
 ```toml
 [cluster]

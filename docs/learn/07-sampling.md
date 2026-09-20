@@ -6,22 +6,20 @@ of the same prompt agree.
 
 ## The idea
 
-The row of **logits** becomes probabilities through a softmax. **Temperature** divides the
-logits first: below one it sharpens the distribution, at zero it is a maximum, **greedy**.
-Then the candidate set is cut: **top-k** keeps the k largest, **top-p** keeps the smallest
-set whose probabilities sum to p, **min-p** keeps every entry above a fraction of the
-largest. A **repetition penalty** scales down the logits of tokens already emitted; a
-**logit bias** adds to chosen entries; **logprobs** report what the row said about the
-token chosen and its runners-up. Then one draw, in proportion to what is left.
-
-**Constrained decoding** is a mask on the row: a grammar (a JSON schema compiled to one)
-says which tokens can continue a valid output at this position, and every other logit is
-removed before the draw.
-
-**Determinism** is a property of the whole path. Greedy on the same logits gives the same
-token; the same logits require the same arithmetic, in the same order, which the next
-lesson's cache reuse and a batched kernel can both change. A seed fixes the draw, not the
-logits.
+- **Logits to a draw**: the row of **logits** becomes probabilities through a softmax.
+  **Temperature** divides the logits first: below one it sharpens the distribution, at zero it
+  is a maximum, **greedy**. Then the candidate set is cut: **top-k** keeps the k largest,
+  **top-p** keeps the smallest set whose probabilities sum to p, **min-p** keeps every entry
+  above a fraction of the largest. A **repetition penalty** scales down the logits of tokens
+  already emitted; a **logit bias** adds to chosen entries; **logprobs** report what the row
+  said about the token chosen and its runners-up. Then one draw, in proportion to what is left.
+- **Constrained decoding**: a mask on the row: a grammar (a JSON schema compiled to one)
+  says which tokens can continue a valid output at this position, and every other logit is
+  removed before the draw.
+- **Determinism**: a property of the whole path. Greedy on the same logits gives the same
+  token; the same logits require the same arithmetic, in the same order, which the next
+  lesson's cache reuse and a batched kernel can both change. A seed fixes the draw, not the
+  logits.
 
 ## In loken
 
