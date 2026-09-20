@@ -204,6 +204,13 @@ impl StatsMonitor {
         );
     }
 
+    /// The CPU utilization the last refresh measured, 0-100, read from the shared system
+    /// without refreshing it. So a device row can carry the host's compute load the way a card
+    /// carries its NVML utilization, at no sampling cost - the periodic logger keeps it fresh.
+    pub async fn cpu_usage(&self) -> f32 {
+        self.system.read().await.global_cpu_usage()
+    }
+
     /// Start periodic stats logging
     pub fn start_periodic_logging(
         &self,

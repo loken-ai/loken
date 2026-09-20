@@ -359,7 +359,7 @@ fn layers_to_json(
 
 /// List available compute devices with detailed availability status
 pub(crate) async fn list_devices(
-    State(_state): State<APIServer>,
+    State(state): State<APIServer>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Per-request log at DEBUG, not INFO - the GUI's Hardware-tab
     // auto-refresh polls this every 2s. INFO would flood the server
@@ -369,7 +369,7 @@ pub(crate) async fn list_devices(
     // the probe, so the figures read here are what a card really has. Not while work
     // runs: the pool's blocks are then the next step's, and taking them would only make
     // the step allocate them again.
-    if !_state.work_in_flight().await {
+    if !state.work_in_flight().await {
         crate::inference::engine::llm_engine::trim_cuda_pools();
     }
 
@@ -446,6 +446,11 @@ pub(crate) async fn list_devices(
         std::collections::HashMap::new()
     };
 
+    // The host's compute load, so the CPU row carries a utilization the way a card does.
+    // NVML answers for a card; nothing did for the host, which left its row without the one
+    // number that says whether a model placed on it is actually working.
+    let cpu_pct = state.stats_monitor.cpu_usage().await;
+
     // Build detailed device info with availability
     let devices: Vec<serde_json::Value> = device_manager.devices().iter().map(|d| {
         let (status, reason, suggestion) = match &d.availability {
@@ -483,7 +488,10 @@ pub(crate) async fn list_devices(
             "memory_gb": d.memory_gb(),
             "memory_bytes": d.memory_bytes,
             "free_bytes": free_bytes,
-            "utilization_gpu_percent": live.util_gpu_pct,
+            "utilization_gpu_percent": match d.device_type {
+                crate::distributed::DeviceType::Cuda => live.util_gpu_pct,
+                _ => Some(cpu_pct),
+            },
             "utilization_memory_percent": live.util_mem_pct,
             "temperature_c": live.temp_c,
             "power_watts": live.power_w,
