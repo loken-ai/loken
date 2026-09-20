@@ -146,6 +146,7 @@ src/inference/cuda/quantized/flash_splitk.cu	0.0%	0	llama.cpp/ggml/src/ggml-sycl
 src/inference/cuda/quantized/helpers.cu	0.0%	0	candle/candle-kernels/src/quantized.cu
 src/inference/cuda/quantized/kv_quantize.cu	0.0%	0	candle/candle-kernels/src/mmvq_gguf.cu
 src/inference/cuda/quantized/sampling.cu	0.0%	0	candle/candle-kernels/src/quantized.cu
+src/inference/cuda/quantized/requant.cu	0.0%	0	candle/candle-kernels/src/quantized.cu
 src/inference/engine/audio_engine.rs	0.9%	5	candle/candle-wasm-examples/whisper/src/worker.rs
 src/inference/engine/boogu_engine.rs	0.0%	0	candle/candle-metal-kernels/src/kernel.rs
 src/inference/engine/decode_step.rs	5.0%	4	vllm/rust/src/engine-core-client/src/protocol/sampling.rs
@@ -448,3 +449,4 @@ src/tensor/tensor/norm.rs	0.0%	0	candle/candle-transformers/src/models/quantized
 src/tensor/tensor/shape.rs	0.0%	0	candle/candle-core/src/tensor.rs
 src/tensor/tensor/tests.rs	0.0%	0	candle/candle-metal-kernels/src/kernel.rs
 src/tensor/varbuilder.rs	0.0%	0	candle/candle-transformers/src/quantized_var_builder.rs
+src/tensor/quant_cpu/format/iq2_xxs.rs	52.9%	64	llama.cpp/ggml/src/ggml-common.h
