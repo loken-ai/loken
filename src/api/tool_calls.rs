@@ -46,6 +46,10 @@ pub enum ToolFormat {
     /// `<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME` then a
     /// ```json block, closed by `<｜tool▁call▁end｜><｜tool▁calls▁end｜>` - DeepSeek V3 / R1.
     DeepSeek,
+    /// A `<｜DSML｜ calls>` block of `<｜DSML｜ invoke name="NAME">` calls, each holding
+    /// `<｜DSML｜ parameter name="KEY" string="true|false">VALUE</｜DSML｜ parameter>` entries -
+    /// DeepSeek V4.1. A string parameter is the value as is; any other is the value as JSON.
+    DeepSeekDsml,
 }
 
 impl ToolFormat {
@@ -68,6 +72,7 @@ impl ToolFormat {
             ToolFormat::Llama3 => &["<|python_tag|>"],
             ToolFormat::Harmony => &["<|channel|>commentary"],
             ToolFormat::DeepSeek => &[DS_CALLS_BEGIN],
+            ToolFormat::DeepSeekDsml => &[DSML_CALLS_OPEN],
         }
     }
 }
@@ -93,6 +98,9 @@ pub fn detect_tool_format(template: Option<&str>, model_name: &str) -> ToolForma
         if t.contains("<|channel|>") {
             return ToolFormat::Harmony;
         }
+        if t.contains(DSML_TOKEN) {
+            return ToolFormat::DeepSeekDsml;
+        }
         if t.contains(DS_CALLS_BEGIN) || t.contains("<｜tool▁call▁begin｜>") {
             return ToolFormat::DeepSeek;
         }
@@ -117,7 +125,12 @@ pub fn detect_tool_format(template: Option<&str>, model_name: &str) -> ToolForma
     if m.contains("gpt-oss") {
         ToolFormat::Harmony
     } else if m.contains("deepseek") {
-        ToolFormat::DeepSeek
+        // V4.1 speaks DSML; V3 and R1 keep the older begin/end markers.
+        if m.contains("v4.1") || m.contains("v4-1") || m.contains("v41") || m.contains("flash") {
+            ToolFormat::DeepSeekDsml
+        } else {
+            ToolFormat::DeepSeek
+        }
     } else if m.contains("mistral")
         || m.contains("mixtral")
         || m.contains("devstral")
@@ -246,6 +259,24 @@ functions, write exactly: {begin_all}{begin}function{sep}<function-name>\n```jso
             end = DS_CALL_END,
             end_all = DS_CALLS_END,
         ),
+        ToolFormat::DeepSeekDsml => format!(
+            "## Tools\n\nYou have access to a set of tools to help answer the user's question. \
+You can invoke tools by writing a \"{open}\" block like the following:\n\n\
+{open}\n{inv} name=\"$TOOL_NAME\">\n\
+{param} name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE{param_close}\n\
+...\n{inv_close}\n{close}\n\n\
+String parameters should be specified as is and set `string=\"true\"`. For all other types \
+(numbers, booleans, arrays, objects), pass the value as JSON and set `string=\"false\"`.\n\n\
+### Available Tool Schemas\n\n{tools}\n\n\
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.",
+            tools = tools_as_json_lines(tools),
+            open = DSML_CALLS_OPEN,
+            close = DSML_CALLS_CLOSE,
+            inv = DSML_INVOKE_OPEN,
+            inv_close = DSML_INVOKE_CLOSE,
+            param = DSML_PARAM_OPEN,
+            param_close = DSML_PARAM_CLOSE,
+        ),
     }
 }
 
@@ -289,7 +320,33 @@ fn render_assistant_tool_calls(format: ToolFormat, calls: &[ToolCall]) -> String
                     "{DS_CALLS_BEGIN}{DS_CALL_BEGIN}function{DS_SEP}{name}\n```json\n{args}\n```{DS_CALL_END}{DS_CALLS_END}\n"
                 ));
             }
+            ToolFormat::DeepSeekDsml => {
+                out.push_str(&format!(
+                    "{DSML_CALLS_OPEN}\n{DSML_INVOKE_OPEN} name=\"{name}\">\n{params}{DSML_INVOKE_CLOSE}\n{DSML_CALLS_CLOSE}\n",
+                    params = dsml_params(args),
+                ));
+            }
         }
+    }
+    out
+}
+
+/// One argument object rendered as DSML parameter entries: a JSON string goes back as it is with
+/// `string="true"`; any other value goes back as JSON with `string="false"`, which is how the
+/// parser tells the two apart.
+fn dsml_params(args_json: &str) -> String {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(args_json) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for (k, v) in &map {
+        let (is_str, val) = match v {
+            Value::String(s) => ("true", s.clone()),
+            other => ("false", other.to_string()),
+        };
+        out.push_str(&format!(
+            "{DSML_PARAM_OPEN} name=\"{k}\" string=\"{is_str}\">{val}{DSML_PARAM_CLOSE}\n"
+        ));
     }
     out
 }
@@ -307,6 +364,8 @@ fn render_tool_result(format: ToolFormat, content: &str) -> String {
             )
         }
         ToolFormat::DeepSeek => format!("<｜tool▁output▁begin｜>{content}<｜tool▁output▁end｜>"),
+        // V4.1 has no standalone tool role: a result is a tool_result block inside the user turn.
+        ToolFormat::DeepSeekDsml => format!("<tool_result>\n{content}\n</tool_result>"),
     }
 }
 
@@ -464,8 +523,18 @@ fn parse_tool_calls_native(format: ToolFormat, raw: &str) -> ToolParseResult {
         ToolFormat::Llama3 => parse_llama3(raw),
         ToolFormat::Harmony => parse_harmony(raw),
         ToolFormat::DeepSeek => parse_deepseek(raw),
+        ToolFormat::DeepSeekDsml => parse_deepseek_dsml(raw),
     }
 }
+
+/// The DeepSeek V4.1 tool-call markup, whose tag names carry a leading space.
+const DSML_TOKEN: &str = "｜DSML｜";
+const DSML_CALLS_OPEN: &str = "<｜DSML｜ calls>";
+const DSML_CALLS_CLOSE: &str = "</｜DSML｜ calls>";
+const DSML_INVOKE_OPEN: &str = "<｜DSML｜ invoke";
+const DSML_INVOKE_CLOSE: &str = "</｜DSML｜ invoke>";
+const DSML_PARAM_OPEN: &str = "<｜DSML｜ parameter";
+const DSML_PARAM_CLOSE: &str = "</｜DSML｜ parameter>";
 
 const DS_CALLS_BEGIN: &str = "<｜tool▁calls▁begin｜>";
 const DS_CALLS_END: &str = "<｜tool▁calls▁end｜>";
@@ -559,6 +628,90 @@ fn parse_deepseek(raw: &str) -> ToolParseResult {
             if !name.is_empty() {
                 calls.push(make_call(name, &call_arguments(args)));
             }
+        }
+        rest = &rest[next.min(rest.len())..];
+    }
+    ToolParseResult {
+        content: content.trim().to_string(),
+        calls,
+    }
+}
+
+/// The value of `key="..."` in the header of a DSML tag, searched only up to the tag's `>` so
+/// a value that itself carries `name="..."` is never mistaken for the tag's own attribute.
+fn dsml_attr(header: &str, key: &str) -> Option<String> {
+    let pat = format!("{key}=\"");
+    let i = header.find(&pat)? + pat.len();
+    let j = header[i..].find('"')?;
+    Some(header[i..i + j].to_string())
+}
+
+/// Parse a DeepSeek V4.1 `<｜DSML｜ calls>` block: each `<｜DSML｜ invoke name="NAME">` becomes a
+/// call whose arguments are its `<｜DSML｜ parameter>` entries - a `string="true"` value taken as
+/// a string, any other parsed as JSON. Text before the block and after its close is the content.
+fn parse_deepseek_dsml(raw: &str) -> ToolParseResult {
+    let Some(open) = raw.find(DSML_CALLS_OPEN) else {
+        return ToolParseResult {
+            content: raw.trim().to_string(),
+            calls: Vec::new(),
+        };
+    };
+    let mut content = raw[..open].to_string();
+    let body_start = open + DSML_CALLS_OPEN.len();
+    let (body, after) = match raw[body_start..].find(DSML_CALLS_CLOSE) {
+        Some(e) => (
+            &raw[body_start..body_start + e],
+            &raw[body_start + e + DSML_CALLS_CLOSE.len()..],
+        ),
+        None => (&raw[body_start..], ""),
+    };
+    content.push_str(after);
+
+    let mut calls = Vec::new();
+    let mut rest = body;
+    while let Some(inv) = rest.find(DSML_INVOKE_OPEN) {
+        let after_inv = &rest[inv + DSML_INVOKE_OPEN.len()..];
+        let head_end = after_inv.find('>').unwrap_or(after_inv.len());
+        let name = dsml_attr(&after_inv[..head_end], "name").unwrap_or_default();
+        let (inv_body, next) = match after_inv.find(DSML_INVOKE_CLOSE) {
+            Some(e) => (
+                &after_inv[..e],
+                inv + DSML_INVOKE_OPEN.len() + e + DSML_INVOKE_CLOSE.len(),
+            ),
+            None => (after_inv, rest.len()),
+        };
+
+        let mut args = serde_json::Map::new();
+        let mut prest = inv_body;
+        while let Some(po) = prest.find(DSML_PARAM_OPEN) {
+            let after_po = &prest[po + DSML_PARAM_OPEN.len()..];
+            let Some(gt) = after_po.find('>') else { break };
+            let header = &after_po[..gt];
+            let pname = dsml_attr(header, "name").unwrap_or_default();
+            let is_string = dsml_attr(header, "string")
+                .map(|s| s == "true")
+                .unwrap_or(true);
+            let val_start = gt + 1;
+            let (value, pnext) = match after_po[val_start..].find(DSML_PARAM_CLOSE) {
+                Some(e) => (
+                    &after_po[val_start..val_start + e],
+                    po + DSML_PARAM_OPEN.len() + val_start + e + DSML_PARAM_CLOSE.len(),
+                ),
+                None => (&after_po[val_start..], prest.len()),
+            };
+            if !pname.is_empty() {
+                let v = if is_string {
+                    Value::String(value.to_string())
+                } else {
+                    serde_json::from_str(value.trim())
+                        .unwrap_or_else(|_| Value::String(value.to_string()))
+                };
+                args.insert(pname, v);
+            }
+            prest = &prest[pnext.min(prest.len())..];
+        }
+        if !name.is_empty() {
+            calls.push(make_call(&name, &Value::Object(args)));
         }
         rest = &rest[next.min(rest.len())..];
     }
@@ -1506,5 +1659,31 @@ mod tests {
             detect_tool_format(None, "deepseek-r1:70b"),
             ToolFormat::DeepSeek
         );
+    }
+
+    #[test]
+    fn parse_deepseek_v41_dsml_call() {
+        // V4.1 routes to DSML; V3/R1 stays on the older markers.
+        assert_eq!(
+            detect_tool_format(None, "deepseek-v4.1-flash:iq2-q6attn"),
+            ToolFormat::DeepSeekDsml
+        );
+        let raw = "I'll search.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search\">\n\
+<｜DSML｜ parameter name=\"query\" string=\"true\">weather in Paris</｜DSML｜ parameter>\n\
+<｜DSML｜ parameter name=\"limit\" string=\"false\">3</｜DSML｜ parameter>\n\
+</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let r = parse_tool_calls(ToolFormat::DeepSeekDsml, raw);
+        assert_eq!(r.content, "I'll search.");
+        assert_eq!(r.calls.len(), 1);
+        let f = r.calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "search");
+        let args: serde_json::Value =
+            serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
+        // A string parameter stays a string; a non-string parameter is real JSON.
+        assert_eq!(args["query"], "weather in Paris");
+        assert_eq!(args["limit"], 3);
+        // The tools prompt shows the model the DSML block to emit.
+        let p = build_tool_system_prompt_base(ToolFormat::DeepSeekDsml, &[]);
+        assert!(p.contains("<｜DSML｜ calls>"));
     }
 }
