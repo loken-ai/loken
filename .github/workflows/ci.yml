@@ -51,6 +51,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+      # The markdown pages link to each other, to headings and to files in the tree;
+      # rustdoc sees none of it.
+      - name: Documentation links
+        run: python3 scripts/check_docs.py
+
   native:
     name: host build, native SIMD
     runs-on: ubuntu-latest

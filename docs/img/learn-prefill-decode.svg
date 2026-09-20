@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="330" viewBox="0 0 900 330" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<style>
+.b{fill:#f6f8fa;stroke:#8c959f;stroke-width:1.2}
+.c{fill:#ddf4ff;stroke:#0969da;stroke-width:1.2}
+.w{fill:#e7e7ea;stroke:#6e7781;stroke-width:1.2}
+.t{fill:#24292f;font-size:13px}
+.s{fill:#57606a;font-size:11px}
+.h{fill:#57606a;font-size:11px;letter-spacing:.06em}
+.a{stroke:#57606a;stroke-width:1.2;fill:none;marker-end:url(#m)}
+@media (prefers-color-scheme:dark){
+.b{fill:#161b22;stroke:#6e7681}.c{fill:#0c2d6b;stroke:#58a6ff}.w{fill:#21262d;stroke:#8b949e}
+.t{fill:#e6edf3}.s,.h{fill:#8b949e}.a{stroke:#8b949e}}
+</style>
+<defs><marker id="m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#57606a"/></marker></defs>
+<text class="h" x="20" y="24">PREFILL: ONE PASS FOR N TOKENS</text>
+<text class="h" x="470" y="24">DECODE: ONE PASS PER TOKEN</text>
+
+<rect class="w" x="20" y="50" width="120" height="180" rx="6"/>
+<text class="t" x="80" y="140" text-anchor="middle">weights</text>
+<text class="s" x="80" y="158" text-anchor="middle">read once</text>
+
+<line class="a" x1="140" y1="140" x2="178" y2="140"/>
+
+<rect class="c" x="180" y="50" width="26" height="180" rx="3"/>
+<rect class="c" x="210" y="50" width="26" height="180" rx="3"/>
+<rect class="c" x="240" y="50" width="26" height="180" rx="3"/>
+<rect class="c" x="270" y="50" width="26" height="180" rx="3"/>
+<rect class="c" x="300" y="50" width="26" height="180" rx="3"/>
+<rect class="c" x="330" y="50" width="26" height="180" rx="3"/>
+<rect class="c" x="360" y="50" width="26" height="180" rx="3"/>
+<rect class="c" x="390" y="50" width="26" height="180" rx="3"/>
+<text class="s" x="298" y="250" text-anchor="middle">n prompt tokens, one matrix product</text>
+<text class="s" x="298" y="266" text-anchor="middle">arithmetic per byte of weight: high</text>
+<text class="s" x="298" y="282" text-anchor="middle">bound by compute, plus an n^2 attention term</text>
+
+<rect class="w" x="470" y="50" width="120" height="180" rx="6"/>
+<text class="t" x="530" y="140" text-anchor="middle">weights</text>
+<text class="s" x="530" y="158" text-anchor="middle">read again</text>
+<line class="a" x1="590" y1="140" x2="628" y2="140"/>
+<rect class="c" x="630" y="50" width="26" height="180" rx="3"/>
+<text class="s" x="643" y="250" text-anchor="middle">1</text>
+
+<rect class="w" x="680" y="50" width="120" height="180" rx="6" opacity="0.7"/>
+<text class="t" x="740" y="140" text-anchor="middle" opacity="0.7">weights</text>
+<text class="s" x="740" y="158" text-anchor="middle" opacity="0.7">read again</text>
+<line class="a" x1="800" y1="140" x2="838" y2="140"/>
+<rect class="c" x="840" y="50" width="26" height="180" rx="3"/>
+<text class="s" x="853" y="250" text-anchor="middle">2</text>
+<text class="s" x="880" y="140">...</text>
+
+<text class="s" x="680" y="266" text-anchor="middle">every weight byte crosses the bus for one token</text>
+<text class="s" x="680" y="282" text-anchor="middle">bound by bandwidth: tok/s is bytes/s over model bytes</text>
+
+<text class="s" x="20" y="312">The same weights, the same layer code; what changes is how many tokens share one read of them. Speculative decoding (lesson 8) is a way to give decode several tokens per read.</text>
+</svg>

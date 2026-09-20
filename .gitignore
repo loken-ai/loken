@@ -64,6 +64,11 @@ scripts/eagle/longctx.txt
 scripts/oracle/gguf_quant_oracle
 scripts/oracle/*.o
 
+# The DeepSeek V4.1 attention parity vectors, dumped from the reference on CPU by the harness in
+# notes/deepseek-oracle. The harness needs torch and the reference weights and stays out of the
+# tree; these vectors ARE committed so the parity test runs without them.
+!tests/vectors/*.safetensors
+
 # Editor and tooling state.
 *~
 *.swp

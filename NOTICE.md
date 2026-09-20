@@ -28,7 +28,9 @@ Two caveats. A snippet scanner sees reformatted copies our line-for-line measure
 larger of the two figures is what is recorded. And the largest range left in `mmq_gguf.cuh` is
 the GGUF k-quant bit specification - masks, shifts and strides any correct reader reproduces  - 
 so two restructurings left the arithmetic identical and the share slightly higher. Convergent
-design over a published format, not residual copying.
+design over a published format, not residual copying. The IQ2_XXS row is the same case in one
+file: every matched line is the format's codebook - the point grid, the sign patterns and the
+mask a reader of that format holds byte for byte - and the dequantiser around them is ours.
 
 **Chain of title.** The `cuda/mmq_gguf/` and `cuda/moe/` kernels reached this tree through
 candle, whose own copies are llama.cpp's - candle matches `ggml/src/ggml-cuda` at 100%, 94%, 63%
@@ -41,6 +43,7 @@ threshold that remain ports carry their attribution inline.
 |------|-------|-------|--------------------|---------|
 | `cuda/moe/gated_delta_net.cu` | 13% | 5 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) `ggml/src/ggml-cuda/gated_delta_net.cu` | MIT |
 | `cuda/mmq_gguf/mmq_gguf.cuh` | 58% | - | [ggerganov/ggml](https://github.com/ggerganov/ggml) `ggml/src/ggml-cuda/mmq.cuh` | MIT |
+| `src/tensor/quant_cpu/format/iq2_xxs.rs` | 53% | 64 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) `ggml/src/ggml-common.h` | MIT |
 
 Model *weights* are not distributed with this repository. Downloading and using any model is
 subject to that model's own license and terms of use. The references each model

@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="330" viewBox="0 0 900 330" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<style>
+.b{fill:#f6f8fa;stroke:#8c959f;stroke-width:1.2}
+.c{fill:#ddf4ff;stroke:#0969da;stroke-width:1.2}
+.g{fill:#dafbe1;stroke:#1a7f37;stroke-width:1.2}
+.y{fill:#fff8c5;stroke:#9a6700;stroke-width:1.2}
+.t{fill:#24292f;font-size:13px}
+.s{fill:#57606a;font-size:11px}
+.h{fill:#57606a;font-size:11px;letter-spacing:.06em}
+.a{stroke:#57606a;stroke-width:1.2;fill:none;marker-end:url(#m)}
+.p{stroke:#57606a;stroke-width:1.2;fill:none}
+@media (prefers-color-scheme:dark){
+.b{fill:#161b22;stroke:#6e7681}.c{fill:#0c2d6b;stroke:#58a6ff}.g{fill:#0f3a1f;stroke:#3fb950}.y{fill:#3b2e00;stroke:#d4a72c}
+.t{fill:#e6edf3}.s,.h{fill:#8b949e}.a,.p{stroke:#8b949e}}
+</style>
+<defs><marker id="m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#57606a"/></marker></defs>
+<text class="h" x="20" y="24">ONE DECODER LAYER: WHAT IT READS, WHAT IT KEEPS</text>
+
+<text class="t" x="20" y="120">x in</text>
+<text class="s" x="20" y="138">one vector</text>
+<text class="s" x="20" y="152">per token</text>
+
+<line class="p" x1="70" y1="115" x2="110" y2="115"/>
+<rect class="b" x="110" y="95" width="70" height="40" rx="6"/>
+<text class="t" x="145" y="120" text-anchor="middle">norm</text>
+<line class="a" x1="180" y1="115" x2="218" y2="115"/>
+
+<rect class="c" x="220" y="70" width="200" height="90" rx="6"/>
+<text class="t" x="320" y="92" text-anchor="middle">attention</text>
+<text class="s" x="320" y="110" text-anchor="middle">q k v = x W_q W_k W_v</text>
+<text class="s" x="320" y="126" text-anchor="middle">rope(q), rope(k)</text>
+<text class="s" x="320" y="142" text-anchor="middle">softmax(q . K) V, then W_o</text>
+
+<rect class="y" x="250" y="190" width="140" height="44" rx="6"/>
+<text class="t" x="320" y="209" text-anchor="middle">KV cache</text>
+<text class="s" x="320" y="225" text-anchor="middle">k, v of every past token</text>
+<line class="a" x1="300" y1="160" x2="300" y2="188"/>
+<line class="a" x1="340" y1="188" x2="340" y2="162"/>
+<text class="s" x="240" y="180" text-anchor="end">write k, v</text>
+<text class="s" x="400" y="180">read all K, V</text>
+
+<line class="a" x1="420" y1="115" x2="458" y2="115"/>
+<circle class="b" cx="470" cy="115" r="12"/>
+<text class="t" x="470" y="120" text-anchor="middle">+</text>
+<path class="p" d="M90,115 L90,40 L470,40 L470,103"/>
+<text class="s" x="280" y="34" text-anchor="middle">residual: x is added back, the layer only writes a correction</text>
+
+<line class="a" x1="482" y1="115" x2="518" y2="115"/>
+<rect class="b" x="520" y="95" width="70" height="40" rx="6"/>
+<text class="t" x="555" y="120" text-anchor="middle">norm</text>
+<line class="a" x1="590" y1="115" x2="628" y2="115"/>
+
+<rect class="g" x="630" y="70" width="150" height="90" rx="6"/>
+<text class="t" x="705" y="92" text-anchor="middle">feed-forward</text>
+<text class="s" x="705" y="110" text-anchor="middle">silu(x W_gate) * x W_up</text>
+<text class="s" x="705" y="126" text-anchor="middle">then W_down</text>
+<text class="s" x="705" y="142" text-anchor="middle">most of the bytes</text>
+
+<rect class="g" x="630" y="190" width="150" height="70" rx="6"/>
+<text class="t" x="705" y="210" text-anchor="middle">or a mixture</text>
+<text class="s" x="705" y="227" text-anchor="middle">router picks top-k experts</text>
+<text class="s" x="705" y="243" text-anchor="middle">only those are read</text>
+<line class="p" x1="705" y1="160" x2="705" y2="188" stroke-dasharray="4 3"/>
+
+<line class="a" x1="780" y1="115" x2="818" y2="115"/>
+<circle class="b" cx="830" cy="115" r="12"/>
+<text class="t" x="830" y="120" text-anchor="middle">+</text>
+<path class="p" d="M500,115 L500,52 L830,52 L830,103"/>
+<line class="a" x1="842" y1="115" x2="878" y2="115"/>
+<text class="t" x="852" y="140">x out</text>
+
+<text class="s" x="20" y="300">Weights are read once per pass whatever the number of tokens in it; the KV cache grows by one row per token.</text>
+<text class="s" x="20" y="318">Forty of these in a row, then a final norm and the output projection to one logit per vocabulary entry.</text>
+</svg>

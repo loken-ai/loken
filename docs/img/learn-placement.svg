@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="340" viewBox="0 0 900 340" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<style>
+.b{fill:#f6f8fa;stroke:#8c959f;stroke-width:1.2}
+.c{fill:#ddf4ff;stroke:#0969da;stroke-width:1.2}
+.g{fill:#dafbe1;stroke:#1a7f37;stroke-width:1.2}
+.w{fill:#e7e7ea;stroke:#6e7781;stroke-width:1.2}
+.r{fill:#ffebe9;stroke:#cf222e;stroke-width:1.2}
+.t{fill:#24292f;font-size:13px}
+.s{fill:#57606a;font-size:11px}
+.h{fill:#57606a;font-size:11px;letter-spacing:.06em}
+@media (prefers-color-scheme:dark){
+.b{fill:#161b22;stroke:#6e7681}.c{fill:#0c2d6b;stroke:#58a6ff}.g{fill:#0f3a1f;stroke:#3fb950}.w{fill:#21262d;stroke:#8b949e}.r{fill:#4a1216;stroke:#ff7b72}
+.t{fill:#e6edf3}.s,.h{fill:#8b949e}}
+</style>
+<text class="h" x="20" y="24">A MIXTURE TOO LARGE FOR THE CARDS: TWO WAYS TO SPILL</text>
+
+<text class="t" x="20" y="60">layer whole</text>
+<text class="s" x="20" y="76">the old rule</text>
+<rect class="c" x="150" y="44" width="34" height="40" rx="4"/>
+<rect class="c" x="188" y="44" width="34" height="40" rx="4"/>
+<rect class="c" x="226" y="44" width="34" height="40" rx="4"/>
+<rect class="c" x="264" y="44" width="34" height="40" rx="4"/>
+<rect class="c" x="302" y="44" width="34" height="40" rx="4"/>
+<rect class="r" x="340" y="44" width="34" height="40" rx="4"/>
+<rect class="r" x="378" y="44" width="34" height="40" rx="4"/>
+<rect class="r" x="416" y="44" width="34" height="40" rx="4"/>
+<text class="s" x="243" y="102" text-anchor="middle">card 0, card 1</text>
+<text class="s" x="395" y="102" text-anchor="middle">host: attention AND experts</text>
+<text class="s" x="470" y="66">every token runs three layers' attention on the host,</text>
+<text class="s" x="470" y="82">for the sake of expert bytes read a few at a time</text>
+
+<text class="t" x="20" y="160">experts only</text>
+<text class="s" x="20" y="176">the rule since</text>
+<rect class="c" x="150" y="130" width="34" height="18" rx="3"/>
+<rect class="c" x="188" y="130" width="34" height="18" rx="3"/>
+<rect class="c" x="226" y="130" width="34" height="18" rx="3"/>
+<rect class="c" x="264" y="130" width="34" height="18" rx="3"/>
+<rect class="c" x="302" y="130" width="34" height="18" rx="3"/>
+<rect class="c" x="340" y="130" width="34" height="18" rx="3"/>
+<rect class="c" x="378" y="130" width="34" height="18" rx="3"/>
+<rect class="c" x="416" y="130" width="34" height="18" rx="3"/>
+<rect class="g" x="150" y="152" width="34" height="32" rx="3"/>
+<rect class="g" x="188" y="152" width="34" height="32" rx="3"/>
+<rect class="g" x="226" y="152" width="34" height="32" rx="3"/>
+<rect class="g" x="264" y="152" width="34" height="32" rx="3"/>
+<rect class="r" x="302" y="152" width="34" height="32" rx="3"/>
+<rect class="r" x="340" y="152" width="34" height="32" rx="3"/>
+<rect class="r" x="378" y="152" width="34" height="32" rx="3"/>
+<rect class="r" x="416" y="152" width="34" height="32" rx="3"/>
+<text class="s" x="140" y="143" text-anchor="end">attention</text>
+<text class="s" x="140" y="172" text-anchor="end">experts</text>
+<text class="s" x="300" y="202" text-anchor="middle">attention of every layer on the cards; experts spill, and only the routed ones are read</text>
+<text class="s" x="470" y="160">experts are 97% of a mixture's bytes</text>
+<text class="s" x="470" y="176">and a token touches a few of them</text>
+
+<rect class="b" x="20" y="230" width="860" height="90" rx="6"/>
+<text class="t" x="34" y="252">how much a request needs beyond the weights: run the forward on a device that allocates nothing</text>
+<text class="s" x="34" y="272">The dry device keeps a running total and a high-water mark; buffer reuse comes for free because a dropped tensor lowers the total.</text>
+<text class="s" x="34" y="290">The heap model replays the allocator on top of it, because a pool's reservation depends on the order of events, not on the peak.</text>
+<text class="s" x="34" y="308">Where the card is read: one probe, pools trimmed first, so freed-but-pooled memory cannot read as used.</text>
+</svg>

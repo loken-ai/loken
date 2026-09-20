@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/loken-ai/.github/main/brand/png/lockup.png" alt="LOKEN - Local . Multimodal . Green" width="420">
+  <img src="https://raw.githubusercontent.com/loken-ai/.github/main/brand/png/banner.png" alt="LOKEN" width="680">
 </p>
 
 # loken
@@ -94,6 +94,7 @@ listens on anything but localhost: `require_auth`, `api_keys` and `rate_limit_pe
 [`docs/README.md`](docs/README.md) says what to read in which order. The short list:
 
 - [`docs/guides/`](docs/guides/) - one page per task, with the configuration and one request
+- [`docs/learn/`](docs/learn/) - the fundamentals of inference in ten lessons, as experimented here
 - [`docs/MODELS.md`](docs/MODELS.md) - the families served and how a request names them
 - [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) - every key of `config.toml` and its default
 - [`docs/API.md`](docs/API.md) - every route on the three surfaces

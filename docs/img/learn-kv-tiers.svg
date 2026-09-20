@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="300" viewBox="0 0 900 300" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
+<style>
+.b{fill:#f6f8fa;stroke:#8c959f;stroke-width:1.2}
+.y{fill:#fff8c5;stroke:#9a6700;stroke-width:1.2}
+.c{fill:#ddf4ff;stroke:#0969da;stroke-width:1.2}
+.t{fill:#24292f;font-size:13px}
+.s{fill:#57606a;font-size:11px}
+.h{fill:#57606a;font-size:11px;letter-spacing:.06em}
+.a{stroke:#57606a;stroke-width:1.2;fill:none;marker-end:url(#m)}
+.a2{stroke:#57606a;stroke-width:1.2;fill:none;marker-end:url(#m);marker-start:url(#m2)}
+@media (prefers-color-scheme:dark){
+.b{fill:#161b22;stroke:#6e7681}.y{fill:#3b2e00;stroke:#d4a72c}.c{fill:#0c2d6b;stroke:#58a6ff}
+.t{fill:#e6edf3}.s,.h{fill:#8b949e}.a,.a2{stroke:#8b949e}}
+</style>
+<defs>
+<marker id="m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#57606a"/></marker>
+<marker id="m2" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="#57606a"/></marker>
+</defs>
+<text class="h" x="20" y="24">WHERE A CONVERSATION'S KV LIVES</text>
+
+<rect class="y" x="20" y="50" width="200" height="90" rx="6"/>
+<text class="t" x="120" y="74" text-anchor="middle">resident KV</text>
+<text class="s" x="120" y="94" text-anchor="middle">on the cards, one per model</text>
+<text class="s" x="120" y="110" text-anchor="middle">F16, Q8 or Q4 per token</text>
+<text class="s" x="120" y="126" text-anchor="middle">the conversation being served</text>
+
+<line class="a2" x1="220" y1="95" x2="258" y2="95"/>
+
+<rect class="b" x="260" y="50" width="200" height="90" rx="6"/>
+<text class="t" x="360" y="74" text-anchor="middle">snapshots</text>
+<text class="s" x="360" y="94" text-anchor="middle">kv_snapshots copies, keyed by tokens</text>
+<text class="s" x="360" y="110" text-anchor="middle">where the layers live, within a budget</text>
+<text class="s" x="360" y="126" text-anchor="middle">other conversations, this run</text>
+
+<line class="a2" x1="460" y1="95" x2="498" y2="95"/>
+
+<rect class="b" x="500" y="50" width="200" height="90" rx="6"/>
+<text class="t" x="600" y="74" text-anchor="middle">disk blocks</text>
+<text class="s" x="600" y="94" text-anchor="middle">kv_disk_dir, hash chained over tokens</text>
+<text class="s" x="600" y="110" text-anchor="middle">a shared prefix shares its blocks</text>
+<text class="s" x="600" y="126" text-anchor="middle">survives a restart</text>
+
+<line class="a2" x1="700" y1="95" x2="738" y2="95"/>
+
+<rect class="c" x="740" y="50" width="140" height="90" rx="6"/>
+<text class="t" x="810" y="74" text-anchor="middle">a peer</text>
+<text class="s" x="810" y="94" text-anchor="middle">the node that holds</text>
+<text class="s" x="810" y="110" text-anchor="middle">the prefix prices its</text>
+<text class="s" x="810" y="126" text-anchor="middle">request lower</text>
+
+<text class="t" x="20" y="185">A request prefills only what none of these hold.</text>
+<text class="s" x="20" y="208">prompt_eval_count says how many tokens were computed; a served prefix does not appear in it.</text>
+<text class="s" x="20" y="228">A second conversation on the same model evicts the resident KV: without a snapshot, the next turn of the first one prefills from zero.</text>
+<text class="s" x="20" y="248">A window too small for the conversation is slower than a large one: compaction rewrites the history, and a rewritten prefix matches nothing.</text>
+</svg>
