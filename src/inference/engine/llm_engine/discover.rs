@@ -214,6 +214,12 @@ impl LlmEngine {
             if let Some(dir) = resolve_awq_repo(model_id, &roots) {
                 return Some(PathBuf::from(dir));
             }
+            if let Some(file) = resolve_hub_gguf(model_id, &roots) {
+                return Some(file);
+            }
+            if let Some(dir) = resolve_hub_checkpoint(model_id, &roots) {
+                return Some(dir);
+            }
         }
         // Try to find GGUF file in models directory
         if let Some(models_dir) = &self.config.models_dir {
@@ -402,5 +408,163 @@ impl LlmEngine {
         }
 
         None
+    }
+}
+
+/// The GGUF of a hub repository id `org/name[:selector]` inside the cache roots: any snapshot
+/// of the repository, at any depth, since a repository keeps each quantisation in its own
+/// directory. The selector, when given, must appear in the path below the snapshot; a split
+/// model resolves to its first part. Several candidates left with no selector to tell them
+/// apart resolve to none, listed in the log, rather than to an arbitrary one.
+pub(super) fn resolve_hub_gguf(model_id: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+    let (base, selector) = match model_id.split_once(':') {
+        Some((b, s)) => (b, Some(s)),
+        None => (model_id, None),
+    };
+    let (org, name) = base.split_once('/')?;
+    if org.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let hub = format!("models--{org}--{name}");
+    let mut found: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let snapshots = root.join(&hub).join("snapshots");
+        let Ok(snaps) = std::fs::read_dir(&snapshots) else {
+            continue;
+        };
+        for snap in snaps.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+            let mut stack = vec![snap.clone()];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for p in entries.flatten().map(|e| e.path()) {
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p.extension().is_some_and(|e| e == "gguf") {
+                        let rel = p
+                            .strip_prefix(&snap)
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .to_string();
+                        let selected = selector.is_none_or(|s| rel.contains(s));
+                        if selected && split_part(&p).is_none_or(|n| n == 1) {
+                            found.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    match found.as_slice() {
+        [one] => Some(one.clone()),
+        [] => None,
+        many => {
+            warn!(
+                "{model_id}: {} GGUF files in the cache; name one with {base}:<selector>: {}",
+                many.len(),
+                many.iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            None
+        }
+    }
+}
+
+/// The snapshot directory of a hub repository id whose checkpoint is a set of safetensors shards
+/// with the model's own `config.json`: the loader that serves it is chosen from that config.
+pub(super) fn resolve_hub_checkpoint(model_id: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+    let (org, name) = model_id.split_once('/')?;
+    if org.is_empty() || name.is_empty() || name.contains('/') || name.contains(':') {
+        return None;
+    }
+    let hub = format!("models--{org}--{name}");
+    for root in roots {
+        let Ok(snaps) = std::fs::read_dir(root.join(&hub).join("snapshots")) else {
+            continue;
+        };
+        let mut dirs: Vec<PathBuf> = snaps
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        for snap in dirs {
+            let has_shards = std::fs::read_dir(&snap)
+                .map(|rd| {
+                    rd.flatten()
+                        .any(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+                })
+                .unwrap_or(false);
+            if has_shards && snap.join("config.json").is_file() {
+                return Some(snap);
+            }
+        }
+    }
+    None
+}
+
+/// The part number of a split GGUF named `<stem>-NNNNN-of-MMMMM.gguf`, `None` for a whole file.
+fn split_part(path: &std::path::Path) -> Option<u32> {
+    let stem = path.file_stem()?.to_str()?;
+    let (head, tail) = stem.rsplit_once("-of-")?;
+    if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (_, part) = head.rsplit_once('-')?;
+    if part.len() != tail.len() {
+        return None;
+    }
+    part.parse().ok()
+}
+
+#[cfg(test)]
+mod hub_gguf_tests {
+    use super::*;
+
+    fn touch(p: &std::path::Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"").unwrap();
+    }
+
+    /// A whole file resolves; a split resolves to its first part; two quantisations need the
+    /// selector; a name with no slash is not a repository id.
+    #[test]
+    fn resolves_whole_split_and_selected_files() {
+        let root = std::env::temp_dir().join(format!("loken-hub-gguf-{}", std::process::id()));
+        let snap = root.join("models--org--one").join("snapshots").join("abc");
+        touch(&snap.join("one-q4.gguf"));
+        let snap2 = root.join("models--org--two").join("snapshots").join("def");
+        touch(&snap2.join("Q2_K").join("two-Q2_K-00001-of-00003.gguf"));
+        touch(&snap2.join("Q2_K").join("two-Q2_K-00002-of-00003.gguf"));
+        touch(&snap2.join("Q2_K").join("two-Q2_K-00003-of-00003.gguf"));
+        touch(&snap2.join("Q4_K").join("two-Q4_K.gguf"));
+        let roots = vec![root.clone()];
+
+        assert_eq!(
+            resolve_hub_gguf("org/one", &roots),
+            Some(snap.join("one-q4.gguf"))
+        );
+        assert_eq!(resolve_hub_gguf("org/two", &roots), None);
+        assert_eq!(
+            resolve_hub_gguf("org/two:Q2_K", &roots),
+            Some(snap2.join("Q2_K").join("two-Q2_K-00001-of-00003.gguf"))
+        );
+        assert_eq!(
+            resolve_hub_gguf("org/two:Q4_K", &roots),
+            Some(snap2.join("Q4_K").join("two-Q4_K.gguf"))
+        );
+        assert_eq!(resolve_hub_gguf("org/three", &roots), None);
+        assert_eq!(resolve_hub_gguf("one", &roots), None);
+        assert_eq!(
+            split_part(std::path::Path::new("a-00002-of-00007.gguf")),
+            Some(2)
+        );
+        assert_eq!(split_part(std::path::Path::new("a-of-b.gguf")), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

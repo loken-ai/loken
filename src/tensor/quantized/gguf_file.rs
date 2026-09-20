@@ -489,6 +489,8 @@ impl TensorInfo {
 pub struct MappedGguf {
     pub content: Content,
     pub mmap: std::sync::Arc<memmap2::Mmap>,
+    /// The mapped file: what page-cache advice about its bytes is addressed to.
+    pub file: std::sync::Arc<std::fs::File>,
 }
 
 impl std::ops::Deref for MappedGguf {
@@ -510,24 +512,55 @@ impl MappedGguf {
     }
 }
 
+/// Ask the kernel to read a set of mappings in ahead of use - only when the whole set fits in the
+/// memory available now. A model larger than that is served by demand paging: reading it ahead
+/// would stream entire files through the page cache in the background, evicting what the model is
+/// using and competing on the disk with the reads it actually needs. The decision is the set's,
+/// not each file's: every part of a large split model can fit on its own.
+pub fn advise_if_it_fits(maps: &[&memmap2::Mmap]) {
+    let total: u64 = maps.iter().map(|m| m.len() as u64).sum();
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    if total <= sys.available_memory() {
+        for m in maps {
+            let _ = m.advise(memmap2::Advice::WillNeed);
+        }
+    }
+}
+
+fn advise_whole_file_if_it_fits(mmap: &memmap2::Mmap) {
+    advise_if_it_fits(&[mmap]);
+}
+
 /// Open + map + parse in one step, the mapping adopted as the tensor-data owner.
 pub fn open_mapped<P: AsRef<std::path::Path>>(path: P) -> Result<MappedGguf> {
+    let g = open_mapped_unadvised(path)?;
+    advise_whole_file_if_it_fits(&g.mmap);
+    Ok(g)
+}
+
+/// `open_mapped` without read-ahead advice, for one mapping of a set whose advice is decided
+/// for the set as a whole.
+pub fn open_mapped_unadvised<P: AsRef<std::path::Path>>(path: P) -> Result<MappedGguf> {
     let path = path.as_ref();
     let file =
         std::fs::File::open(path).map_err(|e| Error(format!("open {}: {e}", path.display())))?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }
         .map_err(|e| Error(format!("mmap {}: {e}", path.display())))?;
-    let _ = mmap.advise(memmap2::Advice::WillNeed);
     let mmap = std::sync::Arc::new(mmap);
     let content = Content::read_mapped(&mut std::io::Cursor::new(&mmap[..]), mmap.clone())?;
-    Ok(MappedGguf { content, mmap })
+    Ok(MappedGguf {
+        content,
+        mmap,
+        file: std::sync::Arc::new(file),
+    })
 }
 
 /// Parse over a fresh private mapping of `file`, adopting it as the tensor-data
 /// owner - the drop-in upgrade for reader-based sites that hold the File anyway.
 pub fn read_mapped_file(file: &std::fs::File) -> Result<Content> {
     let mmap = unsafe { memmap2::Mmap::map(file) }.map_err(|e| Error(format!("gguf mmap: {e}")))?;
-    let _ = mmap.advise(memmap2::Advice::WillNeed);
+    advise_whole_file_if_it_fits(&mmap);
     let mmap = std::sync::Arc::new(mmap);
     Content::read_mapped(&mut std::io::Cursor::new(&mmap[..]), mmap.clone())
 }

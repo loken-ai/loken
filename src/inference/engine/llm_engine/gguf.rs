@@ -5,6 +5,10 @@
 use super::*;
 
 /// Helper: get string value from GGUF metadata
+/// The metadata key under which a file converted by this engine carries its checkpoint's
+/// `tokenizer.json`, verbatim.
+pub const EMBEDDED_TOKENIZER_KEY: &str = "tokenizer.huggingface.json";
+
 pub(super) fn get_gguf_string(ct: &gguf_file::Content, key: &str) -> Option<String> {
     match ct.metadata.get(key)? {
         gguf_file::Value::String(s) => Some(s.clone()),
@@ -77,6 +81,38 @@ fn synthesise_spm_merges(
         .map(|(_, _, _, l, r)| (l.to_string(), r.to_string()))
         .collect()
 }
+
+/// A special token's id from the tokenizer files beside a model, for a GGUF that carries no
+/// tokenizer metadata: `tokenizer_config.json` names the token under `key`, as a string or an
+/// added-token object, and `tokenizer.json` lists its id among the added tokens. `None` when
+/// either file or the token is absent.
+pub fn sidecar_token_id(model_file: &std::path::Path, key: &str) -> Option<u32> {
+    let dir = model_file.parent()?;
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("tokenizer_config.json")).ok()?)
+            .ok()?;
+    let name = match cfg.get(key)? {
+        serde_json::Value::String(s) => s.clone(),
+        v => v.get("content")?.as_str()?.to_string(),
+    };
+    let tok: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("tokenizer.json")).ok()?).ok()?;
+    tok.get("added_tokens")?
+        .as_array()?
+        .iter()
+        .find(|t| t.get("content").and_then(|c| c.as_str()) == Some(name.as_str()))?
+        .get("id")?
+        .as_u64()
+        .map(|v| v as u32)
+}
+
+/// JOYAI-LLM (DeepSeek V4): the three splits of the model's own tokenizer.json, in its order -
+/// digit runs of up to three, CJK runs, then the letter/punctuation split.
+const JOYAI_RES: [&str; 3] = [
+    r"\p{N}{1,3}",
+    r"[\x{4e00}-\x{9fa5}\x{3040}-\x{309f}\x{30a0}-\x{30ff}]+",
+    r"[!\x22#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+];
 
 pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Tokenizer> {
     use ahash::AHashMap;
@@ -210,6 +246,9 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
         Qwen2,
         Qwen35,
         Tekken,
+        // DeepSeek V4: digit runs of up to three, CJK runs, then the letter/punctuation split,
+        // as three isolating splits in sequence.
+        JoyaiLlm,
         Gpt2Default,
     }
     let pre_id = get_gguf_string(content, "tokenizer.ggml.pre").unwrap_or_default();
@@ -227,6 +266,7 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
         // LLAMA_VOCAB_PRE_TYPE_TEKKEN (Mistral tekken: case-split letter runs,
         // no contraction group, `/` folded into the punctuation run)
         "tekken" => BpePreFamily::Tekken,
+        "joyai-llm" => BpePreFamily::JoyaiLlm,
         _ => BpePreFamily::Gpt2Default,
     };
     // Greedy longest-vocab match: the llama3 pre_type list + tekken.
@@ -335,22 +375,25 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
             // Build a Split(regex, Isolated) -> ByteLevel(no built-in regex)
             // pipeline: the regex owns segmentation, ByteLevel only does the
             // byte->unicode (Ġ) mapping. Mirrors the model's HF tokenizer.json.
-            let split_pipeline = |re: &str| -> AnyResult<PreTokenizerWrapper> {
-                let split = Split::new(
-                    SplitPattern::Regex(re.to_string()),
-                    SplitDelimiterBehavior::Isolated,
-                    /*invert=*/ false,
-                )
-                .map_err(|e| anyhow!("build split pre-tokenizer: {e}"))?;
+            let split_sequence = |res: &[&str]| -> AnyResult<PreTokenizerWrapper> {
+                let mut steps = Vec::with_capacity(res.len() + 1);
+                for re in res {
+                    let split = Split::new(
+                        SplitPattern::Regex(re.to_string()),
+                        SplitDelimiterBehavior::Isolated,
+                        /*invert=*/ false,
+                    )
+                    .map_err(|e| anyhow!("build split pre-tokenizer: {e}"))?;
+                    steps.push(PreTokenizerWrapper::Split(split));
+                }
                 let bl = ByteLevelPre::new(
                     /*add_prefix_space=*/ false, /*trim_offsets=*/ true,
                     /*use_regex=*/ false,
                 );
-                Ok(PreTokenizerWrapper::Sequence(PreSequence::new(vec![
-                    PreTokenizerWrapper::Split(split),
-                    PreTokenizerWrapper::ByteLevel(bl),
-                ])))
+                steps.push(PreTokenizerWrapper::ByteLevel(bl));
+                Ok(PreTokenizerWrapper::Sequence(PreSequence::new(steps)))
             };
+            let split_pipeline = |re: &str| split_sequence(&[re]);
 
             match pre_family {
                 BpePreFamily::Llama3 => {
@@ -372,6 +415,10 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
                     debug!(
                         "🔡 Configured TEKKEN pre-tokenizer (pre='{pre_id}', ignore_merges=true)"
                     );
+                }
+                BpePreFamily::JoyaiLlm => {
+                    tokenizer.with_pre_tokenizer(Some(split_sequence(&JOYAI_RES)?));
+                    debug!("🔡 Configured JOYAI-LLM pre-tokenizer (pre='{pre_id}')");
                 }
                 BpePreFamily::Gpt2Default => {
                     // Unchanged: HF ByteLevel with its built-in GPT-2 regex.
@@ -612,6 +659,44 @@ mod cuda_oom_detector_tests {
         assert!(
             !is_cuda_oom(&"oom is a substring of zoom but not of cool"),
             "false positives on substrings like 'zoom' would trigger spurious fallbacks"
+        );
+    }
+
+    /// The joyai-llm splits compile in the regex engine the tokenizer uses and segment as the
+    /// model's tokenizer.json does (the expected pieces are that tokenizer's own output): digits
+    /// in runs of at most three, CJK runs on their own, a space bound to the punctuation after it.
+    #[test]
+    fn joyai_pre_tokenizer_splits_like_the_source() {
+        use tokenizers::pre_tokenizers::sequence::Sequence as PreSequence;
+        use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+        use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+        use tokenizers::{
+            OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer, SplitDelimiterBehavior,
+        };
+        let steps: Vec<PreTokenizerWrapper> = JOYAI_RES
+            .iter()
+            .map(|re| {
+                PreTokenizerWrapper::Split(
+                    Split::new(
+                        SplitPattern::Regex(re.to_string()),
+                        SplitDelimiterBehavior::Isolated,
+                        false,
+                    )
+                    .expect("joyai split regex compiles"),
+                )
+            })
+            .collect();
+        let pre = PreSequence::new(steps);
+        let mut s = PreTokenizedString::from("In 1999, 東京 -scale x");
+        pre.pre_tokenize(&mut s).unwrap();
+        let pieces: Vec<&str> = s
+            .get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .into_iter()
+            .map(|(p, _, _)| p)
+            .collect();
+        assert_eq!(
+            pieces,
+            vec!["In", " ", "199", "9", ",", " ", "東京", " -", "scale", " x"]
         );
     }
 }
