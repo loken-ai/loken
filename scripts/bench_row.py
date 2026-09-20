@@ -1,20 +1,33 @@
 """Turn bench JSONs into the report's table, aligned, with nothing retyped."""
 import re
-import json, os, pathlib, struct, sys
+import json, os, pathlib, shutil, struct, sys
 
 import subprocess
 def _ollama_version():
     """Ask the binary rather than carry a literal: a table that names the wrong version
     of the engine it measured is worse than one that names none."""
+    binary = os.environ.get("OLLAMA_BIN") or shutil.which("ollama") or "ollama"
     try:
-        out = subprocess.run(["/usr/local/bin/ollama", "--version"],
+        out = subprocess.run([binary, "--version"],
                              capture_output=True, text=True, timeout=10)
         m = re.search(r"([0-9]+\.[0-9]+\.[0-9]+)", out.stdout + out.stderr)
         return "Ollama " + m.group(1) if m else "Ollama"
     except Exception:
         return "Ollama"
 
-VERS = {"ollama": _ollama_version(), "loken": "loken 0.1.0", "vllm": "vLLM 0.22.0"}
+def _vllm_version():
+    """The version installed in the environment the harness serves vLLM from."""
+    venv = os.environ.get("VLLM_VENV", os.path.expanduser("~/vllm"))
+    try:
+        out = subprocess.run([os.path.join(venv, "bin", "python"), "-c",
+                              "import vllm; print(vllm.__version__)"],
+                             capture_output=True, text=True, timeout=60)
+        m = re.search(r"([0-9]+\.[0-9]+\.[0-9]+[0-9a-z.+]*)", out.stdout)
+        return "vLLM " + m.group(1) if m else "vLLM"
+    except Exception:
+        return "vLLM"
+
+VERS = {"ollama": _ollama_version(), "loken": "loken 0.1.0", "vllm": _vllm_version()}
 
 def engine_label(target):
     """The Engine column for a target. A variant of this engine is measured under the label
@@ -260,6 +273,10 @@ def rows(path, mode, device):
             # to travel with the numbers, or the table states a speed for nothing.
             "coh":     r.get("coherence_pass"),
             "preview": r.get("first_response_preview") or "",
+            # An engine that could not take the model at all, or one that took it and kept no
+            # iteration: either way no rate, and the result file carries the reason.
+            "impossible": bool(r.get("load_error")),
+            "failed": not (r.get("iterations") or []) and not r.get("load_error"),
         }
     return out
 
@@ -306,6 +323,14 @@ def cells(merged):
                     p = (min(othere) / v["jreq"] - 1) * 100
                     de = f"**{p:+.1f}%**" if p > 0 else f"{p:+.1f}%"
             b = (lambda x: f"**{x}**") if eng.startswith("loken") else (lambda x: x)
+            if v.get("impossible") or v.get("failed"):
+                # The engine was given the model and could not run it, or ran it and kept no
+                # iteration: the row says which, since a comparison that leaves a cell out reads
+                # as a cell that was not tried.
+                mark = "impossible" if v.get("impossible") else "failed"
+                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng)), " - ", " - ",
+                            " - ", " - ", " - ", " - ", mark, "", v.get("day", "")])
+                continue
             if not any(v[k] is not None for k in ("prefill", "decode", "ntok", "e2e", "jreq")):
                 # Nothing was measured, so there is no row. An all-dash line reads as a cell
                 # that was tried and yielded something unprintable, which is not what it means

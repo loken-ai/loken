@@ -6,17 +6,26 @@ Read in this order.
    its configuration key and its state.
 2. [`guides/`](guides/): one page per task, each with the smallest configuration, one request
    and what to expect.
-3. [`MODELS.md`](MODELS.md): the families served, the stores they are read from, how a request
+3. [`learn/`](learn/): the fundamentals of inference in ten lessons, each with what this
+   tree does about it, what was measured, and one thing to run.
+4. [`MODELS.md`](MODELS.md): the families served, the stores they are read from, how a request
    names them.
-4. [`CONFIGURATION.md`](CONFIGURATION.md): every key of `config.toml` and its default.
-5. [`API.md`](API.md): every route on the three surfaces.
-6. [`BUILDING.md`](BUILDING.md): the toolchains, the builds without CUDA, the daemon's flags,
+5. [`CONFIGURATION.md`](CONFIGURATION.md): every key of `config.toml` and its default.
+6. [`API.md`](API.md): every route on the three surfaces.
+7. [`BUILDING.md`](BUILDING.md): the toolchains, the builds without CUDA, the daemon's flags,
    troubleshooting.
-7. [`STATUS.md`](STATUS.md): what is measured, what is slower, what is written and wired to
+8. [`STATUS.md`](STATUS.md): what is measured, what is slower, what is written and wired to
    nothing. Read it before relying on a feature.
-8. [`BENCHMARKS.md`](BENCHMARKS.md): the measurements and the protocol behind them.
-9. [`CLUSTER.md`](CLUSTER.md): serving from more than one machine.
-10. [`REFERENCES.md`](REFERENCES.md): the papers and implementations this work draws on.
+9. [`BENCHMARKS.md`](BENCHMARKS.md): the measurements and the protocol behind them.
+10. [`CLUSTER.md`](CLUSTER.md): serving from more than one machine.
+11. [`REFERENCES.md`](REFERENCES.md): the papers and implementations this work draws on.
+
+## Learn
+
+| Lesson | Question |
+|---|---|
+| [`learn/README.md`](learn/README.md) | The series: ten lessons, ten minutes each, one exercise per lesson |
+| [`learn/slides.html`](learn/slides.html) | The same series as a deck |
 
 ## Guides
 

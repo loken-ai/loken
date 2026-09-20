@@ -113,6 +113,7 @@ except Exception: print('')" 2>/dev/null)" = "$BINT" ]; then
             deepcoder:14b)           VLLM_SERVE="hf:Quickpanda/deepcoder-14b-preview-awq --name $m";;
             devstral:24b)            VLLM_SERVE="hf:cyankiwi/Devstral-Small-2507-AWQ-4bit --name $m";;
             gpt-oss:20b)             VLLM_SERVE="hf:openai/gpt-oss-20b --name $m";;
+            deepseek-v4.1-flash:*)   VLLM_SERVE="hf:deepseek-ai/DeepSeek-V4.1-Flash --name $m --tp 2";;
             qwen3-coder:30b)         VLLM_SERVE="hf:cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit --name $m --tp 2";;
         esac
     fi

@@ -41,8 +41,15 @@ def latest_run_date():
         if len(c) < 15 or c[0] == "Model" or c[2] != PROMPT or c[3] != MODE:
             continue
         seen.setdefault(c[14][:10], set()).add(clean(c[5]))
-    days = [d for d, engs in seen.items() if "Ollama0.32.6" in engs and "loken0.1.0" in engs]
+    days = [d for d, engs in seen.items()
+            if any(e.startswith("Ollama") for e in engs) and "loken0.1.0" in engs]
     return max(days) if days else ""
+
+
+def ollama_of(engines):
+    """The ollama figure of a cell, whichever version measured it: the peer is compared by
+    its name, and its version is read in the table row, not fixed here."""
+    return next((v for k, v in engines.items() if k.startswith("Ollama")), None)
 
 
 RUN_DATE = os.environ.get("RUN_DATE") or latest_run_date()
@@ -66,9 +73,9 @@ def bench_rows():
             continue
         out.setdefault(c[0], {})[clean(c[5])] = decode
     return {
-        m: (e["Ollama0.32.6"], e["loken0.1.0"])
+        m: (ollama_of(e), e["loken0.1.0"])
         for m, e in out.items()
-        if "Ollama0.32.6" in e and "loken0.1.0" in e
+        if ollama_of(e) is not None and "loken0.1.0" in e
     }
 
 
@@ -152,7 +159,7 @@ def bar_chart(rows, path, header=None):
         )
     svg.append(
         f'<text class="h" x="{label_w}" y="{height - 14}">'
-        "GREY OLLAMA 0.32.6   GREEN LOKEN 0.1.0</text>"
+        "GREY OLLAMA   GREEN LOKEN 0.1.0</text>"
     )
     svg.append("</svg>")
     path.write_text("\n".join(svg) + "\n")
@@ -181,21 +188,22 @@ def section_cells():
         if len(c) < 15:
             continue
         key = (c[0], c[1], c[2], c[3], c[4], c[14][:10])
-        total[section].add(key)
         try:
             decode = float(clean(c[7]))
         except ValueError:
+            # A row marked impossible or failed carries no rate: an attempt, not a measure.
             continue
+        total[section].add(key)
         cells[section].setdefault(key, {})[clean(c[5])] = decode
     out = {}
     for sec, found in cells.items():
         pairs = {
             f"{m} {ctx} {prompt} {'S' if mode == 'stream' else 'NS'} {dev}": (
-                e["Ollama0.32.6"],
+                ollama_of(e),
                 e["loken0.1.0"],
             )
             for (m, ctx, prompt, mode, dev, _), e in found.items()
-            if "Ollama0.32.6" in e and "loken0.1.0" in e
+            if ollama_of(e) is not None and "loken0.1.0" in e
         }
         if pairs:
             out[sec] = (pairs, len(total[sec]))
