@@ -808,6 +808,14 @@ pub(crate) struct DeepseekV41Backend {
     /// prompts and tokens, so a placement opened per prompt would give that away at every
     /// prompt. `None` on the host alone.
     streamed: Option<crate::inference::offload::streamed::Streamed>,
+    /// The state as it stood before the last `forward_all`, the tokens it verified, and the
+    /// position it ran at. A partial acceptance rolls back to this mark and replays the accepted
+    /// prefix, since the sliding-window cache cannot truncate by length.
+    verify: Option<(
+        crate::inference::model::deepseek_v41::cache::DecodeState,
+        Vec<u32>,
+        usize,
+    )>,
 }
 
 impl DeepseekV41Backend {
@@ -831,6 +839,28 @@ impl DeepseekV41Backend {
             state,
             widest_ffn,
             streamed,
+            verify: None,
+        }
+    }
+
+    /// One batched verify over `ids` from the current position: each layer's experts are read
+    /// once for the whole block, on the cards when there are any. Advances `self.state` by the
+    /// inputs and returns each position's logits `[seq, vocab]`.
+    fn verify_batch(&mut self, ids: &[u32]) -> crate::tensor::Result<Tensor> {
+        let Self {
+            model,
+            state,
+            streamed,
+            ..
+        } = self;
+        match streamed {
+            Some(s) => {
+                model.offload_experts(Some(s.lanes.clone()));
+                crate::inference::offload::with_offload(s.offload.clone(), || {
+                    model.forward_verify_batch(ids, state)
+                })
+            }
+            None => model.forward_verify_batch(ids, state),
         }
     }
 
@@ -1506,6 +1536,9 @@ impl ModelBackend for Lfm2MoeBackend {
 impl ModelBackend for DeepseekV41Backend {
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
         let ids = x.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+        // A plain decode moves past any verify mark: a full acceptance never trims, so the mark
+        // is stale here and would otherwise hold a whole state clone across the decode.
+        self.verify = None;
         if index_pos == 0 {
             self.state = self.model.new_decode_state();
         }
@@ -1552,10 +1585,9 @@ impl ModelBackend for DeepseekV41Backend {
 
     /// Logits at every input position, for the speculative verify step: the k draft tokens
     /// appended at `index_pos`, each position's next-token distribution kept rather than only
-    /// the last. Advances the cache by the inputs; the caller rolls it back to the accepted
-    /// length. This runs the tokens one at a time, which is correct but reads each layer's
-    /// experts per token; a batched pass that reads them once for the whole block is what turns
-    /// the verify into a speed win, and replaces these internals without changing this contract.
+    /// the last. One batched pass reads each layer's experts once for the whole block, which is
+    /// what turns the verify into a speed win. The cache is advanced by every input; the caller
+    /// then keeps the accepted prefix through `trim_kv`.
     fn forward_all(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
         let ids = x.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
         if index_pos == 0 {
@@ -1567,25 +1599,33 @@ impl ModelBackend for DeepseekV41Backend {
                 self.state.pos
             )));
         }
-        let Self {
-            model,
-            state,
-            streamed,
-            ..
-        } = self;
-        // One batched forward over the block: each layer's experts are read once for the whole
-        // block rather than once per token, which is what makes a speculative verify a win.
-        let logits = match streamed {
-            Some(s) => {
-                model.offload_experts(Some(s.lanes.clone()));
-                crate::inference::offload::with_offload(s.offload.clone(), || {
-                    model.forward_verify_batch(&ids, state)
-                })?
-            }
-            None => model.forward_verify_batch(&ids, state)?,
-        };
+        // The mark to return to if the caller keeps only a prefix: the window cannot be cut by
+        // length, so a rejection replays the accepted tokens from here.
+        self.verify = Some((self.state.checkpoint(), ids.clone(), index_pos));
+        let logits = self.verify_batch(&ids)?;
         // [seq, vocab] -> [1, seq, vocab].
         logits.unsqueeze(0)
+    }
+
+    /// Keep only the first `new_len - index_pos` tokens of the last `forward_all`: roll the
+    /// cache back to the mark that forward took and replay that prefix, one more block read.
+    /// A full acceptance never calls here, so the common case pays nothing.
+    fn trim_kv(&mut self, new_len: usize) {
+        let Some((mark, ids, base)) = self.verify.take() else {
+            return;
+        };
+        self.state.rewind(&mark);
+        let keep = new_len.saturating_sub(base).min(ids.len());
+        if keep > 0 {
+            // The replay reads experts again but leaves the cache exactly where a decode of the
+            // accepted tokens would; a failure leaves it at the mark, which the next forward's
+            // position check reports.
+            let _ = self.verify_batch(&ids[..keep]);
+        }
+    }
+
+    fn supports_pld(&self) -> bool {
+        true
     }
 
     fn widest_ffn(&self) -> usize {
@@ -1595,6 +1635,7 @@ impl ModelBackend for DeepseekV41Backend {
     fn reset_kv_from(&mut self, keep: usize) {
         // The caches only append, so the one prefix that can be kept is the empty one; anything
         // else is left in place and the next forward's position check reports it.
+        self.verify = None;
         if keep == 0 {
             self.state = self.model.new_decode_state();
         }

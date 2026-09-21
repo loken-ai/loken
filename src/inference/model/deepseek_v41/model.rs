@@ -1557,6 +1557,42 @@ mod oracle_gate {
         }
     }
 
+    /// A rejected speculative block rolls back with no trace: checkpoint, verify the whole block,
+    /// rewind, replay only the accepted prefix - the state then stands exactly where verifying that
+    /// prefix alone would have left it, so the next token decodes to the same logits bit for bit.
+    #[test]
+    fn checkpoint_rewind_replays_the_accepted_prefix() {
+        let layouts: [(&[u32], &[u32], &[u32]); 2] =
+            [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
+        for (ratios, kv_src, index_src) in layouts {
+            let (model, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            let split = tokens.len() - 6;
+            let block = &tokens[split..];
+            let next = tokens[0]; // the token decoded after the accepted prefix
+            for keep in [1usize, block.len() / 2] {
+                // Reference: verify only the accepted prefix, then decode the next token.
+                let mut want_state = model.new_decode_state();
+                let _ = model.prefill_into(&tokens[..split], &mut want_state).unwrap();
+                let _ = model.forward_verify_batch(&block[..keep], &mut want_state).unwrap();
+                let want = vecf_of(&model.forward_decode(next, &mut want_state).unwrap());
+
+                // Trial: verify the whole block, reject past `keep`, replay the prefix.
+                let mut state = model.new_decode_state();
+                let _ = model.prefill_into(&tokens[..split], &mut state).unwrap();
+                let mark = state.checkpoint();
+                let _ = model.forward_verify_batch(block, &mut state).unwrap();
+                assert_eq!(state.pos, split + block.len());
+                state.rewind(&mark);
+                assert_eq!(state.pos, split);
+                let _ = model.forward_verify_batch(&block[..keep], &mut state).unwrap();
+                assert_eq!(state.pos, split + keep);
+                let got = vecf_of(&model.forward_decode(next, &mut state).unwrap());
+
+                assert_eq!(got, want, "{ratios:?} keep {keep}: state diverged after rewind");
+            }
+        }
+    }
+
     /// With a card taking attention, index scores and every product it can, a batched prefill gives
     /// the logits and the decode state the CPU gives, on both layouts.
     #[cfg(feature = "cuda")]
