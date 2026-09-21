@@ -217,6 +217,25 @@ impl Block {
         cache: &mut AttnCache,
         shared: &mut SharedAttn,
     ) -> Result<(Tensor, Vec<Vec<f32>>)> {
+        let (x, am_pre) = self.forward_decode_attn(x, pre_mix, cos, sin, pos, cache, shared)?;
+        self.forward_prefill_ffn(&x, &am_pre)
+    }
+
+    /// The attention half of `forward_decode`: the stream after ring-aware attention, and the
+    /// pre-mix the FFN half collapses it with. Split out so a batched verify can run this per
+    /// token, each attending over the ring, and then the FFN half once over the whole block -
+    /// the MoE reads each expert once for the block, which is where the speed of a verify is.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_decode_attn(
+        &self,
+        x: &Tensor,
+        pre_mix: &[Vec<f32>],
+        cos: &Tensor,
+        sin: &Tensor,
+        pos: usize,
+        cache: &mut AttnCache,
+        shared: &mut SharedAttn,
+    ) -> Result<(Tensor, Vec<Vec<f32>>)> {
         use crate::inference::offload::stage;
         let residual = x;
         let am = stage("hc mixes", || self.attn_mixes(x))?;
@@ -229,16 +248,6 @@ impl Block {
         let x = stage("hc post", || {
             hc_post(&xattn, residual, &am.post, &am.comb, self.hc_mult)
         })?;
-
-        let residual = &x;
-        let fm = stage("hc mixes", || self.mixes(&x, &self.hc_ffn))?;
-        let xin = stage("hc pre and norm", || {
-            rms_norm(&hc_pre(&x, &am.pre)?, &self.ffn_norm, self.norm_eps)
-        })?;
-        let xffn = stage("moe", || self.moe.forward(&xin))?;
-        let out = stage("hc post", || {
-            hc_post(&xffn, residual, &fm.post, &fm.comb, self.hc_mult)
-        })?;
-        Ok((out, fm.pre))
+        Ok((x, am.pre))
     }
 }

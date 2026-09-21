@@ -629,6 +629,109 @@ impl DeepseekV41Model {
         state.pos += 1;
         Ok(logits)
     }
+
+    /// Verify a block of `tokens` starting at `state.pos`, returning the next-token logits at
+    /// every position, `[tokens.len(), vocab]`. Attention runs token by token over the ring, as
+    /// decode does, so each token attends only to the ones before it and its own state carries a
+    /// band layer's keys down to a later band layer; the FFN and its MoE then run once over the
+    /// whole block, so each layer's experts are read once - which is why verifying a block is
+    /// faster than decoding its tokens one at a time. The batched MoE differs from the per-token
+    /// path only by floating-point rounding, so the per-position argmax matches what decoding one
+    /// token at a time from the same state would give, and the caches are left in the same place.
+    pub fn forward_verify_batch(&self, tokens: &[u32], state: &mut DecodeState) -> Result<Tensor> {
+        if tokens.is_empty() {
+            return Err(Error::msg("forward_verify_batch: no tokens"));
+        }
+        let (dim, hc) = (self.dim, self.hc_mult);
+        let pos = state.pos;
+        let k = tokens.len();
+
+        // Every token embedded, broadcast into the hyper-connection copies: [1, k, hc, d].
+        let mut rows = Vec::with_capacity(k);
+        for &t in tokens {
+            rows.push(self.embed.narrow(0, t as usize, 1)?);
+        }
+        let refs: Vec<&Tensor> = rows.iter().collect();
+        let emb = Tensor::cat(&refs, 0)?.reshape((1, k, dim))?;
+        let mut x = emb.unsqueeze(2)?.broadcast_as((1, k, hc, dim))?.contiguous()?;
+
+        // Rope tables long enough that token j reads row pos + j.
+        let n = pos + k;
+        let (cos0, sin0) = rope_table(self.rope_head_dim, n, 0, self.rope_theta, self.rope_factor)?;
+        let (cosb, sinb) = rope_table(
+            self.rope_head_dim,
+            n,
+            self.original_seq_len,
+            self.compress_rope_theta,
+            self.rope_factor,
+        )?;
+
+        // The engram recents, one per token, pushed in order so token j reflects tokens up to j.
+        let recents: Vec<_> = tokens
+            .iter()
+            .map(|&t| self.engram_cfg.as_ref().map(|ecfg| state.engram.push(ecfg, t)))
+            .collect();
+
+        // The collapse weights into the top layer, one per token, the top set.
+        let mut pre_mix: Vec<Vec<f32>> = (0..k)
+            .map(|_| {
+                let mut v = vec![0f32; hc];
+                v[0] = 1.0;
+                v
+            })
+            .collect();
+        // One shared-attention state per token: a band layer's index keys, candidates and
+        // compressed KV pass down to a later band layer within a token, so the tokens of the
+        // block cannot share one without a token reading another's keys.
+        let mut shareds: Vec<SharedAttn> = (0..k).map(|_| SharedAttn::default()).collect();
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            let (cos, sin) = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
+                (&cos0, &sin0)
+            } else {
+                (&cosb, &sinb)
+            };
+            // Attention half, token by token in order, each appending to and reading from the ring.
+            let mut attn_rows = Vec::with_capacity(k);
+            let mut am_pre: Vec<Vec<f32>> = Vec::with_capacity(k);
+            for j in 0..k {
+                let mut xj = x.narrow(1, j, 1)?.contiguous()?;
+                if let (Some(engram), Some(ecfg), Some(recent)) =
+                    (&self.engrams[i], &self.engram_cfg, &recents[j])
+                {
+                    let which = ecfg.layer_ids.iter().position(|&l| l == i).unwrap_or(0);
+                    xj = engram.forward(&xj, &[ecfg.hash(which, recent)])?;
+                }
+                let (xj_attn, ampre_j) = block.forward_decode_attn(
+                    &xj,
+                    &pre_mix[j..j + 1],
+                    cos,
+                    sin,
+                    pos + j,
+                    &mut state.layers[i],
+                    &mut shareds[j],
+                )?;
+                attn_rows.push(xj_attn);
+                am_pre.push(ampre_j.into_iter().next().unwrap_or_else(|| {
+                    let mut v = vec![0f32; hc];
+                    v[0] = 1.0;
+                    v
+                }));
+            }
+            let arefs: Vec<&Tensor> = attn_rows.iter().collect();
+            let xattn = Tensor::cat(&arefs, 1)?;
+            // FFN half, once over the whole block: one read of each expert.
+            let (nx, npm) = block.forward_prefill_ffn(&xattn, &am_pre)?;
+            x = nx;
+            pre_mix = npm;
+        }
+
+        let h = hc_pre(&x, &pre_mix)?;
+        let h = rms_norm(&h, &self.norm, self.rms_eps)?;
+        let logits = self.output.apply(&h.reshape((k, dim))?)?;
+        state.pos += k;
+        Ok(logits)
+    }
 }
 
 #[cfg(test)]
@@ -1396,6 +1499,58 @@ mod oracle_gate {
                     assert!(
                         r < 1e-4,
                         "{ratios:?} split {split}: decode step {k} after prefill, rel {r}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A batched verify of a block of tokens gives, at every position, what decoding the tokens
+    /// one at a time from the same state gives: the same argmax, and logits within rounding of
+    /// the per-token path (the FFN runs the block at once, so it differs only by accumulation).
+    #[test]
+    fn forward_verify_batch_matches_sequential_decode() {
+        let layouts: [(&[u32], &[u32], &[u32]); 2] =
+            [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+            (num / b.iter().map(|y| y * y).sum::<f32>()).sqrt()
+        };
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        for (ratios, kv_src, index_src) in layouts {
+            let (model, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            // The target at every position: decode one token at a time from a fresh state.
+            let mut stepped = model.new_decode_state();
+            let want: Vec<Vec<f32>> = tokens
+                .iter()
+                .map(|&t| vecf_of(&model.forward_decode(t, &mut stepped).unwrap()))
+                .collect();
+            let vocab = want[0].len();
+            for split in [tokens.len() - 4, tokens.len() - 6] {
+                let mut state = model.new_decode_state();
+                let _ = model.prefill_into(&tokens[..split], &mut state).unwrap();
+                assert_eq!(state.pos, split);
+                let block = &tokens[split..];
+                let logits = model.forward_verify_batch(block, &mut state).unwrap();
+                let (k, v) = logits.dims2().unwrap();
+                assert_eq!((k, v), (block.len(), vocab));
+                assert_eq!(state.pos, split + block.len());
+                let flat = vecf_of(&logits);
+                for j in 0..k {
+                    let got = &flat[j * vocab..(j + 1) * vocab];
+                    let w = &want[split + j];
+                    let r = rel(got, w);
+                    assert!(r < 1e-3, "{ratios:?} split {split}: verify pos {j} rel {r}");
+                    assert_eq!(
+                        argmax(got),
+                        argmax(w),
+                        "{ratios:?} split {split}: verify pos {j} argmax"
                     );
                 }
             }
