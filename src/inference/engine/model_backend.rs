@@ -1573,31 +1573,19 @@ impl ModelBackend for DeepseekV41Backend {
             streamed,
             ..
         } = self;
-        let mut rows: Vec<Tensor> = Vec::with_capacity(ids.len());
-        match streamed {
+        // One batched forward over the block: each layer's experts are read once for the whole
+        // block rather than once per token, which is what makes a speculative verify a win.
+        let logits = match streamed {
             Some(s) => {
                 model.offload_experts(Some(s.lanes.clone()));
-                for &t in &ids {
-                    rows.push(crate::inference::offload::with_offload(
-                        s.offload.clone(),
-                        || model.forward_decode(t, state),
-                    )?);
-                }
+                crate::inference::offload::with_offload(s.offload.clone(), || {
+                    model.forward_verify_batch(&ids, state)
+                })?
             }
-            None => {
-                for &t in &ids {
-                    rows.push(model.forward_decode(t, state)?);
-                }
-            }
-        }
-        if rows.is_empty() {
-            return Err(crate::tensor::Error::msg(
-                "deepseek_v41: forward_all of an empty input",
-            ));
-        }
-        let refs: Vec<&Tensor> = rows.iter().collect();
-        // Each row is [1, vocab]; stack to [seq, vocab] and add the batch axis.
-        Tensor::cat(&refs, 0)?.unsqueeze(0)
+            None => model.forward_verify_batch(&ids, state)?,
+        };
+        // [seq, vocab] -> [1, seq, vocab].
+        logits.unsqueeze(0)
     }
 
     fn widest_ffn(&self) -> usize {
