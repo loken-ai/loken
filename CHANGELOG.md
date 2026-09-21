@@ -30,6 +30,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Speculative: a configured draft model, and per-position logits for verify.
 - Speculative: a mixture verifies a prompt-lookup block at once when resident.
 - Agents: loken launch for a coding agent; per-layer timing on demand.
+- Perf: a streamed decode reports where its time goes, by stage, on demand.
 - Docs: every config key and route, ten lessons, and CI with cargo-deny.
 
 ### Changed
