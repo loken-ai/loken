@@ -1625,7 +1625,13 @@ impl ModelBackend for DeepseekV41Backend {
     }
 
     fn supports_pld(&self) -> bool {
-        true
+        // A batched verify pays only when the block's experts are already in memory: it reads
+        // their union once instead of per token. With the experts streamed from disk the union
+        // barely overlaps across a block, so a verify reads about as many expert bytes as
+        // decoding the tokens one at a time and a rejected tail replays a whole block on top -
+        // measured a net loss at 82% acceptance (2.5 vs 3.5 tok/s). Resident, the same verify
+        // saves the repeated reads, so the draft path is offered only then.
+        self.streamed.is_none()
     }
 
     fn widest_ffn(&self) -> usize {
