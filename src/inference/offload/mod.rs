@@ -44,6 +44,18 @@ pub fn stage_prof_enabled() -> bool {
     STAGE_PROF_ON.load(Ordering::Relaxed)
 }
 
+/// Add `ns` to a stage the offload timed itself (its lanes' fetch and kernels, the host experts):
+/// these are summed on the caller after the lanes join rather than wrapped by `stage`, so they
+/// reach the profile through here. A no-op when the profile is off.
+pub fn prof_record(stage: &'static str, ns: u64) {
+    if STAGE_PROF_ON.load(Ordering::Relaxed) {
+        let mut m = STAGE_PROF.lock().unwrap_or_else(|e| e.into_inner());
+        let e = m.entry(stage).or_default();
+        e.0 += ns;
+        e.1 += 1;
+    }
+}
+
 /// Each stage's total nanoseconds and call count since it was switched on.
 pub fn stage_prof_snapshot() -> Vec<(&'static str, u64, u64)> {
     STAGE_PROF

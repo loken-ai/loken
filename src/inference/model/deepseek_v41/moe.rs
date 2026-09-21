@@ -111,8 +111,8 @@ impl Moe {
             );
         }
         *self.last_routing.lock().unwrap() = routing;
-        if let Some(off) = crate::inference::offload::current() {
-            off.record("moe routing", gate_started.elapsed().as_nanos() as u64);
+        if crate::inference::offload::current().is_some() {
+            crate::inference::offload::prof_record("moe routing", gate_started.elapsed().as_nanos() as u64);
         }
 
         // The routed experts this batch needs are known from the top-k before any of them runs, so
@@ -167,7 +167,7 @@ impl Moe {
             let (ran, fetch_ns, run_ns) =
                 off.run_all(&active, n, self.swiglu_limit, &fetch, &rows_of);
             done = ran;
-            if let Some(o) = crate::inference::offload::current() {
+            if crate::inference::offload::current().is_some() {
                 // The lanes' own time, split: their threads carry no recorder, so it is
                 // recorded here after the join.
                 for (name, a) in [
@@ -175,14 +175,14 @@ impl Moe {
                     ("moe expert kernels", &off.timings[1]),
                     ("count experts on card", &off.timings[2]),
                 ] {
-                    o.record(name, a.swap(0, std::sync::atomic::Ordering::Relaxed));
+                    crate::inference::offload::prof_record(name, a.swap(0, std::sync::atomic::Ordering::Relaxed));
                 }
-                o.record("moe expert fetch", fetch_ns);
-                o.record("moe expert run", run_ns);
+                crate::inference::offload::prof_record("moe expert fetch", fetch_ns);
+                crate::inference::offload::prof_record("moe expert run", run_ns);
             }
         }
-        if let Some(off) = crate::inference::offload::current() {
-            off.record(
+        if crate::inference::offload::current().is_some() {
+            crate::inference::offload::prof_record(
                 "moe routed experts",
                 routed_started.elapsed().as_nanos() as u64,
             );
@@ -231,9 +231,9 @@ impl Moe {
                 ready[i] = Some(r?);
             }
         }
-        if let Some(o) = crate::inference::offload::current() {
-            o.record("moe host experts", host_started.elapsed().as_nanos() as u64);
-            o.record("count experts on host", host_count);
+        if crate::inference::offload::current().is_some() {
+            crate::inference::offload::prof_record("moe host experts", host_started.elapsed().as_nanos() as u64);
+            crate::inference::offload::prof_record("count experts on host", host_count);
         }
         let add_started = std::time::Instant::now();
         for (i, &e) in active.iter().enumerate() {
@@ -259,8 +259,8 @@ impl Moe {
                 self.experts.release(e, &expert);
             }
         }
-        if let Some(o) = crate::inference::offload::current() {
-            o.record("moe add", add_started.elapsed().as_nanos() as u64);
+        if crate::inference::offload::current().is_some() {
+            crate::inference::offload::prof_record("moe add", add_started.elapsed().as_nanos() as u64);
         }
         // A batch of many tokens read the layer nearly whole; what read-ahead brought in
         // beside the kept experts goes now, before the next layer's reads need the room.
@@ -268,8 +268,8 @@ impl Moe {
             self.experts.sweep()?;
         }
 
-        if let Some(off) = crate::inference::offload::current() {
-            off.record(
+        if crate::inference::offload::current().is_some() {
+            crate::inference::offload::prof_record(
                 "moe gather and add",
                 gather_started.elapsed().as_nanos() as u64,
             );
