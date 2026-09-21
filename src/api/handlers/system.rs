@@ -303,15 +303,35 @@ pub(crate) async fn layer_performance_endpoint(
 pub(crate) async fn stage_performance_endpoint(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
+    use crate::inference::offload::{stage_prof_enable, stage_prof_snapshot};
     use crate::inference::place::layer_perf::stages;
     match params.get("enable").map(String::as_str) {
         Some("1") => {
             stages::reset();
             stages::set_enabled(true);
+            stage_prof_enable(true);
         }
-        Some("0") => stages::set_enabled(false),
+        Some("0") => {
+            stages::set_enabled(false);
+            stage_prof_enable(false);
+        }
         _ => {}
     }
+    // The offloaded models (deepseek streamed) name their own stages and their lanes drop the
+    // per-thread recorder, so the generic tracker above stays empty for them; their profile comes
+    // from the offload's own accumulator.
+    let offload_total: u64 = stage_prof_snapshot().iter().map(|(_, ns, _)| *ns).sum();
+    let offload_stages: Vec<serde_json::Value> = stage_prof_snapshot()
+        .iter()
+        .map(|(name, ns, n)| {
+            serde_json::json!({
+                "stage": name,
+                "total_us": ns / 1000,
+                "share": if offload_total > 0 { *ns as f64 / offload_total as f64 } else { 0.0 },
+                "calls": n,
+            })
+        })
+        .collect();
     let (sums, calls) = stages::snapshot();
     // The share is against the stages that partition a layer-call; the two nested inside
     // the expert block are reported beside them, not counted twice.
@@ -320,6 +340,8 @@ pub(crate) async fn stage_performance_endpoint(
         "enabled": stages::enabled(),
         "layer_calls": calls,
         "total_us": total,
+        "offload_total_us": offload_total / 1000,
+        "offload_stages": offload_stages,
         "host_fast_calls": stages::host_paths().0,
         "host_rejects": stages::host_paths().1.iter()
             .map(|(k, v)| serde_json::json!({ "cause": k, "calls": v })).collect::<Vec<_>>(),

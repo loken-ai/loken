@@ -21,7 +21,38 @@ pub mod streamed;
 
 use crate::tensor::Result;
 use projection::Projection;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// A profile of the named stages a forward runs through, kept whole for a model that offloads its
+/// steps (its lanes discard the per-thread recorder). Off by default: a lock on every stage of
+/// every layer is a cost only a diagnostic wants, and what makes the shares readable is that they
+/// are summed across the lanes rather than lost with the thread that ran them.
+static STAGE_PROF: Mutex<BTreeMap<&'static str, (u64, u64)>> = Mutex::new(BTreeMap::new());
+static STAGE_PROF_ON: AtomicBool = AtomicBool::new(false);
+
+/// Switch the stage profile on (zeroing it) or off.
+pub fn stage_prof_enable(on: bool) {
+    if on {
+        STAGE_PROF.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    STAGE_PROF_ON.store(on, Ordering::Relaxed);
+}
+
+pub fn stage_prof_enabled() -> bool {
+    STAGE_PROF_ON.load(Ordering::Relaxed)
+}
+
+/// Each stage's total nanoseconds and call count since it was switched on.
+pub fn stage_prof_snapshot() -> Vec<(&'static str, u64, u64)> {
+    STAGE_PROF
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, v)| (*k, v.0, v.1))
+        .collect()
+}
 
 pub trait Offload: Send + Sync {
     /// `p` applied to `xs` rows, row-major; `None` to run it here.
@@ -87,11 +118,29 @@ pub fn linear(
 /// Run `f` as stage `stage`: timed and recorded when this thread has an offload, run plainly
 /// otherwise.
 pub fn stage<R>(stage: &'static str, f: impl FnOnce() -> R) -> R {
+    let prof = STAGE_PROF_ON.load(Ordering::Relaxed);
     match current() {
         Some(offload) => {
             let t = std::time::Instant::now();
             let r = f();
-            offload.record(stage, t.elapsed().as_nanos() as u64);
+            let ns = t.elapsed().as_nanos() as u64;
+            offload.record(stage, ns);
+            if prof {
+                let mut m = STAGE_PROF.lock().unwrap_or_else(|e| e.into_inner());
+                let e = m.entry(stage).or_default();
+                e.0 += ns;
+                e.1 += 1;
+            }
+            r
+        }
+        None if prof => {
+            let t = std::time::Instant::now();
+            let r = f();
+            let ns = t.elapsed().as_nanos() as u64;
+            let mut m = STAGE_PROF.lock().unwrap_or_else(|e| e.into_inner());
+            let e = m.entry(stage).or_default();
+            e.0 += ns;
+            e.1 += 1;
             r
         }
         None => f(),
