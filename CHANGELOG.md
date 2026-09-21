@@ -28,6 +28,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Cluster: a peers endpoint, and a scrape endpoint behind a feature.
 - Adapters: rank-decomposition adapters through the layer-swap route.
 - Speculative: a configured draft model, and per-position logits for verify.
+- Speculative: DeepSeek V4.1 drafts by prompt lookup, verifies a block at once.
 - Agents: loken launch for a coding agent; per-layer timing on demand.
 - Docs: every config key and route, ten lessons, and CI with cargo-deny.
 
