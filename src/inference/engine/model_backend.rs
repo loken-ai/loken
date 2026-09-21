@@ -1550,6 +1550,56 @@ impl ModelBackend for DeepseekV41Backend {
         last.ok_or_else(|| crate::tensor::Error::msg("deepseek_v41: forward of an empty input"))
     }
 
+    /// Logits at every input position, for the speculative verify step: the k draft tokens
+    /// appended at `index_pos`, each position's next-token distribution kept rather than only
+    /// the last. Advances the cache by the inputs; the caller rolls it back to the accepted
+    /// length. This runs the tokens one at a time, which is correct but reads each layer's
+    /// experts per token; a batched pass that reads them once for the whole block is what turns
+    /// the verify into a speed win, and replaces these internals without changing this contract.
+    fn forward_all(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
+        let ids = x.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+        if index_pos == 0 {
+            self.state = self.model.new_decode_state();
+        }
+        if self.state.pos != index_pos {
+            return Err(crate::tensor::Error::msg(format!(
+                "deepseek_v41: forward_all at position {index_pos} but the cache stands at {}",
+                self.state.pos
+            )));
+        }
+        let Self {
+            model,
+            state,
+            streamed,
+            ..
+        } = self;
+        let mut rows: Vec<Tensor> = Vec::with_capacity(ids.len());
+        match streamed {
+            Some(s) => {
+                model.offload_experts(Some(s.lanes.clone()));
+                for &t in &ids {
+                    rows.push(crate::inference::offload::with_offload(
+                        s.offload.clone(),
+                        || model.forward_decode(t, state),
+                    )?);
+                }
+            }
+            None => {
+                for &t in &ids {
+                    rows.push(model.forward_decode(t, state)?);
+                }
+            }
+        }
+        if rows.is_empty() {
+            return Err(crate::tensor::Error::msg(
+                "deepseek_v41: forward_all of an empty input",
+            ));
+        }
+        let refs: Vec<&Tensor> = rows.iter().collect();
+        // Each row is [1, vocab]; stack to [seq, vocab] and add the batch axis.
+        Tensor::cat(&refs, 0)?.unsqueeze(0)
+    }
+
     fn widest_ffn(&self) -> usize {
         self.widest_ffn
     }
