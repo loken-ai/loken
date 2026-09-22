@@ -9,6 +9,7 @@
 //! 1), and is judged against a dump of one layer's MoE in the module test.
 
 use crate::inference::offload::experts::{Expert, ExpertOffload};
+use crate::inference::offload::projection::Projection;
 use crate::inference::offload::store::ExpertSet;
 use crate::tensor::{Device, Result, Tensor};
 use std::sync::Arc;
@@ -319,6 +320,27 @@ impl Moe {
             .copied()
             .zip(active_refs.iter().cloned())
             .collect();
+
+        // A decode whose active experts all sit on one card runs the whole mixture there - shared
+        // expert, routed experts and the weighted gather - so the block crosses the bus once for
+        // the layer. The card declines when it cannot hold every active expert, and the streamed
+        // path below runs it; an observer needs the per-expert rows the fused block does not yield.
+        if n == 1 && self.observer.read().unwrap().is_none() {
+            if let Some(off) = crate::inference::offload::current() {
+                let projs: Vec<(&Projection, &Projection, &Projection)> =
+                    active_refs.iter().map(|r| (&r.w1, &r.w3, &r.w2)).collect();
+                let weights: Vec<f32> = active.iter().map(|&e| assign[e][0].1).collect();
+                let shared =
+                    self.has_shared
+                        .then_some((&self.shared.w1, &self.shared.w3, &self.shared.w2));
+                let row = x2.flatten_all()?.to_vec1::<f32>()?;
+                if let Some(res) = stage("moe decode block", || {
+                    off.moe_decode(&projs, &weights, shared, &row, self.swiglu_limit, self.dim)
+                }) {
+                    return Tensor::from_vec(res?, (1, self.dim), &Device::Cpu)?.reshape(dims);
+                }
+            }
+        }
 
         // Every token passes through the shared expert; routed experts add on top, each run over
         // the rows of the tokens that selected it and nothing else.

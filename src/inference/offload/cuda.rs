@@ -986,6 +986,69 @@ impl Offload for Card {
             m2.forward(&h)?.flatten_all()?.to_vec1::<f32>()
         })
     }
+
+    fn moe_decode(
+        &self,
+        active: &[(&Projection, &Projection, &Projection)],
+        weights: &[f32],
+        shared: Option<(&Projection, &Projection, &Projection)>,
+        x: &[f32],
+        limit: f32,
+        dim: usize,
+    ) -> Option<Result<Vec<f32>>> {
+        let quant = |p: &Projection| match p {
+            Projection::Quant(q) => Some(q.clone()),
+            _ => None,
+        };
+        // Every active expert (and the shared) must be kept on THIS card, or the block declines so
+        // the host runs it. The routed experts a decode misses are admitted here as elsewhere.
+        let mut ms: Vec<(Arc<QMatMul>, Arc<QMatMul>, Arc<QMatMul>)> =
+            Vec::with_capacity(active.len());
+        for (w1, w3, w2) in active {
+            ms.push((
+                self.kept(&quant(w1)?)?,
+                self.kept(&quant(w3)?)?,
+                self.kept(&quant(w2)?)?,
+            ));
+        }
+        let sh = match shared {
+            Some((w1, w3, w2)) => Some((
+                self.kept(&quant(w1)?)?,
+                self.kept(&quant(w3)?)?,
+                self.kept(&quant(w2)?)?,
+            )),
+            None => None,
+        };
+        let inter = active.first().map(|(w1, _, _)| w1.dims()[0]).unwrap_or(0);
+        let dev = Device::Cuda(self.dev.clone());
+        let need = (x.len() + (active.len() + 1) * (2 * inter + dim)) * F32;
+        self.attempt("moe decode", need, || {
+            let xd = Tensor::from_vec(x.to_vec(), (1, dim), &dev)?;
+            let hi = Tensor::full(limit, 1, &dev)?;
+            let lo = Tensor::full(-limit, 1, &dev)?;
+            let run = |m1: &QMatMul, m3: &QMatMul, m2: &QMatMul| -> Result<Tensor> {
+                let gate = m1.forward(&xd)?;
+                let up = m3.forward(&xd)?;
+                let h = if limit > 0.0 {
+                    let g = gate.broadcast_minimum(&hi)?;
+                    let u = up.broadcast_maximum(&lo)?.broadcast_minimum(&hi)?;
+                    g.silu()?.mul(&u)?
+                } else {
+                    gate.silu()?.mul(&up)?
+                };
+                m2.forward(&h)
+            };
+            // The shared expert unweighted, then each routed expert scaled by its routing weight.
+            let mut out = match &sh {
+                Some((m1, m3, m2)) => run(m1, m3, m2)?,
+                None => Tensor::zeros_on((1, dim), crate::tensor::DType::F32, &dev)?,
+            };
+            for (i, (m1, m3, m2)) in ms.iter().enumerate() {
+                out = out.add(&run(m1, m3, m2)?.affine(weights[i], 0.0)?)?;
+            }
+            out.flatten_all()?.to_vec1::<f32>()
+        })
+    }
 }
 
 /// The cards of one placement behind the trait: a weight kept on any of them answers from
@@ -1056,6 +1119,20 @@ impl Offload for Cards {
         self.0
             .iter()
             .find_map(|c| c.expert_dev(w1, w3, w2, x, limit))
+    }
+
+    fn moe_decode(
+        &self,
+        active: &[(&Projection, &Projection, &Projection)],
+        weights: &[f32],
+        shared: Option<(&Projection, &Projection, &Projection)>,
+        x: &[f32],
+        limit: f32,
+        dim: usize,
+    ) -> Option<Result<Vec<f32>>> {
+        self.0
+            .iter()
+            .find_map(|c| c.moe_decode(active, weights, shared, x, limit, dim))
     }
 }
 
