@@ -844,8 +844,7 @@ impl DeepseekV41Backend {
             prior: model.hot_experts(),
             fetch: &fetch,
         });
-        // Speculative draft held off for this checkpoint; re-enabled to continue the DSpark work.
-        let dspark: Option<crate::inference::model::deepseek_v41::dspark::Dspark> = None;
+        let dspark = crate::inference::model::deepseek_v41::dspark::Dspark::open();
         let mut state = state;
         let dspark_state = match &dspark {
             Some(d) => {
