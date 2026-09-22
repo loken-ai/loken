@@ -877,6 +877,30 @@ impl ContinuousServer {
     }
 }
 
+/// A spawned batched-decode server the engine streams a request through, whatever model backs it:
+/// one `submit_cb` per request, tokens streamed back as `CbToken` until a `Done`. Both the generic
+/// continuous-batch server and the DeepSeek batch worker implement it, so the serving path has one
+/// route, not one per model.
+pub trait BatchedServer: Send + Sync {
+    fn submit_cb(
+        &self,
+        prompt: Vec<u32>,
+        max_new: usize,
+        sampling: SamplingParams,
+    ) -> Receiver<CbToken>;
+}
+
+impl BatchedServer for ContinuousServer {
+    fn submit_cb(
+        &self,
+        prompt: Vec<u32>,
+        max_new: usize,
+        sampling: SamplingParams,
+    ) -> Receiver<CbToken> {
+        self.submit_sampled(prompt, max_new, sampling)
+    }
+}
+
 fn worker_loop(
     model: GhBatched,
     eos: u32,

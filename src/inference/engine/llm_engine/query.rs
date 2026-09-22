@@ -169,6 +169,46 @@ impl LlmEngine {
         })
     }
 
+    /// The shape a node measures its miss cost against, when the loaded model has streamed experts:
+    /// `(dim, inter, gate_up_dtype, down_dtype)`. `None` for a model with nothing to miss, or when
+    /// none is loaded. The engine forwards what the model declares; the cluster turns it into a cost.
+    pub async fn expert_cost_shape(
+        &self,
+    ) -> Option<(
+        usize,
+        usize,
+        crate::tensor::quantized::GgmlDType,
+        crate::tensor::quantized::GgmlDType,
+    )> {
+        let state = self.model_state.lock().await;
+        state.as_ref().and_then(|s| s.model.expert_cost_shape())
+    }
+
+    /// The model-side inputs the cluster's cut planner needs, when a streamed-expert model is
+    /// loaded: `(attn_bytes_per_layer, expert_bytes, working_set, activated)`. `None` otherwise.
+    pub async fn placement_model_inputs(&self) -> Option<(Vec<u64>, u64, u64, u64)> {
+        let state = self.model_state.lock().await;
+        state
+            .as_ref()
+            .and_then(|s| s.model.placement_model_inputs())
+    }
+
+    /// Make the loaded model the head of a cross-node pipeline, running `[0, cut)` here and handing
+    /// `[cut, n)` to the tail at `addr`. Called when the cluster's auto-tune decides a split pays.
+    pub async fn connect_pipeline_tail(
+        &self,
+        addr: std::net::SocketAddr,
+        cut: usize,
+    ) -> Result<(), String> {
+        let mut state = self.model_state.lock().await;
+        let s = state
+            .as_mut()
+            .ok_or_else(|| "no model loaded".to_string())?;
+        s.model
+            .connect_pipeline_tail(addr, cut)
+            .map_err(|e| e.to_string())
+    }
+
     /// Get device name
     pub async fn get_device_name(&self) -> String {
         let state = self.model_state.lock().await;

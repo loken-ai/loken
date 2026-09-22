@@ -99,6 +99,44 @@ pub(crate) struct DraftAttachResponse {
     status: &'static str,
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct PipelineTailRequest {
+    pub model: String,
+    pub from: usize,
+    pub to: usize,
+    /// The node running the layers after `to`, as `host:port`; absent for the final segment.
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct PipelineTailResponse {
+    pub port: u16,
+}
+
+/// Run this node as one segment of a pipeline for a model, serving layers `[from, to)` and relaying
+/// to `next` when it is not the final segment. The head calls this when the cluster's auto-tune
+/// decides a split pays; the reply carries the wire port the upstream connects its link to. Not an
+/// operator endpoint - it is the cluster talking to itself.
+pub(crate) async fn pipeline_tail_start(
+    State(state): State<APIServer>,
+    Json(req): Json<PipelineTailRequest>,
+) -> Result<Json<PipelineTailResponse>, ApiError> {
+    validate_model_id(&req.model)?;
+    let name = normalize_model_id(&req.model);
+    let next = match req.next.as_deref() {
+        Some(s) => Some(
+            s.parse::<std::net::SocketAddr>()
+                .map_err(|e| ApiError::Validation(format!("bad next address {s}: {e}")))?,
+        ),
+        None => None,
+    };
+    let port = state
+        .become_pipeline_tail(&name, req.from, req.to, next)
+        .map_err(ApiError::Internal)?;
+    Ok(Json(PipelineTailResponse { port }))
+}
+
 /// Attach a speculative draft model to a target. Validates that
 /// the tokenizers are byte-identical (same fingerprint, same vocab size)
 /// before the attach succeeds; otherwise the call returns an error and

@@ -20,6 +20,8 @@ pub mod projection;
 pub mod room;
 pub mod store;
 pub mod streamed;
+pub mod weight_cache;
+pub mod weight_stream;
 
 use crate::tensor::Result;
 use projection::Projection;

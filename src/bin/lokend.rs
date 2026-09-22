@@ -741,20 +741,17 @@ mod tests {
 
         let cli = Cli::parse_from(args);
 
-        match cli.command {
-            Commands::Serve {
-                port,
-                models_dir,
-                verbose,
-                keep_alive,
-                ..
-            } => {
-                assert_eq!(port, 9000);
-                assert_eq!(models_dir.as_deref(), Some("/tmp/models"));
-                assert!(verbose);
-                assert!(keep_alive.is_none());
-            }
-        }
+        let Commands::Serve {
+            port,
+            models_dir,
+            verbose,
+            keep_alive,
+            ..
+        } = cli.command;
+        assert_eq!(port, 9000);
+        assert_eq!(models_dir.as_deref(), Some("/tmp/models"));
+        assert!(verbose);
+        assert!(keep_alive.is_none());
     }
 
     #[test]
@@ -763,10 +760,7 @@ mod tests {
 
         let cli = Cli::parse_from(args);
 
-        match cli.command {
-            Commands::Serve { keep_alive, .. } => {
-                assert_eq!(keep_alive, Some("10m".to_string()));
-            }
-        }
+        let Commands::Serve { keep_alive, .. } = cli.command;
+        assert_eq!(keep_alive, Some("10m".to_string()));
     }
 }

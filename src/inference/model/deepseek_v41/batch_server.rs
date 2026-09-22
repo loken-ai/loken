@@ -19,17 +19,16 @@ use crate::inference::serve::continuous_serve::sample_row_host;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 
-/// A token the worker streams back for one request, ending with `Done`.
-pub enum Tok {
-    Next(u32),
-    Done,
-}
+// The worker streams the shared `CbToken` the continuous-batch server uses, so one serving path
+// carries both. Its `Done` finish reason is not read by the stream glue; it is set for parity.
+use crate::inference::serve::continuous_serve::CbToken;
+use crate::inference::serve::scheduler::FinishReason;
 
 struct Submission {
     prompt: Vec<u32>,
     max_new: usize,
     sampling: SamplingParams,
-    tx: Sender<Tok>,
+    tx: Sender<CbToken>,
 }
 
 /// One running sequence the worker decodes: its cache, the token it decodes next, how many it has
@@ -43,7 +42,7 @@ struct Seq {
     sampling: SamplingParams,
     prompt: Vec<u32>,
     generated: Vec<u32>,
-    tx: Sender<Tok>,
+    tx: Sender<CbToken>,
 }
 
 /// A handle to submit requests to the worker.
@@ -94,8 +93,8 @@ impl V41BatchServer {
     }
 
     /// Submit a greedy request; the returned receiver yields its tokens as they are produced,
-    /// ending with `Tok::Done`.
-    pub fn submit(&self, prompt: Vec<u32>, max_new: usize) -> Receiver<Tok> {
+    /// ending with a `Done` token.
+    pub fn submit(&self, prompt: Vec<u32>, max_new: usize) -> Receiver<CbToken> {
         self.submit_sampled(prompt, max_new, SamplingParams::greedy())
     }
 
@@ -106,7 +105,7 @@ impl V41BatchServer {
         prompt: Vec<u32>,
         max_new: usize,
         sampling: SamplingParams,
-    ) -> Receiver<Tok> {
+    ) -> Receiver<CbToken> {
         let (tx, rx) = mpsc::channel();
         let _ = self.submit_tx.send(Submission {
             prompt,
@@ -115,6 +114,17 @@ impl V41BatchServer {
             tx,
         });
         rx
+    }
+}
+
+impl crate::inference::serve::continuous_serve::BatchedServer for V41BatchServer {
+    fn submit_cb(
+        &self,
+        prompt: Vec<u32>,
+        max_new: usize,
+        sampling: SamplingParams,
+    ) -> Receiver<CbToken> {
+        self.submit_sampled(prompt, max_new, sampling)
     }
 }
 
@@ -153,7 +163,7 @@ fn admit(sm: &SendModel, sub: Submission, active: &mut Vec<Seq>) {
     }) {
         Ok(l) => l,
         Err(_) => {
-            let _ = sub.tx.send(Tok::Done);
+            let _ = sub.tx.send(CbToken::Done(FinishReason::Stop));
             return;
         }
     };
@@ -165,12 +175,12 @@ fn admit(sm: &SendModel, sub: Submission, active: &mut Vec<Seq>) {
     }) {
         Ok((v, rows, vocab)) => (v, rows, vocab),
         Err(_) => {
-            let _ = sub.tx.send(Tok::Done);
+            let _ = sub.tx.send(CbToken::Done(FinishReason::Stop));
             return;
         }
     };
     if sub.max_new == 0 {
-        let _ = sub.tx.send(Tok::Done);
+        let _ = sub.tx.send(CbToken::Done(FinishReason::Stop));
         return;
     }
     let (v, rows, vocab) = flat;
@@ -220,7 +230,7 @@ fn worker(sm: SendModel, eos: Option<u32>, max_batch: usize, rx: Receiver<Submis
             Ok(l) => l,
             Err(_) => {
                 for s in active.drain(..) {
-                    let _ = s.tx.send(Tok::Done);
+                    let _ = s.tx.send(CbToken::Done(FinishReason::Stop));
                 }
                 continue;
             }
@@ -233,11 +243,16 @@ fn worker(sm: SendModel, eos: Option<u32>, max_batch: usize, rx: Receiver<Submis
         let mut finished: Vec<usize> = Vec::new();
         for (row, seq) in active.iter_mut().enumerate() {
             let tok = seq.next;
-            let _ = seq.tx.send(Tok::Next(tok));
+            let _ = seq.tx.send(CbToken::Tok(tok));
             seq.generated.push(tok);
             seq.produced += 1;
             if seq.produced >= seq.max_new || Some(tok) == eos {
-                let _ = seq.tx.send(Tok::Done);
+                let reason = if Some(tok) == eos {
+                    FinishReason::Eos
+                } else {
+                    FinishReason::Length
+                };
+                let _ = seq.tx.send(CbToken::Done(reason));
                 finished.push(row);
             } else {
                 seq.next = sample(seq, &flat, row, vocab);

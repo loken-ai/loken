@@ -64,7 +64,10 @@ pub struct DeepseekV41Model {
     embed: Tensor,      // [vocab, dim]
     output: Projection, // [vocab, dim]
     norm: Tensor,       // [dim]
-    blocks: Vec<Block>,
+    /// One per layer. A node that runs only a layer range holds `None` for the layers outside it -
+    /// their weights are never fetched - so `blocks.len()` is the model's layer count whatever a
+    /// node loaded, and every index into it is the absolute layer.
+    blocks: Vec<Option<Block>>,
     /// Per layer, the engram applied to the stream before that block, when the layer has one.
     engrams: Vec<Option<Engram>>,
     engram_cfg: Option<EngramConfig>,
@@ -96,10 +99,235 @@ pub struct PrefillState {
     next: usize,
 }
 
+/// The activation crossing a pipeline cut mid-stack, for `forward_decode_range`: the residual
+/// stream, its collapse weights, the band state that flows down within a token, and the engram
+/// recent this token pushed. A node running a later layer range resumes from this.
+pub struct DecodeBoundary {
+    pub x: crate::tensor::Tensor,
+    pub pre_mix: Vec<Vec<f32>>,
+    pub shared: SharedAttn,
+    pub recent: Option<Vec<u32>>,
+}
+
+impl DecodeBoundary {
+    /// True when the band state is empty - the case at a ratio-0 layer boundary, where a pipeline
+    /// cut is cheapest and the crossing is only the residual.
+    pub fn shared_is_empty(&self) -> bool {
+        self.shared.compress_kv.is_none()
+            && self.shared.index_k.is_none()
+            && self.shared.topk_idxs.is_none()
+            && self.shared.candidates.is_none()
+    }
+
+    /// Serialise a boundary whose band state is empty (a ratio-0 cut) to the bytes that cross a
+    /// node in a wire frame: the residual stream, its collapse weights, and the engram recent.
+    /// Declines a boundary carrying band state - an interior-band cut - which needs the compressed
+    /// KV and index keys serialised too, added when a plan places a cut there.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let (b, s, hc, dim) = self.x.dims4()?;
+        if b != 1 || s != 1 {
+            return Err(Error::msg(
+                "DecodeBoundary::to_bytes: expected a single decode row",
+            ));
+        }
+        let mut out = Vec::new();
+        let put_u32 = |o: &mut Vec<u8>, v: usize| o.extend_from_slice(&(v as u32).to_le_bytes());
+        put_u32(&mut out, hc);
+        put_u32(&mut out, dim);
+        for f in self.x.flatten_all()?.to_vec1::<f32>()? {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        put_u32(&mut out, self.pre_mix.len());
+        for row in &self.pre_mix {
+            put_u32(&mut out, row.len());
+            for &f in row {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+        match &self.recent {
+            Some(r) => {
+                put_u32(&mut out, 1);
+                put_u32(&mut out, r.len());
+                for &t in r {
+                    out.extend_from_slice(&t.to_le_bytes());
+                }
+            }
+            None => put_u32(&mut out, 0),
+        }
+        // The band state, each field present-flagged. Empty at a ratio-0 cut (four zero flags), and
+        // the compressor and indexer state a mid-band cut carries down, so the boundary crosses the
+        // wire whatever layer it is taken at, not only where the band state happens to be empty.
+        for t in [&self.shared.compress_kv, &self.shared.index_k] {
+            match t {
+                None => put_u32(&mut out, 0),
+                Some(t) => {
+                    put_u32(&mut out, 1);
+                    let dims = t.dims();
+                    put_u32(&mut out, dims.len());
+                    for &d in dims {
+                        put_u32(&mut out, d);
+                    }
+                    for f in t.flatten_all()?.to_vec1::<f32>()? {
+                        out.extend_from_slice(&f.to_le_bytes());
+                    }
+                }
+            }
+        }
+        match &self.shared.topk_idxs {
+            None => put_u32(&mut out, 0),
+            Some(v) => {
+                put_u32(&mut out, 1);
+                put_u32(&mut out, v.len());
+                for &x in v {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }
+        match &self.shared.candidates {
+            None => put_u32(&mut out, 0),
+            Some(v) => {
+                put_u32(&mut out, 1);
+                put_u32(&mut out, v.len());
+                for &b in v {
+                    out.push(b as u8);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Rebuild a boundary from `to_bytes`, band state and all, so a cut taken at any layer resumes
+    /// exactly where it left off.
+    pub fn from_bytes(bytes: &[u8]) -> Result<DecodeBoundary> {
+        let mut p = 0usize;
+        let need = |p: usize, n: usize| -> Result<()> {
+            if p + n > bytes.len() {
+                Err(Error::msg("DecodeBoundary::from_bytes: truncated"))
+            } else {
+                Ok(())
+            }
+        };
+        let mut get_u32 = |p: &mut usize| -> Result<usize> {
+            need(*p, 4)?;
+            let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
+            *p += 4;
+            Ok(v)
+        };
+        let hc = get_u32(&mut p)?;
+        let dim = get_u32(&mut p)?;
+        let mut get_f32 = |p: &mut usize| -> Result<f32> {
+            need(*p, 4)?;
+            let v = f32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap());
+            *p += 4;
+            Ok(v)
+        };
+        let xv: Vec<f32> = (0..hc * dim)
+            .map(|_| get_f32(&mut p))
+            .collect::<Result<_>>()?;
+        let x = crate::tensor::Tensor::from_vec(xv, (1, 1, hc, dim), &crate::tensor::Device::Cpu)?;
+        let rows = get_u32(&mut p)?;
+        let mut pre_mix = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let cols = get_u32(&mut p)?;
+            pre_mix.push((0..cols).map(|_| get_f32(&mut p)).collect::<Result<_>>()?);
+        }
+        let recent = if get_u32(&mut p)? == 1 {
+            let n = get_u32(&mut p)?;
+            Some(
+                (0..n)
+                    .map(|_| get_u32(&mut p).map(|v| v as u32))
+                    .collect::<Result<_>>()?,
+            )
+        } else {
+            None
+        };
+        // The band state, in the order `to_bytes` wrote it: the two tensors, then the two index
+        // vectors. Absent fields (a ratio-0 cut) read back as `None`. Inlined rather than a helper
+        // so the byte cursor is not borrowed by two closures at once.
+        let mut tensors: Vec<Option<crate::tensor::Tensor>> = Vec::with_capacity(2);
+        for _ in 0..2 {
+            if get_u32(&mut p)? == 0 {
+                tensors.push(None);
+                continue;
+            }
+            let nd = get_u32(&mut p)?;
+            let dims: Vec<usize> = (0..nd).map(|_| get_u32(&mut p)).collect::<Result<_>>()?;
+            let count: usize = dims.iter().product();
+            let data: Vec<f32> = (0..count).map(|_| get_f32(&mut p)).collect::<Result<_>>()?;
+            tensors.push(Some(crate::tensor::Tensor::from_vec(
+                data,
+                crate::tensor::Shape::from_dims(&dims),
+                &crate::tensor::Device::Cpu,
+            )?));
+        }
+        let index_k = tensors.pop().unwrap();
+        let compress_kv = tensors.pop().unwrap();
+        let topk_idxs = if get_u32(&mut p)? == 1 {
+            let n = get_u32(&mut p)?;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                need(p, 4)?;
+                v.push(i32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()));
+                p += 4;
+            }
+            Some(v)
+        } else {
+            None
+        };
+        let candidates = if get_u32(&mut p)? == 1 {
+            let n = get_u32(&mut p)?;
+            need(p, n)?;
+            let v = bytes[p..p + n].iter().map(|&b| b != 0).collect();
+            p += n;
+            Some(v)
+        } else {
+            None
+        };
+        Ok(DecodeBoundary {
+            x,
+            pre_mix,
+            shared: SharedAttn {
+                compress_kv,
+                index_k,
+                topk_idxs,
+                candidates,
+            },
+            recent,
+        })
+    }
+}
+
+/// What a decode layer range starts from: the token at the head of the stack, or the boundary a
+/// previous range produced.
+pub enum DecodeRangeIn {
+    Token(u32),
+    Resume(DecodeBoundary),
+}
+
+/// What a decode layer range yields: the boundary for the next range, or the token's logits when
+/// the range runs to the end of the stack.
+pub enum DecodeRangeOut {
+    Boundary(DecodeBoundary),
+    Logits(crate::tensor::Tensor),
+}
+
 impl DeepseekV41Model {
     /// Load the resident model from a GGUF source - one mapped file or a split set. Each layer is
     /// loaded in its band's mode.
     pub fn load<S: WeightSource + ?Sized>(g: &S, cfg: &DeepseekV41Config) -> Result<Self> {
+        Self::load_range(g, cfg, 0)
+    }
+
+    /// Load only the layers `[from, n)`, for a node that runs that range of a pipeline. The layers
+    /// before `from` are left unheld and their weights are never fetched, which is the whole point
+    /// of the split: a node streams and holds only its own stage. The head and tail tensors - the
+    /// embedding, the final norm, the output projection - are loaded whatever the range, so the
+    /// range runs to logits on its own. `from == 0` loads the whole model.
+    pub fn load_range<S: WeightSource + ?Sized>(
+        g: &S,
+        cfg: &DeepseekV41Config,
+        from: usize,
+    ) -> Result<Self> {
         let embed = g.dense_f32("embed.weight")?;
         let norm = g.dense_f32("norm.weight")?;
         // The head is its own tensor when present, otherwise tied to the embedding.
@@ -111,12 +339,18 @@ impl DeepseekV41Model {
         let mut blocks = Vec::with_capacity(cfg.n_layers);
         let mut engrams = Vec::with_capacity(cfg.n_layers);
         for layer in 0..cfg.n_layers {
+            if layer < from {
+                // Outside this node's range: never fetched, never run.
+                blocks.push(None);
+                engrams.push(None);
+                continue;
+            }
             let ratio = cfg.compress_ratios.get(layer).copied().unwrap_or(0);
-            blocks.push(if ratio == 0 {
+            blocks.push(Some(if ratio == 0 {
                 load_ratio0_block(g, layer, cfg)?
             } else {
                 load_band_block(g, layer, cfg)?
-            });
+            }));
             let has_engram = cfg
                 .engram
                 .as_ref()
@@ -230,7 +464,7 @@ impl DeepseekV41Model {
         } else {
             (&state.ropes[1].0, &state.ropes[1].1)
         };
-        let (nx, npm) = self.blocks[i].forward_prefill(
+        let (nx, npm) = self.block(i)?.forward_prefill(
             &state.x,
             &state.pre_mix,
             cos,
@@ -257,6 +491,9 @@ impl DeepseekV41Model {
         }
         let mut prefill = self.prefill_begin(tokens)?;
         for (i, block) in self.blocks.iter().enumerate() {
+            let Some(block) = block.as_ref() else {
+                continue;
+            };
             // Each layer's own time, for a recorder that keeps them apart rather than summed.
             let layer_started = std::time::Instant::now();
             if let (Some(engram), Some(ecfg)) = (&self.engrams[i], &self.engram_cfg) {
@@ -312,7 +549,7 @@ impl DeepseekV41Model {
                 "prefill: layer {i} asked for out of turn"
             )));
         }
-        let block = &self.blocks[i];
+        let block = self.block(i)?;
         let mut mids = Vec::with_capacity(states.len());
         let mut pre = Vec::new();
         for state in states.iter_mut() {
@@ -366,7 +603,7 @@ impl DeepseekV41Model {
 
     /// Resize the routed experts' hot cache of layer `i` alone.
     pub fn set_layer_expert_cache(&self, i: usize, slots: usize) {
-        if let Some(b) = self.blocks.get(i) {
+        if let Some(b) = self.blocks.get(i).and_then(|b| b.as_ref()) {
             b.moe.set_expert_cache(slots);
         }
     }
@@ -378,7 +615,12 @@ impl DeepseekV41Model {
 
     /// Routed experts a token passes through, beside the shared one.
     pub fn n_activated(&self) -> usize {
-        self.blocks.first().map(|b| b.moe.n_activated).unwrap_or(0)
+        self.blocks
+            .iter()
+            .flatten()
+            .next()
+            .map(|b| b.moe.n_activated)
+            .unwrap_or(0)
     }
 
     /// The most a step of a batch of `tokens` asks a card for beside the weights it keeps: an
@@ -389,7 +631,9 @@ impl DeepseekV41Model {
         let f = std::mem::size_of::<f32>();
         let inter = self
             .blocks
-            .first()
+            .iter()
+            .flatten()
+            .next()
             .map(|b| b.moe.shared.w1.dims()[0])
             .unwrap_or(0);
         let per_lane = tokens * (2 * self.dim + 2 * inter) * f;
@@ -402,6 +646,7 @@ impl DeepseekV41Model {
         let largest = self
             .blocks
             .iter()
+            .flatten()
             .map(|b| b.attn.bytes())
             .max()
             .unwrap_or(0)
@@ -423,10 +668,81 @@ impl DeepseekV41Model {
         self.blocks.len()
     }
 
+    /// The block at absolute layer `i`, or an error when this node did not load that layer - it is
+    /// outside the range this node runs.
+    fn block(&self, i: usize) -> Result<&Block> {
+        self.blocks
+            .get(i)
+            .and_then(|b| b.as_ref())
+            .ok_or_else(|| Error::msg(format!("layer {i} is not held on this node")))
+    }
+
+    /// The shape a node needs to measure its own cost of computing one missed routed expert:
+    /// `(dim, inter, gate_up_dtype, down_dtype)`, read from a real expert on the first layer this
+    /// node holds. `None` when no layer is held or the experts are not in a GGUF quant format the
+    /// miss bench models (a dense or block-scaled expert). The model declares the shape; the engine
+    /// turns it into a cost.
+    pub fn expert_cost_shape(
+        &self,
+    ) -> Option<(
+        usize,
+        usize,
+        crate::tensor::quantized::GgmlDType,
+        crate::tensor::quantized::GgmlDType,
+    )> {
+        let l = self.blocks.iter().position(|b| b.is_some())?;
+        let e = self.expert_store(l)?.fetch(0).ok()?;
+        let gate_dt = e.w1.quant_dtype()?;
+        let down_dt = e.w2.quant_dtype()?;
+        // w1 is [inter, dim].
+        let dims = e.w1.dims();
+        let inter = *dims.first()?;
+        let dim = *dims.get(1)?;
+        Some((dim, inter, gate_dt, down_dt))
+    }
+
+    /// The model-side inputs the cut planner needs to place this model across the cluster:
+    /// `(attn_bytes_per_held_layer, expert_bytes, working_set, activated)`. `None` when a piece is
+    /// not measurable - no held layer, no expert bytes, or no calibrated hot-expert count to size
+    /// residency against. The working set is the measured hot-expert count per layer, never a guess.
+    pub fn placement_model_inputs(&self) -> Option<(Vec<u64>, u64, u64, u64)> {
+        let attn_per_layer: Vec<u64> = self
+            .blocks
+            .iter()
+            .flatten()
+            .map(|b| b.attn.bytes() as u64)
+            .collect();
+        if attn_per_layer.is_empty() {
+            return None;
+        }
+        let expert_bytes = self.expert_bytes().ok()? as u64;
+        if expert_bytes == 0 {
+            return None;
+        }
+        let lens: Vec<usize> = self
+            .hot_experts()
+            .iter()
+            .map(|h| h.len())
+            .filter(|&l| l > 0)
+            .collect();
+        if lens.is_empty() {
+            return None;
+        }
+        let working_set = (lens.iter().sum::<usize>() / lens.len()) as u64;
+        Some((
+            attn_per_layer,
+            expert_bytes,
+            working_set,
+            self.n_activated() as u64,
+        ))
+    }
+
     /// The bytes one routed expert occupies as stored.
     pub fn expert_bytes(&self) -> Result<usize> {
         self.blocks
-            .first()
+            .iter()
+            .flatten()
+            .next()
             .map(|b| b.moe.experts.expert_bytes())
             .unwrap_or(Ok(0))
     }
@@ -437,6 +753,7 @@ impl DeepseekV41Model {
     pub fn resident_path_bytes(&self) -> usize {
         self.blocks
             .iter()
+            .flatten()
             .map(|b| b.attn.bytes() + b.moe.shared.bytes() + b.moe.gate_bytes())
             .sum::<usize>()
             + self.output.bytes()
@@ -488,6 +805,7 @@ impl DeepseekV41Model {
     pub fn expert_store_stats(&self) -> Vec<crate::inference::offload::store::StoreStats> {
         self.blocks
             .iter()
+            .flatten()
             .map(|b| match &b.moe.experts {
                 crate::inference::offload::store::ExpertSet::Streamed(s) => s.stats(),
                 crate::inference::offload::store::ExpertSet::Resident(_) => Default::default(),
@@ -497,7 +815,7 @@ impl DeepseekV41Model {
 
     /// Layer `i`'s streamed expert store, when it is one.
     pub fn expert_store(&self, i: usize) -> Option<&crate::inference::offload::store::ExpertStore> {
-        match &self.blocks.get(i)?.moe.experts {
+        match &self.blocks.get(i)?.as_ref()?.moe.experts {
             crate::inference::offload::store::ExpertSet::Streamed(s) => Some(s),
             crate::inference::offload::store::ExpertSet::Resident(_) => None,
         }
@@ -506,7 +824,7 @@ impl DeepseekV41Model {
     /// Reclaim, in every layer, the pages of the experts the tier does not keep: what
     /// read-ahead pulled in beside the ones asked for.
     pub fn sweep_experts(&self) -> Result<()> {
-        for b in &self.blocks {
+        for b in self.blocks.iter().flatten() {
             b.moe.experts.sweep()?;
         }
         Ok(())
@@ -517,6 +835,7 @@ impl DeepseekV41Model {
     pub fn expert_residency(&self) -> Result<Vec<(f64, f64)>> {
         self.blocks
             .iter()
+            .flatten()
             .map(|b| match &b.moe.experts {
                 crate::inference::offload::store::ExpertSet::Streamed(s) => s.residency(),
                 crate::inference::offload::store::ExpertSet::Resident(_) => Ok((1.0, 0.0)),
@@ -528,13 +847,18 @@ impl DeepseekV41Model {
     pub fn last_routing(&self) -> Vec<Vec<Vec<(usize, f32)>>> {
         self.blocks
             .iter()
+            .flatten()
             .map(|b| b.moe.last_routing.lock().unwrap().clone())
             .collect()
     }
 
     /// Per layer, how many times each routed expert was requested so far.
     pub fn expert_usage(&self) -> Vec<Vec<u64>> {
-        self.blocks.iter().map(|b| b.moe.experts.usage()).collect()
+        self.blocks
+            .iter()
+            .flatten()
+            .map(|b| b.moe.experts.usage())
+            .collect()
     }
 
     /// Tell `observe` what every layer's MoE block routes where on each forward, with the layer's
@@ -547,6 +871,7 @@ impl DeepseekV41Model {
         >,
     ) {
         for (l, b) in self.blocks.iter().enumerate() {
+            let Some(b) = b.as_ref() else { continue };
             *b.moe.observer.write().unwrap() = observe.clone().map(|f| {
                 std::sync::Arc::new(move |e: Option<usize>, x: &[f32], w: &[f32], h: &[f32]| {
                     f(l, e, x, w, h)
@@ -560,14 +885,14 @@ impl DeepseekV41Model {
         &self,
         offload: Option<std::sync::Arc<crate::inference::offload::experts::ExpertOffload>>,
     ) {
-        for b in &self.blocks {
+        for b in self.blocks.iter().flatten() {
             *b.moe.offload.write().unwrap() = offload.clone();
         }
     }
 
     /// Resize every layer's expert hot cache to `slots` entries.
     pub fn set_expert_cache(&self, slots: usize) {
-        for b in &self.blocks {
+        for b in self.blocks.iter().flatten() {
             b.moe.set_expert_cache(slots);
         }
     }
@@ -621,6 +946,9 @@ impl DeepseekV41Model {
             state.captured = vec![Vec::new(); cap.len()];
         }
         for (i, block) in self.blocks.iter().enumerate() {
+            let Some(block) = block.as_ref() else {
+                continue;
+            };
             if let (Some(engram), Some(ecfg), Some(recent)) =
                 (&self.engrams[i], &self.engram_cfg, &recent)
             {
@@ -668,6 +996,465 @@ impl DeepseekV41Model {
             crate::inference::offload::stage("head", || self.output.apply(&h.reshape((1, dim))?))?;
         state.pos += 1;
         Ok(logits)
+    }
+
+    /// Run layers `[from, to)` of a decode. This is `forward_decode` split at a layer boundary, so
+    /// a pipeline can place one contiguous run of layers on each node: `from == 0` embeds the token
+    /// and starts the residual; `to == n_layers` finishes with the final norm and head and advances
+    /// the position; an interior range returns the boundary the next range resumes from - the
+    /// residual stream, its collapse weights, the band state that flows down within a token, and the
+    /// engram recent this token pushed. Each range advances only its own layers' caches
+    /// (`state.layers[from..to]`), which on a cluster is exactly the layers that node holds. The
+    /// split is bit-for-bit `forward_decode`: the same per-layer block, only the loop is cut.
+    pub fn forward_decode_range(
+        &self,
+        input: DecodeRangeIn,
+        from: usize,
+        to: usize,
+        state: &mut DecodeState,
+    ) -> Result<DecodeRangeOut> {
+        let pos = state.pos;
+        let (dim, hc) = (self.dim, self.hc_mult);
+        let n = pos + 1;
+        let (cos0, sin0) = rope_table(self.rope_head_dim, n, 0, self.rope_theta, self.rope_factor)?;
+        let (cosb, sinb) = rope_table(
+            self.rope_head_dim,
+            n,
+            self.original_seq_len,
+            self.compress_rope_theta,
+            self.rope_factor,
+        )?;
+
+        // Node 0 embeds the token and pushes the engram recent once; a later range resumes from the
+        // boundary the previous one produced.
+        let (mut x, mut pre_mix, mut shared, recent) = match input {
+            DecodeRangeIn::Token(token) => {
+                let row = crate::inference::offload::stage("embed", || {
+                    self.embed.narrow(0, token as usize, 1)
+                })?;
+                let x = row
+                    .reshape((1, 1, dim))?
+                    .unsqueeze(2)?
+                    .broadcast_as((1, 1, hc, dim))?
+                    .contiguous()?;
+                let pre_mix = vec![{
+                    let mut v = vec![0f32; hc];
+                    v[0] = 1.0;
+                    v
+                }];
+                let recent = self
+                    .engram_cfg
+                    .as_ref()
+                    .map(|ecfg| state.engram.push(ecfg, token));
+                (x, pre_mix, SharedAttn::default(), recent)
+            }
+            DecodeRangeIn::Resume(b) => (b.x, b.pre_mix, b.shared, b.recent),
+        };
+
+        let cap = state.capture_layers.clone();
+        if from == 0 && !cap.is_empty() {
+            state.captured = vec![Vec::new(); cap.len()];
+        }
+        for i in from..to {
+            if let (Some(engram), Some(ecfg), Some(recent)) =
+                (&self.engrams[i], &self.engram_cfg, &recent)
+            {
+                let which = ecfg.layer_ids.iter().position(|&l| l == i).unwrap_or(0);
+                x = engram.forward(&x, &[ecfg.hash(which, recent)])?;
+            }
+            if let Some(ci) = cap.iter().position(|&l| l == i) {
+                let v = x.reshape((hc, dim))?.to_vec2::<f32>()?;
+                let mut m = vec![0f32; dim];
+                for row in &v {
+                    for (j, &val) in row.iter().enumerate() {
+                        m[j] += val;
+                    }
+                }
+                let inv = 1.0 / hc as f32;
+                for val in m.iter_mut() {
+                    *val *= inv;
+                }
+                state.captured[ci] = m;
+            }
+            let (cos, sin) = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
+                (&cos0, &sin0)
+            } else {
+                (&cosb, &sinb)
+            };
+            let (nx, npm) = self.block(i)?.forward_decode(
+                &x,
+                &pre_mix,
+                cos,
+                sin,
+                pos,
+                &mut state.layers[i],
+                &mut shared,
+            )?;
+            x = nx;
+            pre_mix = npm;
+        }
+
+        if to >= self.blocks.len() {
+            let h = hc_pre(&x, &pre_mix)?;
+            let h = crate::inference::offload::stage("final norm", || {
+                rms_norm(&h, &self.norm, self.rms_eps)
+            })?;
+            let logits = crate::inference::offload::stage("head", || {
+                self.output.apply(&h.reshape((1, dim))?)
+            })?;
+            state.pos += 1;
+            Ok(DecodeRangeOut::Logits(logits))
+        } else {
+            Ok(DecodeRangeOut::Boundary(DecodeBoundary {
+                x,
+                pre_mix,
+                shared,
+                recent,
+            }))
+        }
+    }
+
+    /// Decode one token by running the stack in `segments` (half-open layer ranges that must
+    /// partition the layers in order), each a `forward_decode_range`, the boundary handed from one
+    /// to the next. This is the single-process rehearsal of the pipeline a cluster runs with each
+    /// segment on its node, and equals `forward_decode` bit for bit whatever the cut. The engine's
+    /// generalizable form drives `ModelBackend::decode_range` the same way across nodes.
+    pub fn pipeline_decode(
+        &self,
+        token: u32,
+        segments: &[(usize, usize)],
+        state: &mut DecodeState,
+    ) -> Result<Tensor> {
+        let n = self.blocks.len();
+        let mut next = 0;
+        for &(a, b) in segments {
+            if a != next || b <= a || b > n {
+                return Err(Error::msg(format!(
+                    "pipeline_decode: segment ({a},{b}) does not continue a partition of {n} layers"
+                )));
+            }
+            next = b;
+        }
+        if next != n {
+            return Err(Error::msg(
+                "pipeline_decode: segments do not cover the stack",
+            ));
+        }
+        let mut input = DecodeRangeIn::Token(token);
+        for &(a, b) in segments {
+            match self.forward_decode_range(input, a, b, state)? {
+                DecodeRangeOut::Logits(l) => return Ok(l),
+                DecodeRangeOut::Boundary(bd) => input = DecodeRangeIn::Resume(bd),
+            }
+        }
+        Err(Error::msg(
+            "pipeline_decode: last segment yielded no logits",
+        ))
+    }
+
+    /// The head node of a pipeline: run layers `[0, cut)` for `token`, ship the ratio-0 boundary
+    /// over the kept `link`, and read back the tail node's logits. The reply is f32 bytes, the
+    /// vocab row. Reusable serving code, the same path the socket test rehearses.
+    pub fn pipeline_head_step(
+        &self,
+        token: u32,
+        cut: usize,
+        state: &mut DecodeState,
+        link: &mut crate::distributed::wire_link::WireLink,
+    ) -> Result<Vec<f32>> {
+        let bd = match self.forward_decode_range(DecodeRangeIn::Token(token), 0, cut, state)? {
+            DecodeRangeOut::Boundary(bd) => bd,
+            DecodeRangeOut::Logits(_) => {
+                return Err(Error::msg("pipeline_head_step: cut runs the whole stack"))
+            }
+        };
+        // The head runs a range on its own state, so its position advances per token here, the way
+        // the whole-stack path advances it on the logits. Without this the head's KV and rope stay
+        // at position zero and a band layer indexes past the single cached step on the next token.
+        state.pos += 1;
+        let blob = bd.to_bytes()?;
+        let (_h, reply) = link
+            .request(
+                cut as u32,
+                crate::distributed::wire::WireDType::Q8,
+                vec![blob.len() as u32],
+                &blob,
+            )
+            .map_err(|e| Error::msg(format!("pipeline_head_step: link: {e}")))?;
+        if reply.len() % 4 != 0 {
+            return Err(Error::msg(
+                "pipeline_head_step: logits reply not f32-aligned",
+            ));
+        }
+        Ok(reply
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect())
+    }
+
+    /// One head-side decode step over a multiplexed link. Same as `pipeline_head_step`, but the
+    /// boundary carries its `seq_id` ahead of the bytes so a tail serving several sequences on one
+    /// connection knows which decode state to resume, and the link is a shared `MuxLink` so many
+    /// sequences run their steps concurrently on it - the reply is matched to its request by the
+    /// link, not by call order. The model is read-only here and each sequence owns its `state`, so
+    /// the concurrent calls share nothing that mutates.
+    /// One head-side decode step over a plain synchronous link, carrying the same `seq_id`-tagged
+    /// boundary a mux tail expects. For a single sequence this is the whole of the head's work and
+    /// wants no reader thread: send the boundary, read the logits, on the one caller's thread.
+    pub fn pipeline_head_step_wire(
+        &self,
+        token: u32,
+        cut: usize,
+        seq_id: u32,
+        state: &mut DecodeState,
+        link: &mut crate::distributed::wire_link::WireLink,
+    ) -> Result<Vec<f32>> {
+        let bd = match self.forward_decode_range(DecodeRangeIn::Token(token), 0, cut, state)? {
+            DecodeRangeOut::Boundary(bd) => bd,
+            DecodeRangeOut::Logits(_) => {
+                return Err(Error::msg(
+                    "pipeline_head_step_wire: cut runs the whole stack",
+                ))
+            }
+        };
+        // Advance this state's position per token; see `pipeline_head_step`.
+        state.pos += 1;
+        let blob = bd.to_bytes()?;
+        let mut payload = Vec::with_capacity(4 + blob.len());
+        payload.extend_from_slice(&seq_id.to_le_bytes());
+        payload.extend_from_slice(&blob);
+        let (_h, reply) = link
+            .request(
+                cut as u32,
+                crate::distributed::wire::WireDType::Q8,
+                vec![payload.len() as u32],
+                &payload,
+            )
+            .map_err(|e| Error::msg(format!("pipeline_head_step_wire: link: {e}")))?;
+        if reply.len() % 4 != 0 {
+            return Err(Error::msg(
+                "pipeline_head_step_wire: logits reply not f32-aligned",
+            ));
+        }
+        Ok(reply
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect())
+    }
+
+    pub fn pipeline_head_step_mux(
+        &self,
+        token: u32,
+        cut: usize,
+        seq_id: u32,
+        state: &mut DecodeState,
+        link: &crate::distributed::wire_mux::MuxLink,
+    ) -> Result<Vec<f32>> {
+        let bd = match self.forward_decode_range(DecodeRangeIn::Token(token), 0, cut, state)? {
+            DecodeRangeOut::Boundary(bd) => bd,
+            DecodeRangeOut::Logits(_) => {
+                return Err(Error::msg(
+                    "pipeline_head_step_mux: cut runs the whole stack",
+                ))
+            }
+        };
+        // Advance this state's position per token; see `pipeline_head_step`.
+        state.pos += 1;
+        let blob = bd.to_bytes()?;
+        let mut payload = Vec::with_capacity(4 + blob.len());
+        payload.extend_from_slice(&seq_id.to_le_bytes());
+        payload.extend_from_slice(&blob);
+        let (_h, reply) = link
+            .request(
+                cut as u32,
+                crate::distributed::wire::WireDType::Q8,
+                vec![payload.len() as u32],
+                &payload,
+            )
+            .map_err(|e| Error::msg(format!("pipeline_head_step_mux: link: {e}")))?;
+        if reply.len() % 4 != 0 {
+            return Err(Error::msg(
+                "pipeline_head_step_mux: logits reply not f32-aligned",
+            ));
+        }
+        Ok(reply
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect())
+    }
+
+    /// The tail node of a pipeline: handle one boundary frame - rebuild it, run layers `[from, n)`
+    /// on `state`, and return the logits as an f32-byte reply. Given to `wire_link::serve_once` as
+    /// its handler. Errors surface as an empty reply, which the head reads as a short row.
+    pub fn pipeline_tail_reply(
+        &self,
+        payload: &[u8],
+        from: usize,
+        state: &mut DecodeState,
+    ) -> Vec<u8> {
+        let logits = DecodeBoundary::from_bytes(payload)
+            .and_then(|bd| {
+                self.forward_decode_range(DecodeRangeIn::Resume(bd), from, self.blocks.len(), state)
+            })
+            .and_then(|out| match out {
+                DecodeRangeOut::Logits(l) => l.flatten_all()?.to_vec1::<f32>(),
+                DecodeRangeOut::Boundary(_) => Err(Error::msg(
+                    "pipeline_tail_reply: tail did not reach the head",
+                )),
+            });
+        match logits {
+            Ok(v) => {
+                let mut bytes = Vec::with_capacity(v.len() * 4);
+                for f in &v {
+                    bytes.extend_from_slice(&f.to_le_bytes());
+                }
+                bytes
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Run this node as a pipeline tail: accept one head connection on `listener` and serve every
+    /// boundary that arrives over it, running layers `[from, n)` on one decode state and replying
+    /// with the logits, until the head hangs up. This is the whole of a tail node's serving loop -
+    /// additive, touching no other serving path. `from == 0` would run the whole stack, which a
+    /// head node does instead.
+    pub fn serve_pipeline_tail(
+        &self,
+        from: usize,
+        listener: std::net::TcpListener,
+    ) -> std::io::Result<()> {
+        use crate::distributed::wire::{FrameHeader, WireDType};
+        let mut state = self.new_decode_state();
+        let n = self.blocks.len();
+        crate::distributed::wire_link::serve_once(listener, |_h, payload| {
+            let bytes = self.pipeline_tail_reply(payload, from, &mut state);
+            let n_f32 = (bytes.len() / 4) as u32;
+            (
+                FrameHeader {
+                    request_id: 0,
+                    layer_id: n as u32,
+                    dtype: WireDType::F32,
+                    shape: vec![n_f32],
+                },
+                bytes,
+            )
+        })
+    }
+
+    /// Run this node as a pipeline tail serving several sequences multiplexed on one connection.
+    /// Each boundary frame carries its `seq_id` in the first four bytes, ahead of the boundary the
+    /// head sent; the tail keeps one decode state per sequence and runs the frames as they arrive,
+    /// one at a time, so the forward path is never entered concurrently on this node. Replies echo
+    /// the frame's request id (`serve_connection` does that), so a head multiplexing many sequences
+    /// matches each logits row to the boundary it sent. Additive, touching no other serving path.
+    pub fn serve_pipeline_tail_mux(
+        &self,
+        from: usize,
+        listener: std::net::TcpListener,
+    ) -> std::io::Result<()> {
+        self.serve_pipeline_segment(from, self.blocks.len(), None, listener)
+    }
+
+    /// Answer one boundary frame for an interior or final segment `[from, to)`. Runs the range on
+    /// this node's state; if `to` reaches the end it returns the logits, otherwise it relays its own
+    /// boundary to the next node over `down` and returns the logits that come back. An interior
+    /// segment with no downstream, or any failure, answers an empty row - which the caller reads as
+    /// a short reply, not a resumed state.
+    fn pipeline_segment_reply(
+        &self,
+        payload: &[u8],
+        from: usize,
+        to: usize,
+        seq_id: u32,
+        state: &mut DecodeState,
+        down: Option<&mut crate::distributed::wire_link::WireLink>,
+    ) -> Vec<u8> {
+        let out = DecodeBoundary::from_bytes(payload)
+            .and_then(|bd| self.forward_decode_range(DecodeRangeIn::Resume(bd), from, to, state));
+        match out {
+            Ok(DecodeRangeOut::Logits(l)) => {
+                match l.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
+                    Ok(v) => {
+                        let mut bytes = Vec::with_capacity(v.len() * 4);
+                        for f in &v {
+                            bytes.extend_from_slice(&f.to_le_bytes());
+                        }
+                        bytes
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+            Ok(DecodeRangeOut::Boundary(bd2)) => {
+                // An interior range yields a boundary, not logits, so its position does not advance
+                // inside the forward the way the final segment's does; advance it here, as the head
+                // does, or the band layers index past this segment's single cached step next token.
+                state.pos += 1;
+                let Some(down) = down else {
+                    return Vec::new();
+                };
+                let blob = match bd2.to_bytes() {
+                    Ok(b) => b,
+                    Err(_) => return Vec::new(),
+                };
+                let mut fwd = Vec::with_capacity(4 + blob.len());
+                fwd.extend_from_slice(&seq_id.to_le_bytes());
+                fwd.extend_from_slice(&blob);
+                match down.request(
+                    to as u32,
+                    crate::distributed::wire::WireDType::Q8,
+                    vec![fwd.len() as u32],
+                    &fwd,
+                ) {
+                    Ok((_h, reply)) => reply,
+                    Err(_) => Vec::new(),
+                }
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Run this node as one segment of a pipeline of any length: serve layers `[from, to)` for every
+    /// boundary a head or an upstream segment sends, keeping one decode state per sequence. `next` is
+    /// the node running `[to, ...)`; a final segment (`to == n`) passes `None` and replies with the
+    /// logits, an interior segment relays to `next` and returns what it answers. This is the whole of
+    /// a segment node's serving loop, and a two-node tail is just the `to == n`, `next == None` case.
+    pub fn serve_pipeline_segment(
+        &self,
+        from: usize,
+        to: usize,
+        next: Option<std::net::SocketAddr>,
+        listener: std::net::TcpListener,
+    ) -> std::io::Result<()> {
+        use crate::distributed::wire::{FrameHeader, WireDType};
+        use std::collections::HashMap;
+        let mut down = match next {
+            Some(a) => Some(crate::distributed::wire_link::WireLink::connect(a)?),
+            None => None,
+        };
+        let mut states: HashMap<u32, DecodeState> = HashMap::new();
+        let n = self.blocks.len();
+        crate::distributed::wire_link::serve_once(listener, |_h, payload| {
+            let bytes = if payload.len() < 4 {
+                Vec::new()
+            } else {
+                let seq_id = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                let state = states
+                    .entry(seq_id)
+                    .or_insert_with(|| self.new_decode_state());
+                self.pipeline_segment_reply(&payload[4..], from, to, seq_id, state, down.as_mut())
+            };
+            let n_f32 = (bytes.len() / 4) as u32;
+            (
+                FrameHeader {
+                    request_id: 0,
+                    layer_id: n as u32,
+                    dtype: WireDType::F32,
+                    shape: vec![n_f32],
+                },
+                bytes,
+            )
+        })
     }
 
     /// Verify a block of `tokens` starting at `state.pos`, returning the next-token logits at
@@ -733,6 +1520,9 @@ impl DeepseekV41Model {
         let mut shareds: Vec<SharedAttn> = (0..k).map(|_| SharedAttn::default()).collect();
 
         for (i, block) in self.blocks.iter().enumerate() {
+            let Some(block) = block.as_ref() else {
+                continue;
+            };
             let (cos, sin) = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
                 (&cos0, &sin0)
             } else {
@@ -840,6 +1630,9 @@ impl DeepseekV41Model {
         let mut shareds: Vec<SharedAttn> = (0..n).map(|_| SharedAttn::default()).collect();
 
         for (i, block) in self.blocks.iter().enumerate() {
+            let Some(block) = block.as_ref() else {
+                continue;
+            };
             let (cos, sin) = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
                 (&cos0, &sin0)
             } else {
@@ -956,6 +1749,33 @@ impl DeepseekV41Model {
             }
         }
         Ok(out)
+    }
+}
+
+/// The model as the engine's streamed placement sees it: resident footprint, routing and experts,
+/// with no V4.1 concept crossing the seam. The figures delegate to the model's own accounting.
+impl crate::inference::offload::streamed::StreamedModel for DeepseekV41Model {
+    fn resident_bytes(&self) -> usize {
+        self.resident_path_bytes()
+    }
+    fn peak_transient_bytes(&self, tokens: usize) -> usize {
+        self.transient_bytes(tokens)
+    }
+    fn active_experts(&self) -> usize {
+        self.n_activated()
+    }
+    fn layer_count(&self) -> usize {
+        self.n_layers()
+    }
+    fn routing_prior(&self) -> &[Vec<usize>] {
+        self.hot_experts()
+    }
+    fn expert(
+        &self,
+        layer: usize,
+        id: usize,
+    ) -> Option<std::sync::Arc<crate::inference::offload::experts::Expert>> {
+        self.expert_store(layer)?.fetch(id).ok()
     }
 }
 
@@ -1257,6 +2077,21 @@ mod tests {
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("loken-dsv41-{tag}-{}", std::process::id()))
+    }
+
+    /// The model declares its expert cost shape from a real held expert: dims from the loaded
+    /// weight, the stored quant formats. This is what a node measures its miss cost against.
+    #[test]
+    fn declares_its_expert_cost_shape() {
+        let path = tmp("shape.gguf");
+        write_gguf_with_metadata(&path, &real_md(3), &real_entries()).unwrap();
+        let g = open_mapped(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let cfg = DeepseekV41Config::from_gguf(&g.content).unwrap();
+        let model = DeepseekV41Model::load(&g, &cfg).unwrap();
+        let (dim, inter, _gate_dt, _down_dt) =
+            model.expert_cost_shape().expect("shape from a held expert");
+        assert_eq!((dim, inter), (DIM, INTER));
     }
 
     /// A file in llama.cpp's naming, carrying only the keys its converter writes, loads: the
@@ -1919,7 +2754,8 @@ mod oracle_gate {
     /// not change any sequence's output.
     #[test]
     fn batch_server_streams_the_batched_tokens() {
-        use crate::inference::model::deepseek_v41::batch_server::{Tok, V41BatchServer};
+        use crate::inference::model::deepseek_v41::batch_server::V41BatchServer;
+        use crate::inference::serve::continuous_serve::CbToken;
         use std::sync::Arc;
         let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
         let prompts: Vec<Vec<u32>> = (0..3)
@@ -1946,14 +2782,633 @@ mod oracle_gate {
                 let mut seq = Vec::new();
                 while let Ok(t) = rx.recv() {
                     match t {
-                        Tok::Next(x) => seq.push(x),
-                        Tok::Done => break,
+                        CbToken::Tok(x) => seq.push(x),
+                        CbToken::Done(_) => break,
                     }
                 }
                 seq
             })
             .collect();
         assert_eq!(got, want, "the worker must stream the batched tokens");
+    }
+
+    /// Decoding split at a layer boundary equals decoding the whole stack, bit for bit: the same
+    /// per-layer block runs in the same order, only the loop is cut - the property a pipeline that
+    /// places one run of layers per node rests on. The boundary carries the residual, its collapse
+    /// weights, the band state and the engram recent across the cut.
+    #[test]
+    fn forward_decode_range_splits_the_stack() {
+        let layouts: [(&[u32], &[u32], &[u32]); 2] =
+            [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
+        for (ratios, kv_src, index_src) in layouts {
+            let (model, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            let n_layers = ratios.len();
+            for cut in [1usize, n_layers / 2, n_layers - 1] {
+                let mut whole = model.new_decode_state();
+                let mut split = model.new_decode_state();
+                let run_split =
+                    |model: &DeepseekV41Model, t: u32, st: &mut DecodeState| -> Vec<f32> {
+                        let b = model
+                            .forward_decode_range(DecodeRangeIn::Token(t), 0, cut, st)
+                            .unwrap();
+                        let bd = match b {
+                            DecodeRangeOut::Boundary(bd) => bd,
+                            _ => panic!("interior range must yield a boundary"),
+                        };
+                        match model
+                            .forward_decode_range(DecodeRangeIn::Resume(bd), cut, n_layers, st)
+                            .unwrap()
+                        {
+                            DecodeRangeOut::Logits(l) => vecf_of(&l),
+                            _ => panic!("final range must yield logits"),
+                        }
+                    };
+                // Decode a shared prefix identically into both states.
+                for &t in &tokens[..tokens.len() - 1] {
+                    model.forward_decode(t, &mut whole).unwrap();
+                    run_split(&model, t, &mut split);
+                }
+                let last = *tokens.last().unwrap();
+                let wl = vecf_of(&model.forward_decode(last, &mut whole).unwrap());
+                let sl = run_split(&model, last, &mut split);
+                assert_eq!(
+                    wl, sl,
+                    "{ratios:?} cut {cut}: split decode must equal whole decode bit for bit"
+                );
+            }
+        }
+    }
+
+    /// A multi-segment pipeline decode equals the whole decode bit for bit, whatever the partition:
+    /// the rehearsal a cluster runs with one segment per node.
+    #[test]
+    fn pipeline_decode_over_segments_equals_whole() {
+        let layouts: [(&[u32], &[u32], &[u32]); 2] =
+            [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
+        for (ratios, kv_src, index_src) in layouts {
+            let (model, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            let n = ratios.len();
+            let segs: Vec<(usize, usize)> = if n >= 3 {
+                vec![(0, 1), (1, n - 1), (n - 1, n)]
+            } else {
+                vec![(0, 1), (1, n)]
+            };
+            let mut whole = model.new_decode_state();
+            let mut pipe = model.new_decode_state();
+            for &t in &tokens[..tokens.len() - 1] {
+                model.forward_decode(t, &mut whole).unwrap();
+                model.pipeline_decode(t, &segs, &mut pipe).unwrap();
+            }
+            let last = *tokens.last().unwrap();
+            let wl = vecf_of(&model.forward_decode(last, &mut whole).unwrap());
+            let pl = vecf_of(&model.pipeline_decode(last, &segs, &mut pipe).unwrap());
+            assert_eq!(
+                wl, pl,
+                "{ratios:?} segments {segs:?}: pipeline decode must equal whole decode"
+            );
+        }
+    }
+
+    /// A decode boundary at a ratio-0 cut survives serialisation to bytes and back - the crossing a
+    /// node makes - and resuming from the rebuilt boundary equals the whole decode bit for bit.
+    #[test]
+    fn decode_boundary_survives_a_byte_crossing() {
+        use crate::inference::model::deepseek_v41::model::DecodeBoundary;
+        // Layer 0 is ratio-0, so the cut-at-1 boundary carries no band state and serialises.
+        let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let (n, cut) = (3usize, 1usize);
+        let cross = |model: &DeepseekV41Model, t: u32, st: &mut DecodeState| -> Vec<f32> {
+            let b = model
+                .forward_decode_range(DecodeRangeIn::Token(t), 0, cut, st)
+                .unwrap();
+            let bd = match b {
+                DecodeRangeOut::Boundary(bd) => bd,
+                _ => panic!("interior range must yield a boundary"),
+            };
+            let bytes = bd.to_bytes().expect("ratio-0 boundary serialises");
+            let bd2 = DecodeBoundary::from_bytes(&bytes).expect("boundary rebuilds");
+            match model
+                .forward_decode_range(DecodeRangeIn::Resume(bd2), cut, n, st)
+                .unwrap()
+            {
+                DecodeRangeOut::Logits(l) => vecf_of(&l),
+                _ => panic!("final range must yield logits"),
+            }
+        };
+        let mut whole = model.new_decode_state();
+        let mut split = model.new_decode_state();
+        for &t in &tokens[..tokens.len() - 1] {
+            model.forward_decode(t, &mut whole).unwrap();
+            cross(&model, t, &mut split);
+        }
+        let last = *tokens.last().unwrap();
+        let wl = vecf_of(&model.forward_decode(last, &mut whole).unwrap());
+        let sl = cross(&model, last, &mut split);
+        assert_eq!(
+            wl, sl,
+            "a boundary crossed through bytes must resume bit for bit"
+        );
+    }
+
+    #[test]
+    fn a_mid_band_boundary_survives_a_byte_crossing() {
+        use crate::inference::model::deepseek_v41::model::DecodeBoundary;
+        // Cut at layer 2, inside the band: the boundary carries the compressor and indexer state,
+        // not just the residual, so a cut anywhere - not only where the band state is empty -
+        // crosses the wire and resumes exactly.
+        let (model, tokens) = synthetic(&[0, 2, 2, 2, 0], &[1, 2, 3], &[1, 2, 3], 0);
+        let (n, cut) = (5usize, 2usize);
+        let cross = |model: &DeepseekV41Model, t: u32, st: &mut DecodeState| -> Vec<f32> {
+            let bd = match model
+                .forward_decode_range(DecodeRangeIn::Token(t), 0, cut, st)
+                .unwrap()
+            {
+                DecodeRangeOut::Boundary(bd) => bd,
+                _ => panic!("interior range must yield a boundary"),
+            };
+            assert!(
+                !bd.shared_is_empty(),
+                "a cut inside the band must carry non-empty band state"
+            );
+            let bytes = bd.to_bytes().expect("a mid-band boundary serialises");
+            let bd2 = DecodeBoundary::from_bytes(&bytes).expect("boundary rebuilds");
+            match model
+                .forward_decode_range(DecodeRangeIn::Resume(bd2), cut, n, st)
+                .unwrap()
+            {
+                DecodeRangeOut::Logits(l) => vecf_of(&l),
+                _ => panic!("final range must yield logits"),
+            }
+        };
+        let mut whole = model.new_decode_state();
+        let mut split = model.new_decode_state();
+        for &t in &tokens[..tokens.len() - 1] {
+            model.forward_decode(t, &mut whole).unwrap();
+            cross(&model, t, &mut split);
+        }
+        let last = *tokens.last().unwrap();
+        let wl = vecf_of(&model.forward_decode(last, &mut whole).unwrap());
+        let sl = cross(&model, last, &mut split);
+        assert_eq!(
+            wl, sl,
+            "a mid-band boundary crossed through bytes must resume bit for bit"
+        );
+    }
+
+    /// A decode boundary crosses a real wire frame end to end: serialised to bytes, framed with a
+    /// header, read back off the stream, rebuilt, and resumed - the exact path between two pipeline
+    /// nodes. The frame carries the opaque boundary blob as bytes (Q8, shape [len]).
+    #[test]
+    fn a_boundary_crosses_a_wire_frame() {
+        use crate::distributed::wire::{read_frame, write_frame, FrameHeader, WireDType};
+        use crate::inference::model::deepseek_v41::model::DecodeBoundary;
+        let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let (n, cut) = (3usize, 1usize);
+        let cross = |model: &DeepseekV41Model, t: u32, st: &mut DecodeState| -> Vec<f32> {
+            let bd = match model
+                .forward_decode_range(DecodeRangeIn::Token(t), 0, cut, st)
+                .unwrap()
+            {
+                DecodeRangeOut::Boundary(bd) => bd,
+                _ => panic!("interior range must yield a boundary"),
+            };
+            let blob = bd.to_bytes().expect("ratio-0 boundary serialises");
+            let header = FrameHeader {
+                request_id: 7,
+                layer_id: cut as u32,
+                dtype: WireDType::Q8,
+                shape: vec![blob.len() as u32],
+            };
+            let mut framed = Vec::new();
+            write_frame(&mut framed, &header, &blob).expect("frame writes");
+            let mut cursor = std::io::Cursor::new(&framed);
+            let (got_header, payload) = read_frame(&mut cursor).expect("frame reads");
+            assert_eq!(got_header, header, "the header must survive the frame");
+            let bd2 = DecodeBoundary::from_bytes(&payload).expect("boundary rebuilds off the wire");
+            match model
+                .forward_decode_range(DecodeRangeIn::Resume(bd2), cut, n, st)
+                .unwrap()
+            {
+                DecodeRangeOut::Logits(l) => vecf_of(&l),
+                _ => panic!("final range must yield logits"),
+            }
+        };
+        let mut whole = model.new_decode_state();
+        let mut split = model.new_decode_state();
+        for &t in &tokens[..tokens.len() - 1] {
+            model.forward_decode(t, &mut whole).unwrap();
+            cross(&model, t, &mut split);
+        }
+        let last = *tokens.last().unwrap();
+        let wl = vecf_of(&model.forward_decode(last, &mut whole).unwrap());
+        let sl = cross(&model, last, &mut split);
+        assert_eq!(
+            wl, sl,
+            "a boundary crossed through a wire frame must resume bit for bit"
+        );
+    }
+
+    /// A two-node pipeline over a real socket equals the whole decode: node A runs the head layer
+    /// range, sends the boundary frame over a kept link, node B runs the tail range on its own
+    /// state and sends the logits back. Request and reply are lockstep, so the shared toy weights
+    /// are never touched from two threads at once; each node advances only its own layers' caches.
+    #[test]
+    fn a_two_node_pipeline_over_a_socket_equals_the_whole() {
+        use crate::distributed::wire_link::WireLink;
+        use std::net::{Ipv4Addr, TcpListener};
+        use std::sync::Arc;
+
+        let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let cut = 1usize;
+        let model = Arc::new(model);
+
+        // Node B: run the tail range [cut, n) for each boundary that arrives, reply with the logits.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let model_b = model.clone();
+        let node_b = std::thread::spawn(move || {
+            model_b.serve_pipeline_tail(cut, listener).unwrap();
+        });
+
+        // Node A: run the head range [0, cut), ship the boundary, read back the logits.
+        let mut link = WireLink::connect(addr).unwrap();
+        let mut state_a = model.new_decode_state();
+        let step = |link: &mut WireLink, state_a: &mut DecodeState, t: u32| -> Vec<f32> {
+            model.pipeline_head_step(t, cut, state_a, link).unwrap()
+        };
+
+        let mut whole = model.new_decode_state();
+        for &t in &tokens[..tokens.len() - 1] {
+            model.forward_decode(t, &mut whole).unwrap();
+            step(&mut link, &mut state_a, t);
+        }
+        let last = *tokens.last().unwrap();
+        let wl = vecf_of(&model.forward_decode(last, &mut whole).unwrap());
+        let sl = step(&mut link, &mut state_a, last);
+        assert_eq!(
+            wl, sl,
+            "a two-node pipeline over a socket must equal the whole decode"
+        );
+        drop(link);
+        node_b.join().unwrap();
+    }
+
+    #[test]
+    fn a_wire_head_step_over_a_mux_tail_equals_the_whole() {
+        // The synchronous head step (no reader thread) tagged for a mux tail: one sequence should
+        // decode exactly as the whole model, over the same tail serve loop the concurrent path uses.
+        use crate::distributed::wire_link::WireLink;
+        use std::net::{Ipv4Addr, TcpListener};
+        use std::sync::Arc;
+
+        let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let cut = 1usize;
+        let model = Arc::new(model);
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let model_b = model.clone();
+        let node_b = std::thread::spawn(move || {
+            model_b.serve_pipeline_tail_mux(cut, listener).unwrap();
+        });
+
+        let mut link = WireLink::connect(addr).unwrap();
+        let mut state_a = model.new_decode_state();
+        let mut whole = model.new_decode_state();
+        for &t in &tokens[..tokens.len() - 1] {
+            model.forward_decode(t, &mut whole).unwrap();
+            model
+                .pipeline_head_step_wire(t, cut, 0, &mut state_a, &mut link)
+                .unwrap();
+        }
+        let last = *tokens.last().unwrap();
+        let wl = vecf_of(&model.forward_decode(last, &mut whole).unwrap());
+        let sl = model
+            .pipeline_head_step_wire(last, cut, 0, &mut state_a, &mut link)
+            .unwrap();
+        assert_eq!(
+            wl, sl,
+            "the wire head step over a mux tail must equal the whole decode"
+        );
+        drop(link);
+        node_b.join().unwrap();
+    }
+
+    #[test]
+    fn a_band_cut_over_several_tokens_on_separate_states_equals_the_whole() {
+        // The head and tail keep their own states and the cut is inside the band, so a band layer
+        // runs on the head every token. If the head does not advance its position per token, the
+        // second token indexes the rope table past its one cached step - the bug the single-state
+        // and ratio-0 pipeline tests never reach.
+        use crate::distributed::wire_link::WireLink;
+        use std::net::{Ipv4Addr, TcpListener};
+        use std::sync::Arc;
+
+        let (model, _t) = synthetic(&[0, 2, 2, 2, 0], &[1, 2, 3], &[1, 2, 3], 0);
+        let cut = 2usize;
+        let model = Arc::new(model);
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let model_b = model.clone();
+        let node_b = std::thread::spawn(move || {
+            model_b.serve_pipeline_tail_mux(cut, listener).unwrap();
+        });
+
+        let mut link = WireLink::connect(addr).unwrap();
+        let mut head = model.new_decode_state();
+        let mut whole = model.new_decode_state();
+        let seq = [1u32, 5, 3, 7, 2];
+        for &t in &seq {
+            let wl = vecf_of(&model.forward_decode(t, &mut whole).unwrap());
+            let sl = model
+                .pipeline_head_step_wire(t, cut, 0, &mut head, &mut link)
+                .unwrap();
+            assert_eq!(wl, sl, "a band-cut token must match the whole decode");
+        }
+        drop(link);
+        node_b.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_sequences_over_one_mux_link_each_equal_their_whole_decode() {
+        use crate::distributed::wire_mux::MuxLink;
+        use std::net::{Ipv4Addr, TcpListener, TcpStream};
+        use std::sync::Arc;
+
+        let (model, _tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let cut = 1usize;
+        let model = Arc::new(model);
+
+        // Distinct sequences, decoded greedily, each starting from its own token.
+        let starts: [u32; 3] = [1, 7, 3];
+        let steps = 4usize;
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap()
+        };
+
+        // Oracle: each sequence decoded alone through the whole stack.
+        let want: Vec<Vec<u32>> = starts
+            .iter()
+            .map(|&s| {
+                let mut st = model.new_decode_state();
+                let mut cur = s;
+                (0..steps)
+                    .map(|_| {
+                        cur = argmax(&vecf_of(&model.forward_decode(cur, &mut st).unwrap()));
+                        cur
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Tail node: serve every sequence multiplexed on one connection.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let model_b = model.clone();
+        let node_b = std::thread::spawn(move || {
+            model_b.serve_pipeline_tail_mux(cut, listener).unwrap();
+        });
+
+        // Head node: one shared link, one thread per sequence, all in flight at once.
+        let link = MuxLink::new(TcpStream::connect(addr).unwrap(), starts.len()).unwrap();
+        let got: Vec<Vec<u32>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = starts
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| {
+                    let model = &model;
+                    let link = &link;
+                    scope.spawn(move || -> Vec<u32> {
+                        let mut st = model.new_decode_state();
+                        let mut cur = s;
+                        (0..steps)
+                            .map(|_| {
+                                let l = model
+                                    .pipeline_head_step_mux(cur, cut, i as u32, &mut st, link)
+                                    .unwrap();
+                                cur = argmax(&l);
+                                cur
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        assert_eq!(
+            got, want,
+            "each sequence multiplexed on one link must equal its own whole decode"
+        );
+
+        // Drop the link so its socket closes and the tail's serve loop returns.
+        drop(link);
+        node_b.join().unwrap();
+    }
+
+    #[test]
+    fn a_model_streamed_over_the_wire_decodes_like_the_local_one() {
+        use crate::inference::offload::weight_cache::WeightCache;
+        use crate::inference::offload::weight_stream::{serve_weights, GgufBytes, RemoteGguf};
+        use crate::tensor::quantized::gguf_source::SplitGguf;
+        use std::net::{Ipv4Addr, TcpListener};
+
+        // A synthetic model written to a file that survives, so one node can serve it while another
+        // streams it.
+        let ratios = [0u32, 2, 0];
+        let kv = [1u32];
+        let index = [1u32];
+        let bands: Vec<bool> = (0..ratios.len())
+            .map(|l| ratios[l] != 0 || kv.contains(&(l as u32)) || index.contains(&(l as u32)))
+            .collect();
+        let md = super::tests::real_md_layout(&ratios, &kv, &index);
+        let entries = super::tests::real_entries_for(&bands);
+        let dir = std::env::temp_dir().join(format!(
+            "loken-wire-model-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        write_gguf_with_metadata(&path, &md, &entries).unwrap();
+
+        // The local model, loaded straight from the file.
+        let g = open_mapped(&path).unwrap();
+        let mut cfg = DeepseekV41Config::from_gguf(&g.content).unwrap();
+        cfg.expert_cache_count = 0;
+        let local = DeepseekV41Model::load(&g, &cfg).unwrap();
+
+        // The serving node holds the same file; the running node streams it.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = SplitGguf::open(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let _ = serve_weights(&GgufBytes(&served), listener);
+        });
+
+        let cache = WeightCache::ephemeral(&dir, 64 << 20).unwrap();
+        let remote = RemoteGguf::connect(addr, cache).unwrap();
+        let mut rcfg = DeepseekV41Config::from_meta(&remote).unwrap();
+        rcfg.expert_cache_count = 0;
+        let streamed = DeepseekV41Model::load(&remote, &rcfg).unwrap();
+
+        // Decode a few tokens through each and compare the logits: same weights, same math.
+        let tokens = [1u32, 5, 3, 0];
+        let mut ls = local.new_decode_state();
+        let mut rs = streamed.new_decode_state();
+        for &t in &tokens[..tokens.len() - 1] {
+            local.forward_decode(t, &mut ls).unwrap();
+            streamed.forward_decode(t, &mut rs).unwrap();
+        }
+        let last = *tokens.last().unwrap();
+        let ll = vecf_of(&local.forward_decode(last, &mut ls).unwrap());
+        let rl = vecf_of(&streamed.forward_decode(last, &mut rs).unwrap());
+
+        // Every tensor is streamed in its native bytes and mapped in place, the same path a local
+        // file takes, so the model decodes bit for bit like the local one, not merely close.
+        assert_eq!(
+            ll, rl,
+            "a model streamed over the wire must decode identically to the local one"
+        );
+
+        drop(streamed);
+        drop(remote);
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_partial_model_runs_its_range_like_the_whole() {
+        // A node that loaded only [cut, n) runs that range on a boundary and gets the same logits
+        // as the whole model does over the same range - the layers it did not load never mattered.
+        let (whole, _tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let cut = 1usize;
+        let n = whole.n_layers();
+
+        // Reload the same weights holding only [cut, n); the layers before cut are absent.
+        let part = {
+            // Rebuild the source the synthetic model came from, keeping only the tail range.
+            let ratios = [0u32, 2, 0];
+            let kv = [1u32];
+            let index = [1u32];
+            let bands: Vec<bool> = (0..ratios.len())
+                .map(|l| ratios[l] != 0 || kv.contains(&(l as u32)) || index.contains(&(l as u32)))
+                .collect();
+            let md = super::tests::real_md_layout(&ratios, &kv, &index);
+            let entries = super::tests::real_entries_for(&bands);
+            let dir = std::env::temp_dir().join(format!(
+                "loken-partial-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("model.gguf");
+            write_gguf_with_metadata(&path, &md, &entries).unwrap();
+            let g = open_mapped(&path).unwrap();
+            let mut cfg = DeepseekV41Config::from_gguf(&g.content).unwrap();
+            cfg.expert_cache_count = 0;
+            let part = DeepseekV41Model::load_range(&g, &cfg, cut).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            part
+        };
+        assert!(
+            part.blocks[0].is_none(),
+            "a partial model does not hold the layers before its range"
+        );
+
+        // The boundary the head hands over, produced by the whole model running [0, cut). The run
+        // is deterministic, so producing it once per consumer gives two identical boundaries -
+        // simpler than cloning one.
+        let head_boundary = || {
+            let mut hs = whole.new_decode_state();
+            match whole
+                .forward_decode_range(DecodeRangeIn::Token(1), 0, cut, &mut hs)
+                .unwrap()
+            {
+                DecodeRangeOut::Boundary(bd) => bd,
+                DecodeRangeOut::Logits(_) => panic!("cut runs the whole stack"),
+            }
+        };
+
+        // The whole model and the partial one each run [cut, n) from that boundary.
+        let mut ws = whole.new_decode_state();
+        let mut ps = part.new_decode_state();
+        let wl = match whole
+            .forward_decode_range(DecodeRangeIn::Resume(head_boundary()), cut, n, &mut ws)
+            .unwrap()
+        {
+            DecodeRangeOut::Logits(l) => vecf_of(&l),
+            DecodeRangeOut::Boundary(_) => panic!("tail did not reach the head"),
+        };
+        let pl = match part
+            .forward_decode_range(DecodeRangeIn::Resume(head_boundary()), cut, n, &mut ps)
+            .unwrap()
+        {
+            DecodeRangeOut::Logits(l) => vecf_of(&l),
+            DecodeRangeOut::Boundary(_) => panic!("tail did not reach the head"),
+        };
+        assert_eq!(
+            wl, pl,
+            "a partial model must run its range exactly as the whole model does"
+        );
+    }
+
+    /// A cut chosen by the planner runs as a pipeline and equals the whole decode: two nodes each
+    /// too small for the stack force a split, the plan places one contiguous run of layers on each,
+    /// and decoding through those segments gives what one node would. This is the planner driving
+    /// the pipeline, end to end but in one process.
+    #[test]
+    fn a_planned_cut_runs_as_a_pipeline() {
+        use crate::distributed::cut_plan::{plan, CutCosts, CutPlan, NodeCapacity};
+        let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let n = 3usize;
+        // Equal layer weights; two nodes each holding at most two of the three layers, so the only
+        // arrangement that fits uses both - a cut.
+        let layer_bytes = vec![100u64; n];
+        let nodes = vec![
+            NodeCapacity {
+                id: "a".into(),
+                bytes: 200,
+            },
+            NodeCapacity {
+                id: "b".into(),
+                bytes: 200,
+            },
+        ];
+        let costs = CutCosts::from_link_gbps(&[("a", "b", 10.0)], 8192);
+        let cut: CutPlan = plan(&layer_bytes, &nodes, &costs).expect("a plan fits");
+        assert!(cut.covers(n), "the plan must cover every layer once");
+        assert!(
+            cut.segments.len() >= 2,
+            "capacity forces a split: {:?}",
+            cut.segments
+        );
+        let segs: Vec<(usize, usize)> = cut.segments.iter().map(|s| (s.start, s.end)).collect();
+
+        let mut whole = model.new_decode_state();
+        let mut pipe = model.new_decode_state();
+        for &t in &tokens[..tokens.len() - 1] {
+            model.forward_decode(t, &mut whole).unwrap();
+            model.pipeline_decode(t, &segs, &mut pipe).unwrap();
+        }
+        let last = *tokens.last().unwrap();
+        let wl = vecf_of(&model.forward_decode(last, &mut whole).unwrap());
+        let pl = vecf_of(&model.pipeline_decode(last, &segs, &mut pipe).unwrap());
+        assert_eq!(
+            wl, pl,
+            "the planned cut must decode as the whole stack: {segs:?}"
+        );
     }
 
     /// A rejected speculative block rolls back with no trace: checkpoint, verify the whole block,
@@ -2166,5 +3621,106 @@ mod oracle_gate {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(a, b, "one-slot expert cache changed the logits");
+    }
+
+    /// A backend serving as a pipeline head over a loopback tail draws the same tokens, step for
+    /// step, as the whole stack on one node. This gates the serve-side split end to end: the head
+    /// runs `[0, cut)`, ships each boundary over a real socket to a tail running `[cut, n)`, and
+    /// the tokens must be identical to the single-node path - the boundary crosses the wire whole.
+    #[test]
+    fn a_pipeline_head_backend_draws_the_same_tokens_as_one_node() {
+        use crate::inference::engine::model_backend::{DeepseekV41Backend, ModelBackend};
+        use std::net::TcpListener;
+        let (whole_model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let n = whole_model.n_layers();
+        let cut = n / 2;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The tail loads the same weights and serves layers [cut, n) until the head hangs up. Its
+        // model is built inside the thread, so it never crosses a thread boundary.
+        let tail = std::thread::spawn(move || {
+            let (tail_model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+            let _ = tail_model.serve_pipeline_tail_mux(cut, listener);
+        });
+        let (head_model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let mut head = DeepseekV41Backend::new(head_model, 0, tokens.len() + 8);
+        head.connect_pipeline_tail(addr, cut).unwrap();
+        let mut whole = DeepseekV41Backend::new(whole_model, 0, tokens.len() + 8);
+        let argmax_last = |t: &Tensor| -> u32 {
+            let vocab = *t.dims().last().unwrap();
+            let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            v[v.len() - vocab..]
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap()
+        };
+        // Feed the same tokens one at a time to both, at increasing positions: the head decodes
+        // through the wire, the reference on one node, and every drawn token must agree.
+        for (pos, &tok) in tokens.iter().take(8).enumerate() {
+            let x = Tensor::new(&[tok], &Device::Cpu)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap();
+            let ht = argmax_last(&head.forward(&x, pos).unwrap());
+            let wt = argmax_last(&whole.forward(&x, pos).unwrap());
+            assert_eq!(ht, wt, "pipeline and whole stack differ at position {pos}");
+        }
+        drop(head);
+        let _ = tail.join();
+    }
+
+    /// A three-node pipeline draws the same tokens as one node: the head runs `[0, c1)`, an interior
+    /// segment `[c1, c2)` relays its boundary to the final segment `[c2, n)`, and the logits return
+    /// up the chain. This gates the N-node relay - a segment that is neither head nor tail.
+    #[test]
+    fn a_three_node_pipeline_draws_the_same_tokens_as_one_node() {
+        use crate::inference::engine::model_backend::{DeepseekV41Backend, ModelBackend};
+        use std::net::TcpListener;
+        let (whole_model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let n = whole_model.n_layers();
+        let (c1, c2) = (1usize, 2usize); // segments [0,1) [1,2) [2,3)
+        assert!(c1 < c2 && c2 < n);
+        // The final segment [c2, n), then the interior [c1, c2) pointing at it. Both listeners are
+        // bound here so the interior can connect to the final before either accepts.
+        let l_final = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a_final = l_final.local_addr().unwrap();
+        let l_mid = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a_mid = l_mid.local_addr().unwrap();
+        let t_final = std::thread::spawn(move || {
+            let (m, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+            let _ = m.serve_pipeline_segment(c2, n, None, l_final);
+        });
+        let t_mid = std::thread::spawn(move || {
+            let (m, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+            let _ = m.serve_pipeline_segment(c1, c2, Some(a_final), l_mid);
+        });
+        let (head_model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let mut head = DeepseekV41Backend::new(head_model, 0, tokens.len() + 8);
+        head.connect_pipeline_tail(a_mid, c1).unwrap();
+        let mut whole = DeepseekV41Backend::new(whole_model, 0, tokens.len() + 8);
+        let argmax_last = |t: &Tensor| -> u32 {
+            let vocab = *t.dims().last().unwrap();
+            let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            v[v.len() - vocab..]
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap()
+        };
+        for (pos, &tok) in tokens.iter().take(6).enumerate() {
+            let x = Tensor::new(&[tok], &Device::Cpu)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap();
+            let ht = argmax_last(&head.forward(&x, pos).unwrap());
+            let wt = argmax_last(&whole.forward(&x, pos).unwrap());
+            assert_eq!(ht, wt, "three-node pipeline differs at position {pos}");
+        }
+        drop(head);
+        let _ = t_mid.join();
+        let _ = t_final.join();
     }
 }

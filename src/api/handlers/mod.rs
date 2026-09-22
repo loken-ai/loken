@@ -393,6 +393,10 @@ pub struct APIServer {
     /// directories, and gossip asks every round while the answer changes when someone pulls a
     /// model - so it is remembered rather than recomputed.
     servable: Arc<RwLock<Option<(std::time::Instant, Vec<String>)>>>,
+    /// Each loaded model's self-measured placement cost on this node: `(layer_ms, miss_ms)`,
+    /// measured once when the model loads and published in gossip so the cluster can plan a cut
+    /// from measured facts rather than an operator's flag. Keyed by model id.
+    model_costs: Arc<std::sync::Mutex<std::collections::HashMap<String, (f64, f64)>>>,
     engines: Arc<RwLock<Vec<LoadedModelEntry>>>,
     gpu_manager: Option<Arc<GPUManagerImpl>>,
     stats_monitor: Arc<StatsMonitor>,
@@ -1255,6 +1259,16 @@ impl APIServer {
             crate::distributed::rate_meter::Rates::default(),
             |acc, r| if r.samples > acc.samples { r } else { acc },
         );
+        // The placement cost this node measured for each model it holds, for the cluster's cut
+        // planner. Filtered to models actually loaded, so a peer never plans against a cost for a
+        // model this node has since dropped.
+        let cost_by_model: std::collections::HashMap<String, (f64, f64)> = {
+            let costs = self.model_costs.lock().unwrap_or_else(|e| e.into_inner());
+            models
+                .iter()
+                .filter_map(|m| costs.get(m).map(|c| (m.clone(), *c)))
+                .collect()
+        };
         crate::distributed::cluster_runtime::PeerReport {
             node_id,
             models,
@@ -1311,6 +1325,7 @@ impl APIServer {
                     )
                 })
                 .collect(),
+            cost_by_model,
             prefill_tok_per_s: rates.prefill_tok_per_s,
             decode_tok_per_s: rates.decode_tok_per_s,
             model_load_s: rates.model_load_s,
@@ -1392,6 +1407,7 @@ impl APIServer {
             huggingface_models_dir,
             model_manager,
             servable: Arc::new(RwLock::new(None)),
+            model_costs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             engines: Arc::new(RwLock::new(Vec::new())),
             gpu_manager: Some(gpu_manager),
             stats_monitor,
@@ -1665,6 +1681,82 @@ impl APIServer {
         if !last_err.is_empty() {
             return Err(last_err);
         }
+        // Measure this node's placement cost for the model, once, while it is loaded: the on-card
+        // layer time and the cost of a routed expert missed to the cores. Published in gossip so the
+        // cluster plans a cut from measured facts. A model with no streamed experts declares no
+        // shape and is not priced; a node that cannot run the bench simply publishes nothing.
+        //
+        // Only a clustered node needs any of this - a lone node reads no cost, plans no split, and
+        // gossips to no one - so a lone node skips the bench entirely and its load path is exactly
+        // what it was before.
+        let clustered = self
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.config.is_clustered());
+        if let Some((dim, inter, gate_dt, down_dt)) = if clustered {
+            engine.expert_cost_shape().await
+        } else {
+            None
+        } {
+            // The miss bench is a few hundred CPU iterations; run it off the async worker so a
+            // model load never stalls the runtime.
+            let profile = tokio::task::spawn_blocking(move || {
+                crate::distributed::auto_tune::local_profile(dim, inter, gate_dt, down_dt, 1.0)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(p) = profile {
+                self.model_costs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(model_id.to_string(), (p.layer_ms, p.miss_ms));
+                // With peers, decide the placement from the measured profiles now and record it.
+                // The decision is logged here; forming the pipeline it names is a later step. On a
+                // pair where a split does not pay, this says so, and serving stays on one node.
+                if let Some(cluster) = self.cluster.as_ref() {
+                    if cluster.config.is_clustered() {
+                        if let Some((attn, ebytes, ws, act)) = engine.placement_model_inputs().await
+                        {
+                            let local_cards: u64 = self.usable_cards().iter().sum();
+                            let local = crate::distributed::cut_plan::NodeProfile {
+                                vram: local_cards,
+                                layer_ms: p.layer_ms,
+                                miss_ms: p.miss_ms,
+                            };
+                            let now =
+                                crate::distributed::cluster_runtime::now_ms(self.cluster_started());
+                            let (nodes, rtt_pairs) = cluster.placement_inputs(model_id, now, local);
+                            let rtt_refs: Vec<(&str, &str, f64)> = rtt_pairs
+                                .iter()
+                                .map(|(a, b, r)| (a.as_str(), b.as_str(), *r))
+                                .collect();
+                            match crate::distributed::auto_tune::auto_distribution(
+                                &attn, ebytes, ws, act, &nodes, &rtt_refs, |_| true,
+                            ) {
+                                Some(plan) if plan.segments.len() > 1 => {
+                                    match self
+                                        .form_pipeline_head(&engine, cluster, model_id, &plan)
+                                        .await
+                                    {
+                                        Ok(msg) => info!("{msg}"),
+                                        Err(e) => tracing::warn!(
+                                            "cluster auto-tune {model_id}: pipeline not formed ({e}); one node"
+                                        ),
+                                    }
+                                }
+                                Some(_) => info!(
+                                    "cluster auto-tune {model_id}: single node is fastest; not splitting"
+                                ),
+                                None => info!(
+                                    "cluster auto-tune {model_id}: not enough measured nodes to plan a split"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let expire_handle = if keep_alive_minutes > 0 {
             Some(self.schedule_expiration(model_id.to_string(), keep_alive_minutes))
         } else {
@@ -1896,6 +1988,126 @@ impl APIServer {
 
     /// Create an InferenceConfig for a model, resolving the correct models_dir.
     /// Checks HuggingFace dir first (for flat GGUF downloads), then Ollama dir.
+    /// Run this node as one segment of a cross-node pipeline for `model_id`, serving layers
+    /// `[from, to)`: bind an ephemeral port, load the range on its own thread, and serve the boundary
+    /// frames until the upstream hangs up. `next` is the node running the layers after `to`, `None`
+    /// for the final segment. Returns the port the upstream connects its link to. The model is loaded
+    /// inside the thread, so it never crosses a thread boundary.
+    pub(crate) fn become_pipeline_tail(
+        &self,
+        model_id: &str,
+        from: usize,
+        to: usize,
+        next: Option<std::net::SocketAddr>,
+    ) -> Result<u16, String> {
+        let engine = LlmEngine::with_config(self.config_for_model(model_id));
+        let gguf = engine
+            .resolve_model_file(model_id)
+            .ok_or_else(|| format!("pipeline tail: model {model_id} not found on this node"))?
+            .to_string_lossy()
+            .to_string();
+        let listener = std::net::TcpListener::bind(("0.0.0.0", 0))
+            .map_err(|e| format!("pipeline tail: bind: {e}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| format!("pipeline tail: addr: {e}"))?
+            .port();
+        std::thread::Builder::new()
+            .name(format!("pipeline-tail-{model_id}"))
+            .spawn(move || {
+                if let Err(e) = crate::inference::serve::pipeline_serve::run_tail_local(
+                    &gguf, from, to, next, listener,
+                ) {
+                    tracing::warn!("pipeline tail exited: {e}");
+                }
+            })
+            .map_err(|e| format!("pipeline tail: spawn: {e}"))?;
+        info!("pipeline tail: serving {model_id} layers [{from}, {to}) on port {port}");
+        Ok(port)
+    }
+
+    /// Form the cross-node pipeline the auto-tune decided, with this node as the head. The wire
+    /// pipeline is head plus one tail that runs to the end - two segments, this node first - so a
+    /// plan of any other shape stays on one node until multi-node serving is wired. Asks the tail to
+    /// serve its range, then connects this node's model as the head. Returns a line describing what
+    /// happened, whether it formed the pipeline or kept to one node.
+    async fn form_pipeline_head(
+        &self,
+        engine: &Arc<LlmEngine>,
+        cluster: &crate::distributed::cluster::Cluster,
+        model_id: &str,
+        plan: &crate::distributed::cut_plan::TimePlan,
+    ) -> Result<String, String> {
+        use std::net::ToSocketAddrs;
+        let segs = &plan.segments;
+        if segs.len() < 2 {
+            return Ok(format!(
+                "auto-tune {model_id}: single node is fastest; one node"
+            ));
+        }
+        if segs[0].node != cluster.config.node_id {
+            return Ok(format!(
+                "auto-tune {model_id}: this node is not the pipeline head ({}); one node",
+                segs[0].node
+            ));
+        }
+        let client = reqwest::Client::new();
+        // Set up the tail chain from the last segment back to the first, so each segment's
+        // downstream is already listening before the segment that feeds it is told where it is.
+        let mut next_addr: Option<std::net::SocketAddr> = None;
+        let mut first_tail: Option<std::net::SocketAddr> = None;
+        for seg in segs[1..].iter().rev() {
+            let tail_url = cluster
+                .peer_url(&seg.node)
+                .ok_or_else(|| format!("no endpoint known for {}", seg.node))?;
+            let resp = client
+                .post(format!(
+                    "{}/api/pipeline/tail",
+                    tail_url.trim_end_matches('/')
+                ))
+                .json(&serde_json::json!({
+                    "model": model_id,
+                    "from": seg.start,
+                    "to": seg.end,
+                    "next": next_addr.map(|a: std::net::SocketAddr| a.to_string()),
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("tail {}: {e}", seg.node))?;
+            if !resp.status().is_success() {
+                return Err(format!("tail {} refused: {}", seg.node, resp.status()));
+            }
+            let port = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("port").and_then(|p| p.as_u64()))
+                .ok_or_else(|| format!("tail {} gave no port", seg.node))?
+                as u16;
+            let host = reqwest::Url::parse(&tail_url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_string()))
+                .ok_or_else(|| format!("bad tail url {tail_url}"))?;
+            let addr = (host.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|e| format!("resolve {host}:{port}: {e}"))?
+                .next()
+                .ok_or_else(|| format!("no address for {host}:{port}"))?;
+            next_addr = Some(addr);
+            first_tail = Some(addr);
+        }
+        let cut = segs[0].end;
+        let first = first_tail.ok_or_else(|| "no tail in plan".to_string())?;
+        engine
+            .connect_pipeline_tail(first, cut)
+            .await
+            .map_err(|e| format!("connect tail: {e}"))?;
+        Ok(format!(
+            "auto-tune {model_id}: pipeline formed across {} nodes, head [0,{cut}) here",
+            segs.len()
+        ))
+    }
+
     fn config_for_model(&self, model_id: &str) -> InferenceConfig {
         let mut config = self.default_inference_config.clone();
         config.model_id = model_id.to_string();
@@ -2013,6 +2225,10 @@ impl APIServer {
             // .route("/api/unload", axum::routing::post(ollama_unload_model))
             .route("/api/ps", axum::routing::get(ollama_ps))
             .route("/api/inflight", axum::routing::get(inflight_status))
+            .route(
+                "/api/pipeline/tail",
+                axum::routing::post(pipeline_tail_start),
+            )
             .route("/api/draft/attach", axum::routing::post(draft_attach))
             .route("/api/draft/detach", axum::routing::post(draft_detach))
             .route("/api/draft/status", axum::routing::get(draft_status))

@@ -95,6 +95,10 @@ pub struct Cluster {
     /// its speed on another, and placing a 70B request on a 0.6B measurement is how a node
     /// wins a comparison it should lose.
     rates_by_model: Mutex<HashMap<NodeId, HashMap<String, NodeRates>>>,
+    /// Each peer's self-measured placement cost per model, `(layer_ms, miss_ms)`, for the cut
+    /// planner. Kept beside the rates: a node measures these once and gossips them, so the cluster
+    /// plans from facts rather than a flag.
+    cost_by_model: Mutex<HashMap<NodeId, HashMap<String, (f64, f64)>>>,
     /// Round-trip time to each peer, measured by the gossip that just talked to it.
     rtt_ms: Mutex<HashMap<NodeId, f64>>,
     /// Where a peer can be reached.
@@ -117,6 +121,7 @@ impl Cluster {
             members: Mutex::new(Membership::new(config.gossip_interval_ms as f64)),
             rates: Mutex::new(HashMap::new()),
             rates_by_model: Mutex::new(HashMap::new()),
+            cost_by_model: Mutex::new(HashMap::new()),
             penalised: Mutex::new(HashMap::new()),
             rtt_ms: Mutex::new(HashMap::new()),
             urls: Mutex::new(HashMap::new()),
@@ -144,12 +149,17 @@ impl Cluster {
         state: NodeState,
         rates: NodeRates,
         per_model: HashMap<String, NodeRates>,
+        cost_by_model: HashMap<String, (f64, f64)>,
         rtt_ms: f64,
     ) {
         self.rates_by_model
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(node.clone(), per_model);
+        self.cost_by_model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(node.clone(), cost_by_model);
         self.members
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -170,6 +180,74 @@ impl Cluster {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(node.clone(), url.to_string());
+    }
+
+    /// The cut planner's inputs for `model_id`: `(nodes, rtt_pairs)`, assembled from what each node
+    /// measured about itself and the round-trips this node timed. A node enters only if it has a
+    /// measured cost for the model - one that has not run it cannot be planned against. `local` is
+    /// this node's own measured profile; its VRAM and each peer's come from the advertised cards.
+    /// Peer-to-peer RTT is not measured here, so only pairs this node timed are returned; the
+    /// planner prices an unlisted pair from its base latency.
+    pub fn placement_inputs(
+        &self,
+        model_id: &str,
+        now_ms: u64,
+        local: super::cut_plan::NodeProfile,
+    ) -> (
+        Vec<(NodeId, super::cut_plan::NodeProfile)>,
+        Vec<(NodeId, NodeId, f64)>,
+    ) {
+        // This node's advertised VRAM, read before the other locks so no lock is held across it.
+        let local_cards: u64 = self.local_state().cards.iter().sum();
+        let cost = self.cost_by_model.lock().unwrap_or_else(|e| e.into_inner());
+        let members = self.members.lock().unwrap_or_else(|e| e.into_inner());
+        let rtt = self.rtt_ms.lock().unwrap_or_else(|e| e.into_inner());
+        let alive: std::collections::HashSet<NodeId> = members.alive(now_ms).into_iter().collect();
+        let mut nodes: Vec<(NodeId, super::cut_plan::NodeProfile)> = vec![(
+            self.config.node_id.clone(),
+            super::cut_plan::NodeProfile {
+                vram: local_cards,
+                ..local
+            },
+        )];
+        for (node, state) in members.known() {
+            if *node == self.config.node_id || !alive.contains(node) {
+                continue;
+            }
+            let Some((layer_ms, miss_ms)) = cost.get(node).and_then(|m| m.get(model_id)).copied()
+            else {
+                continue;
+            };
+            let vram: u64 = state.cards.iter().sum();
+            nodes.push((
+                node.clone(),
+                super::cut_plan::NodeProfile {
+                    vram,
+                    layer_ms,
+                    miss_ms,
+                },
+            ));
+        }
+        let mut pairs: Vec<(NodeId, NodeId, f64)> = Vec::new();
+        for (node, _) in &nodes {
+            if *node == self.config.node_id {
+                continue;
+            }
+            if let Some(r) = rtt.get(node).copied() {
+                pairs.push((self.config.node_id.clone(), node.clone(), r));
+            }
+        }
+        (nodes, pairs)
+    }
+
+    /// Where a peer can be reached, if this node has learned its endpoint. The head uses it to ask
+    /// a tail to serve its layer range.
+    pub fn peer_url(&self, node: &NodeId) -> Option<String> {
+        self.urls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(node)
+            .cloned()
     }
 
     /// A hand-over to this peer failed. Keep it out of the running for a while.
@@ -548,6 +626,68 @@ pub const FORWARDED_HEADER: &str = "x-loken-forwarded";
 mod tests {
     use super::*;
 
+    #[test]
+    fn placement_inputs_gathers_measured_peers() {
+        let c = Cluster::new(cfg(&["b"]));
+        let with_card = |gb: u64| NodeState {
+            cards: vec![gb << 30],
+            ..Default::default()
+        };
+        c.publish_local(with_card(32));
+        let costs = |ms: (f64, f64)| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("m".to_string(), ms);
+            m
+        };
+        // Peer b measured a cost for model m; peer d has run nothing for m.
+        c.observe_peer(
+            &"b".into(),
+            "http://b",
+            0,
+            with_card(16),
+            NodeRates::default(),
+            std::collections::HashMap::new(),
+            costs((2.0, 1.0)),
+            0.3,
+        );
+        c.observe_peer(
+            &"d".into(),
+            "http://d",
+            0,
+            with_card(8),
+            NodeRates::default(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            0.4,
+        );
+        let local = super::super::cut_plan::NodeProfile {
+            vram: 0,
+            layer_ms: 1.75,
+            miss_ms: 1.1,
+        };
+        let (nodes, pairs) = c.placement_inputs("m", 0, local);
+        let ids: Vec<String> = nodes.iter().map(|(n, _)| n.clone()).collect();
+        assert!(ids.contains(&"self".to_string()));
+        assert!(
+            ids.contains(&"b".to_string()),
+            "a peer that measured m is planned against"
+        );
+        assert!(
+            !ids.contains(&"d".to_string()),
+            "a peer with no cost for m is left out"
+        );
+        let self_p = nodes.iter().find(|(n, _)| n == "self").unwrap().1;
+        assert_eq!(self_p.vram, 32u64 << 30);
+        let b_p = nodes.iter().find(|(n, _)| n == "b").unwrap().1;
+        assert_eq!(
+            (b_p.layer_ms, b_p.miss_ms, b_p.vram),
+            (2.0, 1.0, 16u64 << 30)
+        );
+        assert!(pairs
+            .iter()
+            .any(|(a, b, r)| a == "self" && b == "b" && *r == 0.3));
+    }
+
     fn shape() -> RequestShape {
         RequestShape {
             model: "qwen3:8b".into(),
@@ -617,6 +757,7 @@ mod tests {
                 agg_tok_per_s: 0.0,
             },
             HashMap::new(),
+            HashMap::new(),
             1.0,
         );
         let yielding = RequestShape {
@@ -683,6 +824,7 @@ mod tests {
             free(),
             quick(),
             HashMap::new(),
+            HashMap::new(),
             1.0,
         );
         match c.decide(&shape(), 0, false, &nothing_cached()) {
@@ -719,6 +861,7 @@ mod tests {
             free(),
             quick(),
             HashMap::new(),
+            HashMap::new(),
             1.0,
         );
         {
@@ -747,6 +890,7 @@ mod tests {
             0,
             free(),
             quick(),
+            HashMap::new(),
             HashMap::new(),
             1.0,
         );
@@ -782,6 +926,7 @@ mod tests {
             0,
             free(),
             quick(),
+            HashMap::new(),
             HashMap::new(),
             1.0,
         );
@@ -826,6 +971,7 @@ mod tests {
                 t,
                 free(),
                 quick(),
+                HashMap::new(),
                 HashMap::new(),
                 1.0,
             );

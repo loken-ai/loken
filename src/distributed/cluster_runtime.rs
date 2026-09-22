@@ -52,6 +52,12 @@ pub struct PeerReport {
     /// different model with. Defaulted so a peer that publishes none still parses.
     #[serde(default)]
     pub rates_by_model: HashMap<String, (f64, f64, f64, f64)>,
+    /// What this node measured of its own cost for placing a model across the cluster, per model:
+    /// `(layer_ms, miss_ms)` - one on-card layer, and one routed expert missed to the cores. The
+    /// planner reads these with the VRAM in `cards` to decide the cut; a node self-measures them so
+    /// no operator gives a speed. Defaulted so a peer that publishes none still parses.
+    #[serde(default)]
+    pub cost_by_model: HashMap<String, (f64, f64)>,
 }
 
 impl PeerReport {
@@ -188,6 +194,7 @@ pub fn spawn_gossip(
                                 )
                             })
                             .collect();
+                        let cost_by_model = report.cost_by_model.clone();
                         let (id, state, rates) = report.split();
                         // Our own endpoint can appear in the seed list; adopting it would make
                         // the node a peer of itself.
@@ -201,6 +208,7 @@ pub fn spawn_gossip(
                             state,
                             rates,
                             per_model,
+                            cost_by_model,
                             rtt,
                         );
                     }
@@ -304,6 +312,7 @@ mod tests {
             decode_tok_per_s: 0.0,
             model_load_s: 0.0,
             rates_by_model: HashMap::new(),
+            cost_by_model: HashMap::new(),
         };
         let (_, _, rates) = r.split();
         assert!(rates.prefill_tok_per_s > 0.0);
@@ -330,6 +339,7 @@ mod tests {
             decode_tok_per_s: 72.0,
             model_load_s: 18.0,
             rates_by_model: HashMap::new(),
+            cost_by_model: HashMap::new(),
         };
         let (id, state, rates) = r.split();
         assert_eq!(id, "gpu-b");
@@ -367,6 +377,7 @@ mod tests {
             decode_tok_per_s: 2.0,
             model_load_s: 3.0,
             rates_by_model: HashMap::new(),
+            cost_by_model: HashMap::new(),
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: PeerReport = serde_json::from_str(&s).unwrap();
@@ -392,5 +403,24 @@ mod card_wire_tests {
             "decode_tok_per_s":0.0,"model_load_s":0.0,"rates_by_model":{}}"#;
         let report: PeerReport = serde_json::from_str(new).unwrap();
         assert_eq!(report.split().1.cards, vec![17_000_000_000]);
+    }
+
+    #[test]
+    fn cost_by_model_defaults_empty_and_round_trips() {
+        // An older build says nothing about placement cost: the field defaults empty.
+        let old = r#"{"node_id":"a","models":[],"serves":null,"load":0.0,"busy":0,"lanes":1,
+            "devices":[],"prefix_blocks":[],"prefill_tok_per_s":0.0,"decode_tok_per_s":0.0,
+            "model_load_s":0.0,"rates_by_model":{}}"#;
+        let report: PeerReport = serde_json::from_str(old).unwrap();
+        assert!(report.cost_by_model.is_empty());
+        // A node that measured itself carries the cost, and it survives the wire.
+        let with = r#"{"node_id":"a","models":["m"],"serves":null,"load":0.0,"busy":0,"lanes":1,
+            "devices":[],"prefix_blocks":[],"prefill_tok_per_s":0.0,"decode_tok_per_s":0.0,
+            "model_load_s":0.0,"rates_by_model":{},"cost_by_model":{"m":[1.75,1.1]}}"#;
+        let report: PeerReport = serde_json::from_str(with).unwrap();
+        assert_eq!(report.cost_by_model.get("m"), Some(&(1.75, 1.1)));
+        let back = serde_json::to_string(&report).unwrap();
+        let again: PeerReport = serde_json::from_str(&back).unwrap();
+        assert_eq!(again.cost_by_model.get("m"), Some(&(1.75, 1.1)));
     }
 }

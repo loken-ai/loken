@@ -180,6 +180,12 @@ impl LlmEngine {
     }
 
     /// Find model file by name
+    /// The resolved local file for a model id, for callers outside the loader (a pipeline tail
+    /// resolving the model it must load a layer range of). Same resolution `load_model` uses.
+    pub fn resolve_model_file(&self, model_id: &str) -> Option<PathBuf> {
+        self.find_model_file(model_id)
+    }
+
     pub(super) fn find_model_file(&self, model_id: &str) -> Option<PathBuf> {
         // AWQ (HF safetensors) checkpoint: the model reference is a
         // directory whose config.json declares quant_method==awq (a direct

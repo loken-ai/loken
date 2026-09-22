@@ -25,6 +25,27 @@ pub struct Demand<'a> {
     pub fetch: &'a dyn Fn(usize, usize) -> Option<Arc<Expert>>,
 }
 
+/// A model whose routed experts the engine streams onto the cards. The engine reads these figures
+/// to build a `Demand` and open the placement; it names no architecture, so any MoE model that can
+/// state its resident footprint, its routing and its experts is placed the same way. A model that
+/// keeps every weight resident simply does not implement it and is served on the host.
+pub trait StreamedModel {
+    /// Bytes every token reads before any routed expert (attention, shared expert, gate), kept
+    /// resident on the cards ahead of the experts.
+    fn resident_bytes(&self) -> usize;
+    /// The most a step asks a card for beside its kept weights, at `tokens` wide: a batch's
+    /// products, the peak that must fit as transient room.
+    fn peak_transient_bytes(&self, tokens: usize) -> usize;
+    /// Experts a token routes to at once: the lanes to open.
+    fn active_experts(&self) -> usize;
+    /// The model's expert-block count, the clock span a card holds an expert against eviction.
+    fn layer_count(&self) -> usize;
+    /// Per layer, experts ranked by how often the calibration routed to them: the warming prior.
+    fn routing_prior(&self) -> &[Vec<usize>];
+    /// Expert `id` of `layer`, for warming and fetching; `None` when the model has no such expert.
+    fn expert(&self, layer: usize, id: usize) -> Option<Arc<Expert>>;
+}
+
 /// The cards behind a model's forward: `offload` for its steps, `lanes` for its routed experts.
 pub struct Streamed {
     pub offload: Arc<dyn Offload>,
@@ -41,6 +62,21 @@ impl Streamed {
         }
         #[cfg(feature = "cuda")]
         Self::open_cuda(demand)
+    }
+
+    /// The placement for a `StreamedModel`, sizing the transient room to `transient_tokens` wide.
+    /// The model states its figures and its experts; the engine names no architecture. `None` when
+    /// the model runs on the host alone.
+    pub fn open_for<M: StreamedModel>(model: &M, transient_tokens: usize) -> Option<Self> {
+        let fetch = |layer: usize, id: usize| model.expert(layer, id);
+        Self::open(&Demand {
+            always_read: model.resident_bytes(),
+            transient: model.peak_transient_bytes(transient_tokens),
+            concurrency: model.active_experts(),
+            layers: model.layer_count(),
+            prior: model.routing_prior(),
+            fetch: &fetch,
+        })
     }
 
     #[cfg(feature = "cuda")]
@@ -144,5 +180,52 @@ fn warm(lanes: &ExpertOffload, demand: &Demand) {
             "{taken} experts kept on the cards from the routing prior in {:.1}s",
             started.elapsed().as_secs_f32()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inference::offload::experts::Expert;
+
+    /// A model that is not DeepSeek anything: it states plain figures. The test's point is that the
+    /// streamed placement takes it through `open_for` with no architecture named - the seam is
+    /// generic. On a host with no cards it opens nothing, which is the right answer, not a failure.
+    struct PlainMoe {
+        prior: Vec<Vec<usize>>,
+    }
+
+    impl StreamedModel for PlainMoe {
+        fn resident_bytes(&self) -> usize {
+            1 << 30
+        }
+        fn peak_transient_bytes(&self, tokens: usize) -> usize {
+            tokens * (1 << 20)
+        }
+        fn active_experts(&self) -> usize {
+            8
+        }
+        fn layer_count(&self) -> usize {
+            self.prior.len()
+        }
+        fn routing_prior(&self) -> &[Vec<usize>] {
+            &self.prior
+        }
+        fn expert(&self, _layer: usize, _id: usize) -> Option<Arc<Expert>> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_non_deepseek_model_opens_through_the_generic_seam() {
+        let m = PlainMoe {
+            prior: vec![vec![0, 1, 2]; 4],
+        };
+        // The assertion is that the generic path compiles and runs for a type the offload layer has
+        // never heard of. Without cards (the CPU test host) it places nothing.
+        let placed = Streamed::open_for(&m, 64);
+        #[cfg(not(feature = "cuda"))]
+        assert!(placed.is_none());
+        let _ = placed;
     }
 }

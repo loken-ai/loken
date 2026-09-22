@@ -10,6 +10,7 @@ pub mod continuous_batch;
 pub mod continuous_serve;
 pub mod eagle;
 pub mod pipeline;
+pub mod pipeline_serve;
 pub mod progress;
 pub mod prompt_lookup;
 pub mod scheduler;

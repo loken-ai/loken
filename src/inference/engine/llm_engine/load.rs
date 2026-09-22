@@ -647,9 +647,9 @@ pub(super) fn cb_maybe_wrap(state: &mut LoadedModelState) {
                 std::mem::replace(&mut state.model, Box::new(TakenBackend));
             // DeepSeek V4.1: move a card-placed model into its batch worker. A host-only load has
             // no lanes to batch and hands itself back.
-            let taken = match taken.into_v41(eos, V41_MAX_BATCH) {
+            let taken = match taken.into_batched(eos, V41_MAX_BATCH) {
                 Ok(server) => {
-                    state.model = Box::new(V41BatchBackend(server));
+                    state.model = Box::new(BatchedBackend(server));
                     return;
                 }
                 Err(back) => back,

@@ -87,13 +87,11 @@ pub fn write_gguf(path: &Path, entries: &[GgufEntry]) -> Result<()> {
 /// chat template - carried through byte for byte from the source so a requantised model is served
 /// as the format it declares. Dropping a key here is the failure that makes a model close its
 /// turn after a dozen tokens.
-pub fn write_gguf_with_metadata(
-    path: &Path,
-    metadata: &[(String, Value)],
-    entries: &[GgufEntry],
-) -> Result<()> {
-    let io_err = |e: std::io::Error| Error(format!("gguf write {}: {e}", path.display()));
-
+/// The GGUF header for `metadata` and the descriptors of `entries`: the magic, the counts, the
+/// metadata KVs, then each tensor's descriptor with its data offset. This is the whole file up to
+/// the aligned tensor-data section; `write_gguf_with_metadata` appends the data, and a caller that
+/// only needs the header (a metadata-only transfer) uses it as is.
+fn build_header(metadata: &[(String, Value)], entries: &[GgufEntry]) -> Vec<u8> {
     let mut header: Vec<u8> = Vec::with_capacity(64 * entries.len());
     layout::write_scalars(
         &mut header,
@@ -122,6 +120,24 @@ pub fn write_gguf_with_metadata(
         .encode(&mut header);
         offset = layout::align_up(offset + e.data.len() as u64, DEFAULT_ALIGNMENT);
     }
+    header
+}
+
+/// A GGUF header carrying only metadata and no tensors, as bytes. `Content::read` parses this into
+/// the metadata map, so a node can hand its model configuration to a peer without a file - the peer
+/// reads it exactly as it reads a real GGUF's header.
+pub fn metadata_only_bytes(metadata: &[(String, Value)]) -> Vec<u8> {
+    build_header(metadata, &[])
+}
+
+pub fn write_gguf_with_metadata(
+    path: &Path,
+    metadata: &[(String, Value)],
+    entries: &[GgufEntry],
+) -> Result<()> {
+    let io_err = |e: std::io::Error| Error(format!("gguf write {}: {e}", path.display()));
+
+    let header = build_header(metadata, entries);
 
     let tmp = path.with_extension("gguf.partial");
     let f = std::fs::File::create(&tmp).map_err(io_err)?;

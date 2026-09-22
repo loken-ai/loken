@@ -184,3 +184,66 @@ pub(crate) fn multirow(
     }
     Some(out)
 }
+
+/// How long this node's cores take to compute one routed expert it does not hold resident: gate and
+/// up in `gate_dt`, down in `down_dt`, over `dim` x `inter`, averaged over `iters`. This is the cut
+/// planner's `miss_ms`, measured on the node rather than guessed. The weight bytes are a fixed
+/// pattern - a GEMV's time is its size, not its values - and the activation drawn once.
+///
+/// `None` when a kernel cannot run these dims and formats (an unaligned dim, a quant the kernel does
+/// not carry): a node whose miss cost cannot be measured yields no number rather than crashing the
+/// caller, which is what lets this run on the model-load path. The caller reads `None` as unknown.
+pub fn bench_miss_ms(
+    dim: usize,
+    inter: usize,
+    gate_dt: crate::tensor::quantized::GgmlDType,
+    down_dt: crate::tensor::quantized::GgmlDType,
+    iters: usize,
+) -> Option<f64> {
+    use crate::tensor::quant_cpu::matmul_bytes_multi;
+    let iters = iters.max(1);
+    let gate_bytes = vec![0x11u8; inter * (dim / gate_dt.block_size()) * gate_dt.type_size()];
+    let down_bytes = vec![0x11u8; dim * (inter / down_dt.block_size()) * down_dt.type_size()];
+    let x = vec![0.05f32; dim];
+    let h = vec![0.05f32; inter];
+    let mut gout = vec![0f32; inter];
+    let mut uout = vec![0f32; inter];
+    let mut dout = vec![0f32; dim];
+    let run = |gout: &mut [f32], uout: &mut [f32], dout: &mut [f32]| -> bool {
+        matmul_bytes_multi(gate_dt, dim, inter, &[&gate_bytes], &[&x], &mut [gout]).is_ok()
+            && matmul_bytes_multi(gate_dt, dim, inter, &[&gate_bytes], &[&x], &mut [uout]).is_ok()
+            && matmul_bytes_multi(down_dt, inter, dim, &[&down_bytes], &[&h], &mut [dout]).is_ok()
+    };
+    // Warm the caches and the pool, then time. A kernel failure at either phase yields no number.
+    if !run(&mut gout, &mut uout, &mut dout) {
+        return None;
+    }
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        if !run(&mut gout, &mut uout, &mut dout) {
+            return None;
+        }
+    }
+    Some(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64)
+}
+
+#[cfg(test)]
+mod bench_tests {
+    use super::bench_miss_ms;
+    use crate::tensor::quantized::GgmlDType;
+
+    /// The bench measures a positive per-miss cost over real, block-aligned expert dims.
+    #[test]
+    fn bench_measures_a_miss() {
+        let ms = bench_miss_ms(5120, 2304, GgmlDType::Iq2Xxs, GgmlDType::Q2K, 8)
+            .expect("aligned dims measure");
+        assert!(ms > 0.0);
+    }
+
+    /// A dim the kernel cannot run (not a multiple of the quant's block) yields no number rather
+    /// than a panic - the guard that lets this run on the model-load path.
+    #[test]
+    fn an_unrunnable_dim_yields_none() {
+        assert!(bench_miss_ms(100, 2304, GgmlDType::Iq2Xxs, GgmlDType::Q2K, 4).is_none());
+    }
+}

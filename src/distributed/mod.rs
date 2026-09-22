@@ -3,6 +3,7 @@
 //! This module provides network-distributed LLM inference across multiple servers
 //! and heterogeneous devices (NVIDIA GPU, Intel Arc, CPU).
 
+pub mod auto_tune;
 pub mod cluster;
 pub mod cluster_runtime;
 pub mod cut_plan;
@@ -54,10 +55,11 @@ mod wiring_gate {
     ///
     /// One table, not two: a module that appears in neither list is the case a pair of tables
     /// lets through.
-    const MODULES: [(&str, &str, bool); 19] = [
+    const MODULES: [(&str, &str, bool); 20] = [
+        ("auto_tune", "auto_distribution", true),
         ("cluster", "distributed::cluster::", true),
         ("cluster_runtime", "cluster_runtime::", true),
-        ("cut_plan", "CutPlan", false),
+        ("cut_plan", "CutPlan", true),
         ("device_manager", "DeviceManager", true),
         ("discovery", "discovery::bind_discovery", true),
         ("evidence", "RequestEvidence", false),
@@ -70,9 +72,9 @@ mod wiring_gate {
         ("rate_meter", "rate_meter::", true),
         ("replay", "ResumePoint", false),
         ("routing", "routing::", true),
-        ("wire", "WireFrame", false),
-        ("wire_link", "WireLink", false),
-        ("wire_mux", "MuxLink", false),
+        ("wire", "write_frame", true),
+        ("wire_link", "WireLink", true),
+        ("wire_mux", "MuxLink", true),
         ("mod", "", true),
     ];
 

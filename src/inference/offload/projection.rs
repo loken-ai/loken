@@ -36,6 +36,15 @@ impl Projection {
         }
     }
 
+    /// The GGUF quant format this projection is stored in, when it has one. `None` for a dense or
+    /// block-scaled (fp4/fp8/bf16) weight, whose cost the miss bench does not model.
+    pub fn quant_dtype(&self) -> Option<crate::tensor::quantized::GgmlDType> {
+        match self {
+            Self::Quant(q) => Some(q.dtype()),
+            _ => None,
+        }
+    }
+
     /// Rows `[start, start + count)` as a projection of their own, in place where the storage
     /// allows: a grouped projection's group.
     pub fn rows(&self, start: usize, count: usize) -> Result<Self> {

@@ -140,6 +140,40 @@ pub(crate) trait ModelBackend: Send {
     // --- Core forwards --------------------------------------------------
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor>;
 
+    /// The shape a node measures its cost of computing one missed routed expert against:
+    /// `(dim, inter, gate_up_dtype, down_dtype)`. `None` (default) for a model with no streamed
+    /// experts to miss; a MoE whose experts stream overrides it so the cluster can price it.
+    fn expert_cost_shape(
+        &self,
+    ) -> Option<(
+        usize,
+        usize,
+        crate::tensor::quantized::GgmlDType,
+        crate::tensor::quantized::GgmlDType,
+    )> {
+        None
+    }
+
+    /// The model-side inputs the cluster's cut planner needs to place this model across nodes:
+    /// `(attn_bytes_per_layer, expert_bytes, working_set, activated)`. `None` (default) for a model
+    /// that does not stream experts, or when a piece is not measurable; a streamed MoE overrides it.
+    fn placement_model_inputs(&self) -> Option<(Vec<u64>, u64, u64, u64)> {
+        None
+    }
+
+    /// Make this backend the head of a cross-node pipeline: run layers `[0, cut)` here and hand the
+    /// rest to the tail at `addr`, which serves `[cut, n)`. The default declines, as a model that
+    /// cannot express a layer range cannot be a pipeline head; a pipelineable model overrides it.
+    fn connect_pipeline_tail(
+        &mut self,
+        _addr: std::net::SocketAddr,
+        _cut: usize,
+    ) -> crate::tensor::Result<()> {
+        Err(crate::tensor::Error::msg(
+            "this model cannot be a pipeline head",
+        ))
+    }
+
     /// Widest FFN intermediate dim across the model's layers (the activation-peak
     /// driver used to size the prefill chunk). `0` (default) keeps the 512 chunk.
     fn widest_ffn(&self) -> usize {
@@ -737,9 +771,12 @@ pub(crate) trait ModelBackend: Send {
     /// The continuous-batch worker, when this model is CB-served. The serial
     /// decode methods are NEVER called on a CB-served model - requests are
     /// delegated to the `ContinuousServer`.
-    fn continuous_server(
+    /// The batched-decode server this model is served through, when it is. The generic
+    /// continuous-batch server and the DeepSeek batch worker both provide one; the serial decode
+    /// methods are never called on a batch-served model - requests go to the server.
+    fn batched_server(
         &self,
-    ) -> Option<&std::sync::Arc<crate::inference::serve::continuous_serve::ContinuousServer>> {
+    ) -> Option<std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>> {
         None
     }
 
@@ -753,24 +790,14 @@ pub(crate) trait ModelBackend: Send {
     /// every other backend returns itself unchanged.
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend>;
 
-    /// The DeepSeek V4.1 batch worker, when this model is served through it. As with the generic
-    /// continuous server, the serial decode methods are never called on this variant - requests
-    /// are delegated to the worker.
-    fn v41_batch_server(
-        &self,
-    ) -> Option<&std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>>
-    {
-        None
-    }
-
-    /// Move a card-placed DeepSeek V4.1 model into a batch worker (the CB-wrap stepping stone for
-    /// V4.1); every other backend, and a host-only V4.1 load, returns itself unchanged.
-    fn into_v41(
+    /// Move a batch-eligible model into its batch worker (the CB-wrap stepping stone); a backend
+    /// with nothing to batch, or that does not batch, returns itself unchanged.
+    fn into_batched(
         self: Box<Self>,
         eos: u32,
         max_batch: usize,
     ) -> Result<
-        std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>,
+        std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
         BoxedModelBackend,
     >;
 }
@@ -781,12 +808,12 @@ macro_rules! take_generic_passthrough {
         fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
             Err(self)
         }
-        fn into_v41(
+        fn into_batched(
             self: Box<Self>,
             _eos: u32,
             _max_batch: usize,
         ) -> Result<
-            std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>,
+            std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
             BoxedModelBackend,
         > {
             Err(self)
@@ -852,6 +879,19 @@ pub(crate) struct DeepseekV41Backend {
     dspark: Option<crate::inference::model::deepseek_v41::dspark::Dspark>,
     /// The draft's running window state, beside `state`.
     dspark_state: Option<crate::inference::model::deepseek_v41::dspark::DsparkState>,
+    /// When set, this node is the HEAD of a cross-node pipeline: it runs layers `[0, cut)` and
+    /// hands the boundary to a tail over the link, which runs `[cut, n)` and returns the logits.
+    /// Formed when the cluster's auto-tune decides a split pays; `None` keeps the whole-stack
+    /// single-node path exactly as it was.
+    pipeline: Option<PipelineHead>,
+}
+
+/// The head end of a cross-node pipeline held by a backend: the link to the tail, the boundary
+/// layer, and a per-sequence id so a new prompt starts the tail's decode state clean.
+struct PipelineHead {
+    link: crate::distributed::wire_link::WireLink,
+    cut: usize,
+    seq: u32,
 }
 
 impl DeepseekV41Backend {
@@ -860,21 +900,15 @@ impl DeepseekV41Backend {
         widest_ffn: usize,
         context_length: usize,
     ) -> Self {
-        use crate::inference::offload::streamed::{Demand, Streamed};
+        use crate::inference::offload::streamed::Streamed;
         // Decode needs only a small transient (windowed attention bounds KV growth); the
         // full-context reservation would leave no card room for resident experts. A longer
         // prompt is chunked to this width at prefill.
         const PREFILL_TRANSIENT_TOKENS: usize = 64;
         let state = model.new_decode_state();
-        let fetch = |layer: usize, id: usize| model.expert_store(layer)?.fetch(id).ok();
-        let streamed = Streamed::open(&Demand {
-            always_read: model.resident_path_bytes(),
-            transient: model.transient_bytes(context_length.min(PREFILL_TRANSIENT_TOKENS)),
-            concurrency: model.n_activated(),
-            layers: model.n_layers(),
-            prior: model.hot_experts(),
-            fetch: &fetch,
-        });
+        // The engine opens the card placement through the generic streamed-model seam: the model
+        // states its resident footprint, routing and experts, and no architecture is named here.
+        let streamed = Streamed::open_for(&model, context_length.min(PREFILL_TRANSIENT_TOKENS));
         let dspark = crate::inference::model::deepseek_v41::dspark::Dspark::open();
         let mut state = state;
         let dspark_state = match &dspark {
@@ -907,7 +941,57 @@ impl DeepseekV41Backend {
             verify: None,
             dspark,
             dspark_state,
+            pipeline: None,
         }
+    }
+
+    /// Serve one forward over the pipeline: run `ids` through layers `[0, cut)` here token by token,
+    /// shipping each boundary to the tail and reading its logits, and return the last position's
+    /// logits `[1, vocab]`. A prompt is prefilled by feeding its tokens in order - each advances the
+    /// caches on both nodes - so no separate prefill path crosses the wire. A new sequence
+    /// (`index_pos == 0`) takes a fresh sequence id so the tail resets its decode state for it.
+    fn pipeline_forward(&mut self, ids: &[u32], index_pos: usize) -> crate::tensor::Result<Tensor> {
+        if index_pos == 0 {
+            self.state = self.model.new_decode_state();
+            let p = self.pipeline.as_mut().expect("pipeline set");
+            p.seq = p.seq.wrapping_add(1);
+        } else if self.state.pos != index_pos {
+            return Err(crate::tensor::Error::msg(format!(
+                "deepseek_v41 pipeline: forward at {index_pos} but the cache stands at {}",
+                self.state.pos
+            )));
+        }
+        let Self {
+            model,
+            state,
+            streamed,
+            pipeline,
+            ..
+        } = self;
+        let p = pipeline.as_mut().expect("pipeline set");
+        let (cut, seq) = (p.cut, p.seq);
+        let link = &mut p.link;
+        let logits = match streamed {
+            Some(s) => {
+                model.offload_experts(Some(s.lanes.clone()));
+                crate::inference::offload::with_offload(s.offload.clone(), || {
+                    let mut last = Vec::new();
+                    for &t in ids {
+                        last = model.pipeline_head_step_wire(t, cut, seq, state, link)?;
+                    }
+                    crate::tensor::Result::Ok(last)
+                })?
+            }
+            None => {
+                let mut last = Vec::new();
+                for &t in ids {
+                    last = model.pipeline_head_step_wire(t, cut, seq, state, link)?;
+                }
+                last
+            }
+        };
+        let vocab = logits.len();
+        crate::tensor::Tensor::from_vec(logits, (1, vocab), &crate::tensor::Device::Cpu)
     }
 
     /// One batched verify over `ids` from the current position: each layer's experts are read
@@ -983,10 +1067,10 @@ pub(crate) struct ContinuousBackend(
 );
 
 /// DeepSeek V4.1 served through its batch worker: the model moved into a background
-/// `V41BatchServer` that batches concurrent requests' decode steps. The serial decode methods are
-/// never called on this variant - requests are delegated to the worker.
-pub(crate) struct V41BatchBackend(
-    pub std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>,
+/// A batched-decode server that batches concurrent requests' decode steps. The serial decode
+/// methods are never called on this variant - requests are delegated to the server.
+pub(crate) struct BatchedBackend(
+    pub std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
 );
 
 /// Transient sentinel used ONLY while swapping a loaded GenericHetero model
@@ -1007,7 +1091,7 @@ unsafe impl Send for Qwen35MoeBackend {}
 #[cfg(feature = "cuda")]
 unsafe impl Send for TpQwen2Backend {}
 unsafe impl Send for ContinuousBackend {}
-unsafe impl Send for V41BatchBackend {}
+unsafe impl Send for BatchedBackend {}
 
 // ------------------------------------------------------------
 // Trait impls
@@ -1285,12 +1369,12 @@ impl ModelBackend for GenericBackend {
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
         Ok(self.0)
     }
-    fn into_v41(
+    fn into_batched(
         self: Box<Self>,
         _eos: u32,
         _max_batch: usize,
     ) -> Result<
-        std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>,
+        std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
         BoxedModelBackend,
     > {
         Err(self)
@@ -1619,8 +1703,46 @@ impl ModelBackend for Lfm2MoeBackend {
 }
 
 impl ModelBackend for DeepseekV41Backend {
+    fn expert_cost_shape(
+        &self,
+    ) -> Option<(
+        usize,
+        usize,
+        crate::tensor::quantized::GgmlDType,
+        crate::tensor::quantized::GgmlDType,
+    )> {
+        self.model.expert_cost_shape()
+    }
+
+    fn placement_model_inputs(&self) -> Option<(Vec<u64>, u64, u64, u64)> {
+        self.model.placement_model_inputs()
+    }
+
+    fn connect_pipeline_tail(
+        &mut self,
+        addr: std::net::SocketAddr,
+        cut: usize,
+    ) -> crate::tensor::Result<()> {
+        let n = self.model.n_layers();
+        if cut == 0 || cut >= n {
+            return Err(crate::tensor::Error::msg(format!(
+                "pipeline head: cut {cut} must be in 1..{n}"
+            )));
+        }
+        let link = crate::distributed::wire_link::WireLink::connect(addr).map_err(|e| {
+            crate::tensor::Error::msg(format!("pipeline head: connect {addr}: {e}"))
+        })?;
+        self.pipeline = Some(PipelineHead { link, cut, seq: 0 });
+        Ok(())
+    }
+
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
         let ids = x.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+        // A cross-node pipeline head runs the whole forward through the tail: the local path below
+        // never sees a token, so it stays exactly the single-node path when no split is active.
+        if self.pipeline.is_some() {
+            return self.pipeline_forward(&ids, index_pos);
+        }
         // A plain decode moves past any verify mark: a full acceptance never trims, so the mark
         // is stale here and would otherwise hold a whole state clone across the decode.
         self.verify = None;
@@ -1851,12 +1973,12 @@ impl ModelBackend for DeepseekV41Backend {
         )
     }
 
-    fn into_v41(
+    fn into_batched(
         self: Box<Self>,
         eos: u32,
         max_batch: usize,
     ) -> Result<
-        std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>,
+        std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
         BoxedModelBackend,
     > {
         use crate::inference::model::deepseek_v41::batch_server::V41BatchServer;
@@ -1876,7 +1998,9 @@ impl ModelBackend for DeepseekV41Backend {
             Some(eos),
             max_batch,
         );
-        Ok(std::sync::Arc::new(server))
+        let server: std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer> =
+            std::sync::Arc::new(server);
+        Ok(server)
     }
 
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
@@ -2002,16 +2126,16 @@ impl ModelBackend for ContinuousBackend {
         ))
     }
 
-    fn continuous_server(
+    fn batched_server(
         &self,
-    ) -> Option<&std::sync::Arc<crate::inference::serve::continuous_serve::ContinuousServer>> {
-        Some(&self.0)
+    ) -> Option<std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>> {
+        Some(self.0.clone())
     }
 
     take_generic_passthrough!();
 }
 
-impl ModelBackend for V41BatchBackend {
+impl ModelBackend for BatchedBackend {
     fn forward(&mut self, _x: &Tensor, _index_pos: usize) -> crate::tensor::Result<Tensor> {
         // Batch-served: the worker is the sole caller of the model forward, never this.
         Err(crate::tensor::Error::msg(
@@ -2021,11 +2145,10 @@ impl ModelBackend for V41BatchBackend {
         ))
     }
 
-    fn v41_batch_server(
+    fn batched_server(
         &self,
-    ) -> Option<&std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>>
-    {
-        Some(&self.0)
+    ) -> Option<std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>> {
+        Some(self.0.clone())
     }
 
     take_generic_passthrough!();
