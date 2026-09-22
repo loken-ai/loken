@@ -774,6 +774,116 @@ impl DeepseekV41Model {
         state.pos += k;
         Ok(logits)
     }
+
+    /// Decode one token for each of several independent sequences at once, returning the
+    /// next-token logits per sequence `[reqs.len(), vocab]`. Attention runs per sequence over its
+    /// own ring at its own position - a sequence never reads another's keys - and the FFN with its
+    /// MoE runs once over the whole batch, so each active expert is read once for all the
+    /// sequences that route to it. This is where a batch earns its throughput: the memory-bound
+    /// expert reads amortise across the sequences while single-token decode leaves the card idle.
+    /// Each sequence's `pos` advances by one. Capture (the draft's hidden) is not taken here.
+    pub fn forward_decode_batch(&self, reqs: &mut [(u32, &mut DecodeState)]) -> Result<Tensor> {
+        if reqs.is_empty() {
+            return Err(Error::msg("forward_decode_batch: no requests"));
+        }
+        let (dim, hc) = (self.dim, self.hc_mult);
+        let n = reqs.len();
+
+        // Each sequence's token embedded, broadcast into the hyper-connection copies: [1, n, hc, d].
+        let mut rows = Vec::with_capacity(n);
+        for (t, _) in reqs.iter() {
+            rows.push(self.embed.narrow(0, *t as usize, 1)?);
+        }
+        let refs: Vec<&Tensor> = rows.iter().collect();
+        let emb = Tensor::cat(&refs, 0)?.reshape((1, n, dim))?;
+        let mut x = emb
+            .unsqueeze(2)?
+            .broadcast_as((1, n, hc, dim))?
+            .contiguous()?;
+
+        // Rope tables long enough for the furthest-along sequence; each reads its own row `pos`.
+        let len = reqs.iter().map(|(_, s)| s.pos).max().unwrap_or(0) + 1;
+        let (cos0, sin0) = rope_table(
+            self.rope_head_dim,
+            len,
+            0,
+            self.rope_theta,
+            self.rope_factor,
+        )?;
+        let (cosb, sinb) = rope_table(
+            self.rope_head_dim,
+            len,
+            self.original_seq_len,
+            self.compress_rope_theta,
+            self.rope_factor,
+        )?;
+
+        // One engram recent per sequence, from that sequence's own history.
+        let recents: Vec<_> = reqs
+            .iter_mut()
+            .map(|(t, s)| self.engram_cfg.as_ref().map(|ecfg| s.engram.push(ecfg, *t)))
+            .collect();
+
+        // The collapse weights into the top layer and the band state, one per sequence.
+        let mut pre_mix: Vec<Vec<f32>> = (0..n)
+            .map(|_| {
+                let mut v = vec![0f32; hc];
+                v[0] = 1.0;
+                v
+            })
+            .collect();
+        let mut shareds: Vec<SharedAttn> = (0..n).map(|_| SharedAttn::default()).collect();
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            let (cos, sin) = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
+                (&cos0, &sin0)
+            } else {
+                (&cosb, &sinb)
+            };
+            // Attention half, one sequence at a time, each over its own ring at its own position.
+            let mut attn_rows = Vec::with_capacity(n);
+            let mut am_pre: Vec<Vec<f32>> = Vec::with_capacity(n);
+            for j in 0..n {
+                let pos_j = reqs[j].1.pos;
+                let mut xj = x.narrow(1, j, 1)?.contiguous()?;
+                if let (Some(engram), Some(ecfg), Some(recent)) =
+                    (&self.engrams[i], &self.engram_cfg, &recents[j])
+                {
+                    let which = ecfg.layer_ids.iter().position(|&l| l == i).unwrap_or(0);
+                    xj = engram.forward(&xj, &[ecfg.hash(which, recent)])?;
+                }
+                let (xj_attn, ampre_j) = block.forward_decode_attn(
+                    &xj,
+                    &pre_mix[j..j + 1],
+                    cos,
+                    sin,
+                    pos_j,
+                    &mut reqs[j].1.layers[i],
+                    &mut shareds[j],
+                )?;
+                attn_rows.push(xj_attn);
+                am_pre.push(ampre_j.into_iter().next().unwrap_or_else(|| {
+                    let mut v = vec![0f32; hc];
+                    v[0] = 1.0;
+                    v
+                }));
+            }
+            let arefs: Vec<&Tensor> = attn_rows.iter().collect();
+            let xattn = Tensor::cat(&arefs, 1)?;
+            // FFN half, once over the whole batch: one read of each expert for all the sequences.
+            let (nx, npm) = block.forward_prefill_ffn(&xattn, &am_pre)?;
+            x = nx;
+            pre_mix = npm;
+        }
+
+        let h = hc_pre(&x, &pre_mix)?;
+        let h = rms_norm(&h, &self.norm, self.rms_eps)?;
+        let logits = self.output.apply(&h.reshape((n, dim))?)?;
+        for (_, s) in reqs.iter_mut() {
+            s.pos += 1;
+        }
+        Ok(logits)
+    }
 }
 
 #[cfg(test)]
@@ -1595,6 +1705,82 @@ mod oracle_gate {
                         "{ratios:?} split {split}: verify pos {j} argmax"
                     );
                 }
+            }
+        }
+    }
+
+    /// Independent sequences decoded together give each the logits it gives alone: attention runs
+    /// per sequence over its own ring at its own position, so no sequence reads another's keys, and
+    /// the shared FFN over the batch differs only by accumulation. This is the invariant a
+    /// throughput batcher rests on.
+    #[test]
+    fn forward_decode_batch_matches_separate_decodes() {
+        let layouts: [(&[u32], &[u32], &[u32]); 2] =
+            [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+            (num / b.iter().map(|y| y * y).sum::<f32>()).sqrt()
+        };
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        for (ratios, kv_src, index_src) in layouts {
+            let (model, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            // Three independent sequences: distinct token streams and distinct lengths, so the
+            // batch step runs three different positions at once.
+            let seqs: Vec<Vec<u32>> = (0..3)
+                .map(|j| {
+                    let len = tokens.len() - 2 * j - 1;
+                    (0..len)
+                        .map(|i| tokens[(i + 5 * j) % tokens.len()])
+                        .collect()
+                })
+                .collect();
+            // The target for each sequence: its last logits from a lone token-by-token decode.
+            let want: Vec<Vec<f32>> = seqs
+                .iter()
+                .map(|s| {
+                    let mut st = model.new_decode_state();
+                    let mut last = Vec::new();
+                    for &t in s {
+                        last = vecf_of(&model.forward_decode(t, &mut st).unwrap());
+                    }
+                    last
+                })
+                .collect();
+            let vocab = want[0].len();
+            // The batched step: every sequence decoded up to its last token alone, then one
+            // batched step over all their last tokens together.
+            let mut states: Vec<DecodeState> = seqs
+                .iter()
+                .map(|s| {
+                    let mut st = model.new_decode_state();
+                    for &t in &s[..s.len() - 1] {
+                        model.forward_decode(t, &mut st).unwrap();
+                    }
+                    st
+                })
+                .collect();
+            let mut reqs: Vec<(u32, &mut DecodeState)> = seqs
+                .iter()
+                .zip(states.iter_mut())
+                .map(|(s, st)| (*s.last().unwrap(), st))
+                .collect();
+            let logits = model.forward_decode_batch(&mut reqs).unwrap();
+            let (nrows, v) = logits.dims2().unwrap();
+            assert_eq!((nrows, v), (3, vocab));
+            let flat = vecf_of(&logits);
+            drop(reqs); // releases the mutable borrows into `states` so its positions can be read
+            for (j, s) in seqs.iter().enumerate() {
+                assert_eq!(states[j].pos, s.len(), "{ratios:?} seq {j} position");
+                let got = &flat[j * vocab..(j + 1) * vocab];
+                let r = rel(got, &want[j]);
+                assert!(r < 1e-3, "{ratios:?} seq {j} rel {r}");
+                assert_eq!(argmax(got), argmax(&want[j]), "{ratios:?} seq {j} argmax");
             }
         }
     }
