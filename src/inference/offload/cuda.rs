@@ -234,6 +234,20 @@ impl Card {
 
     /// `q` on this card, kept for the next call. `None` when it could not go over, which leaves
     /// the caller to upload per call as before.
+    /// A weight already resident in the always-read tier, or `None` - never an upload. A step that
+    /// must not admit (a fused block declining unless the whole set is already here, so it never
+    /// forces a routed expert into the always-read tier nor churns the working set) asks through
+    /// this rather than `kept`.
+    fn kept_resident(&self, q: &Arc<QTensor>) -> Option<Arc<QMatMul>> {
+        let bytes = q.data().ok()?;
+        let key = (bytes.as_ptr() as usize, bytes.len());
+        self.resident
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+    }
+
     fn kept(&self, q: &Arc<QTensor>) -> Option<Arc<QMatMul>> {
         let bytes = q.data().ok()?;
         let key = (bytes.as_ptr() as usize, bytes.len());
@@ -1000,22 +1014,25 @@ impl Offload for Card {
             Projection::Quant(q) => Some(q.clone()),
             _ => None,
         };
-        // Every active expert (and the shared) must be kept on THIS card, or the block declines so
-        // the host runs it. The routed experts a decode misses are admitted here as elsewhere.
+        // Every active expert (and the shared) must ALREADY be resident on THIS card, or the block
+        // declines so the streamed path runs it. Resident-only, never an upload: a routed expert
+        // lives in the evictable expert tier with its CPU overlap, so admitting it into the
+        // always-read tier here would force a per-token crossing and churn the working set - the
+        // regression this fused block existed to avoid.
         let mut ms: Vec<(Arc<QMatMul>, Arc<QMatMul>, Arc<QMatMul>)> =
             Vec::with_capacity(active.len());
         for (w1, w3, w2) in active {
             ms.push((
-                self.kept(&quant(w1)?)?,
-                self.kept(&quant(w3)?)?,
-                self.kept(&quant(w2)?)?,
+                self.kept_resident(&quant(w1)?)?,
+                self.kept_resident(&quant(w3)?)?,
+                self.kept_resident(&quant(w2)?)?,
             ));
         }
         let sh = match shared {
             Some((w1, w3, w2)) => Some((
-                self.kept(&quant(w1)?)?,
-                self.kept(&quant(w3)?)?,
-                self.kept(&quant(w2)?)?,
+                self.kept_resident(&quant(w1)?)?,
+                self.kept_resident(&quant(w3)?)?,
+                self.kept_resident(&quant(w2)?)?,
             )),
             None => None,
         };
