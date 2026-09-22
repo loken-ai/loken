@@ -14,7 +14,7 @@ impl LlmEngine {
     /// (so the HTTP layer can skip the single-request gate -> requests batch).
     pub async fn is_continuous(&self) -> bool {
         matches!(self.model_state.lock().await.as_ref(),
-            Some(s) if s.model.continuous_server().is_some())
+            Some(s) if s.model.continuous_server().is_some() || s.model.v41_batch_server().is_some())
     }
 
     /// Stream a request through the continuous-batch worker: tokenize, submit
@@ -136,6 +136,105 @@ impl LlmEngine {
         rx
     }
 
+    /// Stream a request through the DeepSeek V4.1 batch worker: the same shape as `stream_via_cb`,
+    /// only the worker and its token type differ. Tokenize, submit with the resolved sampling
+    /// controls, and pump the worker's channel back as incrementally-detokenized text.
+    pub(super) fn stream_via_v41_batch(
+        &self,
+        server: std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>,
+        tokenizer: Tokenizer,
+        eos_set: Vec<u32>,
+        ctx_len: usize,
+        prompt: &str,
+        params: GenerationParams,
+    ) -> tokio::sync::mpsc::Receiver<Result<String, String>> {
+        use crate::inference::model::deepseek_v41::batch_server::Tok;
+        use crate::inference::serve::continuous_batch::SamplingParams;
+        let config = self.config.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(4096);
+        let tokens: Vec<u32> = match tokenizer.encode(prompt, true) {
+            Ok(e) => with_prefix_tokens(&params, e.get_ids()),
+            Err(e) => {
+                let _ = tx.try_send(Err(format!("Tokenization: {e}")));
+                return rx;
+            }
+        };
+        let max_new = params
+            .max_tokens
+            .unwrap_or(config.max_tokens)
+            .min(ctx_len.saturating_sub(tokens.len()))
+            .max(1);
+        let temperature = params.temperature.unwrap_or(config.temperature);
+        let top_p = params.top_p.unwrap_or(config.top_p);
+        let top_k = params.top_k.unwrap_or(config.top_k);
+        let sampling = SamplingParams {
+            temperature: temperature as f64,
+            top_k: if top_k > 0 { Some(top_k) } else { None },
+            top_p: if top_p < 1.0 {
+                Some(top_p as f64)
+            } else {
+                None
+            },
+            repeat_penalty: params.repeat_penalty.unwrap_or(config.repeat_penalty),
+            repeat_last_n: params.repeat_last_n.unwrap_or(config.repeat_last_n),
+            seed: params.seed.unwrap_or(config.seed),
+        };
+        let stops = params.stop_sequences.clone();
+        let v41_rx = server.submit_sampled(tokens, max_new, sampling);
+        std::thread::spawn(move || {
+            let mut gen: Vec<u32> = Vec::new();
+            let mut emitted = String::new();
+            let skip_special = true;
+            let settled = |gen: &[u32]| -> Option<String> {
+                let keep = gen.len().checked_sub(1)?;
+                tokenizer.decode(&gen[..keep], skip_special).ok()
+            };
+            let mut stopped_early = false;
+            while let Ok(Tok::Next(t)) = v41_rx.recv() {
+                if eos_set.contains(&t) {
+                    break;
+                }
+                gen.push(t);
+                let Some(text) = settled(&gen) else { continue };
+                if text.len() <= emitted.len() || !text.starts_with(&emitted) {
+                    continue;
+                }
+                if let Some(pos) = stops
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| text.find(s.as_str()))
+                    .min()
+                {
+                    if pos > emitted.len() {
+                        let _ = tx.blocking_send(Ok(text[emitted.len()..pos].to_string()));
+                    }
+                    stopped_early = true;
+                    break;
+                }
+                let delta = text[emitted.len()..].to_string();
+                emitted = text;
+                if tx.blocking_send(Ok(delta)).is_err() {
+                    stopped_early = true;
+                    break;
+                }
+            }
+            if !stopped_early {
+                if let Ok(full) = tokenizer.decode(&gen, skip_special) {
+                    let cut = stops
+                        .iter()
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|s| full.find(s.as_str()))
+                        .min()
+                        .unwrap_or(full.len());
+                    if full.starts_with(&emitted) && cut > emitted.len() {
+                        let _ = tx.blocking_send(Ok(full[emitted.len()..cut].to_string()));
+                    }
+                }
+            }
+        });
+        rx
+    }
+
     pub async fn generate_stream(
         &self,
         prompt: &str,
@@ -169,6 +268,17 @@ impl LlmEngine {
                         return Ok(
                             self.stream_via_cb(server, tokenizer, eos_set, ctx_len, prompt, params)
                         );
+                    }
+                    if let Some(server) = state.model.v41_batch_server() {
+                        let server = std::sync::Arc::clone(server);
+                        let tokenizer = state.tokenizer.clone();
+                        let mut eos_set = state.eos_token_ids_extra.clone();
+                        eos_set.push(state.eos_token_id);
+                        let ctx_len = state.context_length;
+                        drop(guard);
+                        return Ok(self.stream_via_v41_batch(
+                            server, tokenizer, eos_set, ctx_len, prompt, params,
+                        ));
                     }
                 }
             }

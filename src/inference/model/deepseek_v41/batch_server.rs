@@ -2,11 +2,11 @@
 //!
 //! Concurrent requests to one model serialise through a lone `forward_decode`, leaving the card
 //! idle between each token. This worker is the sole caller of the model forward: requests submit a
-//! prompt and a token channel, the worker prefills each and then decodes every running sequence
-//! together each tick through `forward_decode_batch`, so each active expert is read once for the
-//! whole batch. The batch shrinks as sequences finish, so a long generation never holds a finished
-//! one's place. It is a throughput lever, not a latency one: each request sees a little less than
-//! its lone rate, but many run at once.
+//! prompt, a sampling spec and a token channel, the worker prefills each and then decodes every
+//! running sequence together each tick through `forward_decode_batch`, so each active expert is
+//! read once for the whole batch. The batch shrinks as sequences finish, so a long generation
+//! never holds a finished one's place. It is a throughput lever, not a latency one: each request
+//! sees a little less than its lone rate, but many run at once.
 //!
 //! Ownership: the worker owns the model for its lifetime and is the only thread that calls its
 //! forward, so the model needs no lock and its device handles are only ever touched from here.
@@ -14,6 +14,8 @@
 use super::cache::DecodeState;
 use super::model::DeepseekV41Model;
 use crate::inference::offload::{with_offload, Offload};
+use crate::inference::serve::continuous_batch::SamplingParams;
+use crate::inference::serve::continuous_serve::sample_row_host;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 
@@ -26,16 +28,21 @@ pub enum Tok {
 struct Submission {
     prompt: Vec<u32>,
     max_new: usize,
+    sampling: SamplingParams,
     tx: Sender<Tok>,
 }
 
 /// One running sequence the worker decodes: its cache, the token it decodes next, how many it has
-/// produced, its budget, and the channel it streams back on.
+/// produced, its budget and sampling spec, the prompt and generated tokens (the repeat-penalty
+/// window), and the channel it streams back on.
 struct Seq {
     state: DecodeState,
     next: u32,
     produced: usize,
     max_new: usize,
+    sampling: SamplingParams,
+    prompt: Vec<u32>,
+    generated: Vec<u32>,
     tx: Sender<Tok>,
 }
 
@@ -52,12 +59,20 @@ struct SendModel {
 }
 unsafe impl Send for SendModel {}
 
-fn argmax(v: &[f32]) -> u32 {
-    v.iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+/// The last `last_n` tokens of (prompt ++ generated) - the window `sample_row_host` reads for the
+/// repeat penalty. Empty when the penalty is off.
+fn recent_window(prompt: &[u32], generated: &[u32], last_n: usize) -> Vec<u32> {
+    if last_n == 0 {
+        return Vec::new();
+    }
+    let total = prompt.len() + generated.len();
+    let start = total.saturating_sub(last_n);
+    prompt
+        .iter()
+        .chain(generated.iter())
+        .skip(start)
+        .copied()
+        .collect()
 }
 
 impl V41BatchServer {
@@ -78,13 +93,25 @@ impl V41BatchServer {
         Self { submit_tx }
     }
 
-    /// Submit a request; the returned receiver yields its tokens as they are produced, ending with
-    /// `Tok::Done`. Dropping it lets the worker reclaim the slot once the sequence finishes.
+    /// Submit a greedy request; the returned receiver yields its tokens as they are produced,
+    /// ending with `Tok::Done`.
     pub fn submit(&self, prompt: Vec<u32>, max_new: usize) -> Receiver<Tok> {
+        self.submit_sampled(prompt, max_new, SamplingParams::greedy())
+    }
+
+    /// Submit with explicit sampling controls. Dropping the receiver lets the worker reclaim the
+    /// slot once the sequence finishes.
+    pub fn submit_sampled(
+        &self,
+        prompt: Vec<u32>,
+        max_new: usize,
+        sampling: SamplingParams,
+    ) -> Receiver<Tok> {
         let (tx, rx) = mpsc::channel();
         let _ = self.submit_tx.send(Submission {
             prompt,
             max_new,
+            sampling,
             tx,
         });
         rx
@@ -97,6 +124,24 @@ fn under<R>(offload: &Option<Arc<dyn Offload>>, f: impl FnOnce() -> R) -> R {
         Some(o) => with_offload(o.clone(), f),
         None => f(),
     }
+}
+
+/// Draw the token that follows `flat[row]` for `seq`, applying its sampling spec over its
+/// repeat-penalty window.
+fn sample(seq: &Seq, flat: &[f32], row: usize, vocab: usize) -> u32 {
+    let logits = flat[row * vocab..(row + 1) * vocab].to_vec();
+    let recent = recent_window(&seq.prompt, &seq.generated, seq.sampling.repeat_last_n);
+    sample_row_host(logits, &seq.sampling, &recent, seq.produced)
+        .unwrap_or_else(|_| argmax(flat, row, vocab))
+}
+
+fn argmax(flat: &[f32], row: usize, vocab: usize) -> u32 {
+    flat[row * vocab..(row + 1) * vocab]
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
 }
 
 /// Prefill a submission's prompt and add it to the running set, streaming nothing yet. A prefill
@@ -112,15 +157,13 @@ fn admit(sm: &SendModel, sub: Submission, active: &mut Vec<Seq>) {
             return;
         }
     };
-    let (rows, vocab) = match logits.dims2() {
-        Ok(d) => d,
-        Err(_) => {
-            let _ = sub.tx.send(Tok::Done);
-            return;
-        }
-    };
-    let flat = match logits.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
-        Ok(v) => v,
+    let flat = match logits.dims2().and_then(|(rows, vocab)| {
+        logits
+            .flatten_all()?
+            .to_vec1::<f32>()
+            .map(|v| (v, rows, vocab))
+    }) {
+        Ok((v, rows, vocab)) => (v, rows, vocab),
         Err(_) => {
             let _ = sub.tx.send(Tok::Done);
             return;
@@ -130,14 +173,20 @@ fn admit(sm: &SendModel, sub: Submission, active: &mut Vec<Seq>) {
         let _ = sub.tx.send(Tok::Done);
         return;
     }
-    let next = argmax(&flat[(rows - 1) * vocab..rows * vocab]);
-    active.push(Seq {
+    let (v, rows, vocab) = flat;
+    let mut seq = Seq {
         state,
-        next,
+        next: 0,
         produced: 0,
         max_new: sub.max_new,
+        sampling: sub.sampling,
+        prompt: sub.prompt,
+        generated: Vec::new(),
         tx: sub.tx,
-    });
+    };
+    // The first token to decode: sampled from the prefill's last position.
+    seq.next = sample(&seq, &v, rows - 1, vocab);
+    active.push(seq);
 }
 
 fn worker(sm: SendModel, eos: Option<u32>, max_batch: usize, rx: Receiver<Submission>) {
@@ -185,12 +234,13 @@ fn worker(sm: SendModel, eos: Option<u32>, max_batch: usize, rx: Receiver<Submis
         for (row, seq) in active.iter_mut().enumerate() {
             let tok = seq.next;
             let _ = seq.tx.send(Tok::Next(tok));
+            seq.generated.push(tok);
             seq.produced += 1;
             if seq.produced >= seq.max_new || Some(tok) == eos {
                 let _ = seq.tx.send(Tok::Done);
                 finished.push(row);
             } else {
-                seq.next = argmax(&flat[row * vocab..(row + 1) * vocab]);
+                seq.next = sample(seq, &flat, row, vocab);
             }
         }
         for &r in finished.iter().rev() {

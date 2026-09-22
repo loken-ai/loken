@@ -638,12 +638,27 @@ pub(super) fn cb_maybe_wrap(state: &mut LoadedModelState) {
             .and_then(|c| c.inference.continuous_batching)
             .unwrap_or(false);
         if cb_enabled {
-            if !state.model.cb_eligible_gpu() {
-                return;
-            }
             let (eos, ctx) = (state.eos_token_id, state.context_length);
+            // The concurrent-decode batch-width cap. The V4.1 bench saturates aggregate throughput
+            // by a batch of a few, so a handful is the useful width; a larger prompt set simply
+            // queues behind it.
+            const V41_MAX_BATCH: usize = 8;
             let taken: BoxedModelBackend =
                 std::mem::replace(&mut state.model, Box::new(TakenBackend));
+            // DeepSeek V4.1: move a card-placed model into its batch worker. A host-only load has
+            // no lanes to batch and hands itself back.
+            let taken = match taken.into_v41(eos, V41_MAX_BATCH) {
+                Ok(server) => {
+                    state.model = Box::new(V41BatchBackend(server));
+                    return;
+                }
+                Err(back) => back,
+            };
+            // Generic dense (Qwen2/3): the paged continuous server, when the GPU is eligible.
+            if !taken.cb_eligible_gpu() {
+                state.model = taken;
+                return;
+            }
             let m = match taken.take_generic() {
                 Ok(m) => m,
                 Err(other) => {

@@ -752,12 +752,43 @@ pub(crate) trait ModelBackend: Send {
     /// Extract the inner `GenericHeteroTransformer` (CB-wrap stepping stone);
     /// every other backend returns itself unchanged.
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend>;
+
+    /// The DeepSeek V4.1 batch worker, when this model is served through it. As with the generic
+    /// continuous server, the serial decode methods are never called on this variant - requests
+    /// are delegated to the worker.
+    fn v41_batch_server(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>>
+    {
+        None
+    }
+
+    /// Move a card-placed DeepSeek V4.1 model into a batch worker (the CB-wrap stepping stone for
+    /// V4.1); every other backend, and a host-only V4.1 load, returns itself unchanged.
+    fn into_v41(
+        self: Box<Self>,
+        eos: u32,
+        max_batch: usize,
+    ) -> Result<
+        std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>,
+        BoxedModelBackend,
+    >;
 }
 
 /// `take_generic` passthrough for every backend that is NOT GenericHetero.
 macro_rules! take_generic_passthrough {
     () => {
         fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
+            Err(self)
+        }
+        fn into_v41(
+            self: Box<Self>,
+            _eos: u32,
+            _max_batch: usize,
+        ) -> Result<
+            std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>,
+            BoxedModelBackend,
+        > {
             Err(self)
         }
     };
@@ -951,6 +982,13 @@ pub(crate) struct ContinuousBackend(
     pub std::sync::Arc<crate::inference::serve::continuous_serve::ContinuousServer>,
 );
 
+/// DeepSeek V4.1 served through its batch worker: the model moved into a background
+/// `V41BatchServer` that batches concurrent requests' decode steps. The serial decode methods are
+/// never called on this variant - requests are delegated to the worker.
+pub(crate) struct V41BatchBackend(
+    pub std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>,
+);
+
 /// Transient sentinel used ONLY while swapping a loaded GenericHetero model
 /// into a Continuous worker (`std::mem::replace` placeholder) - never stored
 /// or used; any method call on it is a bug.
@@ -969,6 +1007,7 @@ unsafe impl Send for Qwen35MoeBackend {}
 #[cfg(feature = "cuda")]
 unsafe impl Send for TpQwen2Backend {}
 unsafe impl Send for ContinuousBackend {}
+unsafe impl Send for V41BatchBackend {}
 
 // ------------------------------------------------------------
 // Trait impls
@@ -1245,6 +1284,16 @@ impl ModelBackend for GenericBackend {
 
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
         Ok(self.0)
+    }
+    fn into_v41(
+        self: Box<Self>,
+        _eos: u32,
+        _max_batch: usize,
+    ) -> Result<
+        std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>,
+        BoxedModelBackend,
+    > {
+        Err(self)
     }
 }
 
@@ -1802,7 +1851,37 @@ impl ModelBackend for DeepseekV41Backend {
         )
     }
 
-    take_generic_passthrough!();
+    fn into_v41(
+        self: Box<Self>,
+        eos: u32,
+        max_batch: usize,
+    ) -> Result<
+        std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>,
+        BoxedModelBackend,
+    > {
+        use crate::inference::model::deepseek_v41::batch_server::V41BatchServer;
+        let mut this = *self;
+        // Only a card-placed model joins the worker: it runs the same streamed decode the serial
+        // path does. A host-only load has no lanes to batch onto and stays serial.
+        let Some(streamed) = this.streamed.take() else {
+            return Err(Box::new(this));
+        };
+        // The routed experts run on the cards through the streamed lanes, set once for the worker's
+        // lifetime; the card offload runs the attention and the products.
+        this.model.offload_experts(Some(streamed.lanes.clone()));
+        let card: std::sync::Arc<dyn crate::inference::offload::Offload> = streamed.offload.clone();
+        let server = V41BatchServer::spawn(
+            std::sync::Arc::new(this.model),
+            Some(card),
+            Some(eos),
+            max_batch,
+        );
+        Ok(std::sync::Arc::new(server))
+    }
+
+    fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
+        Err(self)
+    }
 }
 
 impl ModelBackend for Qwen35MoeBackend {
@@ -1926,6 +2005,26 @@ impl ModelBackend for ContinuousBackend {
     fn continuous_server(
         &self,
     ) -> Option<&std::sync::Arc<crate::inference::serve::continuous_serve::ContinuousServer>> {
+        Some(&self.0)
+    }
+
+    take_generic_passthrough!();
+}
+
+impl ModelBackend for V41BatchBackend {
+    fn forward(&mut self, _x: &Tensor, _index_pos: usize) -> crate::tensor::Result<Tensor> {
+        // Batch-served: the worker is the sole caller of the model forward, never this.
+        Err(crate::tensor::Error::msg(
+            "V4.1 batch-served model: serial forward is not supported; \
+             requests are delegated to the batch worker"
+                .to_string(),
+        ))
+    }
+
+    fn v41_batch_server(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::inference::model::deepseek_v41::batch_server::V41BatchServer>>
+    {
         Some(&self.0)
     }
 

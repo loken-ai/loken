@@ -190,7 +190,7 @@ fn sample_row(
 /// PARALLEL (rayon) after ONE batched device->host transfer - the per-row softmax + top-k
 /// select + multinomial are compute-heavy, so fanning them across cores cuts wall time.
 /// `seed_off` varies the RNG per row (mirrors `sample_row`'s `row`-offset seed).
-fn sample_row_host(
+pub(crate) fn sample_row_host(
     mut v: Vec<f32>,
     sp: &SamplingParams,
     recent: &[u32],
