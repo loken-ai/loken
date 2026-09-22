@@ -35,8 +35,11 @@ fn cpu_experts_batched(experts: &[Arc<Expert>], x: &[f32], limit: f32) -> Option
     let dim = x.len();
     let inter = experts[0].w1.dims()[0];
     let ne = experts.len();
-    let (mut gate_c, mut up_c, mut down_c) =
-        (Vec::with_capacity(ne), Vec::with_capacity(ne), Vec::with_capacity(ne));
+    let (mut gate_c, mut up_c, mut down_c) = (
+        Vec::with_capacity(ne),
+        Vec::with_capacity(ne),
+        Vec::with_capacity(ne),
+    );
     for e in experts {
         gate_c.push(qbytes(&e.w1, GgmlDType::Iq2Xxs)?);
         up_c.push(qbytes(&e.w3, GgmlDType::Iq2Xxs)?);
@@ -103,8 +106,11 @@ fn cpu_experts_multirow(
         }
     }
     let inter = experts[0].w1.dims()[0];
-    let (mut gate_c, mut up_c, mut down_c) =
-        (Vec::with_capacity(ne), Vec::with_capacity(ne), Vec::with_capacity(ne));
+    let (mut gate_c, mut up_c, mut down_c) = (
+        Vec::with_capacity(ne),
+        Vec::with_capacity(ne),
+        Vec::with_capacity(ne),
+    );
     for e in experts {
         gate_c.push(qbytes(&e.w1, GgmlDType::Iq2Xxs)?);
         up_c.push(qbytes(&e.w3, GgmlDType::Iq2Xxs)?);
@@ -156,8 +162,9 @@ fn cpu_experts_multirow(
         let mut o: Vec<&mut [f32]> = out_pairs.iter_mut().map(|v| v.as_mut_slice()).collect();
         matmul_bytes_multi(GgmlDType::Q2K, inter, dim, &down_r, &h_r, &mut o).ok()?;
     }
-    let mut out: Vec<Vec<f32>> =
-        (0..ne).map(|i| Vec::with_capacity(nrows_of[i] * dim)).collect();
+    let mut out: Vec<Vec<f32>> = (0..ne)
+        .map(|i| Vec::with_capacity(nrows_of[i] * dim))
+        .collect();
     let mut p = 0usize;
     for i in 0..ne {
         for _ in 0..nrows_of[i] {
@@ -269,7 +276,10 @@ impl Moe {
         }
         *self.last_routing.lock().unwrap() = routing;
         if crate::inference::offload::current().is_some() {
-            crate::inference::offload::prof_record("moe routing", gate_started.elapsed().as_nanos() as u64);
+            crate::inference::offload::prof_record(
+                "moe routing",
+                gate_started.elapsed().as_nanos() as u64,
+            );
         }
 
         // The routed experts this batch needs are known from the top-k before any of them runs, so
@@ -304,14 +314,19 @@ impl Moe {
         for r in &active_refs {
             r.will_need();
         }
-        let ref_of: std::collections::HashMap<usize, Arc<Expert>> =
-            active.iter().copied().zip(active_refs.iter().cloned()).collect();
+        let ref_of: std::collections::HashMap<usize, Arc<Expert>> = active
+            .iter()
+            .copied()
+            .zip(active_refs.iter().cloned())
+            .collect();
 
         // Every token passes through the shared expert; routed experts add on top, each run over
         // the rows of the tokens that selected it and nothing else.
         let mut y = if self.has_shared {
             stage("moe shared expert", || {
-                self.shared.forward(&x2, self.swiglu_limit)?.to_vec2::<f32>()
+                self.shared
+                    .forward(&x2, self.swiglu_limit)?
+                    .to_vec2::<f32>()
             })?
         } else {
             vec![vec![0f32; self.dim]; n]
@@ -354,11 +369,10 @@ impl Moe {
             let batched = n == 1 && off.run_batch.is_some();
             if batched {
                 let rb = off.run_batch.as_ref().unwrap();
-                if observer.is_none() && off.on_card.is_some() {
+                if let (true, Some(is_on)) = (observer.is_none(), off.on_card.as_ref()) {
                     // The cards run the experts they hold while the cores run, at the same instant,
                     // the ones they do not. One core keeps up with a decode's handful of misses
                     // beside the block, so the two finish together instead of summing.
-                    let is_on = off.on_card.as_ref().unwrap();
                     let cpu_pos: Vec<usize> = (0..active.len())
                         .filter(|&i| !is_on(&active_refs[i]))
                         .collect();
@@ -366,7 +380,8 @@ impl Moe {
                         let g = s.spawn(|| rb(&active, &fetch, &xv[0], self.swiglu_limit));
                         let miss_refs: Vec<Arc<Expert>> =
                             cpu_pos.iter().map(|&i| active_refs[i].clone()).collect();
-                        if let Some(outs) = cpu_experts_batched(&miss_refs, &xv[0], self.swiglu_limit)
+                        if let Some(outs) =
+                            cpu_experts_batched(&miss_refs, &xv[0], self.swiglu_limit)
                         {
                             for ((&i, out), expert) in cpu_pos.iter().zip(outs).zip(miss_refs) {
                                 cpu_side[i] = Some(Ok((Vec::new(), out, Some(expert))));
@@ -434,8 +449,12 @@ impl Moe {
                             miss_i.iter().map(|&i| active_refs[i].clone()).collect();
                         let miss_rows: Vec<Vec<f32>> =
                             miss_i.iter().map(|&i| rows_of(active[i])).collect();
-                        let cpu =
-                            cpu_experts_multirow(&miss_refs, &miss_rows, self.dim, self.swiglu_limit)?;
+                        let cpu = cpu_experts_multirow(
+                            &miss_refs,
+                            &miss_rows,
+                            self.dim,
+                            self.swiglu_limit,
+                        )?;
                         let mut miss_at = 0usize;
                         for i in 0..active.len() {
                             if miss_at < miss_i.len() && miss_i[miss_at] == i {
@@ -471,7 +490,10 @@ impl Moe {
                     ("moe expert kernels", &off.timings[1]),
                     ("count experts on card", &off.timings[2]),
                 ] {
-                    crate::inference::offload::prof_record(name, a.swap(0, std::sync::atomic::Ordering::Relaxed));
+                    crate::inference::offload::prof_record(
+                        name,
+                        a.swap(0, std::sync::atomic::Ordering::Relaxed),
+                    );
                 }
             }
         }
@@ -531,7 +553,10 @@ impl Moe {
             }
         }
         if crate::inference::offload::current().is_some() {
-            crate::inference::offload::prof_record("moe host experts", host_started.elapsed().as_nanos() as u64);
+            crate::inference::offload::prof_record(
+                "moe host experts",
+                host_started.elapsed().as_nanos() as u64,
+            );
             crate::inference::offload::prof_record("count experts on host", host_count);
         }
         let add_started = std::time::Instant::now();
@@ -559,7 +584,10 @@ impl Moe {
             }
         }
         if crate::inference::offload::current().is_some() {
-            crate::inference::offload::prof_record("moe add", add_started.elapsed().as_nanos() as u64);
+            crate::inference::offload::prof_record(
+                "moe add",
+                add_started.elapsed().as_nanos() as u64,
+            );
         }
         // A batch of many tokens read the layer nearly whole; what read-ahead brought in
         // beside the kept experts goes now, before the next layer's reads need the room.
@@ -649,6 +677,7 @@ mod tests {
             gate_bias: drawn(2, &[N_ROUTED], 0.1),
             experts,
             shared: expert(N_ROUTED),
+            has_shared: true,
             n_routed: N_ROUTED,
             n_activated: N_ACTIVATED,
             dim: DIM,

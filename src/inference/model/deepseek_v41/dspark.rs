@@ -172,11 +172,20 @@ impl DsparkConfig {
                 .map(|x| x as usize)
                 .ok_or_else(|| Error::msg(format!("dspark config: missing {k}")))
         };
-        let f = |k: &str, d: f32| t.get(k).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d);
+        let f = |k: &str, d: f32| {
+            t.get(k)
+                .and_then(|x| x.as_f64())
+                .map(|x| x as f32)
+                .unwrap_or(d)
+        };
         let target_layers = t
             .get("dspark_target_layer_ids")
             .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(DsparkConfig {
             block_size: u("dspark_block_size")?,
@@ -196,7 +205,10 @@ impl DsparkConfig {
             gate_temp: f("gate_temp", 1.0),
             route_scale: f("routed_scaling_factor", 1.0),
             swiglu_limit: f("swiglu_limit", 0.0),
-            norm_topk: t.get("norm_topk_prob").and_then(|x| x.as_bool()).unwrap_or(true),
+            norm_topk: t
+                .get("norm_topk_prob")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true),
             rms_eps: f("rms_norm_eps", 1e-6),
             rope_theta: f("rope_theta", 10000.0),
             rope_factor: t
@@ -315,7 +327,11 @@ impl Dspark {
         let bs = c.block_size;
         let eps = c.rms_eps;
         // main_x = main_norm(main_proj(main_hidden)) - the backbone hidden read into the stages.
-        let mh = Tensor::from_vec(main_hidden.to_vec(), (1, dim * c.target_layers.len()), &Device::Cpu)?;
+        let mh = Tensor::from_vec(
+            main_hidden.to_vec(),
+            (1, dim * c.target_layers.len()),
+            &Device::Cpu,
+        )?;
         let main_x = rms_norm(&self.main_proj.apply(&mh)?, &self.main_norm, eps)?; // [1, dim]
         {
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -329,7 +345,9 @@ impl Dspark {
                 w("dbg_main_hidden", main_hidden);
                 w("dbg_main_x", &main_x.flatten_all()?.to_vec1::<f32>()?);
                 w("dbg_token", &[token as f32, start_pos as f32]);
-                tracing::info!("DSPARK-DUMP main_hidden+main_x written, token={token} pos={start_pos}");
+                tracing::info!(
+                    "DSPARK-DUMP main_hidden+main_x written, token={token} pos={start_pos}"
+                );
             }
         }
 
@@ -349,7 +367,10 @@ impl Dspark {
         }
         let refs: Vec<&Tensor> = rows.iter().collect();
         let emb = Tensor::cat(&refs, 0)?.reshape((1, bs, dim))?;
-        let mut x = emb.unsqueeze(2)?.broadcast_as((1, bs, hc, dim))?.contiguous()?;
+        let mut x = emb
+            .unsqueeze(2)?
+            .broadcast_as((1, bs, hc, dim))?
+            .contiguous()?;
         let mut pre_mix: Vec<Vec<f32>> = (0..bs)
             .map(|_| {
                 let mut v = vec![0f32; hc];
@@ -362,8 +383,17 @@ impl Dspark {
         let mut _t_attn = 0u128;
         let mut _t_moe = 0u128;
         for (s, stage) in self.stages.iter().enumerate() {
-            let (nx, ta, tm) =
-                self.stage_forward_timed(stage, &x, &mut pre_mix, s, st, start_pos, coverage, &cos, &sin)?;
+            let (nx, ta, tm) = self.stage_forward_timed(
+                stage,
+                &x,
+                &mut pre_mix,
+                s,
+                st,
+                start_pos,
+                coverage,
+                &cos,
+                &sin,
+            )?;
             x = nx;
             _t_attn += ta;
             _t_moe += tm;
@@ -371,10 +401,12 @@ impl Dspark {
         {
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) % 8 == 0 {
+            if N.fetch_add(1, Ordering::Relaxed).is_multiple_of(8) {
                 tracing::info!(
                     "DSPARK-PROF stages={}us attn={}us moe={}us",
-                    _t_stages.elapsed().as_micros(), _t_attn, _t_moe
+                    _t_stages.elapsed().as_micros(),
+                    _t_attn,
+                    _t_moe
                 );
             }
         }
@@ -399,7 +431,10 @@ impl Dspark {
                 }
                 w("dbg_rawlogits0".into(), &logits[0]);
                 w("dbg_rawlogits1".into(), &logits[1]);
-                w("dbg_argmax".into(), &logits.iter().map(|l| argmax(l) as f32).collect::<Vec<_>>());
+                w(
+                    "dbg_argmax".into(),
+                    &logits.iter().map(|l| argmax(l) as f32).collect::<Vec<_>>(),
+                );
                 tracing::info!(
                     "DSPARK-DUMP2 windows+rawlogits written; block argmax before markov = {:?}",
                     logits.iter().map(|l| argmax(l)).collect::<Vec<_>>()
@@ -411,7 +446,11 @@ impl Dspark {
         for i in 0..bs {
             // markov bias: head(embed(prev)) added to this position's logits.
             let e = self.markov_embed.narrow(0, prev as usize, 1)?; // [1, rank]
-            let bias = self.markov_head.apply(&e)?.flatten_all()?.to_vec1::<f32>()?;
+            let bias = self
+                .markov_head
+                .apply(&e)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
             for (l, b) in logits[i].iter_mut().zip(&bias) {
                 *l += *b;
             }
@@ -464,7 +503,13 @@ impl Dspark {
         )?;
         let main_x = rms_norm(&self.main_proj.apply(&mh)?, &self.main_norm, c.rms_eps)?;
         let n = start_pos + 1;
-        let (cos, sin) = rope_table(c.rope_head_dim, n, c.original_seq_len, c.rope_theta, c.rope_factor)?;
+        let (cos, sin) = rope_table(
+            c.rope_head_dim,
+            n,
+            c.original_seq_len,
+            c.rope_theta,
+            c.rope_factor,
+        )?;
         self.update_windows(st, &main_x, start_pos, &cos, &sin)
     }
 
@@ -596,7 +641,8 @@ impl Dspark {
         let q = rope_partial(&q, &qcos, &qsin, rd)?;
         // The block's own keys, rope'd at the same positions.
         let kv = rms_norm(&a.wkv.apply(&x2)?, &a.kv_norm, a.eps)?.reshape((1, bs, 1, hd))?;
-        let kv = act_quant_fp8_e4m3(&rope_partial(&kv, &qcos, &qsin, rd)?, 32)?.reshape((bs, hd))?;
+        let kv =
+            act_quant_fp8_e4m3(&rope_partial(&kv, &qcos, &qsin, rd)?, 32)?.reshape((bs, hd))?;
         // Concatenate the window (coverage rows, ring order 0..coverage) and the block keys.
         let mut kvbuf: Vec<f32> = Vec::with_capacity((win + bs) * hd);
         for slot in 0..win {

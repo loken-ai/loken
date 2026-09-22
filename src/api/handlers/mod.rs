@@ -1582,10 +1582,7 @@ impl APIServer {
                 }
             }
         }
-        self.loading
-            .lock()
-            .unwrap()
-            .insert(model_id.to_string());
+        self.loading.lock().unwrap().insert(model_id.to_string());
         let _loading = LoadingGuard {
             set: self.loading.clone(),
             model_id: model_id.to_string(),

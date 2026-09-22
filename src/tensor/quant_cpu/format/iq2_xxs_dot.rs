@@ -37,7 +37,11 @@ const SIGNS_U64: [u64; 128] = {
         let mut v = 0u64;
         let mut j = 0;
         while j < 8 {
-            let b: u64 = if KSIGNS_IQ2XS[i] & KMASK_IQ2XS[j] != 0 { 0xff } else { 0x01 };
+            let b: u64 = if KSIGNS_IQ2XS[i] & KMASK_IQ2XS[j] != 0 {
+                0xff
+            } else {
+                0x01
+            };
             v |= b << (8 * j);
             j += 1;
         }

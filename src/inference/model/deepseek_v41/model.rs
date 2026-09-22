@@ -688,7 +688,10 @@ impl DeepseekV41Model {
         }
         let refs: Vec<&Tensor> = rows.iter().collect();
         let emb = Tensor::cat(&refs, 0)?.reshape((1, k, dim))?;
-        let mut x = emb.unsqueeze(2)?.broadcast_as((1, k, hc, dim))?.contiguous()?;
+        let mut x = emb
+            .unsqueeze(2)?
+            .broadcast_as((1, k, hc, dim))?
+            .contiguous()?;
 
         // Rope tables long enough that token j reads row pos + j.
         let n = pos + k;
@@ -704,7 +707,11 @@ impl DeepseekV41Model {
         // The engram recents, one per token, pushed in order so token j reflects tokens up to j.
         let recents: Vec<_> = tokens
             .iter()
-            .map(|&t| self.engram_cfg.as_ref().map(|ecfg| state.engram.push(ecfg, t)))
+            .map(|&t| {
+                self.engram_cfg
+                    .as_ref()
+                    .map(|ecfg| state.engram.push(ecfg, t))
+            })
             .collect();
 
         // The collapse weights into the top layer, one per token, the top set.
@@ -1607,8 +1614,12 @@ mod oracle_gate {
             for keep in [1usize, block.len() / 2] {
                 // Reference: verify only the accepted prefix, then decode the next token.
                 let mut want_state = model.new_decode_state();
-                let _ = model.prefill_into(&tokens[..split], &mut want_state).unwrap();
-                let _ = model.forward_verify_batch(&block[..keep], &mut want_state).unwrap();
+                let _ = model
+                    .prefill_into(&tokens[..split], &mut want_state)
+                    .unwrap();
+                let _ = model
+                    .forward_verify_batch(&block[..keep], &mut want_state)
+                    .unwrap();
                 let want = vecf_of(&model.forward_decode(next, &mut want_state).unwrap());
 
                 // Trial: verify the whole block, reject past `keep`, replay the prefix.
@@ -1619,11 +1630,16 @@ mod oracle_gate {
                 assert_eq!(state.pos, split + block.len());
                 state.rewind(&mark);
                 assert_eq!(state.pos, split);
-                let _ = model.forward_verify_batch(&block[..keep], &mut state).unwrap();
+                let _ = model
+                    .forward_verify_batch(&block[..keep], &mut state)
+                    .unwrap();
                 assert_eq!(state.pos, split + keep);
                 let got = vecf_of(&model.forward_decode(next, &mut state).unwrap());
 
-                assert_eq!(got, want, "{ratios:?} keep {keep}: state diverged after rewind");
+                assert_eq!(
+                    got, want,
+                    "{ratios:?} keep {keep}: state diverged after rewind"
+                );
             }
         }
     }

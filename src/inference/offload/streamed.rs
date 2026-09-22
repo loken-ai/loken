@@ -101,8 +101,7 @@ impl Streamed {
         // block with one sync rather than one per lane. It also keeps that device's residency in
         // one tier instead of fragmenting the hot set across `concurrency` of them.
         let _ = demand.concurrency;
-        let lane_cards: Vec<Arc<Card>> =
-            rooms.iter().filter_map(|&(o, r)| open(o, r)).collect();
+        let lane_cards: Vec<Arc<Card>> = rooms.iter().filter_map(|&(o, r)| open(o, r)).collect();
         if cards.is_empty() || lane_cards.is_empty() {
             return None;
         }

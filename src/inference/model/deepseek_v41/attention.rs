@@ -190,7 +190,11 @@ impl Ratio0Attention {
             if let Some(res) = offload.attn_block(&block) {
                 let (o, kv_row) = res?;
                 let kv = act_quant_fp8_e4m3(&Tensor::from_vec(kv_row, (1, hd), &Device::Cpu)?, 32)?;
-                push_window(cache, &kv.flatten_all()?.to_vec1::<f32>()?, self.window_size);
+                push_window(
+                    cache,
+                    &kv.flatten_all()?.to_vec1::<f32>()?,
+                    self.window_size,
+                );
                 return Tensor::from_vec(o, (b, s, dim), &Device::Cpu);
             }
         }

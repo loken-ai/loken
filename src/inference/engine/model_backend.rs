@@ -856,11 +856,13 @@ impl DeepseekV41Backend {
                     d.cfg.n_routed
                 );
                 state.capture_layers = d.cfg.target_layers.clone();
-                Some(crate::inference::model::deepseek_v41::dspark::DsparkState::new(
-                    d.stages.len(),
-                    d.cfg.window_size,
-                    d.cfg.head_dim,
-                ))
+                Some(
+                    crate::inference::model::deepseek_v41::dspark::DsparkState::new(
+                        d.stages.len(),
+                        d.cfg.window_size,
+                        d.cfg.head_dim,
+                    ),
+                )
             }
             None => {
                 tracing::info!("DSpark draft not available (checkpoint not in hub cache)");
@@ -1613,7 +1615,7 @@ impl ModelBackend for DeepseekV41Backend {
                 if false && ids.len() == 1 && state.pos > 24 {
                     use std::sync::atomic::{AtomicU64, Ordering};
                     static PN: AtomicU64 = AtomicU64::new(0);
-                    if PN.fetch_add(1, Ordering::Relaxed) % 20 == 0 {
+                    if PN.fetch_add(1, Ordering::Relaxed).is_multiple_of(20) {
                         const K: usize = 5;
                         let p0 = state.pos;
                         let first = ids[0];
@@ -1626,10 +1628,10 @@ impl ModelBackend for DeepseekV41Backend {
                         for i in 0..K {
                             toks_in.push(cur);
                             let t0 = std::time::Instant::now();
-                            let lg = crate::inference::offload::with_offload(
-                                s.offload.clone(),
-                                || model.forward_decode(cur, state),
-                            )?;
+                            let lg =
+                                crate::inference::offload::with_offload(s.offload.clone(), || {
+                                    model.forward_decode(cur, state)
+                                })?;
                             dsum += t0.elapsed().as_micros();
                             if i == 0 {
                                 main_hidden = state.captured.concat();
@@ -1656,7 +1658,16 @@ impl ModelBackend for DeepseekV41Backend {
                                 let t0 = std::time::Instant::now();
                                 let drafts = crate::inference::offload::with_offload(
                                     s.offload.clone(),
-                                    || d.forward_draft(ds, &main_hidden, first, p0, model.embed_ref(), model.head_ref()),
+                                    || {
+                                        d.forward_draft(
+                                            ds,
+                                            &main_hidden,
+                                            first,
+                                            p0,
+                                            model.embed_ref(),
+                                            model.head_ref(),
+                                        )
+                                    },
                                 );
                                 let dtime = t0.elapsed().as_micros();
                                 match drafts {

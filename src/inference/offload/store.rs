@@ -33,7 +33,11 @@ pub fn ws_enable() {
 }
 
 pub fn ws_record(layer: usize, expert: usize) {
-    if let Some(m) = WORKING_SET.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(m) = WORKING_SET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
         *m.entry(layer).or_default().entry(expert).or_insert(0) += 1;
     }
 }
@@ -73,7 +77,11 @@ pub fn ws_report() -> Vec<usize> {
 }
 
 pub fn ws_reset() {
-    if let Some(m) = WORKING_SET.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(m) = WORKING_SET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
         m.clear();
     }
 }

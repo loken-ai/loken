@@ -7,14 +7,13 @@ use super::experts::{Expert, ExpertOffload};
 use super::projection::Projection;
 use super::room::Room;
 use super::{AttnBlock, Offload};
-use crate::tensor::ops::rms_norm;
-use crate::tensor::ops::softmax_last_dim;
 use crate::tensor::cuda::{
     gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi, gpu_fp4_linear,
-    gpu_fp8_linear, gpu_index_scores,
-    gpu_quant_linear,
-    gpu_sparse_attn, iq2_xxs_tables, CudaDevice,
+    gpu_fp8_linear, gpu_index_scores, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables,
+    CudaDevice,
 };
+use crate::tensor::ops::rms_norm;
+use crate::tensor::ops::softmax_last_dim;
 use crate::tensor::quantized::{matvec_rows, GgmlDType, QMatMul, QTensor};
 use crate::tensor::{Device, Error, Result, Tensor};
 use cudarc::driver::CudaSlice;
@@ -576,7 +575,8 @@ impl Card {
         // keeping its own hold on the card's weights so an eviction cannot pull them mid-block.
         let hold_started = std::time::Instant::now();
         let mut idx = Vec::new();
-        let mut held: Vec<(Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>)> = Vec::new();
+        let mut held: Vec<(Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>)> =
+            Vec::new();
         for (i, e) in es.iter().enumerate() {
             let Some(key) = self.admit(e, false) else {
                 continue;
@@ -604,7 +604,10 @@ impl Card {
         let ran = self.attempt("expert rows", need, || {
             gpu_expert_rows_grouped(&self.dev, &batch, (&tables.0, &tables.1), dims, xs, limit)
         });
-        timings[1].fetch_add(kernels_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        timings[1].fetch_add(
+            kernels_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
         // A whole-block failure leaves every one of these to the host: `None` stands.
         if let Some(Ok(rows)) = ran {
             timings[2].fetch_add(rows.len() as u64, Ordering::Relaxed);
@@ -644,7 +647,8 @@ impl Card {
         };
         let hold_started = std::time::Instant::now();
         let mut idx = Vec::new();
-        let mut held: Vec<(Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>)> = Vec::new();
+        let mut held: Vec<(Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>)> =
+            Vec::new();
         let mut x_multi: Vec<f32> = Vec::new();
         for (i, e) in insts.iter().enumerate() {
             let Some(gate) = quant_blocks(&e.w1, GgmlDType::Iq2Xxs) else {
@@ -673,9 +677,19 @@ impl Card {
         let need = (x_multi.len() + held.len() * (2 * dims.1 + dims.0)) * F32;
         let kernels_started = std::time::Instant::now();
         let ran = self.attempt("expert rows multi", need, || {
-            gpu_expert_rows_grouped_multi(&self.dev, &batch, (&tables.0, &tables.1), dims, &x_multi, limit)
+            gpu_expert_rows_grouped_multi(
+                &self.dev,
+                &batch,
+                (&tables.0, &tables.1),
+                dims,
+                &x_multi,
+                limit,
+            )
         });
-        timings[1].fetch_add(kernels_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        timings[1].fetch_add(
+            kernels_started.elapsed().as_nanos() as u64,
+            Ordering::Relaxed,
+        );
         if let Some(Ok(rows)) = ran {
             timings[2].fetch_add(rows.len() as u64, Ordering::Relaxed);
             for (&i, row) in idx.iter().zip(rows) {
@@ -853,7 +867,8 @@ impl Offload for Card {
         let wob = self.kept(wob_q)?;
         let need = (o.len() + o_groups * o_lora + dim) * F32;
         self.attempt("attn grouped out", need, || {
-            let o_dev = Tensor::from_vec(o.to_vec(), (o_groups, p), &Device::Cuda(self.dev.clone()))?;
+            let o_dev =
+                Tensor::from_vec(o.to_vec(), (o_groups, p), &Device::Cuda(self.dev.clone()))?;
             let mut parts = Vec::with_capacity(o_groups);
             for (g, m) in groups.iter().enumerate() {
                 let xg = o_dev.narrow(0, g, 1)?;
@@ -1054,8 +1069,7 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
         })),
         run_multi: Some(Box::new(move |eidx, xrows, fetch, limit| {
             let ncards = multi_cards.len().max(1);
-            let mut out: Vec<Option<Result<Vec<f32>>>> =
-                (0..eidx.len()).map(|_| None).collect();
+            let mut out: Vec<Option<Result<Vec<f32>>>> = (0..eidx.len()).map(|_| None).collect();
             let mut by_card: Vec<Vec<usize>> = (0..ncards).map(|_| Vec::new()).collect();
             for (i, &e) in eidx.iter().enumerate() {
                 by_card[e % ncards].push(i);

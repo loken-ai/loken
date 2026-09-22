@@ -628,7 +628,9 @@ pub fn gpu_expert_rows(
     // downloaded below wait once, on the last of them, not once per expert.
     let mut bufs: Vec<(CudaSlice<f32>, CudaSlice<f32>)> = Vec::with_capacity(experts.len());
     for (gate, up, down) in experts {
-        let h = with_oom_retry(dev, "expert rows h", || unsafe { stream.alloc::<f32>(inter) })?;
+        let h = with_oom_retry(dev, "expert rows h", || unsafe {
+            stream.alloc::<f32>(inter)
+        })?;
         let hcfg = LaunchConfig {
             grid_dim: (inter as u32, 1, 1),
             block_dim: (32, 1, 1),
@@ -729,7 +731,9 @@ pub fn gpu_expert_rows_grouped(
     let down_arr = stream
         .clone_htod(&down_ptrs)
         .map_err(|e| alloc_err("grouped down ptrs", e))?;
-    let h = with_oom_retry(dev, "grouped h", || unsafe { stream.alloc::<f32>(n * inter) })?;
+    let h = with_oom_retry(dev, "grouped h", || unsafe {
+        stream.alloc::<f32>(n * inter)
+    })?;
     let y = with_oom_retry(dev, "grouped y", || unsafe { stream.alloc::<f32>(n * dim) })?;
     let (dim_i, inter_i, n_i) = (dim as i32, inter as i32, n as i32);
     let hfun = dev.quantized_fn("mmv_expert_h_iq2_xxs_grouped_f32")?;
@@ -827,8 +831,12 @@ pub fn gpu_expert_rows_grouped_multi(
     let down_arr = stream
         .clone_htod(&down_ptrs)
         .map_err(|e| alloc_err("grouped multi down ptrs", e))?;
-    let h = with_oom_retry(dev, "grouped multi h", || unsafe { stream.alloc::<f32>(n * inter) })?;
-    let y = with_oom_retry(dev, "grouped multi y", || unsafe { stream.alloc::<f32>(n * dim) })?;
+    let h = with_oom_retry(dev, "grouped multi h", || unsafe {
+        stream.alloc::<f32>(n * inter)
+    })?;
+    let y = with_oom_retry(dev, "grouped multi y", || unsafe {
+        stream.alloc::<f32>(n * dim)
+    })?;
     let (dim_i, inter_i, n_i) = (dim as i32, inter as i32, n as i32);
     let hfun = dev.quantized_fn("mmv_expert_h_iq2_xxs_grouped_multi_f32")?;
     let hcfg = LaunchConfig {
@@ -847,8 +855,11 @@ pub fn gpu_expert_rows_grouped_multi(
     b.arg(&inter_i);
     b.arg(&limit);
     b.arg(&n_i);
-    unsafe { b.launch(hcfg) }
-        .map_err(|e| Error(format!("mmv_expert_h_iq2_xxs_grouped_multi_f32 launch: {e}")))?;
+    unsafe { b.launch(hcfg) }.map_err(|e| {
+        Error(format!(
+            "mmv_expert_h_iq2_xxs_grouped_multi_f32 launch: {e}"
+        ))
+    })?;
     let dfun = dev.quantized_fn("mmv_q2_k_grouped_f32")?;
     let dcfg = LaunchConfig {
         grid_dim: (dim as u32, n as u32, 1),
