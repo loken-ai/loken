@@ -884,6 +884,74 @@ impl DeepseekV41Model {
         }
         Ok(logits)
     }
+
+    /// Greedily generate up to `max_new[i]` tokens for each prompt at once. Every prompt is
+    /// prefilled, then the still-running sequences decode one token together each step through
+    /// `forward_decode_batch`, so each active expert is read once for the batch; the batch shrinks
+    /// as sequences hit their length or `eos`, so a long generation never holds a finished one's
+    /// place. Returns the generated tokens per prompt, the prompt excluded. Greedy, so a sequence
+    /// takes the argmax path it would take decoded alone.
+    pub fn generate_batch(
+        &self,
+        prompts: &[&[u32]],
+        max_new: &[usize],
+        eos: Option<u32>,
+    ) -> Result<Vec<Vec<u32>>> {
+        assert_eq!(prompts.len(), max_new.len());
+        let n = prompts.len();
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0)
+        };
+        // Prefill each prompt; the first token to decode is the argmax of its last position.
+        let mut states: Vec<DecodeState> = Vec::with_capacity(n);
+        let mut next: Vec<u32> = Vec::with_capacity(n);
+        let mut out: Vec<Vec<u32>> = (0..n).map(|_| Vec::new()).collect();
+        let mut done: Vec<bool> = vec![false; n];
+        for (i, p) in prompts.iter().enumerate() {
+            let mut st = self.new_decode_state();
+            let logits = self.prefill_into(p, &mut st)?;
+            let (rows, vocab) = logits.dims2()?;
+            let flat = logits.flatten_all()?.to_vec1::<f32>()?;
+            next.push(argmax(&flat[(rows - 1) * vocab..rows * vocab]));
+            states.push(st);
+            if max_new[i] == 0 {
+                done[i] = true;
+            }
+        }
+        // Each step decodes one token for every running sequence at once; the token just decoded is
+        // committed and the returned logits give the next.
+        loop {
+            let mut idxs: Vec<usize> = Vec::new();
+            let mut batch: Vec<(u32, &mut DecodeState)> = Vec::new();
+            for (i, s) in states.iter_mut().enumerate() {
+                if !done[i] {
+                    idxs.push(i);
+                    batch.push((next[i], s));
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let logits = self.forward_decode_batch(&mut batch)?;
+            let (_rows, vocab) = logits.dims2()?;
+            let flat = logits.flatten_all()?.to_vec1::<f32>()?;
+            drop(batch);
+            for (row, &i) in idxs.iter().enumerate() {
+                let tok = next[i];
+                out[i].push(tok);
+                if out[i].len() >= max_new[i] || Some(tok) == eos {
+                    done[i] = true;
+                    continue;
+                }
+                next[i] = argmax(&flat[row * vocab..(row + 1) * vocab]);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -1782,6 +1850,61 @@ mod oracle_gate {
                 assert!(r < 1e-3, "{ratios:?} seq {j} rel {r}");
                 assert_eq!(argmax(got), argmax(&want[j]), "{ratios:?} seq {j} argmax");
             }
+        }
+    }
+
+    /// A batched greedy generation gives each prompt exactly the tokens it gets generated alone,
+    /// and the batch shrinks as sequences hit their length: the shorter ones finish and drop out
+    /// while the longer ones keep decoding, each still on its own path.
+    #[test]
+    fn generate_batch_matches_separate_generations() {
+        let layouts: [(&[u32], &[u32], &[u32]); 2] =
+            [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap()
+        };
+        for (ratios, kv_src, index_src) in layouts {
+            let (model, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            // Distinct streams, lengths and generation budgets, so the sequences finish on
+            // different steps and the batch narrows under them.
+            let prompts: Vec<Vec<u32>> = (0..3)
+                .map(|j| {
+                    let len = 8 + 2 * j;
+                    (0..len)
+                        .map(|i| tokens[(i + 5 * j) % tokens.len()])
+                        .collect()
+                })
+                .collect();
+            let max_new = vec![6usize, 3, 5];
+            // The target: each prompt generated alone, greedily, one token at a time.
+            let want: Vec<Vec<u32>> = prompts
+                .iter()
+                .zip(max_new.iter().copied())
+                .map(|(p, m)| {
+                    let mut st = model.new_decode_state();
+                    let logits = model.prefill_into(p, &mut st).unwrap();
+                    let (rows, vocab) = logits.dims2().unwrap();
+                    let flat = vecf_of(&logits);
+                    let mut next = argmax(&flat[(rows - 1) * vocab..rows * vocab]);
+                    let mut out = Vec::new();
+                    while out.len() < m {
+                        out.push(next);
+                        let lg = model.forward_decode(next, &mut st).unwrap();
+                        next = argmax(&vecf_of(&lg));
+                    }
+                    out
+                })
+                .collect();
+            let pr: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
+            let got = model.generate_batch(&pr, &max_new, None).unwrap();
+            assert_eq!(
+                got, want,
+                "{ratios:?}: batched generation must match separate greedy decodes"
+            );
         }
     }
 
