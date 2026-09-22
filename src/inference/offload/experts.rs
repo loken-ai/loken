@@ -108,6 +108,46 @@ pub struct ExpertOffload {
     /// Keep `expert` (number `id`) ahead of any request, where the offload keeps experts.
     /// Answers whether it was taken.
     pub warm: Option<Box<dyn Fn(usize, &Expert) -> bool + Send + Sync>>,
+    /// A decode's active experts, which all read the one token's row, run as a block: `active`
+    /// the expert numbers, `fetch` builds one, `x` the shared row. Answers in the order asked,
+    /// `None` where the expert is not resident and the host must run it. `None` on the field when
+    /// the offload has no block path.
+    #[allow(clippy::type_complexity)]
+    pub run_batch: Option<
+        Box<
+            dyn Fn(
+                    &[usize],
+                    &(dyn Fn(usize) -> Result<Arc<Expert>> + Sync),
+                    &[f32],
+                    f32,
+                ) -> Vec<Option<Result<(Vec<f32>, Vec<f32>)>>>
+                + Send
+                + Sync,
+        >,
+    >,
+    /// Whether `expert` is resident where the block path would run it with no upload. Read only,
+    /// so the caller can start the host's own experts on the cores in the same instant the cards
+    /// run theirs, instead of after. `None` on the field when the offload has no block path.
+    #[allow(clippy::type_complexity)]
+    pub on_card: Option<Box<dyn Fn(&Expert) -> bool + Send + Sync>>,
+    /// A verify's routed instances, one activation row each: `eidx` the expert number per instance,
+    /// `xrows` its row, `fetch` builds an expert. The resident instances run in one grouped launch
+    /// per card, so the block pays the launch once for all its tokens; `None` where the instance's
+    /// expert is not resident and the host runs it. `None` on the field when the offload has no
+    /// block path.
+    #[allow(clippy::type_complexity)]
+    pub run_multi: Option<
+        Box<
+            dyn Fn(
+                    &[usize],
+                    &[&[f32]],
+                    &(dyn Fn(usize) -> Result<Arc<Expert>> + Sync),
+                    f32,
+                ) -> Vec<Option<Result<Vec<f32>>>>
+                + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl ExpertOffload {

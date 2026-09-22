@@ -66,6 +66,33 @@ pub fn stage_prof_snapshot() -> Vec<(&'static str, u64, u64)> {
         .collect()
 }
 
+/// One ratio-0 attention block's weights and this token's inputs, for a card to run whole. The
+/// weights are the layer's kept projections and dense norms; `x` is the layer input row [dim],
+/// `cos`/`sin` the rope tables' row for this position [rd/2], `window` the last keys [w, hd] the
+/// window held before this token, `sink` the per-head attention sink [h].
+pub struct AttnBlock<'a> {
+    pub wq_a: &'a Projection,
+    pub q_norm: &'a crate::tensor::Tensor,
+    pub wq_b: &'a Projection,
+    pub wkv: &'a Projection,
+    pub kv_norm: &'a crate::tensor::Tensor,
+    pub wo_a: &'a Projection,
+    pub wo_b: &'a Projection,
+    pub sink: &'a crate::tensor::Tensor,
+    pub x: &'a [f32],
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+    pub window: &'a [f32],
+    pub n_heads: usize,
+    pub head_dim: usize,
+    pub rope_head_dim: usize,
+    pub o_groups: usize,
+    pub o_lora: usize,
+    pub dim: usize,
+    pub eps: f32,
+    pub scale: f32,
+}
+
 pub trait Offload: Send + Sync {
     /// `p` applied to `xs` rows, row-major; `None` to run it here.
     fn projection(&self, p: &Projection, xs: &[f32]) -> Option<Result<Vec<f32>>>;
@@ -94,6 +121,34 @@ pub trait Offload: Send + Sync {
         _dims: (usize, usize, usize, usize),
         _ratio: usize,
         _scale: f32,
+    ) -> Option<Result<Vec<f32>>> {
+        None
+    }
+
+    /// A ratio-0 attention block of a decode, run whole on one card so the activation crosses once
+    /// for the layer instead of once per projection. Given the layer's kept weights and this token's
+    /// input, it runs `wq_a`->q_norm->`wq_b`->rope, `wkv`->kv_norm->rope, windowed attention with a
+    /// per-head sink over `window` plus this token's key, output rope and the grouped output
+    /// projection - all on the card. Returns `(o, kv_row)`: the block output [dim] and this token's
+    /// rope'd key row [hd] to append to the window for the next token. `None` to run it here.
+    fn attn_block(&self, _p: &AttnBlock) -> Option<Result<(Vec<f32>, Vec<f32>)>> {
+        None
+    }
+
+    /// The grouped output projection of a decode's attention, run on one card so the activation
+    /// crosses once instead of once per group. `o` is [o_groups, p] row-major; group g is
+    /// multiplied by rows `[g*o_lora, (g+1)*o_lora)` of `wo_a`, the group results concatenated and
+    /// put through `wo_b` to [dim]. `None` to run it here, group by group, as a plain projection.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_out(
+        &self,
+        _wo_a: &Projection,
+        _wo_b: &Projection,
+        _o: &[f32],
+        _o_groups: usize,
+        _p: usize,
+        _o_lora: usize,
+        _dim: usize,
     ) -> Option<Result<Vec<f32>>> {
         None
     }

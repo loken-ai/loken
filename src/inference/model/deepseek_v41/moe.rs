@@ -13,6 +13,161 @@ use crate::inference::offload::store::ExpertSet;
 use crate::tensor::{Device, Result, Tensor};
 use std::sync::Arc;
 
+/// The decode's host experts in one thread-pool region: gate and up over the token's row, the
+/// SwiGLU, then the down projection, each a flat (expert x output column) GEMV that spreads across
+/// every core. `Expert::forward` per expert fans out on rayon instead, and nested under the block's
+/// own threads the decode collapses onto two or three cores; this keeps the pool to one publisher
+/// so all of them run. Bit-for-bit the per-expert products (the kernel is the same dot). `None` if
+/// a weight is not in the format the kernels read, and the caller runs the experts the old way.
+fn cpu_experts_batched(experts: &[Arc<Expert>], x: &[f32], limit: f32) -> Option<Vec<Vec<f32>>> {
+    use crate::inference::offload::projection::Projection;
+    use crate::tensor::quant_cpu::matmul_bytes_multi;
+    use crate::tensor::quantized::GgmlDType;
+    if experts.is_empty() {
+        return Some(Vec::new());
+    }
+    fn qbytes(p: &Projection, want: GgmlDType) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match p {
+            Projection::Quant(q) if q.dtype() == want => q.data().ok(),
+            _ => None,
+        }
+    }
+    let dim = x.len();
+    let inter = experts[0].w1.dims()[0];
+    let ne = experts.len();
+    let (mut gate_c, mut up_c, mut down_c) =
+        (Vec::with_capacity(ne), Vec::with_capacity(ne), Vec::with_capacity(ne));
+    for e in experts {
+        gate_c.push(qbytes(&e.w1, GgmlDType::Iq2Xxs)?);
+        up_c.push(qbytes(&e.w3, GgmlDType::Iq2Xxs)?);
+        down_c.push(qbytes(&e.w2, GgmlDType::Q2K)?);
+    }
+    let lhs: Vec<&[f32]> = vec![x; ne];
+    let gate_r: Vec<&[u8]> = gate_c.iter().map(|c| c.as_ref()).collect();
+    let up_r: Vec<&[u8]> = up_c.iter().map(|c| c.as_ref()).collect();
+    let mut gate_o = vec![vec![0f32; inter]; ne];
+    let mut up_o = vec![vec![0f32; inter]; ne];
+    {
+        let mut o: Vec<&mut [f32]> = gate_o.iter_mut().map(|v| v.as_mut_slice()).collect();
+        matmul_bytes_multi(GgmlDType::Iq2Xxs, dim, inter, &gate_r, &lhs, &mut o).ok()?;
+    }
+    {
+        let mut o: Vec<&mut [f32]> = up_o.iter_mut().map(|v| v.as_mut_slice()).collect();
+        matmul_bytes_multi(GgmlDType::Iq2Xxs, dim, inter, &up_r, &lhs, &mut o).ok()?;
+    }
+    let mut h = vec![vec![0f32; inter]; ne];
+    for e in 0..ne {
+        for k in 0..inter {
+            let (mut g, mut u) = (gate_o[e][k], up_o[e][k]);
+            if limit > 0.0 {
+                u = u.clamp(-limit, limit);
+                g = g.min(limit);
+            }
+            h[e][k] = (g / (1.0 + (-g).exp())) * u;
+        }
+    }
+    let down_r: Vec<&[u8]> = down_c.iter().map(|c| c.as_ref()).collect();
+    let h_r: Vec<&[f32]> = h.iter().map(|v| v.as_slice()).collect();
+    let mut out = vec![vec![0f32; dim]; ne];
+    {
+        let mut o: Vec<&mut [f32]> = out.iter_mut().map(|v| v.as_mut_slice()).collect();
+        matmul_bytes_multi(GgmlDType::Q2K, inter, dim, &down_r, &h_r, &mut o).ok()?;
+    }
+    Some(out)
+}
+
+/// A block of tokens through its routed experts in one thread-pool region, each expert over the
+/// rows the block routed to it. `row_batches[i]` is expert `i`'s inputs, row-major (`nrows_i * dim`
+/// floats); the result is expert `i`'s outputs in the same order. A verify runs this once for the
+/// whole block, so the pool is published to three times a layer for the block instead of three
+/// times a layer per token - the per-layer dispatch is what a decode pays over and over, and the
+/// batch pays it once. `None` if a weight is not in the format the kernels read.
+#[allow(clippy::type_complexity)]
+fn cpu_experts_multirow(
+    experts: &[Arc<Expert>],
+    row_batches: &[Vec<f32>],
+    dim: usize,
+    limit: f32,
+) -> Option<Vec<Vec<f32>>> {
+    use crate::inference::offload::projection::Projection;
+    use crate::tensor::quant_cpu::matmul_bytes_multi;
+    use crate::tensor::quantized::GgmlDType;
+    let ne = experts.len();
+    if ne == 0 {
+        return Some(Vec::new());
+    }
+    fn qbytes(p: &Projection, want: GgmlDType) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match p {
+            Projection::Quant(q) if q.dtype() == want => q.data().ok(),
+            _ => None,
+        }
+    }
+    let inter = experts[0].w1.dims()[0];
+    let (mut gate_c, mut up_c, mut down_c) =
+        (Vec::with_capacity(ne), Vec::with_capacity(ne), Vec::with_capacity(ne));
+    for e in experts {
+        gate_c.push(qbytes(&e.w1, GgmlDType::Iq2Xxs)?);
+        up_c.push(qbytes(&e.w3, GgmlDType::Iq2Xxs)?);
+        down_c.push(qbytes(&e.w2, GgmlDType::Q2K)?);
+    }
+    // Every (expert, row) is a pair the pool runs as one GEMV: the same weight bytes for each of
+    // an expert's rows, that row's activation as the input.
+    let (mut gate_r, mut up_r, mut down_r) = (Vec::new(), Vec::new(), Vec::new());
+    let mut lhs: Vec<&[f32]> = Vec::new();
+    let mut nrows_of = vec![0usize; ne];
+    for i in 0..ne {
+        let nrows = row_batches[i].len() / dim;
+        nrows_of[i] = nrows;
+        for r in 0..nrows {
+            gate_r.push(gate_c[i].as_ref());
+            up_r.push(up_c[i].as_ref());
+            down_r.push(down_c[i].as_ref());
+            lhs.push(&row_batches[i][r * dim..(r + 1) * dim]);
+        }
+    }
+    let npairs = lhs.len();
+    if npairs == 0 {
+        return Some(vec![Vec::new(); ne]);
+    }
+    let mut gate_o = vec![vec![0f32; inter]; npairs];
+    let mut up_o = vec![vec![0f32; inter]; npairs];
+    {
+        let mut o: Vec<&mut [f32]> = gate_o.iter_mut().map(|v| v.as_mut_slice()).collect();
+        matmul_bytes_multi(GgmlDType::Iq2Xxs, dim, inter, &gate_r, &lhs, &mut o).ok()?;
+    }
+    {
+        let mut o: Vec<&mut [f32]> = up_o.iter_mut().map(|v| v.as_mut_slice()).collect();
+        matmul_bytes_multi(GgmlDType::Iq2Xxs, dim, inter, &up_r, &lhs, &mut o).ok()?;
+    }
+    let mut h = vec![vec![0f32; inter]; npairs];
+    for p in 0..npairs {
+        for k in 0..inter {
+            let (mut g, mut u) = (gate_o[p][k], up_o[p][k]);
+            if limit > 0.0 {
+                u = u.clamp(-limit, limit);
+                g = g.min(limit);
+            }
+            h[p][k] = (g / (1.0 + (-g).exp())) * u;
+        }
+    }
+    let h_r: Vec<&[f32]> = h.iter().map(|v| v.as_slice()).collect();
+    let mut out_pairs = vec![vec![0f32; dim]; npairs];
+    {
+        let mut o: Vec<&mut [f32]> = out_pairs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        matmul_bytes_multi(GgmlDType::Q2K, inter, dim, &down_r, &h_r, &mut o).ok()?;
+    }
+    let mut out: Vec<Vec<f32>> =
+        (0..ne).map(|i| Vec::with_capacity(nrows_of[i] * dim)).collect();
+    let mut p = 0usize;
+    for i in 0..ne {
+        for _ in 0..nrows_of[i] {
+            out[i].extend_from_slice(&out_pairs[p]);
+            p += 1;
+        }
+    }
+    Some(out)
+}
+
 /// What a calibration run is told about one MoE block's forward: `expert` is `None` for the block's
 /// whole input, `Some(e)` for the rows routed to expert `e`. `rows` are the inputs, row-major;
 /// `weights` their routing weights; `down` the rows entering the expert's down projection, scaled
@@ -26,6 +181,8 @@ pub struct Moe {
     pub gate_bias: Tensor,   // [n_routed]
     pub experts: ExpertSet,
     pub shared: Expert,
+    /// A DSpark stage has no shared expert; its contribution starts at zero.
+    pub has_shared: bool,
 
     pub n_routed: usize,
     pub n_activated: usize,
@@ -128,21 +285,37 @@ impl Moe {
             .collect();
         self.experts.prefetch(&uses, n as u64)?;
         let active: Vec<usize> = uses.iter().map(|&(e, _, _)| e).collect();
+        {
+            let layer = self as *const Moe as usize;
+            for &e in &active {
+                crate::inference::offload::store::ws_record(layer, e);
+            }
+        }
         // Every routed expert's bytes are asked for at once, so the reads of one overlap the
         // compute of another instead of each faulting in alone. In turn rather than from
         // several threads: issuing the same requests across a thread pool was measured on a
-        // cold prefill and changed nothing, so the loop stays the simpler of the two.
-        for &e in &active {
-            self.experts.fetch(e)?.will_need();
+        // cold prefill and changed nothing, so the loop stays the simpler of the two. Built
+        // once and kept: the residency read, the block and the host all take these same handles,
+        // where fetching afresh at each re-sliced the mmap three times over for one expert.
+        let active_refs: Vec<Arc<Expert>> = active
+            .iter()
+            .map(|&e| self.experts.fetch(e))
+            .collect::<Result<_>>()?;
+        for r in &active_refs {
+            r.will_need();
         }
+        let ref_of: std::collections::HashMap<usize, Arc<Expert>> =
+            active.iter().copied().zip(active_refs.iter().cloned()).collect();
 
         // Every token passes through the shared expert; routed experts add on top, each run over
         // the rows of the tokens that selected it and nothing else.
-        let mut y = stage("moe shared expert", || {
-            self.shared
-                .forward(&x2, self.swiglu_limit)?
-                .to_vec2::<f32>()
-        })?;
+        let mut y = if self.has_shared {
+            stage("moe shared expert", || {
+                self.shared.forward(&x2, self.swiglu_limit)?.to_vec2::<f32>()
+            })?
+        } else {
+            vec![vec![0f32; self.dim]; n]
+        };
         let xv = x2.to_vec2::<f32>()?;
         let observer = self.observer.read().unwrap().clone();
         if let Some(obs) = &observer {
@@ -162,11 +335,134 @@ impl Moe {
         let mut done: Vec<Option<Result<(Vec<f32>, Vec<f32>)>>> =
             (0..active.len()).map(|_| None).collect();
         let routed_started = std::time::Instant::now();
+        // The host's share of a decode's experts, computed on the cores while the cards run
+        // theirs. Filled only on the overlapped block path; the gather below reads it before it
+        // falls back to running an expert itself.
+        #[allow(clippy::type_complexity)]
+        let mut cpu_side: Vec<Option<Result<(Vec<f32>, Vec<f32>, Option<Arc<Expert>>)>>> =
+            (0..active.len()).map(|_| None).collect();
         if let Some(off) = &offload {
-            let fetch = |e: usize| self.experts.fetch(e);
-            let (ran, fetch_ns, run_ns) =
-                off.run_all(&active, n, self.swiglu_limit, &fetch, &rows_of);
-            done = ran;
+            let fetch = |e: usize| {
+                ref_of
+                    .get(&e)
+                    .cloned()
+                    .ok_or_else(|| crate::tensor::Error::msg("expert not in the layer's set"))
+            };
+            // A decode's active experts all read the one token's row, so they run as one block per
+            // card; the per-expert path serves a prompt's batch and stands in when the block path
+            // is absent.
+            let batched = n == 1 && off.run_batch.is_some();
+            if batched {
+                let rb = off.run_batch.as_ref().unwrap();
+                if observer.is_none() && off.on_card.is_some() {
+                    // The cards run the experts they hold while the cores run, at the same instant,
+                    // the ones they do not. One core keeps up with a decode's handful of misses
+                    // beside the block, so the two finish together instead of summing.
+                    let is_on = off.on_card.as_ref().unwrap();
+                    let cpu_pos: Vec<usize> = (0..active.len())
+                        .filter(|&i| !is_on(&active_refs[i]))
+                        .collect();
+                    done = std::thread::scope(|s| {
+                        let g = s.spawn(|| rb(&active, &fetch, &xv[0], self.swiglu_limit));
+                        let miss_refs: Vec<Arc<Expert>> =
+                            cpu_pos.iter().map(|&i| active_refs[i].clone()).collect();
+                        if let Some(outs) = cpu_experts_batched(&miss_refs, &xv[0], self.swiglu_limit)
+                        {
+                            for ((&i, out), expert) in cpu_pos.iter().zip(outs).zip(miss_refs) {
+                                cpu_side[i] = Some(Ok((Vec::new(), out, Some(expert))));
+                            }
+                        } else {
+                            for &i in &cpu_pos {
+                                let e = active[i];
+                                let r = (|| {
+                                    let expert = active_refs[i].clone();
+                                    let xe = Tensor::from_vec(
+                                        rows_of(e),
+                                        (assign[e].len(), self.dim),
+                                        &Device::Cpu,
+                                    )?;
+                                    let out = expert
+                                        .forward(&xe, self.swiglu_limit)?
+                                        .flatten_all()?
+                                        .to_vec1::<f32>()?;
+                                    Ok((Vec::new(), out, Some(expert)))
+                                })();
+                                cpu_side[i] = Some(r);
+                            }
+                        }
+                        g.join().unwrap()
+                    });
+                } else {
+                    done = rb(&active, &fetch, &xv[0], self.swiglu_limit);
+                }
+            } else {
+                // A small batch is a speculative verify, not a prompt's prefill. Its resident
+                // experts run in one grouped launch per card over their rows, so the per-layer
+                // launch a decode pays for every token is paid once for the whole block; the
+                // non-resident ones run in one pool region over their rows, the same amortising.
+                // A prefill's wide batch stays on the lanes, where the cards earn their crossing.
+                const VERIFY_BATCH_MAX: usize = 32;
+                let pooled = n <= VERIFY_BATCH_MAX
+                    && observer.is_none()
+                    && off.run_multi.is_some()
+                    && (|| -> Option<()> {
+                        // One instance per (expert, routed row), the rows kept in the expert's
+                        // assignment order so a card's answers scatter back where the host's would.
+                        let mut eidx: Vec<usize> = Vec::new();
+                        let mut xrows: Vec<&[f32]> = Vec::new();
+                        let mut inst_of: Vec<Vec<usize>> = vec![Vec::new(); active.len()];
+                        for (i, &e) in active.iter().enumerate() {
+                            for &(t, _w) in &assign[e] {
+                                inst_of[i].push(eidx.len());
+                                eidx.push(e);
+                                xrows.push(&xv[t]);
+                            }
+                        }
+                        let rm = off.run_multi.as_ref().unwrap();
+                        let gpu = rm(&eidx, &xrows, &fetch, self.swiglu_limit);
+                        // An expert is resident when its first instance came back from a card;
+                        // then all of its instances did. The rest go to the host in one region.
+                        let miss_i: Vec<usize> = (0..active.len())
+                            .filter(|&i| {
+                                inst_of[i]
+                                    .first()
+                                    .map(|&k| gpu[k].is_none())
+                                    .unwrap_or(false)
+                            })
+                            .collect();
+                        let miss_refs: Vec<Arc<Expert>> =
+                            miss_i.iter().map(|&i| active_refs[i].clone()).collect();
+                        let miss_rows: Vec<Vec<f32>> =
+                            miss_i.iter().map(|&i| rows_of(active[i])).collect();
+                        let cpu =
+                            cpu_experts_multirow(&miss_refs, &miss_rows, self.dim, self.swiglu_limit)?;
+                        let mut miss_at = 0usize;
+                        for i in 0..active.len() {
+                            if miss_at < miss_i.len() && miss_i[miss_at] == i {
+                                done[i] = Some(Ok((Vec::new(), cpu[miss_at].clone())));
+                                miss_at += 1;
+                                continue;
+                            }
+                            let mut out = Vec::with_capacity(inst_of[i].len() * self.dim);
+                            for &k in &inst_of[i] {
+                                let row = gpu[k].as_ref()?.as_ref().ok()?;
+                                out.extend_from_slice(row);
+                            }
+                            done[i] = Some(Ok((Vec::new(), out)));
+                        }
+                        Some(())
+                    })()
+                    .is_some();
+                if !pooled {
+                    let (ran, fetch_ns, run_ns) =
+                        off.run_all(&active, n, self.swiglu_limit, &fetch, &rows_of);
+                    done = ran;
+                    if crate::inference::offload::current().is_some() {
+                        crate::inference::offload::prof_record("moe expert fetch", fetch_ns);
+                        crate::inference::offload::prof_record("moe expert run", run_ns);
+                    }
+                }
+            }
             if crate::inference::offload::current().is_some() {
                 // The lanes' own time, split: their threads carry no recorder, so it is
                 // recorded here after the join.
@@ -177,8 +473,6 @@ impl Moe {
                 ] {
                     crate::inference::offload::prof_record(name, a.swap(0, std::sync::atomic::Ordering::Relaxed));
                 }
-                crate::inference::offload::prof_record("moe expert fetch", fetch_ns);
-                crate::inference::offload::prof_record("moe expert run", run_ns);
             }
         }
         if crate::inference::offload::current().is_some() {
@@ -193,12 +487,17 @@ impl Moe {
         // the experts of a layer depend on nothing but their own rows. Held here rather than
         // released inside the task, so the weights go back in expert order below.
         type Ready = (Vec<f32>, Vec<f32>, Option<Arc<Expert>>);
-        let mut ready: Vec<Option<Ready>> = done
-            .iter_mut()
-            .map(|d| {
-                d.take()
-                    .map(|r| r.map(|(h, out)| (h, out, None)))
-                    .transpose()
+        // The card's answer wins where it ran the expert; else the host copy computed alongside
+        // it on the overlapped path; else nothing yet, and the loop below runs it.
+        let mut ready: Vec<Option<Ready>> = (0..active.len())
+            .map(|i| -> Result<Option<Ready>> {
+                if let Some(r) = done[i].take() {
+                    return Ok(Some(r.map(|(h, out)| (h, out, None))?));
+                }
+                if let Some(r) = cpu_side[i].take() {
+                    return Ok(Some(r?));
+                }
+                Ok(None)
             })
             .collect::<Result<Vec<_>>>()?;
         let host_started = std::time::Instant::now();
@@ -211,7 +510,7 @@ impl Moe {
                 .par_iter()
                 .map(|&i| -> Result<Ready> {
                     let e = active[i];
-                    let expert = self.experts.fetch(e)?;
+                    let expert = active_refs[i].clone();
                     let xe =
                         Tensor::from_vec(rows_of(e), (assign[e].len(), self.dim), &Device::Cpu)?;
                     let h = std::cell::RefCell::new(Vec::new());
@@ -533,6 +832,9 @@ mod tests {
                     .and_then(|t| t.flatten_all()?.to_vec1::<f32>());
                 Some(out.map(|o| (h.into_inner(), o)))
             }),
+            run_batch: None,
+            on_card: None,
+            run_multi: None,
         }));
         let (off_out, off_calls) = record(&moe);
         assert!(ran.load(std::sync::atomic::Ordering::Relaxed) > 0);

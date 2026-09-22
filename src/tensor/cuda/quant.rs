@@ -555,7 +555,7 @@ pub fn gpu_expert_row(
     let func = dev.quantized_fn("mmv_expert_h_iq2_xxs_f32")?;
     let cfg = LaunchConfig {
         grid_dim: (inter as u32, 1, 1),
-        block_dim: (128, 1, 1),
+        block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
     let (dim_i, inter_i) = (dim as i32, inter as i32);
@@ -575,7 +575,7 @@ pub fn gpu_expert_row(
     let func = dev.quantized_fn("mmv_q2_k_f32")?;
     let cfg = LaunchConfig {
         grid_dim: (dim as u32, 1, 1),
-        block_dim: (128, 1, 1),
+        block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
     let mut b = stream.launch_builder(&func);
@@ -594,6 +594,285 @@ pub fn gpu_expert_row(
         .clone_dtoh(&y)
         .map_err(|e| Error(format!("expert row download: {e}")))?;
     Ok((hs, ys))
+}
+
+/// The same two kernels as `gpu_expert_row`, over several experts that share one input row - the
+/// shape a decode takes, where every active expert of a layer sees the same token. The input goes
+/// over once, all the kernels are queued on the one stream, and the outputs come back after they
+/// have all run: one host round-trip for the block instead of one per expert, which is what the
+/// per-expert path pays. Bit-exact with running them one at a time - the kernels and their inputs
+/// are the same, only the host waits less.
+#[allow(clippy::type_complexity)]
+pub fn gpu_expert_rows(
+    dev: &CudaDevice,
+    experts: &[(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)],
+    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
+    (dim, inter): (usize, usize),
+    x: &[f32],
+    limit: f32,
+) -> Result<Vec<(Vec<f32>, Vec<f32>)>> {
+    if dim % 256 != 0 || inter % 256 != 0 || x.len() != dim {
+        return Err(Error(format!(
+            "expert rows: dim {dim}, inter {inter}, {} inputs",
+            x.len()
+        )));
+    }
+    let stream = dev.stream();
+    let xs = stream
+        .clone_htod(x)
+        .map_err(|e| alloc_err("expert rows upload", e))?;
+    let hfun = dev.quantized_fn("mmv_expert_h_iq2_xxs_f32")?;
+    let dfun = dev.quantized_fn("mmv_q2_k_f32")?;
+    let (dim_i, inter_i) = (dim as i32, inter as i32);
+    // Every kernel of every expert is queued before a single byte is read back: the outputs
+    // downloaded below wait once, on the last of them, not once per expert.
+    let mut bufs: Vec<(CudaSlice<f32>, CudaSlice<f32>)> = Vec::with_capacity(experts.len());
+    for (gate, up, down) in experts {
+        let h = with_oom_retry(dev, "expert rows h", || unsafe { stream.alloc::<f32>(inter) })?;
+        let hcfg = LaunchConfig {
+            grid_dim: (inter as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = stream.launch_builder(&hfun);
+        b.arg(*gate);
+        b.arg(*up);
+        b.arg(tables.0);
+        b.arg(tables.1);
+        b.arg(&xs);
+        b.arg(&h);
+        b.arg(&dim_i);
+        b.arg(&inter_i);
+        b.arg(&limit);
+        unsafe { b.launch(hcfg) }
+            .map_err(|e| Error(format!("mmv_expert_h_iq2_xxs_f32 launch: {e}")))?;
+        let y = with_oom_retry(dev, "expert rows y", || unsafe { stream.alloc::<f32>(dim) })?;
+        let dcfg = LaunchConfig {
+            grid_dim: (dim as u32, 1, 1),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = stream.launch_builder(&dfun);
+        b.arg(*down);
+        b.arg(&h);
+        b.arg(&y);
+        b.arg(&inter_i);
+        b.arg(&dim_i);
+        unsafe { b.launch(dcfg) }.map_err(|e| Error(format!("mmv_q2_k_f32 launch: {e}")))?;
+        bufs.push((h, y));
+    }
+    // Only the output comes back. The rows entering the down projection (`h`) are read by a
+    // calibration observer, which a decode does not run; downloading them for every expert of
+    // every layer was a device round-trip spent on nothing. The caller gets an empty `h`.
+    let mut out = Vec::with_capacity(bufs.len());
+    for (_h, y) in &bufs {
+        let ys = stream
+            .clone_dtoh(y)
+            .map_err(|e| Error(format!("expert rows download: {e}")))?;
+        out.push((Vec::new(), ys));
+    }
+    Ok(out)
+}
+
+/// The whole block of experts in ONE pair of launches: the h kernel over `(inter, nexperts)`
+/// blocks and the down kernel over `(dim, nexperts)`, each expert's weights reached through a
+/// device array of pointers. The card runs all of a layer's experts at once instead of one at a
+/// time on the host's clock - the difference between a matvec per crossing and a block per layer.
+/// Bit-exact with `gpu_expert_rows`.
+#[allow(clippy::type_complexity)]
+pub fn gpu_expert_rows_grouped(
+    dev: &CudaDevice,
+    experts: &[(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)],
+    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
+    (dim, inter): (usize, usize),
+    x: &[f32],
+    limit: f32,
+) -> Result<Vec<(Vec<f32>, Vec<f32>)>> {
+    use cudarc::driver::DevicePtr;
+    if dim % 256 != 0 || inter % 256 != 0 || x.len() != dim {
+        return Err(Error(format!(
+            "grouped expert rows: dim {dim}, inter {inter}, {} inputs",
+            x.len()
+        )));
+    }
+    let n = experts.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let stream = dev.stream();
+    let xs = stream
+        .clone_htod(x)
+        .map_err(|e| alloc_err("grouped expert upload", e))?;
+    // The experts' device addresses, gathered into three arrays the kernels index by blockIdx.y.
+    // The guards keep the slices mapped until the launches are queued.
+    let mut gate_ptrs = Vec::with_capacity(n);
+    let mut up_ptrs = Vec::with_capacity(n);
+    let mut down_ptrs = Vec::with_capacity(n);
+    let mut guards = Vec::with_capacity(3 * n);
+    for (g, u, d) in experts {
+        let (gp, gg) = g.device_ptr(&stream);
+        let (up, gu) = u.device_ptr(&stream);
+        let (dp, gd) = d.device_ptr(&stream);
+        gate_ptrs.push(gp);
+        up_ptrs.push(up);
+        down_ptrs.push(dp);
+        guards.push(gg);
+        guards.push(gu);
+        guards.push(gd);
+    }
+    let gate_arr = stream
+        .clone_htod(&gate_ptrs)
+        .map_err(|e| alloc_err("grouped gate ptrs", e))?;
+    let up_arr = stream
+        .clone_htod(&up_ptrs)
+        .map_err(|e| alloc_err("grouped up ptrs", e))?;
+    let down_arr = stream
+        .clone_htod(&down_ptrs)
+        .map_err(|e| alloc_err("grouped down ptrs", e))?;
+    let h = with_oom_retry(dev, "grouped h", || unsafe { stream.alloc::<f32>(n * inter) })?;
+    let y = with_oom_retry(dev, "grouped y", || unsafe { stream.alloc::<f32>(n * dim) })?;
+    let (dim_i, inter_i, n_i) = (dim as i32, inter as i32, n as i32);
+    let hfun = dev.quantized_fn("mmv_expert_h_iq2_xxs_grouped_f32")?;
+    let hcfg = LaunchConfig {
+        grid_dim: (inter as u32, n as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = stream.launch_builder(&hfun);
+    b.arg(&gate_arr);
+    b.arg(&up_arr);
+    b.arg(tables.0);
+    b.arg(tables.1);
+    b.arg(&xs);
+    b.arg(&h);
+    b.arg(&dim_i);
+    b.arg(&inter_i);
+    b.arg(&limit);
+    b.arg(&n_i);
+    unsafe { b.launch(hcfg) }
+        .map_err(|e| Error(format!("mmv_expert_h_iq2_xxs_grouped_f32 launch: {e}")))?;
+    let dfun = dev.quantized_fn("mmv_q2_k_grouped_f32")?;
+    let dcfg = LaunchConfig {
+        grid_dim: (dim as u32, n as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = stream.launch_builder(&dfun);
+    b.arg(&down_arr);
+    b.arg(&h);
+    b.arg(&y);
+    b.arg(&inter_i);
+    b.arg(&dim_i);
+    b.arg(&n_i);
+    unsafe { b.launch(dcfg) }.map_err(|e| Error(format!("mmv_q2_k_grouped_f32 launch: {e}")))?;
+    drop(guards);
+    let ys_all = stream
+        .clone_dtoh(&y)
+        .map_err(|e| Error(format!("grouped expert download: {e}")))?;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push((Vec::new(), ys_all[i * dim..(i + 1) * dim].to_vec()));
+    }
+    Ok(out)
+}
+
+/// Grouped experts with one activation row per instance: `x` is [n, dim] and instance `i` reads
+/// row `i`. A speculative verify makes one instance per (expert, token) it routes, so its whole
+/// block of experts runs in one launch. Returns instance `i`'s output row. Bit-exact with
+/// `gpu_expert_row` per instance.
+pub fn gpu_expert_rows_grouped_multi(
+    dev: &CudaDevice,
+    experts: &[(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)],
+    tables: (&CudaSlice<u8>, &CudaSlice<u8>),
+    (dim, inter): (usize, usize),
+    x: &[f32],
+    limit: f32,
+) -> Result<Vec<Vec<f32>>> {
+    use cudarc::driver::DevicePtr;
+    let n = experts.len();
+    if dim % 256 != 0 || inter % 256 != 0 || x.len() != n * dim {
+        return Err(Error(format!(
+            "grouped multi expert rows: dim {dim}, inter {inter}, {} inputs for {n}",
+            x.len()
+        )));
+    }
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let stream = dev.stream();
+    let xs = stream
+        .clone_htod(x)
+        .map_err(|e| alloc_err("grouped multi upload", e))?;
+    let mut gate_ptrs = Vec::with_capacity(n);
+    let mut up_ptrs = Vec::with_capacity(n);
+    let mut down_ptrs = Vec::with_capacity(n);
+    let mut guards = Vec::with_capacity(3 * n);
+    for (g, u, d) in experts {
+        let (gp, gg) = g.device_ptr(&stream);
+        let (up, gu) = u.device_ptr(&stream);
+        let (dp, gd) = d.device_ptr(&stream);
+        gate_ptrs.push(gp);
+        up_ptrs.push(up);
+        down_ptrs.push(dp);
+        guards.push(gg);
+        guards.push(gu);
+        guards.push(gd);
+    }
+    let gate_arr = stream
+        .clone_htod(&gate_ptrs)
+        .map_err(|e| alloc_err("grouped multi gate ptrs", e))?;
+    let up_arr = stream
+        .clone_htod(&up_ptrs)
+        .map_err(|e| alloc_err("grouped multi up ptrs", e))?;
+    let down_arr = stream
+        .clone_htod(&down_ptrs)
+        .map_err(|e| alloc_err("grouped multi down ptrs", e))?;
+    let h = with_oom_retry(dev, "grouped multi h", || unsafe { stream.alloc::<f32>(n * inter) })?;
+    let y = with_oom_retry(dev, "grouped multi y", || unsafe { stream.alloc::<f32>(n * dim) })?;
+    let (dim_i, inter_i, n_i) = (dim as i32, inter as i32, n as i32);
+    let hfun = dev.quantized_fn("mmv_expert_h_iq2_xxs_grouped_multi_f32")?;
+    let hcfg = LaunchConfig {
+        grid_dim: (inter as u32, n as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = stream.launch_builder(&hfun);
+    b.arg(&gate_arr);
+    b.arg(&up_arr);
+    b.arg(tables.0);
+    b.arg(tables.1);
+    b.arg(&xs);
+    b.arg(&h);
+    b.arg(&dim_i);
+    b.arg(&inter_i);
+    b.arg(&limit);
+    b.arg(&n_i);
+    unsafe { b.launch(hcfg) }
+        .map_err(|e| Error(format!("mmv_expert_h_iq2_xxs_grouped_multi_f32 launch: {e}")))?;
+    let dfun = dev.quantized_fn("mmv_q2_k_grouped_f32")?;
+    let dcfg = LaunchConfig {
+        grid_dim: (dim as u32, n as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = stream.launch_builder(&dfun);
+    b.arg(&down_arr);
+    b.arg(&h);
+    b.arg(&y);
+    b.arg(&inter_i);
+    b.arg(&dim_i);
+    b.arg(&n_i);
+    unsafe { b.launch(dcfg) }
+        .map_err(|e| Error(format!("mmv_q2_k_grouped_f32 (multi) launch: {e}")))?;
+    drop(guards);
+    let ys_all = stream
+        .clone_dtoh(&y)
+        .map_err(|e| Error(format!("grouped multi download: {e}")))?;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(ys_all[i * dim..(i + 1) * dim].to_vec());
+    }
+    Ok(out)
 }
 
 pub fn gpu_quant_linear(

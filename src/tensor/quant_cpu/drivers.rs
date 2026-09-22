@@ -1770,6 +1770,70 @@ pub fn matmul_bytes_multi(
     })
 }
 
+/// `matmul_bytes_multi` on the calling thread, without the shared pool. The pool's region carries
+/// a fixed cost - parking and waking its workers and a barrier - that dwarfs a decode's lone-expert
+/// GEMV, and its spinners take the cores a card block running beside it needs. On one thread there
+/// is no region and no contention; the handful of experts a decode leaves the host are small enough
+/// that one core keeps up, and the product is bit-for-bit `matmul_bytes_multi`'s.
+pub fn matmul_bytes_multi_serial(
+    dtype: GgmlDType,
+    k: usize,
+    n: usize,
+    rhs_bytes: &[&[u8]],
+    lhs: &[&[f32]],
+    outs: &mut [&mut [f32]],
+) -> Result<()> {
+    if lhs.len() != rhs_bytes.len() || outs.len() != rhs_bytes.len() {
+        return Err(Error(format!(
+            "matmul_bytes_multi_serial: ne mismatch rhs {} lhs {} outs {}",
+            rhs_bytes.len(),
+            lhs.len(),
+            outs.len()
+        )));
+    }
+    if rhs_bytes.is_empty() {
+        return Ok(());
+    }
+    with_blocks!(dtype, T => {
+        matmul_bytes_multi_serial_impl::<T>(k, n, rhs_bytes, lhs, outs)
+    })
+}
+
+fn matmul_bytes_multi_serial_impl<T: BlockFormat>(
+    k: usize,
+    n: usize,
+    rhs_bytes: &[&[u8]],
+    lhs: &[&[f32]],
+    outs: &mut [&mut [f32]],
+) -> Result<()>
+where
+    T::ActivationBlock: 'static,
+{
+    if !k.is_multiple_of(T::BLOCK_LEN) {
+        return Err(Error(format!(
+            "matmul_bytes_multi_serial: k {k} not a multiple of block size {}",
+            T::BLOCK_LEN
+        )));
+    }
+    let k_in_blocks = k / T::BLOCK_LEN;
+    for e in 0..rhs_bytes.len() {
+        if lhs[e].len() != k || outs[e].len() != n {
+            return Err(Error("matmul_bytes_multi_serial: shape mismatch".into()));
+        }
+        let re: &[T] = cast_blocks(rhs_bytes[e])?;
+        if re.len() != n * k_in_blocks {
+            return Err(Error("matmul_bytes_multi_serial: rhs block count".into()));
+        }
+        let mut xq = vec![T::ActivationBlock::zeros(); k_in_blocks];
+        T::ActivationBlock::quantize(lhs[e], &mut xq);
+        let o = &mut *outs[e];
+        for col in 0..n {
+            o[col] = T::dot(&re[col * k_in_blocks..(col + 1) * k_in_blocks], &xq);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn matmul_bytes_multi_impl<T: BlockFormat>(
     k: usize,
     n: usize,

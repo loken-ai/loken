@@ -16,6 +16,9 @@ pub struct Demand<'a> {
     pub transient: usize,
     /// Experts a token routes to at once: the lanes opened.
     pub concurrency: usize,
+    /// The model's layer count: how many expert blocks a token runs, and so the clock span within
+    /// which a card holds an expert against eviction as this token's own.
+    pub layers: usize,
     /// Per layer, experts ranked by how often the calibration routed to them.
     pub prior: &'a [Vec<usize>],
     /// Expert `id` of layer `layer`, for warming the cards.
@@ -85,18 +88,21 @@ impl Streamed {
         }
         // Each card handle is its own stream: the steps' handles, one per card, and the lanes',
         // one per expert a token routes to, spread over the cards.
+        let protect = demand.layers as u64;
         let open = |ordinal: usize, r: &'static std::sync::Mutex<room::Room>| {
             CudaDevice::new(ordinal)
                 .ok()
-                .map(|d| Arc::new(Card::new(d, r)))
+                .map(|d| Arc::new(Card::new(d, r, protect)))
         };
         let cards: Vec<Arc<Card>> = rooms.iter().filter_map(|&(o, r)| open(o, r)).collect();
-        let lane_cards: Vec<Arc<Card>> = (0..demand.concurrency.max(1))
-            .filter_map(|l| {
-                let (o, r) = rooms[l % rooms.len()];
-                open(o, r)
-            })
-            .collect();
+        // One lane per device, not one per expert a token routes to. A decode is latency-bound,
+        // not throughput-bound: the cards and cores sit near-idle while the step waits on the
+        // per-lane launch-and-download syncs, so a token's experts on one device run in a single
+        // block with one sync rather than one per lane. It also keeps that device's residency in
+        // one tier instead of fragmenting the hot set across `concurrency` of them.
+        let _ = demand.concurrency;
+        let lane_cards: Vec<Arc<Card>> =
+            rooms.iter().filter_map(|&(o, r)| open(o, r)).collect();
         if cards.is_empty() || lane_cards.is_empty() {
             return None;
         }

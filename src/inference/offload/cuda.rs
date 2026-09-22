@@ -6,19 +6,48 @@
 use super::experts::{Expert, ExpertOffload};
 use super::projection::Projection;
 use super::room::Room;
-use super::Offload;
+use super::{AttnBlock, Offload};
+use crate::tensor::ops::rms_norm;
+use crate::tensor::ops::softmax_last_dim;
 use crate::tensor::cuda::{
-    gpu_expert_row, gpu_fp4_linear, gpu_fp8_linear, gpu_index_scores, gpu_quant_linear,
+    gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi, gpu_fp4_linear,
+    gpu_fp8_linear, gpu_index_scores,
+    gpu_quant_linear,
     gpu_sparse_attn, iq2_xxs_tables, CudaDevice,
 };
 use crate::tensor::quantized::{matvec_rows, GgmlDType, QMatMul, QTensor};
 use crate::tensor::{Device, Error, Result, Tensor};
 use cudarc::driver::CudaSlice;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const F32: usize = std::mem::size_of::<f32>();
+
+/// Rope the last `rd` elements of each row of `x` [n, hd] on the device, interleaved (GPT-J) as the
+/// reference does, leaving the leading `hd - rd` (nope) untouched. `cos`/`sin` are [rd/2] for this
+/// position. The same float operations as the host `rope_partial`, composed from tensor ops.
+fn rope_partial_dev(x: &Tensor, cos: &Tensor, sin: &Tensor, rd: usize) -> Result<Tensor> {
+    let (n, hd) = x.dims2()?;
+    let half = rd / 2;
+    let nope = hd - rd;
+    let head = x.narrow(1, 0, nope)?;
+    let tail = x.narrow(1, nope, rd)?.reshape((n, half, 2))?;
+    let even = tail.narrow(2, 0, 1)?.reshape((n, half))?;
+    let odd = tail.narrow(2, 1, 1)?.reshape((n, half))?;
+    let cos = cos.reshape((1, half))?;
+    let sin = sin.reshape((1, half))?;
+    let ne = even
+        .broadcast_mul(&cos)?
+        .sub(&odd.broadcast_mul(&sin)?)?
+        .reshape((n, half, 1))?;
+    let no = even
+        .broadcast_mul(&sin)?
+        .add(&odd.broadcast_mul(&cos)?)?
+        .reshape((n, half, 1))?;
+    let rot = Tensor::cat(&[&ne, &no], 2)?.reshape((n, rd))?;
+    Tensor::cat(&[&head, &rot], 1)
+}
 
 /// The weights a card keeps, by where their bytes live on the host: a grouped projection hands
 /// out a fresh view of the same weight at every call, so a key made of the view's identity is
@@ -28,22 +57,38 @@ type Resident = HashMap<(usize, usize), Arc<QMatMul>>;
 
 /// One routed expert's three weights on the card, and when it was last asked for.
 struct ExpertOnCard {
-    gate: CudaSlice<u8>,
-    up: CudaSlice<u8>,
-    down: CudaSlice<u8>,
+    // Behind an Arc so an expert about to run is held by a cheap handle clone, not a
+    // device-to-device copy of its ten megabytes - `CudaSlice`'s own `Clone` copies the whole
+    // buffer, which turned every resident expert of every layer into a fresh allocation and a
+    // memcpy, the cost that made a card full of the hot set slower than the host.
+    gate: Arc<CudaSlice<u8>>,
+    up: Arc<CudaSlice<u8>>,
+    down: Arc<CudaSlice<u8>>,
     used: u64,
+    /// How many times a token has routed to this expert while it was kept. A card sized below the
+    /// working set keeps the most FREQUENTLY routed, not the most recent: a traced generation
+    /// missed twice as often under recency, because the hot experts recur across the whole answer
+    /// while recency lets a burst of one-off experts push them out.
+    freq: u64,
+    bytes: usize,
 }
+
+/// How many times an expert must be seen before a slot on a full card is spent on it: a card the
+/// working set overflows keeps only the experts a conversation keeps returning to, and a third
+/// sighting is the evidence it will be asked again rather than a one-off tail. The one-off experts
+/// stay on the host, so the slots settle on the hottest of the set.
+const ADMIT_AFTER: u32 = 3;
 
 type ExpertKeys = (usize, usize);
 
 #[derive(Default)]
 struct ExpertTier {
     kept: HashMap<ExpertKeys, ExpertOnCard>,
-    /// Experts asked for once. Sending one over costs more than the host's own product, so it
-    /// goes over on its second request, not its first: a decode of a few dozen tokens reads
-    /// hundreds of experts exactly once, and paying for each of those is what made a short
-    /// answer slower rather than faster.
-    seen: HashSet<ExpertKeys>,
+    /// How many times each expert has been asked for. Sending one over costs more than the host's
+    /// own product, so a card sized below the working set waits for a few requests before it
+    /// spends a slot: it fills with the experts a conversation keeps returning to and leaves the
+    /// long tail a decode routes to once or twice on the host.
+    seen: HashMap<ExpertKeys, u32>,
     clock: u64,
 }
 
@@ -76,6 +121,11 @@ pub struct Card {
     /// The dense always-read weights - a router's gate - by their storage.
     dense: Mutex<HashMap<crate::tensor::ops::traits::TensorId, Arc<QMatMul>>>,
     experts: Mutex<ExpertTier>,
+    /// The clock ticks one expert block spans a token - the model's layer count. An expert used
+    /// within this many ticks is this token's working set and is never evicted, so a decode
+    /// adapts the card toward its own hot experts across tokens without trading out, at every
+    /// layer, the ones the same token still needs.
+    protect: u64,
     /// The IQ2_XXS decode tables, built on first use and kept beside the weights.
     tables: OnceLock<(CudaSlice<u8>, CudaSlice<u8>)>,
     /// Set when a step failed for want of memory. From then on a step is tried only when the
@@ -89,7 +139,7 @@ pub struct Card {
 }
 
 impl Card {
-    pub fn new(dev: Arc<CudaDevice>, room: &'static Mutex<Room>) -> Self {
+    pub fn new(dev: Arc<CudaDevice>, room: &'static Mutex<Room>, protect: u64) -> Self {
         Self {
             ordinal: dev.ordinal(),
             dev,
@@ -97,6 +147,7 @@ impl Card {
             resident: Mutex::new(HashMap::new()),
             dense: Mutex::new(HashMap::new()),
             experts: Mutex::new(ExpertTier::default()),
+            protect: protect.max(1),
             tables: OnceLock::new(),
             declined: AtomicBool::new(false),
             said: AtomicBool::new(false),
@@ -279,6 +330,17 @@ impl Card {
         }
     }
 
+    /// Whether this card already holds `e`, with no upload owed. Read only: it takes the tier
+    /// lock to look, changes nothing, and is what lets the host start its own experts the moment
+    /// the cards start theirs rather than after the block returns.
+    pub fn holds(&self, e: &Expert) -> bool {
+        let Some(gate) = quant_blocks(&e.w1, GgmlDType::Iq2Xxs) else {
+            return false;
+        };
+        let key = (gate.as_ptr() as usize, gate.len());
+        self.tier().kept.contains_key(&key)
+    }
+
     /// The key under which this card holds `e`, taking it on when the evidence says it will be
     /// asked again: a second request, or `proven` by the caller - a prompt's batch routing it
     /// by several tokens at once, which is what a decode learns over several tokens. `None`
@@ -289,24 +351,51 @@ impl Card {
         let down = quant_blocks(&e.w2, GgmlDType::Q2K)?;
         let key = (gate.as_ptr() as usize, gate.len());
         let total = gate.len() + up.len() + down.len();
-        {
+        let n = {
             let mut tier = self.tier();
             if tier.kept.contains_key(&key) {
                 return Some(key);
             }
-            if tier.seen.insert(key) && !proven {
-                return None;
-            }
-        }
-        // Room for one more, or the host runs it. Nothing is evicted to make room: a miss that
-        // uploads ten megabytes costs more than the host's own product, so a card fills once
-        // and keeps what it holds rather than trading one expert for another at every token.
-        if !self.take_room(total, false) {
+            let c = tier.seen.entry(key).or_insert(0);
+            *c += 1;
+            *c
+        };
+        // A slot goes to an expert the conversation keeps returning to, not to whoever reached the
+        // card first: the one-off tail stays on the host rather than churning the hot set out.
+        if n < ADMIT_AFTER && !proven {
             return None;
         }
+        // How hot the one asking in is: it evicts only experts colder than itself, so a resident
+        // hot expert is never traded for a colder newcomer and the working set settles.
+        let incoming = if proven { u64::MAX } else { n as u64 };
+        // Room for one more, or a colder resident traded for it: the card holds far fewer than the
+        // working set, so the slots must move toward the hottest, but only ever downhill in heat,
+        // or the same experts would upload and evict each other every token.
+        // Room for one more, or a colder resident the last token did not touch traded for it: the
+        // card holds far fewer experts than the working set, so the slots drift toward the hottest,
+        // but the protected recent set (see `evict_to_fit`) keeps a token from trading out what it
+        // still needs, so the drift is one upload per genuinely new hot expert, not a churn.
+        let mut evicted = false;
+        if !self.take_room(total, false) {
+            if !self.evict_to_fit(total, incoming) || !self.take_room(total, false) {
+                return None;
+            }
+            evicted = true;
+        }
+        // A full card fails `fits_now` even when the budget had room - the accounting ceiling is
+        // above what the device physically holds once the always-read weights and the prior are
+        // on it. Without evicting here the eviction never fires (the budget rarely fills), so a
+        // card that has taken budget but has no physical room trades a colder expert for this one;
+        // the eviction frees a real block the upload's pool then serves.
+        if !evicted && !self.fits_now(total) && self.evict_to_fit(total, incoming) {
+            evicted = true;
+        }
         // Into memory the card has free right now, beyond what its own transient work needs:
-        // the accounting knows what is kept, not what a step in flight is holding.
-        if !self.fits_now(total) {
+        // the accounting knows what is kept, not what a step in flight is holding. After an
+        // eviction the freed blocks sit in the device's memory pool, which the driver's free
+        // count does not report until it is trimmed, so this check would refuse an upload the
+        // pool can serve; trust the pool there and let the upload's own OOM guard decline.
+        if !evicted && !self.fits_now(total) {
             self.give_room(total);
             return None;
         }
@@ -338,13 +427,72 @@ impl Card {
         tier.kept.insert(
             key,
             ExpertOnCard {
-                gate: gate_d,
-                up: up_d,
-                down: down_d,
+                gate: Arc::new(gate_d),
+                up: Arc::new(up_d),
+                down: Arc::new(down_d),
                 used,
+                // The heat that earned the slot, not one: inserted at one, a just-admitted expert
+                // is the coldest resident and the next miss evicts it, so the last slots churn -
+                // uploading and evicting the same borderline experts every token. Carrying the
+                // count it was seen means it is only traded for one demonstrably hotter, and the
+                // set converges instead of thrashing.
+                freq: n as u64,
+                bytes: total,
             },
         );
         Some(key)
+    }
+
+    /// Free at least `need` bytes by dropping the LEAST-FREQUENTLY-routed kept experts (never one
+    /// routed to at the current clock), so an adaptive card converges to the hottest experts the
+    /// conversation keeps returning to and lets the one-off ones give way. Evicted slices live
+    /// until any in-flight compute holding a clone drops them; the room goes back at once and the
+    /// caller's `fits_now` check still guards the allocation.
+    fn evict_to_fit(&self, need: usize, incoming: u64) -> bool {
+        let mut freed = Vec::new();
+        {
+            let mut tier = self.tier();
+            let now = tier.clock;
+            // Drop the coldest kept expert (lowest count, ties to least-recently-used) that is
+            // colder than the one asking in, one at a time until `need` is free. Found by a scan,
+            // not a full sort, since a decode frees one expert's worth at a time and the tier
+            // holds thousands. The colder-than-incoming rule is what stops the churn: a resident
+            // hot expert is never traded for a newcomer routed to fewer times, so once the working
+            // set is on the card the one-off tail runs on the host and the uploads stop.
+            while freed.iter().sum::<usize>() < need {
+                // Never the current token's own experts: one used within a layer-count of ticks is
+                // still needed this token, and trading it out would upload it again at the next
+                // layer. Only an expert the last token did not touch, and colder than the one
+                // asking in, is traded - so the card drifts toward the decode's hot set across
+                // tokens without churning within one.
+                let victim = tier
+                    .kept
+                    .iter()
+                    .filter(|(_, v)| v.used + self.protect < now && v.freq < incoming)
+                    .min_by_key(|(_, v)| (v.freq, v.used))
+                    .map(|(k, v)| (*k, v.bytes));
+                match victim {
+                    Some((k, bytes)) => {
+                        // Its heat outlives the slot. A resident's count grows as it runs but its
+                        // `seen` does not (an admitted expert returns before the tally), so without
+                        // this an evicted expert the conversation still returns to comes back at a
+                        // stale low count, the coldest slot, and is traded straight out again. Kept
+                        // in `seen`, it re-admits at the heat it earned and the last slots settle.
+                        if let Some(v) = tier.kept.remove(&k) {
+                            let s = tier.seen.entry(k).or_insert(0);
+                            *s = (*s).max(v.freq.min(u32::MAX as u64) as u32);
+                        }
+                        freed.push(bytes);
+                    }
+                    None => break,
+                }
+            }
+        }
+        let total: usize = freed.iter().sum();
+        for bytes in &freed {
+            self.give_room(*bytes);
+        }
+        total >= need
     }
 
     /// One expert's row with its weights kept on this card: two launches and one crossing each
@@ -364,6 +512,7 @@ impl Card {
         let now = tier.clock;
         let on = tier.kept.get_mut(&key)?;
         on.used = now;
+        on.freq += 1;
         let (gate_d, up_d, down_d) = (on.gate.clone(), on.up.clone(), on.down.clone());
         drop(tier);
         timings[0].fetch_add(hold_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -376,9 +525,9 @@ impl Card {
         let r = self.attempt("an expert row", need, || {
             gpu_expert_row(
                 &self.dev,
-                &gate_d,
-                &up_d,
-                &down_d,
+                gate_d.as_ref(),
+                up_d.as_ref(),
+                down_d.as_ref(),
                 (&tables.0, &tables.1),
                 dims,
                 xs,
@@ -393,6 +542,147 @@ impl Card {
             timings[2].fetch_add(1, Ordering::Relaxed);
         }
         r
+    }
+
+    /// Several experts that share one input row - a decode's active experts of a layer - run on
+    /// this card in one block: each resident expert's kernels are queued, then their outputs come
+    /// back together. `es[i]` answers `Some` when it was resident and ran here, `None` when it was
+    /// not and the host must run it. Bit-exact with `expert_row` called on each.
+    fn expert_rows(
+        &self,
+        es: &[&Expert],
+        xs: &[f32],
+        limit: f32,
+        timings: &[AtomicU64; 3],
+    ) -> Vec<Option<Result<(Vec<f32>, Vec<f32>)>>> {
+        let mut out: Vec<Option<Result<(Vec<f32>, Vec<f32>)>>> =
+            (0..es.len()).map(|_| None).collect();
+        let Some(&first) = es.first() else {
+            return out;
+        };
+        let dims = (first.w1.dims()[1], first.w1.dims()[0]);
+        if self.tables.get().is_none() {
+            match iq2_xxs_tables(&self.dev) {
+                Ok(t) => {
+                    let _ = self.tables.set(t);
+                }
+                Err(_) => return out,
+            }
+        }
+        let Some(tables) = self.tables.get() else {
+            return out;
+        };
+        // The resident subset, admitted (second-sighting or with room) as `expert_row` does, each
+        // keeping its own hold on the card's weights so an eviction cannot pull them mid-block.
+        let hold_started = std::time::Instant::now();
+        let mut idx = Vec::new();
+        let mut held: Vec<(Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>)> = Vec::new();
+        for (i, e) in es.iter().enumerate() {
+            let Some(key) = self.admit(e, false) else {
+                continue;
+            };
+            let mut tier = self.tier();
+            tier.clock += 1;
+            let now = tier.clock;
+            if let Some(on) = tier.kept.get_mut(&key) {
+                on.used = now;
+                on.freq += 1;
+                held.push((on.gate.clone(), on.up.clone(), on.down.clone()));
+                idx.push(i);
+            }
+        }
+        timings[0].fetch_add(hold_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if held.is_empty() {
+            return out;
+        }
+        let batch: Vec<(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)> = held
+            .iter()
+            .map(|(g, u, d)| (g.as_ref(), u.as_ref(), d.as_ref()))
+            .collect();
+        let need = (xs.len() + held.len() * (2 * dims.1 + dims.0)) * F32;
+        let kernels_started = std::time::Instant::now();
+        let ran = self.attempt("expert rows", need, || {
+            gpu_expert_rows_grouped(&self.dev, &batch, (&tables.0, &tables.1), dims, xs, limit)
+        });
+        timings[1].fetch_add(kernels_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // A whole-block failure leaves every one of these to the host: `None` stands.
+        if let Some(Ok(rows)) = ran {
+            timings[2].fetch_add(rows.len() as u64, Ordering::Relaxed);
+            for (&i, row) in idx.iter().zip(rows) {
+                out[i] = Some(Ok(row));
+            }
+        }
+        out
+    }
+
+    /// One activation row per instance through the expert it names, for the instances whose expert
+    /// this card already holds. `insts[i]` is run over `xrows[i]`; an instance whose expert is not
+    /// resident here gets `None` and the caller runs it on the host. Nothing is uploaded: a verify
+    /// uses only what a decode already warmed, so it never churns the set.
+    fn expert_rows_multi(
+        &self,
+        insts: &[&Expert],
+        xrows: &[&[f32]],
+        limit: f32,
+        timings: &[AtomicU64; 3],
+    ) -> Vec<Option<Result<Vec<f32>>>> {
+        let mut out: Vec<Option<Result<Vec<f32>>>> = (0..insts.len()).map(|_| None).collect();
+        let Some(&first) = insts.first() else {
+            return out;
+        };
+        let dims = (first.w1.dims()[1], first.w1.dims()[0]);
+        if self.tables.get().is_none() {
+            match iq2_xxs_tables(&self.dev) {
+                Ok(t) => {
+                    let _ = self.tables.set(t);
+                }
+                Err(_) => return out,
+            }
+        }
+        let Some(tables) = self.tables.get() else {
+            return out;
+        };
+        let hold_started = std::time::Instant::now();
+        let mut idx = Vec::new();
+        let mut held: Vec<(Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>, Arc<CudaSlice<u8>>)> = Vec::new();
+        let mut x_multi: Vec<f32> = Vec::new();
+        for (i, e) in insts.iter().enumerate() {
+            let Some(gate) = quant_blocks(&e.w1, GgmlDType::Iq2Xxs) else {
+                continue;
+            };
+            let key = (gate.as_ptr() as usize, gate.len());
+            let mut tier = self.tier();
+            tier.clock += 1;
+            let now = tier.clock;
+            if let Some(on) = tier.kept.get_mut(&key) {
+                on.used = now;
+                on.freq += 1;
+                held.push((on.gate.clone(), on.up.clone(), on.down.clone()));
+                idx.push(i);
+                x_multi.extend_from_slice(xrows[i]);
+            }
+        }
+        timings[0].fetch_add(hold_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if held.is_empty() {
+            return out;
+        }
+        let batch: Vec<(&CudaSlice<u8>, &CudaSlice<u8>, &CudaSlice<u8>)> = held
+            .iter()
+            .map(|(g, u, d)| (g.as_ref(), u.as_ref(), d.as_ref()))
+            .collect();
+        let need = (x_multi.len() + held.len() * (2 * dims.1 + dims.0)) * F32;
+        let kernels_started = std::time::Instant::now();
+        let ran = self.attempt("expert rows multi", need, || {
+            gpu_expert_rows_grouped_multi(&self.dev, &batch, (&tables.0, &tables.1), dims, &x_multi, limit)
+        });
+        timings[1].fetch_add(kernels_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(Ok(rows)) = ran {
+            timings[2].fetch_add(rows.len() as u64, Ordering::Relaxed);
+            for (&i, row) in idx.iter().zip(rows) {
+                out[i] = Some(Ok(row));
+            }
+        }
+        out
     }
 
     /// `xs` rows through `m`, a weight kept on this card.
@@ -530,6 +820,116 @@ impl Offload for Card {
             gpu_index_scores(&self.dev, q, k, weights, dims, ratio, scale)
         })
     }
+
+    fn attn_out(
+        &self,
+        wo_a: &Projection,
+        wo_b: &Projection,
+        o: &[f32],
+        o_groups: usize,
+        p: usize,
+        o_lora: usize,
+        dim: usize,
+    ) -> Option<Result<Vec<f32>>> {
+        // Only the always-read k-quant path is kept on a card; anything else runs on the host.
+        let wob_q = match wo_b {
+            Projection::Quant(q) => q,
+            _ => return None,
+        };
+        if o.len() != o_groups * p {
+            return None;
+        }
+        // Each group's row-view of wo_a and wo_b, all kept on THIS card or the chain is declined so
+        // the co-located weights answer from one place; the views are what a group projection keeps
+        // on the host path too, so nothing new crosses.
+        let mut groups = Vec::with_capacity(o_groups);
+        for g in 0..o_groups {
+            let rv = match wo_a.rows(g * o_lora, o_lora) {
+                Ok(Projection::Quant(q)) => q,
+                _ => return None,
+            };
+            groups.push(self.kept(&rv)?);
+        }
+        let wob = self.kept(wob_q)?;
+        let need = (o.len() + o_groups * o_lora + dim) * F32;
+        self.attempt("attn grouped out", need, || {
+            let o_dev = Tensor::from_vec(o.to_vec(), (o_groups, p), &Device::Cuda(self.dev.clone()))?;
+            let mut parts = Vec::with_capacity(o_groups);
+            for (g, m) in groups.iter().enumerate() {
+                let xg = o_dev.narrow(0, g, 1)?;
+                parts.push(m.forward(&xg)?);
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            let cat = Tensor::cat(&refs, 1)?;
+            wob.forward(&cat)?.flatten_all()?.to_vec1::<f32>()
+        })
+    }
+
+    fn attn_block(&self, p: &AttnBlock) -> Option<Result<(Vec<f32>, Vec<f32>)>> {
+        // Every projection of the block must be kept on THIS card or it declines to the host chain,
+        // so the activation stays on one device from the layer input to the block output.
+        let keep = |proj: &Projection| -> Option<Arc<QMatMul>> {
+            match proj {
+                Projection::Quant(q) => self.kept(q),
+                _ => None,
+            }
+        };
+        let m_qa = keep(p.wq_a)?;
+        let m_qb = keep(p.wq_b)?;
+        let m_kv = keep(p.wkv)?;
+        let mut wo_groups = Vec::with_capacity(p.o_groups);
+        for g in 0..p.o_groups {
+            let rv = p.wo_a.rows(g * p.o_lora, p.o_lora).ok()?;
+            wo_groups.push(keep(&rv)?);
+        }
+        let wob = keep(p.wo_b)?;
+        let (h, hd, rd) = (p.n_heads, p.head_dim, p.rope_head_dim);
+        let dev = Device::Cuda(self.dev.clone());
+        let w = if hd > 0 { p.window.len() / hd } else { 0 };
+        let need = (p.x.len() + (w + 1) * hd + h * hd * 4 + p.dim) * F32;
+        self.attempt("attn block", need, || {
+            let x = Tensor::from_vec(p.x.to_vec(), (1, p.dim), &dev)?;
+            let cos = Tensor::from_vec(p.cos.to_vec(), (1, rd / 2), &dev)?;
+            let sin = Tensor::from_vec(p.sin.to_vec(), (1, rd / 2), &dev)?;
+            let q_norm = p.q_norm.to_device(&dev)?;
+            let kv_norm = p.kv_norm.to_device(&dev)?;
+            let sink = p.sink.to_device(&dev)?.reshape((h, 1))?;
+            // Query: wq_a -> q_norm -> wq_b -> partial rope, all on the card.
+            let qr = rms_norm(&m_qa.forward(&x)?, &q_norm, p.eps)?;
+            let qf = m_qb.forward(&qr)?.reshape((h, hd))?;
+            let qrot = rope_partial_dev(&qf, &cos, &sin, rd)?;
+            // The token's compressed key latent: wkv -> kv_norm -> partial rope.
+            let kvn = rms_norm(&m_kv.forward(&x)?, &kv_norm, p.eps)?.reshape((1, hd))?;
+            let kvrot = rope_partial_dev(&kvn, &cos, &sin, rd)?;
+            let kv_row: Vec<f32> = kvrot.flatten_all()?.to_vec1::<f32>()?;
+            // Windowed attention over the past keys plus this token's, with a per-head sink that
+            // competes in the softmax but attends to nothing.
+            let winkv = if w == 0 {
+                kvrot.clone()
+            } else {
+                let win = Tensor::from_vec(p.window.to_vec(), (w, hd), &dev)?;
+                Tensor::cat(&[&win, &kvrot], 0)?
+            };
+            let keys = winkv.dim(0)?;
+            let scores = qrot.matmul(&winkv.t()?)?.affine(p.scale, 0.0)?;
+            let logits = Tensor::cat(&[&scores, &sink], 1)?;
+            let probs = softmax_last_dim(&logits)?.narrow(1, 0, keys)?;
+            let o = probs.matmul(&winkv)?;
+            // Output rope (negated sin), then the grouped low-rank output projection.
+            let sin_neg = sin.affine(-1.0, 0.0)?;
+            let orot = rope_partial_dev(&o, &cos, &sin_neg, rd)?;
+            let p2 = h * hd / p.o_groups;
+            let og = orot.reshape((p.o_groups, p2))?;
+            let mut parts = Vec::with_capacity(p.o_groups);
+            for (g, m) in wo_groups.iter().enumerate() {
+                parts.push(m.forward(&og.narrow(0, g, 1)?)?);
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            let cat = Tensor::cat(&refs, 1)?;
+            let out = wob.forward(&cat)?.flatten_all()?.to_vec1::<f32>()?;
+            Ok((out, kv_row))
+        })
+    }
 }
 
 /// The cards of one placement behind the trait: a weight kept on any of them answers from
@@ -569,6 +969,25 @@ impl Offload for Cards {
             .iter()
             .find_map(|c| c.index_scores(q, k, weights, dims, ratio, scale))
     }
+
+    fn attn_out(
+        &self,
+        wo_a: &Projection,
+        wo_b: &Projection,
+        o: &[f32],
+        o_groups: usize,
+        p: usize,
+        o_lora: usize,
+        dim: usize,
+    ) -> Option<Result<Vec<f32>>> {
+        self.0
+            .iter()
+            .find_map(|c| c.attn_out(wo_a, wo_b, o, o_groups, p, o_lora, dim))
+    }
+
+    fn attn_block(&self, p: &AttnBlock) -> Option<Result<(Vec<f32>, Vec<f32>)>> {
+        self.0.iter().find_map(|c| c.attn_block(p))
+    }
 }
 
 /// Routed experts run on `cards`, a lane per card stream: the gate and up products there, the
@@ -578,12 +997,99 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
     let timings: Arc<[AtomicU64; 3]> = Arc::new(Default::default());
     let shared = timings.clone();
     let for_warm = cards.clone();
+    let for_oncard = cards.clone();
+    let batch_cards = cards.clone();
+    let batch_timings = timings.clone();
+    let multi_cards = cards.clone();
+    let multi_timings = timings.clone();
     ExpertOffload {
         lanes: cards.len(),
         timings,
         warm: Some(Box::new(move |id, expert| {
             let on = &for_warm[id % for_warm.len()];
             on.admit(expert, true).is_some()
+        })),
+        run_batch: Some(Box::new(move |active, fetch, x, limit| {
+            let ncards = batch_cards.len().max(1);
+            let mut out: Vec<Option<Result<(Vec<f32>, Vec<f32>)>>> =
+                (0..active.len()).map(|_| None).collect();
+            // Each expert runs on the card its number names, the same home as the per-expert
+            // path, so a card keeps the ones that keep coming back to it. The cards' blocks run
+            // at once, on a thread each: a block is short and one card's kernels and its host
+            // work must not wait on the other's, or the second card's answer arrives a whole
+            // block late every layer.
+            let mut by_card: Vec<Vec<usize>> = (0..ncards).map(|_| Vec::new()).collect();
+            for (i, &e) in active.iter().enumerate() {
+                by_card[e % ncards].push(i);
+            }
+            let slots = std::sync::Mutex::new(&mut out);
+            std::thread::scope(|scope| {
+                for (c, positions) in by_card.iter().enumerate() {
+                    if positions.is_empty() {
+                        continue;
+                    }
+                    let (cards, timings, slots) = (&batch_cards, &batch_timings, &slots);
+                    scope.spawn(move || {
+                        let mut refs_owned: Vec<Arc<Expert>> = Vec::with_capacity(positions.len());
+                        let mut kept: Vec<usize> = Vec::with_capacity(positions.len());
+                        for &p in positions {
+                            if let Ok(e) = fetch(active[p]) {
+                                refs_owned.push(e);
+                                kept.push(p);
+                            }
+                        }
+                        if refs_owned.is_empty() {
+                            return;
+                        }
+                        let refs: Vec<&Expert> = refs_owned.iter().map(|e| e.as_ref()).collect();
+                        let rows = cards[c].expert_rows(&refs, x, limit, timings);
+                        let mut g = slots.lock().unwrap_or_else(|e| e.into_inner());
+                        for (&p, r) in kept.iter().zip(rows) {
+                            g[p] = r;
+                        }
+                    });
+                }
+            });
+            out
+        })),
+        run_multi: Some(Box::new(move |eidx, xrows, fetch, limit| {
+            let ncards = multi_cards.len().max(1);
+            let mut out: Vec<Option<Result<Vec<f32>>>> =
+                (0..eidx.len()).map(|_| None).collect();
+            let mut by_card: Vec<Vec<usize>> = (0..ncards).map(|_| Vec::new()).collect();
+            for (i, &e) in eidx.iter().enumerate() {
+                by_card[e % ncards].push(i);
+            }
+            let slots = std::sync::Mutex::new(&mut out);
+            std::thread::scope(|scope| {
+                for (c, positions) in by_card.iter().enumerate() {
+                    if positions.is_empty() {
+                        continue;
+                    }
+                    let (cards, timings, slots) = (&multi_cards, &multi_timings, &slots);
+                    scope.spawn(move || {
+                        let mut refs_owned: Vec<Arc<Expert>> = Vec::with_capacity(positions.len());
+                        let mut kept: Vec<usize> = Vec::with_capacity(positions.len());
+                        for &p in positions {
+                            if let Ok(e) = fetch(eidx[p]) {
+                                refs_owned.push(e);
+                                kept.push(p);
+                            }
+                        }
+                        if refs_owned.is_empty() {
+                            return;
+                        }
+                        let refs: Vec<&Expert> = refs_owned.iter().map(|e| e.as_ref()).collect();
+                        let xs: Vec<&[f32]> = kept.iter().map(|&p| xrows[p]).collect();
+                        let rows = cards[c].expert_rows_multi(&refs, &xs, limit, timings);
+                        let mut g = slots.lock().unwrap_or_else(|e| e.into_inner());
+                        for (&p, r) in kept.iter().zip(rows) {
+                            g[p] = r;
+                        }
+                    });
+                }
+            });
+            out
         })),
         run: Box::new(move |lane, tokens, expert, rows, limit| {
             let on = &cards[lane % cards.len()];
@@ -638,5 +1144,6 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
             };
             Some(run())
         }),
+        on_card: Some(Box::new(move |e| for_oncard.iter().any(|c| c.holds(e)))),
     }
 }

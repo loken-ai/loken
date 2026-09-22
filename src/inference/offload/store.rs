@@ -23,6 +23,61 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// A measurement of how many distinct experts each layer routes to over a run: the working set,
+/// against which the card and host tiers are sized. Off until asked (LOKEN_WS at start, or the
+/// enable call). Keyed by the layer's store address.
+static WORKING_SET: Mutex<Option<HashMap<usize, HashMap<usize, u64>>>> = Mutex::new(None);
+
+pub fn ws_enable() {
+    *WORKING_SET.lock().unwrap_or_else(|e| e.into_inner()) = Some(HashMap::new());
+}
+
+pub fn ws_record(layer: usize, expert: usize) {
+    if let Some(m) = WORKING_SET.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        *m.entry(layer).or_default().entry(expert).or_insert(0) += 1;
+    }
+}
+
+/// The fraction of activations the `cap` most-frequent experts of each layer cover: what a card
+/// holding the hottest `cap` would answer instead of the host. Averaged over the layers.
+pub fn ws_coverage(cap: usize) -> f64 {
+    let g = WORKING_SET.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_ref() else { return 0.0 };
+    if m.is_empty() {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    for counts in m.values() {
+        let total: u64 = counts.values().sum();
+        if total == 0 {
+            continue;
+        }
+        let mut v: Vec<u64> = counts.values().copied().collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        let top: u64 = v.iter().take(cap).sum();
+        sum += top as f64 / total as f64;
+    }
+    sum / m.len() as f64
+}
+
+/// The distinct-expert count of each layer seen so far, largest first, and the reset that starts a
+/// fresh window.
+pub fn ws_report() -> Vec<usize> {
+    let g = WORKING_SET.lock().unwrap_or_else(|e| e.into_inner());
+    let mut v: Vec<usize> = g
+        .as_ref()
+        .map(|m| m.values().map(HashMap::len).collect())
+        .unwrap_or_default();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    v
+}
+
+pub fn ws_reset() {
+    if let Some(m) = WORKING_SET.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.clear();
+    }
+}
+
 /// Builds one routed expert's weights on demand. The resident model materialises every expert up
 /// front; a low-memory model builds each from its backing source only when needed.
 pub trait ExpertLoader: Send + Sync {

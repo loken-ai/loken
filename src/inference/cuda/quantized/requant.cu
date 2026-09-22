@@ -924,20 +924,15 @@ extern "C" __global__ void mmv_expert_h_iq2_xxs_f32(
             if (w == 0) { ag += acc; } else { au += acc; }
         }
     }
-    __shared__ float rg[256];
-    __shared__ float ru[256];
-    rg[threadIdx.x] = ag;
-    ru[threadIdx.x] = au;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if ((int) threadIdx.x < s) {
-            rg[threadIdx.x] += rg[threadIdx.x + s];
-            ru[threadIdx.x] += ru[threadIdx.x + s];
-        }
-        __syncthreads();
+    // One warp per output row: each lane holds a partial, reduced by shuffle with no shared
+    // memory and no __syncthreads. The old 128-thread block did about one sub-block of work per
+    // thread and then a seven-step barrier reduction, so the barriers, not the dot, set the pace.
+    for (int off = 16; off > 0; off >>= 1) {
+        ag += __shfl_down_sync(0xffffffffu, ag, off);
+        au += __shfl_down_sync(0xffffffffu, au, off);
     }
     if (threadIdx.x == 0) {
-        float g = rg[0], u = ru[0];
+        float g = ag, u = au;
         if (limit > 0.0f) {
             g = fminf(g, limit);
             u = fminf(fmaxf(u, -limit), limit);
@@ -971,14 +966,160 @@ extern "C" __global__ void mmv_q2_k_f32(
             acc += (sd * (float) code - sm) * xp[i];
         }
     }
-    __shared__ float red[256];
-    red[threadIdx.x] = acc;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if ((int) threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
+    // One warp per output row, reduced by shuffle - no barrier reduction, see the h kernel.
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
-    if (threadIdx.x == 0) y[row] = red[0];
+    if (threadIdx.x == 0) y[row] = acc;
+}
+
+// The two kernels above, over a block of experts that share one input row - a decode's active
+// experts of a layer. blockIdx.y indexes the expert; each reads its own weights through a device
+// array of pointers, so all of a layer's experts run in one launch and the card is busy with the
+// whole block at once instead of one expert at a time. Bit-identical to running them singly: the
+// per-expert arithmetic and its order are the same, only the launch is shared.
+extern "C" __global__ void mmv_expert_h_iq2_xxs_grouped_f32(
+        const unsigned long long * __restrict__ gate_ptrs,
+        const unsigned long long * __restrict__ up_ptrs,
+        const unsigned char * __restrict__ grid, const unsigned char * __restrict__ signs,
+        const float * __restrict__ x, float * __restrict__ h,
+        const int dim, const int inter, const float limit, const int nexperts) {
+    const int e = blockIdx.y;
+    if (e >= nexperts) return;
+    const int row = blockIdx.x;
+    if (row >= inter) return;
+    const int sbs = dim / 256;
+    const unsigned char * gate = (const unsigned char *) gate_ptrs[e];
+    const unsigned char * up = (const unsigned char *) up_ptrs[e];
+    const unsigned char * gate0 = gate + (long) row * (long) sbs * 66;
+    const unsigned char * up0 = up + (long) row * (long) sbs * 66;
+    float ag = 0.0f, au = 0.0f;
+    for (int u = threadIdx.x; u < sbs * 8; u += blockDim.x) {
+        const int ib = u / 8, sub = u % 8;
+        const float * xp = x + (long) ib * 256 + sub * 32;
+        for (int w = 0; w < 2; ++w) {
+            const unsigned char * b = (w == 0 ? gate0 : up0) + (long) ib * 66;
+            const float d = req_f16_at(b);
+            const unsigned char * q = b + 2 + 8 * sub;
+            const unsigned int lo = (unsigned int) q[0] | ((unsigned int) q[1] << 8) | ((unsigned int) q[2] << 16) | ((unsigned int) q[3] << 24);
+            const unsigned int hi = (unsigned int) q[4] | ((unsigned int) q[5] << 8) | ((unsigned int) q[6] << 16) | ((unsigned int) q[7] << 24);
+            const float db = d * (0.5f + (float) (hi >> 28)) * 0.25f;
+            float acc = 0.0f;
+            for (int g = 0; g < 4; ++g) {
+                const unsigned char * gp = grid + 8 * ((lo >> (8 * g)) & 0xff);
+                const unsigned char pattern = signs[(hi >> (7 * g)) & 127];
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float v = db * (float) gp[j];
+                    acc += (((pattern >> j) & 1) ? -v : v) * xp[g * 8 + j];
+                }
+            }
+            if (w == 0) { ag += acc; } else { au += acc; }
+        }
+    }
+    // One warp per (expert, row): lanes reduced by shuffle, no shared memory, no barrier.
+    for (int off = 16; off > 0; off >>= 1) {
+        ag += __shfl_down_sync(0xffffffffu, ag, off);
+        au += __shfl_down_sync(0xffffffffu, au, off);
+    }
+    if (threadIdx.x == 0) {
+        float g = ag, u = au;
+        if (limit > 0.0f) {
+            g = fminf(g, limit);
+            u = fminf(fmaxf(u, -limit), limit);
+        }
+        h[(long) e * inter + row] = g / (1.0f + expf(-g)) * u;
+    }
+}
+
+// Grouped IQ2_XXS gate*up SwiGLU, one activation row per expert-instance: `x` is [nexperts, dim]
+// and instance `e` reads row `e`. A speculative verify makes one instance per (expert, token) it
+// routes, so the block's whole MoE runs in a single launch instead of one per token.
+extern "C" __global__ void mmv_expert_h_iq2_xxs_grouped_multi_f32(
+        const unsigned long long * __restrict__ gate_ptrs,
+        const unsigned long long * __restrict__ up_ptrs,
+        const unsigned char * __restrict__ grid, const unsigned char * __restrict__ signs,
+        const float * __restrict__ x, float * __restrict__ h,
+        const int dim, const int inter, const float limit, const int nexperts) {
+    const int e = blockIdx.y;
+    if (e >= nexperts) return;
+    const int row = blockIdx.x;
+    if (row >= inter) return;
+    const int sbs = dim / 256;
+    const unsigned char * gate = (const unsigned char *) gate_ptrs[e];
+    const unsigned char * up = (const unsigned char *) up_ptrs[e];
+    const unsigned char * gate0 = gate + (long) row * (long) sbs * 66;
+    const unsigned char * up0 = up + (long) row * (long) sbs * 66;
+    const float * xe = x + (long) e * dim;
+    float ag = 0.0f, au = 0.0f;
+    for (int u = threadIdx.x; u < sbs * 8; u += blockDim.x) {
+        const int ib = u / 8, sub = u % 8;
+        const float * xp = xe + (long) ib * 256 + sub * 32;
+        for (int w = 0; w < 2; ++w) {
+            const unsigned char * b = (w == 0 ? gate0 : up0) + (long) ib * 66;
+            const float d = req_f16_at(b);
+            const unsigned char * q = b + 2 + 8 * sub;
+            const unsigned int lo = (unsigned int) q[0] | ((unsigned int) q[1] << 8) | ((unsigned int) q[2] << 16) | ((unsigned int) q[3] << 24);
+            const unsigned int hi = (unsigned int) q[4] | ((unsigned int) q[5] << 8) | ((unsigned int) q[6] << 16) | ((unsigned int) q[7] << 24);
+            const float db = d * (0.5f + (float) (hi >> 28)) * 0.25f;
+            float acc = 0.0f;
+            for (int g = 0; g < 4; ++g) {
+                const unsigned char * gp = grid + 8 * ((lo >> (8 * g)) & 0xff);
+                const unsigned char pattern = signs[(hi >> (7 * g)) & 127];
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float v = db * (float) gp[j];
+                    acc += (((pattern >> j) & 1) ? -v : v) * xp[g * 8 + j];
+                }
+            }
+            if (w == 0) { ag += acc; } else { au += acc; }
+        }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        ag += __shfl_down_sync(0xffffffffu, ag, off);
+        au += __shfl_down_sync(0xffffffffu, au, off);
+    }
+    if (threadIdx.x == 0) {
+        float g = ag, u = au;
+        if (limit > 0.0f) {
+            g = fminf(g, limit);
+            u = fminf(fmaxf(u, -limit), limit);
+        }
+        h[(long) e * inter + row] = g / (1.0f + expf(-g)) * u;
+    }
+}
+
+extern "C" __global__ void mmv_q2_k_grouped_f32(
+        const unsigned long long * __restrict__ down_ptrs, const float * __restrict__ h,
+        float * __restrict__ y, const int inp, const int out, const int nexperts) {
+    const int e = blockIdx.y;
+    if (e >= nexperts) return;
+    const int row = blockIdx.x;
+    if (row >= out) return;
+    const int sbs = inp / 256;
+    const unsigned char * blocks = (const unsigned char *) down_ptrs[e];
+    const unsigned char * rowp = blocks + (long) row * (long) sbs * 84;
+    const float * he = h + (long) e * inp;
+    float acc = 0.0f;
+    for (int u = threadIdx.x; u < sbs * 16; u += blockDim.x) {
+        const int ib = u / 16, sub = u % 16, t = sub % 8;
+        const unsigned char * b = rowp + (long) ib * 84;
+        const unsigned char sc = b[sub];
+        const float d = req_f16_at(b + 80), dmin = req_f16_at(b + 82);
+        const int base = 32 * (sub / 8) + 16 * (t % 2), shift = 2 * (t / 2);
+        const float sd = d * (float) (sc & 0x0F), sm = dmin * (float) (sc >> 4);
+        const float * xp = he + (long) ib * 256 + sub * 16;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int code = (b[16 + base + i] >> shift) & 3;
+            acc += (sd * (float) code - sm) * xp[i];
+        }
+    }
+    // One warp per (expert, row), reduced by shuffle - see the h kernel.
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (threadIdx.x == 0) y[(long) e * out + row] = acc;
 }
 
 // q2_K to f32 at full precision, one value per thread: sixteen scale/minimum bytes, then the codes of
