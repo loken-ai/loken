@@ -457,9 +457,14 @@ impl DeepseekV41Model {
         let expert_bytes = self.expert_bytes()? as u64;
         let per_token = expert_bytes * (cfg.n_activated_experts * cfg.n_layers) as u64;
         let per_layer = expert_bytes * cfg.n_routed_experts as u64;
-        let reserve = self.resident_path_bytes() as u64 + per_token + per_layer;
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
+        // A hard free-memory headroom the kept tier never sizes into. The tier keeps its experts
+        // hot, so without it the host runs with MemFree near zero - every byte is reclaimable page
+        // cache, but a co-process or a prefill's allocation burst can outrun the kernel's reclaim
+        // and OOM the host. One eighth of total RAM keeps enough genuinely free for a burst.
+        let headroom = sys.total_memory() / 8;
+        let reserve = self.resident_path_bytes() as u64 + per_token + per_layer + headroom;
         let budget = sys.available_memory().saturating_sub(reserve);
         let slots = if expert_bytes == 0 || cfg.n_layers == 0 {
             0
