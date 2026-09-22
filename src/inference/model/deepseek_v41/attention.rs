@@ -108,6 +108,24 @@ impl Ratio0Attention {
     /// [b, s, n_heads, head_dim]; returns [b, s, dim].
     fn grouped_out(&self, o: &Tensor, b: usize, s: usize, dim: usize) -> Result<Tensor> {
         let p = self.n_heads * self.head_dim / self.o_groups;
+        // A decode's one row runs the whole grouped projection on the card, the activation crossing
+        // once instead of once per group; the host path below serves a prompt's batch.
+        if b * s == 1 {
+            if let Some(offload) = crate::inference::offload::current() {
+                let ov = o.flatten_all()?.to_vec1::<f32>()?;
+                if let Some(y) = offload.attn_out(
+                    &self.wo_a,
+                    &self.wo_b,
+                    &ov,
+                    self.o_groups,
+                    p,
+                    self.o_lora_rank,
+                    dim,
+                ) {
+                    return Tensor::from_vec(y?, (b, s, dim), &Device::Cpu);
+                }
+            }
+        }
         let og = o.reshape((b * s, self.o_groups, p))?;
         let mut parts = Vec::with_capacity(self.o_groups);
         for g in 0..self.o_groups {
@@ -137,6 +155,45 @@ impl Ratio0Attention {
         let cos = &cos.narrow(0, pos, 1)?;
         let sin = &sin.narrow(0, pos, 1)?;
         let x2 = x.reshape((b * s, dim))?;
+
+        // The whole block on one card: the activation crosses once for the layer instead of once
+        // per projection. Declined (None) when the weights are not co-located, and the host chain
+        // below runs it. The card keeps this token's key in f32; the window is rounded to the
+        // reference's fp8 as the host path does, so the two agree on what a later token attends to.
+        if let Some(offload) = crate::inference::offload::current() {
+            let window: Vec<f32> = cache.win.iter().flatten().copied().collect();
+            let xv = x2.flatten_all()?.to_vec1::<f32>()?;
+            let cosv = cos.flatten_all()?.to_vec1::<f32>()?;
+            let sinv = sin.flatten_all()?.to_vec1::<f32>()?;
+            let block = crate::inference::offload::AttnBlock {
+                wq_a: &self.wq_a,
+                q_norm: &self.q_norm,
+                wq_b: &self.wq_b,
+                wkv: &self.wkv,
+                kv_norm: &self.kv_norm,
+                wo_a: &self.wo_a,
+                wo_b: &self.wo_b,
+                sink: &self.attn_sink,
+                x: &xv,
+                cos: &cosv,
+                sin: &sinv,
+                window: &window,
+                n_heads: nh,
+                head_dim: hd,
+                rope_head_dim: rd,
+                o_groups: self.o_groups,
+                o_lora: self.o_lora_rank,
+                dim,
+                eps: self.eps,
+                scale: self.softmax_scale(),
+            };
+            if let Some(res) = offload.attn_block(&block) {
+                let (o, kv_row) = res?;
+                let kv = act_quant_fp8_e4m3(&Tensor::from_vec(kv_row, (1, hd), &Device::Cpu)?, 32)?;
+                push_window(cache, &kv.flatten_all()?.to_vec1::<f32>()?, self.window_size);
+                return Tensor::from_vec(o, (b, s, dim), &Device::Cpu);
+            }
+        }
 
         use crate::inference::offload::stage;
         let qr = stage("attn q_a", || {

@@ -310,6 +310,8 @@ pub(crate) async fn stage_performance_endpoint(
             stages::reset();
             stages::set_enabled(true);
             stage_prof_enable(true);
+            crate::inference::offload::store::ws_enable();
+            crate::inference::offload::store::ws_reset();
         }
         Some("0") => {
             stages::set_enabled(false);
@@ -317,6 +319,9 @@ pub(crate) async fn stage_performance_endpoint(
         }
         _ => {}
     }
+    let working_set = crate::inference::offload::store::ws_report();
+    let ws_cover_71 = crate::inference::offload::store::ws_coverage(71);
+    let ws_cover_120 = crate::inference::offload::store::ws_coverage(120);
     // The offloaded models (deepseek streamed) name their own stages and their lanes drop the
     // per-thread recorder, so the generic tracker above stays empty for them; their profile comes
     // from the offload's own accumulator.
@@ -342,6 +347,9 @@ pub(crate) async fn stage_performance_endpoint(
         "total_us": total,
         "offload_total_us": offload_total / 1000,
         "offload_stages": offload_stages,
+        "working_set_per_layer": working_set,
+        "ws_coverage_top71": ws_cover_71,
+        "ws_coverage_top120": ws_cover_120,
         "host_fast_calls": stages::host_paths().0,
         "host_rejects": stages::host_paths().1.iter()
             .map(|(k, v)| serde_json::json!({ "cause": k, "calls": v })).collect::<Vec<_>>(),

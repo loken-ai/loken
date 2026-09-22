@@ -649,6 +649,24 @@ impl BandAttention {
     /// [b, s, n_heads, head_dim]; returns [b, s, dim].
     fn grouped_out(&self, o: &Tensor, b: usize, s: usize, dim: usize) -> Result<Tensor> {
         let p = self.n_heads * self.head_dim / self.o_groups;
+        // A decode's one row runs the whole grouped projection on the card, the activation crossing
+        // once instead of once per group; the host path below serves a prompt's batch.
+        if b * s == 1 {
+            if let Some(offload) = crate::inference::offload::current() {
+                let ov = o.flatten_all()?.to_vec1::<f32>()?;
+                if let Some(y) = offload.attn_out(
+                    &self.wo_a,
+                    &self.wo_b,
+                    &ov,
+                    self.o_groups,
+                    p,
+                    self.o_lora_rank,
+                    dim,
+                ) {
+                    return Tensor::from_vec(y?, (b, s, dim), &Device::Cpu);
+                }
+            }
+        }
         let og = o.reshape((b * s, self.o_groups, p))?;
         let mut parts = Vec::with_capacity(self.o_groups);
         for g in 0..self.o_groups {
@@ -888,7 +906,7 @@ mod tests {
             }
         }
         let cpu = sparse_attn(&q, &kv, &sink, &idxs, topk, 0.25).unwrap();
-        let card = with_offload(Arc::new(Card::new(dev, room)), || {
+        let card = with_offload(Arc::new(Card::new(dev, room, 1)), || {
             sparse_attn(&q, &kv, &sink, &idxs, topk, 0.25)
         })
         .unwrap();
