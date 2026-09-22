@@ -324,6 +324,21 @@ impl Moe {
         // the rows of the tokens that selected it and nothing else.
         let mut y = if self.has_shared {
             stage("moe shared expert", || {
+                // On a card the shared expert's three products and SwiGLU stay on the device, so
+                // the activation crosses once instead of once per projection; the host path serves
+                // a decline or a batch a card has no room for.
+                if let Some(off) = crate::inference::offload::current() {
+                    let xv = x2.flatten_all()?.to_vec1::<f32>()?;
+                    if let Some(res) = off.expert_dev(
+                        &self.shared.w1,
+                        &self.shared.w3,
+                        &self.shared.w2,
+                        &xv,
+                        self.swiglu_limit,
+                    ) {
+                        return Ok(res?.chunks(self.dim).map(|c| c.to_vec()).collect());
+                    }
+                }
                 self.shared
                     .forward(&x2, self.swiglu_limit)?
                     .to_vec2::<f32>()

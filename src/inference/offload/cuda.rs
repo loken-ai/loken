@@ -945,6 +945,47 @@ impl Offload for Card {
             Ok((out, kv_row))
         })
     }
+
+    fn expert_dev(
+        &self,
+        w1: &Projection,
+        w3: &Projection,
+        w2: &Projection,
+        x: &[f32],
+        limit: f32,
+    ) -> Option<Result<Vec<f32>>> {
+        let quant = |p: &Projection| match p {
+            Projection::Quant(q) => Some(q.clone()),
+            _ => None,
+        };
+        let m1 = self.kept(&quant(w1)?)?;
+        let m3 = self.kept(&quant(w3)?)?;
+        let m2 = self.kept(&quant(w2)?)?;
+        let d1 = w1.dims();
+        let (inter, dim) = (d1[0], d1[1]);
+        if dim == 0 || x.len() % dim != 0 {
+            return None;
+        }
+        let rows = x.len() / dim;
+        let dev = Device::Cuda(self.dev.clone());
+        let need = (x.len() + rows * (2 * inter + dim)) * F32;
+        self.attempt("shared expert", need, || {
+            let xd = Tensor::from_vec(x.to_vec(), (rows, dim), &dev)?;
+            let gate = m1.forward(&xd)?;
+            let up = m3.forward(&xd)?;
+            // SwiGLU with the reference clamps: the gate branch from above, the up branch both sides.
+            let h = if limit > 0.0 {
+                let hi = Tensor::full(limit, 1, &dev)?;
+                let lo = Tensor::full(-limit, 1, &dev)?;
+                let g = gate.broadcast_minimum(&hi)?;
+                let u = up.broadcast_maximum(&lo)?.broadcast_minimum(&hi)?;
+                g.silu()?.mul(&u)?
+            } else {
+                gate.silu()?.mul(&up)?
+            };
+            m2.forward(&h)?.flatten_all()?.to_vec1::<f32>()
+        })
+    }
 }
 
 /// The cards of one placement behind the trait: a weight kept on any of them answers from
@@ -1002,6 +1043,19 @@ impl Offload for Cards {
 
     fn attn_block(&self, p: &AttnBlock) -> Option<Result<(Vec<f32>, Vec<f32>)>> {
         self.0.iter().find_map(|c| c.attn_block(p))
+    }
+
+    fn expert_dev(
+        &self,
+        w1: &Projection,
+        w3: &Projection,
+        w2: &Projection,
+        x: &[f32],
+        limit: f32,
+    ) -> Option<Result<Vec<f32>>> {
+        self.0
+            .iter()
+            .find_map(|c| c.expert_dev(w1, w3, w2, x, limit))
     }
 }
 

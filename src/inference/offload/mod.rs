@@ -135,6 +135,21 @@ pub trait Offload: Send + Sync {
         None
     }
 
+    /// A dense SwiGLU expert (the mixture's shared expert) run whole on one card so its three
+    /// products and the SwiGLU stay on the device and the activation crosses the bus once. `x` is
+    /// [rows, dim] row-major; `limit` is the SwiGLU clamp (the up branch clamped both sides, the
+    /// gate branch from above); returns [rows, dim]. `None` to run it on the host.
+    fn expert_dev(
+        &self,
+        _w1: &Projection,
+        _w3: &Projection,
+        _w2: &Projection,
+        _x: &[f32],
+        _limit: f32,
+    ) -> Option<Result<Vec<f32>>> {
+        None
+    }
+
     /// The grouped output projection of a decode's attention, run on one card so the activation
     /// crosses once instead of once per group. `o` is [o_groups, p] row-major; group g is
     /// multiplied by rows `[g*o_lora, (g+1)*o_lora)` of `wo_a`, the group results concatenated and
