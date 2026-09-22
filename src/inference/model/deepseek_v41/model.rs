@@ -1908,6 +1908,49 @@ mod oracle_gate {
         }
     }
 
+    /// The batch worker streams each concurrent request exactly the tokens `generate_batch`
+    /// produces: requests submitted together are prefilled and decoded through the same batched
+    /// step, and each row's compute is independent of the batch, so the worker's scheduling does
+    /// not change any sequence's output.
+    #[test]
+    fn batch_server_streams_the_batched_tokens() {
+        use crate::inference::model::deepseek_v41::batch_server::{Tok, V41BatchServer};
+        use std::sync::Arc;
+        let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let prompts: Vec<Vec<u32>> = (0..3)
+            .map(|j| {
+                let len = 8 + 2 * j;
+                (0..len)
+                    .map(|i| tokens[(i + 5 * j) % tokens.len()])
+                    .collect()
+            })
+            .collect();
+        let max_new = vec![6usize, 3, 5];
+        let pr: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
+        let want = model.generate_batch(&pr, &max_new, None).unwrap();
+
+        let server = V41BatchServer::spawn(Arc::new(model), None, None, 4);
+        let rxs: Vec<_> = prompts
+            .iter()
+            .zip(&max_new)
+            .map(|(p, &m)| server.submit(p.clone(), m))
+            .collect();
+        let got: Vec<Vec<u32>> = rxs
+            .into_iter()
+            .map(|rx| {
+                let mut seq = Vec::new();
+                while let Ok(t) = rx.recv() {
+                    match t {
+                        Tok::Next(x) => seq.push(x),
+                        Tok::Done => break,
+                    }
+                }
+                seq
+            })
+            .collect();
+        assert_eq!(got, want, "the worker must stream the batched tokens");
+    }
+
     /// A rejected speculative block rolls back with no trace: checkpoint, verify the whole block,
     /// rewind, replay only the accepted prefix - the state then stands exactly where verifying that
     /// prefix alone would have left it, so the next token decodes to the same logits bit for bit.

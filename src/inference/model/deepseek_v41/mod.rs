@@ -13,6 +13,7 @@
 
 pub mod attention;
 pub mod band;
+pub mod batch_server;
 pub mod block;
 pub mod cache;
 pub mod candidates;
