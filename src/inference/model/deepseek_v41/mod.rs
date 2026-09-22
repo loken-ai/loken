@@ -24,6 +24,7 @@ pub mod hyper_connections;
 pub mod load;
 pub mod model;
 pub mod moe;
+pub mod dspark;
 pub mod safetensors_source;
 pub mod source;
 pub mod token_map;

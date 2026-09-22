@@ -94,6 +94,7 @@ pub fn load_moe<S: WeightSource + ?Sized>(
         gate_bias: g.dense_f32(&format!("{p}.gate.bias"))?,
         experts: ExpertSet::Streamed(ExpertStore::new(loader, cfg.expert_cache_count)),
         shared,
+        has_shared: true,
         n_routed: cfg.n_routed_experts,
         n_activated: cfg.n_activated_experts,
         dim: cfg.d_model,

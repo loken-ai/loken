@@ -18,7 +18,7 @@ use crate::tensor::ops::rms_norm;
 use crate::tensor::{Device, Error, Result, Tensor};
 
 /// One layer's rope frequencies (already YaRN-adjusted), as cos and sin tables [seqlen, rd/2].
-fn rope_table(
+pub(crate) fn rope_table(
     rd: usize,
     seqlen: usize,
     original_seq_len: usize,
@@ -395,6 +395,10 @@ impl DeepseekV41Model {
         let per_lane = tokens * (2 * self.dim + 2 * inter) * f;
         let scores = tokens * tokens * f;
         let streams = tokens * self.dim * self.hc_mult * f;
+        // A card holds scratch for the widest single step beside the weights it keeps: without it
+        // the decode's own gemv, sparse attention and any weight it must admit run out of room on a
+        // full card and fall to the host. The widest such step is holding one attention layer's
+        // weights, or the head - whichever is larger.
         let largest = self
             .blocks
             .iter()
@@ -403,6 +407,16 @@ impl DeepseekV41Model {
             .unwrap_or(0)
             .max(self.output.bytes());
         per_lane * self.n_activated().max(1) + scores + streams + largest
+    }
+
+    /// The token embedding table `[vocab, dim]`, shared with the DSpark draft.
+    pub fn embed_ref(&self) -> &Tensor {
+        &self.embed
+    }
+
+    /// The output head, shared with the DSpark draft.
+    pub fn head_ref(&self) -> &crate::inference::offload::projection::Projection {
+        &self.output
     }
 
     pub fn n_layers(&self) -> usize {
@@ -595,12 +609,33 @@ impl DeepseekV41Model {
             .as_ref()
             .map(|ecfg| state.engram.push(ecfg, token));
         let mut shared = SharedAttn::default();
+        // The DSpark draft reads the attention input (the hidden mean-pooled over the
+        // hyper-connection copies) of its target layers; captured here, read after the decode.
+        let cap = state.capture_layers.clone();
+        if !cap.is_empty() {
+            state.captured = vec![Vec::new(); cap.len()];
+        }
         for (i, block) in self.blocks.iter().enumerate() {
             if let (Some(engram), Some(ecfg), Some(recent)) =
                 (&self.engrams[i], &self.engram_cfg, &recent)
             {
                 let which = ecfg.layer_ids.iter().position(|&l| l == i).unwrap_or(0);
                 x = engram.forward(&x, &[ecfg.hash(which, recent)])?;
+            }
+            if let Some(ci) = cap.iter().position(|&l| l == i) {
+                // Mean over the hyper-connection copies: x is [1, 1, hc, dim].
+                let v = x.reshape((hc, dim))?.to_vec2::<f32>()?;
+                let mut m = vec![0f32; dim];
+                for row in &v {
+                    for (j, &val) in row.iter().enumerate() {
+                        m[j] += val;
+                    }
+                }
+                let inv = 1.0 / hc as f32;
+                for val in m.iter_mut() {
+                    *val *= inv;
+                }
+                state.captured[ci] = m;
             }
             let (cos, sin) = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
                 (&cos0, &sin0)
@@ -1613,7 +1648,7 @@ mod oracle_gate {
         let layouts: [(&[u32], &[u32], &[u32]); 2] =
             [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
         let card: std::sync::Arc<dyn crate::inference::offload::Offload> =
-            std::sync::Arc::new(Card::new(dev, room));
+            std::sync::Arc::new(Card::new(dev, room, 1));
         for (ratios, kv_src, index_src) in layouts {
             let (model, tokens) = synthetic(ratios, kv_src, index_src, 0);
             let split = tokens.len() - 3;

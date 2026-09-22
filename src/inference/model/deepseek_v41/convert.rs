@@ -179,6 +179,7 @@ pub fn calibrate(
             always_read: model.resident_path_bytes(),
             transient: model.transient_bytes(texts.iter().map(|t| t.len()).max().unwrap_or(0)),
             concurrency: model.n_activated(),
+            layers: model.n_layers(),
             prior: &no_prior,
             fetch: &|_, _| None,
         },

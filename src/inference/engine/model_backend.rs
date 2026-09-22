@@ -816,6 +816,11 @@ pub(crate) struct DeepseekV41Backend {
         Vec<u32>,
         usize,
     )>,
+    /// The native DSpark draft head, loaded from the released checkpoint when it is on the machine.
+    /// `None` leaves speculative decode to the n-gram fallback.
+    dspark: Option<crate::inference::model::deepseek_v41::dspark::Dspark>,
+    /// The draft's running window state, beside `state`.
+    dspark_state: Option<crate::inference::model::deepseek_v41::dspark::DsparkState>,
 }
 
 impl DeepseekV41Backend {
@@ -825,21 +830,51 @@ impl DeepseekV41Backend {
         context_length: usize,
     ) -> Self {
         use crate::inference::offload::streamed::{Demand, Streamed};
+        // Decode needs only a small transient (windowed attention bounds KV growth); the
+        // full-context reservation would leave no card room for resident experts. A longer
+        // prompt is chunked to this width at prefill.
+        const PREFILL_TRANSIENT_TOKENS: usize = 64;
         let state = model.new_decode_state();
         let fetch = |layer: usize, id: usize| model.expert_store(layer)?.fetch(id).ok();
         let streamed = Streamed::open(&Demand {
             always_read: model.resident_path_bytes(),
-            transient: model.transient_bytes(context_length),
+            transient: model.transient_bytes(context_length.min(PREFILL_TRANSIENT_TOKENS)),
             concurrency: model.n_activated(),
+            layers: model.n_layers(),
             prior: model.hot_experts(),
             fetch: &fetch,
         });
+        // Speculative draft held off for this checkpoint; re-enabled to continue the DSpark work.
+        let dspark: Option<crate::inference::model::deepseek_v41::dspark::Dspark> = None;
+        let mut state = state;
+        let dspark_state = match &dspark {
+            Some(d) => {
+                tracing::info!(
+                    "DSpark draft loaded: {} stages, block_size {}, {} experts/stage",
+                    d.stages.len(),
+                    d.cfg.block_size,
+                    d.cfg.n_routed
+                );
+                state.capture_layers = d.cfg.target_layers.clone();
+                Some(crate::inference::model::deepseek_v41::dspark::DsparkState::new(
+                    d.stages.len(),
+                    d.cfg.window_size,
+                    d.cfg.head_dim,
+                ))
+            }
+            None => {
+                tracing::info!("DSpark draft not available (checkpoint not in hub cache)");
+                None
+            }
+        };
         Self {
             model,
             state,
             widest_ffn,
             streamed,
             verify: None,
+            dspark,
+            dspark_state,
         }
     }
 
@@ -1541,6 +1576,9 @@ impl ModelBackend for DeepseekV41Backend {
         self.verify = None;
         if index_pos == 0 {
             self.state = self.model.new_decode_state();
+            if let Some(d) = &self.dspark {
+                self.state.capture_layers = d.cfg.target_layers.clone();
+            }
         }
         if self.state.pos != index_pos {
             return Err(crate::tensor::Error::msg(format!(
@@ -1562,16 +1600,99 @@ impl ModelBackend for DeepseekV41Backend {
             model,
             state,
             streamed,
+            dspark,
+            dspark_state,
             ..
         } = self;
         match streamed {
             Some(s) => {
                 model.offload_experts(Some(s.lanes.clone()));
+                // PROBE (diagnostic, off): measures a batched verify against K decodes on the real,
+                // warm next tokens - the continuation a draft would propose - so the amortisation is
+                // read on representative experts. Gated off; it perturbs decode timing when live.
+                if false && ids.len() == 1 && state.pos > 24 {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static PN: AtomicU64 = AtomicU64::new(0);
+                    if PN.fetch_add(1, Ordering::Relaxed) % 20 == 0 {
+                        const K: usize = 5;
+                        let p0 = state.pos;
+                        let first = ids[0];
+                        let mark = state.checkpoint();
+                        let mut toks_in: Vec<u32> = Vec::with_capacity(K);
+                        let mut real: Vec<u32> = Vec::with_capacity(K);
+                        let mut main_hidden: Vec<f32> = Vec::new();
+                        let mut cur = first;
+                        let mut dsum = 0u128;
+                        for i in 0..K {
+                            toks_in.push(cur);
+                            let t0 = std::time::Instant::now();
+                            let lg = crate::inference::offload::with_offload(
+                                s.offload.clone(),
+                                || model.forward_decode(cur, state),
+                            )?;
+                            dsum += t0.elapsed().as_micros();
+                            if i == 0 {
+                                main_hidden = state.captured.concat();
+                            }
+                            let v = lg.flatten_all()?.to_vec1::<f32>()?;
+                            cur = v
+                                .iter()
+                                .enumerate()
+                                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                                .map(|(i, _)| i as u32)
+                                .unwrap_or(0);
+                            real.push(cur);
+                        }
+                        state.rewind(&mark);
+                        let t0 = std::time::Instant::now();
+                        let _ = crate::inference::offload::with_offload(s.offload.clone(), || {
+                            model.forward_verify_batch(&toks_in, state)
+                        })?;
+                        let vtime = t0.elapsed().as_micros();
+                        state.rewind(&mark);
+                        // The DSpark draft from the same token, against the greedy continuation.
+                        if let (Some(d), Some(ds)) = (dspark.as_ref(), dspark_state.as_mut()) {
+                            if !main_hidden.is_empty() {
+                                let t0 = std::time::Instant::now();
+                                let drafts = crate::inference::offload::with_offload(
+                                    s.offload.clone(),
+                                    || d.forward_draft(ds, &main_hidden, first, p0, model.embed_ref(), model.head_ref()),
+                                );
+                                let dtime = t0.elapsed().as_micros();
+                                match drafts {
+                                    Ok(drafts) => {
+                                        let acc = drafts
+                                            .iter()
+                                            .zip(&real)
+                                            .take_while(|(a, b)| a == b)
+                                            .count();
+                                        tracing::info!(
+                                            "DSPARK-DRAFT accept {}/{} draft_us={} drafts={:?} real={:?}",
+                                            acc, K, dtime, drafts, real
+                                        );
+                                    }
+                                    Err(e) => tracing::warn!("DSpark forward_draft failed: {e}"),
+                                }
+                            }
+                        }
+                        tracing::info!(
+                            "PROBE verify K={K}: decode_sum={dsum}us verify={vtime}us ratio={:.2} (warm, real tokens)",
+                            vtime as f64 / dsum.max(1) as f64
+                        );
+                    }
+                }
                 for &t in &ids {
                     last = Some(crate::inference::offload::with_offload(
                         s.offload.clone(),
                         || model.forward_decode(t, state),
                     )?);
+                    // Maintain the DSpark window from this committed position's backbone hidden.
+                    if let (Some(d), Some(ds)) = (dspark.as_ref(), dspark_state.as_mut()) {
+                        let mh = state.captured.concat();
+                        if !mh.is_empty() && state.pos > 0 {
+                            let _ = d.update_window_from_hidden(ds, &mh, state.pos - 1);
+                        }
+                    }
                 }
             }
             None => {
@@ -1592,6 +1713,9 @@ impl ModelBackend for DeepseekV41Backend {
         let ids = x.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
         if index_pos == 0 {
             self.state = self.model.new_decode_state();
+            if let Some(d) = &self.dspark {
+                self.state.capture_layers = d.cfg.target_layers.clone();
+            }
         }
         if self.state.pos != index_pos {
             return Err(crate::tensor::Error::msg(format!(
@@ -1644,6 +1768,9 @@ impl ModelBackend for DeepseekV41Backend {
         self.verify = None;
         if keep == 0 {
             self.state = self.model.new_decode_state();
+            if let Some(d) = &self.dspark {
+                self.state.capture_layers = d.cfg.target_layers.clone();
+            }
         }
     }
 

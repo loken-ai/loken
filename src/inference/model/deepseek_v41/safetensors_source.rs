@@ -313,8 +313,9 @@ impl WeightSource for SafeTensorsSource {
     fn experts(&self, layer: usize, n: usize) -> Result<Box<dyn ExpertLoader>> {
         Ok(Box::new(ShardExpertLoader {
             inner: self.inner.clone(),
-            layer,
+            prefix: format!("layers.{layer}.ffn.experts"),
             n,
+            dense: false,
         }))
     }
 
@@ -348,17 +349,26 @@ impl WeightSource for SafeTensorsSource {
     }
 }
 
-/// Each routed expert from its own three tensors, read in place when fp4, dense otherwise.
+/// Each routed expert from its own three tensors, read in place when fp4, dense otherwise. The
+/// prefix names the block: `layers.{layer}.ffn.experts` for the backbone, `mtp.{stage}.ffn.experts`
+/// for a DSpark stage.
 struct ShardExpertLoader {
     inner: Arc<Inner>,
-    layer: usize,
+    prefix: String,
     n: usize,
+    /// Dequantise to a dense f32 weight instead of keeping the block-scaled form. A DSpark draft
+    /// runs its few experts on the cores; a dense dot vectorises where unpacking fp4 per element
+    /// does not, so the draft is far cheaper for the handful of experts it touches.
+    dense: bool,
 }
 
 impl ExpertLoader for ShardExpertLoader {
     fn build(&self, id: usize) -> Result<Expert> {
         let one = |w: &str| -> Result<Projection> {
-            let name = format!("layers.{}.ffn.experts.{id}.{w}.weight", self.layer);
+            let name = format!("{}.{id}.{w}.weight", self.prefix);
+            if self.dense {
+                return Ok(Projection::Dense(self.inner.dense_f32(&name)?));
+            }
             match self.inner.projection(&name)? {
                 Some(p) => Ok(p),
                 None => Ok(Projection::Dense(self.inner.dense_f32(&name)?)),
@@ -373,5 +383,18 @@ impl ExpertLoader for ShardExpertLoader {
 
     fn count(&self) -> usize {
         self.n
+    }
+}
+
+impl SafeTensorsSource {
+    /// An expert loader for a block named by `prefix` (e.g. `mtp.0.ffn.experts`), for loading a
+    /// DSpark stage's routed experts by their stored names. `dense` dequantises each to f32.
+    pub fn experts_named(&self, prefix: &str, n: usize, dense: bool) -> Box<dyn ExpertLoader> {
+        Box::new(ShardExpertLoader {
+            inner: self.inner.clone(),
+            prefix: prefix.to_string(),
+            n,
+            dense,
+        })
     }
 }

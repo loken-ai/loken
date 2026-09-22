@@ -33,6 +33,11 @@ pub struct DecodeState {
     pub layers: Vec<AttnCache>,
     pub engram: EngramState,
     pub pos: usize,
+    /// The block indices whose attention input the DSpark draft reads. Empty leaves the capture off.
+    pub capture_layers: Vec<usize>,
+    /// The last decode's mean-pooled hidden at each capture layer, in `capture_layers` order. Read
+    /// by the draft after a decode; overwritten each decode.
+    pub captured: Vec<Vec<f32>>,
 }
 
 impl DecodeState {
@@ -41,6 +46,8 @@ impl DecodeState {
             layers: (0..n_layers).map(|_| AttnCache::default()).collect(),
             engram: EngramState::default(),
             pos: 0,
+            capture_layers: Vec::new(),
+            captured: Vec::new(),
         }
     }
 
