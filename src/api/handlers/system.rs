@@ -321,6 +321,7 @@ pub(crate) async fn stage_performance_endpoint(
     }
     let working_set = crate::inference::offload::store::ws_report();
     let ws_cover_71 = crate::inference::offload::store::ws_coverage(71);
+    let (expert_hits, expert_misses) = crate::inference::offload::store::hitmiss_report();
     let ws_cover_120 = crate::inference::offload::store::ws_coverage(120);
     // The offloaded models (deepseek streamed) name their own stages and their lanes drop the
     // per-thread recorder, so the generic tracker above stays empty for them; their profile comes
@@ -349,6 +350,9 @@ pub(crate) async fn stage_performance_endpoint(
         "offload_stages": offload_stages,
         "working_set_per_layer": working_set,
         "ws_coverage_top71": ws_cover_71,
+        "expert_hits": expert_hits,
+        "expert_misses": expert_misses,
+        "expert_hit_rate": if expert_hits + expert_misses > 0 { expert_hits as f64 / (expert_hits + expert_misses) as f64 } else { 0.0 },
         "ws_coverage_top120": ws_cover_120,
         "host_fast_calls": stages::host_paths().0,
         "host_rejects": stages::host_paths().1.iter()

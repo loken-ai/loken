@@ -20,15 +20,29 @@ use crate::tensor::quant_view::expert_view;
 use crate::tensor::quantized::QTensor;
 use crate::tensor::{Result, Tensor};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A measurement of how many distinct experts each layer routes to over a run: the working set,
 /// against which the card and host tiers are sized. Off until asked (LOKEN_WS at start, or the
 /// enable call). Keyed by the layer's store address.
 static WORKING_SET: Mutex<Option<HashMap<usize, HashMap<usize, u64>>>> = Mutex::new(None);
+static EXPERT_HITS: AtomicU64 = AtomicU64::new(0);
+static EXPERT_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Global routed-expert cache counters since the last `ws_enable`: kept-tier hits and
+/// misses across every layer, for measuring how close the resident set runs to its coverage
+/// ceiling.
+pub fn hitmiss_report() -> (u64, u64) {
+    (
+        EXPERT_HITS.load(Ordering::Relaxed),
+        EXPERT_MISSES.load(Ordering::Relaxed),
+    )
+}
 
 pub fn ws_enable() {
+    EXPERT_HITS.store(0, Ordering::Relaxed);
+    EXPERT_MISSES.store(0, Ordering::Relaxed);
     *WORKING_SET.lock().unwrap_or_else(|e| e.into_inner()) = Some(HashMap::new());
 }
 
@@ -274,9 +288,11 @@ impl ExpertStore {
             let mut g = self.inner.lock().unwrap();
             if let Some(e) = g.kept.get(&id).cloned() {
                 g.stats.hits += 1;
+                EXPERT_HITS.fetch_add(1, Ordering::Relaxed);
                 return Ok(e);
             }
             g.stats.misses += 1;
+            EXPERT_MISSES.fetch_add(1, Ordering::Relaxed);
         }
         // Build outside the lock; a concurrent build of the same id is harmless (same value).
         let expert = Arc::new(self.loader.build(id)?);
