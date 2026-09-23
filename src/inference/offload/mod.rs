@@ -11,9 +11,11 @@
 //! `cuda` is the card behind the trait; `streamed` opens the placement from what a model
 //! declares, under the engine's own switches.
 
+pub mod cpu_experts;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod experts;
+pub mod moe_dispatch;
 pub mod projection;
 pub mod room;
 pub mod store;
