@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# The one entry point for a reproducible loken bench campaign.
+#
+# It owns nothing the store already knows: the model list comes from loken's own catalogue
+# (GET /api/tags), the store paths from loken/config.toml, and the matrix axes from
+# bench/matrix.toml. There is no model list to maintain and no machine path in the repo.
+#
+# Usage:
+#   bench                 # PLAN: print the cells a campaign would run (no side effects) [default]
+#   bench --plan          # same, explicit
+#   bench run             # RUN the campaign (provisions engines, measures) - see `run` below
+#
+# `run` is deliberately not the default: it installs pinned ollama/vLLM into a bench-only
+# compartment and drives the full matrix, which monopolizes the machine. Plan first, run on purpose.
+set -u
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"   # loken/scripts
+LOKEN="$(cd "$HERE/.." && pwd)"                           # loken
+CONFIG="$LOKEN/config.toml"
+MATRIX="$LOKEN/bench/matrix.toml"
+LOKEN_URL="${LOKEN_URL:-http://127.0.0.1:11435}"
+
+die() { echo "bench: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+have python3 || die "python3 is required (TOML parsing, list handling)"
+have curl || die "curl is required (loken catalogue)"
+[ -f "$CONFIG" ] || die "no config.toml at $CONFIG"
+[ -f "$MATRIX" ] || die "no matrix at $MATRIX"
+
+# --- config.toml: the single source of the store paths -----------------------------------------
+cfg_key() { # cfg_key <dotted.key>
+    python3 - "$CONFIG" "$1" <<'PY'
+import sys, tomllib
+cfg = tomllib.load(open(sys.argv[1], "rb"))
+cur = cfg
+for part in sys.argv[2].split("."):
+    cur = cur.get(part, {}) if isinstance(cur, dict) else {}
+print(cur if isinstance(cur, str) else "")
+PY
+}
+
+OLLAMA_STORE="$(cfg_key ollama_models_dir)"
+HF_STORE="$(cfg_key huggingface_models_dir)"
+[ -n "$OLLAMA_STORE" ] || die "config.toml has no ollama_models_dir"
+# The engines read the same store loken does - this is what ends the split-brain.
+export OLLAMA_MODELS="$OLLAMA_STORE"
+export MODELS_DIR="$OLLAMA_STORE"
+[ -n "$HF_STORE" ] && export HF_HOME="$HF_STORE"
+
+# --- the model list = loken's catalogue, with the modality AND the format loken declares --------
+# loken's /api/tags entries carry, per model, `capabilities` (model_capabilities: completion, tts,
+# asr, txt2img/img2img, music, ...) and `details.format` ("gguf" for an ollama-source model,
+# "safetensors" for a huggingface-source one - set at models.rs:71-81 from the model's source). Both
+# are read from THERE, never guessed from the name: the modality picks assay's clock, the format says
+# which peer engine can load the weights (gguf->ollama, safetensors->vLLM; loken serves both).
+# Emits "name<TAB>modality<TAB>format" per model.
+loken_models() {
+    curl -sf "$LOKEN_URL/api/tags" | python3 -c '
+import sys, json
+def modality(caps):
+    caps = set(caps or [])
+    if "vision" in caps: return "vision"
+    if caps & {"txt2img", "img2img", "edit"}: return "image"
+    if caps & {"music", "sfx"}: return "music"   # /v1/audio/generations: prompt in, audio out
+    if "tts" in caps: return "tts"
+    if "asr" in caps: return "asr"
+    if "completion" in caps: return "text"
+    return "other"  # video, embedding, midi... no assay clock: an error cell, not a silent skip
+for m in json.load(sys.stdin).get("models", []):
+    fmt = (m.get("details") or {}).get("format") or ""
+    print(m["name"] + "\t" + modality(m.get("capabilities")) + "\t" + fmt)
+' 2>/dev/null
+}
+
+# The engines that can serve one cell, and how assay must run it, from the modality and the format.
+# One rule, no name heuristic, no curated peer list: the format loken declares says which peer can
+# load the weights; the modality says which clock and whether a peer speaks that endpoint at all.
+# Emits "engines<TAB>assay-modality<TAB>vllm-serve<TAB>error" (error non-empty => an error cell).
+plan_cell() { # plan_cell <model> <modality> <format>
+    local m="$1" mod="$2" fmt="$3"
+    local engines="loken" amod="$mod" vserve="" err=""
+    case "$mod" in
+        text|vision)
+            case "$fmt" in
+                gguf)        engines="ollama loken" ;;
+                safetensors) engines="loken vllm"; vserve="hf:$m --name $m" ;;
+                *)           err="unknown format '${fmt:-<none>}' (neither gguf nor safetensors)" ;;
+            esac ;;
+        image|music|tts)
+            engines="loken" ;;   # only loken speaks images/generations, audio/speech here
+        asr)
+            if [ -n "${ASR_AUDIO:-}" ] && [ -s "${ASR_AUDIO:-}" ]; then
+                engines="loken"
+            else
+                err="asr needs a golden audio (set ASR_AUDIO=<wav>)"
+            fi ;;
+        *)  err="no assay measurement for modality '$mod' (video/embedding/midi/...)" ;;
+    esac
+    # "|" separates the fields, not a tab: a tab is IFS whitespace, so an empty middle field (an
+    # empty vLLM target) would collapse and shift the error into the wrong column. No field holds a
+    # "|".
+    printf '%s|%s|%s|%s\n' "$engines" "$amod" "$vserve" "$err"
+}
+
+# Write a visible ERROR cell for a model loken lists but the campaign cannot measure, so it appears
+# in the report as impossible (bench_row reads load_error) instead of silently vanishing.
+write_error_cell() { # write_error_cell <model> <reason> <out> <stamp>
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json, sys, datetime
+model, reason, out, stamp = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+doc = {
+    "schema": "assay/2",
+    "engine_build": stamp,
+    "timestamp": datetime.datetime.now().astimezone().isoformat(),
+    "results": [{
+        "target": "loken", "url": "", "model": model, "num_ctx": 4096, "prompt": "short",
+        "prompt_chars": 0, "stats": {}, "iterations": [], "iteration_errors": [],
+        "coherence_pass": None, "first_response_preview": "", "load_time_ms": None,
+        "model_fingerprint": None, "load_error": reason,
+    }],
+}
+json.dump(doc, open(out, "w"))
+PY
+}
+
+# Stamp a freshly measured result with the binary build and the versions of the engines that
+# actually produced a row in it. The report reads the version from here, so a row never carries the
+# version installed when the report was generated - only the one it was measured with.
+stamp_result() { # stamp_result <file> <stamp>
+    python3 - "$1" "$2" "${OLLAMA_VER:-}" "${VLLM_VER:-}" <<'PY'
+import json, sys
+p, stamp, over, vver = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+d = json.load(open(p))
+d["engine_build"] = stamp
+targets = {r.get("target", "").lower() for r in d.get("results", [])}
+if over and "ollama" in targets:
+    d["ollama_version"] = over
+if vver and "vllm" in targets:
+    d["vllm_version"] = vver
+json.dump(d, open(p, "w"))
+PY
+}
+
+# True when a result file can be kept on resume: measured by the CURRENT binary AND, for each engine
+# that produced a row, the CURRENT version of that engine. Change ollama or vLLM and the cells they
+# measured are re-run, not relabelled - a version is never claimed for a bench not run with it.
+cell_current() { # cell_current <file> <stamp>
+    python3 - "$1" "$2" "${OLLAMA_VER:-}" "${VLLM_VER:-}" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+stamp, over, vver = int(sys.argv[2]), sys.argv[3], sys.argv[4]
+if d.get("engine_build") != stamp:
+    sys.exit(1)
+targets = {r.get("target", "").lower() for r in d.get("results", [])}
+if "ollama" in targets and str(d.get("ollama_version") or "") != over:
+    sys.exit(1)
+if "vllm" in targets and str(d.get("vllm_version") or "") != vver:
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+# --- plan: print the cells a campaign would run, no side effects -------------------------------
+plan() {
+    echo "store (ollama):  $OLLAMA_STORE"
+    echo "store (hf):      ${HF_STORE:-<none>}"
+    echo "loken:           $LOKEN_URL"
+    local models
+    models="$(loken_models)"
+    [ -n "$models" ] || die "loken returned no catalogue at $LOKEN_URL/api/tags (is it serving?)"
+    local n_models
+    n_models=$(printf '%s\n' "$models" | grep -c .)
+    echo "models:          $n_models (from loken)"
+    echo
+    printf '%-40s  %-8s  %-12s  %-16s  %s\n' "model" "modality" "format" "engines" "note"
+    printf '%-40s  %-8s  %-12s  %-16s  %s\n' "----------------------------------------" "--------" "------------" "----------------" "----"
+    local m mod fmt engines amod vserve err
+    while IFS=$'\t' read -r m mod fmt; do
+        [ -n "$m" ] || continue
+        IFS='|' read -r engines amod vserve err < <(plan_cell "$m" "$mod" "$fmt")
+        printf '%-40s  %-8s  %-12s  %-16s  %s\n' \
+            "$m" "$mod" "${fmt:-<none>}" "${err:+ERROR}${err:-$engines}" "$err"
+    done <<< "$models"
+    echo
+    echo "(plan only; run with: $0 run)"
+}
+
+# --- provision the bench-only engine compartment (never ~/vllm, never the PATH) ----------------
+# A fresh uv venv for vLLM and the latest ollama release, both under the bench working tree, so the
+# comparison runs against current engines without touching any other environment. Versions printed.
+provision() {
+    have uv || die "uv is required to provision the vLLM venv"
+    have tar || die "tar is required to provision ollama"
+    local comp="$HOME/bench-logs/engines"
+    mkdir -p "$comp"
+    local venv="$comp/vllm-venv"
+    if [ ! -x "$venv/bin/vllm" ]; then
+        echo "provisioning vLLM into $venv (uv pip install vllm)..."
+        uv venv "$venv" >&2 || die "uv venv failed"
+        uv pip install --python "$venv/bin/python" vllm >&2 || die "vllm install failed"
+    fi
+    export VLLM_VENV="$venv"
+    have zstd || die "zstd is required to unpack the ollama release (.tar.zst)"
+    local obin
+    obin="$(ls -d "$comp"/ollama-*/bin/ollama 2>/dev/null | sort -V | tail -1)"
+    if [ -z "$obin" ]; then
+        # Read the version and the real asset URL from the release API: ollama now ships the plain
+        # linux amd64 build as ollama-linux-amd64.tar.zst (no .tgz, no -rocm/-mlx). Reading the URL
+        # rather than constructing it self-heals if the naming shifts again.
+        local ver url dir arc
+        read -r ver url < <(curl -sf https://api.github.com/repos/ollama/ollama/releases/latest \
+            | python3 -c '
+import sys, json
+r = json.load(sys.stdin)
+ver = r["tag_name"].lstrip("v")
+want = "ollama-linux-amd64.tar.zst"
+url = next((a["browser_download_url"] for a in r["assets"] if a["name"] == want), "")
+print(ver, url)')
+        [ -n "$ver" ] && [ -n "$url" ] || die "cannot resolve latest ollama linux amd64 asset"
+        dir="$comp/ollama-$ver"; arc="$comp/ollama-$ver.tar.zst"; mkdir -p "$dir"
+        echo "provisioning ollama $ver into $dir..."
+        curl -fL "$url" -o "$arc" || die "ollama download failed"
+        tar -C "$dir" --zstd -xf "$arc" || die "ollama unpack failed"
+        rm -f "$arc"
+        obin="$dir/bin/ollama"
+    fi
+    [ -x "$obin" ] || die "no ollama binary in the compartment"
+    export OLLAMA_BIN="$obin"
+    # The versions each engine will be measured with. Stamped into every result file so the report
+    # reads the version from the measurement, not from whatever is installed when it is generated.
+    export OLLAMA_VER="$("$OLLAMA_BIN" --version 2>&1 | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    export VLLM_VER="$("$venv/bin/python" -c 'import vllm;print(vllm.__version__)' 2>/dev/null | tail -1)"
+    echo "engines (bench compartment):"
+    echo "  ollama:  ${OLLAMA_VER:-?}  [$OLLAMA_BIN]"
+    echo "  vLLM:    ${VLLM_VER:-?}  [$venv]"
+}
+
+# --- run: sweep the matrix through the existing isolation protocol -----------------------------
+# The measurement protocol (kill peers, thermal floor, per-engine invoke, merge) lives in
+# fair-run.sh and is reused unchanged; this only names the cells from the catalogue + manifest and
+# stamps/reports each. It provisions the bench engine compartment first (ollama + vLLM, never
+# ~/vllm), so text cells run loken vs ollama vs vLLM from the start. First-launch scope: GPU, ctx
+# 4096, short prompts, streaming - a fast pass; FULL=1 for the whole matrix. Vision/tts/asr need
+# golden input assets and are skipped with a note until wired; HF-direct (org/name) needs the
+# loken+vllm engine selection and is likewise skipped for now.
+run() {
+    [ -x "$LOKEN/target/release/lokend" ] || die "no release binary; build it first"
+    "$LOKEN/../assert-binary-current.sh" >/dev/null 2>&1 || die "binary is stale; rebuild before measuring"
+    provision
+    local models; models="$(loken_models)"
+    [ -n "$models" ] || die "loken returned no catalogue at $LOKEN_URL/api/tags (is it serving?)"
+
+    local ctxs prompts streams
+    if [ "${FULL:-0}" = 1 ]; then
+        # The full matrix axes come from the manifest - the only curated data a campaign reads.
+        IFS='|' read -r ctxs prompts streams < <(python3 - "$MATRIX" <<'PY'
+import sys, tomllib
+a = tomllib.load(open(sys.argv[1], "rb"))["axes"]
+print(" ".join(str(c) for c in a["context"]) + "|"
+      + " ".join(a["prompts"]) + "|"
+      + " ".join("1" if s else "0" for s in a["stream"]))
+PY
+)
+    else
+        ctxs="4096"; prompts="short"; streams="1"
+    fi
+    local stamp; stamp=$(stat -c %Y "$LOKEN/target/release/lokend")
+
+    cd "$LOKEN" || die "cannot cd $LOKEN"
+    local m mod fmt engines amod vserve err ctx st out tag mctxs mstreams
+    while IFS=$'\t' read -r m mod fmt; do
+        [ -n "$m" ] || continue
+        IFS='|' read -r engines amod vserve err < <(plan_cell "$m" "$mod" "$fmt")
+        tag=$(echo "$m" | tr ':/' '__')
+        # A model loken lists but the campaign cannot measure is an ERROR cell, visible in the
+        # report - never a silent skip.
+        if [ -n "$err" ]; then
+            out="results/${tag}_error.json"
+            write_error_cell "$m" "$err" "$out" "$stamp"
+            echo "ERROR cell: $m ($mod) - $err"
+            continue
+        fi
+        # Text and vision sweep the ctx/stream axes; a generated-media cell (image/music/tts/asr)
+        # has neither, so it is measured once.
+        case "$mod" in
+            text|vision) mctxs="$ctxs"; mstreams="$streams" ;;
+            *)           mctxs="4096"; mstreams="1" ;;
+        esac
+        for ctx in $mctxs; do for st in $mstreams; do
+            out="results/${tag}_${ctx}_$([ "$st" = 1 ] && echo stream || echo non-stream).json"
+            # Resume: keep a cell only if measured by this binary AND the current engine versions.
+            if [ -s "$out" ] && cell_current "$out" "$stamp"; then
+                echo "kept $m ctx=$ctx stream=$st (already measured, versions current)"; continue
+            fi
+            echo "===== $m ctx=$ctx stream=$st modality=$amod engines=[$engines]"
+            env ENGINES="$engines" STREAM="$st" BENCH_MODE=gpu OUT="$out" VLLM_SERVE="$vserve" \
+                ${ASR_AUDIO:+ASR_AUDIO="$ASR_AUDIO"} \
+                timeout --kill-after=60 "${CELL_CAP:-7200}" \
+                scripts/fair_bench.sh --models "$m" --prompts "$prompts" --num-ctx "$ctx" \
+                --max-tokens "${MAXTOK:-128}" --iterations 3 --modality "$amod" \
+                ${ASR_AUDIO:+--audio "$ASR_AUDIO"} \
+                2>&1 | tail -4
+            [ -s "$out" ] || { echo "no result for $m"; continue; }
+            stamp_result "$out" "$stamp"
+            python3 scripts/bench_row.py docs/BENCHMARKS.md results >/dev/null 2>&1 || echo "  (bench_row not modality-aware yet for $amod)"
+        done; done
+    done <<< "$models"
+    echo "campaign done"
+}
+
+case "${1:---plan}" in
+    --plan|plan|"") plan ;;
+    run) run ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown argument: $1 (try --plan or run)" ;;
+esac

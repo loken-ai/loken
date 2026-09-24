@@ -1,0 +1,23 @@
+# The bench matrix and the only curated data a campaign needs.
+#
+# Everything else is discovered, never listed here: the models come from loken's own catalogue
+# (GET /api/tags), and the store paths from loken/config.toml. So there is NO model list to keep in
+# sync with the store, and NO machine paths in the repo - only public facts about the comparison.
+
+# The axes the driver sweeps. The full matrix is their product (ctx x prompts x stream x device),
+# plus the drafter arm below. A shorter run selects a subset on the command line.
+[axes]
+context = [4096, 131072]
+prompts = ["short", "medium", "long"]
+stream = [true, false]
+device = ["gpu", "cpu"]
+
+# The drafter arm: the same loken measured again with a small draft model attached, on the models
+# that spill a card (where a drafter pays). Derived from the run, not a second model list.
+[drafter]
+model = "llama3.2:1b"
+
+# No vLLM peer table: which engine can serve a model is read from the format loken declares
+# (gguf -> ollama, safetensors -> vLLM), not from a hand-kept mapping. A safetensors model is its
+# own catalogue entry and is measured loken vs vLLM on its own weights; the gguf of the same model
+# is a separate entry, measured loken vs ollama. Two honest rows, no cross-peer to maintain.

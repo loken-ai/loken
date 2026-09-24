@@ -1,33 +1,32 @@
 """Turn bench JSONs into the report's table, aligned, with nothing retyped."""
 import re
-import json, os, pathlib, shutil, struct, sys
+import datetime
+import json, os, pathlib, struct, sys
 
-import subprocess
-def _ollama_version():
-    """Ask the binary rather than carry a literal: a table that names the wrong version
-    of the engine it measured is worse than one that names none."""
-    binary = os.environ.get("OLLAMA_BIN") or shutil.which("ollama") or "ollama"
-    try:
-        out = subprocess.run([binary, "--version"],
-                             capture_output=True, text=True, timeout=10)
-        m = re.search(r"([0-9]+\.[0-9]+\.[0-9]+)", out.stdout + out.stderr)
-        return "Ollama " + m.group(1) if m else "Ollama"
-    except Exception:
-        return "Ollama"
 
-def _vllm_version():
-    """The version installed in the environment the harness serves vLLM from."""
-    venv = os.environ.get("VLLM_VENV", os.path.expanduser("~/vllm"))
-    try:
-        out = subprocess.run([os.path.join(venv, "bin", "python"), "-c",
-                              "import vllm; print(vllm.__version__)"],
-                             capture_output=True, text=True, timeout=60)
-        m = re.search(r"([0-9]+\.[0-9]+\.[0-9]+[0-9a-z.+]*)", out.stdout)
-        return "vLLM " + m.group(1) if m else "vLLM"
-    except Exception:
-        return "vLLM"
+def _measured_at(doc, p):
+    """When a cell was measured, as (epoch, "YYYY-MM-DD HH:MM"), from the file's OWN `timestamp` -
+    not the file's mtime, which any later touch (a version stamp, a copy, a resave) rewrites and
+    which then reads as if every historical bench were run today. Falls back to mtime only for a
+    file that recorded no timestamp of its own."""
+    ts = doc.get("timestamp")
+    if ts:
+        try:
+            # ISO 8601 with offset; trim sub-microsecond digits so fromisoformat accepts it.
+            dt = datetime.datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", ts))
+            return dt.timestamp(), dt.astimezone().strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+    m = p.stat().st_mtime
+    return m, datetime.datetime.fromtimestamp(m).strftime("%Y-%m-%d %H:%M")
 
-VERS = {"ollama": _ollama_version(), "loken": "loken 0.1.0", "vllm": _vllm_version()}
+# Engine version labels come from the result FILES, never from whatever happens to be installed
+# when the report is generated: a report built after an engine upgrade must not stamp the new
+# version onto rows measured with the old one. Each file records `ollama_version`/`vllm_version`
+# for the engines that measured it (load_all folds them in as `ollama@<ver>`/`vllm@<ver>`); a file
+# that recorded none is labelled without a number rather than with a guess. That is why there is no
+# call here that asks the installed binary its version - that call was the bug.
+VERS = {"ollama": "Ollama", "vllm": "vLLM", "loken": "loken 0.1.0"}
 
 def engine_label(target):
     """The Engine column for a target. A variant of this engine is measured under the label
@@ -302,16 +301,17 @@ def cells(merged):
         # against work nobody did.
         ok = lambda v: v.get("coh") is not False and not looks_looping(v.get("preview", ""))
         others = [v["decode"] for k, v in by.items()
-                  if k in ("ollama", "vllm") and v["decode"] and same(v) and ok(v)]
+                  if k.split("@")[0] in ("ollama", "vllm") and v["decode"] and same(v) and ok(v)]
         # Comparable only when both sides counted the same domains: a total over the cards
         # alone against one that also counted the host is not a delta.
         mydom = by.get("loken", {}).get("jdom")
         othere = [v["jreq"] for k, v in by.items()
-                  if k in ("ollama", "vllm") and v["jreq"] and same(v) and ok(v)
+                  if k.split("@")[0] in ("ollama", "vllm") and v["jreq"] and same(v) and ok(v)
                   and v.get("jdom") == mydom]
-        order = sorted(e for e in by if e.startswith("ollama@"))
+        ollama_cols = sorted(e for e in by if e.startswith("ollama@"))
+        vllm_cols = sorted(e for e in by if e.startswith("vllm@"))
         variants = sorted(e for e in by if e.startswith("loken+"))
-        for eng in order + ["ollama", "vllm", "loken"] + variants:
+        for eng in ollama_cols + ["ollama"] + vllm_cols + ["vllm", "loken"] + variants:
             if eng not in by: continue
             v = by[eng]; dd = de = ""
             if eng.startswith("loken") and ok(v):
@@ -383,21 +383,28 @@ def load_all(results_dir):
         # A cell measured against an older reference keeps its place beside the newer one:
         # the version column exists so both can be read, and dropping the earlier rows
         # would throw away the only evidence of what the upgrade changed.
-        ver = json.load(open(p)).get("ollama_version")
-        day = __import__("datetime").datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        doc = json.load(open(p))
+        # The version each engine was measured with, read from the file. An engine whose row is
+        # here but whose version the file did not record keeps its bare key ("ollama"/"vllm") and
+        # is labelled without a number - never with the version installed now.
+        engine_vers = (("ollama", doc.get("ollama_version"), "Ollama"),
+                       ("vllm", doc.get("vllm_version"), "vLLM"))
+        meas_epoch, day = _measured_at(doc, p)
         for k, v in rows(p, mode, device).items():
-            if ver and "ollama" in v:
-                tag = "ollama@" + ver
-                v[tag] = v.pop("ollama")
-                VERS[tag] = "Ollama " + ver
+            for eng, ver, label in engine_vers:
+                if ver and eng in v:
+                    tag = eng + "@" + ver
+                    v[tag] = v.pop(eng)
+                    VERS[tag] = label + " " + ver
             for e in v.values():
                 e["day"] = day
             slot = merged.setdefault(k, {})
             for engine, entry in v.items():
-                mt = p.stat().st_mtime
-                if seen_at.get((k, engine), -1) > mt:
+                # Newer measurement wins, ranked by when it was MEASURED (the file's timestamp),
+                # not by the file's mtime - a version stamp touches mtime without re-measuring.
+                if seen_at.get((k, engine), -1) > meas_epoch:
                     continue
-                seen_at[(k, engine)] = mt
+                seen_at[(k, engine)] = meas_epoch
                 slot[engine] = entry
     return merged
 
