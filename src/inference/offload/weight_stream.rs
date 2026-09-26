@@ -82,7 +82,6 @@ impl<S: crate::tensor::quantized::gguf_source::GgufSource + ?Sized> WeightBytes
     }
 
     fn metadata_kv(&self) -> Vec<(String, crate::tensor::quantized::gguf_file::Value)> {
-        use crate::tensor::quantized::gguf_source::GgufMeta;
         self.0
             .metadata()
             .iter()
@@ -247,10 +246,8 @@ impl RemoteWeights {
         let meta_bytes = &payload[4 + mlen..];
         if !meta_bytes.is_empty() {
             use crate::tensor::quantized::gguf_source::GgufMeta;
-            let content = crate::tensor::quantized::gguf_file::Content::read(
-                &mut std::io::Cursor::new(meta_bytes),
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let content = crate::tensor::quantized::gguf_file::read_header_bytes(meta_bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             let mut mm = self.model_meta.lock().unwrap_or_else(|e| e.into_inner());
             *mm = content.metadata().clone();
         }

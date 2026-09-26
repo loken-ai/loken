@@ -393,7 +393,7 @@ pub fn best_cut(
         return None;
     }
     let mut best: Option<(f64, CutChoice)> = None;
-    let mut consider = |ms: f64, choice: CutChoice, best: &mut Option<(f64, CutChoice)>| {
+    let consider = |ms: f64, choice: CutChoice, best: &mut Option<(f64, CutChoice)>| {
         if best.map(|(b, _)| ms < b).unwrap_or(true) {
             *best = Some((ms, choice));
         }
@@ -469,9 +469,15 @@ pub fn plan_by_time(
     let orders: Vec<Vec<usize>> = if nodes.len() <= EXACT_ORDER_LIMIT {
         permutations((0..nodes.len()).collect())
     } else {
-        // Widest first once the exact search is too costly - the biggest node anchors the plan.
+        // Fastest first once the exact search is too costly: the node with the lowest
+        // measured per-layer time anchors the plan and the others follow by speed.
         let mut idx: Vec<usize> = (0..nodes.len()).collect();
-        idx.sort_by_key(|&i| std::cmp::Reverse(nodes[i].profile.vram));
+        idx.sort_by(|&a, &b| {
+            nodes[a]
+                .profile
+                .layer_ms
+                .total_cmp(&nodes[b].profile.layer_ms)
+        });
         vec![idx]
     };
     let mut best: Option<TimePlan> = None;

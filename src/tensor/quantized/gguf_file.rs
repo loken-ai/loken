@@ -655,6 +655,12 @@ fn read_facts_from<R: Read + Seek>(r: &mut R) -> Result<HeaderFacts> {
     Ok(facts)
 }
 
+/// Parses a header-only GGUF held in memory, such as the metadata a peer sends: no tensor
+/// data follows it, so nothing is copied beyond the header.
+pub fn read_header_bytes(bytes: &[u8]) -> Result<Content> {
+    Content::read(&mut std::io::Cursor::new(bytes))
+}
+
 pub fn open_header<P: AsRef<std::path::Path>>(path: P) -> Result<Content> {
     let path = path.as_ref();
     let mut f =
