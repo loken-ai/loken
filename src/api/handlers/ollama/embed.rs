@@ -46,16 +46,12 @@ pub(crate) async fn list_models(
     }
 }
 
-/// Version (GET /api/version) - Ollama-compatible
-/// The Ollama API level this server implements. Clients gate features on this
-/// number, so it names the Ollama release whose API is served, not this crate's
-/// version, which travels in the `Server` header and `/health`.
-pub(crate) const OLLAMA_API_VERSION: &str = "0.15.0";
-
+/// Version (GET /api/version) - Ollama-compatible endpoint.
+/// Reports loken's own version: this server is not an ollama release and does not name one.
 pub(crate) async fn ollama_version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "version": OLLAMA_API_VERSION,
-        "loken": env!("CARGO_PKG_VERSION"),
+        "version": env!("LOKEN_VERSION"),
+        "loken": env!("LOKEN_VERSION"),
         // Which build, not just which release: two binaries of one version answer
         // differently, and a measurement that cannot name the build cannot be compared
         // with another. "unknown" when built from a tarball with no repository.

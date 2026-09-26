@@ -21,7 +21,7 @@ use loken::{
 #[command(
     about = "Serve language, image, audio and video models locally. OpenAI- and Ollama-compatible."
 )]
-#[command(version)]
+#[command(version = env!("LOKEN_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

@@ -26,17 +26,41 @@ def _measured_at(doc, p):
 # for the engines that measured it (load_all folds them in as `ollama@<ver>`/`vllm@<ver>`); a file
 # that recorded none is labelled without a number rather than with a guess. That is why there is no
 # call here that asks the installed binary its version - that call was the bug.
-VERS = {"ollama": "Ollama", "vllm": "vLLM", "loken": "loken 0.1.0"}
+VERS = {"ollama": "Ollama", "vllm": "vLLM", "loken": "loken"}
 
-def engine_label(target):
+_DEV_VERSIONS = {}
+def _dev_version_at(epoch):
+    """The version a loken row that recorded none was built as: the Cargo.toml version of the
+    last commit before it was measured, as the pre-release it was (no release tag carries it).
+    None when the repository cannot answer."""
+    import subprocess
+    day = datetime.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
+    if day not in _DEV_VERSIONS:
+        try:
+            root = pathlib.Path(__file__).resolve().parent.parent
+            rev = subprocess.run(["git", "-C", str(root), "rev-list", "-1", "--before=" + day, "HEAD"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+            toml = subprocess.run(["git", "-C", str(root), "show", rev + ":Cargo.toml"],
+                                  capture_output=True, text=True, timeout=10).stdout if rev else ""
+            m = re.search(r'^version\s*=\s*"([^"]+)"', toml, re.M)
+            _DEV_VERSIONS[day] = m.group(1) + "-dev" if m else None
+        except Exception:
+            _DEV_VERSIONS[day] = None
+    return _DEV_VERSIONS[day]
+
+def engine_label(target, version=None):
     """The Engine column for a target. A variant of this engine is measured under the label
     "LOKEN+<drafter>" - the same binary with a drafter named in its configuration - and is
-    shown as "loken 0.1.0 + <drafter>" so a row can hold both without the two being confused,
-    and so the scoreboard can tell them apart by the " + "."""
+    shown as "loken <version> + <drafter>" so a row can hold both without the two being confused,
+    and so the scoreboard can tell them apart by the " + ". `version` is what the server said
+    when the row was measured; a row that recorded none is labelled without a number."""
+    base = VERS["loken"] + (" " + version if version else "")
+    if target == "loken":
+        return base
     if target in VERS:
         return VERS[target]
     if target.startswith("loken+"):
-        return VERS["loken"] + " + " + target[len("loken+"):]
+        return base + " + " + target[len("loken+"):]
     return target
 
 # Results measured before the project was renamed carry the old target name. They are the same
@@ -330,7 +354,7 @@ def cells(merged):
                 # iteration: the row says which, since a comparison that leaves a cell out reads
                 # as a cell that was not tried.
                 mark = "impossible" if v.get("impossible") else "failed"
-                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng)), " - ", " - ",
+                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), " - ", " - ",
                             " - ", " - ", " - ", " - ", mark, "", v.get("day", "")])
                 continue
             if not any(v[k] is not None for k in ("prefill", "decode", "ntok", "e2e", "jreq")):
@@ -343,7 +367,7 @@ def cells(merged):
             if not ok(v):
                 # The rates are withheld rather than shown with a caveat: a number in a
                 # performance column is read as performance, whatever sits beside it.
-                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng)), " - ", " - ",
+                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), " - ", " - ",
                             b(fmt(v["ntok"], 0)), " - ", " - ", " - ", "incoherent", "", v.get("day", "")])
                 continue
             if v["ntok"] is not None and v["ntok"] <= 1:
@@ -352,11 +376,11 @@ def cells(merged):
                 # tokens per second against a competitor, three times over, in cells where
                 # our own was empty. A cell that produced no answer says so. What the request
                 # itself cost still stands, because that part really was measured.
-                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng)), b(fmt(v["prefill"])),
+                out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), b(fmt(v["prefill"])),
                             " - ", b(fmt(v["ntok"], 0)), b(fmt(v["e2e"], 0)), b(fmt(v["jreq"], 0)),
                             " - ", "no answer", "", v.get("day", "")])
                 continue
-            out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng)), b(fmt(v["prefill"])),
+            out.append([model, str(ctx), prompt, mode, device, b(engine_label(eng, v.get("version"))), b(fmt(v["prefill"])),
                         b(fmt(v["decode"])), b(fmt(v["ntok"], 0)), b(fmt(v["e2e"], 0)),
                         b(fmt(v["jreq"], 0)), b(fmt(v["j"], 3)), dd, de, v.get("day", "")])
     return out
@@ -387,9 +411,12 @@ def load_all(results_dir):
         # The version each engine was measured with, read from the file. An engine whose row is
         # here but whose version the file did not record keeps its bare key ("ollama"/"vllm") and
         # is labelled without a number - never with the version installed now.
-        engine_vers = (("ollama", doc.get("ollama_version"), "Ollama"),
-                       ("vllm", doc.get("vllm_version"), "vLLM"))
+        said = lambda eng: ((doc.get("subjects") or {}).get(eng) or {}).get("says") or {}
+        engine_vers = (("ollama", said("ollama").get("version") or doc.get("ollama_version"), "Ollama"),
+                       ("vllm", said("vllm").get("version") or doc.get("vllm_version"), "vLLM"))
+        # loken keeps its key (the deltas compare against it); its version rides on the entry.
         meas_epoch, day = _measured_at(doc, p)
+        loken_ver = said("loken").get("version") or _dev_version_at(meas_epoch)
         for k, v in rows(p, mode, device).items():
             for eng, ver, label in engine_vers:
                 if ver and eng in v:
@@ -398,6 +425,9 @@ def load_all(results_dir):
                     VERS[tag] = label + " " + ver
             for e in v.values():
                 e["day"] = day
+            for eng, e in v.items():
+                if eng.startswith("loken") and loken_ver:
+                    e["version"] = loken_ver
             slot = merged.setdefault(k, {})
             for engine, entry in v.items():
                 # Newer measurement wins, ranked by when it was MEASURED (the file's timestamp),

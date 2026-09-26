@@ -14,7 +14,7 @@ use loken::api::{Client, Message, OllamaChatRequest, OllamaGenerateRequest};
 #[derive(Parser)]
 #[command(name = "loken")]
 #[command(about = "Talk to a lokend - pull and manage models, chat, generate. Ollama-compatible.")]
-#[command(version)]
+#[command(version = env!("LOKEN_VERSION"))]
 struct Cli {
     /// Address of the lokend to talk to. 11434 reaches an Ollama instead.
     #[arg(short, long, default_value = "http://localhost:11435")]

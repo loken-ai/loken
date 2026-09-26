@@ -61,7 +61,7 @@ def main(results_dir, brief=False):
     # win - qwen3:0.6b on the raw code-review prompt, where ollama emitted nothing but code
     # fences and we answered. Counting both as "incomparable" hides the difference, and I
     # reported "six degenerate models" when five were ours and the sixth was ollama's.
-    # A variant of this engine - the same binary plus a drafter, labelled "loken 0.1.0 + x" -
+    # A variant of this engine - the same binary plus a drafter, labelled "loken <version> + x" -
     # is a documented extra, not the engine being scored. It shares the cell key with the plain
     # row and would otherwise count twice for one cell.
     plain = lambda label: "loken" in label and " + " not in label

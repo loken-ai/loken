@@ -33,6 +33,7 @@ RUN_CARDS = os.environ.get("RUN_CARDS", "both cards")
 def latest_run_date():
     """The most recent date on which a short/stream row exists for both engines."""
     clean = lambda s: re.sub(r"[*\s  ]", "", s)
+    label = lambda s: s.replace("*", "").strip()
     seen = {}
     for line in (ROOT / "docs" / "BENCHMARKS.md").read_text().splitlines():
         if not line.startswith("| ") or line.startswith("|--"):
@@ -40,9 +41,9 @@ def latest_run_date():
         c = [x.strip() for x in line.strip().strip("|").split("|")]
         if len(c) < 15 or c[0] == "Model" or c[2] != PROMPT or c[3] != MODE:
             continue
-        seen.setdefault(c[14][:10], set()).add(clean(c[5]))
+        seen.setdefault(c[14][:10], set()).add(label(c[5]))
     days = [d for d, engs in seen.items()
-            if any(e.startswith("Ollama") for e in engs) and "loken0.1.0" in engs]
+            if any(e.startswith("Ollama") for e in engs) and loken_of(dict.fromkeys(engs, 0)) is not None]
     return max(days) if days else ""
 
 
@@ -52,12 +53,19 @@ def ollama_of(engines):
     return next((v for k, v in engines.items() if k.startswith("Ollama")), None)
 
 
+def loken_of(engines):
+    """The plain loken figure of a cell, whichever build measured it. A drafter variant is
+    labelled "loken <version> + <drafter>" and is not the engine being compared."""
+    return next((v for k, v in engines.items() if k.startswith("loken") and " + " not in k), None)
+
+
 RUN_DATE = os.environ.get("RUN_DATE") or latest_run_date()
 
 
 def bench_rows():
     """(model, engine) -> decode tok/s, for the run above."""
     clean = lambda s: re.sub(r"[*\s  ]", "", s)
+    label = lambda s: s.replace("*", "").strip()
     out = {}
     for line in (ROOT / "docs" / "BENCHMARKS.md").read_text().splitlines():
         if not line.startswith("| ") or line.startswith("|--"):
@@ -71,11 +79,11 @@ def bench_rows():
             decode = float(clean(c[7]))
         except ValueError:
             continue
-        out.setdefault(c[0], {})[clean(c[5])] = decode
+        out.setdefault(c[0], {})[label(c[5])] = decode
     return {
-        m: (ollama_of(e), e["loken0.1.0"])
+        m: (ollama_of(e), loken_of(e))
         for m, e in out.items()
-        if ollama_of(e) is not None and "loken0.1.0" in e
+        if ollama_of(e) is not None and loken_of(e) is not None
     }
 
 
@@ -159,7 +167,7 @@ def bar_chart(rows, path, header=None):
         )
     svg.append(
         f'<text class="h" x="{label_w}" y="{height - 14}">'
-        "GREY OLLAMA   GREEN LOKEN 0.1.0</text>"
+        "GREY OLLAMA   GREEN LOKEN</text>"
     )
     svg.append("</svg>")
     path.write_text("\n".join(svg) + "\n")
@@ -175,6 +183,7 @@ def section_cells():
     one slice of each.
     """
     clean = lambda s: re.sub(r"[*\s  ]", "", s)
+    label = lambda s: s.replace("*", "").strip()
     section, cells, total = None, {}, {}
     for line in (ROOT / "docs" / "BENCHMARKS.md").read_text().splitlines():
         if line.startswith("### "):
@@ -194,16 +203,16 @@ def section_cells():
             # A row marked impossible or failed carries no rate: an attempt, not a measure.
             continue
         total[section].add(key)
-        cells[section].setdefault(key, {})[clean(c[5])] = decode
+        cells[section].setdefault(key, {})[label(c[5])] = decode
     out = {}
     for sec, found in cells.items():
         pairs = {
             f"{m} {ctx} {prompt} {'S' if mode == 'stream' else 'NS'} {dev}": (
                 ollama_of(e),
-                e["loken0.1.0"],
+                loken_of(e),
             )
             for (m, ctx, prompt, mode, dev, _), e in found.items()
-            if ollama_of(e) is not None and "loken0.1.0" in e
+            if ollama_of(e) is not None and loken_of(e) is not None
         }
         if pairs:
             out[sec] = (pairs, len(total[sec]))

@@ -1263,7 +1263,7 @@ impl ChatCompletionResponse {
 /// Stable identifier surfaced as OpenAI's `system_fingerprint` field.
 /// Tied to the binary version so clients can detect backend updates
 /// between calls (helpful when comparing deterministic seed runs).
-const SYSTEM_FINGERPRINT: &str = concat!("loken-", env!("CARGO_PKG_VERSION"));
+const SYSTEM_FINGERPRINT: &str = concat!("loken-", env!("LOKEN_VERSION"));
 
 /// Chat completion choice
 #[derive(Debug, Clone, Serialize, Deserialize)]

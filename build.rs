@@ -26,6 +26,26 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=LOKEN_COMMIT={commit}");
 
+    // The version a build answers with. A commit carrying the release tag `v<version>` is that
+    // release; any other commit is pre-release work on top of it and says so in SemVer form,
+    // `<version>-dev+g<commit>`. A source archive without a repository is taken as the release
+    // it was cut from.
+    println!("cargo:rerun-if-changed=.git/refs/tags");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    let release = env!("CARGO_PKG_VERSION");
+    let at_release_tag = std::process::Command::new("git")
+        .args(["tag", "--points-at", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|tags| tags.lines().any(|t| t.trim() == format!("v{release}")));
+    let version = match at_release_tag {
+        Some(false) if commit != "unknown" => format!("{release}-dev+g{commit}"),
+        _ => release.to_string(),
+    };
+    println!("cargo:rustc-env=LOKEN_VERSION={version}");
+
     println!("cargo:rerun-if-changed=src/inference/sampling_kernels.cu");
     println!("cargo:rerun-if-changed=src/inference/sampling_kernels.h");
 

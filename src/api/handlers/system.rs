@@ -42,7 +42,7 @@ pub(crate) async fn health_check(
     Json(serde_json::json!({
         "status": "healthy",
         "service": "loken",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": env!("LOKEN_VERSION"),
         "time": chrono::Utc::now().to_rfc3339(),
         "uptime_seconds": uptime_s,
         "loaded_models": loaded_models,
