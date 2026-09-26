@@ -1711,9 +1711,8 @@ impl APIServer {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(model_id.to_string(), (p.layer_ms, p.miss_ms));
-                // With peers, decide the placement from the measured profiles now and record it.
-                // The decision is logged here; forming the pipeline it names is a later step. On a
-                // pair where a split does not pay, this says so, and serving stays on one node.
+                // With peers, decide the placement from the measured profiles and, when a split
+                // pays, form the pipeline it names. Otherwise serving stays on one node.
                 if let Some(cluster) = self.cluster.as_ref() {
                     if cluster.config.is_clustered() {
                         if let Some((attn, ebytes, ws, act)) = engine.placement_model_inputs().await

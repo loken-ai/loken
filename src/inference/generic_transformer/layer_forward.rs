@@ -1520,10 +1520,6 @@ impl GenericTransformerLayer {
         // applies to phi2-class single-token decode on CUDA with Q4_K
         // weights.
         //
-        // Wired but DISABLED: produces NaN sampling weights  -
-        // suspect a layout/scaling mismatch between standalone
-        // quantize_q8_1_pub and what attn_qkv expected from
-        // QMatMul.forward. Foundation infrastructure (try_phi2_shared_q8_1_qkv
         // Phi2 shared-Q8_1 fast path: pre-quantize x_norm to Q8_1 ONCE
         // and reuse for both attn_qkv and ffn_up matmuls (saves 1
         // quantize launch/layer = ~1-2% decode). Verified correct on

@@ -617,22 +617,12 @@ pub(super) fn try_spawn_continuous(
 /// If `state` holds a `cb_eligible` GPU `GenericHetero`, swap it for a `Continuous`
 /// worker (batched paged decode - beats serial 2.4-3.3x under concurrent load,
 /// with automatic prefix caching).
-///
-/// DISABLED IN CODE: the paged decode path returns INCORRECT output
-/// (garbage / immediate EOS) for any prompt that prefills >256 tokens (>16 KV
-/// blocks) - reproduced on mistral-nemo long-context, while the serial path is
-/// coherent and beats ollama. Slot mapping is consistent, so the fault is subtler
-/// in the paged prefill / first decode and needs tensor-dump instrumentation.
-/// Correctness wins over the unvalidated throughput gain, so the
-/// worker stays off (no knob) until the paged path is fixed - then delete this
-/// early return to restore it.
 pub(super) fn cb_maybe_wrap(state: &mut LoadedModelState) {
     #[cfg(feature = "cuda")]
     {
         // Opt-in via config.toml `[inference] continuous_batching = true`.
         // Default OFF: single-stream decode is faster on the serial path;
-        // CB is the concurrent-throughput (vLLM) regime. The paged-rope
-        // >256-prefill bug that originally forced this off was fixed.
+        // CB is the concurrent-throughput (vLLM) regime.
         let cb_enabled = crate::config::Config::load_default()
             .ok()
             .and_then(|c| c.inference.continuous_batching)

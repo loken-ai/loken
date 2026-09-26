@@ -53,7 +53,7 @@ configure one.
 | Speech, music, sound effects, separation | `/v1/audio/speech`, `/v1/audio/generations`, `/v1/audio/separate` | | Runs |
 | Energy per request | every answer | `[energy]` | Measured |
 | Replicated serving across machines | `/api/cluster/*` | `[cluster]` | Runs at one node, unmeasured at two |
-| Sharding one model across machines | | | Written, wired to nothing |
+| Sharding one model across machines | automatic at load | `[cluster]` | DeepSeek V4.1 only, unmeasured at two nodes |
 | Scrape endpoint | `/metrics` | feature `metrics` | Runs |
 | Authentication and rate limit | every route | `require_auth`, `api_keys`, `rate_limit_per_minute` | Runs, off by default |
 

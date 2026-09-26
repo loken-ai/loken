@@ -17,7 +17,7 @@
 //! `[n_q_heads*qlen, head_dim]`; the kernel addresses each kv-head's packed rows
 //! by the global row `h_kv*Mrows + r` and guards padding internally.
 //!
-//! Gated OFF by default (`LOKEN_FLASH_TC` env + a seq_kv-length floor); the
+//! Selected for head_dim 128 on Ampere tensor cores once seq_kv reaches `TC_MIN_KV`; the
 //! dispatch site in inference/generic_transformer/ falls back to split-K otherwise.
 
 use crate::tensor::cuda_ext::{CudaStorage, RawCudaDevice as CudaDevice};

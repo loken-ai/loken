@@ -143,12 +143,12 @@ A hand-over is priced on rates each node measures from its own completed generat
 from hardware nameplates - what a card could do is not what this build achieves on this model
 at this quantisation.
 
-**Sharding does not.** Pipeline parallelism across hosts, the binary data plane it needs, the
-link-cost matrix, the tiered KV, the resume path and the layer scheduler are all written and
-reached by nothing. That is not a claim from reading: `distributed::wiring_gate` records the
-state of every module in that directory and fails both when one of them is finally reached and
-when one that was reached falls silent. Cross-host layer execution refuses loudly rather than
-returning a placeholder.
+**Sharding runs for DeepSeek V4.1, unmeasured at two nodes.** At load, each node measures its
+own profile, the planner compares a split against local serving, and when a split pays the head
+forms a pipeline of any length over the binary data plane. A three-node loopback chain decodes
+bit-identically to one node. Other architectures cannot be a pipeline head. The link-cost
+matrix, the tiered KV, the resume path and the layer scheduler are still reached by nothing:
+`distributed::wiring_gate` records the state of every module in that directory.
 
 **One defect found, and its fix unverified at two nodes.** A node published a capacity derived
 from one generation's decode rate multiplied by its lane count, while its generations serialise

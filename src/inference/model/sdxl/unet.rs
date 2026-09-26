@@ -243,7 +243,7 @@ struct FeedForward {
     hidden: usize,
     /// This module's path in the checkpoint, recorded at load so an adapter can find
     /// its two projections. The feed-forward is a THIRD of an SDXL adapter's linear
-    /// entries and was not wired at all: attention alone is 560 of the 788 pairs in a
+    /// entries: attention alone is 560 of the 788 pairs in a
     /// stock LCM adapter, and applying part of a distillation is not applying it.
     path: String,
 }
