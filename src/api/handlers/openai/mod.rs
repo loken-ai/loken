@@ -46,6 +46,93 @@ fn decode_rate_suffix(first_token_at: Option<std::time::Instant>, tokens: u64) -
     )
 }
 
+/// Whole answers of `runs` generations gathered into one response: the first answer's
+/// fields, every answer's choices indexed in order, and the usage summed - the prompt
+/// once when every run read the same prompt, per run when `sum_prompts`.
+async fn merge_runs<F, Fut>(
+    runs: usize,
+    sum_prompts: bool,
+    mut run: F,
+) -> Result<Response, ApiError>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Response, ApiError>>,
+{
+    let mut merged: Option<serde_json::Value> = None;
+    let mut choices = Vec::new();
+    let (mut prompt_tokens, mut completion_tokens) = (0i64, 0i64);
+    for i in 0..runs {
+        let resp = run(i).await?;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .map_err(|e| ApiError::Internal(format!("n: {e}")))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| ApiError::Internal(format!("n: {e}")))?;
+        for c in v["choices"].as_array().into_iter().flatten() {
+            let mut c = c.clone();
+            c["index"] = serde_json::json!(choices.len());
+            choices.push(c);
+        }
+        let count = |key: &str| {
+            v.pointer(&format!("/usage/{key}"))
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+        };
+        if sum_prompts || i == 0 {
+            prompt_tokens += count("prompt_tokens");
+        }
+        completion_tokens += count("completion_tokens");
+        merged.get_or_insert(v);
+    }
+    let mut out = merged.unwrap_or_else(|| serde_json::json!({}));
+    out["choices"] = serde_json::Value::Array(choices);
+    if !out["usage"].is_object() {
+        out["usage"] = serde_json::json!({});
+    }
+    out["usage"]["prompt_tokens"] = serde_json::json!(prompt_tokens);
+    out["usage"]["completion_tokens"] = serde_json::json!(completion_tokens);
+    out["usage"]["total_tokens"] = serde_json::json!(prompt_tokens + completion_tokens);
+    Ok(Json(out).into_response())
+}
+
+/// A completions `prompt`: the string, or the strings of an array joined by newlines;
+/// `None` for any other shape.
+fn completion_prompt_text(body: &serde_json::Value) -> Option<String> {
+    match body.get("prompt")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(arr) => Some(
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
+/// The prompt with a non-empty `suffix` rendered as a fill-in-the-middle request, with
+/// the sentinels the coder models read, as `/api/generate` does.
+fn fim_wrapped(body: &serde_json::Value, prompt: String) -> String {
+    match body.get("suffix").and_then(serde_json::Value::as_str) {
+        Some(suffix) if !suffix.is_empty() => {
+            format!("<|fim_prefix|>{prompt}<|fim_suffix|>{suffix}<|fim_middle|>")
+        }
+        _ => prompt,
+    }
+}
+
+/// What a chat-completion request says about its prompt: the tools in the model's own
+/// syntax, the reasoning effort, and the grammar a structured output imposes.
+fn chat_prompt_spec(request: &ChatCompletionRequest) -> super::chat_prompt::PromptSpec<'_> {
+    super::chat_prompt::PromptSpec {
+        messages: &request.messages,
+        tools: request.tools.as_ref(),
+        tool_choice: request.tool_choice.as_ref(),
+        thinking: super::chat_prompt::thinking_from_effort(request.reasoning_effort.as_deref()),
+        output_grammar: response_format_to_grammar(request.response_format.as_ref()),
+    }
+}
+
 /// Chat completion (OpenAI-compatible format)
 pub(crate) async fn chat_completion(
     State(state): State<APIServer>,
@@ -75,10 +162,10 @@ pub(crate) async fn chat_completion(
     // returns the same 400 envelope ("messages length must be in [1, 4096]")
     // before we get here. Imperative check removed.
 
-    // Cap the OpenAI `user` field (folded into our session_id /
-    // KV-cache key). Without a cap, a single request can pin an
-    // arbitrary-sized String into the engine pool.
-    validate_user_id(request.user.as_deref())?;
+    // The sampling knobs, `stop`, `top_logprobs` and the `user` session key, bounded
+    // as on every other route.
+    let sampling = super::sampling::SamplingRequest::from_openai(&request);
+    sampling.validate()?;
 
     // OpenAI's allowed message roles. Anything else is a 400 - the
     // chat template would otherwise silently fold an unknown role
@@ -94,51 +181,8 @@ pub(crate) async fn chat_completion(
             }
         }
     }
-    // OpenAI caps `stop` at 4 entries - any more is almost certainly
-    // a client bug or attempted prompt-injection of a long list.
-    // Engine-side stop checks are O(stop_count x generated_tokens
-    //   x stop_string_len) per step so an unbounded list / unbounded
-    // entries adds real cost. Per-entry cap of 256 chars matches the
-    // longest legitimate stop pattern (verbose XML close-tags,
-    // multi-paragraph stop markers); typical entries are 1-10 chars.
-    if let Some(stop) = request.stop.as_ref() {
-        const STOP_ENTRY_MAX_CHARS: usize = 256;
-        let entries: Vec<&String> = match stop {
-            StopSequences::One(s) => vec![s],
-            StopSequences::Many(v) => v.iter().collect(),
-        };
-        if entries.len() > 4 {
-            return Err(ApiError::Validation(format!(
-                "`stop` has {} entries; OpenAI's documented cap is 4",
-                entries.len()
-            )));
-        }
-        for (i, s) in entries.iter().enumerate() {
-            if s.chars().count() > STOP_ENTRY_MAX_CHARS {
-                return Err(ApiError::Validation(format!(
-                    "`stop[{i}]` is {} chars; cap at {STOP_ENTRY_MAX_CHARS}",
-                    s.chars().count()
-                )));
-            }
-        }
-    }
-    // OpenAI's `n` (completions per call). The engine generates a
-    // single sequence per request; supporting n > 1 would require
-    // either rerunning the sampler with different seeds (cost = nx
-    // decode wall) or batched sampling (out-of-scope for the current
-    // graph-mode decode loop). Reject explicit n > 1 up front so SDK
-    // clients see a clear 400 instead of silently receiving one
-    // completion when they asked for several.
-    if let Some(n) = request.n {
-        if n == 0 {
-            return Err(ApiError::Validation("`n` must be >= 1".into()));
-        }
-    }
 
-    // Reject explicit logprobs requests up front - the sampler doesn't
-    // expose per-token top-K softmax data, and silently returning
-    // `logprobs: null` to callers expecting populated values is the
-    // worst kind of bug to debug. Mirrors the /v1/completions guard.
+    // Audio output is produced by /v1/audio/speech, not here.
     if let Some(m) = request.modalities.as_ref() {
         if m.iter().any(|x| x.eq_ignore_ascii_case("audio")) {
             return Err(ApiError::Validation(
@@ -146,59 +190,26 @@ pub(crate) async fn chat_completion(
             ));
         }
     }
-    // `n` > 1 is n completions of the same request, each with its own seed,
-    // gathered into one response; a stream carries one completion.
-    if let Some(n) = request.n.filter(|&n| n > 1) {
+    // `n` > 1 is n completions of the same request, each with its own seed, gathered
+    // into one response as on /v1/completions; a stream carries one completion.
+    let n = super::sampling::completions_asked(request.n.map(u64::from))?;
+    if n > 1 {
         if request.stream.unwrap_or(false) {
             return Err(ApiError::Validation(
                 "`n` > 1 is not supported with `stream`".into(),
             ));
         }
-        let mut merged: Option<serde_json::Value> = None;
-        let mut choices = Vec::new();
-        let mut completion_tokens = 0i64;
-        for i in 0..n {
+        return merge_runs(n, false, |i| {
             let mut one = request.clone();
             one.n = Some(1);
             one.seed = one.seed.map(|s| s.wrapping_add(i as u64));
-            let resp = Box::pin(chat_completion(
+            Box::pin(chat_completion(
                 State(state.clone()),
-                axum::http::HeaderMap::new(),
+                headers.clone(),
                 OpenAIJson(one),
             ))
-            .await?;
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .map_err(|e| ApiError::Internal(format!("n: {e}")))?;
-            let v: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|e| ApiError::Internal(format!("n: {e}")))?;
-            if let Some(c) = v.pointer("/choices/0") {
-                let mut c = c.clone();
-                c["index"] = serde_json::json!(i);
-                choices.push(c);
-            }
-            completion_tokens += v
-                .pointer("/usage/completion_tokens")
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            merged.get_or_insert(v);
-        }
-        let mut out = merged.unwrap_or_else(|| serde_json::json!({}));
-        out["choices"] = serde_json::Value::Array(choices);
-        let prompt_tokens = out
-            .pointer("/usage/prompt_tokens")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0);
-        out["usage"]["completion_tokens"] = serde_json::json!(completion_tokens);
-        out["usage"]["total_tokens"] = serde_json::json!(prompt_tokens + completion_tokens);
-        return Ok(Json(out).into_response());
-    }
-    if let Some(k) = request.top_logprobs {
-        if k > 20 {
-            return Err(ApiError::Validation(format!(
-                "`top_logprobs` = {k}; the cap is 20"
-            )));
-        }
+        })
+        .await;
     }
     // `tools` are handled below (injected into the prompt, then parsed
     // back out of the model output by crate::api::tool_calls). Nothing to
@@ -221,9 +232,17 @@ pub(crate) async fn chat_completion(
     validate_model_id(&request.model)?;
     // Normalize model ID
     let model_name = normalize_model_id(&request.model);
-    // The conversation goes where the model is.
-    if let Ok(body) = serde_json::to_value(&request) {
-        let prompt_text = body["messages"].to_string();
+    // The conversation goes where the model is. Peers are asked about the prompt this
+    // node would prefill, which is the text their caches are keyed on.
+    let clustered = state.cluster_handle().is_some();
+    if let Some(body) = clustered
+        .then(|| serde_json::to_value(&request).ok())
+        .flatten()
+    {
+        let prompt_text = state
+            .prepare_prompt(&model_name, None, &chat_prompt_spec(&request))
+            .await
+            .prompt;
         let max_tokens = body["max_completion_tokens"]
             .as_u64()
             .or_else(|| body["max_tokens"].as_u64())
@@ -314,65 +333,17 @@ pub(crate) async fn chat_completion(
     // Anthropic shim. OpenAI-compatible coding agents (Cline, Continue,
     // Aider) just name a model and expect it to be served - a 404 on the
     // first request breaks them. Falls through to the 404 below only if
-    // the model genuinely can't be loaded (missing weights, bad arch).
-    let keep_alive_minutes_oai = state.get_effective_keep_alive(None);
-    // The window this request asked for, where it asked: a model loaded without it would
-    // be loaded again a moment later to widen it.
-    if let Err(e) = state
-        .ensure_loaded_with_window(
+    // the model genuinely can't be loaded (missing weights, bad arch). The window and
+    // cache format asked in the headers are opened by the load itself.
+    let engine = state
+        .load_for_request(
             &model_name,
-            keep_alive_minutes_oai,
-            crate::api::gate::Window::from_headers(&headers),
+            super::admission::LoadRequest::from_headers(
+                &headers,
+                state.get_effective_keep_alive(None),
+            ),
         )
-        .await
-    {
-        // A model that exists and did not fit is not a model that does not exist. This
-        // answered 404 for both, so a chat request arriving while a render held the
-        // cards told the caller its model was missing - and a client that trusts 404
-        // stops asking for it. The load path escalates before giving up, so reaching
-        // here on memory means the machine is genuinely full right now.
-        let msg = e.to_lowercase();
-        if msg.contains("out of memory") || msg.contains("oom") {
-            return Err(ApiError::Internal(format!(
-                "Model '{model_name}' exists but the machine has no room for it right                  now: {e}. Retry once the current work finishes."
-            )));
-        }
-        return Err(ApiError::NotFound(format!(
-            "Model '{model_name}' could not be loaded: {e}"
-        )));
-    }
-    // A window asked for in the headers, applied the way `options.num_ctx` is on the
-    // Ollama route: above what the engine holds it reloads at that context, and the
-    // loader still bounds it by what the checkpoint declares.
-    // Asked before the window is, where both are asked: the cache format decides what a
-    // window costs, and settling it second would size the cache twice.
-    if let Some(want) = crate::api::gate::KvFormat::from_headers(&headers) {
-        if let Err(e) = state.ensure_engine_kv_quant(&model_name, want).await {
-            return Err(ApiError::Internal(format!(
-                "{} for '{model_name}': {e}",
-                crate::api::gate::KvFormat::HEADER
-            )));
-        }
-    }
-    if let Some(want) = crate::api::gate::Window::from_headers(&headers) {
-        if let Err(e) = state.ensure_engine_context(&model_name, want).await {
-            return Err(ApiError::Internal(format!(
-                "{} {want} for '{model_name}': {e}",
-                crate::api::gate::Window::HEADER
-            )));
-        }
-    }
-    let engine = match state.get_engine(&model_name).await {
-        Ok(engine) => engine,
-        Err(_) => {
-            return Err(ApiError::NotFound(format!(
-                "Model '{model_name}' not loaded. Pull it first with POST /api/pull."
-            )));
-        }
-    };
-
-    // Reset expiration timer on use (like Ollama)
-    state.reset_expiration(&model_name).await;
+        .await?;
 
     // What the model is actually served with, echoed back in the same header the request
     // may have asked in. A client that asks and is quietly clamped - by the checkpoint or
@@ -380,120 +351,22 @@ pub(crate) async fn chat_completion(
     // and the server would truncate them from the front without either side saying so.
     let served_window = engine.context_window().await;
 
-    // Build prompt using model-specific chat template. When tools are
-    // active, rewrite the message list to inject the tool definitions and
-    // round-trip any prior tool calls/results in the model's native marker
-    // syntax (crate::api::tool_calls), then format as usual.
-    let chat_template = state
-        .read_chat_template(&model_name)
-        .or_else(|| infer_template_from_model_name(&model_name));
-    let tools_active = crate::api::tool_calls::should_inject_tools(
-        request.tools.as_ref(),
-        request.tool_choice.as_ref(),
-    );
-    let tool_format =
-        crate::api::tool_calls::detect_tool_format(chat_template.as_deref(), &model_name);
-    let prompt = if tools_active {
-        let tools = request.tools.as_ref().unwrap();
-        let directive = crate::api::tool_calls::tool_choice_directive(request.tool_choice.as_ref());
-        let flattened = crate::api::tool_calls::flatten_messages(
-            &request.messages,
-            tool_format,
-            tools,
-            directive.as_deref(),
-        );
-        if template_takes_tools(chat_template.as_deref()) {
-            format_chat_prompt_with_tools(
-                &request.messages,
-                chat_template.as_deref(),
-                request.tools.as_deref().unwrap_or(&[]),
-            )
-        } else {
-            format_chat_prompt(&flattened, chat_template.as_deref())
-        }
-    } else {
-        format_chat_prompt(&request.messages, chat_template.as_deref())
-    };
-    let mut prompt = prompt;
-    // `none` and `minimal` switch thinking off where a template allows it; the levels
-    // reach a model that reads them (gpt-oss), and leave the others as they are.
-    if let Some(effort) = request
-        .reasoning_effort
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-    {
-        let pref = match effort.as_str() {
-            "none" | "minimal" => "disabled",
-            "low" | "medium" | "high" => effort.as_str(),
-            _ => "enabled",
-        };
-        super::prompt_format::apply_thinking_preference(&mut prompt, Some(pref));
-    }
-    // Whether the template already opened the thinking block; the splitter must know.
-    let thinking_opened = crate::api::thinking::prompt_opens_thinking(&prompt);
+    // The model's template with the tools in its own syntax, the caller's reasoning
+    // effort, and the grammar a structured output or a required call imposes.
+    let super::chat_prompt::PreparedPrompt {
+        prompt,
+        tools_active,
+        tool_format,
+        grammar,
+        thinking_opened,
+    } = state
+        .prepare_prompt(&model_name, Some(&engine), &chat_prompt_spec(&request))
+        .await;
     let single_tool_call = request.parallel_tool_calls == Some(false);
 
-    // OpenAI's `response_format` -> llguidance grammar spec.
-    // Accepted shapes:
-    //   {"type":"text"}                                     -> no grammar
-    //   {"type":"json_object"}                              -> generic object
-    //   {"type":"json_schema","json_schema":{"schema":...}} -> strict schema
-    let grammar = response_format_to_grammar(request.response_format.as_ref());
-
-    // Map OpenAI's frequency_penalty / presence_penalty (both
-    // -2.0..2.0, 0 = no penalty) onto our llama.cpp-style repeat_penalty
-    // (1.0 = no penalty, > 1 discourages repetition). When both fields
-    // are passed, sum them - the engine has only one repetition knob,
-    // and additive treatment matches how OpenAI's reference samplers
-    // compose the two penalties. The sum is clamped to the same
-    // [-2, 2] band each individual penalty was validated against,
-    // matching the /v1/completions path's behaviour (line 4029)  -
-    // otherwise both at +2 would yield `repeat_penalty = 5.0`,
-    // which is well outside the engine's expected range.
-    let oa_pen = (request.frequency_penalty.unwrap_or(0.0)
-        + request.presence_penalty.unwrap_or(0.0))
-    .clamp(-2.0, 2.0);
-    let repeat_penalty = if oa_pen.abs() > f32::EPSILON {
-        // 0 -> 1.0, +2 -> 3.0 (strong), -2 -> -1.0 (engine clamps
-        // negatives internally). Linear scale stays predictable.
-        Some(1.0 + oa_pen)
-    } else {
-        None
-    };
-
-    // Extract generation options from OpenAI request format.
-    // .take() on the Option fields avoids cloning the Vec<String>
-    // (stop sequences) and the user-id String into the params record.
-    // Validation already happened above; nothing past this point reads
-    // request.stop / request.user.
     let params = GenerationParams {
-        prefix_tokens: None,
-        max_tokens: request.completion_cap(),
-        temperature: request.temperature,
-        top_p: request.top_p,
-        top_k: None,
-        seed: request.seed,
-        stop_sequences: request
-            .stop
-            .take()
-            .map(crate::api::types::StopSequences::into_vec)
-            .unwrap_or_default(),
-        early_exit_threshold: None,
-        repeat_penalty,
-        repeat_last_n: None,  // Use server default
-        context_length: None, // OpenAI endpoint doesn't expose num_ctx
-        session_id: request.user.take(),
         grammar,
-        logit_bias: request.logit_bias.as_ref().map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| k.parse::<u32>().ok().map(|id| (id, *v)))
-                .collect()
-        }),
-        top_logprobs: if request.logprobs == Some(true) {
-            Some(request.top_logprobs.unwrap_or(0) as usize)
-        } else {
-            None
-        },
+        ..sampling.into_params()
     };
 
     // The body has no field for this, so it is read from the headers: a client with
@@ -502,30 +375,18 @@ pub(crate) async fn chat_completion(
     let oai_priority = crate::api::gate::Priority::from_headers(&headers)
         .unwrap_or(crate::api::gate::Priority::Interactive);
 
-    if stream {
-        let gate_guard = acquire_gate(
-            &state,
+    // The gate, the in-flight count and the last user turn's images.
+    let admission = state
+        .admit(
+            engine.clone(),
+            &model_name,
             oai_priority,
-            model_name.clone(),
             "/v1/chat/completions",
+            &super::chat_prompt::last_user_images(&request.messages),
         )
         .await?;
-        // Cap captured so the stream closure can report
-        // finish_reason="length" once it produces the cap-th token.
-        // The last user turn's images go to the vision encoder; none clears what an
-        // earlier request left there. After the gate: both take the model lock.
-        let images: Vec<String> = request
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .and_then(|m| m.images.clone())
-            .unwrap_or_default();
-        if images.is_empty() {
-            engine.clear_images().await;
-        } else if let Err(e) = engine.set_images(&images).await {
-            return Err(ApiError::Validation(format!("images: {e}")));
-        }
+
+    if stream {
         let max_tokens_cap = request.completion_cap();
         // Estimate prompt token count once for the trailing usage chunk
         // (when stream_options.include_usage=true). Cheap heuristic  -
@@ -553,7 +414,7 @@ pub(crate) async fn chat_completion(
                 let created_at = chrono::Utc::now().timestamp();
                 let stream_started = std::time::Instant::now();
                 let stream = async_stream::stream! {
-                    let _gate_held = gate_guard;
+                    let _admitted = admission;
                     // First chunk: role indicator
                     let mut role_chunk = ChatCompletionChunk::new_delta_at(
                         &completion_id,
@@ -764,15 +625,17 @@ pub(crate) async fn chat_completion(
                     // every streamed request look slower per token than it was, by
                     // whatever margin the estimate was wrong - on source code, nearly
                     // double.
-                    let (in_tokens, out_tokens) = match stats.as_ref() {
-                        Some(s) => (
-                            (s.prompt_eval_count + s.cached_prompt_tokens) as i32,
-                            s.eval_count as i32,
+                    // The cached share is reported as the whole answer reports it.
+                    let mut usage = match stats.as_ref() {
+                        Some(s) => Usage::from_counts(
+                            s.prompt_eval_count,
+                            s.cached_prompt_tokens,
+                            s.eval_count,
                         ),
-                        None => (prompt_tokens, token_count),
+                        None => Usage::new(prompt_tokens, token_count),
                     };
+                    let (in_tokens, out_tokens) = (usage.prompt_tokens, usage.completion_tokens);
                     if include_usage {
-                        let mut usage = Usage::new(in_tokens, out_tokens);
                         if !reasoning_acc.is_empty() {
                             if let (Some(n), Some(d)) = (
                                 engine_for_stats.count_tokens(&reasoning_acc).await,
@@ -827,28 +690,7 @@ pub(crate) async fn chat_completion(
             }
         }
     } else {
-        let _gate_guard = acquire_gate(
-            &state,
-            oai_priority,
-            model_name.clone(),
-            "/v1/chat/completions",
-        )
-        .await?;
-        // Non-streaming response
-        // The last user turn's images go to the vision encoder; none clears what an
-        // earlier request left there. After the gate: both take the model lock.
-        let images: Vec<String> = request
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .and_then(|m| m.images.clone())
-            .unwrap_or_default();
-        if images.is_empty() {
-            engine.clear_images().await;
-        } else if let Err(e) = engine.set_images(&images).await {
-            return Err(ApiError::Validation(format!("images: {e}")));
-        }
+        let _admitted = admission;
         // `mut` bindings with `None` defaults trigger an
         // "assigned-never-read" warning because the only path that
         // reads timing is the Ok arm (which always overwrites).
@@ -858,7 +700,7 @@ pub(crate) async fn chat_completion(
         let timing_decode_ms: Option<f64>;
         let _cancel = engine.cancel_guard();
         let result_logprobs: Vec<crate::inference::engine::llm_engine::TokenLogprob>;
-        let (content, finish_reason, completion_tokens, prompt_tokens) =
+        let (content, finish_reason, completion_tokens, prompt_tokens, cached_tokens) =
             match engine.generate(&prompt, params).await {
                 Ok(result) => {
                     result_logprobs = result.logprobs.clone();
@@ -874,7 +716,8 @@ pub(crate) async fn chat_completion(
                         result.text,
                         reason.to_string(),
                         result.eval_count as i32,
-                        result.prompt_eval_count as i32,
+                        result.prompt_eval_count,
+                        result.cached_prompt_tokens,
                     )
                 }
                 Err(e) => {
@@ -928,7 +771,7 @@ pub(crate) async fn chat_completion(
             format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             model_name,
             vec![choice],
-            Usage::new(prompt_tokens, completion_tokens),
+            Usage::from_counts(prompt_tokens, cached_tokens, completion_tokens as u64),
         );
         if let Some(r) = reasoning.as_deref() {
             if let (Some(n), Some(d)) = (
@@ -947,8 +790,9 @@ pub(crate) async fn chat_completion(
         }
 
         info!(
-            "Chat completion: prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} finish={finish_for_log}{timing}",
-            timing = match (timing_prefill_ms, timing_decode_ms) {
+            "Chat completion: prompt_tokens={} cached={cached_tokens} completion_tokens={completion_tokens} finish={finish_for_log}{timing}",
+            response.usage.prompt_tokens,
+            timing =match (timing_prefill_ms, timing_decode_ms) {
                 (Some(p), Some(d)) => {
                     // Sub-millisecond decode is almost always
                     // `max_tokens=1` or an early EOS - reporting a
@@ -999,7 +843,7 @@ const JSON_SCHEMA_MAX_BYTES: usize = 64 * 1024;
 /// engine, returning None when the serialized form exceeds the cap.
 /// Centralised so both response_format and Ollama format paths apply
 /// the same bound.
-fn json_schema_grammar_str(schema: &serde_json::Value) -> Option<String> {
+pub(crate) fn json_schema_grammar_str(schema: &serde_json::Value) -> Option<String> {
     let serialized = schema.to_string();
     if serialized.len() > JSON_SCHEMA_MAX_BYTES {
         // Falling back to None matches the "unknown shape ⇒ None" policy
@@ -1074,7 +918,7 @@ pub(crate) async fn text_completions(
     // The completion goes where the model is.
     {
         let model_name = crate::api::handlers::normalize_model_id(&model);
-        let prompt_text = body["prompt"].to_string();
+        let prompt_text = fim_wrapped(&body, completion_prompt_text(&body).unwrap_or_default());
         let max_tokens = body["max_tokens"]
             .as_u64()
             .unwrap_or(state.default_inference_config.max_tokens as u64)
@@ -1107,68 +951,27 @@ pub(crate) async fn text_completions(
                         .into(),
                 ));
             }
-            let mut merged: Option<serde_json::Value> = None;
-            let mut choices = Vec::new();
-            let mut prompt_tokens = 0i64;
-            let mut completion_tokens = 0i64;
-            for (i, one) in arr.iter().enumerate() {
+            return merge_runs(arr.len(), true, |i| {
                 let mut single = body.clone();
-                single["prompt"] = one.clone();
-                let resp = Box::pin(text_completions(
+                single["prompt"] = arr[i].clone();
+                Box::pin(text_completions(
                     State(state.clone()),
                     headers.clone(),
                     Json(single),
                 ))
-                .await?;
-                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                    .await
-                    .map_err(|e| ApiError::Internal(format!("prompts: {e}")))?;
-                let v: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|e| ApiError::Internal(format!("prompts: {e}")))?;
-                if let Some(c) = v.pointer("/choices/0") {
-                    let mut c = c.clone();
-                    c["index"] = serde_json::json!(i);
-                    choices.push(c);
-                }
-                prompt_tokens += v
-                    .pointer("/usage/prompt_tokens")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                completion_tokens += v
-                    .pointer("/usage/completion_tokens")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                merged.get_or_insert(v);
-            }
-            let mut out = merged.unwrap_or_else(|| serde_json::json!({}));
-            out["choices"] = serde_json::Value::Array(choices);
-            out["usage"] = serde_json::json!({
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            });
-            return Ok(Json(out).into_response());
+            })
+            .await;
         }
     }
     // Empty / whitespace-only / oversized / path-traversal model IDs are
     // all rejected by `validate_model_id` below with the same 400 envelope  -
     // no separate early check needed.
-    // OpenAI accepts string OR array-of-strings for `prompt`. Multi-prompt
-    // batches map to n independent generations - we don't yet support
-    // that in one call; flatten by joining with newlines so the model
-    // sees the same conceptual input. Most clients pass a single string.
-    let prompt: String = match body.get("prompt") {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Some(_) | None => {
-            return Err(ApiError::Validation(
-                "`prompt` must be a string or array of strings".to_string(),
-            ));
-        }
+    // OpenAI accepts a string or an array of strings for `prompt`; an array of several
+    // was fanned out above.
+    let Some(prompt) = completion_prompt_text(&body) else {
+        return Err(ApiError::Validation(
+            "`prompt` must be a string or array of strings".to_string(),
+        ));
     };
     if prompt.trim().is_empty() {
         return Err(ApiError::Validation(
@@ -1206,18 +1009,14 @@ pub(crate) async fn text_completions(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    // `logprobs` requests need top-K per-token softmax exposure that
-    // the sampler doesn't currently surface. Fail fast with a clear
-    // 400 instead of returning `logprobs: null` to clients expecting
-    // populated data - the latter looks like a silent compute miss.
-    // Accept the explicit `logprobs: null` / 0 forms (no-op).
-    // `logprobs: n` asks for each token's log-probability with `n` alternatives.
-    let completion_logprobs: Option<usize> = match body.get("logprobs") {
-        Some(serde_json::Value::Number(n)) => n.as_u64().map(|v| v.min(20) as usize),
-        Some(serde_json::Value::Bool(true)) => Some(0),
-        _ => None,
-    };
-    // Same fail-fast for `best_of` (sample N, return top 1) - would
+    // The sampling knobs, `stop`, `logprobs` and the `user` session key, bounded as on
+    // every other route. `logprobs: n` asks for each token's log-probability with `n`
+    // alternatives.
+    let sampling = super::sampling::SamplingRequest::from_completions(&body);
+    sampling.validate()?;
+    let completion_logprobs = sampling.top_logprobs.map(|v| v as usize);
+
+    // Fail-fast for `best_of` (sample N, return top 1) - would
     // require Nx decode + ranking. Default 1 / null is fine; > 1 is
     // rejected so clients don't think they're getting best-of-N output
     // when they're really getting a single sample.
@@ -1239,12 +1038,7 @@ pub(crate) async fn text_completions(
         .get("echo")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let prompt = match body.get("suffix").and_then(serde_json::Value::as_str) {
-        Some(suffix) if !suffix.is_empty() => {
-            format!("<|fim_prefix|>{prompt}<|fim_suffix|>{suffix}<|fim_middle|>")
-        }
-        _ => prompt,
-    };
+    let prompt = fim_wrapped(&body, prompt);
     let echo_text = if echo {
         body.get("prompt")
             .and_then(serde_json::Value::as_str)
@@ -1253,107 +1047,28 @@ pub(crate) async fn text_completions(
     } else {
         String::new()
     };
-    // Cap the OpenAI `user` field - same rationale as the chat path
-    // (folded into session_id / KV-cache key, must not be unbounded).
-    validate_user_id(body.get("user").and_then(|v| v.as_str()))?;
-    // Range validation for sampling knobs - parity with the
-    // ChatCompletionRequest validator (which uses #[validate(range)])
-    // so /v1/completions doesn't silently accept temperature=-1 or
-    // top_p=1.5 and then produce surprising output.
-    if let Some(t) = body.get("temperature").and_then(serde_json::Value::as_f64) {
-        if !(0.0..=2.0).contains(&t) || !t.is_finite() {
-            return Err(ApiError::Validation(format!(
-                "`temperature` must be in [0, 2]; got {t}"
-            )));
+    // `n` > 1 is n completions of the same prompt, each with its own seed, gathered into
+    // one response as on /v1/chat/completions; a stream carries one completion.
+    let n = super::sampling::completions_asked(body.get("n").and_then(serde_json::Value::as_u64))?;
+    if n > 1 {
+        if stream {
+            return Err(ApiError::Validation(
+                "`n` > 1 is not supported with `stream`".into(),
+            ));
         }
-    }
-    if let Some(p) = body.get("top_p").and_then(serde_json::Value::as_f64) {
-        if !(0.0..=1.0).contains(&p) || !p.is_finite() {
-            return Err(ApiError::Validation(format!(
-                "`top_p` must be in [0, 1]; got {p}"
-            )));
-        }
-    }
-    if let Some(fp) = body
-        .get("frequency_penalty")
-        .and_then(serde_json::Value::as_f64)
-    {
-        if !(-2.0..=2.0).contains(&fp) || !fp.is_finite() {
-            return Err(ApiError::Validation(format!(
-                "`frequency_penalty` must be in [-2, 2]; got {fp}"
-            )));
-        }
-    }
-    if let Some(pp) = body
-        .get("presence_penalty")
-        .and_then(serde_json::Value::as_f64)
-    {
-        if !(-2.0..=2.0).contains(&pp) || !pp.is_finite() {
-            return Err(ApiError::Validation(format!(
-                "`presence_penalty` must be in [-2, 2]; got {pp}"
-            )));
-        }
-    }
-    if let Some(mt) = body.get("max_tokens").and_then(serde_json::Value::as_i64) {
-        if mt < 1 {
-            return Err(ApiError::Validation(format!(
-                "`max_tokens` must be >= 1; got {mt}"
-            )));
-        }
-        // Same upper bound as ChatCompletionRequest::max_tokens  -
-        // largest practical decode budget across the perimeter
-        // (128K-context models). Caps a `max_tokens: i64::MAX` request
-        // that would otherwise spin the decode loop forever.
-        if mt > 131072 {
-            return Err(ApiError::Validation(format!(
-                "`max_tokens` is {mt}; cap at 131072 (128K). Issue a follow-up request for longer continuations."
-            )));
-        }
-    }
-
-    // Same `stop` cap as chat-completions (0557dc3) - OpenAI's
-    // documented limit is 4 entries, plus a per-entry char cap so a
-    // single 1-GB stop string can't tie up the per-step matcher.
-    const STOP_ENTRY_MAX_CHARS: usize = 256;
-    if let Some(arr) = body.get("stop").and_then(|v| v.as_array()) {
-        if arr.len() > 4 {
-            return Err(ApiError::Validation(format!(
-                "`stop` has {} entries; OpenAI's documented cap is 4",
-                arr.len()
-            )));
-        }
-        for (i, v) in arr.iter().enumerate() {
-            if let Some(s) = v.as_str() {
-                if s.chars().count() > STOP_ENTRY_MAX_CHARS {
-                    return Err(ApiError::Validation(format!(
-                        "`stop[{i}]` is {} chars; cap at {STOP_ENTRY_MAX_CHARS}",
-                        s.chars().count()
-                    )));
-                }
+        return merge_runs(n, false, |i| {
+            let mut one = body.clone();
+            one["n"] = serde_json::json!(1);
+            if let Some(seed) = body.get("seed").and_then(serde_json::Value::as_u64) {
+                one["seed"] = serde_json::json!(seed.wrapping_add(i as u64));
             }
-        }
-    } else if let Some(s) = body.get("stop").and_then(|v| v.as_str()) {
-        // Single-string form (OpenAI accepts both shapes here).
-        if s.chars().count() > STOP_ENTRY_MAX_CHARS {
-            return Err(ApiError::Validation(format!(
-                "`stop` is {} chars; cap at {STOP_ENTRY_MAX_CHARS}",
-                s.chars().count()
-            )));
-        }
-    }
-    // Reject `n > 1` up front - engine generates one sequence per
-    // request (see the matching guard in /v1/chat/completions). The
-    // /v1/completions surface is even more likely to receive n>1 from
-    // legacy SDKs.
-    if let Some(n) = body.get("n").and_then(serde_json::Value::as_u64) {
-        if n == 0 {
-            return Err(ApiError::Validation("`n` must be >= 1".into()));
-        }
-        if n > 1 {
-            return Err(ApiError::Validation(format!(
-                "`n` = {n} not supported; only n=1 is generated per request - issue {n} requests in parallel for distinct samples"
-            )));
-        }
+            Box::pin(text_completions(
+                State(state.clone()),
+                headers.clone(),
+                Json(one),
+            ))
+        })
+        .await;
     }
 
     validate_model_id(&model)?;
@@ -1393,136 +1108,45 @@ pub(crate) async fn text_completions(
         },
     );
 
-    // LOAD IT, like /v1/chat/completions does.
-    //
-    // These two endpoints are the same server speaking the same protocol, and they
-    // disagreed: chat auto-loads on first use, while this one answered "not loaded,
-    // pull it first" for a model already on disk - naming a fix (`POST /api/pull`) that
-    // would download what is already there. Any tool that reaches for /v1/completions
-    // rather than the chat route saw a server that did not have its models.
-    let keep_alive_minutes = state.get_effective_keep_alive(None);
-    if let Err(e) = state.ensure_loaded(&model_name, keep_alive_minutes).await {
-        let msg = e.to_lowercase();
-        if msg.contains("out of memory") || msg.contains("oom") {
-            return Err(ApiError::Internal(format!(
-                "Model '{model_name}' exists but the machine has no room for it right                  now: {e}. Retry once the current work finishes."
-            )));
-        }
-        return Err(ApiError::NotFound(format!(
-            "Model '{model_name}' could not be loaded: {e}"
-        )));
-    }
-    // A window asked for in the headers, as on the chat route: completions are the
-    // editor's route, and an editor that sends a long prefix needs the same say.
-    // Asked before the window is, where both are asked: the cache format decides what a
-    // window costs, and settling it second would size the cache twice.
-    if let Some(want) = crate::api::gate::KvFormat::from_headers(&headers) {
-        if let Err(e) = state.ensure_engine_kv_quant(&model_name, want).await {
-            return Err(ApiError::Internal(format!(
-                "{} for '{model_name}': {e}",
-                crate::api::gate::KvFormat::HEADER
-            )));
-        }
-    }
-    if let Some(want) = crate::api::gate::Window::from_headers(&headers) {
-        if let Err(e) = state.ensure_engine_context(&model_name, want).await {
-            return Err(ApiError::Internal(format!(
-                "{} {want} for '{model_name}': {e}",
-                crate::api::gate::Window::HEADER
-            )));
-        }
-    }
-    let engine = match state.get_engine(&model_name).await {
-        Ok(e) => e,
-        Err(_) => {
-            return Err(ApiError::NotFound(format!(
-                "Model '{model_name}' could not be loaded."
-            )));
-        }
-    };
-    state.reset_expiration(&model_name).await;
+    // Loaded on first use, as on the chat route, in the window and cache format the
+    // headers ask for: an editor sending a long prefix needs the same say.
+    let engine = state
+        .load_for_request(
+            &model_name,
+            super::admission::LoadRequest::from_headers(
+                &headers,
+                state.get_effective_keep_alive(None),
+            ),
+        )
+        .await?;
 
+    // `response_format` is documented on /v1/chat/completions and several SDKs send it
+    // here too: the same grammar engine serves both.
     let params = GenerationParams {
-        prefix_tokens: None,
-        max_tokens: body
-            .get("max_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize),
-        temperature: body
-            .get("temperature")
-            .and_then(serde_json::Value::as_f64)
-            .map(|v| v as f32),
-        top_p: body
-            .get("top_p")
-            .and_then(serde_json::Value::as_f64)
-            .map(|v| v as f32),
-        top_k: None,
-        seed: body.get("seed").and_then(serde_json::Value::as_u64),
-        // One string or a list of them, both accepted; anything else asks for no stop
-        // sequence at all. A list entry that is not a string is dropped rather than
-        // refusing the whole list, so a caller gets the part of it that is readable.
-        stop_sequences: match body.get("stop") {
-            Some(serde_json::Value::String(one)) => vec![one.clone()],
-            Some(serde_json::Value::Array(list)) => list
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .collect(),
-            _ => Vec::new(),
-        },
-        early_exit_threshold: None,
-        repeat_penalty: None,
-        repeat_last_n: None,
-        context_length: None,
-        session_id: body
-            .get("user")
-            .and_then(|v| v.as_str())
-            .map(std::string::ToString::to_string),
-        // OpenAI's `response_format` is documented on /v1/chat/completions
-        // but several SDKs send it on /v1/completions too. Wire it to the
-        // same grammar engine so structured outputs work either way.
         grammar: response_format_to_grammar(body.get("response_format")),
-        logit_bias: None,
-        top_logprobs: completion_logprobs,
-    };
-    // OpenAI's frequency/presence penalties - same additive mapping
-    // as the chat-completions handler. Out-of-range values are
-    // clamped here rather than rejected (no validator on this
-    // free-form Value body); same end behaviour as the engine's
-    // internal clamps.
-    let freq_pen = body
-        .get("frequency_penalty")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0)
-        + body
-            .get("presence_penalty")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0);
-    let params = if freq_pen.abs() > f64::EPSILON {
-        GenerationParams {
-            repeat_penalty: Some((1.0 + freq_pen.clamp(-2.0, 2.0)) as f32),
-            ..params
-        }
-    } else {
-        params
+        ..sampling.into_params()
     };
 
     let oai_priority = crate::api::gate::Priority::from_headers(&headers)
         .unwrap_or(crate::api::gate::Priority::Interactive);
     let completion_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let created = chrono::Utc::now().timestamp();
-    // Estimator-based prompt token count, used by the streaming usage
-    // chunk. Stream paths don't get a GenerationResult so we can't
-    // surface the real tokenizer count there.
+    // The prompt count a stream reports when the engine publishes no statistics.
     let prompt_tokens_est = estimate_token_count(&prompt) as u32;
+    // The gate (a continuously batching model takes concurrent requests in its own
+    // worker), the in-flight count, and no images: a completion carries none, and what an
+    // earlier request encoded must not answer this one.
+    let admission = state
+        .admit(
+            engine.clone(),
+            &model_name,
+            oai_priority,
+            "/v1/completions",
+            &[],
+        )
+        .await?;
 
     if stream {
-        // CB-served models skip the single-request gate (batch in their worker).
-        let gate_guard = if engine.is_continuous().await {
-            None
-        } else {
-            Some(acquire_gate(&state, oai_priority, model_name.clone(), "/v1/completions").await?)
-        };
         // Capture max_tokens before moving params so the terminal
         // chunk can report `finish_reason: "length"` when we hit the
         // cap (was hardcoded "stop" regardless).
@@ -1538,7 +1162,7 @@ pub(crate) async fn text_completions(
         let mut echo_pending = echo_text.clone();
         let mut text_offset = echo_text.len();
         let stream = async_stream::stream! {
-            let _gate_held = gate_guard;
+            let _admitted = admission;
             let mut rx = rx;
             let mut tokens: u32 = 0;
             let mut first_token_at: Option<std::time::Instant> = None;
@@ -1601,11 +1225,12 @@ pub(crate) async fn text_completions(
             // finish_reason="stop", so otherwise the stream ends with
             // two terminal markers (same fix as the chat-completion +
             // /api/chat streams).
+            let stats = engine_for_stats.take_last_stream_stats();
             if !errored {
                 // Match the non-stream path's `finish_reason` logic:
                 // "length" when we produced exactly `max_tokens`,
                 // "stop" otherwise (EOS / stop sequence / natural end).
-                let finish_reason = match engine_for_stats.take_last_stream_stats() {
+                let finish_reason = match stats.as_ref() {
                     Some(st) => st.finish_reason.openai(),
                     None => match max_tokens_cap {
                         Some(cap) if (tokens as usize) >= cap => "length",
@@ -1626,6 +1251,12 @@ pub(crate) async fn text_completions(
                 });
                 yield Ok(Event::default().data(stop.to_string()));
             }
+            // What the engine counted, the estimate only where it said nothing; the
+            // cached share as the whole answer reports it.
+            let usage = match stats.as_ref() {
+                Some(s) => Usage::from_counts(s.prompt_eval_count, s.cached_prompt_tokens, s.eval_count),
+                None => Usage::new(prompt_tokens_est as i32, tokens as i32),
+            };
             if include_usage {
                 let usage = serde_json::json!({
                     "id": cid,
@@ -1633,11 +1264,7 @@ pub(crate) async fn text_completions(
                     "created": created,
                     "model": mn,
                     "choices": [],
-                    "usage": {
-                        "prompt_tokens": prompt_tokens_est,
-                        "completion_tokens": tokens,
-                        "total_tokens": prompt_tokens_est + tokens,
-                    },
+                    "usage": usage,
                 });
                 yield Ok(Event::default().data(usage.to_string()));
             }
@@ -1654,13 +1281,7 @@ pub(crate) async fn text_completions(
             .into_response());
     }
 
-    // CB-served models skip the single-request gate (they batch in their own
-    // worker) so concurrent /v1/completions reach the worker together.
-    let _gate_guard = if engine.is_continuous().await {
-        None
-    } else {
-        Some(acquire_gate(&state, oai_priority, model_name.clone(), "/v1/completions").await?)
-    };
+    let _admitted = admission;
     let _cancel = engine.cancel_guard();
     let result = engine
         .generate(&prompt, params)
@@ -1684,11 +1305,11 @@ pub(crate) async fn text_completions(
             },
             "finish_reason": finish,
         }],
-        "usage": {
-            "prompt_tokens": result.prompt_eval_count,
-            "completion_tokens": result.eval_count,
-            "total_tokens": result.prompt_eval_count + result.eval_count,
-        },
+        "usage": Usage::from_counts(
+            result.prompt_eval_count,
+            result.cached_prompt_tokens,
+            result.eval_count,
+        ),
     });
     let rate = if decode_ms >= 1.0 {
         format!(

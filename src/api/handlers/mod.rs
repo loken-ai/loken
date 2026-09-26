@@ -56,10 +56,12 @@ macro_rules! to_json_string {
     };
 }
 
+mod admission;
 mod anthropic_api;
 #[cfg(feature = "audio")]
 mod audio;
 mod catalogue;
+mod chat_prompt;
 mod cluster_catalogue;
 mod convert;
 #[cfg(feature = "image")]
@@ -70,6 +72,7 @@ mod model_manager;
 mod ollama;
 mod openai;
 mod prompt_format;
+mod sampling;
 #[cfg(feature = "audio")]
 mod separate;
 mod system;
@@ -132,35 +135,32 @@ fn clamp_finite_f32(v: f32, lo: f32, hi: f32, default: f32) -> f32 {
     }
 }
 
-/// Cap for OpenAI's `user` field (also the Ollama `options.session_id`
-/// extension). The value flows directly into the KV cache HashMap as
-/// the per-session key - without a cap, a single client request can
-/// pin an arbitrary-sized String into the engine pool. 256 chars
-/// matches OpenAI's documented user-id ceiling. Empty/None is fine
-/// (no session reuse for that turn).
+/// Cap for a session key: OpenAI's `user` field, the Ollama `options.session_id`
+/// extension. The value keys the engine's KV-cache map, so it is bounded, and it reaches
+/// log lines, so it holds no control character. 256 bytes matches OpenAI's documented
+/// user-id ceiling. Empty or absent is fine: no session is reused for that turn.
+const SESSION_KEY_MAX_BYTES: usize = 256;
+
+#[cfg(test)]
 fn validate_user_id(user: Option<&str>) -> Result<(), ApiError> {
-    let Some(u) = user else {
+    validate_session_key("user", user)
+}
+
+/// The session-key bounds, for a field of any name.
+pub(crate) fn validate_session_key(field: &str, key: Option<&str>) -> Result<(), ApiError> {
+    let Some(u) = key.filter(|u| !u.is_empty()) else {
         return Ok(());
     };
-    // Empty string ≡ None for our purposes (no session is keyed off it
-    // anyway). Reject non-empty oversized values.
-    if u.is_empty() {
-        return Ok(());
-    }
-    if u.len() > 256 {
+    if u.len() > SESSION_KEY_MAX_BYTES {
         return Err(ApiError::Validation(format!(
-            "`user` is {} chars; cap at 256 (OpenAI's documented user-id ceiling)",
+            "`{field}` is {} chars; cap at {SESSION_KEY_MAX_BYTES}",
             u.len()
         )));
     }
-    // Reject control characters (NUL, newlines, etc.). The user_id flows
-    // into structured-log lines and HashMap keys; an embedded `\n` would
-    // break log parsing for downstream collectors, and a NUL would wedge
-    // some terminals on display. Printable + space is the only safe set.
-    if u.chars().any(|c| c.is_control()) {
-        return Err(ApiError::Validation(
-            "`user` contains control characters (NUL/newline/etc.); ASCII-printable only".into(),
-        ));
+    if u.chars().any(char::is_control) {
+        return Err(ApiError::Validation(format!(
+            "`{field}` contains control characters (NUL/newline/etc.); printable text only"
+        )));
     }
     Ok(())
 }
@@ -461,12 +461,59 @@ pub struct APIServer {
 /// produces cannot contain it, because a quote inside a JSON string arrives escaped.
 const TERMINAL_MARKER: &[u8] = b"\"done\":true";
 
-/// How one surface's request travels to a peer: the route it is posted to, the bytes that
+/// The frames that end an NDJSON stream: the done line, or the error line that replaces it.
+const OLLAMA_TERMINATORS: &[&[u8]] = &[TERMINAL_MARKER, b"{\"error\":"];
+/// The frame that ends an OpenAI event stream. The newlines are the SSE framing, which a
+/// JSON payload cannot carry unescaped, so generated text cannot forge it.
+const OPENAI_TERMINATORS: &[&[u8]] = &[b"data: [DONE]\n\n"];
+/// The events that end a Messages stream: its closing event, or the error that replaces it.
+const MESSAGES_TERMINATORS: &[&[u8]] = &[b"event: message_stop\n", b"event: error\n"];
+
+/// Whether a relayed stream carried one of its terminators, watched across chunk
+/// boundaries: a frame the network split in two is still a frame.
+struct TerminatorWatch {
+    markers: &'static [&'static [u8]],
+    tail: Vec<u8>,
+    seen: bool,
+}
+
+impl TerminatorWatch {
+    fn new(markers: &'static [&'static [u8]]) -> Self {
+        Self {
+            markers,
+            tail: Vec::new(),
+            seen: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> bool {
+        if self.seen {
+            return true;
+        }
+        let keep = self
+            .markers
+            .iter()
+            .map(|m| m.len())
+            .max()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        self.tail.extend_from_slice(chunk);
+        self.seen = self
+            .markers
+            .iter()
+            .any(|m| !m.is_empty() && self.tail.windows(m.len()).any(|w| w == *m));
+        let excess = self.tail.len().saturating_sub(keep);
+        self.tail.drain(..excess);
+        self.seen
+    }
+}
+
+/// How one surface's request travels to a peer: the route it is posted to, the frames that
 /// mark a finished answer on that surface, and the chunk that ends a stream the peer
 /// never finished.
 pub(crate) struct Relay {
     pub path: &'static str,
-    pub marker: &'static [u8],
+    pub markers: &'static [&'static [u8]],
     pub closing: &'static str,
     /// Whether a request that does not say streams, which the Ollama routes do and the
     /// OpenAI and Messages routes do not.
@@ -485,31 +532,31 @@ impl Relay {
 
 pub(crate) const OLLAMA_GENERATE: Relay = Relay {
     path: "/api/generate",
-    marker: TERMINAL_MARKER,
+    markers: OLLAMA_TERMINATORS,
     closing: "{\"response\":\"\",\"done\":true,\"done_reason\":\"peer_failed\",\"error\":\"the node serving this request stopped before finishing it\"}\n",
     streams_by_default: true,
 };
 pub(crate) const OLLAMA_CHAT: Relay = Relay {
     path: "/api/chat",
-    marker: TERMINAL_MARKER,
+    markers: OLLAMA_TERMINATORS,
     closing: "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"peer_failed\",\"error\":\"the node serving this request stopped before finishing it\"}\n",
     streams_by_default: true,
 };
 pub(crate) const OPENAI_CHAT: Relay = Relay {
     path: "/v1/chat/completions",
-    marker: b"[DONE]",
+    markers: OPENAI_TERMINATORS,
     closing: "data: {\"error\":{\"message\":\"the node serving this request stopped before finishing it\",\"type\":\"peer_failed\"}}\n\ndata: [DONE]\n\n",
     streams_by_default: false,
 };
 pub(crate) const OPENAI_COMPLETIONS: Relay = Relay {
     path: "/v1/completions",
-    marker: b"[DONE]",
+    markers: OPENAI_TERMINATORS,
     closing: "data: {\"error\":{\"message\":\"the node serving this request stopped before finishing it\",\"type\":\"peer_failed\"}}\n\ndata: [DONE]\n\n",
     streams_by_default: false,
 };
 pub(crate) const MESSAGES: Relay = Relay {
     path: "/v1/messages",
-    marker: b"message_stop",
+    markers: MESSAGES_TERMINATORS,
     closing: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"peer_failed\",\"message\":\"the node serving this request stopped before finishing it\"}}\n\n",
     streams_by_default: false,
 };
@@ -518,55 +565,55 @@ pub(crate) const MESSAGES: Relay = Relay {
 /// these relays pass what the peer sends and nothing more.
 pub(crate) const IMAGES: Relay = Relay {
     path: "/v1/images/generations",
-    marker: b"",
+    markers: &[],
     closing: "",
     streams_by_default: false,
 };
 pub(crate) const VIDEO: Relay = Relay {
     path: "/v1/video/generations",
-    marker: b"",
+    markers: &[],
     closing: "",
     streams_by_default: false,
 };
 pub(crate) const AUDIO_GENERATIONS: Relay = Relay {
     path: "/v1/audio/generations",
-    marker: b"",
+    markers: &[],
     closing: "",
     streams_by_default: false,
 };
 pub(crate) const AUDIO_SPEECH: Relay = Relay {
     path: "/v1/audio/speech",
-    marker: b"",
+    markers: &[],
     closing: "",
     streams_by_default: false,
 };
 pub(crate) const EMBEDDINGS: Relay = Relay {
     path: "/v1/embeddings",
-    marker: b"",
+    markers: &[],
     closing: "",
     streams_by_default: false,
 };
 pub(crate) const OLLAMA_EMBED: Relay = Relay {
     path: "/api/embed",
-    marker: b"",
+    markers: &[],
     closing: "",
     streams_by_default: false,
 };
 pub(crate) const OLLAMA_EMBEDDINGS: Relay = Relay {
     path: "/api/embeddings",
-    marker: b"",
+    markers: &[],
     closing: "",
     streams_by_default: false,
 };
 pub(crate) const RERANK: Relay = Relay {
     path: "/v1/rerank",
-    marker: b"",
+    markers: &[],
     closing: "",
     streams_by_default: false,
 };
 pub(crate) const CONVERSATION: Relay = Relay {
     path: "/conversation",
-    marker: b"",
+    markers: &[],
     closing: "",
     streams_by_default: false,
 };
@@ -642,7 +689,7 @@ pub(crate) async fn route_media_to_holder(
     cluster_handle_publish(state).await;
     let (cluster, peer, url, now) =
         media_holder(state, headers, model, served_here, fits_here, demand, holds)?;
-    match forward_to_peer(&url, relay, body).await {
+    match forward_to_peer(&url, relay, headers, body).await {
         Ok(relayed) => Some(relayed),
         Err(e) => {
             tracing::warn!("cluster: hand-over to {peer} failed ({e}) - serving here instead");
@@ -677,6 +724,7 @@ pub(crate) async fn route_upload_to_holder(
     match crate::distributed::cluster_runtime::forward_request_bytes(
         &url,
         path,
+        &relayed_headers(headers),
         &content_type,
         body.clone(),
     )
@@ -770,7 +818,7 @@ pub(crate) async fn route_to_holder(
         return None;
     };
     tracing::info!("forwarding to {peer}: {reason}");
-    match forward_to_peer(&url, relay, body).await {
+    match forward_to_peer(&url, relay, headers, body).await {
         Ok(relayed) => Some(relayed),
         // The peer never got as far as answering; nothing has reached the client, so the
         // request is served here rather than failed with someone else's outage.
@@ -782,16 +830,41 @@ pub(crate) async fn route_to_holder(
     }
 }
 
+/// The request headers a peer serves the request by: the credential its own
+/// authentication checks, and the priority, window and cache format the request asked
+/// for.
+pub(crate) fn relayed_headers(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    [
+        axum::http::header::AUTHORIZATION.as_str(),
+        "x-api-key",
+        "anthropic-version",
+        crate::api::gate::Priority::HEADER,
+        crate::api::gate::Window::HEADER,
+        crate::api::gate::KvFormat::HEADER,
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        let v = headers.get(name)?.to_str().ok()?;
+        Some((name.to_string(), v.to_string()))
+    })
+    .collect()
+}
+
 pub(crate) async fn forward_to_peer(
     url: &str,
     relay: &Relay,
+    request_headers: &axum::http::HeaderMap,
     body: &serde_json::Value,
 ) -> Result<axum::response::Response, ApiError> {
     use axum::response::IntoResponse;
-    let (status, headers, resp) =
-        crate::distributed::cluster_runtime::forward_request(url, relay.path, body)
-            .await
-            .map_err(ApiError::Internal)?;
+    let (status, headers, resp) = crate::distributed::cluster_runtime::forward_request(
+        url,
+        relay.path,
+        &relayed_headers(request_headers),
+        body,
+    )
+    .await
+    .map_err(ApiError::Internal)?;
     let code = axum::http::StatusCode::from_u16(status.as_u16())
         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
     let content_type = headers
@@ -799,7 +872,7 @@ pub(crate) async fn forward_to_peer(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    if relay.marker.is_empty() || !relay.streams(body) || !status.is_success() {
+    if relay.markers.is_empty() || !relay.streams(body) || !status.is_success() {
         // A whole body is passed on as it comes; cut short, it fails to parse, which is the
         // error the client sees. A relay without a marker has no ending to restore either,
         // and a refusal from the peer is one JSON body, not a stream that could stop early.
@@ -827,10 +900,10 @@ pub(crate) async fn forward_to_peer(
     let upstream = futures::StreamExt::take_while(resp.bytes_stream(), |item| {
         futures::future::ready(item.is_ok())
     });
-    let marker = relay.marker;
+    let mut watch = TerminatorWatch::new(relay.markers);
     let stream = futures::StreamExt::map(upstream, move |chunk| {
         if let Ok(bytes) = &chunk {
-            if bytes.windows(marker.len()).any(|w| w == marker) {
+            if watch.push(bytes) {
                 watching.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
@@ -1574,6 +1647,20 @@ impl APIServer {
         keep_alive_minutes: i64,
         window: Option<usize>,
     ) -> Result<(), String> {
+        self.ensure_loaded_with(model_id, keep_alive_minutes, window, None)
+            .await
+    }
+
+    /// [`Self::ensure_loaded_with_window`] with the KV-cache format a request asked for,
+    /// so a cold load opens the cache in that format rather than loading once more to
+    /// change it.
+    async fn ensure_loaded_with(
+        &self,
+        model_id: &str,
+        keep_alive_minutes: i64,
+        window: Option<usize>,
+        kv_quant: Option<crate::inference::engine::llm_engine::KvQuant>,
+    ) -> Result<(), String> {
         // Fast path: already loaded.
         if self.get_engine(model_id).await.is_ok() {
             return Ok(());
@@ -1618,6 +1705,9 @@ impl APIServer {
             if want > config.context_length {
                 config.context_length = want;
             }
+        }
+        if let Some(kv) = kv_quant {
+            config.kv_quant = kv;
         }
         // Pressure protocol: idle MEDIA residents (image/video/TTS engines) hold
         // VRAM this LLM may need. Same rule as the media loads in reverse -
@@ -2384,6 +2474,9 @@ impl APIServer {
             // while this comment claimed the opposite. The gate below keeps the two
             // in agreement.
             .layer(CatchPanicLayer::new())
+            // An error on an Ollama route in Ollama's envelope, whichever handler or
+            // extractor raised it.
+            .layer(axum::middleware::from_fn(dialect_error_envelope))
             // Global request timeout. It bounds every non-streaming handler and the
             // time-to-first-byte of streaming ones - streaming BODIES are produced after
             // the response is returned, so a long SSE generation is not cut off by it.
@@ -3118,22 +3211,114 @@ mod relay_terminator_tests {
             .windows(super::TERMINAL_MARKER.len())
             .any(|w| w == super::TERMINAL_MARKER));
     }
+
+    /// A peer is handed the credential and the serving headers, nothing else.
+    #[test]
+    fn a_relay_carries_the_serving_headers() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("authorization", "Bearer k".parse().unwrap());
+        h.insert(crate::api::gate::Priority::HEADER, "batch".parse().unwrap());
+        h.insert(crate::api::gate::Window::HEADER, "32768".parse().unwrap());
+        h.insert(crate::api::gate::KvFormat::HEADER, "q8".parse().unwrap());
+        h.insert("cookie", "session=1".parse().unwrap());
+        let relayed = super::relayed_headers(&h);
+        let names: Vec<&str> = relayed.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"authorization"));
+        assert!(names.contains(&crate::api::gate::Priority::HEADER));
+        assert!(names.contains(&crate::api::gate::Window::HEADER));
+        assert!(names.contains(&crate::api::gate::KvFormat::HEADER));
+        assert!(!names.contains(&"cookie"));
+    }
+
+    /// The SSE relays match the framed terminator: a model writing the bare word in its
+    /// answer does not end the relay, the real frame does, split across chunks or not.
+    #[test]
+    fn sse_relays_match_the_frame_not_the_word() {
+        use axum::response::sse::Event;
+        use futures::StreamExt;
+        let frames = |events: Vec<Event>| -> Vec<u8> {
+            let body = axum::response::IntoResponse::into_response(axum::response::Sse::new(
+                futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>)),
+            ))
+            .into_body();
+            futures::executor::block_on(async {
+                body.into_data_stream()
+                    .fold(Vec::new(), |mut acc, c| async move {
+                        acc.extend_from_slice(&c.unwrap());
+                        acc
+                    })
+                    .await
+            })
+        };
+        let content =
+            |t: &str| Event::default().data(serde_json::json!({"content": t}).to_string());
+        let openai = super::OPENAI_CHAT.markers;
+        let forged = frames(vec![content("[DONE]"), content("data: [DONE]")]);
+        assert!(!super::TerminatorWatch::new(openai).push(&forged));
+        let real = frames(vec![content("hi"), Event::default().data("[DONE]")]);
+        let mut w = super::TerminatorWatch::new(openai);
+        let (a, b) = real.split_at(real.len() - 3);
+        assert!(!w.push(a));
+        assert!(w.push(b), "a frame split across chunks is still a frame");
+
+        let messages = super::MESSAGES.markers;
+        let forged = frames(vec![Event::default()
+            .event("content_block_delta")
+            .data(serde_json::json!({"text": "event: message_stop"}).to_string())]);
+        assert!(!super::TerminatorWatch::new(messages).push(&forged));
+        for end in ["message_stop", "error"] {
+            let real = frames(vec![Event::default().event(end).data("{}")]);
+            assert!(super::TerminatorWatch::new(messages).push(&real), "{end}");
+        }
+
+        let ollama = super::OLLAMA_CHAT.markers;
+        let err = format!("{}\n", serde_json::json!({"error": "boom"}));
+        assert!(super::TerminatorWatch::new(ollama).push(err.as_bytes()));
+        let text = format!(
+            "{}\n",
+            serde_json::json!({"response": "{\"error\": 1}", "done": false})
+        );
+        assert!(!super::TerminatorWatch::new(ollama).push(text.as_bytes()));
+    }
 }
 
-/// The wire dialect a request speaks, for the envelope of an error raised before any
-/// handler: the Messages API's under its path or its version header, OpenAI's else.
-#[derive(Clone, Copy)]
+/// The routes Ollama defines, whose clients read `{"error": "..."}`.
+const OLLAMA_ROUTES: &[&str] = &[
+    "/api/chat",
+    "/api/generate",
+    "/api/tags",
+    "/api/show",
+    "/api/pull",
+    "/api/push",
+    "/api/delete",
+    "/api/copy",
+    "/api/create",
+    "/api/ps",
+    "/api/embed",
+    "/api/embeddings",
+    "/api/version",
+];
+
+/// The wire dialect a request speaks, for the envelope of an error: the Messages API's
+/// under its path or its version header, Ollama's on the routes Ollama defines, OpenAI's
+/// else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dialect {
     OpenAi,
     Anthropic,
+    Ollama,
 }
 
 impl Dialect {
     fn of(req: &axum::extract::Request) -> Self {
-        if req.uri().path().starts_with("/v1/messages")
-            || req.headers().contains_key("anthropic-version")
-        {
+        Self::of_parts(req.uri().path(), req.headers())
+    }
+
+    fn of_parts(path: &str, headers: &axum::http::HeaderMap) -> Self {
+        if path.starts_with("/v1/messages") || headers.contains_key("anthropic-version") {
             Self::Anthropic
+        } else if OLLAMA_ROUTES.contains(&path) || path.starts_with("/api/blobs/") {
+            Self::Ollama
         } else {
             Self::OpenAi
         }
@@ -3157,7 +3342,86 @@ impl Dialect {
                     "code": openai_code
                 }
             }),
+            Self::Ollama => serde_json::json!({ "error": message }),
         }
+    }
+}
+
+/// Bytes of an error body read to re-envelope it: an error is a short message, and a
+/// larger body is passed on as it is.
+const ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// An OpenAI-envelope error body (`{"error": {"message"}}`) as Ollama's
+/// (`{"error": "message"}`); `None` for any other body.
+fn ollama_error_body(bytes: &[u8]) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let message = v.pointer("/error/message")?.as_str()?;
+    Some(serde_json::json!({ "error": message }))
+}
+
+/// Re-envelope an error answered on an Ollama route: the handlers and extractors raise
+/// the shared `ApiError`, whose body is OpenAI's.
+async fn dialect_error_envelope(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let dialect = Dialect::of(&req);
+    let res = next.run(req).await;
+    if dialect != Dialect::Ollama || res.status().is_success() {
+        return res;
+    }
+    let (mut parts, body) = res.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, ERROR_BODY_MAX_BYTES).await else {
+        return axum::response::Response::from_parts(parts, axum::body::Body::empty());
+    };
+    match ollama_error_body(&bytes) {
+        Some(v) => {
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            parts.headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            axum::response::Response::from_parts(parts, axum::body::Body::from(v.to_string()))
+        }
+        None => axum::response::Response::from_parts(parts, axum::body::Body::from(bytes)),
+    }
+}
+
+#[cfg(test)]
+mod dialect_tests {
+    use super::*;
+
+    #[test]
+    fn ollama_routes_speak_ollama() {
+        let h = axum::http::HeaderMap::new();
+        assert_eq!(Dialect::of_parts("/api/chat", &h), Dialect::Ollama);
+        assert_eq!(Dialect::of_parts("/api/generate", &h), Dialect::Ollama);
+        assert_eq!(
+            Dialect::of_parts("/api/blobs/sha256:ab", &h),
+            Dialect::Ollama
+        );
+        assert_eq!(
+            Dialect::of_parts("/v1/chat/completions", &h),
+            Dialect::OpenAi
+        );
+        assert_eq!(Dialect::of_parts("/api/inflight", &h), Dialect::OpenAi);
+        assert_eq!(Dialect::of_parts("/v1/messages", &h), Dialect::Anthropic);
+        assert_eq!(
+            Dialect::Ollama.error_body("rate_limit_error", "too_many_requests", "slow down"),
+            serde_json::json!({"error": "slow down"})
+        );
+    }
+
+    /// The shared error body becomes Ollama's; anything else passes unchanged.
+    #[test]
+    fn an_api_error_is_re_enveloped_for_ollama() {
+        let openai = openai_error_body(StatusCode::NOT_FOUND, "model 'x' not found").to_string();
+        assert_eq!(
+            ollama_error_body(openai.as_bytes()),
+            Some(serde_json::json!({"error": "model 'x' not found"}))
+        );
+        assert_eq!(ollama_error_body(br#"{"error":"already"}"#), None);
+        assert_eq!(ollama_error_body(b"not json"), None);
     }
 }
 

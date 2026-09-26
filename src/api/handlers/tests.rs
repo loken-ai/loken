@@ -672,7 +672,7 @@ fn a_peer_holds_an_image_family_under_any_checkpoint_name() {
 
 #[test]
 fn a_media_relay_passes_the_peer_answer_through() {
-    assert!(super::IMAGES.marker.is_empty());
+    assert!(super::IMAGES.markers.is_empty());
     assert!(super::VIDEO.closing.is_empty());
     assert!(!super::CONVERSATION.streams(&serde_json::json!({})));
 }

@@ -236,14 +236,15 @@ pub async fn forward_generate(
     ),
     String,
 > {
-    forward_request(url, "/api/generate", body).await
+    forward_request(url, "/api/generate", &[], body).await
 }
 
-/// Post a request body to `path` on a peer, marked as forwarded so the peer serves it
-/// rather than handing it on again.
+/// Post a request body to `path` on a peer with the request's own `headers`, marked as
+/// forwarded so the peer serves it rather than handing it on again.
 pub async fn forward_request(
     url: &str,
     path: &str,
+    headers: &[(String, String)],
     body: &serde_json::Value,
 ) -> Result<
     (
@@ -254,8 +255,11 @@ pub async fn forward_request(
     String,
 > {
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}{path}", url.trim_end_matches('/')))
+    let mut request = client.post(format!("{}{path}", url.trim_end_matches('/')));
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let resp = request
         .header(FORWARDED_HEADER, "1")
         .json(body)
         .send()
@@ -268,6 +272,7 @@ pub async fn forward_request(
 pub async fn forward_request_bytes(
     url: &str,
     path: &str,
+    headers: &[(String, String)],
     content_type: &str,
     body: axum::body::Bytes,
 ) -> Result<
@@ -279,8 +284,11 @@ pub async fn forward_request_bytes(
     String,
 > {
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}{path}", url.trim_end_matches('/')))
+    let mut request = client.post(format!("{}{path}", url.trim_end_matches('/')));
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let resp = request
         .header(FORWARDED_HEADER, "1")
         .header(reqwest::header::CONTENT_TYPE, content_type)
         .body(body)

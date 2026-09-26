@@ -20,208 +20,59 @@ pub(super) fn extract_kv_quant_override(
     }
 }
 
-/// Extract generation options from Ollama options field
-/// Range-validate the Ollama options bag before extraction. Mirrors
-/// the chat/text-completion sampling-knob bounds enforced via
-/// validator macros on the OpenAI shape (e7a96bb). Returns 400 on
-/// out-of-range values so /api/chat + /api/generate produce the same
-/// errors as /v1/* for identical inputs.
-pub(super) fn validate_ollama_options(options: Option<&serde_json::Value>) -> Result<(), ApiError> {
-    let Some(opts) = options else {
-        return Ok(());
-    };
-    if let Some(t) = opts.get("temperature").and_then(serde_json::Value::as_f64) {
-        if !(0.0..=2.0).contains(&t) || !t.is_finite() {
-            return Err(ApiError::Validation(format!(
-                "options.temperature must be in [0, 2]; got {t}"
-            )));
-        }
+/// How an Ollama request wants its model loaded: `options.num_ctx` and
+/// `options.kv_quant` first, the headers every route reads otherwise.
+pub(super) fn ollama_load_request(
+    state: &APIServer,
+    options: Option<&serde_json::Value>,
+    headers: &axum::http::HeaderMap,
+    keep_alive: Option<&str>,
+) -> crate::api::handlers::admission::LoadRequest {
+    let from_headers = crate::api::handlers::admission::LoadRequest::from_headers(
+        headers,
+        state.get_effective_keep_alive(keep_alive),
+    );
+    crate::api::handlers::admission::LoadRequest {
+        window: options
+            .and_then(|o| o.get("num_ctx"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as usize)
+            .or(from_headers.window),
+        kv_quant: extract_kv_quant_override(options).or(from_headers.kv_quant),
+        ..from_headers
     }
-    if let Some(p) = opts.get("top_p").and_then(serde_json::Value::as_f64) {
-        if !(0.0..=1.0).contains(&p) || !p.is_finite() {
-            return Err(ApiError::Validation(format!(
-                "options.top_p must be in [0, 1]; got {p}"
-            )));
-        }
-    }
-    if let Some(rp) = opts
-        .get("repeat_penalty")
-        .and_then(serde_json::Value::as_f64)
-    {
-        // Ollama documents repeat_penalty in roughly [0.5, 2.0]. Allow
-        // a wider [0, 4] to tolerate user experimentation but reject
-        // negative / non-finite values that would invert preferences.
-        if !(0.0..=4.0).contains(&rp) || !rp.is_finite() {
-            return Err(ApiError::Validation(format!(
-                "options.repeat_penalty must be in [0, 4]; got {rp}"
-            )));
-        }
-    }
-    if let Some(np) = opts.get("num_predict").and_then(serde_json::Value::as_i64) {
-        // -1 means "until EOS" in Ollama; 0 / >0 set a hard cap.
-        if np < -1 {
-            return Err(ApiError::Validation(format!(
-                "options.num_predict must be >= -1; got {np}"
-            )));
-        }
-        // Same upper bound as ChatCompletionRequest::max_tokens (50d9ca1).
-        // Without it, np = i64::MAX parses past the as_u64 consumer below
-        // and the decode loop spins until process exit.
-        if np > 131072 {
-            return Err(ApiError::Validation(format!(
-                "options.num_predict is {np}; cap at 131072 (128K). Use -1 for unbounded-until-EOS."
-            )));
-        }
-    }
-    if let Some(nc) = opts.get("num_ctx").and_then(serde_json::Value::as_i64) {
-        if nc < 1 {
-            return Err(ApiError::Validation(format!(
-                "options.num_ctx must be >= 1; got {nc}"
-            )));
-        }
-        // num_ctx allocates KV cache proportional to context size; an
-        // unbounded value lets a single request OOM the GPU. 1M tokens
-        // is well past anything the perimeter actually supports.
-        if nc > 1_048_576 {
-            return Err(ApiError::Validation(format!(
-                "options.num_ctx is {nc}; cap at 1048576 (1M tokens) - anything larger would OOM the KV cache"
-            )));
-        }
-    }
-    // top_k bounds the per-step softmax candidate pool. Practical values
-    // sit in [1, vocab_size]; vocabularies are 32K-256K. A request like
-    // top_k = u64::MAX parses straight through the as_u64 consumer and
-    // its only effect is to misallocate buffers in the sampler.
-    if let Some(k) = opts.get("top_k").and_then(serde_json::Value::as_i64) {
-        if k < 0 {
-            return Err(ApiError::Validation(format!(
-                "options.top_k must be >= 0; got {k} (0 = disable top_k filtering)"
-            )));
-        }
-        if k > 1_048_576 {
-            return Err(ApiError::Validation(format!(
-                "options.top_k is {k}; cap at 1048576 - practical vocabularies top out at ~256K tokens"
-            )));
-        }
-    }
-    // repeat_last_n is the rolling window of past tokens scanned for
-    // repetition penalty. Engine cost is O(repeat_last_n x vocab_size)
-    // per step; without a cap a request like u64::MAX brings decode
-    // to a halt at first token. Same upper bound as max_tokens.
-    if let Some(rl) = opts
-        .get("repeat_last_n")
-        .and_then(serde_json::Value::as_i64)
-    {
-        if rl < 0 {
-            return Err(ApiError::Validation(format!(
-                "options.repeat_last_n must be >= 0; got {rl} (0 = disable repeat penalty)"
-            )));
-        }
-        if rl > 131_072 {
-            return Err(ApiError::Validation(format!(
-                "options.repeat_last_n is {rl}; cap at 131072 (128K)"
-            )));
-        }
-    }
-    // Stop-sequence count cap, parity with the /v1/chat/completions
-    // and /v1/completions guards. Engine's per-step stop scan is
-    // O(stop_count x generated_tokens); OpenAI's documented limit
-    // is 4.
-    if let Some(arr) = opts.get("stop").and_then(|v| v.as_array()) {
-        if arr.len() > 4 {
-            return Err(ApiError::Validation(format!(
-                "options.stop has {} entries; cap at 4",
-                arr.len()
-            )));
-        }
-        // Per-entry char cap matches the chat + completions paths so an
-        // unbounded 1 GB stop string can't tie up the per-step matcher.
-        const STOP_ENTRY_MAX_CHARS: usize = 256;
-        for (i, v) in arr.iter().enumerate() {
-            if let Some(s) = v.as_str() {
-                if s.chars().count() > STOP_ENTRY_MAX_CHARS {
-                    return Err(ApiError::Validation(format!(
-                        "options.stop[{i}] is {} chars; cap at {STOP_ENTRY_MAX_CHARS}",
-                        s.chars().count()
-                    )));
-                }
-            }
-        }
-    }
-    // Same per-session-key cap as /v1/{chat,}completions (validate_user_id):
-    // session_id is the KV-cache HashMap key, must be bounded.
-    if let Some(s) = opts.get("session_id").and_then(|v| v.as_str()) {
-        if !s.is_empty() && s.len() > 256 {
-            return Err(ApiError::Validation(format!(
-                "options.session_id is {} chars; cap at 256",
-                s.len()
-            )));
-        }
-    }
-    Ok(())
 }
 
-pub(super) fn extract_generation_options(options: Option<&serde_json::Value>) -> GenerationParams {
-    let options = match options {
-        Some(o) => o,
-        None => return GenerationParams::default(),
-    };
+/// The gate priority an Ollama request asks for: `options.priority`, else the header
+/// every route reads, else Fim for a fill-in-the-middle request and Interactive for the
+/// rest.
+pub(super) fn ollama_priority(
+    options: Option<&serde_json::Value>,
+    headers: &axum::http::HeaderMap,
+    fim: bool,
+) -> crate::api::gate::Priority {
+    options
+        .and_then(|v| v.get("priority"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::api::gate::Priority::parse)
+        .or_else(|| crate::api::gate::Priority::from_headers(headers))
+        .unwrap_or(if fim {
+            crate::api::gate::Priority::Fim
+        } else {
+            crate::api::gate::Priority::Interactive
+        })
+}
 
-    GenerationParams {
-        prefix_tokens: None,
-        logit_bias: None,
-        top_logprobs: None,
-        max_tokens: options
-            .get("num_predict")
-            .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize),
-        temperature: options
-            .get("temperature")
-            .and_then(serde_json::Value::as_f64)
-            .map(|v| v as f32),
-        top_p: options
-            .get("top_p")
-            .and_then(serde_json::Value::as_f64)
-            .map(|v| v as f32),
-        top_k: options
-            .get("top_k")
-            .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize),
-        seed: options.get("seed").and_then(serde_json::Value::as_u64),
-        stop_sequences: options
-            .get("stop")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|s| s.as_str().map(std::string::ToString::to_string))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        early_exit_threshold: options
-            .get("early_exit_threshold")
-            .and_then(serde_json::Value::as_f64)
-            .map(|v| v as f32),
-        repeat_penalty: options
-            .get("repeat_penalty")
-            .and_then(serde_json::Value::as_f64)
-            .map(|v| v as f32),
-        repeat_last_n: options
-            .get("repeat_last_n")
-            .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize),
-        context_length: options
-            .get("num_ctx")
-            .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize),
-        session_id: options
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(std::string::ToString::to_string),
-        grammar: options
-            .get("grammar")
-            .and_then(|v| v.as_str())
-            .map(std::string::ToString::to_string),
-    }
+/// Range-validate the Ollama options bag with the bounds every dialect shares.
+#[cfg(test)]
+pub(super) fn validate_ollama_options(options: Option<&serde_json::Value>) -> Result<(), ApiError> {
+    crate::api::handlers::sampling::SamplingRequest::from_ollama(options, None, None).validate()
+}
+
+/// The engine parameters an Ollama options bag asks for.
+#[cfg(test)]
+pub(super) fn extract_generation_options(options: Option<&serde_json::Value>) -> GenerationParams {
+    crate::api::handlers::sampling::SamplingRequest::from_ollama(options, None, None).into_params()
 }
 
 /// Chat (POST /api/chat) - Ollama format
@@ -238,18 +89,32 @@ pub(crate) async fn ollama_chat(
     // The aggregate-chars cap below is still imperative - validator
     // crate can't express "sum of nested field chars across a Vec".
     validate_request(&request)?;
-    validate_ollama_options(request.options.as_ref())?;
+    let sampling = crate::api::handlers::sampling::SamplingRequest::from_ollama(
+        request.options.as_ref(),
+        request.logprobs,
+        request.top_logprobs,
+    );
+    sampling.validate()?;
     // Normalize model ID
     let model_name = normalize_model_id(&request.model);
     // A conversation, or a load instruction for a model held elsewhere, goes where the
-    // model is; an empty conversation for a model held here stays here.
-    let prompt_text: String = request
-        .messages
-        .iter()
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    {
+    // model is; an empty conversation for a model held here stays here. Peers are asked
+    // about the prompt this node would prefill, which is the text their caches key on.
+    if state.cluster_handle().is_some() {
+        let prompt_text = state
+            .prepare_prompt(
+                &model_name,
+                None,
+                &crate::api::handlers::chat_prompt::PromptSpec {
+                    messages: &request.messages,
+                    tools: request.tools.as_ref(),
+                    tool_choice: request.tool_choice.as_ref(),
+                    thinking: request.thinking_preference(),
+                    output_grammar: None,
+                },
+            )
+            .await
+            .prompt;
         let local_state = state.local_node_state().await;
         let served_here = crate::distributed::routing::can_serve(&local_state, &model_name);
         if !request.messages.is_empty() || !served_here {
@@ -452,12 +317,7 @@ pub(crate) async fn ollama_chat(
     }
 
     // Extract generation options
-    let mut params = extract_generation_options(request.options.as_ref());
-    params.top_logprobs = if request.logprobs == Some(true) {
-        Some(request.top_logprobs.unwrap_or(0).min(20))
-    } else {
-        None
-    };
+    let mut params = sampling.into_params();
     let wants_logprobs = request.logprobs == Some(true);
     // Ollama's `format` field: `"json"` -> json_object grammar; a JSON
     // Schema object -> strict json_schema grammar. Bridges Ollama's
@@ -468,168 +328,43 @@ pub(crate) async fn ollama_chat(
         params.grammar = ollama_format_to_grammar(request.format.as_ref());
     }
 
-    // Per-request kv_quant override (reload if the loaded engine differs).
-    if let Some(want) = extract_kv_quant_override(request.options.as_ref()) {
-        if let Err(e) = state.ensure_engine_kv_quant(&model_name, want).await {
-            return Err(ApiError::Internal(format!(
-                "kv_quant reload for '{model_name}': {e}"
-            )));
-        }
-    }
-    if let Some(want) = request
-        .options
-        .as_ref()
-        .and_then(|o| o.get("num_ctx"))
-        .and_then(serde_json::Value::as_u64)
-    {
-        if let Err(e) = state
-            .ensure_engine_context(&model_name, want as usize)
-            .await
-        {
-            return Err(ApiError::Internal(format!(
-                "num_ctx reload for '{model_name}': {e}"
-            )));
-        }
-    }
+    // Loaded on first use (Ollama-compatible), in the context and cache format the
+    // options or the headers ask for.
+    let engine = state
+        .load_for_request(
+            &model_name,
+            ollama_load_request(
+                &state,
+                request.options.as_ref(),
+                &headers,
+                request.keep_alive.as_deref(),
+            ),
+        )
+        .await?;
 
-    // Auto-load on first use (Ollama-compatible).
-    let keep_alive_minutes_chat = state.get_effective_keep_alive(request.keep_alive.as_deref());
-    if let Err(e) = state
-        .ensure_loaded(&model_name, keep_alive_minutes_chat)
-        .await
-    {
-        return Err(ApiError::NotFound(format!(
-            "Model '{model_name}' could not be auto-loaded: {e}"
-        )));
-    }
-    let engine = match state.get_engine(&model_name).await {
-        Ok(engine) => engine,
-        Err(_) => {
-            return Err(ApiError::NotFound(format!(
-                "Model '{model_name}' not loaded after auto-load attempt"
-            )));
-        }
-    };
-
-    // Reset expiration timer on use (like Ollama)
-    state.reset_expiration(&model_name).await;
-
-    // Build prompt using model-specific chat template (read from Ollama manifest)
-    let chat_template = {
-        let engines = state.engines.read().await;
-        engines
-            .iter()
-            .find(|e| e.model_id == model_name)
-            .and_then(|e| e.chat_template.clone())
-    };
-    // Lazy-load template on first use if not yet cached
-    let chat_template = chat_template.or_else(|| {
-        let tmpl = state.read_chat_template(&model_name);
-        if tmpl.is_some() {
-            // Cache it for next time (fire-and-forget)
-            let state2 = state.clone();
-            let name2 = model_name.clone();
-            let tmpl2 = tmpl.clone();
-            tokio::spawn(async move {
-                let mut engines = state2.engines.write().await;
-                if let Some(entry) = engines.iter_mut().find(|e| e.model_id == name2) {
-                    entry.chat_template = tmpl2;
-                }
-            });
-        }
-        tmpl
-    });
-    // Fallback: if no template found in manifest, synthesize one based on
-    // model name. Some Ollama manifests omit the template layer (e.g.,
-    // gemma4) - falling through to the [INST] default would produce
-    // gibberish on a model that expects <start_of_turn>.
-    let chat_template = chat_template.or_else(|| infer_template_from_model_name(&model_name));
-    // Tool calling: when a non-empty `tools` array is present, inject the
-    // tool definitions + round-trip prior calls/results into the prompt
-    // and remember the family so the response can be parsed back out.
-    // Ollama has no `tool_choice`, so injection is gated only on presence.
-    let tools_active = crate::api::tool_calls::should_inject_tools(
-        request.tools.as_ref(),
-        request.tool_choice.as_ref(),
-    );
-    let tool_directive =
-        crate::api::tool_calls::tool_choice_directive(request.tool_choice.as_ref());
-    // `required` or a named function constrains the generation to the call object.
-    let forced_call: Option<Option<String>> = match request.tool_choice.as_ref() {
-        Some(serde_json::Value::String(s)) if s == "required" => Some(None),
-        Some(serde_json::Value::Object(o))
-            if o.get("type").and_then(serde_json::Value::as_str) == Some("function") =>
-        {
-            Some(
-                o.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-            )
-        }
-        _ => None,
-    };
-    // `required` or a named function: the call object is the grammar, unless the
-    // caller's `format` already set one.
-    if params.grammar.is_none() && tools_active {
-        if let (Some(only), Some(tools)) = (forced_call.as_ref(), request.tools.as_ref()) {
-            params.grammar = Some(format!(
-                "json_schema:{}",
-                crate::api::tool_calls::forced_call_schema(tools, only.as_deref())
-            ));
-        }
-    }
-    let tool_format =
-        crate::api::tool_calls::detect_tool_format(chat_template.as_deref(), &model_name);
-    // qwen35moe (Qwen3-VL): the simple ChatML formatter doesn't render the
-    // template's vision branch, so inject ONE `<|image_pad|>` (wrapped in
-    // vision_start/end) into the last user message carrying images. The engine
-    // expands that single sentinel to n_merged placeholders at prefill (once
-    // preprocessing reveals the patch grid) and splices the ViT output there.
-    let qwen35_vision_active = request
-        .messages
-        .iter()
-        .any(|m| m.role == "user" && m.images.as_ref().is_some_and(|i| !i.is_empty()))
-        && engine.is_qwen35_vision().await;
-    let eff_messages = if qwen35_vision_active {
-        let mut msgs = request.messages.clone();
-        if let Some(um) = msgs
-            .iter_mut()
-            .rev()
-            .find(|m| m.role == "user" && m.images.as_ref().is_some_and(|i| !i.is_empty()))
-        {
-            um.content = format!("<|vision_start|><|image_pad|><|vision_end|>{}", um.content);
-        }
-        msgs
-    } else {
-        request.messages.clone()
-    };
-    let mut prompt = if tools_active {
-        let tools = request.tools.as_ref().unwrap();
-        // Ollama has no tool_choice field -> no forcing directive.
-        let flattened = crate::api::tool_calls::flatten_messages(
-            &eff_messages,
-            tool_format,
-            tools,
-            tool_directive.as_deref(),
-        );
-        if template_takes_tools(chat_template.as_deref()) {
-            format_chat_prompt_with_tools(&eff_messages, chat_template.as_deref(), tools)
-        } else {
-            format_chat_prompt(&flattened, chat_template.as_deref())
-        }
-    } else {
-        format_chat_prompt(&eff_messages, chat_template.as_deref())
-    };
-    // `thinking: "disabled"` - until now the field was parsed and consumed by
-    // NOBODY. For reasoning families whose template opens the assistant turn in
-    // ChatML style (qwen3 & co), the official enable_thinking=false rendering
-    // appends an EMPTY think block after the assistant opener; the model then
-    // answers directly. Only applied when the rendered prompt actually ends
-    // with the ChatML opener, so non-reasoning templates are untouched.
-    apply_thinking_preference(&mut prompt, request.thinking_preference());
-    // Whether the template already opened the thinking block; the splitter must know.
-    let thinking_opened = crate::api::thinking::prompt_opens_thinking(&prompt);
+    // The model's template with the tools in its own syntax, the thinking preference,
+    // the Qwen3-VL vision sentinel, and the call object as the grammar when a call is
+    // required and the caller's `format` set none.
+    let crate::api::handlers::chat_prompt::PreparedPrompt {
+        prompt,
+        tools_active,
+        tool_format,
+        grammar,
+        thinking_opened,
+    } = state
+        .prepare_prompt(
+            &model_name,
+            Some(&engine),
+            &crate::api::handlers::chat_prompt::PromptSpec {
+                messages: &request.messages,
+                tools: request.tools.as_ref(),
+                tool_choice: request.tool_choice.as_ref(),
+                thinking: request.thinking_preference(),
+                output_grammar: params.grammar.take(),
+            },
+        )
+        .await;
+    params.grammar = grammar;
     // Length only: the prompt itself is user content and is never written to a log.
     debug!("Chat prompt: {} chars", prompt.len());
 
@@ -647,52 +382,19 @@ pub(crate) async fn ollama_chat(
         info!("Chat: {} stop sequence(s)", params.stop_sequences.len());
     }
 
-    // Resolve priority for the gate. Chat has no `suffix` FIM auto-promote
-    // path, so we only honor an explicit options.priority; default Interactive.
-    let chat_priority = request
-        .options
-        .as_ref()
-        .and_then(|v| v.get("priority"))
-        .and_then(|v| v.as_str())
-        .and_then(crate::api::gate::Priority::parse)
-        .unwrap_or(crate::api::gate::Priority::Interactive);
-
-    // Acquire gate before touching engine.set_images / clear_images (they
-    // grab the model_state mutex held by the active decode). See the same
-    // fix in ollama_generate.
-    // CB-served models decode in their own background worker (not under the
-    // model_state mutex), so they skip the single-request gate - letting
-    // concurrent requests reach the worker and batch (the throughput win).
-    let chat_gate_guard = if engine.is_continuous().await {
-        None
-    } else {
-        Some(acquire_gate(&state, chat_priority, model_name.clone(), "/api/chat").await?)
-    };
-
-    // Process images from the last user message for vision models.
-    let last_user_images: Vec<String> = request
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .and_then(|m| m.images.clone())
-        .unwrap_or_default();
-    if !last_user_images.is_empty() {
-        if let Err(e) = engine.set_images(&last_user_images).await {
-            warn!("Failed to process images for vision model: {}", e);
-        } else {
-            debug!(
-                "Vision: {} image(s) encoded for chat",
-                last_user_images.len()
-            );
-        }
-    } else {
-        engine.clear_images().await;
-    }
+    // The gate, the in-flight count and the last user turn's images.
+    let admission = state
+        .admit(
+            engine.clone(),
+            &model_name,
+            ollama_priority(request.options.as_ref(), &headers, false),
+            "/api/chat",
+            &crate::api::handlers::chat_prompt::last_user_images(&request.messages),
+        )
+        .await?;
 
     // Check if streaming is requested
     if request.stream {
-        let gate_guard = chat_gate_guard;
         let max_tokens_cap = params.max_tokens;
         // Use streaming generation (NDJSON format, matching Ollama's API)
         match engine.generate_stream(&prompt, params.clone()).await {
@@ -702,7 +404,7 @@ pub(crate) async fn ollama_chat(
                 let prompt_clone = prompt.clone();
                 let engine_for_stats = engine.clone();
                 let stream = async_stream::stream! {
-                    let _gate_held = gate_guard;
+                    let _admitted = admission;
                     let mut accumulated_text = String::new();
                     let mut chunk_count: usize = 0;
                     let mut errored = false;
@@ -900,7 +602,7 @@ pub(crate) async fn ollama_chat(
     } else {
         // Use non-streaming generation
         let start = std::time::Instant::now();
-        let _gate_guard = chat_gate_guard;
+        let _admitted = admission;
         let energy = crate::energy_report::begin();
 
         let _cancel = engine.cancel_guard();
@@ -998,33 +700,9 @@ pub(crate) async fn templated_prompt(
             return rendered;
         }
     }
-    let cached = {
-        let engines = state.engines.read().await;
-        engines
-            .iter()
-            .find(|e| e.model_id == model_name)
-            .and_then(|e| e.chat_template.clone())
-    };
-    let chat_template = cached.or_else(|| {
-        let tmpl = state.read_chat_template(model_name);
-        if tmpl.is_some() {
-            let state2 = state.clone();
-            let name2 = model_name.to_string();
-            let tmpl2 = tmpl.clone();
-            tokio::spawn(async move {
-                let mut engines = state2.engines.write().await;
-                if let Some(entry) = engines.iter_mut().find(|e| e.model_id == name2) {
-                    entry.chat_template = tmpl2;
-                }
-            });
-        }
-        tmpl
-    });
-    // Fallback when the manifest is missing the template layer (e.g. gemma4): synthesize one
-    // from the model name. Without it, /api/generate would emit `[INST]`-formatted gibberish
-    // that mirrors `ollama --raw=true`, while Ollama's own endpoint applies the template by
-    // default and takes raw=true as the opt-out. We match that contract.
-    let chat_template = chat_template.or_else(|| infer_template_from_model_name(model_name));
+    // A name-inferred template stands in when the manifest has none (e.g. gemma4): Ollama
+    // applies the template by default and takes raw=true as the opt-out.
+    let chat_template = state.chat_template_for(model_name).await;
     match chat_template.as_deref() {
         Some(tmpl) if !prompt_already_templated(prompt, tmpl) => {
             let wrapped = format_chat_prompt(&generate_messages(system, prompt), Some(tmpl));
@@ -1037,6 +715,41 @@ pub(crate) async fn templated_prompt(
         }
         _ => prompt.to_string(),
     }
+}
+
+/// The prompt `/api/generate` prefills. A fill-in-the-middle request (a `suffix`, or the
+/// sentinels already in the prompt) bypasses the template; a raw or empty prompt is taken
+/// as given; anything else is rendered in the model's chat template, which a chat-tuned
+/// model needs or it can answer EOS first. The thinking preference is applied as on the
+/// chat route.
+pub(crate) async fn generate_prompt(
+    state: &APIServer,
+    model_name: &str,
+    request: &OllamaGenerateRequest,
+) -> String {
+    let suffix = request.suffix.as_deref().filter(|s| !s.is_empty());
+    let mut prompt = if let Some(suffix) = suffix {
+        format!(
+            "<|fim_prefix|>{}<|fim_suffix|>{suffix}<|fim_middle|>",
+            request.prompt
+        )
+    } else if request.prompt.contains("<|fim_middle|>")
+        || request.raw.unwrap_or(false)
+        || request.prompt.is_empty()
+    {
+        request.prompt.clone()
+    } else {
+        templated_prompt(
+            state,
+            model_name,
+            &request.prompt,
+            request.system.as_deref(),
+            request.template.as_deref(),
+        )
+        .await
+    };
+    apply_thinking_preference(&mut prompt, request.thinking_preference());
+    prompt
 }
 
 /// The one exchange `/api/generate` renders: an optional system turn and the prompt.
@@ -1064,7 +777,12 @@ pub(crate) async fn ollama_generate(
     // "`prompt` length must be in [..., 262144]" instead of the raw
     // validator JSON debug form.
     validate_request(&request)?;
-    validate_ollama_options(request.options.as_ref())?;
+    let sampling = crate::api::handlers::sampling::SamplingRequest::from_ollama(
+        request.options.as_ref(),
+        request.logprobs,
+        request.top_logprobs,
+    );
+    sampling.validate()?;
     // Normalize model ID
     let model_name = normalize_model_id(&request.model);
 
@@ -1103,7 +821,7 @@ pub(crate) async fn ollama_generate(
                 &state,
                 &headers,
                 &model_name,
-                &request.prompt,
+                &generate_prompt(&state, &model_name, &request).await,
                 max_tokens,
                 &crate::api::handlers::OLLAMA_GENERATE,
                 &body,
@@ -1215,52 +933,19 @@ pub(crate) async fn ollama_generate(
         return handle_image_generation(&state, &model_name, &request).await;
     }
 
-    // Per-request kv_quant override. If the caller asked for a format that
-    // differs from what's currently loaded, reload before proceeding.
-    if let Some(want) = extract_kv_quant_override(request.options.as_ref()) {
-        if let Err(e) = state.ensure_engine_kv_quant(&model_name, want).await {
-            return Err(ApiError::Internal(format!(
-                "kv_quant reload for '{model_name}': {e}"
-            )));
-        }
-    }
-    if let Some(want) = request
-        .options
-        .as_ref()
-        .and_then(|o| o.get("num_ctx"))
-        .and_then(serde_json::Value::as_u64)
-    {
-        if let Err(e) = state
-            .ensure_engine_context(&model_name, want as usize)
-            .await
-        {
-            return Err(ApiError::Internal(format!(
-                "num_ctx reload for '{model_name}': {e}"
-            )));
-        }
-    }
-
-    // Auto-load on first use (Ollama-compatible). If the model is on
-    // disk but not in `engines`, ensure_loaded resolves the path, runs
-    // any LRU eviction, and pushes a fresh entry. Only fail if the
-    // load itself fails.
-    let keep_alive_minutes = state.get_effective_keep_alive(request.keep_alive.as_deref());
-    if let Err(e) = state.ensure_loaded(&model_name, keep_alive_minutes).await {
-        return Err(ApiError::NotFound(format!(
-            "Model '{model_name}' could not be auto-loaded: {e}"
-        )));
-    }
-    let engine = match state.get_engine(&model_name).await {
-        Ok(engine) => engine,
-        Err(_) => {
-            return Err(ApiError::NotFound(format!(
-                "Model '{model_name}' not loaded after auto-load attempt"
-            )));
-        }
-    };
-
-    // Reset expiration timer on use (like Ollama)
-    state.reset_expiration(&model_name).await;
+    // Loaded on first use (Ollama-compatible), in the context and cache format the
+    // options or the headers ask for.
+    let engine = state
+        .load_for_request(
+            &model_name,
+            ollama_load_request(
+                &state,
+                request.options.as_ref(),
+                &headers,
+                request.keep_alive.as_deref(),
+            ),
+        )
+        .await?;
 
     // Detect fill-in-the-middle (FIM) intent. Either the caller set `suffix`
     // (Ollama-style FIM - we auto-wrap), or the prompt already contains the
@@ -1280,49 +965,13 @@ pub(crate) async fn ollama_generate(
         );
     }
 
-    // Ollama parity: auto-apply the model's chat template for chat-tuned models
-    // on /api/generate, unless the caller set `raw: true` or the prompt already
-    // contains template markers from this model's family. Without this, chat-tuned
-    // models like deepseek-r1 can emit EOS as their first token on instruction-
-    // shaped prompts.
-    let effective_prompt = if is_fim {
-        if has_suffix {
-            format!(
-                "<|fim_prefix|>{}<|fim_suffix|>{}<|fim_middle|>",
-                request.prompt,
-                request.suffix.as_deref().unwrap_or("")
-            )
-        } else {
-            request.prompt.clone()
-        }
-    } else {
-        let raw_mode = request.raw.unwrap_or(false);
-        if raw_mode || request.prompt.is_empty() {
-            request.prompt.clone()
-        } else {
-            templated_prompt(
-                &state,
-                &model_name,
-                &request.prompt,
-                request.system.as_deref(),
-                request.template.as_deref(),
-            )
-            .await
-        }
-    };
-    // The same request field the chat endpoint honours: a caller asking for no reasoning
-    // gets none here too.
-    let mut effective_prompt = effective_prompt;
-    apply_thinking_preference(&mut effective_prompt, request.thinking_preference());
+    // Ollama parity: the model's chat template unless the caller set `raw: true` or the
+    // prompt is already templated, the sentinels for FIM, and the thinking preference.
+    let effective_prompt = generate_prompt(&state, &model_name, &request).await;
     let thinking_opened = crate::api::thinking::prompt_opens_thinking(&effective_prompt);
 
     // Extract generation options
-    let mut params = extract_generation_options(request.options.as_ref());
-    params.top_logprobs = if request.logprobs == Some(true) {
-        Some(request.top_logprobs.unwrap_or(0).min(20))
-    } else {
-        None
-    };
+    let mut params = sampling.into_params();
     let wants_logprobs = request.logprobs == Some(true);
     // Ollama continuation: the context a previous reply returned is the token prefix
     // this generation resumes from - replayed as tokens, never re-detokenised.
@@ -1369,48 +1018,17 @@ pub(crate) async fn ollama_generate(
         info!("Generate: {} stop sequence(s)", params.stop_sequences.len());
     }
 
-    // Resolve request priority: FIM auto-promotes to Fim; explicit
-    // options.priority overrides; default Interactive.
-    let priority = request
-        .options
-        .as_ref()
-        .and_then(|v| v.get("priority"))
-        .and_then(|v| v.as_str())
-        .and_then(crate::api::gate::Priority::parse)
-        .unwrap_or(if is_fim {
-            crate::api::gate::Priority::Fim
-        } else {
-            crate::api::gate::Priority::Interactive
-        });
-
-    // Acquire the priority gate BEFORE touching engine.set_images /
-    // clear_images. Both grab the model_state mutex which is held by the
-    // active spawn_blocking decode, so doing them before the gate would
-    // serialize all pending requests on that mutex - making the gate
-    // invisible to /api/inflight (queueing happens at the wrong layer).
-    // CB-served models skip the single-request gate (they batch in their own
-    // worker) so concurrent /api/generate requests reach the worker together.
-    let gate_guard_owned = if engine.is_continuous().await {
-        None
-    } else {
-        Some(acquire_gate(&state, priority, model_name.clone(), "/api/generate").await?)
-    };
-
-    // Process images for vision models (encode before generation).
-    // Now serialized correctly: only the gate-holder runs this.
-    if let Some(ref images) = request.images {
-        if !images.is_empty() {
-            if let Err(e) = engine.set_images(images).await {
-                warn!("Failed to process images for vision model: {}", e);
-            } else {
-                debug!("Vision: {} image(s) encoded for generation", images.len());
-            }
-        } else {
-            engine.clear_images().await;
-        }
-    } else {
-        engine.clear_images().await;
-    }
+    // The gate (FIM auto-promotes its priority), the in-flight count and the images.
+    let admission = state
+        .admit(
+            engine.clone(),
+            &model_name,
+            ollama_priority(request.options.as_ref(), &headers, is_fim),
+            "/api/generate",
+            request.images.as_deref().unwrap_or_default(),
+        )
+        .await?;
+    drop(inflight_guard);
 
     // Draft dispatch: if the target has a draft attached and the
     // request is greedy (temperature=0) without grammar/FIM-special
@@ -1448,7 +1066,6 @@ pub(crate) async fn ollama_generate(
 
     // Check if streaming is requested
     if request.stream {
-        let gate_guard = gate_guard_owned;
         // Spec-decode streaming path: used when a draft is attached.
         if let Some((draft_engine, k)) = draft_pair {
             let engine_for_stats = engine.clone();
@@ -1466,7 +1083,7 @@ pub(crate) async fn ollama_generate(
                     let start_time = std::time::Instant::now();
                     let prompt_clone = effective_prompt.clone();
                     let stream = async_stream::stream! {
-                        let _gate_held = gate_guard;
+                        let _admitted = admission;
                         let mut accumulated_text = String::new();
                         let mut chunk_count: usize = 0;
                         let mut splitter = crate::api::thinking::ThinkSplit::opened(thinking_opened);
@@ -1516,7 +1133,8 @@ pub(crate) async fn ollama_generate(
                                     let mut line = err_chunk.to_string();
                                     line.push('\n');
                                     yield Ok::<_, std::io::Error>(axum::body::Bytes::from(line));
-                                    break;
+                                    // The error is the terminal line: no done line follows it.
+                                    return;
                                 }
                             }
                         }
@@ -1612,7 +1230,7 @@ pub(crate) async fn ollama_generate(
                 // (bench-fairness fix - eval_duration matches Ollama).
                 let engine_for_stats = engine.clone();
                 let stream = async_stream::stream! {
-                    let _gate_held = gate_guard; // released when stream ends
+                    let _admitted = admission; // released when the stream ends
                     let mut splitter = crate::api::thinking::ThinkSplit::opened(thinking_opened);
                     let mut thought = false;
                     let mut thinking_ns: Option<u64> = None;
@@ -1761,7 +1379,7 @@ pub(crate) async fn ollama_generate(
     } else {
         // Use non-streaming generation
         let start = std::time::Instant::now();
-        let _gate_guard = gate_guard_owned;
+        let _admitted = admission;
         let energy = crate::energy_report::begin();
 
         let _cancel = engine.cancel_guard();

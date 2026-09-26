@@ -197,13 +197,28 @@ pub(super) async fn classify_route_llm(
     text: &str,
 ) -> Option<ConvRoute> {
     // Keep the router tiny + warm; if it isn't present this loads it once.
-    let keep_alive = state.get_effective_keep_alive(None);
-    if let Err(e) = state.ensure_loaded(router_model, keep_alive).await {
-        warn!("smart-routing: router model '{router_model}' unavailable ({e}); using rules");
-        return None;
-    }
-    let engine = state.get_engine(router_model).await.ok()?;
-    state.reset_expiration(router_model).await;
+    let load = crate::api::handlers::admission::LoadRequest {
+        keep_alive_minutes: state.get_effective_keep_alive(None),
+        window: None,
+        kv_quant: None,
+    };
+    let engine = match state.load_for_request(router_model, load).await {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("smart-routing: router model '{router_model}' unavailable ({e}); using rules");
+            return None;
+        }
+    };
+    let _admitted = state
+        .admit(
+            engine.clone(),
+            router_model,
+            crate::api::gate::Priority::Interactive,
+            "/conversation",
+            &[],
+        )
+        .await
+        .ok()?;
     // Raw instruction (no chat template) - the grammar guarantees a valid
     // label regardless, and a raw prompt sidesteps think-token injection.
     let snippet: String = text.chars().take(400).collect();
@@ -305,6 +320,19 @@ pub(super) fn conv_note_model(conv_id: &str, model: &str) -> Vec<String> {
 /// and is aborted when the generator is dropped: a client that stops reading must not leave
 /// gigabytes loading for nobody.
 #[cfg(feature = "image")]
+/// The messages without their images, for a turn whose images are not encoded: a prompt
+/// must not mark a place for an image the encoder never saw.
+fn without_images(messages: &[crate::api::types::Message]) -> Vec<crate::api::types::Message> {
+    messages
+        .iter()
+        .cloned()
+        .map(|mut m| {
+            m.images = None;
+            m
+        })
+        .collect()
+}
+
 pub(super) async fn conversation_image_stream(
     state: APIServer,
     model: String,
@@ -536,55 +564,75 @@ pub(crate) async fn conversation_handler(
             // failing the turn. No model-name knowledge here.
             let hint = s("model");
             let default_model = state.default_inference_config.model_id.clone();
-            let keep_alive = state.get_effective_keep_alive(None);
+            let load = crate::api::handlers::admission::LoadRequest::from_headers(
+                &headers,
+                state.get_effective_keep_alive(None),
+            );
             let mut model = hint.clone().unwrap_or_else(|| default_model.clone());
-            if let Err(e) = state.ensure_loaded(&model, keep_alive).await {
-                if hint.is_some() && model != default_model {
+            let engine = match state.load_for_request(&model, load).await {
+                Ok(e) => e,
+                Err(e) if hint.is_some() && model != default_model => {
                     warn!("/conversation: hint '{model}' not loadable as an LLM ({e}); using default '{default_model}'");
                     model = default_model.clone();
-                    if let Err(e) = state.ensure_loaded(&model, keep_alive).await {
-                        return conv_err(
-                            StatusCode::NOT_FOUND,
-                            &format!("model '{model}' could not be auto-loaded: {e}"),
-                        );
+                    match state.load_for_request(&model, load).await {
+                        Ok(e) => e,
+                        Err(e) => return e.into_response(),
                     }
-                } else {
-                    return conv_err(
-                        StatusCode::NOT_FOUND,
-                        &format!("model '{model}' could not be auto-loaded: {e}"),
-                    );
                 }
-            }
-            let engine = match state.get_engine(&model).await {
-                Ok(e) => e,
                 Err(e) => return e.into_response(),
             };
-            state.reset_expiration(&model).await;
             // Stage B: keep this conversation's LLM working set warm.
             note_and_touch(&state, model.clone()).await;
-            if route == ConvRoute::Vision && !images.is_empty() {
-                if let Err(e) = engine.set_images(&images).await {
-                    return conv_err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("vision encode: {e}"),
-                    );
-                }
-            }
-            // Use the model's real chat template (read from the Ollama
-            // manifest) so we don't leak generic [INST] scaffolding. Fall
-            // back to a name-inferred template when the manifest omits one  -
-            // same chain as /api/chat. Without this, moondream (whose
-            // manifest template isn't always reachable) gets the [INST]
-            // default and its base-phi2 LM emits gibberish ("!!! ") instead
-            // of the " Question: ...\n\n Answer: " convention it was tuned on.
-            let template = state
-                .read_chat_template(&model)
-                .or_else(|| infer_template_from_model_name(&model));
-            let prompt = format_chat_prompt(&messages, template.as_deref());
+            // The gate, the in-flight count, and the images of a vision turn; any other
+            // turn clears what an earlier request encoded.
+            let turn_images: &[String] = if route == ConvRoute::Vision {
+                &images
+            } else {
+                &[]
+            };
+            let priority = crate::api::gate::Priority::from_headers(&headers)
+                .unwrap_or(crate::api::gate::Priority::Interactive);
+            let _admitted = match state
+                .admit(
+                    engine.clone(),
+                    &model,
+                    priority,
+                    "/conversation",
+                    turn_images,
+                )
+                .await
+            {
+                Ok(a) => a,
+                Err(e) => return e.into_response(),
+            };
+            // The model's own template (a name-inferred one when the manifest has none),
+            // and the Qwen3-VL vision sentinel on a vision turn.
+            let spec_messages;
+            let prompt_messages: &[crate::api::types::Message] = if route == ConvRoute::Vision {
+                &messages
+            } else {
+                spec_messages = without_images(&messages);
+                &spec_messages
+            };
+            let prompt = state
+                .prepare_prompt(
+                    &model,
+                    Some(&engine),
+                    &crate::api::handlers::chat_prompt::PromptSpec {
+                        messages: prompt_messages,
+                        tools: None,
+                        tool_choice: None,
+                        thinking: None,
+                        output_grammar: None,
+                    },
+                )
+                .await
+                .prompt;
             let params = GenerationParams {
                 max_tokens: max_tokens.or(Some(512)),
                 ..Default::default()
             };
+            let _cancel = engine.cancel_guard();
             match engine.generate(&prompt, params).await {
                 Ok(out) => conv_ok(serde_json::json!({
                     "route": if route == ConvRoute::Vision { "vision" } else { "chat" },
@@ -774,6 +822,7 @@ pub(crate) async fn conversation_handler(
 /// Response: { transcript, reply, audio (base64 WAV), sample_rate, model, voice }
 pub(crate) async fn voice_handler(
     State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> axum::response::Response {
     let s = |k: &str| req.get(k).and_then(|v| v.as_str()).map(String::from);
@@ -831,37 +880,53 @@ pub(crate) async fn voice_handler(
         "user".to_string(),
         transcript.clone(),
     ));
-    let keep_alive = state.get_effective_keep_alive(None);
-    if let Err(e) = state.ensure_loaded(&model, keep_alive).await {
-        return conv_err(
-            StatusCode::NOT_FOUND,
-            &format!("model '{model}' could not be auto-loaded: {e}"),
-        );
-    }
-    let engine = match state.get_engine(&model).await {
+    let load = crate::api::handlers::admission::LoadRequest::from_headers(
+        &headers,
+        state.get_effective_keep_alive(None),
+    );
+    let engine = match state.load_for_request(&model, load).await {
         Ok(e) => e,
         Err(e) => return e.into_response(),
     };
-    state.reset_expiration(&model).await;
-    let template = state
-        .read_chat_template(&model)
-        .or_else(|| infer_template_from_model_name(&model));
-    let prompt = format_chat_prompt(&messages, template.as_deref());
+    // The gate, the in-flight count, and no images: a voice turn carries none, and what
+    // an earlier request encoded must not answer this one.
+    let priority = crate::api::gate::Priority::from_headers(&headers)
+        .unwrap_or(crate::api::gate::Priority::Interactive);
+    let admitted = match state
+        .admit(engine.clone(), &model, priority, "/voice", &[])
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    let messages = without_images(&messages);
+    let prepared = state
+        .prepare_prompt(
+            &model,
+            Some(&engine),
+            &crate::api::handlers::chat_prompt::PromptSpec {
+                messages: &messages,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_grammar: None,
+            },
+        )
+        .await;
     let params = GenerationParams {
         max_tokens: max_tokens.or(Some(200)),
         ..Default::default()
     };
-    let reply = match engine.generate(&prompt, params).await {
+    let cancel = engine.cancel_guard();
+    let text = match engine.generate(&prepared.prompt, params).await {
         Ok(out) => out.text,
         Err(e) => return conv_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("generate: {e}")),
     };
-    // Speak the answer, not the chain-of-thought: strip a leading
-    // <think>...</think> block (thinking models like qwen3) so the TTS voices
-    // the actual reply. Falls back to the raw text if there's no closing tag.
-    let spoken = match reply.split_once("</think>") {
-        Some((_, after)) if reply.trim_start().starts_with("<think>") => after.trim(),
-        _ => reply.trim(),
-    };
+    drop(cancel);
+    drop(admitted);
+    // Speak the answer, not the chain-of-thought.
+    let (_, reply) = crate::api::thinking::split_thinking_opened(prepared.thinking_opened, &text);
+    let spoken = reply.trim();
 
     // -- 3. Reply -> speech ------------------------------------------------
     // Selection priority:

@@ -737,11 +737,12 @@ impl LlmEngine {
             .map(|e| e.get_ids().len())
     }
 
-    /// Clear any stored image embeddings
+    /// Clear any stored image embeddings, and the Qwen3-VL patches awaiting prefill.
     pub async fn clear_images(&self) {
         let mut guard = self.model_state.lock().await;
         if let Some(state) = guard.as_mut() {
             state.image_embeds = None;
+            state.qwen35_image = None;
         }
     }
 }

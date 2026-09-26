@@ -16,6 +16,19 @@ pub(crate) fn anthropic_error_response(
     (status, Json(body)).into_response()
 }
 
+/// An [`ApiError`] in the Messages API's envelope, with the error type its status
+/// carries there.
+pub(crate) fn anthropic_api_error(e: ApiError) -> Response {
+    use axum::http::StatusCode;
+    let (status, kind, message) = match e {
+        ApiError::Validation(m) => (StatusCode::BAD_REQUEST, "invalid_request_error", m),
+        ApiError::NotFound(m) => (StatusCode::NOT_FOUND, "not_found_error", m),
+        ApiError::Busy(m) => (StatusCode::SERVICE_UNAVAILABLE, "overloaded_error", m),
+        ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, "api_error", m),
+    };
+    anthropic_error_response(status, kind, message)
+}
+
 /// Anthropic Messages API shim (`POST /v1/messages`). Translates the
 /// Anthropic request into the internal Message/Tool shapes, runs the same
 /// engine + tool-calling pipeline as the OpenAI path, and lifts the output
@@ -30,16 +43,30 @@ pub(crate) async fn anthropic_messages(
     use axum::http::StatusCode;
 
     if let Err(e) = validate_model_id(&req.model) {
-        return anthropic_error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!("{e:?}"),
-        );
+        return anthropic_api_error(e);
     }
     let model_name = normalize_model_id(&req.model);
-    // The conversation goes where the model is.
-    if let Ok(body) = serde_json::to_value(&req) {
-        let prompt_text = body["messages"].to_string();
+    // The conversation goes where the model is. Peers are asked about the prompt this
+    // node would prefill, which is the text their caches are keyed on.
+    let clustered = state.cluster_handle().is_some();
+    if let Some(body) = clustered.then(|| serde_json::to_value(&req).ok()).flatten() {
+        let tool_choice = req.tool_choice.clone();
+        let thinking = req.thinking_preference();
+        let (messages, tools) = req.clone().into_internal();
+        let prompt_text = state
+            .prepare_prompt(
+                &model_name,
+                None,
+                &super::chat_prompt::PromptSpec {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    tool_choice: tool_choice.as_ref(),
+                    thinking,
+                    output_grammar: None,
+                },
+            )
+            .await
+            .prompt;
         let max_tokens = req
             .max_tokens
             .unwrap_or(state.default_inference_config.max_tokens) as u32;
@@ -60,6 +87,11 @@ pub(crate) async fn anthropic_messages(
     if let Some(why) = req.unsupported_input() {
         return anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", why);
     }
+    // The same sampling bounds as every other route.
+    let sampling = super::sampling::SamplingRequest::from_anthropic(&req);
+    if let Err(e) = sampling.validate() {
+        return anthropic_api_error(e);
+    }
 
     if let Some(hint) = non_chat_pipeline_component(&model_name) {
         return anthropic_error_response(
@@ -69,174 +101,74 @@ pub(crate) async fn anthropic_messages(
         );
     }
 
-    // Auto-load on demand (Claude Code expects to just name a model).
-    let keep_alive = state.get_effective_keep_alive(None);
-    if let Err(e) = state.ensure_loaded(&model_name, keep_alive).await {
-        return anthropic_error_response(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            format!("model '{model_name}' could not be loaded: {e}"),
-        );
-    }
-    let engine = match state.get_engine(&model_name).await {
+    // Loaded on demand (Claude Code expects to just name a model), in the window and
+    // cache format the headers ask for.
+    let load =
+        super::admission::LoadRequest::from_headers(&headers, state.get_effective_keep_alive(None));
+    let engine = match state.load_for_request(&model_name, load).await {
         Ok(e) => e,
-        Err(_) => {
-            return anthropic_error_response(
-                StatusCode::NOT_FOUND,
-                "not_found_error",
-                format!("model '{model_name}' not loaded"),
-            );
-        }
+        Err(e) => return anthropic_api_error(e),
     };
-    state.reset_expiration(&model_name).await;
-
-    let chat_template = state
-        .read_chat_template(&model_name)
-        .or_else(|| infer_template_from_model_name(&model_name));
 
     // Pull scalar fields before `into_internal` consumes the request.
     let stream = req.is_stream();
     let max_tokens = req.effective_max_tokens();
-    let temperature = req.temperature;
-    let top_p = req.top_p;
-    let stop_sequences = req.stop_sequences.clone().unwrap_or_default();
-    let tools_active = req.tools_enabled();
-    let tool_format =
-        crate::api::tool_calls::detect_tool_format(chat_template.as_deref(), &model_name);
-    let tool_directive = crate::api::tool_calls::tool_choice_directive(req.tool_choice.as_ref());
     let model_for_resp = model_name.clone();
-    let top_k = req.top_k;
-    let seed = req.seed;
-    let thinking_on = req
-        .thinking
-        .as_ref()
-        .and_then(|t| t.get("type"))
-        .and_then(serde_json::Value::as_str)
-        == Some("enabled");
     let single_tool_call = req
         .tool_choice
         .as_ref()
         .and_then(|c| c.get("disable_parallel_tool_use"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    // A required call (`any`, or one named function) constrains the generation to the
-    // call object itself; a structured output constrains it to the client's schema.
-    let forced_call: Option<Option<String>> = match req
-        .tool_choice
-        .as_ref()
-        .and_then(|c| c.get("type"))
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("any") => Some(None),
-        Some("tool") => Some(
-            req.tool_choice
-                .as_ref()
-                .and_then(|c| c.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-        ),
-        _ => None,
-    };
-    let output_schema = req
-        .output_format
-        .as_ref()
-        .filter(|f| f.get("type").and_then(serde_json::Value::as_str) == Some("json_schema"))
-        .and_then(|f| f.get("schema").cloned());
-
+    let tool_choice = req.tool_choice.clone();
+    let thinking = req.thinking_preference();
+    let output_grammar = req.output_schema().and_then(json_schema_grammar_str);
     let (messages, tools) = req.into_internal();
-    let grammar = if let Some(schema) = output_schema {
-        Some(format!("json_schema:{schema}"))
-    } else if let (Some(only), true) = (forced_call.as_ref(), tools_active) {
-        Some(format!(
-            "json_schema:{}",
-            crate::api::tool_calls::forced_call_schema(&tools, only.as_deref())
-        ))
-    } else {
-        None
-    };
-    let prompt = if tools_active {
-        let flat = crate::api::tool_calls::flatten_messages(
-            &messages,
-            tool_format,
-            &tools,
-            tool_directive.as_deref(),
-        );
-        if template_takes_tools(chat_template.as_deref()) {
-            format_chat_prompt_with_tools(&messages, chat_template.as_deref(), &tools)
-        } else {
-            format_chat_prompt(&flat, chat_template.as_deref())
-        }
-    } else {
-        format_chat_prompt(&messages, chat_template.as_deref())
-    };
-    let mut prompt = prompt;
-    if !thinking_on {
-        super::prompt_format::apply_thinking_preference(&mut prompt, Some("disabled"));
-    }
-    // Whether the template already opened the thinking block; the splitter must know.
-    let thinking_opened = crate::api::thinking::prompt_opens_thinking(&prompt);
+    let super::chat_prompt::PreparedPrompt {
+        prompt,
+        tools_active,
+        tool_format,
+        grammar,
+        thinking_opened,
+    } = state
+        .prepare_prompt(
+            &model_name,
+            Some(&engine),
+            &super::chat_prompt::PromptSpec {
+                messages: &messages,
+                tools: Some(&tools),
+                tool_choice: tool_choice.as_ref(),
+                thinking,
+                output_grammar,
+            },
+        )
+        .await;
     debug!("Anthropic /v1/messages: model={model_name} stream={stream} tools={tools_active} prompt_chars={}", prompt.len());
 
     let params = GenerationParams {
-        prefix_tokens: None,
-        max_tokens: Some(max_tokens),
-        temperature,
-        top_p,
-        top_k: top_k.map(|k| k as _),
-        seed: seed.map(|s| s as _),
-        stop_sequences,
-        early_exit_threshold: None,
-        repeat_penalty: None,
-        repeat_last_n: None,
-        context_length: None,
-        session_id: None,
         grammar,
-        logit_bias: None,
-        top_logprobs: None,
+        ..sampling.into_params()
     };
 
-    let gate_guard = match state
-        .request_gate
-        .acquire_with_info_timeout(
-            crate::api::gate::Priority::Interactive,
-            model_name.clone(),
+    // The gate, the in-flight count and the last user turn's images.
+    let priority = crate::api::gate::Priority::from_headers(&headers)
+        .unwrap_or(crate::api::gate::Priority::Interactive);
+    let admission = match state
+        .admit(
+            engine.clone(),
+            &model_name,
+            priority,
             "/v1/messages",
-            GATE_WAIT,
+            &super::chat_prompt::last_user_images(&messages),
         )
         .await
     {
-        Some(g) => g,
-        None => {
-            return anthropic_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "overloaded_error",
-                format!(
-                    "no inference slot became available within {}s; retry later",
-                    GATE_WAIT.as_secs()
-                ),
-            );
-        }
+        Ok(a) => a,
+        Err(e) => return anthropic_api_error(e),
     };
-    // The last user turn's images go to the vision encoder; none clears what an earlier
-    // request left there. After the gate: both take the model lock.
-    let images: Vec<String> = messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .and_then(|m| m.images.clone())
-        .unwrap_or_default();
-    if images.is_empty() {
-        engine.clear_images().await;
-    } else if let Err(e) = engine.set_images(&images).await {
-        return anthropic_error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!("images: {e}"),
-        );
-    }
 
     if !stream {
-        let _g = gate_guard;
+        let _admitted = admission;
         let _cancel = engine.cancel_guard();
         match engine.generate(&prompt, params).await {
             Ok(result) => {
@@ -260,12 +192,13 @@ pub(crate) async fn anthropic_messages(
                     thinking.as_deref(),
                     &text,
                     &calls,
-                    (result.prompt_eval_count + result.cached_prompt_tokens) as i32,
-                    result.eval_count as i32,
+                    anthropic::MessageUsage::from_counts(
+                        result.prompt_eval_count,
+                        result.cached_prompt_tokens,
+                        result.eval_count,
+                    ),
                     hit_max,
                     stop_seq,
-                    result.cached_prompt_tokens as i32,
-                    result.prompt_eval_count as i32,
                 );
                 (StatusCode::OK, Json(body)).into_response()
             }
@@ -286,7 +219,7 @@ pub(crate) async fn anthropic_messages(
             Ok(mut rx) => {
                 let model_clone = model_for_resp.clone();
                 let event_stream = async_stream::stream! {
-                    let _gate_held = gate_guard;
+                    let _admitted = admission;
                     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
                     // Anthropic event prologue: message_start, open text
                     // block 0, a ping.
@@ -325,7 +258,9 @@ pub(crate) async fn anthropic_messages(
                                     yield Ok(Event::default()
                                         .event("error")
                                         .data(anthropic::sse::error("api_error", &format!("generate: {e}")).to_string()));
-                                    break;
+                                    // The error event ends the stream: no message_delta or
+                                    // message_stop follows it.
+                                    return;
                                 }
                                 None => {
                                     ended = true;
@@ -451,18 +386,30 @@ pub(crate) async fn anthropic_messages(
                     }
 
                     let stats = engine_for_stats.take_last_stream_stats();
-                    let (stop_seq, hit_max, in_tokens, cache_read, cache_creation) = match stats.as_ref() {
+                    // What the engine counted; the chunk count and the prompt estimate only
+                    // where it published nothing.
+                    let (stop_seq, hit_max, usage) = match stats.as_ref() {
                         Some(s) => {
                             let (kind, seq) = s.finish_reason.anthropic();
                             (
                                 seq.map(str::to_string),
                                 kind == "max_tokens" && !used_tools,
-                                (s.prompt_eval_count + s.cached_prompt_tokens) as i32,
-                                s.cached_prompt_tokens as i32,
-                                s.prompt_eval_count as i32,
+                                anthropic::MessageUsage::from_counts(
+                                    s.prompt_eval_count,
+                                    s.cached_prompt_tokens,
+                                    s.eval_count,
+                                ),
                             )
                         }
-                        None => (None, (output_tokens as usize) >= max_tokens && !used_tools, input_tokens, 0, 0),
+                        None => (
+                            None,
+                            (output_tokens as usize) >= max_tokens && !used_tools,
+                            anthropic::MessageUsage {
+                                input: input_tokens,
+                                output: output_tokens,
+                                ..Default::default()
+                            },
+                        ),
                     };
                     yield Ok(Event::default()
                         .event("message_delta")
@@ -470,10 +417,7 @@ pub(crate) async fn anthropic_messages(
                             used_tools,
                             hit_max,
                             stop_seq.as_deref(),
-                            output_tokens,
-                            in_tokens,
-                            cache_read,
-                            cache_creation,
+                            usage,
                         ).to_string()));
                     yield Ok(Event::default()
                         .event("message_stop")
@@ -500,39 +444,31 @@ pub(crate) async fn anthropic_count_tokens(
 ) -> Response {
     use axum::http::StatusCode;
     if let Err(e) = validate_model_id(&req.model) {
-        return anthropic_error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!("{e:?}"),
-        );
+        return anthropic_api_error(e);
     }
     let model_name = normalize_model_id(&req.model);
-    let chat_template = state
-        .read_chat_template(&model_name)
-        .or_else(|| infer_template_from_model_name(&model_name));
-    let tools_active = req.tools_enabled();
-    let tool_format =
-        crate::api::tool_calls::detect_tool_format(chat_template.as_deref(), &model_name);
-    let tool_directive = crate::api::tool_calls::tool_choice_directive(req.tool_choice.as_ref());
+    let tool_choice = req.tool_choice.clone();
+    let thinking = req.thinking_preference();
     let (messages, tools) = req.into_internal();
-    let prompt = if tools_active {
-        let flat = crate::api::tool_calls::flatten_messages(
-            &messages,
-            tool_format,
-            &tools,
-            tool_directive.as_deref(),
-        );
-        if template_takes_tools(chat_template.as_deref()) {
-            format_chat_prompt_with_tools(&messages, chat_template.as_deref(), &tools)
-        } else {
-            format_chat_prompt(&flat, chat_template.as_deref())
-        }
-    } else {
-        format_chat_prompt(&messages, chat_template.as_deref())
-    };
-    let counted = match state.get_engine(&model_name).await {
-        Ok(engine) => engine.count_tokens(&prompt).await,
-        Err(_) => None,
+    let engine = state.get_engine(&model_name).await.ok();
+    // The same prompt the Messages route would prefill, thinking preference included.
+    let prompt = state
+        .prepare_prompt(
+            &model_name,
+            engine.as_deref(),
+            &super::chat_prompt::PromptSpec {
+                messages: &messages,
+                tools: Some(&tools),
+                tool_choice: tool_choice.as_ref(),
+                thinking,
+                output_grammar: None,
+            },
+        )
+        .await
+        .prompt;
+    let counted = match engine {
+        Some(engine) => engine.count_tokens(&prompt).await,
+        None => None,
     };
     let input_tokens = counted.unwrap_or_else(|| estimate_token_count(&prompt) as usize);
     Json(serde_json::json!({ "input_tokens": input_tokens })).into_response()

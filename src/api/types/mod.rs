@@ -996,6 +996,9 @@ pub struct ChatCompletionRequest {
     #[validate(range(min = 0.0, max = 1.0))]
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// Top-k sampling, an extension field OpenAI does not define and several clients send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
     /// Per-request RNG seed. With `temperature > 0` the same seed
     /// produces the same continuation given the same context.
     /// Custom deserializer accepts any integer (including negative
@@ -1028,14 +1031,9 @@ pub struct ChatCompletionRequest {
     #[validate(range(min = -2.0, max = 2.0))]
     #[serde(default)]
     pub presence_penalty: Option<f32>,
-    /// OpenAI's `n`: number of completions to return per call. The
-    /// engine generates one sequence per request; supporting `n > 1`
-    /// requires either repeating the sampler or batched-sampling, both
-    /// of which are out of scope for the current decode loop.
-    /// `max = 1` enforces the cap at the type level - handler-side
-    /// returns the same 400 envelope with a friendlier "issue {n}
-    /// requests in parallel" hint.
-    #[validate(range(min = 1, max = 1))]
+    /// OpenAI's `n`: completions to return per call, each generated as its own request
+    /// and bounded by the handler.
+    #[validate(range(min = 1))]
     #[serde(default)]
     pub n: Option<u32>,
     /// OpenAI's `logprobs` (chat-shape boolean). The sampler doesn't
@@ -1085,6 +1083,16 @@ impl ChatCompletionRequest {
     }
 }
 
+/// OpenAI's `frequency_penalty` and `presence_penalty` (each in [-2, 2], 0 = none) as the
+/// engine's single llama.cpp-style repeat penalty (1 = none). The engine has one
+/// repetition knob, so the two are summed, the sum clamped to the band each penalty is
+/// validated against, and mapped linearly: 0 to 1, +2 to 3, -2 to -1. `None` when the
+/// penalties cancel or are absent.
+pub fn repeat_penalty_from_openai(frequency: Option<f32>, presence: Option<f32>) -> Option<f32> {
+    let pen = (frequency.unwrap_or(0.0) + presence.unwrap_or(0.0)).clamp(-2.0, 2.0);
+    (pen.abs() > f32::EPSILON).then_some(1.0 + pen)
+}
+
 /// OpenAI's `stop` field accepts either a single string or an array.
 /// We deserialize into either shape and flatten downstream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1123,6 +1131,7 @@ impl ChatCompletionRequest {
             user: None,
             stream_options: None,
             top_p: None,
+            top_k: None,
             seed: None,
             stop: None,
             response_format: None,
@@ -1167,22 +1176,9 @@ impl ChatCompletionRequest {
             };
             opts.insert("stop".to_string(), serde_json::json!(v));
         }
-        // Fold OpenAI's two repetition penalties into Ollama's single
-        // repeat_penalty knob using the same +0.0 -> 1.0 / +2.0 -> 3.0 /
-        // -2.0 -> -1.0 linear mapping the chat handler uses. Clamp the
-        // sum to [-2, 2] before adding 1.0 - without the clamp the
-        // converted Ollama request could carry repeat_penalty = 5.0
-        // (both penalties at +2 sum to +4, +1 = 5), which is outside
-        // the engine's expected range. Matches api/handlers/::chat_completion
-        // (line ~3643) so direct-call vs cross-format paths produce
-        // the same engine input.
-        let oa_pen = (self.frequency_penalty.unwrap_or(0.0) + self.presence_penalty.unwrap_or(0.0))
-            .clamp(-2.0, 2.0);
-        if oa_pen.abs() > f32::EPSILON {
-            opts.insert(
-                "repeat_penalty".to_string(),
-                serde_json::json!(1.0_f32 + oa_pen),
-            );
+        if let Some(rp) = repeat_penalty_from_openai(self.frequency_penalty, self.presence_penalty)
+        {
+            opts.insert("repeat_penalty".to_string(), serde_json::json!(rp));
         }
         if let Some(ref u) = self.user {
             opts.insert("session_id".to_string(), serde_json::json!(u));
@@ -1523,6 +1519,16 @@ impl Usage {
             prompt_tokens_details: Some(PromptTokensDetails::default()),
             completion_tokens_details: Some(CompletionTokensDetails::default()),
         }
+    }
+
+    /// Usage from what the engine counted: the prompt is the tokens it prefilled plus
+    /// the ones the resident cache served, and the served ones are reported as cached.
+    pub fn from_counts(prefilled: u64, cached: u64, completion: u64) -> Self {
+        let mut usage = Self::new((prefilled + cached) as i32, completion as i32);
+        if let Some(d) = usage.prompt_tokens_details.as_mut() {
+            d.cached_tokens = cached as i32;
+        }
+        usage
     }
 }
 
@@ -1927,5 +1933,21 @@ mod thinking_field_tests {
         let r: OllamaGenerateRequest =
             serde_json::from_str(r#"{"model":"m","prompt":"p"}"#).unwrap();
         assert_eq!(r.thinking_preference(), None);
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    /// The prompt count includes what the cache served, and the served share is reported
+    /// as cached: the figure a stream and a whole answer both carry.
+    #[test]
+    fn cached_tokens_are_part_of_the_prompt_and_reported() {
+        let u = Usage::from_counts(40, 60, 9);
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 9);
+        assert_eq!(u.total_tokens, 109);
+        assert_eq!(u.prompt_tokens_details.unwrap().cached_tokens, 60);
     }
 }

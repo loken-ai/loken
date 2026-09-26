@@ -233,3 +233,52 @@ fn image_family_matches_catalog_id_rejects_unknown_family_and_id() {
         "z-image-edit"
     ));
 }
+
+/// `n` is bounded the same on chat and completions: 1 when absent, refused at 0 and
+/// past the cap.
+#[test]
+fn n_is_bounded_on_both_routes() {
+    use super::super::sampling::{completions_asked, N_MAX};
+    assert_eq!(completions_asked(None).unwrap(), 1);
+    assert_eq!(completions_asked(Some(3)).unwrap(), 3);
+    assert!(completions_asked(Some(0)).is_err());
+    assert!(completions_asked(Some(N_MAX + 1)).is_err());
+    // The chat request type does not refuse what the handler serves.
+    let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "m", "messages": [{"role": "user", "content": "hi"}], "n": 3
+    }))
+    .unwrap();
+    assert!(validate_request(&req).is_ok());
+}
+
+/// Runs gather into one response: choices re-indexed in order, completions summed, the
+/// prompt counted once or per run.
+#[tokio::test]
+async fn runs_merge_into_one_response() {
+    let answer = |text: &str| -> Result<Response, ApiError> {
+        Ok(Json(serde_json::json!({
+            "id": "x",
+            "choices": [{"index": 0, "text": text}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+        }))
+        .into_response())
+    };
+    for (sum_prompts, prompt) in [(false, 10), (true, 30)] {
+        let out = merge_runs(3, sum_prompts, |i| {
+            let r = answer(&format!("run {i}"));
+            async move { r }
+        })
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(out.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"].as_array().unwrap().len(), 3);
+        assert_eq!(v["choices"][2]["index"], 2);
+        assert_eq!(v["choices"][2]["text"], "run 2");
+        assert_eq!(v["usage"]["prompt_tokens"], prompt);
+        assert_eq!(v["usage"]["completion_tokens"], 6);
+        assert_eq!(v["usage"]["total_tokens"], prompt + 6);
+    }
+}

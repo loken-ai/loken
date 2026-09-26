@@ -178,6 +178,27 @@ impl AnthropicMessagesRequest {
         self.stream.unwrap_or(false)
     }
 
+    /// The thinking preference the prompt builder reads: a reasoning model thinks only
+    /// when `thinking.type` is `enabled`.
+    pub fn thinking_preference(&self) -> Option<&'static str> {
+        let on = self
+            .thinking
+            .as_ref()
+            .and_then(|t| t.get("type"))
+            .and_then(Value::as_str)
+            == Some("enabled");
+        (!on).then_some("disabled")
+    }
+
+    /// The schema a `{type: "json_schema", schema}` structured output constrains the
+    /// answer to.
+    pub fn output_schema(&self) -> Option<&Value> {
+        self.output_format
+            .as_ref()
+            .filter(|f| f.get("type").and_then(Value::as_str) == Some("json_schema"))
+            .and_then(|f| f.get("schema"))
+    }
+
     /// True unless `tool_choice.type == "none"` and tools are present.
     pub fn tools_enabled(&self) -> bool {
         let has = self.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
@@ -375,10 +396,7 @@ fn message_object(
     content: Value,
     stop_reason: Value,
     stop_sequence: Option<&str>,
-    input_tokens: i32,
-    output_tokens: i32,
-    cache_read: i32,
-    cache_creation: i32,
+    usage: MessageUsage,
 ) -> Value {
     json!({
         "id": id,
@@ -388,13 +406,42 @@ fn message_object(
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": stop_sequence,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_read_input_tokens": cache_read,
-            "cache_creation_input_tokens": cache_creation,
-        },
+        "usage": usage.to_json(),
     })
+}
+
+/// Token counts in the Messages API's terms. `input_tokens` excludes what the cache
+/// served, which `cache_read_input_tokens` reports: the prompt is the sum of the input,
+/// cache-read and cache-creation counts, each token counted once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessageUsage {
+    pub input: i32,
+    pub output: i32,
+    pub cache_read: i32,
+    pub cache_creation: i32,
+}
+
+impl MessageUsage {
+    /// From what the engine counted: the tokens it prefilled, the ones the resident
+    /// cache served, and the ones it generated. No request marks a cache breakpoint, so
+    /// nothing is reported as written to a cache.
+    pub fn from_counts(prefilled: u64, cached: u64, output: u64) -> Self {
+        Self {
+            input: prefilled as i32,
+            output: output as i32,
+            cache_read: cached as i32,
+            cache_creation: 0,
+        }
+    }
+
+    fn to_json(self) -> Value {
+        json!({
+            "input_tokens": self.input,
+            "output_tokens": self.output,
+            "cache_read_input_tokens": self.cache_read,
+            "cache_creation_input_tokens": self.cache_creation,
+        })
+    }
 }
 
 /// Build the non-streaming Anthropic Messages response body.
@@ -406,12 +453,9 @@ pub fn build_response(
     thinking: Option<&str>,
     text: &str,
     calls: &[ToolCall],
-    input_tokens: i32,
-    output_tokens: i32,
+    usage: MessageUsage,
     hit_max: bool,
     stop_sequence: Option<&str>,
-    cache_read: i32,
-    cache_creation: i32,
 ) -> Value {
     let used_tools = !calls.is_empty();
     let reason = match stop_sequence {
@@ -424,10 +468,7 @@ pub fn build_response(
         json!(content_blocks(thinking, text, calls)),
         json!(reason),
         stop_sequence.filter(|_| !used_tools),
-        input_tokens,
-        output_tokens,
-        cache_read,
-        cache_creation,
+        usage,
     )
 }
 
@@ -439,7 +480,17 @@ pub mod sse {
     pub fn message_start(id: &str, model: &str, input_tokens: i32) -> Value {
         json!({
             "type": "message_start",
-            "message": message_object(id, model, json!([]), Value::Null, None, input_tokens, 0, 0, 0),
+            "message": message_object(
+                id,
+                model,
+                json!([]),
+                Value::Null,
+                None,
+                MessageUsage {
+                    input: input_tokens,
+                    ..MessageUsage::default()
+                },
+            ),
         })
     }
 
@@ -513,10 +564,7 @@ pub mod sse {
         used_tools: bool,
         hit_max: bool,
         stop_sequence: Option<&str>,
-        output_tokens: i32,
-        input_tokens: i32,
-        cache_read: i32,
-        cache_creation: i32,
+        usage: MessageUsage,
     ) -> Value {
         let reason = match stop_sequence {
             Some(_) if !used_tools => "stop_sequence",
@@ -525,12 +573,7 @@ pub mod sse {
         json!({
             "type": "message_delta",
             "delta": {"stop_reason": reason, "stop_sequence": stop_sequence.filter(|_| !used_tools)},
-            "usage": {
-                "output_tokens": output_tokens,
-                "input_tokens": input_tokens,
-                "cache_read_input_tokens": cache_read,
-                "cache_creation_input_tokens": cache_creation,
-            }
+            "usage": usage.to_json(),
         })
     }
 
@@ -640,7 +683,16 @@ mod tests {
                 arguments: Some("{\"x\":1}".into()),
             }),
         }];
-        let v = build_response("msg_1", "m", None, "", &calls, 5, 7, false, None, 0, 0);
+        let v = build_response(
+            "msg_1",
+            "m",
+            None,
+            "",
+            &calls,
+            MessageUsage::from_counts(5, 0, 7),
+            false,
+            None,
+        );
         assert_eq!(v["stop_reason"], "tool_use");
         let blocks = v["content"].as_array().unwrap();
         assert_eq!(blocks[0]["type"], "tool_use");
@@ -649,8 +701,34 @@ mod tests {
 
     #[test]
     fn response_text_only() {
-        let v = build_response("msg_1", "m", None, "hello", &[], 3, 2, false, None, 0, 0);
+        let v = build_response(
+            "msg_1",
+            "m",
+            None,
+            "hello",
+            &[],
+            MessageUsage::from_counts(3, 0, 2),
+            false,
+            None,
+        );
         assert_eq!(v["stop_reason"], "end_turn");
         assert_eq!(v["content"][0]["text"], "hello");
+    }
+
+    /// A cached token is reported once: the three input counts sum to the prompt, in the
+    /// whole answer and in the stream's closing delta alike.
+    #[test]
+    fn cached_tokens_are_counted_once() {
+        let usage = MessageUsage::from_counts(40, 60, 9);
+        let v = build_response("msg_1", "m", None, "hi", &[], usage, false, None);
+        let d = sse::message_delta(false, false, None, usage);
+        for u in [&v["usage"], &d["usage"]] {
+            let prompt = u["input_tokens"].as_i64().unwrap()
+                + u["cache_read_input_tokens"].as_i64().unwrap()
+                + u["cache_creation_input_tokens"].as_i64().unwrap();
+            assert_eq!(prompt, 100, "{u}");
+            assert_eq!(u["cache_read_input_tokens"], 60);
+            assert_eq!(u["output_tokens"], 9);
+        }
     }
 }

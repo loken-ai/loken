@@ -78,16 +78,38 @@ impl ToolFormat {
 }
 
 /// Decide whether tools should be injected for this request: true when a
-/// non-empty `tools` array is present AND `tool_choice` is not the string
-/// `"none"`. (`required`/specific-function choices degrade to auto, since
-/// the engine can't be forced to emit a particular call - the model is
-/// merely instructed.)
+/// non-empty `tools` array is present AND `tool_choice` is not `none`, in
+/// the OpenAI string form (`"none"`) or the Anthropic object form
+/// (`{"type":"none"}`).
 pub fn should_inject_tools(tools: Option<&Vec<Tool>>, tool_choice: Option<&Value>) -> bool {
     let has_tools = tools.map(|t| !t.is_empty()).unwrap_or(false);
     if !has_tools {
         return false;
     }
-    !matches!(tool_choice.and_then(|v| v.as_str()), Some("none"))
+    let kind = tool_choice.and_then(|v| v.as_str().or_else(|| v.get("type")?.as_str()));
+    kind != Some("none")
+}
+
+/// The call a `tool_choice` requires, in either dialect: `Some(None)` for any tool
+/// (OpenAI `"required"`, Anthropic `{"type":"any"}`), `Some(Some(name))` for one named
+/// function (OpenAI `{"type":"function","function":{"name"}}`, Anthropic
+/// `{"type":"tool","name"}`), `None` when no call is required.
+pub fn forced_call(tool_choice: Option<&Value>) -> Option<Option<String>> {
+    let tc = tool_choice?;
+    if let Some(s) = tc.as_str() {
+        return (s == "required").then_some(None);
+    }
+    match tc.get("type").and_then(Value::as_str)? {
+        "any" | "required" => Some(None),
+        "function" => Some(
+            tc.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ),
+        "tool" => Some(tc.get("name").and_then(Value::as_str).map(str::to_string)),
+        _ => None,
+    }
 }
 
 /// Detect the tool-call family from the model's chat template (preferred,

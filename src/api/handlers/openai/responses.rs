@@ -312,8 +312,48 @@ fn response_object(
     })
 }
 
+/// The chat-completion body a Responses request runs as. `stream_options` goes with a
+/// stream only, the one shape chat completion accepts it in; the reasoning effort,
+/// seed, stop sequences and parallel-call switch carry over under their chat names.
+fn chat_body(
+    req: &Value,
+    model: &str,
+    messages: &[Value],
+    tools: Option<Vec<Value>>,
+    stream: bool,
+) -> Value {
+    let field = |k: &str| req.get(k).cloned().unwrap_or(Value::Null);
+    let mut chat = json!({
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+        "max_completion_tokens": field("max_output_tokens"),
+        "temperature": field("temperature"),
+        "top_p": field("top_p"),
+        "top_k": field("top_k"),
+        "seed": field("seed"),
+        "stop": field("stop"),
+        "user": field("user"),
+        "parallel_tool_calls": field("parallel_tool_calls"),
+        "reasoning_effort": req.pointer("/reasoning/effort").cloned().unwrap_or(Value::Null),
+        "tool_choice": lower_tool_choice(req.get("tool_choice")),
+        "response_format": lower_text_format(req),
+    });
+    if stream {
+        chat["stream_options"] = json!({"include_usage": true});
+    }
+    if let Some(t) = tools {
+        chat["tools"] = Value::Array(t);
+    }
+    if let Some(obj) = chat.as_object_mut() {
+        obj.retain(|_, v| !v.is_null());
+    }
+    chat
+}
+
 pub(crate) async fn openai_responses(
     State(state): State<APIServer>,
+    headers: axum::http::HeaderMap,
     OpenAIJson(req): OpenAIJson<Value>,
 ) -> Result<Response, ApiError> {
     let model = req
@@ -328,35 +368,13 @@ pub(crate) async fn openai_responses(
     let tools = lower_tools(&req).map_err(ApiError::Validation)?;
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let keep = req.get("store").and_then(Value::as_bool).unwrap_or(true);
-    let mut chat = json!({
-        "model": model,
-        "messages": messages,
-        "stream": stream,
-        "stream_options": {"include_usage": true},
-        "max_completion_tokens": req.get("max_output_tokens").cloned().unwrap_or(Value::Null),
-        "temperature": req.get("temperature").cloned().unwrap_or(Value::Null),
-        "top_p": req.get("top_p").cloned().unwrap_or(Value::Null),
-        "user": req.get("user").cloned().unwrap_or(Value::Null),
-        "tool_choice": lower_tool_choice(req.get("tool_choice")),
-        "response_format": lower_text_format(&req),
-    });
-    if let Some(t) = tools {
-        chat["tools"] = Value::Array(t);
-    }
-    if let Some(obj) = chat.as_object_mut() {
-        obj.retain(|_, v| !v.is_null());
-    }
+    let chat = chat_body(&req, &model, &messages, tools, stream);
     let chat_req: ChatCompletionRequest = serde_json::from_value(chat)
         .map_err(|e| ApiError::Validation(format!("responses: {e}")))?;
     let id = new_id("resp");
     let created = chrono::Utc::now().timestamp();
     let history = messages.clone();
-    let inner = chat_completion(
-        State(state),
-        axum::http::HeaderMap::new(),
-        OpenAIJson(chat_req),
-    )
-    .await?;
+    let inner = chat_completion(State(state), headers, OpenAIJson(chat_req)).await?;
     if !inner.status().is_success() {
         return Ok(inner);
     }
@@ -557,6 +575,29 @@ pub(crate) async fn openai_delete_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A whole answer runs as a chat completion chat completion accepts: no
+    /// `stream_options` outside a stream, which it refuses.
+    #[test]
+    fn a_whole_answer_is_a_valid_chat_request() {
+        let req = json!({
+            "model": "m",
+            "input": "hi",
+            "seed": 7,
+            "stop": ["END"],
+            "reasoning": {"effort": "minimal"}
+        });
+        let msgs = lower_input(&req).unwrap();
+        let whole = chat_body(&req, "m", &msgs, None, false);
+        assert!(whole.get("stream_options").is_none());
+        assert_eq!(whole["reasoning_effort"], "minimal");
+        assert_eq!(whole["seed"], 7);
+        assert_eq!(whole["stop"][0], "END");
+        let parsed: ChatCompletionRequest = serde_json::from_value(whole).unwrap();
+        assert_eq!(parsed.reasoning_effort.as_deref(), Some("minimal"));
+        let streamed = chat_body(&req, "m", &msgs, None, true);
+        assert_eq!(streamed["stream_options"]["include_usage"], true);
+    }
 
     #[test]
     fn input_items_lower_to_chat_messages() {
