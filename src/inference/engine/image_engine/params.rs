@@ -40,9 +40,8 @@ pub struct ImageGenParams {
     /// took one all along; nothing carried the caller's, so every render used one fixed
     /// string and no request could say otherwise.
     ///
-    /// `None` keeps that string. The distilled flow-matching models run CFG-free and
-    /// ignore it entirely - handing them one would cost a second forward per step and
-    /// change nothing.
+    /// `None` keeps that string. The distilled flow-matching models run CFG-free, so a
+    /// non-blank one is refused there (see [`MediaCapabilities`]).
     pub negative_prompt: Option<String>,
     /// Areas of the canvas that carry their own prompt, as
     /// `(prompt, x, y, w, h, strength)` with the rectangle in 0..1 of the image.
@@ -96,6 +95,25 @@ impl Default for ImageGenParams {
             loras: Vec::new(),
         }
     }
+}
+
+impl ImageGenParams {
+    /// The seed this render draws its noise from: the caller's when the request named
+    /// one, a fresh random one otherwise. Stored back into `seed`, so every later read -
+    /// the render itself, a caller echoing it for reproduction - sees the same value.
+    pub fn resolve_seed(&mut self) -> u64 {
+        *self.seed.get_or_insert_with(|| {
+            use rand::RngExt;
+            rand::rng().random::<u64>()
+        })
+    }
+}
+
+/// A finished render and the seed its noise was drawn from.
+#[derive(Debug, Clone)]
+pub struct RenderedImage {
+    pub png_base64: String,
+    pub seed: u64,
 }
 
 /// Progress event during image generation

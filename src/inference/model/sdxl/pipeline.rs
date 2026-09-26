@@ -286,9 +286,10 @@ impl SdxlPipeline {
         guidance: f32,
         seed: u64,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
+        on_step: crate::inference::sample::StepSink,
     ) -> Result<Vec<u8>> {
         self.render(
-            prompt, negative, width, height, steps, guidance, seed, None, cancel,
+            prompt, negative, width, height, steps, guidance, seed, None, cancel, on_step,
         )
     }
 
@@ -486,6 +487,7 @@ impl SdxlPipeline {
         strength: f32,
         seed: u64,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
+        on_step: crate::inference::sample::StepSink,
     ) -> Result<Vec<u8>> {
         self.render(
             prompt,
@@ -497,6 +499,7 @@ impl SdxlPipeline {
             seed,
             Some((init, strength)),
             cancel,
+            on_step,
         )
     }
 
@@ -512,6 +515,7 @@ impl SdxlPipeline {
         seed: u64,
         init: Option<(&[u8], f32)>,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
+        on_step: crate::inference::sample::StepSink,
     ) -> Result<Vec<u8>> {
         let (sampler, scheduler) = (self.sampler, self.scheduler);
         let (lw, lh) = (width / 8, height / 8);
@@ -576,7 +580,9 @@ impl SdxlPipeline {
         };
         crate::tensor::rng::clear_global_seed();
 
-        for i in 0..sigmas.len() - 1 {
+        let total_steps = sigmas.len() - 1;
+        on_step(0, total_steps);
+        for i in 0..total_steps {
             if let Some(c) = cancel {
                 c.bail()?;
             }
@@ -647,6 +653,7 @@ impl SdxlPipeline {
                     solver.step(&x, &d, prev, sigma, sigma_next)
                 }
             };
+            on_step(i + 1, total_steps);
         }
 
         // Decode. The VAE applies the SDXL scaling itself.
@@ -735,6 +742,7 @@ mod tests {
                 7.0,
                 7,
                 None,
+                &crate::inference::sample::no_progress,
             )
             .expect("generate");
         println!(
@@ -818,6 +826,7 @@ mod tests {
                 strength,
                 5,
                 None,
+                &crate::inference::sample::no_progress,
             )
             .expect("img2img")
         };

@@ -19,6 +19,8 @@ use crate::inference::model::zimage::hetero::HeteroZImage;
 use crate::inference::place::layer_executor::HeteroPlan;
 use crate::inference::place::model_request::ModelRequest;
 
+mod capabilities;
+pub use capabilities::*;
 mod params;
 pub use params::*;
 mod demand;
@@ -94,7 +96,12 @@ pub(crate) fn remember(presence: &PresenceCell, state: &LoadedImageModelState) {
 }
 
 fn family_of(state: &LoadedImageModelState) -> &'static str {
-    match state.model {
+    family_of_model(&state.model)
+}
+
+/// The family identifier of a loaded model.
+fn family_of_model(model: &LoadedImageModel) -> &'static str {
+    match model {
         LoadedImageModel::Flux(_) => "flux",
         LoadedImageModel::ZImage(_) => "zimage",
         LoadedImageModel::QwenImage(_) => "qwen-image",
@@ -561,7 +568,6 @@ fn build_flux_regions(
     Ok(out)
 }
 
-/// Generate image with Flux pipeline (non-streaming)
 /// The CUDA ordinal a facade device names, or None when it is not a GPU.
 fn gpu_index_of(dev: &Device) -> Option<usize> {
     let nd = dev.clone();
@@ -631,6 +637,7 @@ fn denoise_split(
     timesteps: &[f64],
     guidance: f64,
     cancel: &crate::inference::serve::cancel::CancelToken,
+    on_step: impl FnMut(usize),
 ) -> AnyResult<Tensor> {
     use crate::inference::model::flux::sampling as fs;
     let (noise, ids) = (&state.img, &state.img_ids);
@@ -647,6 +654,7 @@ fn denoise_split(
             pooled,
             timesteps,
             guidance,
+            on_step,
             Some(cancel),
         )?,
         None => fs::denoise(
@@ -658,6 +666,7 @@ fn denoise_split(
             pooled,
             timesteps,
             guidance,
+            on_step,
             Some(cancel),
         )?,
     };
@@ -710,13 +719,19 @@ fn decoded_to_cpu_u8(decoded: Tensor) -> AnyResult<Tensor> {
     Ok(bytes.to_device(&Device::Cpu)?)
 }
 
+/// Generate an image with the Flux pipeline, reporting each denoise step to `on_step`.
+///
+/// Text-to-image, img2img, Kontext editing, inpainting and regions all run through here;
+/// the placement (whole or split) only changes which denoise loop walks the schedule.
 fn generate_flux_image(
     flux_state: &mut FluxModelState,
     device: &Device,
     dtype: DType,
     prompt: &str,
     params: &ImageGenParams,
+    on_step: crate::inference::sample::StepSink,
 ) -> AnyResult<String> {
+    use crate::inference::model::flux::sampling as fs;
     let pipeline_t = std::time::Instant::now();
     let height = params.height;
     let width = params.width;
@@ -737,9 +752,7 @@ fn generate_flux_image(
                 let clat = flux_encode_clean_latent(flux_state, b64, height, width)?
                     .to_device(device)?
                     .to_dtype(DType::F32)?;
-                Some(crate::inference::model::flux::sampling::pack_context(
-                    &clat,
-                )?)
+                Some(fs::pack_context(&clat)?)
             }
             None => return Err(anyhow!("flux-kontext requires an input image")),
         }
@@ -747,93 +760,90 @@ fn generate_flux_image(
         None
     };
 
-    // Prepare latent
-    let (initial_img, timesteps) = if kontext_ctx.is_some() {
-        let img = crate::inference::model::flux::sampling::get_noise(1, height, width, device)?
-            .to_dtype(DType::F32)?;
-        let timesteps =
-            crate::inference::model::flux::sampling::get_schedule(params.num_steps, None);
-        (img, timesteps)
-    } else if let Some(ref input_b64) = params.input_image {
-        info!("img2img mode: strength={}", params.strength);
-        prepare_flux_img2img_latent(
-            flux_state,
-            device,
-            input_b64,
-            height,
-            width,
-            params.strength,
-            params.num_steps,
-        )?
-    } else {
-        let img = crate::inference::model::flux::sampling::get_noise(1, height, width, device)?
-            .to_dtype(DType::F32)?;
-        let timesteps =
-            crate::inference::model::flux::sampling::get_schedule(params.num_steps, None);
-        (img, timesteps)
+    let (initial_img, timesteps) = match &params.input_image {
+        Some(input_b64) if kontext_ctx.is_none() => {
+            info!("img2img mode: strength={}", params.strength);
+            prepare_flux_img2img_latent(
+                flux_state,
+                device,
+                input_b64,
+                height,
+                width,
+                params.strength,
+                params.num_steps,
+            )?
+        }
+        _ => {
+            let img = fs::get_noise(1, height, width, device)?.to_dtype(DType::F32)?;
+            (
+                img,
+                flux_schedule(flux_state.schedule_shift, params.num_steps, height, width),
+            )
+        }
     };
 
     let inpaint = build_flux_inpaint(flux_state, device, params, height, width)?;
     refuse_what_a_split_model_drops(&flux_state.flux, &inpaint, &regions)?;
-    let state =
-        crate::inference::model::flux::sampling::State::new(&t5_emb, &clip_emb, &initial_img)?;
+    refuse_what_kontext_drops(kontext_ctx.is_some(), &inpaint, &regions)?;
+    let state = fs::State::new(&t5_emb, &clip_emb, &initial_img)?;
     drop(t5_emb);
     drop(clip_emb);
     drop(initial_img);
 
-    // Denoise. A whole placement casts the state in ONCE, walks the schedule, and casts the
-    // final latent back ONCE for the VAE - no per-step cast.
     set_flux_loras(flux_state, &device.clone(), &params.loras)?;
+
+    // Progress counts the steps this run takes: img2img truncates the schedule, and a
+    // total that shrank after the first event would make a client's bar jump.
+    let total_steps = timesteps.len().saturating_sub(1);
+    on_step(0, total_steps);
+    let mut step_t = std::time::Instant::now();
+    let report = |step: usize| {
+        info!(
+            "Flux step {}/{}: {:.1}s",
+            step + 1,
+            total_steps,
+            step_t.elapsed().as_secs_f64()
+        );
+        step_t = std::time::Instant::now();
+        on_step(step + 1, total_steps);
+    };
+
     let denoise_t = std::time::Instant::now();
-    // MEASURE WHAT THIS RENDER ACTUALLY TAKES, WHATEVER PATH IT RUNS ON.
-    //
-    // The reserve a placement leaves used to be an estimate that nothing corrected: the
-    // feedback existed but hung off a per-step callback, so it fired on ONE variant of
-    // ONE entry point and silently did nothing for the rest - including the SPLIT path,
-    // which is the one the reserve sent there. Measured once it was wired: 4.29 GB
-    // reserved at 1024^2 for a denoise that needs 2.61 GB. A reserve that high splits a
-    // model that fits one card, and a split runs the cards in sequence.
-    //
-    // The watcher samples from outside, so no variant can be left out of it.
-    //
-    // ONLY A SINGLE-DEVICE RENDER MEASURES WHAT A SINGLE-DEVICE RESERVE NEEDS. Under a
-    // split the card holds a fraction of the blocks, so the free VRAM it gives up is a
-    // fraction too - and feeding that number back as the reserve is how a 1536 render
-    // measured at 3.5 GB while split, was then placed whole on a card with 3.7 GB spare,
-    // and ran out in `matmul` on its first steps. Observed directly, which is the only
-    // reason this guard exists rather than a plausible argument for the other choice.
+    // The watcher samples free VRAM from outside the loop, so every placement and every
+    // loop is measured the same way. Only a whole placement feeds its figure back: a split
+    // card holds a fraction of the blocks and gives up a fraction of its memory.
     let placement_is_whole = !matches!(flux_state.flux, FluxVariant::Hetero(_));
-    // A SPLIT model revisits its own placement between steps. Blocks spilled to the host
-    // under pressure otherwise stay there for every remaining step, however much VRAM the
-    // subsystem that caused the pressure has since given back. The headroom is the same
-    // demand the placement used, so a block only goes back onto a card that can still
-    // hold the next step's activations.
+    // A split model revisits its own placement between steps, keeping this render's demand
+    // free on any card a spilled block moves back to.
     if let FluxVariant::Hetero(h) = &mut flux_state.flux {
         h.set_render_headroom(flux_runtime_demand(width, height));
     }
     let watch_gpu = gpu_index_of(device);
     let free_before = watch_gpu.and_then(crate::inference::place::vram_manager::free_on);
     let watch = watch_gpu.and_then(crate::inference::place::vram_manager::VramWatch::start);
+    // A whole placement casts the state in once, walks the schedule, and casts the final
+    // latent back once for the VAE.
     let denoised = match &mut flux_state.flux {
         FluxVariant::Whole(flux) => {
-            let nstate = crate::inference::model::flux::sampling::NativeState::to_f32(&state)?;
+            let nstate = fs::NativeState::to_f32(&state)?;
             let out = if let Some((ctx, ctx_ids)) = &kontext_ctx {
-                crate::inference::model::flux::sampling::denoise_kontext_native(
+                fs::denoise_kontext_native(
                     flux,
                     &nstate,
                     &ctx.to_dtype(DType::F32)?,
                     &ctx_ids.to_dtype(DType::F32)?,
                     &timesteps,
                     params.guidance,
+                    report,
                     Some(&params.cancel),
                 )?
             } else {
-                crate::inference::model::flux::sampling::denoise_native(
+                fs::denoise_native(
                     flux,
                     &nstate,
                     &timesteps,
                     params.guidance,
-                    |_| {},
+                    report,
                     Some(&params.cancel),
                     params.step_reuse,
                     inpaint.as_ref(),
@@ -849,6 +859,7 @@ fn generate_flux_image(
             &timesteps,
             params.guidance,
             &params.cancel,
+            report,
         )?,
     }
     .to_dtype(dtype)?;
@@ -861,325 +872,14 @@ fn generate_flux_image(
     info!(
         "Flux denoise: {:.1}s ({} steps, {}x{})",
         denoise_t.elapsed().as_secs_f64(),
-        params.num_steps,
+        total_steps,
         width,
         height
     );
     drop(state);
 
-    // VAE decode. <=512^2 -> GPU (fast cuDNN). Large images (>=768^2) whose GPU decode
-    // would OOM (~6 GB peak vs the resident Flux/T5) fall back to the CPU VAE.
     let vae_t = std::time::Instant::now();
-    let big = width.max(height) > 512;
-    let unpacked = crate::inference::model::flux::sampling::unpack(&denoised, height, width)?
-        .to_dtype(DType::F32)?;
-    drop(denoised);
-    let (decoded, vae_where) = if big {
-        // Prefer the WHOLE-image GPU decode: it is seamless, where tiles show faint
-        // seams (the VAE mid-block's attention is global over the whole image).
-        // But CHOOSE by free VRAM instead of discovering by failure: when an
-        // allocation fails the tensor layer bounces that single op to the host
-        // rather than returning an error, so a card with no room does not raise the
-        // OOM this cascade waits for - it just ping-pongs the whole decode across
-        // PCIe. Peak is the widest full-resolution feature map plus its 3x3 im2col.
-        let gpu_lat = unpacked.to_device(&flux_state.vae_device)?;
-        let whole_peak = vae_whole_decode_peak(width, height);
-        let fits_whole = free_on_device(&flux_state.vae_device) >= whole_peak;
-        // MEASURE the decode, and DECIDE NOTHING on it yet.
-        //
-        // Two formulas in this file estimate what a decode costs and they disagree by
-        // more than three times - so a decode is admitted onto a card by one figure and
-        // refused by the other, and neither was ever checked against a decode. Replacing
-        // one guess with another is what stranded a render on the host; the number below
-        // is what the next change should be built on instead.
-        let vae_gpu = gpu_index_of(&flux_state.vae_device);
-        let vae_watch = if fits_whole {
-            vae_gpu.and_then(vram_watch_on)
-        } else {
-            None
-        };
-        let vae_free_before = vae_gpu.and_then(crate::inference::place::vram_manager::free_on);
-        let whole = if fits_whole {
-            flux_state.ae.decode(&gpu_lat)
-        } else {
-            info!(
-                "Flux VAE: {:.1} GB whole-image decode does not fit; tiling",
-                whole_peak as f64 / 1e9
-            );
-            Err(crate::tensor::Error::msg(
-                "vae: no room for a whole-image decode",
-            ))
-        };
-        if let (Some(w), Some(before)) = (vae_watch, vae_free_before) {
-            report_vae_decode_cost("Flux", width, height, whole_peak, before, w, whole.is_ok());
-        }
-        // Size the tile from the VRAM that is actually free rather than fixing it at 64:
-        // a card too tight for a 64-px tile used to skip straight to the CPU, when a
-        // smaller tile would still have decoded on the device.
-        let flux_free = free_on_device(&flux_state.vae_device);
-        let flux_tile =
-            choose_vae_tile(flux_free, whole_peak, width, height).unwrap_or(VAE_TILE_OVERLAP * 4);
-        match whole {
-            Ok(d) => (d, "GPU-whole"),
-            Err(_) => match flux_state
-                .ae
-                .decode_tiled(&gpu_lat, flux_tile, VAE_TILE_OVERLAP)
-            {
-                Ok(d) => (d, "GPU-tiled"),
-                Err(e) => match &flux_state.ae_cpu {
-                    Some(ae_cpu) => {
-                        warn!("Flux VAE GPU decode failed ({e}); CPU fallback");
-                        (ae_cpu.decode(&unpacked.to_device(&Device::Cpu)?)?, "CPU")
-                    }
-                    None => return Err(anyhow!("Flux VAE GPU decode failed: {e}")),
-                },
-            },
-        }
-    } else {
-        (
-            flux_state
-                .ae
-                .decode(&unpacked.to_device(&flux_state.vae_device)?)?,
-            "GPU",
-        )
-    };
-    let _ = vae_where;
-
-    let img_cpu = decoded_to_cpu_u8(decoded)?;
-    let base64_png = tensor_to_png_base64(&img_cpu.squeeze(0)?)?;
-    info!("Flux VAE: {:.1}s", vae_t.elapsed().as_secs_f64());
-    info!(
-        "Flux total: {:.1}s ({}x{}, {} steps)",
-        pipeline_t.elapsed().as_secs_f64(),
-        width,
-        height,
-        params.num_steps
-    );
-    Ok(base64_png)
-}
-
-/// Generate image with Flux pipeline (streaming with progress)
-fn generate_flux_image_stream(
-    flux_state: &mut FluxModelState,
-    device: &Device,
-    dtype: DType,
-    prompt: &str,
-    params: &ImageGenParams,
-    tx: &tokio::sync::mpsc::Sender<ImageStreamEvent>,
-) -> AnyResult<String> {
-    let pipeline_t = std::time::Instant::now();
-    let height = params.height;
-    let width = params.width;
-
-    let (t5_emb, clip_emb) = encode_flux_text(flux_state, device, prompt)?;
-    release_text_encoder_if_needed(flux_state, width, height);
-    // One encode per region. They go through the same prompt cache as the base, so a
-    // repeated region costs nothing after the first step of the first render.
-    let regions = build_flux_regions(
-        flux_state, device, params, height, width, &t5_emb, &clip_emb,
-    )?;
-
-    let (initial_img, timesteps) = if let Some(ref input_b64) = params.input_image {
-        info!("img2img stream: strength={}", params.strength);
-        prepare_flux_img2img_latent(
-            flux_state,
-            device,
-            input_b64,
-            height,
-            width,
-            params.strength,
-            params.num_steps,
-        )?
-    } else {
-        let img = crate::inference::model::flux::sampling::get_noise(1, height, width, device)?
-            .to_dtype(DType::F32)?;
-        let timesteps =
-            crate::inference::model::flux::sampling::get_schedule(params.num_steps, None);
-        (img, timesteps)
-    };
-
-    let inpaint = build_flux_inpaint(flux_state, device, params, height, width)?;
-    refuse_what_a_split_model_drops(&flux_state.flux, &inpaint, &regions)?;
-    let state =
-        crate::inference::model::flux::sampling::State::new(&t5_emb, &clip_emb, &initial_img)?;
-    drop(t5_emb);
-    drop(clip_emb);
-    drop(initial_img);
-
-    // Inline denoise loop for progress
-    let actual_steps = timesteps.len().saturating_sub(1);
-    // Initial "starting" event so the client's progress bar doesn't
-    // sit at no-update for the first step's latency. MUST use the
-    // post-strength-truncation actual_steps as total - img2img cuts
-    // the schedule so `actual_steps = num_steps - start_step`, and
-    // if we report num_steps here the bar visibly jumps to a smaller
-    // total on the very next event.
-    let _ = tx.blocking_send(ImageStreamEvent::Progress {
-        completed: 0,
-        total: actual_steps,
-    });
-    // The STREAMING path needs the adapters too: it is a second denoise loop, and an
-    // adapter honoured on one endpoint but not the other is the kind of split behaviour
-    // nobody finds until a render silently ignores their LoRA.
-    set_flux_loras(flux_state, &device.clone(), &params.loras)?;
-
-    // What this render actually takes, watched from outside the loop - the same
-    // mechanism the non-streaming path uses, so the two entry points cannot disagree
-    // about what the machine has learned. The per-step sampler this replaces read
-    // through `vram_manager::probe`, which trims the CUDA mempools before it reads:
-    // handing memory back to the driver between every step, for a number that is only
-    // being observed.
-    let watch_gpu = gpu_index_of(device);
-    let free_before_denoise = watch_gpu.and_then(crate::inference::place::vram_manager::free_on);
-    let watch = watch_gpu.and_then(crate::inference::place::vram_manager::VramWatch::start);
-    // A whole placement runs the whole loop from a state cast once (one cast in and out per
-    // generate, progress via the denoise_native callback); a split one keeps the inline
-    // per-step loop below, which is also where its between-step repatriation would go.
-    let img = if let FluxVariant::Whole(flux) = &flux_state.flux {
-        let nstate = crate::inference::model::flux::sampling::NativeState::to_f32(&state)?;
-        let mut step_t = std::time::Instant::now();
-        let out = crate::inference::model::flux::sampling::denoise_native(
-            flux,
-            &nstate,
-            &timesteps,
-            params.guidance,
-            |step| {
-                info!(
-                    "Flux step {}/{}: {:.1}s",
-                    step + 1,
-                    actual_steps,
-                    step_t.elapsed().as_secs_f64()
-                );
-                // Track the LOW-WATER free VRAM across the denoise. The reserve this
-                // placement leaves is a constant nobody has checked against a render:
-                // too high and a model that fits one card gets split, which serialises
-                // the cards and is the worst outcome available; too low and the denoise
-                // OOMs mid-render. One NVML read per step is nothing next to a step, and
-                // it turns the reserve into a measured number instead of an argument.
-                step_t = std::time::Instant::now();
-                let _ = tx.blocking_send(ImageStreamEvent::Progress {
-                    completed: step + 1,
-                    total: actual_steps,
-                });
-            },
-            Some(&params.cancel),
-            params.step_reuse,
-            inpaint.as_ref(),
-            &regions,
-        )?;
-        out.to_device(device)?
-    } else {
-        let b_sz = state.img.dim(0)?;
-        let dev = state.img.device();
-        let guidance_tensor = Tensor::full(params.guidance as f32, b_sz, &dev)?;
-        // Everything the forward reads apart from the latent and the timestep is fixed for
-        // the whole walk, so it is named once here instead of being projected out of the
-        // state on every step.
-        let (ids, txt, txt_ids, pooled) = (&state.img_ids, &state.txt, &state.txt_ids, &state.vec);
-        let mut img = state.img.clone();
-
-        for (step, window) in timesteps.windows(2).enumerate() {
-            // Same per-step cancellation contract as the native loop: a dropped
-            // client must not leave this render burning the GPU to completion.
-            if params.cancel.is_cancelled() {
-                return Err(anyhow!("flux: generation cancelled"));
-            }
-            let step_t = std::time::Instant::now();
-            let (t_curr, t_prev) = (window[0], window[1]);
-            let t_vec = Tensor::full(t_curr as f32, b_sz, &dev)?;
-            let pred = {
-                use crate::inference::model::flux::sampling::WithForward;
-                match &flux_state.flux {
-                    // Handled by the whole-loop branch above.
-                    FluxVariant::Whole(_) => unreachable!("a whole placement denoises above"),
-                    FluxVariant::Hetero(hetero) => hetero.forward(
-                        &img,
-                        ids,
-                        txt,
-                        txt_ids,
-                        &t_vec,
-                        pooled,
-                        Some(&guidance_tensor),
-                    )?,
-                }
-            };
-            img = (img + pred * (t_prev - t_curr))?;
-            info!(
-                "Flux step {}/{}: {:.1}s",
-                step + 1,
-                actual_steps,
-                step_t.elapsed().as_secs_f64()
-            );
-            let _ = tx.blocking_send(ImageStreamEvent::Progress {
-                completed: step + 1,
-                total: actual_steps,
-            });
-        }
-        img
-    };
-
-    if let (Some(w), Some(before)) = (watch, free_before_denoise) {
-        report_denoise_vram(
-            width,
-            height,
-            before,
-            w,
-            !matches!(flux_state.flux, FluxVariant::Hetero(_)),
-        );
-    }
-    // VAE decode. This used to read `if width.max(height) > 512 && a CPU VAE exists ->
-    // CPU`, unconditionally: a STATIC SIZE GATE, with no idea whether the GPU had room.
-    // So every edit above 512 decoded on the host even with both cards nearly empty,
-    // which is minutes instead of seconds - the same defect the txt2img path already
-    // had fixed above. Decide by free VRAM, and tile before leaving the device.
-    let vae_t = std::time::Instant::now();
-    let denoised = img.to_dtype(dtype)?;
-    drop(state);
-    let (decoded, vae_where) = {
-        let whole_peak = vae_whole_decode_peak(width, height);
-        let free_here = free_on_device(&flux_state.vae_device);
-        let fits_whole = free_here >= whole_peak;
-        // Same bound as the Z-Image path: tile only at 2x2 or coarser, which measured
-        // clean, and leave anything finer to the CPU.
-        let tile = if fits_whole || !flux_state.vae_device.is_cuda() {
-            None
-        } else {
-            choose_vae_tile(free_here, whole_peak, width, height)
-        };
-        if fits_whole || tile.is_some() || flux_state.ae_cpu.is_none() {
-            let unpacked =
-                crate::inference::model::flux::sampling::unpack(&denoised, height, width)?
-                    .to_dtype(DType::F32)?
-                    .to_device(&flux_state.vae_device)?;
-            drop(denoised);
-            match tile {
-                Some(t) => {
-                    info!(
-                        "Flux VAE (edit): {:.1} GB whole-image decode does not fit; tiling at                          {t} latent px",
-                        whole_peak as f64 / 1e9
-                    );
-                    (
-                        flux_state.ae.decode_tiled(&unpacked, t, VAE_TILE_OVERLAP)?,
-                        "GPU-tiled",
-                    )
-                }
-                None => (flux_state.ae.decode(&unpacked)?, "GPU-whole"),
-            }
-        } else {
-            // Nothing on the device can hold even the smallest tile, and only THEN is
-            // the resident CPU VAE the right answer rather than a slow reflex.
-            let unpacked =
-                crate::inference::model::flux::sampling::unpack(&denoised, height, width)?
-                    .to_dtype(DType::F32)?
-                    .to_device(&Device::Cpu)?;
-            drop(denoised);
-            let ae = flux_state
-                .ae_cpu
-                .as_ref()
-                .ok_or_else(|| crate::tensor::Error::msg("the CPU VAE is not resident"))?;
-            (ae.decode(&unpacked)?, "CPU")
-        }
-    };
+    let (decoded, vae_where) = decode_flux_latent(flux_state, denoised, width, height)?;
     let img_cpu = decoded_to_cpu_u8(decoded)?;
     info!(
         "Flux VAE: {:.1}s ({vae_where})",
@@ -1190,9 +890,107 @@ fn generate_flux_image_stream(
         pipeline_t.elapsed().as_secs_f64(),
         width,
         height,
-        params.num_steps
+        total_steps
     );
     tensor_to_png_base64(&img_cpu.squeeze(0)?)
+}
+
+/// The full sampling schedule for a `height x width` render under the checkpoint's `shift`.
+///
+/// A dev-family checkpoint pushes its stops toward the noisy end by an amount read off the
+/// image's token count; a schnell one walks the plain descent it was distilled on.
+fn flux_schedule(
+    shift: Option<(f64, f64)>,
+    num_steps: usize,
+    height: usize,
+    width: usize,
+) -> Vec<f64> {
+    let image_tokens =
+        (height / (FLUX_VAE_STRIDE * FLUX_PATCH)) * (width / (FLUX_VAE_STRIDE * FLUX_PATCH));
+    crate::inference::model::flux::sampling::get_schedule(
+        num_steps,
+        shift.map(|(base, max)| (image_tokens, base, max)),
+    )
+}
+
+/// Decode a denoised Flux latent, choosing where by free VRAM rather than by failure.
+///
+/// A failed device allocation bounces that op to the host instead of returning an error,
+/// so a card with no room would stream the whole decode over PCIe rather than fail. The
+/// order is: the whole image on the VAE's device when it fits (seamless), tiles on that
+/// device when only a tile fits, the resident CPU VAE otherwise. A device decode that still
+/// fails falls back to the CPU VAE when one is resident. Returns the image and where it ran.
+fn decode_flux_latent(
+    flux_state: &FluxModelState,
+    denoised: Tensor,
+    width: usize,
+    height: usize,
+) -> AnyResult<(Tensor, &'static str)> {
+    let whole_peak = vae_whole_decode_peak(width, height);
+    let free_here = free_on_device(&flux_state.vae_device);
+    let fits_whole = free_here >= whole_peak;
+    // Tiles only at the coarseness `choose_vae_tile` allows, which measured seam-free.
+    let tile = if fits_whole || !flux_state.vae_device.is_cuda() {
+        None
+    } else {
+        choose_vae_tile(free_here, whole_peak, width, height)
+    };
+    let unpacked = crate::inference::model::flux::sampling::unpack(&denoised, height, width)?
+        .to_dtype(DType::F32)?;
+    drop(denoised);
+    let cpu_decode = |ae_cpu: &crate::inference::model::flux::vae::AutoEncoder| {
+        ae_cpu
+            .decode(&unpacked.to_device(&Device::Cpu)?)
+            .map_err(anyhow::Error::from)
+    };
+    if let (false, None, Some(ae_cpu)) = (fits_whole, tile, &flux_state.ae_cpu) {
+        return Ok((cpu_decode(ae_cpu)?, "CPU"));
+    }
+    let gpu_lat = unpacked.to_device(&flux_state.vae_device)?;
+    // Only the whole decode is watched: a tiled run gives up a fraction of the memory the
+    // whole-image estimate describes.
+    let vae_gpu = gpu_index_of(&flux_state.vae_device);
+    let vae_watch = if fits_whole {
+        vae_gpu.and_then(vram_watch_on)
+    } else {
+        None
+    };
+    let vae_free_before = vae_gpu.and_then(crate::inference::place::vram_manager::free_on);
+    let attempt = match tile {
+        Some(t) => {
+            info!(
+                "Flux VAE: {:.1} GB whole-image decode does not fit; tiling at {t} latent px",
+                whole_peak as f64 / 1e9
+            );
+            flux_state
+                .ae
+                .decode_tiled(&gpu_lat, t, VAE_TILE_OVERLAP)
+                .map(|d| (d, "GPU-tiled"))
+        }
+        None => flux_state.ae.decode(&gpu_lat).map(|d| (d, "GPU-whole")),
+    };
+    if let (Some(w), Some(before)) = (vae_watch, vae_free_before) {
+        report_vae_decode_cost(
+            "Flux",
+            width,
+            height,
+            whole_peak,
+            before,
+            w,
+            attempt.is_ok(),
+        );
+    }
+    drop(gpu_lat);
+    match attempt {
+        Ok(v) => Ok(v),
+        Err(e) => match &flux_state.ae_cpu {
+            Some(ae_cpu) => {
+                warn!("Flux VAE device decode failed ({e}); CPU fallback");
+                Ok((cpu_decode(ae_cpu)?, "CPU"))
+            }
+            None => Err(anyhow!("Flux VAE decode failed: {e}")),
+        },
+    }
 }
 
 /// Convert a (C, H, W) U8 tensor to base64-encoded PNG
@@ -1292,7 +1090,7 @@ fn prepare_flux_img2img_latent(
     // known cost of restoring it is documented on get_schedule_from - the control is
     // quantised, and below ~0.4 strength on a 4-step schedule this errors instead of
     // editing gently.
-    let full_schedule = crate::inference::model::flux::sampling::get_schedule(num_steps, None);
+    let full_schedule = flux_schedule(state.schedule_shift, num_steps, height, width);
     let start_step = ((1.0 - strength) * num_steps as f64).round() as usize;
     let timesteps: Vec<f64> = full_schedule[start_step..].to_vec();
     if timesteps.len() < 2 {
@@ -1339,6 +1137,31 @@ fn refuse_what_a_split_model_drops(
         return Err(anyhow!(
             "flux: regional prompts need the model whole on one card, and this one is split \
              across several - retry without `regions`, or on a card that holds the model"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse what the Kontext loops cannot honour, rather than dropping it.
+///
+/// A Kontext forward sees the noise grid and the fixed reference concatenated, so a mask or a
+/// set of region weights laid over it would address the wrong tokens; the loops take neither.
+fn refuse_what_kontext_drops(
+    kontext: bool,
+    inpaint: &Option<crate::inference::model::flux::sampling::Inpaint>,
+    regions: &[crate::inference::model::flux::sampling::Region],
+) -> AnyResult<()> {
+    if !kontext {
+        return Ok(());
+    }
+    if inpaint.is_some() {
+        return Err(anyhow!(
+            "flux-kontext: an instruction edit takes no `mask` - retry without it"
+        ));
+    }
+    if !regions.is_empty() {
+        return Err(anyhow!(
+            "flux-kontext: an instruction edit takes no `regions` - retry without them"
         ));
     }
     Ok(())
@@ -1686,7 +1509,7 @@ fn generate_zimage(
     zimg: &mut ZImageModelState,
     prompt: &str,
     params: &ImageGenParams,
-    tx: Option<&tokio::sync::mpsc::Sender<ImageStreamEvent>>,
+    on_step: crate::inference::sample::StepSink,
 ) -> AnyResult<String> {
     // Z-Image never asked for the reduced-precision paths: the render this engine is held to
     // is the one a freshly started process produces. Saying so here is what stops another
@@ -1867,16 +1690,7 @@ fn generate_zimage(
         #[cfg(not(feature = "cuda"))]
         Vec::new()
     };
-    // Initial "starting" event: 0/remaining_steps so the client's
-    // progress bar paints something during the first step's latency
-    // (~50-200 ms on warm cache, longer on cold). Matches the Flux
-    // streaming path post-fix in this commit.
-    if let Some(tx) = tx {
-        let _ = tx.blocking_send(ImageStreamEvent::Progress {
-            completed: 0,
-            total: remaining_steps,
-        });
-    }
+    on_step(0, remaining_steps);
     // NativeSingle runs the whole loop on the native substrate: latents +
     // text-encoder products are bridged in ONCE here, every per-step tensor
     // (timestep, DiT forward, negate, scheduler Euler update) stays native,
@@ -1907,12 +1721,7 @@ fn generate_zimage(
 
             let done_in_loop = step - start_step + 1;
             debug!("Z-Image step {done_in_loop}/{remaining_steps}: t={t:.4} (native)");
-            if let Some(tx) = tx {
-                let _ = tx.blocking_send(ImageStreamEvent::Progress {
-                    completed: done_in_loop,
-                    total: remaining_steps,
-                });
-            }
+            on_step(done_in_loop, remaining_steps);
         }
         latents = nlatents.to_device(device)?.to_dtype(dtype)?;
     } else {
@@ -1942,12 +1751,7 @@ fn generate_zimage(
 
             let done_in_loop = step - start_step + 1;
             debug!("Z-Image step {done_in_loop}/{remaining_steps}: t={t:.4}");
-            if let Some(tx) = tx {
-                let _ = tx.blocking_send(ImageStreamEvent::Progress {
-                    completed: done_in_loop,
-                    total: remaining_steps,
-                });
-            }
+            on_step(done_in_loop, remaining_steps);
         }
     }
 

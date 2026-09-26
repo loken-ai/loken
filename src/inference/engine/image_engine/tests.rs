@@ -263,3 +263,62 @@ fn pick_aux_device_text_encoder_picks_fastest_that_fits() {
         "text encoder should land on the fastest device that fits, got {picked:?}"
     );
 }
+
+#[test]
+fn a_kontext_edit_refuses_regions_and_masks_it_cannot_honour() {
+    let z = || Tensor::zeros((1,), DType::F32).unwrap();
+    let region = crate::inference::model::flux::sampling::Region {
+        txt: z(),
+        txt_ids: z(),
+        vec: z(),
+        weight: z(),
+    };
+    let regions = [region];
+    assert!(refuse_what_kontext_drops(true, &None, &regions).is_err());
+    assert!(refuse_what_kontext_drops(false, &None, &regions).is_ok());
+    assert!(refuse_what_kontext_drops(true, &None, &[]).is_ok());
+}
+
+#[test]
+fn a_dev_checkpoint_pushes_its_schedule_and_schnell_does_not() {
+    let schnell = flux_schedule(None, 28, 1024, 1024);
+    assert_eq!(
+        schnell,
+        crate::inference::model::flux::sampling::get_schedule(28, None)
+    );
+    let dev = flux_schedule(
+        Some((FLUX_DEV_BASE_SHIFT, FLUX_DEV_MAX_SHIFT)),
+        28,
+        1024,
+        1024,
+    );
+    assert_eq!(dev.len(), schnell.len());
+    assert_eq!((dev[0], *dev.last().unwrap()), (1.0, 0.0));
+    // The push moves every interior stop toward the noisy end.
+    for (d, s) in dev.iter().zip(&schnell).skip(1).take(27) {
+        assert!(d > s, "dev stop {d} is not above schnell stop {s}");
+    }
+}
+
+#[test]
+fn a_named_seed_is_kept_and_a_missing_one_is_drawn_once() {
+    let mut named = ImageGenParams {
+        seed: Some(7),
+        ..Default::default()
+    };
+    assert_eq!(named.resolve_seed(), 7);
+    assert_eq!(named.seed, Some(7));
+
+    let mut unnamed = ImageGenParams::default();
+    let drawn = unnamed.resolve_seed();
+    assert_eq!(
+        unnamed.seed,
+        Some(drawn),
+        "the drawn seed must be stored back"
+    );
+    assert_eq!(
+        unnamed.resolve_seed(),
+        drawn,
+        "a second read must not redraw"
+    );
+}

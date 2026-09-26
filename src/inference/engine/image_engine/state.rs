@@ -64,7 +64,16 @@ pub struct FluxModelState {
     /// Skips the ~50-200 ms base64 decode + VAE encode when the user
     /// iterates with the same source image but a different prompt.
     pub(super) vae_latent_cache: PromptTextCache<Tensor>,
+    /// `(base, max)` shift of the resolution-dependent schedule push a guidance-distilled
+    /// (dev-family) checkpoint samples with; `None` for a timestep-distilled (schnell)
+    /// checkpoint, which walks the plain descent.
+    pub schedule_shift: Option<(f64, f64)>,
 }
+
+/// The shift a dev-family FLUX checkpoint's schedule is pushed by, at the 256-token and
+/// the 4096-token image the push is interpolated between (the reference sampler's values).
+pub(super) const FLUX_DEV_BASE_SHIFT: f64 = 0.5;
+pub(super) const FLUX_DEV_MAX_SHIFT: f64 = 1.15;
 
 /// Z-Image scheduler constants
 pub const ZIMAGE_BASE_SEQ_LEN: usize = 256;

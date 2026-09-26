@@ -200,13 +200,14 @@ pub fn denoise<M: WithForward>(
     vec_: &Tensor,
     timesteps: &[f64],
     guidance: f64,
+    mut on_step: impl FnMut(usize),
     cancel: Option<&crate::inference::serve::cancel::CancelToken>,
 ) -> Result<Tensor> {
     let b_sz = img.dim(0)?;
     let dev = img.device();
     let guidance = Tensor::full(guidance as f32, b_sz, &dev)?;
     let mut img = img.clone();
-    for (t_curr, t_prev) in flow_match::steps(timesteps) {
+    for (step, (t_curr, t_prev)) in flow_match::steps(timesteps).enumerate() {
         if cancelled(cancel) {
             return Err(cancel_err());
         }
@@ -214,6 +215,7 @@ pub fn denoise<M: WithForward>(
         let pred = model.forward(&img, img_ids, txt, txt_ids, &t_vec, vec_, Some(&guidance))?;
         img = flow_match::euler_step(&img, &pred, t_prev - t_curr)?;
         model.between_steps();
+        on_step(step);
     }
     Ok(img)
 }
@@ -245,6 +247,7 @@ pub fn denoise_kontext<M: WithForward>(
     vec_: &Tensor,
     timesteps: &[f64],
     guidance: f64,
+    mut on_step: impl FnMut(usize),
     cancel: Option<&crate::inference::serve::cancel::CancelToken>,
 ) -> Result<Tensor> {
     let b_sz = noise.dim(0)?;
@@ -253,7 +256,7 @@ pub fn denoise_kontext<M: WithForward>(
     let guidance = Tensor::full(guidance as f32, b_sz, &dev)?;
     let ids = Tensor::cat(&[noise_ids, ctx_ids], 1)?;
     let mut img = noise.clone();
-    for (t_curr, t_prev) in flow_match::steps(timesteps) {
+    for (step, (t_curr, t_prev)) in flow_match::steps(timesteps).enumerate() {
         if cancelled(cancel) {
             return Err(cancel_err());
         }
@@ -263,6 +266,7 @@ pub fn denoise_kontext<M: WithForward>(
         let pred_noise = pred.narrow(1, 0, n_noise)?; // only the noise tokens' velocity
         img = flow_match::euler_step(&img, &pred_noise, t_prev - t_curr)?;
         model.between_steps();
+        on_step(step);
     }
     Ok(img)
 }
@@ -518,6 +522,7 @@ pub fn denoise_kontext_native<M: WithForward>(
     ctx_ids: &tensor::Tensor,
     timesteps: &[f64],
     guidance: f64,
+    mut on_step: impl FnMut(usize),
     cancel: Option<&crate::inference::serve::cancel::CancelToken>,
 ) -> tensor::Result<tensor::Tensor> {
     let b_sz = state.img.dim(0)?;
@@ -526,7 +531,7 @@ pub fn denoise_kontext_native<M: WithForward>(
     let guidance = full_native(guidance as f32, b_sz, &dev)?;
     let ids = tensor::Tensor::cat(&[&state.img_ids, ctx_ids], 1)?;
     let mut img = state.img.clone();
-    for (t_curr, t_prev) in flow_match::steps(timesteps) {
+    for (step, (t_curr, t_prev)) in flow_match::steps(timesteps).enumerate() {
         if cancelled(cancel) {
             return Err(cancel_err());
         }
@@ -536,6 +541,7 @@ pub fn denoise_kontext_native<M: WithForward>(
         // Only the noise tokens integrate the velocity; the reference stays clean.
         let pred_noise = pred.narrow(1, 0, n_noise)?;
         img = flow_match::euler_step(&img, &pred_noise, t_prev - t_curr)?;
+        on_step(step);
     }
     Ok(img)
 }

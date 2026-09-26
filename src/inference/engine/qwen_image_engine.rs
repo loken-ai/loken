@@ -552,6 +552,7 @@ pub fn generate_edit(
     // What the guidance steers AWAY from. Blank means an unconditioned branch, which
     // is what an edit is tuned against, so "" stays the default here.
     negative: Option<&str>,
+    on_step: crate::inference::sample::StepSink,
 ) -> AnyResult<String> {
     use base64::Engine as _;
     let dev = &state.dit_device;
@@ -721,6 +722,7 @@ pub fn generate_edit(
     let mut x: Vec<f32> = noise(si * state.cfg.in_channels, seed);
     // An EDIT starts from a real image, where an approximated step is far more
     // visible than in a from-noise render: every step is computed.
+    on_step(0, steps);
     for i in 0..steps {
         cancel.bail()?;
         let mut cat = x.clone();
@@ -750,6 +752,7 @@ pub fn generate_edit(
                 }
             }
         }
+        on_step(i + 1, steps);
     }
 
     tokens_to_png(state, x, lh, lw, true)
@@ -769,6 +772,7 @@ pub fn generate(
     step_reuse: f32,
     // What the guidance steers AWAY from. `None`/blank keeps the family default.
     negative: Option<&str>,
+    on_step: crate::inference::sample::StepSink,
 ) -> AnyResult<String> {
     let dev = &state.dit_device;
     let steps = num_steps.max(2); // sigma schedule divides by (steps-1)
@@ -824,6 +828,7 @@ pub fn generate(
     // twice what it is on a single-branch sampler.
     use crate::inference::model::flux::sampling::StepReuse;
     let (mut reuse_p, mut reuse_n) = (StepReuse::new(step_reuse), StepReuse::new(step_reuse));
+    on_step(0, steps);
     for i in 0..steps {
         cancel.bail()?;
         let last = i + 1 == steps;
@@ -853,6 +858,7 @@ pub fn generate(
         };
         let dt = sig[i + 1] - sig[i];
         x = x.add(&v.affine(dt, 0.0)?)?; // Euler: x += dt*v
+        on_step(i + 1, steps);
     }
     if reuse_p.skipped + reuse_n.skipped > 0 {
         info!(

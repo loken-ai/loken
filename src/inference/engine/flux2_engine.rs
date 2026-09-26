@@ -280,6 +280,7 @@ pub fn generate(
     _guidance: f32,
     seed: u64,
     cancel: &crate::inference::serve::cancel::CancelToken,
+    on_step: crate::inference::sample::StepSink,
 ) -> AnyResult<String> {
     let dev = &state.dit_device;
     let steps = num_steps.max(1);
@@ -303,12 +304,14 @@ pub fn generate(
         (si, state.cfg.in_channels),
     )?
     .to_device(dev)?;
+    on_step(0, steps);
     for i in 0..steps {
         cancel.bail()?;
         // The pipeline hands the model sigma (t/1000) and the model re-multiplies by 1000.
         let v = state.dit.forward(&x, &txt, sig[i] * 1000.0, gh, gw)?;
         let dt = sig[i + 1] - sig[i];
         x = x.add(&v.affine(dt, 0.0)?)?;
+        on_step(i + 1, steps);
     }
 
     // 3) Decode: the VAE owns the batch-norm un-normalisation and the 2x2 unpatchify.

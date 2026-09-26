@@ -332,6 +332,7 @@ pub fn generate(
     guidance: f32,
     seed: u64,
     cancel: &crate::inference::serve::cancel::CancelToken,
+    on_step: crate::inference::sample::StepSink,
 ) -> AnyResult<String> {
     let dev = &state.dit_device;
     let steps = num_steps.max(1);
@@ -383,6 +384,7 @@ pub fn generate(
     let sig: Vec<f32> = (0..steps)
         .map(|k| CONDITIONING_SIGMA + (k as f32) * (1.0 - CONDITIONING_SIGMA) / steps as f32)
         .collect();
+    on_step(0, steps);
     for i in 0..steps {
         cancel.bail()?;
         let sigma = sig[i];
@@ -398,6 +400,7 @@ pub fn generate(
         } else {
             x = x0;
         }
+        on_step(i + 1, steps);
     }
 
     // 4) FLUX VAE decode: [in_ch, lh, lw] -> facade [1, in_ch, lh, lw] -> [1, 3, H, W]. The DiT
@@ -478,6 +481,7 @@ mod tests {
             4.0,
             42,
             &cancel,
+            &crate::inference::sample::no_progress,
         )
         .expect("generate");
         use base64::Engine;

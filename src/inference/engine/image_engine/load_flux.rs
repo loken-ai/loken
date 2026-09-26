@@ -930,6 +930,7 @@ impl ImageEngine {
                     ae_cpu,
                     text_cache: PromptTextCache::new(PROMPT_TEXT_CACHE_CAP),
                     vae_latent_cache: PromptTextCache::new(IMG2IMG_LATENT_CACHE_CAP),
+                    schedule_shift: is_dev.then_some((FLUX_DEV_BASE_SHIFT, FLUX_DEV_MAX_SHIFT)),
                 }),
                 device,
                 dtype: gpu_dtype,
