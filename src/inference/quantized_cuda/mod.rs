@@ -210,6 +210,9 @@ pub use quantize::*;
 #[cfg(all(test, feature = "cuda"))]
 mod ncu_harness;
 
+#[cfg(all(test, feature = "cuda"))]
+mod gqa_ratio_parity;
+
 /// What the runtime NVRTC compile of the mat-vec kernels costs, and how big it is.
 ///
 /// The file instantiates one kernel per (format, destination dtype, batch size) - ten times

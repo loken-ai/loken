@@ -436,14 +436,14 @@ impl LlmEngine {
             // `graph_captured` flag so the non-graph dev_pos path can
             // still grow its buffers. phi2 unblocked.
             let kv_quant_supported = (matches!(head_dim, 64 | 128 | 256)
-                && matches!(n_q_per_kv, 1 | 2 | 4 | 5 | 8))
+                && matches!(n_q_per_kv, 1 | 2 | 4 | 5 | 7 | 8))
                 && kv_arch_check != "gemma4"
                 || is_gemma4_q8_ok;
             // The KV precision follows the architecture: what the quantised kernels can
             // serve, then what each family was measured to prefer.
             let kv_quant = if !kv_quant_supported && !matches!(kv_quant, KvQuant::Off) {
                 warn!(
-                    "⚠️  Q8/Q4 KV cache kernels don't support head_dim={} x n_q_per_kv={} (want {{64,128,256}} x {{1,2,4,5,8}}). Auto-downgrading kv_quant to Off for {}.",
+                    "⚠️  Q8/Q4 KV cache kernels don't support head_dim={} x n_q_per_kv={} (want {{64,128,256}} x {{1,2,4,5,7,8}}). Auto-downgrading kv_quant to Off for {}.",
                     head_dim, n_q_per_kv, &model_id_clone
                 );
                 KvQuant::Off
