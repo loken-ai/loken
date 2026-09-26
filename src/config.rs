@@ -63,54 +63,33 @@ impl Default for ServerConfig {
     }
 }
 
-/// Inference configuration from TOML file
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+/// Inference configuration from TOML file. Only what loken cannot decide itself: the model it
+/// serves by default, where things live, and the features an operator switches on. Sampling,
+/// placement, threads and cache formats are decided from the model and the machine.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub struct InferenceConfigToml {
     pub model_id: String,
-    pub model_source: Option<String>, // "ollama" or "huggingface"
-    pub max_tokens: Option<usize>,
-    pub context_length: Option<usize>,
-    pub temperature: Option<f64>,
-    pub top_p: Option<f64>,
-    pub top_k: Option<usize>,
-    pub seed: Option<u64>,
-    pub device_index: Option<usize>,
     pub draft_model: Option<String>,
     pub draft_device_index: Option<usize>,
-    #[serde(default)]
-    pub kv_shift_reuse: bool,
-    #[serde(default)]
-    pub kv_snapshots: usize,
     #[serde(default)]
     pub kv_disk_dir: Option<String>,
     #[serde(default)]
     pub kv_disk_budget_gb: f64,
-    #[serde(default)]
-    pub kv_snapshot_budget_gb: f64,
     #[serde(default)]
     pub files_dir: Option<String>,
     #[serde(default)]
     pub moderation_model: Option<String>,
     #[serde(default)]
     pub public_url: Option<String>,
-    pub max_gpu_memory_fraction: Option<f64>,
-
-    // Performance settings
-    pub force_gpu_layers: Option<usize>,
-    pub use_quantized_gpu: Option<bool>,
-    pub cpu_threads: Option<usize>,
-
-    // Device testing/optimization
-    pub disable_arc_layers: Option<bool>, // Skip Arc/OpenCL layers (test mode)
-
-    // KV-cache storage quantization: "off" (default), "q8", or "q4".
-    pub kv_quant: Option<String>,
-
     /// Continuous batching (paged KV) for CONCURRENT request throughput.
     /// Default OFF: single-stream decode is faster on the serial path;
     /// turn on for multi-client serving (aggregate throughput regime).
     /// GPU-only; ignored on CPU models.
     pub continuous_batching: Option<bool>,
+    /// Keys this version no longer reads, kept so a config written for an older one still
+    /// loads; each is reported once at startup.
+    #[serde(flatten, skip_serializing)]
+    pub obsolete: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// Energy-reporting configuration (`[energy]` section). All optional with sane
@@ -263,38 +242,22 @@ impl Config {
 
         InferenceConfig {
             model_id: toml_config.model_id.clone(),
-            max_tokens: toml_config.max_tokens.unwrap_or(2048),
-            context_length: toml_config.context_length.unwrap_or(4096),
-            temperature: toml_config.temperature.unwrap_or(0.7) as f32,
-            top_p: toml_config.top_p.unwrap_or(0.9) as f32,
-            top_k: toml_config.top_k.unwrap_or(50),
-            seed: toml_config.seed.unwrap_or(42),
+            context_length: 0,
             dtype: DType::F16, // Default to F16
-            device_index: toml_config.device_index,
+            device_index: None,
             draft_model: toml_config.draft_model.clone(),
             draft_device_index: toml_config.draft_device_index,
-            kv_shift_reuse: toml_config.kv_shift_reuse,
-            kv_snapshots: toml_config.kv_snapshots,
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
             kv_disk_budget_gb: toml_config.kv_disk_budget_gb,
-            kv_snapshot_budget_gb: toml_config.kv_snapshot_budget_gb,
             files_dir: toml_config.files_dir.clone(),
             moderation_model: toml_config.moderation_model.clone(),
             public_url: toml_config.public_url.clone(),
-            max_gpu_memory_fraction: toml_config.max_gpu_memory_fraction.unwrap_or(0.9),
-
-            // Performance settings
-            force_gpu_layers: toml_config.force_gpu_layers,
-            use_quantized_gpu: toml_config.use_quantized_gpu.unwrap_or(true),
-            cpu_threads: toml_config.cpu_threads.unwrap_or(0),
             progress_callback: None, // No progress callback from config file
             models_dir: None,        // Will be set by APIServer
-            disable_arc_layers: toml_config.disable_arc_layers.unwrap_or(false),
+            disable_arc_layers: false,
             disable_cuda: false,
             force_cuda_only_layers: false, // Not exposed in config.toml, use programmatically for testing
-            repeat_penalty: 1.1,           // Ollama default
-            repeat_last_n: 64,             // Ollama default
-            kv_quant: parse_kv_quant(toml_config.kv_quant.as_deref()),
+            kv_quant: crate::inference::engine::llm_engine::KvQuant::Off,
         }
     }
 
@@ -373,31 +336,7 @@ impl Config {
             server: None,
             inference: InferenceConfigToml {
                 model_id: "test".into(),
-                model_source: None,
-                max_tokens: None,
-                context_length: None,
-                temperature: None,
-                top_p: None,
-                top_k: None,
-                seed: None,
-                device_index: None,
-                draft_model: None,
-                draft_device_index: None,
-                kv_shift_reuse: false,
-                kv_snapshots: 0,
-                kv_disk_dir: None,
-                kv_disk_budget_gb: 0.0,
-                kv_snapshot_budget_gb: 0.0,
-                files_dir: None,
-                moderation_model: None,
-                public_url: None,
-                max_gpu_memory_fraction: None,
-                force_gpu_layers: None,
-                use_quantized_gpu: None,
-                cpu_threads: None,
-                disable_arc_layers: None,
-                kv_quant: None,
-                continuous_batching: None,
+                ..Default::default()
             },
             ollama_models_dir: None,
             huggingface_models_dir: None,
@@ -417,24 +356,6 @@ impl Config {
     }
 }
 
-/// Parse a `kv_quant` string into the engine enum. Accepts the same
-/// aliases as the runtime `options.kv_quant` override on the API
-/// (extract_kv_quant_override in api/handlers/) so the same string in
-/// config.toml and in a per-request override resolves identically.
-/// Unknown / missing -> Off (no quantization, F-dtype KV cache).
-fn parse_kv_quant(raw: Option<&str>) -> crate::inference::engine::llm_engine::KvQuant {
-    use crate::inference::engine::llm_engine::KvQuant;
-    let Some(s) = raw else {
-        return KvQuant::Off;
-    };
-    match s.trim().to_ascii_lowercase().as_str() {
-        "off" | "none" | "f16" | "f32" => KvQuant::Off,
-        "q8" | "q8_0" => KvQuant::Q8,
-        "q4" | "q4_0" => KvQuant::Q4,
-        _ => KvQuant::Off,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,7 +369,6 @@ mod tests {
 
             [inference]
             model_id = "test-model"
-            max_tokens = 128
             temperature = 0.8
             force_gpu_layers = 12
         "#;
@@ -456,48 +376,14 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.server().port, 8080);
         assert_eq!(config.inference.model_id, "test-model");
-        assert_eq!(config.inference.force_gpu_layers, Some(12));
-    }
-
-    #[test]
-    fn parse_kv_quant_matches_handler_aliases() {
-        use crate::inference::engine::llm_engine::KvQuant;
-        // None / unknown / explicit-off variants
-        assert!(matches!(parse_kv_quant(None), KvQuant::Off));
-        assert!(matches!(parse_kv_quant(Some("off")), KvQuant::Off));
-        assert!(matches!(parse_kv_quant(Some("NONE")), KvQuant::Off));
-        assert!(matches!(parse_kv_quant(Some("f16")), KvQuant::Off));
-        assert!(matches!(parse_kv_quant(Some("F32")), KvQuant::Off));
-        // Q8 aliases
-        assert!(matches!(parse_kv_quant(Some("q8")), KvQuant::Q8));
-        assert!(matches!(parse_kv_quant(Some("Q8")), KvQuant::Q8));
-        assert!(matches!(parse_kv_quant(Some("Q8_0")), KvQuant::Q8));
-        // Q4 aliases
-        assert!(matches!(parse_kv_quant(Some("q4")), KvQuant::Q4));
-        assert!(matches!(parse_kv_quant(Some("Q4_0")), KvQuant::Q4));
-        // Whitespace-tolerant (TOML strings may carry trailing whitespace
-        // from in-file comments or copy-paste mishaps).
-        assert!(matches!(parse_kv_quant(Some("  q4  ")), KvQuant::Q4));
-        // Unknown falls back to Off (safest - never silently downgrade
-        // precision the user didn't ask for).
-        assert!(matches!(parse_kv_quant(Some("q2")), KvQuant::Off));
-        assert!(matches!(parse_kv_quant(Some("nonsense")), KvQuant::Off));
-    }
-
-    #[test]
-    fn to_inference_config_respects_kv_quant_aliases() {
-        // Parse a minimal config TOML that carries the alias; verifies that
-        // both the TOML deserialiser and to_inference_config() round-trip
-        // 'Q8_0' (handler-side alias) into the engine enum.
-        let toml_str = r#"
-            [inference]
-            model_id = "x"
-            kv_quant = "Q8_0"
-        "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        let inferred = config.to_inference_config();
-        use crate::inference::engine::llm_engine::KvQuant;
-        assert!(matches!(inferred.kv_quant, KvQuant::Q8));
+        // Keys loken now decides still load, and are held aside to be reported.
+        let obsolete: Vec<&str> = config
+            .inference
+            .obsolete
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(obsolete, ["force_gpu_layers", "temperature"]);
     }
 }
 

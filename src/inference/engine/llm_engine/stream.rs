@@ -27,12 +27,15 @@ impl LlmEngine {
         tokenizer: Tokenizer,
         eos_set: Vec<u32>,
         ctx_len: usize,
+        defaults: super::generation_defaults::GenerationDefaults,
         prompt: &str,
-        params: GenerationParams,
+        mut params: GenerationParams,
     ) -> tokio::sync::mpsc::Receiver<Result<String, String>> {
         use crate::inference::serve::continuous_batch::SamplingParams;
         use crate::inference::serve::continuous_serve::CbToken;
-        let config = self.config.clone();
+        if params.stop_sequences.is_empty() {
+            params.stop_sequences = defaults.stop.clone();
+        }
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(4096);
         let tokens: Vec<u32> = match tokenizer.encode(prompt, true) {
             Ok(e) => with_prefix_tokens(&params, e.get_ids()),
@@ -41,27 +44,25 @@ impl LlmEngine {
                 return rx;
             }
         };
-        let max_new = params
-            .max_tokens
-            .unwrap_or(config.max_tokens)
-            .min(ctx_len.saturating_sub(tokens.len()))
-            .max(1);
+        let resolved = resolve_gen_params(&params, &defaults, ctx_len, tokens.len());
+        let max_new = resolved.max_tokens.max(1);
         // Mirror build_sampling_from: top_k>0 gates TopK; top_p<1.0 gates TopP;
         // temperature==0 (penalty<=1) ⇒ exact argmax in the worker's sampler.
-        let temperature = params.temperature.unwrap_or(config.temperature);
-        let top_p = params.top_p.unwrap_or(config.top_p);
-        let top_k = params.top_k.unwrap_or(config.top_k);
         let sampling = SamplingParams {
-            temperature: temperature as f64,
-            top_k: if top_k > 0 { Some(top_k) } else { None },
-            top_p: if top_p < 1.0 {
-                Some(top_p as f64)
+            temperature: resolved.temperature as f64,
+            top_k: if resolved.top_k > 0 {
+                Some(resolved.top_k)
             } else {
                 None
             },
-            repeat_penalty: params.repeat_penalty.unwrap_or(config.repeat_penalty),
-            repeat_last_n: params.repeat_last_n.unwrap_or(config.repeat_last_n),
-            seed: params.seed.unwrap_or(config.seed),
+            top_p: if resolved.top_p < 1.0 {
+                Some(resolved.top_p as f64)
+            } else {
+                None
+            },
+            repeat_penalty: resolved.repeat_penalty,
+            repeat_last_n: resolved.repeat_last_n,
+            seed: resolved.seed,
         };
         let stops = params.stop_sequences.clone();
         let cb_rx = server.submit_cb(tokens, max_new, sampling);
@@ -164,10 +165,11 @@ impl LlmEngine {
                         let mut eos_set = state.eos_token_ids_extra.clone();
                         eos_set.push(state.eos_token_id);
                         let ctx_len = state.context_length;
+                        let defaults = state.generation_defaults.clone();
                         drop(guard);
-                        return Ok(
-                            self.stream_via_cb(server, tokenizer, eos_set, ctx_len, prompt, params)
-                        );
+                        return Ok(self.stream_via_cb(
+                            server, tokenizer, eos_set, ctx_len, defaults, prompt, params,
+                        ));
                     }
                 }
             }
@@ -178,10 +180,6 @@ impl LlmEngine {
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
         let config = self.config.clone();
-        let kv_shift_reuse = config.kv_shift_reuse;
-        let kv_snapshots = config.kv_snapshots;
-        let kv_snapshot_budget =
-            (config.kv_snapshot_budget_gb.max(0.0) * (1u64 << 30) as f64) as u64;
         let kv_disk = self.kv_disk.clone();
         let prompt = prompt.to_string();
         // Buffer-size 4096 (vs prior 64): with the prior buffer, after
@@ -240,6 +238,7 @@ impl LlmEngine {
                 prompt_tokens,
                 _use_speculative,
                 mut calibrator,
+                default_stops,
             ) = {
                 let mut guard = model_state.blocking_lock();
                 let state = match guard.as_mut() {
@@ -289,13 +288,13 @@ impl LlmEngine {
                     Some(sent) => clamp_qwen35_prompt_to_window(
                         with_prefix_tokens(&params, encoding.get_ids()),
                         kv_window - vision_extra,
-                        params.max_tokens.unwrap_or(config.max_tokens),
+                        params.max_tokens.unwrap_or(0),
                         sent,
                     ),
                     None => clamp_prompt_to_window(
                         with_prefix_tokens(&params, encoding.get_ids()),
                         kv_window - vision_extra,
-                        params.max_tokens.unwrap_or(config.max_tokens),
+                        params.max_tokens.unwrap_or(0),
                     ),
                 };
 
@@ -312,10 +311,11 @@ impl LlmEngine {
                 // max_tokens can't push decode past the allocated KV cap.
                 let resolved = resolve_gen_params(
                     &params,
-                    &config,
+                    &state.generation_defaults,
                     effective_context,
                     prompt_tokens.len() + vision_extra,
                 );
+                let default_stops = state.generation_defaults.stop.clone();
                 let device = state.device.clone();
 
                 // Set inference modes before forward passes
@@ -453,8 +453,7 @@ impl LlmEngine {
                         &state.name,
                         &prompt_tokens,
                         false,
-                        kv_shift_reuse,
-                        kv_disk.as_deref().map(|d| (d, kv_snapshots)),
+                        kv_disk.as_deref(),
                     )
                 } else {
                     let sess_guard = sessions.blocking_lock();
@@ -842,8 +841,10 @@ impl LlmEngine {
                     prompt_tokens,
                     use_speculative,
                     calibrator,
+                    default_stops,
                 )
             }; // <- lock released after setup
+            let params = params.with_default_stops(&default_stops);
             let ResolvedGenParams {
                 max_tokens,
                 temperature,
@@ -2191,15 +2192,10 @@ impl LlmEngine {
                     // Never two locks at once: the sessions table is released before the
                     // model is taken.
                     drop(sess_guard);
-                    if kv_snapshots > 0 && image_hash.is_none() {
+                    if image_hash.is_none() {
                         let mut g = model_state.blocking_lock();
                         if let Some(s) = g.as_mut() {
-                            match s.model.snapshot_kv(
-                                full.clone(),
-                                pos,
-                                kv_snapshots,
-                                kv_snapshot_budget,
-                            ) {
+                            match s.model.snapshot_kv(full.clone(), pos) {
                                 Err(e) => tracing::warn!("kv snapshot skipped: {e}"),
                                 Ok(()) => {
                                     if let Some(store) = kv_disk.clone() {

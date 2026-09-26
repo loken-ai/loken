@@ -1635,7 +1635,7 @@ fn generate_zimage(
     let denoise_watch: Vec<(usize, u64, crate::inference::place::vram_manager::VramWatch)> = {
         #[cfg(feature = "cuda")]
         {
-            crate::inference::place::device_probe::probe_cuda_gpus(1.0)
+            crate::inference::place::device_probe::probe_cuda_gpus()
                 .into_iter()
                 .filter_map(|g| {
                     Some((

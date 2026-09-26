@@ -157,31 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         lora_dir: None,
                         inference: loken::config::InferenceConfigToml {
                             model_id: "ollama:qwen3:0.6b".to_string(),
-                            model_source: Some("ollama".to_string()),
-                            max_tokens: Some(512),
-                            context_length: Some(4096),
-                            temperature: Some(0.7),
-                            top_p: Some(0.9),
-                            top_k: Some(50),
-                            seed: Some(42),
-                            device_index: None,
-                            draft_model: None,
-                            draft_device_index: None,
-                            kv_shift_reuse: false,
-                            kv_snapshots: 0,
-                            kv_disk_dir: None,
-                            kv_disk_budget_gb: 0.0,
-                            kv_snapshot_budget_gb: 0.0,
-                            files_dir: None,
-                            moderation_model: None,
-                            public_url: None,
-                            max_gpu_memory_fraction: Some(0.9),
-                            force_gpu_layers: None,
-                            use_quantized_gpu: Some(false),
-                            cpu_threads: Some(0),
-                            disable_arc_layers: None,
-                            kv_quant: None,
-                            continuous_batching: None,
+                            ..Default::default()
                         },
                         ollama_models_dir: None,
                         huggingface_models_dir: None,
@@ -194,9 +170,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // and until now that was never this call: it sat at the top of the first model
             // load, found the pool already up, and warned into a log nobody reads while every
             // host kernel ran on one thread per logical core instead of per physical one.
-            loken::inference::engine::llm_engine::configure_thread_pool(
-                config.inference.cpu_threads.unwrap_or(0),
-            );
+            loken::inference::engine::llm_engine::configure_thread_pool();
+            for key in config.inference.obsolete.keys() {
+                warn!(
+                    "config.toml [inference] `{key}` is no longer read: loken decides it from \
+                     the model and the machine"
+                );
+            }
 
             if let Some(dir) = models_dir.as_ref() {
                 config.ollama_models_dir = Some(dir.clone());
@@ -228,33 +208,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Log loaded configuration
             info!("✅ Configuration loaded:");
             info!("   • Model: {}", inference_config.model_id);
-            info!("   • Max tokens: {}", inference_config.max_tokens);
-            info!("   • Temperature: {}", inference_config.temperature);
-
-            // Performance settings
-            if let Some(forced_layers) = inference_config.force_gpu_layers {
-                info!(
-                    "   🎯 OVERRIDE: force_gpu_layers = {} (from config.toml)",
-                    forced_layers
-                );
-            } else {
-                info!("   • GPU layers: AUTO (will calculate based on available memory)");
-            }
-
-            if inference_config.use_quantized_gpu {
-                info!("   ⚠️  use_quantized_gpu = true (EXPERIMENTAL - may crash!)");
-            } else {
-                info!("   • Quantized GPU: Disabled (safe f16 dequantization)");
-            }
-
-            info!(
-                "   • CPU threads: {}",
-                if inference_config.cpu_threads == 0 {
-                    "AUTO".to_string()
-                } else {
-                    inference_config.cpu_threads.to_string()
-                }
-            );
             info!("");
 
             // Initialize NVML and detect GPUs

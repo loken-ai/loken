@@ -4,7 +4,7 @@
 //!
 //! Before this module each path had its own probe: the generic one was the mature,
 //! process-aware NVML reader; ACE-Step used a bespoke raw `mem_get_info` 0..8 loop.
-//! They diverged. Now the NVML enumeration + stable-free + fraction logic lives here
+//! They diverged. Now the NVML enumeration + stable-free logic lives here
 //! once; ACE-Step's degrade glue is a thin wrapper around `probe_cuda_devices`.
 //!
 //! NEVER panics. NVML init failure (driver absent / acestep_render on a CPU box) ->
@@ -20,8 +20,8 @@ use tracing::{info, warn};
 const GPU_SYSTEM_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// One probed CUDA GPU. `stable_free` is the process-aware free VRAM (see
-/// `probe_cuda_gpus`); `available` is that figure scaled by the caller's
-/// `max_gpu_memory_fraction`. GPUs are returned sorted by `sm_clock` descending
+/// `probe_cuda_gpus`); `available` is what placement may plan into: that figure less
+/// what other subsystems declared they are about to use. GPUs are returned sorted by `sm_clock` descending
 /// (fastest first) so the placer packs the fastest card first.
 #[derive(Debug, Clone, Copy)]
 pub struct CudaGpuInfo {
@@ -30,7 +30,8 @@ pub struct CudaGpuInfo {
     /// process - or our own loaded model - holds VRAM; otherwise floors at
     /// `total - GPU_SYSTEM_RESERVE_BYTES` to recover the driver's lingering cache.
     pub stable_free: u64,
-    /// `stable_free * max_gpu_memory_fraction` (the usable budget for placement).
+    /// The usable budget for placement. Headroom for the load itself is the caller's
+    /// runtime reserve and the out-of-memory ladder, both derived, not a share of the card.
     pub available: u64,
     pub sm_clock: u32,
     /// CUDA core count (NVML `nvmlDeviceGetNumGpuCores`), 0 if unavailable.
@@ -54,9 +55,6 @@ pub struct CudaGpuInfo {
 /// generic LLM engine and ACE-Step consume it. Returns empty (-> CPU placement)
 /// when NVML init fails - never panics.
 ///
-/// `max_gpu_memory_fraction` scales `stable_free` into `available` (the generic
-/// engine's per-GPU budget knob). ACE-Step passes `1.0` (it applies its own
-/// reserve via `probe_cuda_devices`).
 /// Memory bandwidth of one CUDA device in GB/s, from the driver's own attributes
 /// (DDR memory clock x bus width). NVML lacks the bus width on recent cards, the
 /// driver never does. 0.0 when CUDA is absent or the query fails.
@@ -124,7 +122,7 @@ fn primary_ctx_active(_ordinal: usize) -> bool {
     false
 }
 
-pub fn probe_cuda_gpus(max_gpu_memory_fraction: f64) -> Vec<CudaGpuInfo> {
+pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
     let mut gpu_info: Vec<CudaGpuInfo> = Vec::new();
     match nvml_wrapper::Nvml::init() {
         Ok(nvml) => {
@@ -173,7 +171,7 @@ pub fn probe_cuda_gpus(max_gpu_memory_fraction: f64) -> Vec<CudaGpuInfo> {
                             mem.free
                                 .max(mem.total.saturating_sub(GPU_SYSTEM_RESERVE_BYTES))
                         };
-                        let available = (stable_free as f64 * max_gpu_memory_fraction) as u64;
+                        let available = stable_free;
                         let sm_clock = gpu.max_clock_info(Clock::SM).unwrap_or(0);
                         let mem_bw_gbs = cuda_mem_bw_gbs(i as usize);
                         let num_cores = gpu.num_cores().unwrap_or(0);
@@ -184,13 +182,11 @@ pub fn probe_cuda_gpus(max_gpu_memory_fraction: f64) -> Vec<CudaGpuInfo> {
                         } else {
                             sm_clock as u64
                         };
-                        info!("✓ GPU {}: {} - {:.1} GB free / {:.1} GB total, stable {:.1} GB, using {:.0}% = {:.1} GB, {} cores @ {} MHz (perf {})",
+                        info!("✓ GPU {}: {} - {:.1} GB free / {:.1} GB total, stable {:.1} GB, {} cores @ {} MHz (perf {})",
                             i, name,
                             mem.free as f64 / 1e9,
                             mem.total as f64 / 1e9,
                             stable_free as f64 / 1e9,
-                            max_gpu_memory_fraction * 100.0,
-                            available as f64 / 1e9,
                             num_cores, sm_clock, perf_score);
                         gpu_info.push(CudaGpuInfo {
                             index: i as usize,
@@ -223,7 +219,7 @@ pub fn probe_cuda_gpus(max_gpu_memory_fraction: f64) -> Vec<CudaGpuInfo> {
 /// native `Device` handle - `(index, usable_free_bytes, Device)` - for the
 /// HeteroPlan placement of the LM / DiT / VAE / encoders.
 ///
-/// Built on the shared `probe_cuda_gpus` (process-aware NVML, fraction 1.0).
+/// Built on the shared `probe_cuda_gpus` (process-aware NVML).
 /// `reserve` is subtracted from each card's `stable_free`; cards left with no
 /// usable budget are dropped. Cards are offered fastest-first (SM-clock order).
 ///
@@ -237,7 +233,7 @@ pub fn probe_cuda_gpus(max_gpu_memory_fraction: f64) -> Vec<CudaGpuInfo> {
 pub fn probe_cuda_devices(reserve: u64) -> Vec<(usize, u64, crate::tensor::Device)> {
     use crate::tensor::Device;
     let mut out = Vec::new();
-    for g in probe_cuda_gpus(1.0) {
+    for g in probe_cuda_gpus() {
         let usable = g.stable_free.saturating_sub(reserve);
         if usable == 0 {
             continue;
@@ -267,7 +263,7 @@ pub fn probe_cuda_devices(_reserve: u64) -> Vec<(usize, u64, crate::tensor::Devi
 /// Taken GREEDILY from the fastest card down, because that is the order every planner
 /// in this process fills cards in: the declaring subsystem's hot component sits on the
 /// fastest card that holds it, so that is where its peak lands.
-fn apply_pending_demand(owner: &str, cards: &mut [CudaGpuInfo], fraction: f64) {
+fn apply_pending_demand(owner: &str, cards: &mut [CudaGpuInfo]) {
     let mut pending = crate::inference::place::vram_manager::pending_demand_excluding(owner);
     if pending == 0 {
         return;
@@ -276,7 +272,7 @@ fn apply_pending_demand(owner: &str, cards: &mut [CudaGpuInfo], fraction: f64) {
         let take = g.stable_free.min(pending);
         g.stable_free -= take;
         pending -= take;
-        g.available = (g.stable_free as f64 * fraction) as u64;
+        g.available = g.stable_free;
         if pending == 0 {
             break;
         }
@@ -284,9 +280,9 @@ fn apply_pending_demand(owner: &str, cards: &mut [CudaGpuInfo], fraction: f64) {
 }
 
 /// [`probe_cuda_gpus`], minus what other subsystems have declared they are about to use.
-pub fn probe_cuda_gpus_for(owner: &str, max_gpu_memory_fraction: f64) -> Vec<CudaGpuInfo> {
-    let mut cards = probe_cuda_gpus(max_gpu_memory_fraction);
-    apply_pending_demand(owner, &mut cards, max_gpu_memory_fraction);
+pub fn probe_cuda_gpus_for(owner: &str) -> Vec<CudaGpuInfo> {
+    let mut cards = probe_cuda_gpus();
+    apply_pending_demand(owner, &mut cards);
     cards
 }
 
@@ -298,7 +294,7 @@ pub fn probe_cuda_devices_for(
 ) -> Vec<(usize, u64, crate::tensor::Device)> {
     use crate::tensor::Device;
     let mut out = Vec::new();
-    for g in probe_cuda_gpus_for(owner, 1.0) {
+    for g in probe_cuda_gpus_for(owner) {
         let usable = g.stable_free.saturating_sub(reserve);
         if usable == 0 {
             continue;

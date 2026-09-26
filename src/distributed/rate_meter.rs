@@ -69,6 +69,9 @@ pub struct Rates {
     /// How many generations are behind these figures. Zero means nothing has run here yet, and
     /// a peer reading it should treat the rates as unknown rather than as measured.
     pub samples: u64,
+    /// Tokens a generation of this model emits on average: what a request that does not cap
+    /// its length is priced at.
+    pub mean_output_tokens: f64,
     /// Tokens emitted since the current throughput window opened.
     window_tokens: u64,
     /// When it opened. `None` before the first generation.
@@ -126,6 +129,11 @@ pub fn record_generation_at(
     }
     with_rates(|all| {
         let r = all.entry(model.to_string()).or_default();
+        r.mean_output_tokens = if r.samples == 0 {
+            output_tokens as f64
+        } else {
+            r.mean_output_tokens * (1.0 - ALPHA) + output_tokens as f64 * ALPHA
+        };
         if r.samples == 0 {
             // The first real measurement takes the per-request rates over from any hardware
             // prior - a derived number never outlives an observed one.
@@ -230,6 +238,12 @@ pub fn record_load(model: &str, seconds: f64) {
 
 /// What this node has measured for ONE model. All zeros when it has never run it, which a
 /// peer reads as unknown and prices pessimistically rather than optimistically.
+/// The length a request that names no cap is expected to generate on `model`: the measured
+/// mean, or 0 before anything has run, which prices the request on its prompt alone.
+pub fn expected_output_tokens(model: &str) -> u32 {
+    snapshot(model).mean_output_tokens.round() as u32
+}
+
 pub fn snapshot(model: &str) -> Rates {
     with_rates(|all| all.get(model).copied().unwrap_or_default())
 }

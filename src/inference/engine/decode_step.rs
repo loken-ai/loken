@@ -32,8 +32,7 @@ use crate::inference::serve::prompt_lookup::NgramDraftCache;
 use crate::tensor::{IndexOp, Tensor};
 
 use crate::inference::engine::llm_engine::{
-    apply_repeat_penalty, build_sampling_from, gpu_sample, GenerationParams, InferenceConfig,
-    LlmEngine,
+    apply_repeat_penalty, build_sampling_from, gpu_sample, GenerationParams, LlmEngine,
 };
 
 /// Per-request sampling/limit parameters after applying the
@@ -48,26 +47,30 @@ pub(crate) struct ResolvedGenParams {
     pub repeat_last_n: usize,
 }
 
-/// Resolve generation parameters: per-request params override config
-/// defaults; `max_tokens` is clamped so decode can't overrun the KV window
-/// (`effective_context`) past the prompt.
+/// Resolve generation parameters: the request's value, else the model's recommendation, else
+/// the API default. Generation runs to the end of the KV window (`effective_context`) unless
+/// the request caps it, and a request that names no seed samples its own stream.
 pub(crate) fn resolve_gen_params(
     params: &GenerationParams,
-    config: &InferenceConfig,
+    defaults: &crate::inference::engine::llm_engine::generation_defaults::GenerationDefaults,
     effective_context: usize,
     prompt_len: usize,
 ) -> ResolvedGenParams {
+    let room = effective_context.saturating_sub(prompt_len);
     ResolvedGenParams {
-        max_tokens: params
-            .max_tokens
-            .unwrap_or(config.max_tokens)
-            .min(effective_context.saturating_sub(prompt_len)),
-        temperature: params.temperature.unwrap_or(config.temperature),
-        top_p: params.top_p.unwrap_or(config.top_p),
-        top_k: params.top_k.unwrap_or(config.top_k),
-        seed: params.seed.unwrap_or(config.seed),
-        repeat_penalty: params.repeat_penalty.unwrap_or(config.repeat_penalty),
-        repeat_last_n: params.repeat_last_n.unwrap_or(config.repeat_last_n),
+        max_tokens: params.max_tokens.map_or(room, |m| m.min(room)),
+        temperature: params.temperature.unwrap_or_else(|| defaults.temperature()),
+        top_p: params.top_p.unwrap_or_else(|| defaults.top_p()),
+        top_k: params.top_k.unwrap_or_else(|| defaults.top_k()),
+        seed: params
+            .seed
+            .unwrap_or_else(crate::inference::engine::llm_engine::generation_defaults::fresh_seed),
+        repeat_penalty: params
+            .repeat_penalty
+            .unwrap_or_else(|| defaults.repeat_penalty()),
+        repeat_last_n: params
+            .repeat_last_n
+            .unwrap_or_else(|| defaults.repeat_last_n()),
     }
 }
 

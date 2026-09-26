@@ -75,12 +75,45 @@ impl LlmEngine {
         None
     }
 
-    /// Resolve the projector blob (if any) for a model. Walks the same
-    /// Ollama manifest tree as `find_model_file` but scans layers for
-    /// `application/vnd.ollama.image.projector` (vision models like
-    /// moondream/llava ship the vision tower as a separate blob).
-    /// Returns None for text-only models.
+    /// Resolve the projector blob (if any) for a model: vision models like moondream/llava
+    /// ship the vision tower as a separate manifest layer, or as a sibling `mmproj*.gguf` of
+    /// a direct-path GGUF. Returns None for text-only models.
     pub(super) fn find_projector_blob_for_model(&self, model_id: &str) -> Option<PathBuf> {
+        if let Some(blob) =
+            self.find_manifest_layer(model_id, "application/vnd.ollama.image.projector")
+        {
+            debug!("📍 Found projector blob: {}", blob.display());
+            return Some(blob);
+        }
+        self.find_sibling_projector(model_id)
+    }
+
+    /// The sampling the model ships with: the `params` layer of its Ollama manifest, else the
+    /// `generation_config.json` of its checkpoint directory.
+    pub(super) fn generation_defaults_for(
+        &self,
+        model_id: &str,
+        model_file: &std::path::Path,
+    ) -> super::generation_defaults::GenerationDefaults {
+        use super::generation_defaults::GenerationDefaults;
+        if let Some(json) = self
+            .find_manifest_layer(model_id, "application/vnd.ollama.image.params")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+        {
+            return GenerationDefaults::from_ollama_params(&json);
+        }
+        let dir = if model_file.is_dir() {
+            Some(model_file)
+        } else {
+            model_file.parent()
+        };
+        dir.map(GenerationDefaults::from_hf_dir).unwrap_or_default()
+    }
+
+    /// The blob of the first layer of `media_type` in the model's Ollama manifest. Walks the
+    /// same `library/{name}/{tag}` and namespaced `{ns}/{name}/{tag}` layouts as
+    /// `find_model_file`, without the full directory scan.
+    pub(super) fn find_manifest_layer(&self, model_id: &str, media_type: &str) -> Option<PathBuf> {
         let models_dir = self.config.models_dir.as_ref()?;
         if !models_dir.is_dir() {
             return None;
@@ -142,7 +175,7 @@ impl LlmEngine {
                     .get("mediaType")
                     .and_then(|m| m.as_str())
                     .unwrap_or("");
-                if mtype != "application/vnd.ollama.image.projector" {
+                if mtype != media_type {
                     continue;
                 }
                 let digest = match layer.get("digest").and_then(|d| d.as_str()) {
@@ -154,11 +187,14 @@ impl LlmEngine {
                     None => continue,
                 };
                 if let Some(blob) = Self::find_blob_for_digest(&root, digest) {
-                    debug!("📍 Found projector blob: {}", blob.display());
                     return Some(blob);
                 }
             }
         }
+        None
+    }
+
+    fn find_sibling_projector(&self, model_id: &str) -> Option<PathBuf> {
         // Direct-path GGUF (no Ollama manifest): a sibling `mmproj*.gguf` in
         // the model file's directory IS the projector - the llama.cpp/HF
         // convention (model.gguf + mmproj-*.gguf side by side, e.g. Pixtral).

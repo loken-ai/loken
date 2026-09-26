@@ -38,28 +38,29 @@ render: it reports what was last known.
 
 ## `[inference]`
 
-### Model and sampling
+### Model
 
 | Key | Default | What it does |
 |---|---|---|
 | `model_id` | required | The model loaded when a request names none. `loken list` prints the tags on this machine. |
-| `model_source` | detected | `"ollama"` or `"huggingface"`, when a name exists in both stores. |
-| `max_tokens` | `2048` | Generation cap when a request sets none. |
-| `context_length` | `4096` | The window a model is loaded with. A request whose `num_ctx` exceeds it reloads the model at that context, clamped to what the checkpoint declares. |
-| `temperature`, `top_p`, `top_k`, `seed` | `0.15`, `0.9`, `50`, `42` | Sampling defaults, each overridable per request. |
-
-### Placement
-
-| Key | Default | What it does |
-|---|---|---|
-| `device_index` | first card | The card a single-device model loads on. |
-| `max_gpu_memory_fraction` | `0.9` | Share of each card's memory the placement budget may plan against. |
-| `use_quantized_gpu` | `true` | Run quantized matmuls on the cards. Off sends quantized layers to the host. |
-| `force_gpu_layers` | planned | Fix the number of layers placed on cards instead of measuring what fits. |
-| `cpu_threads` | `0` | Threads for the host path. `0` derives the count from the physical cores. |
-| `kv_quant` | `"off"` | KV cache storage: `"off"`, `"q8"` or `"q4"`. Read at load time only. |
 | `continuous_batching` | `false` | Paged KV and batched decode for several concurrent clients. Cards only. |
-| `disable_arc_layers` | `false` | Test switch: skip the OpenCL path so a run can be pinned to CUDA or the host. |
+
+### Decided by loken
+
+Nothing below is configured; a key of that name in an older `config.toml` loads and is reported as no longer read.
+
+| Decision | Where it comes from |
+|---|---|
+| Sampling (`temperature`, `top_p`, `top_k`, repetition penalty, stop sequences) | The request, else the model's own recommendation (the `params` layer of an Ollama manifest, `generation_config.json` of a checkpoint), else the Ollama API defaults. |
+| Seed | The request's, else a fresh one per request. |
+| Generation length | The request's cap, else the end of the context window. |
+| Context window | The request's `num_ctx`, else what the checkpoint declares; a quantised cache grows into it on demand, an F16 cache is sized by the placement plan. |
+| Card a model loads on | The fastest card that holds it, from the probe. |
+| Memory each card offers | The measured free memory; the load keeps its own runtime reserve and backs off after an out-of-memory. |
+| Layers on cards, host threads | The placement plan, and the physical (or performance) cores. |
+| KV cache format | The architecture and the kernels' head shapes; a request may still ask for one with `options.kv_quant`. |
+| Conversation snapshots | Each finished sequence is copied aside so a later request on it resumes from its own KV; how many are kept is bounded by the free device memory, leaving the cache its working window. |
+| Context shift | Once a conversation outgrows the window, the resident tail is kept and re-phased instead of prefilling the whole window, wherever the cache supports it (not Q4 caches, sliding-window layers or recurrent hybrids). |
 
 ### Speculative decoding
 
@@ -74,10 +75,7 @@ render: it reports what was last known.
 
 | Key | Default | What it does |
 |---|---|---|
-| `kv_shift_reuse` | `false` | Once a conversation outgrows the window, keep the resident tail and re-phase it in place instead of prefilling the whole window. Refused, with a cold prefill, on Q4 caches, sliding-window layers and recurrent hybrids. |
-| `kv_snapshots` | `0` | Resident sequences copied aside after a request, so a later request on another conversation resumes from its own KV. Each entry costs one KV where the layers live. `0` keeps the single resident KV. |
-| `kv_snapshot_budget_gb` | `0` | Device memory the snapshots may hold, in GiB, least recently used evicted first. `0` derives it from the free memory at snapshot time, leaving the cache its working window. |
-| `kv_disk_dir` | none | Directory of the disk tier under the snapshots: token blocks shared between sequences by prefix, one manifest per sequence, surviving a restart. Needs `kv_snapshots > 0`. |
+| `kv_disk_dir` | none | Directory of the disk tier under the snapshots: token blocks shared between sequences by prefix, one manifest per sequence, surviving a restart. |
 | `kv_disk_budget_gb` | `0` | Bytes the disk tier may hold, in GiB. `0` is no limit. Least recently used sequences go first. |
 
 ### Files, moderation and URLs

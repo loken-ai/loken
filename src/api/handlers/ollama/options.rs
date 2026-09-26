@@ -123,8 +123,10 @@ pub(crate) async fn ollama_chat(
                 .as_ref()
                 .and_then(|o| o.get("num_predict"))
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(state.default_inference_config.max_tokens as u64)
-                as u32;
+                .map_or_else(
+                    || crate::distributed::rate_meter::expected_output_tokens(&model_name),
+                    |m| m as u32,
+                );
             let body = serde_json::to_value(&request)
                 .map_err(|e| ApiError::Internal(format!("forward: {e}")))?;
             if let Some(relayed) = crate::api::handlers::route_to_holder(
@@ -810,8 +812,10 @@ pub(crate) async fn ollama_generate(
                 .as_ref()
                 .and_then(|o| o.get("num_predict"))
                 .and_then(serde_json::Value::as_u64)
-                .unwrap_or(state.default_inference_config.max_tokens as u64)
-                as u32;
+                .map_or_else(
+                    || crate::distributed::rate_meter::expected_output_tokens(&model_name),
+                    |m| m as u32,
+                );
             // The request is re-serialised from the parsed form rather than relayed as raw
             // bytes. Both nodes run the same build, so a field one understands the other
             // does too.

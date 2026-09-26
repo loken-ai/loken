@@ -20,23 +20,9 @@ port = 11435
 # The model loaded when a request does not name one. Set it to a tag you actually have  - 
 # `loken list` prints them. Nothing is downloaded to satisfy this.
 model_id = "qwen3:0.6b"
-max_tokens = 2048
-context_length = 4096
-temperature = 0.15
-top_p = 0.9
-top_k = 50
-seed = 42
-max_gpu_memory_fraction = 0.9
-use_quantized_gpu = true
-cpu_threads = 0
+# Sampling comes from the model (its Modelfile or generation_config.json) and the request;
+# placement, threads, memory and the KV cache format from the machine. None is configured.
 
-# Skip the OpenCL layer path. This is a test-mode switch: it exists so a run can be pinned to
-# CUDA or the host while something is being bisected. Leave it off unless you are doing that  - 
-# on, an Intel Arc card silently stops being used.
-disable_arc_layers = false
-
-# KV cache storage: "off", "q8" or "q4". Read at load time only.
-# kv_quant = "off"
 # Paged KV and batched decode for several concurrent clients, cards only.
 # continuous_batching = false
 
@@ -45,12 +31,8 @@ disable_arc_layers = false
 # draft_model = "llama3.2:1b"
 # draft_device_index = 0
 
-# KV reuse across requests. Snapshots keep one KV copy per resident conversation, where the
-# layers live; the disk tier makes them survive a restart. Both off by default.
-# kv_shift_reuse = false            # keep the resident tail once a conversation outgrows the window
-# kv_snapshots = 0                  # conversations kept aside, 0 = the single resident KV
-# kv_snapshot_budget_gb = 0         # device memory the snapshots may hold, 0 = derived from what is free
-# kv_disk_dir = "/var/lib/loken/kv" # needs kv_snapshots > 0
+# The disk tier keeps conversation snapshots across a restart, within a disk budget.
+# kv_disk_dir = "/var/lib/loken/kv"
 # kv_disk_budget_gb = 0             # 0 = no limit
 
 # Files, moderation and the URLs handed out.

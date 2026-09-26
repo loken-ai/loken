@@ -246,8 +246,10 @@ pub(crate) async fn chat_completion(
         let max_tokens = body["max_completion_tokens"]
             .as_u64()
             .or_else(|| body["max_tokens"].as_u64())
-            .unwrap_or(state.default_inference_config.max_tokens as u64)
-            as u32;
+            .map_or_else(
+                || crate::distributed::rate_meter::expected_output_tokens(&model_name),
+                |m| m as u32,
+            );
         if let Some(relayed) = super::route_to_holder(
             &state,
             &headers,
@@ -919,10 +921,10 @@ pub(crate) async fn text_completions(
     {
         let model_name = crate::api::handlers::normalize_model_id(&model);
         let prompt_text = fim_wrapped(&body, completion_prompt_text(&body).unwrap_or_default());
-        let max_tokens = body["max_tokens"]
-            .as_u64()
-            .unwrap_or(state.default_inference_config.max_tokens as u64)
-            as u32;
+        let max_tokens = body["max_tokens"].as_u64().map_or_else(
+            || crate::distributed::rate_meter::expected_output_tokens(&model_name),
+            |m| m as u32,
+        );
         if let Some(relayed) = super::route_to_holder(
             &state,
             &headers,

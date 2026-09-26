@@ -267,7 +267,7 @@ pub(super) fn load_deepseek_v41_checkpoint(
     let context_length = if user_context_length > 0 {
         user_context_length
     } else {
-        4096
+        declared_context(dir)
     };
     info!(
         "✅ deepseek_v41 loaded on CPU from {} in {:.1}s ({} layers, {} routed + {} shared experts, engram {}, {} experts pinned per layer of {} MB)",
@@ -307,7 +307,20 @@ pub(super) fn load_deepseek_v41_checkpoint(
         qwen35_image: None,
         image_embed_cache: None,
         grammar_factory: std::sync::OnceLock::new(),
+        generation_defaults: Default::default(),
     })
+}
+
+/// The context a checkpoint directory declares (`max_position_embeddings` of its
+/// `config.json`), else the working window a cache is built for.
+pub(super) fn declared_context(dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("max_position_embeddings").and_then(|x| x.as_u64()))
+        .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| {
+            c as usize
+        })
 }
 
 /// Read the EOS token id(s) for an AWQ checkpoint from generation_config.json
@@ -392,7 +405,7 @@ pub(super) fn load_awq_model_state(
     let context_length = if user_context_length > 0 {
         user_context_length
     } else {
-        4096
+        declared_context(std::path::Path::new(awq_dir))
     };
 
     info!(
@@ -439,6 +452,7 @@ pub(super) fn load_awq_model_state(
         qwen35_image: None,
         image_embed_cache: None,
         grammar_factory: std::sync::OnceLock::new(),
+        generation_defaults: Default::default(),
     })
 }
 
@@ -726,6 +740,8 @@ pub(crate) struct LoadedModelState {
     /// grammar-constrained request from the live tokenizer; cached for reuse
     /// across requests on the same loaded model.
     pub(super) grammar_factory: std::sync::OnceLock<std::sync::Arc<llguidance::ParserFactory>>,
+    /// The sampling the model recommends, applied to every knob a request leaves unset.
+    pub(super) generation_defaults: super::generation_defaults::GenerationDefaults,
 }
 
 /// Snapshot of one session's cached conversation state. The KV cache itself
@@ -840,8 +856,7 @@ pub(crate) fn kv_reuse_start(
     model_name: &str,
     prompt_tokens: &[u32],
     disabled: bool,
-    shift: bool,
-    disk: Option<(&crate::inference::cache::kv_disk::KvDiskStore, usize)>,
+    disk: Option<&crate::inference::cache::kv_disk::KvDiskStore>,
 ) -> usize {
     let mut reuse = if disabled || !model.supports_trim_kv() {
         None
@@ -896,7 +911,7 @@ pub(crate) fn kv_reuse_start(
     // Then the disk: a sequence written after an earlier request, or an earlier run,
     // that covers more of the prompt than anything in memory. Its blocks come back as
     // a snapshot, which is restored like the others.
-    if let (Some((store, cap)), false) = (disk, disabled) {
+    if let (Some(store), false) = (disk, disabled) {
         if let Some((n_layers, _, _)) = model.kv_layout() {
             let cur_keep = reuse
                 .map(|c| chunk_aligned_keep(c, prompt_tokens.len(), chunk))
@@ -919,7 +934,6 @@ pub(crate) fn kv_reuse_start(
                                 prompt_tokens[..covered].to_vec(),
                                 covered,
                                 rows,
-                                cap,
                                 dt,
                             )
                         })
@@ -965,7 +979,7 @@ pub(crate) fn kv_reuse_start(
     // with it the chunk grid below: a shifted tail is kept whole, since rounding it to
     // a grid that can exceed the window would keep nothing.
     let mut shifted: Option<usize> = None;
-    if shift && model.supports_shift_kv() && reuse.is_some_and(|c| c < chunk) {
+    if model.supports_shift_kv() && reuse.is_some_and(|c| c < chunk) {
         let mut g = sessions.blocking_lock();
         if let Some(s) = g.get_mut(GLOBAL_PROMPT_CACHE_KEY) {
             if let Some((discard, reused)) = shift_reuse_plan(

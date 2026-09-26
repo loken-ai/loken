@@ -67,9 +67,10 @@ pub(crate) async fn anthropic_messages(
             )
             .await
             .prompt;
-        let max_tokens = req
-            .max_tokens
-            .unwrap_or(state.default_inference_config.max_tokens) as u32;
+        let max_tokens = req.max_tokens.map_or_else(
+            || crate::distributed::rate_meter::expected_output_tokens(&model_name),
+            |m| m as u32,
+        );
         if let Some(relayed) = super::route_to_holder(
             &state,
             &headers,

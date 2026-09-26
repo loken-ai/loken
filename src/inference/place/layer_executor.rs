@@ -577,7 +577,7 @@ impl HeteroPlan {
         let weights: Vec<u64> = {
             #[cfg(feature = "cuda")]
             {
-                let probed = crate::inference::place::device_probe::probe_cuda_gpus(1.0);
+                let probed = crate::inference::place::device_probe::probe_cuda_gpus();
                 cuda_devices
                     .iter()
                     .map(|&(idx, _)| {

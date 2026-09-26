@@ -124,7 +124,7 @@ pub fn free_total() -> u64 {
 pub fn total_vram() -> u64 {
     #[cfg(feature = "cuda")]
     {
-        crate::inference::place::device_probe::probe_cuda_gpus(1.0)
+        crate::inference::place::device_probe::probe_cuda_gpus()
             .iter()
             .map(|g| g.total)
             .sum()
@@ -142,7 +142,7 @@ pub fn total_vram() -> u64 {
 pub fn largest_gpu_capacity() -> u64 {
     #[cfg(feature = "cuda")]
     {
-        crate::inference::place::device_probe::probe_cuda_gpus(1.0)
+        crate::inference::place::device_probe::probe_cuda_gpus()
             .iter()
             .map(|g| g.total)
             .max()
@@ -592,7 +592,7 @@ impl Drop for VramWatch {
 pub fn free_on(gpu_index: usize) -> Option<u64> {
     #[cfg(feature = "cuda")]
     {
-        crate::inference::place::device_probe::probe_cuda_gpus(1.0)
+        crate::inference::place::device_probe::probe_cuda_gpus()
             .into_iter()
             .find(|g| g.index == gpu_index)
             .map(|g| g.stable_free)
@@ -634,7 +634,7 @@ pub enum Headroom {
 pub fn total_gpu_capacity() -> u64 {
     #[cfg(feature = "cuda")]
     {
-        crate::inference::place::device_probe::probe_cuda_gpus(1.0)
+        crate::inference::place::device_probe::probe_cuda_gpus()
             .iter()
             .map(|g| g.total)
             .sum()

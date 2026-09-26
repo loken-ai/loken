@@ -1476,14 +1476,8 @@ impl GenericHeteroTransformer {
     /// one this sequence extends is replaced, else at capacity the least recently used.
     /// A copy that fails, for lack of memory, drops every snapshot and returns the error;
     /// the request that produced the KV is not at stake.
-    pub fn snapshot_kv(
-        &mut self,
-        tokens: Vec<u32>,
-        kv_len: usize,
-        cap: usize,
-        budget_bytes: u64,
-    ) -> crate::tensor::Result<()> {
-        if cap == 0 || !self.supports_kv_snapshots() {
+    pub fn snapshot_kv(&mut self, tokens: Vec<u32>, kv_len: usize) -> crate::tensor::Result<()> {
+        if !self.supports_kv_snapshots() {
             self.kv_snapshots.clear();
             return Ok(());
         }
@@ -1517,22 +1511,20 @@ impl GenericHeteroTransformer {
             .iter()
             .map(|s| (s.tokens.as_slice(), s.tick))
             .collect();
-        match snapshot_slot(&existing, &snap.tokens, cap) {
+        match snapshot_slot(&existing, &snap.tokens, SNAPSHOT_COUNT_UNBOUNDED) {
             Some(i) => self.kv_snapshots[i] = snap,
             None => self.kv_snapshots.push(snap),
         }
-        self.enforce_kv_snapshot_budget(budget_bytes);
+        self.enforce_kv_snapshot_budget();
         Ok(())
     }
 
     /// Keeps the snapshots within a device-memory budget, dropping the least recently
-    /// used until they fit. A budget of zero is derived: the free device memory plus what
-    /// the snapshots already hold, less the working window the cache may still grow by.
-    fn enforce_kv_snapshot_budget(&mut self, budget_bytes: u64) {
+    /// used until they fit. The budget is the free device memory plus what the snapshots
+    /// already hold, less the working window the cache may still grow by.
+    fn enforce_kv_snapshot_budget(&mut self) {
         let held: u64 = self.kv_snapshots.iter().map(KvSnapshot::device_bytes).sum();
-        let budget = if budget_bytes > 0 {
-            budget_bytes
-        } else {
+        let budget = {
             let (layers, n_kv, hd) = self.kv_layout();
             let window_bytes = (layers
                 * 2
@@ -1546,7 +1538,7 @@ impl GenericHeteroTransformer {
             }
         };
         let mut held = held;
-        while held > budget && self.kv_snapshots.len() > 1 {
+        while held > budget && !self.kv_snapshots.is_empty() {
             let i = self
                 .kv_snapshots
                 .iter()
@@ -1738,7 +1730,6 @@ impl GenericHeteroTransformer {
         tokens: Vec<u32>,
         kv_len: usize,
         rows: Vec<Option<(Vec<f32>, Vec<f32>)>>,
-        cap: usize,
         dtype_code: u8,
     ) -> crate::tensor::Result<()> {
         let kv_dtype = match dtype_code {
@@ -1746,7 +1737,7 @@ impl GenericHeteroTransformer {
             2 => crate::tensor::DType::BF16,
             _ => crate::tensor::DType::F16,
         };
-        if cap == 0 || !self.supports_kv_snapshots() {
+        if !self.supports_kv_snapshots() {
             return Ok(());
         }
         let mut layers = Vec::with_capacity(self.layers.len());
@@ -1810,11 +1801,11 @@ impl GenericHeteroTransformer {
             .iter()
             .map(|s| (s.tokens.as_slice(), s.tick))
             .collect();
-        match snapshot_slot(&existing, &snap.tokens, cap) {
+        match snapshot_slot(&existing, &snap.tokens, SNAPSHOT_COUNT_UNBOUNDED) {
             Some(i) => self.kv_snapshots[i] = snap,
             None => self.kv_snapshots.push(snap),
         }
-        self.enforce_kv_snapshot_budget(0);
+        self.enforce_kv_snapshot_budget();
         Ok(())
     }
 
@@ -2153,6 +2144,10 @@ impl GenericHeteroTransformer {
         self.compute_all_from_kv(&hidden, &all_q)
     }
 }
+
+/// Snapshots are kept by the device-memory budget alone (`enforce_kv_snapshot_budget`), not
+/// by a count.
+const SNAPSHOT_COUNT_UNBOUNDED: usize = usize::MAX;
 
 /// Which snapshot a new one replaces: the one whose tokens it extends or shortens (the
 /// same conversation, one turn on), else, at capacity, the least recently used; `None`

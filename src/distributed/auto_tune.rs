@@ -24,9 +24,8 @@ pub fn local_profile(
     inter: usize,
     gate_dt: GgmlDType,
     down_dt: GgmlDType,
-    max_gpu_fraction: f64,
 ) -> Option<NodeProfile> {
-    let gpus = crate::inference::place::device_probe::probe_cuda_gpus(max_gpu_fraction);
+    let gpus = crate::inference::place::device_probe::probe_cuda_gpus();
     let vram: u64 = gpus.iter().map(|g| g.available).sum();
     let perf: f64 = gpus.iter().map(|g| g.perf_score as f64).sum();
     let layer_ms = if perf > 0.0 {
@@ -87,7 +86,7 @@ mod tests {
     /// holds nothing resident, which the planner reads correctly.
     #[test]
     fn a_node_profiles_itself() {
-        let p = local_profile(5120, 2304, GgmlDType::Iq2Xxs, GgmlDType::Q2K, 0.9)
+        let p = local_profile(5120, 2304, GgmlDType::Iq2Xxs, GgmlDType::Q2K)
             .expect("real expert dims measure on the cores");
         assert!(p.miss_ms > 0.0, "the miss cost is measured on the cores");
         assert!(p.layer_ms.is_finite() && p.layer_ms > 0.0);

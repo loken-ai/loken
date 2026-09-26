@@ -1141,6 +1141,7 @@ use std::time::Instant;
 mod discover;
 mod embed;
 mod generate;
+pub(crate) mod generation_defaults;
 mod loading;
 // The pool must be sized from `main`, before anything can build rayon's global one.
 pub use loading::configure_thread_pool;
@@ -1156,10 +1157,6 @@ fn open_kv_disk(
     config: &InferenceConfig,
 ) -> Option<Arc<crate::inference::cache::kv_disk::KvDiskStore>> {
     let dir = config.kv_disk_dir.as_ref()?;
-    if config.kv_snapshots == 0 {
-        tracing::warn!("kv_disk_dir set but kv_snapshots is 0: the disk tier stays closed");
-        return None;
-    }
     let budget = (config.kv_disk_budget_gb.max(0.0) * (1u64 << 30) as f64) as u64;
     match crate::inference::cache::kv_disk::KvDiskStore::open(
         std::path::PathBuf::from(dir),

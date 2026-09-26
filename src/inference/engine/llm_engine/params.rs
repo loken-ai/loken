@@ -157,21 +157,12 @@ pub(super) static RAYON_INIT: Once = Once::new();
 pub struct InferenceConfig {
     /// Model ID
     pub model_id: String,
-    /// Maximum tokens to generate
-    pub max_tokens: usize,
-    /// Context length
+    /// The window to load with; 0 is the model's own. A request's `num_ctx` sets it.
     pub context_length: usize,
-    /// Temperature for sampling
-    pub temperature: f32,
-    /// Top-p for sampling
-    pub top_p: f32,
-    /// Top-k for sampling
-    pub top_k: usize,
-    /// Seed for reproducibility
-    pub seed: u64,
     /// Data type for model weights
     pub dtype: crate::tensor::DType,
-    /// GPU device index
+    /// The card a single-card load is pinned to, set by code that places a companion model
+    /// (a drafter) on purpose. `None` loads on the fastest card, as placement decides.
     pub device_index: Option<usize>,
     /// A smaller model that proposes tokens for this one to verify, by tag. None = no
     /// drafter. Worth setting only where verifying costs far more than drafting: a model
@@ -179,25 +170,13 @@ pub struct InferenceConfig {
     pub draft_model: Option<String>,
     /// Card the drafter loads on. Defaults to 0; it is placed whole on that one card.
     pub draft_device_index: Option<usize>,
-    /// Reuse the resident KV across a context shift once a conversation outgrows the
-    /// window (`kv_reuse_start`). Off by default: the shifted keys are re-phased, not
-    /// recomputed, so a warm run is no longer the cold run bit for bit.
-    pub kv_shift_reuse: bool,
-    /// Resident sequences kept aside after a request, each a full copy of the KV, so a
-    /// later request on another conversation resumes from its own KV instead of
-    /// prefilling. 0 keeps the single resident KV. Costs one KV per entry, where the
-    /// layers live.
-    pub kv_snapshots: usize,
     /// Directory of the disk tier under the snapshots: token blocks of KV at the cache's
     /// own dtype, shared between sequences by prefix, one manifest per sequence. `None`
-    /// keeps snapshots in memory only. Needs `kv_snapshots > 0`.
+    /// keeps snapshots in memory only.
     pub kv_disk_dir: Option<String>,
     /// Bytes the disk tier may hold, in GiB; 0 for no limit. Least recently used
     /// sequences go first.
     pub kv_disk_budget_gb: f64,
-    /// Device memory the in-memory KV snapshots may hold, in GiB; 0 derives it from the
-    /// free memory at snapshot time, leaving the cache its working window.
-    pub kv_snapshot_budget_gb: f64,
     /// Where `/v1/files` keeps uploads and batch outputs; `None` uses `files/` beside
     /// the model store.
     pub files_dir: Option<String>,
@@ -206,14 +185,6 @@ pub struct InferenceConfig {
     /// The origin clients reach this server at, for the URLs it hands out; `None` uses
     /// the request\'s `Host`.
     pub public_url: Option<String>,
-    /// Max GPU memory fraction (0.0-1.0)
-    pub max_gpu_memory_fraction: f64,
-    /// Force GPU layers count
-    pub force_gpu_layers: Option<usize>,
-    /// Use quantized GPU
-    pub use_quantized_gpu: bool,
-    /// CPU threads (0 = auto)
-    pub cpu_threads: usize,
     /// Progress callback
     pub progress_callback: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
     /// Models directory (for finding model files)
@@ -225,10 +196,6 @@ pub struct InferenceConfig {
     /// Force all layers to CUDA, disabling heterogeneous distribution
     /// Eliminates device transfers, confirms bottleneck location
     pub force_cuda_only_layers: bool,
-    /// Default repetition penalty (1.0 = off, >1.0 = penalize)
-    pub repeat_penalty: f32,
-    /// Default number of recent tokens to consider for repeat penalty
-    pub repeat_last_n: usize,
     /// KV-cache storage quantization. `Off` keeps K/V as the model dtype;
     /// `Q8` stores both as Q8_0 blocks (half VRAM, slight quality drift).
     /// Model-load-time only - changing this after load has no effect.
@@ -257,18 +224,8 @@ impl std::fmt::Debug for InferenceConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InferenceConfig")
             .field("model_id", &self.model_id)
-            .field("max_tokens", &self.max_tokens)
             .field("context_length", &self.context_length)
-            .field("temperature", &self.temperature)
-            .field("top_p", &self.top_p)
-            .field("top_k", &self.top_k)
-            .field("seed", &self.seed)
             .field("dtype", &self.dtype)
-            .field("device_index", &self.device_index)
-            .field("max_gpu_memory_fraction", &self.max_gpu_memory_fraction)
-            .field("force_gpu_layers", &self.force_gpu_layers)
-            .field("use_quantized_gpu", &self.use_quantized_gpu)
-            .field("cpu_threads", &self.cpu_threads)
             .field("models_dir", &self.models_dir)
             .field("progress_callback", &"<closure>")
             .finish()
@@ -279,35 +236,21 @@ impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
             model_id: "default".to_string(),
-            max_tokens: 2048,
-            context_length: 4096,
-            temperature: 0.7,
-            top_p: 0.9,
-            top_k: 50,
-            seed: 42,
+            context_length: 0,
             dtype: crate::tensor::DType::F16,
             device_index: None,
             draft_model: None,
             draft_device_index: None,
-            kv_shift_reuse: false,
-            kv_snapshots: 0,
             kv_disk_dir: None,
             kv_disk_budget_gb: 0.0,
-            kv_snapshot_budget_gb: 0.0,
             files_dir: None,
             moderation_model: None,
             public_url: None,
-            max_gpu_memory_fraction: 0.9,
-            force_gpu_layers: None,
-            use_quantized_gpu: true,
-            cpu_threads: 0,
             progress_callback: None,
             models_dir: None,
             disable_arc_layers: false,
             disable_cuda: false,
             force_cuda_only_layers: false,
-            repeat_penalty: 1.1,
-            repeat_last_n: 64,
             kv_quant: KvQuant::Off,
         }
     }
@@ -440,6 +383,16 @@ pub struct GenerationParams {
     /// Report each drawn token's log-probability with this many alternatives; `Some(0)`
     /// reports the drawn token alone. Costs a host copy of the logits per token.
     pub top_logprobs: Option<usize>,
+}
+
+impl GenerationParams {
+    /// The model's stop sequences when the request names none of its own.
+    pub fn with_default_stops(mut self, stops: &[String]) -> Self {
+        if self.stop_sequences.is_empty() {
+            self.stop_sequences = stops.to_vec();
+        }
+        self
+    }
 }
 
 // The per-architecture dispatch enum (`ModelVariant`) was replaced by the

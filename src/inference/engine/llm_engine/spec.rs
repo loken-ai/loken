@@ -73,7 +73,6 @@ impl LlmEngine {
     ) -> Result<tokio::sync::mpsc::Receiver<Result<String, String>>, Box<dyn std::error::Error>>
     {
         let target_state = self.model_state.clone();
-        let config = self.config.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(64);
 
         // Reset draft KV before we kick off (target's reset happens via
@@ -84,14 +83,14 @@ impl LlmEngine {
         // draft engines, each behind its own model_state mutex.
         let target_engine = self.clone_for_spec();
         tokio::spawn(async move {
-            let max_tokens = params.max_tokens.unwrap_or(config.max_tokens);
+            let mut params = params;
             let eos = {
                 let g = target_state.lock().await;
                 g.as_ref().map(|s| s.eos_token_id).unwrap_or(0)
             };
 
-            // Tokenize.
-            let prompt_tokens: Vec<u32> = {
+            // Tokenize, and read the window and the model's sampling while the lock is held.
+            let (prompt_tokens, ctx_len, defaults): (Vec<u32>, usize, _) = {
                 let g = target_state.lock().await;
                 let state = match g.as_ref() {
                     Some(s) => s,
@@ -100,7 +99,7 @@ impl LlmEngine {
                         return;
                     }
                 };
-                match state.tokenizer.encode(prompt.as_str(), true) {
+                let tokens = match state.tokenizer.encode(prompt.as_str(), true) {
                     Ok(e) => with_prefix_tokens(&params, e.get_ids()),
                     Err(e) => {
                         let msg = format!("Tokenization: {e}");
@@ -108,9 +107,21 @@ impl LlmEngine {
                         let _ = tx.send(Err(msg)).await;
                         return;
                     }
-                }
+                };
+                (
+                    tokens,
+                    state.context_length,
+                    state.generation_defaults.clone(),
+                )
             };
+            if params.stop_sequences.is_empty() {
+                params.stop_sequences = defaults.stop.clone();
+            }
             let prompt_len = prompt_tokens.len();
+            let max_tokens = crate::inference::engine::decode_step::resolve_gen_params(
+                &params, &defaults, ctx_len, prompt_len,
+            )
+            .max_tokens;
             tracing::info!("🎯 Spec decode: prompt={} tokens, k={}", prompt_len, k);
 
             // Cumulative-decode state for streaming (preserves leading

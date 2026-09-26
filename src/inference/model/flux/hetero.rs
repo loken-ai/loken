@@ -406,7 +406,7 @@ impl HeteroFlux {
         // at a low point, so free VRAM here overstates what the next step will leave -
         // which is exactly what the headroom covers.
         let need = self.bytes_per_block.saturating_add(self.render_headroom);
-        let target = crate::inference::place::device_probe::probe_cuda_gpus_for("media", 1.0)
+        let target = crate::inference::place::device_probe::probe_cuda_gpus_for("media")
             .into_iter()
             .find(|g| self.cuda_devices.contains_key(&g.index) && g.stable_free > need);
         let Some(target) = target else {

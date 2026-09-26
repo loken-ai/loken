@@ -1567,29 +1567,26 @@ impl APIServer {
     /// Whether one card of this node has `bytes` of room under the configured fraction.
     /// A model that only fits split against the host is one a peer with a larger card
     /// should take, so every family's hand-over asks this with its own demand.
-    /// What each card admits as a whole load under the configured fraction, probed once:
-    /// a card's size does not change, and the gossip round must not pay an NVML pass.
+    /// What each card admits as a whole load, probed once: a card's size does not change,
+    /// and the gossip round must not pay an NVML pass.
     pub(crate) fn usable_cards(&self) -> Vec<u64> {
         static CARDS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
         CARDS
             .get_or_init(|| {
-                let fraction = self.default_inference_config.max_gpu_memory_fraction;
-                crate::inference::place::device_probe::probe_cuda_gpus(1.0)
+                crate::inference::place::device_probe::probe_cuda_gpus()
                     .iter()
-                    .map(|g| (g.total as f64 * fraction) as u64)
+                    .map(|g| g.total)
                     .collect()
             })
             .clone()
     }
 
     pub(crate) fn card_holds(&self, bytes: u64) -> bool {
-        crate::inference::place::device_probe::probe_cuda_gpus(
-            self.default_inference_config.max_gpu_memory_fraction,
-        )
-        .iter()
-        .map(|g| g.available)
-        .max()
-        .unwrap_or(0)
+        crate::inference::place::device_probe::probe_cuda_gpus()
+            .iter()
+            .map(|g| g.available)
+            .max()
+            .unwrap_or(0)
             >= bytes
     }
 
@@ -1791,7 +1788,7 @@ impl APIServer {
             // The miss bench is a few hundred CPU iterations; run it off the async worker so a
             // model load never stalls the runtime.
             let profile = tokio::task::spawn_blocking(move || {
-                crate::distributed::auto_tune::local_profile(dim, inter, gate_dt, down_dt, 1.0)
+                crate::distributed::auto_tune::local_profile(dim, inter, gate_dt, down_dt)
             })
             .await
             .ok()

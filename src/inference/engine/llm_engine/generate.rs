@@ -188,10 +188,6 @@ impl LlmEngine {
         let model_state = self.model_state.clone();
         let cancel = self.cancel.clone();
         let config = self.config.clone();
-        let kv_shift_reuse = config.kv_shift_reuse;
-        let kv_snapshots = config.kv_snapshots;
-        let kv_snapshot_budget =
-            (config.kv_snapshot_budget_gb.max(0.0) * (1u64 << 30) as f64) as u64;
         let kv_disk = self.kv_disk.clone();
         let prompt = prompt.to_string();
         // Spec-decode: load the drafter, when one is configured, before the
@@ -277,11 +273,11 @@ impl LlmEngine {
                 Some(sent) => clamp_qwen35_prompt_to_window(
                     with_prefix_tokens(&params, encoding.get_ids()),
                     kv_window - vision_extra,
-                    params.max_tokens.unwrap_or(config.max_tokens), sent),
+                    params.max_tokens.unwrap_or(0), sent),
                 None => clamp_prompt_to_window(
                     with_prefix_tokens(&params, encoding.get_ids()),
                     kv_window - vision_extra,
-                    params.max_tokens.unwrap_or(config.max_tokens)),
+                    params.max_tokens.unwrap_or(0)),
             };
 
             // Request-start graph hygiene: a prior request's graph state
@@ -313,8 +309,7 @@ impl LlmEngine {
                     &state.name,
                     &prompt_tokens,
                     disabled,
-                    kv_shift_reuse,
-                    kv_disk.as_deref().map(|d| (d, kv_snapshots)),
+                    kv_disk.as_deref(),
                 )
             };
 
@@ -354,7 +349,8 @@ impl LlmEngine {
             // The KV a vision request consumes = text prompt + spliced image
             // embeds; count both so max_tokens can't push decode past the
             // allocated KV cap (Q8 append fails there -> degenerate output).
-            let resolved = resolve_gen_params(&params, &config, effective_context, prompt_tokens.len() + vision_extra);
+            let resolved = resolve_gen_params(&params, &state.generation_defaults, effective_context, prompt_tokens.len() + vision_extra);
+            let params = params.with_default_stops(&state.generation_defaults.stop);
             let ResolvedGenParams {
                 max_tokens, repeat_penalty, repeat_last_n, ..
             } = resolved;
@@ -1573,13 +1569,11 @@ impl LlmEngine {
                     kv_len: pos,
                 });
                 drop(g);
-                if kv_snapshots > 0 {
-                    match state.model.snapshot_kv(full.clone(), pos, kv_snapshots, kv_snapshot_budget) {
-                        Err(e) => tracing::warn!("kv snapshot skipped: {e}"),
-                        Ok(()) => {
-                            if let Some(store) = kv_disk.clone() {
-                                spawn_persist(model_state.clone(), store, full.clone());
-                            }
+                match state.model.snapshot_kv(full.clone(), pos) {
+                    Err(e) => tracing::warn!("kv snapshot skipped: {e}"),
+                    Ok(()) => {
+                        if let Some(store) = kv_disk.clone() {
+                            spawn_persist(model_state.clone(), store, full.clone());
                         }
                     }
                 }
@@ -1714,23 +1708,27 @@ impl LlmEngine {
                     config.context_length,
                     params.context_length,
                 ),
-                params.max_tokens.unwrap_or(config.max_tokens),
+                params.max_tokens.unwrap_or(0),
             );
 
             let effective_context = params
                 .context_length
                 .map(|c| c.min(state.context_length))
                 .unwrap_or(state.context_length);
-            let max_tokens = params
-                .max_tokens
-                .unwrap_or(config.max_tokens)
-                .min(effective_context.saturating_sub(prompt_tokens.len()));
-            let temperature = params.temperature.unwrap_or(config.temperature);
-            let top_p = params.top_p.unwrap_or(config.top_p);
-            let top_k = params.top_k.unwrap_or(config.top_k);
-            let seed = params.seed.unwrap_or(config.seed);
-            let repeat_penalty = params.repeat_penalty.unwrap_or(config.repeat_penalty);
-            let repeat_last_n = params.repeat_last_n.unwrap_or(config.repeat_last_n);
+            let ResolvedGenParams {
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                repeat_penalty,
+                repeat_last_n,
+            } = resolve_gen_params(
+                &params,
+                &state.generation_defaults,
+                effective_context,
+                prompt_tokens.len(),
+            );
             let device = state.device.clone();
 
             let sampling = build_sampling_from(temperature, top_p, top_k);
@@ -1928,23 +1926,27 @@ impl LlmEngine {
                     config.context_length,
                     params.context_length,
                 ),
-                params.max_tokens.unwrap_or(config.max_tokens),
+                params.max_tokens.unwrap_or(0),
             );
 
             let effective_context = params
                 .context_length
                 .map(|c| c.min(state.context_length))
                 .unwrap_or(state.context_length);
-            let max_tokens = params
-                .max_tokens
-                .unwrap_or(config.max_tokens)
-                .min(effective_context.saturating_sub(prompt_tokens.len()));
-            let temperature = params.temperature.unwrap_or(config.temperature);
-            let top_p = params.top_p.unwrap_or(config.top_p);
-            let top_k = params.top_k.unwrap_or(config.top_k);
-            let seed = params.seed.unwrap_or(config.seed);
-            let repeat_penalty = params.repeat_penalty.unwrap_or(config.repeat_penalty);
-            let repeat_last_n = params.repeat_last_n.unwrap_or(config.repeat_last_n);
+            let ResolvedGenParams {
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                repeat_penalty,
+                repeat_last_n,
+            } = resolve_gen_params(
+                &params,
+                &state.generation_defaults,
+                effective_context,
+                prompt_tokens.len(),
+            );
             let device = state.device.clone();
 
             let sampling = build_sampling_from(temperature, top_p, top_k);

@@ -14,7 +14,7 @@ use super::*;
 /// trace, and every host kernel ran on rayon's default of one thread per LOGICAL core. On a
 /// non-hybrid SMT part that is two siblings contending for one core's execution units and L1,
 /// which is what the count below exists to avoid.
-pub fn configure_thread_pool(cpu_threads: usize) {
+pub fn configure_thread_pool() {
     RAYON_INIT.call_once(|| {
         // Detect hybrid CPU topology - if P/E cores are
         // distinguishable, pin worker threads to P-cores via
@@ -23,17 +23,13 @@ pub fn configure_thread_pool(cpu_threads: usize) {
         // hardware or when detection fails.
         let topo = crate::cpu::detect_cpu_topology();
         let p_cores: Vec<usize> = topo.get_inference_cores();
-        let n = if cpu_threads == 0 {
-            // Hybrid: use P-core count, not physical-core total
-            // (otherwise the worker pool spills onto E-cores).
-            // Non-hybrid: physical cores (skip HT siblings).
-            if topo.is_hybrid && !p_cores.is_empty() {
-                p_cores.len()
-            } else {
-                num_cpus::get_physical()
-            }
+        // Hybrid: use P-core count, not physical-core total
+        // (otherwise the worker pool spills onto E-cores).
+        // Non-hybrid: physical cores (skip HT siblings).
+        let n = if topo.is_hybrid && !p_cores.is_empty() {
+            p_cores.len()
         } else {
-            cpu_threads
+            num_cpus::get_physical()
         };
         let p_cores_for_pin = p_cores.clone();
         // Pin to P-cores only on HYBRID CPUs (to keep workers off the
@@ -122,13 +118,10 @@ impl LlmEngine {
         );
 
         let device_index = self.config.device_index;
-        let max_gpu_memory_fraction = self.config.max_gpu_memory_fraction;
-        let _cpu_threads = self.config.cpu_threads;
         let disable_arc_layers = self.config.disable_arc_layers;
         // `--cpu` serve flag forces the same all-CPU placement as the
         // disable_cuda config (empty cuda_devices -> every layer on CPU).
         let disable_cuda = self.config.disable_cuda || crate::gpu::force_cpu();
-        let force_gpu_layers = self.config.force_gpu_layers;
         let kv_quant = self.config.kv_quant;
         let user_context_length = self.config.context_length;
         let model_state = self.model_state.clone();
@@ -139,6 +132,7 @@ impl LlmEngine {
                                                // the spawn_blocking closure so the CLIP loader can pick it up
                                                // after the LM has loaded as GenericHetero.
         let projector_blob = self.find_projector_blob_for_model(&model_id_clone);
+        let generation_defaults = self.generation_defaults_for(&model_id_clone, &model_file);
 
         // Load model in blocking thread since GGUF parsing and weight loading are CPU-intensive
         let result = tokio::task::spawn_blocking(move || -> AnyResult<()> {
@@ -148,8 +142,9 @@ impl LlmEngine {
             if model_file.is_dir()
                 && checkpoint_model_type(&model_file).as_deref() == Some("deepseek_v41")
             {
-                let state =
+                let mut state =
                     load_deepseek_v41_checkpoint(&model_file, &model_id_clone, user_context_length)?;
+                state.generation_defaults = generation_defaults.clone();
                 let fsz = state.file_size;
                 let mut guard = model_state.blocking_lock();
                 crate::inference::place::vram_manager::residency_changed();
@@ -169,6 +164,7 @@ impl LlmEngine {
                 resolve_awq_dir(&model_file.to_string_lossy())
             {
                 let mut state = load_awq_model_state(&awq_dir, &model_id_clone, user_context_length)?;
+                state.generation_defaults = generation_defaults.clone();
                 let fsz = state.file_size;
                 cb_maybe_wrap(&mut state);
                 let mut guard = model_state.blocking_lock();
@@ -271,7 +267,13 @@ impl LlmEngine {
                 })
                 .unwrap_or(32000) as usize;
             let context_length = get_gguf_u32(&content, &format!("{arch}.context_length"))
-                .unwrap_or(4096) as usize;
+                .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| c as usize);
+            // No window asked for: the model's own.
+            let user_context_length = if user_context_length == 0 {
+                context_length
+            } else {
+                user_context_length
+            };
             // A file without tokenizer metadata may still ship its tokenizer files alongside;
             // they name the end-of-sequence token and carry its id.
             let eos_token_id = get_gguf_u32(&content, "tokenizer.ggml.eos_token_id")
@@ -546,7 +548,13 @@ impl LlmEngine {
             debug!("✓ Tokenizer loaded");
 
             // --- 4. Select device (size-aware: only use GPU if model fits) ---
-            let gpu_idx = device_index.unwrap_or(0);
+            // The primary card is the pinned one, else the fastest present: the probe ranks
+            // by compute.
+            let gpu_idx = device_index.unwrap_or_else(|| {
+                crate::inference::place::device_probe::probe_cuda_gpus()
+                    .first()
+                    .map_or(0, |g| g.index)
+            });
 
             // Enumerate all CUDA GPUs via NVML, sorted by performance (fastest first).
             // Shared, process-aware probe (also serves the ACE-Step native stack):
@@ -584,11 +592,11 @@ impl LlmEngine {
             crate::inference::place::device_probe::debug_vram_by_card("after-pool-release");
             let boost = crate::inference::place::vram_manager::vram_reserve_boost();
             let all_cuda_gpus: Vec<(usize, u64, u64)> = // (index, stable_free, available)
-                crate::inference::place::device_probe::probe_cuda_gpus_for("llm", max_gpu_memory_fraction)
+                crate::inference::place::device_probe::probe_cuda_gpus_for("llm")
                     .into_iter()
                     .map(|g| {
                         let free = g.stable_free.saturating_sub(boost);
-                        (g.index, free, (free as f64 * max_gpu_memory_fraction) as u64)
+                        (g.index, free, free)
                     })
                     .collect();
 
@@ -623,8 +631,8 @@ impl LlmEngine {
             // Prepare heterogeneous devices for potential hetero planning
             // Apply device filters (for benchmarking different configurations).
             //
-            // Reserve a per-GPU loader overhead beyond the user's
-            // `max_gpu_memory_fraction` budget - the second loader pass
+            // Reserve a per-GPU loader overhead beyond the measured free
+            // memory - the second loader pass
             // performs dequant of small tensors (e.g. output projection),
             // KV cache dynamic staging, and CUDA scratch buffers that aren't
             // in the static `file_size` weights number. Without this
@@ -733,18 +741,17 @@ impl LlmEngine {
                 let cuda_devices: Vec<(usize, u64)> = if disable_cuda {
                     cuda_devices.clone()
                 } else {
-                    for g in crate::inference::place::device_probe::probe_cuda_gpus_for("llm", 1.0) {
+                    for g in crate::inference::place::device_probe::probe_cuda_gpus_for("llm") {
                         warm_card(g.index);
                     }
                     crate::inference::engine::llm_engine::release_cuda_pools();
-                    crate::inference::place::device_probe::probe_cuda_gpus_for("llm", max_gpu_memory_fraction)
+                    crate::inference::place::device_probe::probe_cuda_gpus_for("llm")
                         .into_iter()
                         .map(|g| {
                             let free = g.stable_free.saturating_sub(boost);
                             (
                                 g.index,
-                                ((free as f64 * max_gpu_memory_fraction) as u64)
-                                    .saturating_sub(LOADER_OVERHEAD_PER_GPU),
+                                free.saturating_sub(LOADER_OVERHEAD_PER_GPU),
                             )
                         })
                         .filter(|(_, avail)| *avail > 0)
@@ -1156,11 +1163,7 @@ impl LlmEngine {
                     Box::new(crate::inference::engine::model_backend::DeepseekV41Backend::new(
                         model,
                         cfg.moe_inter_dim,
-                        if user_context_length > 0 {
-                            user_context_length
-                        } else {
-                            4096
-                        },
+                        user_context_length,
                     ))
                 }
                 "qwen35moe" | "qwen35" | "qwen3next" => {
@@ -1279,7 +1282,6 @@ impl LlmEngine {
                 "olmo2" | "olmoe" | "ernie4_5" | "smollm3" => {
                     debug!("⬇️  Loading '{}' as generic hetero transformer (CUDA+CPU)...", arch);
                     // For generic models: CUDA + CPU only (no OpenCL, those need per-model kernels).
-                    // Respect force_gpu_layers when set; otherwise auto-calculate from VRAM.
                     // Per-layer KV cache memory cost. Used by HeteroPlan to
                     // reserve headroom on each GPU so weights + KV both fit.
                     // Cost: 2 x n_kv_heads x head_dim x max_seq x kv_dtype_bytes
@@ -1457,13 +1459,7 @@ impl LlmEngine {
                             .saturating_mul(2);
                         CUBLAS_WORKSPACE_BYTES.saturating_add(act)
                     };
-                    let hetero_plan = if let Some(forced) = force_gpu_layers {
-                        if cuda_available {
-                            HeteroPlan::forced_gpu(num_layers, forced, gpu_idx)
-                        } else {
-                            HeteroPlan::calculate_with_kv(num_layers, file_size, &[], &[], 1.0, kv_bytes_per_layer)
-                        }
-                    } else if model_fits_single_gpu && cuda_available {
+                    let hetero_plan = if model_fits_single_gpu && cuda_available {
                         // Weights + KV reserve fit ONE GPU -> keep ALL layers on gpu_idx
                         // (single-GPU decode win) instead of letting the planner spread
                         // a fits-1-GPU model across 2 GPUs + CPU, which eats cross-device
@@ -1730,6 +1726,7 @@ impl LlmEngine {
                 qwen35_image: None,
                 image_embed_cache: None,
                 grammar_factory: std::sync::OnceLock::new(),
+                generation_defaults: generation_defaults.clone(),
             };
             // Route a cb_eligible GPU dense model through the batched
             // continuous-batch worker (no-op for ineligible/CPU models).
@@ -1793,7 +1790,7 @@ impl LlmEngine {
         // card's memory bandwidth at most. Every node derives this the same way, so the
         // cluster can compare two nodes before either has measured anything.
         if file_size > 0 {
-            let bw = crate::inference::place::device_probe::probe_cuda_gpus(1.0)
+            let bw = crate::inference::place::device_probe::probe_cuda_gpus()
                 .iter()
                 .map(|g| g.mem_bw_gbs)
                 .fold(0.0, f64::max);
