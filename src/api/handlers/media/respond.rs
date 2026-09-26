@@ -1,8 +1,4 @@
 //! Split out of the parent module; see its header for what this file is part of.
-//!
-//! `use super::*` keeps the names its items referred to before the split in reach.
-
-use super::*;
 
 /// Build the response headers shared across all three /v1/images/*
 /// endpoints (generations, edits, variations). One helper keeps the
@@ -362,7 +358,7 @@ pub(crate) fn composite_preserved(
 
 #[cfg(test)]
 mod alignment_tests {
-    use super::{align_to, image_model_defaults, regime_for};
+    use super::super::{align_to, image_model_defaults, regime_for};
 
     /// An adapter's regime fills in only what the CALLER left unset. A named step count
     /// is an instruction, and an adapter's preference does not outrank it.

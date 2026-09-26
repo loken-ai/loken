@@ -207,7 +207,7 @@ impl DecodeBoundary {
                 Ok(())
             }
         };
-        let mut get_u32 = |p: &mut usize| -> Result<usize> {
+        let get_u32 = |p: &mut usize| -> Result<usize> {
             need(*p, 4)?;
             let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
             *p += 4;
@@ -215,7 +215,7 @@ impl DecodeBoundary {
         };
         let hc = get_u32(&mut p)?;
         let dim = get_u32(&mut p)?;
-        let mut get_f32 = |p: &mut usize| -> Result<f32> {
+        let get_f32 = |p: &mut usize| -> Result<f32> {
             need(*p, 4)?;
             let v = f32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap());
             *p += 4;
@@ -278,7 +278,6 @@ impl DecodeBoundary {
             let n = get_u32(&mut p)?;
             need(p, n)?;
             let v = bytes[p..p + n].iter().map(|&b| b != 0).collect();
-            p += n;
             Some(v)
         } else {
             None

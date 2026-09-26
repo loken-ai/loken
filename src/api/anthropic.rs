@@ -199,21 +199,6 @@ impl AnthropicMessagesRequest {
             .and_then(|f| f.get("schema"))
     }
 
-    /// True unless `tool_choice.type == "none"` and tools are present.
-    pub fn tools_enabled(&self) -> bool {
-        let has = self.tools.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
-        if !has {
-            return false;
-        }
-        !matches!(
-            self.tool_choice
-                .as_ref()
-                .and_then(|v| v.get("type"))
-                .and_then(|t| t.as_str()),
-            Some("none")
-        )
-    }
-
     /// Lower the Anthropic request to internal `Message`s and `Tool`s.
     /// System prompt becomes a leading system message; assistant
     /// `tool_use` blocks become `Message.tool_calls`; user `tool_result`
@@ -644,7 +629,6 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert!(req.tools_enabled());
         let (msgs, tools) = req.into_internal();
         assert_eq!(tools.len(), 1);
         let asst = msgs.iter().find(|m| m.role == "assistant").unwrap();
@@ -659,18 +643,6 @@ mod tests {
         let tool = msgs.iter().find(|m| m.role == "tool").unwrap();
         assert_eq!(tool.content, "sunny");
         assert_eq!(tool.tool_call_id.as_deref(), Some("tu_1"));
-    }
-
-    #[test]
-    fn tool_choice_none_disables() {
-        let req: AnthropicMessagesRequest = serde_json::from_value(json!({
-            "model": "m", "max_tokens": 10,
-            "tools": [{"name": "f"}],
-            "tool_choice": {"type": "none"},
-            "messages": [{"role": "user", "content": "hi"}]
-        }))
-        .unwrap();
-        assert!(!req.tools_enabled());
     }
 
     #[test]

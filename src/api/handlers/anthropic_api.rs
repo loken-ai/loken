@@ -442,7 +442,6 @@ pub(crate) async fn anthropic_count_tokens(
     State(state): State<APIServer>,
     AnthropicJson(req): AnthropicJson<crate::api::anthropic::AnthropicMessagesRequest>,
 ) -> Response {
-    use axum::http::StatusCode;
     if let Err(e) = validate_model_id(&req.model) {
         return anthropic_api_error(e);
     }

@@ -137,7 +137,7 @@ fn chat_prompt_spec(request: &ChatCompletionRequest) -> super::chat_prompt::Prom
 pub(crate) async fn chat_completion(
     State(state): State<APIServer>,
     headers: axum::http::HeaderMap,
-    OpenAIJson(mut request): OpenAIJson<ChatCompletionRequest>,
+    OpenAIJson(request): OpenAIJson<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
     validate_request(&request)?;
 

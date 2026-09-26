@@ -47,7 +47,6 @@ pub(crate) fn load_error(model_name: &str, e: &str) -> ApiError {
 /// A generation admitted to its engine. Dropping it releases the gate slot and the
 /// in-flight count, so a stream holds it until its last chunk.
 pub(crate) struct Admission {
-    pub engine: Arc<LlmEngine>,
     _gate: Option<crate::api::gate::RequestGuard>,
     _in_flight: crate::distributed::rate_meter::InFlight,
 }
@@ -124,7 +123,6 @@ impl APIServer {
             }
         }
         Ok(Admission {
-            engine,
             _gate: gate,
             _in_flight: in_flight,
         })
