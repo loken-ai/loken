@@ -86,11 +86,32 @@ impl LogitsProcessor {
     pub fn set_top_logprobs(&mut self, top: Option<usize>) {
         self.top_logprobs = top;
     }
-    /// Whether the draw must happen on the host: a bias to apply, or log-probabilities
-    /// to read, neither of which the device's argmax kernel does.
+    /// Whether the draw must happen on the host: a sampled (not greedy) draw, a bias to
+    /// apply, or log-probabilities to read, none of which the device's argmax kernel does.
     pub fn needs_host(&self) -> bool {
-        self.bias.is_some() || self.top_logprobs.is_some()
+        !matches!(self.sampling, Sampling::ArgMax)
+            || self.bias.is_some()
+            || self.top_logprobs.is_some()
     }
+    /// The draw as a card-side top-k sampler runs it: `(k, temperature, top_p, u)`, with `u`
+    /// the uniform this processor's seeded generator supplies. `None` when the draw has to
+    /// happen here: greedy, no top-k (or one wider than `max_k`), a bias, or log-probabilities.
+    pub fn device_draw(&mut self, max_k: usize) -> Option<(usize, f32, f32, f32)> {
+        if self.bias.is_some() || self.top_logprobs.is_some() {
+            return None;
+        }
+        let (k, temperature, p) = match self.sampling {
+            Sampling::TopK { k, temperature } => (k, temperature, 1.0),
+            Sampling::TopKThenTopP { k, p, temperature } => (k, temperature, p),
+            _ => return None,
+        };
+        if k == 0 || k > max_k || temperature <= 0.0 {
+            return None;
+        }
+        let u: f32 = rand::RngExt::random(&mut self.rng);
+        Some((k, temperature as f32, p as f32, u))
+    }
+
     pub fn take_last_logprobs(&mut self) -> Option<SampledLogprobs> {
         self.last_logprobs.take()
     }
@@ -129,13 +150,6 @@ impl LogitsProcessor {
         Ok(distribution.sample(&mut self.rng))
     }
 
-    /// Draw from a restricted candidate set and answer with the vocabulary index.
-    fn draw_among(&mut self, prs: &[f32], candidates: &[usize]) -> Result<u32> {
-        let weights: Vec<f32> = candidates.iter().map(|&i| prs[i]).collect();
-        let drawn = self.draw(&weights)?;
-        Ok(candidates[drawn] as u32)
-    }
-
     /// Sample a token that is never one of `stops`, by suppressing those ids to negative
     /// infinity before sampling. A request that asked for output must not return an empty
     /// answer because the model's first token would be an end-of-sequence token - which a base
@@ -155,22 +169,21 @@ impl LogitsProcessor {
     /// Draws the next token on the host, after the bias, and keeps the draw's
     /// log-probabilities when they were asked for.
     pub fn sample(&mut self, logits: &Tensor) -> Result<u32> {
-        let logits = logits.to_device(&Device::Cpu)?;
-        let logits = match self.bias.as_ref() {
-            Some(bias) => {
-                let mut v = logits.to_vec_f32();
-                for (&id, &b) in bias {
-                    if let Some(l) = v.get_mut(id as usize) {
-                        *l += b;
-                    }
+        let v = logits.to_device(&Device::Cpu)?.to_vec_f32();
+        self.sample_logits(v)
+    }
+
+    /// [`Self::sample`] over a row already on the host.
+    pub fn sample_logits(&mut self, mut v: Vec<f32>) -> Result<u32> {
+        if let Some(bias) = self.bias.as_ref() {
+            for (&id, &b) in bias {
+                if let Some(l) = v.get_mut(id as usize) {
+                    *l += b;
                 }
-                Tensor::from_vec(v, logits.shape(), &Device::Cpu)?
             }
-            None => logits,
-        };
-        let token = self.sample_inner(&logits)?;
+        }
+        let token = self.sample_inner(&v)?;
         if let Some(k) = self.top_logprobs {
-            let v = logits.to_vec_f32();
             let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let lse = max + v.iter().map(|x| (x - max).exp()).sum::<f32>().ln();
             let top = if k == 0 {
@@ -192,27 +205,29 @@ impl LogitsProcessor {
         Ok(token)
     }
 
-    fn sample_inner(&mut self, logits: &Tensor) -> Result<u32> {
-        let logits = logits.to_device(&Device::Cpu)?;
-        let probabilities = |temperature: f64| -> Result<Vec<f32>> {
-            let scaled = logits.scale((1.0 / temperature) as f32)?;
-            Ok(scaled.softmax_last_dim()?.to_vec_f32())
+    fn sample_inner(&mut self, v: &[f32]) -> Result<u32> {
+        // Softmax at `temperature` without materialising it: the weight of logit `x` is
+        // exp((x - max) / t) / z, and z needs one pass over the row.
+        let weights = |temperature: f64| {
+            let t = temperature as f32;
+            let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let z: f32 = v.iter().map(|x| ((x - max) / t).exp()).sum();
+            move |x: f32| ((x - max) / t).exp() / z
         };
-
         match &self.sampling {
             Sampling::ArgMax => {
                 // Vectorised, and first-max-wins like the scalar loop it replaces - greedy has
                 // to be exact, and it runs once per token over the whole vocabulary.
-                Ok(crate::inference::kernel::cpu_decode_exec::argmax_f32(
-                    &logits.to_vec_f32(),
-                ))
+                Ok(crate::inference::kernel::cpu_decode_exec::argmax_f32(v))
             }
             Sampling::All { temperature } => {
-                let prs = probabilities(*temperature)?;
+                let w = weights(*temperature);
+                let prs: Vec<f32> = v.iter().map(|&x| w(x)).collect();
                 Ok(self.draw(&prs)? as u32)
             }
             Sampling::TopP { p, temperature } => {
-                let mut prs = probabilities(*temperature)?;
+                let w = weights(*temperature);
+                let mut prs: Vec<f32> = v.iter().map(|&x| w(x)).collect();
                 // A nucleus that covers everything, or nothing, is no restriction at all.
                 if *p > 0.0 && *p < 1.0 {
                     keep_nucleus(&mut prs, *p as f32);
@@ -220,25 +235,30 @@ impl LogitsProcessor {
                 Ok(self.draw(&prs)? as u32)
             }
             Sampling::TopK { k, temperature } => {
-                let prs = probabilities(*temperature)?;
-                if *k >= prs.len() {
+                let w = weights(*temperature);
+                if *k >= v.len() {
+                    let prs: Vec<f32> = v.iter().map(|&x| w(x)).collect();
                     return Ok(self.draw(&prs)? as u32);
                 }
-                let candidates = most_probable(&prs, *k);
-                self.draw_among(&prs, &candidates)
+                // The k largest logits are the k most probable tokens at any temperature.
+                let candidates = most_probable(v, *k);
+                let kept: Vec<f32> = candidates.iter().map(|&i| w(v[i])).collect();
+                let drawn = self.draw(&kept)?;
+                Ok(candidates[drawn] as u32)
             }
             Sampling::TopKThenTopP { k, p, temperature } => {
-                let mut prs = probabilities(*temperature)?;
-                if *k >= prs.len() {
+                let w = weights(*temperature);
+                if *k >= v.len() {
+                    let mut prs: Vec<f32> = v.iter().map(|&x| w(x)).collect();
                     if *p > 0.0 && *p < 1.0 {
                         keep_nucleus(&mut prs, *p as f32);
                     }
                     return Ok(self.draw(&prs)? as u32);
                 }
-                let candidates = most_probable(&prs, *k);
+                let candidates = most_probable(v, *k);
                 // The nucleus is taken inside what `k` left, so the threshold is compared
                 // against that set's own mass rather than against one.
-                let mut kept: Vec<f32> = candidates.iter().map(|&i| prs[i]).collect();
+                let mut kept: Vec<f32> = candidates.iter().map(|&i| w(v[i])).collect();
                 let mass: f32 = kept.iter().sum();
                 let p = *p as f32;
                 if p > 0.0 && p < mass {

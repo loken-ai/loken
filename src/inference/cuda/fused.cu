@@ -977,6 +977,174 @@ extern "C" __global__ void fused_penalty_argmax_f32(
 }
 
 // ------------------------------------------------------------
+// Top-k sampling on the card, so only the drawn token comes back.
+//
+// Stage 1 (many blocks, one element per thread): each block applies the repeat penalty and
+// the temperature, keeps its online-softmax pair (block max, sum of exp(x - max)) for the
+// normaliser, and extracts its own k best candidates by k rounds of block argmax.
+// Stage 2 (one block): the pairs combine into the full-vocabulary normaliser, the k best of
+// all candidates are extracted in descending order, the nucleus is cut at `top_p` of the
+// FULL distribution (the host sampler's rule), and `u` (a uniform draw from the host's
+// seeded generator) picks the token. A value of -inf is a padding slot and is never drawn.
+// ------------------------------------------------------------
+
+// Negative infinity without <math.h>, which NVRTC does not provide here.
+#define TOPK_NEG_INF __int_as_float(0xff800000)
+
+extern "C" __global__ void sample_topk_block_f32(
+    const float* __restrict__ logits,
+    const int* __restrict__ penalty_ids,
+    const int n_penalty,
+    const float penalty,
+    const int vocab_size,
+    const float inv_temp,
+    const int k,
+    float* __restrict__ cand_vals,     // [gridDim.x * k]
+    int* __restrict__ cand_idxs,       // [gridDim.x * k]
+    float* __restrict__ block_max,     // [gridDim.x]
+    float* __restrict__ block_sum      // [gridDim.x]
+) {
+    extern __shared__ float pairs_tk[];            // [blockDim.x * 2]
+    const int tid = threadIdx.x;
+    const int i = blockIdx.x * blockDim.x + tid;
+    float v = TOPK_NEG_INF;
+    if (i < vocab_size) {
+        v = logits[i];
+        for (int p = 0; p < n_penalty; p++) {
+            if (penalty_ids[p] == i) {
+                if (v >= 0.0f) { v /= penalty; } else { v *= penalty; }
+                break;
+            }
+        }
+        v *= inv_temp;
+    }
+    pairs_tk[tid * 2] = v;
+    pairs_tk[tid * 2 + 1] = __int_as_float(i);
+    __syncthreads();
+    fold_best_pair</*TIE_BY_INDEX=*/false>(pairs_tk, tid);
+    const float m = pairs_tk[0];
+    __syncthreads();
+    pairs_tk[tid * 2] = (i < vocab_size && m > TOPK_NEG_INF) ? __expf(v - m) : 0.0f;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) { pairs_tk[tid * 2] += pairs_tk[(tid + s) * 2]; }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        block_max[blockIdx.x] = m;
+        block_sum[blockIdx.x] = pairs_tk[0];
+    }
+    __syncthreads();
+    float mine = v;
+    for (int r = 0; r < k; r++) {
+        pairs_tk[tid * 2] = mine;
+        pairs_tk[tid * 2 + 1] = __int_as_float(i);
+        __syncthreads();
+        fold_best_pair</*TIE_BY_INDEX=*/false>(pairs_tk, tid);
+        const float wv = pairs_tk[0];
+        const int wi = __float_as_int(pairs_tk[1]);
+        if (tid == 0) {
+            cand_vals[blockIdx.x * k + r] = wv;
+            cand_idxs[blockIdx.x * k + r] = wi;
+        }
+        if (i == wi) { mine = TOPK_NEG_INF; }
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void sample_topk_final_f32(
+    float* __restrict__ cand_vals,           // [n_cand], consumed: taken slots become -inf
+    const int* __restrict__ cand_idxs,       // [n_cand]
+    const int n_cand,
+    const float* __restrict__ block_max,     // [n_blocks]
+    const float* __restrict__ block_sum,     // [n_blocks]
+    const int n_blocks,
+    const int k,
+    const float top_p,
+    const float u,
+    unsigned int* __restrict__ out_token
+) {
+    extern __shared__ float sh_tk[];         // [blockDim.x * 2] pairs, then k values, k ids
+    float* pairs = sh_tk;
+    float* sel_v = sh_tk + blockDim.x * 2;
+    int* sel_i = (int*)(sel_v + k);
+    const int tid = threadIdx.x;
+
+    // Global maximum over the block maxima.
+    float bm = TOPK_NEG_INF;
+    for (int b = tid; b < n_blocks; b += blockDim.x) { bm = fmaxf(bm, block_max[b]); }
+    pairs[tid * 2] = bm;
+    pairs[tid * 2 + 1] = __int_as_float(0);
+    __syncthreads();
+    fold_best_pair</*TIE_BY_INDEX=*/false>(pairs, tid);
+    const float gm = pairs[0];
+    __syncthreads();
+    // Normaliser: each block's sum rescaled to the global maximum.
+    float z = 0.0f;
+    for (int b = tid; b < n_blocks; b += blockDim.x) {
+        if (block_max[b] > TOPK_NEG_INF) { z += block_sum[b] * __expf(block_max[b] - gm); }
+    }
+    pairs[tid * 2] = z;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) { pairs[tid * 2] += pairs[(tid + s) * 2]; }
+        __syncthreads();
+    }
+    const float zt = pairs[0];
+    __syncthreads();
+
+    // The k best candidates, best first.
+    for (int r = 0; r < k; r++) {
+        float best = TOPK_NEG_INF;
+        int at = 0;
+        for (int c = tid; c < n_cand; c += blockDim.x) {
+            if (cand_vals[c] > best) { best = cand_vals[c]; at = c; }
+        }
+        pairs[tid * 2] = best;
+        pairs[tid * 2 + 1] = __int_as_float(at);
+        __syncthreads();
+        fold_best_pair</*TIE_BY_INDEX=*/true>(pairs, tid);
+        if (tid == 0) {
+            const int c = __float_as_int(pairs[1]);
+            sel_v[r] = pairs[0];
+            sel_i[r] = cand_idxs[c];
+            cand_vals[c] = TOPK_NEG_INF;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        // Probabilities of the kept candidates under the full distribution.
+        float mass = 0.0f;
+        for (int r = 0; r < k; r++) {
+            sel_v[r] = (sel_v[r] > TOPK_NEG_INF && zt > 0.0f) ? __expf(sel_v[r] - gm) / zt : 0.0f;
+            mass += sel_v[r];
+        }
+        // Nucleus inside what k left, against the full distribution's mass.
+        int keep = k;
+        if (top_p > 0.0f && top_p < mass) {
+            float cum = 0.0f;
+            keep = 0;
+            while (keep < k && cum < top_p) { cum += sel_v[keep]; keep++; }
+        }
+        float total = 0.0f;
+        for (int r = 0; r < keep; r++) { total += sel_v[r]; }
+        const float target = u * total;
+        float cum = 0.0f;
+        int chosen = sel_i[0];
+        for (int r = 0; r < keep; r++) {
+            if (sel_v[r] <= 0.0f) { continue; }
+            cum += sel_v[r];
+            chosen = sel_i[r];
+            if (cum > target) { break; }
+        }
+        out_token[0] = (unsigned int)chosen;
+    }
+}
+
+#undef TOPK_NEG_INF
+
+// ------------------------------------------------------------
 // Multi-block argmax - 2-kernel chain replaces the single-block scan.
 //
 // nsys profile of gemma4:latest decode: the single-block

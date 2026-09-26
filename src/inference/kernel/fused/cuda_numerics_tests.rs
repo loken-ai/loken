@@ -538,3 +538,38 @@ fn fused_phi2_residual_merge_falls_back_on_cpu() {
         assert!((oo - ww).abs() < 1e-6, "{oo} vs {ww}");
     }
 }
+
+/// The card-side top-k sampler walks the kept candidates best first: a uniform at the bottom
+/// of the range draws the best token, one inside the second token's share draws the second,
+/// the nucleus cuts the tail, and the repeat penalty moves a token down the order.
+#[test]
+fn sample_topk_draws_by_cumulative_share() {
+    let dev = match try_open_cuda() {
+        Some(d) => d,
+        None => {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        }
+    };
+    // A vocabulary wider than one stage-1 block, with three clear leaders.
+    const VOCAB: usize = 5000;
+    let mut v = vec![-20.0f32; VOCAB];
+    v[4000] = 3.0;
+    v[17] = 2.0;
+    v[2500] = 1.0;
+    let logits = Tensor::from_slice(&v, (1, VOCAB), &dev).unwrap();
+    let z: f32 = v.iter().map(|x| (x - 3.0).exp()).sum();
+    let p = |x: f32| (x - 3.0).exp() / z;
+    let (p0, p1, p2) = (p(3.0), p(2.0), p(1.0));
+    let kept = p0 + p1 + p2;
+    let draw = |u: f32, top_p: f32, pen: &[u32], penalty: f32| {
+        sample_topk(&logits, pen, penalty, 1.0, 3, top_p, u).unwrap()
+    };
+    assert_eq!(draw(0.0, 1.0, &[], 1.0), 4000);
+    assert_eq!(draw((p0 + 0.5 * p1) / kept, 1.0, &[], 1.0), 17);
+    assert_eq!(draw(0.999, 1.0, &[], 1.0), 2500);
+    // A nucleus the best token alone covers keeps only it.
+    assert_eq!(draw(0.999, p0 * 0.5, &[], 1.0), 4000);
+    // Dividing the leader's logit by 3 puts it below the second.
+    assert_eq!(draw(0.0, 1.0, &[4000], 3.0), 17);
+}

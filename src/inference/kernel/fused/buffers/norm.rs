@@ -633,6 +633,131 @@ pub fn fused_penalty_argmax_with_device(
     Ok((result[0] as u32, out_token))
 }
 
+/// Largest `k` the card-side sampler serves; a wider top-k samples on the host. It bounds the
+/// rounds of block argmax each stage runs and the selection the final block keeps in shared
+/// memory.
+pub const SAMPLE_TOPK_MAX: usize = 256;
+
+/// Draws one token from the `k` most probable of `logits` after the repeat penalty, at
+/// `temperature`, inside the `top_p` nucleus of the full distribution, using the uniform
+/// `u` in [0, 1). Only the token comes back to the host.
+pub fn sample_topk(
+    logits: &Tensor,
+    penalty_token_ids: &[u32],
+    repeat_penalty: f32,
+    temperature: f32,
+    k: usize,
+    top_p: f32,
+    u: f32,
+) -> Result<u32> {
+    if !logits.device().is_cuda() {
+        crate::tensor::bail!("sample_topk requires CUDA");
+    }
+    if k == 0 || k > SAMPLE_TOPK_MAX || temperature <= 0.0 {
+        crate::tensor::bail!("sample_topk: k {k} temperature {temperature} not served");
+    }
+    let logits = logits
+        .flatten_all()?
+        .to_dtype(crate::tensor::DType::F32)?
+        .contiguous()?;
+    let vocab_size = logits.elem_count();
+    let k = k.min(vocab_size);
+    let cuda_dev = logits.device().as_cuda_device()?;
+    let ptx = get_ptx(&cuda_dev)?;
+    let block_func =
+        cuda_dev.get_or_load_custom_func("sample_topk_block_f32", "loken_fused", ptx)?;
+    let final_func =
+        cuda_dev.get_or_load_custom_func("sample_topk_final_f32", "loken_fused", ptx)?;
+    let stream = cuda_dev.cuda_stream();
+    let err =
+        |what: &str, e: &dyn std::fmt::Display| crate::tensor::Error::msg(format!("{what}: {e}"));
+
+    let penalty_ids: Vec<i32> = penalty_token_ids.iter().map(|&t| t as i32).collect();
+    let n_penalty = penalty_ids.len() as i32;
+    let penalty_gpu = if penalty_ids.is_empty() {
+        stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| err("alloc penalty", &e))?
+    } else {
+        stream
+            .clone_htod(&penalty_ids)
+            .map_err(|e| err("htod penalty", &e))?
+    };
+
+    // One element per thread in stage 1, so every block holds a full warp set of candidates.
+    const THREADS: u32 = 1024;
+    let n_blocks = (vocab_size as u32).div_ceil(THREADS).max(1);
+    let n_cand = n_blocks as usize * k;
+    let cand_vals = stream
+        .alloc_zeros::<f32>(n_cand)
+        .map_err(|e| err("alloc cand", &e))?;
+    let cand_idxs = stream
+        .alloc_zeros::<i32>(n_cand)
+        .map_err(|e| err("alloc cand", &e))?;
+    let block_max = stream
+        .alloc_zeros::<f32>(n_blocks as usize)
+        .map_err(|e| err("alloc max", &e))?;
+    let block_sum = stream
+        .alloc_zeros::<f32>(n_blocks as usize)
+        .map_err(|e| err("alloc sum", &e))?;
+    let out_token = stream
+        .alloc_zeros::<u32>(1)
+        .map_err(|e| err("alloc out", &e))?;
+
+    let (logits_store, logits_layout) = logits.storage_and_layout();
+    let crate::tensor::StorageView::Cuda(ls) = &*logits_store else {
+        crate::tensor::bail!("sample_topk: logits not on CUDA");
+    };
+    let logits_view = ls
+        .as_cuda_slice::<f32>()?
+        .slice(logits_layout.start_offset()..);
+    let (vocab_i32, inv_temp, k_i32) = (vocab_size as i32, 1.0f32 / temperature, k as i32);
+    let mut b1 = block_func.builder();
+    b1.arg(&logits_view);
+    b1.arg(&penalty_gpu);
+    b1.arg(&n_penalty);
+    b1.arg(&repeat_penalty);
+    b1.arg(&vocab_i32);
+    b1.arg(&inv_temp);
+    b1.arg(&k_i32);
+    b1.arg(&cand_vals);
+    b1.arg(&cand_idxs);
+    b1.arg(&block_max);
+    b1.arg(&block_sum);
+    let cfg1 = crate::tensor::cuda_ext::LaunchConfig {
+        grid_dim: (n_blocks, 1, 1),
+        block_dim: (THREADS, 1, 1),
+        shared_mem_bytes: THREADS * 8,
+    };
+    unsafe { b1.launch(cfg1) }.map_err(|e| err("sample_topk_block", &e))?;
+
+    let (n_cand_i32, n_blocks_i32) = (n_cand as i32, n_blocks as i32);
+    let mut b2 = final_func.builder();
+    b2.arg(&cand_vals);
+    b2.arg(&cand_idxs);
+    b2.arg(&n_cand_i32);
+    b2.arg(&block_max);
+    b2.arg(&block_sum);
+    b2.arg(&n_blocks_i32);
+    b2.arg(&k_i32);
+    b2.arg(&top_p);
+    b2.arg(&u);
+    b2.arg(&out_token);
+    let cfg2 = crate::tensor::cuda_ext::LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (THREADS, 1, 1),
+        shared_mem_bytes: THREADS * 8 + (k as u32) * 8,
+    };
+    unsafe { b2.launch(cfg2) }.map_err(|e| err("sample_topk_final", &e))?;
+    drop(logits_store);
+
+    let mut out = vec![0u32];
+    stream
+        .memcpy_dtoh(&out_token, &mut out)
+        .map_err(|e| err("dtoh", &e))?;
+    Ok(out[0])
+}
+
 /// Path B step 2: u32-output sister of
 /// `fused_penalty_argmax_with_device`. The kernel writes the argmax index
 /// directly into an owned `CudaSlice<u32>` - same memory layout as the

@@ -26,26 +26,35 @@ pub(crate) fn apply_repeat_penalty(
     if penalty <= 1.0 || last_n == 0 || recent_tokens.is_empty() {
         return Ok(logits.clone());
     }
-    let start = recent_tokens.len().saturating_sub(last_n);
-    let window = &recent_tokens[start..];
     let mut logits_v: Vec<f32> = logits.to_vec1()?;
-    for &tok in window {
-        let idx = tok as usize;
-        if idx < logits_v.len() {
-            if logits_v[idx] > 0.0 {
-                logits_v[idx] /= penalty;
-            } else {
-                logits_v[idx] *= penalty;
-            }
-        }
-    }
+    penalise_recent(&mut logits_v, recent_tokens, penalty, last_n);
     Tensor::from_vec(logits_v, logits.shape(), &logits.device())
 }
 
-/// GPU-accelerated token sampling.
+/// Divides (or, for a negative logit, multiplies) by `penalty` the logit of every distinct
+/// token among the last `last_n`: a token repeated in the window is penalised once, as the
+/// device kernel does.
+fn penalise_recent(logits: &mut [f32], recent_tokens: &[u32], penalty: f32, last_n: usize) {
+    if penalty <= 1.0 || last_n == 0 {
+        return;
+    }
+    let start = recent_tokens.len().saturating_sub(last_n);
+    let mut seen: Vec<u32> = Vec::with_capacity(recent_tokens.len() - start);
+    for &tok in &recent_tokens[start..] {
+        if seen.contains(&tok) {
+            continue;
+        }
+        seen.push(tok);
+        if let Some(l) = logits.get_mut(tok as usize) {
+            *l = if *l > 0.0 { *l / penalty } else { *l * penalty };
+        }
+    }
+}
+
+/// Token sampling for a row that may live on a card.
 ///
-/// For temperature < 1.0: uses argmax on GPU (transfers 4 bytes instead of 500KB).
-/// For temperature >= 1.0: falls back to full CPU sampling with repeat penalty.
+/// A greedy draw with no bias or log-probabilities runs as one fused penalty + argmax kernel
+/// on the card (4 bytes come back instead of the row). Anything else draws on the host.
 pub(crate) fn gpu_sample(
     logits: &Tensor,
     recent_tokens: &[u32],
@@ -53,12 +62,42 @@ pub(crate) fn gpu_sample(
     repeat_last_n: usize,
     logits_processor: &mut crate::inference::sample::token_sampling::LogitsProcessor,
 ) -> crate::tensor::Result<u32> {
-    // A bias or a log-probability request is served on the host, where the sampler
-    // reads the whole row; the device argmax knows neither.
+    // A top-k draw runs on the card and returns only the token.
+    #[cfg(feature = "cuda")]
+    if logits.device().is_cuda() {
+        if let Some((k, temperature, top_p, u)) =
+            logits_processor.device_draw(crate::inference::kernel::fused::SAMPLE_TOPK_MAX)
+        {
+            let start = recent_tokens.len().saturating_sub(repeat_last_n);
+            let mut unique: Vec<u32> = Vec::with_capacity(recent_tokens.len() - start);
+            if repeat_penalty > 1.0 {
+                for &t in &recent_tokens[start..] {
+                    if !unique.contains(&t) {
+                        unique.push(t);
+                    }
+                }
+            }
+            return crate::inference::kernel::fused::sample_topk(
+                logits,
+                &unique,
+                repeat_penalty,
+                temperature,
+                k,
+                top_p,
+                u,
+            );
+        }
+    }
+    // Any other sampled draw, a bias or a log-probability request is served on the host,
+    // where the sampler reads the whole row; the device argmax knows none of them.
     if logits_processor.needs_host() {
-        let cpu = logits.to_device(&Device::Cpu)?;
-        let cpu = apply_repeat_penalty(&cpu, recent_tokens, repeat_penalty, repeat_last_n)?;
-        return logits_processor.sample(&cpu);
+        let mut v = logits
+            .flatten_all()?
+            .to_dtype(crate::tensor::DType::F32)?
+            .to_device(&Device::Cpu)?
+            .to_vec1::<f32>()?;
+        penalise_recent(&mut v, recent_tokens, repeat_penalty, repeat_last_n);
+        return logits_processor.sample_logits(v);
     }
     // Fused repeat penalty + argmax in a single CUDA kernel (1 launch vs 6+)
     #[cfg(feature = "cuda")]
