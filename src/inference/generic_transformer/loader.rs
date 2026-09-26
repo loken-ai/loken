@@ -873,17 +873,12 @@ fn build_generic_layer(
             let q4_effective = flags.has_qkv_bias && config.n_layers <= 50;
             let q4_not_applicable = config.kv_quant == KvQuant::Q4 && !q4_effective;
             let want_q8 = config.kv_quant == KvQuant::Q8 || q4_not_applicable;
-            // Per-layer head_dim must be in the kernel-supported set.
-            // the old gemma4 HD=512 exclusion ("tiny K-norm
-            // weights amplify Q8 noise -> degenerate") was DISPROVEN - gemma's
-            // k_norm is a uniform per-layer scalar (≈0.127), which Q8_0's
-            // per-block scale absorbs; the degeneracy was the
-            // (then-absent) HD=512 dispatch falling back to garbage. The
-            // HD=512 Q8 score+output kernels exist (attn_score_q8_0_q8_1_gqa_hd512,
-            // attn_output_q8_0_f32_hd512_nq*) and are used by other archs.
-            // So gemma4 global (HD=512) layers now go Q8 too - the bandwidth
-            // lever for the long-context loss (halve the dominant K+V read).
-            let head_dim_supported = matches!(head_dim, 64 | 128 | 256 | 512);
+            // The layer's own head shape must be one the quantised kernels are
+            // instantiated for.
+            let head_dim_supported = crate::inference::cache::kv_core::kv_shape_supported(
+                head_dim,
+                config.n_head / n_kv_head_layer.max(1),
+            );
             if want_q8 && device.is_cuda() && head_dim_supported {
                 // Pre-allocate for the configured (engine-level) context
                 // length so appends never reallocate. Use the PER-LAYER
@@ -929,11 +924,15 @@ fn build_generic_layer(
             //     for ~48-layer 14B models (deepcoder) but regresses for
             //     64-layer 32B models (deepseek-r1:32b) under multi-GPU.
             let want_q4 = flags.has_qkv_bias && config.n_layers <= 50;
-            if want_q4 && config.kv_quant == KvQuant::Q4 && device.is_cuda() {
+            let shape_supported = crate::inference::cache::kv_core::kv_shape_supported(
+                head_dim,
+                config.n_head / n_kv_head_layer.max(1),
+            );
+            if want_q4 && shape_supported && config.kv_quant == KvQuant::Q4 && device.is_cuda() {
                 let max_seq = config.effective_max_context();
                 match crate::inference::cache::q4_kv::Q4KvCache::new(
                     max_seq,
-                    config.n_kv_head,
+                    n_kv_head_layer,
                     head_dim,
                     device,
                 ) {
@@ -1308,7 +1307,10 @@ fn build_awq_layer(
         cpu_norm_cache: None,
         #[cfg(feature = "cuda")]
         q8_kv_cache: {
-            let head_dim_supported = matches!(head_dim, 64 | 128 | 256 | 512);
+            let head_dim_supported = crate::inference::cache::kv_core::kv_shape_supported(
+                head_dim,
+                config.n_head / config.n_kv_head.max(1),
+            );
             if device.is_cuda() && head_dim_supported {
                 crate::inference::cache::q8_kv::Q8KvCache::new(
                     config.effective_max_context(),

@@ -292,6 +292,42 @@ pub(crate) fn get_quantized_ptx(dev: &CudaDevice) -> Result<&'static str> {
     get_quantized_ptx_for_ordinal(dev.ordinal())
 }
 
+/// The quantised translation unit: the compat shim first (stdint + INFINITY/NAN, which NVRTC
+/// has no headers for), then the block formats and their dot products, then the kernel files
+/// in dependency order.
+fn quantized_source() -> String {
+    format!(
+        "{NVRTC_COMPAT_H}\n{GGUF_BLOCKS_CUH}\n{QUANTIZED_HELPERS_CU}\n\
+         {QUANTIZED_KV_CU}\n{QUANTIZED_ATTENTION_CU}\n\
+         {QUANTIZED_FLASH_CU}\n{QUANTIZED_BAND_SOFTMAX_CU}\n{QUANTIZED_SAMPLING_CU}\n\
+         {QUANTIZED_REQUANT_CU}"
+    )
+}
+
+/// NVRTC-compiles `src` for `arch`, or returns an empty string after logging the failure so
+/// the cache remembers it and the compile is not retried on every call.
+fn compile_or_empty(src: String, arch: Option<&'static str>, what: &str) -> String {
+    let opts = cudarc::nvrtc::safe::CompileOptions {
+        include_paths: cuda_include_paths(),
+        arch,
+        ..Default::default()
+    };
+    match cudarc::nvrtc::safe::compile_ptx_with_opts(src, opts) {
+        Ok(ptx) => {
+            let s = ptx.to_src();
+            tracing::info!(
+                "quantized_cuda: NVRTC-compiled {what} OK ({} KB PTX)",
+                s.len() / 1024
+            );
+            s
+        }
+        Err(e) => {
+            tracing::error!("quantized_cuda: {what} NVRTC compile FAILED: {e}");
+            String::new()
+        }
+    }
+}
+
 pub(crate) fn get_quantized_ptx_for_ordinal(ordinal: usize) -> Result<&'static str> {
     // One PTX per architecture present: each card loads code compiled for itself, and a
     // mixed machine never JITs one card's PTX onto another.
@@ -305,43 +341,165 @@ pub(crate) fn get_quantized_ptx_for_ordinal(ordinal: usize) -> Result<&'static s
         }
         return Ok(p);
     }
-    let compiled: String = {
-        let opts = cudarc::nvrtc::safe::CompileOptions {
-            include_paths: cuda_include_paths(),
-            arch,
-            ..Default::default()
-        };
-        // The compat shim first (stdint + INFINITY/NAN, which NVRTC has no headers for),
-        // then the block formats and their dot products. `gguf.cuh` states those once for
-        // both NVRTC units; this one used to carry its own copy of all of it.
-        let src = format!(
-            "{NVRTC_COMPAT_H}\n{GGUF_BLOCKS_CUH}\n{QUANTIZED_HELPERS_CU}\n\
-             {QUANTIZED_KV_CU}\n{QUANTIZED_ATTENTION_CU}\n\
-             {QUANTIZED_FLASH_CU}\n{QUANTIZED_BAND_SOFTMAX_CU}\n{QUANTIZED_SAMPLING_CU}\n\
-             {QUANTIZED_REQUANT_CU}"
-        );
-        match cudarc::nvrtc::safe::compile_ptx_with_opts(src, opts) {
-            Ok(ptx) => {
-                let s = ptx.to_src();
-                tracing::info!(
-                    "quantized_cuda: NVRTC-compiled quantized.cu OK ({} KB PTX)",
-                    s.len() / 1024
-                );
-                s
-            }
-            Err(e) => {
-                tracing::error!("quantized_cuda: quantized.cu NVRTC compile FAILED: {e}");
-                String::new()
-            }
-        }
-    };
+    let compiled = compile_or_empty(quantized_source(), arch, "quantized.cu");
     let leaked: &'static str = Box::leak(compiled.into_boxed_str());
     g.insert(key, leaked);
-    let ptx = leaked;
-    if ptx.is_empty() {
+    if leaked.is_empty() {
         return Err(anyhow!("quantized.cu failed to NVRTC-compile"));
     }
-    Ok(ptx)
+    Ok(leaked)
+}
+
+/// The attention kernels templated on the head size and on the query heads each KV head
+/// serves, as (macro, kernel base name). The source defines the templates only; the instances
+/// a model needs are generated for its own shape, named `<base>_hd<head_dim>_nq<n_q_per_kv>`.
+const SHAPE_KERNELS: &[(&str, &str)] = &[
+    ("ATTN_SCORE_Q4_KERNEL", "attn_score_q4_0_f32_kivi"),
+    (
+        "ATTN_SCORE_Q4_DEV_POS_KERNEL",
+        "attn_score_q4_0_f32_kivi_dev_pos",
+    ),
+    (
+        "ATTN_SCORE_Q8_DEV_POS_KERNEL",
+        "attn_score_q8_0_f32_dev_pos",
+    ),
+    ("ATTN_OUTPUT_KERNEL", "attn_output_q8_0_f32"),
+    (
+        "ATTN_OUTPUT_Q8_DEV_POS_KERNEL",
+        "attn_output_q8_0_f32_dev_pos",
+    ),
+    ("ATTN_OUTPUT_Q4_KERNEL", "attn_output_q4_0_f32"),
+    (
+        "ATTN_OUTPUT_Q4_DEV_POS_KERNEL",
+        "attn_output_q4_0_f32_dev_pos",
+    ),
+    (
+        "ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL",
+        "attn_softmax_output_q8_0_f32_dev_pos",
+    ),
+    (
+        "ATTN_OUTPUT_SOFTMAX_Q4_KERNEL",
+        "attn_softmax_output_q4_0_f32",
+    ),
+    (
+        "ATTN_OUTPUT_SOFTMAX_Q8_KERNEL",
+        "attn_softmax_output_q8_0_f32",
+    ),
+    (
+        "ATTN_SCORE_F16_DEV_POS_KERNEL",
+        "attn_score_f16_f32_dev_pos",
+    ),
+    (
+        "ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL",
+        "attn_softmax_output_f16_f32_dev_pos",
+    ),
+];
+
+/// The attention kernels templated on the head size alone, generated into the same shape
+/// module and named `<base>_hd<head_dim>`.
+const HEAD_KERNELS: &[(&str, &str)] = &[("ATTN_SCORE_GQA_KERNEL", "attn_score_q8_0_q8_1_gqa")];
+
+pub use crate::inference::cache::kv_core::kv_shape_supported;
+use crate::inference::cache::kv_core::{SHAPE_MAX_HEAD_DIM, SHAPE_MAX_Q_PER_KV};
+
+type ShapeKey = (&'static str, usize, usize);
+static SHAPE_PTX: OnceLock<std::sync::Mutex<std::collections::HashMap<ShapeKey, &'static str>>> =
+    OnceLock::new();
+
+/// The quantised unit with every shape kernel instantiated for `(head_dim, n_q_per_kv)`,
+/// compiled once per architecture and shape.
+fn shape_ptx(ordinal: usize, head_dim: usize, n_q_per_kv: usize) -> Result<&'static str> {
+    let arch = nvrtc_arch_of_ordinal(ordinal);
+    let key = (arch.unwrap_or("default"), head_dim, n_q_per_kv);
+    let map = SHAPE_PTX.get_or_init(Default::default);
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = g.get(&key) {
+        if p.is_empty() {
+            return Err(anyhow!("NVRTC compile previously failed for {key:?}"));
+        }
+        return Ok(p);
+    }
+    let mut src = quantized_source();
+    for (mac, base) in SHAPE_KERNELS {
+        src.push_str(&format!(
+            "\n{mac}({base}_hd{head_dim}_nq{n_q_per_kv}, {head_dim}, {n_q_per_kv})"
+        ));
+    }
+    for (mac, base) in HEAD_KERNELS {
+        src.push_str(&format!("\n{mac}({base}_hd{head_dim}, {head_dim})"));
+    }
+    src.push('\n');
+    let what = format!("attention kernels hd{head_dim} nq{n_q_per_kv}");
+    let compiled = compile_or_empty(src, arch, &what);
+    let leaked: &'static str = Box::leak(compiled.into_boxed_str());
+    g.insert(key, leaked);
+    if leaked.is_empty() {
+        return Err(anyhow!("{what} failed to NVRTC-compile"));
+    }
+    Ok(leaked)
+}
+
+/// Compiles the shape module for every CUDA card present. Failures are logged by the compile
+/// and surface again when a kernel is loaded.
+pub fn prewarm_shape(head_dim: usize, n_q_per_kv: usize) {
+    if !kv_shape_supported(head_dim, n_q_per_kv) {
+        return;
+    }
+    let cards = cudarc::driver::result::device::get_count()
+        .unwrap_or(0)
+        .max(0) as usize;
+    for ordinal in 0..cards {
+        let _ = shape_ptx(ordinal, head_dim, n_q_per_kv);
+    }
+}
+
+/// The shape kernel `base` for this head shape, from the module compiled for that shape.
+pub(super) fn shape_kernel(
+    dev: &CudaDevice,
+    base: &str,
+    head_dim: usize,
+    n_q_per_kv: usize,
+) -> Result<crate::tensor::kernel_ffi::CudaFunc> {
+    if !kv_shape_supported(head_dim, n_q_per_kv) {
+        return Err(anyhow!(
+            "{base}: head_dim {head_dim} x n_q_per_kv {n_q_per_kv} outside the shape kernels \
+             (head_dim a multiple of {Q8_0_BLOCK_SIZE} up to {SHAPE_MAX_HEAD_DIM}, \
+             n_q_per_kv 1..={SHAPE_MAX_Q_PER_KV})"
+        ));
+    }
+    load_from_shape(
+        dev,
+        &format!("{base}_hd{head_dim}_nq{n_q_per_kv}"),
+        head_dim,
+        n_q_per_kv,
+    )
+}
+
+/// The head-size kernel `base` (see `HEAD_KERNELS`), from the module compiled for this shape.
+pub(super) fn head_kernel(
+    dev: &CudaDevice,
+    base: &str,
+    head_dim: usize,
+    n_q_per_kv: usize,
+) -> Result<crate::tensor::kernel_ffi::CudaFunc> {
+    if !kv_shape_supported(head_dim, n_q_per_kv) {
+        return Err(anyhow!(
+            "{base}: head_dim {head_dim} x n_q_per_kv {n_q_per_kv} outside the shape kernels"
+        ));
+    }
+    load_from_shape(dev, &format!("{base}_hd{head_dim}"), head_dim, n_q_per_kv)
+}
+
+fn load_from_shape(
+    dev: &CudaDevice,
+    name: &str,
+    head_dim: usize,
+    n_q_per_kv: usize,
+) -> Result<crate::tensor::kernel_ffi::CudaFunc> {
+    let ptx = shape_ptx(dev.ordinal(), head_dim, n_q_per_kv)?;
+    let module = format!("loken_quantized_hd{head_dim}_nq{n_q_per_kv}");
+    dev.get_or_load_custom_func(name, &module, ptx)
+        .map_err(|e| anyhow!("load {name}: {e}"))
 }
 
 /// Prewarm the NVRTC module at model load so the first decode token does not
@@ -666,16 +824,8 @@ pub fn attn_score_q8_0_q8_1_gqa_scaled(
             n_q_heads * head_dim
         );
     }
-    let kernel_name = match head_dim {
-        64 => "attn_score_q8_0_q8_1_gqa_hd64",
-        128 => "attn_score_q8_0_q8_1_gqa_hd128",
-        256 => "attn_score_q8_0_q8_1_gqa_hd256",
-        512 => "attn_score_q8_0_q8_1_gqa_hd512",
-        _ => anyhow::bail!(
-            "attn_score_q8_0_q8_1_gqa: unsupported head_dim {head_dim} (have 64/128/256/512)"
-        ),
-    };
-    let func = quantized_kernel(dev, kernel_name)?;
+    let kernel_name = "attn_score_q8_0_q8_1_gqa";
+    let func = head_kernel(dev, kernel_name, head_dim, n_q_per_kv)?;
 
     // Quantize Q to Q8_1 once for all kv-heads.
     let k_padded = pad(head_dim, MATRIX_ROW_PADDING);
@@ -735,27 +885,8 @@ pub fn attn_softmax_output_q8_0_f32_gqa(
             n_q_heads * seq_kv
         );
     }
-    let nq_bucket = if n_q_per_kv <= 1 {
-        1
-    } else if n_q_per_kv <= 4 {
-        4
-    } else if n_q_per_kv <= 8 {
-        8
-    } else {
-        anyhow::bail!(
-            "attn_softmax_output_q8_0_f32_gqa: n_q_per_kv={n_q_per_kv} > 8 not supported"
-        );
-    };
-    let kernel_name = match (head_dim, nq_bucket) {
-        (64, 1) => "attn_softmax_output_q8_0_f32_hd64_nq1",
-        (64, 4) => "attn_softmax_output_q8_0_f32_hd64_nq4",
-        (64, 8) => "attn_softmax_output_q8_0_f32_hd64_nq8",
-        (128, 1) => "attn_softmax_output_q8_0_f32_hd128_nq1",
-        (128, 4) => "attn_softmax_output_q8_0_f32_hd128_nq4",
-        (128, 8) => "attn_softmax_output_q8_0_f32_hd128_nq8",
-        _ => anyhow::bail!("attn_softmax_output_q8_0_f32_gqa: unsupported head_dim={head_dim}"),
-    };
-    let func = quantized_kernel(dev, kernel_name)?;
+    let kernel_name = "attn_softmax_output_q8_0_f32";
+    let func = shape_kernel(dev, kernel_name, head_dim, n_q_per_kv)?;
 
     let strides = kv_block_strides(head_dim, n_kv_heads);
     let hd_blocks = strides.hd_blocks;
@@ -800,37 +931,8 @@ pub fn attn_score_q4_0_f32_kivi(
     }
     let full_blocks = seq_kv / 32;
     let total_blocks = seq_kv.div_ceil(32);
-    let kernel_name = match (head_dim, n_q_per_kv) {
-        (64, 1) => "attn_score_q4_0_f32_kivi_hd64_nq1",
-        (64, 2) => "attn_score_q4_0_f32_kivi_hd64_nq2",
-        (64, 4) => "attn_score_q4_0_f32_kivi_hd64_nq4",
-        (64, 5) => "attn_score_q4_0_f32_kivi_hd64_nq5",
-        (64, 7) => "attn_score_q4_0_f32_kivi_hd64_nq7",
-        (64, 8) => "attn_score_q4_0_f32_kivi_hd64_nq8",
-        (128, 1) => "attn_score_q4_0_f32_kivi_hd128_nq1",
-        (128, 2) => "attn_score_q4_0_f32_kivi_hd128_nq2",
-        (128, 4) => "attn_score_q4_0_f32_kivi_hd128_nq4",
-        (128, 5) => "attn_score_q4_0_f32_kivi_hd128_nq5",
-        (128, 7) => "attn_score_q4_0_f32_kivi_hd128_nq7",
-        (128, 8) => "attn_score_q4_0_f32_kivi_hd128_nq8",
-        (256, 1) => "attn_score_q4_0_f32_kivi_hd256_nq1",
-        (256, 2) => "attn_score_q4_0_f32_kivi_hd256_nq2",
-        (256, 4) => "attn_score_q4_0_f32_kivi_hd256_nq4",
-        (256, 5) => "attn_score_q4_0_f32_kivi_hd256_nq5",
-        (256, 7) => "attn_score_q4_0_f32_kivi_hd256_nq7",
-        (256, 8) => "attn_score_q4_0_f32_kivi_hd256_nq8",
-        (512, 1) => "attn_score_q4_0_f32_kivi_hd512_nq1",
-        (512, 2) => "attn_score_q4_0_f32_kivi_hd512_nq2",
-        (512, 4) => "attn_score_q4_0_f32_kivi_hd512_nq4",
-        (512, 5) => "attn_score_q4_0_f32_kivi_hd512_nq5",
-        (512, 7) => "attn_score_q4_0_f32_kivi_hd512_nq7",
-        (512, 8) => "attn_score_q4_0_f32_kivi_hd512_nq8",
-        (512, 16) => "attn_score_q4_0_f32_kivi_hd512_nq16",
-        _ => anyhow::bail!(
-            "attn_score_q4_0_f32_kivi: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv})",
-        ),
-    };
-    let func = quantized_kernel(dev, kernel_name)?;
+    let kernel_name = "attn_score_q4_0_f32_kivi";
+    let func = shape_kernel(dev, kernel_name, head_dim, n_q_per_kv)?;
 
     // Grid = (total_blocks, n_kv_heads). Last block of the x axis is the
     // partial residual block when seq_kv is not a multiple of 32; the
@@ -888,37 +990,8 @@ pub fn attn_score_q4_0_f32_kivi_dev_pos(
     // Grid covers max_seq_padded blocks. Kernel writes -INFINITY at
     // positions >= seq_kv_dev[0] so softmax_last_dim masks them out.
     let max_blocks = max_seq_padded / 32;
-    let kernel_name = match (head_dim, n_q_per_kv) {
-        (64,  1) => "attn_score_q4_0_f32_kivi_dev_pos_hd64_nq1",
-        (64,  2) => "attn_score_q4_0_f32_kivi_dev_pos_hd64_nq2",
-        (64,  4) => "attn_score_q4_0_f32_kivi_dev_pos_hd64_nq4",
-        (64,  5) => "attn_score_q4_0_f32_kivi_dev_pos_hd64_nq5",
-        (64,  7) => "attn_score_q4_0_f32_kivi_dev_pos_hd64_nq7",
-        (64,  8) => "attn_score_q4_0_f32_kivi_dev_pos_hd64_nq8",
-        (128, 1) => "attn_score_q4_0_f32_kivi_dev_pos_hd128_nq1",
-        (128, 2) => "attn_score_q4_0_f32_kivi_dev_pos_hd128_nq2",
-        (128, 4) => "attn_score_q4_0_f32_kivi_dev_pos_hd128_nq4",
-        (128, 5) => "attn_score_q4_0_f32_kivi_dev_pos_hd128_nq5",
-        (128, 7) => "attn_score_q4_0_f32_kivi_dev_pos_hd128_nq7",
-        (128, 8) => "attn_score_q4_0_f32_kivi_dev_pos_hd128_nq8",
-        (256, 1) => "attn_score_q4_0_f32_kivi_dev_pos_hd256_nq1",
-        (256, 2) => "attn_score_q4_0_f32_kivi_dev_pos_hd256_nq2",
-        (256, 4) => "attn_score_q4_0_f32_kivi_dev_pos_hd256_nq4",
-        (256, 5) => "attn_score_q4_0_f32_kivi_dev_pos_hd256_nq5",
-        (256, 7) => "attn_score_q4_0_f32_kivi_dev_pos_hd256_nq7",
-        (256, 8) => "attn_score_q4_0_f32_kivi_dev_pos_hd256_nq8",
-        (512, 1) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq1",
-        (512, 2) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq2",
-        (512, 4) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq4",
-        (512, 5) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq5",
-        (512, 7) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq7",
-        (512, 8) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq8",
-        (512, 16) => "attn_score_q4_0_f32_kivi_dev_pos_hd512_nq16",
-        _ => anyhow::bail!(
-            "attn_score_q4_0_f32_kivi_dev_pos: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv})",
-        ),
-    };
-    let func = quantized_kernel(dev, kernel_name)?;
+    let kernel_name = "attn_score_q4_0_f32_kivi_dev_pos";
+    let func = shape_kernel(dev, kernel_name, head_dim, n_q_per_kv)?;
     let n_warps: u32 = 16;
     let cfg = warp_block_launch(
         (max_blocks as u32, n_kv_heads as u32, 1),

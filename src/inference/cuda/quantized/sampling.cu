@@ -106,16 +106,6 @@ extern "C" __global__ void NAME(                                              \
     );                                                                        \
 }
 
-ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd64_nq1,    64, 1)
-ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd64_nq2,    64, 2)
-ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd64_nq4,    64, 4)
-ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd64_nq8,    64, 8)
-ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd128_nq1, 128, 1)
-ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd128_nq2, 128, 2)
-ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd128_nq4, 128, 4)
-ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd128_nq8, 128, 8)
-ATTN_SCORE_F16_DEV_POS_KERNEL(attn_score_f16_f32_dev_pos_hd256_nq1, 256, 1)
-
 /// Add up one partial per warp and hand every warp the total for its lane's position.
 ///
 /// The warps of a block split the key positions between them, so each ends up holding part of
@@ -261,42 +251,7 @@ extern "C" __global__ void NAME(                                             \
     );                                                                       \
 }
 
-ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd64_nq1,    64, 1)
-ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd64_nq2,    64, 2)
-ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd64_nq4,    64, 4)
-ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd64_nq8,    64, 8)
-ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd128_nq1, 128, 1)
-ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd128_nq2, 128, 2)
-ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd128_nq4, 128, 4)
-ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd128_nq8, 128, 8)
-ATTN_SOFTMAX_OUTPUT_F16_DEV_POS_KERNEL(attn_softmax_output_f16_f32_dev_pos_hd256_nq1, 256, 1)
-
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd64_nq1,   64, 1)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd64_nq2,   64, 2)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd64_nq4,   64, 4)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd64_nq5,   64, 5)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd64_nq7,   64, 7)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd64_nq8,   64, 8)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd128_nq1, 128, 1)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd128_nq2, 128, 2)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd128_nq4, 128, 4)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd128_nq5, 128, 5)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd128_nq7, 128, 7)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd128_nq8, 128, 8)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd256_nq1, 256, 1)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd256_nq2, 256, 2)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd256_nq4, 256, 4)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd256_nq5, 256, 5)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd256_nq7, 256, 7)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd256_nq8, 256, 8)
 // HD=512 - matching the attn_score_q4 HD=512 set added above.
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq1, 512, 1)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq2, 512, 2)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq4, 512, 4)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq5, 512, 5)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq7, 512, 7)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq8, 512, 8)
-ATTN_OUTPUT_Q4_KERNEL(attn_output_q4_0_f32_hd512_nq16, 512, 16)
 
 // ------------------------------------------------------------
 // Device-position variant of attn_output_q4_*. Reads `seq_kv` from a
@@ -385,32 +340,7 @@ extern "C" __global__ void NAME(                                               \
     );                                                                         \
 }
 
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd64_nq1,    64, 1)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd64_nq2,    64, 2)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd64_nq4,    64, 4)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd64_nq5,    64, 5)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd64_nq7,    64, 7)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd64_nq8,    64, 8)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd128_nq1, 128, 1)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd128_nq2, 128, 2)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd128_nq4, 128, 4)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd128_nq5, 128, 5)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd128_nq7, 128, 7)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd128_nq8, 128, 8)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd256_nq1, 256, 1)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd256_nq2, 256, 2)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd256_nq4, 256, 4)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd256_nq5, 256, 5)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd256_nq7, 256, 7)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd256_nq8, 256, 8)
 // HD=512 dev-pos output variants - graph-mode partner for the score kernel set.
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq1, 512, 1)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq2, 512, 2)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq4, 512, 4)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq5, 512, 5)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq7, 512, 7)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq8, 512, 8)
-ATTN_OUTPUT_Q4_DEV_POS_KERNEL(attn_output_q4_0_f32_dev_pos_hd512_nq16, 512, 16)
 
 // Half-precision input variant. Saves a promote+copy when the source is
 // already in f16 (common for K/V after attention projection in f16 models).

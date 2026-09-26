@@ -29,94 +29,9 @@ pub fn attn_output_q4_0_f32_gqa(
     let n_kv_stride_blocks = n_kv_heads * hd_blocks;
     let kv_head_stride_blocks = hd_blocks;
 
-    // Split-K path: distributing the seq reduction
-    // across more blocks does NOT speed up this kernel because it is
-    // memory-bandwidth bound (reading the V cache once dominates),
-    // not parallelism-limited. Same wall-time at seq_kv=16k. Kept
-    // as code for future tuning; permanently off in production.
-    let splitk_threshold = usize::MAX;
-
-    if seq_kv >= splitk_threshold {
-        // Split-K path
-        let kernel_name = match (head_dim, n_q_per_kv) {
-            (64, 1) => "attn_output_q4_0_f32_splitk_hd64_nq1",
-            (64, 4) => "attn_output_q4_0_f32_splitk_hd64_nq4",
-            (64, 8) => "attn_output_q4_0_f32_splitk_hd64_nq8",
-            (128, 1) => "attn_output_q4_0_f32_splitk_hd128_nq1",
-            (128, 4) => "attn_output_q4_0_f32_splitk_hd128_nq4",
-            (128, 8) => "attn_output_q4_0_f32_splitk_hd128_nq8",
-            (256, 1) => "attn_output_q4_0_f32_splitk_hd256_nq1",
-            (256, 4) => "attn_output_q4_0_f32_splitk_hd256_nq4",
-            (256, 8) => "attn_output_q4_0_f32_splitk_hd256_nq8",
-            _ => anyhow::bail!(
-                "attn_output_q4_0_f32_gqa: unsupported splitk combo head_dim={head_dim} n_q_per_kv={n_q_per_kv}",
-            ),
-        };
-        let func = dev
-            .get_or_load_custom_func(kernel_name, "loken_quantized", get_quantized_ptx(dev)?)
-            .map_err(|e| anyhow!("load kernel: {e}"))?;
-
-        let seq_per_split: usize = 256;
-        let s = seq_kv.div_ceil(seq_per_split);
-
-        const SPLITK_WARPS_PER_BLOCK: u32 = 8;
-        let cfg = LaunchConfig {
-            grid_dim: (hd_blocks as u32, n_kv_heads as u32, s as u32),
-            block_dim: (WARP_SIZE as u32, SPLITK_WARPS_PER_BLOCK, 1),
-            shared_mem_bytes: 0,
-        };
-
-        // CRITICAL: split-K kernel atomicAdd's its partial; output must be zeroed.
-        let dst = dev.alloc_zeros::<f32>(n_q_heads * head_dim)?;
-        let mut builder = func.builder();
-        builder.arg(v_blob);
-        builder.arg(probs_f32);
-        builder.arg(&dst);
-        barg!(
-            builder,
-            seq_kv as i32,
-            n_kv_stride_blocks as i32,
-            kv_head_stride_blocks as i32,
-            seq_per_split as i32
-        );
-        unsafe { builder.launch(cfg) }.map_err(|e| anyhow!("launch: {e}"))?;
-        return Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()));
-    }
-
     // Monolithic 32-warp path (short ctx)
-    let kernel_name = match (head_dim, n_q_per_kv) {
-        (64, 1) => "attn_output_q4_0_f32_hd64_nq1",
-        (64, 2) => "attn_output_q4_0_f32_hd64_nq2",
-        (64, 4) => "attn_output_q4_0_f32_hd64_nq4",
-        (64, 5) => "attn_output_q4_0_f32_hd64_nq5",
-        (64, 7) => "attn_output_q4_0_f32_hd64_nq7",
-        (64, 8) => "attn_output_q4_0_f32_hd64_nq8",
-        (128, 1) => "attn_output_q4_0_f32_hd128_nq1",
-        (128, 2) => "attn_output_q4_0_f32_hd128_nq2",
-        (128, 4) => "attn_output_q4_0_f32_hd128_nq4",
-        (128, 5) => "attn_output_q4_0_f32_hd128_nq5",
-        (128, 7) => "attn_output_q4_0_f32_hd128_nq7",
-        (128, 8) => "attn_output_q4_0_f32_hd128_nq8",
-        (256, 1) => "attn_output_q4_0_f32_hd256_nq1",
-        (256, 2) => "attn_output_q4_0_f32_hd256_nq2",
-        (256, 4) => "attn_output_q4_0_f32_hd256_nq4",
-        (256, 5) => "attn_output_q4_0_f32_hd256_nq5",
-        (256, 7) => "attn_output_q4_0_f32_hd256_nq7",
-        (256, 8) => "attn_output_q4_0_f32_hd256_nq8",
-        (512, 1) => "attn_output_q4_0_f32_hd512_nq1",
-        (512, 2) => "attn_output_q4_0_f32_hd512_nq2",
-        (512, 4) => "attn_output_q4_0_f32_hd512_nq4",
-        (512, 5) => "attn_output_q4_0_f32_hd512_nq5",
-        (512, 7) => "attn_output_q4_0_f32_hd512_nq7",
-        (512, 8) => "attn_output_q4_0_f32_hd512_nq8",
-        (512, 16) => "attn_output_q4_0_f32_hd512_nq16",
-        _ => anyhow::bail!(
-            "attn_output_q4_0_f32_gqa: unsupported combo head_dim={head_dim} n_q_per_kv={n_q_per_kv}",
-        ),
-    };
-    let func = dev
-        .get_or_load_custom_func(kernel_name, "loken_quantized", get_quantized_ptx(dev)?)
-        .map_err(|e| anyhow!("load kernel: {e}"))?;
+    let kernel_name = "attn_output_q4_0_f32";
+    let func = shape_kernel(dev, kernel_name, head_dim, n_q_per_kv)?;
 
     const WARPS_PER_BLOCK: u32 = 32;
     let cfg = LaunchConfig {
@@ -172,39 +87,8 @@ pub fn attn_output_q4_0_f32_dev_pos(
     let n_kv_stride_blocks = n_kv_heads * hd_blocks;
     let kv_head_stride_blocks = hd_blocks;
 
-    let kernel_name = match (head_dim, n_q_per_kv) {
-        (64,  1) => "attn_output_q4_0_f32_dev_pos_hd64_nq1",
-        (64,  2) => "attn_output_q4_0_f32_dev_pos_hd64_nq2",
-        (64,  4) => "attn_output_q4_0_f32_dev_pos_hd64_nq4",
-        (64,  5) => "attn_output_q4_0_f32_dev_pos_hd64_nq5",
-        (64,  7) => "attn_output_q4_0_f32_dev_pos_hd64_nq7",
-        (64,  8) => "attn_output_q4_0_f32_dev_pos_hd64_nq8",
-        (128, 1) => "attn_output_q4_0_f32_dev_pos_hd128_nq1",
-        (128, 2) => "attn_output_q4_0_f32_dev_pos_hd128_nq2",
-        (128, 4) => "attn_output_q4_0_f32_dev_pos_hd128_nq4",
-        (128, 5) => "attn_output_q4_0_f32_dev_pos_hd128_nq5",
-        (128, 7) => "attn_output_q4_0_f32_dev_pos_hd128_nq7",
-        (128, 8) => "attn_output_q4_0_f32_dev_pos_hd128_nq8",
-        (256, 1) => "attn_output_q4_0_f32_dev_pos_hd256_nq1",
-        (256, 2) => "attn_output_q4_0_f32_dev_pos_hd256_nq2",
-        (256, 4) => "attn_output_q4_0_f32_dev_pos_hd256_nq4",
-        (256, 5) => "attn_output_q4_0_f32_dev_pos_hd256_nq5",
-        (256, 7) => "attn_output_q4_0_f32_dev_pos_hd256_nq7",
-        (256, 8) => "attn_output_q4_0_f32_dev_pos_hd256_nq8",
-        (512, 1) => "attn_output_q4_0_f32_dev_pos_hd512_nq1",
-        (512, 2) => "attn_output_q4_0_f32_dev_pos_hd512_nq2",
-        (512, 4) => "attn_output_q4_0_f32_dev_pos_hd512_nq4",
-        (512, 5) => "attn_output_q4_0_f32_dev_pos_hd512_nq5",
-        (512, 7) => "attn_output_q4_0_f32_dev_pos_hd512_nq7",
-        (512, 8) => "attn_output_q4_0_f32_dev_pos_hd512_nq8",
-        (512, 16) => "attn_output_q4_0_f32_dev_pos_hd512_nq16",
-        _ => anyhow::bail!(
-            "attn_output_q4_0_f32_dev_pos: unsupported combo head_dim={head_dim} n_q_per_kv={n_q_per_kv}",
-        ),
-    };
-    let func = dev
-        .get_or_load_custom_func(kernel_name, "loken_quantized", get_quantized_ptx(dev)?)
-        .map_err(|e| anyhow!("load kernel: {e}"))?;
+    let kernel_name = "attn_output_q4_0_f32_dev_pos";
+    let func = shape_kernel(dev, kernel_name, head_dim, n_q_per_kv)?;
 
     const WARPS_PER_BLOCK: u32 = 32;
     let cfg = LaunchConfig {
@@ -258,34 +142,8 @@ pub fn attn_softmax_output_q4_0_f32_gqa(
     // n_q_per_kv ∈ {2,3,5,6,7} (e.g. qwen2 = 40/8 = 5,
     // deepseek-r1:32b same) actually hit the fused path. Previously
     // those silently fell through to the unfused 2-launch chain.
-    let nq_bucket = if n_q_per_kv <= 1 {
-        1
-    } else if n_q_per_kv <= 4 {
-        4
-    } else if n_q_per_kv <= 8 {
-        8
-    } else if n_q_per_kv <= 16 {
-        16
-    } else {
-        anyhow::bail!(
-            "attn_softmax_output_q4_0_f32_gqa: n_q_per_kv={n_q_per_kv} > 8 not supported"
-        );
-    };
-    let kernel_name = match (head_dim, nq_bucket) {
-        (64, 1) => "attn_softmax_output_q4_0_f32_hd64_nq1",
-        (64, 4) => "attn_softmax_output_q4_0_f32_hd64_nq4",
-        (64, 8) => "attn_softmax_output_q4_0_f32_hd64_nq8",
-        (128, 1) => "attn_softmax_output_q4_0_f32_hd128_nq1",
-        (128, 4) => "attn_softmax_output_q4_0_f32_hd128_nq4",
-        (128, 8) => "attn_softmax_output_q4_0_f32_hd128_nq8",
-        (256, 1) => "attn_softmax_output_q4_0_f32_hd256_nq1",
-        (256, 4) => "attn_softmax_output_q4_0_f32_hd256_nq4",
-        (256, 8) => "attn_softmax_output_q4_0_f32_hd256_nq8",
-        _ => anyhow::bail!("attn_softmax_output_q4_0_f32_gqa: unsupported head_dim={head_dim}",),
-    };
-    let func = dev
-        .get_or_load_custom_func(kernel_name, "loken_quantized", get_quantized_ptx(dev)?)
-        .map_err(|e| anyhow!("load kernel: {e}"))?;
+    let kernel_name = "attn_softmax_output_q4_0_f32";
+    let func = shape_kernel(dev, kernel_name, head_dim, n_q_per_kv)?;
 
     let hd_blocks = head_dim / 32;
     let n_kv_stride_blocks = n_kv_heads * hd_blocks;

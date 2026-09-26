@@ -18,6 +18,23 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Channels one quantised KV block spans; a head is a whole number of blocks.
+const KV_BLOCK: usize = crate::tensor::quantized::GgmlDType::Q8_0.block_size();
+/// Largest head size the quantised attention kernels are instantiated for: one warp lane per
+/// block of channels.
+pub const SHAPE_MAX_HEAD_DIM: usize = 512;
+/// Largest number of query heads per KV head: each thread keeps one accumulator per query head
+/// it serves, so this bounds the registers a shape kernel holds.
+pub const SHAPE_MAX_Q_PER_KV: usize = 16;
+
+/// Whether the quantised KV attention kernels can serve this head shape.
+pub fn kv_shape_supported(head_dim: usize, n_q_per_kv: usize) -> bool {
+    head_dim > 0
+        && head_dim.is_multiple_of(KV_BLOCK)
+        && head_dim <= SHAPE_MAX_HEAD_DIM
+        && (1..=SHAPE_MAX_Q_PER_KV).contains(&n_q_per_kv)
+}
+
 /// Length, capacity, device-position and graph bookkeeping of one KV cache.
 #[derive(Debug)]
 pub struct KvCore {

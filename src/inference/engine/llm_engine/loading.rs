@@ -362,13 +362,9 @@ impl LlmEngine {
                 arch, num_layers, hidden_size, vocab_size, context_length, eos_token_id,
                 num_kv_heads, head_dim);
 
-            // The Q8/Q4 fused attention kernels only support specific
-            // (head_dim, n_q_per_kv) combinations. If the loaded config
-            // doesn't match, the per-step decode fast path errors out
-            // with "unsupported combo" - observed live on deepseek-r1
-            // (40 q-heads / 8 kv-heads = n_q_per_kv=5; kernel wants
-            // {1, 4, 8}). Auto-downgrade to kv_quant=Off so the model
-            // is usable.
+            // The Q8/Q4 attention kernels are instantiated for this model's
+            // (head_dim, n_q_per_kv); a shape outside what they can hold
+            // downgrades to kv_quant=Off below.
             let n_q_per_kv = if num_kv_heads > 0 { num_heads / num_kv_heads } else { 1 };
             // Phi2-style models (parallel attention + LayerNorm with bias)
             // hit a kernel launch failure on the Q8 attn_output path
@@ -435,15 +431,20 @@ impl LlmEngine {
             // `grow_to` gate switched from `cur_pos_dev.is_some()` ->
             // `graph_captured` flag so the non-graph dev_pos path can
             // still grow its buffers. phi2 unblocked.
-            let kv_quant_supported = (matches!(head_dim, 64 | 128 | 256)
-                && matches!(n_q_per_kv, 1 | 2 | 4 | 5 | 7 | 8))
+            let kv_quant_supported =
+                crate::inference::cache::kv_core::kv_shape_supported(head_dim, n_q_per_kv)
                 && kv_arch_check != "gemma4"
                 || is_gemma4_q8_ok;
+            // Compile the shape's attention kernels now rather than on the first decoded token.
+            #[cfg(feature = "cuda")]
+            if kv_quant_supported {
+                crate::inference::quantized_cuda::prewarm_shape(head_dim, n_q_per_kv);
+            }
             // The KV precision follows the architecture: what the quantised kernels can
             // serve, then what each family was measured to prefer.
             let kv_quant = if !kv_quant_supported && !matches!(kv_quant, KvQuant::Off) {
                 warn!(
-                    "⚠️  Q8/Q4 KV cache kernels don't support head_dim={} x n_q_per_kv={} (want {{64,128,256}} x {{1,2,4,5,7,8}}). Auto-downgrading kv_quant to Off for {}.",
+                    "⚠️  Q8/Q4 KV cache kernels don't support head_dim={} x n_q_per_kv={}. Auto-downgrading kv_quant to Off for {}.",
                     head_dim, n_q_per_kv, &model_id_clone
                 );
                 KvQuant::Off

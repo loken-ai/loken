@@ -337,30 +337,8 @@ pub fn attn_score_q8_0_f32_dev_pos(
             n_q_heads * head_dim
         );
     }
-    let kernel_name = match (head_dim, n_q_per_kv) {
-        (64,  1) => "attn_score_q8_0_f32_dev_pos_hd64_nq1",
-        (64,  2) => "attn_score_q8_0_f32_dev_pos_hd64_nq2",
-        (64,  4) => "attn_score_q8_0_f32_dev_pos_hd64_nq4",
-        (64,  5) => "attn_score_q8_0_f32_dev_pos_hd64_nq5",
-        (64,  7) => "attn_score_q8_0_f32_dev_pos_hd64_nq7",
-        (64,  8) => "attn_score_q8_0_f32_dev_pos_hd64_nq8",
-        (128, 1) => "attn_score_q8_0_f32_dev_pos_hd128_nq1",
-        (128, 2) => "attn_score_q8_0_f32_dev_pos_hd128_nq2",
-        (128, 4) => "attn_score_q8_0_f32_dev_pos_hd128_nq4",
-        (128, 5) => "attn_score_q8_0_f32_dev_pos_hd128_nq5",
-        (128, 7) => "attn_score_q8_0_f32_dev_pos_hd128_nq7",
-        (128, 8) => "attn_score_q8_0_f32_dev_pos_hd128_nq8",
-        (256, 1) => "attn_score_q8_0_f32_dev_pos_hd256_nq1",
-        (256, 2) => "attn_score_q8_0_f32_dev_pos_hd256_nq2",
-        (256, 4) => "attn_score_q8_0_f32_dev_pos_hd256_nq4",
-        (256, 5) => "attn_score_q8_0_f32_dev_pos_hd256_nq5",
-        (256, 7) => "attn_score_q8_0_f32_dev_pos_hd256_nq7",
-        (256, 8) => "attn_score_q8_0_f32_dev_pos_hd256_nq8",
-        _ => anyhow::bail!(
-            "attn_score_q8_0_f32_dev_pos: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv}) - supported {{64,128,256}} x {{1,2,4,5,7,8}}",
-        ),
-    };
-    let func = quantized_kernel(dev, kernel_name)?;
+    let kernel_name = "attn_score_q8_0_f32_dev_pos";
+    let func = shape_kernel(dev, kernel_name, head_dim, n_q_per_kv)?;
 
     // Each warp computes one (token, h_kv) and emits scores for all
     // n_q_per_kv query heads in that kv-group.
@@ -420,37 +398,8 @@ pub fn attn_output_q8_0_f32_gqa(
             n_q_heads * seq_kv
         );
     }
-    let kernel_name = match (head_dim, n_q_per_kv) {
-        (64, 1) => "attn_output_q8_0_f32_hd64_nq1",
-        (64, 2) => "attn_output_q8_0_f32_hd64_nq2",
-        (64, 4) => "attn_output_q8_0_f32_hd64_nq4",
-        (64, 5) => "attn_output_q8_0_f32_hd64_nq5",
-        (64, 7) => "attn_output_q8_0_f32_hd64_nq7",
-        (64, 8) => "attn_output_q8_0_f32_hd64_nq8",
-        (128, 1) => "attn_output_q8_0_f32_hd128_nq1",
-        (128, 2) => "attn_output_q8_0_f32_hd128_nq2",
-        (128, 4) => "attn_output_q8_0_f32_hd128_nq4",
-        (128, 5) => "attn_output_q8_0_f32_hd128_nq5",
-        (128, 7) => "attn_output_q8_0_f32_hd128_nq7",
-        (128, 8) => "attn_output_q8_0_f32_hd128_nq8",
-        (256, 1) => "attn_output_q8_0_f32_hd256_nq1",
-        (256, 2) => "attn_output_q8_0_f32_hd256_nq2",
-        (256, 4) => "attn_output_q8_0_f32_hd256_nq4",
-        (256, 5) => "attn_output_q8_0_f32_hd256_nq5",
-        (256, 7) => "attn_output_q8_0_f32_hd256_nq7",
-        (256, 8) => "attn_output_q8_0_f32_hd256_nq8",
-        (512, 1) => "attn_output_q8_0_f32_hd512_nq1",
-        (512, 2) => "attn_output_q8_0_f32_hd512_nq2",
-        (512, 4) => "attn_output_q8_0_f32_hd512_nq4",
-        (512, 5) => "attn_output_q8_0_f32_hd512_nq5",
-        (512, 7) => "attn_output_q8_0_f32_hd512_nq7",
-        (512, 8) => "attn_output_q8_0_f32_hd512_nq8",
-        (512, 16) => "attn_output_q8_0_f32_hd512_nq16",
-        _ => anyhow::bail!(
-            "attn_output_q8_0_f32_gqa: unsupported combo head_dim={head_dim} n_q_per_kv={n_q_per_kv} (want {{64,128,256,512}} x {{1,2,4,5,7,8}})",
-        ),
-    };
-    let func = quantized_kernel(dev, kernel_name)?;
+    let kernel_name = "attn_output_q8_0_f32";
+    let func = shape_kernel(dev, kernel_name, head_dim, n_q_per_kv)?;
 
     let strides = kv_block_strides(head_dim, n_kv_heads);
     let hd_blocks = strides.hd_blocks;
@@ -512,30 +461,8 @@ pub fn attn_output_q8_0_f32_dev_pos(
             max_seq_padded
         );
     }
-    let kernel_name = match (head_dim, n_q_per_kv) {
-        (64,  1) => "attn_output_q8_0_f32_dev_pos_hd64_nq1",
-        (64,  2) => "attn_output_q8_0_f32_dev_pos_hd64_nq2",
-        (64,  4) => "attn_output_q8_0_f32_dev_pos_hd64_nq4",
-        (64,  5) => "attn_output_q8_0_f32_dev_pos_hd64_nq5",
-        (64,  7) => "attn_output_q8_0_f32_dev_pos_hd64_nq7",
-        (64,  8) => "attn_output_q8_0_f32_dev_pos_hd64_nq8",
-        (128, 1) => "attn_output_q8_0_f32_dev_pos_hd128_nq1",
-        (128, 2) => "attn_output_q8_0_f32_dev_pos_hd128_nq2",
-        (128, 4) => "attn_output_q8_0_f32_dev_pos_hd128_nq4",
-        (128, 5) => "attn_output_q8_0_f32_dev_pos_hd128_nq5",
-        (128, 7) => "attn_output_q8_0_f32_dev_pos_hd128_nq7",
-        (128, 8) => "attn_output_q8_0_f32_dev_pos_hd128_nq8",
-        (256, 1) => "attn_output_q8_0_f32_dev_pos_hd256_nq1",
-        (256, 2) => "attn_output_q8_0_f32_dev_pos_hd256_nq2",
-        (256, 4) => "attn_output_q8_0_f32_dev_pos_hd256_nq4",
-        (256, 5) => "attn_output_q8_0_f32_dev_pos_hd256_nq5",
-        (256, 7) => "attn_output_q8_0_f32_dev_pos_hd256_nq7",
-        (256, 8) => "attn_output_q8_0_f32_dev_pos_hd256_nq8",
-        _ => anyhow::bail!(
-            "attn_output_q8_0_f32_dev_pos: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv}) - supported {{64,128,256}} x {{1,2,4,5,7,8}}",
-        ),
-    };
-    let func = quantized_kernel(dev, kernel_name)?;
+    let kernel_name = "attn_output_q8_0_f32_dev_pos";
+    let func = shape_kernel(dev, kernel_name, head_dim, n_q_per_kv)?;
 
     let strides = kv_block_strides(head_dim, n_kv_heads);
     let hd_blocks = strides.hd_blocks;
@@ -604,30 +531,8 @@ pub fn attn_softmax_output_q8_0_f32_dev_pos(
             max_seq_padded
         );
     }
-    let kernel_name = match (head_dim, n_q_per_kv) {
-        (64,  1) => "attn_softmax_output_q8_0_f32_dev_pos_hd64_nq1",
-        (64,  2) => "attn_softmax_output_q8_0_f32_dev_pos_hd64_nq2",
-        (64,  4) => "attn_softmax_output_q8_0_f32_dev_pos_hd64_nq4",
-        (64,  5) => "attn_softmax_output_q8_0_f32_dev_pos_hd64_nq5",
-        (64,  7) => "attn_softmax_output_q8_0_f32_dev_pos_hd64_nq7",
-        (64,  8) => "attn_softmax_output_q8_0_f32_dev_pos_hd64_nq8",
-        (128, 1) => "attn_softmax_output_q8_0_f32_dev_pos_hd128_nq1",
-        (128, 2) => "attn_softmax_output_q8_0_f32_dev_pos_hd128_nq2",
-        (128, 4) => "attn_softmax_output_q8_0_f32_dev_pos_hd128_nq4",
-        (128, 5) => "attn_softmax_output_q8_0_f32_dev_pos_hd128_nq5",
-        (128, 7) => "attn_softmax_output_q8_0_f32_dev_pos_hd128_nq7",
-        (128, 8) => "attn_softmax_output_q8_0_f32_dev_pos_hd128_nq8",
-        (256, 1) => "attn_softmax_output_q8_0_f32_dev_pos_hd256_nq1",
-        (256, 2) => "attn_softmax_output_q8_0_f32_dev_pos_hd256_nq2",
-        (256, 4) => "attn_softmax_output_q8_0_f32_dev_pos_hd256_nq4",
-        (256, 5) => "attn_softmax_output_q8_0_f32_dev_pos_hd256_nq5",
-        (256, 7) => "attn_softmax_output_q8_0_f32_dev_pos_hd256_nq7",
-        (256, 8) => "attn_softmax_output_q8_0_f32_dev_pos_hd256_nq8",
-        _ => anyhow::bail!(
-            "attn_softmax_output_q8_0_f32_dev_pos: unsupported (head_dim={head_dim}, n_q_per_kv={n_q_per_kv}) - supported {{64,128,256}} x {{1,2,4,5,7,8}}",
-        ),
-    };
-    let func = quantized_kernel(dev, kernel_name)?;
+    let kernel_name = "attn_softmax_output_q8_0_f32_dev_pos";
+    let func = shape_kernel(dev, kernel_name, head_dim, n_q_per_kv)?;
 
     let strides = kv_block_strides(head_dim, n_kv_heads);
     let hd_blocks = strides.hd_blocks;

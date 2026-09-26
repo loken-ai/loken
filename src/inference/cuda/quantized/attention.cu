@@ -146,12 +146,8 @@ extern "C" __global__ void NAME(                                             \
     }                                                                        \
 }
 
-ATTN_SCORE_GQA_KERNEL(attn_score_q8_0_q8_1_gqa_hd64,  64)
-ATTN_SCORE_GQA_KERNEL(attn_score_q8_0_q8_1_gqa_hd128, 128)
-ATTN_SCORE_GQA_KERNEL(attn_score_q8_0_q8_1_gqa_hd256, 256)
 // Gemma4 Global layers use HD=512 -> falls into the generic loop at the
 // end of the macro.
-ATTN_SCORE_GQA_KERNEL(attn_score_q8_0_q8_1_gqa_hd512, 512)
 
 // Inside-the-kernel GQA fan-out: each kernel block handles ALL `n_q_per_kv`
 // query heads that share one kv-head. This is the same trick the Q8 V
@@ -266,35 +262,10 @@ extern "C" __global__ void NAME(                                              \
     );                                                                        \
 }
 
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd64_nq1,   64, 1)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd64_nq2,   64, 2)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd64_nq4,   64, 4)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd64_nq5,   64, 5)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd64_nq7,   64, 7)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd64_nq8,   64, 8)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd128_nq1, 128, 1)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd128_nq2, 128, 2)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd128_nq4, 128, 4)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd128_nq5, 128, 5)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd128_nq7, 128, 7)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd128_nq8, 128, 8)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd256_nq1, 256, 1)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd256_nq2, 256, 2)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd256_nq4, 256, 4)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd256_nq5, 256, 5)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd256_nq7, 256, 7)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd256_nq8, 256, 8)
 // HD=512 specializations - for architectures with head_dim 512 global
 // attention layers. The templated kernel scales cleanly with HD (just
 // more channels-per-warp
 // iterations), so this is a pure template instantiation.
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq1, 512, 1)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq2, 512, 2)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq4, 512, 4)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq5, 512, 5)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq7, 512, 7)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq8, 512, 8)
-ATTN_SCORE_Q4_KERNEL(attn_score_q4_0_f32_kivi_hd512_nq16, 512, 16)
 
 // ------------------------------------------------------------
 // Device-position variant of attn_score_q4_*. Reads `seq_kv` from a device
@@ -431,32 +402,7 @@ extern "C" __global__ void NAME(                                              \
     );                                                                        \
 }
 
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd64_nq1,    64, 1)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd64_nq2,    64, 2)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd64_nq4,    64, 4)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd64_nq5,    64, 5)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd64_nq7,    64, 7)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd64_nq8,    64, 8)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd128_nq1, 128, 1)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd128_nq2, 128, 2)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd128_nq4, 128, 4)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd128_nq5, 128, 5)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd128_nq7, 128, 7)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd128_nq8, 128, 8)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd256_nq1, 256, 1)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd256_nq2, 256, 2)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd256_nq4, 256, 4)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd256_nq5, 256, 5)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd256_nq7, 256, 7)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd256_nq8, 256, 8)
 // HD=512 dev-pos variants - for head_dim 512 global attention in graph mode.
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq1, 512, 1)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq2, 512, 2)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq4, 512, 4)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq5, 512, 5)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq7, 512, 7)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq8, 512, 8)
-ATTN_SCORE_Q4_DEV_POS_KERNEL(attn_score_q4_0_f32_kivi_dev_pos_hd512_nq16, 512, 16)
 
 // ------------------------------------------------------------
 // Device-position variant of attn_score_q8_*. Same purpose as the Q4 dev_pos
@@ -588,25 +534,6 @@ extern "C" __global__ void NAME(                                              \
     );                                                                        \
 }
 
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd64_nq1,    64, 1)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd64_nq2,    64, 2)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd64_nq4,    64, 4)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd64_nq5,    64, 5)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd64_nq7,    64, 7)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd64_nq8,    64, 8)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd128_nq1, 128, 1)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd128_nq2, 128, 2)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd128_nq4, 128, 4)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd128_nq5, 128, 5)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd128_nq7, 128, 7)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd128_nq8, 128, 8)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd256_nq1, 256, 1)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd256_nq2, 256, 2)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd256_nq4, 256, 4)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd256_nq5, 256, 5)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd256_nq7, 256, 7)
-ATTN_SCORE_Q8_DEV_POS_KERNEL(attn_score_q8_0_f32_dev_pos_hd256_nq8, 256, 8)
-
 // V-path attention output: `out = probs @ V` where:
 //   probs : [n_q_heads, seq_kv]   (f32, softmax output)
 //   V     : [seq_kv, n_kv_heads, head_dim] Q8_0 blocks along head_dim
@@ -717,32 +644,7 @@ extern "C" __global__ void __launch_bounds__(ATTN_OUTPUT_WARPS * 32) NAME(      
     );                                                                       \
 }
 
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd64_nq1,   64, 1)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd64_nq2,   64, 2)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd64_nq4,   64, 4)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd64_nq5,   64, 5)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd64_nq7,   64, 7)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd64_nq8,   64, 8)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd128_nq1, 128, 1)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd128_nq2, 128, 2)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd128_nq4, 128, 4)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd128_nq5, 128, 5)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd128_nq7, 128, 7)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd128_nq8, 128, 8)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd256_nq1, 256, 1)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd256_nq2, 256, 2)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd256_nq4, 256, 4)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd256_nq5, 256, 5)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd256_nq7, 256, 7)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd256_nq8, 256, 8)
 // Gemma4 Global layers (HD=512). Same kernel template; HD/32=16 blocks.
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq1, 512, 1)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq2, 512, 2)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq4, 512, 4)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq5, 512, 5)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq7, 512, 7)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq8, 512, 8)
-ATTN_OUTPUT_KERNEL(attn_output_q8_0_f32_hd512_nq16, 512, 16)
 
 // ------------------------------------------------------------
 // Device-position variant of attn_output_q8_*. Same template as the
@@ -840,25 +742,6 @@ extern "C" __global__ void NAME(                                             \
     );                                                                       \
 }
 
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd64_nq1,    64, 1)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd64_nq2,    64, 2)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd64_nq4,    64, 4)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd64_nq5,    64, 5)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd64_nq7,    64, 7)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd64_nq8,    64, 8)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd128_nq1, 128, 1)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd128_nq2, 128, 2)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd128_nq4, 128, 4)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd128_nq5, 128, 5)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd128_nq7, 128, 7)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd128_nq8, 128, 8)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd256_nq1, 256, 1)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd256_nq2, 256, 2)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd256_nq4, 256, 4)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd256_nq5, 256, 5)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd256_nq7, 256, 7)
-ATTN_OUTPUT_Q8_DEV_POS_KERNEL(attn_output_q8_0_f32_dev_pos_hd256_nq8, 256, 8)
-
 // --- Q4_0 V-path attention output ----------------------------------------
 //
 // Mirrors the Q8_0 path above with Q4_0 blocks (18 bytes / 32 elements).
@@ -945,120 +828,6 @@ extern "C" __global__ void NAME(                                             \
         block_idx, kv, lane, warp_id                                         \
     );                                                                       \
 }
-
-// --- Q4_0 V-path attention output (split-K variant) ----------------------
-//
-// Same dot product (probs @ V) but with the seq_kv reduction split across
-// many blocks via grid_z. Each block handles a SEQ_PER_SPLIT slice of
-// seq_kv for one (HD chunk, kv head) and atomicAdd's its partial into the
-// pre-zeroed output. Targets the high-ctx regime (>~12k seq_kv) where the
-// monolithic 32-warp kernel under-saturates SMs (~6 warps/SM); the
-// split-K form scales the block count linearly with seq_kv.
-//
-// Kernel parameters:
-//   ATTN_OUTPUT_SPLITK_WARPS  - warps per block (default 8 -> 256 threads)
-//   seq_per_split              - runtime, controlled by host (default 256)
-//
-// Grid: (HD/32, n_kv, S) where S = ceil(seq_kv / seq_per_split).
-//
-// Caller MUST pre-zero `out` (cudaMemsetAsync) before launch because the
-// kernel atomicAdd's its partial.
-#define ATTN_OUTPUT_SPLITK_WARPS 8
-
-template <int HD, int MAX_NQ_PER_KV, int WARPS_PER_BLOCK>
-static __device__ __forceinline__ void attn_output_q4_splitk_inner(
-    const void * __restrict__ V_blob,
-    const float * __restrict__ probs,
-    float * __restrict__ out,
-    int seq_kv,
-    int n_kv_stride_blocks,
-    int kv_head_stride_blocks,
-    int n_q_per_kv,
-    int block_idx,
-    int kv,
-    int s_start,
-    int s_end,
-    int lane,
-    int warp_id
-) {
-    float acc[MAX_NQ_PER_KV];
-    #pragma unroll
-    for (int q = 0; q < MAX_NQ_PER_KV; ++q) acc[q] = 0.0f;
-
-    const int nib_byte = lane & 15;
-    const bool is_high = lane >= 16;
-
-    // Each warp strides through the [s_start, s_end) range.
-    for (int s = s_start + warp_id; s < s_end; s += WARPS_PER_BLOCK) {
-        const block_q4_0 * v_block =
-            reinterpret_cast<const block_q4_0 *>(V_blob)
-            + (size_t)s * n_kv_stride_blocks
-            + kv * kv_head_stride_blocks
-            + block_idx;
-        const uint8_t byte = v_block->qs[nib_byte];
-        const int nib = is_high ? (byte >> 4) : (byte & 0xF);
-        const float v_f = (nib - 8) * __half2float(v_block->d);
-
-        #pragma unroll
-        for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
-            if (q < n_q_per_kv) {
-                const int h = kv * n_q_per_kv + q;
-                const float p = probs[(size_t)h * seq_kv + s];
-                acc[q] = fmaf(p, v_f, acc[q]);
-            }
-        }
-    }
-
-    __shared__ float shmem[WARPS_PER_BLOCK][32];
-    #pragma unroll
-    for (int q = 0; q < MAX_NQ_PER_KV; ++q) {
-        if (q < n_q_per_kv) {
-            const float total = sum_down_warp_column(shmem, warp_id, lane, acc[q]);
-            if (warp_id == 0) {
-                const int h = kv * n_q_per_kv + q;
-                const int d = block_idx * 32 + lane;
-                atomicAdd(&out[(size_t)h * HD + d], total);
-            }
-            __syncthreads();
-        }
-    }
-}
-
-#define ATTN_OUTPUT_Q4_SPLITK_KERNEL(NAME, HD, NQ)                              \
-extern "C" __global__ void NAME(                                                \
-    const void * __restrict__ V_blob,                                           \
-    const float * __restrict__ probs,                                           \
-    float * __restrict__ out,                                                   \
-    int seq_kv,                                                                 \
-    int n_kv_stride_blocks,                                                     \
-    int kv_head_stride_blocks,                                                  \
-    int seq_per_split                                                           \
-) {                                                                             \
-    const int block_idx = blockIdx.x;                                           \
-    const int kv        = blockIdx.y;                                           \
-    const int sb        = blockIdx.z;                                           \
-    const int lane      = threadIdx.x;                                          \
-    const int warp_id   = threadIdx.y;                                          \
-    if (block_idx >= (HD / 32)) return;                                         \
-    const int s_start = sb * seq_per_split;                                     \
-    const int s_end   = min(s_start + seq_per_split, seq_kv);                   \
-    if (s_start >= s_end) return;                                               \
-    attn_output_q4_splitk_inner<HD, NQ, ATTN_OUTPUT_SPLITK_WARPS>(              \
-        V_blob, probs, out, seq_kv,                                             \
-        n_kv_stride_blocks, kv_head_stride_blocks, NQ,                          \
-        block_idx, kv, s_start, s_end, lane, warp_id                            \
-    );                                                                          \
-}
-
-ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd64_nq1,    64, 1)
-ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd64_nq4,    64, 4)
-ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd64_nq8,    64, 8)
-ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd128_nq1, 128, 1)
-ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd128_nq4, 128, 4)
-ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd128_nq8, 128, 8)
-ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd256_nq1, 256, 1)
-ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd256_nq4, 256, 4)
-ATTN_OUTPUT_Q4_SPLITK_KERNEL(attn_output_q4_0_f32_splitk_hd256_nq8, 256, 8)
 
 // --- Fused softmax + Q4 attn output -------------------------------------
 // Eliminates the explicit `softmax_last_dim(scores)` launch + the probs
@@ -1302,22 +1071,6 @@ extern "C" __global__ void __launch_bounds__(ATTN_OUTPUT_WARPS * 32) NAME(      
 }
 
 // e.g. qwen2 with n_q=40, n_kv=8 -> nq_per_kv=5. Bucket to 8 (next power).
-ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd128_nq8, 128, 8)
-ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd128_nq4, 128, 4)
-ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd128_nq1, 128, 1)
-ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd64_nq8,   64, 8)
-ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd64_nq4,   64, 4)
-ATTN_OUTPUT_SOFTMAX_Q8_KERNEL(attn_softmax_output_q8_0_f32_hd64_nq1,   64, 1)
-
-ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd128_nq8, 128, 8)
-ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd128_nq4, 128, 4)
-ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd128_nq1, 128, 1)
-ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd64_nq8,   64, 8)
-ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd64_nq4,   64, 4)
-ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd64_nq1,   64, 1)
-ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd256_nq8, 256, 8)
-ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd256_nq4, 256, 4)
-ATTN_OUTPUT_SOFTMAX_Q4_KERNEL(attn_softmax_output_q4_0_f32_hd256_nq1, 256, 1)
 
 // ------------------------------------------------------------
 // Q8 fused scale+softmax+output with device-side seq_kv (dev_pos variant).
@@ -1477,25 +1230,6 @@ extern "C" __global__ void NAME(                                             \
         block_idx, kv, lane, warp_id, window                                  \
     );                                                                       \
 }
-
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd64_nq1,    64, 1)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd64_nq2,    64, 2)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd64_nq4,    64, 4)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd64_nq5,    64, 5)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd64_nq7,    64, 7)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd64_nq8,    64, 8)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd128_nq1, 128, 1)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd128_nq2, 128, 2)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd128_nq4, 128, 4)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd128_nq5, 128, 5)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd128_nq7, 128, 7)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd128_nq8, 128, 8)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd256_nq1, 256, 1)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd256_nq2, 256, 2)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd256_nq4, 256, 4)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd256_nq5, 256, 5)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd256_nq7, 256, 7)
-ATTN_SOFTMAX_OUTPUT_Q8_DEV_POS_KERNEL(attn_softmax_output_q8_0_f32_dev_pos_hd256_nq8, 256, 8)
 
 // ------------------------------------------------------------
 // Fully fused single-query attention for Q8 KV cache (phi2-class arches).
