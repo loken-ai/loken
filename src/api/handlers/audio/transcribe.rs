@@ -4,6 +4,38 @@
 
 use super::*;
 
+/// Speech bytes (any container the server reads) to text, the way every route that
+/// transcribes does it: an empty upload and an oversized one refused, the audio decoded
+/// to whisper's mono 16 kHz, the model loaded, the transcript produced. The error carries
+/// the status it answers with.
+pub(super) async fn decode_and_transcribe(
+    state: &APIServer,
+    bytes: Vec<u8>,
+    model_name: Option<&str>,
+    params: AudioTranscribeParams,
+) -> Result<TranscribeResult, (StatusCode, String)> {
+    // Zero bytes would reach the decoder as an unhelpful "unsupported format"; most
+    // clients send them when an aborted streaming upload still fires the request.
+    if bytes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "the audio is empty".to_string()));
+    }
+    validate_audio_input_size(bytes.len()).map_err(|e| (StatusCode::PAYLOAD_TOO_LARGE, e))?;
+    let (samples, sr) = decode_audio_blocking(bytes, "audio").await?;
+    ensure_whisper_model_loaded(state, model_name)
+        .await
+        .map_err(|e| (http_status_for_load_error(&e), e))?;
+    state
+        .audio_engine
+        .transcribe(samples, sr, params)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("transcribe: {e}"),
+            )
+        })
+}
+
 pub(super) async fn audio_decode_endpoint(
     axum::extract::State(state): axum::extract::State<APIServer>,
     mut multipart: axum::extract::Multipart,
@@ -168,34 +200,11 @@ pub(super) async fn audio_decode_endpoint(
             )
         }
     };
-    // Empty file slips past the Some() check; calling the decoder on
-    // 0 bytes returns an unhelpful "unsupported format" error. Reject
-    // up front with a clear message - most clients hit this when their
-    // streaming-upload abort handler still fires the request.
-    if bytes.is_empty() {
-        return err_resp(
-            axum::http::StatusCode::BAD_REQUEST,
-            "`file` field is empty".to_string(),
-        );
-    }
-    if let Err(e) = validate_audio_input_size(bytes.len()) {
-        return err_resp(axum::http::StatusCode::PAYLOAD_TOO_LARGE, e);
-    }
-
-    let (samples, sr) = match decode_audio_blocking(bytes, "audio").await {
-        Ok(v) => v,
-        Err((code, e)) => return err_resp(code, e),
-    };
-
     if let Some(name) = model_name.as_deref() {
         if let Err(e) = validate_model_id(name) {
             return e.into_response();
         }
     }
-    if let Err(e) = ensure_whisper_model_loaded(&state, model_name.as_deref()).await {
-        return err_resp(http_status_for_load_error(&e), e);
-    }
-
     let collect_metrics = matches!(response_format.as_str(), "verbose_json" | "srt" | "vtt");
     let params = AudioTranscribeParams {
         language,
@@ -205,18 +214,12 @@ pub(super) async fn audio_decode_endpoint(
         collect_metrics,
         initial_prompt,
     };
-    // Stamp the transcribe step's wall time so the response can carry
-    // `Server-Timing` (RFC 8673). Useful for clients diagnosing slow
-    // ASR calls without server-side log access.
+    // The wall time goes out as `Server-Timing` (RFC 8673), for clients diagnosing a slow
+    // transcription without server-side log access.
     let transcribe_start = std::time::Instant::now();
-    let result: TranscribeResult = match state.audio_engine.transcribe(samples, sr, params).await {
+    let result = match decode_and_transcribe(&state, bytes, model_name.as_deref(), params).await {
         Ok(r) => r,
-        Err(e) => {
-            return err_resp(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("transcribe: {e}"),
-            )
-        }
+        Err((code, e)) => return err_resp(code, e),
     };
     let transcribe_ms = transcribe_start.elapsed().as_secs_f64() * 1000.0;
     info!(

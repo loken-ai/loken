@@ -254,12 +254,11 @@ pub(crate) async fn video_generations(
         Some(p) => (p.width, p.height),
         None => (256usize, 256usize),
     };
+    // Read and bounded as on the image routes.
     if let Some(s) = b.get("size").and_then(|v| v.as_str()) {
-        if let Some((ws, hs)) = s.split_once('x') {
-            if let (Ok(w), Ok(h)) = (ws.trim().parse::<usize>(), hs.trim().parse::<usize>()) {
-                width = w;
-                height = h;
-            }
+        match parse_image_size(s) {
+            Ok((w, h)) => (width, height) = (w, h),
+            Err(e) => return err_resp(axum::http::StatusCode::BAD_REQUEST, format!("size: {e}")),
         }
     }
     // Wan requires spatial dims divisible by 16.
@@ -328,7 +327,9 @@ pub(crate) async fn video_generations(
         None => None,
         Some(sv) => {
             use base64::Engine as _;
-            let bytes = match base64::engine::general_purpose::STANDARD.decode(strip_data_url(sv)) {
+            let bytes = match base64::engine::general_purpose::STANDARD
+                .decode(crate::api::types::base64_payload(sv))
+            {
                 Ok(b) => b,
                 Err(e) => {
                     return err_resp(
@@ -420,7 +421,7 @@ pub(crate) async fn video_generations(
             let img_model = b
                 .get("start_image_model")
                 .and_then(|v| v.as_str())
-                .unwrap_or("z-image")
+                .unwrap_or(DEFAULT_IMAGE_MODEL)
                 .to_string();
             let geom =
                 crate::inference::place::runtime_demand::RequestGeometry::new(side_w, side_h);
@@ -461,7 +462,7 @@ pub(crate) async fn video_generations(
                 Ok(b64) => {
                     use base64::Engine as _;
                     let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(strip_data_url(&b64))
+                        .decode(crate::api::types::base64_payload(&b64))
                         .unwrap_or_default();
                     // ORIENTATION-OK: this is the server's own render, not a camera file.
                     match image::load_from_memory(&bytes) {
@@ -873,7 +874,10 @@ pub(crate) async fn images_generations(
     // model. Flux-schnell has open issues at non-native res (black @512) and
     // OOMs at native 1024 (loads single-GPU, T5-XXL+flux+1024-activations >16GB).
     // Explicit `model:"flux-schnell"` still routes to flux for callers who want it.
-    let model_name = req.model.clone().unwrap_or_else(|| "z-image".to_string());
+    let model_name = req
+        .model
+        .clone()
+        .unwrap_or_else(|| DEFAULT_IMAGE_MODEL.to_string());
     if let Err(e) = validate_model_id(&model_name) {
         return e.into_response();
     }
@@ -1054,7 +1058,9 @@ pub(crate) async fn images_generations(
         None => None,
         Some(b64) => {
             use base64::Engine as _;
-            match base64::engine::general_purpose::STANDARD.decode(strip_data_url(b64)) {
+            match base64::engine::general_purpose::STANDARD
+                .decode(crate::api::types::base64_payload(b64))
+            {
                 Ok(v) => Some(v),
                 Err(e) => {
                     return err_resp(
@@ -1320,14 +1326,13 @@ pub(crate) async fn images_generations(
             loras: lora_list.clone(),
             ..base_params.clone()
         };
-        let _cg = crate::inference::serve::cancel::CancelGuard::new(params.cancel.clone());
-        // Cooperative cancellation: this future is dropped when the client
-        // disconnects (the GUI Cancel button drops the request), the guard fires,
-        // and the blocking render bails at its next step check instead of running
-        // to completion as an orphan burning the GPU.
-        let _cg = crate::inference::serve::cancel::CancelGuard::new(render_cancel.clone());
-        let _res = generate_image_resilient(&state, &model_name, geom, &req.prompt, params).await;
-        _cg.disarm();
+        // Cooperative cancellation: a client that disconnects drops this future and the
+        // render bails at its next step instead of running on as an orphan.
+        let _res = guarded_render(
+            &render_cancel,
+            generate_image_resilient(&state, &model_name, geom, &req.prompt, params),
+        )
+        .await;
         match _res {
             Ok(b64) => {
                 let b64 = match (conditioner.as_ref(), prepared.as_ref()) {

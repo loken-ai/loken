@@ -14,35 +14,6 @@ use super::*;
 /// Cursor - a borrowed `&[u8]` slice can't satisfy 'static. For a 5 MB
 /// MP3 upload that's a 5 MB heap copy saved per request. The WAV branch
 /// just lends `&bytes` since hound is happy with a Cursor<&[u8]>.
-/// Any container the server reads, as interleaved stereo at the model's rate.
-///
-/// Built on the mono decoder that already handles six containers: it resamples to 16 kHz
-/// for speech, so the samples are re-stretched here rather than decoded twice. Mono is
-/// duplicated to both channels, which is what a mono source means to a stereo model.
-pub(super) fn decode_any_to_stereo_44k(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
-    let (mono16k, rate) = decode_audio_to_mono_f32_16k(bytes.to_vec())?;
-    if mono16k.is_empty() {
-        anyhow::bail!("the audio decoded to nothing");
-    }
-    let target = crate::inference::model::stable_audio::SAMPLE_RATE;
-    let src_rate = if rate == 0 { 16_000 } else { rate };
-    let ratio = target as f64 / src_rate as f64;
-    let out_frames = ((mono16k.len() as f64) * ratio).round().max(1.0) as usize;
-    let mut out = Vec::with_capacity(out_frames * 2);
-    for i in 0..out_frames {
-        // Linear interpolation between the two neighbouring source samples.
-        let pos = i as f64 / ratio;
-        let i0 = pos.floor() as usize;
-        let frac = (pos - i0 as f64) as f32;
-        let a = *mono16k.get(i0).unwrap_or(&0.0);
-        let b = *mono16k.get(i0 + 1).unwrap_or(&a);
-        let v = a + (b - a) * frac;
-        out.push(v);
-        out.push(v);
-    }
-    Ok(out)
-}
-
 pub(super) fn decode_audio_to_mono_f32_16k(bytes: Vec<u8>) -> anyhow::Result<(Vec<f32>, u32)> {
     let kind = detect_audio_format(&bytes);
     match kind {
@@ -71,39 +42,7 @@ pub(super) fn detect_audio_format(bytes: &[u8]) -> AudioFormat {
 /// Decode WAV bytes -> mono f32 PCM at 16 kHz. Handles any input sample
 /// rate by passing through rubato's polyphase resampler (anti-aliased).
 pub(super) fn decode_wav_to_mono_f32_16k(bytes: &[u8]) -> anyhow::Result<(Vec<f32>, u32)> {
-    use std::io::Cursor;
-    let mut reader = hound::WavReader::new(Cursor::new(bytes))?;
-    let spec = reader.spec();
-    let channels = spec.channels as usize;
-    if channels == 0 {
-        anyhow::bail!("zero-channel WAV");
-    }
-
-    // Branch by sample format up front. The previous code converted
-    // Float WAV samples to i32 just to divide them back to f32 in
-    // the next step - a redundant pass that also cost 1 ULP at the
-    // i32 round-trip. Each branch produces the per-sample f32 in
-    // [-1, 1] directly so the mono-down-mix consumes a single
-    // pre-normalised stream.
-    let normalized: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .collect::<std::result::Result<Vec<_>, _>>()?,
-        hound::SampleFormat::Int => {
-            let max_amp = match spec.bits_per_sample {
-                8 => 1i64 << 7,
-                16 => 1i64 << 15,
-                24 => 1i64 << 23,
-                32 => 1i64 << 31,
-                b => anyhow::bail!("unsupported bit depth: {b}"),
-            } as f32;
-            reader
-                .samples::<i32>()
-                .map(|r| r.map(|s| s as f32 / max_amp))
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        }
-    };
-
+    let (normalized, channels, sample_rate) = read_wav_interleaved(bytes)?;
     let mono: Vec<f32> = if channels == 1 {
         normalized
     } else {
@@ -115,32 +54,18 @@ pub(super) fn decode_wav_to_mono_f32_16k(bytes: &[u8]) -> anyhow::Result<(Vec<f3
     };
 
     let target_sr = crate::inference::engine::audio_engine::WHISPER_SAMPLE_RATE;
-    let resampled = if spec.sample_rate == target_sr {
+    let resampled = if sample_rate == target_sr {
         mono
     } else {
-        resample_to_16k(&mono, spec.sample_rate, target_sr)?
+        resample_polyphase(&mono, sample_rate, target_sr)?
     };
     Ok((resampled, target_sr))
 }
 
-/// Decode a WAV into interleaved STEREO f32 at 44.1 kHz (Stable Audio's
-/// native rate). Mono input is duplicated to both channels; other rates are
-/// resampled per channel.
-pub(super) fn decode_wav_to_stereo_44k(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
-    use std::io::Cursor;
-    // WAV directly; anything else through the general container decoder.
-    //
-    // Every audio field reads the six formats its file picker offers. Accepting WAV alone
-    // here would reject an MP3 with a raw decoder error, on a control whose own dialog
-    // said it was fine.
-    let mut reader = match hound::WavReader::new(Cursor::new(bytes)) {
-        Ok(r) => r,
-        Err(hound_err) => {
-            return decode_any_to_stereo_44k(bytes).map_err(|e| {
-                anyhow::anyhow!("{e} (as a WAV: {hound_err}). {ACCEPTED_AUDIO_FORMATS}")
-            })
-        }
-    };
+/// A WAV's samples, interleaved and normalised to [-1, 1] whatever the sample format
+/// (8/16/24/32-bit integer or float), with its channel count and rate.
+fn read_wav_interleaved(bytes: &[u8]) -> anyhow::Result<(Vec<f32>, usize, u32)> {
+    let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))?;
     let spec = reader.spec();
     let channels = spec.channels as usize;
     if channels == 0 {
@@ -164,28 +89,153 @@ pub(super) fn decode_wav_to_stereo_44k(bytes: &[u8]) -> anyhow::Result<Vec<f32>>
                 .collect::<std::result::Result<Vec<_>, _>>()?
         }
     };
-    // Split to L/R (mono duplicates; >2 channels take the first two).
-    let frames = normalized.len() / channels;
-    let (mut l, mut r) = (Vec::with_capacity(frames), Vec::with_capacity(frames));
-    for fr in normalized.chunks_exact(channels) {
-        l.push(fr[0]);
-        r.push(if channels > 1 { fr[1] } else { fr[0] });
-    }
-    let target = crate::inference::model::stable_audio::SAMPLE_RATE;
-    let (l, r) = if spec.sample_rate == target {
-        (l, r)
-    } else {
-        (
-            resample_to_16k(&l, spec.sample_rate, target)?,
-            resample_to_16k(&r, spec.sample_rate, target)?,
-        )
+    Ok((normalized, channels, spec.sample_rate))
+}
+
+/// Any container the server reads (WAV of any sample format, MP3, FLAC, OGG, AAC,
+/// MP4), as planar f32 at the source rate with every channel kept: all of channel 0,
+/// then all of channel 1, and so on.
+pub(crate) fn decode_audio_planar(bytes: &[u8]) -> anyhow::Result<(Vec<f32>, usize, u32)> {
+    let (planar, channels, rate) = match detect_audio_format(bytes) {
+        AudioFormat::Wav => {
+            let (interleaved, channels, rate) = read_wav_interleaved(bytes)?;
+            let frames = interleaved.len() / channels;
+            let mut planar = Vec::with_capacity(channels * frames);
+            for c in 0..channels {
+                planar.extend(interleaved.chunks_exact(channels).map(|f| f[c]));
+            }
+            (planar, channels, rate)
+        }
+        AudioFormat::Other => decode_symphonia_planar(bytes.to_vec())?,
     };
-    let mut out = Vec::with_capacity(l.len() * 2);
-    for i in 0..l.len().min(r.len()) {
-        out.push(l[i]);
-        out.push(r[i]);
+    if channels == 0 || planar.is_empty() {
+        anyhow::bail!("the audio decoded to no samples");
     }
-    Ok(out)
+    Ok((planar, channels, rate))
+}
+
+/// Any container the server reads, as left and right channels at `rate`: a mono source
+/// feeds both, a source with more channels gives its first two, and a source at another
+/// rate goes through the polyphase resampler.
+pub(crate) fn decode_audio_stereo(bytes: &[u8], rate: u32) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+    let (planar, channels, src_rate) = decode_audio_planar(bytes)?;
+    let frames = planar.len() / channels;
+    let channel = |c: usize| planar[c * frames..(c + 1) * frames].to_vec();
+    let (mut left, mut right) = (channel(0), channel(1.min(channels - 1)));
+    if src_rate != rate {
+        left = resample_polyphase(&left, src_rate, rate)?;
+        right = resample_polyphase(&right, src_rate, rate)?;
+    }
+    let n = left.len().min(right.len());
+    left.truncate(n);
+    right.truncate(n);
+    Ok((left, right))
+}
+
+/// [`decode_audio_stereo`] interleaved, at Stable Audio's rate: the conditioning audio a
+/// render reads.
+pub(super) fn decode_audio_stereo_interleaved_44k(bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
+    let rate = crate::inference::model::stable_audio::SAMPLE_RATE;
+    let (l, r) = decode_audio_stereo(bytes, rate)
+        .map_err(|e| anyhow::anyhow!("{e}. {ACCEPTED_AUDIO_FORMATS}"))?;
+    Ok(l.iter().zip(&r).flat_map(|(a, b)| [*a, *b]).collect())
+}
+
+/// MP3/FLAC/OGG/AAC/MP4 through symphonia, as planar f32 at the source rate with its
+/// channels kept.
+fn decode_symphonia_planar(bytes: Vec<u8>) -> anyhow::Result<(Vec<f32>, usize, u32)> {
+    use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal};
+    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+    use symphonia::core::conv::FromSample;
+    use symphonia::core::errors::Error as SymError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+    use symphonia::core::sample::Sample;
+
+    let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
+    let probed = symphonia::default::get_probe()
+        .format(
+            &Hint::new(),
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("unrecognised audio container: {e}"))?;
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| anyhow::anyhow!("no decodable audio track"))?;
+    let track_id = track.id;
+    let rate = track
+        .codec_params
+        .sample_rate
+        .ok_or_else(|| anyhow::anyhow!("unknown source sample rate"))?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| anyhow::anyhow!("codec init: {e}"))?;
+
+    // Accumulated per channel, so the layout stays planar all the way through.
+    let mut chans: Vec<Vec<f32>> = Vec::new();
+    fn push(buf: &AudioBuffer<f32>, chans: &mut Vec<Vec<f32>>) {
+        let n = buf.spec().channels.count();
+        if chans.len() < n {
+            chans.resize(n, Vec::new());
+        }
+        for (c, dst) in chans.iter_mut().enumerate().take(n) {
+            dst.extend_from_slice(buf.chan(c));
+        }
+    }
+    fn to_f32<S>(src: &AudioBuffer<S>) -> AudioBuffer<f32>
+    where
+        S: Sample,
+        f32: FromSample<S>,
+    {
+        let frames = src.frames();
+        let mut dst = AudioBuffer::<f32>::new(frames as u64, *src.spec());
+        dst.render_reserved(Some(frames));
+        src.convert(&mut dst);
+        dst
+    }
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(SymError::ResetRequired) => break,
+            Err(e) => anyhow::bail!("read packet: {e}"),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            // A damaged packet mid-file costs that packet, not the upload.
+            Err(SymError::IoError(_)) | Err(SymError::DecodeError(_)) => continue,
+            Err(e) => anyhow::bail!("decode: {e}"),
+        };
+        match decoded {
+            AudioBufferRef::F32(b) => push(&b, &mut chans),
+            AudioBufferRef::F64(b) => push(&to_f32(&b), &mut chans),
+            AudioBufferRef::U8(b) => push(&to_f32(&b), &mut chans),
+            AudioBufferRef::U16(b) => push(&to_f32(&b), &mut chans),
+            AudioBufferRef::U24(b) => push(&to_f32(&b), &mut chans),
+            AudioBufferRef::U32(b) => push(&to_f32(&b), &mut chans),
+            AudioBufferRef::S8(b) => push(&to_f32(&b), &mut chans),
+            AudioBufferRef::S16(b) => push(&to_f32(&b), &mut chans),
+            AudioBufferRef::S24(b) => push(&to_f32(&b), &mut chans),
+            AudioBufferRef::S32(b) => push(&to_f32(&b), &mut chans),
+        }
+    }
+    let channels = chans.len();
+    let frames = chans.iter().map(Vec::len).min().unwrap_or(0);
+    let mut planar = Vec::with_capacity(channels * frames);
+    for c in chans {
+        planar.extend_from_slice(&c[..frames]);
+    }
+    Ok((planar, channels, rate))
 }
 
 /// Fold an AudioBuffer<f32> into a mono f32 accumulator.
@@ -330,14 +380,13 @@ pub(super) fn decode_symphonia_to_mono_f32_16k(bytes: Vec<u8>) -> anyhow::Result
     let out = if src_sr == target_sr {
         mono
     } else {
-        resample_to_16k(&mono, src_sr, target_sr)?
+        resample_polyphase(&mono, src_sr, target_sr)?
     };
     Ok((out, target_sr))
 }
 
-/// Polyphase resampler (rubato FftFixedIn) -> 16 kHz mono. Used when the
-/// uploaded WAV isn't already at whisper's required sample rate. Produces
-/// anti-aliased output suitable for ASR.
+/// Polyphase resampler (rubato FftFixedInOut) for one channel, from `src_rate` to
+/// `dst_rate`, anti-aliased: the one resampler every decoded upload goes through.
 ///
 /// Uses rubato's polyphase FFT resampler (FftFixedInOut). Important
 /// implementation details to keep audio bit-accurate end-to-end:
@@ -347,7 +396,7 @@ pub(super) fn decode_symphonia_to_mono_f32_16k(bytes: Vec<u8>) -> anyhow::Result
 ///   * Input is fed in fixed-size chunks (`input_frames_next()`); the
 ///     final chunk is zero-padded via `process_partial` so the tail of
 ///     the audio actually reaches the output.
-pub(super) fn resample_to_16k(
+pub(super) fn resample_polyphase(
     src: &[f32],
     src_rate: u32,
     dst_rate: u32,
@@ -991,7 +1040,7 @@ pub(crate) async fn audio_generations(
     // close to the source, ~10+ reinterprets it).
     let sao_init: Option<(Vec<f32>, f32)> = if is_sao && b.get("init_audio").is_some() {
         match decode_b64_field(&b, "init_audio").and_then(|bytes| {
-            decode_wav_to_stereo_44k(&bytes).map_err(|e| format!("init_audio: {e}"))
+            decode_audio_stereo_interleaved_44k(&bytes).map_err(|e| format!("init_audio: {e}"))
         }) {
             Ok(pcm) if !pcm.is_empty() => {
                 let level = b
@@ -1600,36 +1649,6 @@ pub(super) fn openai_voice_to_description(voice: &str, speed: f32) -> String {
     )
 }
 
-pub(super) fn pcm_to_wav_bytes(pcm: &[f32], sample_rate: u32) -> anyhow::Result<Vec<u8>> {
-    // 16-bit PCM WAV. We hand-encode to avoid pulling another dep.
-    let n_samples = pcm.len() as u32;
-    let byte_rate = sample_rate * 2; // 1 channel * 2 bytes/sample
-    let block_align: u16 = 2;
-    let data_size = n_samples * 2;
-    let chunk_size = 36 + data_size;
-
-    let mut out = Vec::with_capacity(44 + data_size as usize);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&chunk_size.to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes()); // fmt subchunk size
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM format
-    out.extend_from_slice(&1u16.to_le_bytes()); // mono
-    out.extend_from_slice(&sample_rate.to_le_bytes());
-    out.extend_from_slice(&byte_rate.to_le_bytes());
-    out.extend_from_slice(&block_align.to_le_bytes());
-    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_size.to_le_bytes());
-    // Same write-into-pre-sized-region pattern as pcm_to_wav_base64
-    // - avoids N extend_from_slice calls in the per-sample loop.
-    let data_start = out.len();
-    out.resize(data_start + pcm.len() * 2, 0);
-    write_i16_le_into(&mut out[data_start..], pcm);
-    Ok(out)
-}
-
 /// Constant bitrate of the MP3 the speech endpoint returns; the encoder snaps it to the
 /// nearest value the MPEG version of the checkpoint's sample rate allows.
 const MP3_BITRATE_KBPS: u32 = 96;
@@ -2053,15 +2072,11 @@ pub(crate) async fn audio_speech(
                 )
             }
         },
-        _ => match pcm_to_wav_bytes(&result.pcm, result.sample_rate) {
-            Ok(bytes) => (bytes, "audio/wav".to_string(), "wav"),
-            Err(e) => {
-                return err_resp(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("wav encode: {e}"),
-                )
-            }
-        },
+        _ => (
+            pcm_to_wav_ch(&result.pcm, result.sample_rate, 1),
+            "audio/wav".to_string(),
+            "wav",
+        ),
     };
 
     let synth_ms = synth_start.elapsed().as_secs_f64() * 1000.0;
@@ -2254,27 +2269,6 @@ pub(super) fn split_into_sentences(text: &str) -> Vec<String> {
     out
 }
 
-/// Build a WAV header with the data-chunk size left at 0xFFFFFFFF (the
-/// classic "streaming WAV" trick). Most players, including ffmpeg and
-/// libsndfile, accept this and read until the connection closes.
-pub(super) fn wav_streaming_header(sample_rate: u32) -> Vec<u8> {
-    let mut hdr = Vec::with_capacity(44);
-    hdr.extend_from_slice(b"RIFF");
-    hdr.extend_from_slice(&u32::MAX.to_le_bytes()); // chunk size - unknown
-    hdr.extend_from_slice(b"WAVE");
-    hdr.extend_from_slice(b"fmt ");
-    hdr.extend_from_slice(&16u32.to_le_bytes());
-    hdr.extend_from_slice(&1u16.to_le_bytes());
-    hdr.extend_from_slice(&1u16.to_le_bytes());
-    hdr.extend_from_slice(&sample_rate.to_le_bytes());
-    hdr.extend_from_slice(&(sample_rate * 2).to_le_bytes());
-    hdr.extend_from_slice(&2u16.to_le_bytes());
-    hdr.extend_from_slice(&16u16.to_le_bytes());
-    hdr.extend_from_slice(b"data");
-    hdr.extend_from_slice(&u32::MAX.to_le_bytes()); // data size - unknown
-    hdr
-}
-
 pub(super) async fn tts_stream_response(
     engine: std::sync::Arc<crate::inference::engine::TtsEngine>,
     input: String,
@@ -2316,7 +2310,7 @@ pub(super) async fn tts_stream_response(
         // the client can start playback before the first sentence is
         // ready.
         if format == "wav" {
-            yield Ok::<Vec<u8>, std::io::Error>(wav_streaming_header(sample_rate));
+            yield Ok::<Vec<u8>, std::io::Error>(wav_header(sample_rate, 1, None));
         }
         let mut bytes_total: usize = 0;
         for (idx, sentence) in sentences.into_iter().enumerate() {
@@ -2548,13 +2542,7 @@ pub(super) fn tts_events_response(
                 pcm_to_raw_le_bytes(&pcm),
                 format!("audio/L16; rate={rate}; channels=1"),
             ),
-            _ => match pcm_to_wav_bytes(&pcm, rate) {
-                Ok(b) => (b, "audio/wav".to_string()),
-                Err(e) => {
-                    yield ev(serde_json::json!({"status": "error", "error": format!("wav encode: {e}")}));
-                    return;
-                }
-            },
+            _ => (pcm_to_wav_ch(&pcm, rate, 1), "audio/wav".to_string()),
         };
         let audio_s = pcm.len() as f64 / rate.max(1) as f64;
         let b64 = {

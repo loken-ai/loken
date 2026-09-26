@@ -684,16 +684,16 @@ fn split_into_sentences_text_without_terminator_falls_back_to_whole_text() {
     assert_eq!(out, vec!["hello world"]);
 }
 
-// -- wav_streaming_header --
+// -- wav_header, streaming --
 
 #[test]
-fn wav_streaming_header_uses_unknown_size_markers() {
+fn streaming_wav_header_uses_unknown_size_markers() {
     // Streaming WAV trick: both `RIFF` chunk size AND `data`
     // chunk size are written as 0xFFFFFFFF so the player reads
     // until the connection closes. ffmpeg/libsndfile accept
     // this; pin so a refactor that computed a "real" size
     // doesn't break streaming-aware clients.
-    let h = wav_streaming_header(16_000);
+    let h = wav_header(16_000, 1, None);
     assert_eq!(h.len(), 44);
     assert_eq!(&h[..4], b"RIFF");
     assert_eq!(&h[4..8], &u32::MAX.to_le_bytes());
@@ -715,10 +715,10 @@ fn wav_streaming_header_uses_unknown_size_markers() {
 }
 
 #[test]
-fn wav_streaming_header_threads_sample_rate_through() {
+fn streaming_wav_header_threads_sample_rate_through() {
     // Different sample rates -> byte_rate scales accordingly.
     for sr in [22_050_u32, 24_000, 44_100, 48_000] {
-        let h = wav_streaming_header(sr);
+        let h = wav_header(sr, 1, None);
         assert_eq!(u32::from_le_bytes(h[24..28].try_into().unwrap()), sr);
         assert_eq!(u32::from_le_bytes(h[28..32].try_into().unwrap()), sr * 2);
     }
@@ -1018,7 +1018,7 @@ fn format_vtt_with_no_segments_keeps_webvtt_header() {
 fn resample_empty_input_returns_empty() {
     // Short-circuit: an empty audio buffer must not spin up rubato
     // (which would fail on zero-length input).
-    let out = resample_to_16k(&[], 48_000, 16_000).expect("empty");
+    let out = resample_polyphase(&[], 48_000, 16_000).expect("empty");
     assert!(out.is_empty());
 }
 
@@ -1029,7 +1029,7 @@ fn resample_downsamples_to_expected_length() {
     // the trailing warm-up tail, so a drift here would change the
     // duration the model sees by ±out_delay frames.
     let src: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.01).sin()).collect();
-    let out = resample_to_16k(&src, 48_000, 16_000).expect("resample");
+    let out = resample_polyphase(&src, 48_000, 16_000).expect("resample");
     // expected = round(48000 * 16000 / 48000) = 16000.
     assert_eq!(out.len(), 16_000, "1 s @ 48 kHz -> 16000 samples @ 16 kHz");
 }
@@ -1037,10 +1037,10 @@ fn resample_downsamples_to_expected_length() {
 #[test]
 fn resample_upsamples_to_expected_length() {
     // 16 kHz -> 16 kHz is the no-op fast path (the caller skips
-    // resample_to_16k for matching rates) so test 8 kHz -> 16 kHz
+    // resample_polyphase for matching rates) so test 8 kHz -> 16 kHz
     // here to exercise the upsampling rate ratio.
     let src: Vec<f32> = (0..8_000).map(|i| (i as f32 * 0.02).sin()).collect();
-    let out = resample_to_16k(&src, 8_000, 16_000).expect("resample");
+    let out = resample_polyphase(&src, 8_000, 16_000).expect("resample");
     // expected = round(8000 * 16000 / 8000) = 16000.
     assert_eq!(out.len(), 16_000, "1 s @ 8 kHz -> 16000 samples @ 16 kHz");
 }
@@ -1051,7 +1051,7 @@ fn resample_short_input_yields_proportional_output() {
     // residual-tail path. Pin behaviour: 100 ms @ 22050 should
     // still produce ~1600 samples @ 16 kHz (within out_delay).
     let src: Vec<f32> = vec![0.0_f32; 22_050 / 10]; // 0.1 s of silence
-    let out = resample_to_16k(&src, 22_050, 16_000).expect("resample");
+    let out = resample_polyphase(&src, 22_050, 16_000).expect("resample");
     // expected = round(2205 * 16000 / 22050) = 1600.
     assert_eq!(out.len(), 1600);
 }
@@ -1163,13 +1163,13 @@ fn apply_speed_preserves_unit_input_at_speed_one() {
 }
 
 #[test]
-fn pcm_to_wav_bytes_emits_canonical_riff_header() {
+fn mono_wav_emits_canonical_riff_header() {
     // Same header shape as pcm_to_wav_base64 but raw bytes (no
     // base64). Used by the TTS pipeline when /v1/audio/speech
     // asks for response_format=wav. Pin the byte layout so
     // downstream WAV players still accept it.
     let pcm = vec![0.0_f32; 4];
-    let wav = pcm_to_wav_bytes(&pcm, 24_000).expect("encode");
+    let wav = pcm_to_wav_ch(&pcm, 24_000, 1);
     assert_eq!(wav.len(), 44 + 8); // 4 samples x 2 bytes = 8
     assert_eq!(&wav[..4], b"RIFF");
     assert_eq!(&wav[8..12], b"WAVE");
@@ -1194,15 +1194,15 @@ fn pcm_to_wav_bytes_emits_canonical_riff_header() {
 }
 
 #[test]
-fn pcm_to_wav_bytes_clamps_out_of_range_symmetrically() {
-    // pcm_to_wav_bytes clamps the *float* sample to [-1, 1]
+fn mono_wav_clamps_out_of_range_symmetrically() {
+    // pcm_to_wav_ch clamps the *float* sample to [-1, 1]
     // before multiplying by i16::MAX (=32767). That yields a
     // symmetric output range of [-32767, +32767] - one short
     // of i16::MIN (-32768) but symmetric around zero, which
     // is the standard PCM convention (matches hound, ffmpeg's
     // pcm_s16le, and the OpenAI reference output).
     let pcm = vec![2.0_f32, -2.0, 0.0];
-    let wav = pcm_to_wav_bytes(&pcm, 22_050).expect("encode");
+    let wav = pcm_to_wav_ch(&pcm, 22_050, 1);
     let s0 = i16::from_le_bytes(wav[44..46].try_into().unwrap());
     let s1 = i16::from_le_bytes(wav[46..48].try_into().unwrap());
     let s2 = i16::from_le_bytes(wav[48..50].try_into().unwrap());
@@ -1214,11 +1214,11 @@ fn pcm_to_wav_bytes_clamps_out_of_range_symmetrically() {
 #[test]
 fn pcm_to_raw_le_bytes_matches_data_chunk_of_wav() {
     // pcm_to_raw_le_bytes shares the per-sample encode path with
-    // pcm_to_wav_bytes; equality of the data region pins they
+    // pcm_to_wav_ch; equality of the data region pins they
     // can't diverge (e.g. one rounding vs the other truncating).
     let pcm = vec![0.0_f32, 0.5, -0.5, 1.0, -1.0];
     let raw = pcm_to_raw_le_bytes(&pcm);
-    let wav = pcm_to_wav_bytes(&pcm, 16_000).expect("encode");
+    let wav = pcm_to_wav_ch(&pcm, 16_000, 1);
     assert_eq!(raw.len(), pcm.len() * 2);
     // First sample bytes in raw should equal bytes at offset 44 in WAV.
     assert_eq!(&raw[..], &wav[44..44 + pcm.len() * 2]);
@@ -1442,4 +1442,30 @@ fn a_loaded_parler_model_answers_to_its_aliases() {
     assert!(parler_needs_reload(cur, Some("tts-1-hd")));
     assert!(parler_needs_reload(Some("piper/en_US-amy"), Some("tts-1")));
     assert!(!parler_needs_reload(None, Some("tts-1")));
+}
+
+/// The stereo decoder keeps both channels and the source rate, and resamples each
+/// channel on its own.
+#[test]
+fn stereo_decode_keeps_both_channels() {
+    let rate = crate::inference::model::stable_audio::SAMPLE_RATE;
+    let frames = rate as usize / 10;
+    let mut planar = vec![0.5f32; frames];
+    planar.extend(std::iter::repeat_n(-0.5f32, frames));
+    let wav = crate::inference::media::audio_io::write_wav_planar(&planar, 2, frames, rate);
+    let (p, channels, r) = decode_audio_planar(&wav).expect("planar");
+    assert_eq!((channels, r, p.len()), (2, rate, 2 * frames));
+    let inter = decode_audio_stereo_interleaved_44k(&wav).expect("interleaved");
+    assert_eq!(inter.len(), 2 * frames);
+    assert!(inter[0] > 0.4 && inter[1] < -0.4, "{:?}", &inter[..2]);
+    // Another rate is resampled to the model's, per channel.
+    let wav48 = crate::inference::media::audio_io::write_wav_planar(&planar, 2, frames, 48_000);
+    let (l, r) = decode_audio_stereo(&wav48, rate).expect("resampled");
+    let want = frames * rate as usize / 48_000;
+    assert!(
+        (l.len() as i64 - want as i64).abs() <= 2,
+        "{} vs {want}",
+        l.len()
+    );
+    assert!(l[l.len() / 2] > 0.4 && r[r.len() / 2] < -0.4);
 }

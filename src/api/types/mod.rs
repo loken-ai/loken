@@ -887,6 +887,12 @@ pub(crate) fn data_url_base64(url: &str) -> Option<&str> {
     meta.ends_with(";base64").then_some(payload)
 }
 
+/// The base64 a field carries, given bare or as a `data:<type>;base64,` URL - the form
+/// a browser's FileReader hands a web client.
+pub(crate) fn base64_payload(s: &str) -> &str {
+    data_url_base64(s).unwrap_or(s)
+}
+
 impl TryFrom<MessageWire> for Message {
     type Error = String;
     fn try_from(w: MessageWire) -> Result<Self, String> {
@@ -1949,5 +1955,14 @@ mod usage_tests {
         assert_eq!(u.completion_tokens, 9);
         assert_eq!(u.total_tokens, 109);
         assert_eq!(u.prompt_tokens_details.unwrap().cached_tokens, 60);
+    }
+
+    /// One reading of a base64 field for every route: bare, or a data URL.
+    #[test]
+    fn a_base64_field_is_read_bare_or_as_a_data_url() {
+        assert_eq!(base64_payload("QUJD"), "QUJD");
+        assert_eq!(base64_payload("data:audio/wav;base64,QUJD"), "QUJD");
+        assert_eq!(base64_payload("data:image/png;base64,QUJD"), "QUJD");
+        assert_eq!(data_url_base64("data:text/plain,hello"), None);
     }
 }

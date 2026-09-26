@@ -16,6 +16,8 @@ mod video;
 pub(crate) use video::*;
 mod respond;
 pub(crate) use respond::*;
+mod upload;
+pub(crate) use upload::*;
 
 #[cfg(test)]
 mod tests;

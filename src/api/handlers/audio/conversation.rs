@@ -474,7 +474,8 @@ pub(crate) async fn conversation_handler(
     // way a direct image request does; the peer classifies the turn again and renders.
     #[cfg(feature = "image")]
     if route == ConvRoute::ImageGen {
-        let model = s("image_model").unwrap_or_else(|| "z-image".to_string());
+        let model = s("image_model")
+            .unwrap_or_else(|| crate::api::handlers::media::DEFAULT_IMAGE_MODEL.to_string());
         let hot = match crate::api::handlers::media::image_model_defaults(&model) {
             Ok(d) => crate::api::handlers::media::image_hot_bytes(
                 &state,
@@ -646,12 +647,14 @@ pub(crate) async fn conversation_handler(
         }
         #[cfg(feature = "image")]
         ConvRoute::ImageGen if want_stream => {
-            let model = s("image_model").unwrap_or_else(|| "z-image".to_string());
+            let model = s("image_model")
+                .unwrap_or_else(|| crate::api::handlers::media::DEFAULT_IMAGE_MODEL.to_string());
             conversation_image_stream(state, model, user_text, conversation_id, routed_by).await
         }
         #[cfg(feature = "image")]
         ConvRoute::ImageGen => {
-            let model = s("image_model").unwrap_or_else(|| "z-image".to_string());
+            let model = s("image_model")
+                .unwrap_or_else(|| crate::api::handlers::media::DEFAULT_IMAGE_MODEL.to_string());
             // One media job at a time, and this turn listed from its load on: the
             // load is most of the wait, and a listing that misses it says idle.
             let _media_guard = state.media_lock_for(&model, "image").await;
@@ -832,35 +835,12 @@ pub(crate) async fn voice_handler(
         Ok(b) => b,
         Err(e) => return conv_err(StatusCode::BAD_REQUEST, &e),
     };
-    let (samples, sr) = match decode_audio_blocking(bytes, "audio").await {
-        Ok(v) => v,
-        Err((code, e)) => return conv_err(code, &e),
-    };
     let asr_model = s("asr_model").unwrap_or_else(|| "whisper-small".to_string());
-    if let Err(e) = ensure_whisper_model_loaded(&state, Some(&asr_model)).await {
-        return conv_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("asr model load: {e}"),
-        );
-    }
-    let asr_params = AudioTranscribeParams {
-        language: None,
-        temperature: 0.0,
-        task: WhisperTask::Transcribe,
-        timestamps: false,
-        collect_metrics: false,
-        initial_prompt: None,
-    };
     let asr_job = state.media_note(&asr_model, "transcription");
     let (transcript, detected_lang) =
-        match state.audio_engine.transcribe(samples, sr, asr_params).await {
+        match decode_and_transcribe(&state, bytes, Some(&asr_model), plain_transcription()).await {
             Ok(r) => (r.text.trim().to_string(), r.language),
-            Err(e) => {
-                return conv_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("transcribe: {e}"),
-                )
-            }
+            Err((code, e)) => return conv_err(code, &e),
         };
 
     // -- 2. LLM reply (transcript folded into the shared history) ---------
