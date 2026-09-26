@@ -648,7 +648,7 @@ impl FusedMoeGGUF {
             // GH_PROF: per-stage µs sums over the fast path (same knob as the
             // generic-transformer hooks - FusedMoeGGUF bypasses those, so
             // qwen3-coder-class MoE decode was otherwise unprofilable).
-            let prof_t0: Option<std::time::Instant> = if std::env::var("GH_PROF").is_ok() {
+            let prof_t0: Option<std::time::Instant> = if tracing::enabled!(tracing::Level::DEBUG) {
                 Some(std::time::Instant::now())
             } else {
                 None

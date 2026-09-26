@@ -60,11 +60,11 @@ impl Umt5Encoder {
     /// `encode` casts the additive bias it builds to the active tensors' dtype, so the math
     /// stays consistent.
     pub fn from_pth_dtype(path: &str, device: Device, dtype: crate::tensor::DType) -> Result<Self> {
-        let _prof = std::env::var("UMT5_PROF").is_ok();
+        let _prof = tracing::enabled!(tracing::Level::DEBUG);
         let _t0 = std::time::Instant::now();
         let raw: HashMap<String, Tensor> = read_pt(path)?;
         if _prof {
-            eprintln!(
+            tracing::debug!(
                 "[umt5-prof] read_pt (parse+parallel decode): {:.1}s",
                 _t0.elapsed().as_secs_f64()
             );
@@ -103,7 +103,7 @@ impl Umt5Encoder {
         }
         let final_norm = rms("norm")?;
         if _prof {
-            eprintln!(
+            tracing::debug!(
                 "[umt5-prof] to_dtype({dtype:?})+to_device+assembly: {:.1}s",
                 _t1.elapsed().as_secs_f64()
             );

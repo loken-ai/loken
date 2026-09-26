@@ -258,7 +258,7 @@ pub fn generate(
     // Streaming KV cache: the Helium attends the accumulated K/V (O(1) per step) instead
     // of re-running the whole history each step, and reuses the constant cross-attn K/V.
     let mut kv = lm.new_cache(&cross)?;
-    let timing = std::env::var("KYUTAI_DEBUG").is_ok();
+    let timing = tracing::enabled!(tracing::Level::DEBUG);
     let (mut t_lm, mut t_dep) = (0u128, 0u128);
     for offset in 0..MAX_GEN {
         if let Some(end) = st.end_step {

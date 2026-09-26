@@ -229,15 +229,9 @@ pub fn render_with_progress(
     let sched = VPredScheduler::new(steps);
     let in_chans = dit.in_chans();
     let t0 = std::time::Instant::now();
-    let bypass = std::env::var("EZ_BYPASS").is_ok(); // decode raw noise latent (VAE isolation)
-                                                     // Faithful UDiT input = cat([noisy, mask_embed, ones]) ("ncm"), the exact MaskDiT.forward
-                                                     // assembly. This became correct once the block residual gating was fixed to (1 - gate)
-                                                     // (inference/model/ezaudio/dit.rs) - per-tensor oracle vs torch now matches cos≈1.0 at every stage.
+    // UDiT input = cat([noisy, mask_embed, ones]) ("ncm"), the MaskDiT.forward assembly.
     let mask_embed = dit.mask_embed().to_vec();
     for i in 0..sched.timesteps.len() {
-        if bypass {
-            break;
-        }
         crate::inference::serve::cancel::scoped::bail()?;
         let ts = sched.timesteps[i] as f32;
         let xin = assemble_input(&latent, &mask_embed, t, in_chans, mask_val);
@@ -268,7 +262,7 @@ pub fn render_with_progress(
         } else {
             v_cond
         };
-        if std::env::var("EZ_DEBUG").is_ok() && (i == 0 || i + 1 == sched.timesteps.len()) {
+        if tracing::enabled!(tracing::Level::DEBUG) && (i == 0 || i + 1 == sched.timesteps.len()) {
             let st = |a: &[f32]| {
                 let m = a.iter().sum::<f32>() / a.len() as f32;
                 let sd = (a.iter().map(|x| (x - m).powi(2)).sum::<f32>() / a.len() as f32).sqrt();
@@ -276,7 +270,7 @@ pub fn render_with_progress(
             };
             let (vm, vs, vx) = st(&v);
             let (lm, ls, lx) = st(&latent);
-            eprintln!("[ez-dbg] step{i} t={ts} v(mean={vm:.4} std={vs:.4} max={vx:.4}) latent_in(mean={lm:.4} std={ls:.4} max={lx:.4})");
+            tracing::debug!("[ez-dbg] step{i} t={ts} v(mean={vm:.4} std={vs:.4} max={vx:.4}) latent_in(mean={lm:.4} std={ls:.4} max={lx:.4})");
         }
         latent = sched.step(i, &latent, &v);
         on_step(
@@ -285,10 +279,10 @@ pub fn render_with_progress(
             sched.timesteps.len(),
         );
     }
-    if std::env::var("EZ_DEBUG").is_ok() {
+    if tracing::enabled!(tracing::Level::DEBUG) {
         let m = latent.iter().sum::<f32>() / latent.len() as f32;
         let sd = (latent.iter().map(|x| (x - m).powi(2)).sum::<f32>() / latent.len() as f32).sqrt();
-        eprintln!("[ez-dbg] FINAL latent mean={m:.4} std={sd:.4}");
+        tracing::debug!("[ez-dbg] FINAL latent mean={m:.4} std={sd:.4}");
     }
     eprintln!(
         "[ezaudio] {} diffusion steps in {:.1}s",

@@ -1468,7 +1468,7 @@ impl Qwen3Lm {
         // Any capture or replay error falls back to eager for the rest of the run.
         #[cfg(feature = "cuda")]
         let mut use_graph = self.device.is_cuda() && self.on_one_card() && self.graph_enabled;
-        let _prof = std::env::var("ACE_LM_PROF").is_ok();
+        let _prof = tracing::enabled!(tracing::Level::DEBUG);
         let (mut _t_s, mut _t_f, mut _t_l) = (0f64, 0f64, 0f64);
         loop {
             let _ps = std::time::Instant::now();
@@ -1550,7 +1550,7 @@ impl Qwen3Lm {
         }
         if _prof {
             let n = codes.len().max(1) as f64;
-            eprintln!("[ace-lm-prof] {} codes | sample(host)={:.1}ms ({:.2}ms/c) | forward(launch)={:.1}ms ({:.2}ms/c) | logits+download(sync)={:.1}ms ({:.2}ms/c)",
+            tracing::debug!("[ace-lm-prof] {} codes | sample(host)={:.1}ms ({:.2}ms/c) | forward(launch)={:.1}ms ({:.2}ms/c) | logits+download(sync)={:.1}ms ({:.2}ms/c)",
                 codes.len(), _t_s*1e3, _t_s*1e3/n, _t_f*1e3, _t_f*1e3/n, _t_l*1e3, _t_l*1e3/n);
         }
         // Release the captured graph BEFORE the arena it references (the graph's nodes

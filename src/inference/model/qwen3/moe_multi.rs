@@ -584,7 +584,7 @@ impl Attn {
             // Multi-token paths (prefill, PLD verify batches) still need
             // full F-dtype K, V for attention, so we dequantise the cache.
             // KV-append profiling kept disabled (development diagnostic).
-            let profile = std::env::var("GH_PROF").is_ok();
+            let profile = tracing::enabled!(tracing::Level::DEBUG);
             let t_append = if profile {
                 let _ = k.device().synchronize();
                 Some(std::time::Instant::now())
@@ -1710,7 +1710,7 @@ impl MultiDeviceQwen3MoE {
         // Feeding only the first left `/api/stage_perf` answering zero for this model
         // rather than saying it could not see it.
         use crate::inference::place::layer_perf::stages;
-        let printing = std::env::var("GH_PROF").is_ok();
+        let printing = tracing::enabled!(tracing::Level::DEBUG);
         let profile = printing || stages::enabled();
         let mut t_attn_norm_us: u128 = 0;
         let mut t_attn_us: u128 = 0;

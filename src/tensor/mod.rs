@@ -77,7 +77,7 @@ pub mod bounce {
 
     fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var("NATIVE_BOUNCE").is_ok_and(|v| !v.is_empty() && v != "0"))
+        *ON.get_or_init(|| tracing::enabled!(tracing::Level::DEBUG))
     }
 
     type Stats = Mutex<HashMap<String, (u64, f64)>>;

@@ -26,26 +26,12 @@
 //! forward stage matches cos≈1.0 (patch_embed, AdaLN-SOLA modulation, qk-norm+RoPE attn,
 //! GEGLU, cross-attn, block/mid/out outputs, final). The one fidelity bug found & fixed:
 //! the block residual gate is `(1 - gate)`, not `gate` (blocks.py `DiTBlock._forward`).
-//! Set `EZ_DUMP_DIR` to re-dump per-stage activations for the A/B.
 
 use crate::inference::model::ezaudio::vae::ezaudio_pt;
 use crate::tensor::layer::{same_length_1d, Conv1d, Conv1dConfig, LayerNorm, Linear};
 use crate::tensor::{DType, Device, Error, Result, Tensor};
 
 const LN_EPS: f32 = 1e-5; // LayerNorm default eps (norm_layer = layernorm)
-
-/// Dev-only per-stage activation dump (env `EZ_DUMP_DIR`) for the torch oracle A/B.
-/// No-op unless the env var is set. Writes raw little-endian f32 to `{dir}/{tag}.bin`.
-fn ez_dump(tag: &str, t: &Tensor) {
-    if let Ok(dir) = std::env::var("EZ_DUMP_DIR") {
-        let v = t.to_vec_f32();
-        let mut bytes = Vec::with_capacity(v.len() * 4);
-        for x in &v {
-            bytes.extend_from_slice(&x.to_le_bytes());
-        }
-        let _ = std::fs::write(format!("{dir}/{tag}.bin"), bytes);
-    }
-}
 
 /// One attention sub-module (self- or cross-attention). `to_{q,k,v}` are bias-free
 /// projections; `proj` (the output) carries a bias. `norm_q`/`norm_k` are the qk-norm
@@ -441,7 +427,6 @@ impl EzAudioDiT {
         s: usize,
         sc: usize,
         skip: Option<&Tensor>,
-        tag: &str,
     ) -> Result<Tensor> {
         let h = self.hidden;
         // U-Net skip: concat([x, skip]) -> skip_norm (over 2H) -> skip_linear (-> H).
@@ -456,9 +441,6 @@ impl EzAudioDiT {
             .forward(&b.adaln.lora_a.forward(c)?)?
             .affine(b.adaln.lora_scale, 0.0)?;
         let ada = b.adaln.scale_shift_table.add(t0)?.add(&sola)?; // [1, 6H]
-        if tag == "b0" {
-            ez_dump("b0_adaln", &ada);
-        }
         let part = |i: usize| ada.narrow(1, i * h, h);
         // chunk order: shift_sa, scale_sa, gate_sa, shift_mlp, scale_mlp, gate_mlp.
         let (shift_sa, scale_sa, gate_sa) = (part(0)?, part(1)?, part(2)?);
@@ -467,23 +449,14 @@ impl EzAudioDiT {
         // self-attn (AdaLN-modulated norm -> attn -> (1-gate) residual). The reference gates
         // the residual with (1 - gate), NOT gate (blocks.py DiTBlock._forward).
         let n1 = b.norm1.forward(&x)?;
-        if tag == "b0" {
-            ez_dump("b0_norm1", &n1);
-        }
         let norm_sa = crate::inference::model::adaln::modulate(&n1, &shift_sa, &scale_sa)?;
         let sa = self.attention(&b.attn, &norm_sa, &norm_sa, s, s, Some(rope))?;
-        if tag == "b0" {
-            ez_dump("b0_attn", &sa);
-        }
         x = x.add(&sa.broadcast_mul(&gate_sa.affine(-1.0, 1.0)?)?)?;
 
         // cross-attn (plain LayerNorm query + context, ungated residual).
         let q_in = b.norm2.forward(&x)?;
         let kv_in = b.norm_context.forward(ctx)?;
         let ca = self.attention(&b.cross_attn, &q_in, &kv_in, s, sc, None)?;
-        if tag == "b0" {
-            ez_dump("b0_cross", &ca);
-        }
         x = x.add(&ca)?;
 
         // GEGLU MLP (AdaLN-modulated norm -> geglu -> (1-gate) residual).
@@ -493,13 +466,7 @@ impl EzAudioDiT {
             &scale_mlp,
         )?;
         let mlp = self.geglu(b, &norm_mlp)?;
-        if tag == "b0" {
-            ez_dump("b0_mlp", &mlp);
-        }
         x = x.add(&mlp.broadcast_mul(&gate_mlp.affine(-1.0, 1.0)?)?)?;
-        if !tag.is_empty() {
-            ez_dump(&format!("{tag}_out"), &x);
-        }
         Ok(x)
     }
 
@@ -524,7 +491,6 @@ impl EzAudioDiT {
         let pe = self.patch_embed.forward(&x_dev.unsqueeze(0)?)?; // [1, H, S]
         let s = pe.dims()[2];
         let mut x = pe.squeeze(0)?.transpose(0, 1)?.contiguous()?; // [S, H]
-        ez_dump("patch_embed", &x);
 
         // timestep -> sinusoid(256) -> MLP -> temb [1, H]; c = silu(temb) drives AdaLN.
         let sin = crate::inference::model::acestep::dit::timestep_embedding(t, 256, 10000.0); // [256]
@@ -561,26 +527,10 @@ impl EzAudioDiT {
         let mut skips: Vec<Tensor> = Vec::with_capacity(self.in_blocks.len());
         let on = |t: &Tensor, d: &Device| -> Result<Tensor> { t.to_device(d) };
         for (i, b) in self.in_blocks.iter().enumerate() {
-            let tag = match i {
-                0 => "b0",
-                1 => "b1",
-                _ => "",
-            };
             let d = &self.block_devices[i];
             let (t0d, cd, ctxd) = (on(&t0, d)?, on(&c, d)?, on(&ctx_e, d)?);
             let (cosd, sind) = (on(&cos, d)?, on(&sin_t, d)?);
-            x = self.block_forward(
-                b,
-                on(&x, d)?,
-                &t0d,
-                &cd,
-                &ctxd,
-                (&cosd, &sind),
-                s,
-                sc,
-                None,
-                tag,
-            )?;
+            x = self.block_forward(b, on(&x, d)?, &t0d, &cd, &ctxd, (&cosd, &sind), s, sc, None)?;
             skips.push(x.clone());
         }
         {
@@ -597,7 +547,6 @@ impl EzAudioDiT {
                 s,
                 sc,
                 None,
-                "mid",
             )?;
         }
         let out_base = self.in_blocks.len() + 1;
@@ -605,7 +554,6 @@ impl EzAudioDiT {
             let skip = skips
                 .pop()
                 .ok_or_else(|| Error("ezaudio-dit: skip stack underflow".into()))?;
-            let tag = if i == 0 { "out0" } else { "" };
             let d = &self.block_devices[out_base + i];
             let (t0d, cd, ctxd) = (on(&t0, d)?, on(&c, d)?, on(&ctx_e, d)?);
             let (cosd, sind) = (on(&cos, d)?, on(&sin_t, d)?);
@@ -619,7 +567,6 @@ impl EzAudioDiT {
                 s,
                 sc,
                 Some(&on(&skip, d)?),
-                tag,
             )?;
         }
         // Back where the caller handed it in, for the head.
@@ -639,7 +586,6 @@ impl EzAudioDiT {
         let out = self.final_conv.forward(&xc)?; // [1, out_chans, T]
         debug_assert_eq!(out.dims(), &[self.out_chans, t_len]);
         let out = out.squeeze(0)?;
-        ez_dump("final", &out);
         Ok(out)
     }
 }
