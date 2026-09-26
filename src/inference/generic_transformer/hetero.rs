@@ -1057,6 +1057,10 @@ impl GenericHeteroTransformer {
         if let Some(c) = l.q8_kv_cache.as_ref() {
             n = n.max(c.current_seq_len());
         }
+        #[cfg(feature = "cuda")]
+        if let Some(c) = l.q4_kv_cache.as_ref() {
+            n = n.max(c.current_seq_len());
+        }
         if let Some(c) = l.cpu_q8_kv.as_ref() {
             n = n.max(c.len());
         }

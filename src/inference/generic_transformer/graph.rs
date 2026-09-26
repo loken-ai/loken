@@ -601,25 +601,30 @@ impl GenericHeteroTransformer {
         // ROOT CAUSE FIX: drop model-level captured-region tensor handles
         // so cuMemFree can reclaim their memory now that graph is torn down.
         self.graph_alive_tensors_model.clear();
-        // Release the Q8 capture bookkeeping: with the graph gone the
-        // buffers may grow again and the frozen seq ceiling no longer
-        // applies (`update_graph_state` would otherwise keep erroring).
+        // Release the quantised caches' capture bookkeeping: with the graph gone the
+        // buffers may grow again and the frozen seq ceiling no longer applies.
         #[cfg(feature = "cuda")]
         for l in &mut self.layers {
             if let Some(c) = l.q8_kv_cache.as_mut() {
+                c.clear_graph_captured();
+            }
+            if let Some(c) = l.q4_kv_cache.as_mut() {
                 c.clear_graph_captured();
             }
         }
     }
 
     /// Engine hook: a CUDA graph referencing the per-layer KV buffers is
-    /// now live. Freezes each Q8 cache's growth + seq ceiling (see
-    /// `Q8KvCache::mark_graph_captured`). Paired with
-    /// `invalidate_graph_state` which clears it on teardown.
+    /// now live. Freezes each quantised cache's growth + seq ceiling (see
+    /// `KvCore::mark_captured`). Paired with `invalidate_graph_state`
+    /// which clears it on teardown.
     #[cfg(feature = "cuda")]
     pub fn mark_graph_captured(&mut self) {
         for l in &mut self.layers {
             if let Some(c) = l.q8_kv_cache.as_mut() {
+                c.mark_graph_captured();
+            }
+            if let Some(c) = l.q4_kv_cache.as_mut() {
                 c.mark_graph_captured();
             }
         }
@@ -637,6 +642,9 @@ impl GenericHeteroTransformer {
     pub fn sync_kv_len_for_graph(&mut self, len: usize) {
         for l in &mut self.layers {
             if let Some(c) = l.q8_kv_cache.as_mut() {
+                c.set_seq_len_for_graph(len);
+            }
+            if let Some(c) = l.q4_kv_cache.as_mut() {
                 c.set_seq_len_for_graph(len);
             }
         }
@@ -657,10 +665,15 @@ impl GenericHeteroTransformer {
         // eager path (or re-captures at the wider state).
         #[cfg(feature = "cuda")]
         for (i, l) in self.layers.iter().enumerate() {
-            if let Some(limit) = l.q8_kv_cache.as_ref().and_then(|c| c.graph_seq_limit()) {
+            let limit = l
+                .q8_kv_cache
+                .as_ref()
+                .and_then(|c| c.graph_seq_limit())
+                .or_else(|| l.q4_kv_cache.as_ref().and_then(|c| c.graph_seq_limit()));
+            if let Some(limit) = limit {
                 if pos + 1 > limit {
                     return Err(crate::tensor::Error::msg(format!(
-                        "graph_state: pos {} outgrew captured Q8 seq ceiling {} (layer {}). \
+                        "graph_state: pos {} outgrew captured KV seq ceiling {} (layer {}). \
                          Caller should invalidate the captured graph.",
                         pos, limit, i
                     )));

@@ -30,6 +30,7 @@
 //! block's content into the residual buffer, so subsequent appends see
 //! consistent state. Cost: one block dequant per trim event - small.
 
+use super::kv_core::{DevPos, KvCore};
 use crate::inference::quantized_cuda::dequantize_q4_0_blob_f16;
 use crate::tensor::cuda_ext::{
     tensor_from_cuda_storage, CudaSlice, CudaStorage, DevicePtr, RawCudaDevice as CudaDevice,
@@ -100,28 +101,15 @@ pub struct Q4KvCache {
     v_q4: CudaSlice<u8>,
     v_staging_decode: QCudaStorage,
 
-    current_seq_len: usize,
-    /// Currently allocated capacity in tokens, rounded up to a block
-    /// boundary by `current_capacity_blocks`. Lazy - grows on append.
-    current_capacity_tokens: usize,
-    /// Currently allocated number of Q4 blocks for k_q4_blocks. Equal
-    /// to `current_capacity_tokens.div_ceil(BLOCK_SIZE)`.
-    current_capacity_blocks: usize,
-    /// Hard cap on capacity - appends past it error out.
-    max_seq_len: usize,
+    /// Length, capacity (tokens), device position and graph state (see `KvCore`).
+    core: KvCore,
+    /// Device position read by the replay-safe append and attention kernels; valid while
+    /// `core` is primed. Primed selects the device-slot kernels, unprimed the host-int ones.
+    pos: DevPos,
     n_kv_heads: usize,
     head_dim: usize,
     device: Device,
     cuda_device: CudaDevice,
-
-    /// Single-element i32 device tensor holding the current write
-    /// position (= current_seq_len). Host-side `update_graph_state(pos)`
-    /// writes new values into this slot OUTSIDE the captured CUDA-graph
-    /// region; the device-pos variants of the append kernels read it on
-    /// every replay. None until the first call to `update_graph_state`
-    /// - in non-graph mode this stays None and the host-int kernel
-    /// variants are used.
-    cur_pos_dev: Option<CudaSlice<i32>>,
 }
 
 impl Q4KvCache {
@@ -149,6 +137,7 @@ impl Q4KvCache {
             .min(max_seq_len)
             .max(q4_0_block_size());
         let current_capacity_blocks = current_capacity_tokens.div_ceil(q4_0_block_size());
+        let pos = DevPos::new(&cuda_device)?;
 
         // K blocks: one 18-byte Q4_0 block per (seq_block, head, channel).
         let k_bytes = current_capacity_blocks * n_kv_heads * head_dim * q4_0_type_size();
@@ -177,45 +166,33 @@ impl Q4KvCache {
             k_residual_staging,
             v_q4,
             v_staging_decode,
-            current_seq_len: 0,
-            current_capacity_tokens,
-            current_capacity_blocks,
-            max_seq_len,
+            core: KvCore::new(current_capacity_tokens, max_seq_len),
+            pos,
             n_kv_heads,
             head_dim,
             device: device.clone(),
             cuda_device,
-            cur_pos_dev: None,
         })
+    }
+
+    /// Allocated capacity in K blocks: the capacity in tokens rounded up to whole blocks.
+    fn capacity_blocks(&self) -> usize {
+        self.core.cap().div_ceil(q4_0_block_size())
     }
 
     /// Grow the K/V buffers to hold at least `new_cap` tokens. Doubles
     /// the current capacity (clamped to `max_seq_len`).
     ///
-    /// **Fails if a graph has been captured** (`cur_pos_dev.is_some()`).
-    /// The captured graph bakes both the buffer base pointer (which
-    /// changes on realloc) and `current_capacity_blocks` as the
-    /// stride into kernel launches. Re-capturing requires the engine
-    /// to call `invalidate_graph_state()` first; we surface the error
-    /// up so the engine can take that action.
+    /// Refused while a graph is live: the recorded kernels hold the buffer base pointers and
+    /// the block stride, both of which a reallocation changes.
     fn grow_to(&mut self, new_cap_tokens: usize) -> Result<()> {
-        if self.cur_pos_dev.is_some() {
-            return Err(anyhow!(
-                "Q4KvCache::grow_to: cannot grow after CUDA graph has been captured \
-                 (current_capacity={}, requested={}, max_seq_len={}). The captured graph \
-                 bakes the buffer pointer + stride into kernel launches; engine must call \
-                 invalidate_graph_state() before retrying.",
-                self.current_capacity_tokens,
-                new_cap_tokens,
-                self.max_seq_len
-            ));
-        }
-        let target_tokens = new_cap_tokens
-            .max(self.current_capacity_tokens * 2)
-            .min(self.max_seq_len);
-        if target_tokens <= self.current_capacity_tokens {
+        let Some(target_tokens) = self
+            .core
+            .grow_target(new_cap_tokens)
+            .map_err(|e| anyhow!("Q4KvCache::grow_to: {e}"))?
+        else {
             return Ok(());
-        }
+        };
         // Try the amortized geometric target first; on a GPU OOM, retry with the
         // EXACT requested capacity (`new_cap_tokens`) before propagating - keeps a
         // near-full GPU growing one chunk at a time. A genuine OOM at the minimal
@@ -236,9 +213,7 @@ impl Q4KvCache {
         let (target_tokens, target_blocks, mut new_k, mut new_v) = match alloc_for(target_tokens) {
             Ok(t) => t,
             Err(e) if is_oom(&e) && new_cap_tokens < target_tokens => {
-                let minimal = new_cap_tokens
-                    .max(self.current_capacity_tokens + 1)
-                    .min(self.max_seq_len);
+                let minimal = self.core.minimal_target(new_cap_tokens);
                 tracing::warn!(
                     "Q4KvCache::grow_to: doubled target {target_tokens} OOM'd ({e}); retrying minimal capacity {minimal}"
                 );
@@ -247,13 +222,13 @@ impl Q4KvCache {
             Err(e) => return Err(e),
         };
 
-        if self.current_seq_len > 0 {
+        if !self.core.is_empty() {
             // Copy used prefix of K blocks: blocks [0, current_seq_blocks),
             // where current_seq_blocks covers everything actually written
             // (including the currently-in-flight partial block if any).
-            let current_seq_blocks = self.current_seq_len.div_ceil(q4_0_block_size());
+            let current_seq_blocks = self.core.len().div_ceil(q4_0_block_size());
             let used_k = current_seq_blocks * self.n_kv_heads * self.head_dim * q4_0_type_size();
-            let used_v = self.current_seq_len
+            let used_v = self.core.len()
                 * self.n_kv_heads
                 * (self.head_dim / q4_0_block_size())
                 * q4_0_type_size();
@@ -277,96 +252,76 @@ impl Q4KvCache {
 
         tracing::debug!(
             "Q4KvCache: grew capacity {} -> {} tokens ({} -> {} blocks)",
-            self.current_capacity_tokens,
+            self.core.cap(),
             target_tokens,
-            self.current_capacity_blocks,
+            self.capacity_blocks(),
             target_blocks,
         );
         self.k_q4_blocks = new_k;
         self.v_q4 = new_v;
-        self.current_capacity_tokens = target_tokens;
-        self.current_capacity_blocks = target_blocks;
+        self.core.set_cap(target_tokens);
         Ok(())
     }
 
-    /// Push the current write position into a device-side i32 tensor.
-    /// Required for CUDA graph capture of Q4 KV append - the captured
-    /// kernels read their offsets from this device pointer, while the
-    /// host updates it OUTSIDE the captured region each token via
-    /// `update_graph_state(pos)`.
-    ///
-    /// Allocated lazily on first call. Subsequent calls do a small
-    /// host-to-device copy (4 bytes) to refresh the position.
+    /// Names `pos` (the length before the upcoming append) as the slot the next replay writes,
+    /// copying it to the device only when it changed. Once primed, appends take the
+    /// device-slot kernels.
     pub fn update_graph_state(&mut self, pos: usize) -> Result<()> {
-        let val: [i32; 1] = [pos as i32];
-        // First call: allocate the device slot. Subsequent calls: memcpy into
-        // the same pointer so graph-replay sees a fixed device address.
-        match self.cur_pos_dev.as_mut() {
-            Some(dst) => {
-                self.cuda_device
-                    .cuda_stream()
-                    .memcpy_htod(val.as_slice(), dst)
-                    .map_err(|e| anyhow!("Q4KvCache::update_graph_state copy: {e}"))?;
-            }
-            None => {
-                let slice: CudaSlice<i32> = self
-                    .cuda_device
-                    .cuda_stream()
-                    .clone_htod(val.as_slice())
-                    .map_err(|e| anyhow!("Q4KvCache::update_graph_state alloc: {e}"))?;
-                self.cur_pos_dev = Some(slice);
-            }
+        if self.core.prime(pos) {
+            self.pos.write(&self.cuda_device, pos)?;
         }
         Ok(())
     }
 
-    /// Returns the device pointer to the current-position i32 tensor,
-    /// or None if `update_graph_state` has never been called. Append
-    /// paths use this to pick between the host-int and device-pos
-    /// kernel variants.
+    /// The device position, while primed.
     pub fn cur_pos_dev_ptr(&self) -> Option<&CudaSlice<i32>> {
-        self.cur_pos_dev.as_ref()
+        self.core.is_primed().then_some(self.pos.slice())
     }
 
     pub fn current_seq_len(&self) -> usize {
-        self.current_seq_len
+        self.core.len()
     }
 
+    /// A CUDA graph recorded against these buffers is live (see `KvCore::mark_captured`).
+    pub fn mark_graph_captured(&mut self) {
+        self.core.mark_captured();
+    }
+
+    pub fn clear_graph_captured(&mut self) {
+        self.core.clear_captured();
+    }
+
+    /// Sequence-length ceiling of the live graph; `None` when no graph is live.
+    pub fn graph_seq_limit(&self) -> Option<usize> {
+        self.core.seq_limit()
+    }
+
+    /// Host length after a replayed token, which advanced the cache on the device only.
+    pub fn set_seq_len_for_graph(&mut self, len: usize) {
+        self.core.sync_len(len);
+    }
+
+    /// Empties the cache for a new request (see `KvCore::trim_to`). Buffers are not zeroed:
+    /// reads stop at the length and residual slots are written before they are read.
     pub fn reset(&mut self) {
-        self.current_seq_len = 0;
-        // Drop the device-pos tensor so prefill goes back to the host-int
-        // append path. A stale `cur_pos_dev` from a previous request
-        // would make every prefill token's append read the LAST decode's
-        // pos (= slot from prior turn), overwriting the residual at one
-        // wrong slot. The engine re-primes via `update_graph_state(pos)`
-        // before the first decode call of the next graph cycle.
-        // Don't bother zeroing buffers - `dequantize_kv` only reads up to
-        // current_seq_len and residual slots are overwritten before read.
-        self.cur_pos_dev = None;
+        self.core.reset();
     }
 
     /// Trim to `new_len`. If the trim lands inside a previously-flushed
     /// K block, dequantize that block back into the residual so the next
     /// append has consistent state.
     pub fn trim_to(&mut self, new_len: usize) -> Result<()> {
-        let new_len = new_len.min(self.current_seq_len);
-        if new_len == self.current_seq_len {
-            return Ok(());
-        }
-
-        let old_block = self.current_seq_len.div_ceil(q4_0_block_size()); // number of flushed blocks
+        let old_len = self.core.trim_to(new_len);
+        let new_len = self.core.len();
+        let flushed_blocks = old_len / q4_0_block_size();
         let new_block = new_len / q4_0_block_size();
         let new_slot = new_len % q4_0_block_size();
 
-        // If trim reached back into a block that was already flushed
-        // (new_block is strictly less than what would have been the
-        // residual's block index, i.e. we lost our current partial data),
-        // repopulate residual from that flushed block.
-        if new_slot != 0 && new_block < old_block {
+        // A trim that lands inside a flushed block has lost that block's residual: rebuild it
+        // from the block. A trim inside the current partial block keeps its residual as is.
+        if new_slot != 0 && new_block < flushed_blocks {
             self.dequant_block_to_residual(new_block)?;
         }
-
-        self.current_seq_len = new_len;
         Ok(())
     }
 
@@ -396,27 +351,23 @@ impl Q4KvCache {
             ));
         }
         let n_new = k_dims[2];
-        if self.current_seq_len + n_new > self.max_seq_len {
-            return Err(anyhow!(
-                "Q4KvCache::append: would exceed max_seq_len {} (have {}, adding {})",
-                self.max_seq_len,
-                self.current_seq_len,
-                n_new
-            ));
-        }
+        let need = self
+            .core
+            .room_for(n_new)
+            .map_err(|e| anyhow!("Q4KvCache::append: {e}"))?;
 
         // Lazy growth: enlarge buffers if the append would exceed
         // current capacity. Fails cleanly if a CUDA graph has been
         // captured (the captured stride + base pointer would be stale).
-        if self.current_seq_len + n_new > self.current_capacity_tokens {
-            self.grow_to(self.current_seq_len + n_new)?;
+        if let Some(need) = need {
+            self.grow_to(need)?;
         }
 
         // Bulk fast path: when we start aligned to a 32-boundary and have at
         // least one full block worth of new tokens. Quantizes all
         // n_full_blocks*32 positions in a single launch each for K and V.
         let mut start = 0usize;
-        if self.current_seq_len.is_multiple_of(q4_0_block_size()) && n_new >= q4_0_block_size() {
+        if self.core.len().is_multiple_of(q4_0_block_size()) && n_new >= q4_0_block_size() {
             let n_full_blocks = n_new / q4_0_block_size();
             let bulk_seq = n_full_blocks * q4_0_block_size();
             self.append_bulk(k_new, v_new, bulk_seq)?;
@@ -428,14 +379,13 @@ impl Q4KvCache {
             let v_i = v_new.i((.., .., i..i + 1, ..))?;
             self.append_single_k(&k_i)?;
             self.append_single_v(&v_i)?;
-            self.current_seq_len += 1;
+            self.core.commit(1);
             // Host-side flush is skipped in graph mode - the conditional
             // dev-pos kernel launched inside `append_single_k` handles the
             // 32-window closing on the device side. This keeps the captured
             // launch list identical across replays.
-            if self.cur_pos_dev.is_none() && self.current_seq_len.is_multiple_of(q4_0_block_size())
-            {
-                self.flush_k_residual_to_blocks(self.current_seq_len / q4_0_block_size() - 1)?;
+            if !self.core.is_primed() && self.core.len().is_multiple_of(q4_0_block_size()) {
+                self.flush_k_residual_to_blocks(self.core.len() / q4_0_block_size() - 1)?;
             }
         }
         Ok(())
@@ -446,7 +396,7 @@ impl Q4KvCache {
     /// each side. Caller must guarantee `current_seq_len % 32 == 0`.
     fn append_bulk(&mut self, k_new: &Tensor, v_new: &Tensor, bulk_seq: usize) -> Result<()> {
         debug_assert!(bulk_seq.is_multiple_of(q4_0_block_size()));
-        debug_assert!(self.current_seq_len.is_multiple_of(q4_0_block_size()));
+        debug_assert!(self.core.len().is_multiple_of(q4_0_block_size()));
         let n_full_blocks = bulk_seq / q4_0_block_size();
 
         // ----- K bulk -----
@@ -483,7 +433,7 @@ impl Q4KvCache {
         let src_k = k_staging
             .data_slice_for_copy(k_total_bytes)
             .map_err(|e| anyhow!("Q4KvCache::append_bulk: K data_slice: {e}"))?;
-        let k_block_start = self.current_seq_len / q4_0_block_size();
+        let k_block_start = self.core.len() / q4_0_block_size();
         let k_dst_off = k_block_start * self.n_kv_heads * self.head_dim * q4_0_type_size();
         let mut k_dst = self
             .k_q4_blocks
@@ -519,13 +469,13 @@ impl Q4KvCache {
         let src_v = v_staging
             .data_slice_for_copy(v_total_bytes)
             .map_err(|e| anyhow!("Q4KvCache::append_bulk: V data_slice: {e}"))?;
-        let v_dst_off = self.current_seq_len * token_bytes;
+        let v_dst_off = self.core.len() * token_bytes;
         let mut v_dst = self.v_q4.slice_mut(v_dst_off..v_dst_off + v_total_bytes);
         self.cuda_device
             .memcpy_dtod(&src_v, &mut v_dst)
             .map_err(|e| anyhow!("Q4KvCache::append_bulk: V memcpy: {e}"))?;
 
-        self.current_seq_len += bulk_seq;
+        self.core.commit(bulk_seq);
         Ok(())
     }
 
@@ -552,7 +502,7 @@ impl Q4KvCache {
         let dst_ptr = self.k_residual.device_ptr(&stream).0 as *mut core::ffi::c_void;
         let stream_h = stream.cu_stream() as i64;
         unsafe {
-            if let Some(pos_dev) = self.cur_pos_dev.as_ref() {
+            if let Some(pos_dev) = self.core.is_primed().then_some(self.pos.slice()) {
                 let slot_ptr = pos_dev.device_ptr(&stream).0 as *const core::ffi::c_void;
                 crate::inference::moe_cuda::kv_residual_scatter_f16_dev_slot_raw(
                     src_ptr,
@@ -583,11 +533,11 @@ impl Q4KvCache {
                     slot_ptr,
                     self.n_kv_heads as i32,
                     self.head_dim as i32,
-                    self.current_capacity_blocks as i32,
+                    self.capacity_blocks() as i32,
                     stream_h,
                 );
             } else {
-                let slot = self.current_seq_len % q4_0_block_size();
+                let slot = self.core.len() % q4_0_block_size();
                 crate::inference::moe_cuda::kv_residual_scatter_f16_raw(
                     src_ptr,
                     dst_ptr,
@@ -707,7 +657,7 @@ impl Q4KvCache {
         // destination offset is computed from `cur_pos_dev[0]` at
         // replay time. Non-graph mode keeps the host-offset `memcpy_dtod`
         // - slightly cheaper because it bypasses kernel launch overhead.
-        if let Some(pos_dev) = self.cur_pos_dev.as_ref() {
+        if let Some(pos_dev) = self.core.is_primed().then_some(self.pos.slice()) {
             let stream = self.cuda_device.cuda_stream();
             let src_ptr = src_slice.device_ptr(&stream).0 as *const core::ffi::c_void;
             let dst_ptr = self.v_q4.device_ptr(&stream).0 as *mut core::ffi::c_void;
@@ -723,7 +673,7 @@ impl Q4KvCache {
                 );
             }
         } else {
-            let dst_byte_offset = self.current_seq_len * token_bytes;
+            let dst_byte_offset = self.core.len() * token_bytes;
             let mut dst_slice = self
                 .v_q4
                 .slice_mut(dst_byte_offset..dst_byte_offset + token_bytes);
@@ -737,7 +687,7 @@ impl Q4KvCache {
     /// Dequantize the full K and V caches into
     /// `[1, n_kv_heads, current_seq_len, head_dim]` F-dtype tensors.
     pub fn dequantize_kv(&self, dtype: DType) -> Result<(Tensor, Tensor)> {
-        let seq = self.current_seq_len;
+        let seq = self.core.len();
         if seq == 0 {
             return Err(anyhow!("Q4KvCache::dequantize_kv: cache is empty"));
         }
@@ -863,7 +813,7 @@ impl Q4KvCache {
     pub fn attn_scores(&self, q: &Tensor) -> Result<Tensor> {
         use crate::inference::quantized_cuda::attn_score_q4_0_f32_kivi;
 
-        let seq = self.current_seq_len;
+        let seq = self.core.len();
         if seq == 0 {
             return Err(anyhow!("Q4KvCache::attn_scores: cache is empty"));
         }
@@ -921,7 +871,7 @@ impl Q4KvCache {
     pub fn attn_softmax_output(&self, scores: &Tensor) -> Result<Tensor> {
         use crate::inference::quantized_cuda::attn_softmax_output_q4_0_f32_gqa;
 
-        let seq = self.current_seq_len;
+        let seq = self.core.len();
         if seq == 0 {
             return Err(anyhow!("Q4KvCache::attn_softmax_output: cache is empty"));
         }
@@ -969,7 +919,7 @@ impl Q4KvCache {
     /// context `[1,n_q,1,head_dim]` f32. hd∈{64,128}, GQA only.
     pub fn attn_flash_splitk_decode(&self, q: &Tensor, scale: f32) -> Result<Tensor> {
         use crate::inference::quantized_cuda::attn_flash_splitk_q4_gqa_decode;
-        let seq = self.current_seq_len;
+        let seq = self.core.len();
         if seq == 0 {
             return Err(anyhow!(
                 "Q4KvCache::attn_flash_splitk_decode: cache is empty"
@@ -1027,10 +977,14 @@ impl Q4KvCache {
     /// `[1,n_q,1,hd]` f32.
     pub fn attn_flash_splitk_decode_graph(&self, q: &Tensor, scale: f32) -> Result<Tensor> {
         use crate::inference::quantized_cuda::attn_flash_splitk_q4_gqa_decode_dev_pos;
-        let pos_dev = self.cur_pos_dev.as_ref().ok_or_else(|| {
-            anyhow!("Q4KvCache::attn_flash_splitk_decode_graph: update_graph_state not called")
-        })?;
-        let seq = self.current_seq_len;
+        let pos_dev = self
+            .core
+            .is_primed()
+            .then_some(self.pos.slice())
+            .ok_or_else(|| {
+                anyhow!("Q4KvCache::attn_flash_splitk_decode_graph: update_graph_state not called")
+            })?;
+        let seq = self.core.len();
         if seq == 0 {
             return Err(anyhow!(
                 "Q4KvCache::attn_flash_splitk_decode_graph: cache is empty"
@@ -1084,7 +1038,7 @@ impl Q4KvCache {
     pub fn attn_output(&self, probs: &Tensor) -> Result<Tensor> {
         use crate::inference::quantized_cuda::attn_output_q4_0_f32_gqa;
 
-        let seq = self.current_seq_len;
+        let seq = self.core.len();
         if seq == 0 {
             return Err(anyhow!("Q4KvCache::attn_output: cache is empty"));
         }
@@ -1150,7 +1104,7 @@ impl Q4KvCache {
         // capacity, and the graph attn kernel must not stride past it.
         // Still clamp to CAP to avoid the per-token grid overhead at
         // full 32 K context.
-        let full = self.current_capacity_blocks * q4_0_block_size();
+        let full = self.capacity_blocks() * q4_0_block_size();
         full.min(CAP)
     }
 
@@ -1167,9 +1121,13 @@ impl Q4KvCache {
     pub fn attn_scores_graph(&self, q: &Tensor) -> Result<Tensor> {
         use crate::inference::quantized_cuda::attn_score_q4_0_f32_kivi_dev_pos;
 
-        let pos_dev = self.cur_pos_dev.as_ref().ok_or_else(|| {
-            anyhow!("Q4KvCache::attn_scores_graph: update_graph_state has not been called")
-        })?;
+        let pos_dev = self
+            .core
+            .is_primed()
+            .then_some(self.pos.slice())
+            .ok_or_else(|| {
+                anyhow!("Q4KvCache::attn_scores_graph: update_graph_state has not been called")
+            })?;
         let dims = q.dims();
         if dims.len() != 4 || dims[0] != 1 || dims[2] != 1 || dims[3] != self.head_dim {
             return Err(anyhow!(
@@ -1224,9 +1182,13 @@ impl Q4KvCache {
     pub fn attn_output_graph(&self, probs: &Tensor) -> Result<Tensor> {
         use crate::inference::quantized_cuda::attn_output_q4_0_f32_dev_pos;
 
-        let pos_dev = self.cur_pos_dev.as_ref().ok_or_else(|| {
-            anyhow!("Q4KvCache::attn_output_graph: update_graph_state has not been called")
-        })?;
+        let pos_dev = self
+            .core
+            .is_primed()
+            .then_some(self.pos.slice())
+            .ok_or_else(|| {
+                anyhow!("Q4KvCache::attn_output_graph: update_graph_state has not been called")
+            })?;
         let max_seq_padded = self.max_seq_padded();
         let dims = probs.dims();
         if dims.len() != 4 || dims[0] != 1 || dims[2] != 1 || dims[3] != max_seq_padded {
