@@ -307,14 +307,8 @@ fn free_on_device(dev: &Device) -> u64 {
 }
 
 /// Interleaved RGB8 -> a base64 PNG, the string every image path returns.
-fn rgb_to_png_base64(rgb: &[u8], width: usize, height: usize) -> AnyResult<String> {
-    use base64::Engine as _;
-    let img = image::RgbImage::from_raw(width as u32, height as u32, rgb.to_vec())
-        .ok_or_else(|| anyhow!("sdxl: RGB buffer does not match {width}x{height}"))?;
-    let mut png = std::io::Cursor::new(Vec::new());
-    img.write_to(&mut png, image::ImageFormat::Png)
-        .map_err(|e| anyhow!("sdxl: png encode: {e}"))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(png.into_inner()))
+fn rgb_to_png_base64(rgb: Vec<u8>, width: usize, height: usize) -> AnyResult<String> {
+    crate::inference::media::image_processor::rgb8_to_png_base64(rgb, width, height)
 }
 
 /// Give the denoise its card back when the caption encoder is in the way.
@@ -585,23 +579,11 @@ fn gpu_index_of(dev: &Device) -> Option<usize> {
     }
 }
 
-/// Put the cuBLAS reduced-precision flags where this render needs them.
-///
-/// They are three process-global atomics, set at model LOAD and never cleared, so whichever
-/// family loaded last decided the arithmetic for every family afterwards. A Z-Image render
-/// following a FLUX load in the same process produced different pixels for the same prompt and
-/// seed - silently, because a slightly different teapot is still a teapot.
-///
-/// Precision belongs to the model being run, not to the process that ran something else
-/// earlier. Setting it per render rather than per load makes the answer depend on the request
 /// Whether this family renders with the tensor-core (reduced-precision) GEMM paths.
 ///
-/// Declared per family and applied by the dispatcher, because these are PROCESS-WIDE cuBLAS
-/// flags: whichever render ran last decides the arithmetic for whichever runs next. That was
-/// measured once - the same seed produced two different images depending on what had loaded
-/// before - and fixed for the two families it was observed on, which left the other four
-/// inheriting an answer instead of giving one. Matching on the variant means a new family
-/// cannot be added without deciding.
+/// Declared per family and pinned by the dispatcher for the length of the render, because
+/// the cuBLAS flags are process-wide. Matching on the variant means a new family cannot be
+/// added without deciding.
 fn family_wants_reduced_precision(model: &LoadedImageModel) -> bool {
     match model {
         // Measured and tuned with the tensor-core paths on.
@@ -615,16 +597,6 @@ fn family_wants_reduced_precision(model: &LoadedImageModel) -> bool {
         }
     }
 }
-
-/// alone, whatever is resident beside it.
-#[cfg(feature = "cuda")]
-fn set_render_precision(device: &Device, reduced: bool) {
-    if device.is_cuda() {
-        crate::tensor::cuda_ext::set_gemm_reduced_precision(reduced);
-    }
-}
-#[cfg(not(feature = "cuda"))]
-fn set_render_precision(_device: &Device, _reduced: bool) {}
 
 /// Denoise on a model whose blocks are spread across devices.
 ///
@@ -1005,20 +977,7 @@ fn tensor_to_png_base64(img: &Tensor) -> AnyResult<String> {
         ));
     }
     let img_data = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-    let image_buf: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
-        image::ImageBuffer::from_raw(w as u32, h as u32, img_data)
-            .ok_or_else(|| anyhow!("Failed to create image buffer"))?;
-    // Pre-size the PNG buffer to the raw pixel byte count. Real-world
-    // PNG compression on a photographic image lands between 0.5x and
-    // 2x of raw, so this avoids a few mid-encode realloc copies on
-    // the 1024^2 path (3 MB raw) without significantly over-allocating
-    // on the small-image case.
-    let raw_bytes = h * w * 3;
-    let mut png_bytes: Vec<u8> = Vec::with_capacity(raw_bytes);
-    use std::io::Cursor;
-    image_buf.write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)?;
-    use base64::Engine;
-    Ok(base64::engine::general_purpose::STANDARD.encode(&png_bytes))
+    crate::inference::media::image_processor::rgb8_to_png_base64(img_data, w, h)
 }
 
 /// Decode a base64-encoded image to a normalized tensor (1, C, H, W) in [-1, 1] range.

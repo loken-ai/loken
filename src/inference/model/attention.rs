@@ -135,7 +135,7 @@ impl MultiHeadAttention {
             Mask::Added(t) => Some(t.to_device(&q.device())?),
             _ => None,
         };
-        crate::inference::model::acestep::ops::sdpa(
+        crate::inference::model::sdpa::sdpa(
             q,
             &k,
             &v,

@@ -359,12 +359,11 @@ impl Attention {
         // a 1024-square render went 17 s -> 57 s. This engine runs many short attention
         // tiles rather than one long sequence, and the casts cost more than the narrower
         // GEMMs save. Do not switch it without an A/B on this family.
-        let out = crate::inference::model::acestep::ops::sdpa_tiled(
-            &q, &k, &v, None, false, scale, 1.0, 512,
-        )?
-        .transpose(0, 1)?
-        .contiguous()?
-        .reshape((sq, h * hd))?;
+        let out =
+            crate::inference::model::sdpa::sdpa_tiled(&q, &k, &v, None, false, scale, 1.0, 512)?
+                .transpose(0, 1)?
+                .contiguous()?
+                .reshape((sq, h * hd))?;
         self.to_out.forward(&out)
     }
 }
@@ -584,12 +583,11 @@ impl JointAttention {
         // a 1024-square render went 17 s -> 57 s. This engine runs many short attention
         // tiles rather than one long sequence, and the casts cost more than the narrower
         // GEMMs save. Do not switch it without an A/B on this family.
-        let out = crate::inference::model::acestep::ops::sdpa_tiled(
-            &q, &k, &v, None, false, scale, 1.0, 512,
-        )?
-        .transpose(0, 1)?
-        .contiguous()?
-        .reshape((s, h * hd))?;
+        let out =
+            crate::inference::model::sdpa::sdpa_tiled(&q, &k, &v, None, false, scale, 1.0, 512)?
+                .transpose(0, 1)?
+                .contiguous()?
+                .reshape((s, h * hd))?;
         // Split back to instruction/image, apply per-stream output projections, recombine.
         let inst = self.instruct_out.forward(&out.narrow(0, 0, l_inst)?)?;
         let imgp = self.img_out.forward(&out.narrow(0, l_inst, s - l_inst)?)?;

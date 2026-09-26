@@ -10,7 +10,7 @@
 //! in the LM, applied after this stack). Reuses the tensor-native ops + sdpa + rope_i.
 
 use crate::inference::model::acestep::fsq::rope_tables;
-use crate::inference::model::acestep::ops::sdpa;
+use crate::inference::model::sdpa::sdpa;
 use crate::tensor::VarBuilder;
 use crate::tensor::{Device, Result, Tensor};
 

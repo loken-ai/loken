@@ -27,6 +27,7 @@
 //! single `to_out [3072,12288]` = 3072 attn + 9216 MLP, `norm_out.linear [6144,3072]`,
 //! `proj_out [128,3072]`.
 
+use crate::inference::model::adaln::modulate;
 use crate::inference::model::qwen_image::dit::apply_rope;
 use crate::tensor::quantized::QVarBuilder;
 use crate::tensor::{Device, Result, Tensor as NT};
@@ -197,12 +198,6 @@ fn swiglu(h: &NT) -> Result<NT> {
     crate::tensor::ops::silu(&gate)?.mul(&up)
 }
 
-/// `x * (1 + scale) + shift`, both modulation params `[1, dim]` broadcasting over the sequence.
-fn modulate(x: &NT, shift: &NT, scale: &NT) -> Result<NT> {
-    x.broadcast_mul(&scale.affine(1.0, 1.0)?)?
-        .broadcast_add(shift)
-}
-
 /// One `(shift, scale, gate)` set `i` out of a `[1, 3*sets*dim]` modulation row.
 fn mod_set(m: &NT, dim: usize, i: usize) -> Result<(NT, NT, NT)> {
     let base = 3 * i * dim;
@@ -234,7 +229,7 @@ fn attend(q: &NT, k: &NT, v: &NT, head_dim: usize) -> Result<NT> {
     // The last argument is the soft-cap DIVISOR, and 1.0 is what disables it. Passing 0.0
     // does not mean "no capping": it makes every score `tanh(score/0) * 0` = 0, i.e. uniform
     // attention returning the mean of V - which stays finite and merely renders wrongly.
-    let o = crate::inference::model::acestep::ops::sdpa(
+    let o = crate::inference::model::sdpa::sdpa(
         &t(q)?,
         &t(k)?,
         &t(v)?,

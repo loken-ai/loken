@@ -31,7 +31,7 @@ impl TextEncoder {
         // See `gguf_resident_bytes`. This checkpoint holds nothing but the encoder, so
         // every tensor counts - but each is expanded to f32 on the way to the card, so
         // the quantised file under-stated what goes resident by four.
-        let sz = crate::inference::model::acestep::ops::gguf_resident_bytes(&c, &[]);
+        let sz = crate::inference::model::sdpa::gguf_resident_bytes(&c, &[]);
         // The fastest card that holds it, else the host - the fleet's own answer for a
         // component loaded once. The reserve is a share of the weights because the
         // activations of a fixed-shape encoder scale with its width, not with a request.
@@ -104,7 +104,7 @@ impl TextEncoder {
 
     /// Causal GQA self-attention: `x [S,H]` -> `[S,H]` (key `ki` visible iff `ki<=qi`).
     fn self_attn(&self, l: &DetokLayer, x: &Tensor, s: usize) -> crate::tensor::Result<Tensor> {
-        use crate::inference::model::acestep::ops::{repeat_kv, sdpa};
+        use crate::inference::model::sdpa::{repeat_kv, sdpa};
         let (nh, nkv, d) = (self.n_head, self.n_kv, self.head_dim);
         let q = self.qk_roped(&l.q, &l.q_norm, x, nh, s)?; // [1,nh,s,d]
         let k = self.qk_roped(&l.k, &l.k_norm, x, nkv, s)?; // [1,nkv,s,d]

@@ -387,6 +387,7 @@ pub fn render_with_progress(
     progress: Option<&crate::inference::serve::progress::ProgressTryFn<'_>>,
 ) -> Result<(), DynErr> {
     use crate::inference::serve::progress as ph;
+    let _precision = crate::inference::media::precision::GemmPrecision::full();
     // The checkpoints are gigabytes and load before a single step exists to count.
     ph::try_note(progress, ph::phase::LOAD_MODEL, 0, 0)?;
     let g = |n: &str| acestep_gguf(n).to_str().unwrap().to_string();

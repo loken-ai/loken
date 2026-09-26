@@ -44,11 +44,12 @@ pub struct T5Encoder {
     device: Device,
 }
 
-/// T5 bidirectional relative-position bucket (port of `_relative_position_bucket`).
-/// `rel = key_pos - query_pos`.
-fn rel_bucket(rel: i64) -> usize {
+/// T5 bidirectional relative-position bucket (port of `_relative_position_bucket`), for
+/// `rel = key_pos - query_pos` over `num_buckets` buckets reaching `max_distance`. Shared by
+/// the T5-family encoders that evaluate it per pair in f64.
+pub(crate) fn rel_bucket(rel: i64, num_buckets: usize, max_distance: usize) -> usize {
     let mut ret = 0usize;
-    let nb = NUM_BUCKETS / 2; // bidirectional -> half the buckets carry the sign
+    let nb = num_buckets / 2; // bidirectional -> half the buckets carry the sign
     if rel > 0 {
         ret += nb;
     }
@@ -58,7 +59,7 @@ fn rel_bucket(rel: i64) -> usize {
         ret + n
     } else {
         let large = max_exact
-            + ((n as f64 / max_exact as f64).ln() / (MAX_DISTANCE as f64 / max_exact as f64).ln()
+            + ((n as f64 / max_exact as f64).ln() / (max_distance as f64 / max_exact as f64).ln()
                 * (nb - max_exact) as f64) as usize;
         ret + large.min(nb - 1)
     }
@@ -155,7 +156,7 @@ impl T5Encoder {
         let mut bias = vec![0f32; nh * s * s];
         for i in 0..s {
             for j in 0..s {
-                let b = rel_bucket(j as i64 - i as i64);
+                let b = rel_bucket(j as i64 - i as i64, NUM_BUCKETS, MAX_DISTANCE);
                 for h in 0..nh {
                     bias[h * s * s + i * s + j] = self.rel_bias[b * nh + h];
                 }
@@ -257,5 +258,28 @@ impl T5Encoder {
     /// Where this model's layers sit, by device.
     pub fn placement(&self) -> Vec<crate::inference::serve::progress::placement::Placed> {
         crate::inference::serve::progress::placement::whole(&self.device, self.blocks.len())
+    }
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::*;
+
+    /// Values of the reference `_relative_position_bucket(bidirectional=True, 32, 128)`.
+    #[test]
+    fn buckets_match_the_reference_rule() {
+        for (rel, want) in [
+            (0i64, 0usize),
+            (1, 17),
+            (-1, 1),
+            (7, 23),
+            (8, 24),
+            (-8, 8),
+            (12, 25),
+            (200, 31),
+            (-200, 15),
+        ] {
+            assert_eq!(rel_bucket(rel, 32, 128), want, "rel {rel}");
+        }
     }
 }

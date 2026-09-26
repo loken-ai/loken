@@ -775,7 +775,7 @@ impl DitModel {
         s: usize,
         win: usize,
     ) -> crate::tensor::Result<Tensor> {
-        use crate::inference::model::acestep::ops::{repeat_kv, sdpa};
+        use crate::inference::model::sdpa::{repeat_kv, sdpa};
         let (nh, nkv, d) = (self.n_head, self.n_kv, self.head_dim);
         let q = self.self_attn_qk_roped(&l.sa_q, &l.sa_q_norm, x, nh, s)?; // [1,nh,s,d]
         let k = self.self_attn_qk_roped(&l.sa_k, &l.sa_k_norm, x, nkv, s)?; // [1,nkv,s,d]
@@ -828,7 +828,7 @@ impl DitModel {
         s: usize,
         enc_s: usize,
     ) -> crate::tensor::Result<Tensor> {
-        use crate::inference::model::acestep::ops::{repeat_kv, sdpa};
+        use crate::inference::model::sdpa::{repeat_kv, sdpa};
         let (h, nh, nkv, d) = (self.hidden, self.n_head, self.n_kv, self.head_dim);
         let xe = Tensor::from_vec_f32(enc.to_vec(), (enc_s, h))?.to_device(&l.device)?;
         let q = self.proj_heads_qknorm(&l.ca_q, &l.ca_q_norm, xq, nh, s)?; // [1,nh,s,d]
@@ -1052,7 +1052,7 @@ impl DitModel {
         sin: &Tensor,
         mask: Option<&Tensor>,
     ) -> crate::tensor::Result<Tensor> {
-        use crate::inference::model::acestep::ops::{repeat_kv, sdpa};
+        use crate::inference::model::sdpa::{repeat_kv, sdpa};
         let (nh, nkv, d) = (self.n_head, self.n_kv, self.head_dim);
         let q = self.sa_qk_fast(&l.sa_q, &l.sa_q_norm, x, nh, s, cos, sin)?;
         let k = self.sa_qk_fast(&l.sa_k, &l.sa_k_norm, x, nkv, s, cos, sin)?;
@@ -1076,7 +1076,7 @@ impl DitModel {
         enc_s: usize,
         morph: Option<&Tensor>,
     ) -> crate::tensor::Result<Tensor> {
-        use crate::inference::model::acestep::ops::{repeat_kv, sdpa};
+        use crate::inference::model::sdpa::{repeat_kv, sdpa};
         let (nh, nkv, d) = (self.n_head, self.n_kv, self.head_dim);
         let q = self.proj_heads_qknorm(&l.ca_q, &l.ca_q_norm, xq, nh, s)?;
         let k = self.proj_heads_qknorm(&l.ca_k, &l.ca_k_norm, enc, nkv, enc_s)?;

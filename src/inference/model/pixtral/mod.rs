@@ -200,12 +200,11 @@ impl Block {
         let scale = 1.0f32 / (HD as f32).sqrt();
         // Query-tiled attention (never materializes [H,seq,seq]) - for Pixtral at native 1024px the
         // grid is up to 64x64=4096 patches, so the full scores tensor would be GBs. Non-causal.
-        let o = crate::inference::model::acestep::ops::sdpa_tiled(
-            &q, &k, &v, None, false, scale, 1.0, 512,
-        )?
-        .transpose(0, 1)?
-        .contiguous()?
-        .reshape((seq, DIM))?;
+        let o =
+            crate::inference::model::sdpa::sdpa_tiled(&q, &k, &v, None, false, scale, 1.0, 512)?
+                .transpose(0, 1)?
+                .contiguous()?
+                .reshape((seq, DIM))?;
         let attn = lin(&o, &self.o_w, None)?;
         let x = x.add(&attn)?;
         // SwiGLU FFN: down(silu(gate(x)) . up(x))

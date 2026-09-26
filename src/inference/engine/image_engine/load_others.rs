@@ -36,20 +36,14 @@ impl ImageEngine {
             // was resident - the same index-0 class of bug that sent Flux renders to
             // the CPU. Falls back to the fastest card, then CPU when there is no GPU.
             let primary = {
-                // Weights plus what THIS request's denoise takes, from the DiT's own
-                // width, head count and feed-forward ratio. A fixed reserve stood here
-                // and could not know either.
-                let cfg = crate::inference::model::boogu::dit::Config::default();
-                let tokens = geom.tokens(FLUX_VAE_STRIDE, cfg.patch_size) + FLUX_TEXT_TOKENS;
-                let denoise = crate::inference::place::runtime_demand::dit_activation_bytes(
-                    tokens,
-                    cfg.hidden_size,
-                    cfg.num_heads,
-                    cfg.ffn_inner as f64 / cfg.hidden_size.max(1) as f64,
-                );
+                // Weights plus what THIS request's generation takes, from the same
+                // figure the placement plans against.
                 let want =
                     crate::inference::engine::boogu_engine::hot_component_bytes(&hf_models_dir)
-                        + denoise;
+                        + crate::inference::engine::boogu_engine::runtime_headroom_bytes(
+                            geom.width,
+                            geom.height,
+                        );
                 crate::inference::place::vram_manager::pick_device_for("boogu", want)
                     .map(|(_, _, d)| d)
                     .unwrap_or(crate::tensor::Device::Cpu)
@@ -58,6 +52,7 @@ impl ImageEngine {
             let boogu = crate::inference::engine::boogu_engine::load(
                 &hf_models_dir,
                 &primary,
+                geom,
                 cancel.as_ref(),
             )?;
             let mut guard = model_state.blocking_lock();

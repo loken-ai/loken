@@ -172,6 +172,10 @@ pub fn render(
 }
 
 /// [`render`] with a per-denoise-step progress callback `(done, total)`.
+///
+/// Cancellable through the thread's scoped token (`serve::cancel::scoped`): the loop
+/// checks it before loading, before every step and before the decode, like the other
+/// samplers.
 pub fn render_with_progress(
     prompt: &str,
     seconds: f32,
@@ -184,6 +188,8 @@ pub fn render_with_progress(
     negative: &str,
     mut on_step: impl FnMut(&str, usize, usize),
 ) -> Result<(Vec<f32>, usize)> {
+    let _precision = crate::inference::media::precision::GemmPrecision::full();
+    crate::inference::serve::cancel::scoped::bail()?;
     let t = (seconds * LATENT_SR).round().max(1.0) as usize;
 
     // 1) Text encoder: cond = T5(prompt); uncond (CFG) = T5(negative). The second branch
@@ -232,6 +238,7 @@ pub fn render_with_progress(
         if bypass {
             break;
         }
+        crate::inference::serve::cancel::scoped::bail()?;
         let ts = sched.timesteps[i] as f32;
         let xin = assemble_input(&latent, &mask_embed, t, in_chans, mask_val);
         let xin_t = Tensor::from_vec_f32(xin, (in_chans, t))?;
@@ -289,6 +296,7 @@ pub fn render_with_progress(
         t0.elapsed().as_secs_f32()
     );
 
+    crate::inference::serve::cancel::scoped::bail()?;
     // 5) VAE decode (autoencoder scale=1.0 shift=0.0 ⟹ latent fed directly). Channel-major
     //    [128.T] is exactly the decoder's layout. decode_chunked derives the 480x upsample
     //    from the loaded block strides.
@@ -310,4 +318,22 @@ pub fn render_with_progress(
     );
     debug_assert_eq!(c_out, 1);
     Ok((audio, t_audio))
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    /// A render whose client is already gone stops before it loads a weight: the error is
+    /// the cancellation, not a missing checkpoint.
+    #[test]
+    fn a_cancelled_render_stops_before_loading() {
+        let token = crate::inference::serve::cancel::CancelToken::new();
+        token.cancel();
+        let err = crate::inference::serve::cancel::scoped::with(&token, || {
+            render("rain on a tin roof", 1.0, 4, 3.0, 1, 1.0, "")
+        })
+        .expect_err("a cancelled render must not run");
+        assert!(err.to_string().contains("cancelled"), "{err}");
+    }
 }

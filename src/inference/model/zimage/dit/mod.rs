@@ -845,7 +845,7 @@ pub fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor
 // ==================== ZImageAttention ====================
 
 /// Query chunk size for the memory-bounded attention, from the ONE declaration of it:
-/// [`crate::inference::model::acestep::ops::dit_query_tile`], which derives it from
+/// [`crate::inference::model::sdpa::dit_query_tile`], which derives it from
 /// `head_dim` and says what the multiple is and why.
 ///
 /// Two implementations once named their own numbers here - 512 against 1024 - and a split
@@ -853,7 +853,7 @@ pub fn apply_rotary_emb(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor
 /// MASKED path chunks as well: production Z-Image always passes an all-ones caption mask,
 /// so the bound has to hold whether or not a mask is present.
 fn attn_query_chunk(head_dim: usize, seq: usize, heads: usize) -> usize {
-    crate::inference::model::acestep::ops::dit_query_tile(head_dim, seq, heads)
+    crate::inference::model::sdpa::dit_query_tile(head_dim, seq, heads)
 }
 
 /// Scaled-dot-product attention with an optional `(B, seq)` 0/1 padding mask.
@@ -896,16 +896,7 @@ fn attention_chunked(
         ),
         None => None,
     };
-    crate::inference::model::acestep::ops::sdpa_tiled(
-        q,
-        k,
-        v,
-        additive.as_ref(),
-        false,
-        scale,
-        1.0,
-        chunk,
-    )
+    crate::inference::model::sdpa::sdpa_tiled(q, k, v, additive.as_ref(), false, scale, 1.0, chunk)
 }
 
 /// Z-Image attention with QK normalization and 3D RoPE.

@@ -248,6 +248,43 @@ pub fn preprocess_qwen35vl(
     Ok((t, (grid_h, grid_w)))
 }
 
+/// Interleaved RGB8 of `width x height` -> base64 PNG, the string every image render
+/// returns.
+pub fn rgb8_to_png_base64(rgb: Vec<u8>, width: usize, height: usize) -> Result<String> {
+    use base64::Engine as _;
+    let raw_bytes = rgb.len();
+    let img = image::RgbImage::from_raw(width as u32, height as u32, rgb)
+        .ok_or_else(|| anyhow!("RGB buffer does not match {width}x{height}"))?;
+    let mut png: Vec<u8> = Vec::with_capacity(raw_bytes);
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| anyhow!("png encode: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&png))
+}
+
+/// Planar `[3, height, width]` samples in `[-1, 1]` -> interleaved RGB8.
+///
+/// Each sample maps to `(v / 2 + 1 / 2)` clamped to `[0, 1]`, scaled by 255 and truncated.
+pub fn signed_planes_to_rgb8(planes: &[f32], width: usize, height: usize) -> Vec<u8> {
+    let plane = width * height;
+    let mut rgb = Vec::with_capacity(3 * plane);
+    for p in 0..plane {
+        for c in 0..3 {
+            rgb.push((((planes[c * plane + p] * 0.5 + 0.5).clamp(0.0, 1.0)) * 255.0) as u8);
+        }
+    }
+    rgb
+}
+
+/// A decoded image tensor whose last three dims are `[3, H, W]` in `[-1, 1]` -> base64 PNG.
+pub fn signed_image_to_png_base64(img: &Tensor) -> Result<String> {
+    let d = img.shape().dims().to_vec();
+    if d.len() < 3 || d[d.len() - 3] != 3 {
+        return Err(anyhow!("expected [.., 3, H, W] image, got {d:?}"));
+    }
+    let (h, w) = (d[d.len() - 2], d[d.len() - 1]);
+    rgb8_to_png_base64(signed_planes_to_rgb8(&img.to_vec_f32(), w, h), w, h)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +504,26 @@ mod orientation_tests {
             (20, 40),
             "the quarter turn must swap width and height"
         );
+    }
+
+    #[test]
+    fn signed_planes_interleave_clamp_and_truncate() {
+        // 2x1 image: planes R, G, B of two pixels each.
+        let planes = [-1.0, 1.0, 0.0, 2.0, 0.5, -3.0];
+        assert_eq!(
+            signed_planes_to_rgb8(&planes, 2, 1),
+            vec![0, 127, 191, 255, 255, 0]
+        );
+    }
+
+    #[test]
+    fn an_encoded_render_decodes_back_to_its_pixels() {
+        let rgb: Vec<u8> = (0..4 * 3 * 3).map(|i| (i * 7) as u8).collect();
+        let b64 = rgb8_to_png_base64(rgb.clone(), 4, 3).expect("encode");
+        let back = decode_base64_image(&b64).expect("decode").to_rgb8();
+        assert_eq!((back.width(), back.height()), (4, 3));
+        assert_eq!(back.into_raw(), rgb);
+        assert!(rgb8_to_png_base64(vec![0; 5], 4, 3).is_err());
     }
 
     /// An image with no EXIF at all must come through untouched.

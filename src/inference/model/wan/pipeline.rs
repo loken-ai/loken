@@ -819,6 +819,7 @@ pub fn render_many_sampled(
     start_image: Option<(&[u8], usize, usize)>,
 ) -> Result<Vec<WanFrames>> {
     use crate::tensor::Error;
+    let _precision = crate::inference::media::precision::GemmPrecision::full();
     if !height.is_multiple_of(16) || !width.is_multiple_of(16) {
         return Err(Error("wan: height/width must be multiples of 16".into()));
     }

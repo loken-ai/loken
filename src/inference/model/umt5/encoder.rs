@@ -48,26 +48,6 @@ pub struct Umt5Encoder {
     device: Device,
 }
 
-/// T5 bidirectional relative-position bucket (port of `_relative_position_bucket`).
-/// `rel = key_pos - query_pos`.
-fn rel_bucket(rel: i64) -> usize {
-    let mut ret = 0usize;
-    let nb = NUM_BUCKETS / 2; // bidirectional -> half the buckets carry the sign
-    if rel > 0 {
-        ret += nb;
-    }
-    let n = rel.unsigned_abs() as usize;
-    let max_exact = nb / 2;
-    if n < max_exact {
-        ret + n
-    } else {
-        let large = max_exact
-            + ((n as f64 / max_exact as f64).ln() / (MAX_DISTANCE as f64 / max_exact as f64).ln()
-                * (nb - max_exact) as f64) as usize;
-        ret + large.min(nb - 1)
-    }
-}
-
 impl Umt5Encoder {
     /// Load the umT5-XXL encoder from the Wan `.pth` (bf16 on disk -> f32 on `device`).
     pub fn from_pth(path: &str, device: Device) -> Result<Self> {
@@ -216,7 +196,11 @@ impl Umt5Encoder {
         let mut buckets = vec![0usize; s * s];
         for i in 0..s {
             for j in 0..s {
-                buckets[i * s + j] = rel_bucket(j as i64 - i as i64);
+                buckets[i * s + j] = crate::inference::model::t5::flan::rel_bucket(
+                    j as i64 - i as i64,
+                    NUM_BUCKETS,
+                    MAX_DISTANCE,
+                );
             }
         }
 

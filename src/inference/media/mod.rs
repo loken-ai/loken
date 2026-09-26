@@ -8,3 +8,4 @@ pub mod gif;
 pub mod image_processor;
 #[cfg(feature = "midi")]
 pub mod midi;
+pub mod precision;

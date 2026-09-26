@@ -223,8 +223,7 @@ impl SelfAttention2d {
             self.v.to_sequence(&normed)?,
         );
         let scale = 1.0 / (*q.dims().last().unwrap_or(&1) as f32).sqrt();
-        let attended =
-            crate::inference::model::acestep::ops::sdpa(&q, &k, &v, None, false, scale, 1.0)?;
+        let attended = crate::inference::model::sdpa::sdpa(&q, &k, &v, None, false, scale, 1.0)?;
         self.out.to_grid(&attended, h, w)?.add(xs)
     }
 }
@@ -466,5 +465,98 @@ impl Decoder {
             h = stage.forward(&h)?;
         }
         self.conv_out.forward(&self.norm_out.forward(&h)?.silu()?)
+    }
+
+    /// How many image pixels one latent pixel becomes along each axis: two per upsampling
+    /// stage.
+    pub fn upscale(&self) -> usize {
+        1 << self.stages.iter().filter(|s| s.up.is_some()).count()
+    }
+
+    /// [`Self::forward`] in overlapping spatial tiles, bounding the peak memory by one tile
+    /// (see [`decode_in_tiles`]). A latent no larger than `max_tile` is one tile, which is
+    /// the whole decode.
+    pub fn forward_tiled(&self, xs: &Tensor, max_tile: usize, overlap: usize) -> Result<Tensor> {
+        decode_in_tiles(xs, max_tile, overlap, self.upscale(), |t| self.forward(t))
+    }
+}
+
+/// Decode a `[b, c, h, w]` latent in tiles of at most `max_tile` latent pixels a side.
+///
+/// Each tile is decoded with `overlap` latent pixels of context on every side it has a
+/// neighbour, then cut back to its own band (scaled by `upscale`, the decoder's pixels per
+/// latent pixel), so the convolutions see their context and the seams carry no boundary.
+/// The bands partition the grid and are stitched back in order. The decoder's mid-block
+/// attention sees one tile at a time, which is the one way tiles can drift apart.
+pub fn decode_in_tiles(
+    latent: &Tensor,
+    max_tile: usize,
+    overlap: usize,
+    upscale: usize,
+    decode: impl Fn(&Tensor) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let d = latent.dims();
+    let (hl, wl) = (d[2], d[3]);
+    let bounds = |len: usize| -> Vec<usize> {
+        let n = len.div_ceil(max_tile.max(1)).max(1);
+        (0..=n).map(|i| (i * len) / n).collect()
+    };
+    let (hb, wb) = (bounds(hl), bounds(wl));
+    let mut rows: Vec<Tensor> = Vec::with_capacity(hb.len() - 1);
+    for band in hb.windows(2) {
+        let (h0, h1) = (band[0], band[1]);
+        let (hs, he) = (h0.saturating_sub(overlap), (h1 + overlap).min(hl));
+        let mut cols: Vec<Tensor> = Vec::with_capacity(wb.len() - 1);
+        for col in wb.windows(2) {
+            let (w0, w1) = (col[0], col[1]);
+            let (ws, we) = (w0.saturating_sub(overlap), (w1 + overlap).min(wl));
+            let tile = latent
+                .narrow(2, hs, he - hs)
+                .and_then(|t| t.narrow(3, ws, we - ws))?;
+            let decoded = decode(&tile)?;
+            cols.push(
+                decoded
+                    .narrow(2, (h0 - hs) * upscale, (h1 - h0) * upscale)
+                    .and_then(|t| t.narrow(3, (w0 - ws) * upscale, (w1 - w0) * upscale))?,
+            );
+        }
+        let refs: Vec<&Tensor> = cols.iter().collect();
+        rows.push(Tensor::cat(&refs, 3)?);
+    }
+    let refs: Vec<&Tensor> = rows.iter().collect();
+    Tensor::cat(&refs, 2)
+}
+
+#[cfg(test)]
+mod tiling_tests {
+    use super::*;
+
+    /// A decoder that scales every latent pixel into a `2 x 2` block: tiles of it must
+    /// stitch back into exactly the whole decode, whatever the tile and overlap.
+    #[test]
+    fn tiles_stitch_back_into_the_whole_decode() {
+        let dev = crate::tensor::Device::Cpu;
+        let (h, w) = (13usize, 9usize);
+        let v: Vec<f32> = (0..2 * h * w).map(|i| (i as f32 * 0.37).sin()).collect();
+        let latent = Tensor::from_vec(v, (1, 2, h, w), &dev).unwrap();
+        let decode = |t: &Tensor| {
+            let (_, _, th, tw) = t.shape().dims4()?;
+            t.affine(3.0, 0.5)?.upsample_nearest2d(th * 2, tw * 2)
+        };
+        let whole = decode(&latent)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (tile, overlap) in [(4usize, 1usize), (5, 2), (13, 0), (64, 8)] {
+            let tiled = decode_in_tiles(&latent, tile, overlap, 2, decode)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(tiled, whole, "tile {tile} overlap {overlap}");
+        }
     }
 }

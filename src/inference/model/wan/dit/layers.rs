@@ -23,6 +23,41 @@ pub(super) fn wan_load_t(
     Tensor::from_vec_f32(v, dims)?.to_device(device)
 }
 
+/// The low-rank correction a Wan adapter holds for the projection `stem`, as the
+/// checkpoint stores it: `(down [r, in], up [out, r])` in F32 on `dev`. `None` when the
+/// adapter does not touch `stem`. The files carry no alpha, so the correction is exactly
+/// `up @ down`.
+pub(super) fn wan_lora_factors(
+    lora: &SafeTensorsLoader,
+    stem: &str,
+    dev: &Device,
+) -> Result<Option<(Tensor, Tensor)>> {
+    let dn = format!("diffusion_model.{stem}.lora_down.weight");
+    let up = format!("diffusion_model.{stem}.lora_up.weight");
+    if !(lora.contains(&dn) && lora.contains(&up)) {
+        return Ok(None);
+    }
+    Ok(Some((
+        lora.load_to(&dn, DType::F32, dev)?,
+        lora.load_to(&up, DType::F32, dev)?,
+    )))
+}
+
+/// The dense additive correction a Wan adapter holds for `stem`: `kind` is `diff` for a
+/// weight and `diff_b` for a bias. `None` when the adapter has none.
+pub(super) fn wan_lora_diff(
+    lora: &SafeTensorsLoader,
+    stem: &str,
+    kind: &str,
+    dev: &Device,
+) -> Result<Option<Tensor>> {
+    let key = format!("diffusion_model.{stem}.{kind}");
+    if !lora.contains(&key) {
+        return Ok(None);
+    }
+    lora.load_to(&key, DType::F32, dev).map(Some)
+}
+
 /// Build a quantized `WanLinear` for the 14B path: Q8 weight `[out,in]` on `dev` (via the
 /// QVarBuilder, dequant-on-the-fly) plus its separate F32 `.bias` tensor.
 pub(super) fn wan_qlin(
@@ -48,26 +83,15 @@ pub(super) fn wan_qlin(
         // both in its own transposed convention, so they are transposed here. Reading them
         // straight through gives a shape that happens to multiply and a correction that is
         // the wrong way round.
-        let dn = format!("diffusion_model.{prefix}.lora_down.weight");
-        let up = format!("diffusion_model.{prefix}.lora_up.weight");
-        if l.contains(&dn) && l.contains(&up) {
-            let down = l
-                .load_to(&dn, DType::F32, dev)?
-                .transpose(0, 1)?
-                .contiguous()?;
-            let upt = l
-                .load_to(&up, DType::F32, dev)?
-                .transpose(0, 1)?
-                .contiguous()?;
+        if let Some((down, up)) = wan_lora_factors(l, prefix, dev)? {
             w.add_lora(crate::tensor::lora::LoraDelta {
-                down,
-                up: upt,
+                down: down.transpose(0, 1)?.contiguous()?,
+                up: up.transpose(0, 1)?.contiguous()?,
                 scale: 1.0,
             })?;
         }
-        let db = format!("diffusion_model.{prefix}.diff_b");
-        if l.contains(&db) {
-            b = b.add(&l.load_to(&db, DType::F32, dev)?)?;
+        if let Some(db) = wan_lora_diff(l, prefix, "diff_b", dev)? {
+            b = b.add(&db)?;
         }
     }
     Ok(WanLinear::Quant(QLinear::new(
@@ -393,16 +417,11 @@ impl WanDit {
                 _ => return Ok(t),
             };
             let mut t = t;
-            let dkey = format!("diffusion_model.{stem}.{delta}");
-            if l.contains(&dkey) {
-                t = t.add(&l.load_to(&dkey, DType::F32, dv)?)?;
+            if let Some(d) = wan_lora_diff(l, stem, delta, dv)? {
+                t = t.add(&d)?;
             }
             if delta == "diff" {
-                let dn = format!("diffusion_model.{stem}.lora_down.weight");
-                let up = format!("diffusion_model.{stem}.lora_up.weight");
-                if l.contains(&dn) && l.contains(&up) {
-                    let d = l.load_to(&dn, DType::F32, dv)?; // [r, in]
-                    let u = l.load_to(&up, DType::F32, dv)?; // [out, r]
+                if let Some((d, u)) = wan_lora_factors(l, stem, dv)? {
                     t = t.add(&u.matmul(&d)?)?;
                 }
             }
@@ -892,8 +911,7 @@ impl WanDit {
         // it bounds the transient the same way the feed-forward already bounds its
         // intermediate. Below the bound this is one call, unchanged.
         const NORM_WIDENING: f64 = 4.0;
-        let chunk =
-            crate::inference::model::acestep::ops::ffn_chunk_bytes_bounded(seq, NORM_WIDENING);
+        let chunk = crate::inference::model::sdpa::ffn_chunk_bytes_bounded(seq, NORM_WIDENING);
         let q = if chunk >= seq {
             proj.rms_norm(&w, EPS)?
         } else {
@@ -1076,7 +1094,7 @@ impl WanDit {
         frame_tokens: usize,
         grid_w: usize,
     ) -> Result<Tensor> {
-        use crate::inference::model::acestep::ops::sdpa_tc as sdpa;
+        use crate::inference::model::sdpa::sdpa_tc as sdpa;
         let q = self
             .to_heads_qknorm(&blk.sa_q.forward(x)?, &blk.sa_norm_q, s)?
             .rope_i(cos, sin)?;
@@ -1123,7 +1141,7 @@ impl WanDit {
         s_txt: usize,
         img: Option<&Tensor>,
     ) -> Result<Tensor> {
-        use crate::inference::model::acestep::ops::sdpa_tc as sdpa;
+        use crate::inference::model::sdpa::sdpa_tc as sdpa;
         let q = self.to_heads_qknorm(&blk.ca_q.forward(xq)?, &blk.ca_norm_q, s)?;
         let k = self.to_heads_qknorm(&blk.ca_k.forward(ctx)?, &blk.ca_norm_k, s_txt)?;
         let v = self.to_heads(&blk.ca_v.forward(ctx)?, s_txt)?;
@@ -1253,9 +1271,8 @@ impl WanDit {
         // card. Admitting `tokens / ratio` per call keeps the intermediate to the size of
         // the activation itself, whatever the width.
         let by_ratio = ((tokens as f64) / MLP_RATIO.max(1.0)).ceil() as usize;
-        let chunk =
-            crate::inference::model::acestep::ops::ffn_chunk_bytes_bounded(tokens, MLP_RATIO)
-                .min(by_ratio.max(1));
+        let chunk = crate::inference::model::sdpa::ffn_chunk_bytes_bounded(tokens, MLP_RATIO)
+            .min(by_ratio.max(1));
         if chunk >= tokens {
             return blk.ffn2.forward(&blk.ffn0.forward(norm2)?.gelu()?);
         }
@@ -2075,5 +2092,49 @@ impl WanDit {
             self.blocks.iter().map(|b| b.device.location()),
             0,
         )
+    }
+}
+
+#[cfg(test)]
+mod lora_reader_tests {
+    use super::*;
+
+    /// The adapter readers find a projection's factors and a bias correction by the
+    /// checkpoint's naming, and report absence rather than failing.
+    #[test]
+    fn adapter_parts_are_found_by_name_and_absence_is_none() {
+        let dir = std::env::temp_dir().join(format!("wan_lora_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("adapter.safetensors");
+        let (down, up, bias) = ([0u8; 2 * 3 * 4], [0u8; 4 * 2 * 4], [0u8; 4 * 4]);
+        fn view(shape: Vec<usize>, bytes: &[u8]) -> safetensors::tensor::TensorView<'_> {
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape, bytes).unwrap()
+        }
+        let stem = "diffusion_model.blocks.0.ffn.0";
+        let tensors = vec![
+            (format!("{stem}.lora_down.weight"), view(vec![2, 3], &down)),
+            (format!("{stem}.lora_up.weight"), view(vec![4, 2], &up)),
+            (format!("{stem}.diff_b"), view(vec![4], &bias)),
+        ];
+        safetensors::serialize_to_file(tensors, None, &path).unwrap();
+        let l = unsafe { SafeTensorsLoader::multi(&[&path]) }.unwrap();
+        let dev = Device::Cpu;
+
+        let (d, u) = wan_lora_factors(&l, "blocks.0.ffn.0", &dev)
+            .unwrap()
+            .expect("factors");
+        assert_eq!(d.dims(), &[2, 3]);
+        assert_eq!(u.dims(), &[4, 2]);
+        assert!(wan_lora_factors(&l, "blocks.1.ffn.0", &dev)
+            .unwrap()
+            .is_none());
+        let db = wan_lora_diff(&l, "blocks.0.ffn.0", "diff_b", &dev)
+            .unwrap()
+            .expect("bias");
+        assert_eq!(db.dims(), &[4]);
+        assert!(wan_lora_diff(&l, "blocks.0.ffn.0", "diff", &dev)
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

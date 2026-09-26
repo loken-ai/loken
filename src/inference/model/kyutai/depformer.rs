@@ -14,7 +14,7 @@
 //! Output per codebook: `logits[cb] = linears[cb](dep_output[cb])` (depformer_norms are
 //! Identity). Each head produces `AUDIO_CARD` logits.
 
-use crate::inference::model::acestep::ops::sdpa;
+use crate::inference::model::sdpa::sdpa;
 use crate::tensor::ops::causal_mask;
 use crate::tensor::VarBuilder;
 use crate::tensor::{Device, Result, Tensor};

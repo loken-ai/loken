@@ -390,7 +390,7 @@ impl EzAudioDiT {
         sk: usize,
         rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
-        use crate::inference::model::acestep::ops::sdpa;
+        use crate::inference::model::sdpa::sdpa;
         let (nh, hd) = (self.n_heads, self.head_dim);
         // [S, H] -> [1, nh, S, hd]
         let to_heads = |t: Tensor, s: usize| -> Result<Tensor> {
@@ -424,12 +424,6 @@ impl EzAudioDiT {
         // nn.GELU() default = exact (erf) gelu.
         let act = value.mul(&gate.gelu_erf()?)?;
         b.mlp_out.forward(&act)
-    }
-
-    /// `modulate(norm) = norm . (1 + scale) + shift`, per-channel broadcast over tokens.
-    fn modulate(x: &Tensor, scale: &Tensor, shift: &Tensor) -> Result<Tensor> {
-        x.broadcast_mul(&scale.affine(1.0, 1.0)?)?
-            .broadcast_add(shift)
     }
 
     /// One UDiT block. `x` `[S, H]`; `t0` the shared `time_ada(c)` `[1, 6H]`; `c` the
@@ -476,7 +470,7 @@ impl EzAudioDiT {
         if tag == "b0" {
             ez_dump("b0_norm1", &n1);
         }
-        let norm_sa = Self::modulate(&n1, &scale_sa, &shift_sa)?;
+        let norm_sa = crate::inference::model::adaln::modulate(&n1, &shift_sa, &scale_sa)?;
         let sa = self.attention(&b.attn, &norm_sa, &norm_sa, s, s, Some(rope))?;
         if tag == "b0" {
             ez_dump("b0_attn", &sa);
@@ -493,7 +487,11 @@ impl EzAudioDiT {
         x = x.add(&ca)?;
 
         // GEGLU MLP (AdaLN-modulated norm -> geglu -> (1-gate) residual).
-        let norm_mlp = Self::modulate(&b.norm3.forward(&x)?, &scale_mlp, &shift_mlp)?;
+        let norm_mlp = crate::inference::model::adaln::modulate(
+            &b.norm3.forward(&x)?,
+            &shift_mlp,
+            &scale_mlp,
+        )?;
         let mlp = self.geglu(b, &norm_mlp)?;
         if tag == "b0" {
             ez_dump("b0_mlp", &mlp);
@@ -630,7 +628,11 @@ impl EzAudioDiT {
         // final: modulate(final_norm(x)) with (shift, scale) -> linear -> conv head.
         let shift = final_mod.narrow(1, 0, h)?;
         let scale = final_mod.narrow(1, h, h)?;
-        let xn = Self::modulate(&self.final_norm.forward(&x)?, &scale, &shift)?;
+        let xn = crate::inference::model::adaln::modulate(
+            &self.final_norm.forward(&x)?,
+            &shift,
+            &scale,
+        )?;
         let xl = self.final_linear.forward(&xn)?; // [S, out_chans.patch]
                                                   // [S, out_chans.patch] -> [1, out_chans.patch, S] -> conv -> [out_chans, T].
         let xc = xl.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;

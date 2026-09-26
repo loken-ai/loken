@@ -124,7 +124,7 @@ impl Pooler {
     /// Full bidirectional GQA self-attention: `x [S,H]` -> `[S,H]` post o_proj
     /// (qk-norm + NEOX RoPE, no mask - mirrors the DiT self-attn with win=∞).
     fn self_attn(&self, l: &DetokLayer, x: &Tensor, s: usize) -> crate::tensor::Result<Tensor> {
-        use crate::inference::model::acestep::ops::{repeat_kv, sdpa};
+        use crate::inference::model::sdpa::{repeat_kv, sdpa};
         let (nh, nkv, d) = (self.n_head, self.n_kv, self.head_dim);
         let q = self.qk_roped(&l.q, &l.q_norm, x, nh, s)?; // [1,nh,s,d]
         let k = self.qk_roped(&l.k, &l.k_norm, x, nkv, s)?; // [1,nkv,s,d]
@@ -196,8 +196,7 @@ impl DetokModel {
         // See `gguf_resident_bytes`: the directory is the authority on what this component
         // puts on the card, and the loader below expands every weight it reads.
         let device = {
-            let sz =
-                crate::inference::model::acestep::ops::gguf_resident_bytes(&c, &["detokenizer."]);
+            let sz = crate::inference::model::sdpa::gguf_resident_bytes(&c, &["detokenizer."]);
             crate::inference::place::plan::place_whole(
                 sz,
                 crate::inference::place::runtime_demand::load_runtime_floor(sz),
@@ -292,8 +291,7 @@ impl TokEncoder {
         let mut f = std::fs::File::open(path)?;
         let c = gguf_file::read_mapped_file(&f)?;
         let device = {
-            let sz =
-                crate::inference::model::acestep::ops::gguf_resident_bytes(&c, &["tokenizer."]);
+            let sz = crate::inference::model::sdpa::gguf_resident_bytes(&c, &["tokenizer."]);
             crate::inference::place::plan::place_whole(
                 sz,
                 crate::inference::place::runtime_demand::load_runtime_floor(sz),

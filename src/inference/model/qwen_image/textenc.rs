@@ -275,7 +275,7 @@ impl Qwen2TextEncoder {
         cos: &Tensor,
         sin: &Tensor,
     ) -> crate::tensor::Result<Tensor> {
-        use crate::inference::model::acestep::ops::{repeat_kv, sdpa};
+        use crate::inference::model::sdpa::{repeat_kv, sdpa};
         let (nh, nkv, d) = (self.n_head, self.n_kv, self.head_dim);
         let q = self.qkv_roped(&l.q, x, nh, s, cos, sin)?;
         let k = self.qkv_roped(&l.k, x, nkv, s, cos, sin)?;

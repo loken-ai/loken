@@ -420,7 +420,7 @@ mod delay_pattern_tests {
 
 #[cfg(test)]
 mod causal_mask_tests {
-    use crate::inference::model::acestep::ops::sdpa;
+    use crate::inference::model::sdpa::sdpa;
     use crate::tensor::{Device, Result, Tensor};
 
     /// The decoder used to build its own additive mask and add it to the scores; it now asks

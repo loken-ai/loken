@@ -400,7 +400,7 @@ impl MHA {
         // The mask this used to build for itself is the causal one, and asking for it by the
         // two lengths means the prefill triangle and the decode identity are one call: at one
         // query against everything cached, nothing is masked.
-        let attn_output = crate::inference::model::acestep::ops::sdpa(
+        let attn_output = crate::inference::model::sdpa::sdpa(
             &q,
             &k,
             &v,

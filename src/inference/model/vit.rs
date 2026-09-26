@@ -113,11 +113,10 @@ impl VitBlock {
         let normed = self.norm1.forward(xs)?;
         let (q, k, v) = self.qkv.project(&normed, self.heads, self.head_dim)?;
         let scale = (1.0 / (self.head_dim as f64).sqrt()) as f32;
-        let attended =
-            crate::inference::model::acestep::ops::sdpa(&q, &k, &v, None, false, scale, 1.0)?
-                .transpose(1, 2)?
-                .contiguous()?
-                .reshape((b, n, width))?;
+        let attended = crate::inference::model::sdpa::sdpa(&q, &k, &v, None, false, scale, 1.0)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, n, width))?;
         let xs = (xs + self.proj.forward(&attended)?)?;
 
         let hidden = self.mlp.forward(&self.norm2.forward(&xs)?)?;
@@ -238,9 +237,8 @@ mod tests {
             .unwrap()
             .matmul(&v)
             .unwrap();
-        let got =
-            crate::inference::model::acestep::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.0)
-                .unwrap();
+        let got = crate::inference::model::sdpa::sdpa(&q, &k, &v, None, false, scale as f32, 1.0)
+            .unwrap();
 
         let gap = worst(&want, &got);
         let size = want

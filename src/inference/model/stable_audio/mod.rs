@@ -994,32 +994,6 @@ fn dbg_stage_hash(tag: &str, t: &Tensor) {
     tracing::debug!("sa stage[{tag}]: {h:016x} ({} elems)", v.len());
 }
 
-/// Pins the process-global F32 GEMM precision to FULL for a scope, restoring the prior
-/// state on drop. The switch is flipped by whichever engine loaded last, and a seed must
-/// not answer different audio because an LLM load happened in between - the last face of
-/// the "same seed, different audio depending on what else is resident" defect.
-struct FullPrecisionGuard(bool);
-
-impl FullPrecisionGuard {
-    fn pin() -> Self {
-        #[cfg(feature = "cuda")]
-        {
-            let was = crate::tensor::cuda::gemm_reduced_precision_f32();
-            crate::tensor::cuda::set_gemm_reduced_precision_f32(false);
-            Self(was)
-        }
-        #[cfg(not(feature = "cuda"))]
-        Self(false)
-    }
-}
-
-impl Drop for FullPrecisionGuard {
-    fn drop(&mut self) {
-        #[cfg(feature = "cuda")]
-        crate::tensor::cuda::set_gemm_reduced_precision_f32(self.0);
-    }
-}
-
 pub fn render(
     prompt: &str,
     negative_prompt: &str,
@@ -1054,7 +1028,7 @@ pub fn render_with_init(
     init: Option<(&[f32], f32)>,
     mut on_step: impl FnMut(&str, usize, usize) -> Result<()>,
 ) -> Result<(Vec<f32>, u32)> {
-    let _full_precision = FullPrecisionGuard::pin();
+    let _precision = crate::inference::media::precision::GemmPrecision::full();
     let res = resident()?;
     crate::inference::place::vram_manager::touch("stable-audio");
     let device = res.device.clone();

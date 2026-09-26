@@ -121,7 +121,9 @@ fn render_on(
         .map_err(anyhow::Error::new)?;
     state.device.set_seed(seed)?;
 
-    set_render_precision(&state.device, family_wants_reduced_precision(&state.model));
+    let _precision = crate::inference::media::precision::GemmPrecision::pin(
+        family_wants_reduced_precision(&state.model),
+    );
 
     match &mut state.model {
         LoadedImageModel::Flux(flux_state) => generate_flux_image(
@@ -270,5 +272,5 @@ fn render_sdxl(
             )
             .map_err(|e| anyhow!("sdxl generate: {e}"))?,
     };
-    rgb_to_png_base64(&rgb, params.width, params.height)
+    rgb_to_png_base64(rgb, params.width, params.height)
 }

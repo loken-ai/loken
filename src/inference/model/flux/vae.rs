@@ -175,36 +175,7 @@ impl AutoEncoder {
     ) -> crate::tensor::Result<crate::tensor::Tensor> {
         let x = xs.to_dtype(DType::F32)?.to_device(&self.device)?;
         let x = x.affine((1.0 / self.scale_factor) as f32, self.shift_factor as f32)?;
-        let d = x.dims();
-        let (hl, wl) = (d[2], d[3]);
-        let bounds = |len: usize| -> Vec<usize> {
-            let n = len.div_ceil(max_tile).max(1);
-            (0..=n).map(|i| (i * len) / n).collect()
-        };
-        let (hb, wb) = (bounds(hl), bounds(wl));
-        let mut rows: Vec<Tensor> = Vec::new();
-        for hi in 0..hb.len() - 1 {
-            let (h0, h1) = (hb[hi], hb[hi + 1]);
-            let (hs, he) = (h0.saturating_sub(ov), (h1 + ov).min(hl));
-            let mut cols: Vec<Tensor> = Vec::new();
-            for wi in 0..wb.len() - 1 {
-                let (w0, w1) = (wb[wi], wb[wi + 1]);
-                let (ws, we) = (w0.saturating_sub(ov), (w1 + ov).min(wl));
-                let tin = x
-                    .narrow(2, hs, he - hs)
-                    .and_then(|t| t.narrow(3, ws, we - ws))?;
-                let dec = self.decoder.forward(&tin)?;
-                // keep exactly the [b_i,b_{i+1}) band (image space = latent.8)
-                let dec = dec
-                    .narrow(2, (h0 - hs) * 8, (h1 - h0) * 8)
-                    .and_then(|t| t.narrow(3, (w0 - ws) * 8, (w1 - w0) * 8))?;
-                cols.push(dec);
-            }
-            let refs: Vec<&Tensor> = cols.iter().collect();
-            rows.push(Tensor::cat(&refs, 3)?);
-        }
-        let refs: Vec<&Tensor> = rows.iter().collect();
-        let img = Tensor::cat(&refs, 2)?;
+        let img = self.decoder.forward_tiled(&x, max_tile, ov)?;
         img.to_device(&xs.device())
     }
 }

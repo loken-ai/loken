@@ -6,6 +6,8 @@
 //! moved to codec/, media/, token/ and sample/, because every family draws on those.
 
 pub mod acestep;
+/// Adaptive layer-norm modulation shared by the DiTs.
+pub mod adaln;
 /// The attention every encoder-decoder in the tree runs.
 pub mod attention;
 pub mod block;
@@ -41,6 +43,8 @@ pub mod qwen3vl;
 pub mod qwen_image;
 pub mod reranker;
 pub mod rope;
+/// Scaled dot-product attention shared by every DiT and encoder.
+pub mod sdpa;
 pub mod sdxl;
 #[cfg(feature = "audio")]
 pub mod stable_audio;

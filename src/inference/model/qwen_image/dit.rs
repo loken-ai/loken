@@ -428,9 +428,7 @@ impl Block {
         let shift = mod3.narrow(1, 0, dim)?;
         let scale = mod3.narrow(1, dim, dim)?;
         let gate = mod3.narrow(1, 2 * dim, dim)?;
-        let y = x
-            .broadcast_mul(&scale.affine(1.0, 1.0)?)?
-            .broadcast_add(&shift)?;
+        let y = crate::inference::model::adaln::modulate(x, &shift, &scale)?;
         Ok((y, gate))
     }
 
@@ -571,7 +569,7 @@ impl Block {
             // 1024^2 edit's forward time as an F32 GEMM. BF16 keeps F32's exponent
             // range (this DiT's activations reach ~1e9, which F16 could not hold) and
             // cuBLAS accumulates in F32.
-            crate::inference::model::acestep::ops::sdpa_tiled_dt(
+            crate::inference::model::sdpa::sdpa_tiled_dt(
                 &q, &k, &v, None, false, scale, 1.0, tile, true,
             )?
             .transpose(0, 1)?

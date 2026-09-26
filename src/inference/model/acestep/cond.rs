@@ -47,7 +47,7 @@ impl CondModel {
         // deciding a real placement, and the file size beside it was the whole shared
         // GGUF - denoiser included - for an encoder that is a fraction of it.
         let device = {
-            let sz = crate::inference::model::acestep::ops::gguf_resident_bytes(&c, &["encoder."]);
+            let sz = crate::inference::model::sdpa::gguf_resident_bytes(&c, &["encoder."]);
             crate::inference::place::plan::place_whole(
                 sz,
                 crate::inference::place::runtime_demand::load_runtime_floor(sz),
@@ -166,7 +166,7 @@ impl CondModel {
         s: usize,
         win: usize,
     ) -> crate::tensor::Result<Tensor> {
-        use crate::inference::model::acestep::ops::{repeat_kv, sdpa};
+        use crate::inference::model::sdpa::{repeat_kv, sdpa};
         let (nh, nkv, d) = (self.n_head, self.n_kv, self.head_dim);
         let q = self.qk_roped(&l.q, &l.q_norm, x, nh, s)?; // [1,nh,s,d]
         let k = self.qk_roped(&l.k, &l.k_norm, x, nkv, s)?; // [1,nkv,s,d]

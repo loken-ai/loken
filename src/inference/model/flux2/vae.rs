@@ -65,6 +65,26 @@ impl Flux2Vae {
     /// Three steps that all belong together: re-grid the tokens, un-normalise with the batch-norm
     /// statistics, unpatchify 128 -> 32 channels at double resolution, then run the conv decoder.
     pub fn decode_tokens(&self, tokens: &Tensor, gh: usize, gw: usize) -> Result<Tensor> {
+        self.decoder.forward(&self.decoder_input(tokens, gh, gw)?)
+    }
+
+    /// [`Self::decode_tokens`] in overlapping spatial tiles of at most `max_tile` latent
+    /// pixels a side, bounding the decode's peak memory by one tile.
+    pub fn decode_tokens_tiled(
+        &self,
+        tokens: &Tensor,
+        gh: usize,
+        gw: usize,
+        max_tile: usize,
+        overlap: usize,
+    ) -> Result<Tensor> {
+        self.decoder
+            .forward_tiled(&self.decoder_input(tokens, gh, gw)?, max_tile, overlap)
+    }
+
+    /// Patchified DiT tokens -> the latent the decoder reads: batch-norm undone, unpacked
+    /// to the 2x grid, through the post-quant convolution.
+    fn decoder_input(&self, tokens: &Tensor, gh: usize, gw: usize) -> Result<Tensor> {
         let dims = tokens.shape().dims().to_vec();
         let c_patched = dims[dims.len() - 1];
         let z = tokens
@@ -78,7 +98,7 @@ impl Flux2Vae {
             .broadcast_mul(&self.bn_std)?
             .broadcast_add(&self.bn_mean)?;
         let z = unpatchify(&z)?;
-        self.decoder.forward(&self.post_quant_conv.forward(&z)?)
+        self.post_quant_conv.forward(&z)
     }
 }
 

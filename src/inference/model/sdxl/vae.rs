@@ -156,11 +156,22 @@ impl SdxlVae {
 
     /// Scaled latent -> image `[b, 3, h, w]`.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
+        self.decoder.forward(&self.decoder_input(z)?)
+    }
+
+    /// [`Self::decode`] in overlapping spatial tiles of at most `max_tile` latent pixels a
+    /// side, bounding the decode's peak memory by one tile.
+    pub fn decode_tiled(&self, z: &Tensor, max_tile: usize, overlap: usize) -> Result<Tensor> {
+        self.decoder
+            .forward_tiled(&self.decoder_input(z)?, max_tile, overlap)
+    }
+
+    /// The scaled latent through the post-quant convolution, as the decoder reads it.
+    fn decoder_input(&self, z: &Tensor) -> Result<Tensor> {
         let z = z
             .to_device(&self.device)?
             .affine(1.0 / self.scaling_factor, 0.0)?;
-        let z = self.post_quant_conv.forward(&z)?;
-        self.decoder.forward(&z)
+        self.post_quant_conv.forward(&z)
     }
 
     pub fn device(&self) -> &Device {

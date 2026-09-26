@@ -13,7 +13,8 @@
 //! with RoPE. Reuses `tensor` conv1d/conv_transpose1d, `sdpa`, `rope_tables`.
 
 use crate::inference::model::acestep::fsq::rope_tables;
-use crate::inference::model::acestep::ops::sdpa;
+use crate::inference::model::adaln::modulate;
+use crate::inference::model::sdpa::sdpa;
 use crate::tensor::VarBuilder;
 use crate::tensor::{Device, Result, Tensor};
 
@@ -505,11 +506,6 @@ const TEMP: f32 = 0.7;
 fn linear_b(x: &Tensor, w: &Tensor, b: &Tensor) -> Result<Tensor> {
     let out = w.shape().dims2()?.0;
     x.matmul_t(w)?.broadcast_add(&b.reshape((1, out))?)
-}
-
-/// AdaLN modulate: `x * (1 + scale) + shift` (all `[1, D]`).
-fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
-    x.mul(&scale.affine(1.0, 1.0)?)?.add(shift)
 }
 
 /// pocket-tts RMSNorm: `x * alpha / sqrt(var(x) + eps)`, var over last dim

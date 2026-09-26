@@ -129,24 +129,6 @@ fn dev_label(d: &Device) -> String {
     }
 }
 
-/// Deterministic gaussian noise (Box-Muller on a seeded xorshift - native has no randn). One
-/// sequential stream for the whole latent, as the reference draws it from a single generator.
-fn noise(n: usize, seed: u64) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
-    let mut u = || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        (s >> 11) as f32 / (1u64 << 53) as f32
-    };
-    (0..n)
-        .map(|_| {
-            let (a, b) = (u().max(1e-9), u());
-            (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()
-        })
-        .collect()
-}
-
 /// Load FLUX.2 Klein. Placement comes from the adaptive plan with an OOM-fallback cascade, so a
 /// load can never hard-OOM; `_primary` is ignored (kept for the loader signature).
 pub fn load(
@@ -300,7 +282,7 @@ pub fn generate(
     //    space the DiT consumes (in_channels = the 32-channel latent packed 2x2).
     let sig = sampling::sigmas(si, steps);
     let mut x = NT::from_vec_f32(
-        noise(si * state.cfg.in_channels, seed),
+        crate::inference::sample::seeded_gaussian(si * state.cfg.in_channels, seed),
         (si, state.cfg.in_channels),
     )?
     .to_device(dev)?;
@@ -326,25 +308,8 @@ pub fn generate(
 
 /// `[1, 3, H, W]` in `[-1, 1]` -> base64 PNG.
 fn to_png(img: &NT) -> AnyResult<String> {
-    let d = img.shape().dims().to_vec();
-    let v = img.to_vec_f32();
-    let (ih, iw) = (d[d.len() - 2], d[d.len() - 1]);
-    let plane = ih * iw;
-    let mut buf = image::RgbImage::new(iw as u32, ih as u32);
-    for y in 0..ih {
-        for x in 0..iw {
-            let px = |c: usize| {
-                (((v[c * plane + y * iw + x] * 0.5 + 0.5).clamp(0.0, 1.0)) * 255.0) as u8
-            };
-            buf.put_pixel(x as u32, y as u32, image::Rgb([px(0), px(1), px(2)]));
-        }
-    }
-    let mut png: Vec<u8> = Vec::new();
-    image::DynamicImage::ImageRgb8(buf)
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .map_err(|e| anyhow!("FLUX.2 PNG encode: {e}"))?;
-    use base64::Engine;
-    Ok(base64::engine::general_purpose::STANDARD.encode(&png))
+    crate::inference::media::image_processor::signed_image_to_png_base64(img)
+        .map_err(|e| anyhow!("FLUX.2 PNG encode: {e}"))
 }
 
 /// True when this model name is served by this engine. The weights live in a plain `flux2-*`

@@ -228,7 +228,7 @@ impl Attention {
         let v = crate::tensor::ops::repeat_kv(v, self.shape.kv_groups())?;
         let scale = 1.0 / (self.shape.dim as f32).sqrt();
         // q.kᵀ.scale, an additive mask, softmax, then .v - the shared kernel, no softcapping.
-        let ctx = crate::inference::model::acestep::ops::sdpa(&q, &k, &v, mask, false, scale, 1.0)?;
+        let ctx = crate::inference::model::sdpa::sdpa(&q, &k, &v, mask, false, scale, 1.0)?;
         let out = ctx
             .transpose(1, 2)?
             .reshape(vec![b, l, self.shape.width()])?;

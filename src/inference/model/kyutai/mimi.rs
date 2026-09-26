@@ -11,7 +11,7 @@
 //! weight names. Codebook = `embedding_sum / max(cluster_usage, eps)` (Mimi EMA).
 
 use crate::inference::model::acestep::fsq::rope_tables;
-use crate::inference::model::acestep::ops::sdpa;
+use crate::inference::model::sdpa::sdpa;
 use crate::tensor::VarBuilder;
 use crate::tensor::{Device, Result, Tensor};
 

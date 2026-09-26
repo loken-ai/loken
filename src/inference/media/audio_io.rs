@@ -109,6 +109,74 @@ pub fn read_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     Ok((planar, sample_rate))
 }
 
+/// Anti-aliased resampler: rubato's polyphase FFT resampler, mono.
+///
+/// The output is `round(len * dst_rate / src_rate)` samples, aligned with the input: the
+/// resampler's latency is flushed through the tail and dropped from the front, and the
+/// last partial chunk is zero-padded so the end of the signal reaches the output. A zero
+/// source rate is refused rather than sized against.
+pub fn resample(src: &[f32], src_rate: u32, dst_rate: u32) -> anyhow::Result<Vec<f32>> {
+    use rubato::{FftFixedInOut, Resampler};
+
+    if src.is_empty() {
+        return Ok(Vec::new());
+    }
+    if src_rate == 0 || dst_rate == 0 {
+        anyhow::bail!("invalid audio: sample rate is 0");
+    }
+    if src_rate == dst_rate {
+        return Ok(src.to_vec());
+    }
+
+    /// Input frames per FFT chunk: short enough that the warm-up latency stays small, long
+    /// enough that the transform overhead amortizes.
+    const CHUNK: usize = 1024;
+    let mut resampler = FftFixedInOut::<f32>::new(src_rate as usize, dst_rate as usize, CHUNK, 1)?;
+
+    let in_chunk = resampler.input_frames_next();
+    let out_delay = resampler.output_delay();
+    let expected = (src.len() as f64 * dst_rate as f64 / src_rate as f64).round() as usize;
+
+    let mut output: Vec<f32> = Vec::with_capacity(expected + out_delay);
+    let mut out_buf: Vec<Vec<f32>> = resampler.output_buffer_allocate(true);
+
+    let mut input_pos = 0usize;
+    while input_pos + in_chunk <= src.len() {
+        let in_buf: [&[f32]; 1] = [&src[input_pos..input_pos + in_chunk]];
+        let (_, out_len) = resampler
+            .process_into_buffer(&in_buf, &mut out_buf, None)
+            .map_err(|e| anyhow::anyhow!("resample: {e}"))?;
+        output.extend_from_slice(&out_buf[0][..out_len]);
+        input_pos += in_chunk;
+    }
+    // The residual partial chunk first, then empty calls until the latency is flushed.
+    let mut tail_done = input_pos >= src.len();
+    let none_in: Option<&[&[f32]]> = None;
+    while output.len() < expected + out_delay {
+        let (_, out_len) = if tail_done {
+            resampler
+                .process_partial_into_buffer(none_in, &mut out_buf, None)
+                .map_err(|e| anyhow::anyhow!("resample flush: {e}"))?
+        } else {
+            tail_done = true;
+            let in_buf: [&[f32]; 1] = [&src[input_pos..]];
+            resampler
+                .process_partial_into_buffer(Some(&in_buf), &mut out_buf, None)
+                .map_err(|e| anyhow::anyhow!("resample tail: {e}"))?
+        };
+        if out_len == 0 {
+            break;
+        }
+        output.extend_from_slice(&out_buf[0][..out_len]);
+    }
+
+    if output.len() > out_delay {
+        output.drain(..out_delay);
+    }
+    output.truncate(expected);
+    Ok(output)
+}
+
 /// Linear-interpolation resampler (`align_corners=False` semantics via
 /// input/output ratio - sample positions offset by half a sample, edges
 /// clamped).
@@ -170,6 +238,22 @@ mod tests {
         let (mono, _) = read_wav(&bytes).unwrap();
         assert_eq!(mono.len(), t);
         assert!(mono[t - 1] > 0.8, "ch0 taken, not ch1/average");
+    }
+
+    #[test]
+    fn the_anti_aliased_resampler_keeps_length_and_a_passband_tone() {
+        assert!(resample(&[], 48_000, 16_000).unwrap().is_empty());
+        assert!(resample(&[0.0; 8], 0, 16_000).is_err());
+        let sig: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.01).sin()).collect();
+        assert_eq!(resample(&sig, 24_000, 24_000).unwrap(), sig);
+        let down = resample(&sig, 48_000, 16_000).unwrap();
+        assert_eq!(down.len(), 1600);
+        // A tone far below the new Nyquist survives at its amplitude, in phase.
+        for (j, v) in down.iter().enumerate().skip(100).take(1400) {
+            let want = (3.0 * j as f32 * 0.01).sin();
+            assert!((v - want).abs() < 0.02, "sample {j}: {v} vs {want}");
+        }
+        assert_eq!(resample(&sig, 8_000, 16_000).unwrap().len(), 9600);
     }
 
     #[test]

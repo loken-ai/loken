@@ -256,7 +256,7 @@ impl Qwen3VlTextEncoder {
         sin: &NT,
         mask: Option<&NT>,
     ) -> Result<NT> {
-        use crate::inference::model::acestep::ops::{repeat_kv, sdpa};
+        use crate::inference::model::sdpa::{repeat_kv, sdpa};
         let (nh, nkv, hd, eps) = (
             self.cfg.n_head,
             self.cfg.n_kv,

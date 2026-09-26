@@ -22,7 +22,7 @@
 //! against the phase-1 manifest (bands are contiguous, <=2 bands overlap per bin).
 
 use crate::inference::codec::stft::{istft, stft_reflect, Frame};
-use crate::inference::model::acestep::ops::sdpa;
+use crate::inference::model::sdpa::sdpa;
 use crate::tensor::layer::{Linear, Mlp};
 use crate::tensor::VarBuilder;
 use crate::tensor::{DType, Device, Error, Result, Tensor, D};

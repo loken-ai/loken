@@ -262,9 +262,7 @@ impl Block {
             let vs = v.narrow(0, s, l)?.transpose(0, 1)?.contiguous()?;
             // shared sdpa (native_acestep_ops): qs @ ksᵀ * scale -> softmax -> @ vs,
             // same math as the previous inline scores/probs chain.
-            let o = crate::inference::model::acestep::ops::sdpa(
-                &qs, &ks, &vs, None, false, scale, 1.0,
-            )?; // [16,l,80]
+            let o = crate::inference::model::sdpa::sdpa(&qs, &ks, &vs, None, false, scale, 1.0)?; // [16,l,80]
             let o = o.transpose(0, 1)?.contiguous()?; // [l,16,80]
             let ov = o.to_vec_f32();
             for i in 0..(l * HEADS * HD) {
