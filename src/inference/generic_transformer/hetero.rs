@@ -1054,11 +1054,7 @@ impl GenericHeteroTransformer {
         let l = self.layers.first()?;
         let mut n = l.kv_cache.current_seq_len();
         #[cfg(feature = "cuda")]
-        if let Some(c) = l.q8_kv_cache.as_ref() {
-            n = n.max(c.current_seq_len());
-        }
-        #[cfg(feature = "cuda")]
-        if let Some(c) = l.q4_kv_cache.as_ref() {
+        if let Some(c) = l.quant_kv.as_ref() {
             n = n.max(c.current_seq_len());
         }
         if let Some(c) = l.cpu_q8_kv.as_ref() {
@@ -1721,7 +1717,7 @@ impl GenericHeteroTransformer {
                 if let Some(rid) = ref_idx_opt {
                     let (head, tail) = self.layers.split_at_mut(layer_idx);
                     #[cfg(feature = "cuda")]
-                    let donor_q8 = head[rid].q8_kv_cache.as_ref();
+                    let donor_q8 = head[rid].q8_kv();
                     // Lend the shared layer read access to the donor's F16
                     // KV store (gemma4 CPU). The donor (a real layer < layer_idx,
                     // in `head`) already maintains it for its own decode; shared

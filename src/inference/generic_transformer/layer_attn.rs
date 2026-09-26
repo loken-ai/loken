@@ -320,7 +320,7 @@ impl GenericTransformerLayer {
     #[cfg(feature = "cuda")]
     #[inline]
     pub(super) fn has_q8_cache(&self) -> bool {
-        self.q8_kv_cache.is_some()
+        self.q8_kv().is_some()
     }
     #[cfg(not(feature = "cuda"))]
     #[inline]
@@ -330,8 +330,46 @@ impl GenericTransformerLayer {
     #[cfg(feature = "cuda")]
     #[inline]
     pub(super) fn has_q4_cache(&self) -> bool {
-        self.q4_kv_cache.is_some()
+        self.q4_kv().is_some()
     }
+
+    /// Moves this layer's history from the quantised cache to the F-dtype cache and drops the
+    /// quantised one. Errs when the history cannot be read back: attending over a truncated
+    /// history would decode from wrong logits.
+    #[cfg(feature = "cuda")]
+    fn demote_quant_kv(&mut self, dtype: crate::tensor::DType) -> Result<()> {
+        let Some(q) = self.quant_kv.take() else {
+            return Ok(());
+        };
+        if self.populate_dual_kv {
+            return Ok(());
+        }
+        self.kv_cache.reset();
+        if q.current_seq_len() > 0 {
+            let (k, v) = q.dequantize_kv(dtype).map_err(|e| {
+                crate::tensor::Error::msg(format!("quantised KV history unreadable: {e}"))
+            })?;
+            let _ = self.kv_cache.append(&k, &v)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[inline]
+    pub(super) fn q8_kv(&self) -> Option<&crate::inference::cache::q8_kv::Q8KvCache> {
+        self.quant_kv.as_ref().and_then(|c| c.q8())
+    }
+    #[cfg(feature = "cuda")]
+    #[inline]
+    pub(super) fn q8_kv_mut(&mut self) -> Option<&mut crate::inference::cache::q8_kv::Q8KvCache> {
+        self.quant_kv.as_mut().and_then(|c| c.q8_mut())
+    }
+    #[cfg(feature = "cuda")]
+    #[inline]
+    pub(super) fn q4_kv(&self) -> Option<&crate::inference::cache::q4_kv::Q4KvCache> {
+        self.quant_kv.as_ref().and_then(|c| c.q4())
+    }
+
     #[cfg(not(feature = "cuda"))]
     #[inline]
     pub(super) fn has_q4_cache(&self) -> bool {
@@ -633,7 +671,7 @@ impl GenericTransformerLayer {
                         };
                     }
 
-                    let cache = self.q8_kv_cache.as_mut().unwrap();
+                    let cache = self.quant_kv.as_mut().and_then(|c| c.q8_mut()).unwrap();
                     if index_pos == 0 {
                         cache.reset();
                         self.kv_cache.reset();
@@ -1129,60 +1167,25 @@ impl GenericTransformerLayer {
             if index_pos == 0 {
                 self.kv_cache.reset();
                 #[cfg(feature = "cuda")]
-                if let Some(c) = self.q8_kv_cache.as_mut() {
-                    c.reset();
-                }
-                #[cfg(feature = "cuda")]
-                if let Some(c) = self.q4_kv_cache.as_mut() {
+                if let Some(c) = self.quant_kv.as_mut() {
                     c.reset();
                 }
             }
             if use_graph_ops {
-                // Q4 graph-safe path: the Q4 cache's append uses the
-                // device-pos kernels (kv_residual_scatter_dev_slot +
-                // flush_k_residual_q4_dev_pos + q4_v_scatter_bytes_dev_pos)
-                // when `cur_pos_dev` is set, so the launch sequence is
-                // invariant across graph replays. Attention dispatch below
-                // takes the `attn_scores_graph`/`attn_output_graph` path.
-                if self.q4_kv_cache.is_some()
-                    && self
-                        .q4_kv_cache
-                        .as_ref()
-                        .unwrap()
-                        .cur_pos_dev_ptr()
-                        .is_some()
+                // A primed quantised cache appends through its device-slot kernels, so the
+                // launch sequence is the same on every replay; the attention dispatch below
+                // reads everything from the cache, so `k, v` are not used downstream. Without
+                // it the F-dtype padded path would allocate K/V for the whole context.
+                if self
+                    .quant_kv
+                    .as_ref()
+                    .is_some_and(|c| c.cur_pos_dev_ptr().is_some())
                 {
-                    self.q4_kv_cache
+                    self.quant_kv
                         .as_mut()
                         .unwrap()
                         .append(&k, &v)
-                        .map_err(|e| crate::tensor::Error::msg(format!("Q4 graph append: {e}")))?;
-                    // `k, v` here are no-ops downstream - the Q4 graph
-                    // decode path reads everything from the cache.
-                    (k, v)
-                } else if self.q8_kv_cache.is_some()
-                    && self
-                        .q8_kv_cache
-                        .as_ref()
-                        .unwrap()
-                        .cur_pos_dev_ptr()
-                        .is_some()
-                {
-                    // Q8 graph-safe path: mirror the Q4 branch above. The Q8
-                    // cache's append writes K, V at the lazy capacity (4 K
-                    // initial); the downstream attn dispatch routes through
-                    // `try_q8_graph_decode` which uses cache.attn_scores_graph
-                    // / cache.attn_output_graph at the stable max_seq_padded
-                    // stride. Without this branch the code falls to the
-                    // `kv_cache.append_padded` block below, which allocates
-                    // F-dtype padded K,V at user_context_length (~12.8 GB for
-                    // deepcoder at 32 K config) - exactly the OOM that
-                    // 1e7ac88 hit and got reverted in c1f16cb/e308ab3.
-                    self.q8_kv_cache
-                        .as_mut()
-                        .unwrap()
-                        .append(&k, &v)
-                        .map_err(|e| crate::tensor::Error::msg(format!("Q8 graph append: {e}")))?;
+                        .map_err(|e| crate::tensor::Error::msg(format!("KV graph append: {e}")))?;
                     (k, v)
                 } else {
                     if self.kv_cache.k_buffer().is_none() {
@@ -1204,76 +1207,37 @@ impl GenericTransformerLayer {
                         self.kv_cache.v_buffer().unwrap(),
                     )
                 }
-            } else if self.q8_kv_cache.is_some() {
-                // Consolidated Q8 mode: only Q8 cache holds history. F-dtype
-                // SpecKvCache is never populated. Single-token decode is
-                // served out of Q8 via try_q8_decode below (no dequant).
-                // Multi-token paths (prefill, PLD verify) need full F-dtype
-                // K,V to feed flash-attn / standard_attention - we
-                // dequantize on the fly.
-                //
-                // Exception: when this layer is a donor for a shared_kv
-                // model (gemma4), shared layers downstream read its F-dtype
-                // kv_cache. We populate BOTH caches in that case.
-                let append_res = self.q8_kv_cache.as_mut().unwrap().append(&k, &v);
+            } else if self.quant_kv.is_some() {
+                // The quantised cache holds the history. Decode attends over it directly;
+                // multi-token paths (prefill, verify) dequantise it for flash / standard
+                // attention. A donor layer of a shared-KV model also keeps the F-dtype
+                // cache, which the shared layers downstream read.
+                let append_res = self.quant_kv.as_mut().unwrap().append(&k, &v);
                 if self.populate_dual_kv {
                     let _ = self.kv_cache.append(&k, &v)?;
                 }
                 match append_res {
-                    Ok(()) if seq == 1 && !self.populate_dual_kv => {
-                        // Decode: attention uses Q8 cache directly; k, v
-                        // here are unused downstream.
-                        (k, v)
-                    }
                     Ok(()) if self.populate_dual_kv => {
-                        // Donor layer: return F-dtype cache for downstream
-                        // shared_kv reads.
-
                         self.kv_cache.current_kv().ok_or_else(|| {
                             crate::tensor::Error::msg("dual-populate: kv_cache empty after append")
                         })?
                     }
-                    Ok(()) => {
-                        // Multi-token: dequantize full Q8 history to the
-                        // model dtype for FA / standard_attention.
-                        match self.q8_kv_cache.as_ref().unwrap().dequantize_kv(k.dtype()) {
-                            Ok((k_full, v_full)) => (k_full, v_full),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Q8 dequantize_kv failed (falling back to F-dtype): {e}"
-                                );
-                                self.q8_kv_cache = None;
-                                self.kv_cache.append(&k, &v)?
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Q8 KV append failed (falling back to F-dtype): {e}");
-                        self.q8_kv_cache = None;
-                        self.kv_cache.append(&k, &v)?
-                    }
-                }
-            } else if self.q4_kv_cache.is_some() {
-                // Consolidated Q4 KIVI mode (per-channel K, per-token V).
-                // Same shape as Q8 path: decode runs against Q4 cache
-                // directly; multi-token paths dequantize for FA /
-                // standard_attention.
-                let append_res = self.q4_kv_cache.as_mut().unwrap().append(&k, &v);
-                match append_res {
                     Ok(()) if seq == 1 => (k, v),
-                    Ok(()) => match self.q4_kv_cache.as_ref().unwrap().dequantize_kv(k.dtype()) {
-                        Ok((k_full, v_full)) => (k_full, v_full),
+                    Ok(()) => match self.quant_kv.as_ref().unwrap().dequantize_kv(k.dtype()) {
+                        Ok(kv) => kv,
                         Err(e) => {
                             tracing::warn!(
-                                "Q4 dequantize_kv failed (falling back to F-dtype): {e}"
+                                "quantised KV dequantize failed, moving to F-dtype: {e}"
                             );
-                            self.q4_kv_cache = None;
-                            self.kv_cache.append(&k, &v)?
+                            self.demote_quant_kv(k.dtype())?;
+                            self.kv_cache.current_kv().ok_or_else(|| {
+                                crate::tensor::Error::msg("demoted kv_cache empty")
+                            })?
                         }
                     },
                     Err(e) => {
-                        tracing::warn!("Q4 KV append failed (falling back to F-dtype): {e}");
-                        self.q4_kv_cache = None;
+                        tracing::warn!("quantised KV append failed, moving to F-dtype: {e}");
+                        self.demote_quant_kv(k.dtype())?;
                         self.kv_cache.append(&k, &v)?
                     }
                 }
@@ -1383,15 +1347,14 @@ impl GenericTransformerLayer {
         // path only inside a captured graph.
         let phi2_dev_pos = self.flags.parallel_attn && self.flags.layer_norm_with_bias;
         #[cfg(feature = "cuda")]
-        let try_q8_graph_decode = self.q8_kv_cache.is_some()
+        let try_q8_graph_decode = self.q8_kv().is_some()
             && seq == 1
             && b == 1
             && q.device().is_cuda()
             && !is_shared_layer
             && !self.populate_dual_kv
             && (use_graph_ops || phi2_dev_pos)
-            && self.q8_kv_cache.as_ref().unwrap().current_seq_len()
-                < self.q8_kv_cache.as_ref().unwrap().max_seq_padded();
+            && self.q8_kv().unwrap().current_seq_len() < self.q8_kv().unwrap().max_seq_padded();
         #[cfg(feature = "cuda")]
         if try_q8_graph_decode {
             // Prime cur_pos_dev - UNLESS the current stream is in graph
@@ -1416,8 +1379,8 @@ impl GenericTransformerLayer {
                 // `seq_kv = cur_pos_dev + 1` exactly matches the cache's
                 // filled length. Otherwise the kernel iterates one slot
                 // past the cache and reads uninitialized K/V -> garbage.
-                let cur_seq = self.q8_kv_cache.as_ref().unwrap().current_seq_len();
-                if let Some(cache_mut) = self.q8_kv_cache.as_mut() {
+                let cur_seq = self.q8_kv().unwrap().current_seq_len();
+                if let Some(cache_mut) = self.quant_kv.as_mut().and_then(|c| c.q8_mut()) {
                     cache_mut
                         .update_graph_state(cur_seq.saturating_sub(1))
                         .map_err(|e| {
@@ -1425,7 +1388,7 @@ impl GenericTransformerLayer {
                         })?;
                 }
             }
-            let cache = self.q8_kv_cache.as_ref().unwrap();
+            let cache = self.q8_kv().unwrap();
             let scale = self
                 .attention_scale
                 .unwrap_or_else(|| 1.0 / (self.head_dim as f64).sqrt());
@@ -1448,7 +1411,7 @@ impl GenericTransformerLayer {
         }
 
         #[cfg(feature = "cuda")]
-        let try_q8_decode = self.q8_kv_cache.is_some()
+        let try_q8_decode = self.q8_kv().is_some()
             && seq == 1
             && b == 1
             && !use_graph_ops
@@ -1457,7 +1420,7 @@ impl GenericTransformerLayer {
             && !self.populate_dual_kv;
         #[cfg(feature = "cuda")]
         if try_q8_decode {
-            let cache = self.q8_kv_cache.as_ref().unwrap();
+            let cache = self.q8_kv().unwrap();
             let scale = self
                 .attention_scale
                 .unwrap_or_else(|| 1.0 / (self.head_dim as f64).sqrt());
@@ -1493,14 +1456,14 @@ impl GenericTransformerLayer {
 
         // Q4 KIVI decode fast path - analogous to Q8 above.
         #[cfg(feature = "cuda")]
-        let try_q4_decode = self.q4_kv_cache.is_some()
+        let try_q4_decode = self.q4_kv().is_some()
             && seq == 1
             && b == 1
             && q.device().is_cuda()
             && !is_shared_layer;
         #[cfg(feature = "cuda")]
         if try_q4_decode {
-            let cache = self.q4_kv_cache.as_ref().unwrap();
+            let cache = self.q4_kv().unwrap();
             let scale = self
                 .attention_scale
                 .unwrap_or_else(|| 1.0 / (self.head_dim as f64).sqrt());
@@ -1672,9 +1635,9 @@ impl GenericTransformerLayer {
         // wipe the populated quantized cache - read seq_len from the
         // actual storage path instead.
         #[cfg(feature = "cuda")]
-        let pos = if let Some(c) = self.q4_kv_cache.as_ref() {
+        let pos = if let Some(c) = self.q4_kv() {
             c.current_seq_len()
-        } else if let Some(c) = self.q8_kv_cache.as_ref() {
+        } else if let Some(c) = self.q8_kv() {
             c.current_seq_len()
         } else {
             self.kv_cache.current_seq_len()

@@ -301,29 +301,6 @@ impl GenericHeteroTransformer {
                 "F-dtype (F16) KV: both graph branches are known-broken, see the note above",
             );
         }
-        // Q4-KV dev-pos models - the ONE path whose engine-site capture +
-        // replay is PROVEN correct within a request (deepcoder
-        // KV=q4: 1636-node graph, 0 MEM_ALLOC, coherent 128-token decode
-        // token-matching the Q8 eager reference, probation green) - are
-        // still gated OFF because replayed tokens advance the KV cache
-        // only DEVICE-side (the captured append kernel reads cur_pos_dev,
-        // refreshed by update_graph_state): the Q4 cache's HOST state
-        // (current_seq_len + block/residual bookkeeping) goes stale for
-        // the entire replayed span, so the NEXT request's trim/reset/
-        // prefill operates on wrong lengths. Server repro (// LOKEN_KV_QUANT=q4 deepcoder): request 2+ with fresh prompts
-        // 500s with `broadcast_as: cannot broadcast [10, 11] to
-        // [1, 40, 10, 30]`; with an identical prompt (prefix reuse) it
-        // silently decodes garbage. Note `trim_kv` also never trims
-        // q4_kv_cache. Re-enabling needs a host/device KV-accounting sync
-        // for replayed tokens (host current_seq_len/block state advanced
-        // per replay, or derived from cur_pos_dev at request end) plus a
-        // q4 trim in trim_kv - model-side work, not capture mechanics.
-        // Single-request verification harness: llm_render deepcoder:14b
-        // LOKEN_KV_QUANT=q4 with this gate removed.
-        #[cfg(feature = "cuda")]
-        if self.layers.iter().any(|l| l.has_q4_cache()) {
-            return Err("Q4 KV cache");
-        }
         // Single-GPU requirement (except gemma4:26b which has its own
         // multi-GPU graph code path). Without this, multi-GPU + CPU
         // placement causes `embed_for_graph` to fail with
@@ -605,10 +582,7 @@ impl GenericHeteroTransformer {
         // buffers may grow again and the frozen seq ceiling no longer applies.
         #[cfg(feature = "cuda")]
         for l in &mut self.layers {
-            if let Some(c) = l.q8_kv_cache.as_mut() {
-                c.clear_graph_captured();
-            }
-            if let Some(c) = l.q4_kv_cache.as_mut() {
+            if let Some(c) = l.quant_kv.as_mut() {
                 c.clear_graph_captured();
             }
         }
@@ -621,10 +595,7 @@ impl GenericHeteroTransformer {
     #[cfg(feature = "cuda")]
     pub fn mark_graph_captured(&mut self) {
         for l in &mut self.layers {
-            if let Some(c) = l.q8_kv_cache.as_mut() {
-                c.mark_graph_captured();
-            }
-            if let Some(c) = l.q4_kv_cache.as_mut() {
+            if let Some(c) = l.quant_kv.as_mut() {
                 c.mark_graph_captured();
             }
         }
@@ -641,10 +612,7 @@ impl GenericHeteroTransformer {
     #[cfg(feature = "cuda")]
     pub fn sync_kv_len_for_graph(&mut self, len: usize) {
         for l in &mut self.layers {
-            if let Some(c) = l.q8_kv_cache.as_mut() {
-                c.set_seq_len_for_graph(len);
-            }
-            if let Some(c) = l.q4_kv_cache.as_mut() {
+            if let Some(c) = l.quant_kv.as_mut() {
                 c.set_seq_len_for_graph(len);
             }
         }
@@ -665,11 +633,7 @@ impl GenericHeteroTransformer {
         // eager path (or re-captures at the wider state).
         #[cfg(feature = "cuda")]
         for (i, l) in self.layers.iter().enumerate() {
-            let limit = l
-                .q8_kv_cache
-                .as_ref()
-                .and_then(|c| c.graph_seq_limit())
-                .or_else(|| l.q4_kv_cache.as_ref().and_then(|c| c.graph_seq_limit()));
+            let limit = l.quant_kv.as_ref().and_then(|c| c.graph_seq_limit());
             if let Some(limit) = limit {
                 if pos + 1 > limit {
                     return Err(crate::tensor::Error::msg(format!(
@@ -842,27 +806,13 @@ impl GenericHeteroTransformer {
                 }
             }
 
-            // Q4 KV cache device-pos prime is per-layer (each cache has its
-            // own cur_pos_dev; the value is small (i32) and the htod copy
-            // is ~free; not worth deduping).
+            // Each quantised cache names the slot this replay writes (its own device
+            // position; the copy is skipped when the slot has not changed).
             #[cfg(feature = "cuda")]
-            if let Some(q4) = self.layers[i].q4_kv_cache.as_mut() {
-                q4.update_graph_state(pos).map_err(|e| {
+            if let Some(c) = self.layers[i].quant_kv.as_mut() {
+                c.update_graph_state(pos).map_err(|e| {
                     crate::tensor::Error::msg(format!(
-                        "Q4KvCache::update_graph_state layer {i} pos={pos}: {e}"
-                    ))
-                })?;
-            }
-
-            // Q8 KV cache mirror - same per-layer pattern as Q4 above.
-            // Without this, `try_q8_graph_decode` in forward_attn never
-            // engages (cur_pos_dev stays None) and graph mode falls back
-            // to the F-dtype path which OOMs on full-context KV alloc.
-            #[cfg(feature = "cuda")]
-            if let Some(q8) = self.layers[i].q8_kv_cache.as_mut() {
-                q8.update_graph_state(pos).map_err(|e| {
-                    crate::tensor::Error::msg(format!(
-                        "Q8KvCache::update_graph_state layer {i} pos={pos}: {e}"
+                        "KV update_graph_state layer {i} pos={pos}: {e}"
                     ))
                 })?;
             }
@@ -1486,7 +1436,7 @@ impl GenericHeteroTransformer {
                 ));
             }
             #[cfg(feature = "cuda")]
-            if layer.q4_kv_cache.is_some() {
+            if layer.q4_kv().is_some() {
                 return Err(crate::tensor::Error::msg(
                     "context shift: Q4 KV cache".to_string(),
                 ));
@@ -1499,7 +1449,7 @@ impl GenericHeteroTransformer {
             let mut rotate = |k: &crate::tensor::Tensor| table.rotate_keys_by(k, delta);
             layer.kv_cache.shift_tail(from, discard, &mut rotate)?;
             #[cfg(feature = "cuda")]
-            if let Some(c) = layer.q8_kv_cache.as_mut() {
+            if let Some(c) = layer.q8_kv_mut() {
                 c.shift_tail(from, discard, &mut rotate)
                     .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
             }
@@ -1884,35 +1834,11 @@ impl GenericHeteroTransformer {
             // speculative-decoding rollbacks leave Q8 with stale draft
             // positions and subsequent decode reads garbage.
             //
-            // When fully resetting (new_len == 0), call Q8 `reset()`
-            // instead of trim_to(0). reset() additionally clears
-            // `cur_pos_dev` + `cur_pos_dev_value`, which the dev_pos
-            // attention kernels read to derive seq_kv. trim_to only sets
-            // current_seq_len -> stale device-side position survives across
-            // requests -> cyclic-N non-determinism at temperature=0.
+            // The quantised cache moves length, device position and graph state together
+            // (see `KvCore::trim_to`).
             #[cfg(feature = "cuda")]
-            if let Some(c) = layer.q8_kv_cache.as_mut() {
-                if new_len == 0 {
-                    c.reset();
-                } else {
-                    c.trim_to(new_len);
-                }
-            }
-            // Q4 KIVI mirror: was MISSING - spec-decode
-            // rollbacks and cross-request prefix reuse left the Q4 cache
-            // at a stale length, so the next prefill appended at the
-            // wrong slots (server repro: request 2+ broadcast-shape 500s
-            // with LOKEN_KV_QUANT=q4). trim_to also restores the
-            // partial-block K residual; if that fails, fall back to a
-            // full reset (correct, just loses the reuse win).
-            #[cfg(feature = "cuda")]
-            if let Some(c) = layer.q4_kv_cache.as_mut() {
-                if new_len == 0 {
-                    c.reset();
-                } else if let Err(e) = c.trim_to(new_len) {
-                    tracing::warn!("Q4 KV trim_to({new_len}) failed: {e}; resetting cache");
-                    c.reset();
-                }
+            if let Some(c) = layer.quant_kv.as_mut() {
+                c.trim_to(new_len);
             }
             // CPU KV stores (dense Q8 / gemma4 F16). Multi-token verify
             // (PLD/EAGLE) appends drafts here too; without trimming them the
@@ -2289,27 +2215,7 @@ fn quantised_layer_snapshot(
 ) -> crate::tensor::Result<Option<super::LayerKvSnapshot>> {
     #[cfg(feature = "cuda")]
     {
-        if let Some(q) = l.q8_kv_cache.as_ref() {
-            if q.current_seq_len() > 0 {
-                let (k, v) = q
-                    .dequantize_kv(crate::tensor::DType::F16)
-                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-                let spec = crate::inference::serve::spec_kv_cache::SpecKvSnapshot::from_kv_tensors(
-                    k,
-                    v,
-                    q.current_seq_len(),
-                );
-                return Ok(Some(super::LayerKvSnapshot {
-                    spec: Some(spec),
-                    cpu_f16: None,
-                }));
-            }
-            return Ok(Some(super::LayerKvSnapshot {
-                spec: None,
-                cpu_f16: None,
-            }));
-        }
-        if let Some(q) = l.q4_kv_cache.as_ref() {
+        if let Some(q) = l.quant_kv.as_ref() {
             if q.current_seq_len() > 0 {
                 let (k, v) = q
                     .dequantize_kv(crate::tensor::DType::F16)
@@ -2342,16 +2248,7 @@ fn restore_quantised_layer(
 ) -> crate::tensor::Result<bool> {
     #[cfg(feature = "cuda")]
     {
-        if let Some(q) = l.q8_kv_cache.as_mut() {
-            q.reset();
-            if let Some(spec) = &s.spec {
-                let (k, v) = spec.kv();
-                q.append(k, v)
-                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-            }
-            return Ok(true);
-        }
-        if let Some(q) = l.q4_kv_cache.as_mut() {
+        if let Some(q) = l.quant_kv.as_mut() {
             q.reset();
             if let Some(spec) = &s.spec {
                 let (k, v) = spec.kv();

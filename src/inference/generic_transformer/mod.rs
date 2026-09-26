@@ -13,7 +13,7 @@
 //! OpenCL (Arc) is out of scope here - handled by the Mistral3-specific path.
 
 // The graph-mode init-then-update idiom (see padded_mask, graph_q_buffer,
-// graph_logits_buffer, graph_hidden_buffer, q4_kv_cache, output_proj_*) checks
+// graph_logits_buffer, graph_hidden_buffer, quant_kv, output_proj_*) checks
 // `Option::is_some()` / `is_none()` and then `unwrap()`s in the matching
 // branch. clippy::unnecessary_unwrap can't reason across the if-condition;
 // each site is logically safe. Refactoring the ~20 sites to `match` /
@@ -128,12 +128,12 @@ pub struct GenericTransformerLayer {
     pub ple_output_scale: Option<Tensor>, // [hidden_dim] per-element scale (altup_correct_scale)
     // KV cache + RoPE
     pub kv_cache: SpecKvCache,
-    /// Optional Q8_0-quantized KV cache, populated on every append alongside
-    /// the F-dtype cache when `config.kv_quant == Q8`. Used by the decode
-    /// path (seq=1) to run attention against Q8 K/V and halve KV VRAM.
-    /// Prefill still uses the F16 `kv_cache`.
+    /// The quantised KV cache (Q8_0 or Q4_0 KIVI) when `config.kv_quant` asks for one on a
+    /// CUDA layer. It then holds the history: decode attends over it directly and
+    /// multi-token paths dequantise it; the F-dtype `kv_cache` is only kept for donor
+    /// layers (`populate_dual_kv`).
     #[cfg(feature = "cuda")]
-    pub q8_kv_cache: Option<crate::inference::cache::q8_kv::Q8KvCache>,
+    pub quant_kv: Option<crate::inference::cache::quant_kv::QuantKv>,
     /// CPU-only Q8 KV cache: halves KV streaming bytes at dense decode.
     /// Populated alongside the F16 `kv_cache` (which stays the safe fallback);
     /// read only at single-token CPU decode for eligible dense arches.
@@ -145,13 +145,6 @@ pub struct GenericTransformerLayer {
     /// Per-layer constant norm weights/biases as f32 (lazily built once,
     /// reused every token - removes ~5 `to_vec1` allocs/layer/token).
     pub cpu_norm_cache: Option<crate::inference::kernel::cpu_decode_exec::DecodeNormCache>,
-    /// Optional Q4_0-quantized KV cache (KIVI-style, per-channel K)  -
-    /// populated when `config.kv_quant == Q4` and device is CUDA. Halves
-    /// KV vs Q8 / quarters vs F16. Decode path uses
-    /// `attn_scores`+`attn_output` directly; prefill / multi-token paths
-    /// dequantize on the fly.
-    #[cfg(feature = "cuda")]
-    pub q4_kv_cache: Option<crate::inference::cache::q4_kv::Q4KvCache>,
     /// True for layers in the donor range of a shared_kv model (gemma4).
     /// When set, the layer ALSO populates F-dtype `kv_cache` alongside
     /// the Q8 cache, so shared layers can read donor's F-dtype K/V via
