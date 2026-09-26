@@ -197,6 +197,11 @@ pub(super) fn capture_decode_graph(
                 Ok((g, logits))
             })();
         let (_arena_peak, overflow) = ctx.end_capture_arena();
+        // A capture records kernels without running them, while the host side of each append
+        // still counted its token. The cache holds `pos` tokens, so the eager forward that
+        // follows (probation, or the fallback when the capture is dropped) writes slot `pos`
+        // and attends over the same positions the replay will.
+        model.sync_kv_len_for_graph(pos);
         match cap {
             Err(e) => {
                 // A failed mid-capture forward can leave the stream

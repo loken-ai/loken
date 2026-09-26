@@ -1244,10 +1244,7 @@ impl LlmEngine {
                                                         pos += 1;
                                                         // Host KV sync + freeze quantized-KV
                                                         // growth/seq-ceiling for the lifetime
-                                                        // of the captured graph. (The capture
-                                                        // token's probation eager forward
-                                                        // appended one extra host-side slot;
-                                                        // the sync corrects it.)
+                                                        // of the captured graph.
                                                         state.model.sync_kv_len_for_graph(pos);
                                                         state.model.mark_graph_captured();
                                                         let logits_1d = logits.squeeze(0)?;

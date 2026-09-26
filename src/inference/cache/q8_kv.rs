@@ -16,7 +16,7 @@ use crate::inference::quantized_cuda::{
     quantize_q8_0_f32_into_offset, MATRIX_ROW_PADDING,
 };
 use crate::tensor::cuda_ext::{
-    capture_active_on, tensor_from_cuda_storage, CudaSlice, RawCudaDevice as CudaDevice,
+    capture_active_on, tensor_from_cuda_storage, CudaSlice, DevicePtr, RawCudaDevice as CudaDevice,
 };
 use crate::tensor::quantized::{GgmlDType, QCudaStorage};
 use crate::tensor::{DType, Device, StorageView, Tensor};
@@ -761,6 +761,30 @@ impl Q8KvCache {
         };
 
         let dst_buf = if is_v { &mut self.v_q8 } else { &mut self.k_q8 };
+        // Under graph capture the slot is read from `cur_pos_dev` at replay time: a host
+        // offset would be baked into the graph and every replay would rewrite one slot.
+        if n_new == 1 && capture_active_on(&self.cuda_device.cuda_stream()) {
+            let pos_dev = self.cur_pos_dev.as_ref().ok_or_else(|| {
+                anyhow!("Q8KvCache::append: cur_pos_dev unprimed under graph capture")
+            })?;
+            let stream = self.cuda_device.cuda_stream();
+            let src_ptr = src_slice.device_ptr(&stream).0 as *const core::ffi::c_void;
+            let dst_ptr = dst_buf.device_ptr(&stream).0 as *mut core::ffi::c_void;
+            let pos_ptr = pos_dev.device_ptr(&stream).0 as *const core::ffi::c_void;
+            // SAFETY: the staging slice holds `token_bytes`, the cache holds
+            // `current_capacity` slots of `token_bytes`, and `cur_pos_dev` names a slot below
+            // that capacity (append grew the buffers before capture reached here).
+            unsafe {
+                crate::inference::moe_cuda::q4_v_scatter_bytes_dev_pos_raw(
+                    src_ptr,
+                    dst_ptr,
+                    pos_ptr,
+                    token_bytes as i32,
+                    stream.cu_stream() as i64,
+                );
+            }
+            return Ok(());
+        }
         let mut dst_slice = dst_buf.slice_mut(dst_byte_offset..dst_byte_offset + copy_bytes);
         self.cuda_device
             .memcpy_dtod(&src_slice, &mut dst_slice)
