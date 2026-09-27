@@ -1224,6 +1224,15 @@ impl LlmEngine {
                 #[cfg(feature = "cuda")]
                 _ if !model_fits_single_gpu && model_fits_gpu
                     && cuda_devices.len() >= crate::inference::serve::tp_support::TP_RANKS
+                    // Each rank holds an even share of the weights: a card another model
+                    // still occupies leaves the uneven split of the layer path instead.
+                    && cuda_devices
+                        .iter()
+                        .take(crate::inference::serve::tp_support::TP_RANKS)
+                        .all(|(_, free)| {
+                            *free >= file_size / crate::inference::serve::tp_support::TP_RANKS as u64
+                                + runtime_reserve_bytes
+                        })
                     && crate::inference::serve::tp_support::tensor_parallel_support(&content, &arch)
                         .inspect_err(|why| info!("{arch} stays off tensor parallelism: {why}"))
                         .is_ok() => {
