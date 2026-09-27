@@ -593,6 +593,114 @@ pub(crate) fn template_takes_tools(template: Option<&str>) -> bool {
     template.is_some_and(|t| t.contains("{%") && t.contains("tools"))
 }
 
+/// Whether a template is written in the Mistral instruction format that carries tools and
+/// their results in its own markers.
+pub(crate) fn template_is_mistral_tools(template: Option<&str>) -> bool {
+    template.is_some_and(|t| t.contains("[AVAILABLE_TOOLS]") || t.contains("[SYSTEM_PROMPT]"))
+}
+
+/// A conversation in the Mistral instruction format, written the way the model's own
+/// template writes it: which markers it uses and how a call and a result are spelled are
+/// read from `tmpl`.
+///
+/// The system turn goes in `[SYSTEM_PROMPT]` when the template has that marker and before
+/// the last user message otherwise; the tools, as a JSON array, go in `[AVAILABLE_TOOLS]`
+/// before the last user message; an assistant call is `[TOOL_CALLS]name[CALL_ID]i[ARGS]{..}`,
+/// `[TOOL_CALLS]name[ARGS]{..}` or a `[TOOL_CALLS]` JSON list, as the template spells it.
+pub(crate) fn format_mistral_tools(
+    messages: &[Message],
+    tmpl: &str,
+    tools: Option<&[crate::api::types::Tool]>,
+) -> String {
+    let system_block = tmpl.contains("[SYSTEM_PROMPT]");
+    let call_ids = tmpl.contains("[CALL_ID]");
+    let named_args = tmpl.contains("[ARGS]");
+    let tool_content = tmpl.contains("[TOOL_CONTENT]");
+    let last_user = messages.iter().rposition(|m| m.role == "user");
+    let system: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.role == "system" || m.role == "developer")
+        .map(|m| m.content.as_str())
+        .collect();
+    let mut out = String::new();
+    for (i, m) in messages.iter().enumerate() {
+        let last = i + 1 == messages.len();
+        match m.role.as_str() {
+            "system" | "developer" => {
+                if system_block {
+                    out.push_str(&format!("[SYSTEM_PROMPT]{}[/SYSTEM_PROMPT]", m.content));
+                }
+            }
+            "user" => {
+                if Some(i) == last_user {
+                    if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+                        let json = serde_json::to_string(tools).unwrap_or_else(|_| "[]".into());
+                        out.push_str(&format!("[AVAILABLE_TOOLS]{json}[/AVAILABLE_TOOLS]"));
+                    }
+                }
+                if !system_block && Some(i) == last_user && !system.is_empty() {
+                    out.push_str(&format!(
+                        "[INST]{}\n\n{}[/INST]",
+                        system.join("\n\n"),
+                        m.content
+                    ));
+                } else {
+                    out.push_str(&format!("[INST]{}[/INST]", m.content));
+                }
+            }
+            "assistant" => {
+                out.push_str(&m.content);
+                let calls: Vec<(&str, &str)> = m
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .filter_map(|c| c.function.as_ref())
+                    .map(|f| (f.name.as_str(), f.arguments.as_deref().unwrap_or("{}")))
+                    .collect();
+                if !calls.is_empty() {
+                    if named_args {
+                        for (j, (name, args)) in calls.iter().enumerate() {
+                            if call_ids {
+                                out.push_str(&format!(
+                                    "[TOOL_CALLS]{name}[CALL_ID]{j}[ARGS]{args}"
+                                ));
+                            } else {
+                                out.push_str(&format!("[TOOL_CALLS]{name}[ARGS]{args}"));
+                            }
+                        }
+                    } else {
+                        let list: Vec<String> = calls
+                            .iter()
+                            .map(|(name, args)| {
+                                format!("{{\"name\": \"{name}\", \"arguments\": {args}}}")
+                            })
+                            .collect();
+                        out.push_str(&format!("[TOOL_CALLS][{}]", list.join(", ")));
+                    }
+                }
+                if !last {
+                    out.push_str("</s>");
+                }
+            }
+            "tool" | "function" => {
+                if tool_content {
+                    out.push_str(&format!(
+                        "[TOOL_RESULTS]0[TOOL_CONTENT]{}[/TOOL_RESULTS]",
+                        m.content
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "[TOOL_RESULTS]{{\"content\": {}}}[/TOOL_RESULTS]",
+                        m.content
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// `format_chat_prompt` with the tools handed to a template that renders them.
 pub(crate) fn format_chat_prompt_with_tools(
     messages: &[Message],
@@ -633,6 +741,9 @@ pub(crate) fn format_chat_prompt(messages: &[Message], template: Option<&str>) -
                 return rendered;
             }
         }
+        if template_is_mistral_tools(Some(tmpl)) {
+            return format_mistral_tools(messages, tmpl, None);
+        }
         // Detect template type from characteristic tokens
         if tmpl.contains("<|im_start|>") {
             // ChatML: Qwen, InternLM, SmolLM, StableLM
@@ -666,6 +777,9 @@ pub(crate) fn format_chat_prompt(messages: &[Message], template: Option<&str>) -
             // default below - which is Llama 2's format, from a different family. The
             // model then echoes the markers it was never taught into its own answer.
             return format_llama3(messages);
+        } else if tmpl.contains("<|start|>") && tmpl.contains("<|message|>") {
+            // OpenAI Harmony (gpt-oss): `<|start|>{role}<|message|>{content}<|end|>` turns.
+            return format_openai_harmony(messages);
         } else if tmpl.contains("<|start_of_role|>") {
             // IBM Granite 3.x: <|start_of_role|>{role}<|end_of_role|>{content}
             // <|end_of_text|> per turn, then an assistant role opener. The default
@@ -806,6 +920,194 @@ fn format_gemma(messages: &[Message]) -> String {
 /// Vocab has asymmetric delimiters (id=105 `<|turn>` opens, id=106 `<turn|>`
 /// closes). Verified empirically: `<|turn>user<turn|>What is 2+2?<|turn>model<turn|>`
 /// -> clean English completion. Bare prompts -> degenerate HTML (matches Ollama).
+/// OpenAI Harmony, as gpt-oss reads it: a system turn carrying the reasoning level (the
+/// line `apply_thinking_preference` rewrites), the caller's instructions as a developer
+/// turn, one `<|start|>{role}<|message|>{content}<|end|>` per message, then the assistant
+/// opener the model continues from.
+fn format_openai_harmony(messages: &[Message]) -> String {
+    format_harmony(messages, None)
+}
+
+/// Whether a template is written in OpenAI's Harmony turn format.
+pub(crate) fn template_is_harmony(template: Option<&str>) -> bool {
+    template.is_some_and(|t| t.contains("<|start|>") && t.contains("<|message|>"))
+}
+
+/// A JSON-schema type as the TypeScript a Harmony tool section declares it with.
+fn harmony_ts_type(schema: &serde_json::Value) -> String {
+    use serde_json::Value;
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        return values
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+    match schema.get("type").and_then(Value::as_str) {
+        Some("string") => "string".into(),
+        Some("number") | Some("integer") => "number".into(),
+        Some("boolean") => "boolean".into(),
+        Some("array") => format!(
+            "{}[]",
+            schema.get("items").map_or("any".into(), harmony_ts_type)
+        ),
+        Some("object") => {
+            let required: Vec<&str> = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|r| r.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let fields: Vec<String> = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|props| {
+                    props
+                        .iter()
+                        .map(|(k, v)| {
+                            let opt = if required.contains(&k.as_str()) {
+                                ""
+                            } else {
+                                "?"
+                            };
+                            format!("{k}{opt}: {}", harmony_ts_type(v))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!("{{ {} }}", fields.join(", "))
+        }
+        _ => "any".into(),
+    }
+}
+
+/// The `# Tools` section of a Harmony developer message: each function as a TypeScript
+/// type in the `functions` namespace, its description and its parameters' as comments.
+fn harmony_tools_section(tools: &[crate::api::types::Tool]) -> String {
+    use serde_json::Value;
+    let mut out = String::from("# Tools\n\n## functions\n\nnamespace functions {\n\n");
+    for f in tools.iter().filter_map(|t| t.function.as_ref()) {
+        if let Some(d) = f.description.as_deref().filter(|d| !d.is_empty()) {
+            out.push_str(&format!("// {d}\n"));
+        }
+        let props = f
+            .parameters
+            .as_ref()
+            .and_then(|p| p.get("properties"))
+            .and_then(Value::as_object)
+            .filter(|p| !p.is_empty());
+        let Some(props) = props else {
+            out.push_str(&format!("type {} = () => any;\n\n", f.name));
+            continue;
+        };
+        let required: Vec<&str> = f
+            .parameters
+            .as_ref()
+            .and_then(|p| p.get("required"))
+            .and_then(Value::as_array)
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        out.push_str(&format!("type {} = (_: {{\n", f.name));
+        for (k, v) in props {
+            if let Some(d) = v.get("description").and_then(Value::as_str) {
+                out.push_str(&format!("// {d}\n"));
+            }
+            let opt = if required.contains(&k.as_str()) {
+                ""
+            } else {
+                "?"
+            };
+            out.push_str(&format!("{k}{opt}: {},\n", harmony_ts_type(v)));
+        }
+        out.push_str("}) => any;\n\n");
+    }
+    out.push_str("} // namespace functions");
+    out
+}
+
+/// A conversation in OpenAI's Harmony format: a system turn naming the channels, a
+/// developer turn with the instructions and the tools, prior calls on the commentary
+/// channel addressed to their function, results from that function back to the assistant,
+/// prior answers on the final channel, then an open assistant turn.
+pub(crate) fn format_harmony(
+    messages: &[Message],
+    tools: Option<&[crate::api::types::Tool]>,
+) -> String {
+    let tools = tools.filter(|t| !t.is_empty());
+    let mut out = String::from(
+        "<|start|>system<|message|>Reasoning: medium\n\n# Valid channels: analysis, \
+         commentary, final. Channel must be included for every message.",
+    );
+    if tools.is_some() {
+        out.push_str("\nCalls to these tools must go to the commentary channel: 'functions'.");
+    }
+    out.push_str("<|end|>");
+    let instructions: Vec<&str> = messages
+        .iter()
+        .filter(|m| m.role == "system" || m.role == "developer")
+        .map(|m| m.content.as_str())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if !instructions.is_empty() || tools.is_some() {
+        out.push_str("<|start|>developer<|message|>");
+        if !instructions.is_empty() {
+            out.push_str(&format!("# Instructions\n\n{}", instructions.join("\n\n")));
+            if tools.is_some() {
+                out.push_str("\n\n");
+            }
+        }
+        if let Some(tools) = tools {
+            out.push_str(&harmony_tools_section(tools));
+        }
+        out.push_str("<|end|>");
+    }
+    // The function each result answers: by call id when the client sends one, else the
+    // calls in order.
+    let mut pending: Vec<(Option<String>, String)> = Vec::new();
+    for m in messages {
+        match m.role.as_str() {
+            "system" | "developer" => {}
+            "assistant" => {
+                if !m.content.is_empty() {
+                    out.push_str(&format!(
+                        "<|start|>assistant<|channel|>final<|message|>{}<|end|>",
+                        m.content
+                    ));
+                }
+                for c in m.tool_calls.iter().flatten() {
+                    let Some(f) = c.function.as_ref() else {
+                        continue;
+                    };
+                    out.push_str(&format!(
+                        "<|start|>assistant<|channel|>commentary to=functions.{} \
+                         <|constrain|>json<|message|>{}<|call|>",
+                        f.name,
+                        f.arguments.as_deref().unwrap_or("{}")
+                    ));
+                    pending.push((Some(c.id.clone()), f.name.clone()));
+                }
+            }
+            "tool" | "function" => {
+                let at = m
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|id| pending.iter().position(|(p, _)| p.as_ref() == Some(id)))
+                    .or(if pending.is_empty() { None } else { Some(0) });
+                let name = match at {
+                    Some(i) => pending.remove(i).1,
+                    None => m.name.clone().unwrap_or_default(),
+                };
+                out.push_str(&format!(
+                    "<|start|>functions.{name} to=assistant<|channel|>commentary<|message|>{}<|end|>",
+                    m.content
+                ));
+            }
+            _ => out.push_str(&format!("<|start|>user<|message|>{}<|end|>", m.content)),
+        }
+    }
+    out.push_str("<|start|>assistant");
+    out
+}
+
 fn format_gemma_harmony(messages: &[Message]) -> String {
     // gemma4: id=105 `<|turn>` opens a turn, id=106 `<turn|>` closes it.
     // Per the model's own GGUF chat_template (Jinja), the structure is
@@ -1106,6 +1408,60 @@ mod tests {
         assert!(out.contains("<start_of_turn>model\nA1<end_of_turn>"));
         assert!(out.contains("<start_of_turn>user\nQ2?<end_of_turn>"));
         assert!(out.ends_with("<start_of_turn>model\n"));
+    }
+
+    #[test]
+    fn a_harmony_template_gets_harmony_turns() {
+        let out = format_chat_prompt(
+            &[msg("user", "What is 2+2?")],
+            Some("<|start|>system<|message|>{{ .Prompt }}<|end|>"),
+        );
+        assert_eq!(
+            out,
+            "<|start|>system<|message|>Reasoning: medium\n\n# Valid channels: analysis, \
+             commentary, final. Channel must be included for every message.<|end|>\
+             <|start|>user<|message|>What is 2+2?<|end|><|start|>assistant"
+        );
+    }
+
+    #[test]
+    fn a_harmony_conversation_declares_tools_and_routes_calls() {
+        let tool = crate::api::types::Tool::function(
+            "read_file".into(),
+            Some("Read a file.".into()),
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "File path."}},
+                "required": ["path"]
+            })),
+        );
+        let mut call = msg("assistant", "");
+        call.tool_calls = Some(vec![crate::api::types::ToolCall {
+            id: "c1".into(),
+            r#type: "function".into(),
+            function: Some(crate::api::types::ToolCallFunction {
+                name: "read_file".into(),
+                arguments: Some("{\"path\":\"a.rs\"}".into()),
+            }),
+        }]);
+        let mut result = msg("tool", "fn main() {}");
+        result.tool_call_id = Some("c1".into());
+        let out = format_harmony(
+            &[msg("system", "Be brief."), msg("user", "Show a.rs"), call, result],
+            Some(&[tool]),
+        );
+        assert!(out.contains("'functions'."));
+        assert!(out.contains(
+            "<|start|>developer<|message|># Instructions\n\nBe brief.\n\n# Tools\n\n## functions\n\n\
+             namespace functions {\n\n// Read a file.\ntype read_file = (_: {\n// File path.\n\
+             path: string,\n}) => any;\n\n} // namespace functions<|end|>"
+        ));
+        assert!(out.contains(
+            "<|start|>assistant<|channel|>commentary to=functions.read_file \
+             <|constrain|>json<|message|>{\"path\":\"a.rs\"}<|call|>\
+             <|start|>functions.read_file to=assistant<|channel|>commentary<|message|>fn main() {}<|end|>"
+        ));
+        assert!(out.ends_with("<|start|>assistant"));
     }
 
     #[test]

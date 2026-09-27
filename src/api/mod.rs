@@ -30,7 +30,7 @@ mod anthropic;
 mod client;
 pub mod launch;
 pub(crate) mod thinking;
-mod tool_calls;
+pub(crate) mod tool_calls;
 
 // Production features. Internal to the crate - none of these
 // types are surfaced through loken::api re-exports today, so the

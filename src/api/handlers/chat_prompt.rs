@@ -102,6 +102,10 @@ pub(crate) fn build_prompt(
         Some(tools) if template_takes_tools(template) => {
             format_chat_prompt_with_tools(messages, template, tools)
         }
+        Some(tools) if template_is_harmony(template) => format_harmony(messages, Some(tools)),
+        Some(tools) if template_is_mistral_tools(template) => {
+            format_mistral_tools(messages, template.unwrap_or_default(), Some(tools))
+        }
         Some(tools) => {
             let directive = crate::api::tool_calls::tool_choice_directive(spec.tool_choice);
             let flat = crate::api::tool_calls::flatten_messages(

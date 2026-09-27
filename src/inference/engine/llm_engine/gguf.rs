@@ -523,7 +523,9 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
                         // find a delimiter, and a reasoning model then delivered its chain
                         // of thought as the answer.
                         let parsed_by_the_api =
-                            crate::api::thinking::SPLIT_MARKERS.contains(&token_str.as_str());
+                            crate::api::thinking::SPLIT_MARKERS.contains(&token_str.as_str())
+                                || crate::api::tool_calls::TOOL_MARKERS
+                                    .contains(&token_str.as_str());
                         let special = *type_id != 4 && !parsed_by_the_api;
                         special_tokens.push(tokenizers::AddedToken::from(token_str, special));
                     }

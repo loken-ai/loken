@@ -52,6 +52,19 @@ pub enum ToolFormat {
     DeepSeekDsml,
 }
 
+/// Control tokens a tool-call parser reads in the generated text. A vocabulary that makes
+/// them control tokens would drop them from a decode that skips those, and the call would
+/// reach the client as prose.
+pub(crate) const TOOL_MARKERS: [&str; 7] = [
+    "[TOOL_CALLS]",
+    "[/TOOL_CALLS]",
+    "[ARGS]",
+    "[CALL_ID]",
+    "<|python_tag|>",
+    "<tool_call>",
+    "</tool_call>",
+];
+
 impl ToolFormat {
     /// Start markers that, once fully present in the output, indicate the
     /// model has begun a tool call. Used by the streaming scanner to know
@@ -1015,6 +1028,11 @@ fn json_or_string(value: &str) -> Value {
 
 /// Mistral: `[TOOL_CALLS]` followed by a JSON array (or a single object)
 /// of `{"name":..,"arguments":..}`.
+/// The marker a named Mistral call puts before its arguments.
+const ARGS_MARK: &str = "[ARGS]";
+/// The marker some Mistral templates put between a call's name and its arguments.
+const CALL_ID_MARK: &str = "[CALL_ID]";
+
 fn parse_mistral(raw: &str) -> ToolParseResult {
     const MARK: &str = "[TOOL_CALLS]";
     if !raw.contains(MARK) {
@@ -1027,6 +1045,28 @@ fn parse_mistral(raw: &str) -> ToolParseResult {
     while let Some(idx) = rest.find(MARK) {
         content.push_str(&rest[..idx]);
         let after = rest[idx + MARK.len()..].trim_start();
+        // The newer spelling names the function, then its arguments after [ARGS]:
+        // `[TOOL_CALLS]name[ARGS]{..}`, with a `[CALL_ID]n` between them in some templates.
+        if let Some(args_at) = after
+            .find(ARGS_MARK)
+            .filter(|_| !after.starts_with('[') && !after.starts_with('{'))
+        {
+            let name = after[..args_at]
+                .split(CALL_ID_MARK)
+                .next()
+                .unwrap_or("")
+                .trim();
+            let tail = &after[args_at + ARGS_MARK.len()..];
+            if let Some(span) = first_json_object(tail) {
+                if !name.is_empty() {
+                    let args = serde_json::from_str::<Value>(span).unwrap_or(Value::Null);
+                    calls.push(make_call(name, &args));
+                }
+                let end = (span.as_ptr() as usize + span.len()) - rest.as_ptr() as usize;
+                rest = &rest[end.min(rest.len())..];
+                continue;
+            }
+        }
         // Strip an optional [/TOOL_CALLS] trailer when locating the JSON.
         let after = after.strip_prefix('[').map(|_| after).unwrap_or(after);
         if let Some(span) = first_json_array(after).or_else(|| first_json_object(after)) {
@@ -1314,8 +1354,15 @@ impl StreamToolScanner {
     /// tool region). When `finalize` yields no calls - e.g. a bare-JSON
     /// trigger fired on text that wasn't actually a tool call - the caller
     /// should flush this as content so nothing is lost.
+    ///
+    /// A start marker the model opened and ended on, with no call after it, is not content
+    /// and is dropped.
     pub fn unstreamed(&self) -> &str {
-        &self.buf[self.emitted.min(self.buf.len())..]
+        let rest = &self.buf[self.emitted.min(self.buf.len())..];
+        if self.markers.contains(&rest.trim()) {
+            return "";
+        }
+        rest
     }
 }
 
@@ -1329,6 +1376,15 @@ mod tests {
             Some("desc".into()),
             Some(serde_json::json!({"type":"object"})),
         )
+    }
+
+    #[test]
+    fn a_start_marker_with_no_call_after_it_is_dropped() {
+        let mut sc = StreamToolScanner::new(ToolFormat::Hermes);
+        let streamed = sc.push("The crate name is \"loken\".\n<tool_call>");
+        assert_eq!(streamed, "The crate name is \"loken\".\n");
+        assert!(sc.finalize().is_empty());
+        assert_eq!(sc.unstreamed(), "");
     }
 
     #[test]
@@ -1504,6 +1560,21 @@ mod tests {
         let r = parse_tool_calls(ToolFormat::Hermes, raw);
         assert_eq!(r.calls.len(), 2);
         assert_eq!(r.calls[1].function.as_ref().unwrap().name, "b");
+    }
+
+    #[test]
+    fn parse_mistral_named_calls() {
+        let r = parse_tool_calls(
+            ToolFormat::Mistral,
+            "ok[TOOL_CALLS]read_file[ARGS]{\"path\": \"a.rs\"}[TOOL_CALLS]list_dir[CALL_ID]1[ARGS]{\"path\": \".\"}",
+        );
+        let names: Vec<&str> = r
+            .calls
+            .iter()
+            .map(|c| c.function.as_ref().unwrap().name.as_str())
+            .collect();
+        assert_eq!(names, ["read_file", "list_dir"]);
+        assert_eq!(r.content, "ok");
     }
 
     #[test]
