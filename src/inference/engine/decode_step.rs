@@ -110,9 +110,12 @@ impl StopTracker {
     /// terminates the rolling suffix (generation must stop).
     pub(crate) fn push_and_check(&mut self, text: &str, stop_sequences: &[String]) -> bool {
         self.buf.push_str(text);
-        // Keep buffer trimmed to 2x max stop sequence length
+        // Keep buffer trimmed to 2x max stop sequence length, cut on a char boundary.
         if self.buf.len() > self.max_len * 2 {
-            let trim_at = self.buf.len() - self.max_len * 2;
+            let mut trim_at = self.buf.len() - self.max_len * 2;
+            while !self.buf.is_char_boundary(trim_at) {
+                trim_at += 1;
+            }
             self.buf.drain(..trim_at);
         }
         match stop_sequences
@@ -352,4 +355,21 @@ pub(crate) fn record_logprobs(
             .map(|(id, l)| (id, piece(id), l))
             .collect(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stop_buffer_trims_on_a_char_boundary() {
+        let stops = vec!["<|end|>".to_string()];
+        let mut t = StopTracker::new(&stops);
+        for piece in ["héllo ", "wörld ", "日本語", "é", "<|end", "|>"] {
+            if t.push_and_check(piece, &stops) {
+                break;
+            }
+        }
+        assert_eq!(t.matched(), Some("<|end|>"));
+    }
 }
