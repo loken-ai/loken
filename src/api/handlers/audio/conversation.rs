@@ -310,16 +310,6 @@ pub(super) fn conv_note_model(conv_id: &str, model: &str) -> Vec<String> {
     ws.models.iter().cloned().collect()
 }
 
-/// The image route, as events rather than one late payload.
-///
-/// It forwards exactly what `/v1/images/generations` forwards - the loader's stage lines, then
-/// the denoise progress - and ends with the same JSON body the non-streaming branch returns, so
-/// a client reads one final event instead of parsing a second shape.
-///
-/// The load runs beside this generator so its stage lines can be forwarded while it happens,
-/// and is aborted when the generator is dropped: a client that stops reading must not leave
-/// gigabytes loading for nobody.
-#[cfg(feature = "image")]
 /// The messages without their images, for a turn whose images are not encoded: a prompt
 /// must not mark a place for an image the encoder never saw.
 fn without_images(messages: &[crate::api::types::Message]) -> Vec<crate::api::types::Message> {
@@ -333,6 +323,16 @@ fn without_images(messages: &[crate::api::types::Message]) -> Vec<crate::api::ty
         .collect()
 }
 
+/// The image route, as events rather than one late payload.
+///
+/// It forwards exactly what `/v1/images/generations` forwards - the loader's stage lines, then
+/// the denoise progress - and ends with the same JSON body the non-streaming branch returns, so
+/// a client reads one final event instead of parsing a second shape.
+///
+/// The load runs beside this generator so its stage lines can be forwarded while it happens,
+/// and is aborted when the generator is dropped: a client that stops reading must not leave
+/// gigabytes loading for nobody.
+#[cfg(feature = "image")]
 pub(super) async fn conversation_image_stream(
     state: APIServer,
     model: String,
