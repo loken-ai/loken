@@ -409,7 +409,6 @@ impl LlmEngine {
                     _ => None,
                 })
                 .unwrap_or_default();
-            let _is_gemma4_moe = kv_arch_check == "gemma4" && num_layers == 30;
             // gemma4 stays OFF a quantized KV cache, and the probe that put it back on is
             // reverted here.
             //
@@ -1574,8 +1573,13 @@ impl LlmEngine {
                         Some(effective_ctx),
                     ) {
                         Ok(m) => {
-                            info!("✅ {} loaded: {} segments across {} CUDA GPUs + CPU (kv_quant={:?}, kv_ctx={})",
-                                arch, hetero_plan.segments.len(), hetero_cuda_devs.len(), kv_quant, effective_ctx);
+                            let placement = hetero_plan
+                                .segments
+                                .iter()
+                                .map(|s| format!("{}:{}-{}", s.kind, s.layer_start, s.layer_end))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            info!("✅ {arch} loaded: layers {placement} (kv_quant={kv_quant:?}, kv_ctx={effective_ctx})");
                             try_wrap_with_vision(m, projector_blob.as_deref())?
                         }
                         // Tier 2: OOM on an optimistic placement that did NOT
