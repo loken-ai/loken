@@ -1470,9 +1470,28 @@ impl LlmEngine {
                         // optimism can't mis-size.
                         HeteroPlan::forced_gpu(num_layers, num_layers, gpu_idx)
                     } else {
-                        HeteroPlan::calculate_with_kv_reserve(
-                            num_layers, file_size, &cuda_devices, &[], 1.0,
-                            kv_bytes_per_layer, gpu_runtime_reserve,
+                        let tensor_bytes = |name: &str| {
+                            content.tensor_infos.get(name).map_or(0, |t| t.size_in_bytes() as u64)
+                        };
+                        let block_bytes: u64 = content
+                            .tensor_infos
+                            .iter()
+                            .filter(|(n, _)| n.starts_with("blk."))
+                            .map(|(_, t)| t.size_in_bytes() as u64)
+                            .sum();
+                        // An untied model uploads `output.weight`; a tied one uploads its
+                        // embedding table as the projection.
+                        let head_bytes = match tensor_bytes("output.weight") {
+                            0 => tensor_bytes("token_embd.weight"),
+                            b => b,
+                        };
+                        HeteroPlan::calculate_holding_head(
+                            num_layers,
+                            if block_bytes > 0 { block_bytes } else { file_size },
+                            head_bytes,
+                            &cuda_devices,
+                            kv_bytes_per_layer,
+                            gpu_runtime_reserve,
                         )
                     };
                     // Create CUDA devices for ALL detected GPUs, not just

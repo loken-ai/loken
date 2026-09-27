@@ -149,6 +149,68 @@ impl HeteroPlan {
         )
     }
 
+    /// Plans the blocks of a model whose output projection is uploaded after them to the
+    /// card running its last card block. That card's free memory is held back by
+    /// `head_bytes` before the blocks are divided; when holding it back moves the last card
+    /// block to another card, the projection follows it and the plan is redone, so the
+    /// projection always has room where the loader puts it. The loader also keeps the
+    /// runtime reserve free on that card after the projection, so the reserve is held there
+    /// too instead of being given to blocks. `block_bytes` counts the blocks alone.
+    pub fn calculate_holding_head(
+        total_layers: usize,
+        block_bytes: u64,
+        head_bytes: u64,
+        cuda_devices: &[(usize, u64)],
+        kv_bytes_per_layer: u64,
+        gpu_runtime_reserve_bytes: u64,
+    ) -> Self {
+        let plan_with = |devs: &[(usize, u64)]| {
+            Self::calculate_with_kv_reserve(
+                total_layers,
+                block_bytes,
+                devs,
+                &[],
+                1.0,
+                kv_bytes_per_layer,
+                gpu_runtime_reserve_bytes,
+            )
+        };
+        let last_card = |plan: &Self| {
+            plan.segments.iter().rev().find_map(|s| match s.kind {
+                DeviceKind::Cuda(i) => Some(i),
+                _ => None,
+            })
+        };
+        let held = if head_bytes > 0 {
+            head_bytes.saturating_add(gpu_runtime_reserve_bytes)
+        } else {
+            0
+        };
+        let mut plan = plan_with(cuda_devices);
+        let mut holder = None;
+        for _ in 0..cuda_devices.len() {
+            let Some(card) = last_card(&plan) else {
+                break;
+            };
+            if holder == Some(card) {
+                break;
+            }
+            holder = Some(card);
+            let devs: Vec<(usize, u64)> = cuda_devices
+                .iter()
+                .map(|&(i, free)| {
+                    if i == card {
+                        (i, free.saturating_sub(held))
+                    } else {
+                        (i, free)
+                    }
+                })
+                .collect();
+            plan = plan_with(&devs);
+        }
+        plan
+    }
+
     /// Like `calculate_with_kv`, but reserves `gpu_runtime_reserve_bytes` of
     /// non-weight headroom on every CUDA device before placing layers. This is
     /// the cuBLAS handle/workspace + chunked-prefill activation peak that isn't
@@ -706,6 +768,27 @@ mod tests {
         assert_eq!(plan.segments[1].num_layers(), 14);
         // The segment still reports the device's real VRAM, not its weight.
         assert_eq!(plan.segments[0].free_memory_bytes, gb(16));
+    }
+
+    #[test]
+    fn the_output_projection_keeps_room_on_the_last_card() {
+        // Eighty 1 GiB blocks over two 16 GiB cards spill; the card running the last card
+        // block must still hold the 1 GiB projection after its blocks.
+        let cards = [(0, gb(16)), (1, gb(16))];
+        let plain = HeteroPlan::calculate_with_kv_reserve(80, gb(80), &cards, &[], 1.0, 0, 0);
+        let held = HeteroPlan::calculate_holding_head(80, gb(80), gb(1), &cards, 0, 0);
+        let on = |p: &HeteroPlan, i: usize| -> usize {
+            p.segments
+                .iter()
+                .filter(|s| s.kind == DeviceKind::Cuda(i))
+                .map(|s| s.num_layers())
+                .sum()
+        };
+        assert_eq!(on(&plain, 1), 16);
+        assert_eq!(on(&held, 1), 15);
+        assert_eq!(on(&held, 0), 16);
+        let total: usize = held.segments.iter().map(|s| s.num_layers()).sum();
+        assert_eq!(total, 80);
     }
 
     #[test]
