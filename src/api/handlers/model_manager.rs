@@ -6,21 +6,6 @@ use super::*;
 /// Default keep-alive duration in minutes (same as Ollama)
 const DEFAULT_KEEP_ALIVE_MINUTES: i64 = 5;
 
-/// Default cap on simultaneously loaded models. When loading a new model
-/// would exceed this cap, the LRU model(s) are unloaded first to free
-/// VRAM/RAM. Matches Ollama's default of 1.
-const DEFAULT_MAX_LOADED_MODELS: usize = 1;
-
-/// Read max loaded models from `OLLAMA_MAX_LOADED_MODELS` (Ollama-compat
-/// env var, kept for parity), else the default.
-fn get_max_loaded_models() -> usize {
-    std::env::var("OLLAMA_MAX_LOADED_MODELS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(DEFAULT_MAX_LOADED_MODELS)
-}
-
 /// Declare the engines that can still be holding weights once a request ends.
 ///
 /// One list, expanded into the enum AND into `ALL`, so an engine cannot exist without
@@ -784,44 +769,38 @@ impl APIServer {
         Ok(UnloadOutcome::NotResident)
     }
 
-    /// Free slots for a new model by unloading the LRU entries that
-    /// aren't `incoming_id` until the loaded count is below the cap.
-    /// Generic: applies to every architecture and every accelerator;
-    /// prior engines hold weights, KV blocks, scratch buffers and pool
-    /// allocations that prevent the next model's HeteroPlan from
-    /// claiming GPU memory.
-    pub(crate) async fn evict_to_make_room(&self, incoming_id: &str) {
-        let max_loaded = get_max_loaded_models();
-        // Snapshot candidates (skip the incoming model itself) sorted
-        // by oldest-use first.
-        let victims: Vec<String> = {
-            let engines = self.engines.read().await;
-            // Already counts incoming as +1 once we push it; we want
-            // existing != incoming_id count <= max_loaded - 1.
-            let mut others: Vec<(i64, String)> = engines
+    /// Unloads the least recently used language models, other than `incoming_id`, while the
+    /// cards' free memory is short of the `need` bytes the incoming model's weights take.
+    /// Resident models hold weights, KV blocks and pools that would otherwise push the new
+    /// model's placement onto the host; as many stay resident as the memory allows.
+    pub(crate) async fn evict_to_make_room(&self, incoming_id: &str, need: u64) {
+        let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let free: u64 = crate::inference::place::device_probe::probe_cuda_gpus()
                 .iter()
-                .filter(|e| e.model_id != incoming_id)
-                .map(|e| (e.last_used.load(Ordering::Relaxed), e.model_id.clone()))
-                .collect();
-            let to_remove = others.len().saturating_sub(max_loaded.saturating_sub(1));
-            if to_remove == 0 {
-                Vec::new()
-            } else {
-                others.sort_by_key(|(ts, _)| *ts);
-                others
-                    .into_iter()
-                    .take(to_remove)
-                    .map(|(_, id)| id)
-                    .collect()
+                .map(|g| g.available)
+                .sum();
+            if need <= free {
+                return;
             }
-        };
-        for victim in victims {
+            let victim = {
+                let engines = self.engines.read().await;
+                engines
+                    .iter()
+                    .filter(|e| e.model_id != incoming_id && !tried.contains(&e.model_id))
+                    .min_by_key(|e| e.last_used.load(Ordering::Relaxed))
+                    .map(|e| e.model_id.clone())
+            };
+            let Some(victim) = victim else {
+                return;
+            };
             info!(
-                "⚖️  Auto-evicting LRU model {} to make room for {} (max_loaded={})",
-                victim, incoming_id, max_loaded
+                "⚖️  Evicting LRU model {victim} to make room for {incoming_id} \
+                 ({} MB needed, {} MB free)",
+                need >> 20,
+                free >> 20
             );
-            // unload_model logs success/failure; ignore the result so
-            // a stale entry can't block the new load.
+            tried.insert(victim.clone());
             let _ = self.unload_model(&victim).await;
         }
     }

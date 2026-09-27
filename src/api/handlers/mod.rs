@@ -1687,12 +1687,6 @@ impl APIServer {
             set: self.loading.clone(),
             model_id: model_id.to_string(),
         };
-        // Auto-evict LRU models if we'd exceed the loaded-models cap.
-        // Generic across all architectures: any prior engine with its
-        // weights still on GPU steals VRAM from the new model and may
-        // force the next HeteroPlan into CPU fallback.
-        self.evict_to_make_room(model_id).await;
-
         let mut config = self.config_for_model(model_id);
         if let Some(want) = window {
             let want = match self.declared_context(model_id) {
@@ -1712,6 +1706,9 @@ impl APIServer {
         // GPU otherwise. Sized from the checkpoint file (resident ~ file size
         // for GGUF).
         let hot = self.model_blob_size(model_id, &config);
+        // Resident language models stay while the cards hold the incoming one too; the
+        // least recently used go first when they would push it off the cards.
+        self.evict_to_make_room(model_id, hot).await;
         if hot > 0 {
             crate::inference::place::vram_manager::ensure_gpu_headroom("llm", hot, 0).await;
         }
@@ -2235,11 +2232,7 @@ impl APIServer {
         let ollama = crate::inference::load::ollama_manager::OllamaManager::new(PathBuf::from(
             &self.ollama_models_dir,
         ));
-        ollama
-            .get_model_path(&name, &tag)
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .unwrap_or(0)
+        ollama.weights_size(&name, &tag).unwrap_or(0)
     }
 
     /// Start periodic stats logging

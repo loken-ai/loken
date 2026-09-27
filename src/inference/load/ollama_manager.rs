@@ -568,6 +568,25 @@ impl OllamaManager {
         }
     }
 
+    /// Bytes of the weights a load reads: the manifest's model and projector layers.
+    pub fn weights_size(&self, name: &str, tag: &str) -> Option<u64> {
+        let manifest = self.read_manifest_json(name, tag)?;
+        let layers = manifest.get("layers")?.as_array()?;
+        let bytes = layers
+            .iter()
+            .filter(|l| {
+                l.get("mediaType")
+                    .and_then(|m| m.as_str())
+                    .is_some_and(|m| {
+                        m == "application/vnd.ollama.image.model"
+                            || m == "application/vnd.ollama.image.projector"
+                    })
+            })
+            .filter_map(|l| l.get("size").and_then(|s| s.as_u64()))
+            .sum();
+        Some(bytes)
+    }
+
     /// Get model size in bytes
     pub fn get_model_size(&self, name: &str, tag: &str) -> Result<u64> {
         if let Some(_path) = self.get_model_path(name, tag) {
@@ -634,5 +653,30 @@ pub enum OllamaError {
 impl From<std::io::Error> for OllamaError {
     fn from(err: std::io::Error) -> Self {
         OllamaError::IoError(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_weights_are_the_model_and_projector_layers() {
+        let dir = std::env::temp_dir().join(format!("loken_weights_size_{}", std::process::id()));
+        let m = OllamaManager::new(dir.clone());
+        let path = m.manifest_path("tiny", "1b");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"layers":[
+                {"mediaType":"application/vnd.ollama.image.model","digest":"a","size":1000},
+                {"mediaType":"application/vnd.ollama.image.projector","digest":"b","size":200},
+                {"mediaType":"application/vnd.ollama.image.params","digest":"c","size":30}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.weights_size("tiny", "1b"), Some(1200));
+        assert_eq!(m.weights_size("absent", "1b"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
