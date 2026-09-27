@@ -1228,6 +1228,7 @@ mod embed;
 mod generate;
 pub(crate) mod generation_defaults;
 mod loading;
+pub(crate) use loading::per_card_reserve;
 // The pool must be sized from `main`, before anything can build rayon's global one.
 pub use loading::configure_thread_pool;
 mod query;

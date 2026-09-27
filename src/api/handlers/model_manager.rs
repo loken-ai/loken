@@ -750,17 +750,30 @@ impl APIServer {
         Ok(UnloadOutcome::NotResident)
     }
 
-    /// Unloads the least recently used language models, other than `incoming_id`, while the
-    /// cards' free memory is short of the `need` bytes the incoming model's weights take.
+    /// Unloads the least recently used language models, other than `incoming_id`, while no
+    /// card has room for the `need` bytes the incoming model's weights take (or, for a model
+    /// larger than any card, while the cards together lack it).
     /// Resident models hold weights, KV blocks and pools that would otherwise push the new
     /// model's placement onto the host; as many stay resident as the memory allows.
-    pub(crate) async fn evict_to_make_room(&self, incoming_id: &str, need: u64) {
+    ///
+    /// `per_card` is what the load keeps free on each card it uses beyond the weights: the
+    /// KV cache, workspaces and staging the loader reserves.
+    pub(crate) async fn evict_to_make_room(&self, incoming_id: &str, need: u64, per_card: u64) {
         let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
-            let free: u64 = crate::inference::place::device_probe::probe_cuda_gpus()
-                .iter()
-                .map(|g| g.available)
-                .sum();
+            let cards = crate::inference::place::device_probe::probe_cuda_gpus();
+            // A model one card can hold wants one card with room: split across two it decodes
+            // at a fraction of its speed. A model no card can hold wants the room of all of them.
+            let fits_one_card = cards.iter().any(|g| need + per_card <= g.total);
+            let free: u64 = if fits_one_card {
+                cards
+                    .iter()
+                    .map(|g| g.available.saturating_sub(per_card))
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                cards.iter().map(|g| g.available.saturating_sub(per_card)).sum()
+            };
             if need <= free {
                 return;
             }
@@ -777,9 +790,10 @@ impl APIServer {
             };
             info!(
                 "⚖️  Evicting LRU model {victim} to make room for {incoming_id} \
-                 ({} MB needed, {} MB free)",
+                 ({} MB needed, {} MB free beyond {} MB kept per card)",
                 need >> 20,
-                free >> 20
+                free >> 20,
+                per_card >> 20
             );
             tried.insert(victim.clone());
             let _ = self.unload_model(&victim).await;
@@ -802,7 +816,7 @@ impl APIServer {
             return 0;
         };
         let bytes = self.model_blob_size(&victim, &self.config_for_model(&victim));
-        info!("⚖️  Unloading idle model {victim}: {except} ran out of memory while generating");
+        info!("⚖️  Unloading idle model {victim}: {except} ran out of memory");
         match self.unload_model(&victim).await {
             Ok(_) => bytes.max(1),
             Err(_) => 0,

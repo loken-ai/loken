@@ -10,6 +10,82 @@ use super::*;
 /// `tokenizer.ggml.eos_token_ids`: turn opener, turn closer, tool-response opener.
 const GEMMA4_TURN_STOP_PIECES: [&str; 3] = ["<|turn>", "<turn|>", "<|tool_response>"];
 
+/// Card memory the loader keeps beyond the weights and the runtime reserve: the second
+/// pass dequantises small tensors (the output projection among them), stages the KV cache
+/// and takes CUDA scratch, none of which the weights number counts.
+pub(crate) const LOADER_OVERHEAD_PER_GPU: u64 = 768 * 1024 * 1024;
+/// Largest window the runtime reserve prices the KV cache at: the caches start smaller and
+/// grow, and a longer window is admitted by the context planner, not by this reserve.
+const RESERVE_KV_WINDOW: u64 = 8192;
+/// cuBLAS handle and workspace on each card.
+const CUBLAS_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The dimensions of a language model a placement is priced from, read from its GGUF header.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ModelDims {
+    pub(crate) num_layers: usize,
+    pub(crate) hidden_size: usize,
+    pub(crate) num_heads: usize,
+    pub(crate) num_kv_heads: usize,
+    pub(crate) head_dim: usize,
+}
+
+impl ModelDims {
+    pub(crate) fn read(content: &gguf_file::Content, arch: &str) -> Self {
+        let num_layers = get_gguf_u32(content, &format!("{arch}.num_layers"))
+            .or_else(|| get_gguf_u32(content, &format!("{arch}.num_hidden_layers")))
+            .or_else(|| get_gguf_u32(content, &format!("{arch}.block_count")))
+            .or_else(|| get_gguf_u32(content, "model.num_layers"))
+            .or_else(|| get_gguf_u32(content, "model.num_hidden_layers"))
+            .or_else(|| get_gguf_u32(content, "num_layers"))
+            .or_else(|| get_gguf_u32(content, "num_hidden_layers"))
+            .or_else(|| get_gguf_u32(content, "block_count"))
+            .unwrap_or(32) as usize;
+        let hidden_size = get_gguf_u32(content, &format!("{arch}.hidden_size"))
+            .or_else(|| get_gguf_u32(content, &format!("{arch}.embedding_length")))
+            .or_else(|| get_gguf_u32(content, "embedding_length"))
+            .unwrap_or(4096) as usize;
+        let num_heads = get_gguf_u32(content, &format!("{arch}.num_attention_heads"))
+            .or_else(|| get_gguf_u32(content, &format!("{arch}.attention.head_count")))
+            .unwrap_or(32) as usize;
+        let num_kv_heads = get_gguf_u32(content, &format!("{arch}.attention.head_count_kv"))
+            .or_else(|| get_gguf_u32(content, &format!("{arch}.num_key_value_heads")))
+            .unwrap_or(num_heads as u32) as usize;
+        let head_dim = get_gguf_u32(content, &format!("{arch}.attention.key_length"))
+            .map(|v| v as usize)
+            .unwrap_or_else(|| if num_heads > 0 { hidden_size / num_heads } else { 128 });
+        Self { num_layers, hidden_size, num_heads, num_kv_heads, head_dim }
+    }
+
+    /// Card memory a model needs at run time beyond its weights, on each card it uses: its
+    /// KV cache at the reserve window (one byte per element, the quantised cache), the cuBLAS
+    /// workspace and the chunked-prefill activation peak.
+    pub(crate) fn runtime_reserve(&self, context_length: usize) -> u64 {
+        let kv_ctx = (context_length as u64).min(RESERVE_KV_WINDOW);
+        let kv = 2u64
+            .saturating_mul(self.num_kv_heads as u64)
+            .saturating_mul(self.head_dim as u64)
+            .saturating_mul(kv_ctx)
+            .saturating_mul(self.num_layers as u64);
+        let widest = self.hidden_size.max(self.num_kv_heads * self.head_dim) as u64;
+        let act = (PREFILL_CHUNK_TOKENS as u64)
+            .saturating_mul(widest)
+            .saturating_mul(4)
+            .saturating_mul(2);
+        kv.saturating_add(CUBLAS_WORKSPACE_BYTES).saturating_add(act)
+    }
+}
+
+/// Card memory a load of the GGUF at `path` keeps free on each card it uses, beyond the
+/// weights: the runtime reserve at the model's declared window plus the loader's overhead.
+pub(crate) fn per_card_reserve(path: &std::path::Path) -> Option<u64> {
+    let content = gguf_file::open_header(path).ok()?;
+    let arch = get_gguf_string(&content, "general.architecture")?;
+    let context_length = get_gguf_u32(&content, &format!("{arch}.context_length"))
+        .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| c as usize);
+    Some(ModelDims::read(&content, &arch).runtime_reserve(context_length) + LOADER_OVERHEAD_PER_GPU)
+}
+
 /// Size the rayon pool the host kernels run on, once per process.
 ///
 /// Called from `main` before anything else can touch rayon. It used to sit at the top of the
@@ -337,15 +413,8 @@ impl LlmEngine {
 
             // Extract actual layer count from GGUF (not hardcoded!)
             // Try multiple key variations for different architectures
-            let num_layers = get_gguf_u32(&content, &format!("{arch}.num_layers"))
-                .or_else(|| get_gguf_u32(&content, &format!("{arch}.num_hidden_layers")))
-                .or_else(|| get_gguf_u32(&content, &format!("{arch}.block_count")))  // Mistral3 uses block_count
-                .or_else(|| get_gguf_u32(&content, "model.num_layers"))        // Fallback: generic key
-                .or_else(|| get_gguf_u32(&content, "model.num_hidden_layers"))  // Another generic key
-                .or_else(|| get_gguf_u32(&content, "num_layers"))              // Bare key (some GGUF files)
-                .or_else(|| get_gguf_u32(&content, "num_hidden_layers"))       // Bare key variant
-                .or_else(|| get_gguf_u32(&content, "block_count"))             // Bare block_count
-                .unwrap_or(32) as usize;
+            let dims = ModelDims::read(&content, &arch);
+            let num_layers = dims.num_layers;
 
             // Log metadata extraction for debugging
             info!("🔍 Architecture detected: {}", arch);
@@ -364,19 +433,7 @@ impl LlmEngine {
                 debug!("📋 Available GGUF keys (first 20): {:?}", all_keys);
             }
             // Try multiple key variations for hidden_size (Mistral3 uses embedding_length)
-            let hidden_size = get_gguf_u32(&content, &format!("{arch}.hidden_size"))
-                .or_else(|| get_gguf_u32(&content, &format!("{arch}.embedding_length")))
-                .or_else(|| get_gguf_u32(&content, "embedding_length"))
-                .unwrap_or(4096) as usize;
-            let num_heads = get_gguf_u32(&content, &format!("{arch}.num_attention_heads"))
-                .or_else(|| get_gguf_u32(&content, &format!("{arch}.attention.head_count")))
-                .unwrap_or(32) as usize;
-            let num_kv_heads = get_gguf_u32(&content, &format!("{arch}.attention.head_count_kv"))
-                .or_else(|| get_gguf_u32(&content, &format!("{arch}.num_key_value_heads")))
-                .unwrap_or(num_heads as u32) as usize;
-            let head_dim = get_gguf_u32(&content, &format!("{arch}.attention.key_length"))
-                .map(|v| v as usize)
-                .unwrap_or_else(|| if num_heads > 0 { hidden_size / num_heads } else { 128 });
+            let ModelDims { hidden_size, num_heads, num_kv_heads, head_dim, .. } = dims;
 
             info!("📋 Model info: arch={}, layers={}, hidden_size={}, vocab_size={}, context_length={}, eos_token_id={}, n_kv_heads={}, head_dim={}",
                 arch, num_layers, hidden_size, vocab_size, context_length, eos_token_id,
@@ -595,14 +652,6 @@ impl LlmEngine {
             // Prepare heterogeneous devices for potential hetero planning
             // Apply device filters (for benchmarking different configurations).
             //
-            // Reserve a per-GPU loader overhead beyond the measured free
-            // memory - the second loader pass
-            // performs dequant of small tensors (e.g. output projection),
-            // KV cache dynamic staging, and CUDA scratch buffers that aren't
-            // in the static `file_size` weights number. Without this
-            // reserve, plans that fit weights+KV exactly within budget
-            // OOM during that pass and the loader falls back to CPU.
-            const LOADER_OVERHEAD_PER_GPU: u64 = 768 * 1024 * 1024; // 768 MB
             let cuda_devices: Vec<(usize, u64)> = if disable_cuda {
                 debug!("CUDA disabled by config (disable_cuda=true)");
                 vec![]
@@ -638,32 +687,7 @@ impl LlmEngine {
             // ctx x n_layers) plus a fixed cuBLAS-workspace + prefill-activation
             // margin. Sized from the model's own dimensions - no per-machine
             // constants - so it adapts across architectures.
-            let runtime_reserve_bytes: u64 = {
-                // KV-cache reserve at the loaded context (Q8 ≈ 1 byte/elem; round
-                // up for the F16 scale). The lazy caches start smaller and grow,
-                // but reserving the steady footprint keeps the single-GPU choice
-                // honest about where the cache will end up.
-                // (Tried sizing this reserve to the request num_ctx instead of 8192
-                // to fit borderline 24B single-GPU - NEUTRAL: mistral-small3.2 is
-                // genuinely >15.6 GB so it doesn't fit 1 GPU at any reserve, and the
-                // models that DO fit (devstral 14.3 GB) already fit at 8192. Kept the
-                // conservative 8192 reserve for OOM safety margin.)
-                let kv_ctx = (context_length as u64).min(8192);
-                let kv = 2u64
-                    .saturating_mul(num_kv_heads as u64)
-                    .saturating_mul(head_dim as u64)
-                    .saturating_mul(kv_ctx)
-                    .saturating_mul(num_layers as u64);
-                // cuBLAS handle/workspace + the chunked-prefill activation peak
-                // (PREFILL_CHUNK_TOKENS x widest_ffn x f32 x ~2 live buffers).
-                const CUBLAS_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024; // ~512 MB
-                let widest = hidden_size.max(num_kv_heads * head_dim) as u64;
-                let act = (PREFILL_CHUNK_TOKENS as u64)
-                    .saturating_mul(widest)
-                    .saturating_mul(4)
-                    .saturating_mul(2);
-                kv.saturating_add(CUBLAS_WORKSPACE_BYTES).saturating_add(act)
-            };
+            let runtime_reserve_bytes = dims.runtime_reserve(context_length);
             // The primary card is the fastest one that holds the model whole; a faster card
             // that other residents have filled does not make a model that fits a free one split
             // across both. With no card holding it, the fastest stays primary.

@@ -568,6 +568,23 @@ impl OllamaManager {
         }
     }
 
+    /// The blob holding the model's weights, named by its manifest's model layer.
+    pub fn weights_blob(&self, name: &str, tag: &str) -> Option<PathBuf> {
+        let manifest = self.read_manifest_json(name, tag)?;
+        let digest = manifest
+            .get("layers")?
+            .as_array()?
+            .iter()
+            .find(|l| {
+                l.get("mediaType").and_then(|m| m.as_str())
+                    == Some("application/vnd.ollama.image.model")
+            })?
+            .get("digest")?
+            .as_str()?
+            .replace(':', "-");
+        Some(self.blobs_dir().join(digest))
+    }
+
     /// Bytes of the weights a load reads: the manifest's model and projector layers.
     pub fn weights_size(&self, name: &str, tag: &str) -> Option<u64> {
         let manifest = self.read_manifest_json(name, tag)?;

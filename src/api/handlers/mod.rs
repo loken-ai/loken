@@ -1708,7 +1708,8 @@ impl APIServer {
         let hot = self.model_blob_size(model_id, &config);
         // Resident language models stay while the cards hold the incoming one too; the
         // least recently used go first when they would push it off the cards.
-        self.evict_to_make_room(model_id, hot).await;
+        let per_card = self.model_load_reserve(model_id, &config);
+        self.evict_to_make_room(model_id, hot, per_card).await;
         if hot > 0 {
             crate::inference::place::vram_manager::ensure_gpu_headroom("llm", hot, 0).await;
         }
@@ -2246,6 +2247,27 @@ impl APIServer {
             &self.ollama_models_dir,
         ));
         ollama.weights_size(&name, &tag).unwrap_or(0)
+    }
+
+    /// What loading `model_id` keeps free on each card beyond its weights, 0 when its
+    /// header cannot be read.
+    fn model_load_reserve(
+        &self,
+        model_id: &str,
+        config: &crate::inference::engine::llm_engine::InferenceConfig,
+    ) -> u64 {
+        let path = match &config.models_dir {
+            Some(dir) if dir.is_file() => Some(dir.clone()),
+            _ => {
+                let (name, tag) = model_id.split_once(':').unwrap_or((model_id, "latest"));
+                crate::inference::load::ollama_manager::OllamaManager::new(PathBuf::from(
+                    &self.ollama_models_dir,
+                ))
+                .weights_blob(name, tag)
+            }
+        };
+        path.and_then(|p| crate::inference::engine::llm_engine::per_card_reserve(&p))
+            .unwrap_or(0)
     }
 
     /// Start periodic stats logging
