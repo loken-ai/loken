@@ -3,7 +3,7 @@
 //! Follows the Qwen3-Reranker recipe: a causal LLM is prompted to answer "yes"/"no"
 //! on whether the document satisfies the query, and the relevance score is the softmax
 //! probability of the "yes" token at the final position. This reuses the existing full
-//! LLM forward (`LlmEngine::target_forward_all`) - no new model weights or kernels: any
+//! LLM forward (`LlmEngine::rerank_score`) - no new model weights or kernels: any
 //! causal Qwen-family model can act as the reranker, Qwen3-Reranker being the tuned one.
 
 /// Default retrieval instruction used when the caller doesn't supply one.

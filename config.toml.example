@@ -23,11 +23,6 @@ model_id = "qwen3:0.6b"
 # Sampling comes from the model (its Modelfile or generation_config.json) and the request;
 # placement, threads, memory and the KV cache format from the machine. None is configured.
 
-# A smaller model that proposes tokens the loaded model verifies. Pays where verification
-# is far dearer than drafting, such as a model spilling to the host.
-# draft_model = "llama3.2:1b"
-# draft_device_index = 0
-
 # The disk tier keeps conversation snapshots across a restart, within a disk budget.
 # kv_disk_dir = "/var/lib/loken/kv"
 # kv_disk_budget_gb = 0             # 0 = no limit

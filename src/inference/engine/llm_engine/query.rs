@@ -7,46 +7,6 @@
 use super::*;
 
 impl LlmEngine {
-    /// Multi-position forward returning logits at every input position.
-    /// Used by the speculative-decode verify step. Logits are returned as
-    /// a flat `Vec<f32>` of length `seq * vocab_size`; caller indexes by
-    /// `i * vocab_size .. (i+1) * vocab_size`.
-    pub async fn target_forward_all(
-        &self,
-        input: Vec<u32>,
-        pos: usize,
-    ) -> Result<(Vec<f32>, usize, usize), Box<dyn std::error::Error>> {
-        let model_state = self.model_state.clone();
-        let inner = tokio::task::spawn_blocking(move || -> AnyResult<(Vec<f32>, usize, usize)> {
-            let mut guard = model_state.blocking_lock();
-            let state = guard
-                .as_mut()
-                .ok_or_else(|| anyhow!("Target model not loaded"))?;
-            let device = state.device.clone();
-            let vocab_size = state.vocab_size;
-            let seq = input.len();
-            let x = Tensor::new(input.as_slice(), &device)?.unsqueeze(0)?;
-            let logits = state.model.forward_all(&x, pos)?;
-            let logits_cpu = match logits.device() {
-                Device::Cpu => logits,
-                _ => logits.to_device(&Device::Cpu)?,
-            };
-            // logits_cpu shape: [1, seq, vocab] or [seq, vocab]. Flatten to seq * vocab.
-            let flat = logits_cpu
-                .squeeze(0)?
-                .to_dtype(crate::tensor::DType::F32)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            Ok((flat, seq, vocab_size))
-        })
-        .await;
-        match inner {
-            Ok(Ok(r)) => Ok(r),
-            Ok(Err(e)) => Err(e.into()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// Cross-encoder relevance score in [0,1] for one (query, document) pair,
     /// using this engine's causal LLM as a Qwen3-Reranker (P(yes) at the final
     /// position). `instruction` empty -> the default retrieval instruction.
@@ -103,52 +63,6 @@ impl LlmEngine {
         .await;
         match inner {
             Ok(Ok(s)) => Ok(s),
-            Ok(Err(e)) => Err(e.into()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Trim the model's KV cache to a specific length. Public wrapper
-    /// for spec decode rollback after partial draft acceptance.
-    pub async fn trim_kv(&self, new_len: usize) -> Result<(), Box<dyn std::error::Error>> {
-        let model_state = self.model_state.clone();
-        let inner = tokio::task::spawn_blocking(move || -> AnyResult<()> {
-            let mut guard = model_state.blocking_lock();
-            let state = guard.as_mut().ok_or_else(|| anyhow!("Model not loaded"))?;
-            if state.model.supports_trim_kv() {
-                state.model.trim_kv(new_len);
-            }
-            Ok(())
-        })
-        .await;
-        match inner {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e.into()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Reset the draft model's internal KV state. Called at the start
-    /// of every speculative decode session so the draft's positional
-    /// cache starts at offset 0.
-    pub async fn draft_reset(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let model_state = self.model_state.clone();
-        let inner = tokio::task::spawn_blocking(move || -> AnyResult<()> {
-            let mut guard = model_state.blocking_lock();
-            let state = guard
-                .as_mut()
-                .ok_or_else(|| anyhow!("Draft model not loaded"))?;
-            // forward(_, 0) resets per-layer KV in every supported variant.
-            // Use a no-op single-token forward to trigger the reset path.
-            // Actually cheaper: trim to zero where supported.
-            if state.model.supports_trim_kv() {
-                state.model.trim_kv(0);
-            }
-            Ok(())
-        })
-        .await;
-        match inner {
-            Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(e.into()),
             Err(e) => Err(e.into()),
         }

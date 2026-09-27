@@ -61,7 +61,21 @@ pub fn configure_thread_pool() {
 
 impl LlmEngine {
     /// Load a model from disk with real GGUF parsing and weight loading
+    /// Loads the configured model; a model that will spill to the host gets its drafter
+    /// first (see `load_drafter_for`), confirmed once the model is placed.
     pub async fn load_model(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(target) = self.find_model_file(&self.config.model_id) {
+            if let Ok(meta) = std::fs::metadata(&target) {
+                self.load_drafter_for(&target, meta.len()).await;
+            }
+        }
+        self.load_model_only().await?;
+        self.confirm_drafter().await;
+        Ok(())
+    }
+
+    /// Loads the configured model alone.
+    pub(super) async fn load_model_only(&self) -> Result<(), Box<dyn std::error::Error>> {
         let model_id = self.config.model_id.clone();
         let load_start = std::time::Instant::now();
         crate::inference::place::device_probe::debug_vram_by_card("load-entry");

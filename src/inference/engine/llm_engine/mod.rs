@@ -249,6 +249,10 @@ pub struct LlmEngine {
     active: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether requests have been overlapping, which decides serial or batched serving.
     batching: Arc<std::sync::Mutex<batching::BatchingSignal>>,
+    /// The drafter chosen for the loaded target (`None` = not decided yet).
+    drafter_choice: Arc<std::sync::Mutex<Option<Option<String>>>>,
+    /// What the cycles with the current drafter taught about the best draft length.
+    draft_length: Arc<std::sync::Mutex<crate::inference::engine::decode_step::DraftLength>>,
 }
 
 impl InferenceEngine for LlmEngine {
@@ -267,6 +271,8 @@ impl InferenceEngine for LlmEngine {
             embedding_model: Arc::new(Mutex::new(None)),
             active: Arc::default(),
             batching: Arc::default(),
+            drafter_choice: Arc::default(),
+            draft_length: Arc::default(),
         }
     }
 
@@ -307,6 +313,8 @@ impl LlmEngine {
             embedding_model: Arc::new(Mutex::new(None)),
             active: Arc::default(),
             batching: Arc::default(),
+            drafter_choice: Arc::default(),
+            draft_length: Arc::default(),
         }
     }
 
@@ -326,91 +334,143 @@ impl LlmEngine {
         self.last_stream_stats.clone()
     }
 
-    /// Which model drafts for this one, if any.
-    ///
-    /// None, measured: on the canonical binary (qwen3:8b drafted by qwen3:0.6b, CPU, greedy,
-    /// short prose) the accept rate reaches only ~26%, which makes draft-and-verify
-    /// speed-NEUTRAL against plain decode - and at speed parity it does strictly more work,
-    /// so it costs more energy per token. It pays where acceptance is high, on structured or
-    /// code continuations, and this returns a drafter again when a regime with a measured net
-    /// win is identified. The earlier "+45%" was a sibling pure-CPU build, not a result.
-    fn spec_draft_model_id(&self) -> Option<String> {
-        self.config.draft_model.clone()
+    /// The smallest model in the store whose ordinary vocabulary is the target's, with its
+    /// size: every piece sits at the same id on both sides, so it can draft for it.
+    fn choose_drafter(&self, target: &std::path::Path, target_size: u64) -> Option<(String, u64)> {
+        let want = discover::gguf_vocabulary_hash(target)?;
+        self.store_models()
+            .into_iter()
+            .filter(|(_, path)| path.as_path() != target)
+            .filter_map(|(tag, path)| {
+                let size = std::fs::metadata(&path).ok()?.len();
+                (size < target_size && discover::gguf_vocabulary_hash(&path) == Some(want))
+                    .then_some((size, tag))
+            })
+            .min()
+            .map(|(size, tag)| (tag, size))
     }
 
-    /// Spec-decode: lazily load the nested drafter engine (once). The drafter
-    /// reuses the full `load_model` machinery via a nested `LlmEngine` whose config
-    /// is this engine's config with `model_id` swapped to the drafter. Returns true
-    /// when a drafter is loaded and ready. No-op (false) when unset/already-failed.
-    pub async fn ensure_draft_loaded(&self) -> bool {
-        let drafter_id = match self.spec_draft_model_id() {
-            Some(d) => d,
-            None => return false,
-        };
-        {
-            let g = self.draft_engine.lock().await;
-            if g.is_some() {
-                return true;
-            }
+    /// Decides, before the target is placed, whether it gets a drafter, and loads it first.
+    ///
+    /// Drafting pays where verification is far dearer than drafting, which is a target
+    /// spilling layers to the host, where each token reads gigabytes over the bus (measured on
+    /// deepseek-r1:70b with 26 layers on the host, drafted by llama3.2:1b); on the cards verify
+    /// costs about what drafting saves. A target larger than the cards' free memory will
+    /// spill, so its drafter loads first, whole, on the fastest card, and the target is then
+    /// placed in what is left. Called before the target takes the load lock.
+    async fn load_drafter_for(&self, target: &std::path::Path, target_size: u64) {
+        *self
+            .drafter_choice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(None);
+        let cards = crate::inference::place::device_probe::probe_cuda_gpus_for("llm");
+        let free: u64 = cards.iter().map(|g| g.available).sum();
+        if target_size <= free {
+            return;
         }
+        let Some((drafter_id, _)) = self.choose_drafter(target, target_size) else {
+            return;
+        };
         let mut dcfg = self.config.clone();
         dcfg.model_id = drafter_id.clone();
-        // The drafter is one small model on one card, never a drafter of its own - the
-        // target's config would otherwise make it spill like the target and load a drafter
-        // for the drafter.
-        dcfg.device_index = Some(self.config.draft_device_index.unwrap_or(0));
+        dcfg.device_index = cards.first().map(|g| g.index);
         dcfg.disable_arc_layers = true;
-        dcfg.draft_model = None;
         let nested = LlmEngine::with_config(dcfg);
-        match nested.load_model().await {
-            Ok(()) => {
-                // Same check the attach endpoint makes: the drafter answers in the target's
-                // ids, so every ordinary piece has to sit at the same id on both sides.
-                let same = self.tokenizer_fingerprint().await
-                    == nested.tokenizer_fingerprint().await
-                    && self.vocab_size().await == nested.vocab_size().await;
-                if !same {
-                    warn!(
-                        "spec-decode: drafter '{}' does not share the vocabulary of '{}'; spec-decode OFF",
-                        drafter_id, self.config.model_id
-                    );
-                    let _ = nested.unload().await;
-                    return false;
-                }
-                info!(
-                    "🜂 spec-decode: drafter '{}' loaded for target '{}'",
-                    drafter_id, self.config.model_id
-                );
-                *self.draft_engine.lock().await = Some(Arc::new(nested));
-                true
-            }
-            Err(e) => {
-                warn!(
-                    "spec-decode: drafter '{}' failed to load: {e}; spec-decode OFF",
-                    drafter_id
-                );
-                false
-            }
+        if let Err(e) = nested.load_model_only().await {
+            warn!("spec-decode: drafter '{drafter_id}' failed to load: {e}; spec-decode OFF");
+            return;
         }
+        info!(
+            "{} spills to the host: {drafter_id} drafts for it",
+            self.config.model_id
+        );
+        *self.draft_engine.lock().await = Some(Arc::new(nested));
+        *self.draft_length.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        *self
+            .drafter_choice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Some(drafter_id));
     }
 
-    /// The drafter this engine's configuration names, loaded on first use, as a handle the
-    /// request path can drive the way it drives an attached one. Two speculative loops exist:
-    /// the one inside the plain stream, gated per step by a calibrator, and
-    /// `generate_stream_with_draft`, which is what the attach endpoint uses. Measured on
-    /// deepseek-r1:70b spilling 26 layers to the host with llama3.2:1b drafting, the first gave
-    /// 1.68 tok/s and the second 2.30 against 1.49 alone. A drafter from the configuration
-    /// should get the loop that pays.
-    pub fn has_config_drafter(&self) -> bool {
-        self.config.draft_model.is_some()
+    /// Once the target is loaded: a drafter that does not share its vocabulary, or a target
+    /// that did not spill after all, leaves speculative decoding off.
+    async fn confirm_drafter(&self) {
+        let Some(drafter) = self.draft_engine.lock().await.clone() else {
+            return;
+        };
+        let spills = self.model_state.lock().await.as_ref().is_some_and(|s| {
+            s.model
+                .device_layer_distribution()
+                .iter()
+                .any(|(dev, ..)| dev == "CPU")
+        });
+        let same = self.tokenizer_fingerprint().await == drafter.tokenizer_fingerprint().await
+            && self.vocab_size().await == drafter.vocab_size().await;
+        if spills && same {
+            return;
+        }
+        if !same {
+            warn!("spec-decode: the drafter does not share the target's vocabulary; OFF");
+        }
+        let _ = drafter.unload().await;
+        *self.draft_engine.lock().await = None;
+        *self
+            .drafter_choice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(None);
     }
-    /// The loaded handle, or None until `ensure_draft_loaded` has run. Loading is not done
-    /// here: `load_model` is awaited from blocking threads everywhere else, and awaiting it
-    /// inside an axum handler makes that handler's future non-Send.
-    pub async fn config_drafter(&self) -> Option<Arc<LlmEngine>> {
-        self.config.draft_model.as_ref()?;
-        self.draft_engine.lock().await.as_ref().cloned()
+
+    /// Makes `drafter` draft for this engine until it is detached or the target reloads,
+    /// in place of any drafter it had. The caller has checked that the two share a
+    /// vocabulary. The draft length is learned afresh for the new pair.
+    pub async fn attach_drafter(&self, id: String, drafter: Arc<LlmEngine>) {
+        let previous = self.draft_engine.lock().await.replace(drafter);
+        if let Some(previous) = previous {
+            let _ = previous.unload().await;
+        }
+        *self
+            .drafter_choice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Some(id));
+        *self.draft_length.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
     }
+
+    /// Stops speculative decoding for this engine and releases its drafter; returns which
+    /// model it was.
+    pub async fn detach_drafter(&self) -> Option<String> {
+        let id = self.drafter_id();
+        if let Some(drafter) = self.draft_engine.lock().await.take() {
+            let _ = drafter.unload().await;
+        }
+        *self
+            .drafter_choice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(None);
+        id
+    }
+
+    /// The draft length the cycles so far point to.
+    pub fn draft_length(&self) -> usize {
+        self.draft_length
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next()
+    }
+
+    /// Which model drafts for this one: chosen when the target loaded, or attached.
+    pub fn drafter_id(&self) -> Option<String> {
+        self.drafter_choice
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .flatten()
+    }
+
+    /// Whether a drafter is loaded and ready. It is loaded with the target, never here.
+    pub async fn ensure_draft_loaded(&self) -> bool {
+        self.draft_engine.lock().await.is_some()
+    }
+
     /// Spec-decode: roll the drafter's KV cache back to `len` tokens (after a
     /// partial-accept reject), keeping it in lockstep with the verified target.
     pub fn draft_trim_kv(&self, len: usize) {
@@ -982,18 +1042,6 @@ pub fn release_cuda_pools() {
     if released > 0 {
         tracing::info!("🧹 Trimmed CUDA memory pools on {} device(s)", released);
     }
-}
-
-/// Cumulative-decode helper for streaming paths: decodes the FULL token
-/// sequence each call. Caller is responsible for the sent_text_len diff
-/// arithmetic. Required for Metaspace/SentencePiece tokenizers where
-/// per-token decode strips leading spaces.
-async fn decode_all(engine: &LlmEngine, tokens: &[u32]) -> String {
-    let guard = engine.model_state.lock().await;
-    guard
-        .as_ref()
-        .and_then(|s| s.tokenizer.decode(tokens, true).ok())
-        .unwrap_or_default()
 }
 
 /// Lazily get or build the llguidance ParserFactory for the loaded model.

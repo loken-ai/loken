@@ -209,28 +209,10 @@ pub(crate) struct LoadedModelEntry {
     pub(crate) expire_handle: Option<JoinHandle<()>>,
     /// Chat template loaded from Ollama manifest (Go template syntax)
     pub(crate) chat_template: Option<String>,
-    /// Neural-draft speculative decoding. When set, the streaming
-    /// generate path runs a draft+verify loop using this engine on a
-    /// (typically) different GPU. Tokenizer compat is verified at
-    /// attach time; the draft must produce identical token IDs as the
-    /// target.
-    pub(crate) draft: Option<DraftAttachment>,
     /// UNIX-millis timestamp of last use (request landed on this engine).
     /// Used by auto-eviction to pick the LRU model when we need to free
     /// a slot.
     pub(crate) last_used: Arc<AtomicI64>,
-}
-
-/// Sidecar engine that produces speculative draft tokens for the
-/// target. Tokenizer fingerprint must match the target's.
-pub(crate) struct DraftAttachment {
-    /// Draft model ID (for /api/inflight reporting).
-    pub model_id: String,
-    /// Draft engine on its own GPU. Has its own model_state lock.
-    pub engine: Arc<LlmEngine>,
-    /// How many tokens the draft proposes per cycle. Tunable per
-    /// pair; default 4. The target verifies K + 1 positions.
-    pub k: usize,
 }
 
 impl LoadedModelEntry {
@@ -246,7 +228,6 @@ impl LoadedModelEntry {
             keep_alive_minutes,
             expire_handle: None,
             chat_template: None,
-            draft: None,
             last_used: Arc::new(AtomicI64::new(now_millis())),
         }
     }

@@ -40,11 +40,11 @@ configure one.
 | Vision and speech in a chat turn | the chat routes, image and audio content | | Runs |
 | Log-probabilities, logit bias, seeds | the chat and completion routes | | Runs |
 | Embeddings and reranking | `/v1/embeddings`, `/api/embed`, `/v1/rerank` | | Runs |
-| Placement across cards and the host | automatic | `max_gpu_memory_fraction`, `kv_quant` | Measured, [STATUS](docs/STATUS.md#placement-measured-separately) |
+| Placement across cards and the host | automatic | | Measured, [STATUS](docs/STATUS.md#placement-measured-separately) |
 | Expert spilling for mixtures that do not fit | automatic | | Measured |
-| Continuous batching | | `continuous_batching` | Runs, cards only |
-| Speculative decoding | `/api/draft/attach` | `draft_model` | Measured on one pair, [guide](docs/guides/drafter.md) |
-| KV reuse across conversations, on disk, past the window | automatic | `kv_snapshots`, `kv_disk_dir`, `kv_shift_reuse` | Runs, [guide](docs/guides/kv-memory.md) |
+| Continuous batching | automatic, when requests overlap | | Runs, cards only |
+| Speculative decoding | automatic for a model that spills to the host; `/api/draft/attach` | | Measured on one pair, [guide](docs/guides/drafter.md) |
+| KV reuse across conversations, on disk, past the window | automatic | `kv_disk_dir` | Runs, [guide](docs/guides/kv-memory.md) |
 | Files, batches, message batches | `/v1/files`, `/v1/batches`, `/v1/messages/batches` | `files_dir` | Runs |
 | Moderation with a classifier | `/v1/moderations` | `moderation_model` | Runs, five families |
 | Images, edits, variations, adapters | `/v1/images/*`, `/v1/loras` | `lora_dir` | Judged partially, [STATUS](docs/STATUS.md#judged-partially) |

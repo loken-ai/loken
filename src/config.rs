@@ -69,8 +69,6 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub struct InferenceConfigToml {
     pub model_id: String,
-    pub draft_model: Option<String>,
-    pub draft_device_index: Option<usize>,
     #[serde(default)]
     pub kv_disk_dir: Option<String>,
     #[serde(default)]
@@ -240,8 +238,6 @@ impl Config {
             context_length: 0,
             dtype: DType::F16, // Default to F16
             device_index: None,
-            draft_model: toml_config.draft_model.clone(),
-            draft_device_index: toml_config.draft_device_index,
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
             kv_disk_budget_gb: toml_config.kv_disk_budget_gb,
             files_dir: toml_config.files_dir.clone(),

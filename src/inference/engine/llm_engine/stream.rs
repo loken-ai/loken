@@ -956,8 +956,12 @@ impl LlmEngine {
             // Spec-decode: lazily load the drafter (block_on via the captured
             // runtime Handle - this is a raw thread) + prefill it with the prompt so its
             // KV is in lockstep with the target, ready to draft from `next_token`.
-            let mut spec_on = spec_rt.block_on(spec_engine.ensure_draft_loaded())
-                && spec_engine.draft_prefill(&prompt_tokens);
+            // A drafter whose cycles lost to plain decoding is not prefilled; the plain steps
+            // are then timed so the comparison stays current.
+            let spec_drafter_on = spec_rt.block_on(spec_engine.ensure_draft_loaded());
+            let drafting = spec_drafter_on && spec_engine.draft_length() > 0;
+            let mut spec_on = drafting && spec_engine.draft_prefill(&prompt_tokens);
+            let mut time_plain = spec_drafter_on && !drafting;
             let mut pld_stats_drafted: u64 = 0;
             let mut pld_stats_accepted: u64 = 0;
             // Adaptive PLD gating: if recent accept rate is too low, disable
@@ -1741,16 +1745,29 @@ impl LlmEngine {
                     pld_cooldown = pld_cooldown.saturating_sub(1);
                     // Spec-decode: draft K from the drafter model when active,
                     // else the n-gram PLD draft. Verify below re-samples every position.
-                    const SPEC_K: usize = 4;
+                    // The draft length is learned across cycles (decode_step::DraftLength).
+                    let cycle_start = std::time::Instant::now();
+                    let mut draft_secs = 0.0;
+                    let want = if spec_on {
+                        spec_engine.draft_length()
+                    } else {
+                        0
+                    };
+                    if spec_on && want == 0 {
+                        // Plain decoding pays more; the drafter's cache is left behind for good.
+                        spec_on = false;
+                        time_plain = true;
+                    }
                     let draft: Vec<u32> = if spec_on {
                         let d = spec_engine.draft_k(
                             next_token,
-                            SPEC_K,
+                            want,
                             pos,
                             &recent_tokens,
                             repeat_penalty,
                             repeat_last_n,
                         );
+                        draft_secs = cycle_start.elapsed().as_secs_f64();
                         if d.is_empty() {
                             spec_on = false;
                         }
@@ -1761,151 +1778,172 @@ impl LlmEngine {
                         Vec::new()
                     };
 
-                    let pld_result: Option<(Vec<u32>, u32, usize, Option<Tensor>)> = if draft.len()
-                        >= 2
-                        && token_count + 1 + draft.len() <= max_tokens
-                    {
-                        // --- PLD speculative verification ---------------
-                        let k = draft.len();
+                    // A drafter's single token is worth a verify; an n-gram match of one is not.
+                    let worth_verifying = if spec_on {
+                        !draft.is_empty()
+                    } else {
+                        draft.len() >= 2
+                    };
+                    let pld_result: Option<(Vec<u32>, u32, usize, Option<Tensor>)> =
+                        if worth_verifying && token_count + 1 + draft.len() <= max_tokens {
+                            // --- PLD speculative verification ---------------
+                            let k = draft.len();
 
-                        let mut guard = model_state.blocking_lock();
-                        let state = match guard.as_mut() {
-                            Some(s) => s,
-                            None => {
-                                let _ = tx.blocking_send(Err("Model unloaded".into()));
-                                break;
+                            let mut guard = model_state.blocking_lock();
+                            let state = match guard.as_mut() {
+                                Some(s) => s,
+                                None => {
+                                    let _ = tx.blocking_send(Err("Model unloaded".into()));
+                                    break;
+                                }
+                            };
+
+                            // Build [next_token, draft_0, ..., draft_{k-1}]
+                            let mut input = Vec::with_capacity(k + 1);
+                            input.push(next_token);
+                            input.extend_from_slice(&draft);
+                            let x = match Tensor::new(input.as_slice(), &device_clone)
+                                .and_then(|t| t.unsqueeze(0))
+                            {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    let _ = tx.blocking_send(Err(format!("PLD tensor: {e}")));
+                                    return;
+                                }
+                            };
+                            let logits_res = state.model.forward_all(&x, pos);
+                            if let Err(ref e) = logits_res {
+                                // Some architectures hit a mask broadcast bug in multi-token
+                                // attention with cached KV. Permanently disable PLD for this
+                                // stream and fall through to single-token forward.
+                                tracing::warn!("PLD forward_all failed, disabling PLD: {}", e);
+                                pld_cooldown = u32::MAX;
                             }
-                        };
+                            if let Ok(logits) = logits_res {
+                                pld_stats_drafted += k as u64;
 
-                        // Build [next_token, draft_0, ..., draft_{k-1}]
-                        let mut input = Vec::with_capacity(k + 1);
-                        input.push(next_token);
-                        input.extend_from_slice(&draft);
-                        let x = match Tensor::new(input.as_slice(), &device_clone)
-                            .and_then(|t| t.unsqueeze(0))
-                        {
-                            Ok(t) => t,
-                            Err(e) => {
-                                let _ = tx.blocking_send(Err(format!("PLD tensor: {e}")));
-                                return;
-                            }
-                        };
-                        let logits_res = state.model.forward_all(&x, pos);
-                        if let Err(ref e) = logits_res {
-                            // Some architectures hit a mask broadcast bug in multi-token
-                            // attention with cached KV. Permanently disable PLD for this
-                            // stream and fall through to single-token forward.
-                            tracing::warn!("PLD forward_all failed, disabling PLD: {}", e);
-                            pld_cooldown = u32::MAX;
-                        }
-                        if let Ok(logits) = logits_res {
-                            pld_stats_drafted += k as u64;
-
-                            // Commit-delayed verification loop (shared:
-                            // decode_step::pld_verify_commit).
-                            // Temperature=0: GPU argmax-with-penalty, also
-                            // captures the device-resident U32 [1,1] tensor so
-                            // the next-iter forward can skip the Tensor::new
-                            // H->D round-trip (Path B step 3 - same bit-exact
-                            // contract as the non-PLD greedy site).
-                            // Temperature>0: host CPU sampler path.
-                            let mut committed: Vec<u32> = Vec::new();
-                            let outcome = pld_verify_commit(
-                                &logits,
-                                &draft,
-                                &mut committed,
-                                &mut recent_tokens,
-                                &mut pld_cache,
-                                pld_enabled,
-                                eos_token_id,
-                                &[],
-                                /* committed_base */ token_count,
-                                max_tokens,
-                                &mut |row, recent| {
-                                    if temperature == 0.0 {
-                                        #[cfg(feature = "cuda")]
-                                        {
-                                            gpu_sample_returning_tensor(
-                                                row,
-                                                recent,
-                                                repeat_penalty,
-                                                repeat_last_n,
-                                            )
-                                        }
-                                        #[cfg(not(feature = "cuda"))]
-                                        {
+                                // Commit-delayed verification loop (shared:
+                                // decode_step::pld_verify_commit).
+                                // Temperature=0: GPU argmax-with-penalty, also
+                                // captures the device-resident U32 [1,1] tensor so
+                                // the next-iter forward can skip the Tensor::new
+                                // H->D round-trip (Path B step 3 - same bit-exact
+                                // contract as the non-PLD greedy site).
+                                // Temperature>0: host CPU sampler path.
+                                let mut committed: Vec<u32> = Vec::new();
+                                let outcome = pld_verify_commit(
+                                    &logits,
+                                    &draft,
+                                    &mut committed,
+                                    &mut recent_tokens,
+                                    &mut pld_cache,
+                                    pld_enabled,
+                                    eos_token_id,
+                                    &[],
+                                    /* committed_base */ token_count,
+                                    max_tokens,
+                                    &mut |row, recent| {
+                                        if temperature == 0.0 {
+                                            #[cfg(feature = "cuda")]
+                                            {
+                                                gpu_sample_returning_tensor(
+                                                    row,
+                                                    recent,
+                                                    repeat_penalty,
+                                                    repeat_last_n,
+                                                )
+                                            }
+                                            #[cfg(not(feature = "cuda"))]
+                                            {
+                                                let penalized = apply_repeat_penalty(
+                                                    row,
+                                                    recent,
+                                                    repeat_penalty,
+                                                    repeat_last_n,
+                                                )?;
+                                                logits_processor
+                                                    .sample(&penalized)
+                                                    .map(|t| (t, None))
+                                            }
+                                        } else {
+                                            let row_cpu = match row.device() {
+                                                Device::Cpu => row.clone(),
+                                                _ => row.to_device(&Device::Cpu)?,
+                                            };
                                             let penalized = apply_repeat_penalty(
-                                                row,
+                                                &row_cpu,
                                                 recent,
                                                 repeat_penalty,
                                                 repeat_last_n,
                                             )?;
                                             logits_processor.sample(&penalized).map(|t| (t, None))
                                         }
-                                    } else {
-                                        let row_cpu = match row.device() {
-                                            Device::Cpu => row.clone(),
-                                            _ => row.to_device(&Device::Cpu)?,
-                                        };
-                                        let penalized = apply_repeat_penalty(
-                                            &row_cpu,
-                                            recent,
-                                            repeat_penalty,
-                                            repeat_last_n,
-                                        )?;
-                                        logits_processor.sample(&penalized).map(|t| (t, None))
+                                    },
+                                );
+                                let outcome = match outcome {
+                                    Ok(o) => o,
+                                    Err(e) => {
+                                        let _ = tx.blocking_send(Err(format!("PLD verify: {e}")));
+                                        return;
                                     }
-                                },
-                            );
-                            let outcome = match outcome {
-                                Ok(o) => o,
-                                Err(e) => {
-                                    let _ = tx.blocking_send(Err(format!("PLD verify: {e}")));
-                                    return;
+                                };
+                                let accepted_drafts = outcome.accepted_drafts;
+
+                                pld_stats_accepted += accepted_drafts as u64;
+                                // Window-rate cooldown synced with /api/generate
+                                // path (shared: decode_step::pld_window_update).
+                                pld_window_update(
+                                    &mut pld_window_drafted,
+                                    &mut pld_window_accepted,
+                                    &mut pld_cooldown,
+                                    k,
+                                    accepted_drafts,
+                                );
+                                let n_committed = 1 + accepted_drafts;
+                                let new_pos = pos + n_committed;
+
+                                if n_committed < k + 1 {
+                                    state.model.trim_kv(new_pos);
                                 }
-                            };
-                            let accepted_drafts = outcome.accepted_drafts;
+                                // Spec-decode: drafter KV lockstep (shared:
+                                // decode_step::spec_draft_lockstep).
+                                if spec_on {
+                                    spec_draft_lockstep(
+                                        &spec_engine,
+                                        &draft,
+                                        accepted_drafts,
+                                        new_pos,
+                                    );
+                                    spec_engine
+                                        .draft_length
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .record(
+                                            k,
+                                            accepted_drafts,
+                                            draft_secs,
+                                            cycle_start.elapsed().as_secs_f64(),
+                                        );
+                                }
 
-                            pld_stats_accepted += accepted_drafts as u64;
-                            // Window-rate cooldown synced with /api/generate
-                            // path (shared: decode_step::pld_window_update).
-                            pld_window_update(
-                                &mut pld_window_drafted,
-                                &mut pld_window_accepted,
-                                &mut pld_cooldown,
-                                k,
-                                accepted_drafts,
-                            );
-                            let n_committed = 1 + accepted_drafts;
-                            let new_pos = pos + n_committed;
-
-                            if n_committed < k + 1 {
-                                state.model.trim_kv(new_pos);
+                                // Path B3 carry-through: when the FINAL sampled
+                                // token came from gpu_sample_returning_tensor
+                                // (temperature=0 path), forward the device-
+                                // resident U32 tensor so the next non-PLD iter
+                                // can skip Tensor::new H->D round-trip.
+                                drop(guard); // lock released
+                                Some((
+                                    committed,
+                                    outcome.next_token,
+                                    new_pos,
+                                    outcome.next_token_dev,
+                                ))
+                            } else {
+                                None
                             }
-                            // Spec-decode: drafter KV lockstep (shared:
-                            // decode_step::spec_draft_lockstep).
-                            if spec_on {
-                                spec_draft_lockstep(&spec_engine, &draft, accepted_drafts, new_pos);
-                            }
-
-                            // Path B3 carry-through: when the FINAL sampled
-                            // token came from gpu_sample_returning_tensor
-                            // (temperature=0 path), forward the device-
-                            // resident U32 tensor so the next non-PLD iter
-                            // can skip Tensor::new H->D round-trip.
-                            drop(guard); // lock released
-                            Some((
-                                committed,
-                                outcome.next_token,
-                                new_pos,
-                                outcome.next_token_dev,
-                            ))
                         } else {
                             None
-                        }
-                    } else {
-                        None
-                    };
+                        };
 
                     if let Some((committed_tokens, new_next, new_pos, new_next_dev)) = pld_result {
                         // Stream committed tokens (next_token streams at top of next iter).
@@ -2094,6 +2132,13 @@ impl LlmEngine {
                             (tok, pos + 1, dev_next)
                         };
                         let baseline_ms = t_baseline.elapsed().as_secs_f64() * 1000.0;
+                        if time_plain {
+                            spec_engine
+                                .draft_length
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .record(0, 0, 0.0, cycle_start.elapsed().as_secs_f64());
+                        }
 
                         // Feed calibrator during baseline phase
                         #[cfg(feature = "opencl")]

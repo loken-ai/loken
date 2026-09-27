@@ -60,17 +60,9 @@ Nothing below is configured; a key of that name in an older `config.toml` loads 
 | KV cache format | The architecture and the kernels' head shapes; a request may still ask for one with `options.kv_quant`. |
 | Conversation snapshots | Each finished sequence is copied aside so a later request on it resumes from its own KV; how many are kept is bounded by the free device memory, leaving the cache its working window. |
 | Batched serving | A model serves requests one at a time until they overlap several times in a row, then batches them in its paged worker (cards only); as many lone arrivals in a row take it back to serial decode, the faster path for one stream. |
+| Speculative decoding | A model that spills layers to the host is drafted for by the smallest model in the store with the same ordinary vocabulary, loaded on the fastest card before the target; the draft length is learned from measured acceptance and cycle time. A model held on the cards gets no drafter. `POST /api/draft/attach` still attaches one by hand. |
 | Resident models | As many language models stay loaded as the cards hold; the least recently used is unloaded only when an incoming model would otherwise be pushed off the cards. |
 | Context shift | Once a conversation outgrows the window, the resident tail is kept and re-phased instead of prefilling the whole window, wherever the cache supports it (not Q4 caches, sliding-window layers or recurrent hybrids). |
-
-### Speculative decoding
-
-| Key | Default | What it does |
-|---|---|---|
-| `draft_model` | none | A smaller model, by tag, that proposes tokens the loaded model verifies. Pays where verification is far dearer than drafting, such as a model spilling to the host. |
-| `draft_device_index` | `0` | The card the drafter loads on, whole. |
-
-`POST /api/draft/attach` does the same for one session without a restart.
 
 ### KV reuse across requests
 

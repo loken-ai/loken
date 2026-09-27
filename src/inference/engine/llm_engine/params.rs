@@ -164,12 +164,6 @@ pub struct InferenceConfig {
     /// The card a single-card load is pinned to, set by code that places a companion model
     /// (a drafter) on purpose. `None` loads on the fastest card, as placement decides.
     pub device_index: Option<usize>,
-    /// A smaller model that proposes tokens for this one to verify, by tag. None = no
-    /// drafter. Worth setting only where verifying costs far more than drafting: a model
-    /// that spills to the host, where each token reads gigabytes over the bus.
-    pub draft_model: Option<String>,
-    /// Card the drafter loads on. Defaults to 0; it is placed whole on that one card.
-    pub draft_device_index: Option<usize>,
     /// Directory of the disk tier under the snapshots: token blocks of KV at the cache's
     /// own dtype, shared between sequences by prefix, one manifest per sequence. `None`
     /// keeps snapshots in memory only.
@@ -239,8 +233,6 @@ impl Default for InferenceConfig {
             context_length: 0,
             dtype: crate::tensor::DType::F16,
             device_index: None,
-            draft_model: None,
-            draft_device_index: None,
             kv_disk_dir: None,
             kv_disk_budget_gb: 0.0,
             files_dir: None,

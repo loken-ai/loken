@@ -566,7 +566,11 @@ impl LlmEngine {
             // with the target. `spec_on` ⟺ drafter loaded AND prefill succeeded.
             let spec_drafter_on = tokio::runtime::Handle::current()
                 .block_on(spec_engine.ensure_draft_loaded());
-            let mut spec_on = spec_drafter_on && spec_engine.draft_prefill(&prompt_tokens);
+            // A drafter whose cycles lost to plain decoding is not prefilled; the plain steps
+            // are then timed so the comparison stays current.
+            let drafting = spec_drafter_on && spec_engine.draft_length() > 0;
+            let mut spec_on = drafting && spec_engine.draft_prefill(&prompt_tokens);
+            let mut time_plain = spec_drafter_on && !drafting;
             if spec_on { info!("🜂 spec-decode active: drafter proposing for '{}'", state.name); }
             let (mut spec_drafted, mut spec_accepted): (u64, u64) = (0, 0);
             let mut pld_stats_drafted: u64 = 0;
@@ -1343,21 +1347,6 @@ impl LlmEngine {
                     // drafts). Sample each output position, accept the
                     // longest prefix that matches the draft, and trim the
                     // KV cache back to the accepted length on partial match.
-                    // Per-prompt-length PLD skip for deepseek-r1: this
-                    // reasoning-model family shows -3 % decode at SHORT
-                    // prompts with PLD on (multi-position verify
-                    // overhead exceeds rare n-gram accepts), but
-                    // benefits +8 % at medium/long where acceptance
-                    // compensates. Tuning notes:
-                    //   < 80: matched medium -> regressed it -10 pp
-                    //   < 40: short -0.9 % but medium/long both
-                    //         regressed ~7 pp (medium tokenizes < 40
-                    //         in deepseek-r1's vocab).
-                    //   < 25: tightest gate that only hits assay's
-                    //         "short" prompt (~20 tokens after tokeniser).
-                    let pld_short_skip = pld_enabled
-                        && prompt_tokens.len() < 25
-                        && state.name.starts_with("deepseek-r1");
                     // tried gemma4:latest first-30-decode-tokens
                     // PLD skip (hypothesis: cold-start window has 0%
                     // acceptance). Bench result: gemma4:latest short +44% ->
@@ -1377,15 +1366,24 @@ impl LlmEngine {
                     // makes the per-position verify GEMVs a net loss (qwen3/deepcoder 2.5K
                     // loss->tie once gated). (Proper fix = cpu_q8_kv::attention_multi.)
                     let pld_ctx_ok = pos <= pld_max_ctx_threshold();
-                    let pld_active = pld_enabled && pld_cooldown == 0 && !pld_short_skip && pld_ctx_ok;
+                    let pld_active = pld_enabled && pld_cooldown == 0 && pld_ctx_ok;
                     pld_cooldown = pld_cooldown.saturating_sub(1);
                     // Spec-decode: when a drafter is active, draft K tokens from
                     // it (its KV is at `pos`, in lockstep with the target). Otherwise
                     // fall back to the n-gram PLD draft. Either way the verify below
                     // re-samples every position -> output is the target's greedy.
-                    const SPEC_K: usize = 4;
-                    let mut draft: Vec<u32> = if spec_on {
-                        let d = spec_engine.draft_k(next_token, SPEC_K, pos, &recent_tokens, repeat_penalty, repeat_last_n);
+                    // The draft length is learned across cycles (decode_step::DraftLength).
+                    let cycle_start = std::time::Instant::now();
+                    let mut draft_secs = 0.0;
+                    let want = if spec_on { spec_engine.draft_length() } else { 0 };
+                    if spec_on && want == 0 {
+                        // Plain decoding pays more; the drafter's cache is left behind for good.
+                        spec_on = false;
+                        time_plain = true;
+                    }
+                    let draft: Vec<u32> = if spec_on {
+                        let d = spec_engine.draft_k(next_token, want, pos, &recent_tokens, repeat_penalty, repeat_last_n);
+                        draft_secs = cycle_start.elapsed().as_secs_f64();
                         if d.is_empty() { spec_on = false; } // drafter error -> disable spec
                         d
                     } else if pld_active {
@@ -1393,20 +1391,6 @@ impl LlmEngine {
                     } else {
                         Vec::new()
                     };
-                    // Per-model draft-length cap. deepseek-r1 has natural low
-                    // PLD acceptance at short prompts (post-pld_short_skip
-                    // gating). For non-short prompts that still run PLD,
-                    // capping K at 2 reduces per-cycle wasted forward work
-                    // when verification ultimately rejects. -0.9% TIE target.
-                    if state.name.starts_with("deepseek-r1") && draft.len() > 2 {
-                        draft.truncate(2);
-                    }
-                    // deepcoder cap=3 tested, regressed all 3
-                    // prompts (medium -4 pp, short -1 pp, long -1 pp). Higher
-                    // PLD acceptance benefits more from larger drafts in
-                    // deepcoder's repetitive code-completion patterns.
-                    // Not retrying.
-
                     if !draft.is_empty() && generated.len() + 1 + draft.len() <= max_tokens {
                         let k = draft.len();
                         pld_stats_drafted += k as u64;
@@ -1474,6 +1458,9 @@ impl LlmEngine {
                             spec_drafted += k as u64;
                             spec_accepted += accepted_drafts as u64;
                             spec_draft_lockstep(&spec_engine, &draft, accepted_drafts, pos);
+                            spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).record(
+                                k, accepted_drafts, draft_secs, cycle_start.elapsed().as_secs_f64(),
+                            );
                         }
 
                         // Set next_token to the last committed sample - the
@@ -1495,6 +1482,11 @@ impl LlmEngine {
                             &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                             &mut logits_processor,
                         )?;
+                        if time_plain {
+                            spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).record(
+                                0, 0, 0.0, cycle_start.elapsed().as_secs_f64(),
+                            );
+                        }
                         // next_token will be pushed to pld_cache at the start
                         // of the next outer-loop iteration (symmetric with
                         // generated / recent_tokens).
@@ -1627,8 +1619,9 @@ impl LlmEngine {
             // was - the streaming path has reported it all along.
             if spec_drafted > 0 {
                 info!(
-                    "Spec decode done: drafted={spec_drafted} accepted={spec_accepted} ({}%)",
+                    "Spec decode done: drafted={spec_drafted} accepted={spec_accepted} ({}%), next draft length {}",
                     (spec_accepted * 100) / spec_drafted,
+                    spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).next(),
                 );
             }
 

@@ -78,21 +78,15 @@ pub(crate) struct DraftAttachRequest {
     target: String,
     /// Draft model id. Tokenizer must match the target's exactly.
     draft: String,
-    /// CUDA device index for the draft. If omitted, uses the highest GPU
-    /// index that isn't where the target's primary device lives, falling
-    /// back to GPU 0.
+    /// CUDA device index for the draft. If omitted, the fastest card.
     #[serde(default)]
     device_index: Option<usize>,
-    /// Number of speculative tokens per cycle. Defaults to 4.
-    #[serde(default)]
-    k: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct DraftAttachResponse {
     target: String,
     draft: String,
-    k: usize,
     target_vocab: usize,
     draft_vocab: usize,
     tokenizer_fp_match: bool,
@@ -149,7 +143,6 @@ pub(crate) async fn draft_attach(
     validate_model_id(&request.draft)?;
     let target_name = normalize_model_id(&request.target);
     let draft_name = normalize_model_id(&request.draft);
-    let k = request.k.unwrap_or(4).clamp(1, 16);
 
     // Confirm target is loaded.
     let target_engine = state
@@ -162,16 +155,17 @@ pub(crate) async fn draft_attach(
         .ok_or_else(|| ApiError::Internal("Target model has no tokenizer".into()))?;
     let target_vocab = target_engine.vocab_size().await.unwrap_or(0);
 
-    // Choose draft device. Default: GPU index 1 if available, else 0
-    // - intentionally generic; operators on any setup can override via
-    // `device_index`. Using `unwrap_or(1)` since the default is a
-    // cheap constant; closure forms only earn their keep for
-    // expressions with side-effects or allocation.
-    let draft_device_idx = request.device_index.unwrap_or(1);
+    // The draft runs a step per drafted token, so it goes on the fastest card unless the
+    // caller names one.
+    let draft_device_idx = request.device_index.or_else(|| {
+        crate::inference::place::device_probe::probe_cuda_gpus_for("llm")
+            .first()
+            .map(|g| g.index)
+    });
 
     // Build a fresh engine for the draft, loaded on the chosen device.
     let mut draft_config = state.config_for_model(&draft_name);
-    draft_config.device_index = Some(draft_device_idx);
+    draft_config.device_index = draft_device_idx;
     // Force CUDA-only on the draft device (no multi-GPU split for the draft).
     draft_config.disable_arc_layers = true;
     let draft_engine = Arc::new(LlmEngine::with_config(draft_config));
@@ -195,34 +189,18 @@ pub(crate) async fn draft_attach(
         )));
     }
 
-    // Reset the draft KV cache so the next forward starts clean.
-    let _ = draft_engine.draft_reset().await;
-
-    // Attach to the target's LoadedModelEntry.
-    {
-        let mut engines = state.engines.write().await;
-        let entry = engines
-            .iter_mut()
-            .find(|e| e.model_id == target_name)
-            .ok_or_else(|| {
-                ApiError::NotFound(format!("Target '{}' disappeared mid-attach", target_name))
-            })?;
-        entry.draft = Some(DraftAttachment {
-            model_id: draft_name.clone(),
-            engine: draft_engine,
-            k,
-        });
-    }
+    target_engine
+        .attach_drafter(draft_name.clone(), draft_engine)
+        .await;
 
     info!(
-        "✅ Draft '{}' attached to '{}' (k={}, vocab={}, fp_match={})",
-        draft_name, target_name, k, target_vocab, fp_match
+        "✅ Draft '{}' attached to '{}' (vocab={}, fp_match={})",
+        draft_name, target_name, target_vocab, fp_match
     );
 
     Ok(Json(DraftAttachResponse {
         target: target_name,
         draft: draft_name,
-        k,
         target_vocab,
         draft_vocab,
         tokenizer_fp_match: fp_match,
@@ -241,15 +219,11 @@ pub(crate) async fn draft_detach(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     validate_model_id(&request.target)?;
     let target_name = normalize_model_id(&request.target);
-    let detached = {
-        let mut engines = state.engines.write().await;
-        let entry = engines
-            .iter_mut()
-            .find(|e| e.model_id == target_name)
-            .ok_or_else(|| ApiError::NotFound(format!("Target '{}' not loaded", target_name)))?;
-        let prev = entry.draft.take();
-        prev.map(|a| a.model_id)
-    };
+    let target_engine = state
+        .get_engine(&target_name)
+        .await
+        .map_err(|_| ApiError::NotFound(format!("Target '{}' not loaded", target_name)))?;
+    let detached = target_engine.detach_drafter().await;
     if let Some(draft_id) = detached {
         info!("Draft '{}' detached from '{}'", draft_id, target_name);
         Ok(Json(
@@ -266,11 +240,11 @@ pub(crate) async fn draft_status(State(state): State<APIServer>) -> Json<serde_j
     let engines = state.engines.read().await;
     let mut pairs = Vec::new();
     for entry in engines.iter() {
-        if let Some(d) = &entry.draft {
+        if let Some(draft) = entry.engine.drafter_id() {
             pairs.push(serde_json::json!({
                 "target": entry.model_id,
-                "draft": d.model_id,
-                "k": d.k,
+                "draft": draft,
+                "draft_length": entry.engine.draft_length(),
             }));
         }
     }

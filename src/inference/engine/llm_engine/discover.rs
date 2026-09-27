@@ -110,6 +110,56 @@ impl LlmEngine {
         dir.map(GenerationDefaults::from_hf_dir).unwrap_or_default()
     }
 
+    /// Every GGUF model in the Ollama store, as `(tag, weights blob)`: each manifest under
+    /// `manifests/{registry}/{namespace}/{name}/{tag}` whose model layer resolves to a blob.
+    pub(super) fn store_models(&self) -> Vec<(String, PathBuf)> {
+        let Some(root) = self.config.models_dir.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let read_dirs = |p: &std::path::Path| -> Vec<PathBuf> {
+            std::fs::read_dir(p)
+                .map(|it| it.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default()
+        };
+        for registry in read_dirs(&root.join("manifests")) {
+            for namespace in read_dirs(&registry) {
+                for name in read_dirs(&namespace) {
+                    for manifest in read_dirs(&name) {
+                        let Some(blob) = std::fs::read_to_string(&manifest)
+                            .ok()
+                            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                            .and_then(|m| {
+                                m.get("layers")?.as_array()?.iter().find_map(|l| {
+                                    (l.get("mediaType")?.as_str()?
+                                        == "application/vnd.ollama.image.model")
+                                        .then(|| l.get("digest")?.as_str().map(str::to_string))?
+                                })
+                            })
+                            .and_then(|d| Self::find_blob_for_digest(root, &d))
+                        else {
+                            continue;
+                        };
+                        let ns = namespace.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        let (Some(n), Some(t)) = (
+                            name.file_name().and_then(|n| n.to_str()),
+                            manifest.file_name().and_then(|n| n.to_str()),
+                        ) else {
+                            continue;
+                        };
+                        let tag = if ns == "library" {
+                            format!("{n}:{t}")
+                        } else {
+                            format!("{ns}/{n}:{t}")
+                        };
+                        out.push((tag, blob));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The blob of the first layer of `media_type` in the model's Ollama manifest. Walks the
     /// same `library/{name}/{tag}` and namespaced `{ns}/{name}/{tag}` layouts as
     /// `find_model_file`, without the full directory scan.
@@ -609,4 +659,34 @@ mod hub_gguf_tests {
         assert_eq!(split_part(std::path::Path::new("a-of-b.gguf")), None);
         let _ = std::fs::remove_dir_all(&root);
     }
+}
+
+/// A hash of a GGUF file's ordinary vocabulary, read from its header: every normal piece of
+/// `tokenizer.ggml.tokens` with its id. Two models with the same hash give every ordinary
+/// piece the same id, which is what lets one draft for the other; control and user-defined
+/// tokens (`tokenizer.ggml.token_type` other than normal) may differ between them.
+pub(super) fn gguf_vocabulary_hash(path: &std::path::Path) -> Option<u64> {
+    use crate::tensor::quantized::gguf_file::Value;
+    /// `tokenizer.ggml.token_type` of an ordinary piece.
+    const NORMAL: i32 = 1;
+    let content = crate::tensor::quantized::gguf_file::open_header(path).ok()?;
+    let Value::Array(tokens) = content.metadata.get("tokenizer.ggml.tokens")? else {
+        return None;
+    };
+    let types: Option<Vec<i32>> = match content.metadata.get("tokenizer.ggml.token_type") {
+        Some(Value::Array(ts)) => ts.iter().map(|t| t.to_i32().ok()).collect(),
+        _ => None,
+    };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (id, t) in tokens.iter().enumerate() {
+        if types
+            .as_ref()
+            .and_then(|ts| ts.get(id))
+            .is_some_and(|&ty| ty != NORMAL)
+        {
+            continue;
+        }
+        std::hash::Hash::hash(&(id, t.to_string().ok()?), &mut h);
+    }
+    Some(std::hash::Hasher::finish(&h))
 }
