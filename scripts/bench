@@ -198,6 +198,8 @@ provision() {
     local comp="$HOME/bench-logs/engines"
     mkdir -p "$comp"
     local venv="$comp/vllm-venv"
+    # The download cache stays in the compartment too, on the same disk as the venv it feeds.
+    export UV_CACHE_DIR="$comp/uv-cache"
     if [ ! -x "$venv/bin/vllm" ]; then
         echo "provisioning vLLM into $venv (uv pip install vllm)..."
         uv venv "$venv" >&2 || die "uv venv failed"

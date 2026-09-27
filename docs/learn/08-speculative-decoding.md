@@ -47,10 +47,11 @@ token against 1.49 and 51.8 alone, the same answer token for token, with 18% of 
 accepted. A better-matched drafter would accept more
 ([`../STATUS.md`](../STATUS.md#placement-measured-separately)).
 
-**Two loops, one to go.** The plain stream carries a speculative loop gated per step by a
-calibrator; the attach route and a configured drafter drive another. On the same target and
-drafter the first gave 1.68 tokens a second and the second 2.21. The measurement says which
-should remain ([`../STATUS.md`](../STATUS.md#open)).
+**One loop, a learned length (2026-09-27).** The drafter loken picks for that same target, and
+one attached by hand, drive a single loop. The draft length comes from measured acceptance
+per position and measured cycle time, plain decoding being one of the lengths: 2.79 to 2.85
+tokens a second on the pair above, and a drafter attached to a model that fits the cards is
+dropped by the same rule.
 
 **The head, when it was built.** The EAGLE head reached 1.71 to 1.82 times the plain rate on
 deepcoder, held out, on an earlier substrate; the figure is the module's, dated by it, and
@@ -58,19 +59,12 @@ not re-measured on the native one.
 
 ## Try it
 
-This exercise needs a target that spills, which is a 70B on two 16 GB cards. With the pair
-above in `config.toml`:
+This exercise needs a target that spills, which is a 70B on two 16 GB cards. loken gives it a
+drafter on its own: the smallest model in the store sharing its vocabulary, here llama3.2:1b.
+The log says so at load (`deepseek-r1:70b spills to the host: llama3.2:1b drafts for it`).
 
-```toml
-[inference]
-model_id = "deepseek-r1:70b"
-draft_model = "llama3.2:1b"
-draft_device_index = 0
-```
-
-Run one prompt of a few hundred generated tokens with the drafter and without it, and
-compare `eval_count / eval_duration` on the two replies. Expected: the same `response` text
-both times, and the drafted rate above the plain one by the accepted-draft share. Without
-a restart, `POST /api/draft/attach` with `{"model":"llama3.2:1b"}` attaches the drafter to
-the resident model and `GET /api/draft/status` lists the pair (an empty `pairs` array means
-none is attached).
+Run one prompt of a few hundred generated tokens, then `GET /api/draft/status`: it lists the
+pair and the draft length learned so far. The first request explores the lengths, plain
+decoding included; compare `eval_count / eval_duration` on the first reply and on a later
+one. To see plain decoding for the same prompt, `POST /api/draft/detach` with
+`{"target":"deepseek-r1:70b"}` and run it again: the `response` text is the same.
