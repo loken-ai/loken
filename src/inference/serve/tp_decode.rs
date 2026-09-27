@@ -312,6 +312,24 @@ pub fn all_reduce_sum(
     Ok((s0, s1))
 }
 
+/// An NCCL failure as the library words it: the result code and NCCL's last message, which
+/// names the CUDA error behind it, so an allocation that ran out of memory reads as one and
+/// takes the out-of-memory recovery.
+#[cfg(feature = "cuda")]
+fn nccl_failure(what: &str, e: &cudarc::nccl::result::NcclError) -> anyhow::Error {
+    // SAFETY: ncclGetLastError ignores its communicator and returns a pointer to a static,
+    // NUL-terminated string owned by the library, or null.
+    let detail = unsafe {
+        let p = cudarc::nccl::sys::ncclGetLastError(std::ptr::null_mut());
+        if p.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    };
+    anyhow::anyhow!("{what}: {:?}: {detail}", e.0)
+}
+
 /// NCCL all-reduce(sum) for TP=2 - the OVERLAPPING path. Runs `ncclAllReduce` on each rank's
 /// own stream (so the collective is stream-ordered with the matmuls and the two GPUs
 /// run in parallel - no `device.synchronize()` barrier). `comms` are the 2 per-device comms
@@ -327,14 +345,14 @@ pub fn all_reduce_sum_nccl(
     // NCCL group), so we can all-reduce it in place.
     let (mut c0, dev0, shape0) = clone_cuda_f32(p0)?;
     let (mut c1, dev1, shape1) = clone_cuda_f32(p1)?;
-    group_start().map_err(|e| anyhow::anyhow!("nccl group_start: {e:?}"))?;
+    group_start().map_err(|e| nccl_failure("nccl group_start", &e))?;
     comms[0]
         .all_reduce_in_place(&mut c0, &ReduceOp::Sum)
-        .map_err(|e| anyhow::anyhow!("nccl ar0: {e:?}"))?;
+        .map_err(|e| nccl_failure("nccl ar0", &e))?;
     comms[1]
         .all_reduce_in_place(&mut c1, &ReduceOp::Sum)
-        .map_err(|e| anyhow::anyhow!("nccl ar1: {e:?}"))?;
-    group_end().map_err(|e| anyhow::anyhow!("nccl group_end: {e:?}"))?;
+        .map_err(|e| nccl_failure("nccl ar1", &e))?;
+    group_end().map_err(|e| nccl_failure("nccl group_end", &e))?;
     Ok((
         wrap_cuda_f32(c0, &dev0, shape0)?,
         wrap_cuda_f32(c1, &dev1, shape1)?,
@@ -367,14 +385,14 @@ pub fn all_reduce_sum_nccl_f16(
     let h1 = p1.to_dtype(DType::F16)?;
     let mut c0 = clone_cuda_f16(&h0)?;
     let mut c1 = clone_cuda_f16(&h1)?;
-    group_start().map_err(|e| anyhow::anyhow!("nccl group_start: {e:?}"))?;
+    group_start().map_err(|e| nccl_failure("nccl group_start", &e))?;
     comms[0]
         .all_reduce_in_place(&mut c0, &ReduceOp::Sum)
-        .map_err(|e| anyhow::anyhow!("nccl f16 ar0: {e:?}"))?;
+        .map_err(|e| nccl_failure("nccl f16 ar0", &e))?;
     comms[1]
         .all_reduce_in_place(&mut c1, &ReduceOp::Sum)
-        .map_err(|e| anyhow::anyhow!("nccl f16 ar1: {e:?}"))?;
-    group_end().map_err(|e| anyhow::anyhow!("nccl group_end: {e:?}"))?;
+        .map_err(|e| nccl_failure("nccl f16 ar1", &e))?;
+    group_end().map_err(|e| nccl_failure("nccl group_end", &e))?;
     let r0 = crate::tensor::cuda_ext::tensor_from_f16_slice(c0, shape0, &dev0)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let r1 = crate::tensor::cuda_ext::tensor_from_f16_slice(c1, shape1, &dev1)
@@ -406,7 +424,7 @@ pub fn make_comms(d0: &Device, d1: &Device) -> Result<Vec<cudarc::nccl::safe::Co
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .cuda_stream();
     cudarc::nccl::safe::Comm::from_devices(vec![s0, s1])
-        .map_err(|e| anyhow::anyhow!("nccl comm init: {e:?}"))
+        .map_err(|e| nccl_failure("nccl comm init", &e))
 }
 
 #[cfg(feature = "cuda")]
