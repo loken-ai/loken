@@ -1339,6 +1339,24 @@ fn format_prompt_for_qwen3(prompt: &str) -> String {
     )
 }
 
+/// The tile a VAE decode on `device` runs at for a `width x height` image, `None` for a
+/// whole decode.
+///
+/// Whole when the decode fits the device's free memory or the device is not a card;
+/// otherwise the largest split [`choose_vae_tile`] allows, and whole again when no split
+/// fits, so a failed allocation bounces to the host rather than refusing the render.
+pub(crate) fn vae_decode_tile(device: &Device, width: usize, height: usize) -> Option<usize> {
+    if !device.is_cuda() {
+        return None;
+    }
+    let peak = vae_whole_decode_peak(width, height);
+    let free = free_on_device(device);
+    if free >= peak {
+        return None;
+    }
+    choose_vae_tile(free, peak, width, height)
+}
+
 /// Generate image with Z-Image pipeline (streaming or non-streaming)
 /// Largest tile whose decode fits `free`, or `None` when tiling cannot help.
 ///

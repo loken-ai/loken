@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result as AnyResult};
 use tracing::info;
 
+use crate::inference::engine::image_engine::{vae_decode_tile, VAE_TILE_OVERLAP};
 use crate::inference::engine::qwen_image_engine::load_with_fallback;
 use crate::inference::model::flux2::dit::{Config as DitConfig, Model as DitModel};
 use crate::inference::model::flux2::sampling;
@@ -297,10 +298,18 @@ pub fn generate(
     }
 
     // 3) Decode: the VAE owns the batch-norm un-normalisation and the 2x2 unpatchify.
+    //    Tiled when the whole-image decode does not fit the VAE's card.
     cancel.bail()?;
-    let img = state
-        .vae
-        .decode_tokens(&x, gh, gw)
+    let decoded = match vae_decode_tile(state.vae.device(), width, height) {
+        Some(t) => {
+            tracing::info!("FLUX.2 VAE: whole-image decode does not fit; tiling at {t} latent px");
+            state
+                .vae
+                .decode_tokens_tiled(&x, gh, gw, t, VAE_TILE_OVERLAP)
+        }
+        None => state.vae.decode_tokens(&x, gh, gw),
+    };
+    let img = decoded
         .map_err(|e| anyhow!("FLUX.2 VAE decode: {e}"))?
         .to_device(&Device::Cpu)?;
     to_png(&img)

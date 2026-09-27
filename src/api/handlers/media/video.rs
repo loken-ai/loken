@@ -448,6 +448,7 @@ pub(crate) async fn video_generations(
                         Ok(()) => {
                             generate_image_resilient(&state, &img_model, geom, &prompt, params)
                                 .await
+                                .map(|rendered| rendered.png_base64)
                                 .map_err(|e| e.to_string())
                         }
                         Err(e) => Err(e),
@@ -1334,26 +1335,33 @@ pub(crate) async fn images_generations(
         )
         .await;
         match _res {
-            Ok(b64) => {
+            Ok(rendered) => {
                 let b64 = match (conditioner.as_ref(), prepared.as_ref()) {
-                    (Some(c), Some(p)) => match c.apply_to_frame(p, &b64) {
+                    (Some(c), Some(p)) => match c.apply_to_frame(p, &rendered.png_base64) {
                         Ok(v) => v,
                         Err(e) => return err_resp(axum::http::StatusCode::UNPROCESSABLE_ENTITY, e),
                     },
-                    _ => b64,
+                    _ => rendered.png_base64,
                 };
                 data.push(image_response_entry(
                     b64,
                     &out_format,
                     out_quality,
-                    Some(image_seed),
+                    Some(rendered.seed),
                 ))
             }
             // One variation failing does not fail the batch: losing the images that
             // DID render, because a later seed hit a problem of its own, is the worst
             // available reading of a partial success. Collected here and turned into an
             // error only if nothing rendered at all.
-            Err(e) => failures.push(format!("image {}: {e}", i + 1)),
+            Err(e) => {
+                // Every image of the batch shares the parameters, so one refusal is the
+                // answer for all of them.
+                if let Some(refusal) = refused_parameter(e.as_ref()) {
+                    return refusal.into_response();
+                }
+                failures.push(format!("image {}: {e}", i + 1));
+            }
         }
     }
     // Only a batch where NOTHING rendered is a failed request.

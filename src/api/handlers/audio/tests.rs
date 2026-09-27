@@ -1018,7 +1018,7 @@ fn format_vtt_with_no_segments_keeps_webvtt_header() {
 fn resample_empty_input_returns_empty() {
     // Short-circuit: an empty audio buffer must not spin up rubato
     // (which would fail on zero-length input).
-    let out = resample_polyphase(&[], 48_000, 16_000).expect("empty");
+    let out = crate::inference::media::audio_io::resample(&[], 48_000, 16_000).expect("empty");
     assert!(out.is_empty());
 }
 
@@ -1029,7 +1029,7 @@ fn resample_downsamples_to_expected_length() {
     // the trailing warm-up tail, so a drift here would change the
     // duration the model sees by ±out_delay frames.
     let src: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.01).sin()).collect();
-    let out = resample_polyphase(&src, 48_000, 16_000).expect("resample");
+    let out = crate::inference::media::audio_io::resample(&src, 48_000, 16_000).expect("resample");
     // expected = round(48000 * 16000 / 48000) = 16000.
     assert_eq!(out.len(), 16_000, "1 s @ 48 kHz -> 16000 samples @ 16 kHz");
 }
@@ -1037,10 +1037,10 @@ fn resample_downsamples_to_expected_length() {
 #[test]
 fn resample_upsamples_to_expected_length() {
     // 16 kHz -> 16 kHz is the no-op fast path (the caller skips
-    // resample_polyphase for matching rates) so test 8 kHz -> 16 kHz
+    // the resampler for matching rates) so test 8 kHz -> 16 kHz
     // here to exercise the upsampling rate ratio.
     let src: Vec<f32> = (0..8_000).map(|i| (i as f32 * 0.02).sin()).collect();
-    let out = resample_polyphase(&src, 8_000, 16_000).expect("resample");
+    let out = crate::inference::media::audio_io::resample(&src, 8_000, 16_000).expect("resample");
     // expected = round(8000 * 16000 / 8000) = 16000.
     assert_eq!(out.len(), 16_000, "1 s @ 8 kHz -> 16000 samples @ 16 kHz");
 }
@@ -1051,7 +1051,7 @@ fn resample_short_input_yields_proportional_output() {
     // residual-tail path. Pin behaviour: 100 ms @ 22050 should
     // still produce ~1600 samples @ 16 kHz (within out_delay).
     let src: Vec<f32> = vec![0.0_f32; 22_050 / 10]; // 0.1 s of silence
-    let out = resample_polyphase(&src, 22_050, 16_000).expect("resample");
+    let out = crate::inference::media::audio_io::resample(&src, 22_050, 16_000).expect("resample");
     // expected = round(2205 * 16000 / 22050) = 1600.
     assert_eq!(out.len(), 1600);
 }

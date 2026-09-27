@@ -428,16 +428,21 @@ async fn render_upload_batch(
         )
         .await;
         match rendered {
-            Ok(b64) => match finish(b64) {
+            Ok(rendered) => match finish(rendered.png_base64) {
                 Ok(b64) => data.push(image_response_entry(
                     b64,
                     &form.output_format,
                     form.output_compression,
-                    Some(image_seed),
+                    Some(rendered.seed),
                 )),
                 Err(e) => return form_error(StatusCode::INTERNAL_SERVER_ERROR, e),
             },
-            Err(e) => failures.push(format!("image {}: {e}", i + 1)),
+            Err(e) => {
+                if let Some(refusal) = refused_parameter(e.as_ref()) {
+                    return refusal.into_response();
+                }
+                failures.push(format!("image {}: {e}", i + 1));
+            }
         }
     }
     if data.is_empty() && !failures.is_empty() {

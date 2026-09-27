@@ -238,6 +238,11 @@ fn render_sdxl(
             .map(SchedulerKind::parse)
             .unwrap_or_default(),
     );
+    let tile = super::vae_decode_tile(pipe.vae_device(), params.width, params.height);
+    if let Some(t) = tile {
+        info!("sdxl VAE: whole-image decode does not fit; tiling at {t} latent px");
+    }
+    pipe.set_vae_tile(tile.map(|t| (t, VAE_TILE_OVERLAP)));
     let rgb = match params.input_image.as_deref() {
         // img2img: the source is resized to the render size, since the sampler works on
         // one latent grid.

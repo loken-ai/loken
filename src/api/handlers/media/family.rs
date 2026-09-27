@@ -596,25 +596,10 @@ pub(crate) fn family_runtime_bytes(
             geom.width,
             geom.height,
         ),
-        // 5 GiB was found necessary for this family at 1024x1024; scaled to the
-        // request, and superseded by what a render is measured to take.
+        // The helper the Boogu loader plans its placement against, so admission and
+        // placement read one figure for the request.
         ImageLoader::Boogu => {
-            let cfg = crate::inference::model::boogu::dit::Config::default();
-            let reference = (1024 / (VAE_STRIDE * cfg.patch_size))
-                * (1024 / (VAE_STRIDE * cfg.patch_size))
-                + crate::inference::engine::image_engine::FLUX_TEXT_TOKENS;
-            let measured = demand::MeasuredReserve {
-                bytes: 5 << 30,
-                reference_tokens: reference,
-            };
-            let tokens = geom.tokens(VAE_STRIDE, cfg.patch_size)
-                + crate::inference::engine::image_engine::FLUX_TEXT_TOKENS;
-            demand::planning_demand(
-                "boogu",
-                geom.width,
-                geom.height,
-                demand::scale_measured(&measured, tokens).max(vae),
-            )
+            crate::inference::engine::boogu_engine::runtime_headroom_bytes(geom.width, geom.height)
         }
         // Same contract: the figure this family was found to need at 1024x1024,
         // scaled by the latent's area, and replaced by measurement once there is one.

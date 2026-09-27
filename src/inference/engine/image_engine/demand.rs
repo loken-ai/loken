@@ -715,7 +715,7 @@ pub(super) const DENSE_BYTES: u64 = 4;
 /// 1024^2 decode wants ~6 GB while the decoder weights are a few hundred MB.
 pub(super) const VAE_WIDEST_CH: u64 = 128;
 /// Latent pixels of convolution context carried into each tile of a tiled VAE decode.
-pub(super) const VAE_TILE_OVERLAP: usize = 8;
+pub(crate) const VAE_TILE_OVERLAP: usize = 8;
 
 /// Peak VRAM of decoding the whole image in one pass.
 ///

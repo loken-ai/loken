@@ -621,7 +621,9 @@ mod tests {
             // and the architecture in `audio_demand`, and this is what stops them coming
             // back one plausible-looking literal at a time.
             "src/inference/place/audio_demand.rs",
-            "src/inference/model/acestep/ops.rs",
+            // The shared attention: its query tiles and FFN chunks size every tower's
+            // scratch.
+            "src/inference/model/sdpa.rs",
             "src/inference/model/acestep/dit/mod.rs",
             "src/inference/model/acestep/vae.rs",
             "src/inference/model/acestep/lm/mod.rs",

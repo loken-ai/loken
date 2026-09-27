@@ -33,6 +33,15 @@ pub(super) fn is_vram_exhaustion(e: &(dyn std::error::Error + Send + Sync)) -> b
     s.contains("[oom]") || s.contains("out of memory") || s.contains("out_of_memory")
 }
 
+/// A render the resident family refused over a request parameter, as the validation
+/// error it is: the client can retry without the parameter, so it answers 400.
+pub(super) fn refused_parameter(
+    e: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<ApiError> {
+    e.downcast_ref::<crate::inference::engine::image_engine::UnsupportedParameter>()
+        .map(|refusal| ApiError::Validation(refusal.to_string()))
+}
+
 /// Render, and if the render runs out of VRAM, RE-PLAN and try once more.
 ///
 /// Placement reserves what the request needs, but the card is shared: another engine,
@@ -89,7 +98,10 @@ pub(super) async fn generate_image_resilient(
     geom: crate::inference::place::runtime_demand::RequestGeometry,
     prompt: &str,
     params: crate::inference::engine::image_engine::ImageGenParams,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    crate::inference::engine::image_engine::RenderedImage,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     // Enough attempts to reach the guaranteed floor. Each exhaustion raises the
     // pressure one notch, and the top notch places the model on the host, which always
     // fits - so the sequence terminates in something that runs rather than in an error.
@@ -118,7 +130,7 @@ pub(super) async fn generate_image_resilient(
     for attempt in 0..ATTEMPTS {
         match state
             .image_engine
-            .generate_image(prompt, params.clone())
+            .generate_image_seeded(prompt, params.clone())
             .await
         {
             Ok(v) => {
@@ -773,7 +785,7 @@ pub(crate) async fn handle_image_generation(
         let _res = generate_image_resilient(state, model_name, geom, &request.prompt, params).await;
         _cg.disarm();
         match _res {
-            Ok(image_base64) => {
+            Ok(rendered) => {
                 let total_duration = start.elapsed().as_nanos() as u64;
                 // Echo the seed in the assistant message body so the
                 // GUI surfaces it to the user verbatim. They can
@@ -783,15 +795,18 @@ pub(crate) async fn handle_image_generation(
                 // text annotation is the reproducibility hook.)
                 let mut response = OllamaGenerateResponse::new(
                     model_name.to_string(),
-                    format_seed_echo(resolved_seed),
+                    format_seed_echo(rendered.seed),
                 );
                 response.done = true;
                 response.done_reason = Some("stop".to_string());
                 response.total_duration = Some(total_duration);
-                response.images = Some(vec![image_base64]);
+                response.images = Some(vec![rendered.png_base64]);
                 Ok(Json(response).into_response())
             }
             Err(e) => {
+                if let Some(refusal) = refused_parameter(e.as_ref()) {
+                    return Err(refusal);
+                }
                 error!("Image generation error: {}", e);
                 let mut response = OllamaGenerateResponse::new(
                     model_name.to_string(),

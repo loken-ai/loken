@@ -379,9 +379,12 @@ pub(super) async fn conversation_image_stream(
             return;
         }
 
+        // Resolved here so the finished image can echo the seed it was drawn from.
+        let mut params = ImageGenParams::default();
+        let seed = params.resolve_seed();
         let mut rx = match state
             .image_engine
-            .generate_image_stream(&subject, ImageGenParams::default())
+            .generate_image_stream(&subject, params)
             .await
         {
             Ok(rx) => rx,
@@ -403,6 +406,7 @@ pub(super) async fn conversation_image_stream(
                     "model": model,
                     "message": { "role": "assistant", "content": format!("[Generated an image: {subject}]") },
                     "image": image_base64,
+                    "seed": seed,
                 }),
                 ImageStreamEvent::Error(e) => {
                     serde_json::json!({ "route": "image_gen", "error": e })
@@ -679,10 +683,10 @@ pub(crate) async fn conversation_handler(
             let subject = image_subject(&user_text);
             match state
                 .image_engine
-                .generate_image(&subject, ImageGenParams::default())
+                .generate_image_seeded(&subject, ImageGenParams::default())
                 .await
             {
-                Ok(b64) => conv_ok(serde_json::json!({
+                Ok(rendered) => conv_ok(serde_json::json!({
                     "route": "image_gen",
                     "routed_by": routed_by,
                     "conversation_id": conversation_id,
@@ -690,7 +694,8 @@ pub(crate) async fn conversation_handler(
                     // Bridge: fold a text note into the shared history so later text
                     // turns know an image was produced (KV can't cross models).
                     "message": { "role": "assistant", "content": format!("[Generated an image: {subject}]") },
-                    "image": b64,
+                    "image": rendered.png_base64,
+                    "seed": rendered.seed,
                 })),
                 Err(e) => conv_err(
                     StatusCode::INTERNAL_SERVER_ERROR,

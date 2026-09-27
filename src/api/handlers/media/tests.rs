@@ -785,22 +785,7 @@ fn oracle_runtime_bytes(
             geom.height,
         ),
         ImageLoader::Boogu => {
-            let cfg = crate::inference::model::boogu::dit::Config::default();
-            let reference = (1024 / (VAE_STRIDE * cfg.patch_size))
-                * (1024 / (VAE_STRIDE * cfg.patch_size))
-                + crate::inference::engine::image_engine::FLUX_TEXT_TOKENS;
-            let measured = demand::MeasuredReserve {
-                bytes: 5 << 30,
-                reference_tokens: reference,
-            };
-            let tokens = geom.tokens(VAE_STRIDE, cfg.patch_size)
-                + crate::inference::engine::image_engine::FLUX_TEXT_TOKENS;
-            demand::planning_demand(
-                "boogu",
-                geom.width,
-                geom.height,
-                demand::scale_measured(&measured, tokens).max(vae),
-            )
+            crate::inference::engine::boogu_engine::runtime_headroom_bytes(geom.width, geom.height)
         }
         ImageLoader::Sdxl => {
             let reference = (1024 / VAE_STRIDE) * (1024 / VAE_STRIDE);
@@ -1512,4 +1497,24 @@ fn is_image_gen_model_negatives() {
         is_image_gen_model("fluxbox-tester"),
         "documenting the substring false-positive corner case"
     );
+}
+
+/// A parameter the resident family refuses answers 400; any other engine failure is not
+/// a refusal and keeps the server status.
+#[test]
+fn a_refused_parameter_answers_bad_request() {
+    use axum::response::IntoResponse;
+    let refusal: Box<dyn std::error::Error + Send + Sync> = Box::new(
+        crate::inference::engine::image_engine::UnsupportedParameter {
+            family: "zimage",
+            parameter: "mask",
+        },
+    );
+    let answer = refused_parameter(refusal.as_ref()).expect("a refusal");
+    assert_eq!(
+        answer.into_response().status(),
+        axum::http::StatusCode::BAD_REQUEST
+    );
+    let failure: Box<dyn std::error::Error + Send + Sync> = "render failed".into();
+    assert!(refused_parameter(failure.as_ref()).is_none());
 }

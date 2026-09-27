@@ -40,6 +40,9 @@ pub struct SdxlPipeline {
     /// Solver and sigma curve for the next render (see `set_sampling`).
     sampler: SamplerKind,
     scheduler: SchedulerKind,
+    /// Latent tile side and overlap of the next render's VAE decode, `None` for a whole
+    /// decode (see `set_vae_tile`).
+    vae_tile: Option<(usize, usize)>,
     /// The adapter set currently attached, in request order. Requests carry their whole
     /// adapter set, so this is what makes a repeat request free - see `set_loras`.
     attached: Vec<(String, f32)>,
@@ -234,6 +237,7 @@ impl SdxlPipeline {
             device: unet_dev,
             sampler: SamplerKind::default(),
             scheduler: SchedulerKind::default(),
+            vae_tile: None,
             attached: Vec::new(),
             attached_matched: 0,
         })
@@ -466,6 +470,18 @@ impl SdxlPipeline {
         self.scheduler = scheduler;
     }
 
+    /// Decode subsequent renders in overlapping `(side, overlap)` tiles, in latent pixels,
+    /// or whole when `tile` is `None`. Set per request under the media gate, as
+    /// `set_sampling` is.
+    pub fn set_vae_tile(&mut self, tile: Option<(usize, usize)>) {
+        self.vae_tile = tile;
+    }
+
+    /// The device the VAE decodes on.
+    pub fn vae_device(&self) -> &Device {
+        self.vae.device()
+    }
+
     /// Re-draw an existing image: the sampler starts partway down the ladder from the
     /// SOURCE latent instead of from noise.
     ///
@@ -659,9 +675,12 @@ impl SdxlPipeline {
         // Decode. The VAE applies the SDXL scaling itself.
         let lat = Tensor::from_vec_f32(x, vec![1, LATENT_CHANNELS, lh, lw])?;
         // The VAE stays F32 whatever the denoiser runs in, so the latent converts here.
-        let img = self
-            .vae
-            .decode(&lat.to_dtype(DType::F32)?)?
+        let lat = lat.to_dtype(DType::F32)?;
+        let decoded = match self.vae_tile {
+            Some((tile, overlap)) => self.vae.decode_tiled(&lat, tile, overlap)?,
+            None => self.vae.decode(&lat)?,
+        };
+        let img = decoded
             .to_dtype(DType::F32)?
             .to_device(&Device::Cpu)?
             .to_vec_f32();

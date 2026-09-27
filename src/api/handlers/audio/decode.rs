@@ -57,7 +57,7 @@ pub(super) fn decode_wav_to_mono_f32_16k(bytes: &[u8]) -> anyhow::Result<(Vec<f3
     let resampled = if sample_rate == target_sr {
         mono
     } else {
-        resample_polyphase(&mono, sample_rate, target_sr)?
+        crate::inference::media::audio_io::resample(&mono, sample_rate, target_sr)?
     };
     Ok((resampled, target_sr))
 }
@@ -123,8 +123,8 @@ pub(crate) fn decode_audio_stereo(bytes: &[u8], rate: u32) -> anyhow::Result<(Ve
     let channel = |c: usize| planar[c * frames..(c + 1) * frames].to_vec();
     let (mut left, mut right) = (channel(0), channel(1.min(channels - 1)));
     if src_rate != rate {
-        left = resample_polyphase(&left, src_rate, rate)?;
-        right = resample_polyphase(&right, src_rate, rate)?;
+        left = crate::inference::media::audio_io::resample(&left, src_rate, rate)?;
+        right = crate::inference::media::audio_io::resample(&right, src_rate, rate)?;
     }
     let n = left.len().min(right.len());
     left.truncate(n);
@@ -380,112 +380,9 @@ pub(super) fn decode_symphonia_to_mono_f32_16k(bytes: Vec<u8>) -> anyhow::Result
     let out = if src_sr == target_sr {
         mono
     } else {
-        resample_polyphase(&mono, src_sr, target_sr)?
+        crate::inference::media::audio_io::resample(&mono, src_sr, target_sr)?
     };
     Ok((out, target_sr))
-}
-
-/// Polyphase resampler (rubato FftFixedInOut) for one channel, from `src_rate` to
-/// `dst_rate`, anti-aliased: the one resampler every decoded upload goes through.
-///
-/// Uses rubato's polyphase FFT resampler (FftFixedInOut). Important
-/// implementation details to keep audio bit-accurate end-to-end:
-///   * The resampler has an inherent latency of `chunk_size_out / 2`
-///     frames; we drain it by calling `process_partial(None)` after the
-///     real input, then drop that many output frames from the front.
-///   * Input is fed in fixed-size chunks (`input_frames_next()`); the
-///     final chunk is zero-padded via `process_partial` so the tail of
-///     the audio actually reaches the output.
-pub(super) fn resample_polyphase(
-    src: &[f32],
-    src_rate: u32,
-    dst_rate: u32,
-) -> anyhow::Result<Vec<f32>> {
-    use rubato::{FftFixedInOut, Resampler};
-
-    if src.is_empty() {
-        return Ok(Vec::new());
-    }
-    // A corrupt WAV can carry sample_rate==0; guard before it reaches rubato /
-    // the capacity math (src_rate as f64 in the denominator -> inf -> huge alloc).
-    if src_rate == 0 {
-        anyhow::bail!("invalid audio: sample rate is 0");
-    }
-    if src_rate == dst_rate {
-        return Ok(src.to_vec());
-    }
-
-    // 1024 frames at 44.1 kHz ≈ 23 ms - small enough that the warm-up
-    // latency is short, large enough that FFT overhead amortizes.
-    let mut resampler = FftFixedInOut::<f32>::new(
-        src_rate as usize,
-        dst_rate as usize,
-        1024, // desired input chunk; rubato may round up
-        1,    // channels (mono)
-    )?;
-
-    let in_chunk = resampler.input_frames_next();
-    let out_delay = resampler.output_delay();
-    // Expected output length, computed from the *true* input length so
-    // the trailing zero-padding doesn't appear in the result.
-    let expected = (src.len() as f64 * dst_rate as f64 / src_rate as f64).round() as usize;
-
-    let mut output: Vec<f32> = Vec::with_capacity(expected + out_delay);
-    // Reusable output buffer; rubato's process() convenience method
-    // allocates Vec<Vec<f32>> on every call. With a 30s 44.1 kHz input
-    // and 1024-frame chunks that's ~1300 redundant allocations per
-    // transcription request. Pre-allocate once and reuse via
-    // process_into_buffer.
-    let mut out_buf: Vec<Vec<f32>> = resampler.output_buffer_allocate(true);
-
-    let mut input_pos = 0usize;
-    while input_pos + in_chunk <= src.len() {
-        let slice = &src[input_pos..input_pos + in_chunk];
-        let in_buf: [&[f32]; 1] = [slice];
-        let (_, out_len) = resampler
-            .process_into_buffer(&in_buf, &mut out_buf, None)
-            .map_err(|e| anyhow::anyhow!("rubato resample: {e}"))?;
-        output.extend_from_slice(&out_buf[0][..out_len]);
-        input_pos += in_chunk;
-    }
-    // Drain remaining < chunk_size frames + flush latency tail.
-    // First call: pass the residual. Subsequent calls: pass None to
-    // pump rubato's internal buffer. process_partial_into_buffer still
-    // allocates a temp zero-padded input vec internally each call  -
-    // unavoidable without re-implementing the partial path - but is
-    // bounded to O(out_delay / out_chunk) calls, not O(src.len() /
-    // in_chunk), so the bulk of allocations are gone.
-    let mut tail_done = input_pos >= src.len();
-    // None disambiguation: process_partial_into_buffer has a generic
-    // Vin parameter that's unused when wave_in is None. Help the
-    // compiler infer it.
-    let none_in: Option<&[&[f32]]> = None;
-    while output.len() < expected + out_delay {
-        let (_, out_len) = if tail_done {
-            resampler
-                .process_partial_into_buffer(none_in, &mut out_buf, None)
-                .map_err(|e| anyhow::anyhow!("rubato resample flush: {e}"))?
-        } else {
-            let tail: &[f32] = &src[input_pos..];
-            tail_done = true;
-            input_pos = src.len();
-            let in_buf: [&[f32]; 1] = [tail];
-            resampler
-                .process_partial_into_buffer(Some(&in_buf), &mut out_buf, None)
-                .map_err(|e| anyhow::anyhow!("rubato resample tail: {e}"))?
-        };
-        if out_len == 0 {
-            break;
-        }
-        output.extend_from_slice(&out_buf[0][..out_len]);
-    }
-
-    // Drop the half-window warmup latency from the front.
-    if output.len() > out_delay {
-        output.drain(..out_delay);
-    }
-    output.truncate(expected);
-    Ok(output)
 }
 
 /// Generative audio (text->sound) - fills the API gap where the media models
@@ -1150,7 +1047,12 @@ pub(crate) async fn audio_generations(
         let model_s = model.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, usize, usize)>(64);
         let energy = crate::energy_report::begin();
+        // The denoise loop bails on the thread's scoped token, cancelled when the
+        // stream is dropped.
+        let cancel_x = crate::inference::serve::cancel::CancelToken::new();
+        let guard_x = crate::inference::serve::cancel::CancelGuard::new(cancel_x.clone());
         let handle = tokio::task::spawn_blocking(move || -> Result<Vec<f32>, String> {
+            let _stop = crate::inference::serve::cancel::scoped::publish(&cancel_x);
             crate::inference::model::ezaudio::pipeline::render_with_progress(
                 &sfx_prompt,
                 seconds,
@@ -1169,11 +1071,14 @@ pub(crate) async fn audio_generations(
         let node_s = _state.node_name();
         let t0m = std::time::Instant::now();
         let stream = async_stream::stream! {
+            let _cancel_guard = guard_x;
             yield Ok::<_, axum::Error>(Event::default().data(started_event(&model_s, node_s.as_deref())));
             while let Some((phase, step, total)) = rx.recv().await {
                 yield Ok(Event::default().data(rendering_event(&phase, step, total, t0m, node_s.as_deref())));
             }
-            match handle.await {
+            let rendered = handle.await;
+            _cancel_guard.disarm();
+            match rendered {
                 Ok(Ok(pcm)) => {
                     let b64 = pcm_to_wav_base64(&pcm, 24_000);
                     let energy_j = crate::energy_report::end_measured(
@@ -1307,7 +1212,10 @@ pub(crate) async fn audio_generations(
         // EzAudio text->SFX. render() returns (pcm_f32, n_samples); native rate
         // 24 kHz (the 2nd value is the SAMPLE COUNT, not the rate).
         let sfx_negative = negative_body.clone();
+        let cancel_x = crate::inference::serve::cancel::CancelToken::new();
+        let guard_x = crate::inference::serve::cancel::CancelGuard::new(cancel_x.clone());
         let rendered = tokio::task::spawn_blocking(move || {
+            let _stop = crate::inference::serve::cancel::scoped::publish(&cancel_x);
             crate::inference::model::ezaudio::pipeline::render(
                 &prompt,
                 seconds,
@@ -1319,6 +1227,7 @@ pub(crate) async fn audio_generations(
             )
         })
         .await;
+        guard_x.disarm();
         let (pcm, _n_samples) = match rendered {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
