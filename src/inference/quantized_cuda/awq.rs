@@ -502,6 +502,47 @@ fn load_from_shape(
         .map_err(|e| anyhow!("load {name}: {e}"))
 }
 
+/// Whether `name` is a shape or head kernel base, exported only by a shape module under a
+/// suffixed name.
+#[cfg(test)]
+pub(crate) fn is_shape_kernel_base(name: &str) -> bool {
+    SHAPE_KERNELS
+        .iter()
+        .chain(HEAD_KERNELS)
+        .any(|(_, base)| *base == name)
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod shape_module_tests {
+    use super::*;
+
+    /// Every shape and head kernel loads from the module compiled at each corner of the
+    /// supported domain: the smallest and largest head size, one and the most query heads.
+    #[test]
+    fn every_shape_kernel_resolves_at_the_domain_corners() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the shape modules are NOT covered by this run");
+            return;
+        };
+        let mut missing = Vec::new();
+        for head_dim in [Q8_0_BLOCK_SIZE, SHAPE_MAX_HEAD_DIM] {
+            for n_q_per_kv in [1, SHAPE_MAX_Q_PER_KV] {
+                for (_, base) in SHAPE_KERNELS {
+                    if let Err(e) = shape_kernel(&dev, base, head_dim, n_q_per_kv) {
+                        missing.push(e.to_string());
+                    }
+                }
+                for (_, base) in HEAD_KERNELS {
+                    if let Err(e) = head_kernel(&dev, base, head_dim, n_q_per_kv) {
+                        missing.push(e.to_string());
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+}
+
 /// Prewarm the NVRTC module at model load so the first decode token does not
 /// pay the in-band compile. Non-fatal: logs and returns Err on failure.
 pub fn prewarm(dev: &CudaDevice) -> Result<()> {
