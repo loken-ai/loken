@@ -306,6 +306,9 @@ pub struct GenericTransformerLayer {
     pub no_rope: bool,
     /// Custom attention scale (None = use 1/√head_dim)
     pub attention_scale: Option<f64>,
+    /// Attention scores pass through tanh(s/cap)*cap before the mask (Gemma2). Only the
+    /// unfused attention applies it; the fused and quantised paths step aside for it.
+    pub attn_softcap: Option<f32>,
     /// Residual connection multiplier (None = 1.0)
     pub residual_scale: Option<f64>,
     pub flags: Arc<GenericLayerFlags>,

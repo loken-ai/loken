@@ -1833,11 +1833,16 @@ impl GenericTransformerLayer {
         // form when its shape/dtype guards don't hold, so it is never worse.
         if q.dims()[2] > 1 {
             let raw_att = q.matmul_t(&k)?;
-            let att = crate::tensor::ops::softmax_scaled_masked(&raw_att, scale, mask)?
-                .to_dtype(v.dtype())?;
+            let att = if self.attn_softcap.is_some() {
+                let capped = self.softcap_scores(raw_att.affine(scale as f32, 0.0)?)?;
+                crate::tensor::ops::softmax_last_dim_masked(&capped, mask)?
+            } else {
+                crate::tensor::ops::softmax_scaled_masked(&raw_att, scale, mask)?
+            }
+            .to_dtype(v.dtype())?;
             return att.matmul(&v.contiguous()?);
         }
-        let raw_att = q.matmul_t(&k)?.affine(scale as f32, 0.0)?;
+        let raw_att = self.softcap_scores(q.matmul_t(&k)?.affine(scale as f32, 0.0)?)?;
         let att = if q.dims()[2] == 1 {
             if let Some(qk_buf) = self.graph_attn_qk_buffer.as_ref() {
                 qk_buf.slice_set(&raw_att, 0, 0)?;

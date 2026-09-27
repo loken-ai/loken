@@ -175,8 +175,10 @@ impl GenericLayerFlags {
                         .unwrap_or(false)
                 }
             },
-            // Gemma4 uses GELU; detected by presence of layer_output_scale (unique to Gemma4/3n)
-            use_gelu: has("blk.0.layer_output_scale.weight"),
+            // The Gemma family gates its FFN with GELU. A GGUF does not record the activation,
+            // so it follows the architecture, as the reference does; layer_output_scale marks
+            // the Gemma4/3n builds that name themselves otherwise.
+            use_gelu: arch.starts_with("gemma") || has("blk.0.layer_output_scale.weight"),
             // parallel-attn (phi2/gpt-neox): one input norm feeds both attn+ffn, so
             // there is no separate ffn_norm. OLMo2 ALSO lacks ffn_norm but is SERIAL
             // post-norm (it has post_ffw_norm) - exclude it so it isn't mis-routed.
@@ -267,6 +269,8 @@ pub struct GenericTransformerConfig {
     pub residual_scale: Option<f64>,
     /// Gemma4: final logit softcapping -> tanh(logits/cap)*cap
     pub final_logit_softcapping: Option<f64>,
+    /// Gemma2: attention score softcapping -> tanh(scores/cap)*cap, before the mask.
+    pub attn_logit_softcapping: Option<f64>,
     /// Per-layer sliding-window pattern (gemma4 `attention.sliding_window_pattern`,
     /// 1=SWA / 0=global). Authoritative SWA classification - preferred over the
     /// head_dim heuristic, which mis-classifies KV-shared layers whose Q dim does
@@ -554,6 +558,10 @@ impl GenericTransformerConfig {
         // Residual connection multiplier (Granite: 0.22)
         let residual_scale = meta_f32(content, arch, "residual_scale").map(|v| v as f64);
 
+        // Attention score softcapping (Gemma2: 50.0): tanh(scores/cap)*cap before the mask.
+        let attn_logit_softcapping =
+            meta_f32(content, arch, "attn_logit_softcapping").map(|v| v as f64);
+
         // Logit softcapping (Gemma4: 30.0)
         let final_logit_softcapping =
             meta_f32(content, arch, "final_logit_softcapping").map(|v| v as f64);
@@ -591,6 +599,7 @@ impl GenericTransformerConfig {
             attention_scale,
             residual_scale,
             final_logit_softcapping,
+            attn_logit_softcapping,
             flags,
             kv_quant: crate::inference::engine::llm_engine::KvQuant::Off,
             max_q8_seq_len: 8192,

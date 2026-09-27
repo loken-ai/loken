@@ -117,6 +117,19 @@ impl GenericTransformerLayer {
     /// CPU single-token decode attention from the Q8 KV store (half the
     /// KV bytes vs the F16 matmul). Returns `None` (-> F16 fallback) unless
     /// eligible: CPU build, the store is populated, seq==b==1, no mask.
+    /// `tanh(scores / cap) * cap` when the layer caps its attention scores, applied after the
+    /// scale and before the mask; the scores unchanged otherwise.
+    pub(super) fn softcap_scores(&self, att: Tensor) -> Result<Tensor> {
+        match self.attn_softcap {
+            Some(cap) => {
+                let dt = att.dtype();
+                (att.to_dtype(DType::F32)?.affine(1.0 / cap, 0.0)?.tanh()? * cap as f64)?
+                    .to_dtype(dt)
+            }
+            None => Ok(att),
+        }
+    }
+
     pub(super) fn cpu_q8_attention(
         &self,
         q: &Tensor,
@@ -130,7 +143,7 @@ impl GenericTransformerLayer {
         // standard_attention on CPU (the 2.5K cliff). The impl is device-guarded
         // (only runs when the store is CPU-populated; returns None otherwise).
         {
-            if b != 1 {
+            if b != 1 || self.attn_softcap.is_some() {
                 return Ok(None);
             }
             let hd = self.head_dim;
@@ -547,6 +560,7 @@ impl GenericTransformerLayer {
             } else {
                 att.affine(scale as f32, 0.0)?
             };
+            let att = self.softcap_scores(att)?;
             // Softmax in F32 (ollama parity) then back to kv dtype so p.v reads F16.
             let att = if kv_dt == crate::tensor::DType::F32 {
                 crate::tensor::ops::softmax_last_dim(&att)?
@@ -573,6 +587,7 @@ impl GenericTransformerLayer {
             if matches!(q.device(), crate::tensor::Device::Cpu)
                 && q.dtype() == crate::tensor::DType::F32
                 && q.dims()[0] == 1
+                && self.attn_softcap.is_none()
             {
                 if let Some(m) = mask {
                     return Self::flash_attn_prefill_cpu(q, &k, &v, m, scale as f32, n_rep);
@@ -613,6 +628,7 @@ impl GenericTransformerLayer {
                 } else {
                     att.affine(scale as f32, 0.0)?
                 };
+                let att = self.softcap_scores(att)?;
                 let att = match mask {
                     None => att,
                     Some(m) => {

@@ -446,10 +446,16 @@ impl LlmEngine {
             // `grow_to` gate switched from `cur_pos_dev.is_some()` ->
             // `graph_captured` flag so the non-graph dev_pos path can
             // still grow its buffers. phi2 unblocked.
+            // The quantised attention kernels do not cap scores: a model that caps them
+            // (Gemma2) keeps the unfused attention that does.
+            let caps_attention = content
+                .metadata
+                .contains_key(&format!("{arch}.attn_logit_softcapping"));
             let kv_quant_supported =
-                crate::inference::cache::kv_core::kv_shape_supported(head_dim, n_q_per_kv)
-                && kv_arch_check != "gemma4"
-                || is_gemma4_q8_ok;
+                (crate::inference::cache::kv_core::kv_shape_supported(head_dim, n_q_per_kv)
+                    && kv_arch_check != "gemma4"
+                    || is_gemma4_q8_ok)
+                    && !caps_attention;
             // Compile the shape's attention kernels now rather than on the first decoded token.
             #[cfg(feature = "cuda")]
             if kv_quant_supported {

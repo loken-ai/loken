@@ -928,6 +928,8 @@ impl GenericTransformerLayer {
             // mis-apply the [1] ones tensor as a norm. Route it to the regular forward
             // (where WeightedNorm::Identity::forward returns x unchanged, correctly).
             || matches!(self.attn_norm, WeightedNorm::Identity(_))
+            // Capped attention scores (Gemma2): the executor's attention does not cap.
+            || self.attn_softcap.is_some()
             // MoE layers: this executor computes a DENSE FFN (ffn_gate/up/down); an
             // MoE layer has no real dense FFN (only expert stacks + a placeholder),
             // so it MUST bail to the regular forward that routes through the experts.

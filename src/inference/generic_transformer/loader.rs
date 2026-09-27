@@ -1029,6 +1029,7 @@ fn build_generic_layer(
         },
         rope_dim,
         attention_scale: config.attention_scale,
+        attn_softcap: config.attn_logit_softcapping.map(|c| c as f32),
         residual_scale: config.residual_scale,
         flags,
     })
@@ -1322,6 +1323,7 @@ fn build_awq_layer(
         rope_dim: 0,
         no_rope: false,
         attention_scale: config.attention_scale,
+        attn_softcap: config.attn_logit_softcapping.map(|c| c as f32),
         residual_scale: config.residual_scale,
         flags,
     })
