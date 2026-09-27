@@ -52,7 +52,7 @@ configuration directory.
 | `config.toml not found in CWD, exe dir, or user config dir` | The daemon runs with defaults. Copy `config.toml.example` next to it. |
 | `Model not found` | Neither store holds the name. `loken pull <name> --source ollama` or `--source huggingface`; a Hugging Face id needs its owner. |
 | `Model '...' not found in remote registry` | The registry chosen by `--source` does not know the name. Check the tag on the registry, or the other source. |
-| `alloc failed: out of memory` | A card ran out while the placement had already spread the model. Lower `context_length` or `max_gpu_memory_fraction`, or pick a smaller quantisation. |
+| `alloc failed: out of memory` | A card ran out while the placement had already spread the model. Lower the request's `num_ctx`, or pick a smaller quantisation. |
 | `matmul_q4k_plain: avx2 build required` | This binary was built for a CPU without AVX2 and cannot run quantized weights on the host. Build on the target machine, or serve on a card. |
 | `401` on every request but `/health` | `require_auth` is on. Send `Authorization: Bearer <key>` or `X-API-Key` with a key from `api_keys`. |
 | `Address already in use` | Another daemon holds the port. `lokend serve --port <other>`, or stop it. |

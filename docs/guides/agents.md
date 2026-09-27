@@ -32,6 +32,7 @@ Claude Code presents and the key in Cline's provider file.
 ## Choosing a model
 
 A model that follows tool calls and a context of at least 32k tokens are the floor;
-`context_length` in the daemon's configuration sets the window a model is loaded with.
+a model is loaded with the window its checkpoint declares, and `loken launch` bounds the
+session by it.
 Claude Code speaks the Messages API and Cline the Ollama API, so any chat model the daemon
 serves works for both, and on a cluster the request goes to the node that holds it.

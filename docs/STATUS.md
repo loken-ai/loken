@@ -77,20 +77,18 @@ tok/s against 1.49 alone, same answer, at temperature zero.
 
 A prompt longer than the window keeps its first token and its tail, as ollama does. Once a
 conversation outgrows the window, the prefix it shares with the resident KV is that first
-token alone, and every turn re-prefills the whole window. `[inference] kv_shift_reuse = true`
-keeps the tail instead: the resident keys are pulled down to their new positions and
+token alone, and a cold run re-prefills the whole window every turn. loken keeps the tail
+instead: the resident keys are pulled down to their new positions and
 re-phased in place (the rotary phase of the shift is read off the layer's own table, so
 YaRN and factored frequencies need nothing special), and only the new tokens are prefilled.
 Measured 2026-09-04, second turn of a conversation 500 tokens past a 4,096 window,
-qwen3:8b: 1,256 ms of prefill without the option, 156 ms with it, 508 tokens dropped and
-3,519 reused. On deepseek-r1:70b, 26 layers on the host and a 2,048 window: 153 s without,
-38 s with, 430 dropped and 1,554 reused. The answer is coherent both ways, and not the
-same text.
+qwen3:8b: 1,256 ms of prefill cold, 156 ms with the shift, 508 tokens dropped and 3,519
+reused. On deepseek-r1:70b, 26 layers on the host and a 2,048 window: 153 s cold, 38 s with
+the shift, 430 dropped and 1,554 reused. The answer is coherent both ways, and not the same
+text: a re-phased key is not the key a cold prefill would have produced, bit for bit.
 
-Off by default, for the reason the prompt cache only reuses on a cold-run chunk boundary:
-a re-phased key is not the key a cold prefill would have produced, bit for bit, and the
-benchmark protocol compares cold runs. Refused, with a cold prefill instead, on a Q4 KV
-cache (a block groups 32 positions of one channel), on sliding-window layers (the buffer
+The shift runs by itself wherever the cache supports it. Refused, with a cold prefill
+instead, on a Q4 KV cache (a block groups 32 positions of one channel), on sliding-window layers (the buffer
 index stops being the position after a slide), and on the recurrent hybrids, whose state
 holds no positions to shift.
 

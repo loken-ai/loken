@@ -32,7 +32,7 @@ configure one.
 
 | Capability | Route | Configuration | State |
 |---|---|---|---|
-| Chat and completion, streamed or whole | `/v1/chat/completions`, `/v1/completions`, `/api/chat`, `/api/generate`, `/v1/messages` | `model_id`, `context_length` | Measured against ollama, [STATUS](docs/STATUS.md#decode-rate-vs-ollama) |
+| Chat and completion, streamed or whole | `/v1/chat/completions`, `/v1/completions`, `/api/chat`, `/api/generate`, `/v1/messages` | `model_id` | Measured against ollama, [STATUS](docs/STATUS.md#decode-rate-vs-ollama) |
 | Responses API | `/v1/responses` | | Runs |
 | Coding agents on the daemon | `loken launch claude`, `loken launch cline` | | Runs, [guide](docs/guides/agents.md) |
 | Tools, JSON schema, grammar-constrained output | the chat routes, `tool_choice`, `response_format` | | Runs |

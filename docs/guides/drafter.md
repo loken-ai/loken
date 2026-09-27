@@ -20,7 +20,7 @@ drafter attached to a model that fits the cards, it is dropped.
 ## By hand
 
 `POST /api/draft/attach` with `target` and `draft` attaches a drafter to a loaded model after
-the same vocabulary check, on the fastest card unless `device_index` names one;
+the same vocabulary check, on the fastest card unless the request's `device_index` names one;
 `/api/draft/detach` removes it and `/api/draft/status` lists the pairs and their current draft
 length. These endpoints are loken's own; the Ollama API has none.
 

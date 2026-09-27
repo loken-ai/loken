@@ -47,7 +47,7 @@ Two rules follow:
 | `src/inference/cache/kv_disk.rs` | The disk tier: blocks, the chained hash, one manifest per sequence, writes off the request path. |
 | `src/inference/cache/turboquant/mod.rs` | A 3-bit cache written as a host reference so that the measurement deciding whether to write the kernel exists first. Read `measure` before the rest. |
 | `src/inference/engine/llm_engine/load.rs` (`kv_reuse_start`) | What a new prompt reuses: the resident prefix, a snapshot that covers more of it, a disk sequence that covers more still, each rounded down to a prefill chunk. |
-| `src/inference/engine/llm_engine/params.rs` | The keys: `kv_snapshots`, `kv_disk_dir`, the budgets, `kv_shift_reuse`; the guide is [`../guides/kv-memory.md`](../guides/kv-memory.md). |
+| `src/inference/engine/llm_engine/params.rs` | The keys: `kv_disk_dir` and its budget; snapshots and the shift past the window need none. The guide is [`../guides/kv-memory.md`](../guides/kv-memory.md). |
 
 ## What was measured
 
@@ -81,7 +81,7 @@ which is why the agent's default window is the large one.
 The reused prefix is rounded down to a prefill chunk, and on a small model with a free card
 the chunk is 2 048 tokens (`adaptive_prefill_chunk` in
 `src/inference/engine/model_backend.rs`), so the conversation has to be longer than that to
-show anything. With `kv_snapshots = 4` in the configuration, send a first turn of about
+show anything. Send a first turn of about
 4 400 tokens on conversation A, then its second turn, then a first turn of another
 conversation B, then A's second turn again, each with `"options":{"num_ctx":8192}`, and read
 `prompt_eval_count` and `prompt_eval_duration` on each reply.
@@ -97,6 +97,5 @@ Observed on qwen3:0.6b, RTX 5070 Ti:
 
 The second turn computed 381 tokens: two chunks of the 4 477 shared were reused and the
 remainder recomputed. The last line came from a snapshot, and the daemon's log says so:
-`kv snapshot restored: 4477 tokens shared with the prompt, 4506 resident`. With
-`kv_snapshots = 0` the last line prefills like the first. With turns shorter than a chunk
+`kv snapshot restored: 4477 tokens shared with the prompt, 4506 resident`. With turns shorter than a chunk
 nothing is reused at all, and the counts say so.

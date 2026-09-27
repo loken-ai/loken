@@ -57,7 +57,7 @@ Nothing below is configured; a key of that name in an older `config.toml` loads 
 | Card a model loads on | The fastest card that holds it, from the probe. |
 | Memory each card offers | The measured free memory; the load keeps its own runtime reserve and backs off after an out-of-memory. |
 | Layers on cards, host threads | The placement plan, and the physical (or performance) cores. |
-| KV cache format | The architecture and the kernels' head shapes; a request may still ask for one with `options.kv_quant`. |
+| KV cache format | Q8 for every model whose head shape the quantised kernels serve, Q4 for qwen3moe; full width for a head shape they do not cover, capped attention scores (Gemma2) and gemma4. A request may still ask for one with `options.kv_quant`. |
 | Conversation snapshots | Each finished sequence is copied aside so a later request on it resumes from its own KV; how many are kept is bounded by the free device memory, leaving the cache its working window. |
 | Batched serving | A model serves requests one at a time until they overlap several times in a row, then batches them in its paged worker (cards only); as many lone arrivals in a row take it back to serial decode, the faster path for one stream. |
 | Speculative decoding | A model that spills layers to the host is drafted for by the smallest model in the store with the same ordinary vocabulary, loaded on the fastest card before the target; the draft length is learned from measured acceptance and cycle time. A model held on the cards gets no drafter. `POST /api/draft/attach` still attaches one by hand. |
