@@ -64,6 +64,11 @@ pub struct ThinkSplit {
     close: &'static str,
     pending: String,
     content_started: bool,
+    /// A reasoning block has closed: the blank line after it belongs to neither side.
+    thought: bool,
+    /// Whitespace that arrived before anything else, held until it is known to precede an
+    /// answer (kept) or a reasoning block (dropped).
+    held: String,
 }
 
 impl ThinkSplit {
@@ -100,6 +105,11 @@ impl ThinkSplit {
                     let before = self.pending[..i].to_string();
                     self.pending = self.pending[i + tag.len()..].to_string();
                     self.emit(&mut out, before);
+                    if self.inside {
+                        self.thought = true;
+                    } else {
+                        self.held.clear();
+                    }
                     if !self.inside {
                         self.close = if tag == OPEN_HARMONY {
                             CLOSE_HARMONY
@@ -134,6 +144,9 @@ impl ThinkSplit {
         let rest = std::mem::take(&mut self.pending);
         let mut out = Vec::new();
         self.emit(&mut out, rest);
+        if !self.content_started && !self.held.is_empty() {
+            out.push(Segment::Content(std::mem::take(&mut self.held)));
+        }
         out
     }
 
@@ -150,16 +163,23 @@ impl ThinkSplit {
             return;
         }
         // The blank line a model leaves between its reasoning and its answer belongs
-        // to neither.
+        // to neither. An answer with no reasoning before it keeps its leading whitespace:
+        // it is part of what the model wrote.
         let text = if self.content_started {
             text
-        } else {
+        } else if self.thought {
             let t = text.trim_start();
             if t.is_empty() {
                 return;
             }
             self.content_started = true;
             t.to_string()
+        } else if text.trim().is_empty() {
+            self.held.push_str(&text);
+            return;
+        } else {
+            self.content_started = true;
+            std::mem::take(&mut self.held) + &text
         };
         out.push(Segment::Content(text));
     }
@@ -216,6 +236,24 @@ pub fn split_thinking_opened(by_prompt: bool, text: &str) -> (Option<String>, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_without_reasoning_keeps_its_leading_whitespace() {
+        let mut s = ThinkSplit::opened(false);
+        let mut segs = s.push("\n");
+        segs.extend(s.push("// code"));
+        segs.extend(s.finish());
+        assert_eq!(segs, vec![Segment::Content("\n// code".into())]);
+        assert_eq!(split_thinking_opened(false, " The answer").1, " The answer");
+    }
+
+    #[test]
+    fn the_blank_after_reasoning_belongs_to_neither() {
+        let (thinking, content) =
+            split_thinking_opened(false, "\n<think>\nhmm\n</think>\n\nThe answer");
+        assert_eq!(thinking.as_deref(), Some("hmm"));
+        assert_eq!(content, "The answer");
+    }
 
     #[test]
     fn harmony_channels_split_like_think_tags() {
