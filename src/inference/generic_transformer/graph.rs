@@ -64,56 +64,15 @@ impl GenericHeteroTransformer {
             //   3. max_seq_padded shrinks dynamically with the cache
             //      occupancy.
             if l.has_q8_cache() {
-                // gemma4 still blocked - see recapture_each_token.
-                // tested flipping to true unconditionally.
-                // deepcoder regressed -3.2 % medium / -3.5 % long: graph
-                // capture overhead per replay (2744 nodes for 48-layer
-                // model) exceeded the launch-savings on long-seq Q8.
-                //
-                // re-enabled SPECIFICALLY for phi2-class
-                // (parallel_attn + layer_norm_with_bias). For phi2 the
-                // non-graph dev_pos kernel chain still does 4 launches
-                // per layer (post-Phase-2 fused softmax+output is 2
-                // launches, but the engine wraps several more around
-                // it). CUDA graphs eliminate per-launch overhead, and
-                // the dev_pos kernels are designed graph-safe (read
-                // seq_kv from cur_pos_dev, write at fixed
-                // max_seq_padded stride). Other Q8 arches still bail
-                // because their dispatch is gated to `use_graph_ops`
-                // and the deepcoder regression analysis still holds
-                // for them.
-                //
-                // re-tested with dynamic max_seq_padded now
-                // in tree (commit 8019b06). Capture succeeded (2360 nodes
-                // for deepcoder qwen2 40-layer), but bench showed ZERO
-                // perf delta (75.1 vs 75.8 tok/s, ±0.3 std). Launch
-                // overhead in warm-stream decode is already ~0.5-1µs/launch,
-                // so eliminating it via graph capture doesn't move the
-                // needle. The deepcoder -10% gap is some other cost
-                // (Q8 K cache read bandwidth or matmul scheduling).
-                // Leaving non-phi2 gated to avoid graph-capture surface
-                // area without any upside.
-                //
-                // re-opened for SMALL dense Q8 models
-                // (`q8_graph_small_dense_ok`, embedding <= 2048 on the
-                // qwen2/qwen3/llama whitelist). Those decodes are
-                // LAUNCH-BOUND (qwen3:0.6b eager loses ~6-9 % to
-                // ollama's graph replay); the historical "zero delta"
-                // above was measured on 14B where kernels dominate, and
-                // pre-dates the capture work (model-
-                // stream capture + event-tracking-off + capture arena).
-                // Correctness prerequisites now in tree:
-                //   - host KV bookkeeping synced per replayed token
-                //     (`sync_kv_len_for_graph`, engine replay loop);
-                //   - capture-frozen seq ceiling enforced per token
-                //     (`Q8KvCache::graph_seq_limit` checked in
-                //     update_graph_state -> engine invalidates and
-                //     re-captures/eager-falls-back at the wider state);
-                //   - probation (replay argmax vs eager) + 0-node
-                //     defense at the engine catch anything else.
+                // A Q8 layer is graph-safe: its device-position kernels read the sequence
+                // length from the device and write at the padded stride, the host KV length
+                // is synced per replayed token, the capture-frozen ceiling is enforced per
+                // token, and probation replays catch anything else. Dense models capture;
+                // a phi2-style layer (parallel attention with LayerNorm bias) takes its own
+                // device-position path below.
                 let phi2_dev_pos =
                     self.config.flags.parallel_attn && self.config.flags.layer_norm_with_bias;
-                if self.q8_graph_small_dense_ok() {
+                if self.q8_graph_dense() {
                     return None;
                 }
                 // gemma4 graph mode: the capture crash is solved (capture
@@ -128,8 +87,9 @@ impl GenericHeteroTransformer {
                 // 26.6 tok/s vs 142.4 graph-off = 5.3x SLOWER (split-path
                 // capture/replay overhead). Even with correct output it would
                 // never be enabled. Do NOT re-attempt gemma4 graph mode.
-                return (!phi2_dev_pos)
-                    .then_some("Q8 KV cache on an arch that measured slower captured than eager");
+                return (!phi2_dev_pos).then_some(
+                    "routed experts allocate per token, which a capture cannot contain",
+                );
             }
             // gemma4 HD=512 still blocked.
             // F-dtype-only path: graph-safe ONLY when head_dim <= 256.
@@ -189,26 +149,11 @@ impl GenericHeteroTransformer {
         })
     }
 
-    /// Small dense Q8-KV models whose decode is LAUNCH-BOUND - the class
-    /// where CUDA-graph replay pays (qwen3:0.6b measured 581-605 tok/s
-    /// eager vs ollama ~640 graph-replayed). Larger Q8 models (deepcoder
-    /// 14B, qwen3:8b) measured ~zero graph delta historically (kernels
-    /// dominate) and stay on the proven eager path until re-benched.
-    /// gemma4 is excluded by arch (its graph mode is measured 5.3x
-    /// SLOWER - see kv_state_graph_safe comments; do not re-attempt).
-    /// `granite` joins the set on the same reasoning that admitted the others:
-    /// it is genuinely dense, its embedding is inside the bound, and the main
-    /// capture allow-list already carries it - only this list's name check kept
-    /// it out, and it decoded well below the reference in both streaming modes.
-    /// The MoE members of that family stay out: this path is for dense decode,
-    /// and a routed expert set allocates per token, which a capture cannot
-    /// contain. Each name here is a measured admission, never a merge of the
-    /// two lists - gemma4 sits in the allow-list and belongs OUT of this one.
-    pub fn q8_graph_small_dense_ok(&self) -> bool {
-        matches!(
-            self.config.arch.as_str(),
-            "qwen2" | "qwen3" | "llama" | "granite"
-        ) && self.config.embedding_length <= 2048
+    /// Q8-KV decode captures when every layer is dense: a routed expert set allocates per
+    /// token, which a capture cannot contain. Whether the capture then pays is measured per
+    /// model (llm_engine::decode_choice), not assumed from its size or name.
+    pub fn q8_graph_dense(&self) -> bool {
+        self.layers.iter().all(|l| l.moe.is_none())
     }
 
     /// Drop the F16 lm_head when nothing can use it.
@@ -370,52 +315,12 @@ impl GenericHeteroTransformer {
         // buffers (graph_k_proj_buffer, graph_v_proj_buffer,
         // graph_attn_out_buffer, graph_ffn_up_buffer, ...). Larger
         // refactor; gated off for now while the infra stays in tree.
-        let arch = self.config.arch.as_str();
-        // EXPERIMENTAL: include phi2 to test whether the per-layer
-        // stable intermediate buffers close the
-        // ILLEGAL_ADDRESS replay crash for arches with capture-once
-        // buffers. phi2 is excluded - both the recapture path AND
-        // the non-graph fallback have bugs:
-        //   - cudaGraphExecUpdate returns FAILURE (phi2 changes graph
-        //     STRUCTURE each token, not just params; update can only
-        //     patch params)
-        //   - Post-clear fallback hits "cannot broadcast [6,32] to
-        //     [1,32,6,33]" - separate shape-tracking bug in phi2's
-        //     non-graph path
-        // Both need multi-day fixes. Leave phi2 in non-graph mode
-        // (its current -49% LOSS state).
-        // phi2 BACK OFF the whitelist after measuring that
-        // F-dtype KV (now default after the auto-promote revert) is
-        // significantly faster than Q8 KV (326 tok/s vs 262 tok/s on
-        // moondream short - bench above). Graph mode for F-dtype phi2
-        // is blocked by the original ILLEGAL_ADDRESS bug
-        // which the graph-capture
-        // dev_slot work only addressed for Q8. Leaving phi2 OUT of
-        // auto-on so F-dtype runs on the unbroken non-graph path.
-        // Re-enable phi2 once either (a) F-dtype graph capture is
-        // fixed at the engine level, or (b) Q8 becomes faster than
-        // F-dtype on this shape via further kernel work.
-        // The allow-list is the performance dividing line, not a property of the
-        // architectures: every model measured against ollama that LOSES sits outside it
-        // (olmoe -21%, granitemoe -18%, granite -18%, olmo2 -9%) and every large win sits
-        // inside it (qwen3moe +181%, llama +22%, qwen3 +27%). Without capture, decode
-        // submits 717 kernels per token for 170ms of GPU work in a 2272ms window - the
-        // device computes 7.5% of the time and the host burns a core issuing launches.
-        // qwen3moe already proves a mixture captures correctly, so expert routing is not
-        // the obstacle it was assumed to be.
-        if !matches!(
-            arch,
-            "gemma4"
-                | "qwen2"
-                | "qwen3"
-                | "qwen3moe"
-                | "llama"
-                | "granitemoe"
-                | "granite"
-                | "olmoe"
-                | "olmo2"
-        ) {
-            return Err("architecture not in the capture allow-list");
+        // Parallel-attention layers (phi2) change the graph's structure from one token to
+        // the next, which a replay cannot patch, and their capture faulted on an illegal
+        // address. Every other layout captures; whether that pays is measured per model
+        // (llm_engine::decode_choice) and whether it is correct by the probation replays.
+        if self.config.flags.parallel_attn {
+            return Err("parallel-attention layers change the graph between tokens");
         }
         Ok(())
     }

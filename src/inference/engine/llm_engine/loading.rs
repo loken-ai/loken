@@ -75,6 +75,8 @@ impl LlmEngine {
         }
         self.load_model_only().await?;
         self.confirm_drafter().await;
+        // A new placement decodes at new rates: what the last one measured no longer holds.
+        *self.decode_choice.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         Ok(())
     }
 

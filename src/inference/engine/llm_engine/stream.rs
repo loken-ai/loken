@@ -954,27 +954,41 @@ impl LlmEngine {
             // probation sequence into this loop. Non-split (Q4/Q8 dev-pos)
             // models only - split-path models are gated off engine-wide.
             #[cfg(feature = "cuda")]
-            let (graph_ok, graph_stream) = {
+            let (graph_stream, graph_eligible) = {
                 let guard = model_state.blocking_lock();
                 match guard.as_ref() {
                     Some(s) if device_clone.is_cuda() && s.model.capabilities().graph_mode => {
-                        let ok = s.model.graph_capture_auto_on()
+                        let eligible = s.model.graph_capture_auto_on()
                             && s.model.kv_state_graph_safe()
                             && !s.model.needs_split_graph_path();
                         // Capture MUST target the MODEL's compute stream
                         // (same rule as the non-stream path).
-                        let stream = if ok {
+                        let stream = if eligible {
                             s.model
                                 .model_cuda_stream()
                                 .or_else(|| crate::tensor::cuda_ext::stream_of(&device_clone).ok())
                         } else {
                             None
                         };
-                        (ok && stream.is_some(), stream)
+                        (stream, eligible)
                     }
-                    _ => (false, None),
+                    _ => (None, false),
                 }
             };
+            #[cfg(not(feature = "cuda"))]
+            let graph_eligible = false;
+            let pld_capable = {
+                let guard = model_state.blocking_lock();
+                guard
+                    .as_ref()
+                    .map(|s| s.model.capabilities().pld)
+                    .unwrap_or(false)
+            };
+            // The decode mode is the one this model's own requests measured fastest
+            // (decode_choice).
+            let decode_mode = spec_engine.decode_mode(graph_eligible, pld_capable);
+            #[cfg(feature = "cuda")]
+            let graph_ok = decode_mode == DecodeMode::Captured && graph_stream.is_some();
             #[cfg(feature = "cuda")]
             let mut cuda_graph: Option<crate::tensor::cuda_ext::CudaGraph> = None;
             #[cfg(feature = "cuda")]
@@ -989,14 +1003,8 @@ impl LlmEngine {
             let mut graph_validations: usize = 0;
 
             // -- PLD (Prompt-Lookup Decoding) ---------------------------
-            // Read the PLD capability under a quick lock, then release.
-            let pld_enabled = {
-                let guard = model_state.blocking_lock();
-                guard
-                    .as_ref()
-                    .map(|s| s.model.capabilities().pld)
-                    .unwrap_or(false)
-            };
+            let pld_enabled = decode_mode == DecodeMode::Lookup;
+            info!("decode mode: {decode_mode:?}");
             let mut pld_cache =
                 crate::inference::serve::prompt_lookup::NgramDraftCache::new_cascade(2, 4, 5, 4096);
             if pld_enabled {
@@ -2221,6 +2229,14 @@ impl LlmEngine {
             // ended via break / EOS before reaching the next stream_token).
             if let Some(t) = iter_compute_start.take() {
                 compute_ns += t.elapsed().as_nanos() as u64;
+            }
+            // A request that meant to capture and could not ran in no mode worth recording.
+            #[cfg(feature = "cuda")]
+            let captured = graph_capture_attempted && !graph_disabled_this_request;
+            #[cfg(not(feature = "cuda"))]
+            let captured = false;
+            if !drafting && (captured || decode_mode != DecodeMode::Captured) {
+                spec_engine.record_decode_mode(decode_mode, token_count, compute_ns as f64 / 1e9);
             }
             // Publish compute-only timing for the HTTP handler. The
             // stream final NDJSON chunk uses these so assay computes

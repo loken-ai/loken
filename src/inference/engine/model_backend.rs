@@ -1132,36 +1132,6 @@ impl ModelBackend for MoondreamBackend {
     take_generic_passthrough!();
 }
 
-/// Whether prompt-lookup decoding pays on this generic model. Output-exact
-/// either way (drafts are verified against the target's greedy sample), so
-/// the answer changes speed, never text.
-fn generic_pld_pays(model: &GenericHeteroTransformer) -> bool {
-    // Per-model PLD opt-out: gemma4 family (dense + MoE) shows
-    // ~13-30% n-gram acceptance - straddling or below break-even.
-    // Gemma4's chat template + tokenizer don't repeat n-grams the
-    // way PLD relies on; gemma4:latest measured 20x speedup with
-    // PLD disabled (4.6 -> 115 tok/s on a 64-token medium gen).
-    if model.is_gemma4_arch() {
-        return false;
-    }
-    // Small-model PLD opt-out, measured.
-    // For the sub-~1B dense tier a decode step is so cheap (~1.5 ms,
-    // ~300 MB weight read) that PLD's multi-position verify forward +
-    // KV rollback + n-gram bookkeeping costs MORE than the tokens its
-    // accepts save - even at moderate acceptance. The verify amortizes
-    // a weight read across K positions, which is the whole PLD win, but
-    // a 0.6B model's weight read is already tiny so there is little to
-    // amortize while the fixed per-step overhead is unchanged.
-    // Measured qwen3:0.6b: PLD OFF 641 vs ON 597 tok/s short (+7.4%),
-    // 630 vs 605 medium at 38% accept (+4%) - PLD never pays and leaves
-    // us -8% vs ollama's 645; OFF ties ollama. qwen2.5:0.5b PLD-neutral.
-    // Larger models keep PLD (deepcoder 14B / qwen3:8b / mistral-nemo
-    // 12B all ≫ 1B).
-    // Threshold sits above the measured 0.6B tier (~0.6B params) and
-    // well below the smallest model where PLD is retained (~1.1B).
-    model.decode_weight_params() >= 750_000_000
-}
-
 impl ModelBackend for GenericBackend {
     fn kv_capacity(&self) -> Option<usize> {
         Some(self.0.kv_capacity())
@@ -1260,7 +1230,7 @@ impl ModelBackend for GenericBackend {
             // that must hold.
             trim_kv: true,
             shift_kv: true,
-            pld: generic_pld_pays(&self.0),
+            pld: true,
             graph_mode: true,
             ..Capabilities::default()
         }

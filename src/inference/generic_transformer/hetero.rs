@@ -2102,34 +2102,6 @@ impl GenericHeteroTransformer {
         self.forward_spliced_prefill_chunked(hidden)
     }
 
-    /// True for ANY gemma4 architecture (dense or MoE). Used to
-    /// blanket-disable PLD across the gemma4 family - measured
-    /// 13% n-gram acceptance on gemma4:latest vs >35% on
-    /// llama/qwen2/qwen3 arches. PLD overhead exceeds the win
-    /// for gemma4's tokenizer characteristics.
-    pub fn is_gemma4_arch(&self) -> bool {
-        self.config.arch == "gemma4"
-    }
-
-    /// Approximate number of weight parameters READ per decode token: all
-    /// transformer-layer projections (Q/K/V/O + gate/up/down) across every
-    /// layer, plus the lm_head. The embedding table is a gather (not a
-    /// matmul) so it is excluded. This is a decode-cost proxy - a single
-    /// decode step is bandwidth-bound on exactly these bytes - used by the
-    /// small-model PLD opt-out (`Capabilities::pld`). The FFN is counted as 3
-    /// matrices (gated MLP); non-gated arches are slightly over-counted,
-    /// which only biases them toward KEEPING PLD (the safe direction).
-    pub fn decode_weight_params(&self) -> u64 {
-        let c = &self.config;
-        let hidden = c.embedding_length as u64;
-        let q = (c.n_head * c.head_dim) as u64;
-        let kv = (c.n_kv_head * c.head_dim) as u64;
-        let attn = hidden * q + 2 * hidden * kv + q * hidden;
-        let ffn = 3 * hidden * c.ffn_dim as u64;
-        let lm_head = c.vocab_size as u64 * hidden;
-        (c.n_layers as u64) * (attn + ffn) + lm_head
-    }
-
     /// Set of CUDA device ordinals the engine should pre-warm custom
     /// kernels for. Includes EVERY detected CUDA device (those that
     /// might receive layers under future placement / lazy-grow), not

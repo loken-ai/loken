@@ -540,7 +540,7 @@ impl LlmEngine {
             // is intentionally NOT applied - multi-device variants set the
             // engine-level `device` to CPU but route most layers to GPU
             // internally; speculative decoding still pays off there.
-            let pld_enabled = state.model.capabilities().pld;
+            let pld_capable = state.model.capabilities().pld;
             // Cascading n-gram lookup: try 4-gram first (precise matches
             // for code-style repetition), fall back to 3-gram and 2-gram
             // for shorter patterns. Drafts up to 5 tokens per match.
@@ -556,7 +556,7 @@ impl LlmEngine {
                 /* max_draft */ 5,
                 /* buf       */ 4096,
             );
-            if pld_enabled {
+            if pld_capable {
                 // Seed with the prompt. The initial `next_token` (from
                 // prefill sampling) is NOT pushed here - the outer loop
                 // pushes it at iteration 0 start (same as `generated` /
@@ -652,7 +652,7 @@ impl LlmEngine {
             // Graph-mode gates depend only on immutable model config (arch,
             // n_layers, kv cache types). Hoist out of the per-token loop  - 
             // kv_state_graph_safe iterates all layers.
-            let (graph_auto_on_cached, kv_safe_cached) = if state.model.capabilities().graph_mode {
+            let (graph_eligible, kv_safe_cached) = if state.model.capabilities().graph_mode {
                 let auto = state.model.graph_capture_auto_on();
                 let kv_safe = state.model.kv_state_graph_safe();
                 let split = state.model.needs_split_graph_path();
@@ -668,6 +668,12 @@ impl LlmEngine {
             } else {
                 (false, false)
             };
+            // The decode mode is the one this model's own requests measured fastest
+            // (decode_choice).
+            let decode_mode = spec_engine.decode_mode(graph_eligible && kv_safe_cached, pld_capable);
+            let graph_auto_on_cached = decode_mode == DecodeMode::Captured;
+            let pld_enabled = decode_mode == DecodeMode::Lookup;
+            info!("decode mode: {decode_mode:?}");
             // use_graph_mode is immutable for a given (model backend, device).
             // Hoist so the per-token loop doesn't redo the capability check
             // + `device.is_cuda()` on every iteration.
@@ -1505,6 +1511,15 @@ impl LlmEngine {
             // impossible, and is what made it visible: a client cannot receive tokens faster
             // than the server makes them.
             let decode_elapsed = gen_start.elapsed();
+            // A request that meant to capture and could not ran in no mode worth recording.
+            let captured = graph_capture_attempted && !graph_disabled_this_request;
+            if spec_drafted == 0 && (captured || decode_mode != DecodeMode::Captured) {
+                spec_engine.record_decode_mode(
+                    decode_mode,
+                    generated.len(),
+                    decode_elapsed.as_secs_f64(),
+                );
+            }
 
             // End-of-request graph teardown. The captured graph + its
             // arena-backed transients must not outlive the request: the next
