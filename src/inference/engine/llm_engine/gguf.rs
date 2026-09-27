@@ -249,40 +249,43 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
         // DeepSeek V4: digit runs of up to three, CJK runs, then the letter/punctuation split,
         // as three isolating splits in sequence.
         JoyaiLlm,
+        // GPT-4o (o200k): case-split letter runs with the contraction suffix, digit runs of
+        // up to three.
+        Gpt4o,
         Gpt2Default,
     }
     let pre_id = get_gguf_string(content, "tokenizer.ggml.pre").unwrap_or_default();
-    let pre_family = match pre_id.as_str() {
-        // LLAMA_VOCAB_PRE_TYPE_LLAMA3 + DBRX/SMAUG/CHATGLM4 (share the regex)
+    // The gpt-oss architecture is defined with the o200k tokenizer; a file that names no
+    // pre-tokenizer of its own is split the way the architecture was trained.
+    let pre_id = if pre_id == "default"
+        && get_gguf_string(content, "general.architecture").as_deref() == Some("gptoss")
+    {
+        "gpt-4o".to_string()
+    } else {
+        pre_id
+    };
+    // What the file's pre-tokenizer name means, as the reference defines each type: the split
+    // regex, whether merges give way to a greedy longest-vocab match, and whether a BOS leads
+    // every sequence when the file does not say.
+    let (pre_family, ignore_merges, pre_adds_bos) = match pre_id.as_str() {
+        // LLAMA_VOCAB_PRE_TYPE_LLAMA3
         "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral" | "midm-2.0"
-        | "lfm2" | "jina-v5-nano" | "dbrx" | "smaug-bpe" | "glm4" | "chatglm-bpe" => {
-            BpePreFamily::Llama3
-        }
+        | "lfm2" | "jina-v5-nano" => (BpePreFamily::Llama3, true, true),
+        // DBRX/SMAUG/CHATGLM4: the llama3 regex, rank-ordered merges, no BOS
+        "dbrx" | "smaug-bpe" | "glm4" | "chatglm-bpe" => (BpePreFamily::Llama3, false, false),
         // LLAMA_VOCAB_PRE_TYPE_QWEN2 (single-digit \p{N})
         "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "stablelm2" | "hunyuan"
-        | "solar-open" => BpePreFamily::Qwen2,
+        | "solar-open" => (BpePreFamily::Qwen2, false, false),
         // LLAMA_VOCAB_PRE_TYPE_QWEN35 (adds \p{M} to letter/symbol classes)
-        "qwen35" => BpePreFamily::Qwen35,
+        "qwen35" => (BpePreFamily::Qwen35, false, false),
         // LLAMA_VOCAB_PRE_TYPE_TEKKEN (Mistral tekken: case-split letter runs,
         // no contraction group, `/` folded into the punctuation run)
-        "tekken" => BpePreFamily::Tekken,
-        "joyai-llm" => BpePreFamily::JoyaiLlm,
-        _ => BpePreFamily::Gpt2Default,
+        "tekken" => (BpePreFamily::Tekken, true, true),
+        "joyai-llm" => (BpePreFamily::JoyaiLlm, false, false),
+        // LLAMA_VOCAB_PRE_TYPE_GPT4O
+        "gpt-4o" | "llama4" => (BpePreFamily::Gpt4o, false, false),
+        _ => (BpePreFamily::Gpt2Default, false, false),
     };
-    // Greedy longest-vocab match: the llama3 pre_type list + tekken.
-    let ignore_merges = matches!(
-        pre_id.as_str(),
-        "llama3"
-            | "llama-v3"
-            | "llama-bpe"
-            | "falcon3"
-            | "falcon-h1"
-            | "pixtral"
-            | "midm-2.0"
-            | "lfm2"
-            | "jina-v5-nano"
-            | "tekken"
-    );
 
     // What the metadata holds decides the model kind, not what the file calls itself. A GGUF
     // declaring the llama (SentencePiece) tokenizer carries piece SCORES and no merges: it is
@@ -365,6 +368,7 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
             // TEKKEN: the original tokenizer.json regex (unicode letter classes),
             // which HF's regex engine supports directly - cleaner than llama.cpp's
             // ASCII-lookahead reformulation of the same intent.
+            const GPT4O_RE: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
             const TEKKEN_RE: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
             let dec = ByteLevelDecoder::new(
@@ -416,6 +420,10 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
                         "🔡 Configured TEKKEN pre-tokenizer (pre='{pre_id}', ignore_merges=true)"
                     );
                 }
+                BpePreFamily::Gpt4o => {
+                    tokenizer.with_pre_tokenizer(Some(split_pipeline(GPT4O_RE)?));
+                    debug!("🔡 Configured GPT-4O pre-tokenizer (pre='{pre_id}')");
+                }
                 BpePreFamily::JoyaiLlm => {
                     tokenizer.with_pre_tokenizer(Some(split_sequence(&JOYAI_RES)?));
                     debug!("🔡 Configured JOYAI-LLM pre-tokenizer (pre='{pre_id}')");
@@ -443,15 +451,28 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
             use tokenizers::decoders::sequence::Sequence as DecSequence;
             use tokenizers::DecoderWrapper;
 
-            // Ġ (U+0120) represents a leading space in this tokenizer
-            let pre = MetaspacePre::default();
+            use tokenizers::pre_tokenizers::metaspace::PrependScheme;
+            // SentencePiece reads the text whole, spaces as `▁`, and never splits on them: a
+            // piece may span a space. The leading `▁` is added only when the vocabulary says
+            // so (`add_space_prefix`, true unless stated, as the reference reads it).
+            let add_space_prefix = !matches!(
+                content.metadata.get("tokenizer.ggml.add_space_prefix"),
+                Some(gguf_file::Value::Bool(false))
+            );
+            let prepend = if add_space_prefix {
+                PrependScheme::First
+            } else {
+                PrependScheme::Never
+            };
+            let pre = MetaspacePre::new('▁', prepend, false);
             // SPM vocabularies carry `<0xNN>` byte-fallback tokens for anything
             // outside the learned pieces (newlines, emoji, rare UTF-8). The HF
             // reference decoder for this family is a SEQUENCE ending in
             // ByteFallback + Fuse; with Metaspace alone those tokens leaked
-            // into the output as literal "<0x0A>" strings.
+            // into the output as literal "<0x0A>" strings. The decoder keeps the
+            // space a generated piece starts with: it is part of the answer.
             let dec = DecSequence::new(vec![
-                DecoderWrapper::Metaspace(MetaspaceDec::default()),
+                DecoderWrapper::Metaspace(MetaspaceDec::new('▁', PrependScheme::Never, false)),
                 DecoderWrapper::ByteFallback(ByteFallback::new()),
                 DecoderWrapper::Fuse(Fuse::new()),
             ]);
@@ -461,12 +482,13 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
         }
     }
 
-    // Mark special tokens (for skip_special_tokens support).
-    // Types: 1 = normal, 2 = unknown, 3 = control, 4 = user-defined, 5 = unused
-    // (placeholder slots like [PAD151669]), 6 = byte token. We register only
-    // 2-4 as added_tokens - matches HF's tokenizer.json layout. Skipping
-    // type-5 PADs is what allows llguidance/derivre to compile a byte trie
-    // over this vocab without aborting on placeholder strings.
+    // Register the whole-string tokens. Types: 1 = normal, 2 = unknown, 3 = control,
+    // 4 = user-defined, 5 = unused (placeholder slots like [PAD151669]), 6 = byte token.
+    // 2-4 become added tokens, matched whole - HF's tokenizer.json layout. Unknown and
+    // control tokens are special and a decode skips them; user-defined ones are text the
+    // model writes (a newline, a tag) and stay in the answer, as the reference prints them.
+    // Skipping type-5 PADs is what allows llguidance/derivre to compile a byte trie over
+    // this vocab without aborting on placeholder strings.
     if let Some(gguf_file::Value::Array(type_arr)) =
         content.metadata.get("tokenizer.ggml.token_type")
     {
@@ -491,8 +513,8 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
                         // of thought as the answer.
                         let parsed_by_the_api =
                             crate::api::thinking::SPLIT_MARKERS.contains(&token_str.as_str());
-                        special_tokens
-                            .push(tokenizers::AddedToken::from(token_str, !parsed_by_the_api));
+                        let special = *type_id != 4 && !parsed_by_the_api;
+                        special_tokens.push(tokenizers::AddedToken::from(token_str, special));
                     }
                 }
             }
@@ -506,19 +528,20 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
         }
     }
 
-    // BOS post-processor. The GGUF `add_bos_token` flag (mirrors HF's
-    // `add_bos_token`) tells us the model expects a leading BOS on every
-    // sequence. Our GGUF-built BPE tokenizer has no post-processor, so
-    // `encode(prompt, true)` would NOT prepend it - and Gemma is acutely
-    // BOS-sensitive (no `<bos>` -> degenerate/garbage output). llama.cpp /
-    // Ollama add it automatically; we must too. Scoped to gemma-family
-    // arches for now to avoid shifting the carefully-tuned non-gemma
-    // benchmarks; honoring `add_bos_token` globally is the correct general
-    // behavior and can be widened once each arch is re-validated.
-    let declared_bos = matches!(
-        content.metadata.get("tokenizer.ggml.add_bos_token"),
-        Some(gguf_file::Value::Bool(true))
-    );
+    // BOS post-processor. The GGUF `add_bos_token` flag (mirrors HF's `add_bos_token`) is
+    // the model's statement that it expects a leading BOS; our GGUF-built tokenizer has no
+    // post-processor, so `encode(prompt, true)` would not prepend it, and a BOS-sensitive
+    // model fed a bare prompt degenerates.
+    // A file that does not state the flag gets its vocabulary's default: SentencePiece leads
+    // with a BOS, byte-level BPE as its pre-tokenizer type says.
+    let default_add_bos = match tokenizer_model.as_str() {
+        "gpt2" => pre_adds_bos,
+        _ => true,
+    };
+    let declared_bos = match content.metadata.get("tokenizer.ggml.add_bos_token") {
+        Some(gguf_file::Value::Bool(b)) => *b,
+        _ => default_add_bos,
+    };
     let arch = get_gguf_string(content, "general.architecture").unwrap_or_default();
     // The gemma4 GGUFs declare `add_bos_token = false` and then need one anyway: their chat
     // template carries `<bos>` as literal text, so the templated path is fed correctly and
@@ -546,10 +569,19 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
     // that needed it, since that template does carry one, and the raw path
     // degenerated again. Doubling is not the risk it looked like: gemma4 ran
     // with both for a long time and answers correctly through the templated path.
+    // A byte-level BPE vocabulary that adds a BOS without naming one opens with its end-of-text
+    // token, the GPT-2 convention in which one token both begins and ends a text.
+    let token_id = |key: &str| match content.metadata.get(key) {
+        Some(gguf_file::Value::U32(id)) => Some(*id),
+        _ => None,
+    };
+    let bos_id = token_id("tokenizer.ggml.bos_token_id").or_else(|| {
+        (tokenizer_model == "gpt2")
+            .then(|| token_id("tokenizer.ggml.eos_token_id"))
+            .flatten()
+    });
     if add_bos {
-        if let Some(gguf_file::Value::U32(bos_id)) =
-            content.metadata.get("tokenizer.ggml.bos_token_id")
-        {
+        if let Some(bos_id) = bos_id.as_ref() {
             let bos_str = match content.metadata.get("tokenizer.ggml.tokens") {
                 Some(gguf_file::Value::Array(arr)) => arr.get(*bos_id as usize).and_then(|v| {
                     if let gguf_file::Value::String(s) = v {
