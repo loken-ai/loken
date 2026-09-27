@@ -712,8 +712,8 @@ impl LlmEngine {
                         }
                         d
                     });
-                dev_result.unwrap_or_else(|_| {
-                    warn!("CUDA device {} unavailable, falling back to CPU", gpu_idx);
+                dev_result.unwrap_or_else(|e| {
+                    warn!("CUDA device {} unavailable ({e}), falling back to CPU", gpu_idx);
                     Device::Cpu
                 })
             } else {
