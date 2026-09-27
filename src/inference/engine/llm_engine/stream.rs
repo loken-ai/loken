@@ -175,7 +175,57 @@ impl LlmEngine {
         rx
     }
 
+    /// Streams a generation through the out-of-memory recovery stages of
+    /// [`super::generate::retry_on_oom`]. An attempt counts as out of memory when
+    /// it fails to start or when its first message is an out-of-memory error;
+    /// such an attempt is drained, so its producer has ended, before the next
+    /// one starts. Once a message has been delivered, errors pass through.
     pub async fn generate_stream(
+        &self,
+        prompt: &str,
+        params: GenerationParams,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<String, String>>, Box<dyn std::error::Error>>
+    {
+        // The attempt ends with this block: an error is not `Send` across the next await.
+        let oom = {
+            let started = super::generate::retry_on_oom(
+                || async {
+                    let mut rx = self.generate_stream_once(prompt, params.clone()).await?;
+                    let first = rx.recv().await;
+                    if first_message_is_oom(&first) {
+                        while rx.recv().await.is_some() {}
+                    }
+                    Ok::<_, Box<dyn std::error::Error>>((first, rx))
+                },
+                |outcome| match outcome {
+                    Err(e) if is_cuda_oom(e) => Some(e.to_string()),
+                    Ok((first @ Some(Err(e)), _)) if first_message_is_oom(first) => Some(e.clone()),
+                    _ => None,
+                },
+                || crate::inference::place::vram_manager::evict_idle_llm(&self.config.model_id),
+                release_cuda_pools,
+            )
+            .await;
+            match &started {
+                Err(e) if is_cuda_oom(e) => e.to_string(),
+                Ok((first @ Some(Err(e)), _)) if first_message_is_oom(first) => e.clone(),
+                _ => {
+                    let (first, rx) = started?;
+                    return Ok(match first {
+                        Some(first) => prepend_message(first, rx),
+                        None => rx,
+                    });
+                }
+            }
+        };
+        if self.reload_further_off().await {
+            return self.generate_stream_once(prompt, params).await;
+        }
+        Err(oom.into())
+    }
+
+    /// One streamed generation, without out-of-memory recovery.
+    pub(super) async fn generate_stream_once(
         &self,
         prompt: &str,
         params: GenerationParams,
@@ -2369,5 +2419,59 @@ impl LlmEngine {
     pub async fn vocab_size(&self) -> Option<usize> {
         let guard = self.model_state.lock().await;
         guard.as_ref().map(|s| s.vocab_size)
+    }
+}
+
+/// True when a stream's first message is an out-of-memory error: the attempt
+/// failed before it delivered anything, so it can be run again unseen.
+fn first_message_is_oom(first: &Option<Result<String, String>>) -> bool {
+    matches!(first, Some(Err(e)) if is_cuda_oom(e))
+}
+
+/// A receiver that yields `first`, then every message of `rest`, with the
+/// capacity of `rest`. Dropping it closes `rest` on the next message.
+fn prepend_message(
+    first: Result<String, String>,
+    mut rest: tokio::sync::mpsc::Receiver<Result<String, String>>,
+) -> tokio::sync::mpsc::Receiver<Result<String, String>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(rest.max_capacity());
+    tokio::spawn(async move {
+        if tx.send(first).await.is_err() {
+            return;
+        }
+        while let Some(message) = rest.recv().await {
+            if tx.send(message).await.is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{first_message_is_oom, prepend_message};
+
+    #[test]
+    fn only_an_out_of_memory_first_message_is_retried() {
+        let oom = "DriverError(CUDA_ERROR_OUT_OF_MEMORY)";
+        assert!(first_message_is_oom(&Some(Err(oom.into()))));
+        assert!(!first_message_is_oom(&Some(Err("shape mismatch".into()))));
+        assert!(!first_message_is_oom(&Some(Ok("out of memory".into()))));
+        assert!(!first_message_is_oom(&None));
+    }
+
+    #[tokio::test]
+    async fn the_first_message_comes_before_the_rest() {
+        let (tx, rest) = tokio::sync::mpsc::channel(4);
+        tx.send(Ok("b".to_string())).await.unwrap();
+        tx.send(Err("c".to_string())).await.unwrap();
+        drop(tx);
+        let mut rx = prepend_message(Ok("a".to_string()), rest);
+        let mut seen = Vec::new();
+        while let Some(message) = rx.recv().await {
+            seen.push(message);
+        }
+        assert_eq!(seen, vec![Ok("a".into()), Ok("b".into()), Err("c".into())]);
     }
 }

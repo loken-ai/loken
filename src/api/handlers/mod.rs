@@ -1740,17 +1740,29 @@ impl APIServer {
         const LOAD_ATTEMPTS: usize = 3;
         let mut engine = Arc::new(LlmEngine::with_config(config.clone()));
         let mut last_err = String::new();
-        for attempt in 1..=LOAD_ATTEMPTS {
-            match engine.load_model().await {
+        let mut attempt = 0;
+        while attempt < LOAD_ATTEMPTS {
+            attempt += 1;
+            match engine.load_model().await.map_err(|e| e.to_string()) {
                 Ok(()) => {
                     last_err.clear();
                     break;
                 }
                 Err(e) => {
-                    last_err = format!("{e}");
+                    last_err = e;
                     let out_of_memory = last_err.to_lowercase().contains("out of memory")
                         || last_err.to_lowercase().contains("oom");
-                    if !out_of_memory || attempt == LOAD_ATTEMPTS {
+                    if !out_of_memory {
+                        break;
+                    }
+                    // An idle resident gives its memory back before the placement degrades;
+                    // the retry that follows does not count against the degradation steps.
+                    if self.evict_idle_llm(model_id).await > 0 {
+                        attempt -= 1;
+                        engine = Arc::new(LlmEngine::with_config(config.clone()));
+                        continue;
+                    }
+                    if attempt == LOAD_ATTEMPTS {
                         break;
                     }
                     let level = crate::inference::place::vram_manager::vram_degrade();
@@ -1763,6 +1775,7 @@ impl APIServer {
             }
         }
         if !last_err.is_empty() {
+            tracing::warn!("llm: {model_id} failed to load: {last_err}");
             return Err(last_err);
         }
         // Measure this node's placement cost for the model, once, while it is loaded: the on-card

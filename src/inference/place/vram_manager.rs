@@ -21,7 +21,8 @@
 //!
 //! The LLM engine is deliberately NOT registered as reclaimable: its keep-alive lifecycle is
 //! user-facing (Ollama semantics) and its reload cost is high. Media residents reload on their
-//! next request in tens of seconds and register here.
+//! next request in tens of seconds and register here. Idle language models give way only to a
+//! language model that ran out of memory mid-generation, through [`evict_idle_llm`].
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -384,6 +385,26 @@ pub fn ensure_gpu_headroom_blocking(caller: &'static str, hot_bytes: u64) -> boo
     let before = free_total();
     handle.block_on(ensure_gpu_headroom(caller, hot_bytes, 0));
     free_total() > before
+}
+
+/// Unloads one idle language model other than the named one; returns roughly the bytes it
+/// held, 0 when there was none to unload.
+type IdleLlmEvictor = Box<dyn Fn(String) -> ReclaimFuture + Send + Sync>;
+static IDLE_LLM_EVICTOR: OnceLock<IdleLlmEvictor> = OnceLock::new();
+
+/// Installs the server's idle-language-model evictor, once per process.
+pub fn register_idle_llm_evictor(hook: IdleLlmEvictor) {
+    let _ = IDLE_LLM_EVICTOR.set(hook);
+}
+
+/// Unloads the least recently used idle language model other than `except`, for a model that
+/// ran out of memory while generating. Returns roughly the bytes released, 0 when no idle model
+/// remained or no server registered an evictor.
+pub async fn evict_idle_llm(except: &str) -> u64 {
+    match IDLE_LLM_EVICTOR.get() {
+        Some(hook) => hook(except.to_string()).await,
+        None => 0,
+    }
 }
 
 /// Register (or replace) an engine's reclaim hook. The hook is called ONLY under the pressure

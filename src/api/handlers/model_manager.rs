@@ -786,6 +786,38 @@ impl APIServer {
         }
     }
 
+    /// Unloads the least recently used language model that is not `except` and serves no
+    /// request; returns the bytes its weights took, 0 when every other model is busy or none
+    /// is loaded.
+    pub(crate) async fn evict_idle_llm(&self, except: &str) -> u64 {
+        let victim = {
+            let engines = self.engines.read().await;
+            engines
+                .iter()
+                .filter(|e| e.model_id != except && e.engine.in_flight() == 0)
+                .min_by_key(|e| e.last_used.load(Ordering::Relaxed))
+                .map(|e| e.model_id.clone())
+        };
+        let Some(victim) = victim else {
+            return 0;
+        };
+        let bytes = self.model_blob_size(&victim, &self.config_for_model(&victim));
+        info!("⚖️  Unloading idle model {victim}: {except} ran out of memory while generating");
+        match self.unload_model(&victim).await {
+            Ok(_) => bytes.max(1),
+            Err(_) => 0,
+        }
+    }
+
+    /// Installs the evictor the engines call when a generation runs out of memory.
+    pub fn register_memory_hooks(&self) {
+        let server = self.clone();
+        crate::inference::place::vram_manager::register_idle_llm_evictor(Box::new(move |except| {
+            let server = server.clone();
+            Box::pin(async move { server.evict_idle_llm(&except).await })
+        }));
+    }
+
     /// Refresh the LRU timestamp on every resident model in `ids`
     /// (Stage-B conversation-aware residency - keep a conversation's whole
     /// working set warm so a one-off request from another caller can't

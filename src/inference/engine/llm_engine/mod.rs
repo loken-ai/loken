@@ -457,6 +457,11 @@ impl LlmEngine {
             .next()
     }
 
+    /// Requests admitted and not yet finished.
+    pub fn in_flight(&self) -> usize {
+        self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Which model drafts for this one: chosen when the target loaded, or attached.
     pub fn drafter_id(&self) -> Option<String> {
         self.drafter_choice

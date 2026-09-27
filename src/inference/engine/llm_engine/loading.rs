@@ -703,7 +703,11 @@ impl LlmEngine {
             // The primary card is the fastest one that holds the model whole; a faster card
             // that other residents have filled does not make a model that fits a free one split
             // across both. With no card holding it, the fastest stays primary.
-            let needed_on_one = file_size.saturating_add(runtime_reserve_bytes);
+            // What one card must hold for the model to live on it alone: the weights, the
+            // runtime reserve and the loader's own staging, as the split plan counts them.
+            let needed_on_one = file_size
+                .saturating_add(runtime_reserve_bytes)
+                .saturating_add(LOADER_OVERHEAD_PER_GPU);
             let gpu_idx = match device_index {
                 Some(i) => i,
                 None => all_cuda_gpus
@@ -721,7 +725,7 @@ impl LlmEngine {
             };
             let model_fits_single_gpu = file_size > 0
                 && available_gpu_memory > 0
-                && file_size.saturating_add(runtime_reserve_bytes) <= available_gpu_memory;
+                && needed_on_one <= available_gpu_memory;
             let model_fits_gpu = file_size > 0
                 && total_available_gpu_memory > 0
                 && file_size <= total_available_gpu_memory;

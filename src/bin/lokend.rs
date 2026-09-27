@@ -361,6 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Start periodic stats monitoring
             api_server.start_stats_monitoring();
+            api_server.register_memory_hooks();
             info!("Stats monitoring started (logging every 10 seconds)");
 
             // Apply the configured authentication policy BEFORE the router is built -
