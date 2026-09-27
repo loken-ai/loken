@@ -6,6 +6,10 @@
 
 use super::*;
 
+/// Chat-template markers a gemma4 file stops on when it carries no
+/// `tokenizer.ggml.eos_token_ids`: turn opener, turn closer, tool-response opener.
+const GEMMA4_TURN_STOP_PIECES: [&str; 3] = ["<|turn>", "<turn|>", "<|tool_response>"];
+
 /// Size the rayon pool the host kernels run on, once per process.
 ///
 /// Called from `main` before anything else can touch rayon. It used to sit at the top of the
@@ -300,10 +304,7 @@ impl LlmEngine {
                     );
                     2
                 });
-            // Some models advertise multiple EOS-equivalent token IDs.
-            // Gemma4: [1, 106, 50] - 1 is the canonical EOS, 106 & 50
-            // are chat turn-end markers. Without honoring all three the
-            // model can emit a turn-end and we'd keep generating.
+            // Some files list several end-of-sequence ids; every one stops generation.
             let mut eos_token_ids_extra: Vec<u32> = match content.metadata.get("tokenizer.ggml.eos_token_ids") {
                 Some(gguf_file::Value::Array(arr)) => arr
                     .iter()
@@ -316,14 +317,16 @@ impl LlmEngine {
                     .collect(),
                 _ => Vec::new(),
             };
-            // Arch-specific fallback: when GGUF doesn't ship the eos_token_ids
-            // array, fall back to known chat-template terminators. Without
-            // these, gemma4's `<end_of_turn>` (token 106) and `<start_of_turn>`
-            // (token 105) leak into the response and never stop generation.
-            // verified gemma4 GGUF didn't have the array key.
+            // A gemma4 file without the eos_token_ids array stops on its chat-template
+            // markers, resolved by their text in this file's vocabulary: a turn opener,
+            // a turn closer and a tool-response opener each end the model's answer.
             if eos_token_ids_extra.is_empty() && arch == "gemma4" {
-                for tok in [105u32, 106, 50] {
-                    if tok != eos_token_id { eos_token_ids_extra.push(tok); }
+                for text in GEMMA4_TURN_STOP_PIECES {
+                    match super::gguf::gguf_token_id(&content, text) {
+                        Some(tok) if tok != eos_token_id => eos_token_ids_extra.push(tok),
+                        Some(_) => {}
+                        None => warn!("the vocabulary has no {text} piece; not stopping on it"),
+                    }
                 }
             }
             if !eos_token_ids_extra.is_empty() {
@@ -784,12 +787,10 @@ impl LlmEngine {
             debug!("⚖️  Architecture: {}, Device: {:?}", arch, device);
             let weights_t = std::time::Instant::now();
             let model: BoxedModelBackend = match arch.as_str() {
-                // Moondream legacy path: original PyTorch state-dict naming.
-                // Ollama's moondream GGUF uses standard llama.cpp naming
-                // (token_embd, blk.{i}.attn_qkv) - fall through to the
-                // generic phi2 path below instead.
-                "moondream" if model_id_clone.to_lowercase().contains("moondream")
-                    && content.tensor_infos.contains_key("text_model.transformer.embd.wte.weight") => {
+                // Moondream legacy path: a file with the original PyTorch state-dict
+                // naming, whatever its architecture key says. A file with llama.cpp
+                // naming (token_embd, blk.{i}.attn_qkv) takes the generic phi2 path.
+                _ if content.tensor_infos.contains_key("text_model.transformer.embd.wte.weight") => {
                     debug!("Loading Moondream vision model from GGUF...");
                     let vb = crate::tensor::quantized::QVarBuilder::from_gguf(
                         &model_file, &device,
@@ -1248,6 +1249,10 @@ impl LlmEngine {
                 "granite" | "granite3" | "granitemoe" | "dbrx" | "internlm2" | "yi" | "orion" |
                 "olmo2" | "olmoe" | "ernie4_5" | "smollm3" => {
                     debug!("⬇️  Loading '{}' as generic hetero transformer (CUDA+CPU)...", arch);
+                    // An architecture without a RoPE pairing cannot build a config: refuse
+                    // it here, before any weight is placed.
+                    crate::inference::generic_transformer::rope_pairing(&arch)
+                        .map_err(|e| anyhow!("cannot load {arch} as a generic transformer: {e}"))?;
                     // For generic models: CUDA + CPU only (no OpenCL, those need per-model kernels).
                     // Per-layer KV cache memory cost. Used by HeteroPlan to
                     // reserve headroom on each GPU so weights + KV both fit.
@@ -1569,7 +1574,7 @@ impl LlmEngine {
                         Ok(m) => {
                             info!("✅ {} loaded: {} segments across {} CUDA GPUs + CPU (kv_quant={:?}, kv_ctx={})",
                                 arch, hetero_plan.segments.len(), hetero_cuda_devs.len(), kv_quant, effective_ctx);
-                            try_wrap_with_vision(m, &arch, projector_blob.as_deref())?
+                            try_wrap_with_vision(m, projector_blob.as_deref())?
                         }
                         // Tier 2: OOM on an optimistic placement that did NOT
                         // already span every CUDA device -> retry forced split.
@@ -1595,7 +1600,7 @@ impl LlmEngine {
                                 Ok(m) => {
                                     info!("✅ {} loaded after OOM-recovery: forced {}-GPU split ({} segments)",
                                         arch, cuda_devices.len(), split_plan.segments.len());
-                                    try_wrap_with_vision(m, &arch, projector_blob.as_deref())?
+                                    try_wrap_with_vision(m, projector_blob.as_deref())?
                                 }
                                 Err(e2) => {
                                     warn!("Forced-split retry also failed ({e2}); trying GPU+CPU hybrid before CPU");
@@ -1631,7 +1636,7 @@ impl LlmEngine {
                                 Ok(m) => {
                                     info!("✅ {} recovered via EVEN {}-GPU split ({} segments)",
                                         arch, cuda_devices.len(), even_plan.segments.len());
-                                    try_wrap_with_vision(m, &arch, projector_blob.as_deref())?
+                                    try_wrap_with_vision(m, projector_blob.as_deref())?
                                 }
                                 Err(e2) => {
                                     warn!("Even-split retry also failed ({e2}); trying GPU+CPU hybrid before CPU");

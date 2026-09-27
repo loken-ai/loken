@@ -550,6 +550,26 @@ fn an_embedding_model_offers_embedding_and_nothing_else() {
 }
 
 #[test]
+fn a_readable_header_decides_between_completion_and_embedding() {
+    // The file's pooling declaration overrides what the name suggests.
+    assert_eq!(
+        file_capabilities("embeddinggemma", Some(true)),
+        ["embedding"]
+    );
+    assert_eq!(
+        file_capabilities("my-embed-chat", Some(false)),
+        ["completion"]
+    );
+    // An unreadable file keeps the name's answer.
+    assert_eq!(file_capabilities("nomic-embed-text", None), ["embedding"]);
+    // A media family named by the model keeps its own capabilities.
+    assert_eq!(
+        file_capabilities("whisper-large-v3", Some(false)),
+        model_capabilities("whisper-large-v3")
+    );
+}
+
+#[test]
 fn normalize_model_id_passes_tagged_and_hf_paths() {
     // Ollama tagged name -> unchanged
     assert_eq!(normalize_model_id("qwen3:latest"), "qwen3:latest");

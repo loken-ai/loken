@@ -47,7 +47,7 @@ pub(super) fn load_generic_on_cpu(
     ) {
         Ok(m) => {
             info!("✅ {} loaded on CPU (fallback, kv_quant forced off)", arch);
-            try_wrap_with_vision(m, arch, projector_blob)
+            try_wrap_with_vision(m, projector_blob)
         }
         Err(e2) => Err(anyhow!("Failed to load {arch}: {e2}")),
     }
@@ -139,7 +139,7 @@ pub(super) fn load_generic_hybrid_or_cpu(
                     "✅ {} recovered via GPU+CPU HYBRID ({}% GPU budget): {}/{} layers on GPU, {} on CPU ({} segments)",
                     arch, frac_pct, gpu_layers, num_layers, num_layers - gpu_layers, plan.segments.len()
                 );
-                return try_wrap_with_vision(m, arch, projector_blob);
+                return try_wrap_with_vision(m, projector_blob);
             }
             Err(e) => warn!(
                 "GPU+CPU hybrid at {}% GPU budget also OOM'd ({e}); trying a tighter split",
@@ -458,22 +458,23 @@ pub(super) fn load_awq_model_state(
 
 pub(super) fn try_wrap_with_vision(
     text: GenericHeteroTransformer,
-    arch: &str,
     projector_blob: Option<&std::path::Path>,
 ) -> AnyResult<BoxedModelBackend> {
-    // Phi-class arches are the ones that ship as Ollama dual-blob today
-    // (moondream -> phi2). Llama-arch + a pixtral mmproj = Pixtral-12B.
-    let phi_class = matches!(arch, "phi" | "phi2" | "phi3" | "phi4");
-    let llama_class = matches!(arch, "llama" | "mistral");
-    let blob = match (phi_class || llama_class, projector_blob) {
-        (true, Some(p)) => p,
-        _ => return Ok(Box::new(GenericBackend(text))),
+    let Some(blob) = projector_blob else {
+        return Ok(Box::new(GenericBackend(text)));
     };
-    // Sniff the projector type from the mmproj GGUF metadata so the right
-    // tower loads (clip.projector_type: "pixtral" vs moondream's CLIP).
+    // The projector's clip.projector_type picks the tower: "pixtral" loads the
+    // Pixtral ViT, "mlp" the CLIP tower (which checks the file's vision shapes
+    // and leaves the model text-only when they differ). Any other type, or a
+    // projector without the key, leaves the model text-only.
     let projector_type = sniff_projector_type(blob).unwrap_or_default();
-    if llama_class && projector_type != "pixtral" {
-        return Ok(Box::new(GenericBackend(text))); // llama text-only
+    if !matches!(projector_type.as_str(), "pixtral" | "mlp") {
+        info!(
+            "📷 projector {} has type {:?}, which no tower here loads; text only",
+            blob.display(),
+            projector_type
+        );
+        return Ok(Box::new(GenericBackend(text)));
     }
     // Pick a CUDA device for the CLIP vision tower. Prefer a GPU the
     // text model does NOT have LAYERS on (its pool isn't competing

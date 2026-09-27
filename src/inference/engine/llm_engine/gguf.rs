@@ -46,6 +46,17 @@ pub(super) fn count_gguf_tokens(ct: &gguf_file::Content) -> Option<u32> {
     }
 }
 
+/// The id of the piece whose text is `text` in `tokenizer.ggml.tokens`, if the file has one.
+pub(super) fn gguf_token_id(ct: &gguf_file::Content, text: &str) -> Option<u32> {
+    match ct.metadata.get("tokenizer.ggml.tokens")? {
+        gguf_file::Value::Array(arr) => arr
+            .iter()
+            .position(|v| v.to_string().is_ok_and(|s| s == text))
+            .map(|i| i as u32),
+        _ => None,
+    }
+}
+
 /// Build a tokenizers::Tokenizer from GGUF embedded vocab metadata.
 /// Ollama models never ship tokenizer.json - the full vocab and merges
 /// are always embedded in the GGUF file under tokenizer.ggml.* keys.
@@ -993,5 +1004,38 @@ mod spm_vocabulary_tests {
                 "streaming assembly diverges from batch decode with skip_special={skip}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod token_lookup_tests {
+    use super::*;
+
+    fn content_with_tokens(tokens: &[&str]) -> gguf_file::Content {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            gguf_file::Value::Array(
+                tokens
+                    .iter()
+                    .map(|t| gguf_file::Value::String(t.to_string()))
+                    .collect(),
+            ),
+        );
+        gguf_file::Content {
+            magic: gguf_file::layout::WRITE_VERSION,
+            metadata,
+            tensor_infos: std::collections::HashMap::new(),
+            tensor_data_offset: 0,
+            mmap_owner: None,
+        }
+    }
+
+    #[test]
+    fn a_piece_resolves_to_its_position_in_the_vocabulary() {
+        let ct = content_with_tokens(&["<pad>", "<eos>", "<|turn>", "<turn|>"]);
+        assert_eq!(gguf_token_id(&ct, "<turn|>"), Some(3));
+        assert_eq!(gguf_token_id(&ct, "<|turn>"), Some(2));
+        assert_eq!(gguf_token_id(&ct, "<end_of_turn>"), None);
     }
 }

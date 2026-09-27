@@ -82,13 +82,14 @@ pub(crate) async fn ollama_list_models(
                     };
                     // What the checkpoint says about itself, read from its header, then
                     // the name and the byte size where it says nothing.
-                    let (arch, quant, declared) = match source {
+                    let (arch, quant, declared, pools) = match source {
                         ModelSource::Ollama => state
                             .manifest_layer_path(&m.id, "model")
                             .map(|w| header_facts(&w))
-                            .unwrap_or((None, None, None)),
-                        _ => (None, None, None),
+                            .unwrap_or((None, None, None, false)),
+                        _ => (None, None, None, false),
                     };
+                    let capabilities = file_capabilities(&m.id, arch.as_ref().map(|_| pools));
                     let family = arch
                         .clone()
                         .unwrap_or_else(|| infer_model_family(&m.id).to_string());
@@ -106,7 +107,7 @@ pub(crate) async fn ollama_list_models(
                             .with_source(source)
                             .with_digest(m.digest)
                             .with_details(details);
-                        om.capabilities = model_capabilities(&m.id);
+                        om.capabilities = capabilities;
                         om.defaults = media_model_defaults(&m.id);
                         om
                     }
@@ -423,6 +424,24 @@ pub(crate) fn model_capabilities(model_id: &str) -> Vec<String> {
     caps.iter().map(|s| s.to_string()).collect()
 }
 
+/// What a model can do when its GGUF header declares an architecture: a text model embeds
+/// when the file declares a pooling type and completes otherwise. `declared` is
+/// `Some(pools)` for a readable header naming an architecture, `None` for a file that
+/// cannot be read, which keeps [`model_capabilities`] from the name. A name that places
+/// the model in a media family keeps that family's capabilities.
+pub(crate) fn file_capabilities(model_id: &str, declared: Option<bool>) -> Vec<String> {
+    let by_name = model_capabilities(model_id);
+    let text_only = by_name
+        .iter()
+        .all(|c| c == "completion" || c == "embedding");
+    match declared {
+        Some(pools) if text_only => {
+            vec![if pools { "embedding" } else { "completion" }.to_string()]
+        }
+        _ => by_name,
+    }
+}
+
 /// The name a GGUF `general.file_type` stands for.
 ///
 /// The enum is part of the format, so the mapping is fixed by the file and not by this reader.
@@ -465,7 +484,9 @@ fn gguf_file_type_name(id: u64) -> Option<&'static str> {
     })
 }
 
-type Facts = (Option<String>, Option<String>, Option<u64>);
+/// Architecture, quantisation label, parameter count, and whether the file declares a
+/// pooling type.
+type Facts = (Option<String>, Option<String>, Option<u64>, bool);
 type Stamp = (u64, Option<std::time::SystemTime>);
 type FactsCache = std::collections::HashMap<std::path::PathBuf, (Stamp, Facts)>;
 static CACHE: std::sync::OnceLock<std::sync::Mutex<FactsCache>> = std::sync::OnceLock::new();
@@ -483,14 +504,14 @@ pub(crate) fn retain_facts(seen: &std::collections::HashSet<std::path::PathBuf>)
         .retain(|path, _| seen.contains(path));
 }
 
-/// The architecture, quantisation label and parameter count a checkpoint declares, read once
-/// per file: a header carries the whole vocabulary, and a catalogue of many models read on
-/// every listing is what made the list take seconds. A file that changed size or date is
-/// read again.
+/// The architecture, quantisation label, parameter count and pooling a checkpoint declares,
+/// read once per file: a header carries the whole vocabulary, and a catalogue of many models
+/// read on every listing is what made the list take seconds. A file that changed size or date
+/// is read again.
 pub(crate) fn header_facts(path: &std::path::Path) -> Facts {
     let stamp: Stamp = match std::fs::metadata(path) {
         Ok(m) => (m.len(), m.modified().ok()),
-        Err(_) => return (None, None, None),
+        Err(_) => return (None, None, None, false),
     };
     let cache = facts_cache();
     if let Some((seen, facts)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(path) {
@@ -508,6 +529,7 @@ pub(crate) fn header_facts(path: &std::path::Path) -> Facts {
             .and_then(gguf_file_type_name)
             .map(str::to_string),
         read.parameter_count,
+        read.pools,
     );
     cache
         .lock()
@@ -1114,7 +1136,13 @@ pub(crate) async fn ollama_show_model(
             // (accepts image input). Only meaningful for text LLMs - image-
             // gen / TTS / ASR already return no LLM caps. Matches Ollama,
             // which lists `vision` for llava/moondream/etc.
-            let mut caps = model_capabilities(&model_name);
+            let (model_info, arch, gguf_quant, declared_params) = gguf_facts(&weights);
+            let pools = arch.as_ref().map(|a| {
+                model_info
+                    .as_ref()
+                    .is_some_and(|m| m.contains_key(&format!("{a}.pooling_type")))
+            });
+            let mut caps = file_capabilities(&model_name, pools);
             if caps.iter().any(|c| c == "completion") && state.model_has_vision(&model_name) {
                 caps.push("vision".to_string());
             }
@@ -1144,7 +1172,6 @@ pub(crate) async fn ollama_show_model(
                 }
             }
             let capabilities = Some(caps);
-            let (model_info, arch, gguf_quant, declared_params) = gguf_facts(&weights);
             // Order of authority: what the distributor packaged, then what the checkpoint
             // declares, then the name and the file size. The two disagree on gpt-oss and
             // olmoe, and clients show the packaged answer.

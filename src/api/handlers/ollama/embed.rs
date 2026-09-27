@@ -130,10 +130,12 @@ pub(crate) async fn ollama_ps(
         // If model is split: size_vram = GPU portion (shows "X% CPU/Y% GPU")
         let size_vram = entry.engine.get_gpu_portion_size().await;
 
-        let format_str = if entry.model_id.contains(".gguf") || model_size < 5_000_000_000 {
-            "gguf"
-        } else {
-            "safetensors"
+        // The weights the engine resolves say what they are: a file opening with the GGUF
+        // magic is gguf, anything else it serves (a checkpoint directory) is safetensors.
+        // A model whose weights no longer resolve is reported as gguf, the engine's format.
+        let format_str = match entry.engine.resolve_model_file(&entry.model_id) {
+            Some(p) if !crate::tensor::quantized::gguf_file::has_gguf_magic(&p) => "safetensors",
+            _ => "gguf",
         };
         let parameter_size = estimate_parameter_size(model_size, format_str);
         let details = OllamaModelDetails {

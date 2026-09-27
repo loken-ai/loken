@@ -575,6 +575,9 @@ pub struct HeaderFacts {
     pub architecture: Option<String>,
     pub file_type: Option<u64>,
     pub parameter_count: Option<u64>,
+    /// The file declares `{architecture}.pooling_type`: its output is a pooled
+    /// embedding rather than next-token logits.
+    pub pools: bool,
 }
 
 /// Read the facts a catalogue lists, stopping at the first tokenizer key. The general keys
@@ -649,10 +652,27 @@ fn read_facts_from<R: Read + Seek>(r: &mut R) -> Result<HeaderFacts> {
             "general.parameter_count" => {
                 facts.parameter_count = read_value(r, vtype)?.to_u64().ok()
             }
+            k if facts
+                .architecture
+                .as_deref()
+                .is_some_and(|a| k.strip_prefix(a) == Some(".pooling_type")) =>
+            {
+                facts.pools = true;
+                skip(r, vtype)?
+            }
             _ => skip(r, vtype)?,
         }
     }
     Ok(facts)
+}
+
+/// Whether `path` is a file that opens with the GGUF magic. A directory, an unreadable
+/// file or one shorter than the magic is not.
+pub fn has_gguf_magic<P: AsRef<std::path::Path>>(path: P) -> bool {
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok_and(|()| magic == layout::MAGIC_BYTES)
 }
 
 /// Parses a header-only GGUF held in memory, such as the metadata a peer sends: no tensor
@@ -959,5 +979,25 @@ mod facts_tests {
         ]);
         let facts = read_facts_from(&mut std::io::Cursor::new(bytes)).expect("parses");
         assert_eq!(facts.parameter_count, Some(600_000_000));
+        assert!(!facts.pools);
+    }
+
+    /// A pooling type under the file's own architecture marks an embedding model; one under
+    /// another prefix does not.
+    #[test]
+    fn a_pooling_type_under_the_architecture_is_read() {
+        let bytes = header(&[
+            kv_string("general.architecture", "nomic-bert"),
+            kv_u32("nomic-bert.pooling_type", 1),
+            kv_strings("tokenizer.ggml.tokens", &["a"]),
+        ]);
+        let facts = read_facts_from(&mut std::io::Cursor::new(bytes)).expect("parses");
+        assert!(facts.pools);
+        let bytes = header(&[
+            kv_string("general.architecture", "llama"),
+            kv_u32("bert.pooling_type", 1),
+        ]);
+        let facts = read_facts_from(&mut std::io::Cursor::new(bytes)).expect("parses");
+        assert!(!facts.pools);
     }
 }
