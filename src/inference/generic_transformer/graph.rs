@@ -346,10 +346,18 @@ impl GenericHeteroTransformer {
         if has_cpu_layer {
             return Err("some layers are on the CPU");
         }
-        // Whitelist by arch. `kv_state_graph_safe()` already filters
-        // out HD=512 F-dtype-only layers (which crash on graph replay
-        // - gemma4:latest is the known case), so the arch check here
-        // just selects bench-validated arches.
+        // The captured decode computes the logits on the card of the last layer. An output
+        // projection left elsewhere, on another card or on the host because that card had no
+        // room, takes the eager path, which moves the hidden state to it.
+        if let Some(LayerDevice::Cuda(last)) = self.layer_devs.last() {
+            let head_card = self.output_proj_dev.as_ref().and_then(|d| match d.location() {
+                crate::tensor::DeviceLocation::Cuda { gpu_id } => Some(gpu_id),
+                _ => None,
+            });
+            if head_card != Some(*last) || self.output_norm_cuda_weight.is_none() {
+                return Err("the output projection is not on the card of the last layer");
+            }
+        }
         // phi2 (moondream): option-E split path (commits 3c78c9a +
         // 787986a + the engine wiring) moves scatter_set OUTSIDE the
         // captured region (capture succeeds at pos=14 with new path,

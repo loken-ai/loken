@@ -1636,24 +1636,20 @@ impl GenericHeteroTransformer {
             // dispatches to a device and one that runs on the host are told apart.
             for layer_idx in seg_start..seg_end {
                 let _timer = crate::inference::place::layer_perf::LayerTimer::start(layer_idx);
-                // PLE: transfer to layer's device if needed
-                let ple_on_dev = if let Some(ref inputs) = ple_inputs {
-                    if let Some(t) = inputs.get(layer_idx) {
-                        if on_cuda && t.device().is_cpu() {
-                            current_cuda_idx
-                                .and_then(|idx| self.cuda_devices.get(&idx))
-                                .map(|d| t.to_device(d))
-                                .transpose()?
-                        } else if !on_cuda && t.device().is_cuda() {
-                            Some(t.to_device(&Device::Cpu)?)
+                // PLE: the layer's input moves to the layer's device, host or card.
+                let ple_on_dev = match ple_inputs.as_ref().and_then(|inputs| inputs.get(layer_idx)) {
+                    Some(t) => {
+                        let layer_dev = if on_cuda {
+                            current_cuda_idx.and_then(|idx| self.cuda_devices.get(&idx)).cloned()
                         } else {
-                            Some(t.clone())
+                            Some(Device::Cpu)
+                        };
+                        match layer_dev {
+                            Some(d) if !t.device().same_device(&d) => Some(t.to_device(&d)?),
+                            _ => Some(t.clone()),
                         }
-                    } else {
-                        None
                     }
-                } else {
-                    None
+                    None => None,
                 };
 
                 // Shared KV: for layers in the shared range, grab cached K/V from a

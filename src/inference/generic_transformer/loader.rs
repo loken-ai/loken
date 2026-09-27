@@ -2188,6 +2188,24 @@ impl GenericHeteroTransformer {
             }
         }
 
+        // The adaptive load may have put layers on a card the plan did not name: give every
+        // card that now holds a layer its rotary tables before the layers are built.
+        for raw in &raw_layers {
+            if let DeviceKind::Cuda(idx) = raw.device_kind {
+                if let (std::collections::hash_map::Entry::Vacant(slot), Some(dev)) =
+                    (rope_cache.entry(format!("cuda_{idx}")), cuda_devices.get(&idx))
+                {
+                    let cos = cos_cpu.to_device(dev)?;
+                    let sin = sin_cpu.to_device(dev)?;
+                    #[cfg(feature = "cuda")]
+                    if let Ok(cd) = dev.as_cuda_device() {
+                        cd.synchronize()?;
+                    }
+                    slot.insert((cos, sin));
+                }
+            }
+        }
+
         // -- 6. Phase 2: Build per-device layers ----------------------------
         // build_generic_layer's per-layer dequant->Q4K requant is independent and
         // touches only its layer's tensors on that layer's GPU context. When all
