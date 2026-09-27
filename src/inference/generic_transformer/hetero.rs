@@ -349,6 +349,23 @@ impl GenericHeteroTransformer {
     /// Adds the per-vocabulary logit bias when the architecture carries one.
     /// EVERY site that produces logits must route through this - the engine has
     /// several, and one that skips it is wrong without failing.
+    /// Final norm and output projection for rows computed on a card: both run where the
+    /// projection lives, the card-resident quantised head when there is one.
+    fn head_on_device(&self, x: &Tensor) -> Result<Tensor> {
+        let x = x.to_dtype(crate::tensor::DType::F32)?;
+        #[cfg(feature = "cuda")]
+        if let (Some(proj), Some(dev)) = (
+            self.output_proj_cuda_qmm.as_ref(),
+            self.output_proj_dev.as_ref(),
+        ) {
+            let x = x.to_device(dev)?;
+            let f = self.final_norm_on_device(&x)?;
+            return self.apply_output_bias(proj.forward(&f)?);
+        }
+        let f = self.final_norm_on_device(&x)?;
+        self.apply_output_bias(self.output_proj.forward(&f)?)
+    }
+
     pub(crate) fn apply_output_bias(&self, logits: Tensor) -> Result<Tensor> {
         let Some(b) = self.output_bias.as_ref() else {
             return Ok(logits);
@@ -843,9 +860,7 @@ impl GenericHeteroTransformer {
             x = residual2.broadcast_add(&d)?;
             note_if_non_finite(&format!("layer {li}"), &x);
         }
-        let f = self.output_norm.forward(&x)?;
-        let logits = self.apply_output_bias(self.output_proj.forward(&f)?)?;
-        Ok(logits)
+        self.head_on_device(&x)
     }
 
     /// The capturable GPU decode region: batched layer loop + lm_head, reading ALL
@@ -1199,8 +1214,7 @@ impl GenericHeteroTransformer {
         }
         // logits for the last position only
         let last = x.narrow(0, t - 1, 1)?;
-        let f = self.output_norm.forward(&last)?;
-        self.output_proj.forward(&f)
+        self.head_on_device(&last)
     }
 
     /// Prefix-cached prefill: compute ONLY the suffix `tokens[cached_len..]`,
@@ -1355,8 +1369,7 @@ impl GenericHeteroTransformer {
             note_if_non_finite(&format!("layer {li}"), &x);
         }
         let last = x.narrow(0, tsfx - 1, 1)?;
-        let f = self.output_norm.forward(&last)?;
-        self.output_proj.forward(&f)
+        self.head_on_device(&last)
     }
 
     /// Multi-position forward: returns logits for EVERY input position

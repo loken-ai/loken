@@ -793,6 +793,10 @@ pub(crate) trait ModelBackend: Send {
         std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
         BoxedModelBackend,
     >;
+
+    /// Take a batch-served model back to serial serving; a backend that is not batch-served,
+    /// or cannot hand its model back, returns itself unchanged.
+    fn into_serial(self: Box<Self>) -> Result<BoxedModelBackend, BoxedModelBackend>;
 }
 
 /// `take_generic` passthrough for every backend that is NOT GenericHetero.
@@ -809,6 +813,9 @@ macro_rules! take_generic_passthrough {
             std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
             BoxedModelBackend,
         > {
+            Err(self)
+        }
+        fn into_serial(self: Box<Self>) -> Result<BoxedModelBackend, BoxedModelBackend> {
             Err(self)
         }
     };
@@ -1353,6 +1360,9 @@ impl ModelBackend for GenericBackend {
 
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
         Ok(self.0)
+    }
+    fn into_serial(self: Box<Self>) -> Result<BoxedModelBackend, BoxedModelBackend> {
+        Err(self)
     }
     fn into_batched(
         self: Box<Self>,
@@ -1958,6 +1968,9 @@ impl ModelBackend for DeepseekV41Backend {
         )
     }
 
+    fn into_serial(self: Box<Self>) -> Result<BoxedModelBackend, BoxedModelBackend> {
+        Err(self)
+    }
     fn into_batched(
         self: Box<Self>,
         eos: u32,
@@ -2117,7 +2130,32 @@ impl ModelBackend for ContinuousBackend {
         Some(self.0.clone())
     }
 
-    take_generic_passthrough!();
+    fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
+        Err(self)
+    }
+    fn into_batched(
+        self: Box<Self>,
+        _eos: u32,
+        _max_batch: usize,
+    ) -> Result<
+        std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer>,
+        BoxedModelBackend,
+    > {
+        Err(self)
+    }
+    fn into_serial(self: Box<Self>) -> Result<BoxedModelBackend, BoxedModelBackend> {
+        let server = match std::sync::Arc::try_unwrap(self.0) {
+            Ok(server) => server,
+            Err(shared) => return Err(Box::new(ContinuousBackend(shared))),
+        };
+        match server.stop() {
+            Ok(model) => Ok(Box::new(GenericBackend(model))),
+            Err(e) => {
+                tracing::warn!("continuous batching could not hand its model back: {e}");
+                Err(Box::new(TakenBackend))
+            }
+        }
+    }
 }
 
 impl ModelBackend for BatchedBackend {

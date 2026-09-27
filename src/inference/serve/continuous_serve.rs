@@ -41,6 +41,10 @@ struct Submission {
 /// Handle to the running continuous-batch worker. Cheap to clone-share via Arc.
 pub struct ContinuousServer {
     submit_tx: Sender<Submission>,
+    /// The worker thread, joined by `stop`.
+    worker: std::thread::JoinHandle<()>,
+    /// The served model, shared with the worker; `stop` takes it back once the worker ends.
+    model: Arc<GenericHeteroTransformer>,
 }
 
 /// The model-side adapter: decode items run in ONE batched `batched_paged_decode`
@@ -819,6 +823,7 @@ impl ContinuousServer {
         let stores: Vec<PagedKvStore> = (0..n_layers)
             .map(|_| PagedKvStore::new(num_blocks, block_size, n_kv, hd, store_dt, &cdev))
             .collect::<crate::tensor::Result<_>>()?;
+        let served = Arc::clone(&model);
         let adapter = SendWrap(GhBatched {
             model,
             stores,
@@ -831,7 +836,7 @@ impl ContinuousServer {
         });
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
 
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("cb-worker".into())
             .spawn(move || {
                 let gh = adapter; // SendWrap (Send); unwrap inside the worker thread
@@ -847,7 +852,26 @@ impl ContinuousServer {
             })
             .map_err(|e| crate::tensor::Error::msg(format!("cb-worker spawn: {e}")))?;
 
-        Ok(Self { submit_tx })
+        Ok(Self {
+            submit_tx,
+            worker,
+            model: served,
+        })
+    }
+
+    /// Stops the worker once its sequences finish and hands the model back for serial
+    /// serving. `Err` returns the server when another holder still shares the model.
+    pub fn stop(self) -> std::result::Result<GenericHeteroTransformer, String> {
+        let Self {
+            submit_tx,
+            worker,
+            model,
+        } = self;
+        drop(submit_tx);
+        worker
+            .join()
+            .map_err(|_| "cb-worker panicked".to_string())?;
+        Arc::try_unwrap(model).map_err(|_| "the model is still shared".to_string())
     }
 
     /// Submit a request; returns a receiver that yields its tokens as they are

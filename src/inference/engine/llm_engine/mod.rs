@@ -245,6 +245,10 @@ pub struct LlmEngine {
     /// Lazily-built text-embedding model for `/v1/embeddings` & `/api/embed`,
     /// loaded from this engine's own GGUF on first request (cached behind `&self`).
     embedding_model: Arc<Mutex<Option<Arc<crate::inference::model::embedding::EmbeddingModel>>>>,
+    /// Requests admitted and not yet finished.
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether requests have been overlapping, which decides serial or batched serving.
+    batching: Arc<std::sync::Mutex<batching::BatchingSignal>>,
 }
 
 impl InferenceEngine for LlmEngine {
@@ -261,6 +265,8 @@ impl InferenceEngine for LlmEngine {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             last_stream_stats: Arc::new(std::sync::Mutex::new(None)),
             embedding_model: Arc::new(Mutex::new(None)),
+            active: Arc::default(),
+            batching: Arc::default(),
         }
     }
 
@@ -299,6 +305,8 @@ impl LlmEngine {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             last_stream_stats: Arc::new(std::sync::Mutex::new(None)),
             embedding_model: Arc::new(Mutex::new(None)),
+            active: Arc::default(),
+            batching: Arc::default(),
         }
     }
 
@@ -1138,6 +1146,8 @@ mod sampling_tests;
 use std::io::Cursor;
 use std::time::Instant;
 
+mod batching;
+pub use batching::ActiveRequest;
 mod discover;
 mod embed;
 mod generate;

@@ -49,6 +49,7 @@ pub(crate) fn load_error(model_name: &str, e: &str) -> ApiError {
 pub(crate) struct Admission {
     _gate: Option<crate::api::gate::RequestGuard>,
     _in_flight: crate::distributed::rate_meter::InFlight,
+    _active: crate::inference::engine::llm_engine::ActiveRequest,
 }
 
 impl APIServer {
@@ -106,6 +107,7 @@ impl APIServer {
         images: &[String],
     ) -> Result<Admission, ApiError> {
         let in_flight = crate::distributed::rate_meter::InFlight::enter();
+        let active = engine.admit_request().await;
         let gate = if engine.is_continuous().await {
             None
         } else {
@@ -125,6 +127,7 @@ impl APIServer {
         Ok(Admission {
             _gate: gate,
             _in_flight: in_flight,
+            _active: active,
         })
     }
 }

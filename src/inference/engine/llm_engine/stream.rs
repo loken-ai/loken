@@ -17,6 +17,44 @@ impl LlmEngine {
             Some(s) if s.model.batched_server().is_some())
     }
 
+    /// Counts a request as running on this engine until the returned guard drops, and
+    /// moves the model between serial and batched serving as the arrivals call for it (see
+    /// `batching`). A switch waits for the model lock, so it lands between generations.
+    pub async fn admit_request(&self) -> super::ActiveRequest {
+        let request = super::batching::ActiveRequest::enter(&self.active);
+        let batched = self.is_continuous().await;
+        let switch = self
+            .batching
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .arrive(request.others(), batched);
+        match switch {
+            super::batching::Switch::Stay => {}
+            super::batching::Switch::ToBatched => {
+                let mut guard = self.model_state.lock().await;
+                if let Some(state) = guard.as_mut() {
+                    if super::load::promote_to_batched(state) {
+                        info!("{}: requests overlap - serving batched", state.name);
+                    } else {
+                        self.batching
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .mark_cannot_batch();
+                    }
+                }
+            }
+            super::batching::Switch::ToSerial => {
+                let mut guard = self.model_state.lock().await;
+                if let Some(state) = guard.as_mut() {
+                    if super::load::demote_to_serial(state) {
+                        info!("{}: requests arrive alone - serving serially", state.name);
+                    }
+                }
+            }
+        }
+        request
+    }
+
     /// Stream a request through the continuous-batch worker: tokenize, submit
     /// with the resolved sampling controls, and pump the worker's token channel
     /// back as incrementally-detokenized text chunks (same NDJSON shape the

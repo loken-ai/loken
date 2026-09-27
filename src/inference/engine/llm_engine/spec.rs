@@ -465,6 +465,8 @@ impl LlmEngine {
             sessions: self.sessions.clone(),
             last_stream_stats: self.last_stream_stats.clone(),
             embedding_model: self.embedding_model.clone(),
+            active: self.active.clone(),
+            batching: self.batching.clone(),
         }
     }
 }

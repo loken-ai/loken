@@ -166,7 +166,6 @@ impl LlmEngine {
                 let mut state = load_awq_model_state(&awq_dir, &model_id_clone, user_context_length)?;
                 state.generation_defaults = generation_defaults.clone();
                 let fsz = state.file_size;
-                cb_maybe_wrap(&mut state);
                 let mut guard = model_state.blocking_lock();
                 // Free VRAM just changed by the size of a model.
                 crate::inference::place::vram_manager::residency_changed();
@@ -1702,7 +1701,7 @@ impl LlmEngine {
             }
 
             // --- 6. Store state ---
-            let mut new_state = LoadedModelState {
+            let new_state = LoadedModelState {
                 name: model_id_clone.clone(),
                 num_layers,
                 hidden_size,
@@ -1728,9 +1727,6 @@ impl LlmEngine {
                 grammar_factory: std::sync::OnceLock::new(),
                 generation_defaults: generation_defaults.clone(),
             };
-            // Route a cb_eligible GPU dense model through the batched
-            // continuous-batch worker (no-op for ineligible/CPU models).
-            cb_maybe_wrap(&mut new_state);
             let mut guard = model_state.blocking_lock();
             // Free VRAM just changed by the size of a model.
             crate::inference::place::vram_manager::residency_changed();

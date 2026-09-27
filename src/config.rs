@@ -81,11 +81,6 @@ pub struct InferenceConfigToml {
     pub moderation_model: Option<String>,
     #[serde(default)]
     pub public_url: Option<String>,
-    /// Continuous batching (paged KV) for CONCURRENT request throughput.
-    /// Default OFF: single-stream decode is faster on the serial path;
-    /// turn on for multi-client serving (aggregate throughput regime).
-    /// GPU-only; ignored on CPU models.
-    pub continuous_batching: Option<bool>,
     /// Keys this version no longer reads, kept so a config written for an older one still
     /// loads; each is reported once at startup.
     #[serde(flatten, skip_serializing)]

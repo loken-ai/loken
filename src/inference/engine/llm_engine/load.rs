@@ -628,57 +628,81 @@ pub(super) fn try_spawn_continuous(
     }
 }
 
-/// If `state` holds a `cb_eligible` GPU `GenericHetero`, swap it for a `Continuous`
-/// worker (batched paged decode - beats serial 2.4-3.3x under concurrent load,
-/// with automatic prefix caching).
-pub(super) fn cb_maybe_wrap(state: &mut LoadedModelState) {
+/// Moves the served model into its batch worker: DeepSeek V4.1 into its own, a
+/// `cb_eligible` GPU `GenericHetero` into a paged `ContinuousServer` (batched decode, with
+/// automatic prefix caching). Returns whether the model now serves batched; a model that
+/// cannot batch stays as it was.
+pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
     #[cfg(feature = "cuda")]
     {
-        // Opt-in via config.toml `[inference] continuous_batching = true`.
-        // Default OFF: single-stream decode is faster on the serial path;
-        // CB is the concurrent-throughput (vLLM) regime.
-        let cb_enabled = crate::config::Config::load_default()
-            .ok()
-            .and_then(|c| c.inference.continuous_batching)
-            .unwrap_or(false);
-        if cb_enabled {
-            let (eos, ctx) = (state.eos_token_id, state.context_length);
-            // The concurrent-decode batch-width cap. The V4.1 bench saturates aggregate throughput
-            // by a batch of a few, so a handful is the useful width; a larger prompt set simply
-            // queues behind it.
-            const V41_MAX_BATCH: usize = 8;
-            let taken: BoxedModelBackend =
-                std::mem::replace(&mut state.model, Box::new(TakenBackend));
-            // DeepSeek V4.1: move a card-placed model into its batch worker. A host-only load has
-            // no lanes to batch and hands itself back.
-            let taken = match taken.into_batched(eos, V41_MAX_BATCH) {
-                Ok(server) => {
-                    state.model = Box::new(BatchedBackend(server));
-                    return;
-                }
-                Err(back) => back,
-            };
-            // Generic dense (Qwen2/3): the paged continuous server, when the GPU is eligible.
-            if !taken.cb_eligible_gpu() {
-                state.model = taken;
-                return;
+        if state.model.batched_server().is_some() {
+            return true;
+        }
+        let (eos, ctx) = (state.eos_token_id, state.context_length);
+        // The concurrent-decode batch-width cap. The V4.1 bench saturates aggregate throughput
+        // by a batch of a few, so a handful is the useful width; a larger prompt set simply
+        // queues behind it.
+        const V41_MAX_BATCH: usize = 8;
+        let taken: BoxedModelBackend = std::mem::replace(&mut state.model, Box::new(TakenBackend));
+        // DeepSeek V4.1: move a card-placed model into its batch worker. A host-only load has
+        // no lanes to batch and hands itself back.
+        let taken = match taken.into_batched(eos, V41_MAX_BATCH) {
+            Ok(server) => {
+                state.model = Box::new(BatchedBackend(server));
+                return true;
             }
-            let m = match taken.take_generic() {
-                Ok(m) => m,
-                Err(other) => {
-                    state.model = other;
-                    return;
-                }
-            };
-            state.model = match try_spawn_continuous(m, eos, ctx) {
-                Ok(s) => Box::new(ContinuousBackend(std::sync::Arc::new(s))),
-                Err(m) => Box::new(GenericBackend(m)),
-            };
+            Err(back) => back,
+        };
+        // Generic dense (Qwen2/3): the paged continuous server, when the GPU is eligible.
+        if !taken.cb_eligible_gpu() {
+            state.model = taken;
+            return false;
+        }
+        let m = match taken.take_generic() {
+            Ok(m) => m,
+            Err(other) => {
+                state.model = other;
+                return false;
+            }
+        };
+        let (model, batched): (BoxedModelBackend, bool) = match try_spawn_continuous(m, eos, ctx) {
+            Ok(s) => (Box::new(ContinuousBackend(std::sync::Arc::new(s))), true),
+            Err(m) => (Box::new(GenericBackend(m)), false),
+        };
+        state.model = model;
+        batched
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = state;
+        false
+    }
+}
+
+/// Takes a model served by a paged `ContinuousServer` back to serial serving, once no
+/// stream still holds the server. Returns whether the model now serves serially.
+pub(super) fn demote_to_serial(state: &mut LoadedModelState) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        if state.model.batched_server().is_none() {
+            return true;
+        }
+        let taken: BoxedModelBackend = std::mem::replace(&mut state.model, Box::new(TakenBackend));
+        match taken.into_serial() {
+            Ok(serial) => {
+                state.model = serial;
+                true
+            }
+            Err(back) => {
+                state.model = back;
+                false
+            }
         }
     }
     #[cfg(not(feature = "cuda"))]
     {
         let _ = state;
+        true
     }
 }
 
