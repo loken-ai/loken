@@ -1340,10 +1340,86 @@ pub(super) fn mmvq_t<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
     b_size: usize,
     smallk: bool,
 ) -> Result<CudaSlice<T>> {
-    use crate::tensor::quantized::MATRIX_ROW_PADDING;
     if b_size == 0 || b_size > 8 {
         return Err(Error(format!("mmvq: b_size {b_size} not in 1..=8")));
     }
+    let stream = dev.stream();
+    let mut dst = with_oom_retry(dev, "gemv", || unsafe { stream.alloc::<T>(n * b_size) })?;
+    launch_mmvq(
+        dev,
+        tag,
+        dst_tag,
+        weight_blob,
+        &q8_1.slice(..),
+        &mut dst.slice_mut(..),
+        k,
+        n,
+        b_size,
+        smallk,
+    )?;
+    Ok(dst)
+}
+
+/// The largest batch the mat-vec kernels run with the warp count of a single column
+/// (`mmvq_nwarps_for` in `mmvq_gguf.cu`). Up to it, every column's blocks meet in the order
+/// a one-row launch sums them, so each output row is bit-identical to that row alone.
+pub const MMVQ_DECODE_ORDER_BATCH: usize = 4;
+
+/// Batched MMVQ whose every output row equals a one-row launch over that row: the rows go
+/// in launches of at most [`MMVQ_DECODE_ORDER_BATCH`], and a lone row takes the kernel a
+/// one-row call would (`smallk_single`). `q8_1` holds `rows` quantised activation rows.
+#[allow(clippy::too_many_arguments)]
+pub fn mmvq_decode_order<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+    dev: &CudaDevice,
+    tag: &str,
+    dst_tag: &str,
+    weight_blob: &CudaSlice<u8>,
+    q8_1: &CudaSlice<u8>,
+    k: usize,
+    n: usize,
+    rows: usize,
+    smallk_single: bool,
+) -> Result<CudaSlice<T>> {
+    use crate::tensor::quantized::MATRIX_ROW_PADDING;
+    let stream = dev.stream();
+    let mut dst = with_oom_retry(dev, "gemv", || unsafe { stream.alloc::<T>(n * rows) })?;
+    // block_q8_1 = 32 i8 + 2 f16 per 32 activations.
+    let q8_row_bytes = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING / 32 * 36;
+    let mut first = 0;
+    while first < rows {
+        let b = MMVQ_DECODE_ORDER_BATCH.min(rows - first);
+        launch_mmvq(
+            dev,
+            tag,
+            dst_tag,
+            weight_blob,
+            &q8_1.slice(first * q8_row_bytes..(first + b) * q8_row_bytes),
+            &mut dst.slice_mut(first * n..(first + b) * n),
+            k,
+            n,
+            b,
+            b == 1 && smallk_single,
+        )?;
+        first += b;
+    }
+    Ok(dst)
+}
+
+/// One mat-vec launch of `b_size` activation rows into `dst`.
+#[allow(clippy::too_many_arguments)]
+fn launch_mmvq<T: cudarc::driver::DeviceRepr>(
+    dev: &CudaDevice,
+    tag: &str,
+    dst_tag: &str,
+    weight_blob: &CudaSlice<u8>,
+    q8_1: &cudarc::driver::CudaView<'_, u8>,
+    dst: &mut cudarc::driver::CudaViewMut<'_, T>,
+    k: usize,
+    n: usize,
+    b_size: usize,
+    smallk: bool,
+) -> Result<()> {
+    use crate::tensor::quantized::MATRIX_ROW_PADDING;
     if smallk && (b_size != 1 || !n.is_multiple_of(4)) {
         return Err(Error(format!(
             "mmvq smallk requires b_size==1 && n%4==0 (got b_size={b_size}, n={n})"
@@ -1356,7 +1432,6 @@ pub(super) fn mmvq_t<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
     };
     let func = dev.mmvq_fn(&kernel)?;
     let stream = dev.stream();
-    let dst = with_oom_retry(dev, "gemv", || unsafe { stream.alloc::<T>(n * b_size) })?;
     let k_padded = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
     let stride_col_y = (k_padded / 32) as i32;
     let stride_col_dst = n as i32;
@@ -1370,7 +1445,11 @@ pub(super) fn mmvq_t<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
     } else {
         2
     };
-    let nwarps: u32 = if smallk || b_size <= 4 { 4 } else { 2 };
+    let nwarps: u32 = if smallk || b_size <= MMVQ_DECODE_ORDER_BATCH {
+        4
+    } else {
+        2
+    };
     let grid_x = if smallk {
         n / rows_per_block
     } else {
@@ -1385,13 +1464,13 @@ pub(super) fn mmvq_t<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZero
     let mut b = stream.launch_builder(&func);
     b.arg(weight_blob);
     b.arg(q8_1);
-    b.arg(&dst);
+    b.arg(dst);
     b.arg(&k_i);
     b.arg(&n_i);
     b.arg(&stride_col_y);
     b.arg(&stride_col_dst);
     unsafe { b.launch(cfg) }.map_err(|e| Error(format!("{kernel} launch: {e}")))?;
-    Ok(dst)
+    Ok(())
 }
 
 /// Device-side dtype casts (no host roundtrip).

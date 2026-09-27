@@ -3,6 +3,14 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Q/K/V projections of an attention input, computed ahead of the block.
+pub(super) enum Projected {
+    /// The fused projection, before its bias.
+    Qkv(Tensor),
+    /// The separate projections, before their biases.
+    Split(Tensor, Tensor, Tensor),
+}
+
 impl GenericTransformerLayer {
     /// The QK-norm spans the whole Q and K projections (OLMo2), not one head at a time
     /// (Gemma3, Qwen3): its weight is longer than a head.
@@ -126,101 +134,31 @@ impl GenericTransformerLayer {
         }
     }
 
-    /// Phi2 fast-path: pre-quantize x to Q8_1 once, then run Q/K/V matmuls
-    /// against the shared buffer. Saves 2 launches/layer (the 2 redundant
-    /// quantize_q8_1 of the same x). Returns Some((q, k, v)) on success,
-    /// None on any incompatibility (caller falls back to legacy
-    /// QMatMul::forward x 3).
-    ///
-    /// Conditions: single-token decode + CUDA + all 3 weights are
-    /// QMatMul::QTensor variant + dtype is MMVQ-compatible.
+    /// Separate Q/K/V projections over one quantisation of `x`: the three `forward`s
+    /// would each quantise the same activation. Every output is bit-identical to the
+    /// projection's own `forward`. `None` when a weight would not take the mat-vec kernels
+    /// (the caller then runs the three `forward`s).
     #[cfg(feature = "cuda")]
     fn try_qkv_shared_q8_1(&self, x: &Tensor) -> Result<Option<(Tensor, Tensor, Tensor)>> {
-        use crate::inference::quantized_cuda::{mvq_via_pre_quantized_q8_1, quantize_q8_1_pub};
-        use crate::tensor::cuda_ext::{self, CudaSlice};
-        use crate::tensor::quantized::QStorage;
-
-        let (b, seq, hidden) = x.dims3()?;
-        if seq != 1 || b != 1 || !x.device().is_cuda() {
+        let (Some(wq), Some(wk), Some(wv)) =
+            (self.attn_q.as_ref(), self.attn_k.as_ref(), self.attn_v.as_ref())
+        else {
+            return Ok(None);
+        };
+        if !x.device().is_cuda() || x.dtype() != crate::tensor::DType::F32 {
             return Ok(None);
         }
-        // All 3 must be crate::tensor::quantized::QMatMul::QTensor (not
-        // Tensor/TensorF16 fallbacks). Use the tensor-op path (not our
-        // quantized_mistral3::QMatMul shadow).
-        let attn_q = self.attn_q.as_ref();
-        let attn_k = self.attn_k.as_ref();
-        let attn_v = self.attn_v.as_ref();
-        let (q_arc, k_arc, v_arc) = match (attn_q, attn_k, attn_v) {
-            (Some(qm), Some(km), Some(vm)) => match (qm.qtensor(), km.qtensor(), vm.qtensor()) {
-                (Some(qa), Some(ka), Some(va)) => (qa.clone(), ka.clone(), va.clone()),
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
+        let Some(a) = wq.quantize_for_matvec(&x.contiguous()?)? else {
+            return Ok(None);
         };
-        // Skip layers with biases - bias-add happens after matmul in the
-        // existing path; doing it via this helper would need an extra
-        // broadcast_add. Phi2 always has biases (has_attn_output_bias),
-        // but the Q/K/V biases are routed via `has_qkv_bias` flag and
-        // attn_q_bias/etc. Allow caller to broadcast_add after.
-        let _ = (&q_arc, &k_arc, &v_arc); // explicit use
-
-        let dev = x.device().as_cuda_device()?;
-        let x_f32 = if x.dtype() == crate::tensor::DType::F32 {
-            x.clone()
-        } else {
-            x.to_dtype(crate::tensor::DType::F32)?
-        };
-        let x_c = x_f32.contiguous()?;
-
-        // Padded Q8_1 buffer: padded/32 * 36 bytes
-        use crate::tensor::quantized::MATRIX_ROW_PADDING;
-        let kx_padded = hidden.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
-        let y_size_bytes = (kx_padded / 32) * 36;
-        let mut y_q8_1: CudaSlice<u8> = dev
-            .alloc_zeros::<u8>(y_size_bytes)
-            .map_err(|e| crate::tensor::Error::msg(format!("alloc y_q8_1: {e}")))?;
-
-        // Pre-quantize x -> y_q8_1 (x is on CUDA - checked above - so the
-        // raw-slice borrow can't hit a non-CUDA storage).
-        {
-            let xs = cuda_ext::f32_slice_of(&x_c)?;
-            let x_view = xs.view()?;
-            quantize_q8_1_pub(&x_view, &mut y_q8_1, hidden, 1, &dev)
-                .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+        match (
+            wq.forward_quantized(&a)?,
+            wk.forward_quantized(&a)?,
+            wv.forward_quantized(&a)?,
+        ) {
+            (Some(q), Some(k), Some(v)) => Ok(Some((q, k, v))),
+            _ => Ok(None),
         }
-
-        // For each of q/k/v: get QCudaStorage, run mvq_via_pre_quantized_q8_1
-        let q_out_rows = q_arc.shape().dims()[0];
-        let k_out_rows = k_arc.shape().dims()[0];
-        let v_out_rows = v_arc.shape().dims()[0];
-
-        let q_qstor = match q_arc.storage() {
-            QStorage::Cuda(s) => s,
-            _ => return Ok(None),
-        };
-        let q_cuda_st = mvq_via_pre_quantized_q8_1(q_qstor, &y_q8_1, hidden, q_out_rows, 1)
-            .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-        let _ = q_qstor; // release borrow before next storage()
-        let k_qstor = match k_arc.storage() {
-            QStorage::Cuda(s) => s,
-            _ => return Ok(None),
-        };
-        let k_cuda_st = mvq_via_pre_quantized_q8_1(k_qstor, &y_q8_1, hidden, k_out_rows, 1)
-            .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-        let _ = k_qstor;
-        let v_qstor = match v_arc.storage() {
-            QStorage::Cuda(s) => s,
-            _ => return Ok(None),
-        };
-        let v_cuda_st = mvq_via_pre_quantized_q8_1(v_qstor, &y_q8_1, hidden, v_out_rows, 1)
-            .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-        let _ = v_qstor;
-
-        Ok(Some((
-            cuda_ext::tensor_from_cuda_storage(q_cuda_st, (1usize, 1usize, q_out_rows))?,
-            cuda_ext::tensor_from_cuda_storage(k_cuda_st, (1usize, 1usize, k_out_rows))?,
-            cuda_ext::tensor_from_cuda_storage(v_cuda_st, (1usize, 1usize, v_out_rows))?,
-        )))
     }
 
     /// Phi2 shared-Q8_1 prelude. Pre-quantizes x_norm to Q8_1 once, then
@@ -432,6 +370,112 @@ impl GenericTransformerLayer {
         pre_computed_qkv: Option<&Tensor>,
         donor_f16: Option<&crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
     ) -> Result<Tensor> {
+        if self.attends_rows_as_decode(x, &shared_kv)? {
+            return self.forward_attn_rows_as_decode(x, index_pos, pre_computed_qkv, donor_f16);
+        }
+        let projected = pre_computed_qkv.map(|t| Projected::Qkv(t.clone()));
+        let (y, via_graph_buffer) =
+            self.attend(x, mask, index_pos, shared_kv, projected, donor_f16)?;
+        self.attn_output_projection(&y, via_graph_buffer)
+    }
+
+    /// Whether a multi-row call runs each row as the one-token decode step it stands for.
+    /// A draft verify asks for it (`DecodeOrder`); the rows then see exactly the arithmetic
+    /// of the steps they replace. Layers reading a donor's cache keep the batched path: the
+    /// donor has already appended every row, so a row alone would see the rows after it.
+    fn attends_rows_as_decode(
+        &self,
+        x: &Tensor,
+        shared_kv: &Option<(Tensor, Tensor)>,
+    ) -> Result<bool> {
+        let (b, seq, _) = x.dims3()?;
+        Ok(seq > 1
+            && b == 1
+            && shared_kv.is_none()
+            && x.device().is_cuda()
+            && crate::tensor::quantized::DecodeOrder::active())
+    }
+
+    /// The attention block over `x`'s rows, each row through the decode step at its own
+    /// position: the projections run batched (row-exact under `DecodeOrder`), then every
+    /// row appends its K/V and attends exactly as a one-token forward would.
+    fn forward_attn_rows_as_decode(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        pre_computed_qkv: Option<&Tensor>,
+        donor_f16: Option<&crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
+    ) -> Result<Tensor> {
+        let seq = x.dim(1)?;
+        let row = |t: &Tensor, r: usize| t.narrow(1, r, 1);
+        let projected: Vec<Projected> = if let Some(qkv) = pre_computed_qkv {
+            (0..seq)
+                .map(|r| row(qkv, r).map(Projected::Qkv))
+                .collect::<Result<_>>()?
+        } else if self.flags.fused_qkv || self.attn_q.is_none() {
+            let qkv = self.attn_qkv.as_ref().unwrap().forward(x)?;
+            (0..seq)
+                .map(|r| row(&qkv, r).map(Projected::Qkv))
+                .collect::<Result<_>>()?
+        } else {
+            #[cfg(feature = "cuda")]
+            let shared = self.try_qkv_shared_q8_1(x)?;
+            #[cfg(not(feature = "cuda"))]
+            let shared: Option<(Tensor, Tensor, Tensor)> = None;
+            let (q, k, v) = match shared {
+                Some(qkv) => qkv,
+                None => {
+                    let q = self.attn_q.as_ref().unwrap().forward(x)?;
+                    let k = self.attn_k.as_ref().unwrap().forward(x)?;
+                    let v = match self.attn_v.as_ref() {
+                        Some(wv) => wv.forward(x)?,
+                        None => k.clone(),
+                    };
+                    (q, k, v)
+                }
+            };
+            (0..seq)
+                .map(|r| Ok(Projected::Split(row(&q, r)?, row(&k, r)?, row(&v, r)?)))
+                .collect::<Result<_>>()?
+        };
+        let mut ys = Vec::with_capacity(seq);
+        for (r, p) in projected.into_iter().enumerate() {
+            let (y, _) = self.attend(&row(x, r)?, None, index_pos + r, None, Some(p), donor_f16)?;
+            ys.push(y);
+        }
+        let y = Tensor::cat(&ys.iter().collect::<Vec<_>>(), 1)?;
+        self.attn_output_projection(&y, false)
+    }
+
+    /// The output projection of the attention block. A decode step whose attention came
+    /// through the general path lands in the graph's stable buffer when one is set.
+    fn attn_output_projection(&self, y: &Tensor, via_graph_buffer: bool) -> Result<Tensor> {
+        let raw = self.attn_output.forward(y)?;
+        if via_graph_buffer && y.dim(1)? == 1 {
+            if let Some(buf) = self.graph_attn_proj_buffer.as_ref() {
+                let buf_d = buf.dim(crate::tensor::D::Minus1).unwrap_or(0);
+                let raw_d = raw.dim(crate::tensor::D::Minus1).unwrap_or(0);
+                if buf_d == raw_d && buf_d > 0 {
+                    buf.slice_set(&raw, 0, 0)?;
+                    return Ok(buf.clone());
+                }
+            }
+        }
+        Ok(raw)
+    }
+
+    /// The attention block up to its output projection: `y` `[b, seq, n_head*head_dim]`,
+    /// and whether the projection of it routes through the graph's stable buffer.
+    /// `projected` carries the Q/K/V projections of `x` when they were computed ahead.
+    fn attend(
+        &mut self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        index_pos: usize,
+        shared_kv: Option<(Tensor, Tensor)>,
+        projected: Option<Projected>,
+        donor_f16: Option<&crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
+    ) -> Result<(Tensor, bool)> {
         let (b, seq, _) = x.dims3()?;
 
         // --- Fused QKV+norm+RoPE fast path (Qwen3-style models) -----------
@@ -494,18 +538,14 @@ impl GenericTransformerLayer {
         // Q8 dev_pos cur_pos_dev off-by-one that previously hid attention
         // numerical issues for GQA hd=128. Re-enabled unconditionally.
         let disable_apq = false;
-        // Graph-mode fused fast-path is validated ONLY for the qwen3 family. Other
-        // with_norm arches (e.g. gemma4: SWA + hd256 + special handling) are NOT
-        // validated here and were not a loss - keep them on their original path.
-        // no_norm is NOT graph-safe at all (crashed qwen2.5:0.5b in capture).
-        // Discriminate qwen3-family from gemma4 at layer scope: gemma4 applies a V
-        // RMS-norm (attn_v_norm_ones = Some), qwen3/qwen3moe do not (None). Only the
-        // latter is validated for the graph-mode fused path.
+        // A captured decode takes the fused path wherever the eager decode does, so a
+        // replayed step computes what an eager one would. gemma4 (a V RMS-norm,
+        // attn_v_norm_ones = Some) is the exception: its graph mode keeps the unfused path.
         let graph_fused_ok = self.graph_rope_cos.is_none() || self.attn_v_norm_ones.is_none();
         let want_apq_fast = want_apq_fast
             && !disable_apq
-            && ((want_apq_with_norm && graph_fused_ok)
-                || (want_apq_no_norm && self.has_q8_cache() && self.graph_rope_cos.is_none()));
+            && graph_fused_ok
+            && (want_apq_with_norm || (want_apq_no_norm && self.has_q8_cache()));
 
         if want_apq_fast {
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -521,14 +561,11 @@ impl GenericTransformerLayer {
                 );
             }
 
-            // Fused QKV -> F32 flat buffer.
-            // When pre_computed_qkv is supplied by the phi2 shared-Q8_1
-            // fast path, skip the QMatMul.forward (saves one quantize +
-            // one matmul launch - caller already produced qkv from
-            // mvq_via_pre_quantized_q8_1).
-            let mut qkv = match pre_computed_qkv {
-                Some(pre) => pre.clone(),
-                None => self.attn_qkv.as_ref().unwrap().forward(x)?,
+            // Fused QKV -> F32 flat buffer, unless the caller projected it ahead (the
+            // phi2 shared-Q8_1 path, or a verify row).
+            let mut qkv = match &projected {
+                Some(Projected::Qkv(pre)) => pre.clone(),
+                _ => self.attn_qkv.as_ref().unwrap().forward(x)?,
             };
             // qwen2-family bias add: applied to qkv before reshape/cast so
             // the kernel sees Q/K/V with biases already folded in.
@@ -702,71 +739,6 @@ impl GenericTransformerLayer {
                     // try_q8_graph_decode at line 1853. Requires cur_pos_dev to
                     // be primed (host current_seq_len is the slot count BEFORE
                     // append - after the append above, set it to current_seq_len-1).
-                    let in_capture = crate::tensor::cuda_ext::capture_active(&q.device());
-                    if !in_capture {
-                        // Fix: the kernel comment in
-                        // `attn_score_q8_inner_dev_pos` at quantized.cu:4279 says
-                        // "Host stores current_seq_len BEFORE the append" and
-                        // the kernel adds 1. Passing the POST-append value
-                        // results in seq_kv being one too large; the score
-                        // kernel then reads K[cur_seq] which is uninitialized
-                        // cudaMallocAsync memory -> non-deterministic garbage.
-                        // The downstream softmax+output kernel reads V[cur_seq]
-                        // (also uninitialized) -> cyclic-3 non-determinism in
-                        // generated tokens at temperature=0. The prior comment
-                        // claimed "off-by-one but benign"; verified NOT benign
-                        // via scripts/repro_task26_determinism.py (passes after
-                        // this fix).
-                        let cur_seq = cache.current_seq_len();
-                        cache
-                            .update_graph_state(cur_seq.saturating_sub(1))
-                            .map_err(|e| {
-                                crate::tensor::Error::msg(format!("Q8 prime cur_pos_dev: {e}"))
-                            })?;
-                    }
-                    // Fully-fused 1-kernel path (Q.K + online-softmax + V.attn)
-                    // via v3 kernel (16-warp chunk-by-warp design). Numerically
-                    // correct but DOES NOT WIN over the 2-kernel chain in
-                    // production:
-                    //   2-kernel chain: 340.6 tok/s ± 13.3 (FUSED_ATTN=0)
-                    //   v3 fused      : 333.9 tok/s ±  5.9 (FUSED_ATTN=1)
-                    //   ->  -2 % (within noise)
-                    //
-                    // The 2-kernel chain has ~4x more warps active concurrently
-                    // (attn_scores_graph parallelises over both seq and kv_head)
-                    // which compensates for the launch overhead + scores buffer
-                    // alloc. v3 fused path is permanently OFF in production  -
-                    // 2-kernel chain wins by 2 % on moondream.
-                    let try_fused = false;
-                    // SPLIT-K flash-decode (diagnostic A/B, gated OFF by default).
-                    // MHA (moondream, n_q_per_kv=1): NSPLITxn_q_heads blocks -> good
-                    // occupancy, ~+4% (still gated: length-confounded, doesn't flip
-                    // the -27% loss alone).
-                    // GQA (deepcoder/devstral/qwen3): attn_flash_splitk_decode_graph
-                    // now also handles GQA via a KV-bandwidth-sharing kernel (each
-                    // (split,h_kv) warp reads its KV head ONCE for all n_q_per_kv
-                    // query heads). VALIDATED CORRECT (coherent long-ctx recall) but
-                    // MEASURED -9% at long ctx: the grid is NSPLITxn_KV_heads, and
-                    // n_kv_heads (8) « n_q_heads (32-40), so only 16x8=128 single-
-                    // warp blocks -> underfills ~70 SMs (occupancy-limited), losing
-                    // to the 2-kernel chain's wider parallelism. The KV-read saving
-                    // doesn't compensate. Untried fix = NSPLIT=64 (->512 blocks) or
-                    // multi-warp/shared-mem-KV blocks. NOTE: long context on these GQA
-                    // cells is not where this path is losing time.
-                    // with RUNTIME-ADAPTIVE nsplit (launcher targets
-                    // ~384 blocks regardless of n_kv_heads, vs the old fixed 16x8=128
-                    // that underfilled the GPU) the GQA split-K now WINS: deepcoder
-                    // long 60.8->68.3 (+12%), short neutral (78 vs 80), coherent.
-                    // So AUTO-ENABLE it for GQA (n_q_per_kv>1, hd∈{64,128}). MHA
-                    // (moondream, n_q_per_kv=1) stays OFF: re-measured on
-                    // the real vision-caption workload (short KV) it is pure noise
-                    // (short -0.4%, medium +1%, long +1.8%, all within ±9 stddev)  -
-                    // the old "+4%" only appeared at long KV, which captioning never
-                    // reaches, so there is nothing for the KV-chunk split to divide.
-                    // On any kernel error the match below falls back to the chain.
-                    let try_splitk = cache.n_kv_heads() > 0
-                        && self.n_head > cache.n_kv_heads()
-                        && (self.head_dim == 64 || self.head_dim == 128);
                     // Softmax scale must complement upstream Q pre-scaling:
                     //   q_was_pre_scaled=true  (with_norm, no_norm full_rope) -> scale=1.0
                     //   q_was_pre_scaled=false (partial_rope, moondream)      -> scale=q_scale
@@ -774,106 +746,7 @@ impl GenericTransformerLayer {
                     // for hd=128 GQA) or zero-scales it (sharp -> fragments for
                     // moondream). See dc6f67b for the original double-scale fix.
                     let softmax_scale = if q_was_pre_scaled { 1.0f32 } else { q_scale };
-                    // -- gemma4 windowed-SWA decode ------------------------------
-                    // SWA layers (self.sliding_window set) attend only to the last `w`
-                    // keys. Same dev_pos 2-kernel chain, but window>0 makes the score +
-                    // softmax-output kernels scan ONLY [seq_kv-w, seq_kv) (out-of-window
-                    // tokens -INF'd + skipped) - bounds the scan at 512 instead of the
-                    // full growing KV (the 2.5K collapse) AND matches gemma4's trained
-                    // windowed attention. window=0 everywhere else = bit-identical.
-                    let swa_window = self
-                        .sliding_window
-                        .filter(|&w| w > 0 && cache.current_seq_len() > w);
-                    let y_q8 = if let Some(window) = swa_window {
-                        let scores = cache.attn_scores_graph(&q, window).map_err(|e| {
-                            crate::tensor::Error::msg(format!("Q8 SWA attn_scores_graph: {e}"))
-                        })?;
-                        cache
-                            .attn_softmax_output_graph(&scores, softmax_scale, window)
-                            .map_err(|e| {
-                                crate::tensor::Error::msg(format!(
-                                    "Q8 SWA attn_softmax_output_graph: {e}"
-                                ))
-                            })?
-                    } else if try_splitk {
-                        // Query-head-packed tensor-core flash decode. It needs the fragments
-                        // Ampere brought, a head dimension of 128, and enough KV to be worth
-                        // the deeper grid. Any Err falls through to split-K, which falls
-                        // through to the two-kernel chain, so a card that cannot run it loses
-                        // nothing.
-                        let try_tc = self.head_dim == 128
-                            && cache.current_seq_len()
-                                >= crate::inference::kernel::flash_decode_tc::TC_MIN_KV
-                            && q.device()
-                                .as_cuda_device()
-                                .map(|d| d.has_ampere_tensor_cores())
-                                .unwrap_or(false);
-                        let tc_out = if try_tc {
-                            match cache.attn_flash_tc_decode_graph(&q, softmax_scale) {
-                                Ok(y) => Some(y),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "attn_flash_tc_decode_graph fallback to split-K: {e}"
-                                    );
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                        if let Some(y) = tc_out {
-                            y
-                        } else {
-                            match cache.attn_flash_splitk_decode_graph(&q, softmax_scale) {
-                                Ok(y) => y,
-                                Err(e) => {
-                                    tracing::warn!("attn_flash_splitk_decode_graph fallback to 2-kernel chain: {e}");
-                                    let scores = cache.attn_scores_graph(&q, 0).map_err(|e| {
-                                        crate::tensor::Error::msg(format!(
-                                            "Q8 attn_scores_graph: {e}"
-                                        ))
-                                    })?;
-                                    cache
-                                        .attn_softmax_output_graph(&scores, softmax_scale, 0)
-                                        .map_err(|e| {
-                                            crate::tensor::Error::msg(format!(
-                                                "Q8 attn_softmax_output_graph: {e}"
-                                            ))
-                                        })?
-                                }
-                            }
-                        }
-                    } else if try_fused {
-                        match cache.attn_fused_decode_graph(&q, softmax_scale) {
-                            Ok(y) => y,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "attn_fused_decode_graph fallback to 2-kernel chain: {e}"
-                                );
-                                let scores = cache.attn_scores_graph(&q, 0).map_err(|e| {
-                                    crate::tensor::Error::msg(format!("Q8 attn_scores_graph: {e}"))
-                                })?;
-                                cache
-                                    .attn_softmax_output_graph(&scores, softmax_scale, 0)
-                                    .map_err(|e| {
-                                        crate::tensor::Error::msg(format!(
-                                            "Q8 attn_softmax_output_graph: {e}"
-                                        ))
-                                    })?
-                            }
-                        }
-                    } else {
-                        let scores = cache.attn_scores_graph(&q, 0).map_err(|e| {
-                            crate::tensor::Error::msg(format!("Q8 attn_scores_graph: {e}"))
-                        })?;
-                        cache
-                            .attn_softmax_output_graph(&scores, softmax_scale, 0)
-                            .map_err(|e| {
-                                crate::tensor::Error::msg(format!(
-                                    "Q8 attn_softmax_output_graph: {e}"
-                                ))
-                            })?
-                    };
+                    let y_q8 = self.q8_decode_attention(&q, softmax_scale)?;
                     let attn_out_dim = self.n_head * self.head_dim;
                     // At decode (seq==1) y_q8 is [b, n_head, 1, hd]; transpose(1,2)
                     // then reshape forces a contiguous copy whose order matches a
@@ -886,7 +759,7 @@ impl GenericTransformerLayer {
                         y_q8.transpose(1, 2)?.reshape(&[b, seq, attn_out_dim])?
                     };
                     let _ = mask;
-                    return self.attn_output.forward(&y);
+                    return Ok((y, false));
                 }
             } else {
                 // F-dtype path: with-norm variant only. Fused CUDA decode kernel;
@@ -998,7 +871,7 @@ impl GenericTransformerLayer {
                 let attn_out_dim = self.n_head * self.head_dim;
                 let y = y.transpose(1, 2)?.reshape(&[b, seq, attn_out_dim])?;
                 let _ = mask; // single-token decode: causal mask trivial
-                return self.attn_output.forward(&y);
+                return Ok((y, false));
             }
         }
 
@@ -1012,7 +885,10 @@ impl GenericTransformerLayer {
         let kv_dim_dummy = self.n_kv_head * self.head_dim;
         let (mut q, mut k, v) = if self.flags.fused_qkv || self.attn_q.is_none() {
             // Fused QKV: single [b, seq, (n_head + 2*n_kv_head)*head_dim] projection
-            let mut qkv = self.attn_qkv.as_ref().unwrap().forward(x)?;
+            let mut qkv = match &projected {
+                Some(Projected::Qkv(pre)) => pre.clone(),
+                _ => self.attn_qkv.as_ref().unwrap().forward(x)?,
+            };
             let q_dim = self.n_head * self.head_dim;
             let kv_dim = self.n_kv_head * self.head_dim;
             // QKV biases (qwen2 family): when all three are present and the
@@ -1059,10 +935,14 @@ impl GenericTransformerLayer {
         } else {
             // Phi2 shared-Q8_1 fast path: pre-quantize x once, share across
             // Q/K/V matmuls. Saves 2 launches/layer.
+            let ahead = match &projected {
+                Some(Projected::Split(q, k, v)) => Some((q.clone(), k.clone(), v.clone())),
+                _ => None,
+            };
             #[cfg(feature = "cuda")]
-            let shared_qkv = self.try_qkv_shared_q8_1(x).ok().flatten();
+            let shared_qkv = ahead.or_else(|| self.try_qkv_shared_q8_1(x).ok().flatten());
             #[cfg(not(feature = "cuda"))]
-            let shared_qkv: Option<(Tensor, Tensor, Tensor)> = None;
+            let shared_qkv: Option<(Tensor, Tensor, Tensor)> = ahead;
 
             if let Some((mut q, mut k, mut v)) = shared_qkv {
                 // Biases on top of the shared-path outputs (phi2/qwen2 family).
@@ -1317,107 +1197,27 @@ impl GenericTransformerLayer {
         };
 
         // -- Attention ----------------------------------------------------
-        // Q8 decode fast path: single-token attention with the Q8 KV cache.
-        // Bypasses the F16 `standard_attention` GQA reshape/matmul in favour
-        // of the dedicated Q8_0 x Q8_1 gemv (scores) + Q8_0 gemv (output).
-        // Gated on: cache populated, no shared_kv override, seq == 1, not in
-        // graph mode, on CUDA. Anything else falls through to the F16 path.
-        // Shared layers' own q8_kv_cache is empty (they don't compute K/V),
-        // so skip the Q8 decode path here - they fall through to standard
-        // attention which uses the donor's K/V from `shared_kv`.
-        //
-        // For `populate_dual_kv` donor layers (gemma4): the Q8 cache exists
-        // for downstream consumers, but the Q8 K-quantization noise breaks
-        // the donor's own attention math (gemma4 has tiny K-norm weights
-        // that amplify Q8 noise into degenerate decoding). Skip Q8 decode
-        // for donors and run the F-dtype standard path instead.
-        // Q8 graph-mode decode: separate dispatch from the host-int Q8 path,
-        // sits ABOVE the existing try_q8_decode below. Active when graph
-        // capture has primed cur_pos_dev. Calls attn_scores_graph /
-        // attn_output_graph which read seq_kv from cur_pos_dev[0] and emit
-        // scores at the fixed max_seq_padded stride - invariant across
-        // captured graph replays. The KV append at line 1463-1477 (graph
-        // mode) routes through `q8_kv_cache.append` for this branch (lazy
-        // 4 K initial capacity) instead of the F-dtype padded path that
-        // would allocate user_context_length x n_kv_heads x head_dim x 2
-        // x dtype_bytes per layer.
-        //
-        // dropped the `use_graph_ops` gate FOR PHI2 ONLY so
-        // moondream / plain phi2 (blocked on graph capture by // / ) can still route Q8 KV through the dev_pos kernels  -
-        // the only Q8 attn kernels that fit phi2's hd=64 register
-        // budget. `cur_pos_dev` is lazily primed when None so non-graph
-        // callers don't need to know about graph-mode plumbing.
-        //
-        // For non-phi2 arches (qwen2/3, gemma4, llama, etc.) the
-        // dev_pos path is STILL gated on `use_graph_ops` because it
-        // does fixed-width 2048-wide attention work even at short
-        // seq_kv - deepcoder regressed 14 points when
-        // wired without this guard. Those arches use try_q8_decode
-        // (host-int, seq_kv-wide) for non-graph and the dev_pos
-        // path only inside a captured graph.
-        let phi2_dev_pos = self.flags.parallel_attn && self.flags.layer_norm_with_bias;
+        // One query row over the Q8 cache takes the decode attention every step takes,
+        // eager or replayed from a captured graph (`q8_decode_attention`). Shared layers
+        // read the donor's K/V, and donor layers of a shared cache (gemma4, whose tiny
+        // K-norm weights amplify the Q8 noise) attend in F-dtype: both skip it.
         #[cfg(feature = "cuda")]
-        let try_q8_graph_decode = self.q8_kv().is_some()
-            && seq == 1
+        let q8_decode = seq == 1
             && b == 1
             && q.device().is_cuda()
             && !is_shared_layer
             && !self.populate_dual_kv
-            && (use_graph_ops || phi2_dev_pos)
-            && self.q8_kv().unwrap().current_seq_len() < self.q8_kv().unwrap().max_seq_padded();
+            && self
+                .q8_kv()
+                .is_some_and(|c| c.current_seq_len() < c.max_seq_padded());
         #[cfg(feature = "cuda")]
-        if try_q8_graph_decode {
-            // Prime cur_pos_dev - UNLESS the current stream is in graph
-            // capture mode. `update_graph_state` does a memcpy_htod from
-            // a stack-allocated i32; inside a capture, that gets
-            // recorded as a graph memcpy node whose src pointer points
-            // at the calling stack frame. After the function returns
-            // the stack frame is invalid, and subsequent replays copy
-            // garbage into cur_pos_dev -> dev_pos kernels read a wild
-            // seq_kv -> logits are stale -> sampler emits "!" tokens.
-            //
-            // The engine primes cur_pos_dev BEFORE begin_capture for
-            // graph mode (via the model-level update_graph_state); the
-            // in-capture refresh here is redundant and unsafe. For
-            // non-graph mode this dispatch must keep refreshing per
-            // layer per token (host current_seq_len advances via
-            // append() and the dev pos has to stay in lockstep).
-            let in_capture = crate::tensor::cuda_ext::capture_active(&q.device());
-            if !in_capture {
-                // Fix: see the APQ path branch above. Pass the
-                // BEFORE-append value (cur_seq - 1) so the score kernel's
-                // `seq_kv = cur_pos_dev + 1` exactly matches the cache's
-                // filled length. Otherwise the kernel iterates one slot
-                // past the cache and reads uninitialized K/V -> garbage.
-                let cur_seq = self.q8_kv().unwrap().current_seq_len();
-                if let Some(cache_mut) = self.quant_kv.as_mut().and_then(|c| c.q8_mut()) {
-                    cache_mut
-                        .update_graph_state(cur_seq.saturating_sub(1))
-                        .map_err(|e| {
-                            crate::tensor::Error::msg(format!("Q8 prime cur_pos_dev: {e}"))
-                        })?;
-                }
-            }
-            let cache = self.q8_kv().unwrap();
+        if q8_decode {
             let scale = self
                 .attention_scale
                 .unwrap_or_else(|| 1.0 / (self.head_dim as f64).sqrt());
-            // Fused scale + softmax + V.attn in one kernel - saves 3
-            // launches per layer per token vs the prior chain (scores,
-            // affine, softmax_last_dim, attn_output_graph -> 4 launches;
-            // now scores + fused -> 2 launches). For phi2 / moondream
-            // that's 72 fewer launches per token across 24 layers.
-            let scores = cache
-                .attn_scores_graph(&q, 0)
-                .map_err(|e| crate::tensor::Error::msg(format!("Q8 attn_scores_graph: {e}")))?;
-            let y_q8 = cache
-                .attn_softmax_output_graph(&scores, scale as f32, 0)
-                .map_err(|e| {
-                    crate::tensor::Error::msg(format!("Q8 attn_softmax_output_graph: {e}"))
-                })?;
-            let attn_out_dim = self.n_head * self.head_dim;
-            let y = y_q8.transpose(1, 2)?.reshape(&[b, seq, attn_out_dim])?;
-            return self.attn_output.forward(&y);
+            let y_q8 = self.q8_decode_attention(&q, scale as f32)?;
+            let y = y_q8.reshape(&[b, seq, self.n_head * self.head_dim])?;
+            return Ok((y, false));
         }
 
         #[cfg(feature = "cuda")]
@@ -1461,7 +1261,7 @@ impl GenericTransformerLayer {
             // size-1 seq dim cannot reorder elements. Skip the transpose:
             // the reshape is then a free view, bit-identical output.
             let y = y_q8.reshape(&[b, seq, attn_out_dim])?;
-            return self.attn_output.forward(&y);
+            return Ok((y, false));
         }
 
         // Q4 KIVI decode fast path - analogous to Q8 above.
@@ -1546,7 +1346,7 @@ impl GenericTransformerLayer {
 
             let attn_out_dim = self.n_head * self.head_dim;
             let y = y_q4.transpose(1, 2)?.reshape(&[b, seq, attn_out_dim])?;
-            return self.attn_output.forward(&y);
+            return Ok((y, false));
         }
 
         let y = if use_graph_ops && self.padded_mask.is_some() {
@@ -1615,20 +1415,191 @@ impl GenericTransformerLayer {
         // -- Output projection ---------------------------------------------
         let attn_out_dim = self.n_head * self.head_dim;
         let y = y.transpose(1, 2)?.reshape(&[b, seq, attn_out_dim])?;
-        // route attn_output projection through stable
-        // buffer for graph capture safety (decode only).
-        let raw = self.attn_output.forward(&y)?;
-        if seq == 1 {
-            if let Some(buf) = self.graph_attn_proj_buffer.as_ref() {
-                let buf_d = buf.dim(crate::tensor::D::Minus1).unwrap_or(0);
-                let raw_d = raw.dim(crate::tensor::D::Minus1).unwrap_or(0);
-                if buf_d == raw_d && buf_d > 0 {
-                    buf.slice_set(&raw, 0, 0)?;
-                    return Ok(buf.clone());
+        // The projection of this path routes through the graph's stable buffer (decode).
+        Ok((y, true))
+    }
+
+    /// Decode attention of one query row over the Q8 cache, the row's K/V already appended.
+    /// Every decode step takes it, eager or replayed from a captured graph: its kernels read
+    /// the position from the device, so both compute the same thing. `q` is
+    /// `[1, n_head, 1, head_dim]`; `scale` multiplies the scores (1.0 for a pre-scaled Q).
+    #[cfg(feature = "cuda")]
+    fn q8_decode_attention(&mut self, q: &Tensor, scale: f32) -> Result<Tensor> {
+        let in_capture = crate::tensor::cuda_ext::capture_active(&q.device());
+        if !in_capture {
+            // Fix: the kernel comment in
+            // `attn_score_q8_inner_dev_pos` at quantized.cu:4279 says
+            // "Host stores current_seq_len BEFORE the append" and
+            // the kernel adds 1. Passing the POST-append value
+            // results in seq_kv being one too large; the score
+            // kernel then reads K[cur_seq] which is uninitialized
+            // cudaMallocAsync memory -> non-deterministic garbage.
+            // The downstream softmax+output kernel reads V[cur_seq]
+            // (also uninitialized) -> cyclic-3 non-determinism in
+            // generated tokens at temperature=0. The prior comment
+            // claimed "off-by-one but benign"; verified NOT benign
+            // via scripts/repro_task26_determinism.py (passes after
+            // this fix).
+            let cache = self
+                .quant_kv
+                .as_mut()
+                .and_then(|c| c.q8_mut())
+                .ok_or_else(|| crate::tensor::Error::msg("Q8 decode attention: no Q8 cache"))?;
+            let cur_seq = cache.current_seq_len();
+            cache
+                .update_graph_state(cur_seq.saturating_sub(1))
+                .map_err(|e| {
+                    crate::tensor::Error::msg(format!("Q8 prime cur_pos_dev: {e}"))
+                })?;
+        }
+        let cache = self
+            .q8_kv()
+            .ok_or_else(|| crate::tensor::Error::msg("Q8 decode attention: no Q8 cache"))?;
+        // Fully-fused 1-kernel path (Q.K + online-softmax + V.attn)
+        // via v3 kernel (16-warp chunk-by-warp design). Numerically
+        // correct but DOES NOT WIN over the 2-kernel chain in
+        // production:
+        //   2-kernel chain: 340.6 tok/s ± 13.3 (FUSED_ATTN=0)
+        //   v3 fused      : 333.9 tok/s ±  5.9 (FUSED_ATTN=1)
+        //   ->  -2 % (within noise)
+        //
+        // The 2-kernel chain has ~4x more warps active concurrently
+        // (attn_scores_graph parallelises over both seq and kv_head)
+        // which compensates for the launch overhead + scores buffer
+        // alloc. v3 fused path is permanently OFF in production  -
+        // 2-kernel chain wins by 2 % on moondream.
+        let try_fused = false;
+        // SPLIT-K flash-decode (diagnostic A/B, gated OFF by default).
+        // MHA (moondream, n_q_per_kv=1): NSPLITxn_q_heads blocks -> good
+        // occupancy, ~+4% (still gated: length-confounded, doesn't flip
+        // the -27% loss alone).
+        // GQA (deepcoder/devstral/qwen3): attn_flash_splitk_decode_graph
+        // now also handles GQA via a KV-bandwidth-sharing kernel (each
+        // (split,h_kv) warp reads its KV head ONCE for all n_q_per_kv
+        // query heads). VALIDATED CORRECT (coherent long-ctx recall) but
+        // MEASURED -9% at long ctx: the grid is NSPLITxn_KV_heads, and
+        // n_kv_heads (8) « n_q_heads (32-40), so only 16x8=128 single-
+        // warp blocks -> underfills ~70 SMs (occupancy-limited), losing
+        // to the 2-kernel chain's wider parallelism. The KV-read saving
+        // doesn't compensate. Untried fix = NSPLIT=64 (->512 blocks) or
+        // multi-warp/shared-mem-KV blocks. NOTE: long context on these GQA
+        // cells is not where this path is losing time.
+        // with RUNTIME-ADAPTIVE nsplit (launcher targets
+        // ~384 blocks regardless of n_kv_heads, vs the old fixed 16x8=128
+        // that underfilled the GPU) the GQA split-K now WINS: deepcoder
+        // long 60.8->68.3 (+12%), short neutral (78 vs 80), coherent.
+        // So AUTO-ENABLE it for GQA (n_q_per_kv>1, hd∈{64,128}). MHA
+        // (moondream, n_q_per_kv=1) stays OFF: re-measured on
+        // the real vision-caption workload (short KV) it is pure noise
+        // (short -0.4%, medium +1%, long +1.8%, all within ±9 stddev)  -
+        // the old "+4%" only appeared at long KV, which captioning never
+        // reaches, so there is nothing for the KV-chunk split to divide.
+        // On any kernel error the match below falls back to the chain.
+        let try_splitk = cache.n_kv_heads() > 0
+            && self.n_head > cache.n_kv_heads()
+            && (self.head_dim == 64 || self.head_dim == 128);
+        let softmax_scale = scale;
+        // -- gemma4 windowed-SWA decode ------------------------------
+        // SWA layers (self.sliding_window set) attend only to the last `w`
+        // keys. Same dev_pos 2-kernel chain, but window>0 makes the score +
+        // softmax-output kernels scan ONLY [seq_kv-w, seq_kv) (out-of-window
+        // tokens -INF'd + skipped) - bounds the scan at 512 instead of the
+        // full growing KV (the 2.5K collapse) AND matches gemma4's trained
+        // windowed attention. window=0 everywhere else = bit-identical.
+        let swa_window = self
+            .sliding_window
+            .filter(|&w| w > 0 && cache.current_seq_len() > w);
+        let y_q8 = if let Some(window) = swa_window {
+            let scores = cache.attn_scores_graph(q, window).map_err(|e| {
+                crate::tensor::Error::msg(format!("Q8 SWA attn_scores_graph: {e}"))
+            })?;
+            cache
+                .attn_softmax_output_graph(&scores, softmax_scale, window)
+                .map_err(|e| {
+                    crate::tensor::Error::msg(format!(
+                        "Q8 SWA attn_softmax_output_graph: {e}"
+                    ))
+                })?
+        } else if try_splitk {
+            // Query-head-packed tensor-core flash decode. It needs the fragments
+            // Ampere brought, a head dimension of 128, and enough KV to be worth
+            // the deeper grid. Any Err falls through to split-K, which falls
+            // through to the two-kernel chain, so a card that cannot run it loses
+            // nothing.
+            let try_tc = self.head_dim == 128
+                && cache.current_seq_len()
+                    >= crate::inference::kernel::flash_decode_tc::TC_MIN_KV
+                && q.device()
+                    .as_cuda_device()
+                    .map(|d| d.has_ampere_tensor_cores())
+                    .unwrap_or(false);
+            let tc_out = if try_tc {
+                match cache.attn_flash_tc_decode_graph(q, softmax_scale) {
+                    Ok(y) => Some(y),
+                    Err(e) => {
+                        tracing::warn!(
+                            "attn_flash_tc_decode_graph fallback to split-K: {e}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(y) = tc_out {
+                y
+            } else {
+                match cache.attn_flash_splitk_decode_graph(q, softmax_scale) {
+                    Ok(y) => y,
+                    Err(e) => {
+                        tracing::warn!("attn_flash_splitk_decode_graph fallback to 2-kernel chain: {e}");
+                        let scores = cache.attn_scores_graph(q, 0).map_err(|e| {
+                            crate::tensor::Error::msg(format!(
+                                "Q8 attn_scores_graph: {e}"
+                            ))
+                        })?;
+                        cache
+                            .attn_softmax_output_graph(&scores, softmax_scale, 0)
+                            .map_err(|e| {
+                                crate::tensor::Error::msg(format!(
+                                    "Q8 attn_softmax_output_graph: {e}"
+                                ))
+                            })?
+                    }
                 }
             }
-        }
-        Ok(raw)
+        } else if try_fused {
+            match cache.attn_fused_decode_graph(q, softmax_scale) {
+                Ok(y) => y,
+                Err(e) => {
+                    tracing::warn!(
+                        "attn_fused_decode_graph fallback to 2-kernel chain: {e}"
+                    );
+                    let scores = cache.attn_scores_graph(q, 0).map_err(|e| {
+                        crate::tensor::Error::msg(format!("Q8 attn_scores_graph: {e}"))
+                    })?;
+                    cache
+                        .attn_softmax_output_graph(&scores, softmax_scale, 0)
+                        .map_err(|e| {
+                            crate::tensor::Error::msg(format!(
+                                "Q8 attn_softmax_output_graph: {e}"
+                            ))
+                        })?
+                }
+            }
+        } else {
+            let scores = cache.attn_scores_graph(q, 0).map_err(|e| {
+                crate::tensor::Error::msg(format!("Q8 attn_scores_graph: {e}"))
+            })?;
+            cache
+                .attn_softmax_output_graph(&scores, softmax_scale, 0)
+                .map_err(|e| {
+                    crate::tensor::Error::msg(format!(
+                        "Q8 attn_softmax_output_graph: {e}"
+                    ))
+                })?
+        };
+        Ok(y_q8)
     }
 
     /// Graph-compatible attention block for decode (seq_len == 1).

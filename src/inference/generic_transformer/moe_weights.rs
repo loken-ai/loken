@@ -260,6 +260,36 @@ impl MoeWeights {
     ///       `y   = down_exps[expert] @ (gelu(g) * u)`
     ///       `y  *= down_exps_scale[expert]`
     ///       `out[token] += topk_p * y`
+    /// [`Self::forward`] over the rows of `moe_in`, each row alone and as a decode step
+    /// while a verify holds `DecodeOrder`, so a verified row routes and sums exactly as
+    /// the step it stands for; the whole batch at once otherwise.
+    pub(super) fn forward_rows(
+        &self,
+        moe_in: &Tensor,
+        attn_out: &Tensor,
+        n_embd: usize,
+        rms_eps: f32,
+    ) -> Result<Tensor> {
+        let seq = moe_in.dim(1)?;
+        if seq == 1 || !crate::tensor::quantized::DecodeOrder::active() {
+            return self.forward(moe_in, attn_out, n_embd, rms_eps, seq > 1);
+        }
+        // Each row in storage of its own: `forward` reads its input from the start of the
+        // storage.
+        let rows = (0..seq)
+            .map(|r| {
+                self.forward(
+                    &moe_in.narrow(1, r, 1)?.contiguous()?,
+                    &attn_out.narrow(1, r, 1)?.contiguous()?,
+                    n_embd,
+                    rms_eps,
+                    false,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1)
+    }
+
     pub(super) fn forward(
         &self,
         moe_in_pre_norm_2: &Tensor, // already pre_ffw_norm_2-applied

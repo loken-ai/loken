@@ -291,6 +291,8 @@ pub(crate) fn pld_verify_commit(
 
 /// Longest draft a drafter is asked for.
 pub(crate) const DRAFT_MAX: usize = 8;
+/// Rows of a verify forward: the token carried forward, then the draft.
+pub(crate) const VERIFY_ROWS: usize = DRAFT_MAX + 1;
 /// Weight of the newest cycle in the running cost of a draft length.
 const CYCLE_COST_WEIGHT: f64 = 0.2;
 

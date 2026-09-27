@@ -220,7 +220,9 @@ static __device__ void mmvq_core_fused_impl(
       [] (const float * a) {
         const float up = a[0], g = a[1];
         if constexpr (act == GateAct::Silu) {
-          return up * (g / (1.0f + __expf(-g)));
+          // The expression `fused_silu_mul_f32` evaluates, so a fused row equals the
+          // projections taken apart and activated after.
+          return (g / (1.0f + expf(-g))) * up;
         } else {
           // The tanh approximation, which is what these checkpoints were trained against  - 
           // the error-function form differs by a few thousandths and the model can tell.

@@ -38,6 +38,8 @@ pub(crate) use crate::tensor::{DType, Device, IndexOp, Result, Tensor};
 
 #[cfg(all(test, feature = "cuda"))]
 mod card_host_parity;
+#[cfg(all(test, feature = "cuda"))]
+mod verify_decode_parity;
 mod config;
 mod graph;
 pub mod hetero;

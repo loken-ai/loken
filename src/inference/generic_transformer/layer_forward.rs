@@ -1825,13 +1825,11 @@ impl GenericTransformerLayer {
                 if moe_ref.router_prenormed {
                     // Standard MoE (granitemoe): router + experts both read the single
                     // ffn_norm'd hidden; no dense shared FFN, no gemma4 sandwich norms.
-                    let is_prefill = x_norm.dim(1).map(|s| s > 1).unwrap_or(false);
-                    let mut m = moe_ref.forward(
+                    let mut m = moe_ref.forward_rows(
                         &x_norm_ffn,
                         residual_ffn,
                         self.embedding_length_for_moe,
                         self.ffn_norm_eps,
-                        is_prefill,
                     )?;
                     // Granite scales the MoE/FFN output by residual_multiplier before
                     // the residual add (same as the dense else-branch below).
@@ -1853,13 +1851,11 @@ impl GenericTransformerLayer {
                         residual_ffn.clone()
                     };
                     let moe = self.moe.as_ref().unwrap();
-                    let is_prefill = x_norm.dim(1).map(|s| s > 1).unwrap_or(false);
-                    let mut cur_moe = moe.forward(
+                    let mut cur_moe = moe.forward_rows(
                         &moe_in,
                         residual_ffn,
                         self.embedding_length_for_moe,
                         self.ffn_norm_eps,
-                        is_prefill,
                     )?;
                     if cur_moe.dtype() != cur_mlp.dtype() {
                         cur_moe = cur_moe.to_dtype(cur_mlp.dtype())?;

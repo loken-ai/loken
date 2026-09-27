@@ -31,8 +31,50 @@ pub fn matvec_rows(dtype: GgmlDType, k: usize) -> usize {
         8
     }
 }
+thread_local! {
+    static DECODE_ORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, every quantized matmul on this thread computes each activation row
+/// bit-identically to a one-row call over that row: the rows take the mat-vec kernels in
+/// launches that sum like a single column, never the tiled GEMM. A draft verify holds it,
+/// so a verified row reproduces the decode step it stands for.
+pub struct DecodeOrder {
+    previous: bool,
+}
+
+impl DecodeOrder {
+    pub fn enter() -> Self {
+        Self {
+            previous: DECODE_ORDER.with(|d| d.replace(true)),
+        }
+    }
+
+    pub fn active() -> bool {
+        DECODE_ORDER.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for DecodeOrder {
+    fn drop(&mut self) {
+        DECODE_ORDER.with(|d| d.set(self.previous));
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub use kat::kernel_known_answer_test;
+
+/// An activation quantised to q8_1 by [`QKernelMatMul::quantize_for_matvec`], for every
+/// mat-vec over the same `k` on the same card.
+#[cfg(feature = "cuda")]
+pub struct QuantizedActivation {
+    q81: cudarc::driver::CudaSlice<u8>,
+    k: usize,
+    rows: usize,
+    ordinal: usize,
+    /// The activation's dimensions before `k`.
+    lead: Vec<usize>,
+}
 
 /// Quantized matmul over the production kernels: holds the GGML block
 /// weight on-device and computes `x [.., k] -> [.., n]`. Decode rows (the
@@ -437,6 +479,126 @@ impl QKernelMatMul {
     /// Wrapping the base rather than editing it: the quantised forward has several
     /// return paths (a CPU k-quant fast path and multiple CUDA kernels), and adding the
     /// delta at each one is how a family silently ends up without its adapter.
+    /// The F32 mat-vec over `rows` activation rows already quantised to q8_1.
+    #[cfg(feature = "cuda")]
+    fn mmvq_f32_rows(
+        &self,
+        qdev: &std::sync::Arc<crate::tensor::cuda::CudaDevice>,
+        blob: &cudarc::driver::CudaSlice<u8>,
+        tag: &str,
+        q81: &cudarc::driver::CudaSlice<u8>,
+        rows: usize,
+        odims: Vec<usize>,
+    ) -> Result<crate::tensor::Tensor> {
+        let k = self.k;
+        // smallk (4-rows/block decode kernel) - same ggml dispatch as the
+        // F16 path: decode-only (rows==1), n%4==0, K-quant with a
+        // smallk entry, small K ((k/256) < 4*vdr). Tiny-model GEMVs (small K)
+        // otherwise run the 1-row/block kernel at only ~27% BW peak.
+        let y = if rows > 1 && DecodeOrder::active() {
+            crate::tensor::cuda::mmvq_decode_order::<f32>(
+                qdev,
+                tag,
+                "f32",
+                blob,
+                q81,
+                k,
+                self.n,
+                rows,
+                self.smallk_single(k),
+            )?
+        } else {
+            let smallk = rows == 1 && self.smallk_single(k);
+            crate::tensor::cuda::mmvq_f32(qdev, tag, blob, q81, k, self.n, rows, smallk)?
+        };
+        crate::tensor::Tensor::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(y),
+            qdev.clone(),
+            odims,
+        )
+    }
+
+    /// `x` (F32, `[.., k]`) quantised to q8_1 the way `forward` quantises it for the
+    /// mat-vec kernels, so several weights over the same activation quantise it once.
+    /// `None` where `forward` would not take those kernels.
+    #[cfg(feature = "cuda")]
+    pub fn quantize_for_matvec(
+        &self,
+        x: &crate::tensor::Tensor,
+    ) -> Result<Option<QuantizedActivation>> {
+        let crate::tensor::Device::Cuda(qdev) = &self.device else {
+            return Ok(None);
+        };
+        let rows = x.elem_count() / self.k;
+        if !self.takes_matvec(qdev, rows)
+            || x.dtype() != crate::tensor::DType::F32
+            || x.dims().last() != Some(&self.k)
+        {
+            return Ok(None);
+        }
+        let (x_slice, dev) = x.cuda_f32_slice()?;
+        if dev.ordinal() != qdev.ordinal() {
+            return Ok(None);
+        }
+        let q81 = crate::tensor::cuda::quantize_q8_1_rows(qdev, x_slice, self.k, rows)?;
+        let lead = x.dims()[..x.dims().len() - 1].to_vec();
+        Ok(Some(QuantizedActivation {
+            q81,
+            k: self.k,
+            rows,
+            ordinal: qdev.ordinal(),
+            lead,
+        }))
+    }
+
+    /// `forward` over an activation [`Self::quantize_for_matvec`] produced: bit-identical
+    /// to `forward` on the F32 rows. `None` where `forward` would take another path.
+    #[cfg(feature = "cuda")]
+    pub fn forward_quantized(
+        &self,
+        a: &QuantizedActivation,
+    ) -> Result<Option<crate::tensor::Tensor>> {
+        let (crate::tensor::Device::Cuda(qdev), Some(blob)) = (&self.device, self.blob.as_ref())
+        else {
+            return Ok(None);
+        };
+        if a.k != self.k
+            || a.ordinal != qdev.ordinal()
+            || !self.takes_matvec(qdev, a.rows)
+            || self.lora_fused.is_some()
+        {
+            return Ok(None);
+        }
+        let mut odims = a.lead.clone();
+        odims.push(self.n);
+        let tag = self.kernel_tag()?;
+        self.mmvq_f32_rows(qdev, blob, tag, &a.q81, a.rows, odims)
+            .map(Some)
+    }
+
+    /// Whether `forward` serves `rows` F32 activation rows with the mat-vec kernels.
+    #[cfg(feature = "cuda")]
+    fn takes_matvec(&self, qdev: &crate::tensor::cuda::CudaDevice, rows: usize) -> bool {
+        self.blob.is_some()
+            && ((1..=matvec_rows(self.dtype, self.k)).contains(&rows)
+                || (rows > 1 && DecodeOrder::active()))
+            && !kat_bad(&KAT_BAD_MMVQ, qdev.ordinal())
+            && self.kernel_tag().is_ok()
+    }
+
+    /// Whether a one-row call over this weight takes the four-rows-per-block `smallk`
+    /// mat-vec (ggml's dispatch): K-quants with an entry, `n % 4 == 0`, and a K small
+    /// enough, `(k/256) < 4*vdr`, that the one-row kernel would leave threads idle.
+    #[cfg(feature = "cuda")]
+    fn smallk_single(&self, k: usize) -> bool {
+        let vdr: Option<i32> = match self.dtype {
+            GgmlDType::Q4K | GgmlDType::Q5K => Some(2),
+            GgmlDType::Q6K => Some(1),
+            _ => None,
+        };
+        self.n.is_multiple_of(4) && vdr.is_some_and(|vdr| (k as i32 / 256) < 4 * vdr)
+    }
+
     pub fn forward(&self, x: &crate::tensor::Tensor) -> Result<crate::tensor::Tensor> {
         let base = self.forward_base(x)?;
         let Some((down, up)) = &self.lora_fused else {
@@ -786,7 +948,10 @@ impl QKernelMatMul {
             // rows 6-8 would fall through to the slow dequant-F32 path, so keep the
             // old MMVQ-through-8 boundary for non-MMQ quants (no regression).
             let mmvq_max = matvec_rows(self.dtype, self.k);
-            if (1..=mmvq_max).contains(&rows)
+            // Rows that must each reproduce a one-row call stay on the mat-vec kernels
+            // whatever their count.
+            let decode_order = rows > 1 && DecodeOrder::active();
+            if ((1..=mmvq_max).contains(&rows) || decode_order)
                 && !kat_bad(&KAT_BAD_MMVQ, qdev.ordinal())
                 && self.kernel_tag().is_ok()
                 && matches!(
@@ -814,26 +979,7 @@ impl QKernelMatMul {
                             ));
                         }
                         let q81 = crate::tensor::cuda::quantize_q8_1_rows(qdev, x_slice, k, rows)?;
-                        // smallk (4-rows/block decode kernel) - same ggml dispatch as the
-                        // F16 path above: decode-only (rows==1), n%4==0, K-quant with a
-                        // smallk entry, small K ((k/256) < 4*vdr). Tiny-model GEMVs (small K)
-                        // otherwise run the 1-row/block kernel at only ~27% BW peak.
-                        let smallk_vdr: Option<i32> = match self.dtype {
-                            GgmlDType::Q4K | GgmlDType::Q5K => Some(2),
-                            GgmlDType::Q6K => Some(1),
-                            _ => None,
-                        };
-                        let smallk = rows == 1
-                            && self.n.is_multiple_of(4)
-                            && smallk_vdr.is_some_and(|vdr| (k as i32 / 256) < 4 * vdr);
-                        let y = crate::tensor::cuda::mmvq_f32(
-                            qdev, tag, blob, &q81, k, self.n, rows, smallk,
-                        )?;
-                        return crate::tensor::Tensor::from_cuda_storage(
-                            crate::tensor::cuda::CudaStorage::F32(y),
-                            qdev.clone(),
-                            odims,
-                        );
+                        return self.mmvq_f32_rows(qdev, blob, tag, &q81, rows, odims);
                     }
                     crate::tensor::DType::F16 => {
                         let (x_slice, dev) = x.cuda_f16_slice()?;
@@ -847,17 +993,24 @@ impl QKernelMatMul {
                         // ggml small_k dispatch (fork fast_mmvq.rs): decode-only
                         // (b_size==1), K-quants with a smallk entry, nrows%4==0,
                         // and (k/256) < 4*vdr.
-                        let smallk_vdr: Option<i32> = match self.dtype {
-                            GgmlDType::Q4K | GgmlDType::Q5K => Some(2),
-                            GgmlDType::Q6K => Some(1),
-                            _ => None,
+                        let smallk = rows == 1 && self.smallk_single(k);
+                        let y = if decode_order {
+                            crate::tensor::cuda::mmvq_decode_order::<half::f16>(
+                                qdev,
+                                tag,
+                                "f16",
+                                blob,
+                                &q81,
+                                k,
+                                self.n,
+                                rows,
+                                self.smallk_single(k),
+                            )?
+                        } else {
+                            crate::tensor::cuda::mmvq_f16(
+                                qdev, tag, blob, &q81, k, self.n, rows, smallk,
+                            )?
                         };
-                        let smallk = rows == 1
-                            && self.n.is_multiple_of(4)
-                            && smallk_vdr.is_some_and(|vdr| (k as i32 / 256) < 4 * vdr);
-                        let y = crate::tensor::cuda::mmvq_f16(
-                            qdev, tag, blob, &q81, k, self.n, rows, smallk,
-                        )?;
                         return crate::tensor::Tensor::from_cuda_storage(
                             crate::tensor::cuda::CudaStorage::F16(y),
                             qdev.clone(),
@@ -873,8 +1026,13 @@ impl QKernelMatMul {
                         }
                         let q81 =
                             crate::tensor::cuda::quantize_q8_1_rows_bf16(qdev, x_slice, k, rows)?;
-                        let y =
-                            crate::tensor::cuda::mmvq_bf16(qdev, tag, blob, &q81, k, self.n, rows)?;
+                        let y = if decode_order {
+                            crate::tensor::cuda::mmvq_decode_order::<half::bf16>(
+                                qdev, tag, "bf16", blob, &q81, k, self.n, rows, false,
+                            )?
+                        } else {
+                            crate::tensor::cuda::mmvq_bf16(qdev, tag, blob, &q81, k, self.n, rows)?
+                        };
                         return crate::tensor::Tensor::from_cuda_storage(
                             crate::tensor::cuda::CudaStorage::BF16(y),
                             qdev.clone(),

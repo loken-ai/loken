@@ -1261,43 +1261,10 @@ impl GenericHeteroTransformer {
         // ~2.4x faster on the same shape.
         let mut logits = if self.output_proj_cuda_qmm.is_some() {
             let qmm = self.output_proj_cuda_qmm.as_ref().unwrap();
-            // Try the fused rms_norm+qmatmul kernel first.
-            #[cfg(feature = "cuda")]
-            let fused = {
-                use crate::tensor::quantized::QMatMul;
-                if last_f32.device().is_cuda() && last_f32.dim(crate::tensor::D::Minus1)? <= 16384 {
-                    if let QMatMul::QTensor(ref qt) = qmm {
-                        crate::inference::moe_cuda::rms_norm_then_qmatmul(
-                            &last_f32,
-                            norm_w,
-                            qt.as_ref(),
-                            self.config.rms_norm_eps as f32,
-                        )
-                        .ok()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            };
-            #[cfg(not(feature = "cuda"))]
-            let fused: Option<Tensor> = None;
-            if let Some(o) = fused {
-                let dims = o.dims();
-                if dims.len() == 3 && dims[0] == 1 && dims[1] == 1 {
-                    o.squeeze(0)?
-                } else {
-                    o
-                }
-            } else {
-                let normed = crate::tensor::ops::rms_norm(
-                    &last_f32,
-                    norm_w,
-                    self.config.rms_norm_eps as f32,
-                )?;
-                qmm.forward(&normed)?
-            }
+            // The norm and the head apart, as the eager decode and the verify rows run them.
+            let normed =
+                crate::tensor::ops::rms_norm(&last_f32, norm_w, self.config.rms_norm_eps as f32)?;
+            qmm.forward(&normed)?
         } else {
             let proj = self.output_proj_cuda.as_ref().ok_or_else(|| {
                 crate::tensor::Error::msg(

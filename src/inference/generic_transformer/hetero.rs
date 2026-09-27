@@ -1386,7 +1386,13 @@ impl GenericHeteroTransformer {
     /// Multi-position forward: returns logits for EVERY input position
     /// (shape `[batch, seq_len, vocab]`). Used by speculative decoding to
     /// verify K drafts in a single batched forward.
+    ///
+    /// A draft verify (a few rows continuing a cache) computes every row as the decode step
+    /// it stands for, so drafting never changes what greedy decoding emits.
     pub fn forward_all(&mut self, input_ids: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let (_, seq_len) = input_ids.dims2()?;
+        let verify = index_pos > 0 && seq_len <= crate::inference::engine::decode_step::VERIFY_ROWS;
+        let _order = verify.then(crate::tensor::quantized::DecodeOrder::enter);
         self.forward_inner(input_ids, index_pos, /*all_positions=*/ true)
     }
 
@@ -1825,21 +1831,10 @@ impl GenericHeteroTransformer {
             };
             self.last_feature = Some(f.to_dtype(crate::tensor::DType::F32)?);
         }
-        // The GPU branch below normalises with a fused RMS kernel. That is the
-        // right norm for most architectures and the WRONG one for those whose
-        // final norm is a full LayerNorm with a bias (the phi2 family): it skips
-        // the mean subtraction and the bias, which leaves the residual stream
-        // exact and still reorders the top of the distribution. Those models take
-        // the CPU-object path, which applies the norm the loader actually built.
-        let final_norm_is_rms = matches!(
-            self.output_norm,
-            crate::inference::generic_transformer::config::WeightedNorm::Rms(_)
-        );
         let mut logits = if on_cuda && self.output_proj_cuda_qmm.is_some() {
             // Preferred GPU path: norm in F32 + quantized matmul. The QMatMul
             // dispatches to `mul_mat_vec_q*_K_q8_1` kernels that produce F32
             // output directly, so there are no F16 casts and no cutlass gemm.
-            let norm_w = self.output_norm_cuda_weight.as_ref().unwrap();
             let proj = self.output_proj_cuda_qmm.as_ref().unwrap();
             if all_positions {
                 let (b, s, h) = hidden.dims3()?;
@@ -1851,65 +1846,11 @@ impl GenericHeteroTransformer {
                 let vocab = out_2d.dims()[1];
                 out_2d.reshape((b, s, vocab))?
             } else {
+                // The final norm, then the head: the arithmetic every row of a verify runs.
                 let last = hidden.i((.., seq_len - 1, ..))?;
                 let last_f32 = last.to_dtype(crate::tensor::DType::F32)?;
-                // Fuse the rms_norm + qmatmul into a single launch when
-                // hidden fits the kernel's single-block limit (16384) and
-                // the proj weight is a QTensor - saves the standalone
-                // rms_norm launch on every decode step.
-                #[cfg(feature = "cuda")]
-                let fused = {
-                    use crate::tensor::quantized::QMatMul;
-                    // rms_norm_then_qmatmul produces WRONG logits when hidden is
-                    // not a multiple of 256 (verified: qwen2.5:0.5b,
-                    // hidden=896=128x7, GPU output was garbage "duction" vs the
-                    // correct "Paris"; the separate rms_norm + mmvq below is
-                    // bit-fine - both proven correct in isolation, only the fused
-                    // kernel mishandles the 896 width). Gate the fast path to
-                    // hidden%256==0 (every other served model qualifies; only
-                    // qwen2.5:0.5b falls back, at the cost of one extra launch on
-                    // its tiny lm_head). This is what unblocks qwen2.5:0.5b on GPU.
-                    if last_f32.device().is_cuda()
-                        && final_norm_is_rms
-                        && last_f32.dim(crate::tensor::D::Minus1)? <= 16384
-                        && last_f32.dim(crate::tensor::D::Minus1)? % 256 == 0
-                    {
-                        if let QMatMul::QTensor(ref qt) = proj {
-                            // (a Q8_0 lm_head through here produced
-                            // scattered-NaN logits - MIDI-LLM. Root cause was NOT
-                            // this call but the mvq_via_pre_quantized_q8_1
-                            // launcher's warp count mismatching the kernel's
-                            // compile-time nwarps for qk=32 dtypes; fixed at the
-                            // launcher, so all quantized head dtypes are safe here.)
-                            crate::inference::moe_cuda::rms_norm_then_qmatmul(
-                                &last_f32,
-                                norm_w,
-                                qt.as_ref(),
-                                self.config.rms_norm_eps as f32,
-                            )
-                            .ok()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-                #[cfg(not(feature = "cuda"))]
-                let fused: Option<Tensor> = None;
-                if let Some(o) = fused {
-                    // rms_norm_then_qmatmul emits (1, 1, vocab); the
-                    // unfused proj.forward returns (1, vocab). Match it.
-                    let dims = o.dims();
-                    if dims.len() == 3 && dims[0] == 1 && dims[1] == 1 {
-                        o.squeeze(0)?
-                    } else {
-                        o
-                    }
-                } else {
-                    let normed = self.final_norm_on_device(&last_f32)?;
-                    proj.forward(&normed)?
-                }
+                let normed = self.final_norm_on_device(&last_f32)?;
+                proj.forward(&normed)?
             }
         } else if on_cuda && self.output_proj_cuda.is_some() {
             // Legacy GPU path: norm + F16 matmul via cutlass gemm

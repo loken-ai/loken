@@ -60,6 +60,7 @@ mod host;
 mod kernel_matmul;
 #[cfg(feature = "cuda")]
 pub use kernel_matmul::matvec_rows;
+pub use kernel_matmul::DecodeOrder;
 mod matmul;
 mod mmq;
 mod qtensor;
@@ -97,6 +98,8 @@ pub use host::{QHostTensor, BLOCK_ALIGN};
 #[cfg(feature = "cuda")]
 pub use kernel_matmul::kernel_known_answer_test;
 pub use kernel_matmul::QKernelMatMul;
+#[cfg(feature = "cuda")]
+pub use kernel_matmul::QuantizedActivation;
 pub use matmul::QMatMul;
 #[cfg(feature = "cuda")]
 pub use mmq::release_mmq_workspaces;

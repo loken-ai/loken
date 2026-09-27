@@ -667,6 +667,41 @@ impl QMatMul {
             _ => None,
         }
     }
+
+    /// The kernel matmul `forward` runs when nothing is added on top of it.
+    #[cfg(feature = "cuda")]
+    fn bare_kernel(&self) -> Option<&crate::tensor::quantized::QKernelMatMul> {
+        if self.lora_fused.is_some() {
+            return None;
+        }
+        self.qtensor()?.native_qmm().ok()
+    }
+
+    /// `xs` quantised once for several projections of the same input: see
+    /// `QKernelMatMul::quantize_for_matvec`.
+    #[cfg(feature = "cuda")]
+    pub fn quantize_for_matvec(
+        &self,
+        xs: &Tensor,
+    ) -> Result<Option<crate::tensor::quantized::QuantizedActivation>> {
+        match self.bare_kernel() {
+            Some(k) => k.quantize_for_matvec(xs),
+            None => Ok(None),
+        }
+    }
+
+    /// `forward` over an activation [`Self::quantize_for_matvec`] produced, bit-identical to
+    /// `forward` on it; `None` where `forward` would take another path.
+    #[cfg(feature = "cuda")]
+    pub fn forward_quantized(
+        &self,
+        a: &crate::tensor::quantized::QuantizedActivation,
+    ) -> Result<Option<Tensor>> {
+        match self.bare_kernel() {
+            Some(k) => k.forward_quantized(a),
+            None => Ok(None),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
