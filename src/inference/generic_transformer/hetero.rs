@@ -164,7 +164,7 @@ impl GenericHeteroTransformer {
     /// position `j` (which spans the full history including the new
     /// tokens). For prefill (index_pos=0), seq_kv == seq_q. For
     /// session-resume / PLD verify / spec verify, seq_kv > seq_q.
-    fn make_mask(
+    pub(super) fn make_mask(
         &mut self,
         seq_q: usize,
         index_pos: usize,
@@ -650,12 +650,7 @@ impl GenericHeteroTransformer {
             // RmsNorm over head_dim that forward() applies. No-op when absent.
             // OLMo2 full-dim QK-norm: norm the FLAT q/k (whole projection) before the
             // head reshape; Gemma3/Qwen3 norm per-head after. Detect via weight length.
-            let qk_full = self.config.flags.has_qk_norm
-                && layer
-                    .attn_q_norm
-                    .as_ref()
-                    .map(|n| n.weight().dims1().map(|d| d != hd).unwrap_or(false))
-                    .unwrap_or(false);
+            let qk_full = layer.qk_norm_is_full();
             let qf = q.to_dtype(cdt)?;
             let qf = if qk_full {
                 if let Some(qn) = layer.attn_q_norm.as_ref() {

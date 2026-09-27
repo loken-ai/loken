@@ -36,6 +36,8 @@ pub(crate) use crate::tensor::layer::{Embedding, LayerNorm};
 pub(crate) use crate::tensor::quantized::{gguf_file, QTensor};
 pub(crate) use crate::tensor::{DType, Device, IndexOp, Result, Tensor};
 
+#[cfg(all(test, feature = "cuda"))]
+mod card_host_parity;
 mod config;
 mod graph;
 pub mod hetero;

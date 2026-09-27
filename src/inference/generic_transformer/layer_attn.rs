@@ -4,6 +4,16 @@
 use super::*;
 
 impl GenericTransformerLayer {
+    /// The QK-norm spans the whole Q and K projections (OLMo2), not one head at a time
+    /// (Gemma3, Qwen3): its weight is longer than a head.
+    pub(super) fn qk_norm_is_full(&self) -> bool {
+        self.flags.has_qk_norm
+            && self
+                .attn_q_norm
+                .as_ref()
+                .is_some_and(|n| n.weight().dims1().is_ok_and(|d| d != self.head_dim))
+    }
+
     /// Update pre-allocated RoPE buffers for a given position.
     /// Call before graph replay so the graph reads correct cos/sin values.
     pub fn update_rope_buffers(&mut self, index_pos: usize) -> Result<()> {
@@ -456,8 +466,12 @@ impl GenericTransformerLayer {
             // RoPE from the per-step-updated graph_rope_cos/sin buffer (index 0)
             // instead of self.cos[index_pos] - see the cos/sin selection below.
             && shared_kv.is_none();
-        let want_apq_with_norm =
-            self.flags.has_qk_norm && self.attn_q_norm.is_some() && self.attn_k_norm.is_some();
+        // The fused kernel normalises each head; a norm over the whole projection takes
+        // the unfused path.
+        let want_apq_with_norm = self.flags.has_qk_norm
+            && self.attn_q_norm.is_some()
+            && self.attn_k_norm.is_some()
+            && !self.qk_norm_is_full();
         let want_apq_no_norm = !self.flags.has_qk_norm
             // qwen2-family biases are added as one broadcast_add on the qkv
             // tensor before the fused norm+RoPE+cast kernel.
@@ -1092,12 +1106,7 @@ impl GenericTransformerLayer {
         // OLMo2 QK-norm is FULL-DIM (weight length = n_head*head_dim, not head_dim):
         // RMS-norm the whole flat q/k projection BEFORE the head split, unlike the
         // per-head QK-norm of Gemma3/Qwen3 (applied after reshape below).
-        let qk_norm_full = self.flags.has_qk_norm
-            && self
-                .attn_q_norm
-                .as_ref()
-                .map(|n| n.weight().dims1().map(|d| d != head_dim).unwrap_or(false))
-                .unwrap_or(false);
+        let qk_norm_full = self.qk_norm_is_full();
         if qk_norm_full {
             if let (Some(q_norm), Some(k_norm)) = (&self.attn_q_norm, &self.attn_k_norm) {
                 q = q_norm.forward(&q.contiguous()?)?;

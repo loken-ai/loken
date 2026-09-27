@@ -60,17 +60,7 @@ impl GenericTransformerLayer {
         // Reshape + RoPE for BOTH Q and K (position-dependent - outside graph).
         // OLMo2 full-dim QK-norm: normalise the flat q/k over the whole projection
         // BEFORE the head split (vs Gemma3/Qwen3 per-head after the reshape).
-        let qk_norm_full = self.flags.has_qk_norm
-            && self
-                .attn_q_norm
-                .as_ref()
-                .map(|n| {
-                    n.weight()
-                        .dims1()
-                        .map(|d| d != self.head_dim)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+        let qk_norm_full = self.qk_norm_is_full();
         if qk_norm_full {
             if let (Some(q_norm), Some(k_norm)) = (&self.attn_q_norm, &self.attn_k_norm) {
                 q = q_norm.forward(&q.contiguous()?)?;
