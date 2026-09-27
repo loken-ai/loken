@@ -540,7 +540,7 @@ impl LlmEngine {
             // is intentionally NOT applied - multi-device variants set the
             // engine-level `device` to CPU but route most layers to GPU
             // internally; speculative decoding still pays off there.
-            let pld_enabled = state.model.supports_pld();
+            let pld_enabled = state.model.capabilities().pld;
             // Cascading n-gram lookup: try 4-gram first (precise matches
             // for code-style repetition), fall back to 3-gram and 2-gram
             // for shorter patterns. Drafts up to 5 tokens per match.
@@ -652,7 +652,7 @@ impl LlmEngine {
             // Graph-mode gates depend only on immutable model config (arch,
             // n_layers, kv cache types). Hoist out of the per-token loop  - 
             // kv_state_graph_safe iterates all layers.
-            let (graph_auto_on_cached, kv_safe_cached) = if state.model.supports_graph_mode() {
+            let (graph_auto_on_cached, kv_safe_cached) = if state.model.capabilities().graph_mode {
                 let auto = state.model.graph_capture_auto_on();
                 let kv_safe = state.model.kv_state_graph_safe();
                 let split = state.model.needs_split_graph_path();
@@ -671,7 +671,7 @@ impl LlmEngine {
             // use_graph_mode is immutable for a given (model backend, device).
             // Hoist so the per-token loop doesn't redo the capability check
             // + `device.is_cuda()` on every iteration.
-            let use_graph_mode_cached = state.model.supports_graph_mode() && device.is_cuda();
+            let use_graph_mode_cached = state.model.capabilities().graph_mode && device.is_cuda();
 
             // --- Unified Generation Loop ------------------------------
             let gen_start = std::time::Instant::now();

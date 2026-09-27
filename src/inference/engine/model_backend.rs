@@ -131,7 +131,31 @@ fn adaptive_prefill_chunk_uncached(widest_ffn: usize) -> usize {
 /// layer keeps no cache.
 pub(crate) type KvRows = Vec<Option<(Vec<f32>, Vec<f32>)>>;
 
+/// What a backend can do beyond a plain forward. `Default` claims nothing, so a
+/// backend reports only the capabilities it sets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Capabilities {
+    /// `trim_kv` cuts the KV cache to an arbitrary length, not only back to
+    /// position 0. Session-persistent KV reuse activates only when set.
+    pub trim_kv: bool,
+    /// `shift_kv_tail` drops a span of positions and re-phases the tail, so a
+    /// full context can shift instead of resetting.
+    pub shift_kv: bool,
+    /// Prompt-lookup speculative decoding is offered: `forward_all` verifies a
+    /// draft and `trim_kv` discards its rejected tail.
+    pub pld: bool,
+    /// The engine's CUDA-graph decode dispatch applies to this backend.
+    pub graph_mode: bool,
+    /// The backend drives a draft/verify split of its own.
+    pub speculative: bool,
+}
+
 pub(crate) trait ModelBackend: Send {
+    /// The capabilities this backend reports. The default claims none.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+
     /// Tokens the KV cache accepts, when the backend allocates one up front.
     fn kv_capacity(&self) -> Option<usize> {
         None
@@ -360,13 +384,6 @@ pub(crate) trait ModelBackend: Send {
     /// it is a no-op when `keep == 0`.
     fn reset_kv_from(&mut self, _keep: usize) {}
 
-    /// Whether this variant can trim its KV cache to an arbitrary length
-    /// (vs only reset-from-offset-0). Session-persistent KV only activates
-    /// when true.
-    fn supports_trim_kv(&self) -> bool {
-        false
-    }
-
     /// Context shift: drop positions `[from - discard, from)` and pull the tail down by
     /// `discard`, keys re-phased (`GenericHeteroTransformer::shift_kv_tail`). On `Err`
     /// the caches are in no defined state and the caller must `trim_kv(0)`.
@@ -374,9 +391,6 @@ pub(crate) trait ModelBackend: Send {
         Err(crate::tensor::Error::msg(
             "context shift: unsupported backend".to_string(),
         ))
-    }
-    fn supports_shift_kv(&self) -> bool {
-        false
     }
 
     /// Snapshots of the resident KV (`GenericHeteroTransformer::snapshot_kv`): copy the
@@ -440,17 +454,12 @@ pub(crate) trait ModelBackend: Send {
         None
     }
 
-    /// Whether this variant supports prompt-lookup speculative decoding.
-    fn supports_pld(&self) -> bool {
-        false
-    }
-
     // --- Exact-prompt state snapshot (recurrent-hybrid prefix reuse) -----
     //
     // `trim_kv` reuse assumes the state can return to an arbitrary token
     // position. Hybrids carrying a rolling recurrent state (short-conv / SSM)
     // cannot: that state is advanced per token and can never be rewound, nor
-    // rebuilt from the KV - which is why `supports_trim_kv` is correctly false
+    // rebuilt from the KV - which is why `Capabilities::trim_kv` is correctly false
     // for them, and why they re-prefill in full today. An exact-prompt snapshot
     // is the one reuse shape their state does allow: capture everything after a
     // prefill, restore it verbatim when the very same prompt comes back.
@@ -527,12 +536,6 @@ pub(crate) trait ModelBackend: Send {
         crate::tensor::bail!(
             "compute_all_from_kv_captured only for GenericHetero / GenericHeteroVision"
         )
-    }
-
-    /// Whether the engine's CUDA-graph decode dispatch applies to this arch
-    /// at all (the old `matches!(GenericHetero | GenericHeteroVision)` gate).
-    fn supports_graph_mode(&self) -> bool {
-        false
     }
 
     /// Arch-level auto-enable gate for graph capture.
@@ -702,11 +705,6 @@ pub(crate) trait ModelBackend: Send {
     // --- Misc capabilities ----------------------------------------------
 
     fn set_early_exit_threshold(&mut self, _val: Option<f32>) {}
-
-    /// Whether this model drives a draft/verify split. No variant does today.
-    fn supports_speculative(&self) -> bool {
-        false
-    }
 
     /// Speculative-decode auto-tune calibrator. None keeps the opencl speculative driver
     /// inert, which is what every variant wants today.
@@ -1134,6 +1132,36 @@ impl ModelBackend for MoondreamBackend {
     take_generic_passthrough!();
 }
 
+/// Whether prompt-lookup decoding pays on this generic model. Output-exact
+/// either way (drafts are verified against the target's greedy sample), so
+/// the answer changes speed, never text.
+fn generic_pld_pays(model: &GenericHeteroTransformer) -> bool {
+    // Per-model PLD opt-out: gemma4 family (dense + MoE) shows
+    // ~13-30% n-gram acceptance - straddling or below break-even.
+    // Gemma4's chat template + tokenizer don't repeat n-grams the
+    // way PLD relies on; gemma4:latest measured 20x speedup with
+    // PLD disabled (4.6 -> 115 tok/s on a 64-token medium gen).
+    if model.is_gemma4_arch() {
+        return false;
+    }
+    // Small-model PLD opt-out, measured.
+    // For the sub-~1B dense tier a decode step is so cheap (~1.5 ms,
+    // ~300 MB weight read) that PLD's multi-position verify forward +
+    // KV rollback + n-gram bookkeeping costs MORE than the tokens its
+    // accepts save - even at moderate acceptance. The verify amortizes
+    // a weight read across K positions, which is the whole PLD win, but
+    // a 0.6B model's weight read is already tiny so there is little to
+    // amortize while the fixed per-step overhead is unchanged.
+    // Measured qwen3:0.6b: PLD OFF 641 vs ON 597 tok/s short (+7.4%),
+    // 630 vs 605 medium at 38% accept (+4%) - PLD never pays and leaves
+    // us -8% vs ollama's 645; OFF ties ollama. qwen2.5:0.5b PLD-neutral.
+    // Larger models keep PLD (deepcoder 14B / qwen3:8b / mistral-nemo
+    // 12B all ≫ 1B).
+    // Threshold sits above the measured 0.6B tier (~0.6B params) and
+    // well below the smallest model where PLD is retained (~1.1B).
+    model.decode_weight_params() >= 750_000_000
+}
+
 impl ModelBackend for GenericBackend {
     fn kv_capacity(&self) -> Option<usize> {
         Some(self.0.kv_capacity())
@@ -1181,9 +1209,6 @@ impl ModelBackend for GenericBackend {
     fn shift_kv_tail(&mut self, from: usize, discard: usize) -> crate::tensor::Result<()> {
         self.0.shift_kv_tail(from, discard)
     }
-    fn supports_shift_kv(&self) -> bool {
-        true
-    }
 
     fn snapshot_kv(&mut self, tokens: Vec<u32>, kv_len: usize) -> crate::tensor::Result<()> {
         self.0.snapshot_kv(tokens, kv_len)
@@ -1225,45 +1250,20 @@ impl ModelBackend for GenericBackend {
         self.0.kv_snapshot_dtype(index)
     }
 
-    fn supports_trim_kv(&self) -> bool {
-        // Routed mixtures were excluded because the top-k choice follows the GEMM
-        // shape, and a warm re-prefill used shapes a cold run never had - measured
-        // divergent on GPU and host alike. Since reuse snaps to the cold run's chunk
-        // grid the warm tail runs the exact cold shapes, expert choice included, so
-        // the exclusion is lifted; the cold/warm probe on a routed model is the gate
-        // that must hold.
-        true
-    }
-
-    fn supports_pld(&self) -> bool {
-        // Per-model PLD opt-out: gemma4 family (dense + MoE) shows
-        // ~13-30% n-gram acceptance - straddling or below break-even.
-        // Gemma4's chat template + tokenizer don't repeat n-grams the
-        // way PLD relies on; gemma4:latest measured 20x speedup with
-        // PLD disabled (4.6 -> 115 tok/s on a 64-token medium gen).
-        if self.0.is_gemma4_arch() {
-            return false;
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            // Routed mixtures were excluded because the top-k choice follows the GEMM
+            // shape, and a warm re-prefill used shapes a cold run never had - measured
+            // divergent on GPU and host alike. Since reuse snaps to the cold run's chunk
+            // grid the warm tail runs the exact cold shapes, expert choice included, so
+            // the exclusion is lifted; the cold/warm probe on a routed model is the gate
+            // that must hold.
+            trim_kv: true,
+            shift_kv: true,
+            pld: generic_pld_pays(&self.0),
+            graph_mode: true,
+            ..Capabilities::default()
         }
-        // Small-model PLD opt-out, measured.
-        // For the sub-~1B dense tier a decode step is so cheap (~1.5 ms,
-        // ~300 MB weight read) that PLD's multi-position verify forward +
-        // KV rollback + n-gram bookkeeping costs MORE than the tokens its
-        // accepts save - even at moderate acceptance. The verify amortizes
-        // a weight read across K positions, which is the whole PLD win, but
-        // a 0.6B model's weight read is already tiny so there is little to
-        // amortize while the fixed per-step overhead is unchanged.
-        // Measured qwen3:0.6b: PLD OFF 641 vs ON 597 tok/s short (+7.4%),
-        // 630 vs 605 medium at 38% accept (+4%) - PLD never pays and leaves
-        // us -8% vs ollama's 645; OFF ties ollama. qwen2.5:0.5b PLD-neutral.
-        // Larger models keep PLD (deepcoder 14B / qwen3:8b / mistral-nemo
-        // 12B all ≫ 1B). PLD is output-exact (drafts verified against the
-        // target's greedy sample), so this only changes speed, never text.
-        // Threshold sits above the measured 0.6B tier (~0.6B params) and
-        // well below the smallest model where PLD is retained (~1.1B).
-        if self.0.decode_weight_params() < 750_000_000 {
-            return false;
-        }
-        true
     }
 
     fn prepare_all_kv(
@@ -1305,10 +1305,6 @@ impl ModelBackend for GenericBackend {
 
     fn compute_all_from_kv_captured(&mut self) -> crate::tensor::Result<Tensor> {
         self.0.compute_all_from_kv_captured()
-    }
-
-    fn supports_graph_mode(&self) -> bool {
-        true
     }
 
     fn graph_capture_auto_on(&self) -> bool {
@@ -1404,22 +1400,23 @@ impl ModelBackend for GenericVisionBackend {
     fn shift_kv_tail(&mut self, from: usize, discard: usize) -> crate::tensor::Result<()> {
         self.text.shift_kv_tail(from, discard)
     }
-    fn supports_shift_kv(&self) -> bool {
-        true
-    }
 
-    fn supports_trim_kv(&self) -> bool {
-        true
+    fn capabilities(&self) -> Capabilities {
+        // Vision-conditioned generation produces image captions
+        // (moondream's primary use): low n-gram repetition, so PLD
+        // acceptance is 0-10 % and the multi-position verify cost
+        // dominates the rare-accept gain. Measured:
+        // PLD on vision adds ~5-10 % decode overhead net.
+        // Re-enable per-arch when a vision use case with bursty
+        // repeating tokens emerges (e.g. structured-output VLM).
+        Capabilities {
+            trim_kv: true,
+            shift_kv: true,
+            pld: false,
+            graph_mode: true,
+            ..Capabilities::default()
+        }
     }
-
-    // Vision-conditioned generation produces image captions
-    // (moondream's primary use): low n-gram repetition, so PLD
-    // acceptance is 0-10 % and the multi-position verify cost
-    // dominates the rare-accept gain. Measured:
-    // PLD on vision adds ~5-10 % decode overhead net.
-    // Re-enable per-arch when a vision use case with bursty
-    // repeating tokens emerges (e.g. structured-output VLM).
-    // (supports_pld stays at the default `false`.)
 
     fn prepare_all_kv(
         &mut self,
@@ -1460,10 +1457,6 @@ impl ModelBackend for GenericVisionBackend {
 
     fn compute_all_from_kv_captured(&mut self) -> crate::tensor::Result<Tensor> {
         self.text.compute_all_from_kv_captured()
-    }
-
-    fn supports_graph_mode(&self) -> bool {
-        true
     }
 
     fn graph_capture_auto_on(&self) -> bool {
@@ -1616,19 +1609,21 @@ impl ModelBackend for QwenMoEMultiBackend {
         self.0.trim_kv(keep)
     }
 
-    fn supports_trim_kv(&self) -> bool {
-        true
+    fn capabilities(&self) -> Capabilities {
+        // MoE PLD: OFF - verify cost > accept gain on GGUF MoE. RE-MEASURED
+        // Marlin: qwen3-coder code-gen reaches a high
+        // 48-62% n-gram acceptance, yet enabling PLD dropped it 166 -> 108 tok/s
+        // (-23.7% vs ollama, high variance). 's cheap small-M verify is the
+        // AWQ/Marlin path; GGUF MoE verify still runs the slow `moe_gemm_gguf`
+        // small-batch forward, so each multi-position verify costs more than the
+        // accepted tokens save. Needs a cheap GGUF-MoE small-batch verify kernel
+        // (or AWQ weights) before PLD pays on MoE.
+        Capabilities {
+            trim_kv: true,
+            pld: false,
+            ..Capabilities::default()
+        }
     }
-
-    // MoE PLD: OFF - verify cost > accept gain on GGUF MoE. RE-MEASURED
-    // Marlin: qwen3-coder code-gen reaches a high
-    // 48-62% n-gram acceptance, yet enabling PLD dropped it 166 -> 108 tok/s
-    // (-23.7% vs ollama, high variance). 's cheap small-M verify is the
-    // AWQ/Marlin path; GGUF MoE verify still runs the slow `moe_gemm_gguf`
-    // small-batch forward, so each multi-position verify costs more than the
-    // accepted tokens save. Needs a cheap GGUF-MoE small-batch verify kernel
-    // (or AWQ weights) before PLD pays on MoE.
-    // (supports_pld stays at the default `false`.)
 
     fn device_layer_distribution(&self) -> Vec<(String, usize, u32, u32)> {
         group_layers_by_device(self.0.layer_device_locations())
@@ -1924,14 +1919,17 @@ impl ModelBackend for DeepseekV41Backend {
         }
     }
 
-    fn supports_pld(&self) -> bool {
+    fn capabilities(&self) -> Capabilities {
         // A batched verify pays only when the block's experts are already in memory: it reads
         // their union once instead of per token. With the experts streamed from disk the union
         // barely overlaps across a block, so a verify reads about as many expert bytes as
         // decoding the tokens one at a time and a rejected tail replays a whole block on top -
         // measured a net loss at 82% acceptance (2.5 vs 3.5 tok/s). Resident, the same verify
         // saves the repeated reads, so the draft path is offered only then.
-        self.streamed.is_none()
+        Capabilities {
+            pld: self.streamed.is_none(),
+            ..Capabilities::default()
+        }
     }
 
     fn widest_ffn(&self) -> usize {
@@ -2209,5 +2207,25 @@ mod prefill_chunk_memo_tests {
         let a = super::adaptive_prefill_chunk(14336);
         let b = super::adaptive_prefill_chunk(14336);
         assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod capabilities_tests {
+    use super::Capabilities;
+
+    /// A backend that overrides nothing claims nothing.
+    #[test]
+    fn the_default_claims_nothing() {
+        assert_eq!(
+            Capabilities::default(),
+            Capabilities {
+                trim_kv: false,
+                shift_kv: false,
+                pld: false,
+                graph_mode: false,
+                speculative: false,
+            }
+        );
     }
 }

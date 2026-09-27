@@ -882,7 +882,7 @@ pub(crate) fn kv_reuse_start(
     disabled: bool,
     disk: Option<&crate::inference::cache::kv_disk::KvDiskStore>,
 ) -> usize {
-    let mut reuse = if disabled || !model.supports_trim_kv() {
+    let mut reuse = if disabled || !model.capabilities().trim_kv {
         None
     } else {
         let g = sessions.blocking_lock();
@@ -903,7 +903,7 @@ pub(crate) fn kv_reuse_start(
     // A snapshot of another conversation that shares more of this prompt than the
     // resident KV does becomes the resident: the resident sequence itself was copied
     // aside when its request ended, so nothing is lost by the swap.
-    if !disabled && model.supports_trim_kv() {
+    if !disabled && model.capabilities().trim_kv {
         let cur_keep = reuse
             .map(|c| chunk_aligned_keep(c, prompt_tokens.len(), chunk))
             .unwrap_or(0);
@@ -1003,7 +1003,7 @@ pub(crate) fn kv_reuse_start(
     // with it the chunk grid below: a shifted tail is kept whole, since rounding it to
     // a grid that can exceed the window would keep nothing.
     let mut shifted: Option<usize> = None;
-    if model.supports_shift_kv() && reuse.is_some_and(|c| c < chunk) {
+    if model.capabilities().shift_kv && reuse.is_some_and(|c| c < chunk) {
         let mut g = sessions.blocking_lock();
         if let Some(s) = g.get_mut(GLOBAL_PROMPT_CACHE_KEY) {
             if let Some((discard, reused)) = shift_reuse_plan(
@@ -1040,7 +1040,7 @@ pub(crate) fn kv_reuse_start(
             .map(|common| chunk_aligned_keep(common, prompt_tokens.len(), chunk))
             .unwrap_or(0),
     };
-    if model.supports_trim_kv() {
+    if model.capabilities().trim_kv {
         model.trim_kv(keep);
     }
     keep

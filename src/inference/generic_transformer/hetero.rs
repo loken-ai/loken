@@ -2120,7 +2120,7 @@ impl GenericHeteroTransformer {
     /// layer, plus the lm_head. The embedding table is a gather (not a
     /// matmul) so it is excluded. This is a decode-cost proxy - a single
     /// decode step is bandwidth-bound on exactly these bytes - used by the
-    /// small-model PLD opt-out (`supports_pld`). The FFN is counted as 3
+    /// small-model PLD opt-out (`Capabilities::pld`). The FFN is counted as 3
     /// matrices (gated MLP); non-gated arches are slightly over-counted,
     /// which only biases them toward KEEPING PLD (the safe direction).
     pub fn decode_weight_params(&self) -> u64 {

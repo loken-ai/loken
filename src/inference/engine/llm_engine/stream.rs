@@ -506,7 +506,7 @@ impl LlmEngine {
                                 total_common
                             };
                             if total_common < total_in_cache {
-                                if state.model.supports_trim_kv() {
+                                if state.model.capabilities().trim_kv {
                                     state.model.trim_kv(total_common);
                                     debug!(
                                         "♻️  Vision prefix reuse from session '{}': image+{} text tokens, trimmed to pos {}",
@@ -606,12 +606,12 @@ impl LlmEngine {
                                 .saturating_sub(if common >= prompt_tokens.len() { 1 } else { 0 });
                             if effective_common == 0 && common >= prompt_tokens.len() {
                                 // prompt has 1 token (degenerate). Cold path.
-                                if state.model.supports_trim_kv() {
+                                if state.model.capabilities().trim_kv {
                                     state.model.trim_kv(0);
                                 }
                                 0
                             } else if common >= prompt_tokens.len() {
-                                if state.model.supports_trim_kv() {
+                                if state.model.capabilities().trim_kv {
                                     state.model.trim_kv(effective_common);
                                     debug!(
                                         "♻️  Prefix reuse from session '{}' (full match): stored={} prompt={} -> trim to {} + prefill last token",
@@ -622,7 +622,7 @@ impl LlmEngine {
                                     0
                                 }
                             } else if common < t_len {
-                                if state.model.supports_trim_kv() {
+                                if state.model.capabilities().trim_kv {
                                     state.model.trim_kv(common);
                                     debug!(
                                         "♻️  Prefix reuse from session '{}': stored={} new={} common={} (trimmed to {})",
@@ -915,7 +915,7 @@ impl LlmEngine {
                     tracing::info!("🔬 Streaming: speculative auto-tune calibrating...");
                 }
 
-                let use_speculative = state.model.supports_speculative();
+                let use_speculative = state.model.capabilities().speculative;
 
                 (
                     next_token,
@@ -957,7 +957,7 @@ impl LlmEngine {
             let (graph_ok, graph_stream) = {
                 let guard = model_state.blocking_lock();
                 match guard.as_ref() {
-                    Some(s) if device_clone.is_cuda() && s.model.supports_graph_mode() => {
+                    Some(s) if device_clone.is_cuda() && s.model.capabilities().graph_mode => {
                         let ok = s.model.graph_capture_auto_on()
                             && s.model.kv_state_graph_safe()
                             && !s.model.needs_split_graph_path();
@@ -989,12 +989,12 @@ impl LlmEngine {
             let mut graph_validations: usize = 0;
 
             // -- PLD (Prompt-Lookup Decoding) ---------------------------
-            // Check supports_pld under a quick lock, then release.
+            // Read the PLD capability under a quick lock, then release.
             let pld_enabled = {
                 let guard = model_state.blocking_lock();
                 guard
                     .as_ref()
-                    .map(|s| s.model.supports_pld())
+                    .map(|s| s.model.capabilities().pld)
                     .unwrap_or(false)
             };
             let mut pld_cache =
