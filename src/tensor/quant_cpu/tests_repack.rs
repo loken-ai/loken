@@ -786,18 +786,18 @@ where
     let lhs_b_slice = lhs_b.as_slice();
     let dst_ptr = SendMutPtr(dst.as_mut_ptr());
 
-    if m >= 4 {
-        // Prefill: weight-stationary row tiling. Parallelise over column chunks;
-        // within a chunk, hold a tile of R activation rows resident (L2) and reuse
-        // each loaded weight column across all R rows before moving on. The weight
-        // block then streams from DRAM ~m/R times instead of once per row - the
-        // per-column path (decode branch below) re-reads the whole weight matrix
-        // for every prompt row, which dominates prefill for K-quants that have no
-        // specialised repacked GEMM (e.g. Q6_K down/V). Bit-identical: the same
-        // `dot` calls, only reordered. Q4_K is diverted to the repacked tiled
-        // GEMM before reaching here; this lifts every other K-quant to the same
-        // weight-reuse regime.
-        const R: usize = 4;
+    if m >= 2 {
+        // Several rows: weight-stationary row tiling. Parallelise over column chunks;
+        // within a chunk, hold a tile of activation rows resident (L2) and reuse each
+        // loaded weight column across all of them before moving on. The weight block
+        // then streams from DRAM once per tile instead of once per row, so a few-row
+        // speculative verify costs about one decode and a prefill streams the matrix
+        // m/R times. Tiles are balanced, so a remainder row never re-reads the whole
+        // matrix alone. Bit-identical: the same `dot` calls, only reordered. Q4_K is
+        // diverted to the repacked tiled GEMM before reaching here.
+        const R_MAX: usize = 8;
+        let tiles = m.div_ceil(R_MAX);
+        let r_tile = m.div_ceil(tiles);
         let chunk_cols = (n / (pool.threads * 8)).clamp(8, 256).min(n.max(1));
         let n_col_chunks = n.div_ceil(chunk_cols);
         pool.run(n_col_chunks, &|cc| {
@@ -806,7 +806,7 @@ where
             let col1 = (col0 + chunk_cols).min(n);
             let mut r0 = 0;
             while r0 < m {
-                let r1 = (r0 + R).min(m);
+                let r1 = (r0 + r_tile).min(m);
                 for col in col0..col1 {
                     let rhs_col = &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks];
                     for row in r0..r1 {
@@ -821,8 +821,8 @@ where
             }
         });
     } else {
-        // Decode (m<4): per-column path. No row reuse is possible at m=1, and the
-        // GEMV is bandwidth-bound - streaming each weight column once is optimal.
+        // One row: per-column path. No row reuse is possible, and the GEMV is
+        // bandwidth-bound - streaming each weight column once is optimal.
         let (chunk_cols, n_chunks) = gemv_grid(m, n, pool.threads);
         let chunks_per_row = n.div_ceil(chunk_cols);
         pool.run(n_chunks, &|chunk| {

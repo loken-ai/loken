@@ -412,3 +412,58 @@ fn ffn_coop_vs_repacked() {
     println!("  three repacked GEMVs          : {rep:.1} us");
     println!("  ratio                         : {:.1}x", coop / rep);
 }
+
+/// Cost of a few-row decode (a speculative verify) against one row, at the FFN
+/// shapes of a large dense model: [k=8192, n=28672] for gate and up in Q4_K,
+/// [k=28672, n=8192] for down in Q6_K. A verify of `m` rows pays off only when
+/// it costs far less than `m` single-row decodes.
+///
+///   cargo test --release -p loken few_row_decode_cost -- --ignored --nocapture
+#[test]
+#[ignore = "benchmark: run explicitly with --ignored --nocapture"]
+fn few_row_decode_cost() {
+    let time = |f: &mut dyn FnMut()| {
+        for _ in 0..3 {
+            f();
+        }
+        let mut r = Vec::new();
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            f();
+            r.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        r.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        r[r.len() / 2]
+    };
+    let (k, n) = (8192usize, 28672usize);
+    let nb = k / QK_K;
+    let mut next = prng();
+    let mut wq = vec![BlockQ4K::zeros(); n * nb];
+    for row in 0..n {
+        let wf: Vec<f32> = (0..k).map(|_| next() * 0.1).collect();
+        BlockQ4K::quantize(&wf, &mut wq[row * nb..(row + 1) * nb]);
+    }
+    let x8 = repack_q4k::repack(&wq, n, nb);
+    drop(wq);
+    let (k6, n6) = (n, k);
+    let nb6 = k6 / QK_K;
+    let mut wq6 = vec![BlockQ6K::zeros(); n6 * nb6];
+    for row in 0..n6 {
+        let wf: Vec<f32> = (0..k6).map(|_| next() * 0.1).collect();
+        BlockQ6K::quantize(&wf, &mut wq6[row * nb6..(row + 1) * nb6]);
+    }
+    let bytes6: &[u8] = unsafe {
+        std::slice::from_raw_parts(wq6.as_ptr() as *const u8, std::mem::size_of_val(&wq6[..]))
+    };
+    for m in [1usize, 2, 3, 4, 5, 9, 64] {
+        let x: Vec<f32> = (0..m * k).map(|_| next()).collect();
+        let mut out = vec![0f32; m * n];
+        let q4 = time(&mut || matmul_q4k_plain((m, k, n), &x, &x8, &mut out).unwrap());
+        let x6: Vec<f32> = (0..m * k6).map(|_| next()).collect();
+        let mut out6 = vec![0f32; m * n6];
+        let q6 = time(&mut || {
+            matmul_bytes(GgmlDType::Q6K, (m, k6, n6), &x6, bytes6, &mut out6).unwrap()
+        });
+        println!("m={m}: q4k gate/up {q4:.2} ms  q6k down {q6:.2} ms");
+    }
+}
