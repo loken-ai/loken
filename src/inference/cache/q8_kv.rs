@@ -158,32 +158,9 @@ impl Q8KvCache {
         self.head_dim
     }
 
-    /// Padded stride used by the graph-safe attention kernels - sequence
-    /// positions in `[current_seq_len, max_seq_padded)` get -INFINITY
-    /// scores so the downstream softmax produces zeros there.
-    ///
-    /// Dynamic sizing: rounds the **current** sequence length up to the
-    /// next 256-token block instead of using the full capacity. The score
-    /// kernel iterates `max_seq_padded` positions per token, so capping
-    /// at the actually-occupied + small headroom cuts the -INF writes
-    /// from ~1700 to <=256 at decode time. Capacity grows the underlying
-    /// K/V buffers in 256-token chunks via `grow_to`, so the stride
-    /// stays valid until the next 256-block crossing.
-    ///
-    /// Capped at 2048 to keep parity with the graph-capture path: a wider score
-    /// buffer makes a captured graph too large to hold without hitting
-    /// `pos >= mask_width` invalidation.
+    /// Padded stride used by the graph-safe attention kernels (see `KvCore::padded_stride`).
     pub fn max_seq_padded(&self) -> usize {
-        const CAP: usize = 2048;
-        const STEP: usize = 256;
-        // After append the position is current_seq_len; attention sees
-        // current_seq_len+1 (kernel adds 1 internally for the just-written
-        // slot). Round up to STEP-aligned bucket so the stride only changes
-        // every 256 tokens, not every token.
-        let used = (self.core.len() + 1).min(self.core.cap());
-        let rounded = used.div_ceil(STEP) * STEP;
-        let cap_aligned = (self.core.cap() + Q8_0_BLOCK_SIZE - 1) & !(Q8_0_BLOCK_SIZE - 1);
-        rounded.min(cap_aligned).min(CAP).max(STEP)
+        self.core.padded_stride(Q8_0_BLOCK_SIZE)
     }
 
     /// The device position, while primed. Engine dispatch reads this to choose between the
@@ -669,7 +646,7 @@ impl Q8KvCache {
     /// separate `affine(scale, 0.0)` launch - one fewer kernel
     /// per layer per token.
     pub fn attn_scores_scaled(&self, q: &Tensor, scale: f32) -> Result<Tensor> {
-        if self.core.len() == 0 {
+        if self.core.is_empty() {
             return Err(anyhow!("Q8KvCache::attn_scores_scaled: cache is empty"));
         }
         let dims = q.dims();
@@ -720,7 +697,7 @@ impl Q8KvCache {
     }
 
     pub fn attn_scores(&self, q: &Tensor) -> Result<Tensor> {
-        if self.core.len() == 0 {
+        if self.core.is_empty() {
             return Err(anyhow!("Q8KvCache::attn_scores: cache is empty"));
         }
         let dims = q.dims();
@@ -828,7 +805,7 @@ impl Q8KvCache {
     /// `probs` shape: `[1, n_q_heads, 1, current_seq_len]` (softmax output).
     /// Returns `[1, n_q_heads, 1, head_dim]` in f32.
     pub fn attn_output(&self, probs: &Tensor) -> Result<Tensor> {
-        if self.core.len() == 0 {
+        if self.core.is_empty() {
             return Err(anyhow!("Q8KvCache::attn_output: cache is empty"));
         }
         let dims = probs.dims();

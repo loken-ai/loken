@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Channels one quantised KV block spans; a head is a whole number of blocks.
 const KV_BLOCK: usize = crate::tensor::quantized::GgmlDType::Q8_0.block_size();
+/// Positions a fixed-stride score buffer grows by.
+const STRIDE_STEP: usize = 256;
 /// Largest head size the quantised attention kernels are instantiated for: one warp lane per
 /// block of channels.
 pub const SHAPE_MAX_HEAD_DIM: usize = 512;
@@ -183,6 +185,19 @@ impl KvCore {
         self.chain_stride_seen.store(stride, Ordering::Relaxed);
     }
 
+    /// Stride of the score buffer the fixed-stride attention kernels use: the positions the
+    /// next token attends (length plus the slot it writes), rounded up to `STRIDE_STEP` so the
+    /// stride, and with it a captured graph, changes once per step rather than per token, and
+    /// never past the capacity rounded to whole `block`s. Positions between the length and the
+    /// stride score -INF.
+    pub fn padded_stride(&self, block: usize) -> usize {
+        let used = (self.len + 1).min(self.cap);
+        let cap_aligned = self.cap.div_ceil(block) * block;
+        (used.div_ceil(STRIDE_STEP) * STRIDE_STEP)
+            .min(cap_aligned)
+            .max(STRIDE_STEP.min(cap_aligned))
+    }
+
     /// Host length after a replayed token, which advanced the cache on the device only.
     pub fn sync_len(&mut self, len: usize) {
         self.len = len.min(self.max);
@@ -277,6 +292,19 @@ mod tests {
         assert!(c.prime(7));
         assert!(!c.prime(7));
         assert!(c.prime(8));
+    }
+
+    #[test]
+    fn the_stride_follows_the_length_past_any_fixed_width() {
+        let mut c = KvCore::new(8192, 131072);
+        assert_eq!(c.padded_stride(32), 256);
+        c.commit(2160);
+        assert_eq!(c.padded_stride(32), 2304);
+        c.commit(4000);
+        assert_eq!(c.padded_stride(32), 6400);
+        let mut small = KvCore::new(100, 100);
+        small.commit(99);
+        assert_eq!(small.padded_stride(32), 128);
     }
 
     #[test]

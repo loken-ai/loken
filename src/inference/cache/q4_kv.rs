@@ -1075,37 +1075,9 @@ impl Q4KvCache {
         Ok(out_tensor)
     }
 
-    /// Max sequence length rounded up to a multiple of 32 - the padded
-    /// stride used by the graph-safe attention kernels. Positions in
-    /// `[current_seq_len, max_seq_padded)` are masked via -INFINITY by
-    /// the score kernel so the downstream softmax produces zero there.
-    ///
-    /// **Capped at 2048** for graph mode: at the model's full context
-    /// (32K+), the captured kernel grid schedules max_seq_padded/32
-    /// blocks per layer per token. The vast majority of those blocks
-    /// early-exit (write -INF) but the scheduling cost dominates decode
-    /// latency. Capping here trades graph-mode reach for ~3x speedup at
-    /// short contexts. Callers MUST check `current_seq_len < max_seq_padded`
-    /// before invoking the graph-safe attention path.
+    /// Padded stride used by the graph-safe attention kernels (see `KvCore::padded_stride`).
     pub fn max_seq_padded(&self) -> usize {
-        // 2048 covers typical chat decode lengths (500-1500 tok) without
-        // hitting the graph-mode `pos >= mask_width` fallback that
-        // invalidates the captured graph mid-request. The attention
-        // score kernel iterates `max_seq_padded` positions per token,
-        // so larger cap = more per-token work - but in practice the
-        // 4x kernel cost is dwarfed by the savings from staying in
-        // graph mode (vs 1 cuGraphLaunch + falling to ~14xN_layers
-        // per-token kernel launches once the cap is hit).
-        // Verified: at 1000-tok decode the cap=512 fallback
-        // regresses deepcoder -3% -> -11% vs Ollama, qwen3 +0% -> -5%.
-        const CAP: usize = 2048;
-        // Use current_capacity_tokens (rounded up to block boundary)
-        // instead of max_seq_len: the buffer is sized for current
-        // capacity, and the graph attn kernel must not stride past it.
-        // Still clamp to CAP to avoid the per-token grid overhead at
-        // full 32 K context.
-        let full = self.capacity_blocks() * q4_0_block_size();
-        full.min(CAP)
+        self.core.padded_stride(q4_0_block_size())
     }
 
     /// Graph-safe attention scores. Mirrors `attn_scores` but reads
