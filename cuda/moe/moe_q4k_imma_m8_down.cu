@@ -5,12 +5,12 @@
  *
  * The down matmul takes [size_m sorted pairs, K_inter] F32 input
  * (= gate||up output) and Q4_K weight [num_experts, hidden, K_inter].
- * Output is [num_real_tokens, hidden] F32, accumulated via atomicAdd
+ * Output is one row per routed pair, folded into [num_real_tokens, hidden] F32 in slot order
  * scaled by topk_weights[pair] (sum across topk pairs per token).
  *
  * Structure mirrors moe_q4k_imma_m8 (gate||up) but:
  *   - No gate/up split (one matmul, no GELU)
- *   - Output atomicAdd to per-token slot with topk_weights scaling
+ *   - Each pair's row written once with its topk_weights scaling
  *   - Inputs pre-quantized to Q8_1 by the orchestrator: one Q8_1 row per
  *     routed pair, NOT per real token - down inputs are per-pair-distinct
  *     after gate||up.GELU.mul. The row is addressed by the pair's SLOT,
@@ -43,7 +43,7 @@ extern "C" __global__ void loken_moe_q4k_imma_m8_down_kernel(
     const int32_t * __restrict__ sorted_token_ids,
     const int32_t * __restrict__ expert_ids,
     const float   * __restrict__ topk_weights,
-    float * __restrict__ dst,                    // [num_real_tokens, hidden] F32
+    float * __restrict__ dst,                    // [size_m, hidden] F32, one row per pair
     int num_experts,
     int topk,
     int size_m,
@@ -199,7 +199,7 @@ extern "C" __global__ void loken_moe_q4k_imma_m8_down_kernel(
     }
 
     // Pre-shuffle my_expert / my_pair_tok from the source lanes so the
-    // do_atomic writes don't re-read expert_ids / sorted_token_ids from
+    // store_pair writes do not re-read expert_ids / sorted_token_ids from
     // global memory four times per lane (already in register on source).
     const int src_lane_a_e = (2 * tj + 0) * 4;
     const int src_lane_b_e = (2 * tj + 1) * 4;
@@ -208,30 +208,32 @@ extern "C" __global__ void loken_moe_q4k_imma_m8_down_kernel(
     const int tok_a = __shfl_sync(0xffffffff, my_pair_tok, src_lane_a_e);
     const int tok_b = __shfl_sync(0xffffffff, my_pair_tok, src_lane_b_e);
 
-    // Atomic scatter with topk_weights scaling.
-    auto do_atomic = [&](int pair_local, int weight_row, float v,
+    // One write per (pair, row), scaled by the pair's topk weight.
+    auto store_pair = [&](int pair_local, int weight_row, float v,
                           int e_cached, int pair_tok_cached) {
         const int pair_idx = pair_base + pair_local;
         if (pair_idx >= size_m || weight_row >= hidden) return;
         if (e_cached != block_expert) return;
         const float scale = topk_weights[pair_tok_cached];
-        const int real_token = pair_tok_cached / topk;
-        atomicAdd(&dst[(size_t)real_token * hidden + weight_row], v * scale);
+        dst[(size_t)pair_tok_cached * hidden + weight_row] = v * scale;
     };
 
     if (va) {
-        do_atomic(2 * tj + 0, row_a, out_0, exp_a, tok_a);
-        do_atomic(2 * tj + 1, row_a, out_1, exp_b, tok_b);
+        store_pair(2 * tj + 0, row_a, out_0, exp_a, tok_a);
+        store_pair(2 * tj + 1, row_a, out_1, exp_b, tok_b);
     }
     if (vb) {
-        do_atomic(2 * tj + 0, row_b, out_2, exp_a, tok_a);
-        do_atomic(2 * tj + 1, row_b, out_3, exp_b, tok_b);
+        store_pair(2 * tj + 0, row_b, out_2, exp_a, tok_a);
+        store_pair(2 * tj + 1, row_b, out_3, exp_b, tok_b);
     }
 
     } // end outer expert loop
 
     (void)num_experts;
 }
+
+extern "C" void loken_moe_sum_topk(const float* pairs, float* outputs, int tokens, int topk,
+                                   int cols, cudaStream_t stream);
 
 extern "C" void loken_moe_q4k_imma_m8_down(
     const void * down_w,
@@ -253,8 +255,17 @@ extern "C" void loken_moe_q4k_imma_m8_down(
               (size_m + IDN_N - 1) / IDN_N,
               1);
     dim3 blk(32, 1, 1);
+    // One row per routed pair, folded into the tokens in slot order afterwards: the same sum
+    // on every run (see loken_moe_sum_topk). Prefill only, never inside a capture, so the
+    // rows are a stream-ordered allocation.
+    float* pairs = nullptr;
+    const size_t pair_bytes = (size_t)size_m * hidden * sizeof(float);
+    cudaMallocAsync(&pairs, pair_bytes, stream);
+    cudaMemsetAsync(pairs, 0, pair_bytes, stream);
     loken_moe_q4k_imma_m8_down_kernel<<<grid, blk, 0, stream>>>(
         down_w, inputs_q81, sorted_token_ids, expert_ids, topk_weights,
-        dst_f32, num_experts, topk, size_m, hidden, K
+        pairs, num_experts, topk, size_m, hidden, K
     );
+    loken_moe_sum_topk(pairs, dst_f32, size_m / topk, topk, hidden, stream);
+    cudaFreeAsync(pairs, stream);
 }

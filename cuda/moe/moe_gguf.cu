@@ -459,9 +459,8 @@ __global__ void loken_moe_gemm_gguf_down_reduce_kernel(
     const int32_t * __restrict__ sorted_token_ids,
     const int32_t * __restrict__ expert_ids,
     const float * __restrict__ topk_weights,        // one per routed pair, required here
-    float * __restrict__ all_outputs,               // one row per real token, pre-filled by the
-                                                    // caller with zeros or with the residual;
-                                                    // this kernel only adds to it
+    float * __restrict__ all_outputs,               // one row per routed pair, zeroed; pairs
+                                                    // the routing leaves out stay zero
     moe_dims dims,
     const float * __restrict__ down_bias            // [experts, cols] F32, or null
 ) {
@@ -497,9 +496,27 @@ __global__ void loken_moe_gemm_gguf_down_reduce_kernel(
         if (down_bias != nullptr) {
             v += scale * down_bias[(size_t)routed.expert * dims.cols + row];
         }
-        float * out_ptr = output_row(all_outputs, routed.token / dims.topk, dims.cols);
-        atomicAdd(&out_ptr[row], v);
+        output_row(all_outputs, routed.token, dims.cols)[row] = v;
     });
+}
+
+// Folds each token's `topk` routed rows into its output, in slot order: the same sum on
+// every run, where accumulating the pairs as they finish rounds differently each time and,
+// through the next layer's top-k, can route a token to other experts.
+__global__ void loken_moe_sum_topk_kernel(
+    const float * __restrict__ pairs,   // [tokens * topk, cols], one row per routed pair
+    float * __restrict__ outputs,       // [tokens, cols], pre-filled with zeros or the residual
+    int tokens, int topk, int cols
+) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)tokens * cols) return;
+    const size_t token = i / cols;
+    const size_t col = i % cols;
+    float acc = outputs[i];
+    for (int k = 0; k < topk; ++k) {
+        acc += pairs[(token * topk + k) * cols + col];
+    }
+    outputs[i] = acc;
 }
 
 } // namespace loken_moe
@@ -542,6 +559,15 @@ extern "C" void loken_cast_init_f32_from_dtype(
     }
 }
 
+// The ordered fold of `topk` routed rows per token, for launchers in other units.
+extern "C" void loken_moe_sum_topk(const float* pairs, float* outputs, int tokens, int topk,
+                                   int cols, cudaStream_t stream) {
+    const int threads = 256;
+    const int blocks = ceil_div(tokens * cols, threads);
+    loken_moe::loken_moe_sum_topk_kernel<<<blocks, threads, 0, stream>>>(
+        pairs, outputs, tokens, topk, cols);
+}
+
 extern "C" void loken_moe_gemm_gguf_down_reduce(
     const float* inputs,            // [M*topk, K] f32
     const void*  weights,           // [num_experts, N, K] quantized
@@ -554,10 +580,23 @@ extern "C" void loken_moe_gemm_gguf_down_reduce(
     cudaStream_t stream
 ) {
     const int kx_padded = pad_to(size_k, MATRIX_ROW_PADDING);
-    // Down quantises one activation row per routed pair - no sharing, so one row per entry.
-    // Held until the GEMM below is on the stream - see `y_q8_1_reservation`.
-    const y_q8_1_reservation y_q8_1 =
-        stage_activation(inputs, size_m, size_k, kx_padded, stream);
+    // Down quantises one activation row per routed pair - no sharing, so one row per entry -
+    // and writes one output row per pair into the same scratch, past the activation, for the
+    // ordered sum below. Held until both launches are on the stream - see
+    // `y_q8_1_reservation`.
+    const size_t act_bytes = pad_to(
+        (int)((size_t)size_m * (kx_padded / QK8_1) * sizeof(block_q8_1)), 256);
+    const size_t pair_bytes = (size_t)size_m * size_n * sizeof(float);
+    const y_q8_1_reservation y_q8_1 = get_y_q8_1_scratch(act_bytes + pair_bytes, stream);
+    {
+        const dim3 grid(ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE), size_m, 1);
+        const dim3 block(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+        quantize_q8_1<<<grid, block, 0, stream>>>(inputs, y_q8_1, size_k, kx_padded);
+    }
+    float* pairs = (float*)((char*)(void*)y_q8_1 + act_bytes);
+    cudaMemsetAsync(pairs, 0, pair_bytes, stream);
+    float* reduced = outputs;
+    outputs = pairs;
 
     // Smaller blocks -> more parallelism across SMs (no shared-mem
     // barrier means small blocks are fine). Down has size_n=hidden,
@@ -575,6 +614,7 @@ extern "C" void loken_moe_gemm_gguf_down_reduce(
 #undef MOE_CASE
         default: break;
     }
+    loken_moe_sum_topk(pairs, reduced, size_m / topk, topk, size_n, stream);
 }
 
 // ------------------------------------------------------------

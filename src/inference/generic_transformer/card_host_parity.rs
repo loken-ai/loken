@@ -630,3 +630,85 @@ fn each_layer_decodes_alike() {
         xd = hd;
     }
 }
+
+/// The same prompt decoded twice on the card, each time by a freshly loaded model: greedy
+/// decoding must repeat itself exactly. The first step whose logits differ names where the
+/// card's arithmetic depends on something other than its inputs.
+#[test]
+#[ignore = "needs a model in the store and a CUDA card"]
+fn card_decodes_the_same_twice() {
+    let tag = std::env::var("LOKEN_PARITY_MODEL").unwrap_or_else(|_| "olmoe:latest".into());
+    let path = model_blob(&tag);
+    let file = std::fs::File::open(&path).unwrap();
+    let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
+    let read = || {
+        gguf_file::Content::read_mapped(&mut std::io::Cursor::new(&mmap[..]), mmap.clone()).unwrap()
+    };
+    let Ok(card) = Device::new_cuda(0) else {
+        eprintln!("no CUDA device");
+        return;
+    };
+    let cards: HashMap<usize, Device> = [(0usize, card)].into_iter().collect();
+    let n_layers = {
+        let c = read();
+        let arch = c.metadata["general.architecture"]
+            .to_string()
+            .unwrap()
+            .clone();
+        GenericTransformerConfig::from_gguf(&c, &arch)
+            .unwrap()
+            .n_layers
+    };
+    let prompt: Vec<u32> = (0..40u32).map(|i| 1000 + (i * 37) % 20000).collect();
+    let run = || -> Vec<(u32, Vec<f32>)> {
+        let plan = HeteroPlan::forced_gpu(n_layers, n_layers, 0);
+        let mut m = GenericHeteroTransformer::from_gguf(read(), &mmap[..], &cards, &plan).unwrap();
+        let mut out = Vec::new();
+        let mut input = Tensor::new(prompt.as_slice(), &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let mut pos = 0;
+        for _ in 0..24 {
+            let n = input.dims()[1];
+            let logits = m.forward(&input, pos).unwrap();
+            pos += n;
+            let l = logits
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let t = l
+                .iter()
+                .enumerate()
+                .fold(
+                    (0usize, f32::MIN),
+                    |b, (i, &v)| if v > b.1 { (i, v) } else { b },
+                )
+                .0 as u32;
+            out.push((t, l));
+            input = Tensor::new(&[t], &Device::Cpu)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap();
+        }
+        out
+    };
+    let a = run();
+    let b = run();
+    for (i, ((at, al), (bt, bl))) in a.iter().zip(&b).enumerate() {
+        let worst = al
+            .iter()
+            .zip(bl)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        println!("{tag} step {i:>2}: tokens {at} {bt}  max logit diff {worst:.6}");
+        if at != bt {
+            break;
+        }
+    }
+}

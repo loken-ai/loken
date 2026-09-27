@@ -437,7 +437,7 @@ pub fn moe_gemm_gguf_down_reduce(
     let (_, hidden) = ext.out_shape();
     let out_count = n_real_tokens * hidden;
     let stream = dev.cuda_stream().cu_stream() as i64;
-    // The kernel accumulates into its output with atomicAdd, so a residual is folded by
+    // The kernel adds each token's routed rows into its output, so a residual is folded by
     // starting the buffer at the residual instead of at zero: a device copy when it already
     // is f32, a widening one when it is not.
     let out_alloc = match residual {
@@ -492,8 +492,8 @@ pub fn moe_gemm_gguf_down_reduce(
         }
         None => dev.alloc_zeros::<f32>(out_count)?,
     };
-    // Per-expert down bias [num_experts, size_n] F32: folded into the kernel's
-    // atomicAdd (Σ_slot w.db) - replaces an index_select+broadcast_mul+sum+add
+    // Per-expert down bias [num_experts, size_n] F32: folded into each routed row
+    // (Σ_slot w.db) - replaces an index_select+broadcast_mul+sum+add
     // chain whose temporaries broke CUDA-graph capture. Persistent F32 weight
     // (ld_f32_opt at load) -> graph-safe pointer.
     if let Some(db) = down_bias {
