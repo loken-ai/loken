@@ -464,20 +464,13 @@ impl LlmEngine {
                 );
                 KvQuant::Off
             } else if kv_quant_supported && matches!(kv_quant, KvQuant::Off)
-                && (arch == "qwen3moe" || arch == "qwen3") {
-                // Auto-promote qwen3/qwen3moe to Q4 KV.
-                // qwen3moe (qwen3-coder), measured: Q4 outperforms
-                // Q8 here - decode +17% WIN. Likely benefits from Q4's lower
-                // KV memory bandwidth on the MoE expert routing path.
-                // qwen3 (dense), measured: F-dtype KV decode loses
-                // -12.9% to Ollama at 512 tokens (-0.4% at 128 tokens) because
-                // the attention scan grows with seq_len at full F-dtype
-                // bandwidth. Q4 KIVI's device-pos kernels stay graph-safe
-                // and cut the per-token memory traffic in half.
+                && arch == "qwen3moe" {
+                // qwen3moe (qwen3-coder), measured: Q4 outperforms Q8 on its own
+                // loader - decode +17%.
                 info!("Auto-promoting kv_quant Off -> Q4 for arch={arch}");
                 KvQuant::Q4
             } else if kv_quant_supported && matches!(kv_quant, KvQuant::Off)
-                && matches!(arch.as_str(), "llama" | "qwen2" | "mistral3"
+                && matches!(arch.as_str(), "llama" | "qwen2" | "qwen3" | "mistral3"
                                          | "granite" | "granitemoe" | "olmoe") {
                 // granite and granitemoe joined on their own A/B against the
                 // F-dtype cache they were left on: both decode materially faster,

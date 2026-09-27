@@ -862,103 +862,55 @@ fn build_generic_layer(
         cpu_norm_cache: None,
         #[cfg(feature = "cuda")]
         quant_kv: {
-            let q8 = {
-                use crate::inference::engine::llm_engine::KvQuant;
-                // Enable Q8 KV when config asks for it OR when config asks for
-                // Q4 but Q4 isn't applicable for this model (no qkv_bias /
-                // n_layers > 50). Without this fallback, qwen3 base on
-                // kv_quant=q4 ends up on the F-dtype cache and loses the
-                // APQ Q8 fast-decode path (~-13% vs Q8).
-                // Mirror the q4 block's effective want_q4 (env override + auto)
-                // so we never enable both caches simultaneously.
-                let q4_effective = flags.has_qkv_bias && config.n_layers <= 50;
-                let q4_not_applicable = config.kv_quant == KvQuant::Q4 && !q4_effective;
-                let want_q8 = config.kv_quant == KvQuant::Q8 || q4_not_applicable;
-                // The layer's own head shape must be one the quantised kernels are
-                // instantiated for.
-                let head_dim_supported = crate::inference::cache::kv_core::kv_shape_supported(
-                    head_dim,
-                    config.n_head / n_kv_head_layer.max(1),
-                );
-                if want_q8 && device.is_cuda() && head_dim_supported {
-                    // Pre-allocate for the configured (engine-level) context
-                    // length so appends never reallocate. Use the PER-LAYER
-                    // n_kv_head (n_kv_head_layer), not the model-level one
-                    // from config - for gemma4 26B the model-level value is
-                    // the worst-case (16) while SWA layers actually have 8.
-                    // Allocating with the model-level value would over-reserve
-                    // 2x on every SWA layer and OOM at load.
-                    let max_seq = config.effective_max_context();
-                    match crate::inference::cache::q8_kv::Q8KvCache::new(
-                        max_seq,
-                        n_kv_head_layer,
-                        head_dim,
-                        device,
-                    ) {
-                        Ok(c) => Some(c),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Q8 KV cache alloc failed for layer (device={:?}): {e}; \
-                                 decoding will fall back to F16 KV cache",
-                                device
-                            );
-                            None
-                        }
-                    }
-                } else {
+            use crate::inference::cache::quant_kv::QuantKv;
+            use crate::inference::engine::llm_engine::KvQuant;
+            // The layer's own head shape must be one the quantised kernels are instantiated
+            // for. The cache is sized with the PER-LAYER n_kv_head: gemma4 26B's model-level
+            // value is the worst case (16) while its SWA layers have 8, and the model-level
+            // value would over-reserve every SWA layer twice and OOM at load.
+            let shape_supported = crate::inference::cache::kv_core::kv_shape_supported(
+                head_dim,
+                config.n_head / n_kv_head_layer.max(1),
+            );
+            let max_seq = config.effective_max_context();
+            let built = if device.is_cuda() && shape_supported {
+                match config.kv_quant {
+                    KvQuant::Q8 => Some(
+                        crate::inference::cache::q8_kv::Q8KvCache::new(
+                            max_seq,
+                            n_kv_head_layer,
+                            head_dim,
+                            device,
+                        )
+                        .map(QuantKv::Q8),
+                    ),
+                    KvQuant::Q4 => Some(
+                        crate::inference::cache::q4_kv::Q4KvCache::new(
+                            max_seq,
+                            n_kv_head_layer,
+                            head_dim,
+                            device,
+                        )
+                        .map(QuantKv::Q4),
+                    ),
+                    KvQuant::Off => None,
+                }
+            } else {
+                None
+            };
+            match built {
+                Some(Ok(c)) => Some(c),
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        "{:?} KV cache alloc failed for layer (device={:?}): {e}; \
+                         decoding will fall back to the F-dtype KV cache",
+                        config.kv_quant,
+                        device
+                    );
                     None
                 }
-            };
-            let q4 = {
-                use crate::inference::engine::llm_engine::KvQuant;
-                // Auto-enable Q4 KV cache when GH_APQ will *not* fire - i.e.
-                // when has_qkv_bias is true (qwen2, deepcoder) or fused-QKV
-                // load-time concat won't happen. APQ's F-dtype path
-                // outperforms Q4 decode at short cache lengths, so Q4 only
-                // helps the non-APQ slow path (separate Q/K/V matmuls +
-                // standard_attention with no fused norm/RoPE).
-                //
-                // Auto-enable when the model would NOT use APQ:
-                //   - has_qkv_bias=true (qwen2-style biases block byte-concat)
-                //   - layers <= 50: empirically the Q4 decode overhead amortises
-                //     for ~48-layer 14B models (deepcoder) but regresses for
-                //     64-layer 32B models (deepseek-r1:32b) under multi-GPU.
-                let want_q4 = flags.has_qkv_bias && config.n_layers <= 50;
-                let shape_supported = crate::inference::cache::kv_core::kv_shape_supported(
-                    head_dim,
-                    config.n_head / n_kv_head_layer.max(1),
-                );
-                if want_q4 && shape_supported && config.kv_quant == KvQuant::Q4 && device.is_cuda()
-                {
-                    let max_seq = config.effective_max_context();
-                    match crate::inference::cache::q4_kv::Q4KvCache::new(
-                        max_seq,
-                        n_kv_head_layer,
-                        head_dim,
-                        device,
-                    ) {
-                        Ok(c) => Some(c),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Q4 KV cache alloc failed for layer (device={:?}): {e}; \
-                                 decoding will fall back to F-dtype KV cache",
-                                device
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    if config.kv_quant == KvQuant::Q4 && !want_q4 {
-                        tracing::debug!(
-                            "Q4 KV not applicable for this model (no qkv_bias or \
-                             n_layers > 50); using F-dtype cache for this layer"
-                        );
-                    }
-                    None
-                }
-            };
-            q4.map(crate::inference::cache::quant_kv::QuantKv::Q4)
-                .or(q8.map(crate::inference::cache::quant_kv::QuantKv::Q8))
+                None => None,
+            }
         },
         // Donor layer flag: true when this layer is in the non-shared
         // range and the model has shared_kv_layers > 0. Donors must
