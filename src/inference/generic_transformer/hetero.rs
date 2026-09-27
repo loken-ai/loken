@@ -1396,6 +1396,17 @@ impl GenericHeteroTransformer {
         self.forward_inner(input_ids, index_pos, /*all_positions=*/ true)
     }
 
+    /// `forward_all` with the rows batched as a prefill batches them, for the verify
+    /// benchmark.
+    #[cfg(test)]
+    pub(super) fn forward_all_batched(
+        &mut self,
+        input_ids: &Tensor,
+        index_pos: usize,
+    ) -> Result<Tensor> {
+        self.forward_inner(input_ids, index_pos, /*all_positions=*/ true)
+    }
+
     fn forward_inner(
         &mut self,
         input_ids: &Tensor,

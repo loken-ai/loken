@@ -285,3 +285,56 @@ fn verify_rows_match_decode() {
     assert_eq!(graph_differing, 0, "a graph decode step differs from the eager one");
     assert_eq!(differing_rows, 0, "a verified row differs from its decode step");
 }
+
+/// What a verify costs: `k+1` rows as decode steps (this forward_all), the same rows
+/// batched as a prefill batches them, and `k+1` single-token forwards.
+#[test]
+#[ignore = "needs a model in the store and a CUDA card"]
+fn verify_cost_against_decode_steps() {
+    let Some((tag, mut m, card)) = load(1024) else {
+        return;
+    };
+    let prompt: Vec<u32> = (0..64u32).map(|i| 1000 + (i * 37) % 20000).collect();
+    let ids = |t: &[u32]| Tensor::new(t, &card).unwrap().unsqueeze(0).unwrap();
+    m.forward(&ids(&prompt), 0).unwrap();
+    let base = prompt.len();
+    let toks: Vec<u32> = (0..VERIFY_ROWS as u32).map(|i| 2000 + i * 13).collect();
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let reps = 9;
+    for rows in [2usize, 3, 5, VERIFY_ROWS] {
+        let t = &toks[..rows];
+        let mut verify = Vec::new();
+        let mut batched = Vec::new();
+        let mut steps = Vec::new();
+        for _ in 0..reps {
+            m.trim_kv(base);
+            let s = std::time::Instant::now();
+            host_rows(&m.forward_all(&ids(t), base).unwrap());
+            verify.push(s.elapsed().as_secs_f64());
+
+            m.trim_kv(base);
+            let s = std::time::Instant::now();
+            host_rows(&m.forward_all_batched(&ids(t), base).unwrap());
+            batched.push(s.elapsed().as_secs_f64());
+
+            m.trim_kv(base);
+            let s = std::time::Instant::now();
+            for (r, tok) in t.iter().enumerate() {
+                host_rows(&m.forward(&ids(&[*tok]), base + r).unwrap());
+            }
+            steps.push(s.elapsed().as_secs_f64());
+        }
+        let (v, b, d) = (median(verify), median(batched), median(steps));
+        println!(
+            "{tag}: {rows} rows: verify as decode {:.2} ms, batched {:.2} ms, {rows} decode steps {:.2} ms \
+             (verify = {:.2} steps)",
+            v * 1e3,
+            b * 1e3,
+            d * 1e3,
+            v / (d / rows as f64)
+        );
+    }
+}

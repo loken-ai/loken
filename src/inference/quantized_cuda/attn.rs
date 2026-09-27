@@ -303,6 +303,43 @@ pub fn attn_flash_splitk_q8_decode_dev_pos(
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
 }
 
+/// Split-count schedule of the GQA split-K decode. GQA has few KV heads (4-8), so the partial
+/// grid is `nsplit x n_kv_heads` single warps, memory-bound on the KV read: `base` keeps
+/// about `TARGET_WARPS` in flight at moderate context, and past it the count grows with the
+/// sequence so each split covers about `CHUNK` keys (more warps in flight, more bandwidth).
+/// The wide combine keeps up with the larger counts.
+pub struct GqaSplits {
+    pub base: usize,
+}
+
+impl GqaSplits {
+    /// Warps the partial kernel keeps in flight at moderate context.
+    const TARGET_WARPS: usize = 384;
+    /// Keys per split once the sequence outgrows `base`.
+    pub const CHUNK: usize = 8;
+    pub const MIN: usize = 8;
+    /// Largest `base`: the moderate-context count never exceeds it.
+    const BASE_MAX: usize = 96;
+    /// Largest count, and the partials buffer's per-head capacity.
+    pub const MAX: usize = 256;
+
+    pub fn for_kv_heads(n_kv_heads: usize) -> Self {
+        Self {
+            base: (Self::TARGET_WARPS / n_kv_heads.max(1)).clamp(Self::MIN, Self::BASE_MAX),
+        }
+    }
+}
+
+/// Splits of a `seq_kv`-key decode over `n_kv_heads`; `flash_splitk_nsplit` in
+/// `flash_splitk.cu` computes the same from the device length.
+pub fn gqa_nsplit(seq_kv: usize, n_kv_heads: usize) -> usize {
+    GqaSplits::for_kv_heads(n_kv_heads)
+        .base
+        .max(seq_kv.div_ceil(GqaSplits::CHUNK))
+        .clamp(GqaSplits::MIN, GqaSplits::MAX)
+        .min(seq_kv.max(1))
+}
+
 /// GQA sibling of `attn_flash_splitk_q8_decode_dev_pos`. Fused split-K
 /// flash-decode where each (split, h_kv) warp reads its KV head's chunk ONCE
 /// and feeds all `n_q_per_kv` query heads - so KV bandwidth (the long-context
@@ -311,6 +348,10 @@ pub fn attn_flash_splitk_q8_decode_dev_pos(
 /// round-trip, NSPLITx more blocks than the single-warp-per-head fused path).
 /// The combine kernel is the same per-query-head merge as the MHA variant.
 /// `q_f32` is `[n_q_heads, head_dim]` (n_q_heads = n_kv_heads x n_q_per_kv).
+///
+/// The kernels take their split count from the length they read on the device
+/// (`gqa_nsplit`), so an eager step and a graph replay at the same length split alike.
+/// `seq_kv_hint` is the longest length the launch may serve: it sizes the grid.
 pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     k_blob: &CudaSlice<u8>,
     v_blob: &CudaSlice<u8>,
@@ -342,37 +383,15 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
             n_q_heads * head_dim
         );
     }
-    // Adaptive split count: GQA has few KV heads (4-8), so blocks = nsplit x
-    // n_kv_heads. The partial kernel is one warp per (split, KV-head) and is
-    // memory-bound on the KV read - at long context a seq_kv-independent nsplit
-    // (the old `384/n_kv` ≈ 48 for qwen3) leaves only ~384 warps in flight (~11%
-    // occupancy -> measured ~19% of KV bandwidth) while each warp serially scans
-    // 80+ tokens. So GROW nsplit with seq_kv to keep each split's chunk <= ~24
-    // tokens (more warps in flight -> more memory-level parallelism -> higher
-    // bandwidth), while never dropping below the original moderate-context value
-    // (so the short/medium winning cells are unchanged). Cap by seq_kv and a sane
-    // upper band; the combine loops nsplit but its cost stays small vs the saving.
-    // Chunk target 8 (was 24): nsys on qwen3:0.6b long-ctx decode // measured the partial at 16.3 µs/layer with ~24-token chunks (48 splits x
-    // 8 kv-heads = 384 warps ≈ 11% occupancy - latency-bound, not BW) vs
-    // 12.5 µs at chunk 8 (nsplit ~3x). The larger nsplit only pays off with
-    // the WIDE combine below (grid x HD_BLOCKS); the old single-block-per-head
-    // combine grew 2.5 -> 5.8 µs and ate the gain.
-    let base = (384 / n_kv_heads.max(1)).clamp(8, 96);
-    let by_len = seq_kv_hint.div_ceil(8);
-    let nsplit: usize = base.max(by_len).clamp(8, 256).min(seq_kv_hint.max(1));
-    // Plain partial (NOT `_pf_`): nsys A/B (qwen3:0.6b, kv≈1.1-1.4K)
-    // measured the software-pipelined variant SLOWER (17.1 vs 16.3 µs/layer)  -
-    // the +2xHD_BLOCKS registers cost more occupancy than the hidden load
-    // latency buys. WIDE combine: one block per (head, 32-dim slice), so the
-    // combine keeps up with the chunk-8 nsplit (see kernel comment).
+    let nsplit = gqa_nsplit(seq_kv_hint, n_kv_heads);
     let (partial_name, combine_name) = match head_dim {
         64 => (
-            "flash_splitk_q8_gqa_partial_hd64",
-            "flash_splitk_gqa_combine_wide_hd64",
+            "flash_splitk_q8_gqa_partial_devlen_hd64",
+            "flash_splitk_gqa_combine_wide_devlen_hd64",
         ),
         128 => (
-            "flash_splitk_q8_gqa_partial_hd128",
-            "flash_splitk_gqa_combine_wide_hd128",
+            "flash_splitk_q8_gqa_partial_devlen_hd128",
+            "flash_splitk_gqa_combine_wide_devlen_hd128",
         ),
         _ => unreachable!(),
     };
@@ -387,12 +406,13 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     // Allocate partials at the CONSTANT upper bound (not the runtime nsplit) so the
     // per-decode-token alloc size never changes as seq_kv (hence nsplit) grows  -
     // the async mempool then reuses one block instead of fragmenting. The kernels
-    // index by the runtime `nsplit` (<= MAX_NSPLIT), using only the live prefix.
-    const MAX_NSPLIT: usize = 256;
-    debug_assert!(nsplit <= MAX_NSPLIT);
-    let partials = unsafe { dev.alloc::<f32>(n_q_heads * MAX_NSPLIT * (head_dim + 2))? };
+    // index by the device length's split count (<= GqaSplits::MAX), using only the
+    // live prefix.
+    debug_assert!(nsplit <= GqaSplits::MAX);
+    let partials = unsafe { dev.alloc::<f32>(n_q_heads * GqaSplits::MAX * (head_dim + 2))? };
 
-    // Partial grid is (nsplit, n_kv_heads): each warp serves n_q_per_kv query heads.
+    // Partial grid is (splits of the longest length served, n_kv_heads): each warp serves
+    // n_q_per_kv query heads, and the blocks past the device length's count leave.
     let cfg1 = LaunchConfig {
         grid_dim: (nsplit as u32, n_kv_heads as u32, 1),
         block_dim: (WARP_SIZE as u32, 1, 1),
@@ -404,11 +424,15 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     b1.arg(q_f32);
     b1.arg(&partials);
     b1.arg(seq_kv_dev);
+    let schedule = GqaSplits::for_kv_heads(n_kv_heads);
     barg!(
         b1,
         n_kv_heads as i32,
         n_q_per_kv as i32,
-        nsplit as i32,
+        schedule.base as i32,
+        GqaSplits::CHUNK as i32,
+        GqaSplits::MIN as i32,
+        GqaSplits::MAX as i32,
         scale
     );
     unsafe { b1.launch(cfg1) }.map_err(|e| anyhow!("launch gqa partial: {e}"))?;
@@ -426,7 +450,14 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     let mut b2 = combine_func.builder();
     b2.arg(&partials);
     b2.arg(&dst);
-    barg!(b2, nsplit as i32);
+    b2.arg(seq_kv_dev);
+    barg!(
+        b2,
+        schedule.base as i32,
+        GqaSplits::CHUNK as i32,
+        GqaSplits::MIN as i32,
+        GqaSplits::MAX as i32
+    );
     unsafe { b2.launch(cfg2) }.map_err(|e| anyhow!("launch gqa combine: {e}"))?;
 
     Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
@@ -600,9 +631,8 @@ pub fn attn_flash_splitk_q4_gqa_decode_dev_pos(
         .get_or_load_custom_func(combine_name, "loken_quantized", ptx)
         .map_err(|e| anyhow!("load kernel {combine_name}: {e}"))?;
 
-    const MAX_NSPLIT: usize = 256;
-    debug_assert!(nsplit <= MAX_NSPLIT);
-    let partials = unsafe { dev.alloc::<f32>(n_q_heads * MAX_NSPLIT * (head_dim + 2))? };
+    debug_assert!(nsplit <= GqaSplits::MAX);
+    let partials = unsafe { dev.alloc::<f32>(n_q_heads * GqaSplits::MAX * (head_dim + 2))? };
 
     let cfg1 = LaunchConfig {
         grid_dim: (nsplit as u32, n_kv_heads as u32, 1),

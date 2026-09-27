@@ -1526,13 +1526,18 @@ impl GenericTransformerLayer {
             // the deeper grid. Any Err falls through to split-K, which falls
             // through to the two-kernel chain, so a card that cannot run it loses
             // nothing.
-            let try_tc = self.head_dim == 128
-                && cache.current_seq_len()
-                    >= crate::inference::kernel::flash_decode_tc::TC_MIN_KV
+            let tc_card = self.head_dim == 128
                 && q.device()
                     .as_cuda_device()
                     .map(|d| d.has_ampere_tensor_cores())
                     .unwrap_or(false);
+            let try_tc = tc_card
+                && cache.current_seq_len() >= crate::inference::kernel::flash_decode_tc::TC_MIN_KV;
+            if tc_card && !try_tc && crate::tensor::cuda_ext::capture_active(&q.device()) {
+                // Split-K is recorded; from TC_MIN_KV keys an eager step takes the
+                // tensor-core kernel, so the graph replays no further.
+                cache.note_kernel_bound(crate::inference::kernel::flash_decode_tc::TC_MIN_KV - 1);
+            }
             let tc_out = if try_tc {
                 match cache.attn_flash_tc_decode_graph(q, softmax_scale) {
                     Ok(y) => Some(y),

@@ -872,12 +872,34 @@ impl LlmEngine {
                     let mut split_token_ids: Option<Tensor> = None;
                     if graph_enabled && use_graph_mode && !graph_disabled_this_request {
                         let x = Tensor::new(&[next_token], &Device::Cpu)?.unsqueeze(0)?;
-                        // If the F-dtype kv_cache outgrew the captured graph
-                        // state buffers (e.g. crossing the 512-cap doubling
-                        // boundary mid-decode), update_graph_state errors so
-                        // we can invalidate the graph and fall through to the
-                        // non-graph forward path for the rest of the request.
-                        match state.model.update_graph_state(pos) {
+                        // A live graph that replays no further than this position (its
+                        // recorded sequence ceiling) is dropped and a new one recorded from
+                        // here: warmup at this token, capture at the next. When the state
+                        // cannot be prepared even without a graph (the F-dtype cache
+                        // outgrew the graph buffers), the rest of the request runs eagerly.
+                        let prepared = match state.model.update_graph_state(pos) {
+                            Ok(()) => Ok(()),
+                            Err(e) => {
+                                #[cfg(feature = "cuda")]
+                                { cuda_graph = None; }
+                                graph_logits = None;
+                                state.model.invalidate_graph_state();
+                                #[cfg(feature = "cuda")]
+                                if let Some(Some(ref stream)) = cuda_stream {
+                                    stream.context().free_capture_arena();
+                                }
+                                match state.model.update_graph_state(pos) {
+                                    Ok(()) => {
+                                        info!("graph replay ended at pos={pos} ({e}); recording a new graph from here");
+                                        graph_warmed = false;
+                                        graph_capture_attempted = false;
+                                        Ok(())
+                                    }
+                                    Err(again) => Err(again),
+                                }
+                            }
+                        };
+                        match prepared {
                             Ok(()) => {
                                 if needs_split {
                                     // Split path: prepare_all_kv (called below

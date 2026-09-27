@@ -1492,14 +1492,25 @@ impl LlmEngine {
                                 }
                             },
                         };
+                        // A live graph that replays no further than this position (its
+                        // recorded sequence ceiling) is dropped and a new one recorded from
+                        // here: warmup at this token, capture at the next. When the state
+                        // cannot be prepared even without a graph, the rest of the request
+                        // runs eagerly.
                         if let Err(e) = state.model.update_graph_state(pos) {
-                            warn!("update_graph_state failed at pos={pos}: {e}. Disabling graph for rest of request.");
                             cuda_graph = None;
                             graph_logits = None;
-                            graph_disabled_this_request = true;
                             state.model.invalidate_graph_state();
                             stream.context().free_capture_arena();
-                            break 'graph_blk None;
+                            if let Err(again) = state.model.update_graph_state(pos) {
+                                warn!("update_graph_state failed at pos={pos}: {again}. Disabling graph for rest of request.");
+                                graph_disabled_this_request = true;
+                                state.model.invalidate_graph_state();
+                                break 'graph_blk None;
+                            }
+                            info!("graph replay ended at pos={pos} ({e}); recording a new graph from here");
+                            graph_warmed = false;
+                            graph_capture_attempted = false;
                         }
                         if let Err(e) = state.model.embed_for_graph(&x) {
                             warn!("embed_for_graph failed at pos={pos}: {e}. Disabling graph for rest of request.");

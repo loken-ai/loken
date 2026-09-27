@@ -37,7 +37,10 @@ extern "C" {
         n_kv: i32,
         n_q_per_kv: i32,
         qlen: i32,
-        nsplit: i32,
+        grid_splits: i32,
+        chunk: i32,
+        lo: i32,
+        hi: i32,
         scale: f32,
         stream: i64,
     );
@@ -49,14 +52,25 @@ const MAX_NSPLIT: usize = 256;
 /// launcher: keep each split's KV chunk small for memory-level parallelism, but
 /// bounded so the per-call partial scratch is a stable size for mempool reuse).
 fn pick_nsplit(seq_kv: usize) -> usize {
-    seq_kv.div_ceil(24).clamp(8, MAX_NSPLIT).min(seq_kv.max(1))
+    seq_kv
+        .div_ceil(SPLIT_CHUNK)
+        .clamp(MIN_NSPLIT, MAX_NSPLIT)
+        .min(seq_kv.max(1))
 }
+
+/// Keys per split.
+const SPLIT_CHUNK: usize = 24;
+const MIN_NSPLIT: usize = 8;
 
 /// Tensor-core flash-decode for one attention layer's Q8 KV cache.
 ///
 /// `q_f16`: device f16 `[n_q_heads*qlen, head_dim]` row-major (the model's Q for
 /// this layer; for qlen=1 it is the plain `[n_q_heads, head_dim]` decode Q).
 /// Returns f16 `[n_q_heads*qlen, head_dim]` attention output (same row order).
+///
+/// The kernels take their split count from the length they read on the device
+/// (`pick_nsplit`), so an eager step and a graph replay at the same length split alike.
+/// `seq_kv_hint` is the longest length the launch may serve: it sizes the grid.
 pub fn flash_decode_tc_q8_gqa(
     k_q8: &CudaSlice<u8>,
     v_q8: &CudaSlice<u8>,
@@ -117,6 +131,9 @@ pub fn flash_decode_tc_q8_gqa(
             n_q_per_kv as i32,
             qlen as i32,
             nsplit as i32,
+            SPLIT_CHUNK as i32,
+            MIN_NSPLIT as i32,
+            MAX_NSPLIT as i32,
             scale,
             stream,
         );

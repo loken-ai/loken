@@ -563,7 +563,42 @@ extern "C" __global__ void NAME(                                              \
     );                                                                        \
 }
 
+// Split count of a sequence of `seq_kv` keys: `ceil(seq_kv / chunk)`, at least `base`, within
+// [lo, hi] and at most `seq_kv`. The host launcher states the schedule (`gqa_nsplit`); the
+// device-length kernels below apply it to the length they read, so a step computes the same
+// splits whether it is launched eagerly or replayed from a captured graph.
+static __device__ __forceinline__ int flash_splitk_nsplit(
+    int seq_kv, int base, int chunk, int lo, int hi
+) {
+    const int by_len = (seq_kv + chunk - 1) / chunk;
+    return min(min(max(max(base, by_len), lo), hi), max(seq_kv, 1));
+}
+
+// GQA partial whose split count follows the device length. Grid: (splits for the longest
+// length the launch may serve, n_kv_heads); blocks past the length's own count leave.
+#define FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(NAME, HD, MAXNQ)                \
+extern "C" __global__ void NAME(                                              \
+    const void  * __restrict__ K_blocks,                                      \
+    const void  * __restrict__ V_blocks,                                      \
+    const float * __restrict__ Q,                                             \
+    float       * __restrict__ partials,                                      \
+    const int32_t * __restrict__ seq_kv_dev,                                  \
+    int n_kv,                                                                 \
+    int n_q_per_kv,                                                           \
+    int base, int chunk, int lo, int hi,                                      \
+    float scale                                                               \
+) {                                                                           \
+    const int nsplit = flash_splitk_nsplit(seq_kv_dev[0] + 1, base, chunk, lo, hi); \
+    if ((int)blockIdx.x >= nsplit) return;                                    \
+    flash_splitk_q8_gqa_partial_inner<HD, MAXNQ>(                             \
+        K_blocks, V_blocks, Q, partials, seq_kv_dev,                          \
+        n_kv, n_q_per_kv, nsplit, scale, blockIdx.y, blockIdx.x, threadIdx.x  \
+    );                                                                        \
+}
+
 FLASH_SPLITK_GQA_PARTIAL_KERNEL(flash_splitk_q8_gqa_partial_hd64,  64,  8)
+FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(flash_splitk_q8_gqa_partial_devlen_hd64,  64,  8)
+FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(flash_splitk_q8_gqa_partial_devlen_hd128, 128, 8)
 FLASH_SPLITK_GQA_PARTIAL_KERNEL(flash_splitk_q8_gqa_partial_hd128, 128, 8)
 FLASH_SPLITK_GQA_PARTIAL_PF_KERNEL(flash_splitk_q8_gqa_partial_pf_hd64,  64,  8)
 FLASH_SPLITK_GQA_PARTIAL_PF_KERNEL(flash_splitk_q8_gqa_partial_pf_hd128, 128, 8)
@@ -638,6 +673,21 @@ extern "C" __global__ void NAME(                                              \
     flash_splitk_gqa_combine_wide_inner<HD>(partials, out, nsplit,            \
         blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y);                    \
 }
+// Wide combine of the device-length partials: the same split count, from the same length.
+#define FLASH_SPLITK_GQA_COMBINE_WIDE_DEVLEN_KERNEL(NAME, HD)                 \
+extern "C" __global__ void NAME(                                              \
+    const float * __restrict__ partials,                                      \
+    float       * __restrict__ out,                                           \
+    const int32_t * __restrict__ seq_kv_dev,                                  \
+    int base, int chunk, int lo, int hi                                       \
+) {                                                                           \
+    const int nsplit = flash_splitk_nsplit(seq_kv_dev[0] + 1, base, chunk, lo, hi); \
+    flash_splitk_gqa_combine_wide_inner<HD>(partials, out, nsplit,            \
+        blockIdx.x, blockIdx.y, threadIdx.x, threadIdx.y);                    \
+}
+FLASH_SPLITK_GQA_COMBINE_WIDE_DEVLEN_KERNEL(flash_splitk_gqa_combine_wide_devlen_hd64,  64)
+FLASH_SPLITK_GQA_COMBINE_WIDE_DEVLEN_KERNEL(flash_splitk_gqa_combine_wide_devlen_hd128, 128)
+
 FLASH_SPLITK_GQA_COMBINE_WIDE_KERNEL(flash_splitk_gqa_combine_wide_hd64,  64)
 FLASH_SPLITK_GQA_COMBINE_WIDE_KERNEL(flash_splitk_gqa_combine_wide_hd128, 128)
 

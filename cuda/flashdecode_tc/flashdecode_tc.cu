@@ -193,13 +193,26 @@ static __device__ __forceinline__ void flashdecode_tc_partial_inner(
     }
 }
 
+// Split count of a sequence of `seq_kv` keys: `ceil(seq_kv / chunk)` within [lo, hi] and at
+// most `seq_kv`. The host states the schedule (`pick_nsplit`); the kernels apply it to the
+// length they read, so a step splits alike eagerly and replayed from a captured graph.
+static __device__ __forceinline__ int fdtc_nsplit(int seq_kv, int chunk, int lo, int hi)
+{
+    return min(min(max((seq_kv + chunk - 1) / chunk, lo), hi), max(seq_kv, 1));
+}
+
+// Grid: (splits for the longest length the launch may serve, n_kv); blocks past the device
+// length's own count leave.
 #define FDTC_PARTIAL_KERNEL(NAME, HD)                                          \
 extern "C" __global__ void NAME(                                              \
     const void * __restrict__ K_blocks, const void * __restrict__ V_blocks,   \
     const half * __restrict__ Q, float * __restrict__ partials,               \
     const int32_t * __restrict__ seq_kv_dev,                                  \
-    int n_kv, int n_q_per_kv, int qlen, int nsplit, float scale)              \
+    int n_kv, int n_q_per_kv, int qlen, int chunk, int lo, int hi,           \
+    float scale)                                                              \
 {                                                                             \
+    const int nsplit = fdtc_nsplit(seq_kv_dev[0] + 1, chunk, lo, hi);         \
+    if ((int)blockIdx.x >= nsplit) return;                                    \
     flashdecode_tc_partial_inner<HD>(                                         \
         K_blocks, V_blocks, Q, partials, seq_kv_dev,                          \
         n_kv, n_q_per_kv, qlen, nsplit, scale,                                \
@@ -242,8 +255,10 @@ static __device__ __forceinline__ void flashdecode_tc_combine_inner(
 
 #define FDTC_COMBINE_KERNEL(NAME, HD)                                          \
 extern "C" __global__ void NAME(                                              \
-    const float * __restrict__ partials, half * __restrict__ out, int nsplit) \
+    const float * __restrict__ partials, half * __restrict__ out,             \
+    const int32_t * __restrict__ seq_kv_dev, int chunk, int lo, int hi)       \
 {                                                                             \
+    const int nsplit = fdtc_nsplit(seq_kv_dev[0] + 1, chunk, lo, hi);         \
     flashdecode_tc_combine_inner<HD>(partials, out, nsplit, blockIdx.x, threadIdx.x); \
 }
 
@@ -251,20 +266,24 @@ FDTC_COMBINE_KERNEL(flashdecode_tc_combine_hd128, 128)
 
 // -- Host launchers (extern "C", driven from inference::flash_decode_tc) ------
 // Q is f16 [16, HD] (caller pads Mrows->16, zeroing the unused rows). partials is
-// f32 [Mrows*nsplit*(HD+2)] scratch. out is f16 [Mrows, HD]. seq_kv_dev is the
-// device int (count = *seq_kv_dev + 1). All pointers device.
+// f32 [Mrows*hi*(HD+2)] scratch. out is f16 [Mrows, HD]. seq_kv_dev is the
+// device int (count = *seq_kv_dev + 1). All pointers device. `grid_splits` sizes
+// the partial grid for the longest length the launch may serve; (chunk, lo, hi) is
+// the split schedule the kernels apply to the device length.
 extern "C" void flashdecode_tc_hd128(
     const void * K_blocks, const void * V_blocks, const void * Q,
     float * partials, const int32_t * seq_kv_dev, void * out,
-    int n_kv, int n_q_per_kv, int qlen, int nsplit, float scale,
+    int n_kv, int n_q_per_kv, int qlen, int grid_splits,
+    int chunk, int lo, int hi, float scale,
     long long stream_i64)
 {
     cudaStream_t stream = (cudaStream_t)stream_i64;
     const int total_rows = n_kv * n_q_per_kv * qlen;  // n_q_heads * qlen
-    dim3 g1(nsplit, n_kv, 1), b1(32, 1, 1);
+    dim3 g1(grid_splits, n_kv, 1), b1(32, 1, 1);
     flashdecode_tc_partial_hd128<<<g1, b1, 0, stream>>>(
         K_blocks, V_blocks, (const half *)Q, partials, seq_kv_dev,
-        n_kv, n_q_per_kv, qlen, nsplit, scale);
+        n_kv, n_q_per_kv, qlen, chunk, lo, hi, scale);
     dim3 g2(total_rows, 1, 1), b2(32, 1, 1);
-    flashdecode_tc_combine_hd128<<<g2, b2, 0, stream>>>(partials, (half *)out, nsplit);
+    flashdecode_tc_combine_hd128<<<g2, b2, 0, stream>>>(
+        partials, (half *)out, seq_kv_dev, chunk, lo, hi);
 }

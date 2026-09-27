@@ -158,6 +158,22 @@ impl Q8KvCache {
         self.head_dim
     }
 
+    /// The longest sequence a device-length attention launch serves: the current length
+    /// eagerly, the capacity when recorded (a graph replays no further than the capacity).
+    fn launch_len(&self) -> usize {
+        if capture_active_on(&self.cuda_device.cuda_stream()) {
+            self.core.cap()
+        } else {
+            self.core.len()
+        }
+    }
+
+    /// A recorded kernel is the one an eager step picks only up to `bound` keys (see
+    /// `KvCore::note_kernel_bound`).
+    pub fn note_kernel_bound(&self, bound: usize) {
+        self.core.note_kernel_bound(bound);
+    }
+
     /// Padded stride used by the graph-safe attention kernels (see `KvCore::padded_stride`).
     pub fn max_seq_padded(&self) -> usize {
         self.core.padded_stride(Q8_0_BLOCK_SIZE)
@@ -1257,6 +1273,7 @@ impl Q8KvCache {
             )
             .map_err(|e| anyhow!("Q8KvCache: attn_flash_splitk_q8_decode_dev_pos kernel: {e}"))?
         } else {
+            let longest = self.launch_len();
             crate::inference::quantized_cuda::attn_flash_splitk_q8_gqa_decode_dev_pos(
                 &self.k_q8,
                 &self.v_q8,
@@ -1265,7 +1282,7 @@ impl Q8KvCache {
                 self.head_dim,
                 self.n_kv_heads,
                 n_q_per_kv,
-                self.core.len(),
+                longest,
                 scale,
                 &self.cuda_device,
             )
@@ -1336,6 +1353,7 @@ impl Q8KvCache {
         };
         let q_view = q_cuda.as_cuda_slice::<half::f16>()?;
 
+        let longest = self.launch_len();
         let out_storage = flash_decode_tc_q8_gqa(
             &self.k_q8,
             &self.v_q8,
@@ -1345,7 +1363,7 @@ impl Q8KvCache {
             self.n_kv_heads,
             n_q_per_kv,
             1, // qlen (decode)
-            self.core.len(),
+            longest,
             scale,
             &self.cuda_device,
         )

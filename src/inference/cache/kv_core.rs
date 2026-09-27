@@ -53,6 +53,9 @@ pub struct KvCore {
     /// Padded stride most recently used by a fixed-stride attention chain since the last
     /// capture cycle; 0 = none. Written from `&self` attention calls, hence atomic.
     chain_stride_seen: AtomicUsize,
+    /// Longest sequence the kernels recorded since the last capture cycle serve as an eager
+    /// step would; 0 = none. Written from `&self` attention calls.
+    kernel_bound_seen: AtomicUsize,
 }
 
 impl KvCore {
@@ -65,6 +68,7 @@ impl KvCore {
             captured: false,
             seq_limit: None,
             chain_stride_seen: AtomicUsize::new(0),
+            kernel_bound_seen: AtomicUsize::new(0),
         }
     }
 
@@ -159,21 +163,35 @@ impl KvCore {
     }
 
     /// A graph recorded against the buffers is now live: freezes growth, and bounds replays by
-    /// the capacity and by the stride of a fixed-stride chain if one was recorded.
+    /// the capacity, by the stride of a fixed-stride chain if one was recorded, and by the
+    /// longest sequence its recorded kernels serve as an eager step would.
     pub fn mark_captured(&mut self) {
         self.captured = true;
-        let stride = self.chain_stride_seen.load(Ordering::Relaxed);
-        self.seq_limit = Some(if stride > 0 {
-            self.cap.min(stride)
-        } else {
-            self.cap
-        });
+        let limit = [
+            self.chain_stride_seen.load(Ordering::Relaxed),
+            self.kernel_bound_seen.load(Ordering::Relaxed),
+        ]
+        .into_iter()
+        .filter(|&b| b > 0)
+        .fold(self.cap, usize::min);
+        self.seq_limit = Some(limit);
     }
 
     pub fn clear_captured(&mut self) {
         self.captured = false;
         self.seq_limit = None;
         self.chain_stride_seen.store(0, Ordering::Relaxed);
+        self.kernel_bound_seen.store(0, Ordering::Relaxed);
+    }
+
+    /// A kernel ran that serves sequences of at most `bound` keys as an eager step would; a
+    /// graph recorded now replays no further.
+    pub fn note_kernel_bound(&self, bound: usize) {
+        let _ = self
+            .kernel_bound_seen
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seen| {
+                (seen == 0 || bound < seen).then_some(bound)
+            });
     }
 
     pub fn seq_limit(&self) -> Option<usize> {
@@ -284,6 +302,19 @@ mod tests {
         c.note_chain_stride(512);
         c.mark_captured();
         assert_eq!(c.seq_limit(), Some(512));
+    }
+
+    #[test]
+    fn a_graph_stops_where_a_recorded_kernel_would_be_left() {
+        let mut c = KvCore::new(4096, 32768);
+        c.note_kernel_bound(1023);
+        c.note_kernel_bound(511);
+        c.note_kernel_bound(2047);
+        c.mark_captured();
+        assert_eq!(c.seq_limit(), Some(511));
+        c.clear_captured();
+        c.mark_captured();
+        assert_eq!(c.seq_limit(), Some(4096));
     }
 
     #[test]
