@@ -773,8 +773,8 @@ fn build_generic_layer(
         attn_v_norm_ones,
         attn_output,
         attn_output_bias,
-        // SmolLM3 NoPE: RoPE is skipped on every 4th layer ((idx+1)%4==0).
-        no_rope: config.arch == "smollm3" && (raw.layer_idx + 1).is_multiple_of(4),
+        no_rope: no_rope_layer_period(&config.arch)
+            .is_some_and(|period| (raw.layer_idx + 1).is_multiple_of(period)),
         attn_norm,
         attn_norm_weight_f32,
         post_attn_norm,

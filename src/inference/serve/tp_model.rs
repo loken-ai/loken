@@ -9,7 +9,8 @@
 //! all-reduce). Built entirely on the validated `tp_decode` primitives (TpColumn/TpRow/
 //! all_reduce_sum) - see `bin/tp_{weight_slice,ffn,attn,layer,gqa}_test`.
 //!
-//! Scope: decode-first, qwen2 only (GQA + QKV bias + interleaved RoPE). Loader slices each
+//! Scope: decode-first; `tp_support::tensor_parallel_support` decides from the file's
+//! tensors and metadata which models this decoder runs. Loader slices each
 //! layer's weights across the 2 GPUs; forward keeps the hidden state replicated and reduces
 //! once per attention + once per FFN. Per-rank KV cache holds that rank's kv-head subset.
 
@@ -19,6 +20,7 @@ use anyhow::{bail, Result};
 use std::io::Cursor;
 use std::sync::Arc;
 
+use crate::inference::generic_transformer::rope_pairing;
 use crate::inference::serve::tp_decode::{
     all_reduce_sum_nccl, all_reduce_sum_nccl_f16, make_comms, TpColumn, TpColumnFused, TpRow,
 };
@@ -105,8 +107,8 @@ pub struct TpConfig {
     pub rope_base: f32,
     pub eps: f64,
     pub vocab: usize,
-    /// Interleaved (llama/mistral) vs non-interleaved/NeoX (qwen2 and most others) RoPE.
-    /// Mirrors GenericHetero's `use_rope_i: matches!(arch, "llama"|"mistral"|"mistral3")`.
+    /// Adjacent-pair (interleaved) RoPE when true, half-split (NeoX) otherwise, from the
+    /// shared `rope_pairing` table.
     pub use_rope_i: bool,
 }
 
@@ -133,7 +135,7 @@ impl TpConfig {
             eps: meta_f32(ct, &format!("{arch}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-5)
                 as f64,
             vocab,
-            use_rope_i: matches!(arch, "llama" | "mistral" | "mistral3"),
+            use_rope_i: rope_pairing(arch).map_err(anyhow::Error::msg)?,
         })
     }
 }

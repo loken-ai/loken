@@ -371,6 +371,16 @@ pub fn rope_pairing(arch: &str) -> std::result::Result<bool, String> {
     }
 }
 
+/// Period of the layers that skip RoPE (NoPE): layer `i` skips it when `(i + 1)` is a
+/// multiple of the period. None when every layer rotates. GGUF does not carry this, so it
+/// follows the architecture, as the reference does.
+pub fn no_rope_layer_period(arch: &str) -> Option<usize> {
+    match arch {
+        "smollm3" => Some(4),
+        _ => None,
+    }
+}
+
 /// Panicking wrapper for the config builder, which has no error path here. The
 /// message names the file and the choice, so an unclassified architecture stops
 /// at load with an instruction rather than serving wrong answers.

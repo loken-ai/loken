@@ -1217,42 +1217,27 @@ impl LlmEngine {
                 // o and down row-parallel joined by an all-reduce. A model that DOES fit one
                 // card stays on the single-card path, which is faster still - the guard is the
                 // whole point, and it is derived from the weights rather than named per model.
+                // Which files the decoder computes correctly is read from their tensors and
+                // metadata by `tensor_parallel_support`.
                 #[cfg(feature = "cuda")]
-                "qwen2" if !model_fits_single_gpu && model_fits_gpu && cuda_devices.len() >= 2 => {
-                    info!("⬇️  Loading qwen2 as TpQwen2 - TP=2 across GPU {} + {}",
-                        cuda_devices[0].0, cuda_devices[1].0);
+                _ if !model_fits_single_gpu && model_fits_gpu
+                    && cuda_devices.len() >= crate::inference::serve::tp_support::TP_RANKS
+                    && crate::inference::serve::tp_support::tensor_parallel_support(&content, &arch)
+                        .inspect_err(|why| info!("{arch} stays off tensor parallelism: {why}"))
+                        .is_ok() => {
+                    let ranks = crate::inference::serve::tp_support::TP_RANKS;
+                    info!("⬇️  Loading {} as TpQwen2 - TP={} across GPU {} + {}",
+                        arch, ranks, cuda_devices[0].0, cuda_devices[1].0);
                     let g0 = crate::tensor::Device::new_cuda(cuda_devices[0].0)
                         .map_err(|e| anyhow!("TpQwen2 cuda:{}: {e}", cuda_devices[0].0))?;
                     let g1 = crate::tensor::Device::new_cuda(cuda_devices[1].0)
                         .map_err(|e| anyhow!("TpQwen2 cuda:{}: {e}", cuda_devices[1].0))?;
                     match crate::inference::serve::tp_model::TpQwen2::from_gguf(mmap_bytes, &mmap, &arch, g0, g1) {
                         Ok(m) => {
-                            info!("✅ qwen2 loaded as TpQwen2 (tensor-parallel across 2 GPUs)");
+                            info!("✅ {} loaded as TpQwen2 (tensor-parallel across {} GPUs)", arch, ranks);
                             Box::new(TpQwen2Backend(m))
                         }
-                        Err(e) => return Err(anyhow!("TpQwen2 load failed: {e}")),
-                    }
-                }
-                // Same for the dense no-bias archs - the 24B llama/mistral family. Dense only:
-                // expert_count == 0 excludes mixtral, which also reports arch="llama" and whose
-                // routed FFN this decoder does not implement. The QKV bias is read only when the
-                // file has one, which is what lets these archs share the qwen2 decoder.
-                #[cfg(feature = "cuda")]
-                "llama" | "mistral" | "mistral3"
-                    if !model_fits_single_gpu && model_fits_gpu && cuda_devices.len() >= 2
-                        && get_gguf_u32(&content, &format!("{arch}.expert_count")).unwrap_or(0) == 0 => {
-                    info!("⬇️  Loading {} as TpQwen2 (dense) - TP=2 across GPU {} + {}",
-                        arch, cuda_devices[0].0, cuda_devices[1].0);
-                    let g0 = crate::tensor::Device::new_cuda(cuda_devices[0].0)
-                        .map_err(|e| anyhow!("TP dense cuda:{}: {e}", cuda_devices[0].0))?;
-                    let g1 = crate::tensor::Device::new_cuda(cuda_devices[1].0)
-                        .map_err(|e| anyhow!("TP dense cuda:{}: {e}", cuda_devices[1].0))?;
-                    match crate::inference::serve::tp_model::TpQwen2::from_gguf(mmap_bytes, &mmap, &arch, g0, g1) {
-                        Ok(m) => {
-                            info!("✅ {} loaded as TpQwen2 (tensor-parallel across 2 GPUs)", arch);
-                            Box::new(TpQwen2Backend(m))
-                        }
-                        Err(e) => return Err(anyhow!("TP dense ({arch}) load failed: {e}")),
+                        Err(e) => return Err(anyhow!("TpQwen2 ({arch}) load failed: {e}")),
                     }
                 }
                 "llama" | "mistral" | "mistral3" |

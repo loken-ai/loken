@@ -20,3 +20,5 @@ pub mod speculative_config;
 pub mod tp_decode;
 #[cfg(feature = "cuda")]
 pub mod tp_model;
+#[cfg(any(feature = "cuda", test))]
+pub mod tp_support;
