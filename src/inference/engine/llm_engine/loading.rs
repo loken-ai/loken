@@ -461,8 +461,7 @@ impl LlmEngine {
             if kv_quant_supported {
                 crate::inference::quantized_cuda::prewarm_shape(head_dim, n_q_per_kv);
             }
-            // The KV precision follows the architecture: what the quantised kernels can
-            // serve, then what each family was measured to prefer.
+            // The KV precision follows what the quantised kernels can serve.
             let kv_quant = if !kv_quant_supported && !matches!(kv_quant, KvQuant::Off) {
                 warn!(
                     "⚠️  Q8/Q4 KV cache kernels don't support head_dim={} x n_q_per_kv={}. Auto-downgrading kv_quant to Off for {}.",
@@ -475,61 +474,16 @@ impl LlmEngine {
                 // loader - decode +17%.
                 info!("Auto-promoting kv_quant Off -> Q4 for arch={arch}");
                 KvQuant::Q4
-            } else if kv_quant_supported && matches!(kv_quant, KvQuant::Off)
-                && matches!(arch.as_str(), "llama" | "qwen2" | "qwen3" | "mistral3"
-                                         | "granite" | "granitemoe" | "olmoe") {
-                // granite and granitemoe joined on their own A/B against the
-                // F-dtype cache they were left on: both decode materially faster,
-                // and the dense one additionally starts capturing a decode graph
-                // that the F-dtype cache had refused. The routed one gains WITHOUT
-                // capture, so its win is the cache's memory traffic rather than
-                // submission cost.
-                //
-                // olmoe is held out, and it is the interesting case: it decodes
-                // faster here AND returns full answers, right up until a request
-                // REUSES a cached prefix - from the second request onward it stops
-                // a fraction of the way through on a malformed token. Measured
-                // three ways on the same cell: quantized + reuse truncates,
-                // F-dtype + reuse is correct, quantized with reuse disabled is
-                // correct and still faster than F-dtype. So neither the cache nor
-                // the reuse is wrong alone; the pair is, and until that is
-                // understood the model keeps the cache that answers correctly.
-                // Suppressing reuse for it would be the better trade, but only
-                // once the engine can decide that from a property rather than
-                // from this model's name.
-                //
-                // Auto-promote llama/qwen2/mistral3-arch models (devstral,
-                // devstral-small-2, deepcoder, mistral, qwen2-family) to Q8 KV.
-                // mistral3: rerouted from the legacy MultiDeviceMistral3
-                // path (which had F-dtype KV only) into GenericHetero - Q8 KV is one
-                // of the optimizations it now inherits. It also fixes a first-forward
-                // OOM: F-dtype KV reserved the full 32K context up-front and the
-                // fill-first planner over-packed GPU0; Q8 lazy-grows from a 4096 cap.
-                // Engages the GH_APQ
-                // fast-decode path. Q4 was tried for qwen2 (deepcoder)
-                // REGRESSED decode -28% vs Q8 under the
-                // 2-GPU split. Re-tested post lazy-KV single-GPU
-                // (commit 0ca111c): still REGRESSED (-4 to -5 % across
-                // short/medium/long). Q8 wins regardless of placement.
-                info!("Auto-promoting kv_quant Off -> Q8 for arch={arch} (enables GH_APQ fast-decode)");
-                KvQuant::Q8
-            } else if matches!(arch.as_str(), "phi2")
-                && matches!(kv_quant, KvQuant::Off)
-            {
-                // Auto-promote phi2 (moondream) KV to Q8. Re-verified
-                // With all session optimizations: F-dtype 260
-                // tok/s vs Q8 347 tok/s -> Q8 +33% faster.
-                info!("Auto-promoting kv_quant Off -> Q8 for arch=phi2 (GH_APQ partial-rope fast-decode)");
+            } else if kv_quant_supported && matches!(kv_quant, KvQuant::Off) {
+                // Every model the quantised kernels serve takes a Q8 cache: half the bytes
+                // per token read at each decode step, reference-grade accuracy (Q8_0 KV
+                // perplexity sits within the F16 error bars), and the device-position
+                // kernels a captured decode graph needs. The models kept off it are decided
+                // above by what they are - a head shape the kernels do not cover, capped
+                // attention scores, gemma4's K-norm - not by a list of names.
+                info!("Auto-promoting kv_quant Off -> Q8 for arch={arch}");
                 KvQuant::Q8
             } else {
-                // gemma4 (dense + 26B-MoE): stay on Off -> F16 SpecKvCache with
-                // bounded sliding-window attention. gemma4's SWA layers attend only within a
-                // 512-token window, so the F16 cache is bounded to window+chunk
-                // keys (set_window in inference/generic_transformer/) - VRAM-cheap AND
-                // exact. This replaces the old Off->Q8/Q4 promotions, whose Q8/Q4
-                // KV degenerated gemma4's output at long context (tiny K-norm
-                // ~0.127 amplifies quant noise past the window). The full-F16
-                // global layers (1 in 6) keep correct long-range attention.
                 kv_quant
             };
 
