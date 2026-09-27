@@ -613,12 +613,6 @@ impl LlmEngine {
                     })
                     .collect();
 
-            // Primary GPU memory (for single-GPU decisions)
-            let (_free_gpu_memory, available_gpu_memory) = all_cuda_gpus.iter()
-                .find(|(idx, _, _)| *idx == gpu_idx)
-                .map(|(_, free, avail)| (*free, *avail))
-                .unwrap_or((0, 0));
-
             // Total available VRAM across all GPUs
             let total_available_gpu_memory: u64 = all_cuda_gpus.iter().map(|(_, _, avail)| avail).sum();
 
@@ -667,7 +661,6 @@ impl LlmEngine {
             } else {
                 opencl_devices
             };
-            let available_gpu_memory = if disable_cuda { 0 } else { available_gpu_memory };
 
             // Determine loading strategy:
             //   1. Model fits in GPU -> single-device GPU (CUDA)
@@ -713,6 +706,25 @@ impl LlmEngine {
                     .saturating_mul(4)
                     .saturating_mul(2);
                 kv.saturating_add(CUBLAS_WORKSPACE_BYTES).saturating_add(act)
+            };
+            // The primary card is the fastest one that holds the model whole; a faster card
+            // that other residents have filled does not make a model that fits a free one split
+            // across both. With no card holding it, the fastest stays primary.
+            let needed_on_one = file_size.saturating_add(runtime_reserve_bytes);
+            let gpu_idx = match device_index {
+                Some(i) => i,
+                None => all_cuda_gpus
+                    .iter()
+                    .find(|(_, _, avail)| needed_on_one <= *avail)
+                    .map_or(gpu_idx, |(i, _, _)| *i),
+            };
+            let available_gpu_memory = if disable_cuda {
+                0
+            } else {
+                all_cuda_gpus
+                    .iter()
+                    .find(|(idx, _, _)| *idx == gpu_idx)
+                    .map_or(0, |(_, _, avail)| *avail)
             };
             let model_fits_single_gpu = file_size > 0
                 && available_gpu_memory > 0
