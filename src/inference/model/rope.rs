@@ -186,6 +186,8 @@ pub struct RopeTable {
     pub factored_freqs: Option<crate::tensor::Tensor>,
     pub head_dim: usize,
     pub rope_dim: usize,
+    /// Rotary base the layer's inverse frequencies are powers of.
+    pub base: f32,
     pub no_rope: bool,
     pub interleaved: bool,
 }
@@ -221,12 +223,7 @@ impl RopeTable {
         } else if let Some(factors) = self.freq_factors.as_ref() {
             let factors = factors.to_device(device)?;
             let inv_factors = factors.recip()?.unsqueeze(0)?;
-            let base = if self.rope_dim > 0 {
-                10000.0f32
-            } else {
-                1000000.0f32
-            };
-            let freqs: Vec<f32> = inverse_frequencies(self.head_dim, base);
+            let freqs: Vec<f32> = inverse_frequencies(self.head_dim, self.base);
             let freqs = Tensor::new(freqs, device)?.unsqueeze(0)?;
             let freqs = freqs.broadcast_mul(&inv_factors)?;
             let pos = Tensor::arange(index_pos as f32, (index_pos + seq_len) as f32)?
@@ -315,5 +312,44 @@ impl RopeTable {
             sin: sin.flatten_all()?.to_vec1_f32()?,
             interleaved: self.interleaved,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_with_freq_factors_rotate_by_the_table_base() -> Result<()> {
+        let device = Device::Cpu;
+        let head_dim = 8;
+        let base = 500_000f32;
+        let factors = [1f32, 2.0, 4.0, 8.0];
+        let (cos, sin) = precomput_freqs_cis_host(head_dim, 16, base, &device)?;
+        let table = RopeTable {
+            cos,
+            sin,
+            freq_factors: Some(Tensor::new(&factors[..], &device)?),
+            factored_freqs: None,
+            head_dim,
+            rope_dim: 0,
+            base,
+            no_rope: false,
+            interleaved: false,
+        };
+        let (index_pos, seq_len) = (3, 2);
+        let (cos, sin) = table.rows(index_pos, seq_len, &device)?;
+        let cos = cos.flatten_all()?.to_vec1_f32()?;
+        let sin = sin.flatten_all()?.to_vec1_f32()?;
+        let inv = inverse_frequencies(head_dim, base);
+        for row in 0..seq_len {
+            for (i, (&f, &factor)) in inv.iter().zip(factors.iter()).enumerate() {
+                let angle = (index_pos + row) as f32 * (f / factor);
+                let at = row * factors.len() + i;
+                assert!((cos[at] - angle.cos()).abs() < 1e-6, "cos[{row}][{i}]");
+                assert!((sin[at] - angle.sin()).abs() < 1e-6, "sin[{row}][{i}]");
+            }
+        }
+        Ok(())
     }
 }

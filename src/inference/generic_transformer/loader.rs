@@ -566,13 +566,13 @@ fn build_generic_layer(
 
     // Recompute RoPE when head_dim or rope_dim differs from the config-level precomputed tables.
     let effective_rope_dim = if rope_dim > 0 { rope_dim } else { head_dim };
+    let rope_base = if head_dim < config.head_dim {
+        // SWA layers (Gemma4) use a different RoPE freq base
+        config.rope_freq_base_swa.unwrap_or(config.rope_freq_base)
+    } else {
+        config.rope_freq_base
+    };
     let (cos, sin) = if head_dim != config.head_dim || rope_dim > 0 {
-        let rope_base = if head_dim < config.head_dim {
-            // SWA layers (Gemma4) use a different RoPE freq base
-            config.rope_freq_base_swa.unwrap_or(config.rope_freq_base)
-        } else {
-            config.rope_freq_base
-        };
         // YaRN applies to full-head-dim layers; SWA/partial layers (head_dim<config)
         // keep plain rope (their lower freq base already shortens their context).
         let yarn = if head_dim < config.head_dim {
@@ -982,7 +982,6 @@ fn build_generic_layer(
             let factors = rope_freq_factors.as_ref().unwrap().to_device(device)?;
             let half_dim = effective_rope_dim / 2;
             if factors.elem_count() == half_dim {
-                let rope_base = config.rope_freq_base;
                 let factors_f32 = if factors.dtype() == crate::tensor::DType::F32 {
                     factors.clone()
                 } else {
@@ -1028,6 +1027,7 @@ fn build_generic_layer(
             }
         },
         rope_dim,
+        rope_base,
         attention_scale: config.attention_scale,
         attn_softcap: config.attn_logit_softcapping.map(|c| c as f32),
         residual_scale: config.residual_scale,
@@ -1321,6 +1321,7 @@ fn build_awq_layer(
         head_dim,
         sliding_window: None,
         rope_dim: 0,
+        rope_base: config.rope_freq_base,
         no_rope: false,
         attention_scale: config.attention_scale,
         attn_softcap: config.attn_logit_softcapping.map(|c| c as f32),

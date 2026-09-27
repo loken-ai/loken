@@ -15,10 +15,10 @@ impl GenericTransformerLayer {
     }
 
     /// Update pre-allocated RoPE buffers for a given position.
-    /// Call before graph replay so the graph reads correct cos/sin values.
+    /// Call before graph replay so the graph reads correct cos/sin values. The row comes from
+    /// the same rotary table as the eager path, frequency factors (llama3 scaling) included.
     pub fn update_rope_buffers(&mut self, index_pos: usize) -> Result<()> {
-        let cos_row = self.cos.narrow(0, index_pos, 1)?;
-        let sin_row = self.sin.narrow(0, index_pos, 1)?;
+        let (cos_row, sin_row) = self.rope_table().rows(index_pos, 1, &self.cos.device())?;
 
         // `force_contiguous()` always allocates fresh storage, unlike
         // `contiguous()` which returns a shared-storage handle when the
@@ -85,6 +85,7 @@ impl GenericTransformerLayer {
             factored_freqs: self.rope_factored_freqs.clone(),
             head_dim: self.head_dim,
             rope_dim: self.rope_dim,
+            base: self.rope_base,
             no_rope: self.no_rope,
             interleaved: self.flags.use_rope_i,
         }

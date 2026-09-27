@@ -302,6 +302,9 @@ pub struct GenericTransformerLayer {
     pub sliding_window: Option<usize>,
     /// Partial RoPE: only apply to first `rope_dim` of `head_dim` dims (0 = full)
     pub rope_dim: usize,
+    /// Rotary base this layer's frequencies are powers of: the SWA base on a
+    /// sliding-window layer that has one, the model's `rope.freq_base` otherwise.
+    pub rope_base: f32,
     /// NoPE (SmolLM3): this layer skips RoPE entirely (RoPE-free layer).
     pub no_rope: bool,
     /// Custom attention scale (None = use 1/√head_dim)
