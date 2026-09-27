@@ -167,3 +167,87 @@ fn every_admitted_head_shape_decodes_like_the_reference() {
     }
     assert!(failures.is_empty(), "{failures:?}");
 }
+
+/// The split-K flash decode at the lengths a conversation reaches: its split count grows with
+/// the cache, so a shape right at forty positions says nothing about one at two thousand.
+#[test]
+fn flash_decode_matches_the_reference_at_long_lengths() {
+    let Ok(dev) = CudaDevice::new(0) else {
+        eprintln!("no CUDA device; the split-K flash decode NOT covered by this run");
+        return;
+    };
+    let stream = dev.native().stream();
+    let mut failures = Vec::new();
+    for hd in FLASH_HEAD_DIMS {
+        for nqpk in [1usize, 4, 8] {
+            for seq in [40usize, 1100, 1200, 1500, 2100, 4000] {
+                let n_q = N_KV * nqpk;
+                let blocks = seq * N_KV * (hd / 32);
+                let blob = |salt: usize| {
+                    let mut b = Vec::with_capacity(blocks * 34);
+                    let mut v = Vec::with_capacity(blocks * 32);
+                    for i in 0..blocks {
+                        let d = half::f16::from_f32(0.02 + ((i + salt) % 5) as f32 * 0.003);
+                        b.extend_from_slice(&d.to_le_bytes());
+                        for j in 0..32 {
+                            let q = (((i * 7 + j * 3 + salt) % 23) as i32 - 11) as i8;
+                            b.push(q as u8);
+                            v.push(q as f32 * d.to_f32());
+                        }
+                    }
+                    (b, v)
+                };
+                let (kb, kf) = blob(1);
+                let (vb, vf) = blob(4);
+                let scale = 1.0 / (hd as f32).sqrt();
+                let q: Vec<f32> = (0..n_q * hd)
+                    .map(|i| ((i * 13 % 97) as f32) * 0.02 - 0.9)
+                    .collect();
+                let mut want = vec![0f32; n_q * hd];
+                for h in 0..n_q {
+                    let kv = h / nqpk;
+                    let s: Vec<f32> = (0..seq)
+                        .map(|t| {
+                            (0..hd)
+                                .map(|d| q[h * hd + d] * kf[(t * N_KV + kv) * hd + d])
+                                .sum::<f32>()
+                                * scale
+                        })
+                        .collect();
+                    let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let z: f32 = s.iter().map(|x| (x - m).exp()).sum();
+                    for d in 0..hd {
+                        want[h * hd + d] = (0..seq)
+                            .map(|t| (s[t] - m).exp() / z * vf[(t * N_KV + kv) * hd + d])
+                            .sum();
+                    }
+                }
+                let k_blob = stream.clone_htod(&kb).unwrap();
+                let v_blob = stream.clone_htod(&vb).unwrap();
+                let q_dev = stream.clone_htod(&q).unwrap();
+                let pos_dev = stream.clone_htod(&[(seq - 1) as i32]).unwrap();
+                let got = attn_flash_splitk_q8_gqa_decode_dev_pos(
+                    &k_blob,
+                    &v_blob,
+                    &q_dev.slice(..),
+                    &pos_dev,
+                    hd,
+                    N_KV,
+                    nqpk,
+                    seq,
+                    scale,
+                    &dev,
+                )
+                .unwrap();
+                let got = stream
+                    .clone_dtoh(got.as_cuda_slice::<f32>().unwrap())
+                    .unwrap();
+                let d = max_diff(&got, &want);
+                if d > 1e-3 {
+                    failures.push(format!("hd={hd} nq={nqpk} seq={seq} off by {d:.2e}"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
