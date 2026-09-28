@@ -579,6 +579,42 @@ pub fn load_whole_on<T>(
     Ok((built, built_on))
 }
 
+/// Run work that sits whole on one device and takes `need` bytes of card memory there: on
+/// each card of `cards` offering `need`, in their order, the next one when a card runs out of
+/// memory, then on the host when `host` is set. Any other failure skips the remaining cards.
+/// `None` when no card offered `need` and the host was not allowed.
+pub fn run_whole_on<T, E: std::fmt::Display>(
+    what: &str,
+    need: u64,
+    cards: &[(usize, u64)],
+    host: bool,
+    mut work: impl FnMut(&Device) -> Result<T, E>,
+) -> Option<Result<T, E>> {
+    let mut last = None;
+    for &(idx, _) in cards.iter().filter(|(_, free)| *free >= need) {
+        let device = device_of(DeviceKind::Cuda(idx));
+        if device.is_cpu() {
+            continue;
+        }
+        match work(&device) {
+            Ok(v) => return Some(Ok(v)),
+            Err(e) => {
+                let oom = is_out_of_memory(&e);
+                tracing::warn!("{what}: CUDA:{idx} failed ({e})");
+                last = Some(Err(e));
+                if !oom {
+                    break;
+                }
+                release_pools();
+            }
+        }
+    }
+    if host {
+        return Some(work(&Device::Cpu));
+    }
+    last
+}
+
 /// Whether the load running on this thread was cancelled.
 fn scoped_cancelled() -> bool {
     crate::inference::serve::cancel::scoped::bail().is_err()
@@ -982,6 +1018,17 @@ mod tests {
         });
         assert!(got.is_err());
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn whole_work_no_card_offers_room_for_runs_on_the_host_only_when_allowed() {
+        let cards = [(0, GB)];
+        let ran: Option<Result<bool, String>> =
+            run_whole_on("t", 2 * GB, &cards, true, |d| Ok(d.is_cpu()));
+        assert_eq!(ran, Some(Ok(true)));
+        let ran: Option<Result<bool, String>> =
+            run_whole_on("t", 2 * GB, &cards, false, |d| Ok(d.is_cpu()));
+        assert_eq!(ran, None);
     }
 
     #[test]

@@ -835,18 +835,11 @@ fn tokens_to_png(
     // DECIDE the decode device before running it. The tensor layer bounces an
     // individual op to the host when a device allocation fails, so a card that is
     // too tight does NOT return an error - it ping-pongs every convolution across
-    // PCIe and finishes minutes later, and the cascade below (which only fires on
-    // Err) never gets a chance. Measured on a 1024^2 decode next to a resident
-    // split DiT: 297 s of bouncing where a deliberate CPU decode is a fraction of
-    // that. So: fastest card that fits the transients, else the CPU, chosen here.
+    // PCIe and finishes minutes later. So only a card that fits the transients is
+    // tried, fastest first, the next one when a card still runs out, then the CPU.
     // Decoding in overlapping tiles bounds the peak by ONE tile instead of the whole
     // image, so the demand no longer grows with the requested resolution.
     let transient = VAE_TILE_TRANSIENT_BYTES;
-    let planned =
-        crate::inference::place::vram_manager::pick_device_for("qwen-image vae decode", transient)
-            .filter(|(_, free, _)| *free >= transient)
-            .map(|(_, _, d)| d)
-            .unwrap_or(Device::Cpu);
     // The resident decoder is pinned to `vae_device`; the CPU copy is the movable
     // one, so any other target is served by moving that copy.
     let decode_on = |dev: &Device, whole: bool| -> crate::tensor::Result<NT> {
@@ -858,7 +851,7 @@ fn tokens_to_png(
                 v.decode_spatial_tiled(&l, VAE_TILE_LATENT, VAE_TILE_OVERLAP)
             }
         };
-        if Device::same_device(dev, &state.vae_device) {
+        let img = if Device::same_device(dev, &state.vae_device) {
             tiled(&state.vae, dev)
         } else if let Some(cpu_vae) = &state.vae_cpu {
             if dev.is_cpu() {
@@ -868,16 +861,10 @@ fn tokens_to_png(
             }
         } else {
             tiled(&state.vae, &state.vae_device)
-        }
+        }?;
+        img.to_device(&Device::Cpu)
     };
-    if !Device::same_device(&planned, &state.vae_device) {
-        info!(
-            "Qwen-Image VAE decode: {} has no room for the {:.1} GB transients; decoding on {}",
-            dev_label(&state.vae_device),
-            transient as f64 / 1e9,
-            dev_label(&planned)
-        );
-    }
+    let cards = crate::inference::place::ladder::cards(0);
     // PREFER THE WHOLE-IMAGE DECODE when a card can hold it. This family tiled
     // unconditionally, on every path including the CPU one, and tiling is not free:
     // the decoder's mid-block attends over the WHOLE map, so a per-tile window lets
@@ -892,86 +879,33 @@ fn tokens_to_png(
     // Structural term only, WITHOUT the 2x margin the per-tile constant carries. That
     // margin exists to stop a "fits" verdict OOMing mid-decode, and here it is not
     // needed: the whole decode is only ATTEMPTED, and a failure falls through to the
-    // tiled path below rather than to the user. Carrying the margin made the estimate
-    // 8.6 GB against 5.6 GB free, so the whole decode was never once chosen and every
-    // render kept the tile seams.
+    // tiled path below rather than to the user.
     let whole_transient = (lh as u64 * 8) * (lw as u64 * 8) * 128 * 8 * 4;
-    let whole_dev = crate::inference::place::vram_manager::pick_device_for(
-        "qwen-image vae whole decode",
+    let whole_first = crate::inference::place::ladder::run_whole_on(
+        "Qwen-Image VAE whole decode",
         whole_transient,
+        &cards,
+        false,
+        |d| decode_on(d, true),
     )
-    .filter(|(_, free, _)| *free >= whole_transient)
-    .map(|(_, _, d)| d);
-    let whole_first: Option<NT> = whole_dev.and_then(|d| {
-        info!(
-            "Qwen-Image VAE: decoding whole on {} ({:.1} GB transients) - no tile seams",
-            dev_label(&d),
-            whole_transient as f64 / 1e9
-        );
-        match decode_on(&d, true) {
-            Ok(img) => img.to_device(&Device::Cpu).ok(),
-            Err(e) => {
-                info!("Qwen-Image VAE: whole decode did not complete ({e}); tiling instead");
-                None
-            }
+    .and_then(|r| match r {
+        Ok(img) => Some(img),
+        Err(e) => {
+            info!("Qwen-Image VAE: whole decode did not complete ({e}); tiling instead");
+            None
         }
     });
     let img = match whole_first {
         Some(img) => img,
-        None => match decode_on(&planned, false) {
-            Ok(img) => img.to_device(&Device::Cpu)?,
-            Err(e) => match &state.vae_cpu {
-                Some(cpu_vae) => {
-                    // The planned device still failed (an estimate can be wrong, or another
-                    // engine took the memory in between). Try the OTHER GPUs, fastest first,
-                    // before the slow CPU decode - the decoder weights are small, so moving
-                    // them to a card with room beats a host decode by an order of magnitude.
-                    let mut gpu_result = None;
-                    for (_, _, alt_dev) in crate::inference::place::vram_manager::probe(transient) {
-                        if Device::same_device(&alt_dev, &state.vae_device)
-                            || Device::same_device(&alt_dev, &planned)
-                        {
-                            continue;
-                        }
-                        info!(
-                            "Qwen-Image VAE decode on {} failed ({e}); retrying on {}",
-                            dev_label(&state.vae_device),
-                            dev_label(&alt_dev)
-                        );
-                        match cpu_vae.to_device(&alt_dev).and_then(|v| {
-                            v.decode_spatial_tiled(
-                                &lat.to_device(&alt_dev)?,
-                                VAE_TILE_LATENT,
-                                VAE_TILE_OVERLAP,
-                            )
-                        }) {
-                            Ok(img) => {
-                                gpu_result = Some(img.to_device(&Device::Cpu)?);
-                                break;
-                            }
-                            Err(e2) => info!(
-                                "Qwen-Image VAE decode retry on {} failed ({e2})",
-                                dev_label(&alt_dev)
-                            ),
-                        }
-                    }
-                    match gpu_result {
-                        Some(img) => img,
-                        None => {
-                            info!("Qwen-Image VAE decode falls back to CPU");
-                            cpu_vae
-                                .decode_spatial_tiled(
-                                    &lat.to_device(&Device::Cpu)?,
-                                    VAE_TILE_LATENT,
-                                    VAE_TILE_OVERLAP,
-                                )
-                                .map_err(|e2| anyhow!("Qwen-Image VAE CPU decode: {e2}"))?
-                        }
-                    }
-                }
-                None => return Err(anyhow!("Qwen-Image VAE decode: {e}")),
-            },
-        },
+        None => crate::inference::place::ladder::run_whole_on(
+            "Qwen-Image VAE decode",
+            transient,
+            &cards,
+            true,
+            |d| decode_on(d, false),
+        )
+        .unwrap_or_else(|| Err(crate::tensor::Error("no device to decode on".to_string())))
+        .map_err(|e| anyhow!("Qwen-Image VAE decode: {e}"))?,
     };
 
     // 4) Last 3 dims are [3, H, W], range ~[-1, 1] -> RGB PNG -> base64.
