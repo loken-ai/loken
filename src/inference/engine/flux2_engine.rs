@@ -11,8 +11,6 @@
 //! left over. That is the point of the model, and it means the usual pressure of a 20B DiT does
 //! not apply.
 
-use std::collections::HashMap;
-
 use anyhow::{anyhow, Result as AnyResult};
 use tracing::info;
 
@@ -22,7 +20,7 @@ use crate::inference::model::flux2::sampling;
 use crate::inference::model::flux2::textenc as cond;
 use crate::inference::model::flux2::vae::{self, Flux2Vae};
 use crate::inference::model::qwen3vl::textenc::{Config as EncConfig, Qwen3VlTextEncoder};
-use crate::inference::place::ladder::load_blocks;
+use crate::inference::place::ladder::load_blocks_reserving;
 use crate::tensor::{DType, Device, Tensor as NT};
 
 /// Relative locations under `huggingface_models_dir` - never absolute paths.
@@ -177,14 +175,6 @@ pub fn load(
         .map_err(|e| anyhow!("FLUX.2 tokenizer: {e}"))?;
 
     let reserve = runtime_headroom_bytes(hf_models_dir, geom.width, geom.height);
-    let mut cuda_devices: HashMap<usize, Device> = HashMap::new();
-    let dit_cuda: Vec<(usize, u64)> = crate::inference::place::vram_manager::probe(reserve)
-        .into_iter()
-        .map(|(i, f, d)| {
-            cuda_devices.insert(i, d);
-            (i, f)
-        })
-        .collect();
 
     // Hot DiT, its double then single blocks, run per sampling step.
     let dit_cfg = DitConfig::from_checkpoint(&dit_path).map_err(|e| anyhow!("FLUX.2 DiT: {e}"))?;
@@ -192,22 +182,16 @@ pub fn load(
     let dit_sz = hot_component_bytes(hf_models_dir);
     let dit_str = dit_path.to_string_lossy().to_string();
     info!(
-        "FLUX.2 DiT planning: needs {:.2} GB resident; per-GPU free after the {:.2} GB reserve = {:?}",
+        "FLUX.2 DiT planning: needs {:.2} GB resident beside a {:.2} GB reserve per card",
         dit_sz as f64 / 1e9,
         reserve as f64 / 1e9,
-        dit_cuda.iter().map(|(i, f)| format!("GPU{i}:{:.2}GB", *f as f64 / 1e9)).collect::<Vec<_>>()
     );
-    let dit = load_blocks(n_blocks, dit_sz, &dit_cuda, "FLUX.2 DiT", cancel, |plan| {
-        DitModel::load_hetero(&dit_str, &cuda_devices, plan, cancel).map_err(|e| anyhow!("{e}"))
+    let dit = load_blocks_reserving(n_blocks, dit_sz, reserve, "FLUX.2 DiT", cancel, |plan| {
+        DitModel::load_hetero(&dit_str, plan, cancel).map_err(|e| anyhow!("{e}"))
     })?;
     let dit_device = dit.input_device().clone();
 
-    // One-shot encoder: re-probe FREE (the DiT is resident now) and take what remains.
-    let enc_cuda: Vec<(usize, u64)> = crate::inference::place::vram_manager::probe(reserve)
-        .into_iter()
-        .filter(|(i, _, _)| cuda_devices.contains_key(i))
-        .map(|(i, f, _)| (i, f))
-        .collect();
+    // One-shot encoder: placed on what the cards offer with the DiT resident.
     let enc_cfg =
         EncConfig::from_checkpoint(&shards).map_err(|e| anyhow!("FLUX.2 encoder: {e}"))?;
     cond::check_context(enc_cfg.hidden, dit_cfg.joint_attention_dim).map_err(|e| anyhow!("{e}"))?;
@@ -231,15 +215,14 @@ pub fn load(
             .sum()
     };
     let refs: Vec<&str> = shards.iter().map(String::as_str).collect();
-    let encoder = load_blocks(
+    let encoder = load_blocks_reserving(
         enc_cfg.n_layers,
         enc_sz,
-        &enc_cuda,
+        reserve,
         "FLUX.2 encoder",
         cancel,
         |plan| {
-            Qwen3VlTextEncoder::load_cfg(&refs, enc_cfg, &cuda_devices, plan, cancel)
-                .map_err(|e| anyhow!("{e}"))
+            Qwen3VlTextEncoder::load_cfg(&refs, enc_cfg, plan, cancel).map_err(|e| anyhow!("{e}"))
         },
     )?;
 

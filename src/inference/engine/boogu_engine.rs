@@ -13,10 +13,9 @@ use anyhow::{anyhow, Result as AnyResult};
 use crate::inference::model::boogu::dit::BooguTransformer2DModel;
 use crate::inference::model::flux::vae::{AutoEncoder, Config as VaeConfig};
 use crate::inference::model::qwen3vl::textenc::Qwen3VlTextEncoder;
-use crate::inference::place::ladder::load_blocks;
+use crate::inference::place::ladder::load_blocks_reserving;
 use crate::tensor::DType;
 use crate::tensor::{Device, Tensor as NT};
-use std::collections::HashMap;
 
 /// Relative paths under `huggingface_models_dir`.
 const REL_DIT: &str = "boogu/diffusion_models/boogu_image_turbo_fp8_scaled.safetensors";
@@ -188,10 +187,9 @@ pub fn load(
     // nothing is dropped for text-to-image.
     let drop_idx = 0usize;
 
-    // Placement is decided by the adaptive HeteroPlan (fastest-GPU-first, spill to the next GPU
-    // then CPU) - NEVER a hardcoded device. Probe once for the device handles (shared by BOTH
-    // models so their cross-device transfers see the same physical devices); plan the DiT, then
-    // re-probe the FREE amounts (the DiT is now resident) and plan the encoder on what remains.
+    // Placement is decided by the ladder (fastest-GPU-first, spill to the next GPU then CPU) -
+    // NEVER a hardcoded device. The DiT is placed first; the encoder is placed on what the
+    // cards offer once the DiT is resident.
     let _ = primary; // placement comes from the plan, not the caller's hint
     let gpu_reserve = runtime_headroom_bytes(geom.width, geom.height);
     tracing::info!(
@@ -200,14 +198,6 @@ pub fn load(
         geom.height,
         gpu_reserve as f64 / 1e9
     );
-    let mut cuda_devices: HashMap<usize, Device> = HashMap::new();
-    let dit_cuda: Vec<(usize, u64)> = crate::inference::place::vram_manager::probe(gpu_reserve)
-        .into_iter()
-        .map(|(i, f, d)| {
-            cuda_devices.insert(i, d);
-            (i, f)
-        })
-        .collect();
     let dit_sz = std::fs::metadata(&dit_path).map(|m| m.len()).unwrap_or(0);
     // The plan distributes the main stack, double-stream then single-stream blocks. Undivided
     // on the fastest GPU that fits (hot path); OOM-fallback cascade -> split -> CPU (never OOM).
@@ -218,18 +208,18 @@ pub fn load(
         .map_err(|e| anyhow!("Boogu DiT: {e}"))?
         .stack_blocks();
     let dit_path_str = dit_path.to_string_lossy().to_string();
-    let dit = load_blocks(dit_blocks, dit_sz, &dit_cuda, "Boogu DiT", cancel, |plan| {
-        BooguTransformer2DModel::load_cancellable(&dit_path_str, &cuda_devices, plan, cancel)
-            .map_err(|e| anyhow!("{e}"))
-    })?;
+    let dit = load_blocks_reserving(
+        dit_blocks,
+        dit_sz,
+        gpu_reserve,
+        "Boogu DiT",
+        cancel,
+        |plan| {
+            BooguTransformer2DModel::load_cancellable(&dit_path_str, plan, cancel)
+                .map_err(|e| anyhow!("{e}"))
+        },
+    )?;
 
-    // Re-probe FREE VRAM (the DiT is now resident); reuse the SAME device handles for the encoder so
-    // its output and the DiT input reference the same physical devices.
-    let enc_cuda: Vec<(usize, u64)> = crate::inference::place::vram_manager::probe(gpu_reserve)
-        .into_iter()
-        .filter(|(i, _, _)| cuda_devices.contains_key(i))
-        .map(|(i, f, _)| (i, f))
-        .collect();
     let enc_sz = std::fs::metadata(&enc_path).map(|m| m.len()).unwrap_or(0);
     // One-shot encoder: best-fit remaining device (undivided on the fastest GPU that still fits,
     // e.g. GPU1 whole rather than splitting GPU0's leftover); same OOM-fallback cascade.
@@ -238,14 +228,14 @@ pub fn load(
             .map_err(|e| anyhow!("Boogu encoder: {e}"))?
             .n_layers;
     let enc_path_str = enc_path.to_string_lossy().to_string();
-    let encoder = load_blocks(
+    let encoder = load_blocks_reserving(
         enc_layers,
         enc_sz,
-        &enc_cuda,
+        gpu_reserve,
         "Boogu encoder",
         cancel,
         |plan| {
-            Qwen3VlTextEncoder::load_cancellable(&enc_path_str, &cuda_devices, plan, cancel)
+            Qwen3VlTextEncoder::load_cancellable(&enc_path_str, plan, cancel)
                 .map_err(|e| anyhow!("{e}"))
         },
     )?;

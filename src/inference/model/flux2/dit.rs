@@ -547,7 +547,6 @@ impl Model {
     /// anything else is read as a GGUF.
     pub fn load_hetero(
         path: &str,
-        cuda_devices: &std::collections::HashMap<usize, Device>,
         plan: &crate::inference::place::layer_executor::HeteroPlan,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
     ) -> Result<Self> {
@@ -558,7 +557,6 @@ impl Model {
         // a block dtype over from another family; measure it per model.
         Self::load_hetero_as(
             path,
-            cuda_devices,
             plan,
             cancel,
             crate::tensor::quantized::GgmlDType::Q8_0,
@@ -571,7 +569,6 @@ impl Model {
     /// a distinction no amount of staring at a single error figure can make.
     pub fn load_hetero_as(
         path: &str,
-        cuda_devices: &std::collections::HashMap<usize, Device>,
         plan: &crate::inference::place::layer_executor::HeteroPlan,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
         weight_dtype: crate::tensor::quantized::GgmlDType,
@@ -594,8 +591,7 @@ impl Model {
         };
 
         let n_blocks = cfg.num_layers + cfg.num_single_layers;
-        let block_dev =
-            crate::inference::model::qwen_image::dit::plan_block_devices(plan, cuda_devices);
+        let block_dev = crate::inference::place::ladder::layer_devices(plan, plan.total_layers);
         if block_dev.len() != n_blocks {
             return Err(crate::tensor::Error(format!(
                 "flux2 DiT: plan has {} blocks, expected {n_blocks}",

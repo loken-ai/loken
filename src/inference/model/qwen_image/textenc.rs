@@ -48,26 +48,6 @@ pub struct Qwen2TextEncoder {
     output_device: Device,
 }
 
-/// Flatten a `HeteroPlan` into one `Device` per layer (the plan owns placement - NEVER hardcode a
-/// device). `DeviceKind::Cuda(i)` resolves via the probed `cuda_devices` map; CPU/OpenCL -> CPU.
-fn plan_layer_devices(
-    plan: &crate::inference::place::layer_executor::HeteroPlan,
-    cuda_devices: &std::collections::HashMap<usize, Device>,
-) -> Vec<Device> {
-    use crate::inference::place::layer_executor::DeviceKind;
-    let mut out = Vec::with_capacity(plan.total_layers);
-    for seg in &plan.segments {
-        let dev = match seg.kind {
-            DeviceKind::Cuda(i) => cuda_devices.get(&i).cloned().unwrap_or(Device::Cpu),
-            _ => Device::Cpu,
-        };
-        for _ in seg.layer_start..seg.layer_end {
-            out.push(dev.clone());
-        }
-    }
-    out
-}
-
 /// Dequantize a small GGUF tensor (norm/bias/embed) to a native F32 tensor on `device`.
 fn dq_t(
     content: &crate::tensor::quantized::gguf_file::Content,
@@ -100,7 +80,6 @@ impl Qwen2TextEncoder {
     /// (if present) is ignored - only the text `blk.{i}.*` layers + token_embd + output_norm.
     pub fn from_gguf_hetero(
         path: &str,
-        cuda_devices: &std::collections::HashMap<usize, Device>,
         plan: &crate::inference::place::layer_executor::HeteroPlan,
     ) -> crate::tensor::Result<Self> {
         use crate::tensor::quantized::gguf_file;
@@ -130,7 +109,7 @@ impl Qwen2TextEncoder {
                 )))
             }
         };
-        let layer_dev = plan_layer_devices(plan, cuda_devices);
+        let layer_dev = crate::inference::place::ladder::layer_devices(plan, plan.total_layers);
         if layer_dev.len() != n_layers {
             return Err(crate::tensor::Error(format!(
                 "qwen2 encoder: plan has {} layers, expected {n_layers}",

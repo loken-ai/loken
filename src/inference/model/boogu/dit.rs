@@ -15,26 +15,10 @@
 //! stacks (double/single/refiner), 3-axis RoPE, and the top-level forward + sampling
 //! pipeline are wired on top of these units.
 
-use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
+use crate::inference::place::layer_executor::HeteroPlan;
 use crate::tensor::quantized::{GgmlDType, QKernelMatMul, QVarBuilder};
 use crate::tensor::{Device, DeviceLocation, Error, Result, Tensor as NT};
 use std::collections::HashMap;
-
-/// Flatten a `HeteroPlan` into one `Device` per block (the plan owns placement - NEVER hardcode a
-/// device). `DeviceKind::Cuda(i)` resolves via the probed `cuda_devices` map; CPU/OpenCL -> CPU.
-fn plan_block_devices(plan: &HeteroPlan, cuda_devices: &HashMap<usize, Device>) -> Vec<Device> {
-    let mut out = Vec::with_capacity(plan.total_layers);
-    for seg in &plan.segments {
-        let dev = match seg.kind {
-            DeviceKind::Cuda(i) => cuda_devices.get(&i).cloned().unwrap_or(Device::Cpu),
-            _ => Device::Cpu,
-        };
-        for _ in seg.layer_start..seg.layer_end {
-            out.push(dev.clone());
-        }
-    }
-    out
-}
 
 /// Boogu-Image DiT configuration (Turbo v0.1; derived from the safetensors shapes).
 #[derive(Clone, Debug)]
@@ -837,19 +821,14 @@ impl BooguTransformer2DModel {
     /// is parsed once to CPU (its Q8_0 blobs are device-independent); each block's weights go on the
     /// device the plan assigns. Embedders + refiners + norm_out sit on the input (block-0) device;
     /// they are small and this keeps the multi-stream plumbing simple.
-    pub fn load(
-        path: &str,
-        cuda_devices: &HashMap<usize, Device>,
-        plan: &HeteroPlan,
-    ) -> Result<Self> {
-        Self::load_cancellable(path, cuda_devices, plan, None)
+    pub fn load(path: &str, plan: &HeteroPlan) -> Result<Self> {
+        Self::load_cancellable(path, plan, None)
     }
 
     /// [`Self::load`] with cooperative cancellation: checked per tensor during the fp8 decode
     /// and per block during assembly, so an abandoned load stops in seconds.
     pub fn load_cancellable(
         path: &str,
-        cuda_devices: &HashMap<usize, Device>,
         plan: &HeteroPlan,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
     ) -> Result<Self> {
@@ -867,7 +846,7 @@ impl BooguTransformer2DModel {
         // The plan distributes the main block stack: double (0..n_double) then single (n_double..).
         let n_double = cfg.num_double_stream_layers;
         let n_single = cfg.num_single_stream_layers;
-        let block_dev = plan_block_devices(plan, cuda_devices);
+        let block_dev = crate::inference::place::ladder::layer_devices(plan, plan.total_layers);
         if block_dev.len() != n_double + n_single {
             return Err(Error(format!(
                 "boogu DiT: plan has {} blocks, expected {} (double {} + single {})",
@@ -1200,22 +1179,17 @@ mod tests {
         );
         // Plan across whatever CUDA devices are present (fastest-first, spill to CPU); the plan
         // decides placement - the test never hardcodes a device.
-        let mut cuda_devices = HashMap::new();
         let cuda_list: Vec<(usize, u64)> =
             crate::inference::place::device_probe::probe_cuda_devices(0)
                 .into_iter()
-                .map(|(i, f, d)| {
-                    cuda_devices.insert(i, d);
-                    (i, f)
-                })
+                .map(|(i, f, _)| (i, f))
                 .collect();
         let cfg = Config::default();
         let n_blocks = cfg.num_double_stream_layers + cfg.num_single_stream_layers;
         let sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let plan = HeteroPlan::calculate(n_blocks, sz, &cuda_list, &[], 1.0);
         println!("boogu DiT smoke test, plan: {:?}", plan.segments);
-        let model =
-            BooguTransformer2DModel::load(&path, &cuda_devices, &plan).expect("load boogu DiT");
+        let model = BooguTransformer2DModel::load(&path, &plan).expect("load boogu DiT");
         let dev = model.input_device().clone();
         // 16-channel latent, 8x8 spatial -> 4x4 = 16 image tokens; 6 caption tokens.
         let (c, h, w) = (16usize, 8usize, 8usize);
@@ -1257,21 +1231,16 @@ mod tests {
             "{}/boogu/diffusion_models/boogu_image_turbo_fp8_scaled.safetensors",
             crate::inference::cache::hf::models_dir()
         );
-        let mut cuda_devices = HashMap::new();
         let cuda_list: Vec<(usize, u64)> =
             crate::inference::place::device_probe::probe_cuda_devices(0)
                 .into_iter()
-                .map(|(i, f, d)| {
-                    cuda_devices.insert(i, d);
-                    (i, f)
-                })
+                .map(|(i, f, _)| (i, f))
                 .collect();
         let cfg = Config::default();
         let n_blocks = cfg.num_double_stream_layers + cfg.num_single_stream_layers;
         let sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let plan = HeteroPlan::calculate(n_blocks, sz, &cuda_list, &[], 1.0);
-        let model =
-            BooguTransformer2DModel::load(&path, &cuda_devices, &plan).expect("load boogu DiT");
+        let model = BooguTransformer2DModel::load(&path, &plan).expect("load boogu DiT");
         let dev = model.input_device().clone();
         let (c, h, w) = (16usize, 16usize, 16usize);
         let x = NT::from_vec_f32(read_f32("in_latent_16x16x16.f32"), (c, h, w))
@@ -1318,20 +1287,16 @@ mod tests {
             "{}/boogu/diffusion_models/boogu_image_turbo_fp8_scaled.safetensors",
             crate::inference::cache::hf::models_dir()
         );
-        let mut cuda_devices = HashMap::new();
         let cuda_list: Vec<(usize, u64)> =
             crate::inference::place::device_probe::probe_cuda_devices(0)
                 .into_iter()
-                .map(|(i, f, d)| {
-                    cuda_devices.insert(i, d);
-                    (i, f)
-                })
+                .map(|(i, f, _)| (i, f))
                 .collect();
         let cfg0 = Config::default();
         let n_blocks = cfg0.num_double_stream_layers + cfg0.num_single_stream_layers;
         let sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let plan = HeteroPlan::calculate(n_blocks, sz, &cuda_list, &[], 1.0);
-        let model = BooguTransformer2DModel::load(&path, &cuda_devices, &plan).expect("load");
+        let model = BooguTransformer2DModel::load(&path, &plan).expect("load");
         let idev = model.input_device().clone();
         let (c, hgt, wid) = (16usize, 16usize, 16usize);
         let xv = read_f32("in_latent_16x16x16.f32");

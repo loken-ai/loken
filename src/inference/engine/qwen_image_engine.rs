@@ -8,8 +8,6 @@
 //! loads run through an OOM-fallback cascade so a load can never hard-OOM. Scales to 1 / 2 / N GPUs
 //! + CPU with zero hardware assumptions.
 
-use std::collections::HashMap;
-
 use anyhow::{anyhow, Result as AnyResult};
 use tracing::info;
 
@@ -351,10 +349,8 @@ pub fn load(
         .get_ids()
         .len();
 
-    // Probe once for the device handles (shared by BOTH models so their cross-device transfers see
-    // the same physical devices). Plan the hot DiT first (undivided on the fastest GPU that fits),
-    // then re-probe FREE (the DiT is now resident) and plan the one-shot encoder on what remains.
-    let mut cuda_devices: HashMap<usize, Device> = HashMap::new();
+    // Plan the hot DiT first (undivided on the fastest GPU that fits), then the one-shot encoder
+    // on what the cards offer with the DiT resident.
     let gpu_reserve = runtime_reserve(&dit_path, geom.width, geom.height);
     tracing::info!(
         "Qwen-Image runtime reserve for {}x{} (arch-derived): {:.2} GB/GPU",
@@ -362,16 +358,9 @@ pub fn load(
         geom.height,
         gpu_reserve as f64 / 1e9
     );
-    let dit_cuda: Vec<(usize, u64)> = crate::inference::place::vram_manager::probe(gpu_reserve)
-        .into_iter()
-        .map(|(i, f, d)| {
-            cuda_devices.insert(i, d);
-            (i, f)
-        })
-        .collect();
 
-    // Hot DiT (60 transformer blocks), run per sampling step: undivided on the fastest GPU that
-    // fits; OOM-fallback cascade -> split -> CPU (never OOM).
+    // Hot DiT, run per sampling step: undivided on the fastest GPU that fits; OOM-fallback
+    // cascade -> split -> CPU (never OOM).
     // Plan on the RESIDENT footprint, not the file size: a safetensors checkpoint
     // re-quantizes its 2-D projections at load, so planning with the raw file refuses
     // single-card fits that the resident model makes comfortably - splitting the DiT and
@@ -379,54 +368,36 @@ pub fn load(
     let dit_sz = dit_resident_bytes(&dit_path);
     let dit_path_str = dit_path.to_string_lossy().to_string();
     tracing::info!(
-        "Qwen-Image DiT planning: needs {:.2} GB resident; per-GPU free AFTER the {:.2} GB \
-         reserve = {:?}",
+        "Qwen-Image DiT planning: needs {:.2} GB resident beside a {:.2} GB reserve per card",
         dit_sz as f64 / 1e9,
         gpu_reserve as f64 / 1e9,
-        dit_cuda
-            .iter()
-            .map(|(i, f)| format!("GPU{i}:{:.2}GB", *f as f64 / 1e9))
-            .collect::<Vec<_>>()
     );
     let dit_layers = DitConfig::from_checkpoint(&dit_path)
         .map_err(|e| anyhow!("Qwen-Image DiT: {e}"))?
         .num_layers;
-    let dit = crate::inference::place::ladder::load_blocks(
+    let dit = crate::inference::place::ladder::load_blocks_reserving(
         dit_layers,
         dit_sz,
-        &dit_cuda,
+        gpu_reserve,
         "Qwen-Image DiT",
         cancel,
-        |plan| {
-            DitModel::load_hetero(&dit_path_str, &cuda_devices, plan, cancel)
-                .map_err(|e| anyhow!("{e}"))
-        },
+        |plan| DitModel::load_hetero(&dit_path_str, plan, cancel).map_err(|e| anyhow!("{e}")),
     )?;
     let dit_device = dit.input_device().clone();
 
-    // Re-probe FREE VRAM (the DiT is now resident); reuse the SAME device handles so the encoder's
-    // output and the DiT input reference the same physical devices.
-    let enc_cuda: Vec<(usize, u64)> = crate::inference::place::vram_manager::probe(gpu_reserve)
-        .into_iter()
-        .filter(|(i, _, _)| cuda_devices.contains_key(i))
-        .map(|(i, f, _)| (i, f))
-        .collect();
-    // One-shot encoder: best-fit remaining capacity; same OOM-fallback cascade.
+    // One-shot encoder: best-fit remaining capacity with the DiT resident; same cascade.
     let enc_layers = crate::inference::load::shapes::Shapes::read(&[&enc_gguf])
         .and_then(|s| s.meta_usize("block_count"))
         .map_err(|e| anyhow!("Qwen-Image encoder: {e}"))?;
     let enc_sz = std::fs::metadata(&enc_gguf).map(|m| m.len()).unwrap_or(0);
     let enc_path_str = enc_gguf.to_string_lossy().to_string();
-    let encoder = crate::inference::place::ladder::load_blocks(
+    let encoder = crate::inference::place::ladder::load_blocks_reserving(
         enc_layers,
         enc_sz,
-        &enc_cuda,
+        gpu_reserve,
         "Qwen-Image encoder",
         cancel,
-        |plan| {
-            Qwen2TextEncoder::from_gguf_hetero(&enc_path_str, &cuda_devices, plan)
-                .map_err(|e| anyhow!("{e}"))
-        },
+        |plan| Qwen2TextEncoder::from_gguf_hetero(&enc_path_str, plan).map_err(|e| anyhow!("{e}")),
     )?;
 
     info!(

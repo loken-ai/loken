@@ -489,6 +489,19 @@ pub fn load_blocks<T>(
     )
 }
 
+/// [`load_blocks`] on the cards as they are now, each keeping `reserve` free for the work a
+/// request runs beside the blocks. The pressure the fleet is under is taken off.
+pub fn load_blocks_reserving<T>(
+    layers: usize,
+    bytes: u64,
+    reserve: u64,
+    what: &str,
+    cancel: Option<&crate::inference::serve::cancel::CancelToken>,
+    build: impl Fn(&HeteroPlan) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    load_blocks(layers, bytes, &cards(reserve), what, cancel, build)
+}
+
 /// The cards a whole component is offered, in the order it takes them: those offering
 /// `want`, then those offering only `need`. A card offering less is not listed.
 pub fn whole_order(cards: &[(usize, u64)], need: u64, want: u64) -> Vec<(usize, u64)> {

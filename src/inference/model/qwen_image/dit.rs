@@ -680,29 +680,6 @@ pub struct Model {
     input_device: crate::tensor::Device,
 }
 
-/// Flatten a `HeteroPlan` into one `Device` per block (the plan owns placement - NEVER hardcode a
-/// device). `DeviceKind::Cuda(i)` resolves via the probed `cuda_devices` map; CPU/OpenCL -> CPU.
-pub(crate) fn plan_block_devices(
-    plan: &crate::inference::place::layer_executor::HeteroPlan,
-    cuda_devices: &std::collections::HashMap<usize, crate::tensor::Device>,
-) -> Vec<crate::tensor::Device> {
-    use crate::inference::place::layer_executor::DeviceKind;
-    let mut out = Vec::with_capacity(plan.total_layers);
-    for seg in &plan.segments {
-        let dev = match seg.kind {
-            DeviceKind::Cuda(i) => cuda_devices
-                .get(&i)
-                .cloned()
-                .unwrap_or(crate::tensor::Device::Cpu),
-            _ => crate::tensor::Device::Cpu,
-        };
-        for _ in seg.layer_start..seg.layer_end {
-            out.push(dev.clone());
-        }
-    }
-    out
-}
-
 impl Model {
     fn silu(x: &NT) -> Result<NT> {
         // x*sigmoid(x) = x/(1+e^-x)
@@ -848,7 +825,6 @@ impl Model {
     /// block's device (the forward starts and ends there).
     pub fn load_hetero(
         path: &str,
-        cuda_devices: &std::collections::HashMap<usize, crate::tensor::Device>,
         plan: &crate::inference::place::layer_executor::HeteroPlan,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
     ) -> Result<Self> {
@@ -878,7 +854,7 @@ impl Model {
         } else {
             crate::inference::cache::qvb::from_gguf_cached(path, &crate::tensor::Device::Cpu)?
         };
-        let block_dev = plan_block_devices(plan, cuda_devices);
+        let block_dev = crate::inference::place::ladder::layer_devices(plan, plan.total_layers);
         if block_dev.len() != cfg.num_layers {
             return Err(crate::tensor::Error(format!(
                 "qwen-image DiT: plan has {} blocks, expected {}",

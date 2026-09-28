@@ -11,27 +11,10 @@
 //! the standard quantized matmul (MMQ/MMVQ) is used directly. The vision tower is ignored
 //! (text-to-image conditions on the caption only).
 
-use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
+use crate::inference::place::layer_executor::HeteroPlan;
 use crate::tensor::quantized::{GgmlDType, QKernelMatMul, QVarBuilder};
 use crate::tensor::{Device, DeviceLocation, Error, Result, Tensor as NT};
 use std::collections::HashMap;
-
-/// Flatten a `HeteroPlan` into one `Device` per layer (the plan owns placement - NEVER hardcode a
-/// device). `DeviceKind::Cuda(i)` resolves via the probed `cuda_devices` map; everything else (CPU,
-/// and OpenCL which these models don't plan for) lands on CPU.
-fn plan_layer_devices(plan: &HeteroPlan, cuda_devices: &HashMap<usize, Device>) -> Vec<Device> {
-    let mut out = Vec::with_capacity(plan.total_layers);
-    for seg in &plan.segments {
-        let dev = match seg.kind {
-            DeviceKind::Cuda(i) => cuda_devices.get(&i).cloned().unwrap_or(Device::Cpu),
-            _ => Device::Cpu,
-        };
-        for _ in seg.layer_start..seg.layer_end {
-            out.push(dev.clone());
-        }
-    }
-    out
-}
 
 /// Config for a Qwen3 decoder tower, read from its checkpoint.
 #[derive(Clone, Copy, Debug)]
@@ -149,24 +132,19 @@ impl Qwen3VlTextEncoder {
     /// (adaptive multi-GPU+CPU, fastest-first, spill to next GPU/CPU - NO hardcoded device). The
     /// QVarBuilder is parsed once to CPU; its QHostTensor blobs are device-independent, so
     /// `qmatmul_auto(.., dev)` / `get_f32_auto_on(.., dev)` place each layer's weights per device.
-    pub fn load(
-        path: &str,
-        cuda_devices: &HashMap<usize, Device>,
-        plan: &HeteroPlan,
-    ) -> Result<Self> {
-        Self::load_cancellable(path, cuda_devices, plan, None)
+    pub fn load(path: &str, plan: &HeteroPlan) -> Result<Self> {
+        Self::load_cancellable(path, plan, None)
     }
 
     /// [`Self::load`] with cooperative cancellation: checked per tensor during the fp8 decode
     /// and per block during assembly, so an abandoned load stops in seconds.
     pub fn load_cancellable(
         path: &str,
-        cuda_devices: &HashMap<usize, Device>,
         plan: &HeteroPlan,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
     ) -> Result<Self> {
         let cfg = Config::from_checkpoint(&[path])?;
-        Self::load_cfg(&[path], cfg, cuda_devices, plan, cancel)
+        Self::load_cfg(&[path], cfg, plan, cancel)
     }
 
     /// [`Self::load_cancellable`] over an explicit config and a SHARDED checkpoint.
@@ -177,7 +155,6 @@ impl Qwen3VlTextEncoder {
     pub fn load_cfg(
         paths: &[&str],
         cfg: Config,
-        cuda_devices: &HashMap<usize, Device>,
         plan: &HeteroPlan,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
     ) -> Result<Self> {
@@ -190,7 +167,7 @@ impl Qwen3VlTextEncoder {
                 cancel,
             )
         }?;
-        let layer_dev = plan_layer_devices(plan, cuda_devices);
+        let layer_dev = crate::inference::place::ladder::layer_devices(plan, plan.total_layers);
         if layer_dev.len() != cfg.n_layers {
             return Err(Error(format!(
                 "qwen3vl: plan has {} layers, expected {}",
@@ -452,14 +429,10 @@ mod tests {
         );
         // Plan across whatever CUDA devices are present (fastest-first, spill to CPU); the plan
         // decides placement - the test never hardcodes a device.
-        let mut cuda_devices = HashMap::new();
         let cuda_list: Vec<(usize, u64)> =
             crate::inference::place::device_probe::probe_cuda_devices(0)
                 .into_iter()
-                .map(|(i, f, d)| {
-                    cuda_devices.insert(i, d);
-                    (i, f)
-                })
+                .map(|(i, f, _)| (i, f))
                 .collect();
         let sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let layers = Config::from_checkpoint(&[&path])
@@ -467,8 +440,7 @@ mod tests {
             .n_layers;
         let plan = HeteroPlan::calculate(layers, sz, &cuda_list, &[], 1.0);
         println!("qwen3vl encoder smoke test, plan: {:?}", plan.segments);
-        let enc =
-            Qwen3VlTextEncoder::load(&path, &cuda_devices, &plan).expect("load qwen3vl encoder");
+        let enc = Qwen3VlTextEncoder::load(&path, &plan).expect("load qwen3vl encoder");
         let ids: Vec<u32> = vec![9707, 1879, 11, 419, 374, 264, 1273]; // arbitrary token ids
         let out = enc.forward(&ids).expect("forward");
         assert_eq!(out.shape().dims(), &[ids.len(), 4096]);
