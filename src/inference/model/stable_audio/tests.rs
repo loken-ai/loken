@@ -139,9 +139,9 @@ fn dit_matches_torch() {
     let t_len = 64usize;
     let x = to_tc(read_dump(&dir, "dit_in_64x64.f32"), 64, t_len);
     let cross_v = read_dump(&dir, "dit_cross.f32");
-    let s = cross_v.len() / DIT_COND_DIM;
-    let cross = Tensor::from_vec_f32(cross_v, (s, DIT_COND_DIM)).unwrap();
-    let glob = Tensor::from_vec_f32(read_dump(&dir, "dit_global.f32"), (1usize, DIT_DIM)).unwrap();
+    let s = cross_v.len() / dit.cond_dim();
+    let cross = Tensor::from_vec_f32(cross_v, (s, dit.cond_dim())).unwrap();
+    let glob = Tensor::from_vec_f32(read_dump(&dir, "dit_global.f32"), (1usize, dit.dim)).unwrap();
     let out = from_tc(&dit.forward(&x, 0.5, &cross, &glob).unwrap());
     let reference = read_dump(&dir, "dit_ref_out.f32");
     let d = Divergence::of(&out, &reference, 1e-3);
@@ -162,9 +162,9 @@ fn sampler_matches_torch() {
     let t_len = 64usize;
     let noise = to_tc(read_dump(&dir, "smp_noise_64x64.f32"), 64, t_len);
     let cross_v = read_dump(&dir, "dit_cross.f32");
-    let s = cross_v.len() / DIT_COND_DIM;
-    let cross = Tensor::from_vec_f32(cross_v, (s, DIT_COND_DIM)).unwrap();
-    let glob = Tensor::from_vec_f32(read_dump(&dir, "dit_global.f32"), (1usize, DIT_DIM)).unwrap();
+    let s = cross_v.len() / dit.cond_dim();
+    let cross = Tensor::from_vec_f32(cross_v, (s, dit.cond_dim())).unwrap();
+    let glob = Tensor::from_vec_f32(read_dump(&dir, "dit_global.f32"), (1usize, dit.dim)).unwrap();
 
     let sigmas = sigmas_polyexponential(8, 0.3, 500.0, 1.0);
     let ref_sigmas = read_dump(&dir, "smp_sigmas.f32");
@@ -278,11 +278,14 @@ fn dit_perf_probe() {
         .unwrap()
         .to_device(&device)
         .unwrap();
-    let cross = Tensor::from_vec_f32(vec![0.05f32; 19 * DIT_COND_DIM], (19usize, DIT_COND_DIM))
-        .unwrap()
-        .to_device(&device)
-        .unwrap();
-    let glob = Tensor::from_vec_f32(vec![0.02f32; DIT_DIM], (1usize, DIT_DIM))
+    let cross = Tensor::from_vec_f32(
+        vec![0.05f32; 19 * dit.cond_dim()],
+        (19usize, dit.cond_dim()),
+    )
+    .unwrap()
+    .to_device(&device)
+    .unwrap();
+    let glob = Tensor::from_vec_f32(vec![0.02f32; dit.dim], (1usize, dit.dim))
         .unwrap()
         .to_device(&device)
         .unwrap();

@@ -12,10 +12,44 @@
 use crate::tensor::safetensors_io::SafeTensorsLoader;
 use crate::tensor::{DType, Device, Error, Result, Tensor};
 
-const LATENT_DIM: usize = 64;
-const CHANNELS: usize = 128;
-const C_MULTS: [usize; 5] = [1, 2, 4, 8, 16];
-const STRIDES: [usize; 5] = [2, 4, 4, 8, 8];
+/// The DiT settings `model_config.json`, published beside the checkpoint, states and the
+/// tensors do not: how many heads the attention splits the width into.
+fn dit_heads(checkpoint: &str) -> Result<usize> {
+    let path = std::path::Path::new(checkpoint).with_file_name("model_config.json");
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    let cfg: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+    cfg["model"]["diffusion"]["config"]["num_heads"]
+        .as_u64()
+        .map(|v| v as usize)
+        .ok_or_else(|| Error(format!("{}: missing num_heads", path.display())))
+}
+
+/// How many numbered children `{parent}.0`, `.1`, ... the checkpoint stores.
+fn count_children(loader: &SafeTensorsLoader, parent: &str) -> usize {
+    let base = format!("{parent}.");
+    let indices: std::collections::BTreeSet<usize> = loader
+        .names()
+        .iter()
+        .filter_map(|n| n.strip_prefix(&base))
+        .filter_map(|rest| rest.split('.').next()?.parse().ok())
+        .collect();
+    (0..).take_while(|i| indices.contains(i)).count()
+}
+
+/// The resampling blocks of an Oobleck coder under `prefix`: the layers from `layers.1` on
+/// that are themselves made of layers. The input conv before them and the snake and output
+/// conv after them are single modules.
+fn oobleck_blocks(loader: &SafeTensorsLoader, prefix: &str) -> usize {
+    let names = loader.names();
+    (1..)
+        .take_while(|i| {
+            let block = format!("{prefix}.layers.{i}.layers.");
+            names.iter().any(|n| n.starts_with(&block))
+        })
+        .count()
+}
 
 /// SnakeBeta with log-scale parameters, pre-exponentiated:
 /// `y = x + (1/beta) * sin(alpha * x)^2`, per channel. Runs as device
@@ -102,6 +136,8 @@ impl DecoderBlock {
 }
 
 pub struct OobleckDecoder {
+    /// Latent channels the decoder reads: its input conv's in-channels.
+    latent_dim: usize,
     head: Conv,
     blocks: Vec<DecoderBlock>,
     tail_snake: SnakeBeta,
@@ -109,12 +145,18 @@ pub struct OobleckDecoder {
 }
 
 impl OobleckDecoder {
-    /// Decode a latent `[64, T]` into audio `[2, T * 2048]` (f32, ~[-1, 1]).
+    /// Audio samples one latent frame decodes to: the product of the blocks' strides.
+    pub fn stride(&self) -> usize {
+        self.blocks.iter().map(|b| b.upsample.stride).product()
+    }
+
+    /// Decode a latent `[latent_dim, T]` into audio `[channels, T * stride]` (f32, ~[-1, 1]).
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
         let (c, _) = latent.shape().dims2()?;
-        if c != LATENT_DIM {
+        if c != self.latent_dim {
             return Err(Error::msg(format!(
-                "oobleck decoder expects [{LATENT_DIM}, T] latents, got {c} channels"
+                "oobleck decoder expects [{}, T] latents, got {c} channels",
+                self.latent_dim
             )));
         }
         let mut h = self.head.forward(latent)?;
@@ -196,6 +238,21 @@ fn load_wn_conv(
     })
 }
 
+/// A resampling conv, whose kernel is twice its stride: the stride is read off the stored
+/// kernel, and the padding centres it.
+fn load_resampling_conv(
+    loader: &SafeTensorsLoader,
+    dev: &Device,
+    prefix: &str,
+    transposed: bool,
+) -> Result<Conv> {
+    let mut conv = load_wn_conv(loader, dev, prefix, 1, 0, 1, transposed)?;
+    let (_, _, kernel) = conv.weight.shape().dims3()?;
+    conv.stride = kernel / 2;
+    conv.padding = conv.stride.div_ceil(2);
+    Ok(conv)
+}
+
 fn load_snake(loader: &SafeTensorsLoader, dev: &Device, prefix: &str) -> Result<SnakeBeta> {
     let a = get_f32(loader, &format!("{prefix}.alpha"))?.to_vec_f32();
     let b = get_f32(loader, &format!("{prefix}.beta"))?.to_vec_f32();
@@ -242,34 +299,23 @@ pub fn load_decoder(path: &str, prefix: &str) -> Result<OobleckDecoder> {
 pub fn load_decoder_on(path: &str, prefix: &str, dev: &Device) -> Result<OobleckDecoder> {
     // SAFETY: read-only mmap of the checkpoint; tensors are copied out below.
     let loader = unsafe { SafeTensorsLoader::multi(&[path]) }?;
-    let c_mults: Vec<usize> = std::iter::once(1).chain(C_MULTS).collect();
-    let depth = c_mults.len();
+    let stages = oobleck_blocks(&loader, prefix);
     let head = load_wn_conv(&loader, dev, &format!("{prefix}.layers.0"), 1, 3, 1, false)?;
-    let mut blocks = Vec::with_capacity(depth - 1);
-    let mut li = 1usize;
-    for i in (1..depth).rev() {
-        let stride = STRIDES[i - 1];
+    let latent_dim = head.weight.shape().dims3()?.1;
+    let mut blocks = Vec::with_capacity(stages);
+    for li in 1..=stages {
         let bp = format!("{prefix}.layers.{li}");
-        let _cin = c_mults[i] * CHANNELS;
         blocks.push(DecoderBlock {
             snake: load_snake(&loader, dev, &format!("{bp}.layers.0"))?,
-            upsample: load_wn_conv(
-                &loader,
-                dev,
-                &format!("{bp}.layers.1"),
-                stride,
-                stride.div_ceil(2),
-                1,
-                true,
-            )?,
+            upsample: load_resampling_conv(&loader, dev, &format!("{bp}.layers.1"), true)?,
             res: [
                 load_residual_unit(&loader, dev, &format!("{bp}.layers.2"), 1)?,
                 load_residual_unit(&loader, dev, &format!("{bp}.layers.3"), 3)?,
                 load_residual_unit(&loader, dev, &format!("{bp}.layers.4"), 9)?,
             ],
         });
-        li += 1;
     }
+    let li = stages + 1;
     let tail_snake = load_snake(&loader, dev, &format!("{prefix}.layers.{li}"))?;
     let tail = load_wn_conv(
         &loader,
@@ -281,6 +327,7 @@ pub fn load_decoder_on(path: &str, prefix: &str, dev: &Device) -> Result<Oobleck
         false,
     )?;
     Ok(OobleckDecoder {
+        latent_dim,
         head,
         blocks,
         tail_snake,
@@ -319,15 +366,16 @@ pub struct OobleckEncoder {
 }
 
 impl OobleckEncoder {
-    /// Encode stereo audio `[2, N]` (N a multiple of 2048) into the VAE
-    /// `mean` latent `[64, N/2048]` (the deterministic center; the `scale`
-    /// half of the bottleneck output is dropped).
+    /// Encode stereo audio `[2, N]` (N a multiple of the stride) into the VAE `mean`
+    /// latent `[latent, N/stride]` (the deterministic center; the `scale` half of the
+    /// bottleneck output is dropped).
     pub fn encode_mean(&self, audio: &Tensor) -> Result<Tensor> {
         let out = self.encode_raw(audio)?;
-        out.narrow(0, 0, LATENT_DIM)?.contiguous()
+        let latent = out.shape().dims2()?.0 / 2;
+        out.narrow(0, 0, latent)?.contiguous()
     }
 
-    /// Full bottleneck input `[128, T]` = `mean | scale` stacked.
+    /// Full bottleneck input `[2 * latent, T]` = `mean | scale` stacked.
     pub fn encode_raw(&self, audio: &Tensor) -> Result<Tensor> {
         let mut h = self.head.forward(audio)?;
         for b in &self.blocks {
@@ -342,12 +390,11 @@ impl OobleckEncoder {
 pub fn load_encoder_on(path: &str, prefix: &str, dev: &Device) -> Result<OobleckEncoder> {
     // SAFETY: read-only mmap of the checkpoint; tensors are copied out below.
     let loader = unsafe { SafeTensorsLoader::multi(&[path]) }?;
-    let c_mults: Vec<usize> = std::iter::once(1).chain(C_MULTS).collect();
-    let depth = c_mults.len();
+    let stages = oobleck_blocks(&loader, prefix);
+    let depth = stages + 1;
     let head = load_wn_conv(&loader, dev, &format!("{prefix}.layers.0"), 1, 3, 1, false)?;
-    let mut blocks = Vec::with_capacity(depth - 1);
-    for i in 0..depth - 1 {
-        let stride = STRIDES[i];
+    let mut blocks = Vec::with_capacity(stages);
+    for i in 0..stages {
         let bp = format!("{prefix}.layers.{}", i + 1);
         blocks.push(EncoderBlock {
             res: [
@@ -356,15 +403,7 @@ pub fn load_encoder_on(path: &str, prefix: &str, dev: &Device) -> Result<Oobleck
                 load_residual_unit(&loader, dev, &format!("{bp}.layers.2"), 9)?,
             ],
             snake: load_snake(&loader, dev, &format!("{bp}.layers.3"))?,
-            downsample: load_wn_conv(
-                &loader,
-                dev,
-                &format!("{bp}.layers.4"),
-                stride,
-                stride.div_ceil(2),
-                1,
-                false,
-            )?,
+            downsample: load_resampling_conv(&loader, dev, &format!("{bp}.layers.4"), false)?,
         });
     }
     let tail_snake = load_snake(&loader, dev, &format!("{prefix}.layers.{depth}"))?;
@@ -389,17 +428,10 @@ pub fn load_encoder_on(path: &str, prefix: &str, dev: &Device) -> Result<Oobleck
 //
 // DiffusionTransformer in "prepend" global-cond mode (no adaLN): the global
 // embedding (number conditioners + timestep Fourier features) becomes one
-// prepended token; 24 pre-norm blocks of self-attention (partial rotary on
-// the first 32 of 64 head dims), cross-attention over the conditioning
-// tokens (12 kv heads, GQA-repeated to 24 q heads), and a SwiGLU FFN.
-
-const DIT_DIM: usize = 1536;
-const DIT_HEADS: usize = 24;
-const DIT_HEAD_DIM: usize = 64;
-const DIT_COND_DIM: usize = 768;
-const DIT_DEPTH: usize = 24;
-const DIT_FF_INNER: usize = 6144;
-const ROT_DIM: usize = 32; // rotated prefix of each head (half-rotary)
+// prepended token; pre-norm blocks of self-attention (partial rotary on a
+// prefix of each head), cross-attention over the conditioning tokens (fewer kv
+// heads, GQA-repeated to the q heads), and a SwiGLU FFN. Every width is read
+// from the stored tensors; only the head count comes from `model_config.json`.
 
 use crate::tensor::layer::{LayerNorm, Linear};
 
@@ -440,17 +472,32 @@ pub struct SaoDit {
     /// All the same device is the ONE-SEGMENT PLAN and stays bit-identical: the moves below
     /// are no-ops, because a tensor already on a device is returned unchanged.
     block_devices: Vec<Device>,
-    /// Rotary inverse frequencies `[16]`, host-side.
+    /// Rotary inverse frequencies, one per rotated pair, host-side.
     inv_freq: Vec<f32>,
     postprocess: Linear,
     device: Device,
+    /// The stream's width, its heads, and each head's width.
+    dim: usize,
+    heads: usize,
+    head_dim: usize,
+    /// Width of the conditioning tokens the cross-attention keys and values come from.
+    cond_dim: usize,
+    /// Width of one half of the SwiGLU feed-forward.
+    ff_inner: usize,
 }
 
 impl SaoDit {
-    /// One denoise evaluation. `x` `[T, 64]` (time-major latent), `t` in
-    /// (0, 1), `cross` `[S, 768]` conditioning tokens, `glob` `[1, 1536]`.
-    /// Returns the v-prediction `[T, 64]`.
+    /// Width of the conditioning tokens the cross-attention reads.
+    pub fn cond_dim(&self) -> usize {
+        self.cond_dim
+    }
+
+    /// One denoise evaluation. `x` `[T, latent]` (time-major latent), `t` in
+    /// (0, 1), `cross` `[S, cond_dim]` conditioning tokens, `glob` the number conditioners
+    /// concatenated, `[1, 2 * cond_dim]`.
+    /// Returns the v-prediction `[T, latent]`.
     pub fn forward(&self, x: &Tensor, t: f32, cross: &Tensor, glob: &Tensor) -> Result<Tensor> {
+        let (dim, heads, head_dim) = (self.dim, self.heads, self.head_dim);
         let (seq_x, _) = x.shape().dims2()?;
         let cond = self
             .to_cond_b
@@ -480,9 +527,9 @@ impl SaoDit {
         h = Tensor::cat(&[&g, &h], 0)?; // prepend the global token
         let seq = seq_x + 1;
 
-        // Rotary tables for the rotated 32-dim prefix: cos/sin [1, seq, 16],
-        // duplicated across the two 16-dim halves at apply time.
-        let half = ROT_DIM / 2;
+        // Rotary tables for the rotated prefix: cos/sin [1, seq, half], duplicated across
+        // the two halves at apply time.
+        let half = self.inv_freq.len();
         let (mut cos_v, mut sin_v) = (vec![0f32; seq * half], vec![0f32; seq * half]);
         for i in 0..seq {
             for (j, f) in self.inv_freq.iter().enumerate() {
@@ -509,51 +556,52 @@ impl SaoDit {
                 want,
                 &mut [&mut h, &mut cond, &mut cos, &mut sin],
             )?;
-            // Self-attention (pre-norm, rotary, 24 heads).
+            // Self-attention (pre-norm, rotary).
             let y = blk.pre_norm.forward(&h)?;
             let qkv = blk.to_qkv.forward(&y)?;
             let split_heads = |t: &Tensor, off: usize| -> Result<Tensor> {
-                t.narrow(1, off, DIT_DIM)?
-                    .reshape((seq, DIT_HEADS, DIT_HEAD_DIM))?
+                t.narrow(1, off, dim)?
+                    .reshape((seq, heads, head_dim))?
                     .transpose(0, 1)?
                     .contiguous() // [H, seq, hd]
             };
             let q = self.rope(&split_heads(&qkv, 0)?, &cos, &sin)?;
-            let k = self.rope(&split_heads(&qkv, DIT_DIM)?, &cos, &sin)?;
-            let v = split_heads(&qkv, 2 * DIT_DIM)?;
+            let k = self.rope(&split_heads(&qkv, dim)?, &cos, &sin)?;
+            let v = split_heads(&qkv, 2 * dim)?;
             let ctx = attn(&q, &k, &v)?; // [H, seq, hd]
-            let ctx = ctx.transpose(0, 1)?.contiguous()?.reshape((seq, DIT_DIM))?;
+            let ctx = ctx.transpose(0, 1)?.contiguous()?.reshape((seq, dim))?;
             h = h.add(&blk.self_out.forward(&ctx)?)?;
 
-            // Cross-attention over the conditioning tokens (no rotary; the 12
-            // kv heads are repeated to match the 24 q heads).
+            // Cross-attention over the conditioning tokens (no rotary; the kv heads
+            // are repeated to match the q heads).
             let (s_c, _) = cond.shape().dims2()?;
             let y = blk.cross_norm.forward(&h)?;
             let q = blk
                 .cross_q
                 .forward(&y)?
-                .reshape((seq, DIT_HEADS, DIT_HEAD_DIM))?
+                .reshape((seq, heads, head_dim))?
                 .transpose(0, 1)?
                 .contiguous()?;
-            let kv = blk.cross_kv.forward(&cond)?; // [S, 2*768]
-            let kv_heads = DIT_COND_DIM / DIT_HEAD_DIM; // 12
+            let kv = blk.cross_kv.forward(&cond)?; // [S, 2*kv_width]
+            let kv_width = kv.shape().dims2()?.1 / 2;
+            let kv_heads = kv_width / head_dim;
             let take = |off: usize| -> Result<Tensor> {
-                let heads = kv
-                    .narrow(1, off, DIT_COND_DIM)?
-                    .reshape((s_c, kv_heads, DIT_HEAD_DIM))?
+                let kv_h = kv
+                    .narrow(1, off, kv_width)?
+                    .reshape((s_c, kv_heads, head_dim))?
                     .transpose(0, 1)?
                     .contiguous()?;
-                crate::tensor::ops::repeat_kv_unbatched(&heads, DIT_HEADS / kv_heads)
+                crate::tensor::ops::repeat_kv_unbatched(&kv_h, heads / kv_heads)
             };
-            let ctx = attn(&q, &take(0)?, &take(DIT_COND_DIM)?)?;
-            let ctx = ctx.transpose(0, 1)?.contiguous()?.reshape((seq, DIT_DIM))?;
+            let ctx = attn(&q, &take(0)?, &take(kv_width)?)?;
+            let ctx = ctx.transpose(0, 1)?.contiguous()?.reshape((seq, dim))?;
             h = h.add(&blk.cross_out.forward(&ctx)?)?;
 
             // SwiGLU FFN: proj -> [x | gate] -> x * silu(gate) -> out.
             let y = blk.ff_norm.forward(&h)?;
             let p = blk.ff_proj.forward(&y)?;
-            let a = p.narrow(1, 0, DIT_FF_INNER)?;
-            let gate = p.narrow(1, DIT_FF_INNER, DIT_FF_INNER)?;
+            let a = p.narrow(1, 0, self.ff_inner)?;
+            let gate = p.narrow(1, self.ff_inner, self.ff_inner)?;
             h = h.add(&blk.ff_out.forward(&a.mul(&gate.silu()?)?)?)?;
         }
 
@@ -568,14 +616,15 @@ impl SaoDit {
         out.add(&self.postprocess.forward(&out)?)
     }
 
-    /// Partial rotary (GPT-J half-split on the 32-dim prefix): the first 16
-    /// and second 16 dims form the rotation pair; the remaining 32 pass through.
+    /// Partial rotary (GPT-J half-split on the rotated prefix, one pair per inverse
+    /// frequency): the prefix's two halves form the rotation pair; the rest passes through.
     fn rope(&self, t: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let hd = t.shape().dims3()?.2;
-        let half = ROT_DIM / 2;
+        let half = self.inv_freq.len();
+        let rotated = 2 * half;
         let a = t.narrow(2, 0, half)?.contiguous()?;
         let b = t.narrow(2, half, half)?.contiguous()?;
-        let pass = t.narrow(2, ROT_DIM, hd - ROT_DIM)?.contiguous()?;
+        let pass = t.narrow(2, rotated, hd - rotated)?.contiguous()?;
         let ra = a.broadcast_mul(cos)?.sub(&b.broadcast_mul(sin)?)?;
         let rb = b.broadcast_mul(cos)?.add(&a.broadcast_mul(sin)?)?;
         Tensor::cat(&[&ra, &rb, &pass], 2)
@@ -594,7 +643,13 @@ fn attn(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
 
 /// Load the DiT from the checkpoint (`model.model.*`).
 pub fn load_dit(path: &str, device: &Device) -> Result<SaoDit> {
-    load_dit_planned(path, &vec![device.clone(); DIT_DEPTH], device)
+    load_dit_planned(path, &vec![device.clone(); dit_depth(path)?], device)
+}
+
+/// Transformer blocks the checkpoint stores.
+pub fn dit_depth(path: &str) -> Result<usize> {
+    let loader = unsafe { SafeTensorsLoader::multi(&[path]) }?;
+    Ok(count_children(&loader, "model.model.transformer.layers"))
 }
 
 /// [`load_dit`] with a device per block, which is what lets this stack span cards.
@@ -605,14 +660,15 @@ pub fn load_dit(path: &str, device: &Device) -> Result<SaoDit> {
 /// single-device load exactly, so the plan with one segment is the old path and not a
 /// second one.
 pub fn load_dit_planned(path: &str, block_devices: &[Device], primary: &Device) -> Result<SaoDit> {
-    if block_devices.len() != DIT_DEPTH {
+    let loader = unsafe { SafeTensorsLoader::multi(&[path]) }?;
+    let depth = count_children(&loader, "model.model.transformer.layers");
+    if block_devices.len() != depth {
         return Err(crate::tensor::Error::msg(format!(
-            "stable-audio: a placement of {} blocks for a stack of {DIT_DEPTH}",
+            "stable-audio: a placement of {} blocks for a stack of {depth}",
             block_devices.len(),
         )));
     }
     let device = primary;
-    let loader = unsafe { SafeTensorsLoader::multi(&[path]) }?;
     let pfx = "model.model";
     let get_on = |name: String, d: &Device| -> Result<Tensor> {
         loader.load(&name)?.to_dtype(DType::F32)?.to_device(d)
@@ -654,7 +710,7 @@ pub fn load_dit_planned(path: &str, block_devices: &[Device], primary: &Device) 
     let timestep_w = get(format!("{pfx}.timestep_features.weight"))?.to_vec_f32();
     let tr = format!("{pfx}.transformer");
     let inv_freq = get(format!("{tr}.rotary_pos_emb.inv_freq"))?.to_vec_f32();
-    let mut blocks = Vec::with_capacity(DIT_DEPTH);
+    let mut blocks = Vec::with_capacity(depth);
     for (i, d) in block_devices.iter().enumerate() {
         let b = format!("{tr}.layers.{i}");
         blocks.push(SaoBlock {
@@ -670,7 +726,21 @@ pub fn load_dit_planned(path: &str, block_devices: &[Device], primary: &Device) 
             ff_out: lin_b_on(format!("{b}.ff.ff.2"), d)?,
         });
     }
+    let shape = |name: String| -> Result<Vec<usize>> {
+        loader
+            .shape_of(&name)
+            .ok_or_else(|| Error(format!("stable-audio: no tensor {name}")))
+    };
+    let dim = shape(format!("{tr}.project_in.weight"))?[0];
+    let heads = dit_heads(path)?;
+    let cond_dim = shape(format!("{pfx}.to_cond_embed.0.weight"))?[1];
+    let ff_inner = shape(format!("{tr}.layers.0.ff.ff.2.weight"))?[1];
     Ok(SaoDit {
+        dim,
+        heads,
+        head_dim: dim / heads.max(1),
+        cond_dim,
+        ff_inner,
         timestep_w,
         to_timestep_a: lin_b(format!("{pfx}.to_timestep_embed.0"))?,
         to_timestep_b: lin_b(format!("{pfx}.to_timestep_embed.2"))?,
@@ -813,8 +883,6 @@ pub fn sample_dpmpp_2m(
 // ===================== end-to-end pipeline =====================
 
 pub const SAMPLE_RATE: u32 = 44100;
-/// Audio samples per latent frame (Oobleck stride product 2*4*4*8*8).
-const LATENT_STRIDE: usize = 2048;
 /// Training window: 2_097_152 samples = 1024 latent frames (~47.55 s).
 const MAX_LATENT_T: usize = 1024;
 
@@ -1074,14 +1142,15 @@ pub fn render_with_init(
         Some((pcm, _)) => ((pcm.len() / 2) as f32 / SAMPLE_RATE as f32).clamp(1.0, 47.0),
         None => seconds.clamp(1.0, 47.0),
     };
-    let t_latent = (((seconds as f64) * SAMPLE_RATE as f64 / LATENT_STRIDE as f64).ceil() as usize)
+    let latent_stride = res.decoder.stride();
+    let t_latent = (((seconds as f64) * SAMPLE_RATE as f64 / latent_stride as f64).ceil() as usize)
         .clamp(1, MAX_LATENT_T);
 
     // Encode the init clip to its latent (VAE mean), padded to whole frames.
     let init_latent = match init {
         Some((pcm, _)) => {
-            let frames = (pcm.len() / 2).min(t_latent * LATENT_STRIDE);
-            let n = t_latent * LATENT_STRIDE;
+            let frames = (pcm.len() / 2).min(t_latent * latent_stride);
+            let n = t_latent * latent_stride;
             let mut planar = vec![0f32; 2 * n];
             for (i, fr) in pcm.chunks_exact(2).take(frames).enumerate() {
                 planar[i] = fr[0];
@@ -1127,13 +1196,14 @@ pub fn render_with_init(
         rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
         (((rng >> 33) as f64 / (1u64 << 31) as f64) as f32).clamp(1e-7, 1.0 - 1e-7)
     };
-    let noise: Vec<f32> = (0..t_latent * LATENT_DIM)
+    let latent_dim = res.decoder.latent_dim;
+    let noise: Vec<f32> = (0..t_latent * latent_dim)
         .map(|_| {
             let (u1, u2) = (u01(), u01());
             (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
         })
         .collect();
-    let noise = Tensor::from_vec_f32(noise, (t_latent, LATENT_DIM))?.to_device(&device)?;
+    let noise = Tensor::from_vec_f32(noise, (t_latent, latent_dim))?.to_device(&device)?;
     dbg_stage_hash("noise", &noise);
 
     // Variations shrink the schedule to the init noise level (the reference
@@ -1379,17 +1449,17 @@ mod forward_determinism {
             ((st >> 40) as f32 / 8388608.0) - 1.0
         };
         let x: Vec<f32> = (0..346 * 64).map(|_| xs()).collect();
-        let cross: Vec<f32> = (0..130 * DIT_COND_DIM).map(|_| xs()).collect();
-        let glob: Vec<f32> = (0..2 * DIT_COND_DIM).map(|_| xs()).collect();
+        let cross: Vec<f32> = (0..130 * dit.cond_dim()).map(|_| xs()).collect();
+        let glob: Vec<f32> = (0..2 * dit.cond_dim()).map(|_| xs()).collect();
         let x = Tensor::from_vec_f32(x, (346usize, 64usize))
             .unwrap()
             .to_device(&dev)
             .unwrap();
-        let cross = Tensor::from_vec_f32(cross, (130usize, DIT_COND_DIM))
+        let cross = Tensor::from_vec_f32(cross, (130usize, dit.cond_dim()))
             .unwrap()
             .to_device(&dev)
             .unwrap();
-        let glob = Tensor::from_vec_f32(glob, (1usize, 2 * DIT_COND_DIM))
+        let glob = Tensor::from_vec_f32(glob, (1usize, 2 * dit.cond_dim()))
             .unwrap()
             .to_device(&dev)
             .unwrap();

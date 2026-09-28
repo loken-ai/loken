@@ -164,7 +164,6 @@ const GEOMETRY_DEBT: &[(&str, usize)] = &[
     ("inference/model/sdxl/pipeline.rs", 2),
     ("inference/model/sdxl/text.rs", 10),
     ("inference/model/sdxl/unet.rs", 4),
-    ("inference/model/stable_audio/mod.rs", 7),
     ("inference/model/ultravox/mod.rs", 1),
     ("inference/model/umt5/encoder.rs", 3),
     ("inference/model/voxtral/mod.rs", 3),
