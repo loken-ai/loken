@@ -65,8 +65,17 @@ pub(crate) fn rel_bucket(rel: i64, num_buckets: usize, max_distance: usize) -> u
     }
 }
 
-/// Read `num_layers` / `num_heads` from the model dir's `config.json`.
-fn read_geometry(dir: &str) -> Result<(usize, usize)> {
+/// The encoder's geometry, from the model dir's `config.json`.
+struct Geometry {
+    n_layers: usize,
+    n_heads: usize,
+    d_model: usize,
+    d_ff: usize,
+    /// The longest prompt the encoder is run over.
+    n_positions: usize,
+}
+
+fn read_geometry(dir: &str) -> Result<Geometry> {
     let raw = std::fs::read_to_string(format!("{dir}/config.json"))
         .map_err(|e| Error(format!("t5 config.json: {e}")))?;
     let cfg: serde_json::Value =
@@ -77,21 +86,42 @@ fn read_geometry(dir: &str) -> Result<(usize, usize)> {
             .map(|v| v as usize)
             .ok_or_else(|| Error(format!("t5 config.json: missing {k}")))
     };
-    Ok((n("num_layers")?, n("num_heads")?))
+    Ok(Geometry {
+        n_layers: n("num_layers")?,
+        n_heads: n("num_heads")?,
+        d_model: n("d_model")?,
+        d_ff: n("d_ff")?,
+        n_positions: n("n_positions")?,
+    })
 }
 
 impl T5Encoder {
-    /// Load an encoder from a T5 `model.safetensors` directory (any size/variant).
+    /// Load an encoder from a T5 `model.safetensors` directory (any size/variant), on the
+    /// device the ladder in `place` chooses for it.
     pub fn from_dir(dir: &str) -> Result<Self> {
-        let (n_layers, n_heads) = read_geometry(dir)?;
+        let geo = read_geometry(dir)?;
         let path = format!("{dir}/model.safetensors");
-        let sz = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(3_000_000_000);
-        // The fastest card that holds it, else the host - the fleet's own answer for a
-        // component loaded once, rather than a helper belonging to another family.
-        let device = crate::inference::place::plan::place_whole(sz, sz / 4);
-        let st = unsafe { SafeTensorsLoader::multi(&[&path]) }?;
+        // The encoder's own tensors: a seq2seq checkpoint also carries a decoder this never loads.
+        let (sz, _) =
+            crate::inference::place::runtime_demand::safetensors_f32_split(&[&path], |n| {
+                n.starts_with("encoder.") || n.starts_with("shared.")
+            })
+            .map_err(|e| Error(format!("t5: cannot size {path}: {e}")))?;
+        let reserve = crate::inference::place::runtime_demand::transformer_work_reserve(
+            sz,
+            geo.n_positions,
+            geo.d_model,
+            geo.n_heads,
+            geo.d_ff,
+        );
+        crate::inference::place::ladder::load_whole("T5 encoder", sz, reserve, |device| {
+            Self::load_on(&path, &geo, device.clone())
+        })
+    }
+
+    fn load_on(path: &str, geo: &Geometry, device: Device) -> Result<Self> {
+        let (n_layers, n_heads) = (geo.n_layers, geo.n_heads);
+        let st = unsafe { SafeTensorsLoader::multi(&[path]) }?;
         let get = |name: &str| -> Result<Tensor> { st.load(name)?.to_device(&device) };
         let lin =
             |name: &str| -> Result<Linear> { Linear::new(get(&format!("{name}.weight"))?, None) };

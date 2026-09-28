@@ -985,3 +985,58 @@ mod tensor_core_demand_tests {
         );
     }
 }
+
+/// What a transformer keeps free on its card beside its weights: the load floor for its
+/// checkpoint and one forward's activation peak over `tokens` at its own width.
+pub fn transformer_work_reserve(
+    weight_bytes: u64,
+    tokens: usize,
+    dim: usize,
+    heads: usize,
+    ffn: usize,
+) -> u64 {
+    let mlp_ratio = ffn.max(1) as f64 / dim.max(1) as f64;
+    load_runtime_floor(weight_bytes)
+        .saturating_add(dit_activation_bytes(tokens, dim, heads, mlp_ratio))
+}
+
+/// Bytes the tensors of safetensors checkpoints take once expanded to f32, split into the
+/// tensors `is_block` accepts and the rest. Read from the headers only.
+pub fn safetensors_f32_split(
+    paths: &[impl AsRef<std::path::Path>],
+    is_block: impl Fn(&str) -> bool,
+) -> Result<(u64, u64), String> {
+    const F32_BYTES: u64 = 4;
+    let (mut blocks, mut rest) = (0u64, 0u64);
+    for p in paths {
+        let p = p.as_ref();
+        let file = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        // SAFETY: the mapping is read-only and dropped before this function returns.
+        let map =
+            unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("{}: {e}", p.display()))?;
+        let (_, meta) = safetensors::SafeTensors::read_metadata(&map)
+            .map_err(|e| format!("{}: {e}", p.display()))?;
+        for (name, info) in meta.tensors() {
+            let bytes = info.shape.iter().product::<usize>() as u64 * F32_BYTES;
+            if is_block(&name) {
+                blocks += bytes;
+            } else {
+                rest += bytes;
+            }
+        }
+    }
+    Ok((blocks, rest))
+}
+
+#[cfg(test)]
+mod work_reserve_tests {
+    use super::{load_runtime_floor, transformer_work_reserve};
+
+    #[test]
+    fn a_wider_or_longer_transformer_keeps_more_free() {
+        let base = transformer_work_reserve(1 << 30, 512, 1024, 16, 4096);
+        assert!(base > load_runtime_floor(1 << 30));
+        assert!(transformer_work_reserve(1 << 30, 1024, 1024, 16, 4096) > base);
+        assert!(transformer_work_reserve(1 << 30, 512, 2048, 16, 8192) > base);
+    }
+}

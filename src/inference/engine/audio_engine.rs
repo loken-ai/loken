@@ -240,8 +240,7 @@ impl AudioEngine {
 
     /// Coarse device kind of the loaded whisper model: "CUDA" or "CPU".
     /// Used by /api/models/loaded so the GUI Hardware tab shows the
-    /// right device badge. pick_device prefers CUDA0 but we read the
-    /// actual loaded state in case the load path fell back to CPU.
+    /// right device badge, read from where the load actually placed it.
     pub async fn loaded_device(&self) -> Option<String> {
         self.device_kind.lock().await.clone()
     }
@@ -386,18 +385,32 @@ fn load_whisper_blocking(model_id: &str) -> AnyResult<WhisperModelState> {
     let mut mel_filters = vec![0f32; mel_bytes.len() / 4];
     LittleEndian::read_f32_into(mel_bytes, &mut mel_filters);
 
-    // Native substrate, F32 end-to-end (whisper-small is ~1 GB F32; the
-    // per-step host slicing keeps decode transfers tiny).
-    // Budget-aware placement: fastest GPU whose real free VRAM fits the F32 load
-    // (x2 vs the file when the checkpoint is F16), else CPU - never a blind CUDA:0.
-    let weights_size = std::fs::metadata(&weights_path)
-        .map(|m| m.len())
-        .unwrap_or(3_000_000_000);
-    let device = pick_device(weights_size * 2);
+    // Native substrate, F32 end-to-end, placed through the ladder in `place`: the weights as
+    // the card holds them, and one encoder pass over the full audio window beside them.
+    let (weights_size, _) =
+        crate::inference::place::runtime_demand::safetensors_f32_split(&[&weights_path], |_| true)
+            .map_err(|e| anyhow!("size whisper weights: {e}"))?;
+    let encoder_ffn =
+        unsafe { crate::tensor::safetensors_io::SafeTensorsLoader::multi(&[&weights_path]) }
+            .ok()
+            .and_then(|st| st.shape_of("model.encoder.layers.0.fc1.weight"))
+            .and_then(|d| d.first().copied())
+            .ok_or_else(|| anyhow!("whisper: no encoder feed-forward in the checkpoint"))?;
+    let reserve = crate::inference::place::runtime_demand::transformer_work_reserve(
+        weights_size,
+        config.max_source_positions,
+        config.d_model,
+        config.encoder_attention_heads,
+        encoder_ffn,
+    );
+    let (device, model) =
+        crate::inference::place::ladder::load_whole("Whisper", weights_size, reserve, |device| {
+            let vb = unsafe { VarBuilder::from_files(&[&weights_path], DType::F32, device)? };
+            let model = WhisperF32::load(&vb, config.clone())?;
+            Ok::<_, crate::tensor::Error>((device.clone(), model))
+        })
+        .map_err(|e| anyhow!("load whisper weights: {e}"))?;
     info!("Whisper device: {device:?}, dtype: F32 (native)");
-
-    let vb = unsafe { VarBuilder::from_files(&[weights_path], DType::F32, &device)? };
-    let model = WhisperF32::load(&vb, config.clone()).context("load whisper weights")?;
 
     let control = ControlTokens::resolve(&tokenizer)?;
 
@@ -452,12 +465,6 @@ fn load_whisper_blocking(model_id: &str) -> AnyResult<WhisperModelState> {
             languages: lang_tokens,
         },
     })
-}
-
-fn pick_device(model_bytes: u64) -> Device {
-    // hetero_place::place_whole probes real free VRAM and degrades to CPU when the
-    // model (+512 MB runtime reserve) doesn't fit - the fleet-wide placement policy.
-    crate::inference::place::plan::place_whole(model_bytes, 512 << 20)
 }
 
 /// Resolve a caller-supplied Whisper model name into a full HF model id.

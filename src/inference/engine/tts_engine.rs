@@ -493,30 +493,36 @@ fn load_parler_blocking(model_id: &str) -> AnyResult<TtsModelState> {
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow!("load parler tokenizer.json: {e}"))?;
 
-    // Budget-aware placement (same policy as the other TTS backends): fastest GPU whose real
-    // free VRAM fits the F32 weights, else CPU - never a fixed device index.
-    let weights_bytes: u64 = weights_path
-        .iter()
-        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
-        .sum();
-    let ndev = crate::inference::place::plan::place_whole(weights_bytes.max(512 << 20), 1 << 30);
-    let device = ndev.clone();
-    // Parler-TTS isn't validated under F16 (the audio encoder DAC has
-    // strict numerical behaviour). Stay in F32 to avoid drift.
-    let dtype = DType::F32;
-    info!("TTS device: {device:?}, dtype: {dtype:?}");
-
-    let vb = unsafe { VarBuilder::from_files(&weights_path, dtype, &device)? };
     let config: Config = serde_json::from_str(&std::fs::read_to_string(&config_path)?)
         .context("parse parler-tts config.json")?;
     let sample_rate = config.audio_encoder.sampling_rate as u32;
-    // parler's T5 runs on the native substrate (F32, matching the model dtype).
-    let t5_ndevice = &device.clone();
-    let t5_vb = unsafe {
-        crate::tensor::VarBuilder::from_files(&weights_path, crate::tensor::DType::F32, t5_ndevice)
-    }
-    .map_err(|e| anyhow!("parler t5 native weights: {e}"))?;
-    let model = ParlerModel::new(&config, vb, t5_vb).context("load parler-tts weights")?;
+    // Placed through the ladder in `place`: the weights as the card holds them in F32, and
+    // one decoder pass over its longest utterance beside them. Parler-TTS runs in F32 only:
+    // the DAC audio decoder is numerically strict.
+    let (weights_bytes, _) =
+        crate::inference::place::runtime_demand::safetensors_f32_split(&weights_path, |_| true)
+            .map_err(|e| anyhow!("size parler weights: {e}"))?;
+    let dec = &config.decoder;
+    let reserve = crate::inference::place::runtime_demand::transformer_work_reserve(
+        weights_bytes,
+        dec.max_position_embeddings,
+        dec.hidden_size,
+        dec.num_attention_heads,
+        dec.ffn_dim,
+    );
+    let (device, model) = crate::inference::place::ladder::load_whole(
+        "Parler-TTS",
+        weights_bytes,
+        reserve,
+        |device| {
+            let vb = unsafe { VarBuilder::from_files(&weights_path, DType::F32, device)? };
+            let t5_vb = unsafe { VarBuilder::from_files(&weights_path, DType::F32, device)? };
+            let model = ParlerModel::new(&config, vb, t5_vb)?;
+            Ok::<_, crate::tensor::Error>((device.clone(), model))
+        },
+    )
+    .map_err(|e| anyhow!("load parler-tts weights: {e}"))?;
+    info!("TTS device: {device:?}, dtype: F32");
 
     info!(
         "TTS loaded: parler-tts ({} Hz, vocab={})",
@@ -539,14 +545,16 @@ fn load_parler_blocking(model_id: &str) -> AnyResult<TtsModelState> {
 /// the native tensor stack - no onnxruntime. The voice path is resolved by the
 /// HTTP layer from the configured HF models dir (never hardcoded).
 fn load_piper_blocking(onnx_path: &std::path::Path) -> AnyResult<TtsModelState> {
-    // The HiFi-GAN decoder (the dominant cost) is all groups==1 convs, which
-    // hit the cuBLAS im2col GPU path - ~60x faster than the single-threaded CPU
-    // conv at audio resolution, bit-equivalent output. Budget-aware placement:
-    // fastest GPU whose real free VRAM fits the voice, else CPU.
-    let onnx_bytes = std::fs::metadata(onnx_path).map(|m| m.len()).unwrap_or(0);
-    let ndevice = crate::inference::place::plan::place_whole(onnx_bytes.max(256 << 20), 512 << 20);
-    let device = ndevice.clone();
-    let voice = PiperVoice::load(onnx_path, &ndevice)
+    // The HiFi-GAN decoder (the dominant cost) is all groups==1 convs, which hit the cuBLAS
+    // im2col GPU path. Placed through the ladder in `place` on the voice's own size.
+    let onnx_bytes = std::fs::metadata(onnx_path)
+        .map(|m| m.len())
+        .with_context(|| format!("size piper voice {onnx_path:?}"))?;
+    let reserve = crate::inference::place::runtime_demand::load_runtime_floor(onnx_bytes);
+    let (device, voice) =
+        crate::inference::place::ladder::load_whole("Piper voice", onnx_bytes, reserve, |device| {
+            PiperVoice::load(onnx_path, device).map(|v| (device.clone(), v))
+        })
         .map_err(|e| anyhow!("load piper voice {onnx_path:?}: {e}"))?;
     let sample_rate = voice.sample_rate;
     info!(
@@ -565,20 +573,6 @@ fn load_piper_blocking(onnx_path: &std::path::Path) -> AnyResult<TtsModelState> 
 /// conditioning from `voice_wav`. Runs on CPU (the native flow-matching loop is
 /// CPU-validated); 24 kHz mono output.
 fn load_pocket_tts_blocking(voice_wav: &std::path::Path) -> AnyResult<TtsModelState> {
-    // Prefer GPU: the flow-matching synth is dominated by per-frame
-    // transformer forwards - on CPU that's the /voice latency bottleneck.
-    // Every op threads `device`, so a CUDA device runs the whole pipeline on
-    // GPU. Falls back to CPU when CUDA is unavailable. (If a native op lacks a
-    // CUDA path this surfaces at load/synth; the CPU path stays the fallback.)
-    // Budget-aware placement (same policy as kyutai): fastest GPU that fits
-    // the ~236 MB model within its real free VRAM, else CPU.
-    let ndevice = crate::inference::place::plan::place_whole(512 << 20, 512 << 20);
-    let on_gpu = ndevice.is_cuda();
-    let device = ndevice.clone();
-    info!(
-        "pocket-tts device: {}",
-        if on_gpu { "CUDA (plan-chosen)" } else { "CPU" }
-    );
     let (ckpt, tok) = resolve_paths();
     let ckpt = ckpt
         .to_str()
@@ -593,10 +587,20 @@ fn load_pocket_tts_blocking(voice_wav: &std::path::Path) -> AnyResult<TtsModelSt
             "pocket-tts reference voice not found: {voice_wav:?}"
         ));
     }
-    let model = PocketTts::from_safetensors(ckpt, ndevice.clone())
+    // The flow-matching synth is dominated by per-frame transformer forwards, and every op
+    // threads `device`. Placed through the ladder in `place` on the checkpoint's F32 size.
+    let (ckpt_bytes, _) =
+        crate::inference::place::runtime_demand::safetensors_f32_split(&[ckpt], |_| true)
+            .map_err(|e| anyhow!("size pocket-tts: {e}"))?;
+    let reserve = crate::inference::place::runtime_demand::load_runtime_floor(ckpt_bytes);
+    let (device, model, encoder) =
+        crate::inference::place::ladder::load_whole("pocket-tts", ckpt_bytes, reserve, |device| {
+            let model = PocketTts::from_safetensors(ckpt, device.clone())?;
+            let encoder = MimiEncoder::from_safetensors(ckpt, device.clone())?;
+            Ok::<_, crate::tensor::Error>((device.clone(), model, encoder))
+        })
         .map_err(|e| anyhow!("load pocket-tts: {e}"))?;
-    let encoder = MimiEncoder::from_safetensors(ckpt, ndevice)
-        .map_err(|e| anyhow!("load mimi encoder: {e}"))?;
+    info!("pocket-tts device: {:?}", device.location());
     let tokenizer = SentencePiece::from_file(tok.to_str().unwrap())
         .map_err(|e| anyhow!("load sentencepiece: {e}"))?;
     let mut vsamp = load_wav_mono_24k(voice_wav.to_str().unwrap())
