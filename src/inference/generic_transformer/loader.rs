@@ -35,6 +35,8 @@ struct RawGenericLayer {
     attn_output: QTensor,
     /// Phi2: attn_output has a bias
     attn_output_bias_qt: Option<QTensor>,
+    /// Per-head attention-sink logits `[n_head]`.
+    attn_sinks_qt: Option<QTensor>,
     // Norm weights - always CPU
     attn_norm_qt: Option<QTensor>, // None for post-norm-only archs (OLMo2) -> Identity pre-norm
     /// Phi2/GPT-NeoX: full LayerNorm - bias on attn_norm
@@ -67,6 +69,11 @@ struct RawGenericLayer {
     /// pre-normed router, no dense shared FFN) MoE.
     moe_gate_exps: Option<QTensor>,
     moe_up_exps: Option<QTensor>,
+    /// Router bias `[n_experts]` and per-expert projection biases `[n_experts, width]`.
+    moe_gate_inp_bias_qt: Option<QTensor>,
+    moe_gate_exps_bias_qt: Option<QTensor>,
+    moe_up_exps_bias_qt: Option<QTensor>,
+    moe_down_exps_bias_qt: Option<QTensor>,
     pre_ffw_norm_2_qt: Option<QTensor>,
     post_ffw_norm_1_qt: Option<QTensor>,
     post_ffw_norm_2_qt: Option<QTensor>,
@@ -133,6 +140,43 @@ fn build_generic_layer(
     let build_norm_opt =
         |qt: Option<QTensor>| -> Result<Option<RmsNorm>> { qt.map(build_norm).transpose() };
 
+    // The block format float projections are requantised to: Q4K, unless a float weight's
+    // rows are not whole Q4K blocks, in which case the layer's float weights all take Q8_0
+    // so the byte-concat fusions below still see one format.
+    let requant_dtype = {
+        use crate::tensor::quantized::GgmlDType;
+        let is_float = |qt: &QTensor| {
+            matches!(
+                qt.dtype(),
+                GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
+            )
+        };
+        let whole_q4k_rows = [
+            raw.attn_q.as_ref(),
+            raw.attn_k.as_ref(),
+            raw.attn_v.as_ref(),
+            raw.attn_qkv.as_ref(),
+            Some(&raw.attn_output),
+            raw.ffn_gate.as_ref(),
+            Some(&raw.ffn_up),
+            Some(&raw.ffn_down),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|qt| is_float(qt))
+        .all(|qt| {
+            qt.shape()
+                .dims()
+                .last()
+                .is_some_and(|k| k.is_multiple_of(GgmlDType::Q4K.block_size()))
+        });
+        if whole_q4k_rows {
+            GgmlDType::Q4K
+        } else {
+            GgmlDType::Q8_0
+        }
+    };
+
     // Attention weights. Some GGUFs store specific weights (e.g. qwen3
     // keeps one per-layer tensor at F16) as non-quantized dtypes. That
     // routes them through the reference F32 cublas gemv, which is memory-bound
@@ -159,14 +203,15 @@ fn build_generic_layer(
         if needs_requant {
             let shape = qt.shape().clone();
             let dequantized = qt.dequantize(&Device::Cpu)?;
-            // Use Q4K (not Q6K) so that all per-layer weights share the
-            // same quant type, enabling QKV and FFN gate+up fusions.
-            let qt_q4 = QTensor::quantize_onto(
-                &dequantized,
-                crate::tensor::quantized::GgmlDType::Q4K,
-                device,
-            )?;
-            tracing::debug!("  Requantized {:?} weight from {:?} -> Q4K", shape, dtype);
+            // One block format for every per-layer weight, so that the QKV and FFN
+            // gate+up fusions apply.
+            let qt_q4 = QTensor::quantize_onto(&dequantized, requant_dtype, device)?;
+            tracing::debug!(
+                "  Requantized {:?} weight from {:?} -> {:?}",
+                shape,
+                dtype,
+                requant_dtype
+            );
             Ok(Some(QMatMul::from_qtensor(qt_q4)?))
         } else {
             Ok(Some(QMatMul::from_qtensor(qt)?))
@@ -188,12 +233,13 @@ fn build_generic_layer(
         if needs {
             let shape = qt.shape().clone();
             let dequantized = qt.dequantize(&Device::Cpu)?;
-            let qt_new = QTensor::quantize_onto(
-                &dequantized,
-                crate::tensor::quantized::GgmlDType::Q4K,
-                device,
-            )?;
-            tracing::debug!("  Requantized {:?} weight from {:?} -> Q4K", shape, dtype);
+            let qt_new = QTensor::quantize_onto(&dequantized, requant_dtype, device)?;
+            tracing::debug!(
+                "  Requantized {:?} weight from {:?} -> {:?}",
+                shape,
+                dtype,
+                requant_dtype
+            );
             Ok(qt_new)
         } else {
             Ok(qt)
@@ -500,6 +546,12 @@ fn build_generic_layer(
         }
     };
     let attn_output_bias = bias_to_device(raw.attn_output_bias_qt)?;
+    let attn_sinks_host = raw
+        .attn_sinks_qt
+        .as_ref()
+        .map(|qt| qt.dequantize(&Device::Cpu)?.to_vec1::<f32>())
+        .transpose()?;
+    let attn_sinks = bias_to_device(raw.attn_sinks_qt)?;
     let ffn_up_bias = bias_to_device(raw.ffn_up_bias_qt)?;
     let ffn_down_bias = bias_to_device(raw.ffn_down_bias_qt)?;
     // Extract raw weight for fused add+rmsnorm kernel before build_norm consumes QTensor
@@ -612,6 +664,7 @@ fn build_generic_layer(
         device: &Device,
     ) -> Result<crate::tensor::quantized::QTensor> {
         use crate::tensor::quantized::GgmlDType;
+        // MXFP4 stacks are read in their own format by the expert kernels.
         let supported = matches!(
             qt.dtype(),
             GgmlDType::Q2K
@@ -620,6 +673,7 @@ fn build_generic_layer(
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
                 | GgmlDType::Q8_0
+                | GgmlDType::MxFp4
         );
         if supported {
             return Ok(qt);
@@ -635,8 +689,18 @@ fn build_generic_layer(
         // fused [n_exp, 2*ffn, hidden] layout, then requantize to Q8.
         let (gus, fused_f32, router_prenormed, use_silu, gate_sep, up_sep) =
             match (raw.moe_gate_up_exps, raw.moe_gate_exps, raw.moe_up_exps) {
+                // Clamped-SwiGLU experts read gate and up apart on every device, so no
+                // fused stack or host cache is built for them.
+                (None, Some(ge), Some(ue)) if config.expert_swiglu_clamp.is_some() => (
+                    None,
+                    None,
+                    true,
+                    true,
+                    Some(std::sync::Arc::new(coerce_moe_weight(ge, device)?)),
+                    Some(std::sync::Arc::new(coerce_moe_weight(ue, device)?)),
+                ),
                 (Some(gus_fused), _, _) => (
-                    coerce_moe_weight(gus_fused, device)?,
+                    Some(coerce_moe_weight(gus_fused, device)?),
                     None,
                     false,
                     false,
@@ -656,7 +720,7 @@ fn build_generic_layer(
                     // GPU SiLU kernel; the exact F32 fused feeds the CPU cache.
                     let gate_q = std::sync::Arc::new(coerce_moe_weight(ge, device)?);
                     let up_q = std::sync::Arc::new(coerce_moe_weight(ue, device)?);
-                    (gus, Some(fused), true, true, Some(gate_q), Some(up_q))
+                    (Some(gus), Some(fused), true, true, Some(gate_q), Some(up_q))
                 }
                 _ => {
                     return Err(crate::tensor::Error::msg(
@@ -701,12 +765,13 @@ fn build_generic_layer(
         // footprint per CPU layer (≈1.5 GB instead of 3 GB), keeping the
         // total cache footprint manageable when the heterogeneous planner
         // offloads many layers (e.g., 14 layers x 3 GB = 42 GB -> 21 GB).
-        let (gus_f32, des_f32) = if !on_gpu || use_silu {
-            let g = match &fused_f32 {
-                Some(f) => f.to_dtype(crate::tensor::DType::BF16)?,
-                None => gus
+        let (gus_f32, des_f32) = if (!on_gpu || use_silu) && gus.is_some() {
+            let g = match (&fused_f32, &gus) {
+                (Some(f), _) => f.to_dtype(crate::tensor::DType::BF16)?,
+                (None, Some(gus)) => gus
                     .dequantize(&Device::Cpu)?
                     .to_dtype(crate::tensor::DType::BF16)?,
+                (None, None) => unreachable!("guarded by gus.is_some()"),
             };
             let d = des
                 .dequantize(&Device::Cpu)?
@@ -715,10 +780,30 @@ fn build_generic_layer(
         } else {
             (None, None)
         };
+        let swiglu_clamp = config.expert_swiglu_clamp.filter(|_| gate_sep.is_some());
+        let gate_inp_bias = load_bias(raw.moe_gate_inp_bias_qt)?;
+        let gate_exps_bias = load_bias(raw.moe_gate_exps_bias_qt)?;
+        let up_exps_bias = load_bias(raw.moe_up_exps_bias_qt)?;
+        let down_exps_bias = load_bias(raw.moe_down_exps_bias_qt)?;
+        let biased = gate_inp_bias.is_some()
+            || gate_exps_bias.is_some()
+            || up_exps_bias.is_some()
+            || down_exps_bias.is_some();
+        if biased && (swiglu_clamp.is_none() || !router_prenormed) {
+            return Err(crate::tensor::Error::msg(
+                "MoE layer carries router or expert biases, which only the pre-normed \
+                 clamped-SwiGLU expert block applies",
+            ));
+        }
         Some(MoeWeights {
             gate_inp: crate::tensor::quantized::QMatMul::from_qtensor(gi)?,
             gate_inp_scale,
-            gate_up_exps: std::sync::Arc::new(gus),
+            gate_inp_bias,
+            gate_exps_bias,
+            up_exps_bias,
+            down_exps_bias,
+            swiglu_clamp,
+            gate_up_exps: gus.map(std::sync::Arc::new),
             down_exps: std::sync::Arc::new(des),
             gate_exps_sep: gate_sep,
             up_exps_sep: up_sep,
@@ -759,6 +844,23 @@ fn build_generic_layer(
         None
     };
 
+    // SWA classification: the explicit per-layer pattern (gemma4 `sliding_window_pattern`)
+    // when the file has one, else the architecture's period, else the head_dim heuristic
+    // (SWA layers have a smaller head than the global config).
+    let is_swa = match config
+        .swa_pattern
+        .as_ref()
+        .and_then(|p| p.get(raw.layer_idx))
+    {
+        Some(&s) => s,
+        None => match config.swa_period {
+            Some(period) => windowed_by_period(period, raw.layer_idx),
+            None => head_dim < config.head_dim,
+        },
+    };
+    let layer_window = config.sliding_window.filter(|_| is_swa);
+    let has_sinks = attn_sinks.is_some();
+
     Ok(GenericTransformerLayer {
         attn_q,
         attn_k,
@@ -773,6 +875,8 @@ fn build_generic_layer(
         attn_v_norm_ones,
         attn_output,
         attn_output_bias,
+        attn_sinks,
+        attn_sinks_host,
         no_rope: no_rope_layer_period(&config.arch)
             .is_some_and(|period| (raw.layer_idx + 1).is_multiple_of(period)),
         attn_norm,
@@ -838,15 +942,9 @@ fn build_generic_layer(
             // (set_window overrides max_seq_len; init_cap above governs the
             // GLOBAL, non-windowed layers.) Same SWA classification as the
             // per-layer `sliding_window` below.
-            let is_swa = match config
-                .swa_pattern
-                .as_ref()
-                .and_then(|p| p.get(raw.layer_idx))
-            {
-                Some(&s) => s,
-                None => head_dim < config.head_dim,
-            };
-            if is_swa {
+            // A period-classified model keeps every position: its layers window at
+            // attention time.
+            if layer_window.is_some() && config.swa_period.is_none() {
                 if let Some(w) = config.sliding_window {
                     c.set_window(
                         w,
@@ -873,7 +971,9 @@ fn build_generic_layer(
                 config.n_head / n_kv_head_layer.max(1),
             );
             let max_seq = config.effective_max_context();
-            let built = if device.is_cuda() && shape_supported {
+            // The quantised attention kernels have no sink term: a sink layer keeps its
+            // history in the F-dtype cache.
+            let built = if device.is_cuda() && shape_supported && !has_sinks {
                 match config.kv_quant {
                     KvQuant::Q8 => Some(
                         crate::inference::cache::q8_kv::Q8KvCache::new(
@@ -927,12 +1027,12 @@ fn build_generic_layer(
         // gemma4 F16 KV lever (kv_quant==Off only - Q8/Q4 caches already halve
         // the read). Opt-out A/B knob `LOKEN_GEMMA4_F32_KV` keeps the F32
         // path for measurement. gemma4 detected by arch; other arches unchanged.
+        // A sink layer stores F16 too: its card decode attention reads F16 K/V.
         kv_f16: {
             use crate::inference::engine::llm_engine::KvQuant;
-            config.arch == "gemma4"
+            (config.arch == "gemma4" || has_sinks)
                 && matches!(config.kv_quant, KvQuant::Off)
                 && device.is_cuda()
-                && true
         },
         padded_mask: None,
         graph_q_buffer: None,
@@ -1003,30 +1103,12 @@ fn build_generic_layer(
         n_head: config.n_head,
         n_kv_head: n_kv_head_layer,
         head_dim,
-        // SWA classification: prefer the explicit per-layer pattern (gemma4
-        // `sliding_window_pattern`, authoritative); fall back to the head_dim
-        // heuristic (SWA layers have a smaller head than the global config).
-        sliding_window: match config
-            .swa_pattern
-            .as_ref()
-            .and_then(|p| p.get(raw.layer_idx))
-        {
-            Some(&is_swa) => {
-                if is_swa {
-                    config.sliding_window
-                } else {
-                    None
-                }
-            }
-            None => {
-                if head_dim < config.head_dim {
-                    config.sliding_window
-                } else {
-                    None
-                }
-            }
+        sliding_window: layer_window,
+        prefill_mask_window: if config.swa_period.is_some() {
+            layer_window
+        } else {
+            config.sliding_window
         },
-        prefill_mask_window: config.sliding_window,
         rope_dim,
         rope_base,
         attention_scale: config.attention_scale,
@@ -1244,6 +1326,8 @@ fn build_awq_layer(
         attn_v_norm_ones: None,
         attn_output,
         attn_output_bias: None,
+        attn_sinks: None,
+        attn_sinks_host: None,
         attn_norm,
         attn_norm_weight_f32: None,
         post_attn_norm: None,
@@ -1801,10 +1885,19 @@ impl GenericHeteroTransformer {
                 None
             };
 
-            let attn_output = req!(&format!("{prefix}.attn_output.weight"))?;
+            let attn_output_stem = attn_output_name(&content);
+            let attn_output = req!(&format!("{prefix}.{attn_output_stem}.weight"))?;
             // Phi2: attn_output bias
             let attn_output_bias_qt = if f.has_attn_output_bias {
-                opt_cpu!(&format!("{prefix}.attn_output.bias"))?
+                opt_cpu!(&format!("{prefix}.{attn_output_stem}.bias"))?
+            } else {
+                None
+            };
+            let attn_sinks_qt = if f.has_attn_sinks {
+                let name = attn_sinks_name(&content, idx).ok_or_else(|| {
+                    crate::tensor::Error::msg(format!("missing tensor: {prefix}.attn_sinks"))
+                })?;
+                Some(req_cpu!(&name)?)
             } else {
                 None
             };
@@ -1944,6 +2037,21 @@ impl GenericHeteroTransformer {
             } else {
                 None
             };
+            let (
+                moe_gate_inp_bias_qt,
+                moe_gate_exps_bias_qt,
+                moe_up_exps_bias_qt,
+                moe_down_exps_bias_qt,
+            ) = if f.is_moe {
+                (
+                    opt_cpu!(&format!("{prefix}.ffn_gate_inp.bias"))?,
+                    opt_cpu!(&format!("{prefix}.ffn_gate_exps.bias"))?,
+                    opt_cpu!(&format!("{prefix}.ffn_up_exps.bias"))?,
+                    opt_cpu!(&format!("{prefix}.ffn_down_exps.bias"))?,
+                )
+            } else {
+                (None, None, None, None)
+            };
             let pre_ffw_norm_2_qt = if f.has_pre_ffw_norm_2 {
                 opt_cpu!(&format!("{prefix}.pre_ffw_norm_2.weight"))?
             } else {
@@ -1976,6 +2084,7 @@ impl GenericHeteroTransformer {
                 attn_k_norm_qt,
                 attn_output,
                 attn_output_bias_qt,
+                attn_sinks_qt,
                 attn_norm_qt,
                 attn_norm_bias_qt,
                 post_attn_norm_qt,
@@ -1997,6 +2106,10 @@ impl GenericHeteroTransformer {
                 moe_down_exps_scale_qt,
                 moe_gate_exps,
                 moe_up_exps,
+                moe_gate_inp_bias_qt,
+                moe_gate_exps_bias_qt,
+                moe_up_exps_bias_qt,
+                moe_down_exps_bias_qt,
                 pre_ffw_norm_2_qt,
                 post_ffw_norm_1_qt,
                 post_ffw_norm_2_qt,

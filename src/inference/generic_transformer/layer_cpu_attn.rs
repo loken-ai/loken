@@ -3,6 +3,10 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Bytes the transient scores of one query tile may hold in a multi-row attention that
+/// materialises them.
+const SCORES_TILE_BYTES: usize = 256 << 20;
+
 impl GenericTransformerLayer {
     /// Append the new token(s) `k`/`v` (`[1, n_kv, seq, hd]`, post-RoPE,
     /// pre-F16-append) to the CPU Q8 KV store. Gated to eligible dense GQA
@@ -16,9 +20,11 @@ impl GenericTransformerLayer {
         index_pos: usize,
         is_shared: bool,
     ) {
-        // gemma4 (V-norm) uses the F16 windowed store (Q8 degenerate at hd512);
-        // other dense GQA arches use the Q8 store.
+        // gemma4 (V-norm) uses the F16 windowed store (Q8 degenerate at hd512), and so
+        // does a sink layer, whose host decode scan folds the sink in; other dense GQA
+        // arches use the Q8 store.
         let is_gemma = self.attn_v_norm_ones.is_some();
+        let f16_store = is_gemma || self.attn_sinks.is_some();
         let eligible = !is_shared
             && self.head_dim.is_multiple_of(32)
             && self.n_kv_head > 0
@@ -34,7 +40,7 @@ impl GenericTransformerLayer {
                 .and_then(|t| t.flatten_all().ok())
                 .and_then(|t| t.to_vec1::<f32>().ok())
         };
-        if is_gemma {
+        if f16_store {
             if index_pos == 0 {
                 self.cpu_f16_kv = None;
             }
@@ -63,13 +69,17 @@ impl GenericTransformerLayer {
                 for h in 0..nkv {
                     let src = h * seq * hd + p * hd;
                     kt[h * hd..(h + 1) * hd].copy_from_slice(&kf[src..src + hd]);
-                    // gemma V-norm (RMSNorm-no-weight, eps 1e-6) - match decode.
                     let vs = &vf[src..src + hd];
-                    let mut ss = 0f32;
-                    for &x in vs {
-                        ss += x * x;
-                    }
-                    let inv = 1.0 / (ss / hd as f32 + 1e-6).sqrt();
+                    // gemma V-norm (RMSNorm-no-weight, eps 1e-6) - match decode.
+                    let inv = if is_gemma {
+                        let mut ss = 0f32;
+                        for &x in vs {
+                            ss += x * x;
+                        }
+                        1.0 / (ss / hd as f32 + 1e-6).sqrt()
+                    } else {
+                        1.0
+                    };
                     for i in 0..hd {
                         vt[h * hd + i] = vs[i] * inv;
                     }
@@ -143,7 +153,7 @@ impl GenericTransformerLayer {
         // standard_attention on CPU (the 2.5K cliff). The impl is device-guarded
         // (only runs when the store is CPU-populated; returns None otherwise).
         {
-            if b != 1 || self.attn_softcap.is_some() {
+            if b != 1 || self.attn_softcap.is_some() || self.attn_sinks.is_some() {
                 return Ok(None);
             }
             let hd = self.head_dim;
@@ -392,6 +402,7 @@ impl GenericTransformerLayer {
     /// gated + validated for coherence, like the decode-side fused CPU kernels.
     /// NOT cfg-gated (runs on the canonical CUDA binary under `--cpu`); the
     /// runtime `q.device()==Cpu` check at the call site gates it, no-op on GPU.
+    /// `sinks`, one logit per query head, join each row's denominator unscaled.
     fn flash_attn_prefill_cpu(
         q: &Tensor,
         k: &Tensor,
@@ -399,6 +410,7 @@ impl GenericTransformerLayer {
         mask: &Tensor,
         scale: f32,
         n_rep: usize,
+        sinks: Option<&[f32]>,
     ) -> Result<Tensor> {
         let (b, n_head, seq_q, d) = q.dims4()?;
         let (_, _n_kv, seq_kv, _) = k.dims4()?;
@@ -450,10 +462,18 @@ impl GenericTransformerLayer {
                     m = dot;
                 }
             }
+            // The sink raises the stabilising maximum when it is the largest logit.
+            let sink = sinks.map(|s| s[head]);
+            if let Some(sl) = sink {
+                if sl > m {
+                    m = sl;
+                }
+            }
             // exp(sc - m) in place, returns Σ; the same vectorised primitive the
             // decode/lfm2 softmax scans use.
             let s = if m.is_finite() {
                 crate::inference::kernel::cpu_decode_exec::exp_sub_max_sum(&mut sc, m)
+                    + sink.map_or(0.0, |sl| (sl - m).exp())
             } else {
                 0.0
             };
@@ -469,6 +489,89 @@ impl GenericTransformerLayer {
             }
         });
         Tensor::from_vec(out, (b, n_head, seq_q, d), &q.device())
+    }
+
+    /// Attention of a layer with per-head sinks: `q` `[b, n_head, seq, hd]` against the
+    /// appended `k`/`v` `[b, n_kv, kv, hd]`, `mask` `[seq, kv]` u8 (1 hides a key) or `None`
+    /// at decode. Returns `[b, n_head, seq, hd]` in `q`'s dtype. A windowed layer's decode
+    /// reads its last `sliding_window` keys; its prefill window is in the mask.
+    ///
+    /// The host decode scans the F16 store, a card decode runs the F16 flash decode, the
+    /// host prefill the online-softmax walk, each with the sink in its denominator; every
+    /// other shape materialises the scores.
+    pub(super) fn sink_attention(
+        &self,
+        q: &Tensor,
+        k: Tensor,
+        v: Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let sinks = self
+            .attn_sinks
+            .as_ref()
+            .ok_or_else(|| crate::tensor::Error::msg("sink attention on a layer without sinks"))?;
+        let (b, n_head, seq, hd) = q.dims4()?;
+        let n_rep = self.n_head / self.n_kv_head.max(1);
+        let scale = self
+            .attention_scale
+            .unwrap_or_else(|| 1.0 / (hd as f64).sqrt());
+        let window = self.sliding_window.filter(|&w| w > 0);
+        let kv_len = k.dims()[2];
+        let host = matches!(q.device(), crate::tensor::Device::Cpu);
+        if seq == 1 && b == 1 && mask.is_none() && host {
+            if let (Some(cache), Some(sinks_host)) =
+                (self.cpu_f16_kv.as_ref(), self.attn_sinks_host.as_deref())
+            {
+                if cache.len() == kv_len && cache.window() == window {
+                    let qf = q
+                        .to_dtype(crate::tensor::DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let mut out = vec![0f32; n_head * hd];
+                    cache.attention_sinks(&qf, scale as f32, Some(sinks_host), &mut out)?;
+                    return Tensor::from_vec(out, (1, n_head, 1, hd), &q.device())?
+                        .to_dtype(q.dtype());
+                }
+            }
+        }
+        if seq == 1 && mask.is_none() && q.device().is_cuda() {
+            let kv_start = match window {
+                Some(w) if kv_len > w => kv_len - w,
+                _ => 0,
+            };
+            let f16 = |t: &Tensor| t.to_dtype(crate::tensor::DType::F16);
+            if let Some(o) = crate::inference::kernel::fused::gptoss_flash_decode_win(
+                &f16(q)?,
+                &f16(&k)?,
+                &f16(&v)?,
+                None,
+                Some(sinks),
+                scale as f32,
+                b,
+                n_head,
+                self.n_kv_head,
+                kv_start,
+                kv_len,
+                hd,
+            )? {
+                return o.reshape((b, n_head, 1, hd))?.to_dtype(q.dtype());
+            }
+        }
+        if host && q.dtype() == crate::tensor::DType::F32 && b == 1 {
+            if let (Some(m), Some(sinks_host)) = (mask, self.attn_sinks_host.as_deref()) {
+                let f32 = |t: &Tensor| t.to_dtype(crate::tensor::DType::F32);
+                return Self::flash_attn_prefill_cpu(
+                    q,
+                    &f32(&k)?,
+                    &f32(&v)?,
+                    m,
+                    scale as f32,
+                    n_rep,
+                    Some(sinks_host),
+                );
+            }
+        }
+        sink_attention_matmul(q, k, v, mask, sinks, scale, self.n_kv_head, window)
     }
 
     pub(super) fn standard_attention(
@@ -585,7 +688,7 @@ impl GenericTransformerLayer {
                 && self.attn_softcap.is_none()
             {
                 if let Some(m) = mask {
-                    return Self::flash_attn_prefill_cpu(q, &k, &v, m, scale as f32, n_rep);
+                    return Self::flash_attn_prefill_cpu(q, &k, &v, m, scale as f32, n_rep, None);
                 }
             }
             // General prefill path (seq_q > 1), QUERY-TILED. The [b,n_head,seq,seq]
@@ -612,7 +715,7 @@ impl GenericTransformerLayer {
             // tile auto-shrinks as seq grows (sized from the shape + a memory ceiling, not
             // a magic switch). seq_q <= tile ⇒ a single matmul, identical to before.
             let per_row = (qd.dims()[0] * self.n_head * seq_kv).max(1) * 4;
-            let tile = ((256usize << 20) / per_row).clamp(1, seq_q);
+            let tile = (SCORES_TILE_BYTES / per_row).clamp(1, seq_q);
             let attend = |qt: &Tensor, q_off: usize| -> Result<Tensor> {
                 let tlen = qt.dims()[2];
                 let att = qt.matmul(&kt)?; // [b,n_head,tlen,seq_kv]
@@ -669,5 +772,328 @@ impl GenericTransformerLayer {
                 Ok(out.to_dtype(q.dtype())?)
             }
         }
+    }
+}
+
+/// Attention with per-head sinks over materialised scores: `q` `[b, n_head, seq, hd]`,
+/// `k`/`v` `[b, n_kv_head, kv, hd]`, `mask` `[seq, kv]` u8 with 1 where a key is hidden.
+/// With no mask and one query row, `window` keeps the last `window` keys. Scores and the
+/// sink softmax run in F32; the query rows are tiled so the scores stay within the
+/// budget `standard_attention` uses. Returns `[b, n_head, seq, hd]` in `q`'s dtype.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn sink_attention_matmul(
+    q: &Tensor,
+    k: Tensor,
+    v: Tensor,
+    mask: Option<&Tensor>,
+    sinks: &Tensor,
+    scale: f64,
+    n_kv_head: usize,
+    window: Option<usize>,
+) -> Result<Tensor> {
+    use crate::tensor::DType;
+    let (b, n_head, seq, hd) = q.dims4()?;
+    let (k, v) = match window {
+        Some(w) if mask.is_none() && seq == 1 && k.dims()[2] > w => {
+            let start = k.dims()[2] - w;
+            (k.narrow(2, start, w)?, v.narrow(2, start, w)?)
+        }
+        _ => (k, v),
+    };
+    let kv_len = k.dims()[2];
+    // Query heads sharing one key/value head sit next to each other, so the grouped
+    // reshape reads each K/V head once for its whole group.
+    let g = n_head / n_kv_head.max(1);
+    let kv_dt = k.dtype();
+    let kt = k.t()?;
+    let v = v.contiguous()?;
+    let sinks = sinks.to_dtype(DType::F32)?;
+    let neg_inf = Tensor::new(f32::NEG_INFINITY, &q.device())?;
+    let attend = |qt: &Tensor, off: usize| -> Result<Tensor> {
+        let t = qt.dims()[2];
+        let qt = qt.to_dtype(kv_dt)?.contiguous()?;
+        let scores = qt
+            .reshape((b, n_kv_head, g * t, hd))?
+            .matmul(&kt)?
+            .to_dtype(DType::F32)?
+            .reshape((b, n_head, t, kv_len))?;
+        let scores = match mask {
+            None => scores,
+            Some(m) => {
+                let qdim = m.dims().len() - 2;
+                let mt = if m.dims()[qdim] == 1 {
+                    m.clone()
+                } else {
+                    m.narrow(qdim, off, t)?
+                };
+                mt.broadcast_as(scores.shape())?
+                    .where_cond(&neg_inf.broadcast_as(scores.dims())?, &scores)?
+            }
+        };
+        let weights =
+            crate::tensor::ops::softmax_last_dim_with_sinks(&scores, None, &sinks, scale)?
+                .to_dtype(v.dtype())?;
+        weights
+            .reshape((b, n_kv_head, g * t, kv_len))?
+            .matmul(&v)?
+            .reshape((b, n_head, t, hd))
+    };
+    let per_row = (b * n_head * kv_len).max(1) * std::mem::size_of::<f32>();
+    let tile = (SCORES_TILE_BYTES / per_row).clamp(1, seq.max(1));
+    let out = if seq <= tile {
+        attend(q, 0)?
+    } else {
+        let mut outs = Vec::with_capacity(seq.div_ceil(tile));
+        let mut off = 0;
+        while off < seq {
+            let t = (seq - off).min(tile);
+            outs.push(attend(&q.narrow(2, off, t)?, off)?);
+            off += t;
+        }
+        Tensor::cat(&outs.iter().collect::<Vec<_>>(), 2)?
+    };
+    out.to_dtype(q.dtype())
+}
+
+#[cfg(test)]
+mod sink_attention_tests {
+    use super::*;
+    use crate::tensor::Device;
+
+    /// Deterministic values in `[-amp, amp)`.
+    fn values(n: usize, seed: u64, amp: f32) -> Vec<f32> {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * amp
+            })
+            .collect()
+    }
+
+    /// Scalar attention with sinks: query row `i` at absolute position `base + i` sees the
+    /// keys `j <= base + i` no more than `window - 1` behind it, and each head's sink joins
+    /// its denominator. `q` `[n_head][seq][hd]`, `k`/`v` `[n_kv][kv][hd]`.
+    #[allow(clippy::too_many_arguments)]
+    fn reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        sinks: &[f32],
+        (n_head, n_kv, seq, kv, hd): (usize, usize, usize, usize, usize),
+        base: usize,
+        window: Option<usize>,
+        scale: f32,
+    ) -> Vec<f32> {
+        let g = n_head / n_kv;
+        let mut out = vec![0f32; n_head * seq * hd];
+        for h in 0..n_head {
+            let kh = h / g;
+            for i in 0..seq {
+                let pos = base + i;
+                let visible: Vec<usize> = (0..kv)
+                    .filter(|&j| j <= pos && window.is_none_or(|w| pos - j < w))
+                    .collect();
+                let qrow = &q[(h * seq + i) * hd..(h * seq + i + 1) * hd];
+                let logits: Vec<f32> = visible
+                    .iter()
+                    .map(|&j| {
+                        let krow = &k[(kh * kv + j) * hd..(kh * kv + j + 1) * hd];
+                        qrow.iter().zip(krow).map(|(a, b)| a * b).sum::<f32>() * scale
+                    })
+                    .collect();
+                let m = logits.iter().cloned().fold(sinks[h], f32::max);
+                let denom: f32 =
+                    logits.iter().map(|l| (l - m).exp()).sum::<f32>() + (sinks[h] - m).exp();
+                for (l, &j) in logits.iter().zip(&visible) {
+                    let p = (l - m).exp() / denom;
+                    let vrow = &v[(kh * kv + j) * hd..(kh * kv + j + 1) * hd];
+                    for c in 0..hd {
+                        out[(h * seq + i) * hd + c] += p * vrow[c];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn causal_mask(seq: usize, base: usize, window: Option<usize>) -> Tensor {
+        let kv = base + seq;
+        let data: Vec<u8> = (0..seq)
+            .flat_map(|i| {
+                (0..kv).map(move |j| {
+                    let pos = base + i;
+                    u8::from(j > pos || window.is_some_and(|w| j + w <= pos))
+                })
+            })
+            .collect();
+        Tensor::from_slice(&data, (seq, kv), &Device::Cpu).unwrap()
+    }
+
+    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    }
+
+    const SHAPE: (usize, usize, usize) = (4, 2, 8); // query heads, key/value heads, head dim
+
+    fn inputs(seq: usize, kv: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let (nh, nkv, hd) = SHAPE;
+        (
+            values(nh * seq * hd, 1, 1.0),
+            values(nkv * kv * hd, 2, 1.0),
+            values(nkv * kv * hd, 3, 1.0),
+            values(nh, 4, 2.0),
+        )
+    }
+
+    #[test]
+    fn the_materialised_prefill_matches_the_scalar_reference() {
+        let (nh, nkv, hd) = SHAPE;
+        let (seq, base) = (6usize, 3usize);
+        let kv = base + seq;
+        let (qv, kvv, vv, sv) = inputs(seq, kv);
+        let dev = Device::Cpu;
+        let scale = 1.0 / (hd as f32).sqrt();
+        for window in [None, Some(3)] {
+            let q = Tensor::from_vec(qv.clone(), (1, nh, seq, hd), &dev).unwrap();
+            let k = Tensor::from_vec(kvv.clone(), (1, nkv, kv, hd), &dev).unwrap();
+            let v = Tensor::from_vec(vv.clone(), (1, nkv, kv, hd), &dev).unwrap();
+            let sinks = Tensor::from_vec(sv.clone(), (nh,), &dev).unwrap();
+            let mask = causal_mask(seq, base, window);
+            let got =
+                sink_attention_matmul(&q, k, v, Some(&mask), &sinks, scale as f64, nkv, window)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+            let want = reference(
+                &qv,
+                &kvv,
+                &vv,
+                &sv,
+                (nh, nkv, seq, kv, hd),
+                base,
+                window,
+                scale,
+            );
+            assert!(max_diff(&got, &want) < 1e-5, "window {window:?}");
+        }
+    }
+
+    #[test]
+    fn the_host_flash_prefill_folds_the_sink_like_the_reference() {
+        let (nh, nkv, hd) = SHAPE;
+        let (seq, base) = (5usize, 2usize);
+        let kv = base + seq;
+        let (qv, kvv, vv, sv) = inputs(seq, kv);
+        let dev = Device::Cpu;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let q = Tensor::from_vec(qv.clone(), (1, nh, seq, hd), &dev).unwrap();
+        let k = Tensor::from_vec(kvv.clone(), (1, nkv, kv, hd), &dev).unwrap();
+        let v = Tensor::from_vec(vv.clone(), (1, nkv, kv, hd), &dev).unwrap();
+        let mask = causal_mask(seq, base, Some(4));
+        let got = GenericTransformerLayer::flash_attn_prefill_cpu(
+            &q,
+            &k,
+            &v,
+            &mask,
+            scale,
+            nh / nkv,
+            Some(&sv),
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        let want = reference(
+            &qv,
+            &kvv,
+            &vv,
+            &sv,
+            (nh, nkv, seq, kv, hd),
+            base,
+            Some(4),
+            scale,
+        );
+        assert!(max_diff(&got, &want) < 1e-5);
+    }
+
+    #[test]
+    fn a_windowed_decode_attends_the_last_keys_and_the_sink() {
+        let (nh, nkv, hd) = SHAPE;
+        let kv = 9usize;
+        let (qv, kvv, vv, sv) = inputs(1, kv);
+        let dev = Device::Cpu;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let q = Tensor::from_vec(qv.clone(), (1, nh, 1, hd), &dev).unwrap();
+        let k = Tensor::from_vec(kvv.clone(), (1, nkv, kv, hd), &dev).unwrap();
+        let v = Tensor::from_vec(vv.clone(), (1, nkv, kv, hd), &dev).unwrap();
+        let sinks = Tensor::from_vec(sv.clone(), (nh,), &dev).unwrap();
+        let got = sink_attention_matmul(&q, k, v, None, &sinks, scale as f64, nkv, Some(3))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let want = reference(
+            &qv,
+            &kvv,
+            &vv,
+            &sv,
+            (nh, nkv, 1, kv, hd),
+            kv - 1,
+            Some(3),
+            scale,
+        );
+        assert!(max_diff(&got, &want) < 1e-5);
+    }
+
+    #[test]
+    fn without_a_sink_the_flash_prefill_is_unchanged() {
+        let (nh, nkv, hd) = SHAPE;
+        let (seq, base) = (4usize, 0usize);
+        let (qv, kvv, vv, _) = inputs(seq, seq);
+        let dev = Device::Cpu;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let q = Tensor::from_vec(qv.clone(), (1, nh, seq, hd), &dev).unwrap();
+        let k = Tensor::from_vec(kvv.clone(), (1, nkv, seq, hd), &dev).unwrap();
+        let v = Tensor::from_vec(vv.clone(), (1, nkv, seq, hd), &dev).unwrap();
+        let mask = causal_mask(seq, base, None);
+        let got = GenericTransformerLayer::flash_attn_prefill_cpu(
+            &q,
+            &k,
+            &v,
+            &mask,
+            scale,
+            nh / nkv,
+            None,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        // A sink at -inf contributes nothing: the plain softmax.
+        let silent = vec![f32::NEG_INFINITY; nh];
+        let want = reference(
+            &qv,
+            &kvv,
+            &vv,
+            &silent,
+            (nh, nkv, seq, seq, hd),
+            base,
+            None,
+            scale,
+        );
+        assert!(max_diff(&got, &want) < 1e-5);
     }
 }

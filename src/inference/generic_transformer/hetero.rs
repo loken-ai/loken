@@ -170,16 +170,37 @@ impl GenericHeteroTransformer {
         index_pos: usize,
         cuda_idx: Option<usize>,
     ) -> Result<Tensor> {
+        self.make_mask_reaching(seq_q, index_pos, cuda_idx, self.sliding_window)
+    }
+
+    /// The causal mask of one layer of a period-classified model: a windowed layer sees
+    /// its last `window` keys, its own position included, as the reference's sliding
+    /// window does.
+    pub(super) fn make_layer_mask(
+        &mut self,
+        seq_q: usize,
+        index_pos: usize,
+        cuda_idx: Option<usize>,
+        window: Option<usize>,
+    ) -> Result<Tensor> {
+        let reach = window.map(|w| w.saturating_sub(1));
+        self.make_mask_reaching(seq_q, index_pos, cuda_idx, reach)
+    }
+
+    /// Causal mask that also hides a key more than `sw` positions behind its query.
+    fn make_mask_reaching(
+        &mut self,
+        seq_q: usize,
+        index_pos: usize,
+        cuda_idx: Option<usize>,
+        sw: Option<usize>,
+    ) -> Result<Tensor> {
         let seq_kv = index_pos + seq_q;
-        let key = (seq_q, seq_kv, cuda_idx);
-        // mask_cache key was historically (seq_len, cuda_idx); old entries
-        // become stale-by-shape and are simply never matched, which is fine.
-        let cache_key = (key.0 * 65536 + key.1, key.2);
+        let cache_key = (seq_q * 65536 + seq_kv, cuda_idx, sw);
         if !self.mask_cache.contains_key(&cache_key) {
             let dev = cuda_idx
                 .and_then(|idx| self.cuda_devices.get(&idx))
                 .unwrap_or(&Device::Cpu);
-            let sw = self.sliding_window;
             let data: Vec<u8> = (0..seq_q)
                 .flat_map(|i| {
                     (0..seq_kv).map(move |j| {
@@ -449,6 +470,9 @@ impl GenericHeteroTransformer {
             }
             if l.moe.is_some() {
                 return Some("MoE");
+            }
+            if l.attn_sinks.is_some() {
+                return Some("attention sinks");
             }
             if l.ple_proj.is_some() {
                 return Some("PLE");
@@ -1670,10 +1694,13 @@ impl GenericHeteroTransformer {
             for layer_idx in seg_start..seg_end {
                 let _timer = crate::inference::place::layer_perf::LayerTimer::start(layer_idx);
                 // PLE: the layer's input moves to the layer's device, host or card.
-                let ple_on_dev = match ple_inputs.as_ref().and_then(|inputs| inputs.get(layer_idx)) {
+                let ple_on_dev = match ple_inputs.as_ref().and_then(|inputs| inputs.get(layer_idx))
+                {
                     Some(t) => {
                         let layer_dev = if on_cuda {
-                            current_cuda_idx.and_then(|idx| self.cuda_devices.get(&idx)).cloned()
+                            current_cuda_idx
+                                .and_then(|idx| self.cuda_devices.get(&idx))
+                                .cloned()
                         } else {
                             Some(Device::Cpu)
                         };
@@ -1742,7 +1769,16 @@ impl GenericHeteroTransformer {
 
                 // gemma4 bounded-SWA: windowed SpecKvCache layers use the bounded
                 // SWA mask (matches their shortened K); all others use the full mask.
-                let layer_mask = if self.layers[layer_idx].kv_cache.is_windowed() {
+                // A period-classified model gives each layer the mask of its own window.
+                let own_mask = if seq_len > 1 && self.config.swa_period.is_some() {
+                    let window = self.layers[layer_idx].prefill_mask_window;
+                    Some(self.make_layer_mask(seq_len, index_pos, current_cuda_idx, window)?)
+                } else {
+                    None
+                };
+                let layer_mask = if own_mask.is_some() {
+                    own_mask.as_ref()
+                } else if self.layers[layer_idx].kv_cache.is_windowed() {
                     mask_swa.as_ref()
                 } else {
                     mask.as_ref()

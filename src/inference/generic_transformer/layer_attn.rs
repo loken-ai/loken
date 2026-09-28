@@ -140,9 +140,11 @@ impl GenericTransformerLayer {
     /// (the caller then runs the three `forward`s).
     #[cfg(feature = "cuda")]
     fn try_qkv_shared_q8_1(&self, x: &Tensor) -> Result<Option<(Tensor, Tensor, Tensor)>> {
-        let (Some(wq), Some(wk), Some(wv)) =
-            (self.attn_q.as_ref(), self.attn_k.as_ref(), self.attn_v.as_ref())
-        else {
+        let (Some(wq), Some(wk), Some(wv)) = (
+            self.attn_q.as_ref(),
+            self.attn_k.as_ref(),
+            self.attn_v.as_ref(),
+        ) else {
             return Ok(None);
         };
         if !x.device().is_cuda() || x.dtype() != crate::tensor::DType::F32 {
@@ -510,7 +512,9 @@ impl GenericTransformerLayer {
             // graph_rope_cos.is_none()). In graph mode the fused kernel reads
             // RoPE from the per-step-updated graph_rope_cos/sin buffer (index 0)
             // instead of self.cos[index_pos] - see the cos/sin selection below.
-            && shared_kv.is_none();
+            && shared_kv.is_none()
+            // The fused decode kernels have no sink term.
+            && self.attn_sinks.is_none();
         // The fused kernel normalises each head; a norm over the whole projection takes
         // the unfused path.
         let want_apq_with_norm = self.flags.has_qk_norm
@@ -1226,6 +1230,16 @@ impl GenericTransformerLayer {
         };
 
         // -- Attention ----------------------------------------------------
+        // A sink layer attends through `sink_attention`: none of the quantised, flash
+        // prefill or captured-graph kernels below carries the sink term, and a sink layer
+        // keeps its history in the F-dtype cache, so none of them was selected above.
+        if self.attn_sinks.is_some() {
+            let y = self.sink_attention(&q, k, v, mask)?;
+            let y = y
+                .transpose(1, 2)?
+                .reshape(&[b, seq, self.n_head * self.head_dim])?;
+            return Ok((y, false));
+        }
         #[cfg(feature = "cuda")]
         let (k, v) = if flash_kv {
             let scale = self
@@ -1505,9 +1519,7 @@ impl GenericTransformerLayer {
             let cur_seq = cache.current_seq_len();
             cache
                 .update_graph_state(cur_seq.saturating_sub(1))
-                .map_err(|e| {
-                    crate::tensor::Error::msg(format!("Q8 prime cur_pos_dev: {e}"))
-                })?;
+                .map_err(|e| crate::tensor::Error::msg(format!("Q8 prime cur_pos_dev: {e}")))?;
         }
         let cache = self
             .q8_kv()
@@ -1567,15 +1579,13 @@ impl GenericTransformerLayer {
             .sliding_window
             .filter(|&w| w > 0 && cache.current_seq_len() > w);
         let y_q8 = if let Some(window) = swa_window {
-            let scores = cache.attn_scores_graph(q, window).map_err(|e| {
-                crate::tensor::Error::msg(format!("Q8 SWA attn_scores_graph: {e}"))
-            })?;
+            let scores = cache
+                .attn_scores_graph(q, window)
+                .map_err(|e| crate::tensor::Error::msg(format!("Q8 SWA attn_scores_graph: {e}")))?;
             cache
                 .attn_softmax_output_graph(&scores, softmax_scale, window)
                 .map_err(|e| {
-                    crate::tensor::Error::msg(format!(
-                        "Q8 SWA attn_softmax_output_graph: {e}"
-                    ))
+                    crate::tensor::Error::msg(format!("Q8 SWA attn_softmax_output_graph: {e}"))
                 })?
         } else if try_splitk {
             // Query-head-packed tensor-core flash decode. It needs the fragments
@@ -1599,9 +1609,7 @@ impl GenericTransformerLayer {
                 match cache.attn_flash_tc_decode_graph(q, softmax_scale) {
                     Ok(y) => Some(y),
                     Err(e) => {
-                        tracing::warn!(
-                            "attn_flash_tc_decode_graph fallback to split-K: {e}"
-                        );
+                        tracing::warn!("attn_flash_tc_decode_graph fallback to split-K: {e}");
                         None
                     }
                 }
@@ -1614,11 +1622,11 @@ impl GenericTransformerLayer {
                 match cache.attn_flash_splitk_decode_graph(q, softmax_scale) {
                     Ok(y) => y,
                     Err(e) => {
-                        tracing::warn!("attn_flash_splitk_decode_graph fallback to 2-kernel chain: {e}");
+                        tracing::warn!(
+                            "attn_flash_splitk_decode_graph fallback to 2-kernel chain: {e}"
+                        );
                         let scores = cache.attn_scores_graph(q, 0).map_err(|e| {
-                            crate::tensor::Error::msg(format!(
-                                "Q8 attn_scores_graph: {e}"
-                            ))
+                            crate::tensor::Error::msg(format!("Q8 attn_scores_graph: {e}"))
                         })?;
                         cache
                             .attn_softmax_output_graph(&scores, softmax_scale, 0)
@@ -1634,31 +1642,25 @@ impl GenericTransformerLayer {
             match cache.attn_fused_decode_graph(q, softmax_scale) {
                 Ok(y) => y,
                 Err(e) => {
-                    tracing::warn!(
-                        "attn_fused_decode_graph fallback to 2-kernel chain: {e}"
-                    );
+                    tracing::warn!("attn_fused_decode_graph fallback to 2-kernel chain: {e}");
                     let scores = cache.attn_scores_graph(q, 0).map_err(|e| {
                         crate::tensor::Error::msg(format!("Q8 attn_scores_graph: {e}"))
                     })?;
                     cache
                         .attn_softmax_output_graph(&scores, softmax_scale, 0)
                         .map_err(|e| {
-                            crate::tensor::Error::msg(format!(
-                                "Q8 attn_softmax_output_graph: {e}"
-                            ))
+                            crate::tensor::Error::msg(format!("Q8 attn_softmax_output_graph: {e}"))
                         })?
                 }
             }
         } else {
-            let scores = cache.attn_scores_graph(q, 0).map_err(|e| {
-                crate::tensor::Error::msg(format!("Q8 attn_scores_graph: {e}"))
-            })?;
+            let scores = cache
+                .attn_scores_graph(q, 0)
+                .map_err(|e| crate::tensor::Error::msg(format!("Q8 attn_scores_graph: {e}")))?;
             cache
                 .attn_softmax_output_graph(&scores, softmax_scale, 0)
                 .map_err(|e| {
-                    crate::tensor::Error::msg(format!(
-                        "Q8 attn_softmax_output_graph: {e}"
-                    ))
+                    crate::tensor::Error::msg(format!("Q8 attn_softmax_output_graph: {e}"))
                 })?
         };
         Ok(y_q8)

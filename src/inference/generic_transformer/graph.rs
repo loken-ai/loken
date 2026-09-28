@@ -186,6 +186,9 @@ impl GenericHeteroTransformer {
     /// than logged here so the caller decides where it surfaces; `graph_capture_auto_on`
     /// keeps the boolean contract for existing callers.
     pub fn graph_capture_decision(&self) -> std::result::Result<(), &'static str> {
+        if self.layers.iter().any(|l| l.attn_sinks.is_some()) {
+            return Err("attention sinks: the captured decode attention has no sink term");
+        }
         if let Some(why) = self.kv_state_graph_block() {
             return Err(why);
         }

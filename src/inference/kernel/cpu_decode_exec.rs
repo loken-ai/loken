@@ -37,6 +37,8 @@ pub struct DecodeNormCache {
     // output scale (`[hidden]` broadcast multiply, altup_correct_scale).
     pub ple_post_norm_w: Option<(Vec<f32>, f32)>,
     pub ple_output_scale: Option<Vec<f32>>,
+    /// Bias of the attention output projection.
+    pub o_bias: Option<Vec<f32>>,
 }
 
 /// Persistent per-token scratch for one dense decode step. Allocated once for

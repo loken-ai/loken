@@ -38,8 +38,6 @@ pub(crate) use crate::tensor::{DType, Device, IndexOp, Result, Tensor};
 
 #[cfg(all(test, feature = "cuda"))]
 mod card_host_parity;
-#[cfg(all(test, feature = "cuda"))]
-mod verify_decode_parity;
 mod config;
 mod graph;
 pub mod hetero;
@@ -49,6 +47,8 @@ mod layer_ffn;
 mod layer_forward;
 mod loader;
 mod moe_weights;
+#[cfg(all(test, feature = "cuda"))]
+mod verify_decode_parity;
 pub use config::*;
 pub use moe_weights::*;
 
@@ -90,6 +90,11 @@ pub struct GenericTransformerLayer {
     pub attn_output: QMatMul,
     /// Optional bias on attn_output projection (phi2)
     pub attn_output_bias: Option<Tensor>,
+    /// Per-head attention-sink logits `[n_head]` F32 on the layer's device. Each joins its
+    /// head's softmax denominator and contributes no value, so a row's weights sum below 1.
+    pub attn_sinks: Option<Tensor>,
+    /// The same logits on the host, read by the host attention kernels.
+    pub attn_sinks_host: Option<Vec<f32>>,
     pub attn_norm: WeightedNorm,
     /// Phase B: F32-cast of attn_norm.weight, pre-built
     /// at load time when fused_qkv_norm_eligible. Avoids the per-
@@ -302,8 +307,9 @@ pub struct GenericTransformerLayer {
     /// gemma4 SWA per-layer window: Some(w) ⟹ decode attends only to the last w
     /// keys (the windowed-SWA lever); None ⟹ global/full attention.
     pub sliding_window: Option<usize>,
-    /// Window of the model-wide causal mask a multi-token forward receives
-    /// (`attention.sliding_window`, applied to every layer's prefill mask).
+    /// Window of the causal mask a multi-token forward receives: the model-wide
+    /// `attention.sliding_window` applied to every layer, or this layer's own window on a
+    /// period-classified model.
     pub prefill_mask_window: Option<usize>,
     /// Partial RoPE: only apply to first `rope_dim` of `head_dim` dims (0 = full)
     pub rope_dim: usize,
@@ -383,7 +389,8 @@ pub struct GenericHeteroTransformer {
     output_norm_cuda_weight: Option<Tensor>,
     cuda_devices: HashMap<usize, Device>,
     sliding_window: Option<usize>,
-    mask_cache: HashMap<(usize, Option<usize>), Tensor>, // (seq_len, cuda_gpu_idx_or_none)
+    /// Causal masks by (query and key lengths, card or host, window).
+    mask_cache: HashMap<(usize, Option<usize>, Option<usize>), Tensor>,
     // PLE globals (Gemma4) - all CPU
     ple_token_embd: Option<Embedding>, // small vocab or None
     /// BF16 PLE token embedding for large-vocab models (Gemma4: stays in BF16 to save memory)

@@ -23,8 +23,8 @@ pub const ROPE_TABLE_SEQ_LEN: usize = 16384;
 /// inverse frequencies interpolate between extrapolation (original) for the
 /// high-frequency dims and interpolation (÷factor) for the low-frequency dims,
 /// with a linear ramp over `[low, high]` derived from `beta_fast`/`beta_slow`.
-/// The attention mscale cancels (mscale == mscale_all_dim) -> cos/sin unscaled.
-/// Shared by the Mistral3 path and the GenericHeteroTransformer path so both
+/// `attn_factor` multiplies the cos/sin table; 1.0 leaves it unscaled, which is the
+/// case where the attention mscale cancels (mscale == mscale_all_dim). Shared by the Mistral3 path and the GenericHeteroTransformer path so both
 /// produce identical rope tables (devstral-small-2: factor=48, orig_ctx=8192).
 #[derive(Clone, Copy, Debug)]
 pub struct YarnParams {
@@ -32,6 +32,7 @@ pub struct YarnParams {
     pub orig_ctx: f32,
     pub beta_fast: f32,
     pub beta_slow: f32,
+    pub attn_factor: f32,
 }
 
 /// The angular frequency each pair of a head's dimensions turns at.
@@ -147,7 +148,11 @@ pub fn precomput_freqs_cis_yarn(
         .to_dtype(DType::F32)?
         .reshape((table_seq_len, 1))?;
     let angles = positions.matmul(&frequencies)?;
-    Ok((angles.cos()?, angles.sin()?))
+    let (cos, sin) = (angles.cos()?, angles.sin()?);
+    match yarn.map(|y| y.attn_factor).filter(|&f| f != 1.0) {
+        Some(f) => Ok((cos.affine(f, 0.0)?, sin.affine(f, 0.0)?)),
+        None => Ok((cos, sin)),
+    }
 }
 
 /// One rotary phase per rotary pair, on the host: what carries a stored key from

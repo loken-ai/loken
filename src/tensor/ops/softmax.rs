@@ -194,3 +194,78 @@ pub fn log_softmax(x: &Tensor, dim: usize) -> Result<Tensor> {
     let log_sum = diff.exp()?.sum_keepdim(dim)?.log()?;
     diff.broadcast_sub(&log_sum)
 }
+
+/// Softmax over the last (key) dim with a per-head sink logit added to each row's
+/// denominator, as ggml's `soft_max` with sinks computes it.
+///
+/// - `scores`: attention logits `[b, n_head, q, kv]`, before `scale`.
+/// - `mask`: additive `[.., q, kv]` mask (0 visible, -inf hidden), or `None`.
+/// - `sinks`: learned per-head sink logits `[n_head]`, not scaled.
+///
+/// Returns weights `[b, n_head, q, kv]` whose rows sum below 1: the missing mass is what
+/// the sink, which has no value, absorbed.
+pub fn softmax_last_dim_with_sinks(
+    scores: &Tensor,
+    mask: Option<&Tensor>,
+    sinks: &Tensor,
+    scale: f64,
+) -> Result<Tensor> {
+    // One pass where a fused kernel serves the shape: the mask, the scale on the scores
+    // and the whole sink softmax.
+    if let Some(out) =
+        crate::inference::kernel::fused::fused_softmax_sinks(scores, mask, sinks, scale as f32)?
+    {
+        return Ok(out);
+    }
+    let masked = match mask {
+        Some(m) => Some(scores.broadcast_add(m)?),
+        None => None,
+    };
+    let scores = masked.as_ref().unwrap_or(scores);
+    let (_b, n_head, _q, _kv) = scores.dims4()?;
+    let scores = (scores * scale)?;
+    let sink = sinks.reshape((1, n_head, 1, 1))?;
+    // The stabilising maximum covers the sink logit as well as the scores.
+    let m = scores.max_keepdim(D::Minus1)?.broadcast_maximum(&sink)?;
+    let exp_scores = scores.broadcast_sub(&m)?.exp()?;
+    let exp_sink = sink.broadcast_sub(&m)?.exp()?;
+    let denom = (exp_scores.sum_keepdim(D::Minus1)? + exp_sink)?;
+    exp_scores.broadcast_div(&denom)
+}
+
+#[cfg(test)]
+mod sink_softmax_tests {
+    use super::softmax_last_dim_with_sinks;
+    use crate::tensor::{Device, Tensor};
+
+    #[test]
+    fn a_sink_absorbs_part_of_the_mass() {
+        // scores [1, 2], sink 0: m = 2, exp = [e^-1, 1], sink e^-2,
+        // denominator 1.5032, weights [0.2448, 0.6652], sum 0.9100.
+        let dev = Device::Cpu;
+        let scores = Tensor::from_vec(vec![1.0f32, 2.0], (1, 1, 1, 2), &dev).unwrap();
+        let sinks = Tensor::new(&[0.0f32], &dev).unwrap();
+        let w = softmax_last_dim_with_sinks(&scores, None, &sinks, 1.0).unwrap();
+        let v: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();
+        assert!((v[0] - 0.2448).abs() < 1e-3, "w0={}", v[0]);
+        assert!((v[1] - 0.6652).abs() < 1e-3, "w1={}", v[1]);
+        let sum: f32 = v.iter().sum();
+        assert!((sum - 0.9100).abs() < 1e-3, "sum={sum}");
+    }
+
+    #[test]
+    fn a_very_negative_sink_leaves_the_plain_softmax() {
+        let dev = Device::Cpu;
+        let scores = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], (1, 1, 1, 3), &dev).unwrap();
+        let sinks = Tensor::new(&[-1e30f32], &dev).unwrap();
+        let w = softmax_last_dim_with_sinks(&scores, None, &sinks, 1.0).unwrap();
+        let sum: f32 = w
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .sum();
+        assert!((sum - 1.0).abs() < 1e-4, "sum={sum}");
+    }
+}

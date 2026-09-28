@@ -92,8 +92,34 @@ impl ExpertRouting {
         )
     }
 
+    /// Gate and up kept apart, each with its per-expert bias, combined by the clamped
+    /// SwiGLU: one launch.
+    #[cfg(feature = "cuda")]
+    fn gate_up_swiglu_clamped(
+        &self,
+        xs: &Tensor,
+        gate: &QTensor,
+        up: &QTensor,
+        biases: (Option<&Tensor>, Option<&Tensor>),
+        (alpha, limit): (f64, f64),
+    ) -> Result<Tensor> {
+        crate::inference::moe_cuda::moe_gemm_gguf_gate_up_swiglu_oai(
+            xs,
+            gate,
+            up,
+            biases.0,
+            biases.1,
+            &self.slots,
+            &self.experts,
+            self.topk,
+            alpha,
+            limit,
+        )
+    }
+
     /// Down projection and the weighted scatter-add that ends it: each row scaled by the
-    /// score its expert was chosen with, added into the token it came from.
+    /// score its expert was chosen with, added into the token it came from. A per-expert
+    /// `bias` joins each row before its score scales it.
     #[cfg(feature = "cuda")]
     fn down_reduce(
         &self,
@@ -102,8 +128,9 @@ impl ExpertRouting {
         weights: &Tensor,
         n_tokens: usize,
         imma: bool,
+        bias: Option<&Tensor>,
     ) -> Result<Tensor> {
-        if imma {
+        if imma && bias.is_none() {
             crate::inference::moe_cuda::moe_q4k_imma_m8_down_reduce(
                 rows,
                 stack,
@@ -124,7 +151,7 @@ impl ExpertRouting {
                 self.topk,
                 n_tokens,
                 None,
-                None,
+                bias,
             )
         }
     }
@@ -146,6 +173,29 @@ impl ExpertRouting {
         )
     }
 
+    /// [`Self::gate_up_swiglu_clamped`] on the host.
+    fn host_gate_up_swiglu_clamped(
+        &self,
+        xs: &Tensor,
+        gate: &Arc<QTensor>,
+        up: &Arc<QTensor>,
+        biases: (Option<&Tensor>, Option<&Tensor>),
+        (alpha, limit): (f64, f64),
+    ) -> Result<Tensor> {
+        crate::inference::moe_cpu::moe_gemm_gguf_gate_up_swiglu_oai(
+            xs,
+            gate,
+            up,
+            biases.0,
+            biases.1,
+            &self.slots,
+            &self.experts,
+            self.topk,
+            alpha,
+            limit,
+        )
+    }
+
     /// [`Self::down_reduce`] on the host.
     fn host_down_reduce(
         &self,
@@ -153,6 +203,7 @@ impl ExpertRouting {
         stack: &Arc<QTensor>,
         weights: &Tensor,
         n_tokens: usize,
+        bias: Option<&Tensor>,
     ) -> Result<Tensor> {
         crate::inference::moe_cpu::moe_gemm_gguf_down_reduce(
             rows,
@@ -163,7 +214,7 @@ impl ExpertRouting {
             self.topk,
             n_tokens,
             None,
-            None,
+            bias,
         )
     }
 }
@@ -182,9 +233,20 @@ pub struct MoeWeights {
     pub gate_inp: crate::tensor::quantized::QMatMul,
     /// Per-channel scale on the router input (Gemma4-specific): `[hidden]`.
     pub gate_inp_scale: Tensor,
+    /// Bias added to the router logits before the top-k: `[n_experts]`.
+    pub gate_inp_bias: Option<Tensor>,
+    /// Per-expert biases of the gate, up and down projections: `[n_experts, width]`.
+    /// Present only with `swiglu_clamp`.
+    pub gate_exps_bias: Option<Tensor>,
+    pub up_exps_bias: Option<Tensor>,
+    pub down_exps_bias: Option<Tensor>,
+    /// Gate and up combine through the clamped SwiGLU, `(alpha, limit)`, reading the
+    /// separate stacks: `x = min(gate, limit)`, `x.sigmoid(alpha.x).(1 + clamp(up))`.
+    pub swiglu_clamp: Option<(f64, f64)>,
     /// Stacked expert gate||up weights `[n_experts, 2*expert_ffn_dim, hidden]`
-    /// (the stored layout - GGUF dims are reversed).
-    pub gate_up_exps: std::sync::Arc<crate::tensor::quantized::QTensor>,
+    /// (the stored layout - GGUF dims are reversed). `None` on a clamped-SwiGLU layer,
+    /// which reads gate and up apart.
+    pub gate_up_exps: Option<std::sync::Arc<crate::tensor::quantized::QTensor>>,
     /// Stacked expert down weights `[n_experts, hidden, expert_ffn_dim]`.
     pub down_exps: std::sync::Arc<crate::tensor::quantized::QTensor>,
     /// Standard MoE (granitemoe): SEPARATE gate & up expert stacks `[n_exp, ffn,
@@ -237,7 +299,7 @@ impl MoeWeights {
                 stacks.push(u.clone());
             }
             // A layer that fused gate and up at load is repacked as the one stack it is.
-            _ => stacks.push(self.gate_up_exps.clone()),
+            _ => stacks.extend(self.gate_up_exps.clone()),
         }
         stacks.push(self.down_exps.clone());
         stacks
@@ -329,9 +391,29 @@ impl MoeWeights {
         let logits_f32 = if self.router_prenormed {
             // Standard MoE (granitemoe): `xs` is already the ffn_norm'd hidden  -
             // route it straight through gate_inp (no internal rms_norm / scale).
-            self.gate_inp
-                .forward(&xs)?
-                .to_dtype(crate::tensor::DType::F32)?
+            match self.gate_inp_bias.as_ref() {
+                None => self
+                    .gate_inp
+                    .forward(&xs)?
+                    .to_dtype(crate::tensor::DType::F32)?,
+                // A biased router scores in full F32 on a card: the GEMV kernel, not the
+                // dense matmul whose reduced-precision mode can reorder near-tied experts.
+                Some(bias) => {
+                    let exact = match &self.gate_inp {
+                        crate::tensor::quantized::QMatMul::Tensor(w) => {
+                            crate::inference::moe_cuda::gate_gemv_f32(&xs, w)?
+                        }
+                        _ => None,
+                    };
+                    let logits = match exact {
+                        Some(l) => l,
+                        None => self.gate_inp.forward(&xs)?,
+                    };
+                    logits
+                        .to_dtype(crate::tensor::DType::F32)?
+                        .broadcast_add(&bias.to_dtype(crate::tensor::DType::F32)?)?
+                }
+            }
         } else {
             {
                 #[cfg(feature = "cuda")]
@@ -518,12 +600,14 @@ impl MoeWeights {
         let routing = &routing;
         // Auto-on: per-pair-tile IMMA M=8 for Q4_K MoE prefill - measured
         // +33% over dp4a on gemma4:26b.
-        let weight_is_q4k = self.gate_up_exps.dtype() == crate::tensor::quantized::GgmlDType::Q4K;
+        let weight_is_q4k = self
+            .gate_up_exps
+            .as_ref()
+            .is_some_and(|w| w.dtype() == crate::tensor::quantized::GgmlDType::Q4K);
         let k_is_aligned = self
             .gate_up_exps
-            .shape()
-            .dims()
-            .last()
+            .as_ref()
+            .and_then(|w| w.shape().dims().last().copied())
             .map(|k| k % 256 == 0)
             .unwrap_or(false);
         let imma_m8_disabled = false;
@@ -571,9 +655,21 @@ impl MoeWeights {
             // Decode-only here: the fused
             // single-launch SiLU.mul mmvq kernel (gate GEMM + up GEMM + SiLU.mul in
             // one pass) is exact for M=1 and faster than two separate GEMMs.
-            routing.gate_up_silu(xs, g, u)?
+            match self.swiglu_clamp {
+                Some(clamp) => routing.gate_up_swiglu_clamped(
+                    xs,
+                    g,
+                    u,
+                    (self.gate_exps_bias.as_ref(), self.up_exps_bias.as_ref()),
+                    clamp,
+                )?,
+                None => routing.gate_up_silu(xs, g, u)?,
+            }
         } else {
-            routing.gate_up_gelu(xs, &self.gate_up_exps, use_imma_m8_auto)?
+            let stack = self.gate_up_exps.as_ref().ok_or_else(|| {
+                crate::tensor::Error::msg("MoE layer without a fused gate||up stack")
+            })?;
+            routing.gate_up_gelu(xs, stack, use_imma_m8_auto)?
         };
         if let Some(t) = t_gu {
             let _ = xs.device().synchronize();
@@ -599,6 +695,7 @@ impl MoeWeights {
             topk_weights,
             num_tokens,
             down_use_imma_m8,
+            self.down_exps_bias.as_ref(),
         );
         if let Some(t) = t_dn {
             let _ = xs.device().synchronize();
@@ -626,7 +723,11 @@ impl MoeWeights {
             return Ok(None);
         };
         let hidden = xs.dim(crate::tensor::D::Minus1)?;
+        // The tile kernels fold gate and up biases into the clamped SwiGLU only.
+        let biases_served = self.swiglu_clamp.is_some()
+            || (self.gate_exps_bias.is_none() && self.up_exps_bias.is_none());
         let served = !self.gelu
+            && biases_served
             && gate.dtype() == up.dtype()
             && moe_mmq_serves(gate.dtype(), hidden)
             && moe_mmq_serves(self.down_exps.dtype(), self.expert_ffn_dim);
@@ -655,13 +756,28 @@ impl MoeWeights {
             let _ = xs.device().synchronize();
             std::time::Instant::now()
         });
-        let hs = plan.gate_up_silu(xs, gate, Some(up))?;
+        let glu = match self.swiglu_clamp {
+            Some((alpha, limit)) => crate::inference::moe_cuda::Glu::SwigluOai {
+                gate_bias: self.gate_exps_bias.as_ref(),
+                up_bias: self.up_exps_bias.as_ref(),
+                alpha: alpha as f32,
+                limit: limit as f32,
+            },
+            None => crate::inference::moe_cuda::Glu::Silu,
+        };
+        let hs = plan.gate_up(xs, gate, Some(up), glu)?;
         let t1 = t0.map(|t0| {
             let _ = xs.device().synchronize();
             stages::add(stages::GATE_UP, t0.elapsed().as_micros() as u64);
             std::time::Instant::now()
         });
-        let out = plan.down_fold(&hs, &self.down_exps, topk_weights, None)?;
+        let out = plan.down_fold_biased(
+            &hs,
+            &self.down_exps,
+            topk_weights,
+            None,
+            self.down_exps_bias.as_ref(),
+        )?;
         if let Some(t1) = t1 {
             let _ = xs.device().synchronize();
             stages::add(stages::DOWN, t1.elapsed().as_micros() as u64);
@@ -726,8 +842,23 @@ impl MoeWeights {
                 // SEPARATE gate/up (granitemoe): mirror the CUDA use_silu path -
                 // the original untouched Q4K experts, NOT the lossy Q8 requant of
                 // the fused stack. Then SiLU(gate)*up and the down+topk reduce.
-                let h = routing.host_gate_up_silu(xs, g, u)?;
-                return routing.host_down_reduce(&h, &self.down_exps, topk_weights, num_tokens);
+                let h = match self.swiglu_clamp {
+                    Some(clamp) => routing.host_gate_up_swiglu_clamped(
+                        xs,
+                        g,
+                        u,
+                        (self.gate_exps_bias.as_ref(), self.up_exps_bias.as_ref()),
+                        clamp,
+                    )?,
+                    None => routing.host_gate_up_silu(xs, g, u)?,
+                };
+                return routing.host_down_reduce(
+                    &h,
+                    &self.down_exps,
+                    topk_weights,
+                    num_tokens,
+                    self.down_exps_bias.as_ref(),
+                );
             }
         }
 
@@ -802,5 +933,160 @@ impl MoeWeights {
             }
         }
         Tensor::from_vec(out, (num_tokens, hidden_dim), &xs.device())
+    }
+}
+
+#[cfg(test)]
+mod clamped_swiglu_tests {
+    use super::*;
+    use crate::tensor::quantized::{GgmlDType, QMatMul, QTensor};
+
+    fn values(n: usize, seed: u64, amp: f32) -> Vec<f32> {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * amp
+            })
+            .collect()
+    }
+
+    /// `x.sigmoid(alpha.x).(1 + u)` with `x = min(g, limit)` and `u` clamped to
+    /// `[-limit, limit]`.
+    fn clamped_swiglu(g: f32, u: f32, alpha: f32, limit: f32) -> f32 {
+        let x = g.min(limit);
+        let u = u.clamp(-limit, limit);
+        x / (1.0 + (-alpha * x).exp()) * (1.0 + u)
+    }
+
+    /// `w` `[rows, k]` times `x` `[k]`.
+    fn matvec(w: &[f32], x: &[f32], rows: usize) -> Vec<f32> {
+        let k = x.len();
+        (0..rows)
+            .map(|r| {
+                w[r * k..(r + 1) * k]
+                    .iter()
+                    .zip(x)
+                    .map(|(a, b)| a * b)
+                    .sum()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn biased_clamped_experts_match_the_scalar_reference() {
+        let (experts, used, hidden, ffn, tokens) = (4usize, 2usize, 32usize, 32usize, 3usize);
+        let (alpha, limit) = (1.702f64, 1.5f64);
+        let dev = Device::Cpu;
+        let stack = |seed| {
+            let w = Tensor::from_vec(
+                values(experts * ffn * hidden, seed, 1.0),
+                (experts, ffn, hidden),
+                &dev,
+            )
+            .unwrap();
+            QTensor::quantize_onto(&w, GgmlDType::Q8_0, &dev).unwrap()
+        };
+        let (gate, up, down) = (stack(11), stack(12), stack(13));
+        let router = values(experts * hidden, 14, 0.5);
+        let router_bias = values(experts, 15, 0.5);
+        let (gb, ub, db) = (
+            values(experts * ffn, 16, 0.5),
+            values(experts * ffn, 17, 0.5),
+            values(experts * hidden, 18, 0.5),
+        );
+        let t =
+            |v: &[f32], shape: (usize, usize)| Tensor::from_vec(v.to_vec(), shape, &dev).unwrap();
+        let moe = MoeWeights {
+            gate_inp: QMatMul::Tensor(t(&router, (experts, hidden))),
+            gate_inp_scale: Tensor::ones(hidden, DType::F32, &dev).unwrap(),
+            gate_inp_bias: Some(Tensor::from_vec(router_bias.clone(), (experts,), &dev).unwrap()),
+            gate_exps_bias: Some(t(&gb, (experts, ffn))),
+            up_exps_bias: Some(t(&ub, (experts, ffn))),
+            down_exps_bias: Some(t(&db, (experts, hidden))),
+            swiglu_clamp: Some((alpha, limit)),
+            gate_up_exps: None,
+            down_exps: Arc::new(down),
+            gate_exps_sep: Some(Arc::new(gate)),
+            up_exps_sep: Some(Arc::new(up)),
+            down_exps_scale: Tensor::ones(experts, DType::F32, &dev).unwrap(),
+            n_experts: experts,
+            n_experts_used: used,
+            expert_ffn_dim: ffn,
+            router_prenormed: true,
+            use_silu: true,
+            gelu: false,
+            norm_topk: true,
+            gate_up_exps_f32: None,
+            down_exps_f32: None,
+        };
+        let xs = values(tokens * hidden, 19, 1.0);
+        let input = Tensor::from_vec(xs.clone(), (1, tokens, hidden), &dev).unwrap();
+        let got = moe
+            .forward(&input, &input, hidden, 1e-5, false)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let deq = |q: &Arc<QTensor>| {
+            q.dequantize(&dev)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let (gw, uw, dw) = (
+            deq(moe.gate_exps_sep.as_ref().unwrap()),
+            deq(moe.up_exps_sep.as_ref().unwrap()),
+            deq(&moe.down_exps),
+        );
+        let mut want = vec![0f32; tokens * hidden];
+        let mut clamped = 0usize;
+        for tok in 0..tokens {
+            let x = &xs[tok * hidden..(tok + 1) * hidden];
+            let logits: Vec<f32> = matvec(&router, x, experts)
+                .iter()
+                .zip(&router_bias)
+                .map(|(l, b)| l + b)
+                .collect();
+            let mut order: Vec<usize> = (0..experts).collect();
+            order.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+            let chosen = &order[..used];
+            // Softmax over the chosen logits: the top-k of the full softmax, renormalised.
+            let m = logits[chosen[0]];
+            let z: f32 = chosen.iter().map(|&e| (logits[e] - m).exp()).sum();
+            for &e in chosen {
+                let w = (logits[e] - m).exp() / z;
+                let g = matvec(&gw[e * ffn * hidden..(e + 1) * ffn * hidden], x, ffn);
+                let u = matvec(&uw[e * ffn * hidden..(e + 1) * ffn * hidden], x, ffn);
+                let h: Vec<f32> = (0..ffn)
+                    .map(|i| {
+                        let (gi, ui) = (g[i] + gb[e * ffn + i], u[i] + ub[e * ffn + i]);
+                        clamped += usize::from(gi > limit as f32 || ui.abs() > limit as f32);
+                        clamped_swiglu(gi, ui, alpha as f32, limit as f32)
+                    })
+                    .collect();
+                let d = matvec(&dw[e * hidden * ffn..(e + 1) * hidden * ffn], &h, hidden);
+                for c in 0..hidden {
+                    want[tok * hidden + c] += w * (d[c] + db[e * hidden + c]);
+                }
+            }
+        }
+        assert!(clamped > 0, "the inputs must reach the clamp");
+        let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        // The expert kernels quantise their activations to 8 bits.
+        assert!(worst <= 2e-2 * scale, "max diff {worst} of {scale}");
     }
 }

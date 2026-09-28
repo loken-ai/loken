@@ -109,6 +109,9 @@ pub struct GenericLayerFlags {
     /// FUSED qkv tensor.
     pub has_attn_output_bias: bool,
     pub has_ffn_bias: bool,
+    /// A learned per-head logit joins each attention softmax denominator and absorbs
+    /// probability mass without contributing a value: `blk.0.attn_sinks` exists.
+    pub has_attn_sinks: bool,
     /// Gemma4-MoE (26B A4B): every layer has BOTH a shared dense FFN
     /// AND a 128-expert MoE block. Detected by
     /// `blk.0.ffn_gate_inp.weight`.
@@ -186,8 +189,9 @@ impl GenericLayerFlags {
                 && has("blk.0.ffn_up.weight")
                 && !has("blk.0.post_ffw_norm.weight"),
             layer_norm_with_bias: has("blk.0.attn_norm.bias"),
-            has_attn_output_bias: has("blk.0.attn_output.bias"),
+            has_attn_output_bias: has(&format!("blk.0.{}.bias", attn_output_name(content))),
             has_ffn_bias: has("blk.0.ffn_down.bias"),
+            has_attn_sinks: attn_sinks_name(content, 0).is_some(),
             // Llama, Mistral and Mistral3 rotate ADJACENT pairs; every other architecture
             // pairs a dimension with the one half a head away. Getting it wrong does not
             // fail - it scrambles attention and the model answers nonsense.
@@ -229,6 +233,78 @@ impl GenericLayerFlags {
             // the kernel exists but isn't dispatched on the auto-path.
             fused_qkv_norm_eligible: false,
         }
+    }
+}
+
+/// Stem of the attention output projection: `attn_output` in the reference naming,
+/// `attn_out` where the converter wrote the shorter form. Read from the file, never
+/// assumed from the architecture.
+pub(super) fn attn_output_name(content: &gguf_file::Content) -> &'static str {
+    if content
+        .tensor_infos
+        .contains_key("blk.0.attn_output.weight")
+    {
+        "attn_output"
+    } else if content.tensor_infos.contains_key("blk.0.attn_out.weight") {
+        "attn_out"
+    } else {
+        "attn_output"
+    }
+}
+
+/// Name of layer `il`'s attention-sink tensor, `None` when the layer has none. The
+/// reference stores it without a suffix; a `.weight` suffix is accepted as the same tensor.
+pub(super) fn attn_sinks_name(content: &gguf_file::Content, il: usize) -> Option<String> {
+    [
+        format!("blk.{il}.attn_sinks"),
+        format!("blk.{il}.attn_sinks.weight"),
+    ]
+    .into_iter()
+    .find(|n| content.tensor_infos.contains_key(n))
+}
+
+/// Facts an architecture fixes that its GGUF files do not carry. Every entry names the
+/// reference behaviour it reproduces; a value present in the file's metadata takes
+/// precedence over the one here.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ArchConventions {
+    /// Period of the sliding-window layers: layer `i` is windowed when
+    /// `i % period < period - 1`, global otherwise, and every layer is windowed at
+    /// period 0. Applies when the file carries no per-layer pattern.
+    pub swa_period: Option<usize>,
+    /// The rotary scaling applies YaRN when the file gives a scaling factor but no
+    /// scaling type.
+    pub yarn_by_default: bool,
+    /// YaRN multiplies the rotary table by `1 + 0.1 ln(factor)`: the attention factor the
+    /// reference rope kernel applies whenever its extrapolation mix is on.
+    pub yarn_attention_factor: bool,
+    /// Routed experts combine gate and up through the clamped SwiGLU
+    /// `x.sigmoid(alpha.x).(1 + up)` with `x = min(gate, limit)` and `up` clamped to
+    /// `[-limit, limit]`, as `(alpha, limit)`.
+    pub expert_swiglu_clamp: Option<(f64, f64)>,
+}
+
+/// Whether layer `il` is a sliding-window layer under a period of `period`.
+pub fn windowed_by_period(period: usize, il: usize) -> bool {
+    period == 0 || il % period < period - 1
+}
+
+/// The conventions `arch` fixes beyond its files.
+///
+/// gptoss: the reference sets a sliding-window period of 2 (even layers windowed, odd layers
+/// global), rotates with YaRN from the file's `rope.scaling.factor` and
+/// `rope.scaling.original_context_length` with the rope kernel's implicit attention factor,
+/// and gates its experts with the clamped SwiGLU at alpha 1.702 and limit 7.0, constants of
+/// its expert graph that no converter writes.
+pub fn arch_conventions(arch: &str) -> ArchConventions {
+    match arch {
+        "gptoss" => ArchConventions {
+            swa_period: Some(2),
+            yarn_by_default: true,
+            yarn_attention_factor: true,
+            expert_swiglu_clamp: Some((1.702, 7.0)),
+        },
+        _ => ArchConventions::default(),
     }
 }
 
@@ -276,6 +352,13 @@ pub struct GenericTransformerConfig {
     /// head_dim heuristic, which mis-classifies KV-shared layers whose Q dim does
     /// not encode their head size. None ⟹ fall back to the head_dim heuristic.
     pub swa_pattern: Option<Vec<bool>>,
+    /// Sliding-window layers classified by the architecture's period when the file
+    /// carries no per-layer pattern. Such a model keeps every position in each layer's
+    /// cache and gives each layer the prefill mask of its own window: a global layer
+    /// sees the whole causal history.
+    pub swa_period: Option<usize>,
+    /// Routed experts gate through the clamped SwiGLU, `(alpha, limit)`.
+    pub expert_swiglu_clamp: Option<(f64, f64)>,
     pub flags: GenericLayerFlags,
     /// Per-layer KV cache storage mode. Off -> F-dtype SpecKvCache only;
     /// Q8 -> also maintain a Q8KvCache alongside so the decode-path (seq=1)
@@ -487,11 +570,13 @@ impl GenericTransformerConfig {
         // Without it the rope frequencies are wrong past the original context and the
         // model emits garbage. The parameters go to `rope::precomput_freqs_cis_yarn`, which
         // is the only place these tables are built.
+        let conventions = arch_conventions(arch);
         let yarn = {
             let scaling_type = content
                 .metadata
                 .get(&format!("{arch}.rope.scaling.type"))
-                .and_then(|v| v.to_string().ok().map(|s| s.to_string()));
+                .and_then(|v| v.to_string().ok().map(|s| s.to_string()))
+                .or_else(|| conventions.yarn_by_default.then(|| "yarn".to_string()));
             match scaling_type.as_deref() {
                 Some("yarn") => {
                     let factor = meta_f32(content, arch, "rope.scaling.factor").unwrap_or(1.0);
@@ -507,6 +592,11 @@ impl GenericTransformerConfig {
                                 .unwrap_or(32.0),
                             beta_slow: meta_f32(content, arch, "rope.scaling.beta_slow")
                                 .unwrap_or(1.0),
+                            attn_factor: if conventions.yarn_attention_factor {
+                                1.0 + 0.1 * factor.ln()
+                            } else {
+                                1.0
+                            },
                         })
                     } else {
                         None
@@ -529,6 +619,9 @@ impl GenericTransformerConfig {
         let swa_pattern = meta_u32_array(content, arch, "attention.sliding_window_pattern")
             .map(|arr| arr.iter().map(|&x| x != 0).collect::<Vec<bool>>())
             .filter(|v| !v.is_empty());
+        let swa_period = conventions
+            .swa_period
+            .filter(|_| swa_pattern.is_none() && sliding_window.is_some());
 
         let shared_kv_layers =
             meta_u32(content, arch, "attention.shared_kv_layers").unwrap_or(0) as usize;
@@ -603,6 +696,8 @@ impl GenericTransformerConfig {
             rms_norm_eps,
             sliding_window,
             swa_pattern,
+            swa_period,
+            expert_swiglu_clamp: conventions.expert_swiglu_clamp,
             shared_kv_layers,
             embed_scale,
             logit_scale,
@@ -693,5 +788,156 @@ mod rope_pairing_tests {
         let e = rope_pairing("brand_new_arch").unwrap_err();
         assert!(e.contains("not classified"), "{e}");
         assert!(e.contains("ADJACENT") && e.contains("HALF_SPLIT"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod arch_conventions_tests {
+    use super::*;
+    use crate::tensor::quantized::gguf_file::{Content, TensorInfo, Value, VersionedMagic};
+    use crate::tensor::quantized::GgmlDType;
+
+    /// A header-only file: the metadata `arch` writes and the tensor directory the
+    /// detection reads, with no tensor data.
+    fn synth_content(
+        arch: &str,
+        meta: &[(&str, Value)],
+        tensors: &[(&str, Vec<usize>)],
+    ) -> Content {
+        let mut metadata: HashMap<String, Value> = HashMap::new();
+        metadata.insert(
+            "general.architecture".into(),
+            Value::String(arch.to_string()),
+        );
+        for (k, v) in meta {
+            metadata.insert(format!("{arch}.{k}"), v.clone());
+        }
+        let tensor_infos = tensors
+            .iter()
+            .map(|(name, dims)| {
+                (
+                    name.to_string(),
+                    TensorInfo {
+                        ggml_dtype: GgmlDType::F32,
+                        shape: crate::tensor::Shape::from(dims.clone()),
+                        offset: 0,
+                    },
+                )
+            })
+            .collect();
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos,
+            tensor_data_offset: 0,
+            mmap_owner: None,
+        }
+    }
+
+    /// The dimensions of a small gpt-oss-shaped model: 4 query heads over 2 key/value
+    /// heads of 8, 4 layers, 4 experts of which 2 are used, a window of 4.
+    fn gptoss_like(arch: &str, rope_type: Option<&str>) -> Content {
+        let (hidden, heads, kv_heads, hd, experts) = (32usize, 4usize, 2usize, 8usize, 4usize);
+        let mut meta = vec![
+            ("attention.head_count", Value::U32(heads as u32)),
+            ("attention.head_count_kv", Value::U32(kv_heads as u32)),
+            ("attention.key_length", Value::U32(hd as u32)),
+            ("attention.layer_norm_rms_epsilon", Value::F32(1e-5)),
+            ("attention.sliding_window", Value::U32(4)),
+            ("block_count", Value::U32(4)),
+            ("embedding_length", Value::U32(hidden as u32)),
+            ("feed_forward_length", Value::U32(hidden as u32)),
+            ("expert_count", Value::U32(experts as u32)),
+            ("expert_used_count", Value::U32(2)),
+            ("rope.freq_base", Value::F32(150000.0)),
+            ("rope.scaling.factor", Value::F32(32.0)),
+            ("rope.scaling.original_context_length", Value::U32(4096)),
+        ];
+        if let Some(t) = rope_type {
+            meta.push(("rope.scaling.type", Value::String(t.to_string())));
+        }
+        let tensors = vec![
+            ("token_embd.weight", vec![100, hidden]),
+            ("blk.0.attn_norm.weight", vec![hidden]),
+            ("blk.0.attn_q.weight", vec![heads * hd, hidden]),
+            ("blk.0.attn_q.bias", vec![heads * hd]),
+            ("blk.0.attn_k.weight", vec![kv_heads * hd, hidden]),
+            ("blk.0.attn_k.bias", vec![kv_heads * hd]),
+            ("blk.0.attn_v.weight", vec![kv_heads * hd, hidden]),
+            ("blk.0.attn_v.bias", vec![kv_heads * hd]),
+            ("blk.0.attn_out.weight", vec![hidden, heads * hd]),
+            ("blk.0.attn_out.bias", vec![hidden]),
+            ("blk.0.attn_sinks", vec![heads]),
+            ("blk.0.ffn_norm.weight", vec![hidden]),
+            ("blk.0.ffn_gate_inp.weight", vec![experts, hidden]),
+            ("blk.0.ffn_gate_inp.bias", vec![experts]),
+            ("blk.0.ffn_gate_exps.weight", vec![experts, hidden, hidden]),
+            ("blk.0.ffn_up_exps.weight", vec![experts, hidden, hidden]),
+            ("blk.0.ffn_down_exps.weight", vec![experts, hidden, hidden]),
+        ];
+        synth_content(arch, &meta, &tensors)
+    }
+
+    #[test]
+    fn a_gptoss_file_configures_sinks_windows_yarn_and_the_clamped_experts() {
+        let content = gptoss_like("gptoss", None);
+        let cfg = GenericTransformerConfig::from_gguf(&content, "gptoss").unwrap();
+        assert!(cfg.flags.has_attn_sinks);
+        assert!(cfg.flags.has_qkv_bias);
+        assert!(
+            cfg.flags.has_attn_output_bias,
+            "attn_out.bias names the output bias"
+        );
+        assert!(cfg.flags.is_moe);
+        assert_eq!(attn_output_name(&content), "attn_out");
+        assert_eq!(
+            attn_sinks_name(&content, 0).as_deref(),
+            Some("blk.0.attn_sinks")
+        );
+        assert_eq!(cfg.sliding_window, Some(4));
+        assert_eq!(cfg.swa_pattern, None);
+        assert_eq!(cfg.swa_period, Some(2));
+        let windowed: Vec<bool> = (0..cfg.n_layers)
+            .map(|il| windowed_by_period(2, il))
+            .collect();
+        assert_eq!(windowed, vec![true, false, true, false]);
+        let yarn = cfg.yarn.expect("the architecture rotates with YaRN");
+        assert_eq!(yarn.factor, 32.0);
+        assert_eq!(yarn.orig_ctx, 4096.0);
+        assert!((yarn.attn_factor - (1.0 + 0.1 * 32f32.ln())).abs() < 1e-6);
+        assert_eq!(cfg.expert_swiglu_clamp, Some((1.702, 7.0)));
+        assert!(
+            !cfg.flags.use_rope_i,
+            "gpt-oss pairs a lane with the one half a head away"
+        );
+    }
+
+    #[test]
+    fn a_scaling_type_in_the_file_wins_over_the_convention() {
+        let content = gptoss_like("gptoss", Some("linear"));
+        let cfg = GenericTransformerConfig::from_gguf(&content, "gptoss").unwrap();
+        assert!(cfg.yarn.is_none());
+    }
+
+    #[test]
+    fn the_same_tensors_under_another_architecture_keep_its_defaults() {
+        let content = gptoss_like("qwen3", None);
+        let cfg = GenericTransformerConfig::from_gguf(&content, "qwen3").unwrap();
+        assert_eq!(cfg.swa_period, None);
+        assert_eq!(cfg.expert_swiglu_clamp, None);
+        assert!(
+            cfg.yarn.is_none(),
+            "no scaling type and no convention: no YaRN"
+        );
+        assert_eq!(arch_conventions("qwen3"), ArchConventions::default());
+    }
+
+    #[test]
+    fn the_period_classifies_windowed_and_global_layers() {
+        assert!(windowed_by_period(0, 5), "period 0 windows every layer");
+        assert!(windowed_by_period(3, 0));
+        assert!(windowed_by_period(3, 1));
+        assert!(!windowed_by_period(3, 2));
+        assert!(windowed_by_period(3, 3));
     }
 }

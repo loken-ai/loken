@@ -339,7 +339,7 @@ pub(crate) trait ModelBackend: Send {
     /// smaller chunk - `keep` is the prefill's `index_pos`, so session-reuse
     /// prefixes ([0, session_start)) are preserved. For trim-capable variants
     /// this is `trim_kv(keep)`; for TP (which only ever prefills at pos 0 and
-    /// resets there) and the recurrent-MoE variants (lfm2/qwen35/nemotron/gptoss,
+    /// resets there) and the recurrent-MoE variants (lfm2/qwen35/nemotron,
     /// which self-reset KV + conv state on the next forward at `input_pos == 0`)
     /// it is a no-op when `keep == 0`.
     fn reset_kv_from(&mut self, _keep: usize) {}

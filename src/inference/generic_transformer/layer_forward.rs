@@ -904,6 +904,8 @@ impl GenericTransformerLayer {
         // gemma4: V-norm + GeGLU + sandwich post-norms + per-layer SWA window +
         // F16 KV (Q8 degenerate at hd512). Handled via the gemma branch below.
         let is_gemma = self.attn_v_norm_ones.is_some();
+        // gemma4 and sink layers attend over the F16 store; the rest over the Q8 store.
+        let f16_store = is_gemma || self.attn_sinks.is_some();
         // residual_scale (granite) is now supported (applied at both residual adds);
         // MoE is supported for the SIMPLE router-prenormed case (granite/qwen*moe/
         // olmoe) - the attention runs zero-alloc here and the FFN calls moe.forward.
@@ -941,7 +943,7 @@ impl GenericTransformerLayer {
         }
         // Lazily build the Q8 KV store (prefill's cpu_q8_append usually already
         // did, with the same eligibility gate - but be safe for empty-prompt).
-        if is_gemma {
+        if f16_store {
             if self.cpu_f16_kv.is_none() {
                 // Per-layer window: SWA layers have sliding_window set; global None.
                 let window = self.sliding_window.filter(|&w| w > 0);
@@ -1017,6 +1019,11 @@ impl GenericTransformerLayer {
                     post_ffn_norm_w,
                     ple_post_norm_w,
                     ple_output_scale,
+                    o_bias: self
+                        .attn_output_bias
+                        .as_ref()
+                        .map(|b| b.to_dtype(crate::tensor::DType::F32)?.to_vec1::<f32>())
+                        .transpose()?,
                 });
         }
         // Owned take: `nc` no longer borrows `self`, so the attention block's
@@ -1114,10 +1121,15 @@ impl GenericTransformerLayer {
         let scale = self
             .attention_scale
             .unwrap_or_else(|| 1.0 / (hd as f64).sqrt()) as f32;
-        if is_gemma {
+        if f16_store {
             let cache = self.cpu_f16_kv.as_mut().unwrap();
             cache.append(&arena.k, &arena.v)?;
-            cache.attention(&arena.q, scale, &mut arena.attn)?;
+            match self.attn_sinks_host.as_deref() {
+                Some(sinks) => {
+                    cache.attention_sinks(&arena.q, scale, Some(sinks), &mut arena.attn)?
+                }
+                None => cache.attention(&arena.q, scale, &mut arena.attn)?,
+            }
         } else {
             let cache = self.cpu_q8_kv.as_mut().unwrap();
             cache.append(&arena.k, &arena.v)?;
@@ -1140,8 +1152,9 @@ impl GenericTransformerLayer {
         // path. Build [1,nkv,1,hd] tensors from the arena slices and append
         // (handles the SWA window + advances the counter). Non-donor layers'
         // kv_cache is never read, so they only need the cheap counter advance
-        // and stay zero-alloc (the next request's mask length stays correct).
-        if self.populate_dual_kv {
+        // and stay zero-alloc (the next request's mask length stays correct). A sink
+        // layer's multi-token attention reads the F-dtype cache, so it is filled too.
+        if self.populate_dual_kv || self.attn_sinks.is_some() {
             let kt = crate::tensor::Tensor::from_vec(
                 arena.k[..nkv * hd].to_vec(),
                 (1, nkv, 1, hd),
@@ -1163,6 +1176,9 @@ impl GenericTransformerLayer {
         {
             self.cpu_norm_cache = Some(nc);
             return Ok(false);
+        }
+        if let Some(bias) = &nc.o_bias {
+            ex::residual_add(&mut arena.proj, bias);
         }
         if let Some((w, eps)) = &nc.post_attn_norm_w {
             ex::rms_norm_slice(&arena.proj, w, *eps, &mut arena.norm);
