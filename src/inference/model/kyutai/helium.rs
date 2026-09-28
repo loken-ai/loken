@@ -1,7 +1,7 @@
 //! Kyutai `tts-1.6b-en_fr` - the Helium main transformer (component 4 of the port).
 //!
-//! 16-layer streaming decoder, dim 2048, 16 heads (hd 128), RoPE, causal (ctx 500),
-//! RMSNorm (`alpha` scale), SiLU-GLU gating (hidden 5632), and CROSS-ATTENTION to the
+//! Streaming decoder read from the checkpoint's `config.json`: RoPE, causal over a sliding
+//! window, RMSNorm (`alpha` scale), SiLU-GLU gating, and CROSS-ATTENTION to the
 //! conditioning source (voice/text fuser output). Per-layer forward:
 //!   x += self_attn(rms_norm1(x))                 # causal RoPE self-attn
 //!   x += cross_attn(layer_norm_cross(x), ca)     # attends the condition tokens
@@ -14,16 +14,59 @@ use crate::inference::model::sdpa::sdpa;
 use crate::tensor::VarBuilder;
 use crate::tensor::{Device, Result, Tensor};
 
-const DIM: usize = 2048;
-const N_HEAD: usize = 16;
-const HD: usize = DIM / N_HEAD; // 128
-const HIDDEN: usize = 5632; // (2 * hidden_scale*dim) / 3 = (2*8448)/3
-/// Number of Helium transformer layers (exposed so the LM can size its HeteroPlan).
-pub const N_LAYERS: usize = 16;
-const CONTEXT: usize = 500;
-const ROPE_THETA: f32 = 10_000.0;
 const RMS_EPS: f32 = 1e-5;
 const LN_EPS: f32 = 1e-5;
+
+/// The transformer's shape, read from the `config.json` published beside the checkpoint.
+#[derive(Debug, Clone, Copy)]
+pub struct Geometry {
+    pub dim: usize,
+    pub heads: usize,
+    pub layers: usize,
+    /// Width of one half of the SiLU-GLU gate.
+    pub hidden: usize,
+    /// Positions the self-attention window reaches back.
+    pub context: usize,
+    pub rope_theta: f32,
+}
+
+impl Geometry {
+    /// Read the geometry from the parsed `config.json`.
+    pub fn from_config(cfg: &serde_json::Value) -> Result<Self> {
+        let n = |k: &str| -> Result<usize> {
+            cfg[k]
+                .as_u64()
+                .map(|v| v as usize)
+                .ok_or_else(|| crate::tensor::Error(format!("kyutai config.json: missing {k}")))
+        };
+        let f = |k: &str| -> Result<f64> {
+            cfg[k]
+                .as_f64()
+                .ok_or_else(|| crate::tensor::Error(format!("kyutai config.json: missing {k}")))
+        };
+        let dim = n("dim")?;
+        // The gate's two halves together are two thirds of the feed-forward width.
+        let feed_forward = (f("hidden_scale")? * dim as f64) as usize;
+        Ok(Self {
+            dim,
+            heads: n("num_heads")?,
+            layers: n("num_layers")?,
+            hidden: 2 * feed_forward / 3,
+            context: n("context")?,
+            rope_theta: f("max_period")? as f32,
+        })
+    }
+
+    fn head_dim(&self) -> usize {
+        self.dim / self.heads.max(1)
+    }
+
+    /// F32 bytes one layer's self-attention cache holds over the full window.
+    pub fn kv_bytes_per_layer(&self) -> u64 {
+        const F32_BYTES: u64 = 4;
+        2 * self.dim as u64 * self.context as u64 * F32_BYTES
+    }
+}
 
 struct Layer {
     norm1: Tensor,    // rms alpha [dim]
@@ -40,28 +83,31 @@ struct Layer {
     /// incoming activation (and the conditioning) onto it - no-op within a segment, a
     /// GPU↔CPU copy only at a plan boundary.
     device: Device,
+    g: Geometry,
 }
 impl Layer {
-    fn load(vb: &VarBuilder, i: usize, device: Device) -> Result<Self> {
+    fn load(vb: &VarBuilder, i: usize, device: Device, g: Geometry) -> Result<Self> {
         let p = vb.pp(format!("layers.{i}"));
+        let (dim, hidden) = (g.dim, g.hidden);
         Ok(Self {
-            norm1: p.get((1, 1, DIM), "norm1.alpha")?.reshape(DIM)?,
-            norm2: p.get((1, 1, DIM), "norm2.alpha")?.reshape(DIM)?,
-            ncross_w: p.get(DIM, "norm_cross.weight")?,
-            ncross_b: p.get(DIM, "norm_cross.bias")?,
-            sa_in: p.get((3 * DIM, DIM), "self_attn.in_proj_weight")?,
-            sa_out: p.get((DIM, DIM), "self_attn.out_proj.weight")?,
-            ca_in: p.get((3 * DIM, DIM), "cross_attention.in_proj_weight")?,
-            ca_out: p.get((DIM, DIM), "cross_attention.out_proj.weight")?,
-            g_in: p.get((2 * HIDDEN, DIM), "gating.linear_in.weight")?,
-            g_out: p.get((DIM, HIDDEN), "gating.linear_out.weight")?,
+            norm1: p.get((1, 1, dim), "norm1.alpha")?.reshape(dim)?,
+            norm2: p.get((1, 1, dim), "norm2.alpha")?.reshape(dim)?,
+            ncross_w: p.get(dim, "norm_cross.weight")?,
+            ncross_b: p.get(dim, "norm_cross.bias")?,
+            sa_in: p.get((3 * dim, dim), "self_attn.in_proj_weight")?,
+            sa_out: p.get((dim, dim), "self_attn.out_proj.weight")?,
+            ca_in: p.get((3 * dim, dim), "cross_attention.in_proj_weight")?,
+            ca_out: p.get((dim, dim), "cross_attention.out_proj.weight")?,
+            g_in: p.get((2 * hidden, dim), "gating.linear_in.weight")?,
+            g_out: p.get((dim, hidden), "gating.linear_out.weight")?,
             device,
+            g,
         })
     }
 
     // heads: [S, dim] -> [1, H, S, hd]
-    fn heads(t: &Tensor, s: usize) -> Result<Tensor> {
-        t.reshape((s, N_HEAD, HD))?
+    fn heads(&self, t: &Tensor, s: usize) -> Result<Tensor> {
+        t.reshape((s, self.g.heads, self.g.head_dim()))?
             .transpose(0, 1)?
             .unsqueeze(0)?
             .contiguous()
@@ -69,25 +115,28 @@ impl Layer {
 
     fn forward(&self, x: &Tensor, ca: &Tensor) -> Result<Tensor> {
         let dev = &self.device;
+        let (dim, hd, hidden) = (self.g.dim, self.g.head_dim(), self.g.hidden);
         let x = x.to_device(dev)?;
         let ca = ca.to_device(dev)?;
         let (x, ca) = (&x, &ca);
         let s = x.shape().dims2()?.0;
         let sc = ca.shape().dims2()?.0;
-        let scale = 1.0 / (HD as f32).sqrt();
+        let scale = 1.0 / (hd as f32).sqrt();
         // -- self-attention (causal RoPE, sliding ctx) --
         let h = x.rms_norm(&self.norm1, RMS_EPS)?;
         let qkv = h.matmul_t(&self.sa_in)?;
-        let (cosv, sinv) = rope_tables(s, HD, ROPE_THETA);
-        let cos = Tensor::from_vec_f32(cosv, (s, HD / 2))?.to_device(dev)?;
-        let sin = Tensor::from_vec_f32(sinv, (s, HD / 2))?.to_device(dev)?;
-        let q = Self::heads(&qkv.narrow(1, 0, DIM)?, s)?.rope_i(&cos, &sin)?;
-        let k = Self::heads(&qkv.narrow(1, DIM, DIM)?, s)?.rope_i(&cos, &sin)?;
-        let v = Self::heads(&qkv.narrow(1, 2 * DIM, DIM)?, s)?;
+        let (cosv, sinv) = rope_tables(s, hd, self.g.rope_theta);
+        let cos = Tensor::from_vec_f32(cosv, (s, hd / 2))?.to_device(dev)?;
+        let sin = Tensor::from_vec_f32(sinv, (s, hd / 2))?.to_device(dev)?;
+        let q = self.heads(&qkv.narrow(1, 0, dim)?, s)?.rope_i(&cos, &sin)?;
+        let k = self
+            .heads(&qkv.narrow(1, dim, dim)?, s)?
+            .rope_i(&cos, &sin)?;
+        let v = self.heads(&qkv.narrow(1, 2 * dim, dim)?, s)?;
         let mut mask = vec![0f32; s * s];
         for i in 0..s {
             for j in 0..s {
-                if j > i || i - j >= CONTEXT {
+                if j > i || i - j >= self.g.context {
                     mask[i * s + j] = f32::NEG_INFINITY;
                 }
             }
@@ -96,26 +145,26 @@ impl Layer {
         let att = sdpa(&q, &k, &v, Some(&m), false, scale, 1.0)?
             .transpose(1, 2)?
             .contiguous()?
-            .reshape((s, DIM))?
+            .reshape((s, dim))?
             .matmul_t(&self.sa_out)?;
         let x = x.add(&att)?;
         // -- cross-attention to the conditioning source --
         let h = x.layer_norm(&self.ncross_w, Some(&self.ncross_b), LN_EPS)?;
-        let q = Self::heads(&h.matmul_t(&self.ca_in.narrow(0, 0, DIM)?)?, s)?;
-        let k = Self::heads(&ca.matmul_t(&self.ca_in.narrow(0, DIM, DIM)?)?, sc)?;
-        let v = Self::heads(&ca.matmul_t(&self.ca_in.narrow(0, 2 * DIM, DIM)?)?, sc)?;
+        let q = self.heads(&h.matmul_t(&self.ca_in.narrow(0, 0, dim)?)?, s)?;
+        let k = self.heads(&ca.matmul_t(&self.ca_in.narrow(0, dim, dim)?)?, sc)?;
+        let v = self.heads(&ca.matmul_t(&self.ca_in.narrow(0, 2 * dim, dim)?)?, sc)?;
         let att = sdpa(&q, &k, &v, None, false, scale, 1.0)?
             .transpose(1, 2)?
             .contiguous()?
-            .reshape((s, DIM))?
+            .reshape((s, dim))?
             .matmul_t(&self.ca_out)?;
         let x = x.add(&att)?;
         // -- SiLU-GLU gating FFN --
         let h = x.rms_norm(&self.norm2, RMS_EPS)?.matmul_t(&self.g_in)?; // [s, 2*hidden]
         let gate = h
-            .narrow(1, 0, HIDDEN)?
+            .narrow(1, 0, hidden)?
             .silu()?
-            .mul(&h.narrow(1, HIDDEN, HIDDEN)?)?;
+            .mul(&h.narrow(1, hidden, hidden)?)?;
         x.add(&gate.matmul_t(&self.g_out)?)
     }
 
@@ -125,18 +174,21 @@ impl Layer {
     /// in prior steps instead of re-running them.
     fn forward_step(&self, x: &Tensor, lc: &mut LayerCache, pos: usize) -> Result<Tensor> {
         let dev = &self.device;
+        let (dim, hd, hidden) = (self.g.dim, self.g.head_dim(), self.g.hidden);
         let x = x.to_device(dev)?;
         let x = &x;
-        let scale = 1.0 / (HD as f32).sqrt();
+        let scale = 1.0 / (hd as f32).sqrt();
         // -- self-attention (append new K/V, attend over the cache) --
         let h = x.rms_norm(&self.norm1, RMS_EPS)?;
         let qkv = h.matmul_t(&self.sa_in)?; // [1, 3*dim]
-        let (cosv, sinv) = rope_row(pos, HD, ROPE_THETA);
-        let cos = Tensor::from_vec_f32(cosv, (1, HD / 2))?.to_device(dev)?;
-        let sin = Tensor::from_vec_f32(sinv, (1, HD / 2))?.to_device(dev)?;
-        let q = Self::heads(&qkv.narrow(1, 0, DIM)?, 1)?.rope_i(&cos, &sin)?; // [1,H,1,hd]
-        let k = Self::heads(&qkv.narrow(1, DIM, DIM)?, 1)?.rope_i(&cos, &sin)?;
-        let v = Self::heads(&qkv.narrow(1, 2 * DIM, DIM)?, 1)?;
+        let (cosv, sinv) = rope_row(pos, hd, self.g.rope_theta);
+        let cos = Tensor::from_vec_f32(cosv, (1, hd / 2))?.to_device(dev)?;
+        let sin = Tensor::from_vec_f32(sinv, (1, hd / 2))?.to_device(dev)?;
+        let q = self.heads(&qkv.narrow(1, 0, dim)?, 1)?.rope_i(&cos, &sin)?; // [1,H,1,hd]
+        let k = self
+            .heads(&qkv.narrow(1, dim, dim)?, 1)?
+            .rope_i(&cos, &sin)?;
+        let v = self.heads(&qkv.narrow(1, 2 * dim, dim)?, 1)?;
         let mut kc = match lc.k.take() {
             None => k,
             Some(prev) => Tensor::cat(&[&prev, &k], 2)?,
@@ -145,35 +197,39 @@ impl Layer {
             None => v,
             Some(prev) => Tensor::cat(&[&prev, &v], 2)?,
         };
-        // sliding window: keep only the last CONTEXT keys/values
+        // sliding window: keep only the last `context` keys/values
         let clen = kc.shape().dims()[2];
-        if clen > CONTEXT {
-            kc = kc.narrow(2, clen - CONTEXT, CONTEXT)?.contiguous()?;
-            vc = vc.narrow(2, clen - CONTEXT, CONTEXT)?.contiguous()?;
+        if clen > self.g.context {
+            kc = kc
+                .narrow(2, clen - self.g.context, self.g.context)?
+                .contiguous()?;
+            vc = vc
+                .narrow(2, clen - self.g.context, self.g.context)?
+                .contiguous()?;
         }
         let att = sdpa(&q, &kc, &vc, None, false, scale, 1.0)?
             .transpose(1, 2)?
             .contiguous()?
-            .reshape((1, DIM))?
+            .reshape((1, dim))?
             .matmul_t(&self.sa_out)?;
         lc.k = Some(kc);
         lc.v = Some(vc);
         let x = x.add(&att)?;
         // -- cross-attention (K/V precomputed from the constant conditioning) --
         let h = x.layer_norm(&self.ncross_w, Some(&self.ncross_b), LN_EPS)?;
-        let q = Self::heads(&h.matmul_t(&self.ca_in.narrow(0, 0, DIM)?)?, 1)?;
+        let q = self.heads(&h.matmul_t(&self.ca_in.narrow(0, 0, dim)?)?, 1)?;
         let att = sdpa(&q, &lc.ck, &lc.cv, None, false, scale, 1.0)?
             .transpose(1, 2)?
             .contiguous()?
-            .reshape((1, DIM))?
+            .reshape((1, dim))?
             .matmul_t(&self.ca_out)?;
         let x = x.add(&att)?;
         // -- SiLU-GLU gating FFN --
         let h = x.rms_norm(&self.norm2, RMS_EPS)?.matmul_t(&self.g_in)?;
         let gate = h
-            .narrow(1, 0, HIDDEN)?
+            .narrow(1, 0, hidden)?
             .silu()?
-            .mul(&h.narrow(1, HIDDEN, HIDDEN)?)?;
+            .mul(&h.narrow(1, hidden, hidden)?)?;
         x.add(&gate.matmul_t(&self.g_out)?)
     }
 }
@@ -212,40 +268,22 @@ pub struct HeliumTransformer {
     tail: Device, // last layer's device (output side)
 }
 impl HeliumTransformer {
-    /// Single-device (parity / uniform): all 16 layers on `device`. Numerically identical to
-    /// the hetero path when every layer lands on the same device.
-    pub fn from_safetensors(path: &str, device: Device) -> Result<Self> {
-        let vb = unsafe { VarBuilder::from_files(&[path], crate::tensor::DType::F32, &device)? };
-        let t = vb.pp("transformer");
-        let mut layers = Vec::with_capacity(N_LAYERS);
-        for i in 0..N_LAYERS {
-            layers.push(Layer::load(&t, i, device.clone())?);
-        }
-        Ok(Self {
-            layers,
-            head: device.clone(),
-            tail: device,
-        })
-    }
-
-    /// Heterogeneous: load the 16 layers across `layer_devs` (a HeteroPlan), each from the
+    /// Load the layers across `layer_devs` (one device per layer), each from the
     /// VarBuilder of its device.
     pub fn load_hetero(
         vbs: &crate::inference::place::plan::VbSet,
         layer_devs: &[Device],
+        g: Geometry,
     ) -> Result<Self> {
         use crate::inference::place::plan::vb_on;
-        let mut layers = Vec::with_capacity(N_LAYERS);
-        for i in 0..N_LAYERS {
-            let d = &layer_devs[i];
+        let mut layers = Vec::with_capacity(g.layers);
+        for (i, d) in layer_devs.iter().enumerate().take(g.layers) {
             let t = vb_on(vbs, d).pp("transformer");
-            layers.push(Layer::load(&t, i, d.clone())?);
+            layers.push(Layer::load(&t, i, d.clone(), g)?);
         }
-        Ok(Self {
-            layers,
-            head: layer_devs[0].clone(),
-            tail: layer_devs[N_LAYERS - 1].clone(),
-        })
+        let head = layer_devs.first().cloned().unwrap_or(Device::Cpu);
+        let tail = layer_devs.last().cloned().unwrap_or(Device::Cpu);
+        Ok(Self { layers, head, tail })
     }
 
     pub fn head(&self) -> &Device {
@@ -272,8 +310,9 @@ impl HeliumTransformer {
         let mut layers = Vec::with_capacity(self.layers.len());
         for l in &self.layers {
             let ca = ca.to_device(&l.device)?;
-            let ck = Layer::heads(&ca.matmul_t(&l.ca_in.narrow(0, DIM, DIM)?)?, sc)?;
-            let cv = Layer::heads(&ca.matmul_t(&l.ca_in.narrow(0, 2 * DIM, DIM)?)?, sc)?;
+            let dim = l.g.dim;
+            let ck = l.heads(&ca.matmul_t(&l.ca_in.narrow(0, dim, dim)?)?, sc)?;
+            let cv = l.heads(&ca.matmul_t(&l.ca_in.narrow(0, 2 * dim, dim)?)?, sc)?;
             layers.push(LayerCache {
                 k: None,
                 v: None,

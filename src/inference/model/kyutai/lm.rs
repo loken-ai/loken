@@ -7,61 +7,105 @@
 //!   text_logits = text_linear(h)
 //! (audio_offset=1; K=33 = 1 text + 32 audio codebooks; out_norm = RMSNorm alpha.)
 
-use crate::inference::model::kyutai::helium::{HeliumCache, HeliumTransformer};
-use crate::tensor::VarBuilder;
+use crate::inference::model::kyutai::helium::{Geometry, HeliumCache, HeliumTransformer};
 use crate::tensor::{Device, Result, Tensor};
 
-const DIM: usize = 2048;
-const N_AUDIO: usize = 32;
 const AUDIO_OFFSET: usize = 1;
-const AUDIO_CARD: usize = 2049; // card + 1
-const TEXT_CARD: usize = 8001; // text_card + 1
-const TEXT_CARD_OUT: usize = 8000;
 const RMS_EPS: f32 = 1e-5;
 
+/// The LM's shape, read from the `config.json` published beside the checkpoint.
+struct LmConfig {
+    helium: Geometry,
+    /// Audio codebooks summed into each frame.
+    n_audio: usize,
+    /// Rows of each audio embedding: the codebook size and the zero token.
+    audio_card: usize,
+    /// Rows of the text embedding: the text vocabulary and its padding.
+    text_card: usize,
+    /// Rows of the text head.
+    text_card_out: usize,
+}
+
+impl LmConfig {
+    fn read(checkpoint: &str) -> Result<Self> {
+        let dir = std::path::Path::new(checkpoint).parent().ok_or_else(|| {
+            crate::tensor::Error(format!("kyutai: no directory for {checkpoint}"))
+        })?;
+        let path = dir.join("config.json");
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| crate::tensor::Error(format!("{}: {e}", path.display())))?;
+        let cfg: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| crate::tensor::Error(format!("{}: {e}", path.display())))?;
+        let n = |k: &str| -> Result<usize> {
+            cfg[k]
+                .as_u64()
+                .map(|v| v as usize)
+                .ok_or_else(|| crate::tensor::Error(format!("kyutai config.json: missing {k}")))
+        };
+        let text_card = n("text_card")?;
+        Ok(Self {
+            helium: Geometry::from_config(&cfg)?,
+            n_audio: n("n_q")?,
+            audio_card: n("card")? + 1,
+            text_card: text_card + 1,
+            text_card_out: cfg["text_card_out"]
+                .as_u64()
+                .map_or(text_card, |v| v as usize),
+        })
+    }
+}
+
 pub struct KyutaiLm {
-    audio_emb: Vec<Tensor>, // 32 x [2049, 2048]
-    text_emb: Tensor,       // [8001, 2048]
-    text_out1: Tensor,      // [2048, 2048] demux stream-1 projection
-    text_out2: Tensor,      // [2048, 2048] demux stream-2 projection
+    audio_emb: Vec<Tensor>, // n_audio x [audio_card, dim]
+    text_emb: Tensor,       // [text_card, dim]
+    text_out1: Tensor,      // [dim, dim] demux stream-1 projection
+    text_out2: Tensor,      // [dim, dim] demux stream-2 projection
     transformer: HeliumTransformer,
-    out_norm: Tensor,    // rms alpha [2048]
-    text_linear: Tensor, // [8000, 2048]
+    out_norm: Tensor,    // rms alpha [dim]
+    text_linear: Tensor, // [text_card_out, dim]
+    audio_card: usize,
+    text_card: usize,
     device: Device,
 }
 impl KyutaiLm {
-    pub fn from_safetensors(path: &str, device: Device) -> Result<Self> {
-        let vb = unsafe { VarBuilder::from_files(&[path], crate::tensor::DType::F32, &device)? };
-        let mut audio_emb = Vec::with_capacity(N_AUDIO);
-        for cb in 0..N_AUDIO {
-            audio_emb.push(vb.get((AUDIO_CARD, DIM), &format!("emb.{cb}.weight"))?);
-        }
-        Ok(Self {
-            audio_emb,
-            text_emb: vb.get((TEXT_CARD, DIM), "text_emb.weight")?,
-            text_out1: vb.get((DIM, DIM), "text_emb.out1.weight")?,
-            text_out2: vb.get((DIM, DIM), "text_emb.out2.weight")?,
-            transformer: HeliumTransformer::from_safetensors(path, device.clone())?,
-            out_norm: vb.get((1, 1, DIM), "out_norm.alpha")?.reshape(DIM)?,
-            text_linear: vb.get((TEXT_CARD_OUT, DIM), "text_linear.weight")?,
-            device,
+    /// Load the LM through the ladder in `place`: the Helium layers spread over the cards
+    /// with their self-attention cache, the embeddings, out_norm and text head on the first
+    /// card the plan uses (the input/output side).
+    pub fn from_safetensors_hetero(path: &str) -> Result<Self> {
+        let cfg = LmConfig::read(path)?;
+        let g = cfg.helium;
+        let (block_bytes, head_bytes) =
+            crate::inference::place::runtime_demand::safetensors_f32_split(&[path], |n| {
+                n.starts_with("transformer.layers.")
+            })
+            .map_err(crate::tensor::Error)?;
+        let demand = crate::inference::place::ladder::Demand {
+            layers: g.layers,
+            block_bytes,
+            head_bytes,
+            kv_bytes_per_layer: g.kv_bytes_per_layer(),
+            runtime_reserve: crate::inference::place::runtime_demand::transformer_work_reserve(
+                block_bytes + head_bytes,
+                g.context,
+                g.dim,
+                g.heads,
+                g.hidden,
+            ),
+        };
+        crate::inference::place::ladder::load("Kyutai LM", &demand, |plan| {
+            Self::build(path, &cfg, plan)
         })
     }
 
-    /// Heterogeneous load: the 16-layer Helium transformer (the 1.6 B weight mass) is placed
-    /// across real free VRAM via a HeteroPlan (pack-first on the fastest GPU, spill
-    /// GPU->GPU->CPU, never OOM) - the same mechanism the LLM decoder / ACE-Step DiT use. The
-    /// embeddings + out_norm + text head sit on the primary device (the input/output side).
-    pub fn from_safetensors_hetero(path: &str) -> Result<Self> {
-        use crate::inference::model::kyutai::helium::N_LAYERS;
-        let file_size = std::fs::metadata(path)
-            .map(|m| m.len())
-            .unwrap_or(3_300_000_000);
-        // KV per layer: 2 . heads . head_dim . sliding_ctx(500) . f32 (heads.head_dim = DIM).
-        let kv_per_layer = (2 * DIM * 500 * 4) as u64;
-        let reserve: u64 = 1024 << 20; // CUDA ctx + cuBLAS scratch + the small aux towers
-        let (layer_devs, primary) =
-            crate::inference::place::plan::plan_layers(N_LAYERS, file_size, reserve, kv_per_layer);
+    fn build(
+        path: &str,
+        cfg: &LmConfig,
+        plan: &crate::inference::place::layer_executor::HeteroPlan,
+    ) -> Result<Self> {
+        let g = cfg.helium;
+        let dim = g.dim;
+        let layer_devs = crate::inference::place::ladder::layer_devices(plan, g.layers);
+        let primary = crate::inference::place::ladder::primary_device(plan);
         let vbs = crate::inference::place::plan::build_vbset(
             path,
             &layer_devs
@@ -75,22 +119,25 @@ impl KyutaiLm {
             .filter(|d| crate::inference::place::plan::dev_key(d) != "cpu")
             .count();
         tracing::info!(
-            "kyutai helium hetero: {on_gpu}/{N_LAYERS} layers on GPU, primary {}",
+            "kyutai helium hetero: {on_gpu}/{} layers on GPU, primary {}",
+            g.layers,
             crate::inference::place::plan::dev_key(&primary)
         );
         let vb = crate::inference::place::plan::vb_on(&vbs, &primary);
-        let mut audio_emb = Vec::with_capacity(N_AUDIO);
-        for cb in 0..N_AUDIO {
-            audio_emb.push(vb.get((AUDIO_CARD, DIM), &format!("emb.{cb}.weight"))?);
+        let mut audio_emb = Vec::with_capacity(cfg.n_audio);
+        for cb in 0..cfg.n_audio {
+            audio_emb.push(vb.get((cfg.audio_card, dim), &format!("emb.{cb}.weight"))?);
         }
         Ok(Self {
             audio_emb,
-            text_emb: vb.get((TEXT_CARD, DIM), "text_emb.weight")?,
-            text_out1: vb.get((DIM, DIM), "text_emb.out1.weight")?,
-            text_out2: vb.get((DIM, DIM), "text_emb.out2.weight")?,
-            transformer: HeliumTransformer::load_hetero(&vbs, &layer_devs)?,
-            out_norm: vb.get((1, 1, DIM), "out_norm.alpha")?.reshape(DIM)?,
-            text_linear: vb.get((TEXT_CARD_OUT, DIM), "text_linear.weight")?,
+            text_emb: vb.get((cfg.text_card, dim), "text_emb.weight")?,
+            text_out1: vb.get((dim, dim), "text_emb.out1.weight")?,
+            text_out2: vb.get((dim, dim), "text_emb.out2.weight")?,
+            transformer: HeliumTransformer::load_hetero(&vbs, &layer_devs, g)?,
+            out_norm: vb.get((1, 1, dim), "out_norm.alpha")?.reshape(dim)?,
+            text_linear: vb.get((cfg.text_card_out, dim), "text_linear.weight")?,
+            audio_card: cfg.audio_card,
+            text_card: cfg.text_card,
             device: primary,
         })
     }
@@ -102,7 +149,7 @@ impl KyutaiLm {
     fn text_embed(&self, text_ids: &Tensor) -> Result<Tensor> {
         let s = text_ids.shape().dims1()?;
         let ids = text_ids.to_vec1_u32()?;
-        let card = TEXT_CARD as u32;
+        let card = self.text_card as u32;
         let left: Vec<u32> = ids.iter().map(|&t| t % card).collect();
         let left_t = Tensor::from_vec_u32(left, vec![s])?.to_device(&self.device)?;
         let mut y = self
@@ -135,21 +182,21 @@ impl KyutaiLm {
     fn embed(&self, seq: &Tensor, sum_condition: &Tensor) -> Result<Tensor> {
         let s = seq.shape().dims2()?.1;
         let mut input: Option<Tensor> = None;
-        for cb in 0..N_AUDIO {
+        for cb in 0..self.audio_emb.len() {
             let ids_host = seq
                 .narrow(0, cb + AUDIO_OFFSET, 1)?
                 .reshape(s)?
                 .to_vec1_u32()?;
             let clamped: Vec<u32> = ids_host
                 .iter()
-                .map(|&x| if x < AUDIO_CARD as u32 { x } else { 0 })
+                .map(|&x| if x < self.audio_card as u32 { x } else { 0 })
                 .collect();
             let cl = Tensor::from_vec_u32(clamped, vec![s])?.to_device(&self.device)?;
             let mut e = self.audio_emb[cb].index_select(&cl, 0)?; // [S, DIM]
-            if ids_host.iter().any(|&x| x >= AUDIO_CARD as u32) {
+            if ids_host.iter().any(|&x| x >= self.audio_card as u32) {
                 let mask: Vec<f32> = ids_host
                     .iter()
-                    .map(|&x| if x < AUDIO_CARD as u32 { 1.0 } else { 0.0 })
+                    .map(|&x| if x < self.audio_card as u32 { 1.0 } else { 0.0 })
                     .collect();
                 let m = Tensor::from_vec_f32(mask, (s, 1))?.to_device(&self.device)?;
                 e = e.broadcast_mul(&m)?;

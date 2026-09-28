@@ -110,31 +110,81 @@ pub struct EzAudioDiT {
 
 impl EzAudioDiT {
     /// Resolve + load the EzAudio S3 large DiT from the configured HF hub dir
-    /// (`ckpts/s3/ezaudio_s3_l.pt`).
-    pub fn load_s3_large() -> Result<Self> {
+    /// (`ckpts/s3/ezaudio_s3_l.pt`), placed for a render of `frames` latent frames.
+    pub fn load_s3_large(frames: usize) -> Result<Self> {
         let p = ezaudio_pt("ckpts/s3/ezaudio_s3_l.pt");
         Self::from_pt(
             p.to_str()
                 .ok_or_else(|| Error("ezaudio-dit: bad path".into()))?,
+            frames,
         )
     }
 
-    /// Load the DiT from a torch `.pt` (full-Rust [`crate::tensor::pth`] reader).
-    /// All weights are coerced to F32 on the placement device.
-    pub fn from_pt(path: &str) -> Result<Self> {
+    /// Load the DiT from a torch `.pt` (full-Rust [`crate::tensor::pth`] reader), placed
+    /// through the ladder in `place` for a render of `frames` latent frames. All weights
+    /// are coerced to F32 on the device the plan gives them.
+    pub fn from_pt(path: &str, frames: usize) -> Result<Self> {
         let m = crate::tensor::pth::read_pt(path)?;
-        // The file is right here; a written-down size is a fact about one build of it.
-        let model_size = std::fs::metadata(path).map(|x| x.len()).unwrap_or(0);
-        let dev = crate::inference::model::acestep::vae::vae_best_device(model_size);
         eprintln!("[ezaudio-dit] loading {} tensors from {path}", m.len());
+        let dims = |name: &str| -> Result<Vec<usize>> {
+            m.get(name)
+                .map(|t| t.dims().to_vec())
+                .ok_or_else(|| Error(format!("ezaudio-dit: missing tensor `{name}`")))
+        };
+        // The demand, from the tensor directory: the tower's blocks, and the stem and head
+        // beside them, each expanded to F32.
+        let pe = dims("model.patch_embed.proj.weight")?; // [H, in_chans, patch]
+        let (hidden, patch) = (pe[0], pe[2]);
+        let heads = hidden / dims("model.in_blocks.0.attn.norm_q.weight")?[0].max(1);
+        let ffn = dims("model.in_blocks.0.mlp.net.0.proj.weight")?[0];
+        let is_block = |n: &str| {
+            n.starts_with("model.in_blocks.")
+                || n.starts_with("model.mid_block.")
+                || n.starts_with("model.out_blocks.")
+        };
+        const F32_BYTES: u64 = 4;
+        let (mut block_bytes, mut head_bytes) = (0u64, 0u64);
+        for (name, t) in &m {
+            let b = t.dims().iter().product::<usize>() as u64 * F32_BYTES;
+            if is_block(name) {
+                block_bytes += b;
+            } else {
+                head_bytes += b;
+            }
+        }
+        let count = |prefix: &str| {
+            (0..)
+                .take_while(|i| m.contains_key(&format!("{prefix}.{i}.norm1.weight")))
+                .count()
+        };
+        let layers = count("model.in_blocks") + 1 + count("model.out_blocks");
+        let tokens = (frames / patch.max(1)).max(1);
+        let demand = crate::inference::place::ladder::Demand {
+            layers,
+            block_bytes,
+            head_bytes,
+            kv_bytes_per_layer: 0,
+            runtime_reserve: crate::inference::place::runtime_demand::transformer_work_reserve(
+                block_bytes + head_bytes,
+                tokens,
+                hidden,
+                heads,
+                ffn,
+            ),
+        };
+        crate::inference::place::ladder::load("EzAudio DiT", &demand, |plan| Self::build(&m, plan))
+    }
 
-        // THE CARD A BLOCK LANDS ON, rewritten before each block is built.
-        //
-        // Every tensor used to go to one device, so this per-step tower could not use
-        // a second card and, when it fit none, went to the host in its entirety. The
-        // fetch helpers below read this cell rather than a fixed device, which keeps
-        // the change to where the blocks are built instead of threading a device
-        // through nine closures.
+    /// The DiT built on `plan`: each block on its device, the stem and head on the first card
+    /// the plan uses.
+    fn build(
+        m: &std::collections::HashMap<String, Tensor>,
+        plan: &crate::inference::place::layer_executor::HeteroPlan,
+    ) -> Result<Self> {
+        let dev = crate::inference::place::ladder::primary_device(plan);
+
+        // The device the next tensor is fetched onto, rewritten before each block is built;
+        // the fetch helpers below read it.
         let cur_dev = std::cell::RefCell::new(dev.clone());
 
         // -- tensor / layer fetch helpers (host .pt -> F32 device tensors) --
@@ -230,33 +280,8 @@ impl EzAudioDiT {
             })
         };
 
-        // Spread the tower over every card, the same mechanism the rest of the fleet
-        // uses. The blocks are all the same width here, so a uniform plan is the right
-        // shape - unlike a UNet, where the deep stages dwarf the shallow ones.
         let n_blocks = n_in + 1 + n_out;
-        let block_devices: Vec<Device> = {
-            use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
-            let cudas = crate::inference::place::vram_manager::probe_under_pressure(0);
-            let budget: Vec<(usize, u64)> = cudas.iter().map(|(i, fr, _)| (*i, *fr)).collect();
-            let plan = HeteroPlan::calculate(n_blocks, model_size, &budget, &[], 1.0);
-            let mut out = vec![Device::Cpu; n_blocks];
-            for seg in &plan.segments {
-                let d = match seg.kind {
-                    DeviceKind::Cuda(i) => cudas
-                        .iter()
-                        .find(|(j, _, _)| *j == i)
-                        .map(|(_, _, d)| d.clone())
-                        .unwrap_or(Device::Cpu),
-                    _ => Device::Cpu,
-                };
-                for slot in
-                    out[seg.layer_start.min(n_blocks)..seg.layer_end.min(n_blocks)].iter_mut()
-                {
-                    *slot = d.clone();
-                }
-            }
-            out
-        };
+        let block_devices = crate::inference::place::ladder::layer_devices(plan, n_blocks);
         eprintln!(
             "[ezaudio-dit] {n_blocks} blocks placed across {} device(s)",
             {
@@ -652,8 +677,9 @@ mod tests {
     #[test]
     #[ignore = "needs EzAudio ckpts/s3/ezaudio_s3_l.pt; sanity forward (shape + finite)"]
     fn sanity_forward() {
-        let dit = EzAudioDiT::load_s3_large().unwrap();
-        let (ic, oc, t) = (dit.in_chans, dit.out_chans, 64usize);
+        let t = 64usize;
+        let dit = EzAudioDiT::load_s3_large(t).unwrap();
+        let (ic, oc) = (dit.in_chans, dit.out_chans);
         // random noisy DiT input [in_chans, T] (deterministic pseudo-random).
         let xv: Vec<f32> = (0..ic * t)
             .map(|i| (i as f32 * 0.137).sin() * 0.5)

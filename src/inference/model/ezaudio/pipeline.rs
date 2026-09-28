@@ -209,7 +209,7 @@ pub fn render_with_progress(
     drop(t5_part);
 
     // 2) DiT.
-    let dit = EzAudioDiT::load_s3_large()?;
+    let dit = EzAudioDiT::load_s3_large(t)?;
     let _dit_part = crate::inference::serve::progress::placement::part("dit", &dit.placement());
 
     // 3) init latent ~ N(0,1) [128, T] channel-major (LCG + Box-Muller, seed-driven).
