@@ -922,6 +922,30 @@ pub fn resident_bytes() -> u64 {
     sz(dir.join("model.safetensors")) + sz(dir.join("t5-base/model.safetensors"))
 }
 
+/// Where the decoder's tensors sit in the checkpoint.
+const DECODER_PREFIX: &str = "pretransform.model.decoder";
+
+/// Bytes of the tensors under `prefix` in the checkpoint at `path`, read from its header.
+fn component_bytes(path: &str, prefix: &str) -> Result<u64> {
+    let loader = unsafe { SafeTensorsLoader::multi(&[path]) }?;
+    Ok(loader
+        .byte_sizes()
+        .iter()
+        .filter(|(n, _)| n.starts_with(prefix))
+        .map(|(_, b)| *b as u64)
+        .sum())
+}
+
+/// What a card keeps free beside the pipeline for one Oobleck decode.
+fn decode_reserve() -> u64 {
+    use crate::inference::place::audio_demand as ad;
+    ad::oobleck_reserve(
+        ad::ACE_VAE_REFERENCE_WINDOW,
+        &ad::ACE_VAE_REFERENCE_LEVELS,
+        ad::OOBLECK_KERNEL,
+    )
+}
+
 fn resident() -> Result<std::sync::Arc<SaoResident>> {
     let dir = model_dir().ok_or_else(|| {
         Error::msg(
@@ -948,16 +972,28 @@ fn resident() -> Result<std::sync::Arc<SaoResident>> {
         .to_string();
     let sz = std::fs::metadata(&ckpt_path)
         .map(|m| m.len())
-        .unwrap_or(5 << 30);
-    let device = crate::inference::model::acestep::vae::vae_best_device(sz);
+        .map_err(|e| Error::msg(format!("stable-audio checkpoint {ckpt}: {e}")))?;
+    let t5 = crate::inference::model::t5::flan::T5Encoder::from_dir(&t5_dir)?;
+    // The DiT, the decoder and the conditioners share one device, placed whole by the
+    // ladder in `place` with the decode's reserve beside them.
+    let (dit, decoder, nc_start, nc_total, device) =
+        crate::inference::place::ladder::load_whole("Stable Audio", sz, decode_reserve(), |dev| {
+            Ok::<_, Error>((
+                load_dit(ckpt, dev)?,
+                load_decoder_on(ckpt, DECODER_PREFIX, dev)?,
+                SaoNumberConditioner::load(ckpt, "seconds_start", dev)?,
+                SaoNumberConditioner::load(ckpt, "seconds_total", dev)?,
+                dev.clone(),
+            ))
+        })?;
     let r = std::sync::Arc::new(SaoResident {
-        t5: crate::inference::model::t5::flan::T5Encoder::from_dir(&t5_dir)?,
+        t5,
         t5_dir,
-        dit: load_dit(ckpt, &device)?,
-        decoder: load_decoder_on(ckpt, "pretransform.model.decoder", &device)?,
+        dit,
+        decoder,
         encoder: std::sync::Mutex::new(None),
-        nc_start: SaoNumberConditioner::load(ckpt, "seconds_start", &device)?,
-        nc_total: SaoNumberConditioner::load(ckpt, "seconds_total", &device)?,
+        nc_start,
+        nc_total,
         ckpt_mtime: mtime,
         device,
     });
@@ -1131,37 +1167,24 @@ pub fn render_with_init(
     // Decode: [T, 64] -> [64, T] -> [2, T*2048], trim to the requested length.
     dbg_stage_hash("latent", &latent);
     let latent = latent.transpose(0, 1)?.contiguous()?;
+    // A decode that runs out of card memory next to what else moved onto the card is
+    // placed again through the ladder: the decoder alone, reloaded on the rung that holds
+    // it and its decode, down to the host.
     let audio = match res.decoder.decode(&latent) {
-        // Device out of memory even after the allocator-level reclaim: the
-        // decode transients no longer fit next to whatever else moved onto
-        // the card. Re-plan on the CURRENT best device (free-VRAM-gated, so
-        // it sees the pressure and may pick another GPU or the CPU) and
-        // decode there instead of failing the render.
-        Err(e) if e.is_oom() => {
+        Err(e) if crate::inference::place::ladder::is_out_of_memory(&e) => {
+            tracing::warn!("stable-audio decode ran out of memory on {device:?}; placing it again");
             let ckpt_path = model_dir()
                 .ok_or_else(|| Error::msg("stable-audio weights missing".to_string()))?
                 .join("model.safetensors");
             let ckpt = ckpt_path
                 .to_str()
                 .ok_or_else(|| Error::msg("bad checkpoint path".to_string()))?;
-            let sz = std::fs::metadata(&ckpt_path)
-                .map(|m| m.len())
-                .unwrap_or(5 << 30);
-            let alt = crate::inference::model::acestep::vae::vae_best_device(sz);
-            tracing::warn!(
-                "stable-audio decode OOM on {:?}; re-planning decode on {alt:?}",
-                device
-            );
-            let fallback = load_decoder_on(ckpt, "pretransform.model.decoder", &alt)?;
-            match fallback.decode(&latent.to_device(&alt)?) {
-                Err(e2) if e2.is_oom() => {
-                    tracing::warn!("stable-audio decode OOM again on {alt:?}; decoding on CPU");
-                    let cpu_dec =
-                        load_decoder_on(ckpt, "pretransform.model.decoder", &Device::Cpu)?;
-                    cpu_dec.decode(&latent.to_device(&Device::Cpu)?)?
-                }
-                r => r?,
-            }
+            crate::inference::place::ladder::load_whole(
+                "Stable Audio decoder",
+                component_bytes(ckpt, DECODER_PREFIX)?,
+                decode_reserve(),
+                |dev| load_decoder_on(ckpt, DECODER_PREFIX, dev)?.decode(&latent.to_device(dev)?),
+            )?
         }
         r => r?,
     };
