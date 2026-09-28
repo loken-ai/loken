@@ -139,7 +139,7 @@ const GEOMETRY_DEBT: &[(&str, usize)] = &[
     ("inference/model/boogu/dit.rs", 3),
     ("inference/model/clip/vision.rs", 1),
     ("inference/model/clip/text.rs", 4),
-    ("inference/model/deepseek_v41/mod.rs", 2),
+    ("inference/model/deepseek_v41/mod.rs", 1),
     ("inference/model/flux2/dit.rs", 2),
     ("inference/model/kyutai/mimi.rs", 1),
     ("inference/model/mixformer/mod.rs", 1),

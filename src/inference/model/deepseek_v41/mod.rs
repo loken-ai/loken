@@ -52,7 +52,6 @@ pub struct DeepseekV41Config {
 
     // Attention: latent Q/KV, grouped low-rank output, one KV head (MQA).
     pub n_head: usize,
-    pub n_kv_head: usize,
     pub head_dim: usize,
     pub rope_head_dim: usize,
     pub q_lora_rank: usize,
@@ -176,7 +175,6 @@ impl DeepseekV41Config {
             vocab_size: req_u("vocab_size")?,
             rms_eps: opt_f("norm_eps", 1e-20) as f64,
             n_head: req_u("n_heads")?,
-            n_kv_head: 1,
             head_dim: req_u("head_dim")?,
             rope_head_dim: req_u("rope_head_dim")?,
             q_lora_rank: req_u("q_lora_rank")?,
@@ -364,7 +362,6 @@ impl DeepseekV41Config {
             vocab_size,
             rms_eps: opt_f(&["attention.layer_norm_rms_epsilon"], 1e-5) as f64,
             n_head,
-            n_kv_head: opt_u(&["attention.head_count_kv"], 1),
             head_dim,
             rope_head_dim: opt_u(&["rope.dimension_count"], release::ROPE_HEAD_DIM),
             q_lora_rank,
@@ -552,7 +549,6 @@ mod tests {
         assert_eq!(c.n_mtp_layers, 3);
         assert_eq!(c.d_model, 5120);
         assert_eq!(c.n_head, 64);
-        assert_eq!(c.n_kv_head, 1);
         assert_eq!(c.head_dim, 512);
         assert_eq!(c.rope_head_dim, 64);
         assert_eq!(c.q_lora_rank, 1280);
