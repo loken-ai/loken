@@ -843,7 +843,14 @@ impl LlmEngine {
                     // safety must never reach capture (capturing over an
                     // inconsistent KV records an empty/garbage graph that
                     // REPLAYS silently - constant-token output).
-                    let graph_enabled = graph_auto_on_cached && kv_safe_cached;
+                    // A drafter's step, or an n-gram draft worth verifying, runs eagerly: no
+                    // graph state is prepared, warmed, captured or replayed for it.
+                    let verify_step = spec_on
+                        || (pld_enabled
+                            && pld_cooldown == 0
+                            && pos <= pld_max_ctx_threshold()
+                            && pld_cache.lookup().len() >= 2);
+                    let graph_enabled = graph_auto_on_cached && kv_safe_cached && !verify_step;
                     // Option-E split path (commit 787986a): F-dtype-only
                     // models route through prepare_all_kv (uncaptured) +
                     // compute_all_from_kv (captured) to avoid the
@@ -851,13 +858,7 @@ impl LlmEngine {
                     // Q4/Q8 arches keep the legacy single-pass path.
                     let needs_split = state.model.needs_split_graph_path();
                     let mut split_token_ids: Option<Tensor> = None;
-                    // A drafter's step, or an n-gram draft worth verifying, runs eagerly.
-                    let verify_step = spec_on
-                        || (pld_enabled
-                            && pld_cooldown == 0
-                            && pos <= pld_max_ctx_threshold()
-                            && pld_cache.lookup().len() >= 2);
-                    if graph_enabled && use_graph_mode && !graph_disabled_this_request && !verify_step {
+                    if graph_enabled && use_graph_mode && !graph_disabled_this_request {
                         let x = Tensor::new(&[next_token], &Device::Cpu)?.unsqueeze(0)?;
                         // A live graph that replays no further than this position (its
                         // recorded sequence ceiling) is dropped and a new one recorded from
@@ -1031,7 +1032,7 @@ impl LlmEngine {
                     }
                     #[cfg(feature = "cuda")]
                     let graph_pair = match (cuda_graph.as_mut(), graph_logits.as_ref()) {
-                        (Some(g), Some(l)) => Some((g, l)),
+                        (Some(g), Some(l)) if graph_enabled => Some((g, l)),
                         _ => None,
                     };
                     #[cfg(feature = "cuda")]

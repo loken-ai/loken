@@ -158,9 +158,10 @@ fn matmul_rows_match_single_rows() {
     }
 
     // The decode head fuses the final norm into the head's activation quantisation.
-    if let (Some(crate::tensor::quantized::QMatMul::QTensor(qt)), Some(norm_w)) =
-        (m.output_proj_cuda_qmm.as_ref(), m.output_norm_cuda_weight.as_ref())
-    {
+    if let (Some(crate::tensor::quantized::QMatMul::QTensor(qt)), Some(norm_w)) = (
+        m.output_proj_cuda_qmm.as_ref(),
+        m.output_norm_cuda_weight.as_ref(),
+    ) {
         let h = m.config.embedding_length;
         let x = Tensor::randn(0f32, 1f32, (1, h), &card).unwrap();
         let eps = m.config.rms_norm_eps as f32;
@@ -168,7 +169,12 @@ fn matmul_rows_match_single_rows() {
             crate::inference::moe_cuda::rms_norm_then_qmatmul(&x, norm_w, qt.as_ref(), eps)
         {
             let normed = crate::tensor::ops::rms_norm(&x, norm_w, eps).unwrap();
-            let unfused = m.output_proj_cuda_qmm.as_ref().unwrap().forward(&normed).unwrap();
+            let unfused = m
+                .output_proj_cuda_qmm
+                .as_ref()
+                .unwrap()
+                .forward(&normed)
+                .unwrap();
             println!(
                 "{tag} head: fused norm+matmul vs norm then matmul: {:.1e}",
                 max_diff(&fused.reshape(unfused.shape()).unwrap(), &unfused)
@@ -189,12 +195,7 @@ fn verify_rows_match_decode() {
     };
 
     let prompt: Vec<u32> = (0..24u32).map(|i| 1000 + (i * 37) % 20000).collect();
-    let ids = |t: &[u32]| {
-        Tensor::new(t, &card)
-            .unwrap()
-            .unsqueeze(0)
-            .unwrap()
-    };
+    let ids = |t: &[u32]| Tensor::new(t, &card).unwrap().unsqueeze(0).unwrap();
     let first = host_rows(&m.forward(&ids(&prompt), 0).unwrap());
     let base = prompt.len();
 
@@ -216,7 +217,10 @@ fn verify_rows_match_decode() {
     while at < steps {
         let rows = width.min(steps - at);
         m.trim_kv(base + at);
-        let verified = host_rows(&m.forward_all(&ids(&tokens[at..at + rows]), base + at).unwrap());
+        let verified = host_rows(
+            &m.forward_all(&ids(&tokens[at..at + rows]), base + at)
+                .unwrap(),
+        );
         for (r, row) in verified.iter().enumerate() {
             let step = &decoded[at + r];
             let diff = row
@@ -256,8 +260,13 @@ fn verify_rows_match_decode() {
     let mut graph_differing = 0usize;
     for i in 0..steps {
         m.update_graph_state(base + i).unwrap();
-        m.embed_for_graph(&Tensor::new(&tokens[i..=i], &Device::Cpu).unwrap().unsqueeze(0).unwrap())
-            .unwrap();
+        m.embed_for_graph(
+            &Tensor::new(&tokens[i..=i], &Device::Cpu)
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap(),
+        )
+        .unwrap();
         let row = match m.forward_from_hidden() {
             Ok(logits) => host_rows(&logits).remove(0),
             Err(e) => {
@@ -282,8 +291,14 @@ fn verify_rows_match_decode() {
          worst logit diff {graph_worst:.6}"
     );
 
-    assert_eq!(graph_differing, 0, "a graph decode step differs from the eager one");
-    assert_eq!(differing_rows, 0, "a verified row differs from its decode step");
+    assert_eq!(
+        graph_differing, 0,
+        "a graph decode step differs from the eager one"
+    );
+    assert_eq!(
+        differing_rows, 0,
+        "a verified row differs from its decode step"
+    );
 }
 
 /// What a verify costs: `k+1` rows as decode steps (this forward_all), the same rows
