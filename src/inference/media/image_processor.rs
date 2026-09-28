@@ -275,11 +275,21 @@ pub fn signed_planes_to_rgb8(planes: &[f32], width: usize, height: usize) -> Vec
     rgb
 }
 
-/// A decoded image tensor whose last three dims are `[3, H, W]` in `[-1, 1]` -> base64 PNG.
+/// A decoded image tensor of shape `[3, H, W]` in `[-1, 1]` -> base64 PNG. Axes of length one
+/// around it, a batch or a video VAE's single frame, are the same layout and are ignored.
 pub fn signed_image_to_png_base64(img: &Tensor) -> Result<String> {
-    let d = img.shape().dims().to_vec();
-    if d.len() < 3 || d[d.len() - 3] != 3 {
-        return Err(anyhow!("expected [.., 3, H, W] image, got {d:?}"));
+    let d: Vec<usize> = img
+        .shape()
+        .dims()
+        .iter()
+        .copied()
+        .filter(|&n| n != 1)
+        .collect();
+    if d.len() != 3 || d[0] != 3 {
+        return Err(anyhow!(
+            "expected a [3, H, W] image, got {:?}",
+            img.shape().dims()
+        ));
     }
     let (h, w) = (d[d.len() - 2], d[d.len() - 1]);
     rgb8_to_png_base64(signed_planes_to_rgb8(&img.to_vec_f32(), w, h), w, h)
@@ -293,6 +303,20 @@ mod tests {
 
     fn b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn a_single_frame_image_encodes_as_its_picture() {
+        let dev = crate::tensor::Device::Cpu;
+        let planes: Vec<f32> = (0..3 * 2 * 4)
+            .map(|i| (i as f32 / 24.0) * 2.0 - 1.0)
+            .collect();
+        let flat = Tensor::from_vec(planes.clone(), (3, 2, 4), &dev).unwrap();
+        let framed = Tensor::from_vec(planes, (3, 1, 2, 4), &dev).unwrap();
+        assert_eq!(
+            signed_image_to_png_base64(&framed).unwrap(),
+            signed_image_to_png_base64(&flat).unwrap()
+        );
     }
 
     /// Build a 1x1 PNG containing a single mid-grey pixel.
