@@ -103,6 +103,8 @@ mod cuda {
 
     /// Free + total device memory in bytes.
     pub fn mem_get_info(device: &Device) -> Result<(usize, usize)> {
+        // PLACEMENT-EXEMPT: the substrate's reading itself; every caller outside `place/` is
+        // counted where it calls this.
         device
             .as_cuda_device()?
             .native()

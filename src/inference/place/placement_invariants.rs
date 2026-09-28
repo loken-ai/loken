@@ -1253,7 +1253,8 @@ fn builds_a_card_by_number(line: &str) -> bool {
 }
 
 /// Per production file outside `place/`: placement reads, out-of-memory recoveries, and
-/// cards named by number.
+/// cards named by number. A statement under a `PLACEMENT-EXEMPT:` comment is not counted:
+/// the comment says why it is a substrate query rather than a placement.
 fn route_violations() -> std::collections::BTreeMap<String, (usize, usize, usize)> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut out = std::collections::BTreeMap::new();
@@ -1269,25 +1270,49 @@ fn route_violations() -> std::collections::BTreeMap<String, (usize, usize, usize
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let mut counts = (0, 0, 0);
-        for line in production(&text).lines() {
-            let code = code_only(line);
-            // Defining a probe is not calling one.
-            if declared_fn(code).is_some() {
-                continue;
-            }
-            counts.0 += PLACEMENT_READS.iter().filter(|p| code.contains(*p)).count();
-            if !rel.starts_with("tensor/") {
-                let lower = code.to_lowercase();
-                counts.1 += OOM_RECOVERY.iter().filter(|p| lower.contains(*p)).count();
-            }
-            counts.2 += usize::from(builds_a_card_by_number(code));
-        }
+        let counts = route_counts(&text, &rel);
         if counts != (0, 0, 0) {
             out.insert(rel, counts);
         }
     }
     out
+}
+
+/// [`route_violations`] for one file's text, `rel` its path under `src`.
+fn route_counts(text: &str, rel: &str) -> (usize, usize, usize) {
+    let mut counts = (0, 0, 0);
+    let mut exempt = false;
+    for line in production(text).lines() {
+        let code = code_only(line);
+        // An exemption covers the statement below it, through the line that ends it.
+        if line.contains(EXEMPT) {
+            exempt = true;
+        }
+        if exempt {
+            let end = code.trim_end();
+            if end.ends_with(';') || end.ends_with('{') || end.ends_with('}') {
+                exempt = false;
+            }
+            continue;
+        }
+        // Defining a probe is not calling one.
+        if declared_fn(code).is_some() {
+            continue;
+        }
+        counts.0 += PLACEMENT_READS.iter().filter(|p| code.contains(*p)).count();
+        if !rel.starts_with("tensor/") {
+            let lower = code.to_lowercase();
+            counts.1 += OOM_RECOVERY.iter().filter(|p| lower.contains(*p)).count();
+        }
+        counts.2 += usize::from(builds_a_card_by_number(code));
+    }
+    counts
+}
+
+#[test]
+fn an_exemption_covers_the_statement_below_it_and_no_more() {
+    let text = "fn f() {\n    // PLACEMENT-EXEMPT: the substrate's own reading.\n    let (free, _) = ctx\n        .mem_get_info()\n        .unwrap();\n    let (again, _) = ctx.mem_get_info().unwrap();\n}\n";
+    assert_eq!(route_counts(text, "tensor/x.rs"), (1, 0, 0));
 }
 
 /// Files that still place, recover or name a card outside `place/`, with how many times.
@@ -1329,8 +1354,6 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("inference/offload/streamed.rs", (2, 0, 0)),
     ("inference/serve/continuous_serve.rs", (1, 0, 0)),
     ("inference/serve/tp_model.rs", (1, 0, 0)),
-    ("tensor/cuda/quant.rs", (1, 0, 0)),
-    ("tensor/cuda_ext.rs", (1, 0, 0)),
 ];
 
 /// EVERY COMPONENT IS PLACED BY THE PLANNER AND RECOVERED BY ITS LADDER.

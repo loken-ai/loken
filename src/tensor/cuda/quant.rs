@@ -1012,6 +1012,8 @@ pub fn gpu_sparse_attn(
     );
     // Queries go through in chunks whose gathered keys, logits and outputs take at most half of
     // what the card has free now.
+    // PLACEMENT-EXEMPT: sizes a kernel's chunks inside the card its caller placed it on;
+    // nothing is placed by it.
     let (free, _) = dev
         .ctx
         .mem_get_info()
