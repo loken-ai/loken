@@ -79,9 +79,43 @@ fn production(text: &str) -> &str {
 /// declaration, so the file reads as production from the first line - which is how a fixture's
 /// deliberate `Content::read` started being reported as a shipping defect.
 fn is_test_file(path: &std::path::Path) -> bool {
-    path.file_name()
+    let by_name = path
+        .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n == "tests.rs" || n.ends_with("_tests.rs") || n.ends_with("_test.rs"))
+        .is_some_and(|n| n == "tests.rs" || n.ends_with("_tests.rs") || n.ends_with("_test.rs"));
+    by_name || declared_under_cfg_test(path)
+}
+
+/// Whether the parent module declares this file under a `#[cfg(...test...)]` attribute.
+fn declared_under_cfg_test(path: &std::path::Path) -> bool {
+    let (Some(stem), Some(dir)) = (path.file_stem().and_then(|s| s.to_str()), path.parent()) else {
+        return false;
+    };
+    let decl = format!("mod {stem};");
+    let parents = [
+        dir.join("mod.rs"),
+        dir.with_extension("rs"),
+        dir.join("lib.rs"),
+    ];
+    parents.iter().any(|parent| {
+        let Ok(text) = std::fs::read_to_string(parent) else {
+            return false;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        lines.iter().enumerate().any(|(i, l)| {
+            l.trim_start()
+                .trim_start_matches("pub ")
+                .trim_start_matches("pub(crate) ")
+                == decl
+                && lines[..i]
+                    .iter()
+                    .rev()
+                    .take_while(|p| {
+                        p.trim_start().starts_with("#[") || p.trim_start().starts_with("//")
+                    })
+                    .any(|p| p.contains("cfg(") && p.contains("test"))
+        })
+    })
 }
 
 /// A line with its trailing comment removed. A sentence ABOUT a card index is not a
@@ -1175,5 +1209,191 @@ fn a_gguf_parsed_over_a_mapping_keeps_its_owner() {
          `read_mapped_file` (zero-copy, file-backed), metadata probes through \
          `open_header` (declared intent):\n  {}",
         offenders.join("\n  ")
+    );
+}
+
+// ============================================================================
+// 5. One route: the planner and its recovery live in `place/`
+// ============================================================================
+
+/// Calls that read the cards' memory or decide where something goes.
+const PLACEMENT_READS: [&str; 16] = [
+    "probe_cuda_devices",
+    "probe_cuda_gpus",
+    "vram_manager::probe",
+    "probe_under_pressure(",
+    "mem_get_info(",
+    "pick_device",
+    "pick_aux_device",
+    "place_whole(",
+    "place_aside(",
+    "plan_layers(",
+    "plan_layer_devices(",
+    "forced_gpu(",
+    "split_across_cuda(",
+    "HeteroPlan::calculate",
+    "dry_plan::solve",
+    "declare_demand(",
+];
+
+/// Ways a caller recognises an out-of-memory failure in order to try again differently,
+/// matched on the lowercased line. `tensor/` raises the error and is not a caller.
+const OOM_RECOVERY: [&str; 6] = [
+    "is_cuda_oom(",
+    "is_oom(",
+    "oom_retry(",
+    "out of memory\"",
+    "out_of_memory\"",
+    "\"[oom]\"",
+];
+
+/// A device built from, or listed under, a literal card number.
+fn builds_a_card_by_number(line: &str) -> bool {
+    let digit_after = |pat: &str| -> bool {
+        line.match_indices(pat)
+            .any(|(i, _)| small_literal_at(&line[i + pat.len()..]))
+    };
+    digit_after("Cuda(")
+        || digit_after("new_cuda(")
+        || digit_after("CudaDevice::new(")
+        || digit_after("push((")
+}
+
+/// Per production file outside `place/`: placement reads, out-of-memory recoveries, and
+/// cards named by number.
+fn route_violations() -> std::collections::BTreeMap<String, (usize, usize, usize)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = std::collections::BTreeMap::new();
+    for path in fleet_sources() {
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        if rel.starts_with("inference/place/") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut counts = (0, 0, 0);
+        for line in production(&text).lines() {
+            let code = code_only(line);
+            // Defining a probe is not calling one.
+            if declared_fn(code).is_some() {
+                continue;
+            }
+            counts.0 += PLACEMENT_READS.iter().filter(|p| code.contains(*p)).count();
+            if !rel.starts_with("tensor/") {
+                let lower = code.to_lowercase();
+                counts.1 += OOM_RECOVERY.iter().filter(|p| lower.contains(*p)).count();
+            }
+            counts.2 += usize::from(builds_a_card_by_number(code));
+        }
+        if counts != (0, 0, 0) {
+            out.insert(rel, counts);
+        }
+    }
+    out
+}
+
+/// Files that still place, recover or name a card outside `place/`, with how many times.
+/// The list only shrinks: a file routed through the planner leaves it, and a count that
+/// drops has to be written down here.
+const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
+    ("api/handlers/admission.rs", (0, 1, 0)),
+    ("api/handlers/media/generate.rs", (2, 6, 0)),
+    ("api/handlers/media/video.rs", (0, 3, 0)),
+    ("api/handlers/model_manager.rs", (2, 1, 0)),
+    ("api/handlers/separate.rs", (1, 0, 0)),
+    ("api/handlers/system.rs", (1, 0, 0)),
+    ("distributed/auto_tune.rs", (1, 0, 0)),
+    ("inference/cache/q4_kv.rs", (0, 3, 0)),
+    ("inference/cache/q8_kv.rs", (0, 3, 0)),
+    ("inference/engine/audio_engine.rs", (2, 0, 0)),
+    ("inference/engine/boogu_engine.rs", (2, 0, 0)),
+    ("inference/engine/flux2_engine.rs", (2, 0, 0)),
+    ("inference/engine/image_engine/demand.rs", (1, 0, 0)),
+    ("inference/engine/image_engine/load_flux.rs", (8, 0, 1)),
+    ("inference/engine/image_engine/load_others.rs", (9, 0, 1)),
+    ("inference/engine/image_engine/mod.rs", (2, 0, 0)),
+    ("inference/engine/image_engine/resident.rs", (1, 0, 0)),
+    ("inference/engine/llm_engine/decode.rs", (1, 0, 0)),
+    ("inference/engine/llm_engine/generate.rs", (0, 2, 0)),
+    ("inference/engine/llm_engine/load.rs", (3, 0, 0)),
+    ("inference/engine/llm_engine/loading.rs", (11, 2, 0)),
+    ("inference/engine/llm_engine/mod.rs", (3, 0, 0)),
+    ("inference/engine/llm_engine/params.rs", (0, 2, 0)),
+    ("inference/engine/llm_engine/stream.rs", (0, 6, 0)),
+    ("inference/engine/model_backend.rs", (0, 3, 0)),
+    ("inference/engine/qwen_image_engine.rs", (9, 0, 0)),
+    ("inference/engine/tts_engine.rs", (3, 0, 0)),
+    ("inference/generic_transformer/graph.rs", (1, 0, 0)),
+    ("inference/generic_transformer/loader.rs", (5, 0, 0)),
+    ("inference/generic_transformer/projection.rs", (1, 0, 1)),
+    ("inference/load/requantize.rs", (0, 0, 1)),
+    ("inference/media/midi.rs", (2, 0, 1)),
+    ("inference/model/acestep/cond.rs", (1, 0, 0)),
+    ("inference/model/acestep/dit/mod.rs", (3, 0, 0)),
+    ("inference/model/acestep/fsq.rs", (2, 0, 0)),
+    ("inference/model/acestep/lm/mod.rs", (4, 5, 0)),
+    ("inference/model/acestep/music.rs", (0, 4, 0)),
+    ("inference/model/acestep/textenc.rs", (1, 0, 0)),
+    ("inference/model/acestep/vae.rs", (3, 2, 0)),
+    ("inference/model/ezaudio/dit.rs", (3, 0, 0)),
+    ("inference/model/flux/hetero.rs", (2, 0, 0)),
+    ("inference/model/gptoss/mod.rs", (1, 0, 0)),
+    ("inference/model/kyutai/lm.rs", (1, 0, 0)),
+    ("inference/model/nemotron_h/mod.rs", (1, 0, 0)),
+    ("inference/model/qwen35/moe.rs", (1, 0, 0)),
+    ("inference/model/qwen3vl/textenc.rs", (1, 0, 0)),
+    ("inference/model/qwen_image/dit.rs", (2, 0, 0)),
+    ("inference/model/qwen_image/textenc.rs", (3, 0, 0)),
+    ("inference/model/sdxl/pipeline.rs", (5, 0, 0)),
+    ("inference/model/sdxl/unet.rs", (0, 0, 1)),
+    ("inference/model/stable_audio/mod.rs", (0, 2, 0)),
+    ("inference/model/t5/flan.rs", (1, 0, 0)),
+    ("inference/model/wan/dit/layers.rs", (6, 0, 0)),
+    ("inference/model/wan/pipeline.rs", (8, 5, 0)),
+    ("inference/offload/cuda.rs", (1, 2, 0)),
+    ("inference/offload/streamed.rs", (2, 0, 0)),
+    ("inference/serve/continuous_serve.rs", (1, 0, 0)),
+    ("inference/serve/tp_model.rs", (1, 0, 0)),
+    ("tensor/cuda/quant.rs", (1, 0, 0)),
+    ("tensor/cuda_ext.rs", (1, 0, 0)),
+];
+
+/// EVERY COMPONENT IS PLACED BY THE PLANNER AND RECOVERED BY ITS LADDER.
+///
+/// Reading the cards, deciding where a component goes and retrying after an out-of-memory
+/// failure belong to `place/`. A loader asks it; it does not probe, rank or retry on its
+/// own, and it never names a card by number.
+#[test]
+fn placement_and_recovery_stay_in_place() {
+    let found = route_violations();
+    let debt: std::collections::BTreeMap<String, (usize, usize, usize)> = ROUTE_DEBT
+        .iter()
+        .map(|(f, c)| (f.to_string(), *c))
+        .collect();
+    let mut problems = Vec::new();
+    for (file, now) in &found {
+        match debt.get(file) {
+            None => problems.push(format!("{file}: {now:?} - placement outside place/")),
+            Some(was) if now.0 > was.0 || now.1 > was.1 || now.2 > was.2 => {
+                problems.push(format!("{file}: {now:?} grew from {was:?}"))
+            }
+            Some(was) if now != was => problems.push(format!(
+                "{file}: {now:?} shrank from {was:?}; lower its debt"
+            )),
+            Some(_) => {}
+        }
+    }
+    for file in debt.keys().filter(|f| !found.contains_key(*f)) {
+        problems.push(format!("{file}: clean now; remove it from ROUTE_DEBT"));
+    }
+    assert!(
+        problems.is_empty(),
+        "(placement reads, out-of-memory recoveries, cards by number) per file:\n{}",
+        problems.join("\n")
     );
 }
