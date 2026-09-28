@@ -2194,9 +2194,10 @@ impl GenericHeteroTransformer {
         // card that now holds a layer its rotary tables before the layers are built.
         for raw in &raw_layers {
             if let DeviceKind::Cuda(idx) = raw.device_kind {
-                if let (std::collections::hash_map::Entry::Vacant(slot), Some(dev)) =
-                    (rope_cache.entry(format!("cuda_{idx}")), cuda_devices.get(&idx))
-                {
+                if let (std::collections::hash_map::Entry::Vacant(slot), Some(dev)) = (
+                    rope_cache.entry(format!("cuda_{idx}")),
+                    cuda_devices.get(&idx),
+                ) {
                     let cos = cos_cpu.to_device(dev)?;
                     let sin = sin_cpu.to_device(dev)?;
                     #[cfg(feature = "cuda")]
@@ -2750,6 +2751,33 @@ impl GenericHeteroTransformer {
             &device,
         )?;
 
+        // LM head: lm_head.weight, or embed_tokens if tied. F16 on GPU for the
+        // cutlass path; Q8_0 on CPU as the required fallback `output_proj`. Placed before
+        // the layers: a layer's second Marlin layout is built only while the free VRAM
+        // keeps its reserve, and that reserve must not also have to hold the head.
+        let lm_cpu_f32 = match st.load("lm_head.weight", &Device::Cpu) {
+            Ok(t) => t.to_dtype(DType::F32)?,
+            Err(_) => st
+                .load("model.embed_tokens.weight", &Device::Cpu)?
+                .to_dtype(DType::F32)?,
+        };
+        let output_proj = crate::tensor::quantized::QMatMul::from_qtensor(
+            crate::tensor::quantized::QTensor::quantize(
+                &lm_cpu_f32,
+                crate::tensor::quantized::GgmlDType::Q8_0,
+            )?,
+        )?;
+        // A SECOND copy of the head, dense F16, beside the quantised one - the largest
+        // thing this branch decides, and a move rather than a launch.
+        let (output_proj_cuda, output_proj_dev) = if device.runs_as_card() {
+            (
+                Some(lm_cpu_f32.to_dtype(DType::F16)?.to_device(&device)?),
+                Some(device.clone()),
+            )
+        } else {
+            (None, None)
+        };
+
         let flags = Arc::new(config.flags.clone());
         let mut layers = Vec::with_capacity(config.n_layers);
         let mut layer_devs = Vec::with_capacity(config.n_layers);
@@ -2787,31 +2815,6 @@ impl GenericHeteroTransformer {
             Some(norm_w.to_device(&device)?)
         } else {
             None
-        };
-
-        // LM head: lm_head.weight, or embed_tokens if tied. F16 on GPU for the
-        // cutlass path; Q8_0 on CPU as the required fallback `output_proj`.
-        let lm_cpu_f32 = match st.load("lm_head.weight", &Device::Cpu) {
-            Ok(t) => t.to_dtype(DType::F32)?,
-            Err(_) => st
-                .load("model.embed_tokens.weight", &Device::Cpu)?
-                .to_dtype(DType::F32)?,
-        };
-        let output_proj = crate::tensor::quantized::QMatMul::from_qtensor(
-            crate::tensor::quantized::QTensor::quantize(
-                &lm_cpu_f32,
-                crate::tensor::quantized::GgmlDType::Q8_0,
-            )?,
-        )?;
-        // A SECOND copy of the head, dense F16, beside the quantised one - the largest
-        // thing this branch decides, and a move rather than a launch.
-        let (output_proj_cuda, output_proj_dev) = if device.runs_as_card() {
-            (
-                Some(lm_cpu_f32.to_dtype(DType::F16)?.to_device(&device)?),
-                Some(device.clone()),
-            )
-        } else {
-            (None, None)
         };
 
         let sliding_window = config.sliding_window;
