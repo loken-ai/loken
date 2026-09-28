@@ -57,6 +57,34 @@ pub fn fastest_card(owner: &str) -> Option<usize> {
     probe_cuda_gpus_for(owner).first().map(|g| g.index)
 }
 
+/// The highest memory bandwidth among the cards, in GB/s; zero without a card.
+pub fn fastest_bandwidth_gbs() -> f64 {
+    probe_cuda_gpus()
+        .iter()
+        .map(|g| g.mem_bw_gbs)
+        .fold(0.0, f64::max)
+}
+
+/// Bytes free on the card `device` runs on, as the driver reports them now, the pools left
+/// alone: for a component sizing work inside the room its placement already gave it.
+/// `None` for the host or a card that does not answer.
+pub fn free_now(device: &crate::tensor::Device) -> Option<u64> {
+    #[cfg(feature = "cuda")]
+    if device.is_cuda() {
+        return crate::tensor::cuda_ext::mem_get_info(device)
+            .ok()
+            .map(|(free, _)| free as u64);
+    }
+    let _ = device;
+    None
+}
+
+/// [`free_now`] for a caller holding the card's context rather than a device.
+#[cfg(feature = "cuda")]
+pub fn free_in(ctx: &cudarc::driver::CudaContext) -> Option<u64> {
+    ctx.mem_get_info().ok().map(|(free, _)| free as u64)
+}
+
 /// How the cards' free memory takes a component: whole on one card, and across all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FreeFit {

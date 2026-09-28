@@ -156,9 +156,8 @@ impl Card {
     }
 
     fn free_now(&self) -> Option<usize> {
-        crate::tensor::cuda_ext::mem_get_info(&Device::Cuda(self.dev.clone()))
-            .ok()
-            .map(|(free, _)| free)
+        crate::inference::place::room::free_now(&Device::Cuda(self.dev.clone()))
+            .map(|free| free as usize)
     }
 
     /// Whether the device has `bytes` free right now: what a step in flight may take, the

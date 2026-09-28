@@ -88,14 +88,10 @@ impl Streamed {
         if crate::gpu::force_cpu() || vram_manager::vram_force_cpu() {
             return None;
         }
-        // Fastest first, through the engine's own probe: what it says is free is what every
-        // placement is allowed to believe.
+        // Fastest first, as the placement reads the cards.
         let mut rooms = Vec::new();
-        for (ordinal, _, dev) in vram_manager::probe(0) {
-            let Ok((free, total)) = crate::tensor::cuda_ext::mem_get_info(&dev) else {
-                tracing::warn!("card {ordinal}: no memory reading; not used");
-                continue;
-            };
+        for card in crate::inference::place::room::card_rooms() {
+            let (ordinal, total) = (card.index, card.total as usize);
             // From the card's total, not from what is free at this moment: what is free now
             // is what this placement is about to fill.
             let r = room::open(ordinal, total, demand.transient);
@@ -103,7 +99,7 @@ impl Streamed {
                 "card {ordinal}: keeping up to {} MB of weights, of {} in all ({} free now)",
                 r.lock().unwrap().ceiling() / 1_000_000,
                 total / 1_000_000,
-                free / 1_000_000
+                card.available / 1_000_000
             );
             rooms.push((ordinal, r));
         }

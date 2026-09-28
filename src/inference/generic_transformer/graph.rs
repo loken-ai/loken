@@ -1450,16 +1450,7 @@ impl GenericHeteroTransformer {
 
     /// Free memory on the device holding the first layer, when it is a card.
     fn free_device_memory(&self) -> Option<u64> {
-        #[cfg(feature = "cuda")]
-        {
-            let dev = self.layers.first()?.cos.device();
-            if dev.is_cuda() {
-                return crate::tensor::cuda_ext::mem_get_info(&dev)
-                    .ok()
-                    .map(|(free, _)| free as u64);
-            }
-        }
-        None
+        crate::inference::place::room::free_now(&self.layers.first()?.cos.device())
     }
 
     /// The snapshot sharing the longest prefix with `prompt`, as `(index, common)`,

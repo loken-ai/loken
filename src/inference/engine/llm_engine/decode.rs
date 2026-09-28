@@ -177,6 +177,14 @@ pub(super) fn gpu_sample_returning_tensor(
     Ok((tok, Some(dev_tensor)))
 }
 
+/// Bytes a decode capture arena starts at; it doubles on each overflow.
+#[cfg(feature = "cuda")]
+const ARENA_SEED_BYTES: usize = 16 << 20;
+/// A decode capture arena grows to all but `1 / ARENA_LEAVES_FREE_DIV` of the card's free
+/// memory, the rest staying with the forward that runs beside it.
+#[cfg(feature = "cuda")]
+const ARENA_LEAVES_FREE_DIV: usize = 8;
+
 /// Capture one decode-token forward into a CUDA graph (shared by the
 /// non-streaming and streaming decode loops).
 ///
@@ -206,9 +214,11 @@ pub(super) fn capture_decode_graph(
     // begin_capture_arena (arena-range drops are no-ops only while the
     // arena is alive).
     model.clear_graph_transients();
-    let free_vram = ctx.mem_get_info().map(|(f, _)| f).unwrap_or(0);
-    let ceiling = free_vram.saturating_sub(free_vram / 8).max(1 << 20);
-    let mut arena_bytes = (16usize << 20).min(ceiling);
+    let free_vram = crate::inference::place::room::free_in(ctx).unwrap_or(0) as usize;
+    let ceiling = free_vram
+        .saturating_sub(free_vram / ARENA_LEAVES_FREE_DIV)
+        .max(ARENA_SEED_BYTES);
+    let mut arena_bytes = ARENA_SEED_BYTES.min(ceiling);
     loop {
         if let Err(e) = ctx.begin_capture_arena(arena_bytes) {
             warn!(

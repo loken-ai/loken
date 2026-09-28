@@ -176,8 +176,8 @@ pub fn requantize_gguf(
     };
 
     // The GPU path runs the tensors one at a time - the GPU is the parallelism, and mixing rayon
-    // workers with device launches is what this avoids. It is taken only when a device is present
-    // and every requantised tensor's target has a device kernel; anything else falls to the CPU
+    // workers with device launches is what this avoids. It runs on the fastest card, when there is
+    // one and every requantised tensor's target has a device kernel; anything else falls to the CPU
     // pool. A copied (unchanged) tensor needs no kernel, so it never blocks the choice.
     #[cfg(feature = "cuda")]
     let entries: Vec<GgufEntry> = {
@@ -187,8 +187,8 @@ pub fn requantize_gguf(
             let target = target_dtype(name, info.shape.dims(), src, base, rules);
             target == src || gpu_target_supported(target)
         });
-        match crate::tensor::cuda::CudaDevice::new(0) {
-            Ok(cdev) if all_on_gpu => {
+        match crate::inference::place::ladder::fastest() {
+            Some(crate::tensor::Device::Cuda(cdev)) if all_on_gpu => {
                 let gpu_quantize = move |t: GgmlDType, f: &[f32]| -> Result<Vec<u8>> {
                     match t {
                         GgmlDType::Q8_0 => crate::tensor::cuda::gpu_quantize_q8_0(&cdev, f),

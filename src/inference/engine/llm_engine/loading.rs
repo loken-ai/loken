@@ -1512,10 +1512,7 @@ impl LlmEngine {
         // card's memory bandwidth at most. Every node derives this the same way, so the
         // cluster can compare two nodes before either has measured anything.
         if file_size > 0 {
-            let bw = crate::inference::place::device_probe::probe_cuda_gpus()
-                .iter()
-                .map(|g| g.mem_bw_gbs)
-                .fold(0.0, f64::max);
+            let bw = crate::inference::place::room::fastest_bandwidth_gbs();
             if bw > 0.0 {
                 crate::distributed::rate_meter::record_prior(
                     &model_id,

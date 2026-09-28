@@ -25,9 +25,9 @@ pub fn local_profile(
     gate_dt: GgmlDType,
     down_dt: GgmlDType,
 ) -> Option<NodeProfile> {
-    let gpus = crate::inference::place::device_probe::probe_cuda_gpus();
-    let vram: u64 = gpus.iter().map(|g| g.available).sum();
-    let perf: f64 = gpus.iter().map(|g| g.perf_score as f64).sum();
+    let cards = crate::inference::place::room::card_rooms();
+    let vram: u64 = cards.iter().map(|c| c.available).sum();
+    let perf: f64 = cards.iter().map(|c| c.perf as f64).sum();
     let layer_ms = if perf > 0.0 {
         LAYER_MS_AT_REF * REF_PERF / perf
     } else {
