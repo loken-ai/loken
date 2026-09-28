@@ -112,7 +112,10 @@ impl GenericTransformerLayer {
                 self.cos.device()
             );
         }
-        let (cos, sin) = self.rope_table().rows(index_pos, seq_len, &x.device())?;
+        let (cos, sin) = match &self.rope_rows {
+            Some((cos, sin)) => (cos.to_device(&x.device())?, sin.to_device(&x.device())?),
+            None => self.rope_table().rows(index_pos, seq_len, &x.device())?,
+        };
         let apply_rope = if self.flags.use_rope_i {
             crate::tensor::ops::rope_i
         } else {
@@ -378,7 +381,20 @@ impl GenericTransformerLayer {
         let projected = pre_computed_qkv.map(|t| Projected::Qkv(t.clone()));
         let (y, via_graph_buffer) =
             self.attend(x, mask, index_pos, shared_kv, projected, donor_f16)?;
+        let y = self.gate_attention(x, y)?;
         self.attn_output_projection(&y, via_graph_buffer)
+    }
+
+    /// The attention output gated by `sigmoid(attn_gate(x))` on a layer with an output
+    /// gate, unchanged otherwise.
+    fn gate_attention(&self, x: &Tensor, y: Tensor) -> Result<Tensor> {
+        match &self.attn_gate {
+            Some(gate) => {
+                let g = crate::tensor::ops::sigmoid(&gate.forward(x)?.to_dtype(DType::F32)?)?;
+                y.to_dtype(DType::F32)?.mul(&g)?.to_dtype(y.dtype())
+            }
+            None => Ok(y),
+        }
     }
 
     /// Whether a multi-row call runs each row as the one-token decode step it stands for.
@@ -446,6 +462,7 @@ impl GenericTransformerLayer {
             ys.push(y);
         }
         let y = Tensor::cat(&ys.iter().collect::<Vec<_>>(), 1)?;
+        let y = self.gate_attention(x, y)?;
         self.attn_output_projection(&y, false)
     }
 
@@ -509,6 +526,7 @@ impl GenericTransformerLayer {
             && rope_ok
             // The fused kernels rotate every head: a layer without RoPE takes the unfused path.
             && !self.no_rope
+            && self.rope_rows.is_none()
             && self.rope_freq_factors.is_none()
             // NOTE: graph mode is now ALLOWED here (was gated out by
             // graph_rope_cos.is_none()). In graph mode the fused kernel reads

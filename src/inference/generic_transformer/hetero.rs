@@ -1578,7 +1578,7 @@ impl GenericHeteroTransformer {
     /// `ple_inputs`: per-layer Gemma4 PLE tensors, or None for arches that
     /// don't use PLE (phi2, qwen2/3, llama, etc).
     /// `seq_len` must equal `hidden.dim(1)`.
-    fn forward_layers_and_output(
+    pub(super) fn forward_layers_and_output(
         &mut self,
         mut hidden: Tensor,
         ple_inputs: Option<Vec<Tensor>>,

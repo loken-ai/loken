@@ -232,9 +232,8 @@ impl LlmEngine {
             // primary device (`s.device`), so the GUI topology showed a
             // 2-GPU model entirely on GPU0 - the long-standing bug.
             // Placement comes from the plan, not from the model type: GenericHetero,
-            // the tensor-parallel path and the multi-device variants (MoE-multi,
-            // nemotron, lfm2moe) each read back the device their layers were loaded
-            // onto. A variant with no map at all falls through to the single-entry
+            // the tensor-parallel path and DeepSeek each read back the device their
+            // layers were loaded onto. A variant with no map at all falls through to the single-entry
             // heuristic below.
             let segs: Vec<(String, usize, u32, u32)> = s.model.device_layer_distribution();
             let distributions: Vec<LayerDistribution> = if segs.is_empty() {

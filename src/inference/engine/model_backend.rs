@@ -24,30 +24,6 @@ use crate::inference::engine::llm_engine::{
 /// Boxed backend as stored in `LoadedModelState`.
 pub(crate) type BoxedModelBackend = Box<dyn ModelBackend>;
 
-/// Fold a per-layer device list into the `device_layer_distribution` contract:
-/// one `(device_label, ordinal, layer_start, layer_end)` entry per contiguous
-/// run of layers on one device, both ends INCLUSIVE. The labels are "CPU" and
-/// "CUDA" - the exact spellings `get_gpu_portion_size` filters on, so a model
-/// that reports through here is counted as resident on the card.
-pub(crate) fn group_layers_by_device(
-    locations: impl IntoIterator<Item = crate::tensor::DeviceLocation>,
-) -> Vec<(String, usize, u32, u32)> {
-    use crate::tensor::DeviceLocation;
-    let mut out: Vec<(String, usize, u32, u32)> = Vec::new();
-    for (i, loc) in locations.into_iter().enumerate() {
-        let (label, ordinal) = match loc {
-            DeviceLocation::Cuda { gpu_id } => ("CUDA", gpu_id),
-            DeviceLocation::Cpu => ("CPU", 0usize),
-        };
-        let i = i as u32;
-        match out.last_mut() {
-            Some(last) if last.0 == label && last.1 == ordinal => last.3 = i,
-            _ => out.push((label.to_string(), ordinal, i, i)),
-        }
-    }
-    out
-}
-
 /// Enum-free dispatch surface over supported quantized model architectures.
 ///
 /// Safety contract carried over from the old `unsafe impl Send for
@@ -338,10 +314,9 @@ pub(crate) trait ModelBackend: Send {
     /// partial KV a failed pass appended before replaying from `keep` with a
     /// smaller chunk - `keep` is the prefill's `index_pos`, so session-reuse
     /// prefixes ([0, session_start)) are preserved. For trim-capable variants
-    /// this is `trim_kv(keep)`; for TP (which only ever prefills at pos 0 and
-    /// resets there) and the recurrent-MoE variants (lfm2/qwen35/nemotron,
-    /// which self-reset KV + conv state on the next forward at `input_pos == 0`)
-    /// it is a no-op when `keep == 0`.
+    /// this is `trim_kv(keep)`, which on a recurrent model drops the recurrent state only
+    /// at `keep == 0`; for TP, which only ever prefills at pos 0 and resets there, it is a
+    /// no-op.
     fn reset_kv_from(&mut self, _keep: usize) {}
 
     /// Context shift: drop positions `[from - discard, from)` and pull the tail down by
@@ -577,9 +552,9 @@ pub(crate) trait ModelBackend: Send {
         false
     }
 
-    /// True iff this is a qwen35moe model that carries the vision ViT. qwen35
-    /// vision uses a dedicated prefill path (`forward_with_image`), NOT the
-    /// moondream `encode_image`/`forward_with_img` prepend path.
+    /// True iff the model splices a Qwen3-VL vision tower's embeddings into its text stream
+    /// (`forward_qwen35_image`), NOT the moondream `encode_image`/`forward_with_img` prepend
+    /// path.
     fn is_qwen35_vision(&self) -> bool {
         false
     }
@@ -991,12 +966,6 @@ impl DeepseekV41Backend {
     }
 }
 
-/// qwen35moe: hybrid gated-DeltaNet + attention + softmax MoE, multi-device.
-/// Also runs on CPU (text): the DeltaNet recurrence uses the pure tensor-op
-/// `forward_pertoken` path and the MoE GEMM the fallback CPU path. Vision is
-/// CUDA-only.
-pub(crate) struct Qwen35MoeBackend(pub crate::inference::model::qwen35::moe::Qwen35MoeModel);
-
 /// TpQwen2: tensor-parallel (TP=2) decoder across 2 GPUs. Both cards run EVERY layer -
 /// column/row-parallel weights joined by an all-reduce - against the pipeline's one card
 /// per token with the other idle. Covers qwen2 (deepseek-r1, with QKV bias) and the
@@ -1030,7 +999,6 @@ pub(crate) struct TakenBackend;
 unsafe impl Send for MoondreamBackend {}
 unsafe impl Send for GenericBackend {}
 unsafe impl Send for GenericVisionBackend {}
-unsafe impl Send for Qwen35MoeBackend {}
 #[cfg(feature = "cuda")]
 unsafe impl Send for TpQwen2Backend {}
 unsafe impl Send for ContinuousBackend {}
@@ -1307,6 +1275,29 @@ impl ModelBackend for GenericBackend {
 
     fn cb_eligible_gpu(&self) -> bool {
         self.0.cb_eligible() && !self.0.compute_device().is_cpu()
+    }
+
+    fn is_vision_model(&self) -> bool {
+        self.0.spliced_image_token().is_some()
+    }
+
+    fn is_qwen35_vision(&self) -> bool {
+        self.0.spliced_image_token().is_some()
+    }
+
+    fn qwen35_image_token(&self) -> Option<u32> {
+        self.0.spliced_image_token()
+    }
+
+    fn forward_qwen35_image(
+        &mut self,
+        prompt_tokens: &[u32],
+        px: &Tensor,
+        gh: usize,
+        gw: usize,
+        _device: &Device,
+    ) -> crate::tensor::Result<(Tensor, usize)> {
+        self.0.forward_spliced_image(prompt_tokens, px, gh, gw)
     }
 
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
@@ -1857,106 +1848,6 @@ impl ModelBackend for DeepseekV41Backend {
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
         Err(self)
     }
-}
-
-impl ModelBackend for Qwen35MoeBackend {
-    fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.0.forward(x, index_pos)
-    }
-
-    fn device_layer_distribution(&self) -> Vec<(String, usize, u32, u32)> {
-        group_layers_by_device(self.0.layer_device_locations())
-    }
-
-    fn snapshot_prefix(&mut self, prompt: &[u32], logits: &Tensor) -> crate::tensor::Result<()> {
-        self.0.snapshot_prefix(prompt, logits)
-    }
-
-    fn try_restore_prefix(&mut self, prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
-        // A snapshot of an earlier prompt that this one extends - the previous turn of a
-        // conversation - is restored and advanced over the new tokens.
-        let Some((covered, logits)) = self.0.try_restore_prefix(prompt)? else {
-            return Ok(None);
-        };
-        if covered == prompt.len() {
-            return Ok(Some(logits));
-        }
-        let rest = Tensor::new(&prompt[covered..], &crate::tensor::Device::Cpu)?.unsqueeze(0)?;
-        // A recurrent state that failed part way through the new tokens cannot be rewound:
-        // the whole prompt is prefilled from position 0 instead, which starts a fresh state.
-        let logits = match self.forward_prefill_chunked(&rest, covered) {
-            Ok(logits) => logits,
-            Err(e) => {
-                tracing::warn!("prefix snapshot advance failed ({e}); prefilling the whole prompt");
-                return Ok(None);
-            }
-        };
-        self.0.snapshot_prefix(prompt, &logits)?;
-        Ok(Some(logits))
-    }
-
-    fn is_vision_model(&self) -> bool {
-        self.is_qwen35_vision()
-    }
-
-    fn is_qwen35_vision(&self) -> bool {
-        #[cfg(feature = "cuda")]
-        {
-            self.0.has_vision()
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            false
-        }
-    }
-
-    fn qwen35_image_token(&self) -> Option<u32> {
-        #[cfg(feature = "cuda")]
-        {
-            if self.0.has_vision() {
-                Some(self.0.image_token())
-            } else {
-                None
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            None
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    fn forward_qwen35_image(
-        &mut self,
-        prompt_tokens: &[u32],
-        px: &Tensor,
-        gh: usize,
-        gw: usize,
-        device: &Device,
-    ) -> crate::tensor::Result<(Tensor, usize)> {
-        let m = &mut self.0;
-        let img_tok = m.image_token();
-        let n_merged = (gh / 2) * (gw / 2);
-        let mut ids = Vec::with_capacity(prompt_tokens.len() + n_merged);
-        let mut expanded = false;
-        for &t in prompt_tokens {
-            if t == img_tok && !expanded {
-                ids.extend(std::iter::repeat_n(img_tok, n_merged));
-                expanded = true;
-            } else {
-                ids.push(t);
-            }
-        }
-        if !expanded {
-            return Err(crate::tensor::Error::msg(
-                "qwen35 vision: image_token sentinel missing from prompt".to_string(),
-            ));
-        }
-        let input_ids = Tensor::new(ids.as_slice(), device)?.unsqueeze(0)?;
-        m.forward_with_image(&input_ids, px, gh, gw)
-    }
-
-    take_generic_passthrough!();
 }
 
 #[cfg(feature = "cuda")]

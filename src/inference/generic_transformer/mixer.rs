@@ -20,6 +20,9 @@ pub enum MixerKind {
     ShortConv,
     /// Mamba2 selective state space: `ssm_{in,conv1d,a,d,dt,norm,out}`.
     Ssm,
+    /// Gated delta-rule linear attention: `attn_qkv`, `attn_gate`, `ssm_{alpha,beta}` or
+    /// `ssm_ba`, `ssm_{conv1d,a,dt,norm,out}`.
+    DeltaNet,
     /// No mixing sublayer: the block is a feed-forward alone.
     Absent,
 }
@@ -35,6 +38,8 @@ pub fn layer_mixer_kind(content: &gguf_file::Content, il: usize) -> MixerKind {
         MixerKind::ShortConv
     } else if has("ssm_in.weight") {
         MixerKind::Ssm
+    } else if has("ssm_beta.weight") || has("ssm_ba.weight") {
+        MixerKind::DeltaNet
     } else if has("attn_q.weight") || has("attn_qkv.weight") {
         MixerKind::Attention
     } else {
@@ -75,6 +80,7 @@ pub enum Mixer {
     Attention,
     ShortConv(ShortConv),
     Ssm(Mamba2),
+    DeltaNet(GatedDeltaNet),
     /// The block has no mixing sublayer.
     Absent,
 }
@@ -84,6 +90,7 @@ pub enum Mixer {
 pub enum MixerState {
     ShortConv(Option<ConvState>),
     Ssm(Option<SsmState>),
+    DeltaNet(Option<SsmState>),
 }
 
 impl MixerState {
@@ -94,11 +101,12 @@ impl MixerState {
                 (t.elem_count() * t.dtype().size_in_bytes()) as u64
             }
             MixerState::ShortConv(_) => 0,
-            MixerState::Ssm(Some(SsmState::Card { conv, h })) => [conv, h]
+            MixerState::Ssm(Some(SsmState::Card { conv, h }))
+            | MixerState::DeltaNet(Some(SsmState::Card { conv, h })) => [conv, h]
                 .iter()
                 .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
                 .sum(),
-            MixerState::Ssm(_) => 0,
+            MixerState::Ssm(_) | MixerState::DeltaNet(_) => 0,
         }
     }
 }
@@ -118,6 +126,7 @@ impl Mixer {
             )),
             Mixer::ShortConv(m) => m.forward(x, index_pos),
             Mixer::Ssm(m) => m.forward(x, index_pos),
+            Mixer::DeltaNet(m) => m.forward(x, index_pos),
         }
     }
 
@@ -127,6 +136,7 @@ impl Mixer {
             Mixer::Attention | Mixer::Absent => {}
             Mixer::ShortConv(m) => m.state = None,
             Mixer::Ssm(m) => m.state = None,
+            Mixer::DeltaNet(m) => m.state = None,
         }
     }
 
@@ -140,6 +150,9 @@ impl Mixer {
             Mixer::Ssm(m) => Some(MixerState::Ssm(
                 m.state.as_ref().map(SsmState::deep_copy).transpose()?,
             )),
+            Mixer::DeltaNet(m) => Some(MixerState::DeltaNet(
+                m.state.as_ref().map(SsmState::deep_copy).transpose()?,
+            )),
         })
     }
 
@@ -151,6 +164,10 @@ impl Mixer {
                 Ok(())
             }
             (Mixer::Ssm(m), MixerState::Ssm(s)) => {
+                m.state = s.as_ref().map(SsmState::deep_copy).transpose()?;
+                Ok(())
+            }
+            (Mixer::DeltaNet(m), MixerState::DeltaNet(s)) => {
                 m.state = s.as_ref().map(SsmState::deep_copy).transpose()?;
                 Ok(())
             }
@@ -306,9 +323,10 @@ pub fn short_conv_host(
     y
 }
 
-/// A Mamba2 state: the convolution window of the last `d_conv` inputs of every `x, B, C`
-/// channel and the SSM hidden `[nheads, headdim, d_state]`. On a card as tensors `[b, ..]`
-/// F32, on the host as flat values for one sequence.
+/// A state-space state: a convolution window per channel and the recurrent hidden. On a
+/// card as tensors `[b, ..]` F32, on the host as flat values for one sequence. Mamba2
+/// keeps the last `d_conv` inputs and a hidden `[nheads, headdim, d_state]`; the delta rule
+/// the last `conv_kernel - 1` inputs and a matrix `[n_v, v_dim, k_dim]` per value head.
 #[derive(Clone)]
 pub enum SsmState {
     Card { conv: Tensor, h: Tensor },
@@ -609,6 +627,480 @@ fn mamba2_host(
         }
     }
     y_all
+}
+
+/// The delta rule's input projections: `qkv | z | alpha | beta`, in one matrix when the
+/// file's four share a format, apart otherwise, or with `beta, alpha` packed per key head
+/// in one `ssm_ba`.
+pub enum DeltaProj {
+    Fused(QMatMul),
+    Split {
+        qkv: QMatMul,
+        z: QMatMul,
+        alpha: QMatMul,
+        beta: QMatMul,
+    },
+    Ba {
+        qkv: QMatMul,
+        z: QMatMul,
+        ba: QMatMul,
+    },
+}
+
+/// Delta-rule dimensions, from the file's `ssm.*` metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaDims {
+    pub k_heads: usize,
+    pub v_heads: usize,
+    pub k_dim: usize,
+    pub v_dim: usize,
+    pub conv_kernel: usize,
+    /// Value head `h` reads key head `h % k_heads`, else `h / (v_heads / k_heads)`.
+    pub v_heads_tiled: bool,
+}
+
+impl DeltaDims {
+    /// Channels of the convolution: `q`, `k` over the key heads, `v` over the value heads.
+    pub fn conv_dim(&self) -> usize {
+        2 * self.k_heads * self.k_dim + self.v_heads * self.v_dim
+    }
+    /// The key head value head `h` reads.
+    pub fn key_head(&self, h: usize) -> usize {
+        if self.v_heads_tiled {
+            h % self.k_heads
+        } else {
+            h / (self.v_heads / self.k_heads).max(1)
+        }
+    }
+}
+
+/// The delta rule's host weights, flat F32.
+struct DeltaHost {
+    conv_w: Vec<f32>,
+    a: Vec<f32>,
+    dt_bias: Vec<f32>,
+    norm: Vec<f32>,
+}
+
+/// Gated delta-rule linear attention. `qkv` runs through a causal depthwise convolution and
+/// SiLU; `q` and `k` are L2-normalised per key head, `q` scaled by `1/sqrt(k_dim)`; per value
+/// head the state decays by `exp(a . softplus(alpha + dt_bias))` (`a` stored negated), takes
+/// the correction `sigmoid(beta) . (v - S k) (x) k`, and is read by `q`; the output is
+/// RMS-normalised per head and gated by `silu(z)`.
+pub struct GatedDeltaNet {
+    pub proj: DeltaProj,
+    conv_w: Tensor,
+    a: Tensor,
+    dt_bias: Tensor,
+    norm_w: Tensor,
+    host: DeltaHost,
+    pub dims: DeltaDims,
+    eps: f64,
+    pub state: Option<SsmState>,
+}
+
+impl GatedDeltaNet {
+    /// The mixer over host tensors `conv_w` `[conv_dim, conv_kernel]`, `a`, `dt_bias`
+    /// `[v_heads]` and `norm_w` `[v_dim]`, placed on `device`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        proj: DeltaProj,
+        conv_w: Tensor,
+        a: Tensor,
+        dt_bias: Tensor,
+        norm_w: Tensor,
+        dims: DeltaDims,
+        eps: f64,
+        device: &Device,
+    ) -> Result<Self> {
+        let flat = |t: Tensor| -> Result<Tensor> { t.to_dtype(DType::F32)?.flatten_all() };
+        let conv_w = conv_w.to_dtype(DType::F32)?.contiguous()?;
+        let (a, dt_bias, norm_w) = (flat(a)?, flat(dt_bias)?, flat(norm_w)?);
+        if conv_w.dims() != [dims.conv_dim(), dims.conv_kernel]
+            || a.dims1()? != dims.v_heads
+            || norm_w.dims1()? != dims.v_dim
+            || dims.conv_kernel < 2
+            || !dims.v_heads.is_multiple_of(dims.k_heads.max(1))
+        {
+            return Err(crate::tensor::Error::msg(format!(
+                "delta-rule weights {:?} do not match {dims:?}",
+                conv_w.dims()
+            )));
+        }
+        let host = DeltaHost {
+            conv_w: conv_w.flatten_all()?.to_vec1()?,
+            a: a.to_vec1()?,
+            dt_bias: dt_bias.to_vec1()?,
+            norm: norm_w.to_vec1()?,
+        };
+        Ok(Self {
+            proj,
+            conv_w: conv_w.to_device(device)?,
+            a: a.to_device(device)?,
+            dt_bias: dt_bias.to_device(device)?,
+            norm_w: norm_w.to_device(device)?,
+            host,
+            dims,
+            eps,
+            state: None,
+        })
+    }
+
+    /// `(qkv, z, alpha, beta)` of `x`, in the projection's dtype.
+    fn project(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let d = self.dims;
+        let (zn, nv) = (d.v_heads * d.v_dim, d.v_heads);
+        match &self.proj {
+            DeltaProj::Fused(w) => {
+                let full = w.forward(x)?;
+                let cut = |at: usize, n: usize| full.narrow(D::Minus1, at, n)?.contiguous();
+                Ok((
+                    cut(0, d.conv_dim())?,
+                    cut(d.conv_dim(), zn)?,
+                    cut(d.conv_dim() + zn, nv)?,
+                    cut(d.conv_dim() + zn + nv, nv)?,
+                ))
+            }
+            DeltaProj::Split {
+                qkv,
+                z,
+                alpha,
+                beta,
+            } => Ok((
+                qkv.forward(x)?,
+                z.forward(x)?,
+                alpha.forward(x)?,
+                beta.forward(x)?,
+            )),
+            DeltaProj::Ba { qkv, z, ba } => {
+                // One group per key head, its betas ahead of its alphas.
+                let per = nv / d.k_heads.max(1);
+                let ba = ba.forward(x)?;
+                let mut lead = ba.dims().to_vec();
+                lead.pop();
+                let mut grouped = lead.clone();
+                grouped.extend([d.k_heads, 2 * per]);
+                let ba = ba.reshape(grouped)?;
+                let mut flat = lead;
+                flat.push(nv);
+                let beta = ba
+                    .narrow(D::Minus1, 0, per)?
+                    .contiguous()?
+                    .reshape(flat.clone())?;
+                let alpha = ba
+                    .narrow(D::Minus1, per, per)?
+                    .contiguous()?
+                    .reshape(flat)?;
+                Ok((qkv.forward(x)?, z.forward(x)?, alpha, beta))
+            }
+        }
+    }
+
+    pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        if index_pos == 0 {
+            self.state = None;
+        }
+        let (b, seq, _) = x.dims3()?;
+        let d = self.dims;
+        #[cfg(feature = "cuda")]
+        if b == 1 && x.device().is_cuda() && d.k_dim == d.v_dim && matches!(d.v_dim, 64 | 128 | 256)
+        {
+            return self.forward_card(x, seq);
+        }
+        if b == 1 && !x.device().is_cuda() {
+            let (qkv, z, alpha, beta) = self.project(x)?;
+            let rows = |t: Tensor| -> Result<Tensor> { t.to_dtype(DType::F32)?.contiguous() };
+            let (qkv, z, alpha, beta) = (rows(qkv)?, rows(z)?, rows(alpha)?, rows(beta)?);
+            if !matches!(self.state, Some(SsmState::Host { .. })) {
+                self.state = Some(SsmState::Host {
+                    conv: vec![0f32; d.conv_dim() * (d.conv_kernel - 1)],
+                    h: vec![0f32; d.v_heads * d.v_dim * d.k_dim],
+                });
+            }
+            let Some(SsmState::Host { conv, h }) = self.state.as_mut() else {
+                unreachable!("host state set above")
+            };
+            let y = delta_host(
+                DeltaRows {
+                    qkv: qkv.f32_data()?,
+                    z: z.f32_data()?,
+                    alpha: alpha.f32_data()?,
+                    beta: beta.f32_data()?,
+                },
+                conv,
+                h,
+                &self.host,
+                d,
+                self.eps as f32,
+                seq,
+            );
+            return Tensor::from_vec(y, (1, seq, d.v_heads * d.v_dim), &x.device())?
+                .to_dtype(x.dtype());
+        }
+        self.forward_rows(x, b, seq)
+    }
+
+    /// One token at a time through tensor ops: the path for shapes the fused recurrence
+    /// does not cover.
+    fn forward_rows(&mut self, x: &Tensor, b: usize, seq: usize) -> Result<Tensor> {
+        let d = self.dims;
+        let (kg, vg, kd, vd) = (d.k_heads, d.v_heads, d.k_dim, d.v_dim);
+        let rep = vg / kg;
+        let qk = kd * kg;
+        let (mut conv, mut s) = match self.state.take() {
+            Some(SsmState::Card { conv, h }) => (conv, h),
+            _ => (
+                Tensor::zeros_on(
+                    (b, d.conv_dim(), d.conv_kernel - 1),
+                    DType::F32,
+                    &x.device(),
+                )?,
+                Tensor::zeros_on((b, vg, vd, kd), DType::F32, &x.device())?,
+            ),
+        };
+        let l2 = |t: &Tensor| -> Result<Tensor> {
+            let n = (t.sqr()?.sum_keepdim(D::Minus1)? + 1e-6)?.sqrt()?;
+            t.broadcast_div(&n)
+        };
+        let mut outs = Vec::with_capacity(seq);
+        for t in 0..seq {
+            let (qkv, z, alpha, beta) = self.project(&x.i((.., t, ..))?)?;
+            let qkv = qkv.to_dtype(DType::F32)?;
+            let win = Tensor::cat(&[&conv, &qkv.unsqueeze(qkv.rank())?], D::Minus1)?;
+            let mut acc = self
+                .conv_w
+                .i((.., 0))?
+                .broadcast_mul(&win.i((.., .., 0))?)?;
+            for k in 1..d.conv_kernel {
+                acc = (acc
+                    + self
+                        .conv_w
+                        .i((.., k))?
+                        .broadcast_mul(&win.i((.., .., k))?)?)?;
+            }
+            conv = win.narrow(D::Minus1, 1, d.conv_kernel - 1)?.contiguous()?;
+            let c = crate::tensor::ops::silu(&acc)?;
+            let q = c.narrow(D::Minus1, 0, qk)?.reshape((b, kg, kd))?;
+            let k = c.narrow(D::Minus1, qk, qk)?.reshape((b, kg, kd))?;
+            let v = c.narrow(D::Minus1, 2 * qk, vd * vg)?.reshape((b, vg, vd))?;
+            let q = (l2(&q)? * (1.0 / (kd as f64).sqrt()))?;
+            let k = l2(&k)?;
+            let spread = |t: Tensor| -> Result<Tensor> {
+                if d.v_heads_tiled {
+                    t.unsqueeze(1)?
+                        .broadcast_as((b, rep, kg, kd))?
+                        .reshape((b, vg, kd))
+                } else {
+                    t.unsqueeze(2)?
+                        .broadcast_as((b, kg, rep, kd))?
+                        .reshape((b, vg, kd))
+                }
+            };
+            let (q, k) = (spread(q)?, spread(k)?);
+            let alpha = alpha.to_dtype(DType::F32)?;
+            let sp = match crate::inference::kernel::fused::softplus_bias(&alpha, &self.dt_bias)? {
+                Some(y) => y,
+                None => ((alpha.broadcast_add(&self.dt_bias)?.exp()? + 1.0)?).log()?,
+            };
+            let decay = self.a.broadcast_mul(&sp)?.exp()?;
+            let beta = crate::tensor::ops::sigmoid(&beta.to_dtype(DType::F32)?)?;
+            let st = s.broadcast_mul(&decay.reshape((b, vg, 1, 1))?)?;
+            let kv = st
+                .broadcast_mul(&k.reshape((b, vg, 1, kd))?)?
+                .sum(D::Minus1)?;
+            let delta = (&v - kv)?.broadcast_mul(&beta.reshape((b, vg, 1))?)?;
+            let st = (st
+                + delta
+                    .reshape((b, vg, vd, 1))?
+                    .broadcast_mul(&k.reshape((b, vg, 1, kd))?)?)?;
+            let o = st
+                .broadcast_mul(&q.reshape((b, vg, 1, kd))?)?
+                .sum(D::Minus1)?;
+            s = st;
+            let on = RmsNorm::new(self.norm_w.clone(), self.eps as f32).forward(&o)?;
+            let z = z.to_dtype(DType::F32)?.reshape((b, vg, vd))?;
+            let y = (on * crate::tensor::ops::silu(&z)?)?.reshape((b, vg * vd))?;
+            outs.push(y.to_dtype(x.dtype())?.unsqueeze(1)?);
+        }
+        self.state = Some(SsmState::Card { conv, h: s });
+        Tensor::cat(&outs.iter().collect::<Vec<_>>(), 1)
+    }
+
+    /// The card path for one sequence: the projections and the convolution over every row
+    /// at once, then one fused recurrence launch and the fused gated norm.
+    #[cfg(feature = "cuda")]
+    fn forward_card(&mut self, x: &Tensor, seq: usize) -> Result<Tensor> {
+        use crate::inference::moe_cuda as k;
+        let d = self.dims;
+        let (kg, vg, kd, vd) = (d.k_heads, d.v_heads, d.k_dim, d.v_dim);
+        let (rep, qk) = (vg / kg, kd * kg);
+        let (conv, s) = match self.state.take() {
+            Some(SsmState::Card { conv, h }) => (conv, h),
+            _ => (
+                Tensor::zeros_on(
+                    (1, d.conv_dim(), d.conv_kernel - 1),
+                    DType::F32,
+                    &x.device(),
+                )?,
+                Tensor::zeros_on((1, vg, vd, kd), DType::F32, &x.device())?,
+            ),
+        };
+        let (qkv, z, alpha, beta) = self.project(x)?;
+        let qkv = qkv.reshape((seq, d.conv_dim()))?.contiguous()?;
+        let conv = conv
+            .reshape((d.conv_dim(), d.conv_kernel - 1))?
+            .contiguous()?;
+        let (c, conv) = match k::fused_conv_silu_f16in(&qkv, &conv, &self.conv_w, d.conv_kernel)? {
+            Some(out) => out,
+            None => k::fused_conv_silu(
+                &qkv.to_dtype(DType::F32)?,
+                &conv,
+                &self.conv_w,
+                d.conv_kernel,
+            )?,
+        };
+        let conv = conv.reshape((1, d.conv_dim(), d.conv_kernel - 1))?;
+        let q = c
+            .narrow(D::Minus1, 0, qk)?
+            .reshape((seq, kg, kd))?
+            .contiguous()?;
+        let key = c
+            .narrow(D::Minus1, qk, qk)?
+            .reshape((seq, kg, kd))?
+            .contiguous()?;
+        let v = c
+            .narrow(D::Minus1, 2 * qk, vd * vg)?
+            .reshape((seq, vg, vd))?
+            .contiguous()?;
+        let q = k::l2norm_gqa(&q, kg, kd, rep, d.v_heads_tiled, 1e-6)?;
+        let key = k::l2norm_gqa(&key, kg, kd, rep, d.v_heads_tiled, 1e-6)?;
+        let (alpha, beta) = (alpha.reshape((seq, vg))?, beta.reshape((seq, vg))?);
+        let (g, beta) = match k::deltanet_gate_f16in(&alpha, &beta, &self.a, &self.dt_bias)? {
+            Some(out) => out,
+            None => k::deltanet_gate(
+                &alpha.to_dtype(DType::F32)?,
+                &beta.to_dtype(DType::F32)?,
+                &self.a,
+                &self.dt_bias,
+            )?,
+        };
+        let s = s.reshape((vg, vd, kd))?.contiguous()?;
+        let scale = (1.0 / (kd as f64).sqrt()) as f32;
+        let (o, s) = k::gated_delta_net(&q, &key, &v, &g, &beta, &s, scale)?;
+        self.state = Some(SsmState::Card {
+            conv,
+            h: s.reshape((1, vg, vd, kd))?,
+        });
+        let o = o.reshape((seq * vg, vd))?;
+        let z = z.reshape((seq * vg, vd))?;
+        let y = match k::zgate_rmsnorm_f16io(&o, &z, &self.norm_w, self.eps as f32)? {
+            Some(y) => y,
+            None => k::zgate_rmsnorm(&o, &z.to_dtype(DType::F32)?, &self.norm_w, self.eps as f32)?,
+        };
+        y.reshape((1, seq, vg * vd))?.to_dtype(x.dtype())
+    }
+}
+
+/// The projected rows of a sequence, host F32: `qkv` `[seq, conv_dim]`, `z`
+/// `[seq, v_heads * v_dim]`, `alpha` and `beta` `[seq, v_heads]`.
+struct DeltaRows<'a> {
+    qkv: &'a [f32],
+    z: &'a [f32],
+    alpha: &'a [f32],
+    beta: &'a [f32],
+}
+
+/// [`GatedDeltaNet::forward`] on the host, advancing `conv` `[conv_dim, conv_kernel - 1]`
+/// and `h` `[v_heads, v_dim, k_dim]`. Returns `y` `[seq * v_heads * v_dim]`.
+fn delta_host(
+    rows: DeltaRows<'_>,
+    conv: &mut [f32],
+    h: &mut [f32],
+    w: &DeltaHost,
+    d: DeltaDims,
+    eps: f32,
+    seq: usize,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let (kg, vg, kd, vd) = (d.k_heads, d.v_heads, d.k_dim, d.v_dim);
+    let (ck, cd) = (d.conv_kernel, d.conv_dim());
+    let qk = kd * kg;
+    let scale = 1.0f32 / (kd as f32).sqrt();
+    let silu = |v: f32| v / (1.0 + (-v).exp());
+    let mut y = vec![0f32; seq * vg * vd];
+    let mut conv_out = vec![0f32; cd];
+    let mut qn = vec![0f32; qk];
+    let mut kn = vec![0f32; qk];
+    for t in 0..seq {
+        let xt = &rows.qkv[t * cd..(t + 1) * cd];
+        for c in 0..cd {
+            let taps = &w.conv_w[c * ck..(c + 1) * ck];
+            let s = &conv[c * (ck - 1)..(c + 1) * (ck - 1)];
+            let mut acc = taps[ck - 1] * xt[c];
+            for j in 0..ck - 1 {
+                acc += taps[j] * s[j];
+            }
+            conv_out[c] = silu(acc);
+        }
+        for c in 0..cd {
+            let s = &mut conv[c * (ck - 1)..(c + 1) * (ck - 1)];
+            s.rotate_left(1);
+            s[ck - 2] = xt[c];
+        }
+        for g in 0..kg {
+            let q = &conv_out[g * kd..(g + 1) * kd];
+            let k = &conv_out[qk + g * kd..qk + (g + 1) * kd];
+            let qs = (q.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
+            let ks = (k.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
+            for i in 0..kd {
+                qn[g * kd + i] = q[i] / qs * scale;
+                kn[g * kd + i] = k[i] / ks;
+            }
+        }
+        let v_all = &conv_out[2 * qk..2 * qk + vg * vd];
+        let zr = &rows.z[t * vg * vd..(t + 1) * vg * vd];
+        let (ar, br) = (
+            &rows.alpha[t * vg..(t + 1) * vg],
+            &rows.beta[t * vg..(t + 1) * vg],
+        );
+        let yt = &mut y[t * vg * vd..(t + 1) * vg * vd];
+        let (qn, kn) = (&qn, &kn);
+        h.par_chunks_mut(vd * kd)
+            .zip(yt.par_chunks_mut(vd))
+            .enumerate()
+            .for_each(|(head, (s, yh))| {
+                let j = d.key_head(head);
+                let (q, k) = (&qn[j * kd..(j + 1) * kd], &kn[j * kd..(j + 1) * kd]);
+                let v = &v_all[head * vd..(head + 1) * vd];
+                let sp = (1.0 + (ar[head] + w.dt_bias[head]).exp()).ln();
+                let decay = (w.a[head] * sp).exp();
+                let beta = 1.0 / (1.0 + (-br[head]).exp());
+                let mut sumsq = 0f32;
+                let mut o = vec![0f32; vd];
+                for r in 0..vd {
+                    let row = &mut s[r * kd..(r + 1) * kd];
+                    let mut kv = 0f32;
+                    for c in 0..kd {
+                        row[c] *= decay;
+                        kv += row[c] * k[c];
+                    }
+                    let delta = (v[r] - kv) * beta;
+                    let mut or = 0f32;
+                    for c in 0..kd {
+                        row[c] += delta * k[c];
+                        or += row[c] * q[c];
+                    }
+                    o[r] = or;
+                    sumsq += or * or;
+                }
+                let inv = 1.0 / (sumsq / vd as f32 + eps).sqrt();
+                for r in 0..vd {
+                    let z = zr[head * vd + r];
+                    yh[r] = o[r] * inv * w.norm[r] * silu(z);
+                }
+            });
+    }
+    y
 }
 
 impl GenericTransformerLayer {
@@ -937,5 +1429,100 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(resumed < 1e-5, "resumed max diff {resumed}");
+    }
+
+    #[test]
+    fn the_host_delta_rule_matches_the_row_by_row_tensor_path() {
+        let dev = Device::Cpu;
+        for tiled in [false, true] {
+            let dims = DeltaDims {
+                k_heads: 2,
+                v_heads: 4,
+                k_dim: 4,
+                v_dim: 3,
+                conv_kernel: 4,
+                v_heads_tiled: tiled,
+            };
+            let (hidden, seq, eps) = (10usize, 5usize, 1e-6f64);
+            let q = |seed, rows| {
+                let w = Tensor::from_vec(values(rows * hidden, seed, 0.4), (rows, hidden), &dev)
+                    .unwrap();
+                QMatMul::from_qtensor(
+                    crate::tensor::quantized::QTensor::quantize_onto(
+                        &w,
+                        crate::tensor::quantized::GgmlDType::F32,
+                        &dev,
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            };
+            let zn = dims.v_heads * dims.v_dim;
+            let make = |packed: bool| {
+                let proj = match packed {
+                    false => DeltaProj::Split {
+                        qkv: q(41, dims.conv_dim()),
+                        z: q(42, zn),
+                        alpha: q(43, dims.v_heads),
+                        beta: q(44, dims.v_heads),
+                    },
+                    true => DeltaProj::Ba {
+                        qkv: q(41, dims.conv_dim()),
+                        z: q(42, zn),
+                        ba: q(45, 2 * dims.v_heads),
+                    },
+                };
+                let t = |v: Vec<f32>, shape: &[usize]| Tensor::from_vec(v, shape, &dev).unwrap();
+                let a: Vec<f32> = values(dims.v_heads, 46, 0.5)
+                    .iter()
+                    .map(|v| -(0.3 + v.abs()))
+                    .collect();
+                GatedDeltaNet::new(
+                    proj,
+                    t(
+                        values(dims.conv_dim() * dims.conv_kernel, 47, 0.5),
+                        &[dims.conv_dim(), dims.conv_kernel],
+                    ),
+                    t(a, &[dims.v_heads]),
+                    t(values(dims.v_heads, 48, 0.5), &[dims.v_heads]),
+                    t(values(dims.v_dim, 49, 1.0), &[dims.v_dim]),
+                    dims,
+                    eps,
+                    &dev,
+                )
+                .unwrap()
+            };
+            let x =
+                Tensor::from_vec(values(seq * hidden, 50, 1.0), (1, seq, hidden), &dev).unwrap();
+            let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for packed in [false, true] {
+                let mut host = make(packed);
+                let mut rows = make(packed);
+                let a = v(&host.forward(&x, 0).unwrap());
+                let b = v(&rows.forward_rows(&x, 1, seq).unwrap());
+                let diff = a
+                    .iter()
+                    .zip(&b)
+                    .map(|(p, q)| (p - q).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    diff < 1e-4,
+                    "tiled={tiled} packed={packed}: max diff {diff}"
+                );
+                // Resumed from a snapshot, the host path continues the same sequence.
+                let mut m = Mixer::DeltaNet(make(packed));
+                m.forward(&x.narrow(1, 0, 2).unwrap(), 0).unwrap();
+                let snap = m.snapshot().unwrap().unwrap();
+                m.forward(&x, 0).unwrap();
+                m.restore(&snap).unwrap();
+                let tail = v(&m.forward(&x.narrow(1, 2, seq - 2).unwrap(), 2).unwrap());
+                let resumed = tail
+                    .iter()
+                    .zip(&a[2 * zn..])
+                    .map(|(p, q)| (p - q).abs())
+                    .fold(0f32, f32::max);
+                assert!(resumed < 1e-5, "resumed max diff {resumed}");
+            }
+        }
     }
 }

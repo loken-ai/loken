@@ -83,6 +83,8 @@ struct RawGenericLayer {
     mixer: RawMixer,
     /// The block has a feed-forward sublayer.
     has_ffn: bool,
+    /// Attention output gate, split from the Q projection.
+    attn_gate: Option<QTensor>,
     /// Shared expert: gate (SwiGLU) or none (squared ReLU), up, down, and the scalar gate
     /// `[hidden]` scaling its output.
     shexp_gate: Option<QTensor>,
@@ -97,6 +99,14 @@ enum RawMixer {
     ShortConv {
         in_proj: QTensor,
         conv: QTensor,
+    },
+    DeltaNet {
+        /// `attn_qkv | attn_gate | ssm_alpha | ssm_beta`, or `attn_qkv | attn_gate | ssm_ba`.
+        proj: Vec<QTensor>,
+        conv_w: QTensor,
+        a: QTensor,
+        dt_bias: QTensor,
+        norm: QTensor,
     },
     Ssm {
         in_proj: QTensor,
@@ -139,6 +149,87 @@ fn required_tensor(
         .get(name)
         .ok_or_else(|| crate::tensor::Error::msg(format!("missing tensor: {name}")))?
         .read_slice_owned(mmap, tdo, device, owner)
+}
+
+/// A quantised weight built on `device` from its block bytes, `rows` x `cols`.
+fn qtensor_from_bytes(
+    bytes: &[u8],
+    dtype: crate::tensor::quantized::GgmlDType,
+    rows: usize,
+    cols: usize,
+    device: &Device,
+) -> crate::tensor::Result<QTensor> {
+    // The storage reads the bytes as blocks, so they sit in a word-aligned buffer.
+    let mut buf = vec![0u32; bytes.len().div_ceil(4)];
+    let aligned: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 4) };
+    aligned[..bytes.len()].copy_from_slice(bytes);
+    let storage = crate::tensor::quantized::QStorage::from_data(
+        std::borrow::Cow::Borrowed(&aligned[..bytes.len()]),
+        device,
+        dtype,
+    )?;
+    QTensor::new(storage, crate::tensor::Shape::from((rows, cols)))
+}
+
+/// The rows of `a` in `row_bytes`-sized rows.
+fn row_bytes(qt: &QTensor) -> usize {
+    let cols = qt.shape().dims()[1];
+    cols / qt.dtype().block_size() * qt.dtype().type_size()
+}
+
+/// Splits a Q projection whose rows hold, per head, the head's Q rows followed by as many
+/// output-gate rows into the Q projection and the gate projection, each `[n_head *
+/// head_dim, hidden]` in the stored format.
+fn split_q_gate(
+    q: QTensor,
+    n_head: usize,
+    device: &Device,
+) -> crate::tensor::Result<(QTensor, QTensor)> {
+    let (rows, cols) = (q.shape().dims()[0], q.shape().dims()[1]);
+    if n_head == 0 || rows % (2 * n_head) != 0 {
+        return Err(crate::tensor::Error::msg(format!(
+            "a Q projection of {rows} rows does not interleave Q and a gate over {n_head} heads"
+        )));
+    }
+    let head_bytes = rows / (2 * n_head) * row_bytes(&q);
+    let bytes = q.data()?;
+    let (mut qb, mut gb) = (
+        Vec::with_capacity(bytes.len() / 2),
+        Vec::with_capacity(bytes.len() / 2),
+    );
+    for h in 0..n_head {
+        let at = 2 * h * head_bytes;
+        qb.extend_from_slice(&bytes[at..at + head_bytes]);
+        gb.extend_from_slice(&bytes[at + head_bytes..at + 2 * head_bytes]);
+    }
+    let dtype = q.dtype();
+    Ok((
+        qtensor_from_bytes(&qb, dtype, rows / 2, cols, device)?,
+        qtensor_from_bytes(&gb, dtype, rows / 2, cols, device)?,
+    ))
+}
+
+/// The weights `parts` stacked by rows into one, when they share a format the expert
+/// kernels read and an input width; `None` otherwise.
+fn concat_rows(parts: &[QTensor], device: &Device) -> crate::tensor::Result<Option<QTensor>> {
+    let Some(first) = parts.first() else {
+        return Ok(None);
+    };
+    let (dtype, cols) = (first.dtype(), first.shape().dims()[1]);
+    let same = parts
+        .iter()
+        .all(|p| p.dtype() == dtype && p.shape().dims().len() == 2 && p.shape().dims()[1] == cols);
+    if !same || !crate::inference::moe_cuda::gemm::expert_kernels_serve(dtype) {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    let mut rows = 0;
+    for p in parts {
+        bytes.extend_from_slice(&p.data()?);
+        rows += p.shape().dims()[0];
+    }
+    qtensor_from_bytes(&bytes, dtype, rows, cols, device).map(Some)
 }
 
 /// Build a `GenericTransformerLayer` from a raw loaded layer.
@@ -747,6 +838,22 @@ fn build_generic_layer(
                     None,
                     None,
                 ),
+                // SiLU experts apart beside a shared expert or behind a sigmoid router: every
+                // path reads the two stacks as stored, so no fused stack or host cache is
+                // built beside them.
+                (None, Some(ge), Some(ue))
+                    if !flags.use_gelu
+                        && (raw.shexp_up.is_some() || config.expert_sigmoid_gating) =>
+                {
+                    (
+                        None,
+                        None,
+                        true,
+                        true,
+                        Some(std::sync::Arc::new(coerce_moe_weight(ge, device)?)),
+                        Some(std::sync::Arc::new(coerce_moe_weight(ue, device)?)),
+                    )
+                }
                 (None, Some(ge), Some(ue)) => {
                     let ge_f = ge.dequantize(&Device::Cpu)?;
                     let ue_f = ue.dequantize(&Device::Cpu)?;
@@ -947,6 +1054,66 @@ fn build_generic_layer(
                 device,
             )?)
         }
+        RawMixer::DeltaNet {
+            proj,
+            conv_w,
+            a,
+            dt_bias,
+            norm,
+        } => {
+            let meta = config.ssm.ok_or_else(|| {
+                crate::tensor::Error::msg("delta-rule layer in a file without ssm.inner_size")
+            })?;
+            let dims = super::mixer::DeltaDims {
+                k_heads: meta.group_count.max(1),
+                v_heads: meta.time_step_rank,
+                k_dim: meta.state_size,
+                v_dim: meta.inner_size / meta.time_step_rank.max(1),
+                conv_kernel: meta.conv_kernel,
+                v_heads_tiled: meta.v_heads_tiled,
+            };
+            let packed_ba = proj.len() == 3;
+            let proj = match concat_rows(&proj, device)? {
+                Some(fused) if !packed_ba => {
+                    super::mixer::DeltaProj::Fused(QMatMul::from_qtensor(fused)?)
+                }
+                _ => {
+                    let mut it = proj.into_iter();
+                    let mut next = || -> Result<QMatMul> {
+                        to_qmatmul(it.next()).and_then(|q| {
+                            q.ok_or_else(|| {
+                                crate::tensor::Error::msg("delta-rule projection missing")
+                            })
+                        })
+                    };
+                    let (qkv, z) = (next()?, next()?);
+                    match packed_ba {
+                        true => super::mixer::DeltaProj::Ba {
+                            qkv,
+                            z,
+                            ba: next()?,
+                        },
+                        false => super::mixer::DeltaProj::Split {
+                            qkv,
+                            z,
+                            alpha: next()?,
+                            beta: next()?,
+                        },
+                    }
+                }
+            };
+            let host = |qt: QTensor| qt.dequantize(&Device::Cpu);
+            super::mixer::Mixer::DeltaNet(super::mixer::GatedDeltaNet::new(
+                proj,
+                host(conv_w)?,
+                host(a)?,
+                host(dt_bias)?,
+                host(norm)?,
+                dims,
+                eps,
+                device,
+            )?)
+        }
         RawMixer::Absent => super::mixer::Mixer::Absent,
     };
     let attends = matches!(mixer, super::mixer::Mixer::Attention);
@@ -986,6 +1153,7 @@ fn build_generic_layer(
     Ok(GenericTransformerLayer {
         mixer,
         has_ffn: raw.has_ffn,
+        attn_gate: to_qmatmul(raw.attn_gate)?,
         attn_q,
         attn_k,
         attn_v,
@@ -1233,6 +1401,7 @@ fn build_generic_layer(
             config.sliding_window
         },
         rope_dim,
+        rope_rows: None,
         rope_base,
         attention_scale: config.attention_scale,
         attn_softcap: config.attn_logit_softcapping.map(|c| c as f32),
@@ -1438,6 +1607,7 @@ fn build_awq_layer(
     Ok(GenericTransformerLayer {
         mixer: super::mixer::Mixer::Attention,
         has_ffn: true,
+        attn_gate: None,
         attn_q,
         attn_k,
         attn_v,
@@ -1539,6 +1709,7 @@ fn build_awq_layer(
         sliding_window: None,
         prefill_mask_window: config.sliding_window,
         rope_dim: 0,
+        rope_rows: None,
         rope_base: config.rope_freq_base,
         no_rope: false,
         attention_scale: config.attention_scale,
@@ -1980,6 +2151,7 @@ impl GenericHeteroTransformer {
                 )));
             }
             // Attention
+            let mut attn_gate = None;
             let (attn_q, attn_k, attn_v, attn_qkv) = if !attends {
                 (None, None, None, None)
             } else if f.fused_qkv {
@@ -1987,6 +2159,14 @@ impl GenericHeteroTransformer {
                 (None, None, None, Some(qkv))
             } else {
                 let q = req!(&format!("{prefix}.attn_q.weight"))?;
+                let q = match config.attn_output_gate {
+                    true => {
+                        let (q, gate) = split_q_gate(q, config.n_head, weight_dev)?;
+                        attn_gate = Some(gate);
+                        q
+                    }
+                    false => q,
+                };
                 let k = req!(&format!("{prefix}.attn_k.weight"))?;
                 // Gemma4 26B Global layers omit attn_v and reuse attn_k
                 // as V (AttentionKEqV pattern). Use opt-load for V.
@@ -2008,7 +2188,7 @@ impl GenericHeteroTransformer {
             // in the reference Shape is the output dim (last GGUF dim).
             let q_out_dim = if attends && !f.fused_qkv {
                 ti.get(&format!("{prefix}.attn_q.weight"))
-                    .map(|info| info.shape.dims()[0])
+                    .map(|info| info.shape.dims()[0] / if attn_gate.is_some() { 2 } else { 1 })
             } else {
                 None // fused QKV uses config head_dim
             };
@@ -2032,6 +2212,31 @@ impl GenericHeteroTransformer {
                         conv: req_cpu!(&format!("{prefix}.shortconv.conv.weight"))?,
                     },
                 ),
+                super::mixer::MixerKind::DeltaNet => {
+                    let tail = match ti.contains_key(&format!("{prefix}.ssm_ba.weight")) {
+                        true => vec!["ssm_ba"],
+                        false => vec!["ssm_alpha", "ssm_beta"],
+                    };
+                    let mut proj = Vec::with_capacity(4);
+                    for stem in ["attn_qkv", "attn_gate"].into_iter().chain(tail) {
+                        proj.push(req!(&format!("{prefix}.{stem}.weight"))?);
+                    }
+                    // The dt bias is stored bare or as a `.bias`.
+                    let dt_bias = match ti.contains_key(&format!("{prefix}.ssm_dt")) {
+                        true => req_cpu!(&format!("{prefix}.ssm_dt"))?,
+                        false => req_cpu!(&format!("{prefix}.ssm_dt.bias"))?,
+                    };
+                    (
+                        req!(&format!("{prefix}.ssm_out.weight"))?,
+                        RawMixer::DeltaNet {
+                            proj,
+                            conv_w: req_cpu!(&format!("{prefix}.ssm_conv1d.weight"))?,
+                            a: req_cpu!(&format!("{prefix}.ssm_a"))?,
+                            dt_bias,
+                            norm: req_cpu!(&format!("{prefix}.ssm_norm.weight"))?,
+                        },
+                    )
+                }
                 super::mixer::MixerKind::Ssm => (
                     req!(&format!("{prefix}.ssm_out.weight"))?,
                     RawMixer::Ssm {
@@ -2106,7 +2311,10 @@ impl GenericHeteroTransformer {
                 // OLMo2 post-norm-only: pre-ffn-norm absent -> Identity at build.
                 opt_cpu!(&format!("{prefix}.ffn_norm.weight"))?
             } else {
-                Some(req_cpu!(&format!("{prefix}.ffn_norm.weight"))?)
+                Some(req_cpu!(&format!(
+                    "{prefix}.{}.weight",
+                    config.ffn_norm_stem
+                ))?)
             };
             let post_ffn_norm_qt = if f.has_post_ffn_norm {
                 opt_cpu!(&format!("{prefix}.post_ffw_norm.weight"))?
@@ -2276,6 +2484,7 @@ impl GenericHeteroTransformer {
                 moe_exp_probs_b_qt,
                 mixer,
                 has_ffn,
+                attn_gate,
                 shexp_gate: opt_dev!(&format!("{prefix}.ffn_gate_shexp.weight"))?,
                 shexp_up: opt_dev!(&format!("{prefix}.ffn_up_shexp.weight"))?,
                 shexp_down: opt_dev!(&format!("{prefix}.ffn_down_shexp.weight"))?,
@@ -2557,6 +2766,44 @@ impl GenericHeteroTransformer {
             );
         }
 
+        // The vision tower of a family whose images splice into the text stream, on the card
+        // of the first layer; the tower runs on a card only.
+        let spliced_vision = match (
+            arch_conventions(&config.arch).spliced_vision_tower,
+            content.tensor_infos.contains_key("v.patch_embed.weight"),
+            layer_devs.first(),
+        ) {
+            (true, true, Some(LayerDevice::Cuda(idx))) => {
+                let token = meta_u32(&content, &config.arch, "vision.image_token_id")
+                    .or_else(|| meta_u32(&content, &config.arch, "image_token_id"));
+                match (token, cuda_devices.get(idx)) {
+                    (Some(image_token), Some(card)) => {
+                        let tower =
+                            crate::inference::model::qwen35::vision::Qwen35Vision::from_gguf(
+                                &content,
+                                &mut cursor,
+                                config.embedding_length,
+                                card,
+                            );
+                        match tower {
+                            Ok(tower) => Some(super::splice::SplicedVision { tower, image_token }),
+                            Err(e) => {
+                                warn!("vision tower not loaded ({e}); text only");
+                                None
+                            }
+                        }
+                    }
+                    _ => {
+                        warn!(
+                            "the file names no image token or card for its vision tower; text only"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let model = Self {
             adapters: Vec::new(),
             config,
@@ -2587,6 +2834,7 @@ impl GenericHeteroTransformer {
             workspace_pre_grown: false,
             kv_snapshots: Vec::new(),
             kv_snapshot_tick: 0,
+            spliced_vision,
         };
 
         // A SiLU MoE runs its prefill experts on the host, and that loop reads its weights
@@ -2889,6 +3137,7 @@ impl GenericHeteroTransformer {
             workspace_pre_grown: false,
             kv_snapshots: Vec::new(),
             kv_snapshot_tick: 0,
+            spliced_vision: None,
         })
     }
 }
@@ -2933,5 +3182,29 @@ mod host_spill_admission_tests {
     fn the_boundary_admits_and_one_byte_past_it_refuses() {
         assert!(host_spill_fits(1_000, 1_000));
         assert!(!host_spill_fits(1_001, 1_000));
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    #[test]
+    fn a_q_projection_splits_into_q_and_gate_per_head() {
+        let (heads, hd, hidden) = (3usize, 2usize, 4usize);
+        let rows = 2 * heads * hd;
+        // Row r holds the value r in every column.
+        let data: Vec<f32> = (0..rows).flat_map(|r| vec![r as f32; hidden]).collect();
+        let w = Tensor::from_vec(data, (rows, hidden), &Device::Cpu).unwrap();
+        let qt = QTensor::quantize_onto(&w, crate::tensor::quantized::GgmlDType::F32, &Device::Cpu)
+            .unwrap();
+        let (q, gate) = split_q_gate(qt, heads, &Device::Cpu).unwrap();
+        let first_col = |t: QTensor| -> Vec<f32> {
+            let d = t.dequantize(&Device::Cpu).unwrap();
+            assert_eq!(d.dims(), [heads * hd, hidden]);
+            d.to_vec2::<f32>().unwrap().iter().map(|r| r[0]).collect()
+        };
+        assert_eq!(first_col(q), vec![0., 1., 4., 5., 8., 9.]);
+        assert_eq!(first_col(gate), vec![2., 3., 6., 7., 10., 11.]);
     }
 }

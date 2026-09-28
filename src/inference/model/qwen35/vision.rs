@@ -1,4 +1,4 @@
-//! qwen35moe (Qwen3-VL) vision encoder - 27-block ViT + patch-embed + learned
+//! Qwen3.5 (Qwen3-VL) vision encoder - 27-block ViT + patch-embed + learned
 //! pos-embed (bilinear-interpolated) + 2D rope + 2x2 spatial-merge merger.
 //!
 //! Input: pixel_values [n_patches, patch_dim=1536] (from image_processor::
@@ -35,7 +35,12 @@ pub struct VisionConfig {
 }
 impl VisionConfig {
     pub fn from_gguf(ct: &gguf_file::Content, text_hidden: usize) -> Self {
-        let g = |k: &str| ct.metadata.get(&format!("qwen35moe.vision.{k}"));
+        let arch = ct
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.to_string().ok())
+            .map_or("qwen35moe", |s| s.as_str());
+        let g = |k: &str| ct.metadata.get(&format!("{arch}.vision.{k}"));
         let u = |k: &str, d: usize| {
             g(k).and_then(|v| v.to_u32().ok())
                 .map(|v| v as usize)

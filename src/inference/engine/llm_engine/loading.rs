@@ -759,70 +759,6 @@ impl LlmEngine {
                         ),
                     )
                 }
-                "qwen35moe" | "qwen35" | "qwen3next" => {
-                    // The dense qwen35 belongs here, not on the generic arm: the family's
-                    // block is gated DeltaNet linear attention, which only this path
-                    // implements. Dense vs MoE differs in the FFN alone - the same reason
-                    // the dense lfm2 was wired onto the lfm2moe path rather than ported
-                    // separately.
-                    // Qwen3.5-MoE / Qwen3-Next-80B (same family, two GGUF arch tags):
-                    // gated DeltaNet linear-attn + attention + softmax MoE
-                    // (+ scalar-gated shared expert). F16 stream; deltanet/norms/softmax
-                    // /MoE in F32. TEXT path only (vision ViT is CUDA-only). On a CPU
-                    // build the DeltaNet recurrence uses the pure tensor-op per-token path.
-                    let dtype = crate::tensor::DType::F16;
-                    let mut gpu_ids: Vec<usize> = cuda_devices.iter().map(|(i, _)| *i).collect();
-                    gpu_ids.sort_unstable();
-                    let mut gpu_list: Vec<Device> = Vec::new();
-                    for idx in &gpu_ids {
-                        match Device::new_cuda(*idx) {
-                            Ok(d) => gpu_list.push(d),
-                            Err(e) => warn!("qwen35moe: skipping GPU {idx}: {e}"),
-                        }
-                    }
-                    if gpu_list.is_empty() {
-                        // No usable CUDA device (or a CPU-only build) -> run on CPU.
-                        gpu_list.push(Device::Cpu);
-                    }
-                    info!("⬇️  Loading qwen35moe (gated-DeltaNet+attn+MoE) across {} device(s)", gpu_list.len());
-                    let file_size = mmap_bytes.len() as u64;
-                    let mut gpu_avail: Vec<u64> = gpu_ids.iter().map(|id|
-                        cuda_devices.iter().find(|(i, _)| i == id).map(|(_, a)| *a).unwrap_or(0)
-                    ).collect();
-                    // If the model exceeds total GPU VRAM (e.g. Qwen3-Next-80B at 48GB on
-                    // 2x16GB), append CPU so plan_layer_devices spills the OVERFLOW to host
-                    // RAM instead of piling every remaining layer onto the last GPU (OOM).
-                    let total_vram: u64 = gpu_avail.iter().sum();
-                    if file_size > total_vram && !gpu_list.iter().any(|d| d.is_cpu()) {
-                        gpu_list.push(Device::Cpu);
-                        gpu_avail.push(file_size); // CPU budget: hold whatever spills over
-                        info!("📦 model {}GB > VRAM {}GB -> offloading overflow to CPU",
-                            file_size >> 30, total_vram >> 30);
-                    }
-                    let mut loaded: Option<BoxedModelBackend> = None;
-                    let mut last_err = String::new();
-                    for avail in [gpu_avail.as_slice(), &[][..]] {
-                        let content_fresh = gguf_file::Content::read_mapped(&mut Cursor::new(mmap_bytes), mmap.clone())
-                            .map_err(|e| anyhow!("GGUF re-parse failed: {e}"))?;
-                        let mut reader = Cursor::new(mmap_bytes);
-                        match crate::inference::model::qwen35::moe::Qwen35MoeModel::from_gguf(
-                            &content_fresh, &mut reader, &gpu_list, dtype, avail, file_size,
-                            runtime_reserve_bytes, Some(&mmap),
-                        ) {
-                            Ok(m) => {
-                                info!("✅ qwen35moe loaded ({} split) across {} GPU(s)",
-                                    if avail.is_empty() { "even" } else { "weighted" }, gpu_list.len());
-                                loaded = Some(Box::new(Qwen35MoeBackend(m)));
-                                break;
-                            }
-                            Err(e) => { warn!("qwen35moe {} split load failed: {e}", if avail.is_empty() { "even" } else { "weighted" }); last_err = e.to_string(); }
-                        }
-                    }
-                    match loaded {
-                        Some(m) => m,
-                        None => return Err(anyhow!("qwen35moe load failed: {last_err}")),
-                    }
-                }
                 "llama" | "mistral" | "mistral3" |
                 "qwen2" | "qwen3" | "qwen3moe" | "gptoss" | "gemma" | "gemma2" | "gemma3" |
                 "gemma3n" | "gemma4" |
@@ -830,7 +766,7 @@ impl LlmEngine {
                 "starcoder2" | "falcon" | "bloom" | "mpt" | "refact" | "codeshell" |
                 "granite" | "granite3" | "granitemoe" | "dbrx" | "internlm2" | "yi" | "orion" |
                 "olmo2" | "olmoe" | "ernie4_5" | "smollm3" | "lfm2" | "lfm2moe" |
-                "nemotron_h_moe" => {
+                "nemotron_h_moe" | "qwen35" | "qwen35moe" | "qwen3next" => {
                     debug!("⬇️  Loading '{}' as generic hetero transformer (CUDA+CPU)...", arch);
                     // An architecture without a RoPE pairing cannot build a config: refuse
                     // it here, before any weight is placed.

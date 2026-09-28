@@ -48,6 +48,7 @@ mod layer_forward;
 mod loader;
 pub mod mixer;
 mod moe_weights;
+mod splice;
 #[cfg(all(test, feature = "cuda"))]
 mod verify_decode_parity;
 pub use config::*;
@@ -92,6 +93,10 @@ pub struct GenericTransformerLayer {
     /// fused single-launch op instead of the manual sqr+mean+sqrt+div
     /// (~5 launches/layer/token).
     pub attn_v_norm_ones: Option<Tensor>,
+    /// Output gate: the attention output is multiplied by `sigmoid(attn_gate(x))` before
+    /// the output projection. Split at load from a Q projection that interleaves Q and the
+    /// gate per head.
+    pub attn_gate: Option<QMatMul>,
     // Always present
     pub attn_output: QMatMul,
     /// Optional bias on attn_output projection (phi2)
@@ -319,6 +324,10 @@ pub struct GenericTransformerLayer {
     pub prefill_mask_window: Option<usize>,
     /// Partial RoPE: only apply to first `rope_dim` of `head_dim` dims (0 = full)
     pub rope_dim: usize,
+    /// Rotary rows `[seq, rope_dim / 2]` the next forward rotates by instead of the table
+    /// rows at its position: set around a spliced prefill whose positions are not the
+    /// sequence's.
+    pub rope_rows: Option<(Tensor, Tensor)>,
     /// Rotary base this layer's frequencies are powers of: the SWA base on a
     /// sliding-window layer that has one, the model's `rope.freq_base` otherwise.
     pub rope_base: f32,
@@ -430,6 +439,8 @@ pub struct GenericHeteroTransformer {
     /// used last by `tick`; empty unless the configuration asks for them.
     kv_snapshots: Vec<KvSnapshot>,
     kv_snapshot_tick: u64,
+    /// A vision tower whose embeddings are spliced over a placeholder run.
+    spliced_vision: Option<splice::SplicedVision>,
 }
 
 /// A resident sequence copied aside: its tokens and every layer's KV, taken after a

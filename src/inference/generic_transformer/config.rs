@@ -157,10 +157,13 @@ impl GenericLayerFlags {
         // may run a recurrent mixer.
         let attn = super::mixer::attention_probe_layer(content, n_layer);
         let has_attn = |suffix: &str| has(&format!("blk.{attn}.{suffix}"));
+        let ffn_norm = arch_conventions(arch).ffn_norm_stem.unwrap_or("ffn_norm");
         Self {
             has_qkv_bias: has_attn("attn_q.bias"),
             has_qk_norm: has_attn("attn_q_norm.weight"),
-            has_post_attn_norm: has("blk.0.post_attention_norm.weight"),
+            // A file whose feed-forward norm carries this name has no post-attention norm.
+            has_post_attn_norm: ffn_norm != "post_attention_norm"
+                && has("blk.0.post_attention_norm.weight"),
             has_post_ffn_norm: has("blk.0.post_ffw_norm.weight"),
             fused_qkv: has_attn("attn_qkv.weight"),
             fused_ffn_gate_up: !has("blk.0.ffn_gate.weight") && has("blk.0.ffn_up.weight"),
@@ -190,7 +193,7 @@ impl GenericLayerFlags {
             // parallel-attn (phi2/gpt-neox): one input norm feeds both attn+ffn, so
             // there is no separate ffn_norm. OLMo2 ALSO lacks ffn_norm but is SERIAL
             // post-norm (it has post_ffw_norm) - exclude it so it isn't mis-routed.
-            parallel_attn: !has("blk.0.ffn_norm.weight")
+            parallel_attn: !has(&format!("blk.0.{ffn_norm}.weight"))
                 && has("blk.0.ffn_up.weight")
                 && !has("blk.0.post_ffw_norm.weight"),
             layer_norm_with_bias: has("blk.0.attn_norm.bias"),
@@ -303,6 +306,13 @@ pub struct ArchConventions {
     /// Whether sigmoid-routed expert weights are renormalised over the chosen experts,
     /// over what the file says.
     pub expert_weights_norm: Option<bool>,
+    /// The attention Q projection interleaves Q and an output gate per head.
+    pub attn_output_gate: bool,
+    /// Name of the norm ahead of the feed-forward, when not `ffn_norm`.
+    pub ffn_norm_stem: Option<&'static str>,
+    /// The file's `v.*` tensors are a Qwen3-VL vision tower whose embeddings splice into the
+    /// text stream with multi-axis rotary positions.
+    pub spliced_vision_tower: bool,
 }
 
 /// Whether layer `il` is a sliding-window layer under a period of `period`.
@@ -324,6 +334,15 @@ pub fn arch_conventions(arch: &str) -> ArchConventions {
             yarn_by_default: true,
             yarn_attention_factor: true,
             expert_swiglu_clamp: Some((1.702, 7.0)),
+            ..ArchConventions::default()
+        },
+        // qwen35, qwen35moe, qwen3next: the reference reads a gate beside Q from every
+        // attention layer's Q projection, and names the feed-forward's norm
+        // `post_attention_norm`.
+        "qwen35" | "qwen35moe" | "qwen3next" => ArchConventions {
+            attn_output_gate: true,
+            ffn_norm_stem: Some("post_attention_norm"),
+            spliced_vision_tower: true,
             ..ArchConventions::default()
         },
         // nemotron_h_moe: the reference routes by sigmoid whatever the file says.
@@ -401,6 +420,10 @@ pub struct GenericTransformerConfig {
     pub expert_weights_scale: f64,
     /// The recurrent mixers' dimensions, when the file gives `ssm.inner_size`.
     pub ssm: Option<SsmMeta>,
+    /// The attention Q projection interleaves Q and an output gate per head.
+    pub attn_output_gate: bool,
+    /// Name of the norm ahead of the feed-forward.
+    pub ffn_norm_stem: &'static str,
     pub flags: GenericLayerFlags,
     /// Per-layer KV cache storage mode. Off -> F-dtype SpecKvCache only;
     /// Q8 -> also maintain a Q8KvCache alongside so the decode-path (seq=1)
@@ -470,6 +493,7 @@ pub fn rope_pairing(arch: &str) -> std::result::Result<bool, String> {
         "qwen3moe",
         "qwen35",
         "qwen35moe",
+        "qwen3next",
         "gptoss",
         "lfm2",
         "lfm2moe",
@@ -795,6 +819,8 @@ impl GenericTransformerConfig {
             expert_weights_norm,
             expert_weights_scale,
             ssm,
+            attn_output_gate: conventions.attn_output_gate,
+            ffn_norm_stem: conventions.ffn_norm_stem.unwrap_or("ffn_norm"),
             shared_kv_layers,
             embed_scale,
             logit_scale,
@@ -1226,6 +1252,117 @@ mod arch_conventions_tests {
             "no layer rotates"
         );
         assert!(rope_pairing("nemotron_h_moe").is_ok());
+    }
+
+    #[test]
+    fn a_qwen35moe_file_configures_its_delta_rule_and_gated_attention() {
+        use super::super::mixer::{attention_probe_layer, layer_mixer_kind, MixerKind};
+        let (hidden, heads, hd, experts) = (32usize, 4usize, 8usize, 4usize);
+        let meta = vec![
+            ("attention.head_count", Value::U32(heads as u32)),
+            ("attention.head_count_kv", Value::U32(2)),
+            ("attention.key_length", Value::U32(hd as u32)),
+            ("attention.layer_norm_rms_epsilon", Value::F32(1e-6)),
+            ("block_count", Value::U32(2)),
+            ("embedding_length", Value::U32(hidden as u32)),
+            ("expert_count", Value::U32(experts as u32)),
+            ("expert_used_count", Value::U32(2)),
+            ("rope.dimension_count", Value::U32(4)),
+            ("ssm.conv_kernel", Value::U32(4)),
+            ("ssm.inner_size", Value::U32(16)),
+            ("ssm.state_size", Value::U32(8)),
+            ("ssm.group_count", Value::U32(2)),
+            ("ssm.time_step_rank", Value::U32(4)),
+            ("ssm.v_head_reordered", Value::Bool(true)),
+        ];
+        let mut tensors: Vec<(String, Vec<usize>)> = [
+            ("token_embd.weight", vec![100, hidden]),
+            ("output_norm.weight", vec![hidden]),
+            ("blk.0.attn_qkv.weight", vec![48, hidden]),
+            ("blk.0.attn_gate.weight", vec![16, hidden]),
+            ("blk.0.ssm_alpha.weight", vec![4, hidden]),
+            ("blk.0.ssm_beta.weight", vec![4, hidden]),
+            ("blk.0.ssm_conv1d.weight", vec![48, 4]),
+            ("blk.0.ssm_a", vec![4]),
+            ("blk.0.ssm_dt", vec![4]),
+            ("blk.0.ssm_norm.weight", vec![4]),
+            ("blk.0.ssm_out.weight", vec![hidden, 16]),
+            ("blk.1.attn_q.weight", vec![2 * heads * hd, hidden]),
+            ("blk.1.attn_k.weight", vec![2 * hd, hidden]),
+            ("blk.1.attn_v.weight", vec![2 * hd, hidden]),
+            ("blk.1.attn_q_norm.weight", vec![hd]),
+            ("blk.1.attn_k_norm.weight", vec![hd]),
+            ("blk.1.attn_output.weight", vec![hidden, heads * hd]),
+        ]
+        .into_iter()
+        .map(|(n, d)| (n.to_string(), d))
+        .collect();
+        for il in 0..2 {
+            tensors.extend([
+                (format!("blk.{il}.attn_norm.weight"), vec![hidden]),
+                (format!("blk.{il}.post_attention_norm.weight"), vec![hidden]),
+                (
+                    format!("blk.{il}.ffn_gate_inp.weight"),
+                    vec![experts, hidden],
+                ),
+                (
+                    format!("blk.{il}.ffn_gate_exps.weight"),
+                    vec![experts, hidden, hidden],
+                ),
+                (
+                    format!("blk.{il}.ffn_up_exps.weight"),
+                    vec![experts, hidden, hidden],
+                ),
+                (
+                    format!("blk.{il}.ffn_down_exps.weight"),
+                    vec![experts, hidden, hidden],
+                ),
+                (format!("blk.{il}.ffn_gate_inp_shexp.weight"), vec![hidden]),
+                (
+                    format!("blk.{il}.ffn_gate_shexp.weight"),
+                    vec![hidden, hidden],
+                ),
+                (
+                    format!("blk.{il}.ffn_up_shexp.weight"),
+                    vec![hidden, hidden],
+                ),
+                (
+                    format!("blk.{il}.ffn_down_shexp.weight"),
+                    vec![hidden, hidden],
+                ),
+            ]);
+        }
+        let tensors: Vec<(&str, Vec<usize>)> = tensors
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.clone()))
+            .collect();
+        let content = synth_content("qwen35moe", &meta, &tensors);
+        let cfg = GenericTransformerConfig::from_gguf(&content, "qwen35moe").unwrap();
+        assert_eq!(layer_mixer_kind(&content, 0), MixerKind::DeltaNet);
+        assert_eq!(layer_mixer_kind(&content, 1), MixerKind::Attention);
+        assert_eq!(attention_probe_layer(&content, 2), 1);
+        assert!(
+            !cfg.flags.fused_qkv,
+            "the delta rule's attn_qkv is not attention's"
+        );
+        assert!(cfg.flags.has_qk_norm);
+        assert!(
+            !cfg.flags.has_post_attn_norm,
+            "post_attention_norm is the feed-forward's"
+        );
+        assert!(!cfg.flags.parallel_attn);
+        assert!(cfg.flags.is_moe);
+        assert!(!cfg.expert_sigmoid_gating);
+        assert!(cfg.attn_output_gate);
+        assert_eq!(cfg.ffn_norm_stem, "post_attention_norm");
+        assert_eq!(cfg.head_dim, hd);
+        assert_eq!(cfg.rope_dim, Some(4));
+        let ssm = cfg.ssm.expect("ssm metadata");
+        assert!(ssm.v_heads_tiled);
+        assert_eq!(
+            (ssm.group_count, ssm.time_step_rank, ssm.state_size),
+            (2, 4, 8)
+        );
     }
 
     #[test]

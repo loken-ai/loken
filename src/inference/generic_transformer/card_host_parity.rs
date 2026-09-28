@@ -899,3 +899,39 @@ fn nemotron_h_generic_route_matches_the_reference() {
         "nemotron_3_nano_greedy.json",
     );
 }
+
+/// qwen3.5 (gated delta rule and gated attention, dense or routed) through the generic
+/// route decodes greedily what the reference decoded.
+///
+/// Ignored by default: it needs qwen3.5:latest in the store, the CUDA cards idle, and a
+/// reference run recorded as `reference_run` says. Run with
+///   LOKEN_QWEN35_REFERENCE=/path/to/reference.json cargo test --release --lib \
+///     qwen35_generic_route_matches_the_reference -- --ignored --nocapture
+#[test]
+#[ignore = "needs qwen3.5:latest in the store, idle CUDA cards and a reference run"]
+fn qwen35_generic_route_matches_the_reference() {
+    generic_route_matches_the_reference(
+        "qwen3.5:latest",
+        &["qwen35", "qwen35moe"],
+        "LOKEN_QWEN35_REFERENCE",
+        "qwen35_latest_greedy.json",
+    );
+}
+
+/// qwen3-next (packed beta/alpha projection) through the generic route decodes greedily
+/// what the reference decoded.
+///
+/// Ignored by default: it needs qwen3next:latest in the store, the CUDA cards idle, and a
+/// reference run recorded as `reference_run` says. Run with
+///   LOKEN_QWEN3NEXT_REFERENCE=/path/to/reference.json cargo test --release --lib \
+///     qwen3next_generic_route_matches_the_reference -- --ignored --nocapture
+#[test]
+#[ignore = "needs qwen3next:latest in the store, idle CUDA cards and a reference run"]
+fn qwen3next_generic_route_matches_the_reference() {
+    generic_route_matches_the_reference(
+        "qwen3next:latest",
+        &["qwen3next"],
+        "LOKEN_QWEN3NEXT_REFERENCE",
+        "qwen3next_latest_greedy.json",
+    );
+}
