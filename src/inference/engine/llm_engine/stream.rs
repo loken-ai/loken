@@ -1796,6 +1796,14 @@ impl LlmEngine {
                         next_token_dev = dev_tok;
                         continue 'stream_loop;
                     }
+                    // The graph's forwards append to the cache on the card without advancing
+                    // its host length; an eager step after them starts where they left it.
+                    #[cfg(feature = "cuda")]
+                    if graph_warmed {
+                        if let Some(s) = model_state.blocking_lock().as_mut() {
+                            s.model.sync_kv_len_for_graph(pos);
+                        }
+                    }
 
                     // --- PLD or normal streaming forward ---------------
                     // Adaptive PLD: skip if in cooldown or disabled, or if a
@@ -2012,34 +2020,19 @@ impl LlmEngine {
                         };
 
                     if let Some((committed_tokens, new_next, new_pos, new_next_dev)) = pld_result {
-                        // Stream committed tokens (next_token streams at top of next iter).
-                        // Cumulative-decode to preserve leading spaces.
+                        // Stream committed tokens (next_token streams at top of next iter),
+                        // through the same detokenizer as the plain steps.
                         for &tok in &committed_tokens {
                             if ends(tok) || token_count >= max_tokens {
                                 break 'stream_loop;
                             }
                             generated_token_ids.push(tok);
-                            let cumulative = stream_tokenizer
-                                .decode(&generated_token_ids, skip_special_tokens)
-                                .unwrap_or_default();
-                            let chunk_text = if cumulative.len() >= sent_text_len {
-                                // Char-boundary-safe delta: a multi-token commit (PLD /
-                                // spec-decode commits several tokens at once) can COMPLETE a
-                                // multi-byte char (e.g. an emoji) whose bytes differ from the
-                                // previous step's partial decode, so `sent_text_len` can land
-                                // INSIDE a char in the new `cumulative` - slicing there panics
-                                // ("byte index N is not a char boundary"). Back off to the
-                                // nearest char boundary <= sent_text_len before slicing.
-                                let mut start = sent_text_len;
-                                while start > 0 && !cumulative.is_char_boundary(start) {
-                                    start -= 1;
-                                }
-                                cumulative[start..].to_string()
-                            } else {
-                                // rewound - `sent_text_len = cumulative.len()` below covers it
-                                cumulative.clone()
-                            };
-                            sent_text_len = cumulative.len();
+                            let chunk_text = detok.borrow_mut().step(
+                                &stream_tokenizer,
+                                &generated_token_ids,
+                                skip_special_tokens,
+                            );
+                            sent_text_len += chunk_text.len();
 
                             if stop_tracker.is_active() {
                                 let is_stop =

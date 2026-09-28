@@ -1357,6 +1357,13 @@ impl LlmEngine {
                         }
                     }
 
+                    // The graph's forwards append to the cache on the card without advancing
+                    // its host length; an eager step after them starts where they left it.
+                    #[cfg(feature = "cuda")]
+                    if graph_warmed {
+                        state.model.sync_kv_len_for_graph(pos);
+                    }
+
                     // Prompt-lookup / n-gram speculative decoding.
                     //
                     // Try to draft K tokens from the rolling token buffer.

@@ -838,22 +838,16 @@ fn build_generic_layer(
                     None,
                     None,
                 ),
-                // SiLU experts apart beside a shared expert or behind a sigmoid router: every
-                // path reads the two stacks as stored, so no fused stack or host cache is
-                // built beside them.
-                (None, Some(ge), Some(ue))
-                    if !flags.use_gelu
-                        && (raw.shexp_up.is_some() || config.expert_sigmoid_gating) =>
-                {
-                    (
-                        None,
-                        None,
-                        true,
-                        true,
-                        Some(std::sync::Arc::new(coerce_moe_weight(ge, device)?)),
-                        Some(std::sync::Arc::new(coerce_moe_weight(ue, device)?)),
-                    )
-                }
+                // A SiLU mixture reads gate and up apart on every path, card and host, in
+                // their stored format: nothing else is built for it.
+                (None, Some(ge), Some(ue)) if !flags.use_gelu => (
+                    None,
+                    None,
+                    true,
+                    true,
+                    Some(std::sync::Arc::new(coerce_moe_weight(ge, device)?)),
+                    Some(std::sync::Arc::new(coerce_moe_weight(ue, device)?)),
+                ),
                 (None, Some(ge), Some(ue)) => {
                     let ge_f = ge.dequantize(&Device::Cpu)?;
                     let ue_f = ue.dequantize(&Device::Cpu)?;
@@ -2837,17 +2831,19 @@ impl GenericHeteroTransformer {
             spliced_vision,
         };
 
-        // A SiLU MoE runs its prefill experts on the host, and that loop reads its weights
-        // through a repacked layout derived from the stacks rather than stored with them. It
-        // is built on first use, which is inside the first request - for a 16-layer, 64-expert
-        // model, seconds of it. Build it here instead, on a thread of its own: the load does
-        // not wait for it, so a model answers exactly as early as before, and a request that
-        // arrives while it is still running waits on the stack being built and is handed that
-        // result rather than repacking the same stack beside it.
+        // A SiLU MoE layer on the host runs its experts through a repacked layout derived
+        // from the stacks rather than stored with them. It is built on first use, which is
+        // inside the first request - for a 16-layer, 64-expert model, seconds of it. Build it
+        // here instead, on a thread of its own: the load does not wait for it, so a model
+        // answers exactly as early as before, and a request that arrives while it is still
+        // running waits on the stack being built and is handed that result rather than
+        // repacking the same stack beside it. A layer on a card never reads that layout.
         let host_prefill_stacks: Vec<_> = model
             .layers
             .iter()
-            .filter_map(|layer| layer.moe.as_ref())
+            .zip(model.layer_devs.iter())
+            .filter(|(_, dev)| matches!(dev, LayerDevice::Cpu))
+            .filter_map(|(layer, _)| layer.moe.as_ref())
             .flat_map(|moe| moe.host_prefill_stacks())
             .collect();
         if !host_prefill_stacks.is_empty() {
