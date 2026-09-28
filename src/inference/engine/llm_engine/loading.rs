@@ -79,13 +79,18 @@ impl ModelDims {
             .saturating_mul(self.head_dim as u64)
             .saturating_mul(kv_ctx)
             .saturating_mul(self.num_layers as u64);
+        kv.saturating_add(self.work_reserve())
+    }
+
+    /// What a card keeps free beside the weights and the cache: the cuBLAS workspace and
+    /// the activations of one prefill chunk.
+    pub(crate) fn work_reserve(&self) -> u64 {
         let widest = self.hidden_size.max(self.num_kv_heads * self.head_dim) as u64;
         let act = (PREFILL_CHUNK_TOKENS as u64)
             .saturating_mul(widest)
             .saturating_mul(4)
             .saturating_mul(2);
-        kv.saturating_add(CUBLAS_WORKSPACE_BYTES)
-            .saturating_add(act)
+        CUBLAS_WORKSPACE_BYTES.saturating_add(act)
     }
 }
 
@@ -1479,46 +1484,26 @@ impl LlmEngine {
                         * head_dim as u64
                         * avg_ctx_per_layer
                         * kv_dtype_bytes;
-                    // Per-GPU runtime headroom the weights number doesn't include:
-                    // the cuBLAS handle/workspace + the chunked-prefill activation
-                    // peak. Reserving it on each card stops the pack-first planner
-                    // from committing a GPU's last few hundred MB that the first
-                    // request then needs (devstral 14.3 GB packed GPU0 -> 436 MB
-                    // free -> cuBLAS init OOM, GPU1 idle). The KV cache itself is
-                    // already accounted per-layer via `kv_bytes_per_layer`.
-                    let gpu_runtime_reserve: u64 = {
-                        const CUBLAS_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024; // ~512 MB
-                        let widest = hidden_size.max(num_kv_heads * head_dim) as u64;
-                        let act = (PREFILL_CHUNK_TOKENS as u64)
-                            .saturating_mul(widest)
-                            .saturating_mul(4)
-                            .saturating_mul(2);
-                        CUBLAS_WORKSPACE_BYTES.saturating_add(act)
+                    // What the model asks of the cards; the ladder in `place` turns it into a
+                    // plan, whole on one card when it fits there, and recovers from running out
+                    // of card memory. A pinned card is offered first.
+                    let (block_bytes, head_bytes) = generic_weights
+                        .block_and_head_bytes(&content)
+                        .unwrap_or((file_size, 0));
+                    let demand = crate::inference::place::ladder::Demand {
+                        layers: num_layers,
+                        block_bytes,
+                        head_bytes,
+                        kv_bytes_per_layer,
+                        runtime_reserve: dims.work_reserve(),
                     };
-                    let hetero_plan = if model_fits_single_gpu && cuda_available {
-                        // Weights + KV reserve fit ONE GPU -> keep ALL layers on gpu_idx
-                        // (single-GPU decode win) instead of letting the planner spread
-                        // a fits-1-GPU model across 2 GPUs + CPU, which eats cross-device
-                        // sync every layer (e.g. devstral 24B: 14.3 GB fits 15.6 GB but
-                        // calculate_with_kv_reserve still planned 2 segments -> -4% vs
-                        // ollama's clean single GPU). Mirrors the lfm2moe/gpt-oss/deepcoder
-                        // single-GPU path. The OOM-adaptive ladder below reacts (forced
-                        // even split, then CPU) if a real prefill OOM surfaces, so this
-                        // optimism can't mis-size.
-                        HeteroPlan::forced_gpu(num_layers, num_layers, gpu_idx)
-                    } else {
-                        let (block_bytes, head_bytes) = generic_weights
-                            .block_and_head_bytes(&content)
-                            .unwrap_or((file_size, 0));
-                        HeteroPlan::calculate_holding_head(
-                            num_layers,
-                            block_bytes,
-                            head_bytes,
-                            &cuda_devices,
-                            kv_bytes_per_layer,
-                            gpu_runtime_reserve,
-                        )
-                    };
+                    let mut ranked_cards = cuda_devices.clone();
+                    if let Some(pin) = device_index {
+                        if let Some(at) = ranked_cards.iter().position(|(i, _)| *i == pin) {
+                            let card = ranked_cards.remove(at);
+                            ranked_cards.insert(0, card);
+                        }
+                    }
                     // Create CUDA devices for ALL detected GPUs, not just
                     // those the planner picked. The loader's per-layer
                     // adaptive placement (see generic_transformer
@@ -1612,99 +1597,34 @@ impl LlmEngine {
                     // separate rms_norm+mmvq fallback is correct. So the CPU-route
                     // guard is no longer needed - qwen2.5:0.5b now runs coherently
                     // on GPU at ~280 tok/s (was CPU-routed ~27).
-                    let mmvq_race_arch = false;
-                    if mmvq_race_arch && !hetero_cuda_devs.is_empty() {
-                        warn!("⚠️  {} (arch={}, hidden_size={}) triggers the non-512-K CUDA mmvq async race that crashes the server; routing entirely to CPU (coherent, no race).",
-                            model_id_clone, arch, hidden_size);
-                        load_generic_on_cpu(&generic_weights, &arch, num_layers, file_size,
-                            projector_blob.as_deref())?
-                    } else {
-                    match generic_weights.build(
-                        &hetero_cuda_devs, &hetero_plan, kv_quant, Some(effective_ctx),
-                    ) {
-                        Ok(m) => {
-                            let placement = hetero_plan
+                    let model = crate::inference::place::ladder::load_placed(
+                        &arch,
+                        &demand,
+                        &ranked_cards,
+                        || false,
+                        |plan| {
+                            // The host keeps an unquantised cache sized by the model.
+                            let host_only = plan.segments.iter().all(|s| {
+                                matches!(s.kind, crate::inference::place::layer_executor::DeviceKind::Cpu)
+                            });
+                            let (kv, ctx) = if host_only {
+                                (KvQuant::Off, None)
+                            } else {
+                                (kv_quant, Some(effective_ctx))
+                            };
+                            let m = generic_weights.build(&hetero_cuda_devs, plan, kv, ctx)?;
+                            let placement = plan
                                 .segments
                                 .iter()
                                 .map(|s| format!("{}:{}-{}", s.kind, s.layer_start, s.layer_end))
                                 .collect::<Vec<_>>()
                                 .join(", ");
-                            info!("✅ {arch} loaded: layers {placement} (kv_quant={kv_quant:?}, kv_ctx={effective_ctx})");
-                            try_wrap_with_vision(m, projector_blob.as_deref())?
-                        }
-                        // Tier 2: OOM on an optimistic placement that did NOT
-                        // already span every CUDA device -> retry forced split.
-                        Err(e) if is_cuda_oom(&e)
-                            && cuda_devices.len() > 1
-                            && hetero_plan.segments.iter()
-                                .filter(|s| matches!(s.kind, crate::inference::place::layer_executor::DeviceKind::Cuda(_)))
-                                .count() < cuda_devices.len() =>
-                        {
-                            warn!("GenericHetero OOM on optimistic placement ({e}); retrying with forced {}-GPU split",
-                                cuda_devices.len());
-                            // Return the failed attempt's pool-held memory
-                            // before retrying (see load_generic_hybrid_or_cpu).
-                            #[cfg(feature = "cuda")]
-                            release_cuda_pools();
-                            let split_plan = HeteroPlan::split_across_cuda(num_layers, &cuda_devices);
-                            match generic_weights.build(
-                                &hetero_cuda_devs, &split_plan, kv_quant, Some(effective_ctx),
-                            ) {
-                                Ok(m) => {
-                                    info!("✅ {} loaded after OOM-recovery: forced {}-GPU split ({} segments)",
-                                        arch, cuda_devices.len(), split_plan.segments.len());
-                                    try_wrap_with_vision(m, projector_blob.as_deref())?
-                                }
-                                Err(e2) => {
-                                    warn!("Forced-split retry also failed ({e2}); trying GPU+CPU hybrid before CPU");
-                                    load_generic_hybrid_or_cpu(
-                                        &generic_weights, &arch, num_layers, file_size,
-                                        &cuda_devices, &hetero_cuda_devs, kv_bytes_per_layer,
-                                        kv_quant, effective_ctx, projector_blob.as_deref())?
-                                }
-                            }
-                        }
-                        // Tier 2.5: OOM with a full-GPU plan (the forced-split
-                        // Tier 2 above didn't apply because the plan already used
-                        // all GPUs). The fill-first planner OVER-PACKS the first
-                        // GPU (deepseek-r1:32b: GPU0 got 47/64 layers, GPU1 18 ->
-                        // GPU0 OOMs at load). Retry with an EVEN split across GPUs
-                        // (`split_across_cuda`, ~balanced layer count) so neither
-                        // GPU is over-packed - vastly better than the all-CPU Tier
-                        // 3 (deepseek-r1:32b: 1.1 tok/s all-CPU -> GPU-resident).
-                        Err(e) if is_cuda_oom(&e) && cuda_devices.len() > 1 => {
-                            warn!("GenericHetero OOM with fill-first full-GPU plan ({e}); retrying with an EVEN {}-GPU split", cuda_devices.len());
-                            // Return the failed attempt's pool-held memory
-                            // before retrying (see load_generic_hybrid_or_cpu).
-                            #[cfg(feature = "cuda")]
-                            release_cuda_pools();
-                            let even_plan = HeteroPlan::split_across_cuda(num_layers, &cuda_devices);
-                            match generic_weights.build(
-                                &hetero_cuda_devs, &even_plan, kv_quant, Some(effective_ctx),
-                            ) {
-                                Ok(m) => {
-                                    info!("✅ {} recovered via EVEN {}-GPU split ({} segments)",
-                                        arch, cuda_devices.len(), even_plan.segments.len());
-                                    try_wrap_with_vision(m, projector_blob.as_deref())?
-                                }
-                                Err(e2) => {
-                                    warn!("Even-split retry also failed ({e2}); trying GPU+CPU hybrid before CPU");
-                                    load_generic_hybrid_or_cpu(
-                                        &generic_weights, &arch, num_layers, file_size,
-                                        &cuda_devices, &hetero_cuda_devs, kv_bytes_per_layer,
-                                        kv_quant, effective_ctx, projector_blob.as_deref())?
-                                }
-                            }
-                        }
-                        // Tier 3: any other failure (non-OOM, single-GPU box,
-                        // or split already exhausted) -> CPU.
-                        Err(e) => {
-                            warn!("GenericHetero load failed: {e}, retrying on CPU only");
-                            load_generic_on_cpu(&generic_weights, &arch, num_layers, file_size,
-                                projector_blob.as_deref())?
-                        }
-                    }
-                    }
+                            info!("✅ {arch} loaded: layers {placement} (kv_quant={kv:?}, kv_ctx={ctx:?})");
+                            Ok::<_, crate::tensor::Error>(m)
+                        },
+                    )
+                    .map_err(|e| anyhow!("Failed to load {arch}: {e}"))?;
+                    try_wrap_with_vision(model, projector_blob.as_deref())?
                 }
                 other => {
                     let err_msg = format!(

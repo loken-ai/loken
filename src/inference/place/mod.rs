@@ -8,6 +8,7 @@ pub mod audio_demand;
 pub mod device_probe;
 pub mod dry_plan;
 pub mod fit_report;
+pub mod ladder;
 pub mod layer_executor;
 pub mod layer_perf;
 pub mod model_request;
@@ -62,11 +63,18 @@ mod placement_tests {
     use super::*;
 
     fn card(index: usize, perf: u64, available: u64) -> CardRoom {
-        CardRoom { index, perf, available }
+        CardRoom {
+            index,
+            perf,
+            available,
+        }
     }
 
     fn on(cards: &[usize], host_layers: usize) -> Placement {
-        Placement { cards: cards.iter().copied().collect(), host_layers }
+        Placement {
+            cards: cards.iter().copied().collect(),
+            host_layers,
+        }
     }
 
     #[test]
@@ -74,7 +82,10 @@ mod placement_tests {
         let cards = [card(0, 2, 10), card(1, 1, 0)];
         assert_eq!(on(&[1], 0).better_card(&cards, 8), Some(0));
         assert_eq!(on(&[1], 0).better_card(&cards, 12), None);
-        assert_eq!(on(&[0], 0).better_card(&[card(0, 2, 0), card(1, 1, 16)], 8), None);
+        assert_eq!(
+            on(&[0], 0).better_card(&[card(0, 2, 0), card(1, 1, 16)], 8),
+            None
+        );
     }
 
     #[test]
