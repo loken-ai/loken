@@ -861,105 +861,6 @@ impl LlmEngine {
                         }
                     }
                 }
-                // Generic transformer: Qwen2/3, Gemma3, Phi3, GLM4, StableLM, etc.
-                // Supports CUDA + CPU multi-device via HeteroPlan.
-                // All text LLMs go through GenericHetero for multi-device support.
-                // This replaces the old QuantizedLlama single-device path for llama/mistral.
-                // Qwen3-MoE (qwen3-coder etc): sparse MoE FFN. Handled by a
-                // dedicated loader because weight names differ (ffn_gate_exps,
-                // ffn_up_exps, ffn_down_exps, ffn_gate_inp) and the forward
-                // routes via top-k experts.
-                "qwen3moe" => {
-                    // Prefer our multi-device loader to handle 30B-A3B-class
-                    // models that overflow a single GPU. On a CPU-only build the
-                    // MoE GEMM + attention take their fallback CPU paths (plain
-                    // F-dtype KV; the Q8/Q4 KV fast paths are CUDA-only).
-                    let dtype = crate::tensor::DType::F16;
-                    // cuda_devices is Vec<(gpu_idx, free_mem_bytes)> - iterate
-                    // sorted by idx so layer-split is deterministic.
-                    let mut gpu_ids: Vec<usize> = cuda_devices.iter().map(|(i, _)| *i).collect();
-                    gpu_ids.sort_unstable();
-                    // Per-device throughput weights for proportional layer
-                    // placement. Disabled: uniform split is optimal for
-                    // typical homogeneous-tier multi-GPU setups and avoids
-                    // the pipeline-bottleneck failure mode when per-layer
-                    // cost is launch/scheduling-bound rather than
-                    // throughput-bound.
-                    let weights_enabled = false;
-                    let manual_weights: Option<Vec<f32>> = None;
-                    let device_weights: Option<Vec<f32>> = if let Some(w) = manual_weights {
-                        info!("📐 qwen3moe placement RATIO (manual): {:?}", w);
-                        Some(w)
-                    } else if !weights_enabled {
-                        None
-                    } else {
-                        match nvml_wrapper::Nvml::init() {
-                            Ok(nvml) => {
-                                use nvml_wrapper::enum_wrappers::device::Clock;
-                                let mut ws = Vec::with_capacity(gpu_ids.len());
-                                let mut all_ok = true;
-                                for &idx in &gpu_ids {
-                                    match nvml.device_by_index(idx as u32) {
-                                        Ok(d) => {
-                                            let sm_count = d.num_cores().unwrap_or(0) as f32;
-                                            let clock = d.max_clock_info(Clock::SM).unwrap_or(0) as f32;
-                                            ws.push((sm_count.max(1.0)) * (clock.max(1.0)));
-                                        }
-                                        Err(_) => { all_ok = false; break; }
-                                    }
-                                }
-                                if all_ok && ws.len() == gpu_ids.len() {
-                                    let total: f32 = ws.iter().sum();
-                                    let pct: Vec<String> = ws.iter()
-                                        .map(|w| format!("{:.0}%", w / total * 100.0))
-                                        .collect();
-                                    info!("📐 qwen3moe placement weights (opt-in): {:?} ({})", ws, pct.join("/"));
-                                    Some(ws)
-                                } else { None }
-                            }
-                            Err(_) => None,
-                        }
-                    };
-                    let mut gpu_list: Vec<Device> = Vec::new();
-                    for idx in &gpu_ids {
-                        // Default (NULL) stream rather than `new_with_stream`
-                        // so that an external kernel's C bindings - which
-                        // hard-code `cudaStream_t stream = 0` - order
-                        // correctly against cudarc allocs. With a custom
-                        // stream, the FA kernel on NULL races with the
-                        // cudaMallocAsync on our stream and produces NaN
-                        // output on the first layer.
-                        match Device::new_cuda(*idx) {
-                            Ok(d) => gpu_list.push(d),
-                            Err(e) => warn!("Skipping GPU {idx}: {e}"),
-                        }
-                    }
-                    if gpu_list.is_empty() {
-                        // No usable CUDA device (or a CPU-only build) -> run on CPU.
-                        gpu_list.push(Device::Cpu);
-                    }
-                    info!("⬇️  Loading qwen3moe across {} device(s) via MultiDeviceQwen3MoE",
-                        gpu_list.len());
-                    let content_fresh = gguf_file::Content::read_mapped(&mut Cursor::new(mmap_bytes), mmap.clone())
-                        .map_err(|e| anyhow!("GGUF re-parse failed: {e}"))?;
-                    let weights_ref = device_weights.as_deref()
-                        .filter(|w| w.len() == gpu_list.len());
-                    match crate::inference::model::qwen3::moe_multi::MultiDeviceQwen3MoE::from_gguf_mmap_full(
-                        content_fresh,
-                        mmap_bytes,
-                        &gpu_list,
-                        weights_ref,
-                        dtype,
-                        kv_quant,
-                        Some(user_context_length.min(context_length)),
-                    ) {
-                        Ok(m) => {
-                            info!("✅ qwen3moe loaded across {} GPUs (kv_quant={:?})", gpu_list.len(), kv_quant);
-                            Box::new(QwenMoEMultiBackend(m))
-                        }
-                        Err(e) => return Err(anyhow!("MultiDeviceQwen3MoE load failed: {e}")),
-                    }
-                }
                 "gptoss" => {
                     // gpt-oss (OPENAI_MOE): MXFP4 MoE + attention sinks +
                     // sliding-window + NEOX RoPE. The MXFP4 experts are kept
@@ -1311,7 +1212,7 @@ impl LlmEngine {
                     }
                 }
                 "llama" | "mistral" | "mistral3" |
-                "qwen2" | "qwen3" | "gemma" | "gemma2" | "gemma3" |
+                "qwen2" | "qwen3" | "qwen3moe" | "gemma" | "gemma2" | "gemma3" |
                 "gemma3n" | "gemma4" |
                 "phi" | "phi2" | "phi3" | "phi4" | "chatglm" | "glm4" | "stablelm" | "starcoder" |
                 "starcoder2" | "falcon" | "bloom" | "mpt" | "refact" | "codeshell" |

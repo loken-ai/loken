@@ -844,14 +844,6 @@ pub(crate) struct GenericVisionBackend {
     pub vision: VisionTower,
 }
 
-/// Multi-GPU Qwen3-MoE - layer-split across CUDA devices. Required for
-/// 30B+ MoE models that don't fit on a single GPU (multi-GPU layer split).
-/// Also runs on CPU: the MoE GEMM has a fallback CPU path and the attention
-/// uses the plain F-dtype KV cache (the Q8/Q4 KV fast paths are CUDA-only).
-pub(crate) struct QwenMoEMultiBackend(
-    pub crate::inference::model::qwen3::moe_multi::MultiDeviceQwen3MoE,
-);
-
 /// gpt-oss (OPENAI_MOE): MXFP4 MoE transformer with attention sinks +
 /// sliding-window + NEOX RoPE. Single-device for now. (CUDA-only: MoE GEMM.)
 pub(crate) struct GptOssBackend(pub crate::inference::model::gptoss::GptOssModel);
@@ -1088,7 +1080,6 @@ pub(crate) struct TakenBackend;
 unsafe impl Send for MoondreamBackend {}
 unsafe impl Send for GenericBackend {}
 unsafe impl Send for GenericVisionBackend {}
-unsafe impl Send for QwenMoEMultiBackend {}
 unsafe impl Send for GptOssBackend {}
 unsafe impl Send for NemotronHBackend {}
 unsafe impl Send for Lfm2MoeBackend {}
@@ -1568,50 +1559,6 @@ impl ModelBackend for GenericVisionBackend {
     ) -> crate::tensor::Result<Tensor> {
         self.text
             .forward_with_image_embeds(bos_token, text_input, image_embeds)
-    }
-
-    take_generic_passthrough!();
-}
-
-impl ModelBackend for QwenMoEMultiBackend {
-    fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.0.forward(x, index_pos)
-    }
-
-    fn forward_all(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.0.forward_all(x, index_pos)
-    }
-
-    fn trim_kv(&mut self, new_len: usize) {
-        self.0.trim_kv(new_len)
-    }
-
-    fn kv_len(&self) -> Option<usize> {
-        self.0.kv_len()
-    }
-
-    fn reset_kv_from(&mut self, keep: usize) {
-        self.0.trim_kv(keep)
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        // MoE PLD: OFF - verify cost > accept gain on GGUF MoE. RE-MEASURED
-        // Marlin: qwen3-coder code-gen reaches a high
-        // 48-62% n-gram acceptance, yet enabling PLD dropped it 166 -> 108 tok/s
-        // (-23.7% vs ollama, high variance). 's cheap small-M verify is the
-        // AWQ/Marlin path; GGUF MoE verify still runs the slow `moe_gemm_gguf`
-        // small-batch forward, so each multi-position verify costs more than the
-        // accepted tokens save. Needs a cheap GGUF-MoE small-batch verify kernel
-        // (or AWQ weights) before PLD pays on MoE.
-        Capabilities {
-            trim_kv: true,
-            pld: false,
-            ..Capabilities::default()
-        }
-    }
-
-    fn device_layer_distribution(&self) -> Vec<(String, usize, u32, u32)> {
-        group_layers_by_device(self.0.layer_device_locations())
     }
 
     take_generic_passthrough!();

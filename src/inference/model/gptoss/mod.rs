@@ -7,11 +7,8 @@
 //! attention target that absorbs probability mass (lowering attention to real
 //! tokens) but contributes no value - it has no corresponding K/V.
 //!
-//! This module currently provides the novel numerical primitive (sink-aware
-//! softmax). The full multi-device loader (`gptoss_multi.rs`, modeled on
-//! `inference/model/qwen3/moe_multi.rs`) composes this with existing MoE / sliding-window /
-//! YaRN building blocks; it is built as one complete unit before being wired
-//! into the engine dispatch.
+//! This module provides the sink-aware softmax and the model built on it, composed with
+//! the MoE, sliding-window and YaRN building blocks.
 
 use crate::inference::fused_moe::FusedMoeGGUF;
 use crate::tensor::layer::Embedding;

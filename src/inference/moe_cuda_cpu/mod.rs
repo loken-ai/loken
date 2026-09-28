@@ -1840,7 +1840,7 @@ pub fn topk_softmax(
 }
 
 // -- fused decode kernels (CUDA-only optimizations; CPU uses the slow path) --
-// In qwen3_moe_multi these fire ONLY under `... && device.is_cuda()` guards, so on
+// Their callers fire them ONLY under `... && device.is_cuda()` guards, so on
 // a CPU build they're dead code that must still type-check. `add_rms_norm` is
 // trivially correct so we implement it; the two `attn_post_qkv_decode*` fused
 // q-norm+RoPE kernels have CUDA-specific layout/RoPE-style assumptions, so rather
