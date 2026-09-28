@@ -522,10 +522,9 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
                         // like any other control token dropped it before `ThinkSplit` could
                         // find a delimiter, and a reasoning model then delivered its chain
                         // of thought as the answer.
-                        let parsed_by_the_api =
-                            crate::api::thinking::SPLIT_MARKERS.contains(&token_str.as_str())
-                                || crate::api::tool_calls::TOOL_MARKERS
-                                    .contains(&token_str.as_str());
+                        let parsed_by_the_api = crate::api::thinking::SPLIT_MARKERS
+                            .contains(&token_str.as_str())
+                            || crate::api::tool_calls::TOOL_MARKERS.contains(&token_str.as_str());
                         let special = *type_id != 4 && !parsed_by_the_api;
                         special_tokens.push(tokenizers::AddedToken::from(token_str, special));
                     }
@@ -953,20 +952,43 @@ mod spm_vocabulary_tests {
         ids.extend_from_slice(tok.encode(",", false).expect("encode").get_ids());
 
         let whole = tok.decode(&ids, true).expect("decode");
+        let mut detok = crate::inference::engine::decode_step::StreamDetokenizer::default();
         let mut streamed = String::new();
         for n in 1..=ids.len() {
-            streamed.push_str(
-                &crate::inference::engine::decode_step::incremental_chunk_text(
-                    &tok,
-                    &ids[..n],
-                    true,
-                ),
-            );
+            streamed.push_str(&detok.step(&tok, &ids[..n], true));
         }
+        streamed.push_str(&detok.finish(&tok, &ids, true));
         assert_eq!(
             streamed, whole,
             "streaming assembly diverges from batch decode"
         );
+    }
+
+    /// A character whose bytes arrive as several byte-fallback tokens streams whole: the
+    /// partial bytes are held back until the last one arrives, not sent as U+FFFD.
+    #[test]
+    fn a_character_split_over_byte_tokens_streams_whole() {
+        let Some(tok) = ernie() else {
+            return;
+        };
+        let mut ids: Vec<u32> = tok
+            .encode("smile", false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        for p in ["<0xF0>", "<0x9F>", "<0x98>", "<0x80>"] {
+            ids.push(tok.token_to_id(p).unwrap_or_else(|| panic!("no piece {p}")));
+        }
+        ids.extend_from_slice(tok.encode(" ok", false).expect("encode").get_ids());
+        let whole = tok.decode(&ids, true).expect("decode");
+        let mut detok = crate::inference::engine::decode_step::StreamDetokenizer::default();
+        let mut chunks = Vec::new();
+        for n in 1..=ids.len() {
+            chunks.push(detok.step(&tok, &ids[..n], true));
+        }
+        chunks.push(detok.finish(&tok, &ids, true));
+        assert!(chunks.iter().all(|c| !c.contains('\u{FFFD}')), "{chunks:?}");
+        assert_eq!(chunks.concat(), whole);
     }
 
     /// The incremental decode must honour the flag it is handed rather than assume one.
@@ -991,16 +1013,12 @@ mod spm_vocabulary_tests {
         }
         for skip in [true, false] {
             let whole = tok.decode(&ids, skip).expect("decode");
+            let mut detok = crate::inference::engine::decode_step::StreamDetokenizer::default();
             let mut streamed = String::new();
             for n in 1..=ids.len() {
-                streamed.push_str(
-                    &crate::inference::engine::decode_step::incremental_chunk_text(
-                        &tok,
-                        &ids[..n],
-                        skip,
-                    ),
-                );
+                streamed.push_str(&detok.step(&tok, &ids[..n], skip));
             }
+            streamed.push_str(&detok.finish(&tok, &ids, skip));
             assert_eq!(
                 streamed, whole,
                 "streaming assembly diverges from batch decode with skip_special={skip}"

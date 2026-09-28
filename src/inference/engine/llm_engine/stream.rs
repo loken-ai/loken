@@ -1065,6 +1065,8 @@ impl LlmEngine {
             // the new suffix beyond what was previously sent. `sent_text_len`
             // tracks how many chars of the cumulative decoded text have been
             // forwarded to the client.
+            // One detokenizer for the plain steps and the PLD commits alike.
+            let detok = std::cell::RefCell::new(StreamDetokenizer::default());
             let stream_token = |token: u32,
                                 token_count: &mut usize,
                                 generated_token_ids: &mut Vec<u32>,
@@ -1078,15 +1080,10 @@ impl LlmEngine {
                 generated_token_ids.push(token);
                 recent_tokens.push(token);
 
-                // Incremental decode (2-token sliding window,
-                // decode_step::incremental_chunk_text). The original
-                // implementation called `tokenizer.decode(ALL)` every iter  -
-                // O(N) per call -> O(N²) over the stream. For 64 tokens that's
-                // ~2080 token-decode operations; on moondream stream-mode this
-                // CPU work added ~80ms of overhead (~50% of total wall),
-                // making stream tok/s look ~30pp worse than non-stream tok/s.
                 let chunk_text =
-                    incremental_chunk_text(tokenizer, generated_token_ids, skip_special_tokens);
+                    detok
+                        .borrow_mut()
+                        .step(tokenizer, generated_token_ids, skip_special_tokens);
                 *sent_text_len += chunk_text.len();
 
                 if *token_count < 10 {
@@ -1426,7 +1423,7 @@ impl LlmEngine {
                             }
                             generated_token_ids.push(tok);
 
-                            let chunk_text = incremental_chunk_text(
+                            let chunk_text = detok.borrow_mut().step(
                                 &stream_tokenizer,
                                 &generated_token_ids,
                                 skip_special_tokens,
@@ -2236,6 +2233,18 @@ impl LlmEngine {
                     pld_stats_drafted,
                     accept_rate * 100.0
                 );
+            }
+            // A character still held back is sent now that no token will complete it; a
+            // stream that stopped on a stop sequence sends nothing past it.
+            if stop_tracker.matched().is_none() {
+                let tail = detok.borrow().finish(
+                    &stream_tokenizer,
+                    &generated_token_ids,
+                    skip_special_tokens,
+                );
+                if !tail.is_empty() {
+                    let _ = tx.blocking_send(Ok(tail));
+                }
             }
             info!("🏁 Streaming generation complete: {} tokens", token_count);
             if !generated_token_ids.is_empty() && generated_token_ids.len() <= 50 {

@@ -1,6 +1,6 @@
 use crate::inference::engine::decode_step::{
-    incremental_chunk_text, pld_verify_commit, pld_window_update, resolve_gen_params,
-    sample_row_sync, spec_draft_lockstep, ResolvedGenParams, StopTracker,
+    pld_verify_commit, pld_window_update, resolve_gen_params, sample_row_sync, spec_draft_lockstep,
+    ResolvedGenParams, StopTracker, StreamDetokenizer,
 };
 #[cfg(feature = "cuda")]
 use crate::inference::engine::model_backend::TpQwen2Backend;
@@ -396,19 +396,19 @@ impl LlmEngine {
         let Some(PlannedDrafter { id, room }) = planned else {
             return;
         };
-        let (spills, verifies) = self
-            .model_state
-            .lock()
-            .await
-            .as_ref()
-            .map_or((false, false), |s| {
-                let spills = s
-                    .model
-                    .device_layer_distribution()
-                    .iter()
-                    .any(|(dev, ..)| dev == "CPU");
-                (spills, s.model.capabilities().pld)
-            });
+        let (spills, verifies) =
+            self.model_state
+                .lock()
+                .await
+                .as_ref()
+                .map_or((false, false), |s| {
+                    let spills = s
+                        .model
+                        .device_layer_distribution()
+                        .iter()
+                        .any(|(dev, ..)| dev == "CPU");
+                    (spills, s.model.capabilities().pld)
+                });
         // The drafter's own placement must see the room, not the demand holding it.
         drop(room);
         if !spills {
@@ -438,7 +438,10 @@ impl LlmEngine {
             let _ = nested.unload().await;
             return;
         }
-        info!("{} spills to the host: {id} drafts for it", self.config.model_id);
+        info!(
+            "{} spills to the host: {id} drafts for it",
+            self.config.model_id
+        );
         *self.draft_engine.lock().await = Some(Arc::new(nested));
         *self.draft_length.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         *self
@@ -1261,8 +1264,8 @@ use std::time::Instant;
 
 mod batching;
 mod decode_choice;
-pub(crate) use decode_choice::DecodeMode;
 pub use batching::ActiveRequest;
+pub(crate) use decode_choice::DecodeMode;
 mod discover;
 mod embed;
 mod generate;

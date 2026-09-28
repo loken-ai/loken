@@ -9,8 +9,8 @@
 //! - [`resolve_gen_params`]: per-request parameter resolution (request
 //!   overrides -> config defaults, max_tokens clamped to the KV window).
 //! - [`StopTracker`]: rolling stop-sequence suffix buffer.
-//! - [`incremental_chunk_text`]: O(1) 2-token sliding-window detokenize for
-//!   streamed chunks.
+//! - [`StreamDetokenizer`]: incremental detokenize for streamed chunks, holding back an
+//!   incomplete multi-byte character until a later token completes it.
 //! - [`sample_row_sync`]: the GPU-argmax-or-CPU-sampler dispatch.
 //! - [`pld_verify_commit`]: the commit-delayed PLD/spec-draft verification
 //!   loop (sample every position of the multi-token verify forward, accept
@@ -135,38 +135,66 @@ impl StopTracker {
     }
 }
 
-/// Incremental detokenize for streaming (2-token sliding window).
+/// Incremental detokenizer for streaming.
 ///
-/// Decoding the full cumulative sequence every iter is O(N) per call -> O(N²)
-/// over the stream; decoding a lone token loses leading spaces with
-/// Metaspace/SentencePiece tokenizers. Decode `[prev_token, this_token]` and
-/// subtract `[prev_token]` to get just this token's contribution - preserves
-/// the space/metaspace boundary at O(1) work per iter.
-/// `skip_special` travels with the caller rather than being assumed here. It used to be
-/// hardcoded, so a vocabulary whose channel tokens must reach the reader lost them on the
-/// streamed path while keeping them on the whole-response one: the same answer arrived clean
-/// when returned in one piece and carried a bare channel name when streamed.
-pub(crate) fn incremental_chunk_text(
-    tokenizer: &Tokenizer,
-    generated_token_ids: &[u32],
-    skip_special: bool,
-) -> String {
-    let n = generated_token_ids.len();
-    if n >= 2 {
-        let two_text = tokenizer
-            .decode(&generated_token_ids[n - 2..], skip_special)
+/// Each step decodes from the last committed character boundary forward and emits only the
+/// text beyond what was already sent: the window never starts mid-word, so a SentencePiece
+/// leading space survives, and a trailing UTF-8 sequence a later token will finish is held
+/// back rather than sent as U+FFFD, however many tokens its bytes straddle. The boundary
+/// advances each time a character completes, so a step decodes a few tokens.
+///
+/// `skip_special` travels with the caller: a vocabulary whose channel tokens must reach the
+/// reader keeps them streamed as it does whole.
+#[derive(Debug, Default)]
+pub(crate) struct StreamDetokenizer {
+    /// First token of the open window: the last committed character boundary.
+    prev_index: usize,
+    /// End of the tokens whose text has been emitted.
+    current_index: usize,
+}
+
+impl StreamDetokenizer {
+    /// Text the newest token of `ids` completes beyond what was already emitted; empty while
+    /// the trailing character is incomplete.
+    pub(crate) fn step(
+        &mut self,
+        tokenizer: &Tokenizer,
+        ids: &[u32],
+        skip_special: bool,
+    ) -> String {
+        let sent = tokenizer
+            .decode(&ids[self.prev_index..self.current_index], skip_special)
             .unwrap_or_default();
-        let one_text = tokenizer
-            .decode(&generated_token_ids[n - 2..n - 1], skip_special)
+        let text = tokenizer
+            .decode(&ids[self.prev_index..], skip_special)
             .unwrap_or_default();
-        two_text
-            .strip_prefix(one_text.as_str())
-            .map(String::from)
-            .unwrap_or(two_text)
-    } else {
-        tokenizer
-            .decode(generated_token_ids, skip_special)
-            .unwrap_or_default()
+        if text.len() > sent.len()
+            && !text.ends_with('\u{FFFD}')
+            && text.is_char_boundary(sent.len())
+        {
+            let out = text[sent.len()..].to_string();
+            self.prev_index = self.current_index;
+            self.current_index = ids.len();
+            out
+        } else {
+            String::new()
+        }
+    }
+
+    /// What remains unsent at the end of the stream, an incomplete trailing sequence
+    /// included, since no later token will finish it.
+    pub(crate) fn finish(&self, tokenizer: &Tokenizer, ids: &[u32], skip_special: bool) -> String {
+        let sent = tokenizer
+            .decode(&ids[self.prev_index..self.current_index], skip_special)
+            .unwrap_or_default();
+        let text = tokenizer
+            .decode(&ids[self.prev_index..], skip_special)
+            .unwrap_or_default();
+        if text.len() > sent.len() && text.is_char_boundary(sent.len()) {
+            text[sent.len()..].to_string()
+        } else {
+            String::new()
+        }
     }
 }
 
