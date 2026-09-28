@@ -487,8 +487,7 @@ impl MoeWeights {
             let _ = topk_ids.device().synchronize();
             crate::inference::place::layer_perf::stages::add(9, t.elapsed().as_micros() as u64);
         }
-        // Routing on THIS path, which is not the one `fused_moe` times: a mixture has two
-        // forwards in this tree and only one of them carries the fast argsort.
+        // Routing: from the top-k choice to the expert-grouped plan.
         let t_route = crate::inference::place::layer_perf::stages::enabled().then(|| {
             let _ = topk_ids.device().synchronize();
             std::time::Instant::now()

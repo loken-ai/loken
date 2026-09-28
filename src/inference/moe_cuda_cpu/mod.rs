@@ -33,13 +33,27 @@ use std::sync::{Arc, Mutex, OnceLock};
 // experts) - exactly what Ollama does. `None` for a tensor whose quant type has
 // no CPU dot path -> that call keeps the dequantize-then-matmul fallback.
 
+/// Whether the CPU has a dot product that reads this format's blocks directly.
+///
+/// Written out rather than derived from the block size on purpose. It is an allow-list: a
+/// format added to the table without a CPU dot must fall back to dequantise-then-matmul, and a
+/// derivation would have it claim a path that does not exist. `Q8_1` is absent because it is an
+/// activation format - nothing stores weights in it.
+fn cpu_qmatmul_supported(dtype: GgmlDType) -> bool {
+    use GgmlDType::*;
+    matches!(
+        dtype,
+        Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K | Q8K | MxFp4
+    )
+}
+
 /// Slice a 3-D expert stack `[E, R, C]` into `E` per-expert `[R, C]` `QMatMul`s.
 /// Blocks are laid out expert-major / row-major, so each expert is one
 /// contiguous byte range - exposed as ZERO-COPY views sharing the parent's
 /// storage: the cache used to hold a full byte-copied duplicate of every
 /// expert tensor, doubling the resident weight memory of CPU MoE models.
 fn build_expert_qmms(weights: &Arc<QTensor>) -> Result<Option<Vec<QMatMul>>> {
-    if !crate::inference::fused_moe::cpu_qmatmul_supported(weights.dtype()) {
+    if !cpu_qmatmul_supported(weights.dtype()) {
         return Ok(None);
     }
     let dims = weights.shape().dims();

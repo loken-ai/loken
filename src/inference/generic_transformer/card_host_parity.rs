@@ -712,3 +712,132 @@ fn card_decodes_the_same_twice() {
         }
     }
 }
+
+/// The prompt and the tokens a reference engine decoded greedily after it, read from
+/// `path`: either `{"prompt_tokens": [..], "greedy_tokens": [..]}`, or a reference server's
+/// raw non-streamed generate response, whose `context` holds the prompt's ids followed by
+/// the generated ones and whose `prompt_eval_count` says where the prompt ends.
+fn reference_run(path: &std::path::Path) -> (Vec<u32>, Vec<u32>) {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "no reference at {}: {e}. Record one with a reference server on an idle card, \
+             greedy and without a template, and save the response as that file:\n  \
+             curl -s localhost:11434/api/generate -d '{{\"model\":\"gpt-oss:20b\",\
+             \"prompt\":\"The capital of France is\",\"raw\":true,\"stream\":false,\
+             \"options\":{{\"temperature\":0,\"top_k\":1,\"num_predict\":32}}}}'",
+            path.display()
+        )
+    });
+    let v: serde_json::Value = serde_json::from_str(&text).expect("reference JSON");
+    let ids = |key: &str| -> Option<Vec<u32>> {
+        v.get(key)?
+            .as_array()?
+            .iter()
+            .map(|x| x.as_u64().map(|n| n as u32))
+            .collect()
+    };
+    if let (Some(prompt), Some(greedy)) = (ids("prompt_tokens"), ids("greedy_tokens")) {
+        return (prompt, greedy);
+    }
+    let context = ids("context").expect("prompt_tokens/greedy_tokens or context");
+    let n_prompt = v["prompt_eval_count"]
+        .as_u64()
+        .expect("prompt_eval_count beside context") as usize;
+    (context[..n_prompt].to_vec(), context[n_prompt..].to_vec())
+}
+
+/// gpt-oss through the generic route decodes greedily what the reference decoded.
+///
+/// Ignored by default: it needs gpt-oss:20b in the store, the CUDA cards idle, and a
+/// reference run (see `reference_run`). Run with
+///   LOKEN_GPTOSS_REFERENCE=/path/to/reference.json cargo test --release --lib \
+///     gptoss_generic_route_matches_the_reference -- --ignored --nocapture
+/// `LOKEN_PARITY_MODEL` selects another tag of the same architecture.
+#[test]
+#[ignore = "needs gpt-oss:20b in the store, idle CUDA cards and a reference run"]
+fn gptoss_generic_route_matches_the_reference() {
+    let tag = std::env::var("LOKEN_PARITY_MODEL").unwrap_or_else(|_| "gpt-oss:20b".into());
+    let reference = std::env::var("LOKEN_GPTOSS_REFERENCE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/vectors/gptoss_20b_greedy.json")
+        });
+    let (prompt, greedy) = reference_run(&reference);
+    assert!(!prompt.is_empty() && !greedy.is_empty(), "empty reference");
+
+    let path = model_blob(&tag);
+    let file = std::fs::File::open(&path).unwrap();
+    let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
+    let content =
+        gguf_file::Content::read_mapped(&mut std::io::Cursor::new(&mmap[..]), mmap.clone())
+            .unwrap();
+    let arch = content.metadata["general.architecture"]
+        .to_string()
+        .unwrap()
+        .clone();
+    assert_eq!(arch, "gptoss", "{tag} is not a gpt-oss file");
+    let n_layers = GenericTransformerConfig::from_gguf(&content, &arch)
+        .unwrap()
+        .n_layers;
+
+    // Every card present, each layer placed by its free memory.
+    let mut cards: HashMap<usize, Device> = HashMap::new();
+    let mut free: Vec<(usize, u64)> = Vec::new();
+    for idx in 0.. {
+        let Ok(card) = Device::new_cuda(idx) else {
+            break;
+        };
+        let bytes = card
+            .as_cuda_device()
+            .ok()
+            .and_then(|cd| cd.cuda_stream().context().mem_get_info().ok())
+            .map_or(0, |(f, _)| f as u64);
+        free.push((idx, bytes));
+        cards.insert(idx, card);
+    }
+    assert!(!cards.is_empty(), "no CUDA device");
+    let plan = HeteroPlan::split_across_cuda(n_layers, &free);
+    let mut m = GenericHeteroTransformer::from_gguf(content, &mmap[..], &cards, &plan).unwrap();
+
+    let mut input = Tensor::new(prompt.as_slice(), &Device::Cpu)
+        .unwrap()
+        .unsqueeze(0)
+        .unwrap();
+    let mut pos = 0;
+    let mut decoded = Vec::with_capacity(greedy.len());
+    for (step, &want) in greedy.iter().enumerate() {
+        let n = input.dims()[1];
+        let logits = m
+            .forward(&input, pos)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        pos += n;
+        let (got, top) =
+            logits.iter().enumerate().fold(
+                (0usize, f32::MIN),
+                |b, (i, &v)| if v > b.1 { (i, v) } else { b },
+            );
+        let margin = top - logits[want as usize];
+        println!(
+            "{tag} step {step:>2}: generic {got:>6}  reference {want:>6}  logit gap {margin:.4}"
+        );
+        decoded.push(got as u32);
+        // Teacher forcing: the next step reads the reference token, so one divergence is
+        // reported once rather than cascading.
+        input = Tensor::new(&[want], &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+    }
+    let agree = decoded.iter().zip(&greedy).filter(|(a, b)| a == b).count();
+    println!("{tag}: {agree}/{} greedy tokens agree", greedy.len());
+    assert_eq!(decoded, greedy, "greedy tokens differ from the reference");
+}

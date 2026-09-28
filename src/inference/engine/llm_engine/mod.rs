@@ -6,8 +6,7 @@ use crate::inference::engine::decode_step::{
 use crate::inference::engine::model_backend::TpQwen2Backend;
 use crate::inference::engine::model_backend::{
     BatchedBackend, BoxedModelBackend, ContinuousBackend, GenericBackend, GenericVisionBackend,
-    GptOssBackend, Lfm2MoeBackend, MoondreamBackend, NemotronHBackend, Qwen35MoeBackend,
-    TakenBackend,
+    Lfm2MoeBackend, MoondreamBackend, NemotronHBackend, Qwen35MoeBackend, TakenBackend,
 };
 use crate::inference::engine::InferenceEngine;
 use crate::inference::generic_transformer::GenericHeteroTransformer;

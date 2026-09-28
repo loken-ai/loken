@@ -50,10 +50,7 @@ const ALLOWED: &[(&str, &str)] = &[
         "log",
         "reached by the Mamba-style softplus in nemotron-h and qwen3.5-moe",
     ),
-    (
-        "index_add",
-        "the MoE expert scatter - fused_moe and moe_cuda_cpu",
-    ),
+    ("index_add", "the MoE expert scatter in moe_cuda_cpu"),
 ];
 
 #[test]

@@ -540,11 +540,16 @@ impl LlmEngine {
             let caps_attention = content
                 .metadata
                 .contains_key(&format!("{arch}.attn_logit_softcapping"));
+            // Nor do they fold attention sinks into the softmax: a model with sinks keeps the
+            // F-dtype cache its sink attention reads.
+            let has_attn_sinks = content.tensor_infos.contains_key("blk.0.attn_sinks")
+                || content.tensor_infos.contains_key("blk.0.attn_sinks.weight");
             let kv_quant_supported =
                 (crate::inference::cache::kv_core::kv_shape_supported(head_dim, n_q_per_kv)
                     && kv_arch_check != "gemma4"
                     || is_gemma4_q8_ok)
-                    && !caps_attention;
+                    && !caps_attention
+                    && !has_attn_sinks;
             // Compile the shape's attention kernels now rather than on the first decoded token.
             #[cfg(feature = "cuda")]
             if kv_quant_supported {
@@ -861,88 +866,10 @@ impl LlmEngine {
                         }
                     }
                 }
-                "gptoss" => {
-                    // gpt-oss (OPENAI_MOE): MXFP4 MoE + attention sinks +
-                    // sliding-window + NEOX RoPE. The MXFP4 experts are kept
-                    // native (the MoE-GEMM has an MXFP4 MMVQ path, case 7), so
-                    // expert VRAM stays ~12 GB (vs ~24 GB if requantized to
-                    // Q8_0) and decode reads half the expert bytes/token  - 
-                    // which lets the whole model fit a single 16 GB GPU
-                    // (preferred; see the single-GPU rationale below).
-                    // F16 working dtype: gpt-oss's float weights (attn,
-                    // lm_head) are requantized to Q8_0 at load, so every matmul
-                    // takes the dtype-agnostic MMVQ path (the proven F16
-                    // quantized path, as for gemma4/deepcoder). The F32 norm /
-                    // bias / sink / cos-sin tensors are cast around their ops
-                    // (norms run in F32; attention softmax upcasts to F32).
-                    let dtype = crate::tensor::DType::F16;
-                    let mut gpu_ids_all: Vec<usize> = cuda_devices.iter().map(|(i, _)| *i).collect();
-                    gpu_ids_all.sort_unstable();
-                    // CPU run when no GPUs OR this is a non-CUDA build (the GPUs are
-                    // still enumerated by NVML in the device manager, but the substrate
-                    // can't use them without the cuda feature -> force CPU).
-                    let cpu_only = gpu_ids_all.is_empty() || cfg!(not(feature = "cuda"));
-                    // Native MXFP4 gpt-oss (~14 GB) fits a single 16 GB GPU, and the
-                    // contiguous layer split runs sequentially (no decode
-                    // parallelism). Single-GPU MEASURED +29% (117->151 tok/s) by
-                    // dropping the per-token cross-GPU hidden-state handoff + sync,
-                    // and is also the prerequisite for CUDA-graph capture (capture
-                    // is per-stream/device - a 2-GPU forward can't be one graph).
-                    // Prefer the fastest single GPU ("use fastest GPU first"); fall
-                    // back to a multi-GPU split only if the single-GPU load OOMs on
-                    // a smaller card.
-                    let force_multi = false;
-                    let attempts: Vec<Vec<usize>> = if cpu_only {
-                        vec![vec![]] // single CPU attempt
-                    } else if force_multi || gpu_ids_all.len() == 1 {
-                        vec![gpu_ids_all.clone()]
-                    } else {
-                        vec![vec![gpu_ids_all[0]], gpu_ids_all.clone()]
-                    };
-                    let mut loaded: Option<BoxedModelBackend> = None;
-                    let mut last_err = String::new();
-                    for ids in &attempts {
-                        let mut gpu_list: Vec<Device> = Vec::new();
-                        for idx in ids {
-                            match Device::new_cuda(*idx) {
-                                Ok(d) => gpu_list.push(d),
-                                Err(e) => warn!("gptoss: skipping GPU {idx}: {e}"),
-                            }
-                        }
-                        if gpu_list.is_empty() {
-                            if cpu_only { gpu_list.push(Device::Cpu); } else { continue; }
-                        }
-                        info!("⬇️  Loading gptoss (native MXFP4 MoE + Q8_0 attn + attn-sinks) on {} CUDA GPU(s)", gpu_list.len());
-                        let content_fresh = gguf_file::Content::read_mapped(&mut Cursor::new(mmap_bytes), mmap.clone())
-                            .map_err(|e| anyhow!("GGUF re-parse failed: {e}"))?;
-                        let mut reader = Cursor::new(mmap_bytes);
-                        match crate::inference::model::gptoss::GptOssModel::from_gguf(
-                            &content_fresh, &mut reader, &gpu_list, dtype, Some(&mmap),
-                        ) {
-                            Ok(m) => {
-                                info!("✅ gptoss loaded on {} GPU(s)", gpu_list.len());
-                                // Diagnostic: probe whether the decode forward
-                                // captures + replays as a CUDA graph (settles the
-                                // graph-mode question for this arch before the full
-                                // device-pos rewrite). Single-GPU only; gated.
-                                loaded = Some(Box::new(GptOssBackend(m)));
-                                break;
-                            }
-                            Err(e) => {
-                                last_err = format!("{e}");
-                                warn!("gptoss load on {} GPU(s) failed: {e}", gpu_list.len());
-                            }
-                        }
-                    }
-                    match loaded {
-                        Some(m) => m,
-                        None => return Err(anyhow!("gptoss load failed: {last_err}")),
-                    }
-                }
                 "nemotron_h_moe" => {
                     // nemotron-H: hybrid Mamba2 + attention + non-gated MoE.
-                    // Float weights requantized to Q8_0 at load (same F16-stream
-                    // MMVQ rationale as gptoss); SSM recurrence / norms / softmax
+                    // Float weights requantized to Q8_0 at load (F16-stream
+                    // MMVQ path); SSM recurrence / norms / softmax
                     // / MoE run in F32. Layer-split across all CUDA GPUs.
                     let dtype = crate::tensor::DType::F16;
                     let mut gpu_ids: Vec<usize> = cuda_devices.iter().map(|(i, _)| *i).collect();
@@ -1212,7 +1139,7 @@ impl LlmEngine {
                     }
                 }
                 "llama" | "mistral" | "mistral3" |
-                "qwen2" | "qwen3" | "qwen3moe" | "gemma" | "gemma2" | "gemma3" |
+                "qwen2" | "qwen3" | "qwen3moe" | "gptoss" | "gemma" | "gemma2" | "gemma3" |
                 "gemma3n" | "gemma4" |
                 "phi" | "phi2" | "phi3" | "phi4" | "chatglm" | "glm4" | "stablelm" | "starcoder" |
                 "starcoder2" | "falcon" | "bloom" | "mpt" | "refact" | "codeshell" |
@@ -1431,9 +1358,8 @@ impl LlmEngine {
                     // loads: with tracking ON every CudaSlice carries
                     // read/write events recorded on each use, and capturing
                     // the decode forward then records/waits events created
-                    // OUTSIDE the capture -> CAPTURE_INVALIDATED
-                    // (root-caused; gptoss documents the same
-                    // "must precede tensor loads" constraint).
+                    // OUTSIDE the capture -> CAPTURE_INVALIDATED, so the
+                    // tracking must be off before any tensor loads.
                     //
                     // Scope: every handle, whatever shape the plan has. The
                     // tracking exists to order a slice against a SECOND

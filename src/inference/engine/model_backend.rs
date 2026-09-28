@@ -804,10 +804,6 @@ pub(crate) struct GenericVisionBackend {
     pub vision: VisionTower,
 }
 
-/// gpt-oss (OPENAI_MOE): MXFP4 MoE transformer with attention sinks +
-/// sliding-window + NEOX RoPE. Single-device for now. (CUDA-only: MoE GEMM.)
-pub(crate) struct GptOssBackend(pub crate::inference::model::gptoss::GptOssModel);
-
 /// deepseek_v41: latent MQA, CSA2 bands, hyper-connections, and a MoE whose routed experts stream
 /// from the mmap through a hot cache. CPU, one sequence at a time. The engine's `forward` is
 /// decode-driven: every token of `x` is fed through the per-layer caches at its position, and the
@@ -1040,7 +1036,6 @@ pub(crate) struct TakenBackend;
 unsafe impl Send for MoondreamBackend {}
 unsafe impl Send for GenericBackend {}
 unsafe impl Send for GenericVisionBackend {}
-unsafe impl Send for GptOssBackend {}
 unsafe impl Send for NemotronHBackend {}
 unsafe impl Send for Lfm2MoeBackend {}
 unsafe impl Send for Qwen35MoeBackend {}
@@ -1519,22 +1514,6 @@ impl ModelBackend for GenericVisionBackend {
     ) -> crate::tensor::Result<Tensor> {
         self.text
             .forward_with_image_embeds(bos_token, text_input, image_embeds)
-    }
-
-    take_generic_passthrough!();
-}
-
-impl ModelBackend for GptOssBackend {
-    fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.0.forward(x, index_pos)
-    }
-
-    fn snapshot_prefix(&mut self, prompt: &[u32], logits: &Tensor) -> crate::tensor::Result<()> {
-        self.0.snapshot_prefix(prompt, logits)
-    }
-
-    fn try_restore_prefix(&mut self, prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
-        self.0.try_restore_prefix(prompt)
     }
 
     take_generic_passthrough!();

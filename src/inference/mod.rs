@@ -18,7 +18,6 @@ pub mod moe_cpu;
 pub mod moe_cuda;
 #[cfg(not(feature = "cuda"))]
 pub use moe_cuda as moe_cpu;
-pub mod fused_moe;
 
 pub mod engine;
 pub mod generic_transformer;

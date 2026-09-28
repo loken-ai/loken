@@ -21,7 +21,6 @@ pub mod flow_match;
 pub mod flux;
 #[cfg(feature = "image")]
 pub mod flux2;
-pub mod gptoss;
 pub mod kyutai;
 pub mod lfm2_moe;
 pub mod mixformer;
