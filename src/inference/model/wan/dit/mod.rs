@@ -41,7 +41,6 @@
 use crate::tensor::layer::qlinear::{QLinear, Weight};
 use crate::tensor::layer::Linear;
 
-use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
 use crate::tensor::quantized::QVarBuilder;
 use crate::tensor::safetensors_io::SafeTensorsLoader;
 use crate::tensor::{DType, Device, Result, Tensor};

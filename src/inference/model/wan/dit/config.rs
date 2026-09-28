@@ -290,16 +290,10 @@ pub fn check_wan_geometry(shape: &[usize], want_dim: usize, want_in_ch: usize) -
     // not work: in GGUF order that compares two patch dimensions, which are equal.
     // Refuse a shape that is not one BEFORE reading anything out of it: returning "fits"
     // for a degenerate shape is the one answer that must never come out of a guard.
-    if shape.len() < 2 {
+    let Some((dim, in_ch)) = wan_patch_dims(shape) else {
         return Some(format!(
             "patch_embedding.weight has shape {shape:?}, which is not a Wan patch embedding"
         ));
-    }
-    let (first, last) = (shape[0], shape[shape.len() - 1]);
-    let (dim, in_ch) = if first >= last {
-        (first, shape[1])
-    } else {
-        (last, shape[shape.len() - 2])
     };
     if in_ch != want_in_ch {
         return Some(format!(
@@ -315,6 +309,55 @@ pub fn check_wan_geometry(shape: &[usize], want_dim: usize, want_in_ch: usize) -
         ));
     }
     None
+}
+
+/// The model width and input channel count a `patch_embedding.weight` shape carries, in
+/// either storage order; `None` for a shape that is not a patch embedding.
+///
+/// safetensors stores it `[dim, in_ch, 1, 2, 2]` and the GGUF reader hands back the reverse.
+/// The width is the largest extent, so whichever end carries it names the order and the
+/// channel count is its neighbour.
+pub fn wan_patch_dims(shape: &[usize]) -> Option<(usize, usize)> {
+    if shape.len() < 2 {
+        return None;
+    }
+    let (first, last) = (shape[0], shape[shape.len() - 1]);
+    Some(if first >= last {
+        (first, shape[1])
+    } else {
+        (last, shape[shape.len() - 2])
+    })
+}
+
+/// How many `blocks.N.` stacks a checkpoint's tensor names carry.
+pub(super) fn wan_block_count<'a>(names: impl Iterator<Item = &'a str>) -> usize {
+    names
+        .filter_map(|n| {
+            n.strip_prefix("blocks.")?
+                .split('.')
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .max()
+        .map_or(0, |last| last + 1)
+}
+
+/// The width and block count of the DiT checkpoint at `path`, read from its header:
+/// GGUF or safetensors. `None` when the file cannot be read or is not a Wan DiT.
+pub fn wan_checkpoint_geometry(path: &std::path::Path) -> Option<(usize, usize)> {
+    if path.extension().is_some_and(|e| e == "gguf") {
+        let c = crate::tensor::quantized::gguf_file::open_header(path).ok()?;
+        let (dim, _) = wan_patch_dims(c.tensor_infos.get("patch_embedding.weight")?.shape.dims())?;
+        Some((
+            dim,
+            wan_block_count(c.tensor_infos.keys().map(|k| k.as_str())),
+        ))
+    } else {
+        let ld = unsafe { SafeTensorsLoader::multi(&[path]) }.ok()?;
+        let (dim, _) = wan_patch_dims(&ld.shape_of("patch_embedding.weight")?)?;
+        Some((dim, wan_block_count(ld.names().into_iter())))
+    }
 }
 
 /// Resolve the Wan 14B DiT Q8_0 GGUF (city96 community quant) via the HF-cache resolver

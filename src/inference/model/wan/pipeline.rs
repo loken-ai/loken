@@ -117,12 +117,6 @@ fn encode_text(enc: &Umt5Encoder, ids: &[u32]) -> Result<(Vec<f32>, usize)> {
 /// unconditional `(flat, S)` (present iff CFG > 1; identical for every prompt).
 type PromptCtx = (Vec<f32>, usize, Option<(Vec<f32>, usize)>);
 
-/// Substring test for a CUDA out-of-memory error (the fallback trigger).
-fn is_oom(e: &crate::tensor::Error) -> bool {
-    let s = format!("{e:?}").to_lowercase();
-    s.contains("out of memory") || s.contains("out_of_memory")
-}
-
 /// Process-global cache of the CPU-staged (half-precision) umT5-XXL weights. Parsing and
 /// converting the checkpoint takes far longer than uploading it, so caching it in host RAM
 /// lets each `/v1/video` request just upload a fresh GPU copy via `to_device`, leaving the
@@ -214,39 +208,50 @@ fn umt5_demand(weights: u64, longest_prompt_tokens: usize) -> u64 {
     weights.saturating_add(umt5_encode_reserve(longest_prompt_tokens))
 }
 
-/// Where the text encoder runs: the fastest card that holds its weights AND its encode, else
-/// the host.
+/// The VAE decoder's copy on a card that holds its weights and its decode (`reserve`), aside
+/// from the denoiser's card when there is another; `None` when the host copy decodes.
+fn place_vae(
+    dec_cpu: &crate::inference::model::wan::vae::WanVaeDecoder,
+    weights: u64,
+    reserve: u64,
+) -> Result<Option<crate::inference::model::wan::vae::WanVaeDecoder>> {
+    crate::inference::place::ladder::load_aside(
+        "Wan VAE decoder",
+        weights,
+        reserve,
+        |dev| match dev {
+            Device::Cpu => Ok(None),
+            card => dec_cpu.to_device(card).map(Some),
+        },
+    )
+}
+
+/// The text encoder, loaded where the cards hold its weights AND its encode: the fastest card
+/// that does, else the host, through the ladder in `place`. `staged` is the half-precision
+/// host copy the card copy is uploaded from; the host runs the F32 the CPU forward needs,
+/// converted from it.
 ///
-/// This used to send one checkpoint variant to the host by NAME, on the grounds that a
-/// transient encoder must not hold device memory while the denoiser splits itself across the
-/// cards. That overlap no longer exists: the encoder is dropped when `encode_all` returns and
-/// the pools are released before the denoiser is loaded, so by the time the denoiser plans,
-/// nothing of the encoder is on any card - see `render_many`.
-///
-/// What the variant's name never said is the thing that actually decides this: whether a card
-/// HERE can hold this checkpoint and this prompt's attention. So that is what is asked. The
-/// host remains an ordinary answer rather than a failure - the encoder runs once per render,
-/// and with the staging cache warm it costs seconds - which is why no card is a case to
-/// handle and not a case to refuse.
-fn umt5_device(weights: u64, longest_prompt_tokens: usize) -> Device {
+/// The encoder runs once per render and is dropped before the denoiser is placed, so it
+/// takes the fastest card that holds it rather than yielding one. An unreadable checkpoint
+/// (`weights == 0`) is charged nothing and runs on the host.
+fn load_umt5(
+    staged: &Umt5Encoder,
+    weights: u64,
+    longest_prompt_tokens: usize,
+) -> Result<Umt5Encoder> {
+    use crate::tensor::DType;
+    let on_host = || staged.to_dtype_on(&Device::Cpu, DType::F32);
     if weights == 0 {
-        // The checkpoint could not be stat'd. Charging a card zero would place the encoder
-        // by an amount that is not its size; the loader below reports the real problem.
-        return Device::Cpu;
+        return on_host();
     }
-    // The gate takes the resident weights and the run-time reserve separately, so split the
-    // demand where it was built: the reserve is the part of it that is not the checkpoint.
+    // The ladder takes the resident weights and the run-time reserve separately; the reserve
+    // is the part of the demand that is not the checkpoint.
     let act = umt5_demand(weights, longest_prompt_tokens).saturating_sub(weights);
-    // The encoder is TRANSIENT - encoded once, dropped before the denoiser loads - so it
-    // needs no dedicated card, only the one that can take the upload fastest, because moving
-    // the weights dominates the encode. So it asks for the fastest that fits first, and only
-    // yields the card when that one is full - the host being the last resort. No index, no
-    // free-VRAM ranking, no name of a checkpoint.
     let reserve = crate::inference::place::runtime_demand::load_runtime_floor(weights) + act;
-    match crate::inference::place::plan::place_whole(weights, reserve) {
-        Device::Cpu => crate::inference::place::plan::place_aside(weights, reserve),
-        fastest => fastest,
-    }
+    crate::inference::place::ladder::load_whole("umT5 encoder", weights, reserve, |dev| match dev {
+        Device::Cpu => on_host(),
+        card => staged.to_device(card),
+    })
 }
 
 /// Load the umT5 encoder ONCE, place it where it fits (host when nothing does, and on a CUDA
@@ -295,56 +300,19 @@ fn encode_all(
         .map(|v| v.len())
         .max()
         .unwrap_or(0);
-    let device = umt5_device(weights, longest);
-    let enc = if matches!(device, Device::Cpu) {
-        // Gate chose CPU: encode on F32 (the CPU forward's requirement) CONVERTED from the
-        // shared half-precision host staging cache - populate it on first use (one parse) and
-        // pay an in-RAM upcast per render, instead of re-parsing the whole checkpoint as
-        // uncached F32 every time no card has room.
-        let mut guard = UMT5_CPU_CACHE
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .unwrap();
-        if guard.is_none() {
-            *guard = Some(Umt5Encoder::from_pth_dtype(path, Device::Cpu, DType::BF16)?);
-            register_umt5_cache_reclaim();
-        }
-        let cpu = guard
-            .as_ref()
-            .unwrap()
-            .to_dtype_on(&Device::Cpu, DType::F32)?;
-        drop(guard);
-        cpu
-    } else {
-        // Cache the CPU-staged bf16 weights (a direct copy of the checkpoint dtype) in
-        // host RAM; each
-        // request uploads a fresh GPU copy via to_device, leaving the cache resident. The
-        // lock is held across the load (miss) or upload (hit) - see UMT5_CPU_CACHE.
-        let mut guard = UMT5_CPU_CACHE
-            .get_or_init(|| std::sync::Mutex::new(None))
-            .lock()
-            .unwrap();
-        if guard.is_none() {
-            *guard = Some(Umt5Encoder::from_pth_dtype(path, Device::Cpu, DType::BF16)?);
-            register_umt5_cache_reclaim();
-        }
-        match guard.as_ref().unwrap().to_device(&device) {
-            Ok(e) => e, // GPU copy; the cached host staging stays resident
-            Err(e) if is_oom(&e) => {
-                // The gate over-estimated the card's room: convert the ALREADY-CACHED host
-                // staging to the F32 the CPU forward requires (one in-RAM conversion, seconds)
-                // instead of re-parsing the whole checkpoint as uncached F32 per render.
-                eprintln!("[ace-wan-umt5] move to {device:?} OOM - encoding on CPU (F32 from the cached f16 staging)");
-                let cpu = guard
-                    .as_ref()
-                    .unwrap()
-                    .to_dtype_on(&Device::Cpu, DType::F32)?;
-                drop(guard);
-                cpu
-            }
-            Err(e) => return Err(e),
-        }
-    };
+    // The half-precision host staging is cached across renders; each render uploads a card
+    // copy from it or converts it for the host. The lock is held across the load (miss) or
+    // the upload (hit) - see UMT5_CPU_CACHE.
+    let mut guard = UMT5_CPU_CACHE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap();
+    if guard.is_none() {
+        *guard = Some(Umt5Encoder::from_pth_dtype(path, Device::Cpu, DType::BF16)?);
+        register_umt5_cache_reclaim();
+    }
+    let enc = load_umt5(guard.as_ref().unwrap(), weights, longest)?;
+    drop(guard);
     let _enc_part =
         crate::inference::serve::progress::placement::part("text-encoder", &enc.placement());
     let load_s = t0.elapsed().as_secs_f32();
@@ -901,7 +869,7 @@ pub fn render_many_sampled(
     // for the sizes it can carry it is a real one. What is being refused is the SILENT
     // fallback on a machine whose cards simply cannot hold this frame.
     if dit.is_host_only() {
-        let cards = crate::inference::place::vram_manager::probe_under_pressure(0);
+        let cards = crate::inference::place::ladder::offered_cards();
         if !cards.is_empty() {
             // Tokens scale with the frame's AREA, so the size that fits is found by
             // shrinking until the count is one the cards took - reported rather than
@@ -974,22 +942,9 @@ pub fn render_many_sampled(
     // put the two on the same device, and the decode then had to find its feature maps in
     // what the denoiser had left - which is where the out-of-memory came from, and the host
     // fallback that followed cost several times the denoise.
-    let vae_device = crate::inference::place::plan::place_aside(
-        vae_weights,
-        crate::inference::place::runtime_demand::load_runtime_floor(vae_weights) + vae_act,
-    );
-    let mut dec_gpu = if matches!(vae_device, Device::Cpu) {
-        None
-    } else {
-        match dec_cpu.to_device(&vae_device) {
-            Ok(d) => Some(d),
-            Err(e) if is_oom(&e) => {
-                eprintln!("[ace-wan-vae] move to {vae_device:?} OOM - decoding on CPU");
-                None
-            }
-            Err(e) => return Err(e),
-        }
-    };
+    let vae_reserve =
+        crate::inference::place::runtime_demand::load_runtime_floor(vae_weights) + vae_act;
+    let mut dec_gpu = place_vae(&dec_cpu, vae_weights, vae_reserve)?;
     // The decoder's part follows the decoder: on a card, on the host, back on a card.
     let mut _dec_part = crate::inference::serve::progress::placement::part(
         "vae",
@@ -1038,14 +993,18 @@ pub fn render_many_sampled(
         // onto another device.
         let clip_bytes = std::fs::metadata(&clip_path).map(|m| m.len()).unwrap_or(0);
         let clip_resident = clip_bytes.saturating_mul(2);
-        let one_shot = crate::inference::place::plan::place_aside(
+        let t_clip = std::time::Instant::now();
+        let (tower, one_shot) = crate::inference::place::ladder::load_aside(
+            "CLIP vision tower",
             clip_resident,
             crate::inference::place::runtime_demand::load_runtime_floor(clip_resident) + vae_act,
-        );
-        let t_clip = std::time::Instant::now();
-        let tower = crate::inference::model::clip::vision::ClipVisionH::load(
-            clip_path.to_str().unwrap_or_default(),
-            &one_shot,
+            |dev| {
+                crate::inference::model::clip::vision::ClipVisionH::load(
+                    clip_path.to_str().unwrap_or_default(),
+                    dev,
+                )
+                .map(|t| (t, dev.clone()))
+            },
         )?;
         let tower_part =
             crate::inference::serve::progress::placement::part("clip", &tower.placement());
@@ -1070,13 +1029,17 @@ pub fn render_many_sampled(
         // claim on the denoiser's card, but it does not have to run on the host either.
         let enc_bytes = std::fs::metadata(&enc_path).map(|m| m.len()).unwrap_or(0);
         let enc_resident = enc_bytes.saturating_mul(2);
-        let enc_dev = crate::inference::place::plan::place_aside(
+        let (enc, enc_dev) = crate::inference::place::ladder::load_aside(
+            "Wan VAE encoder",
             enc_resident,
             crate::inference::place::runtime_demand::load_runtime_floor(enc_resident) + vae_act,
-        );
-        let enc = crate::inference::model::wan::vae::load_wan_vae_encoder_safetensors_on(
-            enc_path.to_str().unwrap_or_default(),
-            &enc_dev,
+            |dev| {
+                crate::inference::model::wan::vae::load_wan_vae_encoder_safetensors_on(
+                    enc_path.to_str().unwrap_or_default(),
+                    dev,
+                )
+                .map(|e| (e, dev.clone()))
+            },
         )?;
         let enc_part =
             crate::inference::serve::progress::placement::part("vae-encoder", &enc.placement());
@@ -1286,10 +1249,8 @@ pub fn render_many_sampled(
             x
         };
 
-        // Decode this clip's latent on the resident GPU VAE (CPU fallback on OOM; on OOM
-        // the GPU decoder is dropped so later clips don't re-try and re-OOM). A dead
-        // client cancels BEFORE and DURING the decode - it used to run to completion
-        // (minutes of CPU) for nobody.
+        // Decode this clip's latent on the resident VAE. A dead client cancels BEFORE and
+        // DURING the decode.
         if cancel.is_some_and(|c| c.is_cancelled()) {
             return Err(Error("wan render cancelled (client disconnected)".into()));
         }
@@ -1304,33 +1265,6 @@ pub fn render_many_sampled(
         #[cfg(feature = "cuda")]
         crate::inference::engine::llm_engine::release_cuda_pools();
         let latent = Tensor::from_vec_f32(x, (LATENT_CH, f_lat, hl, wl))?;
-        // Come BACK to the GPU when room returns. One clip OOMing used to disable the
-        // GPU decoder for the rest of the render, so a single tight moment - another
-        // engine holding the card for a few seconds - cost every remaining clip a host
-        // decode, minutes each, long after the memory was free again. The CPU decoder
-        // stays resident either way, so returning is a weight copy, which is nothing
-        // against one clip decoded on the host. Requires DOUBLE the estimated need, so
-        // a card hovering at the threshold cannot make this thrash back and forth.
-        if dec_gpu.is_none() && !matches!(vae_device, Device::Cpu) {
-            let free_now = crate::inference::place::vram_manager::probe(0)
-                .into_iter()
-                .find(|(_, _, d)| Device::same_device(d, &vae_device))
-                .map(|(_, free, _)| free)
-                .unwrap_or(0);
-            if free_now >= (vae_act + vae_weights) * 2 {
-                // A failed move leaves the decoder on the CPU until the next clip.
-                if let Ok(d) = dec_cpu.to_device(&vae_device) {
-                    eprintln!(
-                        "[ace-wan-vae] {:.1} GB free again on {vae_device:?} - moving the \
-                             decoder back to the GPU",
-                        free_now as f64 / 1e9
-                    );
-                    _dec_part =
-                        crate::inference::serve::progress::placement::part("vae", &d.placement());
-                    dec_gpu = Some(d);
-                }
-            }
-        }
         // Say how far the decode has got. It walks the clip one latent frame at a time and
         // always knew, but only ever announced that it had STARTED - so on a long clip the
         // only thing anyone could see was the word "decoding", for minutes, which is
@@ -1339,33 +1273,34 @@ pub fn render_many_sampled(
             ph::note(progress, ph::phase::DECODE, done, total);
         };
         let on_dec: &dyn Fn(usize, usize) = &on_dec;
-        let rgb = match &dec_gpu {
-            None => dec_cpu.decode_reporting(&latent, cancel, Some(on_dec))?,
-            Some(dec) => {
-                let dev = dec.device();
-                let lat = latent.to_device(&dev)?;
-                match dec.decode_reporting(&lat, cancel, Some(on_dec)) {
-                    Ok(r) => r,
-                    Err(e) if is_oom(&e) => {
-                        eprintln!(
-                            "[ace-wan-vae] decode OOM on {dev:?} - freeing the GPU \
-                                   decoder for this clip; the next one re-checks the card"
-                        );
-                        drop(lat);
-                        // Frees the GPU weights so this clip can finish on the host. NOT a
-                        // permanent decision: the check at the top of the loop moves the
-                        // decoder back as soon as the card has room again.
-                        dec_gpu = None;
-                        _dec_part = crate::inference::serve::progress::placement::part(
-                            "vae",
-                            &dec_cpu.placement(),
-                        );
-                        dec_cpu.decode_reporting(&latent, cancel, Some(on_dec))?
-                    }
-                    Err(e) => return Err(e),
-                }
+        // The decode is one unit of the render. A card copy that runs out of memory is
+        // dropped, the pressure level rises, and the unit places the decoder again under
+        // it; with the level at its top the placement is the host. A clip that starts
+        // with the decoder on the host asks the cards again first, so room that returned
+        // is used.
+        let rgb = crate::inference::place::ladder::rerun_under_pressure("Wan VAE decode", || {
+            if dec_gpu.is_none() {
+                dec_gpu = place_vae(&dec_cpu, vae_weights, vae_reserve)?;
+                _dec_part = crate::inference::serve::progress::placement::part(
+                    "vae",
+                    &dec_gpu
+                        .as_ref()
+                        .map(|d| d.placement())
+                        .unwrap_or_else(|| dec_cpu.placement()),
+                );
             }
-        };
+            let out = match &dec_gpu {
+                None => dec_cpu.decode_reporting(&latent, cancel, Some(on_dec)),
+                Some(dec) => latent
+                    .to_device(&dec.device())
+                    .and_then(|lat| dec.decode_reporting(&lat, cancel, Some(on_dec))),
+            };
+            if out.is_err() {
+                dec_gpu = None;
+            }
+            out
+        })
+        .map_err(Error)?;
         let frames = pack_frames(&rgb)?;
         eprintln!(
             "[wan] clip {}/{} ({} frames) in {:.1}s",
@@ -1395,15 +1330,19 @@ pub fn render_many_sampled(
 /// checkpoint name typed back into it fails here.
 #[cfg(test)]
 mod umt5_placement_tests {
-    use super::{checkpoint_bytes, umt5_demand, umt5_device};
-    use crate::tensor::Device;
+    use super::{checkpoint_bytes, umt5_demand};
 
-    /// The choice `umt5_device` delegates to, reproduced without a GPU: the fleet planner,
-    /// given what each card has left over after its own reserve, fastest card first.
+    /// The choice `load_umt5` asks the ladder for, reproduced without a GPU: the first rung
+    /// of a one-block demand, given what each card has free, fastest card first.
     fn planned_card(usable_fastest_first: &[u64], demand: u64) -> Option<usize> {
-        use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
+        use crate::inference::place::layer_executor::DeviceKind;
         let budget: Vec<(usize, u64)> = usable_fastest_first.iter().copied().enumerate().collect();
-        let plan = HeteroPlan::calculate_with_kv_reserve(1, demand, &budget, &[], 1.0, 0, 0);
+        let plan = crate::inference::place::ladder::Demand {
+            layers: 1,
+            block_bytes: demand,
+            ..Default::default()
+        }
+        .plan(&budget);
         match plan.segments.first().map(|s| s.kind) {
             Some(DeviceKind::Cuda(i)) => Some(i),
             _ => None,
@@ -1435,9 +1374,6 @@ mod umt5_placement_tests {
             "a checkpoint that cannot be read is charged nothing, not a guess"
         );
         std::fs::remove_dir(&dir).ok();
-        // ... and an uncharged checkpoint is never placed on a card: the loader must be the
-        // one to report the missing file, with the path in it.
-        assert!(matches!(umt5_device(0, 128), Device::Cpu));
     }
 
     /// The demand has to move with the request, because the attention does: T5 keeps a
@@ -1508,8 +1444,8 @@ mod umt5_placement_tests {
             .join("src/inference/model/wan/pipeline.rs");
         let src = std::fs::read_to_string(&path).expect("the pipeline source");
         let from = src
-            .find("fn umt5_device")
-            .expect("umt5_device moved - point this gate at the placement again");
+            .find("fn load_umt5")
+            .expect("load_umt5 moved - point this gate at the placement again");
         let to = from
             + src[from..]
                 .find("fn pack_frames")

@@ -1353,8 +1353,6 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("inference/model/sdxl/unet.rs", (0, 0, 1)),
     ("inference/model/stable_audio/mod.rs", (0, 2, 0)),
     ("inference/model/t5/flan.rs", (1, 0, 0)),
-    ("inference/model/wan/dit/layers.rs", (6, 0, 0)),
-    ("inference/model/wan/pipeline.rs", (8, 5, 0)),
     ("inference/offload/cuda.rs", (1, 2, 0)),
     ("inference/offload/streamed.rs", (2, 0, 0)),
     ("inference/serve/continuous_serve.rs", (1, 0, 0)),

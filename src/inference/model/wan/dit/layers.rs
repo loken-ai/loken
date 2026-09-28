@@ -220,29 +220,17 @@ pub(super) const I2V_COND_CH: usize = I2V_IN_CH - OUT_CH; // 20 = 4 mask + 16 la
 /// Total GPU demand of the HOT component (DiT) for a clip of `tokens` patch tokens: checkpoint
 /// bytes + the request-derived activation bytes. What the pressure protocol needs BEFORE load.
 pub fn hot_demand_bytes(variant: WanVariant, tokens: usize) -> u64 {
-    let (path, dim, heads, layers) = match variant {
-        WanVariant::B14 => (wan_14b_dit_file(), 5120, 40, 40),
-        _ => (wan_dit_file(), 1536, 12, 30),
+    let path = match variant {
+        WanVariant::B14 => wan_14b_dit_file(),
+        _ => wan_dit_file(),
     };
-    // The checkpoint on disk, or what its own shape implies when it is not there -
-    // rather than a byte count written by hand for one of the two variants.
-    let file = std::fs::metadata(&path)
-        .map(|m| m.len())
-        .unwrap_or_else(|_| weight_bytes_from_shape(dim, layers));
-    file + dit_activation_bytes(tokens, dim, heads)
-}
-
-/// Resident bytes a block stack of this shape implies, at half precision.
-///
-/// Per block: the four attention projections, then a feed-forward's matrices at
-/// `MLP_RATIO` times the width. Used only when the checkpoint cannot be stat'd, so
-/// the placement still plans against something derived from the model rather than
-/// against a number that happened to match one file.
-pub(super) fn weight_bytes_from_shape(dim: usize, layers: usize) -> u64 {
-    const HALF_PRECISION: u64 = 2;
-    let d = dim as u64;
-    let per_layer = 4 * d * d + (2.0 * MLP_RATIO) as u64 * d * d;
-    layers as u64 * per_layer * HALF_PRECISION
+    // The checkpoint on disk and the geometry its header carries. A checkpoint that cannot
+    // be read asks for nothing; its loader reports the file.
+    let file = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    match wan_checkpoint_geometry(&path) {
+        Some((dim, _)) => file + dit_activation_bytes(tokens, dim, dim / HEAD_DIM),
+        None => file,
+    }
 }
 
 pub(crate) fn dit_activation_bytes(tokens: usize, dim: usize, heads: usize) -> u64 {
@@ -376,9 +364,6 @@ impl WanDit {
         checkpoint: Option<&std::path::Path>,
         progress: Option<&crate::inference::serve::progress::ProgressFn<'_>>,
     ) -> Result<Self> {
-        const DIM: usize = 1536;
-        const N_LAYERS: usize = 30;
-        const N_HEADS: usize = 12;
         const IN_CH: usize = 16;
         // A picked checkpoint is either a WHOLE DiT or a CORRECTION of one. The distilled
         // Wan variants ship as rank-32 LoRAs of a hundred megabytes rather than as a
@@ -439,139 +424,120 @@ impl WanDit {
         // REFUSE A CHECKPOINT OF THE WRONG SHAPE, before reading a single weight. An I2V
         // file or a 14B one shares this block stack and would load a long way in; what
         // comes out of a mismatched input is a video, just not the one that was asked for.
-        if let Some(dims) = ld.shape_of("patch_embedding.weight") {
-            if let Some(why) = check_wan_geometry(&dims, DIM, IN_CH) {
-                return Err(crate::tensor::Error(format!("{}: {why}", path.display())));
-            }
+        // The width and depth are the checkpoint's own, read from its header.
+        let patch_shape = ld.shape_of("patch_embedding.weight").unwrap_or_default();
+        let Some((dim, _)) = wan_patch_dims(&patch_shape) else {
+            return Err(crate::tensor::Error(format!(
+                "{}: no Wan patch embedding in this checkpoint",
+                path.display()
+            )));
+        };
+        if let Some(why) = check_wan_geometry(&patch_shape, dim, IN_CH) {
+            return Err(crate::tensor::Error(format!("{}: {why}", path.display())));
         }
-        // ~2.8 GB F16 weights + the CLIP-DERIVED activation demand: the denoise keeps
-        // ~12 live `[tokens, dim]` F32 buffers (hidden/residual/q/k/v/attn-out/ffn) plus the
-        // tiled-attention scores `[tile, tokens, heads]` x2 (scores + softmax). Gating on
-        // weights alone approved a card the denoise then OOMed on.
-        let act = dit_activation_bytes(clip_tokens, DIM, N_HEADS);
-        // The checkpoint's real size, not a figure copied from one build of it.
-        let weights = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or_else(|_| weight_bytes_from_shape(DIM, N_LAYERS));
-        // Plan over the BLOCKS, not over the model as one unit. The activation demand is
-        // the reserve, exactly as the 14B path computes it.
-        let cudas = crate::inference::place::vram_manager::probe_under_pressure(act);
-        let cuda_budget: Vec<(usize, u64)> = cudas.iter().map(|(i, fr, _)| (*i, *fr)).collect();
-        // The budgets ALREADY exclude the activation reserve - `probe_under_pressure` probes
-        // through `probe_cuda_devices`, which returns `stable_free - reserve`. Passing it
-        // again subtracts it twice.
-        let plan =
-            HeteroPlan::calculate_with_kv_reserve(N_LAYERS, weights, &cuda_budget, &[], 1.0, 0, 0);
-        let dev_of_kind = |k: DeviceKind| -> Device {
-            match k {
-                DeviceKind::Cuda(idx) => cudas
+        let n_layers = wan_block_count(ld.names().into_iter());
+        let n_heads = dim / HEAD_DIM;
+        // The weights and the CLIP-DERIVED activation demand: the denoise keeps ~12 live
+        // `[tokens, dim]` F32 buffers (hidden/residual/q/k/v/attn-out/ffn) plus the
+        // tiled-attention scores `[tile, tokens, heads]` x2 (scores + softmax). The
+        // activation demand is each card's reserve; the blocks are what the plan divides.
+        let demand = crate::inference::place::ladder::Demand {
+            layers: n_layers,
+            block_bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            runtime_reserve: dit_activation_bytes(clip_tokens, dim, n_heads),
+            ..Default::default()
+        };
+        crate::inference::place::ladder::load("Wan DiT", &demand, |plan| {
+            let layer_devices = crate::inference::place::ladder::layer_devices(plan, n_layers);
+            // The stem and head are not blocks; they live on the first card the plan uses.
+            let device = crate::inference::place::ladder::primary_device(plan);
+            eprintln!(
+                "[wan-dit] placement: {}",
+                plan.segments
                     .iter()
-                    .find(|(i, _, _)| *i == idx)
-                    .map(|(_, _, dv)| dv.clone())
-                    .unwrap_or(Device::Cpu),
-                _ => Device::Cpu,
-            }
-        };
-        let layer_device = |l: usize| -> Device {
-            plan.segments
-                .iter()
-                .find(|s| l >= s.layer_start && l < s.layer_end)
-                .map(|s| dev_of_kind(s.kind))
-                .unwrap_or(Device::Cpu)
-        };
-        // The stem and head are not blocks; they live on the fastest card, which is where
-        // segment 0 starts. When one segment covers everything this is the old behaviour
-        // and the placement is a numeric no-op.
-        let device = cudas
-            .first()
-            .map(|(_, _, dv)| dv.clone())
-            .unwrap_or(Device::Cpu);
-        eprintln!(
-            "[wan-dit] placement: {}",
-            plan.segments
-                .iter()
-                .map(|s| format!("{}:{}-{}", s.kind, s.layer_start, s.layer_end))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        let f16_on =
-            |name: &str, dv: &Device| -> Result<Tensor> { corrected(name, DType::F16, dv) };
-        let f16 = |name: &str| -> Result<Tensor> { f16_on(name, &device) };
-        // Load each projection in the dtype it will be MULTIPLIED in, once, instead of
-        // widening it on every call. BF16 on a card because that is the tensor-core path and
-        // the checkpoint is BF16 on disk anyway - there is no precision to give up. The host
-        // has no BF16 matmul, so a CPU-resident block keeps the F16 store and the F32 widen
-        // it always had. The bias is pre-widened for the same reason: it was being converted
-        // per call to be added once.
-        let lin_on = |prefix: &str, dv: &Device| -> Result<WanLinear> {
-            let wdt = if dv.is_cuda() {
-                DType::BF16
-            } else {
-                DType::F16
-            };
-            Ok(WanLinear::Dense(Linear::from_published(
-                corrected(&format!("{prefix}.weight"), wdt, dv)?,
-                Some(corrected(&format!("{prefix}.bias"), DType::F32, dv)?),
-            )?))
-        };
-        let lin = |prefix: &str| -> Result<WanLinear> { lin_on(prefix, &device) };
-        let patch_w = f16("patch_embedding.weight")?.reshape((DIM, 16, PATCH_H, PATCH_W))?;
-        let ones = Tensor::from_vec_f32(vec![1.0f32; DIM], (DIM,))?.to_device(&device)?;
-        let mut blocks = Vec::with_capacity(N_LAYERS);
-        for i in 0..N_LAYERS {
-            crate::inference::serve::progress::note(
-                progress,
-                crate::inference::serve::progress::phase::LOAD_MODEL,
-                i,
-                N_LAYERS,
+                    .map(|s| format!("{}:{}-{}", s.kind, s.layer_start, s.layer_end))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             );
-            let p = format!("blocks.{i}");
-            let dv = layer_device(i);
-            blocks.push(WanBlock {
-                modulation: ld.load(&format!("{p}.modulation"))?.to_vec_f32(),
-                norm3_w: f16_on(&format!("{p}.norm3.weight"), &dv)?,
-                norm3_b: f16_on(&format!("{p}.norm3.bias"), &dv)?,
-                sa_q: lin_on(&format!("{p}.self_attn.q"), &dv)?,
-                sa_k: lin_on(&format!("{p}.self_attn.k"), &dv)?,
-                sa_v: lin_on(&format!("{p}.self_attn.v"), &dv)?,
-                sa_o: lin_on(&format!("{p}.self_attn.o"), &dv)?,
-                sa_norm_q: f16_on(&format!("{p}.self_attn.norm_q.weight"), &dv)?,
-                sa_norm_k: f16_on(&format!("{p}.self_attn.norm_k.weight"), &dv)?,
-                ca_q: lin_on(&format!("{p}.cross_attn.q"), &dv)?,
-                ca_k: lin_on(&format!("{p}.cross_attn.k"), &dv)?,
-                ca_v: lin_on(&format!("{p}.cross_attn.v"), &dv)?,
-                ca_o: lin_on(&format!("{p}.cross_attn.o"), &dv)?,
-                ca_norm_q: f16_on(&format!("{p}.cross_attn.norm_q.weight"), &dv)?,
-                ca_norm_k: f16_on(&format!("{p}.cross_attn.norm_k.weight"), &dv)?,
-                // The 1.3B is text-to-video: it has no frame to continue and no weights
-                // that would read one.
-                ca_k_img: None,
-                ca_v_img: None,
-                ca_norm_k_img: None,
-                ffn0: lin_on(&format!("{p}.ffn.0"), &dv)?,
-                ffn2: lin_on(&format!("{p}.ffn.2"), &dv)?,
-                // Each block normalises on its own card: `ones` must live there too, or the
-                // first block off the stem's device faults on a cross-device operand.
-                ones: Tensor::from_vec_f32(vec![1.0f32; DIM], (DIM,))?.to_device(&dv)?,
-                device: dv,
-            });
-        }
-        Ok(WanDit {
-            patch_w,
-            patch_b: f16("patch_embedding.bias")?,
-            text0: lin("text_embedding.0")?,
-            text2: lin("text_embedding.2")?,
-            time0: lin("time_embedding.0")?,
-            time2: lin("time_embedding.2")?,
-            time_proj: lin("time_projection.1")?,
-            blocks,
-            head: lin("head.head")?,
-            head_mod: ld.load("head.modulation")?.to_vec_f32(),
-            ones,
-            device,
-            dim: DIM,
-            n_heads: N_HEADS,
-            img_emb: None,
+            let f16_on =
+                |name: &str, dv: &Device| -> Result<Tensor> { corrected(name, DType::F16, dv) };
+            let f16 = |name: &str| -> Result<Tensor> { f16_on(name, &device) };
+            // Load each projection in the dtype it will be MULTIPLIED in, once, instead of
+            // widening it on every call. BF16 on a card because that is the tensor-core path and
+            // the checkpoint is BF16 on disk anyway - there is no precision to give up. The host
+            // has no BF16 matmul, so a CPU-resident block keeps the F16 store and the F32 widen
+            // it always had. The bias is pre-widened for the same reason: it was being converted
+            // per call to be added once.
+            let lin_on = |prefix: &str, dv: &Device| -> Result<WanLinear> {
+                let wdt = if dv.is_cuda() {
+                    DType::BF16
+                } else {
+                    DType::F16
+                };
+                Ok(WanLinear::Dense(Linear::from_published(
+                    corrected(&format!("{prefix}.weight"), wdt, dv)?,
+                    Some(corrected(&format!("{prefix}.bias"), DType::F32, dv)?),
+                )?))
+            };
+            let lin = |prefix: &str| -> Result<WanLinear> { lin_on(prefix, &device) };
+            let patch_w = f16("patch_embedding.weight")?.reshape((dim, IN_CH, PATCH_H, PATCH_W))?;
+            let ones = Tensor::from_vec_f32(vec![1.0f32; dim], (dim,))?.to_device(&device)?;
+            let mut blocks = Vec::with_capacity(n_layers);
+            for i in 0..n_layers {
+                crate::inference::serve::progress::note(
+                    progress,
+                    crate::inference::serve::progress::phase::LOAD_MODEL,
+                    i,
+                    n_layers,
+                );
+                let p = format!("blocks.{i}");
+                let dv = layer_devices[i].clone();
+                blocks.push(WanBlock {
+                    modulation: ld.load(&format!("{p}.modulation"))?.to_vec_f32(),
+                    norm3_w: f16_on(&format!("{p}.norm3.weight"), &dv)?,
+                    norm3_b: f16_on(&format!("{p}.norm3.bias"), &dv)?,
+                    sa_q: lin_on(&format!("{p}.self_attn.q"), &dv)?,
+                    sa_k: lin_on(&format!("{p}.self_attn.k"), &dv)?,
+                    sa_v: lin_on(&format!("{p}.self_attn.v"), &dv)?,
+                    sa_o: lin_on(&format!("{p}.self_attn.o"), &dv)?,
+                    sa_norm_q: f16_on(&format!("{p}.self_attn.norm_q.weight"), &dv)?,
+                    sa_norm_k: f16_on(&format!("{p}.self_attn.norm_k.weight"), &dv)?,
+                    ca_q: lin_on(&format!("{p}.cross_attn.q"), &dv)?,
+                    ca_k: lin_on(&format!("{p}.cross_attn.k"), &dv)?,
+                    ca_v: lin_on(&format!("{p}.cross_attn.v"), &dv)?,
+                    ca_o: lin_on(&format!("{p}.cross_attn.o"), &dv)?,
+                    ca_norm_q: f16_on(&format!("{p}.cross_attn.norm_q.weight"), &dv)?,
+                    ca_norm_k: f16_on(&format!("{p}.cross_attn.norm_k.weight"), &dv)?,
+                    // The 1.3B is text-to-video: it has no frame to continue and no weights
+                    // that would read one.
+                    ca_k_img: None,
+                    ca_v_img: None,
+                    ca_norm_k_img: None,
+                    ffn0: lin_on(&format!("{p}.ffn.0"), &dv)?,
+                    ffn2: lin_on(&format!("{p}.ffn.2"), &dv)?,
+                    // Each block normalises on its own card: `ones` must live there too, or the
+                    // first block off the stem's device faults on a cross-device operand.
+                    ones: Tensor::from_vec_f32(vec![1.0f32; dim], (dim,))?.to_device(&dv)?,
+                    device: dv,
+                });
+            }
+            Ok(WanDit {
+                patch_w,
+                patch_b: f16("patch_embedding.bias")?,
+                text0: lin("text_embedding.0")?,
+                text2: lin("text_embedding.2")?,
+                time0: lin("time_embedding.0")?,
+                time2: lin("time_embedding.2")?,
+                time_proj: lin("time_projection.1")?,
+                blocks,
+                head: lin("head.head")?,
+                head_mod: ld.load("head.modulation")?.to_vec_f32(),
+                ones,
+                device,
+                dim,
+                n_heads,
+                img_emb: None,
+            })
         })
     }
 
@@ -588,10 +554,6 @@ impl WanDit {
         progress: Option<&crate::inference::serve::progress::ProgressFn<'_>>,
     ) -> Result<Self> {
         use crate::tensor::quantized::gguf_file;
-        const DIM: usize = 5120;
-        const N_LAYERS: usize = 40;
-        const N_HEADS: usize = 40;
-        const FFN: usize = 13824;
         const IN_CH: usize = 16;
         // A picked checkpoint is a whole DiT or a CORRECTION of one, exactly as on the 1.3B
         // path. The step-distillation adapters are published as rank-64 LoRAs of a few
@@ -615,276 +577,269 @@ impl WanDit {
             None => None,
         };
 
-        // -- unified multi-GPU placement over the 40 blocks (pack-first per card, spill to
-        //    CPU). Budget on the real Q8 file size (no F32 blow-up). KV reserve 0 (the DiT
-        //    runs full-sequence, not autoregressive). Same mechanism as the ACE-Step DiT. --
-        let model_size = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or_else(|_| weight_bytes_from_shape(DIM, N_LAYERS));
-        // Clip-derived activation demand at THIS request's dims - the first plan starts honest
-        // (the oom_retry/vram_degrade escalation below remains the safety net).
-        let act_reserve = dit_activation_bytes(clip_tokens, DIM, N_HEADS);
-        // Base headroom only - NO hardcoded resolution-specific reserve. The 14B's activation
-        // peak grows with resolution; rather than guess a magic number, the render wraps this in
-        // `oom_retry` (see bin/wan_render.rs): a denoise/VAE OOM calls `vram_degrade()`, which
-        // makes `probe_under_pressure` escalate the per-card reserve on the next attempt, re-planning
-        // with a more balanced split (and CPU only as a last resort). Self-adapting to any
-        // resolution / VRAM - same mechanism as the ACE-Step DiT.
-        // The activation demand IS the reserve. A flat base sat on top of it, which at
-        // this point is the same claim written twice: the allocator correction inside
-        // `dit_activation_bytes` is what that base was standing in for.
-        let reserve: u64 = act_reserve;
-        let cudas = crate::inference::place::vram_manager::probe_under_pressure(reserve);
-        let cuda_budget: Vec<(usize, u64)> = cudas.iter().map(|(i, fr, _)| (*i, *fr)).collect();
-        let plan = HeteroPlan::calculate_with_kv_reserve(
-            // The budgets below ALREADY exclude the reserve: `probe_under_pressure` probes through
-            // `probe_cuda_devices`, which returns `stable_free - reserve`. Passing it again here
-            // subtracted it TWICE - invisible at half a gigabyte, and fatal at twelve, where it
-            // took both cards to zero usable and sent a whole video DiT to the host.
-            N_LAYERS,
-            model_size,
-            &cuda_budget,
-            &[],
-            1.0,
-            0,
-            0,
-        );
-        let dev_of_kind = |k: DeviceKind| -> Device {
-            match k {
-                DeviceKind::Cuda(idx) => cudas
-                    .iter()
-                    .find(|(i, _, _)| *i == idx)
-                    .map(|(_, _, dv)| dv.clone())
-                    .unwrap_or(Device::Cpu),
-                _ => Device::Cpu,
-            }
-        };
-        let layer_device = |l: usize| -> Device {
-            plan.segments
-                .iter()
-                .find(|s| l >= s.layer_start && l < s.layer_end)
-                .map(|s| dev_of_kind(s.kind))
-                .unwrap_or(Device::Cpu)
-        };
-        let device = cudas
-            .first()
-            .map(|(_, _, dv)| dv.clone())
-            .unwrap_or(Device::Cpu);
-        eprintln!("[wan-14b] geometry: dim={DIM} blocks={N_LAYERS} heads={N_HEADS} hd={HEAD_DIM} ffn={FFN}");
-        eprintln!(
-            "[wan-14b] placement: {}",
-            plan.segments
-                .iter()
-                .map(|s| format!("{}:{}-{}", s.kind, s.layer_start, s.layer_end))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-
-        // QVarBuilder holds the Q8 weight matrices (host QTensors, uploaded per-block by
-        // `qmatmul_on` to that block's device). A separate gguf Content reader supplies the
-        // F32 bias/norm/modulation/patch tensors (dequantized -> native F32 on the target dev).
-        let vb = crate::inference::cache::qvb::from_gguf_cached(&path, &device)?;
         let mut f = std::fs::File::open(&path)
             .map_err(|e| crate::tensor::Error(format!("wan-14b open {path}: {e}")))?;
         let c = gguf_file::read_mapped_file(&f)?;
         // The SAME refusal the safetensors path makes, for the format every community
-        // fine-tune of this variant ships in. Without it a checkpoint of another shape -
-        // an I2V, or the 1.3B - shares enough of the block stack to load a long way in
-        // and then produce a video that is simply not the one asked for.
-        // Which KIND of checkpoint this is, read off the weights rather than the name: an
-        // image-to-video model carries an `img_emb` projection and takes 36 input channels
-        // where text-to-video takes 16 (16 noise + 4 mask + 16 for the frame it continues).
+        // fine-tune of this variant ships in. Which KIND of checkpoint this is, read off the
+        // weights rather than the name: an image-to-video model carries an `img_emb`
+        // projection and takes 36 input channels where text-to-video takes 16 (16 noise +
+        // 4 mask + 16 for the frame it continues).
         let is_i2v = c.tensor_infos.contains_key("img_emb.proj.1.weight");
         let in_ch = if is_i2v { I2V_IN_CH } else { IN_CH };
-        if let Some(info) = c.tensor_infos.get("patch_embedding.weight") {
-            if let Some(why) = check_wan_geometry(info.shape.dims(), DIM, in_ch) {
-                return Err(crate::tensor::Error(format!("{path}: {why}")));
-            }
+        // The width, depth and feed-forward width are the checkpoint's own.
+        let patch_shape = c
+            .tensor_infos
+            .get("patch_embedding.weight")
+            .map(|i| i.shape.dims().to_vec())
+            .unwrap_or_default();
+        let Some((dim, _)) = wan_patch_dims(&patch_shape) else {
+            return Err(crate::tensor::Error(format!(
+                "{path}: no Wan patch embedding in this checkpoint"
+            )));
+        };
+        if let Some(why) = check_wan_geometry(&patch_shape, dim, in_ch) {
+            return Err(crate::tensor::Error(format!("{path}: {why}")));
         }
+        let n_layers = wan_block_count(c.tensor_infos.keys().map(|k| k.as_str()));
+        let n_heads = dim / HEAD_DIM;
+        let ffn = c
+            .tensor_infos
+            .get("blocks.0.ffn.0.weight")
+            .map(|i| i.shape.elem_count() / dim.max(1))
+            .ok_or_else(|| crate::tensor::Error(format!("{path}: no blocks.0.ffn.0.weight")))?;
         if is_i2v {
             eprintln!(
                 "[wan-14b] image-to-video checkpoint: {I2V_IN_CH} input channels, \
                        CLIP image conditioning"
             );
         }
+        eprintln!("[wan-14b] geometry: dim={dim} blocks={n_layers} heads={n_heads} hd={HEAD_DIM} ffn={ffn}");
 
-        let qd = N_HEADS * HEAD_DIM; // q/k/v/o dim (full MHA, no GQA) == DIM
-        let mut blocks = Vec::with_capacity(N_LAYERS);
-        for l in 0..N_LAYERS {
-            crate::inference::serve::progress::note(
-                progress,
-                crate::inference::serve::progress::phase::LOAD_MODEL,
-                l,
-                N_LAYERS,
+        // The blocks are divided over the cards by the ladder in `place` on the file's size
+        // (the Q8 weights stay quantised on the card), with this request's clip-derived
+        // activation demand as each card's reserve. The DiT runs full-sequence, so no cache.
+        let demand = crate::inference::place::ladder::Demand {
+            layers: n_layers,
+            block_bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            runtime_reserve: dit_activation_bytes(clip_tokens, dim, n_heads),
+            ..Default::default()
+        };
+        crate::inference::place::ladder::load("Wan 14B DiT", &demand, |plan| {
+            let layer_devices = crate::inference::place::ladder::layer_devices(plan, n_layers);
+            let device = crate::inference::place::ladder::primary_device(plan);
+            eprintln!(
+                "[wan-14b] placement: {}",
+                plan.segments
+                    .iter()
+                    .map(|s| format!("{}:{}-{}", s.kind, s.layer_start, s.layer_end))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             );
-            let p = format!("blocks.{l}");
-            let ld = layer_device(l);
-            // Quantized weight `[out,in]` (Q8 on device) + its F32 bias.
-            let ql = |in_dim: usize,
-                      out_dim: usize,
-                      nm: &str,
-                      c: &gguf_file::Content,
-                      f: &mut std::fs::File|
-             -> Result<WanLinear> {
-                wan_qlin(
-                    &vb,
-                    c,
-                    f,
-                    in_dim,
-                    out_dim,
-                    &format!("{p}.{nm}"),
-                    &ld,
-                    lora.as_ref(),
-                )
-            };
-            blocks.push(WanBlock {
-                modulation: wan_load_t(&ld, &c, &mut f, &format!("{p}.modulation"))?.to_vec_f32(),
-                norm3_w: wan_load_t(&ld, &c, &mut f, &format!("{p}.norm3.weight"))?,
-                norm3_b: wan_load_t(&ld, &c, &mut f, &format!("{p}.norm3.bias"))?,
-                sa_q: ql(DIM, qd, "self_attn.q", &c, &mut f)?,
-                sa_k: ql(DIM, qd, "self_attn.k", &c, &mut f)?,
-                sa_v: ql(DIM, qd, "self_attn.v", &c, &mut f)?,
-                sa_o: ql(qd, DIM, "self_attn.o", &c, &mut f)?,
-                sa_norm_q: wan_load_t(&ld, &c, &mut f, &format!("{p}.self_attn.norm_q.weight"))?,
-                sa_norm_k: wan_load_t(&ld, &c, &mut f, &format!("{p}.self_attn.norm_k.weight"))?,
-                ca_q: ql(DIM, qd, "cross_attn.q", &c, &mut f)?,
-                ca_k: ql(DIM, qd, "cross_attn.k", &c, &mut f)?,
-                ca_v: ql(DIM, qd, "cross_attn.v", &c, &mut f)?,
-                ca_o: ql(qd, DIM, "cross_attn.o", &c, &mut f)?,
-                ca_norm_q: wan_load_t(&ld, &c, &mut f, &format!("{p}.cross_attn.norm_q.weight"))?,
-                ca_norm_k: wan_load_t(&ld, &c, &mut f, &format!("{p}.cross_attn.norm_k.weight"))?,
-                // Image-to-video only. The checkpoint carries these per block, or it does
-                // not carry them at all - there is no half-conditioned variant.
-                ca_k_img: if is_i2v {
-                    Some(ql(DIM, qd, "cross_attn.k_img", &c, &mut f)?)
-                } else {
-                    None
-                },
-                ca_v_img: if is_i2v {
-                    Some(ql(DIM, qd, "cross_attn.v_img", &c, &mut f)?)
-                } else {
-                    None
-                },
-                ca_norm_k_img: if is_i2v {
-                    Some(wan_load_t(
+
+            // QVarBuilder holds the Q8 weight matrices (host QTensors, uploaded per-block by
+            // `qmatmul_on` to that block's device). The gguf Content reader supplies the F32
+            // bias/norm/modulation/patch tensors (dequantized -> native F32 on the target dev).
+            let vb = crate::inference::cache::qvb::from_gguf_cached(&path, &device)?;
+            let qd = n_heads * HEAD_DIM; // q/k/v/o dim (full MHA, no GQA) == dim
+            let mut blocks = Vec::with_capacity(n_layers);
+            for l in 0..n_layers {
+                crate::inference::serve::progress::note(
+                    progress,
+                    crate::inference::serve::progress::phase::LOAD_MODEL,
+                    l,
+                    n_layers,
+                );
+                let p = format!("blocks.{l}");
+                let ld = layer_devices[l].clone();
+                // Quantized weight `[out,in]` (Q8 on device) + its F32 bias.
+                let ql = |in_dim: usize,
+                          out_dim: usize,
+                          nm: &str,
+                          c: &gguf_file::Content,
+                          f: &mut std::fs::File|
+                 -> Result<WanLinear> {
+                    wan_qlin(
+                        &vb,
+                        c,
+                        f,
+                        in_dim,
+                        out_dim,
+                        &format!("{p}.{nm}"),
+                        &ld,
+                        lora.as_ref(),
+                    )
+                };
+                blocks.push(WanBlock {
+                    modulation: wan_load_t(&ld, &c, &mut f, &format!("{p}.modulation"))?
+                        .to_vec_f32(),
+                    norm3_w: wan_load_t(&ld, &c, &mut f, &format!("{p}.norm3.weight"))?,
+                    norm3_b: wan_load_t(&ld, &c, &mut f, &format!("{p}.norm3.bias"))?,
+                    sa_q: ql(dim, qd, "self_attn.q", &c, &mut f)?,
+                    sa_k: ql(dim, qd, "self_attn.k", &c, &mut f)?,
+                    sa_v: ql(dim, qd, "self_attn.v", &c, &mut f)?,
+                    sa_o: ql(qd, dim, "self_attn.o", &c, &mut f)?,
+                    sa_norm_q: wan_load_t(
                         &ld,
                         &c,
                         &mut f,
-                        &format!("{p}.cross_attn.norm_k_img.weight"),
-                    )?)
-                } else {
-                    None
-                },
-                ffn0: ql(DIM, FFN, "ffn.0", &c, &mut f)?,
-                ffn2: ql(FFN, DIM, "ffn.2", &c, &mut f)?,
-                ones: Tensor::from_vec_f32(vec![1.0f32; DIM], (DIM,))?.to_device(&ld)?,
-                device: ld,
-            });
-        }
-        // Built BEFORE the struct literal takes ownership of `device`.
-        let img_emb = if is_i2v {
-            Some(ImgEmb {
-                ln1_w: wan_load_t(&device, &c, &mut f, "img_emb.proj.0.weight")?,
-                ln1_b: wan_load_t(&device, &c, &mut f, "img_emb.proj.0.bias")?,
-                fc1: wan_qlin(
+                        &format!("{p}.self_attn.norm_q.weight"),
+                    )?,
+                    sa_norm_k: wan_load_t(
+                        &ld,
+                        &c,
+                        &mut f,
+                        &format!("{p}.self_attn.norm_k.weight"),
+                    )?,
+                    ca_q: ql(dim, qd, "cross_attn.q", &c, &mut f)?,
+                    ca_k: ql(dim, qd, "cross_attn.k", &c, &mut f)?,
+                    ca_v: ql(dim, qd, "cross_attn.v", &c, &mut f)?,
+                    ca_o: ql(qd, dim, "cross_attn.o", &c, &mut f)?,
+                    ca_norm_q: wan_load_t(
+                        &ld,
+                        &c,
+                        &mut f,
+                        &format!("{p}.cross_attn.norm_q.weight"),
+                    )?,
+                    ca_norm_k: wan_load_t(
+                        &ld,
+                        &c,
+                        &mut f,
+                        &format!("{p}.cross_attn.norm_k.weight"),
+                    )?,
+                    // Image-to-video only. The checkpoint carries these per block, or it does
+                    // not carry them at all - there is no half-conditioned variant.
+                    ca_k_img: if is_i2v {
+                        Some(ql(dim, qd, "cross_attn.k_img", &c, &mut f)?)
+                    } else {
+                        None
+                    },
+                    ca_v_img: if is_i2v {
+                        Some(ql(dim, qd, "cross_attn.v_img", &c, &mut f)?)
+                    } else {
+                        None
+                    },
+                    ca_norm_k_img: if is_i2v {
+                        Some(wan_load_t(
+                            &ld,
+                            &c,
+                            &mut f,
+                            &format!("{p}.cross_attn.norm_k_img.weight"),
+                        )?)
+                    } else {
+                        None
+                    },
+                    ffn0: ql(dim, ffn, "ffn.0", &c, &mut f)?,
+                    ffn2: ql(ffn, dim, "ffn.2", &c, &mut f)?,
+                    ones: Tensor::from_vec_f32(vec![1.0f32; dim], (dim,))?.to_device(&ld)?,
+                    device: ld,
+                });
+            }
+            // Built BEFORE the struct literal takes ownership of `device`.
+            let img_emb = if is_i2v {
+                Some(ImgEmb {
+                    ln1_w: wan_load_t(&device, &c, &mut f, "img_emb.proj.0.weight")?,
+                    ln1_b: wan_load_t(&device, &c, &mut f, "img_emb.proj.0.bias")?,
+                    fc1: wan_qlin(
+                        &vb,
+                        &c,
+                        &mut f,
+                        CLIP_WIDTH,
+                        CLIP_WIDTH,
+                        "img_emb.proj.1",
+                        &device,
+                        lora.as_ref(),
+                    )?,
+                    fc2: wan_qlin(
+                        &vb,
+                        &c,
+                        &mut f,
+                        CLIP_WIDTH,
+                        dim,
+                        "img_emb.proj.3",
+                        &device,
+                        lora.as_ref(),
+                    )?,
+                    ln2_w: wan_load_t(&device, &c, &mut f, "img_emb.proj.4.weight")?,
+                    ln2_b: wan_load_t(&device, &c, &mut f, "img_emb.proj.4.bias")?,
+                })
+            } else {
+                None
+            };
+            Ok(WanDit {
+                patch_w: wan_load_t(&device, &c, &mut f, "patch_embedding.weight")?
+                    .reshape((dim, in_ch, PATCH_H, PATCH_W))?,
+                patch_b: wan_load_t(&device, &c, &mut f, "patch_embedding.bias")?,
+                text0: wan_qlin(
                     &vb,
                     &c,
                     &mut f,
-                    CLIP_WIDTH,
-                    CLIP_WIDTH,
-                    "img_emb.proj.1",
+                    4096,
+                    dim,
+                    "text_embedding.0",
                     &device,
                     lora.as_ref(),
                 )?,
-                fc2: wan_qlin(
+                text2: wan_qlin(
                     &vb,
                     &c,
                     &mut f,
-                    CLIP_WIDTH,
-                    DIM,
-                    "img_emb.proj.3",
+                    dim,
+                    dim,
+                    "text_embedding.2",
                     &device,
                     lora.as_ref(),
                 )?,
-                ln2_w: wan_load_t(&device, &c, &mut f, "img_emb.proj.4.weight")?,
-                ln2_b: wan_load_t(&device, &c, &mut f, "img_emb.proj.4.bias")?,
+                time0: wan_qlin(
+                    &vb,
+                    &c,
+                    &mut f,
+                    FREQ_DIM,
+                    dim,
+                    "time_embedding.0",
+                    &device,
+                    lora.as_ref(),
+                )?,
+                time2: wan_qlin(
+                    &vb,
+                    &c,
+                    &mut f,
+                    dim,
+                    dim,
+                    "time_embedding.2",
+                    &device,
+                    lora.as_ref(),
+                )?,
+                time_proj: wan_qlin(
+                    &vb,
+                    &c,
+                    &mut f,
+                    dim,
+                    6 * dim,
+                    "time_projection.1",
+                    &device,
+                    lora.as_ref(),
+                )?,
+                head: wan_qlin(
+                    &vb,
+                    &c,
+                    &mut f,
+                    dim,
+                    OUT_CH * PATCH_H * PATCH_W,
+                    "head.head",
+                    &device,
+                    lora.as_ref(),
+                )?,
+                head_mod: wan_load_t(&device, &c, &mut f, "head.modulation")?.to_vec_f32(),
+                ones: Tensor::from_vec_f32(vec![1.0f32; dim], (dim,))?.to_device(&device)?,
+                blocks,
+                device,
+                dim,
+                n_heads,
+                // The projection that turns a CLIP embedding of the continued frame into this
+                // model's width. `img_emb.proj` is norm, linear, GELU (no weights), linear, norm.
+                img_emb,
             })
-        } else {
-            None
-        };
-        Ok(WanDit {
-            patch_w: wan_load_t(&device, &c, &mut f, "patch_embedding.weight")?
-                .reshape((DIM, in_ch, PATCH_H, PATCH_W))?,
-            patch_b: wan_load_t(&device, &c, &mut f, "patch_embedding.bias")?,
-            text0: wan_qlin(
-                &vb,
-                &c,
-                &mut f,
-                4096,
-                DIM,
-                "text_embedding.0",
-                &device,
-                lora.as_ref(),
-            )?,
-            text2: wan_qlin(
-                &vb,
-                &c,
-                &mut f,
-                DIM,
-                DIM,
-                "text_embedding.2",
-                &device,
-                lora.as_ref(),
-            )?,
-            time0: wan_qlin(
-                &vb,
-                &c,
-                &mut f,
-                FREQ_DIM,
-                DIM,
-                "time_embedding.0",
-                &device,
-                lora.as_ref(),
-            )?,
-            time2: wan_qlin(
-                &vb,
-                &c,
-                &mut f,
-                DIM,
-                DIM,
-                "time_embedding.2",
-                &device,
-                lora.as_ref(),
-            )?,
-            time_proj: wan_qlin(
-                &vb,
-                &c,
-                &mut f,
-                DIM,
-                6 * DIM,
-                "time_projection.1",
-                &device,
-                lora.as_ref(),
-            )?,
-            head: wan_qlin(
-                &vb,
-                &c,
-                &mut f,
-                DIM,
-                OUT_CH * PATCH_H * PATCH_W,
-                "head.head",
-                &device,
-                lora.as_ref(),
-            )?,
-            head_mod: wan_load_t(&device, &c, &mut f, "head.modulation")?.to_vec_f32(),
-            ones: Tensor::from_vec_f32(vec![1.0f32; DIM], (DIM,))?.to_device(&device)?,
-            blocks,
-            device,
-            dim: DIM,
-            n_heads: N_HEADS,
-            // The projection that turns a CLIP embedding of the continued frame into this
-            // model's width. `img_emb.proj` is norm, linear, GELU (no weights), linear, norm.
-            img_emb,
         })
     }
 
