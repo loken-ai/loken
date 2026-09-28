@@ -345,7 +345,14 @@ pub fn zgate_rmsnorm(o: &Tensor, z: &Tensor, norm_w: &Tensor, eps: f32) -> Resul
     n * crate::tensor::ops::silu(z)?
 }
 
-pub fn l2norm_gqa(x: &Tensor, _kg: usize, _kd: usize, _rep: usize, eps: f32) -> Result<Tensor> {
+pub fn l2norm_gqa(
+    x: &Tensor,
+    _kg: usize,
+    _kd: usize,
+    _rep: usize,
+    _tiled: bool,
+    eps: f32,
+) -> Result<Tensor> {
     // L2-normalize over the last dim.
     let xf = x.to_dtype(DType::F32)?;
     let norm = xf.sqr()?.sum_keepdim(D::Minus1)?.sqrt()?;

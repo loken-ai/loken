@@ -94,7 +94,8 @@ cuda_launchers! {
         alpha: *const f32, beta_in: *const f32, a_log: *const f32, dt_bias: *const f32,
         g_pre: *mut f32, beta: *mut f32, n: i32, h: i32);
     loken_l2norm_gqa(
-        x: *const f32, y: *mut f32, seq: i32, kg: i32, kd: i32, rep: i32, eps: f32);
+        x: *const f32, y: *mut f32, seq: i32, kg: i32, kd: i32, rep: i32, tiled: i32,
+        eps: f32);
     loken_head_rmsnorm(x: *const f32, w: *const f32, y: *mut f32, n: i32, d: i32, eps: f32);
     loken_gate_gemv_f32(xs: *const c_void, gate_w: *const c_void,
         logits: *mut c_void, hidden: i32, n_rows: i32, n_experts: i32);

@@ -3,7 +3,9 @@
 // (unsqueeze/broadcast_as/reshape ≈2 ops) with ONE kernel:
 //
 //   inv[t,kh] = rsqrt( sum_d x[t,kh,d]^2 + eps )
-//   y[t, hv, d] = x[t, hv % kg, d] * inv[t, hv % kg]      (TILED: hv = j*kg + kh)
+//   y[t, hv, d] = x[t, kh, d] * inv[t, kh] for every v-head hv that k-head kh feeds:
+//     tiled   (tiled != 0): hv = j*kg + kh, v-head hv reads k-head hv % kg
+//     blocked (tiled == 0): hv = kh*rep + j, v-head hv reads k-head hv / rep
 //
 // Row-major f32: x [seq, kg, kd], y [seq, vg, kd] with vg = rep*kg. One warp per
 // (t, kg-head) row reduces sum-of-squares over kd, then writes the normalized
@@ -12,7 +14,7 @@
 extern "C" __global__ void loken_l2norm_gqa_kernel(
         const float * __restrict__ x,
         float * __restrict__ y,
-        int seq, int kg, int kd, int rep, float eps) {
+        int seq, int kg, int kd, int rep, int tiled, float eps) {
     const int row  = blockIdx.x;          // 0 .. seq*kg-1  (= t*kg + kh)
     const int lane = threadIdx.x;
     if (row >= seq * kg) return;
@@ -29,14 +31,14 @@ extern "C" __global__ void loken_l2norm_gqa_kernel(
     const float inv = rsqrtf(ss + eps);
 
     for (int j = 0; j < rep; j++) {
-        const int hv = j * kg + kh;
+        const int hv = tiled ? j * kg + kh : kh * rep + j;
         float * yr = y + ((long) t * vg + hv) * kd;
         for (int d = lane; d < kd; d += 32) yr[d] = xr[d] * inv;
     }
 }
 
 extern "C" void loken_l2norm_gqa(
-        const float * x, float * y, int seq, int kg, int kd, int rep, float eps,
+        const float * x, float * y, int seq, int kg, int kd, int rep, int tiled, float eps,
         cudaStream_t stream) {
-    loken_l2norm_gqa_kernel<<<seq * kg, 32, 0, stream>>>(x, y, seq, kg, kd, rep, eps);
+    loken_l2norm_gqa_kernel<<<seq * kg, 32, 0, stream>>>(x, y, seq, kg, kd, rep, tiled, eps);
 }

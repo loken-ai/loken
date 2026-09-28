@@ -272,7 +272,14 @@ pub fn head_rmsnorm(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {
 /// Fused L2-norm + GQA tile for DeltaNet q/k. `x` [seq, kg, kd] (f32, CUDA,
 /// contiguous). Returns `y` [seq, vg, kd] with vg=rep.kg, where each v-head hv
 /// gets `l2norm(x[:, hv%kg, :])` (TILED GQA). Replaces ~5 tensor ops per q/k.
-pub fn l2norm_gqa(x: &Tensor, kg: usize, kd: usize, rep: usize, eps: f32) -> Result<Tensor> {
+pub fn l2norm_gqa(
+    x: &Tensor,
+    kg: usize,
+    kd: usize,
+    rep: usize,
+    tiled: bool,
+    eps: f32,
+) -> Result<Tensor> {
     let dev = x.device().as_cuda_device()?;
     let (seq, _kg, _kd) = x.dims3()?;
     let vg = rep * kg;
@@ -299,6 +306,7 @@ pub fn l2norm_gqa(x: &Tensor, kg: usize, kd: usize, rep: usize, eps: f32) -> Res
             kg as i32,
             kd as i32,
             rep as i32,
+            i32::from(tiled),
             eps,
             stream,
         );

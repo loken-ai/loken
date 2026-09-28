@@ -153,6 +153,9 @@ pub struct Qwen35Config {
     pub n_k_heads: usize,   // ssm.group_count = 16
     pub n_v_heads: usize,   // ssm.time_step_rank = 32
     pub d_inner: usize,     // ssm.inner_size = 4096
+    /// How the v-heads share the k-heads when there are more of them: tiled (v-head h
+    /// reads k-head h % n_k, `ssm.v_head_reordered`) or in blocks (h / (n_v / n_k)).
+    pub v_heads_tiled: bool,
 }
 
 impl Qwen35Config {
@@ -208,6 +211,10 @@ impl Qwen35Config {
             n_k_heads: ou("ssm.group_count", 16),
             n_v_heads: ou("ssm.time_step_rank", 32),
             d_inner: ou("ssm.inner_size", 4096),
+            v_heads_tiled: matches!(
+                g("ssm.v_head_reordered"),
+                Some(gguf_file::Value::Bool(true))
+            ),
         })
     }
 }
@@ -639,6 +646,7 @@ pub struct Qwen35DeltaNet {
     head_v_dim: usize,
     n_k_heads: usize,
     n_v_heads: usize,
+    v_heads_tiled: bool,
     conv_dim: usize,
     conv_kernel: usize,
     rms_eps: f64,
@@ -713,6 +721,7 @@ impl Qwen35DeltaNet {
             head_v_dim,
             n_k_heads: cfg.n_k_heads,
             n_v_heads: cfg.n_v_heads,
+            v_heads_tiled: cfg.v_heads_tiled,
             conv_dim,
             conv_kernel: cfg.conv_kernel,
             rms_eps: cfg.rms_eps,
@@ -959,14 +968,14 @@ impl Qwen35DeltaNet {
             let yt = &mut y[t * vg * vd..(t + 1) * vg * vd];
             let (a_log, dt, norm) = (&st.a_log, &st.dt, &st.norm);
             let (qn_r, kn_r) = (&qn, &kn);
-            // recurrence per v-head (tiled GQA: v-head h reads k-head h % kg
-            // - matches the reference broadcast (b, rep, kg, .) reshape)
+            // recurrence per v-head, each reading the k-head it shares
+            let (tiled, rep) = (self.v_heads_tiled, vg / kg);
             st.ssm
                 .par_chunks_mut(vd * kd)
                 .zip(yt.par_chunks_mut(vd))
                 .enumerate()
                 .for_each(|(h, (s, yh))| {
-                    let j = h % kg;
+                    let j = if tiled { h % kg } else { h / rep };
                     let (q, k) = (&qn_r[j * kd..(j + 1) * kd], &kn_r[j * kd..(j + 1) * kd]);
                     let v = &v_all[h * vd..(h + 1) * vd];
                     let sp = (1.0 + (ar[h] + dt[h]).exp()).ln();
@@ -1043,17 +1052,17 @@ impl Qwen35DeltaNet {
             // L2-norm q,k per head; scale q by 1/sqrt(kd)
             let q = (l2norm(&q, 1e-6)? * (1.0 / (kd as f64).sqrt()))?;
             let k = l2norm(&k, 1e-6)?;
-            // GQA: repeat q,k heads to vg. qwen35 has ssm.v_head_reordered=true ->
-            // TILED repeat (v-head h ← k-head h%kg), NOT interleave (h/rep).
-            // (ollama Repeat4D(.,numVHeads,.) tiles the k-head block.)
-            let q = q
-                .unsqueeze(1)?
-                .broadcast_as((b, rep, kg, kd))?
-                .reshape((b, vg, kd))?;
-            let k = k
-                .unsqueeze(1)?
-                .broadcast_as((b, rep, kg, kd))?
-                .reshape((b, vg, kd))?;
+            // GQA: repeat q,k heads to vg, tiled (v-head h reads k-head h % kg) or in
+            // blocks (h / rep) as the file says.
+            let spread = |x: Tensor| -> Result<Tensor> {
+                if self.v_heads_tiled {
+                    x.unsqueeze(1)?.broadcast_as((b, rep, kg, kd))?.reshape((b, vg, kd))
+                } else {
+                    x.unsqueeze(2)?.broadcast_as((b, kg, rep, kd))?.reshape((b, vg, kd))
+                }
+            };
+            let q = spread(q)?;
+            let k = spread(k)?;
             // gates: g = -exp(a_log) * softplus(alpha + dt) ; decay = exp(g) ; beta = sigmoid(b_proj)
             let alpha = a_t.to_dtype(DType::F32)?; // [b, n_v]
                                                    // softplus(alpha + dt_bias). The fused launch replaces broadcast_add + exp +
@@ -1155,8 +1164,9 @@ impl Qwen35DeltaNet {
             .reshape((seq, vg, vd))?
             .contiguous()?;
         // 3+4. fused l2norm + GQA-tile (kg -> vg) for q,k -> [seq, vg, kd] (ONE kernel each)
-        let qf = crate::inference::moe_cuda::l2norm_gqa(&q, kg, kd, rep, 1e-6)?;
-        let kf = crate::inference::moe_cuda::l2norm_gqa(&k, kg, kd, rep, 1e-6)?;
+        let tiled = self.v_heads_tiled;
+        let qf = crate::inference::moe_cuda::l2norm_gqa(&q, kg, kd, rep, tiled, 1e-6)?;
+        let kf = crate::inference::moe_cuda::l2norm_gqa(&k, kg, kd, rep, tiled, 1e-6)?;
         // 5. fused gating (ONE kernel): g_pre = a_log.softplus(alpha+dt) (PRE-exp;
         // recurrence kernel does expf); beta = sigmoid(b_proj).
         // F16 a_proj/b_proj outputs fed straight to the F16-input gate kernel (no ->F32 cast).
