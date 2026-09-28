@@ -98,6 +98,19 @@ impl SafeTensorsLoader {
         self.index.contains_key(name)
     }
 
+    /// Every tensor's size in bytes as stored, read from the headers only.
+    pub fn byte_sizes(&self) -> Vec<(String, usize)> {
+        let mut out = Vec::with_capacity(self.index.len());
+        for map in &self.maps {
+            if let Ok(st) = safetensors::SafeTensors::deserialize(map) {
+                for (name, view) in st.tensors() {
+                    out.push((name, view.data().len()));
+                }
+            }
+        }
+        out
+    }
+
     /// A tensor's shape WITHOUT reading its data.
     ///
     /// The header is already parsed and mapped, so this costs nothing - which is the
@@ -264,6 +277,16 @@ impl MmapedSafetensors {
 
     pub fn names(&self) -> Vec<&str> {
         self.inner.names()
+    }
+
+    /// Every tensor's size in bytes as stored, read from the headers only.
+    pub fn byte_sizes(&self) -> Vec<(String, usize)> {
+        self.inner.byte_sizes()
+    }
+
+    /// A tensor's shape, read from the header only.
+    pub fn shape_of(&self, name: &str) -> Option<Vec<usize>> {
+        self.inner.shape_of(name)
     }
 }
 

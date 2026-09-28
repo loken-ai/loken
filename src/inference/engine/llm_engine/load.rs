@@ -15,20 +15,162 @@ use super::*;
 /// builds an all-CPU plan, and forces kv_quant off (Q8/Q4 KV require
 /// CUDA). Used by the load-time OOM-recovery ladder when neither the
 /// optimistic single-GPU placement nor a forced CUDA split fits.
+/// Where a generic transformer's weights come from. The hetero route plans the placement
+/// and recovers from out-of-memory the same way for every source; only reading a layer
+/// differs.
+pub(super) enum GenericWeights<'a> {
+    Gguf {
+        mmap_bytes: &'a [u8],
+        mmap: &'a std::sync::Arc<memmap2::Mmap>,
+    },
+    Awq {
+        dir: &'a str,
+        shards: &'a [String],
+    },
+}
+
+impl GenericWeights<'_> {
+    /// The model built on `plan`.
+    pub(super) fn build(
+        &self,
+        cuda_devices: &std::collections::HashMap<usize, Device>,
+        plan: &crate::inference::place::layer_executor::HeteroPlan,
+        kv_quant: KvQuant,
+        max_kv_seq_len: Option<usize>,
+    ) -> crate::tensor::Result<GenericHeteroTransformer> {
+        match self {
+            GenericWeights::Gguf { mmap_bytes, mmap } => {
+                let content = gguf_file::Content::read_mapped(
+                    &mut Cursor::new(*mmap_bytes),
+                    (*mmap).clone(),
+                )?;
+                GenericHeteroTransformer::from_gguf_with_kv_quant(
+                    content,
+                    mmap_bytes,
+                    cuda_devices,
+                    plan,
+                    kv_quant,
+                    max_kv_seq_len,
+                )
+            }
+            GenericWeights::Awq { dir, shards } => GenericHeteroTransformer::from_awq_safetensors(
+                dir,
+                shards,
+                cuda_devices,
+                plan,
+                kv_quant,
+                max_kv_seq_len,
+            ),
+        }
+    }
+
+    /// Bytes of the repeating blocks and of the output head, as the cards will hold them.
+    /// `None` when the source cannot say, and the file size stands in.
+    pub(super) fn block_and_head_bytes(&self, content: &gguf_file::Content) -> Option<(u64, u64)> {
+        match self {
+            GenericWeights::Gguf { .. } => {
+                let tensor_bytes = |name: &str| {
+                    content
+                        .tensor_infos
+                        .get(name)
+                        .map_or(0, |t| t.size_in_bytes() as u64)
+                };
+                let block_bytes: u64 = content
+                    .tensor_infos
+                    .iter()
+                    .filter(|(n, _)| n.starts_with("blk."))
+                    .map(|(_, t)| t.size_in_bytes() as u64)
+                    .sum();
+                // An untied model uploads `output.weight`; a tied one uploads its
+                // embedding table as the projection.
+                let head_bytes = match tensor_bytes("output.weight") {
+                    0 => tensor_bytes("token_embd.weight"),
+                    b => b,
+                };
+                (block_bytes > 0).then_some((block_bytes, head_bytes))
+            }
+            GenericWeights::Awq { shards, .. } => {
+                let st =
+                    unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(shards) }.ok()?;
+                let block_bytes: u64 = st
+                    .byte_sizes()
+                    .iter()
+                    .filter(|(n, _)| n.starts_with("model.layers."))
+                    .map(|(_, b)| *b as u64)
+                    .sum();
+                // The head is uploaded as dense F16.
+                let head = if st.get("lm_head.weight").is_ok() {
+                    "lm_head.weight"
+                } else {
+                    "model.embed_tokens.weight"
+                };
+                let head_bytes = st
+                    .shape_of(head)
+                    .map_or(0, |d| d.iter().product::<usize>() as u64 * 2);
+                Some((block_bytes, head_bytes))
+            }
+        }
+    }
+}
+
+/// An AWQ checkpoint described as the header the loading route reads: its config, its
+/// tokenizer, its end-of-sequence ids and its declared context, beside the shards that
+/// carry the layers.
+pub(super) fn awq_checkpoint(dir: &str) -> AnyResult<(gguf_file::Content, Vec<String>)> {
+    use crate::inference::load::awq_loader as awql;
+    let cfg = awql::parse_config_json(dir)?;
+    let mut shards: Vec<String> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    shards.sort();
+    if shards.is_empty() {
+        return Err(anyhow!("AWQ: no *.safetensors shards in {dir}"));
+    }
+    let st = unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(&shards)? };
+    let present = awql::AwqTensorPresence {
+        has_q_bias: st.get("model.layers.0.self_attn.q_proj.bias").is_ok(),
+        has_qk_norm: st.get("model.layers.0.self_attn.q_norm.weight").is_ok(),
+    };
+    let mut content = awql::synth_gguf_content(&cfg, present);
+    let arch = cfg.gguf_arch.clone();
+    let meta = &mut content.metadata;
+    let tokenizer = std::fs::read_to_string(format!("{dir}/tokenizer.json"))
+        .map_err(|e| anyhow!("AWQ tokenizer {dir}/tokenizer.json: {e}"))?;
+    meta.insert(
+        super::gguf::EMBEDDED_TOKENIZER_KEY.to_string(),
+        gguf_file::Value::String(tokenizer),
+    );
+    let (eos, extra) = awq_eos_tokens(dir);
+    meta.insert(
+        "tokenizer.ggml.eos_token_id".into(),
+        gguf_file::Value::U32(eos),
+    );
+    if !extra.is_empty() {
+        meta.insert(
+            "tokenizer.ggml.eos_token_ids".into(),
+            gguf_file::Value::Array(extra.into_iter().map(gguf_file::Value::U32).collect()),
+        );
+    }
+    meta.insert(
+        format!("{arch}.context_length"),
+        gguf_file::Value::U32(declared_context(std::path::Path::new(dir)) as u32),
+    );
+    meta.insert(
+        format!("{arch}.vocab_size"),
+        gguf_file::Value::U32(cfg.vocab_size as u32),
+    );
+    Ok((content, shards))
+}
+
 pub(super) fn load_generic_on_cpu(
-    mmap_bytes: &[u8],
-    // What backs `mmap_bytes`. Taken alongside them so the pair cannot come apart: this is
-    // the last-resort placement, reached only by models too large to fit anywhere else, and
-    // it is precisely where copying every tensor into owned host memory costs the most.
-    mmap_owner: &std::sync::Arc<memmap2::Mmap>,
+    weights: &GenericWeights<'_>,
     arch: &str,
     num_layers: usize,
     file_size: u64,
     projector_blob: Option<&std::path::Path>,
 ) -> AnyResult<BoxedModelBackend> {
-    let content_fb =
-        gguf_file::Content::read_mapped(&mut Cursor::new(mmap_bytes), mmap_owner.clone())
-            .map_err(|e| anyhow!("GGUF re-parse failed: {e}"))?;
     let cpu_plan = crate::inference::place::layer_executor::HeteroPlan::calculate(
         num_layers,
         file_size,
@@ -37,14 +179,7 @@ pub(super) fn load_generic_on_cpu(
         1.0,
     );
     let empty_devs = std::collections::HashMap::new();
-    match GenericHeteroTransformer::from_gguf_with_kv_quant(
-        content_fb,
-        mmap_bytes,
-        &empty_devs,
-        &cpu_plan,
-        KvQuant::Off,
-        None,
-    ) {
+    match weights.build(&empty_devs, &cpu_plan, KvQuant::Off, None) {
         Ok(m) => {
             info!("✅ {} loaded on CPU (fallback, kv_quant forced off)", arch);
             try_wrap_with_vision(m, projector_blob)
@@ -53,20 +188,8 @@ pub(super) fn load_generic_on_cpu(
     }
 }
 
-/// GPU+CPU hybrid OOM-recovery. Reached when the optimistic and forced
-/// even-GPU-split plans both OOM at load (the flat weights+KV per-layer
-/// accounting under-reserves for the activation peak / CUDA scratch, so
-/// `calculate_with_kv` over-committed the GPUs). Instead of collapsing to
-/// pure CPU - which throws away ALL GPU acceleration - we retry with
-/// progressively tighter GPU budgets. A smaller budget makes
-/// `calculate_with_kv` place fewer layers on the GPUs and spill the
-/// remainder to CPU, yielding a genuine GPU0(+GPU1)+CPU hybrid that fits.
-/// Only the all-CPU plan is the true last resort.
 pub(super) fn load_generic_hybrid_or_cpu(
-    mmap_bytes: &[u8],
-    // Threaded alongside the bytes for the same reason as in `load_generic_on_cpu`: a
-    // re-parse that loses it turns every weight into committed host memory, silently.
-    mmap_owner: &std::sync::Arc<memmap2::Mmap>,
+    weights: &GenericWeights<'_>,
     arch: &str,
     num_layers: usize,
     file_size: u64,
@@ -123,17 +246,7 @@ pub(super) fn load_generic_hybrid_or_cpu(
         if gpu_layers == 0 || !has_cpu {
             continue;
         }
-        let content_fb =
-            gguf_file::Content::read_mapped(&mut Cursor::new(mmap_bytes), mmap_owner.clone())
-                .map_err(|e| anyhow!("GGUF re-parse failed: {e}"))?;
-        match GenericHeteroTransformer::from_gguf_with_kv_quant(
-            content_fb,
-            mmap_bytes,
-            hetero_cuda_devs,
-            &plan,
-            kv_quant,
-            Some(effective_ctx),
-        ) {
+        match weights.build(hetero_cuda_devs, &plan, kv_quant, Some(effective_ctx)) {
             Ok(m) => {
                 info!(
                     "✅ {} recovered via GPU+CPU HYBRID ({}% GPU budget): {}/{} layers on GPU, {} on CPU ({} segments)",
@@ -148,14 +261,7 @@ pub(super) fn load_generic_hybrid_or_cpu(
         }
     }
     warn!("All GPU+CPU hybrid splits failed; loading pure CPU (last resort)");
-    load_generic_on_cpu(
-        mmap_bytes,
-        mmap_owner,
-        arch,
-        num_layers,
-        file_size,
-        projector_blob,
-    )
+    load_generic_on_cpu(weights, arch, num_layers, file_size, projector_blob)
 }
 
 /// Resolve a model reference to an AWQ checkpoint directory. Accepts
@@ -325,7 +431,6 @@ pub(super) fn declared_context(dir: &std::path::Path) -> usize {
 
 /// Read the EOS token id(s) for an AWQ checkpoint from generation_config.json
 /// (falling back to config.json). `eos_token_id` may be a scalar or an array.
-#[cfg(feature = "cuda")]
 pub(super) fn awq_eos_tokens(dir: &str) -> (u32, Vec<u32>) {
     let read = |f: &str| {
         std::fs::read_to_string(format!("{dir}/{f}"))
@@ -354,106 +459,6 @@ pub(super) fn awq_eos_tokens(dir: &str) -> (u32, Vec<u32>) {
         ids.push(0); // safe fallback; sampler also honors tokenizer-side stops
     }
     (ids[0], ids[1..].to_vec())
-}
-
-/// Build a `LoadedModelState` from an AWQ (HF safetensors) checkpoint.
-/// Self-contained - bypasses the GGUF machinery entirely. Single-GPU placement
-/// (cuda:0); the 2-GPU split for deepseek-r1:32b is deferred.
-#[cfg(feature = "cuda")]
-pub(super) fn load_awq_model_state(
-    awq_dir: &str,
-    model_id: &str,
-    user_context_length: usize,
-) -> AnyResult<LoadedModelState> {
-    let cfg = crate::inference::load::awq_loader::parse_config_json(awq_dir)?;
-
-    // Collect the safetensors shards (any count).
-    let mut shards: Vec<String> = std::fs::read_dir(awq_dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
-    shards.sort();
-    if shards.is_empty() {
-        return Err(anyhow!("AWQ: no *.safetensors shards in {awq_dir}"));
-    }
-    let file_size: u64 = shards
-        .iter()
-        .filter_map(|s| std::fs::metadata(s).ok().map(|m| m.len()))
-        .sum();
-
-    // Single-GPU placement on the FASTEST probed card (the AWQ loader is single-device; it
-    // takes the lowest-keyed map entry, so hand it exactly one - never a fixed index 0).
-    // Fall back to the fastest card WITHOUT the demand subtraction rather than to index
-    // 0: when another subsystem's declared demand covers every card, the demand-aware
-    // probe returns nothing, and `unwrap_or(0)` then names a device by position - the
-    // one thing placement here must never do. It is the same ranking either way, only
-    // without the deduction that left no candidate.
-    let probed = {
-        let with_demand = crate::inference::place::device_probe::probe_cuda_devices_for("llm", 0);
-        if with_demand.is_empty() {
-            crate::inference::place::device_probe::probe_cuda_devices(0)
-        } else {
-            with_demand
-        }
-    };
-    let fastest = probed.first().map(|(i, _, _)| *i).unwrap_or(0);
-    let mut cuda = std::collections::HashMap::new();
-    cuda.insert(fastest, Device::new_cuda(fastest)?);
-    let device = cuda.get(&fastest).unwrap().clone();
-
-    let context_length = if user_context_length > 0 {
-        user_context_length
-    } else {
-        declared_context(std::path::Path::new(awq_dir))
-    };
-
-    info!(
-        "🔄 Loading AWQ checkpoint {} (arch={}, {} layers, {} shards, ctx={})",
-        awq_dir,
-        cfg.gguf_arch,
-        cfg.n_layers,
-        shards.len(),
-        context_length
-    );
-    let t0 = std::time::Instant::now();
-    let model = GenericHeteroTransformer::from_awq_safetensors(
-        awq_dir,
-        &shards,
-        &cuda,
-        Some(context_length),
-    )?;
-    info!(
-        "✅ AWQ model loaded in {:.1}s ({:.2} GB)",
-        t0.elapsed().as_secs_f64(),
-        file_size as f64 / 1e9
-    );
-
-    let tokenizer = Tokenizer::from_file(format!("{awq_dir}/tokenizer.json"))
-        .map_err(|e| anyhow!("AWQ tokenizer load: {e}"))?;
-    let (eos_token_id, eos_token_ids_extra) = awq_eos_tokens(awq_dir);
-
-    Ok(LoadedModelState {
-        name: model_id.to_string(),
-        num_layers: cfg.n_layers,
-        hidden_size: cfg.hidden_size,
-        num_heads: cfg.n_head,
-        vocab_size: cfg.vocab_size,
-        context_length,
-        eos_token_id,
-        moondream_graph: None,
-        moondream_decode_count: 0,
-        eos_token_ids_extra,
-        file_size,
-        model: Box::new(GenericBackend(model)),
-        tokenizer,
-        device,
-        image_embeds: None,
-        qwen35_image: None,
-        image_embed_cache: None,
-        grammar_factory: std::sync::OnceLock::new(),
-        generation_defaults: Default::default(),
-    })
 }
 
 pub(super) fn try_wrap_with_vision(

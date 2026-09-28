@@ -171,6 +171,7 @@ impl AwqWeight {
         qzeros: &[i32],
         scales: &[half::f16],
         check_headroom: bool,
+        keep_free: usize,
     ) -> Result<Option<crate::tensor::marlin::MarlinAwqLayer>> {
         use crate::tensor::marlin;
         let dev = self.qweight.device();
@@ -179,7 +180,7 @@ impl AwqWeight {
                 .map_err(|e| crate::tensor::Error::msg(e.0))?;
         if check_headroom {
             let (free, _total) = crate::tensor::cuda_ext::mem_get_info(&dev)?;
-            if free < r.device_bytes() + awq_marlin_reserve_bytes() {
+            if free < r.device_bytes() + awq_marlin_reserve_bytes() + keep_free {
                 return Ok(None);
             }
         }
@@ -424,7 +425,10 @@ impl QMatMul {
     /// the single-layout follow-up replaces prefill with a repacked dequant.)
     /// The f32 mr4 repacked path was a measured dead end (-19%); dp4a wins
     /// because it removes the f32 dequant-per-weight via int8 dp4a.
-    pub fn from_awq(mut w: AwqWeight) -> Self {
+    ///
+    /// `keep_free` is VRAM the rest of the load still needs on this card: a second
+    /// layout is built only while it stays free beside the reserve.
+    pub fn from_awq(mut w: AwqWeight, keep_free: usize) -> Self {
         // dp4a decode: forward is FAST in-server (12ms < split-K 14ms). The
         // earlier regression was PLD `forward_all` hitting the slow dequant - now
         // small-M forward_all loops dp4a (no dequant, see forward_cuda). Eager-build
@@ -450,7 +454,7 @@ impl QMatMul {
                         // guard the build on free-VRAM headroom; in only mode
                         // it is the single layout -> always build.
                         let check_headroom = policy == AwqMarlinPolicy::Dual;
-                        match w.build_marlin(&qw, &qz, &sc, check_headroom) {
+                        match w.build_marlin(&qw, &qz, &sc, check_headroom, keep_free) {
                             Ok(Some(layer)) => {
                                 let _ = w.marlin.set(Some(std::sync::Arc::new(layer)));
                                 marlin_built = true;
@@ -803,7 +807,7 @@ mod marlin_parity {
             // The layer has to exist before the comparison means anything: `build_marlin` declines
             // on an unsupported shape or when VRAM is tight, and a declined build would leave this
             // comparing the dp4a path against the host and calling it Marlin coverage.
-            let on_gpu = QMatMul::from_awq(build(&gpu));
+            let on_gpu = QMatMul::from_awq(build(&gpu), 0);
             let marlin_built = match &on_gpu.inner {
                 QMatMulKind::Awq(w) => matches!(w.marlin.get(), Some(Some(_))),
                 _ => false,
@@ -813,7 +817,7 @@ mod marlin_parity {
                 "the Marlin layer was not built for K={k} N={n} group={gs}, so this test would \
              cover the dp4a path instead"
             );
-            let on_cpu = QMatMul::from_awq(build(&Device::Cpu));
+            let on_cpu = QMatMul::from_awq(build(&Device::Cpu), 0);
 
             for rows in [1usize, 8, 64] {
                 let xv: Vec<f32> = (0..rows * k)

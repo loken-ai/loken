@@ -265,76 +265,87 @@ impl LlmEngine {
                 return Ok(());
             }
 
-            // --- 0. AWQ (HF safetensors) early path ---
-            // If the resolved path is an AWQ checkpoint dir, load it via the
-            // dedicated loader and store the state directly - bypassing the
-            // entire GGUF parse/placement machinery below.
-            #[cfg(feature = "cuda")]
-            if let Some(awq_dir) =
-                resolve_awq_dir(&model_file.to_string_lossy())
-            {
-                let mut state = load_awq_model_state(&awq_dir, &model_id_clone, user_context_length)?;
-                state.generation_defaults = generation_defaults.clone();
-                let fsz = state.file_size;
-                let mut guard = model_state.blocking_lock();
-                // Free VRAM just changed by the size of a model.
-                crate::inference::place::vram_manager::residency_changed();
-                *guard = Some(state);
-                drop(guard);
-                let mut size_guard = cached_model_size.blocking_lock();
-                *size_guard = fsz;
-                info!("✅ AWQ model '{}' ready (state stored)", model_id_clone);
-                return Ok(());
-            }
+            // --- 0. AWQ (HF safetensors) ---
+            // Its layers come from the shards; its header is synthesised from the checkpoint's
+            // config, and from there it takes the same route as a GGUF file.
+            let awq = resolve_awq_dir(&model_file.to_string_lossy())
+                .map(|dir| awq_checkpoint(&dir).map(|(content, shards)| (dir, content, shards)))
+                .transpose()?;
 
             // --- 1. Parse GGUF header via mmap ---
-            debug!("📂 Opening GGUF file: {}", model_file.display());
-            let file = std::fs::File::open(&model_file)
-                .map_err(|e| {
-                    let err_msg = format!("Failed to open GGUF file at {}: {e}", model_file.display());
-                    error!("❌ {}", err_msg);
-                    anyhow!(err_msg)
-                })?;
+            let (mmap, content, awq) = match awq {
+                Some((dir, content, shards)) => {
+                    // No GGUF file backs this model: a one-byte anonymous map stands in for
+                    // the bytes the GGUF-only readers would take.
+                    let map = memmap2::MmapOptions::new().len(1).map_anon()?.make_read_only()?;
+                    (std::sync::Arc::new(map), content, Some((dir, shards)))
+                }
+                None => {
+                    debug!("📂 Opening GGUF file: {}", model_file.display());
+                    let file = std::fs::File::open(&model_file)
+                        .map_err(|e| {
+                            let err_msg = format!("Failed to open GGUF file at {}: {e}", model_file.display());
+                            error!("❌ {}", err_msg);
+                            anyhow!(err_msg)
+                        })?;
 
-            // Memory-map the file for efficient random access and OS read-ahead
-            debug!("🔗 Memory-mapping GGUF file...");
-            let mmap = unsafe { Mmap::map(&file) }
-                .map_err(|e| {
-                    let err_msg = format!("Failed to mmap GGUF file: {e}");
-                    error!("❌ {}", err_msg);
-                    anyhow!(err_msg)
-                })?;
-            // Arc so loaders can hand out zero-copy file views: a view
-            // holds an Arc clone, keeping the mapping alive past this scope.
-            // No blanket WillNeed here. It prefetched the WHOLE file into the page cache
-            // before anything was placed, so a model that spills had its GPU-resident 28 GB
-            // cached for nothing next to the host layers it actually reads - on a 64 GB box
-            // that put 16 GB of the process into swap during the very decode being timed.
-            // The advice is given per layer once placement is known, see
-            // `advise_pages_by_placement` below: WillNeed for what the host will read every
-            // token, DontNeed for what the cards already hold.
-            let mmap = std::sync::Arc::new(mmap);
-            crate::inference::place::device_probe::debug_vram_by_card("after-mmap-parse");
+                    // Memory-map the file for efficient random access and OS read-ahead
+                    debug!("🔗 Memory-mapping GGUF file...");
+                    let mmap = unsafe { Mmap::map(&file) }
+                        .map_err(|e| {
+                            let err_msg = format!("Failed to mmap GGUF file: {e}");
+                            error!("❌ {}", err_msg);
+                            anyhow!(err_msg)
+                        })?;
+                    // Arc so loaders can hand out zero-copy file views: a view
+                    // holds an Arc clone, keeping the mapping alive past this scope.
+                    // No blanket WillNeed here. It prefetched the WHOLE file into the page cache
+                    // before anything was placed, so a model that spills had its GPU-resident 28 GB
+                    // cached for nothing next to the host layers it actually reads - on a 64 GB box
+                    // that put 16 GB of the process into swap during the very decode being timed.
+                    // The advice is given per layer once placement is known, see
+                    // `advise_pages_by_placement` below: WillNeed for what the host will read every
+                    // token, DontNeed for what the cards already hold.
+                    let mmap = std::sync::Arc::new(mmap);
+                    crate::inference::place::device_probe::debug_vram_by_card("after-mmap-parse");
+                    debug!("✓ GGUF file mmap'd: {} bytes", mmap.len());
+
+                    debug!("📖 Parsing GGUF header...");
+                    let mmap_parse_t = std::time::Instant::now();
+                    let mut content = gguf_file::Content::read_mapped(&mut Cursor::new(&mmap[..]), mmap.clone())
+                        .map_err(|e| {
+                            let err_msg = format!("GGUF parse error: {e}");
+                            error!("❌ {}", err_msg);
+                            anyhow!(err_msg)
+                        })?;
+                    // Back the tensor data with the Arc<Mmap> so the loader reads weights as
+                    // zero-copy views (no host copy, the Arc pins the mmap) instead of copying
+                    // each tensor into owned host bytes - faster load + less committed RAM.
+                    content.mmap_owner = Some(mmap.clone() as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+                    debug!("✓ GGUF header parsed in {:.1}ms", mmap_parse_t.elapsed().as_secs_f64() * 1000.0);
+                    (mmap, content, None)
+                }
+            };
             let mmap_bytes: &[u8] = &mmap[..];
-            debug!("✓ GGUF file mmap'd: {} bytes", mmap_bytes.len());
-
-            debug!("📖 Parsing GGUF header...");
-            let mmap_parse_t = std::time::Instant::now();
-            let mut content = gguf_file::Content::read_mapped(&mut Cursor::new(mmap_bytes), mmap.clone())
-                .map_err(|e| {
-                    let err_msg = format!("GGUF parse error: {e}");
-                    error!("❌ {}", err_msg);
-                    anyhow!(err_msg)
-                })?;
-            // Back the tensor data with the Arc<Mmap> so the loader reads weights as
-            // zero-copy views (no host copy, the Arc pins the mmap) instead of copying
-            // each tensor into owned host bytes - faster load + less committed RAM.
-            content.mmap_owner = Some(mmap.clone() as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+            // What the cards will hold: the shards of an AWQ checkpoint, the file otherwise.
+            let file_size = match &awq {
+                Some((_, shards)) => shards
+                    .iter()
+                    .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                    .sum(),
+                None => file_size,
+            };
+            let generic_weights = match &awq {
+                Some((dir, shards)) => GenericWeights::Awq { dir, shards },
+                None => GenericWeights::Gguf { mmap_bytes, mmap: &mmap },
+            };
             // Captured now: `content` is consumed by one of the loader arms below, and the
             // page advice can only be given once every layer has a device.
+            // Page advice applies to a GGUF file's own bytes; the shards are read, not mapped.
             let layer_page_ranges: Vec<(usize, usize, usize)> = content
                 .tensor_infos
                 .iter()
+                .filter(|_| awq.is_none())
                 .filter_map(|(name, info)| {
                     let rest = name.strip_prefix("blk.")?;
                     let dot = rest.find('.')?;
@@ -346,8 +357,6 @@ impl LlmEngine {
                     ))
                 })
                 .collect();
-            debug!("✓ GGUF header parsed in {:.1}ms", mmap_parse_t.elapsed().as_secs_f64() * 1000.0);
-            debug!("✅ GGUF header parsed successfully");
 
             // --- 2. Extract metadata ---
             let arch = get_gguf_string(&content, "general.architecture")
@@ -1277,6 +1286,7 @@ impl LlmEngine {
                             *free >= file_size / crate::inference::serve::tp_support::TP_RANKS as u64
                                 + runtime_reserve_bytes
                         })
+                    && awq.is_none()
                     && crate::inference::serve::tp_support::tensor_parallel_support(&content, &arch)
                         .inspect_err(|why| info!("{arch} stays off tensor parallelism: {why}"))
                         .is_ok() => {
@@ -1497,24 +1507,12 @@ impl LlmEngine {
                         // optimism can't mis-size.
                         HeteroPlan::forced_gpu(num_layers, num_layers, gpu_idx)
                     } else {
-                        let tensor_bytes = |name: &str| {
-                            content.tensor_infos.get(name).map_or(0, |t| t.size_in_bytes() as u64)
-                        };
-                        let block_bytes: u64 = content
-                            .tensor_infos
-                            .iter()
-                            .filter(|(n, _)| n.starts_with("blk."))
-                            .map(|(_, t)| t.size_in_bytes() as u64)
-                            .sum();
-                        // An untied model uploads `output.weight`; a tied one uploads its
-                        // embedding table as the projection.
-                        let head_bytes = match tensor_bytes("output.weight") {
-                            0 => tensor_bytes("token_embd.weight"),
-                            b => b,
-                        };
+                        let (block_bytes, head_bytes) = generic_weights
+                            .block_and_head_bytes(&content)
+                            .unwrap_or((file_size, 0));
                         HeteroPlan::calculate_holding_head(
                             num_layers,
-                            if block_bytes > 0 { block_bytes } else { file_size },
+                            block_bytes,
                             head_bytes,
                             &cuda_devices,
                             kv_bytes_per_layer,
@@ -1618,12 +1616,11 @@ impl LlmEngine {
                     if mmvq_race_arch && !hetero_cuda_devs.is_empty() {
                         warn!("⚠️  {} (arch={}, hidden_size={}) triggers the non-512-K CUDA mmvq async race that crashes the server; routing entirely to CPU (coherent, no race).",
                             model_id_clone, arch, hidden_size);
-                        load_generic_on_cpu(mmap_bytes, &mmap, &arch, num_layers, file_size,
+                        load_generic_on_cpu(&generic_weights, &arch, num_layers, file_size,
                             projector_blob.as_deref())?
                     } else {
-                    match GenericHeteroTransformer::from_gguf_with_kv_quant(
-                        content, mmap_bytes, &hetero_cuda_devs, &hetero_plan, kv_quant,
-                        Some(effective_ctx),
+                    match generic_weights.build(
+                        &hetero_cuda_devs, &hetero_plan, kv_quant, Some(effective_ctx),
                     ) {
                         Ok(m) => {
                             let placement = hetero_plan
@@ -1649,12 +1646,9 @@ impl LlmEngine {
                             // before retrying (see load_generic_hybrid_or_cpu).
                             #[cfg(feature = "cuda")]
                             release_cuda_pools();
-                            let content_fb = gguf_file::Content::read_mapped(&mut Cursor::new(mmap_bytes), mmap.clone())
-                                .map_err(|e| anyhow!("GGUF re-parse failed: {e}"))?;
                             let split_plan = HeteroPlan::split_across_cuda(num_layers, &cuda_devices);
-                            match GenericHeteroTransformer::from_gguf_with_kv_quant(
-                                content_fb, mmap_bytes, &hetero_cuda_devs, &split_plan, kv_quant,
-                                Some(effective_ctx),
+                            match generic_weights.build(
+                                &hetero_cuda_devs, &split_plan, kv_quant, Some(effective_ctx),
                             ) {
                                 Ok(m) => {
                                     info!("✅ {} loaded after OOM-recovery: forced {}-GPU split ({} segments)",
@@ -1664,8 +1658,7 @@ impl LlmEngine {
                                 Err(e2) => {
                                     warn!("Forced-split retry also failed ({e2}); trying GPU+CPU hybrid before CPU");
                                     load_generic_hybrid_or_cpu(
-                                        mmap_bytes,
-                                        &mmap, &arch, num_layers, file_size,
+                                        &generic_weights, &arch, num_layers, file_size,
                                         &cuda_devices, &hetero_cuda_devs, kv_bytes_per_layer,
                                         kv_quant, effective_ctx, projector_blob.as_deref())?
                                 }
@@ -1685,12 +1678,9 @@ impl LlmEngine {
                             // before retrying (see load_generic_hybrid_or_cpu).
                             #[cfg(feature = "cuda")]
                             release_cuda_pools();
-                            let content_fb = gguf_file::Content::read_mapped(&mut Cursor::new(mmap_bytes), mmap.clone())
-                                .map_err(|e| anyhow!("GGUF re-parse failed: {e}"))?;
                             let even_plan = HeteroPlan::split_across_cuda(num_layers, &cuda_devices);
-                            match GenericHeteroTransformer::from_gguf_with_kv_quant(
-                                content_fb, mmap_bytes, &hetero_cuda_devs, &even_plan, kv_quant,
-                                Some(effective_ctx),
+                            match generic_weights.build(
+                                &hetero_cuda_devs, &even_plan, kv_quant, Some(effective_ctx),
                             ) {
                                 Ok(m) => {
                                     info!("✅ {} recovered via EVEN {}-GPU split ({} segments)",
@@ -1700,8 +1690,7 @@ impl LlmEngine {
                                 Err(e2) => {
                                     warn!("Even-split retry also failed ({e2}); trying GPU+CPU hybrid before CPU");
                                     load_generic_hybrid_or_cpu(
-                                        mmap_bytes,
-                                        &mmap, &arch, num_layers, file_size,
+                                        &generic_weights, &arch, num_layers, file_size,
                                         &cuda_devices, &hetero_cuda_devs, kv_bytes_per_layer,
                                         kv_quant, effective_ctx, projector_blob.as_deref())?
                                 }
@@ -1711,7 +1700,7 @@ impl LlmEngine {
                         // or split already exhausted) -> CPU.
                         Err(e) => {
                             warn!("GenericHetero load failed: {e}, retrying on CPU only");
-                            load_generic_on_cpu(mmap_bytes, &mmap, &arch, num_layers, file_size,
+                            load_generic_on_cpu(&generic_weights, &arch, num_layers, file_size,
                                 projector_blob.as_deref())?
                         }
                     }

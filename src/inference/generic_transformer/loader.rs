@@ -1050,6 +1050,7 @@ fn build_awq_layer(
     cos: &Tensor,
     sin: &Tensor,
     group_size: usize,
+    keep_free: usize,
 ) -> Result<GenericTransformerLayer> {
     use crate::inference::generic_transformer::projection::AwqWeight;
     let eps = config.rms_norm_eps;
@@ -1071,17 +1072,20 @@ fn build_awq_layer(
             .contiguous()?;
         let k = qweight.dim(0)?;
         let n = scales.dim(1)?;
-        Ok(QMatMul::from_awq(AwqWeight {
-            qweight,
-            qzeros,
-            scales,
-            bias: None,
-            k,
-            n,
-            group_size,
-            repacked: std::sync::OnceLock::new(),
-            marlin: std::sync::OnceLock::new(),
-        }))
+        Ok(QMatMul::from_awq(
+            AwqWeight {
+                qweight,
+                qzeros,
+                scales,
+                bias: None,
+                k,
+                n,
+                group_size,
+                repacked: std::sync::OnceLock::new(),
+                marlin: std::sync::OnceLock::new(),
+            },
+            keep_free,
+        ))
     };
     // Raw AWQ tensors (for fusion via cat along the output dim).
     let load_raw = |proj: &str| -> Result<(Tensor, Tensor, Tensor)> {
@@ -1132,17 +1136,20 @@ fn build_awq_layer(
             .to_device(device)?;
         let k = qweight.dim(0)?;
         let n = scales.dim(1)?;
-        Ok(QMatMul::from_awq(AwqWeight {
-            qweight,
-            qzeros,
-            scales,
-            bias: None,
-            k,
-            n,
-            group_size,
-            repacked: std::sync::OnceLock::new(),
-            marlin: std::sync::OnceLock::new(),
-        }))
+        Ok(QMatMul::from_awq(
+            AwqWeight {
+                qweight,
+                qzeros,
+                scales,
+                bias: None,
+                k,
+                n,
+                group_size,
+                repacked: std::sync::OnceLock::new(),
+                marlin: std::sync::OnceLock::new(),
+            },
+            keep_free,
+        ))
     };
     let _ = &load_raw;
     // Optional bias -> F32 on device.
@@ -2639,15 +2646,17 @@ impl GenericHeteroTransformer {
     }
 
     /// Build a `GenericHeteroTransformer` from an HF AutoAWQ checkpoint.
-    /// Dense Qwen2/Qwen3/Mistral only, single-GPU. The projection `QMatMul`s
+    /// Dense Qwen2/Qwen3/Mistral only, each layer on the device `plan` gives it. The
+    /// projection `QMatMul`s
     /// become `QMatMul::Awq` (the 483 GB/s GEMV at decode, dequant->cuBLAS at
     /// prefill); everything else (attention, RoPE, KV, forward) is the generic
-    /// path unchanged. `kv_quant=Off` (F16 SpecKvCache) for this first cut - Q8
-    /// KV is a later optimization.
+    /// path unchanged.
     pub fn from_awq_safetensors(
         dir: &str,
         shards: &[String],
         cuda_devices: &HashMap<usize, Device>,
+        plan: &HeteroPlan,
+        kv_quant: crate::inference::engine::llm_engine::KvQuant,
         max_kv_seq_len: Option<usize>,
     ) -> Result<Self> {
         use crate::inference::load::awq_loader as awql;
@@ -2671,63 +2680,61 @@ impl GenericHeteroTransformer {
         let content = awql::synth_gguf_content(&cfgj, present);
         let arch = cfgj.gguf_arch.clone();
         let mut config = GenericTransformerConfig::from_gguf(&content, &arch)?;
-        // Q8 KV - the GGUF qwen2/qwen3 incremental-decode path (prefill appends +
-        // dequantizes for the scan; seq=1 decode reads the Q8 cache via the fused
-        // decode kernels). Populated consistently across prefill and decode.
-        config.kv_quant = crate::inference::engine::llm_engine::KvQuant::Q8;
+        config.kv_quant = kv_quant;
         if let Some(m) = max_kv_seq_len {
             config.max_q8_seq_len = m;
         }
         let config = Arc::new(config);
         let group_size = cfgj.group_size;
 
-        // Device choice follows the fleet placement rule: iterate GPUs
-        // FASTEST-FIRST (vram_manager::probe ranks by compute throughput,
-        // never by index) and take the first whose CURRENT free VRAM fits the
-        // checkpoint weights plus a prefill-activation reserve. The previous
-        // lowest-index pick loaded a 13 GB checkpoint onto a GPU already
-        // hosting an image model while the other card sat 100% free - the
-        // load "succeeded" with ~1 GB of slack and every prefill then OOM'd
-        // on activations regardless of chunk size.
-        let weight_bytes: u64 = shards
-            .iter()
-            .filter_map(|s| std::fs::metadata(s).ok().map(|m| m.len()))
-            .sum();
-        // Activation reserve: per-chunk transients (attention scores + FFN
-        // intermediates + Marlin/dp4a repack scratch) - sized generously so a
-        // "fits" verdict leaves real prefill headroom.
-        const AWQ_ACT_RESERVE: u64 = 3 * 1024 * 1024 * 1024;
-        let want = weight_bytes + AWQ_ACT_RESERVE;
-        let mut chosen: Option<(usize, Device)> = None;
-        #[cfg(feature = "cuda")]
-        for (idx, free, _) in crate::inference::place::vram_manager::probe(0) {
-            if let Some(d) = cuda_devices.get(&idx) {
-                if free >= want {
-                    chosen = Some((idx, d.clone()));
-                    break;
-                }
-                if chosen.is_none() {
-                    // Remember the fastest card as a fallback; replaced by the
-                    // first card that actually FITS.
-                    chosen = Some((idx, d.clone()));
+        // Layer sizes as stored: what each layer puts on its device.
+        let mut layer_bytes = vec![0u64; config.n_layers];
+        for (name, bytes) in st.byte_sizes() {
+            if let Some(li) = name
+                .strip_prefix("model.layers.")
+                .and_then(|r| r.split('.').next())
+                .and_then(|i| i.parse::<usize>().ok())
+            {
+                if let Some(b) = layer_bytes.get_mut(li) {
+                    *b += bytes as u64;
                 }
             }
         }
-        let (device_ordinal, device) = match chosen {
-            Some((idx, d)) => (idx, d),
-            None => (0, Device::Cpu),
+        let head_name = if st.get("lm_head.weight").is_ok() {
+            "lm_head.weight"
+        } else {
+            "model.embed_tokens.weight"
         };
-        if device.is_cuda() {
-            info!(
-                "AWQ placement: GPU{} (weights {:.1} GB + {:.1} GB activation reserve)",
-                device_ordinal,
-                weight_bytes as f64 / 1e9,
-                AWQ_ACT_RESERVE as f64 / 1e9
-            );
+        // Each layer on the device its plan segment names.
+        let layer_card: Vec<Option<usize>> = plan
+            .segments
+            .iter()
+            .flat_map(|seg| {
+                let card = match seg.kind {
+                    DeviceKind::Cuda(idx) if cuda_devices.contains_key(&idx) => Some(idx),
+                    _ => None,
+                };
+                (seg.layer_start..seg.layer_end).map(move |_| card)
+            })
+            .collect();
+        if layer_card.len() != config.n_layers {
+            return Err(crate::tensor::Error::msg(format!(
+                "the plan covers {} layers and the checkpoint has {}",
+                layer_card.len(),
+                config.n_layers
+            )));
         }
+        let device_of = |card: Option<usize>| match card {
+            Some(idx) => (cuda_devices[&idx].clone(), LayerDevice::Cuda(idx)),
+            None => (Device::Cpu, LayerDevice::Cpu),
+        };
+        // The head goes with the last layer.
+        let (device, _) = device_of(layer_card.last().copied().flatten());
+        let mut used: Vec<usize> = layer_card.iter().flatten().copied().collect();
+        used.dedup();
         info!(
-            "AWQ load: {} arch={} layers={} on {:?} (gs={})",
-            cfgj.hf_arch, arch, config.n_layers, device, group_size
+            "AWQ load: {} arch={} layers={} (gs={})",
+            cfgj.hf_arch, arch, config.n_layers, group_size
         );
 
         // Prewarm the fused decode kernels onto a CLEAN device - BEFORE loading
@@ -2736,31 +2743,37 @@ impl GenericHeteroTransformer {
         // found" (a facade module-cache quirk after many custom-module loads);
         // prewarming first sidesteps it.
         #[cfg(feature = "cuda")]
-        if let Ok(cd) = device.as_cuda_device() {
-            let _ = crate::inference::kernel::fused::prewarm_fused_kernels(&cd);
+        for idx in &used {
+            if let Ok(cd) = cuda_devices[idx].as_cuda_device() {
+                let _ = crate::inference::kernel::fused::prewarm_fused_kernels(&cd);
+            }
         }
 
-        // RoPE tables (full head_dim, YaRN if configured), sized to the KV window.
-        let (cos, sin) = crate::inference::generic_transformer::rope::precomput_freqs_cis_yarn(
-            config.head_dim,
-            config.rope_freq_base,
-            config.yarn,
-            config
-                .effective_max_context()
-                .max(crate::inference::generic_transformer::rope::ROPE_TABLE_SEQ_LEN),
-            &device,
-        )?;
+        // RoPE tables (full head_dim, YaRN if configured), sized to the KV window, one per
+        // device a layer runs on.
+        let mut rope: HashMap<Option<usize>, (Tensor, Tensor)> = HashMap::new();
+        for &card in &layer_card {
+            if let std::collections::hash_map::Entry::Vacant(slot) = rope.entry(card) {
+                let (dev, _) = device_of(card);
+                slot.insert(
+                    crate::inference::generic_transformer::rope::precomput_freqs_cis_yarn(
+                        config.head_dim,
+                        config.rope_freq_base,
+                        config.yarn,
+                        config
+                            .effective_max_context()
+                            .max(crate::inference::generic_transformer::rope::ROPE_TABLE_SEQ_LEN),
+                        &dev,
+                    )?,
+                );
+            }
+        }
 
-        // LM head: lm_head.weight, or embed_tokens if tied. F16 on GPU for the
-        // cutlass path; Q8_0 on CPU as the required fallback `output_proj`. Placed before
-        // the layers: a layer's second Marlin layout is built only while the free VRAM
-        // keeps its reserve, and that reserve must not also have to hold the head.
-        let lm_cpu_f32 = match st.load("lm_head.weight", &Device::Cpu) {
-            Ok(t) => t.to_dtype(DType::F32)?,
-            Err(_) => st
-                .load("model.embed_tokens.weight", &Device::Cpu)?
-                .to_dtype(DType::F32)?,
-        };
+        // LM head: lm_head.weight, or embed_tokens if tied. F16 on the last layer's card for
+        // the cutlass path; Q8_0 on CPU as the required fallback `output_proj`. Placed before
+        // the layers, so the room each layer's second Marlin layout keeps free need not
+        // count it.
+        let lm_cpu_f32 = st.load(head_name, &Device::Cpu)?.to_dtype(DType::F32)?;
         let output_proj = crate::tensor::quantized::QMatMul::from_qtensor(
             crate::tensor::quantized::QTensor::quantize(
                 &lm_cpu_f32,
@@ -2782,21 +2795,26 @@ impl GenericHeteroTransformer {
         let mut layers = Vec::with_capacity(config.n_layers);
         let mut layer_devs = Vec::with_capacity(config.n_layers);
         for li in 0..config.n_layers {
+            let card = layer_card[li];
+            let (dev, dev_enum) = device_of(card);
+            let (cos, sin) = &rope[&card];
+            // What the layers after this one still bring to the same card.
+            let still_to_load: u64 = (li + 1..config.n_layers)
+                .filter(|&l| layer_card[l] == card)
+                .map(|l| layer_bytes[l])
+                .sum();
             layers.push(build_awq_layer(
                 &st,
                 li,
-                &device,
+                &dev,
                 &config,
                 flags.clone(),
-                &cos,
-                &sin,
+                cos,
+                sin,
                 group_size,
+                still_to_load as usize,
             )?);
-            layer_devs.push(if device.is_cuda() {
-                LayerDevice::Cuda(device_ordinal)
-            } else {
-                LayerDevice::Cpu
-            });
+            layer_devs.push(dev_enum);
         }
 
         // Embeddings (CPU - large vocab table). Loaded as F32.
