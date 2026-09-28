@@ -1,51 +1,52 @@
 //! Qwen2.5-VL vision tower (the semantic-conditioning encoder for Qwen-Image-Edit). Ported from
 //! transformers `modeling_qwen2_5_vl.py` against a byte-exact oracle (scripts/qwen25vl_vision_oracle.py).
 //!
-//! Input: pixel_values `[n_patches, 1176]` (the processor's (c,t,h,w) patch flattening) + grid `(t,h,w)`.
-//! Output: merged image embeddings `[n_patches/4, 3584]` that fill the LLM's `<|image_pad|>` slots.
+//! Input: pixel_values `[n_patches, 3*2*patch*patch]` (the processor's (c,t,h,w) patch flattening)
+//! + grid `(t,h,w)`. Output: merged image embeddings `[n_patches/4, projection]` that fill the LLM's
+//! `<|image_pad|>` slots.
 //!
-//! Arch (7B): dim 1280, 32 blocks, 16 heads (hd 80), patch 14, temporal_patch 2, merge 2, ffn 3420
-//! (SwiGLU), RMSNorm eps 1e-6, 2D-RoPE (theta 1e4). Window attention (window 112px = 4 merged-tokens)
-//! in all blocks EXCEPT full-attention at {7,15,23,31}. Merger: RMSNorm->group2x2->5120->GELU->3584.
+//! Arch: SwiGLU blocks, RMSNorm, 2D-RoPE (theta 1e4), temporal_patch 2, merge 2. Window attention
+//! (window 112px) in every block EXCEPT the last of each `n_wa_pattern` run, which attends in full.
+//! Merger: RMSNorm->group2x2->GELU->projection. The width, depth, heads, feed-forward width,
+//! epsilon, projection and window pattern come from the mmproj's `clip.vision.*` metadata.
 //! Weights: mmproj GGUF (`v.*`/`mm.*`), all dequantized to F32 (the tower is small).
+use crate::inference::model::mmproj::MmprojVision;
 use crate::tensor::Result;
 use crate::tensor::{Device, Tensor};
 
-const DIM: usize = 1280;
-const DEPTH: usize = 32;
-const HEADS: usize = 16;
-const HD: usize = 80; // head_dim
-const FFN: usize = 3420;
+/// Patches merged along each side into one language-model token.
 const MERGE: usize = 2;
+/// Patch edge the processor cuts at, in pixels.
 const PATCH: usize = 14;
+/// Pixels on a side of an attention window.
 const WINDOW: usize = 112;
-const OUT: usize = 3584;
-const EPS: f32 = 1e-6;
-const FULLATT: [usize; 4] = [7, 15, 23, 31];
 
 struct Block {
     n1: Tensor,
-    n2: Tensor, // RMSNorm gammas [1280]
+    n2: Tensor, // RMSNorm gammas [dim]
     qkv_w: Tensor,
-    qkv_b: Tensor, // [3840,1280], [3840]
+    qkv_b: Tensor, // [3*dim,dim], [3*dim]
     proj_w: Tensor,
-    proj_b: Tensor, // [1280,1280], [1280]
+    proj_b: Tensor, // [dim,dim], [dim]
     gate_w: Tensor,
-    gate_b: Tensor, // [3420,1280]
+    gate_b: Tensor, // [ffn,dim]
     up_w: Tensor,
     up_b: Tensor,
     down_w: Tensor,
-    down_b: Tensor, // [1280,3420]
+    down_b: Tensor, // [dim,ffn]
 }
 
 pub struct Qwen25Vision {
-    patch_w: Tensor, // [1280,1176]
+    geo: MmprojVision,
+    /// Blocks that attend over the whole image rather than within windows.
+    full_attention: Vec<usize>,
+    patch_w: Tensor, // [dim, 3*2*patch*patch]
     blocks: Vec<Block>,
-    ln_q: Tensor, // merger RMSNorm [1280]
+    ln_q: Tensor, // merger RMSNorm [dim]
     mm0_w: Tensor,
-    mm0_b: Tensor, // [5120,5120]
+    mm0_b: Tensor, // [merge²*dim, merge²*dim]
     mm2_w: Tensor,
-    mm2_b: Tensor, // [3584,5120]
+    mm2_b: Tensor, // [projection, merge²*dim]
     dev: Device,
 }
 
@@ -65,6 +66,17 @@ impl Qwen25Vision {
         use crate::tensor::Device as CDevice;
         let content = gguf_file::open_mapped(std::path::Path::new(path))
             .map_err(|e| err(format!("gguf {path}: {e}")))?;
+        let geo = MmprojVision::read(&content)?;
+        // Every `n_wa_pattern`-th block attends in full; the others within windows.
+        let pattern = content
+            .metadata
+            .get("clip.vision.n_wa_pattern")
+            .ok_or_else(|| err(format!("{path}: missing clip.vision.n_wa_pattern")))?
+            .to_u32()? as usize;
+        let full_attention: Vec<usize> = (0..geo.blocks)
+            .filter(|b| (b + 1) % pattern.max(1) == 0)
+            .collect();
+        let (dim, ffn) = (geo.width, geo.feed_forward);
         let dqv = |name: &str| -> Result<(Vec<f32>, Vec<usize>)> {
             let t = content
                 .tensor(name, &CDevice::Cpu)
@@ -86,16 +98,16 @@ impl Qwen25Vision {
             Tensor::from_vec_f32(v, (n,)).and_then(|t| t.to_device(dev))
         };
 
-        // patch_embed: two [1280,3,14,14] temporal slices -> W[1280,1176], j=((c*2+t)*14+h)*14+w.
+        // patch_embed: two [dim,3,p,p] temporal slices -> W[dim,3*2*p*p], j=((c*2+t)*p+h)*p+w.
         let (s0, _) = dqv("v.patch_embd.weight")?;
         let (s1, _) = dqv("v.patch_embd.weight.1")?;
-        let (cin, ps) = (3usize, PATCH);
+        let (cin, ps) = (3usize, geo.patch);
         let pin = cin * 2 * ps * ps;
         let at = |s: &[f32], o: usize, c: usize, h: usize, w: usize| {
             s[((o * cin + c) * ps + h) * ps + w]
         };
-        let mut pw = vec![0f32; DIM * pin];
-        for o in 0..DIM {
+        let mut pw = vec![0f32; dim * pin];
+        for o in 0..dim {
             for c in 0..cin {
                 for t in 0..2 {
                     let s = if t == 0 { &s0 } else { &s1 };
@@ -107,10 +119,10 @@ impl Qwen25Vision {
                 }
             }
         }
-        let patch_w = t2(pw, (DIM, pin), dev)?;
+        let patch_w = t2(pw, (dim, pin), dev)?;
 
-        let mut blocks = Vec::with_capacity(DEPTH);
-        for b in 0..DEPTH {
+        let mut blocks = Vec::with_capacity(geo.blocks);
+        for b in 0..geo.blocks {
             let g = format!("v.blk.{b}");
             let (qw, _) = dqv(&format!("{g}.attn_q.weight"))?;
             let (kw, _) = dqv(&format!("{g}.attn_k.weight"))?;
@@ -120,10 +132,10 @@ impl Qwen25Vision {
             let (vb, _) = dqv(&format!("{g}.attn_v.bias"))?;
             let mut qkvw = qw;
             qkvw.extend(kw);
-            qkvw.extend(vw); // [3840,1280] row-concat
+            qkvw.extend(vw); // [3*dim,dim] row-concat
             let mut qkvb = qb;
             qkvb.extend(kb);
-            qkvb.extend(vb); // [3840]
+            qkvb.extend(vb); // [3*dim]
             let (pw2, _) = dqv(&format!("{g}.attn_out.weight"))?;
             let (pb, _) = dqv(&format!("{g}.attn_out.bias"))?;
             let (gw, _) = dqv(&format!("{g}.ffn_gate.weight"))?;
@@ -137,80 +149,85 @@ impl Qwen25Vision {
             blocks.push(Block {
                 n1: t1(n1, dev)?,
                 n2: t1(n2, dev)?,
-                qkv_w: t2(qkvw, (3 * DIM, DIM), dev)?,
+                qkv_w: t2(qkvw, (3 * dim, dim), dev)?,
                 qkv_b: t1(qkvb, dev)?,
-                proj_w: t2(pw2, (DIM, DIM), dev)?,
+                proj_w: t2(pw2, (dim, dim), dev)?,
                 proj_b: t1(pb, dev)?,
-                gate_w: t2(gw, (FFN, DIM), dev)?,
+                gate_w: t2(gw, (ffn, dim), dev)?,
                 gate_b: t1(gb, dev)?,
-                up_w: t2(uw, (FFN, DIM), dev)?,
+                up_w: t2(uw, (ffn, dim), dev)?,
                 up_b: t1(ub, dev)?,
-                down_w: t2(dw, (DIM, FFN), dev)?,
+                down_w: t2(dw, (dim, ffn), dev)?,
                 down_b: t1(db, dev)?,
             });
         }
         let (lq, _) = dqv("v.post_ln.weight")?;
-        let (m0w, _) = dqv("mm.0.weight")?;
+        let (m0w, m0d) = dqv("mm.0.weight")?;
         let (m0b, _) = dqv("mm.0.bias")?;
-        let (m2w, _) = dqv("mm.2.weight")?;
+        let (m2w, m2d) = dqv("mm.2.weight")?;
         let (m2b, _) = dqv("mm.2.bias")?;
         Ok(Qwen25Vision {
+            geo,
+            full_attention,
             patch_w,
             blocks,
             ln_q: t1(lq, dev)?,
-            mm0_w: t2(m0w, (5120, 5120), dev)?,
+            mm0_w: t2(m0w, (m0d[0], m0d[1]), dev)?,
             mm0_b: t1(m0b, dev)?,
-            mm2_w: t2(m2w, (OUT, 5120), dev)?,
+            mm2_w: t2(m2w, (m2d[0], m2d[1]), dev)?,
             mm2_b: t1(m2b, dev)?,
             dev: dev.clone(),
         })
     }
 
-    /// Full forward: pixel_values [n,1176], grid (t,h,w) -> merged embeds [n/4, 3584].
+    /// Full forward: pixel_values [n,3*2*p*p], grid (t,h,w) -> merged embeds [n/4, projection].
     pub fn forward(&self, pixel_values: &Tensor, grid: (usize, usize, usize)) -> Result<Tensor> {
         let (gt, gh, gw) = grid;
         let seq = gt * gh * gw;
         let dev = &self.dev;
+        let (dim, eps) = (self.geo.width, self.geo.eps);
         // patch_embed
-        let mut hs = lin(pixel_values, &self.patch_w, None)?; // [seq,1280]
+        let mut hs = lin(pixel_values, &self.patch_w, None)?; // [seq,dim]
 
-        // position_ids (block-major (h,w) per patch), rotary, window permute -> cos/sin [seq,80]
+        // position_ids (block-major (h,w) per patch), rotary, window permute -> cos/sin [seq,hd]
         let pos = position_ids(gt, gh, gw); // [(h,w); seq]
-        let (window_index, cu_win) = window_index(gt, gh, gw);
+        let (window_index, cu_win) = window_index(gt, gh, gw, self.geo.patch);
         let cu_full = vec![0usize, seq];
-        let (cos, sin) = rope_cos_sin(&pos, &window_index, dev)?; // [seq,80] each (window-permuted)
+        // [seq,hd] each (window-permuted)
+        let (cos, sin) = rope_cos_sin(&pos, &window_index, self.geo.head_dim(), dev)?;
 
         // permute hidden by window_index in groups of merge² (=4)
         hs = permute_units(&hs, &window_index, dev)?;
 
         for (bi, blk) in self.blocks.iter().enumerate() {
-            let cu = if FULLATT.contains(&bi) {
+            let cu = if self.full_attention.contains(&bi) {
                 &cu_full
             } else {
                 &cu_win
             };
             // attn
-            let normed = hs.rms_norm(&blk.n1, EPS)?;
-            let attn = blk.attention(&normed, &cos, &sin, cu, dev)?;
+            let normed = hs.rms_norm(&blk.n1, eps)?;
+            let attn = blk.attention(&normed, &cos, &sin, cu, &self.geo, dev)?;
             hs = hs.add(&attn)?;
             // mlp (SwiGLU)
-            let n2 = hs.rms_norm(&blk.n2, EPS)?;
+            let n2 = hs.rms_norm(&blk.n2, eps)?;
             let g = lin(&n2, &blk.gate_w, Some(&blk.gate_b))?.silu()?;
             let u = lin(&n2, &blk.up_w, Some(&blk.up_b))?;
             let m = lin(&g.mul(&u)?, &blk.down_w, Some(&blk.down_b))?;
             hs = hs.add(&m)?;
         }
-        // merger: RMSNorm -> group 4 -> 5120 -> GELU -> 3584, then un-permute
-        let normed = hs.rms_norm(&self.ln_q, EPS)?; // [seq,1280]
-        let grouped = normed.reshape((seq / 4, 4 * DIM))?; // [seq/4,5120]
+        // merger: RMSNorm -> group merge² -> GELU -> projection, then un-permute
+        let unit = MERGE * MERGE;
+        let normed = hs.rms_norm(&self.ln_q, eps)?; // [seq,dim]
+        let grouped = normed.reshape((seq / unit, unit * dim))?; // [seq/unit,unit*dim]
         let x = lin(&grouped, &self.mm0_w, Some(&self.mm0_b))?.gelu()?;
-        let merged = lin(&x, &self.mm2_w, Some(&self.mm2_b))?; // [seq/4,3584]
+        let merged = lin(&x, &self.mm2_w, Some(&self.mm2_b))?; // [seq/unit,projection]
                                                                // un-permute: reverse of window_index (on merged-token units)
         unpermute_merged(&merged, &window_index, dev)
     }
 }
 
-/// rotate_half over the last dim (HD): cat(-x[..,half:], x[..,:half]).
+/// rotate_half over the last dim (hd): cat(-x[..,half:], x[..,:half]).
 fn rotate_half(x: &Tensor) -> Result<Tensor> {
     let d = x.dim(2)?;
     let half = d / 2;
@@ -220,26 +237,28 @@ fn rotate_half(x: &Tensor) -> Result<Tensor> {
 }
 
 impl Block {
-    /// Variable-length attention over segments defined by `cu` (cumulative boundaries), 16 heads.
+    /// Variable-length attention over segments defined by `cu` (cumulative boundaries).
     fn attention(
         &self,
         normed: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
         cu: &[usize],
+        geo: &MmprojVision,
         dev: &Device,
     ) -> Result<Tensor> {
+        let (dim, heads, hd) = (geo.width, geo.heads, geo.head_dim());
         let seq = normed.dim(0)?;
-        let qkv = lin(normed, &self.qkv_w, Some(&self.qkv_b))?; // [seq,3840]
-        let q = qkv.narrow(1, 0, DIM)?.reshape((seq, HEADS, HD))?;
-        let k = qkv.narrow(1, DIM, DIM)?.reshape((seq, HEADS, HD))?;
+        let qkv = lin(normed, &self.qkv_w, Some(&self.qkv_b))?; // [seq,3*dim]
+        let q = qkv.narrow(1, 0, dim)?.reshape((seq, heads, hd))?;
+        let k = qkv.narrow(1, dim, dim)?.reshape((seq, heads, hd))?;
         let v = qkv
-            .narrow(1, 2 * DIM, DIM)?
-            .reshape((seq, HEADS, HD))?
+            .narrow(1, 2 * dim, dim)?
+            .reshape((seq, heads, hd))?
             .contiguous()?;
-        // rope: q*cos + rotate_half(q)*sin ; cos/sin [seq,80] -> [seq,1,80]
-        let cos3 = cos.reshape((seq, 1, HD))?;
-        let sin3 = sin.reshape((seq, 1, HD))?;
+        // rope: q*cos + rotate_half(q)*sin ; cos/sin [seq,hd] -> [seq,1,hd]
+        let cos3 = cos.reshape((seq, 1, hd))?;
+        let sin3 = sin.reshape((seq, 1, hd))?;
         let q = q
             .broadcast_mul(&cos3)?
             .add(&rotate_half(&q)?.broadcast_mul(&sin3)?)?
@@ -248,28 +267,28 @@ impl Block {
             .broadcast_mul(&cos3)?
             .add(&rotate_half(&k)?.broadcast_mul(&sin3)?)?
             .contiguous()?;
-        let scale = 1.0f32 / (HD as f32).sqrt();
-        let mut out = vec![0f32; seq * HEADS * HD];
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let mut out = vec![0f32; seq * heads * hd];
         for w in cu.windows(2) {
             let (s, e) = (w[0], w[1]);
             let l = e - s;
             if l == 0 {
                 continue;
             }
-            // [l,16,80] -> [16,l,80]
+            // [l,heads,hd] -> [heads,l,hd]
             let qs = q.narrow(0, s, l)?.transpose(0, 1)?.contiguous()?;
             let ks = k.narrow(0, s, l)?.transpose(0, 1)?.contiguous()?;
             let vs = v.narrow(0, s, l)?.transpose(0, 1)?.contiguous()?;
             // shared sdpa (native_acestep_ops): qs @ ksᵀ * scale -> softmax -> @ vs,
             // same math as the previous inline scores/probs chain.
-            let o = crate::inference::model::sdpa::sdpa(&qs, &ks, &vs, None, false, scale, 1.0)?; // [16,l,80]
-            let o = o.transpose(0, 1)?.contiguous()?; // [l,16,80]
+            let o = crate::inference::model::sdpa::sdpa(&qs, &ks, &vs, None, false, scale, 1.0)?; // [heads,l,hd]
+            let o = o.transpose(0, 1)?.contiguous()?; // [l,heads,hd]
             let ov = o.to_vec_f32();
-            for i in 0..(l * HEADS * HD) {
-                out[s * HEADS * HD + i] = ov[i];
+            for i in 0..(l * heads * hd) {
+                out[s * heads * hd + i] = ov[i];
             }
         }
-        let attn = Tensor::from_vec_f32(out, (seq, HEADS * HD))?.to_device(dev)?;
+        let attn = Tensor::from_vec_f32(out, (seq, heads * hd))?.to_device(dev)?;
         lin(&attn, &self.proj_w, Some(&self.proj_b))
     }
 }
@@ -295,8 +314,8 @@ fn position_ids(gt: usize, gh: usize, gw: usize) -> Vec<(usize, usize)> {
 }
 
 /// Window reorder indices (merged-token units) + cumulative window boundaries (patch units).
-fn window_index(gt: usize, gh: usize, gw: usize) -> (Vec<usize>, Vec<usize>) {
-    let vm = WINDOW / MERGE / PATCH; // 4
+fn window_index(gt: usize, gh: usize, gw: usize, patch: usize) -> (Vec<usize>, Vec<usize>) {
+    let vm = WINDOW / MERGE / patch; // merged tokens on a window's side
     let unit = MERGE * MERGE; // 4
     let (lh, lw) = (gh / MERGE, gw / MERGE); // llm grid
     let pad_h = (vm - lh % vm) % vm;
@@ -335,19 +354,20 @@ fn window_index(gt: usize, gh: usize, gw: usize) -> (Vec<usize>, Vec<usize>) {
     (window_index, cuu)
 }
 
-/// cos/sin [seq,80]: rotary(pos)=[h.invf(20), w.invf(20)] -> window-permute (units of 4) -> cat(rot,rot).
+/// cos/sin [seq,hd]: rotary(pos)=[h.invf, w.invf] -> window-permute (units of merge²) -> cat(rot,rot).
 fn rope_cos_sin(
     pos: &[(usize, usize)],
     window_index: &[usize],
+    hd: usize,
     dev: &Device,
 ) -> Result<(Tensor, Tensor)> {
-    let half = HD / 2; // 40
-    let nf = half / 2; // 20 freqs
+    let half = hd / 2;
+    let nf = half / 2;
     let inv: Vec<f32> = (0..nf)
         .map(|i| 1.0f32 / 10000f32.powf(2.0 * i as f32 / half as f32))
         .collect();
     let seq = pos.len();
-    // rotary[p] = [h*inv(20), w*inv(20)] (40)
+    // rotary[p] = [h*inv, w*inv] (half)
     let mut rot = vec![0f32; seq * half];
     for (p, &(h, w)) in pos.iter().enumerate() {
         for i in 0..nf {
@@ -357,21 +377,21 @@ fn rope_cos_sin(
     }
     // window-permute rot in units of 4 merged patches
     let permuted = permute_units_vec(&rot, half, window_index);
-    // emb = cat(rot,rot) -> [seq,80]; cos/sin
-    let mut cos = vec![0f32; seq * HD];
-    let mut sin = vec![0f32; seq * HD];
+    // emb = cat(rot,rot) -> [seq,hd]; cos/sin
+    let mut cos = vec![0f32; seq * hd];
+    let mut sin = vec![0f32; seq * hd];
     for p in 0..seq {
         for i in 0..half {
             let a = permuted[p * half + i];
-            cos[p * HD + i] = a.cos();
-            cos[p * HD + half + i] = a.cos();
-            sin[p * HD + i] = a.sin();
-            sin[p * HD + half + i] = a.sin();
+            cos[p * hd + i] = a.cos();
+            cos[p * hd + half + i] = a.cos();
+            sin[p * hd + i] = a.sin();
+            sin[p * hd + half + i] = a.sin();
         }
     }
     Ok((
-        Tensor::from_vec_f32(cos, (seq, HD))?.to_device(dev)?,
-        Tensor::from_vec_f32(sin, (seq, HD))?.to_device(dev)?,
+        Tensor::from_vec_f32(cos, (seq, hd))?.to_device(dev)?,
+        Tensor::from_vec_f32(sin, (seq, hd))?.to_device(dev)?,
     ))
 }
 
@@ -401,7 +421,7 @@ fn permute_units(x: &Tensor, window_index: &[usize], dev: &Device) -> Result<Ten
     Tensor::from_vec_f32(out, (x.dim(0)?, width))?.to_device(dev)
 }
 
-/// Un-permute merged tokens [nu,3584] by reverse of window_index (merged-token units).
+/// Un-permute merged tokens [nu,projection] by reverse of window_index (merged-token units).
 fn unpermute_merged(merged: &Tensor, window_index: &[usize], dev: &Device) -> Result<Tensor> {
     let width = merged.dim(1)?;
     let nu = merged.dim(0)?;
