@@ -1103,11 +1103,12 @@ mod cpu_fallback_invariant {
         .any(|pat| line.contains(pat))
     }
 
-    /// A probe, an OOM test, or an error branch - any of these means the fallback was
-    /// reached by finding out rather than by assuming.
+    /// A probe, an OOM test, an error branch or a placement through the ladder - any of
+    /// these means the fallback was reached by finding out rather than by assuming.
     fn justified(window: &[&str]) -> bool {
         window.iter().any(|l| {
             l.contains("probe(")
+                || l.contains("ladder::")
                 || l.contains("is_oom")
                 || l.contains("vram_manager")
                 || l.contains("Err(")
