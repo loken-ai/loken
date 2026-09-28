@@ -30,13 +30,15 @@ pub(super) enum GenericWeights<'a> {
 }
 
 impl GenericWeights<'_> {
-    /// The model built on `plan`.
+    /// The model built on `plan`, its embedding table on the first layer's card when
+    /// `stem_on_card` says the plan holds room for it there.
     pub(super) fn build(
         &self,
         cuda_devices: &std::collections::HashMap<usize, Device>,
         plan: &crate::inference::place::layer_executor::HeteroPlan,
         kv_quant: KvQuant,
         max_kv_seq_len: Option<usize>,
+        stem_on_card: bool,
     ) -> crate::tensor::Result<GenericHeteroTransformer> {
         match self {
             GenericWeights::Gguf { mmap_bytes, mmap } => {
@@ -44,13 +46,14 @@ impl GenericWeights<'_> {
                     &mut Cursor::new(*mmap_bytes),
                     (*mmap).clone(),
                 )?;
-                GenericHeteroTransformer::from_gguf_with_kv_quant(
+                GenericHeteroTransformer::from_gguf_placed(
                     content,
                     mmap_bytes,
                     cuda_devices,
                     plan,
                     kv_quant,
                     max_kv_seq_len,
+                    stem_on_card,
                 )
             }
             GenericWeights::Awq { dir, shards } => GenericHeteroTransformer::from_awq_safetensors(
@@ -61,6 +64,20 @@ impl GenericWeights<'_> {
                 kv_quant,
                 max_kv_seq_len,
             ),
+        }
+    }
+
+    /// Bytes the embedding table takes on a card, dequantised to f32; zero for a source
+    /// whose table always stays on the host.
+    pub(super) fn stem_bytes(&self, content: &gguf_file::Content) -> u64 {
+        match self {
+            GenericWeights::Gguf { .. } => content
+                .tensor_infos
+                .get("token_embd.weight")
+                .map_or(0, |t| {
+                    t.shape.elem_count() as u64 * std::mem::size_of::<f32>() as u64
+                }),
+            GenericWeights::Awq { .. } => 0,
         }
     }
 
@@ -360,6 +377,7 @@ pub(super) fn awq_eos_tokens(dir: &str) -> (u32, Vec<u32>) {
 pub(super) fn try_wrap_with_vision(
     text: GenericHeteroTransformer,
     projector_blob: Option<&std::path::Path>,
+    keep: u64,
 ) -> AnyResult<BoxedModelBackend> {
     let Some(blob) = projector_blob else {
         return Ok(Box::new(GenericBackend(text)));
@@ -377,77 +395,70 @@ pub(super) fn try_wrap_with_vision(
         );
         return Ok(Box::new(GenericBackend(text)));
     }
-    // Pick a CUDA device for the CLIP vision tower. Prefer a GPU the
-    // text model does NOT have LAYERS on (its pool isn't competing
-    // with the text-model KV cache + activations). Fix:
-    // was using `cuda_device_ordinals()` which returns ALL detected
-    // GPUs in the model's device map (not just placed-on ones)  -
-    // for moondream's text-model-on-GPU-0 + GPU-1-detected case, the
-    // "find different GPU" search returned None and the fallback
-    // landed CLIP back on GPU 0, OOMing on first request. The
-    // `layer_cuda_ordinals()` accessor returns only GPUs that
-    // actually hold text-model layers, so the search finds GPU 1.
-    let busy_text_gpus = text.layer_cuda_ordinals();
-    let nvml = nvml_wrapper::Nvml::init().ok();
-    let total_gpus = nvml
-        .as_ref()
-        .and_then(|n| n.device_count().ok())
-        .unwrap_or(0) as usize;
-    let mut chosen: Option<usize> = (0..total_gpus).find(|i| !busy_text_gpus.contains(i));
-    if chosen.is_none() {
-        chosen = busy_text_gpus.iter().next().copied();
-    }
-    let device = chosen
-        .and_then(|idx| crate::tensor::Device::new_cuda(idx).ok())
-        .unwrap_or(crate::tensor::Device::Cpu);
-    info!(
-        "📷 Loading {} vision tower from {} onto {:?}",
-        if projector_type == "pixtral" {
-            "Pixtral"
-        } else {
-            "CLIP"
-        },
-        blob.display(),
-        device.location(),
+    // The tower runs once per image, so it is offered the cards the text model holds no
+    // layer on first, then the text model's cards with `keep` left free for its work and
+    // cache. It holds its weights and the staging of loading them.
+    let tower = if projector_type == "pixtral" {
+        "Pixtral"
+    } else {
+        "CLIP"
+    };
+    let bytes = std::fs::metadata(blob).map(|m| m.len()).unwrap_or(0);
+    let need = bytes.saturating_add(crate::inference::place::runtime_demand::load_runtime_floor(
+        bytes,
+    ));
+    let hot: Vec<usize> = text.layer_cuda_ordinals().into_iter().collect();
+    let cards = crate::inference::place::ladder::aside(
+        &crate::inference::place::ladder::cards(0),
+        &hot,
+        keep,
     );
     let t0 = std::time::Instant::now();
-    let vision = if projector_type == "pixtral" {
-        // Pixtral-ViT lives on the native substrate; mirror the chosen device.
-        let ndev = match device.location() {
-            crate::tensor::DeviceLocation::Cuda { gpu_id } => {
-                crate::tensor::Device::new_cuda(gpu_id).unwrap_or(crate::tensor::Device::Cpu)
+    let placed = crate::inference::place::ladder::load_whole_on(
+        &format!("{tower} vision tower"),
+        need,
+        need,
+        &cards,
+        None,
+        |on| {
+            // The towers take a plain card handle, not the placement's stream-bound one.
+            let device = match on.location() {
+                crate::tensor::DeviceLocation::Cuda { gpu_id } => {
+                    crate::tensor::Device::new_cuda(gpu_id)?
+                }
+                _ => crate::tensor::Device::Cpu,
+            };
+            info!(
+                "📷 Loading {tower} vision tower from {} onto {:?}",
+                blob.display(),
+                device.location()
+            );
+            if projector_type == "pixtral" {
+                crate::inference::model::pixtral::PixtralVision::load_mmproj(
+                    &blob.to_string_lossy(),
+                    &device,
+                )
+                .map(VisionTower::Pixtral)
+                .map_err(|e| anyhow!("{e}"))
+            } else {
+                crate::inference::model::moondream::vision::MoondreamVisionEncoder::from_clip_gguf(
+                    blob, &device,
+                )
+                .map(VisionTower::Clip)
+                .map_err(|e| anyhow!("{e}"))
             }
-            _ => crate::tensor::Device::Cpu,
-        };
-        match crate::inference::model::pixtral::PixtralVision::load_mmproj(
-            &blob.to_string_lossy(),
-            &ndev,
-        ) {
-            Ok(v) => VisionTower::Pixtral(v),
-            Err(e) => {
-                warn!(
-                    "⚠️  Pixtral vision load failed ({}); model will work for text only",
-                    e
-                );
-                return Ok(Box::new(GenericBackend(text)));
-            }
+        },
+    );
+    match placed {
+        Ok((vision, _)) => {
+            info!("✅ Vision tower loaded in {} ms", t0.elapsed().as_millis());
+            Ok(Box::new(GenericVisionBackend { text, vision }))
         }
-    } else {
-        match crate::inference::model::moondream::vision::MoondreamVisionEncoder::from_clip_gguf(
-            blob, &device,
-        ) {
-            Ok(v) => VisionTower::Clip(v),
-            Err(e) => {
-                warn!(
-                    "⚠️  CLIP load failed ({}); model will work for text only",
-                    e
-                );
-                return Ok(Box::new(GenericBackend(text)));
-            }
+        Err(e) => {
+            warn!("⚠️  {tower} vision load failed ({e}); model will work for text only");
+            Ok(Box::new(GenericBackend(text)))
         }
-    };
-    info!("✅ Vision tower loaded in {} ms", t0.elapsed().as_millis());
-    Ok(Box::new(GenericVisionBackend { text, vision }))
+    }
 }
 
 /// Read `clip.projector_type` from an mmproj GGUF (cheap: metadata only).

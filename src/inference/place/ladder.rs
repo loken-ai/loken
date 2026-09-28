@@ -114,6 +114,32 @@ impl Demand {
 }
 
 impl Demand {
+    /// The first rung for a component whose stem of `stem_bytes` may sit on the card its
+    /// first block runs on: planned with the stem there when that costs the blocks nothing,
+    /// as many of them staying on as many cards, else planned without it. Returns the plan
+    /// and whether it holds the stem.
+    pub fn plan_stem_if_free(&self, cards: &[(usize, u64)], stem_bytes: u64) -> (HeteroPlan, bool) {
+        let without = self.plan(cards);
+        let with = self.plan_with_stem(cards, stem_bytes, self.runtime_reserve);
+        let on_host = |plan: &HeteroPlan| -> usize {
+            plan.segments
+                .iter()
+                .filter(|s| !matches!(s.kind, DeviceKind::Cuda(_)))
+                .map(HeteroSegment::num_layers)
+                .sum()
+        };
+        let free = first_card(&with).is_some()
+            && on_host(&with) == on_host(&without)
+            && cards_of(&with).len() == cards_of(&without).len();
+        if free {
+            (with, true)
+        } else {
+            (without, false)
+        }
+    }
+}
+
+impl Demand {
     /// [`Demand::plan_with_stem`] for a component whose one-shot companion of `companion`
     /// bytes sits on a card the blocks leave alone, or on the host. Whole on one card
     /// when a card holds it; else the blocks are spread with each card in turn keeping
@@ -889,6 +915,20 @@ mod tests {
             "{:?}",
             kinds(&plan)
         );
+    }
+
+    #[test]
+    fn a_stem_goes_on_the_card_only_when_it_costs_the_blocks_nothing() {
+        let d = Demand {
+            runtime_reserve: GB,
+            ..demand(10, 8)
+        };
+        let (plan, stem) = d.plan_stem_if_free(&[(0, 12 * GB)], 2 * GB);
+        assert!(stem);
+        assert_eq!(kinds(&plan), vec!["CUDA(0)".to_string()]);
+        let (plan, stem) = d.plan_stem_if_free(&[(0, 10 * GB)], 6 * GB);
+        assert!(!stem);
+        assert_eq!(kinds(&plan), vec!["CUDA(0)".to_string()]);
     }
 
     #[test]

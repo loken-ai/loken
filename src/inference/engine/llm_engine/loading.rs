@@ -10,15 +10,9 @@ use super::*;
 /// `tokenizer.ggml.eos_token_ids`: turn opener, turn closer, tool-response opener.
 const GEMMA4_TURN_STOP_PIECES: [&str; 3] = ["<|turn>", "<turn|>", "<|tool_response>"];
 
-/// Card memory the loader keeps beyond the weights and the runtime reserve: the second
-/// pass dequantises small tensors (the output projection among them), stages the KV cache
-/// and takes CUDA scratch, none of which the weights number counts.
-pub(crate) const LOADER_OVERHEAD_PER_GPU: u64 = 768 * 1024 * 1024;
 /// Largest window the runtime reserve prices the KV cache at: the caches start smaller and
 /// grow, and a longer window is admitted by the context planner, not by this reserve.
 const RESERVE_KV_WINDOW: u64 = 8192;
-/// cuBLAS handle and workspace on each card.
-const CUBLAS_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The dimensions of a language model a placement is priced from, read from its GGUF header.
 #[derive(Debug, Clone, Copy)]
@@ -85,17 +79,16 @@ impl ModelDims {
     /// What a card keeps free beside the weights and the cache: the cuBLAS workspace and
     /// the activations of one prefill chunk.
     pub(crate) fn work_reserve(&self) -> u64 {
-        let widest = self.hidden_size.max(self.num_kv_heads * self.head_dim) as u64;
-        let act = (PREFILL_CHUNK_TOKENS as u64)
-            .saturating_mul(widest)
-            .saturating_mul(4)
-            .saturating_mul(2);
-        CUBLAS_WORKSPACE_BYTES.saturating_add(act)
+        crate::inference::place::runtime_demand::llm_work_reserve(
+            self.hidden_size.max(self.num_kv_heads * self.head_dim),
+            PREFILL_CHUNK_TOKENS,
+        )
     }
 }
 
 /// Card memory a load of the GGUF at `path` keeps free on each card it uses, beyond the
-/// weights: the runtime reserve at the model's declared window plus the loader's overhead.
+/// weights: the runtime reserve at the model's declared window plus the staging the load
+/// of that checkpoint churns through.
 pub(crate) fn per_card_reserve(path: &std::path::Path) -> Option<u64> {
     let content = gguf_file::open_header(path).ok()?;
     let arch = get_gguf_string(&content, "general.architecture")?;
@@ -103,7 +96,10 @@ pub(crate) fn per_card_reserve(path: &std::path::Path) -> Option<u64> {
         .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| {
             c as usize
         });
-    Some(ModelDims::read(&content, &arch).runtime_reserve(context_length) + LOADER_OVERHEAD_PER_GPU)
+    let staging = crate::inference::place::runtime_demand::load_runtime_floor(
+        std::fs::metadata(path).ok()?.len(),
+    );
+    Some(ModelDims::read(&content, &arch).runtime_reserve(context_length) + staging)
 }
 
 /// Size the rayon pool the host kernels run on, once per process.
@@ -607,229 +603,74 @@ impl LlmEngine {
 
             debug!("✓ Tokenizer loaded");
 
-            // --- 4. Select device (size-aware: only use GPU if model fits) ---
-            // The primary card is the pinned one, else the fastest present: the probe ranks
-            // by compute.
-            let gpu_idx = device_index.unwrap_or_else(|| {
-                crate::inference::place::device_probe::probe_cuda_gpus()
-                    .first()
-                    .map_or(0, |g| g.index)
-            });
-
-            // Enumerate all CUDA GPUs via NVML, sorted by performance (fastest first).
-            // Shared, process-aware probe (also serves the ACE-Step native stack):
-            // see `inference::place::device_probe`. `available` = stable_free x fraction.
-            // Under pressure every card offers LESS, so a retry after an out-of-memory
-            // load plans differently instead of handing back the plan that just failed.
-            // Without this the escalation is a counter nobody reads: the image path had
-            // exactly that bug, three identical re-plans and three identical failures.
-            // Create every CUDA context, and force its cuBLAS workspace, BEFORE
-            // reading free memory. On a fresh process none of that exists yet, so
-            // the FIRST probe reports about half a gigabyte more than any later
-            // one - memory this very load is about to spend. On a model that
-            // spills to CPU the budget IS the split point, so that phantom half
-            // gigabyte moved one layer across the boundary and greedy decoding
-            // at temperature zero answered something else. Once, per process:
-            // afterwards every load sees the same world as the first.
-            // Warm ONLY the fastest card here. The warm's cuBLAS init latches the
-            // card's primary context for the life of the process (the proven cost:
-            // ~150 MB and idle watts, forever), and that latch is exactly what makes
-            // budget probes stable across loads. So each card pays it the first time
-            // a plan can actually reach it: the fastest card always can; the others
-            // only when the model does not fit one GPU - see the multi-GPU branch.
-            #[cfg(feature = "cuda")]
-            warm_card(gpu_idx);
-
-            // Hand the caching allocator's retained blocks back before probing.
-            // They belong to no live tensor, but the driver still reports them as
-            // used, so the budget depends on which model happened to run before.
-            // For a model that must spill to CPU that budget IS the split point:
-            // two loads of the SAME model saw 31.6 GB then 31.1 GB, moved one
-            // layer across the boundary, and greedy decoding at temperature 0
-            // answered two different things - a user-visible irreproducibility,
-            // not a benchmark artefact.
-            crate::inference::engine::llm_engine::release_cuda_pools();
-            crate::inference::place::device_probe::debug_vram_by_card("after-pool-release");
-            let boost = crate::inference::place::vram_manager::vram_reserve_boost();
-            let all_cuda_gpus: Vec<(usize, u64, u64)> = // (index, stable_free, available)
-                crate::inference::place::device_probe::probe_cuda_gpus_for("llm")
-                    .into_iter()
-                    .map(|g| {
-                        let free = g.stable_free.saturating_sub(boost);
-                        (g.index, free, free)
-                    })
-                    .collect();
-
-            // Total available VRAM across all GPUs
-            let total_available_gpu_memory: u64 = all_cuda_gpus.iter().map(|(_, _, avail)| avail).sum();
+            // --- 4. The cards the placement offers this model ---
+            //
+            // Each card offers its free memory under the fleet's pressure, less the staging
+            // a load of this checkpoint churns through; `place::llm::offer` makes every
+            // listed card's context before it measures it, so a card reads the same on every
+            // load. What one card must hold for the model to live on it alone is the weights
+            // and the runtime reserve: the cache at the reserve window, the cuBLAS workspace
+            // and a prefill chunk's activations, sized from the model's own dimensions.
+            let runtime_reserve_bytes = dims.runtime_reserve(context_length);
+            let staging = crate::inference::place::runtime_demand::load_runtime_floor(file_size);
+            let offer = if disable_cuda {
+                debug!("CUDA disabled by config (disable_cuda=true)");
+                crate::inference::place::llm::Offer::default()
+            } else {
+                crate::inference::place::llm::offer(
+                    device_index,
+                    file_size.saturating_add(runtime_reserve_bytes),
+                    staging,
+                )
+            };
+            crate::inference::place::device_probe::debug_vram_by_card("after-offer");
+            let cuda_devices: Vec<(usize, u64)> = offer.cards.clone();
+            let model_fits_single_gpu = file_size > 0 && offer.whole_on.is_some();
+            let gpu_idx = offer.primary().unwrap_or_default();
 
             // --- 4.5 The non-CUDA GPUs, if any answer ---
             //
             // Behind a deadline, because this is a driver call: a card removed while the system
             // ran leaves a device node that blocks every OpenCL client, and enumerating here
             // once wedged a whole node mid-load. See `opencl_probe`.
-            let opencl_devices: Vec<(usize, u64)> = crate::inference::kernel::opencl_probe::non_cuda_devices()
-                .into_iter()
-                .enumerate()
-                .map(|(idx, (name, vram))| {
+            if !disable_arc_layers {
+                for (idx, (name, vram)) in crate::inference::kernel::opencl_probe::non_cuda_devices()
+                    .into_iter()
+                    .enumerate()
+                {
                     debug!("🖥️  OpenCL device {}: {} ({:.1} GB)", idx, name, vram as f64 / 1e9);
-                    (idx, vram)
-                })
-                .collect();
-
-            // Compute device plan for multi-device support
-            // CUDA: expansion 1.0 (quantized weights on GPU)
-            // OpenCL: expansion 1.0 (keeps raw Q4 bytes, dequantizes on-the-fly in kernels)
-            use crate::inference::place::layer_executor::HeteroPlan;
-
-            // Prepare heterogeneous devices for potential hetero planning
-            // Apply device filters (for benchmarking different configurations).
-            //
-            let cuda_devices: Vec<(usize, u64)> = if disable_cuda {
-                debug!("CUDA disabled by config (disable_cuda=true)");
-                vec![]
-            } else {
-                all_cuda_gpus.iter()
-                    .map(|(idx, _, avail)| (*idx, avail.saturating_sub(LOADER_OVERHEAD_PER_GPU)))
-                    .filter(|(_, avail)| *avail > 0)
-                    .collect()
-            };
-            let opencl_devices = if disable_arc_layers {
-                debug!("OpenCL/Arc disabled by config (disable_arc_layers=true)");
-                vec![]
-            } else {
-                opencl_devices
-            };
-
-            // Determine loading strategy:
-            //   1. Model fits in GPU -> single-device GPU (CUDA)
-            //   2. Model > GPU but CUDA available + mistral3 -> multi-CUDA GPU+CPU
-            //   3. CUDA + OpenCL available + mistral3 -> heterogeneous (CUDA+Arc+CPU)
-            //   4. Only OpenCL available + mistral3 -> OpenCL only (Arc+CPU)
-            //   5. No GPU or unsupported arch -> single-device CPU
-            // Single-GPU fit needs WEIGHTS + a runtime reserve, not just weights.
-            // A model whose weights fit one card (e.g. devstral 14.3 GB on a
-            // 15.6 GB budget) but leaves <1 GB free loads fine, then OOMs at the
-            // FIRST request when cuBLAS initialises its handle/workspace, the KV
-            // cache grows, and the prefill activation allocates - none of which
-            // are in `file_size`. That runtime OOM happens AFTER the layers are
-            // committed to one GPU, so the load-time split ladder never fires and
-            // the idle second GPU goes unused. Reserve for it up front so the
-            // planner spills onto the second GPU instead. The reserve scales with
-            // the loaded context (KV cache, Q8: 2xK/V x kv_heads x head_dim x
-            // ctx x n_layers) plus a fixed cuBLAS-workspace + prefill-activation
-            // margin. Sized from the model's own dimensions - no per-machine
-            // constants - so it adapts across architectures.
-            let runtime_reserve_bytes = dims.runtime_reserve(context_length);
-            // The primary card is the fastest one that holds the model whole; a faster card
-            // that other residents have filled does not make a model that fits a free one split
-            // across both. With no card holding it, the fastest stays primary.
-            // What one card must hold for the model to live on it alone: the weights, the
-            // runtime reserve and the loader's own staging, as the split plan counts them.
-            let needed_on_one = file_size
-                .saturating_add(runtime_reserve_bytes)
-                .saturating_add(LOADER_OVERHEAD_PER_GPU);
-            let gpu_idx = match device_index {
-                Some(i) => i,
-                None => all_cuda_gpus
-                    .iter()
-                    .find(|(_, _, avail)| needed_on_one <= *avail)
-                    .map_or(gpu_idx, |(i, _, _)| *i),
-            };
-            let available_gpu_memory = if disable_cuda {
-                0
-            } else {
-                all_cuda_gpus
-                    .iter()
-                    .find(|(idx, _, _)| *idx == gpu_idx)
-                    .map_or(0, |(_, _, avail)| *avail)
-            };
-            let model_fits_single_gpu = file_size > 0
-                && available_gpu_memory > 0
-                && needed_on_one <= available_gpu_memory;
-            let model_fits_gpu = file_size > 0
-                && total_available_gpu_memory > 0
-                && file_size <= total_available_gpu_memory;
-            let cuda_available = total_available_gpu_memory > 0;
-            let _multi_cuda = cuda_devices.len() > 1;
-            let _opencl_available = !opencl_devices.is_empty();
-
-            let device = if model_fits_single_gpu {
-                info!("📊 Model ({:.1} GB) fits in single GPU memory ({:.1} GB), loading on GPU {}",
-                    file_size as f64 / 1e9, available_gpu_memory as f64 / 1e9, gpu_idx);
-                // Use Device::new_cuda (default stream) instead of
-                // new_with_stream (non-default). Default stream + tracking
-                // disabled is captureable in cudaStreamCaptureModeRelaxed,
-                // which the engine uses for CUDA graph capture.
-                #[cfg_attr(not(feature = "cuda"), allow(clippy::map_identity))]
-                let dev_result: crate::tensor::Result<Device> = crate::tensor::Device::new_cuda(gpu_idx)
-                    .map(|d| {
-                        #[cfg(feature = "cuda")]
-                        if let Device::Cuda(ref cd) = d {
-                            unsafe { cd.context().disable_event_tracking(); }
-                        }
-                        d
-                    });
-                dev_result.unwrap_or_else(|e| {
-                    warn!("CUDA device {} unavailable ({e}), falling back to CPU", gpu_idx);
-                    Device::Cpu
-                })
-            } else {
-                // The split plan reads EVERY card's budget, so every card must carry
-                // its context overhead before being measured - the warm latches it.
-                // Re-probed after warming: the first probe saw the other cards bare,
-                // and a budget that moves between loads moves the split layer, which
-                // at temperature zero moves the answer.
-                #[cfg(feature = "cuda")]
-                let cuda_devices: Vec<(usize, u64)> = if disable_cuda {
-                    cuda_devices.clone()
-                } else {
-                    for g in crate::inference::place::device_probe::probe_cuda_gpus_for("llm") {
-                        warm_card(g.index);
-                    }
-                    crate::inference::engine::llm_engine::release_cuda_pools();
-                    crate::inference::place::device_probe::probe_cuda_gpus_for("llm")
-                        .into_iter()
-                        .map(|g| {
-                            let free = g.stable_free.saturating_sub(boost);
-                            (
-                                g.index,
-                                free.saturating_sub(LOADER_OVERHEAD_PER_GPU),
-                            )
-                        })
-                        .filter(|(_, avail)| *avail > 0)
-                        .collect()
-                };
-                // Multi-GPU / spill: base device is CPU; the generic hetero
-                // loader places each layer across CUDA GPUs (+ CPU spill) from
-                // its own HeteroPlan, exactly like every other multi-GPU arch.
-                // The cache is part of what has to fit. Sizing a placement on
-                // the weights alone puts a model on the cards that runs out of
-                // memory once the context fills, and the generation-time re-plan
-                // then produces the SAME plan, because the budget it consults
-                // still ignores the cache. Derived here rather than further down
-                // where the cache is built: both inputs are known long before,
-                // and the decision that needs them is taken here.
-                //
-                // The bound is the CONFIGURED context, not the model's declared
-                // maximum: reserving for a 128k window a model will never open
-                // would spill it to the host to prevent an OOM that cannot
-                // happen. K and V, per layer, per kv head, over that window.
-                let planned_ctx = user_context_length.min(context_length);
-                let kv_elem: u64 = if matches!(kv_quant, KvQuant::Off) { 2 } else { 1 };
-                let kv_bytes = 2u64
-                    .saturating_mul(num_layers as u64)
-                    .saturating_mul(num_kv_heads as u64)
-                    .saturating_mul(head_dim as u64)
-                    .saturating_mul(planned_ctx as u64)
-                    .saturating_mul(kv_elem);
-                if cuda_available && file_size.saturating_add(kv_bytes) > total_available_gpu_memory {
-                    info!("📊 Model ({:.1} GB) > total CUDA GPU memory ({:.1} GB across {} GPUs), CPU spill via generic plan",
-                        file_size as f64 / 1e9, total_available_gpu_memory as f64 / 1e9, cuda_devices.len());
-                } else if !cuda_available {
-                    debug!("No CUDA GPU memory detected, loading on CPU");
                 }
-                Device::Cpu
+            }
+
+            let mut device = match offer.whole_on.filter(|_| model_fits_single_gpu) {
+                Some(idx) => {
+                    info!("📊 Model ({:.1} GB) fits in single GPU memory, loading on GPU {}",
+                        file_size as f64 / 1e9, idx);
+                    // Default stream with event tracking disabled: capturable in
+                    // cudaStreamCaptureModeRelaxed, which the engine's graph capture uses.
+                    #[cfg_attr(not(feature = "cuda"), allow(clippy::map_identity))]
+                    let dev_result: crate::tensor::Result<Device> = crate::tensor::Device::new_cuda(idx)
+                        .map(|d| {
+                            #[cfg(feature = "cuda")]
+                            if let Device::Cuda(ref cd) = d {
+                                unsafe { cd.context().disable_event_tracking(); }
+                            }
+                            d
+                        });
+                    dev_result.unwrap_or_else(|e| {
+                        warn!("CUDA device {} unavailable ({e}), falling back to CPU", idx);
+                        Device::Cpu
+                    })
+                }
+                None => {
+                    if cuda_devices.is_empty() {
+                        debug!("No CUDA GPU memory offered, loading on CPU");
+                    } else {
+                        info!("📊 Model ({:.1} GB) does not sit whole on one card; the plan spreads it over {} card(s)",
+                            file_size as f64 / 1e9, cuda_devices.len());
+                    }
+                    Device::Cpu
+                }
             };
 
             debug!("✓ Using device: {:?}", device);
@@ -848,24 +689,33 @@ impl LlmEngine {
                 // Moondream legacy path: a file with the original PyTorch state-dict
                 // naming, whatever its architecture key says. A file with llama.cpp
                 // naming (token_embd, blk.{i}.attn_qkv) takes the generic phi2 path.
+                // The legacy model runs whole on one device, placed by the ladder.
                 _ if content.tensor_infos.contains_key("text_model.transformer.embd.wte.weight") => {
                     debug!("Loading Moondream vision model from GGUF...");
-                    let vb = crate::tensor::quantized::QVarBuilder::from_gguf(
-                        &model_file, &device,
-                    ).map_err(|e| anyhow!("Failed to load Moondream GGUF: {e}"))?;
-                    let config = crate::inference::model::moondream::quantized::Config::from_checkpoint(&vb)
-                        .map_err(|e| anyhow!("Moondream shape: {e}"))?;
-                    match moondream::Model::new(&config, vb) {
-                        Ok(model) => {
-                            info!("Vision model loaded (Moondream v2)");
-                            Box::new(MoondreamBackend(model))
-                        }
-                        Err(e) => {
-                            let err_msg = format!("Failed to load Moondream weights: {e}");
-                            error!("{}", err_msg);
-                            return Err(anyhow!(err_msg));
-                        }
+                    let mut built_on = Device::Cpu;
+                    let model = crate::inference::place::ladder::load_whole(
+                        "moondream",
+                        file_size,
+                        runtime_reserve_bytes,
+                        |on| {
+                            let vb = crate::tensor::quantized::QVarBuilder::from_gguf(&model_file, on)
+                                .map_err(|e| anyhow!("Failed to load Moondream GGUF: {e}"))?;
+                            let config = crate::inference::model::moondream::quantized::Config::from_checkpoint(&vb)
+                                .map_err(|e| anyhow!("Moondream shape: {e}"))?;
+                            let model = moondream::Model::new(&config, vb)
+                                .map_err(|e| anyhow!("Failed to load Moondream weights: {e}"))?;
+                            built_on = on.clone();
+                            Ok::<_, anyhow::Error>(model)
+                        },
+                    )
+                    .inspect_err(|e| error!("{e}"))?;
+                    info!("Vision model loaded (Moondream v2) on {:?}", built_on.location());
+                    #[cfg(feature = "cuda")]
+                    if built_on.is_cuda() {
+                        crate::tensor::cuda_ext::set_gemm_reduced_precision(true);
                     }
+                    device = built_on;
+                    Box::new(MoondreamBackend(model))
                 }
                 "nemotron_h_moe" => {
                     // nemotron-H: hybrid Mamba2 + attention + non-gated MoE.
@@ -1029,44 +879,6 @@ impl LlmEngine {
                         None => return Err(anyhow!("qwen35moe load failed: {last_err}")),
                     }
                 }
-                // A model that does not fit one card runs EVERY layer on both, instead of one
-                // card per token with the other idle. q/k/v and gate/up are column-parallel,
-                // o and down row-parallel joined by an all-reduce. A model that DOES fit one
-                // card stays on the single-card path, which is faster still - the guard is the
-                // whole point, and it is derived from the weights rather than named per model.
-                // Which files the decoder computes correctly is read from their tensors and
-                // metadata by `tensor_parallel_support`.
-                #[cfg(feature = "cuda")]
-                _ if !model_fits_single_gpu && model_fits_gpu
-                    && cuda_devices.len() >= crate::inference::serve::tp_support::TP_RANKS
-                    // Each rank holds an even share of the weights: a card another model
-                    // still occupies leaves the uneven split of the layer path instead.
-                    && cuda_devices
-                        .iter()
-                        .take(crate::inference::serve::tp_support::TP_RANKS)
-                        .all(|(_, free)| {
-                            *free >= file_size / crate::inference::serve::tp_support::TP_RANKS as u64
-                                + runtime_reserve_bytes
-                        })
-                    && awq.is_none()
-                    && crate::inference::serve::tp_support::tensor_parallel_support(&content, &arch)
-                        .inspect_err(|why| info!("{arch} stays off tensor parallelism: {why}"))
-                        .is_ok() => {
-                    let ranks = crate::inference::serve::tp_support::TP_RANKS;
-                    info!("⬇️  Loading {} as TpQwen2 - TP={} across GPU {} + {}",
-                        arch, ranks, cuda_devices[0].0, cuda_devices[1].0);
-                    let g0 = crate::tensor::Device::new_cuda(cuda_devices[0].0)
-                        .map_err(|e| anyhow!("TpQwen2 cuda:{}: {e}", cuda_devices[0].0))?;
-                    let g1 = crate::tensor::Device::new_cuda(cuda_devices[1].0)
-                        .map_err(|e| anyhow!("TpQwen2 cuda:{}: {e}", cuda_devices[1].0))?;
-                    match crate::inference::serve::tp_model::TpQwen2::from_gguf(mmap_bytes, &mmap, &arch, g0, g1) {
-                        Ok(m) => {
-                            info!("✅ {} loaded as TpQwen2 (tensor-parallel across {} GPUs)", arch, ranks);
-                            Box::new(TpQwen2Backend(m))
-                        }
-                        Err(e) => return Err(anyhow!("TpQwen2 ({arch}) load failed: {e}")),
-                    }
-                }
                 "llama" | "mistral" | "mistral3" |
                 "qwen2" | "qwen3" | "qwen3moe" | "gptoss" | "gemma" | "gemma2" | "gemma3" |
                 "gemma3n" | "gemma4" |
@@ -1124,23 +936,16 @@ impl LlmEngine {
                         }).collect(),
                         _ => Vec::new(),
                     };
-                    // For Q4/Q8 lazy KV caches (Q4KvCache / Q8KvCache), the initial
-                    // allocation is capped at INITIAL_CAPACITY_TOKENS=4096 - the
-                    // cache grows on demand up to the user's full context_length.
-                    // Pre-planning for the worst-case context overestimates VRAM
-                    // need by ~8x at default config (32K config vs 4K bench), which
-                    // pushed deepcoder onto an unnecessary 2-GPU split that costs
-                    // ~20% decode.
-                    //
-                    // Use the actual initial allocation as the planning estimate;
-                    // when the cache later grows, the NVML-polling adaptive loader
-                    // in `inference/generic_transformer/` catches VRAM pressure and
-                    // diverts subsequent layers. F-dtype caches still pre-allocate
-                    // the full user context, so they keep the worst-case estimate.
+                    // A quantised cache (Q4KvCache / Q8KvCache) starts at the working window
+                    // and grows on demand up to the configured context, so it is planned at the
+                    // size it starts at; a cache that grows past what its card holds is
+                    // recovered by the ladder. An F-dtype cache pre-allocates in full.
                     let lazy_kv_initial_cap =
                         crate::inference::cache::KV_WORKING_WINDOW_TOKENS as u64;
-                    // A hybrid's recurrent layers keep no KV: the cache is spread over the
-                    // layers that attend.
+                    // What one layer's cache costs at a given context, sliding windows
+                    // included: a windowed layer never holds more than its window.
+                    // Only the attending layers keep a cache; a recurrent mixer keeps a state
+                    // of fixed size instead, so the cache is spread over the attending share.
                     let attn_layers = crate::inference::generic_transformer::mixer::attention_layer_count(
                         &content, num_layers,
                     ) as u64;
@@ -1151,8 +956,6 @@ impl LlmEngine {
                             bytes
                         }
                     };
-                    // What one layer's cache costs at a given context, sliding windows
-                    // included: a windowed layer never holds more than its window.
                     let kv_bytes_at = |ctx: u64| -> u64 {
                         let avg = if !pattern.is_empty() && sliding_window > 0 {
                             let n_swa = pattern.iter().filter(|&&is_swa| is_swa).count() as u64;
@@ -1165,176 +968,46 @@ impl LlmEngine {
                         };
                         over_attending(2u64 * num_kv_heads as u64 * head_dim as u64 * avg * kv_dtype_bytes)
                     };
-
-                    // Choose the context that yields the best PLAN, not the largest number.
-                    //
-                    // A quantised cache grows on demand, so planning against its initial cap
-                    // is already honest. An F-dtype cache pre-allocates in full, and honouring
-                    // a context the cards cannot hold does not fail - it pushes layers onto the
-                    // host, and a host layer costs far more than a context window nobody asked
-                    // for. Measured on gemma4:31b: the configured 32768 sent six of sixty layers
-                    // to the processor and the model decoded at a third of ollama's rate, while
-                    // its 12b, 26b and latest siblings all won.
-                    //
-                    // So the hardware decides. Take the largest context whose plan keeps every
-                    // layer on the cards, halving down to the cap the lazy path already uses as
-                    // its floor. Nothing here is a memory constant: each candidate is priced
-                    // from the model's own dimensions and weighed against the cards actually
-                    // present, so the same code lands differently on different hardware - which
-                    // is the point.
-                    let ctx_for_planning: u64 = if matches!(kv_quant, KvQuant::Q4 | KvQuant::Q8) {
-                        lazy_kv_initial_cap.min(user_context_length as u64)
-                    } else if !cuda_available || cuda_devices.is_empty() {
-                        user_context_length as u64
-                    } else {
-                        let full = user_context_length as u64;
-                        let floor = lazy_kv_initial_cap.min(full);
-                        let spills = |ctx: u64| {
-                            HeteroPlan::calculate_with_kv(
-                                num_layers, file_size, &cuda_devices, &[], 1.0, kv_bytes_at(ctx),
-                            )
-                            .segments
-                            .iter()
-                            .any(|s| !matches!(s.kind, crate::inference::place::layer_executor::DeviceKind::Cuda(_)))
-                        };
-                        let host_layers = |ctx: u64| -> usize {
-                            HeteroPlan::calculate_with_kv(
-                                num_layers, file_size, &cuda_devices, &[], 1.0, kv_bytes_at(ctx),
-                            )
-                            .segments
-                            .iter()
-                            .filter(|s| !matches!(s.kind, crate::inference::place::layer_executor::DeviceKind::Cuda(_)))
-                            .map(|s| s.num_layers())
-                            .sum()
-                        };
-                        let mut chosen = full;
-                        while chosen > floor && spills(chosen) {
-                            chosen = (chosen / 2).max(floor);
-                        }
-                        if chosen < full {
-                            info!(
-                                "🧠 KV context {} -> {}: at the configured context {} of {} layers would have gone to the host",
-                                full, chosen, host_layers(full), num_layers
-                            );
-                        }
-                        chosen
-                    };
-                    let avg_ctx_per_layer: u64 = if !pattern.is_empty() && sliding_window > 0 {
-                        let cap_swa = ctx_for_planning.min(sliding_window);
-                        let n_swa = pattern.iter().filter(|&&is_swa| is_swa).count() as u64;
-                        let n_global = pattern.len() as u64 - n_swa;
-                        let total: u64 = n_swa.saturating_mul(cap_swa)
-                                       + n_global.saturating_mul(ctx_for_planning);
-                        if !pattern.is_empty() { total / pattern.len() as u64 } else { ctx_for_planning }
-                    } else {
-                        ctx_for_planning
-                    };
-                    // Per-layer non-weight cost during first prefill =
-                    // Per-layer KV-cache footprint, derived purely from the
-                    // model's real dimensions (heads x head_dim x context x
-                    // dtype) - no magic activation constant. Earlier revisions
-                    // added a static `activation_headroom_per_layer`
-                    // (150 MB -> 80 MB for hidden>=4096, 4 MB otherwise) to pad
-                    // the plan toward a 2-GPU split so the first prefill's
-                    // activation peak wouldn't OOM. That constant was an
-                    // arbitrary single-model measurement (qwen3:latest) and is the wrong abstraction: it can't
-                    // distinguish a model that genuinely needs 2 GPUs
-                    // (devstral, whose WEIGHTS don't fit one card) from one
-                    // that doesn't (deepcoder/gpt-oss/qwen3, which fit and win
-                    // big single-GPU). The correct mechanism is REACTIVE, not a
-                    // guess: place optimistically by the weights-only fit
-                    // (`model_fits_single_gpu`), and recover from a real
-                    // allocation failure - the load-time OOM retry ladder below
-                    // (single-GPU -> forced 2-GPU split -> CPU) plus the NVML
-                    // divert-on-pressure loader in generic_transformer handle
-                    // genuine overflow without pre-reserving a fictional margin.
-                    let kv_bytes_per_layer: u64 = over_attending(
-                        2u64 * num_kv_heads as u64 * head_dim as u64 * avg_ctx_per_layer * kv_dtype_bytes,
-                    );
                     // What the model asks of the cards; the ladder in `place` turns it into a
                     // plan, whole on one card when it fits there, and recovers from running out
-                    // of card memory. A pinned card is offered first.
+                    // of card memory. The cache is part of what has to fit: a placement sized
+                    // on the weights alone runs out once the context fills.
                     let (block_bytes, head_bytes) = generic_weights
                         .block_and_head_bytes(&content)
                         .unwrap_or((file_size, 0));
-                    let demand = crate::inference::place::ladder::Demand {
+                    let demand_at = |ctx: u64| crate::inference::place::ladder::Demand {
                         layers: num_layers,
                         block_bytes,
                         head_bytes,
-                        kv_bytes_per_layer,
+                        kv_bytes_per_layer: kv_bytes_at(ctx),
                         runtime_reserve: dims.work_reserve(),
                     };
-                    let mut ranked_cards = cuda_devices.clone();
-                    if let Some(pin) = device_index {
-                        if let Some(at) = ranked_cards.iter().position(|(i, _)| *i == pin) {
-                            let card = ranked_cards.remove(at);
-                            ranked_cards.insert(0, card);
-                        }
-                    }
-                    // Create CUDA devices for ALL detected GPUs, not just
-                    // those the planner picked. The loader's per-layer
-                    // adaptive placement (see generic_transformer
-                    // ::from_gguf load loop) queries NVML free between
-                    // layers and diverts to a secondary GPU when the
-                    // primary fills up - for that to work it needs a
-                    // Device handle on every available GPU even if the
-                    // initial plan only used one. Cost: an extra
-                    // Device::new_cuda(idx) for unused GPUs (one-time,
-                    // ~1 ms each).
-                    //
-                    // We intentionally create fresh Device handles instead
-                    // of reusing the engine's `device`: sharing the
-                    // engine's device (which has `enable_graph_capture_mode`
-                    // set for potential future capture) breaks the normal
-                    // forward path - the stream + async allocator state is
-                    // incompatible with regular inference. The engine's
-                    // graph capture instead targets the MODEL's stream via
-                    // `ModelBackend::model_cuda_stream()`.
-                    //
-                    // Engine-site CUDA-graph decode additionally requires
-                    // per-slice CudaEvent tracking OFF on the model's
-                    // handles, disabled at creation BEFORE any tensor
-                    // loads: with tracking ON every CudaSlice carries
-                    // read/write events recorded on each use, and capturing
-                    // the decode forward then records/waits events created
-                    // OUTSIDE the capture -> CAPTURE_INVALIDATED, so the
-                    // tracking must be off before any tensor loads.
-                    //
-                    // Scope: every handle, whatever shape the plan has. The
-                    // tracking exists to order a slice against a SECOND
-                    // stream, and there is none - a device owns exactly one
-                    // working stream. Within a device the ops are therefore
-                    // already stream-ordered, and a cross-device transfer
-                    // records and waits its own event explicitly, so the
-                    // per-op events order a stream against itself. On a split
-                    // model that is not a small waste: 5600 waits and 3184
-                    // records per token, 36% of the CUDA API time, none of it
-                    // present on the same model when it fits one card.
-                    let mut hetero_cuda_devs: std::collections::HashMap<usize, Device> = std::collections::HashMap::new();
-                    for (idx, _) in &cuda_devices {
-                        if let std::collections::hash_map::Entry::Vacant(slot) = hetero_cuda_devs.entry(*idx) {
-                            if let Ok(d) = Device::new_cuda(*idx) {
-                                #[cfg(feature = "cuda")]
-                                if let Device::Cuda(ref cd) = d {
-                                    unsafe { cd.context().disable_event_tracking(); }
-                                }
-                                slot.insert(d);
-                            }
-                        }
-                    }
-                    // Cap user_context_length at the model's GGUF context.
-                    // moondream (GGUF ctx=2048) OOM'd because
-                    // server config ctx=32768 forced the F-dtype KV cache
-                    // to pre-allocate 24 x [1,32,32768,64] F16 = 12.3 GB
-                    // on first append, exceeding the 13 GB GPU budget.
-                    // The model can't generate beyond its trained context
-                    // anyway, so the larger server cap was pure waste.
-                    // The plan above chose this context because the cards can hold it; the
-                    // cache must be allocated at that size or the plan promised room the
-                    // allocation then takes back.
-                    // A quantised cache was planned at its initial cap and grows on demand, so
-                    // its ceiling is the configured context; an F-dtype cache is allocated in
-                    // full at the context the plan chose.
+
+                    // Choose the context that yields the best PLAN, not the largest number.
+                    // An F-dtype cache honouring a context the cards cannot hold does not fail -
+                    // it pushes layers onto the host, and a host layer costs far more than a
+                    // context window nobody asked for. So the placement takes the largest
+                    // context whose plan keeps every layer on the cards, halving down to the
+                    // working window.
+                    let ctx_for_planning: u64 = if matches!(kv_quant, KvQuant::Q4 | KvQuant::Q8) {
+                        lazy_kv_initial_cap.min(user_context_length as u64)
+                    } else {
+                        let full = user_context_length as u64;
+                        crate::inference::place::llm::context_the_cards_hold(
+                            full,
+                            lazy_kv_initial_cap,
+                            &cuda_devices,
+                            demand_at,
+                        )
+                    };
+                    let demand = demand_at(ctx_for_planning);
+                    // Cap user_context_length at the model's GGUF context: the model cannot
+                    // generate beyond its trained context. The plan chose its context because
+                    // the cards can hold it; the cache must be allocated at that size or the
+                    // plan promised room the allocation then takes back. A quantised cache was
+                    // planned at its initial cap and grows on demand, so its ceiling is the
+                    // configured context; an F-dtype cache is allocated in full at the context
+                    // the plan chose.
                     let effective_ctx = if matches!(kv_quant, KvQuant::Q4 | KvQuant::Q8) {
                         user_context_length.min(context_length)
                     } else {
@@ -1342,43 +1015,53 @@ impl LlmEngine {
                             .min(context_length)
                             .min(ctx_for_planning as usize)
                     };
-                    // Adaptive OOM-recovery ladder. The plan above places
-                    // optimistically - with no fictional activation margin,
-                    // a model whose weights fit one card lands single-GPU
-                    // (the big decode win). If that optimism is wrong and a
-                    // real CUDA_ERROR_OUT_OF_MEMORY surfaces (weights load but
-                    // the first-prefill activation peak overflows, or the load
-                    // itself can't fit), we *react*: retry with a forced even
-                    // CUDA split, then CPU. This replaces the old static
-                    // per-layer headroom guess with a measurement-driven
-                    // fallback that can't mis-size.
-                    // FIXED: qwen2-arch models with hidden_size not a
-                    // multiple of 256 (only qwen2.5:0.5b, hidden=896) used to
-                    // produce deterministic GPU garbage. ROOT CAUSE = the fused
-                    // `rms_norm_then_qmatmul` lm-head kernel mishandles non-256
-                    // hidden widths (the transformer layers were proven correct
-                    // by a per-layer GPU-vs-CPU trace; only the fused head was
-                    // wrong - "duction" vs "Paris"). Fixed by gating that fused
-                    // head to hidden%256==0 (inference/generic_transformer/); the
-                    // separate rms_norm+mmvq fallback is correct. So the CPU-route
-                    // guard is no longer needed - qwen2.5:0.5b now runs coherently
-                    // on GPU at ~280 tok/s (was CPU-routed ~27).
-                    let model = crate::inference::place::ladder::load_placed(
+
+                    // The embedding table joins the first layer's card when the plan can
+                    // hold it there without moving a layer.
+                    let stem_bytes = generic_weights.stem_bytes(&content);
+                    let (first_plan, stem_fits) =
+                        demand.plan_stem_if_free(&cuda_devices, stem_bytes);
+                    // A handle per card a plan uses, made on first use, with per-slice
+                    // event tracking off before any tensor loads: a device owns one
+                    // working stream, so the events would order a stream against itself,
+                    // and a decode capture that meets them is invalidated. Fresh handles
+                    // rather than the engine's `device`, whose stream state is for
+                    // capture.
+                    let mut handles: std::collections::HashMap<usize, Device> =
+                        std::collections::HashMap::new();
+                    let model = crate::inference::place::ladder::load_planned(
                         &arch,
+                        first_plan.clone(),
                         &demand,
-                        &ranked_cards,
+                        &cuda_devices,
+                        &[],
                         || false,
                         |plan| {
+                            for idx in crate::inference::place::ladder::cards_of(plan) {
+                                if let std::collections::hash_map::Entry::Vacant(slot) = handles.entry(idx) {
+                                    let d = Device::new_cuda(idx)?;
+                                    #[cfg(feature = "cuda")]
+                                    if let Device::Cuda(ref cd) = d {
+                                        unsafe { cd.context().disable_event_tracking(); }
+                                    }
+                                    slot.insert(d);
+                                }
+                            }
+                            let on_plan: std::collections::HashMap<usize, Device> =
+                                crate::inference::place::ladder::cards_of(plan)
+                                    .into_iter()
+                                    .filter_map(|idx| handles.get(&idx).map(|d| (idx, d.clone())))
+                                    .collect();
                             // The host keeps an unquantised cache sized by the model.
-                            let host_only = plan.segments.iter().all(|s| {
-                                matches!(s.kind, crate::inference::place::layer_executor::DeviceKind::Cpu)
-                            });
+                            let host_only = on_plan.is_empty();
                             let (kv, ctx) = if host_only {
                                 (KvQuant::Off, None)
                             } else {
                                 (kv_quant, Some(effective_ctx))
                             };
-                            let m = generic_weights.build(&hetero_cuda_devs, plan, kv, ctx)?;
+                            let stem_on_card = stem_fits
+                                && crate::inference::place::dry_plan::same_plan(plan, &first_plan);
+                            let m = generic_weights.build(&on_plan, plan, kv, ctx, stem_on_card)?;
                             let placement = plan
                                 .segments
                                 .iter()
@@ -1390,7 +1073,11 @@ impl LlmEngine {
                         },
                     )
                     .map_err(|e| anyhow!("Failed to load {arch}: {e}"))?;
-                    try_wrap_with_vision(model, projector_blob.as_deref())?
+                    try_wrap_with_vision(
+                        model,
+                        projector_blob.as_deref(),
+                        demand.whole().saturating_sub(demand.block_bytes + demand.head_bytes),
+                    )?
                 }
                 other => {
                     let err_msg = format!(

@@ -13,6 +13,7 @@ mod geometry_invariants;
 pub mod ladder;
 pub mod layer_executor;
 pub mod layer_perf;
+pub mod llm;
 pub mod model_request;
 pub mod paged;
 #[cfg(all(test, feature = "image"))]

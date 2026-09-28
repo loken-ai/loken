@@ -956,9 +956,8 @@ fn build_generic_layer(
         // planner's KV reserve (sized to the request context) -> CUDA OOM on
         // VRAM-tight 2-GPU variants (gemma4:31b 2.5K). Start at the lazy cap and
         // grow on demand (append doubles) - matching the Q4/Q8 lazy caches and
-        // the reserve's planning context; the adaptive prefill + per-layer
-        // divert cover any genuine pressure. So the loader spills/grows rather
-        // than OOMing.
+        // the reserve's planning context; a growth that runs out of card memory
+        // is recovered by the placement ladder.
         kv_cache: {
             use crate::inference::cache::KV_WORKING_WINDOW_TOKENS as LAZY_KV_INITIAL_CAP;
             use crate::inference::engine::llm_engine::KvQuant;
@@ -1476,6 +1475,8 @@ impl GenericHeteroTransformer {
         )
     }
 
+    /// [`Self::from_gguf_placed`] with the embedding table on the plan's card when the plan
+    /// runs on one card, else on the host.
     pub fn from_gguf_with_kv_quant(
         content: gguf_file::Content,
         mmap_bytes: &[u8],
@@ -1483,6 +1484,31 @@ impl GenericHeteroTransformer {
         plan: &HeteroPlan,
         kv_quant: crate::inference::engine::llm_engine::KvQuant,
         max_kv_seq_len: Option<usize>,
+    ) -> Result<Self> {
+        Self::from_gguf_placed(
+            content,
+            mmap_bytes,
+            cuda_devices,
+            plan,
+            kv_quant,
+            max_kv_seq_len,
+            crate::inference::place::ladder::on_one_card(plan),
+        )
+    }
+
+    /// Load from GGUF with every layer on the device `plan` gives it, the output head on the
+    /// last card a layer runs on, and the embedding table on the first layer's card when
+    /// `stem_on_card` says the plan holds room for it there, else on the host. Nothing is
+    /// placed by reading the cards: a card that runs out of memory fails the load, and the
+    /// caller's ladder places it again.
+    pub fn from_gguf_placed(
+        content: gguf_file::Content,
+        mmap_bytes: &[u8],
+        cuda_devices: &HashMap<usize, Device>,
+        plan: &HeteroPlan,
+        kv_quant: crate::inference::engine::llm_engine::KvQuant,
+        max_kv_seq_len: Option<usize>,
+        stem_on_card: bool,
     ) -> Result<Self> {
         use std::io::Cursor;
 
@@ -1513,35 +1539,20 @@ impl GenericHeteroTransformer {
         let n_layers = config.n_layers;
 
         // -- 1. Load embeddings --------------------------
-        // Small embed tables (< 1 GB after F32 dequant) live on GPU 0 to
-        // eliminate the CPU->GPU sync per decode token (~10-25% wall
-        // closure on small models). Larger tables stay on CPU.
-        //
-        // 3 GB threshold was tested - caused deepcoder OOM
-        // (model 8 GB + emb 2.9 GB + KV + activations > 14 GB on 17 GB GPU
-        // when activation peak fires). 1 GB stays safe.
-        //
-        // Threshold examples:
-        //   moondream:latest:   50K x 2048 x 4 =  392 MB -> GPU 0
-        //   qwen3-coder:30b:   151K x 2048 x 4 = 1.2 GB -> CPU
-        //   gemma4:latest:     262K x 2560 x 4 = 2.5 GB -> CPU
-        //   devstral:24b:      131K x 5120 x 4 = 2.5 GB -> CPU
-        //   deepcoder:14b:     152K x 5120 x 4 = 2.9 GB -> CPU
-        //   qwen3:8b:          151K x 4096 x 4 = 2.4 GB -> CPU
-        //
-        // The cast logic in all 5 embed-lookup callsites
-        // (forward_inner, forward_graph, embed_for_graph, prepare_all_kv,
-        // forward_with_image_embeds) reads `embeddings.embeddings().device()`
-        // and casts input_ids accordingly, so this load-time decision is
-        // the ONLY behavioral switch.
+        // The table sits on the first layer's card when the plan made room for it there:
+        // every token's lookup then stays on the card instead of crossing from the host.
+        // The embed-lookup callsites read `embeddings.embeddings().device()` and cast the
+        // ids to it, so this is the only switch.
+        let first_card = plan.segments.first().and_then(|seg| match seg.kind {
+            DeviceKind::Cuda(idx) => cuda_devices.get(&idx).cloned(),
+            _ => None,
+        });
         let mut cursor = Cursor::new(mmap_bytes);
         let emb_qt = content.tensor(&mut cursor, "token_embd.weight", &Device::Cpu)?;
         let emb_table_bytes = (config.vocab_size as u64) * (config.embedding_length as u64) * 4; // F32 after dequantize
-        const EMB_GPU_MAX_BYTES: u64 = 1024 * 1024 * 1024; // 1 GB threshold (3 GB OOMs on 17 GB GPU)
-        let emb_device = if emb_table_bytes < EMB_GPU_MAX_BYTES {
-            cuda_devices.get(&0).cloned().unwrap_or(Device::Cpu)
-        } else {
-            Device::Cpu
+        let emb_device = match (&first_card, stem_on_card) {
+            (Some(card), true) => card.clone(),
+            _ => Device::Cpu,
         };
         let emb_tensor = emb_qt.dequantize(&emb_device)?;
         let embeddings = Embedding::new(emb_tensor);
@@ -1655,14 +1666,14 @@ impl GenericHeteroTransformer {
                 }
             }
         }
-        // Load PLE projection on GPU 0 when available - every prefill runs
+        // Load PLE projection on the first layer's card when there is one - every prefill runs
         // a [batch*seq, hidden] @ [hidden, n_layers*ple_dim] matmul through
         // `ple_model_proj.forward(hidden_2d)`. On a CPU device that becomes
         // a 28+ GFLOPS dequantize-then-matmul at 1k-token prefill, dominating
         // the whole forward and forcing a synchronous device->host copy of
         // the residual stream every prompt. Loading on CUDA flips it to the
         // tensor-core fast_mmq path. Fall back to CPU only when no GPU.
-        let ple_dev = cuda_devices.get(&0).cloned().unwrap_or(Device::Cpu);
+        let ple_dev = first_card.clone().unwrap_or(Device::Cpu);
         let ple_model_proj = if ple_dim > 0 {
             content
                 .tensor(&mut cursor, "per_layer_model_proj.weight", &ple_dev)
@@ -1722,21 +1733,8 @@ impl GenericHeteroTransformer {
         let mut rope_cache: HashMap<String, (Tensor, Tensor)> = HashMap::new();
         rope_cache.insert("cpu".into(), (cos_cpu.clone(), sin_cpu.clone()));
 
-        // Precompute RoPE for EVERY available CUDA device, not just the ones
-        // the plan currently targets. The adaptive NVML loader (Phase 1
-        // below) diverts overflow layers to whichever GPU has the most free
-        // VRAM when the plan's primary fills up - that target may not appear
-        // in `plan.segments` at all (e.g. a pack-first single-GPU plan whose
-        // tail spills to GPU 1). If its RoPE table is missing, the diverted
-        // layer dies with "RoPE cache miss: cuda_N" and the whole load falls
-        // back to CPU. RoPE tables are tiny (cos/sin over ctx x rope_dim), so
-        // materialising them on every detected GPU is cheap insurance that
-        // keeps the optimistic-placement + divert-on-pressure path working
-        // without any pre-reserved placement margin.
-        // Only the cards the PLAN can reach get a RoPE table. On a single-GPU plan the
-        // other probed cards hold no layer and can never receive one (the adaptive divert
-        // needs a multi-GPU plan), yet the two cached tensors pinned their contexts -
-        // ~130 MB and ~10 W per idle card, forever, on every small model.
+        // A RoPE table on each card the plan runs a layer on, and on no other: a cached
+        // table pins its card's context.
         let planned_cuda: std::collections::HashSet<usize> = plan
             .segments
             .iter()
@@ -1745,13 +1743,11 @@ impl GenericHeteroTransformer {
                 _ => None,
             })
             .collect();
-        let divert_eligible = planned_cuda.len() > 1;
         for (&idx, dev) in cuda_devices.iter() {
-            if !divert_eligible && !planned_cuda.contains(&idx) {
+            if !planned_cuda.contains(&idx) {
                 continue;
             }
-            // Vacant-slot form for the same reason as 8d4a4c8 / ea9f8e7:
-            // the body uses ?, so or_insert_with can't propagate it.
+            // Vacant-slot form: the body uses ?, so or_insert_with can't propagate it.
             if let std::collections::hash_map::Entry::Vacant(slot) =
                 rope_cache.entry(format!("cuda_{idx}"))
             {
@@ -1780,17 +1776,7 @@ impl GenericHeteroTransformer {
             }
         }
 
-        #[cfg(feature = "cuda")]
-        for (idx, dev) in cuda_devices.iter() {
-            if let Ok(cd) = dev.as_cuda_device() {
-                if let Ok((free, _)) = cd.cuda_stream().context().mem_get_info() {
-                    info!(
-                        "  [mem] after RoPE precompute: CUDA:{idx} free {:.0} MB",
-                        free as f64 / 1e6
-                    );
-                }
-            }
-        }
+        crate::inference::place::device_probe::debug_vram_by_card("after RoPE precompute");
         // -- 4. Flatten plan to per-layer device assignment ----------------
         let layer_devices: Vec<(usize, DeviceKind)> = plan
             .segments
@@ -2181,71 +2167,9 @@ impl GenericHeteroTransformer {
             })
         };
 
-        // Adaptive load: when more than one CUDA device is available the
-        // loader iterates layers sequentially and queries NVML free VRAM
-        // after each layer. If the plan's target GPU drops below
-        // the model-derived activation reserve, subsequent layers route to
-        // another CUDA device (whichever has the most free) - or to CPU
-        // if all GPUs are tight. This catches the
-        // qwen3-class case (5.2 GB GGUF -> 15.7 GB resident on a 17 GB
-        // card) without dropping + reloading: we observe pressure on
-        // the actual device as it builds up, and divert the next layer
-        // instead of fighting OOM at first prefill.
-        //
-        // Single-GPU systems keep the original parallel-load fast path
-        // (no adaptive routing is possible with only one GPU). Multi-GPU
-        // systems pay a sequential-load cost but gain crash-free
-        // placement; the load is dominated by tensor copy time anyway.
-        // Per-GPU activation reserve for the adaptive divert - DERIVED from
-        // the model, not a flat magic constant. Prefill currently feeds the
-        // prompt unchunked, so the peak GPU working set scales with the
-        // prefill length x the widest per-layer intermediate
-        // (max(hidden, ffn_dim)), in f32, with ~2 simultaneous live buffers
-        // (the up-projection output and its activation copy).
-        //
-        // The prefill length is bounded by the SAME working window the KV
-        // cache actually pre-allocates - `q8_kv_cache::INITIAL_CAPACITY_TOKENS`
-        // (the lazy-KV initial capacity, 4 K) - not the model's full GGUF
-        // context. Using the full 32 K/256 K context here would reserve many
-        // GB for a worst-case prefill that the lazy KV cache itself doesn't
-        // even allocate up front, needlessly spilling weights to CPU. Tying
-        // the activation window to the KV window keeps the two consistent and
-        // the reserve realistic (devstral: 4 K x 32768 x 8 ≈ 1.1 GB, not the
-        // 8.6 GB a 32 K window would demand). The integer factors (4 = f32
-        // bytes, 2 = live buffers) are concrete buffer-count estimates, not
-        // tuned constants.
-        //
-        // NOTE: a prefill longer than this window can still exceed the
-        // reserve - the proper structural fix is to CHUNK prefill (bounding
-        // the activation to a fixed batch, as llama.cpp/ollama do), after
-        // which this reserve shrinks to the chunk size and the divert needs
-        // only KV headroom. Until then this matches the lazy KV cache's own
-        // risk posture (it, too, grows past 4 K lazily and can OOM).
-        // Prefill is forwarded in PREFILL_CHUNK_TOKENS-token chunks, so the
-        // per-forward activation PEAK is bounded by chunkxwidest - NOT the full KV
-        // window. Size the reserve from the chunk. (It used to use the 4096-token
-        // KV window, which over-reserved ~8x - ~1.07 GB for devstral - and pushed
-        // large output projections like a 131072-vocab lm_head off the primary GPU
-        // onto the slow second card. The chunk-sized reserve (~134 MB) leaves room
-        // for the lm_head on GPU0, matching ollama's single-GPU placement.)
-        let activation_window = config
-            .effective_max_context()
-            .min(crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS);
-        let activation_floor_bytes: u64 = {
-            let widest = config.embedding_length.max(config.ffn_dim) as u64;
-            (activation_window as u64)
-                .saturating_mul(widest)
-                .saturating_mul(4)
-                .saturating_mul(2)
-        };
-        info!("  Adaptive load: per-GPU activation reserve = {:.2} GB (derived: min(ctx {}, prefill-chunk {}) x max(hidden {}, ffn {}) x 4 x 2)",
-            activation_floor_bytes as f64 / 1e9,
-            config.effective_max_context(), crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS,
-            config.embedding_length, config.ffn_dim);
-        // Adaptive per-layer NVML diversion only earns its sequential cost when the
-        // plan ACTUALLY spans >1 GPU (spillover is possible). When every layer targets
-        // the SAME GPU (the pack-first common case, even on a 2-GPU box), the single
-        // CUDA context makes the parallel rayon load safe AND ~2x faster - take it.
+        // Every layer goes to the device the plan gives it. A plan that spans more than one
+        // card loads sequentially, one context at a time; a plan on one card, or on the host,
+        // loads in parallel over one context.
         let distinct_gpus: std::collections::HashSet<usize> = layer_devices
             .iter()
             .filter_map(|(_, dk)| {
@@ -2256,92 +2180,12 @@ impl GenericHeteroTransformer {
                 }
             })
             .collect();
-        let adaptive = cuda_devices.len() > 1 && distinct_gpus.len() > 1;
-        if cuda_devices.len() > 1 && distinct_gpus.len() <= 1 {
-            info!("  Load: plan targets a single GPU ({:?}) -> parallel load (skipping adaptive sequential)",
-                distinct_gpus.iter().next());
-        }
-        let raw_layers: Vec<RawGenericLayer> = if adaptive {
-            // Sequential adaptive: load layer N, observe NVML, decide
-            // device for layer N+1. nvml init failure falls back to
-            // strict plan-following (same as the previous behaviour).
-            let nvml_handle = nvml_wrapper::Nvml::init().ok();
-            let mut current_dk_override: Option<DeviceKind> = None;
-            let mut diverted_count: usize = 0;
-            let mut result: Vec<RawGenericLayer> = Vec::with_capacity(layer_devices.len());
-            for (idx, original_dk) in layer_devices {
-                let dk = current_dk_override.unwrap_or(original_dk);
-                let layer = load_one(idx, dk)?;
-                // Only check + adapt when the current target is CUDA.
-                // CPU layers don't consume VRAM; no diversion needed.
-                if let (DeviceKind::Cuda(gpu_idx), Some(ref nvml)) = (dk, &nvml_handle) {
-                    if let Ok(dev) = nvml.device_by_index(gpu_idx as u32) {
-                        if let Ok(mem) = dev.memory_info() {
-                            if mem.free < activation_floor_bytes {
-                                // Find the CUDA device with the most free
-                                // VRAM that's NOT the one we just filled.
-                                // PLACEMENT-EXEMPT: a CORRECTION to a plan already being
-                                // followed, not the plan. The card the planner chose has
-                                // just been observed with less free VRAM than the load
-                                // assumed - another process took it - so the remaining
-                                // layers have to go somewhere that exists NOW. Throughput
-                                // ranking already decided the order; what is left to ask
-                                // is which of the other cards still has room.
-                                let best_other = cuda_devices
-                                    .keys()
-                                    .filter(|&&k| k != gpu_idx)
-                                    .filter_map(|&k| {
-                                        nvml.device_by_index(k as u32)
-                                            .ok()
-                                            .and_then(|d| d.memory_info().ok())
-                                            .map(|m| (k, m.free))
-                                    })
-                                    .max_by_key(|&(_, free)| free);
-                                let new_target = match best_other {
-                                    Some((k, free)) if free >= activation_floor_bytes => {
-                                        DeviceKind::Cuda(k)
-                                    }
-                                    _ => DeviceKind::Cpu, // all GPUs tight
-                                };
-                                if current_dk_override != Some(new_target) {
-                                    diverted_count = 0;
-                                    info!(
-                                        "⚖️  GPU {} dropped to {:.2} GB free at layer {} - diverting remaining layers to {:?}",
-                                        gpu_idx,
-                                        mem.free as f64 / 1e9,
-                                        idx,
-                                        new_target,
-                                    );
-                                    current_dk_override = Some(new_target);
-                                }
-                            }
-                        }
-                    }
-                }
-                if current_dk_override.is_some() {
-                    diverted_count += 1;
-                }
-                result.push(layer);
-            }
-            if diverted_count > 0 {
-                info!(
-                    "⚖️  Adaptive load diverted {} layers off the plan's primary GPU",
-                    diverted_count
-                );
-            }
-            result
-        } else if distinct_gpus.len() > 1 {
-            // Defensive: a genuine >1-GPU plan normally takes the adaptive branch above
-            // (adaptive ⟺ cuda_devices>1 && distinct_gpus>1). If it ever reaches here,
-            // load sequentially (plan-strict) - safe cross-context, unchanged behaviour.
+        let raw_layers: Vec<RawGenericLayer> = if distinct_gpus.len() > 1 {
             layer_devices
                 .into_iter()
                 .map(|(idx, dk)| load_one(idx, dk))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            // Single target GPU (or CPU): one context -> parallel rayon over all layers.
-            // The win: a 2-GPU box whose plan packs onto ONE GPU no longer pays the
-            // adaptive sequential cost (Phase 1 ~1.8x; Phase 2 below is parallel too).
             layer_devices
                 .into_par_iter()
                 .map(|(idx, dk)| load_one(idx, dk))
@@ -2353,46 +2197,15 @@ impl GenericHeteroTransformer {
             "Phase 1 (raw GGUF tensor load -> device) done: {} layers",
             raw_layers.len()
         );
-        // Tightest headroom left on a card THIS MODEL WILL BUILD ON once the raw
-        // weights are resident. Cards the plan does not target are reported but
-        // excluded: another model resident elsewhere would otherwise dictate this
-        // model's worker count, which is neither its constraint nor its business.
-        let mut post_phase1_free = u64::MAX;
-        #[cfg(feature = "cuda")]
-        for (idx, dev) in cuda_devices.iter() {
-            if let Ok(cd) = dev.as_cuda_device() {
-                if let Ok((free, _)) = cd.cuda_stream().context().mem_get_info() {
-                    let targeted = distinct_gpus.contains(idx);
-                    info!(
-                        "  [mem] after Phase1 raw-weight load: CUDA:{idx} free {:.0} MB{}",
-                        free as f64 / 1e6,
-                        if targeted { "" } else { " (not in this plan)" }
-                    );
-                    if targeted {
-                        post_phase1_free = post_phase1_free.min(free as u64);
-                    }
-                }
-            }
-        }
-
-        // The adaptive load may have put layers on a card the plan did not name: give every
-        // card that now holds a layer its rotary tables before the layers are built.
-        for raw in &raw_layers {
-            if let DeviceKind::Cuda(idx) = raw.device_kind {
-                if let (std::collections::hash_map::Entry::Vacant(slot), Some(dev)) = (
-                    rope_cache.entry(format!("cuda_{idx}")),
-                    cuda_devices.get(&idx),
-                ) {
-                    let cos = cos_cpu.to_device(dev)?;
-                    let sin = sin_cpu.to_device(dev)?;
-                    #[cfg(feature = "cuda")]
-                    if let Ok(cd) = dev.as_cuda_device() {
-                        cd.synchronize()?;
-                    }
-                    slot.insert((cos, sin));
-                }
-            }
-        }
+        // Tightest room left on a card this model builds on once the raw weights are
+        // resident; cards the plan does not use are not this model's constraint.
+        let post_phase1_free = distinct_gpus
+            .iter()
+            .filter_map(|idx| cuda_devices.get(idx))
+            .filter_map(crate::inference::place::room::free_now)
+            .min()
+            .unwrap_or(u64::MAX);
+        crate::inference::place::device_probe::debug_vram_by_card("after Phase1 raw-weight load");
 
         // -- 6. Phase 2: Build per-device layers ----------------------------
         // build_generic_layer's per-layer dequant->Q4K requant is independent and
@@ -2496,23 +2309,13 @@ impl GenericHeteroTransformer {
             #[cfg(not(feature = "cuda"))]
             let _ = dev;
         }
-        #[cfg(feature = "cuda")]
-        for (idx, dev) in cuda_devices.iter() {
-            if let Ok(cd) = dev.as_cuda_device() {
-                if let Ok((free, total)) = cd.cuda_stream().context().mem_get_info() {
-                    info!(
-                        "  [mem] after Phase2 layer-build: CUDA:{idx} free {:.0} MB / {:.0} MB",
-                        free as f64 / 1e6,
-                        total as f64 / 1e6
-                    );
-                }
-            }
-        }
+        crate::inference::place::device_probe::debug_vram_by_card("after Phase2 layer-build");
 
         let sliding_window = config.sliding_window;
 
-        // The output projection goes to a card, in its stored format, whenever one has room:
-        // the host matmul over the whole vocabulary is the slowest step of a token.
+        // The output projection sits on the last card a layer runs on, in its stored format:
+        // the plan counted it there. A card that runs out of memory fails the load, so the
+        // ladder places the model again; any other failure leaves the head on the host.
         let last_cuda_idx = layer_devs.iter().rev().find_map(|d| {
             if let LayerDevice::Cuda(idx) = d {
                 Some(*idx)
@@ -2520,103 +2323,31 @@ impl GenericHeteroTransformer {
                 None
             }
         });
-        // Candidate devices for the output projection, in priority order: the
-        // last layer's GPU first (closest - no cross-GPU hop), then any OTHER
-        // CUDA device. The fallback to a SECOND GPU is what saves large-vocab
-        // models on a tight primary GPU: devstral (vocab 131072, 24B) fills
-        // GPU0, so its lm_head OOM'd there and fell back to a CPU lm_head  -
-        // stalling decode to ~35-48% GPU util (-60% vs ollama). An idle GPU1
-        // hosts the ~0.5 GB quantized projection instead; the per-token hidden
-        // [hidden] cross-GPU hop is negligible vs a CPU 5120x131072 matmul.
-        let mut cand_idxs: Vec<usize> = Vec::new();
-        if let Some(li) = last_cuda_idx {
-            cand_idxs.push(li);
-        }
-        let mut others: Vec<usize> = cuda_devices
-            .keys()
-            .cloned()
-            .filter(|i| Some(*i) != last_cuda_idx)
-            .collect();
-        others.sort();
-        cand_idxs.extend(others);
-
         let output_proj_cuda: Option<Tensor> = None;
         let mut output_norm_cuda_weight: Option<Tensor> = None;
         let mut output_proj_cuda_qmm: Option<crate::tensor::quantized::QMatMul> = None;
         let mut output_proj_dev: Option<Device> = None;
-        for (ci, idx) in cand_idxs.iter().enumerate() {
-            let cuda_dev = match cuda_devices.get(idx) {
-                Some(d) => d,
-                None => continue,
-            };
-            // The projection stays in its stored format: every card path, the captured
-            // decode included, runs it as a quantised matmul.
-            let norm_w = match norm_weight_cpu.to_device(cuda_dev) {
-                Ok(w) => w,
-                Err(_) => continue,
-            };
-            #[cfg(feature = "cuda")]
-            if let Ok(cd) = cuda_dev.as_cuda_device() {
-                if let Ok((free, total)) = cd.cuda_stream().context().mem_get_info() {
-                    info!("  Output projection: CUDA:{idx} free {:.0} MB / {:.0} MB before lm_head load",
-                        free as f64 / 1e6, total as f64 / 1e6);
-                }
-            }
+        if let Some((idx, cuda_dev)) =
+            last_cuda_idx.and_then(|idx| cuda_devices.get(&idx).map(|d| (idx, d)))
+        {
             let t_q = std::time::Instant::now();
-            let qmm = content
-                .tensor(&mut cursor, output_weight_name, cuda_dev)
-                .ok()
-                .and_then(|qt| crate::tensor::quantized::QMatMul::from_qtensor(qt).ok());
-            if qmm.is_none() {
-                if ci == 0 {
-                    warn!("  Output projection OOM on primary GPU {idx}; trying other GPUs before CPU");
+            let placed = norm_weight_cpu.to_device(cuda_dev).and_then(|norm_w| {
+                let qt = content.tensor(&mut cursor, output_weight_name, cuda_dev)?;
+                Ok((norm_w, crate::tensor::quantized::QMatMul::from_qtensor(qt)?))
+            });
+            match placed {
+                Ok((norm_w, qmm)) => {
+                    info!(
+                        "  Output projection on CUDA:{idx} as QMatMul ({:.0}ms)",
+                        t_q.elapsed().as_secs_f64() * 1000.0
+                    );
+                    output_norm_cuda_weight = Some(norm_w);
+                    output_proj_cuda_qmm = Some(qmm);
+                    output_proj_dev = Some(cuda_dev.clone());
                 }
-                continue;
+                Err(e) if crate::inference::place::ladder::is_out_of_memory(&e) => return Err(e),
+                Err(e) => warn!("  Output projection on CUDA:{idx} failed ({e}); using the host"),
             }
-            // The lm_head fitting at LOAD isn't enough - the first prefill needs the
-            // cublas workspace (~512 MB) + activation buffers on the SAME GPU. If placing
-            // the lm_head here leaves less than that, the request later OOMs at prefill
-            // (CUBLAS_STATUS_ALLOC_FAILED -> failed request) even though load "succeeded".
-            // So require the prefill reserve to remain free; otherwise drop this placement
-            // and fall to the next GPU / CPU (slow lm_head but a WORKING request - strictly
-            // better than a non-deterministic prefill OOM). Mirrors the planner's
-            // gpu_runtime_reserve (inference/engine/llm_engine/mod.rs).
-            #[cfg(feature = "cuda")]
-            if let Ok(cd) = cuda_dev.as_cuda_device() {
-                if let Ok((free_after, _)) = cd.cuda_stream().context().mem_get_info() {
-                    const CUBLAS_WS_BYTES: u64 = 512 * 1024 * 1024;
-                    let widest = config.embedding_length.max(config.ffn_dim) as u64;
-                    let prefill_act = (crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS
-                        as u64)
-                        .saturating_mul(widest)
-                        .saturating_mul(4)
-                        .saturating_mul(2);
-                    let need = CUBLAS_WS_BYTES.saturating_add(prefill_act);
-                    if (free_after as u64) < need {
-                        warn!("  lm_head fits CUDA:{idx} but leaves {:.0} MB < {:.0} MB prefill reserve \
-                               (cublas+activation) - skipping so the first prefill won't OOM",
-                            free_after as f64 / 1e6, need as f64 / 1e6);
-                        drop(qmm);
-                        continue;
-                    }
-                }
-            }
-            info!(
-                "  Output projection on CUDA:{idx} as QMatMul ({:.0}ms){}",
-                t_q.elapsed().as_secs_f64() * 1000.0,
-                if ci > 0 {
-                    " [fallback to idle GPU - primary was full]"
-                } else {
-                    ""
-                }
-            );
-            output_norm_cuda_weight = Some(norm_w);
-            output_proj_cuda_qmm = qmm;
-            output_proj_dev = Some(cuda_dev.clone());
-            break;
-        }
-        if output_proj_cuda_qmm.is_none() && output_proj_cuda.is_none() {
-            warn!("  GPU output projection failed on all CUDA devices; using CPU fallback");
         }
 
         // Pre-allocate graph_logits_buffer at model load. CRITICAL for the
@@ -2647,15 +2378,10 @@ impl GenericHeteroTransformer {
         };
         ldt!("output projection (lm_head) + norm done - model ready");
 
-        // Keep a handle only for the cards this model actually landed on. The
-        // map above lists every CANDIDATE, because the load needs them all:
-        // the per-layer divert picks its escape card from these keys, and the
-        // out-of-memory retry re-plans across them. Once placement is settled
-        // those extra handles buy nothing and are not free - a handle holds
-        // the card's CUDA context alive, and a context that holds no layer
-        // still costs its allocator workspace and keeps the card out of its
-        // idle power state. On a model that fits one card, that is a second
-        // GPU awake for the whole session.
+        // Keep a handle only for the cards this model landed on. A caller may hand in
+        // handles for cards the plan does not use; they buy nothing and are not free - a
+        // handle holds the card's CUDA context alive, with its allocator workspace, and
+        // keeps the card out of its idle power state.
         //
         // It also removes an arbitrary choice: several fallbacks reach for
         // `cuda_devices.values().next()`, and a map ordered by nothing could
@@ -2957,17 +2683,30 @@ impl GenericHeteroTransformer {
         };
 
         let flags = Arc::new(config.flags.clone());
+        // What each layer's cache takes at the size it starts at, K and V in f16, and what a
+        // request's work keeps free on a card.
+        let kv_per_layer = (2 * config.n_kv_head * config.head_dim * 2) as u64
+            * config
+                .effective_max_context()
+                .min(crate::inference::cache::KV_WORKING_WINDOW_TOKENS) as u64;
+        let work = crate::inference::place::runtime_demand::llm_work_reserve(
+            config.embedding_length.max(config.ffn_dim),
+            crate::inference::engine::llm_engine::PREFILL_CHUNK_TOKENS,
+        );
         let mut layers = Vec::with_capacity(config.n_layers);
         let mut layer_devs = Vec::with_capacity(config.n_layers);
         for li in 0..config.n_layers {
             let card = layer_card[li];
             let (dev, dev_enum) = device_of(card);
             let (cos, sin) = &rope[&card];
-            // What the layers after this one still bring to the same card.
+            // What the card must keep beside this layer's second Marlin layout: the layers
+            // after it, the caches of all its layers and the work.
             let still_to_load: u64 = (li + 1..config.n_layers)
                 .filter(|&l| layer_card[l] == card)
                 .map(|l| layer_bytes[l])
                 .sum();
+            let caches = kv_per_layer * layer_card.iter().filter(|&&c| c == card).count() as u64;
+            let keep_free = still_to_load + caches + work;
             layers.push(build_awq_layer(
                 &st,
                 li,
@@ -2977,7 +2716,7 @@ impl GenericHeteroTransformer {
                 cos,
                 sin,
                 group_size,
-                still_to_load as usize,
+                keep_free as usize,
             )?);
             layer_devs.push(dev_enum);
         }

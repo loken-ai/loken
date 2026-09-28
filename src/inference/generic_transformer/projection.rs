@@ -50,13 +50,6 @@ fn awq_marlin_prefill() -> bool {
     true
 }
 
-/// Free VRAM that must remain AFTER a dual-layout build: the rest of the load - lm_head, KV
-/// caches - plus the transients a forward allocates.
-#[cfg(feature = "cuda")]
-fn awq_marlin_reserve_bytes() -> usize {
-    3072 * (1 << 20)
-}
-
 /// AWQ (uniform 4-bit) resident weight for one linear layer. Holds the raw
 /// AutoAWQ GEMM tensors on-device; `forward` runs the custom GEMV kernel at decode
 /// (seq=1) and a dequant->cuBLAS f16 GEMM at prefill (seq>1). See `inference::load::awq`
@@ -179,8 +172,8 @@ impl AwqWeight {
             marlin::repack_awq_to_marlin(qweight, qzeros, scales, self.k, self.n, self.group_size)
                 .map_err(|e| crate::tensor::Error::msg(e.0))?;
         if check_headroom {
-            let (free, _total) = crate::tensor::cuda_ext::mem_get_info(&dev)?;
-            if free < r.device_bytes() + awq_marlin_reserve_bytes() + keep_free {
+            let free = crate::inference::place::room::free_now(&dev).unwrap_or(0) as usize;
+            if free < r.device_bytes() + keep_free {
                 return Ok(None);
             }
         }
@@ -426,8 +419,8 @@ impl QMatMul {
     /// The f32 mr4 repacked path was a measured dead end (-19%); dp4a wins
     /// because it removes the f32 dequant-per-weight via int8 dp4a.
     ///
-    /// `keep_free` is VRAM the rest of the load still needs on this card: a second
-    /// layout is built only while it stays free beside the reserve.
+    /// `keep_free` is VRAM the rest of the load and the model's work still need on this
+    /// card: a second layout is built only while that stays free beside it.
     pub fn from_awq(mut w: AwqWeight, keep_free: usize) -> Self {
         // dp4a decode: forward is FAST in-server (12ms < split-K 14ms). The
         // earlier regression was PLD `forward_all` hitting the slow dequant - now
@@ -724,7 +717,8 @@ impl Module for Mlp {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
+#[cfg(feature = "cuda")]
 mod marlin_parity {
     use super::*;
 
