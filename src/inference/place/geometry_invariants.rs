@@ -155,7 +155,6 @@ const GEOMETRY_DEBT: &[(&str, usize)] = &[
     ("inference/model/moondream/quantized.rs", 1),
     ("inference/model/moondream/vision.rs", 3),
     ("inference/model/piper/mod.rs", 2),
-    ("inference/model/pixtral/mod.rs", 3),
     ("inference/model/pocket_tts/mod.rs", 1),
     ("inference/model/qwen25/vision.rs", 2),
     ("inference/model/qwen3vl/textenc.rs", 8),

@@ -24,6 +24,8 @@ pub mod flux2;
 pub mod kyutai;
 pub mod lfm2_moe;
 pub mod mixformer;
+/// The vision-tower metadata a llama.cpp `mmproj` GGUF carries.
+pub mod mmproj;
 pub mod moondream;
 pub mod nemotron_h;
 #[cfg(feature = "audio")]
