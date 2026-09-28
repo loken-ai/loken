@@ -369,15 +369,17 @@ pub fn wan_14b_dit_file() -> std::path::PathBuf {
     )
 }
 
-// -- geometry shared by BOTH variants (patch (1,2,2), head_dim 128, freq_dim 256, in/out
-//    channels 16, text_dim 4096, eps 1e-6); only dim/n_heads/n_layers differ per variant. --
+// -- geometry shared by BOTH variants (patch (1,2,2), in/out channels 16, text_dim 4096,
+//    eps 1e-6); the width, depth and timestep-embedding width are read from the checkpoint. --
+/// Width of one attention head. Neither checkpoint format states it - the GGUF carries no
+/// Wan metadata and the tensors are all full-width - and every published Wan size splits its
+/// width into heads of this many channels, so the head count is the width over it.
 pub(super) const HEAD_DIM: usize = 128;
 pub(super) const EPS: f32 = 1e-6;
 pub(super) const OUT_CH: usize = 16;
 /// Input channels an image-to-video checkpoint takes: the 16 noise channels, a 4-channel
 /// mask saying which frames are given, and the 16 channels of the frame being continued.
 pub(super) const I2V_IN_CH: usize = 36;
-pub(super) const FREQ_DIM: usize = 256;
 pub(super) const TEXT_LEN: usize = 512; // umT5 context is zero-padded to this before text_embedding
 pub(super) const PATCH_H: usize = 2;
 pub(super) const PATCH_W: usize = 2;

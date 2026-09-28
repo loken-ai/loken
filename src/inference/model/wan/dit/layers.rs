@@ -296,7 +296,7 @@ pub struct WanDit {
     pub(super) text0: WanLinear,
     pub(super) text2: WanLinear, // text_embedding MLP (umT5 [.,4096] -> [.,dim])
     pub(super) time0: WanLinear,
-    pub(super) time2: WanLinear, // time_embedding MLP (sinusoid[256] -> [dim])
+    pub(super) time2: WanLinear, // time_embedding MLP (sinusoid[freq_dim] -> [dim])
     pub(super) time_proj: WanLinear, // time_projection [dim -> 6.dim]
     pub(super) blocks: Vec<WanBlock>,
     pub(super) head: WanLinear,    // [out_ch.prod(patch)=64, dim]
@@ -305,6 +305,8 @@ pub struct WanDit {
     pub(super) device: Device,     // primary card: patch/text/time/head + activation origin
     pub(super) dim: usize,
     pub(super) n_heads: usize,
+    /// Width of the sinusoidal timestep embedding the time MLP reads.
+    pub(super) freq_dim: usize,
     /// Present only on an image-to-video checkpoint: the projection that turns a CLIP
     /// embedding of the frame being continued into this model's width.
     pub(super) img_emb: Option<ImgEmb>,
@@ -437,6 +439,12 @@ impl WanDit {
         }
         let n_layers = wan_block_count(ld.names().into_iter());
         let n_heads = dim / HEAD_DIM;
+        let freq_dim = ld
+            .shape_of("time_embedding.0.weight")
+            .map(|d| d.iter().product::<usize>() / dim.max(1))
+            .ok_or_else(|| {
+                crate::tensor::Error(format!("{}: no time_embedding.0.weight", path.display()))
+            })?;
         // The weights and the CLIP-DERIVED activation demand: the denoise keeps ~12 live
         // `[tokens, dim]` F32 buffers (hidden/residual/q/k/v/attn-out/ffn) plus the
         // tiled-attention scores `[tile, tokens, heads]` x2 (scores + softmax). The
@@ -536,6 +544,7 @@ impl WanDit {
                 device,
                 dim,
                 n_heads,
+                freq_dim,
                 img_emb: None,
             })
         })
@@ -603,6 +612,11 @@ impl WanDit {
         }
         let n_layers = wan_block_count(c.tensor_infos.keys().map(|k| k.as_str()));
         let n_heads = dim / HEAD_DIM;
+        let freq_dim = c
+            .tensor_infos
+            .get("time_embedding.0.weight")
+            .map(|i| i.shape.elem_count() / dim.max(1))
+            .ok_or_else(|| crate::tensor::Error(format!("{path}: no time_embedding.0.weight")))?;
         let ffn = c
             .tensor_infos
             .get("blocks.0.ffn.0.weight")
@@ -794,7 +808,7 @@ impl WanDit {
                     &vb,
                     &c,
                     &mut f,
-                    FREQ_DIM,
+                    freq_dim,
                     dim,
                     "time_embedding.0",
                     &device,
@@ -836,6 +850,7 @@ impl WanDit {
                 device,
                 dim,
                 n_heads,
+                freq_dim,
                 // The projection that turns a CLIP embedding of the continued frame into this
                 // model's width. `img_emb.proj` is norm, linear, GELU (no weights), linear, norm.
                 img_emb,
@@ -944,12 +959,12 @@ impl WanDit {
         Ok((tokens, frames, hp, wp))
     }
 
-    /// Sinusoidal timestep embedding (reference `sinusoidal_embedding_1d`): half=128,
+    /// Sinusoidal timestep embedding (reference `sinusoidal_embedding_1d`) `freq_dim` wide:
     /// `freq_j = theta^(-j/half)`, embed = `[cos(t.freq), sin(t.freq)]` (cos first). No
     /// diffusion 1000x scale (the scheduler already passes t in the 0..1000 range).
-    pub(super) fn time_sinusoid(t: f32) -> Vec<f32> {
-        let half = FREQ_DIM / 2;
-        let mut e = vec![0f32; FREQ_DIM];
+    pub(super) fn time_sinusoid(t: f32, freq_dim: usize) -> Vec<f32> {
+        let half = freq_dim / 2;
+        let mut e = vec![0f32; freq_dim];
         for j in 0..half {
             let freq = (ROPE_THETA as f32).powf(-(j as f32) / half as f32);
             let a = t * freq;
@@ -1462,8 +1477,8 @@ impl WanDit {
         let mut x = tokens; // [S,dim] F32
 
         // time embedding e [dim] and the 6-way projection e6 [6.dim] (per step).
-        let sin = Self::time_sinusoid(t);
-        let st = Tensor::from_vec_f32(sin, (1, FREQ_DIM))?.to_device(&self.device)?;
+        let sin = Self::time_sinusoid(t, self.freq_dim);
+        let st = Tensor::from_vec_f32(sin, (1, self.freq_dim))?.to_device(&self.device)?;
         let e = self.time2.forward(&self.time0.forward(&st)?.silu()?)?; // [1,dim]
         let e6 = self.time_proj.forward(&e.silu()?)?.to_vec_f32(); // [6.dim]
         let e_vec = e.to_vec_f32(); // [dim]

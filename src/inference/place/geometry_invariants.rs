@@ -160,8 +160,8 @@ const GEOMETRY_DEBT: &[(&str, usize)] = &[
     ("inference/model/sdxl/unet.rs", 4),
     ("inference/model/ultravox/mod.rs", 1),
     ("inference/model/voxtral/mod.rs", 3),
-    ("inference/model/wan/dit/config.rs", 2),
-    ("inference/model/wan/dit/layers.rs", 7),
+    ("inference/model/wan/dit/config.rs", 1),
+    ("inference/model/wan/dit/layers.rs", 1),
     ("inference/model/zimage/dit/mod.rs", 2),
     ("inference/serve/spec_kv_cache.rs", 1),
 ];
