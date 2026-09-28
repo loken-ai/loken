@@ -1,5 +1,5 @@
 use super::{
-    describe_plan, solve, zimage_block_plan, zimage_encoder_card, zimage_placed_reserve,
+    describe_plan, solve, zimage_block_plan, zimage_first_plan, zimage_placed_reserve,
     zimage_runtime_demand, zimage_runtime_demand_from_files, zruntime_demand_from_dry, DeviceKind,
     DeviceLoad, HeteroPlan, PlanLoad, FLUX_TEXT_TOKENS, FLUX_VAE_STRIDE, ZIMAGE_DRY_MARGIN_PERCENT,
 };
@@ -66,7 +66,7 @@ fn a_model_the_cards_can_hold_never_goes_to_the_host() {
         // double charge this alone put a block on the host; at twice it, ten.
         7_050_000_000,
     ] {
-        let plan = zimage_block_plan(&[(0, CARD), (1, CARD)], &[], MAIN_LAYERS, RESIDENT, demand);
+        let plan = zimage_block_plan(&[(0, CARD), (1, CARD)], MAIN_LAYERS, RESIDENT, demand, 0);
         assert_eq!(
             blocks_on_the_host(&plan),
             0,
@@ -97,7 +97,7 @@ fn a_model_the_cards_can_hold_never_goes_to_the_host() {
 #[test]
 fn the_reserve_is_charged_once_per_card_not_once_per_block() {
     let demand = 7_050_000_000u64;
-    let plan = zimage_block_plan(&[(0, CARD), (1, CARD)], &[], MAIN_LAYERS, RESIDENT, demand);
+    let plan = zimage_block_plan(&[(0, CARD), (1, CARD)], MAIN_LAYERS, RESIDENT, demand, 0);
     for seg in &plan.segments {
         let DeviceKind::Cuda(_) = seg.kind else {
             continue;
@@ -146,7 +146,7 @@ fn the_1536_render_keeps_every_block_on_the_cards() {
         zimage_runtime_demand(1536, 1536),
         7_020_000_000,
     ] {
-        let plan = zimage_block_plan(&cards, &[], MAIN_LAYERS, RESIDENT, demand);
+        let plan = zimage_block_plan(&cards, MAIN_LAYERS, RESIDENT, demand, 0);
         assert_eq!(
             blocks_on_the_host(&plan),
             0,
@@ -216,10 +216,10 @@ fn the_working_sizes_still_place_on_one_card() {
                 (0, REPORTED_CARD),
                 (1, REPORTED_CARD - super::zimage_text_encoder_bytes()),
             ],
-            &[],
             MAIN_LAYERS,
             RESIDENT,
             demand,
+            0,
         );
         assert_eq!(
             plan.segments.len(),
@@ -497,6 +497,13 @@ fn a_card_given_to_the_encoder_still_has_to_hold_what_it_is_given() {
 /// every step of every image.
 ///
 /// Six seconds of host encode, against a render that returned 500.
+fn encoder_card(cards: &[(usize, u64)], hot: &[usize]) -> Option<usize> {
+    use crate::inference::place::ladder::{aside, whole_order};
+    whole_order(&aside(cards, hot, u64::MAX), ENCODER, ENCODER)
+        .first()
+        .map(|(idx, _)| *idx)
+}
+
 #[test]
 fn the_caption_encoder_takes_only_what_the_placement_leaves() {
     let cards = [(0usize, REPORTED_CARD), (1usize, REPORTED_CARD)];
@@ -504,7 +511,7 @@ fn the_caption_encoder_takes_only_what_the_placement_leaves() {
         let mut m = walked(w, h, dry, dry);
         let s = solve(MAIN_LAYERS, &cards, 0, &mut m).expect("no placement");
         assert_eq!(
-            zimage_encoder_card(&cards, Some(&s.load), Some(0), ENCODER),
+            encoder_card(&cards, &crate::inference::place::ladder::cards_of(&s.plan)),
             Some(1),
             "at {w}x{h} the encoder no longer goes to the card the transformer leaves \
              alone",
@@ -514,7 +521,7 @@ fn the_caption_encoder_takes_only_what_the_placement_leaves() {
     let s = solve(MAIN_LAYERS, &cards, 0, &mut m).expect("no placement at 1536 square");
     // The split names both cards, so neither is free of it.
     assert_eq!(s.plan.segments.len(), 2, "1536 square stopped splitting");
-    let card = zimage_encoder_card(&cards, Some(&s.load), None, ENCODER);
+    let card = encoder_card(&cards, &crate::inference::place::ladder::cards_of(&s.plan));
     assert_eq!(
         card,
         None,
@@ -549,20 +556,17 @@ fn without_a_measurement_both_decisions_are_the_ones_they_were() {
     let cards = [(0usize, REPORTED_CARD), (1usize, REPORTED_CARD)];
     let mut nothing = |_: &HeteroPlan| None;
     assert!(solve(MAIN_LAYERS, &cards, 0, &mut nothing).is_none());
-    assert_eq!(zimage_encoder_card(&cards, None, Some(0), ENCODER), Some(1));
-    assert_eq!(zimage_encoder_card(&cards, None, Some(1), ENCODER), Some(0));
+    assert_eq!(encoder_card(&cards, &[0]), Some(1));
+    assert_eq!(encoder_card(&cards, &[1]), Some(0));
     // One card is the transformer's and the encoder does not compete with it there.
-    assert_eq!(
-        zimage_encoder_card(&cards[..1], None, Some(0), ENCODER),
-        None
-    );
+    assert_eq!(encoder_card(&cards[..1], &[0]), None);
     // And the plan the loader then takes is the planner's, block for block.
     let plan = zimage_block_plan(
         &[(0, REPORTED_CARD), (1, REPORTED_CARD - ENCODER)],
-        &[],
         MAIN_LAYERS,
         RESIDENT,
         zimage_runtime_demand(1024, 1024),
+        0,
     );
     assert_eq!(plan.segments.len(), 1, "{}", describe_plan(&plan));
     assert_eq!(plan.segments[0].layer_end, MAIN_LAYERS);
@@ -575,10 +579,10 @@ fn without_a_measurement_both_decisions_are_the_ones_they_were() {
 fn a_machine_without_the_room_still_spills() {
     let plan = zimage_block_plan(
         &[(0, 4_000_000_000)],
-        &[],
         MAIN_LAYERS,
         RESIDENT,
         zimage_runtime_demand(1024, 1024),
+        0,
     );
     assert!(
         blocks_on_the_host(&plan) > 0,
@@ -635,13 +639,14 @@ fn a_measured_split_is_never_overruled_by_an_estimate() {
         "the fixture no longer exercises the disagreement it was built for",
     );
     // ...and the decision must not listen to it.
+    let plan = zimage_first_plan(Some(&split), &cards, MAIN_LAYERS, counted, headroom);
     assert!(
-        !super::zimage_fits_one_card(Some(&split), &cards, counted, headroom),
+        plan.segments.len() > 1,
         "a measured split was overruled by an estimate that weighs the model lighter",
     );
     assert_eq!(
-        super::zimage_transformer_card(Some(&split), &cards, counted, headroom),
-        Some(0),
+        plan.segments.first().map(|s| s.kind),
+        Some(DeviceKind::Cuda(0)),
         "the transformer was sent to a card the measured plan does not start on",
     );
 }
@@ -667,9 +672,11 @@ fn a_measured_split_never_produces_a_single_card_load() {
     );
     let counted = 12_309_845_444u64;
     let headroom = zruntime_demand_from_dry(DRY_1536, 1536, 1536);
-    assert_eq!(
-        super::zimage_whole_card(Some(&split), &cards, counted, headroom, true),
-        None,
+    assert!(
+        zimage_first_plan(Some(&split), &cards, MAIN_LAYERS, counted, headroom)
+            .segments
+            .len()
+            > 1,
         "the loader was handed a single card for a placement the measurement split",
     );
 }
@@ -686,15 +693,11 @@ fn a_measured_whole_loads_on_the_card_the_plan_names() {
         1,
         "the fixture stopped being a whole placement"
     );
+    let plan = zimage_first_plan(Some(&whole), &cards, MAIN_LAYERS, RESIDENT, 1);
     assert_eq!(
-        super::zimage_whole_card(Some(&whole), &cards, RESIDENT, 1, true),
-        Some(1),
+        plan.segments.iter().map(|s| s.kind).collect::<Vec<_>>(),
+        vec![DeviceKind::Cuda(1)],
         "the transformer did not follow the card its own plan names",
-    );
-    // ...and never a card at all when there is no CUDA to put it on.
-    assert_eq!(
-        super::zimage_whole_card(Some(&whole), &cards, RESIDENT, 1, false),
-        None
     );
 }
 
@@ -703,17 +706,17 @@ fn a_measured_whole_loads_on_the_card_the_plan_names() {
 fn without_a_measurement_the_estimate_still_decides() {
     let cards = [(0usize, 8_000_000_000u64), (1usize, 20_000_000_000)];
     let (est, headroom) = (12_000_000_000u64, 1_000_000_000u64);
-    assert!(super::zimage_fits_one_card(None, &cards, est, headroom));
+    let plan = zimage_first_plan(None, &cards, MAIN_LAYERS, est, headroom);
     assert_eq!(
-        super::zimage_transformer_card(None, &cards, est, headroom),
-        Some(1)
+        plan.segments.iter().map(|s| s.kind).collect::<Vec<_>>(),
+        vec![DeviceKind::Cuda(1)],
+        "{}",
+        describe_plan(&plan),
     );
-    assert!(!super::zimage_fits_one_card(
-        None,
-        &cards,
-        est,
-        9_000_000_000
-    ));
+    // No card holds it beside that forward: the planner divides it, and still keeps
+    // every block on the cards.
+    let plan = zimage_first_plan(None, &cards, MAIN_LAYERS, est, 9_000_000_000);
+    assert_eq!(blocks_on_the_host(&plan), 0, "{}", describe_plan(&plan));
 }
 
 /// THE GUARD ON THE MARGIN. At every geometry that has been measured, what the

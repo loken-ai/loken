@@ -157,85 +157,6 @@ pub(crate) fn zimage_placed_reserve(
     }
 }
 
-/// What a measured placement already claims on one card: its blocks and its reserve.
-///
-/// Zero for a card the placement does not use - which is the whole point of asking, when
-/// what is being decided is where something ELSE may sit.
-pub(super) fn zimage_claim_on(
-    load: &crate::inference::place::dry_plan::PlanLoad,
-    idx: usize,
-) -> u64 {
-    load.on(crate::inference::place::layer_executor::DeviceKind::Cuda(
-        idx,
-    ))
-    .map(|d| d.peak())
-    .unwrap_or(0)
-}
-
-/// Which card the caption encoder may sit on, given what the transformer's placement
-/// already claims. `None` means the host.
-///
-/// A FUNCTION, because it decides gigabytes and it used to decide them from a question
-/// that has no answer when the model is split. The old rule was "the roomiest card the
-/// transformer does not take WHOLE" - and the moment no card takes it whole, `tf_gpu` is
-/// `None`, nothing is excluded, and the encoder helps itself to the roomiest card. That
-/// is exactly the card a split needs: six and a half gigabytes off one of two 16.4 GB
-/// cards left the second segment eighty megabytes short of the blocks it was given, on a
-/// machine with room for the model twice over.
-///
-/// With a measured placement in hand the question has an answer per card - free VRAM less
-/// what the plan holds there, blocks and forward - and the encoder is offered what is
-/// left. When nothing is left it encodes on the host: about six seconds once per request,
-/// against a render that otherwise does not happen. The hot component gets first claim,
-/// which is the fleet rule; this is only the first time it could be applied honestly.
-///
-/// Without a measurement the old rule stands, unchanged, so a checkpoint the walk cannot
-/// read places the encoder exactly where it placed it before.
-pub(crate) fn zimage_encoder_card(
-    cuda_free: &[(usize, u64)],
-    placed: Option<&crate::inference::place::dry_plan::PlanLoad>,
-    transformer_whole_on: Option<usize>,
-    want_bytes: u64,
-) -> Option<usize> {
-    // One card is the transformer's, and the encoder does not compete with it there:
-    // that is the no-OOM guarantee tight boxes have always had.
-    if cuda_free.len() < 2 {
-        return None;
-    }
-    // PLACEMENT-EXEMPT: this is the ONE-SHOT encoder, offered what the hot component's
-    // plan leaves behind - the transformer has already taken its cards above, and what is
-    // ranked here is the remainder, not the fleet. Ranking by throughput instead would put
-    // the encoder on the transformer's own card, which is the 6.5 GB that left a segment
-    // eighty megabytes short of its blocks.
-    match placed {
-        // A CARD THE PLAN RUNS IS NOT A CARD WITH ROOM. Subtracting what the plan holds
-        // there and offering the difference reads as arithmetic, and it is - but the
-        // difference is a remainder, and a remainder is where the error of every term
-        // above it lands. At 1536 square it came to 0.21 GB against a 6.5 GB tenant that
-        // the sum said would fit: twelve blocks at 5.74, the encoder at 6.50 and a 3.95
-        // reserve make 16.19 of 16.4, and the render died in the first attention GEMM.
-        // The same geometry varies by 0.48 GB between identical runs, so that arrangement
-        // was never inside its own noise.
-        //
-        // So the encoder is offered cards the plan does not touch AT ALL. What runs once
-        // per request does not share with what runs every step of every image - which is
-        // what the paragraph above already says about ranking, applied to the question of
-        // room as well. When the plan takes every card, that is not a failure: the encoder
-        // goes to the host for about six seconds, and the render happens.
-        Some(load) => cuda_free
-            .iter()
-            .filter(|(idx, _)| zimage_claim_on(load, *idx) == 0)
-            .filter(|(_, free)| *free >= want_bytes)
-            .max_by_key(|(_, free)| *free)
-            .map(|(idx, _)| *idx),
-        None => cuda_free
-            .iter()
-            .filter(|(idx, free)| Some(*idx) != transformer_whole_on && *free >= want_bytes)
-            .max_by_key(|(_, free)| *free)
-            .map(|(idx, _)| *idx),
-    }
-}
-
 /// One forward of this checkpoint at this geometry, counted rather than estimated.
 ///
 /// MEMOISED on the checkpoint and the geometry, because the answer depends on nothing
@@ -380,82 +301,6 @@ pub(super) fn zimage_native_from_plan(
     .map_err(|e| anyhow!("{e}"))
 }
 
-/// The card that carries the WHOLE transformer, or `None` when no single card does -
-/// which is the loader's cue to build the split the measurement asked for.
-///
-/// THE LAST LINK, and the one that was missing. Deciding that a request needs two cards
-/// and then loading it onto one is not a smaller version of the same behaviour, it is
-/// the opposite of it: the decision said the model does not fit, and the loader fitted
-/// it anyway, with what was left over standing in for the margin. A plan of N segments
-/// selects the implementation for N segments, and nothing downstream may re-open the
-/// question by weighing the model its own way.
-///
-/// So it goes through the same two answers everything else here goes through, in the
-/// only order that is safe: no card at all unless one card holds it, and then the card
-/// the plan names.
-pub(super) fn zimage_whole_card(
-    measured: Option<&crate::inference::place::dry_plan::Solution>,
-    cuda_free: &[(usize, u64)],
-    size_est: u64,
-    headroom: u64,
-    on_cuda: bool,
-) -> Option<usize> {
-    if !on_cuda || !zimage_fits_one_card(measured, cuda_free, size_est, headroom) {
-        return None;
-    }
-    zimage_transformer_card(measured, cuda_free, size_est, headroom)
-}
-
-/// Whether ONE card can carry the whole transformer - the question the loader branches
-/// on, with ONE answer.
-///
-/// THE READER THIS EXISTS FOR. The solver answers this already: it measures candidate
-/// placements, charges each card its own blocks at what the ALLOCATOR holds for them
-/// beside its own forward, and keeps the first that fits. A second reader asking the
-/// same question of a file-size estimate and a single headroom figure is a second
-/// declaration, and it will disagree - it did: a measurement that had split a request
-/// across two cards was overruled by an estimate that read the weights at what they
-/// count, 0.47 GB lighter, which is exactly the difference between fitting a card and
-/// not. The render went to one card with 0.36 GB to spare where the measurement had
-/// asked for two.
-///
-/// So when there is a measurement, IT decides, and the count of its segments is the
-/// answer: one segment is one card. Without one, the estimate decides exactly as it did
-/// before - the arrangement every placement in this family had before anything was
-/// measured.
-pub(super) fn zimage_fits_one_card(
-    measured: Option<&crate::inference::place::dry_plan::Solution>,
-    cuda_free: &[(usize, u64)],
-    size_est: u64,
-    headroom: u64,
-) -> bool {
-    match measured {
-        Some(s) => s.plan.segments.len() <= 1,
-        None => cuda_free.iter().any(|(_, m)| *m >= size_est + headroom),
-    }
-}
-
-/// Which card the transformer takes, by the same rule and from the same answer.
-///
-/// The plan names it when there is one; otherwise the fastest card the estimate fits.
-pub(super) fn zimage_transformer_card(
-    measured: Option<&crate::inference::place::dry_plan::Solution>,
-    cuda_free: &[(usize, u64)],
-    size_est: u64,
-    headroom: u64,
-) -> Option<usize> {
-    match measured {
-        Some(s) => match s.plan.segments.first().map(|seg| seg.kind) {
-            Some(crate::inference::place::layer_executor::DeviceKind::Cuda(idx)) => Some(idx),
-            _ => None,
-        },
-        None => cuda_free
-            .iter()
-            .find(|(_, m)| *m >= size_est + headroom)
-            .map(|(idx, _)| *idx),
-    }
-}
-
 /// What the pool on the fastest CUDA card reserves in, and what it aligns to - the two
 /// numbers a load has to be priced against.
 ///
@@ -465,7 +310,9 @@ pub(super) fn zimage_transformer_card(
 pub(super) fn zimage_alloc_shape() -> Option<(u64, u64)> {
     #[cfg(feature = "cuda")]
     {
-        let dev = crate::tensor::cuda::CudaDevice::get(0).ok()?;
+        let crate::tensor::Device::Cuda(dev) = crate::inference::place::ladder::fastest()? else {
+            return None;
+        };
         let (_, align) = dev.alloc_shape();
         Some((dev.pool_chunk()?, align))
     }
@@ -582,7 +429,32 @@ pub(super) fn zimage_primary_overhead(checkpoint_bytes: u64) -> u64 {
     zimage_embedder_bytes() + 2 * (cfg.n_refiner_layers as u64) * per_layer
 }
 
-/// Where this family's main blocks go when no single card holds them.
+/// The first plan the transformer is built on: the measured placement when there is one,
+/// and nothing else may overrule it; the planner's estimate otherwise.
+pub(crate) fn zimage_first_plan(
+    measured: Option<&crate::inference::place::dry_plan::Solution>,
+    cuda_free: &[(usize, u64)],
+    total_main_layers: usize,
+    transformer_bytes: u64,
+    runtime_demand: u64,
+) -> HeteroPlan {
+    match measured {
+        Some(s) => s.plan.clone(),
+        // The caption encoder goes to a card the blocks leave alone, or to the host, so
+        // the spread is chosen with one card keeping its room when that costs the blocks
+        // nothing.
+        None => zimage_block_plan(
+            cuda_free,
+            total_main_layers,
+            transformer_bytes,
+            runtime_demand,
+            zimage_text_encoder_bytes(),
+        ),
+    }
+}
+
+/// Where this family's main blocks go without a measured placement: whole on the first
+/// card that holds them beside the stem and the forward, else spread.
 ///
 /// A FUNCTION, not a paragraph inside the loader, because the arithmetic here is the
 /// whole difference between a render and a machine with two idle GPUs and a pinned
@@ -590,7 +462,8 @@ pub(super) fn zimage_primary_overhead(checkpoint_bytes: u64) -> u64 {
 /// gigabyte load.
 ///
 /// `cuda_free` is fastest-first and already net of anything else the loader has
-/// committed to those cards. `runtime_demand` is what ONE forward needs free on
+/// committed to those cards; `companion` is a one-shot component that goes to a card the
+/// blocks leave alone, or to the host. `runtime_demand` is what ONE forward needs free on
 /// whichever card is running a block, and it is charged EXACTLY ONCE, by the planner,
 /// on every card.
 ///
@@ -604,40 +477,25 @@ pub(super) fn zimage_primary_overhead(checkpoint_bytes: u64) -> u64 {
 /// never fails, it just never finishes.
 pub(crate) fn zimage_block_plan(
     cuda_free: &[(usize, u64)],
-    ocl_free: &[(usize, u64)],
     total_main_layers: usize,
     transformer_bytes: u64,
     runtime_demand: u64,
+    companion: u64,
 ) -> HeteroPlan {
-    // The projections and the refiner layers are built on the first card the plan
-    // fills, whatever the plan says about the main stack - so they come off THAT card,
-    // by name, and they come out of the stack the planner divides. Leaving them in both
-    // reserved them twice and cost six layers of thirty to the host.
-    let primary_overhead = zimage_primary_overhead(transformer_bytes);
-    let primary_idx = cuda_free.first().map(|(i, _)| *i).unwrap_or(0);
-    let devices: Vec<(usize, u64)> = cuda_free
-        .iter()
-        .map(|(idx, free)| {
-            let budget = if *idx == primary_idx {
-                free.saturating_sub(primary_overhead)
-            } else {
-                *free
-            };
-            (*idx, budget)
-        })
-        .collect();
-    let main_stack = transformer_bytes.saturating_sub(primary_overhead);
-    let plan = HeteroPlan::calculate_with_kv_reserve(
-        total_main_layers,
-        main_stack,
-        &devices,
-        ocl_free,
-        1.0,
+    // The projections and the refiner layers are built on the card the plan starts on,
+    // whatever the plan says about the main stack - so they are held on THAT card and
+    // come out of the stack the planner divides. Leaving them in both reserved them
+    // twice and cost six layers of thirty to the host.
+    let stem = zimage_primary_overhead(transformer_bytes);
+    let demand = crate::inference::place::ladder::Demand {
+        layers: total_main_layers,
+        block_bytes: transformer_bytes.saturating_sub(stem),
         // Nothing per-layer: the scratch a forward needs is a property of the REQUEST,
         // not of how many blocks happen to sit on the card computing it.
-        0,
-        runtime_demand,
-    );
+        runtime_reserve: runtime_demand,
+        ..Default::default()
+    };
+    let plan = demand.plan_with_stem_beside(cuda_free, stem, runtime_demand, companion);
     // SAY IT when the answer is a render nobody will wait for. A block on the host is
     // minutes per step, so a plan that spills while the cards had room between them is
     // not a degraded placement, it is a failure with no error message - the request runs
@@ -716,6 +574,35 @@ pub(super) const DENSE_BYTES: u64 = 4;
 pub(super) const VAE_WIDEST_CH: u64 = 128;
 /// Latent pixels of convolution context carried into each tile of a tiled VAE decode.
 pub(crate) const VAE_TILE_OVERLAP: usize = 8;
+/// Latent tile sides a VAE decode may split at, largest first.
+pub(super) const VAE_TILES: [usize; 5] = [128, 96, 64, 48, 32];
+
+/// What a VAE built in F32 from `file` must have free on its device, and what it runs a
+/// `width x height` decode best with: its weights beside the smallest tile's decode, and
+/// its weights beside a whole-image decode.
+pub(super) fn vae_placement_bytes(
+    file: &std::path::Path,
+    width: usize,
+    height: usize,
+) -> (u64, u64) {
+    const RESIDENT_ELEM: u64 = 4;
+    let stored = std::fs::metadata(file).map_or(0, |m| m.len());
+    let weights = match ImageEngine::safetensors_elem_bytes(file) {
+        Some(bpe) if bpe < RESIDENT_ELEM => stored * RESIDENT_ELEM / bpe,
+        _ => stored,
+    };
+    vae_placement_for(weights, width, height)
+}
+
+/// [`vae_placement_bytes`] for a VAE whose resident weights are `weights` bytes.
+pub(super) fn vae_placement_for(weights: u64, width: usize, height: usize) -> (u64, u64) {
+    let smallest = VAE_TILES[VAE_TILES.len() - 1];
+    let tile_side = (smallest + 2 * VAE_TILE_OVERLAP) * FLUX_VAE_STRIDE;
+    (
+        weights + vae_whole_decode_peak(tile_side, tile_side),
+        weights + vae_whole_decode_peak(width, height),
+    )
+}
 
 /// Peak VRAM of decoding the whole image in one pass.
 ///

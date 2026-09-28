@@ -417,7 +417,8 @@ fn the_fixed_point_splits_the_real_checkpoint_when_no_card_holds_it() {
 #[test]
 #[ignore = "needs the local Z-Image-Turbo snapshot"]
 fn the_1536_decision_on_the_real_checkpoint() {
-    use crate::inference::engine::image_engine::{zimage_encoder_card, zimage_placed_reserve};
+    use crate::inference::engine::image_engine::zimage_placed_reserve;
+    use crate::inference::place::ladder::{aside, cards_of, whole_order};
     let files = real_checkpoint_shards();
     let refs: Vec<&str> = files.iter().map(String::as_str).collect();
     let cfg = Config::z_image_turbo();
@@ -478,9 +479,13 @@ fn the_1536_decision_on_the_real_checkpoint() {
     }
     // ...and the encoder gets what is left, which at this geometry is nothing: it
     // encodes on the host so that the blocks have the cards.
-    assert_eq!(
-        zimage_encoder_card(&cards, Some(&s.load), None, ENCODER),
-        None,
+    assert!(
+        whole_order(
+            &aside(&cards, &cards_of(&s.plan), u64::MAX),
+            ENCODER,
+            ENCODER
+        )
+        .is_empty(),
         "the encoder was given a card the split needs",
     );
 }

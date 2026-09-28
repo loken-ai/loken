@@ -1038,11 +1038,11 @@ fn the_supported_geometries_keep_their_plan() {
     const MAIN_BLOCKS: usize = 30;
 
     /// The loader's decision, in the order the loader makes it: does one card hold the
-    /// weights AND this request's forward; if not, which card takes the caption encoder;
-    /// and then where the blocks go.
+    /// weights AND this request's forward; if not, where the blocks go beside the caption
+    /// encoder.
     fn shape(fleet: &[u64], width: usize, height: usize) -> (usize, usize, usize) {
         let demand = zi::zimage_runtime_demand(width, height);
-        let mut cards: Vec<(usize, u64)> = fleet.iter().copied().enumerate().collect();
+        let cards: Vec<(usize, u64)> = fleet.iter().copied().enumerate().collect();
         let whole_on = cards
             .iter()
             .find(|(_, f)| *f >= RESIDENT + demand)
@@ -1054,15 +1054,8 @@ fn the_supported_geometries_keep_their_plan() {
             // a slower, roomier one: that is a real answer, not a rounding.
             return (1, 0, if idx == 0 { MAIN_BLOCKS } else { 0 });
         }
-        let encoder = zi::zimage_text_encoder_bytes();
-        if let Some(idx) = zi::zimage_encoder_card(&cards, None, whole_on, encoder) {
-            for e in cards.iter_mut() {
-                if e.0 == idx {
-                    e.1 = e.1.saturating_sub(encoder);
-                }
-            }
-        }
-        let plan = zi::zimage_block_plan(&cards, &[], MAIN_BLOCKS, RESIDENT, demand);
+        // The planner chooses the spread with the card the caption encoder keeps.
+        let plan = zi::zimage_first_plan(None, &cards, MAIN_BLOCKS, RESIDENT, demand);
         let cards_used = plan
             .segments
             .iter()
@@ -1118,7 +1111,7 @@ fn the_supported_geometries_keep_their_plan() {
              third, and the blocks divide over the first two.",
             vec![12 * GB, 12 * GB, 12 * GB],
             [
-                (512, 512, (2, 0, 13)),
+                (512, 512, (2, 0, 20)),
                 (1024, 1024, (2, 0, 13)),
                 (1536, 1536, (2, 0, 16)),
             ],
@@ -1307,11 +1300,6 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("inference/engine/audio_engine.rs", (2, 0, 0)),
     ("inference/engine/boogu_engine.rs", (2, 0, 0)),
     ("inference/engine/flux2_engine.rs", (2, 0, 0)),
-    ("inference/engine/image_engine/demand.rs", (1, 0, 0)),
-    ("inference/engine/image_engine/load_flux.rs", (8, 0, 1)),
-    ("inference/engine/image_engine/load_others.rs", (9, 0, 1)),
-    ("inference/engine/image_engine/mod.rs", (2, 0, 0)),
-    ("inference/engine/image_engine/resident.rs", (1, 0, 0)),
     ("inference/engine/llm_engine/decode.rs", (1, 0, 0)),
     ("inference/engine/llm_engine/load.rs", (1, 0, 0)),
     ("inference/engine/llm_engine/loading.rs", (7, 0, 0)),
@@ -1321,7 +1309,16 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("inference/generic_transformer/loader.rs", (5, 0, 0)),
     ("inference/generic_transformer/projection.rs", (1, 0, 1)),
     ("inference/load/requantize.rs", (0, 0, 1)),
-    ("inference/model/flux/hetero.rs", (2, 0, 0)),
+    ("inference/media/midi.rs", (2, 0, 1)),
+    ("inference/model/acestep/cond.rs", (1, 0, 0)),
+    ("inference/model/acestep/dit/mod.rs", (3, 0, 0)),
+    ("inference/model/acestep/fsq.rs", (2, 0, 0)),
+    ("inference/model/acestep/lm/mod.rs", (4, 5, 0)),
+    ("inference/model/acestep/music.rs", (0, 4, 0)),
+    ("inference/model/acestep/textenc.rs", (1, 0, 0)),
+    ("inference/model/acestep/vae.rs", (3, 2, 0)),
+    ("inference/model/ezaudio/dit.rs", (3, 0, 0)),
+    ("inference/model/gptoss/mod.rs", (1, 0, 0)),
     ("inference/model/kyutai/lm.rs", (1, 0, 0)),
     ("inference/model/nemotron_h/mod.rs", (1, 0, 0)),
     ("inference/model/qwen35/moe.rs", (1, 0, 0)),

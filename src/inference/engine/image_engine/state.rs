@@ -42,6 +42,8 @@ pub struct FluxModelState {
     pub t5_device: Device,
     pub t5_tokenizer: Tokenizer,
     pub clip_model: crate::inference::model::clip::text::Transformer,
+    /// Device the CLIP text encoder lives on.
+    pub clip_device: Device,
     pub clip_tokenizer: Tokenizer,
     pub ae: crate::inference::model::flux::vae::AutoEncoder,
     /// Device the VAE lives on. At 1024^2 the Flux transformer fills GPU0 during
@@ -85,15 +87,10 @@ pub(super) const ZIMAGE_MAX_SHIFT: f64 = 1.15;
 /// See FluxVariant for the same large_enum_variant rationale.
 #[allow(clippy::large_enum_variant)]
 pub enum ZImageVariant {
-    /// Single-device, NATIVE tensor substrate -
-    /// the default when one CUDA device fits the BF16 transformer; the
-    /// facade variants below are the fallback when the native load fails
-    /// or VRAM is too tight. Holds the native model directly: the denoise
-    /// loop in `generate_zimage` runs on native tensors end-to-end,
-    /// bridged once per generate at each loop boundary.
+    /// NATIVE tensor substrate, on the cards and the host its plan names. Holds the
+    /// native model directly: the denoise loop in `generate_zimage` runs on native
+    /// tensors end-to-end, bridged once per generate at each loop boundary.
     NativeSingle(crate::inference::model::zimage::dit::ZImageTransformer2DModel),
-    /// Single-device (all blocks on one GPU or CPU), facade substrate
-    Single(ztf::ZImageTransformer2DModel),
     /// Multi-device (blocks split across devices)
     Hetero(HeteroZImage),
 }
@@ -286,44 +283,4 @@ pub struct ImageModelInfo {
     pub model_type: String,
     pub total_layers: u32,
     pub layer_distribution: Vec<ImageLayerDist>,
-}
-
-/// Pick the best CUDA device for an auxiliary module (VAE, text
-/// encoder) given live per-device free VRAM and a `min_bytes`
-/// footprint estimate. Returns `Some(gpu_id)` if at least one
-/// device has enough room; `None` means caller should fall back
-/// to CPU.
-///
-/// Selection priority:
-/// 1. If `prefer` is Some and that device has >= min_bytes free,
-///    return it (saves a PCIe transfer when the module would
-///    otherwise read tensors from the preferred device).
-/// 2. Otherwise return the device with the MOST free VRAM that
-///    has at least `min_bytes` free.
-///
-/// This addresses the long-standing "VAE OOMs on GPU0 while GPU1
-/// has 15 GB free" pattern. Replaces the boolean `vae_fits_on_gpu`
-/// which only checked the primary device.
-pub(crate) fn pick_aux_device(
-    per_device_free: &[(usize, u64)],
-    min_bytes: u64,
-    prefer: Option<usize>,
-) -> Option<usize> {
-    // 1. Preferred device if it fits - saves the PCIe transfer
-    //    cost of moving the input tensor to a different device.
-    if let Some(pref) = prefer {
-        if let Some((_, free)) = per_device_free.iter().find(|(i, _)| *i == pref) {
-            if *free >= min_bytes {
-                return Some(pref);
-            }
-        }
-    }
-    // 2. Otherwise: FIRST device in the caller's order (fastest-first from the probe) whose free
-    //    VRAM fits the peak. A device the hot model packed full simply fails the fit filter and
-    //    the next-fastest card takes the aux - no "most free VRAM" heuristic (banned: it routes
-    //    work by memory pressure instead of throughput).
-    per_device_free
-        .iter()
-        .find(|(_, free)| *free >= min_bytes)
-        .map(|(idx, _)| *idx)
 }

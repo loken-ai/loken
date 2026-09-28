@@ -202,17 +202,7 @@ impl SdxlTextEncoders {
     pub fn load(checkpoint: &str, device: &Device, dtype: DType) -> Result<Self> {
         let vb = unsafe { VarBuilder::from_files(&[checkpoint], dtype, device) }?;
         // CLIP-L is stored under the HuggingFace names `native_clip` already reads.
-        let l_cfg = ClipConfig {
-            vocab_size: 49408,
-            embed_dim: CLIP_L_DIM,
-            activation: crate::tensor::ops::Activation::QuickGelu,
-            intermediate_size: 3072,
-            max_position_embeddings: CONTEXT_TOKENS,
-            pad_with: None,
-            num_hidden_layers: 12,
-            num_attention_heads: 12,
-            projection_dim: CLIP_L_DIM,
-        };
+        let l_cfg = ClipConfig::vit_l_14();
         Ok(Self {
             l: ClipTransformer::new(vb.pp(L_PREFIX), &l_cfg)?,
             g: ClipG::new(&vb.pp(G_PREFIX))?,

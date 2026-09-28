@@ -29,6 +29,23 @@ pub struct Config {
     pub projection_dim: usize,
 }
 
+impl Config {
+    /// The text tower of CLIP ViT-L/14, as `openai/clip-vit-large-patch14` ships it.
+    pub fn vit_l_14() -> Self {
+        Self {
+            vocab_size: 49408,
+            embed_dim: 768,
+            activation: Activation::QuickGelu,
+            intermediate_size: 3072,
+            max_position_embeddings: 77,
+            pad_with: None,
+            num_hidden_layers: 12,
+            num_attention_heads: 12,
+            projection_dim: 768,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Embeddings {
     token_embedding: Embedding,

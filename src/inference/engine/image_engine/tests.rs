@@ -79,39 +79,53 @@ fn a_load_nobody_cancelled_is_let_through() {
     assert!(ImageEngine::refuse_if_abandoned(Some(&already_abandoned())).is_err());
 }
 
-// -- pick_aux_device --------------------------------------------
-// The replacement for vae_fits_on_gpu's single-device check.
-// Pins the architectural fix for the OOM the user hit (GPU0 full
-// from transformer, GPU1 idle, VAE always landed on GPU0).
+// -- one-shot components placed whole --------------------------------
+// A VAE or an encoder takes the first card its whole order lists, a preferred card
+// first, and the host when the order is empty.
+
+/// The card a whole component of `need` bytes, running best with `want`, lands on.
+fn aux_card(free: &[(usize, u64)], need: u64, want: u64, prefer: Option<usize>) -> Option<usize> {
+    let cards = crate::inference::place::ladder::prefer(free, prefer);
+    crate::inference::place::ladder::whole_order(&cards, need, want)
+        .first()
+        .map(|(idx, _)| *idx)
+}
+
+/// The card a VAE of `weights` resident bytes lands on for a `width x height` decode.
+fn vae_card(free: &[(usize, u64)], weights: u64, width: usize, height: usize) -> Option<usize> {
+    let (need, want) = vae_placement_for(weights, width, height);
+    aux_card(free, need, want, None)
+}
 
 /// The placement that stranded the VAE on the CPU for a process's lifetime.
-/// Both tiers matter: without the floor a card 130 MB short of the whole-image
-/// peak is rejected outright, and without the peak a roomy card would be sized
-/// as if it had to tile.
+/// Both tiers matter: without the floor a card short of the whole-image peak is
+/// rejected outright, and without the peak a roomy card would be sized as if it had
+/// to tile.
 #[test]
 fn the_vae_falls_back_to_a_gpu_before_it_falls_back_to_the_cpu() {
     let weights = 600_000_000u64;
 
-    // The measured pressure state: neither card holds the 4.29 GB peak, but one
-    // has 4.16 GB - far more than the tiled floor needs.
-    let tight = &[(0, 1_550_000_000u64), (1, 4_160_000_000u64)];
-    assert!(
-        pick_vae_gpu(tight, weights, 1024, 1024).is_some(),
+    // Neither card holds the whole-image peak beside the weights, and one has far
+    // more than the tiled floor needs.
+    let (need, want) = vae_placement_for(weights, 2048, 2048);
+    let tight = &[(0, need - 1), (1, (need + want) / 2)];
+    assert_eq!(
+        vae_card(tight, weights, 2048, 2048),
+        Some(1),
         "a tiled decode fits here; the CPU is not the answer"
     );
 
     // Roomy: the fastest card that holds the whole-image peak, undivided.
     let roomy = &[(0, 12_000_000_000u64), (1, 12_000_000_000u64)];
-    assert_eq!(pick_vae_gpu(roomy, weights, 1024, 1024), Some(0));
+    assert_eq!(vae_card(roomy, weights, 1024, 1024), Some(0));
 
     // Genuinely full: no card can host even the smallest tile plus the weights,
-    // and THEN the CPU is correct. Reporting a GPU here would be worse than the
-    // fallback it replaced.
+    // and THEN the CPU is correct.
     let full = &[(0, 100_000_000u64), (1, 80_000_000u64)];
-    assert_eq!(pick_vae_gpu(full, weights, 1024, 1024), None);
+    assert_eq!(vae_card(full, weights, 1024, 1024), None);
 
     // No GPUs at all.
-    assert_eq!(pick_vae_gpu(&[], weights, 1024, 1024), None);
+    assert_eq!(vae_card(&[], weights, 1024, 1024), None);
 }
 
 /// The tile choice decides, per request, whether the decode stays on the device.
@@ -155,112 +169,117 @@ fn the_tile_shrinks_until_the_decode_fits_and_gives_up_honestly() {
     }
 }
 
-/// The state from the pressure run: a chat model on GPU0, the transformer spread,
-/// and 4.16 GB free on GPU1 against a 4.29 GB whole-image decode peak. The old
-/// single-tier placement missed by ~130 MB and sent the VAE to the CPU, where the
-/// decode cost 116 s of a 176 s request. It never needed that much to LIVE there -
-/// only to decode the whole image in one piece, which tiling makes optional.
+/// The whole-image peak is a preference and the tiled floor a requirement: a card that
+/// misses the first and holds the second keeps the VAE off the CPU.
 #[test]
 fn a_vae_that_misses_the_whole_image_peak_still_lands_on_a_gpu() {
-    const NATIVE_SIDE: u64 = 1024;
-    let peak = NATIVE_SIDE * NATIVE_SIDE * VAE_WIDEST_CH * 8 * 4;
-    const SMALLEST_TILE_SIDE: u64 = (32 + 2 * 8) * 8;
-    let weights = 300_000_000u64 * 2;
-    let floor = weights + SMALLEST_TILE_SIDE * SMALLEST_TILE_SIDE * VAE_WIDEST_CH * 8 * 4;
-    assert!(floor < peak, "the tiled floor must be the cheaper demand");
-
-    let free = &[(0, 1_550_000_000u64), (1, 4_160_000_000u64)];
+    let weights = 600_000_000u64;
+    let (need, want) = vae_placement_for(weights, 2048, 2048);
+    assert!(need < want, "the tiled floor must be the cheaper demand");
+    let free = &[(0, need / 2), (1, want - 1)];
     assert_eq!(
-        pick_aux_device(free, peak, None),
+        aux_card(free, want, want, None),
         None,
         "the peak fits neither card"
     );
-    let tiered = pick_aux_device(free, peak, None).or_else(|| pick_aux_device(free, floor, None));
-    // WHICH card is the fleet rule's call (fastest that fits); what this pins is that
-    // some card is chosen at all, because the alternative is not a slower GPU - it is
-    // the CPU, and that is the difference between seconds and minutes.
-    assert!(
-        tiered.is_some(),
-        "the tiled floor must keep the VAE on a GPU, got {tiered:?}"
+    assert_eq!(
+        aux_card(free, need, want, None),
+        Some(1),
+        "the tiled floor must keep the VAE on a GPU"
     );
 }
 
 #[test]
-fn pick_aux_device_user_2x17gb_routes_vae_to_idle_gpu() {
-    // Reproduces the user's exact post-transformer-load state from
-    // an OOM log: GPU0 nearly full (1.1 GB free),
-    // GPU1 nearly idle (15.2 GB free). VAE needs 1.5 GB.
-    // Pre-fix: vae_fits_on_gpu(1.1 GB) = false -> CPU fallback
-    //          (slow). VAE actually targeted GPU0 -> OOM.
-    // Post-fix: pick_aux_device picks GPU1 (first with room), VAE lives
-    //          there, no OOM, no PCIe transfer (last transformer
-    //          segment is also on GPU1 per the new placement).
+fn a_one_shot_component_goes_to_the_idle_card() {
+    // GPU0 nearly full after the transformer, GPU1 nearly idle.
     let free = &[(0, 1_100_000_000u64), (1, 15_200_000_000u64)];
-    let picked = pick_aux_device(free, 1_500_000_000, None);
-    assert_eq!(
-        picked,
-        Some(1),
-        "expected GPU1 (first that fits), got {picked:?}"
-    );
+    assert_eq!(aux_card(free, 1_500_000_000, 1_500_000_000, None), Some(1));
 }
 
 #[test]
-fn pick_aux_device_prefers_target_device_when_it_fits() {
-    // Preferred device has enough room -> return it even if
-    // another device has MORE room. Saves the PCIe transfer.
+fn a_preferred_card_with_room_wins() {
+    // Preferred device has enough room: it wins even beside a roomier card, which
+    // saves the transfer of the latent.
     let free = &[(0, 3_000_000_000u64), (1, 10_000_000_000u64)];
-    // VAE prefers GPU0 (last transformer segment), needs 1.5 GB.
-    // Both fit but prefer=0 wins.
-    let picked = pick_aux_device(free, 1_500_000_000, Some(0));
     assert_eq!(
-        picked,
-        Some(0),
-        "preferred device with enough room should win, got {picked:?}"
+        aux_card(free, 1_500_000_000, 1_500_000_000, Some(0)),
+        Some(0)
+    );
+    assert_eq!(
+        aux_card(free, 1_500_000_000, 1_500_000_000, Some(1)),
+        Some(1)
     );
 }
 
 #[test]
-fn pick_aux_device_skips_preferred_when_it_does_not_fit() {
-    // Preferred is too tight -> fall through to the first device with room.
+fn a_preferred_card_without_room_is_passed_over() {
     let free = &[(0, 500_000_000u64), (1, 10_000_000_000u64)];
-    let picked = pick_aux_device(free, 1_500_000_000, Some(0));
     assert_eq!(
-        picked,
-        Some(1),
-        "preferred too small, should fall back to first-fit, got {picked:?}"
+        aux_card(free, 1_500_000_000, 1_500_000_000, Some(0)),
+        Some(1)
     );
 }
 
 #[test]
-fn pick_aux_device_returns_none_when_nothing_fits() {
-    // Nothing has 1.5 GB -> caller falls back to CPU.
+fn nothing_fits_means_the_host() {
     let free = &[(0, 500_000_000u64), (1, 800_000_000u64)];
-    assert_eq!(pick_aux_device(free, 1_500_000_000, None), None);
-    assert_eq!(pick_aux_device(free, 1_500_000_000, Some(0)), None);
+    assert_eq!(aux_card(free, 1_500_000_000, 1_500_000_000, None), None);
+    assert_eq!(aux_card(free, 1_500_000_000, 1_500_000_000, Some(0)), None);
+    assert_eq!(aux_card(&[], 1_500_000_000, 1_500_000_000, None), None);
+    assert_eq!(aux_card(&[], 1_500_000_000, 1_500_000_000, Some(0)), None);
 }
 
 #[test]
-fn pick_aux_device_handles_empty_device_list() {
-    // No CUDA devices at all -> CPU.
-    assert_eq!(pick_aux_device(&[], 1_500_000_000, None), None);
-    assert_eq!(pick_aux_device(&[], 1_500_000_000, Some(0)), None);
-}
-
-#[test]
-fn pick_aux_device_text_encoder_picks_fastest_that_fits() {
-    // Realistic post-transformer state: GPU0 holds 17 layers
-    // (~7 GB weights), GPU1 holds 13 (~5 GB). Residual free
-    // ~9.8/11.4 GB, text encoder needs ~5 GB. Both fit -> the
-    // FIRST device in the caller's fastest-first order wins (the
-    // one-shot encode also runs fastest there). Memory-pressure
-    // balancing is not a placement signal; a device without room
-    // simply fails the fit filter.
+fn a_one_shot_component_takes_the_fastest_card_that_fits() {
+    // Both cards fit: the first in the fastest-first order wins, whatever the other
+    // card has free.
     let free = &[(0, 9_800_000_000u64), (1, 11_400_000_000u64)];
-    let picked = pick_aux_device(free, 5_000_000_000, None);
+    assert_eq!(aux_card(free, 5_000_000_000, 5_000_000_000, None), Some(0));
+}
+
+#[test]
+fn a_one_shot_component_stays_off_the_hot_cards_while_another_has_room() {
+    use crate::inference::place::ladder::aside;
+    let free = &[(0, 12_000_000_000u64), (1, 6_000_000_000u64)];
+    // The hot component runs on card 0: the encoder goes to card 1.
     assert_eq!(
-        picked,
-        Some(0),
-        "text encoder should land on the fastest device that fits, got {picked:?}"
+        aux_card(
+            &aside(free, &[0], 4_000_000_000),
+            5_000_000_000,
+            5_000_000_000,
+            None
+        ),
+        Some(1)
+    );
+    // Card 1 too small: card 0 is shared, but only with the hot component's need kept.
+    let small = &[(0, 12_000_000_000u64), (1, 2_000_000_000u64)];
+    assert_eq!(
+        aux_card(
+            &aside(small, &[0], 4_000_000_000),
+            5_000_000_000,
+            5_000_000_000,
+            None
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        aux_card(
+            &aside(small, &[0], 8_000_000_000),
+            5_000_000_000,
+            5_000_000_000,
+            None
+        ),
+        None
+    );
+    // Kept whole: the hot cards are not offered at all.
+    assert_eq!(
+        aux_card(
+            &aside(small, &[0], u64::MAX),
+            5_000_000_000,
+            5_000_000_000,
+            None
+        ),
+        None
     );
 }
 

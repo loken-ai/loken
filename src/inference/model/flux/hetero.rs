@@ -406,14 +406,15 @@ impl HeteroFlux {
         // at a low point, so free VRAM here overstates what the next step will leave -
         // which is exactly what the headroom covers.
         let need = self.bytes_per_block.saturating_add(self.render_headroom);
-        let target = crate::inference::place::device_probe::probe_cuda_gpus_for("media")
+        let target = crate::inference::place::ladder::cards_for("media", need)
             .into_iter()
-            .find(|g| self.cuda_devices.contains_key(&g.index) && g.stable_free > need);
+            .map(|(idx, _)| idx)
+            .find(|idx| self.cuda_devices.contains_key(idx));
         let Some(target) = target else {
             self.repatriate_backoff = REPATRIATE_BACKOFF_STEPS;
             return Ok(None);
         };
-        let dev = self.cuda_devices[&target.index].clone();
+        let dev = self.cuda_devices[&target].clone();
 
         let is_double: Vec<bool> = self
             .layers
@@ -422,7 +423,7 @@ impl HeteroFlux {
             .collect();
         let name = checkpoint_block_name(&is_double, pos);
         let vb = VarBuilder::from_gguf(&self.checkpoint, &dev)
-            .map_err(|e| anyhow::anyhow!("repatriate: VarBuilder on CUDA:{}: {e}", target.index))?;
+            .map_err(|e| anyhow::anyhow!("repatriate: VarBuilder on CUDA:{target}: {e}"))?;
         let rebuilt = match &self.layers[pos].block {
             HeteroFluxBlock::Double(_) => {
                 HeteroDoubleBlock::new(&self.cfg, vb.pp(name)).map(HeteroFluxBlock::Double)
@@ -444,7 +445,7 @@ impl HeteroFlux {
         };
 
         self.layers[pos] = HeteroFluxLayer {
-            device: HeteroDevice::Cuda(target.index),
+            device: HeteroDevice::Cuda(target),
             block: rebuilt,
         };
         let (segments, mut unique) = build_segments(&self.layers, &self.cuda_devices);
@@ -465,11 +466,10 @@ impl HeteroFlux {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         info!(
-            "repatriated block {pos} onto CUDA:{} ({} still on the host)",
-            target.index,
+            "repatriated block {pos} onto CUDA:{target} ({} still on the host)",
             self.cpu_block_count()
         );
-        Ok(Some((pos, target.index)))
+        Ok(Some((pos, target)))
     }
 }
 
@@ -503,18 +503,9 @@ const SLAB_SHARE: u64 = 16;
 /// Read once per load rather than per block: probing free VRAM costs a driver call,
 /// and a denoise runs every block on every step - thousands of probes per render.
 fn set_slab_budget(dev: &Device) {
-    let free = match dev.location() {
-        crate::tensor::DeviceLocation::Cuda { gpu_id } => {
-            crate::inference::place::vram_manager::probe(0)
-                .into_iter()
-                .find(|(i, _, _)| *i == gpu_id)
-                .map(|(_, free, _)| free)
-                .unwrap_or(0)
-        }
-        // On the host the constraint is different in kind, and the allocator does not
-        // behave the way this is guarding against.
-        _ => 0,
-    };
+    // On the host the constraint is different in kind, and the allocator does not behave
+    // the way this is guarding against: no budget there.
+    let free = crate::inference::place::ladder::free_on_card(dev).unwrap_or(0);
     SLAB_BUDGET_BYTES.store(free / SLAB_SHARE, std::sync::atomic::Ordering::Relaxed);
     if free > 0 {
         info!(
@@ -1114,19 +1105,7 @@ impl HeteroFlux {
         // One VarBuilder PER CARD the plan actually uses. Building them lazily from the
         // plan's own ordinals is what makes the placement real: a block assigned to
         // card 1 is uploaded to card 1, not to whichever card happened to be passed in.
-        let planned_ordinals: Vec<usize> = {
-            let mut v: Vec<usize> = plan
-                .segments
-                .iter()
-                .filter_map(|s| match s.kind {
-                    DeviceKind::Cuda(i) => Some(i),
-                    _ => None,
-                })
-                .collect();
-            v.sort_unstable();
-            v.dedup();
-            v
-        };
+        let planned_ordinals: Vec<usize> = crate::inference::place::ladder::cards_of(plan);
         let mut cuda_vbs: std::collections::HashMap<usize, VarBuilder> =
             std::collections::HashMap::new();
         if has_cuda_segments {

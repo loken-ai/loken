@@ -101,15 +101,7 @@ impl ImageEngine {
     /// request for as long as the model stays loaded.
     pub async fn resident_device_free_bytes(&self) -> Option<u64> {
         let guard = self.model_state.lock().await;
-        let state = guard.as_ref()?;
-        let gpu_id = match state.device.location() {
-            crate::tensor::DeviceLocation::Cuda { gpu_id } => gpu_id,
-            _ => return None,
-        };
-        crate::inference::place::vram_manager::probe(0)
-            .into_iter()
-            .find(|(idx, _, _)| *idx == gpu_id)
-            .map(|(_, free, _)| free)
+        crate::inference::place::ladder::free_on_card(&guard.as_ref()?.device)
     }
 
     /// Checkpoint FILE the resident model was built from, when the family tracks it

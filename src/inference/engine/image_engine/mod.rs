@@ -1,4 +1,3 @@
-use crate::inference::model::zimage::dit as ztf;
 // Re-exported through `super::` by the placement tests, which is why the non-test build calls
 // these unused.
 #[allow(unused_imports)]
@@ -115,8 +114,8 @@ fn family_of_model(model: &LoadedImageModel) -> &'static str {
 fn describe(state: &LoadedImageModelState) -> Presence {
     let (model_type, total_layers, layer_distribution) = match &state.model {
         LoadedImageModel::Flux(flux) => match &flux.flux {
-            FluxVariant::Whole(_) => {
-                let total = 57u32;
+            FluxVariant::Whole(whole) => {
+                let total = whole.plan.total_layers as u32;
                 let dist = all_on_one_device(state, total);
                 ("Flux Schnell".into(), total, dist)
             }
@@ -127,7 +126,7 @@ fn describe(state: &LoadedImageModelState) -> Presence {
             }
         },
         LoadedImageModel::ZImage(zimg) => match &zimg.transformer {
-            ZImageVariant::Single(_) | ZImageVariant::NativeSingle(_) => {
+            ZImageVariant::NativeSingle(_) => {
                 let total = 34u32;
                 let dist = all_on_one_device(state, total);
                 ("Z-Image".into(), total, dist)
@@ -300,10 +299,7 @@ fn encode_ids(tokenizer: &Tokenizer, text: &str, what: &str) -> AnyResult<Vec<u3
 /// Zero is the honest answer for a device nothing can measure, and it is also the safe
 /// one: every caller compares it against what a decode needs, and no decode needs nothing.
 fn free_on_device(dev: &Device) -> u64 {
-    crate::inference::place::vram_manager::probe(0)
-        .into_iter()
-        .find(|(_, _, d)| crate::tensor::Device::same_device(d, dev))
-        .map_or(0, |(_, free, _)| free)
+    crate::inference::place::ladder::free_on_card(dev).unwrap_or(0)
 }
 
 /// Interleaved RGB8 -> a base64 PNG, the string every image path returns.
@@ -327,16 +323,8 @@ fn release_text_encoder_if_needed(state: &mut FluxModelState, width: usize, heig
         return;
     }
     let need = flux_runtime_demand(width, height);
-    let free_there = match state.t5_device.location() {
-        crate::tensor::DeviceLocation::Cuda { gpu_id } => {
-            crate::inference::place::vram_manager::probe(0)
-                .into_iter()
-                .find(|(i, _, _)| *i == gpu_id)
-                .map(|(_, free, _)| free)
-        }
-        _ => None,
-    }
-    .unwrap_or(u64::MAX);
+    let free_there =
+        crate::inference::place::ladder::free_on_card(&state.t5_device).unwrap_or(u64::MAX);
     if free_there >= need {
         return;
     }
@@ -418,7 +406,7 @@ fn encode_flux_text(
         T5_LEN
     );
 
-    // CLIP (runs on GPU)
+    // CLIP, on the device it was placed on.
     let clip_t = std::time::Instant::now();
     let mut clip_tokens = encode_ids(&state.clip_tokenizer, prompt, "CLIP")?;
     // CLIP's positional table is exactly CLIP_CONTEXT entries, so a longer prompt
@@ -434,10 +422,11 @@ fn encode_flux_text(
         clip_tokens.push(end);
         info!("Flux CLIP: prompt over {CLIP_CONTEXT} tokens, truncated (T5 still sees {T5_LEN})");
     }
-    let clip_input = Tensor::new(&clip_tokens[..], device)?.unsqueeze(0)?;
+    let clip_input = Tensor::new(&clip_tokens[..], &state.clip_device)?.unsqueeze(0)?;
     let clip_emb = state
         .clip_model
         .forward(&clip_input)?
+        .to_device(device)?
         .to_dtype(DType::F32)?;
     info!("Flux CLIP: {:.2}s", clip_t.elapsed().as_secs_f64());
 
@@ -1381,7 +1370,7 @@ fn choose_vae_tile(free: u64, peak: u64, width: usize, height: usize) -> Option<
     // So a coarse split is a legitimate way to keep a decode on the device, and a fine
     // one is a quality bug. Below this floor the answer is the CPU, not more tiles.
     let coarsest = hl.max(wl).div_ceil(2);
-    [128usize, 96, 64, 48, 32].into_iter().find(|&t| {
+    VAE_TILES.into_iter().find(|&t| {
         if t >= hl.max(wl) || t < coarsest {
             return false; // not a split at all, or finer than 2x2
         }
@@ -1390,64 +1379,50 @@ fn choose_vae_tile(free: u64, peak: u64, width: usize, height: usize) -> Option<
     })
 }
 
-/// Which GPU (if any) can host the VAE for a `width x height` decode.
+/// Move a CPU-stranded Z-Image VAE back onto a card when one has room again.
 ///
-/// Two tiers, and the second is the point: the whole-image peak is a PREFERENCE,
-/// while the tiled floor - the weights plus the smallest tile's working set - is
-/// the actual requirement. Charging the full peak is what stranded the VAE on the
-/// CPU with an idle card 130 MB short of it.
-///
-/// `None` means no card can host it even tiled, and only then is the CPU right.
-pub(crate) fn pick_vae_gpu(
-    live_free: &[(usize, u64)],
-    weight_bytes: u64,
-    width: usize,
-    height: usize,
-) -> Option<usize> {
-    let peak = (width * height) as u64 * 4 * (VAE_WIDEST_CH * 9 + VAE_WIDEST_CH * 2);
-    const SMALLEST_TILE_SIDE: u64 = (32 + 2 * VAE_TILE_OVERLAP as u64) * 8;
-    let floor = weight_bytes + SMALLEST_TILE_SIDE * SMALLEST_TILE_SIDE * VAE_WIDEST_CH * 8 * 4;
-    pick_aux_device(live_free, peak, None).or_else(|| pick_aux_device(live_free, floor, None))
-}
-
-/// Move a CPU-stranded Z-Image VAE back onto a GPU when one has room again.
-///
-/// Only ever CPU -> GPU: a VAE already on a GPU stays there, and a failure to reload
-/// leaves the working CPU VAE exactly as it was, so the worst case is the status quo.
+/// Only ever host -> card: a VAE already on a card stays there, and a failure to reload
+/// leaves the working host VAE exactly as it was, so the worst case is the status quo.
 fn repatriate_zimage_vae(zimg: &mut ZImageModelState, width: usize, height: usize) {
     if zimg.vae_device.is_cuda() {
         return;
     }
-    let weights = std::fs::metadata(&zimg.vae_path)
-        .map(|m| m.len())
-        .unwrap_or(0)
-        * 2;
-    let live_free: Vec<(usize, u64)> = crate::inference::place::vram_manager::probe(0)
-        .into_iter()
-        .map(|(i, f, _)| (i, f))
-        .collect();
-    let Some(gpu) = pick_vae_gpu(&live_free, weights, width, height) else {
+    let (need, want) = vae_placement_bytes(&zimg.vae_path, width, height);
+    let cards = crate::inference::place::ladder::cards(0);
+    if !cards.iter().any(|(_, free)| *free >= need) {
         return;
-    };
-    let Ok(dev) = crate::tensor::Device::new_cuda(gpu) else {
-        return;
-    };
-    let ndev = dev.clone();
+    }
     let Ok(path) = zimg.vae_path.clone().into_os_string().into_string() else {
         return;
     };
-    let built = unsafe {
-        crate::tensor::VarBuilder::from_files(&[path.as_str()], crate::tensor::DType::F32, &ndev)
-    }
-    .and_then(|vb| {
-        crate::inference::model::zimage::vae::AutoEncoderKL::new(
-            &crate::inference::model::zimage::vae::VaeConfig::z_image(),
-            vb,
-        )
-    });
+    let built = crate::inference::place::ladder::load_whole_on(
+        "Z-Image VAE",
+        need,
+        want,
+        &cards,
+        None,
+        |dev| {
+            if !dev.is_cuda() {
+                return Err(anyhow!("no card holds it"));
+            }
+            let vb = unsafe {
+                crate::tensor::VarBuilder::from_files(
+                    &[path.as_str()],
+                    crate::tensor::DType::F32,
+                    dev,
+                )
+            }
+            .map_err(|e| anyhow!("{e}"))?;
+            crate::inference::model::zimage::vae::AutoEncoderKL::new(
+                &crate::inference::model::zimage::vae::VaeConfig::z_image(),
+                vb,
+            )
+            .map_err(|e| anyhow!("{e}"))
+        },
+    );
     match built {
-        Ok(gpu_vae) => {
-            info!("Z-Image VAE: VRAM freed up - moving the VAE from the CPU back to CUDA:{gpu}");
+        Ok((gpu_vae, dev)) => {
+            info!("Z-Image VAE: VRAM freed up - moving the VAE from the CPU back to {dev:?}");
             // The CPU copy becomes the fallback instead of being dropped: it is already
             // paid for, and it is exactly what the decode cascade wants underneath.
             let cpu_vae = std::mem::replace(&mut zimg.vae, gpu_vae);
@@ -1459,7 +1434,7 @@ fn repatriate_zimage_vae(zimg: &mut ZImageModelState, width: usize, height: usiz
         }
         Err(e) => {
             // Nothing moved; the CPU VAE is untouched and the decode proceeds as before.
-            warn!("Z-Image VAE: repatriation to CUDA:{gpu} failed ({e}); staying on the CPU");
+            warn!("Z-Image VAE: repatriation failed ({e}); staying on the CPU");
         }
     }
 }
@@ -1650,23 +1625,7 @@ fn generate_zimage(
     // REPORTED, NOT FED BACK. No reserve, no placement and no admission reads this;
     // it is a line in the log, so that the factor those decisions do use can be
     // corrected against measurements rather than against another estimate.
-    let denoise_watch: Vec<(usize, u64, crate::inference::place::vram_manager::VramWatch)> = {
-        #[cfg(feature = "cuda")]
-        {
-            crate::inference::place::device_probe::probe_cuda_gpus()
-                .into_iter()
-                .filter_map(|g| {
-                    Some((
-                        g.index,
-                        g.stable_free,
-                        crate::inference::place::vram_manager::VramWatch::start(g.index)?,
-                    ))
-                })
-                .collect()
-        }
-        #[cfg(not(feature = "cuda"))]
-        Vec::new()
-    };
+    let denoise_watch = crate::inference::place::vram_manager::watch_every_card();
     on_step(0, remaining_steps);
     // NativeSingle runs the whole loop on the native substrate: latents +
     // text-encoder products are bridged in ONCE here, every per-step tensor
@@ -1713,9 +1672,6 @@ fn generate_zimage(
             let noise_pred = match &zimg.transformer {
                 // Handled by the native whole-loop branch above.
                 ZImageVariant::NativeSingle(_) => unreachable!("native z-image denoises above"),
-                ZImageVariant::Single(model) => {
-                    model.forward(&latents, &t_tensor, &cap_feats, &cap_mask)?
-                }
                 ZImageVariant::Hetero(hetero) => {
                     hetero.forward(&latents, &t_tensor, &cap_feats, &cap_mask)?
                 }

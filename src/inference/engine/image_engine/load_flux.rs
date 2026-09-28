@@ -70,26 +70,19 @@ impl ImageEngine {
                     error!("Failed to create HF API client: {}", e);
                     e
                 })?;
-            // PLACEMENT-EXEMPT: bootstrap only. Nothing is loaded onto this device - it
-            // decides the compute dtype and serves as the no-GPU fallback. The real Flux
-            // placement happens below, once the checkpoint size is known, via
-            // vram_manager::pick_device_for.
-            let device = crate::inference::place::vram_manager::probe(0)
-                .first()
-                .and_then(|(idx, _, _)| crate::tensor::cuda_ext::new_device_with_stream(*idx).ok())
-                .map(|d| d.native_device())
-                .unwrap_or(Device::Cpu);
+            // The cards this load may use. Whether there is one decides the compute dtype;
+            // where each component goes is decided below, once its size is known.
+            let cards = crate::inference::place::ladder::cards(0);
 
             // Enable TF32/reduced-precision for TensorCore acceleration (~10-15% matmul speedup).
             // F32 (TF32) and BF16 reduced precision are safe here - wide enough exponent to
             // accumulate 512 products. F16 is left at COMPUTE_32F by the switch itself.
-            if device.is_cuda() {
+            if !cards.is_empty() {
                 crate::tensor::cuda_ext::set_gemm_reduced_precision(true);
             }
 
-            let gpu_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-            let cpu_dtype = DType::F32; // CPU doesn't support BF16 matmul
-            info!("Flux device: {:?}, gpu_dtype: {:?}", device, gpu_dtype);
+            let gpu_dtype = if cards.is_empty() { DType::F32 } else { DType::BF16 };
+            info!("Flux: {} card(s), gpu_dtype: {:?}", cards.len(), gpu_dtype);
 
             // HOT-FIRST (the role-aware contract): the transformer - run per denoise step - is
             // loaded BEFORE the one-shot T5/CLIP encoders so it gets first claim on the fastest
@@ -204,418 +197,120 @@ impl ImageEngine {
             // cross-GPU split, which serialises the cards and is the worse failure.
             let estimated_gpu_mem = file_size;
 
-            // Detect available CUDA devices for multi-device placement.
-            // Walk EVERY NVML index, not just 0 - same single-GPU
-            // enumeration bug that prevented Z-Image from using GPU1
-            // (fixed in 3e3208b). On a 2x 16 GB box, querying only
-            // device 0 meant Flux's hetero-fallback could split CUDA0+CPU
-            // but never CUDA0+CUDA1, defeating the second GPU entirely.
-            let mut cuda_devices: Vec<(usize, u64)> = Vec::new();
-            let mut raw_free_vram: u64 = 0;
-            #[cfg(feature = "cuda")]
-            {
-                if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-                    let count = nvml.device_count().unwrap_or(1);
-                    for idx in 0..count {
-                        if let Ok(gpu) = nvml.device_by_index(idx) {
-                            if let Ok(mem) = gpu.memory_info() {
-                                if idx == 0 {
-                                    raw_free_vram = mem.free;
-                                }
-                                let _per_dev_free = mem.free;
-                                info!(
-                                    "HeteroFlux: CUDA #{} - {:.1} GB free",
-                                    idx, mem.free as f64 / 1e9,
-                                );
-                                // Activations everywhere, plus the resident embedders
-                                // on the card that holds the stem. Both derived above.
-                                let mut usable = mem.free.saturating_sub(runtime_demand);
-                                if idx == 0 {
-                                    usable = usable.saturating_sub(embedding_overhead);
-                                }
-                                cuda_devices.push((idx as usize, usable));
-                            }
-                        }
-                    }
-                }
-            }
-            // FASTEST GPU THAT FITS - the fleet placement rule. Picking merely the
-            // fastest card (what the primary selection above does, before the
-            // checkpoint size is even known) meant Flux only ever considered GPU0:
-            // with GPU0 at 10.3 GB free and GPU1 at 16.5 GB, a 12.1 GB checkpoint
-            // "did not fit single-device", split, failed again, and landed all 57
-            // blocks on the CPU - a render that never finishes - while a card sat
-            // free. Re-pick here, where the resident estimate exists, and take the
-            // chosen card's free VRAM as the single-device budget.
-            let (device, mut raw_free_vram) = {
-                // TWO figures, and they are not the same question. `want` is what a
-                // render is COMFORTABLE with; `floor` is what it genuinely cannot go
-                // under. I collapsed them into one on the grounds that neither was
-                // trustworthy, and that is what made a 1024x1024 render split across
-                // cards where it had run whole on one: its spare cleared the floor by a
-                // wide margin and missed the comfortable figure by 400 MB.
-                //
-                // Splitting a model that fits is not a safe default. It costs a
-                // transfer per block per step, and it is chosen here on a prediction -
-                // while the measured peak of that very render was well under the floor.
-                let want = estimated_gpu_mem + runtime_demand;
-                let floor = estimated_gpu_mem + runtime_floor(runtime_demand);
-                match crate::inference::place::vram_manager::pick_device_tiered("flux", want, floor) {
-                    // Flux runs on a non-default stream with graph capture, so it needs
-                    // the stream-bound handle for the chosen index rather than the plain
-                    // device the picker returns.
-                    Some((idx, free, _)) => {
-                        let d = crate::tensor::cuda_ext::new_device_with_stream(idx)
-                            .map(|h| h.native_device())
-                            .unwrap_or(device.clone());
-                        (d, free)
-                    }
-                    None => (device.clone(), raw_free_vram),
-                }
+            // What the transformer asks of the cards: its blocks, the dense stem on the card
+            // the first block runs on, and what this render needs free beside them. Whole on
+            // one card when a card holds it at the floor of that need; spread otherwise; the
+            // ladder recovers from a card that runs out. The cards are read again here,
+            // after the downloads, so the plan sees what they hold now.
+            let cards = crate::inference::place::ladder::cards(0);
+            let demand = crate::inference::place::ladder::Demand {
+                layers: total_blocks,
+                block_bytes: estimated_gpu_mem,
+                runtime_reserve: runtime_demand,
+                ..Default::default()
             };
-            if raw_free_vram == 0 && device.is_cuda() {
-                // Fallback: assume 6GB free if NVML unavailable but CUDA works
-                raw_free_vram = 6 * 1024 * 1024 * 1024;
-                if cuda_devices.is_empty() {
-                    // Same derived demand as every other path; there is no reason
-                    // for the no-NVML fallback to reserve a different amount than
-                    // the one this request actually needs.
-                    cuda_devices.push((0, raw_free_vram.saturating_sub(runtime_demand)));
-                }
-            }
-
-            // Activation/scratch headroom for the single-device fit check + the OCL
-            // device sizing below. Per-device CUDA deductions (including the
-            // primary-only embedding overhead) already happened inside the NVML walk
-            // above. Same derived figure throughout - one request, one demand.
-            let headroom = runtime_demand;
-
-            // Detect Arc/OpenCL devices
-            #[cfg(feature = "opencl")]
-            let ocl_devs: Vec<(usize, u64)> = {
-                let device_ids = crate::inference::kernel::opencl::enumerate_opencl_devices();
-                device_ids.iter().enumerate().map(|(i, &dev_id)| {
-                    let mem = crate::inference::kernel::opencl::get_opencl_device_memory(dev_id);
-                    let usable = mem.saturating_sub(headroom);
-                    info!("Flux: OpenCL device {} - {:.1} GB total, {:.1} GB usable", i, mem as f64 / 1e9, usable as f64 / 1e9);
-                    (i, usable)
-                }).collect()
-            };
-            #[cfg(not(feature = "opencl"))]
-            let ocl_devs: Vec<(usize, u64)> = vec![];
-
-            // THE DECISION, not a report. This used to print the spare against a floor
-            // and then load single-device regardless, because the only fallback was
-            // triggered by a load-time allocation failure. That is the wrong trigger:
-            // the weights fit whenever the spare is merely thin, so the load SUCCEEDS
-            // and the starvation lands on the first denoise - by which time the model
-            // is resident, the card is full, and there is nothing left to fall back
-            // to. Observed as a run of identical HTTP 500s, one per request, on a host
-            // whose other card sat mostly free the whole time.
-            //
-            // So the spare decides. If it does not cover what this request needs to
-            // denoise, the single-device path is not attempted at all and the split
-            // runs up front.
-            let spare = raw_free_vram.saturating_sub(estimated_gpu_mem);
-            // Against the FLOOR, not the comfortable figure. Above the floor the render
-            // runs; between the floor and the comfortable figure it runs with less room
-            // than one would choose, which is still better than paying a cross-card
-            // transfer on every block of every step.
-            //
-            // THAT RISK IS ONLY DEFENSIBLE ON THE FIRST ATTEMPT. Once a render has
-            // actually run out on this card, taking the same risk again produces the
-            // same failure - which is exactly what a run of identical 500s was: each
-            // re-plan printed "-> single-device" after the previous one starved, because
-            // this decision never looked at the pressure the retry loop had been raising
-            // on its behalf. So the pressure tightens the test, and past the second notch
-            // the single-device path is not offered at all: the request has proved that
-            // this card cannot hold it, and a split that runs is worth more than a fourth
-            // identical plan.
-            let pressure = crate::inference::place::vram_manager::vram_degrade_level();
-            let need = if pressure == 0 { runtime_floor(runtime_demand) } else { runtime_demand };
-            let single_device_fits = pressure < 2 && spare >= need;
+            let first_plan =
+                demand.plan_with_stem(&cards, embedding_overhead, runtime_floor(runtime_demand));
+            let accelerators = crate::inference::place::ladder::accelerators(runtime_demand);
             info!(
-                "HeteroFlux: file={:.1}GB, est_gpu={:.1}GB, free={:.1}GB -> {:.1}GB spare \
-                 against {:.1}GB required (of {:.1}GB wanted) to denoise {}x{} at pressure \
-                 {pressure} -> {}",
+                "HeteroFlux: file={:.1}GB, {:.1}GB to denoise {}x{} ({:.1}GB floor) -> {}",
                 file_size as f64 / 1e9,
-                estimated_gpu_mem as f64 / 1e9,
-                raw_free_vram as f64 / 1e9,
-                spare as f64 / 1e9,
-                need as f64 / 1e9,
                 runtime_demand as f64 / 1e9,
                 geom.width,
                 geom.height,
-                if single_device_fits { "single-device" } else { "SPLIT up front" },
+                runtime_floor(runtime_demand) as f64 / 1e9,
+                crate::inference::place::dry_plan::describe_plan(&first_plan),
             );
-
-            // Strategy:
-            // 1. CUDA present AND the card has room to denoise -> single-device.
-            // 2. Otherwise, or on a load failure -> split across CUDA+CPU+Arc.
-            // 3. No CUDA -> CPU + Arc only.
-            //
-            // The second case used to be reachable ONLY through a load failure, which
-            // is why a thin card loaded happily and starved afterwards.
-            let flux_variant = if raw_free_vram > 0 {
-                send_progress(if single_device_fits {
-                    "Building Flux model (single GPU)..."
-                } else {
-                    "Not enough room to denoise on one card - splitting..."
-                });
-                // Single-device strategy: the whole transformer on the chosen card, which is
-                // the same blocks the split placement runs and differs only in that nothing
-                // competes with them for what is left of the card. When it does not fit, the
-                // Err channel below leads to the split.
-                match (|| -> anyhow::Result<FluxVariant> {
-                    // Decline the single-device path BEFORE loading anything when the
-                    // card cannot also hold this request's denoise. The split below is
-                    // reached through this same Err channel, so declining here and
-                    // failing there take the identical route - the difference is that
-                    // this one costs no load and cannot strand a resident model.
-                    if !single_device_fits {
-                        anyhow::bail!(
-                            "{:.1} GB spare on the chosen card, {:.1} GB needed to denoise {}x{}",
-                            spare as f64 / 1e9,
-                            runtime_demand as f64 / 1e9,
-                            geom.width,
-                            geom.height,
-                        );
-                    }
-                    let native = (|| -> anyhow::Result<FluxVariant> {
-                        let ndev = &device.clone();
-                        // Ray fp8-scaled safetensors (Rayflux / Rayflux-Krea) load
-                        // through the fp8 bridge; GGUF Schnell/Dev keeps from_gguf.
-                        // Same transformer either way -- only the builder source
-                        // differs. Q8_0 for the 2-D projections keeps full CPU+GPU
-                        // kernel coverage (matches the GGUF path).
-                        let is_safetensors = flux_model_file
-                            .extension()
-                            .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
-                        let nvb = if is_safetensors {
-                            unsafe {
-                                crate::inference::load::fp8_scaled::load_qvarbuilder_cancellable(
-                                    &[&flux_model_file],
-                                    crate::tensor::quantized::GgmlDType::Q8_0,
-                                    ndev,
-                                    cancel.as_ref(),
-                                )
-                            }
-                            .map_err(|e| anyhow::anyhow!("{e}"))?
-                        } else {
-                            crate::inference::cache::qvb::from_gguf_cached(
-                                &flux_model_file, ndev,
-                            ).map_err(|e| anyhow::anyhow!("{e}"))?
-                        };
-                        let nflux = HeteroFlux::whole(&flux_cfg, nvb)
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        Ok(FluxVariant::Whole(nflux))
-                    })();
-                    match native {
-                        Ok(variant) => {
-                            info!("Flux: single-device load - the whole transformer on one card");
-                            return Ok(variant);
-                        }
-                        Err(ne) => {
-                            // The split fallback below reopens the checkpoint per card, so an
-                            // fp8-scaled safetensors reaches it only through a full requantised
-                            // GGUF sidecar written to disk. A partial upload from the failed
-                            // attempt is the usual cause here, so retry the whole placement
-                            // ONCE after returning pooled VRAM to the driver, then surface the
-                            // real error rather than pay for that sidecar.
-                            let is_safetensors_ckpt = flux_model_file
-                                .extension()
-                                .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
-                            if is_safetensors_ckpt {
-                                warn!("Flux: fp8 whole-placement load failed ({ne}); trimming pools and retrying once");
-                                crate::inference::engine::llm_engine::trim_cuda_pools();
-                                let ndev = &device.clone();
-                                let nvb = unsafe {
+            send_progress("Building Flux transformer...");
+            let is_safetensors_ckpt = flux_model_file
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
+            let cancelled =
+                || cancel.as_ref().is_some_and(crate::inference::serve::cancel::CancelToken::is_cancelled);
+            let (flux_variant, device) = crate::inference::place::ladder::load_planned(
+                "Flux transformer",
+                first_plan,
+                &demand,
+                &cards,
+                &accelerators,
+                cancelled,
+                |plan| -> anyhow::Result<(FluxVariant, Device)> {
+                    use crate::inference::place::layer_executor::DeviceKind;
+                    // One card: the whole transformer on it, read straight onto the card.
+                    // fp8-scaled safetensors (Rayflux / Rayflux-Krea) load through the fp8
+                    // bridge; GGUF keeps from_gguf. Q8_0 for the 2-D projections keeps full
+                    // CPU+GPU kernel coverage (matches the GGUF path).
+                    if let [seg] = plan.segments.as_slice() {
+                        if let DeviceKind::Cuda(_) = seg.kind {
+                            let ndev = crate::inference::place::ladder::open(seg.kind)?;
+                            let nvb = if is_safetensors_ckpt {
+                                unsafe {
                                     crate::inference::load::fp8_scaled::load_qvarbuilder_cancellable(
                                         &[&flux_model_file],
                                         crate::tensor::quantized::GgmlDType::Q8_0,
-                                        ndev,
+                                        &ndev,
                                         cancel.as_ref(),
                                     )
                                 }
-                                .map_err(|e| anyhow::anyhow!("fp8 retry: {e}"))?;
-                                let nflux = HeteroFlux::whole(&flux_cfg, nvb)
-                                    .map_err(|e| anyhow::anyhow!("fp8 retry: {e}"))?;
-                                info!("Flux: fp8 whole-placement load succeeded on retry");
-                                return Ok(FluxVariant::Whole(nflux));
-                            }
-                            warn!("Flux: single-device load failed ({ne}), splitting instead");
-                        }
-                    }
-                    anyhow::bail!(
-                        "Flux: the single-device load did not produce a transformer."
-                    )
-                })() {
-                    Ok(variant) => {
-                        info!("Flux: single-device CUDA load succeeded");
-                        // ESTIMATE vs REALITY, reported where a normal render will show
-                        // it. The placement reserves FLUX_RUNTIME_RESERVE beyond the
-                        // predicted resident size, but a render was observed leaving only
-                        // 2.7 GB free on the transformer's card and then hitting
-                        // `cuda OOM in kernel out` mid-denoise - so the prediction, not
-                        // the reserve, was short. Nothing here changes placement; it just
-                        // stops the question needing a dedicated experiment to answer,
-                        // because the answer arrives with the next render either way.
-                        {
-                            let after: u64 = crate::inference::place::vram_manager::probe(0)
-                                .into_iter()
-                                .find(|(_, _, d)| {
-                                    crate::tensor::Device::same_device(d, &device)
-                                })
-                                .map(|(_, free, _)| free)
-                                .unwrap_or(0);
-                            let predicted = estimated_gpu_mem;
-                            let actual = raw_free_vram.saturating_sub(after);
-                            info!(
-                                "Flux resident: predicted {:.2} GB, actual {:.2} GB \
-                                 ({:+.2} GB), {:.2} GB left against a {:.2} GB reserve{}",
-                                predicted as f64 / 1e9,
-                                actual as f64 / 1e9,
-                                (actual as f64 - predicted as f64) / 1e9,
-                                after as f64 / 1e9,
-                                runtime_demand as f64 / 1e9,
-                                if after < runtime_demand {
-                                    " - SHORT, the generation can starve"
-                                } else {
-                                    ""
-                                },
-                            );
-                        }
-                        variant
-                    }
-                    Err(e) => {
-                        // Two ways in: the planner declined single-device up front
-                        // because the card has no room to denoise, or a load actually
-                        // failed. Say which - "failed" on a deliberate choice reads as
-                        // a defect, and an unexplained split is exactly the kind of
-                        // silent degradation that hid this whole class of bug.
-                        if single_device_fits {
-                            warn!("Flux: single-device CUDA failed ({e}), splitting across CUDA+CPU+Arc");
-                        } else {
-                            info!("Flux: {e} - splitting across CUDA+CPU+Arc up front");
-                        }
-                        send_progress("Splitting Flux across GPU + CPU + Arc...");
-                        // PLAN OVER EVERY CARD. This used to plan over the chosen card
-                        // alone, because the loader built one CUDA VarBuilder and put
-                        // every GPU-assigned block on it - so planning for two cards
-                        // would have promised capacity it could not honour. The loader
-                        // now uploads each block to the card the plan named, so that
-                        // restriction is gone, and keeping it would be the real defect:
-                        // it spilled blocks to the HOST while a second card sat empty.
-                        let plan_cudas: Vec<(usize, u64)> = cuda_devices.clone();
-                        // Handles for every card the plan may use. Flux runs on a
-                        // non-default stream, so each card is taken through the
-                        // stream-bound handle rather than a plain device.
-                        let dev_map: std::collections::HashMap<usize, Device> = cuda_devices
-                            .iter()
-                            .filter_map(|(idx, _)| {
-                                crate::tensor::cuda_ext::new_device_with_stream(*idx)
-                                    .ok()
-                                    .map(|h| (*idx, h.native_device()))
-                            })
-                            .collect();
-                        // RE-PLAN, don't give up. The plan is computed from free VRAM,
-                        // and between that reading and the upload another engine can
-                        // take the card - the loader then reports "the GPU-assigned
-                        // blocks no longer fit" and the whole render dies. Its own
-                        // comment names the right answer ("re-plan against what is
-                        // actually free") and nobody had written it.
-                        //
-                        // Each attempt RE-PROBES rather than reusing a stale number, and
-                        // hands the GPU a smaller share, so the split walks toward the
-                        // CPU one step at a time instead of jumping there. Putting every
-                        // block on the host is NOT the fallback: a 12 GB transformer on
-                        // the CPU cannot finish inside any request timeout, which is the
-                        // 600 s hang that produced nothing and is why this used to fail
-                        // fast instead.
-                        // The share scales the FREE VRAM we admit to, not the model
-                        // size: `calculate`'s last argument is a dequant expansion and
-                        // sits in the DENOMINATOR, so shrinking it would put MORE blocks
-                        // on the card - the opposite of backing off.
-                        // Start where the CURRENT pressure says, not always at the top:
-                        // a render that already exhausted a card raised the pressure, and
-                        // beginning this walk from the full budget again just repeats the
-                        // placement that failed.
-                        const REPLAN_SHARES: [f64; 4] = [1.0, 0.7, 0.45, 0.25];
-                        let pressure_share =
-                            crate::inference::place::runtime_demand::weight_budget_share();
-                        let mut hetero = None;
-                        let mut last_err = None;
-                        for (attempt, share) in REPLAN_SHARES.iter().enumerate() {
-                            let fresh: Vec<(usize, u64)> = if attempt == 0 {
-                                plan_cudas.clone()
+                                .map_err(|e| anyhow::anyhow!("{e}"))?
                             } else {
-                                crate::inference::place::vram_manager::probe(runtime_demand)
-                                    .into_iter()
-                                    .map(|(idx, free, _)| (idx, free))
-                                    .collect()
+                                crate::inference::cache::qvb::from_gguf_cached(&flux_model_file, &ndev)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?
                             };
-                            let fresh: Vec<(usize, u64)> = fresh
-                                .into_iter()
-                                .map(|(i, free)| (i, (free as f64 * share * pressure_share) as u64))
-                                .collect();
-                            let plan = HeteroPlan::calculate(
-                                total_blocks, estimated_gpu_mem, &fresh, &ocl_devs, 1.0,
-                            );
-                            match HeteroFlux::from_gguf(
-                                &flux_model_file, &flux_cfg, &plan, &dev_map,
-                                #[cfg(feature = "opencl")]
-                                Self::create_flux_ocl_pipelines(&plan),
-                            ) {
-                                Ok(h) => {
-                                    if attempt > 0 {
-                                        info!(
-                                            "HeteroFlux: re-planned at {:.0}% of the card after \
-                                             {attempt} attempt(s); the split now fits",
-                                            share * 100.0
-                                        );
-                                    }
-                                    hetero = Some(h);
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "HeteroFlux: attempt {} at {:.0}% of the card failed \
-                                         ({e}); re-probing and re-planning",
-                                        attempt + 1,
-                                        share * 100.0
-                                    );
-                                    last_err = Some(e);
-                                }
-                            }
+                            let nflux = HeteroFlux::whole(&flux_cfg, nvb)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            return Ok((FluxVariant::Whole(nflux), ndev));
                         }
-                        let hetero = match hetero {
-                            Some(h) => h,
-                            None => {
-                                let e = last_err.unwrap_or_else(|| {
-                                    anyhow!("HeteroFlux: no plan was attempted")
-                                });
-                                error!("HeteroFlux CUDA+CPU+Arc fallback failed: {}", e);
-                                return Err(e);
-                            }
-                        };
-                        FluxVariant::Hetero(hetero)
                     }
-                }
-            } else {
-                // No GPU available
-                send_progress("Building Flux model (CPU + Arc)...");
-                let plan = HeteroPlan::calculate(
-                    total_blocks, estimated_gpu_mem, &[], &ocl_devs, 1.0,
+                    // Several devices, or the host: each block is uploaded to the device the
+                    // plan names, through the card's stream-bound handle.
+                    let cards_used = crate::inference::place::ladder::cards_of(plan);
+                    let mut dev_map: std::collections::HashMap<usize, Device> =
+                        std::collections::HashMap::new();
+                    for idx in &cards_used {
+                        dev_map.insert(*idx, crate::inference::place::ladder::open(DeviceKind::Cuda(*idx))?);
+                    }
+                    let stem = cards_used
+                        .first()
+                        .and_then(|idx| dev_map.get(idx).cloned())
+                        .unwrap_or(Device::Cpu);
+                    let hetero = HeteroFlux::from_gguf(
+                        &flux_model_file,
+                        &flux_cfg,
+                        plan,
+                        &dev_map,
+                        #[cfg(feature = "opencl")]
+                        Self::create_flux_ocl_pipelines(plan),
+                    )?;
+                    Ok((FluxVariant::Hetero(hetero), stem))
+                },
+            )
+            .inspect_err(|e| error!("Flux transformer load failed: {e}"))?;
+            // What the whole placement holds on its card against what the plan charged it,
+            // reported with the next render.
+            if let FluxVariant::Whole(_) = &flux_variant {
+                let before = crate::inference::place::plan::ordinal(&device)
+                    .and_then(|idx| cards.iter().find(|(i, _)| *i == idx))
+                    .map_or(0, |(_, free)| *free);
+                let after = crate::inference::place::ladder::free_on_card(&device).unwrap_or(0);
+                let actual = before.saturating_sub(after);
+                info!(
+                    "Flux resident: predicted {:.2} GB, actual {:.2} GB ({:+.2} GB), {:.2} GB \
+                     left against a {:.2} GB reserve{}",
+                    estimated_gpu_mem as f64 / 1e9,
+                    actual as f64 / 1e9,
+                    (actual as f64 - estimated_gpu_mem as f64) / 1e9,
+                    after as f64 / 1e9,
+                    runtime_demand as f64 / 1e9,
+                    if after < runtime_demand { " - SHORT, the generation can starve" } else { "" },
                 );
-                let hetero = HeteroFlux::from_gguf(
-                    &flux_model_file, &flux_cfg, &plan, &std::collections::HashMap::new(),
-                    #[cfg(feature = "opencl")]
-                    Self::create_flux_ocl_pipelines(&plan),
-                ).map_err(|e| {
-                    error!("HeteroFlux CPU load failed: {}", e);
-                    e
-                })?;
-                FluxVariant::Hetero(hetero)
+            }
+            // The cards the denoiser runs on. The one-shot components below go elsewhere
+            // while another card has room, and share these only while this render's own
+            // need stays free on them.
+            let hot_cards: Vec<usize> = match &flux_variant {
+                FluxVariant::Whole(_) => crate::inference::place::plan::ordinal(&device).into_iter().collect(),
+                FluxVariant::Hetero(h) => crate::inference::place::ladder::cards_of(&h.plan),
             };
             send_progress("Flux transformer loaded");
 
@@ -636,102 +331,45 @@ impl ImageEngine {
                 e
             })?;
             let t5_config: crate::inference::model::t5::encoder::Config = serde_json::from_str(&std::fs::read_to_string(&t5_config_file)?)?;
-            // T5-XXL encode is the single largest per-request cost (~4.7s on CPU
-            // = ~79% of a 6s/image generation), so it wants a GPU - but only one
-            // with room for its weights AND its encode activations. Hardcoding
-            // "the second CUDA device" assumed the transformer always sits on
-            // device 0; once placement became fastest-that-fits, the transformer
-            // could take that same card and T5 loaded into the sliver left over,
-            // then bounced every attention matmul to the host at encode time -
-            // far slower than simply running the whole encoder on the CPU.
-            // The probe here runs AFTER the transformer is resident, so its free
-            // VRAM is the truth, and no card fitting means CPU.
+            // T5-XXL encode is the single largest per-request cost, so it wants a card with
+            // room for its weights AND its encode activations. It is a ONE-SHOT component -
+            // it runs once per prompt and its result is cached - so it goes to a card the
+            // denoiser does not use while one has room, and shares the denoiser's cards only
+            // while this render's own need stays free there. The host otherwise: slower for
+            // one encode, and correct. The cards are read after the transformer is resident,
+            // so what they report is the truth.
             let t5_bytes = t5_encoder_bytes(&t5_config, 2 /* bf16 */) + t5_encode_scratch_bytes(&t5_config);
-            // ANYWHERE BUT THE DENOISER'S CARD, while another card can take it. This
-            // is a ONE-SHOT component - it runs once per prompt and its result is
-            // cached - so it must not compete with the hot DiT, which runs every step.
-            // Probing free VRAM after the transformer is resident is not enough on its
-            // own: that reading counts the DiT's WEIGHTS and not the scratch its
-            // denoise will need, so the encoder could take 9.7 GB of the 11.8 GB left
-            // on the DiT's own card and leave 2 GB for a render needing 9.8. Observed
-            // exactly that, as a 1536x1536 request that OOM'd, re-planned itself onto
-            // the host and then ran past the request timeout.
-            //
-            // Sharing the DiT's card is still allowed when nothing else will have it -
-            // but only if what remains after the encoder still covers the denoise.
-            // Otherwise the host runs it, which is slower for one encode and correct.
-            let t5_pick = crate::inference::place::vram_manager::pick_device_elsewhere(
-                "flux t5 encoder",
-                t5_bytes,
-                &device,
-            )
-            .or_else(|| {
-                crate::inference::place::vram_manager::pick_device_for(
-                    "flux t5 encoder (sharing the denoiser's card)",
-                    t5_bytes + runtime_demand,
-                )
-            });
-            let (mut t5_device, _t5_dtype) = match t5_pick
-                .filter(|(_, free, _)| *free >= t5_bytes)
-                .and_then(|(idx, _, _)| crate::tensor::cuda_ext::new_device_with_stream(idx).ok())
-            {
-                Some(d) => (d.native_device(), DType::BF16),
-                None => (Device::Cpu, cpu_dtype),
-            };
-            send_progress(&format!("Loading T5 encoder ({})...",
-                if t5_device.is_cuda() { "CUDA, BF16" } else { "CPU, F32" }));
-            info!(
-                "Flux T5 encoder device: {:?} (wanted {:.1} GB)",
-                t5_device,
-                t5_bytes as f64 / 1e9
+            let aux_cards = crate::inference::place::ladder::aside(
+                &crate::inference::place::ladder::cards(0),
+                &hot_cards,
+                runtime_demand,
             );
-            // T5 runs on the NATIVE substrate: bf16 on GPU (bf16 required - T5's FF activations
-            // overflow f16), F32 on CPU. Load on the chosen device; on ANY failure (e.g. OOM when
-            // another image model is still resident on GPU1) FALL BACK TO CPU rather than hard-error
-            // - the load must never OOM. The GPU success path is unchanged (only the error path adds
-            // the CPU retry).
-            let mut t5_ndevice = t5_device.clone();
-            let mut t5_ndtype = if t5_device.is_cuda() {
-                crate::tensor::DType::BF16
-            } else {
-                crate::tensor::DType::F32
-            };
-            let t5_model = loop {
-                let attempt = (|| -> anyhow::Result<crate::inference::model::t5::encoder::T5EncoderModel> {
-                    let vb = unsafe {
-                        crate::tensor::VarBuilder::from_files(
-                            &[&t5_model_file], t5_ndtype, &t5_ndevice,
-                        )
-                    }
-                    .map_err(|e| anyhow!("T5 native weights: {e}"))?;
+            send_progress("Loading T5 encoder...");
+            // T5 runs on the NATIVE substrate: bf16 on a card (bf16 required - T5's FF
+            // activations overflow f16), F32 on the host.
+            let (t5_model, t5_device) = crate::inference::place::ladder::load_whole_on(
+                "Flux T5 encoder",
+                t5_bytes,
+                t5_bytes,
+                &aux_cards,
+                cancel.as_ref(),
+                |dev| {
+                    let dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
+                    let vb = unsafe { crate::tensor::VarBuilder::from_files(&[&t5_model_file], dtype, dev) }
+                        .map_err(|e| anyhow!("T5 native weights: {e}"))?;
                     crate::inference::model::t5::encoder::T5EncoderModel::load(vb, &t5_config)
                         .map_err(|e| anyhow!("T5 native load: {e}"))
-                })();
-                match attempt {
-                    Ok(m) => break m,
-                    Err(e) if t5_ndevice.is_cuda() => {
-                        warn!("T5 GPU load failed ({e}); falling back to CPU (never OOM)");
-                        send_progress("T5 GPU tight - loading on CPU...");
-                        t5_device = Device::Cpu;
-                        t5_ndevice = crate::tensor::Device::Cpu;
-                        t5_ndtype = crate::tensor::DType::F32;
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            };
+                },
+            )?;
+            info!("Flux T5 encoder device: {:?} (wanted {:.1} GB)", t5_device, t5_bytes as f64 / 1e9);
             let t5_tokenizer_file = api
                 .model("lmz/mt5-tokenizers".to_string())
                 .get("t5-v1_1-xxl.tokenizer.json")?;
             let t5_tokenizer = Tokenizer::from_file(t5_tokenizer_file)
                 .map_err(|e| anyhow!("T5 tokenizer: {e}"))?;
-            // Say where it ACTUALLY landed. This was the literal string
-            // "T5 encoder loaded (CPU)" regardless of device, so a T5 sitting on a GPU
-            // reported itself on the CPU - which sent me chasing a CPU-fallback theory
-            // for a black-image bug, on evidence the log had invented.
             send_progress(&format!(
                 "T5 encoder loaded ({})",
-                if t5_ndevice.is_cuda() { "GPU" } else { "CPU" }
+                if t5_device.is_cuda() { "GPU" } else { "CPU" }
             ));
 
             // 2. CLIP text encoder (always from HF Hub, cached locally)
@@ -742,32 +380,30 @@ impl ImageEngine {
                 e
             })?;
             send_progress("Loading CLIP encoder...");
-            // CLIP runs on the NATIVE substrate (CPU F32 - ~120M params,
-            // one forward per image-gen; host compute matches the reference
-            // numerics exactly and frees the GPU dtype/device concerns).
-            let clip_vb = unsafe {
-                crate::tensor::VarBuilder::from_files(
-                    &[clip_model_file],
-                    crate::tensor::DType::F32,
-                    &crate::tensor::Device::Cpu,
-                )
-            }
-            .map_err(|e| anyhow!("CLIP native weights: {e}"))?;
-            let clip_config = crate::inference::model::clip::text::Config {
-                vocab_size: 49408,
-                projection_dim: 768,
-                activation: crate::tensor::ops::Activation::QuickGelu,
-                intermediate_size: 3072,
-                embed_dim: 768,
-                max_position_embeddings: 77,
-                pad_with: None,
-                num_hidden_layers: 12,
-                num_attention_heads: 12,
-            };
-            let clip_model = crate::inference::model::clip::text::Transformer::new(clip_vb.pp("text_model"), &clip_config).map_err(|e| {
-                error!("Failed to load CLIP model: {}", e);
-                anyhow!("CLIP native load: {e}")
-            })?;
+            // CLIP runs in F32 wherever it lands, a one-shot component placed like T5. The
+            // file also holds the vision tower, so its size bounds the text tower's.
+            let clip_config = crate::inference::model::clip::text::Config::vit_l_14();
+            let clip_bytes = std::fs::metadata(&clip_model_file).map_or(0, |m| m.len());
+            let aux_cards = crate::inference::place::ladder::aside(
+                &crate::inference::place::ladder::cards(0),
+                &hot_cards,
+                runtime_demand,
+            );
+            let (clip_model, clip_device) = crate::inference::place::ladder::load_whole_on(
+                "Flux CLIP encoder",
+                clip_bytes,
+                clip_bytes,
+                &aux_cards,
+                cancel.as_ref(),
+                |dev| {
+                    let vb = unsafe {
+                        crate::tensor::VarBuilder::from_files(&[&clip_model_file], DType::F32, dev)
+                    }
+                    .map_err(|e| anyhow!("CLIP native weights: {e}"))?;
+                    crate::inference::model::clip::text::Transformer::new(vb.pp("text_model"), &clip_config)
+                        .map_err(|e| anyhow!("CLIP native load: {e}"))
+                },
+            )?;
             let clip_tokenizer_file = clip_repo.get("tokenizer.json")?;
             let clip_tokenizer = Tokenizer::from_file(clip_tokenizer_file)
                 .map_err(|e| anyhow!("CLIP tokenizer: {e}"))?;
@@ -777,7 +413,7 @@ impl ImageEngine {
             // Initialize layer performance tracker for image model
             match &flux_variant {
                 FluxVariant::Whole(_) => {
-                    let total = 57;
+                    let total = total_blocks;
                     let gpu_layers = if device.is_cuda() { total } else { 0 };
                     crate::inference::place::layer_perf::global_tracker().initialize_model("flux-schnell", total, gpu_layers);
                 }
@@ -857,34 +493,38 @@ impl ImageEngine {
                     })?
                 }
             };
-            // VAE on the NATIVE substrate, F32 end-to-end (GPU convs via
-            // im2col + cuBLAS sgemm; GroupNorm/upsample as dedicated kernels).
-            // Prefer the SECOND CUDA device (where T5 lives, idle by VAE-decode
-            // time) so the VAE upsampling activations don't compete with the
-            // Flux transformer that fills GPU0 during denoise (was an OOM).
-            let vae_device = if t5_device.is_cuda() {
-                send_progress("Loading VAE (GPU1)...");
-                t5_device.clone()
-            } else if device.is_cuda() {
-                send_progress("Loading VAE (GPU)...");
-                device.clone()
-            } else {
-                send_progress("Loading VAE (CPU)...");
-                Device::Cpu
-            };
-            let n_vae_device = &vae_device.clone();
-            let ae_vb = unsafe {
-                crate::tensor::VarBuilder::from_files(
-                    std::slice::from_ref(&ae_model_file),
-                    crate::tensor::DType::F32,
-                    n_vae_device,
-                )?
-            };
+            // VAE on the NATIVE substrate, F32 end-to-end (GPU convs via im2col + cuBLAS
+            // sgemm; GroupNorm/upsample as dedicated kernels). A one-shot component placed
+            // like the encoders, so its decode does not compete with the transformer's
+            // denoise: on the first card with room for a whole decode at this geometry,
+            // else for the smallest tile, else on the host.
+            send_progress("Loading VAE...");
+            let (vae_need, vae_want) = vae_placement_bytes(&ae_model_file, geom.width, geom.height);
+            let aux_cards = crate::inference::place::ladder::aside(
+                &crate::inference::place::ladder::cards(0),
+                &hot_cards,
+                runtime_demand,
+            );
             let ae_cfg = crate::inference::model::flux::vae::Config::schnell();
-            let ae = crate::inference::model::flux::vae::AutoEncoder::new(&ae_cfg, ae_vb).map_err(|e| {
-                error!("Failed to load VAE: {}", e);
-                e
-            })?;
+            let (ae, vae_device) = crate::inference::place::ladder::load_whole_on(
+                "Flux VAE",
+                vae_need,
+                vae_want,
+                &aux_cards,
+                cancel.as_ref(),
+                |dev| {
+                    let vb = unsafe {
+                        crate::tensor::VarBuilder::from_files(
+                            std::slice::from_ref(&ae_model_file),
+                            DType::F32,
+                            dev,
+                        )
+                    }
+                    .map_err(|e| anyhow!("VAE weights: {e}"))?;
+                    crate::inference::model::flux::vae::AutoEncoder::new(&ae_cfg, vb)
+                        .map_err(|e| anyhow!("VAE load: {e}"))
+                },
+            )?;
             send_progress(&format!("VAE loaded ({})", if vae_device.is_cuda() { "GPU F32" } else { "CPU" }));
             // CPU VAE fallback for large images (>=768^2): the GPU VAE decode peaks
             // at several GB of conv workspace + feature maps, which doesn't fit
@@ -924,6 +564,7 @@ impl ImageEngine {
                     t5_device,
                     t5_tokenizer,
                     clip_model,
+                    clip_device,
                     clip_tokenizer,
                     ae,
                     vae_device,
