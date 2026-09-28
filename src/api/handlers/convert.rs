@@ -42,8 +42,14 @@ pub(crate) struct CalibrateRequest {
 pub(crate) struct ConvertRequest {
     /// The released checkpoint, by its Hugging Face id.
     pub model: String,
-    /// The record `/api/calibrate` wrote, by name.
-    pub calibration: String,
+    /// The record `/api/calibrate` wrote, by name. Not needed to complete a file.
+    #[serde(default)]
+    pub calibration: Option<String>,
+    /// An existing conversion, `name:tag`, to complete instead of converting again: its tensors
+    /// and keys are carried byte for byte, the draft the checkpoint holds is added, and the file
+    /// is laid out for the reads a token makes.
+    #[serde(default)]
+    pub complete: Option<String>,
     /// The model to create, `name:tag`.
     pub name: String,
     pub gate_up: Option<String>,
@@ -211,21 +217,112 @@ pub(crate) async fn calibrate_model(
     }))
 }
 
+/// A file named by the store's own naming for work in progress, beside its blobs.
+fn work_file(blobs: &std::path::Path, what: &str) -> PathBuf {
+    blobs.join(format!(
+        ".{what}-{}-{}.gguf",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ))
+}
+
+/// Complete the existing conversion `existing` into `request.name`: carried byte for byte, the
+/// checkpoint's draft added, laid out for the device the existing file is on, and checked against
+/// it before it is named.
+async fn complete_model(
+    state: APIServer,
+    request: ConvertRequest,
+    dir: PathBuf,
+    existing: String,
+) -> Result<Response, ApiError> {
+    validate_model_id(&existing)?;
+    let (model, tag) = existing.split_once(':').unwrap_or((&existing, "latest"));
+    let source = state
+        .model_manager
+        .ollama()
+        .weights_blob(model, tag)
+        .ok_or_else(|| ApiError::NotFound(format!("no model {existing} in the store")))?;
+    let format = match request.always_read.as_deref() {
+        None => None,
+        Some(n) => Some(
+            parse_dtype(n).ok_or_else(|| ApiError::Validation(format!("unknown format {n}")))?,
+        ),
+    };
+    let manager = state.model_manager.clone();
+    let blobs = manager.ollama().blobs_dir();
+    std::fs::create_dir_all(&blobs).map_err(|e| ApiError::Internal(format!("blobs dir: {e}")))?;
+    let work = work_file(&blobs, "complete");
+    let first = format!("completing {existing} into '{}'", request.name);
+    let name = request.name.clone();
+    Ok(detached(request.stream, first, move |progress| {
+        use crate::inference::model::deepseek_v41::complete;
+        let run = || -> std::result::Result<(), String> {
+            let ckpt = SafeTensorsSource::open(&dir).map_err(|e| e.to_string())?;
+            let src = crate::tensor::quantized::gguf_file::open_mapped_unadvised(&source)
+                .map_err(|e| e.to_string())?;
+            let layout = complete::Layout::for_paths(&[source.as_path()]);
+            tracing::info!(
+                "completing {}: tensors on {} bytes, expert units on {}",
+                source.display(),
+                layout.alignment,
+                layout.unit
+            );
+            let digest = complete::complete(
+                &src,
+                Some((&ckpt, dir.as_path())),
+                &work,
+                layout,
+                format,
+                &|done, total, _name| progress(done, total, "writing tensors"),
+            )
+            .map_err(|e| e.to_string())?;
+            drop(src);
+            let check = complete::verify_carried(&source, &work, &|done, total, _name| {
+                progress(done, total, "checking carried tensors")
+            })
+            .map_err(|e| e.to_string())?;
+            tracing::info!(
+                "completed {}: {} keys and {} tensors carried ({} stacks as units), {} bytes \
+                 equal, sha256 {digest}",
+                source.display(),
+                check.keys,
+                check.whole + check.split,
+                check.split,
+                check.bytes
+            );
+            progress(0, 0, "writing manifest");
+            ollama::store_gguf_with_digest(manager.ollama(), &work, &digest, &name, [None; 4])
+        };
+        let outcome = run();
+        if outcome.is_err() {
+            let _ = std::fs::remove_file(&work);
+            let _ = std::fs::remove_file(work.with_extension("gguf.partial"));
+        }
+        outcome.map(|()| "success".to_string())
+    }))
+}
+
 pub(crate) async fn convert_model(
     State(state): State<APIServer>,
     Json(request): Json<ConvertRequest>,
 ) -> Result<Response, ApiError> {
     let dir = checkpoint(&state, &request.model).await?;
     validate_model_id(&request.name)?;
-    validate_model_id(&request.calibration)?;
-    let record = calibrations_dir(&state).join(format!(
-        "{}.gguf",
-        request.calibration.replace([':', '/'], "_")
-    ));
+    if let Some(existing) = request.complete.clone() {
+        return complete_model(state, request, dir, existing).await;
+    }
+    let calibration = request.calibration.clone().ok_or_else(|| {
+        ApiError::Validation("convert: a calibration record is needed to convert".into())
+    })?;
+    validate_model_id(&calibration)?;
+    let record =
+        calibrations_dir(&state).join(format!("{}.gguf", calibration.replace([':', '/'], "_")));
     if !record.is_file() {
         return Err(ApiError::NotFound(format!(
-            "no calibration '{}'",
-            request.calibration
+            "no calibration '{calibration}'"
         )));
     }
     let format = |name: Option<&str>, default: GgmlDType| -> Result<GgmlDType, ApiError> {
@@ -255,14 +352,7 @@ pub(crate) async fn convert_model(
     let manager = state.model_manager.clone();
     let blobs = manager.ollama().blobs_dir();
     std::fs::create_dir_all(&blobs).map_err(|e| ApiError::Internal(format!("blobs dir: {e}")))?;
-    let work = blobs.join(format!(
-        ".convert-{}-{}.gguf",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let work = work_file(&blobs, "convert");
     let first = format!("converting {} into '{}'", request.model, request.name);
     let name = request.name.clone();
     Ok(detached(request.stream, first, move |progress| {
@@ -313,5 +403,11 @@ mod tests {
         )
         .unwrap();
         assert!(!v.stream && v.gate_up.is_none() && v.layers.is_none());
+        assert!(v.complete.is_none());
+        let c: ConvertRequest = serde_json::from_str(
+            r#"{"model":"deepseek-ai/DeepSeek-V4.1-Flash","complete":"dsv41:iq2","name":"dsv41:iq2-dspark"}"#,
+        )
+        .unwrap();
+        assert!(c.calibration.is_none() && c.complete.as_deref() == Some("dsv41:iq2"));
     }
 }

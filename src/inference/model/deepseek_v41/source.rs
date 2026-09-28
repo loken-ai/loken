@@ -10,7 +10,7 @@
 use super::engram::EngramTable;
 use super::load::load_f32;
 use crate::inference::offload::projection::Projection;
-use crate::inference::offload::store::{ExpertLoader, QuantExpertLoader};
+use crate::inference::offload::store::{ExpertLoader, QuantExpertLoader, UnitExpertLoader};
 use crate::tensor::mapped::MappedBytes;
 use crate::tensor::quantized::gguf_source::GgufSource;
 use crate::tensor::quantized::GgmlDType;
@@ -26,6 +26,9 @@ pub trait WeightSource {
     fn projection(&self, name: &str) -> Result<Option<Projection>>;
     /// The routed experts of `layer`, `n` of them, read on demand.
     fn experts(&self, layer: usize, n: usize) -> Result<Box<dyn ExpertLoader>>;
+    /// The routed experts named `{prefix}.{e}.{w}.weight`, the released checkpoint's own names,
+    /// `n` of them, read on demand: a DSpark stage's experts.
+    fn experts_under(&self, prefix: &str, n: usize) -> Result<Box<dyn ExpertLoader>>;
     /// The engram table `name`, rows read on demand when the storage allows it.
     fn engram_table(&self, name: &str) -> Result<EngramTable>;
 }
@@ -102,6 +105,19 @@ fn gguf_expert_stack(w: &str) -> Option<&'static str> {
     })
 }
 
+/// The GGUF stacks of a layer's routed experts, in the order an expert unit stores them:
+/// gate, up, down, with the reference projection each holds.
+pub const EXPERT_STACKS: [(&str, &str); 3] = [
+    ("ffn_gate_exps", "w1"),
+    ("ffn_up_exps", "w3"),
+    ("ffn_down_exps", "w2"),
+];
+
+/// One expert of stack `stack` in layer `layer`, stored as a tensor of its own.
+pub fn expert_unit_name(layer: usize, stack: &str, expert: usize) -> String {
+    format!("blk.{layer}.{stack}.{expert}")
+}
+
 /// `layers.{l}.{rest}` taken apart.
 fn layer_of(name: &str) -> Option<(usize, &str)> {
     let rest = name.strip_prefix("layers.")?;
@@ -168,10 +184,15 @@ pub fn gguf_names(name: &str) -> Vec<String> {
     let Some((l, rest)) = layer_of(name) else {
         return vec![name.to_string()];
     };
-    if let Some((_, w)) = expert_of(rest) {
-        // The stack; the expert inside it is addressed separately.
+    if let Some((e, w)) = expert_of(rest) {
+        // The stack, in which the expert is addressed separately; then the expert's own tensor,
+        // for a file that stores each expert as a unit.
         return match gguf_expert_stack(w) {
-            Some(s) => vec![format!("blk.{l}.{s}"), format!("blk.{l}.{s}.weight")],
+            Some(s) => vec![
+                format!("blk.{l}.{s}"),
+                format!("blk.{l}.{s}.weight"),
+                expert_unit_name(l, s, e),
+            ],
             None => vec![],
         };
     }
@@ -183,6 +204,59 @@ pub fn gguf_names(name: &str) -> Vec<String> {
         ],
         None => vec![name.to_string()],
     }
+}
+
+/// Whether `present`, the tensor found for an expert's reference name, is the layer's stack
+/// rather than the expert's own tensor.
+fn is_stack<G: GgufSource>(g: &G, present: &str) -> bool {
+    g.info(present).is_some_and(|i| i.shape.dims().len() == 3)
+}
+
+/// A loader over experts stored as units: `name(e, w)` names expert `e`'s projection `w`
+/// (`w1`, `w3` or `w2`), each a tensor of its own. The views are read in place when their dtype
+/// has a view path; otherwise each expert is dequantised whole.
+fn unit_loader<G: GgufSource>(
+    g: &G,
+    n: usize,
+    name: &dyn Fn(usize, &str) -> String,
+) -> Result<Box<dyn ExpertLoader>> {
+    let mut views = Vec::with_capacity(n);
+    for e in 0..n {
+        let mut unit = Vec::with_capacity(3);
+        for w in ["w1", "w3", "w2"] {
+            let tensor = name(e, w);
+            if g.info(&tensor).is_none() {
+                return Err(Error::msg(format!("gguf: no expert tensor {tensor}")));
+            }
+            match g.mmap_view(&tensor)? {
+                Some(v) => unit.push(Arc::new(v)),
+                None => break,
+            }
+        }
+        let Ok(unit) = <[Arc<crate::tensor::quantized::QTensor>; 3]>::try_from(unit) else {
+            // No view path for this dtype: every expert dequantised once.
+            let experts = (0..n)
+                .map(|e| {
+                    Ok(Arc::new(crate::inference::offload::experts::Expert::dense(
+                        load_f32(g, &name(e, "w1"))?,
+                        load_f32(g, &name(e, "w2"))?,
+                        load_f32(g, &name(e, "w3"))?,
+                    )))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Box::new(
+                crate::inference::offload::store::VecExpertLoader::new(experts),
+            ));
+        };
+        views.push(unit);
+    }
+    // The file and the address its mapping starts at, so a released expert's pages can be
+    // dropped from the page cache by file range, not only from this mapping.
+    let first = name(0, "w1");
+    let anchor = g
+        .mapped_range(&first)?
+        .and_then(|(map, _, _)| Some((g.mapped_file(&first)?, map.as_ptr() as usize)));
+    Ok(Box::new(UnitExpertLoader::new(views, anchor)))
 }
 
 impl<G: GgufSource> WeightSource for G {
@@ -204,11 +278,11 @@ impl<G: GgufSource> WeightSource for G {
             .find(|n| self.info(n).is_some())
             .ok_or_else(|| Error::msg(format!("gguf: no tensor for {name}")))?;
         match layer_of(name).and_then(|(_, rest)| expert_of(rest)) {
-            Some((e, _)) => load_f32(self, &present)?
+            Some((e, _)) if is_stack(self, &present) => load_f32(self, &present)?
                 .narrow(0, e, 1)?
                 .squeeze(0)?
                 .contiguous(),
-            None => load_f32(self, &present),
+            _ => load_f32(self, &present),
         }
     }
 
@@ -223,10 +297,10 @@ impl<G: GgufSource> WeightSource for G {
             return Ok(None);
         };
         match layer_of(name).and_then(|(_, rest)| expert_of(rest)) {
-            Some((e, _)) => Ok(Some(Projection::Quant(Arc::new(
+            Some((e, _)) if is_stack(self, &present) => Ok(Some(Projection::Quant(Arc::new(
                 crate::tensor::quant_view::expert_view(&Arc::new(view), e)?,
             )))),
-            None => Ok(Some(Projection::Quant(Arc::new(view)))),
+            _ => Ok(Some(Projection::Quant(Arc::new(view)))),
         }
     }
 
@@ -241,6 +315,17 @@ impl<G: GgufSource> WeightSource for G {
             Ok((present, view))
         };
         let (gname, gate) = stack("w1")?;
+        if !is_stack(self, &gname) {
+            // Each expert stored as a unit of its own three tensors.
+            return unit_loader(self, n, &|e, w| {
+                let s = EXPERT_STACKS
+                    .iter()
+                    .find(|(_, r)| *r == w)
+                    .map(|(s, _)| *s)
+                    .unwrap_or_default();
+                expert_unit_name(layer, s, e)
+            });
+        }
         let (uname, up) = stack("w3")?;
         let (dname, down) = stack("w2")?;
         if let (Some(gate), Some(up), Some(down)) = (gate, up, down) {
@@ -265,6 +350,10 @@ impl<G: GgufSource> WeightSource for G {
                 n,
             ),
         ))
+    }
+
+    fn experts_under(&self, prefix: &str, n: usize) -> Result<Box<dyn ExpertLoader>> {
+        unit_loader(self, n, &|e, w| format!("{prefix}.{e}.{w}.weight"))
     }
 
     fn engram_table(&self, name: &str) -> Result<EngramTable> {
@@ -362,7 +451,11 @@ mod tests {
         );
         assert_eq!(
             gguf_names("layers.3.ffn.experts.17.w2.weight"),
-            vec!["blk.3.ffn_down_exps", "blk.3.ffn_down_exps.weight"]
+            vec![
+                "blk.3.ffn_down_exps",
+                "blk.3.ffn_down_exps.weight",
+                "blk.3.ffn_down_exps.17"
+            ]
         );
         assert_eq!(gguf_names("layers.3.attn.attn_sink")[2], "blk.3.attn_sink");
         assert!(gguf_names("layers.3.ffn.experts.17.w9.weight").is_empty());

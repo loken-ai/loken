@@ -898,10 +898,22 @@ struct PipelineHead {
 }
 
 impl DeepseekV41Backend {
+    /// The backend with the draft the hub checkpoint holds, when it is on the machine.
     pub(crate) fn new(
         model: crate::inference::model::deepseek_v41::model::DeepseekV41Model,
         widest_ffn: usize,
         context_length: usize,
+    ) -> Self {
+        let dspark = crate::inference::model::deepseek_v41::dspark::Dspark::open();
+        Self::with_draft(model, widest_ffn, context_length, dspark)
+    }
+
+    /// The backend with `dspark` as its draft, `None` for none.
+    pub(crate) fn with_draft(
+        model: crate::inference::model::deepseek_v41::model::DeepseekV41Model,
+        widest_ffn: usize,
+        context_length: usize,
+        dspark: Option<crate::inference::model::deepseek_v41::dspark::Dspark>,
     ) -> Self {
         use crate::inference::offload::streamed::Streamed;
         // Decode needs only a small transient (windowed attention bounds KV growth); the
@@ -912,16 +924,9 @@ impl DeepseekV41Backend {
         // The engine opens the card placement through the generic streamed-model seam: the model
         // states its resident footprint, routing and experts, and no architecture is named here.
         let streamed = Streamed::open_for(&model, context_length.min(PREFILL_TRANSIENT_TOKENS));
-        let dspark = crate::inference::model::deepseek_v41::dspark::Dspark::open();
         let mut state = state;
         let dspark_state = match &dspark {
             Some(d) => {
-                tracing::info!(
-                    "DSpark draft loaded: {} stages, block_size {}, {} experts/stage",
-                    d.stages.len(),
-                    d.cfg.block_size,
-                    d.cfg.n_routed
-                );
                 state.capture_layers = d.cfg.target_layers.clone();
                 Some(
                     crate::inference::model::deepseek_v41::dspark::DsparkState::new(
@@ -931,10 +936,7 @@ impl DeepseekV41Backend {
                     ),
                 )
             }
-            None => {
-                tracing::info!("DSpark draft not available (checkpoint not in hub cache)");
-                None
-            }
+            None => None,
         };
         Self {
             model,

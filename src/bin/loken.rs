@@ -126,8 +126,12 @@ enum Commands {
         /// The released checkpoint, by its Hugging Face id
         model: String,
         /// The calibration record, by the name `calibrate` gave it
-        #[arg(short, long)]
-        calibration: String,
+        #[arg(short, long, required_unless_present = "complete")]
+        calibration: Option<String>,
+        /// Complete this existing conversion, name:tag, instead of converting again: carry its
+        /// tensors and keys byte for byte, add the checkpoint's draft, lay it out for reading
+        #[arg(long)]
+        complete: Option<String>,
         /// The model to create, name:tag
         #[arg(short, long)]
         name: String,
@@ -361,6 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Convert {
             model,
             calibration,
+            complete,
             name,
             gate_up,
             down,
@@ -370,7 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             layers,
         } => {
             let body = serde_json::json!({
-                "model": model, "calibration": calibration, "name": name,
+                "model": model, "calibration": calibration, "complete": complete, "name": name,
                 "gate_up": gate_up, "down": down, "always_read": always_read, "min_rows": min_rows,
                 "damping": damping, "layers": layers,
             });

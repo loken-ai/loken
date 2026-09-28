@@ -174,6 +174,69 @@ pub struct PlannedEntry {
     pub byte_len: u64,
 }
 
+/// Where a streaming write puts each tensor. Every tensor starts at a multiple of `alignment`,
+/// the value the file declares under `general.alignment`; `starts[i]`, when larger, is the
+/// multiple of the file's own offset tensor `i` starts at, so a group of tensors read together
+/// can begin on a boundary the device reads in one request.
+pub struct Placement {
+    pub alignment: u64,
+    /// Per planned tensor, a multiple of `alignment`; empty for `alignment` everywhere.
+    pub starts: Vec<u64>,
+}
+
+impl Placement {
+    /// Every tensor at the next multiple of the default alignment: the layout `create` writes.
+    pub fn packed() -> Self {
+        Self {
+            alignment: DEFAULT_ALIGNMENT,
+            starts: Vec::new(),
+        }
+    }
+}
+
+/// The metadata value's bytes as a file carries them: the type tag, then the payload. Two values
+/// are the same value when these bytes are equal.
+pub fn encode_value(v: &Value) -> Vec<u8> {
+    let mut out = value_tag(v).to_le_bytes().to_vec();
+    write_value_payload(&mut out, v);
+    out
+}
+
+/// The header for `metadata` and `entries` with each tensor's data offset, given the absolute
+/// file position each tensor starts at and where the data section starts.
+fn stream_header(
+    metadata: &[(String, Value)],
+    entries: &[PlannedEntry],
+    starts: &[u64],
+    data_start: u64,
+) -> Vec<u8> {
+    let mut header: Vec<u8> = Vec::with_capacity(64 * entries.len());
+    layout::write_scalars(
+        &mut header,
+        &FILE_HEADER,
+        &[
+            u64::from(MAGIC),
+            u64::from(WRITE_VERSION.to_u32()),
+            entries.len() as u64,
+            metadata.len() as u64,
+        ],
+    );
+    for (key, value) in metadata {
+        layout::write_string(&mut header, key);
+        header.extend_from_slice(&encode_value(value));
+    }
+    for (e, &start) in entries.iter().zip(starts) {
+        TensorDescriptor {
+            name: &e.name,
+            dims: &e.dims,
+            dtype: e.dtype,
+            offset: start - data_start,
+        }
+        .encode(&mut header);
+    }
+    header
+}
+
 /// A GGUF written tensor by tensor: the header - metadata and every descriptor, whose byte
 /// lengths are known ahead - goes out first, then each tensor's bytes are appended in the
 /// planned order. For a file too large to hold in memory, such as a requantised expert set.
@@ -185,7 +248,11 @@ pub struct GgufStreamWriter {
     w: std::io::BufWriter<std::fs::File>,
     digest: sha2::Sha256,
     planned: Vec<u64>,
+    /// The absolute file position each planned tensor starts at.
+    starts: Vec<u64>,
+    alignment: u64,
     next: usize,
+    /// The absolute file position written up to.
     pos: u64,
 }
 
@@ -195,44 +262,89 @@ impl GgufStreamWriter {
         metadata: &[(String, Value)],
         entries: &[PlannedEntry],
     ) -> Result<Self> {
+        Self::create_placed(path, metadata, entries, &Placement::packed())
+    }
+
+    /// `create` with each tensor where `placement` puts it. An alignment other than the default
+    /// is declared in the metadata under `general.alignment`, added when the caller has not.
+    pub fn create_placed(
+        path: &Path,
+        metadata: &[(String, Value)],
+        entries: &[PlannedEntry],
+        placement: &Placement,
+    ) -> Result<Self> {
         let io_err = |e: std::io::Error| Error(format!("gguf write {}: {e}", path.display()));
-        let mut header: Vec<u8> = Vec::with_capacity(64 * entries.len());
-        layout::write_scalars(
-            &mut header,
-            &FILE_HEADER,
-            &[
-                u64::from(MAGIC),
-                u64::from(WRITE_VERSION.to_u32()),
-                entries.len() as u64,
-                metadata.len() as u64,
-            ],
-        );
-        for (key, value) in metadata {
-            layout::write_string(&mut header, key);
-            header.extend_from_slice(&value_tag(value).to_le_bytes());
-            write_value_payload(&mut header, value);
+        let alignment = placement.alignment;
+        if alignment == 0 || alignment % DEFAULT_ALIGNMENT != 0 {
+            return Err(Error(format!(
+                "gguf write {}: alignment {alignment} is not a multiple of {DEFAULT_ALIGNMENT}",
+                path.display()
+            )));
         }
-        let mut offset = 0u64;
-        for e in entries {
-            TensorDescriptor {
-                name: &e.name,
-                dims: &e.dims,
-                dtype: e.dtype,
-                offset,
+        if !placement.starts.is_empty() && placement.starts.len() != entries.len() {
+            return Err(Error(format!(
+                "gguf write {}: {} starts for {} tensors",
+                path.display(),
+                placement.starts.len(),
+                entries.len()
+            )));
+        }
+        let mut metadata = metadata.to_vec();
+        match metadata
+            .iter()
+            .find(|(k, _)| k == layout::ALIGNMENT_KEY)
+            .map(|(_, v)| v.to_u64())
+        {
+            Some(Ok(declared)) if declared == alignment => {}
+            Some(_) => {
+                return Err(Error(format!(
+                    "gguf write {}: the metadata declares an alignment other than {alignment}",
+                    path.display()
+                )))
             }
-            .encode(&mut header);
-            offset = layout::align_up(offset + e.byte_len, DEFAULT_ALIGNMENT);
+            None if alignment != DEFAULT_ALIGNMENT => metadata.push((
+                layout::ALIGNMENT_KEY.to_string(),
+                Value::U32(alignment as u32),
+            )),
+            None => {}
         }
+        // Offsets are fixed-width, so the header's length does not depend on them: measured with
+        // placeholders, then written with the real ones.
+        let zeros = vec![0u64; entries.len()];
+        let header_len = stream_header(&metadata, entries, &zeros, 0).len() as u64;
+        let data_start = layout::align_up(header_len, alignment);
+        let mut starts = Vec::with_capacity(entries.len());
+        let mut end = data_start;
+        for (i, e) in entries.iter().enumerate() {
+            let a = placement
+                .starts
+                .get(i)
+                .copied()
+                .unwrap_or(alignment)
+                .max(alignment);
+            if a % alignment != 0 {
+                return Err(Error(format!(
+                    "gguf write {}: tensor {} starts on {a}, not a multiple of {alignment}",
+                    path.display(),
+                    e.name
+                )));
+            }
+            let start = layout::align_up(end, a);
+            starts.push(start);
+            end = start + e.byte_len;
+        }
+        let mut header = stream_header(&metadata, entries, &starts, data_start);
+        header.resize(data_start as usize, 0);
         let tmp = path.with_extension("gguf.partial");
         let f = std::fs::File::create(&tmp).map_err(io_err)?;
-        let data_start = layout::align_up(header.len() as u64, DEFAULT_ALIGNMENT);
-        header.resize(data_start as usize, 0);
         let mut writer = Self {
             path: path.to_path_buf(),
             tmp,
             w: std::io::BufWriter::with_capacity(8 << 20, f),
             digest: sha2::Digest::new(),
             planned: entries.iter().map(|e| e.byte_len).collect(),
+            starts,
+            alignment,
             next: 0,
             pos: 0,
         };
@@ -243,29 +355,39 @@ impl GgufStreamWriter {
     /// Bytes out to the file and into the digest.
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
         sha2::Digest::update(&mut self.digest, bytes);
+        self.pos += bytes.len() as u64;
         self.w
             .write_all(bytes)
             .map_err(|e| Error(format!("gguf write {}: {e}", self.path.display())))
     }
 
-    /// Zeros up to the next alignment boundary after a tensor of `len` bytes.
-    fn pad(&mut self, len: u64) -> Result<()> {
-        self.pos += len;
-        let padded = layout::align_up(self.pos, DEFAULT_ALIGNMENT);
-        self.put(&vec![0u8; (padded - self.pos) as usize])?;
-        self.pos = padded;
-        self.next += 1;
+    /// Zeros up to `to`, an absolute file position at or after the current one.
+    fn pad_to(&mut self, to: u64) -> Result<()> {
+        let zeros = [0u8; 4096];
+        let mut left = (to - self.pos) as usize;
+        while left > 0 {
+            let n = left.min(zeros.len());
+            self.put(&zeros[..n])?;
+            left -= n;
+        }
         Ok(())
     }
 
-    /// The next planned tensor's bytes, which must be exactly its planned length.
-    pub fn append(&mut self, data: &[u8]) -> Result<()> {
+    /// The next planned tensor's length, with the file padded up to where it starts.
+    fn begin(&mut self) -> Result<u64> {
         let Some(&want) = self.planned.get(self.next) else {
             return Err(Error(format!(
                 "gguf write {}: more tensors than planned",
                 self.path.display()
             )));
         };
+        self.pad_to(self.starts[self.next])?;
+        Ok(want)
+    }
+
+    /// The next planned tensor's bytes, which must be exactly its planned length.
+    pub fn append(&mut self, data: &[u8]) -> Result<()> {
+        let want = self.begin()?;
         if data.len() as u64 != want {
             return Err(Error(format!(
                 "gguf write {}: tensor {} has {} bytes, {want} planned",
@@ -275,7 +397,8 @@ impl GgufStreamWriter {
             )));
         }
         self.put(data)?;
-        self.pad(want)
+        self.next += 1;
+        Ok(())
     }
 
     /// The next planned tensor's bytes, in as many pieces as the caller produces them: a stack too
@@ -285,12 +408,7 @@ impl GgufStreamWriter {
     where
         I: IntoIterator<Item = Result<Vec<u8>>>,
     {
-        let Some(&want) = self.planned.get(self.next) else {
-            return Err(Error(format!(
-                "gguf write {}: more tensors than planned",
-                self.path.display()
-            )));
-        };
+        let want = self.begin()?;
         let mut wrote = 0u64;
         for part in parts {
             let part = part?;
@@ -311,7 +429,30 @@ impl GgufStreamWriter {
                 self.next
             )));
         }
-        self.pad(want)
+        self.next += 1;
+        Ok(())
+    }
+
+    /// Push what is written so far to the disk and drop it from the page cache: a file larger
+    /// than memory then does not evict everything else on its way out.
+    pub fn release_written(&mut self) -> Result<()> {
+        let io_err = |e: std::io::Error| Error(format!("gguf write {}: {e}", self.path.display()));
+        self.w.flush().map_err(io_err)?;
+        self.w.get_ref().sync_data().map_err(io_err)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // Safety: a valid descriptor; advice only.
+            unsafe {
+                libc::posix_fadvise(
+                    self.w.get_ref().as_raw_fd(),
+                    0,
+                    0,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Every planned tensor written: flush and move the file into place.
@@ -321,7 +462,8 @@ impl GgufStreamWriter {
 
     /// `finish`, returning the SHA-256 of the file written, as lowercase hex.
     pub fn finish_with_digest(mut self) -> Result<String> {
-        let io_err = |e: std::io::Error| Error(format!("gguf write {}: {e}", self.path.display()));
+        let path = self.path.clone();
+        let io_err = |e: std::io::Error| Error(format!("gguf write {}: {e}", path.display()));
         if self.next != self.planned.len() {
             let _ = std::fs::remove_file(&self.tmp);
             return Err(Error(format!(
@@ -331,6 +473,9 @@ impl GgufStreamWriter {
                 self.planned.len()
             )));
         }
+        // The file ends on its alignment, as every tensor does.
+        let end = layout::align_up(self.pos, self.alignment);
+        self.pad_to(end)?;
         self.w.flush().map_err(io_err)?;
         std::fs::rename(&self.tmp, &self.path).map_err(io_err)?;
         let digest = sha2::Digest::finalize(std::mem::take(&mut self.digest));
@@ -456,5 +601,52 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(digest, want);
+    }
+
+    /// A placed write declares its alignment, starts every tensor on it and each tensor asked
+    /// for on its own boundary, and reads back with the bytes it was given.
+    #[test]
+    fn a_placed_file_starts_each_tensor_where_asked() {
+        use crate::tensor::quantized::gguf_file::open_mapped;
+        let md = vec![(
+            "general.architecture".to_string(),
+            Value::String("test".into()),
+        )];
+        let plan: Vec<PlannedEntry> = [("a", 3usize), ("b", 5), ("c", 7)]
+            .iter()
+            .map(|&(n, len)| PlannedEntry {
+                name: n.into(),
+                dims: vec![len],
+                dtype: GgmlDType::F32,
+                byte_len: 4 * len as u64,
+            })
+            .collect();
+        let placement = Placement {
+            alignment: 64,
+            starts: vec![64, 256, 64],
+        };
+        let path =
+            std::env::temp_dir().join(format!("loken-gguf-placed-{}.gguf", std::process::id()));
+        let mut w = GgufStreamWriter::create_placed(&path, &md, &plan, &placement).unwrap();
+        for (i, e) in plan.iter().enumerate() {
+            w.append(&vec![i as u8 + 1; e.byte_len as usize]).unwrap();
+        }
+        w.finish().unwrap();
+        let g = open_mapped(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            g.content
+                .metadata
+                .get(layout::ALIGNMENT_KEY)
+                .and_then(|v| v.to_u64().ok()),
+            Some(64)
+        );
+        for (i, (e, start)) in plan.iter().zip(&placement.starts).enumerate() {
+            let at = g.content.tensor_data_offset + g.content.tensor_infos[&e.name].offset;
+            assert_eq!(at % start, 0, "{} starts at {at}", e.name);
+            let bytes = &g.mmap[at as usize..(at + e.byte_len) as usize];
+            assert!(bytes.iter().all(|&b| b == i as u8 + 1));
+        }
+        assert_eq!(g.mmap.len() as u64 % placement.alignment, 0);
     }
 }

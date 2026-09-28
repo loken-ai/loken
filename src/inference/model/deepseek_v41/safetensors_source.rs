@@ -319,6 +319,10 @@ impl WeightSource for SafeTensorsSource {
         }))
     }
 
+    fn experts_under(&self, prefix: &str, n: usize) -> Result<Box<dyn ExpertLoader>> {
+        Ok(self.experts_named(prefix, n, false))
+    }
+
     fn engram_table(&self, name: &str) -> Result<EngramTable> {
         let (e, b) = self.inner.bytes(name)?;
         let [rows, row_len] = e.shape[..] else {

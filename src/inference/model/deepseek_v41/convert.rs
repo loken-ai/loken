@@ -10,6 +10,7 @@
 //! without translation. The file is streamed tensor by tensor: nothing larger than one expert
 //! stack is held.
 
+use super::dspark::{expert_prefix, tensor_names, DsparkConfig};
 use super::engram::EngramConfig;
 use super::model::DeepseekV41Model;
 use super::safetensors_source::SafeTensorsSource;
@@ -344,9 +345,8 @@ pub fn tokenizer_metadata(files: &TokenizerFiles) -> Vec<(String, Value)> {
     ]
 }
 
-/// The checkpoint's own configuration, as the file will carry it. The draft layers the
-/// checkpoint holds under `mtp` are not among the keys written here: this converter does not
-/// take them, and a file that announced them would promise a reader something it cannot serve.
+/// The checkpoint's own configuration, as the file will carry it. The draft's keys are added
+/// beside it with the draft's tensors, by `DsparkConfig::to_metadata`.
 fn metadata(
     cfg: &serde_json::Value,
     engram: Option<&EngramConfig>,
@@ -460,7 +460,31 @@ fn metadata(
     md
 }
 
-fn bytes_per(dtype: GgmlDType, elems: usize) -> u64 {
+/// The format a tensor outside the routed experts is written in: a large matrix whose rows tile
+/// into `always_read` blocks in that format, everything else - norms, biases, small tables - as
+/// f32.
+pub(super) fn written_format(shape: &[usize], always_read: GgmlDType) -> GgmlDType {
+    let elems: usize = shape.iter().product();
+    let large = shape.len() == 2 && elems >= 1 << 20;
+    if large && shape[1].is_multiple_of(always_read.block_size()) {
+        always_read
+    } else {
+        GgmlDType::F32
+    }
+}
+
+/// The format a DSpark routed expert is written in: the always-read format when its rows tile
+/// into that format's blocks, f32 otherwise. The calibration record covers only the backbone's
+/// experts, and the always-read format is the one the recipe writes without calibration.
+pub(super) fn draft_expert_format(shape: &[usize], always_read: GgmlDType) -> GgmlDType {
+    if shape.len() == 2 && shape[1].is_multiple_of(always_read.block_size()) {
+        always_read
+    } else {
+        GgmlDType::F32
+    }
+}
+
+pub(super) fn bytes_per(dtype: GgmlDType, elems: usize) -> u64 {
     (elems / dtype.block_size() * dtype.type_size()) as u64
 }
 
@@ -548,12 +572,7 @@ pub fn convert(
                 return Ok(());
             };
             let elems: usize = shape.iter().product();
-            let large = shape.len() == 2 && elems >= 1 << 20;
-            let dtype = if large && shape[1].is_multiple_of(formats.always_read.block_size()) {
-                formats.always_read
-            } else {
-                GgmlDType::F32
-            };
+            let dtype = written_format(shape, formats.always_read);
             plan.push((
                 PlannedEntry {
                     name: target,
@@ -632,6 +651,43 @@ pub fn convert(
         }
     }
 
+    // The draft the checkpoint holds, under its own names: its always-read tensors as the
+    // backbone's are written, and its routed experts in the always-read format too, since the
+    // calibration record does not cover them.
+    let mut md = metadata(&src.inference_config, cfg.engram.as_ref(), tokenizer);
+    if src.shape("mtp.0.main_proj.weight").is_some() {
+        let draft = DsparkConfig::from_config_value(&src.config)?;
+        let mut names = tensor_names(draft.n_stages);
+        for s in 0..draft.n_stages {
+            for e in 0..draft.n_routed {
+                for w in ["w1", "w3", "w2"] {
+                    names.push(format!("{}.{e}.{w}.weight", expert_prefix(s)));
+                }
+            }
+        }
+        for name in names {
+            let dims = src
+                .shape(&name)
+                .ok_or_else(|| Error::msg(format!("no tensor {name}")))?;
+            let dtype = if name.contains(".ffn.experts.") {
+                draft_expert_format(&dims, formats.always_read)
+            } else {
+                written_format(&dims, formats.always_read)
+            };
+            let elems: usize = dims.iter().product();
+            plan.push((
+                PlannedEntry {
+                    name: name.clone(),
+                    dims,
+                    dtype,
+                    byte_len: bytes_per(dtype, elems),
+                },
+                Source::Dense(name),
+            ));
+        }
+        md.extend(draft.to_metadata());
+    }
+
     let entries: Vec<PlannedEntry> = plan
         .iter()
         .map(|(e, _)| PlannedEntry {
@@ -641,11 +697,7 @@ pub fn convert(
             byte_len: e.byte_len,
         })
         .collect();
-    let mut writer = GgufStreamWriter::create(
-        out,
-        &metadata(&src.inference_config, cfg.engram.as_ref(), tokenizer),
-        &entries,
-    )?;
+    let mut writer = GgufStreamWriter::create(out, &md, &entries)?;
     let total = plan.len();
     // Opened once for the whole file: a context costs seconds and holds memory on the card.
     #[cfg(feature = "cuda")]

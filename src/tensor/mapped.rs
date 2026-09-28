@@ -3,24 +3,37 @@
 use crate::tensor::{Error, Result};
 use std::sync::Arc;
 
+/// The size of a memory page, `None` when the system does not say.
+#[cfg(unix)]
+pub fn page_size() -> Option<usize> {
+    // Safety: sysconf has no preconditions.
+    match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        p if p > 0 => Some(p as usize),
+        _ => None,
+    }
+}
+
 /// Give the kernel `advice` about the pages behind `bytes`: the pages wholly inside the slice when
 /// `inward`, every page the slice touches otherwise. Advice only; a refusal changes nothing.
 #[cfg(unix)]
 pub fn advise_bytes(bytes: &[u8], advice: libc::c_int, inward: bool) {
-    // Safety: sysconf has no preconditions.
-    let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
-        p if p > 0 => p as usize,
-        _ => return,
+    advise_span(bytes.as_ptr() as usize, bytes.len(), advice, inward);
+}
+
+/// `advise_bytes` over `len` bytes at address `start`, which must lie within one mapping.
+#[cfg(unix)]
+pub fn advise_span(start: usize, len: usize, advice: libc::c_int, inward: bool) {
+    let Some(page) = page_size() else {
+        return;
     };
-    let start = bytes.as_ptr() as usize;
-    let end = start + bytes.len();
+    let end = start + len;
     let (lo, hi) = if inward {
         (start.div_ceil(page) * page, end / page * page)
     } else {
         (start / page * page, end.div_ceil(page) * page)
     };
     if hi > lo {
-        // Safety: [lo, hi) lies within the pages `bytes` occupies, which are mapped.
+        // Safety: [lo, hi) lies within the pages the span occupies, which are mapped.
         unsafe { libc::madvise(lo as *mut libc::c_void, hi - lo, advice) };
     }
 }

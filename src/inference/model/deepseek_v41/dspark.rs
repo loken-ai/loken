@@ -11,11 +11,18 @@ use super::source::WeightSource;
 use crate::inference::offload::experts::Expert;
 use crate::inference::offload::projection::Projection;
 use crate::inference::offload::store::{ExpertSet, ExpertStore};
+use crate::tensor::quantized::gguf_file::Value;
+use crate::tensor::quantized::gguf_source::GgufSource;
 use crate::tensor::{Error, Result, Tensor};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// The fixed shape of the draft, read from the checkpoint config.
+/// The fixed shape of the draft, read from the checkpoint config or from the keys a GGUF that
+/// carries the draft holds.
+#[derive(Clone, Debug, PartialEq)]
 pub struct DsparkConfig {
+    /// The stages, `mtp.0` to `mtp.{n_stages - 1}`.
+    pub n_stages: usize,
     pub block_size: usize,
     pub noise_token: u32,
     pub target_layers: Vec<usize>,
@@ -88,13 +95,13 @@ pub struct Dspark {
     pub cfg: DsparkConfig,
 }
 
-fn proj(g: &SafeTensorsSource, name: &str) -> Result<Projection> {
+fn proj<S: WeightSource + ?Sized>(g: &S, name: &str) -> Result<Projection> {
     g.projection(name)?
         .map(Ok)
         .unwrap_or_else(|| Ok(Projection::Dense(g.dense_f32(name)?)))
 }
 
-fn hc(g: &SafeTensorsSource, stage: usize, which: &str) -> Result<HcWeights> {
+fn hc<S: WeightSource + ?Sized>(g: &S, stage: usize, which: &str) -> Result<HcWeights> {
     Ok(HcWeights {
         func: g.dense_f32(&format!("mtp.{stage}.hc_{which}_fn"))?,
         scale: g.dense_f32(&format!("mtp.{stage}.hc_{which}_scale"))?,
@@ -102,7 +109,7 @@ fn hc(g: &SafeTensorsSource, stage: usize, which: &str) -> Result<HcWeights> {
     })
 }
 
-fn attn(g: &SafeTensorsSource, stage: usize, cfg: &DsparkConfig) -> Result<DsparkAttn> {
+fn attn<S: WeightSource + ?Sized>(g: &S, stage: usize, cfg: &DsparkConfig) -> Result<DsparkAttn> {
     let p = format!("mtp.{stage}.attn");
     Ok(DsparkAttn {
         wq_a: proj(g, &format!("{p}.wq_a.weight"))?,
@@ -123,9 +130,9 @@ fn attn(g: &SafeTensorsSource, stage: usize, cfg: &DsparkConfig) -> Result<Dspar
     })
 }
 
-fn stage(g: &SafeTensorsSource, s: usize, cfg: &DsparkConfig) -> Result<DsparkStage> {
+fn stage<S: WeightSource + ?Sized>(g: &S, s: usize, cfg: &DsparkConfig) -> Result<DsparkStage> {
     let p = format!("mtp.{s}.ffn");
-    let loader = g.experts_named(&format!("{p}.experts"), cfg.n_routed, false);
+    let loader = g.experts_under(&expert_prefix(s), cfg.n_routed)?;
     let moe = Moe {
         gate_weight: g.dense_f32(&format!("{p}.gate.weight"))?,
         gate_bias: g.dense_f32(&format!("{p}.gate.bias"))?,
@@ -165,7 +172,12 @@ impl DsparkConfig {
             .map_err(|e| Error::msg(format!("dspark config.json: {e}")))?;
         let v: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| Error::msg(format!("dspark config: {e}")))?;
-        let t = v.get("text_config").unwrap_or(&v);
+        Self::from_config_value(&v)
+    }
+
+    /// `from_config_json` over the configuration already read.
+    pub fn from_config_value(v: &serde_json::Value) -> Result<Self> {
+        let t = v.get("text_config").unwrap_or(v);
         let u = |k: &str| -> Result<usize> {
             t.get(k)
                 .and_then(|x| x.as_u64())
@@ -188,6 +200,7 @@ impl DsparkConfig {
             })
             .unwrap_or_default();
         Ok(DsparkConfig {
+            n_stages: u("num_nextn_predict_layers")?,
             block_size: u("dspark_block_size")?,
             noise_token: u("dspark_noise_token_id")? as u32,
             target_layers,
@@ -228,6 +241,153 @@ impl DsparkConfig {
             vocab: u("vocab_size")?,
         })
     }
+}
+
+/// The prefix of every DSpark key a GGUF carries.
+fn key(name: &str) -> String {
+    format!("{}.dspark.{name}", super::ARCH)
+}
+
+impl DsparkConfig {
+    /// The draft's shape as GGUF metadata: every field, under `deepseek_v41.dspark.*`, so a file
+    /// that carries the draft needs no `config.json` beside it.
+    pub fn to_metadata(&self) -> Vec<(String, Value)> {
+        let u = |name: &str, v: usize| (key(name), Value::U32(v as u32));
+        let f = |name: &str, v: f32| (key(name), Value::F32(v));
+        vec![
+            u("stage_count", self.n_stages),
+            u("block_size", self.block_size),
+            u("noise_token_id", self.noise_token as usize),
+            (
+                key("target_layers"),
+                Value::Array(
+                    self.target_layers
+                        .iter()
+                        .map(|&l| Value::U32(l as u32))
+                        .collect(),
+                ),
+            ),
+            u("markov_rank", self.markov_rank),
+            u("expert_count", self.n_routed),
+            u("expert_used_count", self.n_activated),
+            u("sliding_window", self.window_size),
+            u("embedding_length", self.dim),
+            u("hyper_connection.count", self.hc_mult),
+            u("attention.head_count", self.n_heads),
+            u("attention.key_length", self.head_dim),
+            u("rope.dimension_count", self.rope_head_dim),
+            u("attention.o_groups", self.o_groups),
+            u("attention.o_lora_rank", self.o_lora_rank),
+            f("expert_gating_temperature", self.gate_temp),
+            f("expert_weights_scale", self.route_scale),
+            f("expert_swiglu_limit", self.swiglu_limit),
+            (key("expert_weights_norm"), Value::Bool(self.norm_topk)),
+            f("attention.layer_norm_rms_epsilon", self.rms_eps),
+            f("rope.freq_base", self.rope_theta),
+            f("rope.scaling.factor", self.rope_factor),
+            u(
+                "rope.scaling.original_context_length",
+                self.original_seq_len,
+            ),
+            u(
+                "hyper_connection.sinkhorn_iterations",
+                self.hc_sinkhorn_iters,
+            ),
+            f("hyper_connection.epsilon", self.hc_eps),
+            u("vocab_size", self.vocab),
+        ]
+    }
+
+    /// The draft's shape from the keys `to_metadata` writes; `None` when the file carries no
+    /// draft, an error when it carries some of the keys and not the others.
+    pub fn from_metadata(md: &HashMap<String, Value>) -> Result<Option<Self>> {
+        if !md.contains_key(&key("block_size")) {
+            return Ok(None);
+        }
+        let get = |name: &str| {
+            md.get(&key(name))
+                .ok_or_else(|| Error::msg(format!("dspark: the file has no {}", key(name))))
+        };
+        let u = |name: &str| -> Result<usize> { Ok(get(name)?.to_u32()? as usize) };
+        let f = |name: &str| -> Result<f32> { get(name)?.to_f32() };
+        let target_layers = get("target_layers")?
+            .to_vec()?
+            .iter()
+            .map(|v| v.to_u32().map(|l| l as usize))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(DsparkConfig {
+            n_stages: u("stage_count")?,
+            block_size: u("block_size")?,
+            noise_token: u("noise_token_id")? as u32,
+            target_layers,
+            markov_rank: u("markov_rank")?,
+            n_routed: u("expert_count")?,
+            n_activated: u("expert_used_count")?,
+            window_size: u("sliding_window")?,
+            dim: u("embedding_length")?,
+            hc_mult: u("hyper_connection.count")?,
+            n_heads: u("attention.head_count")?,
+            head_dim: u("attention.key_length")?,
+            rope_head_dim: u("rope.dimension_count")?,
+            o_groups: u("attention.o_groups")?,
+            o_lora_rank: u("attention.o_lora_rank")?,
+            gate_temp: f("expert_gating_temperature")?,
+            route_scale: f("expert_weights_scale")?,
+            swiglu_limit: f("expert_swiglu_limit")?,
+            norm_topk: get("expert_weights_norm")?.to_bool()?,
+            rms_eps: f("attention.layer_norm_rms_epsilon")?,
+            rope_theta: f("rope.freq_base")?,
+            rope_factor: f("rope.scaling.factor")?,
+            original_seq_len: u("rope.scaling.original_context_length")?,
+            hc_sinkhorn_iters: u("hyper_connection.sinkhorn_iterations")?,
+            hc_eps: f("hyper_connection.epsilon")?,
+            vocab: u("vocab_size")?,
+        }))
+    }
+}
+
+/// The prefix of stage `s`'s routed experts: `{prefix}.{e}.{w}.weight` names one projection.
+pub fn expert_prefix(s: usize) -> String {
+    format!("mtp.{s}.ffn.experts")
+}
+
+/// Every tensor the draft reads apart from its routed experts, by the checkpoint's own names:
+/// what a converter carries into a file so that `Dspark::load` finds the draft there.
+pub fn tensor_names(n_stages: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    for s in 0..n_stages {
+        for rest in [
+            "attn.wq_a.weight",
+            "attn.q_norm.weight",
+            "attn.wq_b.weight",
+            "attn.wkv.weight",
+            "attn.kv_norm.weight",
+            "attn.attn_sink",
+            "attn.wo_a.weight",
+            "attn.wo_b.weight",
+            "attn_norm.weight",
+            "ffn_norm.weight",
+            "ffn.gate.weight",
+            "ffn.gate.bias",
+            "hc_attn_fn",
+            "hc_attn_scale",
+            "hc_attn_base",
+            "hc_ffn_fn",
+            "hc_ffn_scale",
+            "hc_ffn_base",
+        ] {
+            names.push(format!("mtp.{s}.{rest}"));
+        }
+    }
+    let last = n_stages.saturating_sub(1);
+    names.extend([
+        "mtp.0.main_proj.weight".to_string(),
+        "mtp.0.main_norm.weight".to_string(),
+        format!("mtp.{last}.norm.weight"),
+        format!("mtp.{last}.markov_head.embed.weight"),
+        format!("mtp.{last}.markov_head.head.weight"),
+    ]);
+    names
 }
 
 /// The released DeepSeek-V4.1 checkpoint under the Hugging Face hub cache, if it is on this machine:
@@ -685,23 +845,80 @@ fn argmax(v: &[f32]) -> u32 {
         .unwrap_or(0)
 }
 
+/// Where a loaded draft came from.
+pub enum DraftSource {
+    /// The model's own GGUF.
+    ModelFile,
+    /// The released checkpoint in the hub cache, at this snapshot.
+    HubCheckpoint(PathBuf),
+}
+
 impl Dspark {
-    /// Open the checkpoint from the hub cache and load the draft, or `None` when it is not present.
+    /// The draft the model file carries, else the one the released checkpoint in the hub cache
+    /// holds, else `None`. Logs which it took, or why it took none.
+    pub fn locate<G: GgufSource>(file: &G) -> Option<Dspark> {
+        match Dspark::from_file(file) {
+            Ok(Some(d)) => {
+                d.log_loaded(&DraftSource::ModelFile);
+                return Some(d);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("DSpark draft in the model file not loaded: {e}"),
+        }
+        Dspark::open()
+    }
+
+    /// The draft `file` carries, `None` when its metadata declares none.
+    pub fn from_file<G: GgufSource>(file: &G) -> Result<Option<Dspark>> {
+        match DsparkConfig::from_metadata(file.metadata())? {
+            Some(cfg) => Dspark::load(file, cfg).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Open the checkpoint from the hub cache and load the draft, or `None` when it is not
+    /// present. Logs the outcome.
     pub fn open() -> Option<Dspark> {
-        let (src, dir) = find_source()?;
-        let cfg = DsparkConfig::from_config_json(&dir).ok()?;
-        match Dspark::load(&src, cfg) {
-            Ok(d) => Some(d),
+        let Some((src, dir)) = find_source() else {
+            tracing::info!(
+                "DSpark draft not available: the model file carries none and no released \
+                 checkpoint is in the hub cache"
+            );
+            return None;
+        };
+        let loaded = DsparkConfig::from_config_json(&dir).and_then(|cfg| Dspark::load(&src, cfg));
+        match loaded {
+            Ok(d) => {
+                d.log_loaded(&DraftSource::HubCheckpoint(dir));
+                Some(d)
+            }
             Err(e) => {
-                tracing::warn!("DSpark draft not loaded: {e}");
+                tracing::warn!("DSpark draft not loaded from {}: {e}", dir.display());
                 None
             }
         }
     }
 
-    /// Load the three stages and the shared draft heads from the released checkpoint.
-    pub fn load(g: &SafeTensorsSource, cfg: DsparkConfig) -> Result<Self> {
-        let n = 3;
+    fn log_loaded(&self, from: &DraftSource) {
+        let from = match from {
+            DraftSource::ModelFile => "the model file".to_string(),
+            DraftSource::HubCheckpoint(dir) => format!("the hub checkpoint {}", dir.display()),
+        };
+        tracing::info!(
+            "DSpark draft loaded from {from}: {} stages, block_size {}, {} experts/stage",
+            self.stages.len(),
+            self.cfg.block_size,
+            self.cfg.n_routed
+        );
+    }
+
+    /// Load the stages and the shared draft heads from `g`, which names them as the released
+    /// checkpoint does.
+    pub fn load<S: WeightSource + ?Sized>(g: &S, cfg: DsparkConfig) -> Result<Self> {
+        let n = cfg.n_stages;
+        if n == 0 {
+            return Err(Error::msg("dspark: no stage"));
+        }
         let mut stages = Vec::with_capacity(n);
         for s in 0..n {
             stages.push(stage(g, s, &cfg)?);
@@ -716,5 +933,72 @@ impl Dspark {
             markov_head: proj(g, &format!("mtp.{last}.markov_head.head.weight"))?,
             cfg,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
+    use crate::tensor::quantized::gguf_file::open_mapped;
+    use crate::tensor::quantized::GgmlDType;
+
+    /// The checkpoint's `text_config`, as the release spells it.
+    fn released(dir: &Path) {
+        let cfg = serde_json::json!({
+            "text_config": {
+                "num_nextn_predict_layers": 3, "dspark_block_size": 5,
+                "dspark_noise_token_id": 128799, "dspark_target_layer_ids": [37, 38, 39],
+                "dspark_markov_rank": 256, "dspark_n_routed_experts": 128,
+                "dspark_num_experts_per_tok": 3, "sliding_window": 128, "hidden_size": 5120,
+                "hc_mult": 4, "num_attention_heads": 64, "head_dim": 512,
+                "qk_rope_head_dim": 64, "o_groups": 8, "o_lora_rank": 1024,
+                "vocab_size": 129280, "swiglu_limit": 10.0, "routed_scaling_factor": 1.5,
+                "norm_topk_prob": true, "rms_norm_eps": 1e-20, "rope_theta": 10000,
+                "hc_sinkhorn_iters": 20, "hc_eps": 1e-6,
+                "rope_scaling": { "factor": 16, "original_max_position_embeddings": 65536 }
+            }
+        });
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+    }
+
+    /// Every field of the draft's configuration written as GGUF keys comes back equal from the
+    /// file, and a file without the keys declares no draft.
+    #[test]
+    fn the_draft_config_survives_the_file() {
+        let dir = std::env::temp_dir().join(format!("loken-dspark-cfg-{}", std::process::id()));
+        released(&dir);
+        let cfg = DsparkConfig::from_config_json(&dir).unwrap();
+        assert_eq!(cfg.target_layers, vec![37, 38, 39]);
+        assert_eq!((cfg.n_stages, cfg.block_size, cfg.markov_rank), (3, 5, 256));
+
+        let mut md = vec![(
+            "general.architecture".to_string(),
+            Value::String(super::super::ARCH.into()),
+        )];
+        md.extend(cfg.to_metadata());
+        let entries = vec![GgufEntry {
+            name: "output_norm".into(),
+            dims: vec![4],
+            dtype: GgmlDType::F32,
+            data: vec![0; 16],
+        }];
+        let path = dir.join("draft.gguf");
+        write_gguf_with_metadata(&path, &md, &entries).unwrap();
+        let g = open_mapped(&path).unwrap();
+        assert_eq!(
+            DsparkConfig::from_metadata(&g.content.metadata).unwrap(),
+            Some(cfg)
+        );
+
+        let bare = dir.join("bare.gguf");
+        write_gguf_with_metadata(&bare, &md[..1], &entries).unwrap();
+        let g = open_mapped(&bare).unwrap();
+        assert_eq!(
+            DsparkConfig::from_metadata(&g.content.metadata).unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

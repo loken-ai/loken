@@ -235,6 +235,10 @@ impl<B: WeightSource + ?Sized> WeightSource for LayeredSource<'_, B> {
         }
     }
 
+    fn experts_under(&self, prefix: &str, n: usize) -> Result<Box<dyn ExpertLoader>> {
+        self.base.experts_under(prefix, n)
+    }
+
     fn engram_table(&self, name: &str) -> Result<EngramTable> {
         self.base.engram_table(name)
     }

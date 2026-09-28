@@ -17,6 +17,7 @@ pub mod batch_server;
 pub mod block;
 pub mod cache;
 pub mod candidates;
+pub mod complete;
 pub mod convert;
 pub mod derived;
 pub mod dspark;

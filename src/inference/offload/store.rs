@@ -552,6 +552,71 @@ impl ExpertLoader for QuantExpertLoader {
     }
 }
 
+/// An `ExpertLoader` over experts each stored as three tensors of their own - gate, up and down
+/// side by side in a mapped file - so one expert is one contiguous range of the file: read in with
+/// one request and dropped from the page cache with one advice. Each view is read in place.
+pub struct UnitExpertLoader {
+    /// Per expert: gate `[inter, dim]`, up `[inter, dim]`, down `[dim, inter]`.
+    experts: Vec<[Arc<QTensor>; 3]>,
+    /// The file the views map and the address its mapping starts at, when known: a released
+    /// expert's pages are dropped by file range, as `QuantExpertLoader` does.
+    anchor: Option<(Arc<std::fs::File>, usize)>,
+}
+
+impl UnitExpertLoader {
+    pub fn new(
+        experts: Vec<[Arc<QTensor>; 3]>,
+        anchor: Option<(Arc<std::fs::File>, usize)>,
+    ) -> Self {
+        Self { experts, anchor }
+    }
+}
+
+impl ExpertLoader for UnitExpertLoader {
+    fn build(&self, id: usize) -> Result<Expert> {
+        let [gate, up, down] = self.experts.get(id).ok_or_else(|| {
+            crate::tensor::Error::msg(format!(
+                "expert {id} of {} stored as units",
+                self.experts.len()
+            ))
+        })?;
+        Ok(Expert {
+            w1: Projection::Quant(gate.clone()),
+            w2: Projection::Quant(down.clone()),
+            w3: Projection::Quant(up.clone()),
+        })
+    }
+
+    fn count(&self) -> usize {
+        self.experts.len()
+    }
+
+    fn release(&self, expert: &Expert) {
+        #[cfg(target_os = "linux")]
+        if let (Some((file, base)), Some((addr, len))) = (&self.anchor, expert.storage_unit()) {
+            if addr >= *base {
+                // This mapping's entries first: the file's pages are not dropped while a
+                // process maps them.
+                for p in [&expert.w1, &expert.w3, &expert.w2] {
+                    p.unmap_pages();
+                }
+                use std::os::fd::AsRawFd;
+                // Safety: a valid descriptor and a range inside the file; advice only.
+                unsafe {
+                    libc::posix_fadvise(
+                        file.as_raw_fd(),
+                        (addr - base) as libc::off_t,
+                        len as libc::off_t,
+                        libc::POSIX_FADV_DONTNEED,
+                    );
+                }
+                return;
+            }
+        }
+        expert.dont_need();
+    }
+}
+
 /// An `ExpertLoader` over stacks already dequantised to f32, sliced per expert on build. The path
 /// a stack takes when its dtype has no in-place view; every expert is resident from the start.
 pub struct DenseStackLoader {

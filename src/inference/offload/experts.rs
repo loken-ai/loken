@@ -35,8 +35,36 @@ impl Expert {
         self.w3.dont_need();
     }
 
-    /// Start reading the three projections in.
+    /// The address range the three projections' storage covers when they lie side by side in
+    /// one mapping, apart by less than a page of padding: an expert stored as one unit. `None`
+    /// when they lie apart, as the slices of three stacks do, or are not mapped.
+    #[cfg(unix)]
+    pub fn storage_unit(&self) -> Option<(usize, usize)> {
+        let page = crate::tensor::mapped::page_size()?;
+        let mut spans = [
+            self.w1.storage_span()?,
+            self.w3.storage_span()?,
+            self.w2.storage_span()?,
+        ];
+        spans.sort_unstable();
+        for pair in spans.windows(2) {
+            let end = pair[0].0 + pair[0].1;
+            if pair[1].0 < end || pair[1].0 - end >= page {
+                return None;
+            }
+        }
+        let last = spans[2];
+        Some((spans[0].0, last.0 + last.1 - spans[0].0))
+    }
+
+    /// Start reading the three projections in: one request over the unit when the expert is
+    /// stored as one, a request per projection otherwise.
     pub fn will_need(&self) {
+        #[cfg(unix)]
+        if let Some((start, len)) = self.storage_unit() {
+            crate::tensor::mapped::advise_span(start, len, libc::MADV_WILLNEED, false);
+            return;
+        }
         self.w1.will_need();
         self.w2.will_need();
         self.w3.will_need();

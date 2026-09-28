@@ -1169,11 +1169,17 @@ impl LlmEngine {
                         cfg.n_shared_experts,
                         slots,
                     );
-                    Box::new(crate::inference::engine::model_backend::DeepseekV41Backend::new(
-                        model,
-                        cfg.moe_inter_dim,
-                        user_context_length,
-                    ))
+                    // The draft the file carries first, the hub checkpoint's when it has none.
+                    let draft =
+                        crate::inference::model::deepseek_v41::dspark::Dspark::locate(&source);
+                    Box::new(
+                        crate::inference::engine::model_backend::DeepseekV41Backend::with_draft(
+                            model,
+                            cfg.moe_inter_dim,
+                            user_context_length,
+                            draft,
+                        ),
+                    )
                 }
                 "qwen35moe" | "qwen35" | "qwen3next" => {
                     // The dense qwen35 belongs here, not on the generic arm: the family's
