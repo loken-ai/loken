@@ -305,15 +305,7 @@ impl APIServer {
             return;
         };
         loop {
-            let cards: Vec<crate::inference::place::CardRoom> =
-                crate::inference::place::device_probe::probe_cuda_gpus()
-                    .iter()
-                    .map(|g| crate::inference::place::CardRoom {
-                        index: g.index,
-                        perf: g.perf_score,
-                        available: g.available,
-                    })
-                    .collect();
+            let cards = crate::inference::place::room::card_rooms();
             let idle: Vec<(String, Arc<LlmEngine>, i64)> = {
                 let engines = self.engines.read().await;
                 engines
@@ -846,22 +838,15 @@ impl APIServer {
     pub(crate) async fn evict_to_make_room(&self, incoming_id: &str, need: u64, per_card: u64) {
         let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
-            let cards = crate::inference::place::device_probe::probe_cuda_gpus();
-            // A model one card can hold wants one card with room: split across two it decodes
-            // at a fraction of its speed. A model no card can hold wants the room of all of them.
-            let fits_one_card = cards.iter().any(|g| need + per_card <= g.total);
-            let free: u64 = if fits_one_card {
-                cards
-                    .iter()
-                    .map(|g| g.available.saturating_sub(per_card))
-                    .max()
-                    .unwrap_or(0)
-            } else {
-                cards
-                    .iter()
-                    .map(|g| g.available.saturating_sub(per_card))
-                    .sum()
+            let demand = crate::inference::place::ladder::Demand {
+                block_bytes: need,
+                runtime_reserve: per_card,
+                ..Default::default()
             };
+            let free = crate::inference::place::room::room_for(
+                &demand,
+                &crate::inference::place::room::card_rooms(),
+            );
             if need <= free {
                 return;
             }
@@ -904,7 +889,7 @@ impl APIServer {
             return 0;
         };
         let bytes = self.model_blob_size(&victim, &self.config_for_model(&victim));
-        info!("⚖️  Unloading idle model {victim}: {except} ran out of memory");
+        info!("⚖️  Unloading idle model {victim} to give {except} room");
         match self.unload_model(&victim).await {
             Ok(_) => bytes.max(1),
             Err(_) => 0,

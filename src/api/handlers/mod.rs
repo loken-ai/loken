@@ -1564,30 +1564,17 @@ impl APIServer {
         }
     }
 
-    /// Whether one card of this node has `bytes` of room under the configured fraction.
-    /// A model that only fits split against the host is one a peer with a larger card
-    /// should take, so every family's hand-over asks this with its own demand.
     /// What each card admits as a whole load, probed once: a card's size does not change,
     /// and the gossip round must not pay an NVML pass.
     pub(crate) fn usable_cards(&self) -> Vec<u64> {
-        static CARDS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-        CARDS
-            .get_or_init(|| {
-                crate::inference::place::device_probe::probe_cuda_gpus()
-                    .iter()
-                    .map(|g| g.total)
-                    .collect()
-            })
-            .clone()
+        crate::inference::place::room::card_sizes()
     }
 
+    /// Whether one card of this node has `bytes` of room. A model that only fits split
+    /// against the host is one a peer with a larger card should take, so every family's
+    /// hand-over asks this with its own demand.
     pub(crate) fn card_holds(&self, bytes: u64) -> bool {
-        crate::inference::place::device_probe::probe_cuda_gpus()
-            .iter()
-            .map(|g| g.available)
-            .max()
-            .unwrap_or(0)
-            >= bytes
+        crate::inference::place::room::a_card_holds(bytes)
     }
 
     /// How this node is named to its peers; none when it runs alone. Stamped on every

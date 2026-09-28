@@ -105,14 +105,22 @@ pub(crate) fn serves_transcription(node: &NodeState, requested: &str) -> bool {
 
 /// Bytes a whole-model load takes on a card for each byte of its checkpoint: the voice
 /// and transcription engines load in F32 from F16 or BF16 files.
-const WHOLE_LOAD_FACTOR: u64 = 2;
+const WHOLE_LOAD_FACTOR: u64 =
+    (std::mem::size_of::<f32>() / std::mem::size_of::<half::f16>()) as u64;
 
-/// The runtime room a whole-model load keeps beside its weights.
-pub(crate) const WHOLE_LOAD_RESERVE: u64 = 512 << 20;
+/// The runtime room a whole-model load keeps beside its weights: the planner's floor.
+pub(crate) const WHOLE_LOAD_RESERVE: u64 =
+    crate::inference::place::runtime_demand::MEASURED_LOAD_FLOOR;
 
-/// What a whole-model load of a checkpoint of `size` bytes asks a card for.
+/// What a whole-model load of a checkpoint of `size` bytes asks one card for.
 pub(crate) fn whole_load_demand(size: u64) -> u64 {
-    size.saturating_mul(WHOLE_LOAD_FACTOR) + WHOLE_LOAD_RESERVE
+    crate::inference::place::ladder::Demand {
+        layers: 1,
+        block_bytes: size.saturating_mul(WHOLE_LOAD_FACTOR),
+        runtime_reserve: WHOLE_LOAD_RESERVE,
+        ..Default::default()
+    }
+    .whole()
 }
 
 /// The size the listing records for the first entry `matches`, from the same listing

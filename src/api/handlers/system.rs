@@ -157,11 +157,9 @@ pub(crate) async fn draft_attach(
 
     // The draft runs a step per drafted token, so it goes on the fastest card unless the
     // caller names one.
-    let draft_device_idx = request.device_index.or_else(|| {
-        crate::inference::place::device_probe::probe_cuda_gpus_for("llm")
-            .first()
-            .map(|g| g.index)
-    });
+    let draft_device_idx = request
+        .device_index
+        .or_else(|| crate::inference::place::room::fastest_card("llm"));
 
     // Build a fresh engine for the draft, loaded on the chosen device.
     let mut draft_config = state.config_for_model(&draft_name);

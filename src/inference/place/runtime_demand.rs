@@ -198,12 +198,13 @@ pub fn load_runtime_floor(model_size: u64) -> u64 {
     /// checkpoint several times larger than anything shipped today is no longer planned
     /// with a 2B model's allowance.
     const STAGED_SHARE: u64 = 32;
-    // measured-resident: the floor a first launch needs free on a card before any
-    // model-specific scratch is counted. Kept as the floor rather than replaced: it covers
-    // module loading, which no arithmetic over the checkpoint can see.
-    let measured_floor: u64 = 512 << 20;
-    measured_floor.max(model_size / STAGED_SHARE)
+    MEASURED_LOAD_FLOOR.max(model_size / STAGED_SHARE)
 }
+
+/// measured-resident: the floor a first launch needs free on a card before any
+/// model-specific scratch is counted. It covers module loading, which no arithmetic over
+/// the checkpoint can see.
+pub const MEASURED_LOAD_FLOOR: u64 = 512 << 20;
 
 /// What fraction of a card's free VRAM the current pressure lets WEIGHTS occupy.
 ///

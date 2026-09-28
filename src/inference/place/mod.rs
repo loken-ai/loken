@@ -18,6 +18,7 @@ pub mod model_request;
 pub mod placement_invariants;
 pub mod plan;
 pub mod recover;
+pub mod room;
 pub mod runtime_demand;
 #[cfg(feature = "video")]
 pub mod video_plan;
@@ -30,12 +31,14 @@ pub struct Placement {
     pub host_layers: usize,
 }
 
-/// A card as a move is judged against it: its index, its speed score and its free memory.
+/// A card as a move is judged against it: its index, its speed score, its free memory and
+/// its size.
 #[derive(Debug, Clone, Copy)]
 pub struct CardRoom {
     pub index: usize,
     pub perf: u64,
     pub available: u64,
+    pub total: u64,
 }
 
 impl Placement {
@@ -70,6 +73,7 @@ mod placement_tests {
             index,
             perf,
             available,
+            total: available,
         }
     }
 

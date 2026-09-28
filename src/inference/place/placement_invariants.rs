@@ -1303,9 +1303,7 @@ fn route_violations() -> std::collections::BTreeMap<String, (usize, usize, usize
 const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("api/handlers/media/generate.rs", (2, 6, 0)),
     ("api/handlers/media/video.rs", (0, 3, 0)),
-    ("api/handlers/model_manager.rs", (2, 1, 0)),
     ("api/handlers/separate.rs", (1, 0, 0)),
-    ("api/handlers/system.rs", (1, 0, 0)),
     ("distributed/auto_tune.rs", (1, 0, 0)),
     ("inference/engine/audio_engine.rs", (2, 0, 0)),
     ("inference/engine/boogu_engine.rs", (2, 0, 0)),
