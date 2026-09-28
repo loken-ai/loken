@@ -387,6 +387,7 @@ pub(crate) async fn ollama_chat(
         info!("Chat: {} stop sequence(s)", params.stop_sequences.len());
     }
 
+    crate::api::handlers::admission::ensure_prompt_fits(&engine, &prompt).await?;
     // The gate, the in-flight count and the last user turn's images.
     let admission = state
         .admit(
@@ -1028,6 +1029,7 @@ pub(crate) async fn ollama_generate(
         info!("Generate: {} stop sequence(s)", params.stop_sequences.len());
     }
 
+    crate::api::handlers::admission::ensure_prompt_fits(&engine, &effective_prompt).await?;
     // The gate (FIM auto-promotes its priority), the in-flight count and the images.
     let admission = state
         .admit(

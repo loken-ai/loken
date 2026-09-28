@@ -44,6 +44,24 @@ pub(crate) fn load_error(model_name: &str, e: &str) -> ApiError {
     ApiError::NotFound(format!("Model '{model_name}' could not be loaded: {e}"))
 }
 
+/// Refuses a prompt longer than the loaded model's context window. Served anyway, it would
+/// be cut to fit and the answer written from what was left: a dropped system prompt or tool
+/// instruction reads as a plausible wrong answer rather than as an error.
+pub(crate) async fn ensure_prompt_fits(engine: &LlmEngine, prompt: &str) -> Result<(), ApiError> {
+    if let (Some(tokens), Some(window)) = (
+        engine.count_tokens(prompt).await,
+        engine.context_window().await,
+    ) {
+        if tokens > window {
+            return Err(ApiError::Validation(format!(
+                "the prompt is {tokens} tokens and the model's context window is {window}; \
+                 shorten the conversation or load the model with a larger num_ctx"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A generation admitted to its engine. Dropping it releases the gate slot and the
 /// in-flight count, so a stream holds it until its last chunk.
 pub(crate) struct Admission {

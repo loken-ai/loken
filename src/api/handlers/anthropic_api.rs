@@ -151,6 +151,9 @@ pub(crate) async fn anthropic_messages(
         ..sampling.into_params()
     };
 
+    if let Err(e) = super::admission::ensure_prompt_fits(&engine, &prompt).await {
+        return anthropic_api_error(e);
+    }
     // The gate, the in-flight count and the last user turn's images.
     let priority = crate::api::gate::Priority::from_headers(&headers)
         .unwrap_or(crate::api::gate::Priority::Interactive);

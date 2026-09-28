@@ -377,6 +377,7 @@ pub(crate) async fn chat_completion(
     let oai_priority = crate::api::gate::Priority::from_headers(&headers)
         .unwrap_or(crate::api::gate::Priority::Interactive);
 
+    super::admission::ensure_prompt_fits(&engine, &prompt).await?;
     // The gate, the in-flight count and the last user turn's images.
     let admission = state
         .admit(
@@ -1135,6 +1136,7 @@ pub(crate) async fn text_completions(
     let created = chrono::Utc::now().timestamp();
     // The prompt count a stream reports when the engine publishes no statistics.
     let prompt_tokens_est = estimate_token_count(&prompt) as u32;
+    super::admission::ensure_prompt_fits(&engine, &prompt).await?;
     // The gate (a continuously batching model takes concurrent requests in its own
     // worker), the in-flight count, and no images: a completion carries none, and what an
     // earlier request encoded must not answer this one.
