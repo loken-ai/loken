@@ -13,7 +13,7 @@ use memmap2::Mmap;
 use crate::cli::DynErr;
 use crate::inference::engine::llm_engine::{build_tokenizer_from_gguf, KvQuant};
 use crate::inference::generic_transformer::GenericHeteroTransformer;
-use crate::inference::place::layer_executor::HeteroPlan;
+use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
 use crate::tensor::quantized::gguf_file;
 use crate::tensor::{DType, Device, Tensor};
 
@@ -83,34 +83,78 @@ pub fn render_midi(
     ids.push(BOS_MIDI); // switch into MIDI generation
     let pp = ids.len();
 
-    // Layers on CUDA when available (probe returns empty on a CPU-only/non-cuda build -> CPU
-    // fallback). The large MIDI embedding table stays on CPU; the compute-heavy layers go on GPU.
+    // What the model asks of the cards, from its tensor directory and metadata: the blocks,
+    // the output head, the cache for this prompt and generation, and one prefill's
+    // activations. The ladder in `place` spreads it over the cards, else the host.
+    let meta_u32 = |suffix: &str| -> Option<usize> {
+        content
+            .metadata
+            .iter()
+            .find(|(k, _)| k.ends_with(suffix))
+            .and_then(|(_, v)| v.to_u32().ok())
+            .map(|v| v as usize)
+    };
+    let dim = meta_u32(".embedding_length").ok_or("gguf: no embedding_length")?;
+    let heads = meta_u32(".attention.head_count").ok_or("gguf: no attention.head_count")?;
+    let kv_heads = meta_u32(".attention.head_count_kv").unwrap_or(heads);
+    let head_dim = meta_u32(".attention.key_length").unwrap_or(dim / heads.max(1));
+    let ffn = meta_u32(".feed_forward_length").ok_or("gguf: no feed_forward_length")?;
+    let kv_len = meta_u32(".context_length").map_or(pp + max_tokens, |c| c.min(pp + max_tokens));
+    let tensor_bytes = |name: &str| {
+        content
+            .tensor_infos
+            .get(name)
+            .map_or(0, |t| t.size_in_bytes() as u64)
+    };
+    let block_bytes: u64 = content
+        .tensor_infos
+        .iter()
+        .filter(|(n, _)| n.starts_with("blk."))
+        .map(|(_, t)| t.size_in_bytes() as u64)
+        .sum();
+    // An untied model uploads `output.weight`; a tied one its embedding table.
+    let head_bytes = match tensor_bytes("output.weight") {
+        0 => tensor_bytes("token_embd.weight"),
+        b => b,
+    };
+    /// Bytes per cached element of an unquantised cache.
+    const KV_ELEM_BYTES: u64 = 4;
+    let demand = crate::inference::place::ladder::Demand {
+        layers: num_layers,
+        block_bytes,
+        head_bytes,
+        kv_bytes_per_layer: 2 * (kv_heads * head_dim * kv_len) as u64 * KV_ELEM_BYTES,
+        runtime_reserve: crate::inference::place::runtime_demand::transformer_work_reserve(
+            file_size, pp, dim, heads, ffn,
+        ),
+    };
+    drop(content);
+    let build = |plan: &HeteroPlan| -> Result<GenericHeteroTransformer, crate::tensor::Error> {
+        let mut hetero: HashMap<usize, Device> = HashMap::new();
+        for seg in &plan.segments {
+            if let DeviceKind::Cuda(i) = seg.kind {
+                hetero.insert(i, crate::inference::place::ladder::device_of(seg.kind));
+            }
+        }
+        let content = gguf_file::Content::read_mapped(&mut Cursor::new(&mmap[..]), mmap.clone())?;
+        GenericHeteroTransformer::from_gguf_with_kv_quant(
+            content,
+            &mmap,
+            &hetero,
+            plan,
+            KvQuant::Off,
+            Some(kv_len),
+        )
+    };
     let use_cuda = matches!(
         device.to_ascii_lowercase().as_str(),
         "cuda" | "gpu" | "auto"
     );
-    let cuda_devices: Vec<(usize, u64)> = if use_cuda {
-        crate::inference::place::device_probe::probe_cuda_devices(512 * 1024 * 1024)
-            .iter()
-            .take(1)
-            .map(|(i, f, _)| (*i, *f))
-            .collect()
+    let mut model = if use_cuda {
+        crate::inference::place::ladder::load("MIDI-LLM", &demand, build)
     } else {
-        Vec::new()
-    };
-    let mut hetero: HashMap<usize, Device> = HashMap::new();
-    for (i, _) in &cuda_devices {
-        hetero.insert(*i, Device::new_cuda(*i).map_err(|e| e.to_string())?);
+        crate::inference::place::ladder::load_placed("MIDI-LLM", &demand, &[], || false, build)
     }
-    let plan = HeteroPlan::calculate_with_kv(num_layers, file_size, &cuda_devices, &[], 1.0, 0);
-    let mut model = GenericHeteroTransformer::from_gguf_with_kv_quant(
-        content,
-        &mmap,
-        &hetero,
-        &plan,
-        KvQuant::Off,
-        Some(4096),
-    )
     .map_err(|e| e.to_string())?;
 
     // Prefill, then autoregressive top-p sampling masked to the MIDI vocab.
@@ -295,12 +339,14 @@ fn write_smf(notes: &[Note]) -> Vec<u8> {
         });
     }
     // Per-channel absolute events: (tick, status, data1, data2).
+    /// Programs are set before the first note.
+    const TRACK_START: u32 = 0;
     let mut per_ch: HashMap<u8, Vec<(u32, u8, u8, u8)>> = HashMap::new();
     for n in notes {
         let ch = *chan.get(&n.instr).unwrap();
         let ev = per_ch.entry(ch).or_default();
         if n.instr != 128 && !ev.iter().any(|e| e.1 == (0xC0 | ch)) {
-            ev.push((0, 0xC0 | ch, (n.instr % 128) as u8, 0)); // program change
+            ev.push((TRACK_START, 0xC0 | ch, (n.instr % 128) as u8, 0)); // program change
         }
         ev.push((n.onset, 0x90 | ch, n.pitch, VELOCITY)); // note on
         ev.push((n.onset + n.dur.max(1), 0x80 | ch, n.pitch, 0)); // note off
