@@ -93,7 +93,7 @@ pub(super) async fn generate_image_resilient(
     // no budget of its own must be refused by name here, never declared at another
     // family's figure.
     let loader = image_family_loader(image_family(model_name))?;
-    let _demand = crate::inference::place::vram_manager::declare_demand(
+    let _demand = crate::inference::place::recover::hold_scratch(
         "media",
         family_runtime_bytes(&state.huggingface_models_dir, loader, model_name, geom),
     );

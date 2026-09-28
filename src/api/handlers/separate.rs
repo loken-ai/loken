@@ -53,15 +53,20 @@ fn model(hf_models_dir: &str) -> Result<&'static MelBandRoformer, String> {
         return Err("source separation needs the Mel-Band RoFormer weights, which are not installed; see the model documentation for how to fetch them"
             .to_string());
     }
-    // Placement through the fleet's authority, never a hardcoded device: the model is
-    // ~600 MB resident plus its per-window activations.
-    let dev =
-        crate::inference::place::vram_manager::pick_device_for_aux("source separation", 3 << 30)
-            .map(|(_, _, d)| d)
-            .unwrap_or(crate::tensor::Device::Cpu);
-    tracing::info!("source separation: loading Mel-Band RoFormer on {dev:?}");
-    let net = MelBandRoformer::load(w.to_str().unwrap_or_default(), &dev)
-        .map_err(|e| format!("separation model load: {e}"))?;
+    // Placed through the ladder, away from the card the hot models want: its weights
+    // resident, with one window's activations kept free beside them.
+    let weights = std::fs::metadata(&w).map(|m| m.len()).unwrap_or(0);
+    let net = crate::inference::place::ladder::load_aside(
+        "source separation",
+        weights,
+        crate::inference::codec::melband::window_activation_bytes(w.to_str().unwrap_or_default())
+            .map_err(|e| format!("separation model shape: {e}"))?,
+        |dev| {
+            tracing::info!("source separation: loading Mel-Band RoFormer on {dev:?}");
+            MelBandRoformer::load(w.to_str().unwrap_or_default(), dev)
+        },
+    )
+    .map_err(|e| format!("separation model load: {e}"))?;
     // Two concurrent first-requests can both load; the loser's copy is dropped here, which
     // frees it. Rare enough to be worth less than a lock held across a checkpoint load.
     Ok(NET.get_or_init(|| net))

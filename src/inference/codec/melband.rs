@@ -212,7 +212,7 @@ impl Attention {
         // The [b, h, n, n] score matrix for the time axis (b=60 bands, n=~801
         // frames) is ~1.2 GB f32 - chunk the independent batch rows to cap the
         // transient (bit-exact: rows never interact).
-        let budget = 256usize << 20;
+        let budget = SCORE_BUDGET;
         let per_row = self.heads * n * n * 4;
         let step = (budget / per_row.max(1)).clamp(1, b);
         let out = if step >= b {
@@ -340,6 +340,31 @@ impl MaskMlp {
         let parts = y.chunk(2, D::Minus1)?;
         parts[0].mul(&parts[1].sigmoid()?)
     }
+}
+
+/// Bytes of attention scores one chunk of batch rows may hold at once.
+const SCORE_BUDGET: usize = 256 << 20;
+
+/// Card bytes one window's forward holds beside the weights: the axial stream over every
+/// (frame, band) token with its normed copy, fused projections, attention output and
+/// feed-forward widening, the scores the time axis caps at [`SCORE_BUDGET`] with the softmax
+/// copy, and the window's band inputs and mask outputs, for the checkpoint at `path`.
+pub fn window_activation_bytes(path: &str) -> Result<u64> {
+    let vb = unsafe { VarBuilder::from_files(&[path], DType::F32, &Device::Cpu)? };
+    let [dim, first_in] = vb.shape_of("band_split.to_features.0.1.weight")?[..] else {
+        return Err(Error::msg("melband: the band projection is not a matrix"));
+    };
+    let channels = first_in / (2 * BAND_RANGES[0].1);
+    let inner = vb.shape_of("layers.0.0.layers.0.0.to_out.0.weight")?[1];
+    let ff_inner = vb.shape_of("layers.0.0.layers.0.1.net.1.weight")?[0];
+    let mask_hidden = vb.shape_of("mask_estimators.0.to_freqs.0.0.0.weight")?[0];
+    let f32b = std::mem::size_of::<f32>() as u64;
+    let frames = (CHUNK_SIZE / HOP + 1) as u64;
+    let tokens = frames * NUM_BANDS as u64;
+    let stream = tokens * (3 * dim + 3 * inner + inner + ff_inner) as u64;
+    let scores = 2 * SCORE_BUDGET as u64;
+    let io = 2 * frames * total_band_dim(channels) as u64 + frames * mask_hidden as u64;
+    Ok(stream * f32b + scores + io * f32b)
 }
 
 pub struct MelBandRoformer {

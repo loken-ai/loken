@@ -1319,8 +1319,6 @@ fn an_exemption_covers_the_statement_below_it_and_no_more() {
 /// The list only shrinks: a file routed through the planner leaves it, and a count that
 /// drops has to be written down here.
 const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
-    ("api/handlers/media/generate.rs", (1, 0, 0)),
-    ("api/handlers/separate.rs", (1, 0, 0)),
     ("distributed/auto_tune.rs", (1, 0, 0)),
     ("inference/engine/llm_engine/decode.rs", (1, 0, 0)),
     ("inference/engine/llm_engine/load.rs", (1, 0, 0)),

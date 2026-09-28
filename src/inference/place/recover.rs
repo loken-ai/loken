@@ -39,6 +39,12 @@ pub fn shrink_on_oom<T, E: std::fmt::Display>(
     }
 }
 
+/// Makes the `bytes` a request is about to allocate beside its resident weights visible to
+/// every other owner's placement for as long as the returned lease lives.
+pub fn hold_scratch(owner: &'static str, bytes: u64) -> super::vram_manager::DemandLease {
+    super::vram_manager::declare_demand(owner, bytes)
+}
+
 /// One request's escalation of the placement pressure, at most [`PRESSURE_RUNGS`] rungs.
 /// Dropping it takes back the rungs it raised.
 #[derive(Debug, Default)]
