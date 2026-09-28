@@ -136,10 +136,6 @@ fn dimension_constants() -> std::collections::BTreeMap<String, usize> {
 /// shrinks: a file that reads its shape from the checkpoint leaves it.
 const GEOMETRY_DEBT: &[(&str, usize)] = &[
     ("inference/engine/qwen_image_engine.rs", 1),
-    ("inference/media/midi.rs", 1),
-    ("inference/model/acestep/cond.rs", 3),
-    ("inference/model/acestep/fsq.rs", 3),
-    ("inference/model/acestep/textenc.rs", 3),
     ("inference/model/boogu/dit.rs", 3),
     ("inference/model/clip/vision.rs", 1),
     ("inference/model/clip/text.rs", 4),

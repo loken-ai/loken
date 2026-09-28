@@ -18,9 +18,13 @@ use crate::tensor::quantized::gguf_file;
 use crate::tensor::{DType, Device, Tensor};
 
 // MIDI-LLM / AMT vocabulary constants (see slSeanWU/MIDI-LLM + jthickstun/anticipation).
-const LLAMA_VOCAB: u32 = 128256; // base Llama 3.2 vocab; MIDI token id = LLAMA_VOCAB + K
-const BOS_MIDI: u32 = LLAMA_VOCAB + 55026; // AMT_GPT2_BOS_ID = 55026 (AUTOREGRESS)
-const ALLOWED_HI: u32 = LLAMA_VOCAB + 55026; // generation is masked to ids [LLAMA_VOCAB, ALLOWED_HI)
+// A MIDI token id is the id of the first MIDI token, read from the checkpoint's vocabulary,
+// plus its AMT code K.
+/// The first MIDI token: AMT code 0.
+const FIRST_MIDI_TOKEN: &str = "<|midi_token_0|>";
+/// AMT_GPT2_BOS_ID (AUTOREGRESS), which switches the model into MIDI; generation is masked to
+/// the codes below it.
+const AMT_BOS: u32 = 55026;
 const TIME_OFFSET: u32 = 0; // K in [0,10000)     -> onset  (units of 10 ms = 1 MIDI tick here)
 const DUR_OFFSET: u32 = 10_000; // K in [10000,11000) -> duration
 const NOTE_OFFSET: u32 = 11_000; // K in [11000,27512) -> instrument*128 + pitch
@@ -72,6 +76,9 @@ pub fn render_midi(
         .and_then(|(_, v)| v.to_u32().ok())
         .ok_or("gguf: no block_count")? as usize;
     let tok = build_tokenizer_from_gguf(&content).map_err(|e| e.to_string())?;
+    let midi_base = tok
+        .token_to_id(FIRST_MIDI_TOKEN)
+        .ok_or("gguf: the vocabulary carries no MIDI tokens")?;
 
     // Prompt = system wrapper + user text + " " (no chat template, per the reference script).
     let prompt_txt = format!("{SYSTEM_PROMPT}{} ", prompt.trim());
@@ -80,7 +87,7 @@ pub fn render_midi(
         .map_err(|e| e.to_string())?
         .get_ids()
         .to_vec();
-    ids.push(BOS_MIDI); // switch into MIDI generation
+    ids.push(midi_base + AMT_BOS); // switch into MIDI generation
     let pp = ids.len();
 
     // What the model asks of the cards, from its tensor directory and metadata: the blocks,
@@ -162,7 +169,7 @@ pub fn render_midi(
     let logits = model
         .forward(&Tensor::from_vec(ids.clone(), (1, pp), &dev)?, 0)
         .map_err(|e| e.to_string())?;
-    let mut tokid = sample(&row(&logits)?, temperature, top_p, &mut rng);
+    let mut tokid = sample(&row(&logits)?, midi_base, temperature, top_p, &mut rng);
     let mut gen: Vec<u32> = Vec::with_capacity(max_tokens);
     let mut pos = pp;
     while gen.len() < max_tokens {
@@ -171,10 +178,10 @@ pub fn render_midi(
             .forward(&Tensor::from_vec(vec![tokid], (1, 1), &dev)?, pos)
             .map_err(|e| e.to_string())?;
         pos += 1;
-        tokid = sample(&row(&l)?, temperature, top_p, &mut rng);
+        tokid = sample(&row(&l)?, midi_base, temperature, top_p, &mut rng);
     }
 
-    let notes = decode_amt(&gen);
+    let notes = decode_amt(&gen, midi_base);
     if notes.is_empty() {
         return Err("no decodable notes (try more max_tokens or a different seed)".into());
     }
@@ -190,10 +197,11 @@ fn row(logits: &Tensor) -> Result<Vec<f32>, DynErr> {
         .map_err(|e| e.to_string())?)
 }
 
-/// Temperature + top-p nucleus sample over the ALLOWED MIDI id range [LLAMA_VOCAB, ALLOWED_HI);
-/// all other logits are excluded. Returns an absolute token id.
-fn sample(logits: &[f32], temperature: f32, top_p: f32, rng: &mut u64) -> u32 {
-    let (lo, hi) = (LLAMA_VOCAB as usize, ALLOWED_HI as usize);
+/// Temperature + top-p nucleus sample over the MIDI ids below the AMT BOS,
+/// `[midi_base, midi_base + AMT_BOS)`; all other logits are excluded. Returns an absolute
+/// token id.
+fn sample(logits: &[f32], midi_base: u32, temperature: f32, top_p: f32, rng: &mut u64) -> u32 {
+    let (lo, hi) = (midi_base as usize, (midi_base + AMT_BOS) as usize);
     let t = temperature.max(1e-4);
     let mut cand: Vec<(u32, f32)> = (lo..hi.min(logits.len()))
         .map(|i| (i as u32, logits[i]))
@@ -229,7 +237,7 @@ fn sample(logits: &[f32], temperature: f32, top_p: f32, rng: &mut u64) -> u32 {
             return id;
         }
     }
-    cand.last().map(|&(id, _)| id).unwrap_or(LLAMA_VOCAB)
+    cand.last().map(|&(id, _)| id).unwrap_or(midi_base)
 }
 
 struct Note {
@@ -241,16 +249,16 @@ struct Note {
 
 /// Decode the generated ids into notes via the AMT arrival-time scheme: a resyncing state machine
 /// reads (TIME, DUR, NOTE) triples, skipping REST / control / separator / out-of-family tokens.
-fn decode_amt(gen: &[u32]) -> Vec<Note> {
+fn decode_amt(gen: &[u32], midi_base: u32) -> Vec<Note> {
     let mut notes = Vec::new();
     let (mut onset, mut dur) = (0u32, 0u32);
     let mut state = 0u8; // 0 = expect TIME, 1 = expect DUR, 2 = expect NOTE
     for &id in gen {
-        if id < LLAMA_VOCAB {
+        if id < midi_base {
             state = 0;
             continue;
         }
-        let k = id - LLAMA_VOCAB;
+        let k = id - midi_base;
         let is_time = k < MAX_TIME;
         let is_dur = (DUR_OFFSET..DUR_OFFSET + MAX_DUR).contains(&k);
         let is_note = (NOTE_OFFSET..NOTE_OFFSET + MAX_NOTE).contains(&k);
