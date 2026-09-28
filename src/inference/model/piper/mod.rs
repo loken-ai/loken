@@ -20,51 +20,93 @@ fn err(m: impl Into<String>) -> tensor::Error {
     tensor::Error(m.into())
 }
 
-/// VITS hyper-params for a Piper "medium" voice (read off the weight shapes).
-#[derive(Clone)]
+/// VITS hyper-params of a Piper voice, read off the ONNX initializers and conv attributes.
+#[derive(Clone, Debug)]
 pub struct PiperConfig {
-    pub n_symbols: usize,    // phoneme vocab (256)
-    pub hidden: usize,       // 192
-    pub inter: usize,        // 192 (flow/decoder channels)
-    pub filter: usize,       // 768 (FFN)
-    pub n_heads: usize,      // 2
-    pub n_enc_layers: usize, // 6
-    pub window: usize,       // 4 (relative-attention window)
-    pub sample_rate: u32,    // 44100
+    /// Rows of the phoneme embedding.
+    pub n_symbols: usize,
+    /// Width of the text encoder.
+    pub hidden: usize,
+    /// Channels of the flow and the decoder's input.
+    pub inter: usize,
+    pub n_heads: usize,
+    pub n_enc_layers: usize,
+    /// Relative-attention window: positions each side a query sees.
+    pub window: usize,
     // HiFi-GAN
-    pub upsample_rates: Vec<usize>,          // [8,8,4]
-    pub upsample_kernels: Vec<usize>,        // [16,16,8]
-    pub upsample_init: usize,                // 256
-    pub resblock_kernels: Vec<usize>,        // [3,5,7]
-    pub resblock_dilations: Vec<Vec<usize>>, // [[1,3]]x3
-    // inference scales
-    pub noise_scale: f32,  // 0.667
-    pub noise_w: f32,      // 0.8 (duration noise)
-    pub length_scale: f32, // 1.0
+    pub upsample_rates: Vec<usize>,
+    pub upsample_kernels: Vec<usize>,
+    pub resblock_kernels: Vec<usize>,
+    /// Per-kernel MRF dilations, read off the ONNX Conv node attributes (NOT the HiFi-GAN
+    /// ResBlock2 default [1,3]). Padding follows (k-1).d/2.
+    pub resblock_dilations: Vec<Vec<usize>>,
 }
 
-impl Default for PiperConfig {
-    fn default() -> Self {
-        Self {
-            n_symbols: 256,
-            hidden: 192,
-            inter: 192,
-            filter: 768,
-            n_heads: 2,
-            n_enc_layers: 6,
-            window: 4,
-            sample_rate: 44100,
-            upsample_rates: vec![8, 8, 4],
-            upsample_kernels: vec![16, 16, 8],
-            upsample_init: 256,
-            // Per-kernel MRF dilations read off the ONNX Conv node attributes (NOT the HiFi-GAN
-            // ResBlock2 default [1,3]): k3->[1,2], k5->[2,6], k7->[3,12]. Padding follows (k-1).d/2.
-            resblock_kernels: vec![3, 5, 7],
-            resblock_dilations: vec![vec![1, 2], vec![2, 6], vec![3, 12]],
-            noise_scale: 0.667,
-            noise_w: 0.8,
-            length_scale: 1.0,
+impl PiperConfig {
+    pub fn from_onnx(m: &OnnxModel) -> Result<Self> {
+        let dims = |name: &str| -> Result<&[usize]> {
+            m.tensors
+                .get(name)
+                .map(|t| t.dims.as_slice())
+                .ok_or_else(|| err(format!("piper: no `{name}` in the voice")))
+        };
+        let count = |stem: &str, leaf: &str| -> usize {
+            (0..)
+                .take_while(|i| m.contains(&format!("{stem}.{i}.{leaf}")))
+                .count()
+        };
+        let hidden = dims("enc_p.encoder.norm_layers_1.0.gamma")?[0];
+        // The phoneme embedding is the gathered table as wide as the encoder.
+        let n_symbols = m
+            .gather_data
+            .iter()
+            .filter_map(|n| m.tensors.get(n))
+            .find(|t| t.dims.len() == 2 && t.dims[1] == hidden)
+            .map(|t| t.dims[0])
+            .ok_or_else(|| err("piper: no phoneme embedding"))?;
+        // The relative-position table is `[1, 2*window+1, head_dim]`.
+        let rel = dims("enc_p.encoder.attn_layers.0.emb_rel_k")?;
+        let (window, head_dim) = (rel[1] / 2, rel[2]);
+        // Each upsampling ConvTranspose's kernel is twice its stride.
+        let n_ups = count("dec.ups", "weight");
+        let upsample_kernels = (0..n_ups)
+            .map(|i| Ok(dims(&format!("dec.ups.{i}.weight"))?[2]))
+            .collect::<Result<Vec<usize>>>()?;
+        let n_kernels = count("dec.resblocks", "convs.0.bias") / n_ups.max(1);
+        let mut resblock_kernels = Vec::with_capacity(n_kernels);
+        let mut resblock_dilations = Vec::with_capacity(n_kernels);
+        for j in 0..n_kernels {
+            let block = format!("dec.resblocks.{j}.convs");
+            let convs = count(&block, "bias");
+            let mut dils = Vec::with_capacity(convs);
+            for i in 0..convs {
+                let bias = format!("{block}.{i}.bias");
+                if i == 0 {
+                    let w = m
+                        .weight_for_bias(&bias)
+                        .map_or_else(|| format!("{block}.{i}.weight"), str::to_string);
+                    resblock_kernels.push(dims(&w)?[2]);
+                }
+                let d = m
+                    .conv_attrs(&format!("{block}.{i}"))
+                    .and_then(|a| a.dilations.first().copied())
+                    .unwrap_or(1);
+                dils.push(d);
+            }
+            resblock_dilations.push(dils);
         }
+        Ok(Self {
+            n_symbols,
+            hidden,
+            inter: dims("dec.conv_pre.weight")?[1],
+            n_heads: hidden / head_dim.max(1),
+            n_enc_layers: count("enc_p.encoder.attn_layers", "conv_q.bias"),
+            window,
+            upsample_rates: upsample_kernels.iter().map(|k| k / 2).collect(),
+            upsample_kernels,
+            resblock_kernels,
+            resblock_dilations,
+        })
     }
 }
 
@@ -768,7 +810,7 @@ pub struct PiperModel {
 impl PiperModel {
     pub fn load(onnx_path: &std::path::Path, dev: &Device) -> Result<Self> {
         let onnx = OnnxModel::read(onnx_path)?;
-        let cfg = PiperConfig::default();
+        let cfg = PiperConfig::from_onnx(&onnx)?;
         let enc = TextEncoder::load(&onnx, dev, &cfg)?;
         let dp = Sdp::load(&onnx, dev, &cfg)?;
         let flow = Flow::load(&onnx, dev, &cfg)?;
