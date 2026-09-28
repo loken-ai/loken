@@ -6,10 +6,6 @@
 
 use super::*;
 
-/// Chat-template markers a gemma4 file stops on when it carries no
-/// `tokenizer.ggml.eos_token_ids`: turn opener, turn closer, tool-response opener.
-const GEMMA4_TURN_STOP_PIECES: [&str; 3] = ["<|turn>", "<turn|>", "<|tool_response>"];
-
 /// Largest window the runtime reserve prices the KV cache at: the caches start smaller and
 /// grow, and a longer window is admitted by the context planner, not by this reserve.
 const RESERVE_KV_WINDOW: u64 = 8192;
@@ -360,8 +356,10 @@ impl LlmEngine {
                 .collect();
 
             // --- 2. Extract metadata ---
-            let arch = get_gguf_string(&content, "general.architecture")
-                .unwrap_or_else(|| "llama".to_string());
+            // Empty when the file names none: the generic route then refuses it for the facts
+            // it cannot look up.
+            let arch = get_gguf_string(&content, "general.architecture").unwrap_or_default();
+            let facts = crate::inference::model_facts::facts_or_default(&arch);
             // A file may carry neither the key nor a vocabulary; the embedding's row count is
             // the vocabulary whatever the converter wrote. In a split model the embedding may
             // sit in another part, so the parts are consulted as one.
@@ -419,11 +417,10 @@ impl LlmEngine {
                     .collect(),
                 _ => Vec::new(),
             };
-            // A gemma4 file without the eos_token_ids array stops on its chat-template
-            // markers, resolved by their text in this file's vocabulary: a turn opener,
-            // a turn closer and a tool-response opener each end the model's answer.
-            if eos_token_ids_extra.is_empty() && arch == "gemma4" {
-                for text in GEMMA4_TURN_STOP_PIECES {
+            // A file without the eos_token_ids array stops on the pieces its architecture ends
+            // a turn with, resolved by their text in this file's vocabulary.
+            if eos_token_ids_extra.is_empty() {
+                for text in facts.turn_stop_pieces {
                     match super::gguf::gguf_token_id(&content, text) {
                         Some(tok) if tok != eos_token_id => eos_token_ids_extra.push(tok),
                         Some(_) => {}
@@ -467,70 +464,8 @@ impl LlmEngine {
             // (head_dim, n_q_per_kv); a shape outside what they can hold
             // downgrades to kv_quant=Off below.
             let n_q_per_kv = if num_kv_heads > 0 { num_heads / num_kv_heads } else { 1 };
-            // Phi2-style models (parallel attention + LayerNorm with bias)
-            // hit a kernel launch failure on the Q8 attn_output path
-            // ("too many resources requested for launch") even though
-            // their (head_dim, n_q_per_kv) is in the supported set  - 
-            // probably because of the partial RoPE / LayerNorm path
-            // upstream that isn't covered by the Q8 fast path. Force the
-            // KV cache to Off for these models.
-            let _phi2_style = !content.tensor_infos.contains_key("blk.0.ffn_norm.weight")
-                && content.tensor_infos.contains_key("blk.0.attn_norm.bias");
-            // Gemma4 26B-A4B (30-layer MoE variant) has per-layer
-            // head_dim variation (256 SWA + 512 Global). The per-layer
-            // Q8 KV construction in inference/generic_transformer/ gates HD=512
-            // layers off and uses n_kv_head_layer so VRAM stays in
-            // budget. Allow kv_quant through here for it specifically.
-            // gemma4:8b (42 layers, n_kv=2) has its own SWA layers but
-            // the Q8 attention path produces incoherent output on its
-            // shape - keep it on the auto-downgrade path.
-            let kv_arch_check = content.metadata.get("general.architecture")
-                .and_then(|v| match v {
-                    crate::tensor::quantized::gguf_file::Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            // gemma4 stays OFF a quantized KV cache, and the probe that put it back on is
-            // reverted here.
-            //
-            // The probe below reasoned that the old "incoherent" verdict was a missing
-            // HD=512 kernel rather than a precision wall, and re-enabled Q8 for the whole
-            // family. That was already answered. On 2026-06-19 the degeneration was traced
-            // to the cache itself: gemma's k_norm is a uniform ~0.127 scalar, and Q8's
-            // per-block scale amplifies its quantization noise until the output collapses
-            // into repetition - coherent below 1k of context, garbage by 2.5k. The blanket
-            // F16 answer OOM'd the tight 12b/26b/31b, so the shipped fix bounded the F16
-            // SWA cache to its window instead: VRAM-cheap and mathematically exact, since
-            // those layers attend only within it. gemma4:31b then benched at +94-103%.
-            //
-            // Re-enabling Q8 brought the repetition back across the family. The bandwidth
-            // it was reaching for is real but it is not free, and it is not paid for by a
-            // kernel - it needs a K-norm-aware quantization that does not yet exist.
-            let is_gemma4_q8_ok = false;
-            // HD=512 deliberately excluded - Q8 KV at HD=512 produces
-            // degenerate output for gemma4 due to tiny K-norm weights
-            // amplifying quantization noise. Verified with
-            // gemma4:latest. Re-include only when K-norm-aware quant
-            // is implemented.
-            // verified the original gate is correct. Lifting
-            // `!phi2_style` and benching moondream surfaced
-            // `Q8 attn_output: CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`. The
-            // non-dev_pos kernel `attn_output_q8_0_f32_hd64_nq1` uses
-            // 32-warp x 32-thread = 1024-thread blocks; at HD=64 with
-            // moondream's register usage it tips past the 64-reg/thread
-            // budget per the 64K-reg/SM limit. The dev_pos kernel (16
-            // warps, 512 threads) fits but only engages in graph mode,
-            // and phi2 graph capture is itself blocked on the
-            // ILLEGAL_ADDRESS class of bug.
-            //
-            // gate lifted. `try_q8_graph_decode` in
-            // `inference/generic_transformer/` now lazy-primes
-            // cur_pos_dev and runs without the `use_graph_ops` gate,
-            // so phi2 routes through the dev_pos kernels (which DO fit)
-            // even when graph capture is unavailable. Q8KvCache's
-            // `grow_to` gate switched from `cur_pos_dev.is_some()` ->
-            // `graph_captured` flag so the non-graph dev_pos path can
-            // still grow its buffers. phi2 unblocked.
+            // An architecture whose output a quantised cache degrades keeps it unquantised.
+            let quantized_kv_degrades = facts.quantized_kv_degrades;
             // The quantised attention kernels do not cap scores: a model that caps them
             // (Gemma2) keeps the unfused attention that does.
             let caps_attention = content
@@ -541,9 +476,8 @@ impl LlmEngine {
             let has_attn_sinks = content.tensor_infos.contains_key("blk.0.attn_sinks")
                 || content.tensor_infos.contains_key("blk.0.attn_sinks.weight");
             let kv_quant_supported =
-                (crate::inference::cache::kv_core::kv_shape_supported(head_dim, n_q_per_kv)
-                    && kv_arch_check != "gemma4"
-                    || is_gemma4_q8_ok)
+                crate::inference::cache::kv_core::kv_shape_supported(head_dim, n_q_per_kv)
+                    && !quantized_kv_degrades
                     && !caps_attention
                     && !has_attn_sinks;
             // Compile the shape's attention kernels now rather than on the first decoded token.
@@ -564,7 +498,8 @@ impl LlmEngine {
                 // perplexity sits within the F16 error bars), and the device-position
                 // kernels a captured decode graph needs. The models kept off it are decided
                 // above by what they are - a head shape the kernels do not cover, capped
-                // attention scores, gemma4's K-norm - not by a list of names.
+                // attention scores, attention sinks, a cache precision the architecture's
+                // facts rule out - not by a list of names.
                 info!("Auto-promoting kv_quant Off -> Q8 for arch={arch}");
                 KvQuant::Q8
             } else {
@@ -764,7 +699,7 @@ impl LlmEngine {
                     debug!("⬇️  Loading '{}' as generic hetero transformer (CUDA+CPU)...", arch);
                     // An architecture without a RoPE pairing cannot build a config: refuse
                     // it here, before any weight is placed.
-                    crate::inference::generic_transformer::rope_pairing(&arch)
+                    crate::inference::model_facts::rope_pairing(&arch)
                         .map_err(|e| anyhow!("cannot load {arch} as a generic transformer: {e}"))?;
                     // For generic models: CUDA + CPU only (no OpenCL, those need per-model kernels).
                     // Per-layer KV cache memory cost. Used by HeteroPlan to

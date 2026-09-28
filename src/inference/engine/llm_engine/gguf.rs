@@ -266,14 +266,13 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
         Gpt2Default,
     }
     let pre_id = get_gguf_string(content, "tokenizer.ggml.pre").unwrap_or_default();
-    // The gpt-oss architecture is defined with the o200k tokenizer; a file that names no
-    // pre-tokenizer of its own is split the way the architecture was trained.
-    let pre_id = if pre_id == "default"
-        && get_gguf_string(content, "general.architecture").as_deref() == Some("gptoss")
-    {
-        "gpt-4o".to_string()
-    } else {
-        pre_id
+    let arch = get_gguf_string(content, "general.architecture").unwrap_or_default();
+    let facts = crate::inference::model_facts::facts_or_default(&arch);
+    // A file that names no pre-tokenizer of its own is split the way its architecture was
+    // trained, when the architecture's facts say how.
+    let pre_id = match facts.default_pre_tokenizer {
+        Some(trained) if pre_id == "default" => trained.to_string(),
+        _ => pre_id,
     };
     // What the file's pre-tokenizer name means, as the reference defines each type: the split
     // regex, whether merges give way to a greedy longest-vocab match, and whether a BOS leads
@@ -554,17 +553,10 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
         Some(gguf_file::Value::Bool(b)) => *b,
         _ => default_add_bos,
     };
-    let arch = get_gguf_string(content, "general.architecture").unwrap_or_default();
-    // The gemma4 GGUFs declare `add_bos_token = false` and then need one anyway: their chat
-    // template carries `<bos>` as literal text, so the templated path is fed correctly and
-    // only a bare continuation arrives without it. The model is acutely BOS-sensitive, and
-    // what came back was a fragment of the prompt echoed and a stop token - nine tokens where
-    // the reference produced a hundred and twenty-eight.
-    //
-    // llama.cpp overrides the same flag for the same family and logs that it did
-    // (llama-vocab.cpp, "workaround for Gemma 4"). Following the file here would mean
-    // following it into a known-wrong value, so the override is stated rather than silent.
-    let forced_bos = !declared_bos && arch.starts_with("gemma4");
+    // An architecture whose converters declare `add_bos_token = false` although the model needs
+    // a BOS gets one anyway: its chat template writes the BOS, so only a bare continuation
+    // would arrive without it. The override is logged rather than silent.
+    let forced_bos = !declared_bos && facts.forces_bos;
     if forced_bos {
         info!(
             "🔖 {arch} declares add_bos_token=false and needs one regardless - adding it, as \

@@ -39,7 +39,7 @@ impl VisionConfig {
             .metadata
             .get("general.architecture")
             .and_then(|v| v.to_string().ok())
-            .map_or("qwen35moe", |s| s.as_str());
+            .map_or("", |s| s.as_str());
         let g = |k: &str| ct.metadata.get(&format!("{arch}.vision.{k}"));
         let u = |k: &str, d: usize| {
             g(k).and_then(|v| v.to_u32().ok())

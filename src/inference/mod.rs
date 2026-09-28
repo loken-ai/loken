@@ -21,6 +21,7 @@ pub use moe_cuda as moe_cpu;
 
 pub mod engine;
 pub mod generic_transformer;
+pub mod model_facts;
 
 // Re-export engine submodules directly
 pub use engine::llm_engine;

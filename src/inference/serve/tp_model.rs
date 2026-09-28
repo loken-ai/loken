@@ -20,7 +20,7 @@ use anyhow::{bail, Result};
 use std::io::Cursor;
 use std::sync::Arc;
 
-use crate::inference::generic_transformer::rope_pairing;
+use crate::inference::model_facts::rope_pairing;
 use crate::inference::serve::tp_decode::{
     all_reduce_sum_nccl, all_reduce_sum_nccl_f16, make_comms, TpColumn, TpColumnFused, TpRow,
 };
@@ -60,7 +60,7 @@ pub struct TpConfig {
     pub eps: f64,
     pub vocab: usize,
     /// Adjacent-pair (interleaved) RoPE when true, half-split (NeoX) otherwise, from the
-    /// shared `rope_pairing` table.
+    /// architecture facts table.
     pub use_rope_i: bool,
 }
 

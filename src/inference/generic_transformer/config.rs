@@ -88,7 +88,7 @@ pub struct GenericLayerFlags {
     /// Distinguished from fused_ffn_gate_up (Phi3) by ffn_up's output dim
     /// equalling intermediate_size (vs 2x for Phi3).
     pub is_phi2_simple_ffn: bool,
-    /// Gemma4: use GELU activation instead of SiLU in FFN
+    /// The FFN gates through GELU instead of SiLU.
     pub use_gelu: bool,
     /// Llama/Mistral: use interleaved RoPE (rope_i) vs non-interleaved (rope)
     pub use_rope_i: bool,
@@ -157,7 +157,8 @@ impl GenericLayerFlags {
         // may run a recurrent mixer.
         let attn = super::mixer::attention_probe_layer(content, n_layer);
         let has_attn = |suffix: &str| has(&format!("blk.{attn}.{suffix}"));
-        let ffn_norm = arch_conventions(arch).ffn_norm_stem.unwrap_or("ffn_norm");
+        let ffn_norm = ffn_norm_stem(content);
+        let facts = crate::inference::model_facts::facts_or_default(arch);
         Self {
             has_qkv_bias: has_attn("attn_q.bias"),
             has_qk_norm: has_attn("attn_q_norm.weight"),
@@ -186,10 +187,9 @@ impl GenericLayerFlags {
                         .unwrap_or(false)
                 }
             },
-            // The Gemma family gates its FFN with GELU. A GGUF does not record the activation,
-            // so it follows the architecture, as the reference does; layer_output_scale marks
-            // the Gemma4/3n builds that name themselves otherwise.
-            use_gelu: arch.starts_with("gemma") || has("blk.0.layer_output_scale.weight"),
+            // A GGUF does not record the activation: it follows the architecture's facts, and
+            // a per-layer output scale marks a GELU-gated build under any architecture key.
+            use_gelu: facts.gelu_ffn || has("blk.0.layer_output_scale.weight"),
             // parallel-attn (phi2/gpt-neox): one input norm feeds both attn+ffn, so
             // there is no separate ffn_norm. OLMo2 ALSO lacks ffn_norm but is SERIAL
             // post-norm (it has post_ffw_norm) - exclude it so it isn't mis-routed.
@@ -200,9 +200,7 @@ impl GenericLayerFlags {
             has_attn_output_bias: has_attn(&format!("{}.bias", attn_output_name(content))),
             has_ffn_bias: has("blk.0.ffn_down.bias"),
             has_attn_sinks: attn_sinks_name(content, attn).is_some(),
-            // Llama, Mistral and Mistral3 rotate ADJACENT pairs; every other architecture
-            // pairs a dimension with the one half a head away. Getting it wrong does not
-            // fail - it scrambles attention and the model answers nonsense.
+            // The pairing is a fact of the architecture the file does not carry.
             use_rope_i: rope_uses_adjacent_pairs(arch),
             intermediate_size: ffn_dim,
             // A mixture may keep dense blocks ahead of its routed ones.
@@ -282,82 +280,54 @@ pub(super) fn attn_sinks_name(content: &gguf_file::Content, il: usize) -> Option
     .find(|n| content.tensor_infos.contains_key(n))
 }
 
-/// Facts an architecture fixes that its GGUF files do not carry. Every entry names the
-/// reference behaviour it reproduces; a value present in the file's metadata takes
-/// precedence over the one here.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct ArchConventions {
-    /// Period of the sliding-window layers: layer `i` is windowed when
-    /// `i % period < period - 1`, global otherwise, and every layer is windowed at
-    /// period 0. Applies when the file carries no per-layer pattern.
-    pub swa_period: Option<usize>,
-    /// The rotary scaling applies YaRN when the file gives a scaling factor but no
-    /// scaling type.
-    pub yarn_by_default: bool,
-    /// YaRN multiplies the rotary table by `1 + 0.1 ln(factor)`: the attention factor the
-    /// reference rope kernel applies whenever its extrapolation mix is on.
-    pub yarn_attention_factor: bool,
-    /// Routed experts combine gate and up through the clamped SwiGLU
-    /// `x.sigmoid(alpha.x).(1 + up)` with `x = min(gate, limit)` and `up` clamped to
-    /// `[-limit, limit]`, as `(alpha, limit)`.
-    pub expert_swiglu_clamp: Option<(f64, f64)>,
-    /// The router scores experts by sigmoid when the file names no gating function.
-    pub sigmoid_expert_gating: bool,
-    /// Whether sigmoid-routed expert weights are renormalised over the chosen experts,
-    /// over what the file says.
-    pub expert_weights_norm: Option<bool>,
-    /// The attention Q projection interleaves Q and an output gate per head.
-    pub attn_output_gate: bool,
-    /// Name of the norm ahead of the feed-forward, when not `ffn_norm`.
-    pub ffn_norm_stem: Option<&'static str>,
-    /// The file's `v.*` tensors are a Qwen3-VL vision tower whose embeddings splice into the
-    /// text stream with multi-axis rotary positions.
-    pub spliced_vision_tower: bool,
+/// Name of the norm ahead of the feed-forward. A block with neither `ffn_norm` nor a norm
+/// after its feed-forward, but with one after attention, normalises the feed-forward's input
+/// with that `post_attention_norm`.
+pub(super) fn ffn_norm_stem(content: &gguf_file::Content) -> &'static str {
+    let has = |key: &str| content.tensor_infos.contains_key(key);
+    if !has("blk.0.ffn_norm.weight")
+        && !has("blk.0.post_ffw_norm.weight")
+        && has("blk.0.post_attention_norm.weight")
+    {
+        "post_attention_norm"
+    } else {
+        "ffn_norm"
+    }
+}
+
+/// Whether the attention Q projection interleaves Q and an output gate per head: on the
+/// first attending block it is twice as wide as the heads it projects and twice as wide as
+/// what the output projection reads.
+fn q_carries_output_gate(
+    content: &gguf_file::Content,
+    n_layers: usize,
+    n_head: usize,
+    head_dim: usize,
+) -> bool {
+    let il = super::mixer::attention_probe_layer(content, n_layers);
+    let dim = |name: &str, axis: usize| {
+        content
+            .tensor_infos
+            .get(&format!("blk.{il}.{name}.weight"))
+            .and_then(|t| t.shape.dims().get(axis).copied())
+    };
+    match (dim("attn_q", 0), dim(attn_output_name(content), 1)) {
+        (Some(q), Some(o)) => q == 2 * o && q == 2 * n_head * head_dim,
+        _ => false,
+    }
+}
+
+/// Whether the file's `v.*` tower splices its embeddings into the text stream: a patch
+/// embedding and rotary sections over several position axes.
+pub fn splices_vision_tower(content: &gguf_file::Content, arch: &str) -> bool {
+    let key = |k: &str| content.metadata.contains_key(&format!("{arch}.{k}"));
+    content.tensor_infos.contains_key("v.patch_embed.weight")
+        && (key("rope.dimension_sections") || key("rope.mrope_section") || key("mrope_sections"))
 }
 
 /// Whether layer `il` is a sliding-window layer under a period of `period`.
 pub fn windowed_by_period(period: usize, il: usize) -> bool {
     period == 0 || il % period < period - 1
-}
-
-/// The conventions `arch` fixes beyond its files.
-///
-/// gptoss: the reference sets a sliding-window period of 2 (even layers windowed, odd layers
-/// global), rotates with YaRN from the file's `rope.scaling.factor` and
-/// `rope.scaling.original_context_length` with the rope kernel's implicit attention factor,
-/// and gates its experts with the clamped SwiGLU at alpha 1.702 and limit 7.0, constants of
-/// its expert graph that no converter writes.
-pub fn arch_conventions(arch: &str) -> ArchConventions {
-    match arch {
-        "gptoss" => ArchConventions {
-            swa_period: Some(2),
-            yarn_by_default: true,
-            yarn_attention_factor: true,
-            expert_swiglu_clamp: Some((1.702, 7.0)),
-            ..ArchConventions::default()
-        },
-        // qwen35, qwen35moe, qwen3next: the reference reads a gate beside Q from every
-        // attention layer's Q projection, and names the feed-forward's norm
-        // `post_attention_norm`.
-        "qwen35" | "qwen35moe" | "qwen3next" => ArchConventions {
-            attn_output_gate: true,
-            ffn_norm_stem: Some("post_attention_norm"),
-            spliced_vision_tower: true,
-            ..ArchConventions::default()
-        },
-        // nemotron_h_moe: the reference routes by sigmoid whatever the file says.
-        "nemotron_h_moe" => ArchConventions {
-            sigmoid_expert_gating: true,
-            ..ArchConventions::default()
-        },
-        // lfm2moe: the reference renormalises the routed weights of its sigmoid router
-        // whatever the file says.
-        "lfm2moe" => ArchConventions {
-            expert_weights_norm: Some(true),
-            ..ArchConventions::default()
-        },
-        _ => ArchConventions::default(),
-    }
 }
 
 // ------------------------------------------------------------
@@ -416,6 +386,9 @@ pub struct GenericTransformerConfig {
     pub expert_sigmoid_gating: bool,
     /// Sigmoid-routed weights are renormalised over the chosen experts.
     pub expert_weights_norm: bool,
+    /// Softmax-routed weights are renormalised over the chosen experts: the file's
+    /// `norm_top_k_prob` or `expert_weights_norm`, else the architecture's fact.
+    pub expert_topk_norm: bool,
     /// Multiplies sigmoid-routed weights; 1 when the file gives none or zero.
     pub expert_weights_scale: f64,
     /// The recurrent mixers' dimensions, when the file gives `ssm.inner_size`.
@@ -454,108 +427,11 @@ pub struct SsmMeta {
     pub v_heads_tiled: bool,
 }
 
-/// Which pairing RoPE rotates a head with: adjacent lanes `(2i, 2i+1)` (true) or
-/// the half-split `(i, i + head_dim/2)` (false).
-///
-/// THIS CANNOT BE READ FROM THE FILE. GGUF carries no rope-type key, and
-/// `rope.dimension_count` equals head_dim under both conventions, so it does not
-/// discriminate. Both reference implementations derive it from the architecture
-/// with a hardcoded table for the same reason (ollama delegates GGUF inference to
-/// llama.cpp, whose `llama_model_rope_type` is such a table).
-///
-/// So a table is unavoidable - but SILENCE IS NOT. An architecture nobody
-/// classified used to fall through to the half-split pairing without a word, and
-/// that is exactly how the granite families spent months answering fluent English
-/// unrelated to the prompt, with neither the loader, the benchmark nor the
-/// determinism check noticing. Getting this wrong does not crash and does not
-/// look like a bug; it just makes the model answer something else. Every
-/// architecture is therefore named here, and a new one must be classified before
-/// it can load.
-pub fn rope_pairing(arch: &str) -> std::result::Result<bool, String> {
-    // Adjacent pairs: the reference's "norm" rope type.
-    const ADJACENT: &[&str] = &[
-        "llama",
-        "mistral",
-        "mistral3",
-        "smollm3",
-        "ernie4_5",
-        "granite",
-        "granitemoe",
-        "granite3",
-        "yi",
-        "internlm2",
-        "starcoder",
-    ];
-    // Half-split: the reference's "neox" rope type.
-    const HALF_SPLIT: &[&str] = &[
-        "qwen2",
-        "qwen3",
-        "qwen3moe",
-        "qwen35",
-        "qwen35moe",
-        "qwen3next",
-        "gptoss",
-        "lfm2",
-        "lfm2moe",
-        "gemma",
-        "gemma2",
-        "gemma3",
-        "gemma4",
-        "phi",
-        "phi2",
-        "phi3",
-        "phi4",
-        "chatglm",
-        "glm4",
-        "stablelm",
-        "starcoder2",
-        "olmo2",
-        "olmoe",
-        "moondream",
-        "falcon",
-        "falcon3",
-        "dbrx",
-        "orion",
-    ];
-    // Positions come from somewhere other than a rotation - an attention bias, learned
-    // embeddings, or the recurrent layers of a hybrid. The pairing is never consulted,
-    // so the value below is inert; these are listed to keep the gate exhaustive rather
-    // than to choose.
-    const NO_ROPE: &[&str] = &["mpt", "nemotron_h_moe"];
-    if ADJACENT.contains(&arch) {
-        Ok(true)
-    } else if HALF_SPLIT.contains(&arch) || NO_ROPE.contains(&arch) {
-        Ok(false)
-    } else {
-        Err(format!(
-            "architecture {arch:?} is not classified for RoPE pairing. GGUF does not carry \
-             this, so it must be decided from the architecture: add it to ADJACENT (rotating \
-             lanes 2i and 2i+1, what the reference calls the norm type) or to HALF_SPLIT \
-             (lanes i and i + head_dim/2, the neox type) in generic_transformer/config.rs. \
-             Check the reference's llama_model_rope_type for this architecture rather than \
-             guessing: the wrong choice does not fail, it makes the model answer something \
-             else."
-        ))
-    }
-}
-
-/// Period of the layers that skip RoPE (NoPE): layer `i` skips it when `(i + 1)` is a
-/// multiple of the period. None when every layer rotates. GGUF does not carry this, so it
-/// follows the architecture, as the reference does.
-pub fn no_rope_layer_period(arch: &str) -> Option<usize> {
-    match arch {
-        "smollm3" => Some(4),
-        // The reference rotates no nemotron-H attention layer.
-        "nemotron_h_moe" => Some(1),
-        _ => None,
-    }
-}
-
-/// Panicking wrapper for the config builder, which has no error path here. The
-/// message names the file and the choice, so an unclassified architecture stops
-/// at load with an instruction rather than serving wrong answers.
+/// Panicking wrapper for the config builder, which has no error path here. The generic
+/// route refuses an architecture without a pairing before it builds a config, so this only
+/// fires for a caller that skipped that check.
 fn rope_uses_adjacent_pairs(arch: &str) -> bool {
-    match rope_pairing(arch) {
+    match crate::inference::model_facts::rope_pairing(arch) {
         Ok(v) => v,
         Err(e) => panic!("{e}"),
     }
@@ -657,13 +533,13 @@ impl GenericTransformerConfig {
         // Without it the rope frequencies are wrong past the original context and the
         // model emits garbage. The parameters go to `rope::precomput_freqs_cis_yarn`, which
         // is the only place these tables are built.
-        let conventions = arch_conventions(arch);
+        let facts = crate::inference::model_facts::facts_or_default(arch);
         let yarn = {
             let scaling_type = content
                 .metadata
                 .get(&format!("{arch}.rope.scaling.type"))
                 .and_then(|v| v.to_string().ok().map(|s| s.to_string()))
-                .or_else(|| conventions.yarn_by_default.then(|| "yarn".to_string()));
+                .or_else(|| facts.yarn_by_default.then(|| "yarn".to_string()));
             match scaling_type.as_deref() {
                 Some("yarn") => {
                     let factor = meta_f32(content, arch, "rope.scaling.factor").unwrap_or(1.0);
@@ -679,7 +555,7 @@ impl GenericTransformerConfig {
                                 .unwrap_or(32.0),
                             beta_slow: meta_f32(content, arch, "rope.scaling.beta_slow")
                                 .unwrap_or(1.0),
-                            attn_factor: if conventions.yarn_attention_factor {
+                            attn_factor: if facts.yarn_attention_factor {
                                 1.0 + 0.1 * factor.ln()
                             } else {
                                 1.0
@@ -706,7 +582,7 @@ impl GenericTransformerConfig {
         let swa_pattern = meta_u32_array(content, arch, "attention.sliding_window_pattern")
             .map(|arr| arr.iter().map(|&x| x != 0).collect::<Vec<bool>>())
             .filter(|v| !v.is_empty());
-        let swa_period = conventions
+        let swa_period = facts
             .swa_period
             .filter(|_| swa_pattern.is_none() && sliding_window.is_some());
 
@@ -717,15 +593,24 @@ impl GenericTransformerConfig {
         const GATING_SIGMOID: u32 = 2;
         let expert_sigmoid_gating = match meta_u32(content, arch, "expert_gating_func") {
             Some(f) => f == GATING_SIGMOID,
-            None => conventions.sigmoid_expert_gating,
+            None => facts.sigmoid_expert_gating,
         };
-        let expert_weights_norm = conventions.expert_weights_norm.unwrap_or_else(|| {
+        let expert_weights_norm = facts.sigmoid_weights_norm.unwrap_or_else(|| {
             content
                 .metadata
                 .get(&format!("{arch}.expert_weights_norm"))
                 .and_then(|v| v.to_bool().ok())
                 .unwrap_or(false)
         });
+        let meta_bool = |key: &str| {
+            content
+                .metadata
+                .get(&format!("{arch}.{key}"))
+                .and_then(|v| v.to_bool().ok())
+        };
+        let expert_topk_norm = meta_bool("norm_top_k_prob")
+            .or_else(|| meta_bool("expert_weights_norm"))
+            .unwrap_or(facts.softmax_topk_renormalised);
         let ssm = meta_u32(content, arch, "ssm.inner_size").map(|inner| SsmMeta {
             conv_kernel: meta_u32(content, arch, "ssm.conv_kernel").unwrap_or(0) as usize,
             state_size: meta_u32(content, arch, "ssm.state_size").unwrap_or(0) as usize,
@@ -752,28 +637,24 @@ impl GenericTransformerConfig {
 
         let flags = GenericLayerFlags::detect(content, ffn_dim, arch);
 
-        // Embedding scaling: Gemma uses √embedding_length, Granite uses explicit value
+        // Embedding scaling: the file's value, else the square root of the width when the
+        // architecture scales by it.
         let embed_scale = meta_f32(content, arch, "embedding_scale")
             .map(|v| v as f64)
             .or_else(|| {
-                if arch.starts_with("gemma") {
-                    Some((embedding_length as f64).sqrt())
-                } else {
-                    None
-                }
+                facts
+                    .embed_scale_sqrt_width
+                    .then(|| (embedding_length as f64).sqrt())
             });
 
         // Logit scaling: Granite divides logits by this value
         let logit_scale = meta_f32(content, arch, "logit_scale").map(|v| v as f64);
 
-        // Custom attention scale replacing 1/√head_dim (Granite: 0.015625 = 1/64)
-        // Per-arch attention scale override. Gemma4 uses self.scaling=1.0
-        // (NOT the default 1/sqrt(head_dim)) - see llama.cpp's
-        // llama-model.cpp LLM_ARCH_GEMMA4 case where
-        // `hparams.f_attention_scale = 1.0f` is hardcoded.
+        // Attention scale replacing 1/sqrt(head_dim): the file's value, else the
+        // architecture's.
         let attention_scale = meta_f32(content, arch, "attention.scale")
             .map(|v| v as f64)
-            .or_else(|| if arch == "gemma4" { Some(1.0) } else { None });
+            .or(facts.attention_scale);
 
         // Residual connection multiplier (Granite: 0.22)
         let residual_scale = meta_f32(content, arch, "residual_scale").map(|v| v as f64);
@@ -814,13 +695,14 @@ impl GenericTransformerConfig {
             sliding_window,
             swa_pattern,
             swa_period,
-            expert_swiglu_clamp: conventions.expert_swiglu_clamp,
+            expert_swiglu_clamp: facts.expert_swiglu_clamp,
             expert_sigmoid_gating,
             expert_weights_norm,
+            expert_topk_norm,
             expert_weights_scale,
             ssm,
-            attn_output_gate: conventions.attn_output_gate,
-            ffn_norm_stem: conventions.ffn_norm_stem.unwrap_or("ffn_norm"),
+            attn_output_gate: q_carries_output_gate(content, n_layers, n_head, head_dim),
+            ffn_norm_stem: ffn_norm_stem(content),
             shared_kv_layers,
             embed_scale,
             logit_scale,
@@ -836,86 +718,7 @@ impl GenericTransformerConfig {
 }
 
 #[cfg(test)]
-mod rope_pairing_tests {
-    use super::rope_pairing;
-
-    #[test]
-    fn every_served_architecture_is_classified() {
-        // The architectures the engine advertises as supported. A new one added
-        // to the dispatch without a pairing must fail here, not in production.
-        for arch in [
-            "llama",
-            "mistral",
-            "mistral3",
-            "qwen2",
-            "qwen3",
-            "qwen3moe",
-            "qwen35",
-            "qwen35moe",
-            "gptoss",
-            "nemotron_h_moe",
-            "lfm2moe",
-            "gemma",
-            "gemma2",
-            "gemma3",
-            "gemma4",
-            "phi",
-            "phi2",
-            "phi3",
-            "phi4",
-            "glm4",
-            "stablelm",
-            "starcoder",
-            "starcoder2",
-            "granite",
-            "granite3",
-            "granitemoe",
-            "dbrx",
-            "internlm2",
-            "yi",
-            "orion",
-            "mpt",
-            "moondream",
-            "smollm3",
-            "ernie4_5",
-            "olmo2",
-            "olmoe",
-        ] {
-            assert!(rope_pairing(arch).is_ok(), "{arch} has no RoPE pairing");
-        }
-    }
-
-    #[test]
-    fn granite_rotates_on_adjacent_pairs() {
-        // The regression this gate exists for: both granite families answered
-        // fluent but unrelated text under the half-split pairing.
-        assert_eq!(rope_pairing("granite"), Ok(true));
-        assert_eq!(rope_pairing("granitemoe"), Ok(true));
-        assert_eq!(rope_pairing("qwen3"), Ok(false));
-    }
-
-    #[test]
-    fn the_pairing_matches_the_reference_where_intuition_gets_it_wrong() {
-        // Four architectures whose pairing does not follow from the family name,
-        // and which a first pass classified from memory rather than from the
-        // reference. They are pinned so a future edit has to consult it too.
-        assert_eq!(rope_pairing("starcoder"), Ok(true)); // adjacent, unlike starcoder2
-        assert_eq!(rope_pairing("starcoder2"), Ok(false));
-        assert_eq!(rope_pairing("dbrx"), Ok(false)); // routed, but not a llama pairing
-        assert_eq!(rope_pairing("orion"), Ok(false));
-        assert!(rope_pairing("mpt").is_ok()); // no rotation at all: the value is inert
-    }
-
-    #[test]
-    fn an_unclassified_architecture_is_refused_with_instructions() {
-        let e = rope_pairing("brand_new_arch").unwrap_err();
-        assert!(e.contains("not classified"), "{e}");
-        assert!(e.contains("ADJACENT") && e.contains("HALF_SPLIT"), "{e}");
-    }
-}
-
-#[cfg(test)]
-mod arch_conventions_tests {
+mod arch_facts_tests {
     use super::*;
     use crate::tensor::quantized::gguf_file::{Content, TensorInfo, Value, VersionedMagic};
     use crate::tensor::quantized::GgmlDType;
@@ -1052,7 +855,10 @@ mod arch_conventions_tests {
             cfg.yarn.is_none(),
             "no scaling type and no convention: no YaRN"
         );
-        assert_eq!(arch_conventions("qwen3"), ArchConventions::default());
+        assert_eq!(
+            crate::inference::model_facts::facts("qwen3").and_then(|f| f.swa_period),
+            None
+        );
     }
 
     /// The dimensions of a small lfm2moe-shaped model: block 0 a short convolution, block 1
@@ -1247,11 +1053,10 @@ mod arch_conventions_tests {
             (4, inner, state, groups, nheads)
         );
         assert_eq!(
-            no_rope_layer_period("nemotron_h_moe"),
+            crate::inference::model_facts::no_rope_layer_period("nemotron_h_moe"),
             Some(1),
             "no layer rotates"
         );
-        assert!(rope_pairing("nemotron_h_moe").is_ok());
     }
 
     #[test]
@@ -1363,6 +1168,33 @@ mod arch_conventions_tests {
             (ssm.group_count, ssm.time_step_rank, ssm.state_size),
             (2, 4, 8)
         );
+    }
+
+    #[test]
+    fn softmax_renormalisation_follows_the_file_then_the_facts() {
+        let olmoe =
+            GenericTransformerConfig::from_gguf(&gptoss_like("olmoe", None), "olmoe").unwrap();
+        assert!(
+            !olmoe.expert_topk_norm,
+            "the architecture weights by the full softmax"
+        );
+        let qwen3 =
+            GenericTransformerConfig::from_gguf(&gptoss_like("qwen3", None), "qwen3").unwrap();
+        assert!(qwen3.expert_topk_norm);
+        let mut said = gptoss_like("olmoe", None);
+        said.metadata
+            .insert("olmoe.norm_top_k_prob".into(), Value::Bool(true));
+        let said = GenericTransformerConfig::from_gguf(&said, "olmoe").unwrap();
+        assert!(said.expert_topk_norm, "the file's key wins");
+    }
+
+    #[test]
+    fn an_ungated_q_projection_and_a_plain_ffn_norm_are_read_as_such() {
+        let content = gptoss_like("gptoss", None);
+        let cfg = GenericTransformerConfig::from_gguf(&content, "gptoss").unwrap();
+        assert!(!cfg.attn_output_gate);
+        assert_eq!(cfg.ffn_norm_stem, "ffn_norm");
+        assert!(!splices_vision_tower(&content, "gptoss"));
     }
 
     #[test]

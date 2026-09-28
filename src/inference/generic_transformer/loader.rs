@@ -969,12 +969,10 @@ fn build_generic_layer(
             expert_ffn_dim: flags.expert_ffn_dim,
             router_prenormed,
             use_silu,
-            // Real activation, decoupled from the use_silu layout flag: GELU only for
-            // gemma4-MoE (flags.use_gelu, keyed on layer_output_scale.weight).
+            // Real activation, decoupled from the use_silu layout flag.
             gelu: flags.use_gelu,
-            // OLMoE uses raw softmax-over-all top-K weights (no renorm); all other
-            // MoE arches renormalize the top-K to sum to 1.
-            norm_topk: config.arch != "olmoe",
+            // Whether the chosen experts' softmax weights are rescaled to sum to one.
+            norm_topk: config.expert_topk_norm,
             sigmoid_routing: config
                 .expert_sigmoid_gating
                 .then(|| -> Result<SigmoidRouting> {
@@ -1163,7 +1161,7 @@ fn build_generic_layer(
         attn_output_bias,
         attn_sinks,
         attn_sinks_host,
-        no_rope: no_rope_layer_period(&config.arch)
+        no_rope: crate::inference::model_facts::no_rope_layer_period(&config.arch)
             .is_some_and(|period| (raw.layer_idx + 1).is_multiple_of(period)),
         attn_norm,
         attn_norm_weight_f32,
@@ -1299,13 +1297,13 @@ fn build_generic_layer(
             };
             config.shared_kv_layers > 0 && raw.layer_idx < first_kv_shared
         },
-        // gemma4 F16 KV lever (kv_quant==Off only - Q8/Q4 caches already halve
-        // the read). Opt-out A/B knob `LOKEN_GEMMA4_F32_KV` keeps the F32
-        // path for measurement. gemma4 detected by arch; other arches unchanged.
+        // An unquantised cache on a card stores F16 when the architecture keeps its cache
+        // unquantised: the half-width read stands in for the quantised one it cannot take.
         // A sink layer stores F16 too: its card decode attention reads F16 K/V.
         kv_f16: {
             use crate::inference::engine::llm_engine::KvQuant;
-            (config.arch == "gemma4" || has_sinks)
+            (crate::inference::model_facts::facts_or_default(&config.arch).quantized_kv_degrades
+                || has_sinks)
                 && matches!(config.kv_quant, KvQuant::Off)
                 && device.is_cuda()
         },
@@ -2788,7 +2786,7 @@ impl GenericHeteroTransformer {
         // The vision tower of a family whose images splice into the text stream, on the card
         // of the first layer; the tower runs on a card only.
         let spliced_vision = match (
-            arch_conventions(&config.arch).spliced_vision_tower,
+            splices_vision_tower(&content, &config.arch),
             content.tensor_infos.contains_key("v.patch_embed.weight"),
             layer_devs.first(),
         ) {

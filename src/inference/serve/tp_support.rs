@@ -5,11 +5,10 @@
 //! scaling of embeddings, attention, residuals or logits, full causal attention, and a
 //! dense SiLU-gated FFN. The decision reads the file's tensors and metadata; only the
 //! facts GGUF does not record (RoPE pairing, NoPE layers, FFN activation) follow the
-//! architecture, through the same tables the generic transformer uses.
+//! architecture, through the facts table the generic transformer uses.
 
-use crate::inference::generic_transformer::{
-    no_rope_layer_period, rope_pairing, GenericTransformerConfig,
-};
+use crate::inference::generic_transformer::GenericTransformerConfig;
+use crate::inference::model_facts::{no_rope_layer_period, rope_pairing};
 use crate::tensor::quantized::gguf_file;
 
 /// Number of GPUs the decoder shards every layer across.
@@ -363,6 +362,6 @@ mod tests {
 
     #[test]
     fn an_unclassified_architecture_is_refused() {
-        assert!(refusal(&dense("brand_new_arch"), "brand_new_arch").contains("not classified"));
+        assert!(refusal(&dense("brand_new_arch"), "brand_new_arch").contains("has no entry"));
     }
 }
