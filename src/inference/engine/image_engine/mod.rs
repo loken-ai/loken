@@ -360,9 +360,6 @@ fn encode_flux_text(
     let mut t5_tokens = encode_ids(&state.t5_tokenizer, prompt, "T5")?;
     let real_len = t5_tokens.len();
     const T5_LEN: usize = 256;
-    /// CLIP's context length: the size of its positional embedding table, and so a
-    /// hard limit rather than a preference.
-    const CLIP_CONTEXT: usize = 77;
     if t5_tokens.len() > T5_LEN {
         t5_tokens.truncate(T5_LEN);
     } else {
@@ -409,18 +406,19 @@ fn encode_flux_text(
     // CLIP, on the device it was placed on.
     let clip_t = std::time::Instant::now();
     let mut clip_tokens = encode_ids(&state.clip_tokenizer, prompt, "CLIP")?;
-    // CLIP's positional table is exactly CLIP_CONTEXT entries, so a longer prompt
-    // indexes past the end and the render dies with "index 77 out of range 77". T5
-    // above was already truncated; this one never was.
+    // CLIP's positional table has exactly `clip_context` rows, so a longer prompt
+    // indexes past the end and the render dies with an out-of-range index. T5 above
+    // was already truncated; this one never was.
     //
     // The last token must stay the END marker: CLIP's pooled embedding is read AT that
     // position, so a blunt truncate would pool from whatever word happened to land
     // last and quietly change the conditioning instead of just shortening it.
-    if clip_tokens.len() > CLIP_CONTEXT {
+    let clip_context = state.clip_context;
+    if clip_tokens.len() > clip_context {
         let end = *clip_tokens.last().unwrap_or(&0);
-        clip_tokens.truncate(CLIP_CONTEXT - 1);
+        clip_tokens.truncate(clip_context - 1);
         clip_tokens.push(end);
-        info!("Flux CLIP: prompt over {CLIP_CONTEXT} tokens, truncated (T5 still sees {T5_LEN})");
+        info!("Flux CLIP: prompt over {clip_context} tokens, truncated (T5 still sees {T5_LEN})");
     }
     let clip_input = Tensor::new(&clip_tokens[..], &state.clip_device)?.unsqueeze(0)?;
     let clip_emb = state

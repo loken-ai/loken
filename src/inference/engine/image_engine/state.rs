@@ -45,6 +45,9 @@ pub struct FluxModelState {
     /// Device the CLIP text encoder lives on.
     pub clip_device: Device,
     pub clip_tokenizer: Tokenizer,
+    /// CLIP's context length: the rows of its positional table, and so a hard limit on the
+    /// tokens it reads rather than a preference.
+    pub clip_context: usize,
     pub ae: crate::inference::model::flux::vae::AutoEncoder,
     /// Device the VAE lives on. At 1024^2 the Flux transformer fills GPU0 during
     /// denoise, so the VAE decode is placed on the (idle-by-then) T5 GPU when a

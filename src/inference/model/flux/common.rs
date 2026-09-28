@@ -25,53 +25,113 @@ pub struct Config {
     pub theta: usize,
     /// Whether the attention's input projection carries a bias.
     pub qkv_bias: bool,
-    /// Whether this checkpoint expects to be told a guidance scale. It is the one field the two
-    /// published sizes disagree on.
+    /// Whether this checkpoint expects to be told a guidance scale: it carries a projection
+    /// for one.
     pub guidance_embed: bool,
+    /// How wide a scalar conditioning is made before it is embedded: the denoise step and the
+    /// guidance scale are each one number, spread over this many sines and cosines so that two
+    /// nearby steps are told apart at every frequency the transformer can read.
+    pub scalar_embed: usize,
 }
 
-/// How wide a scalar conditioning is made before it is embedded: the denoise step and the
-/// guidance scale are each one number, spread over this many sines and cosines so that two
-/// nearby steps are told apart at every frequency the transformer can read.
-pub(crate) const SCALAR_EMBED: usize = 256;
+/// How FLUX's rotary table splits a head between the image index and the two pixel
+/// coordinates, and the base its frequencies are drawn from. The reference fixes both and
+/// the checkpoint does not store them.
+const ROPE_AXES: [usize; 3] = [16, 56, 56];
+const ROPE_THETA: usize = 10_000;
 
 impl Config {
-    /// The two published checkpoints are the same transformer. `dev` was distilled with a
-    /// guidance scale it expects to be told at inference, and `schnell` was not - that one
-    /// flag is the whole difference, and spelling the other eleven fields out twice was an
-    /// invitation for them to drift apart.
-    fn shared(guidance_embed: bool) -> Self {
-        // The head is the unit the transformer is stated in. One is 128 channels wide, split by
-        // the rotary table between the image index and the two pixel coordinates; the stream is
-        // twenty-four of them side by side. The single-stream blocks are twice as many as the
-        // double-stream ones, which is what makes the second half of the depth the cheap half.
-        let axes_dim = vec![16, 56, 56];
-        let heads = 24;
-        let two_stream = 19;
-        Self {
-            // Sixteen VAE channels folded over the four pixels of a 2x2 patch.
-            in_channels: 16 * 4,
-            // CLIP's pooled vector, then T5's sequence.
-            vec_in_dim: 768,
-            context_in_dim: 4096,
-            hidden_size: heads * axes_dim.iter().sum::<usize>(),
-            mlp_ratio: 4.0,
-            num_heads: heads,
-            depth: two_stream,
-            depth_single_blocks: 2 * two_stream,
-            axes_dim,
-            theta: 10_000,
-            qkv_bias: true,
-            guidance_embed,
+    /// The transformer's shape, read from the checkpoint's header: GGUF or safetensors, with
+    /// or without a `model.diffusion_model.` style prefix on the names.
+    pub fn from_checkpoint(path: &std::path::Path) -> Result<Self> {
+        let header = Header::read(path)?;
+        let full = |name: &str| -> Option<&String> {
+            let dotted = format!(".{name}");
+            header
+                .names
+                .iter()
+                .find(|k| k.as_str() == name || k.ends_with(&dotted))
+        };
+        let dims = |name: &str| -> Result<Vec<usize>> {
+            full(name).and_then(|k| header.shape(k)).ok_or_else(|| {
+                Error(format!(
+                    "{}: no `{name}` in this FLUX checkpoint",
+                    path.display()
+                ))
+            })
+        };
+        let count = |stack: &str| -> usize {
+            let marker = format!("{stack}.");
+            let indices: std::collections::BTreeSet<usize> = header
+                .names
+                .iter()
+                .filter_map(|k| {
+                    let at = k.find(&marker)?;
+                    (at == 0 || k.as_bytes()[at - 1] == b'.').then_some(())?;
+                    k[at + marker.len()..].split('.').next()?.parse().ok()
+                })
+                .collect();
+            (0..).take_while(|i| indices.contains(i)).count()
+        };
+        let [hidden_size, in_channels] = dims("img_in.weight")?[..] else {
+            return Err(Error("flux: img_in is not a matrix".into()));
+        };
+        let head_dim = dims("double_blocks.0.img_attn.norm.query_norm.scale")?[0];
+        let mlp_hidden = dims("double_blocks.0.img_mlp.0.weight")?[0];
+        Ok(Self {
+            in_channels,
+            vec_in_dim: dims("vector_in.in_layer.weight")?[1],
+            context_in_dim: dims("txt_in.weight")?[1],
+            hidden_size,
+            mlp_ratio: mlp_hidden as f64 / hidden_size.max(1) as f64,
+            num_heads: hidden_size / head_dim.max(1),
+            depth: count("double_blocks"),
+            depth_single_blocks: count("single_blocks"),
+            axes_dim: ROPE_AXES.to_vec(),
+            theta: ROPE_THETA,
+            qkv_bias: full("double_blocks.0.img_attn.qkv.bias").is_some(),
+            guidance_embed: full("guidance_in.in_layer.weight").is_some(),
+            scalar_embed: dims("time_in.in_layer.weight")?[1],
+        })
+    }
+}
+
+/// The tensor directory of a GGUF or safetensors checkpoint: its names, and each one's
+/// stored shape, row-major.
+struct Header {
+    names: Vec<String>,
+    source: HeaderSource,
+}
+
+enum HeaderSource {
+    Gguf(crate::tensor::quantized::gguf_file::Content),
+    SafeTensors(crate::tensor::safetensors_io::SafeTensorsLoader),
+}
+
+impl Header {
+    fn read(path: &std::path::Path) -> Result<Self> {
+        let source = if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        {
+            HeaderSource::Gguf(crate::tensor::quantized::gguf_file::open_header(path)?)
+        } else {
+            HeaderSource::SafeTensors(unsafe {
+                crate::tensor::safetensors_io::SafeTensorsLoader::multi(&[path])
+            }?)
+        };
+        let names = match &source {
+            HeaderSource::Gguf(c) => c.tensor_infos.keys().cloned().collect(),
+            HeaderSource::SafeTensors(ld) => ld.names().into_iter().map(str::to_string).collect(),
+        };
+        Ok(Self { names, source })
+    }
+
+    fn shape(&self, name: &str) -> Option<Vec<usize>> {
+        match &self.source {
+            HeaderSource::Gguf(c) => c.tensor_infos.get(name).map(|i| i.shape.dims().to_vec()),
+            HeaderSource::SafeTensors(ld) => ld.shape_of(name),
         }
-    }
-
-    pub fn dev() -> Self {
-        Self::shared(true)
-    }
-
-    pub fn schnell() -> Self {
-        Self::shared(false)
     }
 }
 

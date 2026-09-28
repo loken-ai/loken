@@ -110,30 +110,21 @@ impl ImageEngine {
                     e
                 })?
             };
-            // Decide single-device vs multi-device based on model size and available VRAM
-            // Kontext is a guidance-distilled (dev-family) checkpoint -> dev config
-            // (guidance_embed on); plain schnell otherwise. A safetensors checkpoint states its
-            // own family: a `guidance_in` tensor in the header = dev (e.g. the Rayflux fp8
-            // fine-tunes) - probe the header instead of trusting the filename.
+            // Decide single-device vs multi-device based on model size and available VRAM.
+            // The transformer's shape, and whether it was distilled to be told a guidance
+            // scale, are read from the checkpoint's own header.
             // Stable identity of the resident checkpoint: its file name. Two model
             // tags resolving to the same file legitimately share a resident model;
             // different files must never be treated as interchangeable.
             let flux_ckpt_id: Option<String> = flux_model_file
                 .file_name()
                 .map(|f| f.to_string_lossy().to_string());
-            let is_kontext = flux_model_file.to_string_lossy().to_lowercase().contains("kontext");
-            let is_safetensors_ckpt = flux_model_file
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
-            let is_dev = is_kontext
-                || (is_safetensors_ckpt
-                    && crate::inference::load::fp8_scaled::header_contains(&flux_model_file, "guidance_in"));
-            let flux_cfg = if is_dev {
-                crate::inference::model::flux::common::Config::dev()
-            } else {
-                crate::inference::model::flux::common::Config::schnell()
-            };
-            let total_blocks = flux_cfg.depth + flux_cfg.depth_single_blocks; // 57
+            let flux_cfg = crate::inference::model::flux::common::Config::from_checkpoint(
+                &flux_model_file,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let is_dev = flux_cfg.guidance_embed;
+            let total_blocks = flux_cfg.depth + flux_cfg.depth_single_blocks;
             // WHAT THIS REQUEST NEEDS TO DENOISE, beyond the weights. Derived from the
             // model's own width and head count and from the geometry being rendered -
             // never a fixed byte count. A constant is wrong in both directions at once:
@@ -151,7 +142,7 @@ impl ImageEngine {
             let embedding_overhead = {
                 let h = flux_cfg.hidden_size as u64;
                 let projections = (flux_cfg.in_channels + flux_cfg.context_in_dim
-                    + FLUX_TIME_FREQ_DIM
+                    + flux_cfg.scalar_embed
                     + flux_cfg.vec_in_dim) as u64
                     * h;
                 let conditioning_mlps = 3 * h * h;
@@ -384,6 +375,14 @@ impl ImageEngine {
             // file also holds the vision tower, so its size bounds the text tower's.
             let clip_config = crate::inference::model::clip::text::Config::vit_l_14();
             let clip_bytes = std::fs::metadata(&clip_model_file).map_or(0, |m| m.len());
+            // The positions the encoder reads: its positional table's rows, from the file.
+            let clip_context = unsafe {
+                crate::tensor::safetensors_io::SafeTensorsLoader::multi(&[&clip_model_file])
+            }
+            .ok()
+            .and_then(|ld| ld.shape_of("text_model.embeddings.position_embedding.weight"))
+            .map(|d| d[0])
+            .ok_or_else(|| anyhow!("CLIP: no positional table in {}", clip_model_file.display()))?;
             let aux_cards = crate::inference::place::ladder::aside(
                 &crate::inference::place::ladder::cards(0),
                 &hot_cards,
@@ -566,6 +565,7 @@ impl ImageEngine {
                     clip_model,
                     clip_device,
                     clip_tokenizer,
+                    clip_context,
                     ae,
                     vae_device,
                     ae_cpu,

@@ -148,5 +148,3 @@ pub const FLUX_PATCH: usize = 2;
 /// The text conditioning is padded to a fixed length and rides in the same sequence
 /// as the image tokens, so it is part of what the attention is sized for.
 pub const FLUX_TEXT_TOKENS: usize = 256;
-/// Width of the sinusoidal timestep embedding feeding the conditioning MLPs.
-pub(super) const FLUX_TIME_FREQ_DIM: usize = 256;

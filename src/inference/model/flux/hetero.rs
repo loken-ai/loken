@@ -1178,7 +1178,7 @@ impl HeteroFlux {
         )
         .map_err(|e| anyhow::anyhow!("txt_in: {e}"))?;
         let time_in =
-            common::MlpEmbedder::new(common::SCALAR_EMBED, cfg.hidden_size, &emb_vb.pp("time_in"))
+            common::MlpEmbedder::new(cfg.scalar_embed, cfg.hidden_size, &emb_vb.pp("time_in"))
                 .map_err(|e| anyhow::anyhow!("time_in: {e}"))?;
         let vector_in =
             common::MlpEmbedder::new(cfg.vec_in_dim, cfg.hidden_size, &emb_vb.pp("vector_in"))
@@ -1186,7 +1186,7 @@ impl HeteroFlux {
         let guidance_in = if cfg.guidance_embed {
             Some(
                 common::MlpEmbedder::new(
-                    common::SCALAR_EMBED,
+                    cfg.scalar_embed,
                     cfg.hidden_size,
                     &emb_vb.pp("guidance_in"),
                 )
@@ -1482,12 +1482,12 @@ impl HeteroFlux {
         // at whatever width the text encoder publishes. A checkpoint distilled without a
         // guidance scale has no projection for one, and is asked for none.
         let time_in =
-            common::MlpEmbedder::new(common::SCALAR_EMBED, cfg.hidden_size, &vb.pp("time_in"))?;
+            common::MlpEmbedder::new(cfg.scalar_embed, cfg.hidden_size, &vb.pp("time_in"))?;
         let vector_in =
             common::MlpEmbedder::new(cfg.vec_in_dim, cfg.hidden_size, &vb.pp("vector_in"))?;
         let guidance_in = if cfg.guidance_embed {
             Some(common::MlpEmbedder::new(
-                common::SCALAR_EMBED,
+                cfg.scalar_embed,
                 cfg.hidden_size,
                 &vb.pp("guidance_in"),
             )?)
@@ -1743,7 +1743,7 @@ impl crate::inference::model::flux::sampling::WithForward for HeteroFlux {
         let mut txt = cached_or(&self.txt_in_cache, &txt_key, || txt.apply(&self.txt_in))?;
         let mut img = img.apply(&self.img_in)?;
         let vec_ =
-            timestep_embedding(&timesteps, common::SCALAR_EMBED, dtype)?.apply(&self.time_in)?;
+            timestep_embedding(&timesteps, self.cfg.scalar_embed, dtype)?.apply(&self.time_in)?;
         let vec_ = match (
             self.guidance_in.as_ref(),
             guidance.as_ref(),
@@ -1751,7 +1751,7 @@ impl crate::inference::model::flux::sampling::WithForward for HeteroFlux {
         ) {
             (Some(g_in), Some(guidance), Some(g_key)) => {
                 let g_emb = cached_or(&self.guidance_in_cache, g_key, || {
-                    timestep_embedding(guidance, common::SCALAR_EMBED, dtype)?.apply(g_in)
+                    timestep_embedding(guidance, self.cfg.scalar_embed, dtype)?.apply(g_in)
                 })?;
                 (vec_ + g_emb)?
             }

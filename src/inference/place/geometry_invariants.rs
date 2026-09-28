@@ -135,8 +135,6 @@ fn dimension_constants() -> std::collections::BTreeMap<String, usize> {
 /// Files that still write a model dimension as a constant, with how many. The list only
 /// shrinks: a file that reads its shape from the checkpoint leaves it.
 const GEOMETRY_DEBT: &[(&str, usize)] = &[
-    ("inference/engine/image_engine/mod.rs", 1),
-    ("inference/engine/image_engine/params.rs", 1),
     ("inference/engine/qwen_image_engine.rs", 1),
     ("inference/media/midi.rs", 1),
     ("inference/model/acestep/cond.rs", 3),
@@ -146,7 +144,6 @@ const GEOMETRY_DEBT: &[(&str, usize)] = &[
     ("inference/model/clip/vision.rs", 1),
     ("inference/model/clip/text.rs", 4),
     ("inference/model/deepseek_v41/mod.rs", 2),
-    ("inference/model/flux/common.rs", 1),
     ("inference/model/flux2/dit.rs", 2),
     ("inference/model/kyutai/mimi.rs", 1),
     ("inference/model/mixformer/mod.rs", 2),
