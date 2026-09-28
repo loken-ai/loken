@@ -1196,28 +1196,18 @@ fn build_generic_layer(
                 }
             })
             .transpose()?,
-        // KV cache initial sizing.
-        // For Q4/Q8 archs the F16 SpecKvCache buffer is NEVER realized (decode
-        // runs on the quantized cache); only `max_seq_len` is read for graph-mode
-        // `padded_mask` sizing, which MUST equal effective_max_context - too small
-        // fires the "pos >= mask_width" graceful-fallback mid-decode (verified
-        // cause of deepcoder/qwen3 long-decode regressions).
-        // For kv_quant==Off (gemma4) the buffer IS filled. Pre-allocating
-        // effective_max_context (e.g. 32768) per GLOBAL layer overran the
-        // planner's KV reserve (sized to the request context) -> CUDA OOM on
-        // VRAM-tight 2-GPU variants (gemma4:31b 2.5K). Start at the lazy cap and
-        // grow on demand (append doubles) - matching the Q4/Q8 lazy caches and
-        // the reserve's planning context; a growth that runs out of card memory
-        // is recovered by the placement ladder.
+        // KV cache initial sizing: the working window, doubled on demand up to the model's
+        // context. The dense cache is filled by F-dtype layers and by the fused attention of
+        // quantised layers alike, so allocating the whole context up front puts gigabytes
+        // per layer on the card for a window nobody has used. A captured graph bound to the
+        // old width is dropped and recorded again when the cache grows, and a growth that
+        // runs out of card memory is recovered by the placement ladder.
         kv_cache: {
             use crate::inference::cache::KV_WORKING_WINDOW_TOKENS as LAZY_KV_INITIAL_CAP;
-            use crate::inference::engine::llm_engine::KvQuant;
-            let full = config.effective_max_context().max(512);
-            let init_cap = if matches!(config.kv_quant, KvQuant::Off) {
-                full.min(LAZY_KV_INITIAL_CAP)
-            } else {
-                full
-            };
+            let init_cap = config
+                .effective_max_context()
+                .max(512)
+                .min(LAZY_KV_INITIAL_CAP);
             let mut c = SpecKvCache::new(init_cap);
             // gemma4 bounded sliding-window attention: SWA layers only attend within
             // `sliding_window`, so the cache need keep only the last
@@ -1638,7 +1628,12 @@ fn build_awq_layer(
         ple_proj: None,
         ple_post_norm: None,
         ple_output_scale: None,
-        kv_cache: SpecKvCache::new(config.effective_max_context().max(512)),
+        kv_cache: SpecKvCache::new(
+            config
+                .effective_max_context()
+                .max(512)
+                .min(crate::inference::cache::KV_WORKING_WINDOW_TOKENS),
+        ),
         cpu_q8_kv: None,
         cpu_f16_kv: None,
         cpu_decode_arena: None,

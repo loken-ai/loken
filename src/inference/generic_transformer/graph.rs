@@ -171,6 +171,11 @@ impl GenericHeteroTransformer {
         if self.layers.iter().any(|l| l.attn_sinks.is_some()) {
             return Err("attention sinks: the captured decode attention has no sink term");
         }
+        // A routed expert set allocates per token, which a capture cannot contain, whatever
+        // cache the attention writes.
+        if self.layers.iter().any(|l| l.moe.is_some()) {
+            return Err("routed experts: the expert set changes per token");
+        }
         if let Some(why) = self.kv_state_graph_block() {
             return Err(why);
         }

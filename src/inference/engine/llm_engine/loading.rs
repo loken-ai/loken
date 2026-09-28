@@ -558,12 +558,6 @@ impl LlmEngine {
                     head_dim, n_q_per_kv, &model_id_clone
                 );
                 KvQuant::Off
-            } else if kv_quant_supported && matches!(kv_quant, KvQuant::Off)
-                && arch == "qwen3moe" {
-                // qwen3moe (qwen3-coder), measured: Q4 outperforms Q8 on its own
-                // loader - decode +17%.
-                info!("Auto-promoting kv_quant Off -> Q4 for arch={arch}");
-                KvQuant::Q4
             } else if kv_quant_supported && matches!(kv_quant, KvQuant::Off) {
                 // Every model the quantised kernels serve takes a Q8 cache: half the bytes
                 // per token read at each decode step, reference-grade accuracy (Q8_0 KV

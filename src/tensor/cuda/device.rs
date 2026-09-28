@@ -81,9 +81,16 @@ pub(crate) fn with_oom_retry<T>(
             if e.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY
                 && !stream_capturing(dev) =>
         {
+            // The call stack, when RUST_LIB_BACKTRACE asks for it, names the allocation
+            // that did not fit; without it the stack is not captured.
+            let stack = std::backtrace::Backtrace::capture();
             tracing::warn!(
-                "cuda OOM in {ctx} on GPU{}; reclaiming pool and retrying once",
-                dev.ordinal()
+                "cuda OOM in {ctx} on GPU{}; reclaiming pool and retrying once{}",
+                dev.ordinal(),
+                match stack.status() {
+                    std::backtrace::BacktraceStatus::Captured => format!("\n{stack}"),
+                    _ => String::new(),
+                }
             );
             emergency_reclaim(dev);
             f().map_err(|e2| alloc_err(ctx, e2))
