@@ -1508,7 +1508,9 @@ impl GenericHeteroTransformer {
                     };
                     Some((t * ple_scale)?)
                 } else if let Some((ref bf16_tensor, _total_dim)) = self.ple_token_embd_bf16 {
-                    let t = bf16_tensor.index_select(&input_ids.flatten_all()?, 0)?;
+                    // The table stays where it was loaded; the ids go to it.
+                    let ids = input_ids.flatten_all()?.to_device(&bf16_tensor.device())?;
+                    let t = bf16_tensor.index_select(&ids, 0)?;
                     let t = t.to_dtype(crate::tensor::DType::F32)?;
                     Some((t * ple_scale)?)
                 } else {
