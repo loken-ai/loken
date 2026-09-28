@@ -22,17 +22,6 @@ pub(super) fn all_cancelled(failures: &[String]) -> bool {
 /// produced and nothing went wrong.
 pub(super) const CLIENT_CLOSED_REQUEST: u16 = 499;
 
-/// Did this render die for want of VRAM?
-///
-/// The substrate tags allocation failures with a stable marker precisely so callers
-/// can branch on memory pressure, but nothing in the image path ever asked - so an
-/// exhausted card produced the same opaque failure as a corrupt checkpoint, and the
-/// one recovery that would have worked was never attempted.
-pub(super) fn is_vram_exhaustion(e: &(dyn std::error::Error + Send + Sync)) -> bool {
-    let s = e.to_string();
-    s.contains("[oom]") || s.contains("out of memory") || s.contains("out_of_memory")
-}
-
 /// A render the resident family refused over a request parameter, as the validation
 /// error it is: the client can retry without the parameter, so it answers 400.
 pub(super) fn refused_parameter(
@@ -42,20 +31,6 @@ pub(super) fn refused_parameter(
         .map(|refusal| ApiError::Validation(refusal.to_string()))
 }
 
-/// Render, and if the render runs out of VRAM, RE-PLAN and try once more.
-///
-/// Placement reserves what the request needs, but the card is shared: another engine,
-/// another process, or a concurrent request can take the room between the decision
-/// and the denoise. The model is resident by then, so the request has nowhere to go -
-/// and since nothing about the resident model changes on its own, every request after
-/// it fails the same way. That is what a warm server returning one identical failure
-/// per request looks like from the outside.
-///
-/// Dropping the resident returns its card, and the reload plans again against what is
-/// actually free - a split or a spill, which is slow but finishes. One retry only: if
-/// the second attempt also runs out, the pressure is not transient and the error is
-/// the honest answer.
-/// Whether this node has the weights `model_name` resolves to.
 /// Whether this node's catalogue holds the family, judged by the same rule a peer is
 /// judged by. Judged by a checkpoint finder instead, a node that served the family from
 /// a hub directory answered no and handed its own renders to a smaller peer.
@@ -92,6 +67,12 @@ pub(crate) fn serves_image_family(
     })
 }
 
+/// Render, and when the render runs out of card memory recover through the request
+/// ladder of [`crate::inference::place::recover::retry_on_oom`].
+///
+/// The card is shared: another engine, another process or a concurrent request can take
+/// the room between the placement and the denoise, and a resident model does not move on
+/// its own, so every later request would fail the same way.
 pub(super) async fn generate_image_resilient(
     state: &APIServer,
     model_name: &str,
@@ -102,17 +83,6 @@ pub(super) async fn generate_image_resilient(
     crate::inference::engine::image_engine::RenderedImage,
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    // Enough attempts to reach the guaranteed floor. Each exhaustion raises the
-    // pressure one notch, and the top notch places the model on the host, which always
-    // fits - so the sequence terminates in something that runs rather than in an error.
-    // A single retry was not enough: at the first notch the model may still be planned
-    // mostly on the card that just ran out.
-    const ATTEMPTS: usize = 5;
-    // START FROM NO PRESSURE, for the same reason the LLM load does: the degrade level is
-    // this request's escalation, not a standing property of the machine. Left over from an
-    // earlier request it shrinks every card by 4 GB a notch and sends work to the host
-    // while VRAM sits free.
-    crate::inference::place::vram_manager::vram_degrade_reset();
     // Make this render's activation peak visible to every OTHER subsystem for as long as
     // it runs. NVML reports what is ALLOCATED, and a denoise allocates its scratch as it
     // goes, so a model loading alongside a render reads the card as far emptier than it
@@ -127,73 +97,39 @@ pub(super) async fn generate_image_resilient(
         "media",
         family_runtime_bytes(&state.huggingface_models_dir, loader, model_name, geom),
     );
-    for attempt in 0..ATTEMPTS {
-        match state
-            .image_engine
-            .generate_image_seeded(prompt, params.clone())
-            .await
-        {
-            Ok(v) => {
-                // The render finished, so whatever pressure it raised is over. Leaving
-                // it raised would keep spilling later requests to the host for as long
-                // as the process lives.
-                crate::inference::place::vram_manager::vram_degrade_reset();
-                return Ok(v);
-            }
-            Err(e) if is_vram_exhaustion(e.as_ref()) && attempt + 1 < ATTEMPTS => {
-                // NOTHING IS RECORDED HERE.
-                //
-                // The store behind this holds what a render was measured to HOLD. The free
-                // memory of the resident card at the moment an attempt died is a different
-                // quantity: one is a demand, the other is how much room there happened to be
-                // where it stopped. A render that exhausts has not measured its peak - it
-                // has measured where it was interrupted.
-                //
-                // And the store only rises, so a single failure became the demand for
-                // every later request of that shape, for as long as the process lives.
-                // Observed: a 1536 square attempt died with 9.53 GB free, that figure
-                // became the demand, and the re-plan it produced asked 16.04 GB of a
-                // 16.4 GB card - the failure had pushed the next placement towards the
-                // edge instead of away from it.
-                //
-                // The escalation this was standing in for is the pressure counter below,
-                // which exists for exactly this and is bounded. Two mechanisms for one
-                // decision, and the one that decided was the one measuring the wrong
-                // thing.
-                // NO REFUSAL. I put one here - "this machine needs X GB and has Y,
-                // about NxN fits" - on the reasoning that a mostly-host placement
-                // cannot finish inside a request, so an immediate answer beats a
-                // timeout. That is not the contract: the system degrades, it does not
-                // decline. A render that takes the slow path is a render; a 500 is
-                // nothing, and it arrived on a machine that had just done the same
-                // size moments earlier, because the figure it compared against was
-                // free VRAM at that instant - which still held the model this very
-                // request was about to unload.
-                //
-                // The escalation below is the fallback, and it ends somewhere that
-                // always fits.
-                // Raise the pressure BEFORE re-planning. Re-planning against unchanged
-                // numbers hands back a byte-identical placement that fails identically -
-                // observed directly, which is what this counter fixes.
-                let level = crate::inference::place::vram_manager::vram_degrade();
-                tracing::warn!(
-                    "image: {model_name} ran out of VRAM rendering {}x{} ({e}) - pressure now \
-                     {level}, dropping it and re-planning further out rather than failing",
-                    geom.width,
-                    geom.height,
-                );
-                state.image_engine.unload().await;
-                ensure_image_model_loaded(state, model_name, geom)
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-            }
-            Err(e) => {
-                crate::inference::place::vram_manager::vram_degrade_reset();
-                return Err(e);
-            }
-        }
-    }
-    unreachable!("the loop returns on the last attempt")
+    // An exhausted card is a placement that stopped being true: each re-plan drops the
+    // resident and loads it one pressure rung further off the cards, the last rung on the
+    // host, so the walk ends in something that runs. Nothing is recorded from a failed
+    // attempt: the free memory where a render stopped is not the demand it would have held.
+    crate::inference::place::recover::retry_on_oom(
+        model_name,
+        || {
+            state
+                .image_engine
+                .generate_image_seeded(prompt, params.clone())
+        },
+        crate::inference::place::recover::oom_message,
+        crate::inference::place::ladder::release_pools,
+        || std::future::ready(0),
+        |_, _| async move {
+            replan_image(state, model_name, geom)
+                .await
+                .err()
+                .map(|e| Err(e.into()))
+        },
+    )
+    .await
+}
+
+/// Drops the resident image model and loads it again at the pressure in force, for a
+/// render that ran out of card memory.
+pub(super) async fn replan_image(
+    state: &APIServer,
+    model_name: &str,
+    geom: crate::inference::place::runtime_demand::RequestGeometry,
+) -> Result<(), String> {
+    state.image_engine.unload().await;
+    ensure_image_model_loaded(state, model_name, geom).await
 }
 
 /// A spawned task that must not outlive the request that wanted it.
@@ -278,26 +214,18 @@ pub(crate) async fn ensure_image_model_loaded_reporting(
         // silently made repatriation unreachable for every large family.
         let reserve = family_runtime_bytes(&state.huggingface_models_dir, loader, model_name, geom);
         let hot = family_hot_bytes(&state.huggingface_models_dir, loader, model_name) + reserve;
-        let free: Vec<u64> = crate::inference::place::vram_manager::probe(0)
-            .into_iter()
-            .map(|(_, f, _)| f)
-            .collect();
-        let fits_whole = free.iter().any(|f| *f >= hot);
-        // A split ACROSS THE GPUS is a normal placement; a spill to the CPU is not.
-        // Testing only "does one card hold it whole" left a model whose weights exceed
-        // any single card running partly on the host forever - which is what the user
-        // sees as a generation that pins the CPU with both GPUs idle. If the cards can
-        // hold it between them, re-planning is worth the reload whatever one card can
-        // do alone.
-        let fits_across = free.iter().sum::<u64>() >= hot;
-        if fits_whole || fits_across {
+        let fit = crate::inference::place::room::free_fit(hot);
+        // A split ACROSS THE GPUS is a normal placement; a spill to the CPU is not. If the
+        // cards can hold it between them, re-planning is worth the reload whatever one card
+        // can do alone.
+        if fit.whole || fit.across {
             tracing::info!(
                 "image: resident {model_name} is split/spilled and the GPUs can now take it \
                  ({:.1} GB incl. {:.1} GB reserve; {} whole, {} across) - re-planning",
                 hot as f64 / 1e9,
                 reserve as f64 / 1e9,
-                if fits_whole { "fits" } else { "does not fit" },
-                if fits_across { "fits" } else { "does not fit" },
+                if fit.whole { "fits" } else { "does not fit" },
+                if fit.across { "fits" } else { "does not fit" },
             );
             repatriate = true;
         }
@@ -366,7 +294,7 @@ pub(crate) async fn ensure_image_model_loaded_reporting(
             "image",
             hot,
             0,
-            std::time::Duration::from_secs(IMAGE_HEADROOM_WAIT_SECS),
+            crate::api::handlers::GATE_WAIT,
         )
         .await
         {
@@ -388,69 +316,59 @@ pub(crate) async fn ensure_image_model_loaded_reporting(
                 ));
             }
         }
-        // A headroom check is not a RESERVATION: between the check above and the
-        // upload below, another engine can take the card - and it does, under
-        // concurrent chat/audio load. The loaders now refuse to silently put a hot
-        // transformer on the CPU (that produced a 600 s hang that returned nothing),
-        // so a lost race surfaces as a load error. Wait for the next gap and try
-        // again a bounded number of times before telling the caller to retry.
+        // A headroom check is not a RESERVATION: between the check above and the upload
+        // below, another engine can take the card, and a lost race surfaces as a load that
+        // ran out of memory. The request ladder recovers it: the pools come back, then the
+        // partial load is dropped and, once a gap opens, placed again one rung further off.
         type LoadErr = Box<dyn std::error::Error + Send + Sync>;
-        let mut load_result: Result<(), LoadErr> =
-            Err("image load not attempted".to_string().into());
-        // Serialise against any OTHER subsystem's load. The retry loop below exists
-        // because a load can lose the card to a concurrent one; this stops the race from
-        // happening rather than recovering from it afterwards. Taken AFTER the headroom
-        // protocol on purpose - that step can wait on a busy resident, and holding the
-        // admission lock through the wait would block the very loader it is waiting for.
+        // Serialise against any OTHER subsystem's load. Taken AFTER the headroom protocol
+        // on purpose - that step can wait on a busy resident, and holding the admission
+        // lock through the wait would block the very loader it is waiting for.
         let _admission = crate::inference::place::vram_manager::load_admission().await;
-        for attempt in 1..=IMAGE_LOAD_ATTEMPTS {
-            // Load-scoped cancellation: if the client disconnects while the (long) load runs,
-            // this future is dropped, the guard fires, and the blocking loader bails at its
-            // next per-tensor/per-block check instead of decoding gigabytes for nobody.
-            let load_cancel = crate::inference::serve::cancel::CancelToken::new();
-            let load_guard = crate::inference::serve::cancel::CancelGuard::new(load_cancel.clone());
-            // Cloned per attempt: a retry builds a new `LoadStage`, and the caller's
-            // receiver has to outlive all of them.
-            let report = report.clone();
-            load_result = load_image_family(
-                &state.image_engine,
-                &state.huggingface_models_dir,
-                loader,
-                model_name,
-                geom,
-                None,
-                report,
-                Some(load_cancel.clone()),
-            )
-            .await;
-            load_guard.disarm();
-            if load_result.is_ok() || attempt == IMAGE_LOAD_ATTEMPTS {
-                break;
-            }
-            tracing::warn!(
-                "image: load attempt {attempt}/{IMAGE_LOAD_ATTEMPTS} lost the card to another \
-                 engine ({}); waiting for a gap and retrying",
-                load_result
-                    .as_ref()
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_default()
-            );
-            // Drop whatever partial state the failed load left, then wait for room
-            // again - the resident that took the card is usually idle by now.
-            state.image_engine.unload().await;
-            if crate::inference::place::vram_manager::ensure_gpu_headroom_within(
-                "image",
-                hot,
-                0,
-                std::time::Duration::from_secs(IMAGE_HEADROOM_WAIT_SECS),
-            )
-            .await
-                == Headroom::Busy
-            {
-                break;
-            }
-        }
+        let load_result: Result<(), LoadErr> = crate::inference::place::recover::retry_on_oom(
+            model_name,
+            || {
+                // Cloned per attempt: a retry builds a new `LoadStage`, and the caller's
+                // receiver has to outlive all of them.
+                let report = report.clone();
+                async move {
+                    // Load-scoped cancellation: if the client disconnects while the (long)
+                    // load runs, this future is dropped, the guard fires, and the blocking
+                    // loader bails at its next per-tensor/per-block check.
+                    let load_cancel = crate::inference::serve::cancel::CancelToken::new();
+                    let load_guard =
+                        crate::inference::serve::cancel::CancelGuard::new(load_cancel.clone());
+                    let loaded = load_image_family(
+                        &state.image_engine,
+                        &state.huggingface_models_dir,
+                        loader,
+                        model_name,
+                        geom,
+                        None,
+                        report,
+                        Some(load_cancel.clone()),
+                    )
+                    .await;
+                    load_guard.disarm();
+                    loaded
+                }
+            },
+            crate::inference::place::recover::oom_message,
+            crate::inference::place::ladder::release_pools,
+            || std::future::ready(0),
+            |_, oom| async move {
+                state.image_engine.unload().await;
+                let room = crate::inference::place::vram_manager::ensure_gpu_headroom_within(
+                    "image",
+                    hot,
+                    0,
+                    crate::api::handlers::GATE_WAIT,
+                )
+                .await;
+                (room == Headroom::Busy).then(|| Err(oom.into()))
+            },
+        )
+        .await;
         load_result.map_err(|e| format!("load image model: {e}"))?;
     } else {
         // ALREADY RESIDENT: the pressure protocol above only runs on the load path,
@@ -674,22 +592,20 @@ pub(crate) async fn handle_image_generation(
             // Phase 2: Generate image with progress.
             //
             // An exhausted card is a placement that stopped being true, not a broken
-            // render: drop the resident so its memory returns, plan again against
-            // what is free, and try once. Reachable from BOTH the failed call and the
-            // mid-render event, because the denoise reports exhaustion as an event.
-            let mut replanned = false;
+            // render: re-plan one pressure rung further off the cards and render again.
+            // Reachable from BOTH the failed call and the mid-render event, because the
+            // denoise reports exhaustion as an event.
+            let mut pressure = crate::inference::place::recover::Pressure::new();
             'render: loop {
             let attempt_params = params.clone();
             let _cg = crate::inference::serve::cancel::CancelGuard::new(attempt_params.cancel.clone());
             let _res = image_engine.generate_image_stream(&prompt, attempt_params).await;
             _cg.disarm();
             if let Err(e) = &_res {
-                if !replanned && is_vram_exhaustion(e.as_ref()) {
-                    replanned = true;
-                    let level = crate::inference::place::vram_manager::vram_degrade();
-                    tracing::warn!("image stream: {model_name_owned} out of VRAM ({e}) - re-planning at pressure {level}");
-                    image_engine.unload().await;
-                    let _ = ensure_image_model_loaded(&stream_state, &model_name_owned, stream_geom).await;
+                if crate::inference::place::ladder::is_out_of_memory(e)
+                    && pressure.raise(&model_name_owned, e).is_some()
+                {
+                    let _ = replan_image(&stream_state, &model_name_owned, stream_geom).await;
                     continue 'render;
                 }
             }
@@ -697,16 +613,10 @@ pub(crate) async fn handle_image_generation(
                 Ok(mut rx) => {
                     while let Some(event) = rx.recv().await {
                         if let ImageStreamEvent::Error(msg) = &event {
-                            if !replanned
-                                && (msg.contains("[oom]")
-                                    || msg.contains("out of memory")
-                                    || msg.contains("out_of_memory"))
+                            if crate::inference::place::ladder::is_out_of_memory(msg)
+                                && pressure.raise(&model_name_owned, msg).is_some()
                             {
-                                replanned = true;
-                                let level = crate::inference::place::vram_manager::vram_degrade();
-                                tracing::warn!("image stream: {model_name_owned} out of VRAM mid-render ({msg}) - re-planning at pressure {level}");
-                                image_engine.unload().await;
-                                let _ = ensure_image_model_loaded(&stream_state, &model_name_owned, stream_geom).await;
+                                let _ = replan_image(&stream_state, &model_name_owned, stream_geom).await;
                                 continue 'render;
                             }
                         }

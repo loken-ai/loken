@@ -1301,8 +1301,7 @@ fn route_violations() -> std::collections::BTreeMap<String, (usize, usize, usize
 /// The list only shrinks: a file routed through the planner leaves it, and a count that
 /// drops has to be written down here.
 const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
-    ("api/handlers/media/generate.rs", (2, 6, 0)),
-    ("api/handlers/media/video.rs", (0, 3, 0)),
+    ("api/handlers/media/generate.rs", (1, 0, 0)),
     ("api/handlers/separate.rs", (1, 0, 0)),
     ("distributed/auto_tune.rs", (1, 0, 0)),
     ("inference/engine/audio_engine.rs", (2, 0, 0)),
@@ -1314,12 +1313,9 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("inference/engine/image_engine/mod.rs", (2, 0, 0)),
     ("inference/engine/image_engine/resident.rs", (1, 0, 0)),
     ("inference/engine/llm_engine/decode.rs", (1, 0, 0)),
-    ("inference/engine/llm_engine/generate.rs", (0, 2, 0)),
     ("inference/engine/llm_engine/load.rs", (1, 0, 0)),
     ("inference/engine/llm_engine/loading.rs", (7, 0, 0)),
     ("inference/engine/llm_engine/mod.rs", (3, 0, 0)),
-    ("inference/engine/llm_engine/params.rs", (0, 2, 0)),
-    ("inference/engine/llm_engine/stream.rs", (0, 6, 0)),
     ("inference/engine/qwen_image_engine.rs", (5, 0, 0)),
     ("inference/generic_transformer/graph.rs", (1, 0, 0)),
     ("inference/generic_transformer/loader.rs", (5, 0, 0)),

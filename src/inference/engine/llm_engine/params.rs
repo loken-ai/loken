@@ -139,17 +139,6 @@ pub(super) fn clamp_prompt_to_window(
     out
 }
 
-pub(crate) fn is_cuda_oom<E: std::fmt::Display>(err: &E) -> bool {
-    let s = err.to_string().to_ascii_lowercase();
-    s.contains("out of memory")
-        || s.contains("cuda_error_out_of_memory")
-        // cuBLAS workspace / handle allocation failures surface with a
-        // cuBLAS status rather than the driver OOM string; treat the
-        // alloc-class ones as recoverable too.
-        || s.contains("cublas_status_alloc_failed")
-        || s.contains("alloc_failed")
-}
-
 pub(super) static RAYON_INIT: Once = Once::new();
 
 /// Inference configuration for the language engine

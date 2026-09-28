@@ -1725,47 +1725,31 @@ impl APIServer {
         // escalation and a memory of an old failure.
         #[cfg(feature = "audio")]
         crate::inference::place::vram_manager::vram_degrade_reset();
-        const LOAD_ATTEMPTS: usize = 3;
-        let mut engine = Arc::new(LlmEngine::with_config(config.clone()));
-        let mut last_err = String::new();
-        let mut attempt = 0;
-        while attempt < LOAD_ATTEMPTS {
-            attempt += 1;
-            match engine.load_model().await.map_err(|e| e.to_string()) {
-                Ok(()) => {
-                    last_err.clear();
-                    break;
+        // Each attempt loads a fresh engine: the pools come back first, then idle residents
+        // give way, then every re-plan loads one pressure rung further off the cards.
+        let loaded = crate::inference::place::recover::retry_on_oom(
+            model_id,
+            || {
+                let config = config.clone();
+                async move {
+                    let engine = Arc::new(LlmEngine::with_config(config));
+                    engine.load_model().await.map_err(|e| e.to_string())?;
+                    Ok::<_, String>(engine)
                 }
-                Err(e) => {
-                    last_err = e;
-                    let out_of_memory = last_err.to_lowercase().contains("out of memory")
-                        || last_err.to_lowercase().contains("oom");
-                    if !out_of_memory {
-                        break;
-                    }
-                    // An idle resident gives its memory back before the placement degrades;
-                    // the retry that follows does not count against the degradation steps.
-                    if self.evict_idle_llm(model_id).await > 0 {
-                        attempt -= 1;
-                        engine = Arc::new(LlmEngine::with_config(config.clone()));
-                        continue;
-                    }
-                    if attempt == LOAD_ATTEMPTS {
-                        break;
-                    }
-                    let level = crate::inference::place::vram_manager::vram_degrade();
-                    tracing::warn!(
-                        "llm: {model_id} ran out of VRAM loading ({last_err}) - pressure now \
-                         {level}, re-planning further off the GPU rather than failing"
-                    );
-                    engine = Arc::new(LlmEngine::with_config(config.clone()));
-                }
+            },
+            crate::inference::place::recover::oom_message,
+            crate::inference::place::ladder::release_pools,
+            || self.evict_idle_llm(model_id),
+            |_, _| std::future::ready(None),
+        )
+        .await;
+        let engine = match loaded {
+            Ok(engine) => engine,
+            Err(e) => {
+                tracing::warn!("llm: {model_id} failed to load: {e}");
+                return Err(e);
             }
-        }
-        if !last_err.is_empty() {
-            tracing::warn!("llm: {model_id} failed to load: {last_err}");
-            return Err(last_err);
-        }
+        };
         // Measure this node's placement cost for the model, once, while it is loaded: the on-card
         // layer time and the cost of a routed expert missed to the cores. Published in gossip so the
         // cluster plans a cut from measured facts. A model with no streamed experts declares no
@@ -2743,9 +2727,9 @@ fn non_chat_pipeline_component(model_name: &str) -> Option<&'static str> {
 // Error Types
 // ============================================================================
 
-/// How long a request may wait for the single in-flight inference slot before the
-/// server answers 503 instead of queueing forever behind a wedged generation.
-const GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a request may wait for its turn, at the inference slot or for card room,
+/// before the server answers 503 instead of queueing forever behind a wedged generation.
+pub(crate) const GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Acquire the request gate with a bounded wait; `Err(ApiError::Busy)` (-> 503) on timeout.
 async fn acquire_gate(

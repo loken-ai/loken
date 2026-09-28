@@ -222,16 +222,6 @@ pub(super) fn find_local_flux_gguf(hf_models_dir: &str, model_name: &str) -> Opt
     best
 }
 
-/// How long an image load waits for a GPU to free up before telling the caller to
-/// retry. Long enough to cover a chat generation or two (the usual thing holding the
-/// card), short enough that a user is not left hanging.
-pub(super) const IMAGE_HEADROOM_WAIT_SECS: u64 = 90;
-
-/// How many times a load may lose its card to another engine mid-upload before the
-/// caller is told to retry. Two retries cover the usual case (a chat generation and
-/// an audio render finishing) without letting a request grind on indefinitely.
-pub(super) const IMAGE_LOAD_ATTEMPTS: u32 = 3;
-
 /// Detect whether model name refers to Z-Image. Includes the Ray drop-in
 /// variant Rayzist (an fp8-scaled Z-Image fine-tune).
 pub(crate) fn is_z_image_model(model_name: &str) -> bool {

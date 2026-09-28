@@ -78,51 +78,34 @@ impl LlmEngine {
         Ok(())
     }
 
-    /// Generate text (non-streaming) with real model inference, through the
-    /// out-of-memory recovery stages of [`retry_on_oom`].
+    /// Generate text (non-streaming) with real model inference, through the request
+    /// recovery of [`place::recover::retry_on_oom`](crate::inference::place::recover::retry_on_oom).
     ///
-    /// The load path re-plans a placement that does not fit and the prefill path
-    /// halves its chunk; the activation allocations of the decode loop are covered
-    /// here. The pools hold blocks that belong to no live tensor, so handing them
-    /// back is often enough; when it is not, the idle language models give way.
+    /// The load path re-plans a placement that does not fit and the prefill path shrinks its
+    /// chunk; the activation allocations of the decode loop are covered here. The pools hold
+    /// blocks that belong to no live tensor, so handing them back is often enough; when it is
+    /// not, the idle language models give way, and then this model is re-placed further off
+    /// the cards.
     pub async fn generate(
         &self,
         prompt: &str,
         params: GenerationParams,
     ) -> Result<GenerationResult, Box<dyn std::error::Error>> {
-        // The outcome ends with this block: an error is not `Send` across the next await.
-        let oom = {
-            let outcome = retry_on_oom(
-                || self.generate_once(prompt, params.clone()),
-                |outcome| match outcome {
-                    Err(e) if is_cuda_oom(e) => Some(e.to_string()),
-                    _ => None,
-                },
-                || crate::inference::place::vram_manager::evict_idle_llm(&self.config.model_id),
-                release_cuda_pools,
-            )
-            .await;
-            match &outcome {
-                Err(e) if is_cuda_oom(e) => e.to_string(),
-                _ => return outcome,
-            }
-        };
-        if self.reload_further_off().await {
-            return self.generate_once(prompt, params).await;
-        }
-        Err(oom.into())
+        crate::inference::place::recover::retry_on_oom(
+            &self.config.model_id,
+            || self.generate_once(prompt, params.clone()),
+            crate::inference::place::recover::oom_message,
+            release_cuda_pools,
+            || crate::inference::place::vram_manager::evict_idle_llm(&self.config.model_id),
+            |_, oom| async move { (!self.reload_further_off().await).then(|| Err(oom.into())) },
+        )
+        .await
     }
 
-    /// Reloads the model one step further off the cards, for a request that ran out of
-    /// memory with the pools returned and nothing left to evict: the placement that
-    /// loaded it left the cards too little room to serve that request.
+    /// Reloads the model at the pressure in force, for a request that ran out of memory with
+    /// the pools returned and nothing left to evict: the placement that loaded it left the
+    /// cards too little room to serve that request.
     pub(super) async fn reload_further_off(&self) -> bool {
-        let level = crate::inference::place::vram_manager::vram_degrade();
-        warn!(
-            "{}: out of memory with nothing left to evict; reloading it further off the \
-             cards (pressure {level})",
-            self.config.model_id
-        );
         let unloaded = self.unload().await.map_err(|e| e.to_string());
         if let Err(e) = unloaded {
             warn!(
@@ -2136,112 +2119,5 @@ impl LlmEngine {
         });
 
         Ok(rx)
-    }
-}
-
-/// Runs `attempt` until an outcome `oom` does not flag as out of memory, and
-/// returns that outcome. The stages: the attempt as is, again after `release`
-/// returns the pools, then once per idle language model `evict_idle` unloads
-/// (least recently used first, never the model holding the request), and a
-/// last attempt whose outcome is returned whatever it is. Any outcome `oom`
-/// does not flag ends the stages at once.
-///
-/// A flagged outcome is dropped before the next attempt is awaited: an outcome
-/// that carries a `Box<dyn Error>` is not `Send`, and holding it across that
-/// await would make the caller's future non-`Send`, which axum rejects.
-pub(super) async fn retry_on_oom<T, A, AF, O, E, EF, R>(
-    mut attempt: A,
-    oom: O,
-    mut evict_idle: E,
-    release: R,
-) -> T
-where
-    A: FnMut() -> AF,
-    AF: std::future::Future<Output = T>,
-    O: Fn(&T) -> Option<String>,
-    E: FnMut() -> EF,
-    EF: std::future::Future<Output = u64>,
-    R: Fn(),
-{
-    // Each outcome lives in a block that ends before the next await.
-    let message = {
-        let outcome = attempt().await;
-        match oom(&outcome) {
-            None => return outcome,
-            Some(message) => message,
-        }
-    };
-    warn!("OOM during generation ({message}); returning the pools and retrying once");
-    release();
-    {
-        let outcome = attempt().await;
-        if oom(&outcome).is_none() {
-            return outcome;
-        }
-    }
-    warn!("still out of memory after returning the pools; unloading idle models");
-    while evict_idle().await > 0 {
-        release();
-        {
-            let outcome = attempt().await;
-            if oom(&outcome).is_none() {
-                return outcome;
-            }
-        }
-        warn!("still out of memory after unloading an idle model");
-    }
-    release();
-    attempt().await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::retry_on_oom;
-    use std::cell::Cell;
-
-    /// Replays `outcomes` in order, `true` standing for an out-of-memory
-    /// attempt, with `idle` models to evict; returns the attempt that ended
-    /// the stages, the evictions asked for and the pool releases.
-    fn run(outcomes: &[bool], idle: u64) -> (usize, u64, usize) {
-        let attempts = Cell::new(0usize);
-        let evictions = Cell::new(0u64);
-        let releases = Cell::new(0usize);
-        let ended = futures::executor::block_on(retry_on_oom(
-            || {
-                let n = attempts.get();
-                attempts.set(n + 1);
-                std::future::ready((n, outcomes[n]))
-            },
-            |&(_, is_oom)| is_oom.then(|| "out of memory".to_string()),
-            || {
-                let n = evictions.get();
-                evictions.set(n + 1);
-                std::future::ready(u64::from(n < idle))
-            },
-            || releases.set(releases.get() + 1),
-        ));
-        (ended.0, evictions.get(), releases.get())
-    }
-
-    #[test]
-    fn a_first_success_or_other_error_ends_at_once() {
-        assert_eq!(run(&[false], 2), (0, 0, 0));
-    }
-
-    #[test]
-    fn released_pools_are_tried_before_any_eviction() {
-        assert_eq!(run(&[true, false], 2), (1, 0, 1));
-    }
-
-    #[test]
-    fn each_evicted_model_earns_one_attempt() {
-        assert_eq!(run(&[true, true, false], 2), (2, 1, 2));
-        assert_eq!(run(&[true, true, true, false], 2), (3, 2, 3));
-    }
-
-    #[test]
-    fn the_last_attempt_is_returned_once_no_model_is_idle() {
-        assert_eq!(run(&[true, true, true, true, true], 2), (4, 3, 4));
-        assert_eq!(run(&[true, true, true], 0), (2, 1, 2));
     }
 }

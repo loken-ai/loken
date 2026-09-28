@@ -1203,11 +1203,9 @@ pub(crate) async fn images_generations(
                 };
                 // Running out of VRAM is not a rendering failure, it is a placement
                 // that stopped being true - another engine or another process took
-                // the card between the decision and the denoise. Dropping the
-                // resident returns its memory and lets the loader plan again against
-                // what is actually free. Once: a second exhaustion means the pressure
-                // is not transient, and then the error is the honest answer.
-                let mut replanned = false;
+                // the card between the decision and the denoise. Each exhaustion
+                // re-plans the resident one pressure rung further off the cards.
+                let mut pressure = crate::inference::place::recover::Pressure::new();
                 'render: loop {
                 let attempt_params = params.clone();
                 let _cg = crate::inference::serve::cancel::CancelGuard::new(attempt_params.cancel.clone());
@@ -1216,12 +1214,10 @@ pub(crate) async fn images_generations(
                 let mut rx = match _res {
                     Ok(rx) => rx,
                     Err(e) => {
-                        if !replanned && is_vram_exhaustion(e.as_ref()) {
-                            replanned = true;
-                            let level = crate::inference::place::vram_manager::vram_degrade();
-                            tracing::warn!("image stream: {stream_model} out of VRAM ({e}) - re-planning at pressure {level}");
-                            engine.unload().await;
-                            let _ = ensure_image_model_loaded(&stream_state, &stream_model, geom).await;
+                        if crate::inference::place::ladder::is_out_of_memory(&e)
+                            && pressure.raise(&stream_model, &e).is_some()
+                        {
+                            let _ = super::generate::replan_image(&stream_state, &stream_model, geom).await;
                             continue 'render;
                         }
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(
@@ -1235,16 +1231,10 @@ pub(crate) async fn images_generations(
                     // as a failed call, so the retry has to be reachable from here
                     // too - otherwise only the setup was ever recoverable.
                     if let ImageStreamEvent::Error(msg) = &ev {
-                        if !replanned
-                            && (msg.contains("[oom]")
-                                || msg.contains("out of memory")
-                                || msg.contains("out_of_memory"))
+                        if crate::inference::place::ladder::is_out_of_memory(msg)
+                            && pressure.raise(&stream_model, msg).is_some()
                         {
-                            replanned = true;
-                            let level = crate::inference::place::vram_manager::vram_degrade();
-                            tracing::warn!("image stream: {stream_model} out of VRAM mid-render ({msg}) - re-planning at pressure {level}");
-                            engine.unload().await;
-                            let _ = ensure_image_model_loaded(&stream_state, &stream_model, geom).await;
+                            let _ = super::generate::replan_image(&stream_state, &stream_model, geom).await;
                             continue 'render;
                         }
                     }

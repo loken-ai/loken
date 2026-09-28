@@ -672,39 +672,8 @@ pub(crate) fn build_sampling_from(temperature: f32, top_p: f32, top_k: usize) ->
 }
 
 #[cfg(test)]
-mod cuda_oom_detector_tests {
+mod tokenizer_tests {
     use super::*;
-
-    #[test]
-    fn is_cuda_oom_matches_both_lower_and_upper_case_oom_strings() {
-        // The two patterns documented in the body - both must match
-        // any case since CUDA error messages mix cases ("CUDA_ERROR_..."
-        // vs "out of memory"). String search is lowercase-after-
-        // to_ascii_lowercase, so a refactor that dropped the .to_lowercase
-        // would silently skip uppercased messages.
-        let s = "DriverError(CUDA_ERROR_OUT_OF_MEMORY, ...)";
-        assert!(is_cuda_oom(&s));
-        let s = "alloc failed: out of memory";
-        assert!(is_cuda_oom(&s));
-        // Mixed case in middle of message - still matches.
-        let s = "boom: Cuda_Error_OUT_OF_MEMORY at line 17";
-        assert!(is_cuda_oom(&s));
-    }
-
-    #[test]
-    fn is_cuda_oom_rejects_unrelated_errors() {
-        // Other CUDA errors are NOT OOM - must not trigger the
-        // OOM-fallback path (which would silently shuffle layers to
-        // CPU when the real problem is e.g. invalid kernel arg).
-        assert!(!is_cuda_oom(&"DriverError(CUDA_ERROR_ILLEGAL_ADDRESS)"));
-        assert!(!is_cuda_oom(
-            &"shape mismatch: expected (4, 64), got (4, 32)"
-        ));
-        assert!(
-            !is_cuda_oom(&"oom is a substring of zoom but not of cool"),
-            "false positives on substrings like 'zoom' would trigger spurious fallbacks"
-        );
-    }
 
     /// The joyai-llm splits compile in the regex engine the tokenizer uses and segment as the
     /// model's tokenizer.json does (the expected pieces are that tokenizer's own output): digits

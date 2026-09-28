@@ -7,6 +7,7 @@
 use super::params::{FinishReason, TokenLogprob};
 use super::*;
 use crate::inference::engine::decode_step::record_logprobs;
+use crate::inference::place::ladder::is_out_of_memory;
 
 impl LlmEngine {
     /// Generate stream - returns channel receiver for streaming tokens with real model inference
@@ -176,8 +177,8 @@ impl LlmEngine {
     }
 
     /// Streams a generation through the out-of-memory recovery stages of
-    /// [`super::generate::retry_on_oom`]. An attempt counts as out of memory when
-    /// it fails to start or when its first message is an out-of-memory error;
+    /// [`crate::inference::place::recover::retry_on_oom`]. An attempt counts as out of
+    /// memory when it fails to start or when its first message is an out-of-memory error;
     /// such an attempt is drained, so its producer has ended, before the next
     /// one starts. Once a message has been delivered, errors pass through.
     pub async fn generate_stream(
@@ -186,42 +187,31 @@ impl LlmEngine {
         params: GenerationParams,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<String, String>>, Box<dyn std::error::Error>>
     {
-        // The attempt ends with this block: an error is not `Send` across the next await.
-        let oom = {
-            let started = super::generate::retry_on_oom(
-                || async {
-                    let mut rx = self.generate_stream_once(prompt, params.clone()).await?;
-                    let first = rx.recv().await;
-                    if first_message_is_oom(&first) {
-                        while rx.recv().await.is_some() {}
-                    }
-                    Ok::<_, Box<dyn std::error::Error>>((first, rx))
-                },
-                |outcome| match outcome {
-                    Err(e) if is_cuda_oom(e) => Some(e.to_string()),
-                    Ok((first @ Some(Err(e)), _)) if first_message_is_oom(first) => Some(e.clone()),
-                    _ => None,
-                },
-                || crate::inference::place::vram_manager::evict_idle_llm(&self.config.model_id),
-                release_cuda_pools,
-            )
-            .await;
-            match &started {
-                Err(e) if is_cuda_oom(e) => e.to_string(),
-                Ok((first @ Some(Err(e)), _)) if first_message_is_oom(first) => e.clone(),
-                _ => {
-                    let (first, rx) = started?;
-                    return Ok(match first {
-                        Some(first) => prepend_message(first, rx),
-                        None => rx,
-                    });
+        let started = crate::inference::place::recover::retry_on_oom(
+            &self.config.model_id,
+            || async {
+                let mut rx = self.generate_stream_once(prompt, params.clone()).await?;
+                let first = rx.recv().await;
+                if opens_out_of_memory(&first) {
+                    while rx.recv().await.is_some() {}
                 }
-            }
-        };
-        if self.reload_further_off().await {
-            return self.generate_stream_once(prompt, params).await;
-        }
-        Err(oom.into())
+                Ok::<_, Box<dyn std::error::Error>>((first, rx))
+            },
+            |outcome| match outcome {
+                Err(e) if is_out_of_memory(e) => Some(e.to_string()),
+                Ok((first @ Some(Err(e)), _)) if opens_out_of_memory(first) => Some(e.clone()),
+                _ => None,
+            },
+            release_cuda_pools,
+            || crate::inference::place::vram_manager::evict_idle_llm(&self.config.model_id),
+            |_, oom| async move { (!self.reload_further_off().await).then(|| Err(oom.into())) },
+        )
+        .await;
+        let (first, rx) = started?;
+        Ok(match first {
+            Some(first) => prepend_message(first, rx),
+            None => rx,
+        })
     }
 
     /// One streamed generation, without out-of-memory recovery.
@@ -2462,8 +2452,8 @@ impl LlmEngine {
 
 /// True when a stream's first message is an out-of-memory error: the attempt
 /// failed before it delivered anything, so it can be run again unseen.
-fn first_message_is_oom(first: &Option<Result<String, String>>) -> bool {
-    matches!(first, Some(Err(e)) if is_cuda_oom(e))
+fn opens_out_of_memory(first: &Option<Result<String, String>>) -> bool {
+    matches!(first, Some(Err(e)) if is_out_of_memory(e))
 }
 
 /// A receiver that yields `first`, then every message of `rest`, with the
@@ -2488,15 +2478,15 @@ fn prepend_message(
 
 #[cfg(test)]
 mod tests {
-    use super::{first_message_is_oom, prepend_message};
+    use super::{opens_out_of_memory, prepend_message};
 
     #[test]
     fn only_an_out_of_memory_first_message_is_retried() {
         let oom = "DriverError(CUDA_ERROR_OUT_OF_MEMORY)";
-        assert!(first_message_is_oom(&Some(Err(oom.into()))));
-        assert!(!first_message_is_oom(&Some(Err("shape mismatch".into()))));
-        assert!(!first_message_is_oom(&Some(Ok("out of memory".into()))));
-        assert!(!first_message_is_oom(&None));
+        assert!(opens_out_of_memory(&Some(Err(oom.into()))));
+        assert!(!opens_out_of_memory(&Some(Err("shape mismatch".into()))));
+        assert!(!opens_out_of_memory(&Some(Ok("out of memory".into()))));
+        assert!(!opens_out_of_memory(&None));
     }
 
     #[tokio::test]

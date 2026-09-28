@@ -1357,7 +1357,7 @@ pub fn vram_reserve_boost() -> u64 {
 /// across every GPU (HeteroPlan greedy-fill under the escalating reserve); only when
 /// even a 2-GPU split can't hold the weights do layers land on CPU.
 pub fn vram_force_cpu() -> bool {
-    vram_degrade_level() >= 4
+    vram_degrade_level() >= crate::inference::place::ladder::PRESSURE_RUNGS
 }
 
 /// Reset the degradation level to 0 (optimistic placement). Called at the START of a
@@ -1366,4 +1366,13 @@ pub fn vram_force_cpu() -> bool {
 /// load models once and never re-enter) explicitly begin un-degraded.
 pub fn vram_degrade_reset() {
     VRAM_DEGRADE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes back `rungs` notches one escalation raised, never below zero.
+pub fn vram_degrade_lower(rungs: u64) {
+    let _ = VRAM_DEGRADE.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |level| Some(level.saturating_sub(rungs)),
+    );
 }
