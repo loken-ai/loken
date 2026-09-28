@@ -12,6 +12,7 @@
 //! host rung, and if that fails too the first error is returned. A cancelled load stops.
 
 use super::layer_executor::{DeviceKind, HeteroPlan};
+use crate::tensor::Device;
 
 /// Shares of each card's free memory the host-assisted rung offers, largest first.
 const HOST_ASSISTED_SHARES_PCT: [u64; 4] = [70, 50, 35, 20];
@@ -64,6 +65,7 @@ pub fn is_out_of_memory<E: std::fmt::Display + ?Sized>(err: &E) -> bool {
         || s.contains("[oom]")
         // cuBLAS reports its workspace and handle allocations with its own status.
         || s.contains("alloc_failed")
+        || s.contains("alloc failed")
 }
 
 fn cards_used(plan: &HeteroPlan) -> usize {
@@ -182,6 +184,154 @@ pub fn load_blocks<T>(
         || cancel.is_some_and(crate::inference::serve::cancel::CancelToken::is_cancelled),
         |plan| build(plan).map_err(|e| anyhow::anyhow!("{e:#}")),
     )
+}
+
+/// The cards a placement may use now, fastest first, with the bytes each offers under the
+/// pressure the fleet is in.
+pub fn offered_cards() -> Vec<(usize, u64)> {
+    super::vram_manager::probe_under_pressure(0)
+        .into_iter()
+        .map(|(idx, free, _)| (idx, free))
+        .collect()
+}
+
+/// Whether the load running on this thread was cancelled.
+fn scoped_cancelled() -> bool {
+    crate::inference::serve::cancel::scoped::bail().is_err()
+}
+
+/// The device a plan's segment runs on; a card that does not open is the host.
+pub fn device_of(kind: DeviceKind) -> Device {
+    match kind {
+        DeviceKind::Cuda(idx) => Device::new_cuda(idx).unwrap_or(Device::Cpu),
+        _ => Device::Cpu,
+    }
+}
+
+/// The device each of `layers` blocks runs on under `plan`.
+pub fn layer_devices(plan: &HeteroPlan, layers: usize) -> Vec<Device> {
+    (0..layers)
+        .map(|l| {
+            plan.segments
+                .iter()
+                .find(|s| l >= s.layer_start && l < s.layer_end)
+                .map(|s| device_of(s.kind))
+                .unwrap_or(Device::Cpu)
+        })
+        .collect()
+}
+
+/// The device for what sits beside the blocks: the first card the plan uses, else the host.
+pub fn primary_device(plan: &HeteroPlan) -> Device {
+    plan.segments
+        .iter()
+        .find(|s| matches!(s.kind, DeviceKind::Cuda(_)))
+        .map(|s| device_of(s.kind))
+        .unwrap_or(Device::Cpu)
+}
+
+/// Whether a plan runs on one card with nothing on the host.
+pub fn on_one_card(plan: &HeteroPlan) -> bool {
+    let on_host = plan
+        .segments
+        .iter()
+        .any(|s| matches!(s.kind, DeviceKind::Cpu));
+    cards_used(plan) == 1 && !on_host
+}
+
+/// Build `what` through the ladder on the cards as they are now. A cancelled load stops.
+pub fn load<T, E: std::fmt::Display>(
+    what: &str,
+    demand: &Demand,
+    build: impl FnMut(&HeteroPlan) -> Result<T, E>,
+) -> Result<T, E> {
+    load_placed(what, demand, &offered_cards(), scoped_cancelled, build)
+}
+
+/// The demand of a component that runs whole on one device: `bytes` resident and
+/// `reserve` kept free beside them for its work.
+fn whole_demand(bytes: u64, reserve: u64) -> Demand {
+    Demand {
+        layers: 1,
+        block_bytes: bytes,
+        runtime_reserve: reserve,
+        ..Demand::default()
+    }
+}
+
+/// Build a component that runs whole on one device through the ladder: the fastest card
+/// that holds it, else the host.
+pub fn load_whole<T, E: std::fmt::Display>(
+    what: &str,
+    bytes: u64,
+    reserve: u64,
+    mut build: impl FnMut(&Device) -> Result<T, E>,
+) -> Result<T, E> {
+    load(what, &whole_demand(bytes, reserve), |plan| {
+        build(&primary_device(plan))
+    })
+}
+
+/// [`load_whole`] for a component that runs once per request: with more than one card it
+/// takes the slowest card that holds it, leaving the fastest to what runs every step.
+pub fn load_aside<T, E: std::fmt::Display>(
+    what: &str,
+    bytes: u64,
+    reserve: u64,
+    mut build: impl FnMut(&Device) -> Result<T, E>,
+) -> Result<T, E> {
+    let mut cards = offered_cards();
+    cards.reverse();
+    load_placed(
+        what,
+        &whole_demand(bytes, reserve),
+        &cards,
+        scoped_cancelled,
+        |plan| build(&primary_device(plan)),
+    )
+}
+
+/// Run one unit of a render; when it runs out of card memory, raise the pressure level so
+/// its next placement leaves each card more room, and run it again. The unit reloads what
+/// it places so the new level takes effect. Stops once the level that places on the host
+/// has been tried, and at the first failure that is not out of memory.
+pub fn rerun_under_pressure<T, E: std::fmt::Display>(
+    what: &str,
+    mut unit: impl FnMut() -> Result<T, E>,
+) -> Result<T, String> {
+    loop {
+        match unit() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_out_of_memory(&e) && !super::vram_manager::vram_force_cpu() => {
+                release_pools();
+                let level = super::vram_manager::vram_degrade();
+                tracing::warn!("{what}: out of card memory; retrying at pressure level {level}");
+            }
+            Err(e) => return Err(format!("{what}: {e}")),
+        }
+    }
+}
+
+/// Run `work` at `size`, halving the size each time a card runs out of memory while it
+/// stays above `floor`. For work whose transient memory follows a size it chooses, such
+/// as a decode chunk or a capture arena.
+pub fn halve_until_fits<T, E: std::fmt::Display>(
+    what: &str,
+    size: usize,
+    floor: usize,
+    mut work: impl FnMut(usize) -> Result<T, E>,
+) -> Result<T, E> {
+    let mut size = size.max(floor);
+    loop {
+        match work(size) {
+            Err(e) if is_out_of_memory(&e) && size / 2 >= floor && size > floor => {
+                size /= 2;
+                release_pools();
+                tracing::warn!("{what}: out of card memory; retrying at {size}");
+            }
+            done => return done,
+        }
+    }
 }
 
 /// Hands the pools' cached blocks back before the next rung measures the cards.
@@ -308,5 +458,42 @@ mod tests {
         assert_eq!(kinds(&d.plan(&[(0, 10 * GB)])), vec!["CUDA(0)".to_string()]);
         // Blocks that fit a card alone do not make it the home of the whole component.
         assert!(d.whole() > 8 * GB && d.block_bytes < 8 * GB);
+    }
+
+    #[test]
+    fn a_size_halves_after_each_exhaustion_down_to_its_floor() {
+        let mut tried = Vec::new();
+        let got: Result<usize, String> = halve_until_fits("t", 64, 16, |size| {
+            tried.push(size);
+            if size > 16 {
+                Err("[oom] alloc".to_string())
+            } else {
+                Ok(size)
+            }
+        });
+        assert_eq!(got.unwrap(), 16);
+        assert_eq!(tried, vec![64, 32, 16]);
+        let mut n = 0;
+        let got: Result<(), String> = halve_until_fits("t", 64, 16, |_| {
+            n += 1;
+            Err("bad shape".to_string())
+        });
+        assert!(got.is_err());
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn a_component_asking_for_more_than_any_card_runs_on_the_host() {
+        let d = whole_demand(8 * GB, GB);
+        let plan = d.plan(&[(0, 4 * GB)]);
+        assert!(matches!(primary_device(&plan), Device::Cpu));
+        assert!(!on_one_card(&plan));
+        assert!(layer_devices(&plan, 1)
+            .iter()
+            .all(|d| matches!(d, Device::Cpu)));
+        assert_eq!(
+            kinds(&d.plan(&[(0, 4 * GB), (1, 10 * GB)])),
+            vec!["CUDA(1)".to_string()]
+        );
     }
 }
