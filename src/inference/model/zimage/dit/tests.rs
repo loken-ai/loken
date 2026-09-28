@@ -539,18 +539,15 @@ fn tiny_checkpoint(cfg: &Config, path: &std::path::Path) {
     let q_dim = cfg.n_heads * head;
     let kv_dim = cfg.n_kv_heads * head;
     let hidden = cfg.hidden_dim();
-    // The two widths the checkpoint's shapes are written from, asked of the config rather
-    // than recomputed here: a fixture that derives a shape its own way can only agree with
-    // the loader by luck.
-    let adaln = cfg.adaln_dim();
+    // The loader reads the timestep widths off these shapes, so the fixture states them:
+    // the published model's sinusoid, and its modulation width capped at the model's.
+    let (freq, t_mid) = (256, 1024);
+    let adaln = d.min(256);
     let patch_dim = cfg.patch_dim();
     let mut shapes: Vec<(String, Vec<usize>)> = vec![
-        (
-            "t_embedder.mlp.0.weight".into(),
-            vec![1024, FREQUENCY_EMBEDDING_SIZE],
-        ),
-        ("t_embedder.mlp.0.bias".into(), vec![1024]),
-        ("t_embedder.mlp.2.weight".into(), vec![adaln, 1024]),
+        ("t_embedder.mlp.0.weight".into(), vec![t_mid, freq]),
+        ("t_embedder.mlp.0.bias".into(), vec![t_mid]),
+        ("t_embedder.mlp.2.weight".into(), vec![adaln, t_mid]),
         ("t_embedder.mlp.2.bias".into(), vec![adaln]),
         ("cap_embedder.0.weight".into(), vec![cfg.cap_feat_dim]),
         ("cap_embedder.1.weight".into(), vec![d, cfg.cap_feat_dim]),

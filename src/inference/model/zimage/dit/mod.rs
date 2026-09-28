@@ -168,12 +168,6 @@ impl Config {
         self.dim / 3 * 8
     }
 
-    /// The width the timestep is carried at, and so the width every modulation projection
-    /// reads: the embedding's own, unless the model itself is narrower than that.
-    pub fn adaln_dim(&self) -> usize {
-        adaln_dim(self.dim)
-    }
-
     /// How many numbers one patch holds: the latent's width times the volume it is cut
     /// into. The patch embedder reads that many in and the way back out writes that many
     /// back, so it is ONE number - it has been spelled as `patch_dim` in one loader and as
@@ -201,19 +195,6 @@ use std::sync::Mutex;
 
 // ==================== Constants (mirror the facade) ====================
 
-/// AdaLN embedding dimension (256)
-pub const ADALN_EMBED_DIM: usize = 256;
-
-/// The width the timestep is carried at, for a model of the given width.
-///
-/// Written as a function of the width alone because two of its readers hold a width and no
-/// [`Config`]: [`FinalLayer`] is constructed from its own dimensions, and the OpenCL block is
-/// built from loose numbers. [`Config::adaln_dim`] is this, asked of a config.
-pub fn adaln_dim(dim: usize) -> usize {
-    dim.min(ADALN_EMBED_DIM)
-}
-/// Frequency embedding size for timestep encoding
-pub const FREQUENCY_EMBEDDING_SIZE: usize = 256;
 /// Max period for sinusoidal encoding
 pub const MAX_PERIOD: f64 = 10000.0;
 
@@ -527,6 +508,14 @@ impl Vb {
         }
     }
 
+    /// The shape `{prefix}.{name}` is stored at, read from the header.
+    pub fn shape_of(&self, name: &str) -> Result<Vec<usize>> {
+        match self {
+            Self::Q(vb) => vb.shape_of(name),
+            Self::Dense(vb) => vb.shape_of(name),
+        }
+    }
+
     /// `{prefix}.{name}` as an exact-F32 tensor on the compute device
     /// (norm scales, biases, pad tokens).
     fn get_f32<S: Into<crate::tensor::Shape>>(&self, shape: S, name: &str) -> Result<Tensor> {
@@ -614,6 +603,14 @@ fn fused_qkv(
     }
 }
 
+/// `{prefix}.weight` + `{prefix}.bias` (F32), at the `[out, in]` shape the file stores.
+fn stored_linear(vb: Vb) -> Result<QLinear> {
+    let [out_dim, in_dim] = vb.shape_of("weight")?[..] else {
+        return Err(Error::msg("zimage: a projection weight is not a matrix"));
+    };
+    linear(in_dim, out_dim, vb)
+}
+
 /// `{prefix}.weight` (`[out, in]`) + `{prefix}.bias` (F32).
 fn linear(in_dim: usize, out_dim: usize, vb: Vb) -> Result<QLinear> {
     let weight = weight(in_dim, out_dim, &vb)?;
@@ -695,13 +692,16 @@ pub struct TimestepEmbedder {
 }
 
 impl TimestepEmbedder {
-    pub fn new(out_size: usize, mid_size: usize, vb: Vb) -> Result<Self> {
-        let linear1 = linear(FREQUENCY_EMBEDDING_SIZE, mid_size, vb.pp("mlp").pp("0"))?;
-        let linear2 = linear(mid_size, out_size, vb.pp("mlp").pp("2"))?;
+    /// The embedder under `vb`: the sinusoid's width, the hidden width and the width it
+    /// answers at - the one every modulation projection reads - are its stored weights'.
+    pub fn new(vb: Vb) -> Result<Self> {
+        let frequency_embedding_size = vb.pp("mlp").pp("0").shape_of("weight")?[1];
+        let linear1 = stored_linear(vb.pp("mlp").pp("0"))?;
+        let linear2 = stored_linear(vb.pp("mlp").pp("2"))?;
         Ok(Self {
             linear1,
             linear2,
-            frequency_embedding_size: FREQUENCY_EMBEDDING_SIZE,
+            frequency_embedding_size,
         })
     }
 
@@ -1047,8 +1047,7 @@ impl ZImageTransformerBlock {
             // at once, out of an embedding narrower than the model unless the model is
             // narrower still.
             adaln_modulation: if modulation {
-                let adaln = vb.pp("adaLN_modulation").pp("0");
-                Some(linear(cfg.adaln_dim(), 4 * dim, adaln)?)
+                Some(stored_linear(vb.pp("adaLN_modulation").pp("0"))?)
             } else {
                 None
             },
@@ -1117,11 +1116,7 @@ impl FinalLayer {
             // CUDA, so the two always meet on the same device.
             norm_final: layer::layer_norm_no_affine(hidden_size, 1e-6, &Device::Cpu)?,
             linear: linear(hidden_size, out_channels, vb.pp("linear"))?,
-            adaln_silu: linear(
-                adaln_dim(hidden_size),
-                hidden_size,
-                vb.pp("adaLN_modulation").pp("1"),
-            )?,
+            adaln_silu: stored_linear(vb.pp("adaLN_modulation").pp("1"))?,
         })
     }
 
@@ -1324,10 +1319,9 @@ pub mod stem {
 
     /// The timestep embedder, answering at the width every modulation projection reads.
     ///
-    /// The width it passes through on the way there is the checkpoint's own and is derived
-    /// from nothing.
-    pub fn timestep_embedder(cfg: &Config, vb: &Vb) -> Result<TimestepEmbedder> {
-        TimestepEmbedder::new(cfg.adaln_dim(), 1024, vb.pp("t_embedder"))
+    /// Every width it passes through is the checkpoint's own and is derived from nothing.
+    pub fn timestep_embedder(vb: &Vb) -> Result<TimestepEmbedder> {
+        TimestepEmbedder::new(vb.pp("t_embedder"))
     }
 
     /// Both refiners, in the order a loader reads them: the noise side, which the timestep
@@ -1446,7 +1440,7 @@ impl ZImageTransformer2DModel {
         // model's placement is chosen against was measured from. The pieces come from
         // [`stem`], which the multi-device loader shares; where each one lands in the
         // sequence does not.
-        let t_embedder = stem::timestep_embedder(cfg, vb)?;
+        let t_embedder = stem::timestep_embedder(vb)?;
 
         // The caption arrives at the text encoder's width, is normalised there, and is only
         // then projected into the model's - two parts of one embedder, under one prefix.

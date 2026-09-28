@@ -206,7 +206,7 @@ impl HeteroZImage {
         // Wrapping the primary builder once: `Vb` walks a prefix, it does not read a tensor,
         // and the underlying loader is shared rather than reopened.
         let stem_vb = Vb::Dense(vb_primary.clone());
-        let t_embedder = stem::timestep_embedder(cfg, &stem_vb)?;
+        let t_embedder = stem::timestep_embedder(&stem_vb)?;
 
         // The caption embedder is read DENSE here, at the builder's dtype, where the
         // single-device loader stages it host-side into an exact-F32 bias and a transposed
@@ -285,6 +285,14 @@ impl HeteroZImage {
                         .map_err(|e| {
                             crate::tensor::Error::msg(format!("SafeTensors deserialize: {}", e))
                         })?;
+                    // The width the modulation projections read: their stored input width.
+                    let adaln_dim = all_shards
+                        .iter()
+                        .find_map(|sh| sh.tensor("layers.0.adaLN_modulation.0.weight").ok())
+                        .and_then(|t| t.shape().get(1).copied())
+                        .ok_or_else(|| {
+                            crate::tensor::Error::msg("zimage: no layers.0.adaLN_modulation.0")
+                        })?;
 
                     // i needs to be a literal for format!("layers.{i}") and the
                     // log message; index loop is the natural shape.
@@ -301,7 +309,7 @@ impl HeteroZImage {
                             head_dim,
                             cfg.norm_eps,
                             true, // main layers have modulation
-                            cfg.adaln_dim(),
+                            adaln_dim,
                             pipelines,
                         )
                         .map_err(|e| {
