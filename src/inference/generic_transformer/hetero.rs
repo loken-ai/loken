@@ -493,6 +493,11 @@ impl GenericHeteroTransformer {
         self.config.rope_freq_base
     }
 
+    /// The model width: the residual stream and the embedding.
+    pub fn hidden_size(&self) -> usize {
+        self.config.embedding_length
+    }
+
     /// Widest FFN intermediate dim across all layers (dense `intermediate_size`
     /// or per-expert `expert_ffn_dim`) - the activation-peak driver used to size
     /// the prefill chunk to fit L3.

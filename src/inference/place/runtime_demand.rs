@@ -1001,6 +1001,24 @@ pub fn transformer_work_reserve(
         .saturating_add(dit_activation_bytes(tokens, dim, heads, mlp_ratio))
 }
 
+/// A cuBLAS handle and its workspace, on each card a model runs on.
+pub const CUBLAS_WORKSPACE_BYTES: u64 = 512 << 20;
+
+/// Live f32 buffers a language model's widest projection keeps per token: its output and
+/// the activation computed from it.
+const LLM_LIVE_BUFFERS: u64 = 2;
+
+/// What a language model keeps free on a card beside its weights and its cache: the cuBLAS
+/// workspace and the activations of one prefill chunk of `chunk` tokens at its widest
+/// projection `width`.
+pub fn llm_work_reserve(width: usize, chunk: usize) -> u64 {
+    let act = (chunk as u64)
+        .saturating_mul(width as u64)
+        .saturating_mul(ACT_BYTES)
+        .saturating_mul(LLM_LIVE_BUFFERS);
+    CUBLAS_WORKSPACE_BYTES.saturating_add(act)
+}
+
 /// Bytes the tensors of safetensors checkpoints take once expanded to f32, split into the
 /// tensors `is_block` accepts and the rest. Read from the headers only.
 pub fn safetensors_f32_split(

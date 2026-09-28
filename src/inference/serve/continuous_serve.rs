@@ -65,6 +65,9 @@ struct GhBatched {
     // capture - never freed mid-session, so earlier graphs' arena addrs stay valid).
     #[cfg(feature = "cuda")]
     arena_armed: bool,
+    /// Bytes of that arena, as the placement divided the card.
+    #[cfg(feature = "cuda")]
+    arena_bytes: u64,
 }
 
 #[cfg(feature = "cuda")]
@@ -99,6 +102,9 @@ struct CapturedDecode {
 /// the captured shapes stay fixed as context grows (recapture only on bucket cross).
 #[cfg(feature = "cuda")]
 const CB_GRAPH_BUCKET: usize = 256;
+
+/// Tokens per block of the paged cache.
+pub const CB_BLOCK_SIZE: usize = 16;
 
 fn argmax_row(logits: &Tensor, row: usize) -> crate::tensor::Result<u32> {
     logits
@@ -512,6 +518,7 @@ impl GhBatched {
             stores,
             graphs,
             arena_armed,
+            arena_bytes,
             ..
         } = self;
         let dev = model.compute_device();
@@ -661,28 +668,10 @@ impl GhBatched {
         let _ = stream.synchronize();
         // ONE persistent arena shared by every (B,cap) graph: arm it once, then
         // RESUME (no free/reset) for each later capture so all graphs keep distinct,
-        // still-valid offset ranges across replays. Size it MODESTLY: the measured
-        // per-graph peak is only single-digit MB (decode is seq==1, tiny activations)
-        // and a handful of (B,cap) buckets share the arena, so a few hundred MB is
-        // ample. The old 8 GB default OOM'd `begin_capture_arena` on any model that
-        // left <8 GB free (i.e. most), forcing the eager fallback. Cap to a small
-        // fraction of FREE VRAM so we never starve weights/KV; if even that fails,
-        // the caller's graph->eager fallback keeps serving.
+        // still-valid offset ranges across replays. Its size is what the placement set
+        // aside beside the pool; a graph that overruns it runs that step eagerly.
         if !*arena_armed {
-            // The arena is SHARED across every (B, ctx-cap) graph and never freed
-            // mid-session, so under concurrent serving it must hold many graphs at
-            // once (per-graph peak grows with batch width: ~100 MB at B=7 for an 8B
-            // model). Too small -> overflow -> permanent eager fallback (the throughput
-            // regression). Take a generous slice of free VRAM (the KV-pool sizing
-            // reserves for this) up to 2 GB.
-            let free = dev
-                .as_cuda_device()
-                .ok()
-                .and_then(|cd| cd.cuda_stream().context().mem_get_info().ok())
-                .map(|(f, _)| f)
-                .unwrap_or(0);
-            let arena_bytes = (2048usize << 20).min((free / 2).max(128 << 20));
-            cuda_ext::begin_capture_arena(&dev, arena_bytes)?;
+            cuda_ext::begin_capture_arena(&dev, *arena_bytes as usize)?;
             *arena_armed = true;
         } else {
             cuda_ext::resume_capture_arena(&dev)?;
@@ -788,13 +777,15 @@ unsafe impl Send for SendWrap {}
 impl ContinuousServer {
     /// Spawn the worker. `model` is moved in and owned for the worker's lifetime;
     /// `eos` terminates a sequence; `num_blocks`/`block_size` size the paged KV
-    /// pool; `max_running` caps the concurrent decode batch width.
+    /// pool; `max_running` caps the concurrent decode batch width; `arena_bytes` sizes the
+    /// arena its decode graphs are captured into.
     pub fn spawn(
         model: Arc<GenericHeteroTransformer>,
         eos: Vec<u32>,
         num_blocks: usize,
         block_size: usize,
         max_running: usize,
+        arena_bytes: u64,
         max_prefill_tokens: usize,
     ) -> crate::tensor::Result<Self> {
         let (n_kv, hd, n_layers, _vocab) = model.paged_geometry();
@@ -833,6 +824,8 @@ impl ContinuousServer {
             graph_failed: false,
             #[cfg(feature = "cuda")]
             arena_armed: false,
+            #[cfg(feature = "cuda")]
+            arena_bytes,
         });
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
 

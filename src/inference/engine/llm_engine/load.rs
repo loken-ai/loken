@@ -461,9 +461,9 @@ pub(super) fn sniff_projector_type(path: &std::path::Path) -> Option<String> {
 }
 
 /// Try to move a loaded `cb_eligible` GPU `GenericHetero` model into a
-/// `ContinuousServer` worker for batched concurrent serving. Sizes the paged KV
-/// pool from free VRAM (single-digit-MB-per-block decode KV). Returns the model
-/// back unchanged on any failure so the caller keeps the serial path.
+/// `ContinuousServer` worker for batched concurrent serving. The card's room is divided by
+/// `place::paged` from the model's shape. Returns the model back unchanged on any failure
+/// so the caller keeps the serial path.
 #[cfg(feature = "cuda")]
 pub(super) fn try_spawn_continuous(
     model: GenericHeteroTransformer,
@@ -473,42 +473,35 @@ pub(super) fn try_spawn_continuous(
     crate::inference::serve::continuous_serve::ContinuousServer,
     GenericHeteroTransformer,
 > {
+    use crate::inference::place::{paged, runtime_demand};
     use crate::inference::serve::continuous_serve::ContinuousServer;
     let (n_kv, hd, n_layers, _vocab) = model.paged_geometry();
-    let block_size = 16usize;
-    let bytes_per_block = 2 * n_kv * hd * 2 * n_layers * block_size; // K+V, F16, all layers
-    let dev = model.compute_device();
-    let free = dev
-        .as_cuda_device()
-        .ok()
-        .and_then(|cd| cd.cuda_stream().context().mem_get_info().ok())
-        .map(|(f, _)| f)
-        .unwrap_or(0);
-    // Reserve for activations + cuBLAS workspace (~1.5 GB) AND the shared CUDA-
-    // graph capture arena (~2 GB) so the KV pool doesn't starve the arena (an
-    // undersized arena -> overflow -> permanent eager fallback -> throughput loss).
-    let reserve = (1536usize + 2048) << 20;
-    let usable = free.saturating_sub(reserve);
-    let max_running = 32usize; // concurrent decode batch-width cap
-    let cap_ctx = context_length.min(8192);
-    let want_blocks = (max_running * cap_ctx).div_ceil(block_size);
-    let fit_blocks = if bytes_per_block > 0 {
-        usable / bytes_per_block
-    } else {
-        0
+    let block_size = crate::inference::serve::continuous_serve::CB_BLOCK_SIZE;
+    // K and V, F16, every layer.
+    let block_bytes = (2 * n_kv * hd * 2 * n_layers * block_size) as u64;
+    let hidden = model.hidden_size();
+    let ffn = model.widest_ffn();
+    let shape = paged::PagedShape {
+        block_bytes,
+        block_size,
+        window: context_length.min(crate::inference::cache::KV_WORKING_WINDOW_TOKENS),
+        lane_step_bytes: paged::lane_step_bytes(n_layers, hidden, ffn),
+        work_reserve: runtime_demand::llm_work_reserve(hidden.max(ffn), PREFILL_CHUNK_TOKENS),
     };
-    let num_blocks = want_blocks.min(fit_blocks);
-    let min_blocks = (max_running * 256).div_ceil(block_size); // ~256 tokens/seq floor
-    if num_blocks < min_blocks {
-        warn!("CB serve: only {num_blocks} KV blocks fit ({} MB usable) < min {min_blocks} - staying serial",
-            usable >> 20);
+    let Some(plan) = paged::plan(&model.compute_device(), &shape) else {
+        warn!(
+            "CB serve: the card holds fewer than two lanes of {} tokens - staying serial",
+            shape.window
+        );
         return Err(model);
-    }
+    };
+    let (num_blocks, max_running) = (plan.blocks, plan.lanes);
     info!(
         "CB serve: ContinuousServer - {num_blocks} blocks x {block_size} = {} KV slots, \
-           max_running {max_running}, pool {} MB",
+           max_running {max_running}, pool {} MB, arena {} MB",
         num_blocks * block_size,
-        (num_blocks * bytes_per_block) >> 20
+        (num_blocks as u64 * block_bytes) >> 20,
+        plan.arena >> 20
     );
     let arc = std::sync::Arc::new(model);
     match ContinuousServer::spawn(
@@ -517,6 +510,7 @@ pub(super) fn try_spawn_continuous(
         num_blocks,
         block_size,
         max_running,
+        plan.arena,
         1 << 20,
     ) {
         Ok(s) => Ok(s),

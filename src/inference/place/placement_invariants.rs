@@ -1323,7 +1323,6 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("api/handlers/separate.rs", (1, 0, 0)),
     ("inference/engine/boogu_engine.rs", (2, 0, 0)),
     ("inference/engine/flux2_engine.rs", (2, 0, 0)),
-    ("inference/engine/llm_engine/load.rs", (1, 0, 0)),
     ("inference/engine/llm_engine/loading.rs", (6, 0, 0)),
     ("inference/engine/llm_engine/mod.rs", (3, 0, 0)),
     ("inference/engine/qwen_image_engine.rs", (5, 0, 0)),
@@ -1333,7 +1332,6 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("inference/model/qwen35/moe.rs", (1, 0, 0)),
     ("inference/model/sdxl/pipeline.rs", (5, 0, 0)),
     ("inference/model/sdxl/unet.rs", (0, 0, 1)),
-    ("inference/serve/continuous_serve.rs", (1, 0, 0)),
     ("inference/serve/tp_model.rs", (1, 0, 0)),
 ];
 
