@@ -227,6 +227,25 @@ impl QVarBuilder {
             .ok_or_else(|| Error(format!("QVarBuilder: missing `{path}`")))
     }
 
+    /// The shape `{prefix}.{name}` is stored at, without reading its data.
+    pub fn shape_of(&self, name: &str) -> Result<Vec<usize>> {
+        Ok(self.fetch(name)?.dims.clone())
+    }
+
+    /// How many numbered children `{prefix}.{parent}.0`, `.1`, ... the file stores, counted
+    /// up to the first missing index.
+    pub fn count_children(&self, parent: &str) -> usize {
+        let base = format!("{}.", self.full(parent));
+        let indices: std::collections::BTreeSet<usize> = self
+            .inner
+            .tensors
+            .keys()
+            .filter_map(|n| n.strip_prefix(&base))
+            .filter_map(|rest| rest.split('.').next()?.parse().ok())
+            .collect();
+        (0..).take_while(|i| indices.contains(i)).count()
+    }
+
     /// Projection weight `[out, in]` -> quantized matmul on the builder's device.
     pub fn qmatmul(&self, in_dim: usize, out_dim: usize, name: &str) -> Result<QKernelMatMul> {
         self.qmatmul_on(in_dim, out_dim, name, &self.device)

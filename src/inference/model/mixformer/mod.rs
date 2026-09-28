@@ -44,32 +44,31 @@ pub struct Config {
     pub layer_norm_epsilon: f64,
 }
 
+/// The attention's head count. The checkpoint's tensors are all full-width and do not state
+/// it; every published size of this family splits its width into this many heads.
+const ATTENTION_HEADS: usize = 32;
+
+/// The widest prefix of a head the rotary turns: the head width, capped here.
+const ROTARY_CAP: usize = 32;
+
 impl Config {
-    /// The two published sizes differ in their width and their depth, and in nothing else.
-    ///
-    /// The rotary dimension is not a third difference: it is the head width capped at
-    /// thirty-two, and both sizes have thirty-two heads, so both land on thirty-two - writing
-    /// it out per size invited them to drift.
-    fn of_size(n_embd: usize, n_layer: usize) -> Self {
-        const HEADS: usize = 32;
-        Self {
-            vocab_size: 51200,
+    /// The shape of the model rooted at `vb` (its `transformer` and `lm_head`), read from the
+    /// stored tensors.
+    pub fn from_checkpoint(vb: &VarBuilder) -> Result<Self> {
+        let t = vb.pp("transformer");
+        let [vocab_size, n_embd] = t.pp("embd").pp("wte").shape_of("weight")?[..] else {
+            crate::tensor::bail!("mixformer: the token embedding is not a matrix")
+        };
+        Ok(Self {
+            vocab_size,
             n_embd,
-            n_layer,
-            n_inner: None,
-            n_head: HEADS,
-            rotary_dim: usize::min(32, n_embd / HEADS),
+            n_layer: t.count_children("h"),
+            n_inner: Some(t.pp("h").pp(0).pp("mlp").pp("fc1").shape_of("weight")?[0]),
+            n_head: ATTENTION_HEADS,
+            rotary_dim: usize::min(ROTARY_CAP, n_embd / ATTENTION_HEADS),
             activation_function: Activation::Gelu,
             layer_norm_epsilon: 1e-5,
-        }
-    }
-
-    pub fn v1_5() -> Self {
-        Self::of_size(2048, 24)
-    }
-
-    pub fn v2() -> Self {
-        Self::of_size(2560, 32)
+        })
     }
 }
 

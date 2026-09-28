@@ -21,11 +21,15 @@ pub struct Config {
     pub vision_config: VisionConfig,
 }
 impl Config {
-    pub fn v2() -> Self {
-        Self {
-            phi_config: crate::inference::model::mixformer::Config::v1_5(),
-            vision_config: VisionConfig::v2(),
-        }
+    /// Both halves' shapes, read from the stored tensors under `vb`: the text model under
+    /// `text_model`, the tower and its projection under `vision_encoder`.
+    pub fn from_checkpoint(vb: &VarBuilder) -> Result<Self> {
+        Ok(Self {
+            phi_config: crate::inference::model::mixformer::Config::from_checkpoint(
+                &vb.pp("text_model"),
+            )?,
+            vision_config: VisionConfig::from_checkpoint(&vb.pp("vision_encoder"))?,
+        })
     }
 }
 /// What the tower is, and where its output has to land.
@@ -37,6 +41,8 @@ impl Config {
 pub struct VisionConfig {
     /// What a patch becomes and what every block carries.
     pub embed_dim: usize,
+    /// The edge of a patch, in pixels: the patch projection reads three colour planes of it.
+    pub patch: usize,
     /// The width a block's own feed-forward widens to, inside the tower.
     pub hidden_features: usize,
     /// How many patch positions the learnt position table was trained for.
@@ -48,24 +54,30 @@ pub struct VisionConfig {
     pub model_dim: usize,
     pub act: crate::tensor::ops::Activation,
 }
+/// The tower's head count. The checkpoint's tensors do not state it: the attention is one
+/// fused full-width projection.
+const VISION_HEADS: usize = 16;
+
 impl VisionConfig {
-    pub fn v2() -> Self {
-        // The tower's width, which is also what it hands the projection.
-        const WIDTH: usize = 1152;
-        // The decoder's width, which is what the projection has to reach.
-        const TEXT_WIDTH: usize = 2048;
-        // A 378-pixel square cut into 14-pixel patches is 27 positions on a side.
-        const GRID: usize = 27;
-        Self {
-            embed_dim: WIDTH,
-            hidden_features: 4304,
-            embed_len: GRID * GRID,
-            num_blocks: 27,
-            num_heads: 16,
-            hidden_dim: TEXT_WIDTH * 4,
-            model_dim: TEXT_WIDTH,
+    /// The tower's and the projection's shape, read from the stored tensors under `vb`.
+    pub fn from_checkpoint(vb: &VarBuilder) -> Result<Self> {
+        let tower = vb.pp("encoder").pp("model.visual");
+        let [embed_dim, patch_in] = tower.pp("patch_embed").pp("linear").shape_of("weight")?[..]
+        else {
+            crate::tensor::bail!("moondream: the patch projection is not a matrix")
+        };
+        let p = vb.pp("projection").pp("mlp");
+        Ok(Self {
+            embed_dim,
+            patch: ((patch_in / 3) as f64).sqrt().round() as usize,
+            hidden_features: tower.pp("blocks.0.mlp.fc1").shape_of("weight")?[0],
+            embed_len: tower.shape_of("pos_embed")?[1],
+            num_blocks: tower.count_children("blocks"),
+            num_heads: VISION_HEADS,
+            hidden_dim: p.pp("fc1").shape_of("weight")?[0],
+            model_dim: p.pp("fc2").shape_of("weight")?[0],
             act: crate::tensor::ops::Activation::GeluPytorchTanh,
-        }
+        })
     }
 }
 use crate::inference::model::vit::{Qkv, VitBlock};
@@ -90,6 +102,7 @@ use crate::tensor::{Module, Result, Tensor};
 /// replaces contributed.
 #[derive(Debug)]
 pub struct VisionEncoder {
+    patch: usize,
     patch_embed: Linear,
     pos_embed: Tensor,
     blocks: Vec<VitBlock>,
@@ -98,10 +111,6 @@ pub struct VisionEncoder {
 }
 
 impl VisionEncoder {
-    /// The edge of a patch, in pixels. It is the checkpoint's, not a choice: the patch
-    /// projection's input width is `channels * PATCH * PATCH`.
-    const PATCH: usize = 14;
-
     pub fn new(cfg: &VisionConfig, vb: VarBuilder) -> Result<Self> {
         let tower = vb.pp("encoder").pp("model.visual");
         // The checkpoint fuses the three projections into one `attn.qkv` and names the block's
@@ -126,11 +135,12 @@ impl VisionEncoder {
             })
             .collect::<Result<_>>()?;
         Ok(Self {
+            patch: cfg.patch,
             // One patch, flattened, projected to the tower's width. The input width is the
-            // patch itself - three colour planes of PATCH by PATCH - rather than a number
-            // repeated here, and the output is the width the rest of the tower carries.
+            // patch itself - three colour planes of `patch` by `patch` - and the output is the
+            // width the rest of the tower carries.
             patch_embed: linear_b(
-                3 * Self::PATCH * Self::PATCH,
+                3 * cfg.patch * cfg.patch,
                 cfg.embed_dim,
                 true,
                 &tower.pp("patch_embed").pp("linear"),
@@ -158,7 +168,7 @@ impl Module for VisionEncoder {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let mut xs = crate::inference::model::patches::cut(
             xs,
-            Self::PATCH,
+            self.patch,
             crate::inference::model::patches::Order::ByChannel,
         )?
         .apply(&self.patch_embed)?

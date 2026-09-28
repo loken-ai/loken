@@ -853,7 +853,8 @@ impl LlmEngine {
                     let vb = crate::tensor::quantized::QVarBuilder::from_gguf(
                         &model_file, &device,
                     ).map_err(|e| anyhow!("Failed to load Moondream GGUF: {e}"))?;
-                    let config = crate::inference::model::moondream::quantized::Config::v2();
+                    let config = crate::inference::model::moondream::quantized::Config::from_checkpoint(&vb)
+                        .map_err(|e| anyhow!("Moondream shape: {e}"))?;
                     match moondream::Model::new(&config, vb) {
                         Ok(model) => {
                             info!("Vision model loaded (Moondream v2)");
