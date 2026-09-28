@@ -1774,14 +1774,13 @@ impl Qwen35MoeModel {
         Ok(())
     }
 
-    /// If a snapshot exists whose prompt EXACTLY equals `prompt`, restore every
-    /// layer's state from it (deep-copied, so the snapshot stays reusable) and
-    /// return the prefill logits to seed decode from position `prompt.len()`.
-    /// Else None (caller re-prefills). Exact-match only: a recurrent state can't
-    /// be truncated to a shorter prefix.
-    pub fn try_restore_prefix(&mut self, prompt: &[u32]) -> Result<Option<Tensor>> {
+    /// If a snapshot exists whose prompt starts `prompt`, restore every layer's state from it
+    /// (deep-copied, so the snapshot stays reusable) and return how many tokens it covers
+    /// with the logits it was taken with. Else None. A recurrent state cannot be truncated
+    /// to a shorter prefix, but it can be advanced from the snapshot over the rest.
+    pub fn try_restore_prefix(&mut self, prompt: &[u32]) -> Result<Option<(usize, Tensor)>> {
         match &self.prefix_cache {
-            Some(pc) if pc.prompt.as_slice() == prompt => {}
+            Some(pc) if prompt.starts_with(&pc.prompt) => {}
             _ => return Ok(None),
         }
         let pc = self.prefix_cache.take().unwrap();
@@ -1792,8 +1791,9 @@ impl Qwen35MoeModel {
             }
         }
         let logits = pc.logits.affine(1.0, 0.0)?;
+        let covered = pc.prompt.len();
         self.prefix_cache = Some(pc);
-        Ok(Some(logits))
+        Ok(Some((covered, logits)))
     }
     pub fn from_gguf<R: Read + Seek>(
         content: &gguf_file::Content,

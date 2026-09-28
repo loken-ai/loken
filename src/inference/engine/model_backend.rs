@@ -2003,7 +2003,26 @@ impl ModelBackend for Qwen35MoeBackend {
     }
 
     fn try_restore_prefix(&mut self, prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
-        self.0.try_restore_prefix(prompt)
+        // A snapshot of an earlier prompt that this one extends - the previous turn of a
+        // conversation - is restored and advanced over the new tokens.
+        let Some((covered, logits)) = self.0.try_restore_prefix(prompt)? else {
+            return Ok(None);
+        };
+        if covered == prompt.len() {
+            return Ok(Some(logits));
+        }
+        let rest = Tensor::new(&prompt[covered..], &crate::tensor::Device::Cpu)?.unsqueeze(0)?;
+        // A recurrent state that failed part way through the new tokens cannot be rewound:
+        // the whole prompt is prefilled from position 0 instead, which starts a fresh state.
+        let logits = match self.forward_prefill_chunked(&rest, covered) {
+            Ok(logits) => logits,
+            Err(e) => {
+                tracing::warn!("prefix snapshot advance failed ({e}); prefilling the whole prompt");
+                return Ok(None);
+            }
+        };
+        self.0.snapshot_prefix(prompt, &logits)?;
+        Ok(Some(logits))
     }
 
     fn is_vision_model(&self) -> bool {
