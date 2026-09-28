@@ -193,14 +193,9 @@ impl Q4KvCache {
         else {
             return Ok(());
         };
-        // Try the amortized geometric target first; on a GPU OOM, retry with the
-        // EXACT requested capacity (`new_cap_tokens`) before propagating - keeps a
-        // near-full GPU growing one chunk at a time. A genuine OOM at the minimal
-        // size still propagates to the engine's OOM-adaptive prefill (smaller chunk).
-        let is_oom = |e: &anyhow::Error| {
-            let s = e.to_string().to_ascii_lowercase();
-            s.contains("out of memory") || s.contains("cuda_error_out_of_memory")
-        };
+        // The amortized geometric target first, then the minimal capacity that holds
+        // `new_cap_tokens`. An out-of-memory failure at the minimal size propagates to the
+        // prefill, which shrinks its chunk.
         let alloc_for = |toks: usize| {
             let blocks = toks.div_ceil(q4_0_block_size());
             let k_bytes = blocks * self.n_kv_heads * self.head_dim * q4_0_type_size();
@@ -210,17 +205,15 @@ impl Q4KvCache {
             let v = self.cuda_device.alloc_zeros::<u8>(v_bytes)?;
             Ok::<_, anyhow::Error>((toks, blocks, k, v))
         };
-        let (target_tokens, target_blocks, mut new_k, mut new_v) = match alloc_for(target_tokens) {
-            Ok(t) => t,
-            Err(e) if is_oom(&e) && new_cap_tokens < target_tokens => {
-                let minimal = self.core.minimal_target(new_cap_tokens);
-                tracing::warn!(
-                    "Q4KvCache::grow_to: doubled target {target_tokens} OOM'd ({e}); retrying minimal capacity {minimal}"
-                );
-                alloc_for(minimal)?
-            }
-            Err(e) => return Err(e),
-        };
+        let minimal = self.core.minimal_target(new_cap_tokens);
+        let ((target_tokens, target_blocks, mut new_k, mut new_v), _) =
+            crate::inference::place::recover::shrink_on_oom(
+                "Q4KvCache::grow_to",
+                target_tokens,
+                |toks| (minimal < toks).then_some(minimal),
+                |_| false,
+                alloc_for,
+            )?;
 
         if !self.core.is_empty() {
             // Copy used prefix of K blocks: blocks [0, current_seq_blocks),

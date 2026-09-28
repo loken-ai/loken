@@ -13,15 +13,12 @@
 
 use std::collections::HashSet;
 
-use tracing::warn;
-
 use crate::inference::generic_transformer::GenericHeteroTransformer;
 use crate::inference::model::moondream::quantized as moondream;
 use crate::tensor::{Device, Tensor};
 
 use crate::inference::engine::llm_engine::{
-    is_cuda_oom, VisionTower, ADAPTIVE_PREFILL_CHUNK, PREFILL_CHUNK_TOKENS,
-    PREFILL_CHUNK_TOKENS_MIN,
+    VisionTower, ADAPTIVE_PREFILL_CHUNK, PREFILL_CHUNK_TOKENS, PREFILL_CHUNK_TOKENS_MIN,
 };
 
 /// Boxed backend as stored in `LoadedModelState`.
@@ -227,88 +224,51 @@ pub(crate) trait ModelBackend: Send {
     ) -> crate::tensor::Result<Tensor> {
         let (_, seq_len) = x.dims2()?;
         let chunk_start = adaptive_prefill_chunk(self.widest_ffn());
-        if seq_len <= chunk_start {
-            // Single-forward fast path. Even here, a genuinely huge single
-            // chunk on a near-full GPU can OOM; if it does and the chunk is
-            // splittable, fall through to the adaptive chunked path rather
-            // than surfacing the OOM to the user.
-            match self.forward(x, index_pos) {
-                Ok(t) => return Ok(t),
-                Err(e) if is_cuda_oom(&e) && seq_len > PREFILL_CHUNK_TOKENS_MIN => {
-                    warn!("prefill OOM on a single {seq_len}-token forward ({e}); retrying chunk-adaptive");
-                    // Drop any partial KV the failed forward may have appended,
-                    // preserving the session prefix [0, index_pos).
-                    self.reset_kv_from(index_pos);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        // Adaptive chunked prefill. Start at the default compute batch and, on
-        // a CUDA OOM, halve the chunk (down to PREFILL_CHUNK_TOKENS_MIN) and
-        // restart the whole prefill from `index_pos`. A smaller chunk shrinks
-        // the per-forward activation peak (`chunk x widest_ffn x f32`), the
-        // attention scores tensor (`heads x chunk x total`), and the KV-grow
-        // transient - exactly the runtime allocations that OOM a near-full
-        // 2-GPU / co-resident model at long context. The final chunk's logits
-        // (the next-token prediction) are identical regardless of chunk size,
-        // so this degrades speed gracefully without changing the result.
+        // A prompt that fits one chunk runs as one forward; a longer one starts from the last
+        // chunk that fit this model, clamped into [MIN, default]. Each out-of-memory failure
+        // halves the chunk down to the floor and replays the prefill from `index_pos`, which
+        // shrinks the activation peak, the attention scores and the KV growth transient
+        // without changing the final chunk's logits. At the floor the card is full of
+        // something else, so room is asked for once before the failure surfaces.
         use std::sync::atomic::Ordering;
-        // Seed from the last known-good chunk for this loaded model (if any),
-        // so a model that already needed shrinking doesn't re-pay the full
-        // ladder on every request. Clamp into [MIN, default].
-        // Asked once per prefill: a second eviction round would only be evicting things this
-        // request just made room for.
-        let mut asked_for_room = false;
         let widest = self.widest_ffn();
-        let remembered = ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed);
-        let mut chunk_tokens = if remembered == 0 {
-            chunk_start
+        let first = if seq_len <= chunk_start {
+            seq_len
         } else {
-            remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk_start)
-        };
-        loop {
-            match self.forward_prefill_with_chunk(x, index_pos, seq_len, chunk_tokens) {
-                Ok(t) => {
-                    // Remember the chunk that fit (only when it differs from the
-                    // default - the common single-forward case never writes).
-                    if chunk_tokens < chunk_start {
-                        ADAPTIVE_PREFILL_CHUNK.store(chunk_tokens, Ordering::Relaxed);
-                    }
-                    return Ok(t);
-                }
-                Err(e) if is_cuda_oom(&e) && chunk_tokens > PREFILL_CHUNK_TOKENS_MIN => {
-                    let next = (chunk_tokens / 2).max(PREFILL_CHUNK_TOKENS_MIN);
-                    warn!(
-                        "prefill OOM at chunk={chunk_tokens} ({e}); shrinking prefill chunk to {next} and retrying"
-                    );
-                    // Discard the KV appended by the partial failed pass so the
-                    // retry replays cleanly from `index_pos` (preserving any
-                    // session-reuse prefix in [0, index_pos)).
-                    self.reset_kv_from(index_pos);
-                    chunk_tokens = next;
-                }
-                Err(e) if is_cuda_oom(&e) && !asked_for_room => {
-                    // The ladder has bottomed out: at the minimum chunk the activation peak is
-                    // small, so a card that still cannot serve it is full of something else  -
-                    // an idle model from another engine, most often. Every other engine asks
-                    // the pressure protocol for room before giving up; this path never did,
-                    // and surfaced the OOM to the caller instead while gigabytes sat reclaimable
-                    // beside it.
-                    asked_for_room = true;
-                    let want = (chunk_tokens * widest.max(1) * 4 * 2) as u64;
-                    if crate::inference::place::vram_manager::ensure_gpu_headroom_blocking(
-                        "llm", want,
-                    ) {
-                        warn!("prefill OOM at the minimum chunk ({e}); freed room, retrying");
-                        self.reset_kv_from(index_pos);
-                    } else {
-                        warn!("prefill OOM at the minimum chunk ({e}); nothing else holds VRAM");
-                        return Err(e);
-                    }
-                }
-                Err(e) => return Err(e),
+            match ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed) {
+                0 => chunk_start,
+                remembered => remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk_start),
             }
+        };
+        let mut replay = false;
+        let (logits, chunk_tokens) = crate::inference::place::recover::shrink_on_oom(
+            "prefill",
+            first,
+            |chunk| {
+                (chunk > PREFILL_CHUNK_TOKENS_MIN)
+                    .then(|| (chunk / 2).max(PREFILL_CHUNK_TOKENS_MIN))
+            },
+            |chunk| {
+                // One chunk's activation peak: `chunk x widest_ffn` f32 values for each of the
+                // gate and up projections.
+                let want = (chunk * widest.max(1) * 4 * 2) as u64;
+                crate::inference::place::vram_manager::ensure_gpu_headroom_blocking("llm", want)
+            },
+            |chunk| {
+                // A failed pass leaves partial KV behind; the session prefix [0, index_pos)
+                // stays.
+                if replay {
+                    self.reset_kv_from(index_pos);
+                }
+                replay = true;
+                self.forward_prefill_with_chunk(x, index_pos, seq_len, chunk)
+            },
+        )?;
+        // Remember a chunk that had to shrink, so later requests start at it.
+        if chunk_tokens < chunk_start && chunk_tokens < seq_len {
+            ADAPTIVE_PREFILL_CHUNK.store(chunk_tokens, Ordering::Relaxed);
         }
+        Ok(logits)
     }
 
     /// One chunked-prefill pass over `x` (shape `[1, seq_len]`) using a fixed

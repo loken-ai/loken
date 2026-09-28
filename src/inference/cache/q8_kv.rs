@@ -215,34 +215,24 @@ impl Q8KvCache {
             return Ok(());
         };
         let token_bytes = self.n_kv_heads * (self.head_dim / Q8_0_BLOCK_SIZE) * Q8_0_TYPE_SIZE;
-        // Try the amortized geometric target first (doubling -> O(1) appends). If
-        // the GPU can't fit the doubled buffer, retry with the EXACT requested
-        // capacity (`new_cap`) - half-to-quarter the bytes - before giving up.
-        // This keeps a near-full GPU (deepseek-r1 TP / gemma4:26b at long ctx)
-        // growing one chunk at a time instead of surfacing a runtime OOM to the
-        // user. A genuine OOM at the minimal size still propagates, where the
-        // engine's OOM-adaptive prefill shrinks the compute chunk and retries.
-        let is_oom = |e: &anyhow::Error| {
-            let s = e.to_string().to_ascii_lowercase();
-            s.contains("out of memory") || s.contains("cuda_error_out_of_memory")
-        };
+        // The amortized geometric target first (doubling keeps appends O(1)), then the
+        // minimal capacity that holds `new_cap`. An out-of-memory failure at the minimal
+        // size propagates to the prefill, which shrinks its chunk.
         let alloc_pair = |cap: usize| {
             let bytes = cap * token_bytes;
             let k = self.cuda_device.alloc_zeros::<u8>(bytes)?;
             let v = self.cuda_device.alloc_zeros::<u8>(bytes)?;
             Ok::<_, anyhow::Error>((cap, bytes, k, v))
         };
-        let (target, new_kv_bytes, mut new_k, mut new_v) = match alloc_pair(target) {
-            Ok(t) => t,
-            Err(e) if is_oom(&e) && new_cap < target => {
-                let minimal = self.core.minimal_target(new_cap);
-                tracing::warn!(
-                    "Q8KvCache::grow_to: doubled target {target} OOM'd ({e}); retrying minimal capacity {minimal}"
-                );
-                alloc_pair(minimal)?
-            }
-            Err(e) => return Err(e),
-        };
+        let minimal = self.core.minimal_target(new_cap);
+        let ((target, new_kv_bytes, mut new_k, mut new_v), _) =
+            crate::inference::place::recover::shrink_on_oom(
+                "Q8KvCache::grow_to",
+                target,
+                |cap| (minimal < cap).then_some(minimal),
+                |_| false,
+                alloc_pair,
+            )?;
         if !self.core.is_empty() {
             let used_bytes = self.core.len() * token_bytes;
             {

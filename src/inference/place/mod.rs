@@ -17,6 +17,7 @@ pub mod model_request;
 #[cfg(all(test, feature = "image"))]
 pub mod placement_invariants;
 pub mod plan;
+pub mod recover;
 pub mod runtime_demand;
 #[cfg(feature = "video")]
 pub mod video_plan;
