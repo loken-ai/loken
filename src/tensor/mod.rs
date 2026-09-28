@@ -161,12 +161,7 @@ impl Error {
     /// specifically (degrade footprint / fall back to CPU) instead of treating every
     /// error as fatal - and instead of blanket-catching ALL errors as OOM.
     pub fn is_oom(&self) -> bool {
-        let s = self.0.to_ascii_lowercase();
-        s.contains("[oom]") || s.contains("out of memory") || s.contains("out_of_memory")
-            // cuBLAS / cuDNN report OOM as *_STATUS_ALLOC_FAILED (no "out of memory"
-            // text) - a handle/workspace alloc that lost VRAM to a concurrent consumer.
-            // Treat those as memory pressure so the render degrades instead of crashing.
-            || s.contains("alloc_failed") || s.contains("alloc failed")
+        crate::inference::place::ladder::is_out_of_memory(&self.0)
     }
 
     /// The one constructor: anything printable becomes the message. Op kernels

@@ -34,8 +34,7 @@ impl LoadRequest {
 /// path escalates before giving up, so running out of memory here means the machine is
 /// full right now.
 pub(crate) fn load_error(model_name: &str, e: &str) -> ApiError {
-    let msg = e.to_lowercase();
-    if msg.contains("out of memory") || msg.contains("oom") {
+    if crate::inference::place::ladder::is_out_of_memory(e) {
         return ApiError::Busy(format!(
             "Model '{model_name}' exists but the machine has no room for it right now: {e}. \
              Retry once the current work finishes."

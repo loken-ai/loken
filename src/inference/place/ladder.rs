@@ -57,13 +57,20 @@ impl Demand {
     }
 }
 
-/// Whether an error is the card running out of memory, whatever layer raised it.
+/// Pressure rungs a request walks before its placement reaches the host: one per share of the
+/// cards the host-assisted rung offers.
+pub const PRESSURE_RUNGS: u64 = HOST_ASSISTED_SHARES_PCT.len() as u64;
+
+/// Whether an error is the card running out of memory, whatever layer raised it. The one
+/// classifier: every caller that branches on memory pressure asks this.
 pub fn is_out_of_memory<E: std::fmt::Display + ?Sized>(err: &E) -> bool {
     let s = err.to_string().to_ascii_lowercase();
     s.contains("out of memory")
         || s.contains("out_of_memory")
-        || s.contains("[oom]")
-        // cuBLAS reports its workspace and handle allocations with its own status.
+        // The substrate's `[oom]` marker, and the word on its own.
+        || s.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "oom")
+        // cuBLAS and cuDNN report their workspace and handle allocations with a status of
+        // their own.
         || s.contains("alloc_failed")
         || s.contains("alloc failed")
 }
@@ -335,7 +342,7 @@ pub fn halve_until_fits<T, E: std::fmt::Display>(
 }
 
 /// Hands the pools' cached blocks back before the next rung measures the cards.
-fn release_pools() {
+pub(crate) fn release_pools() {
     #[cfg(feature = "cuda")]
     crate::inference::engine::llm_engine::trim_cuda_pools();
 }
@@ -444,6 +451,34 @@ mod tests {
         );
         assert_eq!(seen, 1);
         assert!(got.is_err());
+    }
+
+    #[test]
+    fn every_spelling_of_out_of_memory_is_recognised() {
+        for e in [
+            "DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")",
+            "boom: Cuda_Error_OUT_OF_MEMORY at line 17",
+            "alloc failed: out of memory",
+            "[oom] kernel out on card 1",
+            "cuda OOM in QCudaStorage upload",
+            "CUBLAS_STATUS_ALLOC_FAILED",
+            "cudnn: CUDNN_STATUS_ALLOC_FAILED",
+            "workspace alloc failed",
+        ] {
+            assert!(is_out_of_memory(e), "{e}");
+        }
+    }
+
+    #[test]
+    fn other_failures_are_not_out_of_memory() {
+        for e in [
+            "DriverError(CUDA_ERROR_ILLEGAL_ADDRESS)",
+            "shape mismatch: expected (4, 64), got (4, 32)",
+            "zoom and cool hold the letters, not the word",
+            "missing tensor blk.0.attn_q.weight",
+        ] {
+            assert!(!is_out_of_memory(e), "{e}");
+        }
     }
 
     #[test]

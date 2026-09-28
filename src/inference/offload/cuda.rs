@@ -99,13 +99,6 @@ fn quant_blocks(p: &Projection, want: GgmlDType) -> Option<std::borrow::Cow<'_, 
     }
 }
 
-/// Whether an error is the card saying it has no room, in any of the spellings the driver and
-/// the libraries it calls use for it.
-fn is_out_of_memory(e: &Error) -> bool {
-    let s = format!("{e}");
-    s.contains("[oom]") || s.contains("OUT_OF_MEMORY") || s.contains("ALLOC_FAILED")
-}
-
 /// One card stream and what it keeps.
 pub struct Card {
     dev: Arc<CudaDevice>,
@@ -318,7 +311,7 @@ impl Card {
                 self.declined.store(false, Ordering::Relaxed);
                 Some(Ok(v))
             }
-            Ok(Err(e)) if is_out_of_memory(&e) => {
+            Ok(Err(e)) if crate::inference::place::ladder::is_out_of_memory(&e) => {
                 self.decline(what, &e);
                 None
             }

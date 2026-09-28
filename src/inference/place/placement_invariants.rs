@@ -1301,7 +1301,6 @@ fn route_violations() -> std::collections::BTreeMap<String, (usize, usize, usize
 /// The list only shrinks: a file routed through the planner leaves it, and a count that
 /// drops has to be written down here.
 const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
-    ("api/handlers/admission.rs", (0, 1, 0)),
     ("api/handlers/media/generate.rs", (2, 6, 0)),
     ("api/handlers/media/video.rs", (0, 3, 0)),
     ("api/handlers/model_manager.rs", (2, 1, 0)),
@@ -1347,7 +1346,11 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("inference/model/qwen_image/textenc.rs", (3, 0, 0)),
     ("inference/model/sdxl/pipeline.rs", (5, 0, 0)),
     ("inference/model/sdxl/unet.rs", (0, 0, 1)),
-    ("inference/offload/cuda.rs", (1, 2, 0)),
+    ("inference/model/stable_audio/mod.rs", (0, 2, 0)),
+    ("inference/model/t5/flan.rs", (1, 0, 0)),
+    ("inference/model/wan/dit/layers.rs", (6, 0, 0)),
+    ("inference/model/wan/pipeline.rs", (8, 5, 0)),
+    ("inference/offload/cuda.rs", (1, 0, 0)),
     ("inference/offload/streamed.rs", (2, 0, 0)),
     ("inference/serve/continuous_serve.rs", (1, 0, 0)),
     ("inference/serve/tp_model.rs", (1, 0, 0)),
