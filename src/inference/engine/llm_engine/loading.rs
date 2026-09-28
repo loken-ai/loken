@@ -903,19 +903,6 @@ impl LlmEngine {
                         KvQuant::Q8 => 1,                  // 1 byte/elem (Q8_0 + scale negligible)
                         KvQuant::Q4 => 1,                  // ~0.5 byte/elem nibble + scale; round up to 1 for safety
                     };
-                    // gemma4 26B-MoE with kv_quant != Off: SWA layers
-                    // keep BOTH F-dtype kv_cache AND Q8 kv_cache (Q8
-                    // lazy-pre-alloc at load). Reserve 3 bytes/elem
-                    // (F16 + Q8) so the planner doesn't pack more
-                    // layers on GPU than fit.
-                    let kv_dtype_bytes = if arch == "gemma4"
-                        && num_layers == 30
-                        && !matches!(kv_quant, KvQuant::Off)
-                    {
-                        3u64
-                    } else {
-                        kv_dtype_bytes
-                    };
                     // For models with sliding-window attention (gemma3/4),
                     // most layers cap their KV at sliding_window. With a
                     // pattern like [SWA,SWA,SWA,SWA,SWA,Global,...] the
