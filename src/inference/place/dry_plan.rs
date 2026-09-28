@@ -239,7 +239,7 @@ fn reapportion(
 }
 
 /// Two placements that put the same blocks on the same devices.
-fn same_plan(a: &HeteroPlan, b: &HeteroPlan) -> bool {
+pub fn same_plan(a: &HeteroPlan, b: &HeteroPlan) -> bool {
     a.segments.len() == b.segments.len()
         && a.segments.iter().zip(b.segments.iter()).all(|(x, y)| {
             x.kind == y.kind && x.layer_start == y.layer_start && x.layer_end == y.layer_end
@@ -322,6 +322,55 @@ where
     }
 
     None
+}
+
+/// [`solve`] for a stack that leaves one card room for a companion component of
+/// `companion` bytes. Every card is tried as the one keeping that room; the arrangement
+/// with the fewest segments wins, and between those the one whose stack starts on the
+/// faster card. Returns the card keeping the room with the placement.
+pub fn plan_beside<M>(
+    total_layers: usize,
+    cuda_fastest_first: &[(usize, u64)],
+    companion: u64,
+    measure: &mut M,
+) -> Option<(usize, Solution)>
+where
+    M: FnMut(&HeteroPlan) -> Option<PlanLoad>,
+{
+    let rank_of = |s: &Solution| {
+        let first = s
+            .plan
+            .segments
+            .first()
+            .map_or(usize::MAX, |g| match g.kind {
+                DeviceKind::Cuda(i) => cuda_fastest_first
+                    .iter()
+                    .position(|(idx, _)| *idx == i)
+                    .unwrap_or(usize::MAX),
+                _ => usize::MAX,
+            });
+        (s.plan.segments.len(), first)
+    };
+    let mut best: Option<(usize, Solution)> = None;
+    for &(keeper, _) in cuda_fastest_first {
+        let budgets: Vec<(usize, u64)> = cuda_fastest_first
+            .iter()
+            .map(|&(idx, free)| {
+                if idx == keeper {
+                    (idx, free.saturating_sub(companion))
+                } else {
+                    (idx, free)
+                }
+            })
+            .collect();
+        let Some(s) = solve(total_layers, &budgets, 0, measure) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(_, b)| rank_of(&s) < rank_of(b)) {
+            best = Some((keeper, s));
+        }
+    }
+    best
 }
 
 #[cfg(test)]

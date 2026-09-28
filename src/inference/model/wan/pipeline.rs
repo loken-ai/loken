@@ -869,7 +869,7 @@ pub fn render_many_sampled(
     // for the sizes it can carry it is a real one. What is being refused is the SILENT
     // fallback on a machine whose cards simply cannot hold this frame.
     if dit.is_host_only() {
-        let cards = crate::inference::place::ladder::offered_cards();
+        let cards = crate::inference::place::ladder::cards(0);
         if !cards.is_empty() {
             // Tokens scale with the frame's AREA, so the size that fits is found by
             // shrinking until the count is one the cards took - reported rather than

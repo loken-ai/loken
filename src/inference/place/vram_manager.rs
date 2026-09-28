@@ -605,6 +605,22 @@ impl Drop for VramWatch {
     }
 }
 
+/// A watch on every card, with what each held free when it started, for reporting what a
+/// stretch of work took on each card. Empty when the platform has no watch.
+pub fn watch_every_card() -> Vec<(usize, u64, VramWatch)> {
+    #[cfg(feature = "cuda")]
+    {
+        crate::inference::place::device_probe::probe_cuda_gpus()
+            .into_iter()
+            .filter_map(|g| Some((g.index, g.stable_free, VramWatch::start(g.index)?)))
+            .collect()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Free VRAM on one card, read WITHOUT trimming the pools.
 ///
 /// Deliberately not [`probe`]: trimming returns freed blocks to the driver, so sampling
