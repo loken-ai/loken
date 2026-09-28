@@ -77,6 +77,16 @@ struct RawGenericLayer {
     pre_ffw_norm_2_qt: Option<QTensor>,
     post_ffw_norm_1_qt: Option<QTensor>,
     post_ffw_norm_2_qt: Option<QTensor>,
+    /// Sigmoid router selection bias `[n_experts]`.
+    moe_exp_probs_b_qt: Option<QTensor>,
+    /// The recurrent mixer's own tensors; its output projection is `attn_output`.
+    mixer: RawMixer,
+}
+
+/// A block's mixer tensors, as read.
+enum RawMixer {
+    Attention,
+    ShortConv { in_proj: QTensor, conv: QTensor },
 }
 
 /// Helper: read a tensor by name from mmap with a Cursor, or return None if absent.
@@ -819,6 +829,18 @@ fn build_generic_layer(
             // OLMoE uses raw softmax-over-all top-K weights (no renorm); all other
             // MoE arches renormalize the top-K to sum to 1.
             norm_topk: config.arch != "olmoe",
+            sigmoid_routing: config
+                .expert_sigmoid_gating
+                .then(|| -> Result<SigmoidRouting> {
+                    Ok(SigmoidRouting {
+                        selection_bias: load_bias(raw.moe_exp_probs_b_qt)?
+                            .map(|b| b.to_dtype(crate::tensor::DType::F32))
+                            .transpose()?,
+                        normalize: config.expert_weights_norm,
+                        scale: config.expert_weights_scale,
+                    })
+                })
+                .transpose()?,
             gate_up_exps_f32: gus_f32,
             down_exps_f32: des_f32,
         })
@@ -828,6 +850,18 @@ fn build_generic_layer(
     let pre_ffw_norm_2 = build_norm_opt(raw.pre_ffw_norm_2_qt)?;
     let post_ffw_norm_1 = build_norm_opt(raw.post_ffw_norm_1_qt)?;
     let post_ffw_norm_2 = build_norm_opt(raw.post_ffw_norm_2_qt)?;
+
+    let mixer = match raw.mixer {
+        RawMixer::Attention => super::mixer::Mixer::Attention,
+        RawMixer::ShortConv { in_proj, conv } => {
+            super::mixer::Mixer::ShortConv(super::mixer::ShortConv::new(
+                to_qmatmul(Some(in_proj))?.unwrap(),
+                conv.dequantize(&Device::Cpu)?,
+                device,
+            )?)
+        }
+    };
+    let attends = matches!(mixer, super::mixer::Mixer::Attention);
 
     // gemma4: pre-allocate the unit-weight tensor used by the V-RMS-norm
     // pass (head_dim ones, F32). Built on the LAYER's device - CPU or GPU.
@@ -862,6 +896,7 @@ fn build_generic_layer(
     let has_sinks = attn_sinks.is_some();
 
     Ok(GenericTransformerLayer {
+        mixer,
         attn_q,
         attn_k,
         attn_v,
@@ -973,7 +1008,7 @@ fn build_generic_layer(
             let max_seq = config.effective_max_context();
             // The quantised attention kernels have no sink term: a sink layer keeps its
             // history in the F-dtype cache.
-            let built = if device.is_cuda() && shape_supported && !has_sinks {
+            let built = if device.is_cuda() && shape_supported && !has_sinks && attends {
                 match config.kv_quant {
                     KvQuant::Q8 => Some(
                         crate::inference::cache::q8_kv::Q8KvCache::new(
@@ -1313,6 +1348,7 @@ fn build_awq_layer(
     };
 
     Ok(GenericTransformerLayer {
+        mixer: super::mixer::Mixer::Attention,
         attn_q,
         attn_k,
         attn_v,
@@ -1523,7 +1559,15 @@ impl GenericHeteroTransformer {
         );
 
         // -- 2. Load output norm + output projection on CPU ----------------
-        let norm_qt = content.tensor(&mut cursor, "output_norm.weight", &Device::Cpu)?;
+        // LFM2 files name the final norm `token_embd_norm`; it is read under that name only
+        // when the file carries no `output_norm`.
+        let norm_qt = match content.tensor(&mut cursor, "output_norm.weight", &Device::Cpu) {
+            Ok(qt) => qt,
+            Err(e) => match content.tensor_infos.contains_key("token_embd_norm.weight") {
+                true => content.tensor(&mut cursor, "token_embd_norm.weight", &Device::Cpu)?,
+                false => return Err(e),
+            },
+        };
         let norm_weight_cpu = norm_qt.dequantize(&Device::Cpu)?;
         // Phi2/GPT-NeoX use full LayerNorm: `output_norm.bias` exists.
         let output_norm_bias_cpu = content
@@ -1845,8 +1889,12 @@ impl GenericHeteroTransformer {
                 };
             }
 
+            let mixer_kind = super::mixer::layer_mixer_kind(&content, idx);
+            let attends = mixer_kind == super::mixer::MixerKind::Attention;
             // Attention
-            let (attn_q, attn_k, attn_v, attn_qkv) = if f.fused_qkv {
+            let (attn_q, attn_k, attn_v, attn_qkv) = if !attends {
+                (None, None, None, None)
+            } else if f.fused_qkv {
                 let qkv = req!(&format!("{prefix}.attn_qkv.weight"))?;
                 (None, None, None, Some(qkv))
             } else {
@@ -1870,13 +1918,13 @@ impl GenericHeteroTransformer {
             // Gemma4 has per-layer head_dim (SWA=256, full=512).
             // Q output dim: the loader reverses GGUF dims, so the FIRST dim
             // in the reference Shape is the output dim (last GGUF dim).
-            let q_out_dim = if !f.fused_qkv {
+            let q_out_dim = if attends && !f.fused_qkv {
                 ti.get(&format!("{prefix}.attn_q.weight"))
                     .map(|info| info.shape.dims()[0])
             } else {
                 None // fused QKV uses config head_dim
             };
-            let k_out_dim = if !f.fused_qkv {
+            let k_out_dim = if attends && !f.fused_qkv {
                 ti.get(&format!("{prefix}.attn_k.weight"))
                     .map(|info| info.shape.dims()[0])
             } else {
@@ -1884,14 +1932,26 @@ impl GenericHeteroTransformer {
             };
 
             let attn_output_stem = attn_output_name(&content);
-            let attn_output = req!(&format!("{prefix}.{attn_output_stem}.weight"))?;
+            let (attn_output, mixer) = match mixer_kind {
+                super::mixer::MixerKind::Attention => (
+                    req!(&format!("{prefix}.{attn_output_stem}.weight"))?,
+                    RawMixer::Attention,
+                ),
+                super::mixer::MixerKind::ShortConv => (
+                    req!(&format!("{prefix}.shortconv.out_proj.weight"))?,
+                    RawMixer::ShortConv {
+                        in_proj: req!(&format!("{prefix}.shortconv.in_proj.weight"))?,
+                        conv: req_cpu!(&format!("{prefix}.shortconv.conv.weight"))?,
+                    },
+                ),
+            };
             // Phi2: attn_output bias
-            let attn_output_bias_qt = if f.has_attn_output_bias {
+            let attn_output_bias_qt = if attends && f.has_attn_output_bias {
                 opt_cpu!(&format!("{prefix}.{attn_output_stem}.bias"))?
             } else {
                 None
             };
-            let attn_sinks_qt = if f.has_attn_sinks {
+            let attn_sinks_qt = if attends && f.has_attn_sinks {
                 let name = attn_sinks_name(&content, idx).ok_or_else(|| {
                     crate::tensor::Error::msg(format!("missing tensor: {prefix}.attn_sinks"))
                 })?;
@@ -1901,7 +1961,7 @@ impl GenericHeteroTransformer {
             };
 
             // Optional biases (Qwen2) - always CPU (small tensors)
-            let (attn_q_bias, attn_k_bias, attn_v_bias) = if f.has_qkv_bias {
+            let (attn_q_bias, attn_k_bias, attn_v_bias) = if attends && f.has_qkv_bias {
                 let bq = opt_cpu!(&format!("{prefix}.attn_q.bias"))?;
                 let bk = opt_cpu!(&format!("{prefix}.attn_k.bias"))?;
                 let bv = opt_cpu!(&format!("{prefix}.attn_v.bias"))?;
@@ -1911,7 +1971,7 @@ impl GenericHeteroTransformer {
             };
 
             // QK norms (Gemma3) - always CPU
-            let (attn_q_norm_qt, attn_k_norm_qt) = if f.has_qk_norm {
+            let (attn_q_norm_qt, attn_k_norm_qt) = if attends && f.has_qk_norm {
                 let qn = opt_cpu!(&format!("{prefix}.attn_q_norm.weight"))?;
                 let kn = opt_cpu!(&format!("{prefix}.attn_k_norm.weight"))?;
                 (qn, kn)
@@ -2035,6 +2095,11 @@ impl GenericHeteroTransformer {
             } else {
                 None
             };
+            let moe_exp_probs_b_qt = if f.is_moe {
+                opt_cpu!(&format!("{prefix}.exp_probs_b.bias"))?
+            } else {
+                None
+            };
             let (
                 moe_gate_inp_bias_qt,
                 moe_gate_exps_bias_qt,
@@ -2111,6 +2176,8 @@ impl GenericHeteroTransformer {
                 pre_ffw_norm_2_qt,
                 post_ffw_norm_1_qt,
                 post_ffw_norm_2_qt,
+                moe_exp_probs_b_qt,
+                mixer,
             })
         };
 

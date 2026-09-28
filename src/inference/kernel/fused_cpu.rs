@@ -19,21 +19,6 @@
 use crate::tensor::{DType, Result, Tensor, D};
 
 // -- Option-returning ops: return None so the caller uses its portable fallback --
-pub fn gptoss_flash_decode(
-    _q: &Tensor,
-    _k: &Tensor,
-    _v: &Tensor,
-    _mask: Option<&Tensor>,
-    _sinks: Option<&Tensor>,
-    _scale: f32,
-    _batch: usize,
-    _n_head: usize,
-    _n_kv: usize,
-    _kv_len: usize,
-    _head_dim: usize,
-) -> Result<Option<Tensor>> {
-    Ok(None)
-}
 
 pub fn gptoss_flash_decode_win(
     _q: &Tensor,
@@ -95,9 +80,6 @@ pub fn flash_decode_devkvlen(
     Ok(None)
 }
 
-pub fn embed_gather_f16(_table: &Tensor, _tok: &Tensor, _d_model: usize) -> Result<Option<Tensor>> {
-    Ok(None)
-}
 pub fn silu_mul_f16(_g: &Tensor, _u: &Tensor) -> Result<Option<Tensor>> {
     Ok(None)
 }
@@ -105,15 +87,6 @@ pub fn neox_rope_f16(
     _x: &Tensor,
     _cos: &Tensor,
     _sin: &Tensor,
-    _rope_dim: usize,
-) -> Result<Option<Tensor>> {
-    Ok(None)
-}
-pub fn neox_rope_devpos_f16(
-    _x: &Tensor,
-    _c: &Tensor,
-    _s: &Tensor,
-    _p: &Tensor,
     _rope_dim: usize,
 ) -> Result<Option<Tensor>> {
     Ok(None)
@@ -182,12 +155,6 @@ pub fn paged_kv_write(
 }
 
 // -- Device-scalar in-place helpers (CUDA-graph decode only): no-op on CPU --
-pub fn set_i32_inplace(_t: &Tensor, _val: i32) -> Result<()> {
-    Ok(())
-}
-pub fn copy_u32_dev(_src: &Tensor, _dst: &Tensor) -> Result<()> {
-    Ok(())
-}
 pub fn copy_f32_dev(_src: &Tensor, _dst: &Tensor) -> Result<()> {
     Ok(())
 }
@@ -208,11 +175,6 @@ pub fn fused_rmsnorm_f16(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor
 
 // Matches the CUDA launcher's fallback branch: rmsnorm in F32, rounded through
 // the input dtype, emitted as F32 (bit-identical to the fused kernel's store).
-pub fn fused_rmsnorm_f16_out_f32(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-    crate::tensor::ops::rms_norm(&x.to_dtype(DType::F32)?, weight, eps)?
-        .to_dtype(x.dtype())?
-        .to_dtype(DType::F32)
-}
 
 pub fn fused_add_rmsnorm_f16(
     x: &Tensor,
@@ -345,22 +307,6 @@ pub fn fused_phi2_residual_merge(
 }
 
 // -- KV-cache write at host position (CPU uses pos_dev[0] read back to host) --
-pub fn kv_write_at_pos(
-    k_new: &Tensor,
-    v_new: &Tensor,
-    kbuf: &Tensor,
-    vbuf: &Tensor,
-    pos_dev: &Tensor,
-    _kv_max: usize,
-) -> Result<()> {
-    // pos_dev is a [1] i32 tensor; read it to host and slice_set the new K/V.
-    let pos = pos_dev.to_dtype(DType::U32)?.to_vec1::<u32>()?[0] as usize;
-    // kbuf/vbuf: [b, n_kv, kv_max, hd]; write k_new [b,n_kv,seq,hd] at kv position `pos`.
-    let kv_dim = kbuf.rank() - 2; // the kv_max axis
-    kbuf.slice_set(k_new, kv_dim, pos)?;
-    vbuf.slice_set(v_new, kv_dim, pos)?;
-    Ok(())
-}
 
 // -- attention sink mask (additive [seq, kv]); None -> caller builds its own --
 pub fn fused_gptoss_mask(

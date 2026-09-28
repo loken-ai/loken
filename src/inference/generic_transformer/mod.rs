@@ -46,6 +46,7 @@ mod layer_cpu_attn;
 mod layer_ffn;
 mod layer_forward;
 mod loader;
+pub mod mixer;
 mod moe_weights;
 #[cfg(all(test, feature = "cuda"))]
 mod verify_decode_parity;
@@ -61,6 +62,9 @@ pub(crate) use projection::QMatMul;
 
 /// One transformer layer with all optional architectural variants.
 pub struct GenericTransformerLayer {
+    /// What mixes the tokens: the attention fields below, or a recurrent operator whose
+    /// output projection is `attn_output`.
+    pub mixer: mixer::Mixer,
     // Attention - split Q/K/V (most models)
     pub attn_q: Option<QMatMul>,
     pub attn_k: Option<QMatMul>,
@@ -433,6 +437,9 @@ pub struct KvSnapshot {
     pub kv_len: usize,
     pub(crate) layers: Vec<LayerKvSnapshot>,
     pub(crate) tick: u64,
+    /// The last row's logits of the forward that ended at `kv_len`: a recurrent model's
+    /// prefix snapshot resumes decoding from them.
+    pub(crate) logits: Option<Tensor>,
 }
 
 impl KvSnapshot {
@@ -440,7 +447,10 @@ impl KvSnapshot {
     pub fn device_bytes(&self) -> u64 {
         self.layers
             .iter()
-            .filter_map(|l| l.spec.as_ref().map(|s| s.device_bytes()))
+            .map(|l| {
+                l.spec.as_ref().map_or(0, |s| s.device_bytes())
+                    + l.mixer.as_ref().map_or(0, |m| m.device_bytes())
+            })
             .sum()
     }
 }
@@ -448,6 +458,8 @@ impl KvSnapshot {
 pub(crate) struct LayerKvSnapshot {
     pub(crate) spec: Option<crate::inference::serve::spec_kv_cache::SpecKvSnapshot>,
     pub(crate) cpu_f16: Option<crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
+    /// A recurrent mixer's state at the snapshot's length.
+    pub(crate) mixer: Option<mixer::MixerState>,
 }
 
 #[derive(Debug, Clone)]

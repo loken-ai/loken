@@ -278,16 +278,6 @@ pub fn gate_topk_softmax(
 ) -> Result<Option<(Tensor, Tensor)>> {
     Ok(None)
 }
-pub fn gate_topk_sigmoid(
-    _xs: &Tensor,
-    _gate_w: &Tensor,
-    _bias: Option<&Tensor>,
-    _n: usize,
-    _norm: bool,
-    _scale: f64,
-) -> Result<Option<(Tensor, Tensor)>> {
-    Ok(None)
-}
 pub fn topk_sigmoid_post(
     _logits: &Tensor,
     _bias: Option<&Tensor>,
@@ -307,15 +297,6 @@ pub fn lfm2_shortconv_f16io(
     _d_model: usize,
     _l_cache: usize,
 ) -> Result<Option<(Tensor, Tensor)>> {
-    Ok(None)
-}
-pub fn lfm2_shortconv_f16io_inplace(
-    _bcx: &Tensor,
-    _state: &Tensor,
-    _conv_w: &Tensor,
-    _d_model: usize,
-    _l_cache: usize,
-) -> Result<Option<Tensor>> {
     Ok(None)
 }
 pub fn zgate_rmsnorm_f16io(

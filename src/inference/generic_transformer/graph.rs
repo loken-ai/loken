@@ -165,6 +165,9 @@ impl GenericHeteroTransformer {
     /// than logged here so the caller decides where it surfaces; `graph_capture_auto_on`
     /// keeps the boolean contract for existing callers.
     pub fn graph_capture_decision(&self) -> std::result::Result<(), &'static str> {
+        if self.is_recurrent() {
+            return Err("recurrent mixer: the captured decode has no recurrent step");
+        }
         if self.layers.iter().any(|l| l.attn_sinks.is_some()) {
             return Err("attention sinks: the captured decode attention has no sink term");
         }
@@ -1219,6 +1222,11 @@ impl GenericHeteroTransformer {
     /// window (after a slide the buffer index is no longer the position). An `Err` from
     /// a cache leaves the layers in no common state; the caller resets.
     pub fn shift_kv_tail(&mut self, from: usize, discard: usize) -> crate::tensor::Result<()> {
+        if self.is_recurrent() {
+            return Err(crate::tensor::Error::msg(
+                "context shift: a recurrent state cannot drop positions".to_string(),
+            ));
+        }
         for layer in &self.layers {
             if layer.sliding_window.is_some() {
                 return Err(crate::tensor::Error::msg(
@@ -1258,8 +1266,9 @@ impl GenericHeteroTransformer {
     pub fn supports_kv_snapshots(&self) -> bool {
         // A quantised layer (Q8/Q4 on the card) is captured by dequantising to F16 and
         // restored by re-appending, which stays on the same quant grid. The host q8 cache
-        // has no such round-trip and still bars snapshots.
-        self.layers.iter().all(|l| l.cpu_q8_kv.is_none())
+        // has no such round-trip and still bars snapshots. A recurrent state cannot be cut
+        // to the prefix a KV snapshot is reused at; it is kept by `snapshot_prefix`.
+        self.layers.iter().all(|l| l.cpu_q8_kv.is_none()) && !self.is_recurrent()
     }
 
     /// Copies the resident KV aside under `tokens`, keeping at most `cap` snapshots: the
@@ -1267,34 +1276,60 @@ impl GenericHeteroTransformer {
     /// A copy that fails, for lack of memory, drops every snapshot and returns the error;
     /// the request that produced the KV is not at stake.
     pub fn snapshot_kv(&mut self, tokens: Vec<u32>, kv_len: usize) -> crate::tensor::Result<()> {
+        // A recurrent model's table holds its prefix snapshots, which this leaves alone.
+        if self.is_recurrent() {
+            return Ok(());
+        }
         if !self.supports_kv_snapshots() {
             self.kv_snapshots.clear();
             return Ok(());
         }
+        let layers = match self.capture_layers() {
+            Ok(layers) => layers,
+            Err(e) => {
+                self.kv_snapshots.clear();
+                return Err(e);
+            }
+        };
+        self.store_snapshot(tokens, kv_len, layers, None);
+        Ok(())
+    }
+
+    /// Every layer's KV, and every recurrent mixer's state, copied aside.
+    fn capture_layers(&self) -> crate::tensor::Result<Vec<super::LayerKvSnapshot>> {
         let mut layers = Vec::with_capacity(self.layers.len());
         for l in &self.layers {
-            if let Some(snap) = quantised_layer_snapshot(l)? {
+            let mixer = l.mixer.snapshot()?;
+            if let Some(mut snap) = quantised_layer_snapshot(l)? {
+                snap.mixer = mixer;
                 layers.push(snap);
                 continue;
             }
-            let spec = match l.kv_cache.snapshot() {
-                Ok(s) => s,
-                Err(e) => {
-                    self.kv_snapshots.clear();
-                    return Err(e);
-                }
-            };
             layers.push(super::LayerKvSnapshot {
-                spec,
+                spec: l.kv_cache.snapshot()?,
                 cpu_f16: l.cpu_f16_kv.clone(),
+                mixer,
             });
         }
+        Ok(layers)
+    }
+
+    /// Enters a snapshot in the table: the one this sequence extends is replaced, and the
+    /// table is held to its memory budget.
+    fn store_snapshot(
+        &mut self,
+        tokens: Vec<u32>,
+        kv_len: usize,
+        layers: Vec<super::LayerKvSnapshot>,
+        logits: Option<crate::tensor::Tensor>,
+    ) {
         self.kv_snapshot_tick += 1;
         let snap = super::KvSnapshot {
             tokens,
             kv_len,
             layers,
             tick: self.kv_snapshot_tick,
+            logits,
         };
         let existing: Vec<(&[u32], u64)> = self
             .kv_snapshots
@@ -1306,7 +1341,73 @@ impl GenericHeteroTransformer {
             None => self.kv_snapshots.push(snap),
         }
         self.enforce_kv_snapshot_budget();
+    }
+
+    /// True when a layer carries a recurrent state beside its KV cache.
+    pub fn is_recurrent(&self) -> bool {
+        self.layers.iter().any(|l| l.mixer.is_recurrent())
+    }
+
+    /// A recurrent model's state after prefilling `prompt`, entered in the snapshot table
+    /// with the prefill's last logits. A model without a recurrent layer keeps none: its KV
+    /// is reused through `snapshot_kv` and `trim_kv`.
+    pub fn snapshot_prefix(
+        &mut self,
+        prompt: &[u32],
+        logits: &crate::tensor::Tensor,
+    ) -> crate::tensor::Result<()> {
+        if !self.is_recurrent() {
+            return Ok(());
+        }
+        let layers = match self.capture_layers() {
+            Ok(layers) => layers,
+            Err(e) => {
+                self.kv_snapshots.clear();
+                return Err(e);
+            }
+        };
+        let logits = logits.affine(1.0, 0.0)?;
+        self.store_snapshot(prompt.to_vec(), prompt.len(), layers, Some(logits));
         Ok(())
+    }
+
+    /// Restores the longest prefix snapshot whose tokens begin `prompt` and returns how
+    /// many tokens it covers with the logits it was taken with. A recurrent state cannot be
+    /// cut back to a shorter prefix, so only a snapshot `prompt` extends whole qualifies.
+    pub fn try_restore_prefix(
+        &mut self,
+        prompt: &[u32],
+    ) -> crate::tensor::Result<Option<(usize, crate::tensor::Tensor)>> {
+        if !self.is_recurrent() {
+            return Ok(None);
+        }
+        let Some(index) = self
+            .kv_snapshots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.logits.is_some() && prompt.starts_with(&s.tokens))
+            .max_by_key(|(_, s)| s.tokens.len())
+            .map(|(i, _)| i)
+        else {
+            return Ok(None);
+        };
+        let Self {
+            layers,
+            kv_snapshots,
+            ..
+        } = self;
+        restore_layers(layers, &kv_snapshots[index].layers)?;
+        let snap = &kv_snapshots[index];
+        let covered = snap.kv_len;
+        let logits = snap
+            .logits
+            .as_ref()
+            .map(|l| l.affine(1.0, 0.0))
+            .transpose()?
+            .expect("filtered on logits above");
+        self.kv_snapshot_tick += 1;
+        self.kv_snapshots[index].tick = self.kv_snapshot_tick;
+        Ok(Some((covered, logits)))
     }
 
     /// Keeps the snapshots within a device-memory budget, dropping the least recently
@@ -1367,6 +1468,7 @@ impl GenericHeteroTransformer {
         self.kv_snapshots
             .iter()
             .enumerate()
+            .filter(|(_, s)| s.logits.is_none())
             .map(|(i, s)| (i, common_prefix(&s.tokens, prompt).min(s.kv_len)))
             .filter(|(_, c)| *c > 0)
             .max_by_key(|(_, c)| *c)
@@ -1384,16 +1486,7 @@ impl GenericHeteroTransformer {
             ..
         } = self;
         let snap = &kv_snapshots[index];
-        for (l, s) in layers.iter_mut().zip(&snap.layers) {
-            if restore_quantised_layer(l, s)? {
-                continue;
-            }
-            match &s.spec {
-                Some(spec) => l.kv_cache.restore(spec)?,
-                None => l.kv_cache.trim_to(0),
-            }
-            l.cpu_f16_kv = s.cpu_f16.clone();
-        }
+        restore_layers(layers, &snap.layers)?;
         let out = (snap.tokens.clone(), snap.kv_len);
         self.kv_snapshot_tick += 1;
         self.kv_snapshots[index].tick = self.kv_snapshot_tick;
@@ -1403,7 +1496,11 @@ impl GenericHeteroTransformer {
 
     /// `(layers, n_kv, head_dim)`: what a KV row of this model is made of.
     pub fn kv_layout(&self) -> (usize, usize, usize) {
-        let l = &self.layers[0];
+        let l = self
+            .layers
+            .iter()
+            .find(|l| matches!(l.mixer, super::mixer::Mixer::Attention))
+            .unwrap_or(&self.layers[0]);
         (self.layers.len(), l.n_kv_head, l.head_dim)
     }
 
@@ -1536,6 +1633,7 @@ impl GenericHeteroTransformer {
                 layers.push(super::LayerKvSnapshot {
                     spec: None,
                     cpu_f16: None,
+                    mixer: None,
                 });
                 continue;
             };
@@ -1562,6 +1660,7 @@ impl GenericHeteroTransformer {
                 layers.push(super::LayerKvSnapshot {
                     spec: Some(spec),
                     cpu_f16: None,
+                    mixer: None,
                 });
             } else if let Some(c) = &l.cpu_f16_kv {
                 let mut fresh = c.like();
@@ -1572,6 +1671,7 @@ impl GenericHeteroTransformer {
                 layers.push(super::LayerKvSnapshot {
                     spec: None,
                     cpu_f16: Some(fresh),
+                    mixer: None,
                 });
             } else {
                 return Err(crate::tensor::Error::msg(
@@ -1579,23 +1679,7 @@ impl GenericHeteroTransformer {
                 ));
             }
         }
-        self.kv_snapshot_tick += 1;
-        let snap = super::KvSnapshot {
-            tokens,
-            kv_len,
-            layers,
-            tick: self.kv_snapshot_tick,
-        };
-        let existing: Vec<(&[u32], u64)> = self
-            .kv_snapshots
-            .iter()
-            .map(|s| (s.tokens.as_slice(), s.tick))
-            .collect();
-        match snapshot_slot(&existing, &snap.tokens, SNAPSHOT_COUNT_UNBOUNDED) {
-            Some(i) => self.kv_snapshots[i] = snap,
-            None => self.kv_snapshots.push(snap),
-        }
-        self.enforce_kv_snapshot_budget();
+        self.store_snapshot(tokens, kv_len, layers, None);
         Ok(())
     }
 
@@ -1610,6 +1694,11 @@ impl GenericHeteroTransformer {
     /// `current_seq_len` counter (see `SpecKvCache::trim_to`).
     pub fn trim_kv(&mut self, new_len: usize) {
         for layer in &mut self.layers {
+            // A recurrent state cannot be cut to a shorter length: it is dropped only when
+            // nothing is kept.
+            if new_len == 0 {
+                layer.mixer.reset();
+            }
             layer.kv_cache.trim_to(new_len);
             // Keep the Q8 mirror in sync with the F-dtype cache; otherwise
             // speculative-decoding rollbacks leave Q8 with stale draft
@@ -2013,16 +2102,41 @@ fn quantised_layer_snapshot(
                 return Ok(Some(super::LayerKvSnapshot {
                     spec: Some(spec),
                     cpu_f16: None,
+                    mixer: None,
                 }));
             }
             return Ok(Some(super::LayerKvSnapshot {
                 spec: None,
                 cpu_f16: None,
+                mixer: None,
             }));
         }
     }
     let _ = l;
     Ok(None)
+}
+
+/// Makes a snapshot's layers the resident ones: every KV cache, and every recurrent
+/// mixer's state, a mixer without a captured state starting fresh.
+fn restore_layers(
+    layers: &mut [GenericTransformerLayer],
+    snap: &[super::LayerKvSnapshot],
+) -> crate::tensor::Result<()> {
+    for (l, s) in layers.iter_mut().zip(snap) {
+        match &s.mixer {
+            Some(state) => l.mixer.restore(state)?,
+            None => l.mixer.reset(),
+        }
+        if restore_quantised_layer(l, s)? {
+            continue;
+        }
+        match &s.spec {
+            Some(spec) => l.kv_cache.restore(spec)?,
+            None => l.kv_cache.trim_to(0),
+        }
+        l.cpu_f16_kv = s.cpu_f16.clone();
+    }
+    Ok(())
 }
 
 /// Restore a snapshot layer into a quantised cache by re-appending its dequantised K/V.

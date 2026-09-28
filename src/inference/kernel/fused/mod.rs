@@ -13,9 +13,6 @@ cuda_launchers! {
         x: *const c_void, res: *const c_void, weight: *const f32,
         norm_out: *mut c_void, sum_out: *mut c_void, rows: i32,
         cols: i32, eps: f32);
-    loken_fused_rmsnorm_f16_out_f32(
-        x: *const c_void, weight: *const f32, norm_out: *mut c_void,
-        rows: i32, cols: i32, eps: f32);
     loken_silu_mul_f16(
         g: *const c_void, u: *const c_void, out: *mut c_void,
         n: i64);
@@ -29,9 +26,6 @@ cuda_launchers! {
     loken_neox_rope_f16(x: *const c_void, cos: *const c_void,
         sin: *const c_void, out: *mut c_void, outer: i32, seq: i32,
         hd: i32, rope_dim: i32);
-    loken_neox_rope_devpos_f16(x: *const c_void, cos_full: *const c_void,
-        sin_full: *const c_void, pos_dev: *const i32, out: *mut c_void,
-        outer: i32, seq: i32, hd: i32, rope_dim: i32);
     loken_paged_rope_f16(x: *const c_void, cos: *const c_void,
         sin: *const c_void, out: *mut c_void, outer: i32, heads: i32,
         hd: i32, rope_dim: i32, interleaved: i32);
@@ -68,15 +62,7 @@ cuda_launchers! {
         part_l: *mut f32, part_acc: *mut f32, batch: i32, n_head: i32, n_kv: i32, kv_len: i32,
         nsplit: i32, head_dim: i32, scale: f32, k_batch_stride: i64, k_head_stride: i64,
         k_pos_stride: i64, v_batch_stride: i64, v_head_stride: i64, v_pos_stride: i64);
-    loken_kv_write_at_pos_f16(k_new: *const c_void, v_new: *const c_void,
-        k_buf: *mut c_void, v_buf: *mut c_void, pos_dev: *const i32,
-        b: i32, n_kv: i32, seq: i32, hd: i32, kv_max: i32);
-    loken_embed_gather_f16(
-        table: *const c_void, tok: *const u32, out: *mut c_void,
-        d_model: i32);
-    loken_copy_u32(src: *const u32, dst: *mut u32);
     loken_copy_f32(src: *const f32, dst: *mut f32, n: i32);
-    loken_set_i32(p: *mut i32, v: i32);
     #[link_name = "flash_dit_bf16_hd64"]
     flash_dit_bf16_hd64_raw(
         q: *const c_void, k: *const c_void, v: *const c_void,

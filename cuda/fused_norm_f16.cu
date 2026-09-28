@@ -76,58 +76,6 @@ extern "C" void loken_fused_rmsnorm_f16(
         (__half*)norm_out, (__half*)sum_out, rows, cols, eps);
 }
 
-// F32-out RMSNorm variant: same math as loken_fused_rmsnorm_f16 (no
-// residual/sum path) but stores f32(f16(v)) - BIT-IDENTICAL to the F16 kernel's
-// output followed by a to_dtype(F32) cast launch, which this replaces. For
-// consumers that need the norm in F32 (lfm2 MoE FFN input: router GEMV +
-// expert q8_1 quantize) - was 38 cast launches/token on lfm2 decode.
-extern "C" __global__ void loken_fused_rmsnorm_f16_out_f32_kernel(
-    const __half* __restrict__ x,
-    const float*  __restrict__ weight,
-    float* __restrict__ norm_out,
-    int rows, int cols, float eps
-) {
-    const int row = blockIdx.x;
-    if (row >= rows) return;
-    const int tid = threadIdx.x;
-    const __half* xr = x + (size_t)row * cols;
-    float* nor = norm_out + (size_t)row * cols;
-    extern __shared__ float cache[];
-    float local = 0.0f;
-    for (int j = tid; j < cols; j += blockDim.x) {
-        const float sf = __half2float(xr[j]);
-        cache[j] = sf;
-        local += sf * sf;
-    }
-    local = ll_warp_sum(local);
-    __shared__ float wsum[32];
-    const int warp = tid >> 5, lane = tid & 31, nwarps = blockDim.x >> 5;
-    if (lane == 0) wsum[warp] = local;
-    __syncthreads();
-    if (warp == 0) {
-        float v = (lane < nwarps) ? wsum[lane] : 0.0f;
-        v = ll_warp_sum(v);
-        if (lane == 0) wsum[0] = v;
-    }
-    __syncthreads();
-    const float denom = sqrtf(wsum[0] / (float)cols + eps);
-    for (int j = tid; j < cols; j += blockDim.x) {
-        // round through F16 so downstream sees exactly what the F16 kernel +
-        // cast produced (greedy-argmax stability across 38 layers).
-        nor[j] = __half2float(__float2half(cache[j] / denom * weight[j]));
-    }
-}
-
-extern "C" void loken_fused_rmsnorm_f16_out_f32(
-    const void* x, const float* weight, void* norm_out,
-    int rows, int cols, float eps, cudaStream_t stream
-) {
-    const int block = 256;
-    const int shmem = cols * (int)sizeof(float);
-    loken_fused_rmsnorm_f16_out_f32_kernel<<<rows, block, shmem, stream>>>(
-        (const __half*)x, weight, (float*)norm_out, rows, cols, eps);
-}
-
 // out = silu(f32(g)) * f32(u), F16 in/out, F32 internal. Collapses the
 // chain silu(g.to_f32).u.to_f32 -> f16 (cast+silu+mul+cast = 4 dispatches) into
 // one FFI launch. F32-internal silu so it is bit-identical to the F32 reference
@@ -291,54 +239,6 @@ extern "C" void loken_neox_rope_f16(
     const long grid = (total + block - 1) / block;
     loken_neox_rope_f16_kernel<<<grid, block, 0, stream>>>(
         (const __half*)x, (const __half*)cos, (const __half*)sin, (__half*)out, outer, seq, hd, rope_dim);
-}
-
-// Device-position variant: cos_full/sin_full are the FULL [max_seq, rope_dim/2]
-// tables; the position is read from *pos_dev so a captured graph picks the right
-// rope angle on replay (instead of a host-narrowed slice that freezes). Position
-// for query s is (*pos_dev + s). Otherwise identical/bit-exact to the above.
-extern "C" __global__ void loken_neox_rope_devpos_f16_kernel(
-    const __half* __restrict__ x, const __half* __restrict__ cos_full, const __half* __restrict__ sin_full,
-    const int* __restrict__ pos_dev, __half* __restrict__ out, int outer, int seq, int hd, int rope_dim
-) {
-    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long total = (long)outer * hd;
-    if (idx >= total) return;
-    const int d = (int)(idx % hd);
-    const long row = idx / hd;
-    const int s = (int)(row % seq);
-    if (d >= rope_dim) { out[idx] = x[idx]; return; }
-    const int half = rope_dim >> 1;
-    const int i = (d < half) ? d : (d - half);
-    const long base = row * hd;
-    const int gpos = *pos_dev + s;                      // device-resident position
-    const __half* cr = cos_full + (long)gpos * half;
-    const __half* sr = sin_full + (long)gpos * half;
-    const float x0 = __half2float(x[base + i]);
-    const float x1 = __half2float(x[base + i + half]);
-    const float c = __half2float(cr[i]);
-    const float sn = __half2float(sr[i]);
-    if (d < half) {
-        const float a = __half2float(__float2half(x0 * c));
-        const float b = __half2float(__float2half(x1 * sn));
-        out[idx] = __float2half(a - b);
-    } else {
-        const float a = __half2float(__float2half(x0 * sn));
-        const float b = __half2float(__float2half(x1 * c));
-        out[idx] = __float2half(a + b);
-    }
-}
-
-extern "C" void loken_neox_rope_devpos_f16(
-    const void* x, const void* cos_full, const void* sin_full, const int* pos_dev, void* out,
-    int outer, int seq, int hd, int rope_dim, cudaStream_t stream
-) {
-    const int block = 256;
-    const long total = (long)outer * hd;
-    const long grid = (total + block - 1) / block;
-    loken_neox_rope_devpos_f16_kernel<<<grid, block, 0, stream>>>(
-        (const __half*)x, (const __half*)cos_full, (const __half*)sin_full, pos_dev, (__half*)out,
-        outer, seq, hd, rope_dim);
 }
 
 // Paged-decode RoPE (F16): x is [B, heads, hd] (one position per sequence-row),

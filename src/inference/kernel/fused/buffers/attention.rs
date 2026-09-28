@@ -6,7 +6,7 @@ use super::*;
 
 /// Head-dim-generalized flash-decode (seq=1, GQA), head_dim a multiple of 32 and
 /// <= 256 (each warp lane owns head_dim/32 dims). Same contract as
-/// `gptoss_flash_decode`; `sinks` optional (None -> empty-seeded softmax). Returns
+/// `gptoss_flash_decode_win` at `kv_start` 0; `sinks` optional (None -> empty-seeded softmax). Returns
 /// `[b, n_head, hd]` F16, or None (caller falls back) unless CUDA + F16 + hd ok.
 pub fn flash_decode(
     q: &Tensor,
@@ -357,74 +357,6 @@ pub fn paged_rope_f16(
     drop(xs);
     drop(cs);
     drop(ss);
-    drop(os);
-    Ok(Some(out))
-}
-
-/// Device-position partial-NEOX rope: like `neox_rope_f16` but cos/sin are the
-/// FULL [max_seq, rope_dim/2] F16 tables and the position is read from pos_dev
-/// (i32 [1]) - for CUDA-graph replay. x [b,nh,seq,hd] F16. Returns [b,nh,seq,hd]
-/// F16, or None unless CUDA + all F16.
-pub fn neox_rope_devpos_f16(
-    x: &Tensor,
-    cos_full: &Tensor,
-    sin_full: &Tensor,
-    pos_dev: &Tensor,
-    rope_dim: usize,
-) -> Result<Option<Tensor>> {
-    use crate::tensor::cuda_ext::DevicePtr;
-    use crate::tensor::StorageView::Cuda as C;
-    use core::ffi::c_void;
-    if !x.device().is_cuda()
-        || x.dtype() != DType::F16
-        || cos_full.dtype() != DType::F16
-        || sin_full.dtype() != DType::F16
-    {
-        return Ok(None);
-    }
-    let (b, nh, seq, hd) = x.dims4()?;
-    let x = x.contiguous()?;
-    let cos_full = cos_full.contiguous()?;
-    let sin_full = sin_full.contiguous()?;
-    let outer = (b * nh * seq) as i32;
-    let out = unsafe { Tensor::empty((b, nh, seq, hd), DType::F16, &x.device())? };
-    let dev = x.device().as_cuda_device()?;
-    let stream = dev.cuda_stream().cu_stream() as i64;
-    let (xs, xl) = x.storage_and_layout();
-    let (cs, cl) = cos_full.storage_and_layout();
-    let (ss, sl) = sin_full.storage_and_layout();
-    let (ps, pl) = pos_dev.storage_and_layout();
-    let (os, _) = out.storage_and_layout();
-    if let (C(xc), C(cc), C(sc), C(pc), C(oc)) = (&*xs, &*cs, &*ss, &*ps, &*os) {
-        let xsl = xc.as_cuda_slice::<half::f16>()?;
-        let csl = cc.as_cuda_slice::<half::f16>()?;
-        let ssl = sc.as_cuda_slice::<half::f16>()?;
-        let psl = pc.as_cuda_slice::<i32>()?;
-        let osl = oc.as_cuda_slice::<half::f16>()?;
-        let xp = (xsl.device_ptr(xsl.stream()).0 + (xl.start_offset() * 2) as u64) as *const c_void;
-        let cp = (csl.device_ptr(csl.stream()).0 + (cl.start_offset() * 2) as u64) as *const c_void;
-        let sp = (ssl.device_ptr(ssl.stream()).0 + (sl.start_offset() * 2) as u64) as *const c_void;
-        let pp = (psl.device_ptr(psl.stream()).0 + (pl.start_offset() * 4) as u64) as *const i32;
-        let op = osl.device_ptr(osl.stream()).0 as *mut c_void;
-        unsafe {
-            loken_neox_rope_devpos_f16(
-                xp,
-                cp,
-                sp,
-                pp,
-                op,
-                outer,
-                seq as i32,
-                hd as i32,
-                rope_dim as i32,
-                stream,
-            );
-        }
-    }
-    drop(xs);
-    drop(cs);
-    drop(ss);
-    drop(ps);
     drop(os);
     Ok(Some(out))
 }

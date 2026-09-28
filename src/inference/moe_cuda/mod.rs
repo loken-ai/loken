@@ -108,10 +108,6 @@ cuda_launchers! {
     loken_gate_topk_softmax(xs: *const c_void, gate_w: *const c_void,
         weights: *mut c_void, ids: *mut c_void, hidden: i32, n_rows: i32,
         n_experts: i32, n_expert_used: i32, with_norm: i32);
-    loken_gate_topk_sigmoid(xs: *const c_void, gate_w: *const c_void,
-        bias: *const c_void, weights: *mut c_void,
-        ids: *mut c_void, hidden: i32, n_rows: i32, n_experts: i32,
-        n_expert_used: i32, with_norm: i32, scale: f32);
     loken_topk_sigmoid_post(logits: *const c_void, bias: *const c_void,
         weights: *mut c_void, ids: *mut c_void, n_rows: i32,
         n_experts: i32, n_expert_used: i32, with_norm: i32, scale: f32);

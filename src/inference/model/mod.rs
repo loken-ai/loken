@@ -22,7 +22,6 @@ pub mod flux;
 #[cfg(feature = "image")]
 pub mod flux2;
 pub mod kyutai;
-pub mod lfm2_moe;
 pub mod mixformer;
 /// The vision-tower metadata a llama.cpp `mmproj` GGUF carries.
 pub mod mmproj;

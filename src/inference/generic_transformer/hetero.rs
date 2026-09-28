@@ -423,6 +423,9 @@ impl GenericHeteroTransformer {
     /// serving layer (to decide whether to route a model through ContinuousServer).
     pub fn cb_unsupported_reason(&self) -> Option<&'static str> {
         let c = &self.config;
+        if self.is_recurrent() {
+            return Some("recurrent mixer");
+        }
         if c.embed_scale.is_some() {
             return Some("embed_scale");
         }
@@ -1101,7 +1104,11 @@ impl GenericHeteroTransformer {
     }
 
     pub fn kv_len(&self) -> Option<usize> {
-        let l = self.layers.first()?;
+        // A recurrent layer keeps no cache: the first attending layer holds the length.
+        let l = self
+            .layers
+            .iter()
+            .find(|l| matches!(l.mixer, super::mixer::Mixer::Attention))?;
         let mut n = l.kv_cache.current_seq_len();
         #[cfg(feature = "cuda")]
         if let Some(c) = l.quant_kv.as_ref() {

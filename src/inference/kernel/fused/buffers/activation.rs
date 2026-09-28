@@ -190,46 +190,6 @@ pub fn fused_rmsnorm_f16(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor
     Ok(norm_out)
 }
 
-/// Fused F16 RMSNorm with F32 output = `fused_rmsnorm_f16(x,..)` followed by
-/// `.to_dtype(F32)`, in ONE launch (the kernel rounds through F16 before the
-/// F32 store, so it is BIT-IDENTICAL to that two-launch chain). For F32-input
-/// consumers of a norm over F16 activations (lfm2 MoE FFN).
-pub fn fused_rmsnorm_f16_out_f32(x: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-    use crate::tensor::cuda_ext::DevicePtr;
-    use crate::tensor::StorageView::Cuda as C;
-    use core::ffi::c_void;
-    if !x.device().is_cuda() || x.dtype() != DType::F16 {
-        return crate::tensor::ops::rms_norm(&x.to_dtype(DType::F32)?, weight, eps)?
-            .to_dtype(x.dtype())?
-            .to_dtype(DType::F32);
-    }
-    let x = x.contiguous()?;
-    let weight = weight.contiguous()?;
-    let cols = *x.dims().last().unwrap();
-    let rows = (x.elem_count() / cols) as i32;
-    let norm_out = unsafe { Tensor::empty(x.shape(), DType::F32, &x.device())? };
-    let dev = x.device().as_cuda_device()?;
-    let stream = dev.cuda_stream().cu_stream() as i64;
-    let (xs, xl) = x.storage_and_layout();
-    let (ws, wl) = weight.storage_and_layout();
-    let (ns, _) = norm_out.storage_and_layout();
-    if let (C(xc), C(wc), C(nc)) = (&*xs, &*ws, &*ns) {
-        let xsl = xc.as_cuda_slice::<half::f16>()?;
-        let wsl = wc.as_cuda_slice::<f32>()?;
-        let nsl = nc.as_cuda_slice::<f32>()?;
-        let xp = (xsl.device_ptr(xsl.stream()).0 + (xl.start_offset() * 2) as u64) as *const c_void;
-        let wp = (wsl.device_ptr(wsl.stream()).0 + (wl.start_offset() * 4) as u64) as *const f32;
-        let np = nsl.device_ptr(nsl.stream()).0 as *mut c_void;
-        unsafe {
-            loken_fused_rmsnorm_f16_out_f32(xp, wp, np, rows, cols as i32, eps, stream);
-        }
-    }
-    drop(xs);
-    drop(ws);
-    drop(ns);
-    Ok(norm_out)
-}
-
 /// Adaptive 1D grid sizing for element-wise kernels (1 thread -> 1 element).
 /// When the natural grid is below the SM count, halve block_dim and double
 /// grid_dim until SMs are saturated. Caps: block_dim >= 64 (2 warps), max

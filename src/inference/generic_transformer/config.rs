@@ -152,12 +152,17 @@ impl GenericLayerFlags {
                 .get(&format!("{arch}.{k}"))
                 .and_then(|v| v.to_u32().ok())
         };
+        let n_layer = meta_u32("block_count").unwrap_or(0) as usize;
+        // The attention variant is read on the first block that attends: a hybrid's block 0
+        // may run a recurrent mixer.
+        let attn = super::mixer::attention_probe_layer(content, n_layer);
+        let has_attn = |suffix: &str| has(&format!("blk.{attn}.{suffix}"));
         Self {
-            has_qkv_bias: has("blk.0.attn_q.bias"),
-            has_qk_norm: has("blk.0.attn_q_norm.weight"),
+            has_qkv_bias: has_attn("attn_q.bias"),
+            has_qk_norm: has_attn("attn_q_norm.weight"),
             has_post_attn_norm: has("blk.0.post_attention_norm.weight"),
             has_post_ffn_norm: has("blk.0.post_ffw_norm.weight"),
-            fused_qkv: has("blk.0.attn_qkv.weight"),
+            fused_qkv: has_attn("attn_qkv.weight"),
             fused_ffn_gate_up: !has("blk.0.ffn_gate.weight") && has("blk.0.ffn_up.weight"),
             // Phi2 simple FFN: ffn_up output dim equals ffn_dim (not 2x).
             // Detect by inspecting ffn_up's actual shape against ffn_dim.
@@ -189,15 +194,16 @@ impl GenericLayerFlags {
                 && has("blk.0.ffn_up.weight")
                 && !has("blk.0.post_ffw_norm.weight"),
             layer_norm_with_bias: has("blk.0.attn_norm.bias"),
-            has_attn_output_bias: has(&format!("blk.0.{}.bias", attn_output_name(content))),
+            has_attn_output_bias: has_attn(&format!("{}.bias", attn_output_name(content))),
             has_ffn_bias: has("blk.0.ffn_down.bias"),
-            has_attn_sinks: attn_sinks_name(content, 0).is_some(),
+            has_attn_sinks: attn_sinks_name(content, attn).is_some(),
             // Llama, Mistral and Mistral3 rotate ADJACENT pairs; every other architecture
             // pairs a dimension with the one half a head away. Getting it wrong does not
             // fail - it scrambles attention and the model answers nonsense.
             use_rope_i: rope_uses_adjacent_pairs(arch),
             intermediate_size: ffn_dim,
-            is_moe: has("blk.0.ffn_gate_inp.weight"),
+            // A mixture may keep dense blocks ahead of its routed ones.
+            is_moe: (0..n_layer.max(1)).any(|il| has(&format!("blk.{il}.ffn_gate_inp.weight"))),
             n_experts: meta_u32("expert_count").unwrap_or(0) as usize,
             n_experts_used: meta_u32("expert_used_count").unwrap_or(0) as usize,
             expert_ffn_dim: meta_u32("expert_feed_forward_length").unwrap_or(0) as usize,
@@ -221,7 +227,6 @@ impl GenericLayerFlags {
                 if shared_kv_layers > 0 {
                     false
                 } else if has("blk.0.attn_v.weight") {
-                    let n_layer = meta_u32("block_count").unwrap_or(0) as usize;
                     (1..n_layer).any(|i| !has(&format!("blk.{}.attn_v.weight", i)))
                 } else {
                     false
@@ -240,12 +245,23 @@ impl GenericLayerFlags {
 /// `attn_out` where the converter wrote the shorter form. Read from the file, never
 /// assumed from the architecture.
 pub(super) fn attn_output_name(content: &gguf_file::Content) -> &'static str {
+    let il = content
+        .metadata
+        .get("general.architecture")
+        .and_then(|a| a.to_string().ok())
+        .and_then(|a| meta_u32(content, a, "block_count"))
+        .map_or(0, |n| {
+            super::mixer::attention_probe_layer(content, n as usize)
+        });
     if content
         .tensor_infos
-        .contains_key("blk.0.attn_output.weight")
+        .contains_key(&format!("blk.{il}.attn_output.weight"))
     {
         "attn_output"
-    } else if content.tensor_infos.contains_key("blk.0.attn_out.weight") {
+    } else if content
+        .tensor_infos
+        .contains_key(&format!("blk.{il}.attn_out.weight"))
+    {
         "attn_out"
     } else {
         "attn_output"
@@ -282,6 +298,11 @@ pub struct ArchConventions {
     /// `x.sigmoid(alpha.x).(1 + up)` with `x = min(gate, limit)` and `up` clamped to
     /// `[-limit, limit]`, as `(alpha, limit)`.
     pub expert_swiglu_clamp: Option<(f64, f64)>,
+    /// The router scores experts by sigmoid when the file names no gating function.
+    pub sigmoid_expert_gating: bool,
+    /// Whether sigmoid-routed expert weights are renormalised over the chosen experts,
+    /// over what the file says.
+    pub expert_weights_norm: Option<bool>,
 }
 
 /// Whether layer `il` is a sliding-window layer under a period of `period`.
@@ -303,6 +324,13 @@ pub fn arch_conventions(arch: &str) -> ArchConventions {
             yarn_by_default: true,
             yarn_attention_factor: true,
             expert_swiglu_clamp: Some((1.702, 7.0)),
+            ..ArchConventions::default()
+        },
+        // lfm2moe: the reference renormalises the routed weights of its sigmoid router
+        // whatever the file says.
+        "lfm2moe" => ArchConventions {
+            expert_weights_norm: Some(true),
+            ..ArchConventions::default()
         },
         _ => ArchConventions::default(),
     }
@@ -359,6 +387,13 @@ pub struct GenericTransformerConfig {
     pub swa_period: Option<usize>,
     /// Routed experts gate through the clamped SwiGLU, `(alpha, limit)`.
     pub expert_swiglu_clamp: Option<(f64, f64)>,
+    /// The router scores experts by sigmoid: `expert_gating_func` 2 in the file, or the
+    /// architecture's convention.
+    pub expert_sigmoid_gating: bool,
+    /// Sigmoid-routed weights are renormalised over the chosen experts.
+    pub expert_weights_norm: bool,
+    /// Multiplies sigmoid-routed weights; 1 when the file gives none or zero.
+    pub expert_weights_scale: f64,
     pub flags: GenericLayerFlags,
     /// Per-layer KV cache storage mode. Off -> F-dtype SpecKvCache only;
     /// Q8 -> also maintain a Q8KvCache alongside so the decode-path (seq=1)
@@ -626,6 +661,24 @@ impl GenericTransformerConfig {
         let shared_kv_layers =
             meta_u32(content, arch, "attention.shared_kv_layers").unwrap_or(0) as usize;
 
+        // llama.cpp's gating function numbering: 1 softmax, 2 sigmoid.
+        const GATING_SIGMOID: u32 = 2;
+        let expert_sigmoid_gating = match meta_u32(content, arch, "expert_gating_func") {
+            Some(f) => f == GATING_SIGMOID,
+            None => conventions.sigmoid_expert_gating,
+        };
+        let expert_weights_norm = conventions.expert_weights_norm.unwrap_or_else(|| {
+            content
+                .metadata
+                .get(&format!("{arch}.expert_weights_norm"))
+                .and_then(|v| v.to_bool().ok())
+                .unwrap_or(false)
+        });
+        let expert_weights_scale = match meta_f32(content, arch, "expert_weights_scale") {
+            Some(s) if s != 0.0 => s as f64,
+            _ => 1.0,
+        };
+
         // vocab_size: read from embedding tensor shape (most reliable)
         let vocab_size = content
             .tensor_infos
@@ -698,6 +751,9 @@ impl GenericTransformerConfig {
             swa_pattern,
             swa_period,
             expert_swiglu_clamp: conventions.expert_swiglu_clamp,
+            expert_sigmoid_gating,
+            expert_weights_norm,
+            expert_weights_scale,
             shared_kv_layers,
             embed_scale,
             logit_scale,
@@ -930,6 +986,121 @@ mod arch_conventions_tests {
             "no scaling type and no convention: no YaRN"
         );
         assert_eq!(arch_conventions("qwen3"), ArchConventions::default());
+    }
+
+    /// The dimensions of a small lfm2moe-shaped model: block 0 a short convolution, block 1
+    /// attention with per-head QK norms, the leading block dense and the others routed.
+    fn lfm2moe_like() -> Content {
+        let (hidden, heads, kv_heads, hd, experts) = (32usize, 4usize, 2usize, 8usize, 4usize);
+        let meta = vec![
+            ("attention.head_count", Value::U32(heads as u32)),
+            (
+                "attention.head_count_kv",
+                Value::Array(vec![
+                    Value::U32(0),
+                    Value::U32(kv_heads as u32),
+                    Value::U32(0),
+                ]),
+            ),
+            ("attention.layer_norm_rms_epsilon", Value::F32(1e-5)),
+            ("block_count", Value::U32(3)),
+            ("embedding_length", Value::U32(hidden as u32)),
+            ("feed_forward_length", Value::U32(2 * hidden as u32)),
+            ("expert_count", Value::U32(experts as u32)),
+            ("expert_used_count", Value::U32(2)),
+            ("expert_feed_forward_length", Value::U32(hidden as u32)),
+            ("expert_gating_func", Value::U32(2)),
+            ("expert_weights_scale", Value::F32(0.0)),
+            ("leading_dense_block_count", Value::U32(1)),
+            ("shortconv.l_cache", Value::U32(3)),
+        ];
+        let mut tensors: Vec<(String, Vec<usize>)> = [
+            ("token_embd.weight", vec![100, hidden]),
+            ("token_embd_norm.weight", vec![hidden]),
+            ("blk.0.attn_norm.weight", vec![hidden]),
+            ("blk.0.shortconv.in_proj.weight", vec![3 * hidden, hidden]),
+            ("blk.0.shortconv.conv.weight", vec![hidden, 3]),
+            ("blk.0.shortconv.out_proj.weight", vec![hidden, hidden]),
+            ("blk.0.ffn_norm.weight", vec![hidden]),
+            ("blk.0.ffn_gate.weight", vec![2 * hidden, hidden]),
+            ("blk.0.ffn_up.weight", vec![2 * hidden, hidden]),
+            ("blk.0.ffn_down.weight", vec![hidden, 2 * hidden]),
+            ("blk.1.attn_norm.weight", vec![hidden]),
+            ("blk.1.attn_q.weight", vec![heads * hd, hidden]),
+            ("blk.1.attn_k.weight", vec![kv_heads * hd, hidden]),
+            ("blk.1.attn_v.weight", vec![kv_heads * hd, hidden]),
+            ("blk.1.attn_q_norm.weight", vec![hd]),
+            ("blk.1.attn_k_norm.weight", vec![hd]),
+            ("blk.1.attn_output.weight", vec![hidden, heads * hd]),
+            ("blk.2.attn_norm.weight", vec![hidden]),
+            ("blk.2.shortconv.in_proj.weight", vec![3 * hidden, hidden]),
+            ("blk.2.shortconv.conv.weight", vec![hidden, 3]),
+            ("blk.2.shortconv.out_proj.weight", vec![hidden, hidden]),
+        ]
+        .into_iter()
+        .map(|(n, d)| (n.to_string(), d))
+        .collect();
+        for il in 1..3 {
+            tensors.extend([
+                (format!("blk.{il}.ffn_norm.weight"), vec![hidden]),
+                (
+                    format!("blk.{il}.ffn_gate_inp.weight"),
+                    vec![experts, hidden],
+                ),
+                (format!("blk.{il}.exp_probs_b.bias"), vec![experts]),
+                (
+                    format!("blk.{il}.ffn_gate_exps.weight"),
+                    vec![experts, hidden, hidden],
+                ),
+                (
+                    format!("blk.{il}.ffn_up_exps.weight"),
+                    vec![experts, hidden, hidden],
+                ),
+                (
+                    format!("blk.{il}.ffn_down_exps.weight"),
+                    vec![experts, hidden, hidden],
+                ),
+            ]);
+        }
+        let tensors: Vec<(&str, Vec<usize>)> = tensors
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.clone()))
+            .collect();
+        synth_content("lfm2moe", &meta, &tensors)
+    }
+
+    #[test]
+    fn an_lfm2moe_file_configures_its_mixers_and_the_sigmoid_router() {
+        use super::super::mixer::{
+            attention_layer_count, attention_probe_layer, layer_mixer_kind, MixerKind,
+        };
+        let content = lfm2moe_like();
+        let cfg = GenericTransformerConfig::from_gguf(&content, "lfm2moe").unwrap();
+        assert_eq!(layer_mixer_kind(&content, 0), MixerKind::ShortConv);
+        assert_eq!(layer_mixer_kind(&content, 1), MixerKind::Attention);
+        assert_eq!(layer_mixer_kind(&content, 2), MixerKind::ShortConv);
+        assert_eq!(attention_probe_layer(&content, 3), 1);
+        assert_eq!(attention_layer_count(&content, 3), 1);
+        assert!(
+            cfg.flags.has_qk_norm,
+            "read on the attending block, not block 0"
+        );
+        assert!(!cfg.flags.fused_qkv);
+        assert!(cfg.flags.is_moe, "block 0 is dense, the later ones route");
+        assert!(cfg.expert_sigmoid_gating);
+        assert!(cfg.expert_weights_norm, "the architecture renormalises");
+        assert_eq!(cfg.expert_weights_scale, 1.0, "a zero scale is no scale");
+        assert_eq!(cfg.head_dim, 8, "embedding length over heads");
+        assert!(!cfg.flags.use_rope_i);
+        assert!(!cfg.flags.parallel_attn);
+    }
+
+    #[test]
+    fn a_softmax_mixture_keeps_its_router() {
+        let content = gptoss_like("gptoss", None);
+        let cfg = GenericTransformerConfig::from_gguf(&content, "gptoss").unwrap();
+        assert!(!cfg.expert_sigmoid_gating);
+        assert_eq!(super::super::mixer::attention_probe_layer(&content, 4), 0);
     }
 
     #[test]

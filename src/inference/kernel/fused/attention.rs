@@ -462,30 +462,8 @@ pub fn paged_kv_write(
     Ok(())
 }
 
-/// gpt-oss flash-attention decode (seq=1) with per-head sinks + GQA, in one F16
-/// launch (no cuBLAS, no scores in HBM). `q`: [b, n_head, 1, hd] F16; `k`/`v`:
-/// [b, n_kv, kv_len, hd] F16 (may be the strided KV-cache narrow); `mask`:
-/// `[kv_len]` F32 additive or None; `sinks`: [n_head] F32. Returns `[b, n_head, hd]`
-/// F16. Returns `None` (caller falls back) unless CUDA + hd==64 + contiguous hd.
-pub fn gptoss_flash_decode(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    mask: Option<&Tensor>,
-    sinks: Option<&Tensor>,
-    scale: f32,
-    batch: usize,
-    n_head: usize,
-    n_kv: usize,
-    kv_len: usize,
-    head_dim: usize,
-) -> Result<Option<Tensor>> {
-    gptoss_flash_decode_win(
-        q, k, v, mask, sinks, scale, batch, n_head, n_kv, 0, kv_len, head_dim,
-    )
-}
-
-/// `gptoss_flash_decode` with a `kv_start` offset: attends positions
+/// gpt-oss flash-attention decode (seq=1) with per-head sinks + GQA, in one F16 launch,
+/// with a `kv_start` offset: attends positions
 /// `[kv_start, kv_len)` of the K/V buffers by bumping the base pointers
 /// `kv_start` rows - no narrow (a middle-dim narrow is a device COPY of the
 /// whole cache on this substrate) and no additive mask. This is how the

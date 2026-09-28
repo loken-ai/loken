@@ -722,7 +722,7 @@ fn reference_run(path: &std::path::Path) -> (Vec<u32>, Vec<u32>) {
         panic!(
             "no reference at {}: {e}. Record one with a reference server on an idle card, \
              greedy and without a template, and save the response as that file:\n  \
-             curl -s localhost:11434/api/generate -d '{{\"model\":\"gpt-oss:20b\",\
+             curl -s localhost:11434/api/generate -d '{{\"model\":\"<tag>\",\
              \"prompt\":\"The capital of France is\",\"raw\":true,\"stream\":false,\
              \"options\":{{\"temperature\":0,\"top_k\":1,\"num_predict\":32}}}}'",
             path.display()
@@ -746,22 +746,23 @@ fn reference_run(path: &std::path::Path) -> (Vec<u32>, Vec<u32>) {
     (context[..n_prompt].to_vec(), context[n_prompt..].to_vec())
 }
 
-/// gpt-oss through the generic route decodes greedily what the reference decoded.
-///
-/// Ignored by default: it needs gpt-oss:20b in the store, the CUDA cards idle, and a
-/// reference run (see `reference_run`). Run with
-///   LOKEN_GPTOSS_REFERENCE=/path/to/reference.json cargo test --release --lib \
-///     gptoss_generic_route_matches_the_reference -- --ignored --nocapture
-/// `LOKEN_PARITY_MODEL` selects another tag of the same architecture.
-#[test]
-#[ignore = "needs gpt-oss:20b in the store, idle CUDA cards and a reference run"]
-fn gptoss_generic_route_matches_the_reference() {
-    let tag = std::env::var("LOKEN_PARITY_MODEL").unwrap_or_else(|_| "gpt-oss:20b".into());
-    let reference = std::env::var("LOKEN_GPTOSS_REFERENCE")
+/// The model stored under `LOKEN_PARITY_MODEL`, else `default_tag`, loaded through the
+/// generic route across every idle card, decodes greedily what a reference run decoded. The
+/// reference is read from the file `reference_env` names, else `tests/vectors/<vector>`; the
+/// file's architecture must be one of `arches`.
+fn generic_route_matches_the_reference(
+    default_tag: &str,
+    arches: &[&str],
+    reference_env: &str,
+    vector: &str,
+) {
+    let tag = std::env::var("LOKEN_PARITY_MODEL").unwrap_or_else(|_| default_tag.into());
+    let reference = std::env::var(reference_env)
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/vectors/gptoss_20b_greedy.json")
+                .join("tests/vectors")
+                .join(vector)
         });
     let (prompt, greedy) = reference_run(&reference);
     assert!(!prompt.is_empty() && !greedy.is_empty(), "empty reference");
@@ -776,7 +777,10 @@ fn gptoss_generic_route_matches_the_reference() {
         .to_string()
         .unwrap()
         .clone();
-    assert_eq!(arch, "gptoss", "{tag} is not a gpt-oss file");
+    assert!(
+        arches.contains(&arch.as_str()),
+        "{tag} is a {arch} file, not one of {arches:?}"
+    );
     let n_layers = GenericTransformerConfig::from_gguf(&content, &arch)
         .unwrap()
         .n_layers;
@@ -840,4 +844,40 @@ fn gptoss_generic_route_matches_the_reference() {
     let agree = decoded.iter().zip(&greedy).filter(|(a, b)| a == b).count();
     println!("{tag}: {agree}/{} greedy tokens agree", greedy.len());
     assert_eq!(decoded, greedy, "greedy tokens differ from the reference");
+}
+
+/// gpt-oss through the generic route decodes greedily what the reference decoded.
+///
+/// Ignored by default: it needs gpt-oss:20b in the store, the CUDA cards idle, and a
+/// reference run (see `reference_run`). Run with
+///   LOKEN_GPTOSS_REFERENCE=/path/to/reference.json cargo test --release --lib \
+///     gptoss_generic_route_matches_the_reference -- --ignored --nocapture
+/// `LOKEN_PARITY_MODEL` selects another tag of the same architecture.
+#[test]
+#[ignore = "needs gpt-oss:20b in the store, idle CUDA cards and a reference run"]
+fn gptoss_generic_route_matches_the_reference() {
+    generic_route_matches_the_reference(
+        "gpt-oss:20b",
+        &["gptoss"],
+        "LOKEN_GPTOSS_REFERENCE",
+        "gptoss_20b_greedy.json",
+    );
+}
+
+/// lfm2 (short convolutions and attention, dense or routed) through the generic route
+/// decodes greedily what the reference decoded.
+///
+/// Ignored by default: it needs lfm2:latest in the store, the CUDA cards idle, and a
+/// reference run recorded as `reference_run` says, with `"model":"lfm2:latest"`. Run with
+///   LOKEN_LFM2_REFERENCE=/path/to/reference.json cargo test --release --lib \
+///     lfm2_generic_route_matches_the_reference -- --ignored --nocapture
+#[test]
+#[ignore = "needs lfm2:latest in the store, idle CUDA cards and a reference run"]
+fn lfm2_generic_route_matches_the_reference() {
+    generic_route_matches_the_reference(
+        "lfm2:latest",
+        &["lfm2", "lfm2moe"],
+        "LOKEN_LFM2_REFERENCE",
+        "lfm2_latest_greedy.json",
+    );
 }

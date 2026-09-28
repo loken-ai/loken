@@ -319,57 +319,9 @@ __global__ void topk_softmax_from_logits_kernel(
         ids_out + (size_t)row * n_expert_used);
 }
 
-// SIGMOID-routed variant (lfm2 / deepseek-style): per-expert sigmoid (no
-// cross-expert normalization), top-k SELECTED by (sigmoid + bias) but the
-// OUTPUT weight is the UNBIASED sigmoid prob, optional top-k renorm, then
-// xscale. One launch replaces gate-gemv + sigmoid + bias-add + sort + narrow
-// + gather + sum + div + mul (~8-9 separate tensor ops per MoE layer).
-template <int n_experts, bool with_norm>
-__launch_bounds__(WARP_SIZE, 4)
-__global__ void gate_topk_sigmoid_kernel(
-    const float * __restrict__ x_in,        // [n_rows, hidden]
-    const float * __restrict__ gate_w,      // [n_experts, hidden]
-    const float * __restrict__ bias,        // [n_experts] or nullptr (selection bias)
-    float       * __restrict__ weights_out, // [n_rows, n_expert_used]
-    uint32_t    * __restrict__ ids_out,     // [n_rows, n_expert_used]
-    int hidden,
-    int n_rows,
-    int n_expert_used,
-    float scale
-) {
-    const int row = blockIdx.x;
-    if (row >= n_rows) return;
-    extern __shared__ float x_shared[];
-    const int lane = threadIdx.x;
-
-    load_row_to_shared(x_in + (size_t)row * hidden, x_shared, hidden, lane);
-    __syncwarp();
-
-    constexpr int ept = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
-    float prob[ept], sel[ept];
-#pragma unroll
-    for (int i = 0; i < ept; i++) {
-        const int expert = lane + i * WARP_SIZE;
-        if (n_experts % WARP_SIZE == 0 || expert < n_experts) {
-            const float acc = dot_row_shared(gate_w + (size_t)expert * hidden, x_shared, hidden);
-            const float p = 1.0f / (1.0f + __expf(-acc));
-            prob[i] = p;
-            sel[i]  = p + (bias ? bias[expert] : 0.0f);
-        } else {
-            prob[i] = 0.0f;
-            sel[i]  = -INFINITY;
-        }
-    }
-
-    select_topk_from_warp_probs<n_experts, ept, with_norm>(
-        prob, sel, lane, n_expert_used, scale,
-        weights_out + (size_t)row * n_expert_used,
-        ids_out + (size_t)row * n_expert_used);
-}
-
 // POST-matmul sigmoid router: takes PRE-COMPUTED logits (from the fast cuBLAS
 // gemv) and fuses sigmoid + bias-select top-k + gather(unbiased prob) + renorm
-// + scale into one launch. Unlike gate_topk_sigmoid this does NO matmul, so it
+// + scale into one launch. It does NO matmul, so it
 // keeps the optimized gemv and just erases the ~7 tiny post-ops (incl. the
 // asort) that dominate launch count on launch-bound MoE decode.
 template <int n_experts, bool with_norm>
@@ -479,42 +431,6 @@ extern "C" void loken_topk_softmax(
             return; // Unsupported - the caller falls back to the unfused tensor ops.
     }
 #undef DISPATCH_LOGITS
-}
-
-extern "C" void loken_gate_topk_sigmoid(
-    const float * x_in,         // [n_rows, hidden]
-    const float * gate_w,       // [n_experts, hidden]
-    const float * bias,         // [n_experts] or nullptr
-    float       * weights_out,  // [n_rows, n_expert_used]
-    uint32_t    * ids_out,      // [n_rows, n_expert_used]
-    int hidden,
-    int n_rows,
-    int n_experts,
-    int n_expert_used,
-    int with_norm,
-    float scale,
-    cudaStream_t stream
-) {
-    if (hidden > MAX_HIDDEN_FOR_FUSED_GATE) return;
-    dim3 grid(n_rows, 1, 1);
-    dim3 block(WARP_SIZE, 1, 1);
-    int shared_bytes = hidden * (int)sizeof(float);
-
-#define DISPATCH_SIG(NE) \
-    do { \
-        if (with_norm) ll_gate_topk::gate_topk_sigmoid_kernel<NE, true>  <<<grid, block, shared_bytes, stream>>>(x_in, gate_w, bias, weights_out, ids_out, hidden, n_rows, n_expert_used, scale); \
-        else           ll_gate_topk::gate_topk_sigmoid_kernel<NE, false> <<<grid, block, shared_bytes, stream>>>(x_in, gate_w, bias, weights_out, ids_out, hidden, n_rows, n_expert_used, scale); \
-    } while (0)
-
-    switch (n_experts) {
-        case 32:  DISPATCH_SIG(32);  break;
-        case 64:  DISPATCH_SIG(64);  break;
-        case 128: DISPATCH_SIG(128); break;
-        case 256: DISPATCH_SIG(256); break;
-        default:
-            return;
-    }
-#undef DISPATCH_SIG
 }
 
 // Decode-path argsort for MoE expert grouping. Replaces the tensor-level sort_last_dim(true)

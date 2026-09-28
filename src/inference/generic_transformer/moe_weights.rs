@@ -219,6 +219,56 @@ impl ExpertRouting {
     }
 }
 
+/// Sigmoid expert routing: every expert scores `sigmoid(logit)`, the experts are chosen on
+/// the scores plus a selection bias, and each chosen expert weighs by its unbiased score,
+/// optionally renormalised over the chosen ones and scaled.
+#[derive(Debug, Clone)]
+pub struct SigmoidRouting {
+    /// Added to the scores for the choice only: `[n_experts]` F32.
+    pub selection_bias: Option<Tensor>,
+    /// The chosen weights are divided by their sum, floored at the smallest normal F16.
+    pub normalize: bool,
+    /// Multiplies the chosen weights.
+    pub scale: f64,
+}
+
+impl SigmoidRouting {
+    /// Floor of the renormalising sum, the smallest normal F16.
+    const SUM_FLOOR: f32 = 6.103_515_6e-5;
+
+    /// `(weights, ids)` `[tokens, k]` from the router `logits` `[tokens, n_experts]` F32.
+    pub fn select(&self, logits: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
+        if let Some(out) = crate::inference::moe_cuda::topk_sigmoid_post(
+            logits,
+            self.selection_bias.as_ref(),
+            k,
+            self.normalize,
+            self.scale,
+        )? {
+            return Ok(out);
+        }
+        let probs = crate::tensor::ops::sigmoid(logits)?;
+        let chosen_on = match &self.selection_bias {
+            Some(b) => probs.broadcast_add(&b.to_device(&probs.device())?)?,
+            None => probs.clone(),
+        };
+        let ids = chosen_on
+            .arg_sort_last_dim(false)?
+            .narrow(crate::tensor::D::Minus1, 0, k)?
+            .contiguous()?;
+        let mut weights = probs.gather(&ids, crate::tensor::D::Minus1)?;
+        if self.normalize {
+            let sum = weights.sum_keepdim(crate::tensor::D::Minus1)?;
+            let floor = Tensor::full(Self::SUM_FLOOR, sum.dims(), &sum.device())?;
+            weights = weights.broadcast_div(&sum.maximum(&floor)?)?;
+        }
+        if self.scale != 1.0 {
+            weights = (weights * self.scale)?;
+        }
+        Ok((weights, ids))
+    }
+}
+
 // ------------------------------------------------------------
 // Per-layer struct
 // ------------------------------------------------------------
@@ -275,6 +325,8 @@ pub struct MoeWeights {
     /// most MoE (granite, qwen*moe, gemma4); FALSE for OLMoE (raw softmax-over-all
     /// weights, no renorm) - getting this wrong scales the expert mix wrong.
     pub norm_topk: bool,
+    /// The router scores experts by sigmoid instead of softmax. `None` for softmax.
+    pub sigmoid_routing: Option<SigmoidRouting>,
     /// CPU-only cache: dequantized F32 expert tensors. Populated for layers
     /// placed on CPU since `moe_gemm_gguf` is CUDA-only. Avoids per-call
     /// dequant cost on what is already a slow CPU path.
@@ -391,27 +443,29 @@ impl MoeWeights {
         let logits_f32 = if self.router_prenormed {
             // Standard MoE (granitemoe): `xs` is already the ffn_norm'd hidden  -
             // route it straight through gate_inp (no internal rms_norm / scale).
+            // A biased or sigmoid router scores in full F32 on a card: the GEMV kernel, not
+            // the dense matmul whose reduced-precision mode can reorder near-tied experts.
+            let exact_logits = || -> Result<Tensor> {
+                let exact = match &self.gate_inp {
+                    crate::tensor::quantized::QMatMul::Tensor(w) => {
+                        crate::inference::moe_cuda::gate_gemv_f32(&xs, w)?
+                    }
+                    _ => None,
+                };
+                let logits = match exact {
+                    Some(l) => l,
+                    None => self.gate_inp.forward(&xs)?,
+                };
+                logits.to_dtype(crate::tensor::DType::F32)
+            };
             match self.gate_inp_bias.as_ref() {
+                None if self.sigmoid_routing.is_some() => exact_logits()?,
                 None => self
                     .gate_inp
                     .forward(&xs)?
                     .to_dtype(crate::tensor::DType::F32)?,
-                // A biased router scores in full F32 on a card: the GEMV kernel, not the
-                // dense matmul whose reduced-precision mode can reorder near-tied experts.
                 Some(bias) => {
-                    let exact = match &self.gate_inp {
-                        crate::tensor::quantized::QMatMul::Tensor(w) => {
-                            crate::inference::moe_cuda::gate_gemv_f32(&xs, w)?
-                        }
-                        _ => None,
-                    };
-                    let logits = match exact {
-                        Some(l) => l,
-                        None => self.gate_inp.forward(&xs)?,
-                    };
-                    logits
-                        .to_dtype(crate::tensor::DType::F32)?
-                        .broadcast_add(&bias.to_dtype(crate::tensor::DType::F32)?)?
+                    exact_logits()?.broadcast_add(&bias.to_dtype(crate::tensor::DType::F32)?)?
                 }
             }
         } else {
@@ -462,7 +516,9 @@ impl MoeWeights {
         // over 128); every other width, and every build compiled without kernels, takes the
         // two steps as tensor ops. Which of the two ran is what the stage profile records.
         #[cfg(feature = "cuda")]
-        let (topk_weights, topk_ids) = {
+        let (topk_weights, topk_ids) = if let Some(sigmoid) = self.sigmoid_routing.as_ref() {
+            sigmoid.select(&logits_f32, self.n_experts_used)?
+        } else {
             let fused = logits_f32.device().is_cuda()
                 && matches!(
                     logits_f32.dim(crate::tensor::D::Minus1)?,
@@ -480,7 +536,10 @@ impl MoeWeights {
             }
         };
         #[cfg(not(feature = "cuda"))]
-        let (topk_weights, topk_ids) = self.top_k(&logits_f32)?;
+        let (topk_weights, topk_ids) = match self.sigmoid_routing.as_ref() {
+            Some(sigmoid) => sigmoid.select(&logits_f32, self.n_experts_used)?,
+            None => self.top_k(&logits_f32)?,
+        };
 
         // -- Sort (expert, token) pairs.
         if let Some(t) = t_topk {
@@ -976,6 +1035,122 @@ mod clamped_swiglu_tests {
             .collect()
     }
 
+    /// `x.sigmoid(x)`.
+    fn silu(x: f32) -> f32 {
+        x / (1.0 + (-x).exp())
+    }
+
+    #[test]
+    fn sigmoid_routed_experts_match_the_scalar_reference() {
+        let (experts, used, hidden, ffn, tokens) = (4usize, 2usize, 32usize, 32usize, 3usize);
+        let (scale, floor) = (2.5f64, 6.103_515_6e-5f32);
+        let dev = Device::Cpu;
+        let stack = |seed| {
+            let w = Tensor::from_vec(
+                values(experts * ffn * hidden, seed, 1.0),
+                (experts, ffn, hidden),
+                &dev,
+            )
+            .unwrap();
+            QTensor::quantize_onto(&w, GgmlDType::Q8_0, &dev).unwrap()
+        };
+        let (gate, up, down) = (stack(21), stack(22), stack(23));
+        let router = values(experts * hidden, 24, 0.5);
+        let selection = values(experts, 25, 0.8);
+        for normalize in [true, false] {
+            let moe = MoeWeights {
+                gate_inp: QMatMul::Tensor(
+                    Tensor::from_vec(router.clone(), (experts, hidden), &dev).unwrap(),
+                ),
+                gate_inp_scale: Tensor::ones(hidden, DType::F32, &dev).unwrap(),
+                gate_inp_bias: None,
+                gate_exps_bias: None,
+                up_exps_bias: None,
+                down_exps_bias: None,
+                swiglu_clamp: None,
+                gate_up_exps: None,
+                down_exps: Arc::new(stack(23)),
+                gate_exps_sep: Some(Arc::new(stack(21))),
+                up_exps_sep: Some(Arc::new(stack(22))),
+                down_exps_scale: Tensor::ones(experts, DType::F32, &dev).unwrap(),
+                n_experts: experts,
+                n_experts_used: used,
+                expert_ffn_dim: ffn,
+                router_prenormed: true,
+                use_silu: true,
+                gelu: false,
+                norm_topk: true,
+                sigmoid_routing: Some(SigmoidRouting {
+                    selection_bias: Some(
+                        Tensor::from_vec(selection.clone(), (experts,), &dev).unwrap(),
+                    ),
+                    normalize,
+                    scale,
+                }),
+                gate_up_exps_f32: None,
+                down_exps_f32: None,
+            };
+            let xs = values(tokens * hidden, 26, 1.0);
+            let input = Tensor::from_vec(xs.clone(), (1, tokens, hidden), &dev).unwrap();
+            let got = moe
+                .forward(&input, &input, hidden, 1e-5, false)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let deq = |q: &QTensor| {
+                q.dequantize(&dev)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let (gw, uw, dw) = (deq(&gate), deq(&up), deq(&down));
+            let mut want = vec![0f32; tokens * hidden];
+            for tok in 0..tokens {
+                let x = &xs[tok * hidden..(tok + 1) * hidden];
+                let probs: Vec<f32> = matvec(&router, x, experts)
+                    .iter()
+                    .map(|l| 1.0 / (1.0 + (-l).exp()))
+                    .collect();
+                // Chosen on the biased scores, weighed by the unbiased ones.
+                let mut order: Vec<usize> = (0..experts).collect();
+                order.sort_by(|&a, &b| {
+                    (probs[b] + selection[b]).total_cmp(&(probs[a] + selection[a]))
+                });
+                let chosen = &order[..used];
+                let sum: f32 = chosen.iter().map(|&e| probs[e]).sum();
+                for &e in chosen {
+                    let mut w = probs[e];
+                    if normalize {
+                        w /= sum.max(floor);
+                    }
+                    w *= scale as f32;
+                    let g = matvec(&gw[e * ffn * hidden..(e + 1) * ffn * hidden], x, ffn);
+                    let u = matvec(&uw[e * ffn * hidden..(e + 1) * ffn * hidden], x, ffn);
+                    let h: Vec<f32> = (0..ffn).map(|i| silu(g[i]) * u[i]).collect();
+                    let d = matvec(&dw[e * hidden * ffn..(e + 1) * hidden * ffn], &h, hidden);
+                    for c in 0..hidden {
+                        want[tok * hidden + c] += w * d[c];
+                    }
+                }
+            }
+            let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            // The expert kernels quantise their activations to 8 bits.
+            assert!(
+                worst <= 2e-2 * peak,
+                "normalize={normalize}: max diff {worst} of {peak}"
+            );
+        }
+    }
+
     #[test]
     fn biased_clamped_experts_match_the_scalar_reference() {
         let (experts, used, hidden, ffn, tokens) = (4usize, 2usize, 32usize, 32usize, 3usize);
@@ -1020,6 +1195,7 @@ mod clamped_swiglu_tests {
             use_silu: true,
             gelu: false,
             norm_topk: true,
+            sigmoid_routing: None,
             gate_up_exps_f32: None,
             down_exps_f32: None,
         };

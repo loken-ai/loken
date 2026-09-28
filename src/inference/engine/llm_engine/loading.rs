@@ -923,78 +923,6 @@ impl LlmEngine {
                         None => return Err(anyhow!("nemotron_h load failed: {last_err}")),
                     }
                 }
-                "lfm2moe" | "lfm2" => {
-                    // LFM2 hybrid short-conv + attention + SwiGLU FFN. `lfm2moe`
-                    // uses MoE experts; the dense `lfm2` arch (e.g. lfm2.5-thinking)
-                    // uses a plain SwiGLU FFN - both handled by Lfm2MoeModel (its
-                    // `Ffn::Dense` path covers all blocks when there are no experts).
-                    // F16 stream; shortconv / norms / softmax / FFN in F32.
-                    // Experts are Q4_K (block-256, K÷256 ok) so no requant needed.
-                    let dtype = crate::tensor::DType::F16;
-                    // Single-GPU when the model fits (14.4 GB <= 15.6 GB avail):
-                    // splitting lfm2moe across 2 GPUs (the prior unconditional
-                    // behaviour) ate cross-device latency every layer (109 tok/s
-                    // measured 2-GPU) AND made the decode forward uncapturable
-                    // (the CUDA graph path captures one GPU's stream). Mirrors the
-                    // gpt-oss/deepcoder single-GPU win - keep all layers on the
-                    // fastest GPU (gpu_idx) when weights+KV fit.
-                    let mut gpu_ids: Vec<usize> = if model_fits_single_gpu {
-                        vec![gpu_idx]
-                    } else {
-                        cuda_devices.iter().map(|(i, _)| *i).collect()
-                    };
-                    gpu_ids.sort_unstable();
-                    let mut gpu_list: Vec<Device> = Vec::new();
-                    for idx in &gpu_ids {
-                        match Device::new_cuda(*idx) {
-                            Ok(d) => {
-                                // Single-GPU: per-slice event tracking OFF (must
-                                // precede tensor loads - a slice created with
-                                // tracking on keeps recording forever). The lfm2
-                                // decode is launch-bound (~840 launches/token);
-                                // with tracking on every kernel arg pays a
-                                // cuStreamWaitEvent + cuEventRecord (~5+3 per
-                                // launch measured) ≈ ms-scale pure CPU overhead
-                                // per token. Single stream -> events are self-
-                                // stream no-ops. Multi-GPU keeps events (cross-
-                                // device sync needs them).
-                                #[cfg(feature = "cuda")]
-                                if gpu_ids.len() == 1 {
-                                    if let Device::Cuda(ref cd) = d {
-                                        unsafe { cd.context().disable_event_tracking(); }
-                                    }
-                                }
-                                gpu_list.push(d);
-                            }
-                            Err(e) => warn!("lfm2moe: skipping GPU {idx}: {e}"),
-                        }
-                    }
-                    if gpu_list.is_empty() {
-                        // CPU-only build (or no CUDA GPU): run lfm2moe on the CPU
-                        // device - the MoE expert-GEMM + fused ops use the tensor-op
-                        // shims (moe_cuda_cpu / fused_kernels_cpu).
-                        gpu_list.push(Device::Cpu);
-                        info!("⬇️  Loading lfm2moe (shortconv+attn+MoE) on CPU");
-                    } else {
-                        info!("⬇️  Loading lfm2moe (shortconv+attn+MoE) across {} CUDA GPU(s)", gpu_list.len());
-                    }
-                    let content_fresh = gguf_file::Content::read_mapped(&mut Cursor::new(mmap_bytes), mmap.clone())
-                        .map_err(|e| anyhow!("GGUF re-parse failed: {e}"))?;
-                    let mut reader = Cursor::new(mmap_bytes);
-                    match crate::inference::model::lfm2_moe::Lfm2MoeModel::from_gguf(
-                        &content_fresh,
-                        &mut reader,
-                        &gpu_list,
-                        dtype,
-                        Some(&mmap),
-                    ) {
-                        Ok(m) => {
-                            info!("✅ lfm2moe loaded across {} device(s)", gpu_list.len());
-                            Box::new(Lfm2MoeBackend(m))
-                        }
-                        Err(e) => return Err(anyhow!("lfm2moe load failed: {e}")),
-                    }
-                }
                 "deepseek4" | "deepseek41" | "deepseek_v41" => {
                     // The CPU port: latent MQA, CSA2 bands, hyper-connections, and a MoE whose
                     // routed experts are read in place from the mapping by the quantised dot
@@ -1145,7 +1073,7 @@ impl LlmEngine {
                 "phi" | "phi2" | "phi3" | "phi4" | "chatglm" | "glm4" | "stablelm" | "starcoder" |
                 "starcoder2" | "falcon" | "bloom" | "mpt" | "refact" | "codeshell" |
                 "granite" | "granite3" | "granitemoe" | "dbrx" | "internlm2" | "yi" | "orion" |
-                "olmo2" | "olmoe" | "ernie4_5" | "smollm3" => {
+                "olmo2" | "olmoe" | "ernie4_5" | "smollm3" | "lfm2" | "lfm2moe" => {
                     debug!("⬇️  Loading '{}' as generic hetero transformer (CUDA+CPU)...", arch);
                     // An architecture without a RoPE pairing cannot build a config: refuse
                     // it here, before any weight is placed.
@@ -1211,6 +1139,18 @@ impl LlmEngine {
                     // the full user context, so they keep the worst-case estimate.
                     let lazy_kv_initial_cap =
                         crate::inference::cache::KV_WORKING_WINDOW_TOKENS as u64;
+                    // A hybrid's recurrent layers keep no KV: the cache is spread over the
+                    // layers that attend.
+                    let attn_layers = crate::inference::generic_transformer::mixer::attention_layer_count(
+                        &content, num_layers,
+                    ) as u64;
+                    let over_attending = |bytes: u64| -> u64 {
+                        if attn_layers < num_layers as u64 {
+                            bytes.saturating_mul(attn_layers) / num_layers.max(1) as u64
+                        } else {
+                            bytes
+                        }
+                    };
                     // What one layer's cache costs at a given context, sliding windows
                     // included: a windowed layer never holds more than its window.
                     let kv_bytes_at = |ctx: u64| -> u64 {
@@ -1223,7 +1163,7 @@ impl LlmEngine {
                         } else {
                             ctx
                         };
-                        2u64 * num_kv_heads as u64 * head_dim as u64 * avg * kv_dtype_bytes
+                        over_attending(2u64 * num_kv_heads as u64 * head_dim as u64 * avg * kv_dtype_bytes)
                     };
 
                     // Choose the context that yields the best PLAN, not the largest number.
@@ -1308,11 +1248,9 @@ impl LlmEngine {
                     // (single-GPU -> forced 2-GPU split -> CPU) plus the NVML
                     // divert-on-pressure loader in generic_transformer handle
                     // genuine overflow without pre-reserving a fictional margin.
-                    let kv_bytes_per_layer: u64 = 2u64
-                        * num_kv_heads as u64
-                        * head_dim as u64
-                        * avg_ctx_per_layer
-                        * kv_dtype_bytes;
+                    let kv_bytes_per_layer: u64 = over_attending(
+                        2u64 * num_kv_heads as u64 * head_dim as u64 * avg_ctx_per_layer * kv_dtype_bytes,
+                    );
                     // What the model asks of the cards; the ladder in `place` turns it into a
                     // plan, whole on one card when it fits there, and recovers from running out
                     // of card memory. A pinned card is offered first.
@@ -1457,7 +1395,7 @@ impl LlmEngine {
                 other => {
                     let err_msg = format!(
                         "Unsupported architecture: {}. Supported: llama, mistral, mistral3, \
-                         qwen2, qwen3, qwen3moe, gptoss, nemotron_h_moe, lfm2moe, qwen35moe, qwen35, gemma, gemma2, gemma3, gemma4, phi, phi2, \
+                         qwen2, qwen3, qwen3moe, gptoss, nemotron_h_moe, lfm2, lfm2moe, qwen35moe, qwen35, gemma, gemma2, gemma3, gemma4, phi, phi2, \
                          phi3, phi4, chatglm/glm4, stablelm, starcoder, starcoder2, granite, \
                          granite3, dbrx, internlm2, yi, orion, mpt, moondream",
                         other

@@ -994,9 +994,6 @@ impl DeepseekV41Backend {
 /// nemotron_h_moe: hybrid Mamba2 + attention + non-gated MoE, multi-device.
 pub(crate) struct NemotronHBackend(pub crate::inference::model::nemotron_h::NemotronHModel);
 
-/// lfm2moe: hybrid short-conv + attention + SwiGLU MoE, multi-device (+ CPU).
-pub(crate) struct Lfm2MoeBackend(pub crate::inference::model::lfm2_moe::Lfm2MoeModel);
-
 /// qwen35moe: hybrid gated-DeltaNet + attention + softmax MoE, multi-device.
 /// Also runs on CPU (text): the DeltaNet recurrence uses the pure tensor-op
 /// `forward_pertoken` path and the MoE GEMM the fallback CPU path. Vision is
@@ -1037,7 +1034,6 @@ unsafe impl Send for MoondreamBackend {}
 unsafe impl Send for GenericBackend {}
 unsafe impl Send for GenericVisionBackend {}
 unsafe impl Send for NemotronHBackend {}
-unsafe impl Send for Lfm2MoeBackend {}
 unsafe impl Send for Qwen35MoeBackend {}
 #[cfg(feature = "cuda")]
 unsafe impl Send for TpQwen2Backend {}
@@ -1140,6 +1136,36 @@ impl ModelBackend for GenericBackend {
     fn snapshot_kv(&mut self, tokens: Vec<u32>, kv_len: usize) -> crate::tensor::Result<()> {
         self.0.snapshot_kv(tokens, kv_len)
     }
+    fn snapshot_prefix(&mut self, prompt: &[u32], logits: &Tensor) -> crate::tensor::Result<()> {
+        self.0.snapshot_prefix(prompt, logits)
+    }
+    fn try_restore_prefix(&mut self, prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
+        // A snapshot of an earlier prompt that this one extends - the previous turn of a
+        // conversation - is restored and advanced over the new tokens.
+        let Some((covered, logits)) = self.0.try_restore_prefix(prompt)? else {
+            return Ok(None);
+        };
+        if covered == prompt.len() {
+            return Ok(Some(logits));
+        }
+        let rest = Tensor::new(&prompt[covered..], &crate::tensor::Device::Cpu)?.unsqueeze(0)?;
+        // One pass, no replay: a recurrent state that failed part way through the new tokens
+        // cannot be rewound, so the caller prefills the whole prompt from position 0 instead,
+        // which starts a fresh state.
+        let chunk = adaptive_prefill_chunk(self.widest_ffn());
+        let logits =
+            match self.forward_prefill_with_chunk(&rest, covered, prompt.len() - covered, chunk) {
+                Ok(logits) => logits,
+                Err(e) => {
+                    tracing::warn!(
+                        "prefix snapshot advance failed ({e}); prefilling the whole prompt"
+                    );
+                    return Ok(None);
+                }
+            };
+        self.0.snapshot_prefix(prompt, &logits)?;
+        Ok(Some(logits))
+    }
     fn best_kv_snapshot(&self, prompt: &[u32]) -> Option<(usize, usize)> {
         self.0.best_kv_snapshot(prompt)
     }
@@ -1148,7 +1174,8 @@ impl ModelBackend for GenericBackend {
     }
 
     fn kv_layout(&self) -> Option<(usize, usize, usize)> {
-        Some(self.0.kv_layout())
+        // A recurrent state is not rows of KV: the disk tier has nothing to store for it.
+        (!self.0.is_recurrent()).then(|| self.0.kv_layout())
     }
     fn kv_snapshot_ref(&self, index: usize) -> Option<(&[u32], usize)> {
         self.0.kv_snapshot_ref(index)
@@ -1178,6 +1205,11 @@ impl ModelBackend for GenericBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
+        // A recurrent state advances with every token and cannot be cut back: no trim, no
+        // shift, no draft to roll back, and no captured decode step for it.
+        if self.0.is_recurrent() {
+            return Capabilities::default();
+        }
         Capabilities {
             // Routed mixtures were excluded because the top-k choice follows the GEMM
             // shape, and a warm re-prefill used shapes a cold run never had - measured
@@ -1534,30 +1566,6 @@ impl ModelBackend for NemotronHBackend {
 
     fn device_layer_distribution(&self) -> Vec<(String, usize, u32, u32)> {
         group_layers_by_device(self.0.layer_device_locations())
-    }
-
-    take_generic_passthrough!();
-}
-
-impl ModelBackend for Lfm2MoeBackend {
-    fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.0.forward(x, index_pos)
-    }
-
-    fn widest_ffn(&self) -> usize {
-        self.0.widest_ffn()
-    }
-
-    fn device_layer_distribution(&self) -> Vec<(String, usize, u32, u32)> {
-        group_layers_by_device(self.0.layer_device_locations())
-    }
-
-    fn snapshot_prefix(&mut self, prompt: &[u32], logits: &Tensor) -> crate::tensor::Result<()> {
-        self.0.snapshot_prefix(prompt, logits)
-    }
-
-    fn try_restore_prefix(&mut self, prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
-        self.0.try_restore_prefix(prompt)
     }
 
     take_generic_passthrough!();

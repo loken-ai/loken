@@ -201,42 +201,6 @@ extern "C" void loken_flash_decode_split_f16(
         part_m, part_l, part_acc, (__half*)out, n_head, nsplit, head_dim);
 }
 
-// Capture-safe embedding gather: out[i] = table[(*tok)*d_model + i], reading the
-// token id from a DEVICE buffer at kernel-execution time. A tensor-level index_select
-// BAKES the gather index at CUDA-graph capture (host-reads the index), so the
-// captured embed ignores input_tok on replay - this reads *tok on replay so the
-// input token actually advances. table [vocab, d_model] F16; tok u32 [1]; out
-// [d_model] F16.
-extern "C" __global__ void loken_embed_gather_f16_kernel(
-    const __half* __restrict__ table, const unsigned int* __restrict__ tok,
-    __half* __restrict__ out, int d_model
-) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= d_model) return;
-    out[i] = table[(long)(*tok) * d_model + i];
-}
-extern "C" void loken_embed_gather_f16(
-    const void* table, const unsigned int* tok, void* out, int d_model, cudaStream_t stream
-) {
-    const int block = 256;
-    const int grid = (d_model + block - 1) / block;
-    loken_embed_gather_f16_kernel<<<grid, block, 0, stream>>>(
-        (const __half*)table, tok, (__half*)out, d_model);
-}
-
-// In-place device scalar writes (1 thread). Run OUTSIDE the captured graph region
-// to advance the input token + position between replays (the value is a kernel arg,
-// so it is NOT baked into a captured graph - these are launched before graph.launch).
-// Device-to-device copy of one u32 (the new token id) into the fixed input_tok
-// buffer - avoids a D2H read+sync per decode token in the graph path.
-extern "C" __global__ void loken_copy_u32_kernel(const unsigned int* src, unsigned int* dst) { *dst = *src; }
-extern "C" void loken_copy_u32(const unsigned int* src, unsigned int* dst, cudaStream_t s) {
-    loken_copy_u32_kernel<<<1, 1, 0, s>>>(src, dst);
-}
-extern "C" __global__ void loken_set_i32_kernel(int* p, int v) { *p = v; }
-extern "C" void loken_set_i32(int* p, int v, cudaStream_t s) {
-    loken_set_i32_kernel<<<1, 1, 0, s>>>(p, v);
-}
 // Device-to-device copy of N floats into a fixed buffer. Used as the FINAL op of
 // the captured gpt-oss decode forward: the lm_head writes its logits into a fresh
 // (arena) tensor, which a captured graph cannot be relied on to keep stable across
@@ -250,45 +214,6 @@ extern "C" void loken_copy_f32(const float* src, float* dst, int n, cudaStream_t
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     loken_copy_f32_kernel<<<blocks, threads, 0, s>>>(src, dst, n);
-}
-
-// Device-position KV-cache write (for CUDA-graph decode): scatter the new token's
-// k_new/v_new [b, n_kv, hd] into the fixed-max ring buffers k_buf/v_buf
-// [b, n_kv, kv_max, hd] at slot `*pos_dev`. The position lives on-device so a
-// captured graph advances it on replay (bump *pos_dev between replays) instead of
-// a host-position slice_set, which freezes in a graph. One thread/element.
-// k_new/v_new are [b, n_kv, seq, hd]; write each of the `seq` positions to slot
-// (*pos_dev + s) - so this serves BOTH prefill (seq>1, populates the prompt KV)
-// and decode (seq==1). Handles the base position on-device for graph replay.
-extern "C" __global__ void loken_kv_write_at_pos_f16_kernel(
-    const __half* __restrict__ k_new, const __half* __restrict__ v_new,
-    __half* __restrict__ k_buf, __half* __restrict__ v_buf,
-    const int* __restrict__ pos_dev, int b, int n_kv, int seq, int hd, int kv_max
-) {
-    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long total = (long)b * n_kv * seq * hd;
-    if (idx >= total) return;
-    const int pos = *pos_dev;
-    const int d = (int)(idx % hd);
-    const long tmp = idx / hd;                       // flattened (b, n_kv, seq)
-    const int s = (int)(tmp % seq);
-    const long bn = tmp / seq;                        // flattened (b, n_kv)
-    const long src = (bn * seq + s) * hd + d;         // k_new [b,n_kv,seq,hd]
-    const long dst = bn * (long)kv_max * hd + (long)(pos + s) * hd + d; // k_buf [b,n_kv,kv_max,hd]
-    k_buf[dst] = k_new[src];
-    v_buf[dst] = v_new[src];
-}
-
-extern "C" void loken_kv_write_at_pos_f16(
-    const void* k_new, const void* v_new, void* k_buf, void* v_buf,
-    const int* pos_dev, int b, int n_kv, int seq, int hd, int kv_max, cudaStream_t stream
-) {
-    const int block = 256;
-    const long total = (long)b * n_kv * seq * hd;
-    const long grid = (total + block - 1) / block;
-    loken_kv_write_at_pos_f16_kernel<<<grid, block, 0, stream>>>(
-        (const __half*)k_new, (const __half*)v_new, (__half*)k_buf, (__half*)v_buf,
-        pos_dev, b, n_kv, seq, hd, kv_max);
 }
 
 // Device-kv_len variant for CUDA-graph decode: kv_len = *pos_dev + 1, read on
