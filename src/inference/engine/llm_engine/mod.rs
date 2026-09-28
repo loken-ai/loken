@@ -368,19 +368,14 @@ impl LlmEngine {
             .drafter_choice
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(None);
-        let cards = crate::inference::place::device_probe::probe_cuda_gpus_for("llm");
-        let free: u64 = cards.iter().map(|g| g.available).sum();
-        if target_size <= free {
+        if crate::inference::place::room::cards_hold_for("llm", target_size) {
             return None;
         }
         let (id, size, path) = self.choose_drafter(target, target_size)?;
         let reserve = loading::per_card_reserve(&path).unwrap_or(0);
         Some(PlannedDrafter {
             id,
-            room: crate::inference::place::vram_manager::declare_demand(
-                DRAFTER_DEMAND,
-                size + reserve,
-            ),
+            room: crate::inference::place::room::hold(DRAFTER_DEMAND, size + reserve),
         })
     }
 
@@ -416,10 +411,10 @@ impl LlmEngine {
             );
             return;
         }
-        let cards = crate::inference::place::device_probe::probe_cuda_gpus_for("llm");
+        // The drafter is placed like any model: the ladder puts it whole on the fastest card
+        // that holds it, where its room was held.
         let mut dcfg = self.config.clone();
         dcfg.model_id = id.clone();
-        dcfg.device_index = cards.first().map(|g| g.index);
         dcfg.disable_arc_layers = true;
         let nested = LlmEngine::with_config(dcfg);
         if let Err(e) = nested.load_model_only().await {
@@ -879,10 +874,6 @@ pub struct ModelGeometry {
 #[cfg(not(feature = "cuda"))]
 pub fn trim_cuda_pools() {}
 
-/// Warm one card, once per process: a tiny matmul allocates the cuBLAS handle and
-/// workspace, which latches the primary context - the deliberate cost that makes every
-/// later budget probe of this card read the same world.
-#[cfg(feature = "cuda")]
 /// The owner name the room held for a planned drafter is declared under.
 const DRAFTER_DEMAND: &str = "drafter";
 
@@ -893,6 +884,10 @@ struct PlannedDrafter {
     room: crate::inference::place::vram_manager::DemandLease,
 }
 
+/// Warm one card, once per process: a tiny matmul allocates the cuBLAS handle and
+/// workspace, which latches the primary context - the deliberate cost that makes every
+/// later budget probe of this card read the same world.
+#[cfg(feature = "cuda")]
 pub(crate) fn warm_card(ordinal: usize) {
     use std::sync::{Mutex, OnceLock};
     static WARMED: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();

@@ -57,6 +57,22 @@ pub fn fastest_card(owner: &str) -> Option<usize> {
     probe_cuda_gpus_for(owner).first().map(|g| g.index)
 }
 
+/// Whether the cards together have `bytes` free for `owner`, after what other subsystems
+/// declared they are about to use.
+pub fn cards_hold_for(owner: &str, bytes: u64) -> bool {
+    probe_cuda_gpus_for(owner)
+        .iter()
+        .map(|g| g.available)
+        .sum::<u64>()
+        >= bytes
+}
+
+/// Holds `bytes` of the cards for `owner` until the lease drops: every placement made
+/// meanwhile, but the owner's own, is planned around it.
+pub fn hold(owner: &'static str, bytes: u64) -> super::vram_manager::DemandLease {
+    super::vram_manager::declare_demand(owner, bytes)
+}
+
 /// The highest memory bandwidth among the cards, in GB/s; zero without a card.
 pub fn fastest_bandwidth_gbs() -> f64 {
     probe_cuda_gpus()
