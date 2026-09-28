@@ -3,6 +3,7 @@
 //! `crate::inference::model::kyutai::<part>`
 
 pub mod cond;
+pub mod config;
 pub mod depformer;
 pub mod gen;
 pub mod helium;

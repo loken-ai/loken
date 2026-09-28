@@ -10,6 +10,7 @@
 //! in the LM, applied after this stack). Reuses the tensor-native ops + sdpa + rope_i.
 
 use crate::inference::model::acestep::fsq::rope_tables;
+use crate::inference::model::kyutai::config::KyutaiConfig;
 use crate::inference::model::sdpa::sdpa;
 use crate::tensor::VarBuilder;
 use crate::tensor::{Device, Result, Tensor};
@@ -31,29 +32,17 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    /// Read the geometry from the parsed `config.json`.
-    pub fn from_config(cfg: &serde_json::Value) -> Result<Self> {
-        let n = |k: &str| -> Result<usize> {
-            cfg[k]
-                .as_u64()
-                .map(|v| v as usize)
-                .ok_or_else(|| crate::tensor::Error(format!("kyutai config.json: missing {k}")))
-        };
-        let f = |k: &str| -> Result<f64> {
-            cfg[k]
-                .as_f64()
-                .ok_or_else(|| crate::tensor::Error(format!("kyutai config.json: missing {k}")))
-        };
-        let dim = n("dim")?;
-        // The gate's two halves together are two thirds of the feed-forward width.
-        let feed_forward = (f("hidden_scale")? * dim as f64) as usize;
+    /// Read the geometry from the checkpoint's `config.json`.
+    pub fn from_config(cfg: &KyutaiConfig) -> Result<Self> {
+        let dim = cfg.usize(&["dim"])?;
+        let feed_forward = (cfg.f64(&["hidden_scale"])? * dim as f64) as usize;
         Ok(Self {
             dim,
-            heads: n("num_heads")?,
-            layers: n("num_layers")?,
-            hidden: 2 * feed_forward / 3,
-            context: n("context")?,
-            rope_theta: f("max_period")? as f32,
+            heads: cfg.usize(&["num_heads"])?,
+            layers: cfg.usize(&["num_layers"])?,
+            hidden: KyutaiConfig::gate_width(feed_forward),
+            context: cfg.usize(&["context"])?,
+            rope_theta: cfg.f64(&["max_period"])? as f32,
         })
     }
 

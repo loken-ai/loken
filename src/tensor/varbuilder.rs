@@ -186,6 +186,30 @@ impl VarBuilder {
         self.loader.names()
     }
 
+    /// The shape `{prefix}.{name}` is stored at, read from the header without its data.
+    pub fn shape_of(&self, name: &str) -> Result<Vec<usize>> {
+        let path = self.resolved(name);
+        let shape = match &self.loader {
+            Source::Files(l) => l.shape_of(&path),
+            Source::Memory(m) => m.get(&path).map(|t| t.dims().to_vec()),
+        };
+        shape.ok_or_else(|| Error(format!("VarBuilder: no tensor `{path}`")))
+    }
+
+    /// How many numbered children `{prefix}.{parent}.0`, `.1`, ... the file stores, counted
+    /// up to the first missing index.
+    pub fn count_children(&self, parent: &str) -> usize {
+        let base = format!("{}.", self.resolved(parent));
+        let indices: std::collections::BTreeSet<usize> = self
+            .loader
+            .names()
+            .iter()
+            .filter_map(|n| n.strip_prefix(&base))
+            .filter_map(|rest| rest.split('.').next()?.parse().ok())
+            .collect();
+        (0..).take_while(|i| indices.contains(i)).count()
+    }
+
     /// Fetch by ABSOLUTE name, bypassing the prefix and shape check.
     pub fn get_by_name(&self, name: &str) -> Result<Tensor> {
         self.loader.load_to(name, self.dtype, &self.device)
@@ -218,5 +242,30 @@ impl VarBuilder {
             shape.dims(),
             t.dims()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shapes_and_numbered_children_come_from_the_stored_names() {
+        let mut m = std::collections::HashMap::new();
+        for name in [
+            "blocks.0.w",
+            "blocks.1.w",
+            "blocks.1.b",
+            "blocks.3.w",
+            "head.w",
+        ] {
+            m.insert(name.to_string(), Tensor::zeros((4, 2), DType::F32).unwrap());
+        }
+        let vb = VarBuilder::from_tensors(m, DType::F32, &Device::Cpu);
+        assert_eq!(vb.shape_of("head.w").unwrap(), vec![4, 2]);
+        assert_eq!(vb.pp("blocks").shape_of("1.b").unwrap(), vec![4, 2]);
+        assert!(vb.shape_of("head.b").is_err());
+        assert_eq!(vb.count_children("blocks"), 2);
+        assert_eq!(vb.count_children("head"), 0);
     }
 }

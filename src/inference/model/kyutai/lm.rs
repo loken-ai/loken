@@ -7,6 +7,7 @@
 //!   text_logits = text_linear(h)
 //! (audio_offset=1; K=33 = 1 text + 32 audio codebooks; out_norm = RMSNorm alpha.)
 
+use crate::inference::model::kyutai::config::{KyutaiConfig, Streams};
 use crate::inference::model::kyutai::helium::{Geometry, HeliumCache, HeliumTransformer};
 use crate::tensor::{Device, Result, Tensor};
 
@@ -16,6 +17,7 @@ const RMS_EPS: f32 = 1e-5;
 /// The LM's shape, read from the `config.json` published beside the checkpoint.
 struct LmConfig {
     helium: Geometry,
+    streams: Streams,
     /// Audio codebooks summed into each frame.
     n_audio: usize,
     /// Rows of each audio embedding: the codebook size and the zero token.
@@ -28,29 +30,15 @@ struct LmConfig {
 
 impl LmConfig {
     fn read(checkpoint: &str) -> Result<Self> {
-        let dir = std::path::Path::new(checkpoint).parent().ok_or_else(|| {
-            crate::tensor::Error(format!("kyutai: no directory for {checkpoint}"))
-        })?;
-        let path = dir.join("config.json");
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| crate::tensor::Error(format!("{}: {e}", path.display())))?;
-        let cfg: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| crate::tensor::Error(format!("{}: {e}", path.display())))?;
-        let n = |k: &str| -> Result<usize> {
-            cfg[k]
-                .as_u64()
-                .map(|v| v as usize)
-                .ok_or_else(|| crate::tensor::Error(format!("kyutai config.json: missing {k}")))
-        };
-        let text_card = n("text_card")?;
+        let cfg = KyutaiConfig::read(checkpoint)?;
+        let text_card = cfg.usize(&["text_card"])?;
         Ok(Self {
             helium: Geometry::from_config(&cfg)?,
-            n_audio: n("n_q")?,
-            audio_card: n("card")? + 1,
+            streams: Streams::from_config(&cfg)?,
+            n_audio: cfg.usize(&["n_q"])?,
+            audio_card: cfg.usize(&["card"])? + 1,
             text_card: text_card + 1,
-            text_card_out: cfg["text_card_out"]
-                .as_u64()
-                .map_or(text_card, |v| v as usize),
+            text_card_out: cfg.opt_usize(&["text_card_out"]).unwrap_or(text_card),
         })
     }
 }
@@ -65,6 +53,7 @@ pub struct KyutaiLm {
     text_linear: Tensor, // [text_card_out, dim]
     audio_card: usize,
     text_card: usize,
+    streams: Streams,
     device: Device,
 }
 impl KyutaiLm {
@@ -138,6 +127,7 @@ impl KyutaiLm {
             text_linear: vb.get((cfg.text_card_out, dim), "text_linear.weight")?,
             audio_card: cfg.audio_card,
             text_card: cfg.text_card,
+            streams: cfg.streams.clone(),
             device: primary,
         })
     }
@@ -287,6 +277,11 @@ impl KyutaiLm {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// How the frames this LM reads and writes are laid out.
+    pub fn streams(&self) -> &Streams {
+        &self.streams
     }
 }
 

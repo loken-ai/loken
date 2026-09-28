@@ -2,56 +2,39 @@
 //!
 //! Ties the validated pieces together into text->audio synthesis:
 //!   conditioner (voice+cfg) -> per-step delayed-streams stepping of the Helium LM ->
-//!   text sampling + StateMachine word scheduling -> autoregressive Depformer (32 audio
+//!   text sampling + StateMachine word scheduling -> autoregressive Depformer (the audio
 //!   codebooks) -> Mimi decode -> 24 kHz waveform.
 //!
 //! The model was trained with CFG DISTILLATION (`cfg_coef == 1.0` at the LM), so there is
 //! NO batch-doubled classifier-free guidance here - the guidance is baked into the `cfg`
-//! conditioning. Delays: text/semantic 0, acoustic 2 (`max_delay` 2); a global
-//! `delay_steps` (16) warm-up keeps the audio silent while the text stream primes.
+//! conditioning. The per-stream delays, the second stream's lookahead and the audio's lag
+//! behind the text come from the checkpoint's `config.json` through [`Streams`]; the lag
+//! keeps the audio silent while the text stream primes.
 
 use std::collections::VecDeque;
 
 use crate::inference::model::kyutai::cond::KyutaiConditioner;
+use crate::inference::model::kyutai::config::Streams;
 use crate::inference::model::kyutai::depformer::KyutaiDepformer;
 use crate::inference::model::kyutai::lm::KyutaiLm;
-use crate::inference::model::kyutai::mimi::KyutaiMimiDecoder;
+use crate::inference::model::kyutai::mimi::{KyutaiMimiDecoder, SAMPLE_RATE};
 use crate::tensor::{Device, Result, Tensor};
 use rand::SeedableRng;
 
 // -- TokenIds --
-const CARD: i64 = 8001; // multiplexing modulus (= text_card)
 const NEW_WORD: i64 = 0;
-const PAD: i64 = 3;
 const ZERO: i64 = -1; // -> all-zeros embedding
 const UNGENERATED: i64 = -2;
-const TEXT_INITIAL: i64 = 8000;
-const AUDIO_INITIAL: i64 = 2048;
 
-const N_CB: usize = 33; // 1 text + 32 audio
-const DEP_Q: usize = 32;
 const AUDIO_OFFSET: usize = 1;
-const MAX_DELAY: usize = 2;
-const CT: usize = MAX_DELAY + 2; // cyclic cache length = 4
-const DELAY_STEPS: usize = 16; // audio warm-up (audio_delay 1.28s x 12.5)
 const FINAL_PADDING: usize = 4;
 const MAX_GEN: usize = 30000;
 
-const SECOND_STREAM_AHEAD: usize = 2;
 const MAX_PADDING: i64 = 8;
 const INITIAL_PADDING: i64 = 2;
 
 const TEXT_TOPK: usize = 25;
 const AUDIO_TOPK: usize = 250;
-
-/// delays[k] for the 33 codebooks: text/semantic 0, acoustic 2.
-fn delay(k: usize) -> usize {
-    if k < 2 {
-        0
-    } else {
-        2
-    }
-}
 
 /// A prepared word: its text tokens (with an optional leading speaker token) and how many
 /// pad steps to force after it.
@@ -94,6 +77,11 @@ pub fn prepare_entries(
 
 /// StateMachine state (per utterance).
 struct State {
+    /// The text token that fills a frame with no word.
+    pad: i64,
+    /// The modulus two multiplexed text streams share.
+    card: i64,
+    second_stream_ahead: usize,
     entries: VecDeque<Entry>,
     remaining_padding: i64,
     forced_padding: i64,
@@ -102,8 +90,11 @@ struct State {
     end_step: Option<usize>,
 }
 impl State {
-    fn new(entries: Vec<Entry>) -> Self {
+    fn new(entries: Vec<Entry>, streams: &Streams) -> Self {
         State {
+            pad: streams.text_padding,
+            card: streams.text_card as i64 + 1,
+            second_stream_ahead: streams.second_stream_ahead,
             entries: entries.into(),
             remaining_padding: INITIAL_PADDING,
             forced_padding: INITIAL_PADDING,
@@ -130,12 +121,13 @@ impl State {
 /// Port of `StateMachine.process`: given the model's sampled text token, decide the actual
 /// (multiplexed) text token to feed next, driving word timing + the second lookahead stream.
 fn process(step: usize, st: &mut State, sampled: i64) -> i64 {
+    let pad = st.pad;
     let mut token = sampled;
-    if token != NEW_WORD && token != PAD {
-        token = PAD;
+    if token != NEW_WORD && token != pad {
+        token = pad;
     }
     if !st.queued.is_empty() || st.forced_padding > 0 {
-        token = PAD;
+        token = pad;
     } else if st.remaining_padding <= 0 {
         token = NEW_WORD;
     }
@@ -144,15 +136,15 @@ fn process(step: usize, st: &mut State, sampled: i64) -> i64 {
         if let Some(entry) = st.entries.pop_front() {
             if !entry.tokens.is_empty() {
                 st.queued.extend(entry.tokens.iter().copied());
-                let ahead = st.tokens_ahead(SECOND_STREAM_AHEAD);
+                let ahead = st.tokens_ahead(st.second_stream_ahead);
                 st.lookahead_queued.extend(ahead);
                 st.remaining_padding = MAX_PADDING;
             } else {
-                token = PAD;
+                token = pad;
             }
             st.forced_padding = entry.padding;
         } else {
-            token = PAD;
+            token = pad;
             if st.end_step.is_none() {
                 token = NEW_WORD;
             }
@@ -163,14 +155,14 @@ fn process(step: usize, st: &mut State, sampled: i64) -> i64 {
     }
 
     let mut output: i64;
-    if token == PAD {
+    if token == pad {
         if st.remaining_padding > 0 {
             st.remaining_padding -= 1;
         }
         if st.forced_padding > 0 {
             st.forced_padding -= 1;
         }
-        output = st.queued.pop_front().unwrap_or(PAD);
+        output = st.queued.pop_front().unwrap_or(pad);
     } else {
         // token == NEW_WORD
         output = NEW_WORD;
@@ -180,11 +172,11 @@ fn process(step: usize, st: &mut State, sampled: i64) -> i64 {
     let mut second: i64 = -1;
     if output == NEW_WORD {
         second = NEW_WORD;
-        output = st.queued.pop_front().unwrap_or(PAD);
+        output = st.queued.pop_front().unwrap_or(pad);
     } else if let Some(t) = st.lookahead_queued.pop_front() {
         second = t;
     }
-    (second + 1) * CARD + output
+    (second + 1) * st.card + output
 }
 
 /// Simple seeded top-k multinomial sampler over logits (softmax at `temp`, keep top-k).
@@ -230,7 +222,7 @@ impl Sampler {
 }
 
 /// Full generation: `entries` (from the text/tokenizer front-end), a `voice` tensor
-/// `[512, T]`, and a `cfg_coef` conditioning value -> 24 kHz mono waveform.
+/// `[C, T]`, and a `cfg_coef` conditioning value -> 24 kHz mono waveform.
 pub fn generate(
     lm: &KyutaiLm,
     depformer: &KyutaiDepformer,
@@ -243,18 +235,29 @@ pub fn generate(
     seed: u64,
     dev: &Device,
 ) -> Result<Vec<f32>> {
-    let sum = cond.condition_sum(cfg_coef)?; // [1, DIM]
-    let cross = cond.condition_cross(voice)?; // [Sc, DIM]
-    let mut st = State::new(entries);
+    let streams = lm.streams();
+    let n_cb = streams.per_frame();
+    let dep_q = streams.audio_codebooks;
+    let delay = |k: usize| streams.delays[k];
+    let max_delay = streams.delays.iter().copied().max().unwrap_or(0);
+    // The cyclic cache holds every frame a delayed stream can still be read from.
+    let ct = max_delay + 2;
+    // Frames the audio stays silent while the text leads it.
+    let frame_rate = SAMPLE_RATE as f64 / mimi.frame_samples()? as f64;
+    let delay_steps = (streams.audio_delay * frame_rate).round() as usize;
+
+    let sum = cond.condition_sum(cfg_coef)?; // [1, dim]
+    let cross = cond.condition_cross(voice)?; // [Sc, dim]
+    let mut st = State::new(entries, streams);
     let mut sampler = Sampler::new(seed);
 
-    // cyclic cache [N_CB, CT]
-    let mut cache = vec![vec![UNGENERATED; CT]; N_CB];
-    let initial: Vec<i64> = std::iter::once(TEXT_INITIAL)
-        .chain(std::iter::repeat_n(AUDIO_INITIAL, DEP_Q))
+    // cyclic cache [n_cb, ct]
+    let mut cache = vec![vec![UNGENERATED; ct]; n_cb];
+    let initial: Vec<i64> = std::iter::once(streams.text_card as i64)
+        .chain(std::iter::repeat_n(streams.audio_card as i64, dep_q))
         .collect();
 
-    let mut frames: Vec<[i64; N_CB]> = Vec::new();
+    let mut frames: Vec<Vec<i64>> = Vec::new();
     // Streaming KV cache: the Helium attends the accumulated K/V (O(1) per step) instead
     // of re-running the whole history each step, and reuses the constant cross-attn K/V.
     let mut kv = lm.new_cache(&cross)?;
@@ -262,22 +265,23 @@ pub fn generate(
     let (mut t_lm, mut t_dep) = (0u128, 0u128);
     for offset in 0..MAX_GEN {
         if let Some(end) = st.end_step {
-            if offset >= end + DELAY_STEPS + FINAL_PADDING {
+            if offset >= end + delay_steps + FINAL_PADDING {
                 break;
             }
         }
-        // Build the LM input frame [33]: cache at offset%CT, or initial while offset<=delay.
-        let pos = offset % CT;
-        let mut input = [0i64; N_CB];
-        for k in 0..N_CB {
-            input[k] = if offset <= delay(k) {
-                initial[k]
-            } else {
-                cache[k][pos]
-            };
-        }
+        // Build the LM input frame: cache at offset%ct, or initial while offset<=delay.
+        let pos = offset % ct;
+        let input: Vec<i64> = (0..n_cb)
+            .map(|k| {
+                if offset <= delay(k) {
+                    initial[k]
+                } else {
+                    cache[k][pos]
+                }
+            })
+            .collect();
         let seq_u: Vec<u32> = input.iter().map(|&x| x as u32).collect();
-        let seq = Tensor::from_vec_u32(seq_u, vec![N_CB, 1])?.to_device(dev)?;
+        let seq = Tensor::from_vec_u32(seq_u, vec![n_cb, 1])?.to_device(dev)?;
         let tl0 = if timing {
             Some(std::time::Instant::now())
         } else {
@@ -293,8 +297,8 @@ pub fn generate(
 
         // Depformer: silent (zeros) during the warm-up, else autoregressive sampling with a
         // per-step KV cache (each codebook is O(1) in the prior ones).
-        let mut audio = [ZERO; DEP_Q];
-        if offset >= DELAY_STEPS {
+        let mut audio = vec![ZERO; dep_q];
+        if offset >= delay_steps {
             let td0 = if timing {
                 Some(std::time::Instant::now())
             } else {
@@ -302,10 +306,10 @@ pub fn generate(
             };
             let mut dcache = depformer.new_cache();
             let mut prev = text_token as u32; // input token for the next codebook position
-            for cb in 0..DEP_Q {
+            for (cb, slot) in audio.iter_mut().enumerate() {
                 let logits = depformer.forward_step(&transformer_out, cb, prev, &mut dcache)?;
                 let tok = sampler.sample(&logits, temp, AUDIO_TOPK);
-                audio[cb] = tok as i64;
+                *slot = tok as i64;
                 prev = tok;
             }
             if let Some(t) = td0 {
@@ -313,32 +317,30 @@ pub fn generate(
             }
         }
         // on_audio_hook: force zero for codebooks still inside their delay window.
-        for q in 0..DEP_Q {
-            if offset < delay(q + AUDIO_OFFSET) + DELAY_STEPS {
-                audio[q] = ZERO;
+        for (q, tok) in audio.iter_mut().enumerate() {
+            if offset < delay(q + AUDIO_OFFSET) + delay_steps {
+                *tok = ZERO;
             }
         }
 
-        // Write generated tokens at (offset+1)%CT.
-        let pos_new = (offset + 1) % CT;
+        // Write generated tokens at (offset+1)%ct.
+        let pos_new = (offset + 1) % ct;
         cache[0][pos_new] = text_token;
-        for q in 0..DEP_Q {
-            cache[1 + q][pos_new] = audio[q];
+        for (q, &tok) in audio.iter().enumerate() {
+            cache[1 + q][pos_new] = tok;
         }
 
         // Emit a delay-aligned frame once past the warm-up window.
         let off_new = offset + 1;
-        if off_new > MAX_DELAY {
-            let mut frame = [0i64; N_CB];
-            for k in 0..N_CB {
-                let idx = (off_new - MAX_DELAY + delay(k)) % CT;
-                frame[k] = cache[k][idx];
-            }
+        if off_new > max_delay {
+            let frame: Vec<i64> = (0..n_cb)
+                .map(|k| cache[k][(off_new - max_delay + delay(k)) % ct])
+                .collect();
             frames.push(frame);
         }
     }
 
-    // Assemble the 32 audio codebooks (drop codebook 0 = text), skip warm-up silence
+    // Assemble the audio codebooks (drop codebook 0 = text), skip warm-up silence
     // (leading frames whose acoustic tokens are still zero/ungenerated).
     let start = frames
         .iter()
@@ -349,9 +351,9 @@ pub fn generate(
     if t == 0 {
         return Ok(Vec::new());
     }
-    let mut codes = vec![0u32; DEP_Q * t];
+    let mut codes = vec![0u32; dep_q * t];
     for (ti, f) in valid.iter().enumerate() {
-        for q in 0..DEP_Q {
+        for q in 0..dep_q {
             let v = f[1 + q];
             codes[q * t + ti] = if v < 0 { 0 } else { v as u32 };
         }
@@ -364,6 +366,6 @@ pub fn generate(
             frames.len()
         );
     }
-    let codes_t = Tensor::from_vec_u32(codes, vec![DEP_Q, t])?.to_device(dev)?;
+    let codes_t = Tensor::from_vec_u32(codes, vec![dep_q, t])?.to_device(dev)?;
     mimi.decode(&codes_t)
 }

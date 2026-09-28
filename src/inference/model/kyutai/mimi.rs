@@ -1,32 +1,28 @@
 //! Kyutai `tts-1.6b-en_fr` - Mimi RVQ codec DECODER (component 3 of the TTS port).
 //!
-//! codes `[K=32, T]` (1 semantic + 31 acoustic RVQ, drop the text codebook first)
-//!   -> RVQ dequant -> 512-d latent [512,T]
-//!   -> upsample x2 (depthwise convtr) -> decoder-transformer (8 layers, RoPE + LayerScale)
-//!   -> SEANet decoder (ratios 8.6.5.4 = x960) -> 24 kHz mono waveform.
+//! codes `[K, T]` (1 semantic + the acoustic RVQ codebooks, text codebook dropped first)
+//!   -> RVQ dequant -> latent [C, T]
+//!   -> upsample (depthwise convtr) -> decoder-transformer (RoPE + LayerScale)
+//!   -> SEANet decoder (strided transposed convs) -> 24 kHz mono waveform.
 //!
-//! Structure mirrors `native_pocket_tts`'s Mimi decoder (reuses the tensor-native
-//! conv/attn ops) but for the tts-1.6b checkpoint: DISCRETE RVQ input (vs pocket's
-//! continuous latent), 8 transformer layers, 4 SEANet stages, `self_attn.in_projs.0`
-//! weight names. Codebook = `embedding_sum / max(cluster_usage, eps)` (Mimi EMA).
+//! Every width, codebook count, layer count and stride is read from the tensors the
+//! checkpoint stores. Codebook = `embedding_sum / max(cluster_usage, eps)` (Mimi EMA).
 
 use crate::inference::model::acestep::fsq::rope_tables;
 use crate::inference::model::sdpa::sdpa;
 use crate::tensor::VarBuilder;
-use crate::tensor::{Device, Result, Tensor};
+use crate::tensor::{Device, Error, Result, Tensor};
 
-const CODEC_DIM: usize = 512;
-const VQ_DIM: usize = 256;
-const CODEBOOK: usize = 2048;
-const N_SEMANTIC: usize = 1;
-const N_ACOUSTIC: usize = 31;
-const FFN: usize = 2048;
-const N_HEAD: usize = 8;
-const N_XF: usize = 8;
-const XF_CONTEXT: usize = 250;
+/// Mimi's transformer settings, which its reference code fixes and its checkpoint does not
+/// store: the head count its attention splits the width into, and the positions the
+/// sliding causal window reaches back.
+pub(crate) const ATTENTION_HEADS: usize = 8;
+pub(crate) const ATTENTION_WINDOW: usize = 250;
 const ROPE_THETA: f32 = 10_000.0;
 const LN_EPS: f32 = 1e-5;
 const VQ_EPS: f32 = 1e-5;
+/// Mimi's output sample rate, fixed by the codec.
+pub const SAMPLE_RATE: u32 = 24_000;
 
 // -- shared conv/act helpers (same math as native_pocket_tts) -----------------
 fn add_bias(y: Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
@@ -81,20 +77,28 @@ struct Conv {
     b: Option<Tensor>,
 }
 impl Conv {
-    fn load(vb: &VarBuilder, name: &str, shape: (usize, usize, usize), bias: bool) -> Result<Self> {
-        let w = vb.get(shape, &format!("{name}.weight"))?;
+    /// A conv whose shape is the stored `{name}.weight`, with its bias when `bias`.
+    fn load(vb: &VarBuilder, name: &str, bias: bool) -> Result<Self> {
+        let shape = vb.shape_of(&format!("{name}.weight"))?;
+        let w = vb.get(shape.clone(), &format!("{name}.weight"))?;
         let b = if bias {
-            Some(vb.get(shape.0, &format!("{name}.bias"))?)
+            Some(vb.get(shape[0], &format!("{name}.bias"))?)
         } else {
             None
         };
         Ok(Self { w, b })
     }
-    fn load_tr(vb: &VarBuilder, name: &str, shape: (usize, usize, usize)) -> Result<Self> {
+    /// A transposed conv `[in, out, k]` with its bias over `out`.
+    fn load_tr(vb: &VarBuilder, name: &str) -> Result<Self> {
+        let shape = vb.shape_of(&format!("{name}.weight"))?;
         Ok(Self {
+            b: Some(vb.get(shape[1], &format!("{name}.bias"))?),
             w: vb.get(shape, &format!("{name}.weight"))?,
-            b: Some(vb.get(shape.1, &format!("{name}.bias"))?),
         })
+    }
+    /// The stride of a SEANet resampling conv, whose kernel is twice its stride.
+    fn resampling_stride(&self) -> Result<usize> {
+        Ok(self.w.shape().dims3()?.2 / 2)
     }
 }
 /// SEANet residual block: ELU -> conv(k3) -> ELU -> conv(k1) -> + input.
@@ -103,11 +107,11 @@ struct ResBlock {
     conv2: Conv,
 }
 impl ResBlock {
-    fn load(vb: &VarBuilder, idx: usize, ch: usize, mid: usize) -> Result<Self> {
+    fn load(vb: &VarBuilder, idx: usize) -> Result<Self> {
         let p = format!("{idx}.block");
         Ok(Self {
-            conv1: Conv::load(vb, &format!("{p}.1.conv.conv"), (mid, ch, 3), true)?,
-            conv2: Conv::load(vb, &format!("{p}.3.conv.conv"), (ch, mid, 1), true)?,
+            conv1: Conv::load(vb, &format!("{p}.1.conv.conv"), true)?,
+            conv2: Conv::load(vb, &format!("{p}.3.conv.conv"), true)?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -120,45 +124,51 @@ impl ResBlock {
 }
 
 // -- RVQ dequant (NEW for tts-1.6b) -------------------------------------------
-/// One ResidualVectorQuantizer's decode: Σ_k codebook_k[codes_k] -> output_proj (256->512).
+/// One ResidualVectorQuantizer's decode: Σ_k codebook_k[codes_k] -> output_proj.
 struct Rvq {
-    codebooks: Vec<Tensor>, // each [CODEBOOK, VQ_DIM], EMA-normalized
-    output_proj: Tensor,    // [512, 256, 1] conv1x1
+    codebooks: Vec<Tensor>, // each [entries, vq_dim], EMA-normalized
+    output_proj: Tensor,    // [dim, vq_dim, 1] conv1x1
 }
 impl Rvq {
-    fn load(vb: &VarBuilder, n_cb: usize) -> Result<Self> {
+    fn load(vb: &VarBuilder) -> Result<Self> {
+        let n_cb = vb.count_children("vq.layers");
         let mut codebooks = Vec::with_capacity(n_cb);
         for k in 0..n_cb {
-            let es = vb.get(
-                (CODEBOOK, VQ_DIM),
-                &format!("vq.layers.{k}._codebook.embedding_sum"),
-            )?;
-            let cu = vb.get(CODEBOOK, &format!("vq.layers.{k}._codebook.cluster_usage"))?;
-            // codebook = embedding_sum / max(cluster_usage, eps)  (broadcast over VQ_DIM)
-            let denom = max_scalar(&cu, VQ_EPS)?.reshape((CODEBOOK, 1))?;
+            let sum = format!("vq.layers.{k}._codebook.embedding_sum");
+            let es = vb.get(vb.shape_of(&sum)?, &sum)?;
+            let (entries, _) = es.shape().dims2()?;
+            let cu = vb.get(entries, &format!("vq.layers.{k}._codebook.cluster_usage"))?;
+            // codebook = embedding_sum / max(cluster_usage, eps)  (broadcast over vq_dim)
+            let denom = max_scalar(&cu, VQ_EPS)?.reshape((entries, 1))?;
             codebooks.push(es.broadcast_div(&denom)?);
         }
         Ok(Self {
             codebooks,
-            output_proj: vb.get((CODEC_DIM, VQ_DIM, 1), "output_proj.weight")?,
+            output_proj: vb.get(vb.shape_of("output_proj.weight")?, "output_proj.weight")?,
         })
     }
-    /// `codes`: `[n_cb, T]` (u32 indices) -> `[512, T]`.
+    fn len(&self) -> usize {
+        self.codebooks.len()
+    }
+    /// `codes`: `[n_cb, T]` (u32 indices) -> `[dim, T]`.
     fn decode(&self, codes: &Tensor) -> Result<Tensor> {
         let t = codes.shape().dims2()?.1;
-        // Σ over codebooks of embedding[code]  -> [T, VQ_DIM]
+        // Σ over codebooks of embedding[code]  -> [T, vq_dim]
         let mut acc: Option<Tensor> = None;
         for (k, cb) in self.codebooks.iter().enumerate() {
             let idx = codes.narrow(0, k, 1)?.reshape(t)?; // [T]
-            let e = cb.index_select(&idx, 0)?; // [T, VQ_DIM]
+            let e = cb.index_select(&idx, 0)?; // [T, vq_dim]
             acc = Some(match acc {
                 None => e,
                 Some(a) => a.add(&e)?,
             });
         }
-        let q = acc.unwrap().transpose(0, 1)?.reshape((1, VQ_DIM, t))?; // [1,256,T]
-                                                                        // output_proj is a conv1x1 -> [1,512,T] -> [512,T]
-        causal_conv1d(&q, &self.output_proj, None, 1, 1, 1)?.reshape((CODEC_DIM, t))
+        let acc = acc.ok_or_else(|| Error("mimi: a quantizer with no codebooks".into()))?;
+        let vq_dim = acc.shape().dims2()?.1;
+        let q = acc.transpose(0, 1)?.reshape((1, vq_dim, t))?;
+        // output_proj is a conv1x1 -> [1,dim,T] -> [dim,T]
+        let dim = self.output_proj.shape().dims3()?.0;
+        causal_conv1d(&q, &self.output_proj, None, 1, 1, 1)?.reshape((dim, t))
     }
 }
 
@@ -174,34 +184,39 @@ struct XfLayer {
     linear2: Tensor,
     ls1: Tensor,
     ls2: Tensor,
+    dim: usize,
 }
 impl XfLayer {
     fn load(vb: &VarBuilder, idx: usize) -> Result<Self> {
         let p = vb.pp(format!("layers.{idx}"));
+        let dim = p.shape_of("norm1.weight")?[0];
+        let ffn = p.shape_of("linear1.weight")?[0];
         Ok(Self {
-            norm1_w: p.get(CODEC_DIM, "norm1.weight")?,
-            norm1_b: p.get(CODEC_DIM, "norm1.bias")?,
-            norm2_w: p.get(CODEC_DIM, "norm2.weight")?,
-            norm2_b: p.get(CODEC_DIM, "norm2.bias")?,
-            in_proj: p.get((3 * CODEC_DIM, CODEC_DIM), "self_attn.in_proj_weight")?,
-            out_proj: p.get((CODEC_DIM, CODEC_DIM), "self_attn.out_proj.weight")?,
-            linear1: p.get((FFN, CODEC_DIM), "linear1.weight")?,
-            linear2: p.get((CODEC_DIM, FFN), "linear2.weight")?,
-            ls1: p.get(CODEC_DIM, "layer_scale_1.scale")?,
-            ls2: p.get(CODEC_DIM, "layer_scale_2.scale")?,
+            norm1_w: p.get(dim, "norm1.weight")?,
+            norm1_b: p.get(dim, "norm1.bias")?,
+            norm2_w: p.get(dim, "norm2.weight")?,
+            norm2_b: p.get(dim, "norm2.bias")?,
+            in_proj: p.get((3 * dim, dim), "self_attn.in_proj_weight")?,
+            out_proj: p.get((dim, dim), "self_attn.out_proj.weight")?,
+            linear1: p.get((ffn, dim), "linear1.weight")?,
+            linear2: p.get((dim, ffn), "linear2.weight")?,
+            ls1: p.get(dim, "layer_scale_1.scale")?,
+            ls2: p.get(dim, "layer_scale_2.scale")?,
+            dim,
         })
     }
     /// `x: [S, dim]` - sliding-causal RoPE attention.
     fn forward(&self, x: &Tensor, dev: &Device) -> Result<Tensor> {
+        let dim = self.dim;
         let s = x.shape().dims2()?.0;
-        let hd = CODEC_DIM / N_HEAD;
+        let hd = dim / ATTENTION_HEADS;
         let h = x.layer_norm(&self.norm1_w, Some(&self.norm1_b), LN_EPS)?;
         let qkv = h.matmul_t(&self.in_proj)?;
-        let q = qkv.narrow(1, 0, CODEC_DIM)?;
-        let k = qkv.narrow(1, CODEC_DIM, CODEC_DIM)?;
-        let v = qkv.narrow(1, 2 * CODEC_DIM, CODEC_DIM)?;
+        let q = qkv.narrow(1, 0, dim)?;
+        let k = qkv.narrow(1, dim, dim)?;
+        let v = qkv.narrow(1, 2 * dim, dim)?;
         let shp = |t: &Tensor| -> Result<Tensor> {
-            t.reshape((s, N_HEAD, hd))?
+            t.reshape((s, ATTENTION_HEADS, hd))?
                 .transpose(0, 1)?
                 .unsqueeze(0)?
                 .contiguous()
@@ -213,11 +228,11 @@ impl XfLayer {
         let k = shp(&k)?.rope_i(&cos, &sin)?;
         let v = shp(&v)?;
         let scale = 1.0 / (hd as f32).sqrt();
-        // sliding causal window (ctx 250; for T<250 == full causal)
+        // sliding causal window (a sequence shorter than the window is full causal)
         let mut data = vec![0f32; s * s];
         for i in 0..s {
             for j in 0..s {
-                if j > i || i - j >= XF_CONTEXT {
+                if j > i || i - j >= ATTENTION_WINDOW {
                     data[i * s + j] = f32::NEG_INFINITY;
                 }
             }
@@ -227,58 +242,56 @@ impl XfLayer {
         let att = att
             .transpose(1, 2)?
             .contiguous()?
-            .reshape((s, CODEC_DIM))?
+            .reshape((s, dim))?
             .matmul_t(&self.out_proj)?;
-        let x = x.add(&att.broadcast_mul(&self.ls1.reshape((1, CODEC_DIM))?)?)?;
+        let x = x.add(&att.broadcast_mul(&self.ls1.reshape((1, dim))?)?)?;
         let h = x.layer_norm(&self.norm2_w, Some(&self.norm2_b), LN_EPS)?;
         let h = h
             .matmul_t(&self.linear1)?
             .gelu_erf()?
             .matmul_t(&self.linear2)?;
-        x.add(&h.broadcast_mul(&self.ls2.reshape((1, CODEC_DIM))?)?)
+        x.add(&h.broadcast_mul(&self.ls2.reshape((1, dim))?)?)
     }
 }
 
 /// Full Mimi decoder for tts-1.6b: codes -> 24 kHz waveform.
 pub struct KyutaiMimiDecoder {
-    rvq_first: Rvq,   // 1 semantic codebook
-    rvq_rest: Rvq,    // 31 acoustic codebooks
-    upsample: Tensor, // [512,1,4] depthwise convtr, stride 2
+    rvq_first: Rvq,   // the semantic codebooks
+    rvq_rest: Rvq,    // the acoustic codebooks
+    upsample: Tensor, // [dim,1,k] depthwise convtr
     xf: Vec<XfLayer>,
-    conv_in: Conv,             // model.0  [1024,512,7]
-    up: Vec<(Conv, ResBlock)>, // (convtr, resblock) x 4
-    conv_out: Conv,            // model.14 [1,64,3]
+    conv_in: Conv,
+    up: Vec<(Conv, ResBlock)>, // (convtr, resblock) per SEANet stage
+    conv_out: Conv,
     device: Device,
 }
 impl KyutaiMimiDecoder {
     pub fn from_safetensors(path: &str, device: Device) -> Result<Self> {
         let vb = unsafe { VarBuilder::from_files(&[path], crate::tensor::DType::F32, &device)? };
         let q = vb.pp("quantizer");
-        let rvq_first = Rvq::load(&q.pp("rvq_first"), N_SEMANTIC)?;
-        let rvq_rest = Rvq::load(&q.pp("rvq_rest"), N_ACOUSTIC)?;
-        let upsample = vb.get((CODEC_DIM, 1, 4), "upsample.convtr.convtr.convtr.weight")?;
+        let rvq_first = Rvq::load(&q.pp("rvq_first"))?;
+        let rvq_rest = Rvq::load(&q.pp("rvq_rest"))?;
+        let up_name = "upsample.convtr.convtr.convtr.weight";
+        let upsample = vb.get(vb.shape_of(up_name)?, up_name)?;
         let xt = vb.pp("decoder_transformer.transformer");
-        let mut xf = Vec::with_capacity(N_XF);
-        for i in 0..N_XF {
-            xf.push(XfLayer::load(&xt, i)?);
-        }
+        let xf = (0..xt.count_children("layers"))
+            .map(|i| XfLayer::load(&xt, i))
+            .collect::<Result<Vec<_>>>()?;
+        // SEANet decoder: `model.0` is the input conv, then each stage is an ELU, a
+        // transposed conv and a residual block (three entries), and the output conv
+        // follows the last stage's ELU.
         let dec = vb.pp("decoder.model");
-        let conv_in = Conv::load(&dec, "0.conv.conv", (1024, 512, 7), true)?;
-        // (convtr (in,out,k), stride, convtr_idx, resblock_idx, (ch,mid))
-        let stages: [((usize, usize, usize), usize, usize, usize, (usize, usize)); 4] = [
-            ((1024, 512, 16), 8, 2, 3, (512, 256)),
-            ((512, 256, 12), 6, 5, 6, (256, 128)),
-            ((256, 128, 10), 5, 8, 9, (128, 64)),
-            ((128, 64, 8), 4, 11, 12, (64, 32)),
-        ];
-        let mut up = Vec::with_capacity(4);
-        for (shape, _stride, ctr_idx, rb_idx, (ch, mid)) in stages {
+        let conv_in = Conv::load(&dec, "0.conv.conv", true)?;
+        let mut up = Vec::new();
+        let mut idx = 2;
+        while dec.contains(&format!("{idx}.convtr.convtr.weight")) {
             up.push((
-                Conv::load_tr(&dec, &format!("{ctr_idx}.convtr.convtr"), shape)?,
-                ResBlock::load(&dec, rb_idx, ch, mid)?,
+                Conv::load_tr(&dec, &format!("{idx}.convtr.convtr"))?,
+                ResBlock::load(&dec, idx + 1)?,
             ));
+            idx += 3;
         }
-        let conv_out = Conv::load(&dec, "14.conv.conv", (1, 64, 3), true)?;
+        let conv_out = Conv::load(&dec, &format!("{idx}.conv.conv"), true)?;
         Ok(Self {
             rvq_first,
             rvq_rest,
@@ -291,133 +304,53 @@ impl KyutaiMimiDecoder {
         })
     }
 
-    /// RVQ dequant only (for parity vs mimi_latent): `codes [32,T]` -> `[512,T]`.
+    /// Audio samples one code frame decodes to: the product of every upsampling stride.
+    pub fn frame_samples(&self) -> Result<usize> {
+        let mut n = self.upsample.shape().dims3()?.2 / 2;
+        for (convtr, _) in &self.up {
+            n *= convtr.resampling_stride()?;
+        }
+        Ok(n)
+    }
+
+    /// RVQ dequant only (for parity vs mimi_latent): `codes [K,T]` -> `[dim,T]`.
     pub fn decode_latent(&self, codes: &Tensor) -> Result<Tensor> {
         let t = codes.shape().dims2()?.1;
-        let sem = self.rvq_first.decode(&codes.narrow(0, 0, N_SEMANTIC)?)?;
+        let n_first = self.rvq_first.len();
+        let sem = self.rvq_first.decode(&codes.narrow(0, 0, n_first)?)?;
         let rest = self
             .rvq_rest
-            .decode(&codes.narrow(0, N_SEMANTIC, N_ACOUSTIC)?)?;
+            .decode(&codes.narrow(0, n_first, self.rvq_rest.len())?)?;
         debug_assert_eq!(t, sem.shape().dims2()?.1);
         sem.add(&rest)
     }
 
-    /// Full decode: `codes [32,T]` (u32) -> 24 kHz mono waveform `Vec<f32>`.
+    /// Full decode: `codes [K,T]` (u32) -> 24 kHz mono waveform `Vec<f32>`.
     pub fn decode(&self, codes: &Tensor) -> Result<Vec<f32>> {
-        let latent = self.decode_latent(codes)?; // [512,T]
-        let t = latent.shape().dims2()?.1;
-        let emb = latent.reshape((1, CODEC_DIM, t))?;
-        // upsample x2 (depthwise convtr)
-        let x = causal_convtr1d(&emb, &self.upsample, None, 2, CODEC_DIM)?; // [1,512,2T]
+        let latent = self.decode_latent(codes)?; // [dim,T]
+        let (dim, t) = latent.shape().dims2()?;
+        let emb = latent.reshape((1, dim, t))?;
+        // upsample (depthwise convtr)
+        let up_stride = self.upsample.shape().dims3()?.2 / 2;
+        let x = causal_convtr1d(&emb, &self.upsample, None, up_stride, dim)?;
         let s = x.shape().dims3()?.2;
-        // decoder transformer at 2T framerate
-        let mut h = x.reshape((CODEC_DIM, s))?.transpose(0, 1)?.contiguous()?; // [S,512]
+        // decoder transformer at the upsampled frame rate
+        let mut h = x.reshape((dim, s))?.transpose(0, 1)?.contiguous()?; // [S,dim]
         for l in &self.xf {
             h = l.forward(&h, &self.device)?;
         }
-        let mut y = h
-            .transpose(0, 1)?
-            .reshape((1, CODEC_DIM, s))?
-            .contiguous()?; // [1,512,S]
-                            // SEANet decoder: conv_in -> 4x(ELU->convtr->resblock) -> ELU -> conv_out
+        let mut y = h.transpose(0, 1)?.reshape((1, dim, s))?.contiguous()?; // [1,dim,S]
+                                                                            // SEANet decoder: conv_in -> per stage (ELU->convtr->resblock) -> ELU -> conv_out
         y = causal_conv1d(&y, &self.conv_in.w, self.conv_in.b.as_ref(), 1, 1, 1)?;
-        let strides = [8usize, 6, 5, 4];
-        for ((convtr, res), &stride) in self.up.iter().zip(strides.iter()) {
+        for (convtr, res) in &self.up {
             y = elu(&y)?;
+            let stride = convtr.resampling_stride()?;
             y = causal_convtr1d(&y, &convtr.w, convtr.b.as_ref(), stride, 1)?;
             y = res.forward(&y)?;
         }
         y = elu(&y)?;
         y = causal_conv1d(&y, &self.conv_out.w, self.conv_out.b.as_ref(), 1, 1, 1)?;
         y.flatten_all()?.to_vec1_f32()
-    }
-}
-
-/// Full Mimi ENCODER for tts-1.6b: 24 kHz waveform -> unquantized 512-d latent `[512,T]`
-/// at 12.5 Hz - the `speaker_wavs` voice conditioning. Mirror of the decoder: SEANet
-/// encoder (strides 4.5.6.8 = x960 -> 25 Hz) -> encoder-transformer (8 layers) -> causal
-/// downsample conv (÷2 -> 12.5 Hz). No RVQ (the conditioning is the continuous latent).
-pub struct KyutaiMimiEncoder {
-    conv_in: Conv,               // model.0  [64,1,7]
-    down: Vec<(ResBlock, Conv)>, // (resblock, strided conv) x 4
-    conv_out: Conv,              // model.14 [512,1024,3]
-    xf: Vec<XfLayer>,
-    downsample: Tensor, // [512,512,4] causal conv, stride 2
-    device: Device,
-}
-impl KyutaiMimiEncoder {
-    pub fn from_safetensors(path: &str, device: Device) -> Result<Self> {
-        let vb = unsafe { VarBuilder::from_files(&[path], crate::tensor::DType::F32, &device)? };
-        let enc = vb.pp("encoder.model");
-        let conv_in = Conv::load(&enc, "0.conv.conv", (64, 1, 7), true)?;
-        // (resblock_idx, (ch, mid), conv_idx, conv_shape (out,in,k), stride)
-        let stages: [(usize, (usize, usize), usize, (usize, usize, usize), usize); 4] = [
-            (1, (64, 32), 3, (128, 64, 8), 4),
-            (4, (128, 64), 6, (256, 128, 10), 5),
-            (7, (256, 128), 9, (512, 256, 12), 6),
-            (10, (512, 256), 12, (1024, 512, 16), 8),
-        ];
-        let mut down = Vec::with_capacity(4);
-        for (rb_idx, (ch, mid), cv_idx, shape, _stride) in stages {
-            down.push((
-                ResBlock::load(&enc, rb_idx, ch, mid)?,
-                Conv::load(&enc, &format!("{cv_idx}.conv.conv"), shape, true)?,
-            ));
-        }
-        let conv_out = Conv::load(&enc, "14.conv.conv", (512, 1024, 3), true)?;
-        let xt = vb.pp("encoder_transformer.transformer");
-        let mut xf = Vec::with_capacity(N_XF);
-        for i in 0..N_XF {
-            xf.push(XfLayer::load(&xt, i)?);
-        }
-        let downsample = vb.get(
-            (CODEC_DIM, CODEC_DIM, 4),
-            "downsample.conv.conv.conv.weight",
-        )?;
-        Ok(Self {
-            conv_in,
-            down,
-            conv_out,
-            xf,
-            downsample,
-            device,
-        })
-    }
-
-    /// `wav`: mono 24 kHz samples (host `Vec<f32>`), length ideally a multiple of 1920
-    /// (frame_size); it is right-padded to a multiple otherwise. Returns `[512, T]`.
-    pub fn encode(&self, wav: &[f32]) -> Result<Tensor> {
-        const FRAME: usize = 1920;
-        let mut samples = wav.to_vec();
-        if !samples.len().is_multiple_of(FRAME) {
-            samples.resize(samples.len().div_ceil(FRAME) * FRAME, 0.0);
-        }
-        let l = samples.len();
-        let mut y = Tensor::from_vec_f32(samples, (1, 1, l))?.to_device(&self.device)?;
-        // SEANet encoder
-        y = causal_conv1d(&y, &self.conv_in.w, self.conv_in.b.as_ref(), 1, 1, 1)?;
-        let strides = [4usize, 5, 6, 8];
-        for ((res, conv), &stride) in self.down.iter().zip(strides.iter()) {
-            y = res.forward(&y)?;
-            y = elu(&y)?;
-            y = causal_conv1d(&y, &conv.w, conv.b.as_ref(), stride, 1, 1)?;
-        }
-        y = elu(&y)?;
-        y = causal_conv1d(&y, &self.conv_out.w, self.conv_out.b.as_ref(), 1, 1, 1)?; // [1,512,T25]
-                                                                                     // encoder transformer at 25 Hz
-        let s = y.shape().dims3()?.2;
-        let mut h = y.reshape((CODEC_DIM, s))?.transpose(0, 1)?.contiguous()?; // [S,512]
-        for lyr in &self.xf {
-            h = lyr.forward(&h, &self.device)?;
-        }
-        y = h
-            .transpose(0, 1)?
-            .reshape((1, CODEC_DIM, s))?
-            .contiguous()?; // [1,512,S]
-                            // downsample ÷2 (causal conv, stride 2) -> 12.5 Hz
-        y = causal_conv1d(&y, &self.downsample, None, 2, 1, 1)?;
-        let t = y.shape().dims3()?.2;
-        y.reshape((CODEC_DIM, t))
     }
 }
 
