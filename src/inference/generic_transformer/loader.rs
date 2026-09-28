@@ -1561,8 +1561,6 @@ impl GenericHeteroTransformer {
                     )
                 }
             };
-        // Dequantize before wrapping (needed for CUDA path later)
-        let output_weight_f32 = output_qt.dequantize(&Device::Cpu)?;
         let output_proj = crate::tensor::quantized::QMatMul::from_qtensor(output_qt)?;
         info!("✅ Loaded output norm and projection on CPU");
 
@@ -2446,10 +2444,8 @@ impl GenericHeteroTransformer {
 
         let sliding_window = config.sliding_window;
 
-        // Dequantize output projection to GPU (F16) whenever CUDA is available.
-        // Even for split models, the output proj (~256MB F16) fits in GPU memory
-        // and avoids the expensive CPU matmul (32K x 4096).
-        // Use the last CUDA device (handles final layers, closest to output).
+        // The output projection goes to a card, in its stored format, whenever one has room:
+        // the host matmul over the whole vocabulary is the slowest step of a token.
         let last_cuda_idx = layer_devs.iter().rev().find_map(|d| {
             if let LayerDevice::Cuda(idx) = d {
                 Some(*idx)
@@ -2477,7 +2473,7 @@ impl GenericHeteroTransformer {
         others.sort();
         cand_idxs.extend(others);
 
-        let mut output_proj_cuda: Option<Tensor> = None;
+        let output_proj_cuda: Option<Tensor> = None;
         let mut output_norm_cuda_weight: Option<Tensor> = None;
         let mut output_proj_cuda_qmm: Option<crate::tensor::quantized::QMatMul> = None;
         let mut output_proj_dev: Option<Device> = None;
@@ -2486,10 +2482,8 @@ impl GenericHeteroTransformer {
                 Some(d) => d,
                 None => continue,
             };
-            // The QUANTIZED projection is both smaller (~quant size vs a 1.3 GB
-            // F16 dequant) and the FASTER decode path (mul_mat_vec_q* emits F32
-            // directly, ~650 µs/tok win on qwen3). Try it; skip the OOM-prone
-            // F16 dequant unless this is the primary GPU (graph mode needs F16).
+            // The projection stays in its stored format: every card path, the captured
+            // decode included, runs it as a quantised matmul.
             let norm_w = match norm_weight_cpu.to_device(cuda_dev) {
                 Ok(w) => w,
                 Err(_) => continue,
@@ -2540,14 +2534,6 @@ impl GenericHeteroTransformer {
                     }
                 }
             }
-            let f16 = if ci == 0 {
-                output_weight_f32
-                    .to_dtype(crate::tensor::DType::F16)
-                    .and_then(|t| t.to_device(cuda_dev))
-                    .ok()
-            } else {
-                None
-            };
             info!(
                 "  Output projection on CUDA:{idx} as QMatMul ({:.0}ms){}",
                 t_q.elapsed().as_secs_f64() * 1000.0,
@@ -2557,7 +2543,6 @@ impl GenericHeteroTransformer {
                     ""
                 }
             );
-            output_proj_cuda = f16;
             output_norm_cuda_weight = Some(norm_w);
             output_proj_cuda_qmm = qmm;
             output_proj_dev = Some(cuda_dev.clone());
@@ -2755,7 +2740,7 @@ impl GenericHeteroTransformer {
                 }
             });
         }
-        Ok(model.release_graph_only_lm_head())
+        Ok(model)
     }
 
     /// Build a `GenericHeteroTransformer` from an HF AutoAWQ checkpoint.

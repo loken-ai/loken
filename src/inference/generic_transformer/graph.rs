@@ -157,27 +157,6 @@ impl GenericHeteroTransformer {
 
     /// Drop the F16 lm_head when nothing can use it.
     ///
-    /// The loader materializes the output projection twice on the primary card:
-    /// the quantized `QMatMul` that decode prefers, and an F16 dequant of the
-    /// same weight. Only `forward_graph` requires the F16 form - every other
-    /// reader falls back to the quantized one - so when capture is refused the
-    /// F16 copy is resident for a path that never runs, and a wide vocabulary
-    /// makes that over a gigabyte of the card that decides whether the model
-    /// fits without being split.
-    ///
-    /// The refusal is read from `graph_capture_decision`, never re-derived: a
-    /// second copy of that rule would drift from the first and silently free a
-    /// weight the graph path still needs.
-    pub(crate) fn release_graph_only_lm_head(mut self) -> Self {
-        if self.output_proj_cuda.is_some()
-            && self.output_proj_cuda_qmm.is_some()
-            && self.graph_capture_decision().is_err()
-        {
-            self.output_proj_cuda = None;
-        }
-        self
-    }
-
     /// Whether decode captures a CUDA graph, and when it does not, WHY.
     ///
     /// "no capture" and "capture that logs nothing" used to be indistinguishable from the
@@ -1006,79 +985,6 @@ impl GenericHeteroTransformer {
         }
 
         Ok(())
-    }
-
-    /// Graph-compatible decode forward for CUDA graph capture/replay.
-    ///
-    /// Single-token (seq_len == 1), single-CUDA-device model only. Caller
-    /// must have invoked `update_graph_state(pos)` immediately prior.
-    ///
-    /// Returns logits at the captured output buffer. On replay this is
-    /// stored at a stable device pointer (the captured output of the last
-    /// op), so the engine can sample from it after `graph.launch()`.
-    pub fn forward_graph(&mut self, input_ids: &Tensor) -> Result<Tensor> {
-        let (_, seq_len) = input_ids.dims2()?;
-        debug_assert_eq!(seq_len, 1, "forward_graph is decode-only");
-
-        // Embedding lookup on the table's device (CPU today, Path A may
-        // move small tables to GPU). The result lands on the same device;
-        // a subsequent .to_device() places it on the layer-0 GPU.
-        let emb_device = self.embeddings.embeddings().device().clone();
-        let input_local;
-        let input_ids = if input_ids.device().same_device(&emb_device) {
-            input_ids
-        } else {
-            input_local = input_ids.to_device(&emb_device)?;
-            &input_local
-        };
-        let hidden_cpu = self.embeddings.forward(input_ids)?;
-        let hidden_cpu = if let Some(scale) = self.config.embed_scale {
-            (hidden_cpu * scale)?
-        } else {
-            hidden_cpu
-        };
-
-        // All layers live on one CUDA device in graph mode.
-        let target_dev = self
-            .cuda_devices
-            .values()
-            .next()
-            .ok_or_else(|| crate::tensor::Error::msg("forward_graph requires a CUDA device"))?
-            .clone();
-        let mut hidden = hidden_cpu.to_device(&target_dev)?;
-
-        // See the timer in the eager decode loop: this measures issuing the layer,
-        // which is what tells a dispatching layer from one running on the host.
-        // Layer-by-layer graph-compatible path.
-        for (li, layer) in self.layers.iter_mut().enumerate() {
-            let _timer = crate::inference::place::layer_perf::LayerTimer::start(li);
-            hidden = layer.forward_graph(&hidden)?;
-        }
-
-        // Final norm + output projection on CUDA (fast path only - no CPU
-        // fallback for graph mode; the engine rejects before capture if
-        // output_proj_cuda is absent).
-        let norm_w = self.output_norm_cuda_weight.as_ref().ok_or_else(|| {
-            crate::tensor::Error::msg("forward_graph needs output_norm_cuda_weight")
-        })?;
-        let proj = self
-            .output_proj_cuda
-            .as_ref()
-            .ok_or_else(|| crate::tensor::Error::msg("forward_graph needs output_proj_cuda"))?;
-        let last = hidden.i((.., 0, ..))?;
-        let last_f32 = last.to_dtype(crate::tensor::DType::F32)?;
-        let normed =
-            crate::tensor::ops::rms_norm(&last_f32, norm_w, self.config.rms_norm_eps as f32)?;
-        let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
-        let mut logits = normed_f16.matmul_t(proj)?;
-        logits = logits.to_dtype(crate::tensor::DType::F32)?;
-        if let Some(scale) = self.config.logit_scale {
-            logits = (logits / scale)?;
-        }
-        match self.config.final_logit_softcapping {
-            Some(cap) => (logits / cap)?.tanh()? * cap,
-            None => Ok(logits),
-        }
     }
 
     /// Compute the token embedding and write it into graph_hidden_buffer at
