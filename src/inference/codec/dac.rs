@@ -247,27 +247,30 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// `channels` is the width the head hands to the first block; every block after that trades
-    /// half of it for the length its stride buys, and the tail runs at whatever is left.
-    pub fn new(
-        in_c: usize,
-        channels: usize,
-        rates: &[usize],
-        d_out: usize,
-        vb: VarBuilder,
-    ) -> Result<Self> {
-        // Halving `n` times is a shift by `n`, so a block's two widths are a function of where
-        // it sits rather than of a counter walked alongside the loop.
-        let width = |depth: usize| channels >> depth;
-        let n = rates.len();
-        let tail = width(n);
+    /// The decoder under `vb`, shaped by its stored weights: `model.0` is the head conv, the
+    /// numbered layers after it that hold a `block` are the upsampling blocks, each widening
+    /// the signal by its transposed conv's stride (half its kernel), and a snake and the output
+    /// conv follow them.
+    pub fn new(in_c: usize, vb: VarBuilder) -> Result<Self> {
         let model = vb.pp("model");
-        let conv1 = conv1d_weight_norm(in_c, width(0), 7, same_length_1d(7, 1), model.pp(0))?;
-        let blocks = rates
-            .iter()
-            .enumerate()
-            .map(|(d, &stride)| DecoderBlock::new(width(d), width(d + 1), stride, model.pp(d + 1)))
+        let stored = |layer: usize, name: &str| model.pp(layer).shape_of(name);
+        let head_width = stored(0, "weight_v")?[0];
+        let conv1 = conv1d_weight_norm(in_c, head_width, 7, same_length_1d(7, 1), model.pp(0))?;
+        let n = (1..)
+            .take_while(|&d| model.pp(d).pp("block").contains("1.weight_v"))
+            .count();
+        let blocks = (1..=n)
+            .map(|d| {
+                let [in_dim, out_dim, kernel] = model.pp(d).pp("block").shape_of("1.weight_v")?[..]
+                else {
+                    return Err(crate::tensor::Error::msg("dac: a block conv is not 3-D"));
+                };
+                DecoderBlock::new(in_dim, out_dim, kernel / 2, model.pp(d))
+            })
             .collect::<Result<Vec<_>>>()?;
+        let [d_out, tail, _] = stored(n + 2, "weight_v")?[..] else {
+            return Err(crate::tensor::Error::msg("dac: the output conv is not 3-D"));
+        };
         let snake1 = Snake1d::new(tail, model.pp(n + 1))?;
         let conv2 = conv1d_weight_norm(tail, d_out, 7, same_length_1d(7, 1), model.pp(n + 2))?;
         Ok(Self {
@@ -317,10 +320,11 @@ pub struct ResidualVectorQuantizer {
 
 impl ResidualVectorQuantizer {
     /// The codebooks the configuration names, in the order they are applied: each one codes the
-    /// part of the signal the ones before it left behind, and `cb_dim` is how wide an entry is
-    /// before `out_proj` takes it back up to the latent.
-    pub fn new(cfg: &Config, cb_dim: usize, vb: VarBuilder) -> Result<Self> {
+    /// part of the signal the ones before it left behind. An entry's width, which the
+    /// configuration does not state, is the stored codebook's.
+    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let vb = vb.pp("quantizers");
+        let cb_dim = vb.pp(0).pp("codebook").shape_of("weight")?[1];
         let mut quantizers = Vec::with_capacity(cfg.num_codebooks);
         for i in 0..cfg.num_codebooks {
             let q = VectorQuantizer::new(cfg.latent_dim, cfg.codebook_size, cb_dim, vb.pp(i))?;
@@ -356,31 +360,11 @@ pub struct Model {
     device: Device,
 }
 
-/// How wide one codebook entry is. The configuration says how many codebooks and how many
-/// entries each holds, but not this: it is fixed by the checkpoint's own shape.
-const CODEBOOK_DIM: usize = 8;
-
-/// What the decoder's head hands to its first block.
-const DECODER_WIDTH: usize = 1536;
-
-/// What each block lengthens the signal by. Together they take 1536 channels down to 96 and the
-/// frame rate up 512-fold, which is the codec's compression written as four steps.
-const DECODER_RATES: [usize; 4] = [8, 8, 4, 2];
-
-/// One waveform out.
-const AUDIO_CHANNELS: usize = 1;
-
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let device = vb.device().clone();
-        let quantizer = ResidualVectorQuantizer::new(cfg, CODEBOOK_DIM, vb.pp("quantizer"))?;
-        let decoder = Decoder::new(
-            cfg.latent_dim,
-            DECODER_WIDTH,
-            &DECODER_RATES,
-            AUDIO_CHANNELS,
-            vb.pp("decoder"),
-        )?;
+        let quantizer = ResidualVectorQuantizer::new(cfg, vb.pp("quantizer"))?;
+        let decoder = Decoder::new(cfg.latent_dim, vb.pp("decoder"))?;
         Ok(Self {
             quantizer,
             decoder,
