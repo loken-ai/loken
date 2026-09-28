@@ -253,6 +253,7 @@ impl APIServer {
         keep_alive_minutes: i64,
     ) -> JoinHandle<()> {
         let engines = self.engines.clone();
+        let server = self.clone();
 
         tokio::spawn(async move {
             // Calculate duration - if keep_alive is -1 (forever), don't schedule
@@ -288,7 +289,76 @@ impl APIServer {
                     info!("Model {} unloaded after keep_alive expired", entry.model_id);
                 }
             }
+            drop(engines_guard);
+            server.migrate_idle_models().await;
         })
+    }
+
+    /// Reloads idle language models onto a card that now serves them faster: the memory an
+    /// expired or unloaded model gave back can hold a resident that went to a slower card, or
+    /// to several, or partly to the host, because that card was full when it loaded. One pass
+    /// at a time; a model serving a request is never moved, and one that gets a request while
+    /// it reloads waits for the load like any cold request.
+    pub(crate) async fn migrate_idle_models(&self) {
+        static MIGRATING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let Ok(_one_pass) = MIGRATING.try_lock() else {
+            return;
+        };
+        loop {
+            let cards: Vec<crate::inference::place::CardRoom> =
+                crate::inference::place::device_probe::probe_cuda_gpus()
+                    .iter()
+                    .map(|g| crate::inference::place::CardRoom {
+                        index: g.index,
+                        perf: g.perf_score,
+                        available: g.available,
+                    })
+                    .collect();
+            let idle: Vec<(String, Arc<LlmEngine>, i64)> = {
+                let engines = self.engines.read().await;
+                engines
+                    .iter()
+                    .filter(|e| e.engine.in_flight() == 0)
+                    .map(|e| {
+                        (
+                            e.model_id.clone(),
+                            e.engine.clone(),
+                            e.keep_alive_minutes.unwrap_or(self.default_keep_alive),
+                        )
+                    })
+                    .collect()
+            };
+            let mut moved = false;
+            for (model_id, engine, keep_alive) in idle {
+                let Some(placement) = engine.placement().await else {
+                    continue;
+                };
+                let config = self.config_for_model(&model_id);
+                let need = self.model_blob_size(&model_id, &config)
+                    + self.model_load_reserve(&model_id, &config);
+                let Some(target) = placement.better_card(&cards, need) else {
+                    continue;
+                };
+                if engine.in_flight() > 0 {
+                    continue;
+                }
+                info!(
+                    "⚖️  Moving idle model {model_id} to card {target} (now on cards {:?}, {} \
+                     layers on the host)",
+                    placement.cards, placement.host_layers
+                );
+                drop(engine);
+                let _ = self.unload_model(&model_id).await;
+                if let Err(e) = self.ensure_loaded(&model_id, keep_alive).await {
+                    warn!("⚖️  {model_id} could not be reloaded after its move: {e}");
+                }
+                moved = true;
+                break;
+            }
+            if !moved {
+                return;
+            }
+        }
     }
 
     /// Reset model expiration timer (called on each use, like Ollama).

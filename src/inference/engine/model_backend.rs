@@ -454,6 +454,11 @@ pub(crate) trait ModelBackend: Send {
         None
     }
 
+    /// Where the model's layers run, when the backend can say.
+    fn placement(&self) -> Option<crate::inference::place::Placement> {
+        None
+    }
+
     // --- Exact-prompt state snapshot (recurrent-hybrid prefix reuse) -----
     //
     // `trim_kv` reuse assumes the state can return to an arbitrary token
@@ -1176,6 +1181,10 @@ impl ModelBackend for GenericBackend {
         self.0.kv_len()
     }
 
+    fn placement(&self) -> Option<crate::inference::place::Placement> {
+        Some(self.0.placement())
+    }
+
     fn shift_kv_tail(&mut self, from: usize, discard: usize) -> crate::tensor::Result<()> {
         self.0.shift_kv_tail(from, discard)
     }
@@ -1345,6 +1354,10 @@ impl ModelBackend for GenericBackend {
 impl ModelBackend for GenericVisionBackend {
     fn kv_capacity(&self) -> Option<usize> {
         Some(self.text.kv_capacity())
+    }
+
+    fn placement(&self) -> Option<crate::inference::place::Placement> {
+        Some(self.text.placement())
     }
 
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {

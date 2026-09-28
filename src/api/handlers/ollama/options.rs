@@ -210,6 +210,9 @@ pub(crate) async fn ollama_chat(
             // UNLOAD. The outcome is REPORTED, not assumed: answering "unload" whatever
             // happened makes a name nothing recognised read as freed VRAM.
             let outcome = state.unload_model(&model_name).await?;
+            // The freed memory may now serve a resident faster; the answer does not wait for it.
+            let server = state.clone();
+            tokio::spawn(async move { server.migrate_idle_models().await });
             let mut response = OllamaChatResponse::new(
                 model_name,
                 Message::new("assistant".to_string(), String::new()),
@@ -855,6 +858,9 @@ pub(crate) async fn ollama_generate(
             // nothing to free - but it is not an unload either, and a failure to unload
             // one that IS loaded must say so.
             let outcome = state.unload_model(&model_name).await?;
+            // The freed memory may now serve a resident faster; the answer does not wait for it.
+            let server = state.clone();
+            tokio::spawn(async move { server.migrate_idle_models().await });
             let mut response = OllamaGenerateResponse::new(model_name, String::new());
             response.done = true;
             response.done_reason = Some(outcome.done_reason().to_string());

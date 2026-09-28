@@ -1060,6 +1060,22 @@ impl GenericHeteroTransformer {
     /// `pos` by a constant does not work either: the lag is one after an
     /// ordinary step and zero after a speculative verify has already
     /// resynchronised. So callers that need a POSITION ask the cache.
+    /// The cards holding this model's layers, fastest-first order not implied, and how many
+    /// layers run on the host.
+    pub fn placement(&self) -> crate::inference::place::Placement {
+        let mut cards = std::collections::BTreeSet::new();
+        let mut host_layers = 0;
+        for d in &self.layer_devs {
+            match d {
+                LayerDevice::Cuda(i) => {
+                    cards.insert(*i);
+                }
+                LayerDevice::Cpu => host_layers += 1,
+            }
+        }
+        crate::inference::place::Placement { cards, host_layers }
+    }
+
     pub fn kv_len(&self) -> Option<usize> {
         let l = self.layers.first()?;
         let mut n = l.kv_cache.current_seq_len();

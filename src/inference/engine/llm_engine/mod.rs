@@ -786,6 +786,13 @@ impl LlmEngine {
         result.map_err(std::convert::Into::into)
     }
 
+    /// Where the loaded model's layers run, `None` with no model loaded or when its backend
+    /// cannot say.
+    pub async fn placement(&self) -> Option<crate::inference::place::Placement> {
+        let guard = self.model_state.lock().await;
+        guard.as_ref()?.model.placement()
+    }
+
     /// The context the loaded model is served with, `None` with no model loaded.
     pub async fn context_window(&self) -> Option<usize> {
         let guard = self.model_state.lock().await;
