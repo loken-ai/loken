@@ -129,14 +129,16 @@ struct ReqState {
 pub struct ContinuousBatchEngine<M: BatchedModel> {
     sched: Scheduler,
     model: M,
-    eos: u32,
+    /// The tokens that end a sequence: the model's end of text and its other end-of-turn
+    /// tokens.
+    eos: Vec<u32>,
     reqs: HashMap<SeqId, ReqState>,
 }
 
 impl<M: BatchedModel> ContinuousBatchEngine<M> {
     pub fn new(
         model: M,
-        eos: u32,
+        eos: Vec<u32>,
         num_blocks: usize,
         block_size: usize,
         max_running: usize,
@@ -266,7 +268,7 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
         for (it, &tok) in items.iter().zip(sampled.iter()) {
             self.reqs.get_mut(&it.seq).unwrap().generated.push(tok);
             emits.push((it.seq, tok));
-            results.push((it.seq, tok == self.eos));
+            results.push((it.seq, self.eos.contains(&tok)));
         }
         let finished = self.sched.on_step_done(&results);
 
@@ -337,7 +339,7 @@ mod tests {
             stop_after: stop,
             seen_prefill: Default::default(),
         };
-        ContinuousBatchEngine::new(m, 0, num_blocks, 16, 8, 4096).unwrap()
+        ContinuousBatchEngine::new(m, vec![0], num_blocks, 16, 8, 4096).unwrap()
     }
 
     #[test]

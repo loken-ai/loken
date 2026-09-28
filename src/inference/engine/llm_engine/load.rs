@@ -566,7 +566,7 @@ pub(super) fn sniff_projector_type(path: &std::path::Path) -> Option<String> {
 #[cfg(feature = "cuda")]
 pub(super) fn try_spawn_continuous(
     model: GenericHeteroTransformer,
-    eos: u32,
+    eos: Vec<u32>,
     context_length: usize,
 ) -> std::result::Result<
     crate::inference::serve::continuous_serve::ContinuousServer,
@@ -666,7 +666,9 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
                 return false;
             }
         };
-        let (model, batched): (BoxedModelBackend, bool) = match try_spawn_continuous(m, eos, ctx) {
+        let mut ends = state.eos_token_ids_extra.clone();
+        ends.push(eos);
+        let (model, batched): (BoxedModelBackend, bool) = match try_spawn_continuous(m, ends, ctx) {
             Ok(s) => (Box::new(ContinuousBackend(std::sync::Arc::new(s))), true),
             Err(m) => (Box::new(GenericBackend(m)), false),
         };

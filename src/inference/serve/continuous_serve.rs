@@ -791,7 +791,7 @@ impl ContinuousServer {
     /// pool; `max_running` caps the concurrent decode batch width.
     pub fn spawn(
         model: Arc<GenericHeteroTransformer>,
-        eos: u32,
+        eos: Vec<u32>,
         num_blocks: usize,
         block_size: usize,
         max_running: usize,
@@ -927,7 +927,7 @@ impl BatchedServer for ContinuousServer {
 
 fn worker_loop(
     model: GhBatched,
-    eos: u32,
+    eos: Vec<u32>,
     num_blocks: usize,
     block_size: usize,
     max_running: usize,
@@ -936,7 +936,7 @@ fn worker_loop(
 ) {
     let mut engine = match ContinuousBatchEngine::new(
         model,
-        eos,
+        eos.clone(),
         num_blocks,
         block_size,
         max_running,
@@ -1029,7 +1029,7 @@ fn worker_loop(
         for (id, tok) in emits {
             if let Some(tx) = chans.get(&id) {
                 // Suppress the terminal EOS as a content token; Done carries it.
-                if tok != eos {
+                if !eos.contains(&tok) {
                     let _ = tx.send(CbToken::Tok(tok));
                 }
             }

@@ -320,6 +320,7 @@ impl LlmEngine {
                 mut next_token,
                 mut pos,
                 eos_token_id,
+                eos_extra,
                 resolved,
                 device_clone,
                 mut logits_processor,
@@ -921,6 +922,7 @@ impl LlmEngine {
                     next_token,
                     pos,
                     state.eos_token_id,
+                    state.eos_token_ids_extra.clone(),
                     resolved,
                     // Moved, not cloned: nothing above reads it again, and a device handle
                     // carries the context and the stream along with it.
@@ -1143,7 +1145,11 @@ impl LlmEngine {
             // (PLD verify/draft, temperature > 0 sampling).
             let mut next_token_dev: Option<Tensor> = None;
 
-            'stream_loop: while next_token != eos_token_id && token_count < max_tokens {
+            // Every token the model ends a turn with stops the stream, as it stops the whole
+            // answer: the extra ones are control tokens a decode drops, so no text stop sees
+            // them.
+            let ends = |t: u32| t == eos_token_id || eos_extra.contains(&t);
+            'stream_loop: while !ends(next_token) && token_count < max_tokens {
                 if !logprob_buf.is_empty() {
                     if let Ok(mut q) = logprob_queue.lock() {
                         q.append(&mut logprob_buf);
@@ -1415,7 +1421,7 @@ impl LlmEngine {
                         // avoids O(N²) cumulative decode for moondream's
                         // PLD-heavy vision path).
                         for &tok in &accepted_tokens {
-                            if tok == eos_token_id || token_count >= max_tokens {
+                            if ends(tok) || token_count >= max_tokens {
                                 break 'stream_loop;
                             }
                             generated_token_ids.push(tok);
@@ -1908,7 +1914,7 @@ impl LlmEngine {
                                     &mut pld_cache,
                                     pld_enabled,
                                     eos_token_id,
-                                    &[],
+                                    &eos_extra,
                                     /* committed_base */ token_count,
                                     max_tokens,
                                     &mut |row, recent| {
@@ -2018,7 +2024,7 @@ impl LlmEngine {
                         // Stream committed tokens (next_token streams at top of next iter).
                         // Cumulative-decode to preserve leading spaces.
                         for &tok in &committed_tokens {
-                            if tok == eos_token_id || token_count >= max_tokens {
+                            if ends(tok) || token_count >= max_tokens {
                                 break 'stream_loop;
                             }
                             generated_token_ids.push(tok);
@@ -2265,7 +2271,7 @@ impl LlmEngine {
                 }
                 let finish_reason = if let Some(hit) = stop_tracker.matched() {
                     FinishReason::StopSequence(hit.to_string())
-                } else if next_token == eos_token_id {
+                } else if ends(next_token) {
                     FinishReason::Eos
                 } else if token_count >= max_tokens {
                     FinishReason::MaxTokens
