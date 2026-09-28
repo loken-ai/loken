@@ -6,15 +6,16 @@
 //! prepended (between BOS and text tokens) into the phi2 prefill via
 //! `GenericHeteroTransformer::forward_with_image_embeds`.
 //!
-//! Weight layout (verified against the Ollama moondream:latest blob):
-//!   - `v.patch_embd.{weight,bias}` - Conv2d(3, 1152, k=14, s=14)
-//!   - `v.position_embd.weight` - (1, 729, 1152) F16
-//!   - `v.blk.{0..27}.attn_{q,k,v,out}.{weight,bias}` - separate Q/K/V
-//!   - `v.blk.{0..27}.ffn_{up,down}.{weight,bias}` - GELU between
-//!   - `v.blk.{0..27}.ln{1,2}.{weight,bias}` - LayerNorm(1152, eps=1e-6)
+//! Weight layout (verified against the Ollama moondream:latest blob), with every width,
+//! count and epsilon read from the blob's `clip.vision.*` metadata:
+//!   - `v.patch_embd.{weight,bias}` - Conv2d(3, width, k=patch, s=patch)
+//!   - `v.position_embd.weight` - (1, grid*grid, width) F16
+//!   - `v.blk.{i}.attn_{q,k,v,out}.{weight,bias}` - separate Q/K/V
+//!   - `v.blk.{i}.ffn_{up,down}.{weight,bias}` - GELU between
+//!   - `v.blk.{i}.ln{1,2}.{weight,bias}` - LayerNorm(width)
 //!   - `v.post_ln.{weight,bias}` - LayerNorm after the last block
-//!   - `mm.0.{weight,bias}` - projector fc1 (1152 -> 8192) + GELU
-//!   - `mm.2.{weight,bias}` - projector fc2 (8192 -> 2048)
+//!   - `mm.0.{weight,bias}` - projector fc1 + GELU
+//!   - `mm.2.{weight,bias}` - projector fc2 to the language model's width
 //!
 //! The generic quantized-Moondream path is
 //! NOT compatible - it expects a fused `attn.qkv` weight, `linear(588,1152)`
@@ -23,6 +24,7 @@
 //! repack tensors, so a dedicated module is simpler.
 use std::path::Path;
 
+use crate::inference::model::mmproj::MmprojVision;
 use crate::inference::model::vit::{Qkv, VitBlock};
 use crate::tensor::layer::qlinear::{QLinear, QMlp, Weight};
 use crate::tensor::layer::{Conv2d, Conv2dConfig};
@@ -32,25 +34,13 @@ use crate::tensor::quantized::gguf_file;
 use crate::tensor::{DType, Device, Tensor};
 use anyhow::{anyhow, Result as AnyResult};
 
-/// Architectural constants for Ollama's Moondream CLIP. Hard-coded because
-/// the blob's GGUF metadata records the same values and there's only one
-/// supported shape today; we'll generalise if a second variant ships.
-const IMAGE_SIZE: usize = 378;
-const PATCH_SIZE: usize = 14;
-const EMBED_DIM: usize = 1152;
-const FFN_DIM: usize = 4304;
-const NUM_HEADS: usize = 16;
-const NUM_BLOCKS: usize = 28;
-const LN_EPS: f32 = 1e-6;
-const PROJ_OUT: usize = 2048;
-const NUM_PATCHES: usize = (IMAGE_SIZE / PATCH_SIZE) * (IMAGE_SIZE / PATCH_SIZE); // 27 * 27 = 729
-
-/// Full Moondream vision encoder: ViT (patch embed -> 28 blocks -> post-norm)
+/// Full Moondream vision encoder: ViT (patch embed -> blocks -> post-norm)
 /// followed by the LLaVA-style 2-layer MLP projector that maps from the
-/// vision width (1152) to the phi2 hidden width (2048).
+/// vision width to the phi2 hidden width.
 pub struct MoondreamVisionEncoder {
+    geo: MmprojVision,
     patch_embed: Conv2d,
-    pos_embed: Tensor, // (1, 729, 1152)
+    pos_embed: Tensor, // (1, grid*grid, width)
     blocks: Vec<VitBlock>,
     post_ln: LayerNorm,
     proj_fc1: Linear,
@@ -64,10 +54,10 @@ impl MoondreamVisionEncoder {
         let content = gguf_file::open_mapped(blob_path)
             .map_err(|e| anyhow!("parse CLIP GGUF {}: {}", blob_path.display(), e))?;
 
-        // Sanity: confirm this is a clip projector with vision encoder and
-        // matches the shapes we hard-coded. If the metadata disagrees we
-        // bail loudly rather than producing garbage embeddings.
-        check_metadata(&content)?;
+        // Confirm this is a clip projector, and read the tower's shape from it.
+        check_architecture(&content)?;
+        let geo =
+            MmprojVision::read(&content).map_err(|e| anyhow!("{}: {e}", blob_path.display()))?;
 
         // Helper: load a single tensor from the GGUF, cast to F16 on the
         // target device. The CUDA-fast `dequantize_f16` only handles
@@ -116,7 +106,7 @@ impl MoondreamVisionEncoder {
             Ok(t)
         };
 
-        // -- Patch embedding (Conv2d 3->1152, k=14, s=14) ---------------
+        // -- Patch embedding (Conv2d 3->width, k=patch, s=patch) ---------
         // GGUF stores conv weight as [out, in, kH, kW] which matches
         // the reference Conv2d expectation directly.
         let patch_w = load("v.patch_embd.weight")?;
@@ -125,32 +115,33 @@ impl MoondreamVisionEncoder {
             patch_w,
             Some(patch_b),
             Conv2dConfig {
-                stride: PATCH_SIZE,
+                stride: geo.patch,
                 ..Default::default()
             },
         );
 
-        // -- Position embedding (1, 729, 1152) -------------------------
+        // -- Position embedding (1, grid*grid, width) -------------------
         let pos_embed = load("v.position_embd.weight")?;
 
-        // -- 28 ViT blocks ---------------------------------------------
-        let mut blocks = Vec::with_capacity(NUM_BLOCKS);
-        for i in 0..NUM_BLOCKS {
+        // -- ViT blocks -------------------------------------------------
+        let mut blocks = Vec::with_capacity(geo.blocks);
+        for i in 0..geo.blocks {
             let p = format!("v.blk.{i}");
             let ln1 = LayerNorm::new(
                 load(&format!("{p}.ln1.weight"))?,
                 Some(load(&format!("{p}.ln1.bias"))?),
-                LN_EPS,
+                geo.eps,
             );
             let ln2 = LayerNorm::new(
                 load(&format!("{p}.ln2.weight"))?,
                 Some(load(&format!("{p}.ln2.bias"))?),
-                LN_EPS,
+                geo.eps,
             );
             // The blob stores the three projections apart, and names the FFN's expansion
             // `ffn_down` and its contraction `ffn_up` - the reverse of the convention the
             // language models use. What the layer does is what decides which is which:
-            // `ffn_down` widens 1152 to 4304, so it is the first of the two.
+            // `ffn_down` widens the model width to the feed-forward width, so it is the first
+            // of the two.
             let dense = |w: Tensor, b: Tensor| -> AnyResult<QLinear> {
                 let (out_dim, in_dim) = (w.dim(0)?, w.dim(1)?);
                 Ok(QLinear::new(
@@ -176,8 +167,8 @@ impl MoondreamVisionEncoder {
                 at("attn_out")?,
                 ln2,
                 QMlp::new(at("ffn_down")?, Activation::GeluPytorchTanh, at("ffn_up")?),
-                EMBED_DIM,
-                NUM_HEADS,
+                geo.width,
+                geo.heads,
             )?);
         }
 
@@ -185,14 +176,15 @@ impl MoondreamVisionEncoder {
         let post_ln = LayerNorm::new(
             load("v.post_ln.weight")?,
             Some(load("v.post_ln.bias")?),
-            LN_EPS,
+            geo.eps,
         );
 
-        // -- Projector (1152 -> 8192 -> 2048) ---------------------------
+        // -- Projector (width -> hidden -> projection) -------------------
         let proj_fc1 = Linear::new(load("mm.0.weight")?, Some(load("mm.0.bias")?))?;
         let proj_fc2 = Linear::new(load("mm.2.weight")?, Some(load("mm.2.bias")?))?;
 
         Ok(Self {
+            geo,
             patch_embed,
             pos_embed,
             blocks,
@@ -208,9 +200,9 @@ impl MoondreamVisionEncoder {
     }
 
     /// Run vision encoder + projector on a preprocessed image tensor.
-    /// Input: `(1, 3, 378, 378)` F32, normalised to mean=0.5 std=0.5
+    /// Input: `(1, 3, image_size, image_size)` F32, normalised with the blob's statistics
     /// (matches `crate::inference::media::image_processor::preprocess_moondream`).
-    /// Output: `(1, 729, 2048)` F32 - embeddings ready to splice between
+    /// Output: `(1, grid*grid, projection)` F32 - embeddings ready to splice between
     /// BOS and text tokens in the phi2 prefill.
     pub fn forward(&self, image: &Tensor) -> crate::tensor::Result<Tensor> {
         // Ensure input is on the encoder's device and dtype matches the
@@ -229,12 +221,12 @@ impl MoondreamVisionEncoder {
         } else {
             image
         };
-        // (B, 3, 378, 378) -> (B, 1152, 27, 27) via stride-14 conv
+        // (B, 3, S, S) -> (B, width, grid, grid) via the strided patch conv
         let h = self.patch_embed.forward(&image)?;
         let (b, c, hh, ww) = h.dims4()?;
-        debug_assert_eq!(c, EMBED_DIM);
-        debug_assert_eq!(hh * ww, NUM_PATCHES);
-        // (B, 1152, 27, 27) -> (B, 27*27, 1152)
+        debug_assert_eq!(c, self.geo.width);
+        debug_assert_eq!(hh * ww, self.geo.grid() * self.geo.grid());
+        // (B, width, grid, grid) -> (B, grid*grid, width)
         let h = h.flatten_from(2)?.transpose(1, 2)?.contiguous()?;
         // Add position embedding, broadcasting batch dim.
         let pos = if self.pos_embed.dtype() != h.dtype() {
@@ -276,79 +268,24 @@ impl MoondreamVisionEncoder {
         } else {
             h
         };
-        debug_assert_eq!(h.dim(1)?, NUM_PATCHES);
-        debug_assert_eq!(h.dim(2)?, PROJ_OUT);
+        debug_assert_eq!(h.dim(1)?, self.geo.grid() * self.geo.grid());
+        debug_assert_eq!(h.dim(2)?, self.geo.projection);
         let _ = b;
         Ok(h)
     }
 }
 
-fn check_metadata(content: &gguf_file::Content) -> AnyResult<()> {
-    let get_u32 = |k: &str| -> Option<u32> {
-        content.metadata.get(k).and_then(|v| match v {
-            gguf_file::Value::U32(x) => Some(*x),
-            gguf_file::Value::I32(x) => Some(*x as u32),
-            _ => None,
-        })
-    };
-    let get_str = |k: &str| -> Option<String> {
-        content.metadata.get(k).and_then(|v| match v {
-            gguf_file::Value::String(s) => Some(s.clone()),
-            _ => None,
-        })
-    };
-    let arch = get_str("general.architecture").unwrap_or_default();
+fn check_architecture(content: &gguf_file::Content) -> AnyResult<()> {
+    let arch = content
+        .metadata
+        .get("general.architecture")
+        .and_then(|v| v.to_string().ok())
+        .cloned()
+        .unwrap_or_default();
     if arch != "clip" {
         return Err(anyhow!(
             "CLIP blob has unexpected architecture '{arch}', want 'clip'"
         ));
-    }
-    if let Some(img) = get_u32("clip.vision.image_size") {
-        if img as usize != IMAGE_SIZE {
-            return Err(anyhow!("clip.vision.image_size {} != {}", img, IMAGE_SIZE));
-        }
-    }
-    if let Some(p) = get_u32("clip.vision.patch_size") {
-        if p as usize != PATCH_SIZE {
-            return Err(anyhow!("clip.vision.patch_size {} != {}", p, PATCH_SIZE));
-        }
-    }
-    if let Some(e) = get_u32("clip.vision.embedding_length") {
-        if e as usize != EMBED_DIM {
-            return Err(anyhow!(
-                "clip.vision.embedding_length {} != {}",
-                e,
-                EMBED_DIM
-            ));
-        }
-    }
-    if let Some(f) = get_u32("clip.vision.feed_forward_length") {
-        if f as usize != FFN_DIM {
-            return Err(anyhow!(
-                "clip.vision.feed_forward_length {} != {}",
-                f,
-                FFN_DIM
-            ));
-        }
-    }
-    if let Some(h) = get_u32("clip.vision.attention.head_count") {
-        if h as usize != NUM_HEADS {
-            return Err(anyhow!(
-                "clip.vision.attention.head_count {} != {}",
-                h,
-                NUM_HEADS
-            ));
-        }
-    }
-    if let Some(n) = get_u32("clip.vision.block_count") {
-        if n as usize != NUM_BLOCKS {
-            return Err(anyhow!("clip.vision.block_count {} != {}", n, NUM_BLOCKS));
-        }
-    }
-    if let Some(p) = get_u32("clip.vision.projection_dim") {
-        if p as usize != PROJ_OUT {
-            return Err(anyhow!("clip.vision.projection_dim {} != {}", p, PROJ_OUT));
-        }
     }
     Ok(())
 }
