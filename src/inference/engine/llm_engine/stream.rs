@@ -986,11 +986,10 @@ impl LlmEngine {
                     .map(|s| s.model.capabilities().pld)
                     .unwrap_or(false)
             };
-            // The decode mode is the one this model's own requests measured fastest
-            // (decode_choice).
-            let decode_mode = spec_engine.decode_mode(graph_eligible, pld_capable);
+            // Each step replays the captured graph, unless the n-gram cache has a draft to
+            // verify: that step runs eagerly over the draft, and the next one replays again.
             #[cfg(feature = "cuda")]
-            let graph_ok = decode_mode == DecodeMode::Captured && graph_stream.is_some();
+            let graph_ok = graph_eligible && graph_stream.is_some();
             #[cfg(feature = "cuda")]
             let mut cuda_graph: Option<crate::tensor::cuda_ext::CudaGraph> = None;
             #[cfg(feature = "cuda")]
@@ -1005,8 +1004,7 @@ impl LlmEngine {
             let mut graph_validations: usize = 0;
 
             // -- PLD (Prompt-Lookup Decoding) ---------------------------
-            let pld_enabled = decode_mode == DecodeMode::Lookup;
-            info!("decode mode: {decode_mode:?}");
+            let pld_enabled = pld_capable;
             let mut pld_cache =
                 crate::inference::serve::prompt_lookup::NgramDraftCache::new_cascade(2, 4, 5, 4096);
             if pld_enabled {
@@ -1464,7 +1462,13 @@ impl LlmEngine {
                     // of the request, so PLD resumes naturally).
                     #[cfg(feature = "cuda")]
                     let graph_step: Option<(u32, Option<Tensor>)> = 'graph_blk: {
-                        if !graph_ok || graph_disabled_this_request {
+                        // A drafter's step, or an n-gram draft worth verifying, runs eagerly.
+                        let verify_step = spec_on
+                            || (pld_enabled
+                                && pld_cooldown == 0
+                                && pos <= pld_max_ctx_threshold()
+                                && pld_cache.lookup().len() >= 2);
+                        if !graph_ok || graph_disabled_this_request || verify_step {
                             break 'graph_blk None;
                         }
                         let Some(stream) = graph_stream.as_ref() else {
@@ -2255,14 +2259,6 @@ impl LlmEngine {
             // ended via break / EOS before reaching the next stream_token).
             if let Some(t) = iter_compute_start.take() {
                 compute_ns += t.elapsed().as_nanos() as u64;
-            }
-            // A request that meant to capture and could not ran in no mode worth recording.
-            #[cfg(feature = "cuda")]
-            let captured = graph_capture_attempted && !graph_disabled_this_request;
-            #[cfg(not(feature = "cuda"))]
-            let captured = false;
-            if !drafting && (captured || decode_mode != DecodeMode::Captured) {
-                spec_engine.record_decode_mode(decode_mode, token_count, compute_ns as f64 / 1e9);
             }
             // Publish compute-only timing for the HTTP handler. The
             // stream final NDJSON chunk uses these so assay computes

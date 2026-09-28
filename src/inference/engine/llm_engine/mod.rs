@@ -253,8 +253,6 @@ pub struct LlmEngine {
     drafter_choice: Arc<std::sync::Mutex<Option<Option<String>>>>,
     /// What the cycles with the current drafter taught about the best draft length.
     draft_length: Arc<std::sync::Mutex<crate::inference::engine::decode_step::DraftLength>>,
-    /// Whether this model decodes faster captured or eagerly, as its requests measured it.
-    decode_choice: Arc<std::sync::Mutex<decode_choice::DecodeChoice>>,
 }
 
 impl InferenceEngine for LlmEngine {
@@ -275,7 +273,6 @@ impl InferenceEngine for LlmEngine {
             batching: Arc::default(),
             drafter_choice: Arc::default(),
             draft_length: Arc::default(),
-            decode_choice: Arc::default(),
         }
     }
 
@@ -318,7 +315,6 @@ impl LlmEngine {
             batching: Arc::default(),
             drafter_choice: Arc::default(),
             draft_length: Arc::default(),
-            decode_choice: Arc::default(),
         }
     }
 
@@ -485,22 +481,6 @@ impl LlmEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .next()
-    }
-
-    /// The mode the next request without a drafter decodes in, among those the model can run.
-    pub(crate) fn decode_mode(&self, can_capture: bool, can_lookup: bool) -> DecodeMode {
-        self.decode_choice
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .choose(can_capture, can_lookup)
-    }
-
-    /// Records how fast a request decoded in `mode`.
-    pub(crate) fn record_decode_mode(&self, mode: DecodeMode, tokens: usize, secs: f64) {
-        self.decode_choice
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .record(mode, tokens, secs);
     }
 
     /// Requests admitted and not yet finished.
@@ -1263,9 +1243,7 @@ use std::io::Cursor;
 use std::time::Instant;
 
 mod batching;
-mod decode_choice;
 pub use batching::ActiveRequest;
-pub(crate) use decode_choice::DecodeMode;
 mod discover;
 mod embed;
 mod generate;

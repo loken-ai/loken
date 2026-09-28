@@ -150,8 +150,7 @@ impl GenericHeteroTransformer {
     }
 
     /// Q8-KV decode captures when every layer is dense: a routed expert set allocates per
-    /// token, which a capture cannot contain. Whether the capture then pays is measured per
-    /// model (llm_engine::decode_choice), not assumed from its size or name.
+    /// token, which a capture cannot contain.
     pub fn q8_graph_dense(&self) -> bool {
         self.layers.iter().all(|l| l.moe.is_none())
     }
@@ -295,10 +294,13 @@ impl GenericHeteroTransformer {
         // projection left elsewhere, on another card or on the host because that card had no
         // room, takes the eager path, which moves the hidden state to it.
         if let Some(LayerDevice::Cuda(last)) = self.layer_devs.last() {
-            let head_card = self.output_proj_dev.as_ref().and_then(|d| match d.location() {
-                crate::tensor::DeviceLocation::Cuda { gpu_id } => Some(gpu_id),
-                _ => None,
-            });
+            let head_card = self
+                .output_proj_dev
+                .as_ref()
+                .and_then(|d| match d.location() {
+                    crate::tensor::DeviceLocation::Cuda { gpu_id } => Some(gpu_id),
+                    _ => None,
+                });
             if head_card != Some(*last) || self.output_norm_cuda_weight.is_none() {
                 return Err("the output projection is not on the card of the last layer");
             }
@@ -317,8 +319,7 @@ impl GenericHeteroTransformer {
         // refactor; gated off for now while the infra stays in tree.
         // Parallel-attention layers (phi2) change the graph's structure from one token to
         // the next, which a replay cannot patch, and their capture faulted on an illegal
-        // address. Every other layout captures; whether that pays is measured per model
-        // (llm_engine::decode_choice) and whether it is correct by the probation replays.
+        // address. Every other layout captures, checked by the probation replays.
         if self.config.flags.parallel_attn {
             return Err("parallel-attention layers change the graph between tokens");
         }

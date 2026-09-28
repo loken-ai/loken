@@ -53,8 +53,20 @@ impl ModelDims {
             .unwrap_or(num_heads as u32) as usize;
         let head_dim = get_gguf_u32(content, &format!("{arch}.attention.key_length"))
             .map(|v| v as usize)
-            .unwrap_or_else(|| if num_heads > 0 { hidden_size / num_heads } else { 128 });
-        Self { num_layers, hidden_size, num_heads, num_kv_heads, head_dim }
+            .unwrap_or_else(|| {
+                if num_heads > 0 {
+                    hidden_size / num_heads
+                } else {
+                    128
+                }
+            });
+        Self {
+            num_layers,
+            hidden_size,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        }
     }
 
     /// Card memory a model needs at run time beyond its weights, on each card it uses: its
@@ -72,7 +84,8 @@ impl ModelDims {
             .saturating_mul(widest)
             .saturating_mul(4)
             .saturating_mul(2);
-        kv.saturating_add(CUBLAS_WORKSPACE_BYTES).saturating_add(act)
+        kv.saturating_add(CUBLAS_WORKSPACE_BYTES)
+            .saturating_add(act)
     }
 }
 
@@ -82,7 +95,9 @@ pub(crate) fn per_card_reserve(path: &std::path::Path) -> Option<u64> {
     let content = gguf_file::open_header(path).ok()?;
     let arch = get_gguf_string(&content, "general.architecture")?;
     let context_length = get_gguf_u32(&content, &format!("{arch}.context_length"))
-        .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| c as usize);
+        .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| {
+            c as usize
+        });
     Some(ModelDims::read(&content, &arch).runtime_reserve(context_length) + LOADER_OVERHEAD_PER_GPU)
 }
 
@@ -152,8 +167,6 @@ impl LlmEngine {
             });
         self.load_model_only().await?;
         self.load_planned_drafter(planned).await;
-        // A new placement decodes at new rates: what the last one measured no longer holds.
-        *self.decode_choice.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         Ok(())
     }
 

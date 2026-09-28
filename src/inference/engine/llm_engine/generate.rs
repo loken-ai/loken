@@ -668,12 +668,10 @@ impl LlmEngine {
             } else {
                 (false, false)
             };
-            // The decode mode is the one this model's own requests measured fastest
-            // (decode_choice).
-            let decode_mode = spec_engine.decode_mode(graph_eligible && kv_safe_cached, pld_capable);
-            let graph_auto_on_cached = decode_mode == DecodeMode::Captured;
-            let pld_enabled = decode_mode == DecodeMode::Lookup;
-            info!("decode mode: {decode_mode:?}");
+            // Each step replays the captured graph, unless the n-gram cache has a draft to
+            // verify: that step runs eagerly over the draft, and the next one replays again.
+            let graph_auto_on_cached = graph_eligible && kv_safe_cached;
+            let pld_enabled = pld_capable;
             // use_graph_mode is immutable for a given (model backend, device).
             // Hoist so the per-token loop doesn't redo the capability check
             // + `device.is_cuda()` on every iteration.
@@ -870,7 +868,13 @@ impl LlmEngine {
                     // Q4/Q8 arches keep the legacy single-pass path.
                     let needs_split = state.model.needs_split_graph_path();
                     let mut split_token_ids: Option<Tensor> = None;
-                    if graph_enabled && use_graph_mode && !graph_disabled_this_request {
+                    // A drafter's step, or an n-gram draft worth verifying, runs eagerly.
+                    let verify_step = spec_on
+                        || (pld_enabled
+                            && pld_cooldown == 0
+                            && pos <= pld_max_ctx_threshold()
+                            && pld_cache.lookup().len() >= 2);
+                    if graph_enabled && use_graph_mode && !graph_disabled_this_request && !verify_step {
                         let x = Tensor::new(&[next_token], &Device::Cpu)?.unsqueeze(0)?;
                         // A live graph that replays no further than this position (its
                         // recorded sequence ceiling) is dropped and a new one recorded from
@@ -1533,15 +1537,6 @@ impl LlmEngine {
             // impossible, and is what made it visible: a client cannot receive tokens faster
             // than the server makes them.
             let decode_elapsed = gen_start.elapsed();
-            // A request that meant to capture and could not ran in no mode worth recording.
-            let captured = graph_capture_attempted && !graph_disabled_this_request;
-            if spec_drafted == 0 && (captured || decode_mode != DecodeMode::Captured) {
-                spec_engine.record_decode_mode(
-                    decode_mode,
-                    generated.len(),
-                    decode_elapsed.as_secs_f64(),
-                );
-            }
 
             // End-of-request graph teardown. The captured graph + its
             // arena-backed transients must not outlive the request: the next
