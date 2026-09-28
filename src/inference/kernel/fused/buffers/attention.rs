@@ -361,42 +361,6 @@ pub fn paged_rope_f16(
     Ok(Some(out))
 }
 
-/// out_f16 = f16(a_f32 + f32(b_f16)) in one launch (F32 add -> bit-identical to
-/// a.broadcast_add(b.to_f32()).to_f16()). a F32, b F16, same shape. Returns F16,
-/// or None (caller falls back) unless CUDA + a F32 + b F16.
-pub fn add_to_f16(a: &Tensor, b: &Tensor) -> Result<Option<Tensor>> {
-    use crate::tensor::cuda_ext::DevicePtr;
-    use crate::tensor::StorageView::Cuda as C;
-    use core::ffi::c_void;
-    if !a.device().is_cuda() || a.dtype() != DType::F32 || b.dtype() != DType::F16 {
-        return Ok(None);
-    }
-    let a = a.contiguous()?;
-    let b = b.contiguous()?;
-    let n = a.elem_count() as i64;
-    let out = unsafe { Tensor::empty(a.shape(), DType::F16, &a.device())? };
-    let dev = a.device().as_cuda_device()?;
-    let stream = dev.cuda_stream().cu_stream() as i64;
-    let (as_, al) = a.storage_and_layout();
-    let (bs, bl) = b.storage_and_layout();
-    let (os, _) = out.storage_and_layout();
-    if let (C(ac), C(bc), C(oc)) = (&*as_, &*bs, &*os) {
-        let asl = ac.as_cuda_slice::<f32>()?;
-        let bsl = bc.as_cuda_slice::<half::f16>()?;
-        let osl = oc.as_cuda_slice::<half::f16>()?;
-        let ap = (asl.device_ptr(asl.stream()).0 + (al.start_offset() * 4) as u64) as *const f32;
-        let bp = (bsl.device_ptr(bsl.stream()).0 + (bl.start_offset() * 2) as u64) as *const c_void;
-        let op = osl.device_ptr(osl.stream()).0 as *mut c_void;
-        unsafe {
-            loken_add_to_f16(ap, bp, op, n, stream);
-        }
-    }
-    drop(as_);
-    drop(bs);
-    drop(os);
-    Ok(Some(out))
-}
-
 /// out = softplus(dt + bias) = log(exp(dt+bias)+1), one F32 launch (bit-identical
 /// to the reference ((dt.broadcast_add(bias)).exp()+1).log()). dt [rows,cols] F32, bias
 /// [cols] F32. Returns None (caller falls back) unless CUDA + F32.

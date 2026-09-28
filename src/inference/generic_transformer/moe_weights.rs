@@ -269,6 +269,39 @@ impl SigmoidRouting {
     }
 }
 
+/// The expert every token of a mixture runs beside the routed ones: SwiGLU when it has a
+/// gate, `relu(up)^2` otherwise, its output scaled by `sigmoid(x . scalar_gate)` when the
+/// file gives that gate.
+pub struct SharedExpert {
+    pub gate: Option<QMatMul>,
+    pub up: QMatMul,
+    pub down: QMatMul,
+    /// `[hidden, 1]` F32.
+    pub scalar_gate: Option<Tensor>,
+}
+
+impl SharedExpert {
+    /// The expert over `xs` `[tokens, hidden]` F32, `[tokens, hidden]` F32.
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let up = self.up.forward(xs)?.to_dtype(crate::tensor::DType::F32)?;
+        let h = match &self.gate {
+            Some(g) => {
+                let g = g.forward(xs)?.to_dtype(crate::tensor::DType::F32)?;
+                (crate::tensor::ops::silu(&g)? * up)?
+            }
+            None => up.relu()?.sqr()?,
+        };
+        let out = self.down.forward(&h)?.to_dtype(crate::tensor::DType::F32)?;
+        match &self.scalar_gate {
+            Some(w) => {
+                let gate = crate::tensor::ops::sigmoid(&xs.matmul(w)?)?;
+                out.broadcast_mul(&gate)
+            }
+            None => Ok(out),
+        }
+    }
+}
+
 // ------------------------------------------------------------
 // Per-layer struct
 // ------------------------------------------------------------
@@ -327,6 +360,10 @@ pub struct MoeWeights {
     pub norm_topk: bool,
     /// The router scores experts by sigmoid instead of softmax. `None` for softmax.
     pub sigmoid_routing: Option<SigmoidRouting>,
+    /// The experts have no gate: `down(relu(up(x))^2)` over `up_exps_sep`.
+    pub up_relu2: bool,
+    /// An expert every token runs, added to the routed ones.
+    pub shared_expert: Option<SharedExpert>,
     /// CPU-only cache: dequantized F32 expert tensors. Populated for layers
     /// placed on CPU since `moe_gemm_gguf` is CUDA-only. Avoids per-call
     /// dequant cost on what is already a slow CPU path.
@@ -581,7 +618,9 @@ impl MoeWeights {
         // caught, because that kernel had no parity test - it has one now, and the host detour
         // it justified cost about eight times the prefill.
         let on_cpu = !xs.device().runs_as_card();
-        let expert_rows = if on_cpu {
+        let expert_rows = if self.up_relu2 {
+            self.forward_up_relu2(&xs, &topk_ids, &topk_weights_scaled, num_tokens)?
+        } else if on_cpu {
             self.forward_cpu(&xs, &topk_ids, &topk_weights_scaled, num_tokens, hidden_dim)?
         } else {
             self.forward_cuda(
@@ -600,9 +639,74 @@ impl MoeWeights {
             true => expert_rows,
             false => expert_rows.to_device(&moe_device)?,
         };
+        let expert_rows = match &self.shared_expert {
+            Some(shared) => {
+                (expert_rows.to_dtype(crate::tensor::DType::F32)? + shared.forward(&xs)?)?
+            }
+            None => expert_rows,
+        };
         expert_rows
             .to_dtype(original_dtype)?
             .reshape((batch, seq_len, hidden_dim))
+    }
+
+    /// Experts without a gate: `down(relu(up(x))^2)` for every chosen expert, weighed and
+    /// summed per token. `[tokens, hidden]` F32.
+    fn forward_up_relu2(
+        &self,
+        xs: &Tensor,
+        topk_ids: &Tensor,
+        topk_weights: &Tensor,
+        num_tokens: usize,
+    ) -> Result<Tensor> {
+        let up = self
+            .up_exps_sep
+            .as_ref()
+            .ok_or_else(|| crate::tensor::Error::msg("gateless experts without an up stack"))?;
+        #[cfg(feature = "cuda")]
+        if xs.device().runs_as_card() {
+            let routing = ExpertRouting::group(topk_ids, self.n_experts_used)?;
+            let h = crate::inference::moe_cuda::moe_gemm_gguf(
+                xs,
+                up,
+                &None,
+                &routing.slots,
+                &routing.experts,
+                self.n_experts_used,
+                num_tokens > 1,
+                crate::tensor::DType::F16,
+            )?;
+            let h = match crate::inference::kernel::fused::relu2_f16(&h)? {
+                Some(y) => y,
+                None => h.relu()?.sqr()?,
+            };
+            return routing.down_reduce(
+                &h.to_dtype(crate::tensor::DType::F32)?,
+                &self.down_exps,
+                topk_weights,
+                num_tokens,
+                false,
+                None,
+            );
+        }
+        let host = Device::Cpu;
+        let (xs, ids, weights) = (
+            xs.to_device(&host)?,
+            topk_ids.to_device(&host)?,
+            topk_weights.to_device(&host)?,
+        );
+        let routing = ExpertRouting::group(
+            &ids.to_dtype(crate::tensor::DType::U32)?,
+            self.n_experts_used,
+        )?;
+        let h = crate::inference::moe_cpu::moe_gemm_gguf_up_relu2(
+            &xs,
+            up,
+            &routing.slots,
+            &routing.experts,
+            self.n_experts_used,
+        )?;
+        routing.host_down_reduce(&h, &self.down_exps, &weights, num_tokens, None)
     }
 
     /// The router's choice, from its logits: for every token the `n_experts_used` experts
@@ -1087,6 +1191,8 @@ mod clamped_swiglu_tests {
                     normalize,
                     scale,
                 }),
+                up_relu2: false,
+                shared_expert: None,
                 gate_up_exps_f32: None,
                 down_exps_f32: None,
             };
@@ -1152,6 +1258,123 @@ mod clamped_swiglu_tests {
     }
 
     #[test]
+    fn gateless_experts_and_a_shared_expert_match_the_scalar_reference() {
+        let (experts, used, hidden, ffn, tokens) = (4usize, 2usize, 32usize, 32usize, 3usize);
+        let dev = Device::Cpu;
+        let stack = |seed| {
+            let w = Tensor::from_vec(
+                values(experts * ffn * hidden, seed, 1.0),
+                (experts, ffn, hidden),
+                &dev,
+            )
+            .unwrap();
+            QTensor::quantize_onto(&w, GgmlDType::Q8_0, &dev).unwrap()
+        };
+        let dense = |seed, rows, cols| {
+            let v = values(rows * cols, seed, 0.5);
+            let w = Tensor::from_vec(v.clone(), (rows, cols), &dev).unwrap();
+            let q = QTensor::quantize_onto(&w, GgmlDType::F32, &dev).unwrap();
+            (
+                super::super::projection::QMatMul::from_qtensor(q).unwrap(),
+                v,
+            )
+        };
+        let (up, down) = (stack(31), stack(32));
+        let router = values(experts * hidden, 33, 0.5);
+        let (sh_up, sh_up_w) = dense(34, ffn, hidden);
+        let (sh_down, sh_down_w) = dense(35, hidden, ffn);
+        let moe = MoeWeights {
+            gate_inp: QMatMul::Tensor(
+                Tensor::from_vec(router.clone(), (experts, hidden), &dev).unwrap(),
+            ),
+            gate_inp_scale: Tensor::ones(hidden, DType::F32, &dev).unwrap(),
+            gate_inp_bias: None,
+            gate_exps_bias: None,
+            up_exps_bias: None,
+            down_exps_bias: None,
+            swiglu_clamp: None,
+            gate_up_exps: None,
+            down_exps: Arc::new(stack(32)),
+            gate_exps_sep: None,
+            up_exps_sep: Some(Arc::new(stack(31))),
+            down_exps_scale: Tensor::ones(experts, DType::F32, &dev).unwrap(),
+            n_experts: experts,
+            n_experts_used: used,
+            expert_ffn_dim: ffn,
+            router_prenormed: true,
+            use_silu: false,
+            gelu: false,
+            norm_topk: true,
+            sigmoid_routing: Some(SigmoidRouting {
+                selection_bias: None,
+                normalize: false,
+                scale: 1.0,
+            }),
+            up_relu2: true,
+            shared_expert: Some(SharedExpert {
+                gate: None,
+                up: sh_up,
+                down: sh_down,
+                scalar_gate: None,
+            }),
+            gate_up_exps_f32: None,
+            down_exps_f32: None,
+        };
+        let xs = values(tokens * hidden, 36, 1.0);
+        let input = Tensor::from_vec(xs.clone(), (1, tokens, hidden), &dev).unwrap();
+        let got = moe
+            .forward(&input, &input, hidden, 1e-5, tokens > 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let deq = |q: &QTensor| {
+            q.dequantize(&dev)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let (uw, dw) = (deq(&up), deq(&down));
+        let relu2 = |v: f32| v.max(0.0) * v.max(0.0);
+        let mut want = vec![0f32; tokens * hidden];
+        for tok in 0..tokens {
+            let x = &xs[tok * hidden..(tok + 1) * hidden];
+            let probs: Vec<f32> = matvec(&router, x, experts)
+                .iter()
+                .map(|l| 1.0 / (1.0 + (-l).exp()))
+                .collect();
+            let mut order: Vec<usize> = (0..experts).collect();
+            order.sort_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+            for &e in &order[..used] {
+                let h: Vec<f32> = matvec(&uw[e * ffn * hidden..(e + 1) * ffn * hidden], x, ffn)
+                    .into_iter()
+                    .map(relu2)
+                    .collect();
+                let d = matvec(&dw[e * hidden * ffn..(e + 1) * hidden * ffn], &h, hidden);
+                for c in 0..hidden {
+                    want[tok * hidden + c] += probs[e] * d[c];
+                }
+            }
+            let h: Vec<f32> = matvec(&sh_up_w, x, ffn).into_iter().map(relu2).collect();
+            let d = matvec(&sh_down_w, &h, hidden);
+            for c in 0..hidden {
+                want[tok * hidden + c] += d[c];
+            }
+        }
+        let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        // The expert kernels quantise their activations to 8 bits.
+        assert!(worst <= 2e-2 * peak, "max diff {worst} of {peak}");
+    }
+
+    #[test]
     fn biased_clamped_experts_match_the_scalar_reference() {
         let (experts, used, hidden, ffn, tokens) = (4usize, 2usize, 32usize, 32usize, 3usize);
         let (alpha, limit) = (1.702f64, 1.5f64);
@@ -1196,6 +1419,8 @@ mod clamped_swiglu_tests {
             gelu: false,
             norm_topk: true,
             sigmoid_routing: None,
+            up_relu2: false,
+            shared_expert: None,
             gate_up_exps_f32: None,
             down_exps_f32: None,
         };

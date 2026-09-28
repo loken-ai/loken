@@ -10,6 +10,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::tensor::D;
 
 /// The operator a block's tensors name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +18,10 @@ pub enum MixerKind {
     Attention,
     /// LFM2 gated short convolution: `shortconv.{in_proj,conv,out_proj}`.
     ShortConv,
+    /// Mamba2 selective state space: `ssm_{in,conv1d,a,d,dt,norm,out}`.
+    Ssm,
+    /// No mixing sublayer: the block is a feed-forward alone.
+    Absent,
 }
 
 /// The mixer of block `il`, from the tensors the file carries for it.
@@ -28,9 +33,25 @@ pub fn layer_mixer_kind(content: &gguf_file::Content, il: usize) -> MixerKind {
     };
     if has("shortconv.conv.weight") {
         MixerKind::ShortConv
-    } else {
+    } else if has("ssm_in.weight") {
+        MixerKind::Ssm
+    } else if has("attn_q.weight") || has("attn_qkv.weight") {
         MixerKind::Attention
+    } else {
+        MixerKind::Absent
     }
+}
+
+/// Whether block `il` carries a feed-forward sublayer, dense or routed.
+pub fn layer_has_ffn(content: &gguf_file::Content, il: usize) -> bool {
+    [
+        "ffn_up.weight",
+        "ffn_gate_inp.weight",
+        "ffn_up_exps.weight",
+        "ffn_gate_up_exps.weight",
+    ]
+    .iter()
+    .any(|t| content.tensor_infos.contains_key(&format!("blk.{il}.{t}")))
 }
 
 /// The first block whose mixer is attention, where the attention variant flags are read.
@@ -53,12 +74,16 @@ pub enum Mixer {
     /// Softmax attention through the layer's attention fields and KV cache.
     Attention,
     ShortConv(ShortConv),
+    Ssm(Mamba2),
+    /// The block has no mixing sublayer.
+    Absent,
 }
 
 /// A recurrent mixer's state, copied whole.
 #[derive(Clone)]
 pub enum MixerState {
     ShortConv(Option<ConvState>),
+    Ssm(Option<SsmState>),
 }
 
 impl MixerState {
@@ -69,6 +94,11 @@ impl MixerState {
                 (t.elem_count() * t.dtype().size_in_bytes()) as u64
             }
             MixerState::ShortConv(_) => 0,
+            MixerState::Ssm(Some(SsmState::Card { conv, h })) => [conv, h]
+                .iter()
+                .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
+                .sum(),
+            MixerState::Ssm(_) => 0,
         }
     }
 }
@@ -76,34 +106,39 @@ impl MixerState {
 impl Mixer {
     /// True for a mixer that carries a state beside the KV cache.
     pub fn is_recurrent(&self) -> bool {
-        !matches!(self, Mixer::Attention)
+        !matches!(self, Mixer::Attention | Mixer::Absent)
     }
 
     /// The mixed tokens of `x` `[b, seq, hidden]`, before the output projection. Starts a
     /// fresh state at position 0 and advances it over every row otherwise.
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         match self {
-            Mixer::Attention => Err(crate::tensor::Error::msg(
-                "attention runs through the layer's attention path",
+            Mixer::Attention | Mixer::Absent => Err(crate::tensor::Error::msg(
+                "no recurrent mixer on this layer",
             )),
             Mixer::ShortConv(m) => m.forward(x, index_pos),
+            Mixer::Ssm(m) => m.forward(x, index_pos),
         }
     }
 
     /// Drops the state; the next forward starts from zeros.
     pub fn reset(&mut self) {
         match self {
-            Mixer::Attention => {}
+            Mixer::Attention | Mixer::Absent => {}
             Mixer::ShortConv(m) => m.state = None,
+            Mixer::Ssm(m) => m.state = None,
         }
     }
 
     /// A deep copy of the state, `None` for attention.
     pub fn snapshot(&self) -> Result<Option<MixerState>> {
         Ok(match self {
-            Mixer::Attention => None,
+            Mixer::Attention | Mixer::Absent => None,
             Mixer::ShortConv(m) => Some(MixerState::ShortConv(
                 m.state.as_ref().map(ConvState::deep_copy).transpose()?,
+            )),
+            Mixer::Ssm(m) => Some(MixerState::Ssm(
+                m.state.as_ref().map(SsmState::deep_copy).transpose()?,
             )),
         })
     }
@@ -113,6 +148,10 @@ impl Mixer {
         match (self, state) {
             (Mixer::ShortConv(m), MixerState::ShortConv(s)) => {
                 m.state = s.as_ref().map(ConvState::deep_copy).transpose()?;
+                Ok(())
+            }
+            (Mixer::Ssm(m), MixerState::Ssm(s)) => {
+                m.state = s.as_ref().map(SsmState::deep_copy).transpose()?;
                 Ok(())
             }
             _ => Err(crate::tensor::Error::msg(
@@ -267,15 +306,355 @@ pub fn short_conv_host(
     y
 }
 
+/// A Mamba2 state: the convolution window of the last `d_conv` inputs of every `x, B, C`
+/// channel and the SSM hidden `[nheads, headdim, d_state]`. On a card as tensors `[b, ..]`
+/// F32, on the host as flat values for one sequence.
+#[derive(Clone)]
+pub enum SsmState {
+    Card { conv: Tensor, h: Tensor },
+    Host { conv: Vec<f32>, h: Vec<f32> },
+}
+
+impl SsmState {
+    fn deep_copy(&self) -> Result<Self> {
+        Ok(match self {
+            SsmState::Card { conv, h } => SsmState::Card {
+                conv: conv.affine(1.0, 0.0)?,
+                h: h.affine(1.0, 0.0)?,
+            },
+            SsmState::Host { conv, h } => SsmState::Host {
+                conv: conv.clone(),
+                h: h.clone(),
+            },
+        })
+    }
+}
+
+/// Mamba2 dimensions, from the file's `ssm.*` metadata and the `ssm_a` length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mamba2Dims {
+    pub d_inner: usize,
+    pub d_state: usize,
+    pub ngroups: usize,
+    pub d_conv: usize,
+    pub nheads: usize,
+}
+
+impl Mamba2Dims {
+    /// Channels the convolution runs over: `x`, then `B` and `C` for every group.
+    pub fn d_xbc(&self) -> usize {
+        self.d_inner + 2 * self.ngroups * self.d_state
+    }
+    pub fn headdim(&self) -> usize {
+        self.d_inner / self.nheads.max(1)
+    }
+}
+
+/// The weights the host recurrence reads, flat F32.
+struct Mamba2Host {
+    conv_w: Vec<f32>,
+    conv_b: Vec<f32>,
+    a: Vec<f32>,
+    d: Vec<f32>,
+    dt_bias: Vec<f32>,
+    norm: Vec<f32>,
+}
+
+/// Mamba2 selective state space. `in_proj` gives `z | xBC | dt`; `xBC` runs through a
+/// causal depthwise convolution with bias and SiLU; per head the state decays by
+/// `exp(softplus(dt + dt_bias) . a)` and takes `dt . x (x) B`; the output reads the state
+/// through `C`, adds `D . x`, is gated by `silu(z)` and RMS-normalised per group. `a` is
+/// stored already negated (`-exp(A_log)`).
+pub struct Mamba2 {
+    pub in_proj: QMatMul,
+    conv_w: Tensor,
+    conv_b: Tensor,
+    a: Tensor,
+    d: Tensor,
+    dt_bias: Tensor,
+    norm_w: Tensor,
+    host: Mamba2Host,
+    pub dims: Mamba2Dims,
+    eps: f64,
+    pub state: Option<SsmState>,
+}
+
+/// Mamba2 weights as the file stores them, before placement.
+pub struct Mamba2Weights {
+    pub in_proj: QMatMul,
+    /// `[d_xbc, d_conv]`.
+    pub conv_w: Tensor,
+    /// `[d_xbc]`, zeros when the file has none.
+    pub conv_b: Tensor,
+    pub a: Tensor,
+    pub d: Tensor,
+    pub dt_bias: Tensor,
+    /// `[ngroups, d_inner / ngroups]`.
+    pub norm_w: Tensor,
+}
+
+impl Mamba2 {
+    /// The mixer over host `w`, its small tensors placed on `device`.
+    pub fn new(w: Mamba2Weights, dims: Mamba2Dims, eps: f64, device: &Device) -> Result<Self> {
+        let f32_flat = |t: &Tensor| -> Result<Tensor> { t.to_dtype(DType::F32)?.flatten_all() };
+        let conv_w = w.conv_w.to_dtype(DType::F32)?.contiguous()?;
+        let (conv_b, a, d, dt_bias) = (
+            f32_flat(&w.conv_b)?,
+            f32_flat(&w.a)?,
+            f32_flat(&w.d)?,
+            f32_flat(&w.dt_bias)?,
+        );
+        let norm_w = w.norm_w.to_dtype(DType::F32)?.contiguous()?;
+        if conv_w.dims() != [dims.d_xbc(), dims.d_conv] || a.dims1()? != dims.nheads {
+            return Err(crate::tensor::Error::msg(format!(
+                "ssm weights {:?} / {} heads do not match {dims:?}",
+                conv_w.dims(),
+                a.dims1()?
+            )));
+        }
+        let host = Mamba2Host {
+            conv_w: conv_w.flatten_all()?.to_vec1()?,
+            conv_b: conv_b.to_vec1()?,
+            a: a.to_vec1()?,
+            d: d.to_vec1()?,
+            dt_bias: dt_bias.to_vec1()?,
+            norm: norm_w.flatten_all()?.to_vec1()?,
+        };
+        Ok(Self {
+            in_proj: w.in_proj,
+            conv_w: conv_w.to_device(device)?,
+            conv_b: conv_b.to_device(device)?,
+            a: a.to_device(device)?,
+            d: d.to_device(device)?,
+            dt_bias: dt_bias.to_device(device)?,
+            norm_w: norm_w.to_device(device)?,
+            host,
+            dims,
+            eps,
+            state: None,
+        })
+    }
+
+    pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        if index_pos == 0 {
+            self.state = None;
+        }
+        let (b, seq, _) = x.dims3()?;
+        let dims = self.dims;
+        let proj = self.in_proj.forward(x)?.to_dtype(DType::F32)?;
+        if b == 1 && !x.device().is_cuda() {
+            if !matches!(self.state, Some(SsmState::Host { .. })) {
+                self.state = Some(SsmState::Host {
+                    conv: vec![0f32; dims.d_xbc() * dims.d_conv],
+                    h: vec![0f32; dims.nheads * dims.headdim() * dims.d_state],
+                });
+            }
+            let Some(SsmState::Host { conv, h }) = self.state.as_mut() else {
+                unreachable!("host state set above")
+            };
+            let proj = proj.contiguous()?;
+            let y = mamba2_host(
+                proj.f32_data()?,
+                conv,
+                h,
+                &self.host,
+                dims,
+                self.eps as f32,
+                seq,
+            );
+            return Tensor::from_vec(y, (1, seq, dims.d_inner), &x.device())?.to_dtype(x.dtype());
+        }
+        let (mut conv, mut h) = match self.state.take() {
+            Some(SsmState::Card { conv, h }) => (conv, h),
+            _ => (
+                Tensor::zeros_on((b, dims.d_xbc(), dims.d_conv), DType::F32, &x.device())?,
+                Tensor::zeros_on(
+                    (b, dims.nheads, dims.headdim(), dims.d_state),
+                    DType::F32,
+                    &x.device(),
+                )?,
+            ),
+        };
+        use crate::inference::kernel::fused;
+        let per_group = dims.ngroups * dims.d_state;
+        let mut rows = Vec::with_capacity(seq);
+        for t in 0..seq {
+            let p = proj.i((.., t, ..))?;
+            let z = p.narrow(D::Minus1, 0, dims.d_inner)?;
+            let xbc = p.narrow(D::Minus1, dims.d_inner, dims.d_xbc())?;
+            let dt = p.narrow(D::Minus1, dims.d_inner + dims.d_xbc(), dims.nheads)?;
+            let (xbc, next_conv) = fused::fused_causal_conv1d_silu(
+                &xbc,
+                &conv,
+                &self.conv_w,
+                &self.conv_b,
+                dims.d_xbc(),
+                dims.d_conv,
+            )?;
+            conv = next_conv;
+            let x_c = xbc.narrow(D::Minus1, 0, dims.d_inner)?;
+            let b_ = xbc.narrow(D::Minus1, dims.d_inner, per_group)?;
+            let c_ = xbc.narrow(D::Minus1, dims.d_inner + per_group, per_group)?;
+            let dt = match fused::softplus_bias(&dt, &self.dt_bias)? {
+                Some(y) => y,
+                None => ((dt.broadcast_add(&self.dt_bias)?.exp()? + 1.0)?).log()?,
+            };
+            let (y, next_h) = fused::fused_mamba2_ssm_step(
+                &x_c,
+                &b_,
+                &c_,
+                &dt,
+                &self.a,
+                &h,
+                dims.nheads,
+                dims.headdim(),
+                dims.d_state,
+                dims.ngroups,
+            )?;
+            h = next_h;
+            let y = fused::fused_mamba2_gate_gnorm(
+                &y.reshape((b, dims.d_inner))?,
+                &x_c,
+                &self.d,
+                &z,
+                &self.norm_w,
+                b,
+                dims.d_inner,
+                dims.headdim(),
+                dims.ngroups,
+                self.eps,
+            )?;
+            rows.push(y.to_dtype(x.dtype())?.unsqueeze(1)?);
+        }
+        self.state = Some(SsmState::Card { conv, h });
+        if rows.len() == 1 {
+            return Ok(rows.pop().unwrap());
+        }
+        Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1)
+    }
+}
+
+/// [`Mamba2::forward`] on the host over `proj` `[seq, d_inner + d_xbc + nheads]`, advancing
+/// `conv` `[d_xbc, d_conv]` and `h` `[nheads, headdim, d_state]`. Returns `y`
+/// `[seq * d_inner]`, before the output projection.
+fn mamba2_host(
+    proj: &[f32],
+    conv: &mut [f32],
+    h: &mut [f32],
+    w: &Mamba2Host,
+    dims: Mamba2Dims,
+    eps: f32,
+    seq: usize,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let (nh, hd, ds) = (dims.nheads, dims.headdim(), dims.d_state);
+    let (di, dx, ng, l) = (dims.d_inner, dims.d_xbc(), dims.ngroups, dims.d_conv);
+    let heads_per_group = nh / ng.max(1);
+    let group = di / ng.max(1);
+    let width = di + dx + nh;
+    let silu = |v: f32| v / (1.0 + (-v).exp());
+    let mut y_all = vec![0f32; seq * di];
+    let mut conv_out = vec![0f32; dx];
+    for t in 0..seq {
+        let row = &proj[t * width..(t + 1) * width];
+        let (z, xbc_in, dt_in) = (&row[..di], &row[di..di + dx], &row[di + dx..]);
+        // The window holds the last `l` inputs, the current one included.
+        for c in 0..dx {
+            let s = &mut conv[c * l..(c + 1) * l];
+            s.rotate_left(1);
+            s[l - 1] = xbc_in[c];
+            let taps = &w.conv_w[c * l..(c + 1) * l];
+            let mut acc = w.conv_b[c];
+            for j in 0..l {
+                acc += taps[j] * s[j];
+            }
+            conv_out[c] = silu(acc);
+        }
+        let x_c = &conv_out[..di];
+        let b_ = &conv_out[di..di + ng * ds];
+        let c_ = &conv_out[di + ng * ds..di + 2 * ng * ds];
+        let yt = &mut y_all[t * di..(t + 1) * di];
+        h.par_chunks_mut(hd * ds)
+            .zip(yt.par_chunks_mut(hd))
+            .enumerate()
+            .for_each(|(head, (hs, yh))| {
+                let g = head / heads_per_group.max(1);
+                let dt = (1.0 + (dt_in[head] + w.dt_bias[head]).exp()).ln();
+                let decay = (dt * w.a[head]).exp();
+                let bv = &b_[g * ds..(g + 1) * ds];
+                let cv = &c_[g * ds..(g + 1) * ds];
+                for p in 0..hd {
+                    let xv = x_c[head * hd + p];
+                    let dx_ = dt * xv;
+                    let hrow = &mut hs[p * ds..(p + 1) * ds];
+                    let mut acc = 0f32;
+                    for s in 0..ds {
+                        hrow[s] = hrow[s] * decay + dx_ * bv[s];
+                        acc += hrow[s] * cv[s];
+                    }
+                    yh[p] = acc + w.d[head] * xv;
+                }
+            });
+        // Gate by silu(z), then RMS-normalise each group and apply the weight.
+        for i in 0..di {
+            yt[i] *= silu(z[i]);
+        }
+        for g in 0..ng {
+            let yg = &mut yt[g * group..(g + 1) * group];
+            let var = yg.iter().map(|v| v * v).sum::<f32>() / group as f32;
+            let inv = 1.0 / (var + eps).sqrt();
+            for (i, v) in yg.iter_mut().enumerate() {
+                *v = *v * inv * w.norm[g * group + i];
+            }
+        }
+    }
+    y_all
+}
+
 impl GenericTransformerLayer {
-    /// A layer whose tokens mix through a recurrent operator: `x + out(mixer(norm(x)))`,
-    /// then the feed-forward sublayer.
-    pub(super) fn forward_recurrent(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
-        let x_norm = self.attn_norm.forward(x)?;
-        let mixed = self.mixer.forward(&x_norm, index_pos)?;
-        let mixed = self.attn_output.forward(&mixed)?;
-        let x = (x + mixed.to_dtype(x.dtype())?)?;
-        self.ffn_sublayer(&x)
+    /// True for a layer the hybrid forward runs: a recurrent mixer, no mixer, or no
+    /// feed-forward.
+    pub(super) fn is_hybrid(&self) -> bool {
+        !matches!(self.mixer, Mixer::Attention) || !self.has_ffn
+    }
+
+    /// A hybrid family's layer: `x + out(mix(norm(x)))` where it mixes, then
+    /// `x + ffn(ffn_norm(x))` where it has a feed-forward.
+    pub(super) fn forward_hybrid(
+        &mut self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        index_pos: usize,
+    ) -> Result<Tensor> {
+        let x = match self.mixer {
+            Mixer::Absent => x.clone(),
+            Mixer::Attention => {
+                let x_norm = self.attn_norm.forward(x)?;
+                let mut out = self.forward_attn(
+                    &x_norm,
+                    mask,
+                    index_pos,
+                    None,
+                    None,
+                    #[cfg(feature = "cuda")]
+                    None,
+                )?;
+                if let Some(b) = &self.attn_output_bias {
+                    out = out.broadcast_add(b)?;
+                }
+                (x + out.to_dtype(x.dtype())?)?
+            }
+            _ => {
+                let x_norm = self.attn_norm.forward(x)?;
+                let mixed = self.mixer.forward(&x_norm, index_pos)?;
+                let mixed = self.attn_output.forward(&mixed)?;
+                (x + mixed.to_dtype(x.dtype())?)?
+            }
+        };
+        match self.has_ffn {
+            true => self.ffn_sublayer(&x),
+            false => Ok(x),
+        }
     }
 
     /// `x + ffn(ffn_norm(x))`, the routed experts standing for the feed-forward on a layer
@@ -404,5 +783,159 @@ mod tests {
         let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(v(&tail_a), v(&tail_b));
         assert_eq!(v(&whole.narrow(1, 2, seq - 2).unwrap()), v(&tail_a));
+    }
+
+    /// The Mamba2 block written out over the whole history: the convolution reads the
+    /// inputs directly, the state is carried per head and channel.
+    #[allow(clippy::too_many_arguments)]
+    fn mamba2_reference(
+        proj: &[f32],
+        conv_w: &[f32],
+        conv_b: &[f32],
+        a: &[f32],
+        dvec: &[f32],
+        dt_bias: &[f32],
+        norm: &[f32],
+        dims: Mamba2Dims,
+        eps: f32,
+        seq: usize,
+    ) -> Vec<f32> {
+        let (di, dx, nh, ds, ng, l) = (
+            dims.d_inner,
+            dims.d_xbc(),
+            dims.nheads,
+            dims.d_state,
+            dims.ngroups,
+            dims.d_conv,
+        );
+        let hd = dims.headdim();
+        let width = di + dx + nh;
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        let mut h = vec![0f32; nh * hd * ds];
+        let mut out = vec![0f32; seq * di];
+        for t in 0..seq {
+            let row = |u: usize| &proj[u * width..(u + 1) * width];
+            let xbc: Vec<f32> = (0..dx)
+                .map(|c| {
+                    let mut acc = conv_b[c];
+                    for j in 0..l {
+                        // Tap j reads the input l - 1 - j steps back.
+                        let back = l - 1 - j;
+                        if t >= back {
+                            acc += conv_w[c * l + j] * row(t - back)[di + c];
+                        }
+                    }
+                    silu(acc)
+                })
+                .collect();
+            let r = row(t);
+            let mut y = vec![0f32; di];
+            for head in 0..nh {
+                let g = head / (nh / ng);
+                let dt = (1.0 + (r[di + dx + head] + dt_bias[head]).exp()).ln();
+                for p in 0..hd {
+                    let x = xbc[head * hd + p];
+                    let mut acc = 0f32;
+                    for st in 0..ds {
+                        let hi = (head * hd + p) * ds + st;
+                        let b = xbc[di + g * ds + st];
+                        let c = xbc[di + ng * ds + g * ds + st];
+                        h[hi] = h[hi] * (dt * a[head]).exp() + dt * x * b;
+                        acc += h[hi] * c;
+                    }
+                    y[head * hd + p] = (acc + dvec[head] * x) * silu(r[head * hd + p]);
+                }
+            }
+            let group = di / ng;
+            for g in 0..ng {
+                let ys = &y[g * group..(g + 1) * group];
+                let rms = (ys.iter().map(|v| v * v).sum::<f32>() / group as f32 + eps).sqrt();
+                for i in 0..group {
+                    out[t * di + g * group + i] = ys[i] / rms * norm[g * group + i];
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_host_mamba2_matches_the_block_over_the_history() {
+        let dims = Mamba2Dims {
+            d_inner: 8,
+            d_state: 4,
+            ngroups: 2,
+            d_conv: 4,
+            nheads: 4,
+        };
+        let (hidden, seq, eps) = (12usize, 6usize, 1e-5f32);
+        let width = dims.d_inner + dims.d_xbc() + dims.nheads;
+        let dev = Device::Cpu;
+        let t = |v: Vec<f32>, shape: &[usize]| Tensor::from_vec(v, shape, &dev).unwrap();
+        let w_in = values(width * hidden, 11, 0.3);
+        let conv_w = values(dims.d_xbc() * dims.d_conv, 12, 0.5);
+        let conv_b = values(dims.d_xbc(), 13, 0.2);
+        let a: Vec<f32> = values(dims.nheads, 14, 0.5)
+            .iter()
+            .map(|v| -(0.5 + v.abs()))
+            .collect();
+        let dvec = values(dims.nheads, 15, 1.0);
+        let dt_bias = values(dims.nheads, 16, 0.5);
+        let norm = values(dims.d_inner, 17, 1.0);
+        let in_proj = QMatMul::from_qtensor(
+            crate::tensor::quantized::QTensor::quantize_onto(
+                &t(w_in.clone(), &[width, hidden]),
+                crate::tensor::quantized::GgmlDType::F32,
+                &dev,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let weights = Mamba2Weights {
+            in_proj,
+            conv_w: t(conv_w.clone(), &[dims.d_xbc(), dims.d_conv]),
+            conv_b: t(conv_b.clone(), &[dims.d_xbc()]),
+            a: t(a.clone(), &[dims.nheads, 1]),
+            d: t(dvec.clone(), &[dims.nheads, 1]),
+            dt_bias: t(dt_bias.clone(), &[dims.nheads]),
+            norm_w: t(norm.clone(), &[dims.ngroups, dims.d_inner / dims.ngroups]),
+        };
+        let mut mixer = Mixer::Ssm(Mamba2::new(weights, dims, eps as f64, &dev).unwrap());
+        let xs = values(seq * hidden, 18, 1.0);
+        let x = t(xs.clone(), &[1, seq, hidden]);
+        let proj: Vec<f32> = (0..seq)
+            .flat_map(|u| {
+                let xr = &xs[u * hidden..(u + 1) * hidden];
+                (0..width)
+                    .map(|o| {
+                        (0..hidden)
+                            .map(|k| w_in[o * hidden + k] * xr[k])
+                            .sum::<f32>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let want = mamba2_reference(
+            &proj, &conv_w, &conv_b, &a, &dvec, &dt_bias, &norm, dims, eps, seq,
+        );
+        let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let whole = v(&mixer.forward(&x, 0).unwrap());
+        let diff = whole
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(diff < 1e-4, "max diff {diff}");
+        // Two passes through a snapshot give the single pass.
+        mixer.forward(&x.narrow(1, 0, 4).unwrap(), 0).unwrap();
+        let snap = mixer.snapshot().unwrap().unwrap();
+        mixer.forward(&x, 0).unwrap();
+        mixer.restore(&snap).unwrap();
+        let tail = v(&mixer.forward(&x.narrow(1, 4, seq - 4).unwrap(), 4).unwrap());
+        let resumed = tail
+            .iter()
+            .zip(&whole[4 * dims.d_inner..])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(resumed < 1e-5, "resumed max diff {resumed}");
     }
 }

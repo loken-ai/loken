@@ -81,12 +81,33 @@ struct RawGenericLayer {
     moe_exp_probs_b_qt: Option<QTensor>,
     /// The recurrent mixer's own tensors; its output projection is `attn_output`.
     mixer: RawMixer,
+    /// The block has a feed-forward sublayer.
+    has_ffn: bool,
+    /// Shared expert: gate (SwiGLU) or none (squared ReLU), up, down, and the scalar gate
+    /// `[hidden]` scaling its output.
+    shexp_gate: Option<QTensor>,
+    shexp_up: Option<QTensor>,
+    shexp_down: Option<QTensor>,
+    shexp_scalar_gate_qt: Option<QTensor>,
 }
 
 /// A block's mixer tensors, as read.
 enum RawMixer {
     Attention,
-    ShortConv { in_proj: QTensor, conv: QTensor },
+    ShortConv {
+        in_proj: QTensor,
+        conv: QTensor,
+    },
+    Ssm {
+        in_proj: QTensor,
+        conv_w: QTensor,
+        conv_b: Option<QTensor>,
+        a: QTensor,
+        d: QTensor,
+        dt_bias: QTensor,
+        norm: QTensor,
+    },
+    Absent,
 }
 
 /// Helper: read a tensor by name from mmap with a Cursor, or return None if absent.
@@ -709,6 +730,15 @@ fn build_generic_layer(
                     Some(std::sync::Arc::new(coerce_moe_weight(ge, device)?)),
                     Some(std::sync::Arc::new(coerce_moe_weight(ue, device)?)),
                 ),
+                // Gateless experts: the up stack alone, squared ReLU after it.
+                (None, None, Some(ue)) => (
+                    None,
+                    None,
+                    true,
+                    false,
+                    None,
+                    Some(std::sync::Arc::new(coerce_moe_weight(ue, device)?)),
+                ),
                 (Some(gus_fused), _, _) => (
                     Some(coerce_moe_weight(gus_fused, device)?),
                     None,
@@ -791,6 +821,21 @@ fn build_generic_layer(
             (None, None)
         };
         let swiglu_clamp = config.expert_swiglu_clamp.filter(|_| gate_sep.is_some());
+        let up_only = gus.is_none() && gate_sep.is_none() && up_sep.is_some();
+        let shared_expert = match (raw.shexp_up, raw.shexp_down) {
+            (Some(up), Some(down)) => Some(SharedExpert {
+                gate: to_qmatmul(raw.shexp_gate)?,
+                up: to_qmatmul(Some(up))?.unwrap(),
+                down: to_qmatmul(Some(down))?.unwrap(),
+                scalar_gate: load_bias(raw.shexp_scalar_gate_qt)?
+                    .map(|w| {
+                        let n = w.elem_count();
+                        w.to_dtype(crate::tensor::DType::F32)?.reshape((n, 1))
+                    })
+                    .transpose()?,
+            }),
+            _ => None,
+        };
         let gate_inp_bias = load_bias(raw.moe_gate_inp_bias_qt)?;
         let gate_exps_bias = load_bias(raw.moe_gate_exps_bias_qt)?;
         let up_exps_bias = load_bias(raw.moe_up_exps_bias_qt)?;
@@ -841,6 +886,8 @@ fn build_generic_layer(
                     })
                 })
                 .transpose()?,
+            up_relu2: up_only,
+            shared_expert,
             gate_up_exps_f32: gus_f32,
             down_exps_f32: des_f32,
         })
@@ -860,6 +907,47 @@ fn build_generic_layer(
                 device,
             )?)
         }
+        RawMixer::Ssm {
+            in_proj,
+            conv_w,
+            conv_b,
+            a,
+            d,
+            dt_bias,
+            norm,
+        } => {
+            let meta = config.ssm.ok_or_else(|| {
+                crate::tensor::Error::msg("ssm layer in a file without ssm.inner_size")
+            })?;
+            let host = |qt: QTensor| qt.dequantize(&Device::Cpu);
+            let a = host(a)?;
+            let dims = super::mixer::Mamba2Dims {
+                d_inner: meta.inner_size,
+                d_state: meta.state_size,
+                ngroups: meta.group_count.max(1),
+                d_conv: meta.conv_kernel,
+                nheads: a.elem_count(),
+            };
+            let conv_b = match conv_b {
+                Some(b) => host(b)?,
+                None => Tensor::zeros(dims.d_xbc(), crate::tensor::DType::F32)?,
+            };
+            super::mixer::Mixer::Ssm(super::mixer::Mamba2::new(
+                super::mixer::Mamba2Weights {
+                    in_proj: to_qmatmul(Some(in_proj))?.unwrap(),
+                    conv_w: host(conv_w)?,
+                    conv_b,
+                    a,
+                    d: host(d)?,
+                    dt_bias: host(dt_bias)?,
+                    norm_w: host(norm)?,
+                },
+                dims,
+                eps,
+                device,
+            )?)
+        }
+        RawMixer::Absent => super::mixer::Mixer::Absent,
     };
     let attends = matches!(mixer, super::mixer::Mixer::Attention);
 
@@ -897,6 +985,7 @@ fn build_generic_layer(
 
     Ok(GenericTransformerLayer {
         mixer,
+        has_ffn: raw.has_ffn,
         attn_q,
         attn_k,
         attn_v,
@@ -1348,6 +1437,7 @@ fn build_awq_layer(
 
     Ok(GenericTransformerLayer {
         mixer: super::mixer::Mixer::Attention,
+        has_ffn: true,
         attn_q,
         attn_k,
         attn_v,
@@ -1874,9 +1964,21 @@ impl GenericHeteroTransformer {
                     required_tensor(ti, mmap_bytes, tdo, $name, &Device::Cpu, mmap_owner)
                 };
             }
+            // A tiny Q8 weight for a projection field the layer never runs.
+            let placeholder = || -> crate::tensor::Result<QTensor> {
+                let z =
+                    Tensor::zeros_on((32usize, 32usize), crate::tensor::DType::F32, weight_dev)?;
+                QTensor::quantize_onto(&z, crate::tensor::quantized::GgmlDType::Q8_0, weight_dev)
+            };
 
             let mixer_kind = super::mixer::layer_mixer_kind(&content, idx);
             let attends = mixer_kind == super::mixer::MixerKind::Attention;
+            let has_ffn = super::mixer::layer_has_ffn(&content, idx);
+            if ti.contains_key(&format!("{prefix}.ffn_latent_down.weight")) {
+                return Err(crate::tensor::Error::msg(format!(
+                    "{prefix}: routed experts behind a latent projection are not supported"
+                )));
+            }
             // Attention
             let (attn_q, attn_k, attn_v, attn_qkv) = if !attends {
                 (None, None, None, None)
@@ -1930,6 +2032,21 @@ impl GenericHeteroTransformer {
                         conv: req_cpu!(&format!("{prefix}.shortconv.conv.weight"))?,
                     },
                 ),
+                super::mixer::MixerKind::Ssm => (
+                    req!(&format!("{prefix}.ssm_out.weight"))?,
+                    RawMixer::Ssm {
+                        in_proj: req!(&format!("{prefix}.ssm_in.weight"))?,
+                        conv_w: req_cpu!(&format!("{prefix}.ssm_conv1d.weight"))?,
+                        conv_b: opt_cpu!(&format!("{prefix}.ssm_conv1d.bias"))?,
+                        a: req_cpu!(&format!("{prefix}.ssm_a"))?,
+                        d: req_cpu!(&format!("{prefix}.ssm_d"))?,
+                        dt_bias: req_cpu!(&format!("{prefix}.ssm_dt.bias"))?,
+                        norm: req_cpu!(&format!("{prefix}.ssm_norm.weight"))?,
+                    },
+                ),
+                // A feed-forward block alone: its output projection is never read, so a tiny
+                // placeholder stands in for the non-optional field.
+                super::mixer::MixerKind::Absent => (placeholder()?, RawMixer::Absent),
             };
             // Phi2: attn_output bias
             let attn_output_bias_qt = if attends && f.has_attn_output_bias {
@@ -1978,7 +2095,12 @@ impl GenericHeteroTransformer {
             } else {
                 None
             };
-            let ffn_norm_qt = if f.parallel_attn {
+            let ffn_norm_qt = if !has_ffn {
+                None
+            } else if mixer_kind == super::mixer::MixerKind::Absent {
+                // A block that is a feed-forward alone normalises its input with its one norm.
+                Some(req_cpu!(&format!("{prefix}.attn_norm.weight"))?)
+            } else if f.parallel_attn {
                 None
             } else if f.has_post_ffn_norm {
                 // OLMo2 post-norm-only: pre-ffn-norm absent -> Identity at build.
@@ -1993,36 +2115,25 @@ impl GenericHeteroTransformer {
             };
 
             // FFN
-            let (ffn_gate, ffn_up, ffn_down) =
-                if f.is_moe && !ti.contains_key(&format!("{prefix}.ffn_up.weight")) {
-                    // Standard MoE (granitemoe): the experts ARE the FFN - there is
-                    // no dense/shared FFN (unlike gemma4-MoE). ffn_up/ffn_down are
-                    // never forwarded (layer-forward branches to MoE-only), so load
-                    // tiny Q8 placeholders to satisfy the non-Option struct fields.
-                    let dummy = || -> crate::tensor::Result<QTensor> {
-                        let z = Tensor::zeros_on(
-                            (32usize, 32usize),
-                            crate::tensor::DType::F32,
-                            weight_dev,
-                        )?;
-                        QTensor::quantize_onto(
-                            &z,
-                            crate::tensor::quantized::GgmlDType::Q8_0,
-                            weight_dev,
-                        )
-                    };
-                    (None, dummy()?, dummy()?)
-                } else if f.fused_ffn_gate_up {
-                    // Phi3: no separate gate
-                    let up = req!(&format!("{prefix}.ffn_up.weight"))?;
-                    let down = req!(&format!("{prefix}.ffn_down.weight"))?;
-                    (None, up, down)
-                } else {
-                    let gate = req!(&format!("{prefix}.ffn_gate.weight"))?;
-                    let up = req!(&format!("{prefix}.ffn_up.weight"))?;
-                    let down = req!(&format!("{prefix}.ffn_down.weight"))?;
-                    (Some(gate), up, down)
-                };
+            let (ffn_gate, ffn_up, ffn_down) = if !has_ffn {
+                (None, placeholder()?, placeholder()?)
+            } else if f.is_moe && !ti.contains_key(&format!("{prefix}.ffn_up.weight")) {
+                // Standard MoE (granitemoe): the experts ARE the FFN - there is
+                // no dense/shared FFN (unlike gemma4-MoE). ffn_up/ffn_down are
+                // never forwarded (layer-forward branches to MoE-only), so load
+                // tiny Q8 placeholders to satisfy the non-Option struct fields.
+                (None, placeholder()?, placeholder()?)
+            } else if f.fused_ffn_gate_up {
+                // Phi3: no separate gate
+                let up = req!(&format!("{prefix}.ffn_up.weight"))?;
+                let down = req!(&format!("{prefix}.ffn_down.weight"))?;
+                (None, up, down)
+            } else {
+                let gate = req!(&format!("{prefix}.ffn_gate.weight"))?;
+                let up = req!(&format!("{prefix}.ffn_up.weight"))?;
+                let down = req!(&format!("{prefix}.ffn_down.weight"))?;
+                (Some(gate), up, down)
+            };
             // Phi2: ffn biases
             let (ffn_up_bias_qt, ffn_down_bias_qt) = if f.has_ffn_bias {
                 let up_b = opt_cpu!(&format!("{prefix}.ffn_up.bias"))?;
@@ -2164,6 +2275,11 @@ impl GenericHeteroTransformer {
                 post_ffw_norm_2_qt,
                 moe_exp_probs_b_qt,
                 mixer,
+                has_ffn,
+                shexp_gate: opt_dev!(&format!("{prefix}.ffn_gate_shexp.weight"))?,
+                shexp_up: opt_dev!(&format!("{prefix}.ffn_up_shexp.weight"))?,
+                shexp_down: opt_dev!(&format!("{prefix}.ffn_down_shexp.weight"))?,
+                shexp_scalar_gate_qt: opt_cpu!(&format!("{prefix}.ffn_gate_inp_shexp.weight"))?,
             })
         };
 

@@ -65,6 +65,8 @@ pub struct GenericTransformerLayer {
     /// What mixes the tokens: the attention fields below, or a recurrent operator whose
     /// output projection is `attn_output`.
     pub mixer: mixer::Mixer,
+    /// The layer has a feed-forward sublayer; a hybrid block may be a mixer alone.
+    pub has_ffn: bool,
     // Attention - split Q/K/V (most models)
     pub attn_q: Option<QMatMul>,
     pub attn_k: Option<QMatMul>,

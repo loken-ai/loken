@@ -991,9 +991,6 @@ impl DeepseekV41Backend {
     }
 }
 
-/// nemotron_h_moe: hybrid Mamba2 + attention + non-gated MoE, multi-device.
-pub(crate) struct NemotronHBackend(pub crate::inference::model::nemotron_h::NemotronHModel);
-
 /// qwen35moe: hybrid gated-DeltaNet + attention + softmax MoE, multi-device.
 /// Also runs on CPU (text): the DeltaNet recurrence uses the pure tensor-op
 /// `forward_pertoken` path and the MoE GEMM the fallback CPU path. Vision is
@@ -1033,7 +1030,6 @@ pub(crate) struct TakenBackend;
 unsafe impl Send for MoondreamBackend {}
 unsafe impl Send for GenericBackend {}
 unsafe impl Send for GenericVisionBackend {}
-unsafe impl Send for NemotronHBackend {}
 unsafe impl Send for Qwen35MoeBackend {}
 #[cfg(feature = "cuda")]
 unsafe impl Send for TpQwen2Backend {}
@@ -1546,26 +1542,6 @@ impl ModelBackend for GenericVisionBackend {
     ) -> crate::tensor::Result<Tensor> {
         self.text
             .forward_with_image_embeds(bos_token, text_input, image_embeds)
-    }
-
-    take_generic_passthrough!();
-}
-
-impl ModelBackend for NemotronHBackend {
-    fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.0.forward(x, index_pos)
-    }
-
-    fn snapshot_prefix(&mut self, prompt: &[u32], logits: &Tensor) -> crate::tensor::Result<()> {
-        self.0.snapshot_prefix(prompt, logits)
-    }
-
-    fn try_restore_prefix(&mut self, prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
-        self.0.try_restore_prefix(prompt)
-    }
-
-    fn device_layer_distribution(&self) -> Vec<(String, usize, u32, u32)> {
-        group_layers_by_device(self.0.layer_device_locations())
     }
 
     take_generic_passthrough!();

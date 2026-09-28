@@ -173,23 +173,6 @@ extern "C" void loken_softplus_bias(
     loken_softplus_bias_kernel<<<grid, block, 0, stream>>>(dt, bias, out, rows, cols);
 }
 
-// out_f16 = f16(a_f32 + f32(b_f16)). Collapses the a.broadcast_add(b.to_f32())
-// .to_f16() chain (cast+add+cast = 3 dispatches -> 1). All F32 math -> bit-identical.
-// nemotron MoE shared-expert merge into the routed (F32) output, written F16.
-__global__ void loken_add_to_f16_kernel(
-    const float* __restrict__ a, const __half* __restrict__ b, __half* __restrict__ out, long n
-) {
-    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = __float2half(a[i] + __half2float(b[i]));
-}
-
-extern "C" void loken_add_to_f16(const float* a, const void* b, void* out, long n, cudaStream_t stream) {
-    const int block = 256;
-    const long grid = (n + block - 1) / block;
-    loken_add_to_f16_kernel<<<grid, block, 0, stream>>>(a, (const __half*)b, (__half*)out, n);
-}
-
 // Partial NEOX RoPE in one launch (was narrow+contiguous+rope+cat+contiguous, x2
 // for q & k). Rotates the first `rope_dim` dims (NEOX: split into two halves of
 // rope_dim/2; pair (i, i+rope_dim/2)); dims [rope_dim, hd) pass through. x is

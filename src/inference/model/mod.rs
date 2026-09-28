@@ -26,7 +26,6 @@ pub mod mixformer;
 /// The vision-tower metadata a llama.cpp `mmproj` GGUF carries.
 pub mod mmproj;
 pub mod moondream;
-pub mod nemotron_h;
 #[cfg(feature = "audio")]
 pub mod parler;
 /// Cutting an image into patches, and putting it back.

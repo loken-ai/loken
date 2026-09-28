@@ -99,9 +99,6 @@ pub fn paged_rope_f16(
 ) -> Result<Option<Tensor>> {
     Ok(None)
 }
-pub fn add_to_f16(_a: &Tensor, _b: &Tensor) -> Result<Option<Tensor>> {
-    Ok(None)
-}
 pub fn softplus_bias(_dt: &Tensor, _bias: &Tensor) -> Result<Option<Tensor>> {
     Ok(None)
 }

@@ -1056,9 +1056,13 @@ impl Qwen35DeltaNet {
             // blocks (h / rep) as the file says.
             let spread = |x: Tensor| -> Result<Tensor> {
                 if self.v_heads_tiled {
-                    x.unsqueeze(1)?.broadcast_as((b, rep, kg, kd))?.reshape((b, vg, kd))
+                    x.unsqueeze(1)?
+                        .broadcast_as((b, rep, kg, kd))?
+                        .reshape((b, vg, kd))
                 } else {
-                    x.unsqueeze(2)?.broadcast_as((b, kg, rep, kd))?.reshape((b, vg, kd))
+                    x.unsqueeze(2)?
+                        .broadcast_as((b, kg, rep, kd))?
+                        .reshape((b, vg, kd))
                 }
             };
             let q = spread(q)?;
@@ -1808,11 +1812,10 @@ impl Qwen35MoeModel {
         let cfg = Qwen35Config::from_gguf(content)?;
         let n_dev = devices.len().max(1);
         // VRAM-weighted split: fill the fastest GPU first (vs the old equal-count
-        // split that let the slow GPU gate sequential decode). Shared with nemotron.
+        // split that let the slow GPU gate sequential decode).
         // Real per-layer byte sizes (DeltaNet vs MoE blocks differ hugely) so the
         // fast GPU packs to its true budget instead of being under-filled.
-        let layer_sizes =
-            crate::inference::model::nemotron_h::layer_byte_sizes(content, cfg.n_layers);
+        let layer_sizes = layer_byte_sizes(content, cfg.n_layers);
         // A mixture's expert weights are ~97% of its bytes and only `n_expert_used` of them
         // are read per token; everything else in the layer is read for EVERY token. Sizing
         // the plan by the total puts both on the same side of a spill, so a model that does
@@ -1861,7 +1864,7 @@ impl Qwen35MoeModel {
         } else {
             &layer_sizes
         };
-        let plan = crate::inference::model::nemotron_h::plan_layer_devices(
+        let plan = plan_layer_devices(
             cfg.n_layers,
             n_dev,
             if split_experts { hot_total } else { file_size },
@@ -2300,6 +2303,101 @@ impl Qwen35MoeModel {
             .forward(&x.to_dtype(self.dtype)?)?
             .to_dtype(DType::F32)
     }
+}
+
+/// Assign each layer to a device by filling the FASTEST GPU (devices[0], passed
+/// fastest-first) to its VRAM capacity before spilling to the next. When the cards
+/// differ in bandwidth - which any mixed pair does - an equal-layer-count split
+/// lets the SLOW GPU gate the sequential decode; packing more layers onto the
+/// fast GPU minimizes total per-token time. `gpu_avail` = usable bytes/device,
+/// fastest-first. Empty/len-mismatch ⇒ even split (the old behavior).
+fn plan_layer_devices(
+    n_layers: usize,
+    n_dev: usize,
+    file_size: u64,
+    gpu_avail: &[u64],
+    layer_sizes: &[u64],
+    reserve_bytes: u64,
+) -> Vec<usize> {
+    if n_dev <= 1 {
+        return vec![0; n_layers];
+    }
+    if gpu_avail.len() != n_dev || file_size == 0 {
+        // even-count split (the old behavior / OOM fallback)
+        return (0..n_layers)
+            .map(|l| (l * n_dev / n_layers.max(1)).min(n_dev - 1))
+            .collect();
+    }
+    // Fill each GPU to its configured budget - `gpu_avail` is already
+    // stable_free x max_gpu_memory_fraction - spilling to the next (slower) GPU
+    // only once the fast one is full, so the slow card gates as few layers as
+    // possible in the sequential decode.
+    //
+    // Use REAL per-layer byte sizes when available: these arches are wildly
+    // non-uniform (a MoE block with N experts dwarfs an SSM/conv block), so a
+    // uniform file_size/n_layers estimate mis-counts the fast-GPU boundary and
+    // leaves it under-filled (the fast card ends up with FEWER bytes than the
+    // slow one - the opposite of the intent). Real sizes pack the fast GPU to
+    // its true budget. The non-layer tensors (token embedding, output head,
+    // final norm) live on devices[0], so charge their bytes to GPU0 up front.
+    let use_real = layer_sizes.len() == n_layers;
+    let uniform = (file_size / n_layers.max(1) as u64).max(1);
+    let layer_b = |l: usize| -> u64 {
+        if use_real {
+            layer_sizes[l].max(1)
+        } else {
+            uniform
+        }
+    };
+    let head_bytes = if use_real {
+        file_size.saturating_sub(layer_sizes.iter().copied().sum::<u64>())
+    } else {
+        0
+    };
+    // Reserve per-GPU activation/KV headroom before filling: the chunk's
+    // attention scores [chunk, kv_len], MoE expert activations and the growing
+    // KV cache all allocate on the layer's device. `reserve_bytes` is the
+    // model's PRECISE runtime peak (KV at context + cuBLAS workspace + one
+    // prefill-chunk activation) - the same figure the dense planner trusts  -
+    // not a blanket margin, so low-KV hybrids (mostly SSM/conv layers, few
+    // attention layers) pack the fast GPU much fuller instead of stranding ~1 GB.
+    // Any residual prefill OOM from packing tight is caught by the adaptive
+    // chunker (it halves the compute chunk and retries); load-time OOM falls
+    // back to an even split. Floor at 640 MB so the cuBLAS workspace + a min
+    // chunk always fit even if the caller passes 0.
+    let reserve = reserve_bytes.max(640 * 1024 * 1024);
+    let mut plan = Vec::with_capacity(n_layers);
+    let mut di = 0usize;
+    let mut used = head_bytes; // GPU0 already holds the embed/output head
+    for l in 0..n_layers {
+        let budget = gpu_avail[di].saturating_sub(reserve);
+        let lb = layer_b(l);
+        if di + 1 < n_dev && used + lb > budget {
+            di += 1;
+            used = 0;
+        }
+        plan.push(di);
+        used += lb;
+    }
+    plan
+}
+
+/// Sum the GGUF tensor bytes belonging to each transformer block `blk.{i}.*`,
+/// giving real (non-uniform) per-layer sizes for the device planner.
+fn layer_byte_sizes(content: &gguf_file::Content, n_layers: usize) -> Vec<u64> {
+    let mut sizes = vec![0u64; n_layers];
+    for (name, info) in content.tensor_infos.iter() {
+        if let Some(rest) = name.strip_prefix("blk.") {
+            if let Some(dot) = rest.find('.') {
+                if let Ok(i) = rest[..dot].parse::<usize>() {
+                    if i < n_layers {
+                        sizes[i] += info.size_in_bytes() as u64;
+                    }
+                }
+            }
+        }
+    }
+    sizes
 }
 
 #[cfg(test)]

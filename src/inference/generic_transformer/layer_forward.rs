@@ -1458,8 +1458,8 @@ impl GenericTransformerLayer {
         donor_f16: Option<&crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
         #[cfg(feature = "cuda")] shared_kv_q8: Option<&crate::inference::cache::q8_kv::Q8KvCache>,
     ) -> Result<Tensor> {
-        if self.mixer.is_recurrent() {
-            return self.forward_recurrent(x, index_pos);
+        if self.is_hybrid() {
+            return self.forward_hybrid(x, mask, index_pos);
         }
         // Zero-alloc dense-CPU single-token decode fast path (eligible
         // arches only; falls through to the Tensor forward otherwise).

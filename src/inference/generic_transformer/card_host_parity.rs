@@ -881,3 +881,21 @@ fn lfm2_generic_route_matches_the_reference() {
         "lfm2_latest_greedy.json",
     );
 }
+
+/// nemotron-H (Mamba2 blocks, attention blocks, routed blocks) through the generic route
+/// decodes greedily what the reference decoded.
+///
+/// Ignored by default: it needs nemotron-3-nano:latest in the store, the CUDA cards idle,
+/// and a reference run recorded as `reference_run` says. Run with
+///   LOKEN_NEMOTRON_H_REFERENCE=/path/to/reference.json cargo test --release --lib \
+///     nemotron_h_generic_route_matches_the_reference -- --ignored --nocapture
+#[test]
+#[ignore = "needs nemotron-3-nano:latest in the store, idle CUDA cards and a reference run"]
+fn nemotron_h_generic_route_matches_the_reference() {
+    generic_route_matches_the_reference(
+        "nemotron-3-nano:latest",
+        &["nemotron_h_moe"],
+        "LOKEN_NEMOTRON_H_REFERENCE",
+        "nemotron_3_nano_greedy.json",
+    );
+}

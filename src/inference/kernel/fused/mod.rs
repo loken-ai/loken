@@ -21,8 +21,6 @@ cuda_launchers! {
         out: *mut f32, n_tokens: i32, hidden: i32);
     loken_relu2_f16(x: *const c_void, out: *mut c_void, n: i64);
     loken_softplus_bias(dt: *const f32, bias: *const f32, out: *mut f32, rows: i32, cols: i32);
-    loken_add_to_f16(
-        a: *const f32, b: *const c_void, out: *mut c_void, n: i64);
     loken_neox_rope_f16(x: *const c_void, cos: *const c_void,
         sin: *const c_void, out: *mut c_void, outer: i32, seq: i32,
         hd: i32, rope_dim: i32);

@@ -507,6 +507,8 @@ impl GenericTransformerLayer {
             && x.device().is_cuda()
             && self.attn_qkv.is_some()
             && rope_ok
+            // The fused kernels rotate every head: a layer without RoPE takes the unfused path.
+            && !self.no_rope
             && self.rope_freq_factors.is_none()
             // NOTE: graph mode is now ALLOWED here (was gated out by
             // graph_rope_cos.is_none()). In graph mode the fused kernel reads

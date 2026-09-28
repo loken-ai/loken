@@ -1328,7 +1328,6 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("inference/generic_transformer/loader.rs", (5, 0, 0)),
     ("inference/generic_transformer/projection.rs", (1, 0, 1)),
     ("inference/load/requantize.rs", (0, 0, 1)),
-    ("inference/model/nemotron_h/mod.rs", (1, 0, 0)),
     ("inference/model/qwen35/moe.rs", (1, 0, 0)),
     ("inference/offload/cuda.rs", (1, 0, 0)),
     ("inference/offload/streamed.rs", (2, 0, 0)),

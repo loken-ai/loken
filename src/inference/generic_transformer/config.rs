@@ -326,6 +326,11 @@ pub fn arch_conventions(arch: &str) -> ArchConventions {
             expert_swiglu_clamp: Some((1.702, 7.0)),
             ..ArchConventions::default()
         },
+        // nemotron_h_moe: the reference routes by sigmoid whatever the file says.
+        "nemotron_h_moe" => ArchConventions {
+            sigmoid_expert_gating: true,
+            ..ArchConventions::default()
+        },
         // lfm2moe: the reference renormalises the routed weights of its sigmoid router
         // whatever the file says.
         "lfm2moe" => ArchConventions {
@@ -394,6 +399,8 @@ pub struct GenericTransformerConfig {
     pub expert_weights_norm: bool,
     /// Multiplies sigmoid-routed weights; 1 when the file gives none or zero.
     pub expert_weights_scale: f64,
+    /// The recurrent mixers' dimensions, when the file gives `ssm.inner_size`.
+    pub ssm: Option<SsmMeta>,
     pub flags: GenericLayerFlags,
     /// Per-layer KV cache storage mode. Off -> F-dtype SpecKvCache only;
     /// Q8 -> also maintain a Q8KvCache alongside so the decode-path (seq=1)
@@ -403,6 +410,25 @@ pub struct GenericTransformerConfig {
     /// at max_q8_seq_len x head_dim bytes). Defaults to 8192 - call
     /// `with_max_q8_seq_len` at config construction to raise for long-ctx.
     pub max_q8_seq_len: usize,
+}
+
+/// The `ssm.*` metadata of a model with state-space or delta-rule mixers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SsmMeta {
+    /// Taps of the causal convolution ahead of the recurrence.
+    pub conv_kernel: usize,
+    /// Width of the recurrent state per head (Mamba2 `d_state`, the delta rule's key
+    /// head width).
+    pub state_size: usize,
+    /// Groups sharing `B`/`C` (Mamba2), key heads (delta rule).
+    pub group_count: usize,
+    /// Heads (Mamba2 `dt` rank), value heads (delta rule).
+    pub time_step_rank: usize,
+    /// Channels the recurrence runs over.
+    pub inner_size: usize,
+    /// The delta rule's value head `h` reads key head `h % group_count` rather than
+    /// `h / (time_step_rank / group_count)`.
+    pub v_heads_tiled: bool,
 }
 
 /// Which pairing RoPE rotates a head with: adjacent lanes `(2i, 2i+1)` (true) or
@@ -445,7 +471,6 @@ pub fn rope_pairing(arch: &str) -> std::result::Result<bool, String> {
         "qwen35",
         "qwen35moe",
         "gptoss",
-        "nemotron_h_moe",
         "lfm2",
         "lfm2moe",
         "gemma",
@@ -468,10 +493,11 @@ pub fn rope_pairing(arch: &str) -> std::result::Result<bool, String> {
         "dbrx",
         "orion",
     ];
-    // Positions come from somewhere other than a rotation - an attention bias, or
-    // learned embeddings. The pairing is never consulted, so the value below is
-    // inert; these are listed to keep the gate exhaustive rather than to choose.
-    const NO_ROPE: &[&str] = &["mpt"];
+    // Positions come from somewhere other than a rotation - an attention bias, learned
+    // embeddings, or the recurrent layers of a hybrid. The pairing is never consulted,
+    // so the value below is inert; these are listed to keep the gate exhaustive rather
+    // than to choose.
+    const NO_ROPE: &[&str] = &["mpt", "nemotron_h_moe"];
     if ADJACENT.contains(&arch) {
         Ok(true)
     } else if HALF_SPLIT.contains(&arch) || NO_ROPE.contains(&arch) {
@@ -495,6 +521,8 @@ pub fn rope_pairing(arch: &str) -> std::result::Result<bool, String> {
 pub fn no_rope_layer_period(arch: &str) -> Option<usize> {
     match arch {
         "smollm3" => Some(4),
+        // The reference rotates no nemotron-H attention layer.
+        "nemotron_h_moe" => Some(1),
         _ => None,
     }
 }
@@ -674,6 +702,18 @@ impl GenericTransformerConfig {
                 .and_then(|v| v.to_bool().ok())
                 .unwrap_or(false)
         });
+        let ssm = meta_u32(content, arch, "ssm.inner_size").map(|inner| SsmMeta {
+            conv_kernel: meta_u32(content, arch, "ssm.conv_kernel").unwrap_or(0) as usize,
+            state_size: meta_u32(content, arch, "ssm.state_size").unwrap_or(0) as usize,
+            group_count: meta_u32(content, arch, "ssm.group_count").unwrap_or(1) as usize,
+            time_step_rank: meta_u32(content, arch, "ssm.time_step_rank").unwrap_or(0) as usize,
+            inner_size: inner as usize,
+            v_heads_tiled: content
+                .metadata
+                .get(&format!("{arch}.ssm.v_head_reordered"))
+                .and_then(|v| v.to_bool().ok())
+                .unwrap_or(false),
+        });
         let expert_weights_scale = match meta_f32(content, arch, "expert_weights_scale") {
             Some(s) if s != 0.0 => s as f64,
             _ => 1.0,
@@ -754,6 +794,7 @@ impl GenericTransformerConfig {
             expert_sigmoid_gating,
             expert_weights_norm,
             expert_weights_scale,
+            ssm,
             shared_kv_layers,
             embed_scale,
             logit_scale,
@@ -1093,6 +1134,98 @@ mod arch_conventions_tests {
         assert_eq!(cfg.head_dim, 8, "embedding length over heads");
         assert!(!cfg.flags.use_rope_i);
         assert!(!cfg.flags.parallel_attn);
+    }
+
+    #[test]
+    fn a_nemotron_h_file_configures_its_blocks_without_rope() {
+        use super::super::mixer::{
+            attention_probe_layer, layer_has_ffn, layer_mixer_kind, MixerKind,
+        };
+        let (hidden, heads, hd, experts, inner, state, groups) =
+            (32usize, 4usize, 8usize, 4usize, 64usize, 8usize, 2usize);
+        let nheads = 8usize;
+        let meta = vec![
+            ("attention.head_count", Value::U32(heads as u32)),
+            (
+                "attention.head_count_kv",
+                Value::Array(vec![Value::U32(0), Value::U32(0), Value::U32(2)]),
+            ),
+            ("attention.key_length", Value::U32(hd as u32)),
+            ("attention.layer_norm_rms_epsilon", Value::F32(1e-5)),
+            ("block_count", Value::U32(3)),
+            ("embedding_length", Value::U32(hidden as u32)),
+            ("expert_count", Value::U32(experts as u32)),
+            ("expert_used_count", Value::U32(2)),
+            ("expert_weights_norm", Value::Bool(true)),
+            ("expert_weights_scale", Value::F32(2.5)),
+            ("ssm.conv_kernel", Value::U32(4)),
+            ("ssm.inner_size", Value::U32(inner as u32)),
+            ("ssm.state_size", Value::U32(state as u32)),
+            ("ssm.group_count", Value::U32(groups as u32)),
+            ("ssm.time_step_rank", Value::U32(nheads as u32)),
+        ];
+        let xbc = inner + 2 * groups * state;
+        let tensors: Vec<(&str, Vec<usize>)> = vec![
+            ("token_embd.weight", vec![100, hidden]),
+            ("output_norm.weight", vec![hidden]),
+            ("blk.0.attn_norm.weight", vec![hidden]),
+            ("blk.0.ssm_in.weight", vec![inner + xbc + nheads, hidden]),
+            ("blk.0.ssm_conv1d.weight", vec![xbc, 4]),
+            ("blk.0.ssm_a", vec![nheads, 1]),
+            ("blk.0.ssm_d", vec![nheads, 1]),
+            ("blk.0.ssm_dt.bias", vec![nheads]),
+            ("blk.0.ssm_norm.weight", vec![groups, inner / groups]),
+            ("blk.0.ssm_out.weight", vec![hidden, inner]),
+            ("blk.1.attn_norm.weight", vec![hidden]),
+            ("blk.1.ffn_gate_inp.weight", vec![experts, hidden]),
+            ("blk.1.exp_probs_b.bias", vec![experts]),
+            ("blk.1.ffn_up_exps.weight", vec![experts, hidden, hidden]),
+            ("blk.1.ffn_down_exps.weight", vec![experts, hidden, hidden]),
+            ("blk.1.ffn_up_shexp.weight", vec![hidden, hidden]),
+            ("blk.1.ffn_down_shexp.weight", vec![hidden, hidden]),
+            ("blk.2.attn_norm.weight", vec![hidden]),
+            ("blk.2.attn_q.weight", vec![heads * hd, hidden]),
+            ("blk.2.attn_k.weight", vec![2 * hd, hidden]),
+            ("blk.2.attn_v.weight", vec![2 * hd, hidden]),
+            ("blk.2.attn_output.weight", vec![hidden, heads * hd]),
+        ];
+        let content = synth_content("nemotron_h_moe", &meta, &tensors);
+        let cfg = GenericTransformerConfig::from_gguf(&content, "nemotron_h_moe").unwrap();
+        assert_eq!(layer_mixer_kind(&content, 0), MixerKind::Ssm);
+        assert_eq!(layer_mixer_kind(&content, 1), MixerKind::Absent);
+        assert_eq!(layer_mixer_kind(&content, 2), MixerKind::Attention);
+        assert_eq!(
+            (0..3)
+                .map(|il| layer_has_ffn(&content, il))
+                .collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
+        assert_eq!(attention_probe_layer(&content, 3), 2);
+        assert!(cfg.flags.is_moe);
+        assert!(!cfg.flags.parallel_attn);
+        assert!(
+            cfg.expert_sigmoid_gating,
+            "the architecture routes by sigmoid"
+        );
+        assert!(cfg.expert_weights_norm, "read from the file");
+        assert_eq!(cfg.expert_weights_scale, 2.5);
+        let ssm = cfg.ssm.expect("ssm metadata");
+        assert_eq!(
+            (
+                ssm.conv_kernel,
+                ssm.inner_size,
+                ssm.state_size,
+                ssm.group_count,
+                ssm.time_step_rank
+            ),
+            (4, inner, state, groups, nheads)
+        );
+        assert_eq!(
+            no_rope_layer_period("nemotron_h_moe"),
+            Some(1),
+            "no layer rotates"
+        );
+        assert!(rope_pairing("nemotron_h_moe").is_ok());
     }
 
     #[test]

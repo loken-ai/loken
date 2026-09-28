@@ -717,62 +717,6 @@ impl LlmEngine {
                     device = built_on;
                     Box::new(MoondreamBackend(model))
                 }
-                "nemotron_h_moe" => {
-                    // nemotron-H: hybrid Mamba2 + attention + non-gated MoE.
-                    // Float weights requantized to Q8_0 at load (F16-stream
-                    // MMVQ path); SSM recurrence / norms / softmax
-                    // / MoE run in F32. Layer-split across all CUDA GPUs.
-                    let dtype = crate::tensor::DType::F16;
-                    let mut gpu_ids: Vec<usize> = cuda_devices.iter().map(|(i, _)| *i).collect();
-                    gpu_ids.sort_unstable();
-                    let mut gpu_list: Vec<Device> = Vec::new();
-                    for idx in &gpu_ids {
-                        match Device::new_cuda(*idx) {
-                            Ok(d) => gpu_list.push(d),
-                            Err(e) => warn!("nemotron_h: skipping GPU {idx}: {e}"),
-                        }
-                    }
-                    if gpu_list.is_empty() {
-                        gpu_list.push(Device::Cpu); // CPU-only build: the host shims
-                        info!("⬇️  Loading nemotron_h_moe (Mamba2+attn+MoE) on CPU");
-                    } else {
-                        info!("⬇️  Loading nemotron_h_moe (Mamba2+attn+MoE) across {} CUDA GPU(s)", gpu_list.len());
-                    }
-                    // Per-GPU usable VRAM in gpu_list order -> bandwidth/VRAM-weighted
-                    // layer split (fill the faster GPU first; the equal-count split
-                    // let the slower GPU gate sequential decode).
-                    let file_size = mmap_bytes.len() as u64;
-                    let gpu_avail: Vec<u64> = gpu_ids.iter().map(|id|
-                        cuda_devices.iter().find(|(i, _)| i == id).map(|(_, a)| *a).unwrap_or(0)
-                    ).collect();
-                    let mut loaded: Option<BoxedModelBackend> = None;
-                    let mut last_err = String::new();
-                    // Attempt 1: weighted split. Attempt 2 (OOM): even split (empty avail).
-                    for avail in [gpu_avail.as_slice(), &[][..]] {
-                        let content_fresh = gguf_file::Content::read_mapped(&mut Cursor::new(mmap_bytes), mmap.clone())
-                            .map_err(|e| anyhow!("GGUF re-parse failed: {e}"))?;
-                        let mut reader = Cursor::new(mmap_bytes);
-                        match crate::inference::model::nemotron_h::NemotronHModel::from_gguf(
-                            &content_fresh, &mut reader, &gpu_list, dtype, avail, file_size,
-                            runtime_reserve_bytes, Some(&mmap),
-                        ) {
-                            Ok(m) => {
-                                info!("✅ nemotron_h_moe loaded ({} split) across {} GPU(s)",
-                                    if avail.is_empty() { "even" } else { "weighted" }, gpu_list.len());
-                                loaded = Some(Box::new(NemotronHBackend(m)));
-                                break;
-                            }
-                            Err(e) => {
-                                warn!("nemotron_h {} split load failed: {e}", if avail.is_empty() { "even" } else { "weighted" });
-                                last_err = e.to_string();
-                            }
-                        }
-                    }
-                    match loaded {
-                        Some(m) => m,
-                        None => return Err(anyhow!("nemotron_h load failed: {last_err}")),
-                    }
-                }
                 "deepseek4" | "deepseek41" | "deepseek_v41" => {
                     // The CPU port: latent MQA, CSA2 bands, hyper-connections, and a MoE whose
                     // routed experts are read in place from the mapping by the quantised dot
@@ -885,7 +829,8 @@ impl LlmEngine {
                 "phi" | "phi2" | "phi3" | "phi4" | "chatglm" | "glm4" | "stablelm" | "starcoder" |
                 "starcoder2" | "falcon" | "bloom" | "mpt" | "refact" | "codeshell" |
                 "granite" | "granite3" | "granitemoe" | "dbrx" | "internlm2" | "yi" | "orion" |
-                "olmo2" | "olmoe" | "ernie4_5" | "smollm3" | "lfm2" | "lfm2moe" => {
+                "olmo2" | "olmoe" | "ernie4_5" | "smollm3" | "lfm2" | "lfm2moe" |
+                "nemotron_h_moe" => {
                     debug!("⬇️  Loading '{}' as generic hetero transformer (CUDA+CPU)...", arch);
                     // An architecture without a RoPE pairing cannot build a config: refuse
                     // it here, before any weight is placed.
