@@ -3,17 +3,18 @@
 //! MIT `BS-RoFormer` repo as vendored (frozen) in ZFTurbo's
 //! `Music-Source-Separation-Training` (`models/bs_roformer/mel_band_roformer.py`).
 //!
-//! Pipeline per 8 s chunk (stereo 44.1 kHz, 352800 samples):
-//!   STFT (2048/441 Hann periodic, center REFLECT pad) -> stereo folded into the
-//!   freq axis -> 60 overlapping mel-band gathers -> per-band RMSNorm+Linear -> 384-d
-//!   band tokens -> 6 x (time transformer over frames, freq transformer over bands)
+//! Pipeline per 8 s chunk (44.1 kHz, 352800 samples per channel):
+//!   STFT (2048/441 Hann periodic, center REFLECT pad) -> channels folded into the
+//!   freq axis -> 60 overlapping mel-band gathers -> per-band RMSNorm+Linear -> model-width
+//!   band tokens -> per layer (time transformer over frames, freq transformer over bands)
 //!   with INTERLEAVED (GPT-J) rotary embeddings shared across depth per axis and
 //!   per-head sigmoid gating -> per-band mask MLP (Tanh, GLU) -> overlapping bands
 //!   scatter-ADD then averaged per bin -> complex mask x STFT -> DC bin zeroed
 //!   (`zero_dc=True` in the vendored copy) -> iSTFT.
 //!
-//! KJ config: dim 384, depth 6, heads 8, dim_head 64, time/freq_transformer_depth 1,
-//! num_bands 60, stereo, num_stems 1, mask_estimator_depth 2. 228.2M params fp32.
+//! The width, depth, heads, head width, feed-forward and mask widths and the channel count are
+//! read from the stored tensors; time/freq_transformer_depth 1, num_stems 1 and
+//! mask_estimator_depth 2 are the layout the loader walks.
 //!
 //! The 60 mel-band bin ranges come from `librosa.filters.mel(44100, 2048, 60) > 0`
 //! binarization with the first/last-bin coverage fixes. They are STATIC for the
@@ -32,13 +33,6 @@ pub const CHUNK_SIZE: usize = 352_800; // 8 s
 pub const N_FFT: usize = 2048;
 pub const HOP: usize = 441;
 const N_BINS: usize = N_FFT / 2 + 1; // 1025
-const DIM: usize = 384;
-const DEPTH: usize = 6;
-const HEADS: usize = 8;
-const DIM_HEAD: usize = 64;
-const FF_MULT: usize = 4;
-const MASK_HIDDEN: usize = DIM * 4; // 1536
-const CHANNELS: usize = 2; // stereo
 /// The model's RMSNorm is `F.normalize(x, dim=-1) * sqrt(dim) * gamma`, i.e. the
 /// l2 NORM is clamped at 1e-12 (not an eps under the mean-square). The distinction
 /// matters on near-silent band rows (high-freq bands of quiet audio): torch still
@@ -128,14 +122,17 @@ const BAND_RANGES: [(usize, usize); 60] = [
 ];
 const NUM_BANDS: usize = BAND_RANGES.len();
 
-/// Per-band model input width: bins x 2 (stereo) x 2 (re/im).
-fn band_dim(cnt: usize) -> usize {
-    cnt * CHANNELS * 2
+/// Per-band model input width: bins x channels x 2 (re/im).
+fn band_dim(cnt: usize, channels: usize) -> usize {
+    cnt * channels * 2
 }
 
-/// Sum of all per-band input widths (= 7916 for this checkpoint).
-fn total_band_dim() -> usize {
-    BAND_RANGES.iter().map(|&(_, c)| band_dim(c)).sum()
+/// Sum of all per-band input widths.
+fn total_band_dim(channels: usize) -> usize {
+    BAND_RANGES
+        .iter()
+        .map(|&(_, c)| band_dim(c, channels))
+        .sum()
 }
 
 /// How many bands cover each mono freq bin (1 or 2) - the mask-average denominator.
@@ -155,13 +152,13 @@ fn bands_per_bin() -> [f32; N_BINS] {
 pub struct MelbandTaps {
     /// `[2, 1025, T, 2]` - per-channel complex STFT (dump `stft_complex`).
     pub stft: Option<Vec<f32>>,
-    /// `[T, 60, 384]` - BandSplit output (dump `band_split_out`, batch dim dropped).
+    /// `[T, bands, dim]` - BandSplit output (dump `band_split_out`, batch dim dropped).
     pub band_split: Option<Vec<f32>>,
-    /// `[60, T, 384]` - layer-0 time-transformer output, packed (b.f, t, d).
+    /// `[bands, T, dim]` - layer-0 time-transformer output, packed (b.f, t, d).
     pub layer0_time: Option<Vec<f32>>,
-    /// `[T, 60, 384]` - layer-0 freq-transformer output, packed (b.t, f, d).
+    /// `[T, bands, dim]` - layer-0 freq-transformer output, packed (b.t, f, d).
     pub layer0_freq: Option<Vec<f32>>,
-    /// `[T, 7916]` - mask estimator output pre-scatter (dump `mask_raw`).
+    /// `[T, width]` - mask estimator output pre-scatter (dump `mask_raw`).
     pub mask_raw: Option<Vec<f32>>,
     /// `[2050, T, 2]` - scatter-added / averaged complex mask (dump `mask_avg_complex`).
     pub mask_avg: Option<Vec<f32>>,
@@ -170,27 +167,34 @@ pub struct MelbandTaps {
 /// Attention with per-head sigmoid gating (`out * to_gates(x).sigmoid()`),
 /// bias-less fused QKV, pre-RMSNorm, interleaved rotary embedding.
 struct Attention {
-    norm_g: Tensor, // [384]
-    qkv: Linear,    // [3*512, 384] no bias
-    gates: Linear,  // [8, 384] + bias
-    out: Linear,    // [384, 512] no bias
+    norm_g: Tensor, // [dim]
+    qkv: Linear,    // [3*heads*dim_head, dim] no bias
+    gates: Linear,  // [heads, dim] + bias
+    out: Linear,    // [dim, heads*dim_head] no bias
+    heads: usize,
+    dim_head: usize,
 }
 
 impl Attention {
+    /// One gate per head, so the gate's rows are the head count.
     fn load(vb: &VarBuilder) -> Result<Self> {
-        let dim_inner = HEADS * DIM_HEAD;
+        let dim = vb.shape_of("norm.gamma")?[0];
+        let heads = vb.shape_of("to_gates.weight")?[0];
+        let dim_inner = vb.shape_of("to_out.0.weight")?[1];
         Ok(Self {
-            norm_g: vb.get(DIM, "norm.gamma")?,
-            qkv: Linear::new(vb.get((3 * dim_inner, DIM), "to_qkv.weight")?, None)?,
+            norm_g: vb.get(dim, "norm.gamma")?,
+            qkv: Linear::new(vb.get((3 * dim_inner, dim), "to_qkv.weight")?, None)?,
             gates: Linear::new(
-                vb.get((HEADS, DIM), "to_gates.weight")?,
-                Some(vb.get(HEADS, "to_gates.bias")?),
+                vb.get((heads, dim), "to_gates.weight")?,
+                Some(vb.get(heads, "to_gates.bias")?),
             )?,
-            out: Linear::new(vb.get((DIM, dim_inner), "to_out.0.weight")?, None)?,
+            out: Linear::new(vb.get((dim, dim_inner), "to_out.0.weight")?, None)?,
+            heads,
+            dim_head: dim_inner / heads.max(1),
         })
     }
 
-    /// `x`: `[b, n, 384]`; `cos`/`sin`: `[n, 32]`.
+    /// `x`: `[b, n, dim]`; `cos`/`sin`: `[n, dim_head/2]`.
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let (b, n, _d) = x.dims3()?;
         let xn = melband_rms_norm(x, &self.norm_g)?;
@@ -198,18 +202,18 @@ impl Attention {
         let qkv = self
             .qkv
             .forward(&xn)?
-            .reshape((b, n, 3, HEADS, DIM_HEAD))?
+            .reshape((b, n, 3, self.heads, self.dim_head))?
             .permute([2, 0, 3, 1, 4])?
             .contiguous()?;
         let q = qkv.get_on_dim(0, 0)?.rope_i(cos, sin)?;
         let k = qkv.get_on_dim(0, 1)?.rope_i(cos, sin)?;
         let v = qkv.get_on_dim(0, 2)?;
-        let scale = (DIM_HEAD as f32).powf(-0.5);
+        let scale = (self.dim_head as f32).powf(-0.5);
         // The [b, h, n, n] score matrix for the time axis (b=60 bands, n=~801
         // frames) is ~1.2 GB f32 - chunk the independent batch rows to cap the
         // transient (bit-exact: rows never interact).
         let budget = 256usize << 20;
-        let per_row = HEADS * n * n * 4;
+        let per_row = self.heads * n * n * 4;
         let step = (budget / per_row.max(1)).clamp(1, b);
         let out = if step >= b {
             sdpa(&q, &k, &v, None, false, scale, 1.0)?
@@ -244,12 +248,12 @@ impl Attention {
         let out = out
             .transpose(1, 2)?
             .contiguous()?
-            .reshape((b, n, HEADS * DIM_HEAD))?;
+            .reshape((b, n, self.heads * self.dim_head))?;
         self.out.forward(&out)
     }
 }
 
-/// RMSNorm -> Linear(x4) -> GELU (exact/erf) -> Linear.
+/// RMSNorm -> Linear (widen) -> GELU (exact/erf) -> Linear.
 ///
 /// Only the norm is this codec's own: everything after it is the shared widen-activate-narrow
 /// triple, held as an [`Mlp`]. `Activation::Gelu` is the error-function form, which is what this
@@ -262,19 +266,21 @@ struct FeedForward {
 
 impl FeedForward {
     fn load(vb: &VarBuilder) -> Result<Self> {
-        let inner = DIM * FF_MULT;
+        let [inner, dim] = vb.shape_of("net.1.weight")?[..] else {
+            return Err(Error::msg("melband: the feed-forward is not a matrix"));
+        };
         Ok(Self {
-            norm_g: vb.get(DIM, "net.0.gamma")?,
+            norm_g: vb.get(dim, "net.0.gamma")?,
             // net indices: 0 RMSNorm, 1 Linear, 2 GELU, 3 Dropout, 4 Linear, 5 Dropout
             tail: Mlp::new(
                 Linear::new(
-                    vb.get((inner, DIM), "net.1.weight")?,
+                    vb.get((inner, dim), "net.1.weight")?,
                     Some(vb.get(inner, "net.1.bias")?),
                 )?,
                 crate::tensor::ops::Activation::Gelu,
                 Linear::new(
-                    vb.get((DIM, inner), "net.4.weight")?,
-                    Some(vb.get(DIM, "net.4.bias")?),
+                    vb.get((dim, inner), "net.4.weight")?,
+                    Some(vb.get(dim, "net.4.bias")?),
                 )?,
             ),
         })
@@ -300,7 +306,7 @@ impl TransformerBlock {
         Ok(Self {
             attn: Attention::load(&inner.pp("0"))?,
             ff: FeedForward::load(&inner.pp("1"))?,
-            out_norm_g: vb.get(DIM, "norm.gamma")?,
+            out_norm_g: vb.get(vb.shape_of("norm.gamma")?, "norm.gamma")?,
         })
     }
 
@@ -311,14 +317,14 @@ impl TransformerBlock {
     }
 }
 
-/// Per-band input featurizer: RMSNorm(dim_in) + Linear(dim_in -> 384).
+/// Per-band input featurizer: RMSNorm(dim_in) + Linear(dim_in -> dim).
 struct BandFeature {
     norm_g: Tensor,
     lin: Linear,
 }
 
-/// Per-band mask MLP (depth 2): Linear(384->1536) -> Tanh -> Linear(1536->1536)
-/// -> Tanh -> Linear(1536->2.dim_in) -> GLU.
+/// Per-band mask MLP (depth 2): Linear(dim->hidden) -> Tanh -> Linear(hidden->hidden)
+/// -> Tanh -> Linear(hidden->2.dim_in) -> GLU.
 struct MaskMlp {
     l0: Linear,
     l1: Linear,
@@ -340,8 +346,10 @@ pub struct MelBandRoformer {
     bands: Vec<BandFeature>,
     layers: Vec<(TransformerBlock, TransformerBlock)>, // (time, freq)
     masks: Vec<MaskMlp>,
-    time_freqs: Vec<f32>, // [32] rotary inv-freqs, shared across depth
+    time_freqs: Vec<f32>, // [dim_head/2] rotary inv-freqs, shared across depth
     freq_freqs: Vec<f32>,
+    /// Audio channels the model separates, folded into the frequency axis.
+    channels: usize,
     device: Device,
 }
 
@@ -350,21 +358,29 @@ impl MelBandRoformer {
     pub fn load(path: &str, device: &Device) -> Result<Self> {
         let vb = unsafe { VarBuilder::from_files(&[path], DType::F32, device)? };
 
+        // The first band's input is its bins, every channel, real and imaginary: its width
+        // over twice its bins is the channel count. Its projection's rows are the model width.
+        let first = vb.pp("band_split.to_features.0");
+        let [dim, first_in] = first.shape_of("1.weight")?[..] else {
+            return Err(Error::msg("melband: the band projection is not a matrix"));
+        };
+        let channels = first_in / (2 * BAND_RANGES[0].1);
         let mut bands = Vec::with_capacity(NUM_BANDS);
         for (b, &(_, cnt)) in BAND_RANGES.iter().enumerate() {
-            let dim_in = band_dim(cnt);
+            let dim_in = band_dim(cnt, channels);
             let p = vb.pp(format!("band_split.to_features.{b}"));
             bands.push(BandFeature {
                 norm_g: p.get(dim_in, "0.gamma")?,
                 lin: Linear::new(
-                    p.get((DIM, dim_in), "1.weight")?,
-                    Some(p.get(DIM, "1.bias")?),
+                    p.get((dim, dim_in), "1.weight")?,
+                    Some(p.get(dim, "1.bias")?),
                 )?,
             });
         }
 
-        let mut layers = Vec::with_capacity(DEPTH);
-        for l in 0..DEPTH {
+        let depth = vb.count_children("layers");
+        let mut layers = Vec::with_capacity(depth);
+        for l in 0..depth {
             let time = TransformerBlock::load(&vb.pp(format!("layers.{l}.0")))?;
             let freq = TransformerBlock::load(&vb.pp(format!("layers.{l}.1")))?;
             layers.push((time, freq));
@@ -372,34 +388,34 @@ impl MelBandRoformer {
 
         let mut masks = Vec::with_capacity(NUM_BANDS);
         for (b, &(_, cnt)) in BAND_RANGES.iter().enumerate() {
-            let dim_in = band_dim(cnt);
+            let dim_in = band_dim(cnt, channels);
             let p = vb.pp(format!("mask_estimators.0.to_freqs.{b}.0"));
+            let hidden = p.shape_of("0.weight")?[0];
             masks.push(MaskMlp {
                 l0: Linear::new(
-                    p.get((MASK_HIDDEN, DIM), "0.weight")?,
-                    Some(p.get(MASK_HIDDEN, "0.bias")?),
+                    p.get((hidden, dim), "0.weight")?,
+                    Some(p.get(hidden, "0.bias")?),
                 )?,
                 l1: Linear::new(
-                    p.get((MASK_HIDDEN, MASK_HIDDEN), "2.weight")?,
-                    Some(p.get(MASK_HIDDEN, "2.bias")?),
+                    p.get((hidden, hidden), "2.weight")?,
+                    Some(p.get(hidden, "2.bias")?),
                 )?,
                 l2: Linear::new(
-                    p.get((2 * dim_in, MASK_HIDDEN), "4.weight")?,
+                    p.get((2 * dim_in, hidden), "4.weight")?,
                     Some(p.get(2 * dim_in, "4.bias")?),
                 )?,
             });
         }
 
         // Rotary inv-freqs from the checkpoint (one shared instance per axis,
-        // aliased across the 6 layers).
-        let time_freqs = vb
-            .get(DIM_HEAD / 2, "layers.0.0.layers.0.0.rotary_embed.freqs")?
-            .to_device(&Device::Cpu)?
-            .to_vec1_f32()?;
-        let freq_freqs = vb
-            .get(DIM_HEAD / 2, "layers.0.1.layers.0.0.rotary_embed.freqs")?
-            .to_device(&Device::Cpu)?
-            .to_vec1_f32()?;
+        // aliased across the layers).
+        let freqs = |name: &str| -> Result<Vec<f32>> {
+            vb.get(vb.shape_of(name)?, name)?
+                .to_device(&Device::Cpu)?
+                .to_vec1_f32()
+        };
+        let time_freqs = freqs("layers.0.0.layers.0.0.rotary_embed.freqs")?;
+        let freq_freqs = freqs("layers.0.1.layers.0.0.rotary_embed.freqs")?;
 
         Ok(Self {
             bands,
@@ -407,11 +423,17 @@ impl MelBandRoformer {
             masks,
             time_freqs,
             freq_freqs,
+            channels,
             device: device.clone(),
         })
     }
 
-    /// Interleaved-rope cos/sin tables `[n, 32]` from the checkpoint inv-freqs.
+    /// Audio channels the model separates, planar in its input and output.
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// Interleaved-rope cos/sin tables `[n, dim_head/2]` from the checkpoint inv-freqs.
     fn rope_tables(&self, freqs: &[f32], n: usize) -> Result<(Tensor, Tensor)> {
         let half = freqs.len();
         let (mut c, mut s) = (vec![0f32; n * half], vec![0f32; n * half]);
@@ -436,18 +458,18 @@ impl MelBandRoformer {
         input: &[f32],
         mut taps: Option<&mut MelbandTaps>,
     ) -> Result<Vec<f32>> {
-        let len = input.len() / CHANNELS;
-        if input.len() != len * CHANNELS {
-            return Err(Error::msg("separate_chunk: planar stereo input expected"));
+        let channels = self.channels;
+        let len = input.len() / channels;
+        if input.len() != len * channels {
+            return Err(Error::msg("separate_chunk: planar input expected"));
         }
         // ---- STFT per channel (reflect center pad, periodic Hann) ----
-        let specs: [Vec<Frame>; 2] = [
-            stft_reflect(&input[..len], N_FFT, HOP),
-            stft_reflect(&input[len..], N_FFT, HOP),
-        ];
+        let specs: Vec<Vec<Frame>> = (0..channels)
+            .map(|c| stft_reflect(&input[c * len..(c + 1) * len], N_FFT, HOP))
+            .collect();
         let t = specs[0].len();
         if let Some(tp) = taps.as_deref_mut() {
-            let mut v = vec![0f32; 2 * N_BINS * t * 2];
+            let mut v = vec![0f32; channels * N_BINS * t * 2];
             for (s, spec) in specs.iter().enumerate() {
                 for (ti, frame) in spec.iter().enumerate() {
                     for (f, &(re, im)) in frame.iter().enumerate() {
@@ -460,8 +482,8 @@ impl MelBandRoformer {
             tp.stft = Some(v);
         }
 
-        // ---- gather band inputs: [t, 7916] (freq-major, then channel, then re/im) ----
-        let width = total_band_dim();
+        // ---- gather band inputs: [t, width] (freq-major, then channel, then re/im) ----
+        let width = total_band_dim(channels);
         let mut x = vec![0f32; t * width];
         for ti in 0..t {
             let row = &mut x[ti * width..(ti + 1) * width];
@@ -479,27 +501,27 @@ impl MelBandRoformer {
         }
         let x = Tensor::from_vec_f32(x, (t, width))?.to_device(&self.device)?;
 
-        // ---- band split: per-band RMSNorm + Linear -> [t, 60, 384] ----
+        // ---- band split: per-band RMSNorm + Linear -> [t, bands, dim] ----
         let mut feats = Vec::with_capacity(NUM_BANDS);
         let mut off = 0;
         for (band, &(_, cnt)) in BAND_RANGES.iter().enumerate() {
-            let dim_in = band_dim(cnt);
+            let dim_in = band_dim(cnt, channels);
             let xb = x.narrow(1, off, dim_in)?.contiguous()?;
             let h = melband_rms_norm(&xb, &self.bands[band].norm_g)?;
             feats.push(self.bands[band].lin.forward(&h)?);
             off += dim_in;
         }
-        let mut x = Tensor::stack(&feats, 1)?; // [t, 60, 384]
+        let mut x = Tensor::stack(&feats, 1)?; // [t, bands, dim]
         if let Some(tp) = taps.as_deref_mut() {
             tp.band_split = Some(x.flatten_all()?.to_vec1_f32()?);
         }
 
-        // ---- 6 x axial (time, freq) transformers ----
+        // ---- axial (time, freq) transformers ----
         let (cos_t, sin_t) = self.rope_tables(&self.time_freqs, t)?;
         let (cos_f, sin_f) = self.rope_tables(&self.freq_freqs, NUM_BANDS)?;
         for (li, (time_block, freq_block)) in self.layers.iter().enumerate() {
             // time attention: batch = bands, seq = frames
-            let xt = x.transpose(0, 1)?.contiguous()?; // [60, t, 384]
+            let xt = x.transpose(0, 1)?.contiguous()?; // [bands, t, dim]
             let xt = time_block.forward(&xt, &cos_t, &sin_t)?;
             if li == 0 {
                 if let Some(tp) = taps.as_deref_mut() {
@@ -507,7 +529,7 @@ impl MelBandRoformer {
                 }
             }
             // freq attention: batch = frames, seq = bands
-            let xf = xt.transpose(0, 1)?.contiguous()?; // [t, 60, 384]
+            let xf = xt.transpose(0, 1)?.contiguous()?; // [t, bands, dim]
             x = freq_block.forward(&xf, &cos_f, &sin_f)?;
             if li == 0 {
                 if let Some(tp) = taps.as_deref_mut() {
@@ -516,31 +538,31 @@ impl MelBandRoformer {
             }
         }
 
-        // ---- mask estimator (single stem): per-band MLP + GLU -> [t, 7916] ----
+        // ---- mask estimator (single stem): per-band MLP + GLU -> [t, width] ----
         let mut outs = Vec::with_capacity(NUM_BANDS);
         for (band, mlp) in self.masks.iter().enumerate() {
-            let xb = x.narrow(1, band, 1)?.squeeze(1)?.contiguous()?; // [t, 384]
+            let xb = x.narrow(1, band, 1)?.squeeze(1)?.contiguous()?; // [t, dim]
             outs.push(mlp.forward(&xb)?);
         }
         let refs: Vec<&Tensor> = outs.iter().collect();
-        let mask = Tensor::cat(&refs, D::Minus1)?; // [t, 7916]
+        let mask = Tensor::cat(&refs, D::Minus1)?; // [t, width]
         let mask_v = mask.to_device(&Device::Cpu)?.flatten_all()?.to_vec1_f32()?;
         if let Some(tp) = taps.as_deref_mut() {
             tp.mask_raw = Some(mask_v.clone());
         }
 
         // ---- scatter-add the overlapping band masks, average per stereo-folded bin ----
-        // folded rows: 2050 = 1025 mono bins x 2 channels, row = f.2 + s.
+        // folded rows: mono bins x channels, row = f.channels + s.
         let cover = bands_per_bin();
-        let folded = N_BINS * CHANNELS;
+        let folded = N_BINS * channels;
         let mut acc = vec![0f32; folded * t * 2];
-        let mut col = 0; // complex column pairs within the [t, 7916] mask rows
+        let mut col = 0; // complex column pairs within the [t, width] mask rows
         for &(start, cnt) in BAND_RANGES.iter() {
             for f in start..start + cnt {
-                for s in 0..CHANNELS {
-                    let row = f * CHANNELS + s;
+                for s in 0..channels {
+                    let row = f * channels + s;
                     for ti in 0..t {
-                        let m = ti * total_band_dim() + col * 2;
+                        let m = ti * width + col * 2;
                         acc[(row * t + ti) * 2] += mask_v[m];
                         acc[(row * t + ti) * 2 + 1] += mask_v[m + 1];
                     }
@@ -550,8 +572,8 @@ impl MelBandRoformer {
         }
         for f in 0..N_BINS {
             let d = cover[f].max(1e-8);
-            for s in 0..CHANNELS {
-                let row = f * CHANNELS + s;
+            for s in 0..channels {
+                let row = f * channels + s;
                 for v in acc[row * t * 2..(row + 1) * t * 2].iter_mut() {
                     *v /= d;
                 }
@@ -563,7 +585,7 @@ impl MelBandRoformer {
 
         // ---- complex mask x STFT, zero DC, iSTFT per channel ----
         let out_len = (t - 1) * HOP;
-        let mut out = vec![0f32; CHANNELS * out_len];
+        let mut out = vec![0f32; channels * out_len];
         for (s, spec) in specs.iter().enumerate() {
             let mut masked: Vec<Frame> = Vec::with_capacity(t);
             for ti in 0..t {
@@ -573,7 +595,7 @@ impl MelBandRoformer {
                         frame.push((0.0, 0.0)); // zero_dc
                         continue;
                     }
-                    let row = f * CHANNELS + s;
+                    let row = f * channels + s;
                     let (mr, mi) = (acc[(row * t + ti) * 2], acc[(row * t + ti) * 2 + 1]);
                     let (sr, si) = spec[ti][f];
                     frame.push((sr * mr - si * mi, sr * mi + si * mr));
@@ -589,10 +611,11 @@ impl MelBandRoformer {
     /// Full-length separation with the reference chunked overlap-add loop
     /// (ZFTurbo `demix`, generic mode): chunk 352800, 50% overlap, linear fade
     /// window (fade = chunk/10), reflect border padding, accumulate window.out
-    /// and the window itself, divide. `mix` is planar `[2 * len]`; returns the
-    /// planar vocal stem `[2 * len]`.
+    /// and the window itself, divide. `mix` is planar `[channels * len]`; returns the
+    /// planar vocal stem `[channels * len]`.
     pub fn separate(&self, mix: &[f32], progress: bool) -> Result<Vec<f32>> {
-        let len = mix.len() / CHANNELS;
+        let channels = self.channels;
+        let len = mix.len() / channels;
         let chunk = CHUNK_SIZE;
         let step = chunk / 2; // num_overlap = 2
         let border = chunk - step;
@@ -600,8 +623,8 @@ impl MelBandRoformer {
 
         // reflect-pad both channels by `border` when the mix is long enough
         let (padded, pad): (Vec<Vec<f32>>, usize) = if len > 2 * border {
-            let mut chans = Vec::with_capacity(CHANNELS);
-            for s in 0..CHANNELS {
+            let mut chans = Vec::with_capacity(channels);
+            for s in 0..channels {
                 let ch = &mix[s * len..(s + 1) * len];
                 let mut p = Vec::with_capacity(len + 2 * border);
                 for i in 0..border {
@@ -616,7 +639,7 @@ impl MelBandRoformer {
             (chans, border)
         } else {
             (
-                (0..CHANNELS)
+                (0..channels)
                     .map(|s| mix[s * len..(s + 1) * len].to_vec())
                     .collect(),
                 0,
@@ -632,16 +655,16 @@ impl MelBandRoformer {
             window[chunk - fade + i] = 1.0 - r; // fade-out 1->0
         }
 
-        let mut result = vec![0f32; CHANNELS * plen];
-        let mut counter = vec![0f32; CHANNELS * plen];
+        let mut result = vec![0f32; channels * plen];
+        let mut counter = vec![0f32; channels * plen];
         let mut i = 0usize;
         let mut n_chunks = 0usize;
         let total_chunks = plen.div_ceil(step);
         while i < plen {
             let seg_len = chunk.min(plen - i);
             // chunk extraction + padding to full size (reflect when > chunk/2 remains)
-            let mut part = vec![0f32; CHANNELS * chunk];
-            for s in 0..CHANNELS {
+            let mut part = vec![0f32; channels * chunk];
+            for s in 0..channels {
                 part[s * chunk..s * chunk + seg_len].copy_from_slice(&padded[s][i..i + seg_len]);
                 if seg_len < chunk && seg_len > chunk / 2 {
                     for j in 0..chunk - seg_len {
@@ -651,7 +674,7 @@ impl MelBandRoformer {
                 }
             }
             let vocals = self.separate_chunk(&part, None)?;
-            let out_len = vocals.len() / CHANNELS;
+            let out_len = vocals.len() / channels;
 
             // per-chunk window: first chunk no fade-in, last chunk no fade-out
             let mut w = window.clone();
@@ -665,7 +688,7 @@ impl MelBandRoformer {
                     *v = 1.0;
                 }
             }
-            for s in 0..CHANNELS {
+            for s in 0..channels {
                 for j in 0..seg_len.min(out_len) {
                     result[s * plen + i + j] += vocals[s * out_len + j] * w[j];
                     counter[s * plen + i + j] += w[j];
@@ -678,8 +701,8 @@ impl MelBandRoformer {
             i += step;
         }
 
-        let mut out = vec![0f32; CHANNELS * len];
-        for s in 0..CHANNELS {
+        let mut out = vec![0f32; channels * len];
+        for s in 0..channels {
             for j in 0..len {
                 let c = counter[s * plen + pad + j];
                 let v = result[s * plen + pad + j];
