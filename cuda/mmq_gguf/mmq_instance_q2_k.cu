@@ -5,3 +5,4 @@
 // One translation unit per format, because `mul_mat_q` is a heavy template expansion and the
 // ten build in parallel. The launcher itself lives in `mmq_launch.cuh`, written once.
 MMQ_ENTRY_POINT(GGML_TYPE_Q2_K, q2_k)
+MMQ_MOE_ENTRY_POINT(GGML_TYPE_Q2_K, q2_k)

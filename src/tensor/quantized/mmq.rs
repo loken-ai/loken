@@ -49,7 +49,7 @@ pub fn release_mmq_workspaces() {
 macro_rules! mmq_quantizers {
     ($($(#[$note:meta])* $name:ident;)+) => {
         #[cfg(feature = "cuda")]
-        type MmqQuantizeLauncher = unsafe extern "C" fn(
+        pub(crate) type MmqQuantizeLauncher = unsafe extern "C" fn(
             x: *const std::ffi::c_void,
             ids: *const i32,
             vy: *mut std::ffi::c_void,
@@ -106,7 +106,7 @@ mmq_quantizers! {
 /// one of them. Here a format is a row or it is nothing: the `extern` declaration and the four
 /// answers are all generated from it.
 macro_rules! mmq_formats {
-    ($($dtype:ident => $qk:expr, $quantize:ident, $matmul:ident;)+) => {
+    ($($dtype:ident => $qk:expr, $quantize:ident, $matmul:ident, $moe:ident;)+) => {
         /// The pointer type the dispatch below holds a tile kernel in - the same call the
         /// declarations under it make, said once.
         #[cfg(feature = "cuda")]
@@ -126,6 +126,57 @@ macro_rules! mmq_formats {
             warp_size: i32,
             stream: *mut std::ffi::c_void,
         );
+
+        /// The pointer type the expert-batched tile kernels are held in.
+        #[cfg(feature = "cuda")]
+        pub(crate) type MmqMoeLauncher = unsafe extern "C" fn(
+            x: *const std::ffi::c_void,
+            y: *const std::ffi::c_void,
+            dst: *mut std::ffi::c_void,
+            expert_bounds: *const i32,
+            ids_dst: *const i32,
+            stride_expert_x: i64,
+            ncols_x: i64,
+            nrows_x: i64,
+            ncols_y: i64,
+            stride_row_x: i64,
+            stride_col_dst: i64,
+            n_experts: i32,
+            ncols_max: i64,
+            ncols_hint: i64,
+            mmq_x: i32,
+            cc: i32,
+            smpbo: i64,
+            warp_size: i32,
+            stream: *mut std::ffi::c_void,
+        ) -> i32;
+
+        #[cfg(feature = "cuda")]
+        extern "C" {
+            $(
+                fn $moe(
+                    x: *const std::ffi::c_void,
+                    y: *const std::ffi::c_void,
+                    dst: *mut std::ffi::c_void,
+                    expert_bounds: *const i32,
+                    ids_dst: *const i32,
+                    stride_expert_x: i64,
+                    ncols_x: i64,
+                    nrows_x: i64,
+                    ncols_y: i64,
+                    stride_row_x: i64,
+                    stride_col_dst: i64,
+                    n_experts: i32,
+                    ncols_max: i64,
+                    ncols_hint: i64,
+                    mmq_x: i32,
+                    cc: i32,
+                    smpbo: i64,
+                    warp_size: i32,
+                    stream: *mut std::ffi::c_void,
+                ) -> i32;
+            )+
+        }
 
         #[cfg(feature = "cuda")]
         extern "C" {
@@ -173,6 +224,15 @@ macro_rules! mmq_formats {
             })
         }
 
+        /// The expert-batched tile kernel of a format in the table.
+        #[cfg(feature = "cuda")]
+        fn mmq_moe_launcher_listed(dtype: GgmlDType) -> Result<MmqMoeLauncher> {
+            Ok(match dtype {
+                $(GgmlDType::$dtype => $moe,)+
+                other => return Err(Error(format!("mmq: unsupported dtype {other:?}"))),
+            })
+        }
+
         /// The tile kernel itself.
         #[cfg(feature = "cuda")]
         pub(crate) fn mmq_launcher(dtype: GgmlDType) -> Result<MmqMatmulLauncher> {
@@ -185,15 +245,76 @@ macro_rules! mmq_formats {
 }
 
 mmq_formats! {
-    //         block  activation quantiser           tile kernel
-    Q4_0  =>  32, launch_mmq_quantize_q8_1_DS4,   launch_mmq_gguf_q4_0;
-    Q4_1  =>  32, launch_mmq_quantize_q8_1_DS4,   launch_mmq_gguf_q4_1;
-    Q5_0  =>  32, launch_mmq_quantize_q8_1_D4,    launch_mmq_gguf_q5_0;
-    Q5_1  =>  32, launch_mmq_quantize_q8_1_DS4,   launch_mmq_gguf_q5_1;
-    Q8_0  =>  32, launch_mmq_quantize_q8_1_D4,    launch_mmq_gguf_q8_0;
-    Q2K   => 256, launch_mmq_quantize_q8_1_D2S6,  launch_mmq_gguf_q2_k;
-    Q3K   => 256, launch_mmq_quantize_q8_1_D4,    launch_mmq_gguf_q3_k;
-    Q4K   => 256, launch_mmq_quantize_q8_1_DS4,   launch_mmq_gguf_q4_k;
-    Q5K   => 256, launch_mmq_quantize_q8_1_DS4,   launch_mmq_gguf_q5_k;
-    Q6K   => 256, launch_mmq_quantize_q8_1_D4,    launch_mmq_gguf_q6_k;
+    //         block  activation quantiser           tile kernel            expert-batched
+    Q4_0  =>  32, launch_mmq_quantize_q8_1_DS4,   launch_mmq_gguf_q4_0,  launch_mmq_moe_gguf_q4_0;
+    Q4_1  =>  32, launch_mmq_quantize_q8_1_DS4,   launch_mmq_gguf_q4_1,  launch_mmq_moe_gguf_q4_1;
+    Q5_0  =>  32, launch_mmq_quantize_q8_1_D4,    launch_mmq_gguf_q5_0,  launch_mmq_moe_gguf_q5_0;
+    Q5_1  =>  32, launch_mmq_quantize_q8_1_DS4,   launch_mmq_gguf_q5_1,  launch_mmq_moe_gguf_q5_1;
+    Q8_0  =>  32, launch_mmq_quantize_q8_1_D4,    launch_mmq_gguf_q8_0,  launch_mmq_moe_gguf_q8_0;
+    Q2K   => 256, launch_mmq_quantize_q8_1_D2S6,  launch_mmq_gguf_q2_k,  launch_mmq_moe_gguf_q2_k;
+    Q3K   => 256, launch_mmq_quantize_q8_1_D4,    launch_mmq_gguf_q3_k,  launch_mmq_moe_gguf_q3_k;
+    Q4K   => 256, launch_mmq_quantize_q8_1_DS4,   launch_mmq_gguf_q4_k,  launch_mmq_moe_gguf_q4_k;
+    Q5K   => 256, launch_mmq_quantize_q8_1_DS4,   launch_mmq_gguf_q5_k,  launch_mmq_moe_gguf_q5_k;
+    Q6K   => 256, launch_mmq_quantize_q8_1_D4,    launch_mmq_gguf_q6_k,  launch_mmq_moe_gguf_q6_k;
+}
+
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn launch_mmq_moe_gguf_mxfp4(
+        x: *const std::ffi::c_void,
+        y: *const std::ffi::c_void,
+        dst: *mut std::ffi::c_void,
+        expert_bounds: *const i32,
+        ids_dst: *const i32,
+        stride_expert_x: i64,
+        ncols_x: i64,
+        nrows_x: i64,
+        ncols_y: i64,
+        stride_row_x: i64,
+        stride_col_dst: i64,
+        n_experts: i32,
+        ncols_max: i64,
+        ncols_hint: i64,
+        mmq_x: i32,
+        cc: i32,
+        smpbo: i64,
+        warp_size: i32,
+        stream: *mut std::ffi::c_void,
+    ) -> i32;
+}
+
+/// Whether an expert-batched tile kernel exists for this weight format: every format the
+/// table above serves, and MXFP4, which only mixtures store and so has no dense entry point.
+#[cfg(feature = "cuda")]
+pub(crate) fn mmq_moe_supports(dtype: GgmlDType) -> bool {
+    mmq_supports(dtype) || dtype == GgmlDType::MxFp4
+}
+
+/// Values per block of an expert stack of `dtype`.
+#[cfg(feature = "cuda")]
+pub(crate) fn mmq_moe_qk(dtype: GgmlDType) -> usize {
+    match dtype {
+        GgmlDType::MxFp4 => dtype.block_size(),
+        other => mmq_qk(other),
+    }
+}
+
+/// The activation quantiser an expert stack of `dtype` reads: MXFP4 is symmetric, one scale
+/// per 32 values.
+#[cfg(feature = "cuda")]
+pub(crate) fn mmq_moe_quantize_launcher(dtype: GgmlDType) -> Result<MmqQuantizeLauncher> {
+    match dtype {
+        GgmlDType::MxFp4 => Ok(launch_mmq_quantize_q8_1_D4),
+        other => mmq_quantize_launcher(other),
+    }
+}
+
+/// The expert-batched tile kernel: every expert of a stack against its own sorted run of
+/// activation columns in one launch.
+#[cfg(feature = "cuda")]
+pub(crate) fn mmq_moe_launcher(dtype: GgmlDType) -> Result<MmqMoeLauncher> {
+    match dtype {
+        GgmlDType::MxFp4 => Ok(launch_mmq_moe_gguf_mxfp4),
+        other => mmq_moe_launcher_listed(other),
+    }
 }

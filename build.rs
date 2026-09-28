@@ -410,6 +410,7 @@ fn compile_mmq_kernels() {
         "cuda/mmq_gguf/mmq_instance_q4_k.cu",
         "cuda/mmq_gguf/mmq_instance_q5_k.cu",
         "cuda/mmq_gguf/mmq_instance_q6_k.cu",
+        "cuda/mmq_gguf/mmq_instance_mxfp4.cu",
     ];
     println!("cargo:rerun-if-changed=cuda/mmq_gguf");
 
@@ -513,6 +514,7 @@ fn compile_imma_kernels() {
         "cuda/moe/add_rms_norm.cu",
         "cuda/moe/rms_qmatmul.cu",
         "cuda/moe/moe_gguf.cu",
+        "cuda/moe/moe_mmq.cu",
         "cuda/moe/attn_post_qkv.cu",
         "cuda/moe/kv_residual_scatter.cu",
         "cuda/moe/gated_delta_net.cu",

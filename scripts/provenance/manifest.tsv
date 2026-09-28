@@ -18,6 +18,7 @@ cuda/marlin/marlin_template.h	0.0%	0	vllm/csrc/libtorch_stable/moe/marlin_moe_wn
 cuda/marlin/scalar_type.hpp	0.0%	0	-
 cuda/mmq_gguf/mmq_common.cuh	0.0%	0	candle/candle-kernels/src/mmq_gguf/mmq_common.cuh
 cuda/mmq_gguf/mmq_gguf.cuh	4.4%	31	candle/candle-kernels/src/mmq_gguf/mmq_gguf.cuh
+cuda/mmq_gguf/mmq_instance_mxfp4.cu	0.0%	0	-
 cuda/mmq_gguf/mmq_instance_q2_k.cu	0.0%	0	-
 cuda/mmq_gguf/mmq_instance_q3_k.cu	0.0%	0	-
 cuda/mmq_gguf/mmq_instance_q4_0.cu	0.0%	0	-
@@ -47,6 +48,7 @@ cuda/moe/kv_residual_scatter.cu	0.0%	0	attention.rs/src/kernels/src/dsa_lightnin
 cuda/moe/l2norm_gqa.cu	0.0%	0	-
 cuda/moe/lfm2_shortconv_f16.cu	0.0%	0	attention.rs/src/kernels/src/gdn.cu
 cuda/moe/moe_gguf.cu	0.0%	0	candle/candle-kernels/src/moe/moe_gguf.cu
+cuda/moe/moe_mmq.cu	0.0%	0	llama.cpp/ggml/src/ggml-hexagon/htp/work-queue.c
 cuda/moe/moe_q4k_imma_m8.cu	2.5%	3	candle/candle-kernels/src/moe/moe_gguf.cu
 cuda/moe/moe_q4k_imma_m8_down.cu	7.8%	7	candle/candle-kernels/src/moe/moe_gguf.cu
 cuda/moe/moe_utils.cuh	0.0%	0	candle/candle-kernels/src/quantized.cu

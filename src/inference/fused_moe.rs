@@ -405,18 +405,32 @@ impl FusedMoeGGUF {
                     self.top_k(&crate::tensor::ops::softmax_last_dim(&logits)?)?
                 }
             };
-            let plan = ExpertPlan::group(&topk_ids, self.num_experts_per_tok)?;
-            if let Some(t0) = route_t0 {
-                let _ = xs.device().synchronize();
-                let took = t0.elapsed().as_micros() as u64;
-                // Both readers: the thread-local one a caller subtracts from its own block
-                // time, and the table the endpoint reports.
-                crate::inference::place::layer_perf::stages::note_router_us(took);
-                crate::inference::place::layer_perf::stages::add(
-                    crate::inference::place::layer_perf::stages::ROUTER,
-                    took,
-                );
+            // A wide prefill takes the expert-batched tile kernels when this layer is one
+            // they serve, grouping the rows on the device; decode keeps the kernels below.
+            let batched = match is_prefill {
+                true => self.batched_routing(&xs, &topk_ids)?,
+                false => None,
+            };
+            let note_router = || {
+                if let Some(t0) = route_t0 {
+                    let _ = xs.device().synchronize();
+                    let took = t0.elapsed().as_micros() as u64;
+                    // Both readers: the thread-local one a caller subtracts from its own block
+                    // time, and the table the endpoint reports.
+                    crate::inference::place::layer_perf::stages::note_router_us(took);
+                    crate::inference::place::layer_perf::stages::add(
+                        crate::inference::place::layer_perf::stages::ROUTER,
+                        took,
+                    );
+                }
+            };
+            if let Some(routing) = batched {
+                note_router();
+                let ys = self.batched_experts(&xs, &routing, &topk_weights, residual)?;
+                return ys.to_dtype(original_dtype)?.reshape(block);
             }
+            let plan = ExpertPlan::group(&topk_ids, self.num_experts_per_tok)?;
+            note_router();
             // The two projections the expert block is made of, timed apart: which of them
             // a long prompt is spent in is not a thing to reason about from the outside.
             let timing = crate::inference::place::layer_perf::stages::enabled();
@@ -542,6 +556,107 @@ impl FusedMoeGGUF {
             }
             ys.to_dtype(original_dtype)?.reshape(block)
         } // end #[cfg(feature="cuda")]
+    }
+
+    /// The routing grouped for the expert-batched tile kernels, or `None` when this call is
+    /// not one they serve: too few rows per expert to beat the decode kernels, a gate other
+    /// than SiLU or gpt-oss's clamped SwiGLU, or a weight format they do not read.
+    #[cfg(feature = "cuda")]
+    fn batched_routing(
+        &self,
+        xs: &Tensor,
+        topk_ids: &Tensor,
+    ) -> Result<Option<crate::inference::moe_cuda::MmqRouting>> {
+        use crate::inference::moe_cuda::{moe_mmq_pays, moe_mmq_serves, MmqRouting};
+        let (num_tokens, hidden) = xs.dims2()?;
+        let n_experts = self.down_experts.shape().dims()[0];
+        let gated = self.swiglu_oai.is_some()
+            || (matches!(self.act, Activation::Silu)
+                && self.gate_exps_bias.is_none()
+                && self.up_exps_bias.is_none());
+        let Some((gate, up)) = self.gate_and_up() else {
+            return Ok(None);
+        };
+        let inter = self
+            .down_experts
+            .shape()
+            .dims()
+            .last()
+            .copied()
+            .unwrap_or(0);
+        let served = moe_mmq_serves(gate.dtype(), hidden)
+            && up.is_none_or(|u| u.dtype() == gate.dtype())
+            && moe_mmq_serves(self.down_experts.dtype(), inter);
+        if !gated
+            || !served
+            || !moe_mmq_pays(num_tokens * self.num_experts_per_tok, n_experts)
+            || !xs.device().is_cuda()
+        {
+            return Ok(None);
+        }
+        Ok(Some(MmqRouting::from_choices(topk_ids, n_experts)?))
+    }
+
+    /// The gate and up stacks the expert-batched path reads: apart, or the fused gate‖up
+    /// stack alone.
+    #[cfg(feature = "cuda")]
+    fn gate_and_up(&self) -> Option<(&QTensor, Option<&QTensor>)> {
+        match (&self.gate_experts, &self.up_experts, &self.gate_up_experts) {
+            (Some(g), Some(u), _) => Some((g.as_ref(), Some(u.as_ref()))),
+            (_, _, Some(gu)) => Some((gu.as_ref(), None)),
+            _ => None,
+        }
+    }
+
+    /// The expert block through the expert-batched tile kernels over a grouped routing.
+    #[cfg(feature = "cuda")]
+    fn batched_experts(
+        &self,
+        xs: &Tensor,
+        routing: &crate::inference::moe_cuda::MmqRouting,
+        topk_weights: &Tensor,
+        residual: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        use crate::inference::place::layer_perf::stages;
+        let (num_tokens, hidden) = xs.dims2()?;
+        let Some((gate, up)) = self.gate_and_up() else {
+            crate::tensor::bail!("FusedMoeGGUF: no gate and up stacks for the batched path");
+        };
+        let timing = stages::enabled();
+        let t0 = timing.then(|| {
+            let _ = xs.device().synchronize();
+            std::time::Instant::now()
+        });
+        let glu = match self.swiglu_oai {
+            Some((alpha, limit)) => crate::inference::moe_cuda::Glu::SwigluOai {
+                gate_bias: self.gate_exps_bias.as_ref(),
+                up_bias: self.up_exps_bias.as_ref(),
+                alpha: alpha as f32,
+                limit: limit as f32,
+            },
+            None => crate::inference::moe_cuda::Glu::Silu,
+        };
+        let hs = routing.gate_up(xs, gate, up, glu)?;
+        let t1 = t0.map(|t0| {
+            let _ = xs.device().synchronize();
+            stages::add(stages::GATE_UP, t0.elapsed().as_micros() as u64);
+            std::time::Instant::now()
+        });
+        let residual = residual
+            .map(|r| r.reshape((num_tokens, hidden)))
+            .transpose()?;
+        let ys = routing.down_fold_biased(
+            &hs,
+            &self.down_experts,
+            topk_weights,
+            residual.as_ref(),
+            self.down_exps_bias.as_ref(),
+        )?;
+        if let Some(t1) = t1 {
+            let _ = xs.device().synchronize();
+            stages::add(stages::DOWN, t1.elapsed().as_micros() as u64);
+        }
+        Ok(ys)
     }
 
     /// The router's choice, from its scores: for every token the `num_experts_per_tok`

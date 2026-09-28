@@ -1331,6 +1331,43 @@ impl Qwen35Moe {
             exps_dev: exps_device.clone(),
         })
     }
+    /// The routed experts through the expert-batched tile kernels, or `None` when the call
+    /// has too few rows per expert to beat the decode kernels or a stack they do not read.
+    #[cfg(feature = "cuda")]
+    fn batched_experts(
+        &self,
+        xs: &Tensor,
+        choices: &Tensor,
+        topk_w: &Tensor,
+        n_tokens: usize,
+    ) -> Result<Option<Tensor>> {
+        use crate::inference::moe_cuda::{moe_mmq_pays, moe_mmq_serves, MmqRouting};
+        let hidden = xs.dim(D::Minus1)?;
+        let inter = self.down_exps.shape().dims().last().copied().unwrap_or(0);
+        let served = self.gate_exps.dtype() == self.up_exps.dtype()
+            && moe_mmq_serves(self.gate_exps.dtype(), hidden)
+            && moe_mmq_serves(self.down_exps.dtype(), inter);
+        if !served || !moe_mmq_pays(n_tokens * self.n_expert_used, self.n_expert) {
+            return Ok(None);
+        }
+        let choices = choices.reshape((n_tokens, self.n_expert_used))?;
+        let plan = MmqRouting::from_choices(&choices, self.n_expert)?;
+        let hs = plan.gate_up_silu(xs, &self.gate_exps, Some(&self.up_exps))?;
+        Ok(Some(plan.down_fold(&hs, &self.down_exps, topk_w, None)?))
+    }
+
+    /// A build without the kernels has no batched path.
+    #[cfg(not(feature = "cuda"))]
+    fn batched_experts(
+        &self,
+        _xs: &Tensor,
+        _choices: &Tensor,
+        _topk_w: &Tensor,
+        _n_tokens: usize,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         use crate::inference::moe_cuda as moe;
         let (b, seq, hidden) = x.dims3()?;
@@ -1376,110 +1413,122 @@ impl Qwen35Moe {
         } else {
             (xs.clone(), topk_w.clone(), topk_flat.clone())
         };
-        // Decode: one-warp argsort (bit-identical to sort_last_dim); tensor-op fallback for
-        // prefill. Sorted where the experts are: the ids index their GEMMs.
-        let (expert_ids, sorted_token_ids) =
-            match crate::inference::moe_cuda::argsort_small_u32(&topk_flat_e)? {
-                Some(out) => out,
-                None => topk_flat_e.sort_last_dim(true)?,
+        // A wide prefill takes the expert-batched tile kernels when the stacks are ones
+        // they serve, grouping the rows on the device; everything else keeps the kernels
+        // below.
+        let batched = if on_exps_cuda && seq > 1 {
+            self.batched_experts(&xs_e, &topk_flat_e, &topk_w_e, n_tokens)?
+        } else {
+            None
+        };
+        let routed = if let Some(routed) = batched {
+            routed
+        } else {
+            // Decode: one-warp argsort (bit-identical to sort_last_dim); tensor-op fallback
+            // for prefill. Sorted where the experts are: the ids index their GEMMs.
+            let (expert_ids, sorted_token_ids) =
+                match crate::inference::moe_cuda::argsort_small_u32(&topk_flat_e)? {
+                    Some(out) => out,
+                    None => topk_flat_e.sort_last_dim(true)?,
+                };
+            // Decode (seq==1): ONE fused kernel does gate GEMM + up GEMM + silu.mul
+            // (quantizes the input to q8_1 once). Prefill keeps the wmma 2-GEMM path.
+            // CPU branches to the moe_cpu twins (see on_cuda above).
+            let h = if seq == 1 {
+                if on_exps_cuda {
+                    moe::moe_gemm_gguf_gate_up_silu_mul(
+                        &xs_e,
+                        &self.gate_exps,
+                        &self.up_exps,
+                        &sorted_token_ids,
+                        &expert_ids,
+                        self.n_expert_used,
+                    )?
+                } else {
+                    crate::inference::moe_cpu::moe_gemm_gguf_gate_up_silu_mul(
+                        &xs_e,
+                        &self.gate_exps,
+                        &self.up_exps,
+                        &sorted_token_ids,
+                        &expert_ids,
+                        self.n_expert_used,
+                    )?
+                }
+            } else {
+                let (gate, up) = if on_exps_cuda {
+                    (
+                        crate::inference::moe_cuda::moe_gemm_gguf(
+                            &xs_e,
+                            &self.gate_exps,
+                            &None,
+                            &sorted_token_ids,
+                            &expert_ids,
+                            self.n_expert_used,
+                            true,
+                            self.dtype,
+                        )?,
+                        crate::inference::moe_cuda::moe_gemm_gguf(
+                            &xs_e,
+                            &self.up_exps,
+                            &None,
+                            &sorted_token_ids,
+                            &expert_ids,
+                            self.n_expert_used,
+                            true,
+                            self.dtype,
+                        )?,
+                    )
+                } else {
+                    (
+                        crate::inference::moe_cpu::moe_gemm_gguf(
+                            &xs_e,
+                            &self.gate_exps,
+                            &None,
+                            &sorted_token_ids,
+                            &expert_ids,
+                            self.n_expert_used,
+                            true,
+                            self.dtype,
+                        )?,
+                        crate::inference::moe_cpu::moe_gemm_gguf(
+                            &xs_e,
+                            &self.up_exps,
+                            &None,
+                            &sorted_token_ids,
+                            &expert_ids,
+                            self.n_expert_used,
+                            true,
+                            self.dtype,
+                        )?,
+                    )
+                };
+                (crate::tensor::ops::silu(&gate)? * up)?
             };
-        // Decode (seq==1): ONE fused kernel does gate GEMM + up GEMM + silu.mul
-        // (quantizes the input to q8_1 once). Prefill keeps the wmma 2-GEMM path.
-        // CPU branches to the moe_cpu twins (see on_cuda above).
-        let h = if seq == 1 {
             if on_exps_cuda {
-                moe::moe_gemm_gguf_gate_up_silu_mul(
-                    &xs_e,
-                    &self.gate_exps,
-                    &self.up_exps,
+                crate::inference::moe_cuda::moe_gemm_gguf_down_reduce(
+                    &h,
+                    &self.down_exps,
                     &sorted_token_ids,
                     &expert_ids,
+                    &topk_w_e,
                     self.n_expert_used,
+                    n_tokens,
+                    None,
+                    None,
                 )?
             } else {
-                crate::inference::moe_cpu::moe_gemm_gguf_gate_up_silu_mul(
-                    &xs_e,
-                    &self.gate_exps,
-                    &self.up_exps,
+                crate::inference::moe_cpu::moe_gemm_gguf_down_reduce(
+                    &h,
+                    &self.down_exps,
                     &sorted_token_ids,
                     &expert_ids,
+                    &topk_w_e,
                     self.n_expert_used,
+                    n_tokens,
+                    None,
+                    None,
                 )?
             }
-        } else {
-            let (gate, up) = if on_exps_cuda {
-                (
-                    crate::inference::moe_cuda::moe_gemm_gguf(
-                        &xs_e,
-                        &self.gate_exps,
-                        &None,
-                        &sorted_token_ids,
-                        &expert_ids,
-                        self.n_expert_used,
-                        true,
-                        self.dtype,
-                    )?,
-                    crate::inference::moe_cuda::moe_gemm_gguf(
-                        &xs_e,
-                        &self.up_exps,
-                        &None,
-                        &sorted_token_ids,
-                        &expert_ids,
-                        self.n_expert_used,
-                        true,
-                        self.dtype,
-                    )?,
-                )
-            } else {
-                (
-                    crate::inference::moe_cpu::moe_gemm_gguf(
-                        &xs_e,
-                        &self.gate_exps,
-                        &None,
-                        &sorted_token_ids,
-                        &expert_ids,
-                        self.n_expert_used,
-                        true,
-                        self.dtype,
-                    )?,
-                    crate::inference::moe_cpu::moe_gemm_gguf(
-                        &xs_e,
-                        &self.up_exps,
-                        &None,
-                        &sorted_token_ids,
-                        &expert_ids,
-                        self.n_expert_used,
-                        true,
-                        self.dtype,
-                    )?,
-                )
-            };
-            (crate::tensor::ops::silu(&gate)? * up)?
-        };
-        let routed = if on_exps_cuda {
-            crate::inference::moe_cuda::moe_gemm_gguf_down_reduce(
-                &h,
-                &self.down_exps,
-                &sorted_token_ids,
-                &expert_ids,
-                &topk_w_e,
-                self.n_expert_used,
-                n_tokens,
-                None,
-                None,
-            )?
-        } else {
-            crate::inference::moe_cpu::moe_gemm_gguf_down_reduce(
-                &h,
-                &self.down_exps,
-                &sorted_token_ids,
-                &expert_ids,
-                &topk_w_e,
-                self.n_expert_used,
-                n_tokens,
-                None,
-                None,
-            )?
         };
         let routed = if exps_cross {
             routed.to_device(&x.device())?

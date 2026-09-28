@@ -80,12 +80,6 @@ static __global__ void quantize_mmq_q8_1(const float *__restrict__ x,
         fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w))),
         [](float a, float b) { return fmaxf(a, b); });
 
-    float sum = 0.0f;
-    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
-        sum = reduce_over_group<vals_per_sum>(xi.x + xi.y + xi.z + xi.w,
-                                              [](float a, float b) { return a + b; });
-    }
-
     // A group of pure zeros has no scale to speak of. Deriving one anyway gives 127/0, and
     // every quant in the group becomes 0.inf - a NaN that only survives because the float to
     // int8 conversion happens to flush it. Say zero instead.
@@ -101,6 +95,16 @@ static __global__ void quantize_mmq_q8_1(const float *__restrict__ x,
     q.w = roundf(xi.w * to_int8);
     block_q8_1_mmq *y = (block_q8_1_mmq *) vy;
     ((char4 *) y[ib].qs)[iqs / 4] = q;
+
+    // The sum the weight's minimum multiplies is the sum of the values as quantised, at the
+    // scale the matmul reads back: the minimum then meets the same rounded activation the
+    // codes do, and the two rounding errors cancel instead of adding.
+    float sum = 0.0f;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        const float d_read = coarse_scale ? d : __half2float(__float2half(d));
+        sum = d_read * reduce_over_group<vals_per_sum>(float(q.x + q.y + q.z + q.w),
+                                                       [](float a, float b) { return a + b; });
+    }
 
     // The metadata is written by the first thread of each group, and only by it.
     if (coarse_scale) {

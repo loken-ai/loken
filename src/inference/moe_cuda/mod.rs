@@ -21,6 +21,12 @@ pub use routing::*;
 mod norm;
 pub use norm::*;
 pub(crate) mod gemm;
+mod mmq_experts;
+pub use mmq_experts::*;
+
+/// The expert-batched tiled matmul against the decode kernels and the float answer.
+#[cfg(test)]
+mod mmq_parity;
 
 /// The two expert-GEMM paths judged against each other; nothing else covers the prefill one.
 #[cfg(test)]

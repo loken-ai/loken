@@ -411,7 +411,6 @@ impl MoeWeights {
             let _ = topk_ids.device().synchronize();
             std::time::Instant::now()
         });
-        let routing = ExpertRouting::group(&topk_ids, self.n_experts_used)?;
 
         // -- Fold the per-expert down-output scale into topk_weights.
         // llama.cpp gemma4-iswa.cpp applies it after the down matmul
@@ -445,11 +444,14 @@ impl MoeWeights {
         let expert_rows = if on_cpu {
             self.forward_cpu(&xs, &topk_ids, &topk_weights_scaled, num_tokens, hidden_dim)?
         } else {
-            if let Some(t) = t_route {
-                let _ = moe_device.synchronize();
-                crate::inference::place::layer_perf::stages::add(3, t.elapsed().as_micros() as u64);
-            }
-            self.forward_cuda(&xs, &routing, &topk_weights_scaled, num_tokens, is_prefill)?
+            self.forward_cuda(
+                &xs,
+                &topk_ids,
+                &topk_weights_scaled,
+                num_tokens,
+                is_prefill,
+                t_route,
+            )?
         };
         // Back to the block's own device, width and dtype. The host expert path answers on
         // the host even for a layer that lives on a card, so that the hybrid prefill above
@@ -489,11 +491,31 @@ impl MoeWeights {
     fn forward_cuda(
         &self,
         xs: &Tensor,
-        routing: &ExpertRouting,
+        topk_ids: &Tensor,
         topk_weights: &Tensor,
         num_tokens: usize,
         is_prefill: bool,
+        t_route: Option<std::time::Instant>,
     ) -> Result<Tensor> {
+        let note_route = || {
+            if let Some(t) = t_route {
+                let _ = xs.device().synchronize();
+                crate::inference::place::layer_perf::stages::add(3, t.elapsed().as_micros() as u64);
+            }
+        };
+        // A wide prefill takes the expert-batched tile kernels, grouping the rows on the
+        // device; decode and the layers they do not serve take the sorted routing below.
+        let batched = match is_prefill {
+            true => self.batched_routing(xs, topk_ids, num_tokens)?,
+            false => None,
+        };
+        if let Some(plan) = batched {
+            note_route();
+            return self.batched_experts(xs, &plan, topk_weights);
+        }
+        let routing = ExpertRouting::group(topk_ids, self.n_experts_used)?;
+        note_route();
+        let routing = &routing;
         // Auto-on: per-pair-tile IMMA M=8 for Q4_K MoE prefill - measured
         // +33% over dp4a on gemma4:26b.
         let weight_is_q4k = self.gate_up_exps.dtype() == crate::tensor::quantized::GgmlDType::Q4K;
@@ -588,14 +610,77 @@ impl MoeWeights {
         out
     }
 
+    /// The routing grouped for the expert-batched tile kernels, or `None` when this call is
+    /// not one they serve: a GELU mixture, a fused gate‖up stack, a weight format they do not
+    /// read, or too few rows per expert to beat the decode kernels.
+    #[cfg(feature = "cuda")]
+    fn batched_routing(
+        &self,
+        xs: &Tensor,
+        topk_ids: &Tensor,
+        num_tokens: usize,
+    ) -> Result<Option<crate::inference::moe_cuda::MmqRouting>> {
+        use crate::inference::moe_cuda::{moe_mmq_pays, moe_mmq_serves, MmqRouting};
+        let (Some(gate), Some(up)) = (self.gate_exps_sep.as_ref(), self.up_exps_sep.as_ref())
+        else {
+            return Ok(None);
+        };
+        let hidden = xs.dim(crate::tensor::D::Minus1)?;
+        let served = !self.gelu
+            && gate.dtype() == up.dtype()
+            && moe_mmq_serves(gate.dtype(), hidden)
+            && moe_mmq_serves(self.down_exps.dtype(), self.expert_ffn_dim);
+        if !served || !moe_mmq_pays(num_tokens * self.n_experts_used, self.n_experts) {
+            return Ok(None);
+        }
+        let choices = topk_ids.reshape((num_tokens, self.n_experts_used))?;
+        Ok(Some(MmqRouting::from_choices(&choices, self.n_experts)?))
+    }
+
+    /// The SiLU expert block through the expert-batched tile kernels.
+    #[cfg(feature = "cuda")]
+    fn batched_experts(
+        &self,
+        xs: &Tensor,
+        plan: &crate::inference::moe_cuda::MmqRouting,
+        topk_weights: &Tensor,
+    ) -> Result<Tensor> {
+        use crate::inference::place::layer_perf::stages;
+        let (Some(gate), Some(up)) = (self.gate_exps_sep.as_ref(), self.up_exps_sep.as_ref())
+        else {
+            crate::tensor::bail!("MoeWeights: the batched path needs gate and up apart");
+        };
+        let timing = stages::enabled();
+        let t0 = timing.then(|| {
+            let _ = xs.device().synchronize();
+            std::time::Instant::now()
+        });
+        let hs = plan.gate_up_silu(xs, gate, Some(up))?;
+        let t1 = t0.map(|t0| {
+            let _ = xs.device().synchronize();
+            stages::add(stages::GATE_UP, t0.elapsed().as_micros() as u64);
+            std::time::Instant::now()
+        });
+        let out = plan.down_fold(&hs, &self.down_exps, topk_weights, None)?;
+        if let Some(t1) = t1 {
+            let _ = xs.device().synchronize();
+            stages::add(stages::DOWN, t1.elapsed().as_micros() as u64);
+        }
+        if let Some(t0) = t0 {
+            stages::add(stages::EXPERT_CALL, t0.elapsed().as_micros() as u64);
+        }
+        Ok(out)
+    }
+
     #[cfg(not(feature = "cuda"))]
     fn forward_cuda(
         &self,
         _xs: &Tensor,
-        _routing: &ExpertRouting,
+        _topk_ids: &Tensor,
         _w: &Tensor,
         _nt: usize,
         _ip: bool,
+        _t_route: Option<std::time::Instant>,
     ) -> Result<Tensor> {
         crate::tensor::bail!("CUDA path not compiled in")
     }

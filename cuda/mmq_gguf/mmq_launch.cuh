@@ -176,3 +176,103 @@ static void mmq_launch(float *tmp_fixup, const mmq_args &args, cudaStream_t stre
         mmq_launch<ggml_type_name>((float *) tmp_fixup_ptr, args, (cudaStream_t) stream, cc,  \
                                    nsm, smpbo, warp_size_host);                               \
     }
+
+/// Launch the expert-batched matmul at one tile width.
+template <ggml_type type, int mmq_x>
+static void mmq_moe_launch_tile(const char *x, const int *y, float *dst, const int *expert_bounds,
+                                const int *ids_dst, int64_t stride_expert_x, int64_t ncols_x,
+                                int64_t nrows_x, int64_t ncols_y, int64_t stride_row_x,
+                                int64_t stride_col_dst, int n_experts, int64_t ncols_max,
+                                cudaStream_t stream, const int cc, const int warp_size_host) {
+    const int mmq_y = mmq_rows_per_tile(cc);
+    const int nwarps = 256 / warp_size_host;
+    const int nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size_host, nwarps);
+    constexpr int qk_t = ggml_cuda_type_traits<type>::qk;
+    const int blocks_per_ne00 = (int) (ncols_x / qk_t);
+    const dim3 grid((nrows_x + mmq_y - 1) / mmq_y, (ncols_max + mmq_x - 1) / mmq_x, n_experts);
+    const dim3 block_dims(warp_size_host, nwarps, 1);
+
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_moe<type, mmq_x, false>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_moe<type, mmq_x, true>), nbytes_shared);
+
+    if (nrows_x % mmq_y != 0) {
+        mul_mat_q_moe<type, mmq_x, true><<<grid, block_dims, nbytes_shared, stream>>>(
+            x, y, dst, expert_bounds, ids_dst, stride_expert_x, blocks_per_ne00, (int) nrows_x,
+            (int) stride_row_x, (int) ncols_y, (int) stride_col_dst);
+    } else {
+        mul_mat_q_moe<type, mmq_x, false><<<grid, block_dims, nbytes_shared, stream>>>(
+            x, y, dst, expert_bounds, ids_dst, stride_expert_x, blocks_per_ne00, (int) nrows_x,
+            (int) stride_row_x, (int) ncols_y, (int) stride_col_dst);
+    }
+}
+
+/// Pick the expert-batched tile width, then launch it.
+///
+/// `ncols_max` bounds the columns any one expert holds - the grid is sized for it - and
+/// `ncols_hint` is the run length the width is chosen for: the widest tile that still fits
+/// shared memory, cut back to the narrowest one covering the run in as few tiles. `mmq_x`
+/// forces a width when it is non-zero. Returns the width launched, or 0 when none fits and
+/// nothing ran.
+template <ggml_type type>
+static int mmq_moe_launch(const char *x, const int *y, float *dst, const int *expert_bounds,
+                          const int *ids_dst, int64_t stride_expert_x, int64_t ncols_x,
+                          int64_t nrows_x, int64_t ncols_y, int64_t stride_row_x,
+                          int64_t stride_col_dst, int n_experts, int64_t ncols_max,
+                          int64_t ncols_hint, int mmq_x, cudaStream_t stream, const int cc,
+                          const size_t smpbo, const int warp_size_host) {
+    const int mmq_x_max = turing_mma_available(cc) ? 128 : 64;
+    const int mmq_y = mmq_rows_per_tile(cc);
+    const int nwarps = 256 / warp_size_host;
+
+    int best = 0;
+    int fewest_tiles = INT_MAX;
+    for (int w = 8; w <= mmq_x_max; w += 8) {
+        const int granularity = (turing_mma_available(cc) && w >= 48) ? 16 : 8;
+        if (w % granularity != 0) {
+            continue;
+        }
+        if (mmq_get_nbytes_shared<type>(w, mmq_y, cc, warp_size_host, nwarps) > smpbo) {
+            continue;
+        }
+        if (mmq_x != 0) {
+            if (w == mmq_x) {
+                best = w;
+            }
+            continue;
+        }
+        const int tiles = (int) ((ncols_hint + w - 1) / w);
+        if (tiles < fewest_tiles) {
+            best = w;
+            fewest_tiles = tiles;
+        }
+    }
+
+    switch (best) {
+#define MMQ_MOE_DISPATCH_WIDTH(w)                                                             \
+    case w:                                                                                   \
+        mmq_moe_launch_tile<type, w>(x, y, dst, expert_bounds, ids_dst, stride_expert_x,      \
+                                     ncols_x, nrows_x, ncols_y, stride_row_x, stride_col_dst, \
+                                     n_experts, ncols_max, stream, cc, warp_size_host);       \
+        break;
+        MMQ_TILE_WIDTHS(MMQ_MOE_DISPATCH_WIDTH)
+#undef MMQ_MOE_DISPATCH_WIDTH
+        default:
+            return 0;
+    }
+    return best;
+}
+
+/// The expert-batched C entry point for one format.
+#define MMQ_MOE_ENTRY_POINT(ggml_type_name, suffix)                                           \
+    extern "C" int launch_mmq_moe_gguf_##suffix(                                              \
+        const void *x, const void *y_q8_1_mmq, void *dst, const int *expert_bounds,           \
+        const int *ids_dst, int64_t stride_expert_x, int64_t ncols_x, int64_t nrows_x,        \
+        int64_t ncols_y, int64_t stride_row_x, int64_t stride_col_dst, int n_experts,         \
+        int64_t ncols_max, int64_t ncols_hint, int mmq_x, int cc, int64_t smpbo,              \
+        int warp_size_host, void *stream) {                                                   \
+        return mmq_moe_launch<ggml_type_name>(                                                \
+            (const char *) x, (const int *) y_q8_1_mmq, (float *) dst, expert_bounds,         \
+            ids_dst, stride_expert_x, ncols_x, nrows_x, ncols_y, stride_row_x,                \
+            stride_col_dst, n_experts, ncols_max, ncols_hint, mmq_x, (cudaStream_t) stream,   \
+            cc, (size_t) smpbo, warp_size_host);                                              \
+    }

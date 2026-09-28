@@ -231,6 +231,8 @@ static constexpr __host__ __device__ mmq_format mmq_format_of(const ggml_type ty
                                      {MMQ_TILE_NE_K,   1}, {MMQ_TILE_NE_K/QI4_1,   QI4_1},     {0, 0}};
         case GGML_TYPE_Q5_0: return {MMQ_Q8_1_DS_LAYOUT_D4,   MMQ_MMA_TILE_X_K_Q8_0,
                                      {MMQ_TILE_NE_K*2, 1}, {MMQ_TILE_NE_K*2/QI8_0, QI8_0/2},   {0, 0}};
+        case GGML_TYPE_MXFP4: return {MMQ_Q8_1_DS_LAYOUT_D4,  MMQ_MMA_TILE_X_K_Q8_0,
+                                     {MMQ_TILE_NE_K*2, 1}, {MMQ_TILE_NE_K*2/QI8_0, QI8_0/2},   {0, 0}};
         case GGML_TYPE_Q5_1: return {MMQ_Q8_1_DS_LAYOUT_DS4,  MMQ_MMA_TILE_X_K_Q8_1,
                                      {MMQ_TILE_NE_K*2, 1}, {MMQ_TILE_NE_K*2/QI8_1, QI8_1/2},   {0, 0}};
         case GGML_TYPE_Q8_0: return {MMQ_Q8_1_DS_LAYOUT_D4,   MMQ_MMA_TILE_X_K_Q8_0,
@@ -339,7 +341,19 @@ static __device__ __forceinline__ int mmq_tile_row(const int i0, const int i_max
 // output an entry is. Writing one loop over both would mean choosing an order, and a store
 // order that is not the accumulator's is a scatter.
 
-template<int mmq_x, int mmq_y, bool need_check>
+/// The destination column of tile column `j`: itself, or the entry the block staged for it at
+/// the head of its shared memory, which `mmq_get_nbytes_shared` reserves `mmq_x` ints for.
+template<bool scatter>
+static __device__ __forceinline__ auto mmq_dst_column(const int j) {
+    if constexpr (scatter) {
+        extern __shared__ int mmq_shared[];
+        return int64_t(mmq_shared[j]);
+    } else {
+        return j;
+    }
+}
+
+template<int mmq_x, int mmq_y, bool need_check, bool scatter>
 static __device__ __forceinline__ void mmq_write_back_dp4a(
         const float * __restrict__ sum, float * __restrict__ dst,
         const int stride, const int i_max, const int j_max) {
@@ -362,12 +376,12 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
                 continue;
             }
 
-            dst[j*stride + i] = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
+            dst[mmq_dst_column<scatter>(j)*stride + i] = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
         }
     }
 }
 
-template<int mmq_x, int mmq_y, bool need_check>
+template<int mmq_x, int mmq_y, bool need_check, bool scatter>
 static __device__ __forceinline__ void mmq_write_back_mma(
         const float * __restrict__ sum, float * __restrict__ dst,
         const int stride, const int i_max, const int j_max) {
@@ -410,21 +424,22 @@ static __device__ __forceinline__ void mmq_write_back_mma(
                     continue;
                 }
 
-                dst[j*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                dst[mmq_dst_column<scatter>(j)*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
             }
         }
     }
 }
 
-/// The one the multiply this card has filled.
-template<int mmq_x, int mmq_y, bool need_check>
+/// The one the multiply this card has filled. With `scatter`, tile column `j` lands on the
+/// destination column the block staged at `mmq_shared[j]`; without it, on column `j`.
+template<int mmq_x, int mmq_y, bool need_check, bool scatter = false>
 static __device__ __forceinline__ void mmq_write_back(
         const float * __restrict__ sum, float * __restrict__ dst,
         const int stride, const int i_max, const int j_max) {
     if constexpr (mmq_card::tile_multiply) {
-        mmq_write_back_mma<mmq_x, mmq_y, need_check>(sum, dst, stride, i_max, j_max);
+        mmq_write_back_mma<mmq_x, mmq_y, need_check, scatter>(sum, dst, stride, i_max, j_max);
     } else {
-        mmq_write_back_dp4a<mmq_x, mmq_y, need_check>(sum, dst, stride, i_max, j_max);
+        mmq_write_back_dp4a<mmq_x, mmq_y, need_check, scatter>(sum, dst, stride, i_max, j_max);
     }
 }
 
@@ -547,6 +562,27 @@ struct plane_q5_1 {
         hi = ((raw >> 4) & 0x0F0F0F0F) | q5_fifth_bits(qh >> 16);
     }
     static __device__ __forceinline__ half2 scale(const block * b) { return b->dm; }
+};
+
+// MXFP4: an E2M1 nibble per weight under a power-of-two block exponent. The nibbles index a
+// table of doubled magnitudes, so the looked-up weights arrive as signed bytes already split
+// into their two halves, and the scale takes the doubling back out.
+struct plane_mxfp4 {
+    using block = block_mxfp4;
+    using scale_t = float;
+    static constexpr ggml_type type = GGML_TYPE_MXFP4;
+    static constexpr int qi = QI_MXFP4, qr = QR_MXFP4;
+    static constexpr bool dp4a_holds_halves = true;
+    static __device__ __forceinline__ void unpack(const block * b, const int j, int & lo,
+                                                  int & hi, int & raw) {
+        raw = four_bytes_bytewise(b->qs, j);
+        const int2 v = mxfp4_get_int_from_table_16(raw, kvalues_mxfp4);
+        lo = v.x;
+        hi = v.y;
+    }
+    static __device__ __forceinline__ float scale(const block * b) {
+        return e8m0_to_float(b->e) * 0.5f;
+    }
 };
 
 template <typename plane, int mmq_y, bool need_check>
@@ -1871,6 +1907,10 @@ MMQ_FORMAT(GGML_TYPE_Q5_0,
            (load_tiles_paired<plane_q5_0, mmq_y, need_check>),
            (vec_dot_blocked_mma<mmq_scale_only, mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>),
            (vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>))
+MMQ_FORMAT(GGML_TYPE_MXFP4,
+           (load_tiles_paired<plane_mxfp4, mmq_y, need_check>),
+           (vec_dot_blocked_mma<mmq_scale_only, mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>),
+           (vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>))
 MMQ_FORMAT(GGML_TYPE_Q5_1,
            (load_tiles_paired<plane_q5_1, mmq_y, need_check>),
            (vec_dot_blocked_mma<mmq_scale_and_min, mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_DS4>),
@@ -1936,7 +1976,7 @@ static __device__ __forceinline__ void mmq_stage_activation_run(
     }
 }
 
-template <ggml_type type, int mmq_x, bool need_check, bool fixup>
+template <ggml_type type, int mmq_x, bool need_check, bool fixup, bool scatter = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -1988,7 +2028,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         mmq_write_back<mmq_x, mmq_y, need_check>(
             sum, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
     } else {
-        mmq_write_back<mmq_x, mmq_y, need_check>(
+        mmq_write_back<mmq_x, mmq_y, need_check, scatter>(
             sum, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
     }
 }
@@ -2226,6 +2266,71 @@ static __global__ void mul_mat_q(
 #else
     mmq_block_takes_a_slice_of_k<type, mmq_x, mmq_y, need_check>(w);
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+}
+
+/// The expert-batched matmul: every expert of a stack against its own run of activation
+/// columns, one launch for all of them.
+///
+/// The activation columns are sorted by expert, so expert `e` owns columns
+/// `[expert_bounds[e], expert_bounds[e + 1])` of `y`; its weights are the `e`-th slab of `x`,
+/// `stride_expert_x` bytes apart. The grid is (row tile, column tile, expert) and sized for
+/// the widest run an expert can have, so a block whose column tile lies past its expert's run
+/// has nothing to do and leaves. Each block takes a whole tile and its whole k row: no split,
+/// no fixup, and every output is written exactly once.
+///
+/// Column `c` of the result goes to destination row `ids_dst[c]` when `ids_dst` is given, and
+/// to row `c` otherwise.
+template <ggml_type type, int mmq_x, bool need_check>
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+#else
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+__global__ void mul_mat_q_moe(
+        const char * __restrict__ x, const int * __restrict__ y, float * __restrict__ dst,
+        const int * __restrict__ expert_bounds, const int * __restrict__ ids_dst,
+        const int64_t stride_expert_x, const int blocks_per_ne00, const int nrows_x,
+        const int stride_row_x, const int ncols_y, const int stride_col_dst) {
+    if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int mmq_y     = get_mmq_y_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = mmq_get_nwarps_device();
+    constexpr int run_ints  = sizeof(block_q8_1_mmq) / sizeof(int);
+
+    const int it = blockIdx.x;
+    const int jt = blockIdx.y;
+    const int expert = blockIdx.z;
+
+    const int col_low  = expert_bounds[expert];
+    const int col_high = expert_bounds[expert + 1];
+    const int col0     = col_low + jt*mmq_x;
+    if (col0 >= col_high) {
+        return;
+    }
+
+    // The destination row of every column of the tile, read once into the head of shared
+    // memory where the write-back looks it up. Columns past the run keep a harmless index:
+    // the write-back skips them.
+    extern __shared__ int mmq_shared[];
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
+        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+        if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
+            break;
+        }
+        const int col = min(col0 + j, col_high - 1);
+        mmq_shared[j] = ids_dst ? ids_dst[col] : col;
+    }
+    __syncthreads();
+
+    mul_mat_q_process_tile<type, mmq_x, need_check, false, true>(
+        x + expert*stride_expert_x, it*mmq_y*stride_row_x, y + col0*run_ints,
+        dst + it*mmq_y, nullptr, stride_row_x, ncols_y, stride_col_dst,
+        nrows_x - it*mmq_y - 1, col_high - col0 - 1, 0, blocks_per_ne00);
 }
 
 /// Whether this block left part of a tile for the pass below to add in.

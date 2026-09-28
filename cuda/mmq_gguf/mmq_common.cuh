@@ -7,6 +7,7 @@
 #pragma once
 
 #include "../moe/gguf.cuh"
+#include "../moe/mxfp4_moe.cuh"
 
 #include <cstdint>
 #include <cstdio>
@@ -48,7 +49,8 @@
     X(Q4_K, 12,  QK_K,  QR4_K, QI4_K)          \
     X(Q5_K, 13,  QK_K,  QR5_K, QI5_K)          \
     X(Q6_K, 14,  QK_K,  QR6_K, QI6_K)          \
-    X(Q8_K, 15,  QK_K,  1,     1)
+    X(Q8_K, 15,  QK_K,  1,     1)              \
+    X(MXFP4, 39, QK_MXFP4, QR_MXFP4, QI_MXFP4)
 
 enum ggml_type {
 #define GGUF_TYPE_ID(name, id, qk_v, qr_v, qi_v) GGML_TYPE_##name = id,

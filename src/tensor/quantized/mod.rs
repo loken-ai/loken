@@ -103,6 +103,8 @@ pub use kernel_matmul::QuantizedActivation;
 pub use matmul::QMatMul;
 #[cfg(feature = "cuda")]
 pub use mmq::release_mmq_workspaces;
+#[cfg(feature = "cuda")]
+pub(crate) use mmq::{mmq_moe_launcher, mmq_moe_qk, mmq_moe_quantize_launcher, mmq_moe_supports};
 pub use qtensor::QTensor;
 pub use storage::{QStorage, QStorageWithHost};
 pub use varbuilder::QVarBuilder;
