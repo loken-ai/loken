@@ -217,16 +217,19 @@ const MAX_TEXT_TOKENS: usize = 1024;
 /// attention scores, the largest GGUF weight's F32 dequant + BF16 GEMM scratch (from the header,
 /// no tensor data read), and the VAE decode's conv buffers on the shared device.
 fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize) -> u64 {
+    let f32b = 4u64;
+    // VAE decode conv buffers on the shared device.
+    let vae_tile_px = (64 * 8) as u64;
+    let vae = vae_tile_px * vae_tile_px * 128 * 6 * f32b;
     let cfg = match DitConfig::from_checkpoint(dit_path) {
         Ok(cfg) => cfg,
         Err(e) => {
-            // The load refuses the same checkpoint first; nothing is placed against this.
-            tracing::warn!("Qwen-Image reserve: {e}; nothing to plan against");
-            return 0;
+            // The load refuses the same checkpoint first; only the decode is counted.
+            tracing::warn!("Qwen-Image reserve: {e}; counting the decode alone");
+            return vae;
         }
     };
     let dim = cfg.dim() as u64;
-    let f32b = 4u64;
     // The resident checkpoint of this engine serves EDITS as well as txt2img, and
     // an edit runs the DiT over [noise tokens ; clean image latent tokens] - TWICE
     // the image tokens of a plain generation. Sizing for one frame is what left the
@@ -280,9 +283,6 @@ fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize) -> u
         })
         .unwrap_or_else(|| crate::inference::load::fp8_scaled::largest_2d_elems(dit_path));
     let dequant = largest_2d * 6;
-    // VAE decode conv buffers on the shared device.
-    let vae_tile_px = (64 * 8) as u64;
-    let vae = vae_tile_px * vae_tile_px * 128 * 6 * f32b;
     // The denoise and the VAE decode are SEQUENTIAL phases: the DiT activations are
     // freed before the decoder allocates, so the reserve is the max of the two peaks,
     // not their sum. Summing them cost ~0.8 GB of headroom and was enough to refuse a
