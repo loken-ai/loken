@@ -209,10 +209,16 @@ pub fn load(
         })
         .collect();
     let dit_sz = std::fs::metadata(&dit_path).map(|m| m.len()).unwrap_or(0);
-    // The plan distributes the 40-block main stack (8 double-stream + 32 single-stream). Undivided
+    // The plan distributes the main stack, double-stream then single-stream blocks. Undivided
     // on the fastest GPU that fits (hot path); OOM-fallback cascade -> split -> CPU (never OOM).
+    let dit_blocks = crate::inference::load::shapes::Shapes::read(&[&dit_path])
+        .map(|s| {
+            crate::inference::model::boogu::dit::Config::default().with_depths_of(&s.canonical())
+        })
+        .map_err(|e| anyhow!("Boogu DiT: {e}"))?
+        .stack_blocks();
     let dit_path_str = dit_path.to_string_lossy().to_string();
-    let dit = load_blocks(40, dit_sz, &dit_cuda, "Boogu DiT", cancel, |plan| {
+    let dit = load_blocks(dit_blocks, dit_sz, &dit_cuda, "Boogu DiT", cancel, |plan| {
         BooguTransformer2DModel::load_cancellable(&dit_path_str, &cuda_devices, plan, cancel)
             .map_err(|e| anyhow!("{e}"))
     })?;
@@ -227,11 +233,22 @@ pub fn load(
     let enc_sz = std::fs::metadata(&enc_path).map(|m| m.len()).unwrap_or(0);
     // One-shot encoder: best-fit remaining device (undivided on the fastest GPU that still fits,
     // e.g. GPU1 whole rather than splitting GPU0's leftover); same OOM-fallback cascade.
+    let enc_layers =
+        crate::inference::model::qwen3vl::textenc::Config::from_checkpoint(&[&enc_path])
+            .map_err(|e| anyhow!("Boogu encoder: {e}"))?
+            .n_layers;
     let enc_path_str = enc_path.to_string_lossy().to_string();
-    let encoder = load_blocks(36, enc_sz, &enc_cuda, "Boogu encoder", cancel, |plan| {
-        Qwen3VlTextEncoder::load_cancellable(&enc_path_str, &cuda_devices, plan, cancel)
-            .map_err(|e| anyhow!("{e}"))
-    })?;
+    let encoder = load_blocks(
+        enc_layers,
+        enc_sz,
+        &enc_cuda,
+        "Boogu encoder",
+        cancel,
+        |plan| {
+            Qwen3VlTextEncoder::load_cancellable(&enc_path_str, &cuda_devices, plan, cancel)
+                .map_err(|e| anyhow!("{e}"))
+        },
+    )?;
 
     // The DiT's I/O device (where its output lands) is where the VAE decodes.
     let dit_input_device = dit.input_device().clone();

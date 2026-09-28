@@ -36,7 +36,7 @@
 //!   `time_text_embed` (timestep), 60 blocks, `norm_out = AdaLayerNormContinuous`,
 //!   `proj_out = Linear(dim, out_channels)`. GGUF loader: qmatmul like flux_quantized_model.
 
-/// Qwen-Image DiT config (diffusers defaults for the 20B checkpoint).
+/// Qwen-Image DiT config, read from its checkpoint.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub patch_size: usize,
@@ -51,27 +51,76 @@ pub struct Config {
     pub eps: f64,
 }
 
+/// Latent patch side of the family, for a checkpoint that ships no `config.json`.
+pub const QWEN_IMAGE_PATCH: usize = 2;
+/// Rope split of the family over frame, height and width, as shares of a 128-wide head.
+const ROPE_SHARES: [usize; 3] = [16, 56, 56];
+/// Rope base of the family.
+const QWEN_IMAGE_ROPE_THETA: f32 = 10000.0;
+/// Norm epsilon of the family.
+const QWEN_IMAGE_NORM_EPS: f64 = 1e-6;
+
 impl Config {
     /// The dimensionality of the hidden stream (`num_attention_heads * attention_head_dim`).
     pub fn dim(&self) -> usize {
         self.num_attention_heads * self.attention_head_dim
     }
-}
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            patch_size: 2,
-            in_channels: 64,
-            out_channels: 16,
-            num_layers: 60,
-            num_attention_heads: 24,
-            attention_head_dim: 128,
-            joint_attention_dim: 3584,
-            axes_dims_rope: [16, 56, 56],
-            theta: 10000.0,
-            eps: 1e-6,
+    /// The DiT `path` holds, GGUF or safetensors: widths and depth from the tensor shapes,
+    /// the patch and the rope split from the `config.json` beside the weights, else the
+    /// family's.
+    pub fn from_checkpoint(path: &std::path::Path) -> Result<Self> {
+        let shapes = crate::inference::load::shapes::Shapes::read(&[path])?.canonical();
+        let json = crate::inference::load::shapes::config_beside(path);
+        Self::from_shapes(&shapes, json.as_ref())
+    }
+
+    /// [`Self::from_checkpoint`] over shapes already read.
+    pub fn from_shapes(
+        shapes: &crate::inference::load::shapes::Shapes,
+        json: Option<&serde_json::Value>,
+    ) -> Result<Self> {
+        use crate::tensor::Error;
+        let dim = shapes.dim("img_in.weight", 0)?;
+        let head_dim = shapes.dim("transformer_blocks.0.attn.norm_q.weight", 0)?;
+        if head_dim == 0 {
+            return Err(Error("qwen-image DiT: norm_q is empty".to_string()));
         }
+        let patch = json
+            .and_then(|j| j.get("patch_size"))
+            .and_then(serde_json::Value::as_u64)
+            .map_or(QWEN_IMAGE_PATCH, |p| p as usize);
+        let axes = json
+            .and_then(|j| j.get("axes_dims_rope"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| {
+                let v: Vec<usize> = a
+                    .iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect();
+                <[usize; 3]>::try_from(v).ok()
+            })
+            .unwrap_or_else(|| {
+                let whole: usize = ROPE_SHARES.iter().sum();
+                ROPE_SHARES.map(|s| s * head_dim / whole)
+            });
+        if axes.iter().sum::<usize>() != head_dim {
+            return Err(Error(format!(
+                "qwen-image DiT: rope axes {axes:?} do not tile the {head_dim}-wide heads"
+            )));
+        }
+        Ok(Self {
+            patch_size: patch,
+            in_channels: shapes.dim("img_in.weight", 1)?,
+            out_channels: shapes.dim("proj_out.weight", 0)? / (patch * patch),
+            num_layers: shapes.blocks("transformer_blocks"),
+            num_attention_heads: dim / head_dim,
+            attention_head_dim: head_dim,
+            joint_attention_dim: shapes.dim("txt_in.weight", 1)?,
+            axes_dims_rope: axes,
+            theta: QWEN_IMAGE_ROPE_THETA,
+            eps: QWEN_IMAGE_NORM_EPS,
+        })
     }
 }
 
@@ -803,7 +852,7 @@ impl Model {
         plan: &crate::inference::place::layer_executor::HeteroPlan,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
     ) -> Result<Self> {
-        let cfg = Config::default();
+        let cfg = Config::from_checkpoint(std::path::Path::new(path))?;
         let dim = cfg.dim();
         // Builder source is CHECKPOINT-AWARE: a .safetensors checkpoint is an fp8-scaled Ray
         // drop-in (RayQwest) - decode fp8 (e4m3/e5m2), fold any weight_scale, re-quantize the
@@ -881,22 +930,6 @@ impl Model {
         })
     }
 
-    /// Single-device compat wrapper (smoke/render bins): all blocks on `device`.
-    pub fn load_gguf(path: &str, device: &crate::tensor::Device) -> Result<Self> {
-        let n = Config::default().num_layers;
-        let mut map = std::collections::HashMap::new();
-        let plan = match device.location() {
-            crate::tensor::DeviceLocation::Cuda { gpu_id } => {
-                map.insert(gpu_id, device.clone());
-                crate::inference::place::layer_executor::HeteroPlan::forced_gpu(n, n, gpu_id)
-            }
-            _ => {
-                crate::inference::place::layer_executor::HeteroPlan::calculate(n, 0, &[], &[], 1.0)
-            }
-        };
-        Self::load_hetero(path, &map, &plan, None)
-    }
-
     /// First block's device (where the forward's inputs/outputs live).
     /// True when the blocks do NOT all live on one device: the forward then pays a
     /// cross-device transfer per boundary per step (and a host bounce when the pair
@@ -912,6 +945,10 @@ impl Model {
     pub fn input_device(&self) -> &crate::tensor::Device {
         &self.input_device
     }
+    /// The shape this model was built with, as its checkpoint holds it.
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
     /// Output lands on the input device (norm_out/proj_out run there).
     pub fn output_device(&self) -> &crate::tensor::Device {
         &self.input_device
@@ -922,9 +959,28 @@ impl Model {
 mod tests {
     use super::*;
 
+    /// Qwen-Image as its GGUF header lists it.
+    fn qwen_image() -> Config {
+        let dims: &[(&str, &[usize])] = &[
+            ("img_in.weight", &[3072, 64]),
+            ("txt_in.weight", &[3072, 3584]),
+            ("proj_out.weight", &[64, 3072]),
+            ("transformer_blocks.0.attn.norm_q.weight", &[128]),
+            ("transformer_blocks.59.attn.norm_q.weight", &[128]),
+        ];
+        let shapes = crate::inference::load::shapes::Shapes::from_dims(
+            dims.iter()
+                .map(|(n, d)| (n.to_string(), d.to_vec()))
+                .collect(),
+        );
+        Config::from_shapes(&shapes, None).unwrap()
+    }
+
     #[test]
     fn config_shapes_are_consistent() {
-        let c = Config::default();
+        let c = qwen_image();
+        assert_eq!((c.num_layers, c.num_attention_heads), (60, 24));
+        assert_eq!((c.axes_dims_rope, c.out_channels), ([16, 56, 56], 16));
         // hidden dim = heads * head_dim
         assert_eq!(c.dim(), 3072);
         // the 3 rope axes tile the head dim exactly
@@ -935,7 +991,7 @@ mod tests {
 
     #[test]
     fn rope_shapes_and_identity_at_origin() {
-        let c = Config::default();
+        let c = qwen_image();
         let rope = QwenEmbedRope::new(c.theta, c.axes_dims_rope, true).unwrap();
         let (f, h, w, txt) = (1usize, 4usize, 6usize, 5usize);
         let ((ic, is), (tc, ts)) = rope.forward(f, h, w, txt).unwrap();
@@ -957,7 +1013,7 @@ mod tests {
 
     #[test]
     fn apply_rope_identity_on_frame_axis_at_origin() {
-        let c = Config::default();
+        let c = qwen_image();
         let rope = QwenEmbedRope::new(c.theta, c.axes_dims_rope, true).unwrap();
         let ((ic, is), _) = rope.forward(1, 4, 6, 3).unwrap();
         let (seq, heads, hd) = (24usize, 2usize, c.attention_head_dim);
@@ -980,7 +1036,7 @@ mod tests {
 
     #[test]
     fn block_forward_shapes_and_finite() {
-        let c = Config::default();
+        let c = qwen_image();
         let hd = c.attention_head_dim;
         let heads = 2usize;
         let dim = heads * hd; // 256
@@ -1082,7 +1138,7 @@ mod tests {
 
     #[test]
     fn model_forward_shapes_and_finite() {
-        let mut c = Config::default();
+        let mut c = qwen_image();
         c.num_attention_heads = 2; // dim = 256
         c.num_layers = 2;
         let (dim, hd, heads) = (c.dim(), c.attention_head_dim, c.num_attention_heads);
@@ -1183,7 +1239,7 @@ mod tests {
         // loads without a missing-tensor error -> every reference resolves to a real GGUF name
         let blk = Block::load_f32(&m, 0, heads, hd, 1e-6).unwrap();
 
-        let c = Config::default();
+        let c = qwen_image();
         let rope = QwenEmbedRope::new(c.theta, c.axes_dims_rope, true).unwrap();
         let ((ic, is), (tc, ts)) = rope.forward(1, 4, 6, 3).unwrap();
         let img = NT::from_vec_f32(vec![0.05f32; 24 * dim], (24usize, dim)).unwrap();

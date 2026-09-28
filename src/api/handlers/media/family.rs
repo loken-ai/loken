@@ -567,9 +567,11 @@ pub(crate) fn family_runtime_bytes(
     match loader {
         // Derived from this family's OWN architecture and the requested geometry - notably a
         // DiT token here is 16 pixels a side, not the 8 every other family uses.
-        ImageLoader::Flux2 => {
-            crate::inference::engine::flux2_engine::runtime_headroom_bytes(geom.width, geom.height)
-        }
+        ImageLoader::Flux2 => crate::inference::engine::flux2_engine::runtime_headroom_bytes(
+            hf_models_dir,
+            geom.width,
+            geom.height,
+        ),
         ImageLoader::QwenImage => {
             crate::inference::engine::qwen_image_engine::runtime_headroom_bytes(
                 hf_models_dir,

@@ -373,7 +373,9 @@ impl ImageEngine {
             send_progress("Loading CLIP encoder...");
             // CLIP runs in F32 wherever it lands, a one-shot component placed like T5. The
             // file also holds the vision tower, so its size bounds the text tower's.
-            let clip_config = crate::inference::model::clip::text::Config::vit_l_14();
+            let clip_config = crate::inference::load::shapes::Shapes::read(&[&clip_model_file])
+                .and_then(|s| crate::inference::model::clip::text::Config::from_shapes(&s, "text_model"))
+                .map_err(|e| anyhow!("CLIP shape: {e}"))?;
             let clip_bytes = std::fs::metadata(&clip_model_file).map_or(0, |m| m.len());
             // The positions the encoder reads: its positional table's rows, from the file.
             let clip_context = unsafe {

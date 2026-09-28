@@ -16,7 +16,9 @@
 //! layout, whose attention keeps ONE fused `in_proj` instead of three projections -
 //! so its tower lives here, and the fusion is kept (one GEMM instead of three).
 
-use crate::inference::model::clip::text::{Config as ClipConfig, Transformer as ClipTransformer};
+use crate::inference::model::clip::text::{
+    Config as ClipConfig, Transformer as ClipTransformer, HEAD_WIDTH,
+};
 use crate::tensor::layer::{layer_norm, LayerNorm, Linear};
 use crate::tensor::ops::causal_mask;
 use crate::tensor::VarBuilder;
@@ -37,17 +39,14 @@ pub const BOS_TOKEN: u32 = 49406;
 const L_PREFIX: &str = "conditioner.embedders.0.transformer.text_model";
 const G_PREFIX: &str = "conditioner.embedders.1.model";
 
-/// bigG's published config.
-const G_LAYERS: usize = 32;
-const G_HEADS: usize = 20;
-const G_MLP: usize = 5120;
-
 /// One open_clip residual attention block: `ln_1 -> attn -> +x -> ln_2 -> mlp -> +x`.
 ///
 /// The fused `in_proj` is kept fused: q, k and v come out of a single GEMM and are
 /// split afterwards, which is both what the checkpoint stores and cheaper than three
 /// separate projections.
 struct GBlock {
+    width: usize,
+    heads: usize,
     ln1: LayerNorm,
     ln2: LayerNorm,
     in_proj: Linear,
@@ -57,28 +56,31 @@ struct GBlock {
 }
 
 impl GBlock {
-    fn new(vb: &VarBuilder) -> Result<Self> {
+    fn new(vb: &VarBuilder, width: usize, mlp: usize) -> Result<Self> {
         Ok(Self {
-            ln1: layer_norm(CLIP_G_DIM, 1e-5, &vb.pp("ln_1"))?,
-            ln2: layer_norm(CLIP_G_DIM, 1e-5, &vb.pp("ln_2"))?,
-            in_proj: fused_linear(3 * CLIP_G_DIM, CLIP_G_DIM, &vb.pp("attn"), "in_proj")?,
-            out_proj: named_linear(CLIP_G_DIM, CLIP_G_DIM, &vb.pp("attn").pp("out_proj"))?,
-            fc: named_linear(G_MLP, CLIP_G_DIM, &vb.pp("mlp").pp("c_fc"))?,
-            proj: named_linear(CLIP_G_DIM, G_MLP, &vb.pp("mlp").pp("c_proj"))?,
+            width,
+            heads: width / HEAD_WIDTH,
+            ln1: layer_norm(width, 1e-5, &vb.pp("ln_1"))?,
+            ln2: layer_norm(width, 1e-5, &vb.pp("ln_2"))?,
+            in_proj: fused_linear(3 * width, width, &vb.pp("attn"), "in_proj")?,
+            out_proj: named_linear(width, width, &vb.pp("attn").pp("out_proj"))?,
+            fc: named_linear(mlp, width, &vb.pp("mlp").pp("c_fc"))?,
+            proj: named_linear(width, mlp, &vb.pp("mlp").pp("c_proj"))?,
         })
     }
 
     /// `xs`: `[b, seq, dim]`, `mask`: additive causal mask `[1, 1, seq, seq]`.
     fn forward(&self, xs: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let (b, seq, _) = xs.shape().dims3()?;
-        let hd = CLIP_G_DIM / G_HEADS;
+        let (width, heads) = (self.width, self.heads);
+        let hd = width / heads;
 
         let h = self.ln1.forward(xs)?;
         let qkv = self.in_proj.forward(&h)?;
         // [b, seq, 3*dim] -> three [b, heads, seq, head_dim]
         let split = |i: usize| -> Result<Tensor> {
-            qkv.narrow(2, i * CLIP_G_DIM, CLIP_G_DIM)?
-                .reshape(vec![b, seq, G_HEADS, hd])?
+            qkv.narrow(2, i * width, width)?
+                .reshape(vec![b, seq, heads, hd])?
                 .transpose(1, 2)?
                 .contiguous()
         };
@@ -92,7 +94,7 @@ impl GBlock {
         let attn = attn
             .transpose(1, 2)?
             .contiguous()?
-            .reshape(vec![b, seq, CLIP_G_DIM])?;
+            .reshape(vec![b, seq, width])?;
         let xs = xs.add(&self.out_proj.forward(&attn)?)?;
 
         let h = self.ln2.forward(&xs)?;
@@ -102,9 +104,10 @@ impl GBlock {
     }
 }
 
-/// The bigG text tower: token + positional embeddings, 32 residual blocks, and the
+/// The bigG text tower: token + positional embeddings, its residual blocks, and the
 /// output projection used for the pooled vector.
 pub struct ClipG {
+    width: usize,
     token_embedding: Tensor,
     positional_embedding: Tensor,
     blocks: Vec<GBlock>,
@@ -114,21 +117,36 @@ pub struct ClipG {
 }
 
 impl ClipG {
-    fn new(vb: &VarBuilder) -> Result<Self> {
-        let mut blocks = Vec::with_capacity(G_LAYERS);
+    /// The tower rooted at `root` in `vb`, its width, depth and vocabulary read off `shapes`.
+    fn new(
+        vb: &VarBuilder,
+        shapes: &crate::inference::load::shapes::Shapes,
+        root: &str,
+    ) -> Result<Self> {
+        let token = format!("{root}.token_embedding.weight");
+        let (vocab, width) = (shapes.dim(&token, 0)?, shapes.dim(&token, 1)?);
+        if width % HEAD_WIDTH != 0 {
+            return Err(crate::tensor::Error(format!(
+                "sdxl bigG: {width} wide does not split into {HEAD_WIDTH}-wide heads"
+            )));
+        }
+        let blocks_at = format!("{root}.transformer.resblocks");
+        let depth = shapes.blocks(&blocks_at);
+        let mlp = shapes.dim(&format!("{blocks_at}.0.mlp.c_fc.weight"), 0)?;
+        let context = shapes.dim(&format!("{root}.positional_embedding"), 0)?;
+        let mut blocks = Vec::with_capacity(depth);
         let vb_blocks = vb.pp("transformer").pp("resblocks");
-        for i in 0..G_LAYERS {
-            blocks.push(GBlock::new(&vb_blocks.pp(i.to_string()))?);
+        for i in 0..depth {
+            blocks.push(GBlock::new(&vb_blocks.pp(i.to_string()), width, mlp)?);
         }
         Ok(Self {
-            token_embedding: vb
-                .pp("token_embedding")
-                .get((49408, CLIP_G_DIM), "weight")?,
-            positional_embedding: vb.get((CONTEXT_TOKENS, CLIP_G_DIM), "positional_embedding")?,
+            width,
+            token_embedding: vb.pp("token_embedding").get((vocab, width), "weight")?,
+            positional_embedding: vb.get((context, width), "positional_embedding")?,
             blocks,
-            ln_final: layer_norm(CLIP_G_DIM, 1e-5, &vb.pp("ln_final"))?,
+            ln_final: layer_norm(width, 1e-5, &vb.pp("ln_final"))?,
             // open_clip stores this as a bare `[dim, dim]` tensor, applied on the right.
-            text_projection: vb.get((CLIP_G_DIM, CLIP_G_DIM), "text_projection")?,
+            text_projection: vb.get((width, width), "text_projection")?,
             device: vb.device().clone(),
         })
     }
@@ -141,11 +159,11 @@ impl ClipG {
         let emb = self
             .token_embedding
             .index_select(&idt, 0)?
-            .reshape(vec![1, seq, CLIP_G_DIM])?;
+            .reshape(vec![1, seq, self.width])?;
         let pos = self
             .positional_embedding
             .narrow(0, 0, seq)?
-            .reshape(vec![1, seq, CLIP_G_DIM])?;
+            .reshape(vec![1, seq, self.width])?;
         let mut xs = emb.add(&pos)?;
 
         // Built in F32; it is ADDED to the scores, so it has to arrive in whatever dtype
@@ -170,7 +188,7 @@ impl ClipG {
             .iter()
             .position(|t| *t == EOS_TOKEN)
             .unwrap_or(seq.saturating_sub(1));
-        let row = out.narrow(1, eos, 1)?.reshape(vec![1, CLIP_G_DIM])?;
+        let row = out.narrow(1, eos, 1)?.reshape(vec![1, self.width])?;
         let pooled = row.matmul(&self.text_projection)?;
         Ok((hidden, pooled))
     }
@@ -202,10 +220,11 @@ impl SdxlTextEncoders {
     pub fn load(checkpoint: &str, device: &Device, dtype: DType) -> Result<Self> {
         let vb = unsafe { VarBuilder::from_files(&[checkpoint], dtype, device) }?;
         // CLIP-L is stored under the HuggingFace names `native_clip` already reads.
-        let l_cfg = ClipConfig::vit_l_14();
+        let shapes = crate::inference::load::shapes::Shapes::read(&[checkpoint])?;
+        let l_cfg = ClipConfig::from_shapes(&shapes, L_PREFIX)?;
         Ok(Self {
             l: ClipTransformer::new(vb.pp(L_PREFIX), &l_cfg)?,
-            g: ClipG::new(&vb.pp(G_PREFIX))?,
+            g: ClipG::new(&vb.pp(G_PREFIX), &shapes, G_PREFIX)?,
             device: device.clone(),
         })
     }

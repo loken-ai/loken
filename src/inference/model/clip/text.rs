@@ -16,6 +16,7 @@ use crate::tensor::Module;
 use crate::tensor::VarBuilder;
 use crate::tensor::{self, Tensor};
 
+/// A CLIP text tower's shape, read from its checkpoint.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub vocab_size: usize,
@@ -23,26 +24,38 @@ pub struct Config {
     pub activation: Activation,
     pub intermediate_size: usize,
     pub max_position_embeddings: usize,
-    pub pad_with: Option<String>,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
-    pub projection_dim: usize,
 }
 
+/// Width of one attention head across the CLIP family; the checkpoint stores the fused
+/// width only.
+pub const HEAD_WIDTH: usize = 64;
+
 impl Config {
-    /// The text tower of CLIP ViT-L/14, as `openai/clip-vit-large-patch14` ships it.
-    pub fn vit_l_14() -> Self {
-        Self {
-            vocab_size: 49408,
-            embed_dim: 768,
-            activation: Activation::QuickGelu,
-            intermediate_size: 3072,
-            max_position_embeddings: 77,
-            pad_with: None,
-            num_hidden_layers: 12,
-            num_attention_heads: 12,
-            projection_dim: 768,
+    /// The OpenAI-layout tower rooted at `root` in `shapes` (`text_model` in its own file):
+    /// widths from the embeddings and the first block, depth from the numbered layers.
+    pub fn from_shapes(
+        shapes: &crate::inference::load::shapes::Shapes,
+        root: &str,
+    ) -> tensor::Result<Self> {
+        let token = format!("{root}.embeddings.token_embedding.weight");
+        let embed_dim = shapes.dim(&token, 1)?;
+        if embed_dim % HEAD_WIDTH != 0 {
+            return Err(tensor::Error(format!(
+                "clip text: {embed_dim} wide does not split into {HEAD_WIDTH}-wide heads"
+            )));
         }
+        Ok(Self {
+            vocab_size: shapes.dim(&token, 0)?,
+            embed_dim,
+            activation: Activation::QuickGelu,
+            intermediate_size: shapes.dim(&format!("{root}.encoder.layers.0.mlp.fc1.weight"), 0)?,
+            max_position_embeddings: shapes
+                .dim(&format!("{root}.embeddings.position_embedding.weight"), 0)?,
+            num_hidden_layers: shapes.blocks(&format!("{root}.encoder.layers")),
+            num_attention_heads: embed_dim / HEAD_WIDTH,
+        })
     }
 }
 
@@ -275,5 +288,42 @@ impl Transformer {
         let refs: Vec<&Tensor> = pooled.iter().collect();
         let pooled = Tensor::cat(&refs, 0)?;
         pooled.to_device(&input_ids.device())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tower_is_read_off_its_header() {
+        let dims: &[(&str, &[usize])] = &[
+            (
+                "text_model.embeddings.token_embedding.weight",
+                &[49408, 768],
+            ),
+            (
+                "text_model.embeddings.position_embedding.weight",
+                &[77, 768],
+            ),
+            ("text_model.encoder.layers.0.mlp.fc1.weight", &[3072, 768]),
+            ("text_model.encoder.layers.11.mlp.fc1.weight", &[3072, 768]),
+        ];
+        let shapes = crate::inference::load::shapes::Shapes::from_dims(
+            dims.iter()
+                .map(|(n, d)| (n.to_string(), d.to_vec()))
+                .collect(),
+        );
+        let c = Config::from_shapes(&shapes, "text_model").unwrap();
+        assert_eq!(
+            (
+                c.vocab_size,
+                c.embed_dim,
+                c.intermediate_size,
+                c.max_position_embeddings
+            ),
+            (49408, 768, 3072, 77)
+        );
+        assert_eq!((c.num_hidden_layers, c.num_attention_heads), (12, 12));
     }
 }

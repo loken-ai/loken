@@ -207,10 +207,9 @@ const VAE_TILE_TRANSIENT_BYTES: u64 =
 
 /// Native generation side of the family (Qwen-Image is a 1K model); the runtime reserve is sized
 /// for a generation at this resolution.
-/// The VAE's spatial reduction and the DiT's patch size on top of it. Together they
-/// turn requested PIXELS into the token count the demand below is a function of.
+/// The VAE's spatial reduction; with the DiT's patch on top of it, it turns requested PIXELS
+/// into the token count the demand below is a function of.
 const VAE_STRIDE: usize = 8;
-const PATCH: usize = 2;
 /// Caption token budget the reserve accounts for.
 const MAX_TEXT_TOKENS: usize = 1024;
 
@@ -220,7 +219,14 @@ const MAX_TEXT_TOKENS: usize = 1024;
 /// attention scores, the largest GGUF weight's F32 dequant + BF16 GEMM scratch (from the header,
 /// no tensor data read), and the VAE decode's conv buffers on the shared device.
 fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize) -> u64 {
-    let cfg = crate::inference::model::qwen_image::dit::Config::default();
+    let cfg = match DitConfig::from_checkpoint(dit_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            // The load refuses the same checkpoint first; nothing is placed against this.
+            tracing::warn!("Qwen-Image reserve: {e}; nothing to plan against");
+            return 0;
+        }
+    };
     let dim = cfg.dim() as u64;
     let f32b = 4u64;
     // The resident checkpoint of this engine serves EDITS as well as txt2img, and
@@ -232,10 +238,13 @@ fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize) -> u
     // Sizing every request as if it were 1024^2 is wrong in both directions: it
     // over-reserves at 512^2, refusing placements that would have run, and
     // under-reserves above it, admitting a load that then cannot denoise.
-    let img_tokens =
-        crate::inference::place::runtime_demand::latent_tokens(height, width, VAE_STRIDE, PATCH)
-            as u64
-            * EDIT_FRAMES;
+    let img_tokens = crate::inference::place::runtime_demand::latent_tokens(
+        height,
+        width,
+        VAE_STRIDE,
+        cfg.patch_size,
+    ) as u64
+        * EDIT_FRAMES;
     let seq = img_tokens + MAX_TEXT_TOKENS as u64;
     let buf = |tokens: u64, width: u64| tokens * width * f32b;
 
@@ -379,8 +388,11 @@ pub fn load(
             .map(|(i, f)| format!("GPU{i}:{:.2}GB", *f as f64 / 1e9))
             .collect::<Vec<_>>()
     );
+    let dit_layers = DitConfig::from_checkpoint(&dit_path)
+        .map_err(|e| anyhow!("Qwen-Image DiT: {e}"))?
+        .num_layers;
     let dit = crate::inference::place::ladder::load_blocks(
-        60,
+        dit_layers,
         dit_sz,
         &dit_cuda,
         "Qwen-Image DiT",
@@ -399,11 +411,14 @@ pub fn load(
         .filter(|(i, _, _)| cuda_devices.contains_key(i))
         .map(|(i, f, _)| (i, f))
         .collect();
-    // One-shot encoder (28 Qwen2 layers): best-fit remaining capacity; same OOM-fallback cascade.
+    // One-shot encoder: best-fit remaining capacity; same OOM-fallback cascade.
+    let enc_layers = crate::inference::load::shapes::Shapes::read(&[&enc_gguf])
+        .and_then(|s| s.meta_usize("block_count"))
+        .map_err(|e| anyhow!("Qwen-Image encoder: {e}"))?;
     let enc_sz = std::fs::metadata(&enc_gguf).map(|m| m.len()).unwrap_or(0);
     let enc_path_str = enc_gguf.to_string_lossy().to_string();
     let encoder = crate::inference::place::ladder::load_blocks(
-        28,
+        enc_layers,
         enc_sz,
         &enc_cuda,
         "Qwen-Image encoder",
@@ -448,13 +463,14 @@ pub fn load(
         SigmaShift::Dynamic
     };
 
+    let cfg = dit.config().clone();
     Ok(QwenImageModelState {
         dit,
         vae,
         vae_device,
         vae_cpu,
         tokenizer,
-        cfg: DitConfig::default(),
+        cfg,
         dit_device,
         encoder,
         drop_idx,

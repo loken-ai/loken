@@ -54,6 +54,20 @@ pub fn tokenize(tok: &tokenizers::Tokenizer, prompt: &str) -> Result<(Vec<u32>, 
     Ok((ids, real))
 }
 
+/// Whether an encoder `width` wide, tapped at [`HIDDEN_LAYERS`], fills a DiT context of
+/// `context` features.
+pub fn check_context(width: usize, context: usize) -> Result<()> {
+    if width * HIDDEN_LAYERS.len() == context {
+        Ok(())
+    } else {
+        Err(Error(format!(
+            "flux2 conditioning: {} taps of a {width}-wide encoder do not fill the DiT's \
+             {context}-wide context",
+            HIDDEN_LAYERS.len()
+        )))
+    }
+}
+
 /// Prompt -> `[512, 7680]` conditioning for the DiT.
 pub fn encode(enc: &Qwen3VlTextEncoder, tok: &tokenizers::Tokenizer, prompt: &str) -> Result<NT> {
     let (ids, real) = tokenize(tok, prompt)?;
@@ -87,11 +101,12 @@ mod tests {
 
     #[test]
     fn concatenated_width_is_the_dit_context_dim() {
-        let cfg = crate::inference::model::qwen3vl::textenc::Config::qwen3_4b();
-        let dit = crate::inference::model::flux2::dit::Config::klein_4b();
-        assert_eq!(cfg.hidden * HIDDEN_LAYERS.len(), dit.joint_attention_dim);
-        // The taps must exist in a 36-block stack, and be mid-stack rather than the last layer.
-        assert!(HIDDEN_LAYERS.iter().all(|&k| k >= 1 && k < cfg.n_layers));
+        // FLUX.2 Klein 4B: a 2560-wide, 36-block Qwen3 encoder under a 7680-wide DiT context.
+        let (width, depth, context) = (2560usize, 36usize, 7680usize);
+        assert!(check_context(width, context).is_ok());
+        assert!(check_context(width + 1, context).is_err());
+        // The taps must exist in the stack, and be mid-stack rather than the last layer.
+        assert!(HIDDEN_LAYERS.iter().all(|&k| k >= 1 && k < depth));
     }
 
     /// The empty `<think></think>` block is what `enable_thinking=False` renders. Dropping it is

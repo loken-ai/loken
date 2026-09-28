@@ -63,29 +63,72 @@ impl Config {
     pub fn mlp_hidden(&self) -> usize {
         (self.dim() as f64 * self.mlp_ratio) as usize
     }
-    pub fn klein_4b() -> Self {
-        Self {
-            in_channels: 128,
-            out_channels: 128,
-            num_layers: 5,
-            num_single_layers: 20,
-            num_attention_heads: 24,
-            attention_head_dim: 128,
-            joint_attention_dim: 7680,
-            mlp_ratio: 3.0,
-            axes_dims_rope: [32, 32, 32, 32],
-            rope_theta: 2000.0,
-            timestep_guidance_channels: 256,
-            eps: 1e-6,
+    /// The DiT `path` holds: widths and depths from the tensor shapes, the rope layout, its
+    /// base and the norm epsilon from the `config.json` beside the weights, else the family's.
+    pub fn from_checkpoint(path: &std::path::Path) -> Result<Self> {
+        let shapes = crate::inference::load::shapes::Shapes::read(&[path])?.canonical();
+        let json = crate::inference::load::shapes::config_beside(path);
+        Self::from_shapes(&shapes, json.as_ref())
+    }
+
+    /// [`Self::from_checkpoint`] over shapes already read.
+    pub fn from_shapes(
+        shapes: &crate::inference::load::shapes::Shapes,
+        json: Option<&serde_json::Value>,
+    ) -> Result<Self> {
+        let head_dim = shapes.dim("transformer_blocks.0.attn.norm_q.weight", 0)?;
+        let dim = shapes.dim("x_embedder.weight", 0)?;
+        let mlp_hidden = shapes.dim("transformer_blocks.0.ff.linear_out.weight", 1)?;
+        if head_dim == 0 || dim == 0 {
+            return Err(crate::tensor::Error(
+                "flux2 DiT: empty embedding".to_string(),
+            ));
         }
+        let float = |key: &str, family: f64| {
+            json.and_then(|j| j.get(key))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(family)
+        };
+        let axes = json
+            .and_then(|j| j.get("axes_dims_rope"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|a| {
+                let v: Vec<usize> = a
+                    .iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect();
+                <[usize; ROPE_AXES]>::try_from(v).ok()
+            })
+            .unwrap_or([head_dim / ROPE_AXES; ROPE_AXES]);
+        if axes.iter().sum::<usize>() != head_dim {
+            return Err(crate::tensor::Error(format!(
+                "flux2 DiT: rope axes {axes:?} do not tile the {head_dim}-wide heads"
+            )));
+        }
+        Ok(Self {
+            in_channels: shapes.dim("x_embedder.weight", 1)?,
+            out_channels: shapes.dim("proj_out.weight", 0)?,
+            num_layers: shapes.blocks("transformer_blocks"),
+            num_single_layers: shapes.blocks("single_transformer_blocks"),
+            num_attention_heads: dim / head_dim,
+            attention_head_dim: head_dim,
+            joint_attention_dim: shapes.dim("context_embedder.weight", 1)?,
+            mlp_ratio: mlp_hidden as f64 / dim as f64,
+            axes_dims_rope: axes,
+            rope_theta: float("rope_theta", FLUX2_ROPE_THETA) as f32,
+            timestep_guidance_channels: shapes
+                .dim("time_guidance_embed.timestep_embedder.linear_1.weight", 1)?,
+            eps: float("eps", FLUX2_NORM_EPS),
+        })
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self::klein_4b()
-    }
-}
+/// Rope axes of the family: time, height, width and text position.
+const ROPE_AXES: usize = 4;
+/// Rope base of the family, for a checkpoint that ships no `config.json`.
+const FLUX2_ROPE_THETA: f64 = 2000.0;
+/// Norm epsilon of the family, for a checkpoint that ships no `config.json`.
+const FLUX2_NORM_EPS: f64 = 1e-6;
 
 /// `y = x * w^T`. Every FLUX.2 projection is bias-free, so there is no bias arm to carry.
 pub enum Linear {
@@ -533,7 +576,7 @@ impl Model {
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
         weight_dtype: crate::tensor::quantized::GgmlDType,
     ) -> Result<Self> {
-        let cfg = Config::klein_4b();
+        let cfg = Config::from_checkpoint(std::path::Path::new(path))?;
         let is_st = std::path::Path::new(path)
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
@@ -697,9 +740,34 @@ impl Model {
 mod tests {
     use super::*;
 
+    /// FLUX.2 Klein 4B as its checkpoint header lists it.
+    fn klein_4b() -> Config {
+        let dims: &[(&str, &[usize])] = &[
+            ("x_embedder.weight", &[3072, 128]),
+            ("context_embedder.weight", &[3072, 7680]),
+            ("proj_out.weight", &[128, 3072]),
+            (
+                "time_guidance_embed.timestep_embedder.linear_1.weight",
+                &[3072, 256],
+            ),
+            ("transformer_blocks.0.attn.norm_q.weight", &[128]),
+            ("transformer_blocks.0.ff.linear_out.weight", &[3072, 9216]),
+            ("transformer_blocks.4.attn.norm_q.weight", &[128]),
+            ("single_transformer_blocks.19.attn.norm_q.weight", &[128]),
+        ];
+        let shapes = crate::inference::load::shapes::Shapes::from_dims(
+            dims.iter()
+                .map(|(n, d)| (n.to_string(), d.to_vec()))
+                .collect(),
+        );
+        Config::from_shapes(&shapes, None).unwrap()
+    }
+
     #[test]
     fn config_shapes_match_the_checkpoint_header() {
-        let c = Config::klein_4b();
+        let c = klein_4b();
+        assert_eq!((c.num_layers, c.num_single_layers), (5, 20));
+        assert_eq!(c.num_attention_heads, 24);
         assert_eq!(c.dim(), 3072);
         assert_eq!(c.mlp_hidden(), 9216);
         // ff.linear_in is [2*inner, dim] because the SwiGLU gate is fused into it.
@@ -739,7 +807,7 @@ mod tests {
 
     #[test]
     fn rope_is_identity_at_the_origin() -> Result<()> {
-        let cfg = Config::klein_4b();
+        let cfg = klein_4b();
         let rope = Flux2Rope::new(&cfg);
         let (cos, sin) = rope.forward(&[[0.0, 0.0, 0.0, 0.0]])?;
         assert_eq!(cos.shape().dims(), &[1, cfg.attention_head_dim / 2]);

@@ -767,9 +767,11 @@ fn oracle_runtime_bytes(
     const VAE_DECODER_WIDTH: usize = 128;
     let vae = demand::vae_decode_bytes(geom.height, geom.width, VAE_DECODER_WIDTH);
     match loader {
-        ImageLoader::Flux2 => {
-            crate::inference::engine::flux2_engine::runtime_headroom_bytes(geom.width, geom.height)
-        }
+        ImageLoader::Flux2 => crate::inference::engine::flux2_engine::runtime_headroom_bytes(
+            dir,
+            geom.width,
+            geom.height,
+        ),
         ImageLoader::QwenImage => {
             crate::inference::engine::qwen_image_engine::runtime_headroom_bytes(
                 dir,

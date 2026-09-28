@@ -81,6 +81,22 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// This config with the depths of every stack taken from `shapes`: the double- and
+    /// single-stream blocks the plan divides, and the refiners beside them.
+    pub fn with_depths_of(mut self, shapes: &crate::inference::load::shapes::Shapes) -> Self {
+        self.num_double_stream_layers = shapes.blocks("double_stream_layers");
+        self.num_single_stream_layers = shapes.blocks("single_stream_layers");
+        self.num_refiner_layers = shapes.blocks("noise_refiner");
+        self
+    }
+
+    /// Blocks of the main stack the plan divides.
+    pub fn stack_blocks(&self) -> usize {
+        self.num_double_stream_layers + self.num_single_stream_layers
+    }
+}
+
 // -- weight loading (fp8_scaled / bf16 -> F32 native) ----------------------------
 
 /// Load every tensor of the DiT safetensors into an F32 name->tensor map on `dev`,
@@ -837,7 +853,8 @@ impl BooguTransformer2DModel {
         plan: &HeteroPlan,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
     ) -> Result<Self> {
-        let cfg = Config::default();
+        let shapes = crate::inference::load::shapes::Shapes::read(&[path])?.canonical();
+        let cfg = Config::default().with_depths_of(&shapes);
         // SAFETY: `load_qvarbuilder` copies every tensor out of the mmap before returning.
         let vb = unsafe {
             crate::inference::load::fp8_scaled::load_qvarbuilder_cancellable(

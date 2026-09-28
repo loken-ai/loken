@@ -84,10 +84,25 @@ pub fn hot_component_bytes(hf_models_dir: &str) -> u64 {
     elems * dt.type_size() as u64 / dt.block_size() as u64
 }
 
-/// VRAM one generation needs FREE beyond the weights, derived from the architecture and the
-/// REQUESTED geometry rather than a fixed byte count.
-pub fn runtime_headroom_bytes(width: usize, height: usize) -> u64 {
-    let cfg = DitConfig::klein_4b();
+/// VRAM one generation needs FREE beyond the weights, derived from the architecture the
+/// checkpoint under `hf_models_dir` holds and the REQUESTED geometry rather than a fixed byte
+/// count. Without a readable checkpoint only the decode is counted: the load refuses first.
+pub fn runtime_headroom_bytes(hf_models_dir: &str, width: usize, height: usize) -> u64 {
+    let vae = crate::inference::place::runtime_demand::vae_decode_bytes(height, width, 128);
+    let dit_path = std::path::Path::new(hf_models_dir).join(REL_DIT);
+    let cfg = match DitConfig::from_checkpoint(&dit_path) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!("FLUX.2 reserve: {e}; counting the decode alone");
+            return vae;
+        }
+    };
+    headroom_for(&cfg, width, height)
+}
+
+/// [`runtime_headroom_bytes`] for the DiT `cfg` describes.
+fn headroom_for(cfg: &DitConfig, width: usize, height: usize) -> u64 {
+    let vae = crate::inference::place::runtime_demand::vae_decode_bytes(height, width, 128);
     let dim = cfg.dim() as u64;
     let f32b = 4u64;
     let img = sampling::image_seq_len(height, width) as u64;
@@ -108,7 +123,6 @@ pub fn runtime_headroom_bytes(width: usize, height: usize) -> u64 {
 
     // The VAE decode is a SEQUENTIAL phase - the denoise scratch is freed first - so the reserve
     // is the max of the two, never their sum.
-    let vae = crate::inference::place::runtime_demand::vae_decode_bytes(height, width, 128);
     let peak = dit_peak.max(vae);
     // Allocator reality: the pool's high-water mark tracks what the denoise CHURNS, not the
     // instantaneous live set. Same measured factor the Qwen-Image engine derives.
@@ -162,7 +176,7 @@ pub fn load(
     let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
         .map_err(|e| anyhow!("FLUX.2 tokenizer: {e}"))?;
 
-    let reserve = runtime_headroom_bytes(geom.width, geom.height);
+    let reserve = runtime_headroom_bytes(hf_models_dir, geom.width, geom.height);
     let mut cuda_devices: HashMap<usize, Device> = HashMap::new();
     let dit_cuda: Vec<(usize, u64)> = crate::inference::place::vram_manager::probe(reserve)
         .into_iter()
@@ -172,8 +186,8 @@ pub fn load(
         })
         .collect();
 
-    // Hot DiT (5 double + 20 single blocks), run per sampling step.
-    let dit_cfg = DitConfig::klein_4b();
+    // Hot DiT, its double then single blocks, run per sampling step.
+    let dit_cfg = DitConfig::from_checkpoint(&dit_path).map_err(|e| anyhow!("FLUX.2 DiT: {e}"))?;
     let n_blocks = dit_cfg.num_layers + dit_cfg.num_single_layers;
     let dit_sz = hot_component_bytes(hf_models_dir);
     let dit_str = dit_path.to_string_lossy().to_string();
@@ -194,7 +208,9 @@ pub fn load(
         .filter(|(i, _, _)| cuda_devices.contains_key(i))
         .map(|(i, f, _)| (i, f))
         .collect();
-    let enc_cfg = EncConfig::qwen3_4b();
+    let enc_cfg =
+        EncConfig::from_checkpoint(&shards).map_err(|e| anyhow!("FLUX.2 encoder: {e}"))?;
+    cond::check_context(enc_cfg.hidden, dit_cfg.joint_attention_dim).map_err(|e| anyhow!("{e}"))?;
     // Plan on the RESIDENT footprint, not the file size. These shards are bf16 (2 B/weight) and
     // the loader re-quantizes the projections to Q8_0 (~1 B/weight), so the raw 8.05 GB is twice
     // what ends up on the card - and planning with it pushed 26 of 36 layers to the CPU that had
@@ -352,8 +368,25 @@ mod tests {
     /// over-reserves at 512 and under-reserves above the size it was written for.
     #[test]
     fn reserve_scales_with_the_request() {
-        let small = runtime_headroom_bytes(512, 512);
-        let large = runtime_headroom_bytes(1024, 1024);
+        let dims: &[(&str, &[usize])] = &[
+            ("x_embedder.weight", &[3072, 128]),
+            ("context_embedder.weight", &[3072, 7680]),
+            ("proj_out.weight", &[128, 3072]),
+            (
+                "time_guidance_embed.timestep_embedder.linear_1.weight",
+                &[3072, 256],
+            ),
+            ("transformer_blocks.0.attn.norm_q.weight", &[128]),
+            ("transformer_blocks.0.ff.linear_out.weight", &[3072, 9216]),
+        ];
+        let shapes = crate::inference::load::shapes::Shapes::from_dims(
+            dims.iter()
+                .map(|(n, d)| (n.to_string(), d.to_vec()))
+                .collect(),
+        );
+        let cfg = DitConfig::from_shapes(&shapes, None).unwrap();
+        let small = headroom_for(&cfg, 512, 512);
+        let large = headroom_for(&cfg, 1024, 1024);
         assert!(
             large > small,
             "reserve did not grow with geometry: {small} -> {large}"

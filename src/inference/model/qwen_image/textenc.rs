@@ -1,7 +1,7 @@
 //! Qwen2.5-VL text encoder - produces the `encoder_hidden_states [S, 3584]` that condition the
 //! Qwen-Image / Qwen-Image-Edit DiT. The VL model's TEXT backbone is a Qwen2.5 transformer
-//! (arch `qwen2vl`): 28 causal layers, hidden 3584, 28 q / 4 kv heads, head_dim 128, ffn 18944,
-//! SwiGLU, RMSNorm eps 1e-6, RoPE theta 1e6, **qkv-bias**, **no qk-norm** (unlike Qwen3).
+//! (arch `qwen2vl`): causal layers, SwiGLU, RMSNorm, M-RoPE, **qkv-bias**, **no qk-norm**
+//! (unlike Qwen3). Every width, count and constant is read from the GGUF's metadata.
 //!
 //! Weights stay QUANTIZED on-device via qmatmul (QVarBuilder::from_gguf + qmatmul_on) - a 7B Q4
 //! is ~4.7GB and fits a 16GB GPU; the ACE-Step detok_* helpers would dequantize (~14GB -> OOM).
@@ -39,6 +39,9 @@ pub struct Qwen2TextEncoder {
     n_kv: usize,
     head_dim: usize,
     rope_theta: f32,
+    rms_eps: f32,
+    /// M-RoPE split of the rotary pairs over the temporal, height and width positions.
+    mrope: [usize; 3],
     /// First layer's device (embed_tokens + the forward start here).
     device: Device,
     /// Last layer's device (final norm + the forward output land here).
@@ -105,11 +108,32 @@ impl Qwen2TextEncoder {
         let content = gguf_file::read_mapped_file(&f)?;
         // Parse once; QHostTensor blobs are device-independent -> qmatmul_on/dq_t place per layer.
         let vb = crate::inference::cache::qvb::from_gguf_cached(path, &Device::Cpu)?;
-        let (hidden, nh, nkv, hd) = (3584usize, 28usize, 4usize, 128usize);
-        let layer_dev = plan_layer_devices(plan, cuda_devices);
-        if layer_dev.len() != 28 {
+        let shapes = crate::inference::load::shapes::Shapes::read(&[path])?;
+        let hidden = shapes.meta_usize("embedding_length")?;
+        let n_layers = shapes.meta_usize("block_count")?;
+        let nh = shapes.meta_usize("attention.head_count")?;
+        let nkv = shapes.meta_usize("attention.head_count_kv")?;
+        let ffn = shapes.meta_usize("feed_forward_length")?;
+        if nh == 0 || nkv == 0 || hidden % nh != 0 {
             return Err(crate::tensor::Error(format!(
-                "qwen2 encoder: plan has {} layers, expected 28",
+                "qwen2 encoder: {hidden} wide over {nh} heads does not split"
+            )));
+        }
+        let hd = hidden / nh;
+        let sections = shapes.meta_usizes("rope.dimension_sections")?;
+        let mrope = match sections.as_slice() {
+            [t, h, w, ..] if t + h + w == hd / 2 => [*t, *h, *w],
+            _ => {
+                return Err(crate::tensor::Error(format!(
+                    "qwen2 encoder: rope sections {sections:?} do not cover {} pairs",
+                    hd / 2
+                )))
+            }
+        };
+        let layer_dev = plan_layer_devices(plan, cuda_devices);
+        if layer_dev.len() != n_layers {
+            return Err(crate::tensor::Error(format!(
+                "qwen2 encoder: plan has {} layers, expected {n_layers}",
                 layer_dev.len()
             )));
         }
@@ -131,8 +155,8 @@ impl Qwen2TextEncoder {
             };
             Ok(QLinear::new(Weight::Quant(qm), b, ind, outd))
         };
-        let mut layers = Vec::with_capacity(28);
-        for l in 0..28usize {
+        let mut layers = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
             let dev = &layer_dev[l];
             let p = format!("blk.{l}");
             layers.push(Qwen2Layer {
@@ -179,24 +203,16 @@ impl Qwen2TextEncoder {
                     &vb,
                     &format!("{p}.ffn_gate"),
                     hidden,
-                    18944,
+                    ffn,
                     false,
                     &mut f,
                     dev,
                 )?,
-                up: ql(
-                    &vb,
-                    &format!("{p}.ffn_up"),
-                    hidden,
-                    18944,
-                    false,
-                    &mut f,
-                    dev,
-                )?,
+                up: ql(&vb, &format!("{p}.ffn_up"), hidden, ffn, false, &mut f, dev)?,
                 down: ql(
                     &vb,
                     &format!("{p}.ffn_down"),
-                    18944,
+                    ffn,
                     hidden,
                     false,
                     &mut f,
@@ -214,25 +230,12 @@ impl Qwen2TextEncoder {
             n_head: nh,
             n_kv: nkv,
             head_dim: hd,
-            rope_theta: 1e6,
+            rope_theta: shapes.meta_f32("rope.freq_base")?,
+            rms_eps: shapes.meta_f32("attention.layer_norm_rms_epsilon")?,
+            mrope,
             device: input_device,
             output_device,
         })
-    }
-
-    /// Single-device compat wrapper: all 28 layers on `device`.
-    pub fn from_gguf(path: &str, device: &Device) -> crate::tensor::Result<Self> {
-        let mut map = std::collections::HashMap::new();
-        let plan = match device.location() {
-            crate::tensor::DeviceLocation::Cuda { gpu_id } => {
-                map.insert(gpu_id, device.clone());
-                crate::inference::place::layer_executor::HeteroPlan::forced_gpu(28, 28, gpu_id)
-            }
-            _ => {
-                crate::inference::place::layer_executor::HeteroPlan::calculate(28, 0, &[], &[], 1.0)
-            }
-        };
-        Self::from_gguf_hetero(path, &map, &plan)
     }
 
     /// Device the encoder consumes its input on (the first layer's device).
@@ -245,7 +248,7 @@ impl Qwen2TextEncoder {
     }
 
     fn rms_eps(&self) -> f32 {
-        1e-6
+        self.rms_eps
     }
 
     fn qkv_roped(
@@ -312,18 +315,18 @@ impl Qwen2TextEncoder {
     }
 
     /// Build M-RoPE cos/sin `[S, head_dim/2]` from 3D positions `[S][t,h,w]`. Freq `j` uses the
-    /// temporal/height/width position per the mrope_section split (`[16,24,24]` for the 7B, half=64).
+    /// temporal/height/width position per the checkpoint's mrope_section split.
     fn mrope_cos_sin(&self, positions: &[[i64; 3]]) -> crate::tensor::Result<(Tensor, Tensor)> {
-        const SEC: [usize; 3] = [16, 24, 24]; // mrope_section (sums to head_dim/2 = 64)
+        let sec = self.mrope;
         let (d, s) = (self.head_dim, positions.len());
         let half = d / 2;
         let inv: Vec<f32> = (0..half)
             .map(|j| 1.0 / self.rope_theta.powf(2.0 * j as f32 / d as f32))
             .collect();
         let axis = |j: usize| {
-            if j < SEC[0] {
+            if j < sec[0] {
                 0
-            } else if j < SEC[0] + SEC[1] {
+            } else if j < sec[0] + sec[1] {
                 1
             } else {
                 2

@@ -33,49 +33,59 @@ fn plan_layer_devices(plan: &HeteroPlan, cuda_devices: &HashMap<usize, Device>) 
     out
 }
 
-/// Config for the Qwen3-8B text tower.
+/// Config for a Qwen3 decoder tower, read from its checkpoint.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    pub hidden: usize,   // 4096
-    pub n_layers: usize, // 36
-    pub n_head: usize,   // 32
-    pub n_kv: usize,     // 8
-    pub head_dim: usize, // 128
-    pub ffn: usize,      // 12288
-    pub theta: f32,      // 1e6
-    pub eps: f32,        // 1e-6
+    pub hidden: usize,
+    pub n_layers: usize,
+    pub n_head: usize,
+    pub n_kv: usize,
+    pub head_dim: usize,
+    pub ffn: usize,
+    pub theta: f32,
+    pub eps: f32,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            hidden: 4096,
-            n_layers: 36,
-            n_head: 32,
-            n_kv: 8,
-            head_dim: 128,
-            ffn: 12288,
-            theta: 1_000_000.0,
-            eps: 1e-6,
-        }
-    }
-}
+/// Rope base of the Qwen3 family, for a checkpoint that ships no `config.json`.
+const QWEN3_ROPE_THETA: f32 = 1_000_000.0;
+/// RMSNorm epsilon of the Qwen3 family, for a checkpoint that ships no `config.json`.
+const QWEN3_RMS_EPS: f32 = 1e-6;
 
 impl Config {
-    /// Qwen3-4B - the text encoder FLUX.2 Klein conditions on. The SAME decoder as the 8B tower
-    /// above (36 layers, 32 Q / 8 KV, head_dim 128, QK-RMSNorm, rope 1e6), only narrower, so it
-    /// loads and runs through this module unchanged.
-    pub fn qwen3_4b() -> Self {
-        Config {
-            hidden: 2560,
-            n_layers: 36,
-            n_head: 32,
-            n_kv: 8,
-            head_dim: 128,
-            ffn: 9728,
-            theta: 1_000_000.0,
-            eps: 1e-6,
+    /// The tower `paths` hold: widths, head counts and depth from the tensor shapes, the rope
+    /// base and the norm epsilon from the `config.json` beside the weights, else the family's.
+    pub fn from_checkpoint<P: AsRef<std::path::Path>>(paths: &[P]) -> Result<Self> {
+        let shapes = crate::inference::load::shapes::Shapes::read(paths)?.canonical();
+        let json = paths
+            .first()
+            .and_then(|p| crate::inference::load::shapes::config_beside(p.as_ref()));
+        Self::from_shapes(&shapes, json.as_ref())
+    }
+
+    /// [`Self::from_checkpoint`] over shapes already read.
+    pub fn from_shapes(
+        shapes: &crate::inference::load::shapes::Shapes,
+        json: Option<&serde_json::Value>,
+    ) -> Result<Self> {
+        let head_dim = shapes.dim("layers.0.self_attn.q_norm.weight", 0)?;
+        if head_dim == 0 {
+            return Err(Error("qwen3: q_norm is empty".to_string()));
         }
+        let float = |key: &str, family: f32| {
+            json.and_then(|j| j.get(key))
+                .and_then(serde_json::Value::as_f64)
+                .map_or(family, |v| v as f32)
+        };
+        Ok(Config {
+            hidden: shapes.dim("embed_tokens.weight", 1)?,
+            n_layers: shapes.blocks("layers"),
+            n_head: shapes.dim("layers.0.self_attn.q_proj.weight", 0)? / head_dim,
+            n_kv: shapes.dim("layers.0.self_attn.k_proj.weight", 0)? / head_dim,
+            head_dim,
+            ffn: shapes.dim("layers.0.mlp.gate_proj.weight", 0)?,
+            theta: float("rope_theta", QWEN3_ROPE_THETA),
+            eps: float("rms_norm_eps", QWEN3_RMS_EPS),
+        })
     }
 }
 
@@ -155,7 +165,8 @@ impl Qwen3VlTextEncoder {
         plan: &HeteroPlan,
         cancel: Option<&crate::inference::serve::cancel::CancelToken>,
     ) -> Result<Self> {
-        Self::load_cfg(&[path], Config::default(), cuda_devices, plan, cancel)
+        let cfg = Config::from_checkpoint(&[path])?;
+        Self::load_cfg(&[path], cfg, cuda_devices, plan, cancel)
     }
 
     /// [`Self::load_cancellable`] over an explicit config and a SHARDED checkpoint.
@@ -451,7 +462,10 @@ mod tests {
                 })
                 .collect();
         let sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let plan = HeteroPlan::calculate(Config::default().n_layers, sz, &cuda_list, &[], 1.0);
+        let layers = Config::from_checkpoint(&[&path])
+            .expect("encoder shape")
+            .n_layers;
+        let plan = HeteroPlan::calculate(layers, sz, &cuda_list, &[], 1.0);
         println!("qwen3vl encoder smoke test, plan: {:?}", plan.segments);
         let enc =
             Qwen3VlTextEncoder::load(&path, &cuda_devices, &plan).expect("load qwen3vl encoder");
