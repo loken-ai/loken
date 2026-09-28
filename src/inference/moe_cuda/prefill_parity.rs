@@ -379,3 +379,101 @@ fn the_expert_offsets_are_where_the_host_says_they_are() {
         );
     }
 }
+
+/// The card's routed down projection against the host's, on the same weights and routing.
+///
+/// A model whose experts do not all fit the cards runs some layers' experts on each, so the
+/// two reductions have to agree for every format a file mixes. Both quantise the activation
+/// to 8 bits, so they agree to a few thousandths of the largest output.
+#[test]
+fn the_card_and_host_down_reductions_agree() {
+    let Some(card) = crate::tensor::cuda::CudaDevice::new(0).ok().map(Device::Cuda) else {
+        eprintln!("no CUDA device; the card down reduction is NOT covered by this run");
+        return;
+    };
+    let host = Device::Cpu;
+    let (hidden, k, e_count, topk) = (512usize, 512usize, 16usize, 10usize);
+    let mut keep: Vec<Arc<QTensor>> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for dtype in [GgmlDType::Q4K, GgmlDType::Q6K] {
+        for n_tokens in [1usize, 5, 40] {
+            let (sti, eid, tw) = build_routing(n_tokens, topk, e_count);
+            let m = sti.len();
+            let wdata: Vec<f32> = (0..e_count * hidden * k)
+                .map(|i| (((i * 7 + 3) % 53) as f32) * 0.021 - 0.55)
+                .collect();
+            let wt = Tensor::from_vec(wdata, (e_count, hidden, k), &host).unwrap();
+            let on_host = Arc::new(QTensor::quantize(&wt, dtype).unwrap());
+            let on_card = Arc::new(QTensor::quantize_onto(&wt, dtype, &card).unwrap());
+            keep.push(on_host.clone());
+            keep.push(on_card.clone());
+            let idata: Vec<f32> = (0..m * k)
+                .map(|i| (((i * 11 + 5) % 41) as f32) * 0.033 - 0.6)
+                .collect();
+            let input = Tensor::from_vec(idata, (m, k), &host).unwrap();
+            let u32s = |v: &Vec<u32>, d: &Device| Tensor::from_vec(v.clone(), m, d).unwrap();
+            let tws = |d: &Device| Tensor::from_vec(tw.clone(), (n_tokens, topk), d).unwrap();
+
+            let from_host = crate::inference::moe_cpu::moe_gemm_gguf_down_reduce(
+                &input,
+                &on_host,
+                &u32s(&sti, &host),
+                &u32s(&eid, &host),
+                &tws(&host),
+                topk,
+                n_tokens,
+                None,
+                None,
+            )
+            .unwrap();
+            // The card reads each pair's row at the pair's index, the host at its sorted slot.
+            let by_pair: Vec<f32> = {
+                let x = input.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let mut v = vec![0f32; m * k];
+                for (j, &pair) in sti.iter().enumerate() {
+                    v[pair as usize * k..(pair as usize + 1) * k]
+                        .copy_from_slice(&x[j * k..(j + 1) * k]);
+                }
+                v
+            };
+            let from_card = super::gemm::moe_gemm_gguf_down_reduce(
+                &Tensor::from_vec(by_pair, (m, k), &card).unwrap(),
+                &on_card,
+                &u32s(&sti, &card),
+                &u32s(&eid, &card),
+                &tws(&card),
+                topk,
+                n_tokens,
+                None,
+                None,
+            )
+            .unwrap()
+            .to_device(&host)
+            .unwrap();
+            // The float answer over the dequantised weights: each sorted pair's row times its
+            // expert, scaled by its weight and added to its token.
+            let w = on_host.dequantize(&host).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let x = input.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let mut want = vec![0f32; n_tokens * hidden];
+            for j in 0..m {
+                let (pair, e) = (sti[j] as usize, eid[j] as usize);
+                for r in 0..hidden {
+                    let row = &w[(e * hidden + r) * k..(e * hidden + r + 1) * k];
+                    let dot: f32 = row.iter().zip(&x[j * k..(j + 1) * k]).map(|(a, b)| a * b).sum();
+                    want[(pair / topk) * hidden + r] += tw[pair] * dot;
+                }
+            }
+            let want = Tensor::from_vec(want, (n_tokens, hidden), &host).unwrap();
+            for (side, got) in [("host", &from_host), ("card", &from_card)] {
+                let (gap, place) = worst_gap_at(&want, got, hidden);
+                if gap >= 0.02 {
+                    failures.push(format!(
+                        "{dtype:?} tokens={n_tokens}: the {side} down reduction is {gap} of the \
+                         largest output away from the float answer{place}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
