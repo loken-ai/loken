@@ -58,12 +58,13 @@ fn declares_a_dimension(line: &str) -> bool {
     integer_type && literal && names_a_dimension(name.trim())
 }
 
-/// Words that make a name a bound a request is checked against: `IMAGE_MAX_DIM` caps
-/// what a caller may ask for and says nothing about the model serving it.
-const BOUND_WORDS: [&str; 2] = ["MAX", "MIN"];
+/// Words that make a name something other than a model's shape: a bound a request is
+/// checked against (`IMAGE_MAX_DIM` caps what a caller may ask for), or the reference a
+/// tuning was measured at (`REF_HEADS` is the head count a kernel tile was sized for).
+const BOUND_WORDS: [&str; 3] = ["MAX", "MIN", "REF"];
 
 /// Whether a constant's name states a dimension: one of its `_`-separated words begins
-/// with a dimension word (`HEADS`, `EMBEDDING`), and none of them makes it a bound.
+/// with a dimension word (`HEADS`, `EMBEDDING`), and none of them is a bound word.
 fn names_a_dimension(name: &str) -> bool {
     let words: Vec<&str> = name.split('_').collect();
     let dimension = words
@@ -154,14 +155,12 @@ const GEOMETRY_DEBT: &[(&str, usize)] = &[
     ("inference/model/pocket_tts/mod.rs", 1),
     ("inference/model/qwen3vl/textenc.rs", 8),
     ("inference/model/qwen_image/dit.rs", 2),
-    ("inference/model/sdpa.rs", 1),
     ("inference/model/sdxl/pipeline.rs", 2),
     ("inference/model/sdxl/text.rs", 10),
     ("inference/model/sdxl/unet.rs", 4),
     ("inference/model/ultravox/mod.rs", 1),
     ("inference/model/voxtral/mod.rs", 3),
     ("inference/model/wan/dit/config.rs", 1),
-    ("inference/model/wan/dit/layers.rs", 1),
     ("inference/model/zimage/dit/mod.rs", 2),
     ("inference/serve/spec_kv_cache.rs", 1),
 ];
@@ -187,6 +186,7 @@ fn a_constant_names_a_dimension_only_when_it_is_one() {
     assert!(!declares_a_dimension(
         "const EMBED_MAX_CHARS: usize = 8192;"
     ));
+    assert!(!declares_a_dimension("const REF_HEADS: usize = 12;"));
     assert!(fills_a_dimension_field("        hidden_size: 4096,"));
     assert!(!fills_a_dimension_field("        hidden_size: cfg.hidden,"));
     assert!(!fills_a_dimension_field("        chunk: 64,"));

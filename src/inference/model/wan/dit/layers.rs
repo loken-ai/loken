@@ -1293,9 +1293,10 @@ impl WanDit {
     /// which the positional encoding and the learnt temporal structure are in distribution.
     pub const NATIVE_LATENT_FRAMES: usize = 21;
 
-    /// The narrow model this was measured on, and the share it needed.
-    const NARROW_DIM: usize = 1536;
-    const NARROW_OVERLAP: usize = 13;
+    /// The reference the overlap was measured at: the width of the narrow model, and the
+    /// share it needed.
+    const REF_DIM: usize = 1536;
+    const REF_OVERLAP: usize = 13;
 
     /// How much consecutive windows share, in latent frames, for a model `dim` wide.
     ///
@@ -1314,8 +1315,7 @@ impl WanDit {
     /// is scaled by width against the narrow model that needed it, with a floor at the value
     /// the wide one was measured good at.
     pub(super) fn window_overlap(dim: usize) -> usize {
-        (Self::NARROW_OVERLAP * Self::NARROW_DIM / dim.max(1))
-            .clamp(5, Self::NATIVE_LATENT_FRAMES - 1)
+        (Self::REF_OVERLAP * Self::REF_DIM / dim.max(1)).clamp(5, Self::NATIVE_LATENT_FRAMES - 1)
     }
 
     /// Where each window of a `frames`-long clip begins.
