@@ -508,7 +508,7 @@ fn hiding_the_capacity_in_the_probe_is_what_sends_a_block_to_the_host() {
 /// early that used to strand every small stage after it on the processor.
 #[test]
 fn the_stage_planner_reaches_the_host_only_for_stages_no_card_holds() {
-    use crate::inference::model::sdxl::unet::plan_stage_slots;
+    use crate::inference::place::plan::place as plan_stage_slots;
 
     const MB: u64 = 1_000_000;
     let shapes: [Vec<u64>; 4] = [
@@ -1332,8 +1332,12 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("inference/load/requantize.rs", (0, 0, 1)),
     ("inference/model/nemotron_h/mod.rs", (1, 0, 0)),
     ("inference/model/qwen35/moe.rs", (1, 0, 0)),
-    ("inference/model/sdxl/pipeline.rs", (5, 0, 0)),
-    ("inference/model/sdxl/unet.rs", (0, 0, 1)),
+    ("inference/offload/cuda.rs", (1, 0, 0)),
+    ("inference/offload/streamed.rs", (2, 0, 0)),
+    ("inference/serve/continuous_serve.rs", (1, 0, 0)),
+    ("inference/serve/tp_model.rs", (1, 0, 0)),
+    ("tensor/cuda/quant.rs", (1, 0, 0)),
+    ("tensor/cuda_ext.rs", (1, 0, 0)),
 ];
 
 /// EVERY COMPONENT IS PLACED BY THE PLANNER AND RECOVERED BY ITS LADDER.

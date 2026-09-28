@@ -547,7 +547,7 @@ pub struct SdxlUnet {
 /// Stages are wildly uneven - a 1280-wide attention stage is two orders of magnitude
 /// heavier than a 320-wide residual one - so packing them needs their real sizes.
 /// Derived from the same tables the loader builds from, so the two cannot drift.
-fn stage_weight_bytes(dtype: crate::tensor::DType) -> Vec<u64> {
+pub(crate) fn stage_weight_bytes(dtype: crate::tensor::DType) -> Vec<u64> {
     let elem = if dtype == crate::tensor::DType::F32 {
         4u64
     } else {
@@ -578,7 +578,8 @@ fn stage_weight_bytes(dtype: crate::tensor::DType) -> Vec<u64> {
         width = *out_c;
     }
     let mid = 4 * BASE;
-    out.push((2 * res(mid, mid) + attn(mid, 10)) * elem);
+    let middle = 2 * res(mid, mid) + attn(mid, 10);
+    out.push(middle * elem);
     for (skip_c, in_c, depth, up) in SKIP_SPEC.iter() {
         let mut b = res(skip_c + in_c, *in_c) + attn(*in_c, *depth);
         if *up {
@@ -587,47 +588,6 @@ fn stage_weight_bytes(dtype: crate::tensor::DType) -> Vec<u64> {
         out.push(b * elem);
     }
     out
-}
-
-/// Greedily pack the stages onto `devices`, in order, falling to the host only for the
-/// stages that fit nowhere.
-///
-/// In forward order on purpose: consecutive stages that share a card cost no transfer, so
-/// staying on the card the previous stage used yields the fewest crossings for a given
-/// split. With no budgets everything lands on the first device, which reproduces the
-/// single-device placement exactly.
-///
-/// THE HOST IS FOR STAGES NO CARD HOLDS, and only those. This walked a cursor that never
-/// went back: the first stage too large for the card it was on advanced the cursor, and
-/// once the cursor ran off the end it stayed there - so a single oversized stage sent
-/// every stage AFTER it to the processor, including the small ones, with gigabytes still
-/// free on the cards the cursor had already passed. The deepest levels of this UNet are
-/// twenty times the shallowest, so "one stage does not fit here" is the normal case, not
-/// the exception. A stage is now offered the previous card first and then every card,
-/// fastest first, before the host is considered at all.
-fn plan_stages(weights: &[u64], devices: &[Device], budgets: &[u64]) -> Vec<Device> {
-    let fallback = devices.first().cloned().unwrap_or(Device::Cpu);
-    if budgets.is_empty() || devices.is_empty() {
-        return vec![fallback; weights.len()];
-    }
-    plan_stage_slots(weights, budgets)
-        .into_iter()
-        .map(|slot| match slot {
-            Some(d) => devices.get(d).cloned().unwrap_or(Device::Cpu),
-            None => Device::Cpu,
-        })
-        .collect()
-}
-
-/// The packing decision alone: which card each stage lands on, by index into the
-/// fastest-first budget list, or `None` for the host.
-///
-/// THE BODY MOVED, and only the body: this is now the one placement rule the repository
-/// has, so a UNet stage and a transformer block are packed by the same code against the
-/// same invariant. It was the general form already - a weight per element, a budget per
-/// card - which is why it is the one that survived; what it lacked was callers.
-pub(crate) fn plan_stage_slots(weights: &[u64], budgets: &[u64]) -> Vec<Option<usize>> {
-    crate::inference::place::plan::place(weights, budgets)
 }
 
 /// Residual blocks per resolution level, the constant that sets how the checkpoint's
@@ -840,25 +800,31 @@ impl SdxlUnet {
     }
 
     pub fn load(checkpoint: &str, device: &Device, dtype: crate::tensor::DType) -> Result<Self> {
-        Self::load_planned(checkpoint, std::slice::from_ref(device), &[], dtype)
+        let stages = vec![device.clone(); stage_weight_bytes(dtype).len()];
+        Self::load_planned(checkpoint, &stages, dtype)
     }
 
-    /// Load with the stages SPREAD over `devices`, fastest first.
-    ///
-    /// `budgets` is the usable bytes on each of those devices, in the same order; an
-    /// empty slice means "put everything on the first one", which is what the
-    /// single-device door above asks for and is bit-identical to the old behaviour.
-    /// Any stage that does not fit the cards falls to the host - a stage at a time,
-    /// not the whole network.
+    /// Load with each STAGE on its device, in forward order: the input blocks, the middle,
+    /// then the output blocks, as [`stage_weight_bytes`] lists them. The stem and the tail
+    /// sit on the first card a stage runs on, else the host.
     pub fn load_planned(
         checkpoint: &str,
-        devices: &[Device],
-        budgets: &[u64],
+        stage_devices: &[Device],
         dtype: crate::tensor::DType,
     ) -> Result<Self> {
-        let primary = devices.first().cloned().unwrap_or(Device::Cpu);
-        let weights = stage_weight_bytes(dtype);
-        let stage_devices = plan_stages(&weights, devices, budgets);
+        let stages = stage_weight_bytes(dtype).len();
+        if stage_devices.len() != stages {
+            return Err(crate::tensor::Error(format!(
+                "SDXL UNet: {} stage devices for {stages} stages",
+                stage_devices.len()
+            )));
+        }
+        let stage_devices = stage_devices.to_vec();
+        let primary = stage_devices
+            .iter()
+            .find(|d| !d.is_cpu())
+            .cloned()
+            .unwrap_or(Device::Cpu);
         {
             let mut counts: std::collections::BTreeMap<String, usize> =
                 std::collections::BTreeMap::new();
@@ -1104,6 +1070,19 @@ impl SdxlUnet {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// The cards the stages and the stem run on.
+    pub fn cards(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for d in std::iter::once(&self.device).chain(&self.stage_devices) {
+            if let Some(idx) = crate::inference::place::plan::ordinal(d) {
+                if !out.contains(&idx) {
+                    out.push(idx);
+                }
+            }
+        }
+        out
     }
 }
 

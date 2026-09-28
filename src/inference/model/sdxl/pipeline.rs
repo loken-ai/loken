@@ -48,6 +48,9 @@ pub struct SdxlPipeline {
     attached: Vec<(String, f32)>,
     /// Projections matched by `attached`, so a reused set still reports what it did.
     attached_matched: usize,
+    /// Bytes the denoise keeps free on every card a stage runs on, at the geometry the
+    /// pipeline was loaded for.
+    unet_scratch: u64,
 }
 
 /// Architecture of this family, used to DERIVE what a render needs rather than to
@@ -133,35 +136,12 @@ impl SdxlPipeline {
         // afterwards, on whatever capacity is left, so they never compete with the
         // denoiser for the fast card. Loading all three on one device is what OOMed
         // the first end-to-end run.
-        let elem = if dtype == DType::F32 { 4u64 } else { 2 };
-        let adapter_bytes = 0u64;
-        // 2.6 B parameters, plus room for the activations of one forward AT THIS
-        // REQUEST'S SIZE. The activation term was a flat 3 GiB, which is a different
-        // amount of wrong at every resolution; it now comes from the UNet's own level
-        // widths and attention stages, where the attention dominates by an order of
-        // magnitude at anything above 512.
-        let _unet_bytes = component_bytes(
-            checkpoint,
-            crate::inference::model::sdxl::unet::CHECKPOINT_PREFIX,
-            elem,
-        ) + crate::inference::place::runtime_demand::unet_with_attention_bytes(
-            geom.height / VAE_STRIDE,
-            geom.width / VAE_STRIDE,
-            &crate::inference::model::sdxl::unet::level_channels(),
-            &crate::inference::model::sdxl::unet::attention_levels(),
-            crate::inference::model::sdxl::unet::HEAD_DIM,
-            UNET_MLP_RATIO,
-        ) + adapter_bytes;
         // EVERY card, fastest first - not the one card that happens to hold it whole.
         // Asking for a single device meant a UNet that fits nowhere went to the host
         // ENTIRELY, which is the worst of the three outcomes and the one the fleet
-        // contract exists to prevent. It is spread across the cards instead, and only
+        // contract exists to prevent. The stages are spread across the cards instead,
+        // each card keeping the scratch this request's denoise needs there, and only
         // the stages that fit nowhere land on the host.
-        let probed = crate::inference::place::vram_manager::probe(0);
-        let unet_devices: Vec<Device> = probed.iter().map(|(_, _, d)| d.clone()).collect();
-        // What each card may hold in WEIGHTS: what is free on it, less the scratch this
-        // request's denoise will need there. Every card running stages pays that
-        // scratch, so it is deducted per card and not once.
         let per_card_scratch = crate::inference::place::runtime_demand::unet_with_attention_bytes(
             geom.height / VAE_STRIDE,
             geom.width / VAE_STRIDE,
@@ -170,16 +150,24 @@ impl SdxlPipeline {
             crate::inference::model::sdxl::unet::HEAD_DIM,
             UNET_MLP_RATIO,
         );
-        let budgets: Vec<u64> = probed
-            .iter()
-            .map(|(_, free, _)| free.saturating_sub(per_card_scratch))
-            .collect();
-        let unet_dev = unet_devices.first().cloned().unwrap_or(Device::Cpu);
-        let unet = if unet_devices.is_empty() {
-            SdxlUnet::load(checkpoint, &Device::Cpu, dtype)?
-        } else {
-            SdxlUnet::load_planned(checkpoint, &unet_devices, &budgets, dtype)?
+        let unet = crate::inference::place::ladder::load_stages(
+            "SDXL UNet",
+            &crate::inference::model::sdxl::unet::stage_weight_bytes(dtype),
+            per_card_scratch,
+            |stages| SdxlUnet::load_planned(checkpoint, stages, dtype),
+        )?;
+        let unet_dev = unet.device().clone();
+        // The one-shot towers and the decoder take the cards the UNet leaves alone first,
+        // sharing one of its cards only when nothing else holds them, else the host.
+        let hot = unet.cards();
+        let aside = || {
+            crate::inference::place::ladder::aside(
+                &crate::inference::place::ladder::cards(0),
+                &hot,
+                0,
+            )
         };
+        let to_tensor = |e: anyhow::Error| crate::tensor::Error(format!("{e:#}"));
 
         // The text towers stay F32 even when the denoiser is halved. They were never
         // the memory problem - the UNet was - and their embedding lookup has no
@@ -196,14 +184,15 @@ impl SdxlPipeline {
                 CLIP_CONTEXT_DIM / crate::inference::model::sdxl::unet::HEAD_DIM,
                 UNET_MLP_RATIO,
             );
-        let text_dev = crate::inference::place::vram_manager::pick_device_elsewhere(
-            "sdxl text",
+        let (text, _) = crate::inference::place::ladder::load_whole_on(
+            "SDXL text",
             text_bytes,
-            &unet_dev,
+            text_bytes,
+            &aside(),
+            None,
+            |d| Ok(SdxlTextEncoders::load(checkpoint, d, text_dtype)?),
         )
-        .map(|(_, _, d)| d)
-        .unwrap_or(Device::Cpu);
-        let text = SdxlTextEncoders::load(checkpoint, &text_dev, text_dtype)?;
+        .map_err(to_tensor)?;
 
         // The VAE stays F32 - its decode is short and its convolutions are the part
         // most visible in the output - and it is placed against its DECODE peak, not
@@ -217,12 +206,21 @@ impl SdxlPipeline {
             geom.width,
             VAE_DECODER_WIDTH,
         );
-        let vae_dev = crate::inference::place::vram_manager::pick_device_elsewhere(
-            "sdxl vae", vae_bytes, &unet_dev,
+        let (vae, _) = crate::inference::place::ladder::load_whole_on(
+            "SDXL VAE",
+            vae_bytes,
+            vae_bytes,
+            &aside(),
+            None,
+            |d| {
+                Ok(crate::inference::model::sdxl::vae::load(
+                    checkpoint,
+                    d,
+                    DType::F32,
+                )?)
+            },
         )
-        .map(|(_, _, d)| d)
-        .unwrap_or(Device::Cpu);
-        let vae = crate::inference::model::sdxl::vae::load(checkpoint, &vae_dev, DType::F32)?;
+        .map_err(to_tensor)?;
 
         Ok(Self {
             unet,
@@ -240,6 +238,7 @@ impl SdxlPipeline {
             vae_tile: None,
             attached: Vec::new(),
             attached_matched: 0,
+            unet_scratch: per_card_scratch,
         })
     }
 
@@ -366,36 +365,47 @@ impl SdxlPipeline {
             // ANYWHERE BUT THE DENOISER'S CARD, first. Both run on every step, so they
             // compete for the same card's activations - and asking the ranked picker
             // simply put this one on top of the UNet and the upload ran out of memory.
-            // Reading free VRAM there is not enough: the resident pipeline's own
-            // scratch is not in that number.
+            // The denoiser's cards are offered last, less the scratch its denoise keeps
+            // free there.
             //
             // Sharing is allowed only when nothing else will have it AND the card can
             // hold both. Otherwise this returns nothing and the caller is told, which
             // is a better answer than an out-of-memory from a driver.
-            let dev = crate::inference::place::vram_manager::pick_device_elsewhere(
-                "sdxl controlnet",
+            let cards = crate::inference::place::ladder::whole_order(
+                &crate::inference::place::ladder::aside(
+                    &crate::inference::place::ladder::cards(0),
+                    &self.unet.cards(),
+                    self.unet_scratch,
+                ),
                 want,
-                &self.device,
-            )
-            .or_else(|| {
-                crate::inference::place::vram_manager::pick_device_for("sdxl controlnet", want)
-            })
-            .filter(|(_, free, _)| *free >= want)
-            .map(|(_, _, d)| d)
-            .ok_or_else(|| {
-                crate::tensor::Error(
+                want,
+            );
+            if cards.is_empty() {
+                return Err(crate::tensor::Error(
                     "structural conditioning needs a card with room for it and none has \
                      enough free; render without it, or at a smaller size"
                         .to_string(),
-                )
-            })?;
+                ));
+            }
+            let dtype = self.unet.dtype();
+            let (net, dev) = crate::inference::place::ladder::load_whole_on(
+                "SDXL controlnet",
+                want,
+                want,
+                &cards,
+                None,
+                |d| {
+                    Ok(crate::inference::model::sdxl::controlnet::load(
+                        path.to_str().unwrap_or_default(),
+                        d,
+                        dtype,
+                    )?)
+                },
+            )
+            .map_err(|e| crate::tensor::Error(format!("{e:#}")))?;
             tracing::info!("sdxl controlnet -> {:?}", dev.location());
-            self.control_device = dev.clone();
-            self.controlnet = Some(crate::inference::model::sdxl::controlnet::load(
-                path.to_str().unwrap_or_default(),
-                &dev,
-                self.unet.dtype(),
-            )?);
+            self.control_device = dev;
+            self.controlnet = Some(net);
         }
         // The encoder wants the image at FULL resolution in 0..1; it brings it to the
         // latent grid itself, and doing that here would fight its own strides.

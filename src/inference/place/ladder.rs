@@ -615,6 +615,81 @@ pub fn run_whole_on<T, E: std::fmt::Display>(
     last
 }
 
+/// Build a component of uneven stages, `weights` bytes each in forward order, packed onto the
+/// cards as they are now with `reserve` kept free on each for the work a request does there.
+/// `build` receives the device of every stage. A build that runs out of card memory is packed
+/// again at each shrinking share of the cards the host-assisted rung offers, the host taking
+/// what no card holds, and last on the host alone. Any other failure goes straight to the
+/// host, and if that fails too the first error is returned. A cancelled load stops.
+pub fn load_stages<T, E: std::fmt::Display>(
+    what: &str,
+    weights: &[u64],
+    reserve: u64,
+    mut build: impl FnMut(&[Device]) -> Result<T, E>,
+) -> Result<T, E> {
+    let cards = cards(reserve);
+    let devices: Vec<Device> = cards
+        .iter()
+        .map(|(idx, _)| device_of(DeviceKind::Cuda(*idx)))
+        .collect();
+    let pack = |pct: u64| -> Vec<Device> {
+        let budgets: Vec<u64> = cards
+            .iter()
+            .map(|(_, free)| free.saturating_mul(pct) / 100)
+            .collect();
+        super::plan::place(weights, &budgets)
+            .into_iter()
+            .map(|slot| {
+                slot.and_then(|d| devices.get(d).cloned())
+                    .unwrap_or(Device::Cpu)
+            })
+            .collect()
+    };
+    let host = vec![Device::Cpu; weights.len()];
+    let mut rungs: Vec<(String, Vec<Device>)> = HOST_ASSISTED_SHARES_PCT
+        .iter()
+        .map(|pct| (format!("the cards at {pct}% with the host"), pack(*pct)))
+        .collect();
+    rungs.push(("the host".to_string(), host));
+    let locations = |d: &[Device]| d.iter().map(Device::location).collect::<Vec<_>>();
+    let first_plan = pack(100);
+    let first = match build(&first_plan) {
+        Ok(m) => return Ok(m),
+        Err(e) => e,
+    };
+    if scoped_cancelled() {
+        return Err(first);
+    }
+    if !is_out_of_memory(&first) {
+        tracing::warn!("{what}: placement failed ({first}); trying the host");
+        rungs.retain(|(name, _)| name == "the host");
+    }
+    let mut tried = vec![locations(&first_plan)];
+    let mut last_oom = is_out_of_memory(&first);
+    for (name, plan) in rungs {
+        if (!last_oom && name != "the host") || tried.contains(&locations(&plan)) {
+            continue;
+        }
+        tried.push(locations(&plan));
+        release_pools();
+        tracing::warn!("{what}: retrying on {name}");
+        match build(&plan) {
+            Ok(m) => {
+                tracing::info!("{what}: placed on {name}");
+                return Ok(m);
+            }
+            Err(e) => {
+                if scoped_cancelled() {
+                    return Err(e);
+                }
+                tracing::warn!("{what}: {name} failed ({e})");
+                last_oom = is_out_of_memory(&e);
+            }
+        }
+    }
+    Err(first)
+}
+
 /// Whether the load running on this thread was cancelled.
 fn scoped_cancelled() -> bool {
     crate::inference::serve::cancel::scoped::bail().is_err()
