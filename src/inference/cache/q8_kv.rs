@@ -816,6 +816,28 @@ impl Q8KvCache {
         Ok((k, v))
     }
 
+    /// The current K and V history dequantized to F16, as `[1, n_kv_heads, seq, head_dim]`
+    /// views over the stored `[seq, n_kv_heads, head_dim]` order (strided, not copied).
+    pub fn dequantize_kv_f16_views(&self) -> Result<(Tensor, Tensor)> {
+        use crate::inference::quantized_cuda::dequantize_q8_0_blob_f16;
+
+        let seq = self.core.len();
+        if seq == 0 {
+            return Err(anyhow!(
+                "Q8KvCache::dequantize_kv_f16_views: cache is empty"
+            ));
+        }
+        let elem_count = seq * self.n_kv_heads * self.head_dim;
+        let k_f16 = dequantize_q8_0_blob_f16(&self.k_q8, elem_count, &self.cuda_device)
+            .map_err(|e| anyhow!("Q8KvCache: K dequantize: {e}"))?;
+        let v_f16 = dequantize_q8_0_blob_f16(&self.v_q8, elem_count, &self.cuda_device)
+            .map_err(|e| anyhow!("Q8KvCache: V dequantize: {e}"))?;
+        let shape = (1, seq, self.n_kv_heads, self.head_dim);
+        let k = tensor_from_cuda_storage(k_f16, shape)?.permute((0, 2, 1, 3))?;
+        let v = tensor_from_cuda_storage(v_f16, shape)?.permute((0, 2, 1, 3))?;
+        Ok((k, v))
+    }
+
     /// Compute `attn_out = probs @ V` for the current V cache.
     ///
     /// `probs` shape: `[1, n_q_heads, 1, current_seq_len]` (softmax output).

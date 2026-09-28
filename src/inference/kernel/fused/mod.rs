@@ -122,8 +122,12 @@ mod attention;
 pub use attention::*;
 mod buffers;
 pub use buffers::*;
+mod prefill_gqa;
+pub use prefill_gqa::*;
 
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_numerics_tests;
+#[cfg(all(test, feature = "cuda"))]
+mod flash_prefill_gqa_parity;
 #[cfg(all(test, feature = "cuda"))]
 mod flash_prefill_parity;

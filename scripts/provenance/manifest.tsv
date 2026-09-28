@@ -2,6 +2,7 @@ cuda/flash_decode_f16.cu	0.0%	0	attention.rs/src/kernels/src/flash/flash_decode_
 cuda/flash_decode_tiled_probe.cu	0.0%	0	vllm/csrc/libtorch_stable/kimi_k3/fused_kda_decode_kernel.cu
 cuda/flash_dit_bf16.cu	0.0%	0	llama.cpp/ggml/src/ggml-cuda/fattn-vec.cuh
 cuda/flash_prefill_f16.cu	0.0%	0	llama.cpp/ggml/src/ggml-cuda/fattn-vec.cuh
+cuda/flash_prefill_gqa.cu	0.0%	0	vllm/csrc/libtorch_stable/kimi_k3/fused_kda_decode_kernel.cu
 cuda/flashdecode_tc/flashdecode_tc.cu	0.0%	0	llama.cpp/ggml/src/ggml-cuda/fattn-vec.cuh
 cuda/fused_norm_f16.cu	0.0%	0	vllm/csrc/libtorch_stable/moe/moe_align_sum_kernels.cu
 cuda/gptoss_flash_decode.cu	0.0%	0	attention.rs/src/kernels/src/flash/flash_decode_paged.cuh
@@ -200,8 +201,10 @@ src/inference/kernel/fused/buffers/conv.rs	0.0%	0	candle/candle-core/src/cuda_ba
 src/inference/kernel/fused/buffers/embed.rs	0.0%	0	candle/candle-nn/src/moe.rs
 src/inference/kernel/fused/buffers/norm.rs	0.0%	0	candle/candle-flash-attn-v3/src/lib.rs
 src/inference/kernel/fused/cuda_numerics_tests.rs	0.0%	0	candle/candle-flash-attn-v3/build.rs
+src/inference/kernel/fused/flash_prefill_gqa_parity.rs	0.0%	0	candle/candle-metal-kernels/src/kernel.rs
 src/inference/kernel/fused/flash_prefill_parity.rs	0.0%	0	candle/candle-metal-kernels/src/kernel.rs
 src/inference/kernel/fused/mod.rs	0.0%	0	candle/candle-metal-kernels/src/tests.rs
+src/inference/kernel/fused/prefill_gqa.rs	0.0%	0	candle/candle-transformers/src/models/debertav2.rs
 src/inference/kernel/fused_cpu.rs	0.0%	0	candle/candle-transformers/src/models/debertav2.rs
 src/inference/kernel/opencl.rs	0.0%	0	vllm.rs/src/models/layers/ds_v4/compressor.rs
 src/inference/kernel/opencl_probe.rs	0.0%	0	candle/candle-transformers/src/models/metavoice.rs

@@ -486,14 +486,9 @@ impl GenericTransformerLayer {
         // f_attention_scale=1.0). Saves one launch per attention call.
         let scale_is_one = (scale - 1.0).abs() < 1e-6;
 
-        // `fused_kernels::flash_prefill_f16` is the lever this path needs and is
-        // deliberately NOT wired. On a 6000-token prompt the attention is 79% of the
-        // prefill and this path runs 2.7x slower than the reference, so the kernel is
-        // where the time is. But it answers differently: same prompt, temperature 0, from
-        // a freed machine, three restarts each - this chain gives one continuation and the
-        // kernel another, both perfectly reproducible. It is close to this attention and
-        // not equal to it, and a faster attention that returns something else is a
-        // different feature. Wiring it needs a parity harness against this chain first.
+        // GPU prefill over a Q8 KV history does not reach this function: it runs as
+        // `kernel::fused::flash_prefill_gqa` in `attend`. What arrives here with
+        // seq_q > 1 is the F-dtype cache, shared-KV layers and the CPU.
         if q.dims()[2] == 1 && n_rep >= 1 && mask.is_none() {
             // Single-token decode fast path: same matmul shape as the
             // general path below but skips the redundant v.contiguous()
@@ -599,9 +594,7 @@ impl GenericTransformerLayer {
             // per-tile outputs - bit-identical to the single-shot softmax (each query row's
             // softmax is independent of the others). This keeps the FAST cuBLAS batched
             // GEMMs (q.kᵀ and p.v) for EVERY prefill length and can't OOM, so there is ONE
-            // path and no size-threshold fork. (A dedicated fused-SRAM flash-prefill kernel
-            // was measured SLOWER than this cuBLAS chain at long seq - its only edge was
-            // avoiding the [seq,seq] HBM tensor, which tiling already does at cuBLAS speed.)
+            // path and no size-threshold fork.
             let k = crate::tensor::ops::repeat_kv(k, n_rep)?;
             let v = crate::tensor::ops::repeat_kv(v, n_rep)?.contiguous()?;
             // dtype-agnostic (see decode fast path): F16 KV -> run the matmuls at F16,

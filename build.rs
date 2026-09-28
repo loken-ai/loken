@@ -215,6 +215,7 @@ fn compile_flashdecode_tc_kernels() {
     // (F16 KV) kernels live in this lib - same WMMA HMMA path, same gencode.
     println!("cargo:rerun-if-changed=cuda/flashdecode_tc");
     println!("cargo:rerun-if-changed=cuda/flash_prefill_f16.cu");
+    println!("cargo:rerun-if-changed=cuda/flash_prefill_gqa.cu");
     println!("cargo:rerun-if-changed=cuda/flash_dit_bf16.cu");
     // The DiT kernel's 52 KB static shared-memory tile exceeds the pre-Hopper limit, so it
     // ships for the architectures that can hold it; a card below that never runs a DiT
@@ -232,6 +233,12 @@ fn compile_flashdecode_tc_kernels() {
         (
             "cuda/flash_prefill_f16.cu",
             "flash_prefill_f16.o",
+            &gencodes,
+        ),
+        // Causal GQA prefill attention with mma.sync fragments in registers.
+        (
+            "cuda/flash_prefill_gqa.cu",
+            "flash_prefill_gqa.o",
             &gencodes,
         ),
         // Non-causal BF16 flash attention for the diffusion transformers - same WMMA path,

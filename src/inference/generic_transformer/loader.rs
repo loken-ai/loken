@@ -1026,6 +1026,7 @@ fn build_generic_layer(
                 }
             }
         },
+        prefill_mask_window: config.sliding_window,
         rope_dim,
         rope_base,
         attention_scale: config.attention_scale,
@@ -1320,6 +1321,7 @@ fn build_awq_layer(
         n_kv_head: config.n_kv_head,
         head_dim,
         sliding_window: None,
+        prefill_mask_window: config.sliding_window,
         rope_dim: 0,
         rope_base: config.rope_freq_base,
         no_rope: false,

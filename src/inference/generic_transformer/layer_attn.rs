@@ -1045,6 +1045,18 @@ impl GenericTransformerLayer {
         }
 
         // -- KV: compute or reuse from shared layer ----------------------
+        // Multi-token attention over the Q8 history runs as one flash kernel reading
+        // the history dequantized to F16 in its stored order (`flash_kv` below).
+        #[cfg(feature = "cuda")]
+        let flash_prefill_ok = seq > 1
+            && b == 1
+            && q.device().is_cuda()
+            && mask.is_some()
+            && crate::inference::kernel::fused::FLASH_PREFILL_GQA_HEAD_DIMS.contains(&head_dim)
+            && n_kv_head > 0
+            && n_head.is_multiple_of(n_kv_head);
+        #[cfg(feature = "cuda")]
+        let mut flash_kv = false;
         #[cfg(feature = "cuda")]
         let (k, v) = if let Some((shared_k, shared_v)) = shared_kv {
             (shared_k, shared_v)
@@ -1111,6 +1123,23 @@ impl GenericTransformerLayer {
                         self.kv_cache.current_kv().ok_or_else(|| {
                             crate::tensor::Error::msg("dual-populate: kv_cache empty after append")
                         })?
+                    }
+                    Ok(()) if seq > 1 && flash_prefill_ok && self.q8_kv().is_some() => {
+                        match self.q8_kv().unwrap().dequantize_kv_f16_views() {
+                            Ok(kv) => {
+                                flash_kv = true;
+                                kv
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "quantised KV dequantize failed, moving to F-dtype: {e}"
+                                );
+                                self.demote_quant_kv(k.dtype())?;
+                                self.kv_cache.current_kv().ok_or_else(|| {
+                                    crate::tensor::Error::msg("demoted kv_cache empty")
+                                })?
+                            }
+                        }
                     }
                     Ok(()) if seq == 1 => (k, v),
                     Ok(()) => match self.quant_kv.as_ref().unwrap().dequantize_kv(k.dtype()) {
@@ -1197,6 +1226,34 @@ impl GenericTransformerLayer {
         };
 
         // -- Attention ----------------------------------------------------
+        #[cfg(feature = "cuda")]
+        let (k, v) = if flash_kv {
+            let scale = self
+                .attention_scale
+                .unwrap_or_else(|| 1.0 / (self.head_dim as f64).sqrt());
+            let window = self.prefill_mask_window.unwrap_or(0);
+            if let Some(y) = crate::inference::kernel::fused::flash_prefill_gqa(
+                &q,
+                &k,
+                &v,
+                scale as f32,
+                window,
+            )? {
+                let y = if y.dtype() == q.dtype() {
+                    y
+                } else {
+                    y.to_dtype(q.dtype())?
+                };
+                return Ok((y, false));
+            }
+            // No kernel for this device: the chain below reads K/V in the query dtype.
+            (
+                k.to_dtype(q.dtype())?.contiguous()?,
+                v.to_dtype(q.dtype())?.contiguous()?,
+            )
+        } else {
+            (k, v)
+        };
         // One query row over the Q8 cache takes the decode attention every step takes,
         // eager or replayed from a captured graph (`q8_decode_attention`). Shared layers
         // read the donor's K/V, and donor layers of a shared cache (gemma4, whose tiny

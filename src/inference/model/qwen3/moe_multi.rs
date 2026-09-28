@@ -555,6 +555,16 @@ impl Attn {
         } else {
             (None, None)
         };
+        // Multi-token attention over a quantized history runs as one flash kernel
+        // reading it dequantized to F16 (`flash_kv` below).
+        #[cfg(feature = "cuda")]
+        let flash_prefill_ok = seq > 1
+            && q.device().is_cuda()
+            && q.dims()[0] == 1
+            && crate::inference::kernel::fused::FLASH_PREFILL_GQA_HEAD_DIMS
+                .contains(&self.head_dim);
+        #[cfg(feature = "cuda")]
+        let mut flash_kv = false;
         #[cfg(feature = "cuda")]
         let (k, v) = if self.q8_kv_cache.is_some() {
             // Consolidated Q8 mode: only Q8 cache holds history. Single-token
@@ -563,6 +573,21 @@ impl Attn {
             // Q8 history to F-dtype for downstream matmul.
             match self.q8_kv_cache.as_mut().unwrap().append(&k, &v) {
                 Ok(()) if seq == 1 => (k, v),
+                Ok(()) if flash_prefill_ok => {
+                    match self.q8_kv_cache.as_ref().unwrap().dequantize_kv_f16_views() {
+                        Ok(kv) => {
+                            flash_kv = true;
+                            kv
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Q8 dequantize_kv failed (falling back to F-dtype): {e}"
+                            );
+                            self.q8_kv_cache = None;
+                            self.kv_cache.append(&k, &v)?
+                        }
+                    }
+                }
                 Ok(()) => match self.q8_kv_cache.as_ref().unwrap().dequantize_kv(self.dtype) {
                     Ok((k_full, v_full)) => (k_full, v_full),
                     Err(e) => {
@@ -621,8 +646,17 @@ impl Attn {
                             }
                         }
                     } else {
-                        match self.q4_kv_cache.as_ref().unwrap().dequantize_kv(self.dtype) {
-                            Ok((k_full, v_full)) => (k_full, v_full),
+                        // The flash kernel reads the history in F16.
+                        let dt = if flash_prefill_ok {
+                            DType::F16
+                        } else {
+                            self.dtype
+                        };
+                        match self.q4_kv_cache.as_ref().unwrap().dequantize_kv(dt) {
+                            Ok((k_full, v_full)) => {
+                                flash_kv = flash_prefill_ok;
+                                (k_full, v_full)
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     "Q4 dequantize_kv failed (falling back to F-dtype): {e}"
@@ -644,6 +678,28 @@ impl Attn {
         };
         #[cfg(not(feature = "cuda"))]
         let (k, v) = self.kv_cache.append(&k, &v)?;
+        #[cfg(feature = "cuda")]
+        let (k, v) = if flash_kv {
+            let scale = if q_pre_scaled {
+                1.0f32
+            } else {
+                (1.0 / (self.head_dim as f64).sqrt()) as f32
+            };
+            if let Some(y) =
+                crate::inference::kernel::fused::flash_prefill_gqa(&q, &k, &v, scale, 0)?
+            {
+                let y = if y.dtype() == in_dtype {
+                    y
+                } else {
+                    y.to_dtype(in_dtype)?
+                };
+                return self.wo.forward(&y);
+            }
+            // No kernel for this device: the band loop below reads K/V in the model dtype.
+            (k.to_dtype(self.dtype)?, v.to_dtype(self.dtype)?)
+        } else {
+            (k, v)
+        };
 
         // CPU decode fast path: mirror the new K/V into the f16 GQA
         // cache; at seq==1 run the single-pass online-softmax attention and

@@ -302,6 +302,9 @@ pub struct GenericTransformerLayer {
     /// gemma4 SWA per-layer window: Some(w) ⟹ decode attends only to the last w
     /// keys (the windowed-SWA lever); None ⟹ global/full attention.
     pub sliding_window: Option<usize>,
+    /// Window of the model-wide causal mask a multi-token forward receives
+    /// (`attention.sliding_window`, applied to every layer's prefill mask).
+    pub prefill_mask_window: Option<usize>,
     /// Partial RoPE: only apply to first `rope_dim` of `head_dim` dims (0 = full)
     pub rope_dim: usize,
     /// Rotary base this layer's frequencies are powers of: the SWA base on a

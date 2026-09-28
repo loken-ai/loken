@@ -450,6 +450,19 @@ impl TpQwen2 {
             None => (k_new16.clone(), v_new16.clone()),
         };
         *cache = Some((k_full16.clone(), v_full16.clone()));
+        // PREFILL (seq>1) as one flash kernel over the F16 cache: query i sits at position
+        // pos + i = i + total - seq, the causal offset the kernel derives.
+        if seq > 1 {
+            if let Some(y) = crate::inference::kernel::fused::flash_prefill_gqa(
+                &q.unsqueeze(0)?,
+                &k_full16.unsqueeze(0)?,
+                &v_full16.unsqueeze(0)?,
+                scale as f32,
+                0,
+            )? {
+                return Ok(y.reshape((seq, nh_r * hd))?.to_dtype(q.dtype())?);
+            }
+        }
         // Upcast to F32 for the score/output matmuls (transient, freed after this layer).
         let k_full = k_full16.to_dtype(crate::tensor::DType::F32)?;
         let v_full = v_full16.to_dtype(crate::tensor::DType::F32)?;
