@@ -55,7 +55,21 @@ fn declares_a_dimension(line: &str) -> bool {
         .trim_end_matches(';')
         .chars()
         .all(|c| c.is_ascii_digit() || c == '_');
-    integer_type && literal && DIMENSION_WORDS.iter().any(|w| name.contains(w))
+    integer_type && literal && names_a_dimension(name.trim())
+}
+
+/// Words that make a name a bound a request is checked against: `IMAGE_MAX_DIM` caps
+/// what a caller may ask for and says nothing about the model serving it.
+const BOUND_WORDS: [&str; 2] = ["MAX", "MIN"];
+
+/// Whether a constant's name states a dimension: one of its `_`-separated words begins
+/// with a dimension word (`HEADS`, `EMBEDDING`), and none of them makes it a bound.
+fn names_a_dimension(name: &str) -> bool {
+    let words: Vec<&str> = name.split('_').collect();
+    let dimension = words
+        .iter()
+        .any(|w| DIMENSION_WORDS.iter().any(|d| w.starts_with(d)));
+    dimension && !words.iter().any(|w| BOUND_WORDS.contains(w))
 }
 
 /// Field names a config struct gives a model dimension.
@@ -120,10 +134,6 @@ fn dimension_constants() -> std::collections::BTreeMap<String, usize> {
 /// Files that still write a model dimension as a constant, with how many. The list only
 /// shrinks: a file that reads its shape from the checkpoint leaves it.
 const GEOMETRY_DEBT: &[(&str, usize)] = &[
-    ("api/handlers/media/discover.rs", 1),
-    ("api/handlers/media/request.rs", 1),
-    ("api/handlers/ollama/embed.rs", 2),
-    ("api/handlers/openai/mod.rs", 2),
     ("inference/codec/dac.rs", 2),
     ("inference/codec/melband.rs", 4),
     ("inference/engine/image_engine/load_flux.rs", 4),
@@ -142,9 +152,6 @@ const GEOMETRY_DEBT: &[(&str, usize)] = &[
     ("inference/model/flux2/dit.rs", 2),
     ("inference/model/kyutai/cond.rs", 3),
     ("inference/model/kyutai/depformer.rs", 6),
-    ("inference/model/kyutai/gen.rs", 1),
-    ("inference/model/kyutai/helium.rs", 5),
-    ("inference/model/kyutai/lm.rs", 1),
     ("inference/model/kyutai/mimi.rs", 4),
     ("inference/model/mixformer/mod.rs", 2),
     ("inference/model/moondream/quantized.rs", 1),
@@ -179,6 +186,17 @@ fn a_constant_names_a_dimension_only_when_it_is_one() {
         "const N_LAYERS: usize = cfg.n_layers;"
     ));
     assert!(!declares_a_dimension("const TILE: usize = 64;"));
+    assert!(declares_a_dimension("const N_HEADS: usize = 16;"));
+    assert!(declares_a_dimension(
+        "const FREQUENCY_EMBEDDING_SIZE: usize = 256;"
+    ));
+    assert!(!declares_a_dimension(
+        "const SECOND_STREAM_AHEAD: usize = 2;"
+    ));
+    assert!(!declares_a_dimension("const IMAGE_MAX_DIM: usize = 8192;"));
+    assert!(!declares_a_dimension(
+        "const EMBED_MAX_CHARS: usize = 8192;"
+    ));
     assert!(fills_a_dimension_field("        hidden_size: 4096,"));
     assert!(!fills_a_dimension_field("        hidden_size: cfg.hidden,"));
     assert!(!fills_a_dimension_field("        chunk: 64,"));
