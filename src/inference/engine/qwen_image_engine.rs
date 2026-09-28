@@ -16,7 +16,6 @@ use tracing::info;
 use crate::inference::model::qwen_image::dit::{Config as DitConfig, Model as DitModel};
 use crate::inference::model::qwen_image::textenc::Qwen2TextEncoder;
 use crate::inference::model::wan::vae::{load_wan_vae_decoder_safetensors, WanVaeDecoder};
-use crate::inference::place::layer_executor::HeteroPlan;
 use crate::tensor::{Device, Tensor as NT};
 
 /// Fixed system prefix for the base text-to-image template. Its token length is the `drop_idx`
@@ -304,65 +303,6 @@ fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize) -> u
     reserve
 }
 
-/// Plan a model UNDIVIDED on the fastest GPU that fits it whole (no cross-GPU sync - matters for the
-/// hot per-step DiT); if no single GPU fits, let HeteroPlan spill it across GPUs + CPU. `cuda` is
-/// fastest-first (by throughput). Placement is thus adaptive and role-aware, never hardcoded.
-pub(crate) fn plan_undivided_or_spill(
-    n_layers: usize,
-    size: u64,
-    cuda: &[(usize, u64)],
-) -> HeteroPlan {
-    for &(idx, free) in cuda {
-        if free >= size {
-            return HeteroPlan::forced_gpu(n_layers, n_layers, idx);
-        }
-    }
-    HeteroPlan::calculate(n_layers, size, cuda, &[], 1.0)
-}
-
-/// Load a model with an OOM-fallback CASCADE so a load can NEVER hard-OOM: ideal placement
-/// (undivided on the fastest GPU that fits, or a natural spill) -> on OOM, trim the CUDA pool and
-/// retry an even GPU split -> on OOM, CPU. Mirrors the FLUX single-device -> split -> CPU cascade.
-pub(crate) fn load_with_fallback<T>(
-    n_layers: usize,
-    size: u64,
-    cuda: &[(usize, u64)],
-    what: &str,
-    cancel: Option<&crate::inference::serve::cancel::CancelToken>,
-    load: impl Fn(&HeteroPlan) -> AnyResult<T>,
-) -> AnyResult<T> {
-    // A cancelled load is NOT a placement failure: short-circuit the cascade instead of
-    // retrying cheaper plans that would each bail again.
-    let cancelled =
-        || cancel.is_some_and(crate::inference::serve::cancel::CancelToken::is_cancelled);
-    match load(&plan_undivided_or_spill(n_layers, size, cuda)) {
-        Ok(m) => return Ok(m),
-        Err(e) => {
-            if cancelled() {
-                return Err(e);
-            }
-            tracing::warn!("{what}: ideal placement failed ({e:#}); retrying split across GPUs");
-        }
-    }
-    #[cfg(feature = "cuda")]
-    crate::inference::engine::llm_engine::trim_cuda_pools();
-    if !cuda.is_empty() {
-        match load(&HeteroPlan::split_across_cuda(n_layers, cuda)) {
-            Ok(m) => return Ok(m),
-            Err(e) => {
-                if cancelled() {
-                    return Err(e);
-                }
-                tracing::warn!("{what}: GPU split failed ({e:#}); falling back to CPU");
-            }
-        }
-        #[cfg(feature = "cuda")]
-        crate::inference::engine::llm_engine::trim_cuda_pools();
-    }
-    // Empty CUDA list -> the plan puts every layer on CPU (never OOMs).
-    load(&HeteroPlan::calculate(n_layers, size, &[], &[], 1.0))
-}
-
 /// Load Qwen-Image for generation. Placement is decided by the adaptive `HeteroPlan`
 /// (fastest-GPU-first, spill to the next GPU then CPU) with an OOM-fallback cascade - never a
 /// hardcoded device. `_primary` is ignored (kept for the loader signature); the plan chooses.
@@ -439,10 +379,17 @@ pub fn load(
             .map(|(i, f)| format!("GPU{i}:{:.2}GB", *f as f64 / 1e9))
             .collect::<Vec<_>>()
     );
-    let dit = load_with_fallback(60, dit_sz, &dit_cuda, "Qwen-Image DiT", cancel, |plan| {
-        DitModel::load_hetero(&dit_path_str, &cuda_devices, plan, cancel)
-            .map_err(|e| anyhow!("{e}"))
-    })?;
+    let dit = crate::inference::place::ladder::load_blocks(
+        60,
+        dit_sz,
+        &dit_cuda,
+        "Qwen-Image DiT",
+        cancel,
+        |plan| {
+            DitModel::load_hetero(&dit_path_str, &cuda_devices, plan, cancel)
+                .map_err(|e| anyhow!("{e}"))
+        },
+    )?;
     let dit_device = dit.input_device().clone();
 
     // Re-probe FREE VRAM (the DiT is now resident); reuse the SAME device handles so the encoder's
@@ -455,7 +402,7 @@ pub fn load(
     // One-shot encoder (28 Qwen2 layers): best-fit remaining capacity; same OOM-fallback cascade.
     let enc_sz = std::fs::metadata(&enc_gguf).map(|m| m.len()).unwrap_or(0);
     let enc_path_str = enc_gguf.to_string_lossy().to_string();
-    let encoder = load_with_fallback(
+    let encoder = crate::inference::place::ladder::load_blocks(
         28,
         enc_sz,
         &enc_cuda,

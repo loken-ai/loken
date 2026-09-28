@@ -10,10 +10,10 @@
 
 use anyhow::{anyhow, Result as AnyResult};
 
-use crate::inference::engine::qwen_image_engine::load_with_fallback;
 use crate::inference::model::boogu::dit::BooguTransformer2DModel;
 use crate::inference::model::flux::vae::{AutoEncoder, Config as VaeConfig};
 use crate::inference::model::qwen3vl::textenc::Qwen3VlTextEncoder;
+use crate::inference::place::ladder::load_blocks;
 use crate::tensor::DType;
 use crate::tensor::{Device, Tensor as NT};
 use std::collections::HashMap;
@@ -212,7 +212,7 @@ pub fn load(
     // The plan distributes the 40-block main stack (8 double-stream + 32 single-stream). Undivided
     // on the fastest GPU that fits (hot path); OOM-fallback cascade -> split -> CPU (never OOM).
     let dit_path_str = dit_path.to_string_lossy().to_string();
-    let dit = load_with_fallback(40, dit_sz, &dit_cuda, "Boogu DiT", cancel, |plan| {
+    let dit = load_blocks(40, dit_sz, &dit_cuda, "Boogu DiT", cancel, |plan| {
         BooguTransformer2DModel::load_cancellable(&dit_path_str, &cuda_devices, plan, cancel)
             .map_err(|e| anyhow!("{e}"))
     })?;
@@ -228,7 +228,7 @@ pub fn load(
     // One-shot encoder: best-fit remaining device (undivided on the fastest GPU that still fits,
     // e.g. GPU1 whole rather than splitting GPU0's leftover); same OOM-fallback cascade.
     let enc_path_str = enc_path.to_string_lossy().to_string();
-    let encoder = load_with_fallback(36, enc_sz, &enc_cuda, "Boogu encoder", cancel, |plan| {
+    let encoder = load_blocks(36, enc_sz, &enc_cuda, "Boogu encoder", cancel, |plan| {
         Qwen3VlTextEncoder::load_cancellable(&enc_path_str, &cuda_devices, plan, cancel)
             .map_err(|e| anyhow!("{e}"))
     })?;

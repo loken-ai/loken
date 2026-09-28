@@ -1326,7 +1326,7 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("inference/engine/llm_engine/params.rs", (0, 2, 0)),
     ("inference/engine/llm_engine/stream.rs", (0, 6, 0)),
     ("inference/engine/model_backend.rs", (0, 3, 0)),
-    ("inference/engine/qwen_image_engine.rs", (9, 0, 0)),
+    ("inference/engine/qwen_image_engine.rs", (5, 0, 0)),
     ("inference/engine/tts_engine.rs", (3, 0, 0)),
     ("inference/generic_transformer/graph.rs", (1, 0, 0)),
     ("inference/generic_transformer/loader.rs", (5, 0, 0)),

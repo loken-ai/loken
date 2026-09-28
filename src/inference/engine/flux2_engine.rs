@@ -17,12 +17,12 @@ use anyhow::{anyhow, Result as AnyResult};
 use tracing::info;
 
 use crate::inference::engine::image_engine::{vae_decode_tile, VAE_TILE_OVERLAP};
-use crate::inference::engine::qwen_image_engine::load_with_fallback;
 use crate::inference::model::flux2::dit::{Config as DitConfig, Model as DitModel};
 use crate::inference::model::flux2::sampling;
 use crate::inference::model::flux2::textenc as cond;
 use crate::inference::model::flux2::vae::{self, Flux2Vae};
 use crate::inference::model::qwen3vl::textenc::{Config as EncConfig, Qwen3VlTextEncoder};
+use crate::inference::place::ladder::load_blocks;
 use crate::tensor::{DType, Device, Tensor as NT};
 
 /// Relative locations under `huggingface_models_dir` - never absolute paths.
@@ -183,7 +183,7 @@ pub fn load(
         reserve as f64 / 1e9,
         dit_cuda.iter().map(|(i, f)| format!("GPU{i}:{:.2}GB", *f as f64 / 1e9)).collect::<Vec<_>>()
     );
-    let dit = load_with_fallback(n_blocks, dit_sz, &dit_cuda, "FLUX.2 DiT", cancel, |plan| {
+    let dit = load_blocks(n_blocks, dit_sz, &dit_cuda, "FLUX.2 DiT", cancel, |plan| {
         DitModel::load_hetero(&dit_str, &cuda_devices, plan, cancel).map_err(|e| anyhow!("{e}"))
     })?;
     let dit_device = dit.input_device().clone();
@@ -215,7 +215,7 @@ pub fn load(
             .sum()
     };
     let refs: Vec<&str> = shards.iter().map(String::as_str).collect();
-    let encoder = load_with_fallback(
+    let encoder = load_blocks(
         enc_cfg.n_layers,
         enc_sz,
         &enc_cuda,

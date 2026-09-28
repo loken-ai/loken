@@ -160,6 +160,30 @@ pub fn load_placed<T, E: std::fmt::Display>(
     Err(first)
 }
 
+/// Build a component of `layers` blocks and `bytes` resident bytes, with nothing beside the
+/// blocks, through the ladder. A cancelled load stops.
+pub fn load_blocks<T>(
+    layers: usize,
+    bytes: u64,
+    cards: &[(usize, u64)],
+    what: &str,
+    cancel: Option<&crate::inference::serve::cancel::CancelToken>,
+    build: impl Fn(&HeteroPlan) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let demand = Demand {
+        layers,
+        block_bytes: bytes,
+        ..Demand::default()
+    };
+    load_placed(
+        what,
+        &demand,
+        cards,
+        || cancel.is_some_and(crate::inference::serve::cancel::CancelToken::is_cancelled),
+        |plan| build(plan).map_err(|e| anyhow::anyhow!("{e:#}")),
+    )
+}
+
 /// Hands the pools' cached blocks back before the next rung measures the cards.
 fn release_pools() {
     #[cfg(feature = "cuda")]
