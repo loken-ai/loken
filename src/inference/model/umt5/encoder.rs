@@ -3,11 +3,11 @@
 //!
 //! umT5 is the same T5 v1.1 family as our FLAN-T5 encoder (gated-gelu FFN, scale-only
 //! RMSNorm, no-bias qkv, NO 1/√d attention scaling, relative-position bucket bias) with two
-//! differences handled here: (1) `shared_pos=False` - each of the 24 encoder blocks owns its
-//! OWN relative-position embedding table, so the additive position bias is rebuilt per layer
-//! from that block's table (NOT the shared block-0 table FLAN-T5 uses); (2) larger geometry
-//! (dim 4096 / dim_ffn 10240 / 64 heads x 64 / 24 layers) with bf16 weights from the Wan
-//! `.pth`, loaded and computed in f32 on CPU for the sanity test.
+//! differences handled here: (1) `shared_pos=False` - each encoder block owns its OWN
+//! relative-position embedding table, so the additive position bias is rebuilt per layer
+//! from that block's table (NOT the shared block-0 table FLAN-T5 uses); (2) bf16 weights
+//! from the Wan `.pth`. The block count, the head count and the bucket count are read from
+//! the stored tensors: a block's position table is `[buckets, heads]`.
 //!
 //! The Wan checkpoint uses `wan/modules/t5.py` module names (`token_embedding`,
 //! `blocks.{i}.{attn.{q,k,v,o}, norm1, ffn.{gate.0,fc1,fc2}, norm2, pos_embedding}`, `norm`),
@@ -18,11 +18,7 @@ use crate::tensor::pth::read_pt;
 use crate::tensor::{Device, Error, Result, Tensor};
 use std::collections::HashMap;
 
-// umT5-XXL geometry (confirmed against the Wan checkpoint).
-const N_LAYERS: usize = 24;
-const N_HEADS: usize = 64;
-const D_KV: usize = 64;
-const NUM_BUCKETS: usize = 32;
+/// The relative distance past which T5's position buckets stop growing.
 const MAX_DISTANCE: usize = 128;
 const EPS: f32 = 1e-6;
 
@@ -37,7 +33,7 @@ struct Umt5Block {
     gate: Linear,
     fc1: Linear,
     fc2: Linear,
-    /// This block's OWN relative-position table `[NUM_BUCKETS, N_HEADS]` (host, row-major).
+    /// This block's OWN relative-position table `[buckets, heads]` (host, row-major).
     rel_bias: Vec<f32>,
 }
 
@@ -46,6 +42,10 @@ pub struct Umt5Encoder {
     blocks: Vec<Umt5Block>,
     final_norm: RmsNorm,
     device: Device,
+    /// Attention heads, the width of each, and the relative-position buckets.
+    heads: usize,
+    head_dim: usize,
+    buckets: usize,
 }
 
 impl Umt5Encoder {
@@ -83,11 +83,23 @@ impl Umt5Encoder {
         };
 
         let embed = Embedding::new(get("token_embedding.weight")?);
-        let mut blocks = Vec::with_capacity(N_LAYERS);
-        for i in 0..N_LAYERS {
+        let n_blocks = (0..)
+            .take_while(|i| raw.contains_key(&format!("blocks.{i}.norm1.weight")))
+            .count();
+        let shape_of = |name: &str| -> Result<Vec<usize>> {
+            raw.get(name)
+                .map(|t| t.dims().to_vec())
+                .ok_or_else(|| Error(format!("umt5: missing tensor `{name}`")))
+        };
+        let [buckets, heads] = shape_of("blocks.0.pos_embedding.embedding.weight")?[..] else {
+            return Err(Error("umt5: the position table is not a matrix".into()));
+        };
+        let head_dim = shape_of("blocks.0.attn.q.weight")?[0] / heads.max(1);
+        let mut blocks = Vec::with_capacity(n_blocks);
+        for i in 0..n_blocks {
             let b = format!("blocks.{i}");
             // Per-layer relative-position table (shared_pos=False).
-            let rel = get(&format!("{b}.pos_embedding.embedding.weight"))?; // [NUM_BUCKETS, N_HEADS]
+            let rel = get(&format!("{b}.pos_embedding.embedding.weight"))?; // [buckets, heads]
             blocks.push(Umt5Block {
                 norm1: rms(&format!("{b}.norm1"))?,
                 q: lin(&format!("{b}.attn.q"))?,
@@ -113,6 +125,9 @@ impl Umt5Encoder {
             blocks,
             final_norm,
             device,
+            heads,
+            head_dim,
+            buckets,
         })
     }
 
@@ -148,6 +163,9 @@ impl Umt5Encoder {
             blocks,
             final_norm: self.final_norm.to_dtype_on(dev, dtype)?,
             device: dev.clone(),
+            heads: self.heads,
+            head_dim: self.head_dim,
+            buckets: self.buckets,
         })
     }
 
@@ -179,6 +197,9 @@ impl Umt5Encoder {
             blocks,
             final_norm: self.final_norm.to_device(dev)?,
             device: dev.clone(),
+            heads: self.heads,
+            head_dim: self.head_dim,
+            buckets: self.buckets,
         })
     }
 
@@ -198,24 +219,25 @@ impl Umt5Encoder {
             for j in 0..s {
                 buckets[i * s + j] = crate::inference::model::t5::flan::rel_bucket(
                     j as i64 - i as i64,
-                    NUM_BUCKETS,
+                    self.buckets,
                     MAX_DISTANCE,
                 );
             }
         }
 
+        let n_heads = self.heads;
         for blk in &self.blocks {
-            // Per-layer additive relative-position bias [N_HEADS, S, S] from this block's table.
-            let mut bias = vec![0f32; N_HEADS * s * s];
+            // Per-layer additive relative-position bias [heads, S, S] from this block's table.
+            let mut bias = vec![0f32; n_heads * s * s];
             for i in 0..s {
                 for j in 0..s {
                     let b = buckets[i * s + j];
-                    for h in 0..N_HEADS {
-                        bias[h * s * s + i * s + j] = blk.rel_bias[b * N_HEADS + h];
+                    for h in 0..n_heads {
+                        bias[h * s * s + i * s + j] = blk.rel_bias[b * n_heads + h];
                     }
                 }
             }
-            let bias = Tensor::from_vec_f32(bias, (N_HEADS, s, s))?
+            let bias = Tensor::from_vec_f32(bias, (n_heads, s, s))?
                 .to_device(&self.device)?
                 .to_dtype(dt)?;
 
@@ -234,48 +256,72 @@ impl Umt5Encoder {
     /// T5 self-attention: NO 1/√d scaling (folded into the trained weights); add the per-layer
     /// relative-position bias to the scores before softmax.
     fn attn(&self, blk: &Umt5Block, h: &Tensor, bias: &Tensor, s: usize) -> Result<Tensor> {
-        let inner = N_HEADS * D_KV;
+        let (n_heads, d_kv) = (self.heads, self.head_dim);
+        let inner = n_heads * d_kv;
         let heads = |t: Tensor| -> Result<Tensor> {
-            t.reshape((s, N_HEADS, D_KV))?.transpose(0, 1)?.contiguous() // [H,S,D_KV]
+            t.reshape((s, n_heads, d_kv))?.transpose(0, 1)?.contiguous() // [H,S,d_kv]
         };
         let q = heads(blk.q.forward(h)?)?;
         let k = heads(blk.k.forward(h)?)?;
         let v = heads(blk.v.forward(h)?)?;
         let scores = q.matmul(&k.transpose(1, 2)?.contiguous()?)?; // [H,S,S]
         let probs = scores.add(bias)?.softmax_last_dim()?;
-        let ctx = probs.matmul(&v)?; // [H,S,D_KV]
+        let ctx = probs.matmul(&v)?; // [H,S,d_kv]
         let ctx = ctx.transpose(0, 1)?.contiguous()?.reshape((s, inner))?;
         blk.o.forward(&ctx)
     }
+
+    /// The attention's shape, which is what an encode's working memory is sized by.
+    pub fn attention(&self) -> AttentionShape {
+        AttentionShape {
+            heads: self.heads,
+            head_dim: self.head_dim,
+        }
+    }
 }
 
-/// What ONE `encode` holds on its device for a prompt of `seq` tokens at `dtype`, on top of
-/// the weights.
-///
-/// Read off `encode`/`attn` above rather than chosen: each block builds an additive
-/// relative-position bias `[N_HEADS, seq, seq]`, uploads it as f32 and casts it to the
-/// compute dtype (both copies are live across the cast), and the attention then carries the
-/// scores, the biased scores and the probabilities in that same shape. The bias is rebuilt
-/// per block instead of accumulated, so the peak is ONE block's and does not grow with their
-/// number - it grows with the SQUARE of the prompt, and T5 attention is unusually wide
-/// (every head keeps a full `seq x seq` map). A placement that charges the weights alone
-/// therefore approves a card with no room left to run on, and the failure lands mid-encode.
-pub fn umt5_encode_peak_bytes(seq: usize, dtype: crate::tensor::DType) -> u64 {
-    /// `[N_HEADS, seq, seq]` buffers alive at once in `attn`: the scores, the biased
-    /// scores, the probabilities.
-    const LIVE_SCORE_MAPS: u64 = 3;
-    /// `[seq, d_model]` buffers alive at once in a block: the residual, its normalised
-    /// copy, q, k, v and the attention output.
-    const LIVE_HIDDEN_MAPS: u64 = 6;
-    let elem = dtype.size_in_bytes() as u64;
-    let f32_elem = std::mem::size_of::<f32>() as u64;
-    let d_model = (N_HEADS * D_KV) as u64;
-    let score_map = (N_HEADS as u64) * (seq as u64) * (seq as u64);
-    // The bias is staged as f32 and cast, so it costs one of each.
-    let bias = score_map.saturating_mul(f32_elem + elem);
-    let scores = score_map.saturating_mul(elem * LIVE_SCORE_MAPS);
-    let hidden = (seq as u64).saturating_mul(d_model * elem * LIVE_HIDDEN_MAPS);
-    bias.saturating_add(scores).saturating_add(hidden)
+/// How the encoder's attention splits its width.
+#[derive(Debug, Clone, Copy)]
+pub struct AttentionShape {
+    pub heads: usize,
+    pub head_dim: usize,
+}
+
+impl AttentionShape {
+    /// What ONE `encode` holds on its device for a prompt of `seq` tokens at `dtype`, on top
+    /// of the weights.
+    ///
+    /// Read off `encode`/`attn` above rather than chosen: each block builds an additive
+    /// relative-position bias `[heads, seq, seq]`, uploads it as f32 and casts it to the
+    /// compute dtype (both copies are live across the cast), and the attention then carries
+    /// the scores, the biased scores and the probabilities in that same shape. The bias is
+    /// rebuilt per block instead of accumulated, so the peak is ONE block's and does not grow
+    /// with their number - it grows with the SQUARE of the prompt, and T5 attention is
+    /// unusually wide (every head keeps a full `seq x seq` map). A placement that charges the
+    /// weights alone therefore approves a card with no room left to run on, and the failure
+    /// lands mid-encode.
+    pub fn encode_peak_bytes(&self, seq: usize, dtype: crate::tensor::DType) -> u64 {
+        /// `[heads, seq, seq]` buffers alive at once in `attn`.
+        const SCORE_MAPS: [&str; 3] = ["scores", "biased scores", "probabilities"];
+        /// `[seq, width]` buffers alive at once in a block.
+        const TOKEN_MAPS: [&str; 6] = [
+            "residual",
+            "normalised residual",
+            "q",
+            "k",
+            "v",
+            "attention output",
+        ];
+        let elem = dtype.size_in_bytes() as u64;
+        let f32_elem = std::mem::size_of::<f32>() as u64;
+        let width = (self.heads * self.head_dim) as u64;
+        let score_map = (self.heads as u64) * (seq as u64) * (seq as u64);
+        // The bias is staged as f32 and cast, so it costs one of each.
+        let bias = score_map.saturating_mul(f32_elem + elem);
+        let scores = score_map.saturating_mul(elem * SCORE_MAPS.len() as u64);
+        let hidden = (seq as u64).saturating_mul(width * elem * TOKEN_MAPS.len() as u64);
+        bias.saturating_add(scores).saturating_add(hidden)
+    }
 }
 
 /// Resolve the umT5-XXL encoder `.pth` inside the Wan2.1 snapshot (via the S1 resolver).

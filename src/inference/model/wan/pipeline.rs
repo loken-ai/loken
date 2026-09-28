@@ -32,7 +32,9 @@
 //! ONCE and renders a list of prompts in a single process (no per-clip reload/re-encode);
 //! [`render`] is the backward-compatible single-prompt wrapper.
 
-use crate::inference::model::umt5::encoder::{umt5_pth, umt5_tokenize, Umt5Encoder};
+use crate::inference::model::umt5::encoder::{
+    umt5_pth, umt5_tokenize, AttentionShape, Umt5Encoder,
+};
 use crate::inference::model::wan::dit::{WanDit, WanVariant};
 use crate::inference::model::wan::vae::{load_wan_vae_decoder, wan_file};
 use crate::inference::sample::flow_unipc::heun_integrate;
@@ -193,19 +195,15 @@ fn checkpoint_bytes(path: &std::path::Path) -> u64 {
 /// What one encode holds on the encoder's device, beyond the weights: the encoder's own
 /// geometry applied to this render's LONGEST prompt, because T5 attention keeps a full
 /// `seq x seq` map per head and that is the part a weights-only demand misses.
-fn umt5_encode_reserve(longest_prompt_tokens: usize) -> u64 {
-    use crate::tensor::DType;
-    crate::inference::model::umt5::encoder::umt5_encode_peak_bytes(
-        longest_prompt_tokens,
-        DType::BF16,
-    )
+fn umt5_encode_reserve(attention: &AttentionShape, longest_prompt_tokens: usize) -> u64 {
+    attention.encode_peak_bytes(longest_prompt_tokens, crate::tensor::DType::BF16)
 }
 
 /// What the text encoder needs from a card in total: its weights, plus what one encode
 /// holds. The weights are the checkpoint's own size - it is stored at half precision and
 /// that is the precision it runs at on a card, so the file IS the resident footprint.
-fn umt5_demand(weights: u64, longest_prompt_tokens: usize) -> u64 {
-    weights.saturating_add(umt5_encode_reserve(longest_prompt_tokens))
+fn umt5_demand(attention: &AttentionShape, weights: u64, longest_prompt_tokens: usize) -> u64 {
+    weights.saturating_add(umt5_encode_reserve(attention, longest_prompt_tokens))
 }
 
 /// The VAE decoder's copy on a card that holds its weights and its decode (`reserve`), aside
@@ -246,7 +244,8 @@ fn load_umt5(
     }
     // The ladder takes the resident weights and the run-time reserve separately; the reserve
     // is the part of the demand that is not the checkpoint.
-    let act = umt5_demand(weights, longest_prompt_tokens).saturating_sub(weights);
+    let act =
+        umt5_demand(&staged.attention(), weights, longest_prompt_tokens).saturating_sub(weights);
     let reserve = crate::inference::place::runtime_demand::load_runtime_floor(weights) + act;
     crate::inference::place::ladder::load_whole("umT5 encoder", weights, reserve, |dev| match dev {
         Device::Cpu => on_host(),
@@ -1330,7 +1329,17 @@ pub fn render_many_sampled(
 /// checkpoint name typed back into it fails here.
 #[cfg(test)]
 mod umt5_placement_tests {
-    use super::{checkpoint_bytes, umt5_demand};
+    use super::{checkpoint_bytes, AttentionShape};
+
+    /// umT5-XXL's attention: 64 heads of 64.
+    const XXL: AttentionShape = AttentionShape {
+        heads: 64,
+        head_dim: 64,
+    };
+
+    fn umt5_demand(weights: u64, longest_prompt_tokens: usize) -> u64 {
+        super::umt5_demand(&XXL, weights, longest_prompt_tokens)
+    }
 
     /// The choice `load_umt5` asks the ladder for, reproduced without a GPU: the first rung
     /// of a one-block demand, given what each card has free, fastest card first.
