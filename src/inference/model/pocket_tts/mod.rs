@@ -1,26 +1,27 @@
 //! Kyutai pocket-tts - Stage 1: the Mimi decoder (synthesis path).
 //!
-//! pocket-tts is a flow-matching TTS over a CONTINUOUS 32-dim latent (no discrete
-//! RVQ codebooks - the checkpoint has a single `quantizer.output_proj` 32->512 and
-//! `emb_mean/emb_std` instead of codebooks). Stage 1 ports the audio synthesis half:
-//! a 32-dim latent at 12.5 Hz -> 24 kHz waveform, via
-//!   output_proj(32->512) -> upsample.convtr(x16, depthwise, causal)
-//!   -> decoder_transformer(2 layers, RoPE+LayerScale) -> SEANet decoder(x120, ELU)
-//! Total upsampling 16x120 = 1920 (12.5 Hz -> 24 kHz). All convs are causal
-//! (left-pad) and conv-transposes trim the right tail, matching the streaming model.
+//! pocket-tts is a flow-matching TTS over a CONTINUOUS latent (no discrete RVQ codebooks -
+//! the checkpoint has a single `quantizer.output_proj` from the latent to the codec width
+//! and `emb_mean/emb_std` instead of codebooks). Stage 1 ports the audio synthesis half:
+//! a latent frame -> 24 kHz waveform, via
+//!   output_proj -> upsample.convtr(depthwise, causal)
+//!   -> decoder_transformer(RoPE+LayerScale) -> SEANet decoder(ELU)
+//! Every width, layer count and stride is read from the stored tensors. All convs are
+//! causal (left-pad) and conv-transposes trim the right tail, matching the streaming model.
 //!
 //! Net-new vs existing VAEs: ELU activation, LayerScale, fused-qkv codec transformer
 //! with RoPE. Reuses `tensor` conv1d/conv_transpose1d, `sdpa`, `rope_tables`.
 
 use crate::inference::model::acestep::fsq::rope_tables;
 use crate::inference::model::adaln::modulate;
+use crate::inference::model::kyutai::mimi::{
+    ATTENTION_HEADS as MIMI_HEADS, ATTENTION_WINDOW as MIMI_WINDOW,
+};
 use crate::inference::model::sdpa::sdpa;
 use crate::tensor::VarBuilder;
 use crate::tensor::{Device, Result, Tensor};
 
 pub const SAMPLE_RATE: u32 = 24_000;
-pub const LATENT_DIM: usize = 32;
-pub const CODEC_DIM: usize = 512;
 const ROPE_THETA: f32 = 10_000.0;
 const LN_EPS: f32 = 1e-5;
 
@@ -84,20 +85,27 @@ struct Conv {
     b: Option<Tensor>,
 }
 impl Conv {
-    fn load(vb: &VarBuilder, name: &str, shape: (usize, usize, usize), bias: bool) -> Result<Self> {
-        let w = vb.get(shape, &format!("{name}.weight"))?;
+    /// A conv whose shape is the stored `{name}.weight`, with its bias when `bias`.
+    fn load(vb: &VarBuilder, name: &str, bias: bool) -> Result<Self> {
+        let shape = vb.shape_of(&format!("{name}.weight"))?;
         let b = if bias {
-            Some(vb.get(shape.0, &format!("{name}.bias"))?)
+            Some(vb.get(shape[0], &format!("{name}.bias"))?)
         } else {
             None
         };
+        let w = vb.get(shape, &format!("{name}.weight"))?;
         Ok(Self { w, b })
     }
-    /// ConvTranspose bias has `out` channels = shape.1 (weight is [in,out,k]).
-    fn load_tr(vb: &VarBuilder, name: &str, shape: (usize, usize, usize)) -> Result<Self> {
+    /// ConvTranspose bias has `out` channels = shape[1] (weight is [in,out,k]).
+    fn load_tr(vb: &VarBuilder, name: &str) -> Result<Self> {
+        let shape = vb.shape_of(&format!("{name}.weight"))?;
+        let b = Some(vb.get(shape[1], &format!("{name}.bias"))?);
         let w = vb.get(shape, &format!("{name}.weight"))?;
-        let b = Some(vb.get(shape.1, &format!("{name}.bias"))?);
         Ok(Self { w, b })
+    }
+    /// The stride of a SEANet resampling conv, whose kernel is twice its stride.
+    fn resampling_stride(&self) -> Result<usize> {
+        Ok(self.w.shape().dims3()?.2 / 2)
     }
 }
 
@@ -107,11 +115,11 @@ struct ResBlock {
     conv2: Conv, // [in, mid, 1]
 }
 impl ResBlock {
-    fn load(vb: &VarBuilder, idx: usize, ch: usize, mid: usize) -> Result<Self> {
+    fn load(vb: &VarBuilder, idx: usize) -> Result<Self> {
         let p = format!("{idx}.block");
         Ok(Self {
-            conv1: Conv::load(vb, &format!("{p}.1.conv"), (mid, ch, 3), true)?,
-            conv2: Conv::load(vb, &format!("{p}.3.conv"), (ch, mid, 1), true)?,
+            conv1: Conv::load(vb, &format!("{p}.1.conv"), true)?,
+            conv2: Conv::load(vb, &format!("{p}.3.conv"), true)?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -135,19 +143,23 @@ struct XfLayer {
     linear2: Tensor,     // [dim, ffn]
     ls1: Option<Tensor>, // [dim] (codec only; flow_lm has no LayerScale)
     ls2: Option<Tensor>,
-    /// Sliding causal-attention window (codec transformers use 250; flow_lm = None = full causal).
+    /// Sliding causal-attention window (the codec transformers have one; flow_lm = None =
+    /// full causal).
     context: Option<usize>,
+    dim: usize,
+    heads: usize,
 }
 impl XfLayer {
     fn load(
         vb: &VarBuilder,
         idx: usize,
-        dim: usize,
-        ffn: usize,
+        heads: usize,
         layer_scale: bool,
         context: Option<usize>,
     ) -> Result<Self> {
         let p = vb.pp(format!("layers.{idx}"));
+        let dim = p.shape_of("norm1.weight")?[0];
+        let ffn = p.shape_of("linear1.weight")?[0];
         let (ls1, ls2) = if layer_scale {
             (
                 Some(p.get(dim, "layer_scale_1.scale")?),
@@ -168,11 +180,26 @@ impl XfLayer {
             linear2: p.get((dim, ffn), "linear2.weight")?,
             ls1,
             ls2,
+            dim,
+            heads,
         })
     }
 
+    /// Every layer of the stack under `vb`.
+    fn stack(
+        vb: &VarBuilder,
+        heads: usize,
+        layer_scale: bool,
+        context: Option<usize>,
+    ) -> Result<Vec<Self>> {
+        (0..vb.count_children("layers"))
+            .map(|i| Self::load(vb, i, heads, layer_scale, context))
+            .collect()
+    }
+
     /// `x: [S, dim]` (single batch). Causal RoPE attention.
-    fn forward(&self, x: &Tensor, dim: usize, n_head: usize, dev: &Device) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, dev: &Device) -> Result<Tensor> {
+        let (dim, n_head) = (self.dim, self.heads);
         let s = x.shape().dims2()?.0;
         let hd = dim / n_head;
         // --- attention ---
@@ -232,16 +259,15 @@ impl XfLayer {
     }
 }
 
-/// Mimi decoder: 32-dim latent @12.5 Hz -> 24 kHz mono waveform.
+/// Mimi decoder: latent frames -> 24 kHz mono waveform.
 pub struct MimiDecoder {
-    output_proj: Tensor,       // [512, 32, 1] conv1d 32->512
-    upsample: Tensor,          // [512, 1, 32] depthwise convtr, stride 16
-    xf: Vec<XfLayer>,          // 2 decoder-transformer layers
-    conv_in: Conv,             // model.0  [512,512,7]
-    up: Vec<(Conv, ResBlock)>, // (convtr, resblock) x 3
-    conv_out: Conv,            // model.11 [1,64,3]
+    output_proj: Tensor,       // [codec, latent, 1] conv1d latent->codec
+    upsample: Tensor,          // [codec, 1, k] depthwise convtr, stride k/2
+    xf: Vec<XfLayer>,          // decoder-transformer layers
+    conv_in: Conv,             // model.0
+    up: Vec<(Conv, ResBlock)>, // (convtr, resblock) per SEANet stage
+    conv_out: Conv,
     device: Device,
-    n_head: usize,
 }
 
 impl MimiDecoder {
@@ -249,32 +275,30 @@ impl MimiDecoder {
         let vb = unsafe { VarBuilder::from_files(&[path], crate::tensor::DType::F32, &device)? };
         let mimi = vb.pp("mimi");
         let q = mimi.pp("quantizer");
-        let output_proj = q.get((CODEC_DIM, LATENT_DIM, 1), "output_proj.weight")?;
-        let upsample = mimi.get((CODEC_DIM, 1, 32), "upsample.convtr.convtr.weight")?;
-
-        let xt = mimi.pp("decoder_transformer.transformer");
-        let mut xf = Vec::with_capacity(2);
-        for i in 0..2 {
-            xf.push(XfLayer::load(&xt, i, CODEC_DIM, 2048, true, Some(250))?);
-        }
-
+        let output_proj = q.get(q.shape_of("output_proj.weight")?, "output_proj.weight")?;
+        let up_name = "upsample.convtr.convtr.weight";
+        let upsample = mimi.get(mimi.shape_of(up_name)?, up_name)?;
+        let xf = XfLayer::stack(
+            &mimi.pp("decoder_transformer.transformer"),
+            MIMI_HEADS,
+            true,
+            Some(MIMI_WINDOW),
+        )?;
+        // SEANet decoder: `model.0` is the input conv, then each stage is an ELU, a
+        // transposed conv and a residual block (three entries), and the output conv
+        // follows the last stage's ELU.
         let dec = mimi.pp("decoder.model");
-        let conv_in = Conv::load(&dec, "0.conv", (512, 512, 7), true)?;
-        // (convtr in/out/k/stride, resblock idx, resblock ch/mid)
-        let stages: [((usize, usize, usize, usize), usize, (usize, usize)); 3] = [
-            ((512, 256, 12, 6), 3, (256, 128)),
-            ((256, 128, 10, 5), 6, (128, 64)),
-            ((128, 64, 8, 4), 9, (64, 32)),
-        ];
-        let mut up = Vec::with_capacity(3);
-        for ((ci, co, k, _s), rb, (ch, mid)) in stages {
-            let convtr_idx = rb - 1; // 2,5,8
-            let convtr = Conv::load_tr(&dec, &format!("{convtr_idx}.convtr"), (ci, co, k))?;
-            let res = ResBlock::load(&dec, rb, ch, mid)?;
-            up.push((convtr, res));
+        let conv_in = Conv::load(&dec, "0.conv", true)?;
+        let mut up = Vec::new();
+        let mut idx = 2;
+        while dec.contains(&format!("{idx}.convtr.weight")) {
+            up.push((
+                Conv::load_tr(&dec, &format!("{idx}.convtr"))?,
+                ResBlock::load(&dec, idx + 1)?,
+            ));
+            idx += 3;
         }
-        let conv_out = Conv::load(&dec, "11.conv", (1, 64, 3), true)?;
-
+        let conv_out = Conv::load(&dec, &format!("{idx}.conv"), true)?;
         Ok(Self {
             output_proj,
             upsample,
@@ -283,37 +307,51 @@ impl MimiDecoder {
             up,
             conv_out,
             device,
-            n_head: 8,
         })
     }
 
-    /// `latent: [32, T]` (single batch, conv layout) -> waveform `[T*1920]`.
+    /// Latent channels one frame carries.
+    pub fn latent_dim(&self) -> Result<usize> {
+        Ok(self.output_proj.shape().dims3()?.1)
+    }
+
+    /// Audio samples one latent frame decodes to: the product of every upsampling stride.
+    pub fn frame_samples(&self) -> Result<usize> {
+        let mut n = self.upsample.shape().dims3()?.2 / 2;
+        for (convtr, _) in &self.up {
+            n *= convtr.resampling_stride()?;
+        }
+        Ok(n)
+    }
+
+    /// `latent: [latent, T]` (single batch, conv layout) -> waveform `[T*frame_samples]`.
     pub fn decode(&self, latent: &Tensor) -> Result<Vec<f32>> {
         let (c, t) = latent.shape().dims2()?;
-        debug_assert_eq!(c, LATENT_DIM);
+        debug_assert_eq!(c, self.latent_dim()?);
         let x = latent.reshape((1, c, t))?;
-        // 32 -> 512 (k1 conv = DummyQuantizer.output_proj), then the codec decode path.
+        // latent -> codec width (k1 conv = DummyQuantizer.output_proj), then the codec path.
         let x = causal_conv1d(&x, &self.output_proj, None, 1, 1, 1)?;
         self.decode_from_codec(&x)
     }
 
-    /// Decode from the 512-dim codec embedding `[1,512,T@12.5Hz]` (post-quantizer):
-    /// depthwise upsample x16 -> decoder transformer -> SEANet -> 24 kHz waveform.
+    /// Decode from the codec embedding `[1, codec, T]` (post-quantizer):
+    /// depthwise upsample -> decoder transformer -> SEANet -> 24 kHz waveform.
     pub fn decode_from_codec(&self, emb: &Tensor) -> Result<Vec<f32>> {
-        let mut x = causal_convtr1d(emb, &self.upsample, None, 16, CODEC_DIM)?; // [1,512,16T]
+        let (codec, up_k) = {
+            let (c, _, k) = self.upsample.shape().dims3()?;
+            (c, k)
+        };
+        let mut x = causal_convtr1d(emb, &self.upsample, None, up_k / 2, codec)?;
         let s = x.shape().dims3()?.2;
-        let mut h = x.reshape((CODEC_DIM, s))?.transpose(0, 1)?.contiguous()?; // [S,512]
+        let mut h = x.reshape((codec, s))?.transpose(0, 1)?.contiguous()?; // [S,codec]
         for l in &self.xf {
-            h = l.forward(&h, CODEC_DIM, self.n_head, &self.device)?;
+            h = l.forward(&h, &self.device)?;
         }
-        x = h
-            .transpose(0, 1)?
-            .contiguous()?
-            .reshape((1, CODEC_DIM, s))?;
+        x = h.transpose(0, 1)?.contiguous()?.reshape((1, codec, s))?;
         x = causal_conv1d(&x, &self.conv_in.w, self.conv_in.b.as_ref(), 1, 1, 1)?;
         for (convtr, res) in &self.up {
             x = elu(&x)?;
-            let stride = convtr.w.shape().dims3()?.2.div_ceil(2); // k = 2*stride
+            let stride = convtr.resampling_stride()?;
             x = causal_convtr1d(&x, &convtr.w, convtr.b.as_ref(), stride, 1)?;
             x = res.forward(&x)?;
         }
@@ -324,15 +362,15 @@ impl MimiDecoder {
     }
 }
 
-/// Mimi encoder (waveform -> 512-dim codec embedding @12.5 Hz) - for the decoder
+/// Mimi encoder (waveform -> codec embedding at the frame rate) - for the decoder
 /// round-trip diagnostic and the speaker conditioning.
 pub struct MimiEncoder {
     conv0: Conv,
-    res: Vec<ResBlock>, // 3 residual blocks (after conv0, and after each downsample)
-    down: Vec<Conv>,    // 3 strided downsample convs (ratios 4,5,6)
-    conv_final: Conv,   // model.11 [512,512,3]
-    xf: Vec<XfLayer>,   // 2 encoder-transformer layers
-    downsample: Tensor, // [512,512,32] stride16
+    /// Per SEANet stage: a residual block, then a strided downsample conv.
+    stages: Vec<(ResBlock, Conv)>,
+    conv_final: Conv,
+    xf: Vec<XfLayer>,   // encoder-transformer layers
+    downsample: Tensor, // [codec, codec, k] stride k/2
     device: Device,
 }
 impl MimiEncoder {
@@ -340,29 +378,30 @@ impl MimiEncoder {
         let vb = unsafe { VarBuilder::from_files(&[path], crate::tensor::DType::F32, &device)? };
         let mimi = vb.pp("mimi");
         let enc = mimi.pp("encoder.model");
-        let conv0 = Conv::load(&enc, "0.conv", (64, 1, 7), true)?;
-        // (resblock idx, ch, mid), (downsample idx, in, out, k)
-        let res = vec![
-            ResBlock::load(&enc, 1, 64, 32)?,
-            ResBlock::load(&enc, 4, 128, 64)?,
-            ResBlock::load(&enc, 7, 256, 128)?,
-        ];
-        let down = vec![
-            Conv::load(&enc, "3.conv", (128, 64, 8), true)?,
-            Conv::load(&enc, "6.conv", (256, 128, 10), true)?,
-            Conv::load(&enc, "9.conv", (512, 256, 12), true)?,
-        ];
-        let conv_final = Conv::load(&enc, "11.conv", (512, 512, 3), true)?;
-        let xt = mimi.pp("encoder_transformer.transformer");
-        let mut xf = Vec::with_capacity(2);
-        for i in 0..2 {
-            xf.push(XfLayer::load(&xt, i, CODEC_DIM, 2048, true, Some(250))?);
+        let conv0 = Conv::load(&enc, "0.conv", true)?;
+        // Each stage is a residual block, an ELU and a strided conv (three entries); the
+        // final conv follows the last stage's ELU.
+        let mut stages = Vec::new();
+        let mut idx = 1;
+        while enc.contains(&format!("{idx}.block.1.conv.weight")) {
+            stages.push((
+                ResBlock::load(&enc, idx)?,
+                Conv::load(&enc, &format!("{}.conv", idx + 2), true)?,
+            ));
+            idx += 3;
         }
-        let downsample = mimi.get((CODEC_DIM, CODEC_DIM, 32), "downsample.conv.conv.weight")?;
+        let conv_final = Conv::load(&enc, &format!("{}.conv", idx + 1), true)?;
+        let xf = XfLayer::stack(
+            &mimi.pp("encoder_transformer.transformer"),
+            MIMI_HEADS,
+            true,
+            Some(MIMI_WINDOW),
+        )?;
+        let down_name = "downsample.conv.conv.weight";
+        let downsample = mimi.get(mimi.shape_of(down_name)?, down_name)?;
         Ok(Self {
             conv0,
-            res,
-            down,
+            stages,
             conv_final,
             xf,
             downsample,
@@ -370,28 +409,25 @@ impl MimiEncoder {
         })
     }
 
-    /// `samples`: mono f32 @24 kHz -> codec embedding `[1,512,T@12.5Hz]`.
+    /// `samples`: mono f32 @24 kHz -> codec embedding `[1, codec, T]` at the frame rate.
     pub fn encode(&self, samples: &[f32]) -> Result<Tensor> {
-        // Pad to a whole number of frames (frame_size = sample_rate/frame_rate = 1920)
-        // so the last conv window is full - mirrors `pad_for_conv1d` in encode_to_latent.
-        const FRAME_SIZE: usize = 1920;
+        // Pad to a whole number of frames (the product of every stride) so the last conv
+        // window is full - mirrors `pad_for_conv1d` in encode_to_latent.
+        let down_stride = self.downsample.shape().dims3()?.2 / 2;
+        let mut frame_size = down_stride;
+        for (_, conv) in &self.stages {
+            frame_size *= conv.resampling_stride()?;
+        }
         let mut buf = samples.to_vec();
-        let t = buf.len().div_ceil(FRAME_SIZE) * FRAME_SIZE;
+        let t = buf.len().div_ceil(frame_size) * frame_size;
         buf.resize(t, 0.0);
         let mut x = Tensor::from_vec_f32(buf, (1, 1, t))?.to_device(&self.device)?;
         x = causal_conv1d(&x, &self.conv0.w, self.conv0.b.as_ref(), 1, 1, 1)?;
-        let strides = [4usize, 5, 6];
-        for i in 0..3 {
-            x = self.res[i].forward(&x)?;
+        for (res, down) in &self.stages {
+            x = res.forward(&x)?;
             x = elu(&x)?;
-            x = causal_conv1d(
-                &x,
-                &self.down[i].w,
-                self.down[i].b.as_ref(),
-                strides[i],
-                1,
-                1,
-            )?;
+            let stride = down.resampling_stride()?;
+            x = causal_conv1d(&x, &down.w, down.b.as_ref(), stride, 1, 1)?;
         }
         x = elu(&x)?;
         x = causal_conv1d(&x, &self.conv_final.w, self.conv_final.b.as_ref(), 1, 1, 1)?;
@@ -399,25 +435,22 @@ impl MimiEncoder {
             // ConvDownsample1d uses pad_mode="replicate": left-pad with the first
             // frame repeated (not zeros), then strided conv.
             let k = w.shape().dims3()?.2;
-            let pad = k - 16; // (k-1)+1-stride, stride=16
+            let pad = k - down_stride; // (k-1)+1-stride
             let first = x.narrow(2, 0, 1)?; // [1,C,1]
             let reps: Vec<&Tensor> = std::iter::repeat_n(&first, pad).collect();
             let mut parts = reps;
             parts.push(x);
             let xp = Tensor::cat(&parts, 2)?;
-            xp.conv1d(w, 0, 16, 1, 1)
+            xp.conv1d(w, 0, down_stride, 1, 1)
         };
         // encoder transformer
-        let s = x.shape().dims3()?.2;
-        let mut h = x.reshape((CODEC_DIM, s))?.transpose(0, 1)?.contiguous()?;
+        let (_, codec, s) = x.shape().dims3()?;
+        let mut h = x.reshape((codec, s))?.transpose(0, 1)?.contiguous()?;
         for l in &self.xf {
-            h = l.forward(&h, CODEC_DIM, 8, &self.device)?;
+            h = l.forward(&h, &self.device)?;
         }
-        x = h
-            .transpose(0, 1)?
-            .contiguous()?
-            .reshape((1, CODEC_DIM, s))?;
-        // downsample x16 -> 12.5 Hz (replicate padding)
+        x = h.transpose(0, 1)?.contiguous()?.reshape((1, codec, s))?;
+        // downsample to the frame rate (replicate padding)
         downsample_replicate(&x, &self.downsample)
     }
 }
@@ -496,9 +529,9 @@ pub fn load_wav_mono_24k(path: &str) -> std::io::Result<Vec<f32>> {
 
 // ======================= Stage 2: flow_lm (text -> latents) =======================
 
-const DIM: usize = 1024; // flow_lm transformer dim
-const FLOW_DIM: usize = 512; // flow_net hidden
-const FREQ_EMB: usize = 256; // time embedding freq size (freqs len = 128)
+/// The flow_lm transformer's head count, which pocket-tts's published model settings fix
+/// and its checkpoint does not store.
+const FLOW_LM_HEADS: usize = 16;
 const EOS_THRESHOLD: f32 = -4.0;
 const TEMP: f32 = 0.7;
 
@@ -525,34 +558,35 @@ fn rms_norm_alpha(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
 
 /// Sinusoidal timestep embedder: freqs -> cos/sin -> Linear->SiLU->Linear->RMSNorm.
 struct TimeEmbed {
-    freqs: Vec<f32>, // [128]
+    freqs: Vec<f32>, // [half]
     w0: Tensor,
-    b0: Tensor, // [512,256],[512]
+    b0: Tensor, // [flow, 2*half],[flow]
     w2: Tensor,
-    b2: Tensor,    // [512,512],[512]
-    alpha: Tensor, // RMSNorm [512]
+    b2: Tensor,    // [flow,flow],[flow]
+    alpha: Tensor, // RMSNorm [flow]
 }
 impl TimeEmbed {
-    fn load(vb: &VarBuilder) -> Result<Self> {
-        let half = FREQ_EMB / 2; // 128
+    fn load(vb: &VarBuilder, flow: usize) -> Result<Self> {
+        let half = vb.shape_of("freqs")?[0];
         Ok(Self {
             freqs: vb.get(half, "freqs")?.to_vec1_f32()?,
-            w0: vb.get((FLOW_DIM, FREQ_EMB), "mlp.0.weight")?,
-            b0: vb.get(FLOW_DIM, "mlp.0.bias")?,
-            w2: vb.get((FLOW_DIM, FLOW_DIM), "mlp.2.weight")?,
-            b2: vb.get(FLOW_DIM, "mlp.2.bias")?,
-            alpha: vb.get(FLOW_DIM, "mlp.3.alpha")?,
+            w0: vb.get((flow, 2 * half), "mlp.0.weight")?,
+            b0: vb.get(flow, "mlp.0.bias")?,
+            w2: vb.get((flow, flow), "mlp.2.weight")?,
+            b2: vb.get(flow, "mlp.2.bias")?,
+            alpha: vb.get(flow, "mlp.3.alpha")?,
         })
     }
     fn forward(&self, t: f32, dev: &Device) -> Result<Tensor> {
-        // emb = cat(cos(t*freqs), sin(t*freqs)) -> [1,256]
-        let mut emb = vec![0f32; FREQ_EMB];
+        // emb = cat(cos(t*freqs), sin(t*freqs)) -> [1, 2*half]
         let half = self.freqs.len();
+        let width = 2 * half;
+        let mut emb = vec![0f32; width];
         for (i, &f) in self.freqs.iter().enumerate() {
             emb[i] = (t * f).cos();
             emb[half + i] = (t * f).sin();
         }
-        let e = Tensor::from_vec_f32(emb, (1, FREQ_EMB))?.to_device(dev)?;
+        let e = Tensor::from_vec_f32(emb, (1, width))?.to_device(dev)?;
         let h = linear_b(&e, &self.w0, &self.b0)?.silu()?;
         let h = linear_b(&h, &self.w2, &self.b2)?;
         rms_norm_alpha(&h, &self.alpha, 1e-5)
@@ -568,26 +602,29 @@ struct FlowResBlock {
     mlp2_w: Tensor,
     mlp2_b: Tensor,
     ada_w: Tensor,
-    ada_b: Tensor, // [1536,512],[1536]
+    ada_b: Tensor, // [3*flow,flow],[3*flow]
+    flow: usize,
 }
 impl FlowResBlock {
-    fn load(vb: &VarBuilder) -> Result<Self> {
+    fn load(vb: &VarBuilder, flow: usize) -> Result<Self> {
         Ok(Self {
-            in_ln_w: vb.get(FLOW_DIM, "in_ln.weight")?,
-            in_ln_b: vb.get(FLOW_DIM, "in_ln.bias")?,
-            mlp0_w: vb.get((FLOW_DIM, FLOW_DIM), "mlp.0.weight")?,
-            mlp0_b: vb.get(FLOW_DIM, "mlp.0.bias")?,
-            mlp2_w: vb.get((FLOW_DIM, FLOW_DIM), "mlp.2.weight")?,
-            mlp2_b: vb.get(FLOW_DIM, "mlp.2.bias")?,
-            ada_w: vb.get((3 * FLOW_DIM, FLOW_DIM), "adaLN_modulation.1.weight")?,
-            ada_b: vb.get(3 * FLOW_DIM, "adaLN_modulation.1.bias")?,
+            in_ln_w: vb.get(flow, "in_ln.weight")?,
+            in_ln_b: vb.get(flow, "in_ln.bias")?,
+            mlp0_w: vb.get((flow, flow), "mlp.0.weight")?,
+            mlp0_b: vb.get(flow, "mlp.0.bias")?,
+            mlp2_w: vb.get((flow, flow), "mlp.2.weight")?,
+            mlp2_b: vb.get(flow, "mlp.2.bias")?,
+            ada_w: vb.get((3 * flow, flow), "adaLN_modulation.1.weight")?,
+            ada_b: vb.get(3 * flow, "adaLN_modulation.1.bias")?,
+            flow,
         })
     }
     fn forward(&self, x: &Tensor, y: &Tensor) -> Result<Tensor> {
-        let m = linear_b(&y.silu()?, &self.ada_w, &self.ada_b)?; // [1,1536]
-        let shift = m.narrow(1, 0, FLOW_DIM)?;
-        let scale = m.narrow(1, FLOW_DIM, FLOW_DIM)?;
-        let gate = m.narrow(1, 2 * FLOW_DIM, FLOW_DIM)?;
+        let flow = self.flow;
+        let m = linear_b(&y.silu()?, &self.ada_w, &self.ada_b)?; // [1,3*flow]
+        let shift = m.narrow(1, 0, flow)?;
+        let scale = m.narrow(1, flow, flow)?;
+        let gate = m.narrow(1, 2 * flow, flow)?;
         let h = x.layer_norm(&self.in_ln_w, Some(&self.in_ln_b), 1e-6)?;
         let h = modulate(&h, &shift, &scale)?;
         let h = linear_b(&h, &self.mlp0_w, &self.mlp0_b)?.silu()?;
@@ -599,59 +636,75 @@ impl FlowResBlock {
 /// flow_net (SimpleMLPAdaLN): velocity field for the flow-matching latent.
 struct FlowNet {
     input_proj_w: Tensor,
-    input_proj_b: Tensor, // [512,32]
+    input_proj_b: Tensor, // [flow,latent]
     cond_w: Tensor,
-    cond_b: Tensor,            // [512,1024]
-    time: Vec<TimeEmbed>,      // 2
-    blocks: Vec<FlowResBlock>, // 6
-    fnorm_ones: Tensor,        // ones[512] for no-affine norm_final
+    cond_b: Tensor, // [flow,dim]
+    time: Vec<TimeEmbed>,
+    blocks: Vec<FlowResBlock>,
+    fnorm_ones: Tensor, // ones[flow] for no-affine norm_final
     flin_ada_w: Tensor,
-    flin_ada_b: Tensor, // [1024,512]
+    flin_ada_b: Tensor, // [2*flow,flow]
     flin_w: Tensor,
-    flin_b: Tensor, // [32,512]
+    flin_b: Tensor, // [latent,flow]
+    flow: usize,
     device: Device,
 }
 impl FlowNet {
     fn load(vb: &VarBuilder, device: Device) -> Result<Self> {
-        let mut time = Vec::with_capacity(2);
-        for i in 0..2 {
-            time.push(TimeEmbed::load(&vb.pp(format!("time_embed.{i}")))?);
-        }
-        let mut blocks = Vec::with_capacity(6);
-        for i in 0..6 {
-            blocks.push(FlowResBlock::load(&vb.pp(format!("res_blocks.{i}")))?);
-        }
+        let [flow, latent] = vb.shape_of("input_proj.weight")?[..] else {
+            return Err(crate::tensor::Error(
+                "pocket-tts: input_proj is not a matrix".into(),
+            ));
+        };
+        let dim = vb.shape_of("cond_embed.weight")?[1];
+        let time = (0..vb.count_children("time_embed"))
+            .map(|i| TimeEmbed::load(&vb.pp(format!("time_embed.{i}")), flow))
+            .collect::<Result<Vec<_>>>()?;
+        let blocks = (0..vb.count_children("res_blocks"))
+            .map(|i| FlowResBlock::load(&vb.pp(format!("res_blocks.{i}")), flow))
+            .collect::<Result<Vec<_>>>()?;
         let fl = vb.pp("final_layer");
         Ok(Self {
-            input_proj_w: vb.get((FLOW_DIM, LATENT_DIM), "input_proj.weight")?,
-            input_proj_b: vb.get(FLOW_DIM, "input_proj.bias")?,
-            cond_w: vb.get((FLOW_DIM, DIM), "cond_embed.weight")?,
-            cond_b: vb.get(FLOW_DIM, "cond_embed.bias")?,
+            input_proj_w: vb.get((flow, latent), "input_proj.weight")?,
+            input_proj_b: vb.get(flow, "input_proj.bias")?,
+            cond_w: vb.get((flow, dim), "cond_embed.weight")?,
+            cond_b: vb.get(flow, "cond_embed.bias")?,
             time,
             blocks,
-            fnorm_ones: Tensor::from_vec_f32(vec![1f32; FLOW_DIM], FLOW_DIM)?.to_device(&device)?,
-            flin_ada_w: fl.get((2 * FLOW_DIM, FLOW_DIM), "adaLN_modulation.1.weight")?,
-            flin_ada_b: fl.get(2 * FLOW_DIM, "adaLN_modulation.1.bias")?,
-            flin_w: fl.get((LATENT_DIM, FLOW_DIM), "linear.weight")?,
-            flin_b: fl.get(LATENT_DIM, "linear.bias")?,
+            fnorm_ones: Tensor::from_vec_f32(vec![1f32; flow], flow)?.to_device(&device)?,
+            flin_ada_w: fl.get((2 * flow, flow), "adaLN_modulation.1.weight")?,
+            flin_ada_b: fl.get(2 * flow, "adaLN_modulation.1.bias")?,
+            flin_w: fl.get((latent, flow), "linear.weight")?,
+            flin_b: fl.get(latent, "linear.bias")?,
+            flow,
             device,
         })
     }
-    /// velocity `[1,32]` given conditioning `c [1,1024]`, times s,t, latent `x [1,32]`.
+    /// velocity `[1,latent]` given conditioning `c [1,dim]`, times s,t, latent `x [1,latent]`.
     fn velocity(&self, c: &Tensor, s: f32, t: f32, x: &Tensor) -> Result<Tensor> {
-        let mut h = linear_b(x, &self.input_proj_w, &self.input_proj_b)?; // [1,512]
-        let te0 = self.time[0].forward(s, &self.device)?;
-        let te1 = self.time[1].forward(t, &self.device)?;
-        let tc = te0.add(&te1)?.affine(0.5, 0.0)?;
+        let mut h = linear_b(x, &self.input_proj_w, &self.input_proj_b)?; // [1,flow]
+                                                                          // The time embedders take the two ends of the step in turn, and their mean
+                                                                          // conditions the net.
+        let mut tc: Option<Tensor> = None;
+        for (embed, at) in self.time.iter().zip([s, t]) {
+            let e = embed.forward(at, &self.device)?;
+            tc = Some(match tc {
+                None => e,
+                Some(acc) => acc.add(&e)?,
+            });
+        }
+        let tc = tc
+            .ok_or_else(|| crate::tensor::Error("pocket-tts: no time embedder".into()))?
+            .affine(1.0 / self.time.len() as f32, 0.0)?;
         let ce = linear_b(c, &self.cond_w, &self.cond_b)?;
-        let y = tc.add(&ce)?; // [1,512]
+        let y = tc.add(&ce)?; // [1,flow]
         for b in &self.blocks {
             h = b.forward(&h, &y)?;
         }
         // final layer (norm_final has no affine)
-        let m = linear_b(&y.silu()?, &self.flin_ada_w, &self.flin_ada_b)?; // [1,1024]
-        let shift = m.narrow(1, 0, FLOW_DIM)?;
-        let scale = m.narrow(1, FLOW_DIM, FLOW_DIM)?;
+        let m = linear_b(&y.silu()?, &self.flin_ada_w, &self.flin_ada_b)?; // [1,2*flow]
+        let shift = m.narrow(1, 0, self.flow)?;
+        let scale = m.narrow(1, self.flow, self.flow)?;
         let hn = h.layer_norm(&self.fnorm_ones, None, 1e-6)?;
         let hn = modulate(&hn, &shift, &scale)?;
         linear_b(&hn, &self.flin_w, &self.flin_b)
@@ -705,19 +758,21 @@ fn gauss_noise(n: usize, std: f32, rng: &mut rand::rngs::StdRng) -> Vec<f32> {
 /// The full pocket-tts model: flow_lm (text -> normalized latents) + Mimi decoder.
 pub struct PocketTts {
     // flow_lm
-    embed: Tensor,        // [4001,1024] text token embedding
-    input_linear: Tensor, // [1024,32]
-    xf: Vec<XfLayer>,     // 6 transformer layers (no LayerScale)
+    embed: Tensor,        // [vocab,dim] text token embedding
+    input_linear: Tensor, // [dim,latent]
+    xf: Vec<XfLayer>,     // transformer layers (no LayerScale)
     out_norm_w: Tensor,
     out_norm_b: Tensor,
     out_eos_w: Tensor,
-    out_eos_b: Tensor,    // [1,1024],[1]
-    bos_emb: Tensor,      // [32]
-    emb_mean: Vec<f32>,   // [32]
-    emb_std: Vec<f32>,    // [32]
-    speaker_proj: Tensor, // [1024,512] voice conditioning projection
+    out_eos_b: Tensor,    // [1,dim],[1]
+    bos_emb: Tensor,      // [latent]
+    emb_mean: Vec<f32>,   // [latent]
+    emb_std: Vec<f32>,    // [latent]
+    speaker_proj: Tensor, // [dim,codec] voice conditioning projection
     flow: FlowNet,
     mimi: MimiDecoder,
+    /// Channels of one latent frame.
+    latent: usize,
     device: Device,
 }
 
@@ -725,41 +780,45 @@ impl PocketTts {
     pub fn from_safetensors(path: &str, device: Device) -> Result<Self> {
         let vb = unsafe { VarBuilder::from_files(&[path], crate::tensor::DType::F32, &device)? };
         let f = vb.pp("flow_lm");
-        let mut xf = Vec::with_capacity(6);
-        let xt = f.pp("transformer");
-        for i in 0..6 {
-            xf.push(XfLayer::load(&xt, i, DIM, 4096, false, None)?);
-        }
+        let xf = XfLayer::stack(&f.pp("transformer"), FLOW_LM_HEADS, false, None)?;
         let flow = FlowNet::load(&f.pp("flow_net"), device.clone())?;
         let mimi = MimiDecoder::from_safetensors(path, device.clone())?;
+        let [dim, latent] = f.shape_of("input_linear.weight")?[..] else {
+            return Err(crate::tensor::Error(
+                "pocket-tts: input_linear is not a matrix".into(),
+            ));
+        };
+        let vocab = f.shape_of("conditioner.embed.weight")?[0];
+        let codec = f.shape_of("speaker_proj_weight")?[1];
         Ok(Self {
-            embed: f.get((4001, DIM), "conditioner.embed.weight")?,
-            input_linear: f.get((DIM, LATENT_DIM), "input_linear.weight")?,
+            embed: f.get((vocab, dim), "conditioner.embed.weight")?,
+            input_linear: f.get((dim, latent), "input_linear.weight")?,
             xf,
-            out_norm_w: f.get(DIM, "out_norm.weight")?,
-            out_norm_b: f.get(DIM, "out_norm.bias")?,
-            out_eos_w: f.get((1, DIM), "out_eos.weight")?,
+            out_norm_w: f.get(dim, "out_norm.weight")?,
+            out_norm_b: f.get(dim, "out_norm.bias")?,
+            out_eos_w: f.get((1, dim), "out_eos.weight")?,
             out_eos_b: f.get(1, "out_eos.bias")?,
-            bos_emb: f.get(LATENT_DIM, "bos_emb")?,
-            emb_mean: f.get(LATENT_DIM, "emb_mean")?.to_vec1_f32()?,
-            emb_std: f.get(LATENT_DIM, "emb_std")?.to_vec1_f32()?,
-            speaker_proj: f.get((DIM, CODEC_DIM), "speaker_proj_weight")?,
+            bos_emb: f.get(latent, "bos_emb")?,
+            emb_mean: f.get(latent, "emb_mean")?.to_vec1_f32()?,
+            emb_std: f.get(latent, "emb_std")?.to_vec1_f32()?,
+            speaker_proj: f.get((dim, codec), "speaker_proj_weight")?,
             flow,
             mimi,
+            latent,
             device,
         })
     }
 
-    /// Build a voice conditioning `[T_spk, 1024]` from a 24 kHz mono reference clip:
+    /// Build a voice conditioning `[T_spk, dim]` from a 24 kHz mono reference clip:
     /// `speaker_proj( mimi_encode(ref) )`.
     pub fn voice_from_audio(&self, enc: &MimiEncoder, samples: &[f32]) -> Result<Tensor> {
-        let emb = enc.encode(samples)?; // [1,512,T]
+        let emb = enc.encode(samples)?; // [1,codec,T]
         let (_, c, t) = emb.shape().dims3()?;
-        let lat = emb.reshape((c, t))?.transpose(0, 1)?.contiguous()?; // [T,512]
-        lat.matmul_t(&self.speaker_proj) // [T,1024]
+        let lat = emb.reshape((c, t))?.transpose(0, 1)?.contiguous()?; // [T,codec]
+        lat.matmul_t(&self.speaker_proj) // [T,dim]
     }
 
-    /// Embed text token ids -> `[T,1024]`.
+    /// Embed text token ids -> `[T,dim]`.
     fn embed_text(&self, ids: &[u32]) -> Result<Tensor> {
         let rows: Vec<Tensor> = ids
             .iter()
@@ -769,14 +828,14 @@ impl PocketTts {
         Tensor::cat(&refs, 0)
     }
 
-    /// Run the 6-layer transformer over `seq [S,1024]`, return out_norm of the last row `[1,1024]`.
+    /// Run the transformer over `seq [S,dim]`, return out_norm of the last row `[1,dim]`.
     fn backbone_last(&self, seq: &Tensor) -> Result<Tensor> {
         let mut h = seq.clone();
         for l in &self.xf {
-            h = l.forward(&h, DIM, 16, &self.device)?;
+            h = l.forward(&h, &self.device)?;
         }
         let s = h.shape().dims2()?.0;
-        let last = h.narrow(0, s - 1, 1)?; // [1,1024]
+        let last = h.narrow(0, s - 1, 1)?; // [1,dim]
         last.layer_norm(&self.out_norm_w, Some(&self.out_norm_b), LN_EPS)
     }
 
@@ -793,11 +852,11 @@ impl PocketTts {
     ) -> Result<Vec<Vec<f32>>> {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let text_emb = self.embed_text(text_ids)?; // [T,1024]
+        let text_emb = self.embed_text(text_ids)?; // [T,dim]
                                                    // audio token rows projected to transformer space; first = input_linear(bos).
         let mut audio_rows: Vec<Tensor> = vec![self
             .bos_emb
-            .reshape((1, LATENT_DIM))?
+            .reshape((1, self.latent))?
             .matmul_t(&self.input_linear)?];
         let mut latents: Vec<Vec<f32>> = Vec::new();
         let mut eos_step: Option<usize> = None;
@@ -817,7 +876,7 @@ impl PocketTts {
                 parts.push(r);
             }
             let seq = Tensor::cat(&parts, 0)?;
-            let c = self.backbone_last(&seq)?; // [1,1024]
+            let c = self.backbone_last(&seq)?; // [1,dim]
                                                // EOS
             let eos = linear_b(&c, &self.out_eos_w, &self.out_eos_b)?
                 .flatten_all()?
@@ -826,11 +885,11 @@ impl PocketTts {
                 eos_step = Some(step);
             }
             // flow-matching: 1 Euler step from noise N(0, temp)
-            let noise = gauss_noise(LATENT_DIM, TEMP.sqrt(), &mut rng);
-            let x0 = Tensor::from_vec_f32(noise, (1, LATENT_DIM))?.to_device(&self.device)?;
+            let noise = gauss_noise(self.latent, TEMP.sqrt(), &mut rng);
+            let x0 = Tensor::from_vec_f32(noise, (1, self.latent))?.to_device(&self.device)?;
             let v = self.flow.velocity(&c, 0.0, 1.0, &x0)?;
-            let latent = x0.add(&v)?; // normalized latent [1,32]
-            latents.push(latent.reshape((LATENT_DIM,))?.to_vec1_f32()?);
+            let latent = x0.add(&v)?; // normalized latent [1,latent]
+            latents.push(latent.reshape((self.latent,))?.to_vec1_f32()?);
             // next input
             audio_rows.push(latent.matmul_t(&self.input_linear)?);
             if let Some(es) = eos_step {
@@ -859,8 +918,9 @@ impl PocketTts {
     ) -> Result<Vec<f32>> {
         let (clean, fae_auto) = preprocess_text(text);
         let ids = sp.encode(&clean);
-        // Reference cap: ceil((n_tokens/3 + 2) * 12.5 frames/s).
-        let max_frames = (((ids.len() as f32 / 3.0) + 2.0) * 12.5).ceil() as usize;
+        // Reference cap: ceil((n_tokens/3 + 2) * frames/s).
+        let frame_rate = SAMPLE_RATE as f32 / self.mimi.frame_samples()? as f32;
+        let max_frames = (((ids.len() as f32 / 3.0) + 2.0) * frame_rate).ceil() as usize;
         self.synthesize(
             &ids,
             voice,
@@ -883,15 +943,15 @@ impl PocketTts {
         if latents.is_empty() {
             return Ok(Vec::new());
         }
-        // Denormalize (z*std+mean) and stack into [32, n] (conv layout).
+        // Denormalize (z*std+mean) and stack into [latent, n] (conv layout).
         let n = latents.len();
-        let mut data = vec![0f32; LATENT_DIM * n];
+        let mut data = vec![0f32; self.latent * n];
         for (j, lat) in latents.iter().enumerate() {
-            for c in 0..LATENT_DIM {
+            for c in 0..self.latent {
                 data[c * n + j] = lat[c] * self.emb_std[c] + self.emb_mean[c];
             }
         }
-        let lat = Tensor::from_vec_f32(data, (LATENT_DIM, n))?.to_device(&self.device)?;
+        let lat = Tensor::from_vec_f32(data, (self.latent, n))?.to_device(&self.device)?;
         self.mimi.decode(&lat)
     }
 }
@@ -989,7 +1049,7 @@ mod tests {
         println!("TEXTEMB cosine={:.5}", cosine(&te, &ref_te));
         let bos_row = m
             .bos_emb
-            .reshape((1, LATENT_DIM))
+            .reshape((1, m.latent))
             .unwrap()
             .matmul_t(&m.input_linear)
             .unwrap();
@@ -1008,7 +1068,7 @@ mod tests {
         // raw transformer output (pre out_norm), last row
         let mut h = seq.clone();
         for l in &m.xf {
-            h = l.forward(&h, DIM, 16, &m.device).unwrap();
+            h = l.forward(&h, &m.device).unwrap();
         }
         let s = h.shape().dims2().unwrap().0;
         let tr_last = h
@@ -1028,7 +1088,7 @@ mod tests {
             .unwrap();
         let mut h2 = rseq;
         for l in &m.xf {
-            h2 = l.forward(&h2, DIM, 16, &m.device).unwrap();
+            h2 = l.forward(&h2, &m.device).unwrap();
         }
         let s2 = h2.shape().dims2().unwrap().0;
         let tr2 = h2
@@ -1044,7 +1104,7 @@ mod tests {
         let (ref_c, _) = load_bin("/tmp/ref_c.bin");
         println!("C       cosine={:.5}", cosine(&cv, &ref_c));
         // flow_net velocity at x0=0, s=0, t=1
-        let x0 = Tensor::from_vec_f32(vec![0f32; LATENT_DIM], (1, LATENT_DIM)).unwrap();
+        let x0 = Tensor::from_vec_f32(vec![0f32; m.latent], (1, m.latent)).unwrap();
         let v = m.flow.velocity(&c, 0.0, 1.0, &x0).unwrap();
         let vvel = v.flatten_all().unwrap().to_vec1_f32().unwrap();
         let (ref_vel, _) = load_bin("/tmp/ref_velocity.bin");
@@ -1151,7 +1211,8 @@ mod tests {
         let dec = MimiDecoder::from_safetensors(ckpt().to_str().unwrap(), dev).unwrap();
         // A short random latent -> audio of the expected length, finite samples.
         let t = 25usize; // 2 s @ 12.5 Hz
-        let latent = Tensor::from_vec_f32(vec![0.0f32; LATENT_DIM * t], (LATENT_DIM, t)).unwrap();
+        let latent_dim = dec.latent_dim().unwrap();
+        let latent = Tensor::from_vec_f32(vec![0.0f32; latent_dim * t], (latent_dim, t)).unwrap();
         let wav = dec.decode(&latent).unwrap();
         assert_eq!(wav.len(), t * 1920, "1920x upsampling (12.5 Hz -> 24 kHz)");
         assert!(wav.iter().all(|v| v.is_finite()), "no NaN/Inf in output");
