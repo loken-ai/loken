@@ -447,6 +447,11 @@ impl APIServer {
                 None => return Ok(()),
             }
         };
+        // A window the engine already has needs nothing; answering that first keeps the
+        // file's header, which `declared_context` parses, off the path of every request.
+        if want <= current {
+            return Ok(());
+        }
         // The model cannot open a window past what its checkpoint declares, so a larger
         // request is clamped there before it can cost a reload that would change nothing.
         let want = match self.declared_context(model_id) {
