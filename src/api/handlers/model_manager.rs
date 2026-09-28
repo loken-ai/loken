@@ -436,10 +436,11 @@ impl APIServer {
         model_id: &str,
         want: usize,
     ) -> Result<(), ApiError> {
-        let (current, current_quant, had_keep_alive) = {
+        let (engine, current, current_quant, had_keep_alive) = {
             let engines = self.engines.read().await;
             match engines.iter().find(|e| e.model_id == model_id) {
                 Some(entry) => (
+                    entry.engine.clone(),
                     entry.engine.config().context_length,
                     entry.engine.config().kv_quant,
                     entry.keep_alive_minutes,
@@ -450,6 +451,15 @@ impl APIServer {
         // A window the engine already has needs nothing; answering that first keeps the
         // file's header, which `declared_context` parses, off the path of every request.
         if want <= current {
+            return Ok(());
+        }
+        // A configured context of zero opens the window the model declares, which the
+        // loaded engine reports.
+        if engine
+            .context_window()
+            .await
+            .is_some_and(|open| want <= open)
+        {
             return Ok(());
         }
         // The model cannot open a window past what its checkpoint declares, so a larger
@@ -847,7 +857,10 @@ impl APIServer {
                     .max()
                     .unwrap_or(0)
             } else {
-                cards.iter().map(|g| g.available.saturating_sub(per_card)).sum()
+                cards
+                    .iter()
+                    .map(|g| g.available.saturating_sub(per_card))
+                    .sum()
             };
             if need <= free {
                 return;
