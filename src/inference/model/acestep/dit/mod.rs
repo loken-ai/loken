@@ -160,7 +160,6 @@ pub fn adaln_gate(y: &[f32], gate: &[f32], c: usize, t: usize) -> Vec<f32> {
 // Weights held as dequantized f32 Tensors (Q8_0/BF16 -> F32 at load), in the
 // substrate's row-major layout: Linear weight `[out, in]` (apply as `x.matmul(w.t())`).
 use crate::inference::model::acestep::fsq::in_heads;
-use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
 use crate::tensor::layer::qlinear::{QLinear, Weight};
 use crate::tensor::lora::LoraDelta;
 use crate::tensor::{Device, Tensor};
@@ -365,12 +364,8 @@ impl DitModel {
         let patch = mu("acestep.patch_size", 2);
         let sliding_window = mu("acestep.sliding_window", 128);
         let rope_theta = mf("acestep-dit.rope.freq_base", 1e6);
-        // Standard placement (same mechanism as every other model): a HeteroPlan over
-        // the 24 blocks from real free VRAM (pack-first on the fastest GPU, else split,
-        // remainder -> CPU). The inter-block activation is a host Vec<f32>, so a
-        // CPU-spilled / second-GPU block needs no extra transfer code. No KV cache (the
-        // DiT runs full-sequence, not autoregressive) -> kv reserve 0.
-        // Placement budgets against the REAL device footprint. The per-block linears (the
+        // The inter-block activation moves to each block's device, so a block on the host or
+        // on a second card needs no extra transfer code. Placement budgets against the REAL device footprint. The per-block linears (the
         // parameter mass) now stay QUANTIZED on device (QMatMul) and dequantize on the fly in
         // the matmul kernel, so the footprint is the quantized byte size - not a 4x F32 blow-up.
         // Budgeting on the quantized size lets the planner pack the compact model (a 4B-class
@@ -395,151 +390,165 @@ impl DitModel {
         let ffn = mu("acestep-dit.feed_forward_length", 6144);
         let reserve: u64 =
             crate::inference::place::audio_demand::dit_reserve(frames, hidden, n_head, ffn, patch);
-        let cudas = crate::inference::place::vram_manager::probe_under_pressure(reserve);
-        let cuda_budget: Vec<(usize, u64)> = cudas.iter().map(|(i, fr, _)| (*i, *fr)).collect();
-        let plan = HeteroPlan::calculate_with_kv_reserve(
-            // The budgets below ALREADY exclude the reserve: `probe_under_pressure` probes through
-            // `probe_cuda_devices`, which returns `stable_free - reserve`. Passing it again here
-            // subtracted it TWICE - invisible at half a gigabyte, and fatal at twelve, where it
-            // took both cards to zero usable and sent a whole video DiT to the host.
-            n_layers,
-            model_size,
-            &cuda_budget,
-            &[],
-            1.0,
-            0,
-            0,
-        );
-        let dev_of_kind = |k: DeviceKind| -> Device {
-            match k {
-                DeviceKind::Cuda(idx) => cudas
-                    .iter()
-                    .find(|(i, _, _)| *i == idx)
-                    .map(|(_, _, dv)| dv.clone())
-                    .unwrap_or(Device::Cpu),
-                _ => Device::Cpu,
+        // The blocks divide over the cards; what sits beside them goes on the card of the
+        // first block. No KV cache: the DiT runs full-sequence.
+        let demand = crate::inference::place::ladder::Demand {
+            layers: n_layers,
+            block_bytes: model_size,
+            runtime_reserve: reserve,
+            ..Default::default()
+        };
+        crate::inference::place::ladder::load("ACE-Step DiT", &demand, |plan| {
+            let layer_devices = crate::inference::place::ladder::layer_devices(plan, n_layers);
+            let layer_device = |l: usize| -> Device { layer_devices[l].clone() };
+            let device = crate::inference::place::ladder::primary_device(plan);
+            // BLOCKING sync (yield the host core) instead of the default SPIN: the on-device
+            // Euler trajectory hands the GPU a long fixed block sequence per step and then
+            // blocks on a single readback - a spinning sync would peg a core doing nothing
+            // while the GPU runs. Blocking sync lets that core idle. acestep-only, no numerics.
+            #[cfg(feature = "cuda")]
+            if let Device::Cuda(c) = &device {
+                let _ = c.context().set_blocking_synchronize();
             }
-        };
-        let layer_device = |l: usize| -> Device {
-            plan.segments
-                .iter()
-                .find(|s| l >= s.layer_start && l < s.layer_end)
-                .map(|s| dev_of_kind(s.kind))
-                .unwrap_or(Device::Cpu)
-        };
-        let device = cudas
-            .first()
-            .map(|(_, _, dv)| dv.clone())
-            .unwrap_or(Device::Cpu);
-        // BLOCKING sync (yield the host core) instead of the default SPIN: the on-device
-        // Euler trajectory hands the GPU a long fixed block sequence per step and then
-        // blocks on a single readback - a spinning sync would peg a core doing nothing
-        // while the GPU runs. Blocking sync lets that core idle. acestep-only, no numerics.
-        #[cfg(feature = "cuda")]
-        if let Device::Cuda(c) = &device {
-            let _ = c.context().set_blocking_synchronize();
-        }
-        eprintln!("[ace-dit] geometry: hidden={hidden} layers={n_layers} heads={n_head}/{n_kv}kv hd={head_dim} ffn={ffn} in_ch={in_ch} out_ch={out_ch} patch={patch} rope={rope_theta} swa={sliding_window}");
-        eprintln!(
-            "[ace-dit] placement: {}",
-            plan.segments
-                .iter()
-                .map(|s| format!("{}:{}-{}", s.kind, s.layer_start, s.layer_end))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        // QVarBuilder over the same GGUF for the per-block linears (kept quantized on device).
-        // The F32 conv/small weights still load via the `Content`+`File` reader (`dit_load_t`).
-        let vb = crate::inference::cache::qvb::from_gguf_cached(path, &device)?;
-        let ffn = mu("acestep-dit.feed_forward_length", 6144);
-        let (qd, kvd) = (n_head * head_dim, n_kv * head_dim); // q/o dim, k/v dim (GQA)
-        let mut layers = Vec::with_capacity(n_layers);
-        for l in 0..n_layers {
-            // The builder above only MAPS the file; the seconds are spent here, uploading a
-            // block's weights to its device. Nothing in this loader goes through the shared
-            // readers that count themselves, so the render's published reporter received
-            // nothing at all and a caller watched a stage line sit still through the whole
-            // load. Counted per block, like every other transformer in the fleet.
-            crate::inference::serve::progress::scoped::note(
-                crate::inference::serve::progress::phase::LOAD_MODEL,
-                l,
-                n_layers,
+            eprintln!("[ace-dit] geometry: hidden={hidden} layers={n_layers} heads={n_head}/{n_kv}kv hd={head_dim} ffn={ffn} in_ch={in_ch} out_ch={out_ch} patch={patch} rope={rope_theta} swa={sliding_window}");
+            eprintln!(
+                "[ace-dit] placement: {}",
+                plan.segments
+                    .iter()
+                    .map(|s| format!("{}:{}-{}", s.kind, s.layer_start, s.layer_end))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             );
-            crate::inference::serve::cancel::scoped::bail()?;
-            let p = format!("decoder.layers.{l}");
-            let ld = layer_device(l);
-            // Quantized per-block linear `[out,in]` on the block's device (bias=false).
-            let ql = |indim: usize, outdim: usize, nm: &str| -> crate::tensor::Result<QLinear> {
-                Ok(QLinear::new(
-                    Weight::Quant(vb.qmatmul_on(
-                        indim,
-                        outdim,
-                        &format!("{p}.{nm}.weight"),
+            // QVarBuilder over the same GGUF for the per-block linears (kept quantized on device).
+            // The F32 conv/small weights still load via the `Content`+`File` reader (`dit_load_t`).
+            let vb = crate::inference::cache::qvb::from_gguf_cached(path, &device)?;
+            let ffn = mu("acestep-dit.feed_forward_length", 6144);
+            let (qd, kvd) = (n_head * head_dim, n_kv * head_dim); // q/o dim, k/v dim (GQA)
+            let mut layers = Vec::with_capacity(n_layers);
+            for l in 0..n_layers {
+                // The builder above only MAPS the file; the seconds are spent here, uploading a
+                // block's weights to its device. Nothing in this loader goes through the shared
+                // readers that count themselves, so the render's published reporter received
+                // nothing at all and a caller watched a stage line sit still through the whole
+                // load. Counted per block, like every other transformer in the fleet.
+                crate::inference::serve::progress::scoped::note(
+                    crate::inference::serve::progress::phase::LOAD_MODEL,
+                    l,
+                    n_layers,
+                );
+                crate::inference::serve::cancel::scoped::bail()?;
+                let p = format!("decoder.layers.{l}");
+                let ld = layer_device(l);
+                // Quantized per-block linear `[out,in]` on the block's device (bias=false).
+                let ql =
+                    |indim: usize, outdim: usize, nm: &str| -> crate::tensor::Result<QLinear> {
+                        Ok(QLinear::new(
+                            Weight::Quant(vb.qmatmul_on(
+                                indim,
+                                outdim,
+                                &format!("{p}.{nm}.weight"),
+                                &ld,
+                            )?),
+                            None,
+                            indim,
+                            outdim,
+                        ))
+                    };
+                // layer_types alternate sliding/full starting with sliding (even=SWA).
+                layers.push(DitLayer {
+                    self_attn_norm: dit_load_t(
                         &ld,
-                    )?),
-                    None,
-                    indim,
-                    outdim,
-                ))
-            };
-            // layer_types alternate sliding/full starting with sliding (even=SWA).
-            layers.push(DitLayer {
-                self_attn_norm: dit_load_t(&ld, &c, &mut f, &format!("{p}.self_attn_norm.weight"))?,
-                cross_attn_norm: dit_load_t(
-                    &ld,
-                    &c,
-                    &mut f,
-                    &format!("{p}.cross_attn_norm.weight"),
-                )?,
-                mlp_norm: dit_load_t(&ld, &c, &mut f, &format!("{p}.mlp_norm.weight"))?,
-                sa_q: ql(hidden, qd, "self_attn.q_proj")?,
-                sa_k: ql(hidden, kvd, "self_attn.k_proj")?,
-                sa_v: ql(hidden, kvd, "self_attn.v_proj")?,
-                sa_o: ql(qd, hidden, "self_attn.o_proj")?,
-                sa_q_norm: dit_load_t(&ld, &c, &mut f, &format!("{p}.self_attn.q_norm.weight"))?,
-                sa_k_norm: dit_load_t(&ld, &c, &mut f, &format!("{p}.self_attn.k_norm.weight"))?,
-                ca_q: ql(hidden, qd, "cross_attn.q_proj")?,
-                ca_k: ql(hidden, kvd, "cross_attn.k_proj")?,
-                ca_v: ql(hidden, kvd, "cross_attn.v_proj")?,
-                ca_o: ql(qd, hidden, "cross_attn.o_proj")?,
-                ca_q_norm: dit_load_t(&ld, &c, &mut f, &format!("{p}.cross_attn.q_norm.weight"))?,
-                ca_k_norm: dit_load_t(&ld, &c, &mut f, &format!("{p}.cross_attn.k_norm.weight"))?,
-                mlp_gate: ql(hidden, ffn, "mlp.gate_proj")?,
-                mlp_up: ql(hidden, ffn, "mlp.up_proj")?,
-                mlp_down: ql(ffn, hidden, "mlp.down_proj")?,
-                scale_shift_table: dit_load_t(&ld, &c, &mut f, &format!("{p}.scale_shift_table"))?,
-                layer_type_full: l % 2 == 1,
-                device: ld,
-            });
-        }
-        Ok(DitModel {
-            proj_in: dit_lin(&device, &c, &mut f, "decoder.proj_in.1", true)?,
-            cond_emb: dit_lin(&device, &c, &mut f, "decoder.condition_embedder", true)?,
-            time_embed: DitTimeEmbed {
-                linear_1: dit_lin(&device, &c, &mut f, "decoder.time_embed.linear_1", true)?,
-                linear_2: dit_lin(&device, &c, &mut f, "decoder.time_embed.linear_2", true)?,
-                time_proj: dit_lin(&device, &c, &mut f, "decoder.time_embed.time_proj", true)?,
-            },
-            time_embed_r: DitTimeEmbed {
-                linear_1: dit_lin(&device, &c, &mut f, "decoder.time_embed_r.linear_1", true)?,
-                linear_2: dit_lin(&device, &c, &mut f, "decoder.time_embed_r.linear_2", true)?,
-                time_proj: dit_lin(&device, &c, &mut f, "decoder.time_embed_r.time_proj", true)?,
-            },
-            layers,
-            norm_out: dit_load_t(&device, &c, &mut f, "decoder.norm_out.weight")?,
-            out_scale_shift: dit_load_t(&device, &c, &mut f, "decoder.scale_shift_table")?,
-            proj_out: dit_lin(&device, &c, &mut f, "decoder.proj_out.1", true)?,
-            hidden,
-            n_head,
-            n_kv,
-            head_dim,
-            in_ch,
-            out_ch,
-            patch,
-            rope_theta,
-            sliding_window,
-            device,
-            xattn_morph: None,
+                        &c,
+                        &mut f,
+                        &format!("{p}.self_attn_norm.weight"),
+                    )?,
+                    cross_attn_norm: dit_load_t(
+                        &ld,
+                        &c,
+                        &mut f,
+                        &format!("{p}.cross_attn_norm.weight"),
+                    )?,
+                    mlp_norm: dit_load_t(&ld, &c, &mut f, &format!("{p}.mlp_norm.weight"))?,
+                    sa_q: ql(hidden, qd, "self_attn.q_proj")?,
+                    sa_k: ql(hidden, kvd, "self_attn.k_proj")?,
+                    sa_v: ql(hidden, kvd, "self_attn.v_proj")?,
+                    sa_o: ql(qd, hidden, "self_attn.o_proj")?,
+                    sa_q_norm: dit_load_t(
+                        &ld,
+                        &c,
+                        &mut f,
+                        &format!("{p}.self_attn.q_norm.weight"),
+                    )?,
+                    sa_k_norm: dit_load_t(
+                        &ld,
+                        &c,
+                        &mut f,
+                        &format!("{p}.self_attn.k_norm.weight"),
+                    )?,
+                    ca_q: ql(hidden, qd, "cross_attn.q_proj")?,
+                    ca_k: ql(hidden, kvd, "cross_attn.k_proj")?,
+                    ca_v: ql(hidden, kvd, "cross_attn.v_proj")?,
+                    ca_o: ql(qd, hidden, "cross_attn.o_proj")?,
+                    ca_q_norm: dit_load_t(
+                        &ld,
+                        &c,
+                        &mut f,
+                        &format!("{p}.cross_attn.q_norm.weight"),
+                    )?,
+                    ca_k_norm: dit_load_t(
+                        &ld,
+                        &c,
+                        &mut f,
+                        &format!("{p}.cross_attn.k_norm.weight"),
+                    )?,
+                    mlp_gate: ql(hidden, ffn, "mlp.gate_proj")?,
+                    mlp_up: ql(hidden, ffn, "mlp.up_proj")?,
+                    mlp_down: ql(ffn, hidden, "mlp.down_proj")?,
+                    scale_shift_table: dit_load_t(
+                        &ld,
+                        &c,
+                        &mut f,
+                        &format!("{p}.scale_shift_table"),
+                    )?,
+                    layer_type_full: l % 2 == 1,
+                    device: ld,
+                });
+            }
+            Ok(DitModel {
+                proj_in: dit_lin(&device, &c, &mut f, "decoder.proj_in.1", true)?,
+                cond_emb: dit_lin(&device, &c, &mut f, "decoder.condition_embedder", true)?,
+                time_embed: DitTimeEmbed {
+                    linear_1: dit_lin(&device, &c, &mut f, "decoder.time_embed.linear_1", true)?,
+                    linear_2: dit_lin(&device, &c, &mut f, "decoder.time_embed.linear_2", true)?,
+                    time_proj: dit_lin(&device, &c, &mut f, "decoder.time_embed.time_proj", true)?,
+                },
+                time_embed_r: DitTimeEmbed {
+                    linear_1: dit_lin(&device, &c, &mut f, "decoder.time_embed_r.linear_1", true)?,
+                    linear_2: dit_lin(&device, &c, &mut f, "decoder.time_embed_r.linear_2", true)?,
+                    time_proj: dit_lin(
+                        &device,
+                        &c,
+                        &mut f,
+                        "decoder.time_embed_r.time_proj",
+                        true,
+                    )?,
+                },
+                layers,
+                norm_out: dit_load_t(&device, &c, &mut f, "decoder.norm_out.weight")?,
+                out_scale_shift: dit_load_t(&device, &c, &mut f, "decoder.scale_shift_table")?,
+                proj_out: dit_lin(&device, &c, &mut f, "decoder.proj_out.1", true)?,
+                hidden,
+                n_head,
+                n_kv,
+                head_dim,
+                in_ch,
+                out_ch,
+                patch,
+                rope_theta,
+                sliding_window,
+                device,
+                xattn_morph: None,
+            })
         })
     }
 

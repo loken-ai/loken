@@ -267,6 +267,22 @@ pub fn lm_graph_arena_bytes(layers: usize, dim: usize, ffn: usize, batch: usize)
     (scaled as u64).max(ACE_LM_ARENA_SEED.bytes / ARENA_FLOOR_SHARE)
 }
 
+/// The capture arena to try first for a decode graph on card `card`, and the smallest
+/// worth trying: the arena the step wants, bounded by half of what the card has free but
+/// never under a share of the arena, and a floor at a smaller share of it.
+pub fn lm_graph_arena_range(
+    card: usize,
+    layers: usize,
+    dim: usize,
+    ffn: usize,
+    batch: usize,
+) -> (u64, u64) {
+    let want = lm_graph_arena_bytes(layers, dim, ffn, batch);
+    let free = crate::inference::place::vram_manager::free_on(card).unwrap_or(0);
+    let start = want.min((free / 2).max(want / ARENA_HEADROOM_SHARE));
+    (start, want / ARENA_FLOOR_SHARE)
+}
+
 /// cuBLAS workspace for a decode graph captured at this bucket.
 pub fn lm_cublas_workspace_bytes(bucket: usize) -> u64 {
     scale_measured(&ACE_LM_CUBLAS_SEED, bucket)

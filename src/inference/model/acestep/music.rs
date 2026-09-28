@@ -375,7 +375,7 @@ type DynErr = Box<dyn std::error::Error>;
 /// renders drive the SAME VRAM-degrade ladder): on a CUDA OOM it escalates the global
 /// degradation level - more reserve / a more balanced multi-GPU split, CPU as a last resort
 /// - and re-runs the unit (which reloads its models so the new placement takes effect).
-use crate::inference::model::acestep::lm::oom_retry;
+use crate::inference::place::ladder::rerun_under_pressure;
 
 pub fn render(cfg: &MusicConfig) -> Result<(), DynErr> {
     render_with_progress(cfg, None)
@@ -524,7 +524,7 @@ pub fn render_with_progress(
     let mut codes = if let Some(cc) = cover_codes {
         cc
     } else {
-        oom_retry("LM", || -> Result<_, DynErr> {
+        rerun_under_pressure("LM", || -> Result<_, DynErr> {
             let lm_tok = acestep_tokenizer(&lm_g)?;
             let mut lm = Qwen3Lm::from_gguf(&lm_g)?;
             let lm_part = ph::placement::part("lm", &lm.placement());
@@ -589,7 +589,7 @@ pub fn render_with_progress(
     };
 
     // 2) detok -> context (one continuous timeline). OOM-backstopped.
-    let context = oom_retry("detok", || -> Result<_, DynErr> {
+    let context = rerun_under_pressure("detok", || -> Result<_, DynErr> {
         let detok = DetokModel::from_gguf(&dit_g)?;
         let _detok_part = ph::placement::part("detokenizer", &detok.placement());
         Ok(build_context(&detok.decode(&codes)?, t, t, &[]))
@@ -600,7 +600,7 @@ pub fn render_with_progress(
     //    application and the trajectory - a memory-pressure crash reloads the encoders + DiT
     //    (with more reserve / on CPU) and recomputes this whole stage. Numerically identical on
     //    the no-pressure path (deterministic, seed-driven).
-    let mut latent = oom_retry("DiT", || -> Result<_, DynErr> {
+    let mut latent = rerun_under_pressure("DiT", || -> Result<_, DynErr> {
         // Per-style encs for the TIME-VARYING DiT cross-attention. The lyrics (and timbre) are the
         // SAME for every style (global); only the CAPTION differs -> each style's enc carries the
         // full lyrics + that style. cond_emb each, concatenate -> `enc` + per-style token `bounds`.
@@ -950,7 +950,7 @@ pub fn render_with_progress(
     // 5) VAE (chunked, OOM-safe) -> WAV. The chunked decode already halves its chunk on CUDA OOM;
     //    the backstop additionally reloads the VAE (more reserve / on CPU) if even the floor chunk
     //    won't fit, so the decode always completes.
-    let (audio, c_audio, t_audio) = oom_retry("VAE", || -> Result<_, DynErr> {
+    let (audio, c_audio, t_audio) = rerun_under_pressure("VAE", || -> Result<_, DynErr> {
         let lat_cm: Vec<f32> = {
             let mut v = vec![0f32; 64 * t];
             for ti in 0..t {

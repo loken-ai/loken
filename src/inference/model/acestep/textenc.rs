@@ -1,19 +1,19 @@
 //! ACE-Step 1.5 - text encoder ( M1): Qwen3-Embedding-0.6B (separate GGUF,
-//! arch `acestep-text-enc`). 28L, H=1024, 16 q / 8 kv heads, head_dim 128,
-//! ffn 3072, θ1e6, **causal**, vocab embed lookup. Produces `text_hidden [S,1024]`
-//! that the condition encoder's text_projector maps to 2048 (see native_acestep_cond).
+//! arch `acestep-text-enc`), at the width, heads and depth its tensors have; θ1e6,
+//! **causal**, vocab embed lookup. Produces `text_hidden [S,H]` that the condition
+//! encoder's text_projector maps to the DiT width.
 //! Reuses the Qwen3 pre-norm encoder layer (DetokLayer) validated by the FSQ
 //! detok / cond encoder; only the causal mask + vocab embed differ.
 
-use crate::inference::model::qwen3::encoder::{
-    lin as detok_lin, load_t as detok_load_t, rope_tables, Layer as DetokLayer,
+use crate::inference::model::acestep::fsq::{
+    detok_load_t, load_component, load_stack, rope_tables, DetokLayer, StackGeometry,
 };
 use crate::tensor::{Device, Tensor};
 
 pub struct TextEncoder {
-    pub embed_tokens: Tensor,    // [V, 1024]
-    pub layers: Vec<DetokLayer>, // 28
-    pub norm: Tensor,            // [1024]
+    pub embed_tokens: Tensor, // [V, H]
+    pub layers: Vec<DetokLayer>,
+    pub norm: Tensor, // [H]
     pub hidden: usize,
     pub n_head: usize,
     pub n_kv: usize,
@@ -28,51 +28,20 @@ impl TextEncoder {
         use crate::tensor::quantized::gguf_file;
         let mut f = std::fs::File::open(path)?;
         let c = gguf_file::read_mapped_file(&f)?;
-        // See `gguf_resident_bytes`. This checkpoint holds nothing but the encoder, so
-        // every tensor counts - but each is expanded to f32 on the way to the card, so
-        // the quantised file under-stated what goes resident by four.
-        let sz = crate::inference::model::sdpa::gguf_resident_bytes(&c, &[]);
-        // The fastest card that holds it, else the host - the fleet's own answer for a
-        // component loaded once. The reserve is a share of the weights because the
-        // activations of a fixed-shape encoder scale with its width, not with a request.
-        let device = crate::inference::place::plan::place_whole(sz, sz / 4);
-        let mut layers = Vec::with_capacity(28);
-        for l in 0..28usize {
-            let p = format!("layers.{l}");
-            layers.push(DetokLayer {
-                input_ln: detok_load_t(
-                    &c,
-                    &mut f,
-                    &format!("{p}.input_layernorm.weight"),
-                    &device,
-                )?,
-                post_ln: detok_load_t(
-                    &c,
-                    &mut f,
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    &device,
-                )?,
-                q: detok_lin(&c, &mut f, &format!("{p}.self_attn.q_proj"), false, &device)?,
-                k: detok_lin(&c, &mut f, &format!("{p}.self_attn.k_proj"), false, &device)?,
-                v: detok_lin(&c, &mut f, &format!("{p}.self_attn.v_proj"), false, &device)?,
-                o: detok_lin(&c, &mut f, &format!("{p}.self_attn.o_proj"), false, &device)?,
-                q_norm: detok_load_t(&c, &mut f, &format!("{p}.self_attn.q_norm.weight"), &device)?,
-                k_norm: detok_load_t(&c, &mut f, &format!("{p}.self_attn.k_norm.weight"), &device)?,
-                gate: detok_lin(&c, &mut f, &format!("{p}.mlp.gate_proj"), false, &device)?,
-                up: detok_lin(&c, &mut f, &format!("{p}.mlp.up_proj"), false, &device)?,
-                down: detok_lin(&c, &mut f, &format!("{p}.mlp.down_proj"), false, &device)?,
-            });
-        }
-        Ok(TextEncoder {
-            embed_tokens: detok_load_t(&c, &mut f, "embed_tokens.weight", &device)?,
-            layers,
-            norm: detok_load_t(&c, &mut f, "norm.weight", &device)?,
-            hidden: 1024,
-            n_head: 16,
-            n_kv: 8,
-            head_dim: 128,
-            rope_theta: 1e6,
-            device,
+        // The checkpoint holds nothing but the encoder, so every tensor counts.
+        load_component("text encoder", &c, &[], |device| {
+            let g = StackGeometry::read(&c, "")?;
+            Ok(TextEncoder {
+                layers: load_stack(&c, &mut f, "", g.layers, device)?,
+                embed_tokens: detok_load_t(&c, &mut f, "embed_tokens.weight", device)?,
+                norm: detok_load_t(&c, &mut f, "norm.weight", device)?,
+                hidden: g.hidden,
+                n_head: g.n_head,
+                n_kv: g.n_kv,
+                head_dim: g.head_dim,
+                rope_theta: 1e6,
+                device: device.clone(),
+            })
         })
     }
 
@@ -133,7 +102,7 @@ impl TextEncoder {
         x.add(&ff.matmul_t(l.down.weight()?)?)
     }
 
-    /// Vocab embed lookup only (no encoder layers) -> `[S,1024]` row-major - the
+    /// Vocab embed lookup only (no encoder layers) -> `[S,H]` row-major - the
     /// cond encoder's `lyric_embed` (oracle qwen3_embed_lookup).
     pub fn embed_lookup(&self, token_ids: &[u32]) -> crate::tensor::Result<Vec<f32>> {
         let h = self.hidden;
@@ -149,8 +118,8 @@ impl TextEncoder {
         Ok(out)
     }
 
-    /// Encode token ids -> `text_hidden [S,1024]` (row-major). Vocab embed lookup ->
-    /// 28 causal Qwen3 layers -> final norm.
+    /// Encode token ids -> `text_hidden [S,H]` (row-major). Vocab embed lookup ->
+    /// causal Qwen3 layers -> final norm.
     pub fn forward(&self, token_ids: &[u32]) -> crate::tensor::Result<Vec<f32>> {
         let s = token_ids.len();
         // vocab embed lookup (gather rows) - embed_tokens is on device, so is `hid`.

@@ -187,9 +187,10 @@ fn cross_card_matches_single_card() {
             .unwrap()
     };
     let split = {
-        let half = super::placement_demand(gp) / 2;
+        // Neither card holds the model whole, so the plan divides it.
+        let need = super::placement_demand(gp);
         let mut lm =
-            super::Qwen3Lm::from_gguf_placed(gp, Some(&[(0, half), (1, u64::MAX / 4)])).unwrap();
+            super::Qwen3Lm::from_gguf_placed(gp, Some(&[(0, need / 2), (1, need - 1)])).unwrap();
         assert!(!lm.on_one_card(), "the budget was meant to split the model");
         lm.generate_cfg_batched(&tok, cap, lyr, &cot, "", 40, 0, 7, 0.85, 0.9, 2.0, None)
             .unwrap()

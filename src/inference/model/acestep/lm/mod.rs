@@ -9,7 +9,7 @@
 //! This is the MODEL (prefill/decode -> logits). CFG + top-p/top-k sampling and the
 //! decode loop live in the pipeline orchestration (cond+uncond, temp 0.85, cfg 2.0).
 
-use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
+use crate::inference::place::layer_executor::HeteroPlan;
 use crate::tensor::quantized::QKernelMatMul;
 use crate::tensor::{DType, Device, Result, Tensor};
 use std::cell::RefCell;
@@ -25,9 +25,9 @@ fn dev_key(d: &Device) -> usize {
     }
 }
 
-/// Pre-allocated KV-cache seq capacity (prompt + decoded codes). Matches the
-/// `max_ctx` KV reserve horizon used when planning device placement in `from_gguf`.
-/// The autoregressive position is asserted to stay within this bound.
+/// Pre-allocated KV-cache seq capacity (prompt + decoded codes), which is also the KV
+/// horizon the placement reserves for. The autoregressive position is asserted to stay
+/// within this bound.
 const MAX_SEQ: usize = 8192;
 
 /// One Qwen3 decoder layer (Q8 weights) + its growing on-device KV cache.
@@ -106,57 +106,6 @@ pub struct MorphSection<'a> {
     pub lyrics: &'a str,
     pub cot: &'a str,
     pub n_codes: usize,
-}
-
-/// True when a formatted error MESSAGE indicates a CUDA out-of-memory condition. The
-/// native substrate tags device-allocation OOM (`[oom]` + the driver's `out of memory`
-/// text); cuBLAS/cuDNN OOM surfaces as `*_STATUS_ALLOC_FAILED`. The check is on the
-/// Display string so it works for any error type (`native::Error`, `Box<dyn Error>`, ...).
-pub fn msg_is_oom(s: &str) -> bool {
-    let s = s.to_ascii_lowercase();
-    s.contains("[oom]")
-        || s.contains("out of memory")
-        || s.contains("out_of_memory")
-        || s.contains("alloc_failed")
-        || s.contains("alloc failed")
-}
-
-/// Run one render UNIT with the graceful-degradation backstop shared by every generative
-/// pipeline (ACE-Step audio, Wan video): if the unit hits CUDA OOM (a concurrent VRAM
-/// consumer, a resolution whose activation peak overflows the current split, ...) escalate
-/// the process-global degradation level - which makes the unit's next attempt reserve more
-/// VRAM headroom and re-plan with a more balanced multi-GPU split (CPU only as the last
-/// resort) - then re-run the unit. The unit MUST reload its models so the new placement
-/// takes effect. Non-OOM errors propagate immediately. Bounded to a few attempts so a true
-/// impossibility (OOM even on CPU) finally errors out instead of looping forever.
-pub fn oom_retry<T, E: std::fmt::Display>(
-    label: &str,
-    mut f: impl FnMut() -> std::result::Result<T, E>,
-) -> std::result::Result<T, String> {
-    let mut attempt = 0u32;
-    loop {
-        match f() {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                let msg = e.to_string();
-                if attempt < 5 && msg_is_oom(&msg) {
-                    attempt += 1;
-                    let lvl = crate::inference::place::vram_manager::vram_degrade();
-                    let cpu = crate::inference::place::vram_manager::vram_force_cpu();
-                    eprintln!(
-                        "[oom_retry] {label} hit CUDA OOM - degrading (level {lvl}{}) and retrying",
-                        if cpu {
-                            ", CPU placement"
-                        } else {
-                            ", +VRAM reserve"
-                        }
-                    );
-                    continue;
-                }
-                return Err(format!("{label}: {e}"));
-            }
-        }
-    }
 }
 
 /// Reusable per-device decode scratch (one per device a layer lives on).
@@ -285,113 +234,142 @@ const GRAPH_BUCKET: usize = 256;
 /// the sampler.
 const CFG_ROWS: usize = 2;
 
-/// The checkpoint's geometry: width, heads, KV heads, head size, feed-forward width,
-/// layers and vocabulary.
-const LM_GEOMETRY: (usize, usize, usize, usize, usize, usize, usize) =
-    (2560, 32, 8, 128, 9728, 36, 217204);
-
-/// The context the KV cache is reserved for.
-const LM_KV_HORIZON: u64 = 8192;
-
-/// F32 KV bytes one layer holds over the reserve horizon.
-fn kv_bytes_per_layer() -> u64 {
-    let (_, _, nkv, d, _, _, _) = LM_GEOMETRY;
-    2 * nkv as u64 * d as u64 * LM_KV_HORIZON * 4
+/// The checkpoint's geometry, read from the shapes of its tensors.
+#[derive(Debug, Clone, Copy)]
+struct LmGeometry {
+    hidden: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    ffn: usize,
+    layers: usize,
+    vocab: usize,
 }
 
-/// What a card must hold to run the language model whole: the weights, the KV cache the
-/// plan reserves for every layer, and the step reserve. This is the figure the pressure
-/// protocol has to ask for; the weights alone let a card pass that then spilled a third
-/// of the layers onto the host.
+impl LmGeometry {
+    fn read(c: &crate::tensor::quantized::gguf_file::Content, path: &str) -> Result<Self> {
+        let rows = |name: &str| -> Result<(usize, usize)> {
+            let dims = c
+                .tensor_infos
+                .get(name)
+                .map(|t| t.shape.dims().to_vec())
+                .ok_or_else(|| {
+                    crate::tensor::Error(format!("ace-step LM {path}: no tensor {name}"))
+                })?;
+            Ok((dims[0], dims.get(1).copied().unwrap_or(1)))
+        };
+        let (vocab, hidden) = rows("model.embed_tokens.weight")?;
+        let (q_out, _) = rows("model.layers.0.self_attn.q_proj.weight")?;
+        let (k_out, _) = rows("model.layers.0.self_attn.k_proj.weight")?;
+        let (head_dim, _) = rows("model.layers.0.self_attn.q_norm.weight")?;
+        let (ffn, _) = rows("model.layers.0.mlp.gate_proj.weight")?;
+        let layers = c
+            .tensor_infos
+            .keys()
+            .filter_map(|n| {
+                n.strip_prefix("model.layers.")?
+                    .split('.')
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .max()
+            .map_or(0, |l| l + 1);
+        Ok(Self {
+            hidden,
+            heads: q_out / head_dim.max(1),
+            kv_heads: k_out / head_dim.max(1),
+            head_dim,
+            ffn,
+            layers,
+            vocab,
+        })
+    }
+
+    /// F32 KV bytes one layer holds over the cache capacity.
+    fn kv_bytes_per_layer(&self) -> u64 {
+        2 * self.kv_heads as u64 * self.head_dim as u64 * MAX_SEQ as u64 * 4
+    }
+}
+
+/// Bytes of the checkpoint's layers as they go to the cards, kept quantized.
+fn layer_bytes(c: &crate::tensor::quantized::gguf_file::Content) -> u64 {
+    c.tensor_infos
+        .iter()
+        .filter(|(n, _)| n.starts_with("model.layers."))
+        .map(|(_, t)| t.size_in_bytes() as u64)
+        .sum()
+}
+
+/// What the language model asks of the cards: its layers with their `block_bytes` of
+/// weights, the tied embedding and head it keeps as F32 beside the last layer, the KV cache
+/// over the cache capacity, and the reserve its decode step works in.
+fn lm_demand(block_bytes: u64, geo: &LmGeometry) -> crate::inference::place::ladder::Demand {
+    crate::inference::place::ladder::Demand {
+        layers: geo.layers,
+        block_bytes,
+        head_bytes: geo.vocab as u64 * geo.hidden as u64 * 4,
+        kv_bytes_per_layer: geo.kv_bytes_per_layer(),
+        runtime_reserve: crate::inference::place::audio_demand::lm_reserve(
+            geo.layers, geo.hidden, geo.ffn, CFG_ROWS,
+        ),
+    }
+}
+
+/// What a card must hold to run the language model whole. Zero when the checkpoint
+/// cannot be read.
 pub fn placement_demand(path: &str) -> u64 {
-    let (h, _, _, _, ffn, n_layers, _) = LM_GEOMETRY;
-    let weights = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    weights
-        + n_layers as u64 * kv_bytes_per_layer()
-        + crate::inference::place::audio_demand::lm_reserve(n_layers, h, ffn, CFG_ROWS)
+    let Ok(c) = crate::tensor::quantized::gguf_file::open_header(path) else {
+        return 0;
+    };
+    LmGeometry::read(&c, path).map_or(0, |geo| lm_demand(layer_bytes(&c), &geo).whole())
 }
 
 impl Qwen3Lm {
-    /// Load the 4B LM (Q8 weights kept quantized) from its GGUF.
+    /// Load the LM (Q8 weights kept quantized) from its GGUF.
     pub fn from_gguf(path: &str) -> Result<Self> {
         Self::from_gguf_placed(path, None)
     }
 
     /// Load with the cards' room given rather than probed: `budget` names the bytes each
-    /// card may take, in the order the plan packs them. The tests place a model across
-    /// two cards on purpose with it; a render never passes one.
+    /// card may take, fastest first. The tests place a model across two cards on purpose
+    /// with it; a render never passes one.
     pub fn from_gguf_placed(path: &str, budget: Option<&[(usize, u64)]>) -> Result<Self> {
-        let (h, nh, nkv, d, ffn, n_layers, vocab) = LM_GEOMETRY;
-        // Standard placement (same mechanism as every other model): build a HeteroPlan
-        // from the real free VRAM (pack-first on the fastest GPU, else greedy split,
-        // remainder -> CPU) instead of an ad-hoc all-on-GPU0. The per-layer activation is
-        // a host Vec<f32>, so CPU-spilled / second-GPU layers need no extra transfer code.
-        // A checkpoint that cannot be measured cannot be planned for. This used to answer
-        // with a typed 4.2 GB, which let the planner approve a card on a figure nobody
-        // had measured and then fail obscurely when the same unreadable file was opened a
-        // few lines later. Say it here, where the reason is still in hand.
-        let model_size = std::fs::metadata(path).map(|m| m.len()).map_err(|e| {
-            crate::tensor::Error(format!(
-                "ace-step LM: cannot size the checkpoint {path}: {e}"
-            ))
-        })?;
-        let kv_per_layer = kv_bytes_per_layer(); // F32 KV over the reserve horizon
-                                                 // Headroom left free on each card after weights+KV: covers the decode graph
-                                                 // arena + transient scratch AND a moderate concurrent VRAM consumer, so
-                                                 // placement spills to CPU/another GPU before a post-probe alloc can OOM
-                                                 // mid-render. Sized from the step this checkpoint will actually capture rather
-                                                 // than fixed - the arena has to hold every layer's transients at once, so a deeper
-                                                 // or wider checkpoint needs proportionally more and used to be handed the same
-                                                 // figure as the one the reserve was validated on. Ample-VRAM placement at that
-                                                 // reference geometry is unchanged (the model still packs on GPU0).
-        let reserve: u64 =
-            crate::inference::place::audio_demand::lm_reserve(n_layers, h, ffn, CFG_ROWS);
-        let cudas = crate::inference::place::vram_manager::probe_under_pressure(reserve);
-        // Every card takes part: the plan packs the fastest first, spills to the next, and
-        // puts on the host only what no card holds. The captured decode graph runs on one
-        // card; a plan that spans several takes the eager per-layer path, which moves the
-        // activation to each layer's card, as `cross_card_matches_single_card` verifies.
-        let cuda_budget: Vec<(usize, u64)> = match budget {
-            Some(given) => given
-                .iter()
-                .filter(|(i, _)| cudas.iter().any(|(c, _, _)| c == i))
-                .copied()
-                .collect(),
-            None => cudas.iter().map(|(i, f, _)| (*i, *f)).collect(),
-        };
-        let plan = HeteroPlan::calculate_with_kv_reserve(
-            // The budgets below ALREADY exclude the reserve: `probe_under_pressure` probes through
-            // `probe_cuda_devices`, which returns `stable_free - reserve`. Passing it again here
-            // subtracted it TWICE - invisible at half a gigabyte, and fatal at twelve, where it
-            // took both cards to zero usable and sent a whole video DiT to the host.
-            n_layers,
-            model_size,
-            &cuda_budget,
-            &[],
-            1.0,
-            kv_per_layer,
-            0,
-        );
-        let dev_of_kind = |k: DeviceKind| -> Device {
-            match k {
-                DeviceKind::Cuda(idx) => cudas
-                    .iter()
-                    .find(|(i, _, _)| *i == idx)
-                    .map(|(_, _, dv)| dv.clone())
-                    .unwrap_or(Device::Cpu),
-                _ => Device::Cpu,
-            }
-        };
-        let layer_device = |l: usize| -> Device {
-            plan.segments
-                .iter()
-                .find(|s| l >= s.layer_start && l < s.layer_end)
-                .map(|s| dev_of_kind(s.kind))
-                .unwrap_or(Device::Cpu)
-        };
-        let primary = cudas
-            .first()
-            .map(|(_, _, dv)| dv.clone())
+        let header = crate::tensor::quantized::gguf_file::open_header(path)?;
+        let geo = LmGeometry::read(&header, path)?;
+        let demand = lm_demand(layer_bytes(&header), &geo);
+        let build = |plan: &HeteroPlan| Self::build_on(path, &geo, plan);
+        match budget {
+            Some(cards) => crate::inference::place::ladder::load_placed(
+                "ACE-Step LM",
+                &demand,
+                cards,
+                || false,
+                build,
+            ),
+            None => crate::inference::place::ladder::load("ACE-Step LM", &demand, build),
+        }
+    }
+
+    /// The model built on `plan`. The embedding, its tied head and the final norm sit on
+    /// the card of the last card layer, where the plan held room for them.
+    fn build_on(path: &str, geo: &LmGeometry, plan: &HeteroPlan) -> Result<Self> {
+        let LmGeometry {
+            hidden: h,
+            heads: nh,
+            kv_heads: nkv,
+            head_dim: d,
+            ffn,
+            layers: n_layers,
+            vocab,
+        } = *geo;
+        let layer_devices = crate::inference::place::ladder::layer_devices(plan, n_layers);
+        let layer_device = |l: usize| -> Device { layer_devices[l].clone() };
+        let primary = layer_devices
+            .iter()
+            .rev()
+            .find(|dv| !dv.is_cpu())
+            .cloned()
             .unwrap_or(Device::Cpu);
         eprintln!(
             "[ace-lm] placement: {}",
@@ -402,39 +380,29 @@ impl Qwen3Lm {
                 .join(" ")
         );
 
-        // CUDA-graph capture of the decode step (the launch-bound lever) requires the
-        // per-tensor read/write EVENTS to be off: a captured kernel reading a tensor
-        // created with tracking ON would wait on that tensor's pre-capture event ->
-        // CUDA_ERROR_STREAM_CAPTURE_ISOLATION. Disable tracking on every device used by
-        // this model BEFORE any weight/KV/scratch tensor is created, so they are all
-        // capture-clean. The whole ace-lm pipeline runs serially on each device's
-        // primary stream, so manual cross-stream sync is not needed (same contract as
-        // the LLM graph-decode paths). acestep-only - does not touch LLM placement.
-        // Only a model whole on one card captures a graph. Across cards the per-tensor
-        // events are what order a copy from one card to the next; without them a layer
-        // reads an activation the other card is still writing, and the decode diverges
-        // from the second token on.
-        let cuda_segments = plan
-            .segments
-            .iter()
-            .filter(|s| matches!(s.kind, DeviceKind::Cuda(_)))
-            .count();
+        // CUDA-graph capture of the decode step requires the per-tensor read/write events
+        // to be off: a captured kernel reading a tensor created with tracking on waits on
+        // that tensor's pre-capture event (CUDA_ERROR_STREAM_CAPTURE_ISOLATION). Tracking
+        // is disabled on the model's card before any weight, KV or scratch tensor is
+        // created. Only a model whole on one card captures a graph: across cards the
+        // per-tensor events order a copy from one card to the next.
         #[cfg(feature = "cuda")]
-        for (_, _, dv) in &cudas {
-            if let Device::Cuda(c) = dv {
-                if cuda_segments > 1 {
-                    continue;
+        {
+            let mut cards: Vec<Device> = Vec::new();
+            for dv in layer_devices.iter().chain(std::iter::once(&primary)) {
+                if !dv.is_cpu() && !cards.iter().any(|c| c.location() == dv.location()) {
+                    cards.push(dv.clone());
                 }
-                unsafe {
-                    c.context().disable_event_tracking();
+            }
+            if cards.len() == 1 {
+                if let Device::Cuda(c) = &cards[0] {
+                    unsafe {
+                        c.context().disable_event_tracking();
+                    }
+                    // Blocking sync yields the host core while the serial decode waits on
+                    // the card, instead of spinning on it.
+                    let _ = c.context().set_blocking_synchronize();
                 }
-                // BLOCKING sync (yield the host core) instead of the default SPIN: the
-                // autoregressive decode is serial (each token waits on the GPU before
-                // sampling the next), so once the per-token launch flood is replaced by a
-                // CUDA-graph replay, the host has nothing to do but wait - a spinning sync
-                // would peg a core at ~100% doing nothing. Blocking sync lets that core
-                // idle while the GPU runs. acestep-only.
-                let _ = c.context().set_blocking_synchronize();
             }
         }
 
@@ -1163,57 +1131,29 @@ impl Qwen3Lm {
         stream
             .synchronize()
             .map_err(|e| err(format!("sync: {e}")))?;
-        // Arm a modest arena (decode activations are tiny) and re-home the stable input
-        // buffers into it so their VAs stay stable across replays.
-        let free = ctx.mem_get_info().map(|(f, _)| f).unwrap_or(0);
-        // The arena holds EVERY transient alloc of the decode pass at once (it never frees
-        // mid-capture), so it is a function of the LAYER COUNT and the width, not a fixed
-        // slab: the family ships more than one checkpoint, and the deeper one was being
-        // handed the shallower one's arena. Still bounded by what is free, because an
-        // arena that cannot be allocated is worse than a small one.
-        let arena_cap = crate::inference::place::audio_demand::lm_graph_arena_bytes(
-            self.layers.len(),
-            self.hidden,
-            self.ffn,
-            CFG_ROWS,
-        ) as usize;
-        // What to try when half of free VRAM is less than the arena wants: a share of the
-        // arena rather than a fixed slab, so the fallback follows the model too.
-        let arena_floor =
-            arena_cap / crate::inference::place::audio_demand::ARENA_HEADROOM_SHARE as usize;
-        let mut arena_bytes = arena_cap.min((free / 2).max(arena_floor));
-        // Arena alloc can OOM if a concurrent consumer grabbed VRAM after the free
-        // probe. Shrink-retry before giving up; if even a small arena won't fit, bubble
-        // the error so the decode loop falls back to the eager (arena-free) path.
-        loop {
-            eprintln!(
-                "[ace-lm] graph arena {}MB (free {}MB)",
-                arena_bytes >> 20,
-                free >> 20
+        // Arm the capture arena and re-home the stable input buffers into it so their VAs
+        // stay stable across replays. The arena holds every transient allocation of the
+        // decode pass at once, so it follows the layer count and the widths; it shrinks when
+        // a concurrent consumer took the card's memory after it was measured, and the error
+        // of the smallest attempt sends the decode loop to the eager path.
+        let (arena_start, arena_floor) =
+            crate::inference::place::audio_demand::lm_graph_arena_range(
+                cd.ordinal(),
+                self.layers.len(),
+                self.hidden,
+                self.ffn,
+                CFG_ROWS,
             );
-            match ctx.begin_capture_arena(arena_bytes) {
-                Ok(()) => break,
-                Err(e) => {
-                    let oom = format!("{e:?}")
-                        .to_ascii_lowercase()
-                        .contains("out of memory");
-                    if oom
-                        && arena_bytes
-                            > arena_cap
-                                / crate::inference::place::audio_demand::ARENA_FLOOR_SHARE as usize
-                    {
-                        arena_bytes /= 2;
-                        eprintln!(
-                            "[ace-lm] graph arena alloc OOM - retrying smaller ({}MB)",
-                            arena_bytes >> 20
-                        );
-                        continue;
-                    }
-                    let tag = if oom { "[oom] " } else { "" };
-                    return Err(err(format!("{tag}begin arena: {e:?}")));
-                }
-            }
-        }
+        crate::inference::place::ladder::halve_until_fits(
+            "ace-lm graph arena",
+            arena_start as usize,
+            arena_floor as usize,
+            |bytes| {
+                eprintln!("[ace-lm] graph arena {}MB", bytes >> 20);
+                ctx.begin_capture_arena(bytes)
+                    .map_err(|e| err(format!("begin arena: {e:?}")))
+            },
+        )?;
         let arena_copy = |t: &Tensor| -> Result<Tensor> {
             let a = Tensor::zeros_on(t.dims().to_vec(), t.dtype(), &dev)?;
             a.slice_set(t, 0, 0)?;
@@ -1987,13 +1927,18 @@ mod demand_tests {
     /// step reserve come with them, so the demand is always more than the file.
     #[test]
     fn the_placement_demand_exceeds_the_weights() {
-        let dir = std::env::temp_dir().join(format!("ace-lm-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("lm.gguf");
-        std::fs::write(&path, vec![0u8; 4096]).unwrap();
-        let demand = super::placement_demand(path.to_str().unwrap());
-        assert!(demand > 4096 + super::kv_bytes_per_layer());
-        std::fs::remove_dir_all(&dir).unwrap();
+        let geo = super::LmGeometry {
+            hidden: 64,
+            heads: 4,
+            kv_heads: 2,
+            head_dim: 16,
+            ffn: 128,
+            layers: 3,
+            vocab: 100,
+        };
+        let demand = super::lm_demand(4096, &geo);
+        let head = (geo.vocab * geo.hidden * 4) as u64;
+        assert!(demand.whole() > 4096 + head + geo.layers as u64 * geo.kv_bytes_per_layer());
     }
 }
 

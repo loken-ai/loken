@@ -66,6 +66,113 @@ pub(crate) use crate::inference::model::qwen3::encoder::{
 };
 pub use crate::inference::model::qwen3::encoder::{Layer as DetokLayer, Linear as DetokLinear};
 
+/// The geometry of a Qwen3 encoder stack, read from the shapes of its first layer and the
+/// number of layers the checkpoint holds under its prefix.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StackGeometry {
+    pub layers: usize,
+    pub hidden: usize,
+    pub n_head: usize,
+    pub n_kv: usize,
+    pub head_dim: usize,
+}
+
+/// `{prefix}.layers.` for a prefixed stack, `layers.` for one at the checkpoint's root.
+fn layers_key(prefix: &str) -> String {
+    if prefix.is_empty() {
+        "layers.".to_string()
+    } else {
+        format!("{prefix}.layers.")
+    }
+}
+
+impl StackGeometry {
+    pub(crate) fn read(
+        c: &crate::tensor::quantized::gguf_file::Content,
+        prefix: &str,
+    ) -> crate::tensor::Result<Self> {
+        let key = layers_key(prefix);
+        let rows = |name: &str| -> crate::tensor::Result<usize> {
+            c.tensor_infos
+                .get(&format!("{key}0.{name}"))
+                .map(|t| t.shape.dims()[0])
+                .ok_or_else(|| crate::tensor::Error(format!("no tensor {key}0.{name}")))
+        };
+        let head_dim = rows("self_attn.q_norm.weight")?.max(1);
+        let layers = c
+            .tensor_infos
+            .keys()
+            .filter_map(|n| {
+                n.strip_prefix(key.as_str())?
+                    .split('.')
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .max()
+            .map_or(0, |l| l + 1);
+        Ok(Self {
+            layers,
+            hidden: rows("input_layernorm.weight")?,
+            n_head: rows("self_attn.q_proj.weight")? / head_dim,
+            n_kv: rows("self_attn.k_proj.weight")? / head_dim,
+            head_dim,
+        })
+    }
+}
+
+/// Load the `{prefix}.layers.*` stack of `n` layers on `device`.
+pub(crate) fn load_stack(
+    c: &crate::tensor::quantized::gguf_file::Content,
+    f: &mut std::fs::File,
+    prefix: &str,
+    n: usize,
+    device: &Device,
+) -> crate::tensor::Result<Vec<DetokLayer>> {
+    let key = layers_key(prefix);
+    let mut v = Vec::with_capacity(n);
+    for l in 0..n {
+        let p = format!("{key}{l}");
+        v.push(DetokLayer {
+            input_ln: detok_load_t(c, f, &format!("{p}.input_layernorm.weight"), device)?,
+            post_ln: detok_load_t(
+                c,
+                f,
+                &format!("{p}.post_attention_layernorm.weight"),
+                device,
+            )?,
+            q: detok_lin(c, f, &format!("{p}.self_attn.q_proj"), false, device)?,
+            k: detok_lin(c, f, &format!("{p}.self_attn.k_proj"), false, device)?,
+            v: detok_lin(c, f, &format!("{p}.self_attn.v_proj"), false, device)?,
+            o: detok_lin(c, f, &format!("{p}.self_attn.o_proj"), false, device)?,
+            q_norm: detok_load_t(c, f, &format!("{p}.self_attn.q_norm.weight"), device)?,
+            k_norm: detok_load_t(c, f, &format!("{p}.self_attn.k_norm.weight"), device)?,
+            gate: detok_lin(c, f, &format!("{p}.mlp.gate_proj"), false, device)?,
+            up: detok_lin(c, f, &format!("{p}.mlp.up_proj"), false, device)?,
+            down: detok_lin(c, f, &format!("{p}.mlp.down_proj"), false, device)?,
+        });
+    }
+    Ok(v)
+}
+
+/// Build a component that runs whole on one device from the tensors under `prefixes`,
+/// through the placement ladder: the bytes it takes are read from the checkpoint's tensor
+/// directory, and its reserve follows them.
+pub(crate) fn load_component<T>(
+    what: &str,
+    c: &crate::tensor::quantized::gguf_file::Content,
+    prefixes: &[&str],
+    build: impl FnMut(&Device) -> crate::tensor::Result<T>,
+) -> crate::tensor::Result<T> {
+    let sz = crate::inference::model::sdpa::gguf_resident_bytes(c, prefixes);
+    crate::inference::place::ladder::load_whole(
+        what,
+        sz,
+        crate::inference::place::runtime_demand::load_runtime_floor(sz),
+        build,
+    )
+}
+
 /// The bidirectional Qwen3 stack an ACE-Step checkpoint carries, and the geometry it runs at.
 ///
 /// The de-tokenizer and the tokenizer's attention pooler are the same stack read from two
@@ -73,7 +180,7 @@ pub use crate::inference::model::qwen3::encoder::{Layer as DetokLayer, Linear as
 /// What differs is only what each one projects into it and takes back out, so the stack is
 /// held once and both towers reach it rather than each restating the arithmetic.
 pub struct Pooler {
-    pub layers: Vec<DetokLayer>, // 2 standard Qwen3 encoder layers
+    pub layers: Vec<DetokLayer>,
     pub hidden: usize,
     pub n_head: usize,
     pub n_kv: usize,
@@ -83,18 +190,23 @@ pub struct Pooler {
 }
 
 impl Pooler {
-    /// The geometry both ACE-Step 1.5 towers are published at: 2048 wide, 16 query heads over
-    /// 8 key heads of 128 channels, rotary base 1e6.
-    fn acestep(layers: Vec<DetokLayer>, device: Device) -> Self {
-        Self {
-            layers,
-            hidden: 2048,
-            n_head: 16,
-            n_kv: 8,
-            head_dim: 128,
+    /// The stack under `prefix`, at the geometry its tensors have, on `device`.
+    fn load(
+        c: &crate::tensor::quantized::gguf_file::Content,
+        f: &mut std::fs::File,
+        prefix: &str,
+        device: &Device,
+    ) -> crate::tensor::Result<Self> {
+        let g = StackGeometry::read(c, prefix)?;
+        Ok(Self {
+            layers: load_stack(c, f, prefix, g.layers, device)?,
+            hidden: g.hidden,
+            n_head: g.n_head,
+            n_kv: g.n_kv,
+            head_dim: g.head_dim,
             rope_theta: 1e6,
-            device,
-        }
+            device: device.clone(),
+        })
     }
 
     fn rms_eps(&self) -> f32 {
@@ -188,57 +300,25 @@ pub struct DetokModel {
 
 impl DetokModel {
     /// Load the detokenizer from acestep-v15-turbo-Q8_0.gguf (`tokenizer.*` /
-    /// `detokenizer.*` tensors). Geometry mirrors the DiT (H2048/16h/8kv/hd128/θ1e6).
+    /// `detokenizer.*` tensors), at the geometry its tensors have.
     pub fn from_gguf(path: &str) -> crate::tensor::Result<Self> {
         use crate::tensor::quantized::gguf_file;
         let mut f = std::fs::File::open(path)?;
         let c = gguf_file::read_mapped_file(&f)?;
-        // See `gguf_resident_bytes`: the directory is the authority on what this component
-        // puts on the card, and the loader below expands every weight it reads.
-        let device = {
-            let sz = crate::inference::model::sdpa::gguf_resident_bytes(&c, &["detokenizer."]);
-            crate::inference::place::plan::place_whole(
-                sz,
-                crate::inference::place::runtime_demand::load_runtime_floor(sz),
-            )
-        };
-        let mut layers = Vec::with_capacity(2);
-        for l in 0..2usize {
-            let p = format!("detokenizer.layers.{l}");
-            layers.push(DetokLayer {
-                input_ln: detok_load_t(
-                    &c,
-                    &mut f,
-                    &format!("{p}.input_layernorm.weight"),
-                    &device,
-                )?,
-                post_ln: detok_load_t(
-                    &c,
-                    &mut f,
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    &device,
-                )?,
-                q: detok_lin(&c, &mut f, &format!("{p}.self_attn.q_proj"), false, &device)?,
-                k: detok_lin(&c, &mut f, &format!("{p}.self_attn.k_proj"), false, &device)?,
-                v: detok_lin(&c, &mut f, &format!("{p}.self_attn.v_proj"), false, &device)?,
-                o: detok_lin(&c, &mut f, &format!("{p}.self_attn.o_proj"), false, &device)?,
-                q_norm: detok_load_t(&c, &mut f, &format!("{p}.self_attn.q_norm.weight"), &device)?,
-                k_norm: detok_load_t(&c, &mut f, &format!("{p}.self_attn.k_norm.weight"), &device)?,
-                gate: detok_lin(&c, &mut f, &format!("{p}.mlp.gate_proj"), false, &device)?,
-                up: detok_lin(&c, &mut f, &format!("{p}.mlp.up_proj"), false, &device)?,
-                down: detok_lin(&c, &mut f, &format!("{p}.mlp.down_proj"), false, &device)?,
-            });
-        }
-        // special_tokens GGUF ne=[2048,5] -> substrate row-major [5,2048] (frame-major).
-        let special_tok =
-            detok_load_t(&c, &mut f, "detokenizer.special_tokens", &device)?.reshape((5, 2048))?;
-        Ok(DetokModel {
-            fsq_proj: detok_lin(&c, &mut f, "tokenizer.quantizer.project_out", true, &device)?,
-            embed: detok_lin(&c, &mut f, "detokenizer.embed_tokens", true, &device)?,
-            special_tok,
-            stack: Pooler::acestep(layers, device.clone()),
-            norm: detok_load_t(&c, &mut f, "detokenizer.norm.weight", &device)?,
-            proj_out: detok_lin(&c, &mut f, "detokenizer.proj_out", true, &device)?,
+        load_component("ACE-Step detokenizer", &c, &["detokenizer."], |device| {
+            let stack = Pooler::load(&c, &mut f, "detokenizer", device)?;
+            // special_tokens: one row of the stack's width per frame.
+            let special_tok = detok_load_t(&c, &mut f, "detokenizer.special_tokens", device)?;
+            let frames = special_tok.elem_count() / stack.hidden.max(1);
+            let special_tok = special_tok.reshape((frames, stack.hidden))?;
+            Ok(DetokModel {
+                fsq_proj: detok_lin(&c, &mut f, "tokenizer.quantizer.project_out", true, device)?,
+                embed: detok_lin(&c, &mut f, "detokenizer.embed_tokens", true, device)?,
+                special_tok,
+                stack,
+                norm: detok_load_t(&c, &mut f, "detokenizer.norm.weight", device)?,
+                proj_out: detok_lin(&c, &mut f, "detokenizer.proj_out", true, device)?,
+            })
         })
     }
 
@@ -280,7 +360,7 @@ pub struct TokEncoder {
     pub special_tok: Tensor, // tokenizer.attention_pooler.special_token [1,2048] (CLS)
     pub norm: Tensor,        // tokenizer.attention_pooler.norm [2048]
     pub fsq_in: DetokLinear, // tokenizer.quantizer.project_in [2048->6]
-    /// tokenizer.attention_pooler.layers.{0,1}
+    /// tokenizer.attention_pooler.layers.*
     pub stack: Pooler,
 }
 
@@ -290,65 +370,29 @@ impl TokEncoder {
         use crate::tensor::quantized::gguf_file;
         let mut f = std::fs::File::open(path)?;
         let c = gguf_file::read_mapped_file(&f)?;
-        let device = {
-            let sz = crate::inference::model::sdpa::gguf_resident_bytes(&c, &["tokenizer."]);
-            crate::inference::place::plan::place_whole(
-                sz,
-                crate::inference::place::runtime_demand::load_runtime_floor(sz),
-            )
-        };
-        let mut layers = Vec::with_capacity(2);
-        for l in 0..2usize {
-            let p = format!("tokenizer.attention_pooler.layers.{l}");
-            layers.push(DetokLayer {
-                input_ln: detok_load_t(
-                    &c,
-                    &mut f,
-                    &format!("{p}.input_layernorm.weight"),
-                    &device,
-                )?,
-                post_ln: detok_load_t(
-                    &c,
-                    &mut f,
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    &device,
-                )?,
-                q: detok_lin(&c, &mut f, &format!("{p}.self_attn.q_proj"), false, &device)?,
-                k: detok_lin(&c, &mut f, &format!("{p}.self_attn.k_proj"), false, &device)?,
-                v: detok_lin(&c, &mut f, &format!("{p}.self_attn.v_proj"), false, &device)?,
-                o: detok_lin(&c, &mut f, &format!("{p}.self_attn.o_proj"), false, &device)?,
-                q_norm: detok_load_t(&c, &mut f, &format!("{p}.self_attn.q_norm.weight"), &device)?,
-                k_norm: detok_load_t(&c, &mut f, &format!("{p}.self_attn.k_norm.weight"), &device)?,
-                gate: detok_lin(&c, &mut f, &format!("{p}.mlp.gate_proj"), false, &device)?,
-                up: detok_lin(&c, &mut f, &format!("{p}.mlp.up_proj"), false, &device)?,
-                down: detok_lin(&c, &mut f, &format!("{p}.mlp.down_proj"), false, &device)?,
-            });
-        }
-        let special_tok = detok_load_t(
-            &c,
-            &mut f,
-            "tokenizer.attention_pooler.special_token",
-            &device,
-        )?
-        .reshape((1, 2048))?;
-        Ok(TokEncoder {
-            proj: detok_lin(&c, &mut f, "tokenizer.audio_acoustic_proj", true, &device)?,
-            embed: detok_lin(
+        load_component("ACE-Step tokenizer", &c, &["tokenizer."], |device| {
+            let stack = Pooler::load(&c, &mut f, "tokenizer.attention_pooler", device)?;
+            let special_tok = detok_load_t(
                 &c,
                 &mut f,
-                "tokenizer.attention_pooler.embed_tokens",
-                true,
-                &device,
-            )?,
-            special_tok,
-            norm: detok_load_t(
-                &c,
-                &mut f,
-                "tokenizer.attention_pooler.norm.weight",
-                &device,
-            )?,
-            fsq_in: detok_lin(&c, &mut f, "tokenizer.quantizer.project_in", true, &device)?,
-            stack: Pooler::acestep(layers, device),
+                "tokenizer.attention_pooler.special_token",
+                device,
+            )?
+            .reshape((1, stack.hidden))?;
+            Ok(TokEncoder {
+                proj: detok_lin(&c, &mut f, "tokenizer.audio_acoustic_proj", true, device)?,
+                embed: detok_lin(
+                    &c,
+                    &mut f,
+                    "tokenizer.attention_pooler.embed_tokens",
+                    true,
+                    device,
+                )?,
+                special_tok,
+                norm: detok_load_t(&c, &mut f, "tokenizer.attention_pooler.norm.weight", device)?,
+                fsq_in: detok_lin(&c, &mut f, "tokenizer.quantizer.project_in", true, device)?,
+                stack,
+            })
         })
     }
 

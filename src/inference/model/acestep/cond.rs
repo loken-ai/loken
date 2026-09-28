@@ -12,17 +12,18 @@
 //! full-attention layers.
 
 use crate::inference::model::acestep::fsq::{
-    detok_lin, detok_load_t, rope_tables, DetokLayer, DetokLinear,
+    detok_lin, detok_load_t, load_component, load_stack, rope_tables, DetokLayer, DetokLinear,
+    StackGeometry,
 };
 use crate::tensor::{Device, Tensor};
 
 /// The ACE-Step condition encoder (lyric + timbre encoders + text projector).
 pub struct CondModel {
-    pub lyric_embed: DetokLinear,      // Linear(1024->2048)+bias
-    pub lyric_layers: Vec<DetokLayer>, // 8
+    pub lyric_embed: DetokLinear, // Linear(1024->2048)+bias
+    pub lyric_layers: Vec<DetokLayer>,
     pub lyric_norm: Tensor,
-    pub timbre_embed: DetokLinear,      // Linear(64->2048)+bias
-    pub timbre_layers: Vec<DetokLayer>, // 4
+    pub timbre_embed: DetokLinear, // Linear(64->2048)+bias
+    pub timbre_layers: Vec<DetokLayer>,
     pub timbre_norm: Tensor,
     pub timbre_cls: Option<Tensor>, // [H] learned CLS (XL only)
     pub text_proj: DetokLinear,     // Linear(1024->2048) no bias
@@ -37,96 +38,66 @@ pub struct CondModel {
 
 impl CondModel {
     /// Load the condition encoder from acestep-v15-turbo-Q8_0.gguf (`encoder.*`).
-    /// Geometry mirrors the DiT/detok (H2048/16h/8kv/hd128/θ1e6); lyric 8L, timbre 4L.
+    /// The width, heads and layer counts are those of the checkpoint's tensors.
     pub fn from_gguf(path: &str) -> crate::tensor::Result<Self> {
         use crate::tensor::quantized::gguf_file;
         let mut f = std::fs::File::open(path)?;
         let c = gguf_file::read_mapped_file(&f)?;
-        // Placed on what THIS component occupies, read from the checkpoint's own tensor
-        // directory. The typed 4 GB that used to stand here was a figure nobody measured
-        // deciding a real placement, and the file size beside it was the whole shared
-        // GGUF - denoiser included - for an encoder that is a fraction of it.
-        let device = {
-            let sz = crate::inference::model::sdpa::gguf_resident_bytes(&c, &["encoder."]);
-            crate::inference::place::plan::place_whole(
-                sz,
-                crate::inference::place::runtime_demand::load_runtime_floor(sz),
-            )
-        };
-        let load_layers = |c: &gguf_file::Content,
-                           f: &mut std::fs::File,
-                           prefix: &str,
-                           n: usize,
-                           device: &Device|
-         -> crate::tensor::Result<Vec<DetokLayer>> {
-            let mut v = Vec::with_capacity(n);
-            for l in 0..n {
-                let p = format!("{prefix}.layers.{l}");
-                v.push(DetokLayer {
-                    input_ln: detok_load_t(c, f, &format!("{p}.input_layernorm.weight"), device)?,
-                    post_ln: detok_load_t(
-                        c,
-                        f,
-                        &format!("{p}.post_attention_layernorm.weight"),
-                        device,
-                    )?,
-                    q: detok_lin(c, f, &format!("{p}.self_attn.q_proj"), false, device)?,
-                    k: detok_lin(c, f, &format!("{p}.self_attn.k_proj"), false, device)?,
-                    v: detok_lin(c, f, &format!("{p}.self_attn.v_proj"), false, device)?,
-                    o: detok_lin(c, f, &format!("{p}.self_attn.o_proj"), false, device)?,
-                    q_norm: detok_load_t(c, f, &format!("{p}.self_attn.q_norm.weight"), device)?,
-                    k_norm: detok_load_t(c, f, &format!("{p}.self_attn.k_norm.weight"), device)?,
-                    gate: detok_lin(c, f, &format!("{p}.mlp.gate_proj"), false, device)?,
-                    up: detok_lin(c, f, &format!("{p}.mlp.up_proj"), false, device)?,
-                    down: detok_lin(c, f, &format!("{p}.mlp.down_proj"), false, device)?,
-                });
-            }
-            Ok(v)
-        };
-        let lyric_layers = load_layers(&c, &mut f, "encoder.lyric_encoder", 8, &device)?;
-        let timbre_layers = load_layers(&c, &mut f, "encoder.timbre_encoder", 4, &device)?;
-        // CLS token is used only by XL models (gated on the `acestep.encoder_hidden_size`
-        // metadata, NOT tensor presence - the special_token tensor exists but is unused
-        // on 2B models). Oracle cond-enc.h: use_timbre_cls = encoder_hidden_size > 0.
-        let use_cls = c
-            .metadata
-            .get("acestep.encoder_hidden_size")
-            .and_then(|v| v.to_u32().ok())
-            .unwrap_or(0)
-            > 0;
-        let timbre_cls = if use_cls {
-            detok_load_t(&c, &mut f, "encoder.timbre_encoder.special_token", &device).ok()
-        } else {
-            None
-        };
-        Ok(CondModel {
-            lyric_embed: detok_lin(
-                &c,
-                &mut f,
-                "encoder.lyric_encoder.embed_tokens",
-                true,
-                &device,
-            )?,
-            lyric_layers,
-            lyric_norm: detok_load_t(&c, &mut f, "encoder.lyric_encoder.norm.weight", &device)?,
-            timbre_embed: detok_lin(
-                &c,
-                &mut f,
-                "encoder.timbre_encoder.embed_tokens",
-                true,
-                &device,
-            )?,
-            timbre_layers,
-            timbre_norm: detok_load_t(&c, &mut f, "encoder.timbre_encoder.norm.weight", &device)?,
-            timbre_cls,
-            text_proj: detok_lin(&c, &mut f, "encoder.text_projector", false, &device)?,
-            hidden: 2048,
-            n_head: 16,
-            n_kv: 8,
-            head_dim: 128,
-            rope_theta: 1e6,
-            sliding_window: 128,
-            device,
+        load_component("ACE-Step condition encoder", &c, &["encoder."], |device| {
+            let lyric = StackGeometry::read(&c, "encoder.lyric_encoder")?;
+            let timbre = StackGeometry::read(&c, "encoder.timbre_encoder")?;
+            let lyric_layers =
+                load_stack(&c, &mut f, "encoder.lyric_encoder", lyric.layers, device)?;
+            let timbre_layers =
+                load_stack(&c, &mut f, "encoder.timbre_encoder", timbre.layers, device)?;
+            // The CLS token is used only when the checkpoint declares an encoder hidden
+            // size: the special_token tensor is present on every model and unused on the
+            // smaller ones.
+            let use_cls = c
+                .metadata
+                .get("acestep.encoder_hidden_size")
+                .and_then(|v| v.to_u32().ok())
+                .unwrap_or(0)
+                > 0;
+            let timbre_cls = if use_cls {
+                detok_load_t(&c, &mut f, "encoder.timbre_encoder.special_token", device).ok()
+            } else {
+                None
+            };
+            Ok(CondModel {
+                lyric_embed: detok_lin(
+                    &c,
+                    &mut f,
+                    "encoder.lyric_encoder.embed_tokens",
+                    true,
+                    device,
+                )?,
+                lyric_layers,
+                lyric_norm: detok_load_t(&c, &mut f, "encoder.lyric_encoder.norm.weight", device)?,
+                timbre_embed: detok_lin(
+                    &c,
+                    &mut f,
+                    "encoder.timbre_encoder.embed_tokens",
+                    true,
+                    device,
+                )?,
+                timbre_layers,
+                timbre_norm: detok_load_t(
+                    &c,
+                    &mut f,
+                    "encoder.timbre_encoder.norm.weight",
+                    device,
+                )?,
+                timbre_cls,
+                text_proj: detok_lin(&c, &mut f, "encoder.text_projector", false, device)?,
+                hidden: lyric.hidden,
+                n_head: lyric.n_head,
+                n_kv: lyric.n_kv,
+                head_dim: lyric.head_dim,
+                rope_theta: 1e6,
+                sliding_window: 128,
+                device: device.clone(),
+            })
         })
     }
 
@@ -239,16 +210,18 @@ impl CondModel {
             .to_vec1_f32()
     }
 
-    /// Lyric path: `lyric_embed [S,1024]` -> embed Linear(+bias) -> 8L -> norm -> `[S,2048]`.
+    /// Lyric path: `lyric_embed [S,E]` -> embed Linear(+bias) -> encoder stack -> norm -> `[S,H]`.
     pub fn lyric_forward(&self, lyric_embed: &[f32], s: usize) -> crate::tensor::Result<Vec<f32>> {
-        let x = Tensor::from_vec_f32(lyric_embed.to_vec(), (s, 1024))?.to_device(&self.device)?;
+        let width = lyric_embed.len() / s.max(1);
+        let x = Tensor::from_vec_f32(lyric_embed.to_vec(), (s, width))?.to_device(&self.device)?;
         let emb = self.lyric_embed.forward(&x)?;
         self.encode_stack(emb, &self.lyric_layers, &self.lyric_norm, s)
     }
 
-    /// Text path: `text_hidden [S,1024]` -> text_projector Linear (no bias) -> `[S,2048]`.
+    /// Text path: `text_hidden [S,E]` -> text_projector Linear (no bias) -> `[S,H]`.
     pub fn text_forward(&self, text_hidden: &[f32], s: usize) -> crate::tensor::Result<Vec<f32>> {
-        let x = Tensor::from_vec_f32(text_hidden.to_vec(), (s, 1024))?.to_device(&self.device)?;
+        let width = text_hidden.len() / s.max(1);
+        let x = Tensor::from_vec_f32(text_hidden.to_vec(), (s, width))?.to_device(&self.device)?;
         self.text_proj.forward(&x)?.flatten_all()?.to_vec1_f32()
     }
 

@@ -219,13 +219,9 @@ pub fn fuse_weight_norm(v: &[f32], g: &[f32], d0: usize, eps: f32) -> Vec<f32> {
 use crate::tensor::{DType, Storage};
 use crate::tensor::{Device as ND, Tensor as NT};
 
-/// Standard free-VRAM-aware placement (same mechanism as every other model). The VAE is
-/// a conv pipeline, not a uniform layer stack, so the HeteroPlan degenerates to N=1: the
-/// whole decoder packs onto the fastest GPU when it fits its budget (weights + a reserve
-/// for the chunked-conv intermediates), else falls back to CPU. `model_size` is what the
-/// caller's component actually puts on the card - the file's size on disk is neither: it
-/// covers components this loader does not read, and under-states the ones it does by the
-/// factor their weights expand by on the way to the device.
+/// The device a decoder of `model_size` resident bytes runs on, with the 48 kHz decoder's
+/// reserve for its chunked-conv intermediates: the fastest card that holds both, else the
+/// host. `model_size` is what the component puts on the card, not the file's size.
 pub fn vae_best_device(model_size: u64) -> ND {
     vae_best_device_with_reserve(
         model_size,
@@ -237,42 +233,13 @@ pub fn vae_best_device(model_size: u64) -> ND {
     )
 }
 
-/// [`vae_best_device`] for a caller that knows what its decode actually costs.
-///
-/// The reserve is what stops the planner from putting one more component on the card, so
-/// it has to be the decode's, not a family's. One figure covered a 48 kHz decoder that
-/// upsamples by 1920, a 24 kHz one that upsamples by 480, and a text encoder that
-/// upsamples nothing at all; it can only have been right for one of them.
-///
-/// [`vae_best_device`] still answers with the 48 kHz decoder's figure, so a caller that has
-/// not yet derived its own is placed exactly as it was. That is deliberate: lowering a
-/// reserve does not free memory, it lets the planner put one more component on the card,
-/// and a caller whose real peak nobody has computed is not the place to find that out.
+/// [`vae_best_device`] for a caller that knows what its decode costs: the placement
+/// ladder's answer for a component of `model_size` bytes that keeps `reserve` free.
 pub fn vae_best_device_with_reserve(model_size: u64, reserve: u64) -> ND {
-    use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
-    let cudas = crate::inference::place::vram_manager::probe_under_pressure(reserve);
-    let budget: Vec<(usize, u64)> = cudas.iter().map(|(i, f, _)| (*i, *f)).collect();
-    // The budgets below ALREADY exclude the reserve: `probe_under_pressure` probes through
-    // `probe_cuda_devices`, which returns `stable_free - reserve`. Passing it again here
-    // subtracted it TWICE - invisible at half a gigabyte, and fatal at twelve, where it
-    // took both cards to zero usable and sent a whole video DiT to the host.
-    let plan = HeteroPlan::calculate_with_kv_reserve(1, model_size, &budget, &[], 1.0, 0, 0);
-    let dev = match plan.segments.first().map(|s| s.kind) {
-        Some(DeviceKind::Cuda(idx)) => cudas
-            .iter()
-            .find(|(i, _, _)| *i == idx)
-            .map(|(_, _, d)| d.clone())
-            .unwrap_or(ND::Cpu),
-        _ => ND::Cpu,
-    };
-    eprintln!(
-        "[ace-vae] placement: {} (free-VRAM gate)",
-        plan.segments
-            .first()
-            .map(|s| s.kind.to_string())
-            .unwrap_or_else(|| "CPU".into())
-    );
-    dev
+    crate::inference::place::ladder::load_whole("Oobleck decoder", model_size, reserve, |d| {
+        Ok::<ND, String>(d.clone())
+    })
+    .unwrap_or(ND::Cpu)
 }
 
 /// What the decoder puts on the card, from the checkpoint's own tensor directory.
@@ -604,6 +571,9 @@ fn vae_load_snake(
     })
 }
 
+/// The smallest decode chunk, in latent frames, worth retrying at.
+const MIN_DECODE_CHUNK: usize = 16;
+
 impl OobleckDecoder {
     /// Load the AutoencoderOobleck DECODER from an ACE-Step VAE GGUF
     /// (`vae-BF16.gguf`). Arranges + weight-norm-fuses the 365-tensor inventory
@@ -623,70 +593,69 @@ impl OobleckDecoder {
         // real placement, and the 2 GB reserve behind it was the 48 kHz decoder's - handed
         // unchanged to a 24 kHz one that upsamples by a quarter as much.
         let model_size = decoder_resident_bytes(&content);
-        let dev = vae_best_device_with_reserve(
-            model_size,
-            crate::inference::place::audio_demand::oobleck_reserve(
-                crate::inference::place::audio_demand::ACE_VAE_REFERENCE_WINDOW,
-                &decoder_levels(&content, "decoder.block", &strides),
-                crate::inference::place::audio_demand::OOBLECK_KERNEL,
-            ),
+        let reserve = crate::inference::place::audio_demand::oobleck_reserve(
+            crate::inference::place::audio_demand::ACE_VAE_REFERENCE_WINDOW,
+            &decoder_levels(&content, "decoder.block", &strides),
+            crate::inference::place::audio_demand::OOBLECK_KERNEL,
         );
-
-        let conv1 = vae_load_conv(&content, &mut file, "decoder.conv1", false, eps, &dev)?;
-        let dils = [1usize, 3, 9];
-        let mut blocks = Vec::with_capacity(5);
-        for (i, &stride) in strides.iter().enumerate() {
-            let bp = format!("decoder.block.{i}");
-            let snake1 = vae_load_snake(&content, &mut file, &format!("{bp}.snake1"), &dev)?;
-            let conv_t = vae_load_conv(
-                &content,
-                &mut file,
-                &format!("{bp}.conv_t1"),
-                true,
-                eps,
-                &dev,
-            )?;
-            let mut res = Vec::with_capacity(3);
-            for (r, &dilation) in dils.iter().enumerate() {
-                let rp = format!("{bp}.res_unit{}", r + 1);
-                res.push(ResUnitW {
-                    snake1: vae_load_snake(&content, &mut file, &format!("{rp}.snake1"), &dev)?,
-                    conv1: vae_load_conv(
-                        &content,
-                        &mut file,
-                        &format!("{rp}.conv1"),
-                        false,
-                        eps,
-                        &dev,
-                    )?,
-                    snake2: vae_load_snake(&content, &mut file, &format!("{rp}.snake2"), &dev)?,
-                    conv2: vae_load_conv(
-                        &content,
-                        &mut file,
-                        &format!("{rp}.conv2"),
-                        false,
-                        eps,
-                        &dev,
-                    )?,
-                    dilation,
+        crate::inference::place::ladder::load_whole("ACE-Step VAE", model_size, reserve, |dev| {
+            let dev = dev.clone();
+            let conv1 = vae_load_conv(&content, &mut file, "decoder.conv1", false, eps, &dev)?;
+            let dils = [1usize, 3, 9];
+            let mut blocks = Vec::with_capacity(5);
+            for (i, &stride) in strides.iter().enumerate() {
+                let bp = format!("decoder.block.{i}");
+                let snake1 = vae_load_snake(&content, &mut file, &format!("{bp}.snake1"), &dev)?;
+                let conv_t = vae_load_conv(
+                    &content,
+                    &mut file,
+                    &format!("{bp}.conv_t1"),
+                    true,
+                    eps,
+                    &dev,
+                )?;
+                let mut res = Vec::with_capacity(3);
+                for (r, &dilation) in dils.iter().enumerate() {
+                    let rp = format!("{bp}.res_unit{}", r + 1);
+                    res.push(ResUnitW {
+                        snake1: vae_load_snake(&content, &mut file, &format!("{rp}.snake1"), &dev)?,
+                        conv1: vae_load_conv(
+                            &content,
+                            &mut file,
+                            &format!("{rp}.conv1"),
+                            false,
+                            eps,
+                            &dev,
+                        )?,
+                        snake2: vae_load_snake(&content, &mut file, &format!("{rp}.snake2"), &dev)?,
+                        conv2: vae_load_conv(
+                            &content,
+                            &mut file,
+                            &format!("{rp}.conv2"),
+                            false,
+                            eps,
+                            &dev,
+                        )?,
+                        dilation,
+                    });
+                }
+                blocks.push(BlockW {
+                    snake1,
+                    conv_t,
+                    stride,
+                    padding: stride / 2,
+                    res,
                 });
             }
-            blocks.push(BlockW {
-                snake1,
-                conv_t,
-                stride,
-                padding: stride / 2,
-                res,
-            });
-        }
-        let snake_final = vae_load_snake(&content, &mut file, "decoder.snake1", &dev)?;
-        let conv2 = vae_load_conv(&content, &mut file, "decoder.conv2", false, eps, &dev)?;
-        Ok(OobleckDecoder {
-            conv1,
-            blocks,
-            snake_final,
-            conv2,
-            device: dev,
+            let snake_final = vae_load_snake(&content, &mut file, "decoder.snake1", &dev)?;
+            let conv2 = vae_load_conv(&content, &mut file, "decoder.conv2", false, eps, &dev)?;
+            Ok(OobleckDecoder {
+                conv1,
+                blocks,
+                snake_final,
+                conv2,
+                device: dev,
+            })
         })
     }
 
@@ -714,10 +683,8 @@ impl OobleckDecoder {
         Ok((v, c_out, t_audio))
     }
 
-    /// Memory-bounded decode with OOM protection: tries `chunk`, and on a CUDA
-    /// out-of-memory it HALVES the chunk and retries (the conv im2col scales with the
-    /// chunk), so the decode fits whatever VRAM is free at runtime - even with the DiT
-    /// still resident - instead of crashing. Floors at 16 frames before giving up.
+    /// Memory-bounded decode: tries `chunk`, and each time a card runs out of memory halves
+    /// the chunk (the conv im2col scales with it) down to [`MIN_DECODE_CHUNK`] frames.
     pub fn decode_chunked(
         &self,
         latent: &[f32],
@@ -739,25 +706,15 @@ impl OobleckDecoder {
         overlap: usize,
         on_chunk: Option<&dyn Fn(usize, usize) -> crate::tensor::Result<()>>,
     ) -> crate::tensor::Result<(Vec<f32>, usize, usize)> {
-        let mut ch = chunk.max(16);
-        loop {
-            let ov = overlap.min(ch.saturating_sub(1)).max(1);
-            match self.decode_chunked_at(latent, c, t, ch, ov, on_chunk) {
-                Ok(r) => return Ok(r),
-                Err(e) => {
-                    let oom = {
-                        let s = format!("{e:?}").to_lowercase();
-                        s.contains("out of memory") || s.contains("out_of_memory")
-                    };
-                    if oom && ch > 16 {
-                        ch /= 2;
-                        eprintln!("[ace-vae] decode OOM - retrying at chunk={ch} (im2col shrinks with the chunk)");
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        }
+        crate::inference::place::ladder::halve_until_fits(
+            "ACE-Step VAE decode chunk",
+            chunk,
+            MIN_DECODE_CHUNK,
+            |ch| {
+                let ov = overlap.min(ch.saturating_sub(1)).max(1);
+                self.decode_chunked_at(latent, c, t, ch, ov, on_chunk)
+            },
+        )
     }
 
     /// Single-pass chunked decode (no retry). The Oobleck pipeline upsamples by exactly
