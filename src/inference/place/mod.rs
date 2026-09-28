@@ -8,6 +8,8 @@ pub mod audio_demand;
 pub mod device_probe;
 pub mod dry_plan;
 pub mod fit_report;
+#[cfg(all(test, feature = "image"))]
+mod geometry_invariants;
 pub mod ladder;
 pub mod layer_executor;
 pub mod layer_perf;

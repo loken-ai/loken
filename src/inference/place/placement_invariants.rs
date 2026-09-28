@@ -36,7 +36,7 @@ use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
 
 /// Every `.rs` file under the crate's `src`, except `src/bin`: those binaries are probes
 /// and benchmarks that place by intent on a quiet machine, and are not the served fleet.
-fn fleet_sources() -> Vec<std::path::PathBuf> {
+pub(super) fn fleet_sources() -> Vec<std::path::PathBuf> {
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -68,7 +68,7 @@ fn fleet_sources() -> Vec<std::path::PathBuf> {
 /// The part of a file that ships. Fixtures in a test module name concrete devices and
 /// concrete byte counts on purpose - that is how they pin behaviour - so only production
 /// code is read.
-fn production(text: &str) -> &str {
+pub(super) fn production(text: &str) -> &str {
     text.split("#[cfg(test)]").next().unwrap_or("")
 }
 
@@ -120,7 +120,7 @@ fn declared_under_cfg_test(path: &std::path::Path) -> bool {
 
 /// A line with its trailing comment removed. A sentence ABOUT a card index is not a
 /// decision taken on one, and these files carry a great deal of prose.
-fn code_only(line: &str) -> &str {
+pub(super) fn code_only(line: &str) -> &str {
     match line.find("//") {
         Some(p) => &line[..p],
         None => line,
