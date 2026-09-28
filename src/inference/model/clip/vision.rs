@@ -9,10 +9,10 @@
 //! plausible choice here is wrong in a way nothing downstream can detect - the shapes
 //! all match and the video merely comes out subtly unrelated to the input:
 //!
-//!   * the PENULTIMATE hidden state, i.e. after layer 30 of 0..31, not the last;
+//!   * the PENULTIMATE hidden state, i.e. after the second-to-last layer, not the last;
 //!   * WITHOUT `post_layernorm` (that norm serves the pooled CLS output, which is not
 //!     what is consumed here);
-//!   * all 257 tokens (1 class + 16x16 patches), not a pooled vector.
+//!   * every token (1 class + the patch grid), not a pooled vector.
 //!
 //! The encoder is asked for `intermediate_output=-2` and the model is handed
 //! `penultimate_hidden_states`; the conditioning path
@@ -28,20 +28,57 @@ use crate::tensor::Module;
 use crate::tensor::VarBuilder;
 use crate::tensor::{DType, Device, Result, Tensor};
 
-/// ViT-H/14 geometry. Fixed by the checkpoint, not configurable: a different width or
-/// depth is a different model, and guessing them from tensor shapes would hide a
-/// mismatched file instead of reporting it.
-const WIDTH: usize = 1280;
-const LAYERS: usize = 32;
-const HEADS: usize = 16;
-const MLP_DIM: usize = 5120;
-/// 224 / 14 = 16 patches a side, plus the class token.
-pub const IMAGE_SIZE: usize = 224;
-const PATCH: usize = 14;
-const GRID: usize = IMAGE_SIZE / PATCH;
-pub const TOKENS: usize = GRID * GRID + 1;
-/// Which layer's output is consumed (0-based): the penultimate one.
-const PENULTIMATE: usize = LAYERS - 2;
+/// The attention's head count. The checkpoint ships without a config and its tensors do
+/// not state it; ViT-H splits its width into this many heads.
+const ATTENTION_HEADS: usize = 16;
+
+/// The tower's shape, read from the stored tensors.
+#[derive(Debug, Clone, Copy)]
+struct Geometry {
+    width: usize,
+    layers: usize,
+    mlp: usize,
+    /// Pixels on a side of a patch, and patches on a side of the image.
+    patch: usize,
+    grid: usize,
+}
+
+impl Geometry {
+    fn read(v: &VarBuilder) -> Result<Self> {
+        let e = v.pp("embeddings");
+        let width = e.shape_of("class_embedding")?[0];
+        let patch = e.pp("patch_embedding").shape_of("weight")?[2];
+        let positions = e.pp("position_embedding").shape_of("weight")?[0];
+        // The positions are the class token and a square grid of patches.
+        let grid = (positions.saturating_sub(1) as f64).sqrt().round() as usize;
+        if grid * grid + 1 != positions {
+            return Err(crate::tensor::Error(format!(
+                "clip vision: {positions} positions are not a square grid and a class token"
+            )));
+        }
+        let enc = v.pp("encoder").pp("layers");
+        Ok(Self {
+            width,
+            layers: v.pp("encoder").count_children("layers"),
+            mlp: enc.pp("0").pp("mlp").pp("fc1").shape_of("weight")?[0],
+            patch,
+            grid,
+        })
+    }
+
+    fn tokens(&self) -> usize {
+        self.grid * self.grid + 1
+    }
+
+    fn image_size(&self) -> usize {
+        self.grid * self.patch
+    }
+
+    /// Which layer's output is consumed (0-based): the penultimate one.
+    fn penultimate(&self) -> usize {
+        self.layers.saturating_sub(2)
+    }
+}
 
 /// CLIP's image normalisation. Not ImageNet's - close enough to look right and wrong
 /// enough to shift the embedding.
@@ -53,21 +90,23 @@ struct Attention {
     k: Linear,
     v: Linear,
     out: Linear,
+    width: usize,
 }
 
 impl Attention {
-    fn new(vb: &VarBuilder) -> Result<Self> {
+    fn new(vb: &VarBuilder, width: usize) -> Result<Self> {
         Ok(Self {
-            q: linear(WIDTH, WIDTH, &vb.pp("q_proj"))?,
-            k: linear(WIDTH, WIDTH, &vb.pp("k_proj"))?,
-            v: linear(WIDTH, WIDTH, &vb.pp("v_proj"))?,
-            out: linear(WIDTH, WIDTH, &vb.pp("out_proj"))?,
+            q: linear(width, width, &vb.pp("q_proj"))?,
+            k: linear(width, width, &vb.pp("k_proj"))?,
+            v: linear(width, width, &vb.pp("v_proj"))?,
+            out: linear(width, width, &vb.pp("out_proj"))?,
+            width,
         })
     }
 
-    /// `xs`: `[tokens, WIDTH]`.
+    /// `xs`: `[tokens, width]`.
     ///
-    /// The scores are formed, softmaxed and applied here, in one pass over the whole 257-token
+    /// The scores are formed, softmaxed and applied here, in one pass over the whole token
     /// square, and the scale multiplies them AFTER the first product rather than being folded
     /// into the query before it. Both are part of what this tower answers: the rounding of a
     /// product-then-scale differs from that of a scale-then-product, and a pass split into
@@ -76,9 +115,11 @@ impl Attention {
     /// is invisible at every later step.
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let n = xs.dims()[0];
-        let hd = WIDTH / HEADS;
+        let hd = self.width / ATTENTION_HEADS;
         let split = |t: Tensor| -> Result<Tensor> {
-            t.reshape(vec![n, HEADS, hd])?.transpose(0, 1)?.contiguous()
+            t.reshape(vec![n, ATTENTION_HEADS, hd])?
+                .transpose(0, 1)?
+                .contiguous()
         };
         let q = split(self.q.forward(xs)?)?;
         let k = split(self.k.forward(xs)?)?;
@@ -92,7 +133,7 @@ impl Attention {
             .matmul(&v)?
             .transpose(0, 1)?
             .contiguous()?
-            .reshape(vec![n, WIDTH])?;
+            .reshape(vec![n, self.width])?;
         self.out.forward(&o)
     }
 }
@@ -105,18 +146,19 @@ struct Layer {
 }
 
 impl Layer {
-    fn new(vb: &VarBuilder) -> Result<Self> {
+    fn new(vb: &VarBuilder, g: &Geometry) -> Result<Self> {
+        let (width, mlp) = (g.width, g.mlp);
         Ok(Self {
-            norm1: layer_norm(WIDTH, 1e-5, &vb.pp("layer_norm1"))?,
-            attn: Attention::new(&vb.pp("self_attn"))?,
-            norm2: layer_norm(WIDTH, 1e-5, &vb.pp("layer_norm2"))?,
+            norm1: layer_norm(width, 1e-5, &vb.pp("layer_norm1"))?,
+            attn: Attention::new(&vb.pp("self_attn"), width)?,
+            norm2: layer_norm(width, 1e-5, &vb.pp("layer_norm2"))?,
             // CLIP uses the sigmoid approximation of GELU (`quick_gelu` in this checkpoint's
             // config); the error-function form drifts the activations enough to matter over
-            // thirty-two layers.
+            // the tower's depth.
             mlp: crate::tensor::layer::Mlp::new(
-                linear(WIDTH, MLP_DIM, &vb.pp("mlp").pp("fc1"))?,
+                linear(width, mlp, &vb.pp("mlp").pp("fc1"))?,
                 crate::tensor::ops::Activation::QuickGelu,
-                linear(MLP_DIM, WIDTH, &vb.pp("mlp").pp("fc2"))?,
+                linear(mlp, width, &vb.pp("mlp").pp("fc2"))?,
             ),
         })
     }
@@ -135,6 +177,7 @@ pub struct ClipVisionH {
     position_embedding: Tensor,
     pre_norm: LayerNorm,
     layers: Vec<Layer>,
+    g: Geometry,
     device: Device,
 }
 
@@ -142,33 +185,36 @@ impl ClipVisionH {
     pub fn load(path: &str, device: &Device) -> Result<Self> {
         let vb = unsafe { VarBuilder::from_files(&[path], DType::F32, device) }?;
         let v = vb.pp("vision_model");
+        let g = Geometry::read(&v)?;
+        let (width, patch) = (g.width, g.patch);
         let cfg = Conv2dConfig {
             padding: 0,
-            stride: PATCH,
+            stride: patch,
             ..Default::default()
         };
-        let mut layers = Vec::with_capacity(LAYERS);
+        let mut layers = Vec::with_capacity(g.layers);
         let enc = v.pp("encoder").pp("layers");
-        for i in 0..LAYERS {
-            layers.push(Layer::new(&enc.pp(i.to_string()))?);
+        for i in 0..g.layers {
+            layers.push(Layer::new(&enc.pp(i.to_string()), &g)?);
         }
         Ok(Self {
             // The patch projection carries no bias in this checkpoint.
             patch: conv2d_no_bias(
                 3,
-                WIDTH,
-                PATCH,
+                width,
+                patch,
                 cfg,
                 &v.pp("embeddings").pp("patch_embedding"),
             )?,
-            class_embedding: v.pp("embeddings").get(WIDTH, "class_embedding")?,
+            class_embedding: v.pp("embeddings").get(width, "class_embedding")?,
             position_embedding: v
                 .pp("embeddings")
                 .pp("position_embedding")
-                .get((TOKENS, WIDTH), "weight")?,
+                .get((g.tokens(), width), "weight")?,
             // Checkpoint spelling, typo included.
-            pre_norm: layer_norm(WIDTH, 1e-5, &v.pp("pre_layrnorm"))?,
+            pre_norm: layer_norm(width, 1e-5, &v.pp("pre_layrnorm"))?,
             layers,
+            g,
             device: device.clone(),
         })
     }
@@ -177,16 +223,16 @@ impl ClipVisionH {
         &self.device
     }
 
-    /// Interleaved RGB8 at any size -> the penultimate hidden states `[TOKENS, WIDTH]`.
+    /// Interleaved RGB8 at any size -> the penultimate hidden states `[tokens, width]`.
     ///
-    /// The image is resized to 224 and normalised with CLIP's own statistics; feeding it
+    /// The image is resized to the tower's image size and normalised with CLIP's own statistics; feeding it
     /// raw, or with ImageNet's, produces an embedding that is plausible and wrong.
     pub fn embed_image(&self, rgb: &[u8], w: usize, h: usize) -> Result<Tensor> {
         let x = self.preprocess(rgb, w, h)?;
         self.forward(&x)
     }
 
-    /// RGB8 -> normalised `[1, 3, 224, 224]` on this tower's device.
+    /// RGB8 -> normalised `[1, 3, S, S]` on this tower's device.
     fn preprocess(&self, rgb: &[u8], w: usize, h: usize) -> Result<Tensor> {
         if w == 0 || h == 0 || rgb.len() < w * h * 3 {
             return Err(crate::tensor::Error(format!(
@@ -197,11 +243,11 @@ impl ClipVisionH {
                 rgb.len()
             )));
         }
-        let s = IMAGE_SIZE;
+        let s = self.g.image_size();
         let plane = s * s;
         let mut chw = vec![0f32; 3 * plane];
         for y in 0..s {
-            // Nearest-neighbour: the tower sees a 224 grid whatever the source, and a
+            // Nearest-neighbour: the tower sees its own grid whatever the source, and a
             // fancier filter changes the embedding by less than the crop choice does.
             let sy = y * h / s;
             for x in 0..s {
@@ -216,16 +262,17 @@ impl ClipVisionH {
         Tensor::from_vec_f32(chw, vec![1, 3, s, s])?.to_device(&self.device)
     }
 
-    /// `[1, 3, 224, 224]` -> `[TOKENS, WIDTH]` after the penultimate layer.
+    /// `[1, 3, S, S]` -> `[tokens, width]` after the penultimate layer.
     fn forward(&self, pixels: &Tensor) -> Result<Tensor> {
-        // Patch projection: [1, WIDTH, GRID, GRID] -> [GRID*GRID, WIDTH].
+        let (width, grid) = (self.g.width, self.g.grid);
+        // Patch projection: [1, width, grid, grid] -> [grid*grid, width].
         let p = self.patch.forward(pixels)?;
         let p = p
-            .reshape(vec![WIDTH, GRID * GRID])?
+            .reshape(vec![width, grid * grid])?
             .transpose(0, 1)?
             .contiguous()?;
         // Class token first, then the patches, then positions.
-        let cls = self.class_embedding.reshape(vec![1, WIDTH])?;
+        let cls = self.class_embedding.reshape(vec![1, width])?;
         let x = Tensor::cat(&[&cls, &p], 0)?;
         let x = x.add(&self.position_embedding)?;
         let mut x = self.pre_norm.forward(&x)?;
@@ -234,7 +281,7 @@ impl ClipVisionH {
             // Stop at the penultimate layer's OUTPUT. Running the last one and
             // discarding it would waste a layer; taking the last one instead would be a
             // different conditioning that nothing downstream could flag.
-            if i == PENULTIMATE {
+            if i == self.g.penultimate() {
                 return Ok(x);
             }
         }
@@ -249,14 +296,41 @@ mod tests {
     //!   cargo test --release -p loken --lib NAME -- --ignored --nocapture
     use super::*;
 
-    /// The geometry has to agree with the checkpoint's own tensor shapes, or the loader
-    /// silently reads the wrong slices.
+    /// The geometry follows the stored tensors: the grid from the position table, the
+    /// depth from the numbered layers, and the consumed layer from the depth.
     #[test]
-    fn the_geometry_matches_the_checkpoint() {
-        assert_eq!(GRID, 16, "224/14 is a 16x16 patch grid");
-        assert_eq!(TOKENS, 257, "256 patches plus the class token");
-        assert_eq!(WIDTH % HEADS, 0, "heads must divide the width");
-        assert_eq!(PENULTIMATE, 30, "layer 30 of 0..31 is the penultimate one");
+    fn the_geometry_is_read_from_the_tensors() {
+        let mut m = std::collections::HashMap::new();
+        let z = |d: &[usize]| Tensor::zeros(d.to_vec(), DType::F32).unwrap();
+        let (width, mlp, patch, grid, layers) = (8, 12, 2, 3, 4);
+        m.insert("embeddings.class_embedding".into(), z(&[width]));
+        m.insert(
+            "embeddings.patch_embedding.weight".into(),
+            z(&[width, 3, patch, patch]),
+        );
+        m.insert(
+            "embeddings.position_embedding.weight".into(),
+            z(&[grid * grid + 1, width]),
+        );
+        for i in 0..layers {
+            m.insert(
+                format!("encoder.layers.{i}.mlp.fc1.weight"),
+                z(&[mlp, width]),
+            );
+        }
+        let vb = VarBuilder::from_tensors(m, DType::F32, &Device::Cpu);
+        let g = Geometry::read(&vb).unwrap();
+        assert_eq!(
+            (g.width, g.mlp, g.patch, g.grid, g.layers),
+            (width, mlp, patch, grid, layers)
+        );
+        assert_eq!(
+            g.tokens(),
+            grid * grid + 1,
+            "the patches plus the class token"
+        );
+        assert_eq!(g.image_size(), grid * patch);
+        assert_eq!(g.penultimate(), layers - 2);
     }
 
     /// The activation the blocks are built with is quick GELU, not the erf form:
@@ -305,26 +379,24 @@ mod tests {
             }
         }
         let out = m.embed_image(&rgb, w, h).expect("embed");
+        let (tokens, width) = (m.g.tokens(), m.g.width);
         assert_eq!(
             out.dims(),
-            &[TOKENS, WIDTH],
-            "Wan consumes all 257 tokens, unpooled"
+            &[tokens, width],
+            "Wan consumes every token, unpooled"
         );
         let v = out.to_vec_f32();
         assert!(v.iter().all(|x| x.is_finite()), "embedding must be finite");
         // Tokens must differ from one another: an embedding where every token is the
         // same value passes a shape check and carries no image.
-        let first = &v[..WIDTH];
-        let last = &v[(TOKENS - 1) * WIDTH..];
+        let first = &v[..width];
+        let last = &v[(tokens - 1) * width..];
         let diff: f32 = first.iter().zip(last).map(|(a, b)| (a - b).abs()).sum();
         assert!(
             diff > 1.0,
             "class and last patch tokens are identical ({diff})"
         );
-        println!(
-            "clip-h penultimate: [{}, {}] finite, token spread {diff:.1}",
-            TOKENS, WIDTH
-        );
+        println!("clip-h penultimate: [{tokens}, {width}] finite, token spread {diff:.1}");
     }
 }
 
