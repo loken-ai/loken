@@ -28,8 +28,7 @@ pub type MarlinSlot = std::sync::Arc<()>;
 /// natively f32, and the repacked Marlin layout serves the small-M speculative-verify regime
 /// the tensor cores win. That doubles the per-linear weight VRAM, so a build that would not
 /// leave enough headroom falls back to `Off` for that layer - which is the only way this is
-/// chosen. `Only` drops the dp4a layout entirely and is VRAM-neutral; nothing selects it
-/// today, and it stays because the fallback logic is written in terms of the three.
+/// chosen. `Only` drops the dp4a layout wherever the repack applies and is VRAM-neutral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AwqMarlinPolicy {
     Off,
@@ -37,10 +36,11 @@ enum AwqMarlinPolicy {
     Only,
 }
 
-/// Both layouts resident: the repacked one for the tensor-core GEMM, the original for the
-/// shapes it does not cover. What decides is free VRAM at build time, below.
+/// One layout resident: the repacked one, which serves every row count through the
+/// tensor-core GEMM, and the dp4a layout only for a shape the repack does not cover. A
+/// second copy of the weights would take the room the first prefill needs.
 fn awq_marlin_policy() -> AwqMarlinPolicy {
-    AwqMarlinPolicy::Dual
+    AwqMarlinPolicy::Only
 }
 
 /// Prefill-sized forwards run on the Marlin M-loop rather than dequant-then-GEMM: it

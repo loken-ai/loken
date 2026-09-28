@@ -1804,7 +1804,14 @@ impl GenericHeteroTransformer {
             (Some(card), true) => card.clone(),
             _ => Device::Cpu,
         };
+        // The residual stream runs in F32; a table stored as a float of another width
+        // comes out of `dequantize` in that width.
         let emb_tensor = emb_qt.dequantize(&emb_device)?;
+        let emb_tensor = if emb_tensor.dtype() == DType::F32 {
+            emb_tensor
+        } else {
+            emb_tensor.to_dtype(DType::F32)?
+        };
         let embeddings = Embedding::new(emb_tensor);
         info!(
             "✅ Loaded embeddings: vocab={}, dim={} ({} MB on {:?})",
@@ -2637,7 +2644,7 @@ impl GenericHeteroTransformer {
                 None
             }
         });
-        let output_proj_cuda: Option<Tensor> = None;
+        let mut output_proj_cuda: Option<Tensor> = None;
         let mut output_norm_cuda_weight: Option<Tensor> = None;
         let mut output_proj_cuda_qmm: Option<crate::tensor::quantized::QMatMul> = None;
         let mut output_proj_dev: Option<Device> = None;
@@ -2645,18 +2652,41 @@ impl GenericHeteroTransformer {
             last_cuda_idx.and_then(|idx| cuda_devices.get(&idx).map(|d| (idx, d)))
         {
             let t_q = std::time::Instant::now();
+            // A quantised head runs as a quantised matmul; a float head (F32, F16, BF16) is
+            // held once, in F16, for the dense matmul the card paths take without one.
             let placed = norm_weight_cpu.to_device(cuda_dev).and_then(|norm_w| {
                 let qt = content.tensor(&mut cursor, output_weight_name, cuda_dev)?;
-                Ok((norm_w, crate::tensor::quantized::QMatMul::from_qtensor(qt)?))
+                let dense = matches!(
+                    qt.dtype(),
+                    crate::tensor::quantized::GgmlDType::F32
+                        | crate::tensor::quantized::GgmlDType::F16
+                        | crate::tensor::quantized::GgmlDType::BF16
+                );
+                let head = if dense {
+                    (
+                        None,
+                        Some(
+                            qt.dequantize(cuda_dev)?
+                                .to_dtype(crate::tensor::DType::F16)?,
+                        ),
+                    )
+                } else {
+                    (
+                        Some(crate::tensor::quantized::QMatMul::from_qtensor(qt)?),
+                        None,
+                    )
+                };
+                Ok((norm_w, head))
             });
             match placed {
-                Ok((norm_w, qmm)) => {
+                Ok((norm_w, (qmm, dense))) => {
                     info!(
-                        "  Output projection on CUDA:{idx} as QMatMul ({:.0}ms)",
+                        "  Output projection on CUDA:{idx} ({:.0}ms)",
                         t_q.elapsed().as_secs_f64() * 1000.0
                     );
                     output_norm_cuda_weight = Some(norm_w);
-                    output_proj_cuda_qmm = Some(qmm);
+                    output_proj_cuda_qmm = qmm;
+                    output_proj_cuda = dense;
                     output_proj_dev = Some(cuda_dev.clone());
                 }
                 Err(e) if crate::inference::place::ladder::is_out_of_memory(&e) => return Err(e),

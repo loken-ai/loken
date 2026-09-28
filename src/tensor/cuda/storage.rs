@@ -32,10 +32,21 @@ macro_rules! device_dtypes {
                 pub fn $accessor(&self) -> Result<&CudaSlice<$ty>> {
                     match self {
                         Self::$variant(s) => Ok(s),
-                        other => Err(Error(format!(
-                            concat!("expected ", $name, " cuda storage, got {}"),
-                            other.dtype()
-                        ))),
+                        // The call stack, when RUST_LIB_BACKTRACE asks for it, names the
+                        // operation that handed over the wrong dtype.
+                        other => {
+                            let stack = std::backtrace::Backtrace::capture();
+                            Err(Error(format!(
+                                concat!("expected ", $name, " cuda storage, got {}{}"),
+                                other.dtype(),
+                                match stack.status() {
+                                    std::backtrace::BacktraceStatus::Captured => {
+                                        format!("\n{stack}")
+                                    }
+                                    _ => String::new(),
+                                }
+                            )))
+                        }
                     }
                 }
             )+
