@@ -2,7 +2,7 @@
 //! whether it runs tensor-parallel. The loader asks here and builds what it is told; it does
 //! not read the cards itself.
 
-use super::ladder::Demand;
+use super::ladder::{on_one_card, Demand};
 
 /// The owner a language model's placement reads the cards as.
 const OWNER: &str = "llm";
@@ -134,6 +134,87 @@ pub fn context_the_cards_hold(
     chosen
 }
 
+/// A tensor-parallel placement: every block runs on each of `cards`, the feed-forward rows
+/// split so the first card takes `ffn_share.0 / ffn_share.1` of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorParallel {
+    pub cards: Vec<usize>,
+    pub ffn_share: (usize, usize),
+}
+
+/// Tensor parallelism over the first `ranks` cards, when the cards' speeds are read now.
+pub fn tensor_parallel(
+    demand: &Demand,
+    cards: &[(usize, u64)],
+    ranks: usize,
+) -> Option<TensorParallel> {
+    let speeds: Vec<(usize, u64)> = super::room::card_rooms()
+        .into_iter()
+        .map(|c| (c.index, c.perf))
+        .collect();
+    tensor_parallel_on(demand, cards, &speeds, ranks)
+}
+
+/// Tensor parallelism for `demand` over the first `ranks` of `cards`, chosen when the first
+/// plan does not hold it on one card and each rank holds its share with the runtime reserve
+/// and its part of the cache beside it. The first card takes feed-forward rows in proportion
+/// to its speed among the ranks when that share fits, else an even share.
+pub fn tensor_parallel_on(
+    demand: &Demand,
+    cards: &[(usize, u64)],
+    speeds: &[(usize, u64)],
+    ranks: usize,
+) -> Option<TensorParallel> {
+    if ranks < 2 || cards.len() < ranks || on_one_card(&demand.plan(cards)) {
+        return None;
+    }
+    let ranked = &cards[..ranks];
+    let weights = demand.block_bytes.saturating_add(demand.head_bytes);
+    let cache = demand
+        .kv_bytes_per_layer
+        .saturating_mul(demand.layers as u64)
+        / ranks as u64;
+    let room: Vec<u64> = ranked
+        .iter()
+        .map(|(_, free)| {
+            free.saturating_sub(demand.runtime_reserve)
+                .saturating_sub(cache)
+        })
+        .collect();
+    let speed = |idx: usize| {
+        speeds
+            .iter()
+            .find(|(i, _)| *i == idx)
+            .map_or(0, |(_, s)| *s)
+    };
+    let first = speed(ranked[0].0);
+    let all: u64 = ranked.iter().map(|(idx, _)| speed(*idx)).sum();
+    let fits = |num: u64, den: u64| {
+        let first_share = weights.saturating_mul(num) / den;
+        let rest = weights.saturating_sub(first_share) / (ranks as u64 - 1);
+        first_share <= room[0] && room[1..].iter().all(|r| rest <= *r)
+    };
+    let by_speed = (first > 0 && all > first).then(|| reduced(first, all));
+    let even = (1, ranks as u64);
+    let share = by_speed
+        .filter(|&(n, d)| fits(n, d))
+        .or_else(|| fits(even.0, even.1).then_some(even))?;
+    Some(TensorParallel {
+        cards: ranked.iter().map(|(idx, _)| *idx).collect(),
+        ffn_share: (share.0 as usize, share.1 as usize),
+    })
+}
+
+/// `num / den` in lowest terms.
+fn reduced(num: u64, den: u64) -> (u64, u64) {
+    let (mut a, mut b) = (num, den);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    let g = a.max(1);
+    (num / g, den / g)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +249,37 @@ mod tests {
         assert_eq!(context_the_cards_hold(32768, 4096, &cards, at), 8192);
         assert_eq!(context_the_cards_hold(32768, 4096, &[], at), 32768);
         assert_eq!(context_the_cards_hold(32768, 32768, &cards, at), 32768);
+    }
+
+    #[test]
+    fn a_model_one_card_holds_is_not_split_by_rank() {
+        let cards = [(0, 20 * GB), (1, 20 * GB)];
+        assert_eq!(
+            tensor_parallel_on(&demand(10, 8), &cards, &[(0, 2), (1, 1)], 2),
+            None
+        );
+    }
+
+    #[test]
+    fn the_faster_card_takes_the_larger_share_when_it_fits() {
+        let cards = [(0, 16 * GB), (1, 16 * GB)];
+        let tp = tensor_parallel_on(&demand(10, 20), &cards, &[(0, 2), (1, 1)], 2).unwrap();
+        assert_eq!(tp.cards, vec![0, 1]);
+        assert_eq!(tp.ffn_share, (2, 3));
+    }
+
+    #[test]
+    fn a_speed_share_that_does_not_fit_falls_back_to_even_then_to_none() {
+        let cards = [(0, 14 * GB), (1, 14 * GB)];
+        let tp = tensor_parallel_on(&demand(10, 24), &cards, &[(0, 2), (1, 1)], 2).unwrap();
+        assert_eq!(tp.ffn_share, (1, 2));
+        assert_eq!(
+            tensor_parallel_on(&demand(10, 30), &cards, &[(0, 2), (1, 1)], 2),
+            None
+        );
+        assert_eq!(
+            tensor_parallel_on(&demand(10, 20), &cards[..1], &[(0, 2)], 2),
+            None
+        );
     }
 }

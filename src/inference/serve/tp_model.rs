@@ -43,54 +43,6 @@ fn ar_f16_enabled() -> bool {
     true
 }
 
-/// How much of the feed-forward rows the fast card takes, as `(num, den)`.
-///
-/// Bandwidth says 2/3: the fast card gets through roughly twice the matmul per second, so
-/// giving it two thirds makes both finish together and removes its idle wait at the
-/// all-reduce. That is right whenever the resulting shard FITS.
-///
-/// It did not fit once: a 28.7 GB model asked 19.1 GB of a card holding 16.6, the load
-/// climbed to 14.0 GB on one card while the other sat at 8.6, and the upload hit
-/// CUDA_ERROR_OUT_OF_MEMORY. The cascade then re-planned off the GPU entirely and the model
-/// ran at 2.5 tok/s instead of the ~25 it fits for. A ratio derived from speed alone is a
-/// ratio that assumes room, so the capacity has a veto here: fall back to an even split,
-/// and if even halves do not fit, say so rather than OOM inside the loader.
-fn ffn_split_frac(weights: u64, d0: &Device, d1: &Device) -> Result<(usize, usize)> {
-    let free = |d: &Device| -> u64 {
-        crate::tensor::cuda_ext::mem_get_info(d)
-            .map(|(f, _)| f as u64)
-            .unwrap_or(0)
-    };
-    let (f0, f1) = (free(d0), free(d1));
-    if f0 == 0 || f1 == 0 {
-        return Ok((2, 3)); // no reading available: keep the measured default
-    }
-    // The rows this fraction governs dominate a dense transformer, so charging the whole
-    // file against them is the conservative reading - it can only refuse a split that
-    // would have just fitted, never accept one that will not.
-    for (num, den) in [(2usize, 3usize), (1, 2)] {
-        let want0 = weights.saturating_mul(num as u64) / den as u64;
-        let want1 = weights.saturating_sub(want0);
-        if want0 <= f0 && want1 <= f1 {
-            if (num, den) != (2, 3) {
-                tracing::info!(
-                    "TP split {num}/{den} instead of 2/3: {:.1} GB against {:.1} + {:.1} GB free",
-                    weights as f64 / 1e9,
-                    f0 as f64 / 1e9,
-                    f1 as f64 / 1e9
-                );
-            }
-            return Ok((num, den));
-        }
-    }
-    bail!(
-        "TP=2 cannot hold {:.1} GB across {:.1} + {:.1} GB of free VRAM",
-        weights as f64 / 1e9,
-        f0 as f64 / 1e9,
-        f1 as f64 / 1e9
-    )
-}
-
 fn meta_u32(ct: &gguf_file::Content, key: &str) -> Option<u32> {
     ct.metadata.get(key).and_then(|v| v.to_u32().ok())
 }
@@ -227,13 +179,23 @@ impl TpQwen2 {
         )
     }
 
+    /// The decoder over `cards`, one rank each, the first card taking `ffn_share.0 /
+    /// ffn_share.1` of the feed-forward rows: the placement decided both, and the shares
+    /// it chose fit.
     pub fn from_gguf(
         mmap_bytes: &[u8],
         mmap_owner: &std::sync::Arc<memmap2::Mmap>,
         arch: &str,
-        g0: Device,
-        g1: Device,
+        cards: &[Device],
+        ffn_share: (usize, usize),
     ) -> Result<Self> {
+        let [g0, g1] = cards else {
+            bail!(
+                "the tensor-parallel decoder runs on 2 cards, {} given",
+                cards.len()
+            );
+        };
+        let (g0, g1) = (g0.clone(), g1.clone());
         // Disable the old substrate's per-op CUDA event tracking on both ranks. It records an event after
         // every op (~1.18M cuEventRecord/run in the nsys profile = 7% of CUDA API time) for
         // cross-stream ordering - but within a device ops are already stream-ordered, and the
@@ -256,10 +218,7 @@ impl TpQwen2 {
                 cfg.n_kv_head
             );
         }
-        // Decided before a single byte is uploaded: a shard that does not fit has to be
-        // refused here, where the caller can still fall back cleanly, not discovered
-        // halfway through the upload as an OOM.
-        let (ffn_num, ffn_den) = ffn_split_frac(mmap_bytes.len() as u64, &g0, &g1)?;
+        let (ffn_num, ffn_den) = ffn_share;
         let cpu = crate::tensor::Device::Cpu;
         let rd = |ct: &gguf_file::Content,
                   _cur: &mut Cursor<&[u8]>,
@@ -314,10 +273,9 @@ impl TpQwen2 {
                 )?,
                 v: TpColumn::from_qtensor_bias(&wv, bv.as_ref(), &g0, &g1)?,
                 o: TpRow::from_qtensor(&wo, &g0, &g1)?,
-                // Asymmetric FFN split: GPU0 (5070 Ti) is ~2x the matmul throughput of GPU1
-                // (5060 Ti), so give it ~2/3 of the intermediate rows -> both finish together,
-                // killing GPU0's idle-wait at the FFN all-reduce (nsys-measured). gate/up rows
-                // and down cols split at the SAME point (asym_split(27648,2,3)=18432, QK_K-aligned).
+                // Asymmetric FFN split: the faster rank takes the larger share of the
+                // intermediate rows so both finish together at the FFN all-reduce. gate/up
+                // rows and down cols split at the SAME, QK_K-aligned point.
                 gate_up: TpColumnFused::from_qtensors_frac(
                     &[(&wg, None), (&wu, None)],
                     ffn_num,

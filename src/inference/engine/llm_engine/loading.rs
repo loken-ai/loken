@@ -1016,68 +1016,116 @@ impl LlmEngine {
                             .min(ctx_for_planning as usize)
                     };
 
-                    // The embedding table joins the first layer's card when the plan can
-                    // hold it there without moving a layer.
-                    let stem_bytes = generic_weights.stem_bytes(&content);
-                    let (first_plan, stem_fits) =
-                        demand.plan_stem_if_free(&cuda_devices, stem_bytes);
-                    // A handle per card a plan uses, made on first use, with per-slice
-                    // event tracking off before any tensor loads: a device owns one
-                    // working stream, so the events would order a stream against itself,
-                    // and a decode capture that meets them is invalidated. Fresh handles
-                    // rather than the engine's `device`, whose stream state is for
-                    // capture.
-                    let mut handles: std::collections::HashMap<usize, Device> =
-                        std::collections::HashMap::new();
-                    let model = crate::inference::place::ladder::load_planned(
-                        &arch,
-                        first_plan.clone(),
-                        &demand,
-                        &cuda_devices,
-                        &[],
-                        || false,
-                        |plan| {
-                            for idx in crate::inference::place::ladder::cards_of(plan) {
-                                if let std::collections::hash_map::Entry::Vacant(slot) = handles.entry(idx) {
-                                    let d = Device::new_cuda(idx)?;
-                                    #[cfg(feature = "cuda")]
-                                    if let Device::Cuda(ref cd) = d {
-                                        unsafe { cd.context().disable_event_tracking(); }
-                                    }
-                                    slot.insert(d);
+                    // A model the placement runs tensor-parallel runs every layer on each of its
+                    // cards, joined by an all-reduce, instead of one card per token with the
+                    // others idle. Which files the decoder computes correctly is read from their
+                    // tensors and metadata. A tensor-parallel load that fails leaves the model to
+                    // the ladder below.
+                    #[cfg(feature = "cuda")]
+                    let tensor_parallel: Option<BoxedModelBackend> = {
+                        use crate::inference::serve::tp_support::{tensor_parallel_support, TP_RANKS};
+                        let tp = (awq.is_none()
+                            && tensor_parallel_support(&content, &arch)
+                                .inspect_err(|why| info!("{arch} stays off tensor parallelism: {why}"))
+                                .is_ok())
+                        .then(|| crate::inference::place::llm::tensor_parallel(&demand, &cuda_devices, TP_RANKS))
+                        .flatten();
+                        tp.and_then(|tp| {
+                            info!("⬇️  Loading {arch} tensor-parallel across GPU {:?}, feed-forward share {}/{}",
+                                tp.cards, tp.ffn_share.0, tp.ffn_share.1);
+                            let built = tp
+                                .cards
+                                .iter()
+                                .map(|&idx| Device::new_cuda(idx).map_err(|e| anyhow!("cuda:{idx}: {e}")))
+                                .collect::<AnyResult<Vec<Device>>>()
+                                .and_then(|cards| {
+                                    crate::inference::serve::tp_model::TpQwen2::from_gguf(
+                                        mmap_bytes, &mmap, &arch, &cards, tp.ffn_share,
+                                    )
+                                });
+                            match built {
+                                Ok(m) => {
+                                    info!("✅ {arch} loaded as TpQwen2 (tensor-parallel across {} GPUs)", tp.cards.len());
+                                    Some(Box::new(TpQwen2Backend(m)) as BoxedModelBackend)
+                                }
+                                Err(e) => {
+                                    warn!("{arch}: tensor-parallel load failed ({e}); placing it layer by layer");
+                                    crate::inference::engine::llm_engine::release_cuda_pools();
+                                    None
                                 }
                             }
-                            let on_plan: std::collections::HashMap<usize, Device> =
-                                crate::inference::place::ladder::cards_of(plan)
-                                    .into_iter()
-                                    .filter_map(|idx| handles.get(&idx).map(|d| (idx, d.clone())))
-                                    .collect();
-                            // The host keeps an unquantised cache sized by the model.
-                            let host_only = on_plan.is_empty();
-                            let (kv, ctx) = if host_only {
-                                (KvQuant::Off, None)
-                            } else {
-                                (kv_quant, Some(effective_ctx))
-                            };
-                            let stem_on_card = stem_fits
-                                && crate::inference::place::dry_plan::same_plan(plan, &first_plan);
-                            let m = generic_weights.build(&on_plan, plan, kv, ctx, stem_on_card)?;
-                            let placement = plan
-                                .segments
-                                .iter()
-                                .map(|s| format!("{}:{}-{}", s.kind, s.layer_start, s.layer_end))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            info!("✅ {arch} loaded: layers {placement} (kv_quant={kv:?}, kv_ctx={ctx:?})");
-                            Ok::<_, crate::tensor::Error>(m)
-                        },
-                    )
-                    .map_err(|e| anyhow!("Failed to load {arch}: {e}"))?;
-                    try_wrap_with_vision(
-                        model,
-                        projector_blob.as_deref(),
-                        demand.whole().saturating_sub(demand.block_bytes + demand.head_bytes),
-                    )?
+                        })
+                    };
+                    #[cfg(not(feature = "cuda"))]
+                    let tensor_parallel: Option<BoxedModelBackend> = None;
+
+                    match tensor_parallel {
+                        Some(m) => m,
+                        None => {
+                            // The embedding table joins the first layer's card when the plan can
+                            // hold it there without moving a layer.
+                            let stem_bytes = generic_weights.stem_bytes(&content);
+                            let (first_plan, stem_fits) =
+                                demand.plan_stem_if_free(&cuda_devices, stem_bytes);
+                            // A handle per card a plan uses, made on first use, with per-slice
+                            // event tracking off before any tensor loads: a device owns one
+                            // working stream, so the events would order a stream against itself,
+                            // and a decode capture that meets them is invalidated. Fresh handles
+                            // rather than the engine's `device`, whose stream state is for
+                            // capture.
+                            let mut handles: std::collections::HashMap<usize, Device> =
+                                std::collections::HashMap::new();
+                            let model = crate::inference::place::ladder::load_planned(
+                                &arch,
+                                first_plan.clone(),
+                                &demand,
+                                &cuda_devices,
+                                &[],
+                                || false,
+                                |plan| {
+                                    for idx in crate::inference::place::ladder::cards_of(plan) {
+                                        if let std::collections::hash_map::Entry::Vacant(slot) = handles.entry(idx) {
+                                            let d = Device::new_cuda(idx)?;
+                                            #[cfg(feature = "cuda")]
+                                            if let Device::Cuda(ref cd) = d {
+                                                unsafe { cd.context().disable_event_tracking(); }
+                                            }
+                                            slot.insert(d);
+                                        }
+                                    }
+                                    let on_plan: std::collections::HashMap<usize, Device> =
+                                        crate::inference::place::ladder::cards_of(plan)
+                                            .into_iter()
+                                            .filter_map(|idx| handles.get(&idx).map(|d| (idx, d.clone())))
+                                            .collect();
+                                    // The host keeps an unquantised cache sized by the model.
+                                    let host_only = on_plan.is_empty();
+                                    let (kv, ctx) = if host_only {
+                                        (KvQuant::Off, None)
+                                    } else {
+                                        (kv_quant, Some(effective_ctx))
+                                    };
+                                    let stem_on_card = stem_fits
+                                        && crate::inference::place::dry_plan::same_plan(plan, &first_plan);
+                                    let m = generic_weights.build(&on_plan, plan, kv, ctx, stem_on_card)?;
+                                    let placement = plan
+                                        .segments
+                                        .iter()
+                                        .map(|s| format!("{}:{}-{}", s.kind, s.layer_start, s.layer_end))
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    info!("✅ {arch} loaded: layers {placement} (kv_quant={kv:?}, kv_ctx={ctx:?})");
+                                    Ok::<_, crate::tensor::Error>(m)
+                                },
+                            )
+                            .map_err(|e| anyhow!("Failed to load {arch}: {e}"))?;
+                            try_wrap_with_vision(
+                                model,
+                                projector_blob.as_deref(),
+                                demand.whole().saturating_sub(demand.block_bytes + demand.head_bytes),
+                            )?
+                        }
+                    }
                 }
                 other => {
                     let err_msg = format!(

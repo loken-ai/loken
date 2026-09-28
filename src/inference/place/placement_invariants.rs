@@ -1328,7 +1328,6 @@ const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
     ("inference/model/qwen35/moe.rs", (1, 0, 0)),
     ("inference/model/sdxl/pipeline.rs", (5, 0, 0)),
     ("inference/model/sdxl/unet.rs", (0, 0, 1)),
-    ("inference/serve/tp_model.rs", (1, 0, 0)),
 ];
 
 /// EVERY COMPONENT IS PLACED BY THE PLANNER AND RECOVERED BY ITS LADDER.
