@@ -140,17 +140,18 @@ pub fn configure_thread_pool() {
 }
 
 impl LlmEngine {
-    /// Load a model from disk with real GGUF parsing and weight loading
-    /// Loads the configured model; a model that will spill to the host gets its drafter
-    /// first (see `load_drafter_for`), confirmed once the model is placed.
+    /// Loads the configured model. A model that will spill to the host has room held for a
+    /// drafter while it is placed, and the drafter loads there only if the placed model can
+    /// use it (see `plan_drafter`).
     pub async fn load_model(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(target) = self.find_model_file(&self.config.model_id) {
-            if let Ok(meta) = std::fs::metadata(&target) {
-                self.load_drafter_for(&target, meta.len()).await;
-            }
-        }
+        let planned = self
+            .find_model_file(&self.config.model_id)
+            .and_then(|target| {
+                let size = std::fs::metadata(&target).ok()?.len();
+                self.plan_drafter(&target, size)
+            });
         self.load_model_only().await?;
-        self.confirm_drafter().await;
+        self.load_planned_drafter(planned).await;
         // A new placement decodes at new rates: what the last one measured no longer holds.
         *self.decode_choice.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         Ok(())

@@ -339,8 +339,12 @@ impl LlmEngine {
     }
 
     /// The smallest model in the store whose ordinary vocabulary is the target's, with its
-    /// size: every piece sits at the same id on both sides, so it can draft for it.
-    fn choose_drafter(&self, target: &std::path::Path, target_size: u64) -> Option<(String, u64)> {
+    /// size and file: every piece sits at the same id on both sides, so it can draft for it.
+    fn choose_drafter(
+        &self,
+        target: &std::path::Path,
+        target_size: u64,
+    ) -> Option<(String, u64, std::path::PathBuf)> {
         let want = discover::gguf_vocabulary_hash(target)?;
         self.store_models()
             .into_iter()
@@ -348,21 +352,23 @@ impl LlmEngine {
             .filter_map(|(tag, path)| {
                 let size = std::fs::metadata(&path).ok()?.len();
                 (size < target_size && discover::gguf_vocabulary_hash(&path) == Some(want))
-                    .then_some((size, tag))
+                    .then_some((size, tag, path))
             })
             .min()
-            .map(|(size, tag)| (tag, size))
+            .map(|(size, tag, path)| (tag, size, path))
     }
 
-    /// Decides, before the target is placed, whether it gets a drafter, and loads it first.
+    /// Decides, before the target is placed, whether it may get a drafter, and holds room
+    /// for it.
     ///
     /// Drafting pays where verification is far dearer than drafting, which is a target
     /// spilling layers to the host, where each token reads gigabytes over the bus (measured on
     /// deepseek-r1:70b with 26 layers on the host, drafted by llama3.2:1b); on the cards verify
     /// costs about what drafting saves. A target larger than the cards' free memory will
-    /// spill, so its drafter loads first, whole, on the fastest card, and the target is then
-    /// placed in what is left. Called before the target takes the load lock.
-    async fn load_drafter_for(&self, target: &std::path::Path, target_size: u64) {
+    /// spill, so the room its drafter needs is declared on the fastest card and the target is
+    /// placed around it. Nothing is loaded here: whether the target can use a drafter is
+    /// known once it is placed.
+    fn plan_drafter(&self, target: &std::path::Path, target_size: u64) -> Option<PlannedDrafter> {
         *self
             .drafter_choice
             .lock()
@@ -370,58 +376,75 @@ impl LlmEngine {
         let cards = crate::inference::place::device_probe::probe_cuda_gpus_for("llm");
         let free: u64 = cards.iter().map(|g| g.available).sum();
         if target_size <= free {
-            return;
+            return None;
         }
-        let Some((drafter_id, _)) = self.choose_drafter(target, target_size) else {
+        let (id, size, path) = self.choose_drafter(target, target_size)?;
+        let reserve = loading::per_card_reserve(&path).unwrap_or(0);
+        Some(PlannedDrafter {
+            id,
+            room: crate::inference::place::vram_manager::declare_demand(
+                DRAFTER_DEMAND,
+                size + reserve,
+            ),
+        })
+    }
+
+    /// Once the target is placed: the planned drafter loads into the room held for it when
+    /// the target spilled to the host and its backend verifies a draft in one forward, and
+    /// shares its vocabulary; otherwise the room is given back and nothing is loaded.
+    async fn load_planned_drafter(&self, planned: Option<PlannedDrafter>) {
+        let Some(PlannedDrafter { id, room }) = planned else {
             return;
         };
+        let (spills, verifies) = self
+            .model_state
+            .lock()
+            .await
+            .as_ref()
+            .map_or((false, false), |s| {
+                let spills = s
+                    .model
+                    .device_layer_distribution()
+                    .iter()
+                    .any(|(dev, ..)| dev == "CPU");
+                (spills, s.model.capabilities().pld)
+            });
+        // The drafter's own placement must see the room, not the demand holding it.
+        drop(room);
+        if !spills {
+            return;
+        }
+        if !verifies {
+            info!(
+                "spec-decode: {} cannot verify a draft in one forward; no drafter",
+                self.config.model_id
+            );
+            return;
+        }
+        let cards = crate::inference::place::device_probe::probe_cuda_gpus_for("llm");
         let mut dcfg = self.config.clone();
-        dcfg.model_id = drafter_id.clone();
+        dcfg.model_id = id.clone();
         dcfg.device_index = cards.first().map(|g| g.index);
         dcfg.disable_arc_layers = true;
         let nested = LlmEngine::with_config(dcfg);
         if let Err(e) = nested.load_model_only().await {
-            warn!("spec-decode: drafter '{drafter_id}' failed to load: {e}; spec-decode OFF");
+            warn!("spec-decode: drafter '{id}' failed to load: {e}; spec-decode OFF");
             return;
         }
-        info!(
-            "{} spills to the host: {drafter_id} drafts for it",
-            self.config.model_id
-        );
+        let same = self.tokenizer_fingerprint().await == nested.tokenizer_fingerprint().await
+            && self.vocab_size().await == nested.vocab_size().await;
+        if !same {
+            warn!("spec-decode: the drafter does not share the target's vocabulary; OFF");
+            let _ = nested.unload().await;
+            return;
+        }
+        info!("{} spills to the host: {id} drafts for it", self.config.model_id);
         *self.draft_engine.lock().await = Some(Arc::new(nested));
         *self.draft_length.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         *self
             .drafter_choice
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Some(drafter_id));
-    }
-
-    /// Once the target is loaded: a drafter that does not share its vocabulary, or a target
-    /// that did not spill after all, leaves speculative decoding off.
-    async fn confirm_drafter(&self) {
-        let Some(drafter) = self.draft_engine.lock().await.clone() else {
-            return;
-        };
-        let spills = self.model_state.lock().await.as_ref().is_some_and(|s| {
-            s.model
-                .device_layer_distribution()
-                .iter()
-                .any(|(dev, ..)| dev == "CPU")
-        });
-        let same = self.tokenizer_fingerprint().await == drafter.tokenizer_fingerprint().await
-            && self.vocab_size().await == drafter.vocab_size().await;
-        if spills && same {
-            return;
-        }
-        if !same {
-            warn!("spec-decode: the drafter does not share the target's vocabulary; OFF");
-        }
-        let _ = drafter.unload().await;
-        *self.draft_engine.lock().await = None;
-        *self
-            .drafter_choice
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(None);
+            .unwrap_or_else(|e| e.into_inner()) = Some(Some(id));
     }
 
     /// Makes `drafter` draft for this engine until it is detached or the target reloads,
@@ -878,6 +901,16 @@ pub fn trim_cuda_pools() {}
 /// workspace, which latches the primary context - the deliberate cost that makes every
 /// later budget probe of this card read the same world.
 #[cfg(feature = "cuda")]
+/// The owner name the room held for a planned drafter is declared under.
+const DRAFTER_DEMAND: &str = "drafter";
+
+/// A drafter chosen for a target before the target is placed, and the card memory held for
+/// it until the target's placement is known.
+struct PlannedDrafter {
+    id: String,
+    room: crate::inference::place::vram_manager::DemandLease,
+}
+
 pub(crate) fn warm_card(ordinal: usize) {
     use std::sync::{Mutex, OnceLock};
     static WARMED: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
