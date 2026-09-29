@@ -239,7 +239,7 @@ impl LlmEngine {
                 None => return Err("Model not loaded.".into()),
                 Some(state) => {
                     if let Some(server) = state.model.batched_server() {
-                        let tokenizer = state.tokenizer.clone();
+                        let tokenizer = (*state.tokenizer).clone();
                         let mut eos_set = state.eos_token_ids_extra.clone();
                         eos_set.push(state.eos_token_id);
                         let ctx_len = state.context_length;
@@ -1024,8 +1024,8 @@ impl LlmEngine {
 
             // Snapshot the tokenizer once so the hot-path stream_token closure
             // can decode each emitted token WITHOUT acquiring model_state's
-            // Mutex. Tokenizer is internally Arc'd, so .clone() is cheap.
-            let stream_tokenizer: Tokenizer = {
+            // Mutex. The tokenizer is shared behind an Arc, so the handle is cheap.
+            let stream_tokenizer: std::sync::Arc<Tokenizer> = {
                 let guard = model_state.blocking_lock();
                 match guard.as_ref() {
                     Some(s) => s.tokenizer.clone(),

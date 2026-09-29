@@ -964,7 +964,7 @@ impl LlmEngine {
                 eos_token_ids_extra,
                 file_size,
                 model,
-                tokenizer,
+                tokenizer: std::sync::Arc::new(tokenizer),
                 device,
                 image_embeds: None,
                 qwen35_image: None,

@@ -337,7 +337,7 @@ pub(super) fn load_deepseek_v41_checkpoint(
         eos_token_ids_extra: Vec::new(),
         file_size,
         model: backend,
-        tokenizer,
+        tokenizer: std::sync::Arc::new(tokenizer),
         device: Device::Cpu,
         image_embeds: None,
         qwen35_image: None,
@@ -682,7 +682,8 @@ pub(crate) struct LoadedModelState {
     pub(super) eos_token_ids_extra: Vec<u32>,
     pub(super) file_size: u64,
     pub(super) model: BoxedModelBackend,
-    pub(super) tokenizer: Tokenizer,
+    /// Shared, so a request takes a handle rather than a copy of the vocabulary.
+    pub(super) tokenizer: std::sync::Arc<Tokenizer>,
     pub(super) device: Device,
     /// Pre-encoded image embeddings for the current request (vision models only)
     pub(super) image_embeds: Option<Tensor>,
