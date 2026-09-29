@@ -111,7 +111,73 @@ impl MixerState {
     }
 }
 
+/// `src` written into `dst`'s card buffers where they lie; an error when the two differ in
+/// kind or shape, or live on the host.
+fn copy_state_in_place(dst: &MixerState, src: &MixerState) -> Result<()> {
+    let copy = |d: &Tensor, s: &Tensor| -> Result<()> {
+        if d.dims() != s.dims() || d.dtype() != s.dtype() {
+            return Err(crate::tensor::Error::msg("recurrent state buffers differ"));
+        }
+        d.slice_set(s, 0, 0)
+    };
+    match (dst, src) {
+        (
+            MixerState::ShortConv(Some(ConvState::Card(d))),
+            MixerState::ShortConv(Some(ConvState::Card(s))),
+        ) => copy(d, s),
+        (
+            MixerState::Ssm(Some(SsmState::Card { conv: dc, h: dh })),
+            MixerState::Ssm(Some(SsmState::Card { conv: sc, h: sh })),
+        )
+        | (
+            MixerState::DeltaNet(Some(SsmState::Card { conv: dc, h: dh })),
+            MixerState::DeltaNet(Some(SsmState::Card { conv: sc, h: sh })),
+        ) => {
+            copy(dc, sc)?;
+            copy(dh, sh)
+        }
+        _ => Err(crate::tensor::Error::msg("recurrent state not on a card")),
+    }
+}
+
 impl Mixer {
+    /// True for a mixer whose decode step advances its state where it lies, so a step run
+    /// again reads and writes the same buffers: what a recorded decode step needs. Only the
+    /// delta-rule mixer on a card does so far.
+    pub fn decodes_in_place(&self, device: &Device) -> bool {
+        match self {
+            Mixer::DeltaNet(m) => m.steps_in_place(device),
+            Mixer::Attention | Mixer::Absent => true,
+            Mixer::ShortConv(_) | Mixer::Ssm(_) => false,
+        }
+    }
+
+    /// One decode row through the mixer, its state advanced in place.
+    #[cfg(feature = "cuda")]
+    pub fn step_in_place(&mut self, x: &Tensor) -> Result<Tensor> {
+        let _in_place = crate::inference::moe_cuda::in_place_state(true);
+        self.forward(x, 1)
+    }
+
+    /// The state as it stands, copied, for `restore_in_place` to put back.
+    pub fn checkpoint(&self) -> Result<Option<MixerState>> {
+        self.snapshot()
+    }
+
+    /// Writes `state` back into the buffers the state lives in, without moving them.
+    pub fn restore_in_place(&mut self, state: &MixerState) -> Result<()> {
+        let current = match self {
+            Mixer::Attention | Mixer::Absent => return Ok(()),
+            Mixer::ShortConv(m) => m.state.clone().map(|s| MixerState::ShortConv(Some(s))),
+            Mixer::Ssm(m) => m.state.clone().map(|s| MixerState::Ssm(Some(s))),
+            Mixer::DeltaNet(m) => m.state.clone().map(|s| MixerState::DeltaNet(Some(s))),
+        };
+        match current {
+            Some(cur) => copy_state_in_place(&cur, state),
+            None => self.restore(state),
+        }
+    }
+
     /// True for a mixer that carries a state beside the KV cache.
     pub fn is_recurrent(&self) -> bool {
         !matches!(self, Mixer::Attention | Mixer::Absent)
@@ -746,6 +812,13 @@ impl GatedDeltaNet {
         })
     }
 
+    /// Whether a decode row runs through the fused card recurrence, the path that advances
+    /// its state in place.
+    pub fn steps_in_place(&self, device: &Device) -> bool {
+        let d = self.dims;
+        device.is_cuda() && d.k_dim == d.v_dim && matches!(d.v_dim, 64 | 128 | 256)
+    }
+
     /// `(qkv, z, alpha, beta)` of `x`, in the projection's dtype.
     fn project(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let d = self.dims;
@@ -1104,6 +1177,38 @@ fn delta_host(
 }
 
 impl GenericTransformerLayer {
+    /// Whether this layer mixes by attention, the layers that keep a KV cache.
+    pub(super) fn attends(&self) -> bool {
+        matches!(self.mixer, Mixer::Attention)
+    }
+
+    /// The hybrid layer as the graph's decode step: attention through its graph path, a
+    /// recurrent mixer stepping its state in place.
+    #[cfg(feature = "cuda")]
+    pub(super) fn forward_hybrid_graph(&mut self, x: &Tensor) -> Result<Tensor> {
+        let x = match self.mixer {
+            Mixer::Absent => x.clone(),
+            Mixer::Attention => {
+                let x_norm = self.attn_norm.forward(x)?;
+                let mut out = self.forward_attn_graph(&x_norm)?;
+                if let Some(b) = &self.attn_output_bias {
+                    out = out.broadcast_add(b)?;
+                }
+                (x + out.to_dtype(x.dtype())?)?
+            }
+            _ => {
+                let x_norm = self.attn_norm.forward(x)?;
+                let mixed = self.mixer.step_in_place(&x_norm)?;
+                let mixed = self.attn_output.forward(&mixed)?;
+                (x + mixed.to_dtype(x.dtype())?)?
+            }
+        };
+        match self.has_ffn {
+            true => self.ffn_sublayer(&x),
+            false => Ok(x),
+        }
+    }
+
     /// True for a layer the hybrid forward runs: a recurrent mixer, no mixer, or no
     /// feed-forward.
     pub(super) fn is_hybrid(&self) -> bool {
@@ -1138,6 +1243,12 @@ impl GenericTransformerLayer {
             }
             _ => {
                 let x_norm = self.attn_norm.forward(x)?;
+                // A decoded token advances the state where it lies, the way the recorded
+                // step does, so the two can follow each other on the same buffers.
+                #[cfg(feature = "cuda")]
+                let _in_place = crate::inference::moe_cuda::in_place_state(
+                    index_pos > 0 && x.dim(1).is_ok_and(|n| n == 1),
+                );
                 let mixed = self.mixer.forward(&x_norm, index_pos)?;
                 let mixed = self.attn_output.forward(&mixed)?;
                 (x + mixed.to_dtype(x.dtype())?)?

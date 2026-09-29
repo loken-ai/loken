@@ -573,6 +573,10 @@ impl GenericTransformerLayer {
     /// the normal path. Caller must have refreshed `update_rope_buffers(pos)`
     /// and extended `padded_mask` before calling this.
     pub fn forward_graph(&mut self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if self.is_hybrid() {
+            return self.forward_hybrid_graph(x);
+        }
         let rs = self.residual_scale;
 
         let residual = x;

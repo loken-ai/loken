@@ -518,6 +518,24 @@ pub(crate) trait ModelBackend: Send {
     /// path (`forward_attn` keys on `graph_rope_cos.is_some()`).
     fn invalidate_graph_state(&mut self) {}
 
+    /// Every recurrent state, copied: what lets a decode step be run a second time from the
+    /// state the first started from, as the probation of a recorded step does. Empty for a
+    /// model with none.
+    fn recurrent_checkpoint(
+        &self,
+    ) -> crate::tensor::Result<Vec<Option<crate::inference::generic_transformer::mixer::MixerState>>>
+    {
+        Ok(Vec::new())
+    }
+
+    /// Writes a [`Self::recurrent_checkpoint`] back into the buffers the states live in.
+    fn recurrent_restore(
+        &mut self,
+        _checkpoint: &[Option<crate::inference::generic_transformer::mixer::MixerState>],
+    ) -> crate::tensor::Result<()> {
+        Ok(())
+    }
+
     /// Engine hook after a successful graph capture: a live CUDA graph now
     /// references the per-layer KV buffers. Freezes quantized-KV growth +
     /// the capture-time seq ceiling. Default no-op for non-graph backends.
@@ -1186,9 +1204,13 @@ impl ModelBackend for GenericBackend {
 
     fn capabilities(&self) -> Capabilities {
         // A recurrent state advances with every token and cannot be cut back: no trim, no
-        // shift, no draft to roll back, and no captured decode step for it.
+        // shift, no draft to roll back. Its decode step is captured where the mixers advance
+        // it in place.
         if self.0.is_recurrent() {
-            return Capabilities::default();
+            return Capabilities {
+                graph_mode: true,
+                ..Capabilities::default()
+            };
         }
         Capabilities {
             // Routed mixtures were excluded because the top-k choice follows the GEMM
@@ -1269,6 +1291,20 @@ impl ModelBackend for GenericBackend {
 
     fn invalidate_graph_state(&mut self) {
         self.0.invalidate_graph_state()
+    }
+
+    fn recurrent_checkpoint(
+        &self,
+    ) -> crate::tensor::Result<Vec<Option<crate::inference::generic_transformer::mixer::MixerState>>>
+    {
+        self.0.recurrent_checkpoint()
+    }
+
+    fn recurrent_restore(
+        &mut self,
+        checkpoint: &[Option<crate::inference::generic_transformer::mixer::MixerState>],
+    ) -> crate::tensor::Result<()> {
+        self.0.recurrent_restore(checkpoint)
     }
 
     #[cfg(feature = "cuda")]
@@ -1457,6 +1493,20 @@ impl ModelBackend for GenericVisionBackend {
 
     fn invalidate_graph_state(&mut self) {
         self.text.invalidate_graph_state()
+    }
+
+    fn recurrent_checkpoint(
+        &self,
+    ) -> crate::tensor::Result<Vec<Option<crate::inference::generic_transformer::mixer::MixerState>>>
+    {
+        self.text.recurrent_checkpoint()
+    }
+
+    fn recurrent_restore(
+        &mut self,
+        checkpoint: &[Option<crate::inference::generic_transformer::mixer::MixerState>],
+    ) -> crate::tensor::Result<()> {
+        self.text.recurrent_restore(checkpoint)
     }
 
     #[cfg(feature = "cuda")]

@@ -1049,6 +1049,14 @@ impl LlmEngine {
                         if let Some(Some(ref stream)) = cuda_stream {
                             let _ = stream.synchronize();
                         }
+                        // A recurrent state advances with the replay, so the probation
+                        // below, which runs the same step again, starts from a copy of it.
+                        const GRAPH_VALIDATIONS: usize = 3;
+                        let recurrent_cp = if graph_validations < GRAPH_VALIDATIONS {
+                            state.model.recurrent_checkpoint().unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
                         match graph.launch() {
                             Ok(()) => {
                                 // Sync AFTER launch so subsequent gpu_sample
@@ -1071,12 +1079,12 @@ impl LlmEngine {
                                 // logits, discard the graph, decode the rest
                                 // of the request eagerly - a resurrected
                                 // graph path can never emit replay garbage.
-                                const GRAPH_VALIDATIONS: usize = 3;
                                 if graph_validations < GRAPH_VALIDATIONS {
                                     let rep_argmax: Option<u32> = logits_ref
                                         .flatten_all().ok()
                                         .and_then(|t| t.argmax(0).ok())
                                         .and_then(|t| t.to_scalar::<u32>().ok());
+                                    state.model.recurrent_restore(&recurrent_cp)?;
                                     let eager = if needs_split {
                                         state.model.compute_all_from_kv_captured()
                                     } else {
@@ -1248,6 +1256,8 @@ impl LlmEngine {
                                     // capture token's forward actually executes,
                                     // then run probation validation #1 against an
                                     // eager forward at the same (token, pos).
+                                    let recurrent_cp =
+                                        state.model.recurrent_checkpoint().unwrap_or_default();
                                     match g.launch() {
                                         Ok(()) => {
                                             let _ = stream.synchronize();
@@ -1255,6 +1265,7 @@ impl LlmEngine {
                                                 .flatten_all().ok()
                                                 .and_then(|t| t.argmax(0).ok())
                                                 .and_then(|t| t.to_scalar::<u32>().ok());
+                                            state.model.recurrent_restore(&recurrent_cp)?;
                                             let eager = if needs_split {
                                                 state.model.compute_all_from_kv_captured()
                                             } else {

@@ -116,8 +116,18 @@ pub fn gated_delta_net(
     };
     let (qp, kp, vp) = (cuptr(q)?, cuptr(k)?, cuptr(v)?);
     let (gp, bp, sp) = (cuptr(g)?, cuptr(beta)?, cuptr(state)?);
+    let in_place = super::in_place_state_on();
+    if in_place && !state.is_contiguous() {
+        crate::tensor::bail!("gated_delta_net: an in-place state must be contiguous");
+    }
     let o_slice = unsafe { dev.alloc::<f32>(n_tokens * h * s_v) }?;
-    let ns_slice = unsafe { dev.alloc::<f32>(h * s_v * s_v) }?;
+    // In place, the state is written where it was read: each warp owns a column of it, reads
+    // the column into registers first and writes it back last.
+    let ns_slice = if in_place {
+        None
+    } else {
+        Some(unsafe { dev.alloc::<f32>(h * s_v * s_v) }?)
+    };
     let stream = dev.cuda_stream().cu_stream() as i64;
     let (sq1, sq2) = (s_v as i64, (h * s_v) as i64);
     let (sv1, sv2) = (s_v as i64, (h * s_v) as i64);
@@ -131,7 +141,10 @@ pub fn gated_delta_net(
             bp,
             sp,
             o_slice.device_ptr(o_slice.stream()).0 as *mut f32,
-            ns_slice.device_ptr(ns_slice.stream()).0 as *mut f32,
+            match &ns_slice {
+                Some(ns) => ns.device_ptr(ns.stream()).0 as *mut f32,
+                None => sp as *mut f32,
+            },
             h as i32,
             n_tokens as i32,
             s_v as i32,
@@ -149,10 +162,13 @@ pub fn gated_delta_net(
         CudaStorage::wrap_cuda_slice(o_slice, dev.clone()),
         (n_tokens, h, s_v),
     )?;
-    let ns = tensor_from_cuda_storage(
-        CudaStorage::wrap_cuda_slice(ns_slice, dev.clone()),
-        (h, s_v, s_v),
-    )?;
+    let ns = match ns_slice {
+        Some(ns_slice) => tensor_from_cuda_storage(
+            CudaStorage::wrap_cuda_slice(ns_slice, dev.clone()),
+            (h, s_v, s_v),
+        )?,
+        None => state.reshape((h, s_v, s_v))?,
+    };
     Ok((o, ns))
 }
 
@@ -181,8 +197,17 @@ pub fn fused_conv_silu(
         }
     };
     let (qp, csp, wp) = (cuptr(qkv)?, cuptr(conv_state)?, cuptr(w)?);
+    let in_place = super::in_place_state_on();
+    if in_place && !conv_state.is_contiguous() {
+        crate::tensor::bail!("fused_conv_silu: an in-place state must be contiguous");
+    }
     let out_slice = unsafe { dev.alloc::<f32>(seq * c) }?;
-    let ncs_slice = unsafe { dev.alloc::<f32>(c * (k - 1)) }?;
+    // In place, each channel reads its whole row of state before it writes it back.
+    let ncs_slice = if in_place {
+        None
+    } else {
+        Some(unsafe { dev.alloc::<f32>(c * (k - 1)) }?)
+    };
     let stream = dev.cuda_stream().cu_stream() as i64;
     unsafe {
         loken_fused_conv_silu(
@@ -190,7 +215,10 @@ pub fn fused_conv_silu(
             csp,
             wp,
             out_slice.device_ptr(out_slice.stream()).0 as *mut f32,
-            ncs_slice.device_ptr(ncs_slice.stream()).0 as *mut f32,
+            match &ncs_slice {
+                Some(n) => n.device_ptr(n.stream()).0 as *mut f32,
+                None => csp as *mut f32,
+            },
             c as i32,
             seq as i32,
             k as i32,
@@ -201,10 +229,13 @@ pub fn fused_conv_silu(
         CudaStorage::wrap_cuda_slice(out_slice, dev.clone()),
         (seq, c),
     )?;
-    let ncs = tensor_from_cuda_storage(
-        CudaStorage::wrap_cuda_slice(ncs_slice, dev.clone()),
-        (c, k - 1),
-    )?;
+    let ncs = match ncs_slice {
+        Some(ncs_slice) => tensor_from_cuda_storage(
+            CudaStorage::wrap_cuda_slice(ncs_slice, dev.clone()),
+            (c, k - 1),
+        )?,
+        None => conv_state.clone(),
+    };
     Ok((out, ncs))
 }
 

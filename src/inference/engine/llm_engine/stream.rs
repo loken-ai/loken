@@ -1588,16 +1588,27 @@ impl LlmEngine {
                             (cuda_graph.as_mut(), graph_logits.as_ref())
                         {
                             let _ = stream.synchronize();
+                            // A recurrent state advances with the replay, so the probation
+                            // below, which runs the same step again, starts from a copy of it.
+                            const GRAPH_VALIDATIONS: usize = 3;
+                            let recurrent_cp = if graph_validations < GRAPH_VALIDATIONS {
+                                state.model.recurrent_checkpoint().unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
                             match graph.launch() {
                                 Ok(()) => {
                                     let _ = stream.synchronize();
-                                    const GRAPH_VALIDATIONS: usize = 3;
                                     if graph_validations < GRAPH_VALIDATIONS {
                                         let rep_argmax: Option<u32> = logits_ref
                                             .flatten_all()
                                             .ok()
                                             .and_then(|t| t.argmax(0).ok())
                                             .and_then(|t| t.to_scalar::<u32>().ok());
+                                        if let Err(e) = state.model.recurrent_restore(&recurrent_cp)
+                                        {
+                                            warn!("recurrent state restore before probation failed: {e}");
+                                        }
                                         match state.model.forward_from_hidden() {
                                             Ok(eag) => {
                                                 let _ = stream.synchronize();
@@ -1693,6 +1704,8 @@ impl LlmEngine {
                                     // A capture only RECORDS - launch once so
                                     // this token's forward actually executes,
                                     // then probation #1 vs an eager forward.
+                                    let recurrent_cp =
+                                        state.model.recurrent_checkpoint().unwrap_or_default();
                                     match g.launch() {
                                         Ok(()) => {
                                             let _ = stream.synchronize();
@@ -1701,6 +1714,11 @@ impl LlmEngine {
                                                 .ok()
                                                 .and_then(|t| t.argmax(0).ok())
                                                 .and_then(|t| t.to_scalar::<u32>().ok());
+                                            if let Err(e) =
+                                                state.model.recurrent_restore(&recurrent_cp)
+                                            {
+                                                warn!("recurrent state restore before probation failed: {e}");
+                                            }
                                             match state.model.forward_from_hidden() {
                                                 Ok(eag) => {
                                                     let _ = stream.synchronize();

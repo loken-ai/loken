@@ -161,6 +161,10 @@ impl GenericHeteroTransformer {
     /// head_dim is 128, where it sent a root-cause after a layer that does not exist.
     pub fn kv_state_graph_block(&self) -> Option<&'static str> {
         self.layers.iter().find_map(|l| {
+            // A layer that does not attend keeps no KV.
+            if !l.attends() {
+                return None;
+            }
             // Q4 KV cache: append/flush/attention all run through
             // device-pos kernels in graph mode. `update_graph_state`
             // primes `cur_pos_dev` before each token, so this is safe.
@@ -258,7 +262,11 @@ impl GenericHeteroTransformer {
             // dual-populate donor falls back to F-dtype scatter_set,
             // which is the unstable path. A sink layer attends over its
             // buffers by the device length and reads no padded mask.
-            l.attn_sinks.is_none() && !l.has_q4_cache() && !l.has_q8_cache() && !l.populate_dual_kv
+            l.attends()
+                && l.attn_sinks.is_none()
+                && !l.has_q4_cache()
+                && !l.has_q8_cache()
+                && !l.populate_dual_kv
         })
     }
 
@@ -272,8 +280,14 @@ impl GenericHeteroTransformer {
     /// than logged here so the caller decides where it surfaces; `graph_capture_auto_on`
     /// keeps the boolean contract for existing callers.
     pub fn graph_capture_decision(&self) -> std::result::Result<(), &'static str> {
-        if self.is_recurrent() {
-            return Err("recurrent mixer: the captured decode has no recurrent step");
+        // A recurrent mixer is captured only where its step advances the state in place: a
+        // recorded step writes the addresses it read.
+        if self
+            .layers
+            .iter()
+            .any(|l| !l.mixer.decodes_in_place(&l.cos.device()))
+        {
+            return Err("recurrent mixer: its decode step does not advance its state in place");
         }
         // A sink layer's step is not captured: its replay, which reads the length on the
         // device, costs more than the eager step, whose attention is GPU-bound.
@@ -760,10 +774,9 @@ impl GenericHeteroTransformer {
         // and an ~8 KB graph_kv_pos H2D per token. All-or-nothing so a
         // mixed placement (one layer's Q8 alloc failed -> F-dtype) never
         // sees a skipped group leader.
-        let skip_fdtype_state = self
-            .layers
-            .iter()
-            .all(|l| (l.has_q8_cache() || l.has_q4_cache()) && !l.populate_dual_kv);
+        let skip_fdtype_state = self.layers.iter().all(|l| {
+            !l.attends() || ((l.has_q8_cache() || l.has_q4_cache()) && !l.populate_dual_kv)
+        });
 
         // The step's position for the sink layers' device-length attention: written once
         // per card, shared by that card's sink layers.
@@ -1616,6 +1629,28 @@ impl GenericHeteroTransformer {
             None => self.kv_snapshots.push(snap),
         }
         self.enforce_kv_snapshot_budget();
+    }
+
+    /// Every recurrent layer's state, copied, for `recurrent_restore` to put back: what lets
+    /// a step be run twice from the same state. Empty for a model with no recurrent layer.
+    pub fn recurrent_checkpoint(&self) -> Result<Vec<Option<super::mixer::MixerState>>> {
+        if !self.is_recurrent() {
+            return Ok(Vec::new());
+        }
+        self.layers.iter().map(|l| l.mixer.checkpoint()).collect()
+    }
+
+    /// Writes a checkpoint back into the buffers the states live in.
+    pub fn recurrent_restore(
+        &mut self,
+        checkpoint: &[Option<super::mixer::MixerState>],
+    ) -> Result<()> {
+        for (l, saved) in self.layers.iter_mut().zip(checkpoint) {
+            if let Some(state) = saved {
+                l.mixer.restore_in_place(state)?;
+            }
+        }
+        Ok(())
     }
 
     /// True when a layer carries a recurrent state beside its KV cache.
