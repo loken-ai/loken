@@ -23,6 +23,30 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+/// The tensor names a shard's header lists, `None` when the header cannot be read. Only the
+/// header is read.
+pub fn header_names(shard: &Path) -> Option<Vec<String>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(shard).ok()?;
+    let mut len = [0u8; 8];
+    f.read_exact(&mut len).ok()?;
+    let len = usize::try_from(u64::from_le_bytes(len)).ok()?;
+    let limit = usize::try_from(f.metadata().ok()?.len()).ok()?;
+    if len > limit {
+        return None;
+    }
+    let mut header = vec![0u8; len];
+    f.read_exact(&mut header).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&header).ok()?;
+    Some(
+        v.as_object()?
+            .keys()
+            .filter(|k| *k != "__metadata__")
+            .cloned()
+            .collect(),
+    )
+}
+
 struct Entry {
     map: usize,
     dtype: Dtype,

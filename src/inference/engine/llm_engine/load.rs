@@ -227,13 +227,6 @@ pub(super) fn resolve_awq_repo(model_id: &str, roots: &[PathBuf]) -> Option<Stri
     None
 }
 
-/// `model_type` of the checkpoint directory's own `config.json`, `None` when it has none.
-pub(super) fn checkpoint_model_type(dir: &std::path::Path) -> Option<String> {
-    let txt = std::fs::read_to_string(dir.join("config.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
-    v.get("model_type")?.as_str().map(|s| s.to_string())
-}
-
 /// The released DeepSeek V4.1 checkpoint - safetensors shards, `config.json`,
 /// `inference/config.json`, `tokenizer.json` - loaded on the CPU through the deepseek_v41
 /// source: the always-resident path dequantised to f32, the routed experts read in place, the

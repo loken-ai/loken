@@ -246,9 +246,7 @@ impl LlmEngine {
             crate::inference::place::device_probe::debug_vram_by_card("closure-start");
 
             // --- 0a. A checkpoint directory the deepseek_v41 source serves ---
-            if model_file.is_dir()
-                && checkpoint_model_type(&model_file).as_deref() == Some("deepseek_v41")
-            {
+            if crate::inference::model::deepseek_v41::claims_checkpoint_dir(&model_file) {
                 let mut state =
                     load_deepseek_v41_checkpoint(&model_file, &model_id_clone, user_context_length)?;
                 state.generation_defaults = generation_defaults.clone();
@@ -614,10 +612,12 @@ impl LlmEngine {
             // --- 5. Load model weights based on architecture ---
             debug!("⚖️  Architecture: {}, Device: {:?}", arch, device);
             let weights_t = std::time::Instant::now();
-            let model: BoxedModelBackend = match arch.as_str() {
+            // A special loader claims a file by what it contains; every other file takes the
+            // generic hetero route, which builds what the file describes or says what it cannot.
+            let model: BoxedModelBackend = match () {
                 // Moondream legacy path: a file with the original PyTorch state-dict
                 // naming, whatever its architecture key says. A file with llama.cpp
-                // naming (token_embd, blk.{i}.attn_qkv) takes the generic phi2 path.
+                // naming (token_embd, blk.{i}.attn_qkv) takes the generic route.
                 // The legacy model runs whole on one device, placed by the ladder.
                 _ if content.tensor_infos.contains_key("text_model.transformer.embd.wte.weight") => {
                     debug!("Loading Moondream vision model from GGUF...");
@@ -646,7 +646,9 @@ impl LlmEngine {
                     device = built_on;
                     Box::new(MoondreamBackend(model))
                 }
-                "deepseek4" | "deepseek41" | "deepseek_v41" => {
+                // Residual hyper-connections mark the DeepSeek V4.1 checkpoint, whatever its
+                // converter named the architecture.
+                _ if crate::inference::model::deepseek_v41::claims_gguf(&content) => {
                     // The CPU port: latent MQA, CSA2 bands, hyper-connections, and a MoE whose
                     // routed experts are read in place from the mapping by the quantised dot
                     // engine. The model may ship as one file or a split set; every part is
@@ -688,19 +690,15 @@ impl LlmEngine {
                         ),
                     )
                 }
-                "llama" | "mistral" | "mistral3" |
-                "qwen2" | "qwen3" | "qwen3moe" | "gptoss" | "gemma" | "gemma2" | "gemma3" |
-                "gemma3n" | "gemma4" |
-                "phi" | "phi2" | "phi3" | "phi4" | "chatglm" | "glm4" | "stablelm" | "starcoder" |
-                "starcoder2" | "falcon" | "bloom" | "mpt" | "refact" | "codeshell" |
-                "granite" | "granite3" | "granitemoe" | "dbrx" | "internlm2" | "yi" | "orion" |
-                "olmo2" | "olmoe" | "ernie4_5" | "smollm3" | "lfm2" | "lfm2moe" |
-                "nemotron_h_moe" | "qwen35" | "qwen35moe" | "qwen3next" => {
+                _ => {
                     debug!("⬇️  Loading '{}' as generic hetero transformer (CUDA+CPU)...", arch);
-                    // An architecture without a RoPE pairing cannot build a config: refuse
-                    // it here, before any weight is placed.
-                    crate::inference::model_facts::rope_pairing(&arch)
-                        .map_err(|e| anyhow!("cannot load {arch} as a generic transformer: {e}"))?;
+                    // A config needs the RoPE pairing the file does not carry: an architecture
+                    // the facts table does not know is refused here, before any weight is placed.
+                    crate::inference::model_facts::rope_pairing(&arch).map_err(|e| {
+                        let err = format!("cannot build {arch:?} through the generic transformer: {e}");
+                        error!("❌ {err}");
+                        anyhow!(err)
+                    })?;
                     // For generic models: CUDA + CPU only (no OpenCL, those need per-model kernels).
                     // Per-layer KV cache memory cost. Used by HeteroPlan to
                     // reserve headroom on each GPU so weights + KV both fit.
@@ -923,17 +921,6 @@ impl LlmEngine {
                             )?
                         }
                     }
-                }
-                other => {
-                    let err_msg = format!(
-                        "Unsupported architecture: {}. Supported: llama, mistral, mistral3, \
-                         qwen2, qwen3, qwen3moe, gptoss, nemotron_h_moe, lfm2, lfm2moe, qwen35moe, qwen35, gemma, gemma2, gemma3, gemma4, phi, phi2, \
-                         phi3, phi4, chatglm/glm4, stablelm, starcoder, starcoder2, granite, \
-                         granite3, dbrx, internlm2, yi, orion, mpt, moondream",
-                        other
-                    );
-                    error!("❌ {}", err_msg);
-                    return Err(anyhow!(err_msg));
                 }
             };
             debug!("✓ Weights loaded from mmap in {:.1}ms", weights_t.elapsed().as_secs_f64() * 1000.0);

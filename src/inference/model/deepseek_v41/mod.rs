@@ -38,6 +38,57 @@ use crate::tensor::{Error, Result};
 /// The GGUF metadata prefix for this architecture's keys.
 pub const ARCH: &str = "deepseek_v41";
 
+/// Reference name of block 0's hyper-connection mix: residual hyper-connections are what sets
+/// this model apart from every architecture the generic transformer builds.
+const HYPER_CONNECTION_MARKER: &str = "layers.0.hc_attn_fn";
+
+/// Whether a GGUF file is this model: block 0 carries the hyper-connection mix under one of its
+/// GGUF spellings, or the metadata counts hyper-connections, whatever architecture tag the
+/// converter wrote.
+pub fn claims_gguf(content: &gguf_file::Content) -> bool {
+    let tensor = source::gguf_names(HYPER_CONNECTION_MARKER)
+        .iter()
+        .any(|n| content.tensor_infos.contains_key(n));
+    let arch = content
+        .metadata
+        .get("general.architecture")
+        .and_then(|v| v.to_string().ok());
+    let counted = arch.is_some_and(|a| {
+        ["hyper_connection.count", "hyper_connection_mult"]
+            .iter()
+            .any(|k| content.metadata.contains_key(&format!("{a}.{k}")))
+    });
+    tensor || counted
+}
+
+/// Whether a checkpoint directory holds this model's released weights: its shard index, or a
+/// shard's header when there is no index, names the hyper-connection mix.
+pub fn claims_checkpoint_dir(dir: &std::path::Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    if let Ok(txt) = std::fs::read_to_string(dir.join("model.safetensors.index.json")) {
+        return serde_json::from_str::<serde_json::Value>(&txt)
+            .ok()
+            .and_then(|v| {
+                v.get("weight_map")
+                    .map(|m| m.get(HYPER_CONNECTION_MARKER).is_some())
+            })
+            .unwrap_or(false);
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .any(|p| {
+            safetensors_source::header_names(&p)
+                .is_some_and(|n| n.iter().any(|t| t == HYPER_CONNECTION_MARKER))
+        })
+}
+
 /// Every shape the port needs, read from GGUF metadata. Scalars follow llama.cpp's deepseek keys
 /// (`attention.head_count`, `attention.key_length`, ...); the novel per-layer and CSA2 fields take
 /// keys under the same prefix.
