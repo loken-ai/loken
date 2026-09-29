@@ -101,6 +101,8 @@ pub enum MediaKind {
     Speech(SpeechModel),
     Sound(SoundKind),
     Music,
+    /// Symbolic music: MIDI events.
+    Midi,
     /// A part another pipeline loads: a text or image encoder, an autoencoder, a tokenizer.
     Component,
 }
@@ -116,6 +118,7 @@ impl MediaKind {
             MediaKind::Speech(_) => "tts",
             MediaKind::Sound(_) => "sound",
             MediaKind::Music => "music",
+            MediaKind::Midi => "midi",
             MediaKind::Component => return None,
         })
     }
@@ -314,7 +317,15 @@ fn from_gguf(path: &Path) -> Option<MediaFacts> {
         .and_then(|v| v.to_string().ok())
         .map(String::as_str);
     let mut facts = match declared {
-        Some(arch) => MediaFacts::of(gguf_architecture(arch)?),
+        Some(arch) => match gguf_architecture(arch) {
+            Some(kind) => MediaFacts::of(kind),
+            // A language model whose vocabulary carries MIDI event tokens writes music as
+            // symbolic events.
+            None if vocabulary_has_prefix(&content, MIDI_EVENT_TOKEN) => {
+                MediaFacts::of(MediaKind::Midi)
+            }
+            None => return None,
+        },
         None => by_names?,
     };
     if let Some(named) = by_names {
@@ -325,6 +336,25 @@ fn from_gguf(path: &Path) -> Option<MediaFacts> {
         (k.ends_with(".is_turbo") || k.ends_with(".is_distilled")) && v.to_bool().unwrap_or(false)
     });
     Some(facts)
+}
+
+/// The vocabulary piece that opens the MIDI event tokens of a symbolic-music language model.
+const MIDI_EVENT_TOKEN: &str = "<|midi_token_";
+
+/// Whether a GGUF's vocabulary holds a piece starting with `prefix`.
+fn vocabulary_has_prefix(
+    content: &crate::tensor::quantized::gguf_file::Content,
+    prefix: &str,
+) -> bool {
+    content
+        .metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(|v| v.to_vec().ok())
+        .is_some_and(|tokens| {
+            tokens
+                .iter()
+                .any(|t| t.to_string().is_ok_and(|s| s.starts_with(prefix)))
+        })
 }
 
 /// A JSON file, including one written by Python's encoder, which spells unbounded values

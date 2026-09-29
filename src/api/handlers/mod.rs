@@ -2696,9 +2696,16 @@ fn files_carry_vision(path: &std::path::Path) -> bool {
 /// Speech and transcription checkpoints are not refused here: the chat routes send them to
 /// their own handlers.
 pub(crate) fn non_chat_pipeline_component(hf_models_dir: &str, model_name: &str) -> Option<String> {
-    if media_facts(hf_models_dir, model_name)
-        .is_some_and(|f| f.kind == crate::inference::media_facts::MediaKind::Component)
+    use crate::inference::media_facts::{MediaKind, SpeechModel, TranscriptionModel};
+    let kind = media_facts(hf_models_dir, model_name).map(|f| f.kind);
+    if let Some(
+        MediaKind::Speech(SpeechModel::Unserved)
+        | MediaKind::Transcription(TranscriptionModel::Converted),
+    ) = kind
     {
+        return Some("its files declare a speech model this build runs no engine for.".to_string());
+    }
+    if kind == Some(MediaKind::Component) {
         return Some(
             "its files declare a component of another pipeline - an encoder or an \
              autoencoder that pipeline loads - not a model that generates text. Select the \
@@ -3154,20 +3161,20 @@ pub(crate) mod family {
     }
 
     #[cfg(feature = "audio")]
-    pub(crate) fn is_tts(model: &str) -> bool {
-        super::is_tts_model(model)
+    pub(crate) fn is_tts(hf_models_dir: &str, model: &str) -> bool {
+        super::is_served_speech(hf_models_dir, model)
     }
     #[cfg(not(feature = "audio"))]
-    pub(crate) fn is_tts(_model: &str) -> bool {
+    pub(crate) fn is_tts(_hf_models_dir: &str, _model: &str) -> bool {
         false
     }
 
     #[cfg(feature = "audio")]
-    pub(crate) fn is_asr(model: &str) -> bool {
-        super::is_asr_model(model)
+    pub(crate) fn is_asr(hf_models_dir: &str, model: &str) -> bool {
+        super::is_served_transcription(hf_models_dir, model)
     }
     #[cfg(not(feature = "audio"))]
-    pub(crate) fn is_asr(_model: &str) -> bool {
+    pub(crate) fn is_asr(_hf_models_dir: &str, _model: &str) -> bool {
         false
     }
 }

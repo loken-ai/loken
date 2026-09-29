@@ -17,6 +17,9 @@ pub(crate) struct MediaEntry {
     pub path: PathBuf,
 }
 
+/// Where Piper voices are kept, one directory per voice.
+pub(crate) const PIPER_DIR: &str = "piper";
+
 /// A whole image model is billions of parameters; anything smaller in a weight directory is
 /// a VAE, a text encoder or an adapter, and offering it as a model would hand the user
 /// something unloadable.
@@ -152,7 +155,7 @@ fn registered_entries(hf_dir: &str) -> Vec<MediaEntry> {
     );
     for v in ["turbo", "sft", "base", "xl-turbo", "xl-sft", "xl-base"] {
         push(
-            &format!("ace-step-{v}"),
+            &format!("{}{v}", super::catalogue::MUSIC_ENTRY_PREFIX),
             crate::inference::model::acestep::fsq::acestep_gguf(&format!(
                 "acestep-v15-{v}-Q8_0.gguf"
             )),
@@ -185,6 +188,29 @@ fn registered_entries(hf_dir: &str) -> Vec<MediaEntry> {
             p,
         );
     }
+    // Piper voices, each its own checkpoint: `<models>/piper/<voice>/<voice>.onnx`, with the
+    // phoneme table beside it. The directory steps out of a `hub/` cache as the voices do.
+    let root = if hf.file_name().is_some_and(|n| n == "hub") {
+        hf.parent().unwrap_or(hf)
+    } else {
+        hf
+    };
+    for dir in std::fs::read_dir(root.join(PIPER_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let voice = dir.file_name().to_string_lossy().to_string();
+        push(
+            &format!("{PIPER_DIR}/{voice}"),
+            dir.path().join(format!("{voice}.onnx")),
+        );
+    }
+    #[cfg(feature = "midi")]
+    push(
+        "midi",
+        crate::config::ollama_models_dir().join("MIDI-LLM_Llama-3.2-1B.Q8_0.gguf"),
+    );
     push("flux-kontext", hf.join("flux-kontext-q4km.gguf"));
     push("qwen-image-edit", hf.join("qwen-image-edit/dit-q4km.gguf"));
     push(
@@ -219,9 +245,35 @@ fn bare(id: &str) -> &str {
     id.strip_suffix(":latest").unwrap_or(id)
 }
 
-/// The files `id` names: a local entry, a cached repository by its id or its name, or the
-/// repository an entry of the OpenAI model list stands for.
-pub(crate) fn media_checkpoint(hf_dir: &str, id: &str) -> Option<PathBuf> {
+/// Names the API takes for a checkpoint the catalogue holds under another id: OpenAI's
+/// documented model ids, and the engine words the speech and music routes have always
+/// accepted. A name only looks a checkpoint up; what it is, its files say.
+const ALIASES: &[(&str, &str)] = &[
+    ("whisper-1", "openai/whisper-small"),
+    ("tts-1", "parler-tts/parler-tts-mini-v1"),
+    ("tts-1-1106", "parler-tts/parler-tts-mini-v1"),
+    ("tts-1-hd", "parler-tts/parler-tts-large-v1"),
+    ("tts-1-hd-1106", "parler-tts/parler-tts-large-v1"),
+    ("kyutai", "kyutai/tts-1.6b-en_fr"),
+    ("piper", "piper/fr_FR-tom-medium"),
+    ("ace-step", "ace-step-turbo"),
+    ("acestep", "ace-step-turbo"),
+    ("music", "ace-step-turbo"),
+];
+
+/// The id an alias or an entry of the OpenAI model list stands for.
+pub(crate) fn aliased(id: &str) -> Option<&'static str> {
+    ALIASES
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(id))
+        .map(|(_, target)| *target)
+        .or_else(|| crate::api::handlers::offered_repository(id))
+}
+
+/// A local entry or cached repository `id` names, with the catalogue id it is known by:
+/// the entry's id, a cached repository by its id or its name without the owner, or what an
+/// alias stands for.
+pub(crate) fn resolve(hf_dir: &str, id: &str) -> Option<(String, PathBuf)> {
     let want = bare(id);
     if want.is_empty() {
         return None;
@@ -230,14 +282,123 @@ pub(crate) fn media_checkpoint(hf_dir: &str, id: &str) -> Option<PathBuf> {
         .into_iter()
         .find(|e| e.id.eq_ignore_ascii_case(want))
     {
-        return Some(e.path);
+        return Some((e.id, e.path));
     }
     let hf =
         crate::inference::load::huggingface_manager::HuggingFaceManager::new(PathBuf::from(hf_dir));
-    let repo = hf
-        .repository_named(want)
-        .or_else(|| crate::api::handlers::offered_repository(want).map(str::to_string))?;
-    hf.get_model_path(&repo)
+    if let Some(repo) = hf.repository_named(want) {
+        return hf.get_model_path(&repo).map(|p| (repo, p));
+    }
+    let target = aliased(want).filter(|t| !t.eq_ignore_ascii_case(want))?;
+    // An alias stands for an entry or a repository, never for another alias.
+    if let Some(e) = local_media_entries(hf_dir)
+        .into_iter()
+        .find(|e| e.id.eq_ignore_ascii_case(target))
+    {
+        return Some((e.id, e.path));
+    }
+    let repo = hf.repository_named(target)?;
+    hf.get_model_path(&repo).map(|p| (repo, p))
+}
+
+/// The files `id` names.
+pub(crate) fn media_checkpoint(hf_dir: &str, id: &str) -> Option<PathBuf> {
+    resolve(hf_dir, id).map(|(_, p)| p)
+}
+
+/// The catalogue id `id` stands for; the id an alias names, or the id itself, when nothing
+/// on disk answers to it, so a repository not downloaded yet is fetched under that id.
+pub(crate) fn canonical_id(hf_dir: &str, id: &str) -> String {
+    resolve(hf_dir, id)
+        .map(|(c, _)| c)
+        .or_else(|| aliased(bare(id)).map(str::to_string))
+        .unwrap_or_else(|| bare(id).to_string())
+}
+
+/// A speech request: the synthesiser its files declare, the catalogue id of its checkpoint,
+/// and the voice that follows the checkpoint's name in the request.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SpeechRequest {
+    pub model: crate::inference::media_facts::SpeechModel,
+    pub id: String,
+    pub path: PathBuf,
+    pub voice: Option<String>,
+}
+
+impl SpeechRequest {
+    /// The name the engine holds this request's checkpoint and voice under.
+    pub(crate) fn canonical(&self) -> String {
+        match &self.voice {
+            Some(v) => format!("{}/{v}", self.id),
+            None => self.id.clone(),
+        }
+    }
+}
+
+/// Every way to cut `requested` at a separator into a checkpoint name and what follows it,
+/// the whole name first and the shortest head last.
+pub(crate) fn heads(requested: &str) -> Vec<(&str, &str)> {
+    let requested = bare(requested);
+    let mut cuts: Vec<usize> = requested
+        .char_indices()
+        .filter(|(_, c)| matches!(c, '-' | '/' | ':' | '_'))
+        .map(|(i, _)| i)
+        .collect();
+    cuts.push(requested.len());
+    cuts.iter()
+        .rev()
+        .map(|&cut| requested.split_at(cut))
+        .collect()
+}
+
+/// Whether a catalogue entry, which lists names only, is the checkpoint `name` names: its
+/// id, its name without the owner, or what an alias of `name` stands for.
+pub(crate) fn entry_named(entry: &str, name: &str) -> bool {
+    let (entry, name) = (bare(entry), bare(name));
+    if name.is_empty() {
+        return false;
+    }
+    let short = entry.rsplit('/').next().unwrap_or(entry);
+    [Some(name), aliased(name)]
+        .into_iter()
+        .flatten()
+        .any(|n| entry.eq_ignore_ascii_case(n) || short.eq_ignore_ascii_case(n))
+}
+
+/// What a speech request names: the longest part of `requested`, cut at a separator, that
+/// names a checkpoint whose files declare a speech synthesiser, and the voice after it
+/// (`<checkpoint>-<voice>`, `<checkpoint>/<voice>`).
+pub(crate) fn speech_request(hf_dir: &str, requested: &str) -> Option<SpeechRequest> {
+    for (head, tail) in heads(requested) {
+        let Some((id, path)) = resolve(hf_dir, head) else {
+            continue;
+        };
+        let Some(MediaKind::Speech(model)) = media_facts::read(&path).map(|f| f.kind) else {
+            continue;
+        };
+        let voice = tail.trim_start_matches(['-', '/', ':', '_']);
+        return Some(SpeechRequest {
+            model,
+            id,
+            path,
+            voice: (!voice.is_empty()).then(|| voice.to_string()),
+        });
+    }
+    None
+}
+
+/// Whether `id` names a speech synthesiser this build runs an engine for.
+pub(crate) fn is_served_speech(hf_dir: &str, id: &str) -> bool {
+    use crate::inference::media_facts::SpeechModel;
+    speech_request(hf_dir, id).is_some_and(|r| r.model != SpeechModel::Unserved)
+}
+
+/// Whether `id` names a speech recogniser this build runs an engine for.
+pub(crate) fn is_served_transcription(hf_dir: &str, id: &str) -> bool {
+    media_facts(hf_dir, id).is_some_and(|f| {
+        f.kind
+            == MediaKind::Transcription(crate::inference::media_facts::TranscriptionModel::Whisper)
+    })
 }
 
 /// What the checkpoint `id` names declares itself to be.

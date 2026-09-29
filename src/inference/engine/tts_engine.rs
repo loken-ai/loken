@@ -835,37 +835,14 @@ fn synthesize_parler(
     Ok(TtsResult { pcm, sample_rate })
 }
 
-/// Resolve a caller-supplied TTS model name into a full HF model id.
-///
-/// Three input shapes accepted:
-///
-///   - `None` -> default to `parler-tts/parler-tts-mini-v1`
-///     (works in ~700 MB free; large-v1 is multi-gigabyte).
-///   - OpenAI documented ids (case-insensitive) -> mapped to the
-///     closest local-hostable Parler checkpoint. SDK clients
-///     passing `TTS-1` or `tts-1-HD` resolve correctly.
-///   - Bare `parler-tts-...` name (no slash) -> prefixed with the
-///     `parler-tts/` HF org. Anything else with a `/` is passed
-///     through as a full HF model id.
-///
-/// Lifted out of `load_parler` so the mapping can be unit-tested
-/// without spinning up an async runtime or hitting HF.
+/// The Hugging Face id a Parler load fetches: the caller's id, which the API has already
+/// resolved from any alias, or the default checkpoint when the caller names none.
 pub(crate) fn resolve_tts_model_id(name: Option<&str>) -> String {
-    let raw = name.unwrap_or("parler-tts/parler-tts-mini-v1");
-    let lower = raw.to_lowercase();
-    let mapped = match lower.as_str() {
-        "tts-1" | "tts-1-1106" => "parler-tts-mini-v1",
-        "tts-1-hd" | "tts-1-hd-1106" => "parler-tts-large-v1",
-        _ => raw,
-    };
-    if mapped.contains('/') {
-        mapped.to_string()
-    } else if mapped.to_lowercase().starts_with("parler") {
-        format!("parler-tts/{}", mapped.to_lowercase())
-    } else {
-        mapped.to_string()
-    }
+    name.unwrap_or(DEFAULT_PARLER).to_string()
 }
+
+/// The checkpoint a speech request that names no model loads.
+const DEFAULT_PARLER: &str = "parler-tts/parler-tts-mini-v1";
 
 #[cfg(test)]
 mod tests {
@@ -879,49 +856,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tts_model_id_maps_openai_aliases_case_insensitively() {
-        // OpenAI's documented TTS model ids -> local checkpoints.
-        assert_eq!(
-            resolve_tts_model_id(Some("tts-1")),
-            "parler-tts/parler-tts-mini-v1",
-        );
-        assert_eq!(
-            resolve_tts_model_id(Some("TTS-1")),
-            "parler-tts/parler-tts-mini-v1",
-        );
-        assert_eq!(
-            resolve_tts_model_id(Some("tts-1-1106")),
-            "parler-tts/parler-tts-mini-v1",
-        );
-        assert_eq!(
-            resolve_tts_model_id(Some("tts-1-hd")),
-            "parler-tts/parler-tts-large-v1",
-        );
-        assert_eq!(
-            resolve_tts_model_id(Some("TTS-1-HD")),
-            "parler-tts/parler-tts-large-v1",
-        );
-        assert_eq!(
-            resolve_tts_model_id(Some("tts-1-hd-1106")),
-            "parler-tts/parler-tts-large-v1",
-        );
-    }
-
-    #[test]
-    fn resolve_tts_model_id_auto_prefixes_bare_parler_names() {
-        // Bare `parler-tts-foo` -> `parler-tts/parler-tts-foo`.
-        assert_eq!(
-            resolve_tts_model_id(Some("parler-tts-mini-v1")),
-            "parler-tts/parler-tts-mini-v1",
-        );
-        assert_eq!(
-            resolve_tts_model_id(Some("Parler-TTS-Large-V1")),
-            "parler-tts/parler-tts-large-v1",
-            "case-insensitive prefix match; output lowercased",
-        );
-    }
-
-    #[test]
     fn resolve_tts_model_id_passes_full_hf_paths_through() {
         // Custom forks or non-Parler vendors. Full slash-form ids are
         // threaded through verbatim - no lowercasing (HF model ids
@@ -931,14 +865,6 @@ mod tests {
             "ylacombe/parler-tts-mini-jenny-30H",
         );
         assert_eq!(resolve_tts_model_id(Some("OpenSci/MyTTS")), "OpenSci/MyTTS",);
-    }
-
-    #[test]
-    fn resolve_tts_model_id_unknown_bare_name_passes_through() {
-        // Bare name that doesn't start with `parler` and has no slash:
-        // pass through unchanged (will fail at HF resolve, surfaced
-        // as a proper 404 to the caller).
-        assert_eq!(resolve_tts_model_id(Some("unknown-model")), "unknown-model");
     }
 
     #[test]

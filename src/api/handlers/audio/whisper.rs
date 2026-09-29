@@ -12,29 +12,19 @@ pub(super) async fn ensure_whisper_model_loaded(
     state: &APIServer,
     requested: Option<&str>,
 ) -> Result<(), String> {
+    // The catalogue id the request stands for, so an alias and the id it names are one
+    // model to the engine.
+    let requested = requested.map(|r| canonical_id(&state.huggingface_models_dir, r));
     let loaded = state.audio_engine.loaded_name().await;
-    let needs_reload = match (loaded.as_deref(), requested) {
-        (Some(cur), Some(req)) => {
-            // Resolve the `whisper-1` alias and bare names the same way
-            // load_whisper does, then compare suffixes.
-            let normalize = |s: &str| -> String {
-                let mapped = match s {
-                    "whisper-1" => "whisper-small",
-                    other => other,
-                };
-                mapped.rsplit('/').next().unwrap_or(mapped).to_string()
-            };
-            normalize(cur) != normalize(req)
-        }
-        _ => false,
-    };
+    let needs_reload = matches!((loaded.as_deref(), requested.as_deref()),
+        (Some(cur), Some(req)) if cur != req);
     if needs_reload {
         state.audio_engine.unload().await;
     }
     if !state.audio_engine.is_loaded().await {
         state
             .audio_engine
-            .load_whisper(requested)
+            .load_whisper(requested.as_deref())
             .await
             .map_err(|e| format!("whisper load: {e}"))?;
     }

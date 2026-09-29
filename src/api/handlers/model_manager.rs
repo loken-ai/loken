@@ -94,11 +94,13 @@ impl ResidentEngine {
     /// answer to "what have you got", `None` when it holds nothing - and an engine
     /// holding nothing claims nothing, which is what stops an unload from reporting
     /// freed VRAM that was never allocated.
-    pub(crate) fn claims(self, loaded: Option<&str>, model_id: &str) -> bool {
+    pub(crate) fn claims(self, hf_models_dir: &str, loaded: Option<&str>, model_id: &str) -> bool {
         // Ollama ids arrive normalised to `name:latest`, while the media engines record
         // the name they were asked to load. An exact match failed for every untagged
         // model - and the caller was told the unload had succeeded.
         let bare = |s: &str| s.strip_suffix(":latest").unwrap_or(s).to_string();
+        #[cfg(not(feature = "audio"))]
+        let _ = hf_models_dir;
         let Some(loaded) = loaded else { return false };
         match self {
             // Matched by the caller against the loaded-model registry, so the name is
@@ -106,19 +108,15 @@ impl ResidentEngine {
             ResidentEngine::Llm => loaded == model_id,
             #[cfg(feature = "image")]
             ResidentEngine::Image => bare(loaded).eq_ignore_ascii_case(&bare(model_id)),
-            // Through the engine's OWN id resolution, as for the TTS engine below.
+            // Through the catalogue id the loads record, so an alias, a bare name and the
+            // full repository id all name the checkpoint they load.
             #[cfg(feature = "audio")]
             ResidentEngine::Asr => {
-                crate::inference::engine::audio_engine::resolve_whisper_model_id(Some(&bare(
-                    model_id,
-                ))) == loaded
+                crate::api::handlers::canonical_id(hf_models_dir, model_id) == loaded
             }
-            // Through the engine's OWN id resolution, so "tts-1", "parler-tts-mini-v1"
-            // and the full repo id all name the checkpoint they load.
             #[cfg(feature = "audio")]
             ResidentEngine::Tts => {
-                crate::inference::engine::tts_engine::resolve_tts_model_id(Some(&bare(model_id)))
-                    == loaded
+                crate::api::handlers::speech_canonical(hf_models_dir, model_id) == loaded
             }
             #[cfg(feature = "audio")]
             ResidentEngine::StableAudio => {
@@ -736,7 +734,7 @@ impl APIServer {
     /// Release `kind`'s resident IF `model_id` names it. `Ok(false)` = not this engine's.
     async fn release_named(&self, kind: ResidentEngine, model_id: &str) -> Result<bool, ApiError> {
         let loaded = self.holding(kind, model_id).await;
-        if !kind.claims(loaded.as_deref(), model_id) {
+        if !kind.claims(&self.huggingface_models_dir, loaded.as_deref(), model_id) {
             return Ok(false);
         }
         match kind {
@@ -1054,21 +1052,37 @@ mod tests {
     /// ASR engines and not the TTS one, so `keep_alive:0` against a resident parler-tts
     /// answered `done_reason:"unload"` and freed nothing - 4.5 GB that pushed the next
     /// image render's DiT onto the slower card, for a 1.7x loss nothing reported.
+    /// A store holding the speech checkpoint the TTS rows name.
+    fn store() -> crate::inference::media_facts::fixture::Scratch {
+        use crate::inference::media_facts::fixture::{json, Scratch};
+        let s = Scratch::new("resident-names");
+        let dir = s.0.join("hub/models--parler-tts--parler-tts-mini-v1");
+        std::fs::create_dir_all(dir.join("refs")).unwrap();
+        std::fs::write(dir.join("refs/main"), "r").unwrap();
+        json(
+            &dir.join("snapshots/r/config.json"),
+            serde_json::json!({"model_type": "parler_tts"}),
+        );
+        std::fs::write(dir.join("snapshots/r/model.safetensors"), b"").unwrap();
+        s
+    }
+
     #[cfg(feature = "audio")]
     #[test]
     fn a_resident_tts_checkpoint_is_named_by_the_ids_a_client_has_for_it() {
+        let s = store();
+        let hf = s.0.to_str().unwrap();
         assert!(ResidentEngine::ALL.contains(&ResidentEngine::Tts));
         let loaded = Some("parler-tts/parler-tts-mini-v1");
         for id in [
             "parler-tts/parler-tts-mini-v1",
             "parler-tts/parler-tts-mini-v1:latest",
             "parler-tts-mini-v1",
-            // The OpenAI alias, resolved by the engine's own id rules rather than a
-            // second table that could disagree with them.
+            // The OpenAI alias, resolved by the catalogue the load resolved it by.
             "tts-1",
         ] {
             assert!(
-                ResidentEngine::Tts.claims(loaded, id),
+                ResidentEngine::Tts.claims(hf, loaded, id),
                 "the TTS engine does not answer to {id}"
             );
         }
@@ -1080,7 +1094,7 @@ mod tests {
             }
             let (its_own, _, _) = name_rule(*kind);
             assert!(
-                !kind.claims(Some(its_own), "parler-tts/parler-tts-mini-v1"),
+                !kind.claims(hf, Some(its_own), "parler-tts/parler-tts-mini-v1"),
                 "{kind:?} claimed a TTS checkpoint"
             );
         }
@@ -1092,15 +1106,17 @@ mod tests {
     /// that is still resident - the caller believes the card is free.
     #[test]
     fn an_engine_holding_nothing_claims_nothing() {
+        let s = store();
+        let hf = s.0.to_str().unwrap();
         for kind in ResidentEngine::ALL {
             let (loaded, id, claimed) = name_rule(*kind);
             assert_eq!(
-                kind.claims(Some(loaded), id),
+                kind.claims(hf, Some(loaded), id),
                 claimed,
                 "{kind:?} disagrees with its own name rule"
             );
             assert!(
-                !kind.claims(None, id),
+                !kind.claims(hf, None, id),
                 "{kind:?} claimed {id} while holding nothing"
             );
         }

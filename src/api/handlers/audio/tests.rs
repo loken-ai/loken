@@ -71,99 +71,147 @@ fn conv_note_model_accumulates_working_set() {
     assert_eq!(c.len(), 2);
 }
 
-#[test]
-fn kyutai_voice_name_routes_and_extracts_voice() {
-    // Non-kyutai ids are not this backend.
-    assert_eq!(kyutai_voice_name("parler-tts-mini-v1"), None);
-    assert_eq!(kyutai_voice_name("piper/fr_FR-tom-medium"), None);
-    assert_eq!(kyutai_voice_name("pocket-tts-alba"), None);
-    // Bare markers -> default voice (inner None).
-    assert_eq!(kyutai_voice_name("kyutai"), Some(None));
-    assert_eq!(kyutai_voice_name("kyutai-tts"), Some(None));
-    assert_eq!(kyutai_voice_name("kyutai-en_fr"), Some(None));
-    // Named voice -> the selector substring.
-    assert_eq!(
-        kyutai_voice_name("kyutai-alba"),
-        Some(Some("alba".to_string()))
+/// A models store holding one checkpoint per speech and transcription engine, each declared
+/// only by what the readers look at.
+fn speech_store(tag: &str) -> crate::inference::media_facts::fixture::Scratch {
+    use crate::inference::media_facts::fixture::{json, safetensors, Scratch};
+    let s = Scratch::new(&format!("speech-{tag}"));
+    let repo = |id: &str| {
+        let dir =
+            s.0.join("hub")
+                .join(format!("models--{}", id.replace('/', "--")));
+        std::fs::create_dir_all(dir.join("refs")).unwrap();
+        std::fs::write(dir.join("refs/main"), "r").unwrap();
+        dir.join("snapshots/r")
+    };
+    let with_config = |id: &str, config: serde_json::Value| {
+        let snap = repo(id);
+        json(&snap.join("config.json"), config);
+        std::fs::write(snap.join("model.safetensors"), b"").unwrap();
+    };
+    with_config(
+        "kyutai/tts-1.6b-en_fr",
+        serde_json::json!({"model_type": "tts"}),
     );
-    assert_eq!(
-        kyutai_voice_name("kyutai/alba-mackenna/a-moment-by"),
-        Some(Some("alba-mackenna/a-moment-by".to_string()))
+    with_config(
+        "parler-tts/parler-tts-mini-v1",
+        serde_json::json!({"model_type": "parler_tts"}),
     );
-    assert_eq!(
-        kyutai_voice_name("org/kyutai-estelle"),
-        Some(Some("estelle".to_string()))
+    with_config(
+        "parler-tts/parler-tts-large-v1",
+        serde_json::json!({"model_type": "parler_tts"}),
     );
-    // Recognized as a TTS model + routed before pocket-tts.
-    assert!(is_tts_model("kyutai"));
-    assert!(is_tts_model("kyutai-alba"));
+    with_config(
+        "openai/whisper-small",
+        serde_json::json!({"model_type": "whisper"}),
+    );
+    with_config("coqui/XTTS-v2", serde_json::json!({"model": "xtts"}));
+    safetensors(
+        &repo("kyutai/pocket-tts").join("tts_1.safetensors"),
+        &["flow_lm.transformer.w", "mimi.decoder.w"],
+        None,
+    );
+    let voice = s.0.join("piper/fr_FR-tom-medium");
+    std::fs::create_dir_all(&voice).unwrap();
+    std::fs::write(voice.join("fr_FR-tom-medium.onnx"), b"").unwrap();
+    json(
+        &voice.join("fr_FR-tom-medium.onnx.json"),
+        serde_json::json!({"phoneme_id_map": {}, "espeak": {"voice": "fr"}}),
+    );
+    s
 }
 
+/// A speech request names a checkpoint and, after it, a voice; the checkpoint's files pick
+/// the engine, whatever the name says.
 #[test]
-fn pocket_tts_voice_name_and_path() {
-    // Non-pocket ids fall through.
-    assert_eq!(pocket_tts_voice_name("piper/fr_FR-tom-medium"), None);
-    assert_eq!(pocket_tts_voice_name("parler-tts-mini-v1"), None);
-    // Bare / prefixed forms.
+fn a_speech_request_is_routed_by_its_checkpoints_files() {
+    use crate::inference::media_facts::SpeechModel;
+    let s = speech_store("routes");
+    let hf = s.0.to_str().unwrap();
+    let routed = |r: &str| speech_request(hf, r).map(|q| (q.model, q.voice));
+    assert_eq!(routed("kyutai"), Some((SpeechModel::Kyutai, None)));
     assert_eq!(
-        pocket_tts_voice_name("pocket-tts").as_deref(),
-        Some("default")
+        routed("kyutai/tts-1.6b-en_fr"),
+        Some((SpeechModel::Kyutai, None))
     );
     assert_eq!(
-        pocket_tts_voice_name("pocket-tts-alba").as_deref(),
-        Some("alba")
+        routed("kyutai-alba"),
+        Some((SpeechModel::Kyutai, Some("alba".to_string())))
     );
     assert_eq!(
-        pocket_tts_voice_name("org/pocket-tts-estelle").as_deref(),
-        Some("estelle")
+        routed("kyutai/alba-mackenna/a-moment-by"),
+        Some((
+            SpeechModel::Kyutai,
+            Some("alba-mackenna/a-moment-by".to_string())
+        ))
     );
-    // Path steps out of hub/ and lands under pocket-tts-voices/.
+    assert_eq!(routed("pocket-tts"), Some((SpeechModel::PocketTts, None)));
+    assert_eq!(
+        routed("pocket-tts-alba"),
+        Some((SpeechModel::PocketTts, Some("alba".to_string())))
+    );
+    assert_eq!(
+        routed("piper/fr_FR-tom-medium"),
+        Some((SpeechModel::Piper, None))
+    );
+    assert_eq!(routed("piper"), Some((SpeechModel::Piper, None)));
+    for parler in [
+        "tts-1",
+        "parler-tts-mini-v1",
+        "parler-tts/parler-tts-mini-v1:latest",
+    ] {
+        assert_eq!(
+            routed(parler),
+            Some((SpeechModel::Parler, None)),
+            "{parler}"
+        );
+    }
+    // A cloning synthesiser this build runs no engine for is what it is, and is not served.
+    assert_eq!(routed("xtts-v2"), Some((SpeechModel::Unserved, None)));
+    assert!(!is_served_speech(hf, "xtts-v2"));
+    for other in [
+        "openai/whisper-small",
+        "qwen3-coder:latest",
+        "openai/tts-1",
+        "",
+    ] {
+        assert!(speech_request(hf, other).is_none(), "{other}");
+        assert!(!is_served_speech(hf, other), "{other}");
+    }
+    // The reference voice path steps out of hub/ and lands under pocket-tts-voices/.
     let p = pocket_tts_voice_path("/m/hf/hub", "alba");
     assert!(p.ends_with("pocket-tts-voices/alba.wav"), "{p:?}");
     assert!(p.starts_with("/m/hf"));
-    // is_tts_model recognizes pocket-tts.
-    assert!(is_tts_model("pocket-tts-alba"));
 }
 
+/// An alias, a bare name and a full id of one checkpoint are one model to the engine; another
+/// checkpoint, or another voice of the same one, is another.
 #[test]
-fn piper_voice_name_routes_and_extracts_voice() {
-    // Non-Piper ids return None (fall through to Parler).
-    assert_eq!(piper_voice_name("parler-tts/parler-tts-mini-v1"), None);
-    assert_eq!(piper_voice_name("tts-1"), None);
-    // Bare `piper` -> default French voice.
-    assert_eq!(
-        piper_voice_name("piper").as_deref(),
-        Some("fr_FR-tom-medium")
+fn a_loaded_speech_model_answers_to_every_name_of_its_checkpoint() {
+    let s = speech_store("canonical");
+    let hf = s.0.to_str().unwrap();
+    let mini = super::decode::speech_canonical(hf, "parler-tts/parler-tts-mini-v1");
+    for same in ["tts-1", "parler-tts-mini-v1", "PARLER-TTS-MINI-V1:latest"] {
+        assert_eq!(super::decode::speech_canonical(hf, same), mini, "{same}");
+    }
+    assert_ne!(super::decode::speech_canonical(hf, "tts-1-hd"), mini);
+    assert_ne!(
+        super::decode::speech_canonical(hf, "kyutai-alba"),
+        super::decode::speech_canonical(hf, "kyutai-estelle")
     );
-    assert_eq!(
-        piper_voice_name("Piper").as_deref(),
-        Some("fr_FR-tom-medium")
-    );
-    // `piper/<voice>` and `piper-<voice>` forms extract the voice.
-    assert_eq!(
-        piper_voice_name("piper/fr_FR-tom-medium").as_deref(),
-        Some("fr_FR-tom-medium")
-    );
-    assert_eq!(
-        piper_voice_name("piper-en_US-amy-medium").as_deref(),
-        Some("en_US-amy-medium")
-    );
-    // Piper is recognised as a TTS model.
-    assert!(is_tts_model("piper/fr_FR-tom-medium"));
 }
 
+/// A transcription model is one whose files declare a recogniser this build loads.
 #[test]
-fn piper_onnx_path_resolves_under_hf_dir() {
-    // Plain HF dir -> <dir>/piper/<voice>/<voice>.onnx.
-    assert_eq!(
-        piper_onnx_path("/models/hf", "fr_FR-tom-medium"),
-        std::path::PathBuf::from("/models/hf/piper/fr_FR-tom-medium/fr_FR-tom-medium.onnx"),
-    );
-    // A dir already ending in `hub/` steps back out (voices sit beside hub).
-    assert_eq!(
-        piper_onnx_path("/models/hf/hub", "fr_FR-tom-medium"),
-        std::path::PathBuf::from("/models/hf/piper/fr_FR-tom-medium/fr_FR-tom-medium.onnx"),
-    );
+fn a_transcription_model_is_known_by_its_files() {
+    let s = speech_store("asr");
+    let hf = s.0.to_str().unwrap();
+    for id in ["whisper-1", "openai/whisper-small", "whisper-small"] {
+        assert!(is_served_transcription(hf, id), "{id}");
+    }
+    for id in ["parler-tts-mini-v1", "kyutai", "qwen3-coder:latest", ""] {
+        assert!(!is_served_transcription(hf, id), "{id}");
+    }
 }
 
 // -- validate_tts_input -----------------------------------------
@@ -1242,37 +1290,6 @@ fn pcm_to_wav_base64_handles_empty_input() {
     assert_eq!(data_size, 0);
 }
 
-#[test]
-fn is_asr_model_matches_whisper_variants() {
-    assert!(is_asr_model("openai/whisper-small"));
-    assert!(is_asr_model("whisper-large-v3"));
-    assert!(is_asr_model("distil-whisper/distil-large-v3"));
-    // Case-insensitive
-    assert!(is_asr_model("Whisper"));
-    // Negatives - chat / TTS / image / video must NOT classify as ASR.
-    assert!(!is_asr_model("qwen3-coder:latest"));
-    assert!(!is_asr_model("parler-tts/parler-tts-mini-v1"));
-    assert!(!is_asr_model("Tongyi-MAI/Z-Image-Turbo"));
-    assert!(!is_asr_model(""));
-}
-
-#[test]
-fn is_tts_model_matches_known_families() {
-    assert!(is_tts_model("parler-tts/parler-tts-mini-v1"));
-    assert!(is_tts_model("parler-tts-large-v1"));
-    assert!(is_tts_model("openai/tts-1"));
-    assert!(is_tts_model("tts-1-hd"));
-    assert!(is_tts_model("suno/bark"));
-    assert!(is_tts_model("hexgrad/kokoro"));
-    assert!(is_tts_model("ai4bharat/f5-tts"));
-    // Negative cases: chat / image / ASR models must NOT be TTS.
-    assert!(!is_tts_model("qwen3-coder:latest"));
-    assert!(!is_tts_model("Tongyi-MAI/Z-Image-Turbo"));
-    assert!(!is_tts_model("openai/whisper-small"));
-    assert!(!is_tts_model("lmz/candle-flux"));
-    assert!(!is_tts_model(""));
-}
-
 // -- /v1/audio/speech delivery -------------------------------------------
 
 /// `stream` was already taken on this route and means "send the audio bytes as they
@@ -1395,7 +1412,7 @@ async fn the_speech_event_stream_names_its_phase_before_it_has_anything_to_send(
     );
     let err = outcome["error"].as_str().unwrap_or_default();
     assert!(
-        err.contains("piper voice not found"),
+        err.contains("names no checkpoint"),
         "an error that says why: {err}"
     );
 
@@ -1420,28 +1437,6 @@ async fn the_speech_event_stream_names_its_phase_before_it_has_anything_to_send(
         events.iter().all(|e| e.get("data").is_none()),
         "a failed synthesis must not carry a clip: {text}"
     );
-}
-
-/// The loaded Parler model answers to its alias, its bare name and its full id alike; another
-/// Parler model or another backend's voice makes it reload.
-#[test]
-fn a_loaded_parler_model_answers_to_its_aliases() {
-    use super::decode::parler_needs_reload;
-    let cur = Some("parler-tts/parler-tts-mini-v1");
-    for same in [
-        Some("tts-1"),
-        Some("parler-tts-mini-v1"),
-        Some("parler-tts/parler-tts-mini-v1"),
-        None,
-    ] {
-        assert!(
-            !parler_needs_reload(cur, same),
-            "{same:?} reloaded the loaded model"
-        );
-    }
-    assert!(parler_needs_reload(cur, Some("tts-1-hd")));
-    assert!(parler_needs_reload(Some("piper/en_US-amy"), Some("tts-1")));
-    assert!(!parler_needs_reload(None, Some("tts-1")));
 }
 
 /// The stereo decoder keeps both channels and the source rate, and resamples each

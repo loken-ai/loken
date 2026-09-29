@@ -467,34 +467,14 @@ fn load_whisper_blocking(model_id: &str) -> AnyResult<WhisperModelState> {
     })
 }
 
-/// Resolve a caller-supplied Whisper model name into a full HF model id.
-///
-/// Three input shapes accepted:
-///
-///   - `None` -> default to `openai/whisper-small` (fits in ~500 MB free,
-///     reasonable accuracy/latency for the typical ASR request).
-///   - OpenAI documented id (`whisper-1`, case-insensitive) -> mapped to
-///     `whisper-small` so SDK clients passing `Whisper-1` resolve.
-///   - Bare `whisper-...` name (no slash) -> prefixed with `openai/` and
-///     lowercased. Anything with `/` is passed through as a full HF
-///     model id.
-///
-/// Lifted out of `load_whisper` so the mapping can be unit-tested
-/// without spinning up an async runtime or hitting HF.
+/// The Hugging Face id a whisper load fetches: the caller's id, which the API has already
+/// resolved from any alias, or the default checkpoint when the caller names none.
 pub(crate) fn resolve_whisper_model_id(name: Option<&str>) -> String {
-    let raw = name.unwrap_or("openai/whisper-small");
-    let raw = match raw.to_lowercase().as_str() {
-        "whisper-1" => "whisper-small",
-        _ => raw,
-    };
-    if raw.contains('/') {
-        raw.to_string()
-    } else if raw.starts_with("whisper-") || raw.starts_with("Whisper-") {
-        format!("openai/{}", raw.to_lowercase())
-    } else {
-        raw.to_string()
-    }
+    name.unwrap_or(DEFAULT_WHISPER).to_string()
 }
+
+/// The checkpoint a transcription that names no model loads.
+const DEFAULT_WHISPER: &str = "openai/whisper-small";
 
 fn token_id(t: &Tokenizer, name: &str) -> AnyResult<u32> {
     t.token_to_id(name)
@@ -1302,46 +1282,6 @@ mod tests {
         // request profile. Pin so a refactor doesn't silently
         // switch to large-v3 (multi-GB download on first use).
         assert_eq!(resolve_whisper_model_id(None), "openai/whisper-small",);
-    }
-
-    #[test]
-    fn resolve_whisper_model_id_maps_openai_alias_case_insensitively() {
-        // OpenAI's documented `whisper-1` (and SDK enum variants)
-        // -> local whisper-small. SDK clients passing `Whisper-1`
-        // / `WHISPER-1` must all resolve to the same checkpoint.
-        assert_eq!(
-            resolve_whisper_model_id(Some("whisper-1")),
-            "openai/whisper-small",
-        );
-        assert_eq!(
-            resolve_whisper_model_id(Some("Whisper-1")),
-            "openai/whisper-small",
-        );
-        assert_eq!(
-            resolve_whisper_model_id(Some("WHISPER-1")),
-            "openai/whisper-small",
-        );
-    }
-
-    #[test]
-    fn resolve_whisper_model_id_auto_prefixes_bare_whisper_names() {
-        // Bare `whisper-tiny.en` -> `openai/whisper-tiny.en`. The
-        // explicit lowercasing matters for `.en` checkpoints; HF
-        // paths are case-sensitive on disk but the openai/ repo
-        // is all lowercase.
-        assert_eq!(
-            resolve_whisper_model_id(Some("whisper-tiny.en")),
-            "openai/whisper-tiny.en",
-        );
-        assert_eq!(
-            resolve_whisper_model_id(Some("whisper-medium")),
-            "openai/whisper-medium",
-        );
-        assert_eq!(
-            resolve_whisper_model_id(Some("Whisper-Large-V3")),
-            "openai/whisper-large-v3",
-            "case-insensitive prefix match; output lowercased",
-        );
     }
 
     #[test]

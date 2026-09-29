@@ -434,6 +434,7 @@ fn acestep_render_config(
     cfg: f32,
     seed: u64,
     loop_mode: bool,
+    dit: Option<&str>,
 ) -> (std::path::PathBuf, serde_json::Value) {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -469,6 +470,12 @@ fn acestep_render_config(
             _ => None,
         };
         if let Some(g) = gguf {
+            obj.insert("dit_gguf".to_string(), serde_json::json!(g));
+        }
+    }
+    // Else the denoiser the request's model resolved to.
+    if !obj.contains_key("dit_gguf") {
+        if let Some(g) = dit {
             obj.insert("dit_gguf".to_string(), serde_json::json!(g));
         }
     }
@@ -578,6 +585,9 @@ fn done_event(b64: String, sample_rate: u32, render_ms: u64, energy_j: Option<f6
     done.to_string()
 }
 
+/// The sound model a generation that names none renders with.
+const DEFAULT_SOUND_MODEL: &str = "ezaudio";
+
 /// The event a route ends on when there is no clip to send.
 fn error_event(message: String) -> String {
     serde_json::json!({"status": "error", "error": message}).to_string()
@@ -629,9 +639,31 @@ pub(crate) async fn audio_generations(
     // free-VRAM gate the loaders apply, so "fits" here means "will actually
     // place on GPU there" (a 0-reserve fit test passed on a card where the
     // loader's own gate then pushed the DiT to CPU - a minutes-long render).
+    // What the request names, and what that checkpoint's files declare it to be. A request
+    // naming nothing renders with the default sound model.
+    let hf = _state.huggingface_models_dir.clone();
+    let entry = match crate::api::handlers::catalogue::sound_entry(&body.0) {
+        e if e.is_empty() => DEFAULT_SOUND_MODEL.to_string(),
+        e => e,
+    };
+    let checkpoint = crate::api::handlers::media_checkpoint(&hf, &entry);
+    let kind = checkpoint
+        .as_deref()
+        .and_then(crate::inference::media_facts::read)
+        .map(|f| f.kind);
+    use crate::inference::media_facts::{MediaKind, SoundKind};
+    let is_music = kind == Some(MediaKind::Music);
+    let is_sao = kind == Some(MediaKind::Sound(SoundKind::ConditionedDiffusion));
+    let is_sfx = kind == Some(MediaKind::Sound(SoundKind::LatentDiffusion));
+    let is_midi = kind == Some(MediaKind::Midi);
+    // The denoiser file a music render loads, when the request resolved to one.
+    let music_dit = checkpoint
+        .as_deref()
+        .filter(|_| is_music)
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string());
     {
-        let requested = str_field(&body.0, "model").to_ascii_lowercase();
-        let hot = if requested.contains("stable-audio") || requested.contains("stable_audio") {
+        let hot = if is_sao {
             crate::inference::model::stable_audio::resident_bytes()
         } else {
             let sz = |n: &str| {
@@ -685,11 +717,8 @@ pub(crate) async fn audio_generations(
     let model = b
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or("ezaudio")
+        .unwrap_or(DEFAULT_SOUND_MODEL)
         .to_string();
-    let lower = model.to_lowercase();
-    let is_music = lower.contains("ace") || lower.contains("music");
-    let is_sao = lower.contains("stable-audio") || lower.contains("stable_audio");
     // One media job at a time, this one included: a music render shares the cards with
     // the image and video engines.
     let _media_guard = _state.media_lock_for(&model, "sound").await;
@@ -765,8 +794,8 @@ pub(crate) async fn audio_generations(
 
     let t0 = std::time::Instant::now();
 
-    // MIDI (symbolic, MIDI-LLM) returns a .mid file - distinct response shape (no sample rate).
-    if lower.contains("midi") {
+    // Symbolic music returns a .mid file - distinct response shape (no sample rate).
+    if is_midi {
         // Symbolic rendering is its own feature: without it there is no renderer to
         // call, and answering with audio would be a different format than the one
         // this branch exists to return.
@@ -780,10 +809,14 @@ pub(crate) async fn audio_generations(
             let temperature = b.get("temperature").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             let topp = b.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.98) as f32;
             let prompt_m = prompt.clone();
+            let midi_path = checkpoint
+                .as_deref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
             let res = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
                 crate::inference::media::midi::render_midi(
                     &prompt_m,
-                    "MIDI-LLM_Llama-3.2-1B.Q8_0.gguf",
+                    &midi_path,
                     "cuda",
                     max_tokens,
                     temperature,
@@ -829,11 +862,12 @@ pub(crate) async fn audio_generations(
         );
     }
 
-    let is_sfx = lower.contains("ezaudio") || lower.contains("sfx") || lower.contains("sound");
     if !is_music && !is_sfx && !is_sao {
         return err_resp(
             axum::http::StatusCode::BAD_REQUEST,
-            format!("model '{model}' not supported - use 'ezaudio' (SFX), 'stable-audio' (SFX/loops), 'ace-step' (music), or 'midi'"),
+            format!(
+                "model '{model}' names no checkpoint whose files declare a sound or music model"
+            ),
         );
     }
 
@@ -841,8 +875,16 @@ pub(crate) async fn audio_generations(
     // trajectory has a progress hook; the EzAudio SFX path doesn't (yet).
     if is_music && b.get("stream").and_then(|v| v.as_bool()).unwrap_or(false) {
         use axum::response::sse::Event;
-        let (out_path, cfg_json) =
-            acestep_render_config(&b, &prompt, seconds, steps, cfg, seed, loop_mode);
+        let (out_path, cfg_json) = acestep_render_config(
+            &b,
+            &prompt,
+            seconds,
+            steps,
+            cfg,
+            seed,
+            loop_mode,
+            music_dit.as_deref(),
+        );
         let model_s = model.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, usize, usize)>(64);
         let out_read = out_path.clone();
@@ -1099,8 +1141,16 @@ pub(crate) async fn audio_generations(
         // ACE-Step text->music (48 kHz stereo). render() writes a WAV to cfg.out;
         // build MusicConfig from the request (serde fills the rest via defaults),
         // render to a unique tempfile, read it back, base64 it.
-        let (out_path, cfg_json) =
-            acestep_render_config(&b, &prompt, seconds, steps, cfg, seed, loop_mode);
+        let (out_path, cfg_json) = acestep_render_config(
+            &b,
+            &prompt,
+            seconds,
+            steps,
+            cfg,
+            seed,
+            loop_mode,
+            music_dit.as_deref(),
+        );
         let out_read = out_path.clone();
         let record = _media_guard.reporter();
         let load_record = record.clone();
@@ -2012,15 +2062,21 @@ pub(crate) async fn audio_speech(
     (headers, body).into_response()
 }
 
-/// Ensure the TtsEngine has the requested parler-tts checkpoint loaded.
-/// Unloads + reloads when the request asks for a different one (mini-v1
-/// ↔ large-v1, or a custom HF id) so the next synth call speaks in the
-/// right voice family.
+/// Ensure the TtsEngine holds the speech checkpoint and voice `requested` names, loading
+/// it through the engine its files declare. `None` loads the default checkpoint.
 pub(super) async fn ensure_tts_model_loaded(
     state: &APIServer,
     requested: Option<&str>,
 ) -> Result<(), String> {
     ensure_tts_model_loaded_reporting(state, requested, LoadWatch::default()).await
+}
+
+/// The name the TTS engine holds `requested` under: its checkpoint's catalogue id and its
+/// voice, or the name itself when no speech checkpoint on disk answers to it.
+pub(crate) fn speech_canonical(hf_models_dir: &str, requested: &str) -> String {
+    speech_request(hf_models_dir, requested)
+        .map(|r| r.canonical())
+        .unwrap_or_else(|| canonical_id(hf_models_dir, requested))
 }
 
 /// [`ensure_tts_model_loaded`], with the weights it reads counted into `watch` - and
@@ -2029,58 +2085,47 @@ pub(super) async fn ensure_tts_model_loaded(
 /// The watch is what a STREAMING route forwards to its client. Without one the loaders
 /// publish no reporter, so every tensor count is dropped on the floor, which is why this
 /// route used to answer a cold checkpoint with a minute of silence.
-/// Whether a Parler request for `requested` (an alias, a bare name or the full repo id) is
-/// served by the TTS already loaded as `loaded`. The names go through the engine's own id
-/// resolution, the same the model manager applies, so an alias never reloads the model it names.
-pub(super) fn parler_needs_reload(loaded: Option<&str>, requested: Option<&str>) -> bool {
-    use crate::inference::engine::tts_engine::resolve_tts_model_id;
-    match loaded {
-        None => false,
-        // A Piper, pocket-tts or kyutai voice loaded gives way to a Parler request.
-        Some(cur)
-            if cur.starts_with("piper/")
-                || cur.starts_with("pocket-tts")
-                || cur.starts_with("kyutai") =>
-        {
-            true
-        }
-        Some(cur) => resolve_tts_model_id(requested) != resolve_tts_model_id(Some(cur)),
-    }
-}
-
 pub(super) async fn ensure_tts_model_loaded_reporting(
     state: &APIServer,
     requested: Option<&str>,
     watch: LoadWatch,
 ) -> Result<(), String> {
-    // Kyutai tts-1.6b-en_fr path (multilingual en/fr Delayed-Streams TTS): a precomputed
-    // tts-voices embedding selected by name. Checked before pocket-tts so "kyutai" wins.
-    if let Some(voice) = requested.and_then(kyutai_voice_name) {
-        let canonical = format!("kyutai-{}", voice.as_deref().unwrap_or("default"));
-        let loaded = state.tts_engine.loaded_name().await;
-        if loaded.as_deref() != Some(canonical.as_str()) {
-            if loaded.is_some() {
-                state.tts_engine.unload().await;
-            }
+    use crate::inference::media_facts::SpeechModel;
+    let hf = state.huggingface_models_dir.as_str();
+    let Some(requested) = requested else {
+        if !state.tts_engine.is_loaded().await {
             state
                 .tts_engine
-                .load_kyutai_reporting(voice.clone(), canonical, watch)
+                .load_parler_reporting(None, watch)
                 .await
-                .map_err(|e| format!("kyutai load: {e:#}"))?;
+                .map_err(|e| format!("tts load: {e:#}"))?;
         }
         return Ok(());
+    };
+    let Some(speech) = speech_request(hf, requested) else {
+        return Err(format!(
+            "'{requested}' names no checkpoint whose files declare a speech synthesiser"
+        ));
+    };
+    let canonical = speech.canonical();
+    let loaded = state.tts_engine.loaded_name().await;
+    if loaded.as_deref() == Some(canonical.as_str()) {
+        return Ok(());
     }
-
-    // Kyutai pocket-tts path: resolve the voice WAV under the configured models
-    // dir and load the flow-matching backend.
-    if let Some(voice) = requested.and_then(pocket_tts_voice_name) {
-        let canonical = format!("pocket-tts-{voice}");
-        let loaded = state.tts_engine.loaded_name().await;
-        if loaded.as_deref() != Some(canonical.as_str()) {
-            if loaded.is_some() {
-                state.tts_engine.unload().await;
-            }
-            let voice_wav = pocket_tts_voice_path(&state.huggingface_models_dir, &voice);
+    if loaded.is_some() {
+        state.tts_engine.unload().await;
+    }
+    match speech.model {
+        // A precomputed voice embedding selected by name, or the default one.
+        SpeechModel::Kyutai => state
+            .tts_engine
+            .load_kyutai_reporting(speech.voice.clone(), canonical, watch)
+            .await
+            .map_err(|e| format!("kyutai load: {e:#}")),
+        // A reference voice WAV under the configured models dir.
+        SpeechModel::PocketTts => {
+            let voice = speech.voice.as_deref().unwrap_or("default");
+            let voice_wav = pocket_tts_voice_path(hf, voice);
             if !voice_wav.is_file() {
                 return Err(format!(
                     "pocket-tts reference voice not found: {} (place a 24 kHz mono WAV at \
@@ -2092,48 +2137,26 @@ pub(super) async fn ensure_tts_model_loaded_reporting(
                 .tts_engine
                 .load_pocket_tts_reporting(voice_wav, canonical, watch)
                 .await
-                .map_err(|e| format!("pocket-tts load: {e:#}"))?;
+                .map_err(|e| format!("pocket-tts load: {e:#}"))
         }
-        return Ok(());
-    }
-
-    // Native Piper (VITS) path: resolve the voice + its .onnx under the
-    // configured HF models dir, and load the full-Rust backend.
-    if let Some(voice) = requested.and_then(piper_voice_name) {
-        let canonical = format!("piper/{voice}");
-        let loaded = state.tts_engine.loaded_name().await;
-        if loaded.as_deref() != Some(canonical.as_str()) {
-            if loaded.is_some() {
-                state.tts_engine.unload().await;
-            }
-            let onnx = piper_onnx_path(&state.huggingface_models_dir, &voice);
-            if !onnx.is_file() {
-                return Err(format!(
-                    "piper voice not found: {} (expected under <hf_models_dir>/piper/{voice}/)",
-                    onnx.display()
-                ));
-            }
-            state
-                .tts_engine
-                .load_piper_reporting(onnx, canonical, watch)
-                .await
-                .map_err(|e| format!("piper load: {e:#}"))?;
-        }
-        return Ok(());
-    }
-
-    let loaded = state.tts_engine.loaded_name().await;
-    if parler_needs_reload(loaded.as_deref(), requested) {
-        state.tts_engine.unload().await;
-    }
-    if !state.tts_engine.is_loaded().await {
-        state
+        // A Piper voice is its own checkpoint; nothing follows its name.
+        SpeechModel::Piper if speech.voice.is_some() => Err(format!(
+            "'{requested}': a Piper voice is a checkpoint of its own; name it by its id"
+        )),
+        SpeechModel::Piper => state
             .tts_engine
-            .load_parler_reporting(requested, watch)
+            .load_piper_reporting(speech.path.clone(), canonical, watch)
             .await
-            .map_err(|e| format!("tts load: {e:#}"))?;
+            .map_err(|e| format!("piper load: {e:#}")),
+        SpeechModel::Parler => state
+            .tts_engine
+            .load_parler_reporting(Some(&speech.id), watch)
+            .await
+            .map_err(|e| format!("tts load: {e:#}")),
+        SpeechModel::Unserved => Err(format!(
+            "'{requested}' is a speech model this build runs no engine for"
+        )),
     }
-    Ok(())
 }
 
 /// Split text into rough sentence chunks (period/!/?). Falls back to a

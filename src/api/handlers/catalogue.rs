@@ -7,15 +7,17 @@
 use crate::distributed::membership::NodeState;
 use crate::distributed::routing::can_serve;
 
+use super::{entry_named, heads};
+
 fn catalogue_has(node: &NodeState, matches: impl Fn(&str) -> bool) -> bool {
     node.serves
         .as_ref()
         .is_some_and(|catalogue| catalogue.iter().any(|entry| matches(entry)))
 }
 
-/// The catalogue entry a sound or music request asks for. ACE-Step is one name in the
-/// request and one entry per DiT checkpoint in the catalogue, so the variant joins the
-/// name; an empty answer means the request named nothing and takes any sound model.
+/// The catalogue entry a sound or music request asks for: the model it names, or, when it
+/// names a denoiser variant beside it, the entry of that variant's checkpoint. An empty
+/// answer means the request named nothing and takes any sound model.
 pub(crate) fn sound_entry(body: &serde_json::Value) -> String {
     let field = |key: &str| {
         body.get(key)
@@ -24,15 +26,8 @@ pub(crate) fn sound_entry(body: &serde_json::Value) -> String {
             .trim()
             .to_ascii_lowercase()
     };
-    let requested = field("model");
-    let is_music = requested == "ace-step"
-        || requested == "acestep"
-        || requested == "music"
-        || requested.starts_with("ace-step:");
-    if !is_music {
-        return requested;
-    }
     let variant = match field("dit_model").as_str() {
+        "" => return field("model"),
         "sft" => "sft",
         "base" => "base",
         "xl-turbo" => "xl-turbo",
@@ -40,8 +35,12 @@ pub(crate) fn sound_entry(body: &serde_json::Value) -> String {
         "xl-base" => "xl-base",
         _ => "turbo",
     };
-    format!("ace-step-{variant}")
+    format!("{MUSIC_ENTRY_PREFIX}{variant}")
 }
+
+/// What the catalogue calls the checkpoint of each music denoiser variant, before the
+/// variant's name.
+pub(crate) const MUSIC_ENTRY_PREFIX: &str = "ace-step-";
 
 /// Whether a node holds the sound model a request asks for: the named entry, or any
 /// sound model when the request named none.
@@ -49,54 +48,32 @@ pub(crate) fn serves_sound(node: &NodeState, entry: &str) -> bool {
     if entry.is_empty() {
         can_serve(node, "stable-audio") || can_serve(node, "ezaudio")
     } else {
-        can_serve(node, entry)
+        can_serve(node, entry) || catalogue_has(node, |e| entry_named(e, entry))
     }
 }
 
-/// Whether a catalogue entry is the speech model a request names. A request names a
-/// backend or a voice; the catalogue lists the repository that backend loads.
+/// Whether a catalogue entry is the speech checkpoint a request names: the request, or its
+/// part before a voice, names the entry.
 pub(crate) fn speech_entry_matches(entry: &str, requested: &str) -> bool {
-    let entry = entry.to_ascii_lowercase();
-    let requested = requested.trim().to_ascii_lowercase();
-    if requested.is_empty() {
-        return false;
-    }
-    if requested.starts_with("piper/") {
-        return entry == requested;
-    }
-    if requested.starts_with("pocket") {
-        return entry.contains("pocket-tts");
-    }
-    if requested.starts_with("kyutai") {
-        return entry.starts_with("kyutai/tts");
-    }
-    if requested.contains("parler") {
-        return entry.contains("parler-tts");
-    }
-    if requested.contains("xtts") {
-        return entry.contains("xtts");
-    }
-    if requested.contains("openvoice") {
-        return entry.contains("openvoice");
-    }
-    entry == requested
+    heads(requested)
+        .into_iter()
+        .any(|(head, _)| entry_named(entry, head))
 }
 
 pub(crate) fn serves_speech(node: &NodeState, requested: &str) -> bool {
     catalogue_has(node, |entry| speech_entry_matches(entry, requested))
 }
 
-/// Whether a catalogue entry is the transcription model a request names. `whisper-1` is
-/// the OpenAI alias of the small model; a bare size names the repository ending in it.
+/// Whether a catalogue entry is the transcription checkpoint a request names; a request
+/// naming none asks for the default one.
 pub(crate) fn transcription_entry_matches(entry: &str, requested: &str) -> bool {
-    let requested = match requested.trim().to_ascii_lowercase().as_str() {
-        "" | "whisper-1" => "whisper-small".to_string(),
-        other => other.to_string(),
+    let requested = requested.trim();
+    let requested = if requested.is_empty() {
+        crate::inference::engine::audio_engine::resolve_whisper_model_id(None)
+    } else {
+        requested.to_string()
     };
-    let entry = entry.to_ascii_lowercase();
-    entry == requested
-        || entry.ends_with(&format!("/{requested}"))
-        || entry.ends_with(&format!("/faster-{requested}"))
+    entry_named(entry, &requested)
 }
 
 pub(crate) fn serves_transcription(node: &NodeState, requested: &str) -> bool {
@@ -182,7 +159,11 @@ mod tests {
             sound_entry(&json!({"model": "acestep", "dit_model": "xl"})),
             "ace-step-xl-sft"
         );
-        assert_eq!(sound_entry(&json!({"model": "music"})), "ace-step-turbo");
+        assert_eq!(sound_entry(&json!({"model": "music"})), "music");
+        assert_eq!(
+            sound_entry(&json!({"model": "music", "dit_model": "turbo"})),
+            "ace-step-turbo"
+        );
         assert_eq!(
             sound_entry(&json!({"model": "stable-audio"})),
             "stable-audio"
@@ -199,8 +180,12 @@ mod tests {
             "parler-tts/parler-tts-mini-v1",
             "parler-tts-mini-v1"
         ));
-        assert!(speech_entry_matches("coqui/XTTS-v2", "xtts"));
-        assert!(speech_entry_matches("myshell-ai/OpenVoiceV2", "openvoice"));
+        assert!(speech_entry_matches("coqui/XTTS-v2", "xtts-v2"));
+        assert!(speech_entry_matches(
+            "myshell-ai/OpenVoiceV2",
+            "openvoicev2"
+        ));
+        assert!(!speech_entry_matches("coqui/XTTS-v2", "xtts"));
         assert!(speech_entry_matches(
             "piper/de_DE-thorsten-medium",
             "piper/de_DE-thorsten-medium"
@@ -214,7 +199,8 @@ mod tests {
             "openai/whisper-small",
             "whisper-1"
         ));
-        assert!(transcription_entry_matches(
+        assert!(transcription_entry_matches("openai/whisper-small", ""));
+        assert!(!transcription_entry_matches(
             "Systran/faster-whisper-small",
             ""
         ));
@@ -247,5 +233,7 @@ mod tests {
         assert!(serves_transcription(&node, "whisper-1"));
         assert!(serves_sound(&node, ""));
         assert!(!serves_sound(&node, "ace-step-turbo"));
+        node.serves = Some(vec!["ace-step-turbo".into()]);
+        assert!(serves_sound(&node, "music"));
     }
 }

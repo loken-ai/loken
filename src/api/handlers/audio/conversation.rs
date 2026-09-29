@@ -926,9 +926,9 @@ pub(crate) async fn voice_handler(
     // Selection priority:
     //   1. a registered speech post-processor that recognises this request - it names the
     //      base voice to synthesize with, and transforms the result afterwards;
-    //   2. explicit `voice` - a full backend id ("piper/fr_FR-tom-medium",
-    //      "pocket-tts-alba", "parler-...") passed straight through; a bare name
-    //      -> pocket-tts;
+    //   2. explicit `voice` - a speech checkpoint, with its voice after it
+    //      ("piper/fr_FR-tom-medium", "pocket-tts-alba"), passed straight through; any
+    //      other name -> a reference voice of the voice-cloning synthesiser;
     //   3. else a default voice for the ASR-DETECTED language - multilingual
     //      output via per-language piper voices, English -> pocket-tts.
     let voice = s("voice");
@@ -957,17 +957,11 @@ pub(crate) async fn voice_handler(
         }
         voice_used = post.as_ref().map(|p| p.label()).unwrap_or(base);
     } else {
+        // A voice that names a speech checkpoint is passed through; any other is a
+        // reference voice of the default voice-cloning synthesiser.
         let tts_model = match voice.as_deref() {
-            Some(v)
-                if v.contains('/')
-                    || v.contains("pocket")
-                    || v.contains("piper")
-                    || v.contains("parler")
-                    || v.contains("kyutai") =>
-            {
-                v.to_string()
-            }
-            Some(v) => format!("pocket-tts-{v}"),
+            Some(v) if is_served_speech(&state.huggingface_models_dir, v) => v.to_string(),
+            Some(v) => format!("{CLONING_VOICES}-{v}"),
             None => default_voice_for_language(&detected_lang),
         };
         voice_used = tts_model.clone();

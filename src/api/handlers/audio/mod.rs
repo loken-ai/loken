@@ -25,7 +25,7 @@ enum ConvRoute {
 mod conversation;
 pub(crate) use conversation::*;
 mod voice;
-pub(crate) use voice::*;
+use voice::*;
 mod whisper;
 pub(crate) use whisper::*;
 mod wav;

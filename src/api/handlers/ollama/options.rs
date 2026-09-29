@@ -249,7 +249,7 @@ pub(crate) async fn ollama_chat(
     // Returns audio embedded in the response (audios[0] WAV base64) so
     // the chat tab can render an inline playback control. No streaming
     // - TTS engines synth the full utterance up front.
-    if crate::api::handlers::family::is_tts(&model_name) {
+    if crate::api::handlers::family::is_tts(&state.huggingface_models_dir, &model_name) {
         let last_user_msg = request
             .messages
             .iter()
@@ -275,7 +275,7 @@ pub(crate) async fn ollama_chat(
     // images[] for the Ollama chat shape) and return its transcript
     // as the assistant message content.
     #[cfg(feature = "audio")]
-    if crate::api::handlers::family::is_asr(&model_name) {
+    if crate::api::handlers::family::is_asr(&state.huggingface_models_dir, &model_name) {
         let last_user_msg = request
             .messages
             .iter()
@@ -941,7 +941,7 @@ pub(crate) async fn ollama_generate(
     // TTS routing - same shape as image-gen, returns audio in the
     // response payload. /api/generate's `prompt` field maps directly
     // to the TTS input text.
-    if crate::api::handlers::family::is_tts(&model_name) {
+    if crate::api::handlers::family::is_tts(&state.huggingface_models_dir, &model_name) {
         #[cfg(feature = "audio")]
         return handle_generate_tts(&state, &model_name, &request.prompt).await;
     }

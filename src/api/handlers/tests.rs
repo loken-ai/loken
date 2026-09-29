@@ -279,7 +279,12 @@ fn a_pipeline_component_is_refused_for_what_its_files_declare() {
         "config.json",
         serde_json::json!({"model_type": "parler_tts"}),
     );
-    for id in ["Owner--asr", "Owner--speech"] {
+    repo(
+        "Owner/cloner",
+        "config.json",
+        serde_json::json!({"model": "xtts"}),
+    );
+    for id in ["Owner--asr", "Owner--speech", "Owner--cloner"] {
         let weights =
             s.0.join(format!("hub/models--{id}/snapshots/r/model.safetensors"));
         std::fs::write(weights, b"").unwrap();
@@ -291,6 +296,8 @@ fn a_pipeline_component_is_refused_for_what_its_files_declare() {
     }
     let hint = non_chat_pipeline_component(hf, "tokenizers").unwrap_or_default();
     assert!(hint.contains("no weights"), "got: {hint}");
+    let hint = non_chat_pipeline_component(hf, "cloner").unwrap_or_default();
+    assert!(hint.contains("no engine"), "got: {hint}");
     // Transcription and speech reach their own handlers from the chat routes.
     assert!(non_chat_pipeline_component(hf, "Owner/asr").is_none());
     assert!(non_chat_pipeline_component(hf, "speech").is_none());

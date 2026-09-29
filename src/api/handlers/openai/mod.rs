@@ -282,7 +282,7 @@ pub(crate) async fn chat_completion(
     // chat-completion responses don't have a documented audios field  -
     // direct callers to the right endpoint instead of fabricating one
     // and risking silent SDK breakage.
-    if crate::api::handlers::family::is_tts(&model_name) {
+    if crate::api::handlers::family::is_tts(&state.huggingface_models_dir, &model_name) {
         return Err(ApiError::Validation(format!(
             "model '{model_name}' is a TTS pipeline. \
              POST text to /v1/audio/speech (OpenAI shape) for synthesis, \
@@ -295,7 +295,7 @@ pub(crate) async fn chat_completion(
     // accept audio here. Direct callers to /v1/audio/transcriptions
     // (the canonical OpenAI endpoint). /api/chat handles whisper
     // via its images[] field.
-    if crate::api::handlers::family::is_asr(&model_name) {
+    if crate::api::handlers::family::is_asr(&state.huggingface_models_dir, &model_name) {
         return Err(ApiError::Validation(format!(
             "model '{model_name}' is a speech-to-text pipeline. \
              POST audio bytes to /v1/audio/transcriptions (OpenAI shape), \
@@ -1087,14 +1087,14 @@ pub(crate) async fn text_completions(
     // TTS: same routing rationale as chat_completion - /v1/completions
     // doesn't carry an audio payload field, so direct callers to the
     // canonical /v1/audio/speech endpoint instead.
-    if crate::api::handlers::family::is_tts(&model_name) {
+    if crate::api::handlers::family::is_tts(&state.huggingface_models_dir, &model_name) {
         return Err(ApiError::Validation(format!(
             "model '{model_name}' is a TTS pipeline. \
              POST text to /v1/audio/speech for synthesis."
         )));
     }
     // ASR: /v1/completions has no audio-input field either.
-    if crate::api::handlers::family::is_asr(&model_name) {
+    if crate::api::handlers::family::is_asr(&state.huggingface_models_dir, &model_name) {
         return Err(ApiError::Validation(format!(
             "model '{model_name}' is a speech-to-text pipeline. \
              POST audio bytes to /v1/audio/transcriptions instead."

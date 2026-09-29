@@ -799,10 +799,13 @@ pub fn render_with_progress(
         }
         let t1 = std::time::Instant::now();
         let uncond_ref = uncond_enc.as_ref().map(|(e, s)| (e.as_slice(), *s));
-        // shift: 0 ⟹ auto (turbo 3.0, base/sft 1.0 - the reference per-checkpoint values).
+        // shift: 0 ⟹ auto (a distilled checkpoint 3.0, base/sft 1.0 - the reference
+        // per-checkpoint values). The checkpoint declares its distillation.
+        let distilled = crate::inference::media_facts::read(std::path::Path::new(&dit_g))
+            .is_some_and(|f| f.distilled);
         let shift = if cfg.dit_shift > 0.0 {
             cfg.dit_shift
-        } else if cfg.dit_gguf.contains("turbo") {
+        } else if distilled {
             3.0
         } else {
             1.0
