@@ -93,6 +93,39 @@ pub struct Pool {
 /// too eagerly and regressed the small path.
 const SPIN_ITERS: u32 = 1 << 9;
 
+/// Spin iterations before a worker parks while the host is doing a share of every token's
+/// work between calls into the pool. A parked worker costs a condition-variable wake, tens of
+/// microseconds each and a stagger across the pool, on every host expert layer; spinning
+/// through the card work in between costs cores that are otherwise idle.
+const HOT_SPIN_ITERS: u32 = 1 << 17;
+
+/// How many holders currently ask the workers to stay hot.
+static HOT_HOLDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Asks the decode pool's workers to spin for longer before parking, as long as the returned
+/// guard lives. Nested holds stack.
+pub fn hold_workers_hot() -> HotGuard {
+    HOT_HOLDS.fetch_add(1, Ordering::Relaxed);
+    HotGuard(())
+}
+
+/// See [`hold_workers_hot`].
+pub struct HotGuard(());
+
+impl Drop for HotGuard {
+    fn drop(&mut self) {
+        HOT_HOLDS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn spin_budget() -> u32 {
+    if HOT_HOLDS.load(Ordering::Relaxed) > 0 {
+        HOT_SPIN_ITERS
+    } else {
+        SPIN_ITERS
+    }
+}
+
 thread_local! {
     static IS_POOL_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -110,7 +143,7 @@ fn worker_loop(shared: Arc<Shared>) {
                 break;
             }
             spins += 1;
-            if spins < SPIN_ITERS {
+            if spins < spin_budget() {
                 std::hint::spin_loop();
             } else {
                 let guard = shared.park_mx.lock().unwrap_or_else(|e| e.into_inner());

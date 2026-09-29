@@ -447,6 +447,9 @@ pub struct GenericHeteroTransformer {
     kv_snapshot_tick: u64,
     /// A vision tower whose embeddings are spliced over a placeholder run.
     spliced_vision: Option<splice::SplicedVision>,
+    /// Held while some layer keeps its routed experts in host memory: the decode pool's
+    /// workers then spin through the card work between host layers instead of parking.
+    host_experts_hot: Option<crate::tensor::quant_cpu::gemv_pool::HotGuard>,
 }
 
 /// A resident sequence copied aside: its tokens and every layer's KV, taken after a

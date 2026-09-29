@@ -2844,7 +2844,7 @@ impl GenericHeteroTransformer {
             _ => None,
         };
 
-        let model = Self {
+        let mut model = Self {
             adapters: Vec::new(),
             config,
             embeddings,
@@ -2877,6 +2877,7 @@ impl GenericHeteroTransformer {
             kv_snapshots: Vec::new(),
             kv_snapshot_tick: 0,
             spliced_vision,
+            host_experts_hot: None,
         };
 
         // A SiLU MoE layer on the host runs its experts through a repacked layout derived
@@ -2904,6 +2905,11 @@ impl GenericHeteroTransformer {
                 }
             }
         }
+        model.host_experts_hot = model
+            .layers
+            .iter()
+            .any(|l| l.moe.as_ref().is_some_and(|m| m.experts_on_host()))
+            .then(crate::tensor::quant_cpu::gemv_pool::hold_workers_hot);
         let host_prefill_stacks: Vec<_> = model
             .layers
             .iter()
@@ -3206,6 +3212,7 @@ impl GenericHeteroTransformer {
             kv_snapshots: Vec::new(),
             kv_snapshot_tick: 0,
             spliced_vision: None,
+            host_experts_hot: None,
         })
     }
 }
