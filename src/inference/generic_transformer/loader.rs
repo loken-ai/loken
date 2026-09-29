@@ -2966,6 +2966,10 @@ impl GenericHeteroTransformer {
         if let Some(m) = max_kv_seq_len {
             config.max_q8_seq_len = m;
         }
+        // The checkpoint's Q and K rows are in their original order, which pairs each rotary
+        // lane with the one half a head away. Adjacent pairing belongs to GGUF files, whose
+        // converter reorders the rows of the architectures that use it.
+        config.flags.use_rope_i = false;
         let config = Arc::new(config);
         let group_size = cfgj.group_size;
 
