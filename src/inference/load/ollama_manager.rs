@@ -370,7 +370,7 @@ impl OllamaManager {
 
             info!("   ⬇ Downloading blob {} ({} bytes)...", i + 1, blob.size);
 
-            let blob_resp = client
+            let mut blob_resp = client
                 .get(&blob_url)
                 .send()
                 .await
@@ -384,19 +384,50 @@ impl OllamaManager {
                 ));
             }
 
-            // Download entire blob
-            let bytes = blob_resp
-                .bytes()
+            // Streamed to a partial file as it arrives, hashed on the way, and renamed into
+            // the store only once the digest matches: a blob is never held whole in memory,
+            // and an interrupted or corrupted download never lands under its final name.
+            let partial_path = blobs_dir.join(format!("{blob_filename}.partial"));
+            let mut file = std::fs::File::create(&partial_path)
+                .map_err(|e| anyhow!("Failed to create {}: {e}", partial_path.display()))?;
+            let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+            let base = downloaded_size;
+            let mut received: u64 = 0;
+            // One report per thousandth of the whole pull keeps a progress bar live without a
+            // frame per network chunk.
+            let report_step = (total_size / 1000).max(1);
+            let mut reported = base;
+            while let Some(chunk) = blob_resp
+                .chunk()
                 .await
-                .map_err(|e| anyhow!("Failed to read blob: {}", e))?;
-
-            // Write to file
-            std::fs::write(&blob_path, bytes.as_ref())
-                .map_err(|e| anyhow!("Failed to write blob file: {}", e))?;
+                .map_err(|e| anyhow!("Failed to read blob {}: {e}", blob.digest))?
+            {
+                std::io::Write::write_all(&mut file, &chunk)
+                    .map_err(|e| anyhow!("Failed to write {}: {e}", partial_path.display()))?;
+                sha2::Digest::update(&mut hasher, &chunk);
+                received += chunk.len() as u64;
+                if base + received - reported >= report_step {
+                    reported = base + received;
+                    if let Some(ref cb) = progress {
+                        cb(reported, total_size);
+                    }
+                }
+            }
+            std::io::Write::flush(&mut file)
+                .map_err(|e| anyhow!("Failed to flush {}: {e}", partial_path.display()))?;
+            drop(file);
+            let digest = format!("sha256:{}", hex::encode(sha2::Digest::finalize(hasher)));
+            if digest != blob.digest {
+                let _ = std::fs::remove_file(&partial_path);
+                return Err(anyhow!(
+                    "Blob {} arrived with digest {digest}; discarded",
+                    blob.digest
+                ));
+            }
+            std::fs::rename(&partial_path, &blob_path)
+                .map_err(|e| anyhow!("Failed to store {}: {e}", blob_path.display()))?;
 
             downloaded_size += blob.size as u64;
-
-            // Report progress
             if let Some(ref cb) = progress {
                 cb(downloaded_size, total_size);
             }
