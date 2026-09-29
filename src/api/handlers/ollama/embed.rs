@@ -133,14 +133,17 @@ pub(crate) async fn ollama_ps(
         // The weights the engine resolves say what they are: a file opening with the GGUF
         // magic is gguf, anything else it serves (a checkpoint directory) is safetensors.
         // A model whose weights no longer resolve is reported as gguf, the engine's format.
-        let format_str = match entry.engine.resolve_model_file(&entry.model_id) {
-            Some(p) if !crate::tensor::quantized::gguf_file::has_gguf_magic(&p) => "safetensors",
+        let weights = entry.engine.resolve_model_file(&entry.model_id);
+        let format_str = match &weights {
+            Some(p) if !crate::tensor::quantized::gguf_file::has_gguf_magic(p) => "safetensors",
             _ => "gguf",
         };
         let parameter_size = estimate_parameter_size(model_size, format_str);
         let details = OllamaModelDetails {
             format: format_str.to_string(),
-            family: infer_model_family(&entry.model_id).to_string(),
+            family: reported_family(&entry.model_id, None, || {
+                weights.as_deref().and_then(file_architecture)
+            }),
             families: None,
             parameter_size,
             quantization_level: None,
@@ -198,7 +201,7 @@ pub(crate) async fn ollama_ps(
             digest: placeholder_digest.clone(),
             details: OllamaModelDetails {
                 format: "safetensors".to_string(),
-                family: infer_model_family(&img_info.model_type).to_string(),
+                family: reported_family(&img_info.model_type, None, || None),
                 families: None,
                 parameter_size,
                 quantization_level: None,
@@ -221,7 +224,7 @@ pub(crate) async fn ollama_ps(
             digest: placeholder_digest.clone(),
             details: OllamaModelDetails {
                 format: "safetensors".to_string(),
-                family: infer_model_family(&asr_info.name).to_string(),
+                family: reported_family(&asr_info.name, None, || None),
                 families: None,
                 parameter_size: "unknown".to_string(),
                 quantization_level: None,
@@ -243,7 +246,7 @@ pub(crate) async fn ollama_ps(
             digest: placeholder_digest,
             details: OllamaModelDetails {
                 format: "safetensors".to_string(),
-                family: infer_model_family(&tts_name).to_string(),
+                family: reported_family(&tts_name, None, || None),
                 families: None,
                 parameter_size: "unknown".to_string(),
                 quantization_level: None,

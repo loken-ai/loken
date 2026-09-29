@@ -82,17 +82,22 @@ pub(crate) async fn ollama_list_models(
                     };
                     // What the checkpoint says about itself, read from its header, then
                     // the name and the byte size where it says nothing.
-                    let (arch, quant, declared, pools) = match source {
-                        ModelSource::Ollama => state
-                            .manifest_layer_path(&m.id, "model")
-                            .map(|w| header_facts(&w))
-                            .unwrap_or((None, None, None, false)),
-                        _ => (None, None, None, false),
+                    // A media checkpoint outside the Ollama store declares no text facts.
+                    let weights = match source {
+                        ModelSource::Ollama => state.manifest_layer_path(&m.id, "model"),
+                        _ if media_family(&m.id).is_some() => None,
+                        _ => crate::inference::load::huggingface_manager::HuggingFaceManager::new(
+                            std::path::PathBuf::from(&state.huggingface_models_dir),
+                        )
+                        .get_model_path(&m.id),
+                    };
+                    let (arch, quant, declared, pools) = match &weights {
+                        Some(w) if w.is_dir() => checkpoint_facts(w),
+                        Some(w) => header_facts(w),
+                        None => (None, None, None, false),
                     };
                     let capabilities = file_capabilities(&m.id, arch.as_ref().map(|_| pools));
-                    let family = arch
-                        .clone()
-                        .unwrap_or_else(|| infer_model_family(&m.id).to_string());
+                    let family = reported_family(&m.id, arch, || None);
                     let details = OllamaModelDetails {
                         format: format_str.to_string(),
                         families: Some(vec![family.clone()]),
@@ -261,7 +266,7 @@ pub(crate) fn inject_local_boogu(
             continue; // no local weights: leave whatever the managers discovered untouched
         }
         if let Some(fam) = lm.dedup_family {
-            models.retain(|m| infer_model_family(&m.id) != fam);
+            models.retain(|m| media_family(&m.id) != Some(fam));
         }
         let size = std::fs::metadata(&weights).map(|m| m.len()).unwrap_or(0);
         models.push(crate::inference::load::model_manager::ModelMetadata {
@@ -356,17 +361,13 @@ pub(crate) fn inject_local_boogu(
     }
 }
 
-/// Best-effort family inference from the model id. Maps the common
-/// Ollama families so SDK clients see a non-misleading badge in their
-/// catalog UI (`details.family`). Defaults to "llama" - Ollama's own
-/// fallback for unrecognized GGUF arch strings.
 /// What a model can DO, derived from its family + name - the SERVER-side
 /// single source of truth the /api/tags listing exposes so clients never
 /// hardcode model lists. Only capabilities with a WORKING wired path are
 /// advertised (e.g. boogu has no img2img yet, so it is txt2img-only).
 pub(crate) fn model_capabilities(model_id: &str) -> Vec<String> {
     let lower = model_id.to_lowercase();
-    let fam = infer_model_family(model_id);
+    let fam = media_family(model_id).unwrap_or_default();
     let caps: &[&str] = match fam {
         "flux" => {
             if lower.contains("kontext") {
@@ -403,7 +404,6 @@ pub(crate) fn model_capabilities(model_id: &str) -> Vec<String> {
         "flux2" | "boogu" | "stable-diffusion" => &["txt2img"],
         "whisper" => &["asr"],
         "tts" => &["tts"],
-        "bert" => &["embedding"],
         _ => {
             if lower.contains("stable-audio") {
                 &["sfx", "loops", "audio-variations"]
@@ -687,23 +687,16 @@ pub(crate) fn media_model_defaults(model_id: &str) -> Option<serde_json::Value> 
     None
 }
 
-pub(crate) fn infer_model_family(model_id: &str) -> &'static str {
+/// The media family a model id names (image, video, speech), for the engines whose
+/// checkpoints carry no architecture key. `None` for a text model, whose family is the
+/// architecture its own files declare (`file_architecture`).
+pub(crate) fn media_family(model_id: &str) -> Option<&'static str> {
     let lower = model_id.to_lowercase();
-    // Order matters - match the more specific names first
-    // (gemma4-style names contain "gemma" but should resolve to "gemma").
-    // Video first: the family decides what a picker offers, and "wan" was falling all the
-    // way through to the text default - so the server described its video model as an LLM
-    // and no client could tell it apart from one. A fine-tune dropped in `<models>/wan/`
-    // is advertised under its own tag, which starts with "wan" by the same convention the
-    // Ray families use, so it lands here too.
-    if lower.starts_with("wan") {
+    // A fine-tune dropped in `<models>/wan/` is advertised under its own tag, which starts
+    // with "wan" by the same convention the Ray families use.
+    let fam = if lower.starts_with("wan") {
         "video"
-    } else if lower.contains("gemma") {
-        "gemma"
     }
-    // Qwen-Image is a diffusion T2I model, NOT the Qwen text LLM - must match
-    // before the generic "qwen" arm so it resolves to the image family (and so
-    // /api/show + /api/tags don't advertise chat/embedding on it).
     // BEFORE any `flux` test: "flux2-klein" contains "flux".
     else if is_flux2_model(&lower) {
         "flux2"
@@ -712,39 +705,7 @@ pub(crate) fn infer_model_family(model_id: &str) -> &'static str {
         || lower.contains("rayqwest")
     {
         "qwen-image"
-    } else if lower.contains("qwen") {
-        "qwen"
-    } else if lower.contains("mistral") || lower.contains("mixtral") {
-        "mistral"
-    } else if lower.contains("deepseek") {
-        "deepseek"
-    } else if lower.contains("phi") {
-        "phi"
-    } else if lower.contains("starcoder") || lower.contains("starchat") {
-        "starcoder"
-    } else if lower.contains("falcon") {
-        "falcon"
-    } else if lower.contains("codellama") {
-        "codellama"
-    } else if lower.contains("codestral") {
-        "codestral"
-    } else if lower.contains("devstral") {
-        "devstral"
-    } else if lower.contains("granite") {
-        "granite"
-    } else if lower.contains("moondream") {
-        "moondream"
-    } else if lower.contains("nomic") || lower.contains("bge") || lower.contains("embed") {
-        "bert"
-    } else if lower.contains("glm") {
-        "chatglm"
-    }
-    // Non-LLM image-gen families. MUST come before the generic
-    // "stable" -> "stablelm" arm so that "stable-diffusion" /
-    // "stable-cascade" don't get mislabelled as StableLM. The
-    // /api/show family is what SDK clients read to decide which
-    // schema-aware UI to show.
-    else if lower.contains("stable-diffusion") || lower.contains("stable-cascade") {
+    } else if lower.contains("stable-diffusion") || lower.contains("stable-cascade") {
         "stable-diffusion"
     } else if lower.contains("sdxl")
         || lower.contains("raymnants")
@@ -762,14 +723,49 @@ pub(crate) fn infer_model_family(model_id: &str) -> &'static str {
         "whisper"
     } else if lower.contains("parler") || lower.contains("/tts-") || lower.starts_with("tts") {
         "tts"
-    }
-    // StableLM text LLM family - must come after stable-diffusion above
-    // so the broader "stable" substring doesn't swallow the SD variants.
-    else if lower.contains("stable") {
-        "stablelm"
     } else {
-        "llama"
+        return None;
+    };
+    Some(fam)
+}
+
+/// The architecture a text model's files declare: `general.architecture` of a GGUF file,
+/// `model_type` of a checkpoint directory's `config.json`.
+pub(crate) fn file_architecture(path: &std::path::Path) -> Option<String> {
+    if path.is_dir() {
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path.join("config.json")).ok()?).ok()?;
+        return config
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
     }
+    header_facts(path).0
+}
+
+/// What a checkpoint directory declares: the `model_type` of its `config.json`, and whether
+/// it pools, which a sentence-transformers `modules.json` says.
+fn checkpoint_facts(dir: &std::path::Path) -> Facts {
+    (
+        file_architecture(dir),
+        None,
+        None,
+        dir.join("modules.json").exists(),
+    )
+}
+
+/// The family `/api/tags`, `/api/show` and `/api/ps` report: the architecture a GGUF
+/// header declares, else the media family the id names, else the architecture `files`
+/// reads from the model's other files, else empty.
+pub(crate) fn reported_family(
+    model_id: &str,
+    header: Option<String>,
+    files: impl FnOnce() -> Option<String>,
+) -> String {
+    header
+        .or_else(|| media_family(model_id).map(str::to_string))
+        .or_else(files)
+        .unwrap_or_default()
 }
 
 /// Estimate parameter count from on-disk model size and format.
@@ -1225,9 +1221,9 @@ pub(crate) async fn ollama_show_model(
                 template,
                 details: Some(OllamaModelDetails {
                     format: field("model_format").unwrap_or_else(|| format_str.to_string()),
-                    family: field("model_family")
-                        .or(arch)
-                        .unwrap_or_else(|| infer_model_family(&model_name).to_string()),
+                    family: field("model_family").unwrap_or_else(|| {
+                        reported_family(&model_name, arch, || file_architecture(&weights))
+                    }),
                     families,
                     parameter_size: field("model_type")
                         .or_else(|| declared_params.map(format_parameter_count))

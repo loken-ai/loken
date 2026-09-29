@@ -1,7 +1,7 @@
 /// EVERY image family must advertise `txt2img`.
 ///
 /// `model_capabilities` matches on the family name, and a family added to
-/// `infer_model_family` but not here falls through to the CHAT default - which is
+/// `media_family` but not here falls through to the CHAT default - which is
 /// how SDXL came to describe itself to clients as a chat model, so it never
 /// appeared in any image picker. The failure is silent on the server: the model
 /// loads and renders perfectly when asked directly; it simply cannot be found.
@@ -24,8 +24,8 @@ fn every_image_family_advertises_that_it_generates_images() {
         let caps = super::models::model_capabilities(id);
         assert!(
             caps.iter().any(|c| c == "txt2img"),
-            "{id} (family {}) does not advertise txt2img; it advertises {caps:?}",
-            infer_model_family(id)
+            "{id} (family {:?}) does not advertise txt2img; it advertises {caps:?}",
+            media_family(id)
         );
         assert!(
             !caps.iter().any(|c| c == "completion"),
@@ -149,68 +149,76 @@ fn estimate_parameter_size_known_sizes() {
 }
 
 #[test]
-fn infer_model_family_known_models() {
+fn media_family_known_models() {
     // The video family, which used to fall through to the text default so a client
     // could not tell a video model from an LLM.
-    assert_eq!(infer_model_family("wan"), "video");
-    assert_eq!(infer_model_family("wan-14b"), "video");
+    assert_eq!(media_family("wan"), Some("video"));
+    assert_eq!(media_family("wan-14b"), Some("video"));
     assert_eq!(
-        infer_model_family("wan-photoreal"),
-        "video",
+        media_family("wan-photoreal"),
+        Some("video"),
         "a fine-tune's own tag"
     );
     // And it must not swallow an unrelated name that merely contains the letters.
-    assert_ne!(infer_model_family("swan-lake-7b"), "video");
-    assert_eq!(infer_model_family("gemma4:26b"), "gemma");
-    assert_eq!(infer_model_family("qwen3-coder:latest"), "qwen");
-    assert_eq!(infer_model_family("mistral-7b"), "mistral");
-    assert_eq!(infer_model_family("mixtral-8x7b"), "mistral");
-    assert_eq!(infer_model_family("deepseek-r1"), "deepseek");
-    assert_eq!(infer_model_family("phi3:mini"), "phi");
-    assert_eq!(infer_model_family("moondream"), "moondream");
-    assert_eq!(infer_model_family("nomic-embed-text"), "bert");
-    // Fallback for unknown.
-    assert_eq!(infer_model_family("custom-model-xyz"), "llama");
+    assert_ne!(media_family("swan-lake-7b"), Some("video"));
+}
+
+/// A text model's family is what its files declare; its name decides nothing.
+#[test]
+fn a_text_model_has_no_family_by_name() {
+    for id in [
+        "gemma4:26b",
+        "qwen3-coder:latest",
+        "mixtral-8x7b",
+        "stablelm-3b",
+        "x",
+    ] {
+        assert_eq!(media_family(id), None, "{id}");
+        assert_eq!(reported_family(id, None, || None), "", "{id}");
+    }
+    assert_eq!(
+        reported_family("anything", Some("gemma4".into()), || None),
+        "gemma4"
+    );
+    assert_eq!(
+        reported_family("anything", None, || Some("qwen3".into())),
+        "qwen3"
+    );
+    let dir = std::env::temp_dir().join(format!("loken-family-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), r#"{"model_type": "olmo2"}"#).unwrap();
+    assert_eq!(file_architecture(&dir).as_deref(), Some("olmo2"));
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn infer_model_family_non_llm_modalities() {
+fn media_family_non_llm_modalities() {
     // Image-gen families. Without these, /api/show used to return
     // family="llama" for flux/z-image checkpoints, misleading SDK
     // model-card UIs that switch behaviour on the family name.
-    assert_eq!(infer_model_family("flux-schnell"), "flux");
-    assert_eq!(infer_model_family("flux-dev:fp16"), "flux");
+    assert_eq!(media_family("flux-schnell"), Some("flux"));
+    assert_eq!(media_family("flux-dev:fp16"), Some("flux"));
     assert_eq!(
-        infer_model_family("black-forest-labs/FLUX.1-schnell"),
-        "flux"
+        media_family("black-forest-labs/FLUX.1-schnell"),
+        Some("flux")
     );
-    assert_eq!(infer_model_family("Tongyi-MAI/Z-Image-Turbo"), "z-image");
-    assert_eq!(infer_model_family("z_image_local"), "z-image");
+    assert_eq!(media_family("Tongyi-MAI/Z-Image-Turbo"), Some("z-image"));
+    assert_eq!(media_family("z_image_local"), Some("z-image"));
 
     // ASR + TTS families
-    assert_eq!(infer_model_family("whisper-large-v3"), "whisper");
-    assert_eq!(infer_model_family("openai/whisper-small"), "whisper");
-    assert_eq!(infer_model_family("parler-tts/parler-tts-mini-v1"), "tts");
-    assert_eq!(infer_model_family("tts-1"), "tts");
-    assert_eq!(infer_model_family("openai/tts-1-hd"), "tts");
-}
-
-#[test]
-fn infer_model_family_stable_diffusion_does_not_collide_with_stablelm() {
-    // The historical "stable" -> "stablelm" arm swallowed
-    // "stable-diffusion" and "stable-cascade". Pin the resolution
-    // order so a future bump can't reintroduce the collision.
+    assert_eq!(media_family("whisper-large-v3"), Some("whisper"));
+    assert_eq!(media_family("openai/whisper-small"), Some("whisper"));
+    assert_eq!(media_family("parler-tts/parler-tts-mini-v1"), Some("tts"));
+    assert_eq!(media_family("tts-1"), Some("tts"));
+    assert_eq!(media_family("openai/tts-1-hd"), Some("tts"));
     assert_eq!(
-        infer_model_family("stable-diffusion-3-medium"),
-        "stable-diffusion"
+        media_family("stable-diffusion-3-medium"),
+        Some("stable-diffusion")
     );
     assert_eq!(
-        infer_model_family("stable-cascade-prior"),
-        "stable-diffusion"
+        media_family("stable-cascade-prior"),
+        Some("stable-diffusion")
     );
-    // StableLM proper (text LLM) still resolves correctly.
-    assert_eq!(infer_model_family("stablelm-3b"), "stablelm");
-    assert_eq!(infer_model_family("stable-code-3b"), "stablelm");
 }
 
 #[test]
@@ -364,26 +372,6 @@ fn estimate_parameter_size_scales_with_format() {
     // "this is a 0-param model" output on /api/show for partial loads).
     assert_eq!(estimate_parameter_size(0, "gguf"), "unknown");
     assert_eq!(estimate_parameter_size(0, "safetensors"), "unknown");
-}
-
-#[test]
-fn infer_model_family_orders_specific_before_generic() {
-    // gemma > generic, even when name embeds 'gemma4' (would not match
-    // any of the other arms anyway, but pins the routing).
-    assert_eq!(infer_model_family("gemma4:26b"), "gemma");
-    assert_eq!(infer_model_family("gemma3-it"), "gemma");
-    // qwen
-    assert_eq!(infer_model_family("qwen3-coder"), "qwen");
-    // mistral and mixtral collapse to 'mistral'
-    assert_eq!(infer_model_family("mistral-7b"), "mistral");
-    assert_eq!(infer_model_family("mixtral-8x7b"), "mistral");
-    // embedding/sentence-encoder families collapse to 'bert'
-    assert_eq!(infer_model_family("nomic-embed-text"), "bert");
-    assert_eq!(infer_model_family("BAAI/bge-large-en"), "bert");
-    // Unknown -> llama fallback (never panic, always a usable family
-    // string for prompt-template selection).
-    assert_eq!(infer_model_family("mystery-coder-v2"), "llama");
-    assert_eq!(infer_model_family(""), "llama");
 }
 
 #[test]

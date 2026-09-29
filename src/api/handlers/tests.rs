@@ -442,41 +442,25 @@ fn humanize_validation_error_empty_errors_falls_back_to_generic() {
 // additional classifier (video-gen, embedding-only model, ...)
 // can't silently regress to the old hardcoded list.
 
+/// A HuggingFace model's vision is read from its files, whatever it is called: a
+/// projector beside its GGUF file, or a `vision_config` in its checkpoint's config.
 #[test]
-fn is_vision_model_by_name_matches_known_families_not_plain_text() {
-    // Known vision-LLM families (the direct-path HF fallback for
-    // model_has_vision when there is no Ollama projector layer).
-    for name in [
-        "moondream:1.8b",
-        "llava:13b",
-        "bakllava",
-        "pixtral-12b",
-        "minicpm-v:8b",
-        "qwen2.5-vl:7b",
-        "qwen3-vl:8b",
-        "internvl-8b",
-        "llama3.2-vision:11b",
-        "granite3.2-vision",
-        "smolvlm",
-    ] {
-        assert!(is_vision_model_by_name(name), "{name} should be vision");
-    }
-    // Plain text / non-vision models must NOT be tagged (a false
-    // positive would offer image upload for a text-only model).
-    for name in [
-        "qwen3-coder:latest",
-        "deepseek-r1:32b",
-        "llama3:8b",
-        "mistral-nemo",
-        "gemma4:9b",
-        "nomic-embed-text",
-        "",
-    ] {
-        assert!(
-            !is_vision_model_by_name(name),
-            "{name} should NOT be vision"
-        );
-    }
+fn vision_is_read_from_the_files() {
+    let root = std::env::temp_dir().join(format!("loken-vision-{}", std::process::id()));
+    let flat = root.join("flat");
+    let ckpt = root.join("ckpt");
+    std::fs::create_dir_all(&flat).unwrap();
+    std::fs::create_dir_all(&ckpt).unwrap();
+    let model = flat.join("model.gguf");
+    std::fs::write(&model, b"").unwrap();
+    assert!(!files_carry_vision(&model));
+    std::fs::write(flat.join("mmproj-model-f16.gguf"), b"").unwrap();
+    assert!(files_carry_vision(&model));
+    std::fs::write(ckpt.join("config.json"), r#"{"model_type": "x"}"#).unwrap();
+    assert!(!files_carry_vision(&ckpt));
+    std::fs::write(ckpt.join("config.json"), r#"{"vision_config": {}}"#).unwrap();
+    assert!(files_carry_vision(&ckpt));
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]
@@ -529,27 +513,6 @@ fn a_model_that_cannot_chat_is_never_offered_for_it() {
 }
 
 #[test]
-fn an_embedding_model_offers_embedding_and_nothing_else() {
-    // Nomic / BGE / general "bert"-family models accept embeddings
-    // requests but produce garbage on completion. Pin the
-    // single-cap "embedding"-only response so SDKs (Open-WebUI's
-    // embedder picker, etc.) don't offer the wrong toggle.
-    for name in [
-        "nomic-embed-text:latest",
-        "nomic-embed-text-v1.5",
-        "bge-large-en-v1.5",
-        "snowflake-arctic-embed-l", // "embed" substring
-    ] {
-        let caps = model_capabilities(name);
-        assert_eq!(
-            caps,
-            vec!["embedding".to_string()],
-            "{name} should expose only embedding; got {caps:?}"
-        );
-    }
-}
-
-#[test]
 fn a_readable_header_decides_between_completion_and_embedding() {
     // The file's pooling declaration overrides what the name suggests.
     assert_eq!(
@@ -560,8 +523,8 @@ fn a_readable_header_decides_between_completion_and_embedding() {
         file_capabilities("my-embed-chat", Some(false)),
         ["completion"]
     );
-    // An unreadable file keeps the name's answer.
-    assert_eq!(file_capabilities("nomic-embed-text", None), ["embedding"]);
+    // An unreadable file leaves a text model offered for completion, whatever its name.
+    assert_eq!(file_capabilities("nomic-embed-text", None), ["completion"]);
     // A media family named by the model keeps its own capabilities.
     assert_eq!(
         file_capabilities("whisper-large-v3", Some(false)),

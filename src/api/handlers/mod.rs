@@ -2024,10 +2024,9 @@ impl APIServer {
     /// Stage C capability probe, done WITHOUT loading the model. Ollama
     /// packages the vision tower as a separate manifest layer
     /// (`application/vnd.ollama.image.projector`), so a manifest scan is an
-    /// exact, load-free signal for all Ollama vision models (moondream,
-    /// llava, ...). Falls back to a tight name heuristic for direct-path HF
-    /// GGUF whose sibling `mmproj*.gguf` the Ollama manifest can't see
-    /// (pixtral, qwen-vl, ...).
+    /// exact, load-free signal for all Ollama vision models. A HuggingFace
+    /// model is read from its files: a sibling `mmproj*.gguf` or a checkpoint
+    /// `config.json` declaring a `vision_config`.
     fn model_has_vision(&self, model_id: &str) -> bool {
         let (model_name, tag) = if model_id.contains(':') {
             let parts: Vec<&str> = model_id.split(':').collect();
@@ -2057,7 +2056,11 @@ impl APIServer {
                 }
             }
         }
-        is_vision_model_by_name(&model_name)
+        let hf = crate::inference::load::huggingface_manager::HuggingFaceManager::new(
+            PathBuf::from(&self.huggingface_models_dir),
+        );
+        hf.get_model_path(model_id)
+            .is_some_and(|p| files_carry_vision(&p))
     }
 
     /// Create an InferenceConfig for a model, resolving the correct models_dir.
@@ -2658,26 +2661,30 @@ impl APIServer {
     }
 }
 
-/// Tight name heuristic for known vision-LLM families - the fallback for
-/// direct-path HF GGUF (sibling mmproj) that `model_has_vision`'s manifest
-/// scan can't see. Kept conservative (specific family tokens, not a bare
-/// "vision" substring) to avoid tagging a plain text model as image-capable.
-fn is_vision_model_by_name(model_name: &str) -> bool {
-    let l = model_name.to_lowercase();
-    l.contains("moondream")
-        || l.contains("llava")
-        || l.contains("bakllava")
-        || l.contains("pixtral")
-        || l.contains("minicpm-v")
-        || l.contains("minicpm-o")
-        || l.contains("-vl")           // qwen2-vl / qwen2.5-vl / qwen3-vl
-        || l.contains("qwen-vl")
-        || l.contains("internvl")
-        || l.contains("llama3.2-vision")
-        || l.contains("llama-3.2-vision")
-        || l.contains("granite3.2-vision")
-        || l.contains("gemma3-vision")
-        || l.contains("smolvlm")
+/// Whether a HuggingFace model's files carry a vision tower: a `mmproj*.gguf` beside its
+/// GGUF file, or a `vision_config` in its checkpoint directory's `config.json`.
+fn files_carry_vision(path: &std::path::Path) -> bool {
+    if path.is_dir() {
+        return std::fs::read_to_string(path.join("config.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .is_some_and(|c| c.get("vision_config").is_some());
+    }
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .any(|p| {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            p != path && name.starts_with("mmproj") && name.ends_with(".gguf")
+        })
 }
 
 /// Models that ship in the HF cache as components of a larger pipeline
