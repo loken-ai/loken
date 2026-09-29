@@ -1914,10 +1914,10 @@ impl GenericHeteroTransformer {
                 proj.forward(&normed)?
             }
         } else if on_cuda && self.output_proj_cuda.is_some() {
-            // Legacy GPU path: norm + F16 matmul via cutlass gemm
+            // Float head: norm, then the F16 matmul against the `[vocab, hidden]` head read
+            // in place (a transpose would copy the whole head every call).
             let norm_w = self.output_norm_cuda_weight.as_ref().unwrap();
             let proj = self.output_proj_cuda.as_ref().unwrap();
-            let proj_t = proj.t()?;
             if all_positions {
                 let (b, s, h) = hidden.dims3()?;
                 let hidden_2d = hidden
@@ -1925,7 +1925,7 @@ impl GenericHeteroTransformer {
                     .to_dtype(crate::tensor::DType::F32)?;
                 let normed = self.final_norm_on_device(&hidden_2d)?;
                 let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
-                let out_2d = normed_f16.matmul(&proj_t)?;
+                let out_2d = normed_f16.matmul_t(proj)?;
                 let vocab = out_2d.dims()[1];
                 out_2d.reshape((b, s, vocab))?
             } else {
@@ -1937,7 +1937,7 @@ impl GenericHeteroTransformer {
                     self.config.rms_norm_eps as f32,
                 )?;
                 let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
-                normed_f16.matmul(&proj_t)?
+                normed_f16.matmul_t(proj)?
             }
         } else {
             // Fallback: transfer to CPU, norm + matmul on CPU

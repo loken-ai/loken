@@ -1923,9 +1923,7 @@ impl GenericHeteroTransformer {
             let proj = self.output_proj_cuda.as_ref().unwrap();
             let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
             self.graph_alive_tensors_model.push(normed_f16.clone());
-            let proj_t = proj.t()?;
-            self.graph_alive_tensors_model.push(proj_t.clone());
-            let mm_out = normed_f16.matmul(&proj_t)?;
+            let mm_out = normed_f16.matmul_t(proj)?;
             self.graph_alive_tensors_model.push(mm_out.clone());
             mm_out
         } else {
