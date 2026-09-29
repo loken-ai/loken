@@ -17,6 +17,12 @@ fn sort_by_expert(choices: &Tensor) -> Result<(Tensor, Tensor)> {
     let flat = choices.flatten_all()?;
     let n_pairs = flat.dim(0)?;
     if n_pairs <= 4096 {
+        // On a card the sort stays there: a host round trip would stop the stream at every
+        // routed layer and keep the decode from being captured.
+        #[cfg(feature = "cuda")]
+        if flat.device().is_cuda() && flat.dtype() == crate::tensor::DType::U32 {
+            return crate::inference::moe_cuda::stable_sort_u32(&flat);
+        }
         return flat.sort_last_dim(true);
     }
     // Past the tensor sort's ceiling - only a wide prefill reaches it. Pull the keys back,

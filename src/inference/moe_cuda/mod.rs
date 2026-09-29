@@ -14,6 +14,7 @@ cuda_launchers! {
     loken_topk_softmax(
         logits: *const f32, weights: *mut f32, ids: *mut u32, n_rows: i32, n_experts: i32,
         n_expert_used: i32, with_norm: i32);
+    loken_stable_sort_u32(keys: *const u32, sorted: *mut u32, order: *mut u32, n: i32);
 }
 
 mod routing;

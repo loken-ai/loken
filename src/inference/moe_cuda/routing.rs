@@ -120,6 +120,43 @@ pub fn batched_argmax(logits: &Tensor) -> Result<Vec<u32>> {
     t.to_vec1::<u32>()
 }
 
+/// Stable ascending sort of a 1-D u32 tensor on its card: the sorted keys, then the position
+/// each came from. Equal keys keep their order. Nothing is read back to the host, so the sort
+/// sits inside a captured decode.
+pub fn stable_sort_u32(keys: &Tensor) -> Result<(Tensor, Tensor)> {
+    if keys.dtype() != DType::U32 || keys.dims().len() != 1 {
+        crate::tensor::bail!(
+            "stable_sort_u32: expected a 1-D u32 tensor, got {:?} {:?}",
+            keys.dtype(),
+            keys.dims()
+        );
+    }
+    let n = keys.elem_count();
+    let dev = keys.device().as_cuda_device()?;
+    let keys = keys.contiguous()?;
+    let (storage, layout) = keys.storage_and_layout();
+    let slice = match &*storage {
+        StorageView::Cuda(c) => c.as_cuda_slice::<u32>()?,
+        _ => crate::tensor::bail!("stable_sort_u32: keys must be a cuda tensor"),
+    };
+    let first = layout.start_offset() * std::mem::size_of::<u32>();
+    let sorted = unsafe { dev.alloc::<u32>(n) }?;
+    let order = unsafe { dev.alloc::<u32>(n) }?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    unsafe {
+        loken_stable_sort_u32(
+            (slice.device_ptr(slice.stream()).0 + first as u64) as *const u32,
+            sorted.device_ptr(sorted.stream()).0 as *mut u32,
+            order.device_ptr(order.stream()).0 as *mut u32,
+            n as i32,
+            stream,
+        );
+    }
+    let sorted = tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(sorted, dev.clone()), (n,))?;
+    let order = tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(order, dev.clone()), (n,))?;
+    Ok((sorted, order))
+}
+
 /// Batched top-k + softmax-denominator front-end for the CB sampled path. Per row returns
 /// the top-`k` logits (descending) + their vocab indices + (rowmax, denom) - one custom
 /// CUDA launch, transferring only [n_rows.k]+[n_rows.2] instead of the full [n_rows,vocab].

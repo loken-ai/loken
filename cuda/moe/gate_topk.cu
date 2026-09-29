@@ -495,3 +495,42 @@ extern "C" void loken_topk_sigmoid_post(
     }
 #undef DISPATCH_POST
 }
+
+namespace ll_gate_topk {
+
+// Stable ascending sort of `n` u32 keys by rank: key i lands after every smaller key and
+// every equal key that precedes it. One thread per key, each reading every key once.
+__global__ void stable_rank_sort_u32_kernel(
+    const uint32_t * __restrict__ keys,
+    uint32_t       * __restrict__ sorted,
+    uint32_t       * __restrict__ order,
+    int n
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint32_t k = keys[i];
+    int rank = 0;
+    for (int j = 0; j < n; ++j) {
+        const uint32_t kj = keys[j];
+        rank += (kj < k) || (kj == k && j < i);
+    }
+    sorted[rank] = k;
+    order[rank] = (uint32_t)i;
+}
+
+} // namespace ll_gate_topk
+
+// The routing's (token, choice) pairs grouped by expert without leaving the device: the
+// sorted expert ids and, for each, the flattened pair it came from.
+extern "C" void loken_stable_sort_u32(
+    const uint32_t * keys,
+    uint32_t       * sorted,
+    uint32_t       * order,
+    int n,
+    cudaStream_t stream
+) {
+    if (n <= 0) return;
+    const int threads = 8 * WARP_SIZE;
+    ll_gate_topk::stable_rank_sort_u32_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
+        keys, sorted, order, n);
+}
