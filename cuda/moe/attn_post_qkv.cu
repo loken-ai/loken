@@ -91,9 +91,14 @@ __device__ __forceinline__ float block_reduce_sum(float v, int nthreads, float* 
 // 0 = skip norm (qwen2 / llama / mistral). When WithNorm=0 the norm
 // weight pointers are unused; pass any non-null value (or nullptr  - 
 // they're not dereferenced).
-template <typename T, int RopeStyle, int WithNorm = 1>
+// Split = true reads Q, K and V from three separate buffers (`qkv` holding Q, then `k_in` and
+// `v_in`, each [heads, hd]) instead of one packed row, for a model whose projections are
+// three weights.
+template <typename T, int RopeStyle, int WithNorm = 1, bool Split = false>
 __global__ void attn_post_qkv_decode_qf32_kernel(
     const float* __restrict__ qkv,
+    const float* __restrict__ k_in,
+    const float* __restrict__ v_in,
     const float* __restrict__ q_norm_w,
     const float* __restrict__ k_norm_w,
     const T*     __restrict__ rope_cos,
@@ -123,7 +128,13 @@ __global__ void attn_post_qkv_decode_qf32_kernel(
     else if (kind == 1) off = n_q * hd + head * hd;
     else                off = n_q * hd + n_kv * hd + head * hd;
 
-    float v = qkv[off + tid];
+    float v;
+    if constexpr (Split) {
+        const float* src = (kind == 0) ? qkv : ((kind == 1) ? k_in : v_in);
+        v = src[head * hd + tid];
+    } else {
+        v = qkv[off + tid];
+    }
 
     if (kind == 2) {
         v_out[head * hd + tid] = v;     // F32 output
@@ -443,7 +454,7 @@ extern "C" void loken_attn_post_qkv_decode_qf32(
 #define LAUNCH_QF32(T, STYLE) \
     loken_ll_apq::attn_post_qkv_decode_qf32_kernel<T, STYLE> \
         <<<grid, block, smem_bytes, stream>>>( \
-            qkv, q_norm_w, k_norm_w, \
+            qkv, nullptr, nullptr, q_norm_w, k_norm_w, \
             (const T*)rope_cos, (const T*)rope_sin, \
             q_out, (T*)k_out, v_out, \
             n_q, n_kv, hd, rope_pos, rms_eps, q_scale);
@@ -462,6 +473,54 @@ extern "C" void loken_attn_post_qkv_decode_qf32(
         else                 { LAUNCH_QF32(float, 1); }
     }
 #undef LAUNCH_QF32
+}
+
+// The with-norm variant reading Q, K and V from three buffers of [heads, hd] F32 each.
+extern "C" void loken_attn_post_qkv_decode_qf32_split(
+    const float* q_in,
+    const float* k_in,
+    const float* v_in,
+    const float* q_norm_w,
+    const float* k_norm_w,
+    const void*  rope_cos,
+    const void*  rope_sin,
+    float*       q_out,         // F32
+    void*        k_out,
+    float*       v_out,         // F32
+    int n_q, int n_kv, int hd,
+    int rope_pos,
+    float rms_eps,
+    float q_scale,
+    int dtype,
+    int rope_style,
+    cudaStream_t stream
+) {
+    dim3 grid(3, max(n_q, n_kv), 1);
+    dim3 block(hd, 1, 1);
+    int n_warps = (hd + WARP_SIZE - 1) / WARP_SIZE;
+    size_t smem_bytes = (n_warps + hd) * sizeof(float);
+
+#define LAUNCH_QF32_SPLIT(T, STYLE) \
+    loken_ll_apq::attn_post_qkv_decode_qf32_kernel<T, STYLE, 1, true> \
+        <<<grid, block, smem_bytes, stream>>>( \
+            q_in, k_in, v_in, q_norm_w, k_norm_w, \
+            (const T*)rope_cos, (const T*)rope_sin, \
+            q_out, (T*)k_out, v_out, \
+            n_q, n_kv, hd, rope_pos, rms_eps, q_scale);
+
+    if (dtype == 0) {
+        if (rope_style == 0) { LAUNCH_QF32_SPLIT(__half, 0); }
+        else                 { LAUNCH_QF32_SPLIT(__half, 1); }
+    } else if (dtype == 1) {
+#ifndef NO_BF16_KERNEL
+        if (rope_style == 0) { LAUNCH_QF32_SPLIT(__nv_bfloat16, 0); }
+        else                 { LAUNCH_QF32_SPLIT(__nv_bfloat16, 1); }
+#endif
+    } else {
+        if (rope_style == 0) { LAUNCH_QF32_SPLIT(float, 0); }
+        else                 { LAUNCH_QF32_SPLIT(float, 1); }
+    }
+#undef LAUNCH_QF32_SPLIT
 }
 
 // No-norm variant of attn_post_qkv_decode_qf32: just RoPE + scale +
@@ -496,7 +555,7 @@ extern "C" void loken_attn_post_qkv_decode_qf32_no_norm(
 #define LAUNCH_QF32_NN(T, STYLE) \
     loken_ll_apq::attn_post_qkv_decode_qf32_kernel<T, STYLE, 0> \
         <<<grid, block, smem_bytes, stream>>>( \
-            qkv, dummy_norm, dummy_norm, \
+            qkv, nullptr, nullptr, dummy_norm, dummy_norm, \
             (const T*)rope_cos, (const T*)rope_sin, \
             q_out, (T*)k_out, v_out, \
             n_q, n_kv, hd, rope_pos, 0.0f, q_scale);

@@ -172,6 +172,138 @@ impl GenericTransformerLayer {
         }
     }
 
+    /// The decode step of a layer whose Q, K and V are three weights and whose heads are
+    /// normed then rotated: one launch does both norms, both rotations and the cast that the
+    /// general path spends four on, reading the three projections where they were written.
+    /// `None` where this layer or this step is not one it serves; nothing has run then.
+    #[cfg(feature = "cuda")]
+    fn attend_split_fused(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+    ) -> Result<Option<(Tensor, bool)>> {
+        let (b, seq, _) = x.dims3()?;
+        let (Some(wq), Some(wk), Some(wv)) = (
+            self.attn_q.as_ref(),
+            self.attn_k.as_ref(),
+            self.attn_v.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let (Some(q_norm), Some(k_norm)) = (self.attn_q_norm.as_ref(), self.attn_k_norm.as_ref())
+        else {
+            return Ok(None);
+        };
+        let width = |w: &super::projection::QMatMul| {
+            w.qtensor().and_then(|t| t.shape().dims().first().copied())
+        };
+        let served = seq == 1
+            && b == 1
+            && x.device().is_cuda()
+            && x.dtype() == crate::tensor::DType::F32
+            && self.attn_qkv.is_none()
+            && !self.flags.has_qkv_bias
+            && self.flags.has_qk_norm
+            && !self.qk_norm_is_full()
+            && self.attn_v_norm_ones.is_none()
+            && self.attn_sinks.is_none()
+            && !self.no_rope
+            && self.rope_rows.is_none()
+            && self.rope_freq_factors.is_none()
+            && (self.rope_dim == 0 || self.rope_dim == self.head_dim)
+            && (self.has_q8_cache() || self.has_q4_cache())
+            && width(wq) == Some(self.n_head * self.head_dim)
+            && width(wk) == Some(self.n_kv_head * self.head_dim)
+            && width(wv) == Some(self.n_kv_head * self.head_dim);
+        if !served {
+            return Ok(None);
+        }
+        let (q, k, v) = match self.try_qkv_shared_q8_1(x)? {
+            Some(qkv) => qkv,
+            None => (wq.forward(x)?, wk.forward(x)?, wv.forward(x)?),
+        };
+        if [&q, &k, &v]
+            .iter()
+            .any(|t| t.dtype() != crate::tensor::DType::F32)
+        {
+            crate::tensor::bail!("split QKV decode: the projections must come back F32");
+        }
+        let f32_weight = |w: &Tensor| -> Result<Tensor> {
+            if w.dtype() == crate::tensor::DType::F32 {
+                Ok(w.clone())
+            } else {
+                w.to_dtype(crate::tensor::DType::F32)
+            }
+        };
+        let (q_norm_w, k_norm_w, rms_eps) = (
+            f32_weight(q_norm.weight())?,
+            f32_weight(k_norm.weight())?,
+            q_norm.eps() as f32,
+        );
+        // In a captured step the position is frozen, so the rotation reads the per-step
+        // buffer's single row; eagerly it reads the full table at the position.
+        let (src_cos, src_sin, kernel_pos) = match (&self.graph_rope_cos, &self.graph_rope_sin) {
+            (Some(gc), Some(gs)) if self.graph_step() => (gc.clone(), gs.clone(), 0usize),
+            _ => (self.cos.clone(), self.sin.clone(), index_pos),
+        };
+        let model_dtype = self.cos.dtype();
+        let table = |t: Tensor| -> Result<Tensor> {
+            let t = if t.device().same_device(&x.device()) {
+                t
+            } else {
+                t.to_device(&x.device())?
+            };
+            if t.dtype() == model_dtype {
+                Ok(t)
+            } else {
+                t.to_dtype(model_dtype)
+            }
+        };
+        let (cos, sin) = (table(src_cos)?, table(src_sin)?);
+        let q_scale = self
+            .attention_scale
+            .unwrap_or_else(|| 1.0 / (self.head_dim as f64).sqrt()) as f32;
+        let rope_style = if self.flags.use_rope_i { 1 } else { 0 };
+
+        let (q_h, k_h, v_h) = crate::inference::moe_cuda::attn_post_qkv_decode_qf32_split(
+            &q,
+            &k,
+            &v,
+            &q_norm_w,
+            &k_norm_w,
+            &cos,
+            &sin,
+            self.n_head,
+            self.n_kv_head,
+            self.head_dim,
+            kernel_pos,
+            rms_eps,
+            q_scale,
+            model_dtype,
+            rope_style,
+        )?;
+        let q = q_h.reshape((1, self.n_head, 1, self.head_dim))?;
+        let k = k_h.reshape((1, self.n_kv_head, 1, self.head_dim))?;
+        let v = v_h.reshape((1, self.n_kv_head, 1, self.head_dim))?;
+        let cache = self.quant_kv.as_mut().unwrap();
+        if index_pos == 0 {
+            cache.reset();
+            self.kv_cache.reset();
+        }
+        cache
+            .append(&k, &v)
+            .map_err(|e| crate::tensor::Error::msg(format!("quantised KV append: {e}")))?;
+        // Q carries the attention scale already, so the softmax takes none.
+        let y = if self.has_q8_cache() {
+            self.q8_decode_attention(&q, 1.0f32)?
+        } else {
+            let graph = self.graph_step();
+            self.q4_decode_attention(&q, 1.0f64, graph)?
+        };
+        let y = y.reshape(&[b, seq, self.n_head * self.head_dim])?;
+        Ok(Some((y, false)))
+    }
+
     /// Phi2 shared-Q8_1 prelude. Pre-quantizes x_norm to Q8_1 once, then
     /// computes attn_qkv via mvq_via_pre_quantized_q8_1 (skipping the
     /// redundant in-QMatMul quantize). Returns (qkv, q8_1_buf) so the
@@ -502,6 +634,13 @@ impl GenericTransformerLayer {
         donor_f16: Option<&crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
     ) -> Result<(Tensor, bool)> {
         let (b, seq, _) = x.dims3()?;
+
+        #[cfg(feature = "cuda")]
+        if projected.is_none() && shared_kv.is_none() {
+            if let Some(done) = self.attend_split_fused(x, index_pos)? {
+                return Ok(done);
+            }
+        }
 
         // --- Fused QKV+norm+RoPE fast path (Qwen3-style models) -----------
         // Single fused launch covers wqkv + q_norm + k_norm + RoPE + cast,

@@ -287,6 +287,98 @@ pub fn attn_post_qkv_decode_qf32(
     )
 }
 
+/// [`attn_post_qkv_decode_qf32`] over Q, K and V given as three tensors of `[heads * hd]` F32
+/// each, for a layer whose projections are three weights.
+pub fn attn_post_qkv_decode_qf32_split(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    q_norm_w: &Tensor,
+    k_norm_w: &Tensor,
+    rope_cos: &Tensor,
+    rope_sin: &Tensor,
+    n_q: usize,
+    n_kv: usize,
+    hd: usize,
+    rope_pos: usize,
+    rms_eps: f32,
+    q_scale: f32,
+    out_dtype: DType,
+    rope_style: i32,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    if [q, k, v, q_norm_w, k_norm_w]
+        .iter()
+        .any(|t| t.dtype() != DType::F32)
+    {
+        crate::tensor::bail!(
+            "attn_post_qkv_decode_qf32_split: inputs and norm weights must be F32"
+        );
+    }
+    if q.elem_count() != n_q * hd || k.elem_count() != n_kv * hd || v.elem_count() != n_kv * hd {
+        crate::tensor::bail!(
+            "attn_post_qkv_decode_qf32_split: projection widths do not match the heads"
+        );
+    }
+    if rope_cos.dtype() != out_dtype || rope_sin.dtype() != out_dtype {
+        crate::tensor::bail!("attn_post_qkv_decode_qf32_split: rope dtype mismatch");
+    }
+    let dev = q.device().as_cuda_device()?;
+    let dtype_int = carrier_code(out_dtype)?;
+    let stream_i64 = dev.cuda_stream().cu_stream() as i64;
+
+    let (q_c, k_c, v_c) = (q.contiguous()?, k.contiguous()?, v.contiguous()?);
+    let qn_c = q_norm_w.contiguous()?;
+    let kn_c = k_norm_w.contiguous()?;
+    let rc_c = rope_cos.contiguous()?;
+    let rs_c = rope_sin.contiguous()?;
+    let (q_st, q_lo) = q_c.storage_and_layout();
+    let (k_st, k_lo) = k_c.storage_and_layout();
+    let (v_st, v_lo) = v_c.storage_and_layout();
+    let (qn_storage, _) = qn_c.storage_and_layout();
+    let (kn_storage, _) = kn_c.storage_and_layout();
+    let (rc_storage, _) = rc_c.storage_and_layout();
+    let (rs_storage, _) = rs_c.storage_and_layout();
+
+    let f = std::mem::size_of::<f32>();
+    let q_ptr = (address_of::<f32>(&q_st, "q")? as usize + q_lo.start_offset() * f) as *const f32;
+    let k_ptr = (address_of::<f32>(&k_st, "k")? as usize + k_lo.start_offset() * f) as *const f32;
+    let v_ptr = (address_of::<f32>(&v_st, "v")? as usize + v_lo.start_offset() * f) as *const f32;
+    let qn_ptr = address_of::<f32>(&qn_storage, "q_norm_w")? as *const f32;
+    let kn_ptr = address_of::<f32>(&kn_storage, "k_norm_w")? as *const f32;
+    let (rc_ptr, rs_ptr) = rope_addresses(out_dtype, &rc_storage, &rs_storage)?;
+
+    outputs_q_in_f32(
+        out_dtype,
+        &dev,
+        n_q,
+        n_kv,
+        hd,
+        |q_out, k_out, v_out| unsafe {
+            loken_attn_post_qkv_decode_qf32_split(
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                qn_ptr,
+                kn_ptr,
+                rc_ptr,
+                rs_ptr,
+                q_out as *mut f32,
+                k_out,
+                v_out as *mut f32,
+                n_q as i32,
+                n_kv as i32,
+                hd as i32,
+                rope_pos as i32,
+                rms_eps,
+                q_scale,
+                dtype_int,
+                rope_style,
+                stream_i64,
+            );
+        },
+    )
+}
+
 /// [`attn_post_qkv_decode_qf32`] for the architectures that carry no Q/K norm.
 pub fn attn_post_qkv_decode_qf32_no_norm(
     qkv: &Tensor,
