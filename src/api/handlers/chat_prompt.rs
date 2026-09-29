@@ -84,11 +84,17 @@ fn dir_chat_format(dir: &std::path::Path) -> ChatFormat {
     };
     let config = read_json("tokenizer_config.json");
     let tokenizer = read_json("tokenizer.json");
+    // A checkpoint that ships its vocabulary as a tekken file lists its control tokens
+    // there and nowhere else.
+    let tekken = tokenizer
+        .is_none()
+        .then(|| read_json("tekken.json"))
+        .flatten();
     let template = config
         .as_ref()
         .and_then(|c| declared_template(c.get("chat_template")?))
         .or_else(|| std::fs::read_to_string(dir.join("chat_template.jinja")).ok());
-    if template.is_none() && config.is_none() && tokenizer.is_none() {
+    if template.is_none() && config.is_none() && tokenizer.is_none() && tekken.is_none() {
         let mut ggufs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
             .into_iter()
             .flatten()
@@ -104,7 +110,11 @@ fn dir_chat_format(dir: &std::path::Path) -> ChatFormat {
             return gguf_chat_format(first);
         }
     }
-    let tokens = config.iter().chain(tokenizer.iter()).flat_map(added_tokens);
+    let tokens = config
+        .iter()
+        .chain(tokenizer.iter())
+        .chain(tekken.iter())
+        .flat_map(added_tokens);
     ChatFormat {
         template,
         vocabulary: vocabulary_markers(tokens),
@@ -127,8 +137,14 @@ fn declared_template(v: &serde_json::Value) -> Option<String> {
 }
 
 /// The text of a tokenizer file's added tokens: `added_tokens` in `tokenizer.json`,
-/// `added_tokens_decoder` in `tokenizer_config.json`.
+/// `added_tokens_decoder` in `tokenizer_config.json`, `special_tokens` in a tekken file.
 fn added_tokens(json: &serde_json::Value) -> impl Iterator<Item = &str> {
+    let special = json
+        .get("special_tokens")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.get("token_str").and_then(|c| c.as_str()));
     let listed = json
         .get("added_tokens")
         .and_then(|v| v.as_array())
@@ -142,6 +158,7 @@ fn added_tokens(json: &serde_json::Value) -> impl Iterator<Item = &str> {
     listed
         .chain(decoded)
         .filter_map(|t| t.get("content").and_then(|c| c.as_str()))
+        .chain(special)
 }
 
 /// The rendered prompt and what the response side needs to read the answer back.
@@ -453,5 +470,35 @@ mod tests {
         assert_eq!(thinking_from_effort(Some("HIGH")), Some("high"));
         assert_eq!(thinking_from_effort(Some("other")), Some("enabled"));
         assert_eq!(thinking_from_effort(None), None);
+    }
+
+    /// A checkpoint whose only vocabulary file is a tekken file is prompted in the
+    /// instruction format its control tokens name.
+    #[test]
+    fn a_tekken_vocabulary_chooses_the_instruction_format() {
+        let dir = std::env::temp_dir().join(format!("loken-tekken-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tekken = serde_json::json!({
+            "special_tokens": [
+                {"rank": 1, "token_str": "<s>", "is_control": true},
+                {"rank": 3, "token_str": "[INST]", "is_control": true},
+                {"rank": 4, "token_str": "[/INST]", "is_control": true},
+                {"rank": 17, "token_str": "[SYSTEM_PROMPT]", "is_control": true},
+            ],
+            "vocab": [],
+        });
+        std::fs::write(dir.join("tekken.json"), tekken.to_string()).unwrap();
+        let format = path_chat_format(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        let template = format
+            .effective_template()
+            .expect("a template from the vocabulary");
+        let p = build_prompt(
+            &spec(&[user("hi", None)], None, None),
+            Some(&template),
+            "",
+            false,
+        );
+        assert!(p.prompt.contains("[INST]hi[/INST]"), "{}", p.prompt);
     }
 }
