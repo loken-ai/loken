@@ -3,7 +3,8 @@
 //! with hazard codes in one pass; Shieldstral, ShieldGemma and Granite Guardian answer
 //! one yes/no question per policy, the probability read from the first token; gpt-oss
 //! Safeguard reasons over a written policy and names the violated categories. Every
-//! family lands in the Moderation API's thirteen categories.
+//! family lands in the Moderation API's thirteen categories. The protocol is read from the
+//! classifier's chat template.
 
 use super::*;
 use axum::response::{IntoResponse, Response};
@@ -44,7 +45,7 @@ const CATEGORY_DEFINITIONS: [(&str, &str); 13] = [
     ("violence/graphic", "depicts death, violence, or physical injury in graphic detail"),
 ];
 
-/// The classifier families, told apart by the model's name.
+/// The classifier protocols, told apart by the chat template the model carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
     LlamaGuard,
@@ -55,18 +56,21 @@ enum Family {
 }
 
 impl Family {
-    fn of(model: &str) -> Option<Self> {
-        let m = model.to_ascii_lowercase();
-        if m.contains("llama-guard") || m.contains("llamaguard") {
+    /// The protocol a classifier's template is written for: the hazard-code task of a
+    /// template asking about unsafe content, the policy-expert question, the risk-bank
+    /// question, a written policy reasoned over in the Harmony format, or one yes/no
+    /// question per policy in the instruction format.
+    fn of(template: &str) -> Option<Self> {
+        if template.contains("unsafe content") {
             Some(Self::LlamaGuard)
-        } else if m.contains("shieldstral") {
-            Some(Self::Shieldstral)
-        } else if m.contains("shieldgemma") {
+        } else if template.contains("policy expert") {
             Some(Self::ShieldGemma)
-        } else if m.contains("guardian") {
+        } else if template.contains("risk_bank") || template.contains("safety agent") {
             Some(Self::GraniteGuardian)
-        } else if m.contains("safeguard") {
+        } else if template_is_harmony(Some(template)) {
             Some(Self::GptOssSafeguard)
+        } else if template_is_mistral_tools(Some(template)) || template.contains("[INST]") {
+            Some(Self::Shieldstral)
         } else {
             None
         }
@@ -562,9 +566,10 @@ pub(crate) async fn moderations(
             "no moderation model is configured; set `[inference] moderation_model` to a safety classifier: a Llama Guard 3, Shieldstral, ShieldGemma, Granite Guardian or gpt-oss Safeguard model",
         ));
     };
-    let Some(family) = Family::of(&model) else {
+    let template = state.chat_template_for(&model).await.unwrap_or_default();
+    let Some(family) = Family::of(&template) else {
         return Ok(not_implemented(&format!(
-            "moderation model '{model}' is not of a family this server knows: llama-guard, shieldstral, shieldgemma, granite guardian, gpt-oss-safeguard"
+            "moderation model '{model}' carries no chat template of a classifier protocol this server knows: llama-guard, shieldstral, shieldgemma, granite guardian, gpt-oss-safeguard"
         )));
     };
     let inputs: Vec<String> = match body.get("input") {
@@ -639,20 +644,21 @@ fn not_implemented(message: &str) -> Response {
 mod tests {
     use super::*;
 
+    /// Each protocol is read from the template its classifier carries, never its name.
     #[test]
-    fn families_are_told_apart_by_name() {
-        assert_eq!(Family::of("llama-guard3:8b"), Some(Family::LlamaGuard));
-        assert_eq!(Family::of("shieldstral-q4_k_m"), Some(Family::Shieldstral));
-        assert_eq!(Family::of("shieldgemma:2b"), Some(Family::ShieldGemma));
-        assert_eq!(
-            Family::of("granite3-guardian:2b"),
-            Some(Family::GraniteGuardian)
-        );
-        assert_eq!(
-            Family::of("gpt-oss-safeguard:20b"),
-            Some(Family::GptOssSafeguard)
-        );
-        assert_eq!(Family::of("qwen3:8b"), None);
+    fn families_are_told_apart_by_template() {
+        let guard = "{%- if categories is not defined -%}Task: Check if there is unsafe content in";
+        assert_eq!(Family::of(guard), Some(Family::LlamaGuard));
+        let mistral = "[SYSTEM_PROMPT]{{ system }}[/SYSTEM_PROMPT][INST]{{ m }}[/INST]";
+        assert_eq!(Family::of(mistral), Some(Family::Shieldstral));
+        let shield = "You are a policy expert trying to help determine whether";
+        assert_eq!(Family::of(shield), Some(Family::ShieldGemma));
+        let granite = "{%- set risk_bank = ({\"social_bias\": {}}) -%}<|start_of_role|>user";
+        assert_eq!(Family::of(granite), Some(Family::GraniteGuardian));
+        let harmony = "<|start|>system<|message|>Reasoning: medium<|end|>";
+        assert_eq!(Family::of(harmony), Some(Family::GptOssSafeguard));
+        let chatml = "{% for m in messages %}<|im_start|>{{ m.role }}{% endfor %}";
+        assert_eq!(Family::of(chatml), None);
     }
 
     #[test]
