@@ -242,6 +242,12 @@ impl SpecKvCache {
         self.window
     }
 
+    /// The host length after graph replays, which wrote rows on the card without counting
+    /// them here. Clamped to the buffers.
+    pub fn sync_len(&mut self, len: usize) {
+        self.current_seq_len = len.min(self.max_seq_len);
+    }
+
     /// Advance the sequence length counter without writing data.
     /// Used when the KV write is done via scatter_set outside the cache.
     pub fn advance_seq_len(&mut self, n: usize) {
@@ -365,6 +371,20 @@ impl SpecKvCache {
     /// # Returns
     /// (full_k, full_v) narrowed views of shape [batch, n_kv_heads, current_seq_len+n_new, head_dim]
     pub fn append(&mut self, k_new: &Tensor, v_new: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.append_in_place(k_new, v_new)?;
+        let dim = self.dim;
+        let k_buf = self.k.as_ref().unwrap();
+        let v_buf = self.v.as_ref().unwrap();
+        // Narrowed views of the history (a copy where the narrowed dim is not outermost).
+        let k_out = k_buf.narrow(dim, 0, self.current_seq_len)?;
+        let v_out = v_buf.narrow(dim, 0, self.current_seq_len)?;
+        Ok((k_out, v_out))
+    }
+
+    /// Writes `k_new`/`v_new` into the buffers at the current length and advances it,
+    /// returning nothing: a caller that reads the whole buffers with the length apart
+    /// copies no history.
+    pub fn append_in_place(&mut self, k_new: &Tensor, v_new: &Tensor) -> Result<()> {
         let dims = k_new.dims();
         let (dim, n_new) = if dims.len() == 4 {
             (2, dims[2]) // seq_len at index 2 for 4D
@@ -430,12 +450,7 @@ impl SpecKvCache {
         v_buf.slice_set(v_new, dim, self.current_seq_len)?;
 
         self.current_seq_len += n_new;
-
-        // Return narrowed views (O(1), no copy)
-        let k_out = k_buf.narrow(dim, 0, self.current_seq_len)?;
-        let v_out = v_buf.narrow(dim, 0, self.current_seq_len)?;
-
-        Ok((k_out, v_out))
+        Ok(())
     }
 
     /// Get the full K buffer (for graph mode - fixed pointer).

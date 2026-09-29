@@ -492,18 +492,21 @@ impl GenericTransformerLayer {
     }
 
     /// Attention of a layer with per-head sinks: `q` `[b, n_head, seq, hd]` against the
-    /// appended `k`/`v` `[b, n_kv, kv, hd]`, `mask` `[seq, kv]` u8 (1 hides a key) or `None`
-    /// at decode. Returns `[b, n_head, seq, hd]` in `q`'s dtype. A windowed layer's decode
-    /// reads its last `sliding_window` keys; its prefill window is in the mask.
+    /// first `kv_len` positions of `k`/`v` `[b, n_kv, >= kv_len, hd]`, `mask` `[seq, kv_len]`
+    /// u8 (1 hides a key) or `None` at decode. Returns `[b, n_head, seq, hd]` in `q`'s dtype.
+    /// A windowed layer's decode reads its last `sliding_window` keys; its prefill window is
+    /// in the mask.
     ///
-    /// The host decode scans the F16 store, a card decode runs the F16 flash decode, the
-    /// host prefill the online-softmax walk, each with the sink in its denominator; every
-    /// other shape materialises the scores.
+    /// The graph's decode step reads the length from the device, a card decode reads the
+    /// buffers in place, the host decode scans the F16 store, the host prefill runs the
+    /// online-softmax walk, each with the sink in its denominator; every other shape
+    /// materialises the scores.
     pub(super) fn sink_attention(
         &self,
         q: &Tensor,
         k: Tensor,
         v: Tensor,
+        kv_len: usize,
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let sinks = self
@@ -516,8 +519,42 @@ impl GenericTransformerLayer {
             .attention_scale
             .unwrap_or_else(|| 1.0 / (hd as f64).sqrt());
         let window = self.sliding_window.filter(|&w| w > 0);
-        let kv_len = k.dims()[2];
         let host = matches!(q.device(), crate::tensor::Device::Cpu);
+        // A card decode runs one split-K launch over the whole buffers, the key count read
+        // on the device in the graph's step and given here otherwise; the split count
+        // follows the buffers' capacity, so both sum alike.
+        #[cfg(feature = "cuda")]
+        if seq == 1 && mask.is_none() && q.device().is_cuda() {
+            let pos = match self.graph_step() {
+                true => self.graph_pos_i32.as_ref(),
+                false => None,
+            };
+            if pos.is_some() || !self.graph_step() {
+                let f16 = |t: &Tensor| t.to_dtype(crate::tensor::DType::F16);
+                let nsplit = (self.kv_cache.max_seq_len_padded() / SINK_DECODE_KEYS_PER_SPLIT)
+                    .clamp(SINK_DECODE_MIN_SPLITS, SINK_DECODE_MAX_SPLITS);
+                if let Some(o) = crate::inference::kernel::fused::flash_decode_split_devkvlen(
+                    &f16(q)?.reshape((b, n_head, hd))?,
+                    &f16(&k)?,
+                    &f16(&v)?,
+                    pos,
+                    kv_len,
+                    Some(sinks),
+                    window.unwrap_or(0),
+                    scale as f32,
+                    nsplit,
+                    n_head,
+                    self.n_kv_head,
+                    hd,
+                )? {
+                    return o.reshape((b, n_head, 1, hd))?.to_dtype(q.dtype());
+                }
+            }
+        }
+        let (k, v) = match k.dims()[2] > kv_len {
+            true => (k.narrow(2, 0, kv_len)?, v.narrow(2, 0, kv_len)?),
+            false => (k, v),
+        };
         if seq == 1 && b == 1 && mask.is_none() && host {
             if let (Some(cache), Some(sinks_host)) =
                 (self.cpu_f16_kv.as_ref(), self.attn_sinks_host.as_deref())
@@ -532,29 +569,6 @@ impl GenericTransformerLayer {
                     return Tensor::from_vec(out, (1, n_head, 1, hd), &q.device())?
                         .to_dtype(q.dtype());
                 }
-            }
-        }
-        if seq == 1 && mask.is_none() && q.device().is_cuda() {
-            let kv_start = match window {
-                Some(w) if kv_len > w => kv_len - w,
-                _ => 0,
-            };
-            let f16 = |t: &Tensor| t.to_dtype(crate::tensor::DType::F16);
-            if let Some(o) = crate::inference::kernel::fused::gptoss_flash_decode_win(
-                &f16(q)?,
-                &f16(&k)?,
-                &f16(&v)?,
-                None,
-                Some(sinks),
-                scale as f32,
-                b,
-                n_head,
-                self.n_kv_head,
-                kv_start,
-                kv_len,
-                hd,
-            )? {
-                return o.reshape((b, n_head, 1, hd))?.to_dtype(q.dtype());
             }
         }
         if host && q.dtype() == crate::tensor::DType::F32 && b == 1 {
@@ -774,6 +788,13 @@ impl GenericTransformerLayer {
         }
     }
 }
+
+/// Keys each split of a sink layer's card decode covers at full capacity, and the bounds
+/// on the split count: enough splits to fill the card at short context, few enough that the
+/// combine stays cheap.
+const SINK_DECODE_KEYS_PER_SPLIT: usize = 128;
+const SINK_DECODE_MIN_SPLITS: usize = 32;
+const SINK_DECODE_MAX_SPLITS: usize = 128;
 
 /// Attention with per-head sinks over materialised scores: `q` `[b, n_head, seq, hd]`,
 /// `k`/`v` `[b, n_kv_head, kv, hd]`, `mask` `[seq, kv]` u8 with 1 where a key is hidden.

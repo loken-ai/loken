@@ -153,8 +153,9 @@ impl GenericHeteroTransformer {
         self.layers.iter().any(|l| {
             // Any layer that has no Q4/Q8 KV cache AND is not a
             // dual-populate donor falls back to F-dtype scatter_set,
-            // which is the unstable path.
-            !l.has_q4_cache() && !l.has_q8_cache() && !l.populate_dual_kv
+            // which is the unstable path. A sink layer attends over its
+            // buffers by the device length and reads no padded mask.
+            l.attn_sinks.is_none() && !l.has_q4_cache() && !l.has_q8_cache() && !l.populate_dual_kv
         })
     }
 
@@ -171,8 +172,10 @@ impl GenericHeteroTransformer {
         if self.is_recurrent() {
             return Err("recurrent mixer: the captured decode has no recurrent step");
         }
+        // A sink layer's step is not captured: its replay, which reads the length on the
+        // device, costs more than the eager step, whose attention is GPU-bound.
         if self.layers.iter().any(|l| l.attn_sinks.is_some()) {
-            return Err("attention sinks: the captured decode attention has no sink term");
+            return Err("attention sinks: the replayed step costs more than the eager one");
         }
         // The captured layer runs a mixture that reads the normed hidden alone; one beside a
         // dense feed-forward, with its own norms, runs only in the eager forward.
@@ -449,6 +452,7 @@ impl GenericHeteroTransformer {
             l.graph_rope_cos = None;
             l.graph_rope_sin = None;
             l.graph_kv_pos = None;
+            l.graph_pos_i32 = None;
             l.graph_attn_qk_buffer = None;
             l.graph_attn_out_buffer = None;
             l.graph_attn_proj_buffer = None;
@@ -525,19 +529,16 @@ impl GenericHeteroTransformer {
     #[cfg(feature = "cuda")]
     pub fn sync_kv_len_for_graph(&mut self, len: usize) {
         for l in &mut self.layers {
-            if let Some(c) = l.quant_kv.as_mut() {
-                c.set_seq_len_for_graph(len);
+            match l.quant_kv.as_mut() {
+                Some(c) => c.set_seq_len_for_graph(len),
+                // An F-dtype cache the graph writes by device position (a sink layer's).
+                None if l.attn_sinks.is_some() => l.kv_cache.sync_len(len),
+                None => {}
             }
         }
     }
 
     pub fn update_graph_state(&mut self, pos: usize) -> Result<()> {
-        let dev = self
-            .layers
-            .first()
-            .map(|l| l.cos.device().clone())
-            .unwrap_or(Device::Cpu);
-
         // Captured-graph seq ceiling (Q8 path): the live graph was
         // recorded against a frozen buffer capacity and (if the
         // fixed-stride score chain was captured) a frozen max_seq_padded
@@ -645,8 +646,35 @@ impl GenericHeteroTransformer {
             .iter()
             .all(|l| (l.has_q8_cache() || l.has_q4_cache()) && !l.populate_dual_kv);
 
+        // The step's position for the sink layers' device-length attention: written once
+        // per card, shared by that card's sink layers.
+        let mut pos_by_card: std::collections::HashMap<usize, Tensor> =
+            std::collections::HashMap::new();
         // Second pass: update each leader, then assign Arc-clones to followers.
         for i in 0..n_layers {
+            // A layer's buffers live on the card it runs on.
+            let dev = self.layers[i].cos.device().clone();
+            if self.layers[i].attn_sinks.is_some() {
+                if let crate::tensor::DeviceLocation::Cuda { gpu_id } = dev.location() {
+                    let layer = &mut self.layers[i];
+                    match (pos_by_card.get(&gpu_id), layer.graph_pos_i32.as_ref()) {
+                        (Some(written), None) => layer.graph_pos_i32 = Some(written.clone()),
+                        (Some(_), Some(_)) => {}
+                        (None, held) => {
+                            let row = Tensor::new(&[pos as i32], &dev)?;
+                            let t = match held {
+                                Some(t) => {
+                                    t.slice_set(&row, 0, 0)?;
+                                    t.clone()
+                                }
+                                None => row.force_contiguous()?,
+                            };
+                            layer.graph_pos_i32 = Some(t.clone());
+                            pos_by_card.insert(gpu_id, t);
+                        }
+                    }
+                }
+            }
             // RoPE: only update if this layer is the rope-group leader.
             if rope_group[i] == i {
                 let layer = &mut self.layers[i];
@@ -673,7 +701,9 @@ impl GenericHeteroTransformer {
                     .as_ref()
                     .and_then(|m| m.dim(3).ok())
                     .unwrap_or(max_kv);
-                if pos >= mask_width {
+                // A cache that grew since the mask was made moved its buffers, which a
+                // recorded graph still names.
+                if pos >= mask_width || mask_width != max_kv {
                     return Err(crate::tensor::Error::msg(format!(
                         "graph_state: pos {} >= padded_mask width {} (kv_cache cap {}, layer {}). \
                          Caller should invalidate the captured graph.",

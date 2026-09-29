@@ -87,6 +87,13 @@ cuda_launchers! {
         n_head: i32, n_kv: i32, head_dim: i32, scale: f32, window: i32, k_batch_stride: i64,
         k_head_stride: i64, k_pos_stride: i64, v_batch_stride: i64, v_head_stride: i64,
         v_pos_stride: i64);
+    loken_flash_decode_split_devkvlen_f16(
+        q: *const c_void, k: *const c_void, v: *const c_void, pos_dev: *const i32,
+        kv_len_host: i32, sinks: *const f32, out: *mut c_void, part_m: *mut f32,
+        part_l: *mut f32, part_acc: *mut f32, batch: i32, n_head: i32, n_kv: i32,
+        nsplit: i32, head_dim: i32, scale: f32, window: i32, k_batch_stride: i64,
+        k_head_stride: i64, k_pos_stride: i64, v_batch_stride: i64, v_head_stride: i64,
+        v_pos_stride: i64);
     loken_paged_flash_decode_f16(q: *const c_void, kp: *const c_void,
         vp: *const c_void, block_table: *const i32, seq_lens: *const i32,
         out: *mut c_void, batch: i32, n_head: i32, n_kv: i32, head_dim: i32,

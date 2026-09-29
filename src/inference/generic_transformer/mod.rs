@@ -191,6 +191,9 @@ pub struct GenericTransformerLayer {
     /// 1-element i64 GPU tensor holding the current KV write position.
     /// Updated outside the graph; scatter_set reads it at replay time.
     pub graph_kv_pos: Option<Tensor>,
+    /// 1-element i32 on the layer's card holding the position the graph step writes; the
+    /// device-length sink attention reads it at replay time.
+    pub graph_pos_i32: Option<Tensor>,
     /// Persistent attention-score buffer for the GQA fast path under
     /// graph mode. Shape `[1, n_kv_head, n_rep, max_kv]` F32. Hypothesis:
     /// the fresh per-replay alloc that the reference matmul returns is the

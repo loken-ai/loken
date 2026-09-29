@@ -1136,8 +1136,10 @@ impl GenericTransformerLayer {
                             .ok_or_else(|| crate::tensor::Error::msg("graph_kv_pos not set"))?;
                         let k_buf = self.kv_cache.k_buffer().unwrap();
                         let v_buf = self.kv_cache.v_buffer().unwrap();
-                        k_buf.scatter_set(pos_idx, &k, 2)?;
-                        v_buf.scatter_set(pos_idx, &v, 2)?;
+                        // The row lands in the buffers' own dtype (F16 for an F16 cache).
+                        let kd = k_buf.dtype();
+                        k_buf.scatter_set(pos_idx, &k.to_dtype(kd)?, 2)?;
+                        v_buf.scatter_set(pos_idx, &v.to_dtype(kd)?, 2)?;
                         self.kv_cache.advance_seq_len(1);
                     }
                     (
@@ -1213,7 +1215,17 @@ impl GenericTransformerLayer {
                 } else {
                     v.to_dtype(crate::tensor::DType::F16)?
                 };
-                self.kv_cache.append(&k16, &v16)?
+                // A sink layer's card decode reads the whole buffers with the length apart,
+                // so its history is not copied out every step.
+                if self.attn_sinks.is_some() && seq == 1 && k16.device().is_cuda() {
+                    self.kv_cache.append_in_place(&k16, &v16)?;
+                    match (self.kv_cache.k_buffer(), self.kv_cache.v_buffer()) {
+                        (Some(kb), Some(vb)) => (kb, vb),
+                        _ => crate::tensor::bail!("sink layer: KV buffers missing after append"),
+                    }
+                } else {
+                    self.kv_cache.append(&k16, &v16)?
+                }
             } else {
                 self.cpu_q8_append(&k, &v, seq, index_pos, is_shared_layer);
                 self.kv_cache.append(&k, &v)?
@@ -1266,7 +1278,8 @@ impl GenericTransformerLayer {
         // prefill or captured-graph kernels below carries the sink term, and a sink layer
         // keeps its history in the F-dtype cache, so none of them was selected above.
         if self.attn_sinks.is_some() {
-            let y = self.sink_attention(&q, k, v, mask)?;
+            let kv_len = self.kv_cache.current_seq_len();
+            let y = self.sink_attention(&q, k, v, kv_len, mask)?;
             let y = y
                 .transpose(1, 2)?
                 .reshape(&[b, seq, self.n_head * self.head_dim])?;
