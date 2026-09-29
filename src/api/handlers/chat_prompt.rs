@@ -241,7 +241,7 @@ pub(crate) fn build_prompt(
         }
         None => format_chat_prompt(messages, template),
     };
-    apply_thinking_preference(&mut prompt, spec.thinking);
+    apply_thinking_preference(&mut prompt, spec.thinking, template);
     let thinking_opened = crate::api::thinking::prompt_opens_thinking(&prompt);
     let forced = spec
         .tools

@@ -1154,10 +1154,7 @@ pub(crate) async fn ollama_show_model(
                     if t.contains(".Tools") || t.contains("tools") {
                         caps.push("tools".to_string());
                     }
-                    if t.contains(".Thinking")
-                        || t.contains("enable_thinking")
-                        || t.contains("reasoning_content")
-                    {
+                    if crate::api::handlers::prompt_format::template_has_thinking(t) {
                         caps.push("thinking".to_string());
                     }
                 }

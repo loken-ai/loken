@@ -124,7 +124,13 @@ pub(crate) fn template_from_vocabulary(markers: &str) -> Option<String> {
 ///
 /// Here rather than in a handler because both the chat and the generate endpoints have to
 /// honour the same request field, and the one that did not was silently reasoning anyway.
-pub(crate) fn apply_thinking_preference(prompt: &mut String, thinking: Option<&str>) {
+/// A `template` without a thinking slot gets no empty block: that model does not reason,
+/// and it reads the closed block as a finished turn.
+pub(crate) fn apply_thinking_preference(
+    prompt: &mut String,
+    thinking: Option<&str>,
+    template: Option<&str>,
+) {
     const OPENER: &str = "<|im_start|>assistant\n";
     const HARMONY_SYSTEM: &str = "<|start|>system<|message|>";
     // gpt-oss reads its effort from a `Reasoning:` line of the system turn and cannot
@@ -151,9 +157,20 @@ pub(crate) fn apply_thinking_preference(prompt: &mut String, thinking: Option<&s
         }
         return;
     }
-    if thinking == Some("disabled") && prompt.ends_with(OPENER) {
+    if thinking == Some("disabled")
+        && prompt.ends_with(OPENER)
+        && template.is_none_or(template_has_thinking)
+    {
         prompt.push_str("<think>\n\n</think>\n\n");
     }
+}
+
+/// Whether a chat template has a place for reasoning. Go templates name the fields, Jinja
+/// ones the variables.
+pub(crate) fn template_has_thinking(template: &str) -> bool {
+    template.contains(".Thinking")
+        || template.contains("enable_thinking")
+        || template.contains("reasoning_content")
 }
 
 /// Renders the Go template of an Ollama modelfile for one exchange: the `.System`,
@@ -1900,11 +1917,11 @@ mod go_template_tests {
     fn harmony_effort_is_written_into_the_system_turn() {
         let mut p =
             "<|start|>system<|message|>You are ChatGPT.\nReasoning: medium\n<|end|>".to_string();
-        apply_thinking_preference(&mut p, Some("high"));
+        apply_thinking_preference(&mut p, Some("high"), None);
         assert!(p.contains("Reasoning: high"));
         assert!(!p.contains("Reasoning: medium"));
         let mut q = "<|start|>system<|message|>You are ChatGPT.<|end|>".to_string();
-        apply_thinking_preference(&mut q, Some("disabled"));
+        apply_thinking_preference(&mut q, Some("disabled"), None);
         assert!(q.starts_with("<|start|>system<|message|>Reasoning: low\n"));
     }
 

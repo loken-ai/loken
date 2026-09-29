@@ -754,7 +754,15 @@ pub(crate) async fn generate_prompt(
         )
         .await
     };
-    apply_thinking_preference(&mut prompt, request.thinking_preference());
+    let template = match request.template.as_deref().filter(|t| !t.trim().is_empty()) {
+        Some(t) => Some(t.to_string()),
+        None => state.chat_template_for(model_name).await,
+    };
+    apply_thinking_preference(
+        &mut prompt,
+        request.thinking_preference(),
+        template.as_deref(),
+    );
     prompt
 }
 
