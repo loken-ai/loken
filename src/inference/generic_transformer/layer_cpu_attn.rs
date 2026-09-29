@@ -531,8 +531,8 @@ impl GenericTransformerLayer {
             };
             if pos.is_some() || !self.graph_step() {
                 let f16 = |t: &Tensor| t.to_dtype(crate::tensor::DType::F16);
-                let nsplit = (self.kv_cache.max_seq_len_padded() / SINK_DECODE_KEYS_PER_SPLIT)
-                    .clamp(SINK_DECODE_MIN_SPLITS, SINK_DECODE_MAX_SPLITS);
+                let nsplit = (self.kv_cache.max_seq_len_padded() / F16_DECODE_KEYS_PER_SPLIT)
+                    .clamp(F16_DECODE_MIN_SPLITS, F16_DECODE_MAX_SPLITS);
                 if let Some(o) = crate::inference::kernel::fused::flash_decode_split_devkvlen(
                     &f16(q)?.reshape((b, n_head, hd))?,
                     &f16(&k)?,
@@ -789,12 +789,12 @@ impl GenericTransformerLayer {
     }
 }
 
-/// Keys each split of a sink layer's card decode covers at full capacity, and the bounds
-/// on the split count: enough splits to fill the card at short context, few enough that the
-/// combine stays cheap.
-const SINK_DECODE_KEYS_PER_SPLIT: usize = 128;
-const SINK_DECODE_MIN_SPLITS: usize = 32;
-const SINK_DECODE_MAX_SPLITS: usize = 128;
+/// Keys each split of a card decode over an F16 cache covers at full capacity, and the
+/// bounds on the split count: enough splits to fill the card at short context, few enough
+/// that the combine stays cheap.
+pub(super) const F16_DECODE_KEYS_PER_SPLIT: usize = 128;
+pub(super) const F16_DECODE_MIN_SPLITS: usize = 32;
+pub(super) const F16_DECODE_MAX_SPLITS: usize = 128;
 
 /// Attention with per-head sinks over materialised scores: `q` `[b, n_head, seq, hd]`,
 /// `k`/`v` `[b, n_kv_head, kv, hd]`, `mask` `[seq, kv]` u8 with 1 where a key is hidden.

@@ -138,6 +138,9 @@ pub fn flash_decode_devkvlen(
     Ok(Some(out))
 }
 
+/// Largest head size [`flash_decode_split_devkvlen`] serves.
+pub const SPLIT_DECODE_MAX_HEAD_DIM: usize = 512;
+
 /// Split-K flash decode (seq 1, GQA) over whole KV buffers `kbuf`/`vbuf` `[b, n_kv, cap,
 /// hd]` F16 (hd contiguous): the key count is `*pos_dev + 1` read on the device when
 /// `pos_dev` (`[1]` i32) is given, `kv_len` otherwise, so a captured step and an eager one
@@ -165,7 +168,7 @@ pub fn flash_decode_split_devkvlen(
     use core::ffi::c_void;
     if !q.device().is_cuda()
         || !head_dim.is_multiple_of(32)
-        || !(32..=256).contains(&head_dim)
+        || !(32..=SPLIT_DECODE_MAX_HEAD_DIM).contains(&head_dim)
         || q.dtype() != DType::F16
         || kbuf.dtype() != DType::F16
         || vbuf.dtype() != DType::F16

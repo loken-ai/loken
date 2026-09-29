@@ -507,9 +507,10 @@ extern "C" void loken_paged_kv_write_f16(
 // `pos_dev` is given (kv_len = *pos_dev + 1, the captured decode) and taken from
 // `kv_len_host` otherwise (the eager step). The same launch in both cases, so a replayed
 // step and an eager one sum in the same order. `window` > 0 keeps the last `window`
-// keys. The sink, when given, seeds split 0; the partials reduce through
-// `loken_flash_decode_combine_f16_kernel`.
-extern "C" __global__ void loken_flash_decode_split_devkvlen_f16_kernel(
+// keys. The sink, when given, seeds split 0. `MAXD` bounds the dims each lane holds
+// (head_dim <= 32 * MAXD).
+template <int MAXD>
+__global__ void loken_flash_decode_split_devkvlen_f16_kernel(
     const __half* __restrict__ Q, const __half* __restrict__ K, const __half* __restrict__ V,
     const int* __restrict__ pos_dev, int kv_len_host, const float* __restrict__ sinks,
     float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
@@ -534,20 +535,20 @@ extern "C" __global__ void loken_flash_decode_split_devkvlen_f16_kernel(
     const long pidx = ((long)bi * n_head + head) * nsplit + split;
     float m = (sinks && split == 0) ? sinks[head] : -INFINITY;
     float l = (sinks && split == 0) ? 1.0f : 0.0f;
-    float acc[LL_MAX_DPL];
+    float acc[MAXD];
     #pragma unroll
-    for (int t = 0; t < LL_MAX_DPL; ++t) acc[t] = 0.0f;
+    for (int t = 0; t < MAXD; ++t) acc[t] = 0.0f;
     const __half* q = Q + ((long)bi * n_head + head) * head_dim;
-    float qd[LL_MAX_DPL];
+    float qd[MAXD];
     #pragma unroll
-    for (int t = 0; t < LL_MAX_DPL; ++t) qd[t] = (t < dpl) ? __half2float(q[lane + (t << 5)]) : 0.0f;
+    for (int t = 0; t < MAXD; ++t) qd[t] = (t < dpl) ? __half2float(q[lane + (t << 5)]) : 0.0f;
     const __half* kh = K + (long)bi * k_batch_stride + (long)kvh * k_head_stride;
     const __half* vh = V + (long)bi * v_batch_stride + (long)kvh * v_head_stride;
     for (int j = j0; j < j1; ++j) {
         const __half* kj = kh + (long)j * k_pos_stride;
         float p = 0.0f;
         #pragma unroll
-        for (int t = 0; t < LL_MAX_DPL; ++t) if (t < dpl) p += qd[t] * __half2float(kj[lane + (t << 5)]);
+        for (int t = 0; t < MAXD; ++t) if (t < dpl) p += qd[t] * __half2float(kj[lane + (t << 5)]);
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) p += __shfl_down_sync(0xffffffff, p, o);
         p = __shfl_sync(0xffffffff, p, 0);
@@ -558,13 +559,70 @@ extern "C" __global__ void loken_flash_decode_split_devkvlen_f16_kernel(
         l = l * alpha + pj;
         const __half* vj = vh + (long)j * v_pos_stride;
         #pragma unroll
-        for (int t = 0; t < LL_MAX_DPL; ++t) if (t < dpl) acc[t] = acc[t] * alpha + pj * __half2float(vj[lane + (t << 5)]);
+        for (int t = 0; t < MAXD; ++t) if (t < dpl) acc[t] = acc[t] * alpha + pj * __half2float(vj[lane + (t << 5)]);
         m = m_new;
     }
     if (lane == 0) { part_m[pidx] = m; part_l[pidx] = l; }
     #pragma unroll
-    for (int t = 0; t < LL_MAX_DPL; ++t) if (t < dpl) part_acc[pidx * head_dim + lane + (t << 5)] = acc[t];
+    for (int t = 0; t < MAXD; ++t) if (t < dpl) part_acc[pidx * head_dim + lane + (t << 5)] = acc[t];
 }
+
+// The log-sum-exp merge of `nsplit` partials per head, as
+// `loken_flash_decode_combine_f16_kernel`, for head_dim <= 32 * MAXD.
+template <int MAXD>
+__global__ void loken_flash_decode_combine_n_f16_kernel(
+    const float* __restrict__ part_m, const float* __restrict__ part_l,
+    const float* __restrict__ part_acc, __half* __restrict__ out,
+    int n_head, int nsplit, int head_dim
+) {
+    const int head = blockIdx.x;
+    const int bi   = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (lane >= 32) return;
+    const int dpl  = head_dim >> 5;
+    const long base = ((long)bi * n_head + head) * nsplit;
+    float gm = -INFINITY;
+    for (int s = 0; s < nsplit; ++s) gm = fmaxf(gm, part_m[base + s]);
+    float l = 0.0f;
+    float acc[MAXD];
+    #pragma unroll
+    for (int t = 0; t < MAXD; ++t) acc[t] = 0.0f;
+    for (int s = 0; s < nsplit; ++s) {
+        const float pm = part_m[base + s];
+        if (pm == -INFINITY) continue;
+        const float w = expf(pm - gm);
+        l += part_l[base + s] * w;
+        const float* pa = part_acc + (base + s) * head_dim;
+        #pragma unroll
+        for (int t = 0; t < MAXD; ++t) if (t < dpl) acc[t] += pa[lane + (t << 5)] * w;
+    }
+    const float inv = 1.0f / l;
+    __half* o = out + ((long)bi * n_head + head) * head_dim;
+    #pragma unroll
+    for (int t = 0; t < MAXD; ++t) if (t < dpl) o[lane + (t << 5)] = __float2half(acc[t] * inv);
+}
+
+template <int MAXD>
+static void launch_split_devkvlen(
+    const void* Q, const void* K, const void* V, const int* pos_dev, int kv_len_host,
+    const float* sinks, void* out, float* part_m, float* part_l, float* part_acc,
+    int batch, int n_head, int n_kv, int nsplit, int head_dim, float scale, int window,
+    long k_batch_stride, long k_head_stride, long k_pos_stride,
+    long v_batch_stride, long v_head_stride, long v_pos_stride, cudaStream_t stream
+) {
+    dim3 grid(n_head, batch, nsplit);
+    dim3 block(32, 1, 1);
+    loken_flash_decode_split_devkvlen_f16_kernel<MAXD><<<grid, block, 0, stream>>>(
+        (const __half*)Q, (const __half*)K, (const __half*)V, pos_dev, kv_len_host, sinks,
+        part_m, part_l, part_acc, n_head, n_kv, nsplit, head_dim, scale, window,
+        k_batch_stride, k_head_stride, k_pos_stride, v_batch_stride, v_head_stride, v_pos_stride);
+    dim3 cgrid(n_head, batch, 1);
+    loken_flash_decode_combine_n_f16_kernel<MAXD><<<cgrid, block, 0, stream>>>(
+        part_m, part_l, part_acc, (__half*)out, n_head, nsplit, head_dim);
+}
+
+// Largest head size the split-K device-length decode serves: 32 lanes of 16 dims.
+#define LL_SPLIT_MAX_DPL 16
 
 extern "C" void loken_flash_decode_split_devkvlen_f16(
     const void* Q, const void* K, const void* V, const int* pos_dev, int kv_len_host,
@@ -573,14 +631,14 @@ extern "C" void loken_flash_decode_split_devkvlen_f16(
     long k_batch_stride, long k_head_stride, long k_pos_stride,
     long v_batch_stride, long v_head_stride, long v_pos_stride, cudaStream_t stream
 ) {
-    if (head_dim < 32 || (head_dim & 31) != 0 || (head_dim >> 5) > LL_MAX_DPL || nsplit < 1) return;
-    dim3 grid(n_head, batch, nsplit);
-    dim3 block(32, 1, 1);
-    loken_flash_decode_split_devkvlen_f16_kernel<<<grid, block, 0, stream>>>(
-        (const __half*)Q, (const __half*)K, (const __half*)V, pos_dev, kv_len_host, sinks,
-        part_m, part_l, part_acc, n_head, n_kv, nsplit, head_dim, scale, window,
-        k_batch_stride, k_head_stride, k_pos_stride, v_batch_stride, v_head_stride, v_pos_stride);
-    dim3 cgrid(n_head, batch, 1);
-    loken_flash_decode_combine_f16_kernel<<<cgrid, block, 0, stream>>>(
-        part_m, part_l, part_acc, (__half*)out, n_head, nsplit, head_dim);
+    if (head_dim < 32 || (head_dim & 31) != 0 || (head_dim >> 5) > LL_SPLIT_MAX_DPL || nsplit < 1) return;
+    if ((head_dim >> 5) <= LL_MAX_DPL) {
+        launch_split_devkvlen<LL_MAX_DPL>(Q, K, V, pos_dev, kv_len_host, sinks, out, part_m, part_l,
+            part_acc, batch, n_head, n_kv, nsplit, head_dim, scale, window, k_batch_stride,
+            k_head_stride, k_pos_stride, v_batch_stride, v_head_stride, v_pos_stride, stream);
+    } else {
+        launch_split_devkvlen<LL_SPLIT_MAX_DPL>(Q, K, V, pos_dev, kv_len_host, sinks, out, part_m,
+            part_l, part_acc, batch, n_head, n_kv, nsplit, head_dim, scale, window, k_batch_stride,
+            k_head_stride, k_pos_stride, v_batch_stride, v_head_stride, v_pos_stride, stream);
+    }
 }

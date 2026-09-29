@@ -862,7 +862,30 @@ impl GenericTransformerLayer {
                 } else {
                     (k_new, v_new)
                 };
-                let (k_full, v_full) = self.kv_cache.append(&k_new, &v_new)?;
+                // An F16 cache is attended in place by the split-K decode; Q carries the
+                // scale already.
+                let in_place = self.kv_f16
+                    && self.attn_softcap.is_none()
+                    && k_new.dtype() == crate::tensor::DType::F16;
+                let (k_full, v_full) = if in_place {
+                    self.kv_cache.append_in_place(&k_new, &v_new)?;
+                    #[cfg(feature = "cuda")]
+                    if let (Some(kb), Some(vb)) =
+                        (self.kv_cache.k_buffer(), self.kv_cache.v_buffer())
+                    {
+                        let kv_len = self.kv_cache.current_seq_len();
+                        if let Some(y) = self.f16_decode_attention(&q, &kb, &vb, kv_len, 1.0)? {
+                            let attn_out_dim = self.n_head * self.head_dim;
+                            let y = y.reshape(&[b, seq, attn_out_dim])?;
+                            return Ok((y, false));
+                        }
+                    }
+                    self.kv_cache
+                        .current_kv()
+                        .ok_or_else(|| crate::tensor::Error::msg("F16 cache empty after append"))?
+                } else {
+                    self.kv_cache.append(&k_new, &v_new)?
+                };
 
                 // Pre-scaled attention (q_scale was already folded into Q
                 // by attn_post_qkv_decode). For seq=1 GQA, this matches
@@ -1215,13 +1238,17 @@ impl GenericTransformerLayer {
                 } else {
                     v.to_dtype(crate::tensor::DType::F16)?
                 };
-                // A sink layer's card decode reads the whole buffers with the length apart,
-                // so its history is not copied out every step.
-                if self.attn_sinks.is_some() && seq == 1 && k16.device().is_cuda() {
+                // A card decode reads the whole buffers with the length apart, so the history
+                // is not copied out every step: a sink layer's, and any whose scores are not
+                // capped.
+                if seq == 1
+                    && k16.device().is_cuda()
+                    && (self.attn_sinks.is_some() || self.attn_softcap.is_none())
+                {
                     self.kv_cache.append_in_place(&k16, &v16)?;
                     match (self.kv_cache.k_buffer(), self.kv_cache.v_buffer()) {
                         (Some(kb), Some(vb)) => (kb, vb),
-                        _ => crate::tensor::bail!("sink layer: KV buffers missing after append"),
+                        _ => crate::tensor::bail!("F16 cache: KV buffers missing after append"),
                     }
                 } else {
                     self.kv_cache.append(&k16, &v16)?
@@ -1285,6 +1312,32 @@ impl GenericTransformerLayer {
                 .reshape(&[b, seq, self.n_head * self.head_dim])?;
             return Ok((y, false));
         }
+        // One query row over an F16 cache: the split-K decode over the buffers in place.
+        #[cfg(feature = "cuda")]
+        if self.kv_f16
+            && seq == 1
+            && b == 1
+            && mask.is_none()
+            && !use_graph_ops
+            && !is_shared_layer
+            && self.attn_softcap.is_none()
+            && q.device().is_cuda()
+        {
+            let kv_len = self.kv_cache.current_seq_len();
+            let scale = self
+                .attention_scale
+                .unwrap_or_else(|| 1.0 / (self.head_dim as f64).sqrt());
+            if let Some(y) = self.f16_decode_attention(&q, &k, &v, kv_len, scale as f32)? {
+                let y = y.reshape(&[b, seq, self.n_head * self.head_dim])?;
+                return Ok((y, true));
+            }
+        }
+        // Buffers appended in place and not attended above hold more rows than the history.
+        let kv_len = self.kv_cache.current_seq_len();
+        let (k, v) = match self.kv_f16 && !use_graph_ops && k.dims()[2] > kv_len {
+            true => (k.narrow(2, 0, kv_len)?, v.narrow(2, 0, kv_len)?),
+            false => (k, v),
+        };
         #[cfg(feature = "cuda")]
         let (k, v) = if flash_kv {
             let scale = self
@@ -1466,6 +1519,49 @@ impl GenericTransformerLayer {
         let y = y.transpose(1, 2)?.reshape(&[b, seq, attn_out_dim])?;
         // The projection of this path routes through the graph's stable buffer (decode).
         Ok((y, true))
+    }
+
+    /// One query row `q` `[1, n_head, 1, hd]` over an F16 cache whose buffers `k`/`v`
+    /// `[1, n_kv, cap, hd]` hold the history in their first `kv_len` positions, `scale`
+    /// multiplying the scores; a windowed layer reads its last `sliding_window` keys. The
+    /// split-K decode reads the buffers in place. Returns `[1, n_head, 1, hd]` in `q`'s
+    /// dtype, or `None` for a head size the kernel does not serve.
+    #[cfg(feature = "cuda")]
+    fn f16_decode_attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        kv_len: usize,
+        scale: f32,
+    ) -> Result<Option<Tensor>> {
+        use super::layer_cpu_attn::{
+            F16_DECODE_KEYS_PER_SPLIT, F16_DECODE_MAX_SPLITS, F16_DECODE_MIN_SPLITS,
+        };
+        let (b, n_head, _, hd) = q.dims4()?;
+        let nsplit = (self.kv_cache.max_seq_len_padded() / F16_DECODE_KEYS_PER_SPLIT)
+            .clamp(F16_DECODE_MIN_SPLITS, F16_DECODE_MAX_SPLITS);
+        let window = self.sliding_window.filter(|&w| w > 0).unwrap_or(0);
+        let q16 = q
+            .to_dtype(crate::tensor::DType::F16)?
+            .reshape((b, n_head, hd))?;
+        match crate::inference::kernel::fused::flash_decode_split_devkvlen(
+            &q16,
+            k,
+            v,
+            None,
+            kv_len,
+            None,
+            window,
+            scale,
+            nsplit,
+            n_head,
+            self.n_kv_head,
+            hd,
+        )? {
+            Some(o) => Ok(Some(o.reshape((b, n_head, 1, hd))?.to_dtype(q.dtype())?)),
+            None => Ok(None),
+        }
     }
 
     /// One query row `q` `[1, n_head, 1, hd]` against the Q4 history, `scale` applied to
