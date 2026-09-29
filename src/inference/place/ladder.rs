@@ -114,6 +114,29 @@ impl Demand {
 }
 
 impl Demand {
+    /// For a mixture of experts whose first plan sends whole blocks to the host: the plan
+    /// that keeps every block's dense part on a card and sends only the routed experts of
+    /// the last blocks to the host. `layers` is each block's `(dense bytes, expert bytes)`.
+    /// `None` when `first` spills nothing or the dense parts alone do not fit.
+    pub fn plan_host_experts(
+        &self,
+        first: &HeteroPlan,
+        cards: &[(usize, u64)],
+        layers: &[(u64, u64)],
+    ) -> Option<HeteroPlan> {
+        let spills = first.segments.iter().any(|s| s.kind == DeviceKind::Cpu);
+        if !spills {
+            return None;
+        }
+        HeteroPlan::calculate_host_experts(
+            layers,
+            self.head_bytes,
+            cards,
+            self.kv_bytes_per_layer,
+            self.runtime_reserve,
+        )
+    }
+
     /// The first rung for a component whose stem of `stem_bytes` may sit on the card its
     /// first block runs on: planned with the stem there when that costs the blocks nothing,
     /// every block on the device it takes without the stem, else planned without it.
@@ -409,6 +432,7 @@ fn beside_host(plan: HeteroPlan, demand: &Demand, accelerators: &[(usize, u64)])
     HeteroPlan {
         segments,
         total_layers: plan.total_layers,
+        host_experts_from: plan.host_experts_from,
     }
 }
 

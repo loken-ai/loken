@@ -337,7 +337,7 @@ impl LlmEngine {
             // Captured now: `content` is consumed by one of the loader arms below, and the
             // page advice can only be given once every layer has a device.
             // Page advice applies to a GGUF file's own bytes; the shards are read, not mapped.
-            let layer_page_ranges: Vec<(usize, usize, usize)> = content
+            let layer_page_ranges: Vec<(usize, usize, usize, bool)> = content
                 .tensor_infos
                 .iter()
                 .filter(|_| awq.is_none())
@@ -349,9 +349,12 @@ impl LlmEngine {
                         layer,
                         (content.tensor_data_offset + info.offset) as usize,
                         info.size_in_bytes(),
+                        super::load::is_routed_expert_tensor(&rest[dot + 1..]),
                     ))
                 })
                 .collect();
+            // Set by the generic route when its plan keeps routed experts in host memory.
+            let mut host_experts_from: Option<usize> = None;
 
             // --- 2. Extract metadata ---
             // Empty when the file names none: the generic route then refuses it for the facts
@@ -862,6 +865,23 @@ impl LlmEngine {
                             let stem_bytes = generic_weights.stem_bytes(&content);
                             let (first_plan, stem_fits) =
                                 demand.plan_stem_if_free(&cuda_devices, stem_bytes);
+                            // A plan that sends whole layers to the host is replaced, for a
+                            // mixture of experts, by one that sends only routed experts there:
+                            // every layer's attention and cache then stay on a card.
+                            let expert_split = generic_weights
+                                .layer_dense_and_expert_bytes(&content, num_layers)
+                                .and_then(|layers| demand.plan_host_experts(&first_plan, &cuda_devices, &layers));
+                            if let Some(p) = &expert_split {
+                                info!(
+                                    "📦 routed experts of layers {}-{} kept in host memory; every layer's attention stays on a card",
+                                    p.host_experts_from.unwrap_or(num_layers),
+                                    num_layers
+                                );
+                            }
+                            let (first_plan, stem_fits) = match expert_split {
+                                Some(p) => (p, false),
+                                None => (first_plan, stem_fits),
+                            };
                             // A handle per card a plan uses, made on first use, with per-slice
                             // event tracking off before any tensor loads: a device owns one
                             // working stream, so the events would order a stream against itself,
@@ -903,6 +923,7 @@ impl LlmEngine {
                                     let stem_on_card = stem_fits
                                         && crate::inference::place::dry_plan::same_plan(plan, &first_plan);
                                     let m = generic_weights.build(&on_plan, plan, kv, ctx, stem_on_card)?;
+                                    host_experts_from = plan.host_experts_from;
                                     let placement = plan
                                         .segments
                                         .iter()
@@ -926,7 +947,12 @@ impl LlmEngine {
             debug!("✓ Weights loaded from mmap in {:.1}ms", weights_t.elapsed().as_secs_f64() * 1000.0);
 
             debug!("✓ Model weights loaded");
-            advise_pages_by_placement(&mmap, &layer_page_ranges, &model.device_layer_distribution());
+            advise_pages_by_placement(
+                &mmap,
+                &layer_page_ranges,
+                &model.device_layer_distribution(),
+                host_experts_from,
+            );
 
             // --- 5.5 Initialize layer performance tracking ---
             use crate::inference::place::layer_perf;
@@ -1106,8 +1132,9 @@ impl LlmEngine {
 /// are small next to the layers.
 fn advise_pages_by_placement(
     mmap: &std::sync::Arc<memmap2::Mmap>,
-    ranges: &[(usize, usize, usize)],
+    ranges: &[(usize, usize, usize, bool)],
     dist: &[(String, usize, u32, u32)],
+    host_experts_from: Option<usize>,
 ) {
     if dist.is_empty() {
         return; // this backend did not say where its layers are; leave the cache alone
@@ -1120,10 +1147,12 @@ fn advise_pages_by_placement(
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
     let total = mmap.len();
     let (mut kept, mut dropped, mut n_kept, mut n_dropped) = (0u64, 0u64, 0usize, 0usize);
-    for &(layer, start, len) in ranges {
+    for &(layer, start, len, routed_expert) in ranges {
         let Some(host) = on_host(layer) else {
             continue;
         };
+        // Routed experts the plan keeps in host memory are read from these pages.
+        let host = host || (routed_expert && host_experts_from.is_some_and(|from| layer >= from));
         // Page-aligned outward: a partial page shared with a neighbour is only ever
         // advised, so widening the range costs at most one refault of that neighbour.
         let a = start / page * page;

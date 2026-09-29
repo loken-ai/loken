@@ -649,6 +649,7 @@ fn plan_of(spans: &[(usize, usize, usize)], total: usize) -> HeteroPlan {
             })
             .collect(),
         total_layers: total,
+        host_experts_from: None,
     }
 }
 
@@ -764,6 +765,7 @@ fn a_block_on_the_host_is_weighed_at_the_host_dtype() {
             },
         ],
         total_layers: cfg.n_layers,
+        host_experts_from: None,
     };
     let weigh = |host_dtype| {
         super::dry_forward_planned(

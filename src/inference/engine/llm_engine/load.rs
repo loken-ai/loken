@@ -81,6 +81,39 @@ impl GenericWeights<'_> {
         }
     }
 
+    /// Each block's `(dense bytes, routed expert bytes)`, the experts being the stacked
+    /// `_exps` tensors. `None` when the source cannot say or holds no routed experts.
+    pub(super) fn layer_dense_and_expert_bytes(
+        &self,
+        content: &gguf_file::Content,
+        layers: usize,
+    ) -> Option<Vec<(u64, u64)>> {
+        match self {
+            GenericWeights::Gguf { .. } => {
+                let mut out = vec![(0u64, 0u64); layers];
+                for (name, t) in &content.tensor_infos {
+                    let Some(rest) = name.strip_prefix("blk.") else {
+                        continue;
+                    };
+                    let Some((idx, tail)) = rest.split_once('.') else {
+                        continue;
+                    };
+                    let Some(slot) = idx.parse::<usize>().ok().and_then(|i| out.get_mut(i)) else {
+                        continue;
+                    };
+                    let bytes = t.size_in_bytes() as u64;
+                    if is_routed_expert_tensor(tail) {
+                        slot.1 += bytes;
+                    } else {
+                        slot.0 += bytes;
+                    }
+                }
+                out.iter().any(|&(_, e)| e > 0).then_some(out)
+            }
+            GenericWeights::Awq { .. } => None,
+        }
+    }
+
     /// Bytes of the repeating blocks and of the output head, as the cards will hold them.
     /// `None` when the source cannot say, and the file size stands in.
     pub(super) fn block_and_head_bytes(&self, content: &gguf_file::Content) -> Option<(u64, u64)> {
@@ -1274,4 +1307,12 @@ mod reuse_tests {
     fn a_cache_that_matches_is_used_as_asked() {
         assert_eq!(reuse_verdict(Some(577), 577), Reuse::AsAsked(577));
     }
+}
+
+/// Whether a block tensor, named after its `blk.N.` prefix, is a routed expert stack: the
+/// weights and per-expert biases the host-expert placement keeps off the card. The router
+/// (`ffn_gate_inp`) and the shared expert (`_shexp`) are not.
+pub(crate) fn is_routed_expert_tensor(tail: &str) -> bool {
+    let stem = tail.split('.').next().unwrap_or(tail);
+    stem.ends_with("_exps")
 }

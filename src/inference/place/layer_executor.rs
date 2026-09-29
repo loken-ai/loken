@@ -93,6 +93,10 @@ impl HeteroSegment {
 pub struct HeteroPlan {
     pub segments: Vec<HeteroSegment>,
     pub total_layers: usize,
+    /// Layers from this index on keep their routed experts in host memory while the rest of
+    /// each layer runs on the device its segment names. `None` when every expert sits with
+    /// its layer.
+    pub host_experts_from: Option<usize>,
 }
 
 impl HeteroPlan {
@@ -211,6 +215,83 @@ impl HeteroPlan {
         plan
     }
 
+    /// Plans a mixture-of-experts model that does not fit the cards by moving routed experts,
+    /// not whole layers, to the host: every layer's dense part (attention or mixer, router,
+    /// shared expert, norms) and cache stay on a card, and the experts of the last layers go
+    /// to host memory, as few layers as the cards need. `layers` is each layer's
+    /// `(dense bytes, routed expert bytes)`; cards are filled in the order given, each to its
+    /// free memory less `gpu_runtime_reserve_bytes`, and the card of the last layer also
+    /// holds `head_bytes`. `None` when the dense parts alone do not fit, or no layer has
+    /// routed experts.
+    pub fn calculate_host_experts(
+        layers: &[(u64, u64)],
+        head_bytes: u64,
+        cuda_devices: &[(usize, u64)],
+        kv_bytes_per_layer: u64,
+        gpu_runtime_reserve_bytes: u64,
+    ) -> Option<Self> {
+        let total_layers = layers.len();
+        if total_layers == 0 || layers.iter().all(|&(_, e)| e == 0) {
+            return None;
+        }
+        let budgets: Vec<(usize, u64)> = cuda_devices
+            .iter()
+            .map(|&(i, free)| (i, free.saturating_sub(gpu_runtime_reserve_bytes)))
+            .collect();
+        // Cards filled in order with layers `[0, n)`, a layer from `from` on costing its dense
+        // part alone. The head joins the card of the last layer.
+        let fill = |from: usize| -> Option<Vec<HeteroSegment>> {
+            let cost = |l: usize| {
+                let (dense, experts) = layers[l];
+                let own = if l >= from {
+                    dense
+                } else {
+                    dense.saturating_add(experts)
+                };
+                own.saturating_add(kv_bytes_per_layer)
+            };
+            let mut segments = Vec::new();
+            let mut next = 0usize;
+            for &(idx, budget) in &budgets {
+                if next == total_layers {
+                    break;
+                }
+                let start = next;
+                let mut used = 0u64;
+                while next < total_layers && used.saturating_add(cost(next)) <= budget {
+                    used = used.saturating_add(cost(next));
+                    next += 1;
+                }
+                if next == total_layers && used.saturating_add(head_bytes) > budget {
+                    // The head does not fit beside the last layers: hand one back to the next
+                    // card, or fail when this card is the last.
+                    while next > start && used.saturating_add(head_bytes) > budget {
+                        next -= 1;
+                        used = used.saturating_sub(cost(next));
+                    }
+                }
+                if next > start {
+                    segments.push(HeteroSegment {
+                        kind: DeviceKind::Cuda(idx),
+                        layer_start: start,
+                        layer_end: next,
+                        free_memory_bytes: budget,
+                    });
+                }
+            }
+            (next == total_layers).then_some(segments)
+        };
+        (0..=total_layers).rev().find_map(|from| {
+            // `from` counts down from every expert on the cards to none of them.
+            let segments = fill(from)?;
+            Some(HeteroPlan {
+                segments,
+                total_layers,
+                host_experts_from: (from < total_layers).then_some(from),
+            })
+        })
+    }
+
     /// Like `calculate_with_kv`, but reserves `gpu_runtime_reserve_bytes` of
     /// non-weight headroom on every CUDA device before placing layers. This is
     /// the cuBLAS handle/workspace + chunked-prefill activation peak that isn't
@@ -314,6 +395,7 @@ impl HeteroPlan {
                 return HeteroPlan {
                     segments,
                     total_layers,
+                    host_experts_from: None,
                 };
             }
         }
@@ -586,6 +668,7 @@ impl HeteroPlan {
         HeteroPlan {
             segments,
             total_layers,
+            host_experts_from: None,
         }
     }
 
@@ -626,6 +709,7 @@ impl HeteroPlan {
         HeteroPlan {
             segments,
             total_layers,
+            host_experts_from: None,
         }
     }
 
@@ -685,6 +769,7 @@ impl HeteroPlan {
             return HeteroPlan {
                 segments: Vec::new(),
                 total_layers,
+                host_experts_from: None,
             };
         }
         let mut devs: Vec<(usize, u64, u64)> = cuda_devices
@@ -754,6 +839,7 @@ impl HeteroPlan {
         HeteroPlan {
             segments,
             total_layers,
+            host_experts_from: None,
         }
     }
 }
@@ -796,6 +882,38 @@ mod tests {
 
     fn gb(n: u64) -> u64 {
         n * 1024 * 1024 * 1024
+    }
+
+    /// A mixture that fits the cards only without some experts keeps every layer on a card
+    /// and sends the experts of the last layers, as few as needed, to the host.
+    #[test]
+    fn host_experts_leave_every_layer_on_a_card() {
+        const GB: u64 = 1_000_000_000;
+        // Eight layers of 0.1 GB dense and 1 GB of experts, and a 1 GB head, over two 5 GB
+        // cards.
+        let layers = vec![(GB / 10, GB); 8];
+        let plan =
+            HeteroPlan::calculate_host_experts(&layers, GB, &[(0, 5 * GB), (1, 5 * GB)], 0, 0)
+                .expect("the dense parts fit");
+        assert!(plan
+            .segments
+            .iter()
+            .all(|s| matches!(s.kind, DeviceKind::Cuda(_))));
+        let placed: usize = plan.segments.iter().map(|s| s.num_layers()).sum();
+        assert_eq!(placed, 8);
+        // The head leaves room for three whole layers beside it on the second card; the
+        // last layer's experts go to the host.
+        assert_eq!(plan.host_experts_from, Some(7));
+        // Dense parts too large for the cards: no such plan.
+        let heavy = vec![(3 * GB, GB); 8];
+        assert!(
+            HeteroPlan::calculate_host_experts(&heavy, 0, &[(0, 5 * GB), (1, 5 * GB)], 0, 0)
+                .is_none()
+        );
+        // A model that fits whole keeps its experts with its layers.
+        let small = vec![(GB / 10, GB / 10); 8];
+        let whole = HeteroPlan::calculate_host_experts(&small, 0, &[(0, 5 * GB)], 0, 0).unwrap();
+        assert_eq!(whole.host_experts_from, None);
     }
 
     #[test]

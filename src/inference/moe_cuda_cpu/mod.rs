@@ -85,6 +85,10 @@ pub fn clear_expert_cache() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    read_in_place_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
     {
         repack_q4k_cache()
@@ -140,9 +144,16 @@ fn repacked_q4k(
     e_count: usize,
     n: usize,
     bpr: usize,
-) -> Result<Arc<Vec<Q4Kx8>>> {
+) -> Result<Option<Arc<Vec<Q4Kx8>>>> {
     use crate::tensor::quant_cpu::{repack_q4k, BlockQ4K};
     let key = weights.id();
+    if read_in_place_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key)
+    {
+        return Ok(None);
+    }
     let cell = repack_q4k_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -151,7 +162,7 @@ fn repacked_q4k(
         .clone();
     let mut slot = cell.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(a) = slot.as_ref() {
-        return Ok(a.clone());
+        return Ok(Some(a.clone()));
     }
     let d = weights.data()?;
     let blocks: &[BlockQ4K] = unsafe {
@@ -170,7 +181,7 @@ fn repacked_q4k(
     }
     let a = Arc::new(out);
     *slot = Some(a.clone());
-    Ok(a)
+    Ok(Some(a))
 }
 
 /// Get-or-build the repacked `[E][hidden/8][bpr]` Q6_K stack for `weights`.
@@ -180,9 +191,16 @@ fn repacked_q6k(
     e_count: usize,
     n: usize,
     bpr: usize,
-) -> Result<Arc<Vec<Q6Kx8>>> {
+) -> Result<Option<Arc<Vec<Q6Kx8>>>> {
     use crate::tensor::quant_cpu::{repack_q6k, BlockQ6K};
     let key = weights.id();
+    if read_in_place_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key)
+    {
+        return Ok(None);
+    }
     let cell = repack_q6k_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -191,7 +209,7 @@ fn repacked_q6k(
         .clone();
     let mut slot = cell.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(a) = slot.as_ref() {
-        return Ok(a.clone());
+        return Ok(Some(a.clone()));
     }
     let d = weights.data()?;
     let blocks: &[BlockQ6K] = unsafe {
@@ -210,7 +228,23 @@ fn repacked_q6k(
     }
     let a = Arc::new(out);
     *slot = Some(a.clone());
-    Ok(a)
+    Ok(Some(a))
+}
+
+/// Stacks the host expert loop reads where they are, never through a repacked copy: the
+/// copy is as large as the stack, and a stack kept in host memory beside a card-resident
+/// layer is there because the host has no room for a second one.
+fn read_in_place_ids() -> &'static Mutex<std::collections::HashSet<u64>> {
+    static S: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Marks `weights` to be read in place by the host expert loop (see `read_in_place_ids`).
+pub fn read_in_place(weights: &Arc<QTensor>) {
+    read_in_place_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(weights.id());
 }
 
 /// Build the repack of one expert stack ahead of the request that would otherwise build it.
@@ -542,8 +576,14 @@ fn fused_gate_up_silu_q4k_tiled(
     let bpr = k / 256;
     let e_count = gate_weights.shape().dims()[0];
     let gsz = (n / 8) * bpr; // repacked blocks per expert
-    let gate_all = repacked_q4k(gate_weights, e_count, n, bpr)?;
-    let up_all = repacked_q4k(up_weights, e_count, n, bpr)?;
+    let gate_all = match repacked_q4k(gate_weights, e_count, n, bpr)? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    let up_all = match repacked_q4k(up_weights, e_count, n, bpr)? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
     // Quantize each token's activation ONCE (identical to fused_gate_up_silu_t).
     let xs = input.to_dtype(DType::F32)?.contiguous()?.to_vec2::<f32>()?;
     let xq: Vec<Vec<BlockQ8K>> = xs
@@ -627,8 +667,14 @@ fn fused_gate_up_silu_q4k_gemv_v2(
     let bpr = k / 256;
     let e_count = gate_weights.shape().dims()[0];
     let gsz = (n / 8) * bpr;
-    let gate_all = repacked_q4k(gate_weights, e_count, n, bpr)?;
-    let up_all = repacked_q4k(up_weights, e_count, n, bpr)?;
+    let gate_all = match repacked_q4k(gate_weights, e_count, n, bpr)? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    let up_all = match repacked_q4k(up_weights, e_count, n, bpr)? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
     let xs = input.to_dtype(DType::F32)?.contiguous()?.to_vec2::<f32>()?;
     let xq: Vec<Vec<BlockQ8K>> = xs
         .iter()
@@ -700,7 +746,10 @@ fn fused_gate_up_silu_fused_q4k_gemv_v2(
     let bpr = k / 256;
     let e_count = gate_up_weights.shape().dims()[0];
     let esz = (2 * n / 8) * bpr;
-    let all = repacked_q4k(gate_up_weights, e_count, 2 * n, bpr)?;
+    let all = match repacked_q4k(gate_up_weights, e_count, 2 * n, bpr)? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
     let xs = input.to_dtype(DType::F32)?.contiguous()?.to_vec2::<f32>()?;
     let xq: Vec<Vec<BlockQ8K>> = xs
         .iter()
@@ -1423,7 +1472,10 @@ fn fused_down_reduce_q6k_tiled(
     let bpr = k / 256;
     let e_count = weights.shape().dims()[0];
     let gsz = (hidden / 8) * bpr;
-    let down_all = repacked_q6k(weights, e_count, hidden, bpr)?;
+    let down_all = match repacked_q6k(weights, e_count, hidden, bpr)? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
     // Quantize each slot's GLU row ONCE (identical to fused_down_reduce_t).
     let hs = input.to_dtype(DType::F32)?.contiguous()?.to_vec2::<f32>()?;
     let hq: Vec<Vec<BlockQ8K>> = hs
@@ -1514,7 +1566,10 @@ fn fused_down_reduce_q4k_tiled(
     let bpr = k / 256;
     let e_count = weights.shape().dims()[0];
     let gsz = (hidden / 8) * bpr;
-    let down_all = repacked_q4k(weights, e_count, hidden, bpr)?;
+    let down_all = match repacked_q4k(weights, e_count, hidden, bpr)? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
     let hs = input.to_dtype(DType::F32)?.contiguous()?.to_vec2::<f32>()?;
     let hq: Vec<Vec<BlockQ8K>> = hs
         .iter()
@@ -1610,7 +1665,10 @@ fn fused_down_reduce_q6k_gemv(
     let bpr = k / 256;
     let e_count = weights.shape().dims()[0];
     let gsz = (hidden / 8) * bpr;
-    let down_all = repacked_q6k(weights, e_count, hidden, bpr)?;
+    let down_all = match repacked_q6k(weights, e_count, hidden, bpr)? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
     let hs = input.to_dtype(DType::F32)?.contiguous()?.to_vec2::<f32>()?;
     let hq: Vec<Vec<BlockQ8K>> = hs
         .iter()
@@ -1687,7 +1745,10 @@ fn fused_down_reduce_q4k_gemv_v2(
     let bpr = k / 256;
     let e_count = weights.shape().dims()[0];
     let gsz = (hidden / 8) * bpr;
-    let down_all = repacked_q4k(weights, e_count, hidden, bpr)?;
+    let down_all = match repacked_q4k(weights, e_count, hidden, bpr)? {
+        Some(a) => a,
+        None => return Ok(None),
+    };
     let hs = input.to_dtype(DType::F32)?.contiguous()?.to_vec2::<f32>()?;
     let hq: Vec<Vec<BlockQ8K>> = hs
         .iter()

@@ -786,6 +786,9 @@ fn build_generic_layer(
         device: &Device,
     ) -> Result<crate::tensor::quantized::QTensor> {
         use crate::tensor::quantized::GgmlDType;
+        // A stack the plan keeps in host memory stays there whatever device its layer runs on.
+        let home = qt.device().clone();
+        let device = if home.runs_as_card() { device } else { &home };
         // MXFP4 stacks are read in their own format by the expert kernels, and so is every
         // format those kernels serve on a card: a requantised copy is larger than the plan
         // counted and is built through a host F32 copy of the whole stack.
@@ -2356,6 +2359,17 @@ impl GenericHeteroTransformer {
                     try_read_tensor(ti, mmap_bytes, tdo, $name, weight_dev, mmap_owner)
                 };
             }
+            // Routed expert stacks: in host memory for a layer the plan keeps its experts
+            // there, else with the layer.
+            let expert_dev = match plan.host_experts_from {
+                Some(from) if idx >= from => &Device::Cpu,
+                _ => weight_dev,
+            };
+            macro_rules! opt_exp {
+                ($name:expr) => {
+                    try_read_tensor(ti, mmap_bytes, tdo, $name, expert_dev, mmap_owner)
+                };
+            }
             let ple_inp_gate = opt_dev!(&format!("{prefix}.inp_gate.weight"))?;
             let ple_proj = opt_dev!(&format!("{prefix}.proj.weight"))?;
             let ple_post_norm_qt = opt_cpu!(&format!("{prefix}.post_norm.weight"))?;
@@ -2373,12 +2387,12 @@ impl GenericHeteroTransformer {
                 None
             };
             let moe_gate_up_exps = if f.is_moe {
-                opt_dev!(&format!("{prefix}.ffn_gate_up_exps.weight"))?
+                opt_exp!(&format!("{prefix}.ffn_gate_up_exps.weight"))?
             } else {
                 None
             };
             let moe_down_exps = if f.is_moe {
-                opt_dev!(&format!("{prefix}.ffn_down_exps.weight"))?
+                opt_exp!(&format!("{prefix}.ffn_down_exps.weight"))?
             } else {
                 None
             };
@@ -2390,12 +2404,12 @@ impl GenericHeteroTransformer {
             // granitemoe/standard MoE: SEPARATE gate & up experts (gemma4 fuses
             // them into ffn_gate_up_exps, read above -> None here).
             let moe_gate_exps = if f.is_moe {
-                opt_dev!(&format!("{prefix}.ffn_gate_exps.weight"))?
+                opt_exp!(&format!("{prefix}.ffn_gate_exps.weight"))?
             } else {
                 None
             };
             let moe_up_exps = if f.is_moe {
-                opt_dev!(&format!("{prefix}.ffn_up_exps.weight"))?
+                opt_exp!(&format!("{prefix}.ffn_up_exps.weight"))?
             } else {
                 None
             };
@@ -2869,6 +2883,24 @@ impl GenericHeteroTransformer {
         // answers exactly as early as before, and a request that arrives while it is still
         // running waits on the stack being built and is handed that result rather than
         // repacking the same stack beside it. A layer on a card never reads that layout.
+        // A layer on a card whose routed experts the plan left in host memory reads them in
+        // place: the host holds them because it has no room for a repacked second copy.
+        {
+            #[cfg(feature = "cuda")]
+            use crate::inference::moe_cpu as host_moe;
+            #[cfg(not(feature = "cuda"))]
+            use crate::inference::moe_cuda as host_moe;
+            for (layer, dev) in model.layers.iter().zip(model.layer_devs.iter()) {
+                let Some(moe) = layer.moe.as_ref().filter(|m| m.experts_on_host()) else {
+                    continue;
+                };
+                if matches!(dev, LayerDevice::Cuda(_)) {
+                    for stack in moe.host_prefill_stacks() {
+                        host_moe::read_in_place(&stack);
+                    }
+                }
+            }
+        }
         let host_prefill_stacks: Vec<_> = model
             .layers
             .iter()

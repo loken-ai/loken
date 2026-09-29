@@ -1530,6 +1530,7 @@ impl HeteroFlux {
                     free_memory_bytes: 0,
                 }],
                 total_layers: total_blocks,
+                host_experts_from: None,
             },
             primary_device: device,
             cfg: cfg.clone(),

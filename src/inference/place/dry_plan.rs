@@ -119,6 +119,7 @@ pub fn whole_on(total_layers: usize, idx: usize, free: u64) -> HeteroPlan {
             free_memory_bytes: free,
         }],
         total_layers,
+        host_experts_from: None,
     }
 }
 
@@ -176,6 +177,7 @@ fn segments_from(counts: &[usize], cards: &[(usize, u64)], total_layers: usize) 
     HeteroPlan {
         segments,
         total_layers,
+        host_experts_from: None,
     }
 }
 
@@ -240,7 +242,8 @@ fn reapportion(
 
 /// Two placements that put the same blocks on the same devices.
 pub fn same_plan(a: &HeteroPlan, b: &HeteroPlan) -> bool {
-    a.segments.len() == b.segments.len()
+    a.host_experts_from == b.host_experts_from
+        && a.segments.len() == b.segments.len()
         && a.segments.iter().zip(b.segments.iter()).all(|(x, y)| {
             x.kind == y.kind && x.layer_start == y.layer_start && x.layer_end == y.layer_end
         })

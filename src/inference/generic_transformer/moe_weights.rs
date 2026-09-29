@@ -378,6 +378,12 @@ pub struct MoeWeights {
 }
 
 impl MoeWeights {
+    /// Whether the routed expert stacks sit in host memory, where the expert loop then runs
+    /// whatever device the rest of the layer is on.
+    pub fn experts_on_host(&self) -> bool {
+        !self.down_exps.device().runs_as_card()
+    }
+
     /// The expert stacks this layer's prefill reads on the host, if its prefill goes there.
     ///
     /// The host expert loop reads its weights through a repacked layout it builds on first
@@ -555,8 +561,8 @@ impl MoeWeights {
             std::time::Instant::now()
         });
         // -- Softmax + top-K.
-        // One kernel scores and selects for the expert widths it covers (gemma4-26B routes
-        // over 128); every other width, and every build compiled without kernels, takes the
+        // One kernel scores and selects for the expert widths it covers, 32 to 512; every
+        // other width, and every build compiled without kernels, takes the
         // two steps as tensor ops. Which of the two ran is what the stage profile records.
         #[cfg(feature = "cuda")]
         let (topk_weights, topk_ids) = if let Some(sigmoid) = self.sigmoid_routing.as_ref() {
@@ -623,7 +629,7 @@ impl MoeWeights {
         // SLOT, and it dropped every expert past the fourth in a tile of eight. Neither was
         // caught, because that kernel had no parity test - it has one now, and the host detour
         // it justified cost about eight times the prefill.
-        let on_cpu = !xs.device().runs_as_card();
+        let on_cpu = !xs.device().runs_as_card() || self.experts_on_host();
         let expert_rows = if self.up_relu2 {
             self.forward_up_relu2(&xs, &topk_ids, &topk_weights_scaled, num_tokens)?
         } else if on_cpu {

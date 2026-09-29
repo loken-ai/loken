@@ -111,7 +111,7 @@ impl Case {
 /// answers come out of the same statements in the same order.
 fn twophase<B: Sync>(
     case: &Case,
-    repacked: fn(&Arc<QTensor>, usize, usize, usize) -> Result<Arc<Vec<B>>>,
+    repacked: fn(&Arc<QTensor>, usize, usize, usize) -> Result<Option<Arc<Vec<B>>>>,
     gemm_group: unsafe fn(&[B], &[&[BlockQ8K]], usize, &mut [f32]),
 ) -> Tensor {
     let (hidden, k, topk) = (case.hidden, case.k, case.topk);
@@ -121,7 +121,9 @@ fn twophase<B: Sync>(
     let bpr = k / 256;
     let e_count = case.weights.shape().dims()[0];
     let gsz = (hidden / 8) * bpr;
-    let down_all = repacked(&case.weights, e_count, hidden, bpr).unwrap();
+    let down_all = repacked(&case.weights, e_count, hidden, bpr)
+        .unwrap()
+        .expect("a stack not read in place is repacked");
     let hs = case
         .input
         .to_dtype(DType::F32)

@@ -395,6 +395,14 @@ impl GenericHeteroTransformer {
         if has_cpu_layer {
             return Err("some layers are on the CPU");
         }
+        // A layer whose routed experts sit in host memory stops the stream for them.
+        if self
+            .layers
+            .iter()
+            .any(|l| l.moe.as_ref().is_some_and(|m| m.experts_on_host()))
+        {
+            return Err("some routed experts are in host memory");
+        }
         // The captured decode computes the logits on the card of the last layer. An output
         // projection left elsewhere, on another card or on the host because that card had no
         // room, takes the eager path, which moves the hidden state to it.
