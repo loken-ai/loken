@@ -68,12 +68,20 @@ pub(crate) fn serves_speech(node: &NodeState, requested: &str) -> bool {
 /// naming none asks for the default one.
 pub(crate) fn transcription_entry_matches(entry: &str, requested: &str) -> bool {
     let requested = requested.trim();
-    let requested = if requested.is_empty() {
-        crate::inference::engine::audio_engine::resolve_whisper_model_id(None)
-    } else {
-        requested.to_string()
-    };
-    entry_named(entry, &requested)
+    if !requested.is_empty() {
+        return entry_named(entry, requested);
+    }
+    #[cfg(feature = "audio")]
+    {
+        entry_named(
+            entry,
+            &crate::inference::engine::audio_engine::resolve_whisper_model_id(None),
+        )
+    }
+    #[cfg(not(feature = "audio"))]
+    {
+        false
+    }
 }
 
 pub(crate) fn serves_transcription(node: &NodeState, requested: &str) -> bool {
@@ -199,7 +207,12 @@ mod tests {
             "openai/whisper-small",
             "whisper-1"
         ));
+        // A request that names no checkpoint asks for the default one, which a build without
+        // audio does not have.
+        #[cfg(feature = "audio")]
         assert!(transcription_entry_matches("openai/whisper-small", ""));
+        #[cfg(not(feature = "audio"))]
+        assert!(!transcription_entry_matches("openai/whisper-small", ""));
         assert!(!transcription_entry_matches(
             "Systran/faster-whisper-small",
             ""
