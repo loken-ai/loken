@@ -143,7 +143,7 @@ cuda_launchers! {
         input: *const f32, weights: *const c_void, sorted_token_ids: *const i32,
         expert_ids: *const i32, topk_weights: *const f32, output: *mut f32, num_experts: i32,
         topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32,
-        down_bias: *const f32);
+        down_bias: *const f32, add_after: *const f32);
 }
 cuda_launchers! {
     loken_moe_q4k_imma_m8_gate_up(

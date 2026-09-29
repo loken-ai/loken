@@ -135,8 +135,9 @@ impl ExpertRouting {
         n_tokens: usize,
         imma: bool,
         bias: Option<&Tensor>,
+        add_after: Option<&Tensor>,
     ) -> Result<Tensor> {
-        if imma && bias.is_none() {
+        if imma && bias.is_none() && add_after.is_none() {
             crate::inference::moe_cuda::moe_q4k_imma_m8_down_reduce(
                 rows,
                 stack,
@@ -158,6 +159,7 @@ impl ExpertRouting {
                 n_tokens,
                 None,
                 bias,
+                add_after,
             )
         }
     }
@@ -466,6 +468,56 @@ impl MoeWeights {
         rms_eps: f32,
         is_prefill: bool,
     ) -> Result<Tensor> {
+        self.forward_with(
+            moe_in_pre_norm_2,
+            attn_out,
+            n_embd,
+            rms_eps,
+            is_prefill,
+            None,
+        )
+    }
+
+    /// Whether [`Self::forward_folding`] can join `residual` to the block's output inside the
+    /// last launch: one decoded token on a card, the experts on it too, in F32 throughout, and
+    /// nothing added to the expert rows between the fold and the residual.
+    pub(super) fn can_fold_residual(&self, moe_in: &Tensor, residual: &Tensor) -> bool {
+        use crate::tensor::DType::F32;
+        moe_in.dtype() == F32
+            && residual.dtype() == F32
+            && residual.is_contiguous()
+            && moe_in.dims().len() == 3
+            && moe_in.dims()[..2] == [1, 1]
+            && residual.elem_count() == moe_in.elem_count()
+            && moe_in.device().runs_as_card()
+            && !self.experts_on_host()
+            && !self.up_relu2
+            && self.shared_expert.is_none()
+            && self.decode_slots.is_some()
+    }
+
+    /// [`Self::forward_rows`] for a single token, its output already added to `residual`
+    /// (`can_fold_residual` says when that is possible).
+    pub(super) fn forward_folding(
+        &self,
+        moe_in: &Tensor,
+        attn_out: &Tensor,
+        n_embd: usize,
+        rms_eps: f32,
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        self.forward_with(moe_in, attn_out, n_embd, rms_eps, false, Some(residual))
+    }
+
+    fn forward_with(
+        &self,
+        moe_in_pre_norm_2: &Tensor,
+        attn_out: &Tensor,
+        n_embd: usize,
+        rms_eps: f32,
+        is_prefill: bool,
+        add_after: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (batch, seq_len, hidden_dim) = moe_in_pre_norm_2.dims3()?;
         let xs =
             moe_in_pre_norm_2.reshape((moe_in_pre_norm_2.elem_count() / hidden_dim, hidden_dim))?;
@@ -639,6 +691,11 @@ impl MoeWeights {
         // caught, because that kernel had no parity test - it has one now, and the host detour
         // it justified cost about eight times the prefill.
         let on_cpu = !xs.device().runs_as_card() || self.experts_on_host();
+        if add_after.is_some()
+            && (self.up_relu2 || on_cpu || self.shared_expert.is_some() || num_tokens != 1)
+        {
+            crate::tensor::bail!("MoeWeights: this layer cannot fold a residual into its fold");
+        }
         let expert_rows = if self.up_relu2 {
             self.forward_up_relu2(&xs, &topk_ids, &topk_weights_scaled, num_tokens)?
         } else if on_cpu {
@@ -651,6 +708,7 @@ impl MoeWeights {
                 num_tokens,
                 is_prefill,
                 t_route,
+                add_after,
             )?
         };
         // Back to the block's own device, width and dtype. The host expert path answers on
@@ -708,6 +766,7 @@ impl MoeWeights {
                 num_tokens,
                 false,
                 None,
+                None,
             );
         }
         let host = Device::Cpu;
@@ -761,6 +820,7 @@ impl MoeWeights {
         num_tokens: usize,
         is_prefill: bool,
         t_route: Option<std::time::Instant>,
+        add_after: Option<&Tensor>,
     ) -> Result<Tensor> {
         let note_route = || {
             if let Some(t) = t_route {
@@ -775,6 +835,9 @@ impl MoeWeights {
             false => None,
         };
         if let Some(plan) = batched {
+            if add_after.is_some() {
+                crate::tensor::bail!("MoeWeights: the batched path does not fold a residual");
+            }
             note_route();
             return self.batched_experts(xs, &plan, topk_weights);
         }
@@ -888,6 +951,7 @@ impl MoeWeights {
             num_tokens,
             down_use_imma_m8,
             self.down_exps_bias.as_ref(),
+            add_after,
         );
         if let Some(t) = t_dn {
             let _ = xs.device().synchronize();
@@ -989,6 +1053,7 @@ impl MoeWeights {
         _nt: usize,
         _ip: bool,
         _t_route: Option<std::time::Instant>,
+        _add_after: Option<&Tensor>,
     ) -> Result<Tensor> {
         crate::tensor::bail!("CUDA path not compiled in")
     }

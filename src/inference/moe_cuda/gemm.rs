@@ -417,6 +417,7 @@ pub fn moe_gemm_gguf_down_reduce(
     n_real_tokens: usize,
     residual: Option<&Tensor>,
     down_bias: Option<&Tensor>,
+    add_after: Option<&Tensor>,
 ) -> Result<Tensor> {
     const ENTRY: &str = "down_reduce";
     if input.dtype() != DType::F32 {
@@ -490,7 +491,27 @@ pub fn moe_gemm_gguf_down_reduce(
             }
             alloc
         }
+        // Written whole by the fold when a tensor is joined after it, so it needs no fill.
+        None if add_after.is_some() => unsafe { dev.alloc::<f32>(out_count) }?,
         None => dev.alloc_zeros::<f32>(out_count)?,
+    };
+    // Its address, read from where the view starts.
+    let add_addr = match add_after {
+        Some(a) => {
+            if residual.is_some()
+                || a.dtype() != DType::F32
+                || a.elem_count() != out_count
+                || !a.is_contiguous()
+            {
+                crate::tensor::bail!(
+                    "{ENTRY}: add_after must be a lone contiguous F32 tensor of the output's size"
+                );
+            }
+            let (_, layout) = a.storage_and_layout();
+            dev_addr::<f32>(a, "add_after")?
+                + (layout.start_offset() * std::mem::size_of::<f32>()) as u64
+        }
+        None => 0,
     };
     // Per-expert down bias [num_experts, size_n] F32: folded into each routed row
     // (Σ_slot w.db) - replaces an index_select+broadcast_mul+sum+add
@@ -523,6 +544,7 @@ pub fn moe_gemm_gguf_down_reduce(
             ext.k,
             gguf_dtype,
             down_bias_ptr,
+            add_addr as *const f32,
             stream,
         );
     }

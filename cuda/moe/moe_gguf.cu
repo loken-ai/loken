@@ -468,7 +468,14 @@ __global__ void loken_moe_gemm_gguf_down_reduce_kernel(
     if (slot.row0 >= dims.cols || slot.pair >= dims.pairs) return;
 
     const routed_pair routed = read_routing(sorted_token_ids, expert_ids, slot.pair);
-    if (routed.expert < 0 || routed.expert >= dims.experts) return;
+    if (routed.expert < 0 || routed.expert >= dims.experts) {
+        // A pair the routing leaves out adds nothing. Its row is written zero, so the
+        // reduction never reads what an earlier launch left in the scratch.
+        if (slot.lane == 0 && routed.token >= 0 && routed.token < dims.pairs) {
+            output_row(all_outputs, routed.token, dims.cols)[slot.row0] = 0.0f;
+        }
+        return;
+    }
 
     const float scale = topk_weights[routed.token];
 
@@ -517,6 +524,23 @@ __global__ void loken_moe_sum_topk_kernel(
         acc += pairs[(token * topk + k) * cols + col];
     }
     outputs[i] = acc;
+}
+
+// The same fold with `add` joined after it: `outputs = (the routed rows summed in slot order)
+// + add`, written rather than accumulated, so the destination needs no prior fill.
+__global__ void loken_moe_sum_topk_add_kernel(
+    const float * __restrict__ pairs, const float * __restrict__ add,
+    float * __restrict__ outputs, int tokens, int topk, int cols
+) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)tokens * cols) return;
+    const size_t token = i / cols;
+    const size_t col = i % cols;
+    float acc = 0.0f;
+    for (int k = 0; k < topk; ++k) {
+        acc += pairs[(token * topk + k) * cols + col];
+    }
+    outputs[i] = acc + add[i];
 }
 
 } // namespace loken_moe
@@ -568,15 +592,18 @@ extern "C" void loken_moe_sum_topk(const float* pairs, float* outputs, int token
         pairs, outputs, tokens, topk, cols);
 }
 
+// `add_after`, when given, is joined to each token's folded row and `outputs` is written
+// whole; without it `outputs` must be pre-filled and receives the fold added onto it.
 extern "C" void loken_moe_gemm_gguf_down_reduce(
     const float* inputs,            // [M*topk, K] f32
     const void*  weights,           // [num_experts, N, K] quantized
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
     const float* topk_weights,      // [M*topk] f32 - required (not optional)
-    float* outputs,                 // [num_real_tokens, N] f32 - caller MUST pre-fill
+    float* outputs,                 // [num_real_tokens, N] f32 - pre-filled unless `add_after`
     int num_experts, int topk, int size_m, int size_n, int size_k,
     int quant_type,                 // the weight format, numbered as `MOE_GGUF_FORMATS` does
     const float* down_bias,         // [num_experts, size_n] F32, or nullptr
+    const float* add_after,         // [num_real_tokens, N] F32 joined after the fold, or nullptr
     cudaStream_t stream
 ) {
     const int kx_padded = pad_to(size_k, MATRIX_ROW_PADDING);
@@ -593,8 +620,9 @@ extern "C" void loken_moe_gemm_gguf_down_reduce(
         const dim3 block(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
         quantize_q8_1<<<grid, block, 0, stream>>>(inputs, y_q8_1, size_k, kx_padded);
     }
+    // Every routed row is written by the kernel below, a left-out pair as zeros, so the scratch
+    // needs no clearing first.
     float* pairs = (float*)((char*)(void*)y_q8_1 + act_bytes);
-    cudaMemsetAsync(pairs, 0, pair_bytes, stream);
     float* reduced = outputs;
     outputs = pairs;
 
@@ -614,7 +642,14 @@ extern "C" void loken_moe_gemm_gguf_down_reduce(
 #undef MOE_CASE
         default: break;
     }
-    loken_moe_sum_topk(pairs, reduced, size_m / topk, topk, size_n, stream);
+    if (add_after) {
+        const int threads = 256;
+        const int blocks = ceil_div((size_m / topk) * size_n, threads);
+        loken_moe::loken_moe_sum_topk_add_kernel<<<blocks, threads, 0, stream>>>(
+            pairs, add_after, reduced, size_m / topk, topk, size_n);
+    } else {
+        loken_moe_sum_topk(pairs, reduced, size_m / topk, topk, size_n, stream);
+    }
 }
 
 // ------------------------------------------------------------

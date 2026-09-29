@@ -387,7 +387,10 @@ fn the_expert_offsets_are_where_the_host_says_they_are() {
 /// to 8 bits, so they agree to a few thousandths of the largest output.
 #[test]
 fn the_card_and_host_down_reductions_agree() {
-    let Some(card) = crate::tensor::cuda::CudaDevice::new(0).ok().map(Device::Cuda) else {
+    let Some(card) = crate::tensor::cuda::CudaDevice::new(0)
+        .ok()
+        .map(Device::Cuda)
+    else {
         eprintln!("no CUDA device; the card down reduction is NOT covered by this run");
         return;
     };
@@ -446,20 +449,31 @@ fn the_card_and_host_down_reductions_agree() {
                 n_tokens,
                 None,
                 None,
+                None,
             )
             .unwrap()
             .to_device(&host)
             .unwrap();
             // The float answer over the dequantised weights: each sorted pair's row times its
             // expert, scaled by its weight and added to its token.
-            let w = on_host.dequantize(&host).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let w = on_host
+                .dequantize(&host)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
             let x = input.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             let mut want = vec![0f32; n_tokens * hidden];
             for j in 0..m {
                 let (pair, e) = (sti[j] as usize, eid[j] as usize);
                 for r in 0..hidden {
                     let row = &w[(e * hidden + r) * k..(e * hidden + r + 1) * k];
-                    let dot: f32 = row.iter().zip(&x[j * k..(j + 1) * k]).map(|(a, b)| a * b).sum();
+                    let dot: f32 = row
+                        .iter()
+                        .zip(&x[j * k..(j + 1) * k])
+                        .map(|(a, b)| a * b)
+                        .sum();
                     want[(pair / topk) * hidden + r] += tw[pair] * dot;
                 }
             }

@@ -1801,17 +1801,32 @@ impl GenericTransformerLayer {
 
             let residual_ffn = &x;
             let has_moe = self.moe.is_some();
+            // Set when the expert block's last launch already added the residual.
+            let mut residual_folded = false;
             let combined = if has_moe {
                 let moe_ref = self.moe.as_ref().unwrap();
                 if moe_ref.router_prenormed {
                     // Standard MoE (granitemoe): router + experts both read the single
                     // ffn_norm'd hidden; no dense shared FFN, no gemma4 sandwich norms.
-                    let mut m = moe_ref.forward_rows(
-                        &x_norm_ffn,
-                        residual_ffn,
-                        self.embedding_length_for_moe,
-                        self.ffn_norm_eps,
-                    )?;
+                    residual_folded = rs.is_none()
+                        && self.post_ffn_norm.is_none()
+                        && moe_ref.can_fold_residual(&x_norm_ffn, residual_ffn);
+                    let mut m = if residual_folded {
+                        moe_ref.forward_folding(
+                            &x_norm_ffn,
+                            residual_ffn,
+                            self.embedding_length_for_moe,
+                            self.ffn_norm_eps,
+                            residual_ffn,
+                        )?
+                    } else {
+                        moe_ref.forward_rows(
+                            &x_norm_ffn,
+                            residual_ffn,
+                            self.embedding_length_for_moe,
+                            self.ffn_norm_eps,
+                        )?
+                    };
                     // Granite scales the MoE/FFN output by residual_multiplier before
                     // the residual add (same as the dense else-branch below).
                     if let Some(s) = rs {
@@ -1908,6 +1923,8 @@ impl GenericTransformerLayer {
                     let _ = is_decode;
                     (post_norm.forward(&combined)? + residual_ffn)?
                 }
+            } else if residual_folded {
+                combined
             } else {
                 (combined + residual_ffn)?
             };

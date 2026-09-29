@@ -213,6 +213,7 @@ impl Block {
                 self.tokens,
                 None,
                 None,
+                None,
             )
             .unwrap(),
         )
@@ -353,6 +354,7 @@ fn the_expert_batched_swiglu_oai_block_agrees_with_the_decode_kernels() {
                     tokens,
                     None,
                     Some(&db),
+                    None,
                 )
                 .unwrap(),
             );
@@ -447,6 +449,7 @@ fn expert_batched_matmul_timings() {
             let dec_dn = time(&|| {
                 super::gemm::moe_gemm_gguf_down_reduce(
                     &h_dec, &b.down, &b.slots, &b.experts, &b.weights, topk, tokens, None, None,
+                    None,
                 )
                 .unwrap();
             });
