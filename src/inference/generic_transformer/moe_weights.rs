@@ -565,7 +565,7 @@ impl MoeWeights {
             let fused = logits_f32.device().is_cuda()
                 && matches!(
                     logits_f32.dim(crate::tensor::D::Minus1)?,
-                    32 | 64 | 128 | 256
+                    32 | 64 | 128 | 256 | 512
                 );
             crate::inference::place::layer_perf::stages::note_topk_path(fused);
             if fused {

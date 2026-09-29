@@ -22,7 +22,7 @@ pub fn topk_softmax(
     let n_experts = dims[1];
     if !matches!(n_experts, 32 | 64 | 128 | 256 | 512) {
         crate::tensor::bail!(
-            "topk_softmax only supports n_experts ∈ {{32, 64, 128, 256}}; got {}",
+            "topk_softmax only supports n_experts ∈ {{32, 64, 128, 256, 512}}; got {}",
             n_experts
         );
     }
