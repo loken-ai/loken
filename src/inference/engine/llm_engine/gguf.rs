@@ -277,6 +277,8 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
     // What the file's pre-tokenizer name means, as the reference defines each type: the split
     // regex, whether merges give way to a greedy longest-vocab match, and whether a BOS leads
     // every sequence when the file does not say.
+    // ARCH-NAME-EXEMPT: translates the file's tokenizer.ggml.pre identifier, a tokenizer
+    // format name that some architectures share their spelling with.
     let (pre_family, ignore_merges, pre_adds_bos) = match pre_id.as_str() {
         // LLAMA_VOCAB_PRE_TYPE_LLAMA3
         "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral" | "midm-2.0"

@@ -1217,6 +1217,7 @@ impl StdRng {
 // Whisper supported language codes (subset - full list lives in the reference's
 // example but isn't pub-exported). Matches the BCP-47 codes the tokenizer
 // has language tokens for.
+// ARCH-NAME-EXEMPT: language codes, among them `yi` for Yiddish.
 const WHISPER_LANGS: &[&str] = &[
     "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv", "it",
     "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no", "th", "ur",

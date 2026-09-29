@@ -4,6 +4,8 @@
 //! Callers name a module through this directory - `crate::inference::place::<module>` - so the path says which
 //! part of the system a file belongs to, which is the whole reason the directory exists.
 
+#[cfg(all(test, feature = "image"))]
+mod architecture_invariants;
 pub mod audio_demand;
 pub mod device_probe;
 pub mod dry_plan;

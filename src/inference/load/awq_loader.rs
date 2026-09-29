@@ -43,6 +43,8 @@ pub struct AwqConfigJson {
 
 /// Map an HF `architectures[0]` to the engine's GGUF arch tag.
 pub fn map_hf_arch(hf: &str) -> Result<&'static str> {
+    // ARCH-NAME-EXEMPT: translates the checkpoint's HF `architectures` class into the tag
+    // the synthesised header is written with.
     Ok(match hf {
         "Qwen2ForCausalLM" => "qwen2",
         "Qwen3ForCausalLM" => "qwen3",
