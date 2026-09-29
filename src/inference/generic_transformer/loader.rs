@@ -897,13 +897,15 @@ fn build_generic_layer(
         let down_exps_scale = match raw.moe_down_exps_scale_qt {
             Some(qt) => {
                 let t = qt.dequantize(&Device::Cpu)?;
-                if on_gpu {
-                    t.to_device(device)?
-                } else {
-                    t
-                }
+                Some(if on_gpu { t.to_device(device)? } else { t })
             }
-            None => Tensor::ones(flags.n_experts, crate::tensor::DType::F32, device)?,
+            None => None,
+        };
+        let decode_slots = if on_gpu {
+            let ids: Vec<u32> = (0..flags.n_experts_used as u32).collect();
+            Some(Tensor::from_vec(ids, (flags.n_experts_used,), &Device::Cpu)?.to_device(device)?)
+        } else {
+            None
         };
         let des = coerce_moe_weight(des, device)?;
         // CPU layers: pre-dequantize the expert stacks once into BF16 - the
@@ -970,6 +972,7 @@ fn build_generic_layer(
             gate_exps_sep: gate_sep,
             up_exps_sep: up_sep,
             down_exps_scale,
+            decode_slots,
             n_experts: flags.n_experts,
             n_experts_used: flags.n_experts_used,
             expert_ffn_dim: flags.expert_ffn_dim,

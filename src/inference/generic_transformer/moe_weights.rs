@@ -344,8 +344,13 @@ pub struct MoeWeights {
     /// for gemma4-MoE (fused gate||up + GELU).
     pub gate_exps_sep: Option<std::sync::Arc<crate::tensor::quantized::QTensor>>,
     pub up_exps_sep: Option<std::sync::Arc<crate::tensor::quantized::QTensor>>,
-    /// Per-expert scalar on the down output: `[n_experts]`.
-    pub down_exps_scale: Tensor,
+    /// Per-expert scalar on the down output, `[n_experts]`; `None` when the checkpoint has
+    /// none, every expert then being scaled by one.
+    pub down_exps_scale: Option<Tensor>,
+    /// `0..n_experts_used` on the layer's device: at a single-token decode the routed pairs
+    /// are already the rows in slot order, so this stands in for the sort that would
+    /// otherwise name them.
+    pub decode_slots: Option<Tensor>,
     pub n_experts: usize,
     pub n_experts_used: usize,
     pub expert_ffn_dim: usize,
@@ -608,11 +613,15 @@ impl MoeWeights {
         //   experts[t,k,h] *= topk_weights[t,k]
         // Folding scale into weights gives the same final result and
         // keeps a single weighted reduction.
-        let scale_per_pair = self
-            .down_exps_scale
-            .gather(&topk_ids.flatten_all()?, 0)?
-            .reshape(topk_weights.shape())?;
-        let topk_weights_scaled = (topk_weights.clone() * scale_per_pair)?;
+        let topk_weights_scaled = match self.down_exps_scale.as_ref() {
+            Some(scale) => {
+                let scale_per_pair = scale
+                    .gather(&topk_ids.flatten_all()?, 0)?
+                    .reshape(topk_weights.shape())?;
+                (topk_weights.clone() * scale_per_pair)?
+            }
+            None => topk_weights.clone(),
+        };
 
         // SiLU MoE hybrid: the GPU multi-token PREFILL kernels (WMMA + mmvq) both
         // mis-numeric these separate Q4K experts (verified: per-layer GPU-vs-CPU
@@ -769,7 +778,16 @@ impl MoeWeights {
             note_route();
             return self.batched_experts(xs, &plan, topk_weights);
         }
-        let routing = ExpertRouting::group(topk_ids, self.n_experts_used)?;
+        // One token: the rows are the routed pairs as the router listed them, and every kernel
+        // below treats a pair on its own, so nothing needs grouping by expert.
+        let routing = match (self.decode_slots.as_ref(), num_tokens) {
+            (Some(slots), 1) if topk_ids.dtype() == crate::tensor::DType::U32 => ExpertRouting {
+                slots: slots.clone(),
+                experts: topk_ids.flatten_all()?,
+                topk: self.n_experts_used,
+            },
+            _ => ExpertRouting::group(topk_ids, self.n_experts_used)?,
+        };
         note_route();
         let routing = &routing;
         // Auto-on: per-pair-tile IMMA M=8 for Q4_K MoE prefill - measured
@@ -1188,7 +1206,8 @@ mod clamped_swiglu_tests {
                 down_exps: Arc::new(stack(23)),
                 gate_exps_sep: Some(Arc::new(stack(21))),
                 up_exps_sep: Some(Arc::new(stack(22))),
-                down_exps_scale: Tensor::ones(experts, DType::F32, &dev).unwrap(),
+                down_exps_scale: None,
+                decode_slots: None,
                 n_experts: experts,
                 n_experts_used: used,
                 expert_ffn_dim: ffn,
@@ -1309,7 +1328,8 @@ mod clamped_swiglu_tests {
             down_exps: Arc::new(stack(32)),
             gate_exps_sep: None,
             up_exps_sep: Some(Arc::new(stack(31))),
-            down_exps_scale: Tensor::ones(experts, DType::F32, &dev).unwrap(),
+            down_exps_scale: None,
+            decode_slots: None,
             n_experts: experts,
             n_experts_used: used,
             expert_ffn_dim: ffn,
@@ -1422,7 +1442,8 @@ mod clamped_swiglu_tests {
             down_exps: Arc::new(down),
             gate_exps_sep: Some(Arc::new(gate)),
             up_exps_sep: Some(Arc::new(up)),
-            down_exps_scale: Tensor::ones(experts, DType::F32, &dev).unwrap(),
+            down_exps_scale: None,
+            decode_slots: None,
             n_experts: experts,
             n_experts_used: used,
             expert_ffn_dim: ffn,
