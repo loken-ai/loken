@@ -675,30 +675,7 @@ pub fn dequantize_q8_0_blob_f16(
     elem_count: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
-    if !elem_count.is_multiple_of(32) {
-        anyhow::bail!("dequantize_q8_0_blob_f16: elem_count {elem_count} must be multiple of 32");
-    }
-    let nb = elem_count.div_ceil(256);
-    let func = dev
-        .get_or_load_custom_func(
-            "dequantize_block_q8_0_f16",
-            "loken_quantized",
-            get_quantized_ptx(dev)?,
-        )
-        .map_err(|e| anyhow!("load kernel: {e}"))?;
-    let dst = unsafe { dev.alloc::<f16>(elem_count)? };
-    let cfg = LaunchConfig {
-        grid_dim: (nb as u32, 1, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let nb32 = (elem_count / 32) as i32;
-    let mut builder = func.builder();
-    builder.arg(data);
-    builder.arg(&dst);
-    barg!(builder, nb32);
-    unsafe { builder.launch(cfg) }.map_err(|e| anyhow!("launch: {e}"))?;
-    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+    super::dequantize_block32_blob("q8_0", data, elem_count, dev, false)
 }
 
 /// Fused quantized GEMV: `dst[nrows] = W(quantized) . y(q8_1)`, driving the

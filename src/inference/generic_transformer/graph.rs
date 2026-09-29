@@ -1531,7 +1531,7 @@ impl GenericHeteroTransformer {
     /// Snapshots cover the F-dtype device cache and the host f16 cache. A quantised cache
     /// has no copy constructor, so a model built with one keeps a single resident KV.
     pub fn supports_kv_snapshots(&self) -> bool {
-        // A quantised layer (Q8/Q4 on the card) is captured by dequantising to F16 and
+        // A quantised layer (Q8/Q4 on the card) is captured by dequantising to F32 and
         // restored by re-appending, which stays on the same quant grid. The host q8 cache
         // has no such round-trip and still bars snapshots. A recurrent state cannot be cut
         // to the prefix a KV snapshot is reused at; it is kept by `snapshot_prefix`.
@@ -2349,8 +2349,10 @@ fn quantised_layer_snapshot(
     {
         if let Some(q) = l.quant_kv.as_ref() {
             if q.current_seq_len() > 0 {
+                // F32 holds every dequantised value exactly (an 8- or 4-bit code times an
+                // f16 scale), so the restore requantises to the same codes and scales.
                 let (k, v) = q
-                    .dequantize_kv(crate::tensor::DType::F16)
+                    .dequantize_kv(crate::tensor::DType::F32)
                     .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
                 let spec = crate::inference::serve::spec_kv_cache::SpecKvSnapshot::from_kv_tensors(
                     k,

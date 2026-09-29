@@ -566,12 +566,25 @@ pub fn dequantize_q4_0_blob_f16(
     elem_count: usize,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
+    dequantize_block32_blob("q4_0", data, elem_count, dev, false)
+}
+
+/// A packed blob of a 32-value block format (`fmt` as the kernels name it), dequantised in
+/// storage order to F32 when `f32`, else F16. F32 holds every code-times-scale product
+/// exactly; F16 rounds the ones wider than its mantissa.
+pub fn dequantize_block32_blob(
+    fmt: &str,
+    data: &CudaSlice<u8>,
+    elem_count: usize,
+    dev: &CudaDevice,
+    f32: bool,
+) -> Result<CudaStorage> {
     if !elem_count.is_multiple_of(32) {
-        anyhow::bail!("dequantize_q4_0_blob_f16: elem_count {elem_count} must be multiple of 32");
+        anyhow::bail!("dequantize {fmt} blob: elem_count {elem_count} must be multiple of 32");
     }
     let nb = elem_count.div_ceil(256);
-    let func = quantized_kernel(dev, "dequantize_block_q4_0_f16")?;
-    let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+    let name = format!("dequantize_block_{fmt}_{}", if f32 { "f32" } else { "f16" });
+    let func = quantized_kernel(dev, &name)?;
     let cfg = LaunchConfig {
         grid_dim: (nb as u32, 1, 1),
         block_dim: (32, 1, 1),
@@ -580,8 +593,17 @@ pub fn dequantize_q4_0_blob_f16(
     let nb32 = (elem_count / 32) as i32;
     let mut builder = func.builder();
     builder.arg(data);
-    builder.arg(&dst);
-    barg!(builder, nb32);
-    unsafe { builder.launch(cfg) }.map_err(|e| anyhow!("launch dequantize_block_q4_0_f16: {e}"))?;
-    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+    if f32 {
+        let dst = unsafe { dev.alloc::<f32>(elem_count)? };
+        builder.arg(&dst);
+        barg!(builder, nb32);
+        unsafe { builder.launch(cfg) }.map_err(|e| anyhow!("launch {name}: {e}"))?;
+        Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+    } else {
+        let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+        builder.arg(&dst);
+        barg!(builder, nb32);
+        unsafe { builder.launch(cfg) }.map_err(|e| anyhow!("launch {name}: {e}"))?;
+        Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+    }
 }

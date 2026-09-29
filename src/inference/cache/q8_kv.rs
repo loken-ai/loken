@@ -768,25 +768,31 @@ impl Q8KvCache {
     /// history. Single-token decode avoids this round-trip by going
     /// through `attn_scores`/`attn_output` directly.
     pub fn dequantize_kv(&self, dtype: DType) -> Result<(Tensor, Tensor)> {
-        use crate::inference::quantized_cuda::dequantize_q8_0_blob_f16;
-
         let seq = self.core.len();
         if seq == 0 {
             return Err(anyhow!("Q8KvCache::dequantize_kv: cache is empty"));
         }
         let elem_count = seq * self.n_kv_heads * self.head_dim;
 
-        // Packed storage layout is [seq, n_kv, hd]. dequantize_q8_0_blob_f16
-        // writes f16 values in the same element order; we then reshape and
-        // permute to the [1, n_kv, seq, hd] layout attention code expects.
-        let k_f16 = dequantize_q8_0_blob_f16(&self.k_q8, elem_count, &self.cuda_device)
-            .map_err(|e| anyhow!("Q8KvCache: K dequantize: {e}"))?;
-        let v_f16 = dequantize_q8_0_blob_f16(&self.v_q8, elem_count, &self.cuda_device)
-            .map_err(|e| anyhow!("Q8KvCache: V dequantize: {e}"))?;
+        // Packed storage layout is [seq, n_kv, hd]; the dequantiser writes in the same
+        // element order, then the reshape and permute give [1, n_kv, seq, hd]. F32 is
+        // dequantised directly: it holds every code times its scale exactly.
+        let f32 = dtype == DType::F32;
+        let dq = |blob| {
+            crate::inference::quantized_cuda::dequantize_block32_blob(
+                "q8_0",
+                blob,
+                elem_count,
+                &self.cuda_device,
+                f32,
+            )
+        };
+        let k_dq = dq(&self.k_q8).map_err(|e| anyhow!("Q8KvCache: K dequantize: {e}"))?;
+        let v_dq = dq(&self.v_q8).map_err(|e| anyhow!("Q8KvCache: V dequantize: {e}"))?;
 
         let shape = (1, seq, self.n_kv_heads, self.head_dim);
-        let k = tensor_from_cuda_storage(k_f16, shape)?;
-        let v = tensor_from_cuda_storage(v_f16, shape)?;
+        let k = tensor_from_cuda_storage(k_dq, shape)?;
+        let v = tensor_from_cuda_storage(v_dq, shape)?;
 
         // [1, seq, n_kv, hd] -> [1, n_kv, seq, hd]
         let k = k.permute((0, 2, 1, 3))?.contiguous()?;

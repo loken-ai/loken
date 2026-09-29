@@ -688,6 +688,17 @@ impl Q4KvCache {
         let full_seq_blocks = seq / q4_0_block_size();
         let partial_slots = seq % q4_0_block_size();
         let full_seq = full_seq_blocks * q4_0_block_size();
+        // F32 is dequantised directly: it holds every code times its scale exactly.
+        let f32 = dtype == DType::F32;
+        let dq = |blob: &CudaSlice<u8>, n: usize| {
+            crate::inference::quantized_cuda::dequantize_block32_blob(
+                "q4_0",
+                blob,
+                n,
+                &self.cuda_device,
+                f32,
+            )
+        };
 
         // -- K dequant ------------------------------------------------
         // Blocks live in [seq_block, n_kv, head_dim] order, each block is
@@ -702,8 +713,7 @@ impl Q4KvCache {
             self.cuda_device
                 .memcpy_dtod(&self.k_q4_blocks.slice(..bytes_needed), &mut owned)
                 .map_err(|e| anyhow!("Q4KvCache: K dequant copy: {e}"))?;
-            let dq = dequantize_q4_0_blob_f16(&owned, elem_count, &self.cuda_device)
-                .map_err(|e| anyhow!("Q4KvCache: K dequant: {e}"))?;
+            let dq = dq(&owned, elem_count).map_err(|e| anyhow!("Q4KvCache: K dequant: {e}"))?;
 
             // Layout after dequant is [seq_block, n_kv, head_dim, 32].
             // Permute to [seq_block, 32, n_kv, head_dim] -> reshape to
@@ -750,6 +760,7 @@ impl Q4KvCache {
                 .contiguous()?;
 
             if full_seq > 0 {
+                let partial = partial.to_dtype(k_full.dtype())?;
                 Tensor::cat(&[&k_full, &partial], 0)?
             } else {
                 partial
@@ -778,8 +789,7 @@ impl Q4KvCache {
         self.cuda_device
             .memcpy_dtod(&self.v_q4.slice(..v_bytes), &mut v_owned)
             .map_err(|e| anyhow!("Q4KvCache: V dequant copy: {e}"))?;
-        let v_dq = dequantize_q4_0_blob_f16(&v_owned, v_elem_count, &self.cuda_device)
-            .map_err(|e| anyhow!("Q4KvCache: V dequant: {e}"))?;
+        let v_dq = dq(&v_owned, v_elem_count).map_err(|e| anyhow!("Q4KvCache: V dequant: {e}"))?;
         let v = tensor_from_cuda_storage(v_dq, (1, seq, self.n_kv_heads, self.head_dim))?;
         let v = v.permute((0, 2, 1, 3))?.contiguous()?;
 
