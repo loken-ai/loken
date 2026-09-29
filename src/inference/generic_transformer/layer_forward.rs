@@ -672,7 +672,21 @@ impl GenericTransformerLayer {
         let residual = &x;
         // A routed layer runs its mixture on the normed hidden, as the eager decode does;
         // its expert grouping stays on the device, so the launches repeat every token.
+        // Where the last launch of the block can add the residual itself, it does.
+        let folded = rs.is_none()
+            && self.post_ffn_norm.is_none()
+            && self
+                .moe
+                .as_ref()
+                .is_some_and(|m| m.router_prenormed && m.can_fold_residual(&x_norm, residual));
         let mut ffn_out = match self.moe.as_ref() {
+            Some(moe) if folded => moe.forward_folding(
+                &x_norm,
+                residual,
+                self.embedding_length_for_moe,
+                self.ffn_norm_eps,
+                residual,
+            )?,
             Some(moe) => moe.forward_rows(
                 &x_norm,
                 residual,
@@ -695,6 +709,7 @@ impl GenericTransformerLayer {
                 )?
             }
             Some(post_norm) => (post_norm.forward(&ffn_out)? + residual)?,
+            None if folded => ffn_out,
             None => (ffn_out + residual)?,
         };
 
