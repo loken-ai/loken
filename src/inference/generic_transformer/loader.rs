@@ -2651,24 +2651,25 @@ impl GenericHeteroTransformer {
         {
             let t_q = std::time::Instant::now();
             // A quantised head runs as a quantised matmul; a float head (F32, F16, BF16) is
-            // held once, in F16, for the dense matmul the card paths take without one.
+            // held once, in F16, for the dense matmul the card paths take without one. The
+            // float head is widened on the host, so the card receives only the F16 copy.
             let placed = norm_weight_cpu.to_device(cuda_dev).and_then(|norm_w| {
-                let qt = content.tensor(&mut cursor, output_weight_name, cuda_dev)?;
-                let dense = matches!(
-                    qt.dtype(),
-                    crate::tensor::quantized::GgmlDType::F32
-                        | crate::tensor::quantized::GgmlDType::F16
-                        | crate::tensor::quantized::GgmlDType::BF16
-                );
+                let dense = content
+                    .tensor_infos
+                    .get(output_weight_name)
+                    .is_some_and(|info| {
+                        matches!(
+                            info.ggml_dtype,
+                            crate::tensor::quantized::GgmlDType::F32
+                                | crate::tensor::quantized::GgmlDType::F16
+                                | crate::tensor::quantized::GgmlDType::BF16
+                        )
+                    });
                 let head = if dense {
-                    (
-                        None,
-                        Some(
-                            qt.dequantize(cuda_dev)?
-                                .to_dtype(crate::tensor::DType::F16)?,
-                        ),
-                    )
+                    let qt = content.tensor(&mut cursor, output_weight_name, &Device::Cpu)?;
+                    (None, Some(qt.dequantize_f16(cuda_dev)?))
                 } else {
+                    let qt = content.tensor(&mut cursor, output_weight_name, cuda_dev)?;
                     (
                         Some(crate::tensor::quantized::QMatMul::from_qtensor(qt)?),
                         None,
