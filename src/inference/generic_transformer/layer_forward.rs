@@ -629,124 +629,73 @@ impl GenericTransformerLayer {
             return Ok(x);
         }
 
+        if let Some(b) = &self.attn_output_bias {
+            attn_out = attn_out.broadcast_add(b)?;
+        }
         if let Some(s) = rs {
             attn_out = (attn_out * s)?;
         }
 
-        // Post-attn residual + FFN norm. The `fused_add_rmsnorm_dual`
-        // kernel exists but its `(rows, 1, 1)` grid layout regresses
-        // single-token decode (1 SM running vs 2 SMs across the
-        // unfused add + rmsnorm). Keep the unfused path here until
-        // a multi-block-reduction variant is written.
-        let (x, x_norm) = {
-            let x = if let Some(post_norm) = &self.post_attn_norm {
-                (post_norm.forward(&attn_out)? + residual)?
-            } else {
-                (attn_out + residual)?
-            };
-            let x_norm = self
-                .ffn_norm
-                .as_ref()
-                .ok_or_else(|| crate::tensor::Error::msg("ffn_norm missing"))?
-                .forward(&x)?;
-            (x, x_norm)
+        // Post-attn residual, FFN, and FFN residual through the kernels the eager decode step
+        // runs, so a replayed step computes what an eager one would.
+        #[cfg(feature = "cuda")]
+        let fused = match self.ffn_norm_weight.as_ref() {
+            Some(w) if self.post_attn_norm.is_none() => {
+                Some(crate::inference::kernel::fused::fused_add_rmsnorm_dual(
+                    &attn_out,
+                    residual,
+                    w,
+                    self.ffn_norm_eps,
+                )?)
+            }
+            _ => None,
+        };
+        #[cfg(not(feature = "cuda"))]
+        let fused: Option<(Tensor, Tensor)> = None;
+        let (x, x_norm) = match fused {
+            Some(pair) => pair,
+            None => {
+                let x = if let Some(post_norm) = &self.post_attn_norm {
+                    (post_norm.forward(&attn_out)? + residual)?
+                } else {
+                    (attn_out + residual)?
+                };
+                let x_norm = self
+                    .ffn_norm
+                    .as_ref()
+                    .ok_or_else(|| crate::tensor::Error::msg("ffn_norm missing"))?
+                    .forward(&x)?;
+                (x, x_norm)
+            }
         };
 
-        // FFN. The custom fused kernels are graph-safe because their
-        // PTX module is pre-warmed at model load - every cached
-        // `get_or_load_custom_func` call only does cuModuleGetFunction
-        // (driver metadata, not stream-affecting).
         let residual = &x;
         // A routed layer runs its mixture on the normed hidden, as the eager decode does;
         // its expert grouping stays on the device, so the launches repeat every token.
-        let mut ffn_out = if let Some(moe) = self.moe.as_ref() {
-            moe.forward_rows(
+        let mut ffn_out = match self.moe.as_ref() {
+            Some(moe) => moe.forward_rows(
                 &x_norm,
                 residual,
                 self.embedding_length_for_moe,
                 self.ffn_norm_eps,
-            )?
-        } else {
-            let activated = if self.flags.is_phi2_simple_ffn {
-                // Phi2: y = down(GELU(up(x))). No gate.
-                let up = self.ffn_up.forward(&x_norm)?;
-                up.gelu_erf()?
-            } else if self.flags.fused_ffn_gate_up || self.ffn_gate.is_none() {
-                let i = self.flags.intermediate_size;
-                let up_states = self.ffn_up.forward(&x_norm)?;
-                // Read the packed [.., 2N] matmul output directly (same as the
-                // non-graph path in layer_ffn.rs): the narrow->fused_silu_mul chain
-                // materialized both halves via 2 device copies per layer  -
-                // nsys (qwen3:0.6b decode) showed them as 2x
-                // native_slice_u8 + silu_mul ≈ 2 µs/layer vs 1 fused kernel.
-                #[cfg(feature = "cuda")]
-                if up_states.device().runs_as_card()
-                    && up_states.dtype() == crate::tensor::DType::F32
-                    && up_states
-                        .dim(crate::tensor::D::Minus1)
-                        .map(|d| d == 2 * i)
-                        .unwrap_or(false)
-                {
-                    if self.flags.use_gelu {
-                        crate::inference::kernel::fused::fused_split_gelu_mul(&up_states)?
-                    } else {
-                        crate::inference::kernel::fused::fused_split_silu_mul(&up_states)?
-                    }
-                } else {
-                    let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
-                    let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
-                    if self.flags.use_gelu {
-                        crate::inference::kernel::fused::fused_gelu_mul(&gate, &up)?
-                    } else {
-                        crate::inference::kernel::fused::fused_silu_mul(&gate, &up)?
-                    }
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
-                    let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
-                    if self.flags.use_gelu {
-                        gate.gelu()?.mul(&up)?
-                    } else {
-                        (up * crate::tensor::ops::silu(&gate)?)?
-                    }
-                }
-            } else {
-                let gate = self.ffn_gate.as_ref().unwrap().forward(&x_norm)?;
-                let up = self.ffn_up.forward(&x_norm)?;
-                if self.flags.use_gelu {
-                    #[cfg(feature = "cuda")]
-                    if gate.device().runs_as_card() {
-                        crate::inference::kernel::fused::fused_gelu_mul(&gate, &up)?
-                    } else {
-                        gate.gelu()?.mul(&up)?
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        gate.gelu()?.mul(&up)?
-                    }
-                } else {
-                    #[cfg(feature = "cuda")]
-                    if gate.device().runs_as_card() {
-                        crate::inference::kernel::fused::fused_silu_mul(&gate, &up)?
-                    } else {
-                        crate::tensor::ops::silu(&gate)?.mul(&up)?
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        crate::tensor::ops::silu(&gate)?.mul(&up)?
-                    }
-                }
-            };
-            self.ffn_down.forward(&activated)?
+            )?,
+            None => self.forward_ffn(&x_norm)?,
         };
         if let Some(s) = rs {
             ffn_out = (ffn_out * s)?;
         }
-        let mut x_out = if let Some(post_norm) = &self.post_ffn_norm {
-            (post_norm.forward(&ffn_out)? + residual)?
-        } else {
-            (ffn_out + residual)?
+        let mut x_out = match &self.post_ffn_norm {
+            #[cfg(feature = "cuda")]
+            Some(post_norm) if ffn_out.dtype() == DType::F32 && residual.dtype() == DType::F32 => {
+                crate::inference::kernel::fused::fused_rmsnorm_then_add(
+                    &ffn_out,
+                    post_norm.weight(),
+                    residual,
+                    self.ffn_norm_eps,
+                )?
+            }
+            Some(post_norm) => (post_norm.forward(&ffn_out)? + residual)?,
+            None => (ffn_out + residual)?,
         };
 
         // PLE block for gemma4 graph mode. Port from
