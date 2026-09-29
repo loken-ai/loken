@@ -299,3 +299,30 @@ pub fn batched_topk_denom(
     .to_vec1::<f32>()?;
     Ok((tl, ti, ts))
 }
+
+#[cfg(test)]
+mod stable_sort_tests {
+    use super::*;
+
+    /// The card sort against a stable host sort, over a whole tensor and over a view that
+    /// starts inside its storage.
+    #[test]
+    fn the_card_sort_matches_a_stable_host_sort() {
+        let Ok(dev) = crate::tensor::Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let skip = 5;
+        let all: Vec<u32> = (0..300u32).map(|i| (i * 7919) % 17).collect();
+        let whole = Tensor::from_vec(all.clone(), (all.len(),), &dev).unwrap();
+        let view = whole.narrow(0, skip, all.len() - skip).unwrap();
+        for (keys, t) in [(&all[..], &whole), (&all[skip..], &view)] {
+            let (sorted, order) = stable_sort_u32(t).unwrap();
+            let mut idx: Vec<u32> = (0..keys.len() as u32).collect();
+            idx.sort_by_key(|&i| keys[i as usize]);
+            let want: Vec<u32> = idx.iter().map(|&i| keys[i as usize]).collect();
+            assert_eq!(sorted.to_vec1::<u32>().unwrap(), want);
+            assert_eq!(order.to_vec1::<u32>().unwrap(), idx);
+        }
+    }
+}
