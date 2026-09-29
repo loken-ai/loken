@@ -949,7 +949,10 @@ impl LlmEngine {
             let (graph_stream, graph_eligible) = {
                 let guard = model_state.blocking_lock();
                 match guard.as_ref() {
-                    Some(s) if device_clone.is_cuda() && s.model.capabilities().graph_mode => {
+                    Some(s)
+                        if (device_clone.is_cuda() || s.model.model_cuda_stream().is_some())
+                            && s.model.capabilities().graph_mode =>
+                    {
                         let eligible = s.model.graph_capture_auto_on()
                             && s.model.kv_state_graph_safe()
                             && !s.model.needs_split_graph_path();
@@ -981,7 +984,7 @@ impl LlmEngine {
             #[cfg(feature = "cuda")]
             let graph_ok = graph_eligible && graph_stream.is_some();
             #[cfg(feature = "cuda")]
-            let mut cuda_graph: Option<crate::tensor::cuda_ext::CudaGraph> = None;
+            let mut cuda_graph: Option<super::decode::DecodeGraph> = None;
             #[cfg(feature = "cuda")]
             let mut graph_logits: Option<Tensor> = None;
             #[cfg(feature = "cuda")]

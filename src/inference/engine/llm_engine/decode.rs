@@ -207,13 +207,84 @@ pub(super) fn capture_decode_graph(
     stream: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
     pos: usize,
     needs_split: bool,
-) -> Option<(crate::tensor::cuda_ext::CudaGraph, Tensor)> {
-    let ctx = stream.context();
+) -> Option<(DecodeGraph, Tensor)> {
     // Drop stale captured-region transients from a previous request's
     // capture BEFORE the arena they live in is freed by
     // begin_capture_arena (arena-range drops are no-ops only while the
     // arena is alive).
     model.clear_graph_transients();
+    // One graph per card the step runs on, each recorded on that card's stream; the split
+    // path records on the model's stream alone.
+    let streams = match needs_split {
+        true => vec![stream.clone()],
+        false => model.graph_segment_streams(),
+    };
+    if streams.is_empty() {
+        warn!("Graph capture found no card stream at pos={pos}; eager decode");
+        return None;
+    }
+    let mut parts = Vec::with_capacity(streams.len());
+    let mut logits = None;
+    for (seg, seg_stream) in streams.iter().enumerate() {
+        let (g, out) = capture_segment(model, seg_stream, seg, pos, needs_split)?;
+        parts.push((g, seg_stream.clone()));
+        logits = Some(out);
+    }
+    Some((DecodeGraph { parts }, logits?))
+}
+
+/// The decode step's graphs, one per card in layer order. A launch runs them in order,
+/// each card's stream waiting on the previous one's work; the hidden state hops between
+/// cards through pinned host memory inside the graphs.
+#[cfg(feature = "cuda")]
+pub(super) struct DecodeGraph {
+    parts: Vec<(
+        crate::tensor::cuda_ext::CudaGraph,
+        std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
+    )>,
+}
+
+#[cfg(feature = "cuda")]
+impl DecodeGraph {
+    /// Launches every part. With more than one card the host waits for the last card, which
+    /// holds the logits: the caller synchronises only the first card's stream.
+    pub(super) fn launch(&self) -> crate::tensor::Result<()> {
+        let err = |e| crate::tensor::Error::msg(format!("graph launch: {e:?}"));
+        for (i, (g, s)) in self.parts.iter().enumerate() {
+            g.launch().map_err(err)?;
+            if let Some((_, next)) = self.parts.get(i + 1) {
+                let ev = crate::tensor::cuda_ext::record_event(s)?;
+                crate::tensor::cuda_ext::wait_event(next, &ev)?;
+            }
+        }
+        if self.parts.len() > 1 {
+            if let Some((_, last)) = self.parts.last() {
+                last.synchronize().map_err(err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The single-card graph, which the per-token re-capture path updates in place.
+    pub(super) fn single_mut(&mut self) -> Option<&mut crate::tensor::cuda_ext::CudaGraph> {
+        match self.parts.as_mut_slice() {
+            [(g, _)] => Some(g),
+            _ => None,
+        }
+    }
+}
+
+/// Records segment `seg` of the decode step on `stream`, growing that card's arena until
+/// the capture holds no allocation node.
+#[cfg(feature = "cuda")]
+fn capture_segment(
+    model: &mut BoxedModelBackend,
+    stream: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
+    seg: usize,
+    pos: usize,
+    needs_split: bool,
+) -> Option<(crate::tensor::cuda_ext::CudaGraph, Tensor)> {
+    let ctx = stream.context();
     let free_vram = crate::inference::place::room::free_in(ctx).unwrap_or(0) as usize;
     let ceiling = free_vram
         .saturating_sub(free_vram / ARENA_LEAVES_FREE_DIV)
@@ -236,7 +307,7 @@ pub(super) fn capture_decode_graph(
                     // prepare_all_kv, run by the caller before this).
                     model.compute_all_from_kv_captured()?
                 } else {
-                    model.forward_from_hidden()?
+                    model.forward_graph_segment(seg)?
                 };
                 // cuda_ext::end_capture instantiates with flags=0: no
                 // AUTO_FREE (keeps stream-ordered allocs persistent across
@@ -258,7 +329,7 @@ pub(super) fn capture_decode_graph(
                 // touches the stream.
                 let _ = crate::tensor::cuda_ext::end_capture(stream);
                 let _ = stream.synchronize();
-                warn!("Graph capture failed at pos={pos}: {e}; eager decode for rest of request");
+                warn!("Graph capture failed at pos={pos} (segment {seg}): {e}; eager decode for rest of request");
                 return None;
             }
             Ok((None, _)) => {
@@ -299,7 +370,10 @@ pub(super) fn capture_decode_graph(
                     drop(g);
                     return None;
                 }
-                info!("CUDA graph captured at pos={} ({} nodes)", pos, nc);
+                info!(
+                    "CUDA graph captured at pos={} segment {} ({} nodes)",
+                    pos, seg, nc
+                );
                 // Node-type histogram: confirms
                 // MEM_ALLOC/MEM_FREE stay at 0 with the capture arena.
                 if let Ok(nodes) = g.nodes(nc) {

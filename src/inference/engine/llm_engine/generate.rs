@@ -600,7 +600,7 @@ impl LlmEngine {
 
             // CUDA graph: capture forward pass after warmup, replay for subsequent tokens
             #[cfg(feature = "cuda")]
-            let mut cuda_graph: Option<crate::tensor::cuda_ext::CudaGraph> = None;
+            let mut cuda_graph: Option<super::decode::DecodeGraph> = None;
             // Reference to the output logits tensor from graph capture (same addresses on replay)
             let mut graph_logits: Option<Tensor> = None;
             // Sticky flag: once graph mode trips a fallback (e.g. seq exceeds
@@ -625,10 +625,13 @@ impl LlmEngine {
             // dead-graph root cause). Fall back to the engine
             // device's stream for backends that don't expose theirs.
             #[cfg(feature = "cuda")]
-            let cuda_stream = if device.is_cuda() {
-                Some(state.model.model_cuda_stream()
-                    .or_else(|| crate::tensor::cuda_ext::stream_of(device).ok()))
-            } else { None };
+            // A model spread over several cards runs its decode on theirs while the engine's
+            // device is the host: its own stream is what makes it a card model.
+            let cuda_stream = match state.model.model_cuda_stream() {
+                Some(s) => Some(Some(s)),
+                None if device.is_cuda() => Some(crate::tensor::cuda_ext::stream_of(device).ok()),
+                None => None,
+            };
 
             // Graph-mode user-facing toggle removed: auto-detect uses
             // model arch + KV-cache safety as the gate. No manual override.
@@ -658,6 +661,10 @@ impl LlmEngine {
             // use_graph_mode is immutable for a given (model backend, device).
             // Hoist so the per-token loop doesn't redo the capability check
             // + `device.is_cuda()` on every iteration.
+            #[cfg(feature = "cuda")]
+            let use_graph_mode_cached = state.model.capabilities().graph_mode
+                && cuda_stream.as_ref().is_some_and(|s| s.is_some());
+            #[cfg(not(feature = "cuda"))]
             let use_graph_mode_cached = state.model.capabilities().graph_mode && device.is_cuda();
 
             // --- Unified Generation Loop ------------------------------
@@ -963,7 +970,7 @@ impl LlmEngine {
                     #[cfg(feature = "cuda")]
                     if recapture {
                         if let (Some(graph), Some(Some(stream))) =
-                            (cuda_graph.as_mut(), cuda_stream.as_ref())
+                            (cuda_graph.as_mut().and_then(|g| g.single_mut()), cuda_stream.as_ref())
                         {
                             let _ = stream.synchronize();
                             // populate disabled with gate revert. Code stays

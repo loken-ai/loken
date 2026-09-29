@@ -32,6 +32,109 @@ impl Drop for GraphStep {
     }
 }
 
+/// The hidden state of one decode step crossing from one card to the next without peer
+/// access: the source stream copies it into page-locked host memory, the destination stream
+/// copies it from there into a buffer on its card. Both copies are graph nodes; the order
+/// between the two streams is the launcher's.
+#[cfg(feature = "cuda")]
+pub(crate) struct GraphHop {
+    host: *mut std::ffi::c_void,
+    bytes: usize,
+    /// `[1, 1, width]` F32 on the destination card.
+    dst: Tensor,
+}
+
+// SAFETY: `host` is a page-locked allocation owned by this hop alone, freed once on drop;
+// the copies that touch it are ordered on the card streams.
+#[cfg(feature = "cuda")]
+unsafe impl Send for GraphHop {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for GraphHop {}
+
+#[cfg(feature = "cuda")]
+impl GraphHop {
+    fn new(width: usize, dst_dev: &Device) -> Result<Self> {
+        let bytes = width * std::mem::size_of::<f32>();
+        let host =
+            crate::tensor::cuda_ext::malloc_host(bytes).map_err(crate::tensor::Error::msg)?;
+        let dst = Tensor::zeros_on((1, 1, width), crate::tensor::DType::F32, dst_dev)?;
+        Ok(Self { host, bytes, dst })
+    }
+
+    /// Copies `hidden` `[1, 1, width]` into host memory on its card's stream.
+    fn send(&self, hidden: &Tensor) -> Result<()> {
+        let src = hidden.to_dtype(crate::tensor::DType::F32)?.contiguous()?;
+        if src.elem_count() * std::mem::size_of::<f32>() != self.bytes {
+            crate::tensor::bail!("graph hop: hidden {:?} does not fill the hop", src.dims());
+        }
+        let stream = crate::tensor::cuda_ext::stream_of(&src.device())?;
+        let ptr = f32_device_ptr(&src)?;
+        // A raw driver copy runs in the thread's current context: the stream's own.
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| crate::tensor::Error::msg(format!("graph hop: bind context: {e:?}")))?;
+        let r = unsafe {
+            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                self.host,
+                ptr,
+                self.bytes,
+                stream.cu_stream(),
+            )
+        };
+        if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+            crate::tensor::bail!("graph hop: device to host copy failed: {r:?}");
+        }
+        Ok(())
+    }
+
+    /// Copies the host memory into the destination buffer on its card's stream.
+    fn receive(&self) -> Result<Tensor> {
+        let stream = crate::tensor::cuda_ext::stream_of(&self.dst.device())?;
+        let ptr = f32_device_ptr(&self.dst)?;
+        // A raw driver copy runs in the thread's current context: the stream's own.
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| crate::tensor::Error::msg(format!("graph hop: bind context: {e:?}")))?;
+        let r = unsafe {
+            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                ptr,
+                self.host,
+                self.bytes,
+                stream.cu_stream(),
+            )
+        };
+        if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+            crate::tensor::bail!("graph hop: host to device copy failed: {r:?}");
+        }
+        Ok(self.dst.clone())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for GraphHop {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `malloc_host` in `new` and freed only here.
+        unsafe { crate::tensor::cuda_ext::free_host(self.host) }
+    }
+}
+
+/// The device address of an F32 card tensor's first element.
+#[cfg(feature = "cuda")]
+fn f32_device_ptr(t: &Tensor) -> Result<u64> {
+    use crate::tensor::cuda_ext::DevicePtr;
+    let (st, layout) = t.storage_and_layout();
+    match &*st {
+        crate::tensor::StorageView::Cuda(c) => {
+            let s = c.as_cuda_slice::<f32>()?;
+            Ok(s.device_ptr(s.stream()).0
+                + (layout.start_offset() * std::mem::size_of::<f32>()) as u64)
+        }
+        _ => crate::tensor::bail!("graph hop: tensor is not on a card"),
+    }
+}
+
 impl GenericHeteroTransformer {
     /// Tokens the KV cache accepts: the ceiling it grows to, or was allocated at.
     pub fn kv_capacity(&self) -> usize {
@@ -503,6 +606,12 @@ impl GenericHeteroTransformer {
                 c.clear_graph_captured();
             }
         }
+        // The capture arenas of the cards after the first go with the graph; the caller
+        // frees the first card's.
+        #[cfg(feature = "cuda")]
+        for (_, dev) in self.graph_segments().iter().skip(1) {
+            let _ = crate::tensor::cuda_ext::free_capture_arena(dev);
+        }
     }
 
     /// Engine hook: a CUDA graph referencing the per-layer KV buffers is
@@ -565,10 +674,12 @@ impl GenericHeteroTransformer {
         // then a LATER captured matmul with bigger k triggers
         // workspace_ensure to realloc, invalidating earlier captured
         // kernels' scratch pointers -> ILLEGAL_ADDRESS on replay.
+        #[cfg(feature = "cuda")]
+        self.ensure_graph_hops()?;
         if !self.workspace_pre_grown {
             self.workspace_pre_grown = true;
             #[cfg(feature = "cuda")]
-            if let Some(cuda_dev) = self.cuda_devices.values().next() {
+            for cuda_dev in self.cuda_devices.values() {
                 if let Ok(cd) = cuda_dev.as_cuda_device() {
                     let max_intermediate = self
                         .layers
@@ -1191,22 +1302,133 @@ impl GenericHeteroTransformer {
     /// must have been populated by embed_for_graph before calling this.
     /// This is the body that gets captured into a CUDA graph.
     pub fn forward_from_hidden(&mut self) -> Result<Tensor> {
+        let n = self.graph_segments().len().max(1);
+        for seg in 0..n {
+            let out = self.forward_graph_segment(seg)?;
+            if seg + 1 == n {
+                return Ok(out);
+            }
+            // Eagerly, the next card's stream waits on this card's hop, as a replay does.
+            #[cfg(feature = "cuda")]
+            {
+                let streams = self.graph_segment_streams();
+                if let (Some(from), Some(to)) = (streams.get(seg), streams.get(seg + 1)) {
+                    let ev = crate::tensor::cuda_ext::record_event(from)?;
+                    crate::tensor::cuda_ext::wait_event(to, &ev)?;
+                }
+            }
+        }
+        crate::tensor::bail!("forward_from_hidden: no segment ran")
+    }
+
+    /// The graph step's card segments in layer order: each run of layers on one card and
+    /// that card. Empty when a layer is on the host.
+    pub fn graph_segments(&self) -> Vec<(std::ops::Range<usize>, Device)> {
+        let mut segs: Vec<(std::ops::Range<usize>, Device)> = Vec::new();
+        let mut last: Option<usize> = None;
+        for (i, d) in self.layer_devs.iter().enumerate() {
+            let LayerDevice::Cuda(idx) = d else {
+                return Vec::new();
+            };
+            match (last == Some(*idx), segs.last_mut()) {
+                (true, Some((range, _))) => range.end = i + 1,
+                _ => {
+                    let Some(dev) = self.cuda_devices.get(idx) else {
+                        return Vec::new();
+                    };
+                    segs.push((i..i + 1, dev.clone()));
+                }
+            }
+            last = Some(*idx);
+        }
+        segs
+    }
+
+    /// The stream of each segment's card.
+    #[cfg(feature = "cuda")]
+    pub fn graph_segment_streams(
+        &self,
+    ) -> Vec<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
+        let segs = self.graph_segments();
+        if segs.len() <= 1 {
+            return self.cuda_stream().into_iter().collect();
+        }
+        segs.iter()
+            .filter_map(|(_, d)| crate::tensor::cuda_ext::stream_of(d).ok())
+            .collect()
+    }
+
+    /// Segment `seg` of the graph's decode step, on its card's stream. It starts from the
+    /// hidden buffer (the first) or the hop from the previous card, and ends with the logits
+    /// (the last) or the hop to the next card, whose hidden state it returns.
+    pub fn forward_graph_segment(&mut self, seg: usize) -> Result<Tensor> {
         let _step = GraphStep::enter();
-        let mut hidden = self
-            .graph_hidden_buffer
-            .as_ref()
-            .ok_or_else(|| {
-                crate::tensor::Error::msg("forward_from_hidden: call embed_for_graph first")
-            })?
-            .clone();
+        let segs = self.graph_segments();
+        let n = segs.len().max(1);
+        let range = match segs.get(seg) {
+            Some((r, _)) => r.clone(),
+            None if seg == 0 => 0..self.layers.len(),
+            None => crate::tensor::bail!("forward_graph_segment: no segment {seg}"),
+        };
+        let mut hidden = if seg == 0 {
+            self.graph_hidden_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    crate::tensor::Error::msg("forward_from_hidden: call embed_for_graph first")
+                })?
+                .clone()
+        } else {
+            #[cfg(feature = "cuda")]
+            {
+                self.graph_hops
+                    .get(seg - 1)
+                    .ok_or_else(|| crate::tensor::Error::msg("graph hop not prepared"))?
+                    .receive()?
+            }
+            #[cfg(not(feature = "cuda"))]
+            crate::tensor::bail!("a card hop needs CUDA")
+        };
         // See the timer in the eager decode loop: this measures issuing the layer,
         // which is what tells a dispatching layer from one running on the host.
-
-        for (li, layer) in self.layers.iter_mut().enumerate() {
+        for li in range {
             let _timer = crate::inference::place::layer_perf::LayerTimer::start(li);
-            hidden = layer.forward_graph(&hidden)?;
+            hidden = self.layers[li].forward_graph(&hidden)?;
         }
+        if seg + 1 < n {
+            #[cfg(feature = "cuda")]
+            {
+                self.graph_hops
+                    .get(seg)
+                    .ok_or_else(|| crate::tensor::Error::msg("graph hop not prepared"))?
+                    .send(&hidden)?;
+                return Ok(hidden);
+            }
+            #[cfg(not(feature = "cuda"))]
+            crate::tensor::bail!("a card hop needs CUDA")
+        }
+        self.graph_head(hidden)
+    }
 
+    /// Allocates the hop buffers between consecutive cards, outside any capture.
+    #[cfg(feature = "cuda")]
+    fn ensure_graph_hops(&mut self) -> Result<()> {
+        let segs = self.graph_segments();
+        let boundaries = segs.len().saturating_sub(1);
+        if self.graph_hops.len() == boundaries {
+            return Ok(());
+        }
+        let width = self.config.embedding_length;
+        self.graph_hops = segs
+            .iter()
+            .skip(1)
+            .map(|(_, dev)| GraphHop::new(width, dev))
+            .collect::<Result<_>>()?;
+        Ok(())
+    }
+
+    /// Final norm, output projection and logit transforms of the graph's step, copied into
+    /// the stable logits buffer.
+    fn graph_head(&mut self, hidden: Tensor) -> Result<Tensor> {
         let norm_w = self.output_norm_cuda_weight.as_ref().ok_or_else(|| {
             crate::tensor::Error::msg("forward_from_hidden needs output_norm_cuda_weight")
         })?;

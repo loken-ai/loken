@@ -418,6 +418,9 @@ pub struct GenericHeteroTransformer {
     ple_dim: usize, // per-layer PLE dimension (e.g. 256)
     /// Pre-allocated hidden state buffer for CUDA graph replay.
     graph_hidden_buffer: Option<Tensor>,
+    /// The graph step's hidden-state hops between consecutive cards, one per boundary.
+    #[cfg(feature = "cuda")]
+    graph_hops: Vec<graph::GraphHop>,
     /// Pre-allocated logits output buffer for graph replay. The graph's last
     /// op copies logits here so the output is at a stable device pointer
     /// (CUDA graph instantiation remaps internal allocations).

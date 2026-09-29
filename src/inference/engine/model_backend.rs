@@ -451,6 +451,22 @@ pub(crate) trait ModelBackend: Send {
         crate::tensor::bail!("forward_from_hidden only for GenericHetero / GenericHeteroVision")
     }
 
+    /// The stream of every card a captured decode step runs on, in layer order: one graph
+    /// is recorded per stream.
+    #[cfg(feature = "cuda")]
+    fn graph_segment_streams(&self) -> Vec<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
+        self.model_cuda_stream().into_iter().collect()
+    }
+
+    /// Segment `seg` of the graph's decode step on its card's stream: the logits for the
+    /// last segment, the hidden state handed to the next card otherwise.
+    fn forward_graph_segment(&mut self, seg: usize) -> crate::tensor::Result<Tensor> {
+        match seg {
+            0 => self.forward_from_hidden(),
+            _ => crate::tensor::bail!("this backend's decode step has one segment"),
+        }
+    }
+
     /// True when this model needs the split graph path (F-dtype-only KV
     /// layers present) to avoid scatter_set ILLEGAL_ADDRESS at replay.
     fn needs_split_graph_path(&self) -> bool {
@@ -1214,6 +1230,15 @@ impl ModelBackend for GenericBackend {
         self.0.forward_from_hidden()
     }
 
+    #[cfg(feature = "cuda")]
+    fn graph_segment_streams(&self) -> Vec<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
+        self.0.graph_segment_streams()
+    }
+
+    fn forward_graph_segment(&mut self, seg: usize) -> crate::tensor::Result<Tensor> {
+        self.0.forward_graph_segment(seg)
+    }
+
     fn needs_split_graph_path(&self) -> bool {
         self.0.needs_split_graph_path()
     }
@@ -1391,6 +1416,15 @@ impl ModelBackend for GenericVisionBackend {
 
     fn forward_from_hidden(&mut self) -> crate::tensor::Result<Tensor> {
         self.text.forward_from_hidden()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn graph_segment_streams(&self) -> Vec<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
+        self.text.graph_segment_streams()
+    }
+
+    fn forward_graph_segment(&mut self, seg: usize) -> crate::tensor::Result<Tensor> {
+        self.text.forward_graph_segment(seg)
     }
 
     fn needs_split_graph_path(&self) -> bool {

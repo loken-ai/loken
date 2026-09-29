@@ -2851,6 +2851,8 @@ impl GenericHeteroTransformer {
             ple_proj_norm,
             ple_dim,
             graph_hidden_buffer: None,
+            #[cfg(feature = "cuda")]
+            graph_hops: Vec::new(),
             graph_logits_buffer,
             graph_alive_tensors_model: Vec::new(),
             graph_state_groups: None,
@@ -3156,6 +3158,8 @@ impl GenericHeteroTransformer {
             ple_proj_norm: None,
             ple_dim: 0,
             graph_hidden_buffer: None,
+            #[cfg(feature = "cuda")]
+            graph_hops: Vec::new(),
             graph_logits_buffer: None,
             graph_alive_tensors_model: Vec::new(),
             graph_state_groups: None,
