@@ -1533,10 +1533,9 @@ fn build_awq_layer(
     };
 
     // -- Fused QKV -> routes decode through the APQ fast path (fused norm+RoPE+cast
-    //    + Q8 attention), eliminating 2 GEMV launches/layer. q_norm/k_norm
-    //    (qwen3) block byte-level fusion in GGUF but here we fuse the F32 GEMV, so
-    //    only fuse when there's NO qk-norm (qwen2/mistral); else keep separate.
-    let fuse_qkv = !flags.has_qk_norm; // qwen2/mistral: fuse q|k|v -> APQ fast path
+    //    + Q8 attention), eliminating 2 GEMV launches/layer. The per-head q/k norms are
+    //    applied to the fused projection by that path, so a model with them fuses too.
+    let fuse_qkv = true;
     let (attn_q, attn_k, attn_v, attn_qkv, attn_q_bias, attn_k_bias, attn_v_bias, attn_qkv_bias);
     if fuse_qkv {
         attn_qkv = Some(fuse_awq(&[
