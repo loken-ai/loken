@@ -657,78 +657,89 @@ impl GenericTransformerLayer {
         // `get_or_load_custom_func` call only does cuModuleGetFunction
         // (driver metadata, not stream-affecting).
         let residual = &x;
-        let mut ffn_out = if self.flags.is_phi2_simple_ffn {
-            // Phi2: y = down(GELU(up(x))). No gate.
-            let up = self.ffn_up.forward(&x_norm)?;
-            up.gelu_erf()?
-        } else if self.flags.fused_ffn_gate_up || self.ffn_gate.is_none() {
-            let i = self.flags.intermediate_size;
-            let up_states = self.ffn_up.forward(&x_norm)?;
-            // Read the packed [.., 2N] matmul output directly (same as the
-            // non-graph path in layer_ffn.rs): the narrow->fused_silu_mul chain
-            // materialized both halves via 2 device copies per layer  -
-            // nsys (qwen3:0.6b decode) showed them as 2x
-            // native_slice_u8 + silu_mul ≈ 2 µs/layer vs 1 fused kernel.
-            #[cfg(feature = "cuda")]
-            if up_states.device().runs_as_card()
-                && up_states.dtype() == crate::tensor::DType::F32
-                && up_states
-                    .dim(crate::tensor::D::Minus1)
-                    .map(|d| d == 2 * i)
-                    .unwrap_or(false)
-            {
-                if self.flags.use_gelu {
-                    crate::inference::kernel::fused::fused_split_gelu_mul(&up_states)?
-                } else {
-                    crate::inference::kernel::fused::fused_split_silu_mul(&up_states)?
-                }
-            } else {
-                let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
-                let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
-                if self.flags.use_gelu {
-                    crate::inference::kernel::fused::fused_gelu_mul(&gate, &up)?
-                } else {
-                    crate::inference::kernel::fused::fused_silu_mul(&gate, &up)?
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
-                let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
-                if self.flags.use_gelu {
-                    gate.gelu()?.mul(&up)?
-                } else {
-                    (up * crate::tensor::ops::silu(&gate)?)?
-                }
-            }
+        // A routed layer runs its mixture on the normed hidden, as the eager decode does;
+        // its expert grouping stays on the device, so the launches repeat every token.
+        let mut ffn_out = if let Some(moe) = self.moe.as_ref() {
+            moe.forward_rows(
+                &x_norm,
+                residual,
+                self.embedding_length_for_moe,
+                self.ffn_norm_eps,
+            )?
         } else {
-            let gate = self.ffn_gate.as_ref().unwrap().forward(&x_norm)?;
-            let up = self.ffn_up.forward(&x_norm)?;
-            if self.flags.use_gelu {
+            let activated = if self.flags.is_phi2_simple_ffn {
+                // Phi2: y = down(GELU(up(x))). No gate.
+                let up = self.ffn_up.forward(&x_norm)?;
+                up.gelu_erf()?
+            } else if self.flags.fused_ffn_gate_up || self.ffn_gate.is_none() {
+                let i = self.flags.intermediate_size;
+                let up_states = self.ffn_up.forward(&x_norm)?;
+                // Read the packed [.., 2N] matmul output directly (same as the
+                // non-graph path in layer_ffn.rs): the narrow->fused_silu_mul chain
+                // materialized both halves via 2 device copies per layer  -
+                // nsys (qwen3:0.6b decode) showed them as 2x
+                // native_slice_u8 + silu_mul ≈ 2 µs/layer vs 1 fused kernel.
                 #[cfg(feature = "cuda")]
-                if gate.device().runs_as_card() {
-                    crate::inference::kernel::fused::fused_gelu_mul(&gate, &up)?
+                if up_states.device().runs_as_card()
+                    && up_states.dtype() == crate::tensor::DType::F32
+                    && up_states
+                        .dim(crate::tensor::D::Minus1)
+                        .map(|d| d == 2 * i)
+                        .unwrap_or(false)
+                {
+                    if self.flags.use_gelu {
+                        crate::inference::kernel::fused::fused_split_gelu_mul(&up_states)?
+                    } else {
+                        crate::inference::kernel::fused::fused_split_silu_mul(&up_states)?
+                    }
                 } else {
-                    gate.gelu()?.mul(&up)?
+                    let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
+                    let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
+                    if self.flags.use_gelu {
+                        crate::inference::kernel::fused::fused_gelu_mul(&gate, &up)?
+                    } else {
+                        crate::inference::kernel::fused::fused_silu_mul(&gate, &up)?
+                    }
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    gate.gelu()?.mul(&up)?
+                    let gate = up_states.narrow(crate::tensor::D::Minus1, 0, i)?;
+                    let up = up_states.narrow(crate::tensor::D::Minus1, i, i)?;
+                    if self.flags.use_gelu {
+                        gate.gelu()?.mul(&up)?
+                    } else {
+                        (up * crate::tensor::ops::silu(&gate)?)?
+                    }
                 }
             } else {
-                #[cfg(feature = "cuda")]
-                if gate.device().runs_as_card() {
-                    crate::inference::kernel::fused::fused_silu_mul(&gate, &up)?
+                let gate = self.ffn_gate.as_ref().unwrap().forward(&x_norm)?;
+                let up = self.ffn_up.forward(&x_norm)?;
+                if self.flags.use_gelu {
+                    #[cfg(feature = "cuda")]
+                    if gate.device().runs_as_card() {
+                        crate::inference::kernel::fused::fused_gelu_mul(&gate, &up)?
+                    } else {
+                        gate.gelu()?.mul(&up)?
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        gate.gelu()?.mul(&up)?
+                    }
                 } else {
-                    crate::tensor::ops::silu(&gate)?.mul(&up)?
+                    #[cfg(feature = "cuda")]
+                    if gate.device().runs_as_card() {
+                        crate::inference::kernel::fused::fused_silu_mul(&gate, &up)?
+                    } else {
+                        crate::tensor::ops::silu(&gate)?.mul(&up)?
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        crate::tensor::ops::silu(&gate)?.mul(&up)?
+                    }
                 }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    crate::tensor::ops::silu(&gate)?.mul(&up)?
-                }
-            }
+            };
+            self.ffn_down.forward(&activated)?
         };
-        ffn_out = self.ffn_down.forward(&ffn_out)?;
         if let Some(s) = rs {
             ffn_out = (ffn_out * s)?;
         }

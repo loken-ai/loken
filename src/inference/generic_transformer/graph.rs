@@ -96,29 +96,9 @@ impl GenericHeteroTransformer {
                 // A Q8 layer is graph-safe: its device-position kernels read the sequence
                 // length from the device and write at the padded stride, the host KV length
                 // is synced per replayed token, the capture-frozen ceiling is enforced per
-                // token, and probation replays catch anything else. Dense models capture;
-                // a phi2-style layer (parallel attention with LayerNorm bias) takes its own
-                // device-position path below.
-                let phi2_dev_pos =
-                    self.config.flags.parallel_attn && self.config.flags.layer_norm_with_bias;
-                if self.q8_graph_dense() {
-                    return None;
-                }
-                // gemma4 graph mode: the capture crash is solved (capture
-                // arena), but the split path (prepare_kv/compute_from_kv)
-                // reads the F-dtype kv_cache while the normal forward uses
-                // Q8+GH_APQ - a numerical mismatch (append vs append_padded
-                // + Q8-vs-F-dtype) that diverges at layer-0 attention.
-                // Gated OFF until the normal forward is captured directly
-                // (the arena makes the split-path workaround unnecessary).
-                // Details + reframe in memory: gemma4 graph split-path notes.
-                // DEFINITIVELY DEAD: measured gemma4 graph-on decode at
-                // 26.6 tok/s vs 142.4 graph-off = 5.3x SLOWER (split-path
-                // capture/replay overhead). Even with correct output it would
-                // never be enabled. Do NOT re-attempt gemma4 graph mode.
-                return (!phi2_dev_pos).then_some(
-                    "routed experts allocate per token, which a capture cannot contain",
-                );
+                // token, and probation replays catch anything else. A routed layer groups its
+                // experts on the device, so its launches are the same on every token.
+                return None;
             }
             // gemma4 HD=512 still blocked.
             // F-dtype-only path: graph-safe ONLY when head_dim <= 256.
@@ -178,12 +158,6 @@ impl GenericHeteroTransformer {
         })
     }
 
-    /// Q8-KV decode captures when every layer is dense: a routed expert set allocates per
-    /// token, which a capture cannot contain.
-    pub fn q8_graph_dense(&self) -> bool {
-        self.layers.iter().all(|l| l.moe.is_none())
-    }
-
     /// Drop the F16 lm_head when nothing can use it.
     ///
     /// Whether decode captures a CUDA graph, and when it does not, WHY.
@@ -200,10 +174,16 @@ impl GenericHeteroTransformer {
         if self.layers.iter().any(|l| l.attn_sinks.is_some()) {
             return Err("attention sinks: the captured decode attention has no sink term");
         }
-        // A routed expert set allocates per token, which a capture cannot contain, whatever
-        // cache the attention writes.
-        if self.layers.iter().any(|l| l.moe.is_some()) {
-            return Err("routed experts: the expert set changes per token");
+        // The captured layer runs a mixture that reads the normed hidden alone; one beside a
+        // dense feed-forward, with its own norms, runs only in the eager forward.
+        if self
+            .layers
+            .iter()
+            .any(|l| l.moe.as_ref().is_some_and(|m| !m.router_prenormed))
+        {
+            return Err(
+                "a mixture beside a dense feed-forward: the captured layer has no such branch",
+            );
         }
         if let Some(why) = self.kv_state_graph_block() {
             return Err(why);
