@@ -249,7 +249,6 @@ impl ImageEngine {
             send("Loading encoder (2nd GPU), DiT (primary GPU), VAE (CPU)...");
             let qwen = crate::inference::engine::qwen_image_engine::load(
                 &hf_models_dir,
-                &model_name,
                 local_ckpt.as_deref(),
                 &primary,
                 geom,

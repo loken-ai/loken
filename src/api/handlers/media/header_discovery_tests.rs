@@ -72,7 +72,9 @@ fn every_shipped_single_file_layout_is_recognised() {
     for (want, names) in cases {
         let f = header_file(names);
         assert_eq!(
-            image_family_from_header(&f),
+            crate::inference::media_facts::read(&f)
+                .and_then(|m| m.image_family())
+                .map(ImageFamily::tag),
             Some(want),
             "layout {names:?} is not recognised, so a checkpoint in it is never advertised"
         );
@@ -92,7 +94,7 @@ fn non_generators_are_not_advertised() {
     ] {
         let f = header_file(&names);
         assert_eq!(
-            image_family_from_header(&f),
+            crate::inference::media_facts::read(&f).and_then(|m| m.image_family()),
             None,
             "{names:?} is not an image generator and must not be offered as one"
         );

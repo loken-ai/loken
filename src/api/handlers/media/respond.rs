@@ -358,26 +358,30 @@ pub(crate) fn composite_preserved(
 
 #[cfg(test)]
 mod alignment_tests {
-    use super::super::{align_to, image_model_defaults, regime_for};
+    use super::super::{align_to, fill_unset, image_model_defaults, regime_for};
 
     /// An adapter's regime fills in only what the CALLER left unset. A named step count
     /// is an instruction, and an adapter's preference does not outrank it.
     #[test]
     fn a_named_setting_outranks_the_adapter() {
-        let loras = vec![("lcm-lora-sdxl".to_string(), 1.0f32)];
+        let declared = Some(crate::inference::load::lora::SamplingRegime {
+            steps: 4,
+            guidance: 1.0,
+        });
         assert!(
-            regime_for(&loras, Some(30), Some(7.0)).is_none(),
+            fill_unset(declared, Some(30), Some(7.0)).is_none(),
             "both named"
         );
         // One of the two still leaves the other to fill.
         assert!(
-            regime_for(&loras, Some(30), None).is_some(),
+            fill_unset(declared, Some(30), None).is_some(),
             "guidance still unset"
         );
         assert!(
-            regime_for(&loras, None, Some(7.0)).is_some(),
+            fill_unset(declared, None, Some(7.0)).is_some(),
             "steps still unset"
         );
+        assert!(fill_unset(None, None, None).is_none(), "nothing declared");
     }
 
     /// A style adapter supplies nothing: its render keeps the model's own recipe.
@@ -399,7 +403,8 @@ mod alignment_tests {
     /// At SDXL's own alignment the height never reaches an odd latent.
     #[test]
     fn the_size_that_broke_sdxl_is_brought_onto_its_alignment() {
-        let sdxl = image_model_defaults("raymnants").unwrap();
+        let store = crate::api::handlers::media::tests::image_store("sdxl-align");
+        let sdxl = image_model_defaults(&store.dir, "sdxl-a").unwrap();
         assert_eq!(sdxl.align, 64, "SDXL halves the latent three times over");
         let (w, h) = align_to(1312, 784, sdxl.align, "test");
         assert_eq!(h % 64, 0, "784 -> {h}");
@@ -432,10 +437,12 @@ mod alignment_tests {
     /// away resolution on every edit that follows its source.
     #[test]
     fn each_family_states_its_own_requirement() {
-        assert_eq!(image_model_defaults("z-image").unwrap().align, 16);
-        assert_eq!(image_model_defaults("flux-schnell").unwrap().align, 16);
-        assert_eq!(image_model_defaults("qwen-image").unwrap().align, 16);
-        assert_eq!(image_model_defaults("raymnants").unwrap().align, 64);
+        let store = crate::api::handlers::media::tests::image_store("aligns");
+        let align = |id: &str| image_model_defaults(&store.dir, id).unwrap().align;
+        assert_eq!(align("z-image-turbo"), 16);
+        assert_eq!(align("flux-schnell"), 16);
+        assert_eq!(align("qwen-tune"), 16);
+        assert_eq!(align("sdxl-a"), 64);
     }
 
     /// Snapping DOWN must never reach zero: a tiny source would otherwise ask for a

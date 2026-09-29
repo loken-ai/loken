@@ -239,7 +239,7 @@ pub(crate) async fn ollama_chat(
     // Reject non-decoder pipeline components (CLIP, T5, whisper, parler)
     // before they reach the text engine, where the panic-on-missing-
     // weights path would tear down the worker thread.
-    if let Some(hint) = non_chat_pipeline_component(&model_name) {
+    if let Some(hint) = non_chat_pipeline_component(&state.huggingface_models_dir, &model_name) {
         return Err(ApiError::Validation(format!(
             "model '{model_name}' is not a chat model: {hint}",
         )));
@@ -293,7 +293,7 @@ pub(crate) async fn ollama_chat(
 
     // Check if this is an image generation model (e.g., Flux, Z-Image)
     #[cfg(feature = "image")]
-    if crate::api::handlers::family::is_image(&model_name) {
+    if crate::api::handlers::family::is_image(&state.huggingface_models_dir, &model_name) {
         // Extract prompt and images from last user message. Reject
         // explicitly when no user turn exists - the diffusion engine
         // would otherwise generate from an empty prompt and produce
@@ -878,7 +878,7 @@ pub(crate) async fn ollama_generate(
             // Image models (Flux, Z-Image) don't use the GGUF engine path.
             // Return a "load" response and let the actual generation call handle loading.
             #[cfg(feature = "image")]
-            if crate::api::handlers::family::is_image(&model_name) {
+            if crate::api::handlers::family::is_image(&state.huggingface_models_dir, &model_name) {
                 info!(
                     "Image model load request for {} - will load on first generation",
                     model_name
@@ -932,7 +932,7 @@ pub(crate) async fn ollama_generate(
 
     // Same guard as ollama_chat - reject component-only repos before
     // they panic the text engine.
-    if let Some(hint) = non_chat_pipeline_component(&model_name) {
+    if let Some(hint) = non_chat_pipeline_component(&state.huggingface_models_dir, &model_name) {
         return Err(ApiError::Validation(format!(
             "model '{model_name}' is not a generation model: {hint}",
         )));
@@ -948,7 +948,7 @@ pub(crate) async fn ollama_generate(
 
     // Check if this is an image generation model (e.g., Flux, Z-Image)
     #[cfg(feature = "image")]
-    if crate::api::handlers::family::is_image(&model_name) {
+    if crate::api::handlers::family::is_image(&state.huggingface_models_dir, &model_name) {
         return handle_image_generation(&state, &model_name, &request).await;
     }
 

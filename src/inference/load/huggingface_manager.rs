@@ -315,6 +315,17 @@ impl HuggingFaceManager {
                 }
             }
         }
+        // A cache whose refs name no snapshot on disk: its one snapshot is the checkout.
+        let snapshots: Vec<PathBuf> = std::fs::read_dir(model_dir.join("snapshots"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        if let [only] = snapshots.as_slice() {
+            return Some(only.clone());
+        }
 
         // Try flat layout: model_id is a GGUF filename
         // A bare name arrives as `name:latest` from the Ollama-style normalisation; the
@@ -351,6 +362,30 @@ impl HuggingFaceManager {
         }
 
         None
+    }
+
+    /// The id of the cached repository `name` names: its full id, or its name without the
+    /// owner, either compared without regard to case. `None` when no cached repository
+    /// answers to it, or when two owners' repositories share the name.
+    pub fn repository_named(&self, name: &str) -> Option<String> {
+        let mut found: Option<String> = None;
+        for entry in std::fs::read_dir(&self.models_dir).ok()?.flatten() {
+            let dir = entry.file_name().to_string_lossy().to_string();
+            let Some(id) = dir.strip_prefix("models--").map(|s| s.replace("--", "/")) else {
+                continue;
+            };
+            let short = id.rsplit('/').next().unwrap_or(&id);
+            if id.eq_ignore_ascii_case(name) {
+                return Some(id);
+            }
+            if short.eq_ignore_ascii_case(name) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(id);
+            }
+        }
+        found
     }
 
     /// Pull a model from HuggingFace (async HTTP download)

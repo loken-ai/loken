@@ -764,7 +764,7 @@ pub struct BooguTransformer2DModel {
     x_embedder: QLinear, // [patch^2*in_ch -> hidden]
     // NOT loaded: `ref_image_patch_embedder`, `image_index_embedding` and the
     // `ref_image_refiner` stack. They are the checkpoint's instruction-edit path, which
-    // nothing here drives - `model_capabilities` advertises this family as txt2img only.
+    // nothing here drives - `media_capabilities` advertises this family as txt2img only.
     // They were being read onto the card anyway, `num_refiner_layers` blocks of them,
     // and then never touched. Restore all three together when the edit path is wired.
     // block stacks.

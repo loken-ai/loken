@@ -343,7 +343,10 @@ pub(super) async fn conversation_image_stream(
     use crate::inference::engine::image_engine::ImageStreamEvent;
     use axum::response::sse::Event;
 
-    let side = match crate::api::handlers::media::image_model_defaults(&model) {
+    let side = match crate::api::handlers::media::image_model_defaults(
+        &state.huggingface_models_dir,
+        &model,
+    ) {
         Ok(d) => d.size,
         Err(e) => return conv_err(StatusCode::BAD_REQUEST, &e),
     };
@@ -480,7 +483,10 @@ pub(crate) async fn conversation_handler(
     if route == ConvRoute::ImageGen {
         let model = s("image_model")
             .unwrap_or_else(|| crate::api::handlers::media::DEFAULT_IMAGE_MODEL.to_string());
-        let hot = match crate::api::handlers::media::image_model_defaults(&model) {
+        let hot = match crate::api::handlers::media::image_model_defaults(
+            &state.huggingface_models_dir,
+            &model,
+        ) {
             Ok(d) => crate::api::handlers::media::image_hot_bytes(
                 &state,
                 &model,
@@ -495,7 +501,7 @@ pub(crate) async fn conversation_handler(
             crate::api::handlers::media::image_served_here(&state, &model).await,
             state.card_holds(hot),
             hot,
-            |peer| crate::api::handlers::media::serves_image_family(peer, &model),
+            |peer| crate::api::handlers::media::holds_image_model(peer, &model),
             &crate::api::handlers::CONVERSATION,
             &req,
         )
@@ -664,7 +670,10 @@ pub(crate) async fn conversation_handler(
             let _media_guard = state.media_lock_for(&model, "image").await;
             // This route names no size, so it renders at the family default -
             // which is what the placement must reserve scratch for.
-            let side = match crate::api::handlers::media::image_model_defaults(&model) {
+            let side = match crate::api::handlers::media::image_model_defaults(
+                &state.huggingface_models_dir,
+                &model,
+            ) {
                 Ok(d) => d.size,
                 Err(e) => return conv_err(StatusCode::BAD_REQUEST, &e),
             };

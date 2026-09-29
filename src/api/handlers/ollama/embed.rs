@@ -19,7 +19,7 @@ pub(crate) async fn list_models(
     match manager.list_models().await {
         Ok(mut models) => {
             #[cfg(feature = "media")]
-            inject_local_boogu(&state, &mut models);
+            inject_local_media(&state, &mut models);
             let count = models.len();
             info!("   Found {} model(s)", count);
             // Stable alphabetical order matching /api/tags and /v1/models
@@ -141,7 +141,7 @@ pub(crate) async fn ollama_ps(
         let parameter_size = estimate_parameter_size(model_size, format_str);
         let details = OllamaModelDetails {
             format: format_str.to_string(),
-            family: reported_family(&entry.model_id, None, || {
+            family: reported_family(None, None, || {
                 weights.as_deref().and_then(file_architecture)
             }),
             families: None,
@@ -196,12 +196,16 @@ pub(crate) async fn ollama_ps(
         let parameter_size = estimate_parameter_size(img_size, "safetensors");
         models.push(OllamaPsModel {
             name: img_info.name.clone(),
-            model: img_info.name,
+            model: img_info.name.clone(),
             size: img_size,
             digest: placeholder_digest.clone(),
             details: OllamaModelDetails {
                 format: "safetensors".to_string(),
-                family: reported_family(&img_info.model_type, None, || None),
+                family: reported_family(
+                    media_facts(&state.huggingface_models_dir, &img_info.name).as_ref(),
+                    None,
+                    || None,
+                ),
                 families: None,
                 parameter_size,
                 quantization_level: None,
@@ -224,7 +228,11 @@ pub(crate) async fn ollama_ps(
             digest: placeholder_digest.clone(),
             details: OllamaModelDetails {
                 format: "safetensors".to_string(),
-                family: reported_family(&asr_info.name, None, || None),
+                family: reported_family(
+                    media_facts(&state.huggingface_models_dir, &asr_info.name).as_ref(),
+                    None,
+                    || None,
+                ),
                 families: None,
                 parameter_size: "unknown".to_string(),
                 quantization_level: None,
@@ -246,7 +254,11 @@ pub(crate) async fn ollama_ps(
             digest: placeholder_digest,
             details: OllamaModelDetails {
                 format: "safetensors".to_string(),
-                family: reported_family(&tts_name, None, || None),
+                family: reported_family(
+                    media_facts(&state.huggingface_models_dir, &tts_name).as_ref(),
+                    None,
+                    || None,
+                ),
                 families: None,
                 parameter_size: "unknown".to_string(),
                 quantization_level: None,

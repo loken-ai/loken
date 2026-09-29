@@ -433,28 +433,29 @@ pub(crate) async fn video_generations(
             // own and a load both return a String, a render a boxed error - so all are
             // flattened to one message here rather than left to type inference, which had
             // them disagreeing about what `made` even holds.
-            let made: Result<String, String> = match image_model_defaults(&img_model) {
-                Err(e) => Err(e),
-                Ok(d) => {
-                    let params = crate::inference::engine::image_engine::ImageGenParams {
-                        height: side_h,
-                        width: side_w,
-                        num_steps: d.steps,
-                        guidance: d.guidance,
-                        seed: Some(seed),
-                        ..Default::default()
-                    };
-                    match ensure_image_model_loaded(&state, &img_model, geom).await {
-                        Ok(()) => {
-                            generate_image_resilient(&state, &img_model, geom, &prompt, params)
-                                .await
-                                .map(|rendered| rendered.png_base64)
-                                .map_err(|e| e.to_string())
+            let made: Result<String, String> =
+                match image_model_defaults(&state.huggingface_models_dir, &img_model) {
+                    Err(e) => Err(e),
+                    Ok(d) => {
+                        let params = crate::inference::engine::image_engine::ImageGenParams {
+                            height: side_h,
+                            width: side_w,
+                            num_steps: d.steps,
+                            guidance: d.guidance,
+                            seed: Some(seed),
+                            ..Default::default()
+                        };
+                        match ensure_image_model_loaded(&state, &img_model, geom).await {
+                            Ok(()) => {
+                                generate_image_resilient(&state, &img_model, geom, &prompt, params)
+                                    .await
+                                    .map(|rendered| rendered.png_base64)
+                                    .map_err(|e| e.to_string())
+                            }
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
                     }
-                }
-            };
+                };
             // The card goes back to the denoiser by the pressure protocol immediately
             // below, which reclaims idle residents least-recently-used first - the image
             // model having just become one. Unloading it here by hand would duplicate that
@@ -884,7 +885,7 @@ pub(crate) async fn images_generations(
     }
 
     // Picks: Z-Image defaults to 1024 @ 9 steps; Flux schnell to 512 @ 4.
-    let defaults = match image_model_defaults(&model_name) {
+    let defaults = match image_model_defaults(&state.huggingface_models_dir, &model_name) {
         Ok(d) => d,
         Err(e) => return err_resp(axum::http::StatusCode::BAD_REQUEST, e),
     };
@@ -905,7 +906,7 @@ pub(crate) async fn images_generations(
         super::image_served_here(&state, &model_name).await,
         state.card_holds(super::image_hot_bytes(&state, &model_name, geom)),
         super::image_hot_bytes(&state, &model_name, geom),
-        |peer| super::serves_image_family(peer, &model_name),
+        |peer| super::holds_image_model(peer, &model_name),
         &super::super::IMAGES,
         &body.0,
     )
@@ -917,16 +918,8 @@ pub(crate) async fn images_generations(
     // and letting them try is what produced the OOM storm (see `media_gate`).
     let _media_guard = state.media_lock_for(&model_name, "image").await;
 
-    // FLUX Kontext is a dev-family (guidance-distilled) editor: it needs many more steps
-    // than schnell (4) for a faithful, sharp edit, and a lower guidance. Override the flux
-    // defaults (measured: 4 steps blurs edges, 28 steps ~matches the input's edge sharpness).
-    let is_kontext_model = model_name.to_lowercase().contains("kontext");
-    let default_steps: usize = if is_kontext_model { 28 } else { defaults.steps };
-    let default_guidance: f64 = if is_kontext_model {
-        2.5
-    } else {
-        defaults.guidance
-    };
+    let default_steps: usize = defaults.steps;
+    let default_guidance: f64 = defaults.guidance;
     // Default to 1 when absent. The `n == 0` / `n > 10` guards below
     // catch explicit-zero + over-cap consistently across all three
     // image endpoints.

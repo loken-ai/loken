@@ -37,21 +37,6 @@ const REL_MMPROJ: &str = "qwen2.5-vl/mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf";
 const DIT_BLOCK_DTYPE: crate::tensor::quantized::GgmlDType =
     crate::tensor::quantized::GgmlDType::Q4K;
 
-/// True when a checkpoint of this family is STEP-DISTILLED: the teacher's
-/// classifier-free guidance is folded into the weights, so the sampler runs a single
-/// branch over a handful of steps with the fixed shift the distill's own scheduler
-/// declares - rather than the family's resolution-dependent one.
-///
-/// Detected by name because a bare weights file carries no scheduler: the distillation
-/// is a property of how the checkpoint was TRAINED, not of any tensor in it.
-pub fn is_step_distilled(model_name: &str) -> bool {
-    model_name.to_lowercase().contains("flash")
-}
-
-/// The fixed sigma shift a step-distilled checkpoint of this family samples with
-/// (`scheduler_config.json`: `use_dynamic_shifting: false`, `shift: 3.0`).
-const DISTILLED_SHIFT: f32 = 3.0;
-
 /// How the resident checkpoint wants its sigmas built.
 #[derive(Clone, Copy, Debug)]
 enum SigmaShift {
@@ -316,7 +301,6 @@ fn runtime_reserve(dit_path: &std::path::Path, width: usize, height: usize) -> u
 /// Errors only if paths are missing.
 pub fn load(
     hf_models_dir: &str,
-    model_name: &str,
     local_ckpt: Option<&std::path::Path>,
     _primary: &Device,
     geom: crate::inference::place::runtime_demand::RequestGeometry,
@@ -425,13 +409,14 @@ pub fn load(
         (cpu_vae, None)
     };
 
-    // The sampler profile belongs to the RESIDENT checkpoint, so it is decided once here
-    // rather than re-derived from a name on every generation.
-    let shift = if is_step_distilled(model_name) {
-        info!("Qwen-Image: step-distilled checkpoint - fixed shift {DISTILLED_SHIFT}, single-branch sampler");
-        SigmaShift::Fixed(DISTILLED_SHIFT)
-    } else {
-        SigmaShift::Dynamic
+    // The sampler profile belongs to the RESIDENT checkpoint: the shift its scheduler
+    // configuration fixes, else the family's resolution-dependent one.
+    let shift = match crate::inference::media_facts::read(&dit_path).and_then(|f| f.fixed_shift) {
+        Some(shift) => {
+            info!("Qwen-Image: the checkpoint's scheduler fixes shift {shift}");
+            SigmaShift::Fixed(shift)
+        }
+        None => SigmaShift::Dynamic,
     };
 
     let cfg = dit.config().clone();
@@ -917,6 +902,9 @@ fn tokens_to_png(
 mod tests {
     use super::*;
 
+    /// The shift a distilled checkpoint's scheduler configuration fixes.
+    const DISTILLED_SHIFT: f32 = 3.0;
+
     /// The distilled schedule against the values diffusers produces for this
     /// checkpoint's own scheduler config (`shift: 3.0`, `use_dynamic_shifting: false`)
     /// at its trained step count: base `linspace(1, 1/steps, steps)` = [1, .75, .5, .25]
@@ -956,13 +944,5 @@ mod tests {
         assert!(!needs_guidance_branch(1.0));
         assert!(needs_guidance_branch(4.0));
         assert!(needs_guidance_branch(3.5));
-    }
-
-    #[test]
-    fn step_distilled_detects_the_flash_checkpoint_only() {
-        assert!(is_step_distilled("qwen-image-flash"));
-        assert!(is_step_distilled("Qwen-Image-Flash"));
-        assert!(!is_step_distilled("qwen-image"));
-        assert!(!is_step_distilled("rayqwest"));
     }
 }

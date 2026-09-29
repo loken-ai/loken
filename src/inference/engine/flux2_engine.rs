@@ -320,13 +320,6 @@ fn to_png(img: &NT) -> AnyResult<String> {
         .map_err(|e| anyhow!("FLUX.2 PNG encode: {e}"))
 }
 
-/// True when this model name is served by this engine. The weights live in a plain `flux2-*`
-/// directory, so the name is the directory tag the catalogue advertises.
-pub fn is_flux2_model(model_name: &str) -> bool {
-    let l = model_name.to_lowercase();
-    l.contains("flux2") || l.contains("flux.2") || l.contains("klein")
-}
-
 /// Where this family's weights live, for the presence check the catalogue does.
 pub fn weights_dir(hf_models_dir: &str) -> std::path::PathBuf {
     std::path::Path::new(hf_models_dir).join(REL_DIR)
@@ -335,17 +328,6 @@ pub fn weights_dir(hf_models_dir: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn family_detection_covers_the_names_the_catalogue_can_produce() {
-        for n in ["flux2-klein-4b", "FLUX.2-klein-9B", "klein"] {
-            assert!(is_flux2_model(n), "{n} not detected");
-        }
-        // Must NOT swallow the FLUX.1 family, which a substring match on "flux" would.
-        for n in ["flux", "flux-schnell", "rayflux", "flux-kontext"] {
-            assert!(!is_flux2_model(n), "{n} wrongly claimed by FLUX.2");
-        }
-    }
 
     /// The reserve must follow the REQUEST. A flat figure is wrong in both directions: it
     /// over-reserves at 512 and under-reserves above the size it was written for.

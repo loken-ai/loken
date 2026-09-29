@@ -123,9 +123,6 @@ fn compared(before: &str, after: &str) -> bool {
 /// The text model name a literal holds, if any.
 fn named(literal: &str) -> Option<&'static str> {
     let lower = literal.to_lowercase();
-    if crate::api::handlers::media_family(&lower).is_some() {
-        return None;
-    }
     NAMES.iter().copied().find(|name| {
         lower.match_indices(name).any(|(at, _)| {
             lower[..at]
@@ -197,6 +194,7 @@ fn the_gate_sees_every_comparison_shape() {
         r#"    "phi3" | "phi4" => Format::Phi,"#,
         r#"    "deepseek-r1" => 1,"#,
         r#"let x = m.ends_with("-GLM");"#,
+        r#"if lower.contains("qwen-image") {"#,
     ];
     for line in caught {
         assert!(!violations(line).is_empty(), "missed: {line}");
@@ -206,7 +204,6 @@ fn the_gate_sees_every_comparison_shape() {
         r#"let s = "<|im_start|>";"#,
         r#"Self::LlamaGuard => "llama-guard","#,
         r#"if t.contains("graphic") {"#,
-        r#"if lower.contains("qwen-image") {"#,
         r#"println!("loading gemma"); // "gemma" =>"#,
         "#[cfg(test)]\nmod tests {\n    x.contains(\"gemma\");\n}",
     ];

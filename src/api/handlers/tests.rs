@@ -247,57 +247,56 @@ fn estimate_token_count_uses_word_count_times_1_3() {
 }
 
 #[test]
-fn non_chat_pipeline_component_routes_helpfully() {
-    // Each rejection must explain WHAT the model is and WHERE to use
-    // it (or that it can't be used standalone). A previous user
-    // attempt to chat with CLIP panicked the text-engine worker
-    // thread because the loader bailed with blocking_lock on a
-    // tokio runtime - see the loader in `inference/engine/llm_engine/`.
-    let clip = non_chat_pipeline_component("openai/clip-vit-large-patch14").unwrap();
-    assert!(clip.contains("CLIP"), "got: {clip}");
-    assert!(
-        clip.contains("Flux"),
-        "should suggest using Flux instead: {clip}"
+fn a_pipeline_component_is_refused_for_what_its_files_declare() {
+    use crate::inference::media_facts::fixture::{json, Scratch};
+    let s = Scratch::new("components");
+    let repo = |id: &str, file: &str, content: serde_json::Value| {
+        let dir =
+            s.0.join("hub")
+                .join(format!("models--{}", id.replace('/', "--")));
+        std::fs::create_dir_all(dir.join("refs")).unwrap();
+        std::fs::write(dir.join("refs/main"), "r").unwrap();
+        json(&dir.join("snapshots/r").join(file), content);
+    };
+    repo(
+        "Owner/encoder",
+        "config.json",
+        serde_json::json!({"model_type": "clip"}),
     );
-
-    let t5 = non_chat_pipeline_component("google/t5-v1_1-xxl").unwrap();
-    assert!(t5.contains("T5"), "got: {t5}");
-
-    // Whisper is NOT rejected here on the Ollama /api/chat path  -
-    // it routes to handle_chat_asr (which decodes attached audio
-    // from images[] and returns the transcript). The OpenAI-shape
-    // chat_completion / text_completions handlers still 400 on
-    // whisper via their is_asr_model branch since the OpenAI
-    // request envelope has no input-bytes field.
-    assert!(
-        non_chat_pipeline_component("openai/whisper-small").is_none(),
-        "whisper must reach handle_chat_asr on /api/chat, not the early-reject path"
+    repo(
+        "Owner/text-encoder",
+        "config.json",
+        serde_json::json!({"model_type": "t5"}),
     );
-
-    // Parler / other TTS models are NOT rejected here - they're
-    // routed to handle_chat_tts on /api/chat and /api/generate so
-    // the GUI's "type text, get audio" UX works through the chat
-    // tab. Whisper still rejects (ASR is post-binary-audio, not
-    // text-driven generation).
-    assert!(
-        non_chat_pipeline_component("parler-tts/parler-tts-mini-v1").is_none(),
-        "TTS models must reach handle_chat_tts, not the early-reject path"
+    repo("Owner/tokenizers", "tokenizer.json", serde_json::json!({}));
+    repo(
+        "Owner/asr",
+        "config.json",
+        serde_json::json!({"model_type": "whisper"}),
     );
-    assert!(
-        non_chat_pipeline_component("tts-1-hd").is_none(),
-        "OpenAI-style tts-1 aliases also must reach handle_chat_tts"
+    repo(
+        "Owner/speech",
+        "config.json",
+        serde_json::json!({"model_type": "parler_tts"}),
     );
-
-    let tk = non_chat_pipeline_component("lmz/mt5-tokenizers").unwrap();
-    assert!(tk.contains("tokenizer"), "got: {tk}");
-
-    // Generation models pass through cleanly.
-    assert!(non_chat_pipeline_component("Tongyi-MAI/Z-Image-Turbo").is_none());
-    assert!(non_chat_pipeline_component("lmz/candle-flux").is_none());
-    assert!(non_chat_pipeline_component("qwen3-coder:latest").is_none());
-    assert!(non_chat_pipeline_component("gemma4:26b").is_none());
-    // Edge: empty input -> not rejected (defer to normal validation).
-    assert!(non_chat_pipeline_component("").is_none());
+    for id in ["Owner--asr", "Owner--speech"] {
+        let weights =
+            s.0.join(format!("hub/models--{id}/snapshots/r/model.safetensors"));
+        std::fs::write(weights, b"").unwrap();
+    }
+    let hf = s.0.to_str().unwrap();
+    for id in ["Owner/encoder", "encoder", "text-encoder"] {
+        let hint = non_chat_pipeline_component(hf, id).unwrap_or_default();
+        assert!(hint.contains("component"), "{id}: {hint}");
+    }
+    let hint = non_chat_pipeline_component(hf, "tokenizers").unwrap_or_default();
+    assert!(hint.contains("no weights"), "got: {hint}");
+    // Transcription and speech reach their own handlers from the chat routes.
+    assert!(non_chat_pipeline_component(hf, "Owner/asr").is_none());
+    assert!(non_chat_pipeline_component(hf, "speech").is_none());
+    // A name no file answers to is left to the normal resolution.
+    assert!(non_chat_pipeline_component(hf, "qwen3-coder:latest").is_none());
+    assert!(non_chat_pipeline_component(hf, "").is_none());
 }
 
 // -- humanize_validation_error --
@@ -435,12 +434,7 @@ fn humanize_validation_error_empty_errors_falls_back_to_generic() {
     );
 }
 
-// -- model_capabilities -----------------------------------------
-// /api/show used to hardcode ["completion","embedding"] for every
-// model, even for image-gen / TTS / ASR checkpoints that can't
-// fulfil either. Pin the modality-aware split so a future
-// additional classifier (video-gen, embedding-only model, ...)
-// can't silently regress to the old hardcoded list.
+// -- capabilities -----------------------------------------------
 
 /// A HuggingFace model's vision is read from its files, whatever it is called: a
 /// projector beside its GGUF file, or a `vision_config` in its checkpoint's config.
@@ -464,72 +458,51 @@ fn vision_is_read_from_the_files() {
 }
 
 #[test]
-fn a_text_model_is_offered_for_chat() {
-    // What `/api/tags` advertises drives what an SDK will route at a model. A text LLM that
-    // does not say `chat` disappears from every client's model picker.
-    for name in [
-        "qwen3-coder:latest",
-        "deepseek-r1:32b",
-        "llama3:8b",
-        "moondream:1.8b", // vision, but still text-capable
-        "",               // unknown -> defaults to text
-    ] {
-        let caps = model_capabilities(name);
-        assert!(
-            caps.contains(&"completion".to_string()),
-            "{name} should be offered for chat; it advertises {caps:?}"
-        );
-    }
+fn a_declared_text_model_is_offered_for_chat_or_embedding() {
+    // What `/api/tags` advertises drives what an SDK will route at a model: a text LLM that
+    // does not say `completion` disappears from every client's model picker. The header's
+    // pooling declaration decides between completion and embedding.
+    assert_eq!(capabilities_of(None, Some(false)), ["completion"]);
+    assert_eq!(capabilities_of(None, Some(true)), ["embedding"]);
+    // Files that declare neither a text model nor a media pipeline can do nothing here.
+    assert!(capabilities_of(None, None).is_empty());
 }
 
 #[test]
 fn a_model_that_cannot_chat_is_never_offered_for_it() {
-    // The invariant that matters, and it holds across the whole non-LLM range rather than
-    // one family at a time: whatever an image, speech or music model advertises, routing a
-    // conversation at it fails, so `chat` must not be among it.
-    for name in [
-        "flux-schnell",
-        "flux-dev:fp16",
-        "Tongyi-MAI/Z-Image-Turbo",
-        "stable-diffusion-3-medium",
-        "whisper-large-v3",
-        "openai/whisper-small",
-        "parler-tts/parler-tts-mini-v1",
-        "openai/tts-1",
-        "stable-audio-open-1.0",
-        "ace-step-v1",
-        "wan2.2-t2v",
+    // Whatever an image, speech or music checkpoint advertises, routing a conversation at
+    // it fails, so `completion` must not be among it - even when a text architecture is
+    // declared beside it.
+    use crate::inference::media_facts::{
+        ImageFamily, MediaFacts, MediaKind, SoundKind, SpeechModel, TranscriptionModel,
+    };
+    for kind in [
+        MediaKind::Image(ImageFamily::Flux),
+        MediaKind::Image(ImageFamily::ZImage),
+        MediaKind::Video,
+        MediaKind::Transcription(TranscriptionModel::Whisper),
+        MediaKind::Speech(SpeechModel::Parler),
+        MediaKind::Sound(SoundKind::ConditionedDiffusion),
+        MediaKind::Sound(SoundKind::LatentDiffusion),
+        MediaKind::Music,
     ] {
-        let caps = model_capabilities(name);
+        let facts = MediaFacts {
+            kind,
+            guidance_embedded: false,
+            instruction_edit: false,
+            distilled: false,
+            fixed_shift: None,
+        };
+        let caps = capabilities_of(Some(&facts), Some(false));
         assert!(
             !caps.is_empty(),
-            "{name} advertises nothing at all, so no client can reach it"
+            "{kind:?} advertises nothing at all, so no client can reach it"
         );
         assert!(
             !caps.contains(&"completion".to_string()),
-            "{name} is not a conversational model but advertises chat: {caps:?}"
+            "{kind:?} is not a conversational model but advertises chat: {caps:?}"
         );
     }
-}
-
-#[test]
-fn a_readable_header_decides_between_completion_and_embedding() {
-    // The file's pooling declaration overrides what the name suggests.
-    assert_eq!(
-        file_capabilities("embeddinggemma", Some(true)),
-        ["embedding"]
-    );
-    assert_eq!(
-        file_capabilities("my-embed-chat", Some(false)),
-        ["completion"]
-    );
-    // An unreadable file leaves a text model offered for completion, whatever its name.
-    assert_eq!(file_capabilities("nomic-embed-text", None), ["completion"]);
-    // A media family named by the model keeps its own capabilities.
-    assert_eq!(
-        file_capabilities("whisper-large-v3", Some(false)),
-        model_capabilities("whisper-large-v3")
-    );
 }
 
 #[test]
@@ -643,14 +616,19 @@ fn no_log_line_carries_user_text() {
 
 #[cfg(feature = "image")]
 #[test]
-fn a_peer_holds_an_image_family_under_any_checkpoint_name() {
+fn a_peer_holds_an_image_model_under_the_names_its_catalogue_answers_to() {
     use crate::distributed::membership::NodeState;
     let mut peer = NodeState::default();
-    assert!(!super::media::serves_image_family(&peer, "z-image"));
+    assert!(!super::media::holds_image_model(&peer, "z-image-turbo"));
     peer.serves = Some(vec!["qwen3:8b".into(), "Tongyi-MAI/Z-Image-Turbo".into()]);
-    assert!(super::media::serves_image_family(&peer, "z-image"));
-    assert!(!super::media::serves_image_family(&peer, "flux-schnell"));
-    assert!(!super::media::serves_image_family(&peer, "qwen3:8b"));
+    assert!(super::media::holds_image_model(&peer, "z-image-turbo"));
+    assert!(super::media::holds_image_model(
+        &peer,
+        "Tongyi-MAI/Z-Image-Turbo:latest"
+    ));
+    assert!(!super::media::holds_image_model(&peer, "flux-schnell"));
+    peer.serves = Some(vec!["lmz/candle-flux".into()]);
+    assert!(super::media::holds_image_model(&peer, "flux-schnell"));
 }
 
 #[test]

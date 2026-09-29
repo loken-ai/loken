@@ -89,8 +89,8 @@ impl UnloadOutcome {
 impl ResidentEngine {
     /// Does `model_id` name what this engine is holding?
     ///
-    /// Pure, so the whole table can be tested without standing up an engine (the trick
-    /// `image_family_matches_catalog_id` already uses). `loaded` is the engine's own
+    /// Pure, so the whole table can be tested without standing up an engine. `loaded` is
+    /// the engine's own
     /// answer to "what have you got", `None` when it holds nothing - and an engine
     /// holding nothing claims nothing, which is what stops an unload from reporting
     /// freed VRAM that was never allocated.
@@ -105,10 +105,13 @@ impl ResidentEngine {
             // already the entry's own id.
             ResidentEngine::Llm => loaded == model_id,
             #[cfg(feature = "image")]
-            ResidentEngine::Image => bare(loaded) == bare(model_id) || is_z_image_model(model_id),
+            ResidentEngine::Image => bare(loaded).eq_ignore_ascii_case(&bare(model_id)),
+            // Through the engine's OWN id resolution, as for the TTS engine below.
             #[cfg(feature = "audio")]
             ResidentEngine::Asr => {
-                bare(loaded) == bare(model_id) || model_id.starts_with("whisper")
+                crate::inference::engine::audio_engine::resolve_whisper_model_id(Some(&bare(
+                    model_id,
+                ))) == loaded
             }
             // Through the engine's OWN id resolution, so "tts-1", "parler-tts-mini-v1"
             // and the full repo id all name the checkpoint they load.

@@ -49,7 +49,7 @@ pub(crate) async fn ollama_list_models(
     match manager.list_models().await {
         Ok(mut models) => {
             #[cfg(feature = "media")]
-            inject_local_boogu(&state, &mut models);
+            inject_local_media(&state, &mut models);
             // Only models this node can actually load: present weights, and a format the text
             // loader reads. A manifest that names a deleted blob is not one a client can ask for.
             models.retain(|m| state.serves_weights(m));
@@ -80,14 +80,18 @@ pub(crate) async fn ollama_list_models(
                         ModelSource::HuggingFace => "safetensors",
                         _ => "gguf",
                     };
-                    // What the checkpoint says about itself, read from its header, then
-                    // the name and the byte size where it says nothing.
-                    // A media checkpoint outside the Ollama store declares no text facts.
+                    // What the checkpoint says about itself: the media pipeline its files
+                    // declare, else the text model its header or configuration declares.
+                    let hf = state.huggingface_models_dir.as_str();
+                    let media = match source {
+                        ModelSource::Ollama => None,
+                        _ => media_facts(hf, &m.id),
+                    };
                     let weights = match source {
                         ModelSource::Ollama => state.manifest_layer_path(&m.id, "model"),
-                        _ if media_family(&m.id).is_some() => None,
+                        _ if media.is_some() => None,
                         _ => crate::inference::load::huggingface_manager::HuggingFaceManager::new(
-                            std::path::PathBuf::from(&state.huggingface_models_dir),
+                            std::path::PathBuf::from(hf),
                         )
                         .get_model_path(&m.id),
                     };
@@ -96,8 +100,13 @@ pub(crate) async fn ollama_list_models(
                         Some(w) => header_facts(w),
                         None => (None, None, None, false),
                     };
-                    let capabilities = file_capabilities(&m.id, arch.as_ref().map(|_| pools));
-                    let family = reported_family(&m.id, arch, || None);
+                    // An Ollama-store model is a text GGUF whether or not its header reads.
+                    let text = match source {
+                        ModelSource::Ollama => Some(pools),
+                        _ => arch.as_ref().map(|_| pools),
+                    };
+                    let capabilities = capabilities_of(media.as_ref(), text);
+                    let family = reported_family(media.as_ref(), arch, || None);
                     let details = OllamaModelDetails {
                         format: format_str.to_string(),
                         families: Some(vec![family.clone()]),
@@ -113,7 +122,7 @@ pub(crate) async fn ollama_list_models(
                             .with_digest(m.digest)
                             .with_details(details);
                         om.capabilities = capabilities;
-                        om.defaults = media_model_defaults(&m.id);
+                        om.defaults = media.as_ref().and_then(media_model_defaults);
                         om
                     }
                 })
@@ -134,311 +143,89 @@ pub(crate) async fn ollama_list_models(
     }
 }
 
+/// Add the media checkpoints of the local stores to a listing: the registered pipelines and
+/// the checkpoints dropped into weight directories, which the Hugging Face cache listing does
+/// not name. When a registered Boogu entry is present, a cache repository whose files
+/// declare that family is dropped: its loader reads the registered directory, so the
+/// repository is not independently loadable.
 #[cfg(feature = "media")]
-/// Surface Boogu-Image (text-to-image) in the model list. Its weights live in a plain `boogu/`
-/// subdir (not HF-cache `models--*` format), so the standard managers don't discover it; the GUI's
-/// dynamic image-model dropdown filters /api/tags by `details.family`, so it needs a listing. Adds
-/// a synthetic `boogu` entry only when the DiT checkpoint is actually present on disk.
-pub(crate) fn inject_local_boogu(
+pub(crate) fn inject_local_media(
     state: &APIServer,
     models: &mut Vec<crate::inference::load::model_manager::ModelMetadata>,
 ) {
-    // Local single-model weight dirs the standard managers don't list (plain subdirs, not
-    // HF-cache repos). Each becomes one synthetic catalog entry when its weights exist.
-    // `dedup_family`: collapse same-family manager entries into the canonical local one (used
-    // when discovered repo variants are not independently loadable, like the Boogu GGUFs);
-    // None = the entry coexists with other models of its family (rayflux next to Flux GGUFs).
-    struct LocalModel {
-        id: &'static str,
-        rel: &'static str,
-        dedup_family: Option<&'static str>,
+    let hf = state.huggingface_models_dir.as_str();
+    let entries = local_media_entries(hf);
+    let boogu = Some(crate::inference::media_facts::ImageFamily::Boogu);
+    let registered = |e: &MediaEntry| {
+        crate::inference::media_facts::read(&e.path).and_then(|f| f.image_family()) == boogu
+    };
+    if entries.iter().any(registered) {
+        models.retain(|m| {
+            m.source != "huggingface"
+                || media_facts(hf, &m.id).and_then(|f| f.image_family()) != boogu
+        });
     }
-    const LOCAL_MODELS: &[LocalModel] = &[LocalModel {
-        id: "boogu",
-        rel: "boogu/diffusion_models/boogu_image_turbo_fp8_scaled.safetensors",
-        dedup_family: Some("boogu"),
-    }];
-    // Media engines resolved through snapshot/config dirs (not fixed rels):
-    // advertise each one whose weights are actually present, so clients can
-    // build audio/music pickers dynamically.
-    {
-        let mut push = |id: &str, path: std::path::PathBuf| {
-            let Ok(meta) = std::fs::metadata(&path) else {
-                return;
-            };
-            models.push(crate::inference::load::model_manager::ModelMetadata {
-                id: id.to_string(),
-                name: id.to_string(),
-                size: meta.len(),
-                downloaded_at: chrono::Utc::now().to_rfc3339(),
-                files: vec![path.to_string_lossy().into_owned()],
-                source: "huggingface".to_string(),
-                digest: "sha256:0000000000000000000000000000000000000000".to_string(),
-            });
-        };
-        if let Some(dir) = crate::inference::model::stable_audio::model_dir() {
-            push("stable-audio", dir.join("model.safetensors"));
-        }
-        push(
-            "ezaudio",
-            crate::inference::model::ezaudio::vae::ezaudio_pt("ckpts/s3/ezaudio_s3_l.pt"),
-        );
-        for v in ["turbo", "sft", "base", "xl-turbo", "xl-sft", "xl-base"] {
-            let gguf = match v {
-                "turbo" => "acestep-v15-turbo-Q8_0.gguf".to_string(),
-                "sft" => "acestep-v15-sft-Q8_0.gguf".to_string(),
-                "base" => "acestep-v15-base-Q8_0.gguf".to_string(),
-                "xl-turbo" => "acestep-v15-xl-turbo-Q8_0.gguf".to_string(),
-                "xl-sft" => "acestep-v15-xl-sft-Q8_0.gguf".to_string(),
-                "xl-base" => "acestep-v15-xl-base-Q8_0.gguf".to_string(),
-                _ => format!("acestep-v15-{v}-Q8_0.gguf"),
-            };
-            push(
-                &format!("ace-step-{v}"),
-                crate::inference::model::acestep::fsq::acestep_gguf(&gguf),
-            );
-        }
-        push(
-            "wan",
-            crate::inference::model::wan::vae::wan_file("Wan2.1_VAE.pth"),
-        );
-        // The 14B, when its checkpoint is there. The loader has always supported it -
-        // `WanVariant::from_token` picks it as soon as the requested name contains "14" -
-        // and nothing ever advertised it, so the only way to reach the better model was to
-        // know that rule and type a name for it. `push` lists it only if the file exists.
-        push(
-            "wan-14b",
-            crate::inference::model::wan::dit::wan_14b_dit_file(),
-        );
-        // Video fine-tunes dropped in `<models>/wan/`, so a checkpoint that the loader can
-        // already resolve is also one the picker can offer. Without this the resolver was
-        // reachable only by typing a name nobody could discover - the capability existed
-        // and had no way in.
-        {
-            let dir = std::path::Path::new(&state.huggingface_models_dir)
-                .join(crate::inference::model::wan::dit::WAN_CHECKPOINT_DIR);
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    // Both formats: the 1.3B ships as safetensors, every community 14B is
-                    // a GGUF. Listing only one would have offered the checkpoints nobody has.
-                    let known = p.extension().is_some_and(|x| {
-                        x.eq_ignore_ascii_case("safetensors") || x.eq_ignore_ascii_case("gguf")
-                    });
-                    if !known {
-                        continue;
-                    }
-                    let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    let tag = crate::inference::model::wan::dit::wan_checkpoint_tag(stem);
-                    // The family is read off the NAME, so a file whose tag does not start
-                    // with "wan" would be advertised as something other than video. Say so
-                    // rather than listing it under the wrong kind.
-                    if !tag.starts_with("wan") {
-                        tracing::warn!(
-                            "{}: a video checkpoint's name must start with 'Wan' to be \
-                             offered as one; '{tag}' would be listed as another kind",
-                            p.display()
-                        );
-                        continue;
-                    }
-                    push(&tag, p);
-                }
-            }
-        }
-        // Dedicated instruction editors: named entries so edit-capable pickers
-        // can list them (their weights otherwise resolve through name checks).
-        let hf = std::path::Path::new(&state.huggingface_models_dir);
-        push("flux-kontext", hf.join("flux-kontext-q4km.gguf"));
-        push("qwen-image-edit", hf.join("qwen-image-edit/dit-q4km.gguf"));
-        // FLUX.2 Klein keeps its parts in diffusers SUBDIRECTORIES, so the plain weight-dir
-        // scan below (one level deep) cannot see it. Advertised by its DiT's presence.
-        push(
-            "flux2-klein-4b",
-            crate::inference::engine::flux2_engine::weights_dir(&state.huggingface_models_dir)
-                .join("transformer/diffusion_pytorch_model.safetensors"),
-        );
-    }
-    for lm in LOCAL_MODELS {
-        let weights = std::path::Path::new(&state.huggingface_models_dir).join(lm.rel);
-        if !weights.exists() {
-            continue; // no local weights: leave whatever the managers discovered untouched
-        }
-        if let Some(fam) = lm.dedup_family {
-            models.retain(|m| media_family(&m.id) != Some(fam));
-        }
-        let size = std::fs::metadata(&weights).map(|m| m.len()).unwrap_or(0);
+    for e in entries {
+        let size = std::fs::metadata(&e.path).map(|m| m.len()).unwrap_or(0);
         models.push(crate::inference::load::model_manager::ModelMetadata {
-            id: lm.id.to_string(),
-            name: lm.id.to_string(),
+            id: e.id.clone(),
+            name: e.id,
             size,
             downloaded_at: chrono::Utc::now().to_rfc3339(),
-            files: vec![lm.rel.to_string()],
+            files: vec![e.path.to_string_lossy().into_owned()],
             source: "huggingface".to_string(),
             digest: "sha256:0000000000000000000000000000000000000000".to_string(),
         });
     }
-
-    // Ray / MutantSparrow drop-in checkpoints: SCAN the `ray*` weight dirs and
-    // derive one catalog entry per safetensors file - the tag comes from the
-    // file stem via `ray_variant_tag` (no per-variant code). A file is only
-    // advertised when its tag maps to a family the image engine can actually
-    // load (`is_image_gen_model`), so checkpoints of unported bases (e.g. the
-    // SDXL Ray variants) stay silent instead of erroring at load time.
-    {
-        let root = std::path::Path::new(&state.huggingface_models_dir);
-        let mut seen: std::collections::HashMap<String, (u64, String)> = Default::default();
-        for dir in std::fs::read_dir(root).into_iter().flatten().flatten() {
-            let dname = dir.file_name().to_string_lossy().to_ascii_lowercase();
-            // EVERY plain weight directory, not just the ones called `ray*`. That name
-            // filter is why only the Ray checkpoints ever appeared in the catalogue: a
-            // model dropped in under any other name was not scanned, not advertised and
-            // not loadable, with nothing said about it. `hub/` is skipped because the
-            // standard HF-cache manager already lists it.
-            if !dir.path().is_dir() || dname == "hub" || dname.starts_with('.') {
-                continue;
-            }
-            for f in std::fs::read_dir(dir.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                let p = f.path();
-                if !p
-                    .extension()
-                    .is_some_and(|x| x.eq_ignore_ascii_case("safetensors"))
-                {
-                    continue;
-                }
-                let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-                if size < crate::api::handlers::media::SMALLEST_IMAGE_MODEL {
-                    continue;
-                }
-                let Some(stem) = p.file_stem().and_then(|x| x.to_str()) else {
-                    continue;
-                };
-                // THE CHECKPOINT DECIDES ITS FAMILY, its name only decides what to call
-                // it. Reading the header means a new model is recognised because of what
-                // it IS, not because someone added its name to a list in the source.
-                let Some(fam) = crate::api::handlers::media::image_family_from_header(&p) else {
-                    continue;
-                };
-                // Families whose engine accepts an ALTERNATE local checkpoint. A family
-                // outside this set stays silent rather than erroring at load time.
-                if fam != "flux" && fam != "qwen-image" && fam != "zimage" && fam != "sdxl" {
-                    continue;
-                }
-                // Keep the Ray tags exactly as before; anything else is named after its
-                // directory, which is what a user dropping a checkpoint would expect.
-                // The RESOLVER goes through the same rule, so a model is always fetched
-                // under the name it is advertised as.
-                let tag = crate::api::handlers::media::local_checkpoint_tag(&dname, stem);
-                let rel = format!(
-                    "{dname}/{}",
-                    p.file_name().unwrap_or_default().to_string_lossy()
-                );
-                // Same tag from several files (precision variants): keep the largest.
-                match seen.get(&tag) {
-                    Some((sz, _)) if *sz >= size => {}
-                    _ => {
-                        seen.insert(tag, (size, rel));
-                    }
-                }
-            }
-        }
-        for (tag, (size, rel)) in seen {
-            models.push(crate::inference::load::model_manager::ModelMetadata {
-                id: tag.clone(),
-                name: tag,
-                size,
-                downloaded_at: chrono::Utc::now().to_rfc3339(),
-                files: vec![rel],
-                source: "huggingface".to_string(),
-                digest: "sha256:0000000000000000000000000000000000000000".to_string(),
-            });
-        }
-    }
 }
 
-/// What a model can DO, derived from its family + name - the SERVER-side
-/// single source of truth the /api/tags listing exposes so clients never
-/// hardcode model lists. Only capabilities with a WORKING wired path are
-/// advertised (e.g. boogu has no img2img yet, so it is txt2img-only).
-pub(crate) fn model_capabilities(model_id: &str) -> Vec<String> {
-    let lower = model_id.to_lowercase();
-    let fam = media_family(model_id).unwrap_or_default();
-    let caps: &[&str] = match fam {
-        "flux" => {
-            if lower.contains("kontext") {
-                &["txt2img", "img2img", "edit"]
-            } else {
-                &["txt2img", "img2img"]
-            }
+/// What a media checkpoint can do, from what its files declare. Only capabilities with a
+/// working wired path are advertised.
+pub(crate) fn media_capabilities(facts: &crate::inference::media_facts::MediaFacts) -> Vec<String> {
+    use crate::inference::media_facts::{
+        ImageFamily, MediaKind, SoundKind, SpeechModel, TranscriptionModel,
+    };
+    let caps: &[&str] = match facts.kind {
+        MediaKind::Image(ImageFamily::Flux) if facts.instruction_edit => {
+            &["txt2img", "img2img", "edit"]
         }
-        "z-image" => &["txt2img", "img2img"],
-        // The family's own DiT here IS the edit checkpoint, so it instruction-edits.
-        // A drop-in of the family (RayQwest, the step-distilled Flash) is trained for
-        // text-to-image only, and advertising an edit it cannot do would put it in
-        // front of users on a tab it silently fails.
-        "qwen-image" => {
-            #[cfg(feature = "image")]
-            let step_distilled =
-                crate::inference::engine::qwen_image_engine::is_step_distilled(model_id);
-            #[cfg(not(feature = "image"))]
-            let step_distilled = false;
-            if lower.contains("rayqwest") || step_distilled {
-                &["txt2img"]
-            } else {
-                &["txt2img", "edit"]
-            }
-        }
-        // SDXL generates only: the port has no img2img or instruction-edit path, so
-        // advertising either would put it in front of users on tabs it cannot serve.
-        // SDXL generates and re-draws. It has no INSTRUCTION editor - there is no
-        // Kontext-style checkpoint for the family here - so "edit" stays off and the
-        // Edit tab drives it through img2img with a strength.
-        "sdxl" => &["txt2img", "img2img"],
-        // No img2img or instruction-edit path is wired for FLUX.2 yet, and advertising one
-        // would put it in front of users on a tab it silently fails.
-        "flux2" | "boogu" | "stable-diffusion" => &["txt2img"],
-        "whisper" => &["asr"],
-        "tts" => &["tts"],
-        _ => {
-            if lower.contains("stable-audio") {
-                &["sfx", "loops", "audio-variations"]
-            } else if lower.contains("ezaudio") {
-                &["sfx"]
-            } else if lower.contains("ace-step") || lower.contains("acestep") {
-                &["music"]
-            } else if lower.starts_with("wan") {
-                &["video"]
-            } else if lower.contains("midi") {
-                &["midi"]
-            } else {
-                // The name every client gates on for text generation.
-                &["completion"]
-            }
-        }
+        MediaKind::Image(ImageFamily::Flux) => &["txt2img", "img2img"],
+        MediaKind::Image(ImageFamily::ZImage) => &["txt2img", "img2img"],
+        // An instruction-editing checkpoint edits; one trained for text-to-image only does
+        // not, and advertising an edit it cannot do would put it on a tab it silently fails.
+        MediaKind::Image(ImageFamily::QwenImage) if facts.instruction_edit => &["txt2img", "edit"],
+        MediaKind::Image(ImageFamily::QwenImage) => &["txt2img"],
+        // No instruction editor: the Edit tab drives it through img2img with a strength.
+        MediaKind::Image(ImageFamily::Sdxl) => &["txt2img", "img2img"],
+        // No img2img or instruction-edit path is wired for these.
+        MediaKind::Image(ImageFamily::Flux2 | ImageFamily::Boogu) => &["txt2img"],
+        MediaKind::Video => &["video"],
+        MediaKind::Transcription(TranscriptionModel::Whisper) => &["asr"],
+        MediaKind::Speech(
+            SpeechModel::Parler | SpeechModel::Kyutai | SpeechModel::PocketTts | SpeechModel::Piper,
+        ) => &["tts"],
+        // A model this build runs no engine for can do nothing here.
+        MediaKind::Transcription(TranscriptionModel::Converted)
+        | MediaKind::Speech(SpeechModel::Unserved) => &[],
+        MediaKind::Sound(SoundKind::ConditionedDiffusion) => &["sfx", "loops", "audio-variations"],
+        MediaKind::Sound(SoundKind::LatentDiffusion) => &["sfx"],
+        MediaKind::Music => &["music"],
+        MediaKind::Component => &[],
     };
     caps.iter().map(|s| s.to_string()).collect()
 }
 
-/// What a model can do when its GGUF header declares an architecture: a text model embeds
-/// when the file declares a pooling type and completes otherwise. `declared` is
-/// `Some(pools)` for a readable header naming an architecture, `None` for a file that
-/// cannot be read, which keeps [`model_capabilities`] from the name. A name that places
-/// the model in a media family keeps that family's capabilities.
-pub(crate) fn file_capabilities(model_id: &str, declared: Option<bool>) -> Vec<String> {
-    let by_name = model_capabilities(model_id);
-    let text_only = by_name
-        .iter()
-        .all(|c| c == "completion" || c == "embedding");
-    match declared {
-        Some(pools) if text_only => {
-            vec![if pools { "embedding" } else { "completion" }.to_string()]
-        }
-        _ => by_name,
+/// What a model can do: what its media files declare, else, for a text model whose header or
+/// configuration declares an architecture (`text` is `Some(pools)`), embedding when it pools
+/// and completion otherwise. A model whose files declare neither can do nothing here.
+pub(crate) fn capabilities_of(
+    media: Option<&crate::inference::media_facts::MediaFacts>,
+    text: Option<bool>,
+) -> Vec<String> {
+    match (media, text) {
+        (Some(facts), _) => media_capabilities(facts),
+        (None, Some(pools)) => vec![if pools { "embedding" } else { "completion" }.to_string()],
+        (None, None) => Vec::new(),
     }
 }
 
@@ -647,86 +434,36 @@ pub(crate) fn gguf_facts(
     (Some(info), arch, quant, params)
 }
 
-/// Recommended generation defaults per media model (the knowledge the GUI
-/// used to hardcode in its combo tables). None for models without presets.
-pub(crate) fn media_model_defaults(model_id: &str) -> Option<serde_json::Value> {
-    let lower = model_id.to_lowercase();
-    if lower.contains("ace-step") || lower.contains("acestep") {
-        let (steps, cfg) = if lower.contains("turbo") {
-            (27, 1.0)
-        } else {
-            (50, 4.5)
-        };
-        return Some(serde_json::json!({ "steps": steps, "cfg": cfg }));
+/// The generation defaults a media checkpoint was validated at, from what its files declare.
+/// `None` for a kind without presets.
+pub(crate) fn media_model_defaults(
+    facts: &crate::inference::media_facts::MediaFacts,
+) -> Option<serde_json::Value> {
+    use crate::inference::media_facts::{MediaKind, SoundKind};
+    match facts.kind {
+        // A distilled checkpoint runs fewer steps without guidance.
+        MediaKind::Music if facts.distilled => Some(serde_json::json!({ "steps": 27, "cfg": 1.0 })),
+        MediaKind::Music => Some(serde_json::json!({ "steps": 50, "cfg": 4.5 })),
+        MediaKind::Sound(SoundKind::ConditionedDiffusion) => {
+            Some(serde_json::json!({ "steps": 25, "cfg": 7.0, "max_seconds": 47 }))
+        }
+        MediaKind::Sound(SoundKind::LatentDiffusion) => {
+            Some(serde_json::json!({ "steps": 60, "cfg": 3.0, "max_seconds": 30 }))
+        }
+        // Every image family publishes its recommended knobs from the SAME table the server
+        // itself samples with, so a client that switches models gets values the model was
+        // validated at.
+        #[cfg(feature = "image")]
+        MediaKind::Image(family) => {
+            let d = crate::api::handlers::media::image_defaults_for(family, facts);
+            Some(serde_json::json!({
+                "steps": d.steps,
+                "cfg": d.guidance,
+                "size": d.size,
+            }))
+        }
+        _ => None,
     }
-    if lower.contains("stable-audio") {
-        return Some(serde_json::json!({ "steps": 25, "cfg": 7.0, "max_seconds": 47 }));
-    }
-    if lower.contains("ezaudio") {
-        return Some(serde_json::json!({ "steps": 60, "cfg": 3.0, "max_seconds": 30 }));
-    }
-    if lower.contains("kontext") {
-        return Some(serde_json::json!({ "steps": 28, "cfg": 2.5 }));
-    }
-    // Every image family publishes its recommended knobs from the SAME table the
-    // server itself samples with, so a client that switches models gets values the
-    // model was validated at. Carrying a previous model's slider over is why an
-    // instruction edit sometimes came back barely applied (a Kontext-class editor
-    // needs ~28 steps where a distilled one is done in 4).
-    #[cfg(feature = "image")]
-    if crate::api::handlers::family::is_image(model_id) {
-        // A family with no recipe of its own publishes NOTHING rather than another
-        // family's numbers: a client that reads them sets its sliders from them.
-        let d = crate::api::handlers::media::image_model_defaults(model_id).ok()?;
-        return Some(serde_json::json!({
-            "steps": d.steps,
-            "cfg": d.guidance,
-            "size": d.size,
-        }));
-    }
-    None
-}
-
-/// The media family a model id names (image, video, speech), for the engines whose
-/// checkpoints carry no architecture key. `None` for a text model, whose family is the
-/// architecture its own files declare (`file_architecture`).
-pub(crate) fn media_family(model_id: &str) -> Option<&'static str> {
-    let lower = model_id.to_lowercase();
-    // A fine-tune dropped in `<models>/wan/` is advertised under its own tag, which starts
-    // with "wan" by the same convention the Ray families use.
-    let fam = if lower.starts_with("wan") {
-        "video"
-    }
-    // BEFORE any `flux` test: "flux2-klein" contains "flux".
-    else if is_flux2_model(&lower) {
-        "flux2"
-    } else if lower.contains("qwen-image")
-        || lower.contains("qwen_image")
-        || lower.contains("rayqwest")
-    {
-        "qwen-image"
-    } else if lower.contains("stable-diffusion") || lower.contains("stable-cascade") {
-        "stable-diffusion"
-    } else if lower.contains("sdxl")
-        || lower.contains("raymnants")
-        || lower.contains("rayctifier")
-        || lower.contains("rayburn")
-    {
-        "sdxl"
-    } else if lower.contains("z-image") || lower.contains("z_image") || lower.contains("rayzist") {
-        "z-image"
-    } else if lower.contains("boogu") {
-        "boogu"
-    } else if lower.contains("flux") {
-        "flux"
-    } else if lower.contains("whisper") {
-        "whisper"
-    } else if lower.contains("parler") || lower.contains("/tts-") || lower.starts_with("tts") {
-        "tts"
-    } else {
-        return None;
-    };
-    Some(fam)
 }
 
 /// The architecture a text model's files declare: `general.architecture` of a GGUF file,
@@ -754,16 +491,18 @@ fn checkpoint_facts(dir: &std::path::Path) -> Facts {
     )
 }
 
-/// The family `/api/tags`, `/api/show` and `/api/ps` report: the architecture a GGUF
-/// header declares, else the media family the id names, else the architecture `files`
+/// The family `/api/tags`, `/api/show` and `/api/ps` report: the media family the model's
+/// files declare, else the architecture a GGUF header declares, else the architecture `files`
 /// reads from the model's other files, else empty.
 pub(crate) fn reported_family(
-    model_id: &str,
+    media: Option<&crate::inference::media_facts::MediaFacts>,
     header: Option<String>,
     files: impl FnOnce() -> Option<String>,
 ) -> String {
-    header
-        .or_else(|| media_family(model_id).map(str::to_string))
+    media
+        .and_then(|f| f.kind.listed())
+        .map(str::to_string)
+        .or(header)
         .or_else(files)
         .unwrap_or_default()
 }
@@ -1138,7 +877,8 @@ pub(crate) async fn ollama_show_model(
                     .as_ref()
                     .is_some_and(|m| m.contains_key(&format!("{a}.pooling_type")))
             });
-            let mut caps = file_capabilities(&model_name, pools);
+            // An Ollama-store model is a text GGUF whether or not its header reads.
+            let mut caps = capabilities_of(None, Some(pools.unwrap_or(false)));
             if caps.iter().any(|c| c == "completion") && state.model_has_vision(&model_name) {
                 caps.push("vision".to_string());
             }
@@ -1219,7 +959,7 @@ pub(crate) async fn ollama_show_model(
                 details: Some(OllamaModelDetails {
                     format: field("model_format").unwrap_or_else(|| format_str.to_string()),
                     family: field("model_family").unwrap_or_else(|| {
-                        reported_family(&model_name, arch, || file_architecture(&weights))
+                        reported_family(None, arch, || file_architecture(&weights))
                     }),
                     families,
                     parameter_size: field("model_type")
@@ -1250,18 +990,5 @@ pub(crate) async fn ollama_show_model(
                 )))
             }
         }
-    }
-}
-
-/// Flux 2 checkpoints are told apart by the image engine, when it is compiled.
-fn is_flux2_model(lower: &str) -> bool {
-    #[cfg(feature = "image")]
-    {
-        crate::inference::engine::flux2_engine::is_flux2_model(lower)
-    }
-    #[cfg(not(feature = "image"))]
-    {
-        let _ = lower;
-        false
     }
 }

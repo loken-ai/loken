@@ -35,7 +35,7 @@ pub(super) fn refused_parameter(
 /// judged by. Judged by a checkpoint finder instead, a node that served the family from
 /// a hub directory answered no and handed its own renders to a smaller peer.
 pub(crate) async fn image_served_here(state: &APIServer, model_name: &str) -> bool {
-    serves_image_family(&state.local_node_state().await, model_name)
+    holds_image_model(&state.local_node_state().await, model_name)
 }
 
 /// What the family's hot component and this request's scratch take on one card: the
@@ -45,25 +45,37 @@ pub(crate) fn image_hot_bytes(
     model_name: &str,
     geom: crate::inference::place::runtime_demand::RequestGeometry,
 ) -> u64 {
-    let Ok(loader) = image_family_loader(image_family(model_name)) else {
+    let Ok(loader) = image_loader(&state.huggingface_models_dir, model_name) else {
         return 0;
     };
     family_hot_bytes(&state.huggingface_models_dir, loader, model_name)
         + family_runtime_bytes(&state.huggingface_models_dir, loader, model_name, geom)
 }
 
-/// Whether a peer's catalogue holds a checkpoint of the same image family as
-/// `model_name`. Requests name a family by alias as often as by checkpoint, and the
-/// catalogue lists checkpoints, so the family is what the two have in common.
-pub(crate) fn serves_image_family(
+/// Whether a node's catalogue holds the checkpoint `model_name` names, by the rules the
+/// local catalogue resolves a name by: the entry's id, a repository's name without its
+/// owner, or the repository an entry of the OpenAI model list stands for. A catalogue lists
+/// names only, so a peer is judged by the name the request and its catalogue share.
+pub(crate) fn holds_image_model(
     peer: &crate::distributed::membership::NodeState,
     model_name: &str,
 ) -> bool {
-    let family = image_family(model_name);
+    let bare = |m: &str| {
+        m.trim()
+            .strip_suffix(":latest")
+            .unwrap_or(m.trim())
+            .to_string()
+    };
+    let want = bare(model_name);
+    let repo = crate::api::handlers::offered_repository(&want);
     peer.serves.as_ref().is_some_and(|catalogue| {
-        catalogue
-            .iter()
-            .any(|m| is_image_gen_model(m) && image_family(m) == family)
+        catalogue.iter().any(|m| {
+            let m = bare(m);
+            let short = m.rsplit('/').next().unwrap_or(&m);
+            m.eq_ignore_ascii_case(&want)
+                || short.eq_ignore_ascii_case(&want)
+                || repo.is_some_and(|r| m.eq_ignore_ascii_case(r))
+        })
     })
 }
 
@@ -92,7 +104,7 @@ pub(super) async fn generate_image_resilient(
     // The family has to resolve to a loader before it can be reserved for: a family with
     // no budget of its own must be refused by name here, never declared at another
     // family's figure.
-    let loader = image_family_loader(image_family(model_name))?;
+    let loader = image_loader(&state.huggingface_models_dir, model_name)?;
     let _demand = crate::inference::place::recover::hold_scratch(
         "media",
         family_runtime_bytes(&state.huggingface_models_dir, loader, model_name, geom),
@@ -175,7 +187,7 @@ pub(crate) async fn ensure_image_model_loaded_reporting(
     // Resolve the loader BEFORE anything is unloaded or reserved: a family nobody wired
     // must fail by name here, never fall through to another family's loader - and the
     // VRAM budgets below are keyed on it too, so it also decides what this load reserves.
-    let loader = image_family_loader(image_family(model_name))?;
+    let loader = image_loader(&state.huggingface_models_dir, model_name)?;
     let current = state.image_engine.model_name().await;
     // Same FAMILY is not enough: a Ray drop-in and its base share the family but are different
     // checkpoints - the resident must be swapped whenever the requested variant differs, or a
@@ -194,6 +206,7 @@ pub(crate) async fn ensure_image_model_loaded_reporting(
     let requested_local = requested_checkpoint(&state.huggingface_models_dir, model_name)
         .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()));
     let kind_matches = resident_serves_request(
+        &state.huggingface_models_dir,
         current.as_deref(),
         resident_ckpt.as_deref(),
         model_name,
@@ -422,7 +435,8 @@ pub(crate) async fn handle_image_generation(
             return Err(ApiError::Validation(e));
         }
     }
-    let defaults = image_model_defaults(model_name).map_err(ApiError::Validation)?;
+    let defaults = image_model_defaults(&state.huggingface_models_dir, model_name)
+        .map_err(ApiError::Validation)?;
     let default_steps: u64 = defaults.steps as u64;
     let default_guidance: f64 = defaults.guidance;
     let default_size: u64 = defaults.size as u64;

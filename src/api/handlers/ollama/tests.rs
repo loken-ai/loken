@@ -1,37 +1,39 @@
-/// EVERY image family must advertise `txt2img`.
-///
-/// `model_capabilities` matches on the family name, and a family added to
-/// `media_family` but not here falls through to the CHAT default - which is
-/// how SDXL came to describe itself to clients as a chat model, so it never
-/// appeared in any image picker. The failure is silent on the server: the model
-/// loads and renders perfectly when asked directly; it simply cannot be found.
+/// EVERY image checkpoint advertises `txt2img`, and none advertises chat: a family that
+/// described itself as a chat model would never appear in an image picker.
+#[cfg(feature = "image")]
 #[test]
 fn every_image_family_advertises_that_it_generates_images() {
-    // One representative id per image family the server actually serves.
+    let store = crate::api::handlers::media::tests::image_store("caps");
     for id in [
         "flux-schnell",
-        "flux-kontext",
-        "rayflux",
+        "fluxdev",
+        "editor",
         "Tongyi-MAI/Z-Image-Turbo",
-        "rayzist",
-        "qwen-image",
-        "rayqwest",
-        "boogu",
-        "raymnants",
-        "rayctifier",
-        "rayburn",
+        "zimage-tune",
+        "qwen-tune",
+        "flux.2-klein-4b",
+        "boogu-image-turbo",
+        "sdxl-a",
     ] {
-        let caps = super::models::model_capabilities(id);
+        let facts = crate::api::handlers::media_facts(&store.dir, id);
+        let caps = super::models::capabilities_of(facts.as_ref(), None);
         assert!(
             caps.iter().any(|c| c == "txt2img"),
-            "{id} (family {:?}) does not advertise txt2img; it advertises {caps:?}",
-            media_family(id)
+            "{id} ({facts:?}) does not advertise txt2img; it advertises {caps:?}"
         );
         assert!(
             !caps.iter().any(|c| c == "completion"),
             "{id} is an image model but advertises chat: {caps:?}"
         );
     }
+    let caps = |id: &str| {
+        super::models::capabilities_of(
+            crate::api::handlers::media_facts(&store.dir, id).as_ref(),
+            None,
+        )
+    };
+    assert!(caps("editor").iter().any(|c| c == "edit"));
+    assert!(!caps("fluxdev").iter().any(|c| c == "edit"));
 }
 
 use super::*;
@@ -148,24 +150,79 @@ fn estimate_parameter_size_known_sizes() {
     assert_eq!(estimate_parameter_size(500_000_000, "gguf"), "833M");
 }
 
+/// The family and capabilities a media repository reports come from its files.
 #[test]
-fn media_family_known_models() {
-    // The video family, which used to fall through to the text default so a client
-    // could not tell a video model from an LLM.
-    assert_eq!(media_family("wan"), Some("video"));
-    assert_eq!(media_family("wan-14b"), Some("video"));
-    assert_eq!(
-        media_family("wan-photoreal"),
-        Some("video"),
-        "a fine-tune's own tag"
+fn a_media_repository_reports_what_its_files_declare() {
+    use crate::inference::media_facts::fixture::{json, Scratch};
+    let s = Scratch::new("listed-families");
+    let repo = |id: &str, config: serde_json::Value| {
+        let dir =
+            s.0.join("hub")
+                .join(format!("models--{}", id.replace('/', "--")));
+        std::fs::create_dir_all(dir.join("refs")).unwrap();
+        std::fs::write(dir.join("refs/main"), "r").unwrap();
+        json(&dir.join("snapshots/r/config.json"), config);
+    };
+    repo(
+        "Owner/asr-model",
+        serde_json::json!({"model_type": "whisper"}),
     );
-    // And it must not swallow an unrelated name that merely contains the letters.
-    assert_ne!(media_family("swan-lake-7b"), Some("video"));
+    repo(
+        "Owner/asr-ct2",
+        serde_json::json!({"alignment_heads": [], "lang_ids": []}),
+    );
+    repo(
+        "Owner/speech",
+        serde_json::json!({"model_type": "parler_tts"}),
+    );
+    repo("Owner/cloner", serde_json::json!({"model": "xtts"}));
+    repo("Owner/encoder", serde_json::json!({"model_type": "clip"}));
+    repo(
+        "Owner/video",
+        serde_json::json!({"_class_name": "WanModel"}),
+    );
+    repo(
+        "Owner/text",
+        serde_json::json!({"model_type": "llama", "architectures": ["LlamaForCausalLM"]}),
+    );
+    let hf = s.0.to_str().unwrap();
+    let listed = |id: &str| {
+        let facts = crate::api::handlers::media_facts(hf, id);
+        (
+            reported_family(facts.as_ref(), None, || None),
+            super::models::capabilities_of(facts.as_ref(), None),
+        )
+    };
+    assert_eq!(
+        listed("Owner/asr-model"),
+        ("whisper".into(), vec!["asr".to_string()])
+    );
+    // A conversion this build loads no engine for is what it is, and can do nothing here.
+    assert_eq!(listed("asr-ct2"), ("whisper".into(), Vec::<String>::new()));
+    assert_eq!(
+        listed("Owner/speech"),
+        ("tts".into(), vec!["tts".to_string()])
+    );
+    assert_eq!(listed("cloner"), ("tts".into(), Vec::<String>::new()));
+    assert_eq!(
+        listed("Owner/video"),
+        ("video".into(), vec!["video".to_string()])
+    );
+    // A pipeline component is no model a client can ask for anything, and no chat model.
+    assert_eq!(
+        listed("Owner/encoder"),
+        (String::new(), Vec::<String>::new())
+    );
+    // A text repository is no media model: its family and capabilities come from its
+    // declared architecture, read by the text path.
+    assert_eq!(crate::api::handlers::media_facts(hf, "Owner/text"), None);
+    assert_eq!(crate::api::handlers::media_facts(hf, "swan-lake-7b"), None);
 }
 
 /// A text model's family is what its files declare; its name decides nothing.
 #[test]
 fn a_text_model_has_no_family_by_name() {
+    let empty = std::env::temp_dir().join(format!("loken-no-models-{}", std::process::id()));
     for id in [
         "gemma4:26b",
         "qwen3-coder:latest",
@@ -173,15 +230,16 @@ fn a_text_model_has_no_family_by_name() {
         "stablelm-3b",
         "x",
     ] {
-        assert_eq!(media_family(id), None, "{id}");
-        assert_eq!(reported_family(id, None, || None), "", "{id}");
+        let facts = crate::api::handlers::media_facts(empty.to_str().unwrap(), id);
+        assert_eq!(facts, None, "{id}");
+        assert_eq!(reported_family(facts.as_ref(), None, || None), "", "{id}");
     }
     assert_eq!(
-        reported_family("anything", Some("gemma4".into()), || None),
+        reported_family(None, Some("gemma4".into()), || None),
         "gemma4"
     );
     assert_eq!(
-        reported_family("anything", None, || Some("qwen3".into())),
+        reported_family(None, None, || Some("qwen3".into())),
         "qwen3"
     );
     let dir = std::env::temp_dir().join(format!("loken-family-{}", std::process::id()));
@@ -189,36 +247,6 @@ fn a_text_model_has_no_family_by_name() {
     std::fs::write(dir.join("config.json"), r#"{"model_type": "olmo2"}"#).unwrap();
     assert_eq!(file_architecture(&dir).as_deref(), Some("olmo2"));
     std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn media_family_non_llm_modalities() {
-    // Image-gen families. Without these, /api/show used to return
-    // family="llama" for flux/z-image checkpoints, misleading SDK
-    // model-card UIs that switch behaviour on the family name.
-    assert_eq!(media_family("flux-schnell"), Some("flux"));
-    assert_eq!(media_family("flux-dev:fp16"), Some("flux"));
-    assert_eq!(
-        media_family("black-forest-labs/FLUX.1-schnell"),
-        Some("flux")
-    );
-    assert_eq!(media_family("Tongyi-MAI/Z-Image-Turbo"), Some("z-image"));
-    assert_eq!(media_family("z_image_local"), Some("z-image"));
-
-    // ASR + TTS families
-    assert_eq!(media_family("whisper-large-v3"), Some("whisper"));
-    assert_eq!(media_family("openai/whisper-small"), Some("whisper"));
-    assert_eq!(media_family("parler-tts/parler-tts-mini-v1"), Some("tts"));
-    assert_eq!(media_family("tts-1"), Some("tts"));
-    assert_eq!(media_family("openai/tts-1-hd"), Some("tts"));
-    assert_eq!(
-        media_family("stable-diffusion-3-medium"),
-        Some("stable-diffusion")
-    );
-    assert_eq!(
-        media_family("stable-cascade-prior"),
-        Some("stable-diffusion")
-    );
 }
 
 #[test]

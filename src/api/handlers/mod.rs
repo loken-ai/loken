@@ -62,6 +62,8 @@ mod anthropic_api;
 mod audio;
 mod catalogue;
 mod chat_prompt;
+mod media_catalogue;
+pub(crate) use media_catalogue::*;
 mod cluster_catalogue;
 mod convert;
 #[cfg(feature = "image")]
@@ -87,8 +89,8 @@ pub(crate) use media::*;
 // keeping a dispatch of its own.
 #[cfg(feature = "image")]
 pub use media::{
-    image_family, image_family_loader, image_model_defaults, load_image_family,
-    requested_checkpoint, ImageLoader, ImageModelDefaults,
+    image_family, image_loader, image_model_defaults, load_image_family, requested_checkpoint,
+    ImageModelDefaults,
 };
 pub(crate) use model_manager::*;
 pub(crate) use ollama::*;
@@ -1274,7 +1276,7 @@ impl APIServer {
                 // exactly as the tags route lists them; a catalogue without them sent
                 // every sound turn to a node that had no sound model either.
                 #[cfg(feature = "media")]
-                ollama::inject_local_boogu(self, &mut models);
+                ollama::inject_local_media(self, &mut models);
                 let listed = models.len();
                 // A peer sent a request for a model this node lists and cannot load
                 // would fail it; what is advertised is what can be served.
@@ -2687,50 +2689,28 @@ fn files_carry_vision(path: &std::path::Path) -> bool {
         })
 }
 
-/// Models that ship in the HF cache as components of a larger pipeline
-/// (T5 / CLIP text+vision encoders for Flux), or as encoder-only
-/// architectures (whisper ASR, parler TTS) that have their own purpose-
-/// built endpoints. Routing any of these to /api/chat or /api/generate
-/// would either panic the tensor-op decoder (no decoder layers to load)
-/// or silently produce garbage. Returning a clear 400 instead keeps the
-/// user from staring at a vague "no images" / panic backtrace.
+/// Why `model_name` cannot serve a chat or generation request, when its files say it is
+/// part of another pipeline: a text or image encoder, an autoencoder, or a repository that
+/// holds no weights at all. Routing one of these to the text decoder has nothing to load.
 ///
-/// Returns `Some(suggestion)` when the model should be rejected with
-/// the suggested alternative endpoint, `None` when it's free to proceed
-/// down the text-decoder path.
-fn non_chat_pipeline_component(model_name: &str) -> Option<&'static str> {
-    let lower = model_name.to_lowercase();
-    // CLIP / T5: used as text+vision encoders by Flux. The Flux loader
-    // pulls them on its own - direct use isn't supported.
-    if lower.contains("clip-vit") || lower.contains("clip_vit") || lower.contains("/clip-") {
+/// Speech and transcription checkpoints are not refused here: the chat routes send them to
+/// their own handlers.
+pub(crate) fn non_chat_pipeline_component(hf_models_dir: &str, model_name: &str) -> Option<String> {
+    if media_facts(hf_models_dir, model_name)
+        .is_some_and(|f| f.kind == crate::inference::media_facts::MediaKind::Component)
+    {
         return Some(
-            "CLIP is a text+image encoder, not a chat model. \
-             Select a Flux / Z-Image model instead - it pulls CLIP \
-             automatically as a component.",
+            "its files declare a component of another pipeline - an encoder or an \
+             autoencoder that pipeline loads - not a model that generates text. Select the \
+             pipeline that uses it instead."
+                .to_string(),
         );
     }
-    if lower.contains("t5-v1_1") || lower.contains("/t5-") || lower.contains("t5xxl") {
+    if holds_no_weights(hf_models_dir, model_name) {
         return Some(
-            "T5 is a text encoder, not a chat model. \
-             Select a Flux model instead - it pulls T5 automatically.",
-        );
-    }
-    // (Whisper is NOT rejected here on the /api/chat path - it's routed
-    // to handle_chat_asr when the user attaches an audio file via
-    // images[]. On the OpenAI-shape /v1/chat/completions + /v1/
-    // completions paths the chat_completion / text_completions
-    // handlers still 400 with a pointer to /v1/audio/transcriptions
-    // because there's no input-bytes field there to carry the audio.)
-    // (Parler / TTS are NOT rejected here - they're routed to
-    // handle_chat_tts in the /api/chat + /api/generate handlers so the
-    // GUI's "type text, get audio back" UX works directly through the
-    // chat tab, exactly like image-gen models are routed through
-    // handle_image_generation.)
-    // mt5-tokenizers: tokenizer-only repo.
-    if lower.contains("mt5-tokenizers") {
-        return Some(
-            "This is a tokenizer-only repo, not a model. \
-             It can't serve chat requests on its own.",
+            "this repository holds no weights, only a tokenizer or a configuration. It can't \
+             serve requests on its own."
+                .to_string(),
         );
     }
     None
@@ -3165,11 +3145,11 @@ async fn plan_video(Json(req): Json<serde_json::Value>) -> impl IntoResponse {
 /// branch that follows it.
 pub(crate) mod family {
     #[cfg(feature = "image")]
-    pub(crate) fn is_image(model: &str) -> bool {
-        super::media::is_image_gen_model(model)
+    pub(crate) fn is_image(hf_models_dir: &str, model: &str) -> bool {
+        super::media::is_image_gen_model(hf_models_dir, model)
     }
     #[cfg(not(feature = "image"))]
-    pub(crate) fn is_image(_model: &str) -> bool {
+    pub(crate) fn is_image(_hf_models_dir: &str, _model: &str) -> bool {
         false
     }
 

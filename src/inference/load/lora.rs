@@ -159,19 +159,14 @@ pub struct SamplingRegime {
 /// Read the regime an adapter declares, from the FILE.
 ///
 /// safetensors carries a `__metadata__` object, and a consistency adapter says so there:
-/// the one shipped here records `"modelspec.merged_from": "sdxl_LCM_lora"`. Reading it
-/// beats matching on the filename, which is a label anyone can change and which the
-/// other adapter here does not carry at all - it has no metadata whatsoever.
-///
-/// The filename is still consulted as a FALLBACK, for exactly that case: a file with no
-/// metadata cannot declare anything, and refusing to look at its name would mean a
-/// correctly-named adapter silently getting the wrong recipe.
+/// one records `"modelspec.merged_from": "sdxl_LCM_lora"`. A file with no metadata
+/// declares nothing and keeps the base model's recipe.
 ///
 /// The figures are the published recipe for this family of adapters: four steps, and a
 /// guidance of one - a consistency model is trained to need none, and pushing it re-adds
 /// the contrast the distillation removed.
 pub fn sampling_regime(name: &str) -> Option<SamplingRegime> {
-    is_consistency(header_text(name).as_deref(), name).then_some(CONSISTENCY)
+    is_consistency(header_text(name).as_deref()).then_some(CONSISTENCY)
 }
 
 /// The regime this family of adapters is published with: four steps, and a guidance of
@@ -182,17 +177,17 @@ const CONSISTENCY: SamplingRegime = SamplingRegime {
     guidance: 1.0,
 };
 
-/// Does this adapter retrain the sampling rather than the style?
-///
-/// The FILE is asked first. The name is a fallback for a file that declares nothing -
-/// which is not hypothetical: of the two adapters shipped here, one carries a full
-/// modelspec and the other has no metadata at all.
-fn is_consistency(header: Option<&str>, name: &str) -> bool {
-    let declared = header.is_some_and(|h| {
-        let lower = h.to_lowercase();
-        lower.contains("lcm") || lower.contains("consistency")
-    });
-    declared || name.to_lowercase().contains("lcm")
+/// Does this adapter's metadata declare that it retrains the sampling rather than the
+/// style? `header` is the safetensors header as text.
+fn is_consistency(header: Option<&str>) -> bool {
+    let Some(meta) = header
+        .and_then(|h| serde_json::from_str::<serde_json::Value>(h).ok())
+        .and_then(|h| h.get("__metadata__").cloned())
+    else {
+        return false;
+    };
+    let declared = meta.to_string().to_lowercase();
+    declared.contains("lcm") || declared.contains("consistency")
 }
 
 /// The safetensors header of an adapter, as text.
@@ -517,16 +512,15 @@ mod consistency_tests {
     fn a_file_that_declares_itself_is_believed() {
         let hdr = r#"{"__metadata__":{"modelspec.merged_from":"sdxl_LCM_lora",
                       "modelspec.architecture":"stable-diffusion-xl-v1-base/lora"}}"#;
-        assert!(is_consistency(Some(hdr), "whatever-it-was-renamed-to"));
+        assert!(is_consistency(Some(hdr)));
     }
 
-    /// And a file with NO metadata still gets the right answer from its name - the other
-    /// adapter here has none at all, so refusing to look at names would leave a
-    /// correctly-named adapter running at the base model's recipe.
+    /// A file with NO metadata declares nothing, whatever it is called.
     #[test]
-    fn a_file_with_no_metadata_falls_back_to_its_name() {
-        assert!(is_consistency(None, "lcm-lora-sdxl"));
-        assert!(is_consistency(Some("{}"), "LCM-Lora-SDXL"));
+    fn a_file_with_no_metadata_declares_no_regime() {
+        assert!(!is_consistency(None));
+        assert!(!is_consistency(Some("{}")));
+        assert!(!is_consistency(Some(r#"{"lcm_tensor.weight":{}}"#)));
     }
 
     /// A STYLE adapter must not be mistaken for one: forcing four steps at guidance one
@@ -534,9 +528,7 @@ mod consistency_tests {
     #[test]
     fn a_style_adapter_carries_no_regime() {
         let hdr = r#"{"__metadata__":{}}"#;
-        assert!(!is_consistency(Some(hdr), "flux-realism-xlabs"));
-        assert!(!is_consistency(None, "flux-realism-xlabs"));
-        assert!(!is_consistency(None, "add-detail-xl"));
+        assert!(!is_consistency(Some(hdr)));
     }
 
     /// The regime itself: few steps, almost no guidance. A regression to the base

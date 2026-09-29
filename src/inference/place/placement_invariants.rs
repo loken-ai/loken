@@ -867,7 +867,7 @@ struct HotStack {
 
 /// EVERY IMAGE/VIDEO FAMILY DECLARES HOW ITS HOT STACK SPANS CARDS.
 ///
-/// The match below is exhaustive over [`ImageLoader`], which is the enum every new family
+/// The match below is exhaustive over [`ImageFamily`], which is the enum every new family
 /// already has to appear in before it can load at all. So a family added without an
 /// answer here does not COMPILE - the same mechanism that stopped a family being wired to
 /// another family's weights, pointed at the other half of the same question.
@@ -877,36 +877,35 @@ struct HotStack {
 /// what a single-card loader looks like, and it is what this refuses.
 #[test]
 fn every_image_family_declares_how_its_hot_stack_spans_cards() {
-    use crate::api::handlers::media::{image_family_loader, ImageLoader, IMAGE_FAMILIES};
+    use crate::inference::media_facts::ImageFamily;
 
     let mut checked = 0usize;
-    for family in IMAGE_FAMILIES {
-        let loader = image_family_loader(family)
-            .unwrap_or_else(|e| panic!("advertised family '{family}' has no loader: {e}"));
+    for loader in ImageFamily::ALL {
+        let family = loader.tag();
         // EXHAUSTIVE ON PURPOSE. Adding a variant breaks this build until the new family
         // says which loader spreads its blocks over the cards.
         let hot = match loader {
-            ImageLoader::ZImage => HotStack {
+            ImageFamily::ZImage => HotStack {
                 file: "src/inference/model/zimage/hetero.rs",
                 symbol: "fn from_safetensors",
             },
-            ImageLoader::QwenImage => HotStack {
+            ImageFamily::QwenImage => HotStack {
                 file: "src/inference/model/qwen_image/dit.rs",
                 symbol: "fn load_hetero",
             },
-            ImageLoader::Boogu => HotStack {
+            ImageFamily::Boogu => HotStack {
                 file: "src/inference/model/boogu/dit.rs",
                 symbol: "fn load_cancellable",
             },
-            ImageLoader::Sdxl => HotStack {
+            ImageFamily::Sdxl => HotStack {
                 file: "src/inference/model/sdxl/unet.rs",
                 symbol: "fn load_planned",
             },
-            ImageLoader::Flux2 => HotStack {
+            ImageFamily::Flux2 => HotStack {
                 file: "src/inference/model/flux2/dit.rs",
                 symbol: "fn load_hetero",
             },
-            ImageLoader::Flux => HotStack {
+            ImageFamily::Flux => HotStack {
                 file: "src/inference/model/flux/hetero.rs",
                 symbol: "fn from_gguf",
             },
@@ -964,8 +963,8 @@ fn every_image_family_declares_how_its_hot_stack_spans_cards() {
     }
     assert_eq!(
         checked,
-        IMAGE_FAMILIES.len(),
-        "not every advertised family was checked - the walk over IMAGE_FAMILIES stopped early"
+        ImageFamily::ALL.len(),
+        "not every advertised family was checked - the walk over ImageFamily::ALL stopped early"
     );
 }
 
@@ -1318,28 +1317,7 @@ fn an_exemption_covers_the_statement_below_it_and_no_more() {
 /// Files that still place, recover or name a card outside `place/`, with how many times.
 /// The list only shrinks: a file routed through the planner leaves it, and a count that
 /// drops has to be written down here.
-const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[
-    ("distributed/auto_tune.rs", (1, 0, 0)),
-    ("inference/engine/llm_engine/decode.rs", (1, 0, 0)),
-    ("inference/engine/llm_engine/load.rs", (1, 0, 0)),
-    ("inference/engine/llm_engine/loading.rs", (7, 0, 0)),
-    ("inference/engine/llm_engine/mod.rs", (3, 0, 0)),
-    ("inference/generic_transformer/graph.rs", (1, 0, 0)),
-    ("inference/generic_transformer/loader.rs", (5, 0, 0)),
-    ("inference/generic_transformer/projection.rs", (1, 0, 1)),
-    ("inference/load/requantize.rs", (0, 0, 1)),
-    ("inference/model/qwen3vl/textenc.rs", (1, 0, 0)),
-    ("inference/model/qwen_image/dit.rs", (2, 0, 0)),
-    ("inference/model/qwen_image/textenc.rs", (3, 0, 0)),
-    ("inference/model/sdxl/pipeline.rs", (5, 0, 0)),
-    ("inference/model/sdxl/unet.rs", (0, 0, 1)),
-    ("inference/offload/cuda.rs", (1, 0, 0)),
-    ("inference/offload/streamed.rs", (2, 0, 0)),
-    ("inference/serve/continuous_serve.rs", (1, 0, 0)),
-    ("inference/serve/tp_model.rs", (1, 0, 0)),
-    ("tensor/cuda/quant.rs", (1, 0, 0)),
-    ("tensor/cuda_ext.rs", (1, 0, 0)),
-];
+const ROUTE_DEBT: &[(&str, (usize, usize, usize))] = &[];
 
 /// EVERY COMPONENT IS PLACED BY THE PLANNER AND RECOVERED BY ITS LADDER.
 ///

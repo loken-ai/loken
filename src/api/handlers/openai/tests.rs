@@ -182,58 +182,6 @@ fn openai_error_body_accepts_owned_string_and_str() {
     assert_eq!(from_str, from_string);
 }
 
-// -- image_family_matches_catalog_id ----------------------------
-// Pinned mapping between image_engine.loaded_family() and the
-// per-id catalog entry that should report is_loaded=true on
-// /v1/models. A future addition (e.g. supporting flux-dev OR
-// adding z-image-pro) requires updating both the matcher AND
-// MULTIMODAL_EXTRAS; this test surfaces drift between them.
-
-#[test]
-fn image_family_matches_catalog_id_pins_family_to_id() {
-    // Currently-supported 1:1 mapping
-    assert!(image_family_matches_catalog_id(
-        Some("flux"),
-        "flux-schnell"
-    ));
-    assert!(image_family_matches_catalog_id(
-        Some("zimage"),
-        "z-image-turbo"
-    ));
-}
-
-#[test]
-fn image_family_matches_catalog_id_rejects_cross_family_pairing() {
-    // family "flux" must NOT match z-image-turbo, and vice versa.
-    // A bug at the matcher would mark a Flux-loaded server's
-    // z-image-turbo entry as is_loaded=true (and vice versa).
-    assert!(!image_family_matches_catalog_id(
-        Some("flux"),
-        "z-image-turbo"
-    ));
-    assert!(!image_family_matches_catalog_id(
-        Some("zimage"),
-        "flux-schnell"
-    ));
-}
-
-#[test]
-fn image_family_matches_catalog_id_rejects_unknown_family_and_id() {
-    // Unknown family -> never matches.
-    assert!(!image_family_matches_catalog_id(Some("dalle"), "dall-e-3"));
-    assert!(!image_family_matches_catalog_id(Some(""), "flux-schnell"));
-    // No engine loaded -> never matches.
-    assert!(!image_family_matches_catalog_id(None, "flux-schnell"));
-    assert!(!image_family_matches_catalog_id(None, "z-image-turbo"));
-    // Unknown catalog id under a known family - still false (the
-    // 1:1 contract pins the exact id pair).
-    assert!(!image_family_matches_catalog_id(Some("flux"), "flux-dev"));
-    assert!(!image_family_matches_catalog_id(
-        Some("zimage"),
-        "z-image-edit"
-    ));
-}
-
 /// `n` is bounded the same on chat and completions: 1 when absent, refused at 0 and
 /// past the cap.
 #[test]

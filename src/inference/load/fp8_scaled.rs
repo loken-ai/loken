@@ -66,9 +66,8 @@
 //!     state dict via [`folded_tensors`], or add an fp8-aware safetensors
 //!     builder mirroring `from_mmaped_safetensors`.
 //!
-//! Detection lives in `api::handlers::media`: `is_ray_fp8_model`,
-//! `is_qwen_image_model`/`is_z_image_model` (extended for RayQwest/Rayzist), and
-//! `image_family` already routes rayflux -> flux (via its `flux` substring).
+//! Detection lives in `inference::media_facts`: a checkpoint's family is read from its
+//! tensor names, and `api::handlers::media::image_family` routes it by that.
 //!
 //! TENSOR-NAME MAPPING (verify once real weights exist): the base-arch builder
 //! walks unprefixed names (`img_in.weight`, `double_blocks.0.img_attn.qkv.weight`

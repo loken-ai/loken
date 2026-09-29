@@ -94,7 +94,7 @@ pub(crate) async fn anthropic_messages(
         return anthropic_api_error(e);
     }
 
-    if let Some(hint) = non_chat_pipeline_component(&model_name) {
+    if let Some(hint) = non_chat_pipeline_component(&state.huggingface_models_dir, &model_name) {
         return anthropic_error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",

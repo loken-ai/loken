@@ -222,9 +222,23 @@ pub(super) fn regime_for(
     if steps.is_some() && guidance.is_some() {
         return None;
     }
-    let r = loras
+    let declared = loras
         .iter()
-        .find_map(|(name, _)| crate::inference::load::lora::sampling_regime(name))?;
+        .find_map(|(name, _)| crate::inference::load::lora::sampling_regime(name));
+    fill_unset(declared, steps, guidance)
+}
+
+/// The regime an adapter declares, for whichever of the step count and the guidance the
+/// caller left unset; `None` when the caller named both or no adapter declares one.
+pub(super) fn fill_unset(
+    declared: Option<crate::inference::load::lora::SamplingRegime>,
+    steps: Option<u32>,
+    guidance: Option<f64>,
+) -> Option<crate::inference::load::lora::SamplingRegime> {
+    if steps.is_some() && guidance.is_some() {
+        return None;
+    }
+    let r = declared?;
     info!(
         "lora: this adapter carries its own sampling - {} steps at guidance {:.1}; using \
          it for whichever the request left unset",

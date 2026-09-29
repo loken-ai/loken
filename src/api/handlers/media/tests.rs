@@ -1,46 +1,175 @@
 use super::*;
+use crate::inference::media_facts::fixture::{flux, gguf, json, safetensors, Scratch};
 
-/// The tag a checkpoint is ADVERTISED under and the one the resolver LOOKS UP are
-/// the same rule, so a model can always be fetched by the name the catalogue shows.
-/// They were two copies of the rule before, which is only harmless while they agree.
-#[test]
-fn catalogue_tag_is_the_name_a_request_resolves_by() {
-    // A checkpoint whose stem names an image family keeps that name...
-    assert_eq!(
-        local_checkpoint_tag("rayqwest", "RayQwest.v1.0"),
-        "rayqwest"
+/// A models store holding checkpoints of every image family, each declared only by what
+/// the readers look at: tensor names, a pipeline index, a GGUF header. Drop-ins are sparse
+/// files past the size floor, so the store costs no disk.
+pub(crate) struct ImageStore {
+    _scratch: Scratch,
+    pub dir: String,
+}
+
+fn drop_in(root: &std::path::Path, rel: &str, names: &[&str]) -> std::path::PathBuf {
+    let p = root.join(rel);
+    safetensors(&p, names, None);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&p)
+        .unwrap()
+        .set_len(SMALLEST_IMAGE_MODEL)
+        .unwrap();
+    p
+}
+
+fn cached(root: &std::path::Path, repo: &str) -> std::path::PathBuf {
+    let dir = root
+        .join("hub")
+        .join(format!("models--{}", repo.replace('/', "--")));
+    std::fs::create_dir_all(dir.join("refs")).unwrap();
+    std::fs::write(dir.join("refs/main"), "r").unwrap();
+    let snap = dir.join("snapshots/r");
+    std::fs::create_dir_all(&snap).unwrap();
+    snap
+}
+
+const ZIMAGE: &[&str] = &[
+    "cap_embedder.0.weight",
+    "context_refiner.0.attention.qkv.weight",
+];
+const QWEN: &[&str] = &["transformer_blocks.0.attn.to_q.weight", "img_in.weight"];
+const SDXL: &[&str] = &["model.diffusion_model.input_blocks.1.0.in_layers.0.weight"];
+const FLUX2: &[&str] = &[
+    "single_transformer_blocks.0.attn.to_q.weight",
+    "x_embedder.weight",
+];
+const BOOGU: &[&str] = &[
+    "double_stream_layers.0.attn.qkv.weight",
+    "instruct_proj.weight",
+];
+
+pub(crate) fn image_store(tag: &str) -> ImageStore {
+    let scratch = Scratch::new(&format!("image-store-{tag}"));
+    let root = scratch.0.clone();
+    drop_in(&root, "fluxdev/Tune.v1.0.safetensors", &flux(true));
+    drop_in(&root, "fluxpair/Pair.safetensors", &flux(true));
+    drop_in(&root, "fluxpair/Pair.Other.safetensors", &flux(true));
+    drop_in(&root, "editor/Editor.safetensors", &flux(true));
+    json(
+        &root.join("editor/model_index.json"),
+        serde_json::json!({"_class_name": "FluxKontextPipeline"}),
     );
-    assert_eq!(
-        local_checkpoint_tag("qwen-image-flash", "Qwen-Image-Flash"),
-        "qwen-image-flash"
+    drop_in(&root, "zimage-tune/Tune.safetensors", ZIMAGE);
+    drop_in(&root, "qwen-tune/Tune.safetensors", QWEN);
+    drop_in(&root, "qwen-distilled/Distilled.safetensors", QWEN);
+    json(
+        &root.join("qwen-distilled/model_index.json"),
+        serde_json::json!({"_class_name": "QwenImagePipeline", "is_distilled": true}),
     );
-    // ...and anything else is named after the directory it was dropped into, which
-    // is what a shard-numbered filename would otherwise destroy.
-    assert_eq!(
-        local_checkpoint_tag("qwen-image-flash", "model-00001-of-00001"),
-        "qwen-image-flash"
+    drop_in(&root, "sdxl-a/A.safetensors", SDXL);
+    drop_in(&root, "sdxl-b/B.safetensors", SDXL);
+    gguf(
+        &cached(&root, "lmz/candle-flux").join("flux1-schnell.gguf"),
+        &[],
+        &flux(false),
     );
-    // Every advertised tag must route to a family that can load it, or the
-    // catalogue offers a model the engine refuses.
-    for tag in ["rayqwest", "qwen-image-flash"] {
-        assert!(is_image_gen_model(tag), "{tag} is not routed as image-gen");
-        assert_eq!(image_family(tag), "qwen-image");
+    safetensors(
+        &cached(&root, "Tongyi-MAI/Z-Image-Turbo")
+            .join("transformer/diffusion_pytorch_model-00001-of-00001.safetensors"),
+        ZIMAGE,
+        None,
+    );
+    let klein = cached(&root, "black-forest-labs/FLUX.2-klein-4B");
+    json(
+        &klein.join("model_index.json"),
+        serde_json::json!({"_class_name": "Flux2KleinPipeline", "is_distilled": true}),
+    );
+    safetensors(
+        &klein.join("transformer/diffusion_pytorch_model.safetensors"),
+        FLUX2,
+        None,
+    );
+    safetensors(
+        &cached(&root, "realrebelai/Boogu-Image-Turbo").join("dit.safetensors"),
+        BOOGU,
+        None,
+    );
+    let text = cached(&root, "Owner/Text-Model");
+    json(
+        &text.join("config.json"),
+        serde_json::json!({"model_type": "llama", "architectures": ["LlamaForCausalLM"]}),
+    );
+    ImageStore {
+        dir: root.to_string_lossy().to_string(),
+        _scratch: scratch,
     }
 }
 
-/// The distilled drop-in must not inherit the family's 20-step CFG recipe: that
-/// would be 10x the work for a checkpoint trained to run in 4 steps without
-/// guidance, and the guided sampler would push it off its own manifold.
+/// Every id of the store, with the family its files declare.
+const STORE_IDS: &[(&str, ImageFamily)] = &[
+    ("fluxdev", ImageFamily::Flux),
+    ("pair", ImageFamily::Flux),
+    ("pair-other", ImageFamily::Flux),
+    ("editor", ImageFamily::Flux),
+    ("flux-schnell", ImageFamily::Flux),
+    ("candle-flux", ImageFamily::Flux),
+    ("lmz/candle-flux", ImageFamily::Flux),
+    ("zimage-tune", ImageFamily::ZImage),
+    ("z-image-turbo", ImageFamily::ZImage),
+    ("Tongyi-MAI/Z-Image-Turbo", ImageFamily::ZImage),
+    ("qwen-tune", ImageFamily::QwenImage),
+    ("qwen-distilled", ImageFamily::QwenImage),
+    ("sdxl-a", ImageFamily::Sdxl),
+    ("sdxl-b", ImageFamily::Sdxl),
+    ("flux.2-klein-4b", ImageFamily::Flux2),
+    ("boogu-image-turbo", ImageFamily::Boogu),
+];
+
+/// Every id the store lists resolves to a checkpoint whose files declare the family, and
+/// the drop-ins are listed under the names a request resolves them by.
 #[test]
-fn step_distilled_defaults_differ_from_the_family_recipe() {
-    let flash = image_model_defaults("qwen-image-flash").unwrap();
-    assert_eq!(flash.steps, 4);
-    assert!((flash.guidance - 1.0).abs() < f64::EPSILON);
-    let base = image_model_defaults("qwen-image").unwrap();
+fn every_listed_id_resolves_to_its_own_checkpoint() {
+    let store = image_store("ids");
+    for (id, family) in STORE_IDS {
+        assert_eq!(
+            image_family(&store.dir, id),
+            Some(*family),
+            "'{id}' does not resolve to a {family:?} checkpoint"
+        );
+        assert!(is_image_gen_model(&store.dir, id), "{id}");
+    }
+    let mut listed: Vec<String> = drop_in_entries(&store.dir)
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            "editor",
+            "fluxdev",
+            "pair",
+            "pair-other",
+            "qwen-distilled",
+            "qwen-tune",
+            "sdxl-a",
+            "sdxl-b",
+            "zimage-tune"
+        ]
+    );
+}
+
+/// A checkpoint that declares a distillation does not inherit the family's guided recipe:
+/// that would be 10x the work for a checkpoint trained to run in 4 steps without guidance.
+#[test]
+fn a_declared_distillation_changes_the_recipe() {
+    let store = image_store("distilled");
+    let distilled = image_model_defaults(&store.dir, "qwen-distilled").unwrap();
+    assert_eq!(distilled.steps, 4);
+    assert!((distilled.guidance - 1.0).abs() < f64::EPSILON);
+    let base = image_model_defaults(&store.dir, "qwen-tune").unwrap();
     assert_eq!(base.steps, 20);
     assert!((base.guidance - 4.0).abs() < f64::EPSILON);
-    // Both are 1024-native and share the family's latent alignment.
-    assert_eq!((flash.size, flash.align), (base.size, base.align));
+    assert_eq!((distilled.size, distilled.align), (base.size, base.align));
 }
 
 #[test]
@@ -603,128 +732,61 @@ fn image_response_entry_echoes_seed_through_transcode_path() {
 
 // -- image_model_defaults --
 //
-// Defaults table for image-gen knobs (steps / guidance / size)
-// routed by model family. Drift across the 4 endpoints that
-// used to duplicate this if/else table was the real risk: a
-// bump to Z-Image's default step count would silently miss
-// /v1/images/edits if the developer only updated 3/4 sites.
+// Defaults table for image-gen knobs (steps / guidance / size), keyed on the family the
+// checkpoint's files declare and completed by what else they declare.
 
-/// REFLEXIVITY: whatever tag a model is loaded under, a later request for that
-/// same tag must reuse it. This failed for every Ray variant and cost a full
-/// unload + reload per render; the loaders now record the requested name, and
-/// `no_loader_hardcodes_its_resident_name` keeps them honest.
+/// REFLEXIVITY: whatever id a model is loaded under, a later request for that same id
+/// must reuse it, or every request unloads and reloads the model it already has.
 #[test]
-fn every_advertised_tag_serves_itself() {
-    for tag in [
-        "rayzist",
-        "rayqwest",
-        "rayflux",
-        "rayflux-krea",
-        "rayflux-horndog",
-        "raymnants",
-        "rayctifier",
-        "rayburn",
-        "z-image-turbo",
-        "qwen-image",
-        "qwen-image-edit",
-        "boogu",
-        "flux-schnell",
-        "FLUX.1-schnell",
-    ] {
+fn every_listed_id_serves_itself() {
+    let store = image_store("reflexive");
+    for (id, _) in STORE_IDS {
         assert!(
-            resident_serves_request(Some(tag), None, tag, None),
-            "a resident loaded as '{tag}' does not serve a request for '{tag}'"
+            resident_serves_request(&store.dir, Some(id), None, id, None),
+            "a resident loaded as '{id}' does not serve a request for '{id}'"
         );
     }
 }
 
-/// EVERY family the classifier can name must reach a loader of its OWN.
-///
-/// The dispatch was an inline `match` on the family string, written once per call
-/// site and ending in a `_ =>` arm that ran the FLUX loader. The SSE branch of
-/// /api/generate never grew an "sdxl" arm, so an SDXL request took that default:
-/// FLUX.1-schnell was fetched and rendered with, under the SDXL name and at SDXL's
-/// 25 steps / guidance 7. Nothing failed - the user simply got another model's
-/// picture. This walks the advertised tags and the family list together, so a family
-/// added to the classifier without a loader fails HERE.
+/// EVERY family reaches a loader of its OWN: the loader is the family the checkpoint's
+/// files declare, and every family is exercised by a checkpoint of the store.
 #[test]
-fn every_advertised_family_routes_to_its_own_loader() {
-    let mut covered: Vec<&str> = Vec::new();
-    for (tag, family, loader) in [
-        ("flux-schnell", "flux", ImageLoader::Flux),
-        ("FLUX.1-schnell", "flux", ImageLoader::Flux),
-        ("flux-kontext", "flux", ImageLoader::Flux),
-        ("rayflux", "flux", ImageLoader::Flux),
-        // These three matter most: every one of them CONTAINS "flux", so the FLUX.1 arm
-        // would claim them if the classifier tested it first.
-        ("flux2-klein-4b", "flux2", ImageLoader::Flux2),
-        ("FLUX.2-klein-9B", "flux2", ImageLoader::Flux2),
-        ("klein", "flux2", ImageLoader::Flux2),
-        ("z-image-turbo", "zimage", ImageLoader::ZImage),
-        ("rayzist", "zimage", ImageLoader::ZImage),
-        ("qwen-image", "qwen-image", ImageLoader::QwenImage),
-        ("qwen-image-edit", "qwen-image", ImageLoader::QwenImage),
-        ("rayqwest", "qwen-image", ImageLoader::QwenImage),
-        ("boogu", "boogu", ImageLoader::Boogu),
-        ("sdxl", "sdxl", ImageLoader::Sdxl),
-        ("raymnants", "sdxl", ImageLoader::Sdxl),
-        ("rayctifier", "sdxl", ImageLoader::Sdxl),
-        ("rayburn", "sdxl", ImageLoader::Sdxl),
-    ] {
+fn every_family_routes_to_its_own_loader() {
+    let store = image_store("loaders");
+    let mut covered = Vec::new();
+    for (id, family) in STORE_IDS {
         assert_eq!(
-            image_family(tag),
-            family,
-            "'{tag}' is classified as another family"
+            image_loader(&store.dir, id),
+            Ok(*family),
+            "'{id}' does not route to its own loader"
         );
-        assert!(
-            IMAGE_FAMILIES.contains(&family),
-            "family '{family}' is served but missing from IMAGE_FAMILIES"
-        );
-        assert_eq!(
-            image_family_loader(family),
-            Ok(loader),
-            "'{tag}' (family {family}) does not route to its own loader"
-        );
-        if !covered.contains(&family) {
-            covered.push(family);
-        }
+        covered.push(*family);
     }
-    for family in IMAGE_FAMILIES {
+    for family in ImageFamily::ALL {
         assert!(
-            covered.contains(family),
-            "family '{family}' is advertised but no tag above exercises its routing"
-        );
-        assert!(
-            image_family_loader(family).is_ok(),
-            "family '{family}' is advertised with no loader wired"
+            covered.contains(&family),
+            "no checkpoint of the store exercises the {family:?} loader"
         );
     }
 }
 
-/// The defect itself: an SDXL checkpoint must never be handed to the Flux loader.
+/// An SDXL checkpoint is never handed to the FLUX loader, whatever it is called.
 #[test]
 fn sdxl_never_routes_to_the_flux_loader() {
-    for tag in [
-        "sdxl",
-        "sdxl-base-1.0",
-        "raymnants",
-        "rayctifier",
-        "rayburn",
-    ] {
-        let loader = image_family_loader(image_family(tag))
-            .unwrap_or_else(|e| panic!("'{tag}' has no loader: {e}"));
-        assert_eq!(loader, ImageLoader::Sdxl, "'{tag}' routes to {loader:?}");
+    let store = image_store("sdxl");
+    for id in ["sdxl-a", "sdxl-b"] {
+        assert_eq!(image_loader(&store.dir, id), Ok(ImageFamily::Sdxl), "{id}");
     }
 }
 
-/// A representative model tag per advertised family, for the budget tests below.
-const FAMILY_TAGS: &[(&str, &str)] = &[
-    ("flux", "flux-schnell"),
-    ("flux2", "flux2-klein-4b"),
-    ("zimage", "z-image-turbo"),
-    ("qwen-image", "qwen-image"),
-    ("boogu", "boogu"),
-    ("sdxl", "sdxl"),
+/// A representative id per family, for the budget and recipe tests below.
+const FAMILY_TAGS: &[(ImageFamily, &str)] = &[
+    (ImageFamily::Flux, "flux-schnell"),
+    (ImageFamily::Flux2, "flux.2-klein-4b"),
+    (ImageFamily::ZImage, "z-image-turbo"),
+    (ImageFamily::QwenImage, "qwen-tune"),
+    (ImageFamily::Boogu, "boogu-image-turbo"),
+    (ImageFamily::Sdxl, "sdxl-a"),
 ];
 
 /// An empty directory, so nothing resolves to a checkpoint on disk and every reserve
@@ -749,16 +811,11 @@ fn empty_models_dir(tag: &str) -> TmpDir {
 
 /// The reserve each family's OWN architecture gives, written out here as an oracle.
 ///
-/// It is a deliberate second copy of `family_runtime_bytes`, transcribed from the arms
-/// as they stood when that table was keyed on the family STRING: equality proves the
-/// re-keying moved no family onto another family's figure. It is also exhaustive, so a
-/// family added to the loader enum without a budget fails to compile HERE as well as in
-/// the table - which is the point, since a reserve is what stops the planner from
-/// placing anything else on the card, and inheriting one silently is an OOM or a
-/// placement on the host that nothing explains.
+/// A deliberate second copy of `family_runtime_bytes`. It is exhaustive, so a family
+/// added to the enum without a budget fails to compile HERE as well as in the table.
 fn oracle_runtime_bytes(
     dir: &str,
-    loader: ImageLoader,
+    loader: ImageFamily,
     model_name: &str,
     geom: crate::inference::place::runtime_demand::RequestGeometry,
 ) -> u64 {
@@ -767,12 +824,12 @@ fn oracle_runtime_bytes(
     const VAE_DECODER_WIDTH: usize = 128;
     let vae = demand::vae_decode_bytes(geom.height, geom.width, VAE_DECODER_WIDTH);
     match loader {
-        ImageLoader::Flux2 => crate::inference::engine::flux2_engine::runtime_headroom_bytes(
+        ImageFamily::Flux2 => crate::inference::engine::flux2_engine::runtime_headroom_bytes(
             dir,
             geom.width,
             geom.height,
         ),
-        ImageLoader::QwenImage => {
+        ImageFamily::QwenImage => {
             crate::inference::engine::qwen_image_engine::runtime_headroom_bytes(
                 dir,
                 requested_checkpoint(dir, model_name).as_deref(),
@@ -780,16 +837,16 @@ fn oracle_runtime_bytes(
                 geom.height,
             )
         }
-        ImageLoader::ZImage => crate::inference::engine::image_engine::zimage_runtime_demand_for(
+        ImageFamily::ZImage => crate::inference::engine::image_engine::zimage_runtime_demand_for(
             dir,
-            find_ray_checkpoint(dir, "rayzist", model_name).as_deref(),
+            requested_checkpoint(dir, model_name).as_deref(),
             geom.width,
             geom.height,
         ),
-        ImageLoader::Boogu => {
+        ImageFamily::Boogu => {
             crate::inference::engine::boogu_engine::runtime_headroom_bytes(geom.width, geom.height)
         }
-        ImageLoader::Sdxl => {
+        ImageFamily::Sdxl => {
             let reference = (1024 / VAE_STRIDE) * (1024 / VAE_STRIDE);
             let measured = demand::MeasuredReserve {
                 bytes: 5 << 30,
@@ -803,66 +860,50 @@ fn oracle_runtime_bytes(
                 demand::scale_measured(&measured, tokens).max(vae),
             )
         }
-        ImageLoader::Flux => crate::inference::engine::image_engine::flux_runtime_demand_for(
+        ImageFamily::Flux => crate::inference::engine::image_engine::flux_runtime_demand_for(
             geom.width,
             geom.height,
-            find_local_flux_gguf(dir, model_name).as_deref(),
+            requested_checkpoint(dir, model_name).as_deref(),
         )
         .max(vae),
     }
 }
 
-/// Value by value, every advertised family still gets the reserve its own
-/// architecture gives - at several geometries, because the figure scales with the
-/// request and a family wired to the wrong formula can agree at one size by accident.
+/// Value by value, every family still gets the reserve its own architecture gives - at
+/// several geometries, because the figure scales with the request and a family wired to
+/// the wrong formula can agree at one size by accident.
 #[test]
 fn every_family_reserves_what_its_own_architecture_asks_for() {
     use crate::inference::place::runtime_demand::RequestGeometry;
     let tmp = empty_models_dir("reserve");
     let dir = tmp.0.to_string_lossy().to_string();
-    let mut covered: Vec<&str> = Vec::new();
-    for (family, tag) in FAMILY_TAGS {
-        let loader = image_family_loader(family)
-            .unwrap_or_else(|e| panic!("family '{family}' has no loader: {e}"));
-        assert_eq!(
-            image_family(tag),
-            *family,
-            "'{tag}' is classified as another family"
-        );
+    let mut covered = Vec::new();
+    for (loader, tag) in FAMILY_TAGS {
         for (w, h) in [(512, 512), (1024, 1024), (1024, 1536)] {
             let geom = RequestGeometry::new(w, h);
-            let got = family_runtime_bytes(&dir, loader, tag, geom);
+            let got = family_runtime_bytes(&dir, *loader, tag, geom);
             assert_eq!(
                 got,
-                oracle_runtime_bytes(&dir, loader, tag, geom),
-                "family '{family}' at {w}x{h} no longer reserves what its own \
+                oracle_runtime_bytes(&dir, *loader, tag, geom),
+                "family {loader:?} at {w}x{h} no longer reserves what its own \
                  architecture asks for"
             );
             // A reserve of zero admits any placement, which is the same failure as
             // inheriting another family's: nothing holds the card for the render.
-            assert!(got > 0, "family '{family}' at {w}x{h} reserves nothing");
+            assert!(got > 0, "family {loader:?} at {w}x{h} reserves nothing");
         }
-        covered.push(*family);
+        covered.push(*loader);
     }
-    for family in IMAGE_FAMILIES {
+    for family in ImageFamily::ALL {
         assert!(
-            covered.contains(family),
-            "family '{family}' is advertised but no budget of its own is exercised here"
+            covered.contains(&family),
+            "family {family:?} has no budget of its own exercised here"
         );
     }
 }
 
-/// ONE reserve per family, not one per call site.
-///
-/// Z-Image carried two independent figures for the same request: this table derived
-/// its own from the activation shapes, the loader scaled a measured seed, and at
-/// 1024^2 they read 1.9 GB and 3.2 GB. Two numbers is not a redundancy, it is a
-/// disagreement - and only one of them was wired to the measurement loop, so after a
-/// render exhausted a card the planner asked for what it had learned while the gate
-/// that admits the render went on quoting the figure that admitted the failure.
-///
-/// Equality is asserted against the LOADER's helper by name: the point is not that
-/// the two arithmetics agree today, it is that there is only one of them.
+/// ONE reserve per family, not one per call site: the admission gate asks the loader's
+/// own helper, so the two cannot disagree.
 #[test]
 fn the_zimage_reserve_is_the_figure_its_loader_plans_against() {
     use crate::inference::place::runtime_demand::RequestGeometry;
@@ -877,334 +918,224 @@ fn the_zimage_reserve_is_the_figure_its_loader_plans_against() {
     ] {
         let geom = RequestGeometry::new(w, h);
         assert_eq!(
-            family_runtime_bytes(&dir, ImageLoader::ZImage, "z-image-turbo", geom),
+            family_runtime_bytes(&dir, ImageFamily::ZImage, "z-image-turbo", geom),
             crate::inference::engine::image_engine::zimage_runtime_demand_for(&dir, None, w, h),
             "the Z-Image admission gate and its placement disagree at {w}x{h}"
         );
     }
 }
 
-/// The weight side of the same defect: with ONLY a Flux checkpoint on disk, a family
-/// that has no weights there must report none. The `_ =>` arm this replaces returned
-/// the Flux file's size for every family it did not name, so an unbudgeted family
-/// reserved a card for weights that belong to another model.
+/// With ONLY a FLUX checkpoint on disk, a family that has no weights there reports none:
+/// a family carrying another family's weights reserves a card for a model it is not.
 #[test]
 fn no_family_reports_another_familys_checkpoint_as_its_weights() {
     let tmp = empty_models_dir("weights");
     let dir = tmp.0.to_string_lossy().to_string();
-    // A Ray Flux fine-tune: a plain safetensors under `rayflux/`, the one layout the
-    // Flux finder resolves without an HF cache. The bytes are not a checkpoint, and
-    // nothing here reads them - only the file's LENGTH is the figure under test.
-    const FLUX_WEIGHTS: usize = 4096;
-    std::fs::create_dir_all(tmp.0.join("rayflux")).unwrap();
-    std::fs::write(
-        tmp.0.join("rayflux/rayflux.safetensors"),
-        vec![0u8; FLUX_WEIGHTS],
-    )
-    .unwrap();
-
+    let flux_file = drop_in(&tmp.0, "fluxdev/Tune.safetensors", &flux(true));
+    let flux_len = std::fs::metadata(&flux_file).unwrap().len();
     assert_eq!(
-        family_hot_bytes(&dir, ImageLoader::Flux, "rayflux"),
-        FLUX_WEIGHTS as u64,
-        "the Flux budget must read the Flux checkpoint"
+        family_hot_bytes(&dir, ImageFamily::Flux, "fluxdev"),
+        flux_len,
+        "the FLUX budget must read the FLUX checkpoint"
     );
-    for (family, tag) in FAMILY_TAGS {
-        let loader = image_family_loader(family)
-            .unwrap_or_else(|e| panic!("family '{family}' has no loader: {e}"));
-        if loader == ImageLoader::Flux {
+    for (loader, tag) in FAMILY_TAGS {
+        if *loader == ImageFamily::Flux {
             continue;
         }
         assert_eq!(
-            family_hot_bytes(&dir, loader, tag),
+            family_hot_bytes(&dir, *loader, tag),
             0,
-            "family '{family}' claims the Flux checkpoint as its own hot component"
+            "family {loader:?} claims the FLUX checkpoint as its own hot component"
         );
     }
 }
 
-/// A family nobody wired must FAIL, naming itself. Falling back to some other
-/// family's loader is the bug, not the safety net: it renders the wrong model
-/// instead of reporting that the family is unhandled.
+/// A name whose files declare no image model FAILS, naming itself, rather than borrowing
+/// some family's loader and rendering another model under its name.
 #[test]
-fn an_unwired_family_errors_by_name_instead_of_falling_back() {
-    // `flux2` used to stand in here as an example of an unwired family. It is wired now,
-    // so the placeholders have to be families that genuinely are not - and the point of the
-    // test is unchanged: an unknown family must ERROR by name rather than borrow a loader.
-    for unwired in ["stable-cascade", "pixart", "", "SDXL"] {
-        let err = image_family_loader(unwired)
-            .expect_err("an unwired family must not resolve to a loader");
+fn a_name_whose_files_declare_no_image_model_is_refused_by_name() {
+    let store = image_store("unknown");
+    for name in ["stable-cascade", "Owner/Text-Model", "text-model", ""] {
+        let err = image_loader(&store.dir, name)
+            .expect_err("a checkpoint that is no image model must not resolve to a loader");
         assert!(
-            err.contains(unwired),
-            "the error must name the unhandled family '{unwired}': {err}"
+            err.contains(name),
+            "the error must name the model '{name}': {err}"
         );
+        assert!(image_model_defaults(&store.dir, name).is_err(), "{name}");
+        assert!(!is_image_gen_model(&store.dir, name), "{name}");
     }
 }
 
-/// The recipe each family was validated at, written out here as an oracle.
-///
-/// A deliberate second copy of `image_model_defaults`, transcribed arm for arm from
-/// the table as the family STRING left it: equality proves the re-keying moved no
-/// family onto another family's numbers. Exhaustive on [`ImageLoader`], so a family
-/// added tomorrow has to state its recipe HERE as well as in the table - which is the
-/// point, because a family with no recipe of its own does not fail, it renders at
-/// someone else's step count and someone else's resolution under its own name.
-fn oracle_defaults(loader: ImageLoader, model_name: &str) -> ImageModelDefaults {
-    match loader {
-        ImageLoader::ZImage => ImageModelDefaults {
-            steps: 9,
-            guidance: 5.0,
-            size: 1024,
-            align: 16,
-        },
-        ImageLoader::QwenImage => {
-            if crate::inference::engine::qwen_image_engine::is_step_distilled(model_name) {
-                ImageModelDefaults {
-                    steps: 4,
-                    guidance: 1.0,
-                    size: 1024,
-                    align: 16,
-                }
-            } else {
-                ImageModelDefaults {
-                    steps: 20,
-                    guidance: 4.0,
-                    size: 1024,
-                    align: 16,
-                }
-            }
-        }
-        ImageLoader::Flux2 => ImageModelDefaults {
-            steps: 4,
-            guidance: 1.0,
-            size: 1024,
-            align: 16,
-        },
-        ImageLoader::Boogu => ImageModelDefaults {
-            steps: 4,
-            guidance: 1.0,
-            size: 1024,
-            align: 16,
-        },
-        ImageLoader::Sdxl => ImageModelDefaults {
-            steps: 25,
-            guidance: 7.0,
-            size: 1024,
-            align: 64,
-        },
-        ImageLoader::Flux => {
-            if is_ray_fp8_model(model_name) {
-                ImageModelDefaults {
-                    steps: 20,
-                    guidance: 3.5,
-                    size: 1024,
-                    align: 16,
-                }
-            } else {
-                ImageModelDefaults {
-                    steps: 4,
-                    guidance: 4.0,
-                    size: 512,
-                    align: 16,
-                }
-            }
-        }
+/// The recipe each family was validated at, written out here as an oracle: a deliberate
+/// second copy of `image_defaults_for`. Exhaustive on [`ImageFamily`], so a family added
+/// tomorrow has to state its recipe HERE as well as in the table.
+fn oracle_defaults(
+    family: ImageFamily,
+    facts: &crate::inference::media_facts::MediaFacts,
+) -> (usize, f64, usize, usize) {
+    match family {
+        ImageFamily::ZImage => (9, 5.0, 1024, 16),
+        ImageFamily::QwenImage if facts.distilled => (4, 1.0, 1024, 16),
+        ImageFamily::QwenImage => (20, 4.0, 1024, 16),
+        ImageFamily::Flux2 => (4, 1.0, 1024, 16),
+        ImageFamily::Boogu => (4, 1.0, 1024, 16),
+        ImageFamily::Sdxl => (25, 7.0, 1024, 64),
+        ImageFamily::Flux if facts.instruction_edit => (28, 2.5, 1024, 16),
+        ImageFamily::Flux if facts.guidance_embedded => (20, 3.5, 1024, 16),
+        ImageFamily::Flux => (4, 4.0, 512, 16),
     }
 }
 
-/// Value by value, every advertised family still renders at its OWN recipe.
-///
-/// The drop-in variants are exercised beside their base because the two arms that
-/// used a guard rather than a family name - the step-distilled Qwen-Image, the Ray
-/// FLUX fine-tunes - are the ones a re-keying can quietly reorder.
+/// Value by value, every checkpoint of the store renders at its OWN recipe: the guidance
+/// embedding, the distillation and the instruction editor each move a FLUX.1 or a
+/// Qwen-Image checkpoint off its family's base recipe.
 #[test]
 fn every_family_renders_at_its_own_recipe() {
-    let mut covered: Vec<&str> = Vec::new();
-    for (family, tag) in FAMILY_TAGS.iter().copied().chain([
-        ("qwen-image", "qwen-image-flash"),
-        ("qwen-image", "rayqwest"),
-        ("zimage", "rayzist"),
-        ("flux", "rayflux"),
-        ("flux", "rayflux-krea"),
-        ("sdxl", "raymnants"),
-    ]) {
+    let store = image_store("recipes");
+    for (id, family) in STORE_IDS {
+        let facts = media_facts(&store.dir, id).unwrap();
+        let got = image_model_defaults(&store.dir, id)
+            .unwrap_or_else(|e| panic!("'{id}' has no recipe of its own: {e}"));
         assert_eq!(
-            image_family(tag),
-            family,
-            "'{tag}' is classified as another family"
-        );
-        let loader = image_family_loader(family)
-            .unwrap_or_else(|e| panic!("family '{family}' has no loader: {e}"));
-        let got = image_model_defaults(tag)
-            .unwrap_or_else(|e| panic!("'{tag}' has no recipe of its own: {e}"));
-        let want = oracle_defaults(loader, tag);
-        assert_eq!(
-            got.steps, want.steps,
-            "'{tag}' ({family}) renders at another step count"
-        );
-        assert_eq!(
-            got.guidance, want.guidance,
-            "'{tag}' ({family}) renders at another guidance"
-        );
-        assert_eq!(
-            got.size, want.size,
-            "'{tag}' ({family}) renders at another size"
-        );
-        assert_eq!(
-            got.align, want.align,
-            "'{tag}' ({family}) uses another alignment"
-        );
-        if !covered.contains(&family) {
-            covered.push(family);
-        }
-    }
-    for family in IMAGE_FAMILIES {
-        assert!(
-            covered.contains(family),
-            "family '{family}' is advertised but no recipe of its own is exercised here"
+            (got.steps, got.guidance, got.size, got.align),
+            oracle_defaults(*family, &facts),
+            "'{id}' ({family:?}) renders at another recipe"
         );
     }
+    let recipe = |id: &str| {
+        let d = image_model_defaults(&store.dir, id).unwrap();
+        (d.steps, d.guidance, d.size)
+    };
+    assert_eq!(recipe("flux-schnell"), (4, 4.0, 512));
+    assert_eq!(recipe("fluxdev"), (20, 3.5, 1024));
+    assert_eq!(recipe("editor"), (28, 2.5, 1024));
+    assert!(is_flux_instruction_editor(&store.dir, "editor"));
+    assert!(!is_flux_instruction_editor(&store.dir, "fluxdev"));
 }
 
-/// The recipes must not collapse onto one another: the FLUX Schnell arm is what the
-/// removed `_ =>` handed out, so a family that reads back as 4 steps at guidance 4.0
-/// and 512 pixels without being FLUX Schnell has inherited it.
+/// The recipes do not collapse onto one another: a family that reads back as 4 steps at
+/// guidance 4.0 and 512 pixels without being a FLUX.1 without guidance embedding has
+/// inherited its recipe.
 #[test]
 fn no_family_inherits_the_flux_schnell_recipe() {
-    let schnell = image_model_defaults("flux-schnell").unwrap();
+    let store = image_store("schnell");
+    let schnell = image_model_defaults(&store.dir, "flux-schnell").unwrap();
     assert_eq!(
         (schnell.steps, schnell.guidance, schnell.size),
         (4, 4.0, 512)
     );
     for (family, tag) in FAMILY_TAGS {
-        if *family == "flux" {
+        if *family == ImageFamily::Flux {
             continue;
         }
-        let d = image_model_defaults(tag).unwrap();
+        let d = image_model_defaults(&store.dir, tag).unwrap();
         assert_ne!(
             (d.steps, d.guidance, d.size),
             (schnell.steps, schnell.guidance, schnell.size),
-            "family '{family}' renders at FLUX Schnell's recipe"
+            "family {family:?} renders at FLUX Schnell's recipe"
         );
     }
 }
 
-/// A family nobody wired gets NO recipe and NO checkpoint - it is named in an error
-/// rather than handed FLUX Schnell's numbers, which is what the `_ =>` arm did.
-#[test]
-fn an_unwired_family_gets_no_recipe_of_its_own() {
-    for unwired in ["stable-cascade", "pixart", ""] {
-        let err = image_model_defaults_for_family(unwired, unwired)
-            .expect_err("an unwired family must not inherit a recipe");
-        assert!(
-            err.contains(unwired),
-            "the error must name the family with no recipe '{unwired}': {err}"
-        );
-    }
-}
-
-/// THE CHECKPOINT RESOLVER, with only a FLUX GGUF on disk.
-///
-/// `requested_checkpoint` matched on the family string and ended in a `_ =>` arm
-/// calling the FLUX finder, and that finder stops looking at the model name once its
-/// Ray branch misses: it takes any `*flux*schnell*.gguf` under the models directory.
-/// So a boogu or flux2 request was answered with the FLUX checkpoint's path, and the
-/// family-filtered fallback that would have found the family's own file never ran.
+/// THE CHECKPOINT RESOLVER: a family resolves only a checkpoint its own files declare.
 #[test]
 fn no_family_resolves_another_familys_checkpoint() {
-    let tmp = empty_models_dir("ckpt");
-    let dir = tmp.0.to_string_lossy().to_string();
-    // Only the FLUX family has anything on disk. The bytes are not a checkpoint;
-    // nothing here reads them, only the file's NAME is what the finder selects on.
-    let flux = tmp.0.join("flux1-schnell-Q4_K.gguf");
-    std::fs::write(&flux, b"not a checkpoint").unwrap();
-
+    let store = image_store("ckpt");
+    let dir = &store.dir;
+    let schnell = requested_checkpoint(dir, "flux-schnell").expect("the FLUX GGUF");
     assert_eq!(
-        requested_checkpoint(&dir, "flux-schnell").as_deref(),
-        Some(flux.as_path()),
-        "the FLUX resolver must still find the FLUX checkpoint"
+        schnell.file_name().and_then(|n| n.to_str()),
+        Some("flux1-schnell.gguf")
     );
-    for (family, tag) in FAMILY_TAGS {
-        if *family == "flux" {
-            continue;
-        }
-        assert_eq!(
-            requested_checkpoint(&dir, tag),
-            None,
-            "family '{family}' resolves to the FLUX checkpoint as its own"
-        );
-    }
+    assert!(requested_checkpoint(dir, "zimage-tune")
+        .is_some_and(|p| p.ends_with("zimage-tune/Tune.safetensors")));
+    // The family's own repository is loaded from its directory, by its own loader.
+    assert_eq!(requested_checkpoint(dir, "z-image-turbo"), None);
+    // These two families read their weights from a directory, never a single file.
+    assert_eq!(requested_checkpoint(dir, "flux.2-klein-4b"), None);
+    assert_eq!(requested_checkpoint(dir, "boogu-image-turbo"), None);
+    assert_eq!(requested_checkpoint(dir, "Owner/Text-Model"), None);
 }
 
-/// The guard this reflexivity replaced must survive: a Ray fine-tune may never be
-/// served from a base-model request, or the reverse.
+/// A fine-tune is never served from a request for its base model, or the reverse, and
+/// two checkpoints of one family are two models.
 #[test]
-fn a_ray_finetune_never_aliases_its_base_model() {
+fn a_finetune_never_aliases_its_base_model() {
+    let store = image_store("alias");
+    let d = store.dir.as_str();
     assert!(!resident_serves_request(
-        Some("rayzist"),
+        d,
+        Some("zimage-tune"),
         None,
         "z-image-turbo",
         None
     ));
     assert!(!resident_serves_request(
+        d,
         Some("z-image-turbo"),
         None,
-        "rayzist",
+        "zimage-tune",
         None
     ));
     assert!(!resident_serves_request(
-        Some("rayqwest"),
+        d,
+        Some("qwen-distilled"),
         None,
-        "qwen-image",
+        "qwen-tune",
         None
     ));
     // Different families never match either.
     assert!(!resident_serves_request(
-        Some("boogu"),
+        d,
+        Some("boogu-image-turbo"),
         None,
         "flux-schnell",
         None
     ));
     // Two files of the same family are distinct when both resolve locally.
     assert!(!resident_serves_request(
-        Some("rayflux"),
+        d,
+        Some("pair"),
         Some("A.safetensors"),
-        "rayflux-krea",
+        "pair-other",
         Some("B.safetensors")
     ));
-    // Two SDXL fine-tunes with no resolvable file must not alias either: they did,
-    // and a request for one was answered with the other's weights.
+    // Two SDXL checkpoints with no resolvable file must not alias either.
     assert!(!resident_serves_request(
-        Some("rayctifier"),
+        d,
+        Some("sdxl-a"),
         None,
-        "rayburn",
+        "sdxl-b",
         None
     ));
     assert!(!resident_serves_request(
-        Some("rayburn"),
+        d,
+        Some("sdxl-b"),
         None,
-        "rayctifier",
+        "sdxl-a",
         None
     ));
-    // The same tag still serves itself - a resident that reloaded on every request
-    // would be the opposite failure.
+    // The same id still serves itself.
     assert!(resident_serves_request(
-        Some("rayburn"),
+        d,
+        Some("sdxl-b"),
         None,
-        "rayburn",
+        "sdxl-b",
         None
     ));
     assert!(resident_serves_request(
-        Some("rayflux"),
+        d,
+        Some("pair"),
         Some("A.safetensors"),
-        "rayflux",
+        "pair",
         Some("A.safetensors")
     ));
 }
 
 /// SOURCE GATE: a loader that writes a literal name into its resident state
-/// breaks reflexivity for every variant tag routed through it - the defect above,
-/// which was present at four of the five load sites. The name must come from the
-/// request.
+/// breaks reflexivity for every variant tag routed through it. The name must come from
+/// the request.
 #[test]
 fn no_loader_hardcodes_its_resident_name() {
     let src = include_str!("../../../inference/engine/image_engine/mod.rs");
@@ -1226,35 +1157,17 @@ fn no_loader_hardcodes_its_resident_name() {
 
 #[test]
 fn image_model_defaults_z_image_uses_1024_at_9_steps() {
-    // Z-Image-Turbo's flow-matching scheduler converges in 9
-    // steps at its native 1024- training resolution.
-    let d = image_model_defaults("z-image").unwrap();
+    // Z-Image-Turbo's flow-matching scheduler converges in 9 steps at its native 1024
+    // training resolution.
+    let store = image_store("zimage-defaults");
+    let d = image_model_defaults(&store.dir, "z-image-turbo").unwrap();
     assert_eq!(d.size, 1024);
     assert_eq!(d.steps, 9);
     assert_eq!(d.guidance, 5.0);
-}
-
-#[test]
-fn image_model_defaults_flux_uses_512_at_4_steps() {
-    // Flux Schnell is trained on 4 steps; 512- is the bench-
-    // validated default that fits in <16 GB VRAM with margin.
-    let d = image_model_defaults("flux").unwrap();
-    assert_eq!(d.size, 512);
-    assert_eq!(d.steps, 4);
-    assert_eq!(d.guidance, 4.0);
-}
-
-#[test]
-fn image_model_defaults_zimage_vs_flux_differ_on_every_field() {
-    // Pin that the Z-Image path doesn't accidentally collapse
-    // to the Flux defaults - a regression there would silently
-    // halve Z-Image's default step count + guidance and produce
-    // washed-out output.
-    let z = image_model_defaults("z-image").unwrap();
-    let f = image_model_defaults("flux").unwrap();
-    assert_ne!(z.size, f.size);
-    assert_ne!(z.steps, f.steps);
-    assert_ne!(z.guidance, f.guidance);
+    let f = image_model_defaults(&store.dir, "flux-schnell").unwrap();
+    assert_ne!(d.size, f.size);
+    assert_ne!(d.steps, f.steps);
+    assert_ne!(d.guidance, f.guidance);
 }
 
 // -- transcode_png_b64 --
@@ -1415,90 +1328,6 @@ fn pick_largest_gguf_under_walks_recursively() {
 
     // Non-existent - None (no panic).
     assert!(pick_largest_gguf_under(&guard.0.join("nope")).is_none());
-}
-
-#[test]
-fn is_z_image_model_matches_naming_variants() {
-    assert!(is_z_image_model("Z-Image-Turbo"));
-    assert!(is_z_image_model("Tongyi-MAI/Z-Image-Turbo"));
-    assert!(is_z_image_model("z-image"));
-    assert!(is_z_image_model("z_image_local"));
-    // Case-insensitive
-    assert!(is_z_image_model("Z_IMAGE"));
-    // Negatives
-    assert!(!is_z_image_model("flux-dev"));
-    assert!(!is_z_image_model("stable-diffusion"));
-    assert!(!is_z_image_model("qwen3-coder"));
-    assert!(!is_z_image_model(""));
-}
-
-// -- is_image_gen_model ------------
-// Centralises the image-gen dispatch check that previously lived
-// inline as `model_lower.contains("flux") || ...` at 3 sites
-// (/api/chat + 2- /api/generate) plus the capabilities helper.
-// A future image family (e.g. Stable Diffusion 3.5 weights we
-// could load via the upstream transformers crate) adds one substring here
-// and reaches all 4 routes at once.
-
-#[test]
-fn is_image_gen_model_matches_flux_and_zimage_variants() {
-    // Flux family (Schnell, Dev, fp16, etc.)
-    assert!(is_image_gen_model("flux"));
-    assert!(is_image_gen_model("flux-schnell"));
-    assert!(is_image_gen_model("flux-dev:fp16"));
-    assert!(is_image_gen_model("black-forest-labs/FLUX.1-schnell"));
-    // Z-Image family with all naming variants
-    assert!(is_image_gen_model("z-image"));
-    assert!(is_image_gen_model("z_image"));
-    assert!(is_image_gen_model("Z-Image-Turbo"));
-    assert!(is_image_gen_model("Tongyi-MAI/Z-Image-Turbo"));
-    // Case-insensitive
-    assert!(is_image_gen_model("Z_IMAGE_LOCAL"));
-}
-
-#[test]
-fn is_image_gen_model_is_superset_of_is_z_image_model() {
-    // Drift guard: is_z_image_model classifies a subset of names
-    // that is_image_gen_model also accepts (both check the
-    // "z-image" / "z_image" substrings). A future refactor that
-    // tightens one without the other (e.g. is_image_gen_model
-    // checking "flux|stable-diffusion" but dropping z-image, or
-    // is_z_image_model gaining a new pattern not mirrored)
-    // would break the dispatch invariant the two classifiers
-    // encode together.
-    for name in [
-        "z-image",
-        "z_image",
-        "Z-Image-Turbo",
-        "Tongyi-MAI/Z-Image-Turbo",
-        "z_image_local",
-    ] {
-        if is_z_image_model(name) {
-            assert!(
-                is_image_gen_model(name),
-                "{name} classifies as Z-Image but not as image-gen - \
-                 dispatch invariant violated"
-            );
-        }
-    }
-}
-
-#[test]
-fn is_image_gen_model_negatives() {
-    // Text / vision / audio / unknown - none should match.
-    assert!(!is_image_gen_model("qwen3-coder"));
-    assert!(!is_image_gen_model("deepseek-r1:32b"));
-    assert!(!is_image_gen_model("moondream:1.8b"));
-    assert!(!is_image_gen_model("openai/whisper-small"));
-    assert!(!is_image_gen_model("parler-tts/parler-tts-mini-v1"));
-    assert!(!is_image_gen_model(""));
-    // Substring false-positives don't sneak in - "fluxbox" isn't an
-    // image-gen model but matches "flux"; intentional accepted as
-    // collateral damage (rare to name a text LLM this way).
-    assert!(
-        is_image_gen_model("fluxbox-tester"),
-        "documenting the substring false-positive corner case"
-    );
 }
 
 /// A parameter the resident family refuses answers 400; any other engine failure is not

@@ -310,11 +310,16 @@ mod tests {
     #[ignore = "needs an SDXL checkpoint under the configured models dir"]
     fn round_trips_a_real_image_through_a_real_checkpoint() {
         let dir = crate::config::Config::load_test().get_hf_models_dir();
-        let ckpt = std::fs::read_dir(dir.join("raymnants"))
-            .expect("raymnants dir")
+        let ckpt = std::fs::read_dir(&dir)
+            .expect("the models dir")
             .flatten()
+            .filter(|d| d.path().is_dir())
+            .flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten())
             .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .find(|p| {
+                crate::inference::media_facts::read(p).and_then(|f| f.image_family())
+                    == Some(crate::inference::media_facts::ImageFamily::Sdxl)
+            })
             .expect("an SDXL .safetensors");
         let src = std::env::var("SDXL_VAE_TEST_IMAGE")
             .expect("set SDXL_VAE_TEST_IMAGE to a PNG/JPEG to round-trip");

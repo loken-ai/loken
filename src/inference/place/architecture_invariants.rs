@@ -2,9 +2,11 @@
 //!
 //! What a model is comes from its file: the tensors a block carries, their shapes, the
 //! metadata keys. The few facts a file does not carry sit in one table,
-//! `inference/model_facts.rs`, keyed by the file's `general.architecture`. Anywhere else, a
-//! string literal naming an architecture or a model family inside a comparison, a match
-//! pattern or a list of names is a decision taken on a name, and this gate refuses it.
+//! `inference/model_facts.rs`, keyed by the file's `general.architecture`; what a media
+//! checkpoint's files declare is read in `inference/media_facts.rs`, keyed by the pipeline
+//! class, model type or architecture they carry. Anywhere else, a string literal naming an
+//! architecture or a model family inside a comparison, a match pattern or a list of names
+//! is a decision taken on a name, and this gate refuses it.
 //!
 //! Writing an identifier is not deciding on one: a converter that stores
 //! `general.architecture` in the file it produces, or a translation whose RESULT is an
@@ -16,8 +18,8 @@
 
 use super::placement_invariants::{fleet_sources, production};
 
-/// The table: the one file allowed to decide by architecture key.
-const FACTS_TABLE: &str = "inference/model_facts.rs";
+/// The tables: the files allowed to decide by an identifier a checkpoint's files carry.
+const FACTS_TABLES: [&str; 2] = ["inference/model_facts.rs", "inference/media_facts.rs"];
 
 /// Trees this gate does not read yet. `api/` routes requests by model and carries its own
 /// coverage for now; extend this gate to it once that lands.
@@ -327,7 +329,8 @@ fn no_architecture_name_decides_outside_the_facts_table() {
             .unwrap_or(&path)
             .display()
             .to_string();
-        if rel == FACTS_TABLE || NOT_YET_GATED.iter().any(|d| rel.starts_with(d)) {
+        let table = FACTS_TABLES.contains(&rel.as_str());
+        if table || NOT_YET_GATED.iter().any(|d| rel.starts_with(d)) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -356,8 +359,7 @@ fn no_architecture_name_decides_outside_the_facts_table() {
     }
     assert!(
         problems.is_empty(),
-        "behaviour comes from the file's tensors and metadata, and what the file cannot say \
-         from {FACTS_TABLE}:\n{}",
+        "behaviour comes from the file's tensors and metadata, read in {FACTS_TABLES:?}:\n{}",
         problems.join("\n")
     );
 }

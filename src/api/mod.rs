@@ -15,16 +15,15 @@ pub mod assist;
 /// it up and what recipe it renders at. Exported deliberately narrowly - the handler
 /// module itself stays private.
 ///
-/// `image_family_loader` + `load_image_family` are here because the CLI carried its own
-/// if/else copy of the loader dispatch, ending in the same fall-through to Flux: it had
-/// no boogu arm and no flux2 arm, so it rendered both families with FLUX.1-schnell.
-/// Sharing the dispatch is what stops a fourth copy from being written.
+/// `image_loader` + `load_image_family` are here so a CLI resolves a checkpoint and its
+/// loader through the same dispatch as the handlers.
 #[cfg(feature = "image")]
 pub mod image_paths {
     pub use super::handlers::{
-        image_family, image_family_loader, image_model_defaults, load_image_family,
-        requested_checkpoint, ImageLoader, ImageModelDefaults,
+        image_family, image_loader, image_model_defaults, load_image_family, requested_checkpoint,
+        ImageModelDefaults,
     };
+    pub use crate::inference::media_facts::ImageFamily;
 }
 mod anthropic;
 #[cfg(test)]

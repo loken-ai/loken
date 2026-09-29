@@ -4,15 +4,10 @@
 use super::*;
 
 /// The image model a request that names none renders with, on every image route.
-pub(crate) const DEFAULT_IMAGE_MODEL: &str = "z-image";
+pub(crate) const DEFAULT_IMAGE_MODEL: &str = "z-image-turbo";
 
 /// Images one upload request may render.
 const IMAGE_UPLOAD_N_MAX: u32 = 10;
-
-/// Steps and guidance of a FLUX Kontext edit: a guidance-distilled editor needs many
-/// more steps than schnell for a faithful, sharp edit, and a lower guidance.
-const KONTEXT_STEPS: usize = 28;
-const KONTEXT_GUIDANCE: f64 = 2.5;
 
 /// Strength of an edit by default: the instruction may move the picture far.
 const EDIT_STRENGTH: f64 = 0.75;
@@ -40,7 +35,7 @@ async fn image_upload_where_the_model_is(
         .await
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| DEFAULT_IMAGE_MODEL.to_string());
-    let hot = match image_model_defaults(&model_name) {
+    let hot = match image_model_defaults(&state.huggingface_models_dir, &model_name) {
         Ok(d) => super::image_hot_bytes(
             state,
             &model_name,
@@ -55,7 +50,7 @@ async fn image_upload_where_the_model_is(
         super::image_served_here(state, &model_name).await,
         state.card_holds(hot),
         hot,
-        |peer| super::serves_image_family(peer, &model_name),
+        |peer| super::holds_image_model(peer, &model_name),
         path,
         &body,
     )
@@ -149,8 +144,8 @@ pub(crate) struct ImageUploadJob {
     pub steps: usize,
     pub guidance: f64,
     pub seed: u64,
-    /// A FLUX Kontext checkpoint: the source is an instruction-edit context, not an
-    /// img2img init latent.
+    /// A FLUX.1 checkpoint whose pipeline edits by instruction: the source is an
+    /// instruction-edit context, not an img2img init latent.
     pub kontext: bool,
 }
 
@@ -293,7 +288,7 @@ impl ImageFormFields {
             .clone()
             .unwrap_or_else(|| DEFAULT_IMAGE_MODEL.to_string());
         validate_model_id(&model_name).map_err(IntoResponse::into_response)?;
-        let defaults = image_model_defaults(&model_name)
+        let defaults = image_model_defaults(&state.huggingface_models_dir, &model_name)
             .map_err(|e| form_error(StatusCode::BAD_REQUEST, e))?;
         let (width, height) = match self.size.as_deref() {
             // A size the caller named still has to be one the model can halve evenly:
@@ -305,12 +300,8 @@ impl ImageFormFields {
             // No explicit size: follow the source image, not a square default.
             None => edit_output_size(&image_bytes, defaults.size, defaults.align),
         };
-        let kontext = model_name.to_lowercase().contains("kontext");
-        let (default_steps, default_guidance) = if kontext {
-            (KONTEXT_STEPS, KONTEXT_GUIDANCE)
-        } else {
-            (defaults.steps, defaults.guidance)
-        };
+        let kontext = is_flux_instruction_editor(&state.huggingface_models_dir, &model_name);
+        let (default_steps, default_guidance) = (defaults.steps, defaults.guidance);
         // Bound once: the placement reserves for this geometry, and a render that runs out
         // anyway re-plans against the same one.
         let geom = crate::inference::place::runtime_demand::RequestGeometry::new(width, height);
@@ -698,7 +689,8 @@ mod tests {
     /// Both upload routes and the upload router fall back to one model.
     #[test]
     fn one_default_model_for_uploads() {
-        assert!(image_model_defaults(DEFAULT_IMAGE_MODEL).is_ok());
+        let store = crate::api::handlers::media::tests::image_store("upload-default");
+        assert!(image_model_defaults(&store.dir, DEFAULT_IMAGE_MODEL).is_ok());
         let f = ImageFormFields::default();
         assert!(f.model.is_none());
         assert_eq!(f.n, 1);

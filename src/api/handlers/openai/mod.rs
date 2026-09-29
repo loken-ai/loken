@@ -270,7 +270,7 @@ pub(crate) async fn chat_completion(
     // /api/generate guards. Same rationale as 857388d: routing CLIP to
     // the chat path panicked the tensor-op worker thread on its missing-
     // weights branch (blocking_lock in async).
-    if let Some(hint) = non_chat_pipeline_component(&model_name) {
+    if let Some(hint) = non_chat_pipeline_component(&state.huggingface_models_dir, &model_name) {
         return Err(ApiError::Validation(format!(
             "model '{model_name}' is not a chat model: {hint}",
         )));
@@ -1078,7 +1078,7 @@ pub(crate) async fn text_completions(
     let model_name = normalize_model_id(&model);
 
     // Reject non-decoder pipeline components (parity with the chat path).
-    if let Some(hint) = non_chat_pipeline_component(&model_name) {
+    if let Some(hint) = non_chat_pipeline_component(&state.huggingface_models_dir, &model_name) {
         return Err(ApiError::Validation(format!(
             "model '{model_name}' is not a text-completion model: {hint}",
         )));
@@ -1527,21 +1527,12 @@ pub(crate) async fn openai_list_models(
     Json(serde_json::json!({ "object": "list", "data": data })).into_response()
 }
 
-/// Pure family->catalog-id matcher extracted from
-/// `multimodal_entry_is_loaded` so the (family, id) -> bool table
-/// can be unit-tested without standing up an engine state.
-///
-/// image_engine.loaded_family() returns "flux" or "zimage"  -
-/// coarser than the per-id catalog (flux-schnell, z-image-turbo)
-/// since the engine only tracks family-level state. We currently
-/// only ship one checkpoint per family server-side, so the
-/// family->id mapping is 1:1; this matcher pins that contract.
-pub(crate) fn image_family_matches_catalog_id(family: Option<&str>, catalog_id: &str) -> bool {
-    match family {
-        Some("flux") => catalog_id == "flux-schnell",
-        Some("zimage") => catalog_id == "z-image-turbo",
-        _ => false,
-    }
+/// The repository an entry of the OpenAI model list stands for, by the entry's id.
+pub(crate) fn offered_repository(id: &str) -> Option<&'static str> {
+    MULTIMODAL_EXTRAS
+        .iter()
+        .find(|(entry, ..)| entry.eq_ignore_ascii_case(id))
+        .map(|(.., repo)| *repo)
 }
 
 /// Is a specific MULTIMODAL_EXTRAS catalog entry currently warm?
@@ -1559,10 +1550,13 @@ async fn multimodal_entry_is_loaded(
         "asr" => state.audio_engine.loaded_name().await.as_deref() == Some(hf_repo),
         #[cfg(feature = "audio")]
         "tts" => state.tts_engine.loaded_name().await.as_deref() == Some(hf_repo),
+        // Warm when the resident image model and the entry name the same checkpoint.
         #[cfg(feature = "image")]
         "image" => {
-            let fam = state.image_engine.loaded_family().await;
-            image_family_matches_catalog_id(fam, id)
+            let hf = &state.huggingface_models_dir;
+            let resident = state.image_engine.model_name().await;
+            let entry = media_checkpoint(hf, id);
+            entry.is_some() && resident.is_some_and(|r| media_checkpoint(hf, &r) == entry)
         }
         _ => false,
     }
@@ -1606,12 +1600,13 @@ const MULTIMODAL_EXTRAS: &[(&str, &str, &str, &str, &str)] = &[
         "/v1/audio/speech",
         "parler-tts/parler-tts-large-v1",
     ),
+    // The repository holding the denoiser the entry renders with.
     (
         "flux-schnell",
         "image",
         "black-forest-labs",
         "/v1/images/generations",
-        "black-forest-labs/FLUX.1-schnell",
+        "lmz/candle-flux",
     ),
     // Z-Image: the loader in `inference/engine/image_engine/` actually downloads
     // \`Tongyi-MAI/Z-Image-Turbo\` from HF, not the placeholder
