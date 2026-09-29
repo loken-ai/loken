@@ -763,16 +763,20 @@ impl HeteroPlan {
 fn cuda_throughput(devices: &[(DeviceKind, u64, u64)], cuda: &[usize]) -> Option<Vec<u64>> {
     #[cfg(feature = "cuda")]
     {
-        let probed = crate::inference::place::device_probe::probe_cuda_gpus();
+        // Cores times maximum clock: fixed per card, so probed once per process.
+        static SCORES: std::sync::OnceLock<Vec<(usize, u64)>> = std::sync::OnceLock::new();
+        let scores = SCORES.get_or_init(|| {
+            crate::inference::place::device_probe::probe_cuda_gpus()
+                .iter()
+                .map(|g| (g.index, g.perf_score))
+                .collect()
+        });
         let mut w = vec![0u64; devices.len()];
         for &i in cuda {
             let DeviceKind::Cuda(idx) = devices[i].0 else {
                 return None;
             };
-            w[i] = probed
-                .iter()
-                .find(|g| g.index == idx)
-                .map(|g| g.perf_score)?;
+            w[i] = scores.iter().find(|g| g.0 == idx).map(|g| g.1)?;
             if w[i] == 0 {
                 return None;
             }
