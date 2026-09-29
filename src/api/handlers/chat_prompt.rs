@@ -23,6 +23,127 @@ pub(crate) struct PromptSpec<'a> {
     pub output_grammar: Option<String>,
 }
 
+/// What a model's files say about how it is prompted: the chat template it declares and
+/// the format markers its vocabulary holds (`vocabulary_markers`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ChatFormat {
+    pub template: Option<String>,
+    pub vocabulary: String,
+}
+
+impl ChatFormat {
+    /// The template the model is prompted with: the declared one, else the fingerprint
+    /// its vocabulary's markers choose.
+    pub(crate) fn effective_template(&self) -> Option<String> {
+        self.template
+            .clone()
+            .or_else(|| template_from_vocabulary(&self.vocabulary))
+    }
+}
+
+/// The chat format a model file or checkpoint directory declares.
+///
+/// A GGUF file: its header's `tokenizer.chat_template`, and the vocabulary in
+/// `tokenizer.ggml.tokens` plus the added tokens of an embedded tokenizer. A directory: the
+/// `chat_template` of `tokenizer_config.json` or a `chat_template.jinja`, and the added
+/// tokens of both tokenizer files; a directory holding neither is read from the first GGUF
+/// file in it.
+pub(crate) fn path_chat_format(path: &std::path::Path) -> ChatFormat {
+    if path.is_dir() {
+        dir_chat_format(path)
+    } else {
+        gguf_chat_format(path)
+    }
+}
+
+fn gguf_chat_format(path: &std::path::Path) -> ChatFormat {
+    use crate::inference::engine::llm_engine::EMBEDDED_TOKENIZER_KEY;
+    let Ok(content) = crate::tensor::quantized::gguf_file::open_header(path) else {
+        return ChatFormat::default();
+    };
+    let md = &content.metadata;
+    let text = |key: &str| md.get(key).and_then(|v| v.to_string().ok());
+    let embedded: Option<serde_json::Value> =
+        text(EMBEDDED_TOKENIZER_KEY).and_then(|j| serde_json::from_str(j).ok());
+    let tokens = md
+        .get("tokenizer.ggml.tokens")
+        .and_then(|v| v.to_vec().ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.to_string().ok().map(String::as_str))
+        .chain(embedded.iter().flat_map(added_tokens));
+    ChatFormat {
+        template: text("tokenizer.chat_template").cloned(),
+        vocabulary: vocabulary_markers(tokens),
+    }
+}
+
+fn dir_chat_format(dir: &std::path::Path) -> ChatFormat {
+    let read_json = |name: &str| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(dir.join(name)).ok()?).ok()
+    };
+    let config = read_json("tokenizer_config.json");
+    let tokenizer = read_json("tokenizer.json");
+    let template = config
+        .as_ref()
+        .and_then(|c| declared_template(c.get("chat_template")?))
+        .or_else(|| std::fs::read_to_string(dir.join("chat_template.jinja")).ok());
+    if template.is_none() && config.is_none() && tokenizer.is_none() {
+        let mut ggufs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
+            })
+            .collect();
+        ggufs.sort();
+        if let Some(first) = ggufs.first() {
+            return gguf_chat_format(first);
+        }
+    }
+    let tokens = config.iter().chain(tokenizer.iter()).flat_map(added_tokens);
+    ChatFormat {
+        template,
+        vocabulary: vocabulary_markers(tokens),
+    }
+}
+
+/// A `chat_template` entry: a template, or a list of named ones of which `default` (else
+/// the first) writes the conversation.
+fn declared_template(v: &serde_json::Value) -> Option<String> {
+    if let Some(t) = v.as_str() {
+        return Some(t.to_string());
+    }
+    let named = v.as_array()?;
+    let template = |e: &serde_json::Value| e.get("template")?.as_str().map(str::to_string);
+    named
+        .iter()
+        .find(|e| e.get("name").and_then(|n| n.as_str()) == Some("default"))
+        .or_else(|| named.first())
+        .and_then(template)
+}
+
+/// The text of a tokenizer file's added tokens: `added_tokens` in `tokenizer.json`,
+/// `added_tokens_decoder` in `tokenizer_config.json`.
+fn added_tokens(json: &serde_json::Value) -> impl Iterator<Item = &str> {
+    let listed = json
+        .get("added_tokens")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten();
+    let decoded = json
+        .get("added_tokens_decoder")
+        .and_then(|v| v.as_object())
+        .into_iter()
+        .flat_map(|m| m.values());
+    listed
+        .chain(decoded)
+        .filter_map(|t| t.get("content").and_then(|c| c.as_str()))
+}
+
 /// The rendered prompt and what the response side needs to read the answer back.
 pub(crate) struct PreparedPrompt {
     pub prompt: String,
@@ -81,16 +202,18 @@ pub(crate) fn last_user_images(messages: &[Message]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Render a request against a template. Pure: the same inputs give the same prompt on
-/// every node, which is what lets a peer be asked about the prompt this node would run.
+/// Render a request against a template, the tool-call format read from the template and
+/// then from `vocabulary`, the format markers the model's vocabulary holds. Pure: the same
+/// inputs give the same prompt on every node, which is what lets a peer be asked about the
+/// prompt this node would run.
 pub(crate) fn build_prompt(
     spec: &PromptSpec<'_>,
     template: Option<&str>,
-    model_name: &str,
+    vocabulary: &str,
     vision_sentinel: bool,
 ) -> PreparedPrompt {
     let tools_active = crate::api::tool_calls::should_inject_tools(spec.tools, spec.tool_choice);
-    let tool_format = crate::api::tool_calls::detect_tool_format(template, model_name);
+    let tool_format = crate::api::tool_calls::detect_tool_format(template, vocabulary);
     let owned;
     let messages: &[Message] = if vision_sentinel && carries_images(spec.messages) {
         owned = with_vision_sentinel(spec.messages);
@@ -140,28 +263,31 @@ pub(crate) fn build_prompt(
 }
 
 impl APIServer {
-    /// The chat template a model is prompted with: the one cached on its loaded engine,
-    /// else the one its manifest packages (cached on the engine for next time), else one
-    /// inferred from its name.
-    pub(crate) async fn chat_template_for(&self, model_name: &str) -> Option<String> {
+    /// A model's chat format: the one cached on its loaded engine, else the one read from
+    /// its files (cached on the engine for next time).
+    pub(crate) async fn chat_format_for(&self, model_name: &str) -> ChatFormat {
         let cached = {
             let engines = self.engines.read().await;
             engines
                 .iter()
                 .find(|e| e.model_id == model_name)
-                .and_then(|e| e.chat_template.clone())
+                .and_then(|e| e.chat_format.clone())
         };
-        if cached.is_some() {
-            return cached;
+        if let Some(format) = cached {
+            return format;
         }
-        let read = self.read_chat_template(model_name);
-        if let Some(tmpl) = read.clone() {
-            let mut engines = self.engines.write().await;
-            if let Some(entry) = engines.iter_mut().find(|e| e.model_id == model_name) {
-                entry.chat_template = Some(tmpl);
-            }
+        let read = self.read_chat_format(model_name);
+        let mut engines = self.engines.write().await;
+        if let Some(entry) = engines.iter_mut().find(|e| e.model_id == model_name) {
+            entry.chat_format = Some(read.clone());
         }
-        read.or_else(|| infer_template_from_model_name(model_name))
+        read
+    }
+
+    /// The chat template a model is prompted with: its declared one, else the fingerprint
+    /// its vocabulary's markers choose.
+    pub(crate) async fn chat_template_for(&self, model_name: &str) -> Option<String> {
+        self.chat_format_for(model_name).await.effective_template()
     }
 
     /// The prompt a request prefills on `engine`. With no engine (the model is not
@@ -173,12 +299,13 @@ impl APIServer {
         engine: Option<&LlmEngine>,
         spec: &PromptSpec<'_>,
     ) -> PreparedPrompt {
-        let template = self.chat_template_for(model_name).await;
+        let format = self.chat_format_for(model_name).await;
+        let template = format.effective_template();
         let vision = match engine {
             Some(e) if carries_images(spec.messages) => e.is_qwen35_vision().await,
             _ => false,
         };
-        build_prompt(spec, template.as_deref(), model_name, vision)
+        build_prompt(spec, template.as_deref(), &format.vocabulary, vision)
     }
 }
 
@@ -228,7 +355,7 @@ mod tests {
             let p = build_prompt(
                 &spec(&msgs, Some(&tools), Some(&choice)),
                 Some(CHATML),
-                "qwen3",
+                "",
                 false,
             );
             let g = p.grammar.expect("a required call must set a grammar");
@@ -241,7 +368,7 @@ mod tests {
             let p = build_prompt(
                 &spec(&msgs, Some(&tools), Some(&choice)),
                 Some(CHATML),
-                "qwen3",
+                "",
                 false,
             );
             let g = p.grammar.expect("a named call must set a grammar");
@@ -251,7 +378,7 @@ mod tests {
         let p = build_prompt(
             &spec(&msgs, Some(&tools), Some(&auto)),
             Some(CHATML),
-            "qwen3",
+            "",
             false,
         );
         assert!(p.grammar.is_none());
@@ -270,7 +397,7 @@ mod tests {
             let p = build_prompt(
                 &spec(&msgs, Some(&tools), Some(&choice)),
                 Some(CHATML),
-                "qwen3",
+                "",
                 false,
             );
             assert!(!p.tools_active);
@@ -279,7 +406,7 @@ mod tests {
         let required = serde_json::json!("required");
         let mut s = spec(&msgs, Some(&tools), Some(&required));
         s.output_grammar = Some("json_object".to_string());
-        let p = build_prompt(&s, Some(CHATML), "qwen3", false);
+        let p = build_prompt(&s, Some(CHATML), "", false);
         assert_eq!(p.grammar.as_deref(), Some("json_object"));
     }
 
@@ -290,10 +417,10 @@ mod tests {
             user("first", Some(vec!["a".to_string()])),
             user("second", Some(vec!["b".to_string()])),
         ];
-        let p = build_prompt(&spec(&msgs, None, None), Some(CHATML), "qwen3-vl", true);
+        let p = build_prompt(&spec(&msgs, None, None), Some(CHATML), "", true);
         assert_eq!(p.prompt.matches(QWEN35_IMAGE_SENTINEL).count(), 1);
         assert!(p.prompt.contains(&format!("{QWEN35_IMAGE_SENTINEL}second")));
-        let p = build_prompt(&spec(&msgs, None, None), Some(CHATML), "qwen3-vl", false);
+        let p = build_prompt(&spec(&msgs, None, None), Some(CHATML), "", false);
         assert!(!p.prompt.contains(QWEN35_IMAGE_SENTINEL));
     }
 
@@ -303,7 +430,7 @@ mod tests {
         let msgs = [user("hi", None)];
         let mut s = spec(&msgs, None, None);
         s.thinking = Some("disabled");
-        let p = build_prompt(&s, Some(CHATML), "qwen3", false);
+        let p = build_prompt(&s, Some(CHATML), "", false);
         assert!(
             p.prompt.ends_with("<think>\n\n</think>\n\n"),
             "{}",

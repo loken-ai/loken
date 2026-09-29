@@ -32,65 +32,81 @@ pub(crate) fn prompt_already_templated(prompt: &str, template: &str) -> bool {
         .is_some_and(|(_, markers)| markers.iter().any(|m| prompt.contains(m)))
 }
 
-/// Synthesize a chat template fingerprint when the Ollama manifest omits
-/// the template layer. We return a minimal string containing the
-/// distinctive marker that `format_chat_prompt` looks for, so it routes
-/// to the right `format_*` family. Examples in the wild:
-/// - gemma3/gemma4 sometimes ship without a template layer.
-/// - phi3/phi4 - `<|user|>` / `<|end|>` - usually has template.
-/// - qwen / chatml - `<|im_start|>` - usually has template.
-///
-/// Add new fallbacks here as discovered.
-pub(crate) fn infer_template_from_model_name(model_id: &str) -> Option<String> {
-    let lower = model_id.to_lowercase();
-    let pick = |fingerprint: &'static str| Some(fingerprint.to_string());
-    if lower.contains("gemma") {
-        // gemma4 (entire family - confirmed gemma4:latest AND gemma4:26b)
-        // ships the Harmony-style vocab (asymmetric `<|turn>` / `<turn|>`
-        // tags at IDs 105/106) instead of the legacy `<start_of_turn>` /
-        // `<end_of_turn>`. The legacy template strings BPE-split into 7
-        // pieces ("<", "start", "_", "of", "_", "turn", ">") - the model
-        // never sees a real special token and emits XML-style closing
-        // tags in response (`</start_of_turn>` etc).
-        // gemma3 and earlier still use the legacy vocab.
-        if lower.contains("gemma4") {
-            return pick("<|turn>");
-        }
-        // Gemma3/2/legacy: `<start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n`
-        return pick("<start_of_turn>");
+/// The special tokens that say which chat and tool-call format a vocabulary was built
+/// for. `vocabulary_markers` keeps the ones a model's vocabulary holds.
+pub(crate) const FORMAT_MARKERS: &[&str] = &[
+    "<|start|>",
+    "<|message|>",
+    "<|channel|>",
+    "<|turn>",
+    "<start_of_turn>",
+    "<\u{ff5c}User\u{ff5c}>",
+    "<\u{ff5c}Assistant\u{ff5c}>",
+    "<\u{ff5c}tool\u{2581}calls\u{2581}begin\u{ff5c}>",
+    "<\u{ff5c}tool\u{2581}call\u{2581}begin\u{ff5c}>",
+    "\u{ff5c}DSML\u{ff5c}",
+    "[gMASK]",
+    "<|start_of_role|>",
+    "<|im_start|>",
+    "<tool_call>",
+    "<|start_header_id|>",
+    "<|python_tag|>",
+    "<|system|>",
+    "<|user|>",
+    "<|assistant|>",
+    "<|end|>",
+    "[INST]",
+    "[SYSTEM_PROMPT]",
+    "[AVAILABLE_TOOLS]",
+    "[TOOL_CALLS]",
+    "[CALL_ID]",
+    "[ARGS]",
+    "[TOOL_CONTENT]",
+];
+
+/// The `FORMAT_MARKERS` a vocabulary holds, concatenated in `FORMAT_MARKERS` order. Empty
+/// when it holds none.
+pub(crate) fn vocabulary_markers<'a>(tokens: impl IntoIterator<Item = &'a str>) -> String {
+    let held: std::collections::HashSet<&str> = tokens
+        .into_iter()
+        .filter(|t| FORMAT_MARKERS.contains(t))
+        .collect();
+    FORMAT_MARKERS
+        .iter()
+        .filter(|m| held.contains(*m))
+        .copied()
+        .collect()
+}
+
+/// A template fingerprint for a model that declares no chat template, chosen from the
+/// format markers its vocabulary holds (`vocabulary_markers`). The fingerprint carries the
+/// markers `format_chat_prompt` routes on; the first format whose markers the vocabulary
+/// holds wins. `None` when the vocabulary holds no chat format's markers.
+pub(crate) fn template_from_vocabulary(markers: &str) -> Option<String> {
+    let holds = |needed: &[&str]| needed.iter().all(|m| markers.contains(m));
+    const FORMATS: &[&[&str]] = &[
+        &["<|start|>", "<|message|>", "<|channel|>"],
+        &["<|turn>"],
+        &["<start_of_turn>"],
+        &["<\u{ff5c}User\u{ff5c}>", "<\u{ff5c}Assistant\u{ff5c}>"],
+        &["[gMASK]"],
+        &["<|start_of_role|>"],
+        &["<|im_start|>"],
+        &["<|start_header_id|>"],
+        &["<|system|>", "<|user|>", "<|assistant|>", "<|end|>"],
+    ];
+    if let Some(format) = FORMATS.iter().find(|f| holds(f)) {
+        return Some(format.concat());
     }
-    if lower.contains("qwen") || lower.contains("chatml") {
-        return pick("<|im_start|>");
-    }
-    // lfm2 / lfm2moe (LiquidAI) ship no template layer (Ollama uses a built-in
-    // Go renderer). They use ChatML (`<|im_start|>`/`<|im_end|>`, BOS
-    // `<|startoftext|>` added by the tokenizer). Without this they fall to the
-    // [INST] default and the model echoes/loops.
-    if lower.contains("lfm2") {
-        return pick("<|im_start|>");
-    }
-    if lower.contains("moondream") {
-        // Moondream Q/A template: ` Question: <prompt>\n\n Answer: <response>`.
-        // Detection token "Question:" matches the format_moondream_qa dispatch
-        // in format_chat_prompt. Without this fallback, a moondream variant
-        // whose Modelfile template isn't reachable would get the [INST]
-        // default -> base-phi2 LM emits gibberish on instruction-shaped
-        // prompts.
-        return pick("Question: Answer:");
-    }
-    // Llama 3 and the families that adopted its header block. Only a fallback: a model
-    // whose manifest declares its template is formatted from that declaration.
-    if lower.contains("llama3") || lower.contains("llama-3") {
-        return pick("<|start_header_id|>");
-    }
-    if lower.contains("phi3") || lower.contains("phi4") || lower.contains("phi") {
-        return pick("<|end|><|user|><|assistant|><|system|>");
-    }
-    if lower.contains("deepseek") {
-        return pick("<｜User｜><｜Assistant｜>");
-    }
-    if lower.contains("glm") {
-        return pick("[gMASK]");
+    // The instruction format: every bracket marker the vocabulary holds, which is what
+    // `format_mistral_tools` reads the system, call and result spelling from.
+    if markers.contains("[INST]") {
+        let brackets: String = FORMAT_MARKERS
+            .iter()
+            .filter(|m| m.starts_with('[') && m.ends_with(']') && markers.contains(*m))
+            .copied()
+            .collect();
+        return Some(brackets);
     }
     None
 }
@@ -1447,7 +1463,12 @@ mod tests {
         let mut result = msg("tool", "fn main() {}");
         result.tool_call_id = Some("c1".into());
         let out = format_harmony(
-            &[msg("system", "Be brief."), msg("user", "Show a.rs"), call, result],
+            &[
+                msg("system", "Be brief."),
+                msg("user", "Show a.rs"),
+                call,
+                result,
+            ],
             Some(&[tool]),
         );
         assert!(out.contains("'functions'."));
@@ -1783,9 +1804,10 @@ mod tests {
             out.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"),
             "got: {out}"
         );
-        // The name-inferred fallback must reach the same formatter.
+        // The vocabulary fallback must reach the same formatter.
         assert_eq!(
-            infer_template_from_model_name("llama3.2:1b").as_deref(),
+            template_from_vocabulary(&vocabulary_markers(["<|start_header_id|>", "<|eot_id|>"]))
+                .as_deref(),
             Some("<|start_header_id|>")
         );
     }
@@ -1818,29 +1840,41 @@ mod tests {
         );
     }
 
+    /// A model with no declared template is formatted from the markers its vocabulary
+    /// holds, whatever the model is called.
     #[test]
-    fn infer_template_from_model_name_maps_known_families() {
-        let pick = |name: &str| infer_template_from_model_name(name).unwrap_or_default();
-        // All gemma4 (latest, 26b, instruct...) -> Harmony template
-        // (per b605672: GGUF vocab confirmed asymmetric `<|turn>` IDs 105/106
-        // across the entire gemma4 family, NOT the legacy gemma3 tokens).
-        assert_eq!(pick("gemma4:26b"), "<|turn>");
-        assert_eq!(pick("Gemma4-26b-instruct"), "<|turn>");
-        assert_eq!(pick("gemma4:latest"), "<|turn>");
-        // gemma3 and earlier - legacy template.
-        assert_eq!(pick("gemma3:latest"), "<start_of_turn>");
-        assert_eq!(pick("gemma:2b"), "<start_of_turn>");
-        // ChatML family
-        assert_eq!(pick("qwen3-coder:30b"), "<|im_start|>");
-        assert_eq!(pick("chatml-finetune"), "<|im_start|>");
-        // Phi family - fingerprint includes all role markers so
-        // format_chat_prompt can locate them.
-        assert!(pick("phi3:14b").contains("<|user|>"));
-        assert!(pick("phi4-mini").contains("<|user|>"));
-        // DeepSeek - full-width brackets.
-        assert!(pick("deepseek-r1:32b").contains("<｜User｜>"));
-        // Unknown model -> None.
-        assert!(infer_template_from_model_name("mystery-model").is_none());
+    fn a_vocabulary_picks_the_format_its_markers_belong_to() {
+        let pick = |tokens: &[&str]| {
+            template_from_vocabulary(&vocabulary_markers(tokens.iter().copied()))
+                .unwrap_or_default()
+        };
+        let user = |t: &str| format_chat_prompt(&[msg("user", "hi")], Some(t));
+        let turn = pick(&["<bos>", "<|turn>", "<turn|>"]);
+        assert!(user(&turn).starts_with("<|turn>user\nhi<turn|>"), "{turn}");
+        let legacy = pick(&["<bos>", "<start_of_turn>", "<end_of_turn>"]);
+        assert!(user(&legacy).contains("<start_of_turn>user\nhi<end_of_turn>"));
+        let chatml = pick(&["<|startoftext|>", "<|im_start|>", "<|im_end|>"]);
+        assert!(user(&chatml).contains("<|im_start|>user\nhi<|im_end|>"));
+        let phi = pick(&["<|system|>", "<|user|>", "<|assistant|>", "<|end|>"]);
+        assert!(user(&phi).contains("<|user|>\nhi<|end|>"));
+        let deepseek = pick(&["<\u{ff5c}User\u{ff5c}>", "<\u{ff5c}Assistant\u{ff5c}>"]);
+        assert!(user(&deepseek).contains("<\u{ff5c}User\u{ff5c}>hi"));
+        let harmony = pick(&["<|start|>", "<|message|>", "<|channel|>", "<|end|>"]);
+        assert!(user(&harmony).contains("<|start|>user<|message|>hi<|end|>"));
+        // A vocabulary holding both the ChatML and the header markers is ChatML.
+        let both = pick(&["<|im_start|>", "<|start_header_id|>", "<tool_call>"]);
+        assert!(user(&both).contains("<|im_start|>user"));
+        // The instruction format keeps every bracket marker the tool writer reads.
+        let inst = pick(&[
+            "[INST]",
+            "[/INST]",
+            "[SYSTEM_PROMPT]",
+            "[TOOL_CALLS]",
+            "[ARGS]",
+        ]);
+        assert_eq!(inst, "[INST][SYSTEM_PROMPT][TOOL_CALLS][ARGS]");
+        assert!(template_is_mistral_tools(Some(&inst)));
+        assert!(template_from_vocabulary(&vocabulary_markers(["<s>", "</s>", "hello"])).is_none());
     }
 }
 

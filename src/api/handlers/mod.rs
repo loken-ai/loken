@@ -1945,7 +1945,24 @@ impl APIServer {
         (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
-    fn read_chat_template(&self, model_id: &str) -> Option<String> {
+    /// What a model's files say about how it is prompted: its Ollama manifest and weights,
+    /// else its HuggingFace file or checkpoint directory. Empty when none is found.
+    fn read_chat_format(&self, model_id: &str) -> chat_prompt::ChatFormat {
+        self.read_ollama_chat_format(model_id)
+            .or_else(|| {
+                let hf = crate::inference::load::huggingface_manager::HuggingFaceManager::new(
+                    PathBuf::from(&self.huggingface_models_dir),
+                );
+                hf.get_model_path(model_id)
+                    .map(|p| chat_prompt::path_chat_format(&p))
+            })
+            .unwrap_or_default()
+    }
+
+    /// An Ollama model's chat format: the weights' Jinja template, else the packaged
+    /// template layer, else the weights' own template string; the vocabulary markers are
+    /// the weights'. `None` when the model has no manifest.
+    fn read_ollama_chat_format(&self, model_id: &str) -> Option<chat_prompt::ChatFormat> {
         let (model_name, tag) = if model_id.contains(':') {
             let parts: Vec<&str> = model_id.split(':').collect();
             (
@@ -1984,34 +2001,23 @@ impl APIServer {
                     .map(|d| d.replace(':', "-"));
             }
         }
-        // No template layer. The weights file carries the authoritative one under
-        // `tokenizer.chat_template`; read it rather than letting the caller guess
-        // from the model name. The reference resolves this with a built-in
-        // per-architecture renderer, so a name-derived guess diverges from it: on
-        // the qwen3-next family it wrapped a plain completion prompt as a chat
-        // turn, and the model replied that the user's message looked truncated
-        // instead of continuing the text.
-        // Prefer the weights file's own Jinja template over the distributor's
-        // wrapper. Both describe the same format, but the packaged one is a Go
-        // template we can only approximate by pattern-matching, while the Jinja
-        // one we evaluate exactly - and an approximated chat format makes a model
-        // close its turn after a dozen tokens.
-        let from_gguf = (|| {
-            let blob_path = PathBuf::from(&self.ollama_models_dir)
-                .join("blobs")
-                .join(model_blob.clone()?);
-            let content = crate::tensor::quantized::gguf_file::open_header(&blob_path).ok()?;
-            content
-                .metadata
-                .get("tokenizer.chat_template")?
-                .to_string()
-                .ok()
-                .cloned()
-        })();
-        match from_gguf {
+        // The weights' Jinja template is evaluated exactly; the packaged Go template is only
+        // approximated by pattern-matching, so the Jinja one wins when both exist.
+        let weights = model_blob
+            .map(|b| {
+                chat_prompt::path_chat_format(
+                    &PathBuf::from(&self.ollama_models_dir).join("blobs").join(b),
+                )
+            })
+            .unwrap_or_default();
+        let template = match weights.template {
             Some(j) if j.contains("{%") => Some(j),
             other => packaged.or(other),
-        }
+        };
+        Some(chat_prompt::ChatFormat {
+            template,
+            vocabulary: weights.vocabulary,
+        })
     }
 
     /// True when the model accepts image input (has a vision projector)  -

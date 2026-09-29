@@ -706,8 +706,8 @@ pub(crate) async fn templated_prompt(
             return rendered;
         }
     }
-    // A name-inferred template stands in when the manifest has none (e.g. gemma4): Ollama
-    // applies the template by default and takes raw=true as the opt-out.
+    // A vocabulary-chosen template stands in when the model declares none: Ollama applies
+    // the template by default and takes raw=true as the opt-out.
     let chat_template = state.chat_template_for(model_name).await;
     match chat_template.as_deref() {
         Some(tmpl) if !prompt_already_templated(prompt, tmpl) => {

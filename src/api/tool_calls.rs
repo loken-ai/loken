@@ -125,60 +125,44 @@ pub fn forced_call(tool_choice: Option<&Value>) -> Option<Option<String>> {
     }
 }
 
-/// Detect the tool-call family from the model's chat template (preferred,
-/// it reflects what the model was trained to emit) falling back to the
-/// model name. Mirrors the family detection in `format_chat_prompt`.
-pub fn detect_tool_format(template: Option<&str>, model_name: &str) -> ToolFormat {
-    if let Some(t) = template {
-        if t.contains("<|channel|>") {
-            return ToolFormat::Harmony;
-        }
-        if t.contains(DSML_TOKEN) {
-            return ToolFormat::DeepSeekDsml;
-        }
-        if t.contains(DS_CALLS_BEGIN) || t.contains("<｜tool▁call▁begin｜>") {
-            return ToolFormat::DeepSeek;
-        }
-        if t.contains("[TOOL_CALLS]") || t.contains("[AVAILABLE_TOOLS]") {
-            return ToolFormat::Mistral;
-        }
-        if t.contains("<tool_call>") {
-            return ToolFormat::Hermes;
-        }
-        if t.contains("<|python_tag|>")
-            || (t.contains("ipython") && t.contains("<|start_header_id|>"))
-        {
-            return ToolFormat::Llama3;
-        }
-        // ChatML template without an explicit tool marker still emits
-        // Hermes-style tool calls when instructed.
-        if t.contains("<|im_start|>") {
-            return ToolFormat::Hermes;
-        }
+/// The tool-call format a model writes: read from its chat template, then from the format
+/// markers its vocabulary holds (`vocabulary_markers`) when the template names none. Hermes
+/// when neither does, the most widely followed marker shape.
+pub fn detect_tool_format(template: Option<&str>, vocabulary: &str) -> ToolFormat {
+    template
+        .into_iter()
+        .chain(std::iter::once(vocabulary))
+        .find_map(tool_format_in)
+        .unwrap_or(ToolFormat::Hermes)
+}
+
+/// The tool-call format whose markers `t` holds, a template or a vocabulary's markers.
+fn tool_format_in(t: &str) -> Option<ToolFormat> {
+    if t.contains("<|channel|>") {
+        return Some(ToolFormat::Harmony);
     }
-    let m = model_name.to_ascii_lowercase();
-    if m.contains("gpt-oss") {
-        ToolFormat::Harmony
-    } else if m.contains("deepseek") {
-        // V4.1 speaks DSML; V3 and R1 keep the older begin/end markers.
-        if m.contains("v4.1") || m.contains("v4-1") || m.contains("v41") || m.contains("flash") {
-            ToolFormat::DeepSeekDsml
-        } else {
-            ToolFormat::DeepSeek
-        }
-    } else if m.contains("mistral")
-        || m.contains("mixtral")
-        || m.contains("devstral")
-        || m.contains("codestral")
+    if t.contains(DSML_TOKEN) {
+        return Some(ToolFormat::DeepSeekDsml);
+    }
+    if t.contains(DS_CALLS_BEGIN) || t.contains("<\u{ff5c}tool\u{2581}call\u{2581}begin\u{ff5c}>") {
+        return Some(ToolFormat::DeepSeek);
+    }
+    if t.contains("[TOOL_CALLS]") || t.contains("[AVAILABLE_TOOLS]") {
+        return Some(ToolFormat::Mistral);
+    }
+    if t.contains("<tool_call>") {
+        return Some(ToolFormat::Hermes);
+    }
+    if t.contains("<|python_tag|>") || (t.contains("ipython") && t.contains("<|start_header_id|>"))
     {
-        ToolFormat::Mistral
-    } else if m.contains("llama") {
-        ToolFormat::Llama3
-    } else {
-        // qwen, hermes, deepseek-coder, phi, gemma, glm and anything
-        // unknown: Hermes is the most widely-followed marker shape.
-        ToolFormat::Hermes
+        return Some(ToolFormat::Llama3);
     }
+    // A ChatML template without an explicit tool marker still emits Hermes-style tool
+    // calls when instructed.
+    if t.contains("<|im_start|>") {
+        return Some(ToolFormat::Hermes);
+    }
+    None
 }
 
 /// Serialize the tools array to the per-line JSON the Hermes/Qwen system
@@ -1369,6 +1353,7 @@ impl StreamToolScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::handlers::vocabulary_markers;
 
     fn tool(name: &str) -> Tool {
         Tool::function(
@@ -1390,23 +1375,40 @@ mod tests {
     #[test]
     fn detect_from_template() {
         assert_eq!(
-            detect_tool_format(Some("foo [TOOL_CALLS] bar"), "x"),
+            detect_tool_format(Some("foo [TOOL_CALLS] bar"), ""),
             ToolFormat::Mistral
         );
         assert_eq!(
-            detect_tool_format(Some("<tool_call>"), "x"),
+            detect_tool_format(Some("<tool_call>"), ""),
             ToolFormat::Hermes
         );
         assert_eq!(
-            detect_tool_format(Some("<|im_start|>"), "x"),
+            detect_tool_format(Some("<|im_start|>"), ""),
             ToolFormat::Hermes
         );
+        // No template: the vocabulary's markers decide, Hermes when they name none.
+        let vocab = |t: &[&str]| vocabulary_markers(t.iter().copied());
         assert_eq!(
-            detect_tool_format(None, "devstral:latest"),
+            detect_tool_format(None, &vocab(&["[INST]", "[TOOL_CALLS]"])),
             ToolFormat::Mistral
         );
-        assert_eq!(detect_tool_format(None, "llama-3.1-8b"), ToolFormat::Llama3);
-        assert_eq!(detect_tool_format(None, "qwen3-coder"), ToolFormat::Hermes);
+        assert_eq!(
+            detect_tool_format(None, &vocab(&["<|start_header_id|>", "<|python_tag|>"])),
+            ToolFormat::Llama3
+        );
+        assert_eq!(
+            detect_tool_format(None, &vocab(&["<|im_start|>", "<tool_call>"])),
+            ToolFormat::Hermes
+        );
+        assert_eq!(detect_tool_format(None, ""), ToolFormat::Hermes);
+        // A template naming no tool marker leaves the decision to the vocabulary.
+        assert_eq!(
+            detect_tool_format(
+                Some("<\u{ff5c}User\u{ff5c}>{{ m.content }}"),
+                &vocab(&["<\u{ff5c}User\u{ff5c}>", "\u{ff5c}DSML\u{ff5c}"])
+            ),
+            ToolFormat::DeepSeekDsml
+        );
     }
 
     /// Qwen3-Coder's own template tells it to answer in XML inside the same tags every
@@ -1823,7 +1825,10 @@ mod tests {
         assert_eq!(f.name, "get_weather");
         assert!(f.arguments.as_deref().unwrap().contains("Paris"));
         assert_eq!(r.content, "");
-        assert_eq!(detect_tool_format(None, "gpt-oss:20b"), ToolFormat::Harmony);
+        assert_eq!(
+            detect_tool_format(None, &vocabulary_markers(["<|start|>", "<|channel|>"])),
+            ToolFormat::Harmony
+        );
     }
 
     #[test]
@@ -1834,16 +1839,16 @@ mod tests {
         assert_eq!(r.calls[0].function.as_ref().unwrap().name, "get_weather");
         assert_eq!(r.content, "Let me check.");
         assert_eq!(
-            detect_tool_format(None, "deepseek-r1:70b"),
+            detect_tool_format(None, &vocabulary_markers([DS_CALLS_BEGIN])),
             ToolFormat::DeepSeek
         );
     }
 
     #[test]
     fn parse_deepseek_v41_dsml_call() {
-        // V4.1 routes to DSML; V3/R1 stays on the older markers.
+        // A vocabulary holding the DSML token writes DSML, even beside the older markers.
         assert_eq!(
-            detect_tool_format(None, "deepseek-v4.1-flash:iq2-q6attn"),
+            detect_tool_format(None, &vocabulary_markers([DS_CALLS_BEGIN, DSML_TOKEN])),
             ToolFormat::DeepSeekDsml
         );
         let raw = "I'll search.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search\">\n\

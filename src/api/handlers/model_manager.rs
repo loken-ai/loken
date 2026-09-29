@@ -207,8 +207,8 @@ pub(crate) struct LoadedModelEntry {
     pub(crate) keep_alive_minutes: Option<i64>,
     /// Cancellable expiration task handle
     pub(crate) expire_handle: Option<JoinHandle<()>>,
-    /// Chat template loaded from Ollama manifest (Go template syntax)
-    pub(crate) chat_template: Option<String>,
+    /// The chat format read from the model's files, once read.
+    pub(crate) chat_format: Option<super::chat_prompt::ChatFormat>,
     /// UNIX-millis timestamp of last use (request landed on this engine).
     /// Used by auto-eviction to pick the LRU model when we need to free
     /// a slot.
@@ -227,7 +227,7 @@ impl LoadedModelEntry {
             engine,
             keep_alive_minutes,
             expire_handle: None,
-            chat_template: None,
+            chat_format: None,
             last_used: Arc::new(AtomicI64::new(now_millis())),
         }
     }

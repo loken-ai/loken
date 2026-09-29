@@ -1146,15 +1146,10 @@ pub(crate) async fn ollama_show_model(
             if caps.iter().any(|c| c == "completion") && state.model_has_vision(&model_name) {
                 caps.push("vision".to_string());
             }
-            // Surface the chat template the server uses to wrap user/
-            // assistant messages so SDK clients can format prompts the
-            // same way they'd appear in /api/chat. Prefer the manifest-
-            // declared template; fall back to the name-inferred minimal
-            // template (`<start_of_turn>` / `<|im_start|>` / etc.) so
-            // the response is non-null for every loaded model.
-            let template = state
-                .read_chat_template(&model_name)
-                .or_else(|| infer_template_from_model_name(&model_name));
+            // The chat template the server wraps user and assistant messages in, so SDK
+            // clients can format prompts the way /api/chat does: the declared template,
+            // else the fingerprint the vocabulary's markers choose.
+            let template = state.read_chat_format(&model_name).effective_template();
             // Tool calling and a separate reasoning channel are template properties: a model
             // supports them when its own template has somewhere to put them. Both spellings
             // occur - Go templates name the fields, Jinja ones name the variables.
