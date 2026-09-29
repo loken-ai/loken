@@ -849,6 +849,7 @@ impl LlmEngine {
 mod gguf;
 pub use gguf::*;
 mod decode;
+mod tekken;
 pub(crate) use decode::*;
 /// The shape of the model currently loaded: what the checkpoint declares about its
 /// own geometry, which the planner and the API both ask for.

@@ -153,17 +153,41 @@ pub(super) fn awq_checkpoint(dir: &str) -> AnyResult<(gguf_file::Content, Vec<St
     let mut content = awql::synth_gguf_content(&cfg, present);
     let arch = cfg.gguf_arch.clone();
     let meta = &mut content.metadata;
-    let tokenizer = std::fs::read_to_string(format!("{dir}/tokenizer.json"))
-        .map_err(|e| anyhow!("AWQ tokenizer {dir}/tokenizer.json: {e}"))?;
+    // The checkpoint's tokenizer.json, else its tekken.json read into the same form.
+    let tokenizer_json = std::path::Path::new(dir).join("tokenizer.json");
+    let tekken_json = std::path::Path::new(dir).join(super::tekken::TEKKEN_FILE);
+    let (tokenizer, tekken) = if tokenizer_json.exists() || !tekken_json.exists() {
+        let json = std::fs::read_to_string(&tokenizer_json)
+            .map_err(|e| anyhow!("AWQ tokenizer {}: {e}", tokenizer_json.display()))?;
+        (json, None)
+    } else {
+        let tekken = super::tekken::Tekken::open(&tekken_json)?;
+        let json = tekken
+            .build()?
+            .to_string(false)
+            .map_err(|e| anyhow!("AWQ tokenizer {}: {e}", tekken_json.display()))?;
+        (json, Some(tekken))
+    };
     meta.insert(
         super::gguf::EMBEDDED_TOKENIZER_KEY.to_string(),
         gguf_file::Value::String(tokenizer),
     );
-    let (eos, extra) = awq_eos_tokens(dir);
+    // With no end-of-sequence id declared anywhere, the sampler still honours the
+    // tokenizer's own stops.
+    let (eos, extra) = awq_eos_tokens(dir)
+        .or_else(|| Some((tekken.as_ref()?.eos()?, Vec::new())))
+        .unwrap_or((0, Vec::new()));
     meta.insert(
         "tokenizer.ggml.eos_token_id".into(),
         gguf_file::Value::U32(eos),
     );
+    let bos = awq_token_id(dir, "bos_token_id").or_else(|| tekken.as_ref()?.bos());
+    if let Some(bos) = bos {
+        meta.insert(
+            "tokenizer.ggml.bos_token_id".into(),
+            gguf_file::Value::U32(bos),
+        );
+    }
     if !extra.is_empty() {
         meta.insert(
             "tokenizer.ggml.eos_token_ids".into(),
@@ -335,16 +359,30 @@ pub(super) fn declared_context(dir: &std::path::Path) -> usize {
         })
 }
 
-/// Read the EOS token id(s) for an AWQ checkpoint from generation_config.json
-/// (falling back to config.json). `eos_token_id` may be a scalar or an array.
-pub(super) fn awq_eos_tokens(dir: &str) -> (u32, Vec<u32>) {
+/// An AWQ checkpoint's generation_config.json, else its config.json.
+fn awq_generation_config(dir: &str) -> Option<serde_json::Value> {
     let read = |f: &str| {
         std::fs::read_to_string(format!("{dir}/{f}"))
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
     };
+    read("generation_config.json").or_else(|| read("config.json"))
+}
+
+/// A scalar token id an AWQ checkpoint's generation config declares under `key`.
+fn awq_token_id(dir: &str, key: &str) -> Option<u32> {
+    awq_generation_config(dir)?
+        .get(key)?
+        .as_u64()
+        .map(|i| i as u32)
+}
+
+/// Read the EOS token id(s) for an AWQ checkpoint from generation_config.json
+/// (falling back to config.json). `eos_token_id` may be a scalar or an array.
+/// `None` when neither file declares one.
+pub(super) fn awq_eos_tokens(dir: &str) -> Option<(u32, Vec<u32>)> {
     let mut ids: Vec<u32> = Vec::new();
-    if let Some(v) = read("generation_config.json").or_else(|| read("config.json")) {
+    if let Some(v) = awq_generation_config(dir) {
         match v.get("eos_token_id") {
             Some(serde_json::Value::Number(n)) => {
                 if let Some(i) = n.as_u64() {
@@ -361,10 +399,8 @@ pub(super) fn awq_eos_tokens(dir: &str) -> (u32, Vec<u32>) {
             _ => {}
         }
     }
-    if ids.is_empty() {
-        ids.push(0); // safe fallback; sampler also honors tokenizer-side stops
-    }
-    (ids[0], ids[1..].to_vec())
+    let (&first, rest) = ids.split_first()?;
+    Some((first, rest.to_vec()))
 }
 
 pub(super) fn try_wrap_with_vision(

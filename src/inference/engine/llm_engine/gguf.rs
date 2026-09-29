@@ -125,6 +125,41 @@ const JOYAI_RES: [&str; 3] = [
     r"[!\x22#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 ];
 
+/// Whether the API layer parses `token` out of an answer: such a marker is registered not
+/// special, so it survives a decode that skips the special tokens.
+pub(super) fn parsed_by_the_api(token: &str) -> bool {
+    crate::api::thinking::SPLIT_MARKERS.contains(&token)
+        || crate::api::tool_calls::TOOL_MARKERS.contains(&token)
+}
+
+/// The byte-level BPE pre-tokenizer: each regex of `res` splits in turn, isolating its
+/// matches, then ByteLevel maps the bytes to the GPT-2 unicode alphabet without a regex of
+/// its own. Mirrors the layout of a byte-level HF tokenizer.json.
+pub(super) fn byte_level_split_sequence(
+    res: &[&str],
+) -> AnyResult<tokenizers::pre_tokenizers::PreTokenizerWrapper> {
+    use tokenizers::pre_tokenizers::byte_level::ByteLevel as ByteLevelPre;
+    use tokenizers::pre_tokenizers::sequence::Sequence as PreSequence;
+    use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+    use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+    use tokenizers::SplitDelimiterBehavior;
+    let mut steps = Vec::with_capacity(res.len() + 1);
+    for re in res {
+        let split = Split::new(
+            SplitPattern::Regex(re.to_string()),
+            SplitDelimiterBehavior::Isolated,
+            /*invert=*/ false,
+        )
+        .map_err(|e| anyhow!("build split pre-tokenizer: {e}"))?;
+        steps.push(PreTokenizerWrapper::Split(split));
+    }
+    let bl = ByteLevelPre::new(
+        /*add_prefix_space=*/ false, /*trim_offsets=*/ true, /*use_regex=*/ false,
+    );
+    steps.push(PreTokenizerWrapper::ByteLevel(bl));
+    Ok(PreTokenizerWrapper::Sequence(PreSequence::new(steps)))
+}
+
 pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Tokenizer> {
     use ahash::AHashMap;
     use tokenizers::models::bpe::BPE;
@@ -367,10 +402,6 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
             // and breaks llguidance's byte-trie compilation (derivre aborts).
             use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
             use tokenizers::pre_tokenizers::byte_level::ByteLevel as ByteLevelPre;
-            use tokenizers::pre_tokenizers::sequence::Sequence as PreSequence;
-            use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
-            use tokenizers::pre_tokenizers::PreTokenizerWrapper;
-            use tokenizers::SplitDelimiterBehavior;
 
             // Per-`pre` split regexes, copied verbatim from llama.cpp
             // `llama-vocab.cpp` (the "adapted" explicit-case forms).
@@ -388,27 +419,7 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
                 /*use_regex=*/ false,
             );
 
-            // Build a Split(regex, Isolated) -> ByteLevel(no built-in regex)
-            // pipeline: the regex owns segmentation, ByteLevel only does the
-            // byte->unicode (Ġ) mapping. Mirrors the model's HF tokenizer.json.
-            let split_sequence = |res: &[&str]| -> AnyResult<PreTokenizerWrapper> {
-                let mut steps = Vec::with_capacity(res.len() + 1);
-                for re in res {
-                    let split = Split::new(
-                        SplitPattern::Regex(re.to_string()),
-                        SplitDelimiterBehavior::Isolated,
-                        /*invert=*/ false,
-                    )
-                    .map_err(|e| anyhow!("build split pre-tokenizer: {e}"))?;
-                    steps.push(PreTokenizerWrapper::Split(split));
-                }
-                let bl = ByteLevelPre::new(
-                    /*add_prefix_space=*/ false, /*trim_offsets=*/ true,
-                    /*use_regex=*/ false,
-                );
-                steps.push(PreTokenizerWrapper::ByteLevel(bl));
-                Ok(PreTokenizerWrapper::Sequence(PreSequence::new(steps)))
-            };
+            let split_sequence = byte_level_split_sequence;
             let split_pipeline = |re: &str| split_sequence(&[re]);
 
             match pre_family {
@@ -523,10 +534,7 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
                         // like any other control token dropped it before `ThinkSplit` could
                         // find a delimiter, and a reasoning model then delivered its chain
                         // of thought as the answer.
-                        let parsed_by_the_api = crate::api::thinking::SPLIT_MARKERS
-                            .contains(&token_str.as_str())
-                            || crate::api::tool_calls::TOOL_MARKERS.contains(&token_str.as_str());
-                        let special = *type_id != 4 && !parsed_by_the_api;
+                        let special = *type_id != 4 && !parsed_by_the_api(&token_str);
                         special_tokens.push(tokenizers::AddedToken::from(token_str, special));
                     }
                 }
