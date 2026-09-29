@@ -116,21 +116,15 @@ impl Demand {
 impl Demand {
     /// The first rung for a component whose stem of `stem_bytes` may sit on the card its
     /// first block runs on: planned with the stem there when that costs the blocks nothing,
-    /// as many of them staying on as many cards, else planned without it. Returns the plan
-    /// and whether it holds the stem.
+    /// every block on the device it takes without the stem, else planned without it.
+    /// Returns the plan and whether it holds the stem.
     pub fn plan_stem_if_free(&self, cards: &[(usize, u64)], stem_bytes: u64) -> (HeteroPlan, bool) {
         let without = self.plan(cards);
         let with = self.plan_with_stem(cards, stem_bytes, self.runtime_reserve);
-        let on_host = |plan: &HeteroPlan| -> usize {
-            plan.segments
-                .iter()
-                .filter(|s| !matches!(s.kind, DeviceKind::Cuda(_)))
-                .map(HeteroSegment::num_layers)
-                .sum()
-        };
+        // A block the stem pushes to another card, a slower one or the host, costs every
+        // step; the stem off the card costs a row lookup per token.
         let free = first_card(&with).is_some()
-            && on_host(&with) == on_host(&without)
-            && cards_of(&with).len() == cards_of(&without).len();
+            && crate::inference::place::dry_plan::same_plan(&with, &without);
         if free {
             (with, true)
         } else {
