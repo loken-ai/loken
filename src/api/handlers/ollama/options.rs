@@ -694,13 +694,14 @@ pub(crate) async fn templated_prompt(
     prompt: &str,
     system: Option<&str>,
     template: Option<&str>,
+    thinking_off: bool,
 ) -> String {
     // A template given with the request comes first: Jinja rendered as such, the Go
     // form rendered for this one exchange, anything else falling through to the model's.
     if let Some(t) = template.filter(|t| !t.trim().is_empty()) {
         let msgs = generate_messages(system, prompt);
         if t.contains("{%") {
-            return format_chat_prompt(&msgs, Some(t));
+            return format_chat_prompt_thinking(&msgs, Some(t), thinking_off);
         }
         if let Some(rendered) = super::super::prompt_format::render_go_template(t, system, prompt) {
             return rendered;
@@ -711,7 +712,11 @@ pub(crate) async fn templated_prompt(
     let chat_template = state.chat_template_for(model_name).await;
     match chat_template.as_deref() {
         Some(tmpl) if !prompt_already_templated(prompt, tmpl) => {
-            let wrapped = format_chat_prompt(&generate_messages(system, prompt), Some(tmpl));
+            let wrapped = format_chat_prompt_thinking(
+                &generate_messages(system, prompt),
+                Some(tmpl),
+                thinking_off,
+            );
             debug!(
                 "Generate: applied chat template ({} -> {} chars)",
                 prompt.len(),
@@ -751,6 +756,7 @@ pub(crate) async fn generate_prompt(
             &request.prompt,
             request.system.as_deref(),
             request.template.as_deref(),
+            request.thinking_preference() == Some("disabled"),
         )
         .await
     };

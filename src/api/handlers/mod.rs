@@ -1234,7 +1234,7 @@ impl APIServer {
         // that path templates the prompt unless the caller asked for raw. Comparing against the
         // bare text diverges at token zero and answers zero forever.
         let templated =
-            super::handlers::ollama::templated_prompt(self, model, prompt, None, None).await;
+            super::handlers::ollama::templated_prompt(self, model, prompt, None, None, false).await;
         let engines = self.engines.read().await;
         let entry = engines.iter().find(|e| e.model_id == model)?;
         entry.engine.cached_prompt_tokens(model, &templated).await

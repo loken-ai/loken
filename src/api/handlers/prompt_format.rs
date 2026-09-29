@@ -461,6 +461,7 @@ fn render_jinja_template(
     messages: &[Message],
     add_generation_prompt: bool,
     tools: Option<&[Tool]>,
+    thinking_off: bool,
 ) -> Option<String> {
     use minijinja::{context, Environment, Value};
     // Declared before the environment so the borrow outlives every use of it.
@@ -591,12 +592,11 @@ fn render_jinja_template(
     // `if not tools is defined`, and a none that is defined walks straight past that
     // guard into `tools | length`, which is where the render dies.
     let tools_value = tools_value.unwrap_or(Value::UNDEFINED);
-    // A tool turn is not a reasoning turn. Reasoning templates close an empty thinking
-    // block when `enable_thinking` is false, and leave the model free to open one of its
-    // own when the variable is undefined - which is what happened: qwen3 opened a block,
-    // put its tool call inside it, and the call went to the thinking field where the tool
-    // parser does not look. Undefined without tools, so a plain conversation still reasons.
-    let enable_thinking = if tools.is_some() {
+    // A tool turn is not a reasoning turn, nor is one whose caller turned thinking off.
+    // Reasoning templates render their own closed thinking block when `enable_thinking`
+    // is false, and leave the model free to open one when the variable is undefined.
+    // Undefined otherwise, so a plain conversation still reasons.
+    let enable_thinking = if tools.is_some() || thinking_off {
         Value::from(false)
     } else {
         Value::UNDEFINED
@@ -747,7 +747,8 @@ pub(crate) fn format_chat_prompt_with_tools(
 ) -> String {
     if let Some(tmpl) = template {
         if template_takes_tools(Some(tmpl)) {
-            if let Some(rendered) = render_jinja_template(tmpl, messages, true, Some(tools)) {
+            if let Some(rendered) = render_jinja_template(tmpl, messages, true, Some(tools), false)
+            {
                 return rendered;
             }
         }
@@ -756,6 +757,16 @@ pub(crate) fn format_chat_prompt_with_tools(
 }
 
 pub(crate) fn format_chat_prompt(messages: &[Message], template: Option<&str>) -> String {
+    format_chat_prompt_thinking(messages, template, false)
+}
+
+/// `format_chat_prompt` with `enable_thinking` false for a Jinja template when
+/// `thinking_off`, so the template renders its own form of a turn without reasoning.
+pub(crate) fn format_chat_prompt_thinking(
+    messages: &[Message],
+    template: Option<&str>,
+    thinking_off: bool,
+) -> String {
     // Extract system prompt and last user message for legacy templates
     let system = messages
         .iter()
@@ -775,7 +786,8 @@ pub(crate) fn format_chat_prompt(messages: &[Message], template: Option<&str>) -
         // Jinja has statement blocks, the Go templates a distributor wraps its
         // models in do not.
         if tmpl.contains("{%") {
-            if let Some(rendered) = render_jinja_template(tmpl, messages, true, None) {
+            if let Some(rendered) = render_jinja_template(tmpl, messages, true, None, thinking_off)
+            {
                 return rendered;
             }
         }
@@ -1346,7 +1358,7 @@ mod tests {
         let tmpl = "{%- if not tools is defined %}{%- set tools = [] %}{%- endif %}\
                     {%- if tools is iterable and tools | length > 0 %}TOOLS\
                     {%- else %}NONE{%- endif %}{{ messages[0].content }}";
-        let out = super::render_jinja_template(tmpl, &msgs, false, None);
+        let out = super::render_jinja_template(tmpl, &msgs, false, None, false);
         assert_eq!(out.as_deref(), Some("NONEhello"));
     }
 
@@ -1524,21 +1536,28 @@ mod tests {
     #[test]
     fn tojson_renders_with_and_without_an_indent_keyword() {
         let msgs = vec![msg("user", "hi")];
-        let plain = super::render_jinja_template("{{ messages | tojson }}", &msgs, false, None)
-            .expect("tojson with no keyword failed to render");
+        let plain =
+            super::render_jinja_template("{{ messages | tojson }}", &msgs, false, None, false)
+                .expect("tojson with no keyword failed to render");
         assert!(plain.contains("\"role\""), "got: {plain}");
 
-        let indented =
-            super::render_jinja_template("{{ messages | tojson(indent=4) }}", &msgs, false, None)
-                .expect("tojson(indent=4) failed to render");
+        let indented = super::render_jinja_template(
+            "{{ messages | tojson(indent=4) }}",
+            &msgs,
+            false,
+            None,
+            false,
+        )
+        .expect("tojson(indent=4) failed to render");
         assert!(
             indented.contains("\n    "),
             "indent not applied: {indented}"
         );
 
         // granite3.1-dense calls it both ways in one template, empty parentheses included.
-        let empty = super::render_jinja_template("{{ messages | tojson() }}", &msgs, false, None)
-            .expect("tojson() with empty parentheses failed to render");
+        let empty =
+            super::render_jinja_template("{{ messages | tojson() }}", &msgs, false, None, false)
+                .expect("tojson() with empty parentheses failed to render");
         assert!(empty.contains("\"role\""), "got: {empty}");
     }
 
@@ -1554,7 +1573,7 @@ mod tests {
         // The shape smollm3 uses: the marker on its own line inside the assistant branch of
         // the message loop, whitespace control on the neighbours.
         let src = "{%- for message in messages -%}{%- if message.role == \"assistant\" -%}\n        {% generation %}\n        {%- if r -%}x{%- endif -%}\n        {% endgeneration %}\n    {%- endif -%}{%- endfor -%}";
-        let out = super::render_jinja_template(src, &[msg("assistant", "hi")], false, None);
+        let out = super::render_jinja_template(src, &[msg("assistant", "hi")], false, None, false);
         assert!(out.is_some(), "a template carrying the markers must parse");
     }
 
@@ -1606,8 +1625,9 @@ mod tests {
                     continue;
                 };
                 let renders = |tools: Option<&[Tool]>| {
-                    super::render_jinja_template(&tmpl, &msgs, true, tools).is_some()
-                        || super::render_jinja_template(&tmpl, &with_system, true, tools).is_some()
+                    super::render_jinja_template(&tmpl, &msgs, true, tools, false).is_some()
+                        || super::render_jinja_template(&tmpl, &with_system, true, tools, false)
+                            .is_some()
                 };
                 if !renders(None) {
                     failures.push(format!("{name} without tools"));
@@ -1932,6 +1952,29 @@ mod go_template_tests {
         let mut q = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n".to_string();
         apply_thinking_preference(&mut q, Some("enabled"), Some(template));
         assert!(q.ends_with("<|im_start|>assistant\n<think>\n"), "{q}");
+    }
+
+    /// A caller that turns thinking off gets the template's own form of a turn without
+    /// reasoning, left as rendered.
+    #[test]
+    fn thinking_off_renders_the_templates_own_closed_block() {
+        let template = "{%- set enable_thinking = enable_thinking if enable_thinking is defined \
+                        else True %}{%- for m in messages %}<|im_start|>{{ m.role }}\n\
+                        {{ m.content }}<|im_end|>\n{%- endfor %}{%- if enable_thinking %}\
+                        {{- '<|im_start|>assistant\n<think>\n' }}{%- else %}\
+                        {{- '<|im_start|>assistant\n<think></think>' }}{%- endif %}";
+        let msgs = [crate::api::types::Message::new(
+            "user".to_string(),
+            "hi".to_string(),
+        )];
+        let mut off = format_chat_prompt_thinking(&msgs, Some(template), true);
+        apply_thinking_preference(&mut off, Some("disabled"), Some(template));
+        assert!(
+            off.ends_with("<|im_start|>assistant\n<think></think>"),
+            "{off}"
+        );
+        let on = format_chat_prompt_thinking(&msgs, Some(template), false);
+        assert!(on.ends_with("<|im_start|>assistant\n<think>\n"), "{on}");
     }
 
     #[test]

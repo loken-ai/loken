@@ -221,6 +221,7 @@ pub(crate) fn build_prompt(
     } else {
         spec.messages
     };
+    let thinking_off = spec.thinking == Some("disabled");
     let mut prompt = match spec.tools.filter(|_| tools_active) {
         Some(tools) if template_takes_tools(template) => {
             format_chat_prompt_with_tools(messages, template, tools)
@@ -237,9 +238,9 @@ pub(crate) fn build_prompt(
                 tools,
                 directive.as_deref(),
             );
-            format_chat_prompt(&flat, template)
+            format_chat_prompt_thinking(&flat, template, thinking_off)
         }
-        None => format_chat_prompt(messages, template),
+        None => format_chat_prompt_thinking(messages, template, thinking_off),
     };
     apply_thinking_preference(&mut prompt, spec.thinking, template);
     let thinking_opened = crate::api::thinking::prompt_opens_thinking(&prompt);
