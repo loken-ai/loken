@@ -497,6 +497,20 @@ impl HuggingFaceManager {
                 model_id, revision, file.rfilename
             );
 
+            // A file already in the snapshot at its listed size is kept: a pull that was
+            // interrupted resumes at the first file it has not finished.
+            let present = snapshots_dir.join(&file.rfilename);
+            if let (Some(want), Ok(meta)) = (file.size, std::fs::metadata(&present)) {
+                if meta.len() == want {
+                    info!("   ✓ {} already present", file.rfilename);
+                    downloaded_size += want;
+                    if let Some(ref cb) = progress {
+                        cb(downloaded_size, total_size);
+                    }
+                    continue;
+                }
+            }
+
             info!("   ⬇ Downloading file {} ({})...", i + 1, file.rfilename);
 
             let mut req = client.get(&file_url);
@@ -504,7 +518,7 @@ impl HuggingFaceManager {
                 req = req.header("Authorization", format!("Bearer {}", token));
             }
 
-            let file_resp = req
+            let mut file_resp = req
                 .send()
                 .await
                 .map_err(|e| anyhow!("Failed to download file {}: {}", file.rfilename, e))?;
@@ -517,27 +531,70 @@ impl HuggingFaceManager {
                 ));
             }
 
-            // Download file bytes
-            let bytes = file_resp
-                .bytes()
-                .await
-                .map_err(|e| anyhow!("Failed to read file {}: {}", file.rfilename, e))?;
-
-            // Create file in snapshots directory
             let file_path = snapshots_dir.join(&file.rfilename);
-
-            // Create parent directories if needed
             if let Some(parent) = file_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
 
-            std::fs::write(&file_path, bytes.as_ref())
-                .map_err(|e| anyhow!("Failed to write file {}: {}", file.rfilename, e))?;
+            // Streamed to a partial file as it arrives, hashed on the way, and renamed into
+            // the snapshot only once it is complete: a file is never held whole in memory,
+            // and an interrupted or corrupted download never lands under its final name.
+            // A large file carries its sha256 in `x-linked-etag`; its size is known from the
+            // listing.
+            let expected_sha = file_resp
+                .headers()
+                .get("x-linked-etag")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.trim_matches('"').to_ascii_lowercase())
+                .filter(|v| v.len() == 64 && v.bytes().all(|c| c.is_ascii_hexdigit()));
+            let partial_path = file_path.with_file_name(format!(
+                "{}.partial",
+                file_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ));
+            let mut out = std::fs::File::create(&partial_path)
+                .map_err(|e| anyhow!("Failed to create {}: {e}", partial_path.display()))?;
+            let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+            let mut received: u64 = 0;
+            let report_step = (total_size / 1000).max(1);
+            let mut reported = downloaded_size;
+            while let Some(chunk) = file_resp
+                .chunk()
+                .await
+                .map_err(|e| anyhow!("Failed to read file {}: {}", file.rfilename, e))?
+            {
+                std::io::Write::write_all(&mut out, &chunk)
+                    .map_err(|e| anyhow!("Failed to write {}: {e}", partial_path.display()))?;
+                sha2::Digest::update(&mut hasher, &chunk);
+                received += chunk.len() as u64;
+                if downloaded_size + received - reported >= report_step {
+                    reported = downloaded_size + received;
+                    if let Some(ref cb) = progress {
+                        cb(reported, total_size);
+                    }
+                }
+            }
+            std::io::Write::flush(&mut out)
+                .map_err(|e| anyhow!("Failed to flush {}: {e}", partial_path.display()))?;
+            drop(out);
+            let digest = hex::encode(sha2::Digest::finalize(hasher));
+            let size_ok = file.size.is_none_or(|s| s == received);
+            let digest_ok = expected_sha.as_ref().is_none_or(|e| *e == digest);
+            if !size_ok || !digest_ok {
+                let _ = std::fs::remove_file(&partial_path);
+                return Err(anyhow!(
+                    "{} arrived damaged ({received} bytes, sha256 {digest}); discarded",
+                    file.rfilename
+                ));
+            }
+            std::fs::rename(&partial_path, &file_path)
+                .map_err(|e| anyhow!("Failed to store {}: {e}", file_path.display()))?;
 
-            let file_size = bytes.len() as u64;
+            let file_size = received;
             downloaded_size += file_size;
 
-            // Report progress
             if let Some(ref cb) = progress {
                 cb(downloaded_size, total_size);
             }
