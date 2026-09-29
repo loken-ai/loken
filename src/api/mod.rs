@@ -27,6 +27,8 @@ pub mod image_paths {
     };
 }
 mod anthropic;
+#[cfg(test)]
+mod api_names_invariants;
 mod client;
 pub mod launch;
 pub(crate) mod thinking;
