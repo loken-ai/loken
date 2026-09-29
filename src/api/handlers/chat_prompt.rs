@@ -424,15 +424,23 @@ mod tests {
         assert!(!p.prompt.contains(QWEN35_IMAGE_SENTINEL));
     }
 
-    /// A disabled preference closes the thinking block on every route that builds here.
+    /// A disabled preference closes the thinking block of a template that has one, and
+    /// leaves a template without one as it is.
     #[test]
     fn a_disabled_preference_closes_thinking() {
         let msgs = [user("hi", None)];
         let mut s = spec(&msgs, None, None);
         s.thinking = Some("disabled");
-        let p = build_prompt(&s, Some(CHATML), "", false);
+        let thinking = format!("{{# enable_thinking #}}{CHATML}");
+        let p = build_prompt(&s, Some(&thinking), "", false);
         assert!(
             p.prompt.ends_with("<think>\n\n</think>\n\n"),
+            "{}",
+            p.prompt
+        );
+        let p = build_prompt(&s, Some(CHATML), "", false);
+        assert!(
+            p.prompt.ends_with("<|im_start|>assistant\n"),
             "{}",
             p.prompt
         );
