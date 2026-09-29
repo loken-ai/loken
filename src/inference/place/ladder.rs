@@ -137,6 +137,110 @@ impl Demand {
         )
     }
 
+    /// The plan for a component that runs one token through its blocks in order, so the cards
+    /// take turns and a token costs the time each card needs for its own bytes, added up: the
+    /// fastest card holds as many blocks, and the output head, as it can beside its reserve, a
+    /// growing cache and some headroom, and the block sequence starts on the card that holds
+    /// the rest. `plan` comes back unchanged for anything but two cards of different speed, or
+    /// when this arrangement is not faster by its own estimate.
+    pub fn for_one_stream(&self, plan: HeteroPlan, cards: &[(usize, u64)]) -> HeteroPlan {
+        self.for_one_stream_by(plan, cards, card_bandwidth)
+    }
+
+    /// [`Self::for_one_stream`] with the cards' bandwidths given.
+    fn for_one_stream_by(
+        &self,
+        plan: HeteroPlan,
+        cards: &[(usize, u64)],
+        bandwidth: impl Fn(usize) -> Option<f64>,
+    ) -> HeteroPlan {
+        let used = cards_of(&plan);
+        if used.len() != 2 || plan.segments.iter().any(|s| s.kind == DeviceKind::Cpu) {
+            return plan;
+        }
+        let (Some(bw_a), Some(bw_b)) = (bandwidth(used[0]), bandwidth(used[1])) else {
+            return plan;
+        };
+        let (fast, slow, bw_fast, bw_slow) = if bw_a >= bw_b {
+            (used[0], used[1], bw_a, bw_b)
+        } else {
+            (used[1], used[0], bw_b, bw_a)
+        };
+        if bw_fast < bw_slow * 1.1 || self.layers == 0 {
+            return plan;
+        }
+        let free_of = |idx: usize| cards.iter().find(|c| c.0 == idx).map(|c| c.1);
+        let (Some(free_fast), Some(free_slow)) = (free_of(fast), free_of(slow)) else {
+            return plan;
+        };
+        let per_layer = self.block_bytes / self.layers as u64;
+        let cost = per_layer.saturating_add(self.kv_bytes_per_layer).max(1);
+        // Headroom past the reserve: a cache grows past its planned window, and a peak is
+        // estimated, not measured. A sixteenth of the card.
+        let headroom = |free: u64| self.runtime_reserve.saturating_add(free / 16);
+        let fits_fast = free_fast
+            .saturating_sub(headroom(free_fast))
+            .saturating_sub(self.head_bytes)
+            / cost;
+        let n_fast = (fits_fast as usize).min(self.layers);
+        let n_slow = self.layers - n_fast;
+        if n_fast == 0 || n_slow == 0 {
+            return plan;
+        }
+        if (n_slow as u64).saturating_mul(cost) > free_slow.saturating_sub(headroom(free_slow)) {
+            return plan;
+        }
+        // Seconds per token, in units of bytes over GB/s: the head is read on the card of the
+        // last block.
+        let time = |slow_blocks: usize, fast_blocks: usize, head_on: usize| {
+            let bytes = |n: usize| (n as u64).saturating_mul(per_layer) as f64;
+            let head = |card: usize| {
+                if head_on == card {
+                    self.head_bytes as f64
+                } else {
+                    0.0
+                }
+            };
+            (bytes(slow_blocks) + head(slow)) / bw_slow
+                + (bytes(fast_blocks) + head(fast)) / bw_fast
+        };
+        let now = {
+            let on = |card: usize| -> usize {
+                plan.segments
+                    .iter()
+                    .filter(|s| s.kind == DeviceKind::Cuda(card))
+                    .map(HeteroSegment::num_layers)
+                    .sum()
+            };
+            let last = plan.segments.last().and_then(|s| match s.kind {
+                DeviceKind::Cuda(idx) => Some(idx),
+                _ => None,
+            });
+            time(on(slow), on(fast), last.unwrap_or(fast))
+        };
+        if time(n_slow, n_fast, fast) >= now * 0.97 {
+            return plan;
+        }
+        HeteroPlan {
+            segments: vec![
+                HeteroSegment {
+                    kind: DeviceKind::Cuda(slow),
+                    layer_start: 0,
+                    layer_end: n_slow,
+                    free_memory_bytes: free_slow,
+                },
+                HeteroSegment {
+                    kind: DeviceKind::Cuda(fast),
+                    layer_start: n_slow,
+                    layer_end: self.layers,
+                    free_memory_bytes: free_fast,
+                },
+            ],
+            total_layers: plan.total_layers,
+            host_experts_from: None,
+        }
+    }
+
     /// The first rung for a component whose stem of `stem_bytes` may sit on the card its
     /// first block runs on: planned with the stem there when that costs the blocks nothing,
     /// every block on the device it takes without the stem, else planned without it.
@@ -208,6 +312,30 @@ impl Demand {
             }
         }
         best
+    }
+}
+
+/// A card's memory bandwidth in GB/s, read once: what a decode step of a bandwidth-bound
+/// model is paced by. `None` where the driver does not say.
+fn card_bandwidth(idx: usize) -> Option<f64> {
+    #[cfg(feature = "cuda")]
+    {
+        static BW: std::sync::OnceLock<Vec<(usize, f64)>> = std::sync::OnceLock::new();
+        BW.get_or_init(|| {
+            super::device_probe::probe_cuda_gpus()
+                .iter()
+                .map(|g| (g.index, g.mem_bw_gbs))
+                .collect()
+        })
+        .iter()
+        .find(|(i, _)| *i == idx)
+        .map(|(_, b)| *b)
+        .filter(|b| *b > 0.0)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = idx;
+        None
     }
 }
 
@@ -872,6 +1000,65 @@ mod tests {
             .iter()
             .map(|s| format!("{}", s.kind))
             .collect()
+    }
+
+    /// A token passes through the cards in turn, so the fastest card takes as many blocks and
+    /// the head as it can beside its headroom, and the sequence starts on the slower one.
+    #[test]
+    fn a_single_stream_fills_the_faster_card_and_starts_on_the_slower() {
+        const GB: u64 = 1_000_000_000;
+        let demand = Demand {
+            layers: 64,
+            block_bytes: 64 * 250_000_000,
+            head_bytes: GB,
+            kv_bytes_per_layer: 8_000_000,
+            runtime_reserve: GB / 2,
+        };
+        let cards = [(0usize, 16 * GB), (1usize, 14 * GB)];
+        let even = HeteroPlan {
+            segments: vec![
+                HeteroSegment {
+                    kind: DeviceKind::Cuda(0),
+                    layer_start: 0,
+                    layer_end: 34,
+                    free_memory_bytes: 16 * GB,
+                },
+                HeteroSegment {
+                    kind: DeviceKind::Cuda(1),
+                    layer_start: 34,
+                    layer_end: 64,
+                    free_memory_bytes: 14 * GB,
+                },
+            ],
+            total_layers: 64,
+            host_experts_from: None,
+        };
+        let bandwidth = |idx: usize| Some(if idx == 0 { 896.0 } else { 448.0 });
+        let plan = demand.for_one_stream_by(even.clone(), &cards, bandwidth);
+        assert_eq!(
+            cards_of(&plan),
+            vec![1, 0],
+            "the sequence starts on the slower card"
+        );
+        let on_fast: usize = plan
+            .segments
+            .iter()
+            .filter(|s| s.kind == DeviceKind::Cuda(0))
+            .map(HeteroSegment::num_layers)
+            .sum();
+        assert!(
+            on_fast > 34,
+            "the faster card holds more than an even share: {on_fast}"
+        );
+        let held = on_fast as u64 * (250_000_000 + 8_000_000) + GB;
+        assert!(held < 16 * GB - GB / 2, "and keeps its headroom");
+        // Two cards of one speed, or no bandwidth figure: nothing to gain, nothing changed.
+        let same = demand.for_one_stream_by(even.clone(), &cards, |_| Some(500.0));
+        assert!(crate::inference::place::dry_plan::same_plan(&same, &even));
+        let unknown = demand.for_one_stream_by(even.clone(), &cards, |_| None);
+        assert!(crate::inference::place::dry_plan::same_plan(
+            &unknown, &even
+        ));
     }
 
     #[test]

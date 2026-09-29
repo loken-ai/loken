@@ -882,6 +882,16 @@ impl LlmEngine {
                                 Some(p) => (p, false),
                                 None => (first_plan, stem_fits),
                             };
+                            // A token passes through the cards in turn: the fastest one holds
+                            // the most it can. The embedding table then stays off the card
+                            // the sequence starts on.
+                            let ordered = demand.for_one_stream(first_plan.clone(), &cuda_devices);
+                            let (first_plan, stem_fits) =
+                                if crate::inference::place::dry_plan::same_plan(&ordered, &first_plan) {
+                                    (first_plan, stem_fits)
+                                } else {
+                                    (ordered, false)
+                                };
                             // A handle per card a plan uses, made on first use, with per-slice
                             // event tracking off before any tensor loads: a device owns one
                             // working stream, so the events would order a stream against itself,
