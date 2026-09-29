@@ -392,15 +392,28 @@ impl HeteroPlan {
                 .collect();
             if cuda.len() >= 2 {
                 let total: usize = cuda.iter().map(|i| counts[*i]).sum();
-                let budget_sum: u128 = cuda.iter().map(|i| devices[*i].1 as u128).sum();
-                if budget_sum > 0 && total > 0 {
+                // A component with a cache decodes a token at a time and reads every block
+                // each step, so a step takes each card's bytes over its speed: the blocks go
+                // in proportion to the cards' throughput. One without a cache evens the fill
+                // instead, sharing the headroom its transient buffers need.
+                let speed = match kv_bytes_per_layer > 0 {
+                    true => cuda_throughput(&devices, &cuda),
+                    false => None,
+                };
+                let weight = |i: usize| -> u128 {
+                    match &speed {
+                        Some(w) => w[i] as u128,
+                        None => devices[i].1 as u128,
+                    }
+                };
+                let weight_sum: u128 = cuda.iter().map(|i| weight(*i)).sum();
+                if weight_sum > 0 && total > 0 {
                     let mut assigned = 0usize;
                     for (n, i) in cuda.iter().enumerate() {
                         let share = if n + 1 == cuda.len() {
                             total - assigned
                         } else {
-                            let want =
-                                (total as u128 * devices[*i].1 as u128 / budget_sum) as usize;
+                            let want = (total as u128 * weight(*i) / weight_sum) as usize;
                             // Never leave a card empty and never overrun what is left.
                             want.clamp(1, total - assigned - (cuda.len() - n - 1))
                         };
@@ -742,6 +755,34 @@ impl HeteroPlan {
             segments,
             total_layers,
         }
+    }
+}
+
+/// Each listed CUDA device's measured throughput, indexed like `devices`; `None` when a card
+/// has no figure, and the fill then evens by budget.
+fn cuda_throughput(devices: &[(DeviceKind, u64, u64)], cuda: &[usize]) -> Option<Vec<u64>> {
+    #[cfg(feature = "cuda")]
+    {
+        let probed = crate::inference::place::device_probe::probe_cuda_gpus();
+        let mut w = vec![0u64; devices.len()];
+        for &i in cuda {
+            let DeviceKind::Cuda(idx) = devices[i].0 else {
+                return None;
+            };
+            w[i] = probed
+                .iter()
+                .find(|g| g.index == idx)
+                .map(|g| g.perf_score)?;
+            if w[i] == 0 {
+                return None;
+            }
+        }
+        Some(w)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (devices, cuda);
+        None
     }
 }
 
