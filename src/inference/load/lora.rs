@@ -187,6 +187,8 @@ fn is_consistency(header: Option<&str>) -> bool {
         return false;
     };
     let declared = meta.to_string().to_lowercase();
+    // ARCH-NAME-EXEMPT: the adapter's own `__metadata__`, which names the training it
+    // carries.
     declared.contains("lcm") || declared.contains("consistency")
 }
 
