@@ -786,7 +786,9 @@ fn build_generic_layer(
         device: &Device,
     ) -> Result<crate::tensor::quantized::QTensor> {
         use crate::tensor::quantized::GgmlDType;
-        // MXFP4 stacks are read in their own format by the expert kernels.
+        // MXFP4 stacks are read in their own format by the expert kernels, and so is every
+        // format those kernels serve on a card: a requantised copy is larger than the plan
+        // counted and is built through a host F32 copy of the whole stack.
         let supported = matches!(
             qt.dtype(),
             GgmlDType::Q2K
@@ -796,7 +798,8 @@ fn build_generic_layer(
                 | GgmlDType::Q6K
                 | GgmlDType::Q8_0
                 | GgmlDType::MxFp4
-        );
+        ) || (device.runs_as_card()
+            && crate::inference::moe_cuda::gemm::expert_kernels_serve(qt.dtype()));
         if supported {
             return Ok(qt);
         }
