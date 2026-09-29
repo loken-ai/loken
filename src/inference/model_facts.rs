@@ -62,6 +62,8 @@ pub struct ArchFacts {
     pub softmax_topk_renormalised: bool,
     /// The feed-forward gate is GELU rather than SiLU.
     pub gelu_ffn: bool,
+    /// The attention values are RMS-normalised, without a weight, before they are cached.
+    pub value_rms_norm: bool,
     /// Embeddings are multiplied by the square root of the model width when the file gives
     /// no `embedding_scale`.
     pub embed_scale_sqrt_width: bool,
@@ -93,6 +95,7 @@ impl ArchFacts {
             sigmoid_weights_norm: None,
             softmax_topk_renormalised: true,
             gelu_ffn: false,
+            value_rms_norm: false,
             embed_scale_sqrt_width: false,
             attention_scale: None,
             quantized_kv_degrades: false,
@@ -172,7 +175,8 @@ const FACTS: &[(&str, ArchFacts)] = &[
     ("gemma", GEMMA),
     ("gemma2", GEMMA),
     ("gemma3", GEMMA),
-    // Beyond the Gemma feed-forward: the reference hardcodes an attention scale of 1. The
+    // Beyond the Gemma feed-forward: the reference hardcodes an attention scale of 1 and
+    // normalises the values without a weight, which Gemma 2 and 3 do not. The
     // K-norm weights are small and uniform, and a quantised cache amplifies their rounding
     // until the output repeats. The converters write `add_bos_token = false` though the model
     // needs a BOS, which the reference overrides for this architecture too. Turns end on the
@@ -181,6 +185,7 @@ const FACTS: &[(&str, ArchFacts)] = &[
         "gemma4",
         ArchFacts {
             attention_scale: Some(1.0),
+            value_rms_norm: true,
             quantized_kv_degrades: true,
             forces_bos: true,
             turn_stop_pieces: &["<|turn>", "<turn|>", "<|tool_response>"],

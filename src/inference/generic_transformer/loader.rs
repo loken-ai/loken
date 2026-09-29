@@ -1122,7 +1122,7 @@ fn build_generic_layer(
     // silently SKIP the V-norm, and produce garbage attention on that layer
     // (the multi-device incoherence - single-GPU was fine because every
     // layer had it).
-    let attn_v_norm_ones = if flags.use_gelu {
+    let attn_v_norm_ones = if flags.value_rms_norm {
         Some(Tensor::ones(head_dim, crate::tensor::DType::F32, device)?)
     } else {
         None
