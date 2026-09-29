@@ -527,6 +527,10 @@ fn render_jinja_template(
         )
     });
     let mut env = Environment::new();
+    // The whitespace rules a chat template is written against: a block tag drops the
+    // newline after it and the indentation before it.
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
     env.set_unknown_method_callback(python_string_methods);
     // Chat templates call this to reject malformed conversations. Without it the
     // render fails outright, so map it to an error the caller turns into a
