@@ -819,10 +819,20 @@ pub fn fused_lfm2_shortconv(
     let b = bcx.dim(0)?;
     let lm1 = l_cache - 1;
     let bcx = bcx.contiguous()?;
+    // An in-place state is written where it lies, so it is used as it is, never a copy.
+    if crate::inference::moe_cuda::in_place_state_on() && !state_in.is_contiguous() {
+        crate::tensor::bail!("fused_lfm2_shortconv: an in-place state must be contiguous");
+    }
     let state_in = state_in.contiguous()?;
     let conv_w = conv_w.contiguous()?;
+    // In place, the state is advanced where it lies and handed back as the new state.
+    let in_place = crate::inference::moe_cuda::in_place_state_on();
     let y = unsafe { Tensor::empty((b, d_model), DType::F32, &bcx.device())? };
-    let state_out = unsafe { Tensor::empty((b, d_model, lm1), DType::F32, &bcx.device())? };
+    let state_out = if in_place {
+        state_in.clone()
+    } else {
+        unsafe { Tensor::empty((b, d_model, lm1), DType::F32, &bcx.device())? }
+    };
 
     let cuda_dev = bcx.device().as_cuda_device()?;
     let ptx = get_ptx(&cuda_dev)?;

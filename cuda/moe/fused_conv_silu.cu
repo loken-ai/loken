@@ -12,10 +12,10 @@
 
 extern "C" __global__ void loken_fused_conv_silu_kernel(
         const float * __restrict__ qkv,
-        const float * __restrict__ conv_state,
+        const float * conv_state,   // read into registers first: may be `new_conv_state`
         const float * __restrict__ w,
         float * __restrict__ out,
-        float * __restrict__ new_conv_state,
+        float * new_conv_state,
         int C, int seq, int K) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
@@ -57,10 +57,10 @@ extern "C" void loken_fused_conv_silu(
 #include <cuda_fp16.h>
 extern "C" __global__ void loken_fused_conv_silu_f16in_kernel(
         const __half * __restrict__ qkv,
-        const float * __restrict__ conv_state,
+        const float * conv_state,   // read into registers first: may be `new_conv_state`
         const float * __restrict__ w,
         float * __restrict__ out,
-        float * __restrict__ new_conv_state,
+        float * new_conv_state,
         int C, int seq, int K) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;

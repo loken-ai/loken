@@ -253,11 +253,11 @@ extern "C" __global__ void fused_mamba2_gate_gnorm_f32(
 //   y = silu(acc);  state_out = window
 extern "C" __global__ void fused_causal_conv1d_silu_f32(
     const float* __restrict__ x,         // [b, D]
-    const float* __restrict__ state_in,  // [b, D, L]
+    const float* state_in,               // [b, D, L]; may be `state_out`, read ahead of each write
     const float* __restrict__ conv_w,    // [D, L]
     const float* __restrict__ conv_b,    // [D]
     float* __restrict__ y_out,           // [b, D]
-    float* __restrict__ state_out,       // [b, D, L]
+    float* state_out,                    // [b, D, L]
     const int b, const int D, const int L
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x; // = bi*D + d
@@ -289,9 +289,9 @@ extern "C" __global__ void fused_mamba2_ssm_step_f32(
     const float* __restrict__ c_,    // [b, ngroups*ds]
     const float* __restrict__ dt,    // [b, nh]
     const float* __restrict__ a,     // [nh]
-    const float* __restrict__ h_in,  // [b, nh, hd, ds]
+    const float* h_in,               // [b, nh, hd, ds]; may be `h_out`, each thread owns its row
     float* __restrict__ y_out,       // [b, nh, hd]
-    float* __restrict__ h_out,       // [b, nh, hd, ds]
+    float* h_out,                    // [b, nh, hd, ds]
     const int b, const int nh, const int hd, const int ds, const int ngroups
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x; // = (bi*nh+head)*hd + p
@@ -326,10 +326,10 @@ extern "C" __global__ void fused_mamba2_ssm_step_f32(
 //   state_out = shift_left(state_in) with bx appended    (length L-1)
 extern "C" __global__ void fused_lfm2_shortconv_f32(
     const float* __restrict__ bcx,        // [b, 3*D]
-    const float* __restrict__ state_in,   // [b, D, L-1]
+    const float* state_in,                // [b, D, L-1]; may be `state_out`, read ahead of each write
     const float* __restrict__ conv_w,     // [D, L]
     float* __restrict__ y_out,            // [b, D]
-    float* __restrict__ state_out,        // [b, D, L-1]
+    float* state_out,                     // [b, D, L-1]
     const int b, const int D, const int L
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;

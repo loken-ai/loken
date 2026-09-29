@@ -220,6 +220,11 @@ pub fn lfm2_shortconv_f16io(
     }
     let b = bd[0];
     let dev = bcx.device().as_cuda_device()?;
+    let in_place = super::in_place_state_on();
+    // An in-place state is written where it lies, so it is used as it is, never a copy.
+    if in_place && !state.is_contiguous() {
+        crate::tensor::bail!("lfm2_shortconv_f16io: an in-place state must be contiguous");
+    }
     let bcx = bcx.contiguous()?;
     let state = state.contiguous()?;
     let conv_w = conv_w.contiguous()?;
@@ -239,7 +244,11 @@ pub fn lfm2_shortconv_f16io(
         _ => return Ok(None),
     };
     let y = unsafe { dev.alloc::<half::f16>(b * d_model) }?;
-    let new_state = unsafe { dev.alloc::<f32>(b * d_model * (l_cache - 1)) }?;
+    let new_state = if in_place {
+        None
+    } else {
+        Some(unsafe { dev.alloc::<f32>(b * d_model * (l_cache - 1)) }?)
+    };
     let stream = dev.cuda_stream().cu_stream() as i64;
     unsafe {
         loken_lfm2_shortconv_f16io(
@@ -247,7 +256,10 @@ pub fn lfm2_shortconv_f16io(
             st_s.device_ptr(st_s.stream()).0 as *const c_void,
             cw_s.device_ptr(cw_s.stream()).0 as *const c_void,
             y.device_ptr(y.stream()).0 as *mut c_void,
-            new_state.device_ptr(new_state.stream()).0 as *mut c_void,
+            match &new_state {
+                Some(n) => n.device_ptr(n.stream()).0 as *mut c_void,
+                None => st_s.device_ptr(st_s.stream()).0 as *mut c_void,
+            },
             b as i32,
             d_model as i32,
             l_cache as i32,
@@ -255,9 +267,12 @@ pub fn lfm2_shortconv_f16io(
         );
     }
     let y = tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(y, dev.clone()), (b, d_model))?;
-    let new_state = tensor_from_cuda_storage(
-        CudaStorage::wrap_cuda_slice(new_state, dev.clone()),
-        (b, d_model, l_cache - 1),
-    )?;
+    let new_state = match new_state {
+        Some(n) => tensor_from_cuda_storage(
+            CudaStorage::wrap_cuda_slice(n, dev.clone()),
+            (b, d_model, l_cache - 1),
+        )?,
+        None => state.clone(),
+    };
     Ok(Some((y, new_state)))
 }

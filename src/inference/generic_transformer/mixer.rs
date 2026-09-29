@@ -142,13 +142,16 @@ fn copy_state_in_place(dst: &MixerState, src: &MixerState) -> Result<()> {
 
 impl Mixer {
     /// True for a mixer whose decode step advances its state where it lies, so a step run
-    /// again reads and writes the same buffers: what a recorded decode step needs. Only the
-    /// delta-rule mixer on a card does so far.
+    /// again reads and writes the same buffers, and that is worth recording: the delta rule
+    /// through its fused recurrence, and the short convolution, on a card.
     pub fn decodes_in_place(&self, device: &Device) -> bool {
         match self {
             Mixer::DeltaNet(m) => m.steps_in_place(device),
             Mixer::Attention | Mixer::Absent => true,
-            Mixer::ShortConv(_) | Mixer::Ssm(_) => false,
+            Mixer::ShortConv(_) => device.is_cuda(),
+            // Its step advances in place too, but the recorded step measured slower than the
+            // eager one, so it is not recorded.
+            Mixer::Ssm(_) => false,
         }
     }
 

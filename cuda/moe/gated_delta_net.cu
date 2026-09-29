@@ -25,9 +25,11 @@ __global__ void loken_gated_delta_net_kernel(
         const float * __restrict__ v,
         const float * __restrict__ g,
         const float * __restrict__ beta,
-        const float * __restrict__ state_in,
+        // The state is read into registers first and written back last, so the two may be
+        // the same buffer; they are not `__restrict__`.
+        const float * state_in,
         float * __restrict__ o_out,
-        float * __restrict__ state_out,
+        float * state_out,
         int   H,
         int   n_tokens,
         long  sq1, long sq2,   // q/k strides (floats): head, token

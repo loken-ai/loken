@@ -20,11 +20,21 @@ pub fn fused_causal_conv1d_silu(
     }
     let bsz = x.dim(0)?;
     let x = x.contiguous()?;
+    // An in-place state is written where it lies, so it is used as it is, never a copy.
+    if crate::inference::moe_cuda::in_place_state_on() && !state_in.is_contiguous() {
+        crate::tensor::bail!("fused_causal_conv1d_silu: an in-place state must be contiguous");
+    }
     let state_in = state_in.contiguous()?;
     let conv_w = conv_w.contiguous()?;
     let conv_b = conv_b.contiguous()?;
+    // In place, the state is advanced where it lies and handed back as the new state.
+    let in_place = crate::inference::moe_cuda::in_place_state_on();
     let y = unsafe { Tensor::empty((bsz, d), DType::F32, &x.device())? };
-    let state_out = unsafe { Tensor::empty((bsz, d, l), DType::F32, &x.device())? };
+    let state_out = if in_place {
+        state_in.clone()
+    } else {
+        unsafe { Tensor::empty((bsz, d, l), DType::F32, &x.device())? }
+    };
 
     let cuda_dev = x.device().as_cuda_device()?;
     let ptx = get_ptx(&cuda_dev)?;
@@ -101,9 +111,19 @@ pub fn fused_mamba2_ssm_step(
     let c_ = c_.contiguous()?;
     let dt = dt.contiguous()?;
     let a = a.contiguous()?;
+    // An in-place state is written where it lies, so it is used as it is, never a copy.
+    if crate::inference::moe_cuda::in_place_state_on() && !h_in.is_contiguous() {
+        crate::tensor::bail!("fused_mamba2_ssm_step: an in-place state must be contiguous");
+    }
     let h_in = h_in.contiguous()?;
+    // In place, the state is advanced where it lies and handed back as the new state.
+    let in_place = crate::inference::moe_cuda::in_place_state_on();
     let y = unsafe { Tensor::empty((bsz, nh, hd), DType::F32, &x_c.device())? };
-    let h_out = unsafe { Tensor::empty((bsz, nh, hd, ds), DType::F32, &x_c.device())? };
+    let h_out = if in_place {
+        h_in.clone()
+    } else {
+        unsafe { Tensor::empty((bsz, nh, hd, ds), DType::F32, &x_c.device())? }
+    };
 
     let cuda_dev = x_c.device().as_cuda_device()?;
     let ptx = get_ptx(&cuda_dev)?;

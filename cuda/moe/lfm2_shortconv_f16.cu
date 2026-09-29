@@ -13,10 +13,10 @@
 
 extern "C" __global__ void loken_lfm2_shortconv_f16io_kernel(
     const __half * __restrict__ bcx,        // [b, 3*D] F16
-    const float  * __restrict__ state_in,   // [b, D, L-1] F32
+    const float  * state_in,                // [b, D, L-1] F32; may be `state_out`, read ahead of each write
     const float  * __restrict__ conv_w,     // [D, L] F32
     __half * __restrict__ y_out,            // [b, D] F16
-    float  * __restrict__ state_out,        // [b, D, L-1] F32
+    float  * state_out,                     // [b, D, L-1] F32
     const int b, const int D, const int L
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
