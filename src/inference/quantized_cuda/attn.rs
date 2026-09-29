@@ -364,7 +364,10 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
     scale: f32,
     dev: &CudaDevice,
 ) -> Result<CudaStorage> {
-    const MAX_NQ: usize = 8; // must match FLASH_SPLITK_GQA_PARTIAL_KERNEL MAXNQ
+    // The widest query-head group the devlen partial kernels are built for (their MAXNQ):
+    // up to 8 by one build, up to 16 by the `nq16` one.
+    const MAX_NQ: usize = 16;
+    const NARROW_NQ: usize = 8;
     if !(head_dim == 64 || head_dim == 128) {
         anyhow::bail!(
             "attn_flash_splitk_q8_gqa_decode_dev_pos: head_dim {head_dim} not in {{64,128}}"
@@ -384,13 +387,22 @@ pub fn attn_flash_splitk_q8_gqa_decode_dev_pos(
         );
     }
     let nsplit = gqa_nsplit(seq_kv_hint, n_kv_heads);
-    let (partial_name, combine_name) = match head_dim {
-        64 => (
+    let wide = n_q_per_kv > NARROW_NQ;
+    let (partial_name, combine_name) = match (head_dim, wide) {
+        (64, false) => (
             "flash_splitk_q8_gqa_partial_devlen_hd64",
             "flash_splitk_gqa_combine_wide_devlen_hd64",
         ),
-        128 => (
+        (64, true) => (
+            "flash_splitk_q8_gqa_partial_devlen_nq16_hd64",
+            "flash_splitk_gqa_combine_wide_devlen_hd64",
+        ),
+        (128, false) => (
             "flash_splitk_q8_gqa_partial_devlen_hd128",
+            "flash_splitk_gqa_combine_wide_devlen_hd128",
+        ),
+        (128, true) => (
+            "flash_splitk_q8_gqa_partial_devlen_nq16_hd128",
             "flash_splitk_gqa_combine_wide_devlen_hd128",
         ),
         _ => unreachable!(),

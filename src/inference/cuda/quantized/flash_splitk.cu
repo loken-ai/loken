@@ -599,6 +599,9 @@ extern "C" __global__ void NAME(                                              \
 FLASH_SPLITK_GQA_PARTIAL_KERNEL(flash_splitk_q8_gqa_partial_hd64,  64,  8)
 FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(flash_splitk_q8_gqa_partial_devlen_hd64,  64,  8)
 FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(flash_splitk_q8_gqa_partial_devlen_hd128, 128, 8)
+// Up to 16 query heads per KV head; a separate build keeps the 8-head one's registers.
+FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(flash_splitk_q8_gqa_partial_devlen_nq16_hd64,  64,  16)
+FLASH_SPLITK_GQA_PARTIAL_DEVLEN_KERNEL(flash_splitk_q8_gqa_partial_devlen_nq16_hd128, 128, 16)
 FLASH_SPLITK_GQA_PARTIAL_KERNEL(flash_splitk_q8_gqa_partial_hd128, 128, 8)
 FLASH_SPLITK_GQA_PARTIAL_PF_KERNEL(flash_splitk_q8_gqa_partial_pf_hd64,  64,  8)
 FLASH_SPLITK_GQA_PARTIAL_PF_KERNEL(flash_splitk_q8_gqa_partial_pf_hd128, 128, 8)
