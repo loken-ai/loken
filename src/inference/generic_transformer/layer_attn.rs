@@ -22,6 +22,12 @@ impl GenericTransformerLayer {
                 .is_some_and(|n| n.weight().dims1().is_ok_and(|d| d != self.head_dim))
     }
 
+    /// Whether this call is the graph's decode step, with the per-step buffers filled: the
+    /// position comes from them rather than from the caller.
+    pub(super) fn graph_step(&self) -> bool {
+        self.graph_rope_cos.is_some() && super::graph::GraphStep::active()
+    }
+
     /// Update pre-allocated RoPE buffers for a given position.
     /// Call before graph replay so the graph reads correct cos/sin values. The row comes from
     /// the same rotary table as the eager path, frequency factors (llama3 scaling) included.
@@ -565,7 +571,7 @@ impl GenericTransformerLayer {
         // A captured decode takes the fused path wherever the eager decode does, so a
         // replayed step computes what an eager one would. gemma4 (a V RMS-norm,
         // attn_v_norm_ones = Some) is the exception: its graph mode keeps the unfused path.
-        let graph_fused_ok = self.graph_rope_cos.is_none() || self.attn_v_norm_ones.is_none();
+        let graph_fused_ok = !self.graph_step() || self.attn_v_norm_ones.is_none();
         let want_apq_fast = want_apq_fast
             && !disable_apq
             && graph_fused_ok
@@ -633,7 +639,7 @@ impl GenericTransformerLayer {
             // Outside graph mode, use the full cos/sin table indexed by index_pos.
             let (src_cos, src_sin, kernel_pos) = match (&self.graph_rope_cos, &self.graph_rope_sin)
             {
-                (Some(gc), Some(gs)) => (gc.clone(), gs.clone(), 0usize),
+                (Some(gc), Some(gs)) if self.graph_step() => (gc.clone(), gs.clone(), 0usize),
                 _ => (self.cos.clone(), self.sin.clone(), index_pos),
             };
             let cos = if !src_cos.device().same_device(&x.device()) {
@@ -1060,7 +1066,7 @@ impl GenericTransformerLayer {
         // buffers have been primed by update_graph_state. During prefill
         // (seq_len > 1), graph_rope_cos may still be set from a prior
         // generation, but we must NOT use the single-row buffers for it.
-        let use_graph_ops = self.graph_rope_cos.is_some() && seq == 1;
+        let use_graph_ops = self.graph_step() && seq == 1;
 
         if use_graph_ops {
             q = self.apply_rotary_emb_from_buffer(&q)?;

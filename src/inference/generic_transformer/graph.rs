@@ -3,6 +3,35 @@
 #[allow(unused_imports)]
 use super::*;
 
+thread_local! {
+    static GRAPH_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, the forward on this thread is the graph's decode step: it reads its position
+/// from the per-step buffers `update_graph_state` fills. Every other forward, an eager step
+/// between replays or a verified draft row, reads the position it is given.
+pub(crate) struct GraphStep {
+    previous: bool,
+}
+
+impl GraphStep {
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: GRAPH_STEP.with(|s| s.replace(true)),
+        }
+    }
+
+    pub(crate) fn active() -> bool {
+        GRAPH_STEP.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for GraphStep {
+    fn drop(&mut self) {
+        GRAPH_STEP.with(|s| s.set(self.previous));
+    }
+}
+
 impl GenericHeteroTransformer {
     /// Tokens the KV cache accepts: the ceiling it grows to, or was allocated at.
     pub fn kv_capacity(&self) -> usize {
@@ -1152,6 +1181,7 @@ impl GenericHeteroTransformer {
     /// must have been populated by embed_for_graph before calling this.
     /// This is the body that gets captured into a CUDA graph.
     pub fn forward_from_hidden(&mut self) -> Result<Tensor> {
+        let _step = GraphStep::enter();
         let mut hidden = self
             .graph_hidden_buffer
             .as_ref()
@@ -1782,6 +1812,7 @@ impl GenericHeteroTransformer {
         input_ids: &Tensor,
         index_pos: usize,
     ) -> Result<(Tensor, Vec<Tensor>)> {
+        let _step = GraphStep::enter();
         let (_, seq_len) = input_ids.dims2()?;
         assert_eq!(seq_len, 1);
 
@@ -1990,6 +2021,7 @@ impl GenericHeteroTransformer {
     /// internal state - because captured graphs can't bind per-replay
     /// arguments.
     pub fn compute_all_from_kv_captured(&mut self) -> Result<Tensor> {
+        let _step = GraphStep::enter();
         let hidden = self
             .graph_hidden_buffer
             .as_ref()
