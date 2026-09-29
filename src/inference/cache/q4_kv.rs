@@ -1193,3 +1193,145 @@ impl Q4KvCache {
         Ok(out_tensor)
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod decode_parity_tests {
+    //! The Q4 decode attention against the attention of the F32 history it was built from.
+    //! The history is written as a prefill and then one row per decode step, which crosses
+    //! the residual flush; each step is checked for every query head.
+    use super::Q4KvCache;
+    use crate::tensor::{DType, Device, IndexOp, Tensor};
+
+    fn cuda() -> Option<Device> {
+        (0..4).find_map(|idx| {
+            let dev = Device::new_cuda(idx).ok()?;
+            Tensor::zeros_on((1,), DType::F32, &dev).ok().map(|_| dev)
+        })
+    }
+
+    /// Softmax attention of `q` `[n_q, hd]` over `k`/`v` `[n_kv, len, hd]`, query head `h`
+    /// reading KV head `h / (n_q / n_kv)`.
+    fn reference(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n_q: usize,
+        n_kv: usize,
+        len: usize,
+        hd: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let group = n_q / n_kv;
+        let mut out = vec![0f32; n_q * hd];
+        for h in 0..n_q {
+            let kv = h / group;
+            let scores: Vec<f32> = (0..len)
+                .map(|t| {
+                    (0..hd)
+                        .map(|c| q[h * hd + c] * k[(kv * len + t) * hd + c])
+                        .sum::<f32>()
+                        * scale
+                })
+                .collect();
+            let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let e: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+            let d: f32 = e.iter().sum();
+            for c in 0..hd {
+                out[h * hd + c] = (0..len)
+                    .map(|t| e[t] / d * v[(kv * len + t) * hd + c])
+                    .sum();
+            }
+        }
+        out
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb).max(f32::MIN_POSITIVE)
+    }
+
+    #[test]
+    fn decode_attention_matches_the_f32_history_for_every_group_width() {
+        let Some(dev) = cuda() else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let prefill = 45;
+        let steps = 40;
+        for &(hd, n_kv, group) in &[
+            (128usize, 4usize, 8usize),
+            (128, 8, 4),
+            (64, 4, 8),
+            (128, 2, 1),
+        ] {
+            let n_q = n_kv * group;
+            let total = prefill + steps;
+            let k_all = Tensor::randn(0.0f32, 1.0, (1, n_kv, total, hd), &dev).unwrap();
+            let v_all = Tensor::randn(0.0f32, 1.0, (1, n_kv, total, hd), &dev).unwrap();
+            let mut cache = Q4KvCache::new(4096, n_kv, hd, &dev).unwrap();
+            cache
+                .append(
+                    &k_all.i((.., .., 0..prefill, ..)).unwrap(),
+                    &v_all.i((.., .., 0..prefill, ..)).unwrap(),
+                )
+                .unwrap();
+            let scale = 1.0 / (hd as f32).sqrt();
+            for step in 0..steps {
+                let pos = prefill + step;
+                cache
+                    .append(
+                        &k_all
+                            .i((.., .., pos..pos + 1, ..))
+                            .unwrap()
+                            .contiguous()
+                            .unwrap(),
+                        &v_all
+                            .i((.., .., pos..pos + 1, ..))
+                            .unwrap()
+                            .contiguous()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let len = pos + 1;
+                let q = Tensor::randn(0.0f32, 1.0, (1, n_q, 1, hd), &dev).unwrap();
+                let scores = cache.attn_scores(&q).unwrap().affine(scale, 0.0).unwrap();
+                let got: Vec<f32> = cache
+                    .attn_softmax_output(&scores)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let host = |t: &Tensor| -> Vec<f32> {
+                    t.i((.., .., 0..len, ..))
+                        .unwrap()
+                        .contiguous()
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap()
+                };
+                let want = reference(
+                    &q.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                    &host(&k_all),
+                    &host(&v_all),
+                    n_q,
+                    n_kv,
+                    len,
+                    hd,
+                    scale,
+                );
+                for h in 0..n_q {
+                    let c = cosine(&got[h * hd..(h + 1) * hd], &want[h * hd..(h + 1) * hd]);
+                    assert!(
+                        c > 0.9,
+                        "hd={hd} n_kv={n_kv} group={group} len={len} head {h}: cosine {c}"
+                    );
+                }
+            }
+        }
+    }
+}

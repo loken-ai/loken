@@ -670,13 +670,14 @@ impl GenericTransformerLayer {
             let q_scale = attn_scale as f32;
             let rope_style = if self.flags.use_rope_i { 1 } else { 0 };
 
-            let use_q8 = self.has_q8_cache();
-            if use_q8 {
-                // Q8 KV fast-path is CUDA-only (quantized caches don't exist
-                // on non-CUDA builds, where `use_q8` is always false).
+            // A quantised cache (Q8 or Q4) holds the history: the fused kernels emit F32
+            // Q/K/V, the row is appended to it and attended over it. Quantised caches exist
+            // only on CUDA builds.
+            let use_quant = self.has_q8_cache() || self.has_q4_cache();
+            if use_quant {
                 #[cfg(feature = "cuda")]
                 {
-                    // Q8 path: emit Q & V as F32 (skip downstream casts).
+                    // Quantised path: emit Q & V as F32 (skip downstream casts).
                     //
                     // CRITICAL: the three branches below differ in whether Q gets
                     // pre-scaled by q_scale (1/sqrt(hd)) inside GH_APQ. The
@@ -753,14 +754,14 @@ impl GenericTransformerLayer {
                         };
                     }
 
-                    let cache = self.quant_kv.as_mut().and_then(|c| c.q8_mut()).unwrap();
+                    let cache = self.quant_kv.as_mut().unwrap();
                     if index_pos == 0 {
                         cache.reset();
                         self.kv_cache.reset();
                     }
-                    cache
-                        .append(&k, &v)
-                        .map_err(|e| crate::tensor::Error::msg(format!("Q8 append: {e}")))?;
+                    cache.append(&k, &v).map_err(|e| {
+                        crate::tensor::Error::msg(format!("quantised KV append: {e}"))
+                    })?;
 
                     // BUG FIX: `cache.attn_output` uses the legacy
                     // 1024-thread Q8 kernel which hits CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES
@@ -776,7 +777,12 @@ impl GenericTransformerLayer {
                     // for hd=128 GQA) or zero-scales it (sharp -> fragments for
                     // moondream). See dc6f67b for the original double-scale fix.
                     let softmax_scale = if q_was_pre_scaled { 1.0f32 } else { q_scale };
-                    let y_q8 = self.q8_decode_attention(&q, softmax_scale)?;
+                    let y_q8 = if self.has_q8_cache() {
+                        self.q8_decode_attention(&q, softmax_scale)?
+                    } else {
+                        let graph = self.graph_step();
+                        self.q4_decode_attention(&q, softmax_scale as f64, graph)?
+                    };
                     let attn_out_dim = self.n_head * self.head_dim;
                     // At decode (seq==1) y_q8 is [b, n_head, 1, hd]; transpose(1,2)
                     // then reshape forces a contiguous copy whose order matches a
@@ -1370,77 +1376,10 @@ impl GenericTransformerLayer {
             && !is_shared_layer;
         #[cfg(feature = "cuda")]
         if try_q4_decode {
-            let cache = self.q4_kv().unwrap();
             let scale = self
                 .attention_scale
                 .unwrap_or_else(|| 1.0 / (self.head_dim as f64).sqrt());
-            // Graph mode: use the device-pos variants that read seq_kv
-            // from cur_pos_dev[0] and write/read at the fixed
-            // max_seq_padded stride. Falls back to the host-int path
-            // when graph capture isn't active OR when current_seq_len
-            // would exceed the graph-mode seq cap (positions beyond it
-            // would be invisibly masked by the score kernel).
-            let q4_graph = use_graph_ops
-                && cache.cur_pos_dev_ptr().is_some()
-                && cache.current_seq_len() < cache.max_seq_padded();
-            // Fused flash split-K decode (one pass, no HBM scores round-trip).
-            // OPT-IN (LOKEN_Q4_FUSED=1), default OFF. Measured vs the
-            // GRAPH 2-kernel chain that the Q4 decode actually uses (which already
-            // parallelises over seq AND kv_head): isolated kernel 21.7 µs vs the
-            // graph chain's 30 µs at seq_kv=2700 (≈8 µs/layer), but this is only
-            // ~3 % of the qwen3 decode token and shows NO measurable end-to-end
-            // gain at <=2.5K - attention is NOT the long-context decode bottleneck
-            // there (the graph chain is already efficient). Kept as infrastructure:
-            // the chain materializes the [n_q,seq_kv] scores buffer in HBM each
-            // token, so the fused path's advantage widens at long context (>=8K),
-            // where it should start to pay. Same online-softmax math as the chain
-            // (the Q8 GQA path already ships this kernel). GQA hd∈{64,128} only;
-            // any kernel Err / shape mismatch falls back to the chain.
-            // Expected to pay only at long context (>=8K), where the fused form's per-token
-            // advantage widens; not yet measured to win, so nothing selects it.
-            let q4_fused_ok = false;
-            let scale_f32 = scale as f32;
-            let fused = if !q4_fused_ok {
-                None
-            } else if q4_graph {
-                match cache.attn_flash_splitk_decode_graph(&q, scale_f32) {
-                    Ok(y) => Some(y),
-                    Err(e) => {
-                        tracing::warn!("Q4 fused graph decode fallback to chain: {e}");
-                        None
-                    }
-                }
-            } else {
-                match cache.attn_flash_splitk_decode(&q, scale_f32) {
-                    Ok(y) => Some(y),
-                    Err(e) => {
-                        tracing::warn!("Q4 fused decode fallback to chain: {e}");
-                        None
-                    }
-                }
-            };
-            let y_q4 = if let Some(y) = fused {
-                y
-            } else if q4_graph {
-                let scores = cache
-                    .attn_scores_graph(&q)
-                    .map_err(|e| crate::tensor::Error::msg(format!("Q4 attn_scores_graph: {e}")))?;
-                let scores = scores.affine(scale as f32, 0.0)?;
-                let probs = crate::tensor::ops::softmax_last_dim(&scores)?;
-                cache
-                    .attn_output_graph(&probs)
-                    .map_err(|e| crate::tensor::Error::msg(format!("Q4 attn_output_graph: {e}")))?
-            } else {
-                // Non-graph fallback chain (fused softmax + V-matmul kernel).
-                let scores = cache
-                    .attn_scores(&q)
-                    .map_err(|e| crate::tensor::Error::msg(format!("Q4 attn_scores: {e}")))?;
-                let scores = scores.affine(scale as f32, 0.0)?;
-                cache.attn_softmax_output(&scores).map_err(|e| {
-                    crate::tensor::Error::msg(format!("Q4 attn_softmax_output: {e}"))
-                })?
-            };
-
+            let y_q4 = self.q4_decode_attention(&q, scale, use_graph_ops)?;
             let attn_out_dim = self.n_head * self.head_dim;
             let y = y_q4.transpose(1, 2)?.reshape(&[b, seq, attn_out_dim])?;
             return Ok((y, false));
@@ -1514,6 +1453,81 @@ impl GenericTransformerLayer {
         let y = y.transpose(1, 2)?.reshape(&[b, seq, attn_out_dim])?;
         // The projection of this path routes through the graph's stable buffer (decode).
         Ok((y, true))
+    }
+
+    /// One query row `q` `[1, n_head, 1, hd]` against the Q4 history, `scale` applied to
+    /// the scores. Returns `[1, n_head, 1, hd]` F32. A primed cache (captured decode) takes
+    /// the device-position kernels, which read the length from the device.
+    #[cfg(feature = "cuda")]
+    fn q4_decode_attention(&self, q: &Tensor, scale: f64, use_graph_ops: bool) -> Result<Tensor> {
+        let cache = self.q4_kv().unwrap();
+        // Graph mode: use the device-pos variants that read seq_kv
+        // from cur_pos_dev[0] and write/read at the fixed
+        // max_seq_padded stride. Falls back to the host-int path
+        // when graph capture isn't active OR when current_seq_len
+        // would exceed the graph-mode seq cap (positions beyond it
+        // would be invisibly masked by the score kernel).
+        let q4_graph = use_graph_ops
+            && cache.cur_pos_dev_ptr().is_some()
+            && cache.current_seq_len() < cache.max_seq_padded();
+        // Fused flash split-K decode (one pass, no HBM scores round-trip).
+        // OPT-IN (LOKEN_Q4_FUSED=1), default OFF. Measured vs the
+        // GRAPH 2-kernel chain that the Q4 decode actually uses (which already
+        // parallelises over seq AND kv_head): isolated kernel 21.7 µs vs the
+        // graph chain's 30 µs at seq_kv=2700 (≈8 µs/layer), but this is only
+        // ~3 % of the qwen3 decode token and shows NO measurable end-to-end
+        // gain at <=2.5K - attention is NOT the long-context decode bottleneck
+        // there (the graph chain is already efficient). Kept as infrastructure:
+        // the chain materializes the [n_q,seq_kv] scores buffer in HBM each
+        // token, so the fused path's advantage widens at long context (>=8K),
+        // where it should start to pay. Same online-softmax math as the chain
+        // (the Q8 GQA path already ships this kernel). GQA hd∈{64,128} only;
+        // any kernel Err / shape mismatch falls back to the chain.
+        // Expected to pay only at long context (>=8K), where the fused form's per-token
+        // advantage widens; not yet measured to win, so nothing selects it.
+        let q4_fused_ok = false;
+        let scale_f32 = scale as f32;
+        let fused = if !q4_fused_ok {
+            None
+        } else if q4_graph {
+            match cache.attn_flash_splitk_decode_graph(q, scale_f32) {
+                Ok(y) => Some(y),
+                Err(e) => {
+                    tracing::warn!("Q4 fused graph decode fallback to chain: {e}");
+                    None
+                }
+            }
+        } else {
+            match cache.attn_flash_splitk_decode(q, scale_f32) {
+                Ok(y) => Some(y),
+                Err(e) => {
+                    tracing::warn!("Q4 fused decode fallback to chain: {e}");
+                    None
+                }
+            }
+        };
+        let y_q4 = if let Some(y) = fused {
+            y
+        } else if q4_graph {
+            let scores = cache
+                .attn_scores_graph(q)
+                .map_err(|e| crate::tensor::Error::msg(format!("Q4 attn_scores_graph: {e}")))?;
+            let scores = scores.affine(scale as f32, 0.0)?;
+            let probs = crate::tensor::ops::softmax_last_dim(&scores)?;
+            cache
+                .attn_output_graph(&probs)
+                .map_err(|e| crate::tensor::Error::msg(format!("Q4 attn_output_graph: {e}")))?
+        } else {
+            // Non-graph fallback chain (fused softmax + V-matmul kernel).
+            let scores = cache
+                .attn_scores(q)
+                .map_err(|e| crate::tensor::Error::msg(format!("Q4 attn_scores: {e}")))?;
+            let scores = scores.affine(scale as f32, 0.0)?;
+            cache
+                .attn_softmax_output(&scores)
+                .map_err(|e| crate::tensor::Error::msg(format!("Q4 attn_softmax_output: {e}")))?
+        };
+        Ok(y_q4)
     }
 
     /// Decode attention of one query row over the Q8 cache, the row's K/V already appended.
