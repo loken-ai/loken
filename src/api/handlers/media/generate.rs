@@ -184,25 +184,16 @@ pub(crate) async fn ensure_image_model_loaded_reporting(
     geom: crate::inference::place::runtime_demand::RequestGeometry,
     report: Option<tokio::sync::mpsc::Sender<ImageEngineLoadingProgress>>,
 ) -> Result<(), String> {
-    // Resolve the loader BEFORE anything is unloaded or reserved: a family nobody wired
-    // must fail by name here, never fall through to another family's loader - and the
-    // VRAM budgets below are keyed on it too, so it also decides what this load reserves.
+    // Resolve the loader BEFORE anything is unloaded or reserved: a name whose files declare
+    // no image model must fail here, never fall through to another family's loader - and
+    // the VRAM budgets below are keyed on it too, so it also decides what this load reserves.
     let loader = image_loader(&state.huggingface_models_dir, model_name)?;
     let current = state.image_engine.model_name().await;
-    // Same FAMILY is not enough: a Ray drop-in and its base share the family but are different
-    // checkpoints - the resident must be swapped whenever the requested variant differs, or a
-    // request for one silently generates with the other.
-    // When the resident tracks its checkpoint FILE (Flux), compare files: two tags
-    // over one file share the resident model, two different checkpoints never alias
-    // (a family+ray-flag comparison silently served FLUX.1-schnell requests from a
-    // resident Rayflux fine-tune). Otherwise fall back to family identity.
+    // Same FAMILY is not enough: a drop-in and its base share the family but are different
+    // checkpoints, and the resident is swapped whenever the requested one differs. When both
+    // resolve to a file the files are compared; otherwise the names are, so a checkpoint
+    // served from a repository still serves a later request for itself.
     let resident_ckpt = state.image_engine.resident_ckpt_id().await;
-    // File comparison only applies when the REQUEST resolves to a local checkpoint.
-    // A tag served from the HF cache (FLUX.1-schnell, candle-flux) has no local file,
-    // so requiring equality marked it different from itself and reloaded the whole
-    // model on EVERY request - a silent ~14 s tax per render. Those tags fall back to
-    // family + Ray identity, which still prevents the aliasing this guards against:
-    // a Ray fine-tune can never satisfy a base-model request, or the reverse.
     let requested_local = requested_checkpoint(&state.huggingface_models_dir, model_name)
         .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()));
     let kind_matches = resident_serves_request(

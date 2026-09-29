@@ -53,7 +53,7 @@ pub enum WanVariant {
     /// onto one GPU. The backward-compatible default.
     B1_3,
     /// 14B (dim 5120, 40 blocks, 40 heads, ffn 13824): Q8_0 GGUF -> QMatMul on-device
-    /// weights, multi-GPU layer split. Selected via `WAN_MODEL=14b` (wan_render).
+    /// weights, multi-GPU layer split. Selected by the checkpoint being a GGUF.
     B14,
 }
 

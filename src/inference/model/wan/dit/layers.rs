@@ -336,10 +336,9 @@ pub(super) fn window_starts(frames: usize, window: usize, stride: usize) -> Vec<
 
 impl WanDit {
     /// Load the configured variant (default 1.3B safetensors; 14B = Q8 GGUF, multi-GPU).
-    /// `checkpoint` overrides the variant's own file - a fine-tune resolved by
-    /// [`wan_dit_file_for`]. Its geometry is checked against the variant before anything
-    /// is read, because a checkpoint of the wrong shape renders a video rather than
-    /// failing.
+    /// `checkpoint` overrides the variant's own file - the checkpoint the request resolved
+    /// to. Its geometry is checked against the variant before anything is read, because a
+    /// checkpoint of the wrong shape renders a video rather than failing.
     pub fn load_variant(
         variant: WanVariant,
         clip_tokens: usize,
@@ -1705,16 +1704,12 @@ mod checkpoint_selection_tests {
         assert!(check_wan_geometry(&[2, 2, 1, 36, 5120], 5120, 16).is_some());
     }
 
-    /// A 14B checkpoint selected as the 1.3B is refused, and the message says how to fix it.
+    /// A checkpoint of another width is refused, and the message names both widths.
     #[test]
     pub(super) fn a_checkpoint_of_the_wrong_width_is_refused() {
         let why = check_wan_geometry(&[5120, 16, 1, 2, 2], 1536, 16)
             .expect("a 5120-wide model is not the 1.3B");
         assert!(why.contains("5120") && why.contains("1536"), "{why}");
-        assert!(
-            why.contains("14"),
-            "the message must say how to select the 14B: {why}"
-        );
     }
 
     /// Something that is not a patch embedding at all.
@@ -1724,30 +1719,32 @@ mod checkpoint_selection_tests {
         assert!(check_wan_geometry(&[7], 1536, 16).is_some());
     }
 
-    /// A 14B fine-tune's own file name must still route it to the 14B loader.
-    ///
-    /// `from_token` picks the variant by looking for "14" in the requested name, and the
-    /// requested name is the file's variant tag - so a checkpoint whose tag loses that
-    /// substring would be loaded as the 1.3B and refused by the geometry guard, with the
-    /// user left holding a file that "does not work" for no visible reason.
+    /// The checkpoint's format picks its loader, whatever the file is called: a GGUF goes
+    /// through the quantized loader, a whole safetensors DiT through the dense one.
     #[test]
-    pub(super) fn a_14b_finetune_still_selects_the_14b_loader() {
-        let tag = wan_checkpoint_tag("Wan.FusionX.14b.Q8_0");
-        assert_eq!(
-            tag, "wan-fusionx-14b",
-            "quantisation tokens drop, the size does not"
+    pub(super) fn the_checkpoint_format_selects_the_loader() {
+        use crate::inference::media_facts::fixture::{gguf, safetensors, Scratch};
+        let s = Scratch::new("wan-variant");
+        let quantized = s.0.join("Some.Tune.gguf");
+        gguf(&quantized, &[], &["patch_embedding.weight"]);
+        assert!(matches!(
+            WanVariant::of_checkpoint(&quantized),
+            WanVariant::B14
+        ));
+        let dense = s.0.join("Some.Tune.14b.safetensors");
+        safetensors(
+            &dense,
+            &["patch_embedding.weight", "blocks.0.self_attn.q.weight"],
+            None,
         );
-        assert!(matches!(WanVariant::from_token(&tag), WanVariant::B14));
-        // And a 1.3B fine-tune must NOT be dragged to the 14B by a stray digit.
-        let small = wan_checkpoint_tag("Wan.Photoreal.v2.0");
-        assert!(
-            matches!(WanVariant::from_token(&small), WanVariant::B1_3),
-            "{small}"
-        );
+        assert!(matches!(
+            WanVariant::of_checkpoint(&dense),
+            WanVariant::B1_3
+        ));
     }
 
-    /// The stem of a dropped file decides which name selects it, through the SAME
-    /// normalisation the Ray families use - so the two mechanisms cannot drift.
+    /// The stem of a dropped file decides which name selects it: a request spelled like
+    /// the file and the file itself normalise to one tag.
     #[test]
     pub(super) fn a_dropped_file_answers_to_its_own_name() {
         assert_eq!(
@@ -1887,62 +1884,6 @@ mod checkpoint_tag_tests {
 }
 
 #[cfg(test)]
-mod distilled_defaults_tests {
-    use super::wan_distilled_defaults;
-    use std::path::Path;
-
-    /// A step-distilled checkpoint is not a faster way to the same picture: it was trained
-    /// to be integrated in a handful of steps with NO guidance. Running one at the base
-    /// model's forty steps and guidance 5 does not render it better, it renders it wrong -
-    /// and costs ten times as much doing so. The file has to be able to say so.
-    #[test]
-    pub(super) fn a_distillation_declares_its_own_schedule() {
-        let causvid = Path::new("/m/Wan21_CausVid_bidirect2_T2V_1_3B_lora_rank32.safetensors");
-        assert_eq!(wan_distilled_defaults(causvid), Some((4, 1.0)));
-        let fusionx = Path::new("/m/Wan.FusionX.14b.Q8_0.gguf");
-        assert_eq!(wan_distilled_defaults(fusionx), Some((8, 1.0)));
-    }
-
-    /// Guidance 1.0 is the point: it means the unconditional branch is never evaluated,
-    /// which is half the forwards. A distillation that declared a schedule but kept
-    /// guidance would give back the larger half of the saving.
-    #[test]
-    pub(super) fn every_distillation_turns_guidance_off() {
-        for f in ["A_CausVid_x.safetensors", "b-fusionx-14b.gguf"] {
-            let (steps, cfg) = wan_distilled_defaults(Path::new(f)).expect(f);
-            assert!(steps <= 8, "{f}: {steps} steps is not a distillation");
-            assert_eq!(cfg, 1.0, "{f} still pays for an unconditional branch");
-        }
-    }
-
-    /// A checkpoint nobody has taught this about must keep the BASE schedule. Guessing a
-    /// four-step schedule for an ordinary fine-tune would quietly ruin it.
-    #[test]
-    pub(super) fn an_unrecognised_checkpoint_keeps_the_base_schedule() {
-        for f in [
-            "/m/Wan.Photoreal.v2.0.safetensors",
-            "/m/wan2.1-i2v-14b-480p-Q8_0.gguf",
-            "/m/diffusion_pytorch_model.safetensors",
-        ] {
-            assert_eq!(wan_distilled_defaults(Path::new(f)), None, "{f}");
-        }
-    }
-
-    /// Publishers do not agree on capitalisation, and a checkpoint that fails to be
-    /// recognised is one that renders at ten times the cost with no error anywhere.
-    #[test]
-    pub(super) fn recognition_does_not_depend_on_case() {
-        for f in [
-            "CAUSVID.safetensors",
-            "causvid.safetensors",
-            "CausVid.safetensors",
-        ] {
-            assert_eq!(wan_distilled_defaults(Path::new(f)), Some((4, 1.0)), "{f}");
-        }
-    }
-}
-
-#[cfg(test)]
 mod window_overlap_tests {
     use super::WanDit;
 
@@ -2019,38 +1960,16 @@ mod i2v_tag_tests {
 }
 
 #[cfg(test)]
-mod i2v_distill_tests {
-    use super::{wan_checkpoint_tag, wan_distilled_defaults};
-    use std::path::Path;
+mod i2v_adapter_tests {
+    use super::wan_checkpoint_tag;
 
-    /// The image-to-video distillation adapter, which is what makes that model usable at
-    /// all: forty guided steps against four unguided ones is twenty times the forwards.
-    #[test]
-    pub(super) fn the_image_to_video_distillation_declares_four_steps_and_no_guidance() {
-        let p = Path::new("/m/Wan.I2Vdistill.lora.safetensors");
-        assert_eq!(wan_distilled_defaults(p), Some((4, 1.0)));
-        let q = Path::new("/m/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors");
-        assert_eq!(wan_distilled_defaults(q), Some((4, 1.0)));
-    }
-
-    /// It must not collide with the checkpoint it corrects, or one would serve the other's
-    /// requests and the render would silently be the undistilled forty-step one.
+    /// An adapter must not collide with the checkpoint it corrects, or one would serve the
+    /// other's requests.
     #[test]
     pub(super) fn the_adapter_and_its_base_have_different_names() {
         assert_ne!(
             wan_checkpoint_tag("Wan.I2Vdistill.lora"),
             wan_checkpoint_tag("Wan.I2V.14b.Q8_0")
-        );
-    }
-
-    /// A plain checkpoint keeps the base schedule: guessing four steps for a model that
-    /// was not distilled produces mush, which is exactly what forty-step weights do at
-    /// eight.
-    #[test]
-    pub(super) fn an_undistilled_checkpoint_is_left_alone() {
-        assert_eq!(
-            wan_distilled_defaults(Path::new("/m/Wan.I2V.14b.Q8_0.gguf")),
-            None
         );
     }
 }

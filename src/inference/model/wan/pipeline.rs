@@ -774,8 +774,8 @@ pub fn render_many_sampled(
     progress: Option<&crate::inference::serve::progress::ProgressFn<'_>>,
     cancel: Option<&crate::inference::serve::cancel::CancelToken>,
     negative: &str,
-    // A fine-tune resolved by `wan_dit_file_for`, or None for the variant's
-    // own checkpoint. Its geometry is checked before a weight is read.
+    // The checkpoint the request resolved to, or None for the variant's own. Its
+    // geometry is checked before a weight is read.
     checkpoint: Option<&std::path::Path>,
     // Velocity-reuse threshold, 0 = off. Worth twice here what it is on a
     // single-branch sampler: this loop runs the DiT TWICE per step.
@@ -793,19 +793,6 @@ pub fn render_many_sampled(
     if prompts.is_empty() {
         return Err(Error("wan: no prompts to render".into()));
     }
-    // A step-distilled checkpoint carries its own schedule. It was trained to be integrated
-    // in a handful of steps with no classifier-free guidance, so running it at the base
-    // model's step count and guidance does not render it better - it renders it wrong, and
-    // it does so at ten times the cost. The checkpoint is the only thing that knows this,
-    // and nothing in the request could be expected to.
-    let (steps, cfg) =
-        match checkpoint.and_then(crate::inference::model::wan::dit::wan_distilled_defaults) {
-            Some((ds, dc)) if ds != steps || (dc - cfg).abs() > f32::EPSILON => {
-                eprintln!("[wan] distilled checkpoint: steps {steps} -> {ds}, cfg {cfg} -> {dc}");
-                (ds, dc)
-            }
-            _ => (steps, cfg),
-        };
     let shift = wan_sample_shift(width, height, matches!(variant, WanVariant::B1_3), false);
     let f_lat = (out_frames.saturating_sub(1)) / 4 + 1;
     let (hl, wl) = (height / 8, width / 8);

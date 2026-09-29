@@ -4,6 +4,35 @@
 
 use super::*;
 
+/// The video denoiser `model_name` names: its catalogue entry when that entry is a denoiser
+/// or an adapter of one, else the denoiser of the pipeline the entry belongs to. `None` when
+/// the name's files declare no video model.
+fn video_checkpoint(hf_models_dir: &str, model_name: &str) -> Option<PathBuf> {
+    let path = media_checkpoint(hf_models_dir, model_name)?;
+    let facts = crate::inference::media_facts::read(&path)?;
+    if facts.kind != crate::inference::media_facts::MediaKind::Video {
+        return None;
+    }
+    let weights = path.is_file()
+        && path.extension().is_some_and(|x| {
+            x.eq_ignore_ascii_case("gguf") || x.eq_ignore_ascii_case("safetensors")
+        });
+    if weights {
+        return Some(path);
+    }
+    let dir = if path.is_dir() {
+        path.as_path()
+    } else {
+        path.parent()?
+    };
+    let own = dir.join("diffusion_pytorch_model.safetensors");
+    Some(if own.is_file() {
+        own
+    } else {
+        crate::inference::model::wan::dit::wan_dit_file()
+    })
+}
+
 /// Encode RGB frames as an H.264 MP4 by piping rawvideo through ffmpeg. Returns the mp4 bytes.
 /// Much smaller and higher-quality than the GIF fallback, but needs ffmpeg on PATH. Dims must be
 /// even (the caller clamps to a multiple of 16, so yuv420p is always valid).
@@ -391,16 +420,14 @@ pub(crate) async fn video_generations(
         .and_then(|v| v.as_str())
         .unwrap_or("wan")
         .to_string();
-    // Pick the DiT variant from the model name: anything containing "14" (e.g. "wan-14b")
-    // selects the 14B Q8 GGUF (multi-GPU split, higher quality); otherwise the 1.3B default.
-    let variant = crate::inference::model::wan::dit::WanVariant::from_token(&model_name);
-    // A fine-tune dropped in `<models>/wan/`, selected by name exactly as the Ray families
-    // are. Falls back to the variant's own checkpoint when nothing matches, so the plain
-    // "wan" request is unchanged.
-    let wan_ckpt = crate::inference::model::wan::dit::wan_dit_file_for(
-        &state.huggingface_models_dir,
-        &model_name,
-    );
+    // The denoiser the request names, and the loader its format calls for.
+    let Some(wan_ckpt) = video_checkpoint(&state.huggingface_models_dir, &model_name) else {
+        return err_resp(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("'{model_name}' names no checkpoint whose files declare a video model"),
+        );
+    };
+    let variant = crate::inference::model::wan::dit::WanVariant::of_checkpoint(&wan_ckpt);
 
     // An image-to-video checkpoint renders a clip that CONTINUES a frame. If the caller did
     // not give one, MAKE one from the same prompt rather than refusing: the server already
