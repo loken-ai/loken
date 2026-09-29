@@ -157,11 +157,16 @@ pub(crate) fn apply_thinking_preference(
         }
         return;
     }
-    if thinking == Some("disabled")
-        && prompt.ends_with(OPENER)
-        && template.is_none_or(template_has_thinking)
-    {
-        prompt.push_str("<think>\n\n</think>\n\n");
+    const OPENED: &str = "<|im_start|>assistant\n<think>\n";
+    if thinking == Some("disabled") && template.is_none_or(template_has_thinking) {
+        // A template that opens the thinking block itself rendered it open; it is closed
+        // empty, as the template renders with thinking off.
+        if prompt.ends_with(OPENED) {
+            prompt.truncate(prompt.len() - "<think>\n".len());
+        }
+        if prompt.ends_with(OPENER) {
+            prompt.push_str("<think>\n\n</think>\n\n");
+        }
     }
 }
 
@@ -1911,6 +1916,22 @@ mod go_template_tests {
             "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
         );
         assert!(render_go_template("{{ range .Messages }}x{{ end }}", None, "hi").is_none());
+    }
+
+    /// A template that opens the thinking block itself has it closed empty when the caller
+    /// asks for no reasoning, as the template renders with thinking off.
+    #[test]
+    fn a_thinking_block_the_template_opened_is_closed() {
+        let template = "{%- if enable_thinking is defined and enable_thinking is false %}";
+        let mut p = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n".to_string();
+        apply_thinking_preference(&mut p, Some("disabled"), Some(template));
+        assert!(
+            p.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "{p}"
+        );
+        let mut q = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n".to_string();
+        apply_thinking_preference(&mut q, Some("enabled"), Some(template));
+        assert!(q.ends_with("<|im_start|>assistant\n<think>\n"), "{q}");
     }
 
     #[test]
