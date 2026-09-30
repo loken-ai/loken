@@ -44,7 +44,8 @@ pub fn narrow_storage(
             b.arg(&srb);
             b.arg(&rb);
             b.arg(&nr);
-            unsafe { b.launch(cfg) }.map_err(|e| Error(format!("narrow launch: {e}")))?;
+            unsafe { b.launch(cfg) }
+                .map_err(|e| Error(format!("narrow launch: {e}{}", super::device::stack_note())))?;
             Ok(CudaStorage::$variant(out))
         }};
     }

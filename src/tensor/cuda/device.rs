@@ -66,6 +66,16 @@ pub(super) fn stream_capturing(dev: &CudaDevice) -> bool {
     }
 }
 
+/// The call stack as text, when RUST_LIB_BACKTRACE asks for it, ready to append to an error
+/// message; empty otherwise.
+pub(crate) fn stack_note() -> String {
+    let stack = std::backtrace::Backtrace::capture();
+    match stack.status() {
+        std::backtrace::BacktraceStatus::Captured => format!("\n{stack}"),
+        _ => String::new(),
+    }
+}
+
 /// Run a device allocation with one reclaim-and-retry on OOM. Every
 /// storage-level allocation funnels through this so a transient landing on
 /// a pool full of freed-but-retained memory degrades to a warn + retry
