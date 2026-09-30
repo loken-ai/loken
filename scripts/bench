@@ -8,6 +8,7 @@
 # Usage:
 #   bench                 # PLAN: print the cells a campaign would run (no side effects) [default]
 #   bench --plan          # same, explicit
+#   BENCH_ONLY="a b" bench run   # RUN only the named models
 #   bench run             # RUN the campaign (provisions engines, measures) - see `run` below
 #
 # `run` is deliberately not the default: it installs pinned ollama/vLLM into a bench-only
@@ -181,6 +182,8 @@ plan() {
     local m mod fmt engines amod vserve err
     while IFS=$'\t' read -r m mod fmt; do
         [ -n "$m" ] || continue
+        # BENCH_ONLY: space-separated model names; only those cells run.
+        if [ -n "${BENCH_ONLY:-}" ] && ! [[ " $BENCH_ONLY " == *" $m "* ]]; then continue; fi
         IFS='|' read -r engines amod vserve err < <(plan_cell "$m" "$mod" "$fmt")
         printf '%-40s  %-8s  %-12s  %-16s  %s\n' \
             "$m" "$mod" "${fmt:-<none>}" "${err:+ERROR}${err:-$engines}" "$err"
