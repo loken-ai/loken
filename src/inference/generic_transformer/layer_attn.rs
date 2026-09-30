@@ -1471,9 +1471,12 @@ impl GenericTransformerLayer {
                 return Ok((y, true));
             }
         }
-        // Buffers appended in place and not attended above hold more rows than the history.
+        // Buffers appended in place and not attended above hold more rows than the history. A
+        // layer that reads another layer's cache holds none of its own and is handed the
+        // donor's rows already cut to the history.
         let kv_len = self.kv_cache.current_seq_len();
-        let (k, v) = match self.kv_f16 && !use_graph_ops && k.dims()[2] > kv_len {
+        let (k, v) = match self.kv_f16 && !use_graph_ops && !is_shared_layer && k.dims()[2] > kv_len
+        {
             true => (k.narrow(2, 0, kv_len)?, v.narrow(2, 0, kv_len)?),
             false => (k, v),
         };
