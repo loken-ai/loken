@@ -521,8 +521,29 @@ impl GenericTransformerConfig {
         let embedding_length = meta_u32(content, arch, "embedding_length")
             .unwrap_or((n_head * head_dim) as u32) as usize;
 
-        let ffn_dim = meta_u32(content, arch, "feed_forward_length")
-            .unwrap_or(4 * embedding_length as u32) as usize;
+        // The width the dense feed-forward tensors have. The declared value stands when some
+        // layer has that width; a file whose converter rounds the width after writing it
+        // declares one no layer has, and the tensors are then what says.
+        let declared_ffn = meta_u32(content, arch, "feed_forward_length").map(|v| v as usize);
+        let mut widths = std::collections::BTreeMap::<usize, usize>::new();
+        for i in 0..n_layers {
+            if let Some(w) = content
+                .tensor_infos
+                .get(&format!("blk.{i}.ffn_gate.weight"))
+                .and_then(|t| t.shape.dims().first().copied())
+            {
+                *widths.entry(w).or_default() += 1;
+            }
+        }
+        let ffn_dim = match declared_ffn {
+            Some(d) if widths.is_empty() || widths.contains_key(&d) => d,
+            _ => widths
+                .iter()
+                .max_by_key(|(_, n)| **n)
+                .map(|(w, _)| *w)
+                .or(declared_ffn)
+                .unwrap_or(4 * embedding_length),
+        };
 
         let rope_freq_base = meta_f32(content, arch, "rope.freq_base").unwrap_or(10000.0);
 
