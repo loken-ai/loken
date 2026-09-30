@@ -201,6 +201,13 @@ pub fn load_runtime_floor(model_size: u64) -> u64 {
     MEASURED_LOAD_FLOOR.max(model_size / STAGED_SHARE)
 }
 
+/// What a load of a checkpoint whose weights reach the card one tensor at a time keeps free
+/// on each card it uses: the floor a first launch needs, or the largest tensor in flight,
+/// whichever is more. The rest of the checkpoint is never live on the card beside it.
+pub fn tensor_load_staging(largest_tensor: u64) -> u64 {
+    MEASURED_LOAD_FLOOR.max(largest_tensor)
+}
+
 /// measured-resident: the floor a first launch needs free on a card before any
 /// model-specific scratch is counted. It covers module loading, which no arithmetic over
 /// the checkpoint can see.

@@ -92,8 +92,13 @@ pub(crate) fn per_card_reserve(path: &std::path::Path) -> Option<u64> {
         .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| {
             c as usize
         });
-    let staging = crate::inference::place::runtime_demand::load_runtime_floor(
-        std::fs::metadata(path).ok()?.len(),
+    let staging = crate::inference::place::runtime_demand::tensor_load_staging(
+        content
+            .tensor_infos
+            .values()
+            .map(|t| t.size_in_bytes() as u64)
+            .max()
+            .unwrap_or(0),
     );
     Some(ModelDims::read(&content, &arch).runtime_reserve(context_length) + staging)
 }
@@ -542,7 +547,9 @@ impl LlmEngine {
             // and the runtime reserve: the cache at the reserve window, the cuBLAS workspace
             // and a prefill chunk's activations, sized from the model's own dimensions.
             let runtime_reserve_bytes = dims.runtime_reserve(context_length);
-            let staging = crate::inference::place::runtime_demand::load_runtime_floor(file_size);
+            let staging = crate::inference::place::runtime_demand::tensor_load_staging(
+                content.tensor_infos.values().map(|t| t.size_in_bytes() as u64).max().unwrap_or(0),
+            );
             let offer = if disable_cuda {
                 debug!("CUDA disabled by config (disable_cuda=true)");
                 crate::inference::place::llm::Offer::default()
@@ -555,6 +562,16 @@ impl LlmEngine {
             };
             crate::inference::place::device_probe::debug_vram_by_card("after-offer");
             let cuda_devices: Vec<(usize, u64)> = offer.cards.clone();
+            info!(
+                "📊 cards offered (free less staging): {}; staging {:.2} GB, runtime reserve {:.2} GB",
+                cuda_devices
+                    .iter()
+                    .map(|(i, b)| format!("{i}: {:.2} GB", *b as f64 / 1e9))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                staging as f64 / 1e9,
+                runtime_reserve_bytes as f64 / 1e9
+            );
             let model_fits_single_gpu = file_size > 0 && offer.whole_on.is_some();
             let gpu_idx = offer.primary().unwrap_or_default();
 
