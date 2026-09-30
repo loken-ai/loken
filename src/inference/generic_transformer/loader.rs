@@ -233,6 +233,42 @@ fn concat_rows(parts: &[QTensor], device: &Device) -> crate::tensor::Result<Opti
 }
 
 /// Build a `GenericTransformerLayer` from a raw loaded layer.
+/// The rotary tables the layers of one load share: layers with the same rotary width, base
+/// and scaling on the same device read one table, built once. A table spans the whole
+/// context the model declares, so one per layer is memory the plan never counted.
+#[derive(Default)]
+pub(crate) struct LayerRopes(
+    std::sync::Mutex<HashMap<(String, usize, u32, String, usize), (Tensor, Tensor)>>,
+);
+
+impl LayerRopes {
+    fn table(
+        &self,
+        dim: usize,
+        base: f32,
+        yarn: Option<crate::inference::model::rope::YarnParams>,
+        len: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let key = (
+            format!("{:?}", device.location()),
+            dim,
+            base.to_bits(),
+            format!("{yarn:?}"),
+            len,
+        );
+        let mut tables = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = tables.get(&key) {
+            return Ok(t.clone());
+        }
+        let t = crate::inference::generic_transformer::rope::precomput_freqs_cis_yarn(
+            dim, base, yarn, len, device,
+        )?;
+        tables.insert(key, t.clone());
+        Ok(t)
+    }
+}
+
 fn build_generic_layer(
     raw: RawGenericLayer,
     device: &Device,
@@ -240,6 +276,7 @@ fn build_generic_layer(
     flags: Arc<GenericLayerFlags>,
     cos: &Tensor,
     sin: &Tensor,
+    ropes: &LayerRopes,
     rope_freq_factors: Option<&Tensor>,
 ) -> Result<GenericTransformerLayer> {
     let eps = config.rms_norm_eps;
@@ -754,7 +791,7 @@ fn build_generic_layer(
         } else {
             config.yarn
         };
-        let (c, s) = crate::inference::generic_transformer::rope::precomput_freqs_cis_yarn(
+        ropes.table(
             effective_rope_dim,
             rope_base,
             yarn,
@@ -762,8 +799,7 @@ fn build_generic_layer(
                 .effective_max_context()
                 .max(crate::inference::generic_transformer::rope::ROPE_TABLE_SEQ_LEN),
             device,
-        )?;
-        (c, s)
+        )?
     } else {
         (cos.clone(), sin.clone())
     };
@@ -2554,6 +2590,7 @@ impl GenericHeteroTransformer {
         // same safety profile as the parallel Phase 1 -> build them in parallel (this
         // was the dominant load cost). For a genuine multi-GPU split (mixed contexts)
         // a rayon worker could stripe across both devices, so build sequentially.
+        let layer_ropes = LayerRopes::default();
         let build_one = |raw: RawGenericLayer| -> Result<(GenericTransformerLayer, LayerDevice)> {
             let (device, dev_enum) = match raw.device_kind {
                 DeviceKind::Cuda(idx) => (
@@ -2577,6 +2614,7 @@ impl GenericHeteroTransformer {
                 flags.clone(),
                 cos,
                 sin,
+                &layer_ropes,
                 rope_freq_factors.as_ref(),
             )?;
             // The layer's bytes are on the card now; the file pages that carried them are
