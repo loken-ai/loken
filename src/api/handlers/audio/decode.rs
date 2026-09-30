@@ -660,8 +660,11 @@ pub(crate) async fn audio_generations(
     let music_dit = checkpoint
         .as_deref()
         .filter(|_| is_music)
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().to_string());
+        .and_then(|p| match p.is_dir() {
+            true => crate::inference::media_facts::music_denoiser(p),
+            false => Some(p.to_path_buf()),
+        })
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()));
     {
         let hot = if is_sao {
             crate::inference::model::stable_audio::resident_bytes()

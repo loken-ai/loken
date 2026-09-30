@@ -601,6 +601,24 @@ fn seen() -> &'static std::sync::Mutex<Seen> {
     SEEN.get_or_init(Default::default)
 }
 
+/// The denoiser a music render loads from a checkpoint directory that holds several: among
+/// the GGUF files whose own header declares a music denoiser, the one that declares itself
+/// distilled, then the smallest.
+pub fn music_denoiser(dir: &Path) -> Option<PathBuf> {
+    let mut found: Vec<(bool, u64, PathBuf)> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "gguf"))
+        .filter_map(|p| {
+            let facts = read(&p).filter(|f| f.kind == MediaKind::Music)?;
+            let size = std::fs::metadata(&p).ok()?.len();
+            Some((!facts.distilled, size, p))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next().map(|(_, _, p)| p)
+}
+
 /// What the checkpoint at `path` is: a weights file, or a directory holding a pipeline.
 /// `None` when its files declare no media model this server knows.
 ///
