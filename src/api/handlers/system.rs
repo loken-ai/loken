@@ -348,6 +348,11 @@ pub(crate) async fn stage_performance_endpoint(
             })
         })
         .collect();
+    let (routed, named, unkept, unkept_named) =
+        crate::inference::offload::store::prediction_report();
+    let prediction = serde_json::json!({
+        "routed": routed, "named": named, "unkept": unkept, "unkept_named": unkept_named,
+    });
     let (sums, calls) = stages::snapshot();
     // The share is against the stages that partition a layer-call; the two nested inside
     // the expert block are reported beside them, not counted twice.
@@ -364,6 +369,7 @@ pub(crate) async fn stage_performance_endpoint(
         "expert_misses": expert_misses,
         "expert_hit_rate": if expert_hits + expert_misses > 0 { expert_hits as f64 / (expert_hits + expert_misses) as f64 } else { 0.0 },
         "ws_coverage_top120": ws_cover_120,
+        "prediction": prediction,
         "host_fast_calls": stages::host_paths().0,
         "host_rejects": stages::host_paths().1.iter()
             .map(|(k, v)| serde_json::json!({ "cause": k, "calls": v })).collect::<Vec<_>>(),

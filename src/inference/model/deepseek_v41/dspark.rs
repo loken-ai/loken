@@ -152,6 +152,7 @@ fn stage<S: WeightSource + ?Sized>(g: &S, s: usize, cfg: &DsparkConfig) -> Resul
         swiglu_limit: cfg.swiglu_limit,
         norm_topk: cfg.norm_topk,
         last_routing: std::sync::Mutex::new(Vec::new()),
+        predicted: std::sync::Mutex::new(Vec::new()),
         observer: std::sync::RwLock::new(None),
         offload: std::sync::RwLock::new(None),
     };

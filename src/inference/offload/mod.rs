@@ -17,6 +17,7 @@ pub mod cuda;
 pub mod experts;
 pub mod moe_dispatch;
 pub mod projection;
+pub mod readahead;
 pub mod room;
 pub mod store;
 pub mod streamed;

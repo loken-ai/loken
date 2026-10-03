@@ -60,6 +60,11 @@ pub(crate) fn rope_table(
     ))
 }
 
+/// The layers ahead a decode reads experts for: far enough that a read of one expert, a few
+/// milliseconds, is under way before its layer's gate, near enough that the stream still says
+/// which experts the layer will route to.
+const EXPERT_READAHEAD_DISTANCE: usize = 1;
+
 pub struct DeepseekV41Model {
     embed: Tensor,      // [vocab, dim]
     output: Projection, // [vocab, dim]
@@ -78,6 +83,9 @@ pub struct DeepseekV41Model {
     dim: usize,
     rope_head_dim: usize,
     rms_eps: f32,
+    /// How many layers ahead a decode starts reading the routed experts of, from the stream it
+    /// has by then; 0 reads none ahead. Timing only: the gate still decides the routing.
+    pub expert_readahead: usize,
     // rope regimes: ratio-0 uses base theta with no YaRN; a band layer uses the compressed theta
     // with YaRN from original_seq_len.
     rope_theta: f32,
@@ -379,6 +387,10 @@ impl DeepseekV41Model {
             dim: cfg.d_model,
             rope_head_dim: cfg.rope_head_dim,
             rms_eps: cfg.rms_eps as f32,
+            expert_readahead: std::env::var("LOKEN_EXPERT_READAHEAD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(EXPERT_READAHEAD_DISTANCE),
             rope_theta: cfg.rope_theta,
             compress_rope_theta: cfg.compress_rope_theta,
             rope_factor: cfg.rope_factor,
@@ -968,6 +980,13 @@ impl DeepseekV41Model {
                     *val *= inv;
                 }
                 state.captured[ci] = m;
+            }
+            if self.expert_readahead > 0 {
+                if let Some(Some(ahead)) = self.blocks.get(i + self.expert_readahead) {
+                    crate::inference::offload::stage("expert read-ahead", || {
+                        ahead.advise_experts(&x)
+                    })?;
+                }
             }
             let (cos, sin) = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
                 (&cos0, &sin0)
@@ -2614,6 +2633,31 @@ mod oracle_gate {
                 }
             }
         }
+    }
+
+    /// Reading the next layers' experts ahead only changes when bytes arrive: a streamed decode
+    /// gives the same logits, bit for bit, whether or not it does, and the guesses are scored.
+    #[test]
+    fn expert_readahead_leaves_the_decode_unchanged() {
+        let (mut model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 3);
+        let decode = |model: &DeepseekV41Model| {
+            let mut state = model.new_decode_state();
+            tokens
+                .iter()
+                .map(|&t| vecf_of(&model.forward_decode(t, &mut state).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        model.expert_readahead = 0;
+        let plain = decode(&model);
+        let (routed_before, _, _, _) = crate::inference::offload::store::prediction_report();
+        model.expert_readahead = 1;
+        let ahead = decode(&model);
+        let (routed_after, _, _, _) = crate::inference::offload::store::prediction_report();
+        assert_eq!(plain, ahead, "read-ahead changed a decode's logits");
+        assert!(
+            routed_after > routed_before,
+            "no routing was compared with a guess"
+        );
     }
 
     /// Independent sequences decoded together give each the logits it gives alone: attention runs

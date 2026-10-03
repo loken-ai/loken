@@ -40,6 +40,43 @@ pub fn hitmiss_report() -> (u64, u64) {
     )
 }
 
+static PREDICTED_USED: AtomicU64 = AtomicU64::new(0);
+static ACTUAL_ROUTED: AtomicU64 = AtomicU64::new(0);
+static ACTUAL_UNKEPT: AtomicU64 = AtomicU64::new(0);
+static UNKEPT_PREDICTED: AtomicU64 = AtomicU64::new(0);
+
+/// Record how a guess at a layer's routing compared with the real one: the routed experts, how
+/// many the guess named, and of those not kept (the ones a read waits on) how many it named.
+pub fn note_prediction(
+    actual: impl Iterator<Item = usize>,
+    guess: &[usize],
+    kept: impl Fn(usize) -> bool,
+) {
+    for e in actual {
+        ACTUAL_ROUTED.fetch_add(1, Ordering::Relaxed);
+        let named = guess.contains(&e);
+        if named {
+            PREDICTED_USED.fetch_add(1, Ordering::Relaxed);
+        }
+        if !kept(e) {
+            ACTUAL_UNKEPT.fetch_add(1, Ordering::Relaxed);
+            if named {
+                UNKEPT_PREDICTED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// `(routed, named by the guess, routed and not kept, of those named by the guess)` since start.
+pub fn prediction_report() -> (u64, u64, u64, u64) {
+    (
+        ACTUAL_ROUTED.load(Ordering::Relaxed),
+        PREDICTED_USED.load(Ordering::Relaxed),
+        ACTUAL_UNKEPT.load(Ordering::Relaxed),
+        UNKEPT_PREDICTED.load(Ordering::Relaxed),
+    )
+}
+
 pub fn ws_enable() {
     EXPERT_HITS.store(0, Ordering::Relaxed);
     EXPERT_MISSES.store(0, Ordering::Relaxed);
@@ -311,6 +348,19 @@ impl ExpertStore {
         Ok(expert)
     }
 
+    /// Start reading expert `id` in when it is not kept, counting no request and admitting
+    /// nothing: the read-ahead for an expert the next block is expected to route to.
+    pub fn advise(&self, id: usize, readers: usize, on_card: &dyn Fn(&Expert) -> bool) {
+        if self.is_kept(id) {
+            return;
+        }
+        if let Ok(e) = self.loader.build(id) {
+            if !on_card(&e) {
+                super::readahead::submit(Arc::new(e), readers);
+            }
+        }
+    }
+
     /// One request for expert `id` by one token: noted, then fetched and kept.
     pub fn get(&self, id: usize) -> Result<Arc<Expert>> {
         self.note_uses(&[(id, 1, 0)], 1);
@@ -404,6 +454,21 @@ impl ExpertSet {
         match self {
             ExpertSet::Resident(_) => Ok(()),
             ExpertSet::Streamed(s) => s.sweep(),
+        }
+    }
+
+    /// Start reading expert `id` in ahead of its use; a no-op when resident or kept.
+    pub fn advise(&self, id: usize, readers: usize, on_card: &dyn Fn(&Expert) -> bool) {
+        if let ExpertSet::Streamed(s) = self {
+            s.advise(id, readers, on_card);
+        }
+    }
+
+    /// Whether expert `id` is held in the kept tier; a resident set holds every one.
+    pub fn is_kept(&self, id: usize) -> bool {
+        match self {
+            ExpertSet::Resident(_) => true,
+            ExpertSet::Streamed(s) => s.is_kept(id),
         }
     }
 

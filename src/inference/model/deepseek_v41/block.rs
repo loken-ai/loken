@@ -203,6 +203,17 @@ impl Block {
         Ok((out, fm.pre))
     }
 
+    /// Read ahead the routed experts this block is expected to use for the token whose stream
+    /// reaches the layer below as `x` [1, 1, hc, d]: the FFN input is approximated by the
+    /// stream collapsed with this block's own mixes, which skips the attention in between.
+    pub fn advise_experts(&self, x: &Tensor) -> Result<()> {
+        let am = self.attn_mixes(x)?;
+        let xin = rms_norm(&hc_pre(x, &am.pre)?, &self.ffn_norm, self.norm_eps)?;
+        let dim = xin.elem_count();
+        self.moe.predict_and_advise(&xin.reshape((1, dim))?)?;
+        Ok(())
+    }
+
     /// Decode one token. Same structure as `forward_prefill` at s == 1 - the hyper-connections,
     /// norms and MoE are per-token - but attention reads from and appends to `cache`. `x` is
     /// [1, 1, hc, d], `pre_mix` [1, hc].

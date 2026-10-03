@@ -40,6 +40,8 @@ pub struct Moe {
     /// The last forward's routing, per token: the chosen experts with their weights, heaviest
     /// first. Observability for the cost of each expert read against what it contributes.
     pub last_routing: std::sync::Mutex<Vec<Vec<(usize, f32)>>>,
+    /// The experts the last `predict_and_advise` named, compared with the routing that follows.
+    pub predicted: std::sync::Mutex<Vec<usize>>,
     /// Told what every forward routes where, when a calibration run asks; `None` otherwise, and
     /// then the forward does no extra work.
     pub observer: std::sync::RwLock<Option<std::sync::Arc<ExpertObserver>>>,
@@ -67,6 +69,60 @@ impl Moe {
         self.experts.set_capacity(slots);
     }
 
+    /// Whether a card already holds an expert: false for every expert when no card does.
+    fn on_card_probe(&self) -> impl Fn(&Expert) -> bool {
+        let offload = self.offload.read().unwrap().clone();
+        move |e: &Expert| {
+            offload
+                .as_ref()
+                .and_then(|o| o.on_card.as_ref())
+                .is_some_and(|is_on| is_on(e))
+        }
+    }
+
+    /// The top-k experts of one token's gate row by biased score, with the unbiased weights
+    /// (normalised over the chosen when the gate asks), before the route scale.
+    fn select(&self, row: &[f32], bias: &[f32]) -> (Vec<usize>, Vec<f32>) {
+        let scores: Vec<f32> = row
+            .iter()
+            .map(|&z| Self::softplus(z / self.gate_temp).sqrt())
+            .collect();
+        let mut order: Vec<usize> = (0..self.n_routed).collect();
+        order.sort_by(|&a, &b| {
+            (scores[b] + bias[b])
+                .partial_cmp(&(scores[a] + bias[a]))
+                .unwrap()
+        });
+        let chosen: Vec<usize> = order[..self.n_activated].to_vec();
+        let mut w: Vec<f32> = chosen.iter().map(|&e| scores[e]).collect();
+        if self.norm_topk && self.n_activated > 1 {
+            let s: f32 = w.iter().sum::<f32>() + 1e-20;
+            for wi in w.iter_mut() {
+                *wi /= s;
+            }
+        }
+        (chosen, w)
+    }
+
+    /// The experts this block is expected to route one token `x` [1, dim] to, from an input that
+    /// stands in for the real one. A streamed set starts reading the ones it does not keep, so
+    /// their bytes are in memory when the block runs; the real gate still decides, and a wrong
+    /// guess costs only a read. Returns the guess.
+    pub fn predict_and_advise(&self, x: &Tensor) -> Result<Vec<usize>> {
+        if matches!(self.experts, ExpertSet::Resident(_)) {
+            return Ok(Vec::new());
+        }
+        let raw = crate::inference::offload::linear(x, &self.gate_weight)?.to_vec2::<f32>()?;
+        let bias = self.gate_bias.flatten_all()?.to_vec1::<f32>()?;
+        let (chosen, _) = self.select(&raw[0], &bias);
+        let on_card = self.on_card_probe();
+        for &e in &chosen {
+            self.experts.advise(e, self.n_activated, &on_card);
+        }
+        *self.predicted.lock().unwrap() = chosen.clone();
+        Ok(chosen)
+    }
+
     /// `x` is [b, s, dim]; returns [b, s, dim].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dims = x.dims().to_vec();
@@ -83,25 +139,7 @@ impl Moe {
         let mut assign: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.n_routed];
         let mut routing: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         for (t, row) in raw.iter().enumerate() {
-            let scores: Vec<f32> = row
-                .iter()
-                .map(|&z| Self::softplus(z / self.gate_temp).sqrt())
-                .collect();
-            // Top-k experts by biased score; the weights are the unbiased scores at those experts.
-            let mut order: Vec<usize> = (0..self.n_routed).collect();
-            order.sort_by(|&a, &b| {
-                (scores[b] + bias[b])
-                    .partial_cmp(&(scores[a] + bias[a]))
-                    .unwrap()
-            });
-            let chosen = &order[..self.n_activated];
-            let mut w: Vec<f32> = chosen.iter().map(|&e| scores[e]).collect();
-            if self.norm_topk && self.n_activated > 1 {
-                let s: f32 = w.iter().sum::<f32>() + 1e-20;
-                for wi in w.iter_mut() {
-                    *wi /= s;
-                }
-            }
+            let (chosen, w) = self.select(row, &bias);
             for (slot, &e) in chosen.iter().enumerate() {
                 assign[e].push((t, w[slot] * self.route_scale));
             }
@@ -132,6 +170,16 @@ impl Moe {
                 (e, tokens.len() as u64, last)
             })
             .collect();
+        if n == 1 {
+            let guess = std::mem::take(&mut *self.predicted.lock().unwrap());
+            if !guess.is_empty() {
+                crate::inference::offload::store::note_prediction(
+                    uses.iter().map(|&(e, _, _)| e),
+                    &guess,
+                    |e| self.experts.is_kept(e),
+                );
+            }
+        }
         self.experts.prefetch(&uses, n as u64)?;
         let active: Vec<usize> = uses.iter().map(|&(e, _, _)| e).collect();
         {
@@ -424,6 +472,7 @@ mod tests {
             swiglu_limit: SWIGLU_LIMIT,
             norm_topk: true,
             last_routing: std::sync::Mutex::new(Vec::new()),
+            predicted: std::sync::Mutex::new(Vec::new()),
             observer: std::sync::RwLock::new(None),
             offload: std::sync::RwLock::new(None),
         }

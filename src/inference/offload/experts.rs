@@ -57,6 +57,26 @@ impl Expert {
         Some((spans[0].0, last.0 + last.1 - spans[0].0))
     }
 
+    /// Read the three projections into memory now, returning once they are there: the blocking
+    /// form of `will_need`, for a thread whose job is to wait on the read.
+    pub fn populate(&self) {
+        #[cfg(unix)]
+        {
+            // MADV_POPULATE_READ: fault the range in as a read would, without mapping it for a
+            // caller to touch.
+            const POPULATE_READ: libc::c_int = 22;
+            if let Some((start, len)) = self.storage_unit() {
+                crate::tensor::mapped::advise_span(start, len, POPULATE_READ, false);
+                return;
+            }
+            for w in [&self.w1, &self.w3, &self.w2] {
+                if let Some((start, len)) = w.storage_span() {
+                    crate::tensor::mapped::advise_span(start, len, POPULATE_READ, false);
+                }
+            }
+        }
+    }
+
     /// Start reading the three projections in: one request over the unit when the expert is
     /// stored as one, a request per projection otherwise.
     pub fn will_need(&self) {
