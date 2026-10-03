@@ -68,14 +68,21 @@ pub(crate) fn run_routed(
                 .filter(|&i| !is_on(&active_refs[i]))
                 .collect();
             done = std::thread::scope(|s| {
-                let g = s.spawn(|| rb(active, &fetch, &xv[0], swiglu_limit));
+                let g = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let r = rb(active, &fetch, &xv[0], swiglu_limit);
+                    crate::inference::offload::prof_record(
+                        "moe cards block",
+                        t.elapsed().as_nanos() as u64,
+                    );
+                    r
+                });
+                let cpu_t = std::time::Instant::now();
                 let miss_refs: Vec<Arc<Expert>> =
                     cpu_pos.iter().map(|&i| active_refs[i].clone()).collect();
-                if let Some(outs) = crate::inference::offload::cpu_experts::batched(
-                    &miss_refs,
-                    &xv[0],
-                    swiglu_limit,
-                ) {
+                if let Some(outs) =
+                    crate::inference::offload::cpu_experts::batched(&miss_refs, &xv[0], swiglu_limit)
+                {
                     for ((&i, out), expert) in cpu_pos.iter().zip(outs).zip(miss_refs) {
                         cpu_side[i] = Some(Ok((Vec::new(), out, Some(expert))));
                     }
@@ -95,6 +102,10 @@ pub(crate) fn run_routed(
                         cpu_side[i] = Some(r);
                     }
                 }
+                crate::inference::offload::prof_record(
+                    "moe host misses",
+                    cpu_t.elapsed().as_nanos() as u64,
+                );
                 g.join().unwrap()
             });
         } else {

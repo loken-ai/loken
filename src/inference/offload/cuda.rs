@@ -407,6 +407,7 @@ impl Card {
         // Sent outside the tier's lock, and a driver that panics on the allocation rather than
         // erring is a card that declined: the room goes back and the host runs the expert.
         let stream = self.dev.stream();
+        let upload_started = std::time::Instant::now();
         let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Some((
                 stream.clone_htod(gate.as_ref()).ok()?,
@@ -414,6 +415,10 @@ impl Card {
                 stream.clone_htod(down.as_ref()).ok()?,
             ))
         }));
+        super::prof_record(
+            "card expert upload",
+            upload_started.elapsed().as_nanos() as u64,
+        );
         let Ok(Some((gate_d, up_d, down_d))) = sent else {
             self.give_room(total);
             self.decline(
