@@ -66,9 +66,15 @@ pub(crate) const PREFILL_CHUNK_TOKENS_MIN: usize = 32;
 pub(crate) static ADAPTIVE_PREFILL_CHUNK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Free card bytes when the request that shrank [`ADAPTIVE_PREFILL_CHUNK`] began: the remembered
+/// chunk stands only until the cards hold more than that by what the larger chunk needs.
+pub(crate) static ADAPTIVE_PREFILL_FREE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Reset the adaptive prefill chunk memory (called on model load/unload).
 pub(crate) fn reset_adaptive_prefill_chunk() {
     ADAPTIVE_PREFILL_CHUNK.store(0, std::sync::atomic::Ordering::Relaxed);
+    ADAPTIVE_PREFILL_FREE.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 mod params;
 pub use params::*;

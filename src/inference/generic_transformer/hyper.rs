@@ -212,10 +212,10 @@ pub fn grouped_rms(
 
 /// Largest chunk a prompt is cut into, however many experts a model has.
 const CHUNK_CEILING: usize = 8192;
-/// Buffers of `streams x dim` f32 a wide layer keeps live per token of a chunk: the residual and, at
-/// a combine, the product it adds and the new residual (the mixers' temporaries are bounded apart,
-/// by [`mixer_block_rows`]).
-const WIDE_LIVE_BUFFERS: usize = 3;
+/// Buffers of `streams x dim` f32 a wide layer keeps live per token of a chunk: the residual, at a
+/// combine the product it adds and the new residual, and the sublayers' own activations counted at
+/// the same width (the mixers' temporaries are bounded apart, by [`mixer_block_rows`]).
+const WIDE_LIVE_BUFFERS: usize = 5;
 /// Buffers of `streams x dim` f32 a mixer holds for the rows of one block: the cast residual, the
 /// squared copy, the normed copy, the scaled copy, the gate, the gated product and the low-rank
 /// activations.

@@ -18,7 +18,8 @@ use crate::inference::model::moondream::quantized as moondream;
 use crate::tensor::{Device, Tensor};
 
 use crate::inference::engine::llm_engine::{
-    VisionTower, ADAPTIVE_PREFILL_CHUNK, PREFILL_CHUNK_TOKENS, PREFILL_CHUNK_TOKENS_MIN,
+    VisionTower, ADAPTIVE_PREFILL_CHUNK, ADAPTIVE_PREFILL_FREE, PREFILL_CHUNK_TOKENS,
+    PREFILL_CHUNK_TOKENS_MIN,
 };
 
 /// Boxed backend as stored in `LoadedModelState`.
@@ -239,12 +240,25 @@ pub(crate) trait ModelBackend: Send {
             let sh = self.prefill_shape();
             (sh.bytes_per_token, sh.fixed_bytes)
         };
+        let free_now = crate::inference::place::vram_manager::free_total() as usize;
         let first = if seq_len <= chunk_start {
             seq_len
         } else {
             match ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed) {
                 0 => chunk_start,
-                remembered => remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk_start),
+                remembered => {
+                    let remembered = remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk_start);
+                    // The shrunk chunk stands until the cards hold more than when it shrank
+                    // by what the larger chunk needs on top.
+                    let gain =
+                        free_now.saturating_sub(ADAPTIVE_PREFILL_FREE.load(Ordering::Relaxed));
+                    if gain >= (chunk_start - remembered) * per_token.max(1) {
+                        ADAPTIVE_PREFILL_CHUNK.store(0, Ordering::Relaxed);
+                        chunk_start
+                    } else {
+                        remembered
+                    }
+                }
             }
         };
         let mut replay = false;
@@ -271,8 +285,11 @@ pub(crate) trait ModelBackend: Send {
             },
         )?;
         // Remember a chunk that had to shrink, so later requests start at it.
-        if chunk_tokens < chunk_start && chunk_tokens < seq_len {
-            ADAPTIVE_PREFILL_CHUNK.store(chunk_tokens, Ordering::Relaxed);
+        if chunk_tokens < chunk_start
+            && chunk_tokens < seq_len
+            && ADAPTIVE_PREFILL_CHUNK.swap(chunk_tokens, Ordering::Relaxed) == 0
+        {
+            ADAPTIVE_PREFILL_FREE.store(free_now, Ordering::Relaxed);
         }
         Ok(logits)
     }
