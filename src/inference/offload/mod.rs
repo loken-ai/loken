@@ -123,7 +123,38 @@ pub trait HcStream: Send {
     fn replace(&mut self, x: &[f32]) -> Result<()>;
 }
 
+/// A prompt's attention from the shared query latent on, whole (see `Offload::prefill_attention`).
+pub struct PrefillAttn<'a> {
+    /// The query latent [n, q_lora] and the projection of it to the heads.
+    pub qr: &'a [f32],
+    pub wq_b: &'a Projection,
+    /// The rope tables of the queries' positions, [n, rd / 2].
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+    pub heads: usize,
+    pub hd: usize,
+    pub rd: usize,
+    /// The window and compressed keys [rows, hd], the per-head sink, and for each query the `topk`
+    /// key rows it reads (negative: none).
+    pub kv: &'a [f32],
+    pub sink: &'a [f32],
+    pub idxs: &'a [i32],
+    pub topk: usize,
+    pub scale: f32,
+    /// The grouped output projection.
+    pub wo_a: &'a Projection,
+    pub wo_b: &'a Projection,
+    pub groups: usize,
+}
+
 pub trait Offload: Send + Sync {
+    /// A prompt's attention from the query latent on - queries from the latent, rotated, sparse
+    /// attention with the sink, rotated back, the grouped output projection - run whole where the
+    /// weights and keys are, `[n, dim]`. `None` to run it step by step here.
+    fn prefill_attention(&self, _a: &PrefillAttn) -> Option<Result<Vec<f32>>> {
+        None
+    }
+
     /// Hold `x` [n, hc, d] on a card, the one with the most room, for a prompt's hyper-connection
     /// steps. `None` when no card has room or the offload keeps no stream.
     fn hc_stream(&self, _x: &[f32], _hc: usize, _d: usize) -> Option<Box<dyn HcStream>> {

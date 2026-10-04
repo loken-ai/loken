@@ -594,10 +594,6 @@ impl BandAttention {
         let qr = crate::inference::offload::stage("attn q_a", || {
             rms_norm(&self.wq_a.apply(&x2)?, &self.q_norm, self.eps)
         })?;
-        let q = crate::inference::offload::stage("attn q_b", || {
-            self.wq_b.apply(&qr)?.reshape((b, s, nh, hd))
-        })?;
-        let q = crate::inference::offload::stage("attn rope", || rope_partial(&q, cos, sin, rd))?;
 
         // Window KV (fp8 round trip): the restored window's rows, then this pass's.
         let kv = crate::inference::offload::stage("attn kv", || {
@@ -757,6 +753,45 @@ impl BandAttention {
             }
         }
         let sink = self.attn_sink.flatten_all()?.to_vec1::<f32>()?;
+        // Where the offload keeps the weights and keys, the attention from the latent on runs there
+        // whole: the queries never reach the host.
+        if b == 1 {
+            if let Some(off) = crate::inference::offload::current() {
+                let qrv = super::hyper_connections::dense_f32(&qr)?;
+                let kvv = super::hyper_connections::dense_f32(&kv_all)?;
+                let (cos_c, sin_c) = (cos.contiguous()?, sin.contiguous()?);
+                let (cv, sv) = (
+                    super::hyper_connections::dense_f32(&cos_c)?,
+                    super::hyper_connections::dense_f32(&sin_c)?,
+                );
+                let fused = crate::inference::offload::stage("attention on the card", || {
+                    off.prefill_attention(&crate::inference::offload::PrefillAttn {
+                        qr: &qrv,
+                        wq_b: &self.wq_b,
+                        cos: &cv,
+                        sin: &sv,
+                        heads: nh,
+                        hd,
+                        rd,
+                        kv: &kvv,
+                        sink: &sink,
+                        idxs: &idxs,
+                        topk,
+                        scale: self.softmax_scale(),
+                        wo_a: &self.wo_a,
+                        wo_b: &self.wo_b,
+                        groups: self.o_groups,
+                    })
+                });
+                if let Some(y) = fused {
+                    return Tensor::from_vec(y?, (b, s, dim), &Device::Cpu);
+                }
+            }
+        }
+        let q = crate::inference::offload::stage("attn q_b", || {
+            self.wq_b.apply(&qr)?.reshape((b, s, nh, hd))
+        })?;
+        let q = crate::inference::offload::stage("attn rope", || rope_partial(&q, cos, sin, rd))?;
         let o = crate::inference::offload::stage("sparse attention", || {
             sparse_attn(&q, &kv_all, &sink, &idxs, topk, self.softmax_scale())
         })?;
@@ -1038,6 +1073,136 @@ mod tests {
         );
         for (c, g) in cpu.iter().zip(&card) {
             assert!((c - g).abs() <= 1e-5 * c.abs().max(1.0), "{g} vs {c}");
+        }
+    }
+
+    /// A prompt's attention whole on the card - queries from the latent, rotated, sparse attention
+    /// with the sink, rotated back, the grouped output projection - equals the same steps on the
+    /// host over the expanded weights, to rounding, in one chunk of queries, in several of an
+    /// uneven size, and with the weights expanded a few rows at a time.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_prompts_attention_on_the_card_matches_the_host() {
+        use crate::tensor::cuda::{
+            gpu_prefill_attention_with, CudaDevice, PrefillAttention, QuantWeight,
+        };
+        use crate::tensor::quantized::GgmlDType;
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card attention is NOT covered by this run");
+            return;
+        };
+        let (n, q_lora, h, hd, rd, groups, r, keys, topk) = (
+            37usize, 256usize, 4usize, 128usize, 16usize, 2usize, 128usize, 50usize, 9usize,
+        );
+        let (p, dim) = (h * hd / groups, 256usize);
+        let wave = |len: usize, k: f32, amp: f32| -> Vec<f32> {
+            (0..len).map(|i| ((i as f32) * k).sin() * amp).collect()
+        };
+        let enc = |v: &[f32]| {
+            let b = crate::tensor::quant_cpu::from_float_bytes(GgmlDType::Q6K, v).unwrap();
+            let mut d = vec![0f32; v.len()];
+            crate::tensor::quant_cpu::to_float_bytes(GgmlDType::Q6K, &b, &mut d).unwrap();
+            (b, d)
+        };
+        let (wq_b, wq_d) = enc(&wave(h * hd * q_lora, 0.013, 0.1));
+        let (wo_a, wa_d) = enc(&wave(groups * r * p, 0.017, 0.1));
+        let (wo_b, wb_d) = enc(&wave(dim * groups * r, 0.019, 0.1));
+        let qr = wave(n * q_lora, 0.29, 1.0);
+        let kv = wave(keys * hd, 0.11, 1.0);
+        let sink = vec![0.3f32, -0.2, 1.1, 0.0];
+        let scale = 0.25f32;
+        let half = rd / 2;
+        let cos: Vec<f32> = (0..n * half).map(|i| ((i as f32) * 0.05).cos()).collect();
+        let sin: Vec<f32> = (0..n * half).map(|i| ((i as f32) * 0.05).sin()).collect();
+        let mut idxs: Vec<i32> = window_idxs(1, n, topk, 0);
+        for (i, v) in idxs.iter_mut().enumerate() {
+            if i % 5 == 4 {
+                *v = ((i * 7) % keys) as i32;
+            }
+        }
+        // The host: each step as the model's host path runs it.
+        let mut q = vec![0f32; n * h * hd];
+        for t in 0..n {
+            for o in 0..h * hd {
+                q[t * h * hd + o] = (0..q_lora)
+                    .map(|c| qr[t * q_lora + c] * wq_d[o * q_lora + c])
+                    .sum();
+            }
+        }
+        let tab = |v: &[f32]| Tensor::from_vec(v.to_vec(), (n, half), &Device::Cpu).unwrap();
+        let (ct, st) = (tab(&cos), tab(&sin));
+        let qt = Tensor::from_vec(q, (1, n, h, hd), &Device::Cpu).unwrap();
+        let qt = rope_partial(&qt, &ct, &st, rd).unwrap();
+        let kvt = Tensor::from_vec(kv.clone(), (1, keys, hd), &Device::Cpu).unwrap();
+        let o = sparse_attn(&qt, &kvt, &sink, &idxs, topk, scale).unwrap();
+        let o = rope_partial(&o, &ct, &st.neg().unwrap(), rd).unwrap();
+        let ov = o.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut wide = vec![0f32; n * groups * r];
+        for t in 0..n {
+            for g in 0..groups {
+                for j in 0..r {
+                    wide[t * groups * r + g * r + j] = (0..p)
+                        .map(|c| ov[t * h * hd + g * p + c] * wa_d[(g * r + j) * p + c])
+                        .sum();
+                }
+            }
+        }
+        let mut want = vec![0f32; n * dim];
+        for t in 0..n {
+            for o in 0..dim {
+                want[t * dim + o] = (0..groups * r)
+                    .map(|c| wide[t * groups * r + c] * wb_d[o * groups * r + c])
+                    .sum();
+            }
+        }
+        let args = PrefillAttention {
+            qr: &qr,
+            wq_b: QuantWeight {
+                dtype: GgmlDType::Q6K,
+                bytes: &wq_b,
+                rows: h * hd,
+                inp: q_lora,
+            },
+            cos: &cos,
+            sin: &sin,
+            heads: h,
+            hd,
+            rd,
+            kv: &kv,
+            sink: &sink,
+            idxs: &idxs,
+            topk,
+            scale,
+            wo_a: QuantWeight {
+                dtype: GgmlDType::Q6K,
+                bytes: &wo_a,
+                rows: groups * r,
+                inp: p,
+            },
+            wo_b: QuantWeight {
+                dtype: GgmlDType::Q6K,
+                bytes: &wo_b,
+                rows: dim,
+                inp: groups * r,
+            },
+            groups,
+        };
+        let range = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for (chunk, tile) in [
+            (usize::MAX, 96usize << 20),
+            (8, 96 << 20),
+            (13, 4 * 256 * 4 * 64),
+        ] {
+            let got = gpu_prefill_attention_with(&dev, &args, chunk, tile).unwrap();
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 2e-3 * range.max(1.0),
+                "chunk {chunk} tile {tile}: worst {worst} of range {range}"
+            );
         }
     }
 }

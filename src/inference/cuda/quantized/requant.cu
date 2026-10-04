@@ -1281,6 +1281,41 @@ extern "C" __global__ void hc_post_f32(
     }
 }
 
+// Rotate the last `rd` values of each head of `x` [n, h, hd] in place, pair (2j, 2j + 1) by the angle
+// whose cosine and sine are `cs[t, j]` and `sn[t, j]` for token t: the same float operations as the
+// host's rope. One pair per thread.
+extern "C" __global__ void rope_tail_f32(
+        float * __restrict__ x, const float * __restrict__ cs, const float * __restrict__ sn,
+        const long total, const long h, const long hd, const long rd) {
+    const long i = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
+    if (i >= total) return;
+    const long half = rd / 2;
+    const long j = i % half, head = (i / half) % h, t = i / (half * h);
+    float * p = x + (t * h + head) * hd + hd - rd + 2 * j;
+    const float c = cs[t * half + j], s = sn[t * half + j];
+    const float x0 = p[0], x1 = p[1];
+    p[0] = x0 * c - x1 * s;
+    p[1] = x0 * s + x1 * c;
+}
+
+// Columns `off .. off + w` of `dst` [n, dst_w] set from `src` [n, w], one value per thread.
+extern "C" __global__ void put_cols_f32(
+        const float * __restrict__ src, float * __restrict__ dst,
+        const long total, const long w, const long dst_w, const long off) {
+    const long i = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
+    if (i >= total) return;
+    dst[(i / w) * dst_w + off + i % w] = src[i];
+}
+
+// Columns `off .. off + w` of `src` [n, src_w] copied into `dst` [n, w], one value per thread.
+extern "C" __global__ void take_cols_f32(
+        const float * __restrict__ src, float * __restrict__ dst,
+        const long total, const long w, const long src_w, const long off) {
+    const long i = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
+    if (i >= total) return;
+    dst[i] = src[(i / w) * src_w + off + i % w];
+}
+
 // Rows of `xin` [n, dim] named by `idx`, one value per thread: an expert's input tokens.
 extern "C" __global__ void gather_rows_f32(
         const float * __restrict__ xin, const unsigned int * __restrict__ idx,

@@ -147,6 +147,8 @@ impl Moe {
         let dims = x.dims().to_vec();
         let n: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((n, self.dim))?;
+        // The rows as they lie: nothing copies them unless the tensor is not laid out so.
+        let flat = super::hyper_connections::dense_f32(&x2)?;
 
         use crate::inference::offload::stage;
         // Gate: sqrt-softplus scores, top-k by score+bias, weights from the unbiased scores.
@@ -253,12 +255,11 @@ impl Moe {
                 // the activation crosses once instead of once per projection; the host path serves
                 // a decline or a batch a card has no room for.
                 if let Some(off) = crate::inference::offload::current() {
-                    let xv = x2.flatten_all()?.to_vec1::<f32>()?;
                     if let Some(res) = off.expert_dev(
                         &self.shared.w1,
                         &self.shared.w3,
                         &self.shared.w2,
-                        &xv,
+                        &flat,
                         self.swiglu_limit,
                     ) {
                         return Ok(res?.chunks(self.dim).map(|c| c.to_vec()).collect());
@@ -271,11 +272,10 @@ impl Moe {
         } else {
             vec![vec![0f32; self.dim]; n]
         };
-        let xv = x2.to_vec2::<f32>()?;
+        let xv: Vec<&[f32]> = flat.chunks(self.dim).collect();
         let observer = self.observer.read().unwrap().clone();
         if let Some(obs) = &observer {
-            let all: Vec<f32> = xv.iter().flatten().copied().collect();
-            obs(None, &all, &[], &[]);
+            obs(None, &flat, &[], &[]);
         }
         let offload = self.offload.read().unwrap().clone();
         let rows_of = |e: usize| -> Vec<f32> {
@@ -291,16 +291,9 @@ impl Moe {
             (Some(off), true, true)
                 if n > crate::inference::offload::moe_dispatch::VERIFY_BATCH_MAX_ROWS =>
             {
-                off.device.as_ref().and_then(|d| {
-                    let flat = x2
-                        .contiguous()
-                        .ok()?
-                        .flatten_all()
-                        .ok()?
-                        .to_vec1::<f32>()
-                        .ok()?;
-                    (d.begin)(&flat, self.dim).map(|ctx| (d, ctx))
-                })
+                off.device
+                    .as_ref()
+                    .and_then(|d| (d.begin)(&flat, self.dim).map(|ctx| (d, ctx)))
             }
             _ => None,
         };

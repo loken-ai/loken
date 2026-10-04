@@ -112,7 +112,7 @@ pub(crate) fn run_routed(
     active: &[usize],
     active_refs: &[Arc<Expert>],
     assign: &[Vec<(usize, f32)>],
-    xv: &[Vec<f32>],
+    xv: &[&[f32]],
     n: usize,
     dim: usize,
     swiglu_limit: f32,
@@ -165,7 +165,7 @@ pub(crate) fn run_routed(
             done = std::thread::scope(|s| {
                 let g = s.spawn(|| {
                     let t = std::time::Instant::now();
-                    let r = rb(active, &fetch, &xv[0], swiglu_limit);
+                    let r = rb(active, &fetch, xv[0], swiglu_limit);
                     crate::inference::offload::prof_record(
                         "moe cards block",
                         t.elapsed().as_nanos() as u64,
@@ -176,7 +176,7 @@ pub(crate) fn run_routed(
                 let miss_refs: Vec<Arc<Expert>> =
                     cpu_pos.iter().map(|&i| active_refs[i].clone()).collect();
                 if let Some(outs) =
-                    crate::inference::offload::cpu_experts::batched(&miss_refs, &xv[0], swiglu_limit)
+                    crate::inference::offload::cpu_experts::batched(&miss_refs, xv[0], swiglu_limit)
                 {
                     for ((&i, out), expert) in cpu_pos.iter().zip(outs).zip(miss_refs) {
                         cpu_side[i] = Some(Ok((Vec::new(), out, Some(expert))));
@@ -208,7 +208,7 @@ pub(crate) fn run_routed(
                             .map(|&i| (active[i], active_refs[i].clone()))
                             .collect(),
                         later.iter().map(|&i| weight_of(i)).collect(),
-                        xv[0].clone(),
+                        xv[0].to_vec(),
                         swiglu_limit,
                     ));
                 }
@@ -216,7 +216,7 @@ pub(crate) fn run_routed(
                 g.join().unwrap()
             });
         } else {
-            done = rb(active, &fetch, &xv[0], swiglu_limit);
+            done = rb(active, &fetch, xv[0], swiglu_limit);
         }
     } else {
         // A small batch is a speculative verify, not a prompt's prefill. Its resident experts run
@@ -238,7 +238,7 @@ pub(crate) fn run_routed(
                     for &(t, _w) in &assign[e] {
                         inst_of[i].push(eidx.len());
                         eidx.push(e);
-                        xrows.push(&xv[t]);
+                        xrows.push(xv[t]);
                     }
                 }
                 let rm = off.run_multi.as_ref().unwrap();

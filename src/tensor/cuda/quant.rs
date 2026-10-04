@@ -3,6 +3,7 @@
 //! `use super::*` keeps the names its items referred to before the split in reach.
 
 use super::*;
+use cudarc::driver::CudaView;
 
 /// F32 activations -> q8_1 blocks (row padded to MATRIX_ROW_PADDING=512),
 /// the input format every mmvq GEMV kernel consumes.
@@ -946,12 +947,12 @@ pub fn gpu_quant_linear_tiled(
 fn dequantise_f32(
     dev: &CudaDevice,
     dtype: crate::tensor::quantized::GgmlDType,
-    blob: &CudaSlice<u8>,
+    blob: &CudaView<'_, u8>,
     total: usize,
 ) -> Result<CudaSlice<f32>> {
     let stream = dev.stream();
     Ok(match dtype {
-        crate::tensor::quantized::GgmlDType::Q8_0 => dequantize_q8_0_f32(dev, blob, total)?,
+        crate::tensor::quantized::GgmlDType::Q8_0 => dequantize_q8_0_view(dev, blob, total)?,
         crate::tensor::quantized::GgmlDType::Q2K => {
             let dst = with_oom_retry(dev, "dequant q2_K", || unsafe {
                 stream.alloc::<f32>(total)
@@ -1057,7 +1058,7 @@ fn gpu_quant_linear_once(
         upload_started.elapsed().as_nanos() as u64,
     );
     let launch_started = std::time::Instant::now();
-    let w = dequantise_f32(dev, dtype, &blob, total)?;
+    let w = dequantise_f32(dev, dtype, &blob.as_view(), total)?;
     crate::inference::offload::prof_record(
         "q linear dequant launch",
         launch_started.elapsed().as_nanos() as u64,
@@ -1234,9 +1235,9 @@ pub fn gpu_expert_tokens(
                     )));
                 }
                 let blob = staging.upload(dev, bytes)?;
-                dequantise_f32(dev, *dtype, &blob, total)?
+                dequantise_f32(dev, *dtype, &blob.as_view(), total)?
             }
-            ExpertWeight::Card(blob) => dequantise_f32(dev, *dtype, blob, total)?,
+            ExpertWeight::Card(blob) => dequantise_f32(dev, *dtype, &blob.as_view(), total)?,
         };
         matmul_nt_f32(dev, input, &w, 1, n, inp, out)
     };
@@ -1415,9 +1416,9 @@ pub fn gpu_expert_into_layer(
                     )));
                 }
                 let blob = staging.upload(dev, bytes)?;
-                dequantise_f32(dev, *dtype, &blob, total)?
+                dequantise_f32(dev, *dtype, &blob.as_view(), total)?
             }
-            ExpertWeight::Card(blob) => dequantise_f32(dev, *dtype, blob, total)?,
+            ExpertWeight::Card(blob) => dequantise_f32(dev, *dtype, &blob.as_view(), total)?,
         };
         matmul_nt_f32(dev, input, &w, 1, n, inp, out)
     };
@@ -1460,6 +1461,322 @@ pub fn gpu_layer_sum(dev: &CudaDevice, layer: &LayerBuffers) -> Result<Vec<f32>>
     dev.stream()
         .clone_dtoh(&layer.y)
         .map_err(|e| Error(format!("layer sum download: {e}")))
+}
+
+/// A quantised weight [rows, inp] as it lies in the file, `dtype` its format.
+pub struct QuantWeight<'a> {
+    pub dtype: crate::tensor::quantized::GgmlDType,
+    pub bytes: &'a [u8],
+    pub rows: usize,
+    pub inp: usize,
+}
+
+/// What a prompt's attention needs on the card from the shared query latent on.
+pub struct PrefillAttention<'a> {
+    /// The query latent [n, q_lora] and the projection of it to the heads, [heads * hd, q_lora].
+    pub qr: &'a [f32],
+    pub wq_b: QuantWeight<'a>,
+    /// The rope tables of the queries' positions, [n, rd / 2].
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+    pub heads: usize,
+    pub hd: usize,
+    pub rd: usize,
+    /// The window and compressed keys [rows, hd], the per-head sink, and for each query the
+    /// `topk` key rows it reads (negative: none).
+    pub kv: &'a [f32],
+    pub sink: &'a [f32],
+    pub idxs: &'a [i32],
+    pub topk: usize,
+    pub scale: f32,
+    /// The grouped output projection: `wo_a` [groups * o_lora, heads * hd / groups], then `wo_b`
+    /// [dim, groups * o_lora].
+    pub wo_a: QuantWeight<'a>,
+    pub wo_b: QuantWeight<'a>,
+    pub groups: usize,
+}
+
+/// `x` [n, inp] through rows `row0 .. row0 + rows` of the weight held on the card as `blob`, as
+/// `[n, rows]`: the rows are expanded to f32 a tile at a time, so a weight wider than the card has
+/// room for still goes through.
+fn linear_tiled(
+    dev: &CudaDevice,
+    tile_bytes: usize,
+    dtype: crate::tensor::quantized::GgmlDType,
+    blob: &CudaSlice<u8>,
+    (row0, rows, inp): (usize, usize, usize),
+    x: &CudaSlice<f32>,
+    n: usize,
+) -> Result<CudaSlice<f32>> {
+    let stream = dev.stream();
+    let row_bytes = inp / dtype.block_size() * dtype.type_size();
+    let tile = (tile_bytes / (inp * 4)).clamp(32, rows.max(32)) / 32 * 32;
+    let tile = tile.max(1).min(rows);
+    let one = |start: usize, count: usize| -> Result<CudaSlice<f32>> {
+        let view = blob.slice((row0 + start) * row_bytes..(row0 + start + count) * row_bytes);
+        let w = dequantise_f32(dev, dtype, &view, count * inp)?;
+        matmul_nt_f32(dev, x, &w, 1, n, inp, count)
+    };
+    if tile >= rows {
+        return one(0, rows);
+    }
+    let out = with_oom_retry(dev, "linear tiles", || unsafe {
+        stream.alloc::<f32>(n * rows)
+    })?;
+    let func = dev.quantized_fn("put_cols_f32")?;
+    let mut start = 0;
+    while start < rows {
+        let count = tile.min(rows - start);
+        let part = one(start, count)?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n * count).div_ceil(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (total, w, dst_w, off) = ((n * count) as i64, count as i64, rows as i64, start as i64);
+        let mut b = stream.launch_builder(&func);
+        b.arg(&part);
+        b.arg(&out);
+        b.arg(&total);
+        b.arg(&w);
+        b.arg(&dst_w);
+        b.arg(&off);
+        unsafe { b.launch(cfg) }.map_err(|e| Error(format!("put_cols_f32 launch: {e}")))?;
+        start += count;
+    }
+    Ok(out)
+}
+
+/// A prompt's attention on the card from the shared query latent on, in chunks of queries: the
+/// queries from the latent, rotated, over the gathered keys with the sink, rotated back, and
+/// through the grouped output projection; `[n, dim]` comes back. Nothing but the latent and the
+/// result crosses, where each step through the host moved a copy of the queries or the outputs.
+pub fn gpu_prefill_attention(dev: &CudaDevice, a: &PrefillAttention) -> Result<Vec<f32>> {
+    gpu_prefill_attention_with(dev, a, usize::MAX, QUANT_LINEAR_TILE_BYTES)
+}
+
+/// `gpu_prefill_attention` with the chunk of queries capped at `max_chunk` and the tile of an
+/// expanded weight at `tile_bytes`.
+pub fn gpu_prefill_attention_with(
+    dev: &CudaDevice,
+    a: &PrefillAttention,
+    max_chunk: usize,
+    tile_bytes: usize,
+) -> Result<Vec<f32>> {
+    let (h, hd, rd, topk) = (a.heads, a.hd, a.rd, a.topk);
+    let q_lora = a.wq_b.inp;
+    let n = a.qr.len() / q_lora.max(1);
+    let (p, groups) = (h * hd / a.groups.max(1), a.groups);
+    let r = a.wo_a.rows / groups.max(1);
+    let dim = a.wo_b.rows;
+    if a.qr.len() != n * q_lora
+        || a.wq_b.rows != h * hd
+        || a.cos.len() != n * (rd / 2)
+        || a.sin.len() != a.cos.len()
+        || a.idxs.len() != n * topk
+        || a.wo_a.inp != p
+        || a.wo_b.inp != groups * r
+        || a.kv.len() % hd != 0
+        || a.sink.len() != h
+    {
+        return Err(Error(format!(
+            "prefill attention: shapes disagree ({n} tokens, {} latent values, {} cos values)",
+            a.qr.len(),
+            a.cos.len()
+        )));
+    }
+    let keys_n = a.kv.len() / hd;
+    if let Some(&bad) = a.idxs.iter().find(|&&i| i >= keys_n as i32) {
+        return Err(Error(format!(
+            "prefill attention: slot {bad} past {keys_n} keys"
+        )));
+    }
+    let stream = dev.stream();
+    let mut staging = Staging {
+        stream: &stream,
+        held: Vec::new(),
+        copied: Vec::new(),
+    };
+    let up = |e| alloc_err("prefill attention upload", e);
+    let blobs = [
+        staging.upload(dev, a.wq_b.bytes)?,
+        staging.upload(dev, a.wo_a.bytes)?,
+        staging.upload(dev, a.wo_b.bytes)?,
+    ];
+    let (kvd, sd, idd) = (
+        stream.clone_htod(a.kv).map_err(up)?,
+        stream.clone_htod(a.sink).map_err(up)?,
+        stream.clone_htod(a.idxs).map_err(up)?,
+    );
+    let neg_sin: Vec<f32> = a.sin.iter().map(|v| -v).collect();
+    let (cosd, sind, nsind) = (
+        stream.clone_htod(a.cos).map_err(up)?,
+        stream.clone_htod(a.sin).map_err(up)?,
+        stream.clone_htod(&neg_sin).map_err(up)?,
+    );
+    // Queries go through in chunks whose gathered keys, logits and outputs, and the queries and
+    // outputs themselves, take at most a third of what the card has free now.
+    // PLACEMENT-EXEMPT: sizes a kernel's chunks inside the card its caller placed it on.
+    let (free, _) = dev
+        .ctx
+        .mem_get_info()
+        .map_err(|e| Error(format!("prefill attention memory: {e}")))?;
+    let per_query = (topk * hd + h * topk + 4 * h * hd + groups * r + dim) * 4;
+    let chunk = (free / 3 / per_query.max(1))
+        .clamp(1, n.max(1))
+        .min(max_chunk.max(1));
+    let launch1 = |name: &str, total: usize| -> Result<(CudaFunction, LaunchConfig)> {
+        Ok((
+            dev.quantized_fn(name)?,
+            LaunchConfig {
+                grid_dim: (total.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
+        ))
+    };
+    let (func_gather, func_softmax) = (
+        dev.quantized_fn("gather_slots_f32")?,
+        dev.quantized_fn("sink_softmax_f32")?,
+    );
+    let mut result = vec![0f32; n * dim];
+    for start in (0..n).step_by(chunk) {
+        let count = chunk.min(n - start);
+        let qr = stream
+            .clone_htod(&a.qr[start * q_lora..(start + count) * q_lora])
+            .map_err(up)?;
+        // The queries, rotated.
+        let q = linear_tiled(
+            dev,
+            tile_bytes,
+            a.wq_b.dtype,
+            &blobs[0],
+            (0, h * hd, q_lora),
+            &qr,
+            count,
+        )?;
+        let rope = |buf: &CudaSlice<f32>, sin: &CudaSlice<f32>| -> Result<()> {
+            let pairs = count * h * (rd / 2);
+            let (f, cfg) = launch1("rope_tail_f32", pairs)?;
+            let (tab_c, tab_s) = (
+                cosd.slice(start * (rd / 2)..),
+                sin.slice(start * (rd / 2)..),
+            );
+            let (pairs_i, h_i, hd_i, rd_i) = (pairs as i64, h as i64, hd as i64, rd as i64);
+            let mut b = stream.launch_builder(&f);
+            b.arg(buf);
+            b.arg(&tab_c);
+            b.arg(&tab_s);
+            b.arg(&pairs_i);
+            b.arg(&h_i);
+            b.arg(&hd_i);
+            b.arg(&rd_i);
+            unsafe { b.launch(cfg) }
+                .map_err(|e| Error(format!("rope_tail_f32 launch: {e}")))
+                .map(|_| ())
+        };
+        rope(&q, &sind)?;
+        // Sparse attention over the gathered keys: [count, h, hd] against [count, topk, hd].
+        let keys = with_oom_retry(dev, "prefill attention keys", || unsafe {
+            stream.alloc::<f32>(count * topk * hd)
+        })?;
+        let cfg = |m: usize| LaunchConfig {
+            grid_dim: (m.div_ceil(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (start_i, count_i, topk_i, d_i, h_i) =
+            (start as i64, count as i64, topk as i64, hd as i64, h as i64);
+        let mut g = stream.launch_builder(&func_gather);
+        g.arg(&kvd);
+        g.arg(&idd);
+        g.arg(&keys);
+        g.arg(&start_i);
+        g.arg(&count_i);
+        g.arg(&topk_i);
+        g.arg(&d_i);
+        unsafe { g.launch(cfg(count * topk)) }
+            .map_err(|e| Error(format!("gather_slots_f32 launch: {e}")))?;
+        let logits = matmul_nt_f32(dev, &q, &keys, count, h, hd, topk)?;
+        let mut sm = stream.launch_builder(&func_softmax);
+        sm.arg(&logits);
+        sm.arg(&sd);
+        sm.arg(&idd);
+        sm.arg(&start_i);
+        sm.arg(&count_i);
+        sm.arg(&h_i);
+        sm.arg(&topk_i);
+        sm.arg(&a.scale);
+        unsafe { sm.launch(cfg(count * h)) }
+            .map_err(|e| Error(format!("sink_softmax_f32 launch: {e}")))?;
+        let o = matmul_f32(dev, &logits, &keys, count, h, topk, hd)?;
+        // The output rotated back, then the grouped projection.
+        rope(&o, &nsind)?;
+        let wide = with_oom_retry(dev, "prefill attention groups", || unsafe {
+            stream.alloc::<f32>(count * groups * r)
+        })?;
+        let slice = with_oom_retry(dev, "prefill attention group", || unsafe {
+            stream.alloc::<f32>(count * p)
+        })?;
+        let (take, put) = (
+            dev.quantized_fn("take_cols_f32")?,
+            dev.quantized_fn("put_cols_f32")?,
+        );
+        for gi in 0..groups {
+            let (tot, w, sw, off) = (
+                (count * p) as i64,
+                p as i64,
+                (h * hd) as i64,
+                (gi * p) as i64,
+            );
+            let mut b = stream.launch_builder(&take);
+            b.arg(&o);
+            b.arg(&slice);
+            b.arg(&tot);
+            b.arg(&w);
+            b.arg(&sw);
+            b.arg(&off);
+            unsafe { b.launch(cfg(count * p)) }
+                .map_err(|e| Error(format!("take_cols_f32 launch: {e}")))?;
+            let y = linear_tiled(
+                dev,
+                tile_bytes,
+                a.wo_a.dtype,
+                &blobs[1],
+                (gi * r, r, p),
+                &slice,
+                count,
+            )?;
+            let (tot, w, dw, off) = (
+                (count * r) as i64,
+                r as i64,
+                (groups * r) as i64,
+                (gi * r) as i64,
+            );
+            let mut b = stream.launch_builder(&put);
+            b.arg(&y);
+            b.arg(&wide);
+            b.arg(&tot);
+            b.arg(&w);
+            b.arg(&dw);
+            b.arg(&off);
+            unsafe { b.launch(cfg(count * r)) }
+                .map_err(|e| Error(format!("put_cols_f32 launch: {e}")))?;
+        }
+        let out = linear_tiled(
+            dev,
+            tile_bytes,
+            a.wo_b.dtype,
+            &blobs[2],
+            (0, dim, groups * r),
+            &wide,
+            count,
+        )?;
+        stream
+            .memcpy_dtoh(&out, &mut result[start * dim..(start + count) * dim])
+            .map_err(|e| Error(format!("prefill attention download: {e}")))?;
+    }
+    Ok(result)
 }
 
 /// A prompt's residual stream `x` [n, hc, d] held on a card for the whole prompt, with the
@@ -1980,9 +2297,9 @@ pub fn gpu_matmul_host(
 /// CUDA block (32 threads) dequantizes 256 elements (8 q8_0 blocks), so grid = total/256. Lets the
 /// Q8_0 projections (whose in-dim is a multiple of 32 but not the K-quant 256) run the same
 /// GPU-dequant + BF16-cuBLAS GEMM path as the K-quants instead of a silent CPU fallback.
-pub fn dequantize_q8_0_f32(
+fn dequantize_q8_0_view(
     dev: &CudaDevice,
-    weight_blob: &CudaSlice<u8>,
+    weight_blob: &CudaView<'_, u8>,
     total: usize,
 ) -> Result<CudaSlice<f32>> {
     let func = dev.quantized_fn("dequantize_block_q8_0_f32")?;
@@ -2004,6 +2321,14 @@ pub fn dequantize_q8_0_f32(
     unsafe { b.launch(cfg) }
         .map_err(|e| Error(format!("dequantize_block_q8_0_f32 launch: {e}")))?;
     Ok(dst)
+}
+
+pub fn dequantize_q8_0_f32(
+    dev: &CudaDevice,
+    weight_blob: &CudaSlice<u8>,
+    total: usize,
+) -> Result<CudaSlice<f32>> {
+    dequantize_q8_0_view(dev, &weight_blob.as_view(), total)
 }
 
 /// F16-output batched MMVQ (the fork's `plain_launcher_f16` family).

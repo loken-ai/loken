@@ -10,8 +10,9 @@ use super::{AttnBlock, Offload};
 use crate::tensor::cuda::{
     gpu_expert_into_layer, gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi,
     gpu_expert_tokens, gpu_fp4_linear, gpu_fp8_linear, gpu_index_scores, gpu_layer_begin,
-    gpu_layer_sum, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables, CudaDevice, ExpertWeight,
-    HcStreamDev, LayerBuffers, QUANT_LINEAR_TILE_BYTES,
+    gpu_layer_sum, gpu_prefill_attention, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables,
+    CudaDevice, ExpertWeight, HcStreamDev, LayerBuffers, PrefillAttention, QuantWeight,
+    QUANT_LINEAR_TILE_BYTES,
 };
 use crate::tensor::ops::rms_norm;
 use crate::tensor::ops::softmax_last_dim;
@@ -1263,7 +1264,93 @@ impl super::HcStream for CardHc {
     }
 }
 
+/// A quantised projection's format, bytes and shape, when it is one a card expands.
+struct HeldWeight<'a> {
+    dtype: GgmlDType,
+    bytes: std::borrow::Cow<'a, [u8]>,
+    rows: usize,
+    inp: usize,
+}
+
+impl<'a> HeldWeight<'a> {
+    fn as_weight(&'a self) -> QuantWeight<'a> {
+        QuantWeight {
+            dtype: self.dtype,
+            bytes: &self.bytes,
+            rows: self.rows,
+            inp: self.inp,
+        }
+    }
+}
+
+fn quant_weight(p: &Projection) -> Option<HeldWeight<'_>> {
+    match p {
+        Projection::Quant(q)
+            if matches!(
+                q.dtype(),
+                GgmlDType::Iq2Xxs | GgmlDType::Q2K | GgmlDType::Q6K | GgmlDType::Q8_0
+            ) =>
+        {
+            let d = p.dims();
+            Some(HeldWeight {
+                dtype: q.dtype(),
+                bytes: q.data().ok()?,
+                rows: *d.first()?,
+                inp: *d.get(1)?,
+            })
+        }
+        _ => None,
+    }
+}
+
+impl Card {
+    /// A prompt's attention whole on this card; `None` when a weight is not in a format the card
+    /// expands or it has no room.
+    fn prefill_attention(&self, a: &super::PrefillAttn) -> Option<Result<Vec<f32>>> {
+        let (b, o1, o2) = (
+            quant_weight(a.wq_b)?,
+            quant_weight(a.wo_a)?,
+            quant_weight(a.wo_b)?,
+        );
+        let need = b.bytes.len()
+            + o1.bytes.len()
+            + o2.bytes.len()
+            + (a.kv.len() + a.idxs.len() + 4 * a.cos.len()) * F32
+            + (96 << 20) * 3
+            + (a.heads * a.topk * a.hd + 6 * a.heads * a.hd) * F32 * 8;
+        self.attempt("a prompt's attention", need, || {
+            gpu_prefill_attention(
+                &self.dev,
+                &PrefillAttention {
+                    qr: a.qr,
+                    wq_b: b.as_weight(),
+                    cos: a.cos,
+                    sin: a.sin,
+                    heads: a.heads,
+                    hd: a.hd,
+                    rd: a.rd,
+                    kv: a.kv,
+                    sink: a.sink,
+                    idxs: a.idxs,
+                    topk: a.topk,
+                    scale: a.scale,
+                    wo_a: o1.as_weight(),
+                    wo_b: o2.as_weight(),
+                    groups: a.groups,
+                },
+            )
+        })
+    }
+}
+
 impl Offload for Cards {
+    /// On the card with the most free memory now, the stream's card or not.
+    fn prefill_attention(&self, a: &super::PrefillAttn) -> Option<Result<Vec<f32>>> {
+        let mut order: Vec<&Arc<Card>> = self.0.iter().collect();
+        order.sort_by_key(|c| std::cmp::Reverse(c.free_now().unwrap_or(0)));
+        order.into_iter().find_map(|c| c.prefill_attention(a))
+    }
+
     /// On the card with the most free memory now, the others being left to the experts.
     fn hc_stream(&self, x: &[f32], hc: usize, d: usize) -> Option<Box<dyn super::HcStream>> {
         let mut order: Vec<&Arc<Card>> = self.0.iter().collect();
