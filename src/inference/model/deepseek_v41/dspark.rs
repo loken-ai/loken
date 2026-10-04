@@ -501,6 +501,22 @@ impl Dspark {
         embed: &Tensor,
         head: &Projection,
     ) -> Result<Vec<u32>> {
+        Ok(self
+            .forward_draft_logits(st, main_hidden, token, start_pos, embed, head)?
+            .0)
+    }
+
+    /// `forward_draft`, with the block's logits after the markov bias as well.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_draft_logits(
+        &self,
+        st: &mut DsparkState,
+        main_hidden: &[f32],
+        token: u32,
+        start_pos: usize,
+        embed: &Tensor,
+        head: &Projection,
+    ) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
         let c = &self.cfg;
         let (dim, hc, rd, win) = (c.dim, c.hc_mult, c.rope_head_dim, c.window_size);
         let bs = c.block_size;
@@ -623,6 +639,7 @@ impl Dspark {
         }
         let mut out = Vec::with_capacity(bs);
         let mut prev = token;
+        let mut biased = Vec::with_capacity(bs);
         for i in 0..bs {
             // markov bias: head(embed(prev)) added to this position's logits.
             let e = self.markov_embed.narrow(0, prev as usize, 1)?; // [1, rank]
@@ -636,9 +653,10 @@ impl Dspark {
             }
             let next = argmax(&logits[i]);
             out.push(next);
+            biased.push(logits[i].clone());
             prev = next;
         }
-        Ok(out)
+        Ok((out, biased))
     }
 
     /// Write this position's backbone kv into each stage's window. Called every decode step so the
@@ -1009,5 +1027,92 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The draft against the reference's own: weights, backbone hiddens, tokens and positions
+    /// written by `notes/deepseek-oracle/dump_dspark.py` from the reference model at a small
+    /// size, with the reference's block logits, tokens and confidence. Covers the window seeded by
+    /// a prefill longer than the window, its update at `pos % window`, the noise-token slots,
+    /// the main projection over the target layers, the stages' attention, hyper-connections and
+    /// MoE, and the markov bias.
+    #[test]
+    fn the_draft_matches_the_reference() {
+        use crate::inference::offload::projection::Projection;
+        use safetensors::SafeTensors;
+        let dir = std::env::var_os("LOKEN_DSPARK_VECTORS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/deepseek_v41_dspark")
+            });
+        let vec_bytes = std::fs::read(dir.join("vectors.safetensors")).unwrap();
+        let vecs = SafeTensors::deserialize(&vec_bytes).unwrap();
+        let f32s = |name: &str| -> Vec<f32> {
+            vecs.tensor(name)
+                .unwrap()
+                .data()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()
+        };
+        let i32s = |name: &str| -> Vec<i32> {
+            vecs.tensor(name)
+                .unwrap()
+                .data()
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()
+        };
+        let cfg = DsparkConfig::from_config_json(&dir).unwrap();
+        let src = SafeTensorsSource::open(&dir).unwrap();
+        let d = Dspark::load(&src, cfg.clone()).unwrap();
+        let embed = src.dense_f32("embed.weight").unwrap();
+        let head = Projection::Dense(src.dense_f32("head.weight").unwrap());
+
+        let width = cfg.dim * cfg.target_layers.len();
+        let prefill = f32s("prefill_main_hidden");
+        let mut st = DsparkState::new(d.stages.len(), cfg.window_size, cfg.head_dim);
+        for (pos, row) in prefill.chunks_exact(width).enumerate() {
+            d.update_window_from_hidden(&mut st, row, pos).unwrap();
+        }
+        let (tokens, poss) = (i32s("token"), i32s("pos"));
+        let (hidden, logits, ids) = (f32s("main_hidden"), f32s("draft_logits"), i32s("draft_ids"));
+        let (bs, vocab) = (cfg.block_size, cfg.vocab);
+        let mut worst_cos = 1f32;
+        let mut worst_rel = 0f32;
+        for step in 0..tokens.len() {
+            let (got_ids, got) = d
+                .forward_draft_logits(
+                    &mut st,
+                    &hidden[step * width..(step + 1) * width],
+                    tokens[step] as u32,
+                    poss[step] as usize,
+                    &embed,
+                    &head,
+                )
+                .unwrap();
+            for i in 0..bs {
+                let want = &logits[(step * bs + i) * vocab..(step * bs + i + 1) * vocab];
+                let g = &got[i];
+                let dot: f32 = g.iter().zip(want).map(|(a, b)| a * b).sum();
+                let na = g.iter().map(|a| a * a).sum::<f32>().sqrt();
+                let nb = want.iter().map(|a| a * a).sum::<f32>().sqrt();
+                let num: f32 = g.iter().zip(want).map(|(a, b)| (a - b) * (a - b)).sum();
+                worst_cos = worst_cos.min(dot / (na * nb));
+                worst_rel = worst_rel.max(num.sqrt() / nb);
+            }
+            let want_ids: Vec<u32> = ids[step * (bs + 1) + 1..(step + 1) * (bs + 1)]
+                .iter()
+                .map(|&x| x as u32)
+                .collect();
+            eprintln!("step {step}: draft {got_ids:?} reference {want_ids:?}");
+        }
+        eprintln!(
+            "draft against reference: worst cosine {worst_cos}, worst relative L2 {worst_rel}"
+        );
+        assert!(worst_cos > 0.999, "block logits turned: cosine {worst_cos}");
+        assert!(
+            worst_rel < 0.05,
+            "block logits drifted: relative L2 {worst_rel}"
+        );
     }
 }
