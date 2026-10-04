@@ -229,28 +229,44 @@ pub struct BlockLayout<'a> {
     pub block_tokens: usize,
 }
 
-/// Per layer: groups a block holds, floats of compressed KV and of index keys per group. `None`
-/// for a state the layout cannot cut at block boundaries (a layer with rows but no ratio, a ratio
-/// that does not divide the block, rows that are not a whole number per group).
-fn block_shape(state: &DecodeState, layout: &BlockLayout) -> Option<Vec<(usize, usize, usize)>> {
+/// Per layer: groups a block holds, floats of compressed KV and of index keys per group. `Err`
+/// names why for a state the layout cannot cut at block boundaries (a layer with rows but no ratio,
+/// a ratio that does not divide the block, rows that are not a whole number per group).
+pub fn block_shape(
+    state: &DecodeState,
+    layout: &BlockLayout,
+) -> Result<Vec<(usize, usize, usize)>, String> {
     if layout.ratios.len() != state.layers.len() || layout.block_tokens == 0 {
-        return None;
+        return Err(format!(
+            "{} ratios for {} layers",
+            layout.ratios.len(),
+            state.layers.len()
+        ));
     }
     state
         .layers
         .iter()
         .zip(layout.ratios)
-        .map(|(l, &ratio)| {
+        .enumerate()
+        .map(|(i, (l, &ratio))| {
             let has_rows = !l.comp_kv.is_empty() || !l.index_k.is_empty();
             if !has_rows {
-                return Some((0, 0, 0));
+                return Ok((0, 0, 0));
             }
+            let (c, k) = (l.comp_kv.len(), l.index_k.len());
             if ratio == 0 || !layout.block_tokens.is_multiple_of(ratio) || l.n_groups == 0 {
-                return None;
+                return Err(format!(
+                    "layer {i}: ratio {ratio}, {} groups, {c} + {k} row floats, block {}",
+                    l.n_groups, layout.block_tokens
+                ));
             }
-            let (c, i) = (l.comp_kv.len(), l.index_k.len());
-            (c % l.n_groups == 0 && i % l.n_groups == 0)
-                .then(|| (layout.block_tokens / ratio, c / l.n_groups, i / l.n_groups))
+            if c % l.n_groups != 0 || k % l.n_groups != 0 {
+                return Err(format!(
+                    "layer {i}: {c} + {k} row floats do not divide into {} groups",
+                    l.n_groups
+                ));
+            }
+            Ok((layout.block_tokens / ratio, c / l.n_groups, k / l.n_groups))
         })
         .collect()
 }
@@ -258,7 +274,7 @@ fn block_shape(state: &DecodeState, layout: &BlockLayout) -> Option<Vec<(usize, 
 /// Whole blocks of tokens a state can hand to block files: the position's, when every layer has
 /// the groups for them, else none.
 pub fn block_count(state: &DecodeState, layout: &BlockLayout) -> usize {
-    let Some(shape) = block_shape(state, layout) else {
+    let Ok(shape) = block_shape(state, layout) else {
         return 0;
     };
     let nb = state.pos / layout.block_tokens;
@@ -332,7 +348,7 @@ pub fn encode_grid_manifest(
     identity: &Identity,
     layout: &BlockLayout,
 ) -> Option<(Vec<u8>, usize)> {
-    let shape = block_shape(last, layout)?;
+    let shape = block_shape(last, layout).ok()?;
     let nblocks = point.pos / layout.block_tokens;
     if !point.pos.is_multiple_of(layout.block_tokens)
         || nblocks == 0
@@ -379,7 +395,7 @@ pub fn encode_manifest(
 ) -> (Vec<u8>, usize) {
     let nblocks = layout.map_or(0, |l| block_count(state, l));
     let shape = layout
-        .and_then(|l| block_shape(state, l))
+        .and_then(|l| block_shape(state, l).ok())
         .unwrap_or_else(|| vec![(0, 0, 0); state.layers.len()]);
     let mut w = Writer(Vec::new());
     w.0.extend_from_slice(MAGIC);

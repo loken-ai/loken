@@ -3003,6 +3003,50 @@ mod oracle_gate {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A stored prefix is used only while continuing its remainder is cheaper than prefilling the
+    /// whole prompt: a short remainder restores, a long one is prefilled cold, and both answer as a
+    /// cold prompt does.
+    #[test]
+    fn a_stored_prefix_with_a_long_remainder_is_not_used() {
+        use crate::inference::cache::state_disk::StateStore;
+        use crate::inference::engine::model_backend::DeepseekV41Backend;
+        let base: Vec<u32> = (0..40)
+            .map(|i| (i * 7 + 3) % super::tests::VOCAB as u32)
+            .collect();
+        let extend = |n: usize, salt: u32| {
+            let mut t = base.clone();
+            t.extend((0..n).map(|i| (i as u32 * 5 + salt) % super::tests::VOCAB as u32));
+            t
+        };
+        let dir = scratch_dir("guard");
+        let store = std::sync::Arc::new(StateStore::open(dir.clone(), 0, 8).unwrap());
+        let id = super::super::snapshot::identity(&[b"synthetic"]);
+        let backend = || {
+            let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+            DeepseekV41Backend::new(model, 0, 128).with_state_cache(store.clone(), id)
+        };
+        let mut first = backend();
+        let _ = prompt_logits(&mut first, &base);
+        wait_for_len(&store, 40);
+        let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let mut plain = DeepseekV41Backend::new(model, 0, 128);
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+            (num / b.iter().map(|y| y * y).sum::<f32>()).sqrt()
+        };
+        // 4 more tokens: 4 * 8 <= 44, the stored state is used. 8 more: 8 * 8 > 48, it is not.
+        // Each tail is its own, so no earlier prompt's state shares more than the stored 40.
+        for (more, salt, used) in [(4usize, 11u32, 40usize), (8, 29, 0)] {
+            let prompt = extend(more, salt);
+            let mut b = backend();
+            let got = prompt_logits(&mut b, &prompt);
+            assert_eq!(b.last_restored(), used, "{more} more tokens");
+            let want = prompt_logits(&mut plain, &prompt);
+            assert!(rel(&got, &want) < 1e-4);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A state built by decoding, as a turn's end leaves it, round trips as well, and a restored
     /// state rewinds and checkpoints like any other: the replay after a rewind is bit for bit the
     /// first run, and the rewound state is the snapshot's.
@@ -3510,7 +3554,9 @@ mod oracle_gate {
         let store = Arc::new(StateStore::open(dir.clone(), 0, 8).unwrap());
         let id = super::super::snapshot::identity(&[b"synthetic"]);
         let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
-        let cache = StateCache::new(&model, store.clone(), id).unwrap();
+        let cache = StateCache::new(&model, store.clone(), id)
+            .unwrap()
+            .with_continue_cost_ratio(1);
         let cached = V41BatchServer::spawn(Arc::new(model), None, None, 4, Some(cache));
         let first = run(&cached, &tokens[..24]);
         // The prompt's states and the finished sequence's: 8, 16, 24 and 24 + 4 tokens fed.
@@ -4353,7 +4399,9 @@ mod oracle_gate {
         let store = std::sync::Arc::new(StateStore::open(dir.to_path_buf(), 0, 8).unwrap());
         let id = super::super::snapshot::identity(&[b"synthetic"]);
         (
-            DeepseekV41Backend::new(model, 0, 128).with_state_cache(store.clone(), id),
+            DeepseekV41Backend::new(model, 0, 128)
+                .with_state_cache(store.clone(), id)
+                .with_continue_cost_ratio(1),
             store,
         )
     }

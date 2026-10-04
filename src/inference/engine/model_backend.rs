@@ -933,6 +933,17 @@ impl DeepseekV41Backend {
         self
     }
 
+    /// The cost of a continued token against a batched one that decides whether a stored state
+    /// pays; 1 restores any stored prefix.
+    #[cfg(test)]
+    pub(crate) fn with_continue_cost_ratio(mut self, ratio: usize) -> Self {
+        self.state_cache = self
+            .state_cache
+            .take()
+            .map(|c| c.with_continue_cost_ratio(ratio));
+        self
+    }
+
     /// The prompt prefilled through the cache: a restored prefix, only the rest computed, the
     /// states passed on the way written back. Its heavy steps run on the cards when there are any.
     fn prefill_cached(
