@@ -1,13 +1,13 @@
 # Status
 
-What is measured, what is slower, what has never run. Revised 2026-09-03.
+What is measured, what is slower, what has never run. Revised 2026-10-03.
 
 Every figure comes from one machine: RTX 5070 Ti + RTX 5060 Ti (16 GB each), Linux, CUDA 13.3,
 models on a USB disk reading at 460 MB/s.
 
 ## Decode rate vs ollama
 
-Measured by the campaign of 2026-09-03 on the binary this page describes, and regenerated
+Measured by the campaign of 2026-10-03 on the binary this page describes, and regenerated
 from `docs/BENCHMARKS.md` by `scripts/figures.py` as the campaign advances. Conditions: both
 cards available to every engine, idle machine, greedy, streamed, short prompt, 4096 ctx,
 median of three iterations, decode tokens/s. The earlier table on this page came from a
@@ -18,36 +18,47 @@ one-card probe of 2026-08-27 taken between kernel changes; it is superseded, not
 <!-- table:decode -->
 | model | ollama | loken | |
 |---|---:|---:|---|
-| gpt-oss:20b | 6.1 | **7.5** | +23% |
-| qwen3:8b | 4.5 | **4.8** | +7% |
-| deepcoder:14b | 2.6 | **2.7** | +4% |
-| lfm2.5-thinking:latest | 30.1 | **30.5** | +1% |
-| llama3.2:1b | 16.5 | **16.7** | +1% |
-| gemma4:31b | 1.2 | 1.2 | - |
-| devstral:24b | 1.6 | 1.6 | - |
-| magistral:latest | 1.6 | 1.6 | - |
-| mistral-nemo:latest | 3.5 | 3.5 | - |
-| devstral-small-2:latest | 1.6 | 1.6 | - |
-| mistral-small3.2:latest | 1.6 | 1.6 | - |
-| deepseek-r1:32b | 1.2 | 1.2 | - |
-| qwen2.5:0.5b | **53.1** | 52.4 | **-1%** |
-| gemma4:latest | **7.2** | 7.1 | **-1%** |
-| qwen3:0.6b | **49.2** | 48.5 | **-1%** |
-| falcon3:latest | **14.5** | 14.2 | **-2%** |
-| qwen3.5:latest | **4.3** | 4.2 | **-2%** |
-| gemma4:12b | **3.0** | 2.9 | **-3%** |
-| ernie4-5:latest | **56.5** | 54.5 | **-4%** |
-| qwen3-coder:30b | **11.0** | 10.6 | **-4%** |
-| granite3.1-dense:2b | **14.0** | 13.3 | **-5%** |
-| nemotron-3-nano:latest | **8.4** | 7.9 | **-6%** |
-| smollm3:latest | **11.5** | 10.8 | **-6%** |
-| olmoe:latest | **28.5** | 26.5 | **-7%** |
-| qwen3.5:35b | **9.4** | 8.7 | **-7%** |
-| olmo2:7b | **5.3** | 4.8 | **-9%** |
-| qwen3-coder-next:latest | **7.6** | 6.7 | **-12%** |
-| qwen3next:latest | **7.6** | 6.7 | **-12%** |
-| granite3-moe:1b | **73.0** | 60.0 | **-18%** |
-| moondream:latest | **27.9** | 21.1 | **-24%** |
+| deepseek-r1:70b | 1.6 | **3.1** | +94% |
+| qwen3.5:latest | 74.5 | **132.6** | +78% |
+| falcon3:latest | 271.6 | **422.9** | +56% |
+| deepseek-r1:32b | 26.7 | **40.7** | +52% |
+| devstral-small-2:latest | 36.8 | **55.9** | +52% |
+| lfm2.5-thinking:latest | 506.1 | **754.5** | +49% |
+| granite3-moe:1b | 418.4 | **622.2** | +49% |
+| qwen3:1.7b | 285.8 | **424.6** | +49% |
+| llama3.2:1b | 306.9 | **445.1** | +45% |
+| qwen3:0.6b | 471.3 | **682.9** | +45% |
+| gpt-oss:20b | 110.0 | **158.3** | +44% |
+| gpt-oss:latest | 109.9 | **157.9** | +44% |
+| gpt-oss-safeguard:20b | 109.6 | **156.3** | +43% |
+| gemma3:latest | 142.1 | **202.5** | +43% |
+| qwen3:latest | 97.2 | **138.1** | +42% |
+| qwen3:8b | 97.1 | **137.9** | +42% |
+| mistral-small3.2:latest | 37.8 | **52.9** | +40% |
+| shieldgemma:2b | 187.2 | **261.9** | +40% |
+| mistral-nemo:latest | 73.6 | **102.4** | +39% |
+| moondream:latest | 437.2 | **600.9** | +37% |
+| deepseek-r1:70b-q3ks | 7.1 | **9.7** | +37% |
+| deepcoder:latest | 56.7 | **76.9** | +36% |
+| deepcoder:14b | 56.7 | **76.8** | +35% |
+| smollm3:latest | 207.5 | **277.8** | +34% |
+| magistral:latest | 37.8 | **50.6** | +34% |
+| devstral:latest | 37.8 | **50.4** | +33% |
+| devstral:24b | 37.8 | **50.0** | +32% |
+| qwen2.5:0.5b | 475.4 | **615.1** | +29% |
+| deepseek-r1:70b-ffnq3d2 | 8.2 | **10.6** | +29% |
+| granite3-guardian:2b | 165.9 | **212.5** | +28% |
+| olmo2:7b | 109.7 | **140.4** | +28% |
+| qwen3-coder:latest | 145.1 | **182.6** | +26% |
+| qwen3-coder:30b | 145.5 | **180.9** | +24% |
+| olmoe:latest | 463.6 | **574.2** | +24% |
+| granite3.1-dense:2b | 246.2 | **293.7** | +19% |
+| gemma4:latest | 114.2 | **134.9** | +18% |
+| deepseek-r1:70b-ffnq3 | 5.1 | **5.4** | +6% |
+| qwen3.5:35b | 151.2 | **159.4** | +5% |
+| nemotron-3-nano:latest | 156.1 | **158.9** | +2% |
+| qwen3-coder-next:latest | **34.3** | 30.2 | **-12%** |
+| qwen3next:latest | **38.2** | 33.4 | **-13%** |
 <!-- /table:decode -->
 
 The two mixtures that lose here came from a harness that had moved into its own repository and
@@ -72,6 +83,10 @@ path. Two ways out. A variant that fits: the FFN-at-Q3 requantisation the store 
 but never received weights. And a drafter, which loken now picks itself for a model that spills: on that same cell,
 llama3.2:1b proposing and the 70B verifying with a learned draft length gives 2.79 to 2.85
 tok/s against 1.49 alone, same answer, at temperature zero.
+
+A checkpoint that ships split is read as one model across its parts. unsloth/Qwen3-235B-A22B-GGUF,
+a mixture of 235B parameters, runs on the two cards and the host at 7.0 tok/s prefill and
+4.7 tok/s decode (`docs/BENCHMARKS.md`, 4096 ctx, short prompt, streamed).
 
 ## Context shift
 
