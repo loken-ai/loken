@@ -23,6 +23,7 @@
 use super::mixer::{ConvState, Mixer, MixerState, SsmState};
 use super::*;
 use crate::inference::cache::state_disk::{Entry, StateStore};
+use crate::inference::cache::state_tune;
 use anyhow::{anyhow, bail, Result as AnyResult};
 use sha2::{Digest, Sha256};
 
@@ -662,20 +663,37 @@ impl GenericHeteroTransformer {
         if !self.is_recurrent() || self.layers.iter().any(|l| l.cpu_q8_kv.is_some()) {
             return false;
         }
-        let layout = self.state_layout(store.block_tokens());
+        // The identity first: the block size is settled under it.
         let mut h = Sha256::new();
         h.update(b"loken hybrid state identity");
         h.update(FORMAT_VERSION.to_le_bytes());
         h.update(identity);
+        let probe = self.state_layout(1);
         for (il, l) in self.layers.iter().enumerate() {
-            h.update([layout.kinds[il].tag(), l.cos.device().is_cuda() as u8]);
-            h.update((layout.geometry[il].0 as u64).to_le_bytes());
-            h.update((layout.geometry[il].1 as u64).to_le_bytes());
+            h.update([probe.kinds[il].tag(), l.cos.device().is_cuda() as u8]);
+            h.update((probe.geometry[il].0 as u64).to_le_bytes());
+            h.update((probe.geometry[il].1 as u64).to_le_bytes());
         }
+        let identity: [u8; 32] = h.finalize().into();
+        // What one token adds to the blocks: both rows of every global layer, at the widest
+        // element a cache holds.
+        let token_bytes: usize = probe
+            .kinds
+            .iter()
+            .zip(&probe.geometry)
+            .filter(|(k, _)| **k == StateKind::Global)
+            .map(|(_, (n_kv, hd))| 2 * n_kv * hd * std::mem::size_of::<f32>())
+            .sum();
+        let Some(block) = state_tune::settle_block_tokens(&store, &identity, 1, token_bytes) else {
+            tracing::warn!("state cache off: the directory cannot be written to measure it");
+            return false;
+        };
+        let layout = self.state_layout(block);
         self.hybrid_cache = Some(HybridStateCache {
             store,
-            identity: h.finalize().into(),
+            identity,
             layout: Arc::new(layout),
+            last_stride: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         true
     }
@@ -777,19 +795,18 @@ impl GenericHeteroTransformer {
         Ok(())
     }
 
-    /// Forward `prompt[from..]` in chunks of at most `chunk` tokens, cut at multiples of the
-    /// stride so the state can be kept where a prefill passes it: the largest multiple of the
-    /// block size that fits a chunk. Returns the last logits and the states at the cuts short of
-    /// the end.
+    /// Forward `prompt[from..]` in chunks of at most `chunk` tokens, cut at multiples of `stride`
+    /// so the state can be kept where a prefill passes it. Returns the last logits and the states
+    /// at the cuts short of the end.
     pub(crate) fn prefill_with_grid(
         &mut self,
         prompt: &[u32],
         from: usize,
         chunk: usize,
+        stride: usize,
         layout: &Layout,
     ) -> Result<(Tensor, Vec<Point>)> {
-        let g = layout.block_tokens;
-        let stride = if chunk >= g { chunk / g * g } else { g };
+        let stride = stride.max(1);
         let chunk = chunk.max(1);
         let mut grid = Vec::new();
         let mut pos = from;
@@ -840,9 +857,14 @@ pub(crate) struct HybridStateCache {
     store: Arc<StateStore>,
     identity: [u8; 32],
     layout: Arc<Layout>,
+    last_stride: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl HybridStateCache {
+    pub(crate) fn tuning(&self) -> &state_tune::Tuning {
+        self.store.tuning()
+    }
+
     pub(crate) fn layout(&self) -> &Layout {
         &self.layout
     }
@@ -856,8 +878,34 @@ impl HybridStateCache {
         }
         let keys = self.store.keys(&self.identity, prompt);
         for entry in self.store.candidates(&keys, prompt.len() - 1) {
+            let bytes = self.store.entry_bytes(&entry);
+            let m = self.store.tuning().get();
+            if !state_tune::restore_pays(
+                entry.len,
+                bytes,
+                m.restore.secs_per(),
+                m.prefill.secs_per(),
+            ) {
+                tracing::info!(
+                    "state cache: a {}-token state is not restored: reading {} MiB is expected to cost more than prefilling the tokens",
+                    entry.len,
+                    bytes >> 20
+                );
+                continue;
+            }
+            let started = std::time::Instant::now();
             match self.restore_entry(model, &entry) {
-                Ok(()) => return entry.len,
+                Ok(()) => {
+                    let secs = started.elapsed().as_secs_f64();
+                    self.store.tuning().restored(bytes, secs);
+                    tracing::info!(
+                        "state cache: restored {} tokens ({} MiB) in {:.2} s",
+                        entry.len,
+                        bytes >> 20,
+                        secs
+                    );
+                    return entry.len;
+                }
                 Err(e) => {
                     tracing::warn!("state cache: dropping a {}-token state: {e}", entry.len);
                     self.store.forget(&entry);
@@ -883,10 +931,43 @@ impl HybridStateCache {
             .map_err(|e| anyhow!("{e}"))
     }
 
+    /// The spacing of the states a prefill keeps, from what the store has measured, for a prefill
+    /// that runs forwards of `chunk` tokens. Logged when it changes.
+    pub(crate) fn stride(&self, chunk: usize) -> usize {
+        let m = self.store.tuning().get();
+        let stride = state_tune::grid_stride(
+            self.layout.block_tokens,
+            chunk,
+            m.manifest_bytes,
+            m.write.per_sec(),
+            m.prefill.secs_per(),
+        );
+        if self
+            .last_stride
+            .swap(stride, std::sync::atomic::Ordering::Relaxed)
+            != stride
+        {
+            tracing::info!(
+                "state cache: a state every {stride} tokens (chunk {chunk}, manifest {} KiB, write {} MB/s, prefill {} tokens/s)",
+                m.manifest_bytes >> 10,
+                m.write.per_sec().map_or(0.0, |w| w / 1e6) as u64,
+                m.prefill.per_sec().unwrap_or(0.0) as u64
+            );
+        }
+        stride
+    }
+
     /// Keeps the state the model stands in after `prompt`, and the `grid` states a prefill passed
     /// on the way. The model's rows are copied here; encoding and writing run on a thread of their
-    /// own. A prompt shorter than a block is not worth a file.
-    pub(crate) fn save(&self, model: &GenericHeteroTransformer, prompt: &[u32], grid: Vec<Point>) {
+    /// own, queued behind earlier writes only while the disk drains them within `prefill_secs`,
+    /// the time the prefill took. A prompt shorter than a block is not worth a file.
+    pub(crate) fn save(
+        &self,
+        model: &GenericHeteroTransformer,
+        prompt: &[u32],
+        grid: Vec<Point>,
+        prefill_secs: Option<f64>,
+    ) {
         let layout = &*self.layout;
         let g = layout.block_tokens;
         if prompt.len() < g {
@@ -912,42 +993,51 @@ impl HybridStateCache {
                 }
             }
         }
+        let m = self.store.tuning().get();
+        let bytes = blocks.iter().map(|b| b.len() as u64).sum::<u64>()
+            + m.manifest_bytes * (grid.len() as u64 + 1);
+        let Some(ticket) = self.store.admit(bytes, prefill_secs) else {
+            tracing::info!("state cache: a write is skipped, the disk is still behind");
+            return;
+        };
         let this = self.clone();
         let tokens = prompt.to_vec();
         std::thread::spawn(move || {
-            let keys = this.store.keys(&this.identity, &tokens);
-            let mut points = grid;
-            points.push(end);
-            for p in points {
-                let manifest = encode_manifest(&this.identity, &this.layout, &p);
-                let mut lost = false;
-                let put = this.store.put(&keys, p.pos, &manifest, p.pos / g, |b| {
-                    match b.checked_sub(first).and_then(|i| blocks.get(i)) {
-                        Some(bytes) => bytes.clone(),
-                        None => {
-                            lost = true;
-                            Vec::new()
-                        }
-                    }
-                });
-                match put {
-                    Ok(()) if lost => {
-                        // A block that was on disk when the rows were copied has gone since.
-                        for e in this.store.candidates(&keys, p.pos) {
-                            if e.len == p.pos {
-                                this.store.forget(&e);
+            ticket.run(|| {
+                let keys = this.store.keys(&this.identity, &tokens);
+                let mut points = grid;
+                points.push(end);
+                for p in points {
+                    let manifest = encode_manifest(&this.identity, &this.layout, &p);
+                    let mut lost = false;
+                    let put = this.store.put(&keys, p.pos, &manifest, p.pos / g, |b| {
+                        match b.checked_sub(first).and_then(|i| blocks.get(i)) {
+                            Some(bytes) => bytes.clone(),
+                            None => {
+                                lost = true;
+                                Vec::new()
                             }
                         }
+                    });
+                    match put {
+                        Ok(()) if lost => {
+                            // A block that was on disk when the rows were copied has gone since.
+                            for e in this.store.candidates(&keys, p.pos) {
+                                if e.len == p.pos {
+                                    this.store.forget(&e);
+                                }
+                            }
+                        }
+                        Ok(()) => tracing::info!(
+                            "state cache: stored a {}-token state ({} KiB manifest, {} blocks)",
+                            p.pos,
+                            manifest.len() >> 10,
+                            p.pos / g
+                        ),
+                        Err(e) => tracing::warn!("state cache: not stored at {}: {e}", p.pos),
                     }
-                    Ok(()) => tracing::info!(
-                        "state cache: stored a {}-token state ({} KiB manifest, {} blocks)",
-                        p.pos,
-                        manifest.len() >> 10,
-                        p.pos / g
-                    ),
-                    Err(e) => tracing::warn!("state cache: not stored at {}: {e}", p.pos),
                 }
-            }
+            })
         });
     }
 }

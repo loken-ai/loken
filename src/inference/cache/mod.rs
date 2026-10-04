@@ -33,6 +33,7 @@ pub mod q8_kv;
 pub mod quant_kv;
 pub mod qvb;
 pub mod state_disk;
+pub mod state_tune;
 /// A 3-bit KV scheme that exists on the host only - no kernel, and no cache type the
 /// loader can select. It is here for the measurement in `turboquant::measure`, which is
 /// what decides whether the device path gets written at all.

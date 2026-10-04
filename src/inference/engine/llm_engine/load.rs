@@ -393,6 +393,7 @@ pub(super) fn load_deepseek_v41_checkpoint(
                         &(cfg.n_layers as u64).to_le_bytes(),
                         salt.as_bytes(),
                     ]),
+                    cfg.state_bytes_per_token(),
                 );
             }
             Err(e) => warn!("state cache off: {e}"),

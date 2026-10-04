@@ -178,6 +178,17 @@ mod release {
 }
 
 impl DeepseekV41Config {
+    /// Bytes a token adds to a stored state's blocks: per layer that compresses, one row of the
+    /// compressed KV and one of the index keys per group of `ratio` tokens, in f32.
+    pub fn state_bytes_per_token(&self) -> usize {
+        self.compress_ratios
+            .iter()
+            .take(self.n_layers)
+            .filter(|&&r| r > 0)
+            .map(|&r| (self.head_dim + self.index_head_dim) * std::mem::size_of::<f32>() / r)
+            .sum::<usize>()
+            .max(1)
+    }
     pub fn from_gguf(ct: &gguf_file::Content) -> Result<Self> {
         Self::from_meta(ct)
     }

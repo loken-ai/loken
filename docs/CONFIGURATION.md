@@ -92,11 +92,20 @@ could live, and leave the key unset where nothing about an exchange may reach th
 | Key | Default | What it does |
 |---|---|---|
 | `state_cache_dir` | none | Directory of the cache. |
-| `state_cache_budget_gb` | `0` | Bytes the cache may hold, in GiB. `0` is no limit. Least recently used first; in each family of states sharing a first block the one restored most, the longest among equals, goes last. |
-| `state_cache_block_tokens` | `256` | Tokens per block of the hash chain, the spacing of the states kept while a prompt is prefilled (so any prompt sharing a prefix restores at the last multiple at or below the shared length), and the shortest state worth storing. Must be a multiple of every layer's compression ratio. Changing it orphans what is stored. |
+| `state_cache_budget_gb` | derived | Bytes the cache may hold, in GiB. Unset or `0` derives the limit: what the cache holds plus the free space of the directory's filesystem, less room for one more state of the largest size written. Least recently used first; in each family of states sharing a first block the one restored most, the longest among equals, goes last. |
+| `state_cache_block_tokens` | derived | Tokens per block of the hash chain. Unset or `0` derives one per model, a multiple of what the model's state divides into whole groups by, large enough that a block's transfer time covers the directory's measured per-file cost (see below). Fixing it applies to every model and orphans what is stored. |
 | `state_cache_salt` | empty | Mixed into every state's identity; states written under another salt are never read. |
 
-A state costs about 2.7 MB of window per snapshot (the last 128 tokens of every layer, kept as the
+What the cache works out for itself, from what the model, the disk and the engine report, and logs when it changes:
+
+| Quantity | Derived from |
+|---|---|
+| Block size | The bytes a token adds to the blocks, the model's granule, and the directory's per-file cost and write throughput, measured once on the directory with synced probe files; kept in `geometry.json` so a restart finds the chain it wrote. |
+| Spacing of kept states | The measured write throughput, the size of a manifest and the measured prefill time per token: a state is kept no closer than the disk can finish writing it within the prefill of the tokens in between. It is the prefill's own chunk until both are measured, and a multiple of the block size and of the chunk. |
+| Whether to restore | A stored state is read only while its measured read-and-decode cost per byte, times its bytes, is below the measured prefill time of the tokens it covers; tried while either is unmeasured. |
+| Writes | One at a time, queued behind earlier ones only while the disk drains the queue within the prefill time of the prompt that produced the state; otherwise skipped with a log line. |
+
+A DeepSeek V4.1 state costs about 2.7 MB of window per snapshot (the last 128 tokens of every layer, kept as the
 model keeps them) and about 1.1 KB per token of compressed KV, stored once in block files that every
 snapshot of a conversation shares. A prompt restores the longest stored prefix and prefills the rest
 in one layer-major pass onto it, so a stored prefix always pays. A pass over a few hundred tokens still

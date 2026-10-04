@@ -962,11 +962,13 @@ impl DeepseekV41Backend {
         mut self,
         store: std::sync::Arc<crate::inference::cache::state_disk::StateStore>,
         identity: crate::inference::model::deepseek_v41::snapshot::Identity,
+        token_bytes: usize,
     ) -> Self {
         self.state_cache = crate::inference::model::deepseek_v41::state_cache::StateCache::new(
             &self.model,
             store,
             identity,
+            token_bytes,
         );
         self
     }
@@ -1250,21 +1252,67 @@ impl ModelBackend for GenericBackend {
             return Ok(logits);
         }
         let chunk = adaptive_prefill_chunk(self.widest_ffn());
-        // One pass, no replay: a recurrent state that failed part way through the new tokens
-        // cannot be rewound, so the caller prefills the whole prompt from position 0 instead,
-        // which starts a fresh state.
+        // A recurrent state that failed part way through the new tokens cannot be rewound, so
+        // a failure ends in the caller prefilling the whole prompt from position 0 instead,
+        // which starts a fresh state; a card running out of memory is answered first by the
+        // smaller chunk the cold prefill would take, from the state restored again.
         let logits = match &cache {
-            Some(cache) => match self
-                .0
-                .prefill_with_grid(prompt, covered, chunk, cache.layout())
-            {
-                Ok((logits, grid)) => {
-                    self.0.snapshot_prefix(prompt, &logits)?;
-                    cache.save(&self.0, prompt, grid);
-                    return Ok(Some(logits));
+            Some(cache) => {
+                use std::sync::atomic::Ordering;
+                let widest = self.widest_ffn();
+                let first = match ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed) {
+                    0 => chunk,
+                    remembered => remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk),
+                };
+                let mut replay = false;
+                let grid = std::cell::RefCell::new(Vec::new());
+                let started = std::time::Instant::now();
+                let walked = crate::inference::place::recover::shrink_on_oom(
+                    "state cache prefill",
+                    first,
+                    |c| {
+                        (c > PREFILL_CHUNK_TOKENS_MIN)
+                            .then(|| (c / 2).max(PREFILL_CHUNK_TOKENS_MIN))
+                    },
+                    |c| {
+                        let want = (c * widest.max(1) * 4 * 2) as u64;
+                        crate::inference::place::vram_manager::ensure_gpu_headroom_blocking(
+                            "llm", want,
+                        )
+                    },
+                    |c| {
+                        if replay {
+                            self.0.trim_kv(0);
+                            if covered > 0 && cache.restore(&mut self.0, prompt) != covered {
+                                return Err(crate::tensor::Error::msg(
+                                    "state cache: the stored state went away during a replay"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                        replay = true;
+                        let stride = cache.stride(c);
+                        let (logits, points) =
+                            self.0
+                                .prefill_with_grid(prompt, covered, c, stride, cache.layout())?;
+                        *grid.borrow_mut() = points;
+                        Ok(logits)
+                    },
+                );
+                match walked {
+                    Ok((logits, used)) => {
+                        if used < chunk && used < prompt.len() - covered {
+                            ADAPTIVE_PREFILL_CHUNK.store(used, Ordering::Relaxed);
+                        }
+                        let secs = started.elapsed().as_secs_f64();
+                        cache.tuning().prefilled(prompt.len() - covered, secs);
+                        self.0.snapshot_prefix(prompt, &logits)?;
+                        cache.save(&self.0, prompt, grid.into_inner(), Some(secs));
+                        return Ok(Some(logits));
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
             None => {
                 let rest =
                     Tensor::new(&prompt[covered..], &crate::tensor::Device::Cpu)?.unsqueeze(0)?;

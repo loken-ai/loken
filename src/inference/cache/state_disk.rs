@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// The hash a stored snapshot or block is found by.
 pub type Key = [u8; 16];
@@ -44,6 +44,7 @@ const SUFFIX: &str = "snap";
 const BLOCK_SUFFIX: &str = "blk";
 const BLOCK_DIR: &str = "blocks";
 const INDEX_FILE: &str = "index.json";
+const GEOMETRY_FILE: &str = "geometry.json";
 const TMP_PREFIX: &str = ".tmp-";
 const MANIFEST_MAGIC: &[u8; 8] = b"LKSMAN01";
 
@@ -77,10 +78,40 @@ struct Inner {
 
 pub struct StateStore {
     dir: PathBuf,
+    /// Bytes the operator allows; 0 derives the limit from the filesystem's free space.
     budget: u64,
+    /// Tokens per block the operator fixed for every scope; 0 derives one per scope.
     block_tokens: usize,
+    /// The block size settled for each scope, kept in the directory so a restart finds the chain
+    /// it wrote.
+    geometry: Mutex<HashMap<[u8; 32], usize>>,
     inner: Mutex<Inner>,
     tmp_seq: AtomicU64,
+    tuning: super::state_tune::Tuning,
+    /// Bytes of writes waiting, and the turn they take on the disk one at a time.
+    pending: Arc<AtomicU64>,
+    turn: Arc<Mutex<()>>,
+}
+
+/// A write admitted to the queue. Dropping it releases its bytes.
+pub struct WriteTicket {
+    pending: Arc<AtomicU64>,
+    turn: Arc<Mutex<()>>,
+    bytes: u64,
+}
+
+impl WriteTicket {
+    /// Waits for the disk's turn, then runs `write`.
+    pub fn run<T>(&self, write: impl FnOnce() -> T) -> T {
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        write()
+    }
+}
+
+impl Drop for WriteTicket {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 /// The identity of a model's numerics from the parts that define them, in order: a part that
@@ -110,6 +141,17 @@ fn short(digest: impl AsRef<[u8]>) -> Key {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 fn unhex(s: &str) -> Option<Key> {
@@ -229,15 +271,12 @@ fn read_header(bytes: &[u8]) -> Option<(Vec<Key>, usize)> {
 }
 
 impl StateStore {
-    /// Open (creating) the store in `dir`. `budget` is in bytes, 0 for no limit; `block_tokens`
-    /// the block size of the hash chain, which must not change for a store in use.
+    /// Open (creating) the store in `dir`. `budget` is in bytes, 0 to derive it from the free
+    /// space of the filesystem; `block_tokens` the block size of the hash chain for every scope,
+    /// 0 to settle one per scope (see [`Self::settle`]). A block size must not change for a store
+    /// in use.
     pub fn open(dir: PathBuf, budget: u64, block_tokens: usize) -> Result<Self> {
         use std::io::Read;
-        if block_tokens == 0 {
-            return Err(anyhow!(
-                "state cache: block size must be at least one token"
-            ));
-        }
         std::fs::create_dir_all(dir.join(BLOCK_DIR)).with_context(|| dir.display().to_string())?;
         let index: IndexFile = match std::fs::read(dir.join(INDEX_FILE)) {
             Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
@@ -267,7 +306,7 @@ impl StateStore {
         for item in std::fs::read_dir(&dir)? {
             let item = item?;
             let name = item.file_name().to_string_lossy().into_owned();
-            if name == INDEX_FILE || name == BLOCK_DIR {
+            if name == INDEX_FILE || name == BLOCK_DIR || name == GEOMETRY_FILE {
                 continue;
             }
             if name.starts_with(TMP_PREFIX) {
@@ -335,26 +374,148 @@ impl StateStore {
             }
             keep
         });
+        let geometry: HashMap<[u8; 32], usize> = std::fs::read(dir.join(GEOMETRY_FILE))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<HashMap<String, usize>>(&b).ok())
+            .map(|m| {
+                m.into_iter()
+                    .filter_map(|(k, v)| Some((unhex32(&k)?, v)))
+                    .filter(|(_, v)| *v > 0)
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
             dir,
             budget,
             block_tokens,
+            geometry: Mutex::new(geometry),
             inner: Mutex::new(Inner {
                 entries,
                 refs,
                 block_bytes,
             }),
             tmp_seq: AtomicU64::new(0),
+            tuning: Default::default(),
+            pending: Arc::new(AtomicU64::new(0)),
+            turn: Arc::new(Mutex::new(())),
         })
     }
 
+    /// The block size the operator fixed, 0 when each scope settles its own.
     pub fn block_tokens(&self) -> usize {
         self.block_tokens
     }
 
+    /// The block size of the chain under `scope`: the operator's when one was fixed, else the one
+    /// settled for it. Panics when neither exists: a cache settles its scope before it hashes.
+    pub fn block_tokens_of(&self, scope: &[u8; 32]) -> usize {
+        if self.block_tokens > 0 {
+            return self.block_tokens;
+        }
+        *self
+            .geometry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(scope)
+            .expect("state cache: the scope's block size was not settled")
+    }
+
+    /// Settles the block size of `scope`: the operator's when fixed, the one kept from an earlier
+    /// run when there is one, else `derive` computes it from the store's measurements and it is
+    /// kept.
+    pub fn settle(&self, scope: &[u8; 32], derive: impl FnOnce(&Self) -> usize) -> usize {
+        if self.block_tokens > 0 {
+            return self.block_tokens;
+        }
+        if let Some(&b) = self
+            .geometry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(scope)
+        {
+            return b;
+        }
+        let b = derive(self).max(1);
+        let json = {
+            let mut g = self.geometry.lock().unwrap_or_else(|e| e.into_inner());
+            g.insert(*scope, b);
+            serde_json::to_vec(
+                &g.iter()
+                    .map(|(k, v)| (hex(k), *v))
+                    .collect::<HashMap<String, usize>>(),
+            )
+        };
+        if let Ok(json) = json {
+            let _ = self.write_file(&self.dir.join(GEOMETRY_FILE), &json);
+        }
+        b
+    }
+
+    /// The directory the store lives in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// What the engine and the disk have been measured to do.
+    pub fn tuning(&self) -> &super::state_tune::Tuning {
+        &self.tuning
+    }
+
+    /// Bytes the store may hold with `held` on disk now: the operator's budget, else what is held
+    /// and what the filesystem still offers less room for one more state of the largest size
+    /// written. `None` when the filesystem cannot say.
+    fn limit(&self, held: u64) -> Option<u64> {
+        if self.budget > 0 {
+            return Some(self.budget);
+        }
+        let free = super::state_tune::free_space(&self.dir)?;
+        Some(super::state_tune::derived_budget(
+            held,
+            free,
+            self.tuning.get().largest_state,
+        ))
+    }
+
+    /// Bytes the store could hold now: its limit, unbounded when the filesystem cannot say.
+    pub fn room(&self) -> u64 {
+        self.limit(self.held_bytes()).unwrap_or(u64::MAX)
+    }
+
+    /// What restoring `entry` reads: its manifest and its blocks.
+    pub fn entry_bytes(&self, entry: &Entry) -> u64 {
+        let g = self.lock();
+        entry.bytes
+            + entry
+                .blocks
+                .iter()
+                .map(|b| g.block_bytes.get(b).copied().unwrap_or(0))
+                .sum::<u64>()
+    }
+
+    /// The bytes of the manifests and blocks on disk.
+    fn held_bytes(&self) -> u64 {
+        self.stats().1
+    }
+
+    /// Admits a write of `bytes` to the queue when the disk drains what waits within
+    /// `window_s`, the compute time of the prompt the state belongs to.
+    pub fn admit(&self, bytes: u64, window_s: Option<f64>) -> Option<WriteTicket> {
+        let pending = self.pending.load(Ordering::Relaxed);
+        let w = self.tuning.get().write.per_sec();
+        if !super::state_tune::write_may_queue(pending, bytes, w, window_s) {
+            return None;
+        }
+        self.pending.fetch_add(bytes, Ordering::Relaxed);
+        Some(WriteTicket {
+            pending: self.pending.clone(),
+            turn: self.turn.clone(),
+            bytes,
+        })
+    }
+
     /// The hashes of `tokens` under `scope`.
     pub fn keys<'a>(&self, scope: &[u8; 32], tokens: &'a [u32]) -> PrefixKeys<'a> {
-        PrefixKeys::new(scope, self.block_tokens, tokens)
+        PrefixKeys::new(scope, self.block_tokens_of(scope), tokens)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -487,15 +648,19 @@ impl StateStore {
         let hashes: Vec<Key> = (0..nblocks)
             .map(|b| keys.block_hash(b))
             .collect::<Option<_>>()
-            .filter(|_| nblocks * self.block_tokens <= len)
+            .filter(|_| nblocks * keys.block_tokens <= len)
             .ok_or_else(|| anyhow!("state cache: {nblocks} blocks are outside {len} tokens"))?;
-        if self.budget > 0 && manifest.len() as u64 > self.budget {
-            tracing::info!(
-                "state cache: a {} MiB manifest exceeds the {} MiB budget; not stored",
-                manifest.len() >> 20,
-                self.budget >> 20
-            );
-            return Ok(());
+        let started = std::time::Instant::now();
+        let mut written = 0u64;
+        if let Some(limit) = self.limit(self.held_bytes()) {
+            if manifest.len() as u64 > limit {
+                tracing::info!(
+                    "state cache: a {} MiB manifest exceeds the {} MiB budget; not stored",
+                    manifest.len() >> 20,
+                    limit >> 20
+                );
+                return Ok(());
+            }
         }
         // Count the references first, so the blocks cannot be evicted between their write and the
         // manifest that names them.
@@ -539,6 +704,7 @@ impl StateStore {
                 release(self);
                 return Err(e);
             }
+            written += bytes.len() as u64;
             self.lock().block_bytes.insert(*h, bytes.len() as u64);
         }
         let mut file = Vec::with_capacity(12 + hashes.len() * 16 + manifest.len());
@@ -561,7 +727,18 @@ impl StateStore {
             release(self);
             return Err(e);
         }
+        written += file.len() as u64;
+        let whole = file.len() as u64 + {
+            let g = self.lock();
+            hashes
+                .iter()
+                .map(|h| g.block_bytes.get(h).copied().unwrap_or(0))
+                .sum::<u64>()
+        };
         self.lock().entries.insert(key, entry);
+        self.tuning.stored(whole, manifest.len() as u64);
+        self.tuning
+            .write_rate(written, started.elapsed().as_secs_f64());
         self.evict(&key);
         self.save_index();
         Ok(())
@@ -590,10 +767,8 @@ impl StateStore {
     /// Drop manifests, least recently used first and pinned ones last, until the manifests and the
     /// blocks they reference fit the budget. `keep` is never dropped.
     fn evict(&self, keep: &Key) {
-        if self.budget == 0 {
-            return;
-        }
         let mut victims = Vec::new();
+        let limit;
         {
             let g = self.lock();
             let mut total: u64 = g.entries.values().map(|e| e.bytes).sum::<u64>()
@@ -602,7 +777,11 @@ impl StateStore {
                     .filter(|(h, _)| g.refs.contains_key(*h))
                     .map(|(_, n)| *n)
                     .sum::<u64>();
-            if total <= self.budget {
+            limit = match self.limit(total) {
+                Some(l) => l,
+                None => return,
+            };
+            if total <= limit {
                 return;
             }
             let mut pinned: HashMap<u64, Key> = HashMap::new();
@@ -619,7 +798,7 @@ impl StateStore {
             // A block is freed with its last reference: count what each victim really returns.
             let mut left: HashMap<Key, usize> = g.refs.clone();
             for e in order {
-                if total <= self.budget {
+                if total <= limit {
                     break;
                 }
                 total -= e.bytes;
@@ -974,6 +1153,57 @@ mod tests {
         for tok in &t {
             assert!(!text.contains(&tok.to_string()), "token {tok} appears");
         }
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_scopes_block_size_is_settled_once_and_survives_a_restart() {
+        let d = dir("settle");
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let store = StateStore::open(d.clone(), 0, 0).unwrap();
+        assert_eq!(store.settle(&a, |_| 32), 32);
+        assert_eq!(store.settle(&a, |_| 99), 32, "settled: not derived again");
+        assert_eq!(
+            store.settle(&b, |_| 99),
+            99,
+            "another scope derives its own"
+        );
+        drop(store);
+        let again = StateStore::open(d.clone(), 0, 0).unwrap();
+        assert_eq!(again.block_tokens_of(&a), 32);
+        assert_eq!(again.block_tokens_of(&b), 99);
+        // An operator's block size wins for every scope.
+        let fixed = StateStore::open(dir("settle-fixed"), 0, 16).unwrap();
+        assert_eq!(fixed.settle(&a, |_| 99), 16);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_write_is_admitted_on_an_empty_queue_and_refused_behind_a_slow_one() {
+        let d = dir("admit");
+        let store = StateStore::open(d.clone(), 0, 8).unwrap();
+        let first = store.admit(1 << 20, None).expect("an empty queue admits");
+        assert!(
+            store.admit(1 << 20, None).is_none(),
+            "unmeasured: no queueing"
+        );
+        drop(first);
+        assert!(
+            store.admit(1 << 20, None).is_some(),
+            "released bytes leave the queue"
+        );
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn the_budget_follows_the_free_space_unless_the_operator_set_one() {
+        let d = dir("limit");
+        let derived = StateStore::open(d.clone(), 0, 8).unwrap();
+        let free = crate::inference::cache::state_tune::free_space(&d).unwrap();
+        let room = derived.room();
+        assert!(room > free / 2, "room {room} of {free} free");
+        let set = StateStore::open(dir("limit-set"), 1 << 20, 8).unwrap();
+        assert_eq!(set.room(), 1 << 20);
         let _ = std::fs::remove_dir_all(d);
     }
 }

@@ -222,7 +222,8 @@ fn wait_for_len(store: &StateStore, len: usize) {
 /// The prefill the serving path runs: from `from`, the grid states kept.
 fn prefill(m: &mut GenericHeteroTransformer, tokens: &[u32], from: usize) -> (Tensor, Vec<Point>) {
     let layout = m.state_layout(BLOCK);
-    m.prefill_with_grid(tokens, from, CHUNK, &layout).unwrap()
+    m.prefill_with_grid(tokens, from, CHUNK, CHUNK / BLOCK * BLOCK, &layout)
+        .unwrap()
 }
 
 /// Decodes `steps` tokens greedily and returns every step's logits bits.
@@ -321,7 +322,7 @@ fn a_restored_state_continues_bit_for_bit_like_its_live_twin() {
         grid.iter().map(|p| p.pos).collect::<Vec<_>>(),
         vec![stride, 2 * stride, 3 * stride]
     );
-    cache.save(&writer, &first, grid);
+    cache.save(&writer, &first, grid, None);
     for len in [stride, 2 * stride, 3 * stride, first.len()] {
         wait_for_len(&store, len);
     }
@@ -392,7 +393,7 @@ fn a_restored_state_and_its_remainder_equal_a_cold_prefill() {
     attach(&mut writer, &store, b"");
     let cache = writer.state_cache().unwrap();
     let (_, grid) = prefill(&mut writer, &first, 0);
-    cache.save(&writer, &first, grid);
+    cache.save(&writer, &first, grid, None);
     wait_for_len(&store, first.len());
 
     let mut second = first.clone();
@@ -441,7 +442,7 @@ fn a_damaged_foreign_or_stale_file_is_refused() {
         attach(&mut m, &store, b"");
         let cache = m.state_cache().unwrap();
         let (_, grid) = prefill(&mut m, &first, 0);
-        cache.save(&m, &first, grid);
+        cache.save(&m, &first, grid, None);
         wait_for_len(&store, first.len());
     };
 
@@ -542,4 +543,45 @@ fn rows_round_trip_bit_for_bit() {
 
 fn decode_block_for_test(block: &[(Vec<f32>, Vec<f32>)], layout: &Layout) -> (Vec<f32>, Vec<f32>) {
     block_round_trip(block, layout).remove(0)
+}
+
+/// With no block size fixed, the model settles one from the disk it writes to and finds the same
+/// one after a restart; a state stored under it is restored by the next run.
+#[test]
+fn a_derived_block_size_is_the_same_after_a_restart() {
+    let fx = Fixture::new("derived");
+    let dir = fx.store_dir();
+    let (block, tokens) = {
+        let store = Arc::new(StateStore::open(dir.clone(), 0, 0).unwrap());
+        let mut m = fx.model();
+        attach(&mut m, &store, b"");
+        let cache = m.state_cache().unwrap();
+        let block = cache.layout().block_tokens;
+        assert!(block >= 1);
+        assert!(dir.join("geometry.json").exists());
+        // A prompt of two blocks and a little, as far as the model's own context allows.
+        let tokens = prompt((2 * block + 10).min(3000));
+        if tokens.len() >= 2 * block {
+            let layout = m.state_layout(block);
+            let stride = block.max(CHUNK);
+            let (_, grid) = m
+                .prefill_with_grid(&tokens, 0, CHUNK, stride, &layout)
+                .unwrap();
+            cache.save(&m, &tokens, grid, None);
+            wait_for_len(&store, tokens.len());
+        }
+        (block, tokens)
+    };
+    let store = Arc::new(StateStore::open(dir, 0, 0).unwrap());
+    let mut m = fx.model();
+    attach(&mut m, &store, b"");
+    assert_eq!(m.state_cache().unwrap().layout().block_tokens, block);
+    if tokens.len() >= 2 * block {
+        let mut longer = tokens.clone();
+        longer.extend(prompt(20));
+        assert_eq!(
+            m.state_cache().unwrap().restore(&mut m, &longer),
+            tokens.len()
+        );
+    }
 }

@@ -63,13 +63,6 @@ impl Default for ServerConfig {
     }
 }
 
-/// Tokens per block of the decode-state cache's hash chain when the configuration names none.
-pub const DEFAULT_STATE_CACHE_BLOCK_TOKENS: usize = 256;
-
-fn default_state_cache_block_tokens() -> usize {
-    DEFAULT_STATE_CACHE_BLOCK_TOKENS
-}
-
 /// Inference configuration from TOML file. Only what loken cannot decide itself: the model it
 /// serves by default, where things live, and the features an operator switches on. Sampling,
 /// placement, threads and cache formats are decided from the model and the machine.
@@ -86,11 +79,13 @@ pub struct InferenceConfigToml {
     /// as the prompts.
     #[serde(default)]
     pub state_cache_dir: Option<String>,
-    /// Bytes the decode-state cache may hold, in GiB; 0 is no limit.
+    /// Bytes the decode-state cache may hold, in GiB; 0 derives the limit from the free space
+    /// of the cache directory's filesystem.
     #[serde(default)]
     pub state_cache_budget_gb: f64,
-    /// Tokens per block of the cache's hash chain. Changing it orphans the stored states.
-    #[serde(default = "default_state_cache_block_tokens")]
+    /// Tokens per block of the cache's hash chain; 0 derives one per model from its state size
+    /// and the directory's measured write cost. Changing it orphans the stored states.
+    #[serde(default)]
     pub state_cache_block_tokens: usize,
     /// Mixed into every state's identity: states written under another salt are never read.
     #[serde(default)]

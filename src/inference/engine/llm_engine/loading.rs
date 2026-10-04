@@ -792,6 +792,7 @@ impl LlmEngine {
                                     &(n_layers as u64).to_le_bytes(),
                                     state_cache_salt.as_bytes(),
                                 ]),
+                                cfg.state_bytes_per_token(),
                             );
                         }
                     }

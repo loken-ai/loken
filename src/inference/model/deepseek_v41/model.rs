@@ -3774,7 +3774,7 @@ mod oracle_gate {
         let store = Arc::new(StateStore::open(dir.clone(), 0, 8).unwrap());
         let id = super::super::snapshot::identity(&[b"synthetic"]);
         let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
-        let cache = StateCache::new(&model, store.clone(), id).unwrap();
+        let cache = StateCache::new(&model, store.clone(), id, 1).unwrap();
         let cached = V41BatchServer::spawn(Arc::new(model), None, None, 4, Some(cache));
         let first = run(&cached, &tokens[..24]);
         // The prompt's states and the finished sequence's: 8, 16, 24 and 24 + 4 tokens fed.
@@ -4687,7 +4687,7 @@ mod oracle_gate {
         let store = std::sync::Arc::new(StateStore::open(dir.to_path_buf(), 0, 8).unwrap());
         let id = super::super::snapshot::identity(&[b"synthetic"]);
         (
-            DeepseekV41Backend::new(model, 0, 128).with_state_cache(store.clone(), id),
+            DeepseekV41Backend::new(model, 0, 128).with_state_cache(store.clone(), id, 1),
             store,
         )
     }

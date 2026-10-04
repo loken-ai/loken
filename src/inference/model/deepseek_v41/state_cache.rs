@@ -27,6 +27,9 @@ pub struct StateCache {
     store: Arc<StateStore>,
     identity: Identity,
     ratios: Vec<usize>,
+    /// Tokens per block of this model's chain, settled in the store.
+    block: usize,
+    last_stride: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A prefix restored from the cache.
@@ -44,8 +47,23 @@ impl StateCache {
         model: &DeepseekV41Model,
         store: Arc<StateStore>,
         identity: Identity,
+        token_bytes: usize,
     ) -> Option<Self> {
-        let block = store.block_tokens();
+        // A block holds whole groups of every layer: a multiple of every ratio.
+        let granule = model
+            .compress_ratios()
+            .iter()
+            .filter(|&&r| r != 0)
+            .fold(1usize, |a, &r| a / gcd(a, r) * r);
+        let Some(block) = crate::inference::cache::state_tune::settle_block_tokens(
+            &store,
+            &identity,
+            granule,
+            token_bytes,
+        ) else {
+            tracing::warn!("state cache off: the directory cannot be written to measure it");
+            return None;
+        };
         if let Some(r) = model
             .compress_ratios()
             .iter()
@@ -59,6 +77,8 @@ impl StateCache {
         Some(Self {
             store,
             identity,
+            block,
+            last_stride: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             // The ratios of the layers a state has: the model lists the draft's after them.
             ratios: model.compress_ratios()[..model.n_layers().min(model.compress_ratios().len())]
                 .to_vec(),
@@ -68,7 +88,7 @@ impl StateCache {
     fn layout(&self) -> BlockLayout<'_> {
         BlockLayout {
             ratios: &self.ratios,
-            block_tokens: self.store.block_tokens(),
+            block_tokens: self.block,
         }
     }
 
@@ -78,6 +98,22 @@ impl StateCache {
     fn restore(&self, model: &DeepseekV41Model, ids: &[u32]) -> Option<Restored> {
         let keys = self.store.keys(&self.identity, ids);
         for entry in self.store.candidates(&keys, ids.len()) {
+            let bytes = self.store.entry_bytes(&entry);
+            let m = self.store.tuning().get();
+            if !crate::inference::cache::state_tune::restore_pays(
+                entry.len,
+                bytes,
+                m.restore.secs_per(),
+                m.prefill.secs_per(),
+            ) {
+                tracing::info!(
+                    "state cache: a {}-token state is not restored: reading {} MiB is expected to cost more than prefilling the tokens",
+                    entry.len,
+                    bytes >> 20
+                );
+                continue;
+            }
+            let started = std::time::Instant::now();
             let manifest = match self.store.read(&entry) {
                 Ok(b) => b,
                 Err(e) => {
@@ -103,6 +139,9 @@ impl StateCache {
                     if entry.len == ids.len() && snap.logits.is_none() {
                         continue;
                     }
+                    self.store
+                        .tuning()
+                        .restored(bytes, started.elapsed().as_secs_f64());
                     return Some(Restored {
                         covered: entry.len,
                         state: snap.state,
@@ -122,12 +161,32 @@ impl StateCache {
         None
     }
 
-    /// The token counts inside `(from, to)` at which a state is kept: every multiple of the
-    /// store's block size, which are the block boundaries.
+    /// The token counts inside `(from, to)` at which a state is kept: multiples of the stride the
+    /// store's measurements give, which are block boundaries.
     fn grid_points(&self, from: usize, to: usize) -> Vec<usize> {
-        let b = self.store.block_tokens();
-        (from / b + 1..)
-            .map(|k| k * b)
+        let m = self.store.tuning().get();
+        let s = crate::inference::cache::state_tune::grid_stride(
+            self.block,
+            self.block,
+            m.manifest_bytes,
+            m.write.per_sec(),
+            m.prefill.secs_per(),
+        );
+        if self
+            .last_stride
+            .swap(s, std::sync::atomic::Ordering::Relaxed)
+            != s
+        {
+            tracing::info!(
+                "state cache: a state every {s} tokens (block {}, manifest {} KiB, write {} MB/s, prefill {} tokens/s)",
+                self.block,
+                m.manifest_bytes >> 10,
+                m.write.per_sec().map_or(0.0, |w| w / 1e6) as u64,
+                m.prefill.per_sec().unwrap_or(0.0) as u64
+            );
+        }
+        (from / s + 1..)
+            .map(|k| k * s)
             .take_while(|&p| p < to)
             .collect()
     }
@@ -160,11 +219,14 @@ impl StateCache {
             }
         }
         let grid = self.grid_points(from, ids.len());
+        let started = std::time::Instant::now();
         let (out, windows) = if from == 0 {
             model.prefill_into_grid(ids, state, &grid)?
         } else {
             model.prefill_continue_grid(&ids[from..], state, &grid)?
         };
+        let secs = started.elapsed().as_secs_f64();
+        self.store.tuning().prefilled(ids.len() - from, secs);
         let logits = out.flatten_all()?.to_vec1::<f32>()?;
         self.save(
             model,
@@ -172,13 +234,14 @@ impl StateCache {
             ids,
             Some(logits),
             grid.into_iter().zip(windows).collect(),
+            Some(secs),
         );
         Ok((out, from))
     }
 
     /// The state a finished turn left, which stands after exactly `tokens`.
     pub fn save_turn(&self, model: &DeepseekV41Model, state: &DecodeState, tokens: &[u32]) {
-        self.save(model, state, tokens, None, Vec::new());
+        self.save(model, state, tokens, None, Vec::new(), None);
     }
 
     /// Write `state`, which stands after `tokens`, and the grid states a prefill passed on the
@@ -191,10 +254,17 @@ impl StateCache {
         tokens: &[u32],
         logits: Option<Vec<f32>>,
         grid: Vec<(usize, Vec<Vec<u8>>)>,
+        prefill_secs: Option<f64>,
     ) {
-        if state.pos != tokens.len() || tokens.len() < self.store.block_tokens() {
+        if state.pos != tokens.len() || tokens.len() < self.block {
             return;
         }
+        let m = self.store.tuning().get();
+        let estimate = m.largest_state.max(m.manifest_bytes) * (grid.len() as u64 + 1);
+        let Some(ticket) = self.store.admit(estimate, prefill_secs) else {
+            tracing::info!("state cache: a write is skipped, the disk is still behind");
+            return;
+        };
         let this = self.clone();
         let (state, tokens) = (state.clone(), tokens.to_vec());
         let grid: Vec<_> = grid
@@ -202,6 +272,7 @@ impl StateCache {
             .map(|(p, w)| (p, w, model.engram_after(&tokens[..p])))
             .collect();
         std::thread::spawn(move || {
+            ticket.run(|| {
             let layout = this.layout();
             if let Err(why) = block_shape(&state, &layout) {
                 tracing::info!("state cache: states are kept whole, not in blocks: {why}");
@@ -249,6 +320,15 @@ impl StateCache {
                 ),
                 Err(e) => tracing::warn!("state cache: not stored: {e}"),
             }
+        })
         });
+    }
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
     }
 }
