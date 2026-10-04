@@ -574,24 +574,38 @@ impl HeteroPlan {
         // `bytes_per_layer` and bounds this pass too. Only the flat reserve gives way,
         // and callers that pass none (the probe already removed it) see no change at all.
         if placed < total_layers && bytes_per_layer > 0 {
-            for (i, (kind, _, capacity)) in devices.iter().enumerate() {
-                if placed >= total_layers {
-                    break;
+            // A component with a cache takes one block at a time to the card that keeps the most
+            // of its capacity free after taking it, so the dip into the reserve is shared by the
+            // cards instead of landing whole on the first one that has room; one without keeps
+            // the first card with room.
+            let spare = |i: usize, counts: &[usize]| {
+                devices[i]
+                    .2
+                    .saturating_sub(counts[i] as u64 * bytes_per_layer)
+            };
+            let mut taken = vec![0usize; devices.len()];
+            while placed < total_layers {
+                let with_room =
+                    (0..devices.len()).filter(|&i| spare(i, &counts) >= bytes_per_layer);
+                let best = match kv_bytes_per_layer > 0 {
+                    true => with_room.max_by_key(|&i| spare(i, &counts)),
+                    false => with_room.into_iter().next(),
+                };
+                let Some(i) = best else { break };
+                counts[i] += 1;
+                taken[i] += 1;
+                placed += 1;
+            }
+            for (i, (kind, _, _)) in devices.iter().enumerate() {
+                if taken[i] > 0 {
+                    info!(
+                        "  {}: {} more layer(s) taken out of the {:.1} GB runtime reserve rather \
+                         than sent to the host",
+                        kind,
+                        taken[i],
+                        gpu_runtime_reserve_bytes as f64 / 1e9,
+                    );
                 }
-                let room = (capacity / bytes_per_layer) as usize;
-                let extra = room.saturating_sub(counts[i]).min(total_layers - placed);
-                if extra == 0 {
-                    continue;
-                }
-                info!(
-                    "  {}: {} more layer(s) taken out of the {:.1} GB runtime reserve rather \
-                     than sent to the host",
-                    kind,
-                    extra,
-                    gpu_runtime_reserve_bytes as f64 / 1e9,
-                );
-                counts[i] += extra;
-                placed += extra;
             }
         }
 
