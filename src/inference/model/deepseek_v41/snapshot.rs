@@ -20,6 +20,7 @@
 
 use super::cache::{AttnCache, DecodeState};
 use super::engram::EngramState;
+use super::packed::{fp4_len, fp8_len, pack_fp4, pack_fp8, unpack_fp4, unpack_fp8};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 
@@ -27,7 +28,7 @@ const MAGIC: &[u8; 8] = b"LKDSSNAP";
 
 /// Bumped whenever the byte layout or the meaning of a field changes; a file of another version
 /// is refused rather than reinterpreted.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 const DIGEST_LEN: usize = 32;
 
@@ -108,6 +109,58 @@ impl Writer {
             self.u32(*x);
         }
     }
+    /// `v` in the packed form of `kind` when it is on that grid bit for bit, as f32 otherwise.
+    fn rows(&mut self, kind: Kind, v: &[f32]) {
+        match kind.pack(v) {
+            Some(bytes) => {
+                self.0.push(1);
+                self.u64(v.len() as u64);
+                self.u64(bytes.len() as u64);
+                self.0.extend_from_slice(&bytes);
+            }
+            None => {
+                self.0.push(0);
+                self.f32s(v);
+            }
+        }
+    }
+}
+
+/// The quantised forms the cache rows come in.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// e4m3, power-of-two scale per block of 32: the window rows.
+    Fp8,
+    /// e2m1, f32 scale per block of 16: the compressed KV.
+    Fp4Block16,
+    /// e2m1, power-of-two scale per block of 32: the index keys.
+    Fp4Pow2Block32,
+}
+
+impl Kind {
+    fn pack(self, v: &[f32]) -> Option<Vec<u8>> {
+        match self {
+            Self::Fp8 => pack_fp8(v),
+            Self::Fp4Block16 => pack_fp4(v, 16, false),
+            Self::Fp4Pow2Block32 => pack_fp4(v, 32, true),
+        }
+    }
+    /// Packed bytes for `n` values, `None` when `n` is not a whole number of blocks.
+    fn packed_len(self, n: usize) -> Option<usize> {
+        let (block, len) = match self {
+            Self::Fp8 => (32, fp8_len(n)),
+            Self::Fp4Block16 => (16, fp4_len(n, 16, false)),
+            Self::Fp4Pow2Block32 => (32, fp4_len(n, 32, true)),
+        };
+        n.is_multiple_of(block).then_some(len)
+    }
+    fn unpack(self, bytes: &[u8], n: usize) -> Vec<f32> {
+        match self {
+            Self::Fp8 => unpack_fp8(bytes, n),
+            Self::Fp4Block16 => unpack_fp4(bytes, n, 16, false),
+            Self::Fp4Pow2Block32 => unpack_fp4(bytes, n, 32, true),
+        }
+    }
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -144,6 +197,20 @@ impl<'a> Reader<'a> {
             .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
             .collect())
     }
+    fn rows(&mut self, kind: Kind) -> Result<Vec<f32>, SnapshotError> {
+        match self.take(1)?[0] {
+            0 => self.f32s(),
+            1 => {
+                let n = usize::try_from(self.u64()?).map_err(|_| SnapshotError::Truncated)?;
+                let len = self.len(1)?;
+                if kind.packed_len(n) != Some(len) {
+                    return Err(SnapshotError::Shape("packed rows"));
+                }
+                Ok(kind.unpack(self.take(len)?, n))
+            }
+            _ => Err(SnapshotError::Shape("rows mode")),
+        }
+    }
     fn u32s(&mut self) -> Result<Vec<u32>, SnapshotError> {
         let n = self.len(4)?;
         Ok(self
@@ -165,12 +232,21 @@ pub fn encode(state: &DecodeState, logits: Option<&[f32]>, identity: &Identity) 
     w.u32(state.layers.len() as u32);
     for layer in &state.layers {
         w.u64(layer.n_groups as u64);
+        let row_len = layer.win.front().map_or(0, Vec::len);
         w.u64(layer.win.len() as u64);
-        for row in &layer.win {
-            w.f32s(row);
+        w.u64(row_len as u64);
+        let flat: Vec<f32> = layer.win.iter().flatten().copied().collect();
+        if flat.len() == layer.win.len() * row_len {
+            w.0.push(1);
+            w.rows(Kind::Fp8, &flat);
+        } else {
+            w.0.push(0);
+            for row in &layer.win {
+                w.f32s(row);
+            }
         }
-        w.f32s(&layer.comp_kv);
-        w.f32s(&layer.index_k);
+        w.rows(Kind::Fp4Block16, &layer.comp_kv);
+        w.rows(Kind::Fp4Pow2Block32, &layer.index_k);
         w.u64(layer.group_x.len() as u64);
         for row in &layer.group_x {
             w.f32s(row);
@@ -222,14 +298,32 @@ pub fn decode(
     let mut layers = Vec::with_capacity(n_layers);
     for _ in 0..n_layers {
         let n_groups = usize::try_from(r.u64()?).map_err(|_| SnapshotError::Truncated)?;
-        // Each window row carries at least its own length word.
-        let n_win = r.len(8)?;
-        let mut win = VecDeque::with_capacity(n_win);
-        for _ in 0..n_win {
-            win.push_back(r.f32s()?);
+        let n_win = usize::try_from(r.u64()?).map_err(|_| SnapshotError::Truncated)?;
+        let row_len = usize::try_from(r.u64()?).map_err(|_| SnapshotError::Truncated)?;
+        let mut win = VecDeque::new();
+        match r.take(1)?[0] {
+            1 => {
+                let flat = r.rows(Kind::Fp8)?;
+                if n_win.checked_mul(row_len) != Some(flat.len()) {
+                    return Err(SnapshotError::Shape("window rows"));
+                }
+                if row_len > 0 {
+                    win.extend(flat.chunks_exact(row_len).map(<[f32]>::to_vec));
+                }
+            }
+            0 => {
+                // Each window row carries at least its own length word.
+                if n_win.checked_mul(8).is_none_or(|b| b > r.0.len()) {
+                    return Err(SnapshotError::Truncated);
+                }
+                for _ in 0..n_win {
+                    win.push_back(r.f32s()?);
+                }
+            }
+            _ => return Err(SnapshotError::Shape("window mode")),
         }
-        let comp_kv = r.f32s()?;
-        let index_k = r.f32s()?;
+        let comp_kv = r.rows(Kind::Fp4Block16)?;
+        let index_k = r.rows(Kind::Fp4Pow2Block32)?;
         let n_x = r.len(8)?;
         let mut group_x = Vec::with_capacity(n_x);
         for _ in 0..n_x {
@@ -309,6 +403,33 @@ mod tests {
         assert_eq!(back.logits.as_deref(), Some(&[0.25, -2.0][..]));
         let none = decode(&encode(&s, None, &id()), &id(), 2).unwrap();
         assert!(none.logits.is_none());
+    }
+
+    /// A state whose rows are what the quantisers produce is written packed: smaller by a factor
+    /// of several, and back to the bit.
+    #[test]
+    fn quantised_rows_are_stored_packed_and_come_back_exact() {
+        use crate::inference::model::deepseek_v41::attention::act_quant_fp8_e4m3;
+        use crate::inference::model::deepseek_v41::band::fp4_act_quant;
+        use crate::tensor::{Device, Tensor};
+        let raw: Vec<f32> = (0..64 * 40)
+            .map(|i| ((i * 2654435761u64 as usize) % 1000) as f32 / 97.0 - 5.0)
+            .collect();
+        let t = |rows: usize| {
+            Tensor::from_vec(raw[..rows * 64].to_vec(), (rows, 64), &Device::Cpu).unwrap()
+        };
+        let flat = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut s = DecodeState::new(1);
+        s.pos = 30;
+        let win = flat(act_quant_fp8_e4m3(&t(30), 32).unwrap());
+        s.layers[0].win = win.chunks(64).map(<[f32]>::to_vec).collect();
+        s.layers[0].comp_kv = flat(fp4_act_quant(&t(20), 16, false).unwrap());
+        s.layers[0].index_k = flat(fp4_act_quant(&t(20), 32, true).unwrap());
+        s.layers[0].n_groups = 20;
+        let bytes = encode(&s, None, &id());
+        let floats = (win.len() + 2 * 20 * 64) * 4;
+        assert!(bytes.len() * 3 < floats, "{} against {floats}", bytes.len());
+        assert!(same_state(&s, &decode(&bytes, &id(), 1).unwrap().state));
     }
 
     #[test]

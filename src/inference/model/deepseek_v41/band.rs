@@ -22,7 +22,7 @@ const FP4_MAX: f32 = 6.0;
 /// Block-wise fp4 (e2m1) quant/dequant round trip on the last dimension. With `pow2_scale` the
 /// block scale is rounded up to a power of two (the e8m0 format the indexer q/k use); without it
 /// the raw f32 scale is kept (the e4m3-scale path the compressed latent uses).
-fn fp4_act_quant(x: &Tensor, block: usize, pow2_scale: bool) -> Result<Tensor> {
+pub(crate) fn fp4_act_quant(x: &Tensor, block: usize, pow2_scale: bool) -> Result<Tensor> {
     let dims = x.dims().to_vec();
     let n = *dims.last().unwrap();
     debug_assert_eq!(n % block, 0);

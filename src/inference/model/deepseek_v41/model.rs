@@ -2651,6 +2651,22 @@ mod oracle_gate {
                 let mut live = model.new_decode_state();
                 let at_split = vecf_of(&model.prefill_into(&tokens[..split], &mut live).unwrap());
                 let bytes = encode(&live, Some(&at_split), &id);
+                // The rows are on their grids, so the file is a fraction of the f32 state.
+                let floats = live
+                    .layers
+                    .iter()
+                    .map(|l| {
+                        l.win.iter().map(Vec::len).sum::<usize>()
+                            + l.comp_kv.len()
+                            + l.index_k.len()
+                    })
+                    .sum::<usize>()
+                    * 4;
+                assert!(
+                    bytes.len() < floats / 2 + at_split.len() * 4 + 4096 + live.layers.len() * 8192,
+                    "{ratios:?} split {split}: {} bytes for {floats} of rows",
+                    bytes.len()
+                );
                 let back = decode(&bytes, &id, model.n_layers()).unwrap();
                 assert!(same_state(&live, &back.state), "{ratios:?} split {split}");
                 assert_eq!(back.logits.as_deref(), Some(&at_split[..]));
