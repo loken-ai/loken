@@ -23,6 +23,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Tools: DeepSeek DSML calls, and a generic tool-calls block fallback.
 - Requant: a model into a new tag, on the GPU, as detached work.
 - Loading: a split GGUF as one source; a BPE or Unigram tokenizer from it.
+- Loading: a split GGUF set on the generic route, read as one model part by part.
 - Cluster: routing for every surface, handing a model or render to a peer.
 - Cluster: the model listing shows a loading model and per-layer placement.
 - Cluster: a peers endpoint, and a scrape endpoint behind a feature.
@@ -47,6 +48,13 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Tests: the demand-ledger tests take turns, so a module's parallelism no longer fails them.
+- Catalogue: a GGUF in the Hugging Face store is listed as one, with the model's own parameter
+  count, split sets included.
+- Client: a load the daemon refuses is reported, not printed as a success.
+- CLI: pull follows the daemon's streamed progress, with no total deadline.
+- Loading: a part of a split set on the single-file route is refused, not built as pass-through
+  blocks.
 - Reasoning: markers survive decode, so the thought is not the answer.
 - Reasoning: a prompt-opened block is read as reasoning (deepcoder, qwen3.5).
 - Tools: calls no longer leak into the answer (XML, arrays, failed templates).

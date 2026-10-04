@@ -19,6 +19,13 @@ loaded loads it, and a model stays resident for the keep-alive the daemon was st
 Quantisations are read as the file carries them. On the cards the block formats run through
 their own kernels; on the host they need AVX2 (see [`BUILDING.md`](BUILDING.md)).
 
+A GGUF split into parts by `gguf-split` is read as one model on the generic route: the first
+part's metadata, the union of the parts' tensor directories, each tensor read from the part
+that holds it. It is named by its first part, and a part whose siblings are missing is refused.
+A set is placed layer by layer, never tensor-parallel. A family's vision tower reads from the
+first part only; a set whose `v.*` tensors sit in another part is served as text, and the log
+says why.
+
 ## Language models
 
 One generic transformer reads its shape from the checkpoint, so a family is a row in a table
