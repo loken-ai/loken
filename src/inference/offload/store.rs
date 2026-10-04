@@ -376,6 +376,18 @@ impl ExpertStore {
                 }
             }
         }
+        // Into page-locked memory a card's uploads read from directly, where there is a card.
+        #[cfg(feature = "cuda")]
+        {
+            let spans: Vec<(usize, usize)> = todo
+                .iter()
+                .flat_map(|e| [&e.w1, &e.w3, &e.w2])
+                .filter_map(|p| p.storage_span())
+                .collect();
+            if crate::tensor::cuda::prestage_weights(spans, readers.max(1)) {
+                return;
+            }
+        }
         let readers = readers.max(1).min(todo.len().max(1));
         let todo = Arc::new(todo);
         let next = Arc::new(AtomicUsize::new(0));

@@ -18,6 +18,10 @@ use super::*;
 /// freezes the entire server (an incident: a Flux OOM inside MMQ
 /// wedged the process for two hours). Skipping a contended workspace is
 /// also semantically required - the holder is using it.
+pub fn reclaim_pool(dev: &CudaDevice) {
+    emergency_reclaim(dev)
+}
+
 pub(super) fn emergency_reclaim(dev: &CudaDevice) {
     crate::tensor::quantized::fast_mmvq::release_workspaces();
     crate::tensor::quantized::release_mmq_workspaces();

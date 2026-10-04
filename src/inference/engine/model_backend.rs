@@ -877,10 +877,11 @@ impl DeepseekV41Backend {
         dspark: Option<crate::inference::model::deepseek_v41::dspark::Dspark>,
     ) -> Self {
         use crate::inference::offload::streamed::Streamed;
-        // Decode needs only a small transient (windowed attention bounds KV growth); a wider
-        // step - a prompt's attention, its projections, its experts' products - takes its room
-        // from the coldest kept experts when it runs (`Card::attempt`).
-        const PREFILL_TRANSIENT_TOKENS: usize = 64;
+        // Room each card keeps free for a prompt this wide to run its stream, attention and
+        // experts there. With less, the experts that fill the cards leave a prompt's steps to
+        // decline, and they fall to the host for the rest of the request. A wider prompt runs its
+        // widest steps in chunks.
+        const PREFILL_TRANSIENT_TOKENS: usize = 2048;
         let state = model.new_decode_state();
         // The engine opens the card placement through the generic streamed-model seam: the model
         // states its resident footprint, routing and experts, and no architecture is named here.

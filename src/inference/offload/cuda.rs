@@ -1217,6 +1217,25 @@ struct CardHc {
     s: HcStreamDev,
 }
 
+impl CardHc {
+    /// `f` with room made for it first, from the coldest experts the card keeps, and once more
+    /// after the device's pool is trimmed if it still finds the card full: the stream's steps
+    /// are not ones to hand to the host halfway through a prompt.
+    fn with_room<T>(&self, need: usize, mut f: impl FnMut(&HcStreamDev) -> Result<T>) -> Result<T> {
+        if !self.card.has_free(need) {
+            self.card.evict_to_fit(need, u64::MAX);
+        }
+        match f(&self.s) {
+            Err(e) if crate::inference::place::ladder::is_out_of_memory(&e) => {
+                crate::tensor::cuda::reclaim_pool(&self.card.dev);
+                self.card.evict_to_fit(need * 2, u64::MAX);
+                f(&self.s)
+            }
+            r => r,
+        }
+    }
+}
+
 impl super::HcStream for CardHc {
     fn mixes(
         &mut self,
@@ -1228,30 +1247,33 @@ impl super::HcStream for CardHc {
         hc_eps: f32,
     ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let need = (func.len() + 2 * self.s.len()) * F32;
-        let (card, s) = (&self.card, &self.s);
-        card.attempt("the stream's mixes", need, || {
-            s.mixes(&card.dev, func, scale, base, iters, norm_eps, hc_eps)
+        let dev = &self.card.dev;
+        self.with_room(need, |s| {
+            s.mixes(dev, func, scale, base, iters, norm_eps, hc_eps)
         })
-        .unwrap_or_else(|| Err(Error::msg("the card has no room for the stream's mixes")))
     }
 
     fn pre_norm(&mut self, pre: &[f32], w: &[f32], eps: f32) -> Result<Vec<f32>> {
         let need = self.s.len() / 2 * F32;
-        let (card, s) = (&self.card, &self.s);
-        card.attempt("the stream's collapse", need, || {
-            s.pre_norm(&card.dev, pre, w, eps)
-        })
-        .unwrap_or_else(|| Err(Error::msg("the card has no room for the stream's collapse")))
+        let dev = &self.card.dev;
+        self.with_room(need, |s| s.pre_norm(dev, pre, w, eps))
     }
 
     fn post(&mut self, xo: &[f32], post: &[f32], comb: &[f32]) -> Result<()> {
         let need = xo.len() * F32 * 2;
+        if !self.card.has_free(need) {
+            self.card.evict_to_fit(need, u64::MAX);
+        }
         let card = self.card.clone();
-        let s = &mut self.s;
-        card.attempt("the stream's update", need, || {
-            s.post(&card.dev, xo, post, comb)
-        })
-        .unwrap_or_else(|| Err(Error::msg("the card has no room for the stream's update")))
+        let first = self.s.post(&card.dev, xo, post, comb);
+        match first {
+            Err(e) if crate::inference::place::ladder::is_out_of_memory(&e) => {
+                crate::tensor::cuda::reclaim_pool(&card.dev);
+                card.evict_to_fit(need * 2, u64::MAX);
+                self.s.post(&card.dev, xo, post, comb)
+            }
+            r => r,
+        }
     }
 
     fn rows(&mut self, from: usize, count: usize) -> Result<Vec<f32>> {
@@ -1344,18 +1366,14 @@ impl Card {
 }
 
 impl Offload for Cards {
-    /// On the card with the most free memory now, the stream's card or not.
+    /// On the fastest card that has the room, as the placement ranks them.
     fn prefill_attention(&self, a: &super::PrefillAttn) -> Option<Result<Vec<f32>>> {
-        let mut order: Vec<&Arc<Card>> = self.0.iter().collect();
-        order.sort_by_key(|c| std::cmp::Reverse(c.free_now().unwrap_or(0)));
-        order.into_iter().find_map(|c| c.prefill_attention(a))
+        self.0.iter().find_map(|c| c.prefill_attention(a))
     }
 
-    /// On the card with the most free memory now, the others being left to the experts.
+    /// On the fastest card that has the room, as the placement ranks them.
     fn hc_stream(&self, x: &[f32], hc: usize, d: usize) -> Option<Box<dyn super::HcStream>> {
-        let mut order: Vec<&Arc<Card>> = self.0.iter().collect();
-        order.sort_by_key(|c| std::cmp::Reverse(c.free_now().unwrap_or(0)));
-        for card in order {
+        for card in &self.0 {
             let opened = card.attempt("a prompt's residual stream", x.len() * 2 * F32, || {
                 HcStreamDev::open(&card.dev, x, hc, d)
             });

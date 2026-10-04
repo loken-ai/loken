@@ -99,6 +99,14 @@ impl LayerAttn {
     }
 }
 
+/// Where a prefill's stream stands after a layer run against a card that holds it.
+pub enum DevLayer {
+    /// Still on the card; the collapse weights for the next layer.
+    Device(Vec<Vec<f32>>),
+    /// Handed back to the host: the stream and the collapse weights.
+    Host(Tensor, Vec<Vec<f32>>),
+}
+
 /// The hyper-connection weights of one sublayer: the projection, its per-set scales, and biases.
 pub struct HcWeights {
     pub func: Tensor,  // [mix_hc, hc*d]
@@ -184,8 +192,8 @@ impl Block {
 
     /// One layer of a prefill whose residual stream is held by `ds` (a card): both halves, with the
     /// stream's mixes, collapse and update done there and only each sublayer's input and output
-    /// crossing. `pre_mix` is the collapse weights from the layer above; returns the ones this
-    /// layer hands to the next.
+    /// crossing. `pre_mix` is the collapse weights from the layer above. A step the card cannot
+    /// do hands the stream back to the host, which finishes the layer and carries on without it.
     pub fn forward_prefill_dev(
         &self,
         ds: &mut dyn crate::inference::offload::HcStream,
@@ -194,7 +202,7 @@ impl Block {
         sin: &Tensor,
         shared: &mut SharedAttn,
         cache: Option<&mut AttnCache>,
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<DevLayer> {
         use crate::inference::offload::stage;
         let hc = self.hc_mult;
         let n = pre_mix.len();
@@ -230,24 +238,67 @@ impl Block {
             let xin = ds.pre_norm(&flat(pre), &w, self.norm_eps)?;
             Tensor::from_vec(xin, (1, n, d), &crate::tensor::Device::Cpu)
         };
-        let am = stage("hc mixes", || mixes(ds, &self.hc_attn))?;
-        let xin = stage("hc pre and norm", || input(ds, pre_mix, &self.attn_norm))?;
+        // The stream as the host holds it from here on.
+        let back = |ds: &mut dyn crate::inference::offload::HcStream,
+                    why: &crate::tensor::Error|
+         -> Result<Tensor> {
+            tracing::warn!(
+                "the card cannot hold the prompt's stream ({why}); the host finishes it"
+            );
+            Tensor::from_vec(ds.rows(0, n)?, (1, n, hc, d), &crate::tensor::Device::Cpu)
+        };
+        let attended = (|| -> Result<(HcMixes, Tensor)> {
+            let am = stage("hc mixes", || mixes(ds, &self.hc_attn))?;
+            let xin = stage("hc pre and norm", || input(ds, pre_mix, &self.attn_norm))?;
+            Ok((am, xin))
+        })();
+        let (am, xin) = match attended {
+            Ok(v) => v,
+            Err(e) => {
+                let x = back(ds, &e)?;
+                let (mid, mix) = self.forward_prefill_attn(&x, pre_mix, cos, sin, shared, cache)?;
+                let (nx, npm) = self.forward_prefill_ffn(&mid, &mix)?;
+                return Ok(DevLayer::Host(nx, npm));
+            }
+        };
         let xattn = stage("attention", || {
             self.attn
                 .forward_prefill_cached(&xin, cos, sin, shared, cache)
         })?;
-        stage("hc post", || {
+        let posted = stage("hc post", || {
             let xo = super::hyper_connections::dense_f32(&xattn)?;
             ds.post(&xo, &flat(&am.post), &comb_flat(&am.comb))
-        })?;
-        let fm = stage("hc mixes", || mixes(ds, &self.hc_ffn))?;
-        let xin = stage("hc pre and norm", || input(ds, &am.pre, &self.ffn_norm))?;
+        });
+        if let Err(e) = posted {
+            let x = back(ds, &e)?;
+            let mid = hc_post(&xattn, &x, &am.post, &am.comb, hc)?;
+            let (nx, npm) = self.forward_prefill_ffn(&mid, &am.pre)?;
+            return Ok(DevLayer::Host(nx, npm));
+        }
+        let ffn = (|| -> Result<(HcMixes, Tensor)> {
+            let fm = stage("hc mixes", || mixes(ds, &self.hc_ffn))?;
+            let xin = stage("hc pre and norm", || input(ds, &am.pre, &self.ffn_norm))?;
+            Ok((fm, xin))
+        })();
+        let (fm, xin) = match ffn {
+            Ok(v) => v,
+            Err(e) => {
+                let x = back(ds, &e)?;
+                let (nx, npm) = self.forward_prefill_ffn(&x, &am.pre)?;
+                return Ok(DevLayer::Host(nx, npm));
+            }
+        };
         let xffn = stage("moe", || self.moe.forward(&xin))?;
-        stage("hc post", || {
+        let posted = stage("hc post", || {
             let xo = super::hyper_connections::dense_f32(&xffn)?;
             ds.post(&xo, &flat(&fm.post), &comb_flat(&fm.comb))
-        })?;
-        Ok(fm.pre)
+        });
+        if let Err(e) = posted {
+            let x = back(ds, &e)?;
+            let out = hc_post(&xffn, &x, &fm.post, &fm.comb, hc)?;
+            return Ok(DevLayer::Host(out, fm.pre));
+        }
+        Ok(DevLayer::Device(fm.pre))
     }
 
     /// The FFN half of `forward_prefill`, over `x` [b, s, hc, d] and the pre-mix attention produced.

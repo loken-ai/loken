@@ -98,6 +98,10 @@ pub struct AttnBlock<'a> {
     pub scale: f32,
 }
 
+/// Bytes of a quantised weight expanded to f32 on a card at a time: the tile a projection wider than
+/// that goes through in pieces, and what a card keeps free for each such step in flight.
+pub const WEIGHT_TILE_BYTES: usize = 96 << 20;
+
 /// A prompt's residual stream kept on a card for the whole prompt, with the hyper-connection steps
 /// that read and rewrite it. Only the sublayers' inputs and outputs, and a few values per token,
 /// cross to the host.

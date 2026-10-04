@@ -598,14 +598,22 @@ impl DeepseekV41Model {
             };
             let (cos, sin) = (&prefill.ropes[rope].0, &prefill.ropes[rope].1);
             if let Some(ds) = held.as_mut() {
-                prefill.pre_mix = block.forward_prefill_dev(
+                match block.forward_prefill_dev(
                     ds.as_mut(),
                     &prefill.pre_mix,
                     cos,
                     sin,
                     &mut prefill.shared,
                     Some(&mut state.layers[i]),
-                )?;
+                )? {
+                    super::block::DevLayer::Device(pre) => prefill.pre_mix = pre,
+                    super::block::DevLayer::Host(x, pre) => {
+                        // The card let go of the stream: the host has it from here.
+                        prefill.x = x;
+                        prefill.pre_mix = pre;
+                        held = None;
+                    }
+                }
             } else {
                 let (mid, mix) = block.forward_prefill_attn(
                     &prefill.x,
@@ -775,6 +783,8 @@ impl DeepseekV41Model {
     /// scores over the batch, the batch's residual streams, and the largest weight a batch
     /// product sends over for the call.
     pub fn transient_bytes(&self, tokens: usize) -> usize {
+        /// Experts a card runs at once during a prompt: the threads that feed it.
+        const EXPERT_LANES_IN_FLIGHT: usize = 4;
         let f = std::mem::size_of::<f32>();
         let inter = self
             .blocks
@@ -798,7 +808,13 @@ impl DeepseekV41Model {
             .max()
             .unwrap_or(0)
             .max(self.output.bytes());
-        per_lane * self.n_activated().max(1) + scores + streams + largest
+        // A card that holds a prompt's stream and runs its attention and experts needs room for
+        // them as well: the sublayers' inputs and outputs, the layer's token context, the tiles
+        // of the attention weights expanded to f32, and the weights of the experts in flight.
+        let prompt_steps = 4 * tokens * self.dim * f;
+        let tiles = 3 * crate::inference::offload::WEIGHT_TILE_BYTES;
+        let in_flight = EXPERT_LANES_IN_FLIGHT * 2 * inter * self.dim * f;
+        per_lane + scores + streams + largest + prompt_steps + tiles + in_flight
     }
 
     /// The token embedding table `[vocab, dim]`, shared with the DSpark draft.

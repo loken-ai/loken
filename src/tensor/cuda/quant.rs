@@ -891,7 +891,7 @@ pub fn gpu_expert_rows_grouped_multi(
 /// the expanded f32 weights of one tile of output rows and their products. A weight wider than
 /// this is multiplied one tile of rows after another, so a card with little room beside what it
 /// keeps still takes a prompt's projections.
-pub const QUANT_LINEAR_TILE_BYTES: usize = 96 << 20;
+pub const QUANT_LINEAR_TILE_BYTES: usize = crate::inference::offload::WEIGHT_TILE_BYTES;
 
 /// `x` [n, inp] through a quantised weight [out, inp] on the card, as `[n, out]`, one tile of
 /// output rows at a time (see `QUANT_LINEAR_TILE_BYTES`).
@@ -1087,6 +1087,180 @@ unsafe impl Send for Pinned {}
 
 static PINNED: std::sync::Mutex<Vec<Pinned>> = std::sync::Mutex::new(Vec::new());
 
+/// A layer's expert weights read ahead into page-locked memory while the layer before computes.
+/// Two slabs alternate, one being filled for the next layer while the other is consumed by this
+/// one; an upload that finds its weight there copies from it directly, with no read and no copy
+/// into a staging buffer of its own.
+struct SlabInner {
+    ptr: usize,
+    cap: usize,
+    /// Bumped when the slab is refilled: readers of an earlier fill stop, and its entries vanish.
+    generation: u64,
+    /// Source address of a weight to its place in the slab and whether it has arrived.
+    entries: std::collections::HashMap<usize, (usize, usize, bool)>,
+    /// Reader threads still running on this slab.
+    active: usize,
+}
+
+struct Slab {
+    inner: std::sync::Mutex<SlabInner>,
+    cv: std::sync::Condvar,
+}
+
+fn slabs() -> &'static [Slab; 2] {
+    static S: std::sync::OnceLock<[Slab; 2]> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let one = || Slab {
+            inner: std::sync::Mutex::new(SlabInner {
+                ptr: 0,
+                cap: 0,
+                generation: 0,
+                entries: Default::default(),
+                active: 0,
+            }),
+            cv: std::sync::Condvar::new(),
+        };
+        [one(), one()]
+    })
+}
+
+static SLAB_TURN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Start reading the weights at `spans` = (address, length) of mapped files into the next slab,
+/// on `readers` threads this call does not wait for, in the order given and as many as the host's
+/// free memory allows a quarter of. Answers whether the slab took them; `false` leaves the reads
+/// to whoever asks for the weights.
+pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        if spans.is_empty() {
+            return false;
+        }
+        // PLACEMENT-EXEMPT: sizes a host staging area, not a device placement. What the kernel
+        // calls available counts the page cache it can give back, which free pages do not.
+        let avail = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|m| {
+                m.lines()
+                    .find_map(|l| l.strip_prefix("MemAvailable:"))
+                    .and_then(|v| v.split_whitespace().next()?.parse::<usize>().ok())
+            })
+            .map_or(0, |kb| kb * 1024);
+        let budget = avail / 4;
+        let mut taken = 0usize;
+        let mut chosen: Vec<(usize, usize, usize)> = Vec::new();
+        for &(addr, len) in &spans {
+            let at = (taken + 63) / 64 * 64;
+            if at + len > budget {
+                break;
+            }
+            chosen.push((addr, len, at));
+            taken = at + len;
+        }
+        if chosen.is_empty() {
+            return false;
+        }
+        let turn = SLAB_TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2;
+        let slab = &slabs()[turn];
+        let generation = {
+            let mut g = slab.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // Readers of the fill before stop at their next weight; wait for them, since the
+            // slab may be about to move.
+            g.generation += 1;
+            g.entries.clear();
+            while g.active > 0 {
+                g = slab.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+            if g.cap < taken {
+                if g.ptr != 0 {
+                    let _ = unsafe {
+                        cudarc::driver::result::free_host(g.ptr as *mut std::ffi::c_void)
+                    };
+                    g.ptr = 0;
+                    g.cap = 0;
+                }
+                match unsafe { cudarc::driver::result::malloc_host(taken, 0) } {
+                    Ok(p) => {
+                        g.ptr = p as usize;
+                        g.cap = taken;
+                    }
+                    Err(_) => return false,
+                }
+            }
+            for &(addr, len, at) in &chosen {
+                g.entries.insert(addr, (at, len, false));
+            }
+            g.active = readers.max(1);
+            g.generation
+        };
+        let chosen = std::sync::Arc::new(chosen);
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..readers.max(1) {
+            let (chosen, next) = (chosen.clone(), next.clone());
+            std::thread::spawn(move || {
+                let slab = &slabs()[turn];
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(addr, len, at)) = chosen.get(i) else {
+                        break;
+                    };
+                    let base = {
+                        let g = slab.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.generation != generation {
+                            break;
+                        }
+                        g.ptr
+                    };
+                    let read = crate::tensor::mapped::file_span(addr, len).and_then(|(f, off)| {
+                        let buf =
+                            unsafe { std::slice::from_raw_parts_mut((base + at) as *mut u8, len) };
+                        f.read_exact_at(buf, off).ok()
+                    });
+                    let mut g = slab.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.generation == generation {
+                        if read.is_some() {
+                            if let Some(e) = g.entries.get_mut(&addr) {
+                                e.2 = true;
+                            }
+                        } else {
+                            g.entries.remove(&addr);
+                        }
+                    }
+                    slab.cv.notify_all();
+                }
+                let mut g = slab.inner.lock().unwrap_or_else(|e| e.into_inner());
+                g.active -= 1;
+                slab.cv.notify_all();
+            });
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (spans, readers);
+        false
+    }
+}
+
+/// The page-locked address of the weight at `addr`, `len` bytes, once a slab has read it in;
+/// waits for a read that has begun. `None` when no slab holds it.
+fn staged_weight(addr: usize, len: usize) -> Option<usize> {
+    for slab in slabs() {
+        let mut g = slab.inner.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match g.entries.get(&addr) {
+                Some(&(at, l, true)) if l == len => return Some(g.ptr + at),
+                Some(&(_, l, false)) if l == len => {
+                    g = slab.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                }
+                _ => break,
+            }
+        }
+    }
+    None
+}
+
 /// Staging buffers in use by one expert's products. Dropping them waits for the card's stream,
 /// so a buffer goes back to the pool only once no copy still reads it.
 struct Staging<'a> {
@@ -1117,6 +1291,37 @@ impl<'a> Staging<'a> {
     }
 
     fn upload_inner(&mut self, dev: &CudaDevice, bytes: &[u8]) -> Result<CudaSlice<u8>> {
+        // Already in page-locked memory, read ahead: sent from there.
+        if let Some(src) = staged_weight(bytes.as_ptr() as usize, bytes.len()) {
+            let stream = self.stream;
+            let dst = with_oom_retry(dev, "expert weight upload", || unsafe {
+                stream.alloc::<u8>(bytes.len())
+            })?;
+            stream
+                .context()
+                .bind_to_thread()
+                .map_err(|e| Error(format!("staged upload: bind context: {e:?}")))?;
+            use cudarc::driver::DevicePtr;
+            let (dptr, guard) = dst.device_ptr(stream);
+            let r = unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    dptr,
+                    src as *const std::ffi::c_void,
+                    bytes.len(),
+                    stream.cu_stream(),
+                )
+            };
+            drop(guard);
+            if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+                return Err(Error(format!("staged upload: {r:?}")));
+            }
+            self.copied.push(
+                stream
+                    .record_event(None)
+                    .map_err(|e| Error(format!("staged upload: record: {e:?}")))?,
+            );
+            return Ok(dst);
+        }
         let pin = {
             let mut pool = PINNED.lock().unwrap_or_else(|e| e.into_inner());
             match pool.iter().position(|p| p.cap >= bytes.len()) {
