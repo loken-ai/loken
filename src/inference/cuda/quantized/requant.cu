@@ -1139,6 +1139,28 @@ extern "C" __global__ void dequant_q2_k_f32(
     out[idx] = d * (float) (sc & 0x0F) * (float) code - dmin * (float) (sc >> 4);
 }
 
+// q6_K to f32 at full precision, one value per thread: 128 low-nibble bytes, 64 bytes of high
+// bit pairs, sixteen signed sub-block scales, then the f16 `d`. Value `i` of a superblock lies in
+// half `h = i / 128`, quarter `k = (i % 128) / 32`, lane `l = i % 32`: its low four bits are the
+// nibble of `ql[64 h + l + 32 (k % 2)]` (high nibble for k >= 2), its top two the pair `k` of
+// `qh[32 h + l]`, and its scale is `sc[8 h + l / 16 + 2 k]`.
+extern "C" __global__ void dequant_q6_k_f32(
+        const unsigned char * __restrict__ blocks, float * __restrict__ out, const long total) {
+    const long idx = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
+    if (idx >= total) return;
+    const long ib = idx / 256;
+    const int i = (int) (idx % 256), h = i / 128, k = (i % 128) / 32, l = i % 32;
+    const unsigned char * b = blocks + ib * 210;
+    const unsigned char * ql = b + 64 * h;
+    const unsigned char * qh = b + 128 + 32 * h;
+    const signed char * sc = (const signed char *) (b + 192) + 8 * h;
+    const unsigned char lo = ql[l + 32 * (k % 2)];
+    const int low = k < 2 ? (lo & 0x0F) : (lo >> 4);
+    const int q = (low | (((qh[l] >> (2 * k)) & 3) << 4)) - 32;
+    const float d = req_f16_at(b + 208);
+    out[idx] = d * (float) sc[l / 16 + 2 * k] * (float) q;
+}
+
 // Index scores, one (query, compressed position) pair per thread: the sum over heads of
 // relu(q . k) * weight * scale, for the positions query `i` can reach ((i + 1) / ratio of them);
 // the rest are -inf. `q` [s, nh, ihd], `k` [g, ihd], `w` [s, nh]; the output is [s, g].

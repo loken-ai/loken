@@ -10,7 +10,7 @@ use super::{AttnBlock, Offload};
 use crate::tensor::cuda::{
     gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi, gpu_fp4_linear,
     gpu_fp8_linear, gpu_index_scores, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables,
-    CudaDevice,
+    CudaDevice, QUANT_LINEAR_TILE_BYTES,
 };
 use crate::tensor::ops::rms_norm;
 use crate::tensor::ops::softmax_last_dim;
@@ -788,9 +788,15 @@ impl Offload for Card {
             }),
             Projection::Quant(q) => {
                 let dtype = q.dtype();
-                if !matches!(dtype, GgmlDType::Iq2Xxs | GgmlDType::Q2K | GgmlDType::Q8_0) {
+                if !matches!(
+                    dtype,
+                    GgmlDType::Iq2Xxs | GgmlDType::Q2K | GgmlDType::Q6K | GgmlDType::Q8_0
+                ) {
                     return None;
                 }
+                // One tile of the weight expanded to f32 on the card beside the activations; a
+                // narrower weight needs less (see `gpu_quant_linear`).
+                let need = xs.len() * F32 + QUANT_LINEAR_TILE_BYTES * 3 / 2;
                 self.attempt("a quantised weight", need, || {
                     let bytes = q.data()?;
                     gpu_quant_linear(dev, dtype, &bytes, (out, inp), xs)

@@ -886,7 +886,63 @@ pub fn gpu_expert_rows_grouped_multi(
     Ok(out)
 }
 
+/// Bytes of the card a product of `gpu_quant_linear` may hold at once beside the activations:
+/// the expanded f32 weights of one tile of output rows and their products. A weight wider than
+/// this is multiplied one tile of rows after another, so a card with little room beside what it
+/// keeps still takes a prompt's projections.
+pub const QUANT_LINEAR_TILE_BYTES: usize = 96 << 20;
+
+/// `x` [n, inp] through a quantised weight [out, inp] on the card, as `[n, out]`, one tile of
+/// output rows at a time (see `QUANT_LINEAR_TILE_BYTES`).
 pub fn gpu_quant_linear(
+    dev: &CudaDevice,
+    dtype: crate::tensor::quantized::GgmlDType,
+    blocks: &[u8],
+    shape: (usize, usize),
+    x: &[f32],
+) -> Result<Vec<f32>> {
+    gpu_quant_linear_tiled(dev, dtype, blocks, shape, x, QUANT_LINEAR_TILE_BYTES)
+}
+
+/// `gpu_quant_linear` with a tile of at most `tile_bytes`.
+pub fn gpu_quant_linear_tiled(
+    dev: &CudaDevice,
+    dtype: crate::tensor::quantized::GgmlDType,
+    blocks: &[u8],
+    (out, inp): (usize, usize),
+    x: &[f32],
+    tile_bytes: usize,
+) -> Result<Vec<f32>> {
+    let bs = dtype.block_size();
+    if inp == 0 || inp % bs != 0 || x.len() % inp != 0 {
+        return gpu_quant_linear_once(dev, dtype, blocks, (out, inp), x);
+    }
+    let n = x.len() / inp;
+    let row_bytes = inp / bs * dtype.type_size();
+    let tile = (tile_bytes / ((inp + n) * 4)).clamp(32, out.max(32)) / 32 * 32;
+    if tile >= out || blocks.len() != out * row_bytes {
+        return gpu_quant_linear_once(dev, dtype, blocks, (out, inp), x);
+    }
+    let mut y = vec![0f32; n * out];
+    let mut o0 = 0;
+    while o0 < out {
+        let rows = tile.min(out - o0);
+        let part = gpu_quant_linear_once(
+            dev,
+            dtype,
+            &blocks[o0 * row_bytes..(o0 + rows) * row_bytes],
+            (rows, inp),
+            x,
+        )?;
+        for t in 0..n {
+            y[t * out + o0..t * out + o0 + rows].copy_from_slice(&part[t * rows..(t + 1) * rows]);
+        }
+        o0 += rows;
+    }
+    Ok(y)
+}
+
+fn gpu_quant_linear_once(
     dev: &CudaDevice,
     dtype: crate::tensor::quantized::GgmlDType,
     blocks: &[u8],
@@ -928,6 +984,24 @@ pub fn gpu_quant_linear(
             b.arg(&dst);
             b.arg(&total_i);
             unsafe { b.launch(cfg) }.map_err(|e| Error(format!("dequant_q2_k_f32 launch: {e}")))?;
+            dst
+        }
+        crate::tensor::quantized::GgmlDType::Q6K => {
+            let dst = with_oom_retry(dev, "dequant q6_K", || unsafe {
+                stream.alloc::<f32>(total)
+            })?;
+            let func = dev.quantized_fn("dequant_q6_k_f32")?;
+            let cfg = LaunchConfig {
+                grid_dim: (total.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let total_i = total as i64;
+            let mut b = stream.launch_builder(&func);
+            b.arg(&blob);
+            b.arg(&dst);
+            b.arg(&total_i);
+            unsafe { b.launch(cfg) }.map_err(|e| Error(format!("dequant_q6_k_f32 launch: {e}")))?;
             dst
         }
         crate::tensor::quantized::GgmlDType::Iq2Xxs => {
@@ -2201,7 +2275,7 @@ mod iq2_xxs_gpu_tests {
             eprintln!("no CUDA device; the card quant linear is NOT covered by this run");
             return;
         };
-        let (out, inp, n) = (12usize, 512usize, 5usize);
+        let (out, inp, n) = (96usize, 512usize, 5usize);
         let w: Vec<f32> = (0..out * inp)
             .map(|i| {
                 (((i as u32).wrapping_mul(2_654_435_761).rotate_left(9) >> 8) as f32
@@ -2211,7 +2285,12 @@ mod iq2_xxs_gpu_tests {
             })
             .collect();
         let x: Vec<f32> = (0..n * inp).map(|i| ((i as f32) * 0.31).sin()).collect();
-        for dtype in [GgmlDType::Iq2Xxs, GgmlDType::Q2K, GgmlDType::Q8_0] {
+        for dtype in [
+            GgmlDType::Iq2Xxs,
+            GgmlDType::Q2K,
+            GgmlDType::Q6K,
+            GgmlDType::Q8_0,
+        ] {
             let blocks = crate::tensor::quant_cpu::from_float_bytes(dtype, &w).unwrap();
             let mut dense = vec![0f32; out * inp];
             crate::tensor::quant_cpu::to_float_bytes(dtype, &blocks, &mut dense).unwrap();
@@ -2222,6 +2301,17 @@ mod iq2_xxs_gpu_tests {
                 }
             }
             let got = gpu_quant_linear(&dev, dtype, &blocks, (out, inp), &x).unwrap();
+            // The same product a few rows of the weight at a time.
+            let tiled =
+                gpu_quant_linear_tiled(&dev, dtype, &blocks, (out, inp), &x, 64 * (inp + n) * 4)
+                    .unwrap();
+            assert_eq!(tiled.len(), got.len());
+            for (g, v) in tiled.iter().zip(&want) {
+                assert!(
+                    (g - v).abs() <= 1e-4 * v.abs().max(1.0),
+                    "{dtype:?} tiled: {g} vs {v}"
+                );
+            }
             for (g, v) in got.iter().zip(&want) {
                 assert!(
                     (g - v).abs() <= 1e-4 * v.abs().max(1.0),

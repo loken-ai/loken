@@ -549,14 +549,23 @@ impl BandAttention {
         let (nh, hd, rd) = (self.n_heads, self.head_dim, self.rope_head_dim);
         let x2 = x.reshape((b * s, dim))?;
 
-        let qr = rms_norm(&self.wq_a.apply(&x2)?, &self.q_norm, self.eps)?;
-        let q = self.wq_b.apply(&qr)?.reshape((b, s, nh, hd))?;
-        let q = rope_partial(&q, cos, sin, rd)?;
+        let qr = crate::inference::offload::stage("attn q_a", || {
+            rms_norm(&self.wq_a.apply(&x2)?, &self.q_norm, self.eps)
+        })?;
+        let q = crate::inference::offload::stage("attn q_b", || {
+            self.wq_b.apply(&qr)?.reshape((b, s, nh, hd))
+        })?;
+        let q = crate::inference::offload::stage("attn rope", || rope_partial(&q, cos, sin, rd))?;
 
         // Window KV (fp8 round trip), keys 0..s-1 of the concatenated cache.
-        let kv = rms_norm(&self.wkv.apply(&x2)?, &self.kv_norm, self.eps)?;
-        let kv = rope_partial(&kv.reshape((b, s, 1, hd))?, cos, sin, rd)?.reshape((b, s, hd))?;
-        let window_kv = act_quant_fp8_e4m3(&kv, 32)?;
+        let kv = crate::inference::offload::stage("attn kv", || {
+            rms_norm(&self.wkv.apply(&x2)?, &self.kv_norm, self.eps)
+        })?;
+        let kv = crate::inference::offload::stage("attn rope", || {
+            rope_partial(&kv.reshape((b, s, 1, hd))?, cos, sin, rd)?.reshape((b, s, hd))
+        })?;
+        let window_kv =
+            crate::inference::offload::stage("attn kv fp8", || act_quant_fp8_e4m3(&kv, 32))?;
         if let Some(cache) = cache.as_deref_mut() {
             super::attention::fill_window(cache, &window_kv, b, self.window_size)?;
         }
@@ -574,17 +583,19 @@ impl BandAttention {
         let qr3 = qr.reshape((b, s, qr.dim(1)?))?;
         let indexer_started = std::time::Instant::now();
         let compress_idxs = match &self.indexer {
-            Some(idx) => idx.forward_prefill(
-                x,
-                &qr3,
-                latent.as_ref(),
-                cos,
-                sin,
-                self.ratio,
-                offset,
-                groups,
-                shared,
-            )?,
+            Some(idx) => crate::inference::offload::stage("attn indexer", || {
+                idx.forward_prefill(
+                    x,
+                    &qr3,
+                    latent.as_ref(),
+                    cos,
+                    sin,
+                    self.ratio,
+                    offset,
+                    groups,
+                    shared,
+                )
+            })?,
             None => shared
                 .topk_idxs
                 .clone()
@@ -668,15 +679,17 @@ impl BandAttention {
             }
         }
         let og = o.reshape((b * s, self.o_groups, p))?;
-        let mut parts = Vec::with_capacity(self.o_groups);
-        for g in 0..self.o_groups {
-            let slice = og.narrow(1, g, 1)?.reshape((b * s, p))?;
-            let wa = self.wo_a.rows(g * self.o_lora_rank, self.o_lora_rank)?;
-            parts.push(wa.apply(&slice)?);
-        }
-        let refs: Vec<&Tensor> = parts.iter().collect();
-        let o = Tensor::cat(&refs, 1)?;
-        self.wo_b.apply(&o)?.reshape((b, s, dim))
+        let o = crate::inference::offload::stage("attn wo_a", || {
+            let mut parts = Vec::with_capacity(self.o_groups);
+            for g in 0..self.o_groups {
+                let slice = og.narrow(1, g, 1)?.reshape((b * s, p))?;
+                let wa = self.wo_a.rows(g * self.o_lora_rank, self.o_lora_rank)?;
+                parts.push(wa.apply(&slice)?);
+            }
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            Tensor::cat(&refs, 1)
+        })?;
+        crate::inference::offload::stage("attn wo_b", || self.wo_b.apply(&o)?.reshape((b, s, dim)))
     }
 
     /// Decode one token at `pos`. `x` is [1, 1, dim], `cos`/`sin` the layer's full rope tables,
