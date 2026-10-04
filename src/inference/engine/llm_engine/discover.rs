@@ -295,13 +295,7 @@ impl LlmEngine {
             // The configured HuggingFace hub root (from config.toml, OS-default
             // fallback) - never a hardcoded absolute path.
             if let Ok(cfg) = crate::config::Config::load_default() {
-                let hf = cfg.get_hf_models_dir();
-                let hub = if hf.file_name().is_some_and(|n| n == "hub") {
-                    hf
-                } else {
-                    hf.join("hub")
-                };
-                roots.push(hub);
+                roots.push(hub_root(cfg.get_hf_models_dir()));
             }
             if let Some(dir) = resolve_awq_repo(model_id, &roots) {
                 return Some(PathBuf::from(dir));
@@ -503,12 +497,21 @@ impl LlmEngine {
     }
 }
 
+/// The hub cache under a Hugging Face models directory, which may name the hub itself.
+pub(crate) fn hub_root(hf: PathBuf) -> PathBuf {
+    if hf.file_name().is_some_and(|n| n == "hub") {
+        hf
+    } else {
+        hf.join("hub")
+    }
+}
+
 /// The GGUF of a hub repository id `org/name[:selector]` inside the cache roots: any snapshot
 /// of the repository, at any depth, since a repository keeps each quantisation in its own
 /// directory. The selector, when given, must appear in the path below the snapshot; a split
 /// model resolves to its first part. Several candidates left with no selector to tell them
 /// apart resolve to none, listed in the log, rather than to an arbitrary one.
-pub(super) fn resolve_hub_gguf(model_id: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+pub(crate) fn resolve_hub_gguf(model_id: &str, roots: &[PathBuf]) -> Option<PathBuf> {
     let (base, selector) = match model_id.split_once(':') {
         Some((b, s)) => (b, Some(s)),
         None => (model_id, None),

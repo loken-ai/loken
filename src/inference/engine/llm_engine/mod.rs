@@ -1244,7 +1244,7 @@ use std::time::Instant;
 
 mod batching;
 pub use batching::ActiveRequest;
-mod discover;
+pub(crate) mod discover;
 mod embed;
 mod generate;
 pub(crate) mod generation_defaults;

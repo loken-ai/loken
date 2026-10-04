@@ -72,20 +72,23 @@ pub(crate) async fn ollama_list_models(
                         "huggingface" => ModelSource::HuggingFace,
                         _ => ModelSource::Ollama,
                     };
-                    // Fill in details.{format, parameter_size} so SDK
-                    // clients (LangChain-Ollama, Open-WebUI, etc.) can
-                    // surface a friendly catalog without an extra
-                    // /api/show round-trip per row.
-                    let format_str = match source {
-                        ModelSource::HuggingFace => "safetensors",
-                        _ => "gguf",
-                    };
                     // What the checkpoint says about itself: the media pipeline its files
                     // declare, else the text model its header or configuration declares.
                     let hf = state.huggingface_models_dir.as_str();
                     let media = match source {
                         ModelSource::Ollama => None,
                         _ => media_facts(hf, &m.id),
+                    };
+                    // The format follows the file, not the store it sits in: a GGUF in a
+                    // repository's snapshot is a GGUF.
+                    let gguf = match source {
+                        ModelSource::Ollama => None,
+                        ModelSource::HuggingFace => hf_gguf(hf, &m.id),
+                    };
+                    let format_str = match (&gguf, source) {
+                        (Some(_), _) => "gguf",
+                        (None, ModelSource::HuggingFace) => "safetensors",
+                        (None, ModelSource::Ollama) => "gguf",
                     };
                     let weights = match source {
                         ModelSource::Ollama => state.manifest_layer_path(&m.id, "model"),
@@ -95,10 +98,11 @@ pub(crate) async fn ollama_list_models(
                         )
                         .get_model_path(&m.id),
                     };
-                    let (arch, quant, declared, pools) = match &weights {
-                        Some(w) if w.is_dir() => checkpoint_facts(w),
-                        Some(w) => header_facts(w),
-                        None => (None, None, None, false),
+                    let (arch, quant, declared, pools) = match (&gguf, &weights) {
+                        (Some(g), _) => header_facts(g),
+                        (None, Some(w)) if w.is_dir() => checkpoint_facts(w),
+                        (None, Some(w)) => header_facts(w),
+                        (None, None) => (None, None, None, false),
                     };
                     // An Ollama-store model is a text GGUF whether or not its header reads.
                     let text = match source {
@@ -311,12 +315,20 @@ pub(crate) fn header_facts(path: &std::path::Path) -> Facts {
         warn!("no facts from {}: {e}", path.display());
         Default::default()
     });
+    // A part of a split set lists only the tensors it carries: every part is counted.
+    let parameter_count = match read.split_parts {
+        Some(n) if n > 1 => crate::tensor::quantized::gguf_source::set_parameter_count(path)
+            .ok()
+            .filter(|n| *n > 0)
+            .or(read.parameter_count),
+        _ => read.parameter_count,
+    };
     let facts = (
         read.architecture,
         read.file_type
             .and_then(gguf_file_type_name)
             .map(str::to_string),
-        read.parameter_count,
+        parameter_count,
         read.pools,
     );
     cache
@@ -490,6 +502,14 @@ fn checkpoint_facts(dir: &std::path::Path) -> Facts {
         None,
         dir.join("modules.json").exists(),
     )
+}
+
+/// The GGUF a Hugging Face entry is, when it is one: the file a load resolves `model_id` to,
+/// which for a split set is its first part. A safetensors checkpoint answers `None`.
+fn hf_gguf(hf: &str, model_id: &str) -> Option<std::path::PathBuf> {
+    use crate::inference::engine::llm_engine::discover::{hub_root, resolve_hub_gguf};
+    let root = std::path::PathBuf::from(hf);
+    resolve_hub_gguf(model_id, &[hub_root(root.clone()), root])
 }
 
 /// The family `/api/tags`, `/api/show` and `/api/ps` report: the media family the model's
@@ -991,5 +1011,72 @@ pub(crate) async fn ollama_show_model(
                 )))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod catalogue_tests {
+    use super::*;
+    use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
+    use crate::tensor::quantized::gguf_file::Value;
+    use crate::tensor::quantized::GgmlDType;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("loken-cat-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A split set is named by the parameters of every part, not of the first.
+    #[test]
+    fn a_split_set_is_counted_across_its_parts() {
+        let dir = scratch("split");
+        let entry = |name: &str| GgufEntry {
+            name: name.to_string(),
+            dims: vec![4, 4],
+            dtype: GgmlDType::F32,
+            data: [0f32.to_le_bytes(); 16].concat(),
+        };
+        let md = |no: u32| {
+            vec![
+                (
+                    "general.architecture".to_string(),
+                    Value::String("llama".into()),
+                ),
+                ("split.count".to_string(), Value::U32(2)),
+                ("split.no".to_string(), Value::U32(no)),
+            ]
+        };
+        let first = dir.join("set-00001-of-00002.gguf");
+        write_gguf_with_metadata(&first, &md(0), &[entry("blk.0.attn_norm.weight")]).unwrap();
+        write_gguf_with_metadata(
+            &dir.join("set-00002-of-00002.gguf"),
+            &md(1),
+            &[entry("blk.1.attn_norm.weight")],
+        )
+        .unwrap();
+        let (arch, _, declared, _) = header_facts(&first);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(arch.as_deref(), Some("llama"));
+        assert_eq!(declared, Some(32), "two parts of one 4x4 tensor each");
+    }
+
+    /// A GGUF in the Hugging Face store resolves to its file; a checkpoint of safetensors does not.
+    #[test]
+    fn a_gguf_in_the_hub_store_is_found_by_its_repository() {
+        let dir = scratch("hub");
+        let snap = dir.join("hub/models--org--quant/snapshots/abc");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("quant-q4.gguf"), b"").unwrap();
+        let other = dir.join("hub/models--org--plain/snapshots/abc");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("model.safetensors"), b"").unwrap();
+        let root = dir.to_string_lossy().to_string();
+        let found = hf_gguf(&root, "org/quant");
+        let plain = hf_gguf(&root, "org/plain");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found, Some(snap.join("quant-q4.gguf")));
+        assert_eq!(plain, None);
     }
 }
