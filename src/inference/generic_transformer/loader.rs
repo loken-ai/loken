@@ -1078,13 +1078,13 @@ fn build_generic_layer(
             None
         };
         let des = coerce_moe_weight(des, device)?;
-        // CPU layers: pre-dequantize the expert stacks once into BF16 - the
-        // per-call dequant cost (≈3 GB allocation per call) would dominate.
-        // BF16 (2 bytes/elem) instead of F32 (4 bytes/elem) halves the RAM
-        // footprint per CPU layer (≈1.5 GB instead of 3 GB), keeping the
-        // total cache footprint manageable when the heterogeneous planner
-        // offloads many layers (e.g., 14 layers x 3 GB = 42 GB -> 21 GB).
-        let (gus_f32, des_f32) = if (!on_gpu || use_silu) && gus.is_some() {
+        // A stack in host memory is read in place by the host expert loop, which decodes only
+        // the experts a call routes to. A stack on a card has no host blocks to slice, and the
+        // layer's host prefill reads a BF16 cache built here, declared in the ledger.
+        let stacks_on_card =
+            gus.as_ref().is_some_and(|g| g.device().runs_as_card()) || des.device().runs_as_card();
+        let (gus_f32, des_f32) = if stacks_on_card && use_silu && gus.is_some() {
+            // CONVERSION: a card layer's host prefill reads its experts dense; no host blocks exist to slice.
             let g = match (&fused_f32, &gus) {
                 (Some(f), _) => f.to_dtype(crate::tensor::DType::BF16)?,
                 (None, Some(gus)) => gus
@@ -1092,9 +1092,19 @@ fn build_generic_layer(
                     .to_dtype(crate::tensor::DType::BF16)?,
                 (None, None) => unreachable!("guarded by gus.is_some()"),
             };
+            // CONVERSION: a card layer's host prefill reads its experts dense; no host blocks exist to slice.
             let d = des
                 .dequantize(&Device::Cpu)?
                 .to_dtype(crate::tensor::DType::BF16)?;
+            crate::tensor::conversion::record_kept(
+                "experts",
+                des.dtype().gguf_name(),
+                "bf16",
+                (des.shape().elem_count() as u64 * des.dtype().type_size() as u64)
+                    / des.dtype().block_size() as u64,
+                (g.elem_count() + d.elem_count()) as u64 * 2,
+                "host prefill of a card layer reads a dense expert cache",
+            );
             (Some(std::sync::Arc::new(g)), Some(std::sync::Arc::new(d)))
         } else {
             (None, None)

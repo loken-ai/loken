@@ -1058,6 +1058,31 @@ impl MoeWeights {
         crate::tensor::bail!("CUDA path not compiled in")
     }
 
+    /// One expert's fused gate||up `[2*ffn, hidden]` and down `[hidden, ffn]` weights as F32.
+    ///
+    /// A stack in host memory is read in place: only the routed expert's blocks are decoded,
+    /// so nothing is held between calls. A stack on a card has no host blocks to slice; its
+    /// layer built a dense cache at load, and that cache is read here.
+    fn expert_dense(&self, e: usize) -> Result<(Tensor, Tensor)> {
+        if let (Some(gu), Some(dn)) = (self.gate_up_exps_f32.as_ref(), self.down_exps_f32.as_ref())
+        {
+            let one = |t: &Tensor| -> Result<Tensor> {
+                t.narrow(0, e, 1)?
+                    .squeeze(0)?
+                    .to_dtype(crate::tensor::DType::F32)
+            };
+            return Ok((one(gu)?, one(dn)?));
+        }
+        let gu = self.gate_up_exps.as_ref().ok_or_else(|| {
+            crate::tensor::Error::msg("MoE CPU path: the layer has no fused gate||up stack")
+        })?;
+        let dense = |stack: &std::sync::Arc<crate::tensor::quantized::QTensor>| -> Result<Tensor> {
+            // CONVERSION: one routed expert is decoded to F32 for the call and dropped.
+            crate::tensor::quant_view::expert_view(stack, e)?.dequantize(&Device::Cpu)
+        };
+        Ok((dense(gu)?, dense(&self.down_exps)?))
+    }
+
     /// CPU path: per-expert F32 batched matmul over the tokens routed to
     /// each expert, then scatter back into [num_tokens, hidden]. Slow,
     /// but only used for layers the heterogeneous planner offloaded to
@@ -1119,16 +1144,6 @@ impl MoeWeights {
             }
         }
 
-        let gu_full = self.gate_up_exps_f32.as_ref().ok_or_else(|| {
-            crate::tensor::Error::msg(
-                "MoE CPU path: gate_up_exps_f32 not cached. Layer was placed on CPU \
-                 but the dequantized expert cache wasn't built at load time.",
-            )
-        })?;
-        let dn_full = self
-            .down_exps_f32
-            .as_ref()
-            .ok_or_else(|| crate::tensor::Error::msg("MoE CPU path: down_exps_f32 not cached."))?;
         let topk_ids_v: Vec<u32> = topk_ids.flatten_all()?.to_vec1()?;
         let topk_w_v: Vec<f32> = topk_weights.flatten_all()?.to_vec1()?;
         let xs_v: Vec<f32> = xs.flatten_all()?.to_vec1()?;
@@ -1162,14 +1177,7 @@ impl MoeWeights {
             // We want x @ W^T, so narrow to expert e then matmul.
             // Cached weights are BF16 - promote to F32 for the matmul to
             // keep the precision the GPU path provides.
-            let w_gu = gu_full
-                .narrow(0, e, 1)?
-                .squeeze(0)?
-                .to_dtype(crate::tensor::DType::F32)?; // [2*ffn, hidden]
-            let w_dn = dn_full
-                .narrow(0, e, 1)?
-                .squeeze(0)?
-                .to_dtype(crate::tensor::DType::F32)?; // [hidden, ffn]
+            let (w_gu, w_dn) = self.expert_dense(e)?; // [2*ffn, hidden], [hidden, ffn]
             let gu = x_t.matmul(&w_gu.transpose(0, 1)?)?; // [m, 2*ffn]
             let n = gu.dim(crate::tensor::D::Minus1)? / 2;
             let gate = gu.narrow(crate::tensor::D::Minus1, 0, n)?.contiguous()?;
@@ -1237,6 +1245,79 @@ mod clamped_swiglu_tests {
     /// `x.sigmoid(x)`.
     fn silu(x: f32) -> f32 {
         x / (1.0 + (-x).exp())
+    }
+
+    /// A fused gate||up stack on the host is read in place: the host expert loop decodes only
+    /// the routed experts, and gives exactly what a dense cache of the same stacks gives.
+    #[test]
+    fn a_host_stack_serves_the_expert_loop_without_a_dense_cache() {
+        let (experts, used, hidden, ffn, tokens) = (4usize, 2usize, 32usize, 32usize, 3usize);
+        let dev = Device::Cpu;
+        let stack = |seed, rows| {
+            let w = Tensor::from_vec(
+                values(experts * rows * hidden, seed, 1.0),
+                (experts, rows, hidden),
+                &dev,
+            )
+            .unwrap();
+            QTensor::quantize_onto(&w, GgmlDType::Q8_0, &dev).unwrap()
+        };
+        let down = {
+            let w = Tensor::from_vec(
+                values(experts * hidden * ffn, 33, 1.0),
+                (experts, hidden, ffn),
+                &dev,
+            )
+            .unwrap();
+            QTensor::quantize_onto(&w, GgmlDType::Q8_0, &dev).unwrap()
+        };
+        let gate_up = stack(31, 2 * ffn);
+        let router =
+            Tensor::from_vec(values(experts * hidden, 34, 0.5), (experts, hidden), &dev).unwrap();
+        let build = |cache: bool| {
+            let dense = |q: &QTensor| Arc::new(q.dequantize(&dev).unwrap());
+            MoeWeights {
+                gate_inp: QMatMul::Tensor(router.clone()),
+                gate_inp_scale: Tensor::ones(hidden, DType::F32, &dev).unwrap(),
+                gate_inp_bias: None,
+                gate_exps_bias: None,
+                up_exps_bias: None,
+                down_exps_bias: None,
+                swiglu_clamp: None,
+                gate_up_exps: Some(Arc::new(stack(31, 2 * ffn))),
+                down_exps: Arc::new(
+                    QTensor::quantize_onto(&down.dequantize(&dev).unwrap(), GgmlDType::Q8_0, &dev)
+                        .unwrap(),
+                ),
+                gate_exps_sep: None,
+                up_exps_sep: None,
+                down_exps_scale: None,
+                decode_slots: None,
+                n_experts: experts,
+                n_experts_used: used,
+                expert_ffn_dim: ffn,
+                router_prenormed: true,
+                use_silu: false,
+                gelu: true,
+                norm_topk: true,
+                sigmoid_routing: None,
+                up_relu2: false,
+                shared_expert: None,
+                gate_up_exps_f32: cache.then(|| dense(&gate_up)),
+                down_exps_f32: cache.then(|| dense(&down)),
+            }
+        };
+        let input =
+            Tensor::from_vec(values(tokens * hidden, 35, 1.0), (1, tokens, hidden), &dev).unwrap();
+        let run = |m: &MoeWeights| {
+            m.forward(&input, &input, hidden, 1e-5, false)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        assert_eq!(run(&build(false)), run(&build(true)));
     }
 
     #[test]
