@@ -133,17 +133,32 @@ fn attn<S: WeightSource + ?Sized>(g: &S, stage: usize, cfg: &DsparkConfig) -> Re
 fn stage<S: WeightSource + ?Sized>(g: &S, s: usize, cfg: &DsparkConfig) -> Result<DsparkStage> {
     let p = format!("mtp.{s}.ffn");
     let loader = g.experts_under(&expert_prefix(s), cfg.n_routed)?;
+    // The stage's shared expert, which every token passes through, when the source carries one: a
+    // file converted without it leaves the stage with its routed experts alone.
+    let shared_names = ["w1", "w3", "w2"].map(|w| format!("{p}.shared_experts.{w}.weight"));
+    let shared = if shared_names.iter().all(|n| g.shape(n).is_some()) {
+        let [w1, w3, w2] = [0, 1, 2].map(|i| proj(g, &shared_names[i]));
+        Some(Expert {
+            w1: w1?,
+            w2: w2?,
+            w3: w3?,
+        })
+    } else {
+        None
+    };
     let moe = Moe {
         gate_weight: g.dense_f32(&format!("{p}.gate.weight"))?,
         gate_bias: g.dense_f32(&format!("{p}.gate.bias"))?,
         experts: ExpertSet::Streamed(ExpertStore::new(loader, 0)),
-        // A stage has no shared expert; a zero projection leaves the shared contribution at nothing.
-        shared: Expert {
-            w1: proj(g, &format!("mtp.{s}.attn.wkv.weight"))?,
-            w2: proj(g, &format!("mtp.{s}.attn.wkv.weight"))?,
-            w3: proj(g, &format!("mtp.{s}.attn.wkv.weight"))?,
+        has_shared: shared.is_some(),
+        shared: match shared {
+            Some(e) => e,
+            None => Expert {
+                w1: proj(g, &format!("mtp.{s}.attn.wkv.weight"))?,
+                w2: proj(g, &format!("mtp.{s}.attn.wkv.weight"))?,
+                w3: proj(g, &format!("mtp.{s}.attn.wkv.weight"))?,
+            },
         },
-        has_shared: false,
         n_routed: cfg.n_routed,
         n_activated: cfg.n_activated,
         dim: cfg.dim,
@@ -370,6 +385,9 @@ pub fn tensor_names(n_stages: usize) -> Vec<String> {
             "ffn_norm.weight",
             "ffn.gate.weight",
             "ffn.gate.bias",
+            "ffn.shared_experts.w1.weight",
+            "ffn.shared_experts.w2.weight",
+            "ffn.shared_experts.w3.weight",
             "hc_attn_fn",
             "hc_attn_scale",
             "hc_attn_base",
