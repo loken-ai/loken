@@ -1425,6 +1425,10 @@ macro_rules! with_blocks {
                 type $T = BlockIq2Xxs;
                 $body
             }
+            GgmlDType::Iq4Nl => {
+                type $T = BlockIq4Nl;
+                $body
+            }
             // Q8_1 is an activation-side format (no `dequantize`, never a GGUF
             // weight dtype) - not routable as a weight.
             GgmlDType::Q8_1 => Err(Error("quant_cpu: Q8_1 has no weight-side path".into())),

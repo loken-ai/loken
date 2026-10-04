@@ -8,6 +8,7 @@ use super::*;
 
 pub mod iq2_xxs;
 mod iq2_xxs_dot;
+pub mod iq4_nl;
 pub mod mxfp4;
 pub mod q2_k;
 pub mod q3_k;
@@ -23,6 +24,7 @@ pub mod q8_1;
 pub mod q8_k;
 
 pub use iq2_xxs::*;
+pub use iq4_nl::*;
 pub use mxfp4::*;
 pub use q2_k::*;
 pub use q3_k::*;
