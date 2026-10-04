@@ -10,9 +10,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::gguf_file::{
-    advise_if_it_fits, open_mapped_unadvised, Content, MappedGguf, TensorInfo, Value,
-};
+use super::gguf_file::{open_mapped_unadvised, Content, MappedGguf, TensorInfo, Value};
 use super::QTensor;
 use crate::tensor::quant_view::gguf_mmap_view;
 use crate::tensor::{Device, Error, Result};
@@ -222,7 +220,6 @@ impl SplitGguf {
                 }
             }
         }
-        advise_if_it_fits(&parts.iter().map(|p| &*p.mmap).collect::<Vec<_>>());
         Ok(Self { parts, owner })
     }
 
