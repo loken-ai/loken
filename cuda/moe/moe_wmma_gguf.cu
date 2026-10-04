@@ -70,6 +70,8 @@ struct expander_threads<block_q8_0> { static constexpr int value = 32; };
 template <>
 struct expander_threads<block_q5_0> { static constexpr int value = 32; };
 template <>
+struct expander_threads<block_q5_1> { static constexpr int value = 32; };
+template <>
 struct expander_threads<block_q4_K> { static constexpr int value = 32; };
 template <>
 struct expander_threads<block_q2_K> { static constexpr int value = 64; };

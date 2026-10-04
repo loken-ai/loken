@@ -60,7 +60,8 @@ static __device__ __forceinline__ float warp_sum(float x) {
     X(4, q5_K,  QK_K,     QI5_K,    VDR_Q5_K_Q8_1_MMVQ)   \
     X(5, q6_K,  QK_K,     QI6_K,    VDR_Q6_K_Q8_1_MMVQ)   \
     X(6, q5_0,  QK5_0,    QI5_0,    VDR_Q5_0_Q8_1_MMVQ)   \
-    X(7, mxfp4, QK_MXFP4, QI_MXFP4, VDR_MXFP4_Q8_1_MMVQ)
+    X(7, mxfp4, QK_MXFP4, QI_MXFP4, VDR_MXFP4_Q8_1_MMVQ) \
+    X(8, q5_1,  QK5_1,    QI5_1,    VDR_Q5_1_Q8_1_MMVQ)
 
 /// The subset of the table above that a block dequantiser exists for.
 ///
@@ -74,7 +75,8 @@ static __device__ __forceinline__ float warp_sum(float x) {
     X(3, q3_K, QK_K,  QI3_K, VDR_Q3_K_Q8_1_MMVQ)     \
     X(4, q5_K, QK_K,  QI5_K, VDR_Q5_K_Q8_1_MMVQ)     \
     X(5, q6_K, QK_K,  QI6_K, VDR_Q6_K_Q8_1_MMVQ)     \
-    X(6, q5_0, QK5_0, QI5_0, VDR_Q5_0_Q8_1_MMVQ)
+    X(6, q5_0, QK5_0, QI5_0, VDR_Q5_0_Q8_1_MMVQ)     \
+    X(8, q5_1, QK5_1, QI5_1, VDR_Q5_1_Q8_1_MMVQ)
 
 /// `a` divided by `b`, rounded up - how many whole `b`s it takes to cover `a`.
 ///
@@ -1213,6 +1215,27 @@ inline __device__ void dequantize_block_q5_0(const void * __restrict__ vx, dst_t
         const int q = lane < 16 ? ((qs[j] & 0x0F) | (((qh >> j) << 4) & 0x10))
                                 : ((qs[j] >> 4)   | ((qh >> (j + 12)) & 0x10));
         yy[lane] = dst_t((float) (q - 16) * d);
+    }
+}
+
+/// Q5_1: q5_0's layout with a minimum beside the scale, so the five bits are unsigned and the
+/// value is `q . d + m`. The block is 24 bytes: scale, minimum, fifth-bit plane, nibbles.
+template<typename dst_t>
+inline __device__ void dequantize_block_q5_1(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const auto lane = threadIdx.x;
+    const uint8_t * b = (const uint8_t *) vx;
+    const float d = block_scale_broadcast(b);
+    const float m = block_scale_broadcast(b + 2);
+
+    uint32_t qh;
+    memcpy(&qh, b + 4, 4);
+    const uint8_t * qs = b + 8;
+
+    if (lane < QK5_1) {
+        const int j = lane & 15;
+        const int q = lane < 16 ? ((qs[j] & 0x0F) | (((qh >> j) << 4) & 0x10))
+                                : ((qs[j] >> 4)   | ((qh >> (j + 12)) & 0x10));
+        yy[lane] = dst_t((float) q * d + m);
     }
 }
 

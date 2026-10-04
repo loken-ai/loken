@@ -232,6 +232,8 @@ fn the_prefill_expert_gemm_agrees_with_the_decode_one_on_the_same_weights() {
         GgmlDType::Q2K,
         GgmlDType::Q3K,
         GgmlDType::Q8_0,
+        GgmlDType::Q5_0,
+        GgmlDType::Q5_1,
     ] {
         for &(n, tk, e) in &[(8usize, 2usize, 4usize), (33, 4, 8)] {
             let (gap, place) = run_case(&mut keep, &dev, dtype, n, tk, e, 256, 512);
