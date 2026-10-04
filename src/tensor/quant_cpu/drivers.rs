@@ -1429,6 +1429,26 @@ macro_rules! with_blocks {
                 type $T = BlockIq4Nl;
                 $body
             }
+            GgmlDType::Iq4Xs => {
+                type $T = BlockIq4Xs;
+                $body
+            }
+            GgmlDType::Iq3Xxs => {
+                type $T = BlockIq3Xxs;
+                $body
+            }
+            GgmlDType::Iq3S => {
+                type $T = BlockIq3S;
+                $body
+            }
+            GgmlDType::Iq2S => {
+                type $T = BlockIq2S;
+                $body
+            }
+            GgmlDType::Q2_0 => {
+                type $T = BlockQ2_0;
+                $body
+            }
             // Q8_1 is an activation-side format (no `dequantize`, never a GGUF
             // weight dtype) - not routable as a weight.
             GgmlDType::Q8_1 => Err(Error("quant_cpu: Q8_1 has no weight-side path".into())),

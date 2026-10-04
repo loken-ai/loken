@@ -8,7 +8,7 @@ use super::*;
 pub const QK4_NL: usize = 32;
 
 /// The sixteen levels a code names.
-const LEVELS: [i8; 16] = [
+pub(super) const LEVELS: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 

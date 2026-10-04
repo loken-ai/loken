@@ -6,10 +6,17 @@
 
 use super::*;
 
+pub mod iq2_s;
 pub mod iq2_xxs;
 mod iq2_xxs_dot;
+pub mod iq3_s;
+pub mod iq3_xxs;
 pub mod iq4_nl;
+pub mod iq4_xs;
+mod iq_grids;
+mod iq_read;
 pub mod mxfp4;
+pub mod q2_0;
 pub mod q2_k;
 pub mod q3_k;
 pub mod q4_0;
@@ -21,11 +28,17 @@ pub mod q5_k;
 pub mod q6_k;
 pub mod q8_0;
 pub mod q8_1;
+pub mod q8_64;
 pub mod q8_k;
 
+pub use iq2_s::*;
 pub use iq2_xxs::*;
+pub use iq3_s::*;
+pub use iq3_xxs::*;
 pub use iq4_nl::*;
+pub use iq4_xs::*;
 pub use mxfp4::*;
+pub use q2_0::*;
 pub use q2_k::*;
 pub use q3_k::*;
 pub use q4_0::*;
@@ -37,4 +50,5 @@ pub use q5_k::*;
 pub use q6_k::*;
 pub use q8_0::*;
 pub use q8_1::*;
+pub use q8_64::*;
 pub use q8_k::*;

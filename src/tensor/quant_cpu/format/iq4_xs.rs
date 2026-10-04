@@ -1,0 +1,61 @@
+//! iq4_xs - 256 values in 136 bytes, four-bit codes into the non-linear table of iq4_nl.
+//!
+//! The block carries one f16 scale and a six-bit scale per thirty-two values, split between a
+//! low nibble array and a shared 16-bit word of high pairs. Read-only: loken reads these files
+//! and does not produce them.
+
+use super::iq4_nl::LEVELS;
+use super::*;
+
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIq4Xs {
+    pub(crate) d: f16,
+    pub(crate) scales_h: u16,
+    pub(crate) scales_l: [u8; QK_K / 64],
+    pub(crate) qs: [u8; QK_K / 2],
+}
+const _: () = assert!(std::mem::size_of::<BlockIq4Xs>() == 136);
+
+impl BlockFormat for BlockIq4Xs {
+    const DTYPE: GgmlDType = GgmlDType::Iq4Xs;
+    const BLOCK_LEN: usize = QK_K;
+    type ActivationBlock = BlockQ8K;
+
+    fn zeros() -> Self {
+        Self {
+            d: f16::ZERO,
+            scales_h: 0,
+            scales_l: [0; QK_K / 64],
+            qs: [0x88; QK_K / 2],
+        }
+    }
+
+    fn dequantize(xs: &[Self], ys: &mut [f32]) {
+        for (x, out) in xs.iter().zip(ys.chunks_exact_mut(QK_K)) {
+            let d = x.d.to_f32();
+            for (ib, sub) in out.chunks_exact_mut(32).enumerate() {
+                let low = (x.scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F;
+                let high = ((x.scales_h >> (2 * ib)) & 3) as u8;
+                let dl = d * ((low | (high << 4)) as i32 - 32) as f32;
+                let q = &x.qs[16 * ib..16 * ib + 16];
+                for j in 0..16 {
+                    sub[j] = dl * LEVELS[(q[j] & 0x0F) as usize] as f32;
+                    sub[j + 16] = dl * LEVELS[(q[j] >> 4) as usize] as f32;
+                }
+            }
+        }
+    }
+
+    fn quantize(_: &[f32], _: &mut [Self]) {
+        panic!("iq4_xs is read, not written");
+    }
+
+    fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
+        Self::dot_scalar(xs, ys)
+    }
+
+    fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
+        super::iq_read::dot_by_decoding(xs, ys)
+    }
+}

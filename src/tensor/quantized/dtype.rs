@@ -82,6 +82,11 @@ ggml_dtypes! {
     Q8K                  = 15, 256, 292, "q8_K";
     Iq2Xxs               = 16, 256, 66, "iq2_xxs";
     Iq4Nl                = 20, 32, 18, "iq4_nl";
+    Iq3Xxs               = 18, 256, 98, "iq3_xxs";
+    Iq3S                 = 21, 256, 110, "iq3_s";
+    Iq2S                 = 22, 256, 82, "iq2_s";
+    Iq4Xs                = 23, 256, 136, "iq4_xs";
+    Q2_0                 = 42, 64, 18, "q2_0";
     BF16                 = 30, 1, 2, "bf16";
     /// Raw bytes, no arithmetic: what a tensor carries when the file holds a layout only its own
     /// reader understands - the released fp8 engram rows and their e8m0 scales.
