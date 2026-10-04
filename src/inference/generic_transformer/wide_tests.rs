@@ -201,7 +201,12 @@ fn the_ngram_features_match_the_reference() {
     let tokens = ids(&v, "a.ids");
     let n = tokens.len();
     let ng = model.ngram.as_mut().unwrap();
-    let rows = ng.history.rows(&ng.meta, &tokens);
+    let rows = model.layers[1]
+        .ngram
+        .as_mut()
+        .unwrap()
+        .history
+        .rows(&ng.meta, &tokens);
     let emb = ng.table.gather(&rows).unwrap();
     let emb =
         Tensor::from_vec(emb, (1, n, ng.meta.heads() * ng.meta.row_dim), &Device::Cpu).unwrap();
@@ -294,4 +299,22 @@ fn a_low_rank_wide_residual_is_not_the_deepseek_port() {
     assert!(!crate::inference::model::deepseek_v41::claims_gguf(
         &content
     ));
+}
+
+#[test]
+fn a_prefix_snapshot_resumes_to_the_same_logits() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let mut model = toy();
+    let tokens = ids(&v, "b.ids");
+    let split = 24;
+    let row = |t: &[u32]| Tensor::from_vec(t.to_vec(), (1, t.len()), &Device::Cpu).unwrap();
+    let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let logits = model.forward(&row(&tokens[..split]), 0).unwrap();
+    model.snapshot_prefix(&tokens[..split], &logits).unwrap();
+    let first = flat(&model.forward_all(&row(&tokens[split..]), split).unwrap());
+    let (_, length) = model.restore_kv_snapshot(0).unwrap();
+    assert_eq!(length, split);
+    let again = flat(&model.forward_all(&row(&tokens[split..]), split).unwrap());
+    assert_eq!(first, again);
 }

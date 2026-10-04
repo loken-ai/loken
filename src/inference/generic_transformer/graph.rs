@@ -1574,7 +1574,7 @@ impl GenericHeteroTransformer {
     fn capture_layers(&self) -> crate::tensor::Result<Vec<super::LayerKvSnapshot>> {
         let mut layers = Vec::with_capacity(self.layers.len());
         for l in &self.layers {
-            let mixer = l.mixer.snapshot()?;
+            let mixer = l.state_snapshot()?;
             if let Some(mut snap) = quantised_layer_snapshot(l)? {
                 snap.mixer = mixer;
                 layers.push(snap);
@@ -1624,7 +1624,7 @@ impl GenericHeteroTransformer {
         if !self.is_recurrent() {
             return Ok(Vec::new());
         }
-        self.layers.iter().map(|l| l.mixer.checkpoint()).collect()
+        self.layers.iter().map(|l| l.state_checkpoint()).collect()
     }
 
     /// Writes a checkpoint back into the buffers the states live in.
@@ -1634,7 +1634,7 @@ impl GenericHeteroTransformer {
     ) -> Result<()> {
         for (l, saved) in self.layers.iter_mut().zip(checkpoint) {
             if let Some(state) = saved {
-                l.mixer.restore_in_place(state)?;
+                l.state_restore_in_place(state)?;
             }
         }
         Ok(())
@@ -1945,7 +1945,7 @@ impl GenericHeteroTransformer {
             // A recurrent state cannot be cut to a shorter length: it is dropped only when
             // nothing is kept.
             if new_len == 0 {
-                layer.mixer.reset();
+                layer.state_reset();
             }
             layer.kv_cache.trim_to(new_len);
             // Keep the Q8 mirror in sync with the F-dtype cache; otherwise
@@ -2424,8 +2424,8 @@ pub(super) fn restore_layers(
 ) -> crate::tensor::Result<()> {
     for (l, s) in layers.iter_mut().zip(snap) {
         match &s.mixer {
-            Some(state) => l.mixer.restore(state)?,
-            None => l.mixer.reset(),
+            Some(state) => l.state_restore(state)?,
+            None => l.state_reset(),
         }
         if restore_quantised_layer(l, s)? {
             continue;

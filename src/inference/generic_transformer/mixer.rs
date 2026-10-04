@@ -91,6 +91,17 @@ pub enum MixerState {
     ShortConv(Option<ConvState>),
     Ssm(Option<SsmState>),
     DeltaNet(Option<SsmState>),
+    /// A wide-residual layer's: its mixer's state beside the caches of its indexer and of its
+    /// n-gram features.
+    Wide(Box<WideState>),
+}
+
+/// What a wide-residual layer carries beyond its mixer's own state.
+#[derive(Clone)]
+pub struct WideState {
+    pub mixer: Option<MixerState>,
+    pub index: Option<super::qsa::IndexerCache>,
+    pub ngram: Option<super::ngram::PleState>,
 }
 
 impl MixerState {
@@ -107,6 +118,10 @@ impl MixerState {
                 .map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
                 .sum(),
             MixerState::Ssm(_) | MixerState::DeltaNet(_) => 0,
+            MixerState::Wide(w) => {
+                w.mixer.as_ref().map_or(0, MixerState::device_bytes)
+                    + w.ngram.as_ref().map_or(0, |n| n.device_bytes())
+            }
         }
     }
 }

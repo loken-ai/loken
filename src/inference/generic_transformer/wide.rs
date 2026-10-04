@@ -189,6 +189,87 @@ impl GenericTransformerLayer {
     }
 }
 
+impl GenericTransformerLayer {
+    /// The layer's recurrent state, copied: its mixer's and, on a wide layer, the caches its
+    /// indexer and n-gram block carry. `None` for a layer with no state.
+    pub(super) fn state_snapshot(&self) -> Result<Option<mixer::MixerState>> {
+        let mixer = self.mixer.snapshot()?;
+        self.with_wide_state(mixer, |p| p.snapshot())
+    }
+
+    /// [`Self::state_snapshot`] for a checkpoint a step may be run twice from.
+    pub(super) fn state_checkpoint(&self) -> Result<Option<mixer::MixerState>> {
+        let mixer = self.mixer.checkpoint()?;
+        self.with_wide_state(mixer, |p| p.snapshot())
+    }
+
+    fn with_wide_state(
+        &self,
+        mixer: Option<mixer::MixerState>,
+        ple: impl Fn(&ngram::PleBlock) -> Result<ngram::PleState>,
+    ) -> Result<Option<mixer::MixerState>> {
+        if self.sparse.is_none() && self.ngram.is_none() {
+            return Ok(mixer);
+        }
+        Ok(Some(mixer::MixerState::Wide(Box::new(mixer::WideState {
+            mixer,
+            index: self.sparse.as_ref().map(|s| s.cache.clone()),
+            ngram: self.ngram.as_ref().map(ple).transpose()?,
+        }))))
+    }
+
+    /// Make `state` the layer's state; the copy stays reusable.
+    pub(super) fn state_restore(&mut self, state: &mixer::MixerState) -> Result<()> {
+        match state {
+            mixer::MixerState::Wide(w) => {
+                if let Some(m) = &w.mixer {
+                    self.mixer.restore(m)?;
+                } else {
+                    self.mixer.reset();
+                }
+                if let (Some(sp), Some(c)) = (self.sparse.as_mut(), w.index.as_ref()) {
+                    sp.cache = c.clone();
+                }
+                if let (Some(p), Some(st)) = (self.ngram.as_mut(), w.ngram.as_ref()) {
+                    p.restore(st)?;
+                }
+                Ok(())
+            }
+            other => self.mixer.restore(other),
+        }
+    }
+
+    /// [`Self::state_restore`] into the buffers the state lives in.
+    pub(super) fn state_restore_in_place(&mut self, state: &mixer::MixerState) -> Result<()> {
+        match state {
+            mixer::MixerState::Wide(w) => {
+                if let Some(m) = &w.mixer {
+                    self.mixer.restore_in_place(m)?;
+                }
+                if let (Some(sp), Some(c)) = (self.sparse.as_mut(), w.index.as_ref()) {
+                    sp.cache = c.clone();
+                }
+                if let (Some(p), Some(st)) = (self.ngram.as_mut(), w.ngram.as_ref()) {
+                    p.restore(st)?;
+                }
+                Ok(())
+            }
+            other => self.mixer.restore_in_place(other),
+        }
+    }
+
+    /// Forget the sequence: the mixer's state and the caches of a wide layer.
+    pub(super) fn state_reset(&mut self) {
+        self.mixer.reset();
+        if let Some(sp) = self.sparse.as_mut() {
+            sp.cache.clear();
+        }
+        if let Some(p) = self.ngram.as_mut() {
+            p.reset();
+        }
+    }
+}
+
 /// The residual a token starts from, one copy of its embedding per stream.
 pub(super) fn widen_embedding(hidden: &Tensor, streams: usize) -> Result<Tensor> {
     super::hyper::widen(&hidden.to_dtype(DType::F32)?, streams)

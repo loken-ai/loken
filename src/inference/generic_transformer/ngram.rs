@@ -209,6 +209,26 @@ pub struct PleBlock {
     eps: f64,
     /// The last `(taps - 1) * dilation` normalised rows, `[history, channels]` F32.
     state: Option<Tensor>,
+    /// The tokens the hashes of the next forward reach back to.
+    pub history: NgramHistory,
+    meta: NgramMeta,
+}
+
+/// A block's carried state: the convolution's rows and the token history.
+#[derive(Clone)]
+pub struct PleState {
+    conv: Option<Tensor>,
+    history: NgramHistory,
+}
+
+impl PleState {
+    /// Device memory the rows hold.
+    pub fn device_bytes(&self) -> u64 {
+        self.conv
+            .as_ref()
+            .filter(|t| t.device().is_cuda())
+            .map_or(0, |t| (t.elem_count() * t.dtype().size_in_bytes()) as u64)
+    }
 }
 
 impl PleBlock {
@@ -253,11 +273,38 @@ impl PleBlock {
             dim,
             eps,
             state: None,
+            history: NgramHistory::new(meta),
+            meta: meta.clone(),
         })
     }
 
+    /// Forget the sequence: the convolution's rows and the token history.
     pub fn reset(&mut self) {
         self.state = None;
+        self.history.reset(&self.meta);
+    }
+
+    /// The carried state, copied.
+    pub fn snapshot(&self) -> Result<PleState> {
+        Ok(PleState {
+            conv: self
+                .state
+                .as_ref()
+                .map(|t| t.affine(1.0, 0.0))
+                .transpose()?,
+            history: self.history.clone(),
+        })
+    }
+
+    /// Make `state` the carried state; the copy stays reusable.
+    pub fn restore(&mut self, state: &PleState) -> Result<()> {
+        self.state = state
+            .conv
+            .as_ref()
+            .map(|t| t.affine(1.0, 0.0))
+            .transpose()?;
+        self.history = state.history.clone();
+        Ok(())
     }
 
     /// The features for the rows of `r` `[1, seq, streams * dim]`, from the gathered

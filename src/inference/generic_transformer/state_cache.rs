@@ -169,6 +169,11 @@ impl MixerHost {
             MixerState::ShortConv(s) => MixerHost::Conv(s.as_ref().map(conv).transpose()?),
             MixerState::Ssm(s) => MixerHost::Ssm(s.as_ref().map(ssm).transpose()?),
             MixerState::DeltaNet(s) => MixerHost::Delta(s.as_ref().map(ssm).transpose()?),
+            MixerState::Wide(_) => {
+                return Err(crate::tensor::Error::msg(
+                    "a wide-residual layer's state has no stored form",
+                ))
+            }
         })
     }
 
@@ -685,7 +690,11 @@ impl GenericHeteroTransformer {
         store: Arc<StateStore>,
         identity: [u8; 32],
     ) -> bool {
-        if !self.is_recurrent() || self.layers.iter().any(|l| l.cpu_q8_kv.is_some()) {
+        // A wide-residual layer's indexer and n-gram state have no stored form yet.
+        if !self.is_recurrent()
+            || self.is_wide()
+            || self.layers.iter().any(|l| l.cpu_q8_kv.is_some())
+        {
             return false;
         }
         // The identity first: the block size is settled under it.

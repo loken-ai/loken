@@ -1497,20 +1497,24 @@ impl GenericHeteroTransformer {
         let hidden = match self.config.hyper {
             Some(h) => {
                 if let Some(ng) = self.ngram.as_mut() {
+                    let ple = self.layers[ng.meta.layer]
+                        .ngram
+                        .as_mut()
+                        .expect("the layer the n-gram file names carries its block");
                     if index_pos == 0 {
-                        ng.history.reset(&ng.meta);
+                        ple.reset();
                     }
-                    if ng.history.seen != index_pos {
+                    if ple.history.seen != index_pos {
                         crate::tensor::bail!(
                             "the n-gram history holds {} tokens but the forward starts at {index_pos}",
-                            ng.history.seen
+                            ple.history.seen
                         );
                     }
                     let ids = input_ids
                         .flatten_all()?
                         .to_dtype(crate::tensor::DType::U32)?
                         .to_vec1::<u32>()?;
-                    let rows = ng.history.rows(&ng.meta, &ids);
+                    let rows = ple.history.rows(&ng.meta, &ids);
                     let data = ng.table.gather(&rows)?;
                     let width = ng.meta.heads() * ng.meta.row_dim;
                     ng.pending = Some(Tensor::from_vec(data, (1, ids.len(), width), &Device::Cpu)?);

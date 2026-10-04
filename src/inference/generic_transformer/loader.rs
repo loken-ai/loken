@@ -3269,7 +3269,6 @@ impl GenericHeteroTransformer {
             Some(meta) if config.hyper.is_some() => {
                 let table = source.read("per_layer_token_embd.weight", &Device::Cpu)?;
                 Some(NgramModel {
-                    history: super::ngram::NgramHistory::new(meta),
                     table: super::ngram::NgramTable::new(table, meta)?,
                     meta: meta.clone(),
                     pending: None,

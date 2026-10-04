@@ -482,11 +482,10 @@ pub struct GenericHeteroTransformer {
     ngram: Option<NgramModel>,
 }
 
-/// The model-level state of the n-gram embedding.
+/// The model-level part of the n-gram embedding; the token history lives with its layer.
 pub struct NgramModel {
     pub meta: ngram::NgramMeta,
     pub table: ngram::NgramTable,
-    pub history: ngram::NgramHistory,
     /// The gathered embeddings `[1, seq, heads * row_dim]` of the forward in progress.
     pub pending: Option<Tensor>,
 }
