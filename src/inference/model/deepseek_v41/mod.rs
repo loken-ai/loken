@@ -28,6 +28,7 @@ pub mod load;
 pub mod model;
 pub mod moe;
 pub mod packed;
+pub mod quality;
 pub mod safetensors_source;
 pub mod sibling;
 pub mod snapshot;
