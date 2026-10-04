@@ -84,7 +84,7 @@ fn now_secs() -> u64 {
 
 /// Written pages are handed back to the kernel once they are on disk, so a snapshot
 /// never pushes the weights out of the page cache.
-fn release_written(file: &std::fs::File) {
+pub(crate) fn release_written(file: &std::fs::File) {
     let _ = file.sync_data();
     #[cfg(target_os = "linux")]
     {
