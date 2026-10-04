@@ -928,3 +928,41 @@ fn the_wide_prefill_footprint_follows_the_model() {
         2 * a.bytes_per_token
     );
 }
+
+/// A prefill pinned at the whole prompt, at a divisor of its length and at a size that leaves a
+/// short last chunk gives the logits of the unchunked reference at every position.
+#[test]
+fn a_prefill_at_any_pinned_chunk_gives_the_unchunked_logits() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let tokens = ids(&v, "b.ids");
+    let want = f32s(&v, "b.logits");
+    let n = tokens.len();
+    let vocab = want.len() / n;
+    let divisor = (2..n)
+        .find(|d| n.is_multiple_of(*d) && n / d > 1)
+        .unwrap_or(1);
+    let ragged = (2..n)
+        .rev()
+        .find(|c| !n.is_multiple_of(*c) && n.div_ceil(*c) > 1)
+        .unwrap_or(1);
+    for chunk in [n, n / divisor, ragged] {
+        let mut model = toy();
+        let mut at = 0;
+        while at < n {
+            let len = chunk.min(n - at);
+            let input =
+                Tensor::from_vec(tokens[at..at + len].to_vec(), (1, len), &Device::Cpu).unwrap();
+            let got = model.forward_all(&input, at).unwrap();
+            let got = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            within_rounding(
+                &got,
+                &want[at * vocab..(at + len) * vocab],
+                scale_of(&want),
+                vocab,
+                &format!("chunk {chunk} at {at}"),
+            );
+            at += len;
+        }
+    }
+}
