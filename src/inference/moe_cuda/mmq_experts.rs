@@ -14,6 +14,25 @@ use crate::tensor::quantized::{
 };
 use cudarc::driver::CudaSlice;
 
+/// `n` uninitialised elements on the device's stream. A card whose pool still holds what earlier
+/// chunks freed gets it back and the allocation runs once more, as every storage-level
+/// allocation does.
+fn scratch<T: cudarc::driver::DeviceRepr>(
+    dev: &crate::tensor::kernel_ffi::CudaDevice,
+    n: usize,
+) -> Result<CudaSlice<T>> {
+    use cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY;
+    let take = || unsafe { dev.native().stream().alloc::<T>(n) };
+    match take() {
+        Err(e) if e.0 == CUDA_ERROR_OUT_OF_MEMORY => {
+            crate::tensor::cuda::reclaim_pool(dev.native());
+            take()
+        }
+        r => r,
+    }
+    .map_err(|e| crate::tensor::Error::msg(format!("[oom] moe mmq: {e}")))
+}
+
 cuda_launchers! {
     loken_moe_mmq_plan(
         experts: *const i32, slots: *const i32, n: i32, topk: i32, n_experts: i32,
@@ -211,8 +230,7 @@ impl MmqRouting {
         let dev = xs.device().as_cuda_device()?;
         let rows = self.rows();
         let y = self.quantize(xs, Some(&self.src_rows), gate.dtype(), k)?;
-        let gu = unsafe { dev.native().stream().alloc::<f32>(rows * 2 * width) }
-            .map_err(|e| crate::tensor::Error::msg(format!("moe mmq: {e}")))?;
+        let gu = scratch::<f32>(&dev, rows * 2 * width)?;
         let gu_ptr = gu.device_ptr(gu.stream()).0;
         match up {
             Some(u) => {
@@ -222,8 +240,7 @@ impl MmqRouting {
             }
             None => self.matmul(gate, &y, k, gu_ptr, 2 * width, None)?,
         }
-        let out = unsafe { dev.native().stream().alloc::<f32>(rows * width) }
-            .map_err(|e| crate::tensor::Error::msg(format!("moe mmq: {e}")))?;
+        let out = scratch::<f32>(&dev, rows * width)?;
         let out_ptr = out.device_ptr(out.stream()).0 as *mut f32;
         let stream = dev.cuda_stream().cu_stream() as i64;
         match glu {
@@ -316,8 +333,7 @@ impl MmqRouting {
         }
         let dev = hs.device().as_cuda_device()?;
         let y = self.quantize(hs, None, down.dtype(), k)?;
-        let pairs = unsafe { dev.native().stream().alloc::<f32>(rows * hidden) }
-            .map_err(|e| crate::tensor::Error::msg(format!("moe mmq: {e}")))?;
+        let pairs = scratch::<f32>(&dev, rows * hidden)?;
         let pairs_ptr = pairs.device_ptr(pairs.stream()).0;
         let slots = self.slots.device_ptr(self.slots.stream()).0 as *const i32;
         self.matmul(down, &y, k, pairs_ptr, hidden, Some(slots))?;
@@ -394,8 +410,7 @@ impl MmqRouting {
         let x = x.to_dtype(DType::F32)?.contiguous()?;
         let dev = x.device().as_cuda_device()?;
         let stream = dev.native().stream();
-        let y = unsafe { stream.alloc::<u8>(bytes) }
-            .map_err(|e| crate::tensor::Error::msg(format!("moe mmq: {e}")))?;
+        let y = scratch::<u8>(&dev, bytes)?;
         let ids = match gather {
             Some(g) => g.device_ptr(g.stream()).0 as *const i32,
             None => std::ptr::null(),
