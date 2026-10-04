@@ -43,7 +43,23 @@ pub(crate) fn cpu_qmatmul_supported(dtype: GgmlDType) -> bool {
     use GgmlDType::*;
     matches!(
         dtype,
-        Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K | Q8K | MxFp4
+        Q4_0 | Q4_1
+            | Q5_0
+            | Q5_1
+            | Q8_0
+            | Q2K
+            | Q3K
+            | Q4K
+            | Q5K
+            | Q6K
+            | Q8K
+            | MxFp4
+            | Iq4Nl
+            | Iq4Xs
+            | Iq3Xxs
+            | Iq3S
+            | Iq2S
+            | Q2_0
     )
 }
 
@@ -481,7 +497,9 @@ fn fused_gate_up_silu_cpu(
     use crate::tensor::quant_cpu::*;
     dispatch!(Q4_0 => BlockQ4_0, Q5_0 => BlockQ5_0, Q8_0 => BlockQ8_0,
               Q2K => BlockQ2K, Q3K => BlockQ3K, Q4K => BlockQ4K,
-              Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4)
+              Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4,
+              Q5_1 => BlockQ5_1, Iq4Nl => BlockIq4Nl, Iq4Xs => BlockIq4Xs, Iq3Xxs => BlockIq3Xxs,
+              Iq3S => BlockIq3S, Iq2S => BlockIq2S, Q2_0 => BlockQ2_0)
 }
 
 fn fused_gate_up_silu_t<T: crate::tensor::quant_cpu::BlockFormat>(
@@ -842,7 +860,9 @@ fn fused_gate_up_silu_fused_cpu(
     use crate::tensor::quant_cpu::*;
     dispatch!(Q4_0 => BlockQ4_0, Q5_0 => BlockQ5_0, Q8_0 => BlockQ8_0,
               Q2K => BlockQ2K, Q3K => BlockQ3K, Q4K => BlockQ4K,
-              Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4)
+              Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4,
+              Q5_1 => BlockQ5_1, Iq4Nl => BlockIq4Nl, Iq4Xs => BlockIq4Xs, Iq3Xxs => BlockIq3Xxs,
+              Iq3S => BlockIq3S, Iq2S => BlockIq2S, Q2_0 => BlockQ2_0)
 }
 
 fn fused_gate_up_silu_fused_t<T: crate::tensor::quant_cpu::BlockFormat>(
@@ -1068,7 +1088,9 @@ pub fn moe_gemm_gguf_gate_up_swiglu_oai(
                 _ => None, } } }
             if let Some(h) = disp!(Q4_0 => BlockQ4_0, Q5_0 => BlockQ5_0, Q8_0 => BlockQ8_0,
                 Q2K => BlockQ2K, Q3K => BlockQ3K, Q4K => BlockQ4K,
-                Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4)
+                Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4,
+              Q5_1 => BlockQ5_1, Iq4Nl => BlockIq4Nl, Iq4Xs => BlockIq4Xs, Iq3Xxs => BlockIq3Xxs,
+              Iq3S => BlockIq3S, Iq2S => BlockIq2S, Q2_0 => BlockQ2_0)
             {
                 return Ok(h);
             }
@@ -1148,7 +1170,9 @@ fn fused_up_relu2_cpu(
     use crate::tensor::quant_cpu::*;
     dispatch!(Q4_0 => BlockQ4_0, Q5_0 => BlockQ5_0, Q8_0 => BlockQ8_0,
               Q2K => BlockQ2K, Q3K => BlockQ3K, Q4K => BlockQ4K,
-              Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4)
+              Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4,
+              Q5_1 => BlockQ5_1, Iq4Nl => BlockIq4Nl, Iq4Xs => BlockIq4Xs, Iq3Xxs => BlockIq3Xxs,
+              Iq3S => BlockIq3S, Iq2S => BlockIq2S, Q2_0 => BlockQ2_0)
 }
 
 fn fused_up_relu2_t<T: crate::tensor::quant_cpu::BlockFormat>(
@@ -1376,7 +1400,9 @@ fn fused_down_reduce_cpu(
     use crate::tensor::quant_cpu::*;
     dispatch!(Q4_0 => BlockQ4_0, Q5_0 => BlockQ5_0, Q8_0 => BlockQ8_0,
               Q2K => BlockQ2K, Q3K => BlockQ3K, Q4K => BlockQ4K,
-              Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4)
+              Q5K => BlockQ5K, Q6K => BlockQ6K, MxFp4 => BlockMxFp4,
+              Q5_1 => BlockQ5_1, Iq4Nl => BlockIq4Nl, Iq4Xs => BlockIq4Xs, Iq3Xxs => BlockIq3Xxs,
+              Iq3S => BlockIq3S, Iq2S => BlockIq2S, Q2_0 => BlockQ2_0)
 }
 
 fn fused_down_reduce_t<T: crate::tensor::quant_cpu::BlockFormat>(

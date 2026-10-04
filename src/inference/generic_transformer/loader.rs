@@ -1177,7 +1177,7 @@ fn build_generic_layer(
             ));
         }
         Some(MoeWeights {
-            gate_inp: crate::tensor::quantized::QMatMul::from_qtensor(gi)?,
+            gate_inp: super::wide::dense_router(gi)?,
             gate_inp_scale,
             gate_inp_bias,
             gate_exps_bias,
@@ -2426,7 +2426,10 @@ impl GenericHeteroTransformer {
                 .filter(|(_, k)| matches!(k, DeviceKind::Cpu))
                 .count();
             if cpu_layers > 0 {
-                let per_layer = (source.total_bytes()) / (n_layers.max(1) as u64);
+                let placed = source
+                    .total_bytes()
+                    .saturating_sub(super::ngram::demand_paged_bytes(content, &config.arch));
+                let per_layer = placed / (n_layers.max(1) as u64);
                 let want = per_layer.saturating_mul(cpu_layers as u64);
                 let budget = plan
                     .segments

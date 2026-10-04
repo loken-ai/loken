@@ -78,6 +78,15 @@ impl NgramMeta {
     }
 }
 
+/// Bytes of the file the load does not place: the n-gram table, read by row from the mapping
+/// whatever the placement, so only the pages its tokens touch ever count. Zero for a file
+/// without one.
+pub fn demand_paged_bytes(content: &gguf_file::Content, arch: &str) -> u64 {
+    NgramMeta::from_gguf(content, arch)
+        .and_then(|_| content.tensor_infos.get("per_layer_token_embd.weight"))
+        .map_or(0, |t| t.size_in_bytes() as u64)
+}
+
 /// The last tokens of the sequence, which the hash of the next token reaches back to.
 #[derive(Debug, Clone)]
 pub struct NgramHistory {

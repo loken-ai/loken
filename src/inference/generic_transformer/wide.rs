@@ -30,6 +30,20 @@ fn sublayer_dtype(x: &Tensor) -> DType {
     }
 }
 
+/// [`load_matrix`] for the tensor-level projection a router uses.
+pub(super) fn dense_router(qt: QTensor) -> Result<crate::tensor::quantized::QMatMul> {
+    use crate::tensor::quantized::GgmlDType::{BF16, F16, F32};
+    match qt.dtype() {
+        F16 | BF16 => {
+            let dev = qt.device().clone();
+            // CONVERSION: a float router weight is held F32, as the wide residual's projections are.
+            let w = qt.dequantize(&dev)?.to_dtype(DType::F32)?;
+            crate::tensor::quantized::QMatMul::from_qtensor(QTensor::quantize_onto(&w, F32, &dev)?)
+        }
+        _ => crate::tensor::quantized::QMatMul::from_qtensor(qt),
+    }
+}
+
 impl GenericTransformerLayer {
     /// The wide block of this layer, `None` on a model with a plain residual.
     pub(super) fn is_wide(&self) -> bool {

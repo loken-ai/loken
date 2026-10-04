@@ -380,6 +380,13 @@ impl LlmEngine {
                 (None, Some(s)) => s.parts().iter().map(|p| p.mmap.len() as u64).sum(),
                 (None, None) => file_size,
             };
+            // A table read by row is never placed: the cards and the host answer for the rest.
+            let file_size = file_size.saturating_sub(
+                crate::inference::generic_transformer::ngram::demand_paged_bytes(
+                    &content,
+                    &get_gguf_string(&content, "general.architecture").unwrap_or_default(),
+                ),
+            );
             let generic_weights = match (&awq, &split) {
                 (Some((dir, shards)), _) => GenericWeights::Awq { dir, shards },
                 (None, Some(s)) => GenericWeights::GgufSplit { split: s },
