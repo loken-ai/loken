@@ -514,7 +514,8 @@ impl Dspark {
 
         // Rope tables long enough for the window positions and this block.
         let n = start_pos + 1 + bs;
-        let (cos, sin) = rope_table(rd, n, c.original_seq_len, c.rope_theta, c.rope_factor)?;
+        // The draft's attention is sliding-window only: plain rotary at the base theta, no YaRN.
+        let (cos, sin) = rope_table(rd, n, 0, c.rope_theta, c.rope_factor)?;
 
         self.update_windows(st, &main_x, start_pos, &cos, &sin)?;
         let coverage = win.min(start_pos + 1);
@@ -664,13 +665,7 @@ impl Dspark {
         )?;
         let main_x = rms_norm(&self.main_proj.apply(&mh)?, &self.main_norm, c.rms_eps)?;
         let n = start_pos + 1;
-        let (cos, sin) = rope_table(
-            c.rope_head_dim,
-            n,
-            c.original_seq_len,
-            c.rope_theta,
-            c.rope_factor,
-        )?;
+        let (cos, sin) = rope_table(c.rope_head_dim, n, 0, c.rope_theta, c.rope_factor)?;
         self.update_windows(st, &main_x, start_pos, &cos, &sin)
     }
 
