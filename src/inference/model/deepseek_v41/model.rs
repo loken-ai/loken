@@ -3962,6 +3962,184 @@ mod oracle_gate {
         assert!(backend.forward(&x, pos + 1).is_err());
     }
 
+    /// A backend over the synthetic model with a decode-state cache in `dir`, blocks of 8 tokens.
+    fn cached_backend(
+        dir: &std::path::Path,
+    ) -> (
+        crate::inference::engine::model_backend::DeepseekV41Backend,
+        std::sync::Arc<crate::inference::cache::state_disk::StateStore>,
+    ) {
+        use crate::inference::cache::state_disk::StateStore;
+        use crate::inference::engine::model_backend::DeepseekV41Backend;
+        let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let store = std::sync::Arc::new(StateStore::open(dir.to_path_buf(), 0, 8).unwrap());
+        let id = super::super::snapshot::identity(&[b"synthetic"]);
+        (
+            DeepseekV41Backend::new(model, 0, 128).with_state_cache(store.clone(), id),
+            store,
+        )
+    }
+
+    fn prompt_logits(
+        backend: &mut crate::inference::engine::model_backend::DeepseekV41Backend,
+        tokens: &[u32],
+    ) -> Vec<f32> {
+        use crate::inference::engine::model_backend::ModelBackend;
+        let x = Tensor::new(tokens, &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        vecf_of(&backend.forward(&x, 0).unwrap())
+    }
+
+    fn wait_for_states(store: &crate::inference::cache::state_disk::StateStore, n: usize) {
+        let start = std::time::Instant::now();
+        while store.stats().0 < n {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(20),
+                "the state was not written"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("loken-dsv41-cache-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// A prompt that begins with one the cache holds is answered from the restored state and its
+    /// remainder: the logits match a cold prefill to rounding with the same token, a prompt seen
+    /// whole is answered with the logits it was stored with, and the turn a backend finishes is
+    /// stored as the state after the tokens it fed.
+    #[test]
+    fn a_backend_restores_a_stored_prefix_and_matches_a_cold_prompt() {
+        use crate::inference::engine::model_backend::{DeepseekV41Backend, ModelBackend};
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+            (num / b.iter().map(|y| y * y).sum::<f32>()).sqrt()
+        };
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        let tokens: Vec<u32> = (0..48)
+            .map(|i| (i * 7 + 3) % super::tests::VOCAB as u32)
+            .collect();
+        let dir = scratch_dir("restore");
+        let (mut first, store) = cached_backend(&dir);
+        let cold_24 = prompt_logits(&mut first, &tokens[..24]);
+        wait_for_states(&store, 1);
+
+        // A longer prompt on a fresh backend over the same directory restores the 24 and prefills 24.
+        let (mut second, store2) = cached_backend(&dir);
+        let warm_48 = prompt_logits(&mut second, &tokens);
+        let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let mut plain = DeepseekV41Backend::new(model, 0, 128);
+        let cold_48 = prompt_logits(&mut plain, &tokens);
+        assert!(
+            rel(&warm_48, &cold_48) < 1e-4,
+            "rel {}",
+            rel(&warm_48, &cold_48)
+        );
+        assert_eq!(argmax(&warm_48), argmax(&cold_48));
+        wait_for_states(&store2, 2);
+
+        // The prompt seen whole comes back with the logits it was stored with, to the bit.
+        let (mut third, _) = cached_backend(&dir);
+        assert_eq!(prompt_logits(&mut third, &tokens[..24]), cold_24);
+
+        // A decode after a restored prompt agrees with the one after a cold prompt.
+        let x = Tensor::new(&[5u32], &Device::Cpu)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        let warm_step = vecf_of(&second.forward(&x, tokens.len()).unwrap());
+        let cold_step = vecf_of(&plain.forward(&x, tokens.len()).unwrap());
+        assert!(rel(&warm_step, &cold_step) < 1e-3);
+
+        // The turn's end: the state after the tokens fed is stored, whatever came after them.
+        let mut turn = tokens.clone();
+        turn.push(5);
+        second.snapshot_kv(turn.clone(), turn.len()).unwrap();
+        wait_for_states(&store2, 3);
+        // A position the state does not stand at is not stored.
+        second.snapshot_kv(turn.clone(), turn.len() - 1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(store2.stats().0, 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A damaged snapshot - truncated, flipped, or written by another format version - is passed
+    /// over with the prompt prefilled cold, never a panic and never a wrong answer, and the file
+    /// is dropped. The files hold no run of the prompt's token ids.
+    #[test]
+    fn a_damaged_snapshot_is_ignored_and_the_files_hold_no_tokens() {
+        use crate::inference::engine::model_backend::DeepseekV41Backend;
+        let tokens: Vec<u32> = (0..40)
+            .map(|i| (i * 7 + 3) % super::tests::VOCAB as u32)
+            .collect();
+        let dir = scratch_dir("damaged");
+        let (mut first, store) = cached_backend(&dir);
+        let _ = prompt_logits(&mut first, &tokens[..24]);
+        wait_for_states(&store, 1);
+
+        let snaps: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "snap"))
+            .collect();
+        assert_eq!(snaps.len(), 1);
+        let good = std::fs::read(&snaps[0]).unwrap();
+        // No run of six consecutive prompt ids, as written, in any file of the directory.
+        for run in tokens.windows(6) {
+            let needle: Vec<u8> = run.iter().flat_map(|t| t.to_le_bytes()).collect();
+            assert!(!good.windows(needle.len()).any(|w| w == &needle[..]));
+        }
+
+        let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let mut plain = DeepseekV41Backend::new(model, 0, 128);
+        let cold = prompt_logits(&mut plain, &tokens);
+
+        let mut other_version = good.clone();
+        other_version[8..12]
+            .copy_from_slice(&(super::super::snapshot::FORMAT_VERSION + 1).to_le_bytes());
+        let mut flipped = good.clone();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0x01;
+        for (name, bad) in [
+            ("truncated", good[..good.len() / 2].to_vec()),
+            ("empty", Vec::new()),
+            ("flipped", flipped),
+            ("other version", other_version),
+        ] {
+            std::fs::write(&snaps[0], &bad).unwrap();
+            // A fresh store reads the directory as a restarted server would.
+            let (mut backend, store) = cached_backend(&dir);
+            assert_eq!(store.stats().0, 1, "{name}");
+            let got = prompt_logits(&mut backend, &tokens);
+            let num: f32 = got.iter().zip(&cold).map(|(a, b)| (a - b) * (a - b)).sum();
+            let den: f32 = cold.iter().map(|b| b * b).sum();
+            assert!((num / den).sqrt() < 1e-4, "{name}: answered wrongly");
+            // The unusable file is gone; the prompt just prefilled is stored in its place.
+            wait_for_states(&store, 1);
+            assert!(
+                !std::fs::read(&snaps[0]).is_ok_and(|b| b == bad),
+                "{name}: kept"
+            );
+            // Back to a clean directory for the next case.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&snaps[0], &good).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn streamed_load_matches_resident_load() {
         let (m0, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 0);

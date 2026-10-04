@@ -430,29 +430,48 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The identity of a set of model files: each file's length and modification time, and its first
-/// `head_bytes`, which in a GGUF carry the metadata and the tensor table, so a file requantised or
-/// replaced gives another digest without the weights being read.
-pub fn files_digest(paths: &[PathBuf], head_bytes: usize) -> std::io::Result<[u8; 32]> {
-    use std::io::Read;
-    let mut h = Sha256::new();
-    for p in paths {
-        let meta = std::fs::metadata(p)?;
-        h.update(meta.len().to_le_bytes());
+/// Bytes read from the head of each model file for its digest: in a GGUF, the metadata and the
+/// tensor table.
+pub const DIGEST_HEAD_BYTES: usize = 4 << 20;
+
+/// The identity of a set of model files: each file's length, modification time and head, so a
+/// file requantised or replaced gives another digest without its weights being read.
+#[derive(Default)]
+pub struct FilesDigest(Sha256);
+
+impl FilesDigest {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add one file, from its metadata and the first bytes it holds (at most
+    /// `DIGEST_HEAD_BYTES` are used).
+    pub fn file(&mut self, meta: &std::fs::Metadata, head: &[u8]) {
+        self.0.update(meta.len().to_le_bytes());
         let mtime = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        h.update(mtime.to_le_bytes());
-        let mut head = Vec::new();
-        std::fs::File::open(p)?
-            .take(head_bytes as u64)
-            .read_to_end(&mut head)?;
-        h.update(&head);
+        self.0.update(mtime.to_le_bytes());
+        self.0.update(&head[..head.len().min(DIGEST_HEAD_BYTES)]);
     }
-    Ok(h.finalize().into())
+
+    /// Add the file at `path`.
+    pub fn path(&mut self, path: &Path) -> std::io::Result<()> {
+        use std::io::Read;
+        let mut head = Vec::new();
+        std::fs::File::open(path)?
+            .take(DIGEST_HEAD_BYTES as u64)
+            .read_to_end(&mut head)?;
+        self.file(&std::fs::metadata(path)?, &head);
+        Ok(())
+    }
+
+    pub fn finish(self) -> [u8; 32] {
+        self.0.finalize().into()
+    }
 }
 
 #[cfg(test)]
@@ -572,6 +591,24 @@ mod tests {
         std::fs::remove_file(store.path_of(&e)).unwrap();
         assert!(store.read(&e).is_err());
         assert!(store.candidates(&keys, 16).is_empty());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_model_file_that_changes_gives_another_digest() {
+        let d = dir("digest");
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("model.gguf");
+        std::fs::write(&f, b"header-one and the weights").unwrap();
+        let digest = |p: &Path| {
+            let mut h = FilesDigest::new();
+            h.path(p).unwrap();
+            h.finish()
+        };
+        let a = digest(&f);
+        assert_eq!(a, digest(&f));
+        std::fs::write(&f, b"header-two and the weights").unwrap();
+        assert_ne!(a, digest(&f));
         let _ = std::fs::remove_dir_all(d);
     }
 

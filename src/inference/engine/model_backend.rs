@@ -844,6 +844,15 @@ pub(crate) struct DeepseekV41Backend {
     /// Formed when the cluster's auto-tune decides a split pays; `None` keeps the whole-stack
     /// single-node path exactly as it was.
     pipeline: Option<PipelineHead>,
+    /// The on-disk cache of decode states this backend restores a prompt's prefix from and writes
+    /// its finished prompts and turns to. `None` leaves every prompt a cold prefill.
+    state_cache: Option<StateCache>,
+}
+
+/// A decode-state store and the identity every state in it is written and read under.
+struct StateCache {
+    store: std::sync::Arc<crate::inference::cache::state_disk::StateStore>,
+    identity: crate::inference::model::deepseek_v41::snapshot::Identity,
 }
 
 /// The head end of a cross-node pipeline held by a backend: the link to the tail, the boundary
@@ -903,6 +912,110 @@ impl DeepseekV41Backend {
             dspark,
             dspark_state,
             pipeline: None,
+            state_cache: None,
+        }
+    }
+
+    /// Restore prompt prefixes from, and write finished prompts and turns to, `store`, under
+    /// `identity`: the model files, the numerics and the operator's salt the states belong to.
+    pub(crate) fn with_state_cache(
+        mut self,
+        store: std::sync::Arc<crate::inference::cache::state_disk::StateStore>,
+        identity: crate::inference::model::deepseek_v41::snapshot::Identity,
+    ) -> Self {
+        self.state_cache = Some(StateCache { store, identity });
+        self
+    }
+
+    /// Replace the state with the longest stored one that is a prefix of `ids`, returning the
+    /// tokens it covers and, when it covers all of them, the logits it was stored with. A state
+    /// that is whole `ids` but holds no logits cannot answer and is passed over; a file that
+    /// cannot be read is logged, dropped and passed over. `None` leaves the state untouched.
+    fn restore_prefix(&mut self, ids: &[u32]) -> Option<(usize, Option<Vec<f32>>)> {
+        use crate::inference::model::deepseek_v41::snapshot::decode;
+        let cache = self.state_cache.as_ref()?;
+        let keys = cache.store.keys(&cache.identity, ids);
+        for entry in cache.store.candidates(&keys, ids.len()) {
+            let bytes = match cache.store.read(&entry) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("state cache: {e}; ignored");
+                    continue;
+                }
+            };
+            match decode(&bytes, &cache.identity, self.model.n_layers()) {
+                Ok(snap) if snap.state.pos == entry.len => {
+                    if entry.len == ids.len() && snap.logits.is_none() {
+                        continue;
+                    }
+                    let mut state = snap.state;
+                    if let Some(d) = &self.dspark {
+                        state.capture_layers = d.cfg.target_layers.clone();
+                    }
+                    self.state = state;
+                    return Some((entry.len, snap.logits));
+                }
+                Ok(_) => {
+                    tracing::warn!("state cache: a snapshot disagrees with its name; dropped");
+                    cache.store.forget(&entry);
+                }
+                Err(e) => {
+                    tracing::warn!("state cache: a snapshot is unusable ({e}); dropped");
+                    cache.store.forget(&entry);
+                }
+            }
+        }
+        None
+    }
+
+    /// Write the state, which stands after `tokens`, to the cache: `logits` are those of its last
+    /// position when it was just prefilled. Encoding and writing run on their own thread over a
+    /// copy, so the request is not held for them. A state shorter than one block of the store's
+    /// hash chain is not worth a file.
+    fn save_state(&self, tokens: &[u32], logits: Option<Vec<f32>>) {
+        let Some(cache) = &self.state_cache else {
+            return;
+        };
+        if self.pipeline.is_some()
+            || self.state.pos != tokens.len()
+            || tokens.len() < cache.store.block_tokens()
+        {
+            return;
+        }
+        let (store, identity) = (cache.store.clone(), cache.identity);
+        let (state, tokens) = (self.state.clone(), tokens.to_vec());
+        std::thread::spawn(move || {
+            use crate::inference::model::deepseek_v41::snapshot::encode;
+            let bytes = encode(&state, logits.as_deref(), &identity);
+            let keys = store.keys(&identity, &tokens);
+            match store.put(&keys, tokens.len(), &bytes) {
+                Ok(()) => tracing::info!(
+                    "state cache: stored a {}-token state ({} MiB)",
+                    tokens.len(),
+                    bytes.len() >> 20
+                ),
+                Err(e) => tracing::warn!("state cache: not stored: {e}"),
+            }
+        });
+    }
+
+    /// The rest of a prompt after a restored prefix, its heavy steps on the cards when there are
+    /// any: the logits after its last token.
+    fn prefill_rest(&mut self, ids: &[u32]) -> crate::tensor::Result<Tensor> {
+        let Self {
+            model,
+            state,
+            streamed,
+            ..
+        } = self;
+        match streamed {
+            Some(s) => {
+                model.offload_experts(Some(s.lanes.clone()));
+                crate::inference::offload::with_offload(s.offload.clone(), || {
+                    model.prefill_continue(ids, state)
+                })
+            }
+            None => model.prefill_continue(ids, state),
         }
     }
 
@@ -1680,7 +1793,34 @@ impl ModelBackend for DeepseekV41Backend {
         // A prompt that starts a sequence runs as one prefill over all its tokens, which leaves the
         // caches where feeding them one at a time would; the tokens that follow are decoded.
         if index_pos == 0 && ids.len() > 1 {
-            return self.prefill(&ids);
+            // A prefix the cache holds is restored and only the rest is prefilled; the state the
+            // prompt ends in is written back for the next prompt that begins with it.
+            let vocab_logits = |v: Vec<f32>| {
+                let n = v.len();
+                Tensor::from_vec(v, (1, n), &Device::Cpu)
+            };
+            if let Some((covered, logits)) = self.restore_prefix(&ids) {
+                tracing::info!(
+                    "state cache: restored {covered} of {} prompt tokens",
+                    ids.len()
+                );
+                if covered == ids.len() {
+                    if let Some(l) = logits {
+                        return vocab_logits(l);
+                    }
+                } else {
+                    let out = self.prefill_rest(&ids[covered..])?;
+                    let flat = out.flatten_all()?.to_vec1::<f32>()?;
+                    self.save_state(&ids, Some(flat));
+                    return Ok(out);
+                }
+            }
+            let out = self.prefill(&ids)?;
+            if self.state_cache.is_some() {
+                let flat = out.flatten_all()?.to_vec1::<f32>()?;
+                self.save_state(&ids, Some(flat));
+            }
+            return Ok(out);
         }
         // The always-read weights answer a token from the card they were left on: the host reads
         // them at its memory's speed, the card at its own, and a decode reads every one of them
@@ -1863,6 +2003,14 @@ impl ModelBackend for DeepseekV41Backend {
 
     fn widest_ffn(&self) -> usize {
         self.widest_ffn
+    }
+
+    /// A finished turn, prompt and reply: the state it left stands after the tokens it fed.
+    fn snapshot_kv(&mut self, tokens: Vec<u32>, kv_len: usize) -> crate::tensor::Result<()> {
+        if kv_len == self.state.pos && kv_len <= tokens.len() {
+            self.save_state(&tokens[..kv_len], None);
+        }
+        Ok(())
     }
 
     fn reset_kv_from(&mut self, keep: usize) {

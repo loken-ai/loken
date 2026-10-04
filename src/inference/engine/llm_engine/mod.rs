@@ -223,6 +223,9 @@ pub struct LlmEngine {
     draft_engine: Arc<Mutex<Option<Arc<LlmEngine>>>>,
     /// The disk tier under the KV snapshots, when the configuration names a directory.
     kv_disk: Option<Arc<crate::inference::cache::kv_disk::KvDiskStore>>,
+    /// The on-disk cache of decode states for a model that keeps one, when the configuration
+    /// names a directory.
+    state_cache: Option<Arc<crate::inference::cache::state_disk::StateStore>>,
     /// Raised by a `CancelGuard` when the request that holds it goes away; the
     /// generation loops read it between tokens. One request runs at a time on an
     /// engine, so one flag is enough.
@@ -261,6 +264,7 @@ impl InferenceEngine for LlmEngine {
             model_state: Arc::new(Mutex::new(None)),
             draft_engine: Arc::new(Mutex::new(None)),
             kv_disk: None,
+            state_cache: None,
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             logprob_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_error: Arc::new(Mutex::new(None)),
@@ -300,6 +304,7 @@ impl LlmEngine {
     pub fn with_config(config: InferenceConfig) -> Self {
         Self {
             kv_disk: open_kv_disk(&config),
+            state_cache: open_state_cache(&config),
             config,
             model_state: Arc::new(Mutex::new(None)),
             draft_engine: Arc::new(Mutex::new(None)),
@@ -1275,6 +1280,33 @@ fn open_kv_disk(
         }
         Err(e) => {
             tracing::warn!("kv disk tier at {dir} unavailable: {e}");
+            None
+        }
+    }
+}
+
+/// The decode-state cache the configuration names, `None` when it names none or the directory
+/// cannot be used.
+fn open_state_cache(
+    config: &InferenceConfig,
+) -> Option<Arc<crate::inference::cache::state_disk::StateStore>> {
+    let dir = config.state_cache_dir.as_ref()?;
+    let budget = (config.state_cache_budget_gb.max(0.0) * (1u64 << 30) as f64) as u64;
+    match crate::inference::cache::state_disk::StateStore::open(
+        std::path::PathBuf::from(dir),
+        budget,
+        config.state_cache_block_tokens,
+    ) {
+        Ok(store) => {
+            let (n, bytes) = store.stats();
+            tracing::info!(
+                "state cache open at {dir}: {n} states, {} MiB; it stores state derived from prompts",
+                bytes >> 20
+            );
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            tracing::warn!("state cache at {dir} unavailable: {e}");
             None
         }
     }

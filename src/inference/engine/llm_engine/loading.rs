@@ -236,6 +236,8 @@ impl LlmEngine {
         let disable_cuda = self.config.disable_cuda || crate::gpu::force_cpu();
         let kv_quant = self.config.kv_quant;
         let expert_deferral = self.config.expert_deferral;
+        let state_cache = self.state_cache.clone();
+        let state_cache_salt = self.config.state_cache_salt.clone();
         let user_context_length = self.config.context_length;
         let model_state = self.model_state.clone();
         let cached_model_size = self.cached_model_size.clone();
@@ -253,8 +255,12 @@ impl LlmEngine {
 
             // --- 0a. A checkpoint directory the deepseek_v41 source serves ---
             if crate::inference::model::deepseek_v41::claims_checkpoint_dir(&model_file) {
-                let mut state =
-                    load_deepseek_v41_checkpoint(&model_file, &model_id_clone, user_context_length)?;
+                let mut state = load_deepseek_v41_checkpoint(
+                    &model_file,
+                    &model_id_clone,
+                    user_context_length,
+                    state_cache.clone().map(|store| (store, state_cache_salt.clone())),
+                )?;
                 state.generation_defaults = generation_defaults.clone();
                 let fsz = state.file_size;
                 let mut guard = model_state.blocking_lock();
@@ -717,14 +723,44 @@ impl LlmEngine {
                     // The draft the file carries first, the hub checkpoint's when it has none.
                     let draft =
                         crate::inference::model::deepseek_v41::dspark::Dspark::locate(&model_file, &source);
-                    Box::new(
+                    let n_layers = cfg.n_layers;
+                    let mut backend =
                         crate::inference::engine::model_backend::DeepseekV41Backend::with_draft(
                             model,
                             cfg.moe_inter_dim,
                             user_context_length,
                             draft,
-                        ),
-                    )
+                        );
+                    // The states of a prompt are stored under the model files and the numerics
+                    // they were computed with.
+                    if let Some(store) = state_cache.clone() {
+                        let mut files = crate::inference::cache::state_disk::FilesDigest::new();
+                        let mut readable = true;
+                        for part in source.parts() {
+                            let head = &part.mmap[..part.mmap.len().min(
+                                crate::inference::cache::state_disk::DIGEST_HEAD_BYTES,
+                            )];
+                            match part.file.metadata() {
+                                Ok(meta) => files.file(&meta, head),
+                                Err(e) => {
+                                    warn!("state cache off: {e}");
+                                    readable = false;
+                                }
+                            }
+                        }
+                        if readable {
+                            backend = backend.with_state_cache(
+                                store,
+                                crate::inference::model::deepseek_v41::snapshot::identity(&[
+                                    &files.finish(),
+                                    &expert_deferral.to_le_bytes(),
+                                    &(n_layers as u64).to_le_bytes(),
+                                    state_cache_salt.as_bytes(),
+                                ]),
+                            );
+                        }
+                    }
+                    Box::new(backend)
                 }
                 _ => {
                     debug!("⬇️  Loading '{}' as generic hetero transformer (CUDA+CPU)...", arch);

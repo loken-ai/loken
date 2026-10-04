@@ -27,6 +27,12 @@ model_id = "qwen3:0.6b"
 # kv_disk_dir = "/var/lib/loken/kv"
 # kv_disk_budget_gb = 0             # 0 = no limit
 
+# DeepSeek V4.1 only: keep the decode state of finished prompts and turns on disk, so a prompt that
+# begins with one seen before skips prefilling it. Off unless the directory is set. The files hold
+# state derived from prompts (KV tensors, no text).
+# state_cache_dir = "/var/lib/loken/state"
+# state_cache_budget_gb = 0         # 0 = no limit
+
 # Files, moderation and the URLs handed out.
 # files_dir = "/var/lib/loken/files"   # uploads and batch outputs, default: files/ beside the model store
 # moderation_model = "llama-guard3:1b" # Llama Guard, Shieldstral, ShieldGemma, Granite Guardian or gpt-oss Safeguard

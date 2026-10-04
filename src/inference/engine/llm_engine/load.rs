@@ -292,6 +292,10 @@ pub(super) fn load_deepseek_v41_checkpoint(
     dir: &std::path::Path,
     model_id: &str,
     user_context_length: usize,
+    state_cache: Option<(
+        std::sync::Arc<crate::inference::cache::state_disk::StateStore>,
+        String,
+    )>,
 ) -> AnyResult<LoadedModelState> {
     use crate::inference::model::deepseek_v41::engram::EngramConfig;
     use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
@@ -349,13 +353,39 @@ pub(super) fn load_deepseek_v41_checkpoint(
         slots,
         expert_bytes / 1_000_000,
     );
-    let backend: BoxedModelBackend = Box::new(
-        crate::inference::engine::model_backend::DeepseekV41Backend::new(
-            model,
-            cfg.moe_inter_dim,
-            context_length,
-        ),
+    let mut backend = crate::inference::engine::model_backend::DeepseekV41Backend::new(
+        model,
+        cfg.moe_inter_dim,
+        context_length,
     );
+    // The states of a prompt are stored under the shards and the configuration they were
+    // computed with.
+    if let Some((store, salt)) = state_cache {
+        let mut files = crate::inference::cache::state_disk::FilesDigest::new();
+        let mut shards: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|x| x == "safetensors" || x == "json")
+            })
+            .collect();
+        shards.sort();
+        match shards.iter().try_for_each(|p| files.path(p)) {
+            Ok(()) => {
+                backend = backend.with_state_cache(
+                    store,
+                    crate::inference::model::deepseek_v41::snapshot::identity(&[
+                        &files.finish(),
+                        &(cfg.n_layers as u64).to_le_bytes(),
+                        salt.as_bytes(),
+                    ]),
+                );
+            }
+            Err(e) => warn!("state cache off: {e}"),
+        }
+    }
+    let backend: BoxedModelBackend = Box::new(backend);
     Ok(LoadedModelState {
         name: model_id.to_string(),
         num_layers: cfg.n_layers,
