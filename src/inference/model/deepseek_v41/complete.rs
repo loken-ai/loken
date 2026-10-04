@@ -516,6 +516,62 @@ pub fn complete(
     writer.finish_with_digest()
 }
 
+/// Write the draft alone, from the released checkpoint in `dir`, as a file of its own to keep
+/// beside a model that carries none: the architecture key, the draft's metadata, and its tensors
+/// laid out as `complete` lays them, each in `format` where its rows tile into that format's
+/// blocks. Returns the SHA-256 of the file written.
+pub fn write_draft(
+    ckpt: &SafeTensorsSource,
+    dir: &Path,
+    out: &Path,
+    layout: Layout,
+    format: GgmlDType,
+    progress: &(dyn Fn(usize, usize, &str) + Sync),
+) -> Result<String> {
+    let cfg = DsparkConfig::from_config_json(dir)?;
+    let (dense, experts) = draft_items(ckpt, &cfg, format, layout)?;
+    let mut metadata = vec![(
+        "general.architecture".to_string(),
+        crate::tensor::quantized::gguf_file::Value::String(super::ARCH.to_string()),
+    )];
+    metadata.extend(cfg.to_metadata());
+    let items: Vec<Item> = dense.into_iter().chain(experts).collect();
+    let entries: Vec<PlannedEntry> = items
+        .iter()
+        .map(|it| PlannedEntry {
+            name: it.entry.name.clone(),
+            dims: it.entry.dims.clone(),
+            dtype: it.entry.dtype,
+            byte_len: it.entry.byte_len,
+        })
+        .collect();
+    let placement = Placement {
+        alignment: layout.alignment,
+        starts: items.iter().map(|it| it.start).collect(),
+    };
+    let mut writer = GgufStreamWriter::create_placed(out, &metadata, &entries, &placement)?;
+    let total = items.len();
+    let batch = rayon::current_num_threads().max(1);
+    let mut i = 0;
+    while i < total {
+        let run: Vec<&Item> = items[i..].iter().take(batch).collect();
+        let produced: Vec<Result<Vec<u8>>> = run
+            .par_iter()
+            .map(|it| match &it.bytes {
+                Bytes::Draft(name) => draft_bytes(ckpt, name, it.entry.dtype),
+                _ => unreachable!("a draft file holds draft tensors only"),
+            })
+            .collect();
+        for (it, bytes) in run.iter().zip(produced) {
+            writer.append(&bytes?)?;
+            i += 1;
+            progress(i, total, &it.entry.name);
+        }
+        writer.release_written()?;
+    }
+    writer.finish_with_digest()
+}
+
 /// What `verify_carried` compared.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CarryCheck {
@@ -943,5 +999,65 @@ mod tests {
             first.content.tensor_infos.len()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A draft written alone is found beside the model it was written for and loads there, with
+    /// the configuration of the checkpoint it came from.
+    #[test]
+    fn a_draft_written_alone_loads_by_itself() {
+        let dir = scratch("alone");
+        let ckpt_dir = dir.join("ckpt");
+        checkpoint(&ckpt_dir);
+        let ckpt = SafeTensorsSource::open(&ckpt_dir).unwrap();
+        let out = dir.join("draft.gguf");
+        let layout = Layout {
+            alignment: 64,
+            unit: 256,
+        };
+        write_draft(
+            &ckpt,
+            &ckpt_dir,
+            &out,
+            layout,
+            GgmlDType::Q8_0,
+            &|_, _, _| {},
+        )
+        .unwrap();
+        let g = crate::tensor::quantized::gguf_file::open_mapped(&out).unwrap();
+        let d = super::super::dspark::Dspark::from_file(&g)
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.cfg, DsparkConfig::from_config_json(&ckpt_dir).unwrap());
+        assert_eq!(d.stages.len(), STAGES);
+        assert_eq!(d.stages[0].moe.experts.count(), DRAFT_EXPERTS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real draft written alone, run by hand: `LOKEN_DSV41_CKPT` names the released
+    /// checkpoint's directory, `LOKEN_DSV41_DRAFT_OUT` the file to write, `LOKEN_DSV41_DRAFT_FORMAT`
+    /// the quantisation (a ggml name, default the one of the model it goes beside).
+    #[test]
+    #[ignore = "needs the released checkpoint"]
+    fn write_the_real_draft_alone() {
+        let dir =
+            std::path::PathBuf::from(std::env::var("LOKEN_DSV41_CKPT").expect("LOKEN_DSV41_CKPT"));
+        let out = std::path::PathBuf::from(
+            std::env::var("LOKEN_DSV41_DRAFT_OUT").expect("LOKEN_DSV41_DRAFT_OUT"),
+        );
+        let format = match std::env::var("LOKEN_DSV41_DRAFT_FORMAT").as_deref() {
+            Ok("q4_0") => GgmlDType::Q4_0,
+            Ok("q5_0") => GgmlDType::Q5_0,
+            Ok("q6k") => GgmlDType::Q6K,
+            _ => GgmlDType::Q8_0,
+        };
+        let ckpt = SafeTensorsSource::open(&dir).unwrap();
+        let layout = Layout::for_paths(&[out.as_path()]);
+        let digest = write_draft(&ckpt, &dir, &out, layout, format, &|i, n, name| {
+            if i % 64 == 0 {
+                eprintln!("{i}/{n} {name}");
+            }
+        })
+        .unwrap();
+        eprintln!("wrote {} sha256 {digest}", out.display());
     }
 }

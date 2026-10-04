@@ -275,7 +275,7 @@ impl GgufStreamWriter {
     ) -> Result<Self> {
         let io_err = |e: std::io::Error| Error(format!("gguf write {}: {e}", path.display()));
         let alignment = placement.alignment;
-        if alignment == 0 || alignment % DEFAULT_ALIGNMENT != 0 {
+        if alignment == 0 || !alignment.is_multiple_of(DEFAULT_ALIGNMENT) {
             return Err(Error(format!(
                 "gguf write {}: alignment {alignment} is not a multiple of {DEFAULT_ALIGNMENT}",
                 path.display()
