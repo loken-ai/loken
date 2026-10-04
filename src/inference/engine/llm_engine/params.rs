@@ -160,6 +160,15 @@ pub struct InferenceConfig {
     /// Bytes the disk tier may hold, in GiB; 0 for no limit. Least recently used
     /// sequences go first.
     pub kv_disk_budget_gb: f64,
+    /// Directory of the on-disk cache of DeepSeek V4.1 decode states (prompt-derived KV
+    /// tensors, no text). `None` keeps the cache off.
+    pub state_cache_dir: Option<String>,
+    /// Bytes the decode-state cache may hold, in GiB; 0 for no limit.
+    pub state_cache_budget_gb: f64,
+    /// Tokens per block of the cache's hash chain.
+    pub state_cache_block_tokens: usize,
+    /// Mixed into the identity of every stored state.
+    pub state_cache_salt: String,
     /// Where `/v1/files` keeps uploads and batch outputs; `None` uses `files/` beside
     /// the model store.
     pub files_dir: Option<String>,
@@ -227,6 +236,10 @@ impl Default for InferenceConfig {
             device_index: None,
             kv_disk_dir: None,
             kv_disk_budget_gb: 0.0,
+            state_cache_dir: None,
+            state_cache_budget_gb: 0.0,
+            state_cache_block_tokens: crate::config::DEFAULT_STATE_CACHE_BLOCK_TOKENS,
+            state_cache_salt: String::new(),
             files_dir: None,
             moderation_model: None,
             public_url: None,

@@ -71,6 +71,28 @@ Nothing below is configured; a key of that name in an older `config.toml` loads 
 | `kv_disk_dir` | none | Directory of the disk tier under the snapshots: token blocks shared between sequences by prefix, one manifest per sequence, surviving a restart. |
 | `kv_disk_budget_gb` | `0` | Bytes the disk tier may hold, in GiB. `0` is no limit. Least recently used sequences go first. |
 
+### Decode-state cache (DeepSeek V4.1)
+
+Off unless `state_cache_dir` is set. A DeepSeek V4.1 prompt costs one pass over the routed experts,
+read from disk; this cache stores the model's decode state after a prompt and after each finished
+turn, so a later prompt that begins with the same tokens restores it and prefills only the rest.
+
+The files hold state derived from prompts: KV tensors, hidden rows of the filling compression group
+and compressed token-class ids. They hold no text and no token ids, and names and keys are hashes,
+but the state is as private as the prompt it came from. Keep the directory where the prompts
+could live, and leave the key unset where nothing about an exchange may reach the disk.
+
+| Key | Default | What it does |
+|---|---|---|
+| `state_cache_dir` | none | Directory of the cache. |
+| `state_cache_budget_gb` | `0` | Bytes the cache may hold, in GiB. `0` is no limit. Least recently used first; in each family of states sharing a first block the one restored most, the longest among equals, goes last. |
+| `state_cache_block_tokens` | `256` | Tokens per block of the hash chain a prefix is looked up by, and the shortest state worth storing. Changing it orphans what is stored. |
+| `state_cache_salt` | empty | Mixed into every state's identity; states written under another salt are never read. |
+
+A state is also keyed by the model files (length, modification time and header) and `expert_deferral`,
+so a different file or setting starts from nothing. A damaged, truncated or foreign file is ignored
+with a log line.
+
 ### Files, moderation and URLs
 
 | Key | Default | What it does |

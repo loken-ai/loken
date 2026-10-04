@@ -63,6 +63,13 @@ impl Default for ServerConfig {
     }
 }
 
+/// Tokens per block of the decode-state cache's hash chain when the configuration names none.
+pub const DEFAULT_STATE_CACHE_BLOCK_TOKENS: usize = 256;
+
+fn default_state_cache_block_tokens() -> usize {
+    DEFAULT_STATE_CACHE_BLOCK_TOKENS
+}
+
 /// Inference configuration from TOML file. Only what loken cannot decide itself: the model it
 /// serves by default, where things live, and the features an operator switches on. Sampling,
 /// placement, threads and cache formats are decided from the model and the machine.
@@ -73,6 +80,21 @@ pub struct InferenceConfigToml {
     pub kv_disk_dir: Option<String>,
     #[serde(default)]
     pub kv_disk_budget_gb: f64,
+    /// Directory of the on-disk cache of DeepSeek V4.1 decode states, which lets a prompt that
+    /// begins with a prefix seen before skip prefilling it. Off unless set. The files hold
+    /// state derived from prompts (KV tensors and hidden rows, no text), so they are as private
+    /// as the prompts.
+    #[serde(default)]
+    pub state_cache_dir: Option<String>,
+    /// Bytes the decode-state cache may hold, in GiB; 0 is no limit.
+    #[serde(default)]
+    pub state_cache_budget_gb: f64,
+    /// Tokens per block of the cache's hash chain. Changing it orphans the stored states.
+    #[serde(default = "default_state_cache_block_tokens")]
+    pub state_cache_block_tokens: usize,
+    /// Mixed into every state's identity: states written under another salt are never read.
+    #[serde(default)]
+    pub state_cache_salt: String,
     #[serde(default)]
     pub files_dir: Option<String>,
     #[serde(default)]
@@ -245,6 +267,10 @@ impl Config {
             device_index: None,
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
             kv_disk_budget_gb: toml_config.kv_disk_budget_gb,
+            state_cache_dir: toml_config.state_cache_dir.clone(),
+            state_cache_budget_gb: toml_config.state_cache_budget_gb,
+            state_cache_block_tokens: toml_config.state_cache_block_tokens,
+            state_cache_salt: toml_config.state_cache_salt.clone(),
             files_dir: toml_config.files_dir.clone(),
             moderation_model: toml_config.moderation_model.clone(),
             public_url: toml_config.public_url.clone(),
