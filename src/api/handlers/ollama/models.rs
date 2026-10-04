@@ -416,15 +416,25 @@ pub(crate) fn gguf_facts(
                 .max_by_key(|(_, n)| *n)
                 .map(|(name, _)| name.to_uppercase())
         });
-    // Most checkpoints do not declare a count; the shapes are the count.
-    let params = Some(
+    // Most checkpoints do not declare a count; the shapes are the count, across every part of
+    // a split set.
+    let split = content
+        .metadata
+        .get("split.count")
+        .and_then(|v| v.to_u32().ok())
+        .is_some_and(|n| n > 1);
+    let summed = match split {
+        true => crate::tensor::quantized::gguf_source::set_parameter_count(path).ok(),
+        false => None,
+    }
+    .unwrap_or_else(|| {
         content
             .tensor_infos
             .values()
             .map(|t| t.elem_count() as u64)
-            .sum::<u64>(),
-    )
-    .filter(|n| *n > 0);
+            .sum()
+    });
+    let params = Some(summed).filter(|n| *n > 0);
     let params = content
         .metadata
         .get("general.parameter_count")
@@ -1060,6 +1070,39 @@ mod catalogue_tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(arch.as_deref(), Some("llama"));
         assert_eq!(declared, Some(32), "two parts of one 4x4 tensor each");
+    }
+
+    /// `/api/show` counts a split set across its parts, as the listing does.
+    #[test]
+    fn show_counts_a_split_set_across_its_parts() {
+        let dir = scratch("show");
+        let entry = |name: &str| GgufEntry {
+            name: name.to_string(),
+            dims: vec![4, 4],
+            dtype: GgmlDType::F32,
+            data: [0f32.to_le_bytes(); 16].concat(),
+        };
+        let md = |no: u32| {
+            vec![
+                (
+                    "general.architecture".to_string(),
+                    Value::String("llama".into()),
+                ),
+                ("split.count".to_string(), Value::U32(2)),
+                ("split.no".to_string(), Value::U32(no)),
+            ]
+        };
+        let first = dir.join("set-00001-of-00002.gguf");
+        write_gguf_with_metadata(&first, &md(0), &[entry("blk.0.attn_norm.weight")]).unwrap();
+        write_gguf_with_metadata(
+            &dir.join("set-00002-of-00002.gguf"),
+            &md(1),
+            &[entry("blk.1.attn_norm.weight")],
+        )
+        .unwrap();
+        let (_, _, _, params) = gguf_facts(&first);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(params, Some(32));
     }
 
     /// A GGUF in the Hugging Face store resolves to its file; a checkpoint of safetensors does not.
