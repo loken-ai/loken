@@ -2121,8 +2121,18 @@ impl GenericHeteroTransformer {
         info!("✅ Loaded output norm and projection on CPU");
 
         // -- 2b. Load PLE globals (Gemma4) - optional ---------------------
-        let ple_dim = meta_u32(content, &config.arch, "embedding_length_per_layer_input")
-            .unwrap_or(0) as usize;
+        // Per-layer input embeddings are a model-wide table plus a projection. A file whose
+        // `per_layer_token_embd` is a hashed gather table has no projection, and is read by
+        // row elsewhere: it must not be expanded here.
+        let ple_dim = if content
+            .tensor_infos
+            .contains_key("per_layer_model_proj.weight")
+        {
+            meta_u32(content, &config.arch, "embedding_length_per_layer_input").unwrap_or(0)
+                as usize
+        } else {
+            0
+        };
         // The per-layer token table is `vocab x (layers * ple_dim)`: the largest tensor of a
         // model that has one. It stays in the file's format and each lookup decodes its rows.
         let ple_token_embd: Option<Embedding> = if ple_dim > 0 {

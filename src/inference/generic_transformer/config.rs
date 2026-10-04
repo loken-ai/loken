@@ -426,6 +426,14 @@ pub struct GenericTransformerConfig {
     pub expert_weights_scale: f64,
     /// The recurrent mixers' dimensions, when the file gives `ssm.inner_size`.
     pub ssm: Option<SsmMeta>,
+    /// The delta rule gates its output norm by `sigmoid(z)` rather than `silu(z)`.
+    pub delta_output_gate_sigmoid: bool,
+    /// The wide residual, when the file declares parallel streams.
+    pub hyper: Option<super::hyper::HyperMeta>,
+    /// The block-sparse attention indexer, when the file declares one.
+    pub indexer: Option<super::qsa::IndexerMeta>,
+    /// The hashed n-gram embedding, when the file declares one.
+    pub ngram: Option<super::ngram::NgramMeta>,
     /// The attention Q projection interleaves Q and an output gate per head.
     pub attn_output_gate: bool,
     /// Name of the norm ahead of the feed-forward.
@@ -494,10 +502,20 @@ fn meta_f32(ct: &gguf_file::Content, arch: &str, key: &str) -> Option<f32> {
         .and_then(|v| v.to_f32().ok())
 }
 
+/// Read a GGUF array-of-int metadata key as `Vec<u64>`; `None` if absent, not an array, or
+/// holding a value that is not a non-negative whole number.
+pub(super) fn meta_u64_array(ct: &gguf_file::Content, arch: &str, key: &str) -> Option<Vec<u64>> {
+    let v = ct
+        .metadata
+        .get(&format!("{arch}.{key}"))
+        .or_else(|| ct.metadata.get(key))?;
+    v.to_vec().ok()?.iter().map(|e| e.to_u64().ok()).collect()
+}
+
 /// Read a GGUF array-of-int metadata key as `Vec<u32>` (e.g. gemma4's
 /// `attention.sliding_window_pattern` = per-layer 1=SWA / 0=global). Returns
 /// None if absent or not an array.
-fn meta_u32_array(ct: &gguf_file::Content, arch: &str, key: &str) -> Option<Vec<u32>> {
+pub(super) fn meta_u32_array(ct: &gguf_file::Content, arch: &str, key: &str) -> Option<Vec<u32>> {
     use gguf_file::Value as V;
     let elem_u32 = |e: &V| -> Option<u32> {
         match e {
@@ -675,7 +693,7 @@ impl GenericTransformerConfig {
                 .metadata
                 .get(&format!("{arch}.ssm.v_head_reordered"))
                 .and_then(|v| v.to_bool().ok())
-                .unwrap_or(false),
+                .unwrap_or(facts.delta_v_heads_tiled),
         });
         let expert_weights_scale = match meta_f32(content, arch, "expert_weights_scale") {
             Some(s) if s != 0.0 => s as f64,
@@ -755,6 +773,10 @@ impl GenericTransformerConfig {
             expert_topk_norm,
             expert_weights_scale,
             ssm,
+            delta_output_gate_sigmoid: facts.delta_output_gate_sigmoid,
+            hyper: super::hyper::HyperMeta::from_gguf(content, arch),
+            indexer: super::qsa::IndexerMeta::from_gguf(content, arch),
+            ngram: super::ngram::NgramMeta::from_gguf(content, arch),
             attn_output_gate: q_carries_output_gate(content, n_layers, n_head, head_dim),
             ffn_norm_stem: ffn_norm_stem(content),
             shared_kv_layers,

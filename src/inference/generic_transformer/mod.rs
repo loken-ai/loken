@@ -47,6 +47,7 @@ mod config;
 mod conversion_tests;
 mod graph;
 pub mod hetero;
+pub mod hyper;
 mod layer_attn;
 mod layer_cpu_attn;
 mod layer_ffn;
@@ -54,6 +55,8 @@ mod layer_forward;
 mod loader;
 pub mod mixer;
 mod moe_weights;
+pub mod ngram;
+pub mod qsa;
 mod splice;
 #[cfg(test)]
 mod state_cache_tests;

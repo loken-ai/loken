@@ -72,6 +72,12 @@ pub struct ArchFacts {
     pub attention_scale: Option<f64>,
     /// A quantised KV cache degrades the output; the cache stays unquantised.
     pub quantized_kv_degrades: bool,
+    /// The delta rule's value heads are stored tiled: value head `h` reads key head
+    /// `h % key_heads`. The converter reorders the heads of these files and writes no
+    /// `ssm.v_head_reordered` key.
+    pub delta_v_heads_tiled: bool,
+    /// The delta rule's per-head output norm is gated by `sigmoid(z)` instead of `silu(z)`.
+    pub delta_output_gate_sigmoid: bool,
     /// A BOS leads every sequence even when the file declares `add_bos_token = false`.
     pub forces_bos: bool,
     /// Vocabulary pieces that end the model's turn when the file lists no
@@ -99,6 +105,8 @@ impl ArchFacts {
             embed_scale_sqrt_width: false,
             attention_scale: None,
             quantized_kv_degrades: false,
+            delta_v_heads_tiled: false,
+            delta_output_gate_sigmoid: false,
             forces_bos: false,
             turn_stop_pieces: &[],
             default_pre_tokenizer: None,
@@ -146,6 +154,16 @@ const FACTS: &[(&str, ArchFacts)] = &[
     ("qwen35", HALF_SPLIT),
     ("qwen35moe", HALF_SPLIT),
     ("qwen3next", HALF_SPLIT),
+    // The converter tiles the delta rule's value heads without writing a key, and the
+    // output gate is a sigmoid: both are constants of the reference graph.
+    (
+        "qwen4exp",
+        ArchFacts {
+            delta_v_heads_tiled: true,
+            delta_output_gate_sigmoid: true,
+            ..HALF_SPLIT
+        },
+    ),
     // The window alternates on even and odd layers, YaRN applies from the file's factor with
     // the rope kernel's implicit attention factor, and the experts gate through the clamped
     // SwiGLU at alpha 1.702 and limit 7.0: constants of the reference graph no converter
