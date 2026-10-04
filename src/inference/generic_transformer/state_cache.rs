@@ -561,10 +561,35 @@ fn resident_len(l: &GenericTransformerLayer) -> usize {
     spec.max(host).max(quant)
 }
 
+/// The element type a layer's resident KV rows are read back in.
+fn cache_dtype(l: &GenericTransformerLayer) -> Result<u8> {
+    if l.cpu_f16_kv.as_ref().is_some_and(|c| !c.is_empty()) {
+        return Ok(0);
+    }
+    #[cfg(feature = "cuda")]
+    if l.quant_kv.as_ref().is_some_and(|q| q.current_seq_len() > 0) {
+        return Ok(1);
+    }
+    match l.kv_cache.k_buffer() {
+        Some(k) => dtype_code(k.dtype()),
+        None => Ok(0),
+    }
+}
+
 /// Tokens `[from, to)` of a layer's resident KV as host f32 rows, with the element type the
 /// cache holds them in.
 fn live_rows(l: &GenericTransformerLayer, from: usize, to: usize) -> Result<Rows> {
     let (n_kv, head_dim) = (l.n_kv_head, l.head_dim);
+    if from == to {
+        return Ok(Rows {
+            dtype: cache_dtype(l)?,
+            n_kv,
+            head_dim,
+            n: 0,
+            k: Vec::new(),
+            v: Vec::new(),
+        });
+    }
     let (dtype, (k, v)) = if let Some(c) = l
         .cpu_f16_kv
         .as_ref()
