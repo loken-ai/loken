@@ -1,26 +1,33 @@
 //! A disk store of decode-state snapshots, found by the longest prefix of a prompt they cover.
 //!
-//! A snapshot is an opaque blob that stands for the state of a sequence after its first `len`
-//! tokens. The store keys it by a chain of hashes over the tokens, so a prompt finds the longest
-//! stored prefix of itself without the store ever holding a token: each block of `block_tokens`
-//! tokens is hashed with its parent's hash and the scope (the identity of the model and numerics),
-//! and the entry's key hashes the last full block's chain value with the length and the tokens
-//! after that block. Two sequences that share a prefix share the chain over it, so a lookup is one
-//! pass over the prompt and one map probe per distinct stored length.
+//! A snapshot is a small manifest plus references to content-addressed blocks. The manifest is an
+//! opaque blob the caller encodes: the part of the state that belongs to its exact position. A
+//! block holds what a block of `block_tokens` tokens added to the state and is named by the chain
+//! hash of the tokens up to its end, so every snapshot of one conversation, and every snapshot of
+//! conversations that share a prefix, names the same block files and stores each once.
+//!
+//! The chain: each block of tokens is hashed with its parent's hash and the scope (the identity of
+//! the model and numerics); a manifest's key hashes the last full block's chain value with the
+//! length and the tokens after that block. A lookup hashes the prompt once and probes one key per
+//! distinct stored length, longest first, so it finds the longest stored prefix without the store
+//! ever holding a token.
 //!
 //! Privacy: file names and the index hold lengths, hashes, byte counts, use counts and times; the
 //! blobs are whatever the caller encodes, KV tensors and not text. The store is off unless the
 //! operator gives it a directory, and the files are prompt-derived state.
 //!
 //! Durability: every file is written beside its name, synced, then renamed in, so a reader sees a
-//! whole file or none; the index is the same. A file the index does not know is taken up from its
-//! name, one whose name is not ours is removed, and an unreadable index is dropped with a log
-//! line and rebuilt from the names.
+//! whole file or none. A manifest is written only after every block it names is on disk, and a
+//! block a put is about to reference is counted before it is written, so eviction cannot take it
+//! away between the two. At open, a stray or foreign file is removed, a manifest whose block is
+//! missing is dropped, and a block no manifest names is removed; an unreadable index is dropped
+//! with a log line and rebuilt from the names.
 //!
-//! Eviction: when the stored bytes pass the budget the least recently used entries go first. In
-//! each family of entries - those sharing a first block - the entry used most, the longest
-//! among equals, is pinned: it goes last, so a long prefix that conversations keep coming back
-//! to outlives the one-off tails around it. The entry just written is never the victim.
+//! Eviction: when the manifests plus the blocks they reference pass the budget the least recently
+//! used manifests go first, and a block goes with its last reference. In each family of manifests
+//! - those sharing a first block - the one used most, the longest among equals, is pinned: it goes
+//! last, so a long prefix that conversations keep coming back to outlives the one-off tails around
+//! it. The manifest just written is never the victim.
 
 use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
@@ -30,23 +37,29 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// The hash a stored snapshot is found by.
+/// The hash a stored snapshot or block is found by.
 pub type Key = [u8; 16];
 
 const SUFFIX: &str = "snap";
+const BLOCK_SUFFIX: &str = "blk";
+const BLOCK_DIR: &str = "blocks";
 const INDEX_FILE: &str = "index.json";
 const TMP_PREFIX: &str = ".tmp-";
+const MANIFEST_MAGIC: &[u8; 8] = b"LKSMAN01";
 
-/// One stored snapshot.
+/// One stored snapshot: its manifest file and the blocks it references.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub key: Key,
     /// Tokens the snapshot's state covers.
     pub len: usize,
     family: u64,
+    /// Size of the manifest file.
     pub bytes: u64,
     last_used: u64,
     hits: u64,
+    /// The blocks the snapshot references, in token order.
+    pub blocks: Vec<Key>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -57,6 +70,9 @@ struct IndexFile {
 
 struct Inner {
     entries: HashMap<Key, Entry>,
+    /// Manifests (and puts in flight) referencing each block, and each block's size on disk.
+    refs: HashMap<Key, usize>,
+    block_bytes: HashMap<Key, u64>,
 }
 
 pub struct StateStore {
@@ -82,6 +98,17 @@ fn short(digest: impl AsRef<[u8]>) -> Key {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<Key> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut key = [0u8; 16];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(key)
 }
 
 fn now_nanos() -> u64 {
@@ -141,6 +168,11 @@ impl<'a> PrefixKeys<'a> {
         Some((key, u64::from_le_bytes(family_of[..8].try_into().unwrap())))
     }
 
+    /// The hash of the block ending at token `(b + 1) * block_tokens`, `None` past the sequence.
+    pub fn block_hash(&self, b: usize) -> Option<Key> {
+        self.chain.get(b).copied()
+    }
+
     /// Tokens the sequence has.
     pub fn len(&self) -> usize {
         self.tokens.len()
@@ -160,27 +192,41 @@ fn parse_name(name: &str) -> Option<(usize, u64, Key)> {
     let mut parts = stem.split('.');
     let len = parts.next()?.parse().ok()?;
     let family = u64::from_str_radix(parts.next()?, 16).ok()?;
-    let key_hex = parts.next()?;
-    if parts.next().is_some() || key_hex.len() != 32 {
+    let key = unhex(parts.next()?)?;
+    if parts.next().is_some() {
         return None;
     }
-    let mut key = [0u8; 16];
-    for (i, b) in key.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&key_hex[2 * i..2 * i + 2], 16).ok()?;
-    }
     Some((len, family, key))
+}
+
+/// The blocks a manifest file names, from its header, and where the caller's payload starts.
+fn read_header(bytes: &[u8]) -> Option<(Vec<Key>, usize)> {
+    if bytes.len() < 12 || &bytes[..8] != MANIFEST_MAGIC {
+        return None;
+    }
+    let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let end = n.checked_mul(16)?.checked_add(12)?;
+    let hashes = bytes.get(12..end)?;
+    Some((
+        hashes
+            .chunks_exact(16)
+            .map(|c| c.try_into().unwrap())
+            .collect(),
+        end,
+    ))
 }
 
 impl StateStore {
     /// Open (creating) the store in `dir`. `budget` is in bytes, 0 for no limit; `block_tokens`
     /// the block size of the hash chain, which must not change for a store in use.
     pub fn open(dir: PathBuf, budget: u64, block_tokens: usize) -> Result<Self> {
+        use std::io::Read;
         if block_tokens == 0 {
             return Err(anyhow!(
                 "state cache: block size must be at least one token"
             ));
         }
-        std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+        std::fs::create_dir_all(dir.join(BLOCK_DIR)).with_context(|| dir.display().to_string())?;
         let index: IndexFile = match std::fs::read(dir.join(INDEX_FILE)) {
             Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
                 tracing::warn!("state cache: index unreadable ({e}); rebuilt from the file names");
@@ -188,11 +234,28 @@ impl StateStore {
             }),
             Err(_) => IndexFile::default(),
         };
+        let mut block_bytes: HashMap<Key, u64> = HashMap::new();
+        for item in std::fs::read_dir(dir.join(BLOCK_DIR))? {
+            let item = item?;
+            let name = item.file_name().to_string_lossy().into_owned();
+            let hash = name
+                .strip_suffix(&format!(".{BLOCK_SUFFIX}"))
+                .and_then(unhex);
+            match hash {
+                Some(h) => {
+                    block_bytes.insert(h, item.metadata()?.len());
+                }
+                None => {
+                    let _ = std::fs::remove_file(item.path());
+                }
+            }
+        }
         let mut entries = HashMap::new();
+        let mut refs: HashMap<Key, usize> = HashMap::new();
         for item in std::fs::read_dir(&dir)? {
             let item = item?;
             let name = item.file_name().to_string_lossy().into_owned();
-            if name == INDEX_FILE {
+            if name == INDEX_FILE || name == BLOCK_DIR {
                 continue;
             }
             if name.starts_with(TMP_PREFIX) {
@@ -204,6 +267,27 @@ impl StateStore {
                 let _ = std::fs::remove_file(item.path());
                 continue;
             };
+            let mut head = Vec::new();
+            let blocks = std::fs::File::open(item.path())
+                .and_then(|f| {
+                    // The header is 12 bytes and the hashes after it; read as many as it says.
+                    let mut f = f.take(12);
+                    f.read_to_end(&mut head)?;
+                    let n = head
+                        .get(8..12)
+                        .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+                    let mut f = f.into_inner().take(n as u64 * 16);
+                    f.read_to_end(&mut head)
+                })
+                .ok()
+                .and_then(|_| read_header(&head))
+                .map(|(b, _)| b);
+            let Some(blocks) = blocks.filter(|b| b.iter().all(|h| block_bytes.contains_key(h)))
+            else {
+                tracing::warn!("state cache: {name} is damaged or names a missing block; removed");
+                let _ = std::fs::remove_file(item.path());
+                continue;
+            };
             let meta = item.metadata()?;
             let mtime = meta
                 .modified()
@@ -212,6 +296,9 @@ impl StateStore {
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
             let (last_used, hits) = index.uses.get(&hex(&key)).copied().unwrap_or((mtime, 0));
+            for b in &blocks {
+                *refs.entry(*b).or_default() += 1;
+            }
             entries.insert(
                 key,
                 Entry {
@@ -221,14 +308,30 @@ impl StateStore {
                     bytes: meta.len(),
                     last_used,
                     hits,
+                    blocks,
                 },
             );
         }
+        // A block no manifest names was an interrupted write.
+        block_bytes.retain(|h, _| {
+            let keep = refs.contains_key(h);
+            if !keep {
+                let _ = std::fs::remove_file(
+                    dir.join(BLOCK_DIR)
+                        .join(format!("{}.{BLOCK_SUFFIX}", hex(h))),
+                );
+            }
+            keep
+        });
         Ok(Self {
             dir,
             budget,
             block_tokens,
-            inner: Mutex::new(Inner { entries }),
+            inner: Mutex::new(Inner {
+                entries,
+                refs,
+                block_bytes,
+            }),
             tmp_seq: AtomicU64::new(0),
         })
     }
@@ -250,6 +353,12 @@ impl StateStore {
         self.dir.join(file_name(e.len, e.family, &e.key))
     }
 
+    fn block_path(&self, h: &Key) -> PathBuf {
+        self.dir
+            .join(BLOCK_DIR)
+            .join(format!("{}.{BLOCK_SUFFIX}", hex(h)))
+    }
+
     /// The stored snapshots that are prefixes of the sequence `keys` hashes and no longer than
     /// `max_len`, longest first.
     pub fn candidates(&self, keys: &PrefixKeys, max_len: usize) -> Vec<Entry> {
@@ -268,10 +377,17 @@ impl StateStore {
             .collect()
     }
 
-    /// The bytes of a stored snapshot, counted as a use. A file that cannot be read is dropped.
+    /// The manifest payload of a stored snapshot, counted as a use. A file that cannot be read is
+    /// dropped.
     pub fn read(&self, entry: &Entry) -> Result<Vec<u8>> {
         let path = self.path_of(entry);
-        match std::fs::read(&path) {
+        let bytes = std::fs::read(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|b| {
+                let (_, start) = read_header(&b).ok_or_else(|| anyhow!("manifest header"))?;
+                Ok(b[start..].to_vec())
+            });
+        match bytes {
             Ok(bytes) => {
                 {
                     let mut g = self.lock();
@@ -290,56 +406,136 @@ impl StateStore {
         }
     }
 
-    /// Remove a snapshot that proved unusable.
+    /// The bytes of a block a manifest references. A block that cannot be read is an error the
+    /// caller answers by forgetting the snapshot that needs it.
+    pub fn read_block(&self, hash: &Key) -> Result<Vec<u8>> {
+        let path = self.block_path(hash);
+        std::fs::read(&path).map_err(|e| anyhow!("{}: {e}", path.display()))
+    }
+
+    /// Remove a snapshot that proved unusable, and the blocks only it referenced.
     pub fn forget(&self, entry: &Entry) {
         let _ = std::fs::remove_file(self.path_of(entry));
-        self.lock().entries.remove(&entry.key);
+        self.drop_entry(&entry.key);
         self.save_index();
     }
 
-    /// Store `bytes` as the state after the first `len` tokens of the sequence `keys` hashes.
-    /// Does nothing when that state is stored already, or when it alone exceeds the budget.
-    pub fn put(&self, keys: &PrefixKeys, len: usize, bytes: &[u8]) -> Result<()> {
+    /// Remove an entry from the index and release its blocks, deleting those no one else names.
+    fn drop_entry(&self, key: &Key) {
+        let freed: Vec<Key> = {
+            let mut g = self.lock();
+            let Some(e) = g.entries.remove(key) else {
+                return;
+            };
+            let mut freed = Vec::new();
+            for b in e.blocks {
+                if let Some(n) = g.refs.get_mut(&b) {
+                    *n -= 1;
+                    if *n == 0 {
+                        g.refs.remove(&b);
+                        g.block_bytes.remove(&b);
+                        freed.push(b);
+                    }
+                }
+            }
+            freed
+        };
+        for b in freed {
+            let _ = std::fs::remove_file(self.block_path(&b));
+        }
+    }
+
+    /// Store the state after the first `len` tokens of the sequence `keys` hashes: `manifest` is
+    /// the caller's payload and the state also references the first `nblocks` blocks of the
+    /// sequence, whose bytes `block(b)` supplies for those not on disk already. Does nothing when
+    /// the state is stored already, or when its manifest alone exceeds the budget.
+    pub fn put(
+        &self,
+        keys: &PrefixKeys,
+        len: usize,
+        manifest: &[u8],
+        nblocks: usize,
+        mut block: impl FnMut(usize) -> Vec<u8>,
+    ) -> Result<()> {
         let Some((key, family)) = keys.at(len) else {
             return Err(anyhow!("state cache: length {len} is outside the sequence"));
         };
-        if self.budget > 0 && bytes.len() as u64 > self.budget {
+        let hashes: Vec<Key> = (0..nblocks)
+            .map(|b| keys.block_hash(b))
+            .collect::<Option<_>>()
+            .filter(|_| nblocks * self.block_tokens <= len)
+            .ok_or_else(|| anyhow!("state cache: {nblocks} blocks are outside {len} tokens"))?;
+        if self.budget > 0 && manifest.len() as u64 > self.budget {
             tracing::info!(
-                "state cache: a {} MiB snapshot exceeds the {} MiB budget; not stored",
-                bytes.len() >> 20,
+                "state cache: a {} MiB manifest exceeds the {} MiB budget; not stored",
+                manifest.len() >> 20,
                 self.budget >> 20
             );
             return Ok(());
         }
-        let known = {
+        // Count the references first, so the blocks cannot be evicted between their write and the
+        // manifest that names them.
+        {
             let mut g = self.lock();
-            g.entries.get_mut(&key).map(|e| e.last_used = now_nanos())
-        };
-        if known.is_some() {
-            self.save_index();
-            return Ok(());
+            if let Some(e) = g.entries.get_mut(&key) {
+                e.last_used = now_nanos();
+                drop(g);
+                self.save_index();
+                return Ok(());
+            }
+            for h in &hashes {
+                *g.refs.entry(*h).or_default() += 1;
+            }
         }
+        let release = |this: &Self| {
+            let mut freed = Vec::new();
+            {
+                let mut g = this.lock();
+                for h in &hashes {
+                    if let Some(n) = g.refs.get_mut(h) {
+                        *n -= 1;
+                        if *n == 0 {
+                            g.refs.remove(h);
+                            g.block_bytes.remove(h);
+                            freed.push(*h);
+                        }
+                    }
+                }
+            }
+            for h in freed {
+                let _ = std::fs::remove_file(this.block_path(&h));
+            }
+        };
+        for (b, h) in hashes.iter().enumerate() {
+            if self.lock().block_bytes.contains_key(h) {
+                continue;
+            }
+            let bytes = block(b);
+            if let Err(e) = self.write_file(&self.block_path(h), &bytes) {
+                release(self);
+                return Err(e);
+            }
+            self.lock().block_bytes.insert(*h, bytes.len() as u64);
+        }
+        let mut file = Vec::with_capacity(12 + hashes.len() * 16 + manifest.len());
+        file.extend_from_slice(MANIFEST_MAGIC);
+        file.extend_from_slice(&(hashes.len() as u32).to_le_bytes());
+        for h in &hashes {
+            file.extend_from_slice(h);
+        }
+        file.extend_from_slice(manifest);
         let entry = Entry {
             key,
             len,
             family,
-            bytes: bytes.len() as u64,
+            bytes: file.len() as u64,
             last_used: now_nanos(),
             hits: 0,
+            blocks: hashes.clone(),
         };
-        let path = self.path_of(&entry);
-        let tmp = self.dir.join(format!(
-            "{TMP_PREFIX}{}-{}",
-            std::process::id(),
-            self.tmp_seq.fetch_add(1, Ordering::Relaxed)
-        ));
-        write_whole(&tmp, bytes).with_context(|| tmp.display().to_string())?;
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(anyhow!("{}: {e}", path.display()));
-        }
-        if let Ok(d) = std::fs::File::open(&self.dir) {
-            let _ = d.sync_all();
+        if let Err(e) = self.write_file(&self.path_of(&entry), &file) {
+            release(self);
+            return Err(e);
         }
         self.lock().entries.insert(key, entry);
         self.evict(&key);
@@ -347,8 +543,28 @@ impl StateStore {
         Ok(())
     }
 
-    /// Drop entries, least recently used first and pinned ones last, until the store fits its
-    /// budget. `keep` is never dropped.
+    /// `bytes` in a new file at `path`: written beside it, synced, renamed in.
+    fn write_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let tmp = self.dir.join(format!(
+            "{TMP_PREFIX}{}-{}",
+            std::process::id(),
+            self.tmp_seq.fetch_add(1, Ordering::Relaxed)
+        ));
+        write_whole(&tmp, bytes).with_context(|| tmp.display().to_string())?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow!("{}: {e}", path.display()));
+        }
+        if let Some(parent) = path.parent() {
+            if let Ok(d) = std::fs::File::open(parent) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop manifests, least recently used first and pinned ones last, until the manifests and the
+    /// blocks they reference fit the budget. `keep` is never dropped.
     fn evict(&self, keep: &Key) {
         if self.budget == 0 {
             return;
@@ -356,7 +572,12 @@ impl StateStore {
         let mut victims = Vec::new();
         {
             let g = self.lock();
-            let mut total: u64 = g.entries.values().map(|e| e.bytes).sum();
+            let mut total: u64 = g.entries.values().map(|e| e.bytes).sum::<u64>()
+                + g.block_bytes
+                    .iter()
+                    .filter(|(h, _)| g.refs.contains_key(*h))
+                    .map(|(_, n)| *n)
+                    .sum::<u64>();
             if total <= self.budget {
                 return;
             }
@@ -371,22 +592,32 @@ impl StateStore {
             let is_pinned = |e: &Entry| pinned.get(&e.family) == Some(&e.key);
             let mut order: Vec<&Entry> = g.entries.values().filter(|e| &e.key != keep).collect();
             order.sort_by_key(|e| (is_pinned(e), e.last_used));
+            // A block is freed with its last reference: count what each victim really returns.
+            let mut left: HashMap<Key, usize> = g.refs.clone();
             for e in order {
                 if total <= self.budget {
                     break;
                 }
                 total -= e.bytes;
+                for b in &e.blocks {
+                    if let Some(n) = left.get_mut(b) {
+                        *n -= 1;
+                        if *n == 0 {
+                            total -= g.block_bytes.get(b).copied().unwrap_or(0);
+                        }
+                    }
+                }
                 victims.push(e.clone());
             }
         }
         for v in victims {
             tracing::info!(
-                "state cache: evicted a {}-token snapshot ({} MiB)",
+                "state cache: evicted a {}-token snapshot ({} KiB manifest)",
                 v.len,
-                v.bytes >> 20
+                v.bytes >> 10
             );
             let _ = std::fs::remove_file(self.path_of(&v));
-            self.lock().entries.remove(&v.key);
+            self.drop_entry(&v.key);
         }
     }
 
@@ -402,22 +633,27 @@ impl StateStore {
         let Ok(json) = serde_json::to_vec(&index) else {
             return;
         };
-        let tmp = self.dir.join(format!(
-            "{TMP_PREFIX}index-{}-{}",
-            std::process::id(),
-            self.tmp_seq.fetch_add(1, Ordering::Relaxed)
-        ));
-        if write_whole(&tmp, &json).is_ok()
-            && std::fs::rename(&tmp, self.dir.join(INDEX_FILE)).is_err()
-        {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        let _ = self.write_file(&self.dir.join(INDEX_FILE), &json);
     }
 
-    /// Snapshots held and the bytes they take.
+    /// Snapshots held and the bytes they and their blocks take.
     pub fn stats(&self) -> (usize, u64) {
         let g = self.lock();
-        (g.entries.len(), g.entries.values().map(|e| e.bytes).sum())
+        let blocks: u64 = g
+            .block_bytes
+            .iter()
+            .filter(|(h, _)| g.refs.contains_key(*h))
+            .map(|(_, n)| *n)
+            .sum();
+        (
+            g.entries.len(),
+            g.entries.values().map(|e| e.bytes).sum::<u64>() + blocks,
+        )
+    }
+
+    /// Blocks on disk, for tests and status.
+    pub fn block_count(&self) -> usize {
+        self.lock().block_bytes.len()
     }
 }
 
@@ -491,21 +727,27 @@ mod tests {
         (0..n).map(|i| i * 31 + salt).collect()
     }
 
+    /// A put with `len / block` blocks of 10 bytes each.
+    fn put(store: &StateStore, t: &[u32], len: usize, manifest: &[u8]) {
+        let nb = len / store.block_tokens();
+        store
+            .put(&store.keys(&SCOPE, t), len, manifest, nb, |_| vec![1u8; 10])
+            .unwrap();
+    }
+
     #[test]
     fn the_longest_stored_prefix_of_a_prompt_is_found() {
         let d = dir("longest");
         let store = StateStore::open(d.clone(), 0, 8).unwrap();
         let base = seq(40, 1);
-        store.put(&store.keys(&SCOPE, &base), 13, b"short").unwrap();
-        store.put(&store.keys(&SCOPE, &base), 37, b"long").unwrap();
+        put(&store, &base, 13, b"short");
+        put(&store, &base, 37, b"long");
         // Storing a state that is stored already changes nothing.
-        store.put(&store.keys(&SCOPE, &base), 37, b"long").unwrap();
+        put(&store, &base, 37, b"long");
         assert_eq!(store.stats().0, 2);
         let mut other = base.clone();
         other[20] ^= 1;
-        store
-            .put(&store.keys(&SCOPE, &other), 40, b"diverged")
-            .unwrap();
+        put(&store, &other, 40, b"diverged");
 
         let mut prompt = base.clone();
         prompt.extend(seq(10, 99));
@@ -532,42 +774,116 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_of_one_conversation_store_their_shared_blocks_once() {
+        let d = dir("shared");
+        let store = StateStore::open(d.clone(), 0, 8).unwrap();
+        let t = seq(64, 5);
+        put(&store, &t, 24, b"m1");
+        assert_eq!(store.block_count(), 3);
+        put(&store, &t, 40, b"m2");
+        put(&store, &t, 61, b"m3");
+        // Three manifests, blocks 0..7 written once each: 7 blocks, not 3 + 5 + 7.
+        assert_eq!(store.block_count(), 7);
+        let keys = store.keys(&SCOPE, &t);
+        let e = store.candidates(&keys, 64).remove(0);
+        assert_eq!(e.len, 61);
+        assert_eq!(e.blocks.len(), 7);
+        assert_eq!(store.read_block(&e.blocks[6]).unwrap(), vec![1u8; 10]);
+        // Forgetting the longest frees only the blocks no other manifest names.
+        store.forget(&e);
+        assert_eq!(store.block_count(), 5);
+        let again = StateStore::open(d.clone(), 0, 8).unwrap();
+        assert_eq!(again.stats().0, 2);
+        assert_eq!(again.block_count(), 5);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn the_least_recently_used_goes_first_and_the_pinned_prefix_last() {
         let d = dir("evict");
-        let store = StateStore::open(d.clone(), 30, 8).unwrap();
+        // Each snapshot is a 10-byte manifest plus 12 bytes of header; none has blocks.
+        let store = StateStore::open(d.clone(), 3 * 22, 8).unwrap();
+        let a = seq(7, 1);
+        let b = seq(7, 5000);
+        let c = seq(7, 9000);
         let blob = [0u8; 10];
-        let a = seq(24, 1);
-        let b = seq(24, 5000);
-        let c = seq(24, 9000);
         let (ka, kb, kc) = (
             store.keys(&SCOPE, &a),
             store.keys(&SCOPE, &b),
             store.keys(&SCOPE, &c),
         );
-        store.put(&ka, 24, &blob).unwrap();
-        store.put(&kb, 24, &blob).unwrap();
-        store.put(&kc, 24, &blob).unwrap();
+        put(&store, &a, 7, &blob);
+        put(&store, &b, 7, &blob);
+        put(&store, &c, 7, &blob);
         // `a` is the oldest but was restored: pinned. The next write drops `b`, not `a`.
-        let ea = store.candidates(&ka, 24).remove(0);
+        let ea = store.candidates(&ka, 7).remove(0);
         store.read(&ea).unwrap();
-        let e = seq(24, 13000);
-        store.put(&store.keys(&SCOPE, &e), 24, &blob).unwrap();
+        let e = seq(7, 13000);
+        put(&store, &e, 7, &blob);
         assert_eq!(store.stats().0, 3);
         assert!(
-            !store.candidates(&ka, 24).is_empty(),
+            !store.candidates(&ka, 7).is_empty(),
             "the pinned entry stays"
         );
         assert!(
-            store.candidates(&kb, 24).is_empty(),
+            store.candidates(&kb, 7).is_empty(),
             "the oldest unpinned goes"
         );
-        assert!(!store.candidates(&kc, 24).is_empty());
-        // A snapshot larger than the whole budget is not stored.
-        let big = seq(24, 20000);
-        store
-            .put(&store.keys(&SCOPE, &big), 24, &[0u8; 31])
-            .unwrap();
-        assert!(store.candidates(&store.keys(&SCOPE, &big), 24).is_empty());
+        assert!(!store.candidates(&kc, 7).is_empty());
+        // A manifest larger than the whole budget is not stored.
+        let big = seq(7, 20000);
+        put(&store, &big, 7, &[0u8; 80]);
+        assert!(store.candidates(&store.keys(&SCOPE, &big), 7).is_empty());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn eviction_counts_a_block_with_its_last_reference() {
+        let d = dir("evictblocks");
+        // Blocks are 10 bytes, manifests 12 + 16 per block + payload. Budget for two of the three.
+        let store = StateStore::open(d.clone(), 200, 8).unwrap();
+        let t = seq(48, 3);
+        put(&store, &t, 16, b"aa"); // 2 blocks: 20 + 12 + 32 + 2 = 66 bytes
+        put(&store, &t, 24, b"bb"); // + 1 block + 62 -> 138
+        assert_eq!(store.stats().0, 2);
+        put(&store, &t, 32, b"cc"); // + 1 block + 78 -> 226, over 200: the oldest goes, leaving 180
+        assert_eq!(store.stats().0, 2);
+        assert!(store.stats().1 <= 200);
+        assert!(store.candidates(&store.keys(&SCOPE, &t), 16).is_empty());
+        assert_eq!(store.candidates(&store.keys(&SCOPE, &t), 48)[0].len, 32);
+        // Blocks 0..4 are all still named by the survivors.
+        assert_eq!(store.block_count(), 4);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_half_written_block_or_manifest_is_never_referenced() {
+        let d = dir("crash");
+        let store = StateStore::open(d.clone(), 0, 8).unwrap();
+        let t = seq(32, 9);
+        put(&store, &t, 16, b"ok");
+        drop(store);
+        // An interrupted write leaves a temp file, a block no manifest names, and a manifest that
+        // names a block that is gone.
+        std::fs::write(d.join(format!("{TMP_PREFIX}9-9")), b"half").unwrap();
+        let orphan = d
+            .join(BLOCK_DIR)
+            .join(format!("{}.{BLOCK_SUFFIX}", hex(&[9u8; 16])));
+        std::fs::write(&orphan, b"orphan").unwrap();
+        let store = StateStore::open(d.clone(), 0, 8).unwrap();
+        assert!(!orphan.exists());
+        assert!(!d.join(format!("{TMP_PREFIX}9-9")).exists());
+        let keys = store.keys(&SCOPE, &t);
+        let e = store.candidates(&keys, 32).remove(0);
+        std::fs::remove_file(store.block_path(&e.blocks[1])).unwrap();
+        drop(store);
+        let store = StateStore::open(d.clone(), 0, 8).unwrap();
+        assert_eq!(
+            store.stats().0,
+            0,
+            "a manifest with a missing block is dropped"
+        );
+        assert_eq!(store.block_count(), 0);
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -576,15 +892,13 @@ mod tests {
         let d = dir("damaged");
         let store = StateStore::open(d.clone(), 0, 8).unwrap();
         let t = seq(16, 3);
-        store.put(&store.keys(&SCOPE, &t), 16, b"state").unwrap();
+        put(&store, &t, 16, b"state");
         drop(store);
         std::fs::write(d.join(INDEX_FILE), b"{ not json").unwrap();
         std::fs::write(d.join("stray.txt"), b"x").unwrap();
-        std::fs::write(d.join(format!("{TMP_PREFIX}1-1")), b"half").unwrap();
         let store = StateStore::open(d.clone(), 0, 8).unwrap();
         assert_eq!(store.stats().0, 1);
         assert!(!d.join("stray.txt").exists());
-        assert!(!d.join(format!("{TMP_PREFIX}1-1")).exists());
         // A file that vanished is dropped on the read that finds it gone.
         let keys = store.keys(&SCOPE, &t);
         let e = store.candidates(&keys, 16).remove(0);
@@ -617,7 +931,7 @@ mod tests {
         let d = dir("names");
         let store = StateStore::open(d.clone(), 0, 8).unwrap();
         let t = seq(20, 123_456);
-        store.put(&store.keys(&SCOPE, &t), 20, b"state").unwrap();
+        put(&store, &t, 20, b"state");
         let mut text = String::new();
         for item in std::fs::read_dir(&d).unwrap() {
             let p = item.unwrap().path();

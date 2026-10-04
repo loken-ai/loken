@@ -679,6 +679,11 @@ impl DeepseekV41Model {
         &self.output
     }
 
+    /// Each layer's compression ratio, 0 for a layer that keeps only a window.
+    pub fn compress_ratios(&self) -> &[usize] {
+        &self.ratios
+    }
+
     pub fn n_layers(&self) -> usize {
         self.blocks.len()
     }
@@ -2690,6 +2695,68 @@ mod oracle_gate {
         }
     }
 
+    /// A state cut into a manifest and block files comes back to the bit when the blocks are
+    /// read in order, at every split: the blocks cover whole groups, the manifest the tail and the
+    /// window. The blocks of a state that later grew are byte-identical to the earlier ones, which
+    /// is what lets a store keep each once.
+    #[test]
+    fn a_state_split_into_blocks_restores_exactly_and_shares_its_blocks() {
+        use super::super::snapshot::{
+            block_count, decode_split, encode_block, encode_manifest, identity, same_state,
+            BlockLayout,
+        };
+        let id = identity(&[b"synthetic"]);
+        let layouts: [(&[u32], &[u32], &[u32]); 2] =
+            [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
+        for (ratios, kv_src, index_src) in layouts {
+            let (model, _) = synthetic(ratios, kv_src, index_src, 0);
+            let tokens: Vec<u32> = (0..80)
+                .map(|i| (i * 7 + 3) % super::tests::VOCAB as u32)
+                .collect();
+            let layout = BlockLayout {
+                ratios: model.compress_ratios(),
+                block_tokens: 8,
+            };
+            for split in [1usize, 5, 17, 32, 41, 64] {
+                let mut live = model.new_decode_state();
+                model.prefill_into(&tokens[..split], &mut live).unwrap();
+                let nb = block_count(&live, &layout);
+                assert_eq!(nb, split / 8, "{ratios:?} split {split}");
+                let (manifest, n) = encode_manifest(&live, None, &id, Some(&layout));
+                assert_eq!(n, nb);
+                let blocks: Vec<Vec<u8>> =
+                    (0..nb).map(|b| encode_block(&live, b, &layout)).collect();
+                let back = decode_split(&manifest, &blocks, &id, model.n_layers()).unwrap();
+                assert!(same_state(&live, &back.state), "{ratios:?} split {split}");
+                // Too few or too many blocks are refused.
+                if nb > 0 {
+                    assert!(decode_split(&manifest, &blocks[1..], &id, model.n_layers()).is_err());
+                }
+                let mut restored = back.state;
+                let want = vecf_of(&model.prefill_continue(&tokens[split..], &mut live).unwrap());
+                let got = vecf_of(
+                    &model
+                        .prefill_continue(&tokens[split..], &mut restored)
+                        .unwrap(),
+                );
+                assert_eq!(got, want, "{ratios:?} split {split}");
+            }
+            // One live sequence snapshotted at two lengths shares its blocks byte for byte.
+            let mut live = model.new_decode_state();
+            model.prefill_into(&tokens[..24], &mut live).unwrap();
+            let early: Vec<Vec<u8>> = (0..3).map(|b| encode_block(&live, b, &layout)).collect();
+            model.prefill_continue(&tokens[24..48], &mut live).unwrap();
+            for (b, blk) in early.iter().enumerate() {
+                assert_eq!(
+                    &encode_block(&live, b, &layout),
+                    blk,
+                    "{ratios:?} block {b}"
+                );
+            }
+            assert_eq!(block_count(&live, &layout), 6);
+        }
+    }
+
     /// A state built by decoding, as a turn's end leaves it, round trips as well, and a restored
     /// state rewinds and checkpoints like any other: the replay after a rewind is bit for bit the
     /// first run, and the rewound state is the snapshot's.
@@ -4091,9 +4158,9 @@ mod oracle_gate {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A damaged snapshot - truncated, flipped, or written by another format version - is passed
-    /// over with the prompt prefilled cold, never a panic and never a wrong answer, and the file
-    /// is dropped. The files hold no run of the prompt's token ids.
+    /// A damaged snapshot - a manifest or a block, truncated, flipped, emptied, or written by
+    /// another format version - is passed over with the prompt prefilled cold, never a panic and
+    /// never a wrong answer, and the file is dropped. The files hold no run of the prompt's ids.
     #[test]
     fn a_damaged_snapshot_is_ignored_and_the_files_hold_no_tokens() {
         use crate::inference::engine::model_backend::DeepseekV41Backend;
@@ -4105,53 +4172,92 @@ mod oracle_gate {
         let _ = prompt_logits(&mut first, &tokens[..24]);
         wait_for_states(&store, 1);
 
-        let snaps: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "snap"))
-            .collect();
-        assert_eq!(snaps.len(), 1);
-        let good = std::fs::read(&snaps[0]).unwrap();
+        let files = |d: &std::path::Path, ext: &str| -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|x| x == ext))
+                .collect()
+        };
+        let manifests = files(&dir, "snap");
+        let blocks = files(&dir.join("blocks"), "blk");
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(blocks.len(), 3);
+        let good_manifest = std::fs::read(&manifests[0]).unwrap();
+        let good_blocks: Vec<Vec<u8>> = blocks.iter().map(|b| std::fs::read(b).unwrap()).collect();
+        let good_block = good_blocks[0].clone();
         // No run of six consecutive prompt ids, as written, in any file of the directory.
         for run in tokens.windows(6) {
             let needle: Vec<u8> = run.iter().flat_map(|t| t.to_le_bytes()).collect();
-            assert!(!good.windows(needle.len()).any(|w| w == &needle[..]));
+            for bytes in [&good_manifest, &good_block] {
+                assert!(!bytes.windows(needle.len()).any(|w| w == &needle[..]));
+            }
         }
 
         let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
         let mut plain = DeepseekV41Backend::new(model, 0, 128);
         let cold = prompt_logits(&mut plain, &tokens);
 
-        let mut other_version = good.clone();
-        other_version[8..12]
-            .copy_from_slice(&(super::super::snapshot::FORMAT_VERSION + 1).to_le_bytes());
-        let mut flipped = good.clone();
-        let mid = flipped.len() / 2;
+        let version = super::super::snapshot::FORMAT_VERSION + 1;
+        // The manifest's snapshot payload starts after the store's header: magic, count, hashes.
+        let payload = 12 + 16 * 3;
+        let mut other_version = good_manifest.clone();
+        other_version[payload + 8..payload + 12].copy_from_slice(&version.to_le_bytes());
+        let mut flipped = good_manifest.clone();
+        let mid = payload + (flipped.len() - payload) / 2;
         flipped[mid] ^= 0x01;
-        for (name, bad) in [
-            ("truncated", good[..good.len() / 2].to_vec()),
-            ("empty", Vec::new()),
-            ("flipped", flipped),
-            ("other version", other_version),
-        ] {
-            std::fs::write(&snaps[0], &bad).unwrap();
-            // A fresh store reads the directory as a restarted server would.
-            let (mut backend, store) = cached_backend(&dir);
-            assert_eq!(store.stats().0, 1, "{name}");
-            let got = prompt_logits(&mut backend, &tokens);
+        let mut other_block = good_block.clone();
+        other_block[8..12].copy_from_slice(&version.to_le_bytes());
+        let mut flipped_block = good_block.clone();
+        let mid = flipped_block.len() / 2;
+        flipped_block[mid] ^= 0x01;
+        let manifest_cases = [
+            (
+                "manifest truncated",
+                good_manifest[..good_manifest.len() / 2].to_vec(),
+            ),
+            ("manifest empty", Vec::new()),
+            ("manifest flipped", flipped),
+            ("manifest other version", other_version),
+        ];
+        let block_cases = [
+            (
+                "block truncated",
+                good_block[..good_block.len() / 2].to_vec(),
+            ),
+            ("block empty", Vec::new()),
+            ("block flipped", flipped_block),
+            ("block other version", other_block),
+        ];
+        let close = |got: &[f32], name: &str| {
             let num: f32 = got.iter().zip(&cold).map(|(a, b)| (a - b) * (a - b)).sum();
             let den: f32 = cold.iter().map(|b| b * b).sum();
             assert!((num / den).sqrt() < 1e-4, "{name}: answered wrongly");
-            // The unusable file is gone; the prompt just prefilled is stored in its place.
+        };
+        for (name, bad) in manifest_cases.into_iter().chain(block_cases) {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("blocks")).unwrap();
+            std::fs::write(&manifests[0], &good_manifest).unwrap();
+            for (b, bytes) in blocks.iter().zip(&good_blocks) {
+                std::fs::write(b, bytes).unwrap();
+            }
+            let target = if name.starts_with("manifest") {
+                &manifests[0]
+            } else {
+                &blocks[0]
+            };
+            std::fs::write(target, &bad).unwrap();
+            // A fresh store reads the directory as a restarted server would; blocks other than
+            // the damaged one are the real ones, so only the case under test can fail.
+            let (mut backend, store) = cached_backend(&dir);
+            let got = prompt_logits(&mut backend, &tokens);
+            close(&got, name);
+            // The prompt just prefilled is stored; the damaged file is not served again.
             wait_for_states(&store, 1);
             assert!(
-                !std::fs::read(&snaps[0]).is_ok_and(|b| b == bad),
+                !std::fs::read(target).is_ok_and(|b| b == bad),
                 "{name}: kept"
             );
-            // Back to a clean directory for the next case.
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(&snaps[0], &good).unwrap();
         }
         let _ = std::fs::remove_dir_all(dir);
     }

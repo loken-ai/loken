@@ -25,10 +25,11 @@ use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 
 const MAGIC: &[u8; 8] = b"LKDSSNAP";
+const BLOCK_MAGIC: &[u8; 8] = b"LKDSBLK1";
 
 /// Bumped whenever the byte layout or the meaning of a field changes; a file of another version
 /// is refused rather than reinterpreted.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 const DIGEST_LEN: usize = 32;
 
@@ -221,16 +222,104 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// `state` and optionally the logits of its last position as bytes under `identity`. The DSpark
-/// capture (`capture_layers`, `captured`) is per-decode scratch and is not carried.
+/// How a state's compressed rows divide into blocks of tokens: each layer's compression ratio and
+/// the block size. A block of `block_tokens` tokens adds `block_tokens / ratio` groups to a layer.
+pub struct BlockLayout<'a> {
+    pub ratios: &'a [usize],
+    pub block_tokens: usize,
+}
+
+/// Per layer: groups a block holds, floats of compressed KV and of index keys per group. `None`
+/// for a state the layout cannot cut at block boundaries (a layer with rows but no ratio, a ratio
+/// that does not divide the block, rows that are not a whole number per group).
+fn block_shape(state: &DecodeState, layout: &BlockLayout) -> Option<Vec<(usize, usize, usize)>> {
+    if layout.ratios.len() != state.layers.len() || layout.block_tokens == 0 {
+        return None;
+    }
+    state
+        .layers
+        .iter()
+        .zip(layout.ratios)
+        .map(|(l, &ratio)| {
+            let has_rows = !l.comp_kv.is_empty() || !l.index_k.is_empty();
+            if !has_rows {
+                return Some((0, 0, 0));
+            }
+            if ratio == 0 || !layout.block_tokens.is_multiple_of(ratio) || l.n_groups == 0 {
+                return None;
+            }
+            let (c, i) = (l.comp_kv.len(), l.index_k.len());
+            (c % l.n_groups == 0 && i % l.n_groups == 0)
+                .then(|| (layout.block_tokens / ratio, c / l.n_groups, i / l.n_groups))
+        })
+        .collect()
+}
+
+/// Whole blocks of tokens a state can hand to block files: the position's, when every layer has
+/// the groups for them, else none.
+pub fn block_count(state: &DecodeState, layout: &BlockLayout) -> usize {
+    let Some(shape) = block_shape(state, layout) else {
+        return 0;
+    };
+    let nb = state.pos / layout.block_tokens;
+    let fits = state
+        .layers
+        .iter()
+        .zip(&shape)
+        .all(|(l, &(g, _, _))| nb * g <= l.n_groups);
+    if fits {
+        nb
+    } else {
+        0
+    }
+}
+
+/// The compressed rows block `b` of `state` adds, every layer's, under `identity`'s version.
+pub fn encode_block(state: &DecodeState, b: usize, layout: &BlockLayout) -> Vec<u8> {
+    let shape = block_shape(state, layout).unwrap_or_default();
+    let mut w = Writer(Vec::new());
+    w.0.extend_from_slice(BLOCK_MAGIC);
+    w.u32(FORMAT_VERSION);
+    w.u32(state.layers.len() as u32);
+    for (l, &(g, cl, il)) in state.layers.iter().zip(&shape) {
+        w.rows(Kind::Fp4Block16, &l.comp_kv[b * g * cl..(b + 1) * g * cl]);
+        w.rows(
+            Kind::Fp4Pow2Block32,
+            &l.index_k[b * g * il..(b + 1) * g * il],
+        );
+    }
+    let sum: [u8; DIGEST_LEN] = Sha256::digest(&w.0).into();
+    w.0.extend_from_slice(&sum);
+    w.0
+}
+
+/// `state` and optionally the logits of its last position as one self-contained snapshot under
+/// `identity`. The DSpark capture (`capture_layers`, `captured`) is per-decode scratch and is not
+/// carried.
 pub fn encode(state: &DecodeState, logits: Option<&[f32]>, identity: &Identity) -> Vec<u8> {
+    encode_manifest(state, logits, identity, None).0
+}
+
+/// The manifest of `state`: everything but the compressed rows the first `blocks` blocks of
+/// `layout` carry, and that count of blocks (0 without a layout or when the state cannot be cut).
+pub fn encode_manifest(
+    state: &DecodeState,
+    logits: Option<&[f32]>,
+    identity: &Identity,
+    layout: Option<&BlockLayout>,
+) -> (Vec<u8>, usize) {
+    let nblocks = layout.map_or(0, |l| block_count(state, l));
+    let shape = layout
+        .and_then(|l| block_shape(state, l))
+        .unwrap_or_else(|| vec![(0, 0, 0); state.layers.len()]);
     let mut w = Writer(Vec::new());
     w.0.extend_from_slice(MAGIC);
     w.u32(FORMAT_VERSION);
     w.0.extend_from_slice(identity);
     w.u64(state.pos as u64);
+    w.u64(nblocks as u64);
     w.u32(state.layers.len() as u32);
-    for layer in &state.layers {
+    for (layer, &(g, cl, il)) in state.layers.iter().zip(&shape) {
         w.u64(layer.n_groups as u64);
         let row_len = layer.win.front().map_or(0, Vec::len);
         w.u64(layer.win.len() as u64);
@@ -245,8 +334,14 @@ pub fn encode(state: &DecodeState, logits: Option<&[f32]>, identity: &Identity) 
                 w.f32s(row);
             }
         }
-        w.rows(Kind::Fp4Block16, &layer.comp_kv);
-        w.rows(Kind::Fp4Pow2Block32, &layer.index_k);
+        w.rows(
+            Kind::Fp4Block16,
+            &layer.comp_kv[(nblocks * g * cl).min(layer.comp_kv.len())..],
+        );
+        w.rows(
+            Kind::Fp4Pow2Block32,
+            &layer.index_k[(nblocks * g * il).min(layer.index_k.len())..],
+        );
         w.u64(layer.group_x.len() as u64);
         for row in &layer.group_x {
             w.f32s(row);
@@ -262,13 +357,58 @@ pub fn encode(state: &DecodeState, logits: Option<&[f32]>, identity: &Identity) 
     }
     let sum: [u8; DIGEST_LEN] = Sha256::digest(&w.0).into();
     w.0.extend_from_slice(&sum);
-    w.0
+    (w.0, nblocks)
 }
 
 /// The snapshot in `bytes`, if it is one of this format and version, written under `identity`
-/// for a model of `n_layers` layers, and whole.
+/// for a model of `n_layers` layers, whole and with no blocks.
 pub fn decode(
     bytes: &[u8],
+    identity: &Identity,
+    n_layers: usize,
+) -> Result<Snapshot, SnapshotError> {
+    decode_split(bytes, &[], identity, n_layers)
+}
+
+/// One block's compressed rows per layer, as `(compressed KV, index keys)`.
+fn decode_block(bytes: &[u8], n_layers: usize) -> Result<Vec<(Vec<f32>, Vec<f32>)>, SnapshotError> {
+    if bytes.len() < BLOCK_MAGIC.len() + 4 + DIGEST_LEN {
+        return Err(SnapshotError::Truncated);
+    }
+    if &bytes[..BLOCK_MAGIC.len()] != BLOCK_MAGIC {
+        return Err(SnapshotError::NotASnapshot);
+    }
+    let version = u32::from_le_bytes(
+        bytes[BLOCK_MAGIC.len()..BLOCK_MAGIC.len() + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if version != FORMAT_VERSION {
+        return Err(SnapshotError::Version(version));
+    }
+    let (body, sum) = bytes.split_at(bytes.len() - DIGEST_LEN);
+    if Sha256::digest(body).as_slice() != sum {
+        return Err(SnapshotError::Corrupt);
+    }
+    let mut r = Reader(&body[BLOCK_MAGIC.len() + 4..]);
+    if r.u32()? as usize != n_layers {
+        return Err(SnapshotError::Shape("layer count"));
+    }
+    let mut out = Vec::with_capacity(n_layers);
+    for _ in 0..n_layers {
+        out.push((r.rows(Kind::Fp4Block16)?, r.rows(Kind::Fp4Pow2Block32)?));
+    }
+    if !r.0.is_empty() {
+        return Err(SnapshotError::Shape("trailing bytes"));
+    }
+    Ok(out)
+}
+
+/// The snapshot whose manifest is `bytes` and whose first compressed rows are in `blocks`, in
+/// order: the same checks as `decode`, and the block count must be the manifest's.
+pub fn decode_split(
+    bytes: &[u8],
+    blocks: &[Vec<u8>],
     identity: &Identity,
     n_layers: usize,
 ) -> Result<Snapshot, SnapshotError> {
@@ -292,6 +432,9 @@ pub fn decode(
         return Err(SnapshotError::Identity);
     }
     let pos = usize::try_from(r.u64()?).map_err(|_| SnapshotError::Truncated)?;
+    if usize::try_from(r.u64()?).ok() != Some(blocks.len()) {
+        return Err(SnapshotError::Shape("block count"));
+    }
     if r.u32()? as usize != n_layers {
         return Err(SnapshotError::Shape("layer count"));
     }
@@ -345,6 +488,21 @@ pub fn decode(
     };
     if !r.0.is_empty() {
         return Err(SnapshotError::Shape("trailing bytes"));
+    }
+    // The blocks' rows come first, then the manifest's tail.
+    for block in blocks.iter().rev() {
+        for (layer, (comp, index)) in layers.iter_mut().zip(decode_block(block, n_layers)?) {
+            layer.comp_kv.splice(..0, comp);
+            layer.index_k.splice(..0, index);
+        }
+    }
+    for l in &layers {
+        let rows_ok = |len: usize| {
+            l.n_groups == 0 && len == 0 || l.n_groups > 0 && len.is_multiple_of(l.n_groups)
+        };
+        if !rows_ok(l.comp_kv.len()) || !rows_ok(l.index_k.len()) {
+            return Err(SnapshotError::Shape("rows per group"));
+        }
     }
     let mut state = DecodeState::new(n_layers);
     state.layers = layers;
@@ -486,6 +644,7 @@ mod tests {
         w.u32(FORMAT_VERSION);
         w.0.extend_from_slice(&id());
         w.u64(1);
+        w.u64(0);
         w.u32(1);
         w.u64(0);
         w.u64(u64::MAX / 16);

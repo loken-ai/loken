@@ -923,6 +923,19 @@ impl DeepseekV41Backend {
         store: std::sync::Arc<crate::inference::cache::state_disk::StateStore>,
         identity: crate::inference::model::deepseek_v41::snapshot::Identity,
     ) -> Self {
+        // A block of the store's chain must hold whole groups of every layer.
+        let block = store.block_tokens();
+        if let Some(r) = self
+            .model
+            .compress_ratios()
+            .iter()
+            .find(|&&r| r != 0 && block % r != 0)
+        {
+            tracing::warn!(
+                "state cache off: a block of {block} tokens is not a whole number of groups at ratio {r}"
+            );
+            return self;
+        }
         self.state_cache = Some(StateCache { store, identity });
         self
     }
@@ -932,18 +945,31 @@ impl DeepseekV41Backend {
     /// that is whole `ids` but holds no logits cannot answer and is passed over; a file that
     /// cannot be read is logged, dropped and passed over. `None` leaves the state untouched.
     fn restore_prefix(&mut self, ids: &[u32]) -> Option<(usize, Option<Vec<f32>>)> {
-        use crate::inference::model::deepseek_v41::snapshot::decode;
+        use crate::inference::model::deepseek_v41::snapshot::decode_split;
         let cache = self.state_cache.as_ref()?;
         let keys = cache.store.keys(&cache.identity, ids);
         for entry in cache.store.candidates(&keys, ids.len()) {
-            let bytes = match cache.store.read(&entry) {
+            let manifest = match cache.store.read(&entry) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!("state cache: {e}; ignored");
                     continue;
                 }
             };
-            match decode(&bytes, &cache.identity, self.model.n_layers()) {
+            let blocks: Result<Vec<Vec<u8>>, _> = entry
+                .blocks
+                .iter()
+                .map(|h| cache.store.read_block(h))
+                .collect();
+            let blocks = match blocks {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("state cache: {e}; dropped");
+                    cache.store.forget(&entry);
+                    continue;
+                }
+            };
+            match decode_split(&manifest, &blocks, &cache.identity, self.model.n_layers()) {
                 Ok(snap) if snap.state.pos == entry.len => {
                     if entry.len == ids.len() && snap.logits.is_none() {
                         continue;
@@ -984,15 +1010,26 @@ impl DeepseekV41Backend {
         }
         let (store, identity) = (cache.store.clone(), cache.identity);
         let (state, tokens) = (self.state.clone(), tokens.to_vec());
+        let ratios = self.model.compress_ratios().to_vec();
         std::thread::spawn(move || {
-            use crate::inference::model::deepseek_v41::snapshot::encode;
-            let bytes = encode(&state, logits.as_deref(), &identity);
+            use crate::inference::model::deepseek_v41::snapshot::{
+                encode_block, encode_manifest, BlockLayout,
+            };
+            let layout = BlockLayout {
+                ratios: &ratios,
+                block_tokens: store.block_tokens(),
+            };
+            let (manifest, nblocks) =
+                encode_manifest(&state, logits.as_deref(), &identity, Some(&layout));
             let keys = store.keys(&identity, &tokens);
-            match store.put(&keys, tokens.len(), &bytes) {
+            let put = store.put(&keys, tokens.len(), &manifest, nblocks, |b| {
+                encode_block(&state, b, &layout)
+            });
+            match put {
                 Ok(()) => tracing::info!(
-                    "state cache: stored a {}-token state ({} MiB)",
+                    "state cache: stored a {}-token state ({} KiB manifest, {nblocks} blocks)",
                     tokens.len(),
-                    bytes.len() >> 20
+                    manifest.len() >> 10
                 ),
                 Err(e) => tracing::warn!("state cache: not stored: {e}"),
             }
