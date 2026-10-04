@@ -376,6 +376,20 @@ fn requant_float_weight(
     Ok(out)
 }
 
+/// Whether the expert kernels of a device read a stack of `dtype` as the file stores it: the
+/// card kernels on a card, the host dot kernels on the host. A stack for which this is false
+/// is rebuilt in a format they read.
+pub(crate) fn moe_stack_served_as_stored(
+    dtype: crate::tensor::quantized::GgmlDType,
+    on_card: bool,
+) -> bool {
+    if on_card {
+        crate::inference::moe_cuda::gemm::expert_kernels_serve(dtype)
+    } else {
+        crate::inference::moe_cpu::cpu_qmatmul_supported(dtype)
+    }
+}
+
 fn build_generic_layer(
     raw: RawGenericLayer,
     device: &Device,
@@ -928,18 +942,7 @@ fn build_generic_layer(
         // A stack the plan keeps in host memory stays there whatever device its layer runs on.
         let home = qt.device().clone();
         let device = if home.runs_as_card() { device } else { &home };
-        let supported = matches!(
-            qt.dtype(),
-            GgmlDType::Q2K
-                | GgmlDType::Q3K
-                | GgmlDType::Q4K
-                | GgmlDType::Q5K
-                | GgmlDType::Q6K
-                | GgmlDType::Q8_0
-                | GgmlDType::MxFp4
-        ) || (device.runs_as_card()
-            && crate::inference::moe_cuda::gemm::expert_kernels_serve(qt.dtype()));
-        if supported {
+        if moe_stack_served_as_stored(qt.dtype(), device.runs_as_card()) {
             return Ok(qt);
         }
         let before = qt.shape().elem_count() as u64 * qt.dtype().type_size() as u64

@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// format added to the table without a CPU dot must fall back to dequantise-then-matmul, and a
 /// derivation would have it claim a path that does not exist. `Q8_1` is absent because it is an
 /// activation format - nothing stores weights in it.
-fn cpu_qmatmul_supported(dtype: GgmlDType) -> bool {
+pub(crate) fn cpu_qmatmul_supported(dtype: GgmlDType) -> bool {
     use GgmlDType::*;
     matches!(
         dtype,

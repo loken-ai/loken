@@ -43,6 +43,8 @@ pub(crate) use crate::tensor::{DType, Device, IndexOp, Result, Tensor};
 mod card_host_parity;
 
 mod config;
+#[cfg(test)]
+mod conversion_tests;
 mod graph;
 pub mod hetero;
 mod layer_attn;

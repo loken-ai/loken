@@ -402,6 +402,25 @@ pub struct QMatMul {
 }
 
 impl QMatMul {
+    /// The format the weight is resident in, by name, and the bytes it owns beyond the
+    /// file's own blocks (zero for a weight kept as stored, the dense size for a widened one).
+    #[cfg(test)]
+    pub(crate) fn resident_format(&self) -> (String, u64) {
+        match &self.inner {
+            QMatMulKind::Gguf(crate::tensor::quantized::QMatMul::QTensor(q)) => {
+                (q.dtype().gguf_name().to_string(), 0)
+            }
+            QMatMulKind::Gguf(
+                crate::tensor::quantized::QMatMul::Tensor(t)
+                | crate::tensor::quantized::QMatMul::TensorF16(t),
+            ) => (
+                t.dtype().as_str().to_string(),
+                (t.elem_count() * t.dtype().size_in_bytes()) as u64,
+            ),
+            QMatMulKind::Awq(_) => ("awq_int4".to_string(), 0),
+        }
+    }
+
     pub fn from_qtensor(qtensor: QTensor) -> Result<Self> {
         let inner = crate::tensor::quantized::QMatMul::from_qtensor(qtensor)?;
         Ok(Self {
