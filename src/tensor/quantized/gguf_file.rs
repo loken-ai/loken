@@ -580,12 +580,17 @@ pub struct HeaderFacts {
     /// The file declares `{architecture}.pooling_type`: its output is a pooled
     /// embedding rather than next-token logits.
     pub pools: bool,
+    /// `split.count` when the file is one part of a split set. A part's directory lists only
+    /// the tensors it carries, so the set's parameter count is across the parts, not this one's.
+    pub split_parts: Option<u64>,
 }
 
-/// Read the facts a catalogue lists, stopping at the first tokenizer key. The general keys
-/// come first in a GGUF and the vocabulary arrays after them, so a few kilobytes are read
-/// where the whole header runs to tens of megabytes; a key that only follows the vocabulary
-/// stays unread and reports as absent.
+/// Read the facts a catalogue lists. The general keys come first in a GGUF and the vocabulary
+/// arrays after them, so a few kilobytes are read where the whole header runs to tens of
+/// megabytes: the walk stops at the first tokenizer key once it has the parameter count.
+///
+/// A file that declares no `general.parameter_count` is walked past the vocabulary to the
+/// tensor directory, and the count is the sum of the elements its tensors hold.
 pub fn read_facts<P: AsRef<std::path::Path>>(path: P) -> Result<HeaderFacts> {
     let path = path.as_ref();
     let f =
@@ -597,7 +602,7 @@ pub fn read_facts<P: AsRef<std::path::Path>>(path: P) -> Result<HeaderFacts> {
 fn read_facts_from<R: Read + Seek>(r: &mut R) -> Result<HeaderFacts> {
     use layout::value_type;
     use std::io::SeekFrom;
-    let [magic, version, _tensor_count, kv_count] = layout::read_scalars(r, &layout::FILE_HEADER)?;
+    let [magic, version, tensor_count, kv_count] = layout::read_scalars(r, &layout::FILE_HEADER)?;
     if magic != u64::from(layout::MAGIC) {
         return Err(Error(format!("not a GGUF file (magic {magic:#x})")));
     }
@@ -643,8 +648,10 @@ fn read_facts_from<R: Read + Seek>(r: &mut R) -> Result<HeaderFacts> {
     for _ in 0..kv_count {
         let key = layout::read_string(r)?;
         let vtype = layout::read_u32(r)?;
-        if key.starts_with("tokenizer.") {
-            break;
+        // The listed keys precede the vocabulary: with the count read the walk stops there.
+        // Without it the walk finishes, since the tensor directory follows the vocabulary.
+        if key.starts_with("tokenizer.") && facts.parameter_count.is_some() {
+            return Ok(facts);
         }
         match key.as_str() {
             "general.architecture" => {
@@ -654,6 +661,8 @@ fn read_facts_from<R: Read + Seek>(r: &mut R) -> Result<HeaderFacts> {
             "general.parameter_count" => {
                 facts.parameter_count = read_value(r, vtype)?.to_u64().ok()
             }
+            // A split part: its directory lists only the tensors it carries.
+            "split.count" => facts.split_parts = read_value(r, vtype)?.to_u64().ok(),
             k if facts
                 .architecture
                 .as_deref()
@@ -665,7 +674,35 @@ fn read_facts_from<R: Read + Seek>(r: &mut R) -> Result<HeaderFacts> {
             _ => skip(r, vtype)?,
         }
     }
+    // No declared count: the reader stands at the tensor directory. Only shapes are read, never
+    // tensor data. An empty directory leaves the count absent rather than zero.
+    if facts.parameter_count.is_none() {
+        if let Some(n) = directory_parameter_count(r, tensor_count)
+            .ok()
+            .filter(|n| *n > 0)
+        {
+            facts.parameter_count = Some(n);
+        }
+    }
     Ok(facts)
+}
+
+/// The elements every tensor in the directory holds. An error when the directory cannot be
+/// walked.
+fn directory_parameter_count<R: Read + Seek>(r: &mut R, tensor_count: u64) -> Result<u64> {
+    let mut total: u64 = 0;
+    for _ in 0..tensor_count {
+        let _name = layout::read_string(r)?;
+        let n_dims = layout::read_u32(r)?;
+        let mut elems: u64 = 1;
+        for _ in 0..n_dims {
+            elems = elems.saturating_mul(layout::read_u64(r)?);
+        }
+        let _dtype = layout::read_u32(r)?;
+        let _offset = layout::read_u64(r)?;
+        total = total.saturating_add(elems);
+    }
+    Ok(total)
 }
 
 /// Whether `path` is a file that opens with the GGUF magic. A directory, an unreadable
@@ -940,34 +977,91 @@ mod facts_tests {
         b
     }
     fn header(kvs: &[Vec<u8>]) -> Vec<u8> {
+        header_with_tensors(kvs, &[])
+    }
+
+    /// A header with a tensor directory: `tensors` are `(name, dims)` in the file's own order.
+    fn header_with_tensors(kvs: &[Vec<u8>], tensors: &[(&str, &[usize])]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend(layout::MAGIC_BYTES);
         b.extend(3u32.to_le_bytes());
-        b.extend(0u64.to_le_bytes());
+        b.extend((tensors.len() as u64).to_le_bytes());
         b.extend((kvs.len() as u64).to_le_bytes());
         for kv in kvs {
             b.extend(kv);
         }
+        for (name, dims) in tensors {
+            b.extend((name.len() as u64).to_le_bytes());
+            b.extend(name.as_bytes());
+            b.extend((dims.len() as u32).to_le_bytes());
+            for d in *dims {
+                b.extend((*d as u64).to_le_bytes());
+            }
+            b.extend(2u32.to_le_bytes()); // GgmlDType::F16
+            b.extend(0u64.to_le_bytes()); // offset
+        }
         b
     }
 
-    /// The facts are read from the keys before the vocabulary, arrays in between are
-    /// skipped, and nothing after the first tokenizer key is read.
+    /// The facts are read from the keys before the vocabulary, arrays in between are skipped,
+    /// and a declared count ends the walk there - nothing behind the vocabulary can change it.
     #[test]
-    fn the_facts_come_from_the_keys_before_the_vocabulary() {
+    fn a_declared_count_ends_the_walk_at_the_vocabulary() {
         let bytes = header(&[
             kv_string("general.architecture", "llama"),
             kv_strings("general.tags", &["chat", "code"]),
             kv_u32("general.file_type", 15),
-            kv_strings("tokenizer.ggml.tokens", &["a", "b", "c"]),
             kv_u32("general.parameter_count", 7),
+            kv_strings("tokenizer.ggml.tokens", &["a", "b", "c"]),
         ]);
         let facts = read_facts_from(&mut std::io::Cursor::new(bytes)).expect("parses");
         assert_eq!(facts.architecture.as_deref(), Some("llama"));
         assert_eq!(facts.file_type, Some(15));
+        assert_eq!(facts.parameter_count, Some(7));
+    }
+
+    /// A file that declares no count: the walk goes past the vocabulary to the tensor directory
+    /// and sums what the tensors hold.
+    #[test]
+    fn a_missing_count_is_summed_from_the_directory() {
+        let bytes = header_with_tensors(
+            &[
+                kv_string("general.architecture", "qwen3moe"),
+                kv_strings("tokenizer.ggml.tokens", &["a", "b"]),
+            ],
+            &[
+                ("token_embd.weight", &[1000, 64]),
+                ("blk.0.attn_q.weight", &[64, 64]),
+                ("blk.0.ffn_up_exps.weight", &[8, 64, 64]),
+            ],
+        );
+        let facts = read_facts_from(&mut std::io::Cursor::new(bytes)).expect("parses");
+        assert_eq!(facts.architecture.as_deref(), Some("qwen3moe"));
         assert_eq!(
-            facts.parameter_count, None,
-            "a key after the vocabulary stays unread"
+            facts.parameter_count,
+            Some(1000 * 64 + 64 * 64 + 8 * 64 * 64),
+            "the sum of what the directory lists"
+        );
+    }
+
+    /// A part of a split set says so, so a caller knows its summed directory is a share of the
+    /// model.
+    #[test]
+    fn a_split_part_reports_the_set_it_belongs_to() {
+        let bytes = header_with_tensors(
+            &[
+                kv_string("general.architecture", "qwen3moe"),
+                kv_u32("split.count", 2),
+                kv_u32("split.no", 0),
+            ],
+            &[("blk.0.attn_q.weight", &[64, 64])],
+        );
+        let facts = read_facts_from(&mut std::io::Cursor::new(bytes)).expect("parses");
+        assert_eq!(facts.split_parts, Some(2));
+        assert_eq!(
+            facts.parameter_count,
+            Some(64 * 64),
+            "this file's own share, which the caller must widen across the parts"
         );
     }
 
