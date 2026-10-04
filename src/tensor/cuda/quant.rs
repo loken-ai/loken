@@ -1462,6 +1462,214 @@ pub fn gpu_layer_sum(dev: &CudaDevice, layer: &LayerBuffers) -> Result<Vec<f32>>
         .map_err(|e| Error(format!("layer sum download: {e}")))
 }
 
+/// A prompt's residual stream `x` [n, hc, d] held on a card for the whole prompt, with the
+/// hyper-connection steps that read and rewrite it. The coefficients are a few dozen values per
+/// token and cross as such; the sublayers' inputs and outputs cross once each.
+pub struct HcStreamDev {
+    x: CudaSlice<f32>,
+    n: usize,
+    hc: usize,
+    d: usize,
+}
+
+impl HcStreamDev {
+    /// Tokens held times values per token.
+    pub fn len(&self) -> usize {
+        self.n * self.hc * self.d
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Upload `x`, which holds `hc` copies of `d` values per token. `hc` is at most the widest the
+    /// kernels hold in registers.
+    pub fn open(dev: &CudaDevice, x: &[f32], hc: usize, d: usize) -> Result<Self> {
+        if hc == 0 || hc > 8 || d == 0 || x.len() % (hc * d) != 0 {
+            return Err(Error(format!(
+                "hc stream: {} values for {hc} x {d}",
+                x.len()
+            )));
+        }
+        let xd = dev
+            .stream()
+            .clone_htod(x)
+            .map_err(|e| alloc_err("hc stream upload", e))?;
+        Ok(Self {
+            x: xd,
+            n: x.len() / (hc * d),
+            hc,
+            d,
+        })
+    }
+
+    /// The pre, post and comb coefficients of every token from the stream, as `[n, hc]`, `[n, hc]`
+    /// and `[n, hc, hc]`. `func` is the projection [mix_hc, hc * d].
+    pub fn mixes(
+        &self,
+        dev: &CudaDevice,
+        func: &[f32],
+        scale: &[f32],
+        base: &[f32],
+        iters: usize,
+        norm_eps: f32,
+        hc_eps: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let (n, hc, flat) = (self.n, self.hc, self.hc * self.d);
+        let mix_hc = (2 + hc) * hc;
+        if func.len() != mix_hc * flat || scale.len() != 3 || base.len() != mix_hc {
+            return Err(Error(format!(
+                "hc mixes: {} projection values, {} scales, {} biases",
+                func.len(),
+                scale.len(),
+                base.len()
+            )));
+        }
+        let stream = dev.stream();
+        let up = |e| alloc_err("hc mixes upload", e);
+        let (fd, sd, bd) = (
+            stream.clone_htod(func).map_err(up)?,
+            stream.clone_htod(scale).map_err(up)?,
+            stream.clone_htod(base).map_err(up)?,
+        );
+        let pre = stream.alloc_zeros::<f32>(n * hc).map_err(up)?;
+        let post = stream.alloc_zeros::<f32>(n * hc).map_err(up)?;
+        let comb = stream.alloc_zeros::<f32>(n * hc * hc).map_err(up)?;
+        let func_k = dev.quantized_fn("hc_mixes_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (flat_i, hc_i, mix_i, it_i) = (flat as i64, hc as i32, mix_hc as i32, iters as i32);
+        let mut b = stream.launch_builder(&func_k);
+        b.arg(&self.x);
+        b.arg(&fd);
+        b.arg(&sd);
+        b.arg(&bd);
+        b.arg(&pre);
+        b.arg(&post);
+        b.arg(&comb);
+        b.arg(&flat_i);
+        b.arg(&hc_i);
+        b.arg(&mix_i);
+        b.arg(&it_i);
+        b.arg(&norm_eps);
+        b.arg(&hc_eps);
+        unsafe { b.launch(cfg) }.map_err(|e| Error(format!("hc_mixes_f32 launch: {e}")))?;
+        let down = |s: &CudaSlice<f32>| {
+            stream
+                .clone_dtoh(s)
+                .map_err(|e| Error(format!("hc mixes download: {e}")))
+        };
+        Ok((down(&pre)?, down(&post)?, down(&comb)?))
+    }
+
+    /// The stream collapsed by `pre` [n, hc] and RMS-normalised by `w` [d]: the sublayer's input,
+    /// `[n, d]`.
+    pub fn pre_norm(&self, dev: &CudaDevice, pre: &[f32], w: &[f32], eps: f32) -> Result<Vec<f32>> {
+        let (n, hc, d) = (self.n, self.hc, self.d);
+        if pre.len() != n * hc || w.len() != d {
+            return Err(Error(format!(
+                "hc pre: {} weights for {n} x {hc}, {} norm values for {d}",
+                pre.len(),
+                w.len()
+            )));
+        }
+        let stream = dev.stream();
+        let up = |e| alloc_err("hc pre upload", e);
+        let (pd, wd) = (
+            stream.clone_htod(pre).map_err(up)?,
+            stream.clone_htod(w).map_err(up)?,
+        );
+        let out = with_oom_retry(dev, "hc pre", || unsafe { stream.alloc::<f32>(n * d) })?;
+        let func = dev.quantized_fn("hc_pre_norm_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (d * 4) as u32,
+        };
+        let (d_i, hc_i) = (d as i64, hc as i32);
+        let mut b = stream.launch_builder(&func);
+        b.arg(&self.x);
+        b.arg(&pd);
+        b.arg(&wd);
+        b.arg(&out);
+        b.arg(&d_i);
+        b.arg(&hc_i);
+        b.arg(&eps);
+        unsafe { b.launch(cfg) }.map_err(|e| Error(format!("hc_pre_norm_f32 launch: {e}")))?;
+        stream
+            .clone_dtoh(&out)
+            .map_err(|e| Error(format!("hc pre download: {e}")))
+    }
+
+    /// Rewrite the stream with the sublayer's output `xo` [n, d] and the coefficients `post`
+    /// [n, hc], `comb` [n, hc, hc].
+    pub fn post(&mut self, dev: &CudaDevice, xo: &[f32], post: &[f32], comb: &[f32]) -> Result<()> {
+        let (n, hc, d) = (self.n, self.hc, self.d);
+        if xo.len() != n * d || post.len() != n * hc || comb.len() != n * hc * hc {
+            return Err(Error(format!(
+                "hc post: {} outputs, {} post, {} comb for {n} x {hc} x {d}",
+                xo.len(),
+                post.len(),
+                comb.len()
+            )));
+        }
+        let stream = dev.stream();
+        let up = |e| alloc_err("hc post upload", e);
+        let (xd, pd, cd) = (
+            stream.clone_htod(xo).map_err(up)?,
+            stream.clone_htod(post).map_err(up)?,
+            stream.clone_htod(comb).map_err(up)?,
+        );
+        let func = dev.quantized_fn("hc_post_f32")?;
+        let total = n * d;
+        let cfg = LaunchConfig {
+            grid_dim: (total.div_ceil(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (total_i, d_i, hc_i) = (total as i64, d as i64, hc as i32);
+        let mut b = stream.launch_builder(&func);
+        b.arg(&xd);
+        b.arg(&self.x);
+        b.arg(&pd);
+        b.arg(&cd);
+        b.arg(&total_i);
+        b.arg(&d_i);
+        b.arg(&hc_i);
+        unsafe { b.launch(cfg) }.map_err(|e| Error(format!("hc_post_f32 launch: {e}")))?;
+        // The inputs above are freed when this returns; the launch is ordered before that.
+        Ok(())
+    }
+
+    /// The stream of tokens `from..from + count`, `[count, hc, d]`.
+    pub fn rows(&self, dev: &CudaDevice, from: usize, count: usize) -> Result<Vec<f32>> {
+        let w = self.hc * self.d;
+        if from + count > self.n {
+            return Err(Error(format!("hc rows: {from} + {count} of {}", self.n)));
+        }
+        let stream = dev.stream();
+        let view = self.x.slice(from * w..(from + count) * w);
+        stream
+            .clone_dtoh(&view)
+            .map_err(|e| Error(format!("hc rows download: {e}")))
+    }
+
+    /// Replace the stream with `x`, the same shape.
+    pub fn replace(&mut self, dev: &CudaDevice, x: &[f32]) -> Result<()> {
+        if x.len() != self.n * self.hc * self.d {
+            return Err(Error(format!("hc replace: {} values", x.len())));
+        }
+        self.x = dev
+            .stream()
+            .clone_htod(x)
+            .map_err(|e| alloc_err("hc stream upload", e))?;
+        Ok(())
+    }
+}
+
 /// Sparse attention with a per-head sink on the device: `q` [s, h, d], `kv` [n, d] one shared head,
 /// `idxs` [s, topk] into `kv`, negative for an empty slot. Returns [s, h, d], each query's softmax
 /// over its keys and its head's sink, applied to those keys.
@@ -2959,6 +3167,98 @@ mod iq2_xxs_gpu_tests {
                 "the order the experts ran in changed the sum"
             );
         }
+    }
+
+    /// The stream's mixes, collapse and update on the card equal the host's, to rounding.
+    #[test]
+    fn gpu_hc_stream_matches_the_cpu() {
+        use crate::inference::model::deepseek_v41::hyper_connections::{hc_mixes, hc_post, hc_pre};
+        use crate::tensor::{Device, Tensor};
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card stream is NOT covered by this run");
+            return;
+        };
+        let (n, hc, d) = (37usize, 4usize, 96usize);
+        let mix_hc = (2 + hc) * hc;
+        let wave = |len: usize, k: f32, amp: f32, off: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * k).sin() * amp + off)
+                .collect()
+        };
+        let x = wave(n * hc * d, 0.173, 1.5, 0.1);
+        let func = wave(mix_hc * hc * d, 0.071, 0.2, 0.0);
+        let scale = [0.7f32, 1.1, 0.9];
+        let base = wave(mix_hc, 0.9, 0.5, 0.0);
+        let (iters, norm_eps, hc_eps) = (20usize, 1e-6f32, 1e-6f32);
+        let xt = Tensor::from_vec(x.clone(), (1, n, hc, d), &Device::Cpu).unwrap();
+        let ft = Tensor::from_vec(func.clone(), (mix_hc, hc * d), &Device::Cpu).unwrap();
+        let want = hc_mixes(&xt, &ft, &scale, &base, hc, iters, norm_eps, hc_eps).unwrap();
+        let mut s = HcStreamDev::open(&dev, &x, hc, d).unwrap();
+        let (pre, post, comb) = s
+            .mixes(&dev, &func, &scale, &base, iters, norm_eps, hc_eps)
+            .unwrap();
+        let close = |a: &[f32], b: &[f32], what: &str| {
+            let worst = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            let range = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert!(
+                worst <= 2e-5 * range.max(1.0),
+                "{what}: worst {worst} of {range}"
+            );
+        };
+        close(&pre, &want.pre.concat(), "pre");
+        close(&post, &want.post.concat(), "post");
+        close(
+            &comb,
+            &want
+                .comb
+                .iter()
+                .flatten()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            "comb",
+        );
+        // The collapse and the update, from the host's own coefficients.
+        let w = wave(d, 0.37, 0.3, 1.0);
+        let wt = Tensor::from_vec(w.clone(), d, &Device::Cpu).unwrap();
+        let collapsed =
+            crate::tensor::ops::rms_norm(&hc_pre(&xt, &want.pre).unwrap(), &wt, 1e-6).unwrap();
+        let got = s.pre_norm(&dev, &want.pre.concat(), &w, 1e-6).unwrap();
+        close(
+            &got,
+            &collapsed.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "collapse",
+        );
+        let xo = wave(n * d, 0.53, 0.8, 0.0);
+        let xot = Tensor::from_vec(xo.clone(), (1, n, d), &Device::Cpu).unwrap();
+        let after = hc_post(&xot, &xt, &want.post, &want.comb, hc).unwrap();
+        s.post(
+            &dev,
+            &xo,
+            &want.post.concat(),
+            &want
+                .comb
+                .iter()
+                .flatten()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        close(
+            &s.rows(&dev, 0, n).unwrap(),
+            &after.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "update",
+        );
+        close(
+            &s.rows(&dev, n - 1, 1).unwrap(),
+            &after.flatten_all().unwrap().to_vec1::<f32>().unwrap()[(n - 1) * hc * d..],
+            "last row",
+        );
     }
 
     /// A rectangular row-major product on the card equals the one on the CPU, to rounding.

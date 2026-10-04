@@ -1161,6 +1161,126 @@ extern "C" __global__ void dequant_q6_k_f32(
     out[idx] = d * (float) sc[l / 16 + 2 * k] * (float) q;
 }
 
+// ---- Hyper-connection steps over a prompt's residual stream x [n, hc, d] ----------------------------
+
+#define HC_MAX 8
+
+// Sum of `v` over the block, valid in thread 0. `scratch` holds one float per warp.
+__device__ static float hc_block_sum(float v, float * scratch) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    __syncthreads();
+    if (lane == 0) scratch[warp] = v;
+    __syncthreads();
+    float total = 0.0f;
+    if (threadIdx.x == 0) {
+        for (int w = 0; w < (int) (blockDim.x + 31) / 32; ++w) total += scratch[w];
+    }
+    return total;
+}
+
+// A token's coefficients: the stream's statistic and the projection of its flattened hc*d values
+// onto `fn` [mix_hc, flat], then the pre and post gates and the Sinkhorn-normalised comb matrix.
+// One block per token; the projection is read as dot products, the rest runs in thread 0.
+extern "C" __global__ void hc_mixes_f32(
+        const float * __restrict__ x, const float * __restrict__ fn,
+        const float * __restrict__ scale, const float * __restrict__ base,
+        float * __restrict__ pre, float * __restrict__ post, float * __restrict__ comb,
+        const long flat, const int hc, const int mix_hc, const int iters,
+        const float norm_eps, const float hc_eps) {
+    __shared__ float scratch[32];
+    __shared__ float mixed[(2 + HC_MAX) * HC_MAX + 1];
+    const long t = blockIdx.x;
+    const float * row = x + t * flat;
+    for (int m = 0; m <= mix_hc; ++m) {
+        const float * w = m < mix_hc ? fn + (long) m * flat : row;
+        float acc = 0.0f;
+        for (long j = threadIdx.x; j < flat; j += blockDim.x) acc += row[j] * w[j];
+        const float total = hc_block_sum(acc, scratch);
+        if (threadIdx.x == 0) mixed[m] = total;
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    const float rsq = 1.0f / sqrtf(mixed[mix_hc] / (float) flat + norm_eps);
+    float cm[HC_MAX][HC_MAX];
+    for (int c = 0; c < hc; ++c) {
+        const float a = mixed[c] * rsq * scale[0] + base[c];
+        pre[t * hc + c] = 1.0f / (1.0f + expf(-a)) + hc_eps;
+        const float b = mixed[hc + c] * rsq * scale[1] + base[hc + c];
+        post[t * hc + c] = 2.0f / (1.0f + expf(-b));
+    }
+    for (int i = 0; i < hc; ++i)
+        for (int j = 0; j < hc; ++j)
+            cm[i][j] = mixed[2 * hc + i * hc + j] * rsq * scale[2] + base[2 * hc + i * hc + j];
+    for (int i = 0; i < hc; ++i) {
+        float mx = cm[i][0];
+        for (int j = 1; j < hc; ++j) mx = fmaxf(mx, cm[i][j]);
+        float den = 0.0f;
+        for (int j = 0; j < hc; ++j) { cm[i][j] = expf(cm[i][j] - mx); den += cm[i][j]; }
+        for (int j = 0; j < hc; ++j) cm[i][j] = cm[i][j] / den + hc_eps;
+    }
+    for (int it = 0; it < (iters > 0 ? iters : 1); ++it) {
+        if (it > 0) {
+            for (int i = 0; i < hc; ++i) {
+                float sum = 0.0f;
+                for (int j = 0; j < hc; ++j) sum += cm[i][j];
+                sum += hc_eps;
+                for (int j = 0; j < hc; ++j) cm[i][j] /= sum;
+            }
+        }
+        for (int j = 0; j < hc; ++j) {
+            float sum = 0.0f;
+            for (int i = 0; i < hc; ++i) sum += cm[i][j];
+            sum += hc_eps;
+            for (int i = 0; i < hc; ++i) cm[i][j] /= sum;
+        }
+    }
+    for (int i = 0; i < hc; ++i)
+        for (int j = 0; j < hc; ++j) comb[t * hc * hc + i * hc + j] = cm[i][j];
+}
+
+// The stream collapsed by `pre` [n, hc] into one row per token and RMS-normalised by `w` [d]:
+// out[t] = rms_norm(sum_c pre[t, c] * x[t, c]) * w. One block per token, the row held in shared memory.
+extern "C" __global__ void hc_pre_norm_f32(
+        const float * __restrict__ x, const float * __restrict__ pre,
+        const float * __restrict__ w, float * __restrict__ out,
+        const long d, const int hc, const float eps) {
+    extern __shared__ float row[];
+    __shared__ float scratch[32];
+    const long t = blockIdx.x;
+    float ss = 0.0f;
+    for (long k = threadIdx.x; k < d; k += blockDim.x) {
+        float v = 0.0f;
+        for (int c = 0; c < hc; ++c) v += pre[t * hc + c] * x[(t * hc + c) * d + k];
+        row[k] = v;
+        ss += v * v;
+    }
+    const float total = hc_block_sum(ss, scratch);
+    __shared__ float rsq;
+    if (threadIdx.x == 0) rsq = 1.0f / sqrtf(total / (float) d + eps);
+    __syncthreads();
+    for (long k = threadIdx.x; k < d; k += blockDim.x) out[t * d + k] = row[k] * rsq * w[k];
+}
+
+// The sublayer's output `xo` [n, d] spread back over the hc copies, the residual mixed in through
+// `comb`, in place: x[t, j] = post[t, j] * xo[t] + sum_i comb[t, i, j] * x[t, i]. One (token, value)
+// per thread, which reads its hc residual values before it writes any of them.
+extern "C" __global__ void hc_post_f32(
+        const float * __restrict__ xo, float * __restrict__ x,
+        const float * __restrict__ post, const float * __restrict__ comb,
+        const long total, const long d, const int hc) {
+    const long i = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
+    if (i >= total) return;
+    const long t = i / d, k = i % d;
+    float res[HC_MAX];
+    for (int c = 0; c < hc; ++c) res[c] = x[(t * hc + c) * d + k];
+    for (int j = 0; j < hc; ++j) {
+        float acc = post[t * hc + j] * xo[i];
+        for (int c = 0; c < hc; ++c) acc += comb[(t * hc + c) * hc + j] * res[c];
+        x[(t * hc + j) * d + k] = acc;
+    }
+}
+
 // Rows of `xin` [n, dim] named by `idx`, one value per thread: an expert's input tokens.
 extern "C" __global__ void gather_rows_f32(
         const float * __restrict__ xin, const unsigned int * __restrict__ idx,

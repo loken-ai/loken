@@ -11,7 +11,7 @@ use crate::tensor::cuda::{
     gpu_expert_into_layer, gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi,
     gpu_expert_tokens, gpu_fp4_linear, gpu_fp8_linear, gpu_index_scores, gpu_layer_begin,
     gpu_layer_sum, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables, CudaDevice, ExpertWeight,
-    LayerBuffers, QUANT_LINEAR_TILE_BYTES,
+    HcStreamDev, LayerBuffers, QUANT_LINEAR_TILE_BYTES,
 };
 use crate::tensor::ops::rms_norm;
 use crate::tensor::ops::softmax_last_dim;
@@ -1210,7 +1210,78 @@ impl Offload for Card {
 /// run on the first card, the fastest.
 pub struct Cards(pub Vec<Arc<Card>>);
 
+/// A prompt's stream on one card (see `HcStream`).
+struct CardHc {
+    card: Arc<Card>,
+    s: HcStreamDev,
+}
+
+impl super::HcStream for CardHc {
+    fn mixes(
+        &mut self,
+        func: &[f32],
+        scale: &[f32],
+        base: &[f32],
+        iters: usize,
+        norm_eps: f32,
+        hc_eps: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let need = (func.len() + 2 * self.s.len()) * F32;
+        let (card, s) = (&self.card, &self.s);
+        card.attempt("the stream's mixes", need, || {
+            s.mixes(&card.dev, func, scale, base, iters, norm_eps, hc_eps)
+        })
+        .unwrap_or_else(|| Err(Error::msg("the card has no room for the stream's mixes")))
+    }
+
+    fn pre_norm(&mut self, pre: &[f32], w: &[f32], eps: f32) -> Result<Vec<f32>> {
+        let need = self.s.len() / 2 * F32;
+        let (card, s) = (&self.card, &self.s);
+        card.attempt("the stream's collapse", need, || {
+            s.pre_norm(&card.dev, pre, w, eps)
+        })
+        .unwrap_or_else(|| Err(Error::msg("the card has no room for the stream's collapse")))
+    }
+
+    fn post(&mut self, xo: &[f32], post: &[f32], comb: &[f32]) -> Result<()> {
+        let need = xo.len() * F32 * 2;
+        let card = self.card.clone();
+        let s = &mut self.s;
+        card.attempt("the stream's update", need, || {
+            s.post(&card.dev, xo, post, comb)
+        })
+        .unwrap_or_else(|| Err(Error::msg("the card has no room for the stream's update")))
+    }
+
+    fn rows(&mut self, from: usize, count: usize) -> Result<Vec<f32>> {
+        self.s.rows(&self.card.dev, from, count)
+    }
+
+    fn replace(&mut self, x: &[f32]) -> Result<()> {
+        let card = self.card.clone();
+        self.s.replace(&card.dev, x)
+    }
+}
+
 impl Offload for Cards {
+    /// On the card with the most free memory now, the others being left to the experts.
+    fn hc_stream(&self, x: &[f32], hc: usize, d: usize) -> Option<Box<dyn super::HcStream>> {
+        let mut order: Vec<&Arc<Card>> = self.0.iter().collect();
+        order.sort_by_key(|c| std::cmp::Reverse(c.free_now().unwrap_or(0)));
+        for card in order {
+            let opened = card.attempt("a prompt's residual stream", x.len() * 2 * F32, || {
+                HcStreamDev::open(&card.dev, x, hc, d)
+            });
+            if let Some(Ok(s)) = opened {
+                return Some(Box::new(CardHc {
+                    card: card.clone(),
+                    s,
+                }));
+            }
+        }
+        None
+    }
+
     fn projection(&self, p: &Projection, xs: &[f32]) -> Option<Result<Vec<f32>>> {
         self.0.iter().find_map(|c| c.projection(p, xs))
     }

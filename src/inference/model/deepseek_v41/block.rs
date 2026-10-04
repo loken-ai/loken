@@ -182,6 +182,74 @@ impl Block {
         Ok((x, am.pre))
     }
 
+    /// One layer of a prefill whose residual stream is held by `ds` (a card): both halves, with the
+    /// stream's mixes, collapse and update done there and only each sublayer's input and output
+    /// crossing. `pre_mix` is the collapse weights from the layer above; returns the ones this
+    /// layer hands to the next.
+    pub fn forward_prefill_dev(
+        &self,
+        ds: &mut dyn crate::inference::offload::HcStream,
+        pre_mix: &[Vec<f32>],
+        cos: &Tensor,
+        sin: &Tensor,
+        shared: &mut SharedAttn,
+        cache: Option<&mut AttnCache>,
+    ) -> Result<Vec<Vec<f32>>> {
+        use crate::inference::offload::stage;
+        let hc = self.hc_mult;
+        let n = pre_mix.len();
+        let d = self.attn_norm.elem_count();
+        let flat = |rows: &[Vec<f32>]| -> Vec<f32> { rows.iter().flatten().copied().collect() };
+        let comb_flat =
+            |c: &[Vec<Vec<f32>>]| -> Vec<f32> { c.iter().flatten().flatten().copied().collect() };
+        let mixes =
+            |ds: &mut dyn crate::inference::offload::HcStream, w: &HcWeights| -> Result<HcMixes> {
+                let func = super::hyper_connections::dense_f32(&w.func)?;
+                let (pre, post, comb) = ds.mixes(
+                    &func,
+                    &w.scale.flatten_all()?.to_vec1::<f32>()?,
+                    &w.base.flatten_all()?.to_vec1::<f32>()?,
+                    self.hc_sinkhorn_iters,
+                    self.norm_eps,
+                    self.hc_eps,
+                )?;
+                Ok(HcMixes {
+                    pre: pre.chunks(hc).map(<[f32]>::to_vec).collect(),
+                    post: post.chunks(hc).map(<[f32]>::to_vec).collect(),
+                    comb: comb
+                        .chunks(hc * hc)
+                        .map(|t| t.chunks(hc).map(<[f32]>::to_vec).collect())
+                        .collect(),
+                })
+            };
+        let input = |ds: &mut dyn crate::inference::offload::HcStream,
+                     pre: &[Vec<f32>],
+                     norm: &Tensor|
+         -> Result<Tensor> {
+            let w = norm.flatten_all()?.to_vec1::<f32>()?;
+            let xin = ds.pre_norm(&flat(pre), &w, self.norm_eps)?;
+            Tensor::from_vec(xin, (1, n, d), &crate::tensor::Device::Cpu)
+        };
+        let am = stage("hc mixes", || mixes(ds, &self.hc_attn))?;
+        let xin = stage("hc pre and norm", || input(ds, pre_mix, &self.attn_norm))?;
+        let xattn = stage("attention", || {
+            self.attn
+                .forward_prefill_cached(&xin, cos, sin, shared, cache)
+        })?;
+        stage("hc post", || {
+            let xo = super::hyper_connections::dense_f32(&xattn)?;
+            ds.post(&xo, &flat(&am.post), &comb_flat(&am.comb))
+        })?;
+        let fm = stage("hc mixes", || mixes(ds, &self.hc_ffn))?;
+        let xin = stage("hc pre and norm", || input(ds, &am.pre, &self.ffn_norm))?;
+        let xffn = stage("moe", || self.moe.forward(&xin))?;
+        stage("hc post", || {
+            let xo = super::hyper_connections::dense_f32(&xffn)?;
+            ds.post(&xo, &flat(&fm.post), &comb_flat(&fm.comb))
+        })?;
+        Ok(fm.pre)
+    }
+
     /// The FFN half of `forward_prefill`, over `x` [b, s, hc, d] and the pre-mix attention produced.
     /// Every step is per token, so the streams of several prefills run as one when concatenated
     /// along the sequence.

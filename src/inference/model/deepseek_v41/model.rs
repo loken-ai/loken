@@ -549,6 +549,16 @@ impl DeepseekV41Model {
             }
         }
         let mut prefill = self.prefill_begin_at(tokens, base)?;
+        // The residual stream goes to a card for the whole prompt when one has room: the
+        // hyper-connection steps run there and only each sublayer's input and output cross.
+        let mut held: Option<Box<dyn crate::inference::offload::HcStream>> =
+            match crate::inference::offload::current() {
+                Some(off) => {
+                    let x = prefill.x.flatten_all()?.to_vec1::<f32>()?;
+                    off.hc_stream(&x, self.hc_mult, self.dim)
+                }
+                None => None,
+            };
         for (i, block) in self.blocks.iter().enumerate() {
             let Some(block) = block.as_ref() else {
                 continue;
@@ -562,12 +572,24 @@ impl DeepseekV41Model {
             let layer_started = std::time::Instant::now();
             if let (Some(engram), Some(ecfg)) = (&self.engrams[i], &self.engram_cfg) {
                 let which = ecfg.layer_ids.iter().position(|&l| l == i).unwrap_or(0);
+                // The engram rewrites the whole stream on the host.
+                if let Some(ds) = held.as_mut() {
+                    let s = tokens.len();
+                    prefill.x = Tensor::from_vec(
+                        ds.rows(0, s)?,
+                        (1, s, self.hc_mult, self.dim),
+                        &Device::Cpu,
+                    )?;
+                }
                 prefill.x = crate::inference::offload::stage("engram", || {
                     engram.forward(
                         &prefill.x,
                         &prefill_hashes_from(ecfg, which, tokens, engram_start.clone()),
                     )
                 })?;
+                if let Some(ds) = held.as_mut() {
+                    ds.replace(&prefill.x.flatten_all()?.to_vec1::<f32>()?)?;
+                }
             }
             let rope = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
                 0
@@ -575,21 +597,38 @@ impl DeepseekV41Model {
                 1
             };
             let (cos, sin) = (&prefill.ropes[rope].0, &prefill.ropes[rope].1);
-            let (mid, mix) = block.forward_prefill_attn(
-                &prefill.x,
-                &prefill.pre_mix,
-                cos,
-                sin,
-                &mut prefill.shared,
-                Some(&mut state.layers[i]),
-            )?;
-            let (nx, npm) = block.forward_prefill_ffn(&mid, &mix)?;
+            if let Some(ds) = held.as_mut() {
+                prefill.pre_mix = block.forward_prefill_dev(
+                    ds.as_mut(),
+                    &prefill.pre_mix,
+                    cos,
+                    sin,
+                    &mut prefill.shared,
+                    Some(&mut state.layers[i]),
+                )?;
+            } else {
+                let (mid, mix) = block.forward_prefill_attn(
+                    &prefill.x,
+                    &prefill.pre_mix,
+                    cos,
+                    sin,
+                    &mut prefill.shared,
+                    Some(&mut state.layers[i]),
+                )?;
+                let (nx, npm) = block.forward_prefill_ffn(&mid, &mix)?;
+                prefill.x = nx;
+                prefill.pre_mix = npm;
+            }
             if let Some(off) = crate::inference::offload::current() {
                 off.record("prefill layer", layer_started.elapsed().as_nanos() as u64);
             }
-            prefill.x = nx;
-            prefill.pre_mix = npm;
             prefill.next += 1;
+        }
+        // The head reads the last token's stream.
+        if let Some(ds) = held.as_mut() {
+            let s = tokens.len();
+            let last = ds.rows(s - 1, 1)?;
+            prefill.x = Tensor::from_vec(last, (1, 1, self.hc_mult, self.dim), &Device::Cpu)?;
         }
         // Once more over every layer now that every read has landed: the read-ahead a layer's
         // sweep could not see was still in flight when it ran.
@@ -601,7 +640,10 @@ impl DeepseekV41Model {
         }
         state.pos = base + tokens.len();
         let s = tokens.len();
-        let last = prefill.x.narrow(1, s - 1, 1)?.contiguous()?;
+        let last = prefill
+            .x
+            .narrow(1, prefill.x.dim(1)? - 1, 1)?
+            .contiguous()?;
         let h = hc_pre(&last, &prefill.pre_mix[s - 1..])?;
         let h = rms_norm(&h, &self.norm, self.rms_eps)?;
         let logits = self.output.apply(&h.reshape((1, self.dim))?)?;
@@ -4287,6 +4329,76 @@ mod oracle_gate {
                     "{ratios:?}: decode after the card prefill rel {}",
                     rel(&b, &a)
                 );
+            }
+        }
+    }
+
+    /// With the residual stream held on a card for the whole prompt - its mixes, collapse and
+    /// update done there - a batched prefill, and a continuation of a state, give the logits and
+    /// the decode state the CPU gives, on both layouts and at splits inside and past the window.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_prefill_with_the_stream_on_a_card_matches_the_cpu() {
+        use crate::inference::offload::cuda::{Card, Cards};
+        use crate::inference::offload::{room, with_offload};
+        let Ok(dev) = crate::tensor::cuda::CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card stream is NOT covered by this run");
+            return;
+        };
+        let (_, total) = crate::tensor::cuda_ext::mem_get_info(&Device::Cuda(dev.clone())).unwrap();
+        let room = room::open(dev.ordinal(), total, 0);
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+            (num / b.iter().map(|y| y * y).sum::<f32>()).sqrt()
+        };
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        let cards: std::sync::Arc<dyn crate::inference::offload::Offload> =
+            std::sync::Arc::new(Cards(vec![std::sync::Arc::new(Card::new(dev, room, 1))]));
+        let layouts: [(&[u32], &[u32], &[u32]); 2] =
+            [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
+        for (ratios, kv_src, index_src) in layouts {
+            let (model, _) = synthetic(ratios, kv_src, index_src, 0);
+            let tokens: Vec<u32> = (0..80)
+                .map(|i| (i * 7 + 3) % super::tests::VOCAB as u32)
+                .collect();
+            for split in [5usize, 33, 64] {
+                // The CPU: a prefix, then the rest onto it.
+                let mut cpu = model.new_decode_state();
+                model.prefill_into(&tokens[..split], &mut cpu).unwrap();
+                let want = vecf_of(&model.prefill_continue(&tokens[split..], &mut cpu).unwrap());
+                // The card holding the stream: the same two passes.
+                let mut dev_state = model.new_decode_state();
+                let got = with_offload(cards.clone(), || {
+                    model
+                        .prefill_into(&tokens[..split], &mut dev_state)
+                        .unwrap();
+                    vecf_of(
+                        &model
+                            .prefill_continue(&tokens[split..], &mut dev_state)
+                            .unwrap(),
+                    )
+                });
+                assert!(
+                    rel(&got, &want) < 1e-4,
+                    "{ratios:?} split {split}: rel {}",
+                    rel(&got, &want)
+                );
+                assert_eq!(argmax(&got), argmax(&want), "{ratios:?} split {split}");
+                for t in [3u32, 9] {
+                    let a = vecf_of(&model.forward_decode(t, &mut cpu).unwrap());
+                    let b = vecf_of(&model.forward_decode(t, &mut dev_state).unwrap());
+                    assert!(
+                        rel(&b, &a) < 1e-3,
+                        "{ratios:?} split {split}: decode rel {}",
+                        rel(&b, &a)
+                    );
+                }
             }
         }
     }

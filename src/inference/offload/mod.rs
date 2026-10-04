@@ -98,7 +98,38 @@ pub struct AttnBlock<'a> {
     pub scale: f32,
 }
 
+/// A prompt's residual stream kept on a card for the whole prompt, with the hyper-connection steps
+/// that read and rewrite it. Only the sublayers' inputs and outputs, and a few values per token,
+/// cross to the host.
+pub trait HcStream: Send {
+    /// The pre, post and comb coefficients of every token from the stream, `[n, hc]`, `[n, hc]`,
+    /// `[n, hc, hc]`; `func` is the projection [(2 + hc) * hc, hc * d].
+    fn mixes(
+        &mut self,
+        func: &[f32],
+        scale: &[f32],
+        base: &[f32],
+        iters: usize,
+        norm_eps: f32,
+        hc_eps: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)>;
+    /// The stream collapsed by `pre` [n, hc] and RMS-normalised by `w` [d]: `[n, d]`.
+    fn pre_norm(&mut self, pre: &[f32], w: &[f32], eps: f32) -> Result<Vec<f32>>;
+    /// Rewrite the stream with a sublayer's output `xo` [n, d] and its `post` and `comb`.
+    fn post(&mut self, xo: &[f32], post: &[f32], comb: &[f32]) -> Result<()>;
+    /// Tokens `from..from + count` of the stream, `[count, hc, d]`.
+    fn rows(&mut self, from: usize, count: usize) -> Result<Vec<f32>>;
+    /// Replace the whole stream, the same shape.
+    fn replace(&mut self, x: &[f32]) -> Result<()>;
+}
+
 pub trait Offload: Send + Sync {
+    /// Hold `x` [n, hc, d] on a card, the one with the most room, for a prompt's hyper-connection
+    /// steps. `None` when no card has room or the offload keeps no stream.
+    fn hc_stream(&self, _x: &[f32], _hc: usize, _d: usize) -> Option<Box<dyn HcStream>> {
+        None
+    }
+
     /// `p` applied to `xs` rows, row-major; `None` to run it here.
     fn projection(&self, p: &Projection, xs: &[f32]) -> Option<Result<Vec<f32>>>;
 

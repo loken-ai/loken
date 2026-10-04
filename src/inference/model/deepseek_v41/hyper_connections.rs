@@ -13,7 +13,7 @@ use crate::tensor::{Device, Result, Tensor};
 
 /// The elements of a CPU f32 tensor in row-major order: borrowed when the tensor owns exactly
 /// them, copied otherwise.
-fn dense_f32(t: &Tensor) -> Result<std::borrow::Cow<'_, [f32]>> {
+pub(super) fn dense_f32(t: &Tensor) -> Result<std::borrow::Cow<'_, [f32]>> {
     if t.is_contiguous() {
         if let Ok(v) = t.cpu_f32_data() {
             if v.len() == t.elem_count() {
