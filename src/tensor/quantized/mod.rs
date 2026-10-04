@@ -50,7 +50,7 @@ pub(crate) fn dry_blob_room(
     Some(crate::tensor::dry::DryStorage::new(
         led.clone(),
         crate::tensor::DType::U8,
-        qt.data().len() + BLOB_TAIL_PAD_BYTES,
+        qt.byte_len() + BLOB_TAIL_PAD_BYTES,
     ))
 }
 

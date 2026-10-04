@@ -180,7 +180,7 @@ impl QVarBuilder {
         self.inner
             .tensors
             .values()
-            .map(|t| t.data().len() as u64)
+            .map(|t| t.byte_len() as u64)
             .sum()
     }
 

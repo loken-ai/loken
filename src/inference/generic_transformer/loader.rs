@@ -591,12 +591,15 @@ fn build_generic_layer(
                 dtype,
             )?;
             drop(buf);
-            crate::tensor::conversion::record_copy(
-                "projection",
-                dtype.gguf_name(),
-                total as u64,
-                "q, k and v fused into one weight, one GEMV per token",
-            );
+            // A card holds the fused blocks alone; only a host layer keeps an owned copy.
+            if !on_gpu {
+                crate::tensor::conversion::record_copy(
+                    "projection",
+                    dtype.gguf_name(),
+                    total as u64,
+                    "q, k and v fused into one weight, one GEMV per token",
+                );
+            }
             let fused_shape = crate::tensor::Shape::from((q_out + k_out + v_out, hidden));
             let fused_qt = QTensor::new(fused_storage, fused_shape)?;
             tracing::debug!(
@@ -736,12 +739,15 @@ fn build_generic_layer(
                     dtype,
                 )?;
                 drop(buf); // safe: from_data already copied to GPU
-                crate::tensor::conversion::record_copy(
-                    "projection",
-                    dtype.gguf_name(),
-                    total as u64,
-                    "gate and up fused into one weight, one GEMV per token",
-                );
+                           // A card holds the fused blocks alone; only a host layer keeps an owned copy.
+                if !on_gpu {
+                    crate::tensor::conversion::record_copy(
+                        "projection",
+                        dtype.gguf_name(),
+                        total as u64,
+                        "gate and up fused into one weight, one GEMV per token",
+                    );
+                }
                 let fused_shape = crate::tensor::Shape::from((2 * inter, hidden));
                 let fused_qt = QTensor::new(fused_storage, fused_shape)?;
                 tracing::debug!(

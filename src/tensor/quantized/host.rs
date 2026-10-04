@@ -52,6 +52,12 @@ impl AlignedBytes {
 /// stack), re-hosted from `tensor/quant_view.rs`.
 pub enum QHostStorage {
     Owned(AlignedBytes),
+    /// The blocks live on a card and nowhere else: this handle keeps the dtype, the shape and
+    /// the identity of the weight and no bytes. Reading them is a download, done by the
+    /// device-side owner ([`QTensor`], [`QKernelMatMul`]).
+    OnCard {
+        len: usize,
+    },
     View {
         _owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
         ptr: *const u8,
@@ -68,6 +74,7 @@ impl Clone for QHostStorage {
     fn clone(&self) -> Self {
         match self {
             Self::Owned(b) => Self::Owned(b.clone()),
+            Self::OnCard { len } => Self::OnCard { len: *len },
             Self::View { _owner, ptr, len } => Self::View {
                 _owner: _owner.clone(),
                 ptr: *ptr,
@@ -104,11 +111,12 @@ impl std::fmt::Debug for QHostTensor {
         f.debug_struct("QHostTensor")
             .field("dtype", &self.dtype)
             .field("dims", &self.dims)
-            .field("bytes", &self.data().len())
+            .field("bytes", &self.byte_len())
             .field(
                 "storage",
                 &match self.storage {
                     QHostStorage::Owned(_) => "owned",
+                    QHostStorage::OnCard { .. } => "on card",
                     QHostStorage::View { .. } => "view",
                 },
             )
@@ -179,9 +187,39 @@ impl QHostTensor {
         })
     }
 
-    /// Raw GGML block bytes.
+    /// Bytes of block data, wherever they live.
+    pub fn byte_len(&self) -> usize {
+        match &self.storage {
+            QHostStorage::Owned(b) => b.as_slice().len(),
+            QHostStorage::OnCard { len } | QHostStorage::View { len, .. } => *len,
+        }
+    }
+
+    /// Whether the blocks exist only on a card.
+    pub fn is_card_only(&self) -> bool {
+        matches!(self.storage, QHostStorage::OnCard { .. })
+    }
+
+    /// The same weight with its host bytes let go: dtype, shape and identity kept, the blocks
+    /// known to live on a card. The bytes are freed once every other holder of them drops.
+    pub(crate) fn card_only(&self) -> Self {
+        Self {
+            storage: QHostStorage::OnCard {
+                len: self.byte_len(),
+            },
+            dtype: self.dtype,
+            dims: self.dims.clone(),
+            id: self.id,
+        }
+    }
+
+    /// Raw GGML block bytes. Panics on a card-only weight: a caller that can meet one reads
+    /// through [`QTensor::data`], which downloads.
     pub fn data(&self) -> &[u8] {
         match &self.storage {
+            QHostStorage::OnCard { .. } => {
+                panic!("the blocks of this weight live on a card only; read them through QTensor::data")
+            }
             QHostStorage::Owned(b) => b.as_slice(),
             QHostStorage::View { ptr, len, .. } => unsafe {
                 std::slice::from_raw_parts(*ptr, *len)
@@ -197,6 +235,11 @@ impl QHostTensor {
     /// Routed through the lifted k_quants engine (`quant_cpu`) - bit-exact
     /// with the fork for every supported dtype, incl. MxFp4 and the K-quants.
     pub fn dequantize_f32(&self) -> Result<Vec<f32>> {
+        if self.is_card_only() {
+            return Err(Error(
+                "dequantize_f32: the blocks live on a card only".into(),
+            ));
+        }
         let n = self.elem_count();
         let mut out = vec![0f32; n];
         crate::tensor::quant_cpu::to_float_bytes(self.dtype, self.data(), &mut out)?;

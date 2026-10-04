@@ -320,6 +320,29 @@ impl QKernelMatMul {
     }
 
     /// `x`: [.., k] on the same device -> [.., n].
+    /// The weight as a flat host `[n * k]` F32 vector: decoded from the host blocks, or from
+    /// the card's copy when the card holds the only one.
+    fn host_f32(&self) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        if self.host.is_card_only() {
+            let blob = self
+                .blob
+                .as_ref()
+                .ok_or_else(|| Error("a card-only weight has no blob".into()))?;
+            let crate::tensor::Device::Cuda(dev) = &self.device else {
+                return Err(Error("a card-only weight is not on a card".into()));
+            };
+            let bytes = dev
+                .stream()
+                .clone_dtoh(&blob.slice(0..self.host.byte_len()))
+                .map_err(|e| Error(format!("QKernelMatMul download: {e}")))?;
+            let mut out = vec![0f32; self.n * self.k];
+            crate::tensor::quant_cpu::to_float_bytes(self.dtype, &bytes, &mut out)?;
+            return Ok(out);
+        }
+        self.host.dequantize_f32()
+    }
+
     /// Force an exact F32 matmul: dequantize the weight per call and accumulate in F32. The
     /// quantized MMQ/MMVQ path quantizes the activation and can overflow fp16 at very large
     /// activation magnitudes; the Qwen-Image DiT legitimately produces those (AdaLN scale ~477),
@@ -332,7 +355,7 @@ impl QKernelMatMul {
         let wt = if x.device().is_dry() {
             crate::tensor::Tensor::dry(&x.device(), crate::tensor::DType::F32, (self.n, self.k))?
         } else {
-            let w = self.host.dequantize_f32()?; // flat [n.k], weight rows [n, k]
+            let w = self.host_f32()?; // flat [n.k], weight rows [n, k]
             crate::tensor::Tensor::from_vec_f32(w, (self.n, self.k))?.to_device(&x.device())?
         };
         let x32 = x.to_dtype(crate::tensor::DType::F32)?;
@@ -1120,7 +1143,7 @@ impl QKernelMatMul {
         let w = match self.dequant.get() {
             Some(w) => w.clone(),
             None => {
-                let wf = self.host.dequantize_f32()?;
+                let wf = self.host_f32()?;
                 let wt = crate::tensor::Tensor::from_vec_f32(wf, vec![self.n, self.k])?
                     .transpose(0, 1)? // [k, n] so x @ w works row-major
                     .to_device(&self.device)?;

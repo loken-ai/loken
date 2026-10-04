@@ -1214,3 +1214,93 @@ fn what_a_gguf_load_and_one_forward_would_cost_a_card() {
         }
     }
 }
+
+/// A weight built from bytes the loader owns is not kept on the host once the card holds it.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a CUDA device; run in a lock window"]
+fn a_weight_built_on_a_card_holds_no_host_bytes() {
+    let dev = Device::new_cuda(0).expect("a card");
+    let (rows, cols) = (64usize, 512usize);
+    let vals: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+        .collect();
+    let t = Tensor::from_vec(vals, (rows, cols), &Device::Cpu).unwrap();
+    for dtype in [
+        GgmlDType::Q4K,
+        GgmlDType::Q8_0,
+        GgmlDType::Q6K,
+        GgmlDType::Q5_0,
+    ] {
+        let on_host = QTensor::quantize_onto(&t, dtype, &Device::Cpu).unwrap();
+        let on_card = QTensor::quantize_onto(&t, dtype, &dev).unwrap();
+        assert!(
+            on_card.native_qtensor().is_card_only(),
+            "{dtype:?} keeps its host bytes"
+        );
+        assert_eq!(
+            *on_card.data().unwrap(),
+            *on_host.data().unwrap(),
+            "{dtype:?} download"
+        );
+        let a = on_host
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let b = on_card
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert_eq!(a, b, "{dtype:?} dequantize");
+        let back = on_card.to_device(&Device::Cpu).unwrap();
+        assert_eq!(
+            *back.data().unwrap(),
+            *on_host.data().unwrap(),
+            "{dtype:?} to host"
+        );
+        let again = on_card.to_device(&dev).unwrap();
+        assert_eq!(
+            *again.data().unwrap(),
+            *on_host.data().unwrap(),
+            "{dtype:?} same card"
+        );
+        let x = Tensor::from_vec(vec![0.5f32; cols], (1usize, cols), &Device::Cpu).unwrap();
+        let want = QMatMul::from_qtensor(on_host)
+            .unwrap()
+            .forward(&x)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        let got = QMatMul::from_qtensor(on_card)
+            .unwrap()
+            .forward(&x.to_device(&dev).unwrap())
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        for (w, g) in want[0].iter().zip(&got[0]) {
+            assert!(
+                (w - g).abs() <= 0.02 * w.abs().max(1.0),
+                "{dtype:?} matmul {w} vs {g}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_card_only_handle_keeps_identity_and_refuses_a_host_read() {
+    let t = Tensor::from_vec(vec![1.0f32; 64], (2usize, 32usize), &Device::Cpu).unwrap();
+    let q = QTensor::quantize_onto(&t, GgmlDType::Q8_0, &Device::Cpu).unwrap();
+    let native = q.native_qtensor();
+    let shell = native.card_only();
+    assert!(shell.is_card_only() && !native.is_card_only());
+    assert_eq!(
+        (shell.id, shell.dtype, shell.byte_len()),
+        (native.id, native.dtype, native.byte_len())
+    );
+    assert!(shell.dequantize_f32().is_err());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shell.data().len())).is_err());
+}

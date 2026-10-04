@@ -46,6 +46,17 @@ impl QTensor {
             _ => QStorage::Cpu,
         };
         let dry = dry_blob_room(&inner, device);
+        // Bytes this tensor owns, now on the card, are let go: nothing on a card placement
+        // reads the host copy, and the mapping of a file (a view) costs only page cache.
+        // The shell keeps the weight's identity; a download serves the rare host reader.
+        #[cfg(feature = "cuda")]
+        let inner = if matches!(storage, QStorage::Cuda(_))
+            && matches!(inner.storage, super::host::QHostStorage::Owned(_))
+        {
+            Arc::new(inner.card_only())
+        } else {
+            inner
+        };
         Ok(Self {
             shape: Shape::from(inner.dims.clone()),
             inner,
@@ -74,13 +85,49 @@ impl QTensor {
     /// Same device in, same tensor out (a fresh handle over the same host blocks), so
     /// callers can ask unconditionally.
     pub fn to_device(&self, device: &Device) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if self.inner.is_card_only() {
+            if let (QStorage::Cuda(c), true) = (&self.storage, self.device.same_device(device)) {
+                return Ok(Self {
+                    inner: self.inner.clone(),
+                    shape: self.shape.clone(),
+                    device: self.device.clone(),
+                    storage: QStorage::Cuda(c.share()),
+                    qmm: std::sync::OnceLock::new(),
+                    dry: None,
+                });
+            }
+            let bytes = self.host_blocks()?;
+            let host = QHostTensor::from_bytes(&bytes, self.inner.dtype, self.inner.dims.clone())?;
+            return Self::from_native(Arc::new(host), device);
+        }
         Self::from_native(self.inner.clone(), device)
+    }
+
+    /// The block bytes on the host: borrowed when the host holds them, downloaded from the
+    /// card when the card holds the only copy.
+    fn host_blocks(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
+        #[cfg(feature = "cuda")]
+        if self.inner.is_card_only() {
+            return match &self.storage {
+                QStorage::Cuda(c) => Ok(std::borrow::Cow::Owned(c.download()?)),
+                _ => Err(Error::msg("a card-only weight has no card storage")),
+            };
+        }
+        Ok(std::borrow::Cow::Borrowed(self.inner.data()))
     }
 
     /// legacy-shaped: build from a `QStorage::from_data` result.
     pub fn new(storage: QStorageWithHost, shape: Shape) -> Result<Self> {
         let inner = QHostTensor::from_bytes(&storage.host, storage.dtype, shape.dims().to_vec())?;
         let dry = dry_blob_room(&inner, &storage.device);
+        // The card holds the blocks `from_data` uploaded; the host copy is let go.
+        #[cfg(feature = "cuda")]
+        let inner = if matches!(storage.storage, QStorage::Cuda(_)) {
+            inner.card_only()
+        } else {
+            inner
+        };
         Ok(Self {
             shape,
             inner: Arc::new(inner),
@@ -152,7 +199,7 @@ impl QTensor {
     /// Host block bytes (always available: the native QTensor keeps the
     /// host copy that built the device blob).
     pub fn data(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
-        Ok(std::borrow::Cow::Borrowed(self.inner.data()))
+        self.host_blocks()
     }
 
     /// Dequantize to a dense tensor on `device`. Mirrors the fork: F16
@@ -164,7 +211,17 @@ impl QTensor {
         if device.is_dry() {
             return Tensor::dry(device, crate::tensor::DType::F32, self.shape.clone());
         }
-        let f = self.inner.dequantize_f32()?;
+        let f = if self.inner.is_card_only() {
+            let mut out = vec![0f32; self.inner.elem_count()];
+            crate::tensor::quant_cpu::to_float_bytes(
+                self.inner.dtype,
+                &self.host_blocks()?,
+                &mut out,
+            )?;
+            out
+        } else {
+            self.inner.dequantize_f32()?
+        };
         let t = Tensor::from_vec(f, self.shape.clone(), &tensor::Device::Cpu)?;
         let t = match (self.dtype(), device) {
             (GgmlDType::F16, tensor::Device::Cpu) => t.to_dtype(crate::tensor::DType::F16)?,

@@ -136,7 +136,7 @@ const CONVERSION_DEBT: &[(&str, usize)] = &[
     ("tensor/quant_cpu/drivers.rs", 37),
     ("tensor/quant_cpu/mod.rs", 1),
     ("tensor/quant_cpu/repack_q8_0_x8.rs", 3),
-    ("tensor/quantized/kernel_matmul.rs", 45),
+    ("tensor/quantized/kernel_matmul.rs", 44),
     ("tensor/quantized/kernel_matmul/repack.rs", 10),
     ("tensor/quantized/matmul.rs", 2),
     ("tensor/quantized/qtensor.rs", 3),

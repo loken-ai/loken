@@ -81,6 +81,25 @@ impl QCudaStorage {
         self.dtype
     }
 
+    /// A second handle over the same blob.
+    pub(crate) fn share(&self) -> Self {
+        Self {
+            blob: self.blob.clone(),
+            len: self.len,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        }
+    }
+
+    /// The unpadded block bytes, downloaded.
+    pub(crate) fn download(&self) -> Result<Vec<u8>> {
+        self.device
+            .0
+            .stream()
+            .clone_dtoh(&self.blob.slice(0..self.len))
+            .map_err(|e| Error::msg(format!("QCudaStorage download: {e}")))
+    }
+
     pub fn device(&self) -> &CudaDevice {
         &self.device
     }
