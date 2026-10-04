@@ -7,6 +7,7 @@
 //! spellings for the same thing let three pairs of DIFFERENT types share a name unnoticed.
 
 pub mod blockscaled;
+pub mod conversion;
 mod cpu_storage;
 #[cfg(feature = "cuda")]
 pub mod cuda;

@@ -1040,7 +1040,32 @@ impl LlmEngine {
                                     };
                                     let stem_on_card = stem_fits
                                         && crate::inference::place::dry_plan::same_plan(plan, &first_plan);
+                                    // The ledger of this load: every conversion a loader declares
+                                    // lands in it, and the card growth is compared with what the
+                                    // file and those conversions explain.
+                                    crate::tensor::conversion::open();
+                                    let cards: Vec<usize> = on_plan.keys().copied().collect();
+                                    let free_before: Vec<Option<u64>> = cards
+                                        .iter()
+                                        .map(|&i| crate::inference::place::vram_manager::free_on(i))
+                                        .collect();
                                     let m = generic_weights.build(&on_plan, plan, kv, ctx, stem_on_card)?;
+                                    let grown: Option<u64> = cards
+                                        .iter()
+                                        .zip(&free_before)
+                                        .map(|(&i, before)| {
+                                            let after = crate::inference::place::vram_manager::free_on(i)?;
+                                            Some((*before)?.saturating_sub(after))
+                                        })
+                                        .sum::<Option<u64>>()
+                                        .filter(|_| !cards.is_empty());
+                                    let reserve = per_card_reserve(&model_file)
+                                        .unwrap_or(0)
+                                        .saturating_mul(cards.len() as u64);
+                                    crate::tensor::conversion::close(
+                                        demand.whole(),
+                                        grown.map(|g| g.saturating_sub(reserve)),
+                                    );
                                     host_experts_from = plan.host_experts_from;
                                     let placement = plan
                                         .segments

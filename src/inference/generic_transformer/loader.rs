@@ -349,6 +349,33 @@ impl LayerRopes {
     }
 }
 
+/// A float projection rebuilt as the block format `target` on `device`, and the ledger entry
+/// that says so. The block-quant kernels read it at a fraction of the float bytes and the
+/// fused projections need one format across a layer.
+fn requant_float_weight(
+    qt: QTensor,
+    target: crate::tensor::quantized::GgmlDType,
+    device: &Device,
+    class: &'static str,
+) -> Result<QTensor> {
+    let from = qt.dtype();
+    let elems = qt.shape().elem_count() as u64;
+    let before = elems * qt.dtype().type_size() as u64 / qt.dtype().block_size() as u64;
+    // CONVERSION: the block-quant kernels need a block format; the float weight is rebuilt.
+    let dequantized = qt.dequantize(&Device::Cpu)?;
+    // CONVERSION: the block-quant kernels need a block format; the float weight is rebuilt.
+    let out = QTensor::quantize_onto(&dequantized, target, device)?;
+    crate::tensor::conversion::record_kept(
+        class,
+        from.gguf_name(),
+        target.gguf_name(),
+        before,
+        elems * target.type_size() as u64 / target.block_size() as u64,
+        "float projection rebuilt as a block format for the block-quant kernels and fused projections",
+    );
+    Ok(out)
+}
+
 fn build_generic_layer(
     raw: RawGenericLayer,
     device: &Device,
@@ -440,17 +467,9 @@ fn build_generic_layer(
         // of Q4K's ~0.6 B. Requanting also makes CPU numerics match GPU (which
         // already requants to Q4K). The byte-concat *fusion* stays GPU-only.
         if needs_requant {
-            let shape = qt.shape().clone();
-            let dequantized = qt.dequantize(&Device::Cpu)?;
             // One block format for every per-layer weight, so that the QKV and FFN
             // gate+up fusions apply.
-            let qt_q4 = QTensor::quantize_onto(&dequantized, requant_dtype, device)?;
-            tracing::debug!(
-                "  Requantized {:?} weight from {:?} -> {:?}",
-                shape,
-                dtype,
-                requant_dtype
-            );
+            let qt_q4 = requant_float_weight(qt, requant_dtype, device, "projection")?;
             Ok(Some(QMatMul::from_qtensor(qt_q4)?))
         } else {
             Ok(Some(QMatMul::from_qtensor(qt)?))
@@ -470,16 +489,7 @@ fn build_generic_layer(
                 | crate::tensor::quantized::GgmlDType::BF16
         );
         if needs {
-            let shape = qt.shape().clone();
-            let dequantized = qt.dequantize(&Device::Cpu)?;
-            let qt_new = QTensor::quantize_onto(&dequantized, requant_dtype, device)?;
-            tracing::debug!(
-                "  Requantized {:?} weight from {:?} -> {:?}",
-                shape,
-                dtype,
-                requant_dtype
-            );
-            Ok(qt_new)
+            requant_float_weight(qt, requant_dtype, device, "projection")
         } else {
             Ok(qt)
         }
@@ -559,12 +569,19 @@ fn build_generic_layer(
             buf_bytes[q_bytes.len() + k_bytes.len()..total].copy_from_slice(&v_bytes);
             let combined_slice: &[u8] =
                 unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, total) };
+            // CONVERSION: q, k and v are copied into one fused weight, one GEMV per token.
             let fused_storage = crate::tensor::quantized::QStorage::from_data(
                 std::borrow::Cow::Borrowed(combined_slice),
                 device,
                 dtype,
             )?;
             drop(buf);
+            crate::tensor::conversion::record_copy(
+                "projection",
+                dtype.gguf_name(),
+                total as u64,
+                "q, k and v fused into one weight, one GEMV per token",
+            );
             let fused_shape = crate::tensor::Shape::from((q_out + k_out + v_out, hidden));
             let fused_qt = QTensor::new(fused_storage, fused_shape)?;
             tracing::debug!(
@@ -696,12 +713,19 @@ fn build_generic_layer(
                 // buf's u32 backing guarantees >=2-byte alignment.
                 let combined_slice: &[u8] =
                     unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, total) };
+                // CONVERSION: gate and up are copied into one fused weight, one GEMV per token.
                 let fused_storage = crate::tensor::quantized::QStorage::from_data(
                     std::borrow::Cow::Borrowed(combined_slice),
                     device,
                     dtype,
                 )?;
                 drop(buf); // safe: from_data already copied to GPU
+                crate::tensor::conversion::record_copy(
+                    "projection",
+                    dtype.gguf_name(),
+                    total as u64,
+                    "gate and up fused into one weight, one GEMV per token",
+                );
                 let fused_shape = crate::tensor::Shape::from((2 * inter, hidden));
                 let fused_qt = QTensor::new(fused_storage, fused_shape)?;
                 tracing::debug!(
@@ -893,10 +917,9 @@ fn build_generic_layer(
     // live on the layer's target device; the small per-channel scales
     // dequantize to F32 there too.
     //
-    // the reference `moe_gemm_gguf` only accepts {Q2K, Q3K, Q4K, Q5K, Q6K, Q8_0}
-    // weights. Q4_K_M GGUFs mix Q5_0/Q4_0 on some down projections, which
-    // would otherwise abort. Requantize unsupported types up to Q8_0 at load
-    // time (small VRAM penalty, kept on CPU then quantize_onto target dev).
+    // An expert stack is used in the format the file stores it in whenever a kernel on the
+    // device it lives on reads that format. Only a format no kernel there reads is rebuilt,
+    // as Q8_0.
     fn coerce_moe_weight(
         qt: crate::tensor::quantized::QTensor,
         device: &Device,
@@ -905,9 +928,6 @@ fn build_generic_layer(
         // A stack the plan keeps in host memory stays there whatever device its layer runs on.
         let home = qt.device().clone();
         let device = if home.runs_as_card() { device } else { &home };
-        // MXFP4 stacks are read in their own format by the expert kernels, and so is every
-        // format those kernels serve on a card: a requantised copy is larger than the plan
-        // counted and is built through a host F32 copy of the whole stack.
         let supported = matches!(
             qt.dtype(),
             GgmlDType::Q2K
@@ -922,8 +942,25 @@ fn build_generic_layer(
         if supported {
             return Ok(qt);
         }
+        let before = qt.shape().elem_count() as u64 * qt.dtype().type_size() as u64
+            / qt.dtype().block_size() as u64;
+        let from = qt.dtype();
+        // CONVERSION: no expert kernel on this device reads the stored format.
         let dequant = qt.dequantize(&Device::Cpu)?;
-        crate::tensor::quantized::QTensor::quantize_onto(&dequant, GgmlDType::Q8_0, device)
+        // CONVERSION: no expert kernel on this device reads the stored format.
+        let out =
+            crate::tensor::quantized::QTensor::quantize_onto(&dequant, GgmlDType::Q8_0, device)?;
+        let after = out.shape().elem_count() as u64 * GgmlDType::Q8_0.type_size() as u64
+            / GgmlDType::Q8_0.block_size() as u64;
+        crate::tensor::conversion::record_kept(
+            "experts",
+            from.gguf_name(),
+            GgmlDType::Q8_0.gguf_name(),
+            before,
+            after,
+            "no expert kernel reads the stored format on this device",
+        );
+        Ok(out)
     }
 
     let moe = if let (Some(gi), Some(des)) = (raw.moe_gate_inp, raw.moe_down_exps) {
