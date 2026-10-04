@@ -523,11 +523,24 @@ impl DeepseekV41Model {
             layer.grid = grid.clone();
             layer.at_grid.clear();
         }
+        // A prompt this wide routes to nearly every expert of every layer, so each layer is read
+        // in while the one before it computes, instead of faulting in under its own MoE.
+        let reads_whole_layers = self.routes_whole_layers(tokens.len());
+        if reads_whole_layers {
+            if let Some(b) = self.blocks.iter().flatten().next() {
+                b.moe.prefetch_layer();
+            }
+        }
         let mut prefill = self.prefill_begin(tokens)?;
         for (i, block) in self.blocks.iter().enumerate() {
             let Some(block) = block.as_ref() else {
                 continue;
             };
+            if reads_whole_layers {
+                if let Some(next) = self.blocks.get(i + 1).and_then(Option::as_ref) {
+                    next.moe.prefetch_layer();
+                }
+            }
             // Each layer's own time, for a recorder that keeps them apart rather than summed.
             let layer_started = std::time::Instant::now();
             if let (Some(engram), Some(ecfg)) = (&self.engrams[i], &self.engram_cfg) {
@@ -587,6 +600,17 @@ impl DeepseekV41Model {
             layer.at_grid.clear();
         }
         Ok((logits, windows))
+    }
+
+    /// Whether a batch of `tokens` routes to most of a layer's experts: with `k` of `E` chosen per
+    /// token, the batch covers a share of the layer of about `1 - (1 - k/E)^tokens`, and reading
+    /// the whole layer ahead pays once that share passes one half.
+    fn routes_whole_layers(&self, tokens: usize) -> bool {
+        let Some(b) = self.blocks.iter().flatten().next() else {
+            return false;
+        };
+        let (k, e) = (b.moe.n_activated as f64, b.moe.n_routed as f64);
+        e > 0.0 && 1.0 - (1.0 - k / e).powf(tokens as f64) > 0.5
     }
 
     /// The engram ids a decode holds after `tokens`: the last `max_ngram` of them, compressed.

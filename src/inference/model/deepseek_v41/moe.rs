@@ -105,6 +105,13 @@ impl Moe {
         (chosen, w)
     }
 
+    /// Start reading this layer's experts into memory: a prompt's batch routes to nearly all of
+    /// them, so the whole layer is asked for while the layers before it compute.
+    pub fn prefetch_layer(&self) {
+        let on_card = self.on_card_probe();
+        self.experts.populate_all(self.n_activated * 2, &on_card);
+    }
+
     /// The experts this block is expected to route one token `x` [1, dim] to, from an input that
     /// stands in for the real one. A streamed set starts reading the ones it does not keep, so
     /// their bytes are in memory when the block runs; the real gate still decides, and a wrong

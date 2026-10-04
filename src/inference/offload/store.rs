@@ -361,6 +361,36 @@ impl ExpertStore {
         }
     }
 
+    /// Start reading every expert that is neither kept nor on a card into the page cache, across
+    /// `readers` threads that this call does not wait for: the read-ahead of a layer a prompt's
+    /// batch is about to use nearly whole. Counts no request and admits nothing.
+    pub fn populate_all(&self, readers: usize, on_card: &dyn Fn(&Expert) -> bool) {
+        let mut todo: Vec<Arc<Expert>> = Vec::new();
+        for id in 0..self.loader.count() {
+            if self.is_kept(id) {
+                continue;
+            }
+            if let Ok(e) = self.loader.build(id) {
+                if !on_card(&e) {
+                    todo.push(Arc::new(e));
+                }
+            }
+        }
+        let readers = readers.max(1).min(todo.len().max(1));
+        let todo = Arc::new(todo);
+        let next = Arc::new(AtomicUsize::new(0));
+        for _ in 0..readers {
+            let (todo, next) = (todo.clone(), next.clone());
+            std::thread::spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                match todo.get(i) {
+                    Some(e) => e.populate(),
+                    None => return,
+                }
+            });
+        }
+    }
+
     /// One request for expert `id` by one token: noted, then fetched and kept.
     pub fn get(&self, id: usize) -> Result<Arc<Expert>> {
         self.note_uses(&[(id, 1, 0)], 1);
@@ -446,6 +476,14 @@ impl ExpertSet {
         match self {
             ExpertSet::Resident(_) => Ok(()),
             ExpertSet::Streamed(s) => s.prefetch(uses, span),
+        }
+    }
+
+    /// Start reading the experts of a streamed set that are neither kept nor on a card, without
+    /// waiting; a no-op when resident.
+    pub fn populate_all(&self, readers: usize, on_card: &dyn Fn(&Expert) -> bool) {
+        if let ExpertSet::Streamed(s) = self {
+            s.populate_all(readers, on_card);
         }
     }
 
