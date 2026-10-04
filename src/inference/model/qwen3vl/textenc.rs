@@ -112,7 +112,7 @@ pub struct Qwen3VlTextEncoder {
     /// First layer's device (embed_tokens lives here; the forward starts here).
     input_device: Device,
     /// Last layer's device (final_norm lives here; the forward output ends here).
-    embed_tokens: NT, // [vocab, hidden] F32, on input_device
+    embed_tokens: crate::tensor::layer::Embedding, // [vocab, hidden] as stored, decoded per lookup
     layers: Vec<Layer>,
     final_norm: NT, // model.norm gamma [hidden], on output_device
 }
@@ -203,7 +203,7 @@ impl Qwen3VlTextEncoder {
             });
         }
         Ok(Qwen3VlTextEncoder {
-            embed_tokens: vb.get_f32_auto_on("embed_tokens.weight", &input_device)?,
+            embed_tokens: vb.get_embedding("embed_tokens.weight")?,
             final_norm: vb.get_f32_auto_on("norm.weight", &output_device)?,
             layers,
             cfg,
@@ -341,8 +341,11 @@ impl Qwen3VlTextEncoder {
     /// when set, marks the end of the real tokens in a right-padded sequence.
     fn run(&self, ids: &[u32], taps: &[usize], n_real: Option<usize>) -> Result<(NT, Vec<NT>)> {
         let s = ids.len();
-        let idx = NT::from_vec_u32(ids.to_vec(), (s,))?.to_device(&self.input_device)?;
-        let mut x = self.embed_tokens.index_select(&idx, 0)?; // [s, hidden] on input_device
+        let idx = NT::from_vec_u32(ids.to_vec(), (s,))?;
+        let mut x = self
+            .embed_tokens
+            .forward(&idx)?
+            .to_device(&self.input_device)?; // [s, hidden] on input_device
         let (cos_cpu, sin_cpu) = self.rope_cos_sin(s)?;
         // Pre-materialize the rope on every distinct device the plan uses.
         let mut rope: HashMap<DeviceLocation, (NT, NT)> = HashMap::new();

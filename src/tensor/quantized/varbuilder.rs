@@ -311,6 +311,14 @@ impl QVarBuilder {
         Self::dense_on(&qt, device)
     }
 
+    /// An embedding table kept in the stored format, rows decoded per lookup on the host.
+    /// The table is never widened: resident cost is the stored blocks.
+    pub fn get_embedding(&self, name: &str) -> Result<crate::tensor::layer::Embedding> {
+        let qt = self.fetch(name)?;
+        let qt = QTensor::from_native(qt, &crate::tensor::Device::Cpu)?;
+        crate::tensor::layer::Embedding::from_stored(std::sync::Arc::new(qt))
+    }
+
     /// Small tensor (norm scale, bias, embedding) dequantized to F32 on the
     /// builder's device.
     pub fn get_f32<S: Into<crate::tensor::Shape>>(

@@ -1304,3 +1304,30 @@ fn a_card_only_handle_keeps_identity_and_refuses_a_host_read() {
     assert!(shell.dequantize_f32().is_err());
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shell.data().len())).is_err());
 }
+
+/// An embedding table taken from a quantised store stays in its stored format and decodes
+/// the rows asked for to what the dense accessor gives.
+#[test]
+fn a_store_embedding_is_not_widened() {
+    let (v, d) = (5usize, 64usize);
+    let vals: Vec<f32> = (0..v * d)
+        .map(|i| ((i * 13 % 29) as f32 - 14.0) / 7.0)
+        .collect();
+    let t = Tensor::from_vec(vals, (v, d), &Device::Cpu).unwrap();
+    let vb = QVarBuilder::from_named_tensors(
+        [("embed_tokens.weight".to_string(), t)],
+        GgmlDType::Q8_0,
+        &Device::Cpu,
+    )
+    .unwrap();
+    let emb = vb.get_embedding("embed_tokens.weight").unwrap();
+    assert!(emb.is_stored());
+    assert_eq!(emb.owned_bytes(), 0);
+    let dense = vb
+        .get_f32_auto_on("embed_tokens.weight", &Device::Cpu)
+        .unwrap();
+    let ids = Tensor::from_vec_u32(vec![4, 1, 1], vec![3]).unwrap();
+    let got = emb.forward(&ids).unwrap().to_vec_f32();
+    let want = dense.index_select(&ids, 0).unwrap().to_vec_f32();
+    assert_eq!(got, want);
+}

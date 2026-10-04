@@ -31,7 +31,7 @@ struct Qwen2Layer {
 }
 
 pub struct Qwen2TextEncoder {
-    embed_tokens: Tensor, // [V, 3584] F32 (dequantized for row-gather), on input_device
+    embed_tokens: crate::tensor::layer::Embedding, // [V, hidden] as stored, rows decoded per lookup
     layers: Vec<Qwen2Layer>,
     norm: Tensor, // [3584], on output_device
     hidden: usize,
@@ -199,7 +199,10 @@ impl Qwen2TextEncoder {
                 )?,
             });
         }
-        let embed_tokens = dq_t(&content, &mut f, &input_device, "token_embd.weight")?;
+        let embed_tokens = {
+            let qt = content.tensor(&mut f, "token_embd.weight", &crate::tensor::Device::Cpu)?;
+            crate::tensor::layer::Embedding::from_stored(std::sync::Arc::new(qt))?
+        };
         let norm = dq_t(&content, &mut f, &output_device, "output_norm.weight")?;
         Ok(Qwen2TextEncoder {
             embed_tokens,
@@ -364,7 +367,7 @@ impl Qwen2TextEncoder {
                 rows.push(vision.narrow(0, vi, 1)?);
                 vi += 1;
             } else {
-                rows.push(self.embed_tokens.narrow(0, id as usize, 1)?);
+                rows.push(self.embed_row(id)?);
             }
         }
         let refs: Vec<&Tensor> = rows.iter().collect();
@@ -375,11 +378,19 @@ impl Qwen2TextEncoder {
         hid.narrow(0, s - keep, keep)
     }
 
+    /// One token's embedding `[1, hidden]`, decoded from the stored table onto the input device.
+    fn embed_row(&self, id: u32) -> crate::tensor::Result<Tensor> {
+        let ids = Tensor::from_vec_u32(vec![id], (1,))?;
+        self.embed_tokens
+            .forward(&ids)?
+            .to_device(self.input_device())
+    }
+
     /// Row-gather token embeddings `[S,3584]`.
     fn embed_ids(&self, ids: &[u32]) -> crate::tensor::Result<Tensor> {
         let rows: Vec<Tensor> = ids
             .iter()
-            .map(|&id| self.embed_tokens.narrow(0, id as usize, 1))
+            .map(|&id| self.embed_row(id))
             .collect::<crate::tensor::Result<_>>()?;
         let refs: Vec<&Tensor> = rows.iter().collect();
         Tensor::cat(&refs, 0)
