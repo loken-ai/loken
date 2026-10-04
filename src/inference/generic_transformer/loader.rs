@@ -2913,6 +2913,7 @@ impl GenericHeteroTransformer {
             workspace_pre_grown: false,
             kv_snapshots: Vec::new(),
             kv_snapshot_tick: 0,
+            hybrid_cache: None,
             spliced_vision,
             host_experts_hot: None,
         };
@@ -3248,6 +3249,7 @@ impl GenericHeteroTransformer {
             workspace_pre_grown: false,
             kv_snapshots: Vec::new(),
             kv_snapshot_tick: 0,
+            hybrid_cache: None,
             spliced_vision: None,
             host_experts_hot: None,
         })

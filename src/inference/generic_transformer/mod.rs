@@ -23,6 +23,9 @@
 /// The quantised projection every layer multiplies through.
 pub mod projection;
 
+/// The disk cache of a recurrent hybrid's decode state.
+pub(crate) mod state_cache;
+
 /// Rotary position embeddings and the table a decode reads them from.
 /// Rotary tables are not this transformer's own: the image families want them too, so they
 /// live under `model` and are named here for the paths that already say `rope::`.
@@ -38,6 +41,7 @@ pub(crate) use crate::tensor::{DType, Device, IndexOp, Result, Tensor};
 
 #[cfg(all(test, feature = "cuda"))]
 mod card_host_parity;
+
 mod config;
 mod graph;
 pub mod hetero;
@@ -49,6 +53,8 @@ mod loader;
 pub mod mixer;
 mod moe_weights;
 mod splice;
+#[cfg(test)]
+mod state_cache_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod verify_decode_parity;
 pub use config::*;
@@ -445,6 +451,9 @@ pub struct GenericHeteroTransformer {
     /// used last by `tick`; empty unless the configuration asks for them.
     kv_snapshots: Vec<KvSnapshot>,
     kv_snapshot_tick: u64,
+    /// The disk cache of this model's decode state, when the operator opened a store and the
+    /// model carries a recurrent state.
+    hybrid_cache: Option<state_cache::HybridStateCache>,
     /// A vision tower whose embeddings are spliced over a placeholder run.
     spliced_vision: Option<splice::SplicedVision>,
     /// Held while some layer keeps its routed experts in host memory: the decode pool's

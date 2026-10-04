@@ -1034,6 +1034,27 @@ impl LlmEngine {
             debug!("✓ Weights loaded from mmap in {:.1}ms", weights_t.elapsed().as_secs_f64() * 1000.0);
 
             debug!("✓ Model weights loaded");
+            // A model with a recurrent state keeps the states of its prompts on disk when the
+            // operator opened a store, under the file and the numerics they were computed with.
+            let mut model = model;
+            if let Some(store) = state_cache.clone() {
+                let mut files = crate::inference::cache::state_disk::FilesDigest::new();
+                let head = &mmap[..mmap.len().min(crate::inference::cache::state_disk::DIGEST_HEAD_BYTES)];
+                match std::fs::metadata(&model_file) {
+                    Ok(meta) => {
+                        files.file(&meta, head);
+                        let identity = crate::inference::cache::state_disk::identity(&[
+                            &files.finish(),
+                            format!("{kv_quant:?}").as_bytes(),
+                            state_cache_salt.as_bytes(),
+                        ]);
+                        if model.attach_state_cache(store, identity) {
+                            info!("state cache on for {arch}");
+                        }
+                    }
+                    Err(e) => warn!("state cache off: {e}"),
+                }
+            }
             advise_pages_by_placement(
                 &mmap,
                 &layer_page_ranges,

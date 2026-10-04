@@ -71,11 +71,18 @@ Nothing below is configured; a key of that name in an older `config.toml` loads 
 | `kv_disk_dir` | none | Directory of the disk tier under the snapshots: token blocks shared between sequences by prefix, one manifest per sequence, surviving a restart. |
 | `kv_disk_budget_gb` | `0` | Bytes the disk tier may hold, in GiB. `0` is no limit. Least recently used sequences go first. |
 
-### Decode-state cache (DeepSeek V4.1)
+### Decode-state cache (DeepSeek V4.1 and recurrent hybrids)
 
 Off unless `state_cache_dir` is set. A DeepSeek V4.1 prompt costs one pass over the routed experts,
 read from disk; this cache stores the model's decode state after a prompt and after each finished
 turn, so a later prompt that begins with the same tokens restores it and prefills only the rest.
+
+The same keys open the same store for a generic-route model that carries a recurrent state beside
+its KV (a convolution, state-space or delta-rule mixer interleaved with attention). Such a state
+cannot be cut back to a shorter prefix, so no prefix of an earlier prompt can be reused by trimming
+and every turn re-prefills; with the store open, each state the prefill passes is kept and a later
+prompt restores the longest one it extends. A dense model keeps its disk tier (`kv_disk`) and is
+unchanged.
 
 The files hold state derived from prompts: KV tensors, hidden rows of the filling compression group
 and compressed token-class ids. They hold no text and no token ids, and names and keys are hashes,
@@ -100,6 +107,19 @@ the tail node.
 A state is also keyed by the model files (length, modification time and header) and `expert_deferral`,
 so a different file or setting starts from nothing. A damaged, truncated or foreign file is ignored
 with a log line.
+
+For a recurrent hybrid a stored state is a manifest and blocks. The manifest holds every recurrent
+mixer's state, every windowed layer's resident rows and the global layers' rows past the last whole
+block; its size depends on the model and not on the prompt. Blocks hold the global layers' rows for
+`state_cache_block_tokens` tokens, once per shared prefix, as f16 where every value is exactly an f16
+and as f32 otherwise, so a restore returns the stored bits. States are kept at multiples of the
+largest whole number of blocks that fits a prefill chunk, and at the end of every prompt of at least
+one block. A state is keyed by the file, `kv_quant`, the salt, the layer kinds, the row geometry and
+which layers run on a card, so another placement or KV format starts from nothing. What a restore
+removes is the prefill of the covered tokens: the recurrent state and the global KV are read from
+disk instead of recomputed, so the gain grows with the covered length and with how slow a prefill is
+on the machine and placement in use, and is bounded by the read speed of the cache directory against
+the state size. A restore always leaves at least one token to prefill, to produce the logits.
 
 ### Files, moderation and URLs
 

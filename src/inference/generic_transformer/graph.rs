@@ -1938,47 +1938,7 @@ impl GenericHeteroTransformer {
                 });
                 continue;
             };
-            let (n_kv, hd) = (l.n_kv_head, l.head_dim);
-            let n = k.len() / (n_kv * hd);
-            // A GPU layer keeps its KV in the spec cache. On a cold server the buffer is
-            // not allocated yet, so there is no tensor to copy the device and dtype from:
-            // build a like tensor on the layer's own device (F-dtype KV is F16).
-            let spec_like = if let Some(buf) = l.kv_cache.k_buffer() {
-                Some(buf)
-            } else if l.cpu_f16_kv.is_none() {
-                Some(crate::tensor::Tensor::zeros_on(
-                    (1, 1, 1, 1),
-                    kv_dtype,
-                    &l.cos.device(),
-                )?)
-            } else {
-                None
-            };
-            if let Some(buf) = spec_like {
-                let spec = crate::inference::serve::spec_kv_cache::SpecKvSnapshot::from_host_rows(
-                    &buf, &k, &v, n, n_kv, hd,
-                )?;
-                layers.push(super::LayerKvSnapshot {
-                    spec: Some(spec),
-                    cpu_f16: None,
-                    mixer: None,
-                });
-            } else if let Some(c) = &l.cpu_f16_kv {
-                let mut fresh = c.like();
-                let row = n_kv * hd;
-                for t in 0..n {
-                    fresh.append(&k[t * row..(t + 1) * row], &v[t * row..(t + 1) * row])?;
-                }
-                layers.push(super::LayerKvSnapshot {
-                    spec: None,
-                    cpu_f16: Some(fresh),
-                    mixer: None,
-                });
-            } else {
-                return Err(crate::tensor::Error::msg(
-                    "kv snapshot import: a layer has no cache to place rows in".to_string(),
-                ));
-            }
+            layers.push(layer_snapshot_from_rows(l, &k, &v, kv_dtype)?);
         }
         self.store_snapshot(tokens, kv_len, layers, None);
         Ok(())
@@ -2419,9 +2379,59 @@ fn quantised_layer_snapshot(
     Ok(None)
 }
 
+/// A layer's KV snapshot rebuilt from host rows `k` and `v` (token-major, `[n, n_kv, head_dim]`),
+/// placed where the layer keeps its KV today. A GPU layer keeps its KV in the spec cache; on
+/// a cold server the buffer is not allocated yet, so a like tensor is built on the layer's
+/// own device in `kv_dtype`.
+pub(super) fn layer_snapshot_from_rows(
+    l: &GenericTransformerLayer,
+    k: &[f32],
+    v: &[f32],
+    kv_dtype: crate::tensor::DType,
+) -> crate::tensor::Result<super::LayerKvSnapshot> {
+    let (n_kv, hd) = (l.n_kv_head, l.head_dim);
+    let n = k.len() / (n_kv * hd);
+    let spec_like = if let Some(buf) = l.kv_cache.k_buffer() {
+        Some(buf)
+    } else if l.cpu_f16_kv.is_none() {
+        Some(crate::tensor::Tensor::zeros_on(
+            (1, 1, 1, 1),
+            kv_dtype,
+            &l.cos.device(),
+        )?)
+    } else {
+        None
+    };
+    if let Some(buf) = spec_like {
+        let spec = crate::inference::serve::spec_kv_cache::SpecKvSnapshot::from_host_rows(
+            &buf, k, v, n, n_kv, hd,
+        )?;
+        return Ok(super::LayerKvSnapshot {
+            spec: Some(spec),
+            cpu_f16: None,
+            mixer: None,
+        });
+    }
+    if let Some(c) = &l.cpu_f16_kv {
+        let mut fresh = c.like();
+        let row = n_kv * hd;
+        for t in 0..n {
+            fresh.append(&k[t * row..(t + 1) * row], &v[t * row..(t + 1) * row])?;
+        }
+        return Ok(super::LayerKvSnapshot {
+            spec: None,
+            cpu_f16: Some(fresh),
+            mixer: None,
+        });
+    }
+    Err(crate::tensor::Error::msg(
+        "kv snapshot import: a layer has no cache to place rows in".to_string(),
+    ))
+}
+
 /// Makes a snapshot's layers the resident ones: every KV cache, and every recurrent
 /// mixer's state, a mixer without a captured state starting fresh.
-fn restore_layers(
+pub(super) fn restore_layers(
     layers: &mut [GenericTransformerLayer],
     snap: &[super::LayerKvSnapshot],
 ) -> crate::tensor::Result<()> {

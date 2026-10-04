@@ -412,6 +412,16 @@ pub(crate) trait ModelBackend: Send {
         Ok(())
     }
 
+    /// Open a disk cache of decode states over `store` for this model, `identity` naming the model
+    /// files and the numerics. False when the model keeps no recurrent state or cannot use one.
+    fn attach_state_cache(
+        &mut self,
+        _store: std::sync::Arc<crate::inference::cache::state_disk::StateStore>,
+        _identity: [u8; 32],
+    ) -> bool {
+        false
+    }
+
     /// On an EXACT prompt match, restore every layer's state and return the
     /// prefill logits, so decode resumes at `prompt.len()` with no prefill.
     /// An inexact prompt MUST miss: a partial match cannot be replayed.
@@ -1193,30 +1203,65 @@ impl ModelBackend for GenericBackend {
     }
     fn try_restore_prefix(&mut self, prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
         // A snapshot of an earlier prompt that this one extends - the previous turn of a
-        // conversation - is restored and advanced over the new tokens.
-        let Some((covered, logits)) = self.0.try_restore_prefix(prompt)? else {
-            return Ok(None);
+        // conversation - is restored and advanced over the new tokens. With a disk cache the
+        // stored states stand in for the in-memory ones when there is none, and a prompt no
+        // state covers is prefilled here too, so the states it passes are kept.
+        let cache = self.0.state_cache();
+        let (covered, logits) = match self.0.try_restore_prefix(prompt)? {
+            Some((covered, logits)) => (covered, Some(logits)),
+            None => match &cache {
+                Some(cache) if prompt.len() > 1 => {
+                    let covered = cache.restore(&mut self.0, prompt);
+                    if covered == 0 {
+                        self.0.trim_kv(0);
+                    }
+                    (covered, None)
+                }
+                _ => return Ok(None),
+            },
         };
         if covered == prompt.len() {
-            return Ok(Some(logits));
+            return Ok(logits);
         }
-        let rest = Tensor::new(&prompt[covered..], &crate::tensor::Device::Cpu)?.unsqueeze(0)?;
+        let chunk = adaptive_prefill_chunk(self.widest_ffn());
         // One pass, no replay: a recurrent state that failed part way through the new tokens
         // cannot be rewound, so the caller prefills the whole prompt from position 0 instead,
         // which starts a fresh state.
-        let chunk = adaptive_prefill_chunk(self.widest_ffn());
-        let logits =
-            match self.forward_prefill_with_chunk(&rest, covered, prompt.len() - covered, chunk) {
-                Ok(logits) => logits,
-                Err(e) => {
-                    tracing::warn!(
-                        "prefix snapshot advance failed ({e}); prefilling the whole prompt"
-                    );
-                    return Ok(None);
+        let logits = match &cache {
+            Some(cache) => match self
+                .0
+                .prefill_with_grid(prompt, covered, chunk, cache.layout())
+            {
+                Ok((logits, grid)) => {
+                    self.0.snapshot_prefix(prompt, &logits)?;
+                    cache.save(&self.0, prompt, grid);
+                    return Ok(Some(logits));
                 }
-            };
+                Err(e) => Err(e),
+            },
+            None => {
+                let rest =
+                    Tensor::new(&prompt[covered..], &crate::tensor::Device::Cpu)?.unsqueeze(0)?;
+                self.forward_prefill_with_chunk(&rest, covered, prompt.len() - covered, chunk)
+            }
+        };
+        let logits = match logits {
+            Ok(logits) => logits,
+            Err(e) => {
+                tracing::warn!("prefix snapshot advance failed ({e}); prefilling the whole prompt");
+                self.0.trim_kv(0);
+                return Ok(None);
+            }
+        };
         self.0.snapshot_prefix(prompt, &logits)?;
         Ok(Some(logits))
+    }
+    fn attach_state_cache(
+        &mut self,
+        store: std::sync::Arc<crate::inference::cache::state_disk::StateStore>,
+        identity: [u8; 32],
+    ) -> bool {
+        self.0.attach_state_cache(store, identity)
     }
     fn best_kv_snapshot(&self, prompt: &[u32]) -> Option<(usize, usize)> {
         self.0.best_kv_snapshot(prompt)
