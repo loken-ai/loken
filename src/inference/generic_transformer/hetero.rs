@@ -524,6 +524,32 @@ impl GenericHeteroTransformer {
             .unwrap_or(0)
     }
 
+    /// What the prefill asks of a card per token and the chunk it runs best at.
+    ///
+    /// A wide residual keeps `streams x dim` f32 per token in the residual and the product a
+    /// combine adds, its mixers' temporaries are bounded to a block of rows, and the chunk it
+    /// wants is the one that gives every routed expert a full tile of the grouped matmul (see
+    /// `hyper::prefill_footprint`).
+    pub fn prefill_shape(&self) -> crate::inference::engine::model_backend::PrefillShape {
+        use crate::inference::engine::model_backend::PrefillShape;
+        let plain = PrefillShape::from_widest_ffn(self.widest_ffn());
+        let Some(h) = self.config.hyper else {
+            return plain;
+        };
+        let experts = self
+            .layers
+            .iter()
+            .find_map(|l| l.moe.as_ref())
+            .map(|m| (m.n_experts, m.n_experts_used));
+        let fp = super::hyper::prefill_footprint(h.streams, self.config.embedding_length, experts);
+        PrefillShape {
+            bytes_per_token: fp.bytes_per_token.max(plain.bytes_per_token),
+            fixed_bytes: fp.fixed_bytes,
+            target_chunk: fp.target_chunk,
+            share: 2,
+        }
+    }
+
     /// Embed `tokens` -> `[b, hidden]` on the layer-compute device in F16 (the
     /// eager, non-capturable input to `decode_layers_gpu`).
     pub fn embed_batch(&self, tokens: &[u32]) -> Result<Tensor> {

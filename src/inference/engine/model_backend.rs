@@ -43,51 +43,73 @@ pub(crate) type BoxedModelBackend = Box<dyn ModelBackend>;
 /// VRAM, so it cannot change between two requests that load nothing - but it was recomputed
 /// per request, and each recomputation probed both cards with a stability loop AND trimmed
 /// the memory pools. Measured at four device probes per `/api/generate`, on every model.
-static CHUNK_MEMO: std::sync::Mutex<Option<(u64, usize, usize)>> = std::sync::Mutex::new(None);
+static CHUNK_MEMO: std::sync::Mutex<Option<(u64, PrefillShape, usize)>> =
+    std::sync::Mutex::new(None);
 
-pub(crate) fn adaptive_prefill_chunk(widest_ffn: usize) -> usize {
+/// What a model's prefill asks of a card per token, and the chunk it wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillShape {
+    /// Card bytes one token of a chunk keeps live at the model's widest point.
+    pub bytes_per_token: usize,
+    /// Card bytes a chunk keeps live whatever its length (a mixer's block temporaries).
+    pub fixed_bytes: usize,
+    /// The chunk the model runs best at, when free memory allows it: 0 keeps the ladder's own top
+    /// rung (2048).
+    pub target_chunk: usize,
+    /// The share of free card memory a chunk may take is one over this: the rest is left for what
+    /// else a forward allocates. A shape that counts every live buffer itself takes a larger share.
+    pub share: usize,
+}
+
+impl PrefillShape {
+    /// The shape of a model that knows only its widest FFN: two f32 buffers of it per token (the
+    /// gate and the up projection), an eighth of the free memory.
+    pub(crate) fn from_widest_ffn(widest_ffn: usize) -> Self {
+        Self {
+            bytes_per_token: widest_ffn * 4 * 2,
+            fixed_bytes: 0,
+            target_chunk: 0,
+            share: 8,
+        }
+    }
+}
+
+pub(crate) fn adaptive_prefill_chunk(shape: PrefillShape) -> usize {
     let epoch = crate::inference::place::vram_manager::residency_epoch();
     if let Ok(memo) = CHUNK_MEMO.lock() {
-        if let Some((e, ffn, chunk)) = *memo {
-            if e == epoch && ffn == widest_ffn {
+        if let Some((e, sh, chunk)) = *memo {
+            if e == epoch && sh == shape {
                 return chunk;
             }
         }
     }
-    let chunk = adaptive_prefill_chunk_uncached(widest_ffn);
+    let chunk = adaptive_prefill_chunk_uncached(shape);
     if let Ok(mut memo) = CHUNK_MEMO.lock() {
-        *memo = Some((epoch, widest_ffn, chunk));
+        *memo = Some((epoch, shape, chunk));
     }
     chunk
 }
 
-fn adaptive_prefill_chunk_uncached(widest_ffn: usize) -> usize {
-    if widest_ffn == 0 {
+fn adaptive_prefill_chunk_uncached(shape: PrefillShape) -> usize {
+    let per_token = shape.bytes_per_token;
+    if per_token == 0 {
         return PREFILL_CHUNK_TOKENS;
     }
-    // One chunk's activation peak is roughly `chunk x widest_ffn x 4 bytes`, twice over for
-    // the gate and up projections a SwiGLU holds at once.
-    let per_token = widest_ffn * 4 * 2;
-
-    // Derived from what the card actually has free, not from a constant. The budget here used
-    // to be `1024 * 14336 * 4 * 2` - a figure calibrated so one particular FFN width got 1024
-    // tokens - which meant a near-full card was handed the same chunk as an empty one and
-    // discovered the difference by running out of memory.
-    //
-    // An eighth of the free VRAM, because the activation peak is not the only thing a forward
-    // allocates: the attention scores and the KV growth transient come out of the same pool,
-    // and a chunk sized to take all of it would leave nothing for either.
+    // Derived from what the card actually has free, not from a constant: a near-full card is
+    // not handed the chunk of an empty one and left to discover the difference by running out
+    // of memory. A share of the free VRAM, because the activation peak is not the only thing a
+    // forward allocates: the attention transients and the KV growth come out of the same pool.
     let free = crate::inference::place::vram_manager::free_total() as usize;
-    let budget = if free == 0 {
+    if free == 0 {
         // No CUDA, or nothing to probe: the host path is bounded by RAM, which this is not
         // measuring, so keep the conservative default rather than inventing a number.
         return PREFILL_CHUNK_TOKENS;
-    } else {
-        free / 8
-    };
-
-    let raw = budget / per_token;
-    if raw >= 2048 {
+    }
+    let raw = (free / shape.share.max(1)).saturating_sub(shape.fixed_bytes) / per_token;
+    let top = shape.target_chunk.max(2048);
+    if raw >= top {
+        top
+    } else if raw >= 2048 {
         2048
     } else if raw >= 1024 {
         1024
@@ -177,6 +199,12 @@ pub(crate) trait ModelBackend: Send {
         0
     }
 
+    /// What this model's prefill asks of a card per token and the chunk it wants; by default
+    /// the activation of its widest FFN.
+    fn prefill_shape(&self) -> PrefillShape {
+        PrefillShape::from_widest_ffn(self.widest_ffn())
+    }
+
     /// Chunked prefill: forward `x` (shape `[1, seq]`) in
     /// `PREFILL_CHUNK_TOKENS`-token slices at increasing `index_pos`,
     /// returning only the LAST chunk's logits - the next-token prediction,
@@ -199,7 +227,7 @@ pub(crate) trait ModelBackend: Send {
         index_pos: usize,
     ) -> crate::tensor::Result<Tensor> {
         let (_, seq_len) = x.dims2()?;
-        let chunk_start = adaptive_prefill_chunk(self.widest_ffn());
+        let chunk_start = adaptive_prefill_chunk(self.prefill_shape());
         // A prompt that fits one chunk runs as one forward; a longer one starts from the last
         // chunk that fit this model, clamped into [MIN, default]. Each out-of-memory failure
         // halves the chunk down to the floor and replays the prefill from `index_pos`, which
@@ -207,7 +235,10 @@ pub(crate) trait ModelBackend: Send {
         // without changing the final chunk's logits. At the floor the card is full of
         // something else, so room is asked for once before the failure surfaces.
         use std::sync::atomic::Ordering;
-        let widest = self.widest_ffn();
+        let (per_token, fixed) = {
+            let sh = self.prefill_shape();
+            (sh.bytes_per_token, sh.fixed_bytes)
+        };
         let first = if seq_len <= chunk_start {
             seq_len
         } else {
@@ -225,9 +256,8 @@ pub(crate) trait ModelBackend: Send {
                     .then(|| (chunk / 2).max(PREFILL_CHUNK_TOKENS_MIN))
             },
             |chunk| {
-                // One chunk's activation peak: `chunk x widest_ffn` f32 values for each of the
-                // gate and up projections.
-                let want = (chunk * widest.max(1) * 4 * 2) as u64;
+                // One chunk's activation peak, from what the model keeps live per token.
+                let want = (chunk * per_token.max(1) + fixed) as u64;
                 crate::inference::place::vram_manager::ensure_gpu_headroom_blocking("llm", want)
             },
             |chunk| {
@@ -1273,6 +1303,10 @@ impl ModelBackend for GenericBackend {
         self.0.widest_ffn()
     }
 
+    fn prefill_shape(&self) -> PrefillShape {
+        self.0.prefill_shape()
+    }
+
     fn forward_all(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
         self.0.forward_all(x, index_pos)
     }
@@ -1329,7 +1363,7 @@ impl ModelBackend for GenericBackend {
         if covered == prompt.len() {
             return Ok(logits);
         }
-        let chunk = adaptive_prefill_chunk(self.widest_ffn());
+        let chunk = adaptive_prefill_chunk(self.prefill_shape());
         // A recurrent state that failed part way through the new tokens cannot be rewound, so
         // a failure ends in the caller prefilling the whole prompt from position 0 instead,
         // which starts a fresh state; a card running out of memory is answered first by the
@@ -1337,7 +1371,10 @@ impl ModelBackend for GenericBackend {
         let logits = match &cache {
             Some(cache) => {
                 use std::sync::atomic::Ordering;
-                let widest = self.widest_ffn();
+                let (per_token, fixed) = {
+                    let sh = self.prefill_shape();
+                    (sh.bytes_per_token, sh.fixed_bytes)
+                };
                 let first = match ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed) {
                     0 => chunk,
                     remembered => remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk),
@@ -1353,7 +1390,7 @@ impl ModelBackend for GenericBackend {
                             .then(|| (c / 2).max(PREFILL_CHUNK_TOKENS_MIN))
                     },
                     |c| {
-                        let want = (c * widest.max(1) * 4 * 2) as u64;
+                        let want = (c * per_token.max(1) + fixed) as u64;
                         crate::inference::place::vram_manager::ensure_gpu_headroom_blocking(
                             "llm", want,
                         )
@@ -2241,8 +2278,8 @@ mod prefill_chunk_memo_tests {
     /// but each would have re-probed both cards and trimmed the pools to say so.
     #[test]
     fn the_answer_is_stable_while_residency_is() {
-        let a = super::adaptive_prefill_chunk(14336);
-        let b = super::adaptive_prefill_chunk(14336);
+        let a = super::adaptive_prefill_chunk(super::PrefillShape::from_widest_ffn(14336));
+        let b = super::adaptive_prefill_chunk(super::PrefillShape::from_widest_ffn(14336));
         assert_eq!(a, b);
     }
 }

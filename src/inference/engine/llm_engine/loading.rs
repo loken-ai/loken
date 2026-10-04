@@ -30,6 +30,9 @@ pub(crate) struct ModelDims {
     pub(crate) num_heads: usize,
     pub(crate) num_kv_heads: usize,
     pub(crate) head_dim: usize,
+    /// For a model whose residual is wide: what its prefill keeps live on a card per token and the
+    /// chunk it wants (see `generic_transformer::hyper::prefill_footprint`).
+    pub(crate) wide_prefill: Option<crate::inference::generic_transformer::hyper::PrefillFootprint>,
 }
 
 impl ModelDims {
@@ -62,12 +65,25 @@ impl ModelDims {
                     128
                 }
             });
+        let streams =
+            get_gguf_u32(content, &format!("{arch}.hyper_connection.count")).unwrap_or(0) as usize;
+        let wide_prefill = (streams > 1).then(|| {
+            let experts = get_gguf_u32(content, &format!("{arch}.expert_count"))
+                .zip(get_gguf_u32(content, &format!("{arch}.expert_used_count")))
+                .map(|(n, k)| (n as usize, k as usize));
+            crate::inference::generic_transformer::hyper::prefill_footprint(
+                streams,
+                hidden_size,
+                experts,
+            )
+        });
         Self {
             num_layers,
             hidden_size,
             num_heads,
             num_kv_heads,
             head_dim,
+            wide_prefill,
         }
     }
 
@@ -90,6 +106,13 @@ impl ModelDims {
     /// What a card keeps free beside the weights and the cache: the cuBLAS workspace and
     /// the activations of one prefill chunk.
     pub(crate) fn work_reserve(&self) -> u64 {
+        if let Some(fp) = self.wide_prefill.filter(|w| w.target_chunk > 0) {
+            // A wide residual's prefill takes the whole chunk it wants, counted from the buffers
+            // it keeps live, beside the mixers' block temporaries and the cuBLAS workspace.
+            return crate::inference::place::runtime_demand::CUBLAS_WORKSPACE_BYTES
+                .saturating_add((fp.target_chunk as u64).saturating_mul(fp.bytes_per_token as u64))
+                .saturating_add(fp.fixed_bytes as u64);
+        }
         crate::inference::place::runtime_demand::llm_work_reserve(
             self.hidden_size.max(self.num_kv_heads * self.head_dim),
             PREFILL_CHUNK_TOKENS,

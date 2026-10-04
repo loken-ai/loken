@@ -35,7 +35,7 @@ const Q8_1_MMQ_VALUES: usize = 128;
 const Q8_1_MMQ_BYTES: usize = Q8_1_MMQ_VALUES + 16;
 /// The widest tile the kernels are built for, in activation columns: the quantised activation
 /// is padded by this many so the last tile can read past the last row.
-const MMQ_X_MAX: usize = 128;
+pub const MMQ_X_MAX: usize = 128;
 /// The narrowest tile, which sets how many column tiles the grid can need.
 const MMQ_X_MIN: usize = 8;
 /// The row padding the quantiser lays a row out to.

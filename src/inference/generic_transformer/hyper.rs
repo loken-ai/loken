@@ -133,7 +133,30 @@ impl HyperMixer {
     /// The sublayer input `[b, seq, dim]`, and the write weights `[b, seq, streams]` when
     /// this mixer has them.
     pub fn mix(&self, r: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
-        self.mix_traced(r, |_, _| {})
+        let (_, seq, _) = r.dims3()?;
+        let block = mixer_block_rows();
+        if seq <= block {
+            return self.mix_traced(r, |_, _| {});
+        }
+        // A long chunk goes through the mixer a block of rows at a time, so its temporaries
+        // (several buffers as wide as the residual) stay the size of one block.
+        let mut mixed = Vec::new();
+        let mut inj = Vec::new();
+        let mut at = 0;
+        while at < seq {
+            let n = block.min(seq - at);
+            let (m, i) = self.mix_traced(&r.narrow(1, at, n)?, |_, _| {})?;
+            mixed.push(m);
+            inj.extend(i);
+            at += n;
+        }
+        let refs: Vec<&Tensor> = mixed.iter().collect();
+        let inj = if inj.is_empty() {
+            None
+        } else {
+            Some(Tensor::cat(&inj.iter().collect::<Vec<_>>(), 1)?)
+        };
+        Ok((Tensor::cat(&refs, 1)?, inj))
     }
 
     /// [`Self::mix`], handing each intermediate to `sink` by name.
@@ -185,6 +208,60 @@ pub fn grouped_rms(
         .broadcast_mul(&inv)?
         .reshape((b, seq, streams * dim))?;
     normed.broadcast_mul(&gamma.to_device(&r.device())?)
+}
+
+/// Largest chunk a prompt is cut into, however many experts a model has.
+const CHUNK_CEILING: usize = 8192;
+/// Buffers of `streams x dim` f32 a wide layer keeps live per token of a chunk: the residual and, at
+/// a combine, the product it adds and the new residual (the mixers' temporaries are bounded apart,
+/// by [`mixer_block_rows`]).
+const WIDE_LIVE_BUFFERS: usize = 3;
+/// Buffers of `streams x dim` f32 a mixer holds for the rows of one block: the cast residual, the
+/// squared copy, the normed copy, the scaled copy, the gate, the gated product and the low-rank
+/// activations.
+const MIXER_LIVE_BUFFERS: usize = 8;
+
+/// Rows a mixer works on at once: two tiles of the grouped expert matmul, so the low-rank products
+/// still fill their tiles while the mixer's temporaries stay a fixed size however long the chunk.
+pub fn mixer_block_rows() -> usize {
+    #[cfg(feature = "cuda")]
+    let tile = crate::inference::moe_cuda::MMQ_X_MAX;
+    #[cfg(not(feature = "cuda"))]
+    let tile = 128;
+    2 * tile
+}
+
+/// What a wide layer's prefill keeps on a card: per token of a chunk, the `streams x dim` f32
+/// buffers live at once; apart from the chunk, the mixers' block temporaries; and the chunk it
+/// runs best at, the one that gives each routed expert a full tile of the grouped matmul on
+/// average, `tile x experts / top-k` tokens, between the ladder's usual top and [`CHUNK_CEILING`].
+/// `experts` is `(count, used)`, `None` for a model without a routed mixture.
+pub fn prefill_footprint(
+    streams: usize,
+    dim: usize,
+    experts: Option<(usize, usize)>,
+) -> PrefillFootprint {
+    #[cfg(feature = "cuda")]
+    let tile = crate::inference::moe_cuda::MMQ_X_MAX;
+    #[cfg(not(feature = "cuda"))]
+    let tile = 1;
+    let target_chunk = experts
+        .map(|(n, used)| (n * tile / used.max(1)).clamp(2048, CHUNK_CEILING))
+        .unwrap_or(0);
+    let f = std::mem::size_of::<f32>();
+    PrefillFootprint {
+        bytes_per_token: streams * dim * f * WIDE_LIVE_BUFFERS,
+        fixed_bytes: mixer_block_rows() * streams * dim * f * MIXER_LIVE_BUFFERS,
+        target_chunk,
+    }
+}
+
+/// See [`prefill_footprint`].
+#[derive(Debug, Clone, Copy)]
+pub struct PrefillFootprint {
+    pub bytes_per_token: usize,
+    pub fixed_bytes: usize,
+    pub target_chunk: usize,
 }
 
 /// The two mixers of one block: the one ahead of the token mixer and the one ahead of the

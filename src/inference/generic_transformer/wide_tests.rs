@@ -892,3 +892,39 @@ fn the_fused_card_stages_match_the_tensor_ops() {
         "the F16 sublayer input"
     );
 }
+
+/// A mixer handed more rows than its block works on them block by block and gives, row for row,
+/// what it gives when it takes them all at once: every operation of the mixer is per row.
+#[test]
+fn a_mixer_blocked_over_its_rows_matches_the_whole() {
+    let m = toy();
+    let hc = m.layers[0].hyper.as_ref().expect("a wide layer");
+    let wide = m.config.hyper.unwrap().streams * m.config.embedding_length;
+    let rows = 2 * hyper::mixer_block_rows() + 37;
+    let data: Vec<f32> = (0..rows * wide)
+        .map(|i| (((i * 2654435761usize) >> 7) % 2001) as f32 / 1000.0 - 1.0)
+        .collect();
+    let r = Tensor::from_vec(data, (1, rows, wide), &Device::Cpu).unwrap();
+    let (blocked, inj_b) = hc.attn.mix(&r).unwrap();
+    let (whole, inj_w) = hc.attn.mix_traced(&r, |_, _| {}).unwrap();
+    let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    assert_eq!(flat(&blocked), flat(&whole));
+    assert_eq!(flat(&inj_b.unwrap()), flat(&inj_w.unwrap()));
+}
+
+/// A wide model's prefill footprint grows with the streams and its wanted chunk with the experts,
+/// within the ladder's top and the ceiling; a model without a routed mixture asks for no chunk.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_wide_prefill_footprint_follows_the_model() {
+    let a = hyper::prefill_footprint(4, 2560, Some((160, 10)));
+    let b = hyper::prefill_footprint(4, 2560, Some((512, 10)));
+    assert!(a.bytes_per_token > 0 && a.fixed_bytes > 0);
+    assert!(a.target_chunk >= 2048 && b.target_chunk > a.target_chunk);
+    assert!(b.target_chunk <= 8192);
+    assert_eq!(hyper::prefill_footprint(4, 2560, None).target_chunk, 0);
+    assert_eq!(
+        hyper::prefill_footprint(8, 2560, None).bytes_per_token,
+        2 * a.bytes_per_token
+    );
+}
