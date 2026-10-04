@@ -13,16 +13,17 @@ struct State {
     /// Tokens in a window: as many as the model has layers, so that every layer's routing is
     /// seen as often as the model is deep.
     window: usize,
-    /// Windows spent on the winner between two rounds of trials: the exploration (the trial
-    /// windows of the neighbours) is then one fifth of the time.
+    /// Windows spent on the winner between two rounds of trials.
     exploit_windows: usize,
     phase: Phase,
     n: usize,
     sum: f64,
     sum_sq: f64,
-    incumbent_mean: f64,
-    incumbent_err: f64,
-    best: (usize, f64),
+    /// The last window of the incumbent: a trial is judged against the windows on both sides of
+    /// it, so a speed that drifts as the run warms up is not taken for a gain.
+    last_incumbent: (f64, f64),
+    pending: Option<(usize, f64, f64)>,
+    best: Option<(usize, f64)>,
     trials_left: Vec<usize>,
     name: &'static str,
 }
@@ -60,9 +61,9 @@ impl Tuner {
                 n: 0,
                 sum: 0.0,
                 sum_sq: 0.0,
-                incumbent_mean: 0.0,
-                incumbent_err: 0.0,
-                best: (start.min(max), f64::MAX),
+                last_incumbent: (0.0, 0.0),
+                pending: None,
+                best: None,
                 trials_left: Vec::new(),
                 name,
             }),
@@ -96,46 +97,51 @@ impl Tuner {
         s.sum_sq = 0.0;
         match std::mem::replace(&mut s.phase, Phase::Incumbent) {
             Phase::Incumbent => {
-                s.incumbent_mean = mean;
-                s.incumbent_err = err;
-                s.best = (s.value, mean);
-                let mut next = Vec::new();
-                if s.value < s.max {
-                    next.push(s.value + 1);
+                if let Some((v, tm, te)) = s.pending.take() {
+                    // The trial sat between two windows of the incumbent: the reference is their
+                    // average.
+                    let (pm, pe) = s.last_incumbent;
+                    let reference = (pm + mean) / 2.0;
+                    let ref_err = (pe * pe + err * err).sqrt() / 2.0;
+                    let margin = 2.0 * (te * te + ref_err * ref_err).sqrt();
+                    let wins = tm + margin < reference;
+                    tracing::info!(
+                        "{}: tried {v}: {:.1} ms per token against {:.1} at {}: {}",
+                        s.name,
+                        tm / 1e6,
+                        reference / 1e6,
+                        s.value,
+                        if wins { "kept" } else { "not kept" }
+                    );
+                    if wins && s.best.is_none_or(|b| tm < b.1) {
+                        s.best = Some((v, tm));
+                    }
+                } else {
+                    let mut next = Vec::new();
+                    if s.value < s.max {
+                        next.push(s.value + 1);
+                    }
+                    if s.value > 0 {
+                        next.push(s.value - 1);
+                    }
+                    s.trials_left = next;
+                    s.best = None;
                 }
-                if s.value > 0 {
-                    next.push(s.value - 1);
-                }
-                s.trials_left = next;
+                s.last_incumbent = (mean, err);
                 s.phase = match s.trials_left.pop() {
                     Some(v) => Phase::Trial(v),
-                    None => Phase::Exploit(s.exploit_windows),
-                };
-            }
-            Phase::Trial(v) => {
-                let margin = 2.0 * (err * err + s.incumbent_err * s.incumbent_err).sqrt();
-                let wins = mean + margin < s.best.1;
-                tracing::info!(
-                    "{}: tried {v}: {:.1} ms per token against {:.1} at {}: {}",
-                    s.name,
-                    mean / 1e6,
-                    s.best.1 / 1e6,
-                    s.best.0,
-                    if wins { "kept" } else { "not kept" }
-                );
-                if wins {
-                    s.best = (v, mean);
-                }
-                s.phase = match s.trials_left.pop() {
-                    Some(next) => Phase::Trial(next),
                     None => {
-                        if s.best.0 != s.value {
-                            tracing::info!("{}: now {}", s.name, s.best.0);
+                        if let Some((v, _)) = s.best.take() {
+                            tracing::info!("{}: now {v}", s.name);
+                            s.value = v;
                         }
-                        s.value = s.best.0;
                         Phase::Exploit(s.exploit_windows)
                     }
                 };
+            }
+            Phase::Trial(v) => {
+                s.pending = Some((v, mean, err));
+                s.phase = Phase::Incumbent;
             }
             Phase::Exploit(left) => {
                 s.phase = if left > 1 {
@@ -163,10 +169,11 @@ mod tests {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                 ((seed >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 2.0e6
             };
-            for _ in 0..4000 {
+            for step in 0..4000 {
                 let v = t.value();
                 assert!(v <= 6);
-                let base = 270.0e6 + 20.0e6 * (v as f64 - best as f64).abs();
+                let warm = 1.0 + 0.5 * (-(step as f64) / 600.0).exp();
+                let base = (270.0e6 + 20.0e6 * (v as f64 - best as f64).abs()) * warm;
                 t.note_token((base + noise()) as u64);
             }
             let settled = t.state.lock().unwrap().value;
