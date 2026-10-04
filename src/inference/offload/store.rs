@@ -507,6 +507,15 @@ impl ExpertSet {
         }
     }
 
+    /// Expert `id`'s weights viewed in place, for a question about them; `None` when resident
+    /// sets hold them already.
+    pub fn peek(&self, id: usize) -> Option<Expert> {
+        match self {
+            ExpertSet::Streamed(s) => s.view(id).ok(),
+            ExpertSet::Resident(_) => None,
+        }
+    }
+
     /// Start reading expert `id` in ahead of its use; a no-op when resident or kept.
     pub fn advise(&self, id: usize, readers: usize, on_card: &dyn Fn(&Expert) -> bool) {
         if let ExpertSet::Streamed(s) = self {

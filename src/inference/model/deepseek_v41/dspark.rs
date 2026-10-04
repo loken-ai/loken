@@ -168,6 +168,8 @@ fn stage<S: WeightSource + ?Sized>(g: &S, s: usize, cfg: &DsparkConfig) -> Resul
         norm_topk: cfg.norm_topk,
         last_routing: std::sync::Mutex::new(Vec::new()),
         predicted: std::sync::Mutex::new(Vec::new()),
+        truncation: Default::default(),
+        resident_override: Default::default(),
         observer: std::sync::RwLock::new(None),
         offload: std::sync::RwLock::new(None),
     };

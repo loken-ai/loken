@@ -22,6 +22,27 @@ use std::sync::Arc;
 /// the weighted rows make.
 pub type ExpertObserver = dyn Fn(Option<usize>, &[f32], &[f32], &[f32]) + Send + Sync;
 
+/// Routing that gives up some of a token's experts for speed. Every field's zero is exact routing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Truncation {
+    /// Keep at most this many of a token's experts, the heaviest; 0 keeps them all.
+    pub keep: usize,
+    /// Drop the lightest experts while the weight they carry together stays below this share of
+    /// the token's total; 0 drops none.
+    pub drop_mass: f32,
+    /// An expert whose share of the token's weight is below this and that is neither on a card nor
+    /// kept is replaced (or dropped); 0 touches none.
+    pub miss_below: f32,
+    /// Drop such an expert instead of replacing it with the best resident one.
+    pub miss_drops: bool,
+}
+
+impl Truncation {
+    pub fn active(&self) -> bool {
+        self.keep > 0 || self.drop_mass > 0.0 || self.miss_below > 0.0
+    }
+}
+
 /// A full MoE block: gate, routed experts, and the shared expert.
 pub struct Moe {
     pub gate_weight: Tensor, // [n_routed, dim]
@@ -43,6 +64,11 @@ pub struct Moe {
     pub last_routing: std::sync::Mutex<Vec<Vec<(usize, f32)>>>,
     /// The experts the last `predict_and_advise` named, compared with the routing that follows.
     pub predicted: std::sync::Mutex<Vec<usize>>,
+    /// Lossy routing options; all off unless set.
+    pub truncation: std::sync::RwLock<Truncation>,
+    /// Experts to treat as resident in place of the live tiers: for a quality measurement that
+    /// prefills a text, where no tier fills.
+    pub resident_override: std::sync::RwLock<Option<std::collections::HashSet<usize>>>,
     /// Told what every forward routes where, when a calibration run asks; `None` otherwise, and
     /// then the forward does no extra work.
     pub observer: std::sync::RwLock<Option<std::sync::Arc<ExpertObserver>>>,
@@ -105,6 +131,89 @@ impl Moe {
         (chosen, w)
     }
 
+    /// `select` under the lossy options: the experts a missed light slot is replaced by or loses,
+    /// then the lightest given up, the rest weighted as the gate weights them.
+    fn select_lossy(
+        &self,
+        row: &[f32],
+        bias: &[f32],
+        t: Truncation,
+        resident: &dyn Fn(usize) -> bool,
+    ) -> (Vec<usize>, Vec<f32>) {
+        let scores: Vec<f32> = row
+            .iter()
+            .map(|&z| Self::softplus(z / self.gate_temp).sqrt())
+            .collect();
+        let mut order: Vec<usize> = (0..self.n_routed).collect();
+        order.sort_by(|&a, &b| {
+            (scores[b] + bias[b])
+                .partial_cmp(&(scores[a] + bias[a]))
+                .unwrap()
+        });
+        let k = self.n_activated;
+        let mut slots: Vec<(usize, f32)> = order[..k].iter().map(|&e| (e, scores[e])).collect();
+        if t.miss_below > 0.0 {
+            let total: f32 = slots.iter().map(|s| s.1).sum::<f32>() + 1e-20;
+            let heaviest = slots.iter().map(|s| s.1).fold(f32::MIN, f32::max);
+            let mut next = k;
+            let mut out = Vec::with_capacity(k);
+            for &(e, s) in &slots {
+                let light = s / total < t.miss_below && s < heaviest;
+                if !light || resident(e) {
+                    out.push((e, s));
+                } else if !t.miss_drops {
+                    // The best-ranked expert beyond the selection that is already in memory takes
+                    // the slot and its weight.
+                    while next < order.len() && !resident(order[next]) {
+                        next += 1;
+                    }
+                    if next < order.len() {
+                        out.push((order[next], s));
+                        next += 1;
+                    } else {
+                        out.push((e, s));
+                    }
+                }
+            }
+            slots = out;
+        }
+        slots.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        if t.keep > 0 && t.keep < slots.len() {
+            slots.truncate(t.keep);
+        }
+        if t.drop_mass > 0.0 {
+            let total: f32 = slots.iter().map(|s| s.1).sum::<f32>() + 1e-20;
+            let mut dropped = 0f32;
+            while slots.len() > 1 && (dropped + slots[slots.len() - 1].1) / total < t.drop_mass {
+                dropped += slots.pop().map_or(0.0, |s| s.1);
+            }
+        }
+        let chosen: Vec<usize> = slots.iter().map(|s| s.0).collect();
+        let mut w: Vec<f32> = slots.iter().map(|s| s.1).collect();
+        if self.norm_topk && self.n_activated > 1 {
+            let s: f32 = w.iter().sum::<f32>() + 1e-20;
+            for wi in w.iter_mut() {
+                *wi /= s;
+            }
+        }
+        (chosen, w)
+    }
+
+    /// Whether an expert is in memory for the host or a card now: the override when one is set,
+    /// else the kept tier and the cards.
+    fn residency(&self) -> impl Fn(usize) -> bool + Sync + '_ {
+        let on_card = self.on_card_probe();
+        let over = self.resident_override.read().unwrap().clone();
+        move |e: usize| match &over {
+            Some(set) => set.contains(&e),
+            None => {
+                self.experts.is_kept(e)
+                    || self.experts.peek(e).is_some_and(|x| on_card(&x))
+                    || matches!(self.experts, ExpertSet::Resident(_))
+            }
+        }
+    }
+
     /// Start reading this layer's experts into memory: a prompt's batch routes to nearly all of
     /// them, so the whole layer is asked for while the layers before it compute.
     pub fn prefetch_layer(&self) {
@@ -160,9 +269,17 @@ impl Moe {
         let mut assign: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.n_routed];
         let mut routing: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
         // Each token's choice is its own: made across the cores, taken in token order below.
+        let truncation = *self.truncation.read().unwrap();
         let picks: Vec<(Vec<usize>, Vec<f32>)> = {
             use rayon::prelude::*;
-            raw.par_iter().map(|row| self.select(row, &bias)).collect()
+            if truncation.active() {
+                let resident = self.residency();
+                raw.par_iter()
+                    .map(|row| self.select_lossy(row, &bias, truncation, &resident))
+                    .collect()
+            } else {
+                raw.par_iter().map(|row| self.select(row, &bias)).collect()
+            }
         };
         for (t, (chosen, w)) in picks.into_iter().enumerate() {
             for (slot, &e) in chosen.iter().enumerate() {
@@ -609,6 +726,8 @@ mod tests {
             norm_topk: true,
             last_routing: std::sync::Mutex::new(Vec::new()),
             predicted: std::sync::Mutex::new(Vec::new()),
+            truncation: Default::default(),
+            resident_override: Default::default(),
             observer: std::sync::RwLock::new(None),
             offload: std::sync::RwLock::new(None),
         }
@@ -793,6 +912,65 @@ mod tests {
         assert!(ran.load(std::sync::atomic::Ordering::Relaxed) > 0);
         assert_eq!(cpu_out, off_out);
         assert_eq!(cpu_calls, off_calls);
+    }
+
+    fn routing_of(moe: &Moe) -> Vec<Vec<(usize, f32)>> {
+        moe.last_routing.lock().unwrap().clone()
+    }
+
+    /// Off, the lossy options route as the gate does; keeping one expert leaves each token the
+    /// heaviest, alone, with the whole route scale.
+    #[test]
+    fn truncation_keeps_the_heaviest_and_weights_it_whole() {
+        let moe = build_moe(ExpertSet::Resident(experts_arc()));
+        let x = input();
+        let _ = moe.forward(&x).unwrap();
+        let exact = routing_of(&moe);
+        *moe.truncation.write().unwrap() = Truncation::default();
+        let _ = moe.forward(&x).unwrap();
+        assert_eq!(routing_of(&moe), exact, "zeros changed the routing");
+
+        *moe.truncation.write().unwrap() = Truncation {
+            keep: 1,
+            ..Default::default()
+        };
+        let _ = moe.forward(&x).unwrap();
+        for (kept, full) in routing_of(&moe).iter().zip(&exact) {
+            assert_eq!(kept.len(), 1);
+            let heaviest = full.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+            assert_eq!(kept[0].0, heaviest.0);
+            assert!((kept[0].1 - ROUTE_SCALE).abs() < 1e-6);
+        }
+    }
+
+    /// A light expert that is in no tier gives its slot to a resident one, or is dropped; the
+    /// heaviest of a token is never touched.
+    #[test]
+    fn a_missed_light_expert_is_replaced_by_a_resident_one() {
+        let moe = build_moe(ExpertSet::Resident(experts_arc()));
+        let x = input();
+        let _ = moe.forward(&x).unwrap();
+        let exact = routing_of(&moe);
+        let resident: std::collections::HashSet<usize> = [0usize, 1, 2, 3].into_iter().collect();
+        *moe.resident_override.write().unwrap() = Some(resident.clone());
+        *moe.truncation.write().unwrap() = Truncation {
+            miss_below: 1.1,
+            ..Default::default()
+        };
+        let _ = moe.forward(&x).unwrap();
+        for (got, full) in routing_of(&moe).iter().zip(&exact) {
+            assert_eq!(got.len(), full.len());
+            let heaviest = full.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
+            assert!(got.iter().any(|g| g.0 == heaviest));
+            for g in got.iter().filter(|g| g.0 != heaviest) {
+                assert!(resident.contains(&g.0), "expert {} is not resident", g.0);
+            }
+        }
+        moe.truncation.write().unwrap().miss_drops = true;
+        let _ = moe.forward(&x).unwrap();
+        for got in routing_of(&moe) {
+            assert!(!got.is_empty() && got.len() <= N_ACTIVATED);
+        }
     }
 
     /// Whether the toy "card" holds `e`: decided by the expert's own weights, so it is the same

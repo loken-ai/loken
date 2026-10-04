@@ -236,6 +236,13 @@ impl LlmEngine {
         let disable_cuda = self.config.disable_cuda || crate::gpu::force_cpu();
         let kv_quant = self.config.kv_quant;
         let expert_deferral = self.config.expert_deferral;
+        let (keep_fraction, drop_mass, miss_below, miss_drops, companion_first) = (
+            self.config.expert_keep_fraction,
+            self.config.expert_drop_mass,
+            self.config.expert_miss_below,
+            self.config.expert_miss_drops,
+            self.config.companion_prior_first,
+        );
         let state_cache = self.state_cache.clone();
         let state_cache_salt = self.config.state_cache_salt.clone();
         let user_context_length = self.config.context_length;
@@ -690,7 +697,7 @@ impl LlmEngine {
                     // A file that carries no routing prior borrows the one a companion file beside
                     // it declares, so its cards start filled instead of filling over the first
                     // request.
-                    if cfg.hot_experts.iter().all(Vec::is_empty) {
+                    if companion_first || cfg.hot_experts.iter().all(Vec::is_empty) {
                         if let Some(prior) =
                             crate::inference::model::deepseek_v41::sibling::prior_beside(
                                 &model_file,
@@ -704,6 +711,7 @@ impl LlmEngine {
                     let mut model = DeepseekV41Model::load(&source, &cfg)
                         .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
                     model.set_expert_deferral(expert_deferral);
+                    model.set_expert_truncation(keep_fraction, drop_mass, miss_below, miss_drops);
                     // Without a kept tier the page cache is the only cache, and a prompt's
                     // prefill sweeps every expert through it: the decode that follows starts
                     // with the early layers evicted. The tier keeps each layer's most routed

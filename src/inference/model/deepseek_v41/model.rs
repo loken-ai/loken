@@ -1055,6 +1055,44 @@ impl DeepseekV41Model {
         self.expert_deferral = share.clamp(0.0, 1.0);
     }
 
+    /// Give up experts for speed, on every layer: keep at most `keep_fraction` of a token's
+    /// experts (rounded up, the heaviest), drop the lightest while they carry under `drop_mass`
+    /// of the weight, and replace (or, with `miss_drops`, drop) a light expert that is in no
+    /// tier when its share is under `miss_below`. Zeros are exact routing.
+    pub fn set_expert_truncation(
+        &self,
+        keep_fraction: f32,
+        drop_mass: f32,
+        miss_below: f32,
+        miss_drops: bool,
+    ) {
+        let k = self.n_activated();
+        let keep = if keep_fraction > 0.0 && keep_fraction < 1.0 {
+            // A fraction that lands a hair over a whole count (two thirds of six) keeps that count.
+            (((keep_fraction * k as f32) - 1e-3).ceil() as usize).clamp(1, k)
+        } else {
+            0
+        };
+        for b in self.blocks.iter().flatten() {
+            *b.moe.truncation.write().unwrap() = super::moe::Truncation {
+                keep,
+                drop_mass,
+                miss_below,
+                miss_drops,
+            };
+        }
+    }
+
+    /// Treat, per layer, the given experts as the resident ones in place of the live tiers.
+    pub fn set_resident_override(&self, per_layer: Option<&[std::collections::HashSet<usize>]>) {
+        for (i, b) in self.blocks.iter().enumerate() {
+            if let Some(b) = b {
+                *b.moe.resident_override.write().unwrap() =
+                    per_layer.and_then(|p| p.get(i).cloned());
+            }
+        }
+    }
+
     /// How many routed experts per token the share allows to finish late.
     fn deferred_experts(&self) -> usize {
         (self.expert_deferral * self.n_activated() as f32).floor() as usize

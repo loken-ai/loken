@@ -180,6 +180,13 @@ pub struct InferenceConfig {
     /// The share of a streamed model's routed experts per token whose host compute may finish a
     /// layer late; 0 keeps every layer exact.
     pub expert_deferral: f32,
+    /// Lossy routing for a streamed model (see the configuration); zeros are exact.
+    pub expert_keep_fraction: f32,
+    pub expert_drop_mass: f32,
+    pub expert_miss_below: f32,
+    pub expert_miss_drops: bool,
+    /// Take the routing prior from a companion file even when the model file carries one.
+    pub companion_prior_first: bool,
     /// Progress callback
     pub progress_callback: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
     /// Models directory (for finding model files)
@@ -244,6 +251,11 @@ impl Default for InferenceConfig {
             moderation_model: None,
             public_url: None,
             expert_deferral: 0.0,
+            expert_keep_fraction: 0.0,
+            expert_drop_mass: 0.0,
+            expert_miss_below: 0.0,
+            expert_miss_drops: false,
+            companion_prior_first: false,
             progress_callback: None,
             models_dir: None,
             disable_arc_layers: false,
