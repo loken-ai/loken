@@ -131,6 +131,64 @@ fn declared(part: &MappedGguf, key: &str) -> Option<usize> {
         .map(|v| v as usize)
 }
 
+/// The files after the first of the set `path` opens, for a header that declares `count` parts.
+/// Empty for a single file. The count in the name must be the header's, and the set is opened by
+/// its first part.
+fn sibling_paths(path: &Path, count: usize) -> Result<Vec<PathBuf>> {
+    if count <= 1 {
+        return Ok(Vec::new());
+    }
+    let (stem, no, named, width) = split_name(path).ok_or_else(|| {
+        Error::msg(format!(
+            "{}: header declares split.count {count} but the name is not a split part",
+            path.display()
+        ))
+    })?;
+    if named != count {
+        return Err(Error::msg(format!(
+            "{}: name says {named} parts, header says {count}",
+            path.display()
+        )));
+    }
+    if no != 1 {
+        return Err(Error::msg(format!(
+            "{}: open a split by its first part",
+            path.display()
+        )));
+    }
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    Ok((2..=count)
+        .map(|i| dir.join(format!("{stem}-{i:0width$}-of-{count:0width$}.gguf")))
+        .collect())
+}
+
+/// The elements every tensor of the set `path` belongs to holds: the model's parameter count. A
+/// part lists only the tensors it carries, so the set is counted across its parts. Only the
+/// headers are read: no part is mapped, so this is safe to ask of a listing.
+pub fn set_parameter_count<P: AsRef<Path>>(path: P) -> Result<u64> {
+    let path = path.as_ref();
+    let first = super::gguf_file::open_header(path)?;
+    let count = first
+        .metadata
+        .get("split.count")
+        .and_then(|v| v.to_u32().ok())
+        .unwrap_or(1) as usize;
+    let mut total: u64 = first
+        .tensor_infos
+        .values()
+        .map(|t| t.elem_count() as u64)
+        .sum();
+    for sibling in sibling_paths(path, count)? {
+        let part = super::gguf_file::open_header(&sibling)?;
+        total += part
+            .tensor_infos
+            .values()
+            .map(|t| t.elem_count() as u64)
+            .sum::<u64>();
+    }
+    Ok(total)
+}
+
 impl SplitGguf {
     /// Open the file at `path` and, when it is one part of a split, its siblings. A single file is
     /// a set of one. The parts are checked against what they declare: the count in the name must
@@ -140,30 +198,8 @@ impl SplitGguf {
         let first = open_mapped_unadvised(path)?;
         let count = declared(&first, "split.count").unwrap_or(1);
         let mut parts = vec![first];
-        if count > 1 {
-            let (stem, no, named, width) = split_name(path).ok_or_else(|| {
-                Error::msg(format!(
-                    "{}: header declares split.count {count} but the name is not a split part",
-                    path.display()
-                ))
-            })?;
-            if named != count {
-                return Err(Error::msg(format!(
-                    "{}: name says {named} parts, header says {count}",
-                    path.display()
-                )));
-            }
-            if no != 1 {
-                return Err(Error::msg(format!(
-                    "{}: open a split by its first part",
-                    path.display()
-                )));
-            }
-            let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-            for i in 2..=count {
-                let p: PathBuf = dir.join(format!("{stem}-{i:0width$}-of-{count:0width$}.gguf"));
-                parts.push(open_mapped_unadvised(&p)?);
-            }
+        for sibling in sibling_paths(path, count)? {
+            parts.push(open_mapped_unadvised(&sibling)?);
         }
         for (i, part) in parts.iter().enumerate() {
             let no = declared(part, "split.no").unwrap_or(0);
@@ -199,6 +235,36 @@ impl SplitGguf {
             .get(name)
             .map(|&i| &self.parts[i])
             .ok_or_else(|| Error::msg(format!("gguf: no tensor `{name}` in any part")))
+    }
+
+    /// The set's header as one: the metadata of the first part - a split set writes it once,
+    /// there - and the union of every part's tensor directory.
+    ///
+    /// A tensor keeps the offset it has in its own part, so its *bytes* still have to be read
+    /// from `part_of`; this is the header a loader asks *about* the model - its architecture,
+    /// its shapes, what each block carries - and it answers for the whole set. `mmap_owner` is
+    /// left unset: no single mapping backs this directory, so a reader that wants zero-copy
+    /// views takes them from the part it reads.
+    pub fn merged_content(&self) -> Content {
+        let first = &self.parts[0].content;
+        let tensor_infos = self
+            .owner
+            .iter()
+            .filter_map(|(name, &i)| {
+                self.parts[i]
+                    .content
+                    .tensor_infos
+                    .get(name)
+                    .map(|info| (name.clone(), info.clone()))
+            })
+            .collect();
+        Content {
+            magic: first.magic,
+            metadata: first.metadata.clone(),
+            tensor_infos,
+            tensor_data_offset: first.tensor_data_offset,
+            mmap_owner: None,
+        }
     }
 }
 
@@ -245,5 +311,68 @@ mod tests {
         assert_eq!(split_name(p), Some(("DSV41-mixedq2".to_string(), 2, 5, 5)));
         assert_eq!(split_name(Path::new("/m/model.gguf")), None);
         assert_eq!(split_name(Path::new("/m/a-of-b.gguf")), None);
+    }
+
+    /// A set's header as one: the metadata of the first part - where a split set writes it - and
+    /// the union of every part's tensor directory, so a loader asks about the whole model. The
+    /// offsets stay per part, so a read still goes to the part that carries the tensor; a reader
+    /// that took the bytes from the merged header would read the wrong file's bytes.
+    #[test]
+    fn a_set_reads_as_one_header() {
+        use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
+        use crate::tensor::quantized::gguf_file::Value;
+        use crate::tensor::quantized::GgmlDType;
+
+        let dir = std::env::temp_dir().join(format!("loken-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (one, two) = (
+            dir.join("set-00001-of-00002.gguf"),
+            dir.join("set-00002-of-00002.gguf"),
+        );
+        let entry = |name: &str| GgufEntry {
+            name: name.to_string(),
+            dims: vec![4, 4],
+            dtype: GgmlDType::F32,
+            data: [0f32.to_le_bytes(); 16].concat(),
+        };
+        let md1 = vec![
+            ("split.count".to_string(), Value::U32(2)),
+            ("split.no".to_string(), Value::U32(0)),
+            (
+                "general.architecture".to_string(),
+                Value::String("qwen3moe".into()),
+            ),
+        ];
+        let md2 = vec![
+            ("split.count".to_string(), Value::U32(2)),
+            ("split.no".to_string(), Value::U32(1)),
+        ];
+        write_gguf_with_metadata(&one, &md1, &[entry("blk.0.attn_norm.weight")]).unwrap();
+        write_gguf_with_metadata(&two, &md2, &[entry("blk.1.attn_norm.weight")]).unwrap();
+
+        let split = SplitGguf::open(&one).unwrap();
+        let merged = split.merged_content();
+        assert_eq!(
+            merged
+                .metadata
+                .get("general.architecture")
+                .and_then(|v| v.to_string().ok())
+                .map(std::string::String::as_str),
+            Some("qwen3moe"),
+            "the metadata is the first part's"
+        );
+        assert!(merged.tensor_infos.contains_key("blk.0.attn_norm.weight"));
+        assert!(
+            merged.tensor_infos.contains_key("blk.1.attn_norm.weight"),
+            "the directory is the union of the parts"
+        );
+        assert!(
+            merged.mmap_owner.is_none(),
+            "no single mapping backs the union"
+        );
+        // The count is the set's, not the first part's: each part holds one 4x4 tensor.
+        assert_eq!(set_parameter_count(&one).unwrap(), 32);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

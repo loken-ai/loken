@@ -334,6 +334,35 @@ pub fn windowed_by_period(period: usize, il: usize) -> bool {
     period == 0 || il % period < period - 1
 }
 
+/// Whether the file is one part of a set of two or more: `split.count` names the set and
+/// `split.no` the part. A whole file carries neither.
+pub fn is_a_split_part(content: &gguf_file::Content) -> bool {
+    content
+        .metadata
+        .get("split.count")
+        .and_then(|v| v.to_u32().ok())
+        .is_some_and(|count| count > 1)
+}
+
+/// Refuses a GGUF that is one part of a split set on a route that reads a single file.
+///
+/// A part lists only the tensors it carries, and a block with no mixer and no feed-forward is
+/// built as a pass-through, so the load would succeed with part of the stack missing. A set is
+/// read as one source by `GenericHeteroTransformer::from_split_gguf`.
+pub fn refuse_a_split_part(content: &gguf_file::Content) -> crate::tensor::Result<()> {
+    if !is_a_split_part(content) {
+        return Ok(());
+    }
+    let u = |k: &str| content.metadata.get(k).and_then(|v| v.to_u32().ok());
+    let count = u("split.count").unwrap_or(1);
+    let part = u("split.no").map_or(1, |n| n + 1);
+    Err(crate::tensor::Error::msg(format!(
+        "this file is part {part} of a {count}-part split GGUF, and this route reads one file: \
+         the blocks the other parts carry would be built as pass-through placeholders. Open the \
+         set by its first part, or merge the parts into one file."
+    )))
+}
+
 // ------------------------------------------------------------
 // Configuration read from GGUF metadata
 // ------------------------------------------------------------
@@ -1193,6 +1222,35 @@ mod arch_facts_tests {
             (ssm.group_count, ssm.time_step_rank, ssm.state_size),
             (2, 4, 8)
         );
+    }
+
+    /// A part of a split set carries only its own blocks, and a single-file route reads one
+    /// file: the part is refused rather than built with its missing blocks as placeholders.
+    #[test]
+    fn a_split_part_is_refused_rather_than_built_incomplete() {
+        let mut content = synth_content(
+            "llama",
+            &[("block_count", Value::U32(2))],
+            &[("blk.0.attn_norm.weight", vec![4])],
+        );
+        assert!(refuse_a_split_part(&content).is_ok(), "a whole file");
+        content
+            .metadata
+            .insert("split.count".to_string(), Value::U32(1));
+        assert!(
+            refuse_a_split_part(&content).is_ok(),
+            "one part is a whole file"
+        );
+        content
+            .metadata
+            .insert("split.count".to_string(), Value::U32(2));
+        let e = refuse_a_split_part(&content).unwrap_err().to_string();
+        assert!(e.contains("part 1 of a 2-part split"), "{e}");
+        content
+            .metadata
+            .insert("split.no".to_string(), Value::U32(1));
+        let e = refuse_a_split_part(&content).unwrap_err().to_string();
+        assert!(e.contains("part 2 of a 2-part split"), "{e}");
     }
 
     #[test]

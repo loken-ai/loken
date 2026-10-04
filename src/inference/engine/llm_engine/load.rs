@@ -23,6 +23,11 @@ pub(super) enum GenericWeights<'a> {
         mmap_bytes: &'a [u8],
         mmap: &'a std::sync::Arc<memmap2::Mmap>,
     },
+    /// A split GGUF set: one model across several files, each listing only the tensors it
+    /// carries, read as one source.
+    GgufSplit {
+        split: &'a crate::tensor::quantized::gguf_source::SplitGguf,
+    },
     Awq {
         dir: &'a str,
         shards: &'a [String],
@@ -56,6 +61,14 @@ impl GenericWeights<'_> {
                     stem_on_card,
                 )
             }
+            GenericWeights::GgufSplit { split } => GenericHeteroTransformer::from_split_gguf(
+                split,
+                cuda_devices,
+                plan,
+                kv_quant,
+                max_kv_seq_len,
+                stem_on_card,
+            ),
             GenericWeights::Awq { dir, shards } => GenericHeteroTransformer::from_awq_safetensors(
                 dir,
                 shards,
@@ -71,7 +84,7 @@ impl GenericWeights<'_> {
     /// whose table always stays on the host.
     pub(super) fn stem_bytes(&self, content: &gguf_file::Content) -> u64 {
         match self {
-            GenericWeights::Gguf { .. } => content
+            GenericWeights::Gguf { .. } | GenericWeights::GgufSplit { .. } => content
                 .tensor_infos
                 .get("token_embd.weight")
                 .map_or(0, |t| {
@@ -89,7 +102,7 @@ impl GenericWeights<'_> {
         layers: usize,
     ) -> Option<Vec<(u64, u64)>> {
         match self {
-            GenericWeights::Gguf { .. } => {
+            GenericWeights::Gguf { .. } | GenericWeights::GgufSplit { .. } => {
                 let mut out = vec![(0u64, 0u64); layers];
                 for (name, t) in &content.tensor_infos {
                     let Some(rest) = name.strip_prefix("blk.") else {
@@ -118,7 +131,7 @@ impl GenericWeights<'_> {
     /// `None` when the source cannot say, and the file size stands in.
     pub(super) fn block_and_head_bytes(&self, content: &gguf_file::Content) -> Option<(u64, u64)> {
         match self {
-            GenericWeights::Gguf { .. } => {
+            GenericWeights::Gguf { .. } | GenericWeights::GgufSplit { .. } => {
                 let tensor_bytes = |name: &str| {
                     content
                         .tensor_infos

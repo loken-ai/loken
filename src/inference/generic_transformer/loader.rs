@@ -120,35 +120,115 @@ enum RawMixer {
     Absent,
 }
 
-/// Helper: read a tensor by name from mmap with a Cursor, or return None if absent.
-type MmapOwner<'a> = Option<&'a std::sync::Arc<dyn std::any::Any + Send + Sync>>;
-
-fn try_read_tensor(
-    tensor_infos: &HashMap<String, gguf_file::TensorInfo>,
-    mmap: &[u8],
-    tdo: u64,
-    name: &str,
-    device: &Device,
-    owner: MmapOwner,
-) -> crate::tensor::Result<Option<QTensor>> {
-    match tensor_infos.get(name) {
-        Some(ti) => Ok(Some(ti.read_slice_owned(mmap, tdo, device, owner)?)),
-        None => Ok(None),
-    }
+/// Where a model's tensors are read from: one mapped file, or the parts of a split set.
+///
+/// A loader asks by name. A whole file answers from its own directory; a split set answers from
+/// the part that holds the tensor, since each part's offsets are relative to its own mapping.
+/// Either way the read is a zero-copy view of the mapping - the engine's path pins it - which is
+/// what keeps a large model's load off the host heap.
+struct TensorSource<'a> {
+    parts: Vec<TensorPart<'a>>,
+    /// Which part holds a tensor. Empty for one file: every tensor is in it.
+    owner: HashMap<String, usize>,
 }
 
-fn required_tensor(
-    tensor_infos: &HashMap<String, gguf_file::TensorInfo>,
-    mmap: &[u8],
-    tdo: u64,
-    name: &str,
-    device: &Device,
-    owner: MmapOwner,
-) -> crate::tensor::Result<QTensor> {
-    tensor_infos
-        .get(name)
-        .ok_or_else(|| crate::tensor::Error::msg(format!("missing tensor: {name}")))?
-        .read_slice_owned(mmap, tdo, device, owner)
+struct TensorPart<'a> {
+    content: &'a gguf_file::Content,
+    bytes: &'a [u8],
+    /// The mapping a view pins, when there is one; `None` copies (dev bins, tests).
+    owner: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl<'a> TensorSource<'a> {
+    /// One mapped file: every tensor is in it.
+    fn one(content: &'a gguf_file::Content, bytes: &'a [u8]) -> Self {
+        Self {
+            owner: HashMap::new(),
+            parts: vec![TensorPart {
+                content,
+                bytes,
+                owner: content.mmap_owner.clone(),
+            }],
+        }
+    }
+
+    /// The parts of a split set, in order: metadata from the first, tensor bytes from whichever
+    /// part carries them.
+    fn of_split(split: &'a crate::tensor::quantized::gguf_source::SplitGguf) -> Self {
+        let mut owner = HashMap::new();
+        let mut parts = Vec::new();
+        for part in split.parts() {
+            let index = parts.len();
+            for name in part.content.tensor_infos.keys() {
+                owner.insert(name.clone(), index);
+            }
+            let mapped: std::sync::Arc<dyn std::any::Any + Send + Sync> = part.mmap.clone();
+            parts.push(TensorPart {
+                content: &part.content,
+                bytes: &part.mmap[..],
+                owner: Some(mapped),
+            });
+        }
+        Self { parts, owner }
+    }
+
+    /// The part a tensor's bytes are in.
+    fn part_of(&self, name: &str) -> Option<&TensorPart<'a>> {
+        match self.owner.get(name) {
+            Some(&i) => self.parts.get(i),
+            None => self.parts.first(),
+        }
+    }
+
+    /// The first part's header and bytes: what a reader of its own - a family's vision tower -
+    /// takes, since it reads by a cursor over one mapping.
+    fn first(&self) -> (&'a gguf_file::Content, &'a [u8]) {
+        match self.parts.first() {
+            Some(p) => (p.content, p.bytes),
+            None => unreachable!("a source is built with at least one part"),
+        }
+    }
+
+    /// `name` on `device`, `None` when no part carries it.
+    fn read_opt(&self, name: &str, device: &Device) -> crate::tensor::Result<Option<QTensor>> {
+        let Some(part) = self.part_of(name) else {
+            return Ok(None);
+        };
+        let Some(info) = part.content.tensor_infos.get(name) else {
+            return Ok(None);
+        };
+        Ok(Some(info.read_slice_owned(
+            part.bytes,
+            part.content.tensor_data_offset,
+            device,
+            part.owner.as_ref(),
+        )?))
+    }
+
+    /// `name` on `device`; a name no part carries is an error that says so.
+    fn read(&self, name: &str, device: &Device) -> crate::tensor::Result<QTensor> {
+        self.read_opt(name, device)?
+            .ok_or_else(|| crate::tensor::Error::msg(format!("missing tensor: {name}")))
+    }
+
+    /// The bytes the model is stored in, across every part: what a host spill is measured against.
+    fn total_bytes(&self) -> u64 {
+        self.parts.iter().map(|p| p.bytes.len() as u64).sum()
+    }
+
+    /// Drop layer `layer`'s pages: its weights are on a card now. Per part, since a set's
+    /// offsets are relative to the mapping they sit in.
+    fn release_layer_pages(&self, layer: usize) {
+        for part in &self.parts {
+            if let Some(mmap) = part
+                .owner
+                .as_ref()
+                .and_then(|o| o.downcast_ref::<memmap2::Mmap>())
+            {
+                part.content.release_layer_pages_in(mmap, layer);
+            }
+        }
+    }
 }
 
 /// A quantised weight built on `device` from its block bytes, `rows` x `cols`.
@@ -1804,8 +1884,55 @@ impl GenericHeteroTransformer {
         max_kv_seq_len: Option<usize>,
         stem_on_card: bool,
     ) -> Result<Self> {
-        use std::io::Cursor;
+        // One file: a part of a set is refused rather than built from the blocks this file
+        // happens to carry. A set is read as one model through `from_split_gguf`.
+        super::config::refuse_a_split_part(&content)?;
+        let source = TensorSource::one(&content, mmap_bytes);
+        Self::from_gguf_source(
+            &content,
+            source,
+            cuda_devices,
+            plan,
+            kv_quant,
+            max_kv_seq_len,
+            stem_on_card,
+        )
+    }
 
+    /// A split set read as one model: the header is the union of the parts and every tensor is
+    /// read from the part that carries it, so a set loads as the merged file would.
+    pub fn from_split_gguf(
+        split: &crate::tensor::quantized::gguf_source::SplitGguf,
+        cuda_devices: &HashMap<usize, Device>,
+        plan: &HeteroPlan,
+        kv_quant: crate::inference::engine::llm_engine::KvQuant,
+        max_kv_seq_len: Option<usize>,
+        stem_on_card: bool,
+    ) -> Result<Self> {
+        let content = split.merged_content();
+        let source = TensorSource::of_split(split);
+        Self::from_gguf_source(
+            &content,
+            source,
+            cuda_devices,
+            plan,
+            kv_quant,
+            max_kv_seq_len,
+            stem_on_card,
+        )
+    }
+
+    /// The load itself: `content` is the header the model is read from - one file's, or a set's
+    /// union - and `source` says where each tensor's bytes are.
+    fn from_gguf_source(
+        content: &gguf_file::Content,
+        source: TensorSource<'_>,
+        cuda_devices: &HashMap<usize, Device>,
+        plan: &HeteroPlan,
+        kv_quant: crate::inference::engine::llm_engine::KvQuant,
+        max_kv_seq_len: Option<usize>,
+        stem_on_card: bool,
+    ) -> Result<Self> {
         let arch = content
             .metadata
             .get("general.architecture")
@@ -1820,7 +1947,7 @@ impl GenericHeteroTransformer {
         let _ldt = std::time::Instant::now();
         macro_rules! ldt { ($($a:tt)*) => { info!("[load] {:>7.2}s  {}", _ldt.elapsed().as_secs_f32(), format!($($a)*)); } }
 
-        let mut cfg = GenericTransformerConfig::from_gguf(&content, &arch)?;
+        let mut cfg = GenericTransformerConfig::from_gguf(content, &arch)?;
         cfg.kv_quant = kv_quant;
         // Cap the per-layer Q8/Q4 KV allocation at the user's configured
         // context_length when supplied - otherwise GGUF's native
@@ -1841,8 +1968,7 @@ impl GenericHeteroTransformer {
             DeviceKind::Cuda(idx) => cuda_devices.get(&idx).cloned(),
             _ => None,
         });
-        let mut cursor = Cursor::new(mmap_bytes);
-        let emb_qt = content.tensor(&mut cursor, "token_embd.weight", &Device::Cpu)?;
+        let emb_qt = source.read("token_embd.weight", &Device::Cpu)?;
         let emb_table_bytes = (config.vocab_size as u64) * (config.embedding_length as u64) * 4; // F32 after dequantize
         let emb_device = match (&first_card, stem_on_card) {
             (Some(card), true) => card.clone(),
@@ -1873,18 +1999,19 @@ impl GenericHeteroTransformer {
         // -- 2. Load output norm + output projection on CPU ----------------
         // LFM2 files name the final norm `token_embd_norm`; it is read under that name only
         // when the file carries no `output_norm`.
-        let norm_qt = match content.tensor(&mut cursor, "output_norm.weight", &Device::Cpu) {
+        let norm_qt = match source.read("output_norm.weight", &Device::Cpu) {
             Ok(qt) => qt,
             Err(e) => match content.tensor_infos.contains_key("token_embd_norm.weight") {
-                true => content.tensor(&mut cursor, "token_embd_norm.weight", &Device::Cpu)?,
+                true => source.read("token_embd_norm.weight", &Device::Cpu)?,
                 false => return Err(e),
             },
         };
         let norm_weight_cpu = norm_qt.dequantize(&Device::Cpu)?;
         // Phi2/GPT-NeoX use full LayerNorm: `output_norm.bias` exists.
-        let output_norm_bias_cpu = content
-            .tensor(&mut cursor, "output_norm.bias", &Device::Cpu)
+        let output_norm_bias_cpu = source
+            .read_opt("output_norm.bias", &Device::Cpu)
             .ok()
+            .flatten()
             .and_then(|qt| qt.dequantize(&Device::Cpu).ok());
         let output_norm = match &output_norm_bias_cpu {
             Some(bias) => WeightedNorm::Layer(LayerNorm::new(
@@ -1902,26 +2029,26 @@ impl GenericHeteroTransformer {
         // phi2 graph; without it the residual stream stays exact and the top of the
         // distribution is still reordered, which reads as a coherent answer to a
         // different question.
-        let output_bias = content
-            .tensor(&mut cursor, "output.bias", &Device::Cpu)
+        let output_bias = source
+            .read_opt("output.bias", &Device::Cpu)
             .ok()
+            .flatten()
             .and_then(|qt| qt.dequantize(&Device::Cpu).ok());
-        let (output_qt, output_weight_name) =
-            match content.tensor(&mut cursor, "output.weight", &Device::Cpu) {
-                Ok(qt) => (qt, "output.weight"),
-                Err(_) => {
-                    // Tied embeddings (weight sharing)
-                    (
-                        content.tensor(&mut cursor, "token_embd.weight", &Device::Cpu)?,
-                        "token_embd.weight",
-                    )
-                }
-            };
+        let (output_qt, output_weight_name) = match source.read("output.weight", &Device::Cpu) {
+            Ok(qt) => (qt, "output.weight"),
+            Err(_) => {
+                // Tied embeddings (weight sharing)
+                (
+                    source.read("token_embd.weight", &Device::Cpu)?,
+                    "token_embd.weight",
+                )
+            }
+        };
         let output_proj = crate::tensor::quantized::QMatMul::from_qtensor(output_qt)?;
         info!("✅ Loaded output norm and projection on CPU");
 
         // -- 2b. Load PLE globals (Gemma4) - optional ---------------------
-        let ple_dim = meta_u32(&content, &config.arch, "embedding_length_per_layer_input")
+        let ple_dim = meta_u32(content, &config.arch, "embedding_length_per_layer_input")
             .unwrap_or(0) as usize;
         let ple_token_embd: Option<Embedding> = None;
         let mut ple_token_embd_bf16: Option<(Tensor, usize)> = None;
@@ -1944,7 +2071,7 @@ impl GenericHeteroTransformer {
                         "PLE: Loading per_layer_token_embd ({:.1}GB BF16)...",
                         expected_bf16_bytes as f64 / 1e9
                     );
-                    match content.tensor(&mut cursor, tensor_name, &Device::Cpu) {
+                    match source.read(tensor_name, &Device::Cpu) {
                         Ok(qt) => {
                             // dequantize BF16 -> gets F32 tensor, then convert back to BF16 for Embedding
                             match qt.dequantize(&Device::Cpu) {
@@ -1976,18 +2103,20 @@ impl GenericHeteroTransformer {
         // tensor-core fast_mmq path. Fall back to CPU only when no GPU.
         let ple_dev = first_card.clone().unwrap_or(Device::Cpu);
         let ple_model_proj = if ple_dim > 0 {
-            content
-                .tensor(&mut cursor, "per_layer_model_proj.weight", &ple_dev)
+            source
+                .read_opt("per_layer_model_proj.weight", &ple_dev)
                 .ok()
+                .flatten()
                 .map(crate::tensor::quantized::QMatMul::from_qtensor)
                 .transpose()?
         } else {
             None
         };
         let ple_proj_norm = if ple_dim > 0 {
-            content
-                .tensor(&mut cursor, "per_layer_proj_norm.weight", &ple_dev)
+            source
+                .read_opt("per_layer_proj_norm.weight", &ple_dev)
                 .ok()
+                .flatten()
                 .map(|qt| RmsNorm::from_qtensor(qt, config.rms_norm_eps))
                 .transpose()?
         } else {
@@ -2004,9 +2133,10 @@ impl GenericHeteroTransformer {
         }
 
         // -- 2c. Load rope_freqs (Gemma4 proportional RoPE for global layers) --
-        let rope_freq_factors = content
-            .tensor(&mut cursor, "rope_freqs.weight", &Device::Cpu)
+        let rope_freq_factors = source
+            .read_opt("rope_freqs.weight", &Device::Cpu)
             .ok()
+            .flatten()
             .and_then(|qt| qt.dequantize(&Device::Cpu).ok());
         if rope_freq_factors.is_some() {
             info!("✅ Loaded rope_freqs.weight for proportional RoPE");
@@ -2108,7 +2238,7 @@ impl GenericHeteroTransformer {
                 .filter(|(_, k)| matches!(k, DeviceKind::Cpu))
                 .count();
             if cpu_layers > 0 {
-                let per_layer = (mmap_bytes.len() as u64) / (n_layers.max(1) as u64);
+                let per_layer = (source.total_bytes()) / (n_layers.max(1) as u64);
                 let want = per_layer.saturating_mul(cpu_layers as u64);
                 let budget = plan
                     .segments
@@ -2146,11 +2276,8 @@ impl GenericHeteroTransformer {
             },
             multi_gpu
         );
-        let tdo = content.tensor_data_offset;
         let f = &flags;
         let ti = &content.tensor_infos;
-        // When set (engine path), weights load as zero-copy mmap views (Arc pins it).
-        let mmap_owner: MmapOwner = content.mmap_owner.as_ref();
 
         let load_one = |idx: usize, dk: DeviceKind| -> crate::tensor::Result<RawGenericLayer> {
             let prefix = format!("blk.{idx}");
@@ -2161,18 +2288,18 @@ impl GenericHeteroTransformer {
 
             macro_rules! req {
                 ($name:expr) => {
-                    required_tensor(ti, mmap_bytes, tdo, $name, weight_dev, mmap_owner)
+                    source.read($name, weight_dev)
                 };
             }
             // Biases and norms always on CPU
             macro_rules! opt_cpu {
                 ($name:expr) => {
-                    try_read_tensor(ti, mmap_bytes, tdo, $name, &Device::Cpu, mmap_owner)
+                    source.read_opt($name, &Device::Cpu)
                 };
             }
             macro_rules! req_cpu {
                 ($name:expr) => {
-                    required_tensor(ti, mmap_bytes, tdo, $name, &Device::Cpu, mmap_owner)
+                    source.read($name, &Device::Cpu)
                 };
             }
             // A tiny Q8 weight for a projection field the layer never runs.
@@ -2182,9 +2309,9 @@ impl GenericHeteroTransformer {
                 QTensor::quantize_onto(&z, crate::tensor::quantized::GgmlDType::Q8_0, weight_dev)
             };
 
-            let mixer_kind = super::mixer::layer_mixer_kind(&content, idx);
+            let mixer_kind = super::mixer::layer_mixer_kind(content, idx);
             let attends = mixer_kind == super::mixer::MixerKind::Attention;
-            let has_ffn = super::mixer::layer_has_ffn(&content, idx);
+            let has_ffn = super::mixer::layer_has_ffn(content, idx);
             if ti.contains_key(&format!("{prefix}.ffn_latent_down.weight")) {
                 return Err(crate::tensor::Error::msg(format!(
                     "{prefix}: routed experts behind a latent projection are not supported"
@@ -2210,14 +2337,7 @@ impl GenericHeteroTransformer {
                 let k = req!(&format!("{prefix}.attn_k.weight"))?;
                 // Gemma4 26B Global layers omit attn_v and reuse attn_k
                 // as V (AttentionKEqV pattern). Use opt-load for V.
-                let v = try_read_tensor(
-                    ti,
-                    mmap_bytes,
-                    tdo,
-                    &format!("{prefix}.attn_v.weight"),
-                    weight_dev,
-                    mmap_owner,
-                )?;
+                let v = source.read_opt(&format!("{prefix}.attn_v.weight"), weight_dev)?;
                 (Some(q), Some(k), v, None)
             };
 
@@ -2239,7 +2359,7 @@ impl GenericHeteroTransformer {
                 None
             };
 
-            let attn_output_stem = attn_output_name(&content);
+            let attn_output_stem = attn_output_name(content);
             let (attn_output, mixer) = match mixer_kind {
                 super::mixer::MixerKind::Attention => (
                     req!(&format!("{prefix}.{attn_output_stem}.weight"))?,
@@ -2300,7 +2420,7 @@ impl GenericHeteroTransformer {
                 None
             };
             let attn_sinks_qt = if attends && f.has_attn_sinks {
-                let name = attn_sinks_name(&content, idx).ok_or_else(|| {
+                let name = attn_sinks_name(content, idx).ok_or_else(|| {
                     crate::tensor::Error::msg(format!("missing tensor: {prefix}.attn_sinks"))
                 })?;
                 Some(req_cpu!(&name)?)
@@ -2394,7 +2514,7 @@ impl GenericHeteroTransformer {
             // PLE tensors (Gemma4) - on layer's target device
             macro_rules! opt_dev {
                 ($name:expr) => {
-                    try_read_tensor(ti, mmap_bytes, tdo, $name, weight_dev, mmap_owner)
+                    source.read_opt($name, weight_dev)
                 };
             }
             // Routed expert stacks: in host memory for a layer the plan keeps its experts
@@ -2405,7 +2525,7 @@ impl GenericHeteroTransformer {
             };
             macro_rules! opt_exp {
                 ($name:expr) => {
-                    try_read_tensor(ti, mmap_bytes, tdo, $name, expert_dev, mmap_owner)
+                    source.read_opt($name, expert_dev)
                 };
             }
             let ple_inp_gate = opt_dev!(&format!("{prefix}.inp_gate.weight"))?;
@@ -2621,7 +2741,7 @@ impl GenericHeteroTransformer {
             // dead weight, and on a spilled model they are what pushes the host layers'
             // working set into swap before decode even starts.
             if matches!(dev_enum, LayerDevice::Cuda(_)) {
-                content.release_layer_pages(layer_idx);
+                source.release_layer_pages(layer_idx);
             }
             Ok((layer, dev_enum))
         };
@@ -2725,10 +2845,10 @@ impl GenericHeteroTransformer {
                         )
                     });
                 let head = if dense {
-                    let qt = content.tensor(&mut cursor, output_weight_name, &Device::Cpu)?;
+                    let qt = source.read(output_weight_name, &Device::Cpu)?;
                     (None, Some(qt.dequantize_f16(cuda_dev)?))
                 } else {
-                    let qt = content.tensor(&mut cursor, output_weight_name, cuda_dev)?;
+                    let qt = source.read(output_weight_name, cuda_dev)?;
                     (
                         Some(crate::tensor::quantized::QMatMul::from_qtensor(qt)?),
                         None,
@@ -2846,18 +2966,23 @@ impl GenericHeteroTransformer {
         // The vision tower of a family whose images splice into the text stream, on the card
         // of the first layer; the tower runs on a card only.
         let spliced_vision = match (
-            splices_vision_tower(&content, &config.arch),
+            splices_vision_tower(content, &config.arch),
             content.tensor_infos.contains_key("v.patch_embed.weight"),
             layer_devs.first(),
         ) {
             (true, true, Some(LayerDevice::Cuda(idx))) => {
-                let token = meta_u32(&content, &config.arch, "vision.image_token_id")
-                    .or_else(|| meta_u32(&content, &config.arch, "image_token_id"));
+                let token = meta_u32(content, &config.arch, "vision.image_token_id")
+                    .or_else(|| meta_u32(content, &config.arch, "image_token_id"));
                 match (token, cuda_devices.get(idx)) {
                     (Some(image_token), Some(card)) => {
+                        // The tower reads through a cursor over one mapping, so it takes the
+                        // first part's header and bytes. A set whose `v.*` tensors live in
+                        // another part fails here and is served as text only.
+                        let (tower_content, tower_bytes) = source.first();
+                        let mut cursor = std::io::Cursor::new(tower_bytes);
                         let tower =
                             crate::inference::model::qwen35::vision::Qwen35Vision::from_gguf(
-                                &content,
+                                tower_content,
                                 &mut cursor,
                                 config.embedding_length,
                                 card,
@@ -3320,5 +3445,157 @@ mod split_tests {
         };
         assert_eq!(first_col(q), vec![0., 1., 4., 5., 8., 9.]);
         assert_eq!(first_col(gate), vec![2., 3., 6., 7., 10., 11.]);
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
+    use crate::tensor::quantized::gguf_file::Value;
+    use crate::tensor::quantized::gguf_source::SplitGguf;
+    use crate::tensor::quantized::GgmlDType;
+
+    const LAYERS: usize = 2;
+    const EMBD: usize = 8;
+    const FFN: usize = 16;
+    const VOCAB: usize = 11;
+
+    /// A tiny dense model: `[out, in]` weights of a deterministic pattern, F32.
+    fn entries() -> Vec<GgufEntry> {
+        let mut seed = 7u32;
+        let mut entry = |name: String, dims: Vec<usize>| {
+            let n: usize = dims.iter().product();
+            let data = (0..n)
+                .flat_map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (((seed >> 16) as f32 / 65536.0 - 0.5) * 0.4).to_le_bytes()
+                })
+                .collect();
+            GgufEntry {
+                name,
+                dims,
+                dtype: GgmlDType::F32,
+                data,
+            }
+        };
+        let mut out = vec![
+            entry("token_embd.weight".into(), vec![VOCAB, EMBD]),
+            entry("output.weight".into(), vec![VOCAB, EMBD]),
+        ];
+        let norm = |name: String| GgufEntry {
+            name,
+            dims: vec![EMBD],
+            dtype: GgmlDType::F32,
+            data: [1.0f32.to_le_bytes(); EMBD].concat(),
+        };
+        out.push(norm("output_norm.weight".into()));
+        for il in 0..LAYERS {
+            out.push(norm(format!("blk.{il}.attn_norm.weight")));
+            out.push(norm(format!("blk.{il}.ffn_norm.weight")));
+            for (n, d) in [
+                ("attn_q", [EMBD, EMBD]),
+                ("attn_k", [EMBD, EMBD]),
+                ("attn_v", [EMBD, EMBD]),
+                ("attn_output", [EMBD, EMBD]),
+                ("ffn_gate", [FFN, EMBD]),
+                ("ffn_up", [FFN, EMBD]),
+                ("ffn_down", [EMBD, FFN]),
+            ] {
+                out.push(entry(format!("blk.{il}.{n}.weight"), d.to_vec()));
+            }
+        }
+        out
+    }
+
+    fn metadata() -> Vec<(String, Value)> {
+        let u = |k: &str, v: u32| (format!("llama.{k}"), Value::U32(v));
+        vec![
+            ("general.architecture".into(), Value::String("llama".into())),
+            u("block_count", LAYERS as u32),
+            u("embedding_length", EMBD as u32),
+            u("feed_forward_length", FFN as u32),
+            u("attention.head_count", 2),
+            u("attention.head_count_kv", 2),
+            u("context_length", 64),
+            (
+                "llama.attention.layer_norm_rms_epsilon".into(),
+                Value::F32(1e-5),
+            ),
+            ("llama.rope.freq_base".into(), Value::F32(10000.0)),
+        ]
+    }
+
+    fn logits(mut model: GenericHeteroTransformer) -> Vec<f32> {
+        let ids = Tensor::from_vec(vec![1u32, 4, 2, 9], (1usize, 4usize), &Device::Cpu).unwrap();
+        model
+            .forward(&ids, 0)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// A model written as two parts, blocks divided between them, loads to the logits of the
+    /// same model in one file: which part a tensor sits in does not matter. A part opened alone
+    /// is refused.
+    #[test]
+    fn a_split_set_loads_like_one_file() {
+        let dir = std::env::temp_dir().join(format!("loken-source-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = HeteroPlan::calculate_with_kv(LAYERS, 1 << 20, &[], &[], 1.0, 0);
+        let none = HashMap::new();
+
+        let single = dir.join("one.gguf");
+        write_gguf_with_metadata(&single, &metadata(), &entries()).unwrap();
+        let g = crate::tensor::quantized::gguf_file::open_mapped(&single).unwrap();
+        let bytes = g.mmap.clone();
+        let want = logits(
+            GenericHeteroTransformer::from_gguf(g.content, &bytes[..], &none, &plan).unwrap(),
+        );
+
+        let (first, second): (Vec<_>, Vec<_>) = entries()
+            .into_iter()
+            .partition(|e| !e.name.starts_with("blk.1."));
+        let with = |no: u32| {
+            let mut m = metadata();
+            m.push(("split.count".to_string(), Value::U32(2)));
+            m.push(("split.no".to_string(), Value::U32(no)));
+            m
+        };
+        let (p1, p2) = (
+            dir.join("set-00001-of-00002.gguf"),
+            dir.join("set-00002-of-00002.gguf"),
+        );
+        write_gguf_with_metadata(&p1, &with(0), &first).unwrap();
+        write_gguf_with_metadata(&p2, &with(1), &second).unwrap();
+
+        let part = crate::tensor::quantized::gguf_file::open_mapped(&p1).unwrap();
+        let part_bytes = part.mmap.clone();
+        let refused =
+            GenericHeteroTransformer::from_gguf(part.content, &part_bytes[..], &none, &plan);
+        assert!(
+            refused
+                .err()
+                .is_some_and(|e| e.to_string().contains("part 1 of a 2-part")),
+            "a part alone must not build an incomplete model"
+        );
+
+        let set = SplitGguf::open(&p1).unwrap();
+        let got = logits(
+            GenericHeteroTransformer::from_split_gguf(
+                &set,
+                &none,
+                &plan,
+                crate::inference::engine::llm_engine::KvQuant::Off,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, want, "the split set changed the logits");
     }
 }

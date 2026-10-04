@@ -341,37 +341,59 @@ impl LlmEngine {
                 }
             };
             let mmap_bytes: &[u8] = &mmap[..];
-            // What the cards will hold: the shards of an AWQ checkpoint, the file otherwise.
-            let file_size = match &awq {
-                Some((_, shards)) => shards
+            // A split set is one model: the union of its parts is the header and each tensor is
+            // read from the part that holds it. A part whose siblings are missing is an error.
+            let split = match (
+                awq.is_none(),
+                crate::inference::generic_transformer::is_a_split_part(&content),
+            ) {
+                (true, true) => match crate::tensor::quantized::gguf_source::SplitGguf::open(&model_file)
+                {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        error!("❌ {e}");
+                        return Err(anyhow!("{e}"));
+                    }
+                },
+                _ => None,
+            };
+            let content = match &split {
+                Some(s) => s.merged_content(),
+                None => content,
+            };
+            // What the cards will hold: the shards of an AWQ checkpoint, the parts of a set, the
+            // file otherwise.
+            let file_size = match (&awq, &split) {
+                (Some((_, shards)), _) => shards
                     .iter()
                     .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
                     .sum(),
-                None => file_size,
+                (None, Some(s)) => s.parts().iter().map(|p| p.mmap.len() as u64).sum(),
+                (None, None) => file_size,
             };
-            let generic_weights = match &awq {
-                Some((dir, shards)) => GenericWeights::Awq { dir, shards },
-                None => GenericWeights::Gguf { mmap_bytes, mmap: &mmap },
+            let generic_weights = match (&awq, &split) {
+                (Some((dir, shards)), _) => GenericWeights::Awq { dir, shards },
+                (None, Some(s)) => GenericWeights::GgufSplit { split: s },
+                (None, None) => GenericWeights::Gguf { mmap_bytes, mmap: &mmap },
             };
             // Captured now: `content` is consumed by one of the loader arms below, and the
-            // page advice can only be given once every layer has a device.
-            // Page advice applies to a GGUF file's own bytes; the shards are read, not mapped.
-            let layer_page_ranges: Vec<(usize, usize, usize, bool)> = content
-                .tensor_infos
-                .iter()
-                .filter(|_| awq.is_none())
-                .filter_map(|(name, info)| {
-                    let rest = name.strip_prefix("blk.")?;
-                    let dot = rest.find('.')?;
-                    let layer = rest[..dot].parse::<usize>().ok()?;
-                    Some((
-                        layer,
-                        (content.tensor_data_offset + info.offset) as usize,
-                        info.size_in_bytes(),
-                        super::load::is_routed_expert_tensor(&rest[dot + 1..]),
-                    ))
-                })
-                .collect();
+            // page advice can only be given once every layer has a device. The advice is per
+            // mapping, since a set's offsets are relative to its part; AWQ shards are not mapped.
+            let page_advice: Vec<MappedAdvice> = match (&awq, &split) {
+                (Some(_), _) => Vec::new(),
+                (None, Some(s)) => s
+                    .parts()
+                    .iter()
+                    .map(|p| MappedAdvice {
+                        mmap: p.mmap.clone(),
+                        ranges: page_ranges_of(&p.content),
+                    })
+                    .collect(),
+                (None, None) => vec![MappedAdvice {
+                    mmap: mmap.clone(),
+                    ranges: page_ranges_of(&content),
+                }],
+            };
             // Set by the generic route when its plan keeps routed experts in host memory.
             let mut host_experts_from: Option<usize> = None;
 
@@ -899,7 +921,10 @@ impl LlmEngine {
                     #[cfg(feature = "cuda")]
                     let tensor_parallel: Option<BoxedModelBackend> = {
                         use crate::inference::serve::tp_support::{tensor_parallel_support, TP_RANKS};
+                        // The tensor-parallel loader reads one mapping, so a split set takes the
+                        // ladder.
                         let tp = (awq.is_none()
+                            && split.is_none()
                             && tensor_parallel_support(&content, &arch)
                                 .inspect_err(|why| info!("{arch} stays off tensor parallelism: {why}"))
                                 .is_ok())
@@ -1056,8 +1081,7 @@ impl LlmEngine {
                 }
             }
             advise_pages_by_placement(
-                &mmap,
-                &layer_page_ranges,
+                &page_advice,
                 &model.device_layer_distribution(),
                 host_experts_from,
             );
@@ -1238,9 +1262,33 @@ impl LlmEngine {
 /// comes back from the file - so a wrong guess costs a refault, never a wrong weight. Only
 /// `blk.N.*` tensors are covered: embeddings and the output head are placed elsewhere and
 /// are small next to the layers.
+/// One mapping's share of the page advice: its byte ranges, in the mapping's own offsets.
+struct MappedAdvice {
+    mmap: std::sync::Arc<memmap2::Mmap>,
+    ranges: Vec<(usize, usize, usize, bool)>,
+}
+
+/// Each block tensor's `(layer, start, len, is a routed expert)`, in `content`'s own offsets.
+fn page_ranges_of(content: &gguf_file::Content) -> Vec<(usize, usize, usize, bool)> {
+    content
+        .tensor_infos
+        .iter()
+        .filter_map(|(name, info)| {
+            let rest = name.strip_prefix("blk.")?;
+            let dot = rest.find('.')?;
+            let layer = rest[..dot].parse::<usize>().ok()?;
+            Some((
+                layer,
+                (content.tensor_data_offset + info.offset) as usize,
+                info.size_in_bytes(),
+                super::load::is_routed_expert_tensor(&rest[dot + 1..]),
+            ))
+        })
+        .collect()
+}
+
 fn advise_pages_by_placement(
-    mmap: &std::sync::Arc<memmap2::Mmap>,
-    ranges: &[(usize, usize, usize, bool)],
+    advice: &[MappedAdvice],
     dist: &[(String, usize, u32, u32)],
     host_experts_from: Option<usize>,
 ) {
@@ -1253,35 +1301,39 @@ fn advise_pages_by_placement(
             .map(|(kind, _, _, _)| kind == "CPU")
     };
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
-    let total = mmap.len();
     let (mut kept, mut dropped, mut n_kept, mut n_dropped) = (0u64, 0u64, 0usize, 0usize);
-    for &(layer, start, len, routed_expert) in ranges {
-        let Some(host) = on_host(layer) else {
-            continue;
-        };
-        // Routed experts the plan keeps in host memory are read from these pages.
-        let host = host || (routed_expert && host_experts_from.is_some_and(|from| layer >= from));
-        // Page-aligned outward: a partial page shared with a neighbour is only ever
-        // advised, so widening the range costs at most one refault of that neighbour.
-        let a = start / page * page;
-        let b = (start + len).div_ceil(page) * page;
-        let b = b.min(total);
-        if a >= b {
-            continue;
-        }
-        if host {
-            let _ = mmap.advise_range(memmap2::Advice::WillNeed, a, b - a);
-            kept += len as u64;
-            n_kept += 1;
-        } else {
-            // DontNeed is the "unchecked" advice because it discards a private or anonymous
-            // mapping's contents. This one is a read-only shared file mapping: the page
-            // comes back from the file, unchanged, if it is ever read again.
-            let _ = unsafe {
-                mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, a, b - a)
+    for part in advice {
+        let mmap = &part.mmap;
+        let total = mmap.len();
+        for &(layer, start, len, routed_expert) in part.ranges.iter() {
+            let Some(host) = on_host(layer) else {
+                continue;
             };
-            dropped += len as u64;
-            n_dropped += 1;
+            // Routed experts the plan keeps in host memory are read from these pages.
+            let host =
+                host || (routed_expert && host_experts_from.is_some_and(|from| layer >= from));
+            // Page-aligned outward: a partial page shared with a neighbour is only ever
+            // advised, so widening the range costs at most one refault of that neighbour.
+            let a = start / page * page;
+            let b = (start + len).div_ceil(page) * page;
+            let b = b.min(total);
+            if a >= b {
+                continue;
+            }
+            if host {
+                let _ = mmap.advise_range(memmap2::Advice::WillNeed, a, b - a);
+                kept += len as u64;
+                n_kept += 1;
+            } else {
+                // DontNeed is the "unchecked" advice because it discards a private or anonymous
+                // mapping's contents. This one is a read-only shared file mapping: the page
+                // comes back from the file, unchanged, if it is ever read again.
+                let _ = unsafe {
+                    mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, a, b - a)
+                };
+                dropped += len as u64;
+                n_dropped += 1;
+            }
         }
     }
     info!(

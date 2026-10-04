@@ -838,6 +838,12 @@ impl Content {
         let Some(mmap) = owner.downcast_ref::<memmap2::Mmap>() else {
             return;
         };
+        self.release_layer_pages_in(mmap, layer);
+    }
+
+    /// `release_layer_pages` for a mapping the caller names: the offsets of this header are
+    /// relative to `mmap`, which for a part of a split set is the part's own.
+    pub fn release_layer_pages_in(&self, mmap: &memmap2::Mmap, layer: usize) {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
         let prefix = format!("blk.{layer}.");
         let total = mmap.len();
