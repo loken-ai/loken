@@ -78,11 +78,12 @@ card, and the 390-against-496 penalty an earlier revision of this page reported 
 
 For a model that fits on neither card the limit is the bus. deepseek-r1:70b at Q4_K_M holds
 26 of its 80 layers on the host, every one read in full per token at ~36 GB/s, this machine's
-DRAM ceiling: 1.51 tok/s here, 1.55 under ollama, both pinned to it. There is no faster host
-path. Two ways out. A variant that fits: the FFN-at-Q3 requantisation the store already names
-but never received weights. And a drafter, which loken now picks itself for a model that spills: on that same cell,
-llama3.2:1b proposing and the 70B verifying with a learned draft length gives 2.79 to 2.85
-tok/s against 1.49 alone, same answer, at temperature zero.
+DRAM ceiling. Unaided, the host path is the limit: 1.6 tok/s for loken against 1.5 for ollama
+in the 2026-09 rows of `docs/BENCHMARKS.md`. In the table above, which is the 2026-10-03 row,
+loken decodes 3.1 against ollama's 1.6: the drafter loken picks itself for a model that spills
+proposes tokens and the 70B verifies them. The 2026-09 row with a llama3.2:1b drafter measures
+2.0 tok/s. A variant that fits is the other way out: the FFN-at-Q3 requantisations
+(`deepseek-r1:70b-ffnq3`, `-ffnq3d2`, `-q3ks`) appear in the table.
 
 A checkpoint that ships split is read as one model across its parts. unsloth/Qwen3-235B-A22B-GGUF,
 a mixture of 235B parameters, runs on the two cards and the host at 7.0 tok/s prefill and
