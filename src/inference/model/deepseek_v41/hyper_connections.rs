@@ -11,6 +11,36 @@
 
 use crate::tensor::{Device, Result, Tensor};
 
+/// The elements of a CPU f32 tensor in row-major order: borrowed when the tensor owns exactly
+/// them, copied otherwise.
+fn dense_f32(t: &Tensor) -> Result<std::borrow::Cow<'_, [f32]>> {
+    if t.is_contiguous() {
+        if let Ok(v) = t.cpu_f32_data() {
+            if v.len() == t.elem_count() {
+                return Ok(std::borrow::Cow::Borrowed(v));
+            }
+        }
+    }
+    Ok(std::borrow::Cow::Owned(t.flatten_all()?.to_vec1::<f32>()?))
+}
+
+/// The dot product of `a` and `b` in eight independent lanes, which the compiler keeps in vector
+/// registers where a single running sum would serialise.
+fn dot8(a: &[f32], b: &[f32]) -> f32 {
+    let mut lanes = [0f32; 8];
+    let chunks = a.len() / 8;
+    for c in 0..chunks {
+        for l in 0..8 {
+            lanes[l] += a[c * 8 + l] * b[c * 8 + l];
+        }
+    }
+    let mut sum = lanes.iter().sum::<f32>();
+    for i in chunks * 8..a.len() {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
 /// The pre/post/comb coefficients for one sublayer, per token.
 pub struct HcMixes {
     /// [n, hc]
@@ -42,17 +72,38 @@ pub fn hc_mixes(
     let xf = x.reshape((n, flat))?;
     // One statistic per token over the whole flattened hc*d stream, then the projection scaled by
     // it - the reference's `F.linear(x, hc_fn) * rsqrt`.
-    let rows = xf.flatten_all()?.to_vec1::<f32>()?;
-    let mixes = crate::inference::offload::linear(&xf, hc_fn)?
-        .flatten_all()?
-        .to_vec1::<f32>()?; // [n, mix_hc]
+    let rows = dense_f32(&xf)?;
+    let mixes: Vec<f32> = if n > 1 {
+        // A prompt's batch: the projection is a few dozen dot products per token over a row that
+        // fits the cache, so it runs where the rows are; sending them to a card costs more than
+        // the product.
+        let w = dense_f32(hc_fn)?;
+        let mix_hc = w.len() / flat.max(1);
+        let mut out = vec![0f32; n * mix_hc];
+        out.par_chunks_mut(mix_hc).enumerate().for_each(|(t, o)| {
+            let row = &rows[t * flat..(t + 1) * flat];
+            for (m, v) in o.iter_mut().enumerate() {
+                *v = dot8(row, &w[m * flat..(m + 1) * flat]);
+            }
+        });
+        out
+    } else {
+        crate::inference::offload::linear(&xf, hc_fn)?
+            .flatten_all()?
+            .to_vec1::<f32>()? // [n, mix_hc]
+    };
     let mix_hc = mixes.len() / n.max(1);
 
     // Tokens are independent: each is computed in the order a single token would be.
     let per_token: Vec<(Vec<f32>, Vec<f32>, Vec<Vec<f32>>)> = (0..n)
         .into_par_iter()
         .map(|t| {
-            let ss: f32 = rows[t * flat..(t + 1) * flat].iter().map(|v| v * v).sum();
+            let row = &rows[t * flat..(t + 1) * flat];
+            let ss: f32 = if n > 1 {
+                dot8(row, row)
+            } else {
+                row.iter().map(|v| v * v).sum()
+            };
             let rsqrt = 1.0 / (ss / flat as f32 + norm_eps).sqrt();
             let m: Vec<f32> = mixes[t * mix_hc..(t + 1) * mix_hc]
                 .iter()
@@ -136,7 +187,7 @@ pub fn hc_pre(x: &Tensor, pre_mix: &[Vec<f32>]) -> Result<Tensor> {
     let (b, s, hc, d) = x.dims4()?;
     let n = b * s;
     use rayon::prelude::*;
-    let xv = x.flatten_all()?.to_vec1::<f32>()?;
+    let xv = dense_f32(x)?;
     let mut out = vec![0f32; n * d];
     out.par_chunks_mut(d).enumerate().for_each(|(t, o)| {
         for c in 0..hc {
@@ -175,8 +226,8 @@ pub fn hc_post(
 ) -> Result<Tensor> {
     let (b, s, d) = x.dims3()?;
     let n = b * s;
-    let xv = x.flatten_all()?.to_vec1::<f32>()?;
-    let rv = residual.flatten_all()?.to_vec1::<f32>()?;
+    let xv = dense_f32(x)?;
+    let rv = dense_f32(residual)?;
     use rayon::prelude::*;
     let mut out = vec![0f32; n * hc * d];
     out.par_chunks_mut(hc * d)

@@ -376,6 +376,9 @@ impl Moe {
             crate::inference::offload::prof_record("count experts on host", host_count);
         }
         let add_started = std::time::Instant::now();
+        // Each expert's rows, kept until every token's sum is formed: the sums run a token at a
+        // time across the cores, in expert order as they would one by one.
+        let mut outs: Vec<Option<Vec<f32>>> = (0..active.len()).map(|_| None).collect();
         for (i, &e) in active.iter().enumerate() {
             if later.contains(&i) {
                 continue;
@@ -393,14 +396,35 @@ impl Moe {
                     .collect();
                 obs(Some(e), &rows_of(e), &weights, &weighted);
             }
-            for (r, &(t, w)) in assign[e].iter().enumerate() {
-                for j in 0..self.dim {
-                    y[t][j] += w * out[r * self.dim + j];
-                }
-            }
+            outs[i] = Some(out);
             if let Some(expert) = held {
                 self.experts.release(e, &expert);
             }
+        }
+        {
+            use rayon::prelude::*;
+            // For each token, the (expert position, row in its output, weight) of every expert
+            // that served it, in expert order.
+            let mut serving: Vec<Vec<(usize, usize, f32)>> = vec![Vec::new(); n];
+            for (i, &e) in active.iter().enumerate() {
+                if outs[i].is_none() {
+                    continue;
+                }
+                for (r, &(t, w)) in assign[e].iter().enumerate() {
+                    serving[t].push((i, r, w));
+                }
+            }
+            let dim = self.dim;
+            y.par_iter_mut()
+                .zip(serving.par_iter())
+                .for_each(|(row, parts)| {
+                    for &(i, r, w) in parts {
+                        let out = outs[i].as_ref().expect("a served expert has its rows");
+                        for (a, b) in row.iter_mut().zip(&out[r * dim..(r + 1) * dim]) {
+                            *a += w * b;
+                        }
+                    }
+                });
         }
         if crate::inference::offload::current().is_some() {
             crate::inference::offload::prof_record(
