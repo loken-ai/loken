@@ -15,6 +15,11 @@ fn dir() -> PathBuf {
 }
 
 fn toy() -> GenericHeteroTransformer {
+    toy_on(None)
+}
+
+/// The toy placed on card `ordinal`, or on the host.
+fn toy_on(ordinal: Option<usize>) -> GenericHeteroTransformer {
     let file = std::fs::File::open(dir().join("toy.gguf")).unwrap();
     let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file) }.unwrap());
     let mut content =
@@ -22,11 +27,19 @@ fn toy() -> GenericHeteroTransformer {
             .unwrap();
     content.mmap_owner = Some(mmap.clone() as Arc<dyn std::any::Any + Send + Sync>);
     let layers = content.metadata["qwen4exp.block_count"].to_u32().unwrap() as usize;
+    let cards: HashMap<usize, Device> = match ordinal {
+        #[cfg(feature = "cuda")]
+        Some(o) => [(o, Device::new_cuda(o).expect("a card for the card test"))]
+            .into_iter()
+            .collect(),
+        _ => HashMap::new(),
+    };
+    let on_card = if ordinal.is_some() { layers } else { 0 };
     GenericHeteroTransformer::from_gguf_with_kv_quant(
         content,
         &mmap[..],
-        &HashMap::new(),
-        &HeteroPlan::forced_gpu(layers, 0, 0),
+        &cards,
+        &HeteroPlan::forced_gpu(layers, on_card, ordinal.unwrap_or(0)),
         KvQuant::Off,
         None,
     )
@@ -317,4 +330,403 @@ fn a_prefix_snapshot_resumes_to_the_same_logits() {
     assert_eq!(length, split);
     let again = flat(&model.forward_all(&row(&tokens[split..]), split).unwrap());
     assert_eq!(first, again);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn the_toy_on_a_card_gives_the_logits_of_the_host() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let mut host = toy();
+    let mut card = toy_on(Some(0));
+    for tag in ["a", "b"] {
+        let tokens = ids(&v, &format!("{tag}.ids"));
+        let input = Tensor::from_vec(tokens.clone(), (1, tokens.len()), &Device::Cpu).unwrap();
+        let on_host = host
+            .forward_all(&input, 0)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let input_card = input.to_device(&card.layers[0].cos.device()).unwrap();
+        let on_card = card
+            .forward_all(&input_card, 0)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let want = f32s(&v, &format!("{tag}.logits"));
+        within_rounding(
+            &on_card,
+            &want,
+            scale_of(&want),
+            want.len() / tokens.len(),
+            &format!("card {tag} against the reference"),
+        );
+        eprintln!(
+            "prompt {tag}: card against host {}",
+            max_diff(&on_card, &on_host)
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "diagnostic on a real file named by LOKEN_Q38_FILE, needs an idle CUDA card"]
+fn real_layers_on_a_card_against_the_host() {
+    let path = std::env::var("LOKEN_Q38_FILE").expect("LOKEN_Q38_FILE names the file");
+    let open = || {
+        let file = std::fs::File::open(&path).unwrap();
+        let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file) }.unwrap());
+        let mut content =
+            gguf_file::Content::read_mapped(&mut std::io::Cursor::new(&mmap[..]), mmap.clone())
+                .unwrap();
+        content.mmap_owner = Some(mmap.clone() as Arc<dyn std::any::Any + Send + Sync>);
+        (content, mmap)
+    };
+    let layers_on_card = 4;
+    let (c1, m1) = open();
+    let n = c1.metadata["qwen4exp.block_count"].to_u32().unwrap() as usize;
+    let mut host = GenericHeteroTransformer::from_gguf_with_kv_quant(
+        c1,
+        &m1[..],
+        &HashMap::new(),
+        &HeteroPlan::forced_gpu(n, 0, 0),
+        KvQuant::Off,
+        Some(512),
+    )
+    .unwrap();
+    let (c2, m2) = open();
+    let card = Device::new_cuda(0).unwrap();
+    let cards: HashMap<usize, Device> = [(0, card.clone())].into_iter().collect();
+    let mut onc = GenericHeteroTransformer::from_gguf_with_kv_quant(
+        c2,
+        &m2[..],
+        &cards,
+        &HeteroPlan::forced_gpu(n, layers_on_card, 0),
+        KvQuant::Off,
+        Some(512),
+    )
+    .unwrap();
+    let tokens: Vec<u32> = vec![760, 6511, 314, 9338, 369, 1234, 5678, 910];
+    let seq = tokens.len();
+    let ids = Tensor::from_vec(tokens.clone(), (1, seq), &Device::Cpu).unwrap();
+    let embed = host.embeddings.forward(&ids).unwrap();
+    let mut h = super::wide::widen_embedding(&embed, 4).unwrap();
+    let flat = |t: &Tensor| {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let report = |what: &str, a: &Tensor, b: &Tensor| {
+        let (x, y) = (flat(a), flat(b));
+        eprintln!(
+            "    {what:<26} max {:>10.3e}  scale {:>10.3e}  cosine {:.5}",
+            max_diff(&x, &y),
+            scale_of(&x),
+            cosine(&x, &y)
+        );
+    };
+    let to_card = |t: &Tensor| t.to_device(&card).unwrap();
+    // Fill the card's free memory with NaN and give it back: whatever the allocator hands out
+    // next is stale, and a kernel that reads a byte nobody wrote shows it.
+    let poison = |gib: usize| {
+        let held: Vec<Tensor> = (0..gib)
+            .filter_map(|_| Tensor::full(f32::NAN, 256usize << 20, &card).ok())
+            .collect();
+        drop(held);
+    };
+    let poisoned = std::env::var("LOKEN_Q38_POISON").is_ok();
+    for i in 0..layers_on_card {
+        if poisoned {
+            poison(6);
+        }
+        eprintln!(
+            "layer {i} (poisoned: {poisoned}): {}",
+            if matches!(host.layers[i].mixer, mixer::Mixer::Attention) {
+                "attention"
+            } else {
+                "delta rule"
+            }
+        );
+        let mask_h = host.make_mask(seq, 0, None).ok();
+        let mask_c = onc.make_mask(seq, 0, Some(0)).ok();
+        // The attention-side mixer, every intermediate.
+        let mut trace_h: Vec<(String, Tensor)> = Vec::new();
+        let mut trace_c: Vec<(String, Tensor)> = Vec::new();
+        let (mixed_h, inj_h) = host.layers[i]
+            .hyper
+            .as_ref()
+            .unwrap()
+            .attn
+            .mix_traced(&h, |k, t| trace_h.push((k.to_string(), t.clone())))
+            .unwrap();
+        let (mixed_c, _) = onc.layers[i]
+            .hyper
+            .as_ref()
+            .unwrap()
+            .attn
+            .mix_traced(&to_card(&h), |k, t| {
+                trace_c.push((k.to_string(), t.clone()))
+            })
+            .unwrap();
+        eprintln!("  hyper mixer (attention side):");
+        for ((k, a), (_, b)) in trace_h.iter().zip(&trace_c) {
+            report(k, a, b);
+        }
+        let x_h = mixed_h.to_dtype(DType::F32).unwrap();
+        let x_c16 = mixed_c.to_dtype(DType::F16).unwrap();
+        let x_c32 = mixed_c.to_dtype(DType::F32).unwrap();
+        let out_h;
+        if let mixer::Mixer::DeltaNet(_) = &host.layers[i].mixer {
+            // The projections.
+            let (ph, pc) = match (&host.layers[i].mixer, &onc.layers[i].mixer) {
+                (mixer::Mixer::DeltaNet(a), mixer::Mixer::DeltaNet(b)) => {
+                    (a.project(&x_h).unwrap(), b.project(&x_c16).unwrap())
+                }
+                _ => unreachable!(),
+            };
+            eprintln!("  projections (host f32 against card f16 input):");
+            report("qkv", &ph.0, &pc.0);
+            report("z", &ph.1, &pc.1);
+            report("alpha", &ph.2, &pc.2);
+            report("beta", &ph.3, &pc.3);
+            // The recurrence.
+            host.layers[i].mixer.reset();
+            let core_h = host.layers[i].mixer.forward(&x_h, 0).unwrap();
+            let run_card = |layer: &mut GenericTransformerLayer, x: &Tensor, rows: bool| {
+                layer.mixer.reset();
+                match &mut layer.mixer {
+                    mixer::Mixer::DeltaNet(g) => {
+                        if rows {
+                            g.forward_rows(x, 1, seq).unwrap()
+                        } else {
+                            g.forward_card(x, seq).unwrap()
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            };
+            eprintln!("  delta-rule core against the host:");
+            for call in 0..3 {
+                report(
+                    &format!("card fused, f16, call {call}"),
+                    &core_h,
+                    &run_card(&mut onc.layers[i], &x_c16, false),
+                );
+            }
+            report(
+                "card fused, f32 input",
+                &core_h,
+                &run_card(&mut onc.layers[i], &x_c32, false),
+            );
+            report(
+                "card per-row ops, f16",
+                &core_h,
+                &run_card(&mut onc.layers[i], &x_c16, true),
+            );
+            report(
+                "card per-row ops, f32",
+                &core_h,
+                &run_card(&mut onc.layers[i], &x_c32, true),
+            );
+            let o_h = host.layers[i].attn_output.forward(&core_h).unwrap();
+            let core_c = run_card(&mut onc.layers[i], &x_c16, false);
+            let o_c = onc.layers[i].attn_output.forward(&core_c).unwrap();
+            report("output projection", &o_h, &o_c);
+            out_h = o_h;
+        } else {
+            let a_h = host.layers[i]
+                .wide_attention(&x_h, mask_h.as_ref(), 0)
+                .unwrap();
+            let a_c = onc.layers[i]
+                .wide_attention(&x_c16, mask_c.as_ref(), 0)
+                .unwrap();
+            eprintln!("  attention block:");
+            report("block output", &a_h, &a_c);
+            out_h = a_h;
+        }
+        let r1 = super::hyper::combine(&h, &out_h, &inj_h.unwrap()).unwrap();
+        // The feed-forward side.
+        let mut fh: Vec<(String, Tensor)> = Vec::new();
+        let mut fc: Vec<(String, Tensor)> = Vec::new();
+        let (fm_h, _) = host.layers[i]
+            .hyper
+            .as_ref()
+            .unwrap()
+            .ffn
+            .mix_traced(&r1, |k, t| fh.push((k.to_string(), t.clone())))
+            .unwrap();
+        let (fm_c, _) = onc.layers[i]
+            .hyper
+            .as_ref()
+            .unwrap()
+            .ffn
+            .mix_traced(&to_card(&r1), |k, t| fc.push((k.to_string(), t.clone())))
+            .unwrap();
+        eprintln!("  hyper mixer (feed-forward side):");
+        for ((k, a), (_, b)) in fh.iter().zip(&fc) {
+            report(k, a, b);
+        }
+        let moe_h = host.layers[i].moe.as_ref().unwrap();
+        let moe_c = onc.layers[i].moe.as_ref().unwrap();
+        let xf_h = fm_h.to_dtype(DType::F32).unwrap();
+        let xf_c = fm_c.to_dtype(DType::F16).unwrap();
+        eprintln!("  mixture:");
+        report(
+            "router logits",
+            &moe_h.gate_inp.forward(&xf_h).unwrap(),
+            &moe_c
+                .gate_inp
+                .forward(&xf_c.to_dtype(DType::F32).unwrap())
+                .unwrap(),
+        );
+        let eh = moe_h
+            .forward_rows(
+                &xf_h,
+                &xf_h,
+                host.layers[i].embedding_length_for_moe,
+                host.layers[i].ffn_norm_eps,
+            )
+            .unwrap();
+        // The card twice: a result that moves between two identical calls reads memory nobody wrote.
+        for call in 0..3 {
+            let ec = moe_c
+                .forward_rows(
+                    &xf_c,
+                    &xf_c,
+                    onc.layers[i].embedding_length_for_moe,
+                    onc.layers[i].ffn_norm_eps,
+                )
+                .unwrap();
+            report(&format!("whole mixture, call {call}"), &eh, &ec);
+        }
+
+        h = host.layers[i]
+            .forward_wide(&h, mask_h.as_ref(), 0, None)
+            .unwrap();
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "diagnostic on a real file named by LOKEN_Q38_FILE, needs both cards idle"]
+fn real_model_layer_by_layer_on_the_cards_against_the_host() {
+    use crate::inference::place::layer_executor::{DeviceKind, HeteroSegment};
+    let path = std::env::var("LOKEN_Q38_FILE").expect("LOKEN_Q38_FILE names the file");
+    let open = || {
+        let file = std::fs::File::open(&path).unwrap();
+        let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file) }.unwrap());
+        let mut content =
+            gguf_file::Content::read_mapped(&mut std::io::Cursor::new(&mmap[..]), mmap.clone())
+                .unwrap();
+        content.mmap_owner = Some(mmap.clone() as Arc<dyn std::any::Any + Send + Sync>);
+        (content, mmap)
+    };
+    let (c1, m1) = open();
+    let n = c1.metadata["qwen4exp.block_count"].to_u32().unwrap() as usize;
+    let mut host = GenericHeteroTransformer::from_gguf_with_kv_quant(
+        c1,
+        &m1[..],
+        &HashMap::new(),
+        &HeteroPlan::forced_gpu(n, 0, 0),
+        KvQuant::Off,
+        Some(512),
+    )
+    .unwrap();
+    let (c2, m2) = open();
+    let cards: HashMap<usize, Device> = [
+        (0, Device::new_cuda(0).unwrap()),
+        (1, Device::new_cuda(1).unwrap()),
+    ]
+    .into_iter()
+    .collect();
+    let split = n / 2;
+    let plan = HeteroPlan {
+        segments: vec![
+            HeteroSegment {
+                kind: DeviceKind::Cuda(0),
+                layer_start: 0,
+                layer_end: split,
+                free_memory_bytes: u64::MAX,
+            },
+            HeteroSegment {
+                kind: DeviceKind::Cuda(1),
+                layer_start: split,
+                layer_end: n,
+                free_memory_bytes: u64::MAX,
+            },
+        ],
+        total_layers: n,
+        host_experts_from: None,
+    };
+    let mut onc = GenericHeteroTransformer::from_gguf_with_kv_quant(
+        c2,
+        &m2[..],
+        &cards,
+        &plan,
+        KvQuant::Off,
+        Some(512),
+    )
+    .unwrap();
+    let prompt =
+        std::env::var("LOKEN_Q38_TOKENS").unwrap_or_else(|_| "785,6722,314,9338,369".into());
+    let tokens: Vec<u32> = prompt.split(',').map(|t| t.parse().unwrap()).collect();
+    let seq = tokens.len();
+    let ids = Tensor::from_vec(tokens, (1, seq), &Device::Cpu).unwrap();
+    let embed = host.embeddings.forward(&ids).unwrap();
+    let mut hh = super::wide::widen_embedding(&embed, 4).unwrap();
+    let mut hc = hh.clone();
+    let flat = |t: &Tensor| {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    for i in 0..n {
+        let dev = match onc.layer_devs[i] {
+            LayerDevice::Cuda(k) => (k, onc.cuda_devices[&k].clone()),
+            LayerDevice::Cpu => unreachable!(),
+        };
+        let mask_h = host.make_mask(seq, 0, None).ok();
+        let mask_c = onc.make_mask(seq, 0, Some(dev.0)).ok();
+        hh = host.layers[i]
+            .forward_wide(&hh, mask_h.as_ref(), 0, None)
+            .unwrap();
+        hc = onc.layers[i]
+            .forward_wide(&hc.to_device(&dev.1).unwrap(), mask_c.as_ref(), 0, None)
+            .unwrap();
+        let (a, b) = (flat(&hh), flat(&hc));
+        // The last row alone: the one the head reads.
+        let w = a.len() / seq;
+        let (la, lb) = (&a[a.len() - w..], &b[b.len() - w..]);
+        eprintln!(
+            "layer {i:2}: cosine {:.5}  last row cosine {:.5}  scale {:>9.3e}  last row max diff {:>9.3e}",
+            cosine(&a, &b), cosine(la, lb), scale_of(la), max_diff(la, lb)
+        );
+        if i < 5 {
+            let per_row: Vec<String> = (0..seq)
+                .map(|r| {
+                    format!(
+                        "{:.4}/{:.2e}",
+                        cosine(&a[r * w..(r + 1) * w], &b[r * w..(r + 1) * w]),
+                        scale_of(&a[r * w..(r + 1) * w])
+                    )
+                })
+                .collect();
+            eprintln!("          rows (cosine/scale): {}", per_row.join("  "));
+        }
+    }
 }

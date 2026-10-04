@@ -181,6 +181,15 @@ impl NgramTable {
     /// The rows `rows`, dequantised and concatenated: `[rows.len() * row_dim]`.
     pub fn gather(&self, rows: &[u32]) -> Result<Vec<f32>> {
         let data = self.table.data()?;
+        // Every row is asked for before the first is read, so the reads of a token's rows, which
+        // lie far apart in the file, are in flight together.
+        #[cfg(unix)]
+        for r in rows {
+            let at = *r as usize * self.row_bytes;
+            if let Some(bytes) = data.get(at..at + self.row_bytes) {
+                crate::tensor::mapped::advise_bytes(bytes, libc::MADV_WILLNEED, false);
+            }
+        }
         let mut out = vec![0f32; rows.len() * self.row_dim];
         for (r, y) in rows.iter().zip(out.chunks_exact_mut(self.row_dim)) {
             let at = *r as usize * self.row_bytes;

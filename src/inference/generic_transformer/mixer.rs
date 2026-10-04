@@ -840,7 +840,7 @@ impl GatedDeltaNet {
     }
 
     /// `(qkv, z, alpha, beta)` of `x`, in the projection's dtype.
-    fn project(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    pub(super) fn project(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let d = self.dims;
         let (zn, nv) = (d.v_heads * d.v_dim, d.v_heads);
         match &self.proj {
@@ -935,7 +935,7 @@ impl GatedDeltaNet {
 
     /// One token at a time through tensor ops: the path for shapes the fused recurrence
     /// does not cover.
-    fn forward_rows(&mut self, x: &Tensor, b: usize, seq: usize) -> Result<Tensor> {
+    pub(super) fn forward_rows(&mut self, x: &Tensor, b: usize, seq: usize) -> Result<Tensor> {
         let d = self.dims;
         let (kg, vg, kd, vd) = (d.k_heads, d.v_heads, d.k_dim, d.v_dim);
         let rep = vg / kg;
@@ -1027,7 +1027,7 @@ impl GatedDeltaNet {
     /// The card path for one sequence: the projections and the convolution over every row
     /// at once, then one fused recurrence launch and the fused gated norm.
     #[cfg(feature = "cuda")]
-    fn forward_card(&mut self, x: &Tensor, seq: usize) -> Result<Tensor> {
+    pub(super) fn forward_card(&mut self, x: &Tensor, seq: usize) -> Result<Tensor> {
         use crate::inference::moe_cuda as k;
         let d = self.dims;
         let (kg, vg, kd, vd) = (d.k_heads, d.v_heads, d.k_dim, d.v_dim);

@@ -86,18 +86,34 @@ impl HyperMixer {
     /// The sublayer input `[b, seq, dim]`, and the write weights `[b, seq, streams]` when
     /// this mixer has them.
     pub fn mix(&self, r: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
+        self.mix_traced(r, |_, _| {})
+    }
+
+    /// [`Self::mix`], handing each intermediate to `sink` by name.
+    pub fn mix_traced(
+        &self,
+        r: &Tensor,
+        mut sink: impl FnMut(&str, &Tensor),
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let (b, seq, _) = r.dims3()?;
         let r = r.to_dtype(DType::F32)?;
         let xn = self.grouped_norm(&r)?;
+        sink("normed", &xn);
         let n = self.streams as f64;
-        let low = crate::tensor::ops::silu(&(self.down.forward(&xn)? / n)?)?;
-        let gate = crate::tensor::ops::sigmoid(&self.up.forward(&low)?)?;
+        let down = self.down.forward(&xn)?;
+        sink("down", &down);
+        let low = crate::tensor::ops::silu(&(down / n)?)?;
+        let up = self.up.forward(&low)?;
+        sink("up", &up);
+        let gate = crate::tensor::ops::sigmoid(&up)?;
         let gated = (xn.clone() * gate)?.reshape((b, seq, self.streams, self.dim))?;
         let mixed = (gated.sum(2)? / n)?;
+        sink("mixed", &mixed);
         let inj = match &self.inject {
             Some(w) => {
-                let z = (w.forward(&xn)? / n)?;
-                Some((crate::tensor::ops::sigmoid(&z)? * 2.0)?)
+                let raw = w.forward(&xn)?;
+                sink("inject", &raw);
+                Some((crate::tensor::ops::sigmoid(&(raw / n)?)? * 2.0)?)
             }
             None => None,
         };

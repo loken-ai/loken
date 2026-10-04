@@ -259,6 +259,8 @@ impl SparseAttention {
         mut on_scores: impl FnMut(usize, &[f32]),
     ) -> Result<Option<Vec<Vec<u32>>>> {
         let (_, seq, _) = x.dims3()?;
+        // The projections are dense float weights: they read the activation in F32.
+        let x = &x.to_dtype(DType::F32)?;
         let m = self.meta;
         if index_pos == 0 {
             self.cache.clear();
