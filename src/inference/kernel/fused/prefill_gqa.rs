@@ -23,7 +23,7 @@ extern "C" {
 }
 
 /// Head sizes `flash_prefill_gqa` has a kernel for.
-pub const FLASH_PREFILL_GQA_HEAD_DIMS: [usize; 2] = [64, 128];
+pub const FLASH_PREFILL_GQA_HEAD_DIMS: [usize; 3] = [64, 128, 256];
 
 /// Elements per 16-byte `cp.async` run of F16: every K/V row start must be a multiple.
 const F16_PER_CP_ASYNC: usize = 16 / std::mem::size_of::<half::f16>();

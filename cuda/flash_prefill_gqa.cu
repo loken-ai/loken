@@ -343,6 +343,11 @@ extern "C" int loken_flash_prefill_gqa_f16kv(
         case 128:
             return launch<128, 4>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, kv_tok_stride,
                                   kv_head_stride, scale, window, stream);
+        case 256:
+            // Half the warps of the narrower sizes: the O accumulator and the Q fragments of a
+            // 256-wide head fill the register file at four warps' worth of rows.
+            return launch<256, 2>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, kv_tok_stride,
+                                  kv_head_stride, scale, window, stream);
         default:
             return 1;
     }

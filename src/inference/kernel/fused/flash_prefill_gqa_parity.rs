@@ -107,7 +107,7 @@ fn chain(c: &Case, q: &Tensor, k: &Tensor, v: &Tensor, scale: f32, dev: &Device)
 
 /// The GQA flash prefill against exact attention, over the shapes prefill produces: a first
 /// chunk, a later chunk over a longer history, group sizes that do not divide the tile,
-/// lengths off the tile grid, both head sizes, and a sliding window.
+/// lengths off the tile grid, the head sizes (64, 128 and 256), and a sliding window.
 #[test]
 #[ignore = "needs a CUDA device"]
 fn flash_prefill_gqa_matches_exact_attention() {
@@ -168,6 +168,32 @@ fn flash_prefill_gqa_matches_exact_attention() {
             n_head: 8,
             n_kv: 4,
             hd: 128,
+            seq_q: 90,
+            seq_kv: 400,
+            window: 100,
+        },
+        // The 256-wide head of a hybrid model: 24 query heads over 2 kv heads, a first chunk,
+        // a later chunk over a longer history, lengths off the tile grid, and a window.
+        Case {
+            n_head: 24,
+            n_kv: 2,
+            hd: 256,
+            seq_q: 77,
+            seq_kv: 77,
+            window: 0,
+        },
+        Case {
+            n_head: 24,
+            n_kv: 2,
+            hd: 256,
+            seq_q: 130,
+            seq_kv: 613,
+            window: 0,
+        },
+        Case {
+            n_head: 8,
+            n_kv: 2,
+            hd: 256,
             seq_q: 90,
             seq_kv: 400,
             window: 100,
