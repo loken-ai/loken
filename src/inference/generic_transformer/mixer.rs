@@ -1049,6 +1049,11 @@ impl GatedDeltaNet {
         let conv = conv
             .reshape((d.conv_dim(), d.conv_kernel - 1))?
             .contiguous()?;
+        let prep = std::time::Instant::now();
+        let prepping = crate::inference::offload::stage_prof_enabled();
+        if prepping {
+            let _ = dev.synchronize();
+        }
         let (c, conv) = match k::fused_conv_silu_f16in(&qkv, &conv, &self.conv_w, d.conv_kernel)? {
             Some(out) => out,
             None => k::fused_conv_silu(
@@ -1085,7 +1090,16 @@ impl GatedDeltaNet {
         };
         let s = s.reshape((vg, vd, kd))?.contiguous()?;
         let scale = (1.0 / (kd as f64).sqrt()) as f32;
-        let (o, s) = k::gated_delta_net(&q, &key, &v, &g, &beta, &s, scale)?;
+        if prepping {
+            let _ = dev.synchronize();
+            crate::inference::offload::prof_record(
+                "gdn_conv_gate",
+                prep.elapsed().as_nanos() as u64,
+            );
+        }
+        let (o, s) = super::wide::staged("gdn_scan", &dev, || {
+            k::gated_delta_net(&q, &key, &v, &g, &beta, &s, scale)
+        })?;
         self.state = Some(SsmState::Card {
             conv,
             h: s.reshape((1, vg, vd, kd))?,
