@@ -498,6 +498,11 @@ impl GenericHeteroTransformer {
         self.config.rope_freq_base
     }
 
+    /// Whether the residual is wide: parallel streams behind gated mixers.
+    pub fn is_wide(&self) -> bool {
+        self.output_hyper.is_some()
+    }
+
     /// The model width: the residual stream and the embedding.
     pub fn hidden_size(&self) -> usize {
         self.config.embedding_length

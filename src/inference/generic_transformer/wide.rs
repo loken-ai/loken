@@ -21,6 +21,15 @@ pub(super) fn load_matrix(qt: QTensor) -> Result<QMatMul> {
     }
 }
 
+/// The activation type the sublayers read: what the card kernels take, F32 on the host.
+fn sublayer_dtype(x: &Tensor) -> DType {
+    if x.device().is_cpu() {
+        DType::F32
+    } else {
+        DType::F16
+    }
+}
+
 impl GenericTransformerLayer {
     /// The wide block of this layer, `None` on a model with a plain residual.
     pub(super) fn is_wide(&self) -> bool {
@@ -46,6 +55,7 @@ impl GenericTransformerLayer {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             hc.attn.mix(&r)?
         };
+        let mixed = mixed.to_dtype(sublayer_dtype(&mixed))?;
         let out = if matches!(self.mixer, mixer::Mixer::Attention) {
             self.wide_attention(&mixed, mask, index_pos)?
         } else {
@@ -58,6 +68,7 @@ impl GenericTransformerLayer {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             hc.ffn.mix(&r)?
         };
+        let mixed = mixed.to_dtype(sublayer_dtype(&mixed))?;
         let out = match self.moe.as_ref() {
             Some(moe) => moe.forward_rows(
                 &mixed,
