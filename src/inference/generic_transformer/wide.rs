@@ -23,23 +23,9 @@ pub(super) fn load_matrix(qt: QTensor) -> Result<QMatMul> {
     }
 }
 
-/// Run `f`; when the stage profile is on, wait for the device before and after and record
-/// the time under `stage`, so the shares a step spends in each part are measured and not
-/// guessed from launches.
-pub(super) fn staged<T>(
-    stage: &'static str,
-    dev: &Device,
-    f: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    if !crate::inference::offload::stage_prof_enabled() {
-        return f();
-    }
-    let _ = dev.synchronize();
-    let t = std::time::Instant::now();
-    let out = f()?;
-    let _ = dev.synchronize();
-    crate::inference::offload::prof_record(stage, t.elapsed().as_nanos() as u64);
-    Ok(out)
+/// Whether the rows are a prefill's: more than the one a decode step carries.
+fn prefilling(x: &Tensor) -> bool {
+    x.dims().get(1).is_some_and(|&n| n > 1)
 }
 
 /// The activation type the sublayers read: what the card kernels take, F32 on the host.
@@ -69,6 +55,31 @@ pub(super) fn dense_router(qt: QTensor) -> Result<crate::tensor::quantized::QMat
     }
 }
 
+/// Run `f` as the named stage of the wide layer: timed, with the device drained either side so the
+/// time is the stage's own, when the stage profile is on. With `settle` the device is drained after
+/// the stage, so the frees it queued complete before the next stage allocates: a prefill stage is
+/// allocated against the memory the card has, not against what the host has run ahead of.
+pub(super) fn staged<R>(
+    name: &'static str,
+    dev: &crate::tensor::Device,
+    settle: bool,
+    f: impl FnOnce() -> Result<R>,
+) -> Result<R> {
+    if !crate::inference::offload::stage_prof_enabled() {
+        let r = f();
+        if settle {
+            let _ = dev.synchronize();
+        }
+        return r;
+    }
+    let _ = dev.synchronize();
+    let started = std::time::Instant::now();
+    let r = f();
+    let _ = dev.synchronize();
+    crate::inference::offload::prof_record(name, started.elapsed().as_nanos() as u64);
+    r
+}
+
 impl GenericTransformerLayer {
     /// The wide block of this layer, `None` on a model with a plain residual.
     pub(super) fn is_wide(&self) -> bool {
@@ -86,9 +97,10 @@ impl GenericTransformerLayer {
         ngram: Option<&Tensor>,
     ) -> Result<Tensor> {
         let dev = x.device();
+        let settle = prefilling(x);
         let mut r = x.to_dtype(DType::F32)?;
         if let (Some(ple), Some(emb)) = (self.ngram.as_mut(), ngram) {
-            let add = staged("ngram", &dev, || ple.forward(&r, emb, index_pos))?;
+            let add = staged("ngram", &dev, settle, || ple.forward(&r, emb, index_pos))?;
             r = (r + add)?;
         }
         #[cfg(feature = "cuda")]
@@ -100,21 +112,21 @@ impl GenericTransformerLayer {
         {
             return self.forward_wide_on_card(r, mask, index_pos, &dev);
         }
-        let (mixed, inj) = staged("mix_token", &dev, || {
+        let (mixed, inj) = staged("mix_token", &dev, settle, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             let (mixed, inj) = hc.attn.mix(&r)?;
             Ok((mixed.to_dtype(sublayer_dtype(&mixed))?, inj))
         })?;
         let out = self.token_mixer(&mixed, mask, index_pos, &dev)?;
         let inj = inj.expect("the token mixer's mixer writes back");
-        r = staged("combine", &dev, || combine(&r, &out, &inj))?;
-        let (mixed, inj) = staged("mix_ffn", &dev, || {
+        r = staged("combine", &dev, settle, || combine(&r, &out, &inj))?;
+        let (mixed, inj) = staged("mix_ffn", &dev, settle, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             let (mixed, inj) = hc.ffn.mix(&r)?;
             Ok((mixed.to_dtype(sublayer_dtype(&mixed))?, inj))
         })?;
         let out = self.feed_forward(&mixed, &dev)?;
-        staged("combine", &dev, || {
+        staged("combine", &dev, settle, || {
             combine(
                 &r,
                 &out,
@@ -188,10 +200,12 @@ impl GenericTransformerLayer {
         index_pos: usize,
         dev: &Device,
     ) -> Result<Tensor> {
+        let settle = prefilling(mixed);
         let attends = matches!(self.mixer, mixer::Mixer::Attention);
         staged(
             if attends { "attention" } else { "delta_rule" },
             dev,
+            settle,
             || {
                 if attends {
                     self.wide_attention(mixed, mask, index_pos)
@@ -205,7 +219,8 @@ impl GenericTransformerLayer {
 
     /// The routed experts and the shared expert, or the dense feed-forward.
     fn feed_forward(&mut self, mixed: &Tensor, dev: &Device) -> Result<Tensor> {
-        staged("experts", dev, || match self.moe.as_ref() {
+        let settle = prefilling(mixed);
+        staged("experts", dev, settle, || match self.moe.as_ref() {
             Some(moe) => moe.forward_rows(
                 mixed,
                 mixed,
@@ -227,17 +242,18 @@ impl GenericTransformerLayer {
         dev: &Device,
     ) -> Result<Tensor> {
         let f16 = sublayer_dtype_of(dev) == DType::F16;
+        let settle = prefilling(&r);
         let (s, d) = {
             let h = self.hyper.as_ref().expect("a wide layer has its mixers");
             (h.attn.streams(), h.attn.dim())
         };
-        let (mixed, inj) = staged("mix_token", dev, || {
+        let (mixed, inj) = staged("mix_token", dev, settle, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             let xn = hc.attn.normed_on_card(&r)?;
             hc.attn.mix_on_card(&xn, f16)
         })?;
         let out = self.token_mixer(&mixed, mask, index_pos, dev)?;
-        let (r, xn) = staged("combine", dev, || {
+        let (r, xn) = staged("combine", dev, settle, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             combine_on_card(
                 &r,
@@ -248,13 +264,13 @@ impl GenericTransformerLayer {
                 d,
             )
         })?;
-        let (mixed, inj) = staged("mix_ffn", dev, || {
+        let (mixed, inj) = staged("mix_ffn", dev, settle, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             hc.ffn
                 .mix_on_card(&xn.expect("the norm was asked for"), f16)
         })?;
         let out = self.feed_forward(&mixed, dev)?;
-        let (r, _) = staged("combine", dev, || {
+        let (r, _) = staged("combine", dev, settle, || {
             combine_on_card(
                 &r,
                 &out,

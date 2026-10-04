@@ -25,6 +25,11 @@ fn scratch<T: cudarc::driver::DeviceRepr>(
     let take = || unsafe { dev.native().stream().alloc::<T>(n) };
     match take() {
         Err(e) if e.0 == CUDA_ERROR_OUT_OF_MEMORY => {
+            tracing::warn!(
+                "moe mmq scratch of {} MB on GPU{} failed; reclaiming",
+                n * std::mem::size_of::<T>() >> 20,
+                dev.native().ordinal()
+            );
             crate::tensor::cuda::reclaim_pool(dev.native());
             take()
         }

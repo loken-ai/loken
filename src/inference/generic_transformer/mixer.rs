@@ -1043,8 +1043,9 @@ impl GatedDeltaNet {
                 Tensor::zeros_on((1, vg, vd, kd), DType::F32, &x.device())?,
             ),
         };
+        use super::wide::staged;
         let dev = x.device();
-        let (qkv, z, alpha, beta) = super::wide::staged("gdn_project", &dev, || self.project(x))?;
+        let (qkv, z, alpha, beta) = staged("gdn_project", &dev, false, || self.project(x))?;
         let qkv = qkv.reshape((seq, d.conv_dim()))?.contiguous()?;
         let conv = conv
             .reshape((d.conv_dim(), d.conv_kernel - 1))?
@@ -1097,7 +1098,7 @@ impl GatedDeltaNet {
                 prep.elapsed().as_nanos() as u64,
             );
         }
-        let (o, s) = super::wide::staged("gdn_scan", &dev, || {
+        let (o, s) = staged("gdn_scan", &dev, false, || {
             k::gated_delta_net(&q, &key, &v, &g, &beta, &s, scale)
         })?;
         self.state = Some(SsmState::Card {
