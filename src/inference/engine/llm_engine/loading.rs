@@ -680,7 +680,21 @@ impl LlmEngine {
                     };
                     let source = crate::tensor::quantized::gguf_source::SplitGguf::open(&model_file)
                         .map_err(|e| anyhow!("deepseek_v41: open parts: {e}"))?;
-                    let cfg = DeepseekV41Config::from_meta(&source)?;
+                    let mut cfg = DeepseekV41Config::from_meta(&source)?;
+                    // A file that carries no routing prior borrows the one a companion file beside
+                    // it declares, so its cards start filled instead of filling over the first
+                    // request.
+                    if cfg.hot_experts.iter().all(Vec::is_empty) {
+                        if let Some(prior) =
+                            crate::inference::model::deepseek_v41::sibling::prior_beside(
+                                &model_file,
+                                cfg.n_layers,
+                                cfg.n_routed_experts,
+                            )
+                        {
+                            cfg.hot_experts = prior;
+                        }
+                    }
                     let mut model = DeepseekV41Model::load(&source, &cfg)
                         .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
                     model.set_expert_deferral(expert_deferral);

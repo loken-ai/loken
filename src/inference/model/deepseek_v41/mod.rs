@@ -28,6 +28,7 @@ pub mod load;
 pub mod model;
 pub mod moe;
 pub mod safetensors_source;
+pub mod sibling;
 pub mod source;
 pub mod token_map;
 
