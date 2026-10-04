@@ -851,15 +851,13 @@ pub enum DraftSource {
     /// The model's own GGUF.
     ModelFile,
     /// The released checkpoint in the hub cache, at this snapshot.
-    HubCheckpoint(PathBuf),
     Companion(PathBuf),
 }
 
 impl Dspark {
-    /// The draft a file beside the model declares, else the one the model file carries, else the
-    /// one the released checkpoint in the hub cache holds, else `None`. A companion that has moved
-    /// or does not load is passed over for the next source. Logs which it took, or why it took
-    /// none.
+    /// The draft a file beside the model declares, else the one the model file carries, else
+    /// `None`. A companion that has moved or does not load is passed over for the next source.
+    /// Logs which it took, or which sources it tried.
     pub fn locate<G: GgufSource>(model: &Path, file: &G) -> Option<Dspark> {
         let key = format!("{}.dspark.", super::ARCH);
         for path in super::sibling::find_beside(model, &key) {
@@ -882,7 +880,11 @@ impl Dspark {
             Ok(None) => {}
             Err(e) => tracing::warn!("DSpark draft in the model file not loaded: {e}"),
         }
-        Dspark::open()
+        tracing::info!(
+            "DSpark draft not available: no file beside {} and not the model file declares one",
+            model.display()
+        );
+        None
     }
 
     /// The draft `file` carries, `None` when its metadata declares none.
@@ -893,34 +895,10 @@ impl Dspark {
         }
     }
 
-    /// Open the checkpoint from the hub cache and load the draft, or `None` when it is not
-    /// present. Logs the outcome.
-    pub fn open() -> Option<Dspark> {
-        let Some((src, dir)) = find_source() else {
-            tracing::info!(
-                "DSpark draft not available: the model file carries none and no released \
-                 checkpoint is in the hub cache"
-            );
-            return None;
-        };
-        let loaded = DsparkConfig::from_config_json(&dir).and_then(|cfg| Dspark::load(&src, cfg));
-        match loaded {
-            Ok(d) => {
-                d.log_loaded(&DraftSource::HubCheckpoint(dir));
-                Some(d)
-            }
-            Err(e) => {
-                tracing::warn!("DSpark draft not loaded from {}: {e}", dir.display());
-                None
-            }
-        }
-    }
-
     fn log_loaded(&self, from: &DraftSource) {
         let from = match from {
             DraftSource::ModelFile => "the model file".to_string(),
             DraftSource::Companion(path) => format!("the companion file {}", path.display()),
-            DraftSource::HubCheckpoint(dir) => format!("the hub checkpoint {}", dir.display()),
         };
         tracing::info!(
             "DSpark draft loaded from {from}: {} stages, block_size {}, {} experts/stage",

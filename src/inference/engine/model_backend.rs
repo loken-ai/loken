@@ -855,14 +855,13 @@ struct PipelineHead {
 }
 
 impl DeepseekV41Backend {
-    /// The backend with the draft the hub checkpoint holds, when it is on the machine.
+    /// The backend with no draft.
     pub(crate) fn new(
         model: crate::inference::model::deepseek_v41::model::DeepseekV41Model,
         widest_ffn: usize,
         context_length: usize,
     ) -> Self {
-        let dspark = crate::inference::model::deepseek_v41::dspark::Dspark::open();
-        Self::with_draft(model, widest_ffn, context_length, dspark)
+        Self::with_draft(model, widest_ffn, context_length, None)
     }
 
     /// The backend with `dspark` as its draft, `None` for none.

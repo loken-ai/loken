@@ -809,32 +809,8 @@ mod tests {
 
         // The companion moves away: the model has no draft of its own and takes none.
         std::fs::rename(&carrying, dir.join("elsewhere")).unwrap();
-        with_no_hub(|| assert_eq!(locate(&plain), None));
+        assert_eq!(locate(&plain), None);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Run `f` with the hub cache pointed at nothing, so a test of the other sources cannot be
-    /// answered by the released checkpoint on the machine running it.
-    fn with_no_hub(f: impl FnOnce()) {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
-            ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "HOME"]
-                .into_iter()
-                .map(|k| (k, std::env::var_os(k)))
-                .collect();
-        let empty = std::env::temp_dir().join(format!("loken-no-hub-{}", std::process::id()));
-        std::fs::create_dir_all(&empty).unwrap();
-        for k in ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "HOME"] {
-            std::env::set_var(k, &empty);
-        }
-        f();
-        for (k, v) in saved {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
     }
 
     /// A completed file carries every key and every tensor of the one it completes, byte for
