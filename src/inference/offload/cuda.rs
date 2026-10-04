@@ -295,6 +295,13 @@ impl Card {
         need: usize,
         run: impl FnOnce() -> Result<T>,
     ) -> Option<Result<T>> {
+        // A step the card has no room for takes it from the coldest experts it keeps: they are
+        // uploaded again when they prove hot, and a prompt's attention and projections run on
+        // the card instead of falling to the host kernels, three times slower, for want of
+        // the few hundred megabytes a step holds.
+        if !self.has_free(need) {
+            self.evict_to_fit(need, u64::MAX);
+        }
         if self.declined.load(Ordering::Relaxed) && !self.has_free(need) {
             return None;
         }

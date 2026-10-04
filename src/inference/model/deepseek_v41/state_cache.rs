@@ -67,7 +67,9 @@ impl StateCache {
         Some(Self {
             store,
             identity,
-            ratios: model.compress_ratios().to_vec(),
+            // The ratios of the layers a state has: the model lists the draft's after them.
+            ratios: model.compress_ratios()[..model.n_layers().min(model.compress_ratios().len())]
+                .to_vec(),
             continue_cost_ratio: CONTINUE_COST_RATIO,
         })
     }
