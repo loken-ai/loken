@@ -8,9 +8,10 @@ use super::projection::Projection;
 use super::room::Room;
 use super::{AttnBlock, Offload};
 use crate::tensor::cuda::{
-    gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi, gpu_expert_tokens,
-    gpu_fp4_linear, gpu_fp8_linear, gpu_index_scores, gpu_quant_linear, gpu_sparse_attn,
-    iq2_xxs_tables, CudaDevice, ExpertWeight, QUANT_LINEAR_TILE_BYTES,
+    gpu_expert_into_layer, gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi,
+    gpu_expert_tokens, gpu_fp4_linear, gpu_fp8_linear, gpu_index_scores, gpu_layer_begin,
+    gpu_layer_sum, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables, CudaDevice, ExpertWeight,
+    LayerBuffers, QUANT_LINEAR_TILE_BYTES,
 };
 use crate::tensor::ops::rms_norm;
 use crate::tensor::ops::softmax_last_dim;
@@ -306,10 +307,10 @@ impl Card {
         // uploaded again when they prove hot, and a prompt's attention and projections run on
         // the card instead of falling to the host kernels, three times slower, for want of
         // the few hundred megabytes a step holds.
-        if !self.has_free(need) {
-            self.evict_to_fit(need, u64::MAX);
-        }
-        if self.declined.load(Ordering::Relaxed) && !self.has_free(need) {
+        // Memory it frees goes back to the device's pool, which the driver's free count does not
+        // show until the pool is trimmed, so a step that made room is not held to that count.
+        let made_room = !self.has_free(need) && self.evict_to_fit(need, u64::MAX);
+        if self.declined.load(Ordering::Relaxed) && !made_room && !self.has_free(need) {
             return None;
         }
         // The driver panics on some allocations it cannot make rather than erring; a step that
@@ -773,6 +774,72 @@ impl Card {
                 ],
             };
             gpu_expert_tokens(&self.dev, w, (inter, dim), xs, limit)
+        })
+    }
+
+    /// The weighted sum over the layer's slots, read back.
+    fn layer_sum(&self, layer: &LayerBuffers) -> Result<Vec<f32>> {
+        gpu_layer_sum(&self.dev, layer)
+    }
+
+    /// A layer's token context on this card (see `DeviceLayer`): `None` when it has no room.
+    fn layer_begin(&self, x: &[f32], dim: usize) -> Option<LayerBuffers> {
+        let need = x.len() * 2 * F32;
+        self.attempt("a layer's token context", need, || {
+            gpu_layer_begin(&self.dev, x, dim)
+        })
+        .and_then(|r| r.ok())
+    }
+
+    /// One expert over its rows of the layer, its products left in the layer's slots: from the
+    /// weights this card keeps for it, else staged over from the file.
+    fn layer_expert(
+        &self,
+        layer: &LayerBuffers,
+        e: &Expert,
+        order: usize,
+        toks: &[(u32, f32)],
+        limit: f32,
+    ) -> Option<Result<()>> {
+        let (inter, dim) = (e.w1.dims()[0], e.w1.dims()[1]);
+        let dtype_of = |p: &Projection| match p {
+            Projection::Quant(q)
+                if matches!(
+                    q.dtype(),
+                    GgmlDType::Iq2Xxs | GgmlDType::Q2K | GgmlDType::Q6K | GgmlDType::Q8_0
+                ) =>
+            {
+                Some(q.dtype())
+            }
+            _ => None,
+        };
+        let (d1, d3, d2) = (dtype_of(&e.w1)?, dtype_of(&e.w3)?, dtype_of(&e.w2)?);
+        let rows = toks.len();
+        let need = inter * dim * 4 * 2 + (rows * (dim + 3 * inter + 2 * dim)) * F32;
+        let resident = quant_blocks(&e.w1, GgmlDType::Iq2Xxs).and_then(|g| {
+            let key = (g.as_ptr() as usize, g.len());
+            let tier = self.tier();
+            tier.kept
+                .get(&key)
+                .map(|on| (on.gate.clone(), on.up.clone(), on.down.clone()))
+        });
+        self.attempt("an expert's rows of a layer", need, || {
+            let b1 = quant_blocks_any(&e.w1)?;
+            let b3 = quant_blocks_any(&e.w3)?;
+            let b2 = quant_blocks_any(&e.w2)?;
+            let w = match &resident {
+                Some((g, u, d)) => [
+                    (d1, ExpertWeight::Card(g.clone())),
+                    (d3, ExpertWeight::Card(u.clone())),
+                    (d2, ExpertWeight::Card(d.clone())),
+                ],
+                None => [
+                    (d1, ExpertWeight::Host(&b1)),
+                    (d3, ExpertWeight::Host(&b3)),
+                    (d2, ExpertWeight::Host(&b2)),
+                ],
+            };
+            gpu_expert_into_layer(&self.dev, w, (inter, dim), layer, order, toks, limit)
         })
     }
 
@@ -1241,7 +1308,52 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
     let batch_timings = timings.clone();
     let multi_cards = cards.clone();
     let multi_timings = timings.clone();
+    let (begin_cards, run_cards, end_cards, skip_cards) =
+        (cards.clone(), cards.clone(), cards.clone(), cards.clone());
     ExpertOffload {
+        device: Some(super::experts::DeviceLayer {
+            groups: cards.len(),
+            begin: Box::new(move |x, dim| {
+                let layers: Vec<Option<LayerBuffers>> =
+                    begin_cards.iter().map(|c| c.layer_begin(x, dim)).collect();
+                layers
+                    .iter()
+                    .any(Option::is_some)
+                    .then(|| Arc::new(layers) as Arc<dyn std::any::Any + Send + Sync>)
+            }),
+            run: Box::new(move |lane, ctx, expert, order, toks, limit| {
+                let layers = ctx.downcast_ref::<Vec<Option<LayerBuffers>>>()?;
+                let c = lane % run_cards.len();
+                let layer = layers.get(c)?.as_ref()?;
+                let r = run_cards[c].layer_expert(layer, expert, order, toks, limit);
+                // A card that declined has not taken its turn: the experts after it must not wait.
+                layer.finish(order);
+                r
+            }),
+            skip: Box::new(move |lane, ctx, order| {
+                if let Some(Some(layer)) = ctx
+                    .downcast_ref::<Vec<Option<LayerBuffers>>>()
+                    .and_then(|l| l.get(lane % skip_cards.len()))
+                {
+                    layer.finish(order);
+                }
+            }),
+            end: Box::new(move |ctx| {
+                let layers = ctx
+                    .downcast_ref::<Vec<Option<LayerBuffers>>>()
+                    .ok_or_else(|| Error::msg("a layer context of another kind"))?;
+                let mut sum: Option<Vec<f32>> = None;
+                for (card, layer) in end_cards.iter().zip(layers) {
+                    let Some(layer) = layer else { continue };
+                    let part = card.layer_sum(layer)?;
+                    match &mut sum {
+                        None => sum = Some(part),
+                        Some(s) => s.iter_mut().zip(&part).for_each(|(a, b)| *a += b),
+                    }
+                }
+                sum.ok_or_else(|| Error::msg("no card holds the layer"))
+            }),
+        }),
         lanes: cards.len() * LANES_PER_CARD,
         timings,
         warm: Some(Box::new(move |id, expert| {

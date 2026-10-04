@@ -89,6 +89,17 @@ impl Drop for DeferredExperts {
     }
 }
 
+/// The widest batch that is a speculative verify, not a prompt: its experts run in grouped launches
+/// over the rows, where a prompt's run one at a time.
+pub(crate) const VERIFY_BATCH_MAX_ROWS: usize = 32;
+
+/// A prompt's layer whose experts keep their tokens' rows and products on the cards: the offload's
+/// hooks and the layer's context.
+pub(crate) struct DevRun<'a> {
+    pub hooks: &'a super::experts::DeviceLayer,
+    pub ctx: &'a Arc<dyn std::any::Any + Send + Sync>,
+}
+
 /// Run the `active` experts of one block: resident ones on the cards, the misses on the cores at
 /// the same instant. `assign[e]` is expert `e`'s `(token, weight)` rows; `xv[t]` is token `t`'s
 /// row; `active_refs[i]` is the handle for `active[i]`; `n` is the batch width; `observed` is true
@@ -107,6 +118,7 @@ pub(crate) fn run_routed(
     swiglu_limit: f32,
     observed: bool,
     defer: usize,
+    dev: Option<DevRun>,
 ) -> Routed {
     let ref_of: HashMap<usize, Arc<Expert>> = active
         .iter()
@@ -212,7 +224,7 @@ pub(crate) fn run_routed(
         // every token is paid once for the whole block; the non-resident ones run in one pool region
         // over their rows, the same amortising. A prefill's wide batch stays on the lanes, where the
         // cards earn their crossing.
-        const VERIFY_BATCH_MAX: usize = 32;
+        const VERIFY_BATCH_MAX: usize = VERIFY_BATCH_MAX_ROWS;
         let pooled = n <= VERIFY_BATCH_MAX
             && !observed
             && off.run_multi.is_some()
@@ -267,7 +279,12 @@ pub(crate) fn run_routed(
                 Some(())
             })()
             .is_some();
-        if !pooled {
+        if let (false, Some(dev)) = (pooled, &dev) {
+            let toks_of = |e: usize| -> Vec<(u32, f32)> {
+                assign[e].iter().map(|&(t, w)| (t as u32, w)).collect()
+            };
+            done = off.run_all_dev(dev.hooks, dev.ctx, active, swiglu_limit, &fetch, &toks_of);
+        } else if !pooled {
             let (ran, fetch_ns, run_ns) = off.run_all(active, n, swiglu_limit, &fetch, &rows_of);
             done = ran;
             if crate::inference::offload::current().is_some() {

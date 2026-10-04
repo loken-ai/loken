@@ -1091,11 +1091,16 @@ static PINNED: std::sync::Mutex<Vec<Pinned>> = std::sync::Mutex::new(Vec::new())
 struct Staging<'a> {
     stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
     held: Vec<Pinned>,
+    /// One per upload, recorded behind its copy: waited on instead of the whole stream, which
+    /// other threads' work shares.
+    copied: Vec<cudarc::driver::CudaEvent>,
 }
 
 impl Drop for Staging<'_> {
     fn drop(&mut self) {
-        let _ = self.stream.synchronize();
+        for e in &self.copied {
+            let _ = e.synchronize();
+        }
         PINNED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1170,6 +1175,11 @@ impl<'a> Staging<'a> {
         if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
             return Err(Error(format!("staged upload: {r:?}")));
         }
+        self.copied.push(
+            stream
+                .record_event(None)
+                .map_err(|e| Error(format!("staged upload: record: {e:?}")))?,
+        );
         Ok(dst)
     }
 }
@@ -1203,6 +1213,7 @@ pub fn gpu_expert_tokens(
     let mut staging = Staging {
         stream: &stream,
         held: Vec::new(),
+        copied: Vec::new(),
     };
     let xs = stream
         .clone_htod(x)
@@ -1260,6 +1271,195 @@ pub fn gpu_expert_tokens(
         .map_err(|e| Error(format!("expert tokens download: {e}")))?;
     crate::inference::offload::prof_record("staged card wait", t_wait.elapsed().as_nanos() as u64);
     Ok((h_host, out_host))
+}
+
+/// A layer's routed experts' token context on a card: the layer's input rows `xin` [n, dim] and
+/// the accumulated weighted products `y` [n, dim], zeroed. The experts add into `y` in the order
+/// of their position in the layer, which a turnstile enforces, so the sum does not depend on how
+/// the threads that feed the card happened to be scheduled.
+pub struct LayerBuffers {
+    xin: CudaSlice<f32>,
+    y: CudaSlice<f32>,
+    n: usize,
+    dim: usize,
+    turn: (
+        std::sync::Mutex<(usize, std::collections::HashSet<usize>)>,
+        std::sync::Condvar,
+    ),
+}
+
+impl LayerBuffers {
+    /// Mark position `order` of the layer's experts as past: it added its products, or it will not.
+    /// Idempotent. Every position must be marked once, or a later one waits for ever.
+    pub fn finish(&self, order: usize) {
+        let mut g = self.turn.0.lock().unwrap_or_else(|e| e.into_inner());
+        g.1.insert(order);
+        loop {
+            let next = g.0;
+            if !g.1.remove(&next) {
+                break;
+            }
+            g.0 += 1;
+        }
+        self.turn.1.notify_all();
+    }
+
+    fn wait_turn(&self, order: usize) {
+        let mut g = self.turn.0.lock().unwrap_or_else(|e| e.into_inner());
+        while g.0 != order {
+            g = self.turn.1.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Open a layer's context on the card from its input rows `x` [n, dim].
+pub fn gpu_layer_begin(dev: &CudaDevice, x: &[f32], dim: usize) -> Result<LayerBuffers> {
+    let n = x.len() / dim.max(1);
+    let stream = dev.stream();
+    let xin = stream
+        .clone_htod(x)
+        .map_err(|e| alloc_err("layer context upload", e))?;
+    let y = with_oom_retry(dev, "layer sum", || stream.alloc_zeros::<f32>(n * dim))?;
+    Ok(LayerBuffers {
+        xin,
+        y,
+        n,
+        dim,
+        turn: Default::default(),
+    })
+}
+
+/// One expert over its rows of the layer on the card, its weighted products added into the layer's
+/// sum: the rows `toks` = (token, weight) are gathered from the layer's input, put through the
+/// expert as `gpu_expert_tokens` does, scaled by their weights and added, in turn after the
+/// experts before it (`order`). Nothing returns to the host.
+pub fn gpu_expert_into_layer(
+    dev: &CudaDevice,
+    weights: [(crate::tensor::quantized::GgmlDType, ExpertWeight); 3],
+    (inter, dim): (usize, usize),
+    layer: &LayerBuffers,
+    order: usize,
+    toks: &[(u32, f32)],
+    limit: f32,
+) -> Result<()> {
+    if dim != layer.dim || toks.is_empty() {
+        layer.finish(order);
+        return Err(Error(format!(
+            "expert rows: rows of {dim} against a layer of {}",
+            layer.dim
+        )));
+    }
+    /// Marks the expert's position past however the function leaves.
+    struct Past<'a>(&'a LayerBuffers, usize);
+    impl Drop for Past<'_> {
+        fn drop(&mut self) {
+            self.0.finish(self.1);
+        }
+    }
+    let _past = Past(layer, order);
+    let n = toks.len();
+    let stream = dev.stream();
+    let mut staging = Staging {
+        stream: &stream,
+        held: Vec::new(),
+        copied: Vec::new(),
+    };
+    let tok: Vec<u32> = toks.iter().map(|t| t.0).collect();
+    let w: Vec<f32> = toks.iter().map(|t| t.1).collect();
+    let up = |e| alloc_err("expert rows upload", e);
+    let (tok_d, w_d) = (
+        stream.clone_htod(&tok).map_err(up)?,
+        stream.clone_htod(&w).map_err(up)?,
+    );
+    macro_rules! launch {
+        ($name:expr, $total:expr, $($arg:expr),+) => {{
+            let func = dev.quantized_fn($name)?;
+            let cfg = LaunchConfig {
+                grid_dim: ($total.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = stream.launch_builder(&func);
+            $( b.arg($arg); )+
+            unsafe { b.launch(cfg) }.map_err(|e| Error(format!("{} launch: {e}", $name)))?;
+        }};
+    }
+    let xs = with_oom_retry(dev, "expert rows", || unsafe {
+        stream.alloc::<f32>(n * dim)
+    })?;
+    {
+        let (total, dim_i) = ((n * dim) as i64, dim as i64);
+        launch!(
+            "gather_rows_f32",
+            n * dim,
+            &layer.xin,
+            &tok_d,
+            &xs,
+            &total,
+            &dim_i
+        );
+    }
+    let product = |staging: &mut Staging,
+                   (dtype, weight): &(crate::tensor::quantized::GgmlDType, ExpertWeight),
+                   input: &CudaSlice<f32>,
+                   (out, inp): (usize, usize)|
+     -> Result<CudaSlice<f32>> {
+        let total = out * inp;
+        let want = total / dtype.block_size() * dtype.type_size();
+        let w = match weight {
+            ExpertWeight::Host(bytes) => {
+                if total % dtype.block_size() != 0 || bytes.len() != want {
+                    return Err(Error(format!(
+                        "{dtype:?} expert weight: {} bytes for [{out}, {inp}]",
+                        bytes.len()
+                    )));
+                }
+                let blob = staging.upload(dev, bytes)?;
+                dequantise_f32(dev, *dtype, &blob, total)?
+            }
+            ExpertWeight::Card(blob) => dequantise_f32(dev, *dtype, blob, total)?,
+        };
+        matmul_nt_f32(dev, input, &w, 1, n, inp, out)
+    };
+    let gate = product(&mut staging, &weights[0], &xs, (inter, dim))?;
+    let up_p = product(&mut staging, &weights[1], &xs, (inter, dim))?;
+    let h = with_oom_retry(dev, "expert swiglu", || unsafe {
+        stream.alloc::<f32>(n * inter)
+    })?;
+    {
+        let total = (n * inter) as i64;
+        launch!("swiglu_f32", n * inter, &gate, &up_p, &h, &total, &limit);
+    }
+    let out = product(&mut staging, &weights[2], &h, (dim, inter))?;
+    // In turn: this expert's add is queued after the ones before it in the layer.
+    layer.wait_turn(order);
+    let (total, dim_i) = ((n * dim) as i64, dim as i64);
+    launch!(
+        "scatter_add_f32",
+        n * dim,
+        &out,
+        &tok_d,
+        &w_d,
+        &layer.y,
+        &total,
+        &dim_i
+    );
+    layer.finish(order);
+    // Held to the card's pace: this expert's buffers are freed when its work is behind it, and
+    // threads that queued without limit would hold the card's memory for work not yet reached.
+    stream
+        .record_event(None)
+        .and_then(|e| e.synchronize())
+        .map_err(|e| Error(format!("expert rows: wait: {e:?}")))?;
+    Ok(())
+}
+
+/// The accumulated sum, `[n, dim]`, once every expert's work is queued.
+pub fn gpu_layer_sum(dev: &CudaDevice, layer: &LayerBuffers) -> Result<Vec<f32>> {
+    let _ = layer.n;
+    dev.stream()
+        .clone_dtoh(&layer.y)
+        .map_err(|e| Error(format!("layer sum download: {e}")))
 }
 
 /// Sparse attention with a per-head sink on the device: `q` [s, h, d], `kv` [n, d] one shared head,
@@ -2633,6 +2833,132 @@ mod iq2_xxs_gpu_tests {
             host.1, card.1,
             "staged and resident weights give the same bits"
         );
+    }
+
+    /// Experts run over their rows of a layer on the card, their weighted products added into the
+    /// layer's sum, equal the experts and the weighted sum on the CPU, to rounding; threads that
+    /// start the experts in the opposite order give the same bits.
+    #[test]
+    fn gpu_layer_sum_matches_the_cpu() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card layer sum is NOT covered by this run");
+            return;
+        };
+        let (inter, dim, n) = (256usize, 512usize, 13usize);
+        let wave = |len: usize, kk: f32, amp: f32| -> Vec<f32> {
+            (0..len).map(|i| ((i as f32) * kk).sin() * amp).collect()
+        };
+        let enc = |dtype: GgmlDType, v: &[f32]| {
+            let b = crate::tensor::quant_cpu::from_float_bytes(dtype, v).unwrap();
+            let mut d = vec![0f32; v.len()];
+            crate::tensor::quant_cpu::to_float_bytes(dtype, &b, &mut d).unwrap();
+            (b, d)
+        };
+        struct E {
+            gb: Vec<u8>,
+            ub: Vec<u8>,
+            db: Vec<u8>,
+            gd: Vec<f32>,
+            ud: Vec<f32>,
+            dd: Vec<f32>,
+        }
+        let experts: Vec<E> = (0..3)
+            .map(|j| {
+                let f = 0.011 + 0.003 * j as f32;
+                let (gb, gd) = enc(GgmlDType::Iq2Xxs, &wave(inter * dim, f, 0.08));
+                let (ub, ud) = enc(GgmlDType::Iq2Xxs, &wave(inter * dim, f * 1.3, 0.08));
+                let (db, dd) = enc(GgmlDType::Q2K, &wave(dim * inter, f * 0.9, 0.08));
+                E {
+                    gb,
+                    ub,
+                    db,
+                    gd,
+                    ud,
+                    dd,
+                }
+            })
+            .collect();
+        let x = wave(n * dim, 0.29, 1.0);
+        let limit = 7.0f32;
+        // Every token goes to every expert, with weights that differ, so the sums have three terms
+        // whose order would show in the last bits.
+        let weight = |t: usize, j: usize| 0.25 + 0.1 * ((t + 3 * j) % 5) as f32;
+        let toks =
+            |j: usize| -> Vec<(u32, f32)> { (0..n).map(|t| (t as u32, weight(t, j))).collect() };
+        let cpu_expert = |e: &E, t: usize| -> Vec<f32> {
+            let h: Vec<f32> = (0..inter)
+                .map(|i| {
+                    let dot = |w: &[f32]| {
+                        (0..dim)
+                            .map(|c| x[t * dim + c] * w[i * dim + c])
+                            .sum::<f32>()
+                    };
+                    let (g, u) = (dot(&e.gd).min(limit), dot(&e.ud).clamp(-limit, limit));
+                    g / (1.0 + (-g).exp()) * u
+                })
+                .collect();
+            (0..dim)
+                .map(|o| (0..inter).map(|c| h[c] * e.dd[o * inter + c]).sum())
+                .collect()
+        };
+        let mut want = vec![0f32; n * dim];
+        for t in 0..n {
+            for (j, e) in experts.iter().enumerate() {
+                let out = cpu_expert(e, t);
+                for c in 0..dim {
+                    want[t * dim + c] += weight(t, j) * out[c];
+                }
+            }
+        }
+        let run_one = |layer: &LayerBuffers, j: usize| {
+            let e = &experts[j];
+            gpu_expert_into_layer(
+                &dev,
+                [
+                    (GgmlDType::Iq2Xxs, ExpertWeight::Host(&e.gb)),
+                    (GgmlDType::Iq2Xxs, ExpertWeight::Host(&e.ub)),
+                    (GgmlDType::Q2K, ExpertWeight::Host(&e.db)),
+                ],
+                (inter, dim),
+                layer,
+                j,
+                &toks(j),
+                limit,
+            )
+            .unwrap();
+        };
+        // In order on one thread.
+        let layer = gpu_layer_begin(&dev, &x, dim).unwrap();
+        for j in 0..3 {
+            run_one(&layer, j);
+        }
+        let a = gpu_layer_sum(&dev, &layer).unwrap();
+        let worst = a
+            .iter()
+            .zip(&want)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        let range = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(
+            worst <= 1e-3 * range.max(1.0),
+            "worst {worst} of range {range}"
+        );
+        // Started last-first on three threads: the turnstile adds them in order all the same.
+        for _ in 0..3 {
+            let layer = gpu_layer_begin(&dev, &x, dim).unwrap();
+            std::thread::scope(|s| {
+                for j in (0..3).rev() {
+                    let (layer, run_one) = (&layer, &run_one);
+                    s.spawn(move || run_one(layer, j));
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+            });
+            assert_eq!(
+                a,
+                gpu_layer_sum(&dev, &layer).unwrap(),
+                "the order the experts ran in changed the sum"
+            );
+        }
     }
 
     /// A rectangular row-major product on the card equals the one on the CPU, to rounding.

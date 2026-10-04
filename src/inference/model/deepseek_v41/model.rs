@@ -3221,6 +3221,7 @@ mod oracle_gate {
         // Every expert is the host's: the cards decline all of them.
         model.offload_experts(Some(std::sync::Arc::new(ExpertOffload {
             lanes: 1,
+            device: None,
             timings: std::sync::Arc::new(Default::default()),
             warm: None,
             run: Box::new(|_, _, _, _, _| None),
@@ -3311,6 +3312,7 @@ mod oracle_gate {
         let mut model = DeepseekV41Model::load(&source, &cfg).unwrap();
         model.offload_experts(Some(std::sync::Arc::new(ExpertOffload {
             lanes: 1,
+            device: None,
             timings: std::sync::Arc::new(Default::default()),
             warm: None,
             run: Box::new(|_, _, _, _, _| None),

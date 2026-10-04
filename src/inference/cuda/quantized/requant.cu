@@ -1161,6 +1161,26 @@ extern "C" __global__ void dequant_q6_k_f32(
     out[idx] = d * (float) sc[l / 16 + 2 * k] * (float) q;
 }
 
+// Rows of `xin` [n, dim] named by `idx`, one value per thread: an expert's input tokens.
+extern "C" __global__ void gather_rows_f32(
+        const float * __restrict__ xin, const unsigned int * __restrict__ idx,
+        float * __restrict__ out, const long total, const long dim) {
+    const long i = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
+    if (i >= total) return;
+    out[i] = xin[(long) idx[i / dim] * dim + i % dim];
+}
+
+// An expert's rows `out` [rows, dim], each scaled by its routing weight and added to its token's row
+// of `y` [n, dim]. An expert names a token once, so no two threads of a launch touch one value;
+// launches on a stream run one after another, so the experts add in the order they were queued.
+extern "C" __global__ void scatter_add_f32(
+        const float * __restrict__ out, const unsigned int * __restrict__ tok,
+        const float * __restrict__ w, float * __restrict__ y, const long total, const long dim) {
+    const long i = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
+    if (i >= total) return;
+    y[(long) tok[i / dim] * dim + i % dim] += w[i / dim] * out[i];
+}
+
 // SwiGLU over a prompt's rows, one value per thread: the expert's gate and up products clamped as
 // the reference clamps them when `limit` is positive, then silu(gate) * up.
 extern "C" __global__ void swiglu_f32(

@@ -138,7 +138,45 @@ impl Expert {
 /// Routed experts run somewhere other than the CPU, `lanes` of them at once. `run(lane, expert, rows,
 /// swiglu_limit)` takes an expert's input rows, row-major, and returns the rows entering its w2 and
 /// its output, or `None` for an expert whose storage it cannot run, which the CPU then runs.
+/// The token context of one layer's routed experts held where the offload computes: the layer's
+/// input rows on each card and a slot for each (token, chosen expert) product. The experts a
+/// card runs gather their rows there and put their weighted products in their slots, so nothing
+/// returns to the host per expert; the sum over a token's slots is read once at the end.
+pub struct DeviceLayer {
+    /// How many devices share a layer's experts: expert `e` is the device `e % groups`'s.
+    pub groups: usize,
+    /// Open a layer's context from its input `x` [n, dim]. `None` when the offload has no room.
+    #[allow(clippy::type_complexity)]
+    pub begin:
+        Box<dyn Fn(&[f32], usize) -> Option<Arc<dyn std::any::Any + Send + Sync>> + Send + Sync>,
+    /// Run `expert` on lane `lane` over its `(token, weight)` rows, as the `order`th of its
+    /// device's experts of the layer: the products are added in that order. `None` where the lane
+    /// declines and the host runs the expert.
+    #[allow(clippy::type_complexity)]
+    pub run: Box<
+        dyn Fn(
+                usize,
+                &Arc<dyn std::any::Any + Send + Sync>,
+                &Expert,
+                usize,
+                &[(u32, f32)],
+                f32,
+            ) -> Option<Result<()>>
+            + Send
+            + Sync,
+    >,
+    /// Mark the `order`th expert of lane `lane`'s device as past without a run, when it could not
+    /// be run at all.
+    #[allow(clippy::type_complexity)]
+    pub skip: Box<dyn Fn(usize, &Arc<dyn std::any::Any + Send + Sync>, usize) + Send + Sync>,
+    /// The sum of every device's products, `[n, dim]`.
+    #[allow(clippy::type_complexity)]
+    pub end: Box<dyn Fn(&Arc<dyn std::any::Any + Send + Sync>) -> Result<Vec<f32>> + Send + Sync>,
+}
+
 pub struct ExpertOffload {
+    /// A prompt's experts held on the cards' side (see `DeviceLayer`), where the offload has it.
+    pub device: Option<DeviceLayer>,
     pub lanes: usize,
     #[allow(clippy::type_complexity)]
     /// `(lane, tokens in the batch, expert, its rows, the SwiGLU clamp)`. The batch's size is
@@ -199,6 +237,61 @@ pub struct ExpertOffload {
 }
 
 impl ExpertOffload {
+    /// Run the `active` experts of a layer over the context `ctx` of the device layer, each on the
+    /// lane its number names. An expert a lane ran answers `Some(Ok(..))` with empty vectors - its
+    /// products are in the context - and one a lane declined answers `None` for the host.
+    #[allow(clippy::type_complexity)]
+    pub fn run_all_dev(
+        &self,
+        hooks: &DeviceLayer,
+        ctx: &Arc<dyn std::any::Any + Send + Sync>,
+        active: &[usize],
+        swiglu_limit: f32,
+        fetch: &(dyn Fn(usize) -> Result<Arc<Expert>> + Sync),
+        rows_of: &(dyn Fn(usize) -> Vec<(u32, f32)> + Sync),
+    ) -> Vec<Option<Result<(Vec<f32>, Vec<f32>)>>> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut done: Vec<Option<Result<(Vec<f32>, Vec<f32>)>>> =
+            (0..active.len()).map(|_| None).collect();
+        let next = AtomicUsize::new(0);
+        let slots = std::sync::Mutex::new(&mut done);
+        let lanes = self.lanes.max(1);
+        let groups = hooks.groups.max(1);
+        // The place of each expert among its device's: the order its products are added in.
+        let order_of: Vec<usize> = {
+            let mut seen = vec![0usize; groups];
+            active
+                .iter()
+                .map(|&e| {
+                    seen[e % groups] += 1;
+                    seen[e % groups] - 1
+                })
+                .collect()
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..lanes {
+                let (next, slots, order_of) = (&next, &slots, &order_of);
+                scope.spawn(move || loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&e) = active.get(i) else { break };
+                    let home = e % lanes;
+                    let r = match fetch(e) {
+                        Ok(expert) => {
+                            (hooks.run)(home, ctx, &expert, order_of[i], &rows_of(e), swiglu_limit)
+                                .map(|r| r.map(|()| (Vec::new(), Vec::new())))
+                        }
+                        Err(err) => {
+                            (hooks.skip)(home, ctx, order_of[i]);
+                            Some(Err(err))
+                        }
+                    };
+                    slots.lock().unwrap()[i] = r;
+                });
+            }
+        });
+        done
+    }
+
     /// Run the `active` experts across the lanes, each on the lane its number names, and
     /// answer in the order asked, `None` where a lane declined and the caller runs the expert
     /// itself. `fetch` builds an expert by number and `rows_of` gives its input rows;

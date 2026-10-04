@@ -285,6 +285,25 @@ impl Moe {
                 .collect()
         };
         let routed_started = std::time::Instant::now();
+        // A prompt's experts keep their tokens' rows and their products on the cards: the layer's
+        // input crosses once per card and the sum over each token's slots comes back once.
+        let layer_dev = match (&offload, n > 1, observer.is_none()) {
+            (Some(off), true, true)
+                if n > crate::inference::offload::moe_dispatch::VERIFY_BATCH_MAX_ROWS =>
+            {
+                off.device.as_ref().and_then(|d| {
+                    let flat = x2
+                        .contiguous()
+                        .ok()?
+                        .flatten_all()
+                        .ok()?
+                        .to_vec1::<f32>()
+                        .ok()?;
+                    (d.begin)(&flat, self.dim).map(|ctx| (d, ctx))
+                })
+            }
+            _ => None,
+        };
         // The routed experts of this block, resident ones on the cards and the misses on the
         // cores at once; run on the host from its mapping when no card placement is set.
         let (mut done, mut cpu_side, deferred) = if let Some(off) = &offload {
@@ -299,6 +318,9 @@ impl Moe {
                 self.swiglu_limit,
                 observer.is_some(),
                 defer,
+                layer_dev.as_ref().map(|(hooks, ctx)| {
+                    crate::inference::offload::moe_dispatch::DevRun { hooks, ctx }
+                }),
             )
         } else {
             (
@@ -407,7 +429,8 @@ impl Moe {
             // that served it, in expert order.
             let mut serving: Vec<Vec<(usize, usize, f32)>> = vec![Vec::new(); n];
             for (i, &e) in active.iter().enumerate() {
-                if outs[i].is_none() {
+                // An expert a card ran left its products in the layer's slots, not here.
+                if outs[i].as_ref().is_none_or(Vec::is_empty) {
                     continue;
                 }
                 for (r, &(t, w)) in assign[e].iter().enumerate() {
@@ -415,6 +438,17 @@ impl Moe {
                 }
             }
             let dim = self.dim;
+            // The cards' share: each token's slots summed there, added to what the host formed.
+            if let Some((hooks, ctx)) = &layer_dev {
+                let sum = (hooks.end)(ctx)?;
+                y.par_iter_mut()
+                    .zip(sum.par_chunks(dim))
+                    .for_each(|(row, part)| {
+                        for (a, b) in row.iter_mut().zip(part) {
+                            *a += b;
+                        }
+                    });
+            }
             y.par_iter_mut()
                 .zip(serving.par_iter())
                 .for_each(|(row, parts)| {
@@ -702,6 +736,7 @@ mod tests {
         let counter = ran.clone();
         *moe.offload.write().unwrap() = Some(Arc::new(ExpertOffload {
             lanes: 3,
+            device: None,
             timings: Arc::new(Default::default()),
             warm: None,
             run: Box::new(move |_lane, _tokens, expert, rows, limit| {
@@ -741,6 +776,7 @@ mod tests {
     fn toy_cards() -> Arc<ExpertOffload> {
         Arc::new(ExpertOffload {
             lanes: 1,
+            device: None,
             timings: Arc::new(Default::default()),
             warm: None,
             run: Box::new(|_, _, _, _, _| None),
