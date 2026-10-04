@@ -147,6 +147,10 @@ pub trait ExpertLoader: Send + Sync {
     fn release(&self, expert: &Expert) {
         expert.dont_need();
     }
+    /// The file the experts are mapped from, when there is one.
+    fn backing_file(&self) -> Option<Arc<std::fs::File>> {
+        None
+    }
 }
 
 /// Tier accounting, for observability and to let the gate assert eviction actually happened.
@@ -251,6 +255,11 @@ impl ExpertStore {
             .collect();
         v.sort();
         v
+    }
+
+    /// The file the experts are mapped from, when there is one.
+    pub fn backing_file(&self) -> Option<Arc<std::fs::File>> {
+        self.loader.backing_file()
     }
 
     /// Build expert `id`'s views without touching the tier: for probes.
@@ -555,6 +564,14 @@ impl ExpertSet {
         }
     }
 
+    /// How many experts the kept tier holds; 0 when resident.
+    pub fn capacity(&self) -> usize {
+        match self {
+            ExpertSet::Streamed(s) => s.capacity.load(Ordering::Relaxed),
+            ExpertSet::Resident(_) => 0,
+        }
+    }
+
     /// Resize a streamed set's hot cache; a no-op when resident.
     pub fn set_capacity(&self, capacity: usize) {
         if let ExpertSet::Streamed(s) = self {
@@ -564,14 +581,6 @@ impl ExpertSet {
 }
 
 /// An `ExpertLoader` over experts already held in memory, handing back a clone on each build. It
-/// How many experts the kept tier holds; 0 when resident.
-pub fn capacity(&self) -> usize {
-    match self {
-        ExpertSet::Streamed(s) => s.capacity.load(Ordering::Relaxed),
-        ExpertSet::Resident(_) => 0,
-    }
-}
-
 /// backs the machinery gate (a small cache over these must match the resident forward) and is the
 /// shape a disk-backed, dequant-on-read loader will replace to actually shrink the footprint.
 pub struct VecExpertLoader {
@@ -721,6 +730,10 @@ impl ExpertLoader for UnitExpertLoader {
 
     fn count(&self) -> usize {
         self.experts.len()
+    }
+
+    fn backing_file(&self) -> Option<Arc<std::fs::File>> {
+        self.anchor.as_ref().map(|(f, _)| f.clone())
     }
 
     fn release(&self, expert: &Expert) {

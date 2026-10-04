@@ -909,6 +909,7 @@ mod tests {
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = ran.clone();
         *moe.offload.write().unwrap() = Some(Arc::new(ExpertOffload {
+            host_expert_ns: Default::default(),
             lanes: 3,
             device: None,
             timings: Arc::new(Default::default()),
@@ -1008,6 +1009,7 @@ mod tests {
     /// An offload with a block path whose card holds the experts `on_toy_card` names.
     fn toy_cards() -> Arc<ExpertOffload> {
         Arc::new(ExpertOffload {
+            host_expert_ns: Default::default(),
             lanes: 1,
             device: None,
             timings: Arc::new(Default::default()),

@@ -175,6 +175,9 @@ pub struct DeviceLayer {
 }
 
 pub struct ExpertOffload {
+    /// Nanoseconds the host takes for one routed expert of a decode, smoothed over the blocks
+    /// that ran some there: what a use on a card saves.
+    pub host_expert_ns: Arc<std::sync::atomic::AtomicU64>,
     /// A prompt's experts held on the cards' side (see `DeviceLayer`), where the offload has it.
     pub device: Option<DeviceLayer>,
     pub lanes: usize,

@@ -713,7 +713,7 @@ impl LlmEngine {
                     // A file that carries no routing prior borrows the one a companion file beside
                     // it declares, so its cards start filled instead of filling over the first
                     // request.
-                    if companion_first || cfg.hot_experts.iter().all(Vec::is_empty) {
+                    if cfg.hot_experts.iter().all(Vec::is_empty) {
                         if let Some(prior) =
                             crate::inference::model::deepseek_v41::sibling::prior_beside(
                                 &model_file,

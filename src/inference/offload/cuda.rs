@@ -3,6 +3,7 @@
 //! The weights every token reads stay on the card once sent; routed experts are kept as the
 //! room allows and never traded for one another.
 
+use super::admission::Admission;
 use super::experts::{Expert, ExpertOffload};
 use super::projection::Projection;
 use super::room::Room;
@@ -65,6 +66,8 @@ struct ExpertOnCard {
     gate: Arc<CudaSlice<u8>>,
     up: Arc<CudaSlice<u8>>,
     down: Arc<CudaSlice<u8>>,
+    /// The sightings it carried in, so the uses it earned here are the difference.
+    admitted_freq: u64,
     used: u64,
     /// How many times a token has routed to this expert while it was kept. A card sized below the
     /// working set keeps the most FREQUENTLY routed, not the most recent: a traced generation
@@ -73,12 +76,6 @@ struct ExpertOnCard {
     freq: u64,
     bytes: usize,
 }
-
-/// How many times an expert must be seen before a slot on a full card is spent on it: a card the
-/// working set overflows keeps only the experts a conversation keeps returning to, and a third
-/// sighting is the evidence it will be asked again rather than a one-off tail. The one-off experts
-/// stay on the host, so the slots settle on the hottest of the set.
-const ADMIT_AFTER: u32 = 3;
 
 type ExpertKeys = (usize, usize);
 
@@ -137,6 +134,11 @@ pub struct Card {
     declined: AtomicBool,
     /// Whether a refusal on the always-read path has been said.
     said: AtomicBool,
+    /// How many sightings an expert needs before it is taken on, from the measured cost of an
+    /// upload against what a use saves.
+    admission: Admission,
+    /// Nanoseconds the host takes for one expert, smoothed; set when the card joins an offload.
+    host_expert_ns: OnceLock<Arc<AtomicU64>>,
 }
 
 impl Card {
@@ -152,6 +154,8 @@ impl Card {
             tables: OnceLock::new(),
             declined: AtomicBool::new(false),
             said: AtomicBool::new(false),
+            admission: Admission::new(protect as usize),
+            host_expert_ns: OnceLock::new(),
         }
     }
 
@@ -383,7 +387,11 @@ impl Card {
         };
         // A slot goes to an expert the conversation keeps returning to, not to whoever reached the
         // card first: the one-off tail stays on the host rather than churning the hot set out.
-        if n < ADMIT_AFTER && !proven {
+        let host_ns = self
+            .host_expert_ns
+            .get()
+            .map_or(0, |h| h.load(Ordering::Relaxed));
+        if n < self.admission.sightings(host_ns) && !proven {
             return None;
         }
         // How hot the one asking in is: it evicts only experts colder than itself, so a resident
@@ -463,6 +471,7 @@ impl Card {
                 // count it was seen means it is only traded for one demonstrably hotter, and the
                 // set converges instead of thrashing.
                 freq: n as u64,
+                admitted_freq: n as u64,
                 bytes: total,
             },
         );
@@ -507,6 +516,12 @@ impl Card {
                         if let Some(v) = tier.kept.remove(&k) {
                             let s = tier.seen.entry(k).or_insert(0);
                             *s = (*s).max(v.freq.min(u32::MAX as u64) as u32);
+                            let host_ns = self
+                                .host_expert_ns
+                                .get()
+                                .map_or(0, |h| h.load(Ordering::Relaxed));
+                            self.admission
+                                .settle(v.freq.saturating_sub(v.admitted_freq), host_ns);
                         }
                         freed.push(bytes);
                     }
@@ -1472,9 +1487,13 @@ impl Offload for Cards {
 /// Threads that feed each card a prompt's experts: while one expert's weights are read into the
 /// staging buffer and cross the bus, another's products run on the card. An expert goes to the
 /// card its number names whichever thread takes it.
-const LANES_PER_CARD: usize = 2;
+const LANES_PER_CARD: usize = 2; // double buffering: one lane reads and crosses while the other computes
 
 pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
+    let host_expert_ns = Arc::new(AtomicU64::new(0));
+    for card in &cards {
+        let _ = card.host_expert_ns.set(host_expert_ns.clone());
+    }
     let cards = Arc::new(cards);
     let timings: Arc<[AtomicU64; 3]> = Arc::new(Default::default());
     let shared = timings.clone();
@@ -1487,6 +1506,7 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
     let (begin_cards, run_cards, end_cards, skip_cards) =
         (cards.clone(), cards.clone(), cards.clone(), cards.clone());
     ExpertOffload {
+        host_expert_ns,
         device: Some(super::experts::DeviceLayer {
             groups: cards.len(),
             begin: Box::new(move |x, dim| {

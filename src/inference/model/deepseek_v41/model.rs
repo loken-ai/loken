@@ -60,10 +60,9 @@ pub(crate) fn rope_table(
     ))
 }
 
-/// The layers ahead a decode reads experts for: far enough that a read of one expert, a few
-/// milliseconds, is under way before its layer's gate, near enough that the stream still says
-/// which experts the layer will route to.
-const EXPERT_READAHEAD_DISTANCE: usize = 1;
+/// Windows the read-ahead depth runs on its winner between rounds of trying its neighbours: four
+/// times the three windows of a round, so a round is a fifth of the time.
+const READAHEAD_EXPLOIT_WINDOWS: usize = 12;
 
 pub struct DeepseekV41Model {
     embed: Tensor,      // [vocab, dim]
@@ -84,16 +83,19 @@ pub struct DeepseekV41Model {
     rope_head_dim: usize,
     rms_eps: f32,
     /// How many layers ahead a decode starts reading the routed experts of, from the stream it
-    /// has by then; 0 reads none ahead. Timing only: the gate still decides the routing.
-    pub expert_readahead: usize,
+    /// has by then; 0 reads none ahead. Moved by the decode's own timing; timing only, the gate
+    /// still decides the routing.
+    readahead: crate::inference::offload::tuner::Tuner,
+    /// A depth held fixed in place of the controller's: for a test of the read-ahead itself.
+    readahead_pin: Option<usize>,
     /// The share of a token's routed experts whose host compute may finish a layer late; 0 keeps
     /// every layer exact.
     expert_deferral: f32,
-    // rope regimes: ratio-0 uses base theta with no YaRN; a band layer uses the compressed theta
-    // with YaRN from original_seq_len.
     /// The quality budget to calibrate at backend start, with the model's identity and the
     /// calibration text's tokens; taken once.
     quality: std::sync::Mutex<Option<(f64, String, Vec<u32>)>>,
+    // rope regimes: ratio-0 uses base theta with no YaRN; a band layer uses the compressed theta
+    // with YaRN from original_seq_len.
     rope_theta: f32,
     compress_rope_theta: f32,
     rope_factor: f32,
@@ -394,10 +396,17 @@ impl DeepseekV41Model {
             rope_head_dim: cfg.rope_head_dim,
             rms_eps: cfg.rms_eps as f32,
             expert_deferral: 0.0,
-            expert_readahead: std::env::var("LOKEN_EXPERT_READAHEAD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(EXPERT_READAHEAD_DISTANCE),
+            quality: std::sync::Mutex::new(None),
+            // Starts one layer ahead (the nearest stream that stands in for the layer's own) and
+            // may go as deep as the stack; a window is as many tokens as the stack has layers.
+            readahead: crate::inference::offload::tuner::Tuner::new(
+                "expert read-ahead depth",
+                1,
+                cfg.n_layers.saturating_sub(1),
+                cfg.n_layers,
+                READAHEAD_EXPLOIT_WINDOWS,
+            ),
+            readahead_pin: None,
             rope_theta: cfg.rope_theta,
             compress_rope_theta: cfg.compress_rope_theta,
             rope_factor: cfg.rope_factor,
@@ -787,7 +796,7 @@ impl DeepseekV41Model {
     /// product sends over for the call.
     pub fn transient_bytes(&self, tokens: usize) -> usize {
         /// Experts a card runs at once during a prompt: the threads that feed it.
-        const EXPERT_LANES_IN_FLIGHT: usize = 4;
+        const EXPERT_LANES_IN_FLIGHT: usize = 4; // lanes per card times the pair of cards a plan spans
         let f = std::mem::size_of::<f32>();
         let inter = self
             .blocks
@@ -1086,15 +1095,6 @@ impl DeepseekV41Model {
         }
     }
 
-    /// Treat, per layer, the given experts as the resident ones in place of the live tiers.
-    pub fn set_resident_override(&self, per_layer: Option<&[std::collections::HashSet<usize>]>) {
-        for (i, b) in self.blocks.iter().enumerate() {
-            if let Some(b) = b {
-                *b.moe.resident_override.write().unwrap() =
-                    per_layer.and_then(|p| p.get(i).cloned());
-            }
-        }
-    }
     /// Ask for the routing that gives up the most disk reads within `budget` (KL, nats) of the
     /// exact output, to be calibrated when the backend starts.
     pub fn set_quality_policy(&self, budget: f64, identity: String, ids: Vec<u32>) {
@@ -1149,6 +1149,16 @@ impl DeepseekV41Model {
             .collect()
     }
 
+    /// Treat, per layer, the given experts as the resident ones in place of the live tiers.
+    pub fn set_resident_override(&self, per_layer: Option<&[std::collections::HashSet<usize>]>) {
+        for (i, b) in self.blocks.iter().enumerate() {
+            if let Some(b) = b {
+                *b.moe.resident_override.write().unwrap() =
+                    per_layer.and_then(|p| p.get(i).cloned());
+            }
+        }
+    }
+
     /// How many routed experts per token the share allows to finish late.
     fn deferred_experts(&self) -> usize {
         (self.expert_deferral * self.n_activated() as f32).floor() as usize
@@ -1180,6 +1190,8 @@ impl DeepseekV41Model {
     /// sequence one token at a time from a fresh state reproduces `forward_prefill`'s per-position
     /// logits, which is what the self-consistency gate checks.
     pub fn forward_decode(&self, token: u32, state: &mut DecodeState) -> Result<Tensor> {
+        let started = std::time::Instant::now();
+        let depth = self.readahead_pin.unwrap_or_else(|| self.readahead.value());
         let pos = state.pos;
         let (dim, hc) = (self.dim, self.hc_mult);
 
@@ -1246,8 +1258,8 @@ impl DeepseekV41Model {
                 }
                 state.captured[ci] = m;
             }
-            if self.expert_readahead > 0 {
-                if let Some(Some(ahead)) = self.blocks.get(i + self.expert_readahead) {
+            if depth > 0 {
+                if let Some(Some(ahead)) = self.blocks.get(i + depth) {
                     crate::inference::offload::stage("expert read-ahead", || {
                         ahead.advise_experts(&x)
                     })?;
@@ -1304,7 +1316,16 @@ impl DeepseekV41Model {
         let logits =
             crate::inference::offload::stage("head", || self.output.apply(&h.reshape((1, dim))?))?;
         state.pos += 1;
+        if self.readahead_pin.is_none() {
+            self.readahead
+                .note_token(started.elapsed().as_nanos() as u64);
+        }
         Ok(logits)
+    }
+
+    /// Hold the read-ahead depth at `depth` (or hand it back to the controller with `None`).
+    pub fn pin_readahead(&mut self, depth: Option<usize>) {
+        self.readahead_pin = depth;
     }
 
     /// Run layers `[from, to)` of a decode. This is `forward_decode` split at a layer boundary, so
@@ -3349,10 +3370,10 @@ mod oracle_gate {
                 .map(|&t| vecf_of(&model.forward_decode(t, &mut state).unwrap()))
                 .collect::<Vec<_>>()
         };
-        model.expert_readahead = 0;
+        model.pin_readahead(Some(0));
         let plain = decode(&model);
         let (routed_before, _, _, _) = crate::inference::offload::store::prediction_report();
-        model.expert_readahead = 1;
+        model.pin_readahead(Some(1));
         let ahead = decode(&model);
         let (routed_after, _, _, _) = crate::inference::offload::store::prediction_report();
         assert_eq!(plain, ahead, "read-ahead changed a decode's logits");
@@ -3372,6 +3393,7 @@ mod oracle_gate {
         let (mut model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 3);
         // Every expert is the host's: the cards decline all of them.
         model.offload_experts(Some(std::sync::Arc::new(ExpertOffload {
+            host_expert_ns: Default::default(),
             lanes: 1,
             device: None,
             timings: std::sync::Arc::new(Default::default()),
@@ -3463,6 +3485,7 @@ mod oracle_gate {
             crate::inference::model::deepseek_v41::DeepseekV41Config::from_meta(&source).unwrap();
         let mut model = DeepseekV41Model::load(&source, &cfg).unwrap();
         model.offload_experts(Some(std::sync::Arc::new(ExpertOffload {
+            host_expert_ns: Default::default(),
             lanes: 1,
             device: None,
             timings: std::sync::Arc::new(Default::default()),
@@ -3501,6 +3524,52 @@ mod oracle_gate {
         assert!(loss <= 0.005, "next-token agreement fell by {loss}");
     }
 
+    /// The quality budget end to end on a small model: a zero budget runs nothing and leaves the
+    /// logits bit for bit, a budget measures every candidate (divergence no smaller than zero,
+    /// reads saved counted) and a pick within it is applied.
+    #[test]
+    fn a_quality_budget_calibrates_and_zero_changes_nothing() {
+        use super::super::calibrate;
+        let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 3);
+        let run = |m: &DeepseekV41Model, ids: &[u32]| -> Result<Vec<Vec<f32>>> {
+            m.forward_prefill(ids)?.to_vec2::<f32>()
+        };
+        let plain = run(&model, &tokens).unwrap();
+        let resident = model.plan_residency();
+        let nothing = |_: &DeepseekV41Model, _: &[u32]| -> Result<Vec<Vec<f32>>> {
+            panic!("a zero budget must not run the model")
+        };
+        assert!(
+            calibrate::apply_budget(&model, 0.0, "k", &tokens, &resident, &nothing)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            run(&model, &tokens).unwrap(),
+            plain,
+            "a zero budget changed the logits"
+        );
+
+        let table = calibrate::measure(&model, &tokens, &resident, &run).unwrap();
+        assert_eq!(
+            table.len(),
+            calibrate::candidates(model.n_activated()).len()
+        );
+        assert!(table
+            .iter()
+            .all(|m| m.kl >= -1e-9 && m.saved_per_token >= 0.0));
+        assert_eq!(
+            run(&model, &tokens).unwrap(),
+            plain,
+            "measuring left a setting on"
+        );
+        let chosen = calibrate::pick(&table, 1e9);
+        if let Some(m) = chosen {
+            model.set_truncation(m.truncation());
+            assert!(model.take_saved() == 0);
+        }
+    }
+
     /// Independent sequences decoded together give each the logits it gives alone: attention runs
     /// per sequence over its own ring at its own position, so no sequence reads another's keys, and
     /// the shared FFN over the batch differs only by accumulation. This is the invariant a
@@ -3522,52 +3591,6 @@ mod oracle_gate {
         };
         for (ratios, kv_src, index_src) in layouts {
             let (model, tokens) = synthetic(ratios, kv_src, index_src, 0);
-            /// The quality budget end to end on a small model: a zero budget runs nothing and leaves the
-            /// logits bit for bit, a budget measures every candidate (divergence no smaller than zero,
-            /// reads saved counted) and a pick within it is applied.
-            #[test]
-            fn a_quality_budget_calibrates_and_zero_changes_nothing() {
-                use super::super::calibrate;
-                let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 3);
-                let run = |m: &DeepseekV41Model, ids: &[u32]| -> Result<Vec<Vec<f32>>> {
-                    m.forward_prefill(ids)?.to_vec2::<f32>()
-                };
-                let plain = run(&model, &tokens).unwrap();
-                let resident = model.plan_residency();
-                let nothing = |_: &DeepseekV41Model, _: &[u32]| -> Result<Vec<Vec<f32>>> {
-                    panic!("a zero budget must not run the model")
-                };
-                assert!(
-                    calibrate::apply_budget(&model, 0.0, "k", &tokens, &resident, &nothing)
-                        .unwrap()
-                        .is_none()
-                );
-                assert_eq!(
-                    run(&model, &tokens).unwrap(),
-                    plain,
-                    "a zero budget changed the logits"
-                );
-
-                let table = calibrate::measure(&model, &tokens, &resident, &run).unwrap();
-                assert_eq!(
-                    table.len(),
-                    calibrate::candidates(model.n_activated()).len()
-                );
-                assert!(table
-                    .iter()
-                    .all(|m| m.kl >= -1e-9 && m.saved_per_token >= 0.0));
-                assert_eq!(
-                    run(&model, &tokens).unwrap(),
-                    plain,
-                    "measuring left a setting on"
-                );
-                let chosen = calibrate::pick(&table, 1e9);
-                if let Some(m) = chosen {
-                    model.set_truncation(m.truncation());
-                    assert!(model.take_saved() == 0);
-                }
-            }
-
             // Three independent sequences: distinct token streams and distinct lengths, so the
             // batch step runs three different positions at once.
             let seqs: Vec<Vec<u32>> = (0..3)

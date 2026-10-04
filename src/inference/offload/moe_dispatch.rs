@@ -90,7 +90,8 @@ impl Drop for DeferredExperts {
 }
 
 /// The widest batch that is a speculative verify, not a prompt: its experts run in grouped launches
-/// over the rows, where a prompt's run one at a time.
+/// over the rows, where a prompt's run one at a time. Set by the width of a draft block (a handful
+/// of rows) with room for several blocks; a prompt's batch is hundreds.
 pub(crate) const VERIFY_BATCH_MAX_ROWS: usize = 32;
 
 /// A prompt's layer whose experts keep their tokens' rows and products on the cards: the offload's
@@ -211,6 +212,15 @@ pub(crate) fn run_routed(
                         xv[0].to_vec(),
                         swiglu_limit,
                     ));
+                }
+                if !cpu_pos.is_empty() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let per = host_ns / cpu_pos.len() as u64;
+                    let old = off.host_expert_ns.load(Relaxed);
+                    off.host_expert_ns.store(
+                        old - old / super::admission::SMOOTHING + per / super::admission::SMOOTHING,
+                        Relaxed,
+                    );
                 }
                 crate::inference::offload::prof_record("moe host misses", host_ns);
                 g.join().unwrap()
