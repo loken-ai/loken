@@ -285,9 +285,29 @@ async fn launch(
 
 /// Print a daemon job's NDJSON progress as it arrives, one line per step of the status or of a
 /// hundredth of its count, and fail on the job's own error.
-async fn follow(mut response: reqwest::Response) -> Result<(), Box<dyn std::error::Error>> {
+async fn follow(
+    response: reqwest::Response,
+    stall_guard: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut response = response;
     let (mut pending, mut last_status, mut last_step) = (String::new(), String::new(), usize::MAX);
-    while let Some(chunk) = response.chunk().await? {
+    // With the guard, a job is stalled when no frame arrives for several times the longest gap
+    // between frames seen so far: the window follows the throughput the job itself shows.
+    const STALL_GAP_FACTOR: u32 = 8;
+    let (mut last_frame, mut longest_gap) =
+        (std::time::Instant::now(), None::<std::time::Duration>);
+    loop {
+        let next = match longest_gap.filter(|_| stall_guard) {
+            Some(gap) => tokio::time::timeout(gap * STALL_GAP_FACTOR, response.chunk())
+                .await
+                .map_err(|_| format!("stalled: no progress for {:?}", gap * STALL_GAP_FACTOR))?,
+            None => response.chunk().await,
+        };
+        let Some(chunk) = next? else { break };
+        let now = std::time::Instant::now();
+        let gap = now - last_frame;
+        last_frame = now;
+        longest_gap = Some(longest_gap.map_or(gap, |g| g.max(gap)));
         pending.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(end) = pending.find('\n') {
             let line: String = pending.drain(..=end).collect();
@@ -360,7 +380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "model": model, "name": name, "texts": texts,
                 "excerpt": excerpt, "tokens": tokens, "rows": rows,
             });
-            follow(client.post_streaming("/api/calibrate", &body).await?).await?;
+            follow(client.post_streaming("/api/calibrate", &body).await?, false).await?;
         }
         Commands::Convert {
             model,
@@ -379,7 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "gate_up": gate_up, "down": down, "always_read": always_read, "min_rows": min_rows,
                 "damping": damping, "layers": layers,
             });
-            follow(client.post_streaming("/api/convert", &body).await?).await?;
+            follow(client.post_streaming("/api/convert", &body).await?, false).await?;
         }
         Commands::Pull { model, source } => {
             let source = source.unwrap_or_else(|| {
@@ -397,7 +417,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let body = serde_json::json!({ "name": model, "source": source, "stream": true });
-            follow(client.post_streaming("/api/pull", &body).await?).await?;
+            follow(client.post_streaming("/api/pull", &body).await?, true).await?;
         }
 
         Commands::Load { model } => {
