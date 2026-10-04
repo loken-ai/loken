@@ -41,6 +41,8 @@ pub(crate) use crate::tensor::{DType, Device, IndexOp, Result, Tensor};
 
 #[cfg(all(test, feature = "cuda"))]
 mod card_host_parity;
+#[cfg(test)]
+mod wide_tests;
 
 mod config;
 #[cfg(test)]
@@ -62,6 +64,7 @@ mod splice;
 mod state_cache_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod verify_decode_parity;
+mod wide;
 pub use config::*;
 pub use moe_weights::*;
 
@@ -355,6 +358,12 @@ pub struct GenericTransformerLayer {
     /// Residual connection multiplier (None = 1.0)
     pub residual_scale: Option<f64>,
     pub flags: Arc<GenericLayerFlags>,
+    /// The mixers of the wide residual, on a model that has one.
+    pub hyper: Option<hyper::WideBlock>,
+    /// The block-sparse attention indexer, on an attention layer of a model with one.
+    pub sparse: Option<qsa::SparseAttention>,
+    /// The gated n-gram features this layer adds to the residual before it mixes.
+    pub ngram: Option<ngram::PleBlock>,
 }
 
 impl std::fmt::Debug for GenericTransformerLayer {
@@ -466,6 +475,20 @@ pub struct GenericHeteroTransformer {
     /// Held while some layer keeps its routed experts in host memory: the decode pool's
     /// workers then spin through the card work between host layers instead of parking.
     host_experts_hot: Option<crate::tensor::quant_cpu::gemv_pool::HotGuard>,
+    /// The mixer that stands for the final norm of a wide-residual model.
+    output_hyper: Option<hyper::HyperMixer>,
+    /// The n-gram embedding table, the tokens it hashes behind, and the rows gathered for
+    /// the forward in progress.
+    ngram: Option<NgramModel>,
+}
+
+/// The model-level state of the n-gram embedding.
+pub struct NgramModel {
+    pub meta: ngram::NgramMeta,
+    pub table: ngram::NgramTable,
+    pub history: ngram::NgramHistory,
+    /// The gathered embeddings `[1, seq, heads * row_dim]` of the forward in progress.
+    pub pending: Option<Tensor>,
 }
 
 /// A resident sequence copied aside: its tokens and every layer's KV, taken after a

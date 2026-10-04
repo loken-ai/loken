@@ -726,6 +726,8 @@ pub struct DeltaDims {
     pub conv_kernel: usize,
     /// Value head `h` reads key head `h % k_heads`, else `h / (v_heads / k_heads)`.
     pub v_heads_tiled: bool,
+    /// The per-head output norm is gated by `sigmoid(z)`, else by `silu(z)`.
+    pub gate_sigmoid: bool,
 }
 
 impl DeltaDims {
@@ -995,7 +997,12 @@ impl GatedDeltaNet {
             s = st;
             let on = RmsNorm::new(self.norm_w.clone(), self.eps as f32).forward(&o)?;
             let z = z.to_dtype(DType::F32)?.reshape((b, vg, vd))?;
-            let y = (on * crate::tensor::ops::silu(&z)?)?.reshape((b, vg * vd))?;
+            let gate = if d.gate_sigmoid {
+                crate::tensor::ops::sigmoid(&z)?
+            } else {
+                crate::tensor::ops::silu(&z)?
+            };
+            let y = (on * gate)?.reshape((b, vg * vd))?;
             outs.push(y.to_dtype(x.dtype())?.unsqueeze(1)?);
         }
         self.state = Some(SsmState::Card { conv, h: s });
@@ -1069,9 +1076,17 @@ impl GatedDeltaNet {
         });
         let o = o.reshape((seq * vg, vd))?;
         let z = z.reshape((seq * vg, vd))?;
-        let y = match k::zgate_rmsnorm_f16io(&o, &z, &self.norm_w, self.eps as f32)? {
-            Some(y) => y,
-            None => k::zgate_rmsnorm(&o, &z.to_dtype(DType::F32)?, &self.norm_w, self.eps as f32)?,
+        let y = if d.gate_sigmoid {
+            // The fused kernel gates by silu: a sigmoid gate takes the unfused ops.
+            let on = crate::tensor::ops::rms_norm(&o, &self.norm_w, self.eps as f32)?;
+            (on * crate::tensor::ops::sigmoid(&z.to_dtype(DType::F32)?)?)?
+        } else {
+            match k::zgate_rmsnorm_f16io(&o, &z, &self.norm_w, self.eps as f32)? {
+                Some(y) => y,
+                None => {
+                    k::zgate_rmsnorm(&o, &z.to_dtype(DType::F32)?, &self.norm_w, self.eps as f32)?
+                }
+            }
         };
         y.reshape((1, seq, vg * vd))?.to_dtype(x.dtype())
     }
@@ -1172,7 +1187,12 @@ fn delta_host(
                 let inv = 1.0 / (sumsq / vd as f32 + eps).sqrt();
                 for r in 0..vd {
                     let z = zr[head * vd + r];
-                    yh[r] = o[r] * inv * w.norm[r] * silu(z);
+                    let gate = if d.gate_sigmoid {
+                        1.0 / (1.0 + (-z).exp())
+                    } else {
+                        silu(z)
+                    };
+                    yh[r] = o[r] * inv * w.norm[r] * gate;
                 }
             });
     }
@@ -1556,6 +1576,7 @@ mod tests {
                 v_dim: 3,
                 conv_kernel: 4,
                 v_heads_tiled: tiled,
+                gate_sigmoid: false,
             };
             let (hidden, seq, eps) = (10usize, 5usize, 1e-6f64);
             let q = |seed, rows| {

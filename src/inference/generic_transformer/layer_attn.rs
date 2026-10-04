@@ -525,7 +525,7 @@ impl GenericTransformerLayer {
 
     /// The attention output gated by `sigmoid(attn_gate(x))` on a layer with an output
     /// gate, unchanged otherwise.
-    fn gate_attention(&self, x: &Tensor, y: Tensor) -> Result<Tensor> {
+    pub(super) fn gate_attention(&self, x: &Tensor, y: Tensor) -> Result<Tensor> {
         match &self.attn_gate {
             Some(gate) => {
                 let g = crate::tensor::ops::sigmoid(&gate.forward(x)?.to_dtype(DType::F32)?)?;

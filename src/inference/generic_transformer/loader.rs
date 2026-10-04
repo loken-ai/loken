@@ -91,6 +91,40 @@ struct RawGenericLayer {
     shexp_up: Option<QTensor>,
     shexp_down: Option<QTensor>,
     shexp_scalar_gate_qt: Option<QTensor>,
+    /// The wide residual's, indexer's and n-gram layer's tensors, when the block has them.
+    wide: RawWide,
+}
+
+/// The tensors of a wide-residual block beyond a plain one's.
+#[derive(Default)]
+struct RawWide {
+    attn_mixer: Option<RawMixerWeights>,
+    ffn_mixer: Option<RawMixerWeights>,
+    indexer: Option<RawIndexer>,
+    ngram: Option<RawNgram>,
+}
+
+struct RawMixerWeights {
+    norm: QTensor,
+    down: QTensor,
+    up: QTensor,
+    inject: Option<QTensor>,
+}
+
+struct RawIndexer {
+    q_proj: QTensor,
+    k_proj: QTensor,
+    q_norm: QTensor,
+    k_norm: QTensor,
+}
+
+struct RawNgram {
+    key: QTensor,
+    value: QTensor,
+    norm_key: QTensor,
+    norm_query: QTensor,
+    norm_conv: QTensor,
+    conv: QTensor,
 }
 
 /// A block's mixer tensors, as read.
@@ -1258,6 +1292,7 @@ fn build_generic_layer(
                 v_dim: meta.inner_size / meta.time_step_rank.max(1),
                 conv_kernel: meta.conv_kernel,
                 v_heads_tiled: meta.v_heads_tiled,
+                gate_sigmoid: config.delta_output_gate_sigmoid,
             };
             let packed_ba = proj.len() == 3;
             let proj = match concat_rows(&proj, device)? {
@@ -1338,7 +1373,74 @@ fn build_generic_layer(
     let layer_window = config.sliding_window.filter(|_| is_swa);
     let has_sinks = attn_sinks.is_some();
 
-    Ok(GenericTransformerLayer {
+    let (hyper, sparse, ngram) = {
+        let wide = raw.wide;
+        let dim = config.embedding_length;
+        let build_mixer =
+            |w: RawMixerWeights, streams: usize| -> Result<super::hyper::HyperMixer> {
+                // CONVERSION: a mixer's norm scale is a small vector held dense on the layer's device, whatever the file stores.
+                let gamma = w.norm.dequantize(&Device::Cpu)?.to_device(device)?;
+                super::hyper::HyperMixer::new(
+                    gamma,
+                    super::wide::load_matrix(w.down)?,
+                    super::wide::load_matrix(w.up)?,
+                    w.inject.map(super::wide::load_matrix).transpose()?,
+                    streams,
+                    dim,
+                    eps,
+                )
+            };
+        let hyper = match (config.hyper, wide.attn_mixer, wide.ffn_mixer) {
+            (Some(h), Some(a), Some(f)) => Some(super::hyper::WideBlock {
+                attn: build_mixer(a, h.streams)?,
+                ffn: build_mixer(f, h.streams)?,
+            }),
+            _ => None,
+        };
+        // CONVERSION: the indexer's norm vectors are read to host F32, whatever the file stores.
+        let host = |qt: QTensor| -> Result<Vec<f32>> {
+            qt.dequantize(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()
+        };
+        let sparse = match (config.indexer, wide.indexer) {
+            (Some(meta), Some(ix)) => Some(super::qsa::SparseAttention::new(
+                meta,
+                super::wide::load_matrix(ix.q_proj)?,
+                super::wide::load_matrix(ix.k_proj)?,
+                host(ix.q_norm)?,
+                host(ix.k_norm)?,
+                eps as f32,
+                config.rope_dim.filter(|&d| d > 0).unwrap_or(meta.head_dim),
+                config.rope_freq_base,
+            )),
+            _ => None,
+        };
+        let ngram = match (&config.ngram, config.hyper, wide.ngram) {
+            (Some(meta), Some(h), Some(n)) => {
+                // CONVERSION: the n-gram block's norm vectors are small and held dense, whatever the file stores.
+                let dense = |qt: QTensor| -> Result<Tensor> { qt.dequantize(&Device::Cpu) };
+                Some(super::ngram::PleBlock::new(
+                    super::wide::load_matrix(n.key)?,
+                    super::wide::load_matrix(n.value)?,
+                    dense(n.norm_key)?,
+                    dense(n.norm_query)?,
+                    dense(n.norm_conv)?,
+                    dense(n.conv)?,
+                    meta,
+                    h.streams,
+                    dim,
+                    eps,
+                    device,
+                )?)
+            }
+            _ => None,
+        };
+        (hyper, sparse, ngram)
+    };
+
+    let mut layer = GenericTransformerLayer {
         mixer,
         has_ffn: raw.has_ffn,
         attn_gate: to_qmatmul(raw.attn_gate)?,
@@ -1588,7 +1690,16 @@ fn build_generic_layer(
         attn_softcap: config.attn_logit_softcapping.map(|c| c as f32),
         residual_scale: config.residual_scale,
         flags,
-    })
+        hyper,
+        sparse,
+        ngram,
+    };
+    // A layer that selects tokens reads its history from the one cache the selection reads.
+    #[cfg(feature = "cuda")]
+    if layer.sparse.is_some() {
+        layer.quant_kv = None;
+    }
+    Ok(layer)
 }
 
 /// Build one `GenericTransformerLayer` from an AWQ checkpoint. Dense
@@ -1907,6 +2018,9 @@ fn build_awq_layer(
         attn_softcap: config.attn_logit_softcapping.map(|c| c as f32),
         residual_scale: config.residual_scale,
         flags,
+        hyper: None,
+        sparse: None,
+        ngram: None,
     })
 }
 impl GenericHeteroTransformer {
@@ -2070,15 +2184,26 @@ impl GenericHeteroTransformer {
         // -- 2. Load output norm + output projection on CPU ----------------
         // LFM2 files name the final norm `token_embd_norm`; it is read under that name only
         // when the file carries no `output_norm`.
-        let norm_qt = match source.read("output_norm.weight", &Device::Cpu) {
-            Ok(qt) => qt,
-            Err(e) => match content.tensor_infos.contains_key("token_embd_norm.weight") {
-                true => source.read("token_embd_norm.weight", &Device::Cpu)?,
-                false => return Err(e),
-            },
-        };
-        // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
-        let norm_weight_cpu = norm_qt.dequantize(&Device::Cpu)?;
+        // A wide-residual file has none: its final mixer is the output norm, so the plain one
+        // is a placeholder the forward never reads.
+        let norm_weight_cpu =
+            if config.hyper.is_some() && !content.tensor_infos.contains_key("output_norm.weight") {
+                Tensor::ones(
+                    config.embedding_length,
+                    crate::tensor::DType::F32,
+                    &Device::Cpu,
+                )?
+            } else {
+                let norm_qt = match source.read("output_norm.weight", &Device::Cpu) {
+                    Ok(qt) => qt,
+                    Err(e) => match content.tensor_infos.contains_key("token_embd_norm.weight") {
+                        true => source.read("token_embd_norm.weight", &Device::Cpu)?,
+                        false => return Err(e),
+                    },
+                };
+                // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
+                norm_qt.dequantize(&Device::Cpu)?
+            };
         // Phi2/GPT-NeoX use full LayerNorm: `output_norm.bias` exists.
         let output_norm_bias_cpu = source
             .read_opt("output_norm.bias", &Device::Cpu)
@@ -2529,7 +2654,7 @@ impl GenericHeteroTransformer {
             } else if mixer_kind == super::mixer::MixerKind::Absent {
                 // A block that is a feed-forward alone normalises its input with its one norm.
                 Some(req_cpu!(&format!("{prefix}.attn_norm.weight"))?)
-            } else if f.parallel_attn {
+            } else if f.parallel_attn || config.hyper.is_some() {
                 None
             } else if f.has_post_ffn_norm {
                 // OLMo2 post-norm-only: pre-ffn-norm absent -> Identity at build.
@@ -2671,6 +2796,50 @@ impl GenericHeteroTransformer {
                 None
             };
 
+            let wide = match config.hyper {
+                None => RawWide::default(),
+                Some(_) => {
+                    let mixer_weights =
+                        |stem: &str, inject: bool| -> crate::tensor::Result<RawMixerWeights> {
+                            Ok(RawMixerWeights {
+                                norm: req_cpu!(&format!("{prefix}.{stem}_norm.weight"))?,
+                                down: req!(&format!("{prefix}.{stem}_down.weight"))?,
+                                up: req!(&format!("{prefix}.{stem}_up.weight"))?,
+                                inject: if inject {
+                                    Some(req!(&format!("{prefix}.{stem}_inject.weight"))?)
+                                } else {
+                                    None
+                                },
+                            })
+                        };
+                    let indexer = match (attends, config.indexer) {
+                        (true, Some(_)) => Some(RawIndexer {
+                            q_proj: req!(&format!("{prefix}.indexer.q_proj.weight"))?,
+                            k_proj: req!(&format!("{prefix}.indexer.k_proj.weight"))?,
+                            q_norm: req_cpu!(&format!("{prefix}.indexer.q_norm.weight"))?,
+                            k_norm: req_cpu!(&format!("{prefix}.indexer.k_norm.weight"))?,
+                        }),
+                        _ => None,
+                    };
+                    let ngram = match &config.ngram {
+                        Some(n) if n.layer == idx => Some(RawNgram {
+                            key: req!(&format!("{prefix}.ple_key.weight"))?,
+                            value: req!(&format!("{prefix}.ple_value.weight"))?,
+                            norm_key: req_cpu!(&format!("{prefix}.ple_norm_key.weight"))?,
+                            norm_query: req_cpu!(&format!("{prefix}.ple_norm_query.weight"))?,
+                            norm_conv: req_cpu!(&format!("{prefix}.ple_norm_conv.weight"))?,
+                            conv: req_cpu!(&format!("{prefix}.ple_conv1d.weight"))?,
+                        }),
+                        _ => None,
+                    };
+                    RawWide {
+                        attn_mixer: Some(mixer_weights("hc_attn", true)?),
+                        ffn_mixer: Some(mixer_weights("hc_ffn", true)?),
+                        indexer,
+                        ngram,
+                    }
+                }
+            };
             Ok(RawGenericLayer {
                 layer_idx: idx,
                 device_kind: dk,
@@ -2724,6 +2893,7 @@ impl GenericHeteroTransformer {
                 shexp_up: opt_dev!(&format!("{prefix}.ffn_up_shexp.weight"))?,
                 shexp_down: opt_dev!(&format!("{prefix}.ffn_down_shexp.weight"))?,
                 shexp_scalar_gate_qt: opt_cpu!(&format!("{prefix}.ffn_gate_inp_shexp.weight"))?,
+                wide,
             })
         };
 
@@ -3071,6 +3241,42 @@ impl GenericHeteroTransformer {
             _ => None,
         };
 
+        // A wide-residual model has no output norm: its final mixer does that work, on the
+        // device the head runs on.
+        let output_hyper = match config.hyper {
+            Some(h) => {
+                let dev = output_proj_dev.clone().unwrap_or(Device::Cpu);
+                // CONVERSION: the output mixer's norm scale is a small vector held dense on the head's device.
+                let gamma = source
+                    .read("output_hc_norm.weight", &Device::Cpu)?
+                    .dequantize(&Device::Cpu)?
+                    .to_device(&dev)?;
+                let down = source.read("output_hc_down.weight", &dev)?;
+                let up = source.read("output_hc_up.weight", &dev)?;
+                Some(super::hyper::HyperMixer::new(
+                    gamma,
+                    super::wide::load_matrix(down)?,
+                    super::wide::load_matrix(up)?,
+                    None,
+                    h.streams,
+                    config.embedding_length,
+                    config.rms_norm_eps,
+                )?)
+            }
+            None => None,
+        };
+        let ngram_model = match &config.ngram {
+            Some(meta) if config.hyper.is_some() => {
+                let table = source.read("per_layer_token_embd.weight", &Device::Cpu)?;
+                Some(NgramModel {
+                    history: super::ngram::NgramHistory::new(meta),
+                    table: super::ngram::NgramTable::new(table, meta)?,
+                    meta: meta.clone(),
+                    pending: None,
+                })
+            }
+            _ => None,
+        };
         let mut model = Self {
             adapters: Vec::new(),
             config,
@@ -3107,6 +3313,8 @@ impl GenericHeteroTransformer {
             #[cfg(feature = "audio")]
             spliced_audio: None,
             host_experts_hot: None,
+            output_hyper,
+            ngram: ngram_model,
         };
 
         // A SiLU MoE layer on the host runs its experts through a repacked layout derived
@@ -3444,6 +3652,8 @@ impl GenericHeteroTransformer {
             #[cfg(feature = "audio")]
             spliced_audio: None,
             host_experts_hot: None,
+            output_hyper: None,
+            ngram: None,
         })
     }
 }

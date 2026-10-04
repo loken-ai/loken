@@ -69,6 +69,8 @@ scripts/oracle/*.o
 # tree; these vectors ARE committed so the parity test runs without them.
 !tests/vectors/*.safetensors
 !tests/vectors/**/*.safetensors
+# The toy wide-residual model the reference produced the vectors from, written as a GGUF.
+!tests/vectors/qwen4exp/toy.gguf
 
 # Editor and tooling state.
 *~

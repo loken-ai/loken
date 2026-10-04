@@ -1487,6 +1487,34 @@ impl GenericHeteroTransformer {
         };
         note_if_non_finite("the embedding, before any layer", &hidden);
 
+        // A wide residual starts as one copy of the embedding per stream, and the n-gram
+        // rows of the tokens are gathered for the layer that takes them.
+        let hidden = match self.config.hyper {
+            Some(h) => {
+                if let Some(ng) = self.ngram.as_mut() {
+                    if index_pos == 0 {
+                        ng.history.reset(&ng.meta);
+                    }
+                    if ng.history.seen != index_pos {
+                        crate::tensor::bail!(
+                            "the n-gram history holds {} tokens but the forward starts at {index_pos}",
+                            ng.history.seen
+                        );
+                    }
+                    let ids = input_ids
+                        .flatten_all()?
+                        .to_dtype(crate::tensor::DType::U32)?
+                        .to_vec1::<u32>()?;
+                    let rows = ng.history.rows(&ng.meta, &ids);
+                    let data = ng.table.gather(&rows)?;
+                    let width = ng.meta.heads() * ng.meta.row_dim;
+                    ng.pending = Some(Tensor::from_vec(data, (1, ids.len(), width), &Device::Cpu)?);
+                }
+                super::wide::widen_embedding(&hidden, h.streams)?
+            }
+            None => hidden,
+        };
+
         // -- Compute PLE per-layer inputs (Gemma4) ------------------------
         let ple_inputs: Option<Vec<Tensor>> = if self.ple_dim > 0 {
             if let (Some(model_proj), Some(proj_norm)) = (&self.ple_model_proj, &self.ple_proj_norm)
@@ -1725,6 +1753,15 @@ impl GenericHeteroTransformer {
                     None => None,
                 };
 
+                // The n-gram embeddings go to the one layer that adds them.
+                let ple_on_dev = match (
+                    self.ngram.as_ref().and_then(|n| n.pending.as_ref()),
+                    self.layers[layer_idx].ngram.is_some(),
+                ) {
+                    (Some(emb), true) => Some(emb.clone()),
+                    _ => ple_on_dev,
+                };
+
                 // Shared KV: for layers in the shared range, grab cached K/V from a
                 // type-matched reference layer (SWA->SWA ref, global->global ref).
                 let (shared_kv, ref_idx_opt) =
@@ -1891,7 +1928,30 @@ impl GenericHeteroTransformer {
             };
             self.last_feature = Some(f.to_dtype(crate::tensor::DType::F32)?);
         }
-        let mut logits = if on_cuda && self.output_proj_cuda_qmm.is_some() {
+        let mut logits = if let Some(oh) = self.output_hyper.as_ref() {
+            // The final mixer is the output norm: it mixes the streams, then the head reads
+            // the result.
+            let (b, s, _) = hidden.dims3()?;
+            let rows = if all_positions {
+                hidden.clone()
+            } else {
+                hidden.narrow(1, s - 1, 1)?
+            };
+            let rows = rows.to_device(&oh.device())?;
+            let (normed, _) = oh.mix(&rows)?;
+            let n = normed.dim(1)?;
+            let normed = normed.reshape((b * n, self.config.embedding_length))?;
+            let out = match (&self.output_proj_cuda_qmm, &self.output_proj_dev) {
+                (Some(proj), Some(dev)) => proj.forward(&normed.to_device(dev)?)?,
+                _ => self.output_proj.forward(&normed.to_device(&Device::Cpu)?)?,
+            };
+            let vocab = out.dim(1)?;
+            if all_positions {
+                out.reshape((b, n, vocab))?
+            } else {
+                out
+            }
+        } else if on_cuda && self.output_proj_cuda_qmm.is_some() {
             // Preferred GPU path: norm in F32 + quantized matmul. The QMatMul
             // dispatches to `mul_mat_vec_q*_K_q8_1` kernels that produce F32
             // output directly, so there are no F16 casts and no cutlass gemm.
