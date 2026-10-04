@@ -13,6 +13,7 @@
 
 use super::cache::DecodeState;
 use super::model::DeepseekV41Model;
+use super::state_cache::StateCache;
 use crate::inference::offload::{with_offload, Offload};
 use crate::inference::serve::continuous_batch::SamplingParams;
 use crate::inference::serve::continuous_serve::sample_row_host;
@@ -55,6 +56,8 @@ pub struct V41BatchServer {
 struct SendModel {
     model: Arc<DeepseekV41Model>,
     offload: Option<Arc<dyn Offload>>,
+    /// The decode-state cache a prompt is prefilled through and a finished sequence is written to.
+    cache: Option<StateCache>,
 }
 unsafe impl Send for SendModel {}
 
@@ -82,9 +85,14 @@ impl V41BatchServer {
         offload: Option<Arc<dyn Offload>>,
         eos: Option<u32>,
         max_batch: usize,
+        cache: Option<StateCache>,
     ) -> Self {
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
-        let sm = SendModel { model, offload };
+        let sm = SendModel {
+            model,
+            offload,
+            cache,
+        };
         std::thread::Builder::new()
             .name("dsv41-batch".into())
             .spawn(move || worker(sm, eos, max_batch.max(1), submit_rx))
@@ -158,8 +166,12 @@ fn argmax(flat: &[f32], row: usize, vocab: usize) -> u32 {
 /// failure or an empty budget ends the request at once.
 fn admit(sm: &SendModel, sub: Submission, active: &mut Vec<Seq>) {
     let mut state = sm.model.new_decode_state();
-    let logits = match under(&sm.offload, || {
-        sm.model.prefill_into(&sub.prompt, &mut state)
+    // A prefix the cache holds is restored and the sequence goes on from there as any other.
+    let logits = match under(&sm.offload, || match &sm.cache {
+        Some(cache) => cache
+            .prefill(&sm.model, &sub.prompt, &mut state)
+            .map(|(logits, _)| logits),
+        None => sm.model.prefill_into(&sub.prompt, &mut state),
     }) {
         Ok(l) => l,
         Err(_) => {
@@ -253,6 +265,13 @@ fn worker(sm: SendModel, eos: Option<u32>, max_batch: usize, rx: Receiver<Submis
                     FinishReason::Length
                 };
                 let _ = seq.tx.send(CbToken::Done(reason));
+                // Every generated token was fed, the last in this step: the state stands after
+                // the prompt and all of them.
+                if let Some(cache) = &sm.cache {
+                    let mut turn = seq.prompt.clone();
+                    turn.extend_from_slice(&seq.generated);
+                    cache.save_turn(&sm.model, &seq.state, &turn);
+                }
                 finished.push(row);
             } else {
                 seq.next = sample(seq, &flat, row, vocab);

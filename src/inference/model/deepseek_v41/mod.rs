@@ -32,6 +32,7 @@ pub mod safetensors_source;
 pub mod sibling;
 pub mod snapshot;
 pub mod source;
+pub mod state_cache;
 pub mod token_map;
 
 use crate::tensor::quantized::gguf_file::{self, Value};

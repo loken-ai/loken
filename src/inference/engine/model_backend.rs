@@ -846,15 +846,9 @@ pub(crate) struct DeepseekV41Backend {
     pipeline: Option<PipelineHead>,
     /// The on-disk cache of decode states this backend restores a prompt's prefix from and writes
     /// its finished prompts and turns to. `None` leaves every prompt a cold prefill.
-    state_cache: Option<StateCache>,
+    state_cache: Option<crate::inference::model::deepseek_v41::state_cache::StateCache>,
     /// Prompt tokens the last prompt took from the cache instead of prefilling.
     restored: usize,
-}
-
-/// A decode-state store and the identity every state in it is written and read under.
-struct StateCache {
-    store: std::sync::Arc<crate::inference::cache::state_disk::StateStore>,
-    identity: crate::inference::model::deepseek_v41::snapshot::Identity,
 }
 
 /// The head end of a cross-node pipeline held by a backend: the link to the tail, the boundary
@@ -931,172 +925,38 @@ impl DeepseekV41Backend {
         store: std::sync::Arc<crate::inference::cache::state_disk::StateStore>,
         identity: crate::inference::model::deepseek_v41::snapshot::Identity,
     ) -> Self {
-        // A block of the store's chain must hold whole groups of every layer.
-        let block = store.block_tokens();
-        if let Some(r) = self
-            .model
-            .compress_ratios()
-            .iter()
-            .find(|&&r| r != 0 && block % r != 0)
-        {
-            tracing::warn!(
-                "state cache off: a block of {block} tokens is not a whole number of groups at ratio {r}"
-            );
-            return self;
-        }
-        self.state_cache = Some(StateCache { store, identity });
+        self.state_cache = crate::inference::model::deepseek_v41::state_cache::StateCache::new(
+            &self.model,
+            store,
+            identity,
+        );
         self
     }
 
-    /// Replace the state with the longest stored one that is a prefix of `ids`, returning the
-    /// tokens it covers and, when it covers all of them, the logits it was stored with. A state
-    /// that is whole `ids` but holds no logits cannot answer and is passed over; a file that
-    /// cannot be read is logged, dropped and passed over. `None` leaves the state untouched.
-    fn restore_prefix(&mut self, ids: &[u32]) -> Option<(usize, Option<Vec<f32>>)> {
-        use crate::inference::model::deepseek_v41::snapshot::decode_split;
-        let cache = self.state_cache.as_ref()?;
-        let keys = cache.store.keys(&cache.identity, ids);
-        for entry in cache.store.candidates(&keys, ids.len()) {
-            let manifest = match cache.store.read(&entry) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("state cache: {e}; ignored");
-                    continue;
-                }
-            };
-            let blocks: Result<Vec<Vec<u8>>, _> = entry
-                .blocks
-                .iter()
-                .map(|h| cache.store.read_block(h))
-                .collect();
-            let blocks = match blocks {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("state cache: {e}; dropped");
-                    cache.store.forget(&entry);
-                    continue;
-                }
-            };
-            match decode_split(&manifest, &blocks, &cache.identity, self.model.n_layers()) {
-                Ok(snap) if snap.state.pos == entry.len => {
-                    if entry.len == ids.len() && snap.logits.is_none() {
-                        continue;
-                    }
-                    let mut state = snap.state;
-                    if let Some(d) = &self.dspark {
-                        state.capture_layers = d.cfg.target_layers.clone();
-                    }
-                    self.state = state;
-                    return Some((entry.len, snap.logits));
-                }
-                Ok(_) => {
-                    tracing::warn!("state cache: a snapshot disagrees with its name; dropped");
-                    cache.store.forget(&entry);
-                }
-                Err(e) => {
-                    tracing::warn!("state cache: a snapshot is unusable ({e}); dropped");
-                    cache.store.forget(&entry);
-                }
-            }
-        }
-        None
-    }
-
-    /// Write the state, which stands after `tokens`, to the cache: `logits` are those of its last
-    /// position when it was just prefilled. Encoding and writing run on their own thread over a
-    /// copy, so the request is not held for them. A state shorter than one block of the store's
-    /// hash chain is not worth a file.
-    fn save_state(
-        &self,
-        tokens: &[u32],
-        logits: Option<Vec<f32>>,
-        grid: Vec<(usize, Vec<Vec<u8>>)>,
-    ) {
-        let Some(cache) = &self.state_cache else {
-            return;
-        };
-        if self.pipeline.is_some()
-            || self.state.pos != tokens.len()
-            || tokens.len() < cache.store.block_tokens()
-        {
-            return;
-        }
-        let (store, identity) = (cache.store.clone(), cache.identity);
-        let (state, tokens) = (self.state.clone(), tokens.to_vec());
-        let ratios = self.model.compress_ratios().to_vec();
-        let grid: Vec<_> = grid
-            .into_iter()
-            .map(|(p, w)| (p, w, self.model.engram_after(&tokens[..p])))
-            .collect();
-        std::thread::spawn(move || {
-            use crate::inference::model::deepseek_v41::snapshot::{
-                encode_block, encode_grid_manifest, encode_manifest, BlockLayout, GridPoint,
-            };
-            let layout = BlockLayout {
-                ratios: &ratios,
-                block_tokens: store.block_tokens(),
-            };
-            // The states the prefill passed on the way, at block boundaries, so any prompt that
-            // shares a prefix with this one restores at the last of them it shares.
-            let keys = store.keys(&identity, &tokens);
-            let mut kept = 0;
-            for (p, windows, engram) in grid {
-                let point = GridPoint {
-                    pos: p,
-                    windows: &windows,
-                    engram,
-                };
-                let Some((manifest, nb)) = encode_grid_manifest(&state, &point, &identity, &layout)
-                else {
-                    tracing::info!(
-                        "state cache: no state kept at token {p}: the final state cannot be cut at that block boundary"
-                    );
-                    continue;
-                };
-                match store.put(&keys, p, &manifest, nb, |b| {
-                    encode_block(&state, b, &layout)
-                }) {
-                    Ok(()) => kept += 1,
-                    Err(e) => tracing::warn!("state cache: not stored at {p}: {e}"),
-                }
-            }
-            if kept > 0 {
-                tracing::info!("state cache: kept {kept} states on the block grid");
-            }
-            let (manifest, nblocks) =
-                encode_manifest(&state, logits.as_deref(), &identity, Some(&layout));
-            let put = store.put(&keys, tokens.len(), &manifest, nblocks, |b| {
-                encode_block(&state, b, &layout)
-            });
-            match put {
-                Ok(()) => tracing::info!(
-                    "state cache: stored a {}-token state ({} KiB manifest, {nblocks} blocks)",
-                    tokens.len(),
-                    manifest.len() >> 10
-                ),
-                Err(e) => tracing::warn!("state cache: not stored: {e}"),
-            }
-        });
-    }
-
-    /// The rest of a prompt after a restored prefix, its heavy steps on the cards when there are
-    /// any: the logits after its last token.
-    fn prefill_rest(&mut self, ids: &[u32], grid: &[usize]) -> crate::tensor::Result<Grid> {
+    /// The prompt prefilled through the cache: a restored prefix, only the rest computed, the
+    /// states passed on the way written back. Its heavy steps run on the cards when there are any.
+    fn prefill_cached(
+        &mut self,
+        cache: &crate::inference::model::deepseek_v41::state_cache::StateCache,
+        ids: &[u32],
+    ) -> crate::tensor::Result<Tensor> {
         let Self {
             model,
             state,
             streamed,
             ..
         } = self;
-        match streamed {
+        let (out, restored) = match streamed {
             Some(s) => {
                 model.offload_experts(Some(s.lanes.clone()));
                 crate::inference::offload::with_offload(s.offload.clone(), || {
-                    model.prefill_continue_grid(ids, state, grid)
-                })
+                    cache.prefill(model, ids, state)
+                })?
             }
-            None => model.prefill_continue_grid(ids, state, grid),
-        }
+            None => cache.prefill(model, ids, state)?,
+        };
+        self.restored = restored;
+        Ok(out)
     }
 
     /// Serve one forward over the pipeline: run `ids` through layers `[0, cut)` here token by token,
@@ -1170,7 +1030,7 @@ impl DeepseekV41Backend {
     }
 
     /// The whole prompt in one prefill, its heavy steps on the cards when there are any.
-    fn prefill(&mut self, ids: &[u32], grid: &[usize]) -> crate::tensor::Result<Grid> {
+    fn prefill(&mut self, ids: &[u32]) -> crate::tensor::Result<Tensor> {
         let Self {
             model,
             state,
@@ -1184,33 +1044,13 @@ impl DeepseekV41Backend {
                 // decode reads the same experts the prompt just routed to.
                 model.offload_experts(Some(s.lanes.clone()));
                 crate::inference::offload::with_offload(s.offload.clone(), || {
-                    model.prefill_into_grid(ids, state, grid)
+                    model.prefill_into(ids, state)
                 })
             }
-            None => model.prefill_into_grid(ids, state, grid),
+            None => model.prefill_into(ids, state),
         }
-    }
-
-    /// The token counts inside `(from, to)` at which a state is worth keeping: every multiple of
-    /// the store's block size, none when there is no cache or the pipeline holds half the state.
-    fn grid_points(&self, from: usize, to: usize) -> Vec<usize> {
-        let Some(cache) = &self.state_cache else {
-            return Vec::new();
-        };
-        if self.pipeline.is_some() {
-            return Vec::new();
-        }
-        let b = cache.store.block_tokens();
-        (from / b + 1..)
-            .map(|k| k * b)
-            .take_while(|&p| p < to)
-            .collect()
     }
 }
-
-/// The logits after a prefill and the windows it kept at the token counts it was asked for, one
-/// section per layer for each.
-type Grid = (Tensor, Vec<Vec<Vec<u8>>>);
 
 /// TpQwen2: tensor-parallel (TP=2) decoder across 2 GPUs. Both cards run EVERY layer -
 /// column/row-parallel weights joined by an all-reduce - against the pipeline's one card
@@ -1864,6 +1704,9 @@ impl ModelBackend for DeepseekV41Backend {
         let link = crate::distributed::wire_link::WireLink::connect(addr).map_err(|e| {
             crate::tensor::Error::msg(format!("pipeline head: connect {addr}: {e}"))
         })?;
+        // The tail's half of the state is on another node: a state restored here alone would
+        // continue against a tail that stands at position zero, so the cache stays out of it.
+        self.state_cache = None;
         self.pipeline = Some(PipelineHead { link, cut, seq: 0 });
         Ok(())
     }
@@ -1893,38 +1736,13 @@ impl ModelBackend for DeepseekV41Backend {
         // A prompt that starts a sequence runs as one prefill over all its tokens, which leaves the
         // caches where feeding them one at a time would; the tokens that follow are decoded.
         if index_pos == 0 && ids.len() > 1 {
-            // A prefix the cache holds is restored and only the rest is prefilled; the state the
-            // prompt ends in is written back for the next prompt that begins with it.
-            let vocab_logits = |v: Vec<f32>| {
-                let n = v.len();
-                Tensor::from_vec(v, (1, n), &Device::Cpu)
-            };
+            // A prefix the cache holds is restored and only the rest is prefilled; the states the
+            // prompt passes and ends in are written back for the next prompt that shares them.
             self.restored = 0;
-            if let Some((covered, logits)) = self.restore_prefix(&ids) {
-                self.restored = covered;
-                tracing::info!(
-                    "state cache: restored {covered} of {} prompt tokens",
-                    ids.len()
-                );
-                if covered == ids.len() {
-                    if let Some(l) = logits {
-                        return vocab_logits(l);
-                    }
-                } else {
-                    let grid = self.grid_points(covered, ids.len());
-                    let (out, windows) = self.prefill_rest(&ids[covered..], &grid)?;
-                    let flat = out.flatten_all()?.to_vec1::<f32>()?;
-                    self.save_state(&ids, Some(flat), grid.into_iter().zip(windows).collect());
-                    return Ok(out);
-                }
+            if let Some(cache) = self.state_cache.clone() {
+                return self.prefill_cached(&cache, &ids);
             }
-            let grid = self.grid_points(0, ids.len());
-            let (out, windows) = self.prefill(&ids, &grid)?;
-            if self.state_cache.is_some() {
-                let flat = out.flatten_all()?.to_vec1::<f32>()?;
-                self.save_state(&ids, Some(flat), grid.into_iter().zip(windows).collect());
-            }
-            return Ok(out);
+            return self.prefill(&ids);
         }
         // The always-read weights answer a token from the card they were left on: the host reads
         // them at its memory's speed, the card at its own, and a decode reads every one of them
@@ -2111,8 +1929,10 @@ impl ModelBackend for DeepseekV41Backend {
 
     /// A finished turn, prompt and reply: the state it left stands after the tokens it fed.
     fn snapshot_kv(&mut self, tokens: Vec<u32>, kv_len: usize) -> crate::tensor::Result<()> {
-        if kv_len == self.state.pos && kv_len <= tokens.len() {
-            self.save_state(&tokens[..kv_len], None, Vec::new());
+        if let (Some(cache), None) = (&self.state_cache, &self.pipeline) {
+            if kv_len == self.state.pos && kv_len <= tokens.len() {
+                cache.save_turn(&self.model, &self.state, &tokens[..kv_len]);
+            }
         }
         Ok(())
     }
@@ -2174,6 +1994,7 @@ impl ModelBackend for DeepseekV41Backend {
             Some(card),
             Some(eos),
             max_batch,
+            this.state_cache.take(),
         );
         let server: std::sync::Arc<dyn crate::inference::serve::continuous_serve::BatchedServer> =
             std::sync::Arc::new(server);

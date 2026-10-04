@@ -3435,7 +3435,7 @@ mod oracle_gate {
         let pr: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
         let want = model.generate_batch(&pr, &max_new, None).unwrap();
 
-        let server = V41BatchServer::spawn(Arc::new(model), None, None, 4);
+        let server = V41BatchServer::spawn(Arc::new(model), None, None, 4, None);
         let rxs: Vec<_> = prompts
             .iter()
             .zip(&max_new)
@@ -3455,6 +3455,55 @@ mod oracle_gate {
             })
             .collect();
         assert_eq!(got, want, "the worker must stream the batched tokens");
+    }
+
+    /// The batch worker prefills through the cache: a second prompt that extends a first one is
+    /// restored from the state the first left (its prompt-end and grid states), continues as an
+    /// ordinary sequence, and streams the same tokens a worker without a cache streams. The state a
+    /// finished sequence leaves is written for the next one.
+    #[test]
+    fn the_batch_worker_restores_a_stored_prefix_and_streams_the_same_tokens() {
+        use crate::inference::cache::state_disk::StateStore;
+        use crate::inference::model::deepseek_v41::batch_server::V41BatchServer;
+        use crate::inference::model::deepseek_v41::state_cache::StateCache;
+        use crate::inference::serve::continuous_serve::CbToken;
+        use std::sync::Arc;
+        let run = |server: &V41BatchServer, prompt: &[u32]| -> Vec<u32> {
+            let rx = server.submit(prompt.to_vec(), 4);
+            let mut seq = Vec::new();
+            while let Ok(t) = rx.recv() {
+                match t {
+                    CbToken::Tok(x) => seq.push(x),
+                    CbToken::Done(_) => break,
+                }
+            }
+            seq
+        };
+        let tokens: Vec<u32> = (0..40)
+            .map(|i| (i * 7 + 3) % super::tests::VOCAB as u32)
+            .collect();
+        let dir = scratch_dir("batch");
+        let store = Arc::new(StateStore::open(dir.clone(), 0, 8).unwrap());
+        let id = super::super::snapshot::identity(&[b"synthetic"]);
+        let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let cache = StateCache::new(&model, store.clone(), id).unwrap();
+        let cached = V41BatchServer::spawn(Arc::new(model), None, None, 4, Some(cache));
+        let first = run(&cached, &tokens[..24]);
+        // The prompt's states and the finished sequence's: 8, 16, 24 and 24 + 4 tokens fed.
+        wait_for_len(&store, 28);
+        assert_eq!(store.lengths(), vec![8, 16, 24, 28]);
+        let longer = run(&cached, &tokens);
+        wait_for_len(&store, 40);
+
+        let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let plain = V41BatchServer::spawn(Arc::new(model), None, None, 4, None);
+        assert_eq!(first, run(&plain, &tokens[..24]));
+        assert_eq!(
+            longer,
+            run(&plain, &tokens),
+            "the restored sequence streams the same tokens"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Decoding split at a layer boundary equals decoding the whole stack, bit for bit: the same
