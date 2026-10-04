@@ -214,6 +214,7 @@ impl QVarBuilder {
         if device.is_dry() {
             return crate::tensor::Tensor::dry(device, crate::tensor::DType::F32, qt.dims.clone());
         }
+        // CONVERSION: a dense accessor decodes the stored entry on request.
         let data = qt.dequantize_f32()?;
         crate::tensor::Tensor::from_vec_f32(data, qt.dims.clone())?.to_device(device)
     }

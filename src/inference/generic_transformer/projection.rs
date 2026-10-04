@@ -146,6 +146,7 @@ impl AwqWeight {
             qzeros.to_vec(),
             scales.to_vec(),
         );
+        // CONVERSION: the AWQ weight is repacked output-major for the dp4a decode kernel.
         let r = repack_awq(&t);
         let ng = self.k / self.group_size;
         let qw_t = Tensor::from_vec(r.qw_t, (self.n, self.k / 8), &dev)?;
@@ -169,6 +170,7 @@ impl AwqWeight {
         use crate::tensor::marlin;
         let dev = self.qweight.device();
         let r =
+            // CONVERSION: the AWQ weight is repacked into the tensor-core layout, built only while room stays free.
             marlin::repack_awq_to_marlin(qweight, qzeros, scales, self.k, self.n, self.group_size)
                 .map_err(|e| crate::tensor::Error::msg(e.0))?;
         if check_headroom {

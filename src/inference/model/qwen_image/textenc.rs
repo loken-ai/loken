@@ -58,6 +58,7 @@ fn dq_t(
     use crate::tensor::{DType as CDType, Device as CDevice};
     let dq = content
         .tensor(file, name, &CDevice::Cpu)
+        // CONVERSION: small vectors (norm scales) are held F32.
         .and_then(|t| t.dequantize(&CDevice::Cpu))
         .and_then(|t| t.to_dtype(CDType::F32))
         .and_then(|t| t.flatten_all())

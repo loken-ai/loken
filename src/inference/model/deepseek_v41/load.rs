@@ -27,6 +27,7 @@ use crate::tensor::{DType, Device, Result, Tensor};
 /// Load one GGUF tensor to an f32 CPU tensor, dequantised. The GGUF source's dense path.
 pub fn load_f32<S: GgufSource>(g: &S, name: &str) -> Result<Tensor> {
     g.tensor(name, &Device::Cpu)?
+        // CONVERSION: the dense path of the GGUF source decodes the tensor to F32 for its caller.
         .dequantize(&Device::Cpu)?
         .to_dtype(DType::F32)
 }

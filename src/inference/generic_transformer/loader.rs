@@ -244,6 +244,7 @@ fn qtensor_from_bytes(
     let aligned: &mut [u8] =
         unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 4) };
     aligned[..bytes.len()].copy_from_slice(bytes);
+    // CONVERSION: the q projection is split into its q and gate halves, each a weight of its own.
     let storage = crate::tensor::quantized::QStorage::from_data(
         std::borrow::Cow::Borrowed(&aligned[..bytes.len()]),
         device,
@@ -814,6 +815,7 @@ fn build_generic_layer(
             if w.dtype() == crate::tensor::DType::F32 {
                 Some(w.clone())
             } else {
+                // CONVERSION: the fused norm kernel reads the scale as F32.
                 Some(w.to_dtype(crate::tensor::DType::F32)?)
             }
         } else {
@@ -1193,6 +1195,7 @@ fn build_generic_layer(
         RawMixer::ShortConv { in_proj, conv } => {
             super::mixer::Mixer::ShortConv(super::mixer::ShortConv::new(
                 to_qmatmul(Some(in_proj))?.unwrap(),
+                // CONVERSION: a recurrent mixer holds its small convolution kernel F32 for the host recurrence.
                 conv.dequantize(&Device::Cpu)?,
                 device,
             )?)
@@ -1209,6 +1212,7 @@ fn build_generic_layer(
             let meta = config.ssm.ok_or_else(|| {
                 crate::tensor::Error::msg("ssm layer in a file without ssm.inner_size")
             })?;
+            // CONVERSION: a recurrent mixer holds its small weights F32 for the host recurrence.
             let host = |qt: QTensor| qt.dequantize(&Device::Cpu);
             let a = host(a)?;
             let dims = super::mixer::Mamba2Dims {
@@ -1285,6 +1289,7 @@ fn build_generic_layer(
                     }
                 }
             };
+            // CONVERSION: a recurrent mixer holds its small weights F32 for the host recurrence.
             let host = |qt: QTensor| qt.dequantize(&Device::Cpu);
             super::mixer::Mixer::DeltaNet(super::mixer::GatedDeltaNet::new(
                 proj,
@@ -1377,6 +1382,7 @@ fn build_generic_layer(
         ple_output_scale: raw
             .ple_output_scale_qt
             .map(|qt| {
+                // CONVERSION: a per-layer gate vector is held F32.
                 let t = qt.dequantize(&Device::Cpu)?;
                 if on_gpu {
                     t.to_device(device)
@@ -1550,6 +1556,7 @@ fn build_generic_layer(
                 let factors_f32 = if factors.dtype() == crate::tensor::DType::F32 {
                     factors.clone()
                 } else {
+                    // CONVERSION: rope factors are held F32, one table per layer kind.
                     factors.to_dtype(crate::tensor::DType::F32)?
                 };
                 let inv_factors = factors_f32.recip()?.unsqueeze(0)?;
@@ -1616,6 +1623,7 @@ fn build_awq_layer(
             .contiguous()?;
         let scales = st
             .load(&format!("{p}.{proj}.scales"), device)?
+            // CONVERSION: AWQ scales are held F16, the width the AWQ kernels read.
             .to_dtype(DType::F16)?
             .contiguous()?;
         let k = qweight.dim(0)?;
@@ -1645,6 +1653,7 @@ fn build_awq_layer(
             .contiguous()?;
         let scales = st
             .load(&format!("{p}.{proj}.scales"), device)?
+            // CONVERSION: AWQ scales are held F16, the width the AWQ kernels read.
             .to_dtype(DType::F16)?
             .contiguous()?;
         Ok((qweight, qzeros, scales))
@@ -1661,6 +1670,7 @@ fn build_awq_layer(
             let z = st.load(&format!("{p}.{proj}.qzeros"), &Device::Cpu)?;
             let s = st
                 .load(&format!("{p}.{proj}.scales"), &Device::Cpu)?
+                // CONVERSION: AWQ scales are held F16, the width the AWQ kernels read.
                 .to_dtype(DType::F16)?;
             Ok((w, z, s))
         };
@@ -1703,6 +1713,7 @@ fn build_awq_layer(
     // Optional bias -> F32 on device.
     let load_bias = |proj: &str| -> Result<Option<Tensor>> {
         match st.load(&format!("{p}.{proj}.bias"), device) {
+            // CONVERSION: a bias is a small vector held F32.
             Ok(t) => Ok(Some(t.to_dtype(DType::F32)?)),
             Err(_) => Ok(None),
         }
@@ -1710,6 +1721,7 @@ fn build_awq_layer(
     let load_norm = |name: &str| -> Result<RmsNorm> {
         let w = st
             .load(&format!("{p}.{name}"), device)?
+            // CONVERSION: a norm scale is a small vector held F32.
             .to_dtype(DType::F32)?;
         Ok(RmsNorm::from_tensor(w, eps))
     };
@@ -2347,6 +2359,7 @@ impl GenericHeteroTransformer {
             let placeholder = || -> crate::tensor::Result<QTensor> {
                 let z =
                     Tensor::zeros_on((32usize, 32usize), crate::tensor::DType::F32, weight_dev)?;
+                // CONVERSION: a 32 by 32 placeholder for a projection field the layer never runs.
                 QTensor::quantize_onto(&z, crate::tensor::quantized::GgmlDType::Q8_0, weight_dev)
             };
 
@@ -2887,6 +2900,7 @@ impl GenericHeteroTransformer {
                     });
                 let head = if dense {
                     let qt = source.read(output_weight_name, &Device::Cpu)?;
+                    // CONVERSION: a float head is held once, in F16, for the dense matmul the card paths take.
                     (None, Some(qt.dequantize_f16(cuda_dev)?))
                 } else {
                     let qt = source.read(output_weight_name, cuda_dev)?;

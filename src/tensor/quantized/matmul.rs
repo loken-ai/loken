@@ -42,6 +42,7 @@ impl QMatMul {
     /// fork-compat: dequantize to F16 on the weight's device.
     pub fn dequantize_f16(&self) -> Result<Tensor> {
         match self {
+            // CONVERSION: the F16 dequantisation is what the caller asked for.
             Self::QTensor(t) => t.dequantize_f16(t.device()),
             Self::Tensor(t) => t.to_dtype(crate::tensor::DType::F16),
             Self::TensorF16(t) => Ok(t.clone()),

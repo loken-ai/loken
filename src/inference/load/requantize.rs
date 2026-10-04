@@ -146,6 +146,7 @@ pub fn requantize_gguf(
             // F16 or BF16 from a half-precision one. Cast to F32 so the quantiser always gets the
             // element type it reads.
             let f32s = q
+                // CONVERSION: the requantiser decodes a tensor to F32 and encodes it as its target, one tensor at a time.
                 .dequantize(&dev)?
                 .to_dtype(DType::F32)?
                 .flatten_all()?

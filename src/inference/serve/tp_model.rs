@@ -238,6 +238,7 @@ impl TpQwen2 {
                         cur: &mut Cursor<&[u8]>,
                         n: &str|
              -> Result<(Tensor, Tensor)> {
+                // CONVERSION: a norm scale is a small vector held F32 on each card.
                 let w = rd(ct, cur, n)?.dequantize(&cpu)?;
                 Ok((w.to_device(&g0)?, w.to_device(&g1)?))
             };
@@ -248,6 +249,7 @@ impl TpQwen2 {
                         n: &str|
              -> Result<Option<Tensor>> {
                 if ct.tensor_infos.contains_key(n) {
+                    // CONVERSION: a bias is a small vector held F32.
                     Ok(Some(rd(ct, cur, n)?.dequantize(&cpu)?))
                 } else {
                     Ok(None)
@@ -296,6 +298,7 @@ impl TpQwen2 {
         //  rope_base=1e6 eps=1e-5 vocab=152064; attn_q/output=Q4K, ffn_down=Q6K - all QK_K=256
         //  so the row-parallel slice_qtensor_cols block math is exact.)
         let out_norm = rd(&ct, &mut cur, "output_norm.weight")?
+            // CONVERSION: a norm scale is a small vector held F32.
             .dequantize(&cpu)?
             .to_device(&g0)?;
         let lm_qt = match ct.tensor(&mut cur, "output.weight", &g0) {

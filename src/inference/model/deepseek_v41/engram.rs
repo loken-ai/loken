@@ -235,6 +235,7 @@ impl EngramTable {
                 let start = r - r % group;
                 let count = group.min(rows - start);
                 rows_view(t, start, count)?
+                    // CONVERSION: one table row is decoded from the mapped blocks per lookup.
                     .dequantize(&Device::Cpu)?
                     .narrow(0, r - start, 1)?
                     .flatten_all()?

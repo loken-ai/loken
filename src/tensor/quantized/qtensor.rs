@@ -141,6 +141,7 @@ impl QTensor {
     /// Quantize an f32/f16 tensor's values into GGML blocks (host-side;
     /// result lives on the input tensor's device).
     pub fn quantize(t: &Tensor, dtype: GgmlDType) -> Result<Self> {
+        // CONVERSION: quantisation of a float tensor is the constructor; the result is the resident form.
         Self::quantize_onto(t, dtype, &t.device())
     }
 
@@ -220,6 +221,7 @@ impl QTensor {
             )?;
             out
         } else {
+            // CONVERSION: a dense decode is what dequantize returns.
             self.inner.dequantize_f32()?
         };
         let t = Tensor::from_vec(f, self.shape.clone(), &tensor::Device::Cpu)?;
@@ -238,6 +240,7 @@ impl QTensor {
         if device.is_dry() {
             return Tensor::dry(device, crate::tensor::DType::F16, self.shape.clone());
         }
+        // CONVERSION: F16 dequantisation goes through the host decode.
         self.dequantize(&tensor::Device::Cpu)?
             .to_dtype(crate::tensor::DType::F16)?
             .to_device(device)

@@ -481,6 +481,7 @@ impl crate::tensor::quantized::gguf_source::GgufSource for RemoteGguf {
             .map_err(|e| crate::tensor::Error::msg(format!("remote gguf: fetch {name}: {e}")))?
             .ok_or_else(|| crate::tensor::Error::msg(format!("remote gguf: no tensor {name}")))?;
         let dtype = crate::tensor::quantized::GgmlDType::from_u32(blob.dtype)?;
+        // CONVERSION: a streamed weight is assembled from block bytes into one storage.
         let storage = crate::tensor::quantized::QStorage::from_data(
             std::borrow::Cow::Owned(blob.bytes),
             device,

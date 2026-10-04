@@ -46,6 +46,7 @@ macro_rules! repack_gemm_formats {
                             }
                             let packed = self
                                 .$cache
+                                // CONVERSION: x8 interleaved layout the host dot kernels read; the stored blocks stay for the paths that read them.
                                 .get_or_init(|| qc::$repack::repack(blocks, self.n, nb));
                             let lhs_f32: Vec<f32> = lhs.iter().map(|&v| v.to_f32()).collect();
                             let mut dst32 = vec![0f32; rows * self.n];

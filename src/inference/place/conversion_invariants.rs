@@ -8,20 +8,21 @@
 //! `CONVERSION_DEBT`, and the count only goes down.
 //!
 //! Counted calls: the dequantisers, the quantisers, the raw-bytes storage constructor and the
-//! repacks, everywhere in production code; and `.to_dtype(` in the files that load weights,
+//! calls that build a repacked layout, everywhere in production code; and `.to_dtype(` in the files that load weights,
 //! where it widens a stored tensor rather than casting an activation.
 
 use super::placement_invariants::{code_only, fleet_sources, production};
 
 /// Calls that turn a stored weight into another representation, wherever they appear.
-const CONVERSION_CALLS: [&str; 7] = [
+const CONVERSION_CALLS: [&str; 8] = [
     ".dequantize(",
     ".dequantize_f16(",
     ".dequantize_f32(",
     "quantize_onto(",
     "QTensor::quantize(",
     "QStorage::from_data(",
-    "repack_",
+    "::repack(",
+    "repack_awq",
 ];
 
 /// The cast, counted only in the files that read checkpoints into resident weights.
@@ -110,39 +111,19 @@ fn counts() -> std::collections::BTreeMap<String, usize> {
 /// list only shrinks: annotate a site, or remove the conversion, and lower the count.
 /// Regenerate with `cargo test conversion_debt_listing -- --ignored --nocapture`.
 const CONVERSION_DEBT: &[(&str, usize)] = &[
-    ("inference/generic_transformer/loader.rs", 22),
-    ("inference/generic_transformer/projection.rs", 2),
-    ("inference/load/calibration.rs", 1),
-    ("inference/load/requantize.rs", 1),
+    ("inference/generic_transformer/loader.rs", 8),
     ("inference/model/acestep/dit/mod.rs", 1),
     ("inference/model/acestep/music.rs", 1),
     ("inference/model/acestep/vae.rs", 1),
-    ("inference/model/deepseek_v41/engram.rs", 1),
-    ("inference/model/deepseek_v41/load.rs", 1),
-    ("inference/model/flux/opencl.rs", 3),
     ("inference/model/moondream/vision.rs", 1),
     ("inference/model/pixtral/mod.rs", 1),
     ("inference/model/qwen25/vision.rs", 1),
     ("inference/model/qwen3/encoder.rs", 1),
     ("inference/model/qwen35/vision.rs", 1),
-    ("inference/model/qwen_image/textenc.rs", 1),
     ("inference/model/wan/dit/layers.rs", 1),
-    ("inference/moe_cuda_cpu/mod.rs", 25),
+    ("inference/moe_cuda_cpu/mod.rs", 7),
     ("inference/offload/cuda.rs", 1),
-    ("inference/offload/weight_stream.rs", 1),
-    ("inference/serve/tp_model.rs", 3),
-    ("tensor/layer/norm.rs", 1),
-    ("tensor/quant_cpu/avx/superblock.rs", 1),
-    ("tensor/quant_cpu/drivers.rs", 37),
-    ("tensor/quant_cpu/mod.rs", 1),
-    ("tensor/quant_cpu/repack_q8_0_x8.rs", 3),
-    ("tensor/quantized/kernel_matmul.rs", 44),
-    ("tensor/quantized/kernel_matmul/repack.rs", 10),
-    ("tensor/quantized/matmul.rs", 2),
-    ("tensor/quantized/qtensor.rs", 3),
-    ("tensor/quantized/varbuilder.rs", 1),
-    ("tensor/safetensors_io.rs", 1),
-    ("tensor/varbuilder.rs", 1),
+    ("tensor/quantized/matmul.rs", 1),
 ];
 
 #[test]
@@ -160,6 +141,17 @@ fn the_scanner_counts_an_unannotated_site_and_skips_an_annotated_one() {
     assert_eq!(unannotated("x.rs", &far).len(), 1);
     let prose = "// the dequantize( call is slow\nfn dequantize(&self) {}\n";
     assert!(unannotated("x.rs", prose).is_empty());
+    // Building a repacked layout is a conversion; running a kernel over one is not.
+    assert_eq!(
+        unannotated("x.rs", "let r = repack_q4k::repack(blocks, n, nb);\n"),
+        vec![1]
+    );
+    assert!(unannotated(
+        "x.rs",
+        "repack_q4k::gemv_group_avx2_plain(g, a, b, &mut o);\n"
+    )
+    .is_empty());
+    assert!(unannotated("x.rs", "cpu_repack_q4k: OnceLock<Vec<BlockQ4Kx8>>,\n").is_empty());
     let cast = "let t = w.to_dtype(DType::F32)?;\n";
     assert!(unannotated("tensor/ops/x.rs", cast).is_empty());
     assert_eq!(unannotated("tensor/varbuilder.rs", cast), vec![1]);

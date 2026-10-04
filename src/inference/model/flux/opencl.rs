@@ -327,6 +327,7 @@ fn load_weight_from_qtensor(
                 other
             );
             let f32_data = qt
+                // CONVERSION: the OpenCL path takes dense weights.
                 .dequantize(&crate::tensor::Device::Cpu)?
                 .flatten_all()?
                 .to_vec1::<f32>()?;
@@ -354,6 +355,7 @@ fn load_qlinear(
         let bias_name = format!("{}.bias", prefix);
         let bias_tensor = content.tensor(reader, &bias_name, &crate::tensor::Device::Cpu)?;
         let bias_f32 = bias_tensor
+            // CONVERSION: the OpenCL path takes dense weights.
             .dequantize(&crate::tensor::Device::Cpu)?
             .flatten_all()?
             .to_vec1::<f32>()?;
@@ -406,6 +408,7 @@ fn load_rms_norm(
 ) -> Result<OclRmsNorm> {
     let qt = content.tensor(reader, name, &crate::tensor::Device::Cpu)?;
     let f32_data = qt
+        // CONVERSION: the OpenCL path takes dense weights.
         .dequantize(&crate::tensor::Device::Cpu)?
         .flatten_all()?
         .to_vec1::<f32>()?;

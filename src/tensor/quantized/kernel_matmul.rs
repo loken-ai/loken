@@ -340,6 +340,7 @@ impl QKernelMatMul {
             crate::tensor::quant_cpu::to_float_bytes(self.dtype, &bytes, &mut out)?;
             return Ok(out);
         }
+        // CONVERSION: an exact F32 matmul was asked for; the weight is decoded for the call.
         self.host.dequantize_f32()
     }
 
@@ -851,6 +852,7 @@ impl QKernelMatMul {
                         crate::tensor::quant_cpu::BlockQ6K,
                     >(self.host.data())
                     .expect("q6k_prefill guard verified the cast");
+                    // CONVERSION: x8 interleaved layout the host dot kernels read; the stored blocks stay.
                     crate::tensor::quant_cpu::repack_q6k::repack(blocks, self.n, nb)
                 });
                 crate::tensor::quant_cpu::matmul_q6k_repacked_tiled(
@@ -865,6 +867,7 @@ impl QKernelMatMul {
                         crate::tensor::quant_cpu::BlockQ5K,
                     >(self.host.data())
                     .expect("q5k_prefill guard verified the cast");
+                    // CONVERSION: x8 interleaved layout the host dot kernels read; the stored blocks stay.
                     crate::tensor::quant_cpu::repack_q5k::repack(blocks, self.n, nb)
                 });
                 crate::tensor::quant_cpu::matmul_q5k_repacked_tiled(
@@ -879,6 +882,7 @@ impl QKernelMatMul {
                         crate::tensor::quant_cpu::BlockQ5_0,
                     >(self.host.data())
                     .expect("q5_0_prefill guard verified the cast");
+                    // CONVERSION: x8 interleaved layout the host dot kernels read; the stored blocks stay.
                     crate::tensor::quant_cpu::repack_q5_0::repack(blocks, self.n, nb40)
                 });
                 crate::tensor::quant_cpu::matmul_q5_0_repacked_tiled(
@@ -893,6 +897,7 @@ impl QKernelMatMul {
                         crate::tensor::quant_cpu::BlockQ8_0,
                     >(self.host.data())
                     .expect("q8_0_prefill guard verified the cast");
+                    // CONVERSION: x8 interleaved layout the host dot kernels read; the stored blocks stay.
                     crate::tensor::quant_cpu::repack_q8_0_x8::repack(blocks, self.n, nb40)
                 });
                 crate::tensor::quant_cpu::matmul_q8_0_x8_tiled(
@@ -907,6 +912,7 @@ impl QKernelMatMul {
                         crate::tensor::quant_cpu::BlockQ4_0,
                     >(self.host.data())
                     .expect("q4_0_prefill guard verified the cast");
+                    // CONVERSION: x8 interleaved layout the host dot kernels read; the stored blocks stay.
                     crate::tensor::quant_cpu::repack_q4_0::repack(blocks, self.n, nb40)
                 });
                 crate::tensor::quant_cpu::matmul_q4_0_repacked_tiled(
@@ -921,6 +927,7 @@ impl QKernelMatMul {
                         crate::tensor::quant_cpu::BlockMxFp4,
                     >(self.host.data())
                     .expect("mxfp4_prefill guard verified the cast");
+                    // CONVERSION: x8 interleaved layout the host dot kernels read; the stored blocks stay.
                     crate::tensor::quant_cpu::repack_mxfp4_x8::repack(blocks, self.n, nb40)
                 });
                 crate::tensor::quant_cpu::matmul_mxfp4_x8_tiled(
@@ -935,6 +942,7 @@ impl QKernelMatMul {
                         crate::tensor::quant_cpu::BlockQ4_0,
                     >(self.host.data())
                     .expect("q4_0_decode guard verified the cast");
+                    // CONVERSION: x8 interleaved layout the host dot kernels read; the stored blocks stay.
                     crate::tensor::quant_cpu::repack_q4_0::repack(blocks, self.n, nb40)
                 });
                 crate::tensor::quant_cpu::matmul_q4_0_repacked_gemv(
@@ -1199,6 +1207,7 @@ impl QKernelMatMul {
         }
         Some(
             self.cpu_repack_q4k
+                // CONVERSION: x8 interleaved layout the host dot kernels read; the stored blocks stay.
                 .get_or_init(|| crate::tensor::quant_cpu::repack_q4k::repack(blocks, self.n, nb)),
         )
     }

@@ -46,6 +46,7 @@ impl Source {
                 let t = if t.dtype() == dtype {
                     t.clone()
                 } else {
+                    // CONVERSION: the caller names the dtype it wants the tensor in.
                     t.to_dtype(dtype)?
                 };
                 t.to_device(device)

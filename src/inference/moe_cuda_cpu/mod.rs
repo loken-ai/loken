@@ -173,6 +173,7 @@ fn repacked_q4k(
     };
     let mut out = Vec::with_capacity(e_count * (n / 8) * bpr);
     for e in 0..e_count {
+        // CONVERSION: x8 interleaved layout the host expert dot kernels read; the stored blocks stay for the paths that read them.
         out.extend(repack_q4k::repack(
             &blocks[e * n * bpr..(e + 1) * n * bpr],
             n,
@@ -220,6 +221,7 @@ fn repacked_q6k(
     };
     let mut out = Vec::with_capacity(e_count * (n / 8) * bpr);
     for e in 0..e_count {
+        // CONVERSION: x8 interleaved layout the host expert dot kernels read; the stored blocks stay for the paths that read them.
         out.extend(repack_q6k::repack(
             &blocks[e * n * bpr..(e + 1) * n * bpr],
             n,

@@ -197,6 +197,7 @@ pub fn read(path: &Path) -> Result<HashMap<String, (Vec<f32>, Vec<f32>, usize)>>
         }
         let t = g.tensor(name, &crate::tensor::Device::Cpu)?;
         let values = t
+            // CONVERSION: the calibration reader decodes one record to F32 offline.
             .dequantize(&crate::tensor::Device::Cpu)?
             .flatten_all()?
             .to_vec1::<f32>()?;
