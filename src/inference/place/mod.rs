@@ -7,6 +7,8 @@
 #[cfg(all(test, feature = "image"))]
 mod architecture_invariants;
 pub mod audio_demand;
+#[cfg(all(test, feature = "image"))]
+mod conversion_invariants;
 pub mod device_probe;
 pub mod dry_plan;
 pub mod fit_report;

@@ -410,6 +410,7 @@ fn build_generic_layer(
     // Helper: build RmsNorm, placing weights on the layer's device
     let build_norm = |qt: QTensor| -> Result<RmsNorm> {
         if on_gpu {
+            // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
             let w = qt.dequantize(&Device::Cpu)?.to_device(device)?;
             Ok(RmsNorm::from_tensor(w, eps))
         } else {
@@ -621,6 +622,7 @@ fn build_generic_layer(
     // Biases: dequantize to F32 Tensor on the layer device
     let load_bias = |qt: Option<QTensor>| -> Result<Option<Tensor>> {
         qt.map(|q| {
+            // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
             let t = q.dequantize(&Device::Cpu)?;
             if on_gpu {
                 t.to_device(device)
@@ -780,6 +782,7 @@ fn build_generic_layer(
         Some(qt) => {
             if let Some(bias_qt) = raw.attn_norm_bias_qt {
                 let weight_t = if on_gpu {
+                    // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
                     qt.dequantize(&Device::Cpu)?.to_device(device)?
                 } else {
                     qt.dequantize(device)?
@@ -815,6 +818,7 @@ fn build_generic_layer(
     let bias_to_device = |qt: Option<QTensor>| -> Result<Option<Tensor>> {
         match qt {
             Some(b) => Ok(Some(if on_gpu {
+                // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
                 b.dequantize(&Device::Cpu)?.to_device(device)?
             } else {
                 b.dequantize(device)?
@@ -826,6 +830,7 @@ fn build_generic_layer(
     let attn_sinks_host = raw
         .attn_sinks_qt
         .as_ref()
+        // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
         .map(|qt| qt.dequantize(&Device::Cpu)?.to_vec1::<f32>())
         .transpose()?;
     let attn_sinks = bias_to_device(raw.attn_sinks_qt)?;
@@ -833,6 +838,7 @@ fn build_generic_layer(
     let ffn_down_bias = bias_to_device(raw.ffn_down_bias_qt)?;
     // Extract raw weight for fused add+rmsnorm kernel before build_norm consumes QTensor
     let ffn_norm_weight_for_fused = match &raw.ffn_norm_qt {
+        // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
         Some(qt) if on_gpu => Some(qt.dequantize(&Device::Cpu)?.to_device(device)?),
         _ => None,
     };
@@ -1033,6 +1039,7 @@ fn build_generic_layer(
             };
         let gate_inp_scale = match raw.moe_gate_inp_scale_qt {
             Some(qt) => {
+                // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
                 let t = qt.dequantize(&Device::Cpu)?;
                 if on_gpu {
                     t.to_device(device)?
@@ -1052,6 +1059,7 @@ fn build_generic_layer(
         let gate_inp_scale = (gate_inp_scale * inv_sqrt_n_embd)?;
         let down_exps_scale = match raw.moe_down_exps_scale_qt {
             Some(qt) => {
+                // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
                 let t = qt.dequantize(&Device::Cpu)?;
                 Some(if on_gpu { t.to_device(device)? } else { t })
             }
@@ -1095,6 +1103,7 @@ fn build_generic_layer(
                 scalar_gate: load_bias(raw.shexp_scalar_gate_qt)?
                     .map(|w| {
                         let n = w.elem_count();
+                        // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
                         w.to_dtype(crate::tensor::DType::F32)?.reshape((n, 1))
                     })
                     .transpose()?,
@@ -1143,6 +1152,7 @@ fn build_generic_layer(
                 .then(|| -> Result<SigmoidRouting> {
                     Ok(SigmoidRouting {
                         selection_bias: load_bias(raw.moe_exp_probs_b_qt)?
+                            // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
                             .map(|b| b.to_dtype(crate::tensor::DType::F32))
                             .transpose()?,
                         normalize: config.expert_weights_norm,
@@ -2039,6 +2049,7 @@ impl GenericHeteroTransformer {
                 false => return Err(e),
             },
         };
+        // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
         let norm_weight_cpu = norm_qt.dequantize(&Device::Cpu)?;
         // Phi2/GPT-NeoX use full LayerNorm: `output_norm.bias` exists.
         let output_norm_bias_cpu = source
@@ -2066,6 +2077,7 @@ impl GenericHeteroTransformer {
             .read_opt("output.bias", &Device::Cpu)
             .ok()
             .flatten()
+            // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
             .and_then(|qt| qt.dequantize(&Device::Cpu).ok());
         let (output_qt, output_weight_name) = match source.read("output.weight", &Device::Cpu) {
             Ok(qt) => (qt, "output.weight"),
@@ -2149,6 +2161,7 @@ impl GenericHeteroTransformer {
             .read_opt("rope_freqs.weight", &Device::Cpu)
             .ok()
             .flatten()
+            // CONVERSION: norm scales, biases and gates are small vectors, held F32 whatever the file stores.
             .and_then(|qt| qt.dequantize(&Device::Cpu).ok());
         if rope_freq_factors.is_some() {
             info!("✅ Loaded rope_freqs.weight for proportional RoPE");
