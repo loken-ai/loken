@@ -564,6 +564,14 @@ impl ExpertSet {
 }
 
 /// An `ExpertLoader` over experts already held in memory, handing back a clone on each build. It
+/// How many experts the kept tier holds; 0 when resident.
+pub fn capacity(&self) -> usize {
+    match self {
+        ExpertSet::Streamed(s) => s.capacity.load(Ordering::Relaxed),
+        ExpertSet::Resident(_) => 0,
+    }
+}
+
 /// backs the machinery gate (a small cache over these must match the resident forward) and is the
 /// shape a disk-backed, dequant-on-read loader will replace to actually shrink the footprint.
 pub struct VecExpertLoader {

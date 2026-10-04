@@ -64,6 +64,9 @@ pub struct Moe {
     pub last_routing: std::sync::Mutex<Vec<Vec<(usize, f32)>>>,
     /// The experts the last `predict_and_advise` named, compared with the routing that follows.
     pub predicted: std::sync::Mutex<Vec<usize>>,
+    /// Slots of a token that were not in memory and that the lossy options removed or replaced,
+    /// since last read: the disk reads they saved.
+    pub saved: std::sync::atomic::AtomicU64,
     /// Lossy routing options; all off unless set.
     pub truncation: std::sync::RwLock<Truncation>,
     /// Experts to treat as resident in place of the live tiers: for a quality measurement that
@@ -152,6 +155,7 @@ impl Moe {
         });
         let k = self.n_activated;
         let mut slots: Vec<(usize, f32)> = order[..k].iter().map(|&e| (e, scores[e])).collect();
+        let mut saved = 0u64;
         if t.miss_below > 0.0 {
             let total: f32 = slots.iter().map(|s| s.1).sum::<f32>() + 1e-20;
             let heaviest = slots.iter().map(|s| s.1).fold(f32::MIN, f32::max);
@@ -162,6 +166,7 @@ impl Moe {
                 if !light || resident(e) {
                     out.push((e, s));
                 } else if !t.miss_drops {
+                    saved += 1;
                     // The best-ranked expert beyond the selection that is already in memory takes
                     // the slot and its weight.
                     while next < order.len() && !resident(order[next]) {
@@ -171,23 +176,32 @@ impl Moe {
                         out.push((order[next], s));
                         next += 1;
                     } else {
+                        saved -= 1;
                         out.push((e, s));
                     }
+                } else {
+                    saved += 1;
                 }
             }
             slots = out;
         }
         slots.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         if t.keep > 0 && t.keep < slots.len() {
+            saved += slots[t.keep..].iter().filter(|s| !resident(s.0)).count() as u64;
             slots.truncate(t.keep);
         }
         if t.drop_mass > 0.0 {
             let total: f32 = slots.iter().map(|s| s.1).sum::<f32>() + 1e-20;
             let mut dropped = 0f32;
             while slots.len() > 1 && (dropped + slots[slots.len() - 1].1) / total < t.drop_mass {
-                dropped += slots.pop().map_or(0.0, |s| s.1);
+                if let Some(gone) = slots.pop() {
+                    dropped += gone.1;
+                    saved += !resident(gone.0) as u64;
+                }
             }
         }
+        self.saved
+            .fetch_add(saved, std::sync::atomic::Ordering::Relaxed);
         let chosen: Vec<usize> = slots.iter().map(|s| s.0).collect();
         let mut w: Vec<f32> = slots.iter().map(|s| s.1).collect();
         if self.norm_topk && self.n_activated > 1 {
@@ -197,6 +211,14 @@ impl Moe {
             }
         }
         (chosen, w)
+    }
+
+    /// The experts a card holds now.
+    pub fn cards_hold(&self) -> std::collections::HashSet<usize> {
+        let on_card = self.on_card_probe();
+        (0..self.n_routed)
+            .filter(|&e| self.experts.peek(e).is_some_and(|x| on_card(&x)))
+            .collect()
     }
 
     /// Whether an expert is in memory for the host or a card now: the override when one is set,
@@ -726,6 +748,7 @@ mod tests {
             norm_topk: true,
             last_routing: std::sync::Mutex::new(Vec::new()),
             predicted: std::sync::Mutex::new(Vec::new()),
+            saved: Default::default(),
             truncation: Default::default(),
             resident_override: Default::default(),
             observer: std::sync::RwLock::new(None),

@@ -106,22 +106,12 @@ pub struct InferenceConfigToml {
     /// little accuracy; 0 keeps every layer exact.
     #[serde(default)]
     pub expert_deferral: f32,
-    /// For a streamed model, lossy routing for speed; every zero is exact. The share of a
-    /// token's experts to keep (the heaviest, rounded up).
+    /// For a streamed model: the largest mean divergence (KL, in nats) from the exact output the
+    /// operator accepts in exchange for speed. The engine measures what each way of giving up
+    /// experts costs on a bundled text at load and picks the fastest that fits; 0 keeps the
+    /// output exact.
     #[serde(default)]
-    pub expert_keep_fraction: f32,
-    /// Drop a token's lightest experts while together they carry under this share of its weight.
-    #[serde(default)]
-    pub expert_drop_mass: f32,
-    /// Replace (or drop) an expert in no tier whose share of the token's weight is under this.
-    #[serde(default)]
-    pub expert_miss_below: f32,
-    /// Drop such an expert instead of replacing it by the best resident one.
-    #[serde(default)]
-    pub expert_miss_drops: bool,
-    /// Take the routing prior from a companion file even when the model file carries one.
-    #[serde(default)]
-    pub companion_prior_first: bool,
+    pub quality_budget: f32,
     /// Keys this version no longer reads, kept so a config written for an older one still
     /// loads; each is reported once at startup.
     #[serde(flatten, skip_serializing)]
@@ -291,11 +281,7 @@ impl Config {
             moderation_model: toml_config.moderation_model.clone(),
             public_url: toml_config.public_url.clone(),
             expert_deferral: toml_config.expert_deferral,
-            expert_keep_fraction: toml_config.expert_keep_fraction,
-            expert_drop_mass: toml_config.expert_drop_mass,
-            expert_miss_below: toml_config.expert_miss_below,
-            expert_miss_drops: toml_config.expert_miss_drops,
-            companion_prior_first: toml_config.companion_prior_first,
+            quality_budget: toml_config.quality_budget,
             progress_callback: None, // No progress callback from config file
             models_dir: None,        // Will be set by APIServer
             disable_arc_layers: false,

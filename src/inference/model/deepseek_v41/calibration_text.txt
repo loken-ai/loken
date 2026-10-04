@@ -1,0 +1,36 @@
+fn merge_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] <= b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            out.push(b[j]);
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
+}
+
+A cache keeps the entries a program asked for most recently, so that asking again is fast. When it
+is full, the entry that was used longest ago makes room for the new one. The cost of a miss is the
+time to fetch the entry from the slower store; the benefit of a hit is the time that fetch would
+have taken. A cache pays for itself when the hit rate times the fetch time exceeds the time spent
+looking entries up.
+
+def moving_average(values, window):
+    total = 0.0
+    out = []
+    for i, v in enumerate(values):
+        total += v
+        if i >= window:
+            total -= values[i - window]
+        out.append(total / min(i + 1, window))
+    return out
+
+The report describes three phases. First the data is collected and checked for gaps. Then each
+series is smoothed and compared with the previous quarter. Finally the differences are summarised
+in a table, with the largest changes listed first and a short note on how each was measured.

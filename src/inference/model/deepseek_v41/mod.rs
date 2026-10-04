@@ -16,6 +16,7 @@ pub mod band;
 pub mod batch_server;
 pub mod block;
 pub mod cache;
+pub mod calibrate;
 pub mod candidates;
 pub mod complete;
 pub mod convert;

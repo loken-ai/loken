@@ -91,6 +91,9 @@ pub struct DeepseekV41Model {
     expert_deferral: f32,
     // rope regimes: ratio-0 uses base theta with no YaRN; a band layer uses the compressed theta
     // with YaRN from original_seq_len.
+    /// The quality budget to calibrate at backend start, with the model's identity and the
+    /// calibration text's tokens; taken once.
+    quality: std::sync::Mutex<Option<(f64, String, Vec<u32>)>>,
     rope_theta: f32,
     compress_rope_theta: f32,
     rope_factor: f32,
@@ -1091,6 +1094,59 @@ impl DeepseekV41Model {
                     per_layer.and_then(|p| p.get(i).cloned());
             }
         }
+    }
+    /// Ask for the routing that gives up the most disk reads within `budget` (KL, nats) of the
+    /// exact output, to be calibrated when the backend starts.
+    pub fn set_quality_policy(&self, budget: f64, identity: String, ids: Vec<u32>) {
+        *self.quality.lock().unwrap() = Some((budget, identity, ids));
+    }
+
+    /// The policy `set_quality_policy` left, once.
+    pub fn take_quality_policy(&self) -> Option<(f64, String, Vec<u32>)> {
+        self.quality.lock().unwrap().take()
+    }
+
+    /// Set every layer's lossy routing options as given.
+    pub fn set_truncation(&self, t: super::moe::Truncation) {
+        for b in self.blocks.iter().flatten() {
+            *b.moe.truncation.write().unwrap() = t;
+        }
+    }
+
+    /// The disk reads the lossy options saved since last asked, summed over layers.
+    pub fn take_saved(&self) -> u64 {
+        self.blocks
+            .iter()
+            .flatten()
+            .map(|b| b.moe.saved.swap(0, std::sync::atomic::Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Per layer, the experts the plan keeps in memory: those on a card now and the most routed-to
+    /// ones the kept tier will hold, from the routing prior.
+    pub fn plan_residency(&self) -> Vec<std::collections::HashSet<usize>> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let Some(b) = b else {
+                    return Default::default();
+                };
+                let mut set = b.moe.cards_hold();
+                let slots = b.moe.experts.capacity();
+                set.extend(
+                    self.hot_experts()
+                        .get(i)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(|e| !set.contains(e))
+                        .take(slots)
+                        .collect::<Vec<_>>(),
+                );
+                set
+            })
+            .collect()
     }
 
     /// How many routed experts per token the share allows to finish late.
@@ -3466,6 +3522,52 @@ mod oracle_gate {
         };
         for (ratios, kv_src, index_src) in layouts {
             let (model, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            /// The quality budget end to end on a small model: a zero budget runs nothing and leaves the
+            /// logits bit for bit, a budget measures every candidate (divergence no smaller than zero,
+            /// reads saved counted) and a pick within it is applied.
+            #[test]
+            fn a_quality_budget_calibrates_and_zero_changes_nothing() {
+                use super::super::calibrate;
+                let (model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 3);
+                let run = |m: &DeepseekV41Model, ids: &[u32]| -> Result<Vec<Vec<f32>>> {
+                    m.forward_prefill(ids)?.to_vec2::<f32>()
+                };
+                let plain = run(&model, &tokens).unwrap();
+                let resident = model.plan_residency();
+                let nothing = |_: &DeepseekV41Model, _: &[u32]| -> Result<Vec<Vec<f32>>> {
+                    panic!("a zero budget must not run the model")
+                };
+                assert!(
+                    calibrate::apply_budget(&model, 0.0, "k", &tokens, &resident, &nothing)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    run(&model, &tokens).unwrap(),
+                    plain,
+                    "a zero budget changed the logits"
+                );
+
+                let table = calibrate::measure(&model, &tokens, &resident, &run).unwrap();
+                assert_eq!(
+                    table.len(),
+                    calibrate::candidates(model.n_activated()).len()
+                );
+                assert!(table
+                    .iter()
+                    .all(|m| m.kl >= -1e-9 && m.saved_per_token >= 0.0));
+                assert_eq!(
+                    run(&model, &tokens).unwrap(),
+                    plain,
+                    "measuring left a setting on"
+                );
+                let chosen = calibrate::pick(&table, 1e9);
+                if let Some(m) = chosen {
+                    model.set_truncation(m.truncation());
+                    assert!(model.take_saved() == 0);
+                }
+            }
+
             // Three independent sequences: distinct token streams and distinct lengths, so the
             // batch step runs three different positions at once.
             let seqs: Vec<Vec<u32>> = (0..3)

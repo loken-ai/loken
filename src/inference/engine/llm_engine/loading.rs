@@ -236,13 +236,7 @@ impl LlmEngine {
         let disable_cuda = self.config.disable_cuda || crate::gpu::force_cpu();
         let kv_quant = self.config.kv_quant;
         let expert_deferral = self.config.expert_deferral;
-        let (keep_fraction, drop_mass, miss_below, miss_drops, companion_first) = (
-            self.config.expert_keep_fraction,
-            self.config.expert_drop_mass,
-            self.config.expert_miss_below,
-            self.config.expert_miss_drops,
-            self.config.companion_prior_first,
-        );
+        let quality_budget = self.config.quality_budget;
         let state_cache = self.state_cache.clone();
         let state_cache_salt = self.config.state_cache_salt.clone();
         let user_context_length = self.config.context_length;
@@ -733,7 +727,18 @@ impl LlmEngine {
                     let mut model = DeepseekV41Model::load(&source, &cfg)
                         .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
                     model.set_expert_deferral(expert_deferral);
-                    model.set_expert_truncation(keep_fraction, drop_mass, miss_below, miss_drops);
+                    if quality_budget > 0.0 {
+                        let file_len = std::fs::metadata(&model_file).map_or(0, |m| m.len());
+                        let name = model_file
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if let Some(ids) =
+                            crate::inference::model::deepseek_v41::calibrate::calibration_ids(&source)
+                        {
+                            model.set_quality_policy(quality_budget as f64, format!("{name}:{file_len}"), ids);
+                        }
+                    }
                     // Without a kept tier the page cache is the only cache, and a prompt's
                     // prefill sweeps every expert through it: the decode that follows starts
                     // with the early layers evicted. The tier keeps each layer's most routed

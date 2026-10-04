@@ -891,11 +891,37 @@ impl DeepseekV41Backend {
         // experts there. With less, the experts that fill the cards leave a prompt's steps to
         // decline, and they fall to the host for the rest of the request. A wider prompt runs its
         // widest steps in chunks.
-        const PREFILL_TRANSIENT_TOKENS: usize = 2048;
+        const PREFILL_TRANSIENT_TOKENS: usize = 2048; // the widest prompt chunk the prefill ladder starts from
         let state = model.new_decode_state();
         // The engine opens the card placement through the generic streamed-model seam: the model
         // states its resident footprint, routing and experts, and no architecture is named here.
         let streamed = Streamed::open_for(&model, context_length.min(PREFILL_TRANSIENT_TOKENS));
+        // A quality budget is spent here, once the placement stands: the engine measures what each
+        // way of giving up experts costs and applies the fastest that fits.
+        if let Some((budget, identity, ids)) = model.take_quality_policy() {
+            use crate::inference::model::deepseek_v41::calibrate;
+            if let Some(s) = &streamed {
+                model.offload_experts(Some(s.lanes.clone()));
+            }
+            let resident = model.plan_residency();
+            let key = format!(
+                "{identity}|resident:{}",
+                resident.iter().map(|r| r.len()).sum::<usize>()
+            );
+            let run = |m: &crate::inference::model::deepseek_v41::model::DeepseekV41Model,
+                       toks: &[u32]|
+             -> crate::tensor::Result<Vec<Vec<f32>>> {
+                let forward = || m.forward_prefill(toks);
+                let logits = match &streamed {
+                    Some(s) => crate::inference::offload::with_offload(s.offload.clone(), forward),
+                    None => forward(),
+                }?;
+                logits.to_vec2::<f32>()
+            };
+            if let Err(e) = calibrate::apply_budget(&model, budget, &key, &ids, &resident, &run) {
+                tracing::warn!("quality calibration failed, routing stays exact: {e}");
+            }
+        }
         let mut state = state;
         let dspark_state = match &dspark {
             Some(d) => {
@@ -1807,89 +1833,6 @@ impl ModelBackend for DeepseekV41Backend {
         match streamed {
             Some(s) => {
                 model.offload_experts(Some(s.lanes.clone()));
-                // PROBE (diagnostic, off): measures a batched verify against K decodes on the real,
-                // warm next tokens - the continuation a draft would propose - so the amortisation is
-                // read on representative experts. Gated off; it perturbs decode timing when live.
-                if false && ids.len() == 1 && state.pos > 24 {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static PN: AtomicU64 = AtomicU64::new(0);
-                    if PN.fetch_add(1, Ordering::Relaxed).is_multiple_of(20) {
-                        const K: usize = 5;
-                        let p0 = state.pos;
-                        let first = ids[0];
-                        let mark = state.checkpoint();
-                        let mut toks_in: Vec<u32> = Vec::with_capacity(K);
-                        let mut real: Vec<u32> = Vec::with_capacity(K);
-                        let mut main_hidden: Vec<f32> = Vec::new();
-                        let mut cur = first;
-                        let mut dsum = 0u128;
-                        for i in 0..K {
-                            toks_in.push(cur);
-                            let t0 = std::time::Instant::now();
-                            let lg =
-                                crate::inference::offload::with_offload(s.offload.clone(), || {
-                                    model.forward_decode(cur, state)
-                                })?;
-                            dsum += t0.elapsed().as_micros();
-                            if i == 0 {
-                                main_hidden = state.captured.concat();
-                            }
-                            let v = lg.flatten_all()?.to_vec1::<f32>()?;
-                            cur = v
-                                .iter()
-                                .enumerate()
-                                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                                .map(|(i, _)| i as u32)
-                                .unwrap_or(0);
-                            real.push(cur);
-                        }
-                        state.rewind(&mark);
-                        let t0 = std::time::Instant::now();
-                        let _ = crate::inference::offload::with_offload(s.offload.clone(), || {
-                            model.forward_verify_batch(&toks_in, state)
-                        })?;
-                        let vtime = t0.elapsed().as_micros();
-                        state.rewind(&mark);
-                        // The DSpark draft from the same token, against the greedy continuation.
-                        if let (Some(d), Some(ds)) = (dspark.as_ref(), dspark_state.as_mut()) {
-                            if !main_hidden.is_empty() {
-                                let t0 = std::time::Instant::now();
-                                let drafts = crate::inference::offload::with_offload(
-                                    s.offload.clone(),
-                                    || {
-                                        d.forward_draft(
-                                            ds,
-                                            &main_hidden,
-                                            first,
-                                            p0,
-                                            model.embed_ref(),
-                                            model.head_ref(),
-                                        )
-                                    },
-                                );
-                                let dtime = t0.elapsed().as_micros();
-                                match drafts {
-                                    Ok(drafts) => {
-                                        let acc = drafts
-                                            .iter()
-                                            .zip(&real)
-                                            .take_while(|(a, b)| a == b)
-                                            .count();
-                                        tracing::info!(
-                                            "DSPARK-DRAFT accept {}/{} draft_us={} drafts={:?} real={:?}",
-                                            acc, K, dtime, drafts, real
-                                        );
-                                    }
-                                    Err(e) => tracing::warn!("DSpark forward_draft failed: {e}"),
-                                }
-                            }
-                        }
-                        tracing::info!(
-                            "PROBE verify K={K}: decode_sum={dsum}us verify={vtime}us ratio={:.2} (warm, real tokens)",
-                            vtime as f64 / dsum.max(1) as f64
-                        );
-                    }
-                }
                 for &t in &ids {
                     last = Some(crate::inference::offload::with_offload(
                         s.offload.clone(),
