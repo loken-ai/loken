@@ -1528,8 +1528,28 @@ impl DeepseekV41Model {
     /// path only by floating-point rounding, so the per-position argmax matches what decoding one
     /// token at a time from the same state would give, and the caches are left in the same place.
     pub fn forward_verify_batch(&self, tokens: &[u32], state: &mut DecodeState) -> Result<Tensor> {
+        self.forward_block(tokens, state, false)
+    }
+
+    /// Continue a sequence whose state stands at `state.pos` over `tokens`, returning the
+    /// next-token logits after the last one, `[1, vocab]`. This is the prefill of a prompt's
+    /// remainder after a restored prefix: the block runs as `forward_verify_batch` does - each
+    /// layer's experts read once for all of it - and only the last position goes through the
+    /// head, so no `[tokens, vocab]` matrix is built.
+    pub fn prefill_continue(&self, tokens: &[u32], state: &mut DecodeState) -> Result<Tensor> {
+        self.forward_block(tokens, state, true)
+    }
+
+    /// The block pass behind `forward_verify_batch` and `prefill_continue`: the logits of every
+    /// position, or of the last one alone when `last_only`.
+    fn forward_block(
+        &self,
+        tokens: &[u32],
+        state: &mut DecodeState,
+        last_only: bool,
+    ) -> Result<Tensor> {
         if tokens.is_empty() {
-            return Err(Error::msg("forward_verify_batch: no tokens"));
+            return Err(Error::msg("forward_block: no tokens"));
         }
         let (dim, hc) = (self.dim, self.hc_mult);
         let pos = state.pos;
@@ -1625,9 +1645,18 @@ impl DeepseekV41Model {
             pre_mix = npm;
         }
 
+        let (x, pre_mix, rows) = if last_only {
+            (
+                x.narrow(1, k - 1, 1)?.contiguous()?,
+                pre_mix[k - 1..].to_vec(),
+                1,
+            )
+        } else {
+            (x, pre_mix, k)
+        };
         let h = hc_pre(&x, &pre_mix)?;
         let h = rms_norm(&h, &self.norm, self.rms_eps)?;
-        let logits = self.output.apply(&h.reshape((k, dim))?)?;
+        let logits = self.output.apply(&h.reshape((rows, dim))?)?;
         state.pos += k;
         Ok(logits)
     }
@@ -2585,6 +2614,113 @@ mod oracle_gate {
             for (a, b) in first.iter().zip(&again) {
                 assert_eq!(a, b, "a rewound state must replay bit for bit");
             }
+        }
+    }
+
+    /// A snapshot written after a prefix and read back is that prefix's state to the bit: the
+    /// logits of the remainder prefilled onto it equal, bit for bit, those of the same remainder
+    /// prefilled onto the live state, and the decode that follows too. Against a cold prefill of the
+    /// whole prompt - another summation order, the one `prefill_into_leaves_the_decode_state`
+    /// bounds - the logits agree to rounding and name the same token. Splits fall inside a
+    /// compression group, shorter than the window, on the window, past it and on a group boundary.
+    #[test]
+    fn a_restored_snapshot_continues_exactly_like_the_live_state() {
+        use super::super::snapshot::{decode, encode, identity, same_state};
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+            (num / b.iter().map(|y| y * y).sum::<f32>()).sqrt()
+        };
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        let id = identity(&[b"synthetic"]);
+        let layouts: [(&[u32], &[u32], &[u32]); 2] =
+            [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
+        for (ratios, kv_src, index_src) in layouts {
+            let (model, _) = synthetic(ratios, kv_src, index_src, 0);
+            let tokens: Vec<u32> = (0..80)
+                .map(|i| (i * 7 + 3) % super::tests::VOCAB as u32)
+                .collect();
+            let mut cold_state = model.new_decode_state();
+            let cold = vecf_of(&model.prefill_into(&tokens, &mut cold_state).unwrap());
+            for split in [1usize, 5, 17, 32, 41, 64] {
+                let mut live = model.new_decode_state();
+                let at_split = vecf_of(&model.prefill_into(&tokens[..split], &mut live).unwrap());
+                let bytes = encode(&live, Some(&at_split), &id);
+                let back = decode(&bytes, &id, model.n_layers()).unwrap();
+                assert!(same_state(&live, &back.state), "{ratios:?} split {split}");
+                assert_eq!(back.logits.as_deref(), Some(&at_split[..]));
+                let mut restored = back.state;
+                let rest = &tokens[split..];
+                let want = vecf_of(&model.prefill_continue(rest, &mut live).unwrap());
+                let got = vecf_of(&model.prefill_continue(rest, &mut restored).unwrap());
+                assert_eq!(got, want, "{ratios:?} split {split}: restored against live");
+                assert!(same_state(&live, &restored), "{ratios:?} split {split}");
+                assert_eq!(got.len(), cold.len());
+                let r = rel(&got, &cold);
+                assert!(r < 1e-4, "{ratios:?} split {split}: against cold rel {r}");
+                assert_eq!(argmax(&got), argmax(&cold), "{ratios:?} split {split}");
+                // The decode after the remainder agrees too.
+                for t in [3u32, 9, 11] {
+                    let a = vecf_of(&model.forward_decode(t, &mut live).unwrap());
+                    let b = vecf_of(&model.forward_decode(t, &mut restored).unwrap());
+                    assert_eq!(a, b, "{ratios:?} split {split}: decode after restore");
+                }
+            }
+        }
+    }
+
+    /// A state built by decoding, as a turn's end leaves it, round trips as well, and a restored
+    /// state rewinds and checkpoints like any other: the replay after a rewind is bit for bit the
+    /// first run, and the rewound state is the snapshot's.
+    #[test]
+    fn a_restored_state_checkpoints_and_rewinds_exactly() {
+        use super::super::snapshot::{decode, encode, identity, same_state};
+        let id = identity(&[b"synthetic"]);
+        for (ratios, kv_src, index_src) in [
+            (&[0u32, 2, 0][..], &[1u32][..], &[1u32][..]),
+            (&[0u32, 2, 2, 0][..], &[1u32][..], &[1u32, 3][..]),
+        ] {
+            let (model, tokens) = synthetic(ratios, kv_src, index_src, 0);
+            let head = tokens.len() - 7;
+            let mut state = model.new_decode_state();
+            for &t in &tokens[..head] {
+                model.forward_decode(t, &mut state).unwrap();
+            }
+            let snap = encode(&state, None, &id);
+            let mut restored = decode(&snap, &id, model.n_layers()).unwrap().state;
+            assert!(same_state(&state, &restored));
+            let mark = restored.checkpoint();
+            let first: Vec<Vec<f32>> = tokens[head..]
+                .iter()
+                .map(|&t| vecf_of(&model.forward_decode(t, &mut restored).unwrap()))
+                .collect();
+            restored.rewind(&mark);
+            assert!(same_state(&state, &restored));
+            assert_eq!(encode(&restored, None, &id), snap);
+            let again = vecf_of(
+                &model
+                    .prefill_continue(&tokens[head..], &mut restored)
+                    .unwrap(),
+            );
+            // A verified block and a decode agree to rounding on the last position.
+            let last = first.last().unwrap();
+            let num: f32 = again.iter().zip(last).map(|(a, b)| (a - b) * (a - b)).sum();
+            let den: f32 = last.iter().map(|b| b * b).sum();
+            assert!((num / den).sqrt() < 1e-3);
+            restored.rewind(&mark);
+            let replay: Vec<Vec<f32>> = tokens[head..]
+                .iter()
+                .map(|&t| vecf_of(&model.forward_decode(t, &mut restored).unwrap()))
+                .collect();
+            assert_eq!(
+                first, replay,
+                "a rewound restored state replays bit for bit"
+            );
         }
     }
 

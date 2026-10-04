@@ -397,6 +397,18 @@ pub struct EngramState {
 }
 
 impl EngramState {
+    /// The compressed ids held, oldest first.
+    pub fn recent(&self) -> Vec<u32> {
+        self.recent.iter().copied().collect()
+    }
+
+    /// A state holding exactly `recent`, oldest first.
+    pub fn from_recent(recent: impl IntoIterator<Item = u32>) -> Self {
+        Self {
+            recent: recent.into_iter().collect(),
+        }
+    }
+
     /// Record `token` and return the ids the hash reads at its position, newest last.
     pub fn push(&mut self, cfg: &EngramConfig, token: u32) -> Vec<u32> {
         self.recent.push_back(cfg.compress(token));
