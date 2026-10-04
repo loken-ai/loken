@@ -914,6 +914,7 @@ impl DeepseekV41Backend {
     }
 
     /// Prompt tokens the last prompt took from the decode-state cache.
+    #[cfg(test)]
     pub(crate) fn last_restored(&self) -> usize {
         self.restored
     }

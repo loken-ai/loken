@@ -89,6 +89,13 @@ could live, and leave the key unset where nothing about an exchange may reach th
 | `state_cache_block_tokens` | `256` | Tokens per block of the hash chain, the spacing of the states kept while a prompt is prefilled (so any prompt sharing a prefix restores at the last multiple at or below the shared length), and the shortest state worth storing. Must be a multiple of every layer's compression ratio. Changing it orphans what is stored. |
 | `state_cache_salt` | empty | Mixed into every state's identity; states written under another salt are never read. |
 
+A state costs about 2.7 MB of window per snapshot (the last 128 tokens of every layer, kept as the
+model keeps them) and about 1.1 KB per token of compressed KV, stored once in block files that every
+snapshot of a conversation shares. A prompt restores a stored prefix only when continuing the rest is
+cheaper than prefilling the whole prompt, which on a 2000-token prompt means a remainder of about a
+quarter of it or less. The batch worker and the serial path use the cache; a pipelined model does
+not, because half of its state is on the tail node.
+
 A state is also keyed by the model files (length, modification time and header) and `expert_deferral`,
 so a different file or setting starts from nothing. A damaged, truncated or foreign file is ignored
 with a log line.
