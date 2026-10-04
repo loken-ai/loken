@@ -884,9 +884,8 @@ impl LlmEngine {
                         _ => Vec::new(),
                     };
                     // A quantised cache (Q4KvCache / Q8KvCache) starts at the working window
-                    // and grows on demand up to the configured context, so it is planned at the
-                    // size it starts at; a cache that grows past what its card holds is
-                    // recovered by the ladder. An F-dtype cache pre-allocates in full.
+                    // and grows on demand up to the configured context, and is planned at that
+                    // context; an F-dtype cache pre-allocates in full.
                     let lazy_kv_initial_cap =
                         crate::inference::cache::KV_WORKING_WINDOW_TOKENS as u64;
                     // What one layer's cache costs at a given context, sliding windows
@@ -937,7 +936,11 @@ impl LlmEngine {
                     // context whose plan keeps every layer on the cards, halving down to the
                     // working window.
                     let ctx_for_planning: u64 = if matches!(kv_quant, KvQuant::Q4 | KvQuant::Q8) {
-                        lazy_kv_initial_cap.min(user_context_length as u64)
+                        // The cache grows to the declared context while a long prompt prefills
+                        // on cards that hold the weights, so the plan keeps that room: a model
+                        // that then does not fit takes the ladder's rungs, not a prefill that
+                        // runs out of memory part-way.
+                        user_context_length.min(context_length) as u64
                     } else {
                         let full = user_context_length as u64;
                         crate::inference::place::llm::context_the_cards_hold(
