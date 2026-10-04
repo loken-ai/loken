@@ -159,8 +159,12 @@ impl Moe {
         let bias = self.gate_bias.flatten_all()?.to_vec1::<f32>()?;
         let mut assign: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.n_routed];
         let mut routing: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
-        for (t, row) in raw.iter().enumerate() {
-            let (chosen, w) = self.select(row, &bias);
+        // Each token's choice is its own: made across the cores, taken in token order below.
+        let picks: Vec<(Vec<usize>, Vec<f32>)> = {
+            use rayon::prelude::*;
+            raw.par_iter().map(|row| self.select(row, &bias)).collect()
+        };
+        for (t, (chosen, w)) in picks.into_iter().enumerate() {
             for (slot, &e) in chosen.iter().enumerate() {
                 assign[e].push((t, w[slot] * self.route_scale));
             }
@@ -254,28 +258,30 @@ impl Moe {
 
         // Every token passes through the shared expert; routed experts add on top, each run over
         // the rows of the tokens that selected it and nothing else.
-        let mut y = if self.has_shared {
-            stage("moe shared expert", || {
-                // On a card the shared expert's three products and SwiGLU stay on the device, so
-                // the activation crosses once instead of once per projection; the host path serves
-                // a decline or a batch a card has no room for.
-                if let Some(off) = crate::inference::offload::current() {
-                    if let Some(res) = off.expert_dev(
-                        &self.shared.w1,
-                        &self.shared.w3,
-                        &self.shared.w2,
-                        &flat,
-                        self.swiglu_limit,
-                    ) {
-                        return Ok(res?.chunks(self.dim).map(|c| c.to_vec()).collect());
+        let shared_fn = || -> Result<Vec<Vec<f32>>> {
+            Ok(if self.has_shared {
+                stage("moe shared expert", || {
+                    // On a card the shared expert's three products and SwiGLU stay on the device, so
+                    // the activation crosses once instead of once per projection; the host path serves
+                    // a decline or a batch a card has no room for.
+                    if let Some(off) = crate::inference::offload::current() {
+                        if let Some(res) = off.expert_dev(
+                            &self.shared.w1,
+                            &self.shared.w3,
+                            &self.shared.w2,
+                            &flat,
+                            self.swiglu_limit,
+                        ) {
+                            return Ok(res?.chunks(self.dim).map(|c| c.to_vec()).collect());
+                        }
                     }
-                }
-                self.shared
-                    .forward(&x2, self.swiglu_limit)?
-                    .to_vec2::<f32>()
-            })?
-        } else {
-            vec![vec![0f32; self.dim]; n]
+                    self.shared
+                        .forward(&x2, self.swiglu_limit)?
+                        .to_vec2::<f32>()
+                })?
+            } else {
+                vec![vec![0f32; self.dim]; n]
+            })
         };
         let xv: Vec<&[f32]> = flat.chunks(self.dim).collect();
         let observer = self.observer.read().unwrap().clone();
@@ -289,54 +295,67 @@ impl Moe {
                 .flat_map(|&(t, _)| xv[t].iter().copied())
                 .collect()
         };
+        // The shared expert runs on the cards beside the routed experts: they are independent, and
+        // each leaves the host waiting on the card.
         let routed_started = std::time::Instant::now();
-        // A prompt's experts keep their tokens' rows and their products on the cards: the layer's
-        // input crosses once per card and the sum over each token's slots comes back once.
-        let begun = std::time::Instant::now();
-        let layer_dev = match (&offload, n > 1, observer.is_none()) {
-            (Some(off), true, true)
-                if n > crate::inference::offload::moe_dispatch::VERIFY_BATCH_MAX_ROWS =>
-            {
-                off.device
-                    .as_ref()
-                    .and_then(|d| (d.begin)(&flat, self.dim).map(|ctx| (d, ctx)))
-            }
-            _ => None,
-        };
-        crate::inference::offload::prof_record(
-            "moe layer context",
-            begun.elapsed().as_nanos() as u64,
-        );
-        let dispatched = std::time::Instant::now();
-        // The routed experts of this block, resident ones on the cards and the misses on the
-        // cores at once; run on the host from its mapping when no card placement is set.
-        let (mut done, mut cpu_side, deferred) = if let Some(off) = &offload {
-            crate::inference::offload::moe_dispatch::run_routed(
-                off,
-                &active,
-                &active_refs,
-                &assign,
-                &xv,
-                n,
-                self.dim,
-                self.swiglu_limit,
-                observer.is_some(),
-                defer,
-                layer_dev.as_ref().map(|(hooks, ctx)| {
-                    crate::inference::offload::moe_dispatch::DevRun { hooks, ctx }
+        let shared_off = crate::inference::offload::current();
+        let (shared_y, (layer_dev, (mut done, mut cpu_side, deferred))) = std::thread::scope(
+            |sc| {
+                let h = sc.spawn(|| match shared_off.clone() {
+                    Some(o) => crate::inference::offload::with_offload(o, shared_fn),
+                    None => shared_fn(),
+                });
+                let routed = {
+                    // A prompt's experts keep their tokens' rows and their products on the cards: the layer's
+                    // input crosses once per card and the sum over each token's slots comes back once.
+                    let begun = std::time::Instant::now();
+                    let layer_dev = match (&offload, n > 1, observer.is_none()) {
+                (Some(off), true, true) if n > crate::inference::offload::moe_dispatch::VERIFY_BATCH_MAX_ROWS => off.device.as_ref().and_then(|d| {
+                    (d.begin)(&flat, self.dim).map(|ctx| (d, ctx))
                 }),
-            )
-        } else {
-            (
-                (0..active.len()).map(|_| None).collect(),
-                (0..active.len()).map(|_| None).collect(),
-                None,
-            )
-        };
-        crate::inference::offload::prof_record(
-            "moe dispatch",
-            dispatched.elapsed().as_nanos() as u64,
+                _ => None,
+            };
+                    crate::inference::offload::prof_record(
+                        "moe layer context",
+                        begun.elapsed().as_nanos() as u64,
+                    );
+                    let dispatched = std::time::Instant::now();
+                    // The routed experts of this block, resident ones on the cards and the misses on the
+                    // cores at once; run on the host from its mapping when no card placement is set.
+                    let routed = if let Some(off) = &offload {
+                        crate::inference::offload::moe_dispatch::run_routed(
+                            off,
+                            &active,
+                            &active_refs,
+                            &assign,
+                            &xv,
+                            n,
+                            self.dim,
+                            self.swiglu_limit,
+                            observer.is_some(),
+                            defer,
+                            layer_dev.as_ref().map(|(hooks, ctx)| {
+                                crate::inference::offload::moe_dispatch::DevRun { hooks, ctx }
+                            }),
+                        )
+                    } else {
+                        (
+                            (0..active.len()).map(|_| None).collect(),
+                            (0..active.len()).map(|_| None).collect(),
+                            None,
+                        )
+                    };
+                    crate::inference::offload::prof_record(
+                        "moe dispatch",
+                        dispatched.elapsed().as_nanos() as u64,
+                    );
+                    (layer_dev, routed)
+                };
+                (h.join(), routed)
+            },
         );
+        let mut y = shared_y
+            .map_err(|_| crate::tensor::Error::msg("the shared expert's thread panicked"))??;
         let later: Vec<usize> = deferred
             .as_ref()
             .map(|d| d.indexes.clone())
