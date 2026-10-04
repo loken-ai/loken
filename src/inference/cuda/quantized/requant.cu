@@ -1161,6 +1161,21 @@ extern "C" __global__ void dequant_q6_k_f32(
     out[idx] = d * (float) sc[l / 16 + 2 * k] * (float) q;
 }
 
+// SwiGLU over a prompt's rows, one value per thread: the expert's gate and up products clamped as
+// the reference clamps them when `limit` is positive, then silu(gate) * up.
+extern "C" __global__ void swiglu_f32(
+        const float * __restrict__ gate, const float * __restrict__ up, float * __restrict__ h,
+        const long total, const float limit) {
+    const long idx = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
+    if (idx >= total) return;
+    float g = gate[idx], u = up[idx];
+    if (limit > 0.0f) {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+    }
+    h[idx] = g / (1.0f + expf(-g)) * u;
+}
+
 // Index scores, one (query, compressed position) pair per thread: the sum over heads of
 // relu(q . k) * weight * scale, for the positions query `i` can reach ((i + 1) / ratio of them);
 // the rest are -inf. `q` [s, nh, ihd], `k` [g, ihd], `w` [s, nh]; the output is [s, g].

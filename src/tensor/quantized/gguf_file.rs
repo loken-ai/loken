@@ -549,10 +549,12 @@ pub fn open_mapped_unadvised<P: AsRef<std::path::Path>>(path: P) -> Result<Mappe
         .map_err(|e| Error(format!("mmap {}: {e}", path.display())))?;
     let mmap = std::sync::Arc::new(mmap);
     let content = Content::read_mapped(&mut std::io::Cursor::new(&mmap[..]), mmap.clone())?;
+    let file = std::sync::Arc::new(file);
+    crate::tensor::mapped::register_file(&mmap, &file);
     Ok(MappedGguf {
         content,
         mmap,
-        file: std::sync::Arc::new(file),
+        file,
     })
 }
 

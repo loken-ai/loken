@@ -38,6 +38,30 @@ pub fn advise_span(start: usize, len: usize, advice: libc::c_int, inward: bool) 
     }
 }
 
+/// The mapped files by address: each live mapping with the file behind it, so bytes read through
+/// a mapping can be read from the file instead (see `file_span`).
+static FILES: std::sync::Mutex<Vec<(std::sync::Weak<memmap2::Mmap>, Arc<std::fs::File>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Record that `map` maps `file`. The record holds the mapping weakly: once it is unmapped the
+/// record can answer nothing, so an address a later mapping reuses is never taken for this file.
+pub fn register_file(map: &Arc<memmap2::Mmap>, file: &Arc<std::fs::File>) {
+    let mut g = FILES.lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|(m, _)| m.strong_count() > 0);
+    g.push((Arc::downgrade(map), file.clone()));
+}
+
+/// The file and the offset in it of `len` bytes at `start`, when they lie within a live mapping
+/// registered with `register_file`.
+pub fn file_span(start: usize, len: usize) -> Option<(Arc<std::fs::File>, u64)> {
+    let g = FILES.lock().unwrap_or_else(|e| e.into_inner());
+    g.iter().find_map(|(m, f)| {
+        let m = m.upgrade()?;
+        let base = m.as_ptr() as usize;
+        (start >= base && start + len <= base + m.len()).then(|| (f.clone(), (start - base) as u64))
+    })
+}
+
 /// A byte range of a mapped file, pinned by the mapping.
 #[derive(Clone)]
 pub struct MappedBytes {

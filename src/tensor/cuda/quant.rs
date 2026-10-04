@@ -942,32 +942,16 @@ pub fn gpu_quant_linear_tiled(
     Ok(y)
 }
 
-fn gpu_quant_linear_once(
+/// `total` values of a quantised weight in `blob`, expanded to f32 on the card at full precision.
+fn dequantise_f32(
     dev: &CudaDevice,
     dtype: crate::tensor::quantized::GgmlDType,
-    blocks: &[u8],
-    (out, inp): (usize, usize),
-    x: &[f32],
-) -> Result<Vec<f32>> {
-    let total = out * inp;
-    let want = total / dtype.block_size() * dtype.type_size();
-    if inp == 0 || total % dtype.block_size() != 0 || blocks.len() != want || x.len() % inp != 0 {
-        return Err(Error(format!(
-            "{dtype:?} linear: {} block bytes ({want} wanted), {} inputs for [{out}, {inp}]",
-            blocks.len(),
-            x.len()
-        )));
-    }
-    let n = x.len() / inp;
+    blob: &CudaSlice<u8>,
+    total: usize,
+) -> Result<CudaSlice<f32>> {
     let stream = dev.stream();
-    let blob = stream
-        .clone_htod(blocks)
-        .map_err(|e| alloc_err("quant linear upload", e))?;
-    let xs = stream
-        .clone_htod(x)
-        .map_err(|e| alloc_err("quant linear upload", e))?;
-    let w = match dtype {
-        crate::tensor::quantized::GgmlDType::Q8_0 => dequantize_q8_0_f32(dev, &blob, total)?,
+    Ok(match dtype {
+        crate::tensor::quantized::GgmlDType::Q8_0 => dequantize_q8_0_f32(dev, blob, total)?,
         crate::tensor::quantized::GgmlDType::Q2K => {
             let dst = with_oom_retry(dev, "dequant q2_K", || unsafe {
                 stream.alloc::<f32>(total)
@@ -980,7 +964,7 @@ fn gpu_quant_linear_once(
             };
             let total_i = total as i64;
             let mut b = stream.launch_builder(&func);
-            b.arg(&blob);
+            b.arg(blob);
             b.arg(&dst);
             b.arg(&total_i);
             unsafe { b.launch(cfg) }.map_err(|e| Error(format!("dequant_q2_k_f32 launch: {e}")))?;
@@ -998,7 +982,7 @@ fn gpu_quant_linear_once(
             };
             let total_i = total as i64;
             let mut b = stream.launch_builder(&func);
-            b.arg(&blob);
+            b.arg(blob);
             b.arg(&dst);
             b.arg(&total_i);
             unsafe { b.launch(cfg) }.map_err(|e| Error(format!("dequant_q6_k_f32 launch: {e}")))?;
@@ -1026,7 +1010,7 @@ fn gpu_quant_linear_once(
             };
             let total_i = total as i64;
             let mut b = stream.launch_builder(&func);
-            b.arg(&blob);
+            b.arg(blob);
             b.arg(&grid);
             b.arg(&signs);
             b.arg(&dst);
@@ -1040,11 +1024,242 @@ fn gpu_quant_linear_once(
                 "{other:?} has no device dequantiser for a linear"
             )))
         }
-    };
+    })
+}
+
+fn gpu_quant_linear_once(
+    dev: &CudaDevice,
+    dtype: crate::tensor::quantized::GgmlDType,
+    blocks: &[u8],
+    (out, inp): (usize, usize),
+    x: &[f32],
+) -> Result<Vec<f32>> {
+    let total = out * inp;
+    let want = total / dtype.block_size() * dtype.type_size();
+    if inp == 0 || total % dtype.block_size() != 0 || blocks.len() != want || x.len() % inp != 0 {
+        return Err(Error(format!(
+            "{dtype:?} linear: {} block bytes ({want} wanted), {} inputs for [{out}, {inp}]",
+            blocks.len(),
+            x.len()
+        )));
+    }
+    let n = x.len() / inp;
+    let stream = dev.stream();
+    let upload_started = std::time::Instant::now();
+    let blob = stream
+        .clone_htod(blocks)
+        .map_err(|e| alloc_err("quant linear upload", e))?;
+    let xs = stream
+        .clone_htod(x)
+        .map_err(|e| alloc_err("quant linear upload", e))?;
+    crate::inference::offload::prof_record(
+        "q linear upload",
+        upload_started.elapsed().as_nanos() as u64,
+    );
+    let launch_started = std::time::Instant::now();
+    let w = dequantise_f32(dev, dtype, &blob, total)?;
+    crate::inference::offload::prof_record(
+        "q linear dequant launch",
+        launch_started.elapsed().as_nanos() as u64,
+    );
+    let gemm_started = std::time::Instant::now();
     let y = matmul_nt_f32(dev, &xs, &w, 1, n, inp, out)?;
-    stream
+    let r = stream
         .clone_dtoh(&y)
-        .map_err(|e| Error(format!("quant linear download: {e}")))
+        .map_err(|e| Error(format!("quant linear download: {e}")));
+    crate::inference::offload::prof_record(
+        "q linear gemm and download",
+        gemm_started.elapsed().as_nanos() as u64,
+    );
+    r
+}
+
+/// A page-locked host buffer the weights of an expert are staged through: copied into here from
+/// the mapped file, then sent to the card by a copy that runs beside the card's other work.
+struct Pinned {
+    ptr: *mut std::ffi::c_void,
+    cap: usize,
+}
+
+// Safety: the buffer is owned by one holder at a time and freed only with the process.
+unsafe impl Send for Pinned {}
+
+static PINNED: std::sync::Mutex<Vec<Pinned>> = std::sync::Mutex::new(Vec::new());
+
+/// Staging buffers in use by one expert's products. Dropping them waits for the card's stream,
+/// so a buffer goes back to the pool only once no copy still reads it.
+struct Staging<'a> {
+    stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
+    held: Vec<Pinned>,
+}
+
+impl Drop for Staging<'_> {
+    fn drop(&mut self) {
+        let _ = self.stream.synchronize();
+        PINNED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append(&mut self.held);
+    }
+}
+
+impl<'a> Staging<'a> {
+    /// `bytes` on the card: read into the page cache and mapped in one pass, copied to a
+    /// page-locked buffer, and sent asynchronously on the stream.
+    fn upload(&mut self, dev: &CudaDevice, bytes: &[u8]) -> Result<CudaSlice<u8>> {
+        self.upload_inner(dev, bytes)
+    }
+
+    fn upload_inner(&mut self, dev: &CudaDevice, bytes: &[u8]) -> Result<CudaSlice<u8>> {
+        let pin = {
+            let mut pool = PINNED.lock().unwrap_or_else(|e| e.into_inner());
+            match pool.iter().position(|p| p.cap >= bytes.len()) {
+                Some(i) => pool.swap_remove(i),
+                None => {
+                    let cap = bytes.len().next_power_of_two().max(1 << 20);
+                    let ptr = unsafe { cudarc::driver::result::malloc_host(cap, 0) }
+                        .map_err(|e| Error(format!("pinned staging buffer: {e}")))?;
+                    Pinned { ptr, cap }
+                }
+            }
+        };
+        // Read from the file into the page-locked buffer in one copy: through the mapping, each
+        // page of the weight would first be mapped into the process, which costs more than the
+        // copy. A weight that is not in a registered mapping is copied from its bytes.
+        let t_copy = std::time::Instant::now();
+        let from_file = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                crate::tensor::mapped::file_span(bytes.as_ptr() as usize, bytes.len()).and_then(
+                    |(file, off)| {
+                        let buf = unsafe {
+                            std::slice::from_raw_parts_mut(pin.ptr as *mut u8, bytes.len())
+                        };
+                        file.read_exact_at(buf, off).ok()
+                    },
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                None::<()>
+            }
+        };
+        if from_file.is_none() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), pin.ptr as *mut u8, bytes.len())
+            };
+        }
+        crate::inference::offload::prof_record("staged copy", t_copy.elapsed().as_nanos() as u64);
+        let ptr = pin.ptr;
+        self.held.push(pin);
+        let stream = self.stream;
+        let dst = with_oom_retry(dev, "expert weight upload", || unsafe {
+            stream.alloc::<u8>(bytes.len())
+        })?;
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| Error(format!("staged upload: bind context: {e:?}")))?;
+        use cudarc::driver::DevicePtr;
+        let (dptr, guard) = dst.device_ptr(stream);
+        let r = unsafe {
+            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dptr, ptr, bytes.len(), stream.cu_stream())
+        };
+        drop(guard);
+        if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+            return Err(Error(format!("staged upload: {r:?}")));
+        }
+        Ok(dst)
+    }
+}
+
+/// Where a weight of an expert is: in the mapped file, to be staged over, or already on the card.
+pub enum ExpertWeight<'a> {
+    Host(&'a [u8]),
+    Card(std::sync::Arc<CudaSlice<u8>>),
+}
+
+/// One expert over a prompt's rows on the card, whole: `x` [n, dim] through the gate and up
+/// weights ([inter, dim] each, quantised, `dtypes` as stored), their SwiGLU on the card, and the
+/// down weight ([dim, inter]) over it. The three weights go over through page-locked staging while
+/// the card works on the one before, nothing returns to the host between the products, and the
+/// intermediate `h` [n, inter] and the output [n, dim] come back together.
+pub fn gpu_expert_tokens(
+    dev: &CudaDevice,
+    weights: [(crate::tensor::quantized::GgmlDType, ExpertWeight); 3],
+    (inter, dim): (usize, usize),
+    x: &[f32],
+    limit: f32,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    if dim == 0 || x.len() % dim != 0 {
+        return Err(Error(format!(
+            "expert tokens: {} inputs for rows of {dim}",
+            x.len()
+        )));
+    }
+    let n = x.len() / dim;
+    let stream = dev.stream();
+    let mut staging = Staging {
+        stream: &stream,
+        held: Vec::new(),
+    };
+    let xs = stream
+        .clone_htod(x)
+        .map_err(|e| alloc_err("expert tokens upload", e))?;
+    let product = |staging: &mut Staging,
+                   (dtype, weight): &(crate::tensor::quantized::GgmlDType, ExpertWeight),
+                   input: &CudaSlice<f32>,
+                   (out, inp): (usize, usize)|
+     -> Result<CudaSlice<f32>> {
+        let total = out * inp;
+        let want = total / dtype.block_size() * dtype.type_size();
+        let w = match weight {
+            ExpertWeight::Host(bytes) => {
+                if total % dtype.block_size() != 0 || bytes.len() != want {
+                    return Err(Error(format!(
+                        "{dtype:?} expert weight: {} bytes for [{out}, {inp}]",
+                        bytes.len()
+                    )));
+                }
+                let blob = staging.upload(dev, bytes)?;
+                dequantise_f32(dev, *dtype, &blob, total)?
+            }
+            ExpertWeight::Card(blob) => dequantise_f32(dev, *dtype, blob, total)?,
+        };
+        matmul_nt_f32(dev, input, &w, 1, n, inp, out)
+    };
+    let gate = product(&mut staging, &weights[0], &xs, (inter, dim))?;
+    let up = product(&mut staging, &weights[1], &xs, (inter, dim))?;
+    let h = with_oom_retry(dev, "expert swiglu", || unsafe {
+        stream.alloc::<f32>(n * inter)
+    })?;
+    {
+        let func = dev.quantized_fn("swiglu_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n * inter).div_ceil(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let total = (n * inter) as i64;
+        let mut b = stream.launch_builder(&func);
+        b.arg(&gate);
+        b.arg(&up);
+        b.arg(&h);
+        b.arg(&total);
+        b.arg(&limit);
+        unsafe { b.launch(cfg) }.map_err(|e| Error(format!("swiglu_f32 launch: {e}")))?;
+    }
+    let out = product(&mut staging, &weights[2], &h, (dim, inter))?;
+    let t_wait = std::time::Instant::now();
+    let h_host = stream
+        .clone_dtoh(&h)
+        .map_err(|e| Error(format!("expert tokens download: {e}")))?;
+    let out_host = stream
+        .clone_dtoh(&out)
+        .map_err(|e| Error(format!("expert tokens download: {e}")))?;
+    crate::inference::offload::prof_record("staged card wait", t_wait.elapsed().as_nanos() as u64);
+    Ok((h_host, out_host))
 }
 
 /// Sparse attention with a per-head sink on the device: `q` [s, h, d], `kv` [n, d] one shared head,
@@ -2327,6 +2542,97 @@ mod iq2_xxs_gpu_tests {
                 );
             }
         }
+    }
+
+    /// An expert's whole prompt pass on the card - staged weights or weights already resident -
+    /// equals the three products and the SwiGLU on the CPU, to rounding.
+    #[test]
+    fn gpu_expert_tokens_matches_the_cpu() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the card expert pass is NOT covered by this run");
+            return;
+        };
+        let (inter, dim, n) = (256usize, 512usize, 9usize);
+        let wave = |len: usize, k: f32, amp: f32| -> Vec<f32> {
+            (0..len).map(|i| ((i as f32) * k).sin() * amp).collect()
+        };
+        let enc = |dtype: GgmlDType, v: &[f32]| {
+            let b = crate::tensor::quant_cpu::from_float_bytes(dtype, v).unwrap();
+            let mut d = vec![0f32; v.len()];
+            crate::tensor::quant_cpu::to_float_bytes(dtype, &b, &mut d).unwrap();
+            (b, d)
+        };
+        let (gb, gd) = enc(GgmlDType::Iq2Xxs, &wave(inter * dim, 0.013, 0.08));
+        let (ub, ud) = enc(GgmlDType::Iq2Xxs, &wave(inter * dim, 0.017, 0.08));
+        let (db, dd) = enc(GgmlDType::Q2K, &wave(dim * inter, 0.011, 0.08));
+        let x = wave(n * dim, 0.31, 1.0);
+        let limit = 7.0f32;
+        let mut h = vec![0f32; n * inter];
+        let mut want = vec![0f32; n * dim];
+        for t in 0..n {
+            for i in 0..inter {
+                let dot = |w: &[f32]| {
+                    (0..dim)
+                        .map(|c| x[t * dim + c] * w[i * dim + c])
+                        .sum::<f32>()
+                };
+                let (g, u) = (dot(&gd).min(limit), dot(&ud).clamp(-limit, limit));
+                h[t * inter + i] = g / (1.0 + (-g).exp()) * u;
+            }
+            for o in 0..dim {
+                want[t * dim + o] = (0..inter)
+                    .map(|c| h[t * inter + c] * dd[o * inter + c])
+                    .sum();
+            }
+        }
+        let check = |got: &(Vec<f32>, Vec<f32>), what: &str| {
+            let close = |a: &[f32], b: &[f32], tag: &str| {
+                let worst = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0f32, f32::max);
+                let range = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+                assert!(
+                    worst <= 1e-3 * range.max(1.0),
+                    "{what} {tag}: worst {worst} of range {range}"
+                );
+            };
+            close(&got.0, &h, "h");
+            close(&got.1, &want, "out");
+        };
+        let host = gpu_expert_tokens(
+            &dev,
+            [
+                (GgmlDType::Iq2Xxs, ExpertWeight::Host(&gb)),
+                (GgmlDType::Iq2Xxs, ExpertWeight::Host(&ub)),
+                (GgmlDType::Q2K, ExpertWeight::Host(&db)),
+            ],
+            (inter, dim),
+            &x,
+            limit,
+        )
+        .unwrap();
+        check(&host, "staged");
+        let stream = dev.stream();
+        let up = |b: &[u8]| std::sync::Arc::new(stream.clone_htod(b).unwrap());
+        let card = gpu_expert_tokens(
+            &dev,
+            [
+                (GgmlDType::Iq2Xxs, ExpertWeight::Card(up(&gb))),
+                (GgmlDType::Iq2Xxs, ExpertWeight::Card(up(&ub))),
+                (GgmlDType::Q2K, ExpertWeight::Card(up(&db))),
+            ],
+            (inter, dim),
+            &x,
+            limit,
+        )
+        .unwrap();
+        check(&card, "resident");
+        assert_eq!(
+            host.1, card.1,
+            "staged and resident weights give the same bits"
+        );
     }
 
     /// A rectangular row-major product on the card equals the one on the CPU, to rounding.

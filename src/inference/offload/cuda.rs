@@ -8,9 +8,9 @@ use super::projection::Projection;
 use super::room::Room;
 use super::{AttnBlock, Offload};
 use crate::tensor::cuda::{
-    gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi, gpu_fp4_linear,
-    gpu_fp8_linear, gpu_index_scores, gpu_quant_linear, gpu_sparse_attn, iq2_xxs_tables,
-    CudaDevice, QUANT_LINEAR_TILE_BYTES,
+    gpu_expert_row, gpu_expert_rows_grouped, gpu_expert_rows_grouped_multi, gpu_expert_tokens,
+    gpu_fp4_linear, gpu_fp8_linear, gpu_index_scores, gpu_quant_linear, gpu_sparse_attn,
+    iq2_xxs_tables, CudaDevice, ExpertWeight, QUANT_LINEAR_TILE_BYTES,
 };
 use crate::tensor::ops::rms_norm;
 use crate::tensor::ops::softmax_last_dim;
@@ -92,6 +92,13 @@ struct ExpertTier {
 }
 
 /// A projection's blocks, when it is quantised in the format asked for.
+fn quant_blocks_any(p: &Projection) -> Result<std::borrow::Cow<'_, [u8]>> {
+    match p {
+        Projection::Quant(q) => q.data(),
+        _ => Err(Error::msg("an expert weight that is not quantised")),
+    }
+}
+
 fn quant_blocks(p: &Projection, want: GgmlDType) -> Option<std::borrow::Cow<'_, [u8]>> {
     match p {
         Projection::Quant(q) if q.dtype() == want => q.data().ok(),
@@ -717,6 +724,58 @@ impl Card {
         out
     }
 
+    /// One expert over a prompt's rows, whole on this card: from the weights it keeps when it
+    /// keeps the expert, else staged over from the mapped file. `None` when the weights are not
+    /// quantised in a format the card expands, or it has no room.
+    fn expert_tokens(
+        &self,
+        e: &Expert,
+        xs: &[f32],
+        limit: f32,
+    ) -> Option<Result<(Vec<f32>, Vec<f32>)>> {
+        let (inter, dim) = (e.w1.dims()[0], e.w1.dims()[1]);
+        let dtype_of = |p: &Projection| match p {
+            Projection::Quant(q)
+                if matches!(
+                    q.dtype(),
+                    GgmlDType::Iq2Xxs | GgmlDType::Q2K | GgmlDType::Q6K | GgmlDType::Q8_0
+                ) =>
+            {
+                Some(q.dtype())
+            }
+            _ => None,
+        };
+        let (d1, d3, d2) = (dtype_of(&e.w1)?, dtype_of(&e.w3)?, dtype_of(&e.w2)?);
+        let rows = xs.len() / dim.max(1);
+        let need = inter * dim * 4 * 2 + (xs.len() + 3 * rows * inter + 2 * rows * dim) * F32;
+        // A resident expert answers from its own weights: nothing crosses for it.
+        let resident = quant_blocks(&e.w1, GgmlDType::Iq2Xxs).and_then(|g| {
+            let key = (g.as_ptr() as usize, g.len());
+            let tier = self.tier();
+            tier.kept
+                .get(&key)
+                .map(|on| (on.gate.clone(), on.up.clone(), on.down.clone()))
+        });
+        self.attempt("an expert's prompt rows", need, || {
+            let b1 = quant_blocks_any(&e.w1)?;
+            let b3 = quant_blocks_any(&e.w3)?;
+            let b2 = quant_blocks_any(&e.w2)?;
+            let w = match &resident {
+                Some((g, u, d)) => [
+                    (d1, ExpertWeight::Card(g.clone())),
+                    (d3, ExpertWeight::Card(u.clone())),
+                    (d2, ExpertWeight::Card(d.clone())),
+                ],
+                None => [
+                    (d1, ExpertWeight::Host(&b1)),
+                    (d3, ExpertWeight::Host(&b3)),
+                    (d2, ExpertWeight::Host(&b2)),
+                ],
+            };
+            gpu_expert_tokens(&self.dev, w, (inter, dim), xs, limit)
+        })
+    }
+
     /// `xs` rows through `m`, a weight kept on this card.
     fn through_kept(
         &self,
@@ -1167,6 +1226,11 @@ impl Offload for Cards {
 
 /// Routed experts run on `cards`, a lane per card stream: the gate and up products there, the
 /// activation between them here, the down product there.
+/// Threads that feed each card a prompt's experts: while one expert's weights are read into the
+/// staging buffer and cross the bus, another's products run on the card. An expert goes to the
+/// card its number names whichever thread takes it.
+const LANES_PER_CARD: usize = 2;
+
 pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
     let cards = Arc::new(cards);
     let timings: Arc<[AtomicU64; 3]> = Arc::new(Default::default());
@@ -1178,7 +1242,7 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
     let multi_cards = cards.clone();
     let multi_timings = timings.clone();
     ExpertOffload {
-        lanes: cards.len(),
+        lanes: cards.len() * LANES_PER_CARD,
         timings,
         warm: Some(Box::new(move |id, expert| {
             let on = &for_warm[id % for_warm.len()];
@@ -1279,6 +1343,12 @@ pub fn lanes(cards: Vec<Arc<Card>>) -> ExpertOffload {
             // weights that batch never reads again.
             if tokens == 1 && rows.len() == expert.w1.dims()[1] {
                 if let Some(r) = on.expert_row(expert, rows, limit, &shared) {
+                    return Some(r);
+                }
+            }
+            // A prompt's rows through the whole expert on the card: staged weights, one sync.
+            if tokens > 1 {
+                if let Some(r) = on.expert_tokens(expert, rows, limit) {
                     return Some(r);
                 }
             }
