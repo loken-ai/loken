@@ -1262,6 +1262,29 @@ mod decode_parity_tests {
         dot / (na * nb).max(f32::MIN_POSITIVE)
     }
 
+    fn rel_l2(a: &[f32], b: &[f32]) -> f32 {
+        let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+        let den: f32 = b.iter().map(|y| y * y).sum();
+        (num / den.max(f32::MIN_POSITIVE)).sqrt()
+    }
+
+    /// The decode attention against two references, for every group width.
+    ///
+    /// Against the attention of the cache's own dequantised history the kernels must agree to
+    /// their accumulation error, whatever the data: every term is an f32 product, a score sums
+    /// `hd <= 128` of them (relative error at most `hd * 2^-24`, about 8e-6), the softmax weights
+    /// carry that and the 2 ulp of `__expf` (2.4e-7), and the output sums `len <= 85` weighted
+    /// terms (at most `len * 2^-24`, about 5e-6). Their sum is bounded by 2e-5 per element of a
+    /// vector, so a relative L2 of 1e-3 leaves fifty times that, and is violated only by a
+    /// wrong read: a stale block, a row past the length, a missed flush.
+    ///
+    /// Against the F32 history the cache was built from, the difference is the Q4_0 quantisation
+    /// of K and V, which depends on the random data. A worst head of one run is therefore no gate
+    /// (the minimum over 2000 heads falls under 0.9 in one run in six); the mean over all of them
+    /// is: each element of a Q4_0 block of 32 standard normals carries a uniform error of
+    /// `amax / 16` (`amax` about 2.1, so a standard deviation of 0.075), which perturbs the output
+    /// by about 0.075 through V and as much through the scores, a relative error of about 0.11 and
+    /// a cosine of about 0.994. A mean above 0.97 is twice that error.
     #[test]
     fn decode_attention_matches_the_f32_history_for_every_group_width() {
         let Some(dev) = cuda() else {
@@ -1270,6 +1293,8 @@ mod decode_parity_tests {
         };
         let prefill = 45;
         let steps = 40;
+        let mut cosine_sum = 0f64;
+        let mut checks = 0usize;
         for &(hd, n_kv, group) in &[
             (128usize, 4usize, 8usize),
             (128, 8, 4),
@@ -1324,24 +1349,31 @@ mod decode_parity_tests {
                         .to_vec1()
                         .unwrap()
                 };
-                let want = reference(
-                    &q.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-                    &host(&k_all),
-                    &host(&v_all),
-                    n_q,
-                    n_kv,
-                    len,
-                    hd,
-                    scale,
-                );
+                let qv = q.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let (dk, dv) = cache.dequantize_kv(DType::F32).unwrap();
+                let flat = |t: &Tensor| -> Vec<f32> {
+                    t.contiguous()
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap()
+                };
+                let own = reference(&qv, &flat(&dk), &flat(&dv), n_q, n_kv, len, hd, scale);
+                let want = reference(&qv, &host(&k_all), &host(&v_all), n_q, n_kv, len, hd, scale);
                 for h in 0..n_q {
-                    let c = cosine(&got[h * hd..(h + 1) * hd], &want[h * hd..(h + 1) * hd]);
+                    let g = &got[h * hd..(h + 1) * hd];
+                    let r = rel_l2(g, &own[h * hd..(h + 1) * hd]);
                     assert!(
-                        c > 0.9,
-                        "hd={hd} n_kv={n_kv} group={group} len={len} head {h}: cosine {c}"
+                        r < 1e-3,
+                        "hd={hd} n_kv={n_kv} group={group} len={len} head {h}: relative L2 {r} against the dequantised history"
                     );
+                    cosine_sum += cosine(g, &want[h * hd..(h + 1) * hd]) as f64;
+                    checks += 1;
                 }
             }
         }
+        let mean = cosine_sum / checks as f64;
+        assert!(mean > 0.97, "mean cosine {mean} against the F32 history");
     }
 }
