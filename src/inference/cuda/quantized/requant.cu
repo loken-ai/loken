@@ -1161,6 +1161,113 @@ extern "C" __global__ void dequant_q6_k_f32(
     out[idx] = d * (float) sc[l / 16 + 2 * k] * (float) q;
 }
 
+// ---- A token group through a quantised weight, the codes read where they lie ----------------------
+
+#define MMR_MAX 32
+
+// Up to MMR_MAX rows of `x` [total_rows, k], starting at `row0`, through an IQ2_XXS weight [n, k]:
+// y[(row0 + r) * n + o] = sum_c w[o, c] * x[row0 + r, c]. A block of eight warps takes eight weight
+// rows; per superblock of 256 values the block stages the rows' slice of x in shared memory, and
+// each lane decodes eight weight values once and applies them to every row. The codes are read
+// once for the whole group, and no f32 copy of the weight exists.
+extern "C" __global__ void mm_iq2_xxs_rows_f32(
+        const unsigned char * __restrict__ blocks, const unsigned char * __restrict__ grid,
+        const unsigned char * __restrict__ signs, const float * __restrict__ x,
+        float * __restrict__ y, const int k, const int n, const int row0, const int rows) {
+    __shared__ __align__(16) float xs[MMR_MAX * 256];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int o = blockIdx.x * 8 + warp;
+    const int sbs = k / 256;
+    float acc[MMR_MAX];
+    #pragma unroll
+    for (int r = 0; r < MMR_MAX; ++r) acc[r] = 0.0f;
+    for (int ib = 0; ib < sbs; ++ib) {
+        __syncthreads();
+        for (int e = threadIdx.x; e < rows * 256; e += blockDim.x)
+            xs[e] = x[(long) (row0 + e / 256) * k + (long) ib * 256 + e % 256];
+        __syncthreads();
+        if (o >= n) continue;
+        const unsigned char * b = blocks + ((long) o * sbs + ib) * 66;
+        const float d = req_f16_at(b);
+        const int sub = lane / 4, g = lane % 4;
+        const unsigned char * q = b + 2 + 8 * sub;
+        const unsigned int lo = (unsigned int) q[0] | ((unsigned int) q[1] << 8) | ((unsigned int) q[2] << 16) | ((unsigned int) q[3] << 24);
+        const unsigned int hi = (unsigned int) q[4] | ((unsigned int) q[5] << 8) | ((unsigned int) q[6] << 16) | ((unsigned int) q[7] << 24);
+        const float db = d * (0.5f + (float) (hi >> 28)) * 0.25f;
+        const unsigned char * gp = grid + 8 * ((lo >> (8 * g)) & 0xff);
+        const unsigned char pattern = signs[(hi >> (7 * g)) & 127];
+        float wv[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float v = db * (float) gp[j];
+            wv[j] = ((pattern >> j) & 1) ? -v : v;
+        }
+        #pragma unroll
+        for (int r = 0; r < MMR_MAX; ++r) {
+            if (r >= rows) break;
+            const float4 a = *(const float4 *) (xs + r * 256 + lane * 8);
+            const float4 c = *(const float4 *) (xs + r * 256 + lane * 8 + 4);
+            acc[r] += wv[0] * a.x + wv[1] * a.y + wv[2] * a.z + wv[3] * a.w
+                    + wv[4] * c.x + wv[5] * c.y + wv[6] * c.z + wv[7] * c.w;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < MMR_MAX; ++r) {
+        if (r >= rows) break;
+        float v = acc[r];
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+        if (lane == 0 && o < n) y[(long) (row0 + r) * n + o] = v;
+    }
+}
+
+// The same for a Q2_K weight [n, k]: superblocks of 256 values in 84 bytes (sixteen scale and
+// minimum bytes, the two-bit codes, then the f16 scale and minimum scale). A lane takes eight values.
+extern "C" __global__ void mm_q2_k_rows_f32(
+        const unsigned char * __restrict__ blocks, const float * __restrict__ x,
+        float * __restrict__ y, const int k, const int n, const int row0, const int rows) {
+    __shared__ __align__(16) float xs[MMR_MAX * 256];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int o = blockIdx.x * 8 + warp;
+    const int sbs = k / 256;
+    float acc[MMR_MAX];
+    #pragma unroll
+    for (int r = 0; r < MMR_MAX; ++r) acc[r] = 0.0f;
+    for (int ib = 0; ib < sbs; ++ib) {
+        __syncthreads();
+        for (int e = threadIdx.x; e < rows * 256; e += blockDim.x)
+            xs[e] = x[(long) (row0 + e / 256) * k + (long) ib * 256 + e % 256];
+        __syncthreads();
+        if (o >= n) continue;
+        const unsigned char * b = blocks + ((long) o * sbs + ib) * 84;
+        const float d = req_f16_at(b + 80), dmin = req_f16_at(b + 82);
+        const int sub = lane / 2, t = sub % 8;
+        const unsigned char sc = b[sub];
+        const int base = 32 * (sub / 8) + 16 * (t % 2), shift = 2 * (t / 2);
+        const float sd = d * (float) (sc & 0x0F), sm = dmin * (float) (sc >> 4);
+        float wv[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int code = (b[16 + base + (lane % 2) * 8 + j] >> shift) & 3;
+            wv[j] = sd * (float) code - sm;
+        }
+        #pragma unroll
+        for (int r = 0; r < MMR_MAX; ++r) {
+            if (r >= rows) break;
+            const float4 a = *(const float4 *) (xs + r * 256 + lane * 8);
+            const float4 c = *(const float4 *) (xs + r * 256 + lane * 8 + 4);
+            acc[r] += wv[0] * a.x + wv[1] * a.y + wv[2] * a.z + wv[3] * a.w
+                    + wv[4] * c.x + wv[5] * c.y + wv[6] * c.z + wv[7] * c.w;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < MMR_MAX; ++r) {
+        if (r >= rows) break;
+        float v = acc[r];
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+        if (lane == 0 && o < n) y[(long) (row0 + r) * n + o] = v;
+    }
+}
+
 // ---- Hyper-connection steps over a prompt's residual stream x [n, hc, d] ----------------------------
 
 #define HC_MAX 8

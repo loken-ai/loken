@@ -1075,6 +1075,102 @@ fn gpu_quant_linear_once(
     r
 }
 
+/// The IQ2_XXS tables of a card, uploaded once: the same for every weight.
+fn shared_iq2_tables(dev: &CudaDevice) -> Result<std::sync::Arc<(CudaSlice<u8>, CudaSlice<u8>)>> {
+    static TABLES: std::sync::Mutex<Vec<(usize, std::sync::Arc<(CudaSlice<u8>, CudaSlice<u8>)>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut g = TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, t)) = g.iter().find(|(o, _)| *o == dev.ordinal()) {
+        return Ok(t.clone());
+    }
+    let t = std::sync::Arc::new(iq2_xxs_tables(dev)?);
+    g.push((dev.ordinal(), t.clone()));
+    Ok(t)
+}
+
+/// The widest token group the in-place kernels serve; wider groups expand the weight and multiply.
+const IN_PLACE_MAX_ROWS: usize = 8;
+
+/// `input` [rows, inp] through rows `row0 .. row0 + rows` of the quantised weight held on the card
+/// as `blob`, as `[rows, out]`, for the formats a kernel reads in place: no f32 copy of the weight
+/// is made. `None` for a format with no such kernel.
+fn product_in_place(
+    dev: &CudaDevice,
+    dtype: crate::tensor::quantized::GgmlDType,
+    blob: &CudaView<'_, u8>,
+    (out, inp): (usize, usize),
+    input: &CudaSlice<f32>,
+    rows: usize,
+) -> Option<Result<CudaSlice<f32>>> {
+    use crate::tensor::quantized::GgmlDType;
+    let kernel = match dtype {
+        GgmlDType::Iq2Xxs => "mm_iq2_xxs_rows_f32",
+        GgmlDType::Q2K => "mm_q2_k_rows_f32",
+        _ => return None,
+    };
+    // Measured on an expert-sized weight: the kernel beats expanding the weight and a GEMM up to
+    // eight rows (0.105 ms against 0.149), loses at 31 (0.353 against 0.208) and by 3x at 64, because
+    // the expansion's cost does not grow with the rows and the kernel's does.
+    if inp % 256 != 0 || rows > IN_PLACE_MAX_ROWS {
+        return None;
+    }
+    Some((|| {
+        let stream = dev.stream();
+        let y = with_oom_retry(dev, "in place product", || unsafe {
+            stream.alloc::<f32>(rows * out)
+        })?;
+        let tables = if dtype == GgmlDType::Iq2Xxs {
+            Some(shared_iq2_tables(dev)?)
+        } else {
+            None
+        };
+        let func = dev.quantized_fn(kernel)?;
+        let cfg = LaunchConfig {
+            grid_dim: (out.div_ceil(8) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i, n_i) = (inp as i32, out as i32);
+        // Rows go through in groups the kernel holds in registers; each pass reads the codes once.
+        let mut row0 = 0usize;
+        while row0 < rows {
+            let group = (rows - row0).min(32);
+            let (r0_i, rows_i) = (row0 as i32, group as i32);
+            let mut b = stream.launch_builder(&func);
+            b.arg(blob);
+            if let Some(t) = &tables {
+                b.arg(&t.0);
+                b.arg(&t.1);
+            }
+            b.arg(input);
+            b.arg(&y);
+            b.arg(&k_i);
+            b.arg(&n_i);
+            b.arg(&r0_i);
+            b.arg(&rows_i);
+            unsafe { b.launch(cfg) }.map_err(|e| Error(format!("{kernel} launch: {e}")))?;
+            row0 += group;
+        }
+        Ok(y)
+    })())
+}
+
+/// The copy stream of a card, made once: weights go up on it while the compute stream runs.
+fn copy_stream(dev: &CudaDevice) -> Result<std::sync::Arc<cudarc::driver::CudaStream>> {
+    static COPY: std::sync::Mutex<Vec<(usize, std::sync::Arc<cudarc::driver::CudaStream>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut g = COPY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = g.iter().find(|(o, _)| *o == dev.ordinal()) {
+        return Ok(s.clone());
+    }
+    let s = dev
+        .ctx
+        .new_stream()
+        .map_err(|e| Error(format!("copy stream: {e:?}")))?;
+    g.push((dev.ordinal(), s.clone()));
+    Ok(s)
+}
+
 /// A page-locked host buffer the weights of an expert are staged through: copied into here from
 /// the mapped file, then sent to the card by a copy that runs beside the card's other work.
 struct Pinned {
@@ -1246,6 +1342,15 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
 /// The page-locked address of the weight at `addr`, `len` bytes, once a slab has read it in;
 /// waits for a read that has begun. `None` when no slab holds it.
 fn staged_weight(addr: usize, len: usize) -> Option<usize> {
+    let started = std::time::Instant::now();
+    let found = staged_weight_wait(addr, len);
+    if found.is_some() {
+        crate::inference::offload::prof_record("slab wait", started.elapsed().as_nanos() as u64);
+    }
+    found
+}
+
+fn staged_weight_wait(addr: usize, len: usize) -> Option<usize> {
     for slab in slabs() {
         let mut g = slab.inner.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -1265,6 +1370,9 @@ fn staged_weight(addr: usize, len: usize) -> Option<usize> {
 /// so a buffer goes back to the pool only once no copy still reads it.
 struct Staging<'a> {
     stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
+    /// The card's copy stream: uploads run there beside the compute stream's kernels, and the
+    /// compute stream waits for each one's event before it reads the weight.
+    copy: std::sync::Arc<cudarc::driver::CudaStream>,
     held: Vec<Pinned>,
     /// One per upload, recorded behind its copy: waited on instead of the whole stream, which
     /// other threads' work shares.
@@ -1293,34 +1401,7 @@ impl<'a> Staging<'a> {
     fn upload_inner(&mut self, dev: &CudaDevice, bytes: &[u8]) -> Result<CudaSlice<u8>> {
         // Already in page-locked memory, read ahead: sent from there.
         if let Some(src) = staged_weight(bytes.as_ptr() as usize, bytes.len()) {
-            let stream = self.stream;
-            let dst = with_oom_retry(dev, "expert weight upload", || unsafe {
-                stream.alloc::<u8>(bytes.len())
-            })?;
-            stream
-                .context()
-                .bind_to_thread()
-                .map_err(|e| Error(format!("staged upload: bind context: {e:?}")))?;
-            use cudarc::driver::DevicePtr;
-            let (dptr, guard) = dst.device_ptr(stream);
-            let r = unsafe {
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                    dptr,
-                    src as *const std::ffi::c_void,
-                    bytes.len(),
-                    stream.cu_stream(),
-                )
-            };
-            drop(guard);
-            if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
-                return Err(Error(format!("staged upload: {r:?}")));
-            }
-            self.copied.push(
-                stream
-                    .record_event(None)
-                    .map_err(|e| Error(format!("staged upload: record: {e:?}")))?,
-            );
-            return Ok(dst);
+            return self.send(dev, src as *const std::ffi::c_void, bytes.len());
         }
         let pin = {
             let mut pool = PINNED.lock().unwrap_or_else(|e| e.into_inner());
@@ -1364,28 +1445,45 @@ impl<'a> Staging<'a> {
         crate::inference::offload::prof_record("staged copy", t_copy.elapsed().as_nanos() as u64);
         let ptr = pin.ptr;
         self.held.push(pin);
-        let stream = self.stream;
+        self.send(dev, ptr, bytes.len())
+    }
+
+    /// `len` page-locked bytes at `src` sent to a new buffer on the card. The buffer belongs to
+    /// the compute stream, so it is freed behind the kernels that read it; the copy runs on the
+    /// copy stream, after the allocation, and the compute stream waits for it.
+    fn send(
+        &mut self,
+        dev: &CudaDevice,
+        src: *const std::ffi::c_void,
+        len: usize,
+    ) -> Result<CudaSlice<u8>> {
+        let (stream, copy) = (self.stream, &self.copy);
         let dst = with_oom_retry(dev, "expert weight upload", || unsafe {
-            stream.alloc::<u8>(bytes.len())
+            stream.alloc::<u8>(len)
         })?;
-        stream
-            .context()
+        let allocated = stream
+            .record_event(None)
+            .map_err(|e| Error(format!("staged upload: record: {e:?}")))?;
+        copy.wait(&allocated)
+            .map_err(|e| Error(format!("staged upload: wait: {e:?}")))?;
+        copy.context()
             .bind_to_thread()
             .map_err(|e| Error(format!("staged upload: bind context: {e:?}")))?;
         use cudarc::driver::DevicePtr;
         let (dptr, guard) = dst.device_ptr(stream);
-        let r = unsafe {
-            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dptr, ptr, bytes.len(), stream.cu_stream())
-        };
+        let r =
+            unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dptr, src, len, copy.cu_stream()) };
         drop(guard);
         if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
             return Err(Error(format!("staged upload: {r:?}")));
         }
-        self.copied.push(
-            stream
-                .record_event(None)
-                .map_err(|e| Error(format!("staged upload: record: {e:?}")))?,
-        );
+        let done = copy
+            .record_event(None)
+            .map_err(|e| Error(format!("staged upload: record: {e:?}")))?;
+        stream
+            .wait(&done)
+            .map_err(|e| Error(format!("staged upload: wait: {e:?}")))?;
+        self.copied.push(done);
         Ok(dst)
     }
 }
@@ -1418,6 +1516,7 @@ pub fn gpu_expert_tokens(
     let stream = dev.stream();
     let mut staging = Staging {
         stream: &stream,
+        copy: copy_stream(dev)?,
         held: Vec::new(),
         copied: Vec::new(),
     };
@@ -1440,9 +1539,21 @@ pub fn gpu_expert_tokens(
                     )));
                 }
                 let blob = staging.upload(dev, bytes)?;
+                if let Some(y) =
+                    product_in_place(dev, *dtype, &blob.as_view(), (out, inp), input, n)
+                {
+                    return y;
+                }
                 dequantise_f32(dev, *dtype, &blob.as_view(), total)?
             }
-            ExpertWeight::Card(blob) => dequantise_f32(dev, *dtype, &blob.as_view(), total)?,
+            ExpertWeight::Card(blob) => {
+                if let Some(y) =
+                    product_in_place(dev, *dtype, &blob.as_view(), (out, inp), input, n)
+                {
+                    return y;
+                }
+                dequantise_f32(dev, *dtype, &blob.as_view(), total)?
+            }
         };
         matmul_nt_f32(dev, input, &w, 1, n, inp, out)
     };
@@ -1567,6 +1678,7 @@ pub fn gpu_expert_into_layer(
     let stream = dev.stream();
     let mut staging = Staging {
         stream: &stream,
+        copy: copy_stream(dev)?,
         held: Vec::new(),
         copied: Vec::new(),
     };
@@ -1621,9 +1733,21 @@ pub fn gpu_expert_into_layer(
                     )));
                 }
                 let blob = staging.upload(dev, bytes)?;
+                if let Some(y) =
+                    product_in_place(dev, *dtype, &blob.as_view(), (out, inp), input, n)
+                {
+                    return y;
+                }
                 dequantise_f32(dev, *dtype, &blob.as_view(), total)?
             }
-            ExpertWeight::Card(blob) => dequantise_f32(dev, *dtype, &blob.as_view(), total)?,
+            ExpertWeight::Card(blob) => {
+                if let Some(y) =
+                    product_in_place(dev, *dtype, &blob.as_view(), (out, inp), input, n)
+                {
+                    return y;
+                }
+                dequantise_f32(dev, *dtype, &blob.as_view(), total)?
+            }
         };
         matmul_nt_f32(dev, input, &w, 1, n, inp, out)
     };
@@ -1638,7 +1762,12 @@ pub fn gpu_expert_into_layer(
     }
     let out = product(&mut staging, &weights[2], &h, (dim, inter))?;
     // In turn: this expert's add is queued after the ones before it in the layer.
+    let turn_started = std::time::Instant::now();
     layer.wait_turn(order);
+    crate::inference::offload::prof_record(
+        "expert turn wait",
+        turn_started.elapsed().as_nanos() as u64,
+    );
     let (total, dim_i) = ((n * dim) as i64, dim as i64);
     launch!(
         "scatter_add_f32",
@@ -1653,10 +1782,15 @@ pub fn gpu_expert_into_layer(
     layer.finish(order);
     // Held to the card's pace: this expert's buffers are freed when its work is behind it, and
     // threads that queued without limit would hold the card's memory for work not yet reached.
+    let sync_started = std::time::Instant::now();
     stream
         .record_event(None)
         .and_then(|e| e.synchronize())
         .map_err(|e| Error(format!("expert rows: wait: {e:?}")))?;
+    crate::inference::offload::prof_record(
+        "expert card wait",
+        sync_started.elapsed().as_nanos() as u64,
+    );
     Ok(())
 }
 
@@ -1799,6 +1933,7 @@ pub fn gpu_prefill_attention_with(
     let stream = dev.stream();
     let mut staging = Staging {
         stream: &stream,
+        copy: copy_stream(dev)?,
         held: Vec::new(),
         copied: Vec::new(),
     };
@@ -3477,6 +3612,155 @@ mod iq2_xxs_gpu_tests {
                 assert!(
                     (g - v).abs() <= 1e-4 * v.abs().max(1.0),
                     "{dtype:?}: {g} vs {v}"
+                );
+            }
+        }
+    }
+
+    /// The in-place kernels read the codes where they lie and give what the expanded weight and
+    /// the f32 product give, to rounding, for one row, a few, a full group, and groups past it.
+    #[test]
+    fn gpu_products_in_place_match_the_expanded_weight() {
+        let Ok(dev) = CudaDevice::new(0) else {
+            eprintln!("no CUDA device; the in-place products are NOT covered by this run");
+            return;
+        };
+        let (out, inp) = (100usize, 768usize);
+        let w: Vec<f32> = (0..out * inp)
+            .map(|i| {
+                (((i as u32).wrapping_mul(2_654_435_761).rotate_left(9) >> 8) as f32
+                    / (1 << 24) as f32
+                    - 0.5)
+                    * 0.08
+            })
+            .collect();
+        for dtype in [GgmlDType::Iq2Xxs, GgmlDType::Q2K] {
+            let blocks = crate::tensor::quant_cpu::from_float_bytes(dtype, &w).unwrap();
+            let blob = dev.stream().clone_htod(&blocks).unwrap();
+            for rows in [1usize, 7, 8] {
+                let x: Vec<f32> = (0..rows * inp).map(|i| ((i as f32) * 0.37).sin()).collect();
+                let xd = dev.stream().clone_htod(&x).unwrap();
+                let got = product_in_place(&dev, dtype, &blob.as_view(), (out, inp), &xd, rows)
+                    .expect("a kernel for the format")
+                    .unwrap();
+                let got = dev.stream().clone_dtoh(&got).unwrap();
+                let want = gpu_quant_linear(&dev, dtype, &blocks, (out, inp), &x).unwrap();
+                let range = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    worst <= 2e-4 * range.max(1.0),
+                    "{dtype:?} rows {rows}: worst {worst} of range {range}"
+                );
+            }
+        }
+        // Wider groups are left to the expanded weight.
+        let (blocks, x) = (vec![0u8; 8], dev.stream().clone_htod(&[0f32; 4]).unwrap());
+        let blob = dev.stream().clone_htod(&blocks).unwrap();
+        assert!(product_in_place(&dev, GgmlDType::Q6K, &blob.as_view(), (1, 256), &x, 1).is_none());
+    }
+
+    /// Time of one expert-sized product through the in-place kernel against the expanded weight.
+    #[test]
+    #[ignore = "benchmark: run explicitly with --ignored --nocapture"]
+    fn bench_products_in_place() {
+        let Ok(dev) = CudaDevice::new(0) else { return };
+        let (out, inp) = (2304usize, 5120usize);
+        let w: Vec<f32> = (0..out * inp)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.05)
+            .collect();
+        for dtype in [GgmlDType::Iq2Xxs, GgmlDType::Q2K] {
+            let blocks = crate::tensor::quant_cpu::from_float_bytes(dtype, &w).unwrap();
+            let blob = dev.stream().clone_htod(&blocks).unwrap();
+            for rows in [8usize, 31, 64] {
+                let x: Vec<f32> = (0..rows * inp).map(|i| ((i as f32) * 0.37).sin()).collect();
+                let xd = dev.stream().clone_htod(&x).unwrap();
+                let time = |f: &mut dyn FnMut()| {
+                    f();
+                    dev.stream().synchronize().unwrap();
+                    let t = std::time::Instant::now();
+                    for _ in 0..50 {
+                        f();
+                    }
+                    dev.stream().synchronize().unwrap();
+                    t.elapsed().as_secs_f64() * 1000.0 / 50.0
+                };
+                let a = time(&mut || {
+                    let _ = product_in_place(&dev, dtype, &blob.as_view(), (out, inp), &xd, rows)
+                        .unwrap()
+                        .unwrap();
+                });
+                let b = time(&mut || {
+                    let wf = dequantise_f32(&dev, dtype, &blob.as_view(), out * inp).unwrap();
+                    let _ = matmul_nt_f32(&dev, &xd, &wf, 1, rows, inp, out).unwrap();
+                });
+                eprintln!("{dtype:?} rows {rows}: in place {a:.3} ms, expanded {b:.3} ms");
+            }
+        }
+    }
+
+    /// Time per expert of a prompt's pass: weights staged each time, then resident on the card;
+    /// one thread, then four.
+    #[test]
+    #[ignore = "benchmark: run explicitly with --ignored --nocapture"]
+    fn bench_expert_into_layer() {
+        let Ok(dev) = CudaDevice::new(0) else { return };
+        let (inter, dim, n) = (2304usize, 5120usize, 128usize);
+        let enc = |dtype: GgmlDType, len: usize, f: f32| {
+            let v: Vec<f32> = (0..len).map(|i| ((i as f32) * f).sin() * 0.05).collect();
+            crate::tensor::quant_cpu::from_float_bytes(dtype, &v).unwrap()
+        };
+        let (gb, ub, db) = (
+            enc(GgmlDType::Iq2Xxs, inter * dim, 0.013),
+            enc(GgmlDType::Iq2Xxs, inter * dim, 0.017),
+            enc(GgmlDType::Q2K, dim * inter, 0.011),
+        );
+        let x: Vec<f32> = (0..n * dim).map(|i| ((i as f32) * 0.3).sin()).collect();
+        let toks: Vec<(u32, f32)> = (0..31u32).map(|t| (t * 3, 0.5)).collect();
+        let stream = dev.stream();
+        let (gc, uc, dc) = (
+            std::sync::Arc::new(stream.clone_htod(&gb).unwrap()),
+            std::sync::Arc::new(stream.clone_htod(&ub).unwrap()),
+            std::sync::Arc::new(stream.clone_htod(&db).unwrap()),
+        );
+        for resident in [false, true] {
+            for threads in [1usize, 4] {
+                let layer = gpu_layer_begin(&dev, &x, dim).unwrap();
+                let calls = 120usize;
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let t = std::time::Instant::now();
+                std::thread::scope(|s| {
+                    for _ in 0..threads {
+                        s.spawn(|| loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= calls {
+                                break;
+                            }
+                            let w = if resident {
+                                [
+                                    (GgmlDType::Iq2Xxs, ExpertWeight::Card(gc.clone())),
+                                    (GgmlDType::Iq2Xxs, ExpertWeight::Card(uc.clone())),
+                                    (GgmlDType::Q2K, ExpertWeight::Card(dc.clone())),
+                                ]
+                            } else {
+                                [
+                                    (GgmlDType::Iq2Xxs, ExpertWeight::Host(&gb)),
+                                    (GgmlDType::Iq2Xxs, ExpertWeight::Host(&ub)),
+                                    (GgmlDType::Q2K, ExpertWeight::Host(&db)),
+                                ]
+                            };
+                            gpu_expert_into_layer(&dev, w, (inter, dim), &layer, i, &toks, 7.0)
+                                .unwrap();
+                        });
+                    }
+                });
+                dev.stream().synchronize().unwrap();
+                eprintln!(
+                    "resident {resident} threads {threads}: {:.2} ms per expert",
+                    t.elapsed().as_secs_f64() * 1000.0 / calls as f64
                 );
             }
         }

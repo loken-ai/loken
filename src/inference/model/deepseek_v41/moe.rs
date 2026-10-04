@@ -182,6 +182,7 @@ impl Moe {
 
         // The routed experts this batch needs are known from the top-k before any of them runs, so
         // a streamed set prefetches that working set before the compute loop reads it.
+        let prepared = std::time::Instant::now();
         let uses: Vec<(usize, u64, u64)> = assign
             .iter()
             .enumerate()
@@ -223,6 +224,10 @@ impl Moe {
             r.will_need();
         }
 
+        crate::inference::offload::prof_record(
+            "moe expert prep",
+            prepared.elapsed().as_nanos() as u64,
+        );
         // A decode whose active experts all sit on one card runs the whole mixture there - shared
         // expert, routed experts and the weighted gather - so the block crosses the bus once for
         // the layer. The card declines when it cannot hold every active expert, and the streamed
@@ -287,6 +292,7 @@ impl Moe {
         let routed_started = std::time::Instant::now();
         // A prompt's experts keep their tokens' rows and their products on the cards: the layer's
         // input crosses once per card and the sum over each token's slots comes back once.
+        let begun = std::time::Instant::now();
         let layer_dev = match (&offload, n > 1, observer.is_none()) {
             (Some(off), true, true)
                 if n > crate::inference::offload::moe_dispatch::VERIFY_BATCH_MAX_ROWS =>
@@ -297,6 +303,11 @@ impl Moe {
             }
             _ => None,
         };
+        crate::inference::offload::prof_record(
+            "moe layer context",
+            begun.elapsed().as_nanos() as u64,
+        );
+        let dispatched = std::time::Instant::now();
         // The routed experts of this block, resident ones on the cards and the misses on the
         // cores at once; run on the host from its mapping when no card placement is set.
         let (mut done, mut cpu_side, deferred) = if let Some(off) = &offload {
@@ -322,6 +333,10 @@ impl Moe {
                 None,
             )
         };
+        crate::inference::offload::prof_record(
+            "moe dispatch",
+            dispatched.elapsed().as_nanos() as u64,
+        );
         let later: Vec<usize> = deferred
             .as_ref()
             .map(|d| d.indexes.clone())
@@ -433,7 +448,12 @@ impl Moe {
             let dim = self.dim;
             // The cards' share: each token's slots summed there, added to what the host formed.
             if let Some((hooks, ctx)) = &layer_dev {
+                let ended = std::time::Instant::now();
                 let sum = (hooks.end)(ctx)?;
+                crate::inference::offload::prof_record(
+                    "moe layer sum",
+                    ended.elapsed().as_nanos() as u64,
+                );
                 y.par_iter_mut()
                     .zip(sum.par_chunks(dim))
                     .for_each(|(row, part)| {
