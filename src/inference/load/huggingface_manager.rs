@@ -108,6 +108,30 @@ fn pick_revision(model_dir: &std::path::Path) -> Option<String> {
     None
 }
 
+/// Splits `owner/repo:SELECTOR` into the repository id and the selector. A bare
+/// repository id, or the default tag, carries no selector.
+fn split_selector(model_id: &str) -> (&str, Option<&str>) {
+    match model_id.split_once(':') {
+        Some((repo, sel)) if !sel.is_empty() && sel != "latest" => (repo, Some(sel)),
+        Some((repo, _)) => (repo, None),
+        None => (model_id, None),
+    }
+}
+
+/// True when `selector` names the quantisation a repository file belongs to: a
+/// directory of the path, or a dash-delimited token of the file name.
+fn selector_names_file(selector: &str, rfilename: &str) -> bool {
+    let sel = selector.to_ascii_lowercase();
+    let lower = rfilename.to_ascii_lowercase();
+    let (dirs, file) = match lower.rsplit_once('/') {
+        Some((d, f)) => (d, f),
+        None => ("", lower.as_str()),
+    };
+    dirs.split('/').any(|d| d == sel)
+        || file.contains(&format!("-{sel}-"))
+        || file.ends_with(&format!("-{sel}.gguf"))
+}
+
 impl HuggingFaceManager {
     /// Create a new HuggingFace manager pointing to a models cache directory.
     ///
@@ -394,6 +418,8 @@ impl HuggingFaceManager {
         model_id: &str,
         progress: Option<ProgressCallback>,
     ) -> Result<()> {
+        // `repo:SELECTOR` keeps one quantisation of a GGUF repository.
+        let (model_id, selector) = split_selector(model_id);
         info!("🔽 Pulling HuggingFace model: {}", model_id);
 
         // Validate model_id format
@@ -416,7 +442,7 @@ impl HuggingFaceManager {
         let client = reqwest::Client::new();
 
         // Fetch model info from HuggingFace API
-        let api_url = format!("https://huggingface.co/api/models/{}", model_id);
+        let api_url = format!("https://huggingface.co/api/models/{}?blobs=true", model_id);
         info!("   📋 Fetching model info from {}", api_url);
 
         let mut req = client.get(&api_url);
@@ -467,6 +493,11 @@ impl HuggingFaceManager {
             .iter()
             .filter(|f| {
                 let name = f.rfilename.to_lowercase();
+                if name.ends_with(".gguf") {
+                    if let Some(sel) = selector {
+                        return selector_names_file(sel, &f.rfilename);
+                    }
+                }
                 // Download model files and configs
                 name.ends_with(".safetensors")
                     || name.ends_with(".gguf")
@@ -728,6 +759,32 @@ pub enum HuggingFaceError {
 impl From<std::io::Error> for HuggingFaceError {
     fn from(err: std::io::Error) -> Self {
         HuggingFaceError::IoError(err)
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    #[test]
+    fn a_selector_splits_off_the_repository_id() {
+        assert_eq!(split_selector("a/b:Q4"), ("a/b", Some("Q4")));
+        assert_eq!(split_selector("a/b:latest"), ("a/b", None));
+        assert_eq!(split_selector("a/b"), ("a/b", None));
+    }
+
+    #[test]
+    fn a_selector_names_a_directory_or_a_file_token() {
+        assert!(selector_names_file(
+            "UD-Q4_K_XL",
+            "UD-Q4_K_XL/m-UD-Q4_K_XL-00001-of-00004.gguf"
+        ));
+        assert!(selector_names_file("Q8_0", "m-Q8_0.gguf"));
+        assert!(!selector_names_file("Q8_0", "MTP/mtp-m-Q4_K_M.gguf"));
+        assert!(!selector_names_file(
+            "Q4_K",
+            "UD-Q4_K_XL/m-UD-Q4_K_XL-1.gguf"
+        ));
     }
 }
 
