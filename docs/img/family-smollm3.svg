@@ -37,20 +37,20 @@
 <rect class="l" x="249" y="262" width="414.3" height="11" rx="2"/>
 <text class="t" x="520.6357640161232" y="258">173</text>
 <text class="t" x="669.3056064492488" y="274">269  (+56%)</text>
-<text class="m" x="239" y="294" text-anchor="end">smollm3:latest 4096 short S GPU</text>
-<rect class="o" x="249" y="282" width="264.7" height="11" rx="2"/>
-<rect class="l" x="249" y="296" width="410.6" height="11" rx="2"/>
-<text class="t" x="519.7123488457311" y="292">172</text>
-<text class="t" x="665.6119457676805" y="308">267  (+55%)</text>
-<text class="m" x="239" y="328" text-anchor="end">smollm3:latest 4096 medium S GPU</text>
-<rect class="o" x="249" y="316" width="261.2" height="11" rx="2"/>
-<rect class="l" x="249" y="330" width="400.1" height="11" rx="2"/>
-<text class="t" x="516.1725906925614" y="326">170</text>
-<text class="t" x="655.1465738365703" y="342">260  (+53%)</text>
-<text class="m" x="239" y="362" text-anchor="end">smollm3:latest 131072 medium S GPU</text>
-<rect class="o" x="249" y="350" width="263.6" height="11" rx="2"/>
-<rect class="l" x="249" y="364" width="402.5" height="11" rx="2"/>
-<text class="t" x="518.6350311469403" y="360">171</text>
-<text class="t" x="657.4551117625504" y="376">262  (+53%)</text>
-<text class="h" x="249" y="422">GREY OLLAMA   GREEN LOKEN 0.1.0</text>
+<text class="m" x="239" y="294" text-anchor="end">smollm3:latest 4096 medium S GPU</text>
+<rect class="o" x="249" y="282" width="261.2" height="11" rx="2"/>
+<rect class="l" x="249" y="296" width="400.1" height="11" rx="2"/>
+<text class="t" x="516.1725906925614" y="292">170</text>
+<text class="t" x="655.1465738365703" y="308">260  (+53%)</text>
+<text class="m" x="239" y="328" text-anchor="end">smollm3:latest 131072 medium S GPU</text>
+<rect class="o" x="249" y="316" width="263.6" height="11" rx="2"/>
+<rect class="l" x="249" y="330" width="402.5" height="11" rx="2"/>
+<text class="t" x="518.6350311469403" y="326">171</text>
+<text class="t" x="657.4551117625504" y="342">262  (+53%)</text>
+<text class="m" x="239" y="362" text-anchor="end">smollm3:latest 4096 short NS GPU</text>
+<rect class="o" x="249" y="350" width="169.0" height="11" rx="2"/>
+<rect class="l" x="249" y="364" width="235.2" height="11" rx="2"/>
+<text class="t" x="423.98497618175156" y="360">110</text>
+<text class="t" x="490.16306339318436" y="376">153  (+39%)</text>
+<text class="h" x="249" y="422">GREY OLLAMA   GREEN LOKEN</text>
 </svg>

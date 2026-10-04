@@ -38,10 +38,10 @@
 <text class="t" x="521.4223380006513" y="258">371</text>
 <text class="t" x="682.2559426896776" y="274">606  (+63%)</text>
 <text class="m" x="252" y="294" text-anchor="end">moondream:latest 4096 short S GPU</text>
-<rect class="o" x="262" y="282" width="256.1" height="11" rx="2"/>
-<rect class="l" x="262" y="296" width="402.8" height="11" rx="2"/>
-<text class="t" x="524.0892217518724" y="292">374</text>
-<text class="t" x="670.7678280690329" y="308">589  (+57%)</text>
+<rect class="o" x="262" y="282" width="299.0" height="11" rx="2"/>
+<rect class="l" x="262" y="296" width="410.9" height="11" rx="2"/>
+<text class="t" x="566.96450667535" y="292">437</text>
+<text class="t" x="678.9052425919895" y="308">601  (+37%)</text>
 <text class="m" x="252" y="328" text-anchor="end">moondream:latest 4096 medium S CPU</text>
 <rect class="o" x="262" y="316" width="18.9" height="11" rx="2"/>
 <rect class="l" x="262" y="330" width="14.2" height="11" rx="2"/>
@@ -52,5 +52,5 @@
 <rect class="l" x="262" y="364" width="14.2" height="11" rx="2"/>
 <text class="t" x="286.8733311624878" y="360">28</text>
 <text class="t" x="282.1549983718658" y="376">21  (-25%)</text>
-<text class="h" x="262" y="422">GREY OLLAMA   GREEN LOKEN 0.1.0</text>
+<text class="h" x="262" y="422">GREY OLLAMA   GREEN LOKEN</text>
 </svg>

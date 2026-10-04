@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="780" height="436" viewBox="0 0 780 436" font-family="DejaVu Sans, Liberation Sans, Helvetica, Arial, sans-serif">
 <style>.t{fill:#57606a;font-size:10.5px}.m{fill:#24292f;font-size:11px}.h{fill:#57606a;font-size:11px;letter-spacing:.06em}.o{fill:#8c959f}.l{fill:#2da44e}.ax{stroke:#d0d7de;stroke-width:1}@media (prefers-color-scheme:dark){.t,.h{fill:#8b949e}.m{fill:#e6edf3}.o{fill:#6e7681}.l{fill:#3fb950}.ax{stroke:#30363d}}</style>
-<text class="h" x="256" y="22">QWEN2 - DECODE TOK/S, 10 WIDEST GAPS OF 54 COMPARABLE CELLS, 54 MEASURED</text>
+<text class="h" x="256" y="22">QWEN2 - DECODE TOK/S, 10 WIDEST GAPS OF 55 COMPARABLE CELLS, 55 MEASURED</text>
 <line class="ax" x1="256" y1="38" x2="256" y2="420"/>
 <text class="m" x="246" y="56" text-anchor="end">deepseek-r1:32b 131072 short S GPU</text>
 <rect class="o" x="256" y="44" width="2.4" height="11" rx="2"/>
@@ -42,15 +42,15 @@
 <rect class="l" x="256" y="296" width="98.6" height="11" rx="2"/>
 <text class="t" x="277.0343642611684" y="292">12</text>
 <text class="t" x="360.6254295532646" y="308">82  (+556%)</text>
-<text class="m" x="246" y="328" text-anchor="end">deepcoder:14b 131072 medium S GPU</text>
-<rect class="o" x="256" y="316" width="15.5" height="11" rx="2"/>
-<rect class="l" x="256" y="330" width="101.3" height="11" rx="2"/>
-<text class="t" x="277.5154639175258" y="326">13</text>
-<text class="t" x="363.27147766323026" y="342">84  (+553%)</text>
-<text class="m" x="246" y="362" text-anchor="end">qwen2.5:0.5b 131072 short NS GPU</text>
-<rect class="o" x="256" y="350" width="208.4" height="11" rx="2"/>
-<rect class="l" x="256" y="364" width="420.0" height="11" rx="2"/>
-<text class="t" x="470.4364261168385" y="360">173</text>
-<text class="t" x="682.0" y="376">349  (+102%)</text>
-<text class="h" x="256" y="422">GREY OLLAMA   GREEN LOKEN 0.1.0</text>
+<text class="m" x="246" y="328" text-anchor="end">qwen2.5:0.5b 131072 short NS GPU</text>
+<rect class="o" x="256" y="316" width="208.4" height="11" rx="2"/>
+<rect class="l" x="256" y="330" width="420.0" height="11" rx="2"/>
+<text class="t" x="470.4364261168385" y="326">173</text>
+<text class="t" x="682.0" y="342">349  (+102%)</text>
+<text class="m" x="246" y="362" text-anchor="end">deepcoder:latest 4096 short S GPU</text>
+<rect class="o" x="256" y="350" width="68.2" height="11" rx="2"/>
+<rect class="l" x="256" y="364" width="92.5" height="11" rx="2"/>
+<text class="t" x="330.1958762886598" y="360">57</text>
+<text class="t" x="354.4914089347079" y="376">77  (+36%)</text>
+<text class="h" x="256" y="422">GREY OLLAMA   GREEN LOKEN</text>
 </svg>

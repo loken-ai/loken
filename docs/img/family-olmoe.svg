@@ -3,54 +3,54 @@
 <text class="h" x="236" y="22">OLMOE - DECODE TOK/S, 10 WIDEST GAPS OF 17 COMPARABLE CELLS, 18 MEASURED</text>
 <line class="ax" x1="236" y1="38" x2="236" y2="420"/>
 <text class="m" x="226" y="56" text-anchor="end">olmoe:latest 4096 medium S GPU</text>
-<rect class="o" x="236" y="44" width="262.2" height="11" rx="2"/>
-<rect class="l" x="236" y="58" width="420.0" height="11" rx="2"/>
-<text class="t" x="504.1829163071613" y="54">289</text>
-<text class="t" x="662.0" y="70">464  (+60%)</text>
+<rect class="o" x="236" y="44" width="211.7" height="11" rx="2"/>
+<rect class="l" x="236" y="58" width="339.1" height="11" rx="2"/>
+<text class="t" x="453.68234064785787" y="54">289</text>
+<text class="t" x="581.1013584117032" y="70">464  (+60%)</text>
 <text class="m" x="226" y="90" text-anchor="end">olmoe:latest 131072 short NS GPU</text>
-<rect class="o" x="236" y="78" width="270.5" height="11" rx="2"/>
-<rect class="l" x="236" y="92" width="383.9" height="11" rx="2"/>
-<text class="t" x="512.5176876617775" y="88">299</text>
-<text class="t" x="625.8524590163934" y="104">424  (+42%)</text>
+<rect class="o" x="236" y="78" width="218.4" height="11" rx="2"/>
+<rect class="l" x="236" y="92" width="309.9" height="11" rx="2"/>
+<text class="t" x="460.4117032392894" y="88">299</text>
+<text class="t" x="551.9164054336468" y="104">424  (+42%)</text>
 <text class="m" x="226" y="124" text-anchor="end">olmoe:latest 4096 medium NS GPU</text>
-<rect class="o" x="236" y="112" width="287.9" height="11" rx="2"/>
-<rect class="l" x="236" y="126" width="374.1" height="11" rx="2"/>
-<text class="t" x="529.9119930974979" y="122">318</text>
-<text class="t" x="616.0681622088007" y="138">413  (+30%)</text>
+<rect class="o" x="236" y="112" width="232.5" height="11" rx="2"/>
+<rect class="l" x="236" y="126" width="302.0" height="11" rx="2"/>
+<text class="t" x="474.45559038662486" y="122">318</text>
+<text class="t" x="544.0167189132706" y="138">413  (+30%)</text>
 <text class="m" x="226" y="158" text-anchor="end">olmoe:latest 131072 medium NS GPU</text>
-<rect class="o" x="236" y="146" width="289.0" height="11" rx="2"/>
-<rect class="l" x="236" y="160" width="362.1" height="11" rx="2"/>
-<text class="t" x="530.9991371872304" y="156">319</text>
-<text class="t" x="604.1095772217428" y="172">400  (+25%)</text>
-<text class="m" x="226" y="192" text-anchor="end">olmoe:latest 131072 short S GPU</text>
-<rect class="o" x="236" y="180" width="353.6" height="11" rx="2"/>
-<rect class="l" x="236" y="194" width="418.7" height="11" rx="2"/>
-<text class="t" x="595.5936151855047" y="190">390</text>
-<text class="t" x="660.7316652286454" y="206">462  (+18%)</text>
-<text class="m" x="226" y="226" text-anchor="end">olmoe:latest 4096 short S GPU</text>
-<rect class="o" x="236" y="214" width="352.5" height="11" rx="2"/>
-<rect class="l" x="236" y="228" width="412.3" height="11" rx="2"/>
-<text class="t" x="594.5064710957722" y="224">389</text>
-<text class="t" x="654.2993960310613" y="240">455  (+17%)</text>
+<rect class="o" x="236" y="146" width="233.3" height="11" rx="2"/>
+<rect class="l" x="236" y="160" width="292.4" height="11" rx="2"/>
+<text class="t" x="475.33333333333326" y="156">319</text>
+<text class="t" x="534.3615464994775" y="172">400  (+25%)</text>
+<text class="m" x="226" y="192" text-anchor="end">olmoe:latest 4096 short S GPU</text>
+<rect class="o" x="236" y="180" width="339.1" height="11" rx="2"/>
+<rect class="l" x="236" y="194" width="420.0" height="11" rx="2"/>
+<text class="t" x="581.1013584117032" y="190">464</text>
+<text class="t" x="662.0" y="206">574  (+24%)</text>
+<text class="m" x="226" y="226" text-anchor="end">olmoe:latest 131072 short S GPU</text>
+<rect class="o" x="236" y="214" width="285.5" height="11" rx="2"/>
+<rect class="l" x="236" y="228" width="338.1" height="11" rx="2"/>
+<text class="t" x="527.4858934169279" y="224">390</text>
+<text class="t" x="580.0773249738767" y="240">462  (+18%)</text>
 <text class="m" x="226" y="260" text-anchor="end">olmoe:latest 131072 medium S GPU</text>
-<rect class="o" x="236" y="248" width="353.2" height="11" rx="2"/>
-<rect class="l" x="236" y="262" width="411.2" height="11" rx="2"/>
-<text class="t" x="595.2312338222605" y="258">390</text>
-<text class="t" x="653.2122519413288" y="274">454  (+16%)</text>
+<rect class="o" x="236" y="248" width="285.2" height="11" rx="2"/>
+<rect class="l" x="236" y="262" width="332.0" height="11" rx="2"/>
+<text class="t" x="527.1933124346917" y="258">390</text>
+<text class="t" x="574.0062695924764" y="274">454  (+16%)</text>
 <text class="m" x="226" y="294" text-anchor="end">olmoe:latest 4096 short NS GPU</text>
-<rect class="o" x="236" y="282" width="291.0" height="11" rx="2"/>
-<rect class="l" x="236" y="296" width="337.3" height="11" rx="2"/>
-<text class="t" x="532.9922346850733" y="292">321</text>
-<text class="t" x="579.2864538395168" y="308">372  (+16%)</text>
+<rect class="o" x="236" y="282" width="234.9" height="11" rx="2"/>
+<rect class="l" x="236" y="296" width="272.3" height="11" rx="2"/>
+<text class="t" x="476.94252873563215" y="292">321</text>
+<text class="t" x="514.3197492163009" y="308">372  (+16%)</text>
 <text class="m" x="226" y="328" text-anchor="end">olmoe:latest 4096 long S GPU</text>
-<rect class="o" x="236" y="316" width="347.2" height="11" rx="2"/>
-<rect class="l" x="236" y="330" width="376.2" height="11" rx="2"/>
-<text class="t" x="589.1613459879206" y="326">383</text>
-<text class="t" x="618.1518550474548" y="342">415  (+8%)</text>
+<rect class="o" x="236" y="316" width="280.3" height="11" rx="2"/>
+<rect class="l" x="236" y="330" width="303.7" height="11" rx="2"/>
+<text class="t" x="522.2925809822361" y="326">383</text>
+<text class="t" x="545.6990595611285" y="342">415  (+8%)</text>
 <text class="m" x="226" y="362" text-anchor="end">olmoe:latest 4096 medium S CPU</text>
-<rect class="o" x="236" y="350" width="25.5" height="11" rx="2"/>
-<rect class="l" x="236" y="364" width="23.5" height="11" rx="2"/>
-<text class="t" x="267.5478861087144" y="360">28</text>
-<text class="t" x="265.4641932700604" y="376">26  (-8%)</text>
-<text class="h" x="236" y="422">GREY OLLAMA   GREEN LOKEN 0.1.0</text>
+<rect class="o" x="236" y="350" width="20.6" height="11" rx="2"/>
+<rect class="l" x="236" y="364" width="18.9" height="11" rx="2"/>
+<text class="t" x="262.6269592476489" y="360">28</text>
+<text class="t" x="260.944618599791" y="376">26  (-8%)</text>
+<text class="h" x="236" y="422">GREY OLLAMA   GREEN LOKEN</text>
 </svg>

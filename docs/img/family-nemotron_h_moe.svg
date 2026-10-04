@@ -37,20 +37,20 @@
 <rect class="l" x="301" y="262" width="419.4" height="11" rx="2"/>
 <text class="t" x="680.735899137359" y="258">134</text>
 <text class="t" x="726.4426011944261" y="274">150  (+12%)</text>
-<text class="m" x="291" y="294" text-anchor="end">nemotron-3-nano:latest 4096 short S GPU</text>
-<rect class="o" x="301" y="282" width="373.2" height="11" rx="2"/>
-<rect class="l" x="301" y="296" width="417.5" height="11" rx="2"/>
-<text class="t" x="680.178500331785" y="292">134</text>
-<text class="t" x="724.491705374917" y="308">150  (+12%)</text>
-<text class="m" x="291" y="328" text-anchor="end">nemotron-3-nano:latest 4096 medium S GPU</text>
-<rect class="o" x="301" y="316" width="379.3" height="11" rx="2"/>
-<rect class="l" x="301" y="330" width="418.9" height="11" rx="2"/>
-<text class="t" x="686.3098871930989" y="326">136</text>
-<text class="t" x="725.8852023888521" y="342">150  (+10%)</text>
-<text class="m" x="291" y="362" text-anchor="end">nemotron-3-nano:latest 4096 long S GPU</text>
-<rect class="o" x="301" y="350" width="377.1" height="11" rx="2"/>
-<rect class="l" x="301" y="364" width="415.8" height="11" rx="2"/>
-<text class="t" x="684.080291970803" y="360">135</text>
-<text class="t" x="722.8195089581951" y="376">149  (+10%)</text>
-<text class="h" x="301" y="422">GREY OLLAMA   GREEN LOKEN 0.1.0</text>
+<text class="m" x="291" y="294" text-anchor="end">nemotron-3-nano:latest 4096 medium S GPU</text>
+<rect class="o" x="301" y="282" width="379.3" height="11" rx="2"/>
+<rect class="l" x="301" y="296" width="418.9" height="11" rx="2"/>
+<text class="t" x="686.3098871930989" y="292">136</text>
+<text class="t" x="725.8852023888521" y="308">150  (+10%)</text>
+<text class="m" x="291" y="328" text-anchor="end">nemotron-3-nano:latest 4096 long S GPU</text>
+<rect class="o" x="301" y="316" width="377.1" height="11" rx="2"/>
+<rect class="l" x="301" y="330" width="415.8" height="11" rx="2"/>
+<text class="t" x="684.080291970803" y="326">135</text>
+<text class="t" x="722.8195089581951" y="342">149  (+10%)</text>
+<text class="m" x="291" y="362" text-anchor="end">nemotron-3-nano:latest 4096 long S CPU</text>
+<rect class="o" x="301" y="350" width="23.1" height="11" rx="2"/>
+<rect class="l" x="301" y="364" width="20.9" height="11" rx="2"/>
+<text class="t" x="330.1320504313205" y="360">8</text>
+<text class="t" x="327.90245520902454" y="376">8  (-10%)</text>
+<text class="h" x="301" y="422">GREY OLLAMA   GREEN LOKEN</text>
 </svg>

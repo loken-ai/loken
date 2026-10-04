@@ -47,10 +47,10 @@
 <rect class="l" x="230" y="330" width="414.7" height="11" rx="2"/>
 <text class="t" x="590.1721854304635" y="326">115</text>
 <text class="t" x="650.7461368653421" y="342">134  (+17%)</text>
-<text class="m" x="220" y="362" text-anchor="end">qwen3.5:35b 4096 short S GPU</text>
-<rect class="o" x="230" y="350" width="355.4" height="11" rx="2"/>
-<rect class="l" x="230" y="364" width="410.7" height="11" rx="2"/>
-<text class="t" x="591.4083885209712" y="360">115</text>
-<text class="t" x="646.7284768211921" y="376">133  (+16%)</text>
-<text class="h" x="230" y="422">GREY OLLAMA   GREEN LOKEN 0.1.0</text>
+<text class="m" x="220" y="362" text-anchor="end">qwen3.5:35b 4096 medium S CPU</text>
+<rect class="o" x="230" y="350" width="29.1" height="11" rx="2"/>
+<rect class="l" x="230" y="364" width="26.3" height="11" rx="2"/>
+<text class="t" x="265.0507726269316" y="360">9</text>
+<text class="t" x="262.26931567328916" y="376">8  (-10%)</text>
+<text class="h" x="230" y="422">GREY OLLAMA   GREEN LOKEN</text>
 </svg>
