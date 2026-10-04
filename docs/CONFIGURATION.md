@@ -86,7 +86,7 @@ could live, and leave the key unset where nothing about an exchange may reach th
 |---|---|---|
 | `state_cache_dir` | none | Directory of the cache. |
 | `state_cache_budget_gb` | `0` | Bytes the cache may hold, in GiB. `0` is no limit. Least recently used first; in each family of states sharing a first block the one restored most, the longest among equals, goes last. |
-| `state_cache_block_tokens` | `256` | Tokens per block of the hash chain a prefix is looked up by, and the shortest state worth storing. Changing it orphans what is stored. |
+| `state_cache_block_tokens` | `256` | Tokens per block of the hash chain, the spacing of the states kept while a prompt is prefilled (so any prompt sharing a prefix restores at the last multiple at or below the shared length), and the shortest state worth storing. Must be a multiple of every layer's compression ratio. Changing it orphans what is stored. |
 | `state_cache_salt` | empty | Mixed into every state's identity; states written under another salt are never read. |
 
 A state is also keyed by the model files (length, modification time and header) and `expert_deferral`,

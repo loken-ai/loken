@@ -8,7 +8,7 @@
 use super::band::SharedAttn;
 use super::block::Block;
 use super::cache::DecodeState;
-use super::engram::{prefill_hashes, Engram, EngramConfig};
+use super::engram::{prefill_hashes, Engram, EngramConfig, EngramState};
 use super::hyper_connections::hc_pre;
 use super::load::{load_band_block, load_ratio0_block, projection};
 use super::source::WeightSource;
@@ -497,12 +497,31 @@ impl DeepseekV41Model {
     /// the engram's recent ids, the position. Returns the last position's logits [1, vocab]. Runs
     /// each layer once over every token instead of every layer once per token.
     pub fn prefill_into(&self, tokens: &[u32], state: &mut DecodeState) -> Result<Tensor> {
+        self.prefill_into_grid(tokens, state, &[])
+            .map(|(logits, _)| logits)
+    }
+
+    /// `prefill_into`, also keeping every layer's window at each token count of `grid` below the
+    /// prompt's length: `windows[k][layer]` is the window section of `grid[k]` (see
+    /// `snapshot::window_section`). The windows exist only while the pass runs, so this is the one
+    /// place a mid-prompt state can be had.
+    pub fn prefill_into_grid(
+        &self,
+        tokens: &[u32],
+        state: &mut DecodeState,
+        grid: &[usize],
+    ) -> Result<(Tensor, Vec<Vec<Vec<u8>>>)> {
         if state.pos != 0 || tokens.is_empty() {
             return Err(Error::msg(format!(
                 "prefill_into: {} tokens into a state at position {}; a batched prefill starts a sequence",
                 tokens.len(),
                 state.pos
             )));
+        }
+        let grid: Vec<usize> = grid.iter().copied().filter(|&p| p < tokens.len()).collect();
+        for layer in &mut state.layers {
+            layer.grid = grid.clone();
+            layer.at_grid.clear();
         }
         let mut prefill = self.prefill_begin(tokens)?;
         for (i, block) in self.blocks.iter().enumerate() {
@@ -552,7 +571,33 @@ impl DeepseekV41Model {
         let last = prefill.x.narrow(1, s - 1, 1)?.contiguous()?;
         let h = hc_pre(&last, &prefill.pre_mix[s - 1..])?;
         let h = rms_norm(&h, &self.norm, self.rms_eps)?;
-        self.output.apply(&h.reshape((1, self.dim))?)
+        let logits = self.output.apply(&h.reshape((1, self.dim))?)?;
+        let empty = super::snapshot::window_section(&Default::default());
+        let windows = (0..grid.len())
+            .map(|k| {
+                state
+                    .layers
+                    .iter()
+                    .map(|l| l.at_grid.get(k).cloned().unwrap_or_else(|| empty.clone()))
+                    .collect()
+            })
+            .collect();
+        for layer in &mut state.layers {
+            layer.grid.clear();
+            layer.at_grid.clear();
+        }
+        Ok((logits, windows))
+    }
+
+    /// The engram ids a decode holds after `tokens`: the last `max_ngram` of them, compressed.
+    pub fn engram_after(&self, tokens: &[u32]) -> EngramState {
+        let mut st = EngramState::default();
+        if let Some(cfg) = &self.engram_cfg {
+            for &t in &tokens[tokens.len().saturating_sub(cfg.max_ngram)..] {
+                st.push(cfg, t);
+            }
+        }
+        st
     }
 
     /// Layer `i` of several prefills at once: engram and attention prefill by prefill, then the FFN
@@ -1533,7 +1578,8 @@ impl DeepseekV41Model {
     /// path only by floating-point rounding, so the per-position argmax matches what decoding one
     /// token at a time from the same state would give, and the caches are left in the same place.
     pub fn forward_verify_batch(&self, tokens: &[u32], state: &mut DecodeState) -> Result<Tensor> {
-        self.forward_block(tokens, state, false)
+        self.forward_block(tokens, state, false, &[])
+            .map(|(logits, _)| logits)
     }
 
     /// Continue a sequence whose state stands at `state.pos` over `tokens`, returning the
@@ -1542,7 +1588,19 @@ impl DeepseekV41Model {
     /// layer's experts read once for all of it - and only the last position goes through the
     /// head, so no `[tokens, vocab]` matrix is built.
     pub fn prefill_continue(&self, tokens: &[u32], state: &mut DecodeState) -> Result<Tensor> {
-        self.forward_block(tokens, state, true)
+        self.prefill_continue_grid(tokens, state, &[])
+            .map(|(logits, _)| logits)
+    }
+
+    /// `prefill_continue`, also keeping every layer's window at each token count of `grid` that
+    /// falls strictly inside the block: `windows[k][layer]` for `grid[k]`, as `prefill_into_grid`.
+    pub fn prefill_continue_grid(
+        &self,
+        tokens: &[u32],
+        state: &mut DecodeState,
+        grid: &[usize],
+    ) -> Result<(Tensor, Vec<Vec<Vec<u8>>>)> {
+        self.forward_block(tokens, state, true, grid)
     }
 
     /// The block pass behind `forward_verify_batch` and `prefill_continue`: the logits of every
@@ -1552,10 +1610,18 @@ impl DeepseekV41Model {
         tokens: &[u32],
         state: &mut DecodeState,
         last_only: bool,
-    ) -> Result<Tensor> {
+        grid: &[usize],
+    ) -> Result<(Tensor, Vec<Vec<Vec<u8>>>)> {
         if tokens.is_empty() {
             return Err(Error::msg("forward_block: no tokens"));
         }
+        let grid: Vec<usize> = grid
+            .iter()
+            .copied()
+            .filter(|&p| p > state.pos && p < state.pos + tokens.len())
+            .collect();
+        let empty = super::snapshot::window_section(&Default::default());
+        let mut windows: Vec<Vec<Vec<u8>>> = vec![vec![empty; self.blocks.len()]; grid.len()];
         let (dim, hc) = (self.dim, self.hc_mult);
         let pos = state.pos;
         let k = tokens.len();
@@ -1635,6 +1701,9 @@ impl DeepseekV41Model {
                     &mut state.layers[i],
                     &mut shareds[j],
                 )?;
+                if let Some(k) = grid.iter().position(|&p| p == pos + j + 1) {
+                    windows[k][i] = super::snapshot::window_section(&state.layers[i].win);
+                }
                 attn_rows.push(xj_attn);
                 am_pre.push(ampre_j.into_iter().next().unwrap_or_else(|| {
                     let mut v = vec![0f32; hc];
@@ -1663,7 +1732,7 @@ impl DeepseekV41Model {
         let h = rms_norm(&h, &self.norm, self.rms_eps)?;
         let logits = self.output.apply(&h.reshape((rows, dim))?)?;
         state.pos += k;
-        Ok(logits)
+        Ok((logits, windows))
     }
 
     /// Decode one token for each of several independent sequences at once, returning the
@@ -2755,6 +2824,159 @@ mod oracle_gate {
             }
             assert_eq!(block_count(&live, &layout), 6);
         }
+    }
+
+    /// The states a prefill passes on the way, kept at block boundaries, are states of their own
+    /// prefixes: restored from a manifest of the window at that point and the blocks of the final
+    /// state, the remainder prefilled onto them gives the logits a cold prefill of the whole prompt
+    /// gives, to rounding and with the same token, and the logits of a prefix prefilled alone. The
+    /// pass need not be cut anywhere for this: the windows are taken as it goes. The same holds for
+    /// a prompt continued from a restored state, whose boundaries lie inside the continued block.
+    #[test]
+    fn grid_states_taken_during_a_prefill_restore_like_prefixes_of_their_own() {
+        use super::super::snapshot::{
+            decode_split, encode_block, encode_grid_manifest, identity, BlockLayout, GridPoint,
+        };
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+            (num / b.iter().map(|y| y * y).sum::<f32>()).sqrt()
+        };
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        let id = identity(&[b"synthetic"]);
+        let layouts: [(&[u32], &[u32], &[u32]); 2] =
+            [(&[0, 2, 0], &[1], &[1]), (&[0, 2, 2, 0], &[1], &[1, 3])];
+        for (ratios, kv_src, index_src) in layouts {
+            let (model, _) = synthetic(ratios, kv_src, index_src, 0);
+            let tokens: Vec<u32> = (0..80)
+                .map(|i| (i * 7 + 3) % super::tests::VOCAB as u32)
+                .collect();
+            let layout = BlockLayout {
+                ratios: model.compress_ratios(),
+                block_tokens: 8,
+            };
+            let grid: Vec<usize> = (1..10).map(|k| k * 8).collect();
+            // One pass from nothing, and one continued from a restored prefix of 20 tokens.
+            let mut cold_state = model.new_decode_state();
+            let (cold, windows) = model
+                .prefill_into_grid(&tokens, &mut cold_state, &grid)
+                .unwrap();
+            let cold = vecf_of(&cold);
+            assert_eq!(windows.len(), grid.len());
+            let mut head = model.new_decode_state();
+            model.prefill_into(&tokens[..20], &mut head).unwrap();
+            let (_, cont_windows) = model
+                .prefill_continue_grid(&tokens[20..], &mut head, &grid)
+                .unwrap();
+            let sources = [
+                ("prefill", &cold_state, grid.clone(), windows),
+                (
+                    "continued",
+                    &head,
+                    grid.iter().copied().filter(|&p| p > 20).collect(),
+                    cont_windows,
+                ),
+            ];
+            for (what, last, points, windows) in sources {
+                assert_eq!(windows.len(), points.len(), "{ratios:?} {what}");
+                for (p, win) in points.iter().copied().zip(&windows) {
+                    let point = GridPoint {
+                        pos: p,
+                        windows: win,
+                        engram: model.engram_after(&tokens[..p]),
+                    };
+                    let (manifest, nb) =
+                        encode_grid_manifest(last, &point, &id, &layout).expect("boundary state");
+                    assert_eq!(nb, p / 8);
+                    let blocks: Vec<Vec<u8>> =
+                        (0..nb).map(|b| encode_block(last, b, &layout)).collect();
+                    let mut restored = decode_split(&manifest, &blocks, &id, model.n_layers())
+                        .unwrap()
+                        .state;
+                    assert_eq!(restored.pos, p);
+                    let got =
+                        vecf_of(&model.prefill_continue(&tokens[p..], &mut restored).unwrap());
+                    assert!(
+                        rel(&got, &cold) < 1e-4,
+                        "{ratios:?} {what} at {p}: rel {}",
+                        rel(&got, &cold)
+                    );
+                    assert_eq!(argmax(&got), argmax(&cold), "{ratios:?} {what} at {p}");
+                    // A prefix prefilled alone, the state's own twin, continued the same way.
+                    let mut twin = model.new_decode_state();
+                    model.prefill_into(&tokens[..p], &mut twin).unwrap();
+                    let want = vecf_of(&model.prefill_continue(&tokens[p..], &mut twin).unwrap());
+                    assert!(
+                        rel(&got, &want) < 1e-4,
+                        "{ratios:?} {what} at {p}: twin rel {}",
+                        rel(&got, &want)
+                    );
+                    assert_eq!(argmax(&got), argmax(&want));
+                    // And what follows decodes the same from the restored state as from its twin.
+                    let a = vecf_of(&model.forward_decode(5, &mut restored).unwrap());
+                    let b = vecf_of(&model.forward_decode(5, &mut twin).unwrap());
+                    assert!(
+                        rel(&a, &b) < 1e-3,
+                        "{ratios:?} {what} at {p}: decode rel {}",
+                        rel(&a, &b)
+                    );
+                }
+            }
+            // A point that is not on a block boundary is not a state this can write.
+            let point = GridPoint {
+                pos: 12,
+                windows: &vec![Vec::new(); model.n_layers()],
+                engram: model.engram_after(&tokens[..12]),
+            };
+            assert!(encode_grid_manifest(&cold_state, &point, &id, &layout).is_none());
+        }
+    }
+
+    /// Two prompts that share a prefix ending inside a block: the second restores at the last grid
+    /// point at or below the shared length and answers as a cold prefill would.
+    #[test]
+    fn a_prompt_sharing_a_prefix_mid_block_restores_at_the_grid_point_below() {
+        use crate::inference::engine::model_backend::DeepseekV41Backend;
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+            (num / b.iter().map(|y| y * y).sum::<f32>()).sqrt()
+        };
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        let first: Vec<u32> = (0..40)
+            .map(|i| (i * 7 + 3) % super::tests::VOCAB as u32)
+            .collect();
+        // The same for 27 tokens, then its own tail: shared prefix ends mid-block (blocks of 8).
+        let mut second = first[..27].to_vec();
+        second.extend((0..18).map(|i| (i * 5 + 11) % super::tests::VOCAB as u32));
+        let dir = scratch_dir("midblock");
+        let (mut a, store) = cached_backend(&dir);
+        let _ = prompt_logits(&mut a, &first);
+        wait_for_len(&store, 40);
+        assert_eq!(store.lengths(), vec![8, 16, 24, 32, 40]);
+
+        let (mut b, store_b) = cached_backend(&dir);
+        let warm = prompt_logits(&mut b, &second);
+        assert_eq!(b.last_restored(), 24);
+        let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
+        let mut plain = DeepseekV41Backend::new(model, 0, 128);
+        let cold = prompt_logits(&mut plain, &second);
+        assert!(rel(&warm, &cold) < 1e-4, "rel {}", rel(&warm, &cold));
+        assert_eq!(argmax(&warm), argmax(&cold));
+        // It wrote its own grid on the way: 32 and 40 are the new tail's, 24 was its prefix.
+        wait_for_len(&store_b, 45);
+        assert!(store_b.lengths().contains(&40));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A state built by decoding, as a turn's end leaves it, round trips as well, and a restored
@@ -4075,9 +4297,9 @@ mod oracle_gate {
         vecf_of(&backend.forward(&x, 0).unwrap())
     }
 
-    fn wait_for_states(store: &crate::inference::cache::state_disk::StateStore, n: usize) {
+    fn wait_for_len(store: &crate::inference::cache::state_disk::StateStore, len: usize) {
         let start = std::time::Instant::now();
-        while store.stats().0 < n {
+        while !store.lengths().contains(&len) {
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(20),
                 "the state was not written"
@@ -4117,7 +4339,9 @@ mod oracle_gate {
         let dir = scratch_dir("restore");
         let (mut first, store) = cached_backend(&dir);
         let cold_24 = prompt_logits(&mut first, &tokens[..24]);
-        wait_for_states(&store, 1);
+        wait_for_len(&store, 24);
+        // The grid of the prefill, blocks of 8: the states at 8 and 16 on the way to 24.
+        assert_eq!(store.lengths(), vec![8, 16, 24]);
 
         // A longer prompt on a fresh backend over the same directory restores the 24 and prefills 24.
         let (mut second, store2) = cached_backend(&dir);
@@ -4131,7 +4355,8 @@ mod oracle_gate {
             rel(&warm_48, &cold_48)
         );
         assert_eq!(argmax(&warm_48), argmax(&cold_48));
-        wait_for_states(&store2, 2);
+        wait_for_len(&store2, 48);
+        assert_eq!(second.last_restored(), 24);
 
         // The prompt seen whole comes back with the logits it was stored with, to the bit.
         let (mut third, _) = cached_backend(&dir);
@@ -4150,11 +4375,12 @@ mod oracle_gate {
         let mut turn = tokens.clone();
         turn.push(5);
         second.snapshot_kv(turn.clone(), turn.len()).unwrap();
-        wait_for_states(&store2, 3);
+        wait_for_len(&store2, 49);
         // A position the state does not stand at is not stored.
+        let held = store2.lengths();
         second.snapshot_kv(turn.clone(), turn.len() - 1).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
-        assert_eq!(store2.stats().0, 3);
+        assert_eq!(store2.lengths(), held);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4170,7 +4396,7 @@ mod oracle_gate {
         let dir = scratch_dir("damaged");
         let (mut first, store) = cached_backend(&dir);
         let _ = prompt_logits(&mut first, &tokens[..24]);
-        wait_for_states(&store, 1);
+        wait_for_len(&store, 24);
 
         let files = |d: &std::path::Path, ext: &str| -> Vec<std::path::PathBuf> {
             std::fs::read_dir(d)
@@ -4179,11 +4405,19 @@ mod oracle_gate {
                 .filter(|p| p.extension().is_some_and(|x| x == ext))
                 .collect()
         };
-        let manifests = files(&dir, "snap");
+        let mut manifests = files(&dir, "snap");
+        manifests.sort();
         let blocks = files(&dir.join("blocks"), "blk");
-        assert_eq!(manifests.len(), 1);
+        // The states at 8, 16 and 24 tokens, and the three blocks they share.
+        assert_eq!(manifests.len(), 3);
         assert_eq!(blocks.len(), 3);
-        let good_manifest = std::fs::read(&manifests[0]).unwrap();
+        let all_manifests: Vec<Vec<u8>> = manifests
+            .iter()
+            .map(|m| std::fs::read(m).unwrap())
+            .collect();
+        // The 24-token state is the longest and the first a 40-token prompt tries.
+        let longest = manifests.len() - 1;
+        let good_manifest = all_manifests[longest].clone();
         let good_blocks: Vec<Vec<u8>> = blocks.iter().map(|b| std::fs::read(b).unwrap()).collect();
         let good_block = good_blocks[0].clone();
         // No run of six consecutive prompt ids, as written, in any file of the directory.
@@ -4237,12 +4471,14 @@ mod oracle_gate {
         for (name, bad) in manifest_cases.into_iter().chain(block_cases) {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join("blocks")).unwrap();
-            std::fs::write(&manifests[0], &good_manifest).unwrap();
+            for (m, bytes) in manifests.iter().zip(&all_manifests) {
+                std::fs::write(m, bytes).unwrap();
+            }
             for (b, bytes) in blocks.iter().zip(&good_blocks) {
                 std::fs::write(b, bytes).unwrap();
             }
             let target = if name.starts_with("manifest") {
-                &manifests[0]
+                &manifests[longest]
             } else {
                 &blocks[0]
             };
@@ -4253,7 +4489,7 @@ mod oracle_gate {
             let got = prompt_logits(&mut backend, &tokens);
             close(&got, name);
             // The prompt just prefilled is stored; the damaged file is not served again.
-            wait_for_states(&store, 1);
+            wait_for_len(&store, 40);
             assert!(
                 !std::fs::read(target).is_ok_and(|b| b == bad),
                 "{name}: kept"

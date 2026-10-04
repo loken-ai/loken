@@ -293,6 +293,75 @@ pub fn encode_block(state: &DecodeState, b: usize, layout: &BlockLayout) -> Vec<
     w.0
 }
 
+/// A layer's window as the manifest writes it: row count, row length, then the rows packed when
+/// they are on the e4m3 grid and as f32 otherwise.
+pub fn window_section(win: &VecDeque<Vec<f32>>) -> Vec<u8> {
+    let mut w = Writer(Vec::new());
+    let row_len = win.front().map_or(0, Vec::len);
+    w.u64(win.len() as u64);
+    w.u64(row_len as u64);
+    let flat: Vec<f32> = win.iter().flatten().copied().collect();
+    if flat.len() == win.len() * row_len {
+        w.0.push(1);
+        w.rows(Kind::Fp8, &flat);
+    } else {
+        w.0.push(0);
+        for row in win {
+            w.f32s(row);
+        }
+    }
+    w.0
+}
+
+/// A position inside a prefill that is a block boundary: its windows (one section per layer)
+/// and the engram ids a decode would hold there.
+pub struct GridPoint<'a> {
+    pub pos: usize,
+    pub windows: &'a [Vec<u8>],
+    pub engram: EngramState,
+}
+
+/// The manifest of the state a prefill passed at `point`, built from the state it ended in:
+/// the first `point.pos / block_tokens` blocks of the final state are that state's blocks, and at
+/// a block boundary nothing is left over - no tail rows, no filling group - but the window and
+/// the engram ids. `None` when the final state cannot be cut at that boundary, or the point is
+/// not on one.
+pub fn encode_grid_manifest(
+    last: &DecodeState,
+    point: &GridPoint,
+    identity: &Identity,
+    layout: &BlockLayout,
+) -> Option<(Vec<u8>, usize)> {
+    let shape = block_shape(last, layout)?;
+    let nblocks = point.pos / layout.block_tokens;
+    if !point.pos.is_multiple_of(layout.block_tokens)
+        || nblocks == 0
+        || block_count(last, layout) < nblocks
+        || point.windows.len() != last.layers.len()
+    {
+        return None;
+    }
+    let mut w = Writer(Vec::new());
+    w.0.extend_from_slice(MAGIC);
+    w.u32(FORMAT_VERSION);
+    w.0.extend_from_slice(identity);
+    w.u64(point.pos as u64);
+    w.u64(nblocks as u64);
+    w.u32(last.layers.len() as u32);
+    for ((window, &(g, _, _)), &ratio) in point.windows.iter().zip(&shape).zip(layout.ratios) {
+        w.u64(if g > 0 { (point.pos / ratio) as u64 } else { 0 });
+        w.0.extend_from_slice(window);
+        w.rows(Kind::Fp4Block16, &[]);
+        w.rows(Kind::Fp4Pow2Block32, &[]);
+        w.u64(0);
+    }
+    w.u32s(&point.engram.recent());
+    w.u32(0);
+    let sum: [u8; DIGEST_LEN] = Sha256::digest(&w.0).into();
+    w.0.extend_from_slice(&sum);
+    Some((w.0, nblocks))
+}
+
 /// `state` and optionally the logits of its last position as one self-contained snapshot under
 /// `identity`. The DSpark capture (`capture_layers`, `captured`) is per-decode scratch and is not
 /// carried.
@@ -321,19 +390,7 @@ pub fn encode_manifest(
     w.u32(state.layers.len() as u32);
     for (layer, &(g, cl, il)) in state.layers.iter().zip(&shape) {
         w.u64(layer.n_groups as u64);
-        let row_len = layer.win.front().map_or(0, Vec::len);
-        w.u64(layer.win.len() as u64);
-        w.u64(row_len as u64);
-        let flat: Vec<f32> = layer.win.iter().flatten().copied().collect();
-        if flat.len() == layer.win.len() * row_len {
-            w.0.push(1);
-            w.rows(Kind::Fp8, &flat);
-        } else {
-            w.0.push(0);
-            for row in &layer.win {
-                w.f32s(row);
-            }
-        }
+        w.0.extend_from_slice(&window_section(&layer.win));
         w.rows(
             Kind::Fp4Block16,
             &layer.comp_kv[(nblocks * g * cl).min(layer.comp_kv.len())..],
@@ -478,6 +535,7 @@ pub fn decode_split(
             index_k,
             group_x,
             n_groups,
+            ..AttnCache::default()
         });
     }
     let engram = EngramState::from_recent(r.u32s()?);

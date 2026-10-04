@@ -24,6 +24,11 @@ pub struct AttnCache {
     pub group_x: Vec<Vec<f32>>,
     /// Completed compressed groups so far.
     pub n_groups: usize,
+    /// Prefill scratch, input: the token counts at which this layer's window is to be kept.
+    pub grid: Vec<usize>,
+    /// Prefill scratch, output: the window at each of `grid` that the prefill passed, as the
+    /// snapshot format's window section (see `snapshot::window_section`).
+    pub at_grid: Vec<Vec<u8>>,
 }
 
 /// The whole model's decode state: one cache per layer, the recent ids the engram hash reads,

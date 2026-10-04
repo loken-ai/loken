@@ -847,6 +847,8 @@ pub(crate) struct DeepseekV41Backend {
     /// The on-disk cache of decode states this backend restores a prompt's prefix from and writes
     /// its finished prompts and turns to. `None` leaves every prompt a cold prefill.
     state_cache: Option<StateCache>,
+    /// Prompt tokens the last prompt took from the cache instead of prefilling.
+    restored: usize,
 }
 
 /// A decode-state store and the identity every state in it is written and read under.
@@ -913,7 +915,13 @@ impl DeepseekV41Backend {
             dspark_state,
             pipeline: None,
             state_cache: None,
+            restored: 0,
         }
+    }
+
+    /// Prompt tokens the last prompt took from the decode-state cache.
+    pub(crate) fn last_restored(&self) -> usize {
+        self.restored
     }
 
     /// Restore prompt prefixes from, and write finished prompts and turns to, `store`, under
@@ -998,7 +1006,12 @@ impl DeepseekV41Backend {
     /// position when it was just prefilled. Encoding and writing run on their own thread over a
     /// copy, so the request is not held for them. A state shorter than one block of the store's
     /// hash chain is not worth a file.
-    fn save_state(&self, tokens: &[u32], logits: Option<Vec<f32>>) {
+    fn save_state(
+        &self,
+        tokens: &[u32],
+        logits: Option<Vec<f32>>,
+        grid: Vec<(usize, Vec<Vec<u8>>)>,
+    ) {
         let Some(cache) = &self.state_cache else {
             return;
         };
@@ -1011,17 +1024,47 @@ impl DeepseekV41Backend {
         let (store, identity) = (cache.store.clone(), cache.identity);
         let (state, tokens) = (self.state.clone(), tokens.to_vec());
         let ratios = self.model.compress_ratios().to_vec();
+        let grid: Vec<_> = grid
+            .into_iter()
+            .map(|(p, w)| (p, w, self.model.engram_after(&tokens[..p])))
+            .collect();
         std::thread::spawn(move || {
             use crate::inference::model::deepseek_v41::snapshot::{
-                encode_block, encode_manifest, BlockLayout,
+                encode_block, encode_grid_manifest, encode_manifest, BlockLayout, GridPoint,
             };
             let layout = BlockLayout {
                 ratios: &ratios,
                 block_tokens: store.block_tokens(),
             };
+            // The states the prefill passed on the way, at block boundaries, so any prompt that
+            // shares a prefix with this one restores at the last of them it shares.
+            let keys = store.keys(&identity, &tokens);
+            let mut kept = 0;
+            for (p, windows, engram) in grid {
+                let point = GridPoint {
+                    pos: p,
+                    windows: &windows,
+                    engram,
+                };
+                let Some((manifest, nb)) = encode_grid_manifest(&state, &point, &identity, &layout)
+                else {
+                    tracing::info!(
+                        "state cache: no state kept at token {p}: the final state cannot be cut at that block boundary"
+                    );
+                    continue;
+                };
+                match store.put(&keys, p, &manifest, nb, |b| {
+                    encode_block(&state, b, &layout)
+                }) {
+                    Ok(()) => kept += 1,
+                    Err(e) => tracing::warn!("state cache: not stored at {p}: {e}"),
+                }
+            }
+            if kept > 0 {
+                tracing::info!("state cache: kept {kept} states on the block grid");
+            }
             let (manifest, nblocks) =
                 encode_manifest(&state, logits.as_deref(), &identity, Some(&layout));
-            let keys = store.keys(&identity, &tokens);
             let put = store.put(&keys, tokens.len(), &manifest, nblocks, |b| {
                 encode_block(&state, b, &layout)
             });
@@ -1038,7 +1081,7 @@ impl DeepseekV41Backend {
 
     /// The rest of a prompt after a restored prefix, its heavy steps on the cards when there are
     /// any: the logits after its last token.
-    fn prefill_rest(&mut self, ids: &[u32]) -> crate::tensor::Result<Tensor> {
+    fn prefill_rest(&mut self, ids: &[u32], grid: &[usize]) -> crate::tensor::Result<Grid> {
         let Self {
             model,
             state,
@@ -1049,10 +1092,10 @@ impl DeepseekV41Backend {
             Some(s) => {
                 model.offload_experts(Some(s.lanes.clone()));
                 crate::inference::offload::with_offload(s.offload.clone(), || {
-                    model.prefill_continue(ids, state)
+                    model.prefill_continue_grid(ids, state, grid)
                 })
             }
-            None => model.prefill_continue(ids, state),
+            None => model.prefill_continue_grid(ids, state, grid),
         }
     }
 
@@ -1127,7 +1170,7 @@ impl DeepseekV41Backend {
     }
 
     /// The whole prompt in one prefill, its heavy steps on the cards when there are any.
-    fn prefill(&mut self, ids: &[u32]) -> crate::tensor::Result<Tensor> {
+    fn prefill(&mut self, ids: &[u32], grid: &[usize]) -> crate::tensor::Result<Grid> {
         let Self {
             model,
             state,
@@ -1141,13 +1184,33 @@ impl DeepseekV41Backend {
                 // decode reads the same experts the prompt just routed to.
                 model.offload_experts(Some(s.lanes.clone()));
                 crate::inference::offload::with_offload(s.offload.clone(), || {
-                    model.prefill_into(ids, state)
+                    model.prefill_into_grid(ids, state, grid)
                 })
             }
-            None => model.prefill_into(ids, state),
+            None => model.prefill_into_grid(ids, state, grid),
         }
     }
+
+    /// The token counts inside `(from, to)` at which a state is worth keeping: every multiple of
+    /// the store's block size, none when there is no cache or the pipeline holds half the state.
+    fn grid_points(&self, from: usize, to: usize) -> Vec<usize> {
+        let Some(cache) = &self.state_cache else {
+            return Vec::new();
+        };
+        if self.pipeline.is_some() {
+            return Vec::new();
+        }
+        let b = cache.store.block_tokens();
+        (from / b + 1..)
+            .map(|k| k * b)
+            .take_while(|&p| p < to)
+            .collect()
+    }
 }
+
+/// The logits after a prefill and the windows it kept at the token counts it was asked for, one
+/// section per layer for each.
+type Grid = (Tensor, Vec<Vec<Vec<u8>>>);
 
 /// TpQwen2: tensor-parallel (TP=2) decoder across 2 GPUs. Both cards run EVERY layer -
 /// column/row-parallel weights joined by an all-reduce - against the pipeline's one card
@@ -1836,7 +1899,9 @@ impl ModelBackend for DeepseekV41Backend {
                 let n = v.len();
                 Tensor::from_vec(v, (1, n), &Device::Cpu)
             };
+            self.restored = 0;
             if let Some((covered, logits)) = self.restore_prefix(&ids) {
+                self.restored = covered;
                 tracing::info!(
                     "state cache: restored {covered} of {} prompt tokens",
                     ids.len()
@@ -1846,16 +1911,18 @@ impl ModelBackend for DeepseekV41Backend {
                         return vocab_logits(l);
                     }
                 } else {
-                    let out = self.prefill_rest(&ids[covered..])?;
+                    let grid = self.grid_points(covered, ids.len());
+                    let (out, windows) = self.prefill_rest(&ids[covered..], &grid)?;
                     let flat = out.flatten_all()?.to_vec1::<f32>()?;
-                    self.save_state(&ids, Some(flat));
+                    self.save_state(&ids, Some(flat), grid.into_iter().zip(windows).collect());
                     return Ok(out);
                 }
             }
-            let out = self.prefill(&ids)?;
+            let grid = self.grid_points(0, ids.len());
+            let (out, windows) = self.prefill(&ids, &grid)?;
             if self.state_cache.is_some() {
                 let flat = out.flatten_all()?.to_vec1::<f32>()?;
-                self.save_state(&ids, Some(flat));
+                self.save_state(&ids, Some(flat), grid.into_iter().zip(windows).collect());
             }
             return Ok(out);
         }
@@ -2045,7 +2112,7 @@ impl ModelBackend for DeepseekV41Backend {
     /// A finished turn, prompt and reply: the state it left stands after the tokens it fed.
     fn snapshot_kv(&mut self, tokens: Vec<u32>, kv_len: usize) -> crate::tensor::Result<()> {
         if kv_len == self.state.pos && kv_len <= tokens.len() {
-            self.save_state(&tokens[..kv_len], None);
+            self.save_state(&tokens[..kv_len], None, Vec::new());
         }
         Ok(())
     }

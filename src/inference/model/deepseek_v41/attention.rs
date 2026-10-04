@@ -242,6 +242,14 @@ pub(super) fn fill_window(
     }
     let (_, s, hd) = kv.dims3()?;
     let rows = kv.flatten_all()?.to_vec1::<f32>()?;
+    // The window a decode would hold at each requested earlier count of tokens.
+    for &p in cache.grid.clone().iter().filter(|&&p| p > 0 && p <= s) {
+        let from = p.saturating_sub(window);
+        let at: std::collections::VecDeque<Vec<f32>> = (from..p)
+            .map(|t| rows[t * hd..(t + 1) * hd].to_vec())
+            .collect();
+        cache.at_grid.push(super::snapshot::window_section(&at));
+    }
     for t in s.saturating_sub(window)..s {
         push_window(cache, &rows[t * hd..(t + 1) * hd], window);
     }

@@ -651,6 +651,13 @@ impl StateStore {
         )
     }
 
+    /// The token counts of the snapshots held, ascending.
+    pub fn lengths(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.lock().entries.values().map(|e| e.len).collect();
+        v.sort_unstable();
+        v
+    }
+
     /// Blocks on disk, for tests and status.
     pub fn block_count(&self) -> usize {
         self.lock().block_bytes.len()
