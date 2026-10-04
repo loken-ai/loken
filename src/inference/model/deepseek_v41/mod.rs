@@ -50,7 +50,8 @@ const HYPER_CONNECTION_MARKER: &str = "layers.0.hc_attn_fn";
 
 /// Whether a GGUF file is this model: block 0 carries the hyper-connection mix under one of its
 /// GGUF spellings, or the metadata counts hyper-connections, whatever architecture tag the
-/// converter wrote.
+/// converter wrote. A file whose mixers carry a low-rank gate (`hyper_connection.low_rank`) is a
+/// different wide residual, which the generic route serves.
 pub fn claims_gguf(content: &gguf_file::Content) -> bool {
     let tensor = source::gguf_names(HYPER_CONNECTION_MARKER)
         .iter()
@@ -59,12 +60,17 @@ pub fn claims_gguf(content: &gguf_file::Content) -> bool {
         .metadata
         .get("general.architecture")
         .and_then(|v| v.to_string().ok());
-    let counted = arch.is_some_and(|a| {
+    let counted = arch.as_ref().is_some_and(|a| {
         ["hyper_connection.count", "hyper_connection_mult"]
             .iter()
             .any(|k| content.metadata.contains_key(&format!("{a}.{k}")))
     });
-    tensor || counted
+    let low_rank = arch.as_ref().is_some_and(|a| {
+        content
+            .metadata
+            .contains_key(&format!("{a}.hyper_connection.low_rank"))
+    });
+    tensor || (counted && !low_rank)
 }
 
 /// Whether a checkpoint directory holds this model's released weights: its shard index, or a

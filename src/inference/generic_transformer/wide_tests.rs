@@ -285,3 +285,13 @@ fn the_selected_attention_matches_the_reference_block() {
         "the block cannot tell a selection from dense attention"
     );
 }
+
+#[test]
+fn a_low_rank_wide_residual_is_not_the_deepseek_port() {
+    let file = std::fs::File::open(dir().join("toy.gguf")).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+    let content = gguf_file::Content::read(&mut std::io::Cursor::new(&mmap[..])).unwrap();
+    assert!(!crate::inference::model::deepseek_v41::claims_gguf(
+        &content
+    ));
+}
