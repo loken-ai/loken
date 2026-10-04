@@ -83,6 +83,18 @@ pub struct StateStore {
     tmp_seq: AtomicU64,
 }
 
+/// The identity of a model's numerics from the parts that define them, in order: a part that
+/// changes (a file digest, a numerics setting, the operator's salt) gives another identity.
+pub fn identity(parts: &[&[u8]]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"loken state identity");
+    for p in parts {
+        h.update((p.len() as u64).to_le_bytes());
+        h.update(p);
+    }
+    h.finalize().into()
+}
+
 /// The hashes of a token sequence under one scope: a chain over its full blocks, from which the
 /// key at any length up to its own is read.
 pub struct PrefixKeys<'a> {
@@ -443,6 +455,18 @@ impl StateStore {
         for b in freed {
             let _ = std::fs::remove_file(self.block_path(&b));
         }
+    }
+
+    /// The first of the first `nblocks` blocks of the sequence `keys` hashes that is not on disk,
+    /// `nblocks` when all are. A caller that needs only the missing blocks' bytes starts there.
+    pub fn first_missing_block(&self, keys: &PrefixKeys, nblocks: usize) -> usize {
+        let g = self.lock();
+        (0..nblocks)
+            .find(|&b| {
+                keys.block_hash(b)
+                    .is_none_or(|h| !g.block_bytes.contains_key(&h))
+            })
+            .unwrap_or(nblocks)
     }
 
     /// Store the state after the first `len` tokens of the sequence `keys` hashes: `manifest` is
