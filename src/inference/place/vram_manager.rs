@@ -951,11 +951,20 @@ pub fn reclaim_host_ram(needed_bytes: u64) -> u64 {
 mod concurrent_admission_tests {
     use super::*;
 
+    /// The tests that touch the process-wide demand ledger take turns: the harness runs a
+    /// module's tests in parallel threads, and one test's lease is another's baseline.
+    static LEDGER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn taking_turns() -> std::sync::MutexGuard<'static, ()> {
+        LEDGER.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The whole point of the ledger: a subsystem must not plan AROUND its own demand.
     /// Subtracting it from itself is not conservative, it spills the very work that
     /// declared it onto the host.
     #[test]
     fn a_declared_demand_is_invisible_to_its_own_owner() {
+        let _turn = taking_turns();
         let _lease = declare_demand("media-test-owner", 4 << 30);
         assert_eq!(pending_demand_excluding("media-test-owner"), 0);
         assert_eq!(pending_demand_excluding("llm-test-owner"), 4 << 30);
@@ -965,6 +974,7 @@ mod concurrent_admission_tests {
     /// full - which is what any ledger keyed on anything but a guard would do.
     #[test]
     fn a_demand_disappears_with_its_lease() {
+        let _turn = taking_turns();
         let before = pending_demand_excluding("someone-else");
         {
             let _lease = declare_demand("transient-owner", 1 << 30);
