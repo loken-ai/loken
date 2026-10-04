@@ -416,9 +416,8 @@ pub struct GenericHeteroTransformer {
     /// Causal masks by (query and key lengths, card or host, window).
     mask_cache: HashMap<(usize, Option<usize>, Option<usize>), Tensor>,
     // PLE globals (Gemma4) - all CPU
-    ple_token_embd: Option<Embedding>, // small vocab or None
-    /// BF16 PLE token embedding for large-vocab models (Gemma4: stays in BF16 to save memory)
-    ple_token_embd_bf16: Option<(Tensor, usize)>, // (bf16_tensor, total_ple_dim)
+    /// The per-layer token table, in the file's format, decoded per lookup.
+    ple_token_embd: Option<Embedding>,
     ple_model_proj: Option<crate::tensor::quantized::QMatMul>, // hidden -> n_layers * ple_dim
     ple_proj_norm: Option<RmsNorm>,
     ple_dim: usize, // per-layer PLE dimension (e.g. 256)

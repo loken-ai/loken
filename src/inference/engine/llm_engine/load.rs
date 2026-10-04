@@ -80,18 +80,10 @@ impl GenericWeights<'_> {
         }
     }
 
-    /// Bytes the embedding table takes on a card, dequantised to f32; zero for a source
-    /// whose table always stays on the host.
-    pub(super) fn stem_bytes(&self, content: &gguf_file::Content) -> u64 {
-        match self {
-            GenericWeights::Gguf { .. } | GenericWeights::GgufSplit { .. } => content
-                .tensor_infos
-                .get("token_embd.weight")
-                .map_or(0, |t| {
-                    t.shape.elem_count() as u64 * std::mem::size_of::<f32>() as u64
-                }),
-            GenericWeights::Awq { .. } => 0,
-        }
+    /// Bytes the embedding table takes on a card: zero, since a table is read row by row from
+    /// the file's own blocks on the host and no source places it on a card.
+    pub(super) fn stem_bytes(&self, _content: &gguf_file::Content) -> u64 {
+        0
     }
 
     /// Each block's `(dense bytes, routed expert bytes)`, the experts being the stacked

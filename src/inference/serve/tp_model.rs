@@ -112,7 +112,7 @@ pub struct TpQwen2 {
     cfg: TpConfig,
     g0: Device,
     g1: Device,
-    embed: Tensor, // dequantized [vocab, hidden] on CPU
+    embed: crate::tensor::layer::Embedding, // the file's [vocab, hidden] blocks, decoded per lookup
     layers: Vec<TpLayer>,
     out_norm: Tensor, // on g0
     lm_head: QMatMul, // on g0
@@ -224,8 +224,12 @@ impl TpQwen2 {
                   _cur: &mut Cursor<&[u8]>,
                   name: &str|
          -> Result<QTensor> { Ok(ct.tensor_mapped(mmap_bytes, name, &cpu)?) };
-        // embeddings (dequantized on CPU, index_select per token)
-        let embed = rd(&ct, &mut cur, "token_embd.weight")?.dequantize(&cpu)?;
+        // embeddings: kept in the file's format, the rows of a prompt decoded per lookup
+        let embed = crate::tensor::layer::Embedding::from_stored(Arc::new(rd(
+            &ct,
+            &mut cur,
+            "token_embd.weight",
+        )?))?;
         // layers
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
@@ -497,7 +501,7 @@ impl TpQwen2 {
         let eps = self.cfg.eps;
         // embed -> [seq, hidden] on g0, replicate to g1
         let ids = Tensor::new(tokens, &Device::Cpu)?;
-        let emb = self.embed.index_select(&ids, 0)?; // [seq, hidden] CPU
+        let emb = self.embed.forward(&ids)?; // [seq, hidden] CPU
         let mut x0 = emb
             .to_device(&self.g0)?
             .to_dtype(crate::tensor::DType::F32)?;

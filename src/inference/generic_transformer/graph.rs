@@ -1246,19 +1246,6 @@ impl GenericHeteroTransformer {
                 t
             };
             Some((t * ple_scale)?)
-        } else if let Some((ref bf16_tensor, _)) = self.ple_token_embd_bf16 {
-            // bf16_tensor lives on CPU (large vocabxple_dimxn_layers table).
-            // Move input_ids to its device before index_select.
-            let bf16_dev = bf16_tensor.device().clone();
-            let flat = input_ids.flatten_all()?;
-            let flat = if flat.device().same_device(&bf16_dev) {
-                flat
-            } else {
-                flat.to_device(&bf16_dev)?
-            };
-            let t = bf16_tensor.index_select(&flat, 0)?;
-            let t = t.to_dtype(crate::tensor::DType::F32)?;
-            Some((t * ple_scale)?)
         } else {
             None
         };

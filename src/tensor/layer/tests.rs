@@ -65,6 +65,43 @@ mod tests {
         }
     }
 
+    /// A stored table decodes the rows it is asked for to exactly what the dense table of the
+    /// same blocks holds, and owns no bytes beyond the blocks.
+    #[test]
+    fn stored_embedding_matches_the_dense_table() {
+        use crate::tensor::quantized::{GgmlDType, QTensor};
+        let (v, d) = (9usize, 256usize);
+        let table = Tensor::from_vec_f32(data(v * d, 7), vec![v, d]).unwrap();
+        for dtype in [
+            GgmlDType::Q8_0,
+            GgmlDType::Q4K,
+            GgmlDType::Q6K,
+            GgmlDType::Q5_0,
+            GgmlDType::F16,
+        ] {
+            let qt = QTensor::quantize(&table, dtype).unwrap();
+            let dense = qt
+                .dequantize(&Device::Cpu)
+                .unwrap()
+                .to_dtype(crate::tensor::DType::F32)
+                .unwrap();
+            let emb = Embedding::from_stored(std::sync::Arc::new(qt)).unwrap();
+            assert!(emb.is_stored());
+            assert_eq!(emb.owned_bytes(), 0);
+            let ids = Tensor::from_vec_u32(vec![8, 0, 3, 3], vec![2, 2]).unwrap();
+            let got = emb.forward(&ids).unwrap();
+            assert_eq!(got.dims(), &[2, 2, d]);
+            let flat = Tensor::from_vec_u32(vec![8, 0, 3, 3], vec![4]).unwrap();
+            let want = dense.index_select(&flat, 0).unwrap();
+            assert_eq!(got.to_vec_f32(), want.to_vec_f32(), "{dtype:?}");
+            let bad = Tensor::from_vec_u32(vec![9], vec![1]).unwrap();
+            assert!(
+                emb.forward(&bad).is_err(),
+                "an id past the table is an error"
+            );
+        }
+    }
+
     /// `from_transposed(W^T)` must run the exact same forward as `new(W)`  -
     /// the host-staged big-checkpoint load path depends on it.
     #[test]

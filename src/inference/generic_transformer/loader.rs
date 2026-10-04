@@ -1931,7 +1931,7 @@ impl GenericHeteroTransformer {
         plan: &HeteroPlan,
         kv_quant: crate::inference::engine::llm_engine::KvQuant,
         max_kv_seq_len: Option<usize>,
-        stem_on_card: bool,
+        _stem_on_card: bool,
     ) -> Result<Self> {
         let arch = content
             .metadata
@@ -1962,29 +1962,22 @@ impl GenericHeteroTransformer {
         // -- 1. Load embeddings --------------------------
         // The table sits on the first layer's card when the plan made room for it there:
         // every token's lookup then stays on the card instead of crossing from the host.
-        // The embed-lookup callsites read `embeddings.embeddings().device()` and cast the
+        // The embed-lookup callsites read `embeddings.device()` and cast the
         // ids to it, so this is the only switch.
         let first_card = plan.segments.first().and_then(|seg| match seg.kind {
             DeviceKind::Cuda(idx) => cuda_devices.get(&idx).cloned(),
             _ => None,
         });
         let emb_qt = source.read("token_embd.weight", &Device::Cpu)?;
-        let emb_table_bytes = (config.vocab_size as u64) * (config.embedding_length as u64) * 4; // F32 after dequantize
-        let emb_device = match (&first_card, stem_on_card) {
-            (Some(card), true) => card.clone(),
-            _ => Device::Cpu,
-        };
-        // The residual stream runs in F32; a table stored as a float of another width
-        // comes out of `dequantize` in that width.
-        let emb_tensor = emb_qt.dequantize(&emb_device)?;
-        let emb_tensor = if emb_tensor.dtype() == DType::F32 {
-            emb_tensor
-        } else {
-            emb_tensor.to_dtype(DType::F32)?
-        };
-        let embeddings = Embedding::new(emb_tensor);
+        // The table stays in the file's format and each lookup decodes the rows it needs:
+        // resident cost is the mapping, and the residual stream is still F32.
+        let emb_table_bytes = emb_qt.shape().elem_count() as u64
+            * emb_qt.dtype().type_size() as u64
+            / emb_qt.dtype().block_size() as u64;
+        let emb_device = Device::Cpu;
+        let embeddings = Embedding::from_stored(Arc::new(emb_qt))?;
         info!(
-            "✅ Loaded embeddings: vocab={}, dim={} ({} MB on {:?})",
+            "✅ Loaded embeddings: vocab={}, dim={} ({} MB stored, decoded per lookup on {:?})",
             config.vocab_size,
             config.embedding_length,
             emb_table_bytes / (1024 * 1024),
@@ -2050,50 +2043,29 @@ impl GenericHeteroTransformer {
         // -- 2b. Load PLE globals (Gemma4) - optional ---------------------
         let ple_dim = meta_u32(content, &config.arch, "embedding_length_per_layer_input")
             .unwrap_or(0) as usize;
-        let ple_token_embd: Option<Embedding> = None;
-        let mut ple_token_embd_bf16: Option<(Tensor, usize)> = None;
-        let load_ple_token_embd = true;
-        if ple_dim > 0 && load_ple_token_embd {
-            let tensor_name = "per_layer_token_embd.weight";
-            if let Some(ti) = content.tensor_infos.get(tensor_name) {
-                let total_ple_dim = n_layers * ple_dim;
-                let elem_count: usize = ti.shape.dims().iter().product();
-                let _expected_q4_bytes = elem_count / 32 * 18;
-                let expected_bf16_bytes = elem_count * 2;
-                let offset = ti.offset as usize;
-                let tdo = content.tensor_data_offset as usize;
-                let _start = tdo + offset;
-
-                {
-                    // Load as BF16 tensor via facade's normal path, keep in BF16 to save RAM
-                    // (dequantize -> F32 would be 9.4GB, BF16 stays at 4.7GB)
-                    tracing::info!(
-                        "PLE: Loading per_layer_token_embd ({:.1}GB BF16)...",
-                        expected_bf16_bytes as f64 / 1e9
-                    );
-                    match source.read(tensor_name, &Device::Cpu) {
-                        Ok(qt) => {
-                            // dequantize BF16 -> gets F32 tensor, then convert back to BF16 for Embedding
-                            match qt.dequantize(&Device::Cpu) {
-                                Ok(t) => {
-                                    // Store as BF16 to halve memory
-                                    let t_bf16 =
-                                        t.to_dtype(crate::tensor::DType::BF16).unwrap_or(t);
-                                    tracing::info!(
-                                        "PLE: ✅ Token embedding {:?} {:?}",
-                                        t_bf16.shape(),
-                                        t_bf16.dtype()
-                                    );
-                                    ple_token_embd_bf16 = Some((t_bf16, total_ple_dim));
-                                }
-                                Err(e) => warn!("PLE dequantize failed (needs ~9.4GB): {e}"),
-                            }
-                        }
-                        Err(e) => warn!("PLE tensor read failed: {e}"),
+        // The per-layer token table is `vocab x (layers * ple_dim)`: the largest tensor of a
+        // model that has one. It stays in the file's format and each lookup decodes its rows.
+        let ple_token_embd: Option<Embedding> = if ple_dim > 0 {
+            match source.read_opt("per_layer_token_embd.weight", &Device::Cpu) {
+                Ok(None) => None,
+                Ok(Some(qt)) => match Embedding::from_stored(Arc::new(qt)) {
+                    Ok(e) => {
+                        tracing::info!("PLE: per-layer token table kept in the stored format");
+                        Some(e)
                     }
+                    Err(e) => {
+                        warn!("PLE token table unusable: {e}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!("PLE tensor read failed: {e}");
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
         // Load PLE projection on the first layer's card when there is one - every prefill runs
         // a [batch*seq, hidden] @ [hidden, n_layers*ple_dim] matmul through
         // `ple_model_proj.forward(hidden_2d)`. On a CPU device that becomes
@@ -2916,7 +2888,7 @@ impl GenericHeteroTransformer {
                     _ => None,
                 })
                 .collect();
-            let emb_dev = embeddings.embeddings().device();
+            let emb_dev = embeddings.device();
             for d in [output_proj_dev.as_ref(), Some(&emb_dev)]
                 .into_iter()
                 .flatten()
@@ -3025,7 +2997,6 @@ impl GenericHeteroTransformer {
             sliding_window,
             mask_cache: HashMap::new(),
             ple_token_embd,
-            ple_token_embd_bf16,
             ple_model_proj,
             ple_proj_norm,
             ple_dim,
@@ -3361,7 +3332,6 @@ impl GenericHeteroTransformer {
             sliding_window,
             mask_cache: HashMap::new(),
             ple_token_embd: None,
-            ple_token_embd_bf16: None,
             ple_model_proj: None,
             ple_proj_norm: None,
             ple_dim: 0,
