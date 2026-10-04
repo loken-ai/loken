@@ -10,6 +10,18 @@ use super::*;
 /// grow, and a longer window is admitted by the context planner, not by this reserve.
 const RESERVE_KV_WINDOW: u64 = 8192;
 
+/// Bytes a KV cache of `elems` elements occupies: a quantised cache by its block geometry
+/// (a block of values and its scale), an unquantised one at `native_bytes` per element.
+pub(crate) fn kv_cache_bytes(kv_quant: KvQuant, native_bytes: u64, elems: u64) -> u64 {
+    use crate::tensor::quantized::GgmlDType;
+    let blocks = |d: GgmlDType| elems.div_ceil(d.block_size() as u64) * d.type_size() as u64;
+    match kv_quant {
+        KvQuant::Off => elems * native_bytes,
+        KvQuant::Q8 => blocks(GgmlDType::Q8_0),
+        KvQuant::Q4 => blocks(GgmlDType::Q4_0),
+    }
+}
+
 /// The dimensions of a language model a placement is priced from, read from its GGUF header.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ModelDims {
@@ -64,11 +76,14 @@ impl ModelDims {
     /// workspace and the chunked-prefill activation peak.
     pub(crate) fn runtime_reserve(&self, context_length: usize) -> u64 {
         let kv_ctx = (context_length as u64).min(RESERVE_KV_WINDOW);
-        let kv = 2u64
-            .saturating_mul(self.num_kv_heads as u64)
-            .saturating_mul(self.head_dim as u64)
-            .saturating_mul(kv_ctx)
-            .saturating_mul(self.num_layers as u64);
+        let kv = kv_cache_bytes(
+            KvQuant::Q8,
+            0,
+            2u64.saturating_mul(self.num_kv_heads as u64)
+                .saturating_mul(self.head_dim as u64)
+                .saturating_mul(kv_ctx)
+                .saturating_mul(self.num_layers as u64),
+        );
         kv.saturating_add(self.work_reserve())
     }
 
@@ -814,11 +829,10 @@ impl LlmEngine {
                     // (x2 for K and V). Also adds a small activations
                     // headroom (~4 MB/layer) since at long ctx the
                     // intermediate score tensors aren't free either.
-                    let kv_dtype_bytes: u64 = match kv_quant {
-                        KvQuant::Off => 2,                 // F16
-                        KvQuant::Q8 => 1,                  // 1 byte/elem (Q8_0 + scale negligible)
-                        KvQuant::Q4 => 1,                  // ~0.5 byte/elem nibble + scale; round up to 1 for safety
-                    };
+                    // Bytes per element from the cache the layers will build: the block
+                    // geometry of a quantised cache, F16 for an unquantised card cache of an
+                    // architecture that keeps it so (or one with sinks), else F32.
+                    let native_kv_bytes: u64 = if quantized_kv_degrades || has_attn_sinks { 2 } else { 4 };
                     // For models with sliding-window attention (gemma3/4),
                     // most layers cap their KV at sliding_window. With a
                     // pattern like [SWA,SWA,SWA,SWA,SWA,Global,...] the
@@ -869,7 +883,7 @@ impl LlmEngine {
                         } else {
                             ctx
                         };
-                        over_attending(2u64 * num_kv_heads as u64 * head_dim as u64 * avg * kv_dtype_bytes)
+                        over_attending(kv_cache_bytes(kv_quant, native_kv_bytes, 2u64 * num_kv_heads as u64 * head_dim as u64 * avg))
                     };
                     // What the model asks of the cards; the ladder in `place` turns it into a
                     // plan, whole on one card when it fits there, and recovers from running out
@@ -1372,4 +1386,22 @@ fn advise_pages_by_placement(
         dropped as f64 / 1e9,
         kept as f64 / 1e9
     );
+}
+
+#[cfg(test)]
+mod kv_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn a_quantised_cache_is_priced_by_its_blocks() {
+        assert_eq!(kv_cache_bytes(KvQuant::Q8, 0, 64), 2 * 34);
+        assert_eq!(kv_cache_bytes(KvQuant::Q4, 0, 64), 2 * 18);
+        assert_eq!(kv_cache_bytes(KvQuant::Q8, 0, 33), 2 * 34);
+    }
+
+    #[test]
+    fn an_unquantised_cache_is_priced_at_its_native_width() {
+        assert_eq!(kv_cache_bytes(KvQuant::Off, 2, 100), 200);
+        assert_eq!(kv_cache_bytes(KvQuant::Off, 4, 100), 400);
+    }
 }
