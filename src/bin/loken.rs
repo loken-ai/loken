@@ -396,23 +396,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 model, source
             );
 
-            match client.pull_model_with_source(&model, &source).await {
-                Ok(response) => {
-                    println!("✅ Model pull initiated!");
-                    println!("  Source: {}", source);
-                    println!("  Status: {}", response.status);
-                    if let Some(digest) = response.digest {
-                        println!("  Digest: {}", digest);
-                    }
-                    if let Some(total) = response.total {
-                        println!("  Size: {} MB", total / (1024 * 1024));
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to pull model: {}", e);
-                    std::process::exit(1);
-                }
-            }
+            let body = serde_json::json!({ "name": model, "source": source, "stream": true });
+            follow(client.post_streaming("/api/pull", &body).await?).await?;
         }
 
         Commands::Load { model } => {

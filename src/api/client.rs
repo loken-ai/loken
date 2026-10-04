@@ -38,45 +38,6 @@ impl Client {
         Ok(ListModelsResponse::from_ollama(ollama_response))
     }
 
-    /// Pull a model with explicit source (POST /api/pull)
-    pub async fn pull_model_with_source(
-        &self,
-        model_name: &str,
-        source: &str,
-    ) -> Result<OllamaPullResponse, ClientError> {
-        let url = format!("{}/api/pull", self.base_url);
-
-        let mut request = OllamaPullRequest::new(model_name.to_string());
-        request.source = source.to_string();
-
-        let response = self
-            .http_client
-            .post(&url)
-            .json(&request)
-            .timeout(Duration::from_secs(600)) // 10 minutes for large models
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    /// Pull a model (POST /api/pull) - defaults to auto-detection
-    pub async fn pull_model(&self, model_name: &str) -> Result<OllamaPullResponse, ClientError> {
-        let url = format!("{}/api/pull", self.base_url);
-
-        let request = OllamaPullRequest::new(model_name.to_string());
-
-        let response = self
-            .http_client
-            .post(&url)
-            .json(&request)
-            .timeout(Duration::from_secs(600)) // 10 minutes for large models
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
     /// Delete a model (DELETE /api/delete)
     pub async fn delete_model(&self, model_name: &str) -> Result<(), ClientError> {
         let url = format!("{}/api/delete", self.base_url);
@@ -253,8 +214,12 @@ impl Client {
             .send()
             .await?;
 
-        // Parse response and convert to LoadModelResponse
-        let _ollama_response: OllamaGenerateResponse = self.handle_response(response).await?;
+        // A load the daemon could not serve answers 200 with `done_reason: "error"` and the
+        // reason in `response`: the body, not the status, says whether the model loaded.
+        let loaded: OllamaGenerateResponse = self.handle_response(response).await?;
+        if loaded.done_reason.as_deref() == Some("error") {
+            return Err(ClientError::Daemon(loaded.response));
+        }
         Ok(LoadModelResponse {
             model: model_name.to_string(),
             status: "success".to_string(),
@@ -397,6 +362,9 @@ pub enum ClientError {
     Validation(String),
     #[error("Request error: {0}")]
     Request(String),
+    /// The daemon answered and said the work did not happen; the message is its own.
+    #[error("{0}")]
+    Daemon(String),
 }
 
 impl From<validator::ValidationErrors> for ClientError {
@@ -414,6 +382,44 @@ impl From<reqwest::Error> for ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve one canned JSON body on `/api/generate` and return the base URL.
+    async fn daemon_answering(body: serde_json::Value) -> String {
+        let app = axum::Router::new().route(
+            "/api/generate",
+            axum::routing::post(move || {
+                let body = body.clone();
+                async move { axum::Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// A load the daemon refuses is reported as an error carrying its reason, not as a success.
+    #[tokio::test]
+    async fn a_load_the_daemon_reports_failed_is_an_error() {
+        let base = daemon_answering(serde_json::json!({
+            "model": "m", "created_at": "", "response": "no room on any card",
+            "done": true, "done_reason": "error"
+        }))
+        .await;
+        let err = Client::new(base).load_model("m").await.unwrap_err();
+        assert_eq!(err.to_string(), "no room on any card");
+    }
+
+    #[tokio::test]
+    async fn a_load_the_daemon_reports_done_succeeds() {
+        let base = daemon_answering(serde_json::json!({
+            "model": "m", "created_at": "", "response": "",
+            "done": true, "done_reason": "load"
+        }))
+        .await;
+        let loaded = Client::new(base).load_model("m").await.unwrap();
+        assert_eq!(loaded.status, "success");
+    }
 
     #[tokio::test]
     async fn test_client_creation() {
