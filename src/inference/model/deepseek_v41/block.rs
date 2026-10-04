@@ -203,6 +203,47 @@ impl Block {
         Ok((out, fm.pre))
     }
 
+    /// The FFN half of a decode step that may leave up to `defer` of its host experts running:
+    /// the stream returned lacks their share, and the job comes back with this layer's `post`
+    /// weights, which `add_deferred` needs to fold the share into the stream later.
+    #[allow(clippy::type_complexity)]
+    pub fn forward_decode_ffn_deferring(
+        &self,
+        x: &Tensor,
+        pre_mix: &[Vec<f32>],
+        defer: usize,
+    ) -> Result<(
+        Tensor,
+        Vec<Vec<f32>>,
+        Option<(super::moe::DeferredExperts, Vec<f32>)>,
+    )> {
+        use crate::inference::offload::stage;
+        let residual = x;
+        let fm = stage("hc mixes", || self.mixes(x, &self.hc_ffn))?;
+        let xin = stage("hc pre and norm", || {
+            rms_norm(&hc_pre(x, pre_mix)?, &self.ffn_norm, self.norm_eps)
+        })?;
+        let (xffn, deferred) = stage("moe", || self.moe.forward_with(&xin, defer))?;
+        let out = stage("hc post", || {
+            hc_post(&xffn, residual, &fm.post, &fm.comb, self.hc_mult)
+        })?;
+        let post = fm.post.first().cloned().unwrap_or_default();
+        Ok((out, fm.pre, deferred.map(|d| (d, post))))
+    }
+
+    /// Wait for the experts a deferring FFN half left running and add their share to `x`.
+    pub fn add_deferred(
+        &self,
+        x: &Tensor,
+        deferred: super::moe::DeferredExperts,
+        post: &[f32],
+    ) -> Result<Tensor> {
+        let delta = crate::inference::offload::stage("moe deferred wait", || {
+            self.moe.finish_deferred(deferred)
+        })?;
+        super::hyper_connections::hc_add(x, post, &delta)
+    }
+
     /// Read ahead the routed experts this block is expected to use for the token whose stream
     /// reaches the layer below as `x` [1, 1, hc, d]: the FFN input is approximated by the
     /// stream collapsed with this block's own mixes, which skips the attention in between.

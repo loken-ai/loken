@@ -86,6 +86,9 @@ pub struct DeepseekV41Model {
     /// How many layers ahead a decode starts reading the routed experts of, from the stream it
     /// has by then; 0 reads none ahead. Timing only: the gate still decides the routing.
     pub expert_readahead: usize,
+    /// The share of a token's routed experts whose host compute may finish a layer late; 0 keeps
+    /// every layer exact.
+    expert_deferral: f32,
     // rope regimes: ratio-0 uses base theta with no YaRN; a band layer uses the compressed theta
     // with YaRN from original_seq_len.
     rope_theta: f32,
@@ -387,6 +390,7 @@ impl DeepseekV41Model {
             dim: cfg.d_model,
             rope_head_dim: cfg.rope_head_dim,
             rms_eps: cfg.rms_eps as f32,
+            expert_deferral: 0.0,
             expert_readahead: std::env::var("LOKEN_EXPERT_READAHEAD")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -891,6 +895,18 @@ impl DeepseekV41Model {
         }
     }
 
+    /// Let up to `share` of a decoding token's routed experts finish on the host a layer late,
+    /// overlapping the next layer's attention: their output joins the stream after that
+    /// attention instead of before it, so the logits drift from the exact ones. 0 is exact.
+    pub fn set_expert_deferral(&mut self, share: f32) {
+        self.expert_deferral = share.clamp(0.0, 1.0);
+    }
+
+    /// How many routed experts per token the share allows to finish late.
+    fn deferred_experts(&self) -> usize {
+        (self.expert_deferral * self.n_activated() as f32).floor() as usize
+    }
+
     /// Run every layer's routed experts through `offload`, or back on the CPU with `None`.
     pub fn offload_experts(
         &self,
@@ -956,6 +972,8 @@ impl DeepseekV41Model {
         if !cap.is_empty() {
             state.captured = vec![Vec::new(); cap.len()];
         }
+        let defer = self.deferred_experts();
+        let mut pending: Option<(usize, super::moe::DeferredExperts, Vec<f32>)> = None;
         for (i, block) in self.blocks.iter().enumerate() {
             let Some(block) = block.as_ref() else {
                 continue;
@@ -993,7 +1011,23 @@ impl DeepseekV41Model {
             } else {
                 (&cosb, &sinb)
             };
-            let (nx, npm) = block.forward_decode(
+            if defer == 0 {
+                let (nx, npm) = block.forward_decode(
+                    &x,
+                    &pre_mix,
+                    cos,
+                    sin,
+                    pos,
+                    &mut state.layers[i],
+                    &mut shared,
+                )?;
+                x = nx;
+                pre_mix = npm;
+                continue;
+            }
+            // The experts the layer above left running overlap this layer's attention; their
+            // share joins the stream before this layer's FFN reads it.
+            let (xa, am_pre) = block.forward_decode_attn(
                 &x,
                 &pre_mix,
                 cos,
@@ -1002,8 +1036,18 @@ impl DeepseekV41Model {
                 &mut state.layers[i],
                 &mut shared,
             )?;
+            let xa = match pending.take() {
+                Some((layer, job, post)) => self.block(layer)?.add_deferred(&xa, job, &post)?,
+                None => xa,
+            };
+            let (nx, npm, left) = block.forward_decode_ffn_deferring(&xa, &am_pre, defer)?;
+            pending = left.map(|(job, post)| (i, job, post));
             x = nx;
             pre_mix = npm;
+        }
+        // Nothing stays running past the token: the head reads the stream whole.
+        if let Some((layer, job, post)) = pending.take() {
+            x = self.block(layer)?.add_deferred(&x, job, &post)?;
         }
 
         let h = hc_pre(&x, &pre_mix)?;
@@ -2658,6 +2702,143 @@ mod oracle_gate {
             routed_after > routed_before,
             "no routing was compared with a guess"
         );
+    }
+
+    /// A decode that lets some host experts finish a layer late stays close to the exact one:
+    /// every position's logits keep their direction and most keep their argmax. A replay from a
+    /// checkpoint reproduces the deferred decode bit for bit, and a share of zero is the exact
+    /// decode.
+    #[test]
+    fn expert_deferral_stays_close_and_replays_exactly() {
+        use crate::inference::offload::experts::ExpertOffload;
+        let (mut model, tokens) = synthetic(&[0, 2, 0], &[1], &[1], 3);
+        // Every expert is the host's: the cards decline all of them.
+        model.offload_experts(Some(std::sync::Arc::new(ExpertOffload {
+            lanes: 1,
+            timings: std::sync::Arc::new(Default::default()),
+            warm: None,
+            run: Box::new(|_, _, _, _, _| None),
+            run_batch: Some(Box::new(|active, _, _, _| {
+                active.iter().map(|_| None).collect()
+            })),
+            on_card: Some(Box::new(|_| false)),
+            run_multi: None,
+        })));
+        let decode = |model: &DeepseekV41Model, state: &mut DecodeState, toks: &[u32]| {
+            toks.iter()
+                .map(|&t| vecf_of(&model.forward_decode(t, state).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        };
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        let mut exact_state = model.new_decode_state();
+        let exact = decode(&model, &mut exact_state, &tokens);
+
+        model.set_expert_deferral(0.0);
+        let mut zero_state = model.new_decode_state();
+        assert_eq!(decode(&model, &mut zero_state, &tokens), exact);
+
+        let share = 0.5;
+        model.set_expert_deferral(share);
+        assert!(model.deferred_experts() > 0, "the share defers nothing");
+        let mut state = model.new_decode_state();
+        let split = tokens.len() / 2;
+        let first = decode(&model, &mut state, &tokens[..split]);
+        let mark = state.checkpoint();
+        let rest = decode(&model, &mut state, &tokens[split..]);
+        state.rewind(&mark);
+        assert_eq!(
+            decode(&model, &mut state, &tokens[split..]),
+            rest,
+            "a replay after a rewind differs"
+        );
+
+        let drifted: Vec<Vec<f32>> = first.into_iter().chain(rest).collect();
+        let mut agree = 0;
+        for (got, want) in drifted.iter().zip(&exact) {
+            let c = cosine(got, want);
+            // The bound a share of the experts moved one layer late may cost a position.
+            assert!(c > 1.0 - 0.1 * share, "logits turned: cosine {c}");
+            agree += (argmax(got) == argmax(want)) as usize;
+        }
+        assert!(
+            agree * 4 >= drifted.len() * 3,
+            "argmax kept at {agree} of {} positions",
+            drifted.len()
+        );
+    }
+
+    /// The real-model gate for expert deferral, run by hand: `LOKEN_DSV41_GGUF` names the file,
+    /// `LOKEN_DSV41_TOKENS` a comma list of token ids to decode, `LOKEN_DSV41_DEFERRAL` the
+    /// share. The next-token agreement with the exact decode over the sequence must stay within
+    /// the 0.5 percent the published method allows.
+    #[test]
+    #[ignore = "needs the real checkpoint"]
+    fn expert_deferral_keeps_a_real_models_next_tokens() {
+        use crate::inference::offload::experts::ExpertOffload;
+        let path = std::env::var("LOKEN_DSV41_GGUF").expect("LOKEN_DSV41_GGUF");
+        let tokens: Vec<u32> = std::env::var("LOKEN_DSV41_TOKENS")
+            .expect("LOKEN_DSV41_TOKENS")
+            .split(',')
+            .map(|t| t.trim().parse().unwrap())
+            .collect();
+        let share: f32 = std::env::var("LOKEN_DSV41_DEFERRAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.34);
+        let source =
+            crate::tensor::quantized::gguf_source::SplitGguf::open(std::path::Path::new(&path))
+                .unwrap();
+        let cfg =
+            crate::inference::model::deepseek_v41::DeepseekV41Config::from_meta(&source).unwrap();
+        let mut model = DeepseekV41Model::load(&source, &cfg).unwrap();
+        model.offload_experts(Some(std::sync::Arc::new(ExpertOffload {
+            lanes: 1,
+            timings: std::sync::Arc::new(Default::default()),
+            warm: None,
+            run: Box::new(|_, _, _, _, _| None),
+            run_batch: Some(Box::new(|active, _, _, _| {
+                active.iter().map(|_| None).collect()
+            })),
+            on_card: Some(Box::new(|_| false)),
+            run_multi: None,
+        })));
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        let run = |model: &DeepseekV41Model| {
+            let mut state = model.new_decode_state();
+            tokens
+                .iter()
+                .map(|&t| argmax(&vecf_of(&model.forward_decode(t, &mut state).unwrap())))
+                .collect::<Vec<_>>()
+        };
+        model.set_expert_deferral(0.0);
+        let exact = run(&model);
+        model.set_expert_deferral(share);
+        let drifted = run(&model);
+        let agree = exact.iter().zip(&drifted).filter(|(a, b)| a == b).count();
+        let loss = 1.0 - agree as f64 / exact.len() as f64;
+        eprintln!(
+            "deferral {share}: next-token agreement {agree}/{}",
+            exact.len()
+        );
+        assert!(loss <= 0.005, "next-token agreement fell by {loss}");
     }
 
     /// Independent sequences decoded together give each the logits it gives alone: attention runs

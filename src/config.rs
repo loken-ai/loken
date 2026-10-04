@@ -79,6 +79,11 @@ pub struct InferenceConfigToml {
     pub moderation_model: Option<String>,
     #[serde(default)]
     pub public_url: Option<String>,
+    /// For a model whose routed experts stream from disk: the share of a token's experts whose
+    /// host compute may finish a layer late, overlapping the next layer's attention. Costs a
+    /// little accuracy; 0 keeps every layer exact.
+    #[serde(default)]
+    pub expert_deferral: f32,
     /// Keys this version no longer reads, kept so a config written for an older one still
     /// loads; each is reported once at startup.
     #[serde(flatten, skip_serializing)]
@@ -243,6 +248,7 @@ impl Config {
             files_dir: toml_config.files_dir.clone(),
             moderation_model: toml_config.moderation_model.clone(),
             public_url: toml_config.public_url.clone(),
+            expert_deferral: toml_config.expert_deferral,
             progress_callback: None, // No progress callback from config file
             models_dir: None,        // Will be set by APIServer
             disable_arc_layers: false,

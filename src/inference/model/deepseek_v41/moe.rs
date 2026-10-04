@@ -9,6 +9,7 @@
 //! 1), and is judged against a dump of one layer's MoE in the module test.
 
 use crate::inference::offload::experts::{Expert, ExpertOffload};
+pub use crate::inference::offload::moe_dispatch::DeferredExperts;
 use crate::inference::offload::projection::Projection;
 use crate::inference::offload::store::ExpertSet;
 use crate::tensor::{Device, Result, Tensor};
@@ -125,6 +126,17 @@ impl Moe {
 
     /// `x` is [b, s, dim]; returns [b, s, dim].
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        Ok(self.forward_with(x, 0)?.0)
+    }
+
+    /// `forward` for one decoding token that may leave up to `defer` of the host's routed
+    /// experts running when it returns: the output then lacks their weighted sum, which the
+    /// caller adds to the stream through `finish_deferred` before the stream is read again.
+    pub fn forward_with(
+        &self,
+        x: &Tensor,
+        defer: usize,
+    ) -> Result<(Tensor, Option<DeferredExperts>)> {
         let dims = x.dims().to_vec();
         let n: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((n, self.dim))?;
@@ -218,7 +230,10 @@ impl Moe {
                 if let Some(res) = stage("moe decode block", || {
                     off.moe_decode(&projs, &weights, shared, &row, self.swiglu_limit, self.dim)
                 }) {
-                    return Tensor::from_vec(res?, (1, self.dim), &Device::Cpu)?.reshape(dims);
+                    return Ok((
+                        Tensor::from_vec(res?, (1, self.dim), &Device::Cpu)?.reshape(dims)?,
+                        None,
+                    ));
                 }
             }
         }
@@ -265,7 +280,7 @@ impl Moe {
         let routed_started = std::time::Instant::now();
         // The routed experts of this block, resident ones on the cards and the misses on the
         // cores at once; run on the host from its mapping when no card placement is set.
-        let (mut done, mut cpu_side) = if let Some(off) = &offload {
+        let (mut done, mut cpu_side, deferred) = if let Some(off) = &offload {
             crate::inference::offload::moe_dispatch::run_routed(
                 off,
                 &active,
@@ -276,13 +291,19 @@ impl Moe {
                 self.dim,
                 self.swiglu_limit,
                 observer.is_some(),
+                defer,
             )
         } else {
             (
                 (0..active.len()).map(|_| None).collect(),
                 (0..active.len()).map(|_| None).collect(),
+                None,
             )
         };
+        let later: Vec<usize> = deferred
+            .as_ref()
+            .map(|d| d.indexes.clone())
+            .unwrap_or_default();
         if crate::inference::offload::current().is_some() {
             crate::inference::offload::prof_record(
                 "moe routed experts",
@@ -312,7 +333,9 @@ impl Moe {
         let host_count: u64;
         {
             use rayon::prelude::*;
-            let todo: Vec<usize> = (0..active.len()).filter(|&i| ready[i].is_none()).collect();
+            let todo: Vec<usize> = (0..active.len())
+                .filter(|&i| ready[i].is_none() && !later.contains(&i))
+                .collect();
             host_count = todo.len() as u64;
             let made: Vec<Result<Ready>> = todo
                 .par_iter()
@@ -347,6 +370,9 @@ impl Moe {
         }
         let add_started = std::time::Instant::now();
         for (i, &e) in active.iter().enumerate() {
+            if later.contains(&i) {
+                continue;
+            }
             let (h, out, held) = ready[i]
                 .take()
                 .ok_or_else(|| crate::tensor::Error::msg("an active expert produced nothing"))?;
@@ -388,7 +414,20 @@ impl Moe {
             );
         }
         let flat: Vec<f32> = y.into_iter().flatten().collect();
-        Tensor::from_vec(flat, (n, self.dim), &Device::Cpu)?.reshape(dims)
+        Ok((
+            Tensor::from_vec(flat, (n, self.dim), &Device::Cpu)?.reshape(dims)?,
+            deferred,
+        ))
+    }
+
+    /// Wait for the experts `forward_with` left running and return their weighted sum
+    /// `[dim]`, handing their weights back to the store.
+    pub fn finish_deferred(&self, deferred: DeferredExperts) -> Result<Vec<f32>> {
+        let (sum, held) = deferred.wait()?;
+        for (e, expert) in held {
+            self.experts.release(e, &expert);
+        }
+        Ok(sum)
     }
 }
 
@@ -656,6 +695,69 @@ mod tests {
         assert!(ran.load(std::sync::atomic::Ordering::Relaxed) > 0);
         assert_eq!(cpu_out, off_out);
         assert_eq!(cpu_calls, off_calls);
+    }
+
+    /// Whether the toy "card" holds `e`: decided by the expert's own weights, so it is the same
+    /// at every call.
+    fn on_toy_card(e: &Expert) -> bool {
+        match &e.w1 {
+            Projection::Dense(t) => t.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0] > 0.0,
+            _ => false,
+        }
+    }
+
+    /// An offload with a block path whose card holds the experts `on_toy_card` names.
+    fn toy_cards() -> Arc<ExpertOffload> {
+        Arc::new(ExpertOffload {
+            lanes: 1,
+            timings: Arc::new(Default::default()),
+            warm: None,
+            run: Box::new(|_, _, _, _, _| None),
+            run_batch: Some(Box::new(|active, fetch, x, limit| {
+                active
+                    .iter()
+                    .map(|&e| {
+                        let expert = fetch(e).ok()?;
+                        if !on_toy_card(&expert) {
+                            return None;
+                        }
+                        let row = Tensor::from_vec(x.to_vec(), (1, x.len()), &Device::Cpu).ok()?;
+                        let out = expert
+                            .forward(&row, limit)
+                            .and_then(|t| t.flatten_all()?.to_vec1::<f32>());
+                        Some(out.map(|o| (Vec::new(), o)))
+                    })
+                    .collect()
+            })),
+            on_card: Some(Box::new(on_toy_card)),
+            run_multi: None,
+        })
+    }
+
+    /// The host experts a token leaves running add up, with the output the call returned, to what
+    /// the exact call gives: deferring moves when their share arrives, not what it is.
+    #[test]
+    fn a_deferred_share_completes_the_exact_output() {
+        let moe = build_moe(ExpertSet::Resident(experts_arc()));
+        *moe.offload.write().unwrap() = Some(toy_cards());
+        let mut deferred_any = false;
+        for t in 0..TOKENS {
+            let x = input().narrow(1, t, 1).unwrap().contiguous().unwrap();
+            let exact = moe.forward(&x).unwrap().flatten_all().unwrap();
+            let exact = exact.to_vec1::<f32>().unwrap();
+            let (now, job) = moe.forward_with(&x, 1).unwrap();
+            let mut got = now.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            if let Some(job) = job {
+                deferred_any = true;
+                for (g, d) in got.iter_mut().zip(moe.finish_deferred(job).unwrap()) {
+                    *g += d;
+                }
+            }
+            for (g, w) in got.iter().zip(&exact) {
+                assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "{g} vs {w}");
+            }
+        }
+        assert!(deferred_any, "no token left an expert running");
     }
 
     /// Unit 4 gate: an MoE whose experts are streamed through a hot cache too small to hold them all

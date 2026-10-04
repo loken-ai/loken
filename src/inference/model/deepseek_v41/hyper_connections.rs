@@ -150,6 +150,20 @@ pub fn hc_pre(x: &Tensor, pre_mix: &[Vec<f32>]) -> Result<Tensor> {
     Tensor::from_vec(out, (b, s, d), &Device::Cpu)
 }
 
+/// `x` [1, 1, hc, d] with `delta` [d] added to every hc copy, copy `j` scaled by `post[j]`: the
+/// term `hc_post` would have contributed had `delta` been part of the sublayer's output.
+pub fn hc_add(x: &Tensor, post: &[f32], delta: &[f32]) -> Result<Tensor> {
+    let (b, s, hc, d) = x.dims4()?;
+    let mut out = x.flatten_all()?.to_vec1::<f32>()?;
+    for (j, copy) in out.chunks_mut(d).enumerate() {
+        let pj = post[j % hc];
+        for (o, v) in copy.iter_mut().zip(delta) {
+            *o += pj * v;
+        }
+    }
+    Tensor::from_vec(out, (b, s, hc, d), &Device::Cpu)
+}
+
 /// Expand `x` [b, s, d] back to hc copies and mix in `residual` [b, s, hc, d] through `comb`.
 /// `y[.., j, ..] = post[.., j] * x + sum_i comb[.., i, j] * residual[.., i, ..]`.
 pub fn hc_post(
@@ -184,4 +198,54 @@ pub fn hc_post(
             }
         });
     Tensor::from_vec(out, (b, s, hc, d), &Device::Cpu)
+}
+
+#[cfg(test)]
+mod deferral_tests {
+    use super::*;
+
+    /// Adding a share to the stream after the fact is what `hc_post` would have done had the
+    /// share been in the sublayer's output: `hc_post(x + d) - hc_post(x) = post * d` per copy.
+    #[test]
+    fn hc_add_is_what_hc_post_gives_a_larger_output() {
+        let (hc, d) = (3usize, 8usize);
+        let x = Tensor::from_vec(
+            (0..d).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            (1, 1, d),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let delta: Vec<f32> = (0..d).map(|i| 1.0 - i as f32 * 0.07).collect();
+        let residual = Tensor::from_vec(
+            (0..hc * d).map(|i| (i as f32).sin()).collect::<Vec<_>>(),
+            (1, 1, hc, d),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let post = vec![vec![0.5f32, 1.5, -0.25]];
+        let comb = vec![vec![vec![0.2f32; hc]; hc]];
+        let plain = hc_post(&x, &residual, &post, &comb, hc).unwrap();
+        let both = Tensor::from_vec(
+            x.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .iter()
+                .zip(&delta)
+                .map(|(a, b)| a + b)
+                .collect::<Vec<_>>(),
+            (1, 1, d),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let want = hc_post(&both, &residual, &post, &comb, hc).unwrap();
+        let got = hc_add(&plain, &post[0], &delta).unwrap();
+        let (got, want) = (
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            want.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-5, "{g} vs {w}");
+        }
+    }
 }

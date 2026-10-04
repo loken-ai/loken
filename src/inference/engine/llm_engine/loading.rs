@@ -235,6 +235,7 @@ impl LlmEngine {
         // disable_cuda config (empty cuda_devices -> every layer on CPU).
         let disable_cuda = self.config.disable_cuda || crate::gpu::force_cpu();
         let kv_quant = self.config.kv_quant;
+        let expert_deferral = self.config.expert_deferral;
         let user_context_length = self.config.context_length;
         let model_state = self.model_state.clone();
         let cached_model_size = self.cached_model_size.clone();
@@ -680,8 +681,9 @@ impl LlmEngine {
                     let source = crate::tensor::quantized::gguf_source::SplitGguf::open(&model_file)
                         .map_err(|e| anyhow!("deepseek_v41: open parts: {e}"))?;
                     let cfg = DeepseekV41Config::from_meta(&source)?;
-                    let model = DeepseekV41Model::load(&source, &cfg)
+                    let mut model = DeepseekV41Model::load(&source, &cfg)
                         .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
+                    model.set_expert_deferral(expert_deferral);
                     // Without a kept tier the page cache is the only cache, and a prompt's
                     // prefill sweeps every expert through it: the decode that follows starts
                     // with the early layers evicted. The tier keeps each layer's most routed
