@@ -8,7 +8,7 @@
 use super::band::SharedAttn;
 use super::block::Block;
 use super::cache::DecodeState;
-use super::engram::{prefill_hashes, Engram, EngramConfig, EngramState};
+use super::engram::{prefill_hashes, prefill_hashes_from, Engram, EngramConfig, EngramState};
 use super::hyper_connections::hc_pre;
 use super::load::{load_band_block, load_ratio0_block, projection};
 use super::source::WeightSource;
@@ -415,6 +415,12 @@ impl DeepseekV41Model {
     /// `forward_prefill` is `prefill_begin`, `prefill_layer` for each layer in order, then
     /// `prefill_finish`; a caller may interleave the layers of several prefills.
     pub fn prefill_begin(&self, tokens: &[u32]) -> Result<PrefillState> {
+        self.prefill_begin_at(tokens, 0)
+    }
+
+    /// `prefill_begin` for tokens that continue a sequence of `base` tokens: the rope tables run
+    /// to the end of them, and the first of `tokens` reads row `base`.
+    pub fn prefill_begin_at(&self, tokens: &[u32], base: usize) -> Result<PrefillState> {
         let s = tokens.len();
         let (dim, hc) = (self.dim, self.hc_mult);
 
@@ -432,10 +438,16 @@ impl DeepseekV41Model {
             .contiguous()?;
 
         // The two rope regimes, built at this sequence length.
-        let (cos0, sin0) = rope_table(self.rope_head_dim, s, 0, self.rope_theta, self.rope_factor)?;
+        let (cos0, sin0) = rope_table(
+            self.rope_head_dim,
+            base + s,
+            0,
+            self.rope_theta,
+            self.rope_factor,
+        )?;
         let (cosb, sinb) = rope_table(
             self.rope_head_dim,
-            s,
+            base + s,
             self.original_seq_len,
             self.compress_rope_theta,
             self.rope_factor,
@@ -511,18 +523,23 @@ impl DeepseekV41Model {
         state: &mut DecodeState,
         grid: &[usize],
     ) -> Result<(Tensor, Vec<Vec<Vec<u8>>>)> {
-        if state.pos != 0 || tokens.is_empty() {
-            return Err(Error::msg(format!(
-                "prefill_into: {} tokens into a state at position {}; a batched prefill starts a sequence",
-                tokens.len(),
-                state.pos
-            )));
+        if tokens.is_empty() {
+            return Err(Error::msg("prefill_into: no tokens"));
         }
-        let grid: Vec<usize> = grid.iter().copied().filter(|&p| p < tokens.len()).collect();
+        // A state that holds tokens is continued: the pass appends to each layer's window,
+        // compressed rows and filling group as the same tokens decoded would have.
+        let base = state.pos;
+        let grid: Vec<usize> = grid
+            .iter()
+            .copied()
+            .filter(|&p| p > base && p < base + tokens.len())
+            .collect();
         for layer in &mut state.layers {
+            layer.base = base;
             layer.grid = grid.clone();
             layer.at_grid.clear();
         }
+        let engram_start = state.engram.clone();
         // A prompt this wide routes to nearly every expert of every layer, so each layer is read
         // in while the one before it computes, instead of faulting in under its own MoE.
         let reads_whole_layers = self.routes_whole_layers(tokens.len());
@@ -531,7 +548,7 @@ impl DeepseekV41Model {
                 b.moe.prefetch_layer();
             }
         }
-        let mut prefill = self.prefill_begin(tokens)?;
+        let mut prefill = self.prefill_begin_at(tokens, base)?;
         for (i, block) in self.blocks.iter().enumerate() {
             let Some(block) = block.as_ref() else {
                 continue;
@@ -546,7 +563,10 @@ impl DeepseekV41Model {
             if let (Some(engram), Some(ecfg)) = (&self.engrams[i], &self.engram_cfg) {
                 let which = ecfg.layer_ids.iter().position(|&l| l == i).unwrap_or(0);
                 prefill.x = crate::inference::offload::stage("engram", || {
-                    engram.forward(&prefill.x, &prefill_hashes(ecfg, which, tokens))
+                    engram.forward(
+                        &prefill.x,
+                        &prefill_hashes_from(ecfg, which, tokens, engram_start.clone()),
+                    )
                 })?;
             }
             let rope = if self.ratios.get(i).copied().unwrap_or(0) == 0 {
@@ -579,7 +599,7 @@ impl DeepseekV41Model {
                 state.engram.push(ecfg, t);
             }
         }
-        state.pos = tokens.len();
+        state.pos = base + tokens.len();
         let s = tokens.len();
         let last = prefill.x.narrow(1, s - 1, 1)?.contiguous()?;
         let h = hc_pre(&last, &prefill.pre_mix[s - 1..])?;
@@ -596,6 +616,7 @@ impl DeepseekV41Model {
             })
             .collect();
         for layer in &mut state.layers {
+            layer.base = 0;
             layer.grid.clear();
             layer.at_grid.clear();
         }
@@ -1608,9 +1629,9 @@ impl DeepseekV41Model {
 
     /// Continue a sequence whose state stands at `state.pos` over `tokens`, returning the
     /// next-token logits after the last one, `[1, vocab]`. This is the prefill of a prompt's
-    /// remainder after a restored prefix: the block runs as `forward_verify_batch` does - each
-    /// layer's experts read once for all of it - and only the last position goes through the
-    /// head, so no `[tokens, vocab]` matrix is built.
+    /// remainder after a restored prefix: one layer-major pass over the block, attending over the
+    /// restored window and compressed rows and the new ones, each layer's experts read once for
+    /// all of it, and only the last position through the head.
     pub fn prefill_continue(&self, tokens: &[u32], state: &mut DecodeState) -> Result<Tensor> {
         self.prefill_continue_grid(tokens, state, &[])
             .map(|(logits, _)| logits)
@@ -1618,13 +1639,25 @@ impl DeepseekV41Model {
 
     /// `prefill_continue`, also keeping every layer's window at each token count of `grid` that
     /// falls strictly inside the block: `windows[k][layer]` for `grid[k]`, as `prefill_into_grid`.
+    /// The block runs as one layer-major prefill onto the state, as a cold prompt does.
     pub fn prefill_continue_grid(
         &self,
         tokens: &[u32],
         state: &mut DecodeState,
         grid: &[usize],
     ) -> Result<(Tensor, Vec<Vec<Vec<u8>>>)> {
-        self.forward_block(tokens, state, true, grid)
+        self.prefill_into_grid(tokens, state, grid)
+    }
+
+    /// The block as `forward_verify_batch` runs it, token by token through attention, for the
+    /// tests that hold the batched continuation against it.
+    #[cfg(test)]
+    pub fn prefill_continue_stepped(
+        &self,
+        tokens: &[u32],
+        state: &mut DecodeState,
+    ) -> Result<Tensor> {
+        self.forward_block(tokens, state, true, &[]).map(|(l, _)| l)
     }
 
     /// The block pass behind `forward_verify_batch` and `prefill_continue`: the logits of every
@@ -2745,7 +2778,7 @@ mod oracle_gate {
                 .collect();
             let mut cold_state = model.new_decode_state();
             let cold = vecf_of(&model.prefill_into(&tokens, &mut cold_state).unwrap());
-            for split in [1usize, 5, 17, 32, 41, 64] {
+            for split in [1usize, 2, 3, 5, 17, 32, 33, 41, 64] {
                 let mut live = model.new_decode_state();
                 let at_split = vecf_of(&model.prefill_into(&tokens[..split], &mut live).unwrap());
                 let bytes = encode(&live, Some(&at_split), &id);
@@ -2778,11 +2811,19 @@ mod oracle_gate {
                 let r = rel(&got, &cold);
                 assert!(r < 1e-4, "{ratios:?} split {split}: against cold rel {r}");
                 assert_eq!(argmax(&got), argmax(&cold), "{ratios:?} split {split}");
-                // The decode after the remainder agrees too.
+                // The decode after the remainder agrees too: bit for bit with the live twin, and to
+                // rounding with the state a cold prefill of everything left.
+                let mut cold_twin = cold_state.clone();
                 for t in [3u32, 9, 11] {
                     let a = vecf_of(&model.forward_decode(t, &mut live).unwrap());
                     let b = vecf_of(&model.forward_decode(t, &mut restored).unwrap());
                     assert_eq!(a, b, "{ratios:?} split {split}: decode after restore");
+                    let c = vecf_of(&model.forward_decode(t, &mut cold_twin).unwrap());
+                    assert!(
+                        rel(&b, &c) < 1e-3,
+                        "{ratios:?} split {split}: against cold rel {}",
+                        rel(&b, &c)
+                    );
                 }
             }
         }
@@ -3000,50 +3041,6 @@ mod oracle_gate {
         // It wrote its own grid on the way: 32 and 40 are the new tail's, 24 was its prefix.
         wait_for_len(&store_b, 45);
         assert!(store_b.lengths().contains(&40));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A stored prefix is used only while continuing its remainder is cheaper than prefilling the
-    /// whole prompt: a short remainder restores, a long one is prefilled cold, and both answer as a
-    /// cold prompt does.
-    #[test]
-    fn a_stored_prefix_with_a_long_remainder_is_not_used() {
-        use crate::inference::cache::state_disk::StateStore;
-        use crate::inference::engine::model_backend::DeepseekV41Backend;
-        let base: Vec<u32> = (0..40)
-            .map(|i| (i * 7 + 3) % super::tests::VOCAB as u32)
-            .collect();
-        let extend = |n: usize, salt: u32| {
-            let mut t = base.clone();
-            t.extend((0..n).map(|i| (i as u32 * 5 + salt) % super::tests::VOCAB as u32));
-            t
-        };
-        let dir = scratch_dir("guard");
-        let store = std::sync::Arc::new(StateStore::open(dir.clone(), 0, 8).unwrap());
-        let id = super::super::snapshot::identity(&[b"synthetic"]);
-        let backend = || {
-            let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
-            DeepseekV41Backend::new(model, 0, 128).with_state_cache(store.clone(), id)
-        };
-        let mut first = backend();
-        let _ = prompt_logits(&mut first, &base);
-        wait_for_len(&store, 40);
-        let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
-        let mut plain = DeepseekV41Backend::new(model, 0, 128);
-        let rel = |a: &[f32], b: &[f32]| {
-            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
-            (num / b.iter().map(|y| y * y).sum::<f32>()).sqrt()
-        };
-        // 4 more tokens: 4 * 8 <= 44, the stored state is used. 8 more: 8 * 8 > 48, it is not.
-        // Each tail is its own, so no earlier prompt's state shares more than the stored 40.
-        for (more, salt, used) in [(4usize, 11u32, 40usize), (8, 29, 0)] {
-            let prompt = extend(more, salt);
-            let mut b = backend();
-            let got = prompt_logits(&mut b, &prompt);
-            assert_eq!(b.last_restored(), used, "{more} more tokens");
-            let want = prompt_logits(&mut plain, &prompt);
-            assert!(rel(&got, &want) < 1e-4);
-        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3554,9 +3551,7 @@ mod oracle_gate {
         let store = Arc::new(StateStore::open(dir.clone(), 0, 8).unwrap());
         let id = super::super::snapshot::identity(&[b"synthetic"]);
         let (model, _) = synthetic(&[0, 2, 0], &[1], &[1], 0);
-        let cache = StateCache::new(&model, store.clone(), id)
-            .unwrap()
-            .with_continue_cost_ratio(1);
+        let cache = StateCache::new(&model, store.clone(), id).unwrap();
         let cached = V41BatchServer::spawn(Arc::new(model), None, None, 4, Some(cache));
         let first = run(&cached, &tokens[..24]);
         // The prompt's states and the finished sequence's: 8, 16, 24 and 24 + 4 tokens fed.
@@ -4399,9 +4394,7 @@ mod oracle_gate {
         let store = std::sync::Arc::new(StateStore::open(dir.to_path_buf(), 0, 8).unwrap());
         let id = super::super::snapshot::identity(&[b"synthetic"]);
         (
-            DeepseekV41Backend::new(model, 0, 128)
-                .with_state_cache(store.clone(), id)
-                .with_continue_cost_ratio(1),
+            DeepseekV41Backend::new(model, 0, 128).with_state_cache(store.clone(), id),
             store,
         )
     }

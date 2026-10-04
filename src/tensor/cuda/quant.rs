@@ -1158,6 +1158,7 @@ pub fn gpu_index_scores(
     (s, nh, ihd, g): (usize, usize, usize, usize),
     ratio: usize,
     scale: f32,
+    q_off: usize,
 ) -> Result<Vec<f32>> {
     if q.len() != s * nh * ihd || k.len() != g * ihd || weights.len() != s * nh || ratio == 0 {
         return Err(Error(format!(
@@ -1183,7 +1184,14 @@ pub fn gpu_index_scores(
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let dims = [s as i64, nh as i64, ihd as i64, g as i64, ratio as i64];
+    let dims = [
+        s as i64,
+        nh as i64,
+        ihd as i64,
+        g as i64,
+        ratio as i64,
+        q_off as i64,
+    ];
     let mut b = stream.launch_builder(&func);
     b.arg(&qd);
     b.arg(&kd);

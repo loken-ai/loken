@@ -141,6 +141,14 @@ pub struct SharedAttn {
     pub candidates: Option<Vec<bool>>, // [b*s*compress_len]
 }
 
+/// What a prefill pass that continues a state tells the indexer: the tokens held before it, the
+/// compressed groups held, and the index keys of those groups when this layer owns them.
+pub(super) struct PrefillAt<'a> {
+    pub base: usize,
+    pub held_groups: usize,
+    pub held_index_k: Option<&'a Tensor>,
+}
+
 /// The indexer of an index-source layer. It owns its index keys only when it is also a kv-source
 /// (`owns_k`); otherwise it reads them from the kv-source below. A candidate source publishes the
 /// block mask; a candidate consumer scores only inside that mask.
@@ -172,8 +180,9 @@ impl Indexer {
         x: &Tensor,
         qr: &Tensor,
         latent: Option<&Tensor>,
-        cos: &Tensor,
-        sin: &Tensor,
+        full_cos: &Tensor,
+        full_sin: &Tensor,
+        at: PrefillAt,
         ratio: usize,
         offset: usize,
         groups: usize,
@@ -183,32 +192,57 @@ impl Indexer {
         let ihd = self.index_head_dim;
         let rd = self.rope_head_dim;
         let nh = self.n_heads;
+        let (cos, sin) = (
+            full_cos.narrow(0, at.base, s)?,
+            full_sin.narrow(0, at.base, s)?,
+        );
+        let (cos, sin) = (&cos, &sin);
 
         // Own the index keys (derive from the pre-RoPE latent), or read the kv-source's.
         if self.owns_k {
-            let latent = latent.expect("owns_k needs the compressor latent");
-            let cos_c = stride_rows(cos, 0, ratio, groups)?;
-            let sin_c = stride_rows(sin, 0, ratio, groups)?;
-            let hd_latent = latent.dim(2)?;
-            let wk = self.wk.as_ref().expect("owns_k needs index keys");
-            let k_norm = self
-                .k_norm
-                .as_ref()
-                .expect("owns_k needs an index key norm");
-            let k = rms_norm(
-                &crate::inference::offload::linear(&latent.reshape((b * groups, hd_latent))?, wk)?,
-                k_norm,
-                self.eps,
-            )?;
-            let k = rope_partial(&k.reshape((b, groups, 1, ihd))?, &cos_c, &sin_c, rd)?
-                .reshape((b, groups, ihd))?;
-            shared.index_k = Some(fp4_act_quant(&k, 32, true)?);
+            // The keys of the groups this pass completes, appended to the ones already held.
+            let fresh = match latent {
+                Some(latent) => {
+                    let cos_c = stride_rows(full_cos, at.held_groups * ratio, ratio, groups)?;
+                    let sin_c = stride_rows(full_sin, at.held_groups * ratio, ratio, groups)?;
+                    let hd_latent = latent.dim(2)?;
+                    let wk = self.wk.as_ref().expect("owns_k needs index keys");
+                    let k_norm = self
+                        .k_norm
+                        .as_ref()
+                        .expect("owns_k needs an index key norm");
+                    let k = rms_norm(
+                        &crate::inference::offload::linear(
+                            &latent.reshape((b * groups, hd_latent))?,
+                            wk,
+                        )?,
+                        k_norm,
+                        self.eps,
+                    )?;
+                    let k = rope_partial(&k.reshape((b, groups, 1, ihd))?, &cos_c, &sin_c, rd)?
+                        .reshape((b, groups, ihd))?;
+                    Some(fp4_act_quant(&k, 32, true)?)
+                }
+                None => None,
+            };
+            shared.index_k = Some(match (at.held_index_k, fresh) {
+                (Some(h), Some(f)) => Tensor::cat(&[h, &f], 1)?,
+                (Some(h), None) => h.clone(),
+                (None, Some(f)) => f,
+                (None, None) => Tensor::from_vec(Vec::<f32>::new(), (1, 0, ihd), &Device::Cpu)?,
+            });
         }
         let index_k = shared
             .index_k
             .clone()
             .expect("index_source needs an index_k source");
         let gtot = index_k.dim(1)?;
+        if gtot == 0 {
+            // Nothing is compressed yet: every slot is empty.
+            let out = vec![-1i32; b * s * self.index_topk];
+            shared.topk_idxs = Some(out.clone());
+            return Ok(out);
+        }
 
         // Index queries from the shared query latent.
         let q = self
@@ -225,11 +259,11 @@ impl Indexer {
 
         let qv = q.flatten_all()?.to_vec1::<f32>()?;
         let kv = index_k.flatten_all()?.to_vec1::<f32>()?;
-        let clen_of = |i: usize| (i + 1) / ratio;
+        let clen_of = |i: usize| (at.base + i + 1) / ratio;
         let offloaded = match (crate::inference::offload::current(), b) {
             (Some(off), 1) => {
                 let flat: Vec<f32> = weights.iter().flatten().copied().collect();
-                off.index_scores(&qv, &kv, &flat, (s, nh, ihd, gtot), ratio, scale)
+                off.index_scores(&qv, &kv, &flat, (s, nh, ihd, gtot), ratio, scale, at.base)
             }
             _ => None,
         };
@@ -471,15 +505,18 @@ pub(super) fn sparse_attn(
 }
 
 /// Which window cache slots each prefill query attends to, as [b, s, window] int32 into the window
-/// KV (positions 0..s-1), -1 for slots the query cannot yet see. Matches get_window_topk_idxs.
-pub(super) fn window_idxs(b: usize, s: usize, window: usize) -> Vec<i32> {
+/// KV, -1 for slots the query cannot yet see. Matches get_window_topk_idxs. Query `i` is row
+/// `q_off + i` of the keys: a pass that continues a state has the restored window's rows before its
+/// own.
+pub(super) fn window_idxs(b: usize, s: usize, window: usize, q_off: usize) -> Vec<i32> {
     let mut out = vec![-1i32; b * s * window];
     for bi in 0..b {
         for i in 0..s {
-            let base = i.saturating_sub(window - 1);
-            for k in 0..window.min(s) {
+            let iq = q_off + i;
+            let base = iq.saturating_sub(window - 1);
+            for k in 0..window.min(q_off + s) {
                 let pos = base + k;
-                if pos <= i {
+                if pos <= iq {
                     out[(bi * s + i) * window + k] = pos as i32;
                 }
             }
@@ -547,6 +584,11 @@ impl BandAttention {
     ) -> Result<Tensor> {
         let (b, s, dim) = x.dims3()?;
         let (nh, hd, rd) = (self.n_heads, self.head_dim, self.rope_head_dim);
+        // A pass that continues a state: the tokens it holds, and the tables from their row on.
+        let base = cache.as_deref().map_or(0, |c| c.base);
+        let (full_cos, full_sin) = (cos, sin);
+        let (cos, sin) = (cos.narrow(0, base, s)?, sin.narrow(0, base, s)?);
+        let (cos, sin) = (&cos, &sin);
         let x2 = x.reshape((b * s, dim))?;
 
         let qr = crate::inference::offload::stage("attn q_a", || {
@@ -557,39 +599,77 @@ impl BandAttention {
         })?;
         let q = crate::inference::offload::stage("attn rope", || rope_partial(&q, cos, sin, rd))?;
 
-        // Window KV (fp8 round trip), keys 0..s-1 of the concatenated cache.
+        // Window KV (fp8 round trip): the restored window's rows, then this pass's.
         let kv = crate::inference::offload::stage("attn kv", || {
             rms_norm(&self.wkv.apply(&x2)?, &self.kv_norm, self.eps)
         })?;
         let kv = crate::inference::offload::stage("attn rope", || {
             rope_partial(&kv.reshape((b, s, 1, hd))?, cos, sin, rd)?.reshape((b, s, hd))
         })?;
-        let window_kv =
+        let new_kv =
             crate::inference::offload::stage("attn kv fp8", || act_quant_fp8_e4m3(&kv, 32))?;
+        let old_rows = cache.as_deref().map_or(0, |c| c.win.len());
+        let window_kv = match cache.as_deref() {
+            Some(c) if old_rows > 0 => {
+                Tensor::cat(&[&super::attention::window_tensor(c, hd)?, &new_kv], 1)?
+            }
+            _ => new_kv.clone(),
+        };
         if let Some(cache) = cache.as_deref_mut() {
-            super::attention::fill_window(cache, &window_kv, b, self.window_size)?;
+            super::attention::fill_window(cache, &new_kv, b, self.window_size)?;
         }
-        let offset = s;
-        let groups = s / self.ratio;
+        // Compressed groups before this pass, and the raw rows of the group still filling.
+        let held_groups = cache.as_deref().map_or(0, |c| c.n_groups);
+        let held_x: Vec<Vec<f32>> = cache
+            .as_deref()
+            .map_or_else(Vec::new, |c| c.group_x.clone());
+        let offset = old_rows + s;
+        let pooled_rows = held_x.len() + s;
+        let groups = pooled_rows / self.ratio;
 
-        // The compressor (kv-source only) yields the pre-RoPE latent, which the indexer reads
-        // before it is rotated and quantised for attention.
-        let latent = match &self.compressor {
-            Some(c) => Some(crate::inference::offload::stage("compressor", || {
-                c.forward_prefill(x)
-            })?),
-            None => None,
+        // The compressor (kv-source only) yields the pre-RoPE latent of the groups this pass
+        // completes, which the indexer reads before it is rotated and quantised for attention.
+        let latent = match (&self.compressor, groups) {
+            (Some(c), g) if g > 0 => {
+                let pooled_x = if held_x.is_empty() {
+                    x.clone()
+                } else {
+                    let held: Vec<f32> = held_x.iter().flatten().copied().collect();
+                    let held = Tensor::from_vec(held, (1, held_x.len(), dim), &Device::Cpu)?;
+                    Tensor::cat(&[&held, x], 1)?
+                };
+                Some(crate::inference::offload::stage("compressor", || {
+                    c.forward_prefill(&pooled_x)
+                })?)
+            }
+            _ => None,
         };
         let qr3 = qr.reshape((b, s, qr.dim(1)?))?;
         let indexer_started = std::time::Instant::now();
+        let held_index_k = match cache.as_deref() {
+            Some(c) if self.indexer.as_ref().is_some_and(|i| i.owns_k) && held_groups > 0 => {
+                let ihd = self.indexer.as_ref().map_or(0, |i| i.index_head_dim);
+                Some(Tensor::from_vec(
+                    c.index_k.clone(),
+                    (1, held_groups, ihd),
+                    &Device::Cpu,
+                )?)
+            }
+            _ => None,
+        };
         let compress_idxs = match &self.indexer {
             Some(idx) => crate::inference::offload::stage("attn indexer", || {
                 idx.forward_prefill(
                     x,
                     &qr3,
                     latent.as_ref(),
-                    cos,
-                    sin,
+                    full_cos,
+                    full_sin,
+                    PrefillAt {
+                        base,
+                        held_groups,
+                        held_index_k: held_index_k.as_ref(),
+                    },
                     self.ratio,
                     offset,
                     groups,
@@ -604,14 +684,39 @@ impl BandAttention {
         if let Some(off) = crate::inference::offload::current() {
             off.record("indexer", indexer_started.elapsed().as_nanos() as u64);
         }
-        // A kv-source rotates and fp4-quantises its latent, then publishes it; a reader takes the
-        // compressed KV a source below it published.
-        if let Some(latent) = latent {
-            let cos_c = stride_rows(cos, 0, self.ratio, groups)?;
-            let sin_c = stride_rows(sin, 0, self.ratio, groups)?;
-            let latent = rope_partial(&latent.reshape((b, groups, 1, hd))?, &cos_c, &sin_c, rd)?
-                .reshape((b, groups, hd))?;
-            shared.compress_kv = Some(fp4_act_quant(&latent, 16, false)?);
+        // A kv-source rotates and fp4-quantises the latent of its new groups, appends them to the
+        // rows it holds, and publishes the lot; a reader takes the compressed KV a source below
+        // it published.
+        if self.compressor.is_some() {
+            let held = match cache.as_deref() {
+                Some(c) if held_groups > 0 => Some(Tensor::from_vec(
+                    c.comp_kv.clone(),
+                    (1, held_groups, hd),
+                    &Device::Cpu,
+                )?),
+                _ => None,
+            };
+            let all = match &latent {
+                Some(latent) => {
+                    let cos_c =
+                        stride_rows(full_cos, held_groups * self.ratio, self.ratio, groups)?;
+                    let sin_c =
+                        stride_rows(full_sin, held_groups * self.ratio, self.ratio, groups)?;
+                    let rotated =
+                        rope_partial(&latent.reshape((b, groups, 1, hd))?, &cos_c, &sin_c, rd)?
+                            .reshape((b, groups, hd))?;
+                    let fresh = fp4_act_quant(&rotated, 16, false)?;
+                    match &held {
+                        Some(h) => Tensor::cat(&[h, &fresh], 1)?,
+                        None => fresh,
+                    }
+                }
+                None => match held {
+                    Some(h) => h,
+                    None => Tensor::from_vec(Vec::<f32>::new(), (1, 0, hd), &Device::Cpu)?,
+                },
+            };
+            shared.compress_kv = Some(all);
         }
         let compress_kv = shared
             .compress_kv
@@ -619,22 +724,26 @@ impl BandAttention {
             .expect("a band layer needs a compressed KV source");
         if let (Some(cache), true) = (cache, self.compressor.is_some()) {
             cache.comp_kv = compress_kv.flatten_all()?.to_vec1::<f32>()?;
-            cache.n_groups = groups;
+            cache.n_groups = held_groups + groups;
             if self.indexer.as_ref().is_some_and(|i| i.owns_k) {
                 if let Some(k) = &shared.index_k {
                     cache.index_k = k.flatten_all()?.to_vec1::<f32>()?;
                 }
             }
             let rows = x2.flatten_all()?.to_vec1::<f32>()?;
-            cache.group_x = (groups * self.ratio..s)
-                .map(|t| rows[t * dim..(t + 1) * dim].to_vec())
-                .collect();
+            let mut all_rows = held_x;
+            all_rows.extend((0..s).map(|t| rows[t * dim..(t + 1) * dim].to_vec()));
+            cache.group_x = all_rows.split_off(groups * self.ratio);
         }
 
         // One sparse_attn over [window || compressed] keys and their concatenated indices.
-        let kv_all = Tensor::cat(&[&window_kv, &compress_kv], 1)?;
+        let kv_all = if compress_kv.dim(1)? == 0 {
+            window_kv.clone()
+        } else {
+            Tensor::cat(&[&window_kv, &compress_kv], 1)?
+        };
         let win = self.window_size;
-        let wi = window_idxs(b, s, win);
+        let wi = window_idxs(b, s, win, old_rows);
         let itopk = self.index_topk;
         let topk = win + itopk;
         let mut idxs = vec![-1i32; b * s * topk];
@@ -912,7 +1021,7 @@ mod tests {
         let kv = Tensor::from_vec(wave(n * d, 0.11), (1, n, d), &Device::Cpu).unwrap();
         let sink = vec![0.3f32, -0.2, 1.1];
         let topk = 9;
-        let mut idxs: Vec<i32> = window_idxs(1, s, topk);
+        let mut idxs: Vec<i32> = window_idxs(1, s, topk, 0);
         for (i, v) in idxs.iter_mut().enumerate() {
             if i % 5 == 4 {
                 *v = ((i * 7) % n) as i32;

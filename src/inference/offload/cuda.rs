@@ -852,10 +852,11 @@ impl Offload for Card {
         dims: (usize, usize, usize, usize),
         ratio: usize,
         scale: f32,
+        q_off: usize,
     ) -> Option<Result<Vec<f32>>> {
         let need = (q.len() + k.len() + weights.len() + dims.0 * dims.3) * F32;
         self.attempt("the indexer scores", need, || {
-            gpu_index_scores(&self.dev, q, k, weights, dims, ratio, scale)
+            gpu_index_scores(&self.dev, q, k, weights, dims, ratio, scale, q_off)
         })
     }
 
@@ -1110,10 +1111,11 @@ impl Offload for Cards {
         dims: (usize, usize, usize, usize),
         ratio: usize,
         scale: f32,
+        q_off: usize,
     ) -> Option<Result<Vec<f32>>> {
         self.0
             .iter()
-            .find_map(|c| c.index_scores(q, k, weights, dims, ratio, scale))
+            .find_map(|c| c.index_scores(q, k, weights, dims, ratio, scale, q_off))
     }
 
     fn attn_out(

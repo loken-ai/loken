@@ -421,7 +421,18 @@ impl EngramState {
 
 /// The row ids of every position of a prefill, per engram layer index.
 pub fn prefill_hashes(cfg: &EngramConfig, which: usize, tokens: &[u32]) -> Vec<Vec<u64>> {
-    let mut st = EngramState::default();
+    prefill_hashes_from(cfg, which, tokens, EngramState::default())
+}
+
+/// The row ids of every position of `tokens` that continue a sequence whose engram state is
+/// `start`.
+pub fn prefill_hashes_from(
+    cfg: &EngramConfig,
+    which: usize,
+    tokens: &[u32],
+    start: EngramState,
+) -> Vec<Vec<u64>> {
+    let mut st = start;
     tokens
         .iter()
         .map(|&t| {

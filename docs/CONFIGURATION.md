@@ -91,10 +91,11 @@ could live, and leave the key unset where nothing about an exchange may reach th
 
 A state costs about 2.7 MB of window per snapshot (the last 128 tokens of every layer, kept as the
 model keeps them) and about 1.1 KB per token of compressed KV, stored once in block files that every
-snapshot of a conversation shares. A prompt restores a stored prefix only when continuing the rest is
-cheaper than prefilling the whole prompt, which on a 2000-token prompt means a remainder of about a
-quarter of it or less. The batch worker and the serial path use the cache; a pipelined model does
-not, because half of its state is on the tail node.
+snapshot of a conversation shares. A prompt restores the longest stored prefix and prefills the rest
+in one layer-major pass onto it, so a stored prefix always pays. A pass over a few hundred tokens still
+routes to nearly every expert of every layer and so reads about as many expert bytes as a whole prompt:
+a remainder of 250 tokens costs a little over half a cold 2000-token prompt. The batch worker and the serial path use the cache; a pipelined model does not, because half of its state is on
+the tail node.
 
 A state is also keyed by the model files (length, modification time and header) and `expert_deferral`,
 so a different file or setting starts from nothing. A damaged, truncated or foreign file is ignored

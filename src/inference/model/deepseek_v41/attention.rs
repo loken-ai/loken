@@ -71,6 +71,10 @@ impl Ratio0Attention {
     ) -> Result<Tensor> {
         let (b, s, dim) = x.dims3()?;
         let (nh, hd, rd) = (self.n_heads, self.head_dim, self.rope_head_dim);
+        // A pass that continues a state reads the table from the row of its first token.
+        let base = cache.as_deref().map_or(0, |c| c.base);
+        let (cos, sin) = (cos.narrow(0, base, s)?, sin.narrow(0, base, s)?);
+        let (cos, sin) = (&cos, &sin);
         let x2 = x.reshape((b * s, dim))?;
 
         // Latent Q: down-project, RMS-norm the latent, up-project, split into heads, rope the tail.
@@ -91,6 +95,12 @@ impl Ratio0Attention {
             rope_partial(&kv.reshape((b, s, 1, hd))?, cos, sin, rd)?.reshape((b, s, hd))
         })?;
         let kv = crate::inference::offload::stage("attn kv fp8", || act_quant_fp8_e4m3(&kv, 32))?;
+        // The window rows the restored state holds come before the new ones.
+        let old = cache.as_deref().map_or(0, |c| c.win.len());
+        let keys = match cache.as_deref() {
+            Some(c) if old > 0 => Tensor::cat(&[&window_tensor(c, hd)?, &kv], 1)?,
+            _ => kv.clone(),
+        };
         if let Some(cache) = cache {
             fill_window(cache, &kv, b, self.window_size)?;
         }
@@ -99,10 +109,11 @@ impl Ratio0Attention {
         // query head. o is [b, s, nh, hd].
         let o = sparse_window_attn(
             &q,
-            &kv,
+            &keys,
             &self.attn_sink,
             self.window_size,
             self.softmax_scale(),
+            old,
         )?;
         // The cache stays in one rotated form, so the query's rotation is removed from the output.
         let o = rope_partial(&o, cos, &sin.neg()?, rd)?;
@@ -238,7 +249,15 @@ impl Ratio0Attention {
     }
 }
 
-/// The window ring a decode would hold after a prefill's `kv` [1, s, hd]: its last `window` rows.
+/// The window ring of `cache` as a tensor [1, rows, hd], oldest first.
+pub(super) fn window_tensor(cache: &AttnCache, hd: usize) -> Result<Tensor> {
+    let flat: Vec<f32> = cache.win.iter().flatten().copied().collect();
+    Tensor::from_vec(flat, (1, cache.win.len(), hd), &Device::Cpu)
+}
+
+/// The window ring a decode would hold after a prefill's `kv` [1, s, hd]: its last `window` rows,
+/// appended to what the ring holds when the pass continues a state. The window at each token
+/// count of `cache.grid` the pass goes through is kept packed in `cache.at_grid`.
 pub(super) fn fill_window(
     cache: &mut AttnCache,
     kv: &Tensor,
@@ -252,12 +271,24 @@ pub(super) fn fill_window(
     }
     let (_, s, hd) = kv.dims3()?;
     let rows = kv.flatten_all()?.to_vec1::<f32>()?;
-    // The window a decode would hold at each requested earlier count of tokens.
-    for &p in cache.grid.clone().iter().filter(|&&p| p > 0 && p <= s) {
-        let from = p.saturating_sub(window);
-        let at: std::collections::VecDeque<Vec<f32>> = (from..p)
-            .map(|t| rows[t * hd..(t + 1) * hd].to_vec())
-            .collect();
+    let base = cache.base;
+    let old: Vec<Vec<f32>> = cache.win.iter().cloned().collect();
+    // The window a decode would hold at each requested count of tokens: the last `window` rows of
+    // the old window followed by the new rows up to that count.
+    for &p in cache
+        .grid
+        .clone()
+        .iter()
+        .filter(|&&p| p > base && p <= base + s)
+    {
+        let upto = p - base;
+        let all = old
+            .iter()
+            .cloned()
+            .chain((0..upto).map(|t| rows[t * hd..(t + 1) * hd].to_vec()));
+        let total = old.len() + upto;
+        let at: std::collections::VecDeque<Vec<f32>> =
+            all.skip(total.saturating_sub(window)).collect();
         cache.at_grid.push(super::snapshot::window_section(&at));
     }
     for t in s.saturating_sub(window)..s {
@@ -404,6 +435,7 @@ fn sparse_window_attn(
     sink: &Tensor,
     window: usize,
     scale: f32,
+    q_off: usize,
 ) -> Result<Tensor> {
     let (b, s, h, d) = q.dims4()?;
     let n = kv.dim(1)?;
@@ -411,7 +443,7 @@ fn sparse_window_attn(
     let kvv = kv.flatten_all()?.to_vec1::<f32>()?;
     let sinkv = sink.flatten_all()?.to_vec1::<f32>()?;
     if let (Some(offload), 1) = (crate::inference::offload::current(), b) {
-        let idxs = super::band::window_idxs(b, s, window);
+        let idxs = super::band::window_idxs(b, s, window, q_off);
         if let Some(out) =
             offload.sparse_attention(&qv, &kvv, &sinkv, &idxs, (s, h, d, window), scale)
         {
@@ -422,18 +454,20 @@ fn sparse_window_attn(
 
     for bi in 0..b {
         for i in 0..s {
-            let lo = i.saturating_sub(window - 1);
+            // Query i is key row `q_off + i` of `kv`: the restored window comes first.
+            let iq = q_off + i;
+            let lo = iq.saturating_sub(window - 1);
             for hi in 0..h {
-                let q_off = ((bi * s + i) * h + hi) * d;
+                let q_at = ((bi * s + i) * h + hi) * d;
                 let sink_logit = sinkv[hi];
                 // First pass: logits over the window and their running max (the sink included).
-                let mut logits = Vec::with_capacity(i - lo + 1);
+                let mut logits = Vec::with_capacity(iq - lo + 1);
                 let mut m = sink_logit;
-                for j in lo..=i {
+                for j in lo..=iq {
                     let kv_off = (bi * n + j) * d;
                     let mut dot = 0f32;
                     for t in 0..d {
-                        dot += qv[q_off + t] * kvv[kv_off + t];
+                        dot += qv[q_at + t] * kvv[kv_off + t];
                     }
                     let l = dot * scale;
                     if l > m {
@@ -443,8 +477,8 @@ fn sparse_window_attn(
                 }
                 // Second pass: softmax denominator (with the sink) and the value-weighted sum.
                 let mut denom = (sink_logit - m).exp();
-                let o_off = q_off;
-                for (k, j) in (lo..=i).enumerate() {
+                let o_off = q_at;
+                for (k, j) in (lo..=iq).enumerate() {
                     let w = (logits[k] - m).exp();
                     denom += w;
                     let kv_off = (bi * n + j) * d;

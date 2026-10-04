@@ -116,8 +116,8 @@ pub trait Offload: Send + Sync {
     ) -> Option<Result<Vec<f32>>>;
 
     /// An indexer's scores [s, g]: `q` [s, nh, ihd], `k` [g, ihd], `weights` [s, nh]; the sum over
-    /// heads of relu(q . k) * weight * scale where query `i` reaches, `(i + 1) / ratio` positions,
-    /// -inf past. `None` to run it here.
+    /// heads of relu(q . k) * weight * scale where query `i` reaches, `(q_off + i + 1) / ratio` positions
+    /// (`q_off` tokens came before the first query), -inf past. `None` to run it here.
     fn index_scores(
         &self,
         _q: &[f32],
@@ -126,6 +126,7 @@ pub trait Offload: Send + Sync {
         _dims: (usize, usize, usize, usize),
         _ratio: usize,
         _scale: f32,
+        _q_off: usize,
     ) -> Option<Result<Vec<f32>>> {
         None
     }

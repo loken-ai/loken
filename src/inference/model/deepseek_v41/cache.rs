@@ -24,6 +24,9 @@ pub struct AttnCache {
     pub group_x: Vec<Vec<f32>>,
     /// Completed compressed groups so far.
     pub n_groups: usize,
+    /// Prefill input: the tokens this layer's state already holds before the pass, so the pass
+    /// continues it (its window, compressed rows and filling group) instead of starting one.
+    pub base: usize,
     /// Prefill scratch, input: the token counts at which this layer's window is to be kept.
     pub grid: Vec<usize>,
     /// Prefill scratch, output: the window at each of `grid` that the prefill passed, as the

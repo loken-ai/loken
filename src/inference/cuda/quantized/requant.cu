@@ -1167,11 +1167,11 @@ extern "C" __global__ void dequant_q6_k_f32(
 extern "C" __global__ void index_scores_f32(
         const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ w,
         float * __restrict__ out, const long s, const long nh, const long ihd, const long g,
-        const long ratio, const float scale) {
+        const long ratio, const long q_off, const float scale) {
     const long idx = (long) blockIdx.x * (long) blockDim.x + (long) threadIdx.x;
     if (idx >= s * g) return;
     const long i = idx / g, t = idx % g;
-    long reach = (i + 1) / ratio;
+    long reach = (i + q_off + 1) / ratio;
     if (reach > g) reach = g;
     if (t >= reach) { out[idx] = -INFINITY; return; }
     const float * kk = k + t * ihd;
