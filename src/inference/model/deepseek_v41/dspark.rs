@@ -852,12 +852,28 @@ pub enum DraftSource {
     ModelFile,
     /// The released checkpoint in the hub cache, at this snapshot.
     HubCheckpoint(PathBuf),
+    Companion(PathBuf),
 }
 
 impl Dspark {
-    /// The draft the model file carries, else the one the released checkpoint in the hub cache
-    /// holds, else `None`. Logs which it took, or why it took none.
-    pub fn locate<G: GgufSource>(file: &G) -> Option<Dspark> {
+    /// The draft a file beside the model declares, else the one the model file carries, else the
+    /// one the released checkpoint in the hub cache holds, else `None`. A companion that has moved
+    /// or does not load is passed over for the next source. Logs which it took, or why it took
+    /// none.
+    pub fn locate<G: GgufSource>(model: &Path, file: &G) -> Option<Dspark> {
+        let key = format!("{}.dspark.", super::ARCH);
+        for path in super::sibling::find_beside(model, &key) {
+            let loaded = crate::tensor::quantized::gguf_source::SplitGguf::open(&path)
+                .and_then(|g| Dspark::from_file(&g));
+            match loaded {
+                Ok(Some(d)) => {
+                    d.log_loaded(&DraftSource::Companion(path));
+                    return Some(d);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("DSpark draft in {} not loaded: {e}", path.display()),
+            }
+        }
         match Dspark::from_file(file) {
             Ok(Some(d)) => {
                 d.log_loaded(&DraftSource::ModelFile);
@@ -903,6 +919,7 @@ impl Dspark {
     fn log_loaded(&self, from: &DraftSource) {
         let from = match from {
             DraftSource::ModelFile => "the model file".to_string(),
+            DraftSource::Companion(path) => format!("the companion file {}", path.display()),
             DraftSource::HubCheckpoint(dir) => format!("the hub checkpoint {}", dir.display()),
         };
         tracing::info!(

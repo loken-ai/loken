@@ -716,7 +716,7 @@ impl LlmEngine {
                     );
                     // The draft the file carries first, the hub checkpoint's when it has none.
                     let draft =
-                        crate::inference::model::deepseek_v41::dspark::Dspark::locate(&source);
+                        crate::inference::model::deepseek_v41::dspark::Dspark::locate(&model_file, &source);
                     Box::new(
                         crate::inference::engine::model_backend::DeepseekV41Backend::with_draft(
                             model,

@@ -765,6 +765,78 @@ mod tests {
         dir
     }
 
+    /// Where the draft comes from, in order: a companion file beside the model that declares it,
+    /// then the model file itself; a companion that has moved is not missed, and with neither the
+    /// model has no draft.
+    #[test]
+    fn the_draft_is_taken_from_a_companion_then_the_model_file() {
+        use super::super::dspark::Dspark;
+        let dir = scratch("locate");
+        let ckpt_dir = dir.join("ckpt");
+        checkpoint(&ckpt_dir);
+        let ckpt = SafeTensorsSource::open(&ckpt_dir).unwrap();
+        let layout = Layout {
+            alignment: 64,
+            unit: 256,
+        };
+        let plain = dir.join("models").join("plain");
+        std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        converted(&plain);
+        let carrying = dir.join("models").join("carrying");
+        let src = open_mapped(&plain).unwrap();
+        complete(
+            &src,
+            Some((&ckpt, ckpt_dir.as_path())),
+            &carrying,
+            layout,
+            Some(GgmlDType::Q8_0),
+            &|_, _, _| {},
+        )
+        .unwrap();
+        let locate = |model: &Path| {
+            let g = crate::tensor::quantized::gguf_source::SplitGguf::open(model).unwrap();
+            Dspark::locate(model, &g).map(|d| d.stages.len())
+        };
+
+        // The model file carries the draft, the companion is gone: the model file's.
+        let apart = dir.join("apart");
+        std::fs::create_dir_all(&apart).unwrap();
+        std::fs::copy(&carrying, apart.join("model")).unwrap();
+        assert_eq!(locate(&apart.join("model")), Some(STAGES));
+
+        // The model carries none and a companion beside it does: the companion's.
+        assert_eq!(locate(&plain), Some(STAGES));
+
+        // The companion moves away: the model has no draft of its own and takes none.
+        std::fs::rename(&carrying, dir.join("elsewhere")).unwrap();
+        with_no_hub(|| assert_eq!(locate(&plain), None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Run `f` with the hub cache pointed at nothing, so a test of the other sources cannot be
+    /// answered by the released checkpoint on the machine running it.
+    fn with_no_hub(f: impl FnOnce()) {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "HOME"]
+                .into_iter()
+                .map(|k| (k, std::env::var_os(k)))
+                .collect();
+        let empty = std::env::temp_dir().join(format!("loken-no-hub-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        for k in ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME", "HOME"] {
+            std::env::set_var(k, &empty);
+        }
+        f();
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
     /// A completed file carries every key and every tensor of the one it completes, byte for
     /// byte - the stacks as one tensor per expert - lays each on the boundary asked for, puts a
     /// layer's hot experts first, and carries the draft the reader loads with the checkpoint's
