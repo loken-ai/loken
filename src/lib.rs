@@ -41,6 +41,8 @@
     // about the name, and `as_chunks` changes nothing the chunked loops rely on.
     unknown_lints,
     clippy::chunks_exact_to_as_chunks,
+    // An async trait method expands to a must-use future; the lint reads its own result type twice.
+    clippy::double_must_use,
     clippy::excessive_precision,
     clippy::identity_op,
     clippy::manual_range_contains,
