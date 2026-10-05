@@ -159,6 +159,19 @@ What the offload derives for itself, from measurement, and logs:
 During a prompt's prefill, the experts of the next layer are read from the file into one of two
 page-locked slabs while the dense work of the current layer runs.
 
+### Expert cache of a mixture held in the file's mapping
+
+No key. A mixture too large for the cards keeps its routed experts in the file's mapping, and
+the cache on each layer's card is sized by the load:
+
+| Quantity | Derived from |
+|---|---|
+| Experts a layer's cache holds | The budget the plan gave the card, less what the load took of it since, shared evenly over the cached layers, divided by the bytes of one expert |
+| Which expert a slot holds | Counts of each expert's use, halved every `n_experts` tokens through a layer, so the cache follows the text in hand. A missing expert replaces the coldest slot not in use only when its count is higher |
+| Bytes page-locked for copies to the cards | Three quarters of the memory the kernel still has free, within the cap of the process's control group |
+| A wide batch streams a layer's experts | Only when copying what the card does not hold, at the host-to-card rate measured, takes less than running the rows through the cache at the pace tokens have decoded |
+| Host memory admitted for a spill | The bytes the process owns; pages viewed in place from the mapping are not counted, and the log gives the bytes read from the mapping with a warning when they exceed the host's memory |
+
 ### Files, moderation and URLs
 
 | Key | Default | What it does |

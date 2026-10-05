@@ -148,7 +148,7 @@ quoted here.
 
 | What | State |
 |---|---|
-| Card against host numerics | The 160-expert file's host path reproduces the reference tokens on three of four raw prompts; the card paths agree with the host to a cosine of 0.9997 per layer |
+| Card against host numerics | The card paths agree with the host to a cosine of 0.9997 per layer on the 160-expert file |
 | Low-bit expert formats | Run on the card in decode and prefill, judged against the host decoder |
 | Expert cache | Hot experts held on each layer's card, the rest computed on the host beside it; a wide batch streams a layer's experts through two buffers when that costs less than its rows |
 | Decode graph | Captured for files without an n-gram table or indexed attention. The others, and every file under the cache plan, decode eagerly |
