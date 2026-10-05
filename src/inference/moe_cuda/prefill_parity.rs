@@ -246,6 +246,113 @@ fn the_prefill_expert_gemm_agrees_with_the_decode_one_on_the_same_weights() {
     }
 }
 
+/// Expert blocks of the formats that are only read: random codes under scales that are finite, as
+/// many experts as `experts`, `rows` rows of `k` weights each.
+fn read_only_experts(dtype: GgmlDType, experts: usize, rows: usize, k: usize) -> QTensor {
+    use crate::tensor::quantized::QStorage;
+    let blocks = experts * rows * k / dtype.block_size();
+    let size = dtype.type_size();
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ dtype.to_u32() as u64;
+    let mut bytes = Vec::with_capacity(blocks * size);
+    for _ in 0..blocks {
+        for i in 0..size {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            bytes.push((state >> 33) as u8 ^ (i as u8).wrapping_mul(31));
+        }
+        // Every one of these formats opens a block with its f16 scale: a modest finite one.
+        let at = bytes.len() - size;
+        let scale = half::f16::from_f32(0.004 + (bytes[at + 2] as f32) * 1e-5).to_le_bytes();
+        bytes[at] = scale[0];
+        bytes[at + 1] = scale[1];
+    }
+    let storage = QStorage::from_data(std::borrow::Cow::Owned(bytes), &Device::Cpu, dtype).unwrap();
+    QTensor::new(storage, crate::tensor::Shape::from((experts, rows, k))).unwrap()
+}
+
+/// The expert GEMMs over the formats that are only read, against the weights decoded on the host.
+///
+/// The decode and prefill kernels decode a block through the same code, so agreeing with each
+/// other proves nothing about the decoding: this judges both against the host's decoder, which
+/// is held to blocks cut from real files.
+#[test]
+fn the_expert_gemms_read_the_low_bit_formats_as_the_host_decodes_them() {
+    let Some(dev) = ampere_card("the low-bit expert formats are") else {
+        return;
+    };
+    let (n_tokens, topk, experts, rows, k) = (5usize, 2usize, 4usize, 64usize, 512usize);
+    // Pairs, sorted by expert so each expert's rows are one run.
+    let mut pairs: Vec<(u32, u32)> = (0..n_tokens * topk)
+        .map(|t| (((t * 5 + 1) % experts) as u32, t as u32))
+        .collect();
+    pairs.sort_by_key(|p| p.0);
+    let sti: Vec<u32> = pairs.iter().map(|p| p.1).collect();
+    let eid: Vec<u32> = pairs.iter().map(|p| p.0).collect();
+    let x: Vec<f32> = (0..n_tokens * k)
+        .map(|i| (((i * 13 + 7) % 47) as f32) * 0.04 - 0.9)
+        .collect();
+    for dtype in [
+        GgmlDType::Iq4Nl,
+        GgmlDType::Iq4Xs,
+        GgmlDType::Iq3Xxs,
+        GgmlDType::Iq3S,
+        GgmlDType::Iq2S,
+        GgmlDType::Q2_0,
+    ] {
+        let host = read_only_experts(dtype, experts, rows, k);
+        let w = host
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // The pair `t` is the expert `eid` of its sorted position, run against its token's row.
+        let mut want = vec![0f32; n_tokens * topk * rows];
+        for (pos, &t) in sti.iter().enumerate() {
+            let e = eid[pos] as usize;
+            let row = &x[(t as usize / topk) * k..(t as usize / topk + 1) * k];
+            for r in 0..rows {
+                let wr = &w[(e * rows + r) * k..(e * rows + r + 1) * k];
+                want[t as usize * rows + r] = wr.iter().zip(row).map(|(a, b)| a * b).sum();
+            }
+        }
+        let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let card = host.to_device(&dev).unwrap();
+        let input = Tensor::from_vec(x.clone(), (n_tokens, k), &dev).unwrap();
+        let sti_t = Tensor::from_vec(sti.clone(), sti.len(), &dev).unwrap();
+        let eid_t = Tensor::from_vec(eid.clone(), eid.len(), &dev).unwrap();
+        for prefill in [false, true] {
+            let got = super::gemm::moe_gemm_gguf(
+                &input,
+                &card,
+                &None,
+                &sti_t,
+                &eid_t,
+                topk,
+                prefill,
+                DType::F16,
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst < 0.03 * peak,
+                "{dtype:?} {}: the card differs from the host's decoding by {worst} of {peak}",
+                if prefill { "prefill" } else { "decode" }
+            );
+        }
+    }
+}
+
 /// The same judgement, from several threads at once.
 ///
 /// Every caller of the expert GEMM quantises its activation into one staging buffer per stream,

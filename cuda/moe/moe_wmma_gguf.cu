@@ -9,6 +9,7 @@
 // stores it, expanded there, and the expanded tile is what the instruction reads.
 
 #include "gguf.cuh"
+#include "gguf_iq.cuh"
 #include <mma.h>
 #include "moe_utils.cuh"
 
@@ -71,6 +72,18 @@ template <>
 struct expander_threads<block_q5_0> { static constexpr int value = 32; };
 template <>
 struct expander_threads<block_q5_1> { static constexpr int value = 32; };
+template <>
+struct expander_threads<block_iq4_nl> { static constexpr int value = 32; };
+template <>
+struct expander_threads<block_iq4_xs> { static constexpr int value = 32; };
+template <>
+struct expander_threads<block_iq3_xxs> { static constexpr int value = 32; };
+template <>
+struct expander_threads<block_iq3_s> { static constexpr int value = 32; };
+template <>
+struct expander_threads<block_iq2_s> { static constexpr int value = 32; };
+template <>
+struct expander_threads<block_q2_0> { static constexpr int value = 32; };
 template <>
 struct expander_threads<block_q4_K> { static constexpr int value = 32; };
 template <>

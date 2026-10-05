@@ -61,7 +61,13 @@ static __device__ __forceinline__ float warp_sum(float x) {
     X(5, q6_K,  QK_K,     QI6_K,    VDR_Q6_K_Q8_1_MMVQ)   \
     X(6, q5_0,  QK5_0,    QI5_0,    VDR_Q5_0_Q8_1_MMVQ)   \
     X(7, mxfp4, QK_MXFP4, QI_MXFP4, VDR_MXFP4_Q8_1_MMVQ) \
-    X(8, q5_1,  QK5_1,    QI5_1,    VDR_Q5_1_Q8_1_MMVQ)
+    X(8, q5_1,  QK5_1,    QI5_1,    VDR_Q5_1_Q8_1_MMVQ)   \
+    X(9, iq4_nl,  QK4_NL,     QI4_NL,     VDR_IQ4_NL_Q8_1_MMVQ)   \
+    X(10, iq4_xs, QK_IQ4_XS,  QI_IQ4_XS,  VDR_IQ4_XS_Q8_1_MMVQ)   \
+    X(11, iq3_xxs, QK_IQ3_XXS, QI_IQ3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ) \
+    X(12, iq3_s,  QK_IQ3_S,   QI_IQ3_S,   VDR_IQ3_S_Q8_1_MMVQ)    \
+    X(13, iq2_s,  QK_IQ2_S,   QI_IQ2_S,   VDR_IQ2_S_Q8_1_MMVQ)    \
+    X(14, q2_0,   QK_Q2_0,    QI_Q2_0,    VDR_Q2_0_Q8_1_MMVQ)
 
 /// The subset of the table above that a block dequantiser exists for.
 ///
@@ -76,7 +82,13 @@ static __device__ __forceinline__ float warp_sum(float x) {
     X(4, q5_K, QK_K,  QI5_K, VDR_Q5_K_Q8_1_MMVQ)     \
     X(5, q6_K, QK_K,  QI6_K, VDR_Q6_K_Q8_1_MMVQ)     \
     X(6, q5_0, QK5_0, QI5_0, VDR_Q5_0_Q8_1_MMVQ)     \
-    X(8, q5_1, QK5_1, QI5_1, VDR_Q5_1_Q8_1_MMVQ)
+    X(8, q5_1, QK5_1, QI5_1, VDR_Q5_1_Q8_1_MMVQ)     \
+    X(9, iq4_nl,  QK4_NL,     QI4_NL,     VDR_IQ4_NL_Q8_1_MMVQ)   \
+    X(10, iq4_xs, QK_IQ4_XS,  QI_IQ4_XS,  VDR_IQ4_XS_Q8_1_MMVQ)   \
+    X(11, iq3_xxs, QK_IQ3_XXS, QI_IQ3_XXS, VDR_IQ3_XXS_Q8_1_MMVQ) \
+    X(12, iq3_s,  QK_IQ3_S,   QI_IQ3_S,   VDR_IQ3_S_Q8_1_MMVQ)    \
+    X(13, iq2_s,  QK_IQ2_S,   QI_IQ2_S,   VDR_IQ2_S_Q8_1_MMVQ)    \
+    X(14, q2_0,   QK_Q2_0,    QI_Q2_0,    VDR_Q2_0_Q8_1_MMVQ)
 
 /// `a` divided by `b`, rounded up - how many whole `b`s it takes to cover `a`.
 ///

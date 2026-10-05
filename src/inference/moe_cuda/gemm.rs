@@ -20,7 +20,7 @@ use half::{bf16, f16};
 /// `cuda/moe/moe_gguf.cu` dispatches on that number and its table is these same rows  -
 /// the entry points used to carry a copy each, differing by a row or two, which is how a
 /// format came to be accepted here and unhandled there.
-const EXPERT_QUANT_CODES: [(GgmlDType, i32); 9] = [
+const EXPERT_QUANT_CODES: [(GgmlDType, i32); 15] = [
     (GgmlDType::Q8_0, 0),
     (GgmlDType::Q4K, 1),
     (GgmlDType::Q2K, 2),
@@ -30,6 +30,12 @@ const EXPERT_QUANT_CODES: [(GgmlDType, i32); 9] = [
     (GgmlDType::Q5_0, 6),
     (GgmlDType::MxFp4, 7),
     (GgmlDType::Q5_1, 8),
+    (GgmlDType::Iq4Nl, 9),
+    (GgmlDType::Iq4Xs, 10),
+    (GgmlDType::Iq3Xxs, 11),
+    (GgmlDType::Iq3S, 12),
+    (GgmlDType::Iq2S, 13),
+    (GgmlDType::Q2_0, 14),
 ];
 
 /// Whether the expert kernels serve this weight format at all.

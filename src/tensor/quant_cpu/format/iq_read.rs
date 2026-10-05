@@ -110,4 +110,45 @@ mod tests {
             );
         }
     }
+
+    /// The card's codebooks, in `cuda/moe/iq_tables.cuh`, are the host's: every entry, read back
+    /// from the header the kernels include.
+    #[test]
+    fn the_card_codebooks_are_the_hosts() {
+        use super::super::iq2_xxs::KSIGNS_IQ2XS;
+        use super::super::iq4_nl::LEVELS;
+        use super::super::iq_grids::{IQ2S_GRID, IQ3S_GRID, IQ3XXS_GRID};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cuda/moe/iq_tables.cuh");
+        let text = std::fs::read_to_string(path).unwrap();
+        let table = |name: &str| -> Vec<i64> {
+            let start = text
+                .find(&format!(" {name}["))
+                .unwrap_or_else(|| panic!("{name} is not in the header"));
+            let body = &text[text[start..].find('{').unwrap() + start + 1..];
+            let body = &body[..body.find('}').unwrap()];
+            body.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| {
+                    let t = t.trim_end_matches(['u', 'l']);
+                    match t.strip_prefix("0x") {
+                        Some(h) => u64::from_str_radix(h, 16).unwrap() as i64,
+                        None => t.parse().unwrap(),
+                    }
+                })
+                .collect()
+        };
+        let same = |name: &str, host: Vec<i64>| assert_eq!(table(name), host, "{name}");
+        same("IQ2S_GRID", IQ2S_GRID.iter().map(|&v| v as i64).collect());
+        same(
+            "IQ3XXS_GRID",
+            IQ3XXS_GRID.iter().map(|&v| v as i64).collect(),
+        );
+        same("IQ3S_GRID", IQ3S_GRID.iter().map(|&v| v as i64).collect());
+        same(
+            "KSIGNS_IQ2XS",
+            KSIGNS_IQ2XS.iter().map(|&v| v as i64).collect(),
+        );
+        same("KVALUES_IQ4NL", LEVELS.iter().map(|&v| v as i64).collect());
+    }
 }

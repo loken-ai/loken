@@ -8,6 +8,7 @@
  * a real token's row, or pair it with a second GEMM's total through a gated activation.
  */
 #include "gguf.cuh"
+#include "gguf_iq.cuh"
 #include "mxfp4_moe.cuh"
 #include <cuda.h>
 #include <cuda_runtime.h>
