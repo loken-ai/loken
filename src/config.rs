@@ -89,12 +89,12 @@ pub struct InferenceConfigToml {
     pub moderation_model: Option<String>,
     #[serde(default)]
     pub public_url: Option<String>,
-    /// For a streamed model: the largest mean divergence (KL, in nats) from the exact output the
-    /// operator accepts in exchange for speed. The engine measures what each way of giving up
-    /// experts costs on a bundled text at load and picks the fastest that fits; 0 keeps the
-    /// output exact.
+    /// For a streamed model: how much exactness the output may give up for speed. `exact` (the
+    /// default) keeps it identical to the full model; `balanced` accepts differences no larger
+    /// than the model's own run-to-run noise; `fast` accepts a small multiple of that. The
+    /// engine measures the noise and the cost of each way of giving up experts at load.
     #[serde(default)]
-    pub quality_budget: f32,
+    pub quality: crate::inference::engine::llm_engine::QualityLevel,
     /// Keys this version no longer reads, kept so a config written for an older one still
     /// loads; each is reported once at startup.
     #[serde(flatten, skip_serializing)]
@@ -111,6 +111,9 @@ pub fn obsolete_note(key: &str) -> String {
         }
         "state_cache_salt" => "a stored state is identified by the model's files and the plan; \
              a salt adds nothing"
+            .to_string(),
+        "quality_budget" => "set `quality` to exact, balanced or fast; the engine derives the \
+             divergence it accepts from the model's own numerical noise"
             .to_string(),
         "expert_deferral" => "a share of host experts finishing a layer late changes the output \
              and could not be measured at load; the mechanism stays off"
@@ -279,7 +282,7 @@ impl Config {
             files_dir: toml_config.files_dir.clone(),
             moderation_model: toml_config.moderation_model.clone(),
             public_url: toml_config.public_url.clone(),
-            quality_budget: toml_config.quality_budget,
+            quality: toml_config.quality,
             progress_callback: None, // No progress callback from config file
             models_dir: None,        // Will be set by APIServer
             disable_arc_layers: false,
@@ -422,6 +425,7 @@ mod tests {
             state_cache_block_tokens = 256
             state_cache_salt = "mine"
             expert_deferral = 0.25
+            quality_budget = 0.05
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         let keys: Vec<&str> = config
@@ -434,6 +438,7 @@ mod tests {
             keys,
             [
                 "expert_deferral",
+                "quality_budget",
                 "state_cache_block_tokens",
                 "state_cache_salt"
             ]
@@ -442,6 +447,32 @@ mod tests {
             assert!(!obsolete_note(key).is_empty());
         }
         assert!(obsolete_note("state_cache_block_tokens").contains("derived"));
+        assert!(obsolete_note("quality_budget").contains("quality"));
+    }
+
+    #[test]
+    fn the_quality_policy_is_read_strictly() {
+        use crate::inference::engine::llm_engine::QualityLevel;
+        let read = |v: &str| -> Result<Config, toml::de::Error> {
+            toml::from_str(&format!(
+                "[inference]\nmodel_id = \"m\"\nquality = \"{v}\"\n"
+            ))
+        };
+        assert_eq!(
+            read("balanced").unwrap().inference.quality,
+            QualityLevel::Balanced
+        );
+        assert_eq!(read("fast").unwrap().inference.quality, QualityLevel::Fast);
+        assert_eq!(
+            read("exact").unwrap().inference.quality,
+            QualityLevel::Exact
+        );
+        let none: Config = toml::from_str("[inference]\nmodel_id = \"m\"\n").unwrap();
+        assert_eq!(none.inference.quality, QualityLevel::Exact);
+        let err = read("quick").unwrap_err().to_string();
+        for name in ["exact", "balanced", "fast"] {
+            assert!(err.contains(name), "{err}");
+        }
     }
 }
 

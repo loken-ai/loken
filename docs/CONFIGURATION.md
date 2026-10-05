@@ -130,18 +130,24 @@ the state size. A restore always leaves at least one token to prefill, to produc
 
 ### Streamed mixtures (DeepSeek V4.1)
 
-`quality_budget` applies to a model whose routed experts stream from disk. It defaults to `0`,
-which keeps every layer and every output exact; above `0` it changes the output.
+`quality` applies to a model whose routed experts stream from disk, and it is the only knob: the
+engine measures the rest.
 
 | Key | Default | What it does |
 |---|---|---|
-| `quality_budget` | `0` | Largest mean divergence from the exact output, in nats of KL, accepted in exchange for speed. Above `0`, the engine runs a bundled text teacher-forced once exactly and once under each candidate way of giving up experts, and applies the candidate that saves the most disk reads within the budget. |
+| `quality` | `exact` | How much exactness the output may give up for speed. `exact`: identical to the full model. `balanced`: differences no larger than the model's own run-to-run noise, the divergence between its exact runs on the card's kernels and on the host's. `fast`: more speed for small, measured differences, three times that noise. Any other value is a startup error. |
+
+At load the engine runs a bundled text teacher-forced on the card path and on the host path to
+measure the noise, then once under each candidate way of giving up experts, and applies the
+candidate that saves the most disk reads within the level's budget. With no card and host to
+compare, `balanced` and `fast` run exact and say why in the log. The old key `quality_budget` is no
+longer read.
 
 The candidates derive from `K`, the number of experts a token routes to: keep the `K-1` or `K-2`
 heaviest, or replace a light expert that sits in no card tier when its weight share is under
 `0.5/K`, `0.75/K` or `1/K`. The measured table is cached per model file and plan in
-`quality-calibration.json` under `loken/` in the user cache directory, so a different budget reuses
-it. A file with no tokenizer in its metadata runs exact.
+`quality-calibration.json`, and the noise in `quality-noise.json`, under `loken/` in the user cache
+directory, so a different level reuses them. A file with no tokenizer in its metadata runs exact.
 
 What the offload derives for itself, from measurement, and logs:
 

@@ -1000,7 +1000,7 @@ impl DeepseekV41Backend {
         let streamed = Streamed::open_for(&model, context_length.min(PREFILL_TRANSIENT_TOKENS));
         // A quality budget is spent here, once the placement stands: the engine measures what each
         // way of giving up experts costs and applies the fastest that fits.
-        if let Some((budget, identity, ids)) = model.take_quality_policy() {
+        if let Some((level, identity, ids)) = model.take_quality_policy() {
             use crate::inference::model::deepseek_v41::calibrate;
             if let Some(s) = &streamed {
                 model.offload_experts(Some(s.lanes.clone()));
@@ -1020,7 +1020,18 @@ impl DeepseekV41Backend {
                 }?;
                 logits.to_vec2::<f32>()
             };
-            if let Err(e) = calibrate::apply_budget(&model, budget, &key, &ids, &resident, &run) {
+            // The model's own noise is the card's exact run against the host's: the second pass
+            // runs without the offload, so the experts compute where the card is not.
+            let host = |m: &crate::inference::model::deepseek_v41::model::DeepseekV41Model,
+                        toks: &[u32]|
+             -> crate::tensor::Result<Vec<Vec<f32>>> {
+                m.forward_prefill(toks)?.to_vec2::<f32>()
+            };
+            let other: Option<&dyn Fn(&_, &[u32]) -> crate::tensor::Result<Vec<Vec<f32>>>> =
+                streamed.as_ref().map(|_| &host as &dyn Fn(&_, &[u32]) -> _);
+            if let Err(e) =
+                calibrate::apply_level(&model, level, &key, &ids, &resident, &run, other)
+            {
                 tracing::warn!("quality calibration failed, routing stays exact: {e}");
             }
         }

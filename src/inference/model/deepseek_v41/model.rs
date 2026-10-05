@@ -13,6 +13,7 @@ use super::hyper_connections::hc_pre;
 use super::load::{load_band_block, load_ratio0_block, projection};
 use super::source::WeightSource;
 use super::DeepseekV41Config;
+use crate::inference::engine::llm_engine::QualityLevel;
 use crate::inference::offload::projection::Projection;
 use crate::tensor::ops::rms_norm;
 use crate::tensor::{Device, Error, Result, Tensor};
@@ -93,7 +94,7 @@ pub struct DeepseekV41Model {
     expert_deferral: f32,
     /// The quality budget to calibrate at backend start, with the model's identity and the
     /// calibration text's tokens; taken once.
-    quality: std::sync::Mutex<Option<(f64, String, Vec<u32>)>>,
+    quality: std::sync::Mutex<Option<(QualityLevel, String, Vec<u32>)>>,
     // rope regimes: ratio-0 uses base theta with no YaRN; a band layer uses the compressed theta
     // with YaRN from original_seq_len.
     rope_theta: f32,
@@ -1095,14 +1096,14 @@ impl DeepseekV41Model {
         }
     }
 
-    /// Ask for the routing that gives up the most disk reads within `budget` (KL, nats) of the
+    /// Ask for the routing that gives up the most disk reads within what `level` accepts of the
     /// exact output, to be calibrated when the backend starts.
-    pub fn set_quality_policy(&self, budget: f64, identity: String, ids: Vec<u32>) {
-        *self.quality.lock().unwrap() = Some((budget, identity, ids));
+    pub fn set_quality_policy(&self, level: QualityLevel, identity: String, ids: Vec<u32>) {
+        *self.quality.lock().unwrap() = Some((level, identity, ids));
     }
 
     /// The policy `set_quality_policy` left, once.
-    pub fn take_quality_policy(&self) -> Option<(f64, String, Vec<u32>)> {
+    pub fn take_quality_policy(&self) -> Option<(QualityLevel, String, Vec<u32>)> {
         self.quality.lock().unwrap().take()
     }
 

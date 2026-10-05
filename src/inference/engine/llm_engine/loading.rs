@@ -271,7 +271,7 @@ impl LlmEngine {
         // disable_cuda config (empty cuda_devices -> every layer on CPU).
         let disable_cuda = self.config.disable_cuda || crate::gpu::force_cpu();
         let kv_quant = self.config.kv_quant;
-        let quality_budget = self.config.quality_budget;
+        let quality = self.config.quality;
         let state_cache = self.state_cache.clone();
         let user_context_length = self.config.context_length;
         let model_state = self.model_state.clone();
@@ -774,7 +774,7 @@ impl LlmEngine {
                     }
                     let model = DeepseekV41Model::load(&source, &cfg)
                         .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
-                    if quality_budget > 0.0 {
+                    if quality != QualityLevel::Exact {
                         let file_len = std::fs::metadata(&model_file).map_or(0, |m| m.len());
                         let name = model_file
                             .file_name()
@@ -783,7 +783,7 @@ impl LlmEngine {
                         if let Some(ids) =
                             crate::inference::model::deepseek_v41::calibrate::calibration_ids(&source)
                         {
-                            model.set_quality_policy(quality_budget as f64, format!("{name}:{file_len}"), ids);
+                            model.set_quality_policy(quality, format!("{name}:{file_len}"), ids);
                         }
                     }
                     // Without a kept tier the page cache is the only cache, and a prompt's

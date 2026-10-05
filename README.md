@@ -46,7 +46,7 @@ configure one.
 | Speculative decoding | automatic for a model that spills to the host; `/api/draft/attach` | | Measured on one pair, [guide](docs/guides/drafter.md) |
 | KV reuse across conversations, on disk, past the window | automatic | `kv_disk_dir` | Runs, [guide](docs/guides/kv-memory.md) |
 | Decode-state cache for the large mixture and recurrent hybrids | automatic once set | `state_cache_dir` | Runs, off by default, [CONFIG](docs/CONFIGURATION.md#decode-state-cache-deepseek-v41-and-recurrent-hybrids) |
-| Lossy expert routing for speed, within a stated divergence | automatic once set | `quality_budget` | DeepSeek V4.1 only, off by default, [CONFIG](docs/CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
+| Lossy expert routing for speed, within the model's own noise | automatic once set | `quality` | DeepSeek V4.1 only, off by default, [CONFIG](docs/CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
 | Files, batches, message batches | `/v1/files`, `/v1/batches`, `/v1/messages/batches` | `files_dir` | Runs |
 | Moderation with a classifier | `/v1/moderations` | `moderation_model` | Runs, five families |
 | Images, edits, variations, adapters | `/v1/images/*`, `/v1/loras` | `lora_dir` | Judged partially, [STATUS](docs/STATUS.md#judged-partially) |

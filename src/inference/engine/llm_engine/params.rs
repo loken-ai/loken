@@ -4,6 +4,20 @@
 
 use super::*;
 
+/// How much exactness a streamed model may give up for speed, as a policy the engine turns into
+/// a measured divergence budget (see `deepseek_v41::calibrate`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QualityLevel {
+    /// The output of the full model, bit for bit.
+    #[default]
+    Exact,
+    /// Differences no larger than the model's own run-to-run numerical noise.
+    Balanced,
+    /// More speed for small, measured differences: a fixed multiple of that noise.
+    Fast,
+}
+
 /// Check whether an error indicates a CUDA out-of-memory condition. Used to
 /// distinguish recoverable load failures (retry via split) from real errors,
 /// and recoverable runtime allocation failures (retry with a smaller prefill
@@ -173,8 +187,8 @@ pub struct InferenceConfig {
     /// The origin clients reach this server at, for the URLs it hands out; `None` uses
     /// the request\'s `Host`.
     pub public_url: Option<String>,
-    /// The divergence from exact output accepted for speed on a streamed model; 0 is exact.
-    pub quality_budget: f32,
+    /// How much exactness a streamed model may give up for speed.
+    pub quality: QualityLevel,
     /// Progress callback
     pub progress_callback: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
     /// Models directory (for finding model files)
@@ -236,7 +250,7 @@ impl Default for InferenceConfig {
             files_dir: None,
             moderation_model: None,
             public_url: None,
-            quality_budget: 0.0,
+            quality: QualityLevel::Exact,
             progress_callback: None,
             models_dir: None,
             disable_arc_layers: false,

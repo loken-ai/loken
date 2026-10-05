@@ -1,6 +1,7 @@
-//! Choosing how much exactness to give up for speed, from a quality budget. The budget is the
-//! largest mean divergence (KL, in nats) the user accepts between the model's distribution and the
-//! exact one; zero keeps routing exact. A short bundled text is run teacher-forced once exactly and
+//! Choosing how much exactness to give up for speed, from a quality level. The level is turned
+//! into a budget: the largest mean divergence (KL, in nats) accepted between the model's
+//! distribution and the exact one, derived from the model's own numerical noise (see
+//! [`noise`]); a zero budget keeps routing exact. A short bundled text is run teacher-forced once exactly and
 //! once under each candidate setting, each scored by the teacher-forced harness; the candidate that
 //! saves the most disk reads while staying within the budget is chosen. The measurements are cached
 //! per model and plan, so they are taken once and a different budget reuses them.
@@ -12,8 +13,117 @@
 use super::model::DeepseekV41Model;
 use super::moe::Truncation;
 use super::quality::{log_softmax, score, top, Reference, TOP};
+use crate::inference::engine::llm_engine::QualityLevel;
 use crate::tensor::Result;
 use serde::{Deserialize, Serialize};
+
+/// What `fast` accepts, as a multiple of the model's own numerical noise: the divergence between
+/// two exact runs that differ only in numerics the engine does not control. `balanced` accepts
+/// one times the noise.
+pub const FAST_NOISE_MULTIPLE: f64 = 3.0;
+
+/// The budget a level accepts for a model whose exact runs diverge by `noise` (mean KL, nats);
+/// `None` when the level asks for no loss, or when the noise is unknown and nothing can be said
+/// to stay within it.
+pub fn budget_for(level: QualityLevel, noise: Option<f64>) -> Option<f64> {
+    let noise = noise.filter(|n| n.is_finite() && *n >= 0.0)?;
+    match level {
+        QualityLevel::Exact => None,
+        QualityLevel::Balanced => Some(noise),
+        QualityLevel::Fast => Some(noise * FAST_NOISE_MULTIPLE),
+    }
+}
+
+/// The model's own numerical noise: the mean KL of the exact run on `other` against the exact run
+/// on `run` (the card's kernels against the host's, the pair the engine cannot choose between).
+pub fn noise(
+    model: &DeepseekV41Model,
+    ids: &[u32],
+    run: &dyn Fn(&DeepseekV41Model, &[u32]) -> Result<Vec<Vec<f32>>>,
+    other: &dyn Fn(&DeepseekV41Model, &[u32]) -> Result<Vec<Vec<f32>>>,
+) -> Result<f64> {
+    model.set_resident_override(None);
+    model.set_truncation(Truncation::default());
+    let first = run(model, ids)?;
+    let second = other(model, ids)?;
+    let mut reference = Reference {
+        ids: Vec::new(),
+        logprobs: Vec::new(),
+    };
+    for row in &first {
+        let (i, v) = top(&log_softmax(row));
+        reference.ids.push(i);
+        reference.logprobs.push(v);
+    }
+    let next: Vec<Option<u32>> = (0..ids.len()).map(|i| ids.get(i + 1).copied()).collect();
+    Ok(score(&second, &reference, &next).mean_kl)
+}
+
+fn noise_file() -> Option<std::path::PathBuf> {
+    Some(dirs::cache_dir()?.join("loken").join("quality-noise.json"))
+}
+
+/// The cached noise for `key`, if one was written.
+pub fn cached_noise(key: &str) -> Option<f64> {
+    let text = std::fs::read_to_string(noise_file()?).ok()?;
+    let mut all: std::collections::HashMap<String, f64> = serde_json::from_str(&text).ok()?;
+    all.remove(key)
+}
+
+/// Keep `noise` under `key`, beside the figures of other models and plans.
+pub fn store_noise(key: &str, noise: f64) {
+    let Some(path) = noise_file() else { return };
+    let mut all: std::collections::HashMap<String, f64> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    all.insert(key.to_string(), noise);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&all) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// Apply `level`: the noise of this model and plan from the cache, else measured against `other`
+/// (and cached), turned into a budget and spent by [`apply_budget`]. Without a second device kind
+/// to compare (`other` is `None`) the noise cannot be measured and routing stays exact, with the
+/// reason logged.
+pub fn apply_level(
+    model: &DeepseekV41Model,
+    level: QualityLevel,
+    key: &str,
+    ids: &[u32],
+    resident: &[std::collections::HashSet<usize>],
+    run: &dyn Fn(&DeepseekV41Model, &[u32]) -> Result<Vec<Vec<f32>>>,
+    other: Option<&dyn Fn(&DeepseekV41Model, &[u32]) -> Result<Vec<Vec<f32>>>>,
+) -> Result<Option<Measured>> {
+    if level == QualityLevel::Exact {
+        return Ok(None);
+    }
+    let measured = match (cached_noise(key), other) {
+        (Some(n), _) => Some(n),
+        (None, Some(other)) => {
+            let n = noise(model, ids, run, other)?;
+            store_noise(key, n);
+            Some(n)
+        }
+        (None, None) => None,
+    };
+    let Some(budget) = budget_for(level, measured) else {
+        tracing::info!(
+            "quality {level:?}: the model's numerical noise cannot be measured here (no card and \
+             host to compare); routing stays exact"
+        );
+        return Ok(None);
+    };
+    tracing::info!(
+        "quality {level:?}: the model's own run-to-run noise is {:.4} nats; budget {budget:.4}",
+        measured.unwrap_or(0.0)
+    );
+    apply_budget(model, budget, key, ids, resident, run)
+}
 
 /// The text the calibration runs, bundled with the engine: some code and some prose, long enough
 /// to route a few hundred tokens and short enough to run in the time a model takes to load.
@@ -225,6 +335,18 @@ pub fn apply_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_level_is_a_multiple_of_the_models_noise() {
+        assert_eq!(budget_for(QualityLevel::Exact, Some(0.02)), None);
+        assert_eq!(budget_for(QualityLevel::Balanced, Some(0.02)), Some(0.02));
+        assert_eq!(
+            budget_for(QualityLevel::Fast, Some(0.02)),
+            Some(0.02 * FAST_NOISE_MULTIPLE)
+        );
+        assert_eq!(budget_for(QualityLevel::Balanced, None), None);
+        assert_eq!(budget_for(QualityLevel::Fast, Some(f64::NAN)), None);
+    }
 
     fn m(keep: usize, miss: f32, kl: f64, saved: f64) -> Measured {
         Measured {
