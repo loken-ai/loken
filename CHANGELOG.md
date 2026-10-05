@@ -13,96 +13,122 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
-- API: a Responses endpoint over chat completions, with a continuation store.
-- OpenAI: n, reasoning_effort, parallel_tool_calls, logprobs, logit_bias, suffix, echo.
-- Messages: count_tokens, models list, thinking, tool choice, structured output.
-- Ollama: version, embed dims/truncate, pull progress, tool choice, reasoning.
-- API: files, batches, message batches, and moderations.
-- Ollama: legacy embeddings, copy, delete, create, tags and show.
-- Multimodal: image input, image results by URL, and MP3 speech output.
-- Multimodal: audio input to a chat turn, for models with a speech tower beside the text GGUF.
-- Reasoning: returned apart from the answer, with per-token log-probs.
-- Tools: parsing for gpt-oss Harmony, DeepSeek, qwen3-coder XML, and templates.
-- OpenAI: headers for the context window, KV format, and background priority.
+- API: a Responses endpoint over chat completions.
+- API: a continuation store for the Responses endpoint.
+- OpenAI: the n, logprobs, logit_bias, suffix and echo parameters.
+- OpenAI: reasoning_effort and parallel_tool_calls.
+- OpenAI: response headers for context window, KV format and priority.
+- Messages: count_tokens and the models list.
+- Messages: thinking, tool choice and structured output.
+- Ollama: version, embed dims and truncate, pull progress.
+- Ollama: tool choice and reasoning.
+- Ollama: legacy embeddings.
+- Ollama: copy, delete, create, tags and show endpoints.
+- API: files, batches and moderations.
+- API: message batches.
+- Multimodal: image input.
+- Multimodal: image results by URL.
+- Multimodal: MP3 speech output.
+- Multimodal: audio input to a chat turn through a model's speech tower.
+- Reasoning: returned apart from the answer.
+- Reasoning: per-token log-probs.
+- Tools: parsing for gpt-oss Harmony.
+- Tools: parsing for DeepSeek calls.
+- Tools: parsing for qwen3-coder XML calls.
+- Tools: parsing from chat templates.
+- Tools: DeepSeek DSML calls.
+- Tools: a generic tool-calls block fallback.
 - KV: context-shift reuse of the resident cache past the window.
-- KV: snapshots resume a conversation from its cache, in memory or on disk.
+- KV: snapshots resume a conversation from its cache.
+- KV: snapshots stored on disk as well as in memory.
 - Offload: a mixture's experts spilled across cards and host.
-- Placement: one ladder over the measured cards places every language model and the image and
-  speech stacks, with a ledger of every conversion a load makes.
-- Offload: a streamed mixture reads the next layer's experts into page-locked memory ahead of
-  its gate; read-ahead depth, reader threads and the sightings that move an expert to a card
-  are derived from measurement.
-- Prefill: a wide mixture's prompt runs its attention, residual stream, expert products and
-  routing on the cards, a layer's experts staged on a copy stream.
-- Cache: decode states stored on disk by prefix for the large mixture and for transformers
-  with recurrent layers; block size, spacing, budget and restore-or-prefill derived.
-- Quality: a `quality` policy (exact, balanced, fast) picks lossy expert routing within the model's
-  own numerical noise; the default is exact.
+- Offload: a streamed mixture reads the next layer's experts ahead of its gate.
+- Offload: read-ahead depth, reader threads and promotion are derived.
+- Offload: host experts cached on the cards by use.
+- Offload: a wide batch's experts streamed through two card buffers.
+- Offload: a cache plan for a file with no room to prefill.
+- Placement: one ladder over the measured cards for every language model.
+- Placement: the same ladder for the image and speech stacks.
+- Placement: a ledger of every conversion a load makes.
+- Prefill: a wide mixture's prompt runs its attention and experts on the cards.
+- Prefill: a layer's experts staged on a copy stream.
+- Cache: decode states stored on disk by prefix for the large mixture.
+- Cache: decode states stored on disk for transformers with recurrent layers.
+- Cache: block size, spacing and budget derived from the model.
+- Quality: a policy (exact, balanced, fast) bounds lossy routing, default exact.
 - Quality: a teacher-forced harness scores a setting against the exact run.
 - DeepSeek: V4.1 Flash served from its own GGUF, experts streamed from disk.
-- Tools: DeepSeek DSML calls, and a generic tool-calls block fallback.
 - Requant: a model into a new tag, on the GPU, as detached work.
-- Loading: a split GGUF as one source; a BPE or Unigram tokenizer from it.
-- Loading: a split GGUF set on the generic route, read as one model part by part.
-- Models: the qwen4exp architecture on the generic route: wide residual, delta-rule and indexed
-  attention layers, a sparsely read n-gram table, 160 to 512 routed experts.
-- Formats: IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S and Q2_0 read, and run on a card for experts.
-- Offload: host experts cached on the cards by use, a wide batch's experts streamed through two
-  buffers, a cache plan for a file with no room to prefill.
-- CLI: `loken pull owner/repo:SELECTOR` fetches one quantisation of a GGUF repository.
-- Tests: a gate requires every conversion of a stored weight to state its reason.
-- CLI: a pull stops when no progress frame arrives for eight times the longest frame gap.
+- Loading: a split GGUF as one source.
+- Loading: a BPE or Unigram tokenizer from a GGUF.
+- Loading: a split GGUF set on the generic route, read part by part.
+- Models: the qwen4exp architecture on the generic route.
+- Models: a sparsely read n-gram table for the qwen4exp family.
+- Formats: IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S and Q2_0 read.
+- Formats: the same formats run on a card for experts.
+- CLI: pull owner/repo:SELECTOR fetches one quantisation of a GGUF repo.
+- CLI: a pull stops after eight times the longest progress gap.
+- Tests: a gate makes every stored-weight conversion state its reason.
 - Cluster: routing for every surface, handing a model or render to a peer.
 - Cluster: the model listing shows a loading model and per-layer placement.
-- Cluster: a peers endpoint, and a scrape endpoint behind a feature.
+- Cluster: a peers endpoint.
+- Cluster: a scrape endpoint behind a feature.
 - Adapters: rank-decomposition adapters through the layer-swap route.
-- Speculative: a configured draft model, and per-position logits for verify.
-- Speculative: a mixture verifies a prompt-lookup block at once when resident.
-- Agents: loken launch for a coding agent; per-layer timing on demand.
+- Speculative: a configured draft model.
+- Speculative: per-position logits for verify.
+- Speculative: a resident mixture verifies a prompt-lookup block at once.
+- Agents: loken launch for a coding agent.
+- Perf: per-layer timing on demand.
 - Perf: a streamed decode reports where its time goes, by stage, on demand.
-- Docs: every config key and route, ten lessons, and CI with cargo-deny.
+- Docs: every config key and route.
+- Docs: ten lessons.
+- CI: a cargo-deny job.
 
 ### Changed
 
 - Attention: prefill accumulates over a band of keys in one pass.
 - Cluster: yielding work goes to a peer, not the node holding a conversation.
-- Perf: wide RMSNorm decode kernel, prefill chunk priced once, pages advised.
-- KV: num_ctx clamped to the checkpoint; the quantised cache grows to context.
+- Perf: wide RMSNorm decode kernel.
+- Perf: prefill chunk priced once.
+- Perf: pages advised.
+- KV: num_ctx clamped to the checkpoint.
+- KV: the quantised cache grows to context.
 - API: the version endpoint names the build commit.
-- Cluster: media requests count as in flight; the pool returns between jobs.
+- Cluster: media requests count as in flight.
+- Cluster: the pool returns between jobs.
 - Offload: the expert host-tier sizing is logged at load.
 - Build: a commit or checkout no longer recompiles the CUDA kernels.
 - Docs: condensed to lead with the point, detail in tables.
-- Loading: token tables and text-encoder embeddings stay in the stored format; a card weight
-  built by the loader keeps no host copy.
-- Loading: host expert stacks are used in the format the file stores when the host kernels
-  read it.
+- Loading: token tables and text-encoder embeddings stay in the stored format.
+- Loading: a card weight built by the loader keeps no host copy.
+- Loading: host expert stacks keep the file's format when the host reads it.
 
 ### Fixed
 
 - Loading: a card allocation failure reports how full the card was.
-- Attention: the sparse layer's scores are bounded to a block of rows, its cache held at half
-  width on a card.
-- Placement: the KV cache is priced by the cache the layers build, not a byte per element.
-- Catalogue: a repository holding a model and its projector resolves to the model file.
-- Tests: the demand-ledger tests take turns, so a module's parallelism no longer fails them.
-- Catalogue: a GGUF in the Hugging Face store is listed as one, with the model's own parameter
-  count, split sets included.
+- Attention: the sparse layer's scores are bounded to a block of rows.
+- Attention: the sparse layer's cache is held at half width on a card.
+- Placement: the KV cache is priced by the cache the layers build.
+- Catalogue: a repository with a model and projector resolves to the model.
+- Tests: the demand-ledger tests no longer fail when run in parallel.
+- Catalogue: a GGUF in the Hugging Face store is listed as one.
+- Catalogue: the parameter count of a split set is the model's own.
 - Client: a load the daemon refuses is reported, not printed as a success.
 - CLI: pull follows the daemon's streamed progress, with no total deadline.
-- Loading: a part of a split set on the single-file route is refused, not built as pass-through
-  blocks.
+- Loading: a part of a split set on the single-file route is refused.
 - Reasoning: markers survive decode, so the thought is not the answer.
 - Reasoning: a prompt-opened block is read as reasoning (deepcoder, qwen3.5).
 - Tools: calls no longer leak into the answer (XML, arrays, failed templates).
-- Streaming: no dropped or repeated characters, no resent settled text.
+- Streaming: no dropped or repeated characters.
+- Streaming: no resent settled text.
 - KV: prefix reuse prefills from the cache's real position.
 - Precision: attention and rotary run at full precision, so no misspelling.
 - Reload: a failed widening or format reload restores the model.
 - Cluster: a member/address lock-order inversion no longer deadlocks a node.
 - Generation: never returns an empty answer when one was asked for.
 - Offload: a reopened placement resets its per-card accounting.
-- Build: the host-only and no-AVX2 builds, and newer clippy lints.
+- Build: the host-only and no-AVX2 builds work again.
+- Build: newer clippy lints pass.
 - Bench: empty cells no longer render as literal asterisks.
 
 ### Security
