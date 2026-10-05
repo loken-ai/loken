@@ -94,6 +94,13 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// eight layers compound it. A wrong head order, gate or norm departs by the scale itself.
 const QUANTISED_SLACK: f32 = 0.12;
 
+/// The direction the logits keep. Two vectors whose difference is a fraction `e` of their norm
+/// and is orthogonal to them have cosine `1 - e^2 / 2`. The host's budget is
+/// `QUANTISED_SLACK`; a card adds the rounding of its half-precision activations, an
+/// independent error of at most the same size, so the budget doubles. A wrong head order,
+/// gate or norm departs by `e` near 1, which this bound rejects.
+const MIN_COSINE: f32 = 1.0 - (2.0 * QUANTISED_SLACK) * (2.0 * QUANTISED_SLACK) / 2.0;
+
 /// Logits agree within the rounding, with the same direction, and with the same best token
 /// wherever the reference's best leads its runner-up by more than the rounding.
 fn within_rounding(got: &[f32], want: &[f32], scale: f32, vocab: usize, what: &str) {
@@ -104,7 +111,7 @@ fn within_rounding(got: &[f32], want: &[f32], scale: f32, vocab: usize, what: &s
     );
     for (row, (g, w)) in got.chunks(vocab).zip(want.chunks(vocab)).enumerate() {
         assert!(
-            cosine(g, w) > 0.99,
+            cosine(g, w) > MIN_COSINE,
             "{what} row {row}: cosine {}",
             cosine(g, w)
         );
