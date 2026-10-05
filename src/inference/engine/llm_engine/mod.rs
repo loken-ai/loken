@@ -1293,6 +1293,8 @@ fn _assert_generate_future_send(e: &LlmEngine, prompt: &str, params: GenerationP
 }
 
 #[cfg(test)]
+mod quality;
+#[cfg(test)]
 mod sampling_tests;
 use std::io::Cursor;
 use std::time::Instant;
