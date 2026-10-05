@@ -63,6 +63,7 @@ impl TensorReader<'_> {
     /// The tensor `name` as F32 on the device, with its dimensions as the files give them:
     /// weights `[out, in]`, convolutions `[out, in, k]`.
     pub fn get(&self, name: &str) -> Result<Tensor> {
+        // CONVERSION: an audio tower's weights are held F32; the tower runs once per clip.
         let host = match self.source {
             Source::Gguf(f) => f
                 .tensor(name, &Device::Cpu)
@@ -75,7 +76,7 @@ impl TensorReader<'_> {
                     .map_err(|e| Error(format!("{n}: {e}")))?
             }
         };
-        // CONVERSION: an audio tower's weights are held F32; the tower runs once per clip.
+        // CONVERSION: the checkpoint's dtype widens to the F32 the tower is held in.
         host.to_dtype(DType::F32)?.to_device(self.dev)
     }
 
