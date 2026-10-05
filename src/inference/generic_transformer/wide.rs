@@ -366,22 +366,34 @@ impl GenericTransformerLayer {
                 .reshape((b, n_head, kv_len, hd))
         };
         let (k_all, v_all) = (spread(k_all)?, spread(v_all)?);
-        let mut bias = vec![f32::MIN / 2.0; seq * kv_len];
-        for (row, kept) in bias.chunks_exact_mut(kv_len).zip(selection) {
-            for t in kept {
-                row[*t as usize] = 0.0;
-            }
-        }
-        let bias = Tensor::from_vec(bias, (1, 1, seq, kv_len), &q.device())?;
         let scale = self
             .attention_scale
             .unwrap_or_else(|| 1.0 / (hd as f64).sqrt());
-        let scores = (q.to_dtype(DType::F32)?.matmul(&k_all.transpose(2, 3)?)? * scale)?;
-        let probs = crate::tensor::ops::softmax_last_dim(&scores.broadcast_add(&bias)?)?;
-        let y = probs
-            .matmul(&v_all)?
-            .transpose(1, 2)?
-            .reshape((b, seq, n_head * hd))?;
+        let q = q.to_dtype(DType::F32)?;
+        let k_t = k_all.transpose(2, 3)?;
+        // The scores of a block of rows at a time: all of them at once is `heads x rows x kv_len`
+        // floats, several times over, which a long chunk over a long cache cannot hold.
+        let block = hyper::mixer_block_rows().max(1);
+        let mut parts = Vec::with_capacity(seq.div_ceil(block));
+        for (first, kept) in (0..seq).step_by(block).zip(selection.chunks(block)) {
+            let rows = kept.len();
+            let mut bias = vec![f32::MIN / 2.0; rows * kv_len];
+            for (row, kept) in bias.chunks_exact_mut(kv_len).zip(kept) {
+                for t in kept {
+                    row[*t as usize] = 0.0;
+                }
+            }
+            let bias = Tensor::from_vec(bias, (1, 1, rows, kv_len), &q.device())?;
+            let scores = (q.narrow(2, first, rows)?.matmul(&k_t)? * scale)?;
+            let probs = crate::tensor::ops::softmax_last_dim(&scores.broadcast_add(&bias)?)?;
+            parts.push(probs.matmul(&v_all)?);
+        }
+        let y = if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            Tensor::cat(&parts.iter().collect::<Vec<_>>(), 2)?
+        };
+        let y = y.transpose(1, 2)?.reshape((b, seq, n_head * hd))?;
         let y = self.gate_attention(x, y)?;
         self.attn_output.forward(&y)
     }
