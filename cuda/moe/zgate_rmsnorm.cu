@@ -12,7 +12,7 @@ extern "C" __global__ void loken_zgate_rmsnorm_kernel(
         const float * __restrict__ z,
         const float * __restrict__ norm_w,
         float * __restrict__ y,
-        int N, int D, float eps) {
+        int N, int D, float eps, int sigmoid_gate) {
     const int row  = blockIdx.x;          // one block (one warp) per row
     const int lane = threadIdx.x;         // 0..31
     if (row >= N) return;
@@ -29,15 +29,15 @@ extern "C" __global__ void loken_zgate_rmsnorm_kernel(
 
     for (int d = lane; d < D; d += 32) {
         const float zd = zrow[d];
-        const float silu = zd / (1.f + expf(-zd));
-        yrow[d] = orow[d] * rms * norm_w[d] * silu;
+        const float gate = sigmoid_gate ? 1.f / (1.f + expf(-zd)) : zd / (1.f + expf(-zd));
+        yrow[d] = orow[d] * rms * norm_w[d] * gate;
     }
 }
 
 extern "C" void loken_zgate_rmsnorm(
         const float * o, const float * z, const float * norm_w, float * y,
-        int N, int D, float eps, cudaStream_t stream) {
-    loken_zgate_rmsnorm_kernel<<<N, 32, 0, stream>>>(o, z, norm_w, y, N, D, eps);
+        int N, int D, float eps, int sigmoid_gate, cudaStream_t stream) {
+    loken_zgate_rmsnorm_kernel<<<N, 32, 0, stream>>>(o, z, norm_w, y, N, D, eps, sigmoid_gate);
 }
 
 // F16-I/O variant: z read in F16 (z_proj output) + y written in F16 (out_proj
@@ -49,7 +49,7 @@ extern "C" __global__ void loken_zgate_rmsnorm_f16io_kernel(
         const __half * __restrict__ z,
         const float * __restrict__ norm_w,
         __half * __restrict__ y,
-        int N, int D, float eps) {
+        int N, int D, float eps, int sigmoid_gate) {
     const int row  = blockIdx.x;
     const int lane = threadIdx.x;
     if (row >= N) return;
@@ -64,14 +64,14 @@ extern "C" __global__ void loken_zgate_rmsnorm_f16io_kernel(
     const float rms = rsqrtf(ss / (float) D + eps);
     for (int d = lane; d < D; d += 32) {
         const float zd = __half2float(zrow[d]);
-        const float silu = zd / (1.f + expf(-zd));
-        yrow[d] = __float2half(orow[d] * rms * norm_w[d] * silu);
+        const float gate = sigmoid_gate ? 1.f / (1.f + expf(-zd)) : zd / (1.f + expf(-zd));
+        yrow[d] = __float2half(orow[d] * rms * norm_w[d] * gate);
     }
 }
 
 extern "C" void loken_zgate_rmsnorm_f16io(
         const float * o, const void * z, const float * norm_w, void * y,
-        int N, int D, float eps, cudaStream_t stream) {
+        int N, int D, float eps, int sigmoid_gate, cudaStream_t stream) {
     loken_zgate_rmsnorm_f16io_kernel<<<N, 32, 0, stream>>>(
-        o, (const __half *)z, norm_w, (__half *)y, N, D, eps);
+        o, (const __half *)z, norm_w, (__half *)y, N, D, eps, sigmoid_gate);
 }

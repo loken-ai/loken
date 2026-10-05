@@ -5,13 +5,15 @@
 use super::*;
 
 /// F16-I/O zgate_rmsnorm: `o` [N,D] F32, `z` [N,D] F16 (z_proj output, no ->F32
-/// cast), `norm_w` [D] F32 -> `y` [N,D] F16 (no y->F16 cast). Bit-identical.
+/// cast), `norm_w` [D] F32 -> `y` [N,D] F16 (no y->F16 cast). Bit-identical. The gate is
+/// `silu(z)`, or `sigmoid(z)` when `sigmoid_gate`.
 /// `Ok(None)` if not F16/CUDA.
 pub fn zgate_rmsnorm_f16io(
     o: &Tensor,
     z: &Tensor,
     norm_w: &Tensor,
     eps: f32,
+    sigmoid_gate: bool,
 ) -> Result<Option<Tensor>> {
     use core::ffi::c_void;
     if z.dtype() != DType::F16 || !o.device().is_cuda() {
@@ -65,6 +67,7 @@ pub fn zgate_rmsnorm_f16io(
             n as i32,
             d as i32,
             eps,
+            sigmoid_gate as i32,
             stream,
         );
     }
@@ -408,4 +411,68 @@ pub fn rms_norm_then_qmatmul_bf16(
     )
     .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
     tensor_from_cuda_storage(out_storage, (1, 1, out_rows))
+}
+
+#[cfg(test)]
+mod zgate_tests {
+    use super::*;
+
+    /// The fused gate-and-norm against the tensor ops, with a silu gate and with a sigmoid gate,
+    /// for both the F32 and the half-precision input of the gate.
+    #[test]
+    fn the_fused_gate_and_norm_matches_the_tensor_ops_for_both_gates() {
+        let Ok(dev) = crate::tensor::Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (n, d) = (6, 128);
+        let val = |i: usize, m: u64| ((((i as u64 + 1) * m) >> 5) % 997) as f32 / 300.0 - 1.6;
+        let o: Vec<f32> = (0..n * d).map(|i| val(i, 2654435761)).collect();
+        let z: Vec<f32> = (0..n * d).map(|i| val(i, 40503)).collect();
+        let w: Vec<f32> = (0..d).map(|i| 0.5 + val(i, 69069).abs()).collect();
+        let (ot, zt, wt) = (
+            Tensor::from_vec(o, (n, d), &dev).unwrap(),
+            Tensor::from_vec(z, (n, d), &dev).unwrap(),
+            Tensor::from_vec(w, (d,), &dev).unwrap(),
+        );
+        let zh = zt.to_dtype(DType::F16).unwrap();
+        let zr = zh.to_dtype(DType::F32).unwrap();
+        let eps = 1e-6f32;
+        for sigmoid in [false, true] {
+            let normed = crate::tensor::ops::rms_norm(&ot, &wt, eps).unwrap();
+            let gate = if sigmoid {
+                crate::tensor::ops::sigmoid(&zr).unwrap()
+            } else {
+                crate::tensor::ops::silu(&zr).unwrap()
+            };
+            let want = (normed * gate)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let half = zgate_rmsnorm_f16io(&ot, &zh, &wt, eps, sigmoid)
+                .unwrap()
+                .unwrap();
+            let half = half
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let full = super::zgate_rmsnorm(&ot, &zr, &wt, eps, sigmoid).unwrap();
+            let full = full.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (i, w) in want.iter().enumerate() {
+                assert!(
+                    (full[i] - w).abs() < 1e-4,
+                    "sigmoid {sigmoid}: f32 gate at {i}"
+                );
+                assert!(
+                    (half[i] - w).abs() < 2e-3 * w.abs().max(1.0),
+                    "sigmoid {sigmoid}: f16 gate at {i}"
+                );
+            }
+        }
+    }
 }

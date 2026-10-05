@@ -242,7 +242,13 @@ pub fn fused_conv_silu(
 /// Fused z-gated RMSNorm for the DeltaNet output. `o`,`z` [N, D], `norm_w` [D]
 /// (f32, CUDA). Returns `y` [N, D] = rmsnorm(o).norm_w.silu(z). Replaces ~9
 /// tensor ops/layer.
-pub fn zgate_rmsnorm(o: &Tensor, z: &Tensor, norm_w: &Tensor, eps: f32) -> Result<Tensor> {
+pub fn zgate_rmsnorm(
+    o: &Tensor,
+    z: &Tensor,
+    norm_w: &Tensor,
+    eps: f32,
+    sigmoid_gate: bool,
+) -> Result<Tensor> {
     let dev = o.device().as_cuda_device()?;
     let (n, d) = o.dims2()?;
     let cuptr = |t: &Tensor| -> Result<*const f32> {
@@ -269,6 +275,7 @@ pub fn zgate_rmsnorm(o: &Tensor, z: &Tensor, norm_w: &Tensor, eps: f32) -> Resul
             n as i32,
             d as i32,
             eps,
+            sigmoid_gate as i32,
             stream,
         );
     }

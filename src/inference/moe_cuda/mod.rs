@@ -99,9 +99,9 @@ cuda_launchers! {
         dt_bias: *const f32, g_pre: *mut f32, beta: *mut f32, n: i32, h: i32);
     loken_zgate_rmsnorm(
         o: *const f32, z: *const f32, norm_w: *const f32, y: *mut f32, n: i32, d: i32,
-        eps: f32);
+        eps: f32, sigmoid_gate: i32);
     loken_zgate_rmsnorm_f16io(o: *const f32, z: *const c_void, norm_w: *const f32,
-        y: *mut c_void, n: i32, d: i32, eps: f32);
+        y: *mut c_void, n: i32, d: i32, eps: f32, sigmoid_gate: i32);
     loken_deltanet_gate(
         alpha: *const f32, beta_in: *const f32, a_log: *const f32, dt_bias: *const f32,
         g_pre: *mut f32, beta: *mut f32, n: i32, h: i32);

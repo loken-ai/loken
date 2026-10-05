@@ -1091,17 +1091,16 @@ impl GatedDeltaNet {
         });
         let o = o.reshape((seq * vg, vd))?;
         let z = z.reshape((seq * vg, vd))?;
-        let y = if d.gate_sigmoid {
-            // The fused kernel gates by silu: a sigmoid gate takes the unfused ops.
-            let on = crate::tensor::ops::rms_norm(&o, &self.norm_w, self.eps as f32)?;
-            (on * crate::tensor::ops::sigmoid(&z.to_dtype(DType::F32)?)?)?
-        } else {
-            match k::zgate_rmsnorm_f16io(&o, &z, &self.norm_w, self.eps as f32)? {
-                Some(y) => y,
-                None => {
-                    k::zgate_rmsnorm(&o, &z.to_dtype(DType::F32)?, &self.norm_w, self.eps as f32)?
-                }
-            }
+        let y = match k::zgate_rmsnorm_f16io(&o, &z, &self.norm_w, self.eps as f32, d.gate_sigmoid)?
+        {
+            Some(y) => y,
+            None => k::zgate_rmsnorm(
+                &o,
+                &z.to_dtype(DType::F32)?,
+                &self.norm_w,
+                self.eps as f32,
+                d.gate_sigmoid,
+            )?,
         };
         y.reshape((1, seq, vg * vd))?.to_dtype(x.dtype())
     }
