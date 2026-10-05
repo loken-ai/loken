@@ -1043,7 +1043,8 @@ impl GatedDeltaNet {
                 Tensor::zeros_on((1, vg, vd, kd), DType::F32, &x.device())?,
             ),
         };
-        let (qkv, z, alpha, beta) = self.project(x)?;
+        let dev = x.device();
+        let (qkv, z, alpha, beta) = super::wide::staged("gdn_project", &dev, || self.project(x))?;
         let qkv = qkv.reshape((seq, d.conv_dim()))?.contiguous()?;
         let conv = conv
             .reshape((d.conv_dim(), d.conv_kernel - 1))?

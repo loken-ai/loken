@@ -527,6 +527,7 @@ fn compile_imma_kernels() {
         "cuda/moe/gated_delta_net.cu",
         "cuda/moe/fused_conv_silu.cu",
         "cuda/moe/zgate_rmsnorm.cu",
+        "cuda/moe/hyper_residual.cu",
         "cuda/moe/deltanet_gate.cu",
         "cuda/moe/l2norm_gqa.cu",
         "cuda/moe/head_rmsnorm.cu",

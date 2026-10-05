@@ -78,6 +78,53 @@ impl HyperMixer {
         grouped_rms(r, &self.gamma, self.streams, self.dim, self.eps)
     }
 
+    /// Whether this mixer's stages run as the fused launches: its weights are on a card.
+    #[cfg(feature = "cuda")]
+    pub fn on_card(&self) -> bool {
+        self.gamma.device().is_cuda()
+    }
+
+    /// The grouped norm of `r`, in the launch a card has for it.
+    #[cfg(feature = "cuda")]
+    pub fn normed_on_card(&self, r: &Tensor) -> Result<Tensor> {
+        crate::inference::moe_cuda::hc_norm(
+            &r.to_dtype(DType::F32)?,
+            &self.gamma,
+            self.streams,
+            self.dim,
+            self.eps as f32,
+        )
+    }
+
+    /// The gamma and epsilon of the norm: what the previous layer's write-back fuses in.
+    #[cfg(feature = "cuda")]
+    pub fn norm_params(&self) -> (&Tensor, f32) {
+        (&self.gamma, self.eps as f32)
+    }
+
+    /// [`Self::mix`] from the already normalised residual `xn`, each stage a launch: the
+    /// sublayer input (F16 when `f16_out`) and the raw write-back weights, which
+    /// [`Self::combine_on_card`] turns into `2 sigmoid(. / streams)`.
+    #[cfg(feature = "cuda")]
+    pub fn mix_on_card(&self, xn: &Tensor, f16_out: bool) -> Result<(Tensor, Option<Tensor>)> {
+        use crate::inference::moe_cuda::{hc_low, hc_mean_gate};
+        let low = hc_low(&self.down.forward(xn)?, self.streams)?;
+        let up = self.up.forward(&low)?;
+        let mixed = hc_mean_gate(xn, &up, self.streams, self.dim, f16_out)?;
+        let inject = self.inject.as_ref().map(|w| w.forward(xn)).transpose()?;
+        Ok((mixed, inject))
+    }
+
+    /// Streams the mixer mixes.
+    pub fn streams(&self) -> usize {
+        self.streams
+    }
+
+    /// Width of one stream.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
     /// The device the mixer's weights live on.
     pub fn device(&self) -> crate::tensor::Device {
         self.down.device()
@@ -157,6 +204,27 @@ pub fn combine(r: &Tensor, out: &Tensor, inj: &Tensor) -> Result<Tensor> {
     let w = inj.reshape((b, seq, streams, 1))?;
     let add = out.broadcast_mul(&w)?.reshape((b, seq, wide))?;
     r.to_dtype(DType::F32)? + add
+}
+
+/// [`combine`] for raw write-back weights, in one launch; with `next` the norm of the result
+/// for the mixer that follows comes back too.
+#[cfg(feature = "cuda")]
+pub fn combine_on_card(
+    r: &Tensor,
+    out: &Tensor,
+    inject_raw: &Tensor,
+    next: Option<&HyperMixer>,
+    streams: usize,
+    dim: usize,
+) -> Result<(Tensor, Option<Tensor>)> {
+    crate::inference::moe_cuda::hc_combine(
+        r,
+        out,
+        inject_raw,
+        next.map(|m| m.norm_params()),
+        streams,
+        dim,
+    )
 }
 
 /// The residual a token starts from: its embedding, repeated once per stream.

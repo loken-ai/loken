@@ -2,6 +2,8 @@
 //! each sublayer reads it through a mixer and writes back to every stream, and the token mixer
 //! of an indexed-attention layer reads only the tokens its indexer keeps.
 
+#[cfg(feature = "cuda")]
+use super::hyper::combine_on_card;
 use super::hyper::{combine, WideBlock};
 use super::*;
 use crate::tensor::D;
@@ -21,9 +23,32 @@ pub(super) fn load_matrix(qt: QTensor) -> Result<QMatMul> {
     }
 }
 
+/// Run `f`; when the stage profile is on, wait for the device before and after and record
+/// the time under `stage`, so the shares a step spends in each part are measured and not
+/// guessed from launches.
+pub(super) fn staged<T>(
+    stage: &'static str,
+    dev: &Device,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !crate::inference::offload::stage_prof_enabled() {
+        return f();
+    }
+    let _ = dev.synchronize();
+    let t = std::time::Instant::now();
+    let out = f()?;
+    let _ = dev.synchronize();
+    crate::inference::offload::prof_record(stage, t.elapsed().as_nanos() as u64);
+    Ok(out)
+}
+
 /// The activation type the sublayers read: what the card kernels take, F32 on the host.
 fn sublayer_dtype(x: &Tensor) -> DType {
-    if x.device().is_cpu() {
+    sublayer_dtype_of(&x.device())
+}
+
+fn sublayer_dtype_of(dev: &Device) -> DType {
+    if dev.is_cpu() {
         DType::F32
     } else {
         DType::F16
@@ -60,43 +85,130 @@ impl GenericTransformerLayer {
         index_pos: usize,
         ngram: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let dev = x.device();
         let mut r = x.to_dtype(DType::F32)?;
         if let (Some(ple), Some(emb)) = (self.ngram.as_mut(), ngram) {
-            let add = ple.forward(&r, emb, index_pos)?;
+            let add = staged("ngram", &dev, || ple.forward(&r, emb, index_pos))?;
             r = (r + add)?;
         }
-        let (mixed, inj) = {
+        #[cfg(feature = "cuda")]
+        if dev.is_cuda()
+            && self
+                .hyper
+                .as_ref()
+                .is_some_and(|h| h.attn.on_card() && h.ffn.on_card())
+        {
+            return self.forward_wide_on_card(r, mask, index_pos, &dev);
+        }
+        let (mixed, inj) = staged("mix_token", &dev, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
-            hc.attn.mix(&r)?
-        };
-        let mixed = mixed.to_dtype(sublayer_dtype(&mixed))?;
-        let out = if matches!(self.mixer, mixer::Mixer::Attention) {
-            self.wide_attention(&mixed, mask, index_pos)?
-        } else {
-            let m = self.mixer.forward(&mixed, index_pos)?;
-            self.attn_output.forward(&m)?
-        };
+            let (mixed, inj) = hc.attn.mix(&r)?;
+            Ok((mixed.to_dtype(sublayer_dtype(&mixed))?, inj))
+        })?;
+        let out = self.token_mixer(&mixed, mask, index_pos, &dev)?;
         let inj = inj.expect("the token mixer's mixer writes back");
-        r = combine(&r, &out, &inj)?;
-        let (mixed, inj) = {
+        r = staged("combine", &dev, || combine(&r, &out, &inj))?;
+        let (mixed, inj) = staged("mix_ffn", &dev, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
-            hc.ffn.mix(&r)?
-        };
-        let mixed = mixed.to_dtype(sublayer_dtype(&mixed))?;
-        let out = match self.moe.as_ref() {
+            let (mixed, inj) = hc.ffn.mix(&r)?;
+            Ok((mixed.to_dtype(sublayer_dtype(&mixed))?, inj))
+        })?;
+        let out = self.feed_forward(&mixed, &dev)?;
+        staged("combine", &dev, || {
+            combine(
+                &r,
+                &out,
+                &inj.expect("the feed-forward's mixer writes back"),
+            )
+        })
+    }
+
+    /// The token mixer behind its mixer's output: the delta rule through its output
+    /// projection, or attention.
+    fn token_mixer(
+        &mut self,
+        mixed: &Tensor,
+        mask: Option<&Tensor>,
+        index_pos: usize,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        let attends = matches!(self.mixer, mixer::Mixer::Attention);
+        staged(
+            if attends { "attention" } else { "delta_rule" },
+            dev,
+            || {
+                if attends {
+                    self.wide_attention(mixed, mask, index_pos)
+                } else {
+                    let m = self.mixer.forward(mixed, index_pos)?;
+                    self.attn_output.forward(&m)
+                }
+            },
+        )
+    }
+
+    /// The routed experts and the shared expert, or the dense feed-forward.
+    fn feed_forward(&mut self, mixed: &Tensor, dev: &Device) -> Result<Tensor> {
+        staged("experts", dev, || match self.moe.as_ref() {
             Some(moe) => moe.forward_rows(
-                &mixed,
-                &mixed,
+                mixed,
+                mixed,
                 self.embedding_length_for_moe,
                 self.ffn_norm_eps,
-            )?,
-            None => self.forward_ffn(&mixed)?,
+            ),
+            None => self.forward_ffn(mixed),
+        })
+    }
+
+    /// The same layer with each elementwise stage of the wide residual one launch, the norm of
+    /// the feed-forward's mixer joined to the write-back that ends the token mixer.
+    #[cfg(feature = "cuda")]
+    fn forward_wide_on_card(
+        &mut self,
+        r: Tensor,
+        mask: Option<&Tensor>,
+        index_pos: usize,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        let f16 = sublayer_dtype_of(dev) == DType::F16;
+        let (s, d) = {
+            let h = self.hyper.as_ref().expect("a wide layer has its mixers");
+            (h.attn.streams(), h.attn.dim())
         };
-        combine(
-            &r,
-            &out,
-            &inj.expect("the feed-forward's mixer writes back"),
-        )
+        let (mixed, inj) = staged("mix_token", dev, || {
+            let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
+            let xn = hc.attn.normed_on_card(&r)?;
+            hc.attn.mix_on_card(&xn, f16)
+        })?;
+        let out = self.token_mixer(&mixed, mask, index_pos, dev)?;
+        let (r, xn) = staged("combine", dev, || {
+            let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
+            combine_on_card(
+                &r,
+                &out,
+                &inj.expect("the token mixer's mixer writes back"),
+                Some(&hc.ffn),
+                s,
+                d,
+            )
+        })?;
+        let (mixed, inj) = staged("mix_ffn", dev, || {
+            let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
+            hc.ffn
+                .mix_on_card(&xn.expect("the norm was asked for"), f16)
+        })?;
+        let out = self.feed_forward(&mixed, dev)?;
+        let (r, _) = staged("combine", dev, || {
+            combine_on_card(
+                &r,
+                &out,
+                &inj.expect("the feed-forward's mixer writes back"),
+                None,
+                s,
+                d,
+            )
+        })?;
+        Ok(r)
     }
 
     /// Attention over the cache: dense while the context fits the indexer's budget, over

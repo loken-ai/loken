@@ -737,3 +737,158 @@ fn real_model_layer_by_layer_on_the_cards_against_the_host() {
         }
     }
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "diagnostic on a real file named by LOKEN_Q38_FILE, needs idle cards"]
+fn the_decode_step_by_stage() {
+    use crate::inference::place::layer_executor::{DeviceKind, HeteroSegment};
+    let path = std::env::var("LOKEN_Q38_FILE").expect("LOKEN_Q38_FILE names the file");
+    let file = std::fs::File::open(&path).unwrap();
+    let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file) }.unwrap());
+    let mut content =
+        gguf_file::Content::read_mapped(&mut std::io::Cursor::new(&mmap[..]), mmap.clone())
+            .unwrap();
+    content.mmap_owner = Some(mmap.clone() as Arc<dyn std::any::Any + Send + Sync>);
+    let n = content.metadata["qwen4exp.block_count"].to_u32().unwrap() as usize;
+    let cards: HashMap<usize, Device> = [
+        (0, Device::new_cuda(0).unwrap()),
+        (1, Device::new_cuda(1).unwrap()),
+    ]
+    .into_iter()
+    .collect();
+    let split = n * 26 / 48;
+    let seg = |k: usize, a: usize, b: usize| HeteroSegment {
+        kind: DeviceKind::Cuda(k),
+        layer_start: a,
+        layer_end: b,
+        free_memory_bytes: u64::MAX,
+    };
+    let plan = HeteroPlan {
+        segments: vec![seg(0, 0, split), seg(1, split, n)],
+        total_layers: n,
+        host_experts_from: None,
+    };
+    let mut model = GenericHeteroTransformer::from_gguf_with_kv_quant(
+        content,
+        &mmap[..],
+        &cards,
+        &plan,
+        KvQuant::Q8,
+        Some(512),
+    )
+    .unwrap();
+    let prompt: Vec<u32> = (0..64).map(|i| 1000 + (i * 37) % 5000).collect();
+    let ids = Tensor::from_vec(prompt.clone(), (1, 64), &Device::Cpu).unwrap();
+    let first = model.forward(&ids, 0).unwrap();
+    let argmax = |t: &Tensor| {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0 as u32
+    };
+    let mut tok = argmax(&first);
+    let mut pos = 64;
+    let step = |model: &mut GenericHeteroTransformer, tok: u32, pos: usize| {
+        let t = Tensor::from_vec(vec![tok], (1, 1), &Device::Cpu).unwrap();
+        let l = model.forward(&t, pos).unwrap();
+        argmax(&l)
+    };
+    for _ in 0..8 {
+        tok = step(&mut model, tok, pos);
+        pos += 1;
+    }
+    let t = std::time::Instant::now();
+    for _ in 0..16 {
+        tok = step(&mut model, tok, pos);
+        pos += 1;
+    }
+    let plain = t.elapsed().as_secs_f64() / 16.0;
+    eprintln!(
+        "decode step, no profile: {:.2} ms ({:.1} tok/s)",
+        plain * 1e3,
+        1.0 / plain
+    );
+    crate::inference::offload::stage_prof_enable(true);
+    for _ in 0..16 {
+        tok = step(&mut model, tok, pos);
+        pos += 1;
+    }
+    let mut stages = crate::inference::offload::stage_prof_snapshot();
+    crate::inference::offload::stage_prof_enable(false);
+    stages.sort_by_key(|s| std::cmp::Reverse(s.1));
+    let total: u64 = stages.iter().map(|s| s.1).sum();
+    for (name, ns, calls) in stages {
+        eprintln!(
+            "  {name:<12} {:>7.3} ms per step  {:>5.1}%  ({} calls per step)",
+            ns as f64 / 16.0 / 1e6,
+            100.0 * ns as f64 / total as f64,
+            calls / 16
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn the_fused_card_stages_match_the_tensor_ops() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let model = toy_on(Some(0));
+    let card = model.layers[0].cos.device();
+    let n = ids(&v, "b.ids").len();
+    let r = Tensor::from_vec(f32s(&v, "b.layer1_out"), (1, n, 256), &Device::Cpu)
+        .unwrap()
+        .to_device(&card)
+        .unwrap();
+    let hc = model.layers[1].hyper.as_ref().unwrap();
+    let flat = |t: &Tensor| {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let (mixed_ref, inj_ref) = hc.attn.mix(&r).unwrap();
+    let xn = hc.attn.normed_on_card(&r).unwrap();
+    let (mixed, inj_raw) = hc.attn.mix_on_card(&xn, false).unwrap();
+    assert!(
+        max_diff(&flat(&mixed), &flat(&mixed_ref)) < 1e-4,
+        "the sublayer input"
+    );
+    let (s, d) = (hc.attn.streams(), hc.attn.dim());
+    let weights = (crate::tensor::ops::sigmoid(&(inj_raw.clone().unwrap() / s as f64).unwrap())
+        .unwrap()
+        * 2.0)
+        .unwrap();
+    assert!(
+        max_diff(&flat(&weights), &flat(&inj_ref.clone().unwrap())) < 1e-5,
+        "the write-back weights"
+    );
+    // the write-back and the next norm, against the tensor ops
+    let out = (mixed_ref.clone() * 0.5).unwrap();
+    let want = super::hyper::combine(&r, &out, &inj_ref.unwrap()).unwrap();
+    let want_norm = super::hyper::grouped_rms(&want, hc.ffn.norm_params().0, s, d, 1e-6).unwrap();
+    let (got, got_norm) =
+        super::hyper::combine_on_card(&r, &out, &inj_raw.unwrap(), Some(&hc.ffn), s, d).unwrap();
+    assert!(max_diff(&flat(&got), &flat(&want)) < 1e-5, "the write-back");
+    assert!(
+        max_diff(&flat(&got_norm.unwrap()), &flat(&want_norm)) < 1e-4,
+        "the next norm"
+    );
+    // an F16 sublayer output
+    let (f16_in, _) = hc.attn.mix_on_card(&xn, true).unwrap();
+    assert_eq!(f16_in.dtype(), DType::F16);
+    assert!(
+        max_diff(&flat(&f16_in), &flat(&mixed_ref)) < 5e-3,
+        "the F16 sublayer input"
+    );
+}

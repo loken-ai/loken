@@ -14,6 +14,8 @@ mod shortconv;
 pub use shortconv::*;
 mod rmsnorm;
 pub use rmsnorm::*;
+mod hyper;
+pub use hyper::*;
 
 thread_local! {
     static IN_PLACE_STATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
