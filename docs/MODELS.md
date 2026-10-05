@@ -49,16 +49,23 @@ surface; gpt-oss speaks Harmony and is read as such.
 Vision: `moondream`, `pixtral`, the Qwen vision lines (`qwen25` vision, `qwen3vl`). Images travel
 base64 in the request on all three surfaces.
 
-Speech in: `voxtral` and `ultravox` take audio in a chat turn. The text model is a Llama-line
-GGUF, the speech tower the `mmproj*.gguf` beside it (`clip.projector_type` names the family), and
-a model whose files carry one lists `audio` among its capabilities. The tower is placed after the
-text model, on a card the text model does not use when there is one. A clip arrives base64 as an
-`input_audio` part of `/v1/chat/completions` or in `audios` of an `/api/chat` message, in any
-container the server decodes, and is mixed down and resampled to the tower's rate. Its embeddings
-take the place of one marker in the prompt, so the clip counts against the context window. A
-request carrying a clip is not served from the prompt cache and takes no grammar. An Ultravox
-checkpoint directory is read by the tower loader too, but serving it needs the language model as a
-GGUF beside it.
+Speech in: `voxtral` and `ultravox` take audio in a chat turn. A model whose files carry a speech
+tower lists `audio` among its capabilities. The tower is either the `mmproj*.gguf` beside a text
+GGUF (`clip.projector_type` names the family), or a checkpoint directory whose `config.json`
+declares an `audio_config`: Ultravox ships only the tower and the projector, and names its text
+model by `text_model_id`, which is looked up in the hub cache by id, else by name under any owner.
+The tower is placed after the text model, on a card the text model does not use when there is one.
+A clip arrives base64 as an `input_audio` part of `/v1/chat/completions` or in `audios` of an
+`/api/chat` message, in any container the server decodes, and is mixed down and resampled to the
+tower's rate. Clips over 30 s are encoded window by window. Its embeddings take the place of one
+marker in the prompt, so the clip counts against the context window and in `prompt_tokens` /
+`prompt_eval_count`. A request carrying a clip is not served from the prompt cache and takes no
+grammar.
+
+Dense checkpoints: a directory of `config.json`, a tokenizer and F32, F16 or BF16 safetensors
+shards of a Llama, Mistral or Qwen text model is served through the same generic route as a GGUF
+file. Shapes come from the configuration, the tensors are read in their stored width, and a
+long-context rope declared there is turned into the frequency table a GGUF file would carry.
 
 Embeddings and reranking: BERT-shaped encoders (`nomic`, `bge` and the like) answer
 `/v1/embeddings` and `/api/embed`; a Qwen3-Reranker checkpoint answers `/v1/rerank`.

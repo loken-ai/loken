@@ -284,7 +284,18 @@ impl<'a> TensorSource<'a> {
                 &Device::Cpu,
                 part.owner.as_ref(),
             )?;
+            // CONVERSION: widened to F32 on the host first (declared below).
             let wide = stored.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?;
+            let n = wide.elem_count() as u64;
+            crate::tensor::conversion::record_kept(
+                "norm",
+                info.ggml_dtype.gguf_name(),
+                "f32",
+                n * info.ggml_dtype.type_size() as u64 / info.ggml_dtype.block_size() as u64,
+                n * 4,
+                "a norm scale or bias is a small vector held F32",
+            );
+            // CONVERSION: held F32, declared above.
             return Ok(Some(QTensor::quantize_onto(
                 &wide,
                 crate::tensor::quantized::GgmlDType::F32,
@@ -303,12 +314,23 @@ impl<'a> TensorSource<'a> {
                 &Device::Cpu,
                 part.owner.as_ref(),
             )?;
+            // CONVERSION: widened to F32 on the host first (declared below).
             let wide = stored.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?;
             let width = if device.is_cpu() {
                 crate::tensor::quantized::GgmlDType::F32
             } else {
                 crate::tensor::quantized::GgmlDType::F16
             };
+            let n = wide.elem_count() as u64;
+            crate::tensor::conversion::record_kept(
+                "weight",
+                "bf16",
+                width.gguf_name(),
+                n * 2,
+                n * width.type_size() as u64,
+                "no kernel reads BF16: F16 on a card, F32 on the host",
+            );
+            // CONVERSION: held at `width`, declared above.
             return Ok(Some(QTensor::quantize_onto(&wide, width, device)?));
         }
         Ok(Some(info.read_slice_owned(
