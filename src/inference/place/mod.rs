@@ -11,6 +11,8 @@ pub mod audio_demand;
 mod conversion_invariants;
 pub mod device_probe;
 pub mod dry_plan;
+#[cfg(test)]
+mod environment_invariants;
 pub mod expert_cache;
 pub mod fit_report;
 #[cfg(all(test, feature = "image"))]
