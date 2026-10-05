@@ -421,11 +421,23 @@ extern "C" void loken_topk_softmax(
         else           ll_gate_topk::topk_softmax_from_logits_kernel<NE, false> <<<grid, block, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used); \
     } while (0)
 
+    // Any expert count that fills whole warps: a lane holds count / 32 of the experts.
     switch (n_experts) {
         case 32:  DISPATCH_LOGITS(32);  break;
         case 64:  DISPATCH_LOGITS(64);  break;
+        case 96:  DISPATCH_LOGITS(96);  break;
         case 128: DISPATCH_LOGITS(128); break;
+        case 160: DISPATCH_LOGITS(160); break;
+        case 192: DISPATCH_LOGITS(192); break;
+        case 224: DISPATCH_LOGITS(224); break;
         case 256: DISPATCH_LOGITS(256); break;
+        case 288: DISPATCH_LOGITS(288); break;
+        case 320: DISPATCH_LOGITS(320); break;
+        case 352: DISPATCH_LOGITS(352); break;
+        case 384: DISPATCH_LOGITS(384); break;
+        case 416: DISPATCH_LOGITS(416); break;
+        case 448: DISPATCH_LOGITS(448); break;
+        case 480: DISPATCH_LOGITS(480); break;
         case 512: DISPATCH_LOGITS(512); break;
         default:
             return; // Unsupported - the caller falls back to the unfused tensor ops.

@@ -8,6 +8,11 @@ use super::*;
 /// keeps no per-expert CPU QMatMul cache, so there is nothing to drop.
 pub fn clear_expert_cache() {}
 
+/// Whether the fused routing kernel serves `n_experts`: whole warps of 32, at most 512.
+pub fn topk_softmax_serves(n_experts: usize) -> bool {
+    n_experts != 0 && n_experts % 32 == 0 && n_experts <= 512
+}
+
 /// Top-k softmax over expert logits -> (weights, expert ids).
 pub fn topk_softmax(
     logits: &Tensor,
@@ -20,9 +25,9 @@ pub fn topk_softmax(
     }
     let n_rows = dims[0];
     let n_experts = dims[1];
-    if !matches!(n_experts, 32 | 64 | 128 | 256 | 512) {
+    if !topk_softmax_serves(n_experts) {
         crate::tensor::bail!(
-            "topk_softmax only supports n_experts ∈ {{32, 64, 128, 256, 512}}; got {}",
+            "topk_softmax serves expert counts that are whole warps (a multiple of 32, up to 512); got {}",
             n_experts
         );
     }
@@ -323,6 +328,63 @@ mod stable_sort_tests {
             let want: Vec<u32> = idx.iter().map(|&i| keys[i as usize]).collect();
             assert_eq!(sorted.to_vec1::<u32>().unwrap(), want);
             assert_eq!(order.to_vec1::<u32>().unwrap(), idx);
+        }
+    }
+}
+
+#[cfg(test)]
+mod topk_softmax_tests {
+    use super::*;
+
+    /// The fused routing kernel against a host softmax and selection, at expert counts that are
+    /// not powers of two.
+    #[test]
+    fn the_fused_router_matches_a_host_softmax_at_every_served_width() {
+        let Ok(dev) = crate::tensor::Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        for n_experts in (1..=16).map(|w| w * 32) {
+            for with_norm in [true, false] {
+                let rows = 3;
+                let k = 10;
+                let logits: Vec<f32> = (0..rows * n_experts)
+                    .map(|i| (((i as u64 * 2654435761) >> 7) % 1000) as f32 / 90.0 - 5.0)
+                    .collect();
+                let t = Tensor::from_vec(logits.clone(), (rows, n_experts), &dev).unwrap();
+                let (w, ids) = topk_softmax(&t, k, with_norm).unwrap();
+                let (w, ids) = (w.to_vec2::<f32>().unwrap(), ids.to_vec2::<u32>().unwrap());
+                for r in 0..rows {
+                    let row = &logits[r * n_experts..(r + 1) * n_experts];
+                    let max = row.iter().cloned().fold(f32::MIN, f32::max);
+                    let exp: Vec<f32> = row.iter().map(|v| (v - max).exp()).collect();
+                    let sum: f32 = exp.iter().sum();
+                    let mut order: Vec<usize> = (0..n_experts).collect();
+                    order.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+                    let chosen = &order[..k];
+                    let kept: f32 = chosen.iter().map(|&e| exp[e] / sum).sum();
+                    let mut got: Vec<(u32, f32)> =
+                        ids[r].iter().cloned().zip(w[r].iter().cloned()).collect();
+                    got.sort_by_key(|g| g.0);
+                    let mut want: Vec<(u32, f32)> = chosen
+                        .iter()
+                        .map(|&e| (e as u32, exp[e] / sum / if with_norm { kept } else { 1.0 }))
+                        .collect();
+                    want.sort_by_key(|g| g.0);
+                    for (g, h) in got.iter().zip(&want) {
+                        assert_eq!(
+                            g.0, h.0,
+                            "{n_experts} experts, row {r}: the chosen experts differ"
+                        );
+                        assert!(
+                            (g.1 - h.1).abs() < 1e-5,
+                            "{n_experts} experts, row {r}: {} against {}",
+                            g.1,
+                            h.1
+                        );
+                    }
+                }
+            }
         }
     }
 }

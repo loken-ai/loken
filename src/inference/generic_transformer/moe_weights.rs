@@ -626,9 +626,8 @@ impl MoeWeights {
             sigmoid.select(&logits_f32, self.n_experts_used)?
         } else {
             let fused = logits_f32.device().is_cuda()
-                && matches!(
+                && crate::inference::moe_cuda::topk_softmax_serves(
                     logits_f32.dim(crate::tensor::D::Minus1)?,
-                    32 | 64 | 128 | 256 | 512
                 );
             crate::inference::place::layer_perf::stages::note_topk_path(fused);
             if fused {
