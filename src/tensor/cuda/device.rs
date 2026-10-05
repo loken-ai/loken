@@ -26,12 +26,18 @@ pub(super) fn emergency_reclaim(dev: &CudaDevice) {
     crate::tensor::quantized::fast_mmvq::release_workspaces();
     crate::tensor::quantized::release_mmq_workspaces();
     let _ = dev.stream().synchronize();
+    trim_pool(dev.ordinal());
+}
+
+/// Gives the device's default memory pool back every block it holds free, so memory the pool
+/// cached for transients is available to a graph's allocations and to other allocators.
+pub fn trim_pool(ordinal: usize) {
     unsafe {
         use cudarc::driver::sys::{
             cuDeviceGetDefaultMemPool, cuMemPoolGetAttribute, cuMemPoolSetAttribute,
             cuMemPoolTrimTo, cudaError_enum, CUmemPool_attribute, CUmemoryPool,
         };
-        let ordinal = dev.ordinal() as i32;
+        let ordinal = ordinal as i32;
         let mut pool: CUmemoryPool = std::ptr::null_mut();
         if cuDeviceGetDefaultMemPool(&mut pool, ordinal) != cudaError_enum::CUDA_SUCCESS
             || pool.is_null()
@@ -675,22 +681,20 @@ pub(crate) fn dev_const_i32(dev: &CudaDevice, vals: &[i32]) -> Result<Arc<CudaSl
         return Ok(s.clone());
     }
     let stream = dev.stream();
-    // Graph capture in flight (or its bump arena armed): a fresh upload here
-    // would land in the capture arena (whose lifetime is the graph's, not the
-    // process's) and record an H2D node. Keep it OUT of the persistent cache
-    // and leak the host buffer so the captured memcpy node's source stays
-    // valid for every replay. Pre-capture warmup makes this path cold.
-    let capturing = stream.context().arena_armed()
-        || stream
-            .capture_status()
-            .ok()
-            .map(|st| {
-                !matches!(
-                    st,
-                    cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
-                )
-            })
-            .unwrap_or(false);
+    // Graph capture in flight: a fresh upload here would record an H2D node.
+    // Keep it OUT of the persistent cache and leak the host buffer so the
+    // captured memcpy node's source stays valid for every replay. Pre-capture
+    // warmup makes this path cold.
+    let capturing = stream
+        .capture_status()
+        .ok()
+        .map(|st| {
+            !matches!(
+                st,
+                cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+            )
+        })
+        .unwrap_or(false);
     if capturing {
         let host: &'static [i32] = Box::leak(vals.to_vec().into_boxed_slice());
         let mut d = with_oom_retry(dev, "dev_const", || unsafe {

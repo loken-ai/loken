@@ -88,7 +88,7 @@ pub struct Qwen3Lm {
     pub n_kv: usize,
     pub head_dim: usize,
     /// Feed-forward width. Kept because the decode step's transient footprint - and so the
-    /// capture arena that has to hold it - is set by it as much as by the hidden size.
+    /// memory its graph needs - is set by it as much as by the hidden size.
     pub ffn: usize,
     pub vocab: usize,
     pub rope_theta: f32,
@@ -206,11 +206,11 @@ impl CfgKv {
 /// token-varying state is only (a) the embedded token `x`, (b) the per-row RoPE
 /// cos/sin rows, (c) the per-row KV write offset (a device i32 index buffer the
 /// `scatter_set` reads), and (d) the per-row additive attention mask (-inf beyond the
-/// row's current length). All four are arena buffers refreshed via `slice_set`; the
+/// row's current length). All four are stable buffers refreshed via `slice_set`; the
 /// graph shape is constant within the bucket, so one capture replays for ~256 tokens.
 #[cfg(feature = "cuda")]
 struct DecodeGraph {
-    graph: cudarc::driver::CudaGraph,
+    graph: crate::tensor::cuda::CapturedGraph,
     cap: usize,     // captured context capacity (multiple of GRAPH_BUCKET)
     x: Tensor,      // [2,1,H]   embedded token (both rows = same chosen token)
     cos: Tensor,    // [2,1,1,half] per-row RoPE cos
@@ -544,7 +544,7 @@ impl Qwen3Lm {
     }
 
     /// Whether every layer sits on the primary card, which is what the captured decode
-    /// graph needs: its arena and its scatter live on one device.
+    /// graph needs: its buffers and its scatter live on one device.
     fn on_one_card(&self) -> bool {
         let key = dev_key(&self.device);
         self.layers.iter().all(|l| dev_key(&l.device) == key)
@@ -1026,7 +1026,7 @@ impl Qwen3Lm {
 
     /// Captured-graph B=2 CFG decode step. Mirrors `continuous_serve`'s capture/replay:
     /// capture once per ctx-capacity bucket (warmup eager -> this token's real result),
-    /// then replay (refresh the arena input buffers + launch) for the rest of the bucket
+    /// then replay (refresh the input buffers + launch) for the rest of the bucket
     /// - removing the per-token kernel-launch flood that pegs a host core. The growing
     /// KV is handled by a fixed `cap` window + a refreshed length mask (see `graph_inputs`
     /// / `attn_row_capped`). Returns hidden `[2,1,H]` on-device. On ANY capture/replay
@@ -1034,7 +1034,7 @@ impl Qwen3Lm {
     #[cfg(feature = "cuda")]
     fn forward_b2_graph(&self, chosen: u32, kv: &mut CfgKv) -> Result<Tensor> {
         use cudarc::driver::sys::{CUgraphInstantiate_flags_enum, CUstreamCaptureMode};
-        // The decode graph is SINGLE-DEVICE by construction (its arena buffers live on the
+        // The decode graph is SINGLE-DEVICE by construction (its input buffers live on the
         // primary device and every captured op must run there). Under a hetero plan that
         // spilled layers onto another CUDA card, a capture attempt aborts MID-STREAM on the
         // first cross-device op (scatter_set) - and an aborted capture leaves the stream in a
@@ -1057,7 +1057,6 @@ impl Qwen3Lm {
             _ => return Err(err("graph: model not on CUDA".into())),
         };
         let dev = self.device.clone();
-        let ctx = cd.context().clone();
         let stream = cd.stream().clone();
         let pos = [kv.cached[0], kv.cached[1]];
         let cap = (pos.iter().copied().max().unwrap() + 1).div_ceil(GRAPH_BUCKET) * GRAPH_BUCKET;
@@ -1097,9 +1096,8 @@ impl Qwen3Lm {
                 kv.cached[1] += 1;
                 return Ok(hidden);
             }
-            // bucket changed -> drop the old graph + arena, recapture below.
+            // bucket changed -> drop the old graph, recapture below.
             kv.graph = None;
-            ctx.free_capture_arena();
         }
 
         // -- capture (new bucket) --
@@ -1131,40 +1129,19 @@ impl Qwen3Lm {
         stream
             .synchronize()
             .map_err(|e| err(format!("sync: {e}")))?;
-        // Arm the capture arena and re-home the stable input buffers into it so their VAs
-        // stay stable across replays. The arena holds every transient allocation of the
-        // decode pass at once, so it follows the layer count and the widths; it shrinks when
-        // a concurrent consumer took the card's memory after it was measured, and the error
-        // of the smallest attempt sends the decode loop to the eager path.
-        let (arena_start, arena_floor) =
-            crate::inference::place::audio_demand::lm_graph_arena_range(
-                cd.ordinal(),
-                self.layers.len(),
-                self.hidden,
-                self.ffn,
-                CFG_ROWS,
-            );
-        crate::inference::place::ladder::halve_until_fits(
-            "ace-lm graph arena",
-            arena_start as usize,
-            arena_floor as usize,
-            |bytes| {
-                eprintln!("[ace-lm] graph arena {}MB", bytes >> 20);
-                ctx.begin_capture_arena(bytes)
-                    .map_err(|e| err(format!("begin arena: {e:?}")))
-            },
-        )?;
-        let arena_copy = |t: &Tensor| -> Result<Tensor> {
+        // Re-home the stable input buffers before the capture, so they outlive it and the graph
+        // reads them at fixed addresses.
+        let stable_copy = |t: &Tensor| -> Result<Tensor> {
             let a = Tensor::zeros_on(t.dims().to_vec(), t.dtype(), &dev)?;
             a.slice_set(t, 0, 0)?;
             Ok(a)
         };
-        let x = arena_copy(&x)?;
-        let cos = arena_copy(&cos)?;
-        let sin = arena_copy(&sin)?;
-        let widx = arena_copy(&widx)?;
-        let mask = arena_copy(&mask)?;
-        // Settle ALL pre-capture stream work (arena copies, input prep) so the captured
+        let x = stable_copy(&x)?;
+        let cos = stable_copy(&cos)?;
+        let sin = stable_copy(&sin)?;
+        let widx = stable_copy(&widx)?;
+        let mask = stable_copy(&mask)?;
+        // Settle ALL pre-capture stream work (input copies, input prep) so the captured
         // region has no live dependency on uncaptured same-/cross-stream work
         // (CUDA_ERROR_STREAM_CAPTURE_ISOLATION otherwise).
         stream
@@ -1173,38 +1150,25 @@ impl Qwen3Lm {
         let inst_flags: CUgraphInstantiate_flags_enum = unsafe { std::mem::transmute(0u32) };
         let mut hidden_out: Option<Tensor> = None;
         let cap_res: std::result::Result<_, crate::tensor::Error> = (|| {
-            stream
-                .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
-                .map_err(|e| err(format!("begin_capture: {e:?}")))?;
+            crate::tensor::cuda::begin_capture(
+                &stream,
+                CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+            )
+            .map_err(|e| err(format!("begin_capture: {e:?}")))?;
             let hf = self.forward_graph(&x, &cos, &sin, &widx, &mask, cap, &mut kv.k, &mut kv.v)?;
             hidden_out = Some(hf);
-            stream
-                .end_capture(inst_flags)
+            crate::tensor::cuda::end_capture(&stream, inst_flags)
                 .map_err(|e| err(format!("end_capture: {e:?}")))?
                 .ok_or_else(|| err("graph capture: null graph".into()))
         })();
-        let (_peak, overflow) = ctx.end_capture_arena();
         let graph = match cap_res {
-            Ok(g) if overflow == 0 => {
-                eprintln!(
-                    "[ace-lm] graph captured (cap={cap}) arena peak {}MB",
-                    _peak >> 20
-                );
+            Ok(g) => {
+                eprintln!("[ace-lm] graph captured (cap={cap})");
                 g
             }
-            Ok(g) => {
-                drop(g);
-                ctx.free_capture_arena();
-                return Err(err(format!(
-                    "graph capture: arena overflow ({}MB over, peak {}MB)",
-                    overflow >> 20,
-                    _peak >> 20
-                )));
-            }
             Err(e) => {
-                let _ = stream.end_capture(inst_flags);
+                let _ = crate::tensor::cuda::end_capture(&stream, inst_flags);
                 let _ = stream.synchronize();
-                ctx.free_capture_arena();
                 return Err(e);
             }
         };
@@ -1455,9 +1419,6 @@ impl Qwen3Lm {
                                 );
                                 use_graph = false;
                                 kv.graph = None;
-                                if let Device::Cuda(c) = &self.device {
-                                    c.context().free_capture_arena();
-                                }
                                 let row = self.embed_row(chosen)?;
                                 let rows2 = Tensor::cat(&[&row, &row], 0)?;
                                 self.forward_b2_t(&rows2, &mut kv)?
@@ -1493,14 +1454,9 @@ impl Qwen3Lm {
             tracing::debug!("[ace-lm-prof] {} codes | sample(host)={:.1}ms ({:.2}ms/c) | forward(launch)={:.1}ms ({:.2}ms/c) | logits+download(sync)={:.1}ms ({:.2}ms/c)",
                 codes.len(), _t_s*1e3, _t_s*1e3/n, _t_f*1e3, _t_f*1e3/n, _t_l*1e3, _t_l*1e3/n);
         }
-        // Release the captured graph BEFORE the arena it references (the graph's nodes
-        // point into the arena allocation), then free the arena.
         #[cfg(feature = "cuda")]
         {
             kv.graph = None;
-            if let Device::Cuda(c) = &self.device {
-                c.context().free_capture_arena();
-            }
         }
         Ok(codes)
     }

@@ -903,10 +903,6 @@ impl LlmEngine {
                                 { cuda_graph = None; }
                                 graph_logits = None;
                                 state.model.invalidate_graph_state();
-                                #[cfg(feature = "cuda")]
-                                if let Some(Some(ref stream)) = cuda_stream {
-                                    stream.context().free_capture_arena();
-                                }
                                 match state.model.update_graph_state(pos) {
                                     Ok(()) => {
                                         info!("graph replay ended at pos={pos} ({e}); recording a new graph from here");
@@ -944,10 +940,6 @@ impl LlmEngine {
                                 // transients as no-ops) BEFORE freeing the
                                 // capture arena.
                                 state.model.invalidate_graph_state();
-                                #[cfg(feature = "cuda")]
-                                if let Some(Some(ref stream)) = cuda_stream {
-                                    stream.context().free_capture_arena();
-                                }
                             }
                         }
                     }
@@ -967,9 +959,6 @@ impl LlmEngine {
                                 // Transients first, then the arena (see
                                 // update_graph_state failure path above).
                                 state.model.invalidate_graph_state();
-                                if let Some(Some(ref stream)) = cuda_stream {
-                                    stream.context().free_capture_arena();
-                                }
                             }
                         }
                     }
@@ -1134,9 +1123,6 @@ impl LlmEngine {
                                                 // (arena-range drops are no-ops
                                                 // only while it is alive).
                                                 state.model.invalidate_graph_state();
-                                                if let Some(Some(ref stream)) = cuda_stream {
-                                                    stream.context().free_capture_arena();
-                                                }
                                                 pos += 1;
                                                 let logits_1d = eag.squeeze(0)?;
                                                 next_token = gpu_sample(
@@ -1176,9 +1162,6 @@ impl LlmEngine {
                                 // Same teardown order as the mismatch path:
                                 // transients first, then the arena.
                                 state.model.invalidate_graph_state();
-                                if let Some(Some(ref stream)) = cuda_stream {
-                                    stream.context().free_capture_arena();
-                                }
                             }
                         }
                     }
@@ -1267,10 +1250,9 @@ impl LlmEngine {
                                 state.model.prepare_all_kv(tok_ids, pos)?;
                             }
 
-                            // Capture arena + record + 0-node defense +
-                            // histogram + upload - shared with the streaming
-                            // decode loop (see `capture_decode_graph`).
-                            let ctx = stream.context();
+                            // Record + 0-node defense + histogram + upload -
+                            // shared with the streaming decode loop (see
+                            // `capture_decode_graph`).
                             match capture_decode_graph(&mut state.model, stream, pos, needs_split) {
                                 Some((g, logits)) => {
                                     // A capture only RECORDS - the logits buffer
@@ -1330,7 +1312,6 @@ impl LlmEngine {
                                                     )?;
                                                     record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                                     state.model.invalidate_graph_state();
-                                                    ctx.free_capture_arena();
                                                     continue;
                                                 }
                                                 Err(e) => {
@@ -1368,7 +1349,6 @@ impl LlmEngine {
                                             )?;
                                             record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                             state.model.invalidate_graph_state();
-                                            ctx.free_capture_arena();
                                             continue;
                                         }
                                     }
@@ -1393,7 +1373,6 @@ impl LlmEngine {
                                     )?;
                                     record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                     state.model.invalidate_graph_state();
-                                    ctx.free_capture_arena();
                                     continue;
                                 }
                             }
@@ -1571,14 +1550,10 @@ impl LlmEngine {
             // than the server makes them.
             let decode_elapsed = gen_start.elapsed();
 
-            // End-of-request graph teardown. The captured graph + its
-            // arena-backed transients must not outlive the request: the next
-            // request re-captures with a FRESH arena (begin_capture_arena
-            // frees any previous one), and stale arena tensors dropped after
-            // that free would real-cuMemFree garbage pointers. Order: graph
-            // first, then transients/buffers (arena-range drops are no-ops
-            // while the arena is alive), then the arena itself - which also
-            // returns its VRAM between requests.
+            // End-of-request graph teardown. The captured graph and the
+            // transients it references must not outlive the request: the next
+            // request captures anew. Order: graph first, then
+            // transients/buffers.
             #[cfg(feature = "cuda")]
             if graph_capture_attempted {
                 let captured = cuda_graph.is_some();
@@ -1586,9 +1561,6 @@ impl LlmEngine {
                 drop(graph_logits.take());
                 if captured {
                     state.model.invalidate_graph_state();
-                    if let Some(Some(ref stream)) = cuda_stream {
-                        stream.context().free_capture_arena();
-                    }
                 }
             }
 

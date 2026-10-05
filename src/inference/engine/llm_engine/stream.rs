@@ -1548,7 +1548,6 @@ impl LlmEngine {
                             cuda_graph = None;
                             graph_logits = None;
                             state.model.invalidate_graph_state();
-                            stream.context().free_capture_arena();
                             if let Err(again) = state.model.update_graph_state(pos) {
                                 warn!("update_graph_state failed at pos={pos}: {again}. Disabling graph for rest of request.");
                                 graph_disabled_this_request = true;
@@ -1565,7 +1564,6 @@ impl LlmEngine {
                             graph_logits = None;
                             graph_disabled_this_request = true;
                             state.model.invalidate_graph_state();
-                            stream.context().free_capture_arena();
                             break 'graph_blk None;
                         }
 
@@ -1674,7 +1672,6 @@ impl LlmEngine {
                                                     graph_logits = None;
                                                     graph_disabled_this_request = true;
                                                     state.model.invalidate_graph_state();
-                                                    stream.context().free_capture_arena();
                                                     pos += 1;
                                                     // The eager logits are the trusted ones.
                                                     break 'graph_blk Some(sample_graph!(eag));
@@ -1699,7 +1696,6 @@ impl LlmEngine {
                                     graph_logits = None;
                                     graph_disabled_this_request = true;
                                     state.model.invalidate_graph_state();
-                                    stream.context().free_capture_arena();
                                     break 'graph_blk None;
                                 }
                             }
@@ -1791,7 +1787,6 @@ impl LlmEngine {
                                                     drop(g);
                                                     graph_disabled_this_request = true;
                                                     state.model.invalidate_graph_state();
-                                                    stream.context().free_capture_arena();
                                                     pos += 1;
                                                     break 'graph_blk Some(sample_graph!(eag));
                                                 }
@@ -1816,13 +1811,11 @@ impl LlmEngine {
                                                 Ok(l) => {
                                                     pos += 1;
                                                     state.model.invalidate_graph_state();
-                                                    stream.context().free_capture_arena();
                                                     break 'graph_blk Some(sample_graph!(l));
                                                 }
                                                 Err(e2) => {
                                                     warn!("eager forward after failed graph launch also failed: {e2}");
                                                     state.model.invalidate_graph_state();
-                                                    stream.context().free_capture_arena();
                                                     break 'graph_blk None;
                                                 }
                                             }
@@ -1839,13 +1832,11 @@ impl LlmEngine {
                                         Ok(l) => {
                                             pos += 1;
                                             state.model.invalidate_graph_state();
-                                            stream.context().free_capture_arena();
                                             break 'graph_blk Some(sample_graph!(l));
                                         }
                                         Err(e) => {
                                             warn!("eager forward after failed capture also failed: {e}");
                                             state.model.invalidate_graph_state();
-                                            stream.context().free_capture_arena();
                                             break 'graph_blk None;
                                         }
                                     }

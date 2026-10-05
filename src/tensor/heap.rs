@@ -10,7 +10,7 @@
 //! it has to be replayed.
 //!
 //! THE ALLOCATOR THIS MODELS, and how its shape was established by probing it. Every
-//! device allocation in this substrate goes through the vendored cudarc's
+//! device allocation in this substrate goes through cudarc's
 //! `CudaStream::alloc`, which issues `cuMemAllocAsync` whenever the device has a
 //! memory pool - so the allocator is the driver's STREAM-ORDERED POOL, and what a
 //! card reports is that pool's reservation. Probed, it behaves like one heap:

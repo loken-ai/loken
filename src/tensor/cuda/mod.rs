@@ -26,6 +26,9 @@ pub(crate) fn alloc_err(ctx: &str, e: cudarc::driver::DriverError) -> Error {
     }
 }
 
+mod captured_graph;
+pub use captured_graph::*;
+
 mod device;
 pub use device::*;
 mod storage;

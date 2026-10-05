@@ -1,5 +1,5 @@
 //! Device + unified storage for the native tensor (CPU and, with the `cuda`
-//! feature, GPU via the vendored cudarc).
+//! feature, GPU via cudarc).
 
 #[cfg(feature = "cuda")]
 use super::cuda::{CudaDevice, CudaStorage};

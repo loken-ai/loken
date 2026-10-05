@@ -439,7 +439,7 @@ impl CudaDevice {
     }
 
     /// fork-compat: disable cudarc's event tracking on the context (graph
-    /// capture). Same vendored cudarc -> same semantics.
+    /// capture). Same cudarc -> same semantics.
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn disable_event_tracking(&self) {
         unsafe { self.0.context().disable_event_tracking() }

@@ -61,34 +61,20 @@ struct GhBatched {
     // Set once if capture ever fails -> permanently use the eager path.
     #[cfg(feature = "cuda")]
     graph_failed: bool,
-    // One persistent capture arena shared by all graphs (armed once, resumed per
-    // capture - never freed mid-session, so earlier graphs' arena addrs stay valid).
-    #[cfg(feature = "cuda")]
-    arena_armed: bool,
-    /// Bytes of that arena, as the placement divided the card.
-    #[cfg(feature = "cuda")]
-    arena_bytes: u64,
 }
 
 #[cfg(feature = "cuda")]
 impl Drop for GhBatched {
     fn drop(&mut self) {
-        // Destroy the captured graphs (they reference arena VAs) BEFORE releasing
-        // the shared capture arena - a raw cuMemAlloc block (up to ~2 GB) not owned
-        // by any Tensor, so without this it LEAKS that VRAM every time a CB-served
-        // model is unloaded/switched. The paged KV stores free via their own Drop.
+        // The captured graphs go before the model and the paged KV stores they read.
         self.graphs.clear();
-        if self.arena_armed {
-            let dev = self.model.compute_device();
-            let _ = crate::tensor::cuda_ext::free_capture_arena(&dev);
-        }
     }
 }
 
 /// A captured batched-decode graph + its stable I/O buffers (one per (B,cap)).
 #[cfg(feature = "cuda")]
 struct CapturedDecode {
-    graph: crate::tensor::cuda_ext::CudaGraph,
+    graph: crate::tensor::cuda_ext::CapturedGraph,
     x: Tensor,
     cos: Tensor,
     sin: Tensor,
@@ -327,18 +313,9 @@ impl BatchedModel for GhBatched {
                         Ok(l) => l,
                         Err(e) => {
                             let msg = format!("{e}");
-                            // Arena overflow is RECOVERABLE (a transient wide batch /
-                            // long context overran the shared arena) - run this step
-                            // eager but keep the graph enabled so narrower batches
-                            // still accelerate. Any OTHER failure latches it off.
-                            if !msg.contains("overflow") {
-                                eprintln!(
-                                    "cb graph disabled permanently (fallback to eager): {msg}"
-                                );
-                                self.graph_failed = true;
-                            } else {
-                                eprintln!("cb graph: arena overflow at B={} - eager this step, graph kept", toks.len());
-                            }
+                            // Any capture or replay failure latches the graph off.
+                            eprintln!("cb graph disabled permanently (fallback to eager): {msg}");
+                            self.graph_failed = true;
                             self.model.batched_paged_decode(
                                 &toks,
                                 &pos,
@@ -517,8 +494,6 @@ impl GhBatched {
             model,
             stores,
             graphs,
-            arena_armed,
-            arena_bytes,
             ..
         } = self;
         let dev = model.compute_device();
@@ -532,7 +507,7 @@ impl GhBatched {
         // their logits (rows raw_b..bpad) are ignored by the caller (it reads only
         // the real rows 0..raw_b). This caps the distinct (B,cap) graphs to the few
         // buckets {1,2,4,8,16,32} instead of one per live width -> far fewer
-        // recaptures and bounded shared-arena use as concurrency churns.
+        // recaptures as concurrency churns.
         let raw_b = toks.len();
         let bpad = if raw_b <= 1 {
             1
@@ -666,41 +641,26 @@ impl GhBatched {
         // so the captured region has no live cross-stream dependency on uncaptured
         // work (else CUDA_ERROR_STREAM_CAPTURE_ISOLATION).
         let _ = stream.synchronize();
-        // ONE persistent arena shared by every (B,cap) graph: arm it once, then
-        // RESUME (no free/reset) for each later capture so all graphs keep distinct,
-        // still-valid offset ranges across replays. Its size is what the placement set
-        // aside beside the pool; a graph that overruns it runs that step eagerly.
-        if !*arena_armed {
-            cuda_ext::begin_capture_arena(&dev, *arena_bytes as usize)?;
-            *arena_armed = true;
-        } else {
-            cuda_ext::resume_capture_arena(&dev)?;
-        }
-        // Re-home the stable per-step INPUT buffers into the ARENA (now armed).
-        // They were built (embed/rope/from_vec) in the standard cudaMallocAsync pool
-        // BEFORE arming; the captured graph bakes their VAs, but standard-pool VAs
-        // are not guaranteed stable once the pool flips to graph-tracked mode -> the
-        // graph can read a stale/zeroed buffer on replay (the zero-hidden bug). Arena
-        // buffers are a single fixed cuMemAlloc block (never reorganized), so copying
-        // the inputs into arena buffers and refreshing THOSE in-place each replay
-        // makes the baked input VAs stable. The eager copy here runs pre-capture.
-        let arena_copy = |t: &Tensor| -> crate::tensor::Result<Tensor> {
+        // Re-home the stable per-step INPUT buffers just before the capture: the graph reads
+        // them at fixed addresses and each replay refreshes them in place, so they are
+        // allocated outside the capture and live as long as the graph.
+        let stable_copy = |t: &Tensor| -> crate::tensor::Result<Tensor> {
             let a = Tensor::zeros_on(t.dims(), t.dtype(), &dev)?;
             a.slice_set(t, 0, 0)?;
             Ok(a)
         };
-        let x = arena_copy(&x)?;
-        let cos = arena_copy(&cos)?;
-        let sin = arena_copy(&sin)?;
-        let slot_dev = arena_copy(&slot_dev)?;
-        let seq_lens_dev = arena_copy(&seq_lens_dev)?;
-        let block_table_dev = arena_copy(&block_table_dev)?;
-        // Capture hf (the final-norm output) DIRECTLY as the persistent hidden buffer
-        // (an arena buffer written by the captured fused_rmsnorm_f16 on the capture
-        // stream -> reproduces on replay) - no separate hidden_buf / slice_set copy.
+        let x = stable_copy(&x)?;
+        let cos = stable_copy(&cos)?;
+        let sin = stable_copy(&sin)?;
+        let slot_dev = stable_copy(&slot_dev)?;
+        let seq_lens_dev = stable_copy(&seq_lens_dev)?;
+        let block_table_dev = stable_copy(&block_table_dev)?;
+        // The final-norm output is copied inside the capture into a buffer allocated before
+        // it: the graph then allocates nothing it keeps, and the buffer holds the hidden
+        // state after each replay.
         let _ = hidden_sz;
-        let mut hidden_out: Option<Tensor> = None;
-        let cap_res: crate::tensor::Result<cuda_ext::CudaGraph> = (|| {
+        let hidden_buf = Tensor::zeros_on(eager_hidden.dims(), eager_hidden.dtype(), &dev)?;
+        let cap_res: crate::tensor::Result<cuda_ext::CapturedGraph> = (|| {
             cuda_ext::begin_capture(&stream)?;
             let hf = model.decode_layers_gpu(
                 &x,
@@ -713,13 +673,13 @@ impl GhBatched {
                 max_blocks,
                 stores,
             )?;
-            hidden_out = Some(hf);
+            hidden_buf.slice_set(&hf, 0, 0)?;
+            drop(hf);
             cuda_ext::end_capture(&stream)?
                 .ok_or_else(|| crate::tensor::Error::msg("cb capture: null graph"))
         })();
-        let (peak, overflow) = cuda_ext::end_capture_arena(&dev)?;
         let graph = match cap_res {
-            Ok(g) if overflow == 0 => {
+            Ok(g) => {
                 let nnodes = g.num_nodes().unwrap_or(0);
                 // DEFENSE IN DEPTH: a 0-node graph recorded no work - replaying
                 // it would leave the hidden/logits buffers frozen -> constant
@@ -731,18 +691,9 @@ impl GhBatched {
                         "cb capture: empty graph (0 nodes) - refusing to replay".to_string(),
                     ));
                 }
-                eprintln!(
-                    "cb graph captured (B={b} cap={cap}) arena peak={}MB nodes={nnodes}",
-                    peak >> 20
-                );
+                eprintln!("cb graph captured (B={b} cap={cap}) nodes={nnodes}");
+                crate::tensor::cuda::trim_pool(dev.as_cuda_device()?.ordinal());
                 g
-            }
-            Ok(g) => {
-                // Shared arena exhausted (can't grow - earlier graphs reference it).
-                drop(g);
-                return Err(crate::tensor::Error::msg(
-                    "cb capture: shared arena overflow",
-                ));
             }
             Err(e) => {
                 let _ = cuda_ext::end_capture(&stream);
@@ -750,8 +701,6 @@ impl GhBatched {
                 return Err(e);
             }
         };
-        let hidden_buf = hidden_out
-            .ok_or_else(|| crate::tensor::Error::msg("cb capture: hidden not produced"))?;
         graphs.insert(
             key,
             CapturedDecode {
@@ -777,15 +726,13 @@ unsafe impl Send for SendWrap {}
 impl ContinuousServer {
     /// Spawn the worker. `model` is moved in and owned for the worker's lifetime;
     /// `eos` terminates a sequence; `num_blocks`/`block_size` size the paged KV
-    /// pool; `max_running` caps the concurrent decode batch width; `arena_bytes` sizes the
-    /// arena its decode graphs are captured into.
+    /// pool; `max_running` caps the concurrent decode batch width.
     pub fn spawn(
         model: Arc<GenericHeteroTransformer>,
         eos: Vec<u32>,
         num_blocks: usize,
         block_size: usize,
         max_running: usize,
-        arena_bytes: u64,
         max_prefill_tokens: usize,
     ) -> crate::tensor::Result<Self> {
         let (n_kv, hd, n_layers, _vocab) = model.paged_geometry();
@@ -798,7 +745,7 @@ impl ContinuousServer {
             let _ = crate::tensor::cuda_ext::pin_cublas_workspace(&cdev, 256 << 20);
             // Disable event tracking: the CB worker is single-stream, so the
             // multi-stream sync events aren't needed - and creating CUDA events
-            // during arena allocs INSIDE a graph capture invalidates the capture
+            // during allocations INSIDE a graph capture invalidates the capture
             // (required for the captured decode graph; mirrors tp_model + test_graph_capture).
             if let Ok(cd) = cdev.as_cuda_device() {
                 unsafe {
@@ -822,10 +769,6 @@ impl ContinuousServer {
             graphs: std::collections::HashMap::new(),
             #[cfg(feature = "cuda")]
             graph_failed: false,
-            #[cfg(feature = "cuda")]
-            arena_armed: false,
-            #[cfg(feature = "cuda")]
-            arena_bytes,
         });
         let (submit_tx, submit_rx) = mpsc::channel::<Submission>();
 

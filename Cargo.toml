@@ -82,15 +82,8 @@ nvml-wrapper = "0.12"
 # ML inference - loken's own native tensor substrate (src/tensor):
 # all models implemented in-crate (inference/native_* + generic_transformer +
 # native_sampling/native_ops); quantized GGUF + safetensors loaders included.
-# cudarc backs the CUDA device, stream and NCCL layer. A small local delta over it
-# is tracked separately at loken-ai/cudarc, which exists to be deleted:
-# two of its patches are upstreamable and the third can move into this crate's
-# allocator, because the synchronous allocation entry points it needs are public.
-# Pinned by revision, not by path: a sibling checkout is how the author works, not something a
-# clone has, and `cargo build` failing on a manifest error is a bad first impression. To work on
-# the patches locally, add a `[patch]` override to your own .cargo/config.toml - that keeps the
-# convenience out of the file everybody gets.
-cudarc = { version = "0.19", git = "https://github.com/loken-ai/cudarc.git", rev = "d307a98", package = "cudarc", optional = true, default-features = false, features = [
+# cudarc backs the CUDA device, stream and NCCL layer.
+cudarc = { version = "0.19.10", package = "cudarc", optional = true, default-features = false, features = [
     "std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "f8",
     "cuda-version-from-build-system", "dynamic-linking", "nccl",
 ] }

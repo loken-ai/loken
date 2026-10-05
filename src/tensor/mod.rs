@@ -1,5 +1,5 @@
 //! LOKEN's tensor substrate: the CPU block-quantisation engine, CUDA storage
-//! and streams over the vendored cudarc, GGUF and safetensors IO, the layer
+//! and streams over cudarc, GGUF and safetensors IO, the layer
 //! library, and the kernel boundary (`kernel_ffi`: storage projection plus the
 //! CUDA device and launch handles).
 //!

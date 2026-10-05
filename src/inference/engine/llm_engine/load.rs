@@ -697,10 +697,9 @@ pub(super) fn try_spawn_continuous(
     let (num_blocks, max_running) = (plan.blocks, plan.lanes);
     info!(
         "CB serve: ContinuousServer - {num_blocks} blocks x {block_size} = {} KV slots, \
-           max_running {max_running}, pool {} MB, arena {} MB",
+           max_running {max_running}, pool {} MB",
         num_blocks * block_size,
-        (num_blocks as u64 * block_bytes) >> 20,
-        plan.arena >> 20
+        (num_blocks as u64 * block_bytes) >> 20
     );
     let arc = std::sync::Arc::new(model);
     match ContinuousServer::spawn(
@@ -709,7 +708,6 @@ pub(super) fn try_spawn_continuous(
         num_blocks,
         block_size,
         max_running,
-        plan.arena,
         1 << 20,
     ) {
         Ok(s) => Ok(s),
@@ -816,7 +814,7 @@ unsafe impl Sync for MoondreamGraphState {}
 /// failure; recaptured on next eligible warmup).
 #[cfg(feature = "cuda")]
 pub(super) struct MoondreamGraphState {
-    pub(super) graph: crate::tensor::cuda_ext::CudaGraph,
+    pub(super) graph: crate::tensor::cuda_ext::CapturedGraph,
 }
 
 pub(crate) struct LoadedModelState {

@@ -8,8 +8,7 @@
 //!   - building a `Tensor` back from a kernel-produced `CudaSlice`,
 //!   - the quantized weight blob of a `QTensor`,
 //!   - stream / event / alt-stream (overlap) handles,
-//!   - CUDA-graph capture status + begin/end + capture-arena wrappers
-//!     (the cudarc-fork APIs the gptoss/lfm2 graph decode uses).
+//!   - CUDA-graph capture status + begin/end wrappers (the graph decode uses them).
 //!
 //! Everything CUDA-typed is gated on the `cuda` feature; `capture_active`
 //! also exists as a `false` stub on non-CUDA builds so call sites can drop
@@ -42,8 +41,8 @@ pub fn set_gemm_reduced_precision(_enable: bool) {}
 #[cfg(not(feature = "cuda"))]
 pub fn clear_device_cache() {}
 
-/// The CUDA backing: the substrate's CudaDevice/Storage over the vendored
-/// cudarc fork - the raw handle types (`CudaSlice`/`CudaStream`/...) are exactly
+/// The CUDA backing: the substrate's CudaDevice/Storage over
+/// cudarc - the raw handle types (`CudaSlice`/`CudaStream`/...) are exactly
 /// what every custom-kernel launcher takes.
 #[cfg(feature = "cuda")]
 mod cuda {
@@ -58,8 +57,9 @@ mod cuda {
 
     // Re-export the raw handle types under the boundary's namespace so call sites
     // can name them without spelling out the cudarc path.
+    pub use crate::tensor::cuda::{CapturedGraph, UpdateOutcome};
     pub use crate::tensor::kernel_ffi::CudaDevice as RawCudaDevice;
-    pub use cudarc::driver::{CudaEvent, CudaGraph, CudaSlice, CudaStream, CudaView};
+    pub use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, CudaView};
 
     // Raw launch surface for the FFI kernel-wrapper files ( Wave 2): the
     // launch-config / kernel-arg / device-pointer traits every custom-kernel
@@ -73,7 +73,6 @@ mod cuda {
     // node-type histogram diagnostics + the cheap-update-or-
     // reinstantiate recapture outcome.
     pub use cudarc::driver::sys::CUgraphNodeType;
-    pub use cudarc::driver::UpdateOutcome;
 
     fn msg<E: std::fmt::Debug>(ctx: &str) -> impl FnOnce(E) -> Error + '_ {
         move |e| Error::msg(format!("cuda_ext::{ctx}: {e:?}"))
@@ -161,65 +160,18 @@ mod cuda {
     /// Begin capturing `stream` into a CUDA graph (relaxed mode - the mode
     /// every production capture in loken uses).
     pub fn begin_capture(stream: &Arc<CudaStream>) -> Result<()> {
-        stream
-            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
+        tensor::cuda::begin_capture(stream, CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(msg("begin_capture"))
     }
 
     /// End the capture begun by [`begin_capture`] and instantiate the graph
     /// (default instantiation flags). `Ok(None)` mirrors cudarc: the driver
     /// returned a null graph.
-    pub fn end_capture(stream: &Arc<CudaStream>) -> Result<Option<CudaGraph>> {
+    pub fn end_capture(stream: &Arc<CudaStream>) -> Result<Option<CapturedGraph>> {
         // Default (empty) instantiate flags. The sys enum has no 0 variant to
         // name, hence the transmute - same as the existing gptoss/lfm2 sites.
         let flags: CUgraphInstantiate_flags_enum = unsafe { std::mem::transmute(0u32) };
-        stream.end_capture(flags).map_err(msg("end_capture"))
-    }
-
-    /// Route transient allocations of the upcoming capture into a pre-sized
-    /// bump arena (cudarc-fork extension). Allocations inside a captured
-    /// region must not create MEM_ALLOC nodes - the arena guarantees stable
-    /// replay addresses. Pair with [`end_capture_arena`].
-    pub fn begin_capture_arena(device: &Device, size_bytes: usize) -> Result<()> {
-        device
-            .as_cuda_device()?
-            .native()
-            .context()
-            .begin_capture_arena(size_bytes)
-            .map_err(msg("begin_capture_arena"))
-    }
-
-    /// Re-arm an already-allocated capture arena WITHOUT freeing/resetting it, so
-    /// multiple captured graphs share one persistent arena (each at a distinct
-    /// offset range, all valid across replays). Returns false if no arena exists.
-    pub fn resume_capture_arena(device: &Device) -> Result<bool> {
-        Ok(device
-            .as_cuda_device()?
-            .native()
-            .context()
-            .resume_capture_arena())
-    }
-
-    /// Stop arena routing; returns `(peak_bytes_used, overflow_bytes)`.
-    /// `overflow > 0` means the capture spilled past the arena into real
-    /// allocations (-> relocatable MEM_ALLOC nodes): grow and recapture.
-    pub fn end_capture_arena(device: &Device) -> Result<(usize, usize)> {
-        Ok(device
-            .as_cuda_device()?
-            .native()
-            .context()
-            .end_capture_arena())
-    }
-
-    /// Release the capture arena's backing allocation (e.g. when a graph is
-    /// discarded or the model resets at position 0).
-    pub fn free_capture_arena(device: &Device) -> Result<()> {
-        device
-            .as_cuda_device()?
-            .native()
-            .context()
-            .free_capture_arena();
-        Ok(())
+        tensor::cuda::end_capture(stream, flags).map_err(msg("end_capture"))
     }
 
     /// Pin a dedicated cuBLAS workspace of `bytes` for `device`'s handle so

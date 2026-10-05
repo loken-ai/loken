@@ -638,12 +638,6 @@ impl GenericHeteroTransformer {
                 c.clear_graph_captured();
             }
         }
-        // The capture arenas of the cards after the first go with the graph; the caller
-        // frees the first card's.
-        #[cfg(feature = "cuda")]
-        for (_, dev) in self.graph_segments().iter().skip(1) {
-            let _ = crate::tensor::cuda_ext::free_capture_arena(dev);
-        }
     }
 
     /// Engine hook: a CUDA graph referencing the per-layer KV buffers is

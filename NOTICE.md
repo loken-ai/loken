@@ -7,15 +7,11 @@ It builds on, vendors, or links against the third-party works listed below. Each
 under its own license; this file collects the required notices. The authoritative license for
 any crate dependency is the one shipped in its own source tree (resolved in `Cargo.lock`).
 
-## Patched dependency
+## Dependency
 
 | Component | Upstream | License |
 |-----------|----------|---------|
 | `cudarc` | [chelsea0x3b/cudarc](https://github.com/chelsea0x3b/cudarc) | MIT OR Apache-2.0 |
-
-A small delta over `cudarc` lives at [loken-ai/cudarc](https://github.com/loken-ai/cudarc),
-which carries the patched sources and their upstream licence files, and states what has to
-happen for it to stop existing.
 
 ## Borrowed code, measured
 
