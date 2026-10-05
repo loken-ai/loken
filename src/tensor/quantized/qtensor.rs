@@ -67,6 +67,24 @@ impl QTensor {
         })
     }
 
+    /// The tensor `inner` describes, held by `storage` on the card in place of an upload of its
+    /// blocks: the storage is filled by the caller, as often as it likes.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn over_card(
+        inner: Arc<QHostTensor>,
+        device: &Device,
+        storage: QCudaStorage,
+    ) -> Self {
+        Self {
+            shape: Shape::from(inner.dims.clone()),
+            inner,
+            device: device.clone(),
+            storage: QStorage::Cuda(storage),
+            qmm: std::sync::OnceLock::new(),
+            dry: None,
+        }
+    }
+
     /// What identifies these weights. Stable across `to_device` - the same weights on another
     /// card are the same weights - and never reused, so a cache keyed by it cannot answer a
     /// new tensor with a dropped one's entry.

@@ -62,6 +62,30 @@ impl QCudaStorage {
         Self::over(blob, data.len(), dtype, device)
     }
 
+    /// A zeroed blob of room for `len` bytes of blocks, for storages that take turns over it.
+    pub(crate) fn arena(
+        device: &CudaDevice,
+        len: usize,
+    ) -> Result<Arc<cudarc::driver::CudaSlice<u8>>> {
+        Ok(Arc::new(padded_blob(device, "expert staging arena", len)?))
+    }
+
+    /// This type over a blob that other storages share, whose first `len` bytes hold this one's
+    /// blocks while it is the one in use.
+    pub(crate) fn sharing(
+        blob: Arc<cudarc::driver::CudaSlice<u8>>,
+        len: usize,
+        dtype: GgmlDType,
+        device: &CudaDevice,
+    ) -> Self {
+        Self {
+            blob,
+            len,
+            dtype,
+            device: device.clone(),
+        }
+    }
+
     /// This type over an already-allocated blob whose first `len` bytes are the block data.
     fn over(
         blob: cudarc::driver::CudaSlice<u8>,

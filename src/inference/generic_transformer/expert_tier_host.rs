@@ -5,6 +5,8 @@ use super::moe_weights::MoeWeights;
 use crate::tensor::{Device, Result, Tensor};
 use std::sync::Arc;
 
+pub use super::moe_weights::prefill_bytes_per_token;
+
 /// A layer's cache of its experts on a card: none is ever built here.
 pub struct LayerTier;
 
@@ -17,6 +19,22 @@ impl LayerTier {
         _: &Tensor,
     ) -> Result<Tensor> {
         crate::tensor::bail!("an expert cache lives on a card")
+    }
+
+    pub fn stream_pays(&self, _rows: usize, _used: usize) -> bool {
+        false
+    }
+
+    pub fn prefetch(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub(super) fn stacks(&self) -> Result<&[crate::tensor::quantized::QTensor; 3]> {
+        crate::tensor::bail!("an expert cache lives on a card")
+    }
+
+    pub(super) fn release_stacks(&self) -> Result<()> {
+        Ok(())
     }
 }
 

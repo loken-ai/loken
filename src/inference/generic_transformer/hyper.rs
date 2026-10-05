@@ -211,7 +211,7 @@ pub fn grouped_rms(
 }
 
 /// Largest chunk a prompt is cut into, however many experts a model has.
-const CHUNK_CEILING: usize = 8192;
+pub(super) const CHUNK_CEILING: usize = 8192;
 /// Buffers of `streams x dim` f32 a wide layer keeps live per token of a chunk: the residual, at a
 /// combine the product it adds and the new residual, and the sublayers' own activations counted at
 /// the same width (the mixers' temporaries are bounded apart, by [`mixer_block_rows`]).

@@ -703,6 +703,27 @@ impl MoeWeights {
             (self.tier.as_ref(), xs.device().runs_as_card(), num_tokens)
         {
             tier.decode(self, &xs, &topk_ids, &topk_weights_scaled)?
+        } else if let Some(tier) = self.tier.as_ref().filter(|t| {
+            xs.device().runs_as_card() && t.stream_pays(num_tokens, self.n_experts_used)
+        }) {
+            // A wide batch reads nearly every expert: the layer's experts come to the card,
+            // beside the work before them, and the whole layer runs there as if it lived there.
+            let dev = xs.device().clone();
+            let stacks = super::wide::staged("tier fill wait", &dev, false, || tier.stacks())?;
+            let out = super::wide::staged("tier experts", &dev, false, || {
+                self.forward_cuda(
+                    &xs,
+                    &topk_ids,
+                    &topk_weights_scaled,
+                    num_tokens,
+                    true,
+                    t_route,
+                    None,
+                    Some(stacks),
+                )
+            });
+            tier.release_stacks()?;
+            out?
         } else if on_cpu {
             self.forward_cpu(&xs, &topk_ids, &topk_weights_scaled, num_tokens, hidden_dim)?
         } else {
@@ -714,6 +735,7 @@ impl MoeWeights {
                 is_prefill,
                 t_route,
                 add_after,
+                None,
             )?
         };
         // Back to the block's own device, width and dtype. The host expert path answers on
@@ -826,6 +848,7 @@ impl MoeWeights {
         is_prefill: bool,
         t_route: Option<std::time::Instant>,
         add_after: Option<&Tensor>,
+        staged: Option<&[QTensor; 3]>,
     ) -> Result<Tensor> {
         let note_route = || {
             if let Some(t) = t_route {
@@ -836,7 +859,7 @@ impl MoeWeights {
         // A wide prefill takes the expert-batched tile kernels, grouping the rows on the
         // device; decode and the layers they do not serve take the sorted routing below.
         let batched = match is_prefill {
-            true => self.batched_routing(xs, topk_ids, num_tokens)?,
+            true => self.batched_routing(xs, topk_ids, num_tokens, staged)?,
             false => None,
         };
         if let Some(plan) = batched {
@@ -844,7 +867,7 @@ impl MoeWeights {
                 crate::tensor::bail!("MoeWeights: the batched path does not fold a residual");
             }
             note_route();
-            return self.batched_experts(xs, &plan, topk_weights);
+            return self.batched_experts(xs, &plan, topk_weights, staged);
         }
         // One token: the rows are the routed pairs as the router listed them, and every kernel
         // below treats a pair on its own, so nothing needs grouping by expert.
@@ -906,12 +929,18 @@ impl MoeWeights {
             // one moe_gemm_gguf each (prefill+decode), then SiLU.mul in Rust. Uses
             // the untouched Q4K experts - no fused Q8 requant (which mangles the 3D
             // stack) and SiLU not the gemma4 kernel's baked GELU.
-            let g = self.gate_exps_sep.as_ref().ok_or_else(|| {
-                crate::tensor::Error::msg("use_silu MoE missing separate gate experts")
-            })?;
-            let u = self.up_exps_sep.as_ref().ok_or_else(|| {
-                crate::tensor::Error::msg("use_silu MoE missing separate up experts")
-            })?;
+            let g: &QTensor = match staged {
+                Some(s) => &s[0],
+                None => self.gate_exps_sep.as_deref().ok_or_else(|| {
+                    crate::tensor::Error::msg("use_silu MoE missing separate gate experts")
+                })?,
+            };
+            let u: &QTensor = match staged {
+                Some(s) => &s[1],
+                None => self.up_exps_sep.as_deref().ok_or_else(|| {
+                    crate::tensor::Error::msg("use_silu MoE missing separate up experts")
+                })?,
+            };
             // Decode-only here: the fused
             // single-launch SiLU.mul mmvq kernel (gate GEMM + up GEMM + SiLU.mul in
             // one pass) is exact for M=1 and faster than two separate GEMMs.
@@ -938,7 +967,8 @@ impl MoeWeights {
         let t_dn = st.then(std::time::Instant::now);
         // Down + topk-weighted reduce. For Q4_K MoE prefill the IMMA M=8
         // down kernel (same pattern as gate||up) takes over from dp4a.
-        let down_q4k_aligned = self.down_exps.dtype() == crate::tensor::quantized::GgmlDType::Q4K
+        let down_stack: &QTensor = staged.map_or(&*self.down_exps, |s| &s[2]);
+        let down_q4k_aligned = down_stack.dtype() == crate::tensor::quantized::GgmlDType::Q4K
             && self
                 .down_exps
                 .shape()
@@ -951,7 +981,7 @@ impl MoeWeights {
         let down_use_imma_m8 = is_prefill && down_q4k_aligned && size_m_est >= 64 && !down_no;
         let out = routing.down_reduce(
             &down_inputs,
-            &self.down_exps,
+            down_stack,
             topk_weights,
             num_tokens,
             down_use_imma_m8,
@@ -977,12 +1007,16 @@ impl MoeWeights {
         xs: &Tensor,
         topk_ids: &Tensor,
         num_tokens: usize,
+        staged: Option<&[QTensor; 3]>,
     ) -> Result<Option<crate::inference::moe_cuda::MmqRouting>> {
         use crate::inference::moe_cuda::{moe_mmq_pays, moe_mmq_serves, MmqRouting};
-        let (Some(gate), Some(up)) = (self.gate_exps_sep.as_ref(), self.up_exps_sep.as_ref())
-        else {
+        let (Some(gate), Some(up)) = (
+            staged.map(|s| &s[0]).or(self.gate_exps_sep.as_deref()),
+            staged.map(|s| &s[1]).or(self.up_exps_sep.as_deref()),
+        ) else {
             return Ok(None);
         };
+        let down_stack: &QTensor = staged.map_or(&*self.down_exps, |s| &s[2]);
         let hidden = xs.dim(crate::tensor::D::Minus1)?;
         // The tile kernels fold gate and up biases into the clamped SwiGLU only.
         let biases_served = self.swiglu_clamp.is_some()
@@ -991,7 +1025,7 @@ impl MoeWeights {
             && biases_served
             && gate.dtype() == up.dtype()
             && moe_mmq_serves(gate.dtype(), hidden)
-            && moe_mmq_serves(self.down_exps.dtype(), self.expert_ffn_dim);
+            && moe_mmq_serves(down_stack.dtype(), self.expert_ffn_dim);
         if !served || !moe_mmq_pays(num_tokens * self.n_experts_used, self.n_experts) {
             return Ok(None);
         }
@@ -1006,10 +1040,13 @@ impl MoeWeights {
         xs: &Tensor,
         plan: &crate::inference::moe_cuda::MmqRouting,
         topk_weights: &Tensor,
+        staged: Option<&[QTensor; 3]>,
     ) -> Result<Tensor> {
         use crate::inference::place::layer_perf::stages;
-        let (Some(gate), Some(up)) = (self.gate_exps_sep.as_ref(), self.up_exps_sep.as_ref())
-        else {
+        let (Some(gate), Some(up)) = (
+            staged.map(|s| &s[0]).or(self.gate_exps_sep.as_deref()),
+            staged.map(|s| &s[1]).or(self.up_exps_sep.as_deref()),
+        ) else {
             crate::tensor::bail!("MoeWeights: the batched path needs gate and up apart");
         };
         let timing = stages::enabled();
@@ -1034,7 +1071,7 @@ impl MoeWeights {
         });
         let out = plan.down_fold_biased(
             &hs,
-            &self.down_exps,
+            staged.map_or(&*self.down_exps, |s| &s[2]),
             topk_weights,
             None,
             self.down_exps_bias.as_ref(),
@@ -1059,6 +1096,7 @@ impl MoeWeights {
         _ip: bool,
         _t_route: Option<std::time::Instant>,
         _add_after: Option<&Tensor>,
+        _staged: Option<&[QTensor; 3]>,
     ) -> Result<Tensor> {
         crate::tensor::bail!("CUDA path not compiled in")
     }
@@ -1677,4 +1715,11 @@ mod clamped_swiglu_tests {
         // The expert kernels quantise their activations to 8 bits.
         assert!(worst <= 2e-2 * scale, "max diff {worst} of {scale}");
     }
+}
+
+/// What a batch of tokens keeps live on the card per token while its experts run there: for each
+/// routed expert a row of the hidden width in f32, the activation quantised to 8 bits, and the
+/// gate, the up and the combined outputs in f32; and the hidden rows the layer around them holds.
+pub fn prefill_bytes_per_token(used: usize, hidden: usize, ffn: usize) -> usize {
+    used * (hidden * 4 + hidden + hidden / 8 + ffn * 4 * 3) + hidden * 4 * 3
 }
