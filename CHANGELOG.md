@@ -4,6 +4,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-05
+
 ### Fixed
 
 - Load: an undeclared context window no longer takes the weights' room.
