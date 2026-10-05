@@ -531,23 +531,6 @@ impl Dspark {
             &Device::Cpu,
         )?;
         let main_x = rms_norm(&self.main_proj.apply(&mh)?, &self.main_norm, eps)?; // [1, dim]
-        {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static DUMPED: AtomicBool = AtomicBool::new(false);
-            if !DUMPED.swap(true, Ordering::Relaxed) {
-                let d = "/mnt/data/deepseek-v41-study/wsmeasure";
-                let w = |name: &str, v: &[f32]| {
-                    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                    let _ = std::fs::write(format!("{d}/{name}.bin"), bytes);
-                };
-                w("dbg_main_hidden", main_hidden);
-                w("dbg_main_x", &main_x.flatten_all()?.to_vec1::<f32>()?);
-                w("dbg_token", &[token as f32, start_pos as f32]);
-                tracing::info!(
-                    "DSPARK-DUMP main_hidden+main_x written, token={token} pos={start_pos}"
-                );
-            }
-        }
 
         // Rope tables long enough for the window positions and this block.
         let n = start_pos + 1 + bs;
@@ -578,11 +561,8 @@ impl Dspark {
             })
             .collect();
 
-        let _t_stages = std::time::Instant::now();
-        let mut _t_attn = 0u128;
-        let mut _t_moe = 0u128;
         for (s, stage) in self.stages.iter().enumerate() {
-            let (nx, ta, tm) = self.stage_forward_timed(
+            let (nx, _, _) = self.stage_forward_timed(
                 stage,
                 &x,
                 &mut pre_mix,
@@ -594,20 +574,6 @@ impl Dspark {
                 &sin,
             )?;
             x = nx;
-            _t_attn += ta;
-            _t_moe += tm;
-        }
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed).is_multiple_of(8) {
-                tracing::info!(
-                    "DSPARK-PROF stages={}us attn={}us moe={}us",
-                    _t_stages.elapsed().as_micros(),
-                    _t_attn,
-                    _t_moe
-                );
-            }
         }
 
         // Collapse and read the block's logits, then refine each position with the markov head and
@@ -616,30 +582,6 @@ impl Dspark {
         let h = rms_norm(&h, &self.final_norm, eps)?;
         let logits = head.apply(&h.reshape((bs, dim))?)?; // [bs, vocab]
         let mut logits = logits.to_vec2::<f32>()?;
-        {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static D2: AtomicBool = AtomicBool::new(false);
-            if !D2.swap(true, Ordering::Relaxed) {
-                let d = "/mnt/data/deepseek-v41-study/wsmeasure";
-                let w = |name: String, v: &[f32]| {
-                    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                    let _ = std::fs::write(format!("{d}/{name}.bin"), bytes);
-                };
-                for (s, win) in st.windows.iter().enumerate() {
-                    w(format!("dbg_window{s}"), &win.concat());
-                }
-                w("dbg_rawlogits0".into(), &logits[0]);
-                w("dbg_rawlogits1".into(), &logits[1]);
-                w(
-                    "dbg_argmax".into(),
-                    &logits.iter().map(|l| argmax(l) as f32).collect::<Vec<_>>(),
-                );
-                tracing::info!(
-                    "DSPARK-DUMP2 windows+rawlogits written; block argmax before markov = {:?}",
-                    logits.iter().map(|l| argmax(l)).collect::<Vec<_>>()
-                );
-            }
-        }
         let mut out = Vec::with_capacity(bs);
         let mut prev = token;
         let mut biased = Vec::with_capacity(bs);
