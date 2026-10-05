@@ -333,12 +333,24 @@ impl<'a> TensorSource<'a> {
             // CONVERSION: held at `width`, declared above.
             return Ok(Some(QTensor::quantize_onto(&wide, width, device)?));
         }
-        Ok(Some(info.read_slice_owned(
+        let qt = info.read_slice_owned(
             part.bytes,
             part.content.tensor_data_offset,
             device,
             part.owner.as_ref(),
-        )?))
+        )?;
+        // A projection in a format only the experts' kernels read is requantised, for a card, to
+        // the widest block format the dense kernels read. The experts keep theirs.
+        if device.runs_as_card() && !name.contains("_exps") && codebook_format(qt.dtype()) {
+            // CONVERSION: no dense kernel reads a codebook format on a card: dequantised, then held Q8_0.
+            let values = qt.dequantize(&Device::Cpu)?;
+            return Ok(Some(QTensor::quantize_onto(
+                &values,
+                crate::tensor::quantized::GgmlDType::Q8_0,
+                device,
+            )?));
+        }
+        Ok(Some(qt))
     }
 
     /// `name` on `device`; a name no part carries is an error that says so.
@@ -384,6 +396,13 @@ impl<'a> TensorSource<'a> {
             }
         }
     }
+}
+
+/// Whether `dtype` is one of the formats read from a codebook, which the card reads in the
+/// experts' kernels only.
+fn codebook_format(dtype: crate::tensor::quantized::GgmlDType) -> bool {
+    use crate::tensor::quantized::GgmlDType::*;
+    matches!(dtype, Iq4Nl | Iq4Xs | Iq3Xxs | Iq3S | Iq2S | Q2_0)
 }
 
 /// A quantised weight built on `device` from its block bytes, `rows` x `cols`.
