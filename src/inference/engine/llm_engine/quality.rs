@@ -106,9 +106,11 @@ pub struct Dump {
     pub tokens: Vec<u32>,
     pub ids: Vec<[u32; TOP]>,
     pub lp: Vec<[f32; TOP]>,
+    /// Per position the log-probability of the true next token; NaN at the last position.
+    pub true_lp: Vec<f32>,
 }
 
-const MAGIC: &[u8; 4] = b"LKQ1";
+const MAGIC: &[u8; 4] = b"LKQ2";
 
 impl Dump {
     fn new(tokens: &[u32]) -> Self {
@@ -116,11 +118,12 @@ impl Dump {
             tokens: tokens.to_vec(),
             ids: Vec::new(),
             lp: Vec::new(),
+            true_lp: Vec::new(),
         }
     }
 
-    /// Little-endian: magic, `TOP`, position count, the tokens, then per position `TOP` ids
-    /// and `TOP` f32 log-probabilities.
+    /// Little-endian: magic, `TOP`, position count, the tokens, then per position `TOP` ids,
+    /// `TOP` f32 log-probabilities and the f32 log-probability of the true next token.
     pub fn write(&self, mut out: impl Write) -> std::io::Result<()> {
         out.write_all(MAGIC)?;
         out.write_all(&(TOP as u32).to_le_bytes())?;
@@ -128,13 +131,14 @@ impl Dump {
         for t in &self.tokens {
             out.write_all(&t.to_le_bytes())?;
         }
-        for (ids, lp) in self.ids.iter().zip(&self.lp) {
+        for ((ids, lp), t) in self.ids.iter().zip(&self.lp).zip(&self.true_lp) {
             for i in ids {
                 out.write_all(&i.to_le_bytes())?;
             }
             for l in lp {
                 out.write_all(&l.to_le_bytes())?;
             }
+            out.write_all(&t.to_le_bytes())?;
         }
         Ok(())
     }
@@ -163,14 +167,21 @@ impl Dump {
                 .collect())
         };
         let tokens: Vec<u32> = u32s(n)?.into_iter().map(u32::from_le_bytes).collect();
-        let body = u32s(n * TOP * 2)?;
+        let body = u32s(n * (TOP * 2 + 1))?;
         let mut ids = Vec::with_capacity(n);
         let mut lp = Vec::with_capacity(n);
-        for row in body.chunks_exact(TOP * 2) {
+        let mut true_lp = Vec::with_capacity(n);
+        for row in body.chunks_exact(TOP * 2 + 1) {
             ids.push(std::array::from_fn(|j| u32::from_le_bytes(row[j])));
             lp.push(std::array::from_fn(|j| f32::from_le_bytes(row[TOP + j])));
+            true_lp.push(f32::from_le_bytes(row[TOP * 2]));
         }
-        Ok(Self { tokens, ids, lp })
+        Ok(Self {
+            tokens,
+            ids,
+            lp,
+            true_lp,
+        })
     }
 }
 
@@ -244,6 +255,7 @@ pub fn score_rows(
             acc.top1_hits += (s.ids[0] == rids[0]) as usize;
             acc.kl_sum += kl_over_top(&p_ref, &at);
         }
+        dump.true_lp.push(true_lp.map_or(f32::NAN, |l| l as f32));
         dump.ids.push(s.ids);
         dump.lp.push(std::array::from_fn(|j| s.lp[j] as f32));
     }
@@ -439,6 +451,12 @@ mod tests {
         }
         want /= (n - 1) as f64;
         assert_eq!(acc.predicted, n - 1);
+        let from_dump: f64 = dump.true_lp[..n - 1]
+            .iter()
+            .map(|&x| -(x as f64))
+            .sum::<f64>()
+            / (n - 1) as f64;
+        assert!((from_dump - acc.nll()).abs() < 1e-5);
         assert!(
             (acc.nll() - want).abs() < 1e-12,
             "{} against {want}",
@@ -533,8 +551,15 @@ mod tests {
         );
         let mut bytes = Vec::new();
         dump.write(&mut bytes).unwrap();
-        assert_eq!(bytes.len(), 16 + n * 4 + n * TOP * 8);
-        assert_eq!(Dump::read(&bytes[..]).unwrap(), dump);
+        assert_eq!(bytes.len(), 16 + n * 4 + n * (TOP * 8 + 4));
+        let back = Dump::read(&bytes[..]).unwrap();
+        assert_eq!(
+            (&back.tokens, &back.ids, &back.lp),
+            (&dump.tokens, &dump.ids, &dump.lp)
+        );
+        let bits = |d: &Dump| d.true_lp.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&back), bits(&dump));
+        assert!(dump.true_lp[n - 1].is_nan() && dump.true_lp[..n - 1].iter().all(|x| *x < 0.0));
         assert!(Dump::read(&b"nope"[..]).is_err());
     }
 
@@ -732,7 +757,10 @@ mod tests {
     /// text where each token ends, one per line) into, `LOKEN_QUALITY_REFERENCE` a
     /// directory of such dumps to score against, `LOKEN_QUALITY_HOST` set to place nothing on
     /// a card, `LOKEN_QUALITY_CHUNK` a chunk length instead of the one a prefill would take,
-    /// `LOKEN_QUALITY_CTX` the window to load with (default: the longest text).
+    /// `LOKEN_QUALITY_CTX` the window to load with (default: the longest text),
+    /// `LOKEN_QUALITY_PREPEND` a token id placed before the text's tokens.
+    /// Beside each dump `<name>.cutbad` lists the token positions whose text prefix tokenises
+    /// differently from the prefix of the tokens.
     /// `CUDA_VISIBLE_DEVICES` picks the cards, as for the server. One line per text on stderr.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs a real model, its texts and an idle machine"]
@@ -774,6 +802,22 @@ mod tests {
                 .take(tokens.len())
                 .map(|o| o.1)
                 .collect();
+            // Positions whose text prefix does not tokenise to the prefix of the tokens: a
+            // BPE merge across the cut, which an engine fed text prefixes would see.
+            let cut_bad: Vec<usize> = (0..tokens.len())
+                .filter(|&k| {
+                    let prefix = &text.as_bytes()[..ends[k]];
+                    let prefix = String::from_utf8_lossy(prefix);
+                    state
+                        .tokenizer
+                        .encode(prefix.as_ref(), true)
+                        .map_or(true, |e| e.get_ids() != &tokens[..=k])
+                })
+                .collect();
+            // A token prepended to the sequence, to test begin-of-text handling.
+            if let Some(b) = env("LOKEN_QUALITY_PREPEND").and_then(|v| v.parse::<u32>().ok()) {
+                tokens.insert(0, b);
+            }
             let reference = ref_dir.as_ref().map(|d| {
                 Dump::read(
                     std::fs::File::open(d.join(format!("{name}.lkq"))).expect("a dump per text"),
@@ -809,6 +853,8 @@ mod tests {
             if let Some(dir) = &out_dir {
                 let lines: Vec<String> = ends.iter().map(|e| e.to_string()).collect();
                 std::fs::write(dir.join(format!("{name}.ends")), lines.join("\n")).unwrap();
+                let bad: Vec<String> = cut_bad.iter().map(|k| k.to_string()).collect();
+                std::fs::write(dir.join(format!("{name}.cutbad")), bad.join("\n")).unwrap();
                 dump.write(std::io::BufWriter::new(
                     std::fs::File::create(dir.join(format!("{name}.lkq"))).unwrap(),
                 ))
