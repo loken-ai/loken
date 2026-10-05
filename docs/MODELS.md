@@ -24,12 +24,22 @@ their own kernels; on the host they need AVX2 (see [`BUILDING.md`](BUILDING.md))
 | Float | `F32`, `F16`, `BF16` |
 | Legacy blocks | `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1` |
 | K-quants | `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K` |
-| Others | `IQ2_XXS`, `MXFP4` |
+| Codebook | `IQ2_XXS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `Q2_0` |
+| Others | `MXFP4` |
+
+The codebook formats run on a card for the experts, in decode and prefill, and on the host
+through integer dot products that need AVX2. A dense projection stored in a codebook format is
+requantised once at load to Q8_0 for a card; the experts keep their format.
 
 A file that stores a tensor in another format is refused with the format's id. Token and
 per-layer embedding tables stay as stored and a lookup decodes the rows it needs. A load that
 rebuilds a weight in another representation logs one ledger line with the bytes before and
 after.
+
+`loken pull owner/repo:SELECTOR` keeps the GGUF files of a repository whose directory, or
+dash-delimited file-name token, equals SELECTOR (case-insensitive), with the repository's
+configuration files; without a selector every file is pulled. Each file is checked against its
+listed size and its sha256.
 
 A pull follows the daemon's streamed progress and stops when no frame arrives for a multiple of
 the longest gap seen, `--stall-factor` (see [`CONFIGURATION.md`](CONFIGURATION.md)). A repository
@@ -50,7 +60,7 @@ rather than a port. The architectures that table names:
 | Line | Architectures as the GGUF header declares them |
 |---|---|
 | Llama and its distils | `llama`, `mistral`, `mistral3`, `yi`, `falcon`, `falcon3`, `internlm2`, `neox`, `stablelm` |
-| Qwen | `qwen2`, `qwen3`, `qwen3moe`, `qwen35`, `qwen35moe`, `qwen3next` |
+| Qwen | `qwen2`, `qwen3`, `qwen3moe`, `qwen35`, `qwen35moe`, `qwen3next`, `qwen4exp` |
 | Gemma | `gemma`, `gemma2`, `gemma3`, `gemma4` |
 | Phi | `phi`, `phi2`, `phi3`, `phi4` |
 | Granite | `granite`, `granite3`, `granitemoe` |
@@ -92,6 +102,33 @@ long-context rope declared there is turned into the frequency table a GGUF file 
 
 Embeddings and reranking: BERT-shaped encoders (`nomic`, `bge` and the like) answer
 `/v1/embeddings` and `/api/embed`; a Qwen3-Reranker checkpoint answers `/v1/rerank`.
+
+### The qwen4exp family
+
+One generic transformer reads the architecture from the file: a model of this family is not a
+loader of its own. What the file declares and the loader reads:
+
+| Element | Read from the file |
+|---|---|
+| Wide residual (hyper-connections) | The stream count and the low-rank width, with the mixers that replace the layer norms and the output mixer. Mixers and tables stored in BF16 or a block format are read as stored |
+| Layer pattern | One indexed-attention layer after every `full_attention_interval` layers, the others delta-rule (three delta-rule layers, then one attention layer, in the files measured) |
+| Indexed attention | The indexer's head count, key length and top-k, and the per-layer compress ratio |
+| Experts | Routed and used counts, expert width, a shared expert with a scalar gate. 160, 256 and 512 routed experts have been loaded |
+| N-gram table | One table at the layer `ple.layers` names, 16 heads over bigrams and trigrams. It is read by row from the mapping and never staged on a card |
+
+The files measured, all loading through the generic route:
+
+| File | Experts | Parts | Size |
+|---|---|---|---|
+| Q4_K_M | 160 | 1 | 28.4 GB |
+| IQ1_M | 256 | 2 | 58.4 GB, 28.8 GB of it the n-gram table |
+| UD-Q4_K_XL | 512 | 4 | 111 GB |
+
+The experts stay in the file's mapping. A card holds a cache of the hot ones per layer and the
+rest run on the host beside it; a wide prompt batch streams the layer's experts to the card
+through two buffers when that costs less than running its rows one by one. Host memory is
+admitted against the bytes the process owns. Limits and measurements are in
+[`STATUS.md`](STATUS.md#the-qwen4exp-family).
 
 ## Image
 
