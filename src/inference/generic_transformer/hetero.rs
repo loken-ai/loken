@@ -503,6 +503,11 @@ impl GenericHeteroTransformer {
         self.output_hyper.is_some()
     }
 
+    /// Width of the residual a layer reads: the model width, times the streams of a wide one.
+    pub fn stream_width(&self) -> usize {
+        self.config.embedding_length * self.config.hyper.map_or(1, |h| h.streams)
+    }
+
     /// The model width: the residual stream and the embedding.
     pub fn hidden_size(&self) -> usize {
         self.config.embedding_length

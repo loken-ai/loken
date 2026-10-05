@@ -428,9 +428,19 @@ impl GenericHeteroTransformer {
                     crate::tensor::DeviceLocation::Cuda { gpu_id } => Some(gpu_id),
                     _ => None,
                 });
-            if head_card != Some(*last) || self.output_norm_cuda_weight.is_none() {
+            // A wide residual's final mixer stands for the output norm.
+            if head_card != Some(*last)
+                || (self.output_norm_cuda_weight.is_none() && self.output_hyper.is_none())
+            {
                 return Err("the output projection is not on the card of the last layer");
             }
+        }
+        // The n-gram features and the indexer's selection read the host between tokens.
+        if self.ngram.is_some() {
+            return Err("n-gram features are not captured");
+        }
+        if self.layers.iter().any(|l| l.sparse.is_some()) {
+            return Err("indexed attention is not captured");
         }
         // phi2 (moondream): option-E split path (commits 3c78c9a +
         // 787986a + the engine wiring) moves scatter_set OUTSIDE the
@@ -709,7 +719,7 @@ impl GenericHeteroTransformer {
                         .map(|l| l.flags.intermediate_size)
                         .max()
                         .unwrap_or(self.config.embedding_length);
-                    let max_k = std::cmp::max(self.config.embedding_length, max_intermediate);
+                    let max_k = std::cmp::max(self.stream_width(), max_intermediate);
                     let max_scratch =
                         crate::tensor::quantized::fast_mmvq::max_scratch_bytes_for_k(max_k);
                     if let Err(e) = crate::tensor::quantized::fast_mmvq::ensure_workspace_capacity(
@@ -1182,6 +1192,9 @@ impl GenericHeteroTransformer {
         if let Some(scale) = self.config.embed_scale {
             hidden = (hidden * scale)?;
         }
+        if let Some(h) = self.config.hyper {
+            hidden = super::wide::widen_embedding(&hidden, h.streams)?;
+        }
         // Land hidden on the device that owns layer 0 - that's where
         // forward_from_hidden starts iterating and any earlier device
         // (e.g. `cuda_devices.values().next()` returning a non-first
@@ -1425,7 +1438,7 @@ impl GenericHeteroTransformer {
         if self.graph_hops.len() == boundaries {
             return Ok(());
         }
-        let width = self.config.embedding_length;
+        let width = self.stream_width();
         self.graph_hops = segs
             .iter()
             .skip(1)
@@ -1437,9 +1450,24 @@ impl GenericHeteroTransformer {
     /// Final norm, output projection and logit transforms of the graph's step, copied into
     /// the stable logits buffer.
     fn graph_head(&mut self, hidden: Tensor) -> Result<Tensor> {
-        let norm_w = self.output_norm_cuda_weight.as_ref().ok_or_else(|| {
-            crate::tensor::Error::msg("forward_from_hidden needs output_norm_cuda_weight")
-        })?;
+        let wide_normed: Option<Tensor> = match self.output_hyper.as_ref() {
+            #[cfg(feature = "cuda")]
+            Some(oh) => {
+                let xn = oh.normed_on_card(&hidden)?;
+                let (mixed, _) = oh.mix_on_card(&xn, false)?;
+                Some(mixed.reshape((1, self.config.embedding_length))?)
+            }
+            #[cfg(not(feature = "cuda"))]
+            Some(_) => crate::tensor::bail!("a wide residual's head runs on a card"),
+            None => None,
+        };
+        let norm_w = match (&wide_normed, self.output_norm_cuda_weight.as_ref()) {
+            (_, Some(w)) => Some(w),
+            (Some(_), None) => None,
+            (None, None) => {
+                crate::tensor::bail!("forward_from_hidden needs output_norm_cuda_weight")
+            }
+        };
         let last = hidden.i((.., 0, ..))?;
         let last_f32 = last.to_dtype(crate::tensor::DType::F32)?;
         // Prefer the quantized output proj (Q6_K mvq, F32-out, no F16
@@ -1450,8 +1478,13 @@ impl GenericHeteroTransformer {
         let mut logits = if self.output_proj_cuda_qmm.is_some() {
             let qmm = self.output_proj_cuda_qmm.as_ref().unwrap();
             // The norm and the head apart, as the eager decode and the verify rows run them.
-            let normed =
-                crate::tensor::ops::rms_norm(&last_f32, norm_w, self.config.rms_norm_eps as f32)?;
+            let normed = match (&wide_normed, norm_w) {
+                (Some(n), _) => n.clone(),
+                (None, Some(w)) => {
+                    crate::tensor::ops::rms_norm(&last_f32, w, self.config.rms_norm_eps as f32)?
+                }
+                (None, None) => unreachable!("a norm was found above"),
+            };
             qmm.forward(&normed)?
         } else {
             let proj = self.output_proj_cuda.as_ref().ok_or_else(|| {
@@ -1459,8 +1492,13 @@ impl GenericHeteroTransformer {
                     "forward_from_hidden needs output_proj_cuda or output_proj_cuda_qmm",
                 )
             })?;
-            let normed =
-                crate::tensor::ops::rms_norm(&last_f32, norm_w, self.config.rms_norm_eps as f32)?;
+            let normed = match (&wide_normed, norm_w) {
+                (Some(n), _) => n.clone(),
+                (None, Some(w)) => {
+                    crate::tensor::ops::rms_norm(&last_f32, w, self.config.rms_norm_eps as f32)?
+                }
+                (None, None) => unreachable!("a norm was found above"),
+            };
             let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
             normed_f16.matmul_t(proj)?
         };

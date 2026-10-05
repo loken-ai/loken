@@ -123,6 +123,62 @@ impl GenericTransformerLayer {
         })
     }
 
+    /// One layer of the captured decode step: the same stages with the recurrent mixer
+    /// advancing its state where it lies and attention reading the graph's position buffers.
+    /// The residual is the F32 `[1, 1, streams * dim]` the graph's hidden buffer holds.
+    #[cfg(feature = "cuda")]
+    pub(super) fn forward_wide_graph(&mut self, x: &Tensor) -> Result<Tensor> {
+        let dev = x.device();
+        let (s, d) = {
+            let h = self.hyper.as_ref().expect("a wide layer has its mixers");
+            (h.attn.streams(), h.attn.dim())
+        };
+        let (mixed, inj) = {
+            let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
+            let xn = hc.attn.normed_on_card(x)?;
+            hc.attn.mix_on_card(&xn, true)?
+        };
+        let out = match self.mixer {
+            mixer::Mixer::Attention => {
+                let mut o = self.forward_attn_graph(&mixed)?;
+                if let Some(b) = &self.attn_output_bias {
+                    o = o.broadcast_add(b)?;
+                }
+                o
+            }
+            _ => {
+                let m = self.mixer.step_in_place(&mixed)?;
+                self.attn_output.forward(&m)?
+            }
+        };
+        let (r, xn) = {
+            let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
+            combine_on_card(
+                x,
+                &out,
+                &inj.expect("the token mixer's mixer writes back"),
+                Some(&hc.ffn),
+                s,
+                d,
+            )?
+        };
+        let (mixed, inj) = {
+            let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
+            hc.ffn
+                .mix_on_card(&xn.expect("the norm was asked for"), true)?
+        };
+        let out = self.feed_forward(&mixed, &dev)?;
+        let (r, _) = combine_on_card(
+            &r,
+            &out,
+            &inj.expect("the feed-forward's mixer writes back"),
+            None,
+            s,
+            d,
+        )?;
+        Ok(r)
+    }
+
     /// The token mixer behind its mixer's output: the delta rule through its output
     /// projection, or attention.
     fn token_mixer(

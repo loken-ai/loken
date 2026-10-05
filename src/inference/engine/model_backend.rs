@@ -1459,8 +1459,7 @@ impl ModelBackend for GenericBackend {
         // it in place.
         if self.0.is_recurrent() {
             return Capabilities {
-                // A wide residual is not captured yet: its step runs eagerly.
-                graph_mode: !self.0.is_wide(),
+                graph_mode: true,
                 ..Capabilities::default()
             };
         }

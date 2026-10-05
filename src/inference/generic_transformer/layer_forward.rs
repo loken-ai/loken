@@ -574,6 +574,10 @@ impl GenericTransformerLayer {
     /// and extended `padded_mask` before calling this.
     pub fn forward_graph(&mut self, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
+        if self.is_wide() {
+            return self.forward_wide_graph(x);
+        }
+        #[cfg(feature = "cuda")]
         if self.is_hybrid() {
             return self.forward_hybrid_graph(x);
         }
