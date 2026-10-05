@@ -467,6 +467,7 @@ impl LlmEngine {
             let context_length = get_gguf_u32(&content, &format!("{arch}.context_length"))
                 .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| c as usize);
             // No window asked for: the model's own.
+            let window_asked = user_context_length != 0;
             let user_context_length = if user_context_length == 0 {
                 context_length
             } else {
@@ -935,11 +936,14 @@ impl LlmEngine {
                     // context window nobody asked for. So the placement takes the largest
                     // context whose plan keeps every layer on the cards, halving down to the
                     // working window.
-                    let ctx_for_planning: u64 = if matches!(kv_quant, KvQuant::Q4 | KvQuant::Q8) {
+                    let ctx_for_planning: u64 = if window_asked
+                        && matches!(kv_quant, KvQuant::Q4 | KvQuant::Q8)
+                    {
                         // The cache grows to the declared context while a long prompt prefills
                         // on cards that hold the weights, so the plan keeps that room: a model
                         // that then does not fit takes the ladder's rungs, not a prefill that
-                        // runs out of memory part-way.
+                        // runs out of memory part-way. A window nobody declared takes the
+                        // else branch: it never pushes a layer off the cards.
                         user_context_length.min(context_length) as u64
                     } else {
                         let full = user_context_length as u64;

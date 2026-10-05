@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Load: an undeclared context window no longer takes the weights' room.
 - Bench: the model filter applies to the run, not only to the printed plan.
 
 ## [0.2.0] - 2026-10-05
