@@ -12,8 +12,10 @@
 //! placement or the number of cards; the dump holds the tokens it was made from and a run
 //! against it refuses a different sequence.
 //!
-//! The model run is a driver the caller writes: it loads a model as the server does, reads texts,
-//! and hands both to `score_pass`; no file or model name lives here.
+//! The model run is a driver: it loads a model as the server does, reads texts, and hands both
+//! to `score_pass`; no file or model name lives here. The by-hand driver is the ignored test
+//! `score_the_listed_models_on_held_out_texts`, which takes its models from a list in the user
+//! cache directory.
 //!
 //! Held-out text rule (`select_files`): candidates are the repository's `src/**/*.rs` files for
 //! a code text and `docs/**/*.md` for a documentation text, at least `MIN_FILE_BYTES` long. A
@@ -701,5 +703,169 @@ mod tests {
 
     fn logits_noise(len: usize) -> Vec<f32> {
         logits(1, len, 99).into_iter().map(|x| x * 0.5).collect()
+    }
+}
+
+/// The real-model run, by hand: `cargo test --release --lib -- --ignored --nocapture
+/// score_the_listed_models`. It reads no process environment: the models come from the list in
+/// `models.txt` under `loken/quality/` in the user cache directory (one model file per line),
+/// the texts from the repository this crate was built in, and every result goes beside that
+/// list.
+#[cfg(test)]
+mod real_models {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Token budgets of the two held-out texts.
+    const CODE_TOKENS: usize = 1500;
+    const DOCS_TOKENS: usize = 2200;
+
+    /// Characters read per token wanted, a margin: the text is cut to its token budget after
+    /// tokenising.
+    const CHARS_PER_TOKEN_READ: usize = 6;
+
+    /// The held-out calibration text any calibration of this repository used.
+    const CALIBRATION: &str = include_str!("../../model/deepseek_v41/calibration_text.txt");
+
+    /// `(relative path, content)` of every file under `root/dir` with the extension `ext`.
+    fn read_candidates(root: &Path, dir: &str, ext: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.join(dir)];
+        while let Some(d) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == ext) {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        let rel = path.strip_prefix(root).unwrap_or(&path);
+                        found.push((rel.to_string_lossy().into_owned(), text));
+                    }
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// The two held-out texts under the selection rule of the module comment.
+    fn held_out_texts() -> Vec<(&'static str, usize, String)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        [
+            ("code", "src", "rs", CODE_TOKENS),
+            ("docs", "docs", "md", DOCS_TOKENS),
+        ]
+        .into_iter()
+        .map(|(name, dir, ext, tokens)| {
+            let candidates = read_candidates(root, dir, ext);
+            let chosen = select_files(&candidates, CALIBRATION, tokens * CHARS_PER_TOKEN_READ);
+            let text: String = chosen
+                .iter()
+                .filter_map(|p| candidates.iter().find(|c| &c.0 == p).map(|c| c.1.clone()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let digest: String = Sha256::digest(text.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            eprintln!("TEXT {name} sha256={digest} files={}", chosen.join(","));
+            (name, tokens, text)
+        })
+        .collect()
+    }
+
+    /// One line per model and text on stderr: NLL, perplexity and, against a reference dump
+    /// kept as `<name>.lkq` under `reference/` beside the model's results, top-1 agreement and
+    /// KL. Each run writes its own `<name>.lkq` dump.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs real models listed in the cache directory and an idle machine"]
+    async fn score_the_listed_models_on_held_out_texts() {
+        let Some(root) = dirs::cache_dir().map(|d| d.join("loken").join("quality")) else {
+            eprintln!("QUALITY no user cache directory");
+            return;
+        };
+        let Ok(list) = std::fs::read_to_string(root.join("models.txt")) else {
+            eprintln!(
+                "QUALITY nothing to score: list one model file per line in {}",
+                root.join("models.txt").display()
+            );
+            return;
+        };
+        let texts = held_out_texts();
+        let widest = texts.iter().map(|t| t.1).max().unwrap_or(0);
+        for path in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let stem = Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let out: PathBuf = root.join(&stem);
+            std::fs::create_dir_all(&out).unwrap();
+            let engine = LlmEngine::with_config(InferenceConfig {
+                model_id: "quality".to_string(),
+                models_dir: Some(PathBuf::from(path)),
+                context_length: widest + 64,
+                ..InferenceConfig::default()
+            });
+            engine
+                .load_model()
+                .await
+                .expect("the model loads as the server loads it");
+            let mut guard = engine.model_state.lock().await;
+            let state = guard.as_mut().expect("a loaded model");
+            for (name, budget, text) in &texts {
+                let mut tokens: Vec<u32> = state
+                    .tokenizer
+                    .encode(text.as_str(), true)
+                    .unwrap()
+                    .get_ids()
+                    .to_vec();
+                tokens.truncate(*budget);
+                let reference =
+                    std::fs::File::open(out.join("reference").join(format!("{name}.lkq")))
+                        .ok()
+                        .and_then(|f| Dump::read(f).ok());
+                let first = crate::inference::engine::model_backend::adaptive_prefill_chunk(
+                    state.model.prefill_shape(),
+                );
+                let device = state.device.clone();
+                let cell = std::cell::RefCell::new(&mut state.model);
+                let started = std::time::Instant::now();
+                let ((acc, dump), chunk) = crate::inference::place::recover::shrink_on_oom(
+                    "quality",
+                    first,
+                    |c| (c > 2 * VERIFY_ROWS).then_some(c / 2),
+                    |_| false,
+                    |c| {
+                        score_pass(
+                            &mut |x, p| cell.borrow_mut().forward_all(x, p),
+                            &mut || cell.borrow_mut().reset_kv_from(0),
+                            &device,
+                            &tokens,
+                            c,
+                            reference.as_ref(),
+                        )
+                    },
+                )
+                .expect("a teacher-forced pass");
+                dump.write(std::io::BufWriter::new(
+                    std::fs::File::create(out.join(format!("{name}.lkq"))).unwrap(),
+                ))
+                .unwrap();
+                let opt =
+                    |v: Option<f64>, w: usize| v.map_or("-".to_string(), |x| format!("{x:.w$}"));
+                eprintln!(
+                    "QUALITY model={stem} text={name} tokens={} chunk={chunk} nll={:.4} ppl={:.3} top1={} kl={} secs={:.0}",
+                    tokens.len(),
+                    acc.nll(),
+                    acc.perplexity(),
+                    opt(acc.top1(), 4),
+                    opt(acc.kl(), 5),
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        }
     }
 }
