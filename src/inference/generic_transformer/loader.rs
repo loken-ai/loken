@@ -1841,6 +1841,8 @@ fn build_generic_layer(
     #[cfg(feature = "cuda")]
     if layer.sparse.is_some() {
         layer.quant_kv = None;
+        // Its one cache is unquantised, and on a card that cache holds half-width values.
+        layer.kv_f16 = device.is_cuda();
     }
     Ok(layer)
 }
