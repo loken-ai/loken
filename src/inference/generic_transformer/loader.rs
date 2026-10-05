@@ -3094,6 +3094,8 @@ impl GenericHeteroTransformer {
             kv_snapshot_tick: 0,
             hybrid_cache: None,
             spliced_vision,
+            #[cfg(feature = "audio")]
+            spliced_audio: None,
             host_experts_hot: None,
         };
 
@@ -3429,6 +3431,8 @@ impl GenericHeteroTransformer {
             kv_snapshot_tick: 0,
             hybrid_cache: None,
             spliced_vision: None,
+            #[cfg(feature = "audio")]
+            spliced_audio: None,
             host_experts_hot: None,
         })
     }
@@ -3588,6 +3592,47 @@ mod source_tests {
             .unwrap()
             .to_vec1::<f32>()
             .unwrap()
+    }
+
+    /// Embeddings that are the model's own rows for some tokens, spliced over a placeholder,
+    /// give the logits of those tokens read as text, and the next decode position is the
+    /// length of the sequence they make.
+    #[test]
+    fn spliced_embeddings_stand_for_the_tokens_they_replace() {
+        let dir = std::env::temp_dir().join(format!("loken-splice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.gguf");
+        write_gguf_with_metadata(&path, &metadata(), &entries()).unwrap();
+        let plan = HeteroPlan::calculate_with_kv(LAYERS, 1 << 20, &[], &[], 1.0, 0);
+        let none = HashMap::new();
+        let load = || {
+            let g = crate::tensor::quantized::gguf_file::open_mapped(&path).unwrap();
+            let bytes = g.mmap.clone();
+            GenericHeteroTransformer::from_gguf(g.content, &bytes[..], &none, &plan).unwrap()
+        };
+        let want = logits(load());
+
+        let mut model = load();
+        let rows = model
+            .embeddings
+            .forward(&Tensor::from_vec(vec![4u32, 2], (1usize, 2usize), &Device::Cpu).unwrap())
+            .unwrap();
+        // 1, [placeholder], 9 with the placeholder standing for 4, 2.
+        let prompt = [1u32, 0, 9];
+        let (got, next) = model.forward_spliced_audio(&prompt, 1, &rows).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let got = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(
+            next, 4,
+            "the sequence is the prompt less the placeholder plus the rows"
+        );
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 1e-5, "spliced logits differ by {worst}");
     }
 
     /// A model written as two parts, blocks divided between them, loads to the logits of the

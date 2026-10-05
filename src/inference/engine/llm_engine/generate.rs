@@ -255,12 +255,17 @@ impl LlmEngine {
             let qwen35_sentinel = if state.qwen35_image.is_some() {
                 state.model.qwen35_image_token()
             } else { None };
-            let prompt_tokens: Vec<u32> = match qwen35_sentinel {
-                Some(sent) => clamp_qwen35_prompt_to_window(
+            // A clip's embeddings replace the placeholder inside the prompt; the prompt is
+            // never clamped around them, a prompt that does not fit is refused.
+            let audio_split = audio_split_for(state, prompt.as_str(), &params, kv_window)
+                .map_err(|e| anyhow!(e))?;
+            let prompt_tokens: Vec<u32> = match (&audio_split, qwen35_sentinel) {
+                (Some(a), _) => a.tokens.clone(),
+                (None, Some(sent)) => clamp_qwen35_prompt_to_window(
                     with_prefix_tokens(&params, encoding.get_ids()),
                     kv_window - vision_extra,
                     params.max_tokens.unwrap_or(0), sent),
-                None => clamp_prompt_to_window(
+                (None, None) => clamp_prompt_to_window(
                     with_prefix_tokens(&params, encoding.get_ids()),
                     kv_window - vision_extra,
                     params.max_tokens.unwrap_or(0)),
@@ -286,7 +291,8 @@ impl LlmEngine {
             // requests fall back to a full reset.
             let cache_session_start: usize = {
                 let is_vision_req = (state.model.is_vision_model() && state.image_embeds.is_some())
-                    || state.qwen35_image.is_some();
+                    || state.qwen35_image.is_some()
+                    || audio_split.is_some();
                 let disabled = is_vision_req
                     || false;
                 kv_reuse_start(
@@ -370,7 +376,14 @@ impl LlmEngine {
             // continuing logical mRoPE position. Otherwise the moondream prepend
             // path (or plain text).
             let qwen35_img = state.qwen35_image.take();
-            let (vision_prefix_len, mut logits, qwen35_pos) = if let Some((ref px, (gh, gw))) = qwen35_img {
+            let (vision_prefix_len, mut logits, qwen35_pos) = if let Some(ref a) = audio_split {
+                // The embeddings were encoded for this request; the sequence they make is as
+                // long as the prefill says, which is where decoding continues.
+                let embeds = state.audio.as_ref().map(|c| c.embeds.clone())
+                    .ok_or_else(|| anyhow!("the audio was cleared before the prefill"))?;
+                let (lg, total) = state.model.forward_audio_spliced(&prompt_tokens, a.at, &embeds)?;
+                (None, lg, Some(total))
+            } else if let Some((ref px, (gh, gw))) = qwen35_img {
                 let (lg, next_pos) = state.model.forward_qwen35_image(&prompt_tokens, px, gh, gw, device)?;
                 (None, lg, Some(next_pos))
             } else if let Some(image_embeds) = state
@@ -1725,6 +1738,9 @@ impl LlmEngine {
                 .as_mut()
                 .ok_or_else(|| anyhow!("Model not loaded. Load a model first."))?;
 
+            if state.audio.is_some() {
+                return Err(anyhow!("a request with a grammar cannot carry audio"));
+            }
             let factory = grammar_factory_for(state)?;
             let grammar_str = params.grammar.as_deref().unwrap_or("json_object");
             let top_grammar = parse_grammar_spec(grammar_str)?;
@@ -1904,8 +1920,13 @@ impl LlmEngine {
     ) -> Result<tokio::sync::mpsc::Receiver<Result<String, String>>, Box<dyn std::error::Error>>
     {
         let guard = self.model_state.lock().await;
-        if guard.is_none() {
-            return Err("Model not loaded.".into());
+        match guard.as_ref() {
+            None => return Err("Model not loaded.".into()),
+            // The constrained loop prefills token ids; a clip's embeddings would be dropped.
+            Some(s) if s.audio.is_some() => {
+                return Err("a request with a grammar cannot carry audio".into())
+            }
+            Some(_) => {}
         }
         drop(guard);
 

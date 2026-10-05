@@ -426,6 +426,11 @@ impl GenericHeteroTransformer {
         if self.is_recurrent() {
             return Some("recurrent mixer");
         }
+        // The batched server prefills token ids; a prompt with embeddings spliced in is not.
+        #[cfg(feature = "audio")]
+        if self.spliced_audio.is_some() {
+            return Some("speech tower");
+        }
         if c.embed_scale.is_some() {
             return Some("embed_scale");
         }
@@ -2085,21 +2090,33 @@ impl GenericHeteroTransformer {
                 t.to_device(&emb_device)
             }
         };
-        let prefix_local = to_emb_device(prefix_ids)?;
-        let suffix_local = to_emb_device(suffix_ids)?;
-        let mut prefix_emb = self.embeddings.forward(&prefix_local)?;
-        let mut suffix_emb = self.embeddings.forward(&suffix_local)?;
-        if let Some(scale) = self.config.embed_scale {
-            prefix_emb = (prefix_emb * scale)?;
-            suffix_emb = (suffix_emb * scale)?;
-        }
-        let aud = if embeds.device().same_device(&prefix_emb.device()) {
+        // A segment of no tokens contributes no rows.
+        let embed = |ids: &Tensor| -> Result<Option<Tensor>> {
+            if ids.dim(1)? == 0 {
+                return Ok(None);
+            }
+            let mut e = self.embeddings.forward(&to_emb_device(ids)?)?;
+            if let Some(scale) = self.config.embed_scale {
+                e = (e * scale)?;
+            }
+            Ok(Some(e))
+        };
+        let prefix_emb = embed(prefix_ids)?;
+        let suffix_emb = embed(suffix_ids)?;
+        let like = prefix_emb.as_ref().or(suffix_emb.as_ref()).ok_or_else(|| {
+            crate::tensor::Error::msg(
+                "forward_with_audio_embeds: no text around the embeds".to_string(),
+            )
+        })?;
+        let (like_device, like_dtype) = (like.device(), like.dtype());
+        let aud = if embeds.device().same_device(&like_device) {
             embeds.clone()
         } else {
-            embeds.to_device(&prefix_emb.device())?
+            embeds.to_device(&like_device)?
         };
-        let aud = if aud.dtype() != prefix_emb.dtype() {
-            aud.to_dtype(prefix_emb.dtype())?
+        let aud = if aud.dtype() != like_dtype {
+            // CONVERSION: the embeddings join the text rows in the embedding table's dtype.
+            aud.to_dtype(like_dtype)?
         } else {
             aud
         };
@@ -2110,7 +2127,12 @@ impl GenericHeteroTransformer {
                 aud_d, self.config.embedding_length,
             )));
         }
-        let hidden = Tensor::cat(&[&prefix_emb, &aud, &suffix_emb], 1)?;
+        let parts: Vec<&Tensor> = prefix_emb
+            .iter()
+            .chain(std::iter::once(&aud))
+            .chain(suffix_emb.iter())
+            .collect();
+        let hidden = Tensor::cat(&parts, 1)?;
         self.forward_spliced_prefill_chunked(hidden)
     }
 

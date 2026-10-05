@@ -652,6 +652,38 @@ pub(crate) trait ModelBackend: Send {
         ))
     }
 
+    // --- Audio ---------------------------------------------------------
+
+    /// What a request needs to hand this model audio, `None` when it carries no speech tower.
+    fn audio_input(&self) -> Option<AudioInput> {
+        None
+    }
+
+    /// Mono PCM at the tower's rate to embeddings `[1, n, width]`.
+    fn encode_audio(&self, _pcm: &[f32]) -> crate::tensor::Result<Tensor> {
+        Err(crate::tensor::Error::msg(
+            "this model carries no speech tower".to_string(),
+        ))
+    }
+
+    /// Embeddings a clip of `samples` yields, known before the tower runs.
+    fn audio_embeds_for(&self, _samples: usize) -> usize {
+        0
+    }
+
+    /// Prefill `prompt` with the token at `at` replaced by the audio `embeds`. Returns the
+    /// last logits and the sequence length, which is the next decode position.
+    fn forward_audio_spliced(
+        &mut self,
+        _prompt: &[u32],
+        _at: usize,
+        _embeds: &Tensor,
+    ) -> crate::tensor::Result<(Tensor, usize)> {
+        Err(crate::tensor::Error::msg(
+            "this model carries no speech tower".to_string(),
+        ))
+    }
+
     /// Vision-aware prefill: forward with image embeddings (Moondream only).
     /// bos_token: BOS token tensor (1, 1)
     /// text_input: text token tensor (1, seq_len)
@@ -806,6 +838,17 @@ macro_rules! take_generic_passthrough {
 // ------------------------------------------------------------
 // Backend wrapper structs (one per former ModelVariant arm)
 // ------------------------------------------------------------
+
+/// How a model takes audio: the rate of the clip, the prompt text the embeddings replace
+/// and the width they come in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioInput {
+    pub sample_rate: usize,
+    /// Written where the audio goes, after `begin`; the prompt is split around it.
+    pub placeholder: String,
+    /// Written before the placeholder, empty for none.
+    pub begin: String,
+}
 
 /// Moondream legacy path (original PyTorch state-dict naming GGUF).
 pub(crate) struct MoondreamBackend(pub moondream::Model);
@@ -1172,6 +1215,41 @@ impl ModelBackend for MoondreamBackend {
 }
 
 impl ModelBackend for GenericBackend {
+    #[cfg(feature = "audio")]
+    fn audio_input(&self) -> Option<AudioInput> {
+        let tower = self.0.audio_tower()?;
+        Some(AudioInput {
+            sample_rate: tower.sample_rate(),
+            placeholder: tower.facts().placeholder.to_string(),
+            begin: tower.facts().begin.to_string(),
+        })
+    }
+
+    #[cfg(feature = "audio")]
+    fn encode_audio(&self, pcm: &[f32]) -> crate::tensor::Result<Tensor> {
+        self.0
+            .audio_tower()
+            .ok_or_else(|| {
+                crate::tensor::Error::msg("this model carries no speech tower".to_string())
+            })?
+            .embed(pcm)
+    }
+
+    #[cfg(feature = "audio")]
+    fn audio_embeds_for(&self, samples: usize) -> usize {
+        self.0.audio_tower().map_or(0, |t| t.embeds_for(samples))
+    }
+
+    #[cfg(feature = "audio")]
+    fn forward_audio_spliced(
+        &mut self,
+        prompt: &[u32],
+        at: usize,
+        embeds: &Tensor,
+    ) -> crate::tensor::Result<(Tensor, usize)> {
+        self.0.forward_spliced_audio(prompt, at, embeds)
+    }
+
     fn kv_capacity(&self) -> Option<usize> {
         Some(self.0.kv_capacity())
     }

@@ -411,3 +411,71 @@ pub enum VisionTower {
     Clip(crate::inference::model::moondream::vision::MoondreamVisionEncoder),
     Pixtral(crate::inference::model::pixtral::PixtralVision),
 }
+
+/// A prompt whose audio placeholder is one stand-in token: where it is, and the tokens.
+pub(super) struct AudioPrompt {
+    pub tokens: Vec<u32>,
+    pub at: usize,
+}
+
+/// The prompt as tokens with its audio placeholder replaced by the single token `stand_in`
+/// (its embedding is never read: the clip's embeddings take its place at prefill).
+///
+/// The text is split around the placeholder and each side tokenized alone, the leading side
+/// with the model's special tokens: the placeholder need not be a vocabulary entry. Refused
+/// when the prompt and the embeddings do not fit the KV window.
+pub(super) fn tokenize_around_audio(
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    placeholder: &str,
+    stand_in: u32,
+    params: &GenerationParams,
+    embeds: usize,
+    kv_window: usize,
+) -> Result<AudioPrompt, String> {
+    let (before, after) = prompt
+        .split_once(placeholder)
+        .ok_or_else(|| format!("the prompt holds no audio placeholder {placeholder:?}"))?;
+    let head = tokenizer
+        .encode(before, true)
+        .map_err(|e| format!("Tokenization error: {e}"))?;
+    let tail = tokenizer
+        .encode(after, false)
+        .map_err(|e| format!("Tokenization error: {e}"))?;
+    let mut tokens = with_prefix_tokens(params, head.get_ids());
+    let at = tokens.len();
+    tokens.push(stand_in);
+    tokens.extend_from_slice(tail.get_ids());
+    let positions = tokens.len() - 1 + embeds;
+    if positions >= kv_window {
+        return Err(format!(
+            "the prompt and the audio occupy {positions} KV positions but the context window is \
+             only {kv_window}; increase context_length / num_ctx or send a shorter clip"
+        ));
+    }
+    Ok(AudioPrompt { tokens, at })
+}
+
+/// The split of `prompt` around the audio the loaded model holds for this request, `None`
+/// when there is none.
+pub(super) fn audio_split_for(
+    state: &LoadedModelState,
+    prompt: &str,
+    params: &GenerationParams,
+    kv_window: usize,
+) -> Result<Option<AudioPrompt>, String> {
+    let (Some(clip), Some(input)) = (state.audio.as_ref(), state.model.audio_input()) else {
+        return Ok(None);
+    };
+    let embeds = clip.embeds.dim(1).map_err(|e| e.to_string())?;
+    tokenize_around_audio(
+        &state.tokenizer,
+        prompt,
+        &input.placeholder,
+        state.eos_token_id,
+        params,
+        embeds,
+        kv_window,
+    )
+    .map(Some)
+}

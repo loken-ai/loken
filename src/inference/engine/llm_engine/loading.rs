@@ -1170,6 +1170,7 @@ impl LlmEngine {
                 tokenizer: std::sync::Arc::new(tokenizer),
                 device,
                 image_embeds: None,
+                audio: None,
                 qwen35_image: None,
                 image_embed_cache: None,
                 grammar_factory: std::sync::OnceLock::new(),

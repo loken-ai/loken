@@ -409,6 +409,7 @@ pub(super) fn load_deepseek_v41_checkpoint(
         tokenizer: std::sync::Arc::new(tokenizer),
         device: Device::Cpu,
         image_embeds: None,
+        audio: None,
         qwen35_image: None,
         image_embed_cache: None,
         grammar_factory: std::sync::OnceLock::new(),
@@ -485,6 +486,10 @@ pub(super) fn try_wrap_with_vision(
     // and leaves the model text-only when they differ). Any other type, or a
     // projector without the key, leaves the model text-only.
     let projector_type = sniff_projector_type(blob).unwrap_or_default();
+    #[cfg(feature = "audio")]
+    if crate::inference::model_facts::audio_facts(&projector_type).is_some() {
+        return Ok(attach_audio_tower(text, blob, keep));
+    }
     if !matches!(projector_type.as_str(), "pixtral" | "mlp") {
         info!(
             "📷 projector {} has type {:?}, which no tower here loads; text only",
@@ -557,6 +562,59 @@ pub(super) fn try_wrap_with_vision(
             Ok(Box::new(GenericBackend(text)))
         }
     }
+}
+
+/// The speech tower of an `mmproj` GGUF, loaded beside the text model it feeds. The tower
+/// runs once per clip, so it is offered the cards the text model holds no layer on first,
+/// then the text model's cards with `keep` left free. A tower that does not load leaves the
+/// model text only.
+#[cfg(feature = "audio")]
+fn attach_audio_tower(
+    mut text: GenericHeteroTransformer,
+    blob: &std::path::Path,
+    keep: u64,
+) -> BoxedModelBackend {
+    use crate::inference::model::audio_in::{resident_bytes, AudioTower};
+    let bytes = resident_bytes(blob);
+    let need = bytes.saturating_add(crate::inference::place::runtime_demand::load_runtime_floor(
+        bytes,
+    ));
+    let hot: Vec<usize> = text.layer_cuda_ordinals().into_iter().collect();
+    let cards = crate::inference::place::ladder::aside(
+        &crate::inference::place::ladder::cards(0),
+        &hot,
+        keep,
+    );
+    let t0 = std::time::Instant::now();
+    let placed = crate::inference::place::ladder::load_whole_on(
+        "audio tower",
+        need,
+        need,
+        &cards,
+        None,
+        |on| {
+            let device = match on.location() {
+                crate::tensor::DeviceLocation::Cuda { gpu_id } => {
+                    crate::tensor::Device::new_cuda(gpu_id)?
+                }
+                _ => crate::tensor::Device::Cpu,
+            };
+            info!(
+                "Loading the audio tower from {} onto {:?}",
+                blob.display(),
+                device.location()
+            );
+            AudioTower::from_mmproj(blob, &device).map_err(|e| anyhow!("{e}"))
+        },
+    );
+    match placed
+        .map(|(tower, _)| tower)
+        .and_then(|tower| text.set_audio_tower(tower).map_err(|e| anyhow!("{e}")))
+    {
+        Ok(()) => info!("Audio tower loaded in {} ms", t0.elapsed().as_millis()),
+        Err(e) => warn!("audio tower not loaded ({e}); model will work for text only"),
+    }
+    Box::new(GenericBackend(text))
 }
 
 /// Read `clip.projector_type` from an mmproj GGUF (cheap: metadata only).
@@ -756,6 +814,8 @@ pub(crate) struct LoadedModelState {
     pub(super) device: Device,
     /// Pre-encoded image embeddings for the current request (vision models only)
     pub(super) image_embeds: Option<Tensor>,
+    /// The clip of the current request, encoded (speech models only).
+    pub(super) audio: Option<AudioClip>,
     /// qwen35moe (Qwen3-VL) raw preprocessed image for the current request:
     /// `(pixel_values [n_patches,1536], patch grid (gh,gw))`. Unlike moondream
     /// (pre-encoded + prepended), qwen35 keeps the raw patches and runs the ViT
@@ -774,6 +834,13 @@ pub(crate) struct LoadedModelState {
     pub(super) grammar_factory: std::sync::OnceLock<std::sync::Arc<llguidance::ParserFactory>>,
     /// The sampling the model recommends, applied to every knob a request leaves unset.
     pub(super) generation_defaults: super::generation_defaults::GenerationDefaults,
+}
+
+/// A request's clip as the model reads it: the embeddings that replace the prompt's
+/// placeholder, and a hash of the clip that keeps the prompt cache from matching across clips.
+pub(super) struct AudioClip {
+    pub embeds: Tensor,
+    pub hash: u64,
 }
 
 /// Snapshot of one session's cached conversation state. The KV cache itself

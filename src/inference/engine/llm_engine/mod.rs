@@ -842,13 +842,62 @@ impl LlmEngine {
             .map(|e| e.get_ids().len())
     }
 
-    /// Clear any stored image embeddings, and the Qwen3-VL patches awaiting prefill.
+    /// Clear any stored image embeddings, the Qwen3-VL patches awaiting prefill and the
+    /// clip of the last audio request.
     pub async fn clear_images(&self) {
         let mut guard = self.model_state.lock().await;
         if let Some(state) = guard.as_mut() {
             state.image_embeds = None;
             state.qwen35_image = None;
+            state.audio = None;
         }
+    }
+
+    /// How the loaded model takes audio, `None` when it carries no speech tower or no model
+    /// is loaded.
+    pub async fn audio_input(&self) -> Option<crate::inference::engine::model_backend::AudioInput> {
+        let guard = self.model_state.lock().await;
+        guard.as_ref()?.model.audio_input()
+    }
+
+    /// Embeddings a clip of `samples` yields, `0` when the model takes no audio.
+    pub async fn audio_embeds_for(&self, samples: usize) -> usize {
+        let guard = self.model_state.lock().await;
+        guard
+            .as_ref()
+            .map_or(0, |s| s.model.audio_embeds_for(samples))
+    }
+
+    /// Encode a clip, mono PCM at the rate [`Self::audio_input`] names, and hold its
+    /// embeddings for the next generation call.
+    pub async fn set_audio(&self, pcm: Vec<f32>) -> Result<(), Box<dyn std::error::Error>> {
+        let model_state = self.model_state.clone();
+        let result = tokio::task::spawn_blocking(move || -> AnyResult<()> {
+            use std::hash::{Hash, Hasher};
+            let mut guard = model_state.blocking_lock();
+            let state = guard.as_mut().ok_or_else(|| anyhow!("Model not loaded"))?;
+            if state.model.audio_input().is_none() {
+                return Err(anyhow!("Model does not take audio"));
+            }
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            pcm.len().hash(&mut hasher);
+            for s in &pcm {
+                s.to_bits().hash(&mut hasher);
+            }
+            let embeds = state.model.encode_audio(&pcm)?;
+            debug!(
+                "Audio: {} samples -> embeddings {:?}",
+                pcm.len(),
+                embeds.shape()
+            );
+            state.audio = Some(load::AudioClip {
+                embeds,
+                hash: hasher.finish(),
+            });
+            Ok(())
+        })
+        .await?;
+        result.map_err(std::convert::Into::into)
     }
 }
 mod gguf;

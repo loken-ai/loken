@@ -457,6 +457,9 @@ pub struct GenericHeteroTransformer {
     hybrid_cache: Option<state_cache::HybridStateCache>,
     /// A vision tower whose embeddings are spliced over a placeholder run.
     spliced_vision: Option<splice::SplicedVision>,
+    /// A speech tower whose embeddings are spliced over the placeholder of a prompt.
+    #[cfg(feature = "audio")]
+    spliced_audio: Option<splice::SplicedAudio>,
     /// Held while some layer keeps its routed experts in host memory: the decode pool's
     /// workers then spin through the card work between host layers instead of parking.
     host_experts_hot: Option<crate::tensor::quant_cpu::gemv_pool::HotGuard>,

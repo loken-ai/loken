@@ -363,14 +363,31 @@ impl LlmEngine {
                 } else {
                     None
                 };
-                let prompt_tokens: Vec<u32> = match qwen35_sentinel {
-                    Some(sent) => clamp_qwen35_prompt_to_window(
+                // A clip's embeddings replace the placeholder inside the prompt; the prompt
+                // is never clamped around them, a prompt that does not fit is refused.
+                let audio_split = match audio_split_for(state, prompt.as_str(), &params, kv_window)
+                {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        return;
+                    }
+                };
+                let audio_extra = state
+                    .audio
+                    .as_ref()
+                    .filter(|_| audio_split.is_some())
+                    .and_then(|c| c.embeds.dim(1).ok())
+                    .map_or(0, |n| n.saturating_sub(1));
+                let prompt_tokens: Vec<u32> = match (&audio_split, qwen35_sentinel) {
+                    (Some(a), _) => a.tokens.clone(),
+                    (None, Some(sent)) => clamp_qwen35_prompt_to_window(
                         with_prefix_tokens(&params, encoding.get_ids()),
                         kv_window - vision_extra,
                         params.max_tokens.unwrap_or(0),
                         sent,
                     ),
-                    None => clamp_prompt_to_window(
+                    (None, None) => clamp_prompt_to_window(
                         with_prefix_tokens(&params, encoding.get_ids()),
                         kv_window - vision_extra,
                         params.max_tokens.unwrap_or(0),
@@ -392,7 +409,7 @@ impl LlmEngine {
                     &params,
                     &state.generation_defaults,
                     effective_context,
-                    prompt_tokens.len() + vision_extra,
+                    prompt_tokens.len() + vision_extra + audio_extra,
                 );
                 let default_stops = state.generation_defaults.stop.clone();
                 let device = state.device.clone();
@@ -437,10 +454,9 @@ impl LlmEngine {
                 // model means we can only match against ONE other session's
                 // tokens (whichever the engine currently holds), but the
                 // sessions table tells us which.
-                let session_start: usize = if is_vision
-                    && session_id.is_some()
-                    && cur_image_hash.is_some()
-                {
+                let session_start: usize = if audio_split.is_some() {
+                    0 // the rows of a clip are in no token stream a prefix could match
+                } else if is_vision && session_id.is_some() && cur_image_hash.is_some() {
                     // Vision prefix-KV reuse: match by image_hash + common text.
                     let sess_guard = sessions.blocking_lock();
                     let mut best: Option<(&str, usize, usize)> = None;
@@ -689,7 +705,34 @@ impl LlmEngine {
                     session_start
                 );
                 let mut qwen35_next_pos: Option<usize> = None;
-                let mut logits = if let Some((px, (gh, gw))) = state.qwen35_image.take() {
+                let mut logits = if let Some(a) = audio_split.as_ref() {
+                    // The embeddings were encoded for this request; the sequence they make is
+                    // as long as the prefill says, which is where decoding continues.
+                    let embeds = match state.audio.as_ref().map(|c| c.embeds.clone()) {
+                        Some(e) => e,
+                        None => {
+                            let _ = tx.blocking_send(Err(
+                                "STREAMING PREFILL (audio): the clip was cleared".to_string(),
+                            ));
+                            return;
+                        }
+                    };
+                    match state
+                        .model
+                        .forward_audio_spliced(&prompt_tokens, a.at, &embeds)
+                    {
+                        Ok((l, total)) => {
+                            qwen35_next_pos = Some(total);
+                            l
+                        }
+                        Err(e) => {
+                            let err_msg = format!("STREAMING PREFILL (audio): Forward failed: {e}");
+                            error!("{}", err_msg);
+                            let _ = tx.blocking_send(Err(err_msg));
+                            return;
+                        }
+                    }
+                } else if let Some((px, (gh, gw))) = state.qwen35_image.take() {
                     // qwen35moe (Qwen3-VL) cold vision prefill: ViT + splice at
                     // the image_token sentinel + mRoPE-2D. Returns the continuing
                     // logical decode position (image compresses positions).
@@ -2325,6 +2368,8 @@ impl LlmEngine {
                     let (image_hash, image_prefix_len) = {
                         let g = model_state.blocking_lock();
                         match g.as_ref() {
+                            // A clip is keyed like an image: its rows are not in the tokens.
+                            Some(s) if s.audio.is_some() => (s.audio.as_ref().map(|c| c.hash), 0),
                             Some(s) if s.model.is_vision_model() => {
                                 let hash = s.image_embed_cache.as_ref().map(|(h, _)| *h);
                                 let prefix = s

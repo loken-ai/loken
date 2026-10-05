@@ -15,6 +15,12 @@ pub struct SplicedVision {
     pub image_token: u32,
 }
 
+/// The speech tower whose output replaces the placeholder of a prompt.
+#[cfg(feature = "audio")]
+pub struct SplicedAudio {
+    pub tower: crate::inference::model::audio_in::AudioTower,
+}
+
 /// Per-token `(t, h, w)` positions of `ids`: every run of `image_token` spans the merged
 /// grid `grids[k]` of the `k`-th image.
 pub fn mrope_positions(ids: &[u32], image_token: u32, grids: &[(usize, usize)]) -> Vec<[i32; 3]> {
@@ -157,6 +163,53 @@ impl GenericHeteroTransformer {
         }
         let logits = logits.ok_or_else(|| crate::tensor::Error::msg("empty spliced prefill"))?;
         Ok((logits, next))
+    }
+}
+
+#[cfg(feature = "audio")]
+impl GenericHeteroTransformer {
+    /// Gives the model a speech tower. The tower's embeddings must be as wide as the model's.
+    pub fn set_audio_tower(
+        &mut self,
+        tower: crate::inference::model::audio_in::AudioTower,
+    ) -> Result<()> {
+        if tower.embedding_width() != self.config.embedding_length {
+            return Err(crate::tensor::Error::msg(format!(
+                "the speech tower projects to {} and the model is {} wide",
+                tower.embedding_width(),
+                self.config.embedding_length
+            )));
+        }
+        self.spliced_audio = Some(SplicedAudio { tower });
+        Ok(())
+    }
+
+    /// The speech tower, when the model carries one.
+    pub fn audio_tower(&self) -> Option<&crate::inference::model::audio_in::AudioTower> {
+        self.spliced_audio.as_ref().map(|a| &a.tower)
+    }
+}
+
+impl GenericHeteroTransformer {
+    /// Prefills `prompt` with the token at `at` replaced by `embeds`, `[1, n, width]`.
+    /// Returns the last logits and the sequence length, which is the next decode position.
+    pub fn forward_spliced_audio(
+        &mut self,
+        prompt: &[u32],
+        at: usize,
+        embeds: &Tensor,
+    ) -> Result<(Tensor, usize)> {
+        if at >= prompt.len() {
+            return Err(crate::tensor::Error::msg(
+                "the audio placeholder is past the end of the prompt".to_string(),
+            ));
+        }
+        let emb_device = self.embeddings.embeddings().device().clone();
+        let ids = |part: &[u32]| -> Result<Tensor> { Tensor::new(part, &emb_device)?.unsqueeze(0) };
+        let total = prompt.len() - 1 + embeds.dim(1)?;
+        let logits =
+            self.forward_with_audio_embeds(&ids(&prompt[..at])?, embeds, &ids(&prompt[at + 1..])?)?;
+        Ok((logits, total))
     }
 }
 
