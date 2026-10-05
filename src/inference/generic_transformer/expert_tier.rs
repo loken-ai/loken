@@ -52,6 +52,8 @@ pub struct LayerTier {
     copy: Arc<cudarc::driver::CudaStream>,
     /// A copy into the cache is queued or running.
     promoting: std::sync::atomic::AtomicBool,
+    /// Microseconds a decoded token took here, smoothed: what a batch's rows cost one by one.
+    decode_us: AtomicU64,
     /// What a decoded token moves, made on the first.
     scratch: Mutex<Option<Scratch>>,
 }
@@ -147,6 +149,8 @@ fn address_of<T: crate::tensor::kernel_ffi::CudaDType>(t: &Tensor) -> Result<u64
 /// The card's room for a layer's experts to pass through, and the copies that fill it.
 pub struct CardStager {
     dev: Device,
+    /// Bytes per microsecond the host sends to this card, measured when the stager is made.
+    bandwidth: f64,
     copy: Arc<cudarc::driver::CudaStream>,
     buffers: [StageBuffer; 2],
 }
@@ -241,13 +245,6 @@ impl super::GenericHeteroTransformer {
                     widest[i] = widest[i].max(stacks[i].native_qtensor().data().len());
                 }
             }
-            // What the wide batches the experts now run on the card for keep live: the chunk the
-            // prefill is to run at, held free beside the room for the cache.
-            let shape = self.prefill_shape_with(true);
-            let chunk_bytes = (shape.bytes_per_token as u64)
-                .saturating_mul(shape.target_chunk as u64)
-                .saturating_add(shape.fixed_bytes as u64);
-            let held: u64 = 2 * widest.iter().sum::<usize>() as u64 + chunk_bytes;
             let bytes = expert_bytes(
                 self.layers[first]
                     .moe
@@ -261,9 +258,19 @@ impl super::GenericHeteroTransformer {
                 .map(|s| s.free_memory_bytes)
                 .max()
                 .unwrap_or(0);
+            let before = free_before.get(&ordinal).copied().unwrap_or(0);
+            // What the wide batches the experts now run on the card for keep live: the chunk the
+            // prefill is to run at. The plan already leaves a reserve free for the work of a
+            // forward, so the cache gives up only what the chunk needs beyond it.
+            let shape = self.prefill_shape_with(true);
+            let chunk_bytes = (shape.bytes_per_token as u64)
+                .saturating_mul(shape.target_chunk as u64)
+                .saturating_add(shape.fixed_bytes as u64);
+            let held: u64 = 2 * widest.iter().sum::<usize>() as u64
+                + chunk_bytes.saturating_sub(before.saturating_sub(budget));
             let slots = expert_cache::slots_per_layer(
                 budget.saturating_sub(held),
-                free_before.get(&ordinal).copied().unwrap_or(0),
+                before,
                 expert_cache::free_now(dev),
                 tiered.len(),
                 bytes,
@@ -446,6 +453,7 @@ impl LayerTier {
                 .new_stream()
                 .map_err(|e| crate::tensor::Error::msg(format!("copy stream: {e:?}")))?,
             promoting: std::sync::atomic::AtomicBool::new(false),
+            decode_us: AtomicU64::new(0),
             scratch: Mutex::new(None),
         })
     }
@@ -483,6 +491,29 @@ impl LayerTier {
     /// One decoded token's expert block: `xs` `[1, hidden]` and the router's choice `ids`,
     /// `weights` `[1, k]`, all on the card. Returns `[1, hidden]` on the card.
     pub(super) fn decode(
+        self: &Arc<Self>,
+        moe: &MoeWeights,
+        xs: &Tensor,
+        ids: &Tensor,
+        weights: &Tensor,
+    ) -> Result<Tensor> {
+        let started = std::time::Instant::now();
+        let out = self.decode_token(moe, xs, ids, weights);
+        let us = started.elapsed().as_micros() as u64;
+        let before = self.decode_us.load(Ordering::Relaxed);
+        // A weighted mean that forgets a token in sixteen.
+        self.decode_us.store(
+            if before == 0 {
+                us
+            } else {
+                (before * 15 + us) / 16
+            },
+            Ordering::Relaxed,
+        );
+        out
+    }
+
+    fn decode_token(
         self: &Arc<Self>,
         moe: &MoeWeights,
         xs: &Tensor,
@@ -785,12 +816,48 @@ impl CardStager {
                 free: Mutex::new(None),
             })
         };
+        let buffers = [buffer()?, buffer()?];
+        let bandwidth = measure_upload_bandwidth(dev, &buffers[0].arenas[0], widest[0])?;
         Ok(Arc::new(Self {
             dev: dev.clone(),
+            bandwidth,
             copy,
-            buffers: [buffer()?, buffer()?],
+            buffers,
         }))
     }
+}
+
+/// Bytes per microsecond that page-locked host memory reaches the card at: a copy into `arena`,
+/// the best of a few.
+fn measure_upload_bandwidth(
+    dev: &Device,
+    arena: &Arc<cudarc::driver::CudaSlice<u8>>,
+    arena_bytes: usize,
+) -> Result<f64> {
+    use cudarc::driver::DevicePtr;
+    let cd = dev.as_cuda_device()?;
+    cd.0.context()
+        .bind_to_thread()
+        .map_err(|e| crate::tensor::Error::msg(format!("bind context: {e:?}")))?;
+    let bytes = arena_bytes.min(64 << 20);
+    let host = unsafe { cudarc::driver::result::malloc_host(bytes, 0) }
+        .map_err(|e| crate::tensor::Error::msg(format!("pinned probe: {e}")))?;
+    let dst = arena.device_ptr(arena.stream()).0;
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let t = std::time::Instant::now();
+        let r = unsafe { cudarc::driver::sys::cuMemcpyHtoD_v2(dst, host, bytes) };
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        if r == cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+            best = best.min(us);
+        }
+    }
+    unsafe { cudarc::driver::result::free_host(host) }.ok();
+    Ok(if best.is_finite() && best > 0.0 {
+        bytes as f64 / best
+    } else {
+        0.0
+    })
 }
 
 /// Page-lock `[ptr, ptr + len)` as far as whole pages allow, and give the locked range.
@@ -859,8 +926,29 @@ impl Drop for Stage {
 impl LayerTier {
     /// Whether a batch of `rows` pays for the whole layer's experts to come to the card: when
     /// the rows' routed pairs outnumber the experts, nearly every expert is used.
+    ///
+    /// The rows run one by one through the cache where that is cheaper: the copy of what the card
+    /// does not hold, at the rate the host reaches the card, against the rows at the pace tokens
+    /// have been decoded here. Before any token was decoded the copy is taken.
     pub fn stream_pays(&self, rows: usize, used: usize) -> bool {
-        self.stage.is_some() && rows * used >= self.n_experts
+        let Some(stage) = self.stage.as_ref() else {
+            return false;
+        };
+        if rows * used < self.n_experts {
+            return false;
+        }
+        let per_token = self.decode_us.load(Ordering::Relaxed) as f64;
+        let held = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .slot_of
+            .iter()
+            .filter(|&&s| s >= 0)
+            .count();
+        let missing = (self.n_experts - held) * self.expert_bytes.iter().sum::<usize>();
+        let copy_us = missing as f64 / stage.stager.bandwidth.max(1e-9);
+        per_token == 0.0 || (rows as f64) * per_token > copy_us
     }
 
     /// Start the copies that fill this layer's buffer with every expert: the ones the card

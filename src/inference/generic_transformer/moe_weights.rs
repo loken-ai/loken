@@ -724,6 +724,24 @@ impl MoeWeights {
             });
             tier.release_stacks()?;
             out?
+        } else if let Some(tier) = self
+            .tier
+            .as_ref()
+            .filter(|_| xs.device().runs_as_card() && num_tokens > 1)
+        {
+            // Too few rows to pay for the layer's experts to come: each goes through the cache as
+            // a decoded token does, in the storage of its own.
+            let rows = (0..num_tokens)
+                .map(|t| {
+                    tier.decode(
+                        self,
+                        &xs.narrow(0, t, 1)?.contiguous()?,
+                        &topk_ids.narrow(0, t, 1)?.contiguous()?,
+                        &topk_weights_scaled.narrow(0, t, 1)?.contiguous()?,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?
         } else if on_cpu {
             self.forward_cpu(&xs, &topk_ids, &topk_weights_scaled, num_tokens, hidden_dim)?
         } else {

@@ -108,6 +108,12 @@ fn adaptive_prefill_chunk_uncached(shape: PrefillShape) -> usize {
     }
     let raw = (free / shape.share.max(1)).saturating_sub(shape.fixed_bytes) / per_token;
     let top = shape.target_chunk.max(2048);
+    tracing::debug!(
+        "prefill chunk: {:.2} GB free, {} B per token + {:.0} MB fixed, ladder top {top}: rows {raw}",
+        free as f64 / 1e9,
+        per_token,
+        shape.fixed_bytes as f64 / 1e6
+    );
     if raw >= top {
         top
     } else if raw >= 2048 {
