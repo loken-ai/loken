@@ -1234,6 +1234,7 @@ fn build_generic_layer(
             up_relu2: up_only,
             shared_expert,
             gate_up_exps_f32: gus_f32,
+            tier: None,
             down_exps_f32: des_f32,
         })
     } else {
@@ -2155,6 +2156,10 @@ impl GenericHeteroTransformer {
             plan.segments.len(),
             kv_quant
         );
+        let free_before: HashMap<usize, u64> = cuda_devices
+            .iter()
+            .map(|(&i, d)| (i, crate::inference::place::expert_cache::free_now(d)))
+            .collect();
         let _ldt = std::time::Instant::now();
         macro_rules! ldt { ($($a:tt)*) => { info!("[load] {:>7.2}s  {}", _ldt.elapsed().as_secs_f32(), format!($($a)*)); } }
 
@@ -3376,6 +3381,7 @@ impl GenericHeteroTransformer {
                 }
             }
         }
+        model.attach_expert_tiers(cuda_devices, plan, &free_before)?;
         model.host_experts_hot = model
             .layers
             .iter()

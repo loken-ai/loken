@@ -45,14 +45,14 @@ fn sort_by_expert(choices: &Tensor) -> Result<(Tensor, Tensor)> {
 /// `experts[i]` the expert that row is multiplied by. Every expert launch below takes those two
 /// together with the per-token choice count - so they travel together, and the launches hang
 /// off them rather than repeating the triple at each call.
-struct ExpertRouting {
-    slots: Tensor,
-    experts: Tensor,
-    topk: usize,
+pub(super) struct ExpertRouting {
+    pub(super) slots: Tensor,
+    pub(super) experts: Tensor,
+    pub(super) topk: usize,
 }
 
 impl ExpertRouting {
-    fn group(choices: &Tensor, topk: usize) -> Result<Self> {
+    pub(super) fn group(choices: &Tensor, topk: usize) -> Result<Self> {
         let (experts, slots) = sort_by_expert(choices)?;
         Ok(Self {
             slots,
@@ -87,7 +87,7 @@ impl ExpertRouting {
 
     /// The same, against gate and up kept apart, combined by SiLU.
     #[cfg(feature = "cuda")]
-    fn gate_up_silu(&self, xs: &Tensor, gate: &QTensor, up: &QTensor) -> Result<Tensor> {
+    pub(super) fn gate_up_silu(&self, xs: &Tensor, gate: &QTensor, up: &QTensor) -> Result<Tensor> {
         crate::inference::moe_cuda::moe_gemm_gguf_gate_up_silu_mul(
             xs,
             gate,
@@ -127,7 +127,7 @@ impl ExpertRouting {
     /// score its expert was chosen with, added into the token it came from. A per-expert
     /// `bias` joins each row before its score scales it.
     #[cfg(feature = "cuda")]
-    fn down_reduce(
+    pub(super) fn down_reduce(
         &self,
         rows: &Tensor,
         stack: &QTensor,
@@ -165,7 +165,7 @@ impl ExpertRouting {
     }
 
     /// [`Self::gate_up_silu`] on the host.
-    fn host_gate_up_silu(
+    pub(super) fn host_gate_up_silu(
         &self,
         xs: &Tensor,
         gate: &Arc<QTensor>,
@@ -205,7 +205,7 @@ impl ExpertRouting {
     }
 
     /// [`Self::down_reduce`] on the host.
-    fn host_down_reduce(
+    pub(super) fn host_down_reduce(
         &self,
         rows: &Tensor,
         stack: &Arc<QTensor>,
@@ -381,6 +381,8 @@ pub struct MoeWeights {
     /// placed on CPU since `moe_gemm_gguf` is CUDA-only. Avoids per-call
     /// dequant cost on what is already a slow CPU path.
     pub gate_up_exps_f32: Option<std::sync::Arc<Tensor>>,
+    /// The routed experts in host memory with a cache of them on the card.
+    pub tier: Option<std::sync::Arc<super::expert_tier::LayerTier>>,
     pub down_exps_f32: Option<std::sync::Arc<Tensor>>,
 }
 
@@ -697,6 +699,10 @@ impl MoeWeights {
         }
         let expert_rows = if self.up_relu2 {
             self.forward_up_relu2(&xs, &topk_ids, &topk_weights_scaled, num_tokens)?
+        } else if let (Some(tier), true, 1) =
+            (self.tier.as_ref(), xs.device().runs_as_card(), num_tokens)
+        {
+            tier.decode(self, &xs, &topk_ids, &topk_weights_scaled)?
         } else if on_cpu {
             self.forward_cpu(&xs, &topk_ids, &topk_weights_scaled, num_tokens, hidden_dim)?
         } else {
@@ -1304,6 +1310,7 @@ mod clamped_swiglu_tests {
                 shared_expert: None,
                 gate_up_exps_f32: cache.then(|| dense(&gate_up)),
                 down_exps_f32: cache.then(|| dense(&down)),
+                tier: None,
             }
         };
         let input =
@@ -1370,6 +1377,7 @@ mod clamped_swiglu_tests {
                 up_relu2: false,
                 shared_expert: None,
                 gate_up_exps_f32: None,
+                tier: None,
                 down_exps_f32: None,
             };
             let xs = values(tokens * hidden, 26, 1.0);
@@ -1495,6 +1503,7 @@ mod clamped_swiglu_tests {
                 scalar_gate: None,
             }),
             gate_up_exps_f32: None,
+            tier: None,
             down_exps_f32: None,
         };
         let xs = values(tokens * hidden, 36, 1.0);
@@ -1600,6 +1609,7 @@ mod clamped_swiglu_tests {
             up_relu2: false,
             shared_expert: None,
             gate_up_exps_f32: None,
+            tier: None,
             down_exps_f32: None,
         };
         let xs = values(tokens * hidden, 19, 1.0);

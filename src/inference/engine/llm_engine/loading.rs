@@ -1021,9 +1021,12 @@ impl LlmEngine {
                             // A plan that sends whole layers to the host is replaced, for a
                             // mixture of experts, by one that sends only routed experts there:
                             // every layer's attention and cache then stay on a card.
+                            // Whether the routed experts left on the host can have a cache of
+                            // them on the cards: the file says, from its stacks' formats.
+                            let cached_experts = crate::inference::generic_transformer::expert_tier::header_serves(&content);
                             let expert_split = generic_weights
                                 .layer_dense_and_expert_bytes(&content, num_layers)
-                                .and_then(|layers| demand.plan_host_experts(&first_plan, &cuda_devices, &layers));
+                                .and_then(|layers| demand.plan_host_experts(&first_plan, &cuda_devices, &layers, cached_experts));
                             if let Some(p) = &expert_split {
                                 info!(
                                     "📦 routed experts of layers {}-{} kept in host memory; every layer's attention stays on a card",

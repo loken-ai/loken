@@ -223,12 +223,18 @@ impl HeteroPlan {
     /// free memory less `gpu_runtime_reserve_bytes`, and the card of the last layer also
     /// holds `head_bytes`. `None` when the dense parts alone do not fit, or no layer has
     /// routed experts.
+    ///
+    /// With `cached` the cards keep an adaptive cache of the experts that stay on the host, and
+    /// a cache spread over every layer serves a routing better than whole layers of experts do:
+    /// a model that does not fit sends all its experts to the host and gives the room that
+    /// leaves to the caches.
     pub fn calculate_host_experts(
         layers: &[(u64, u64)],
         head_bytes: u64,
         cuda_devices: &[(usize, u64)],
         kv_bytes_per_layer: u64,
         gpu_runtime_reserve_bytes: u64,
+        cached: bool,
     ) -> Option<Self> {
         let total_layers = layers.len();
         if total_layers == 0 || layers.iter().all(|&(_, e)| e == 0) {
@@ -281,7 +287,13 @@ impl HeteroPlan {
             }
             (next == total_layers).then_some(segments)
         };
-        (0..=total_layers).rev().find_map(|from| {
+        let candidates: Vec<usize> = if cached {
+            // Every expert on the cards when they fit, else none of them.
+            vec![total_layers, 0]
+        } else {
+            (0..=total_layers).rev().collect()
+        };
+        candidates.into_iter().find_map(|from| {
             // `from` counts down from every expert on the cards to none of them.
             let segments = fill(from)?;
             Some(HeteroPlan {
@@ -906,9 +918,15 @@ mod tests {
         // Eight layers of 0.1 GB dense and 1 GB of experts, and a 1 GB head, over two 5 GB
         // cards.
         let layers = vec![(GB / 10, GB); 8];
-        let plan =
-            HeteroPlan::calculate_host_experts(&layers, GB, &[(0, 5 * GB), (1, 5 * GB)], 0, 0)
-                .expect("the dense parts fit");
+        let plan = HeteroPlan::calculate_host_experts(
+            &layers,
+            GB,
+            &[(0, 5 * GB), (1, 5 * GB)],
+            0,
+            0,
+            false,
+        )
+        .expect("the dense parts fit");
         assert!(plan
             .segments
             .iter()
@@ -920,14 +938,35 @@ mod tests {
         assert_eq!(plan.host_experts_from, Some(7));
         // Dense parts too large for the cards: no such plan.
         let heavy = vec![(3 * GB, GB); 8];
-        assert!(
-            HeteroPlan::calculate_host_experts(&heavy, 0, &[(0, 5 * GB), (1, 5 * GB)], 0, 0)
-                .is_none()
-        );
+        assert!(HeteroPlan::calculate_host_experts(
+            &heavy,
+            0,
+            &[(0, 5 * GB), (1, 5 * GB)],
+            0,
+            0,
+            false
+        )
+        .is_none());
         // A model that fits whole keeps its experts with its layers.
         let small = vec![(GB / 10, GB / 10); 8];
-        let whole = HeteroPlan::calculate_host_experts(&small, 0, &[(0, 5 * GB)], 0, 0).unwrap();
+        let whole =
+            HeteroPlan::calculate_host_experts(&small, 0, &[(0, 5 * GB)], 0, 0, false).unwrap();
         assert_eq!(whole.host_experts_from, None);
+        // Cached: a mixture that does not fit sends every expert to the host, and one that fits
+        // keeps them.
+        let cached = HeteroPlan::calculate_host_experts(
+            &layers,
+            GB,
+            &[(0, 5 * GB), (1, 5 * GB)],
+            0,
+            0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(cached.host_experts_from, Some(0));
+        let fits =
+            HeteroPlan::calculate_host_experts(&small, 0, &[(0, 5 * GB)], 0, 0, true).unwrap();
+        assert_eq!(fits.host_experts_from, None);
     }
 
     #[test]

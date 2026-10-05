@@ -123,6 +123,7 @@ impl Demand {
         first: &HeteroPlan,
         cards: &[(usize, u64)],
         layers: &[(u64, u64)],
+        cached: bool,
     ) -> Option<HeteroPlan> {
         let spills = first.segments.iter().any(|s| s.kind == DeviceKind::Cpu);
         if !spills {
@@ -134,6 +135,7 @@ impl Demand {
             cards,
             self.kv_bytes_per_layer,
             self.runtime_reserve,
+            cached,
         )
     }
 

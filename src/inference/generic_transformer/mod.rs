@@ -47,6 +47,11 @@ mod wide_tests;
 mod config;
 #[cfg(test)]
 mod conversion_tests;
+#[cfg(feature = "cuda")]
+pub mod expert_tier;
+#[cfg(not(feature = "cuda"))]
+#[path = "expert_tier_host.rs"]
+pub mod expert_tier;
 mod graph;
 pub mod hetero;
 pub mod hyper;

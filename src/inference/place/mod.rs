@@ -11,6 +11,7 @@ pub mod audio_demand;
 mod conversion_invariants;
 pub mod device_probe;
 pub mod dry_plan;
+pub mod expert_cache;
 pub mod fit_report;
 #[cfg(all(test, feature = "image"))]
 mod geometry_invariants;
