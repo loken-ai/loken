@@ -306,6 +306,7 @@ impl LlmEngine {
             // session cache already held: both outlive the prefill block.
             let mut logprob_buf: Vec<TokenLogprob> = Vec::new();
             let reused_prompt_tokens: usize;
+            let audio_positions: usize;
             let (
                 mut next_token,
                 mut pos,
@@ -379,6 +380,7 @@ impl LlmEngine {
                     .filter(|_| audio_split.is_some())
                     .and_then(|c| c.embeds.dim(1).ok())
                     .map_or(0, |n| n.saturating_sub(1));
+                audio_positions = audio_extra;
                 let prompt_tokens: Vec<u32> = match (&audio_split, qwen35_sentinel) {
                     (Some(a), _) => a.tokens.clone(),
                     (None, Some(sent)) => clamp_qwen35_prompt_to_window(
@@ -2335,8 +2337,11 @@ impl LlmEngine {
                 *slot = Some(StreamStats {
                     eval_count: token_count as u64,
                     eval_duration_ns: compute_ns,
-                    prompt_eval_count: prompt_tokens.len().saturating_sub(reused_prompt_tokens)
-                        as u64,
+                    prompt_eval_count: prompt_eval_positions(
+                        prompt_tokens.len(),
+                        reused_prompt_tokens,
+                        audio_positions,
+                    ),
                     prompt_eval_duration_ns,
                     total_duration_ns,
                     cached_prompt_tokens: reused_prompt_tokens as u64,

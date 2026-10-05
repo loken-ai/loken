@@ -479,3 +479,50 @@ pub(super) fn audio_split_for(
     )
     .map(Some)
 }
+
+/// The positions a prefill evaluated: the prompt's tokens less those the cache held, plus the
+/// positions a clip's embeddings take beyond the one placeholder token they replace.
+pub(super) fn prompt_eval_positions(tokens: usize, reused: usize, audio_extra: usize) -> u64 {
+    (tokens.saturating_sub(reused) + audio_extra) as u64
+}
+
+#[cfg(test)]
+mod audio_position_tests {
+    use super::*;
+
+    /// A clip of 375 embeddings in a prompt of 20 tokens (the placeholder one of them) is 394
+    /// positions; a prompt with no clip is its tokens less the reused ones.
+    #[test]
+    fn a_clip_counts_as_its_embeddings_less_the_placeholder() {
+        assert_eq!(prompt_eval_positions(20, 0, 375 - 1), 394);
+        assert_eq!(prompt_eval_positions(20, 5, 0), 15);
+    }
+
+    /// Splitting around the placeholder keeps every other token and one stand-in.
+    #[test]
+    fn the_prompt_splits_around_its_placeholder() {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+        let vocab: ahash::AHashMap<String, u32> = ["[UNK]", "a", "b", "c", "PH"]
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.to_string(), i as u32))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut tok = Tokenizer::new(model);
+        tok.with_pre_tokenizer(Some(Whitespace {}));
+        let params = GenerationParams::default();
+        let split = tokenize_around_audio(&tok, "a b PH c", "PH", 99, &params, 10, 100).unwrap();
+        assert_eq!(split.tokens, vec![1, 2, 99, 3]);
+        assert_eq!(split.at, 2);
+        // 4 tokens, one replaced by 10 embeddings.
+        assert_eq!(prompt_eval_positions(split.tokens.len(), 0, 10 - 1), 13);
+        // A prompt that does not fit the window is refused, one with no placeholder too.
+        assert!(tokenize_around_audio(&tok, "a b PH c", "PH", 99, &params, 10, 13).is_err());
+        assert!(tokenize_around_audio(&tok, "a b c", "PH", 99, &params, 10, 100).is_err());
+    }
+}

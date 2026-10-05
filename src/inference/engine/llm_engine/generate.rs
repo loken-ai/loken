@@ -259,6 +259,13 @@ impl LlmEngine {
             // never clamped around them, a prompt that does not fit is refused.
             let audio_split = audio_split_for(state, prompt.as_str(), &params, kv_window)
                 .map_err(|e| anyhow!(e))?;
+            // The positions a clip's embeddings take beyond the placeholder token they replace.
+            let audio_positions = state
+                .audio
+                .as_ref()
+                .filter(|_| audio_split.is_some())
+                .and_then(|c| c.embeds.dim(1).ok())
+                .map_or(0, |n| n.saturating_sub(1));
             let prompt_tokens: Vec<u32> = match (&audio_split, qwen35_sentinel) {
                 (Some(a), _) => a.tokens.clone(),
                 (None, Some(sent)) => clamp_qwen35_prompt_to_window(
@@ -369,7 +376,7 @@ impl LlmEngine {
 
 
             // Batched prefill (all prompt tokens in one forward pass)
-            let prompt_token_count = prompt_tokens.len().saturating_sub(cache_session_start) as u64;
+            let prompt_token_count = prompt_eval_positions(prompt_tokens.len(), cache_session_start, audio_positions);
             let prefill_start = std::time::Instant::now();
             // Prefill only the divergent suffix when the global cache reused a
             // prefix (cache_session_start>0, text path). Vision/no-cache -> start=0 ->
