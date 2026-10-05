@@ -79,16 +79,59 @@ fn cuda_mem_bw_gbs(_index: usize) -> f64 {
     0.0
 }
 
+/// The cards this process can use, as `(CUDA ordinal, NVML index)` in ordinal order.
+///
+/// The driver numbers the cards after `CUDA_VISIBLE_DEVICES` and `CUDA_DEVICE_ORDER`, NVML
+/// numbers every card of the machine; the two meet on the PCI bus id. Without CUDA, or when a
+/// card's bus id does not resolve, the NVML index stands for the ordinal.
+pub fn visible_cards(nvml: &nvml_wrapper::Nvml) -> Vec<(usize, u32)> {
+    let all = nvml.device_count().unwrap_or(0);
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::driver::sys::{cuDeviceGetPCIBusId, cudaError_enum};
+        let _ = cudarc::driver::result::init();
+        if let Ok(n) = cudarc::driver::result::device::get_count() {
+            let mut out = Vec::new();
+            for ordinal in 0..n {
+                let mut id = [0 as std::os::raw::c_char; 64];
+                let ok = unsafe { cuDeviceGetPCIBusId(id.as_mut_ptr(), id.len() as i32, ordinal) }
+                    == cudaError_enum::CUDA_SUCCESS;
+                let bus = ok.then(|| {
+                    let bytes: Vec<u8> = id
+                        .iter()
+                        .take_while(|&&c| c != 0)
+                        .map(|&c| c as u8)
+                        .collect();
+                    String::from_utf8_lossy(&bytes).to_uppercase()
+                });
+                let index = bus.and_then(|b| {
+                    (0..all).find(|&i| {
+                        nvml.device_by_index(i)
+                            .and_then(|d| d.pci_info())
+                            .is_ok_and(|p| {
+                                p.bus_id
+                                    .to_uppercase()
+                                    .ends_with(&b[b.len().saturating_sub(12)..])
+                            })
+                    })
+                });
+                out.push((ordinal as usize, index.unwrap_or(ordinal as u32)));
+            }
+            return out;
+        }
+    }
+    (0..all).map(|i| (i as usize, i)).collect()
+}
+
 /// Per-card VRAM snapshot at debug level, tagged with the load phase that asked.
 /// The instrument task #64 calls for: a context appearing on a card that holds no
 /// layer is invisible in any log until the phase that created it is bracketed.
 pub fn debug_vram_by_card(tag: &str) {
     if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-        let n = nvml.device_count().unwrap_or(0);
-        for i in 0..n {
-            if let Ok(d) = nvml.device_by_index(i) {
+        for (i, nvml_index) in visible_cards(&nvml) {
+            if let Ok(d) = nvml.device_by_index(nvml_index) {
                 if let Ok(m) = d.memory_info() {
-                    let active = primary_ctx_active(i as usize);
+                    let active = primary_ctx_active(i);
                     tracing::debug!(
                         "vram[{tag}] gpu{i}: {:.0} MB used, primary ctx {}",
                         m.used as f64 / 1e6,
@@ -127,10 +170,18 @@ pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
     match nvml_wrapper::Nvml::init() {
         Ok(nvml) => {
             use nvml_wrapper::enum_wrappers::device::Clock;
-            let gpu_count = nvml.device_count().unwrap_or(0);
+            let cards = visible_cards(&nvml);
+            let machine_cards = nvml.device_count().unwrap_or(0) as usize;
+            if cards.len() != machine_cards {
+                info!(
+                    "{} of the machine's {} GPU(s) visible to this process (CUDA_VISIBLE_DEVICES)",
+                    cards.len(),
+                    machine_cards
+                );
+            }
             let our_pid = std::process::id();
-            for i in 0..gpu_count {
-                if let Ok(gpu) = nvml.device_by_index(i) {
+            for (i, nvml_index) in cards {
+                if let Ok(gpu) = nvml.device_by_index(nvml_index) {
                     if let Ok(mem) = gpu.memory_info() {
                         let name = gpu.name().unwrap_or_else(|_| format!("GPU {}", i));
                         // Trust nvml's free figure UNLESS there are no other
@@ -173,7 +224,7 @@ pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
                         };
                         let available = stable_free;
                         let sm_clock = gpu.max_clock_info(Clock::SM).unwrap_or(0);
-                        let mem_bw_gbs = cuda_mem_bw_gbs(i as usize);
+                        let mem_bw_gbs = cuda_mem_bw_gbs(i);
                         let num_cores = gpu.num_cores().unwrap_or(0);
                         // Throughput proxy: cores x clock. Falls back to clock
                         // alone if the core count is unavailable.
@@ -189,7 +240,7 @@ pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
                             stable_free as f64 / 1e9,
                             num_cores, sm_clock, perf_score);
                         gpu_info.push(CudaGpuInfo {
-                            index: i as usize,
+                            index: i,
                             stable_free,
                             available,
                             sm_clock,
@@ -368,5 +419,44 @@ mod primary_ctx_tests {
             "cuBLAS no longer latches the primary context - the warm-up policy in \
              llm_engine (WARM_CTX) can be revisited"
         );
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod visible_tests {
+    use super::*;
+
+    /// Each ordinal the probe offers is the driver's card of that ordinal: the name NVML gives the
+    /// card behind it is the name the driver gives the ordinal, so a restricted
+    /// `CUDA_VISIBLE_DEVICES` offers the cards it names and no others.
+    #[test]
+    fn the_probe_offers_the_cards_the_driver_numbers() {
+        if cudarc::driver::result::init().is_err() {
+            eprintln!("skipping: no usable CUDA driver");
+            return;
+        }
+        let Ok(nvml) = nvml_wrapper::Nvml::init() else {
+            eprintln!("skipping: no NVML");
+            return;
+        };
+        let visible = cudarc::driver::result::device::get_count().unwrap_or(0) as usize;
+        let cards = visible_cards(&nvml);
+        assert_eq!(cards.len(), visible, "every visible card and only those");
+        for (ordinal, index) in cards {
+            let dev = cudarc::driver::result::device::get(ordinal as i32).unwrap();
+            let mut name = [0 as std::os::raw::c_char; 128];
+            unsafe { cudarc::driver::sys::cuDeviceGetName(name.as_mut_ptr(), 128, dev) };
+            let bytes: Vec<u8> = name
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            let driver_name = String::from_utf8_lossy(&bytes).to_string();
+            let nvml_name = nvml.device_by_index(index).unwrap().name().unwrap();
+            assert_eq!(
+                driver_name, nvml_name,
+                "ordinal {ordinal} is NVML card {index}"
+            );
+        }
     }
 }

@@ -990,7 +990,7 @@ pub fn trim_cuda_pools() {
             CUmemPool_attribute, CUmemoryPool,
         };
         let device_count = match nvml_wrapper::Nvml::init() {
-            Ok(nvml) => nvml.device_count().unwrap_or(0) as i32,
+            Ok(nvml) => crate::inference::place::device_probe::visible_cards(&nvml).len() as i32,
             Err(_) => 0,
         };
         for ordinal in 0..device_count {
@@ -1047,7 +1047,7 @@ pub fn release_cuda_pools() {
     // querying via cudarc::driver::CudaContext (which would create a new
     // context just to count). We use the raw FFI directly.
     let device_count = match nvml_wrapper::Nvml::init() {
-        Ok(nvml) => nvml.device_count().unwrap_or(0) as i32,
+        Ok(nvml) => crate::inference::place::device_probe::visible_cards(&nvml).len() as i32,
         Err(_) => 0,
     };
     let mut released = 0u64;
