@@ -87,6 +87,19 @@ pub fn demand_paged_bytes(content: &gguf_file::Content, arch: &str) -> u64 {
         .map_or(0, |t| t.size_in_bytes() as u64)
 }
 
+/// Size of the largest tensor the load places on a card: the tensors that are placed, so not
+/// the n-gram table, which stays in the mapping. This is what a load stages one tensor at a time.
+pub fn largest_placed_tensor(content: &gguf_file::Content, arch: &str) -> u64 {
+    let paged = NgramMeta::from_gguf(content, arch).map(|_| "per_layer_token_embd.weight");
+    content
+        .tensor_infos
+        .iter()
+        .filter(|(name, _)| Some(name.as_str()) != paged)
+        .map(|(_, t)| t.size_in_bytes() as u64)
+        .max()
+        .unwrap_or(0)
+}
+
 /// The last tokens of the sequence, which the hash of the next token reaches back to.
 #[derive(Debug, Clone)]
 pub struct NgramHistory {
@@ -407,6 +420,31 @@ mod tests {
         m.head_vocab = vec![101, 103, 107, 109];
         m.head_offsets = vec![0, 200, 400, 600];
         m
+    }
+
+    /// The table is read by row from the mapping, so a load stages the largest tensor that is
+    /// placed, however large the table.
+    #[test]
+    fn the_table_is_not_the_tensor_a_load_stages() {
+        use crate::tensor::quantized::GgmlDType;
+        use crate::tensor::Shape;
+        let mut c = content(4);
+        let info = |rows: usize| gguf_file::TensorInfo {
+            ggml_dtype: GgmlDType::F32,
+            shape: Shape::from((rows, 64)),
+            offset: 0,
+        };
+        c.tensor_infos
+            .insert("blk.0.ffn_down.weight".into(), info(10));
+        c.tensor_infos
+            .insert("per_layer_token_embd.weight".into(), info(100_000));
+        assert_eq!(largest_placed_tensor(&c, "a"), 10 * 64 * 4);
+        assert_eq!(demand_paged_bytes(&c, "a"), 100_000 * 64 * 4);
+        // Without the table's metadata the tensor is an ordinary one.
+        let mut plain = content(4);
+        plain.metadata.retain(|k, _| !k.contains(".ple."));
+        plain.tensor_infos = c.tensor_infos.clone();
+        assert_eq!(largest_placed_tensor(&plain, "a"), 100_000 * 64 * 4);
     }
 
     #[test]

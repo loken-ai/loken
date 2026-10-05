@@ -131,12 +131,7 @@ pub(crate) fn per_card_reserve(path: &std::path::Path) -> Option<u64> {
             c as usize
         });
     let staging = crate::inference::place::runtime_demand::tensor_load_staging(
-        content
-            .tensor_infos
-            .values()
-            .map(|t| t.size_in_bytes() as u64)
-            .max()
-            .unwrap_or(0),
+        crate::inference::generic_transformer::ngram::largest_placed_tensor(&content, &arch),
     );
     Some(ModelDims::read(&content, &arch).runtime_reserve(context_length) + staging)
 }
@@ -623,7 +618,10 @@ impl LlmEngine {
             // and a prefill chunk's activations, sized from the model's own dimensions.
             let runtime_reserve_bytes = dims.runtime_reserve(context_length);
             let staging = crate::inference::place::runtime_demand::tensor_load_staging(
-                content.tensor_infos.values().map(|t| t.size_in_bytes() as u64).max().unwrap_or(0),
+                crate::inference::generic_transformer::ngram::largest_placed_tensor(
+                    &content,
+                    &get_gguf_string(&content, "general.architecture").unwrap_or_default(),
+                ),
             );
             let offer = if disable_cuda {
                 debug!("CUDA disabled by config (disable_cuda=true)");
