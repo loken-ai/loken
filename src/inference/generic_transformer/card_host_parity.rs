@@ -746,24 +746,14 @@ fn reference_run(path: &std::path::Path) -> (Vec<u32>, Vec<u32>) {
     (context[..n_prompt].to_vec(), context[n_prompt..].to_vec())
 }
 
-/// The model stored under `LOKEN_PARITY_MODEL`, else `default_tag`, loaded through the
-/// generic route across every idle card, decodes greedily what a reference run decoded. The
-/// reference is read from the file `reference_env` names, else `tests/vectors/<vector>`; the
-/// file's architecture must be one of `arches`.
-fn generic_route_matches_the_reference(
-    default_tag: &str,
-    arches: &[&str],
-    reference_env: &str,
-    vector: &str,
-) {
-    let tag = std::env::var("LOKEN_PARITY_MODEL").unwrap_or_else(|_| default_tag.into());
-    let reference = std::env::var(reference_env)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/vectors")
-                .join(vector)
-        });
+/// The model stored under `default_tag`, loaded through the generic route across every idle
+/// card, decodes greedily what a reference run decoded. The reference is read from
+/// `tests/vectors/<vector>`; the file's architecture must be one of `arches`.
+fn generic_route_matches_the_reference(default_tag: &str, arches: &[&str], vector: &str) {
+    let tag = default_tag.to_string();
+    let reference = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/vectors")
+        .join(vector);
     let (prompt, greedy) = reference_run(&reference);
     assert!(!prompt.is_empty() && !greedy.is_empty(), "empty reference");
 
@@ -850,18 +840,12 @@ fn generic_route_matches_the_reference(
 ///
 /// Ignored by default: it needs gpt-oss:20b in the store, the CUDA cards idle, and a
 /// reference run (see `reference_run`). Run with
-///   LOKEN_GPTOSS_REFERENCE=/path/to/reference.json cargo test --release --lib \
+///   cargo test --release --lib \
 ///     gptoss_generic_route_matches_the_reference -- --ignored --nocapture
-/// `LOKEN_PARITY_MODEL` selects another tag of the same architecture.
 #[test]
 #[ignore = "needs gpt-oss:20b in the store, idle CUDA cards and a reference run"]
 fn gptoss_generic_route_matches_the_reference() {
-    generic_route_matches_the_reference(
-        "gpt-oss:20b",
-        &["gptoss"],
-        "LOKEN_GPTOSS_REFERENCE",
-        "gptoss_20b_greedy.json",
-    );
+    generic_route_matches_the_reference("gpt-oss:20b", &["gptoss"], "gptoss_20b_greedy.json");
 }
 
 /// lfm2 (short convolutions and attention, dense or routed) through the generic route
@@ -869,7 +853,7 @@ fn gptoss_generic_route_matches_the_reference() {
 ///
 /// Ignored by default: it needs lfm2:latest in the store, the CUDA cards idle, and a
 /// reference run recorded as `reference_run` says, with `"model":"lfm2:latest"`. Run with
-///   LOKEN_LFM2_REFERENCE=/path/to/reference.json cargo test --release --lib \
+///   cargo test --release --lib \
 ///     lfm2_generic_route_matches_the_reference -- --ignored --nocapture
 #[test]
 #[ignore = "needs lfm2:latest in the store, idle CUDA cards and a reference run"]
@@ -877,7 +861,6 @@ fn lfm2_generic_route_matches_the_reference() {
     generic_route_matches_the_reference(
         "lfm2:latest",
         &["lfm2", "lfm2moe"],
-        "LOKEN_LFM2_REFERENCE",
         "lfm2_latest_greedy.json",
     );
 }
@@ -887,7 +870,7 @@ fn lfm2_generic_route_matches_the_reference() {
 ///
 /// Ignored by default: it needs nemotron-3-nano:latest in the store, the CUDA cards idle,
 /// and a reference run recorded as `reference_run` says. Run with
-///   LOKEN_NEMOTRON_H_REFERENCE=/path/to/reference.json cargo test --release --lib \
+///   cargo test --release --lib \
 ///     nemotron_h_generic_route_matches_the_reference -- --ignored --nocapture
 #[test]
 #[ignore = "needs nemotron-3-nano:latest in the store, idle CUDA cards and a reference run"]
@@ -895,7 +878,6 @@ fn nemotron_h_generic_route_matches_the_reference() {
     generic_route_matches_the_reference(
         "nemotron-3-nano:latest",
         &["nemotron_h_moe"],
-        "LOKEN_NEMOTRON_H_REFERENCE",
         "nemotron_3_nano_greedy.json",
     );
 }
@@ -905,7 +887,7 @@ fn nemotron_h_generic_route_matches_the_reference() {
 ///
 /// Ignored by default: it needs qwen3.5:latest in the store, the CUDA cards idle, and a
 /// reference run recorded as `reference_run` says. Run with
-///   LOKEN_QWEN35_REFERENCE=/path/to/reference.json cargo test --release --lib \
+///   cargo test --release --lib \
 ///     qwen35_generic_route_matches_the_reference -- --ignored --nocapture
 #[test]
 #[ignore = "needs qwen3.5:latest in the store, idle CUDA cards and a reference run"]
@@ -913,7 +895,6 @@ fn qwen35_generic_route_matches_the_reference() {
     generic_route_matches_the_reference(
         "qwen3.5:latest",
         &["qwen35", "qwen35moe"],
-        "LOKEN_QWEN35_REFERENCE",
         "qwen35_latest_greedy.json",
     );
 }
@@ -923,7 +904,7 @@ fn qwen35_generic_route_matches_the_reference() {
 ///
 /// Ignored by default: it needs qwen3next:latest in the store, the CUDA cards idle, and a
 /// reference run recorded as `reference_run` says. Run with
-///   LOKEN_QWEN3NEXT_REFERENCE=/path/to/reference.json cargo test --release --lib \
+///   cargo test --release --lib \
 ///     qwen3next_generic_route_matches_the_reference -- --ignored --nocapture
 #[test]
 #[ignore = "needs qwen3next:latest in the store, idle CUDA cards and a reference run"]
@@ -931,7 +912,6 @@ fn qwen3next_generic_route_matches_the_reference() {
     generic_route_matches_the_reference(
         "qwen3next:latest",
         &["qwen3next"],
-        "LOKEN_QWEN3NEXT_REFERENCE",
         "qwen3next_latest_greedy.json",
     );
 }

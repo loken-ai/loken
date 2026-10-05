@@ -984,11 +984,7 @@ mod tests {
     fn the_draft_matches_the_reference() {
         use crate::inference::offload::projection::Projection;
         use safetensors::SafeTensors;
-        let dir = std::env::var_os("LOKEN_DSPARK_VECTORS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/deepseek_v41_dspark")
-            });
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/deepseek_v41_dspark");
         let vec_bytes = std::fs::read(dir.join("vectors.safetensors")).unwrap();
         let vecs = SafeTensors::deserialize(&vec_bytes).unwrap();
         let f32s = |name: &str| -> Vec<f32> {

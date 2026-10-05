@@ -1032,32 +1032,4 @@ mod tests {
         assert_eq!(d.stages[0].moe.experts.count(), DRAFT_EXPERTS);
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    /// The real draft written alone, run by hand: `LOKEN_DSV41_CKPT` names the released
-    /// checkpoint's directory, `LOKEN_DSV41_DRAFT_OUT` the file to write, `LOKEN_DSV41_DRAFT_FORMAT`
-    /// the quantisation (a ggml name, default the one of the model it goes beside).
-    #[test]
-    #[ignore = "needs the released checkpoint"]
-    fn write_the_real_draft_alone() {
-        let dir =
-            std::path::PathBuf::from(std::env::var("LOKEN_DSV41_CKPT").expect("LOKEN_DSV41_CKPT"));
-        let out = std::path::PathBuf::from(
-            std::env::var("LOKEN_DSV41_DRAFT_OUT").expect("LOKEN_DSV41_DRAFT_OUT"),
-        );
-        let format = match std::env::var("LOKEN_DSV41_DRAFT_FORMAT").as_deref() {
-            Ok("q4_0") => GgmlDType::Q4_0,
-            Ok("q5_0") => GgmlDType::Q5_0,
-            Ok("q6k") => GgmlDType::Q6K,
-            _ => GgmlDType::Q8_0,
-        };
-        let ckpt = SafeTensorsSource::open(&dir).unwrap();
-        let layout = Layout::for_paths(&[out.as_path()]);
-        let digest = write_draft(&ckpt, &dir, &out, layout, format, &|i, n, name| {
-            if i % 64 == 0 {
-                eprintln!("{i}/{n} {name}");
-            }
-        })
-        .unwrap();
-        eprintln!("wrote {} sha256 {digest}", out.display());
-    }
 }

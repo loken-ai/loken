@@ -287,9 +287,7 @@ mod tests {
 
     /// The weights blob an Ollama manifest names, header only.
     fn ollama_gguf_header(manifest: &str) -> Option<gguf_file::Content> {
-        let store = std::env::var("OLLAMA_MODELS")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| crate::config::Config::default_ollama_models_dir());
+        let store = crate::config::Config::default_ollama_models_dir();
         let man = store
             .join("manifests/registry.ollama.ai/library")
             .join(manifest);
@@ -312,9 +310,7 @@ mod tests {
 
     /// The first snapshot of an HF hub repository that ships a `tekken.json`.
     fn hub_tekken(repo_dir: &str) -> Option<std::path::PathBuf> {
-        let root = std::env::var("HF_HUB_CACHE")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| crate::config::Config::default_hf_models_dir());
+        let root = crate::config::Config::default_hf_models_dir();
         let mut snaps: Vec<std::path::PathBuf> =
             std::fs::read_dir(root.join(repo_dir).join("snapshots"))
                 .ok()?

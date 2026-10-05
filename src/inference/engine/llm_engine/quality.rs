@@ -12,8 +12,8 @@
 //! placement or the number of cards; the dump holds the tokens it was made from and a run
 //! against it refuses a different sequence.
 //!
-//! The model run is by hand (see the `#[ignore]`d tests): the model, the texts and every
-//! directory come from the environment, and no file or model name lives here.
+//! The model run is a driver the caller writes: it loads a model as the server does, reads texts,
+//! and hands both to `score_pass`; no file or model name lives here.
 //!
 //! Held-out text rule (`select_files`): candidates are the repository's `src/**/*.rs` files for
 //! a code text and `docs/**/*.md` for a documentation text, at least `MIN_FILE_BYTES` long. A
@@ -46,9 +46,6 @@ pub const CALIBRATION_OVERLAP: f64 = 0.5;
 
 /// A line shorter than this (trimmed) says too little to count as shared.
 const SUBSTANTIAL_LINE: usize = 20;
-
-/// Characters of source read per budgeted token before the run cuts at its token budget.
-pub const CHARS_PER_TOKEN_READ: usize = 8;
 
 /// What one row of logits says: its log-sum-exp and its `TOP` best tokens.
 struct RowStat {
@@ -367,51 +364,6 @@ pub fn select_files(
         chosen.push(path.clone());
     }
     chosen
-}
-
-/// The files under `root/dir` with `extension`, as (path relative to `root`, content).
-pub fn read_candidates(root: &Path, dir: &str, extension: &str) -> Vec<(String, String)> {
-    fn walk(base: &Path, dir: &Path, extension: &str, out: &mut Vec<(String, String)>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(base, &p, extension, out);
-            } else if p.extension().is_some_and(|x| x == extension) {
-                if let (Ok(text), Ok(rel)) = (std::fs::read_to_string(&p), p.strip_prefix(base)) {
-                    out.push((rel.to_string_lossy().replace('\\', "/"), text));
-                }
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(root, &root.join(dir), extension, &mut out);
-    out.sort();
-    out
-}
-
-/// `name:tokens=file+file;...`: each text's name, its token budget and the files it is made
-/// of, read in order.
-pub fn parse_texts(spec: &str) -> Vec<(String, usize, String)> {
-    spec.split(';')
-        .filter(|t| !t.trim().is_empty())
-        .map(|t| {
-            let (head, files) = t.split_once('=').expect("name:tokens=files");
-            let (name, budget) = head.split_once(':').expect("name:tokens");
-            let text: String = files
-                .split('+')
-                .map(|f| std::fs::read_to_string(f.trim()).expect("a readable text file"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            (
-                name.to_string(),
-                budget.parse().expect("a token budget"),
-                text,
-            )
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -749,170 +701,5 @@ mod tests {
 
     fn logits_noise(len: usize) -> Vec<f32> {
         logits(1, len, 99).into_iter().map(|x| x * 0.5).collect()
-    }
-
-    /// The real-model run. Environment: `LOKEN_QUALITY_MODEL` the GGUF file,
-    /// `LOKEN_QUALITY_TEXTS` the texts (`name:tokens=file+file;...`), `LOKEN_QUALITY_OUT` a
-    /// directory to write each text's `<name>.lkq` dump and `<name>.ends` (the byte offset in the
-    /// text where each token ends, one per line) into, `LOKEN_QUALITY_REFERENCE` a
-    /// directory of such dumps to score against, `LOKEN_QUALITY_HOST` set to place nothing on
-    /// a card, `LOKEN_QUALITY_CHUNK` a chunk length instead of the one a prefill would take,
-    /// `LOKEN_QUALITY_CTX` the window to load with (default: the longest text),
-    /// `LOKEN_QUALITY_PREPEND` a token id placed before the text's tokens.
-    /// Beside each dump `<name>.cutbad` lists the token positions whose text prefix tokenises
-    /// differently from the prefix of the tokens.
-    /// `CUDA_VISIBLE_DEVICES` picks the cards, as for the server. One line per text on stderr.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "needs a real model, its texts and an idle machine"]
-    async fn score_a_model_on_held_out_texts() {
-        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let path = env("LOKEN_QUALITY_MODEL").expect("LOKEN_QUALITY_MODEL");
-        let texts = parse_texts(&env("LOKEN_QUALITY_TEXTS").expect("LOKEN_QUALITY_TEXTS"));
-        let out_dir = env("LOKEN_QUALITY_OUT").map(std::path::PathBuf::from);
-        let ref_dir = env("LOKEN_QUALITY_REFERENCE").map(std::path::PathBuf::from);
-        let widest = texts.iter().map(|t| t.1).max().unwrap_or(0);
-        let context = env("LOKEN_QUALITY_CTX")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(widest + 64);
-        let config = InferenceConfig {
-            model_id: "quality".to_string(),
-            models_dir: Some(std::path::PathBuf::from(&path)),
-            context_length: context,
-            disable_cuda: env("LOKEN_QUALITY_HOST").is_some(),
-            ..InferenceConfig::default()
-        };
-        let engine = LlmEngine::with_config(config);
-        engine
-            .load_model()
-            .await
-            .expect("the model loads as the server loads it");
-        let mut guard = engine.model_state.lock().await;
-        let state = guard.as_mut().expect("a loaded model");
-        let chunk_override: Option<usize> = env("LOKEN_QUALITY_CHUNK").and_then(|v| v.parse().ok());
-        if let Some(dir) = &out_dir {
-            std::fs::create_dir_all(dir).unwrap();
-        }
-        for (name, budget, text) in texts {
-            let encoding = state.tokenizer.encode(text.as_str(), true).unwrap();
-            let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
-            tokens.truncate(budget);
-            let ends: Vec<usize> = encoding
-                .get_offsets()
-                .iter()
-                .take(tokens.len())
-                .map(|o| o.1)
-                .collect();
-            // Positions whose text prefix does not tokenise to the prefix of the tokens: a
-            // BPE merge across the cut, which an engine fed text prefixes would see.
-            let cut_bad: Vec<usize> = (0..tokens.len())
-                .filter(|&k| {
-                    let prefix = &text.as_bytes()[..ends[k]];
-                    let prefix = String::from_utf8_lossy(prefix);
-                    state
-                        .tokenizer
-                        .encode(prefix.as_ref(), true)
-                        .map_or(true, |e| e.get_ids() != &tokens[..=k])
-                })
-                .collect();
-            // A token prepended to the sequence, to test begin-of-text handling.
-            if let Some(b) = env("LOKEN_QUALITY_PREPEND").and_then(|v| v.parse::<u32>().ok()) {
-                tokens.insert(0, b);
-            }
-            let reference = ref_dir.as_ref().map(|d| {
-                Dump::read(
-                    std::fs::File::open(d.join(format!("{name}.lkq"))).expect("a dump per text"),
-                )
-                .expect("a readable dump")
-            });
-            let first = chunk_override.unwrap_or_else(|| {
-                crate::inference::engine::model_backend::adaptive_prefill_chunk(
-                    state.model.prefill_shape(),
-                )
-            });
-            let device = state.device.clone();
-            let model = &mut state.model;
-            let started = std::time::Instant::now();
-            let cell = std::cell::RefCell::new(model);
-            let ((acc, dump), chunk) = crate::inference::place::recover::shrink_on_oom(
-                "quality",
-                first,
-                |c| (c > 2 * VERIFY_ROWS).then_some(c / 2),
-                |_| false,
-                |c| {
-                    score_pass(
-                        &mut |x, p| cell.borrow_mut().forward_all(x, p),
-                        &mut || cell.borrow_mut().reset_kv_from(0),
-                        &device,
-                        &tokens,
-                        c,
-                        reference.as_ref(),
-                    )
-                },
-            )
-            .expect("a teacher-forced pass");
-            if let Some(dir) = &out_dir {
-                let lines: Vec<String> = ends.iter().map(|e| e.to_string()).collect();
-                std::fs::write(dir.join(format!("{name}.ends")), lines.join("\n")).unwrap();
-                let bad: Vec<String> = cut_bad.iter().map(|k| k.to_string()).collect();
-                std::fs::write(dir.join(format!("{name}.cutbad")), bad.join("\n")).unwrap();
-                dump.write(std::io::BufWriter::new(
-                    std::fs::File::create(dir.join(format!("{name}.lkq"))).unwrap(),
-                ))
-                .unwrap();
-            }
-            let opt = |v: Option<f64>, w: usize| v.map_or("-".to_string(), |x| format!("{x:.w$}"));
-            eprintln!(
-                "QUALITY text={name} tokens={} chunk={chunk} nll={:.4} ppl={:.3} top1={} kl={} secs={:.0}",
-                tokens.len(),
-                acc.nll(),
-                acc.perplexity(),
-                opt(acc.top1(), 4),
-                opt(acc.kl(), 5),
-                started.elapsed().as_secs_f64()
-            );
-        }
-    }
-
-    /// Write the held-out texts: `LOKEN_QUALITY_ROOT` the repository (default: this one),
-    /// `LOKEN_QUALITY_SELECT_OUT` the directory for `code.txt` and `docs.txt`,
-    /// `LOKEN_QUALITY_CALIBRATION` a file holding the text any calibration used, and
-    /// `LOKEN_QUALITY_CODE_TOKENS` and `LOKEN_QUALITY_DOCS_TOKENS` the budgets the texts are
-    /// read for. Lists each text's files with the SHA-256 of its bytes on stderr.
-    #[test]
-    #[ignore = "writes files"]
-    fn select_the_held_out_texts() {
-        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let root =
-            env("LOKEN_QUALITY_ROOT").unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").to_string());
-        let out = std::path::PathBuf::from(
-            env("LOKEN_QUALITY_SELECT_OUT").expect("LOKEN_QUALITY_SELECT_OUT"),
-        );
-        let calibration = env("LOKEN_QUALITY_CALIBRATION")
-            .map(|f| std::fs::read_to_string(f).expect("a readable calibration text"))
-            .unwrap_or_default();
-        let budget = |k: &str| env(k).and_then(|v| v.parse::<usize>().ok()).expect(k);
-        std::fs::create_dir_all(&out).unwrap();
-        for (name, dir, ext, tokens) in [
-            ("code", "src", "rs", budget("LOKEN_QUALITY_CODE_TOKENS")),
-            ("docs", "docs", "md", budget("LOKEN_QUALITY_DOCS_TOKENS")),
-        ] {
-            let candidates = read_candidates(Path::new(&root), dir, ext);
-            let chosen = select_files(&candidates, &calibration, tokens * CHARS_PER_TOKEN_READ);
-            let text: String = chosen
-                .iter()
-                .map(|p| candidates.iter().find(|c| &c.0 == p).unwrap().1.clone())
-                .collect::<Vec<_>>()
-                .join("\n");
-            std::fs::write(out.join(format!("{name}.txt")), &text).unwrap();
-            let digest: String = Sha256::digest(text.as_bytes())
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            eprintln!(
-                "TEXT {name} sha256={digest} bytes={} files={}",
-                text.len(),
-                chosen.join(",")
-            );
-        }
     }
 }
