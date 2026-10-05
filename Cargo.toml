@@ -85,10 +85,12 @@ nvml-wrapper = "0.12"
 # cudarc backs the CUDA device, stream and NCCL layer.
 cudarc = { version = "0.19.10", package = "cudarc", optional = true, default-features = false, features = [
     "std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "f8",
-    "cuda-version-from-build-system", "dynamic-linking", "nccl",
+    "cuda-version-from-build-system", "dynamic-loading", "nccl",
 ] }
 tokenizers = "0.21"
-hf-hub = "0.4"
+# The blocking client only: it carries its own TLS stack and certificate roots, so the binary
+# links no OpenSSL and needs no system certificate store.
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 
 # Grammar-constrained decoding. Used to compile JSON schemas /
 # Lark grammars into per-token logit masks. Lazy: only used when a request
@@ -118,7 +120,8 @@ core_affinity = "0.8"
 once_cell = "1.20"
 
 # GPU compute shaders for Intel Arc / AMD support (via OpenCL)
-opencl3 = { version = "0.9", optional = true }
+# Opens the OpenCL loader at run time: a machine without one has no OpenCL device.
+opencl3 = { version = "0.12", optional = true }
 # adjacent_loop_items: chat templates decide where a run of tool messages ends by
 # comparing loop.previtem and loop.nextitem. Without it those are undefined and the
 # render fails on the turn that carries a tool result, which is every agent turn.

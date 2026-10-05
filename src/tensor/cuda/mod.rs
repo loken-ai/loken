@@ -30,6 +30,7 @@ mod captured_graph;
 pub use captured_graph::*;
 
 mod device;
+pub mod runtime;
 pub use device::*;
 mod storage;
 pub(crate) use storage::*;

@@ -415,6 +415,9 @@ fn clone_cuda_f16(t: &Tensor) -> Result<crate::tensor::cuda_ext::CudaSlice<half:
 /// streams. Create once and reuse for every layer's all-reduce.
 #[cfg(feature = "cuda")]
 pub fn make_comms(d0: &Device, d1: &Device) -> Result<Vec<cudarc::nccl::safe::Comm>> {
+    if !crate::tensor::cuda::runtime::nccl_present() {
+        return Err(anyhow::anyhow!("NCCL library not found"));
+    }
     let s0 = d0
         .as_cuda_device()
         .map_err(|e| anyhow::anyhow!("{e}"))?

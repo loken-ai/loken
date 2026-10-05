@@ -62,6 +62,9 @@ pub struct CudaGpuInfo {
 fn cuda_mem_bw_gbs(index: usize) -> f64 {
     use cudarc::driver::result as cu;
     use cudarc::driver::sys::CUdevice_attribute as A;
+    if crate::tensor::cuda::runtime::require().is_err() {
+        return 0.0;
+    }
     let _ = cu::init();
     let Ok(d) = cu::device::get(index as i32) else {
         return 0.0;
@@ -86,6 +89,12 @@ fn cuda_mem_bw_gbs(_index: usize) -> f64 {
 /// card's bus id does not resolve, the NVML index stands for the ordinal.
 pub fn visible_cards(nvml: &nvml_wrapper::Nvml) -> Vec<(usize, u32)> {
     let all = nvml.device_count().unwrap_or(0);
+    // A driver without the toolkit libraries lists cards through NVML that CUDA cannot open:
+    // the machine has no usable card.
+    #[cfg(feature = "cuda")]
+    if !crate::tensor::cuda::runtime::usable() {
+        return Vec::new();
+    }
     #[cfg(feature = "cuda")]
     {
         use cudarc::driver::sys::{cuDeviceGetPCIBusId, cudaError_enum};
@@ -148,6 +157,9 @@ pub fn debug_vram_by_card(tag: &str) {
 #[cfg(feature = "cuda")]
 fn primary_ctx_active(ordinal: usize) -> bool {
     use cudarc::driver::sys::{cuDevicePrimaryCtxGetState, cudaError_enum};
+    if crate::tensor::cuda::runtime::require().is_err() {
+        return false;
+    }
     let _ = cudarc::driver::result::init();
     let Ok(d) = cudarc::driver::result::device::get(ordinal as i32) else {
         return false;

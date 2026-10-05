@@ -99,6 +99,7 @@ pub(crate) fn nvrtc_arch_of_ordinal(ordinal: usize) -> Option<&'static str> {
     if let Some(a) = g.get(&ordinal) {
         return Some(a);
     }
+    crate::tensor::cuda::runtime::require().ok()?;
     use cudarc::driver::result as cu;
     use cudarc::driver::sys::CUdevice_attribute as A;
     let d = cu::device::get(ordinal as i32).ok()?;
@@ -120,6 +121,7 @@ pub(crate) fn nvrtc_arch_of(dev: &CudaDevice) -> Option<&'static str> {
 pub(crate) fn nvrtc_arch() -> Option<&'static str> {
     static ARCH: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
     *ARCH.get_or_init(|| {
+        crate::tensor::cuda::runtime::require().ok()?;
         use cudarc::driver::result as cu;
         use cudarc::driver::sys::CUdevice_attribute as A;
         cu::init().ok()?;

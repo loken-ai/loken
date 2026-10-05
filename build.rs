@@ -578,7 +578,13 @@ fn compile_imma_kernels() {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=loken_imma");
     println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
-    println!("cargo:rustc-link-lib=cudart");
+    // The runtime the kernel objects launch through is linked in, so the binary has no
+    // dependency on libcudart. The driver stays a run-time library: the static runtime opens
+    // libcuda with dlopen on its first call, which is what lets a machine without a card start.
+    println!("cargo:rustc-link-lib=static=cudart_static");
+    for system in ["dl", "rt", "pthread"] {
+        println!("cargo:rustc-link-lib={system}");
+    }
 }
 
 /// Compile `src` into `obj` with `flags`, unless a build of the same sources and flags already

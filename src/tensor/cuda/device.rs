@@ -216,6 +216,7 @@ impl CudaDevice {
     }
 
     pub fn new(ordinal: usize) -> Result<Arc<Self>> {
+        super::runtime::require()?;
         tracing::debug!("cuda ctx: creating a context on ordinal {ordinal}");
         let ctx =
             CudaContext::new(ordinal).map_err(|e| Error(format!("cuda context {ordinal}: {e}")))?;

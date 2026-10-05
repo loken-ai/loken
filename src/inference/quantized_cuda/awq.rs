@@ -445,6 +445,9 @@ pub fn prewarm_shape(head_dim: usize, n_q_per_kv: usize) {
     if !kv_shape_supported(head_dim, n_q_per_kv) {
         return;
     }
+    if crate::tensor::cuda::runtime::require().is_err() {
+        return;
+    }
     let cards = cudarc::driver::result::device::get_count()
         .unwrap_or(0)
         .max(0) as usize;

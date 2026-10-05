@@ -201,6 +201,7 @@ mod cuda {
     /// Page-locked host allocation (hetero pipeline staging buffers).
     /// Safety contract is the caller's (raw pointer lifecycle).
     pub fn malloc_host(bytes: usize) -> std::result::Result<*mut std::ffi::c_void, String> {
+        crate::tensor::cuda::runtime::require().map_err(|e| e.to_string())?;
         unsafe { cudarc::driver::result::malloc_host(bytes, 0).map_err(|e| format!("{e}")) }
     }
 

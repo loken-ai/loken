@@ -256,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Check CUDA availability for inference
             #[cfg(feature = "cuda")]
-            let cuda_available = true;
+            let cuda_available = loken::tensor::cuda::runtime::usable();
             #[cfg(not(feature = "cuda"))]
             let cuda_available = false;
 

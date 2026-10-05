@@ -11,6 +11,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Linux: CUDA and OpenCL load at run time; without them the server runs on the host.
 - Prefill: a request is sized from free memory, not from cached blocks.
 - Build: a CUDA kernel recompiles only when its own sources change.
 - Build: CUDA runs on the published cudarc crate, graph capture handled by loken.

@@ -1192,20 +1192,8 @@ unsafe impl Sync for OpenCLZImageBlock {}
 unsafe impl Send for OclZImageScratch {}
 unsafe impl Sync for OclZImageScratch {}
 
-/// Read an OpenCL status code as a result, naming the call that returned it.
-///
-/// The raw entry points below report failure in their return value rather than by any other
-/// means, and a code on its own says nothing about where it came from; the caller's name is
-/// what makes the message usable, so it is asked for rather than reconstructed.
-fn cl_status(call: &str, status: i32) -> Result<()> {
-    match status {
-        0 => Ok(()),
-        code => Err(anyhow::anyhow!("{call} failed: {code}")),
-    }
-}
-
 /// Copy a region from one OpenCL buffer to another (immutable references).
-/// Uses raw OpenCL API to avoid Rust mutability requirements.
+/// Goes through the loader entry points to avoid Rust mutability requirements.
 unsafe fn copy_buffer_region(
     queue: &opencl3::command_queue::CommandQueue,
     src: &Buffer<u8>,
@@ -1214,21 +1202,7 @@ unsafe fn copy_buffer_region(
     dst_offset: usize,
     size: usize,
 ) -> Result<()> {
-    use opencl3::types::*;
-    extern "C" {
-        fn clEnqueueCopyBuffer(
-            command_queue: cl_command_queue,
-            src_buffer: cl_mem,
-            dst_buffer: cl_mem,
-            src_offset: usize,
-            dst_offset: usize,
-            cb: usize,
-            num_events_in_wait_list: cl_uint,
-            event_wait_list: *const cl_event,
-            event: *mut cl_event,
-        ) -> cl_int;
-    }
-    let ret = clEnqueueCopyBuffer(
+    let event = opencl3::command_queue::enqueue_copy_buffer(
         queue.get(),
         src.get(),
         dst.get(),
@@ -1237,9 +1211,9 @@ unsafe fn copy_buffer_region(
         size,
         0,
         std::ptr::null(),
-        std::ptr::null_mut(),
-    );
-    cl_status("clEnqueueCopyBuffer", ret)
+    )
+    .map_err(|code| anyhow::anyhow!("clEnqueueCopyBuffer failed: {code}"))?;
+    release_event(event)
 }
 
 /// Write data to an OpenCL buffer (immutable reference).
@@ -1248,32 +1222,25 @@ unsafe fn write_buffer_raw(
     dst: &Buffer<u8>,
     data: &[u8],
 ) -> Result<()> {
-    use opencl3::types::*;
-    extern "C" {
-        fn clEnqueueWriteBuffer(
-            command_queue: cl_command_queue,
-            buffer: cl_mem,
-            blocking_write: cl_bool,
-            offset: usize,
-            cb: usize,
-            ptr: *const std::ffi::c_void,
-            num_events_in_wait_list: cl_uint,
-            event_wait_list: *const cl_event,
-            event: *mut cl_event,
-        ) -> cl_int;
-    }
-    let ret = clEnqueueWriteBuffer(
+    // Blocking: the host bytes are consumed when the call returns.
+    let event = opencl3::command_queue::enqueue_write_buffer(
         queue.get(),
         dst.get(),
-        1, // CL_BLOCKING
+        opencl3::types::CL_BLOCKING,
         0,
         data.len(),
         data.as_ptr() as *const std::ffi::c_void,
         0,
         std::ptr::null(),
-        std::ptr::null_mut(),
-    );
-    cl_status("clEnqueueWriteBuffer", ret)
+    )
+    .map_err(|code| anyhow::anyhow!("clEnqueueWriteBuffer failed: {code}"))?;
+    release_event(event)
+}
+
+/// Drop the handle of an event nobody waits on.
+unsafe fn release_event(event: opencl3::types::cl_event) -> Result<()> {
+    opencl3::event::release_event(event)
+        .map_err(|code| anyhow::anyhow!("clReleaseEvent failed: {code}"))
 }
 
 /// Public wrapper for write_buffer_raw for cross-module use.
