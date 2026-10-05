@@ -47,8 +47,18 @@ beside attention. Reasoning models return their thinking apart from the answer o
 surface; gpt-oss speaks Harmony and is read as such.
 
 Vision: `moondream`, `pixtral`, the Qwen vision lines (`qwen25` vision, `qwen3vl`). Images travel
-base64 in the request on all three surfaces. Speech in: `voxtral`, `ultravox` take audio in a
-chat turn.
+base64 in the request on all three surfaces.
+
+Speech in: `voxtral` and `ultravox` take audio in a chat turn. The text model is a Llama-line
+GGUF, the speech tower the `mmproj*.gguf` beside it (`clip.projector_type` names the family), and
+a model whose files carry one lists `audio` among its capabilities. The tower is placed after the
+text model, on a card the text model does not use when there is one. A clip arrives base64 as an
+`input_audio` part of `/v1/chat/completions` or in `audios` of an `/api/chat` message, in any
+container the server decodes, and is mixed down and resampled to the tower's rate. Its embeddings
+take the place of one marker in the prompt, so the clip counts against the context window. A
+request carrying a clip is not served from the prompt cache and takes no grammar. An Ultravox
+checkpoint directory is read by the tower loader too, but serving it needs the language model as a
+GGUF beside it.
 
 Embeddings and reranking: BERT-shaped encoders (`nomic`, `bge` and the like) answer
 `/v1/embeddings` and `/api/embed`; a Qwen3-Reranker checkpoint answers `/v1/rerank`.

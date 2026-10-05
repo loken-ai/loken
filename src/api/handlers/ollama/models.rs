@@ -109,7 +109,12 @@ pub(crate) async fn ollama_list_models(
                         ModelSource::Ollama => Some(pools),
                         _ => arch.as_ref().map(|_| pools),
                     };
-                    let capabilities = capabilities_of(media.as_ref(), text);
+                    let mut capabilities = capabilities_of(media.as_ref(), text);
+                    if capabilities.iter().any(|c| c == "completion")
+                        && state.model_has_audio(&m.id)
+                    {
+                        capabilities.push("audio".to_string());
+                    }
                     let family = reported_family(media.as_ref(), arch, || None);
                     let details = OllamaModelDetails {
                         format: format_str.to_string(),
@@ -912,6 +917,9 @@ pub(crate) async fn ollama_show_model(
             let mut caps = capabilities_of(None, Some(pools.unwrap_or(false)));
             if caps.iter().any(|c| c == "completion") && state.model_has_vision(&model_name) {
                 caps.push("vision".to_string());
+            }
+            if caps.iter().any(|c| c == "completion") && state.model_has_audio(&model_name) {
+                caps.push("audio".to_string());
             }
             // The chat template the server wraps user and assistant messages in, so SDK
             // clients can format prompts the way /api/chat does: the declared template,

@@ -271,3 +271,37 @@ fn optional_thinking_normalises_bool_and_strings() {
     // Other types ignored - no 422.
     assert_eq!(parse_tk(r#"{"thinking":42}"#), None);
 }
+
+// ---------- content parts ----------
+
+#[test]
+fn an_input_audio_part_becomes_a_clip_of_the_message() {
+    let m: Message = serde_json::from_str(
+        r#"{"role":"user","content":[
+            {"type":"text","text":"what is said?"},
+            {"type":"input_audio","input_audio":{"data":"UklGRg==","format":"wav"}}
+        ]}"#,
+    )
+    .unwrap();
+    assert_eq!(m.content, "what is said?");
+    assert_eq!(m.audios.as_deref(), Some(&["UklGRg==".to_string()][..]));
+    assert!(m.images.is_none());
+}
+
+#[test]
+fn an_input_audio_part_without_data_is_refused() {
+    let e = serde_json::from_str::<Message>(
+        r#"{"role":"user","content":[{"type":"input_audio","input_audio":{"format":"wav"}}]}"#,
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("input_audio.data"), "{e}");
+}
+
+#[test]
+fn a_data_url_clip_is_read_as_its_payload() {
+    let m: Message = serde_json::from_str(
+        r#"{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"data:audio/wav;base64,UklGRg=="}}]}"#,
+    )
+    .unwrap();
+    assert_eq!(m.audios.as_deref(), Some(&["UklGRg==".to_string()][..]));
+}

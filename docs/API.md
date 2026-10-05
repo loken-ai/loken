@@ -23,7 +23,7 @@ Every route but `/health` demands a key when `[server] require_auth` is on, as
 | `HEAD /api/blobs/{digest}`, `POST /api/blobs/{digest}` | Check for and upload a blob. |
 | `POST /api/copy` | Copy a manifest under a new name, blobs shared. |
 | `DELETE /api/delete` | Remove a manifest and every blob no manifest names. |
-| `POST /api/chat` | Chat. Takes `tools`, `tool_choice`, `think`, `format`, `logprobs`, `top_logprobs`, images. Returns `thinking` apart from `content`, `done_reason`, and the engine's timings. |
+| `POST /api/chat` | Chat. Takes `tools`, `tool_choice`, `think`, `format`, `logprobs`, `top_logprobs`, images, and `audios` (base64 clips) on a user message for a model with the `audio` capability. Returns `thinking` apart from `content`, `done_reason`, and the engine's timings. |
 | `POST /api/generate` | Completion. Renders `system` and `template`, takes `suffix`, returns `context`. |
 | `POST /api/embed` | Embeddings. Honours `dimensions` and `truncate`. |
 | `POST /api/embeddings` | The legacy one-prompt shape. |
@@ -34,7 +34,7 @@ Every route but `/health` demands a key when `[server] require_auth` is on, as
 
 | Route | What it does |
 |---|---|
-| `POST /v1/chat/completions` | Chat. Takes content parts and images, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `reasoning_effort`, `n`, `logprobs`, `logit_bias`, `max_completion_tokens`. Returns `reasoning_content` apart from `content`, `finish_reason`, and reasoning tokens in `usage`. |
+| `POST /v1/chat/completions` | Chat. Takes content parts, images and `input_audio` parts (`{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`, any container the server decodes) for a model with the `audio` capability, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `reasoning_effort`, `n`, `logprobs`, `logit_bias`, `max_completion_tokens`. Returns `reasoning_content` apart from `content`, `finish_reason`, and reasoning tokens in `usage`. |
 | `POST /v1/completions` | Text completion, with `suffix` as fill-in-the-middle, `echo`, and an array of prompts. |
 | `POST /v1/responses` | The Responses API, lowered to a chat completion and lifted back into output items. `GET` and `DELETE /v1/responses/{id}` read and drop a stored response; `previous_response_id` continues one. |
 | `POST /v1/embeddings` | Embeddings, loading the model on demand. |

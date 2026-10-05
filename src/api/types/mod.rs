@@ -786,10 +786,11 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(length(max = 16))]
     pub images: Option<Vec<String>>,
-    /// Audio payloads (base64-encoded WAV) returned for TTS pipeline
-    /// responses so the chat tab can render a playback control inline.
-    /// Same cap shape as images for symmetry; in practice always
-    /// length-1 since TTS produces a single utterance per request.
+    /// Audio payloads, base64. On a user message: the clips a speech model is asked about
+    /// (the first of the last such message is read; the container is sniffed from the
+    /// bytes). On a response: the WAV a TTS pipeline returned, so the chat tab can render
+    /// a playback control inline; always length-1 since TTS produces a single utterance
+    /// per request. Same cap shape as images for symmetry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(length(max = 16))]
     pub audios: Option<Vec<String>>,
@@ -811,10 +812,10 @@ pub struct Message {
 }
 
 /// A message as OpenAI clients send it: `content` is a string, null, or an array of
-/// parts (`text`, `image_url`). Parts are folded into `Message`: the texts joined, the
-/// images carried as base64. What is not carried is refused rather than dropped, so a
-/// client learns at once that a remote image or an audio part reached a server that
-/// does not take them.
+/// parts (`text`, `image_url`, `input_audio`). Parts are folded into `Message`: the texts
+/// joined, the images and the audio carried as base64. What is not carried is refused rather
+/// than dropped, so a client learns at once that a remote image reached a server that does
+/// not fetch them.
 #[derive(Deserialize)]
 struct MessageWire {
     role: String,
@@ -836,17 +837,38 @@ struct MessageWire {
     name: Option<String>,
 }
 
-/// Text and base64 images of a `content` value.
-fn fold_content_parts(v: Option<serde_json::Value>) -> Result<(String, Vec<String>), String> {
+/// What the parts of a `content` value carry: the texts joined, the base64 images and the
+/// base64 audio clips.
+struct FoldedContent {
+    text: String,
+    images: Vec<String>,
+    audios: Vec<String>,
+}
+
+/// Text, base64 images and base64 audio of a `content` value.
+fn fold_content_parts(v: Option<serde_json::Value>) -> Result<FoldedContent, String> {
     use serde_json::Value;
     let parts = match v {
-        None | Some(Value::Null) => return Ok((String::new(), Vec::new())),
-        Some(Value::String(s)) => return Ok((s, Vec::new())),
+        None | Some(Value::Null) => {
+            return Ok(FoldedContent {
+                text: String::new(),
+                images: Vec::new(),
+                audios: Vec::new(),
+            })
+        }
+        Some(Value::String(s)) => {
+            return Ok(FoldedContent {
+                text: s,
+                images: Vec::new(),
+                audios: Vec::new(),
+            })
+        }
         Some(Value::Array(parts)) => parts,
         Some(_) => return Err("`content` must be a string or an array of parts".to_string()),
     };
     let mut text = String::new();
     let mut images = Vec::new();
+    let mut audios = Vec::new();
     for part in parts {
         let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
@@ -874,10 +896,24 @@ fn fold_content_parts(v: Option<serde_json::Value>) -> Result<(String, Vec<Strin
                 };
                 images.push(b64.to_string());
             }
+            "input_audio" => {
+                // `{"input_audio": {"data": <base64>, "format": "wav"}}`. The container is
+                // read from the bytes; `format` is a hint and is not relied on.
+                let data = part
+                    .get("input_audio")
+                    .and_then(|a| a.get("data"))
+                    .and_then(Value::as_str)
+                    .ok_or("an `input_audio` part needs `input_audio.data`, a base64 string")?;
+                audios.push(base64_payload(data).to_string());
+            }
             other => return Err(format!("unsupported content part type '{other}'")),
         }
     }
-    Ok((text, images))
+    Ok(FoldedContent {
+        text,
+        images,
+        audios,
+    })
 }
 
 /// The base64 payload of a `data:<type>;base64,<payload>` URL.
@@ -896,9 +932,16 @@ pub(crate) fn base64_payload(s: &str) -> &str {
 impl TryFrom<MessageWire> for Message {
     type Error = String;
     fn try_from(w: MessageWire) -> Result<Self, String> {
-        let (content, mut images) = fold_content_parts(w.content)?;
+        let FoldedContent {
+            text: content,
+            mut images,
+            mut audios,
+        } = fold_content_parts(w.content)?;
         if let Some(more) = w.images {
             images.extend(more);
+        }
+        if let Some(more) = w.audios {
+            audios.extend(more);
         }
         Ok(Self {
             role: w.role,
@@ -906,7 +949,7 @@ impl TryFrom<MessageWire> for Message {
             thinking: w.thinking,
             reasoning_content: w.reasoning_content,
             images: (!images.is_empty()).then_some(images),
-            audios: w.audios,
+            audios: (!audios.is_empty()).then_some(audios),
             tool_calls: w.tool_calls,
             tool_call_id: w.tool_call_id,
             name: w.name,

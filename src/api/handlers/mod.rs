@@ -2065,6 +2065,16 @@ impl APIServer {
             .is_some_and(|p| files_carry_vision(&p))
     }
 
+    /// True when the model takes audio input: its files carry a speech tower this build
+    /// reads. Read from the files without loading the model, as the vision probe is.
+    pub(crate) fn model_has_audio(&self, model_id: &str) -> bool {
+        let hf = crate::inference::load::huggingface_manager::HuggingFaceManager::new(
+            PathBuf::from(&self.huggingface_models_dir),
+        );
+        hf.get_model_path(model_id)
+            .is_some_and(|p| files_carry_audio(&p))
+    }
+
     /// Create an InferenceConfig for a model, resolving the correct models_dir.
     /// Checks HuggingFace dir first (for flat GGUF downloads), then Ollama dir.
     /// Run this node as one segment of a cross-node pipeline for `model_id`, serving layers
@@ -2687,6 +2697,50 @@ fn files_carry_vision(path: &std::path::Path) -> bool {
                 .unwrap_or_default();
             p != path && name.starts_with("mmproj") && name.ends_with(".gguf")
         })
+}
+
+/// Whether a HuggingFace model's files carry a speech tower: a `mmproj*.gguf` beside its
+/// GGUF file whose header declares an audio encoder, or a checkpoint directory whose
+/// configuration declares an `audio_config`.
+#[cfg(feature = "audio")]
+fn files_carry_audio(path: &std::path::Path) -> bool {
+    use crate::inference::model::audio_in::{checkpoint_has_tower, mmproj_has_tower};
+    // The mmproj files of `dir` and of the directories below it: a repository keeps each
+    // quantisation in a directory of its own.
+    fn projector_with_tower(
+        dir: &std::path::Path,
+        skip: Option<&std::path::Path>,
+        depth: usize,
+    ) -> bool {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .any(|p| {
+                if p.is_dir() {
+                    return depth > 0 && projector_with_tower(&p, skip, depth - 1);
+                }
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                Some(p.as_path()) != skip
+                    && name.starts_with("mmproj")
+                    && name.ends_with(".gguf")
+                    && mmproj_has_tower(&p)
+            })
+    }
+    if path.is_dir() {
+        return checkpoint_has_tower(path) || projector_with_tower(path, None, 2);
+    }
+    path.parent()
+        .is_some_and(|dir| projector_with_tower(dir, Some(path), 0))
+}
+
+#[cfg(not(feature = "audio"))]
+fn files_carry_audio(_path: &std::path::Path) -> bool {
+    false
 }
 
 /// Why `model_name` cannot serve a chat or generation request, when its files say it is

@@ -147,6 +147,77 @@ impl APIServer {
             _active: active,
         })
     }
+
+    /// Hand the loaded model the clip of a chat request: `clip`, base64 in any container the
+    /// server reads, decoded to mono at the tower's rate and encoded. Called after
+    /// [`Self::admit`], which holds the gate and cleared what an earlier request held. A
+    /// request without a clip does nothing; a clip for a model with no speech tower, a clip
+    /// that does not decode or one longer than the context window holds is refused.
+    #[cfg(feature = "audio")]
+    pub(crate) async fn admit_audio(
+        &self,
+        engine: &LlmEngine,
+        clip: Option<&str>,
+    ) -> Result<(), ApiError> {
+        use base64::Engine as _;
+        let Some(clip) = clip else {
+            return Ok(());
+        };
+        let input = engine.audio_input().await.ok_or_else(|| {
+            ApiError::Validation(
+                "this model takes no audio: its files carry no speech tower".into(),
+            )
+        })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(crate::api::types::base64_payload(clip).trim())
+            .map_err(|e| ApiError::Validation(format!("audio: not base64 ({e})")))?;
+        let rate = u32::try_from(input.sample_rate).map_err(|_| {
+            ApiError::Internal("the speech tower's sample rate is out of range".into())
+        })?;
+        let pcm = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<f32>> {
+            let (planar, channels, source_rate) = super::audio::decode_audio_planar(&bytes)?;
+            let frames = planar.len() / channels;
+            // Mono: the mean of the channels.
+            let mono: Vec<f32> = (0..frames)
+                .map(|i| {
+                    (0..channels).map(|c| planar[c * frames + i]).sum::<f32>() / channels as f32
+                })
+                .collect();
+            crate::inference::media::audio_io::resample(&mono, source_rate, rate)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("audio decode task: {e}")))?
+        .map_err(|e| ApiError::Validation(format!("audio: {e}")))?;
+        let embeds = engine.audio_embeds_for(pcm.len()).await;
+        if let Some(window) = engine.context_window().await {
+            if embeds >= window {
+                return Err(ApiError::Validation(format!(
+                    "the clip needs {embeds} positions and the context window holds {window}; \
+                     send a shorter clip or raise num_ctx"
+                )));
+            }
+        }
+        let failure = engine.set_audio(pcm).await.err().map(|e| e.to_string());
+        if let Some(e) = failure {
+            engine.clear_images().await;
+            return Err(ApiError::Validation(format!("audio: {e}")));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "audio"))]
+    pub(crate) async fn admit_audio(
+        &self,
+        _engine: &LlmEngine,
+        clip: Option<&str>,
+    ) -> Result<(), ApiError> {
+        match clip {
+            None => Ok(()),
+            Some(_) => Err(ApiError::Validation(
+                "this build takes no audio input (built without the `audio` feature)".into(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

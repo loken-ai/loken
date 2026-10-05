@@ -202,6 +202,37 @@ fn with_vision_sentinel(messages: &[Message]) -> Vec<Message> {
     msgs
 }
 
+/// The messages with `sentinel` put in front of the last user turn that carries audio, the
+/// only turn whose clip reaches the speech tower.
+fn with_audio_sentinel(messages: &[Message], sentinel: &str) -> Vec<Message> {
+    let mut msgs = messages.to_vec();
+    if let Some(um) = msgs
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == "user" && m.audios.as_ref().is_some_and(|a| !a.is_empty()))
+    {
+        um.content = format!("{sentinel}{}", um.content);
+    }
+    msgs
+}
+
+/// Whether any user turn carries audio.
+pub(crate) fn carries_audio(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .any(|m| m.role == "user" && m.audios.as_ref().is_some_and(|a| !a.is_empty()))
+}
+
+/// The clip the speech tower reads: the first clip of the last user turn that carries one.
+pub(crate) fn last_user_audio(messages: &[Message]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == "user")
+        .find_map(|m| m.audios.as_ref()?.first())
+        .map(String::as_str)
+}
+
 /// Whether any user turn carries an image.
 pub(crate) fn carries_images(messages: &[Message]) -> bool {
     messages
@@ -228,16 +259,21 @@ pub(crate) fn build_prompt(
     template: Option<&str>,
     vocabulary: &str,
     vision_sentinel: bool,
+    audio_sentinel: Option<&str>,
 ) -> PreparedPrompt {
     let tools_active = crate::api::tool_calls::should_inject_tools(spec.tools, spec.tool_choice);
     let tool_format = crate::api::tool_calls::detect_tool_format(template, vocabulary);
-    let owned;
-    let messages: &[Message] = if vision_sentinel && carries_images(spec.messages) {
-        owned = with_vision_sentinel(spec.messages);
-        &owned
-    } else {
-        spec.messages
-    };
+    let mut owned: Option<Vec<Message>> = None;
+    if vision_sentinel && carries_images(spec.messages) {
+        owned = Some(with_vision_sentinel(spec.messages));
+    }
+    if let Some(sentinel) = audio_sentinel.filter(|_| carries_audio(spec.messages)) {
+        owned = Some(with_audio_sentinel(
+            owned.as_deref().unwrap_or(spec.messages),
+            sentinel,
+        ));
+    }
+    let messages: &[Message] = owned.as_deref().unwrap_or(spec.messages);
     let thinking_off = spec.thinking == Some("disabled");
     let mut prompt = match spec.tools.filter(|_| tools_active) {
         Some(tools) if template_takes_tools(template) => {
@@ -323,7 +359,22 @@ impl APIServer {
             Some(e) if carries_images(spec.messages) => e.is_qwen35_vision().await,
             _ => false,
         };
-        build_prompt(spec, template.as_deref(), &format.vocabulary, vision)
+        // What opens a clip and marks where its embeddings go, as the loaded model's tower
+        // declares it.
+        let audio = match engine {
+            Some(e) if carries_audio(spec.messages) => e
+                .audio_input()
+                .await
+                .map(|a| format!("{}{}", a.begin, a.placeholder)),
+            _ => None,
+        };
+        build_prompt(
+            spec,
+            template.as_deref(),
+            &format.vocabulary,
+            vision,
+            audio.as_deref(),
+        )
     }
 }
 
@@ -375,6 +426,7 @@ mod tests {
                 Some(CHATML),
                 "",
                 false,
+                None,
             );
             let g = p.grammar.expect("a required call must set a grammar");
             assert!(g.contains("get_weather") && g.contains("get_time"), "{g}");
@@ -388,6 +440,7 @@ mod tests {
                 Some(CHATML),
                 "",
                 false,
+                None,
             );
             let g = p.grammar.expect("a named call must set a grammar");
             assert!(g.contains("get_time") && !g.contains("get_weather"), "{g}");
@@ -398,8 +451,30 @@ mod tests {
             Some(CHATML),
             "",
             false,
+            None,
         );
         assert!(p.grammar.is_none());
+    }
+
+    /// The audio sentinel goes in front of the last user turn with a clip, and only when
+    /// the model's tower declares one.
+    #[test]
+    fn the_audio_sentinel_leads_the_last_turn_with_a_clip() {
+        let mut clip = user("what is said?", None);
+        clip.audios = Some(vec!["AAAA".to_string()]);
+        let msgs = [user("hello", None), clip];
+        let p = build_prompt(
+            &spec(&msgs, None, None),
+            Some(CHATML),
+            "",
+            false,
+            Some("<a><b>"),
+        );
+        assert_eq!(p.prompt.matches("<a><b>").count(), 1);
+        assert!(p.prompt.contains("<a><b>what is said?"));
+        let p = build_prompt(&spec(&msgs, None, None), Some(CHATML), "", false, None);
+        assert!(!p.prompt.contains("<a><b>"));
+        assert_eq!(last_user_audio(&msgs), Some("AAAA"));
     }
 
     /// `none` switches tools off in both dialects, and a structured output wins over a
@@ -417,6 +492,7 @@ mod tests {
                 Some(CHATML),
                 "",
                 false,
+                None,
             );
             assert!(!p.tools_active);
             assert!(p.grammar.is_none());
@@ -424,7 +500,7 @@ mod tests {
         let required = serde_json::json!("required");
         let mut s = spec(&msgs, Some(&tools), Some(&required));
         s.output_grammar = Some("json_object".to_string());
-        let p = build_prompt(&s, Some(CHATML), "", false);
+        let p = build_prompt(&s, Some(CHATML), "", false, None);
         assert_eq!(p.grammar.as_deref(), Some("json_object"));
     }
 
@@ -435,10 +511,10 @@ mod tests {
             user("first", Some(vec!["a".to_string()])),
             user("second", Some(vec!["b".to_string()])),
         ];
-        let p = build_prompt(&spec(&msgs, None, None), Some(CHATML), "", true);
+        let p = build_prompt(&spec(&msgs, None, None), Some(CHATML), "", true, None);
         assert_eq!(p.prompt.matches(QWEN35_IMAGE_SENTINEL).count(), 1);
         assert!(p.prompt.contains(&format!("{QWEN35_IMAGE_SENTINEL}second")));
-        let p = build_prompt(&spec(&msgs, None, None), Some(CHATML), "", false);
+        let p = build_prompt(&spec(&msgs, None, None), Some(CHATML), "", false, None);
         assert!(!p.prompt.contains(QWEN35_IMAGE_SENTINEL));
     }
 
@@ -450,13 +526,13 @@ mod tests {
         let mut s = spec(&msgs, None, None);
         s.thinking = Some("disabled");
         let thinking = format!("{{# enable_thinking #}}{CHATML}");
-        let p = build_prompt(&s, Some(&thinking), "", false);
+        let p = build_prompt(&s, Some(&thinking), "", false, None);
         assert!(
             p.prompt.ends_with("<think>\n\n</think>\n\n"),
             "{}",
             p.prompt
         );
-        let p = build_prompt(&s, Some(CHATML), "", false);
+        let p = build_prompt(&s, Some(CHATML), "", false, None);
         assert!(
             p.prompt.ends_with("<|im_start|>assistant\n"),
             "{}",
@@ -498,6 +574,7 @@ mod tests {
             Some(&template),
             "",
             false,
+            None,
         );
         assert!(p.prompt.contains("[INST]hi[/INST]"), "{}", p.prompt);
     }

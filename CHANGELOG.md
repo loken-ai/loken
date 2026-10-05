@@ -13,6 +13,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - API: files, batches, message batches, and moderations.
 - Ollama: legacy embeddings, copy, delete, create, tags and show.
 - Multimodal: image input, image results by URL, and MP3 speech output.
+- Multimodal: audio input to a chat turn, for models with a speech tower beside the text GGUF.
 - Reasoning: returned apart from the answer, with per-token log-probs.
 - Tools: parsing for gpt-oss Harmony, DeepSeek, qwen3-coder XML, and templates.
 - OpenAI: headers for the context window, KV format, and background priority.
