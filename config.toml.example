@@ -27,11 +27,15 @@ model_id = "qwen3:0.6b"
 # kv_disk_dir = "/var/lib/loken/kv"
 # kv_disk_budget_gb = 0             # 0 = no limit
 
-# DeepSeek V4.1 only: keep the decode state of finished prompts and turns on disk, so a prompt that
-# begins with one seen before skips prefilling it. Off unless the directory is set. The files hold
-# state derived from prompts (KV tensors, no text).
+# DeepSeek V4.1 and models with recurrent layers: keep the decode state of finished prompts and
+# turns on disk, so a prompt that begins with one seen before skips prefilling it. Off unless the
+# directory is set. The files hold state derived from prompts (KV tensors, no text).
 # state_cache_dir = "/var/lib/loken/state"
-# state_cache_budget_gb = 0         # 0 = no limit
+# state_cache_budget_gb = 0         # 0 = derived from the directory's free space
+
+# Models whose routed experts stream from disk: both default to 0, which keeps every output exact.
+# expert_deferral = 0               # share of a token's host experts that may finish a layer late
+# quality_budget = 0                # largest mean KL (nats) the engine may give up for speed
 
 # Files, moderation and the URLs handed out.
 # files_dir = "/var/lib/loken/files"   # uploads and batch outputs, default: files/ beside the model store
