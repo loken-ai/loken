@@ -279,6 +279,7 @@ PY
     local m mod fmt engines amod vserve err ctx st out tag mctxs mstreams
     while IFS=$'\t' read -r m mod fmt; do
         [ -n "$m" ] || continue
+        if [ -n "${BENCH_ONLY:-}" ] && ! [[ " $BENCH_ONLY " == *" $m "* ]]; then continue; fi
         IFS='|' read -r engines amod vserve err < <(plan_cell "$m" "$mod" "$fmt")
         tag=$(echo "$m" | tr ':/' '__')
         # A model loken lists but the campaign cannot measure is an ERROR cell, visible in the
