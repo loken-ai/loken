@@ -140,8 +140,7 @@ engine measures the rest.
 At load the engine runs a bundled text teacher-forced on the card path and on the host path to
 measure the noise, then once under each candidate way of giving up experts, and applies the
 candidate that saves the most disk reads within the level's budget. With no card and host to
-compare, `balanced` and `fast` run exact and say why in the log. The old key `quality_budget` is no
-longer read.
+compare, `balanced` and `fast` run exact and say why in the log.
 
 The candidates derive from `K`, the number of experts a token routes to: keep the `K-1` or `K-2`
 heaviest, or replace a light expert that sits in no card tier when its weight share is under

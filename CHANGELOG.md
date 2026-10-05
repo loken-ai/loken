@@ -31,8 +31,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
   routing on the cards, a layer's experts staged on a copy stream.
 - Cache: decode states stored on disk by prefix for the large mixture and for transformers
   with recurrent layers; block size, spacing, budget and restore-or-prefill derived.
-- Quality: `quality_budget` picks lossy expert routing from a stated divergence; `expert_deferral`
-  lets a share of host experts finish a layer late. Both default to exact.
+- Quality: a `quality` policy (exact, balanced, fast) picks lossy expert routing within the model's
+  own numerical noise; the default is exact.
 - Quality: a teacher-forced harness scores a setting against the exact run.
 - DeepSeek: V4.1 Flash served from its own GGUF, experts streamed from disk.
 - Tools: DeepSeek DSML calls, and a generic tool-calls block fallback.
@@ -46,7 +46,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
   buffers, a cache plan for a file with no room to prefill.
 - CLI: `loken pull owner/repo:SELECTOR` fetches one quantisation of a GGUF repository.
 - Tests: a gate requires every conversion of a stored weight to state its reason.
-- CLI: `loken pull --stall-factor`, the multiple of the longest frame gap that stops a pull.
+- CLI: a pull stops when no progress frame arrives for eight times the longest frame gap.
 - Cluster: routing for every surface, handing a model or render to a peer.
 - Cluster: the model listing shows a loading model and per-layer placement.
 - Cluster: a peers endpoint, and a scrape endpoint behind a feature.

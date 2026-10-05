@@ -101,27 +101,6 @@ pub struct InferenceConfigToml {
     pub obsolete: std::collections::BTreeMap<String, toml::Value>,
 }
 
-/// What to tell an operator whose configuration names a key this version no longer reads.
-pub fn obsolete_note(key: &str) -> String {
-    match key {
-        "state_cache_block_tokens" => {
-            "the block size of the state cache is derived from the model's state size and the \
-             directory's write cost"
-                .to_string()
-        }
-        "state_cache_salt" => "a stored state is identified by the model's files and the plan; \
-             a salt adds nothing"
-            .to_string(),
-        "quality_budget" => "set `quality` to exact, balanced or fast; the engine derives the \
-             divergence it accepts from the model's own numerical noise"
-            .to_string(),
-        "expert_deferral" => "a share of host experts finishing a layer late changes the output \
-             and could not be measured at load; the mechanism stays off"
-            .to_string(),
-        _ => "loken decides it from the model and the machine".to_string(),
-    }
-}
-
 /// Energy-reporting configuration (`[energy]` section). All optional with sane
 /// defaults so existing config.toml files keep working unchanged.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
@@ -415,39 +394,6 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(obsolete, ["force_gpu_layers", "temperature"]);
-    }
-
-    #[test]
-    fn a_file_naming_a_derived_key_loads_and_reports_it() {
-        let toml_str = r#"
-            [inference]
-            model_id = "test-model"
-            state_cache_block_tokens = 256
-            state_cache_salt = "mine"
-            expert_deferral = 0.25
-            quality_budget = 0.05
-        "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        let keys: Vec<&str> = config
-            .inference
-            .obsolete
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            keys,
-            [
-                "expert_deferral",
-                "quality_budget",
-                "state_cache_block_tokens",
-                "state_cache_salt"
-            ]
-        );
-        for key in keys {
-            assert!(!obsolete_note(key).is_empty());
-        }
-        assert!(obsolete_note("state_cache_block_tokens").contains("derived"));
-        assert!(obsolete_note("quality_budget").contains("quality"));
     }
 
     #[test]

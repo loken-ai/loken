@@ -173,8 +173,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loken::inference::engine::llm_engine::configure_thread_pool();
             for key in config.inference.obsolete.keys() {
                 warn!(
-                    "config.toml [inference] `{key}` is no longer read: {}",
-                    loken::config::obsolete_note(key)
+                    "config.toml [inference] `{key}` is no longer read: loken decides it from \
+                     the model and the machine"
                 );
             }
 
