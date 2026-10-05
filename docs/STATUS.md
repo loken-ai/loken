@@ -139,6 +139,57 @@ held against the reference implementation at rounding level on toy towers
 (`tests/vectors/audio_in/`). No real-checkpoint transcript or timing is committed, and the
 Ultravox language model must be supplied as a GGUF beside the tower.
 
+## The qwen4exp family
+
+Three files of the architecture load through the generic route on the two-card machine: a
+160-expert Q4_K_M (28.4 GB), a 256-expert IQ1_M in two parts (58.4 GB) and a 512-expert
+UD-Q4_K_XL in four (111 GB). Speed is in the rows of [`BENCHMARKS.md`](BENCHMARKS.md); none is
+quoted here.
+
+| What | State |
+|---|---|
+| Card against host numerics | The 160-expert file's host path reproduces the reference tokens on three of four raw prompts; the card paths agree with the host to a cosine of 0.9997 per layer |
+| Low-bit expert formats | Run on the card in decode and prefill, judged against the host decoder |
+| Expert cache | Hot experts held on each layer's card, the rest computed on the host beside it; a wide batch streams a layer's experts through two buffers when that costs less than its rows |
+| Decode graph | Captured for files without an n-gram table or indexed attention. The others, and every file under the cache plan, decode eagerly |
+| 160 experts, one card | Measured on 3.2k and 12.9k token prompts |
+| 160 experts, two cards | Measured on a 4.5k token prompt |
+| 256 experts, one card | Answers a 72-token prompt coherently; 3.2k tokens prefill, the first request then ends after one token and a second fails out of memory |
+| 256 experts, two cards | Measured on a 72-token prompt before the cache plan; the 3.2k-token prompt fails as on one card |
+| 512 experts | Loads. Not measured on either envelope |
+
+Quality, as the mean negative log-likelihood per token of held-out texts from this repository
+(code, 1500 tokens; docs, 2200 tokens), chunk 512, two cards, scored by the quality harness:
+
+| File | Code | Docs |
+|---|---:|---:|
+| 160 experts, Q4_K_M | 2.18 | 3.37 |
+| 256 experts, IQ1_M | 1.23 | 1.81 |
+| 512 experts, UD-Q4_K_XL | 1.03 | 1.76 |
+
+For the 160-expert file the placements differ by at most 0.01 nat: host only 2.176 and 3.359,
+two cards 2.181 and 3.370. Host against cards, top-1 agreement is 0.94 and 0.92 at a mean KL of
+0.017 and 0.021. One run per cell.
+
+Limits:
+
+- **Out of memory in prefill.** The 256-expert file on a 3.2k token prompt fails with a card
+  reported nearly full (27 to 59 MB free) while the chunk accounting counted several GB free.
+  The engine halves the chunk and the request ends with one token or an error. The cause is not
+  found; a 2.7k token prompt completes.
+- **Prefill is compute-bound** in the delta-rule projections, convolution, scan and the wide
+  mixers. The expert copy is hidden behind it.
+- **The first 128 decoded tokens run while the expert cache learns**, so a decode rate over
+  fewer tokens understates the steady state.
+- **The 512-expert file** holds 77 GB of experts against 56 GB of host memory in the scope
+  measured, which is untried. Only three quarters of the memory the kernel still has free is
+  page-locked; the rest copies through the driver's staging at a lower rate.
+- **Two cards** under the cache plan put every layer on the first card when its dense part
+  fits there, and leave the second unused. The second card's link is x4.
+- **Multi-token prediction** is not implemented.
+- A unit test of the q4 KV decode parity fails now and then when GPU tests run in parallel, and
+  passes alone.
+
 ## Costs
 
 - **~870 MiB per load, any model.** CUDA contexts, cuBLAS workspace, preloaded module images.
