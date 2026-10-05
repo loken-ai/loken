@@ -89,11 +89,6 @@ pub struct InferenceConfigToml {
     pub moderation_model: Option<String>,
     #[serde(default)]
     pub public_url: Option<String>,
-    /// For a model whose routed experts stream from disk: the share of a token's experts whose
-    /// host compute may finish a layer late, overlapping the next layer's attention. Costs a
-    /// little accuracy; 0 keeps every layer exact.
-    #[serde(default)]
-    pub expert_deferral: f32,
     /// For a streamed model: the largest mean divergence (KL, in nats) from the exact output the
     /// operator accepts in exchange for speed. The engine measures what each way of giving up
     /// experts costs on a bundled text at load and picks the fastest that fits; 0 keeps the
@@ -116,6 +111,9 @@ pub fn obsolete_note(key: &str) -> String {
         }
         "state_cache_salt" => "a stored state is identified by the model's files and the plan; \
              a salt adds nothing"
+            .to_string(),
+        "expert_deferral" => "a share of host experts finishing a layer late changes the output \
+             and could not be measured at load; the mechanism stays off"
             .to_string(),
         _ => "loken decides it from the model and the machine".to_string(),
     }
@@ -281,7 +279,6 @@ impl Config {
             files_dir: toml_config.files_dir.clone(),
             moderation_model: toml_config.moderation_model.clone(),
             public_url: toml_config.public_url.clone(),
-            expert_deferral: toml_config.expert_deferral,
             quality_budget: toml_config.quality_budget,
             progress_callback: None, // No progress callback from config file
             models_dir: None,        // Will be set by APIServer
@@ -424,6 +421,7 @@ mod tests {
             model_id = "test-model"
             state_cache_block_tokens = 256
             state_cache_salt = "mine"
+            expert_deferral = 0.25
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         let keys: Vec<&str> = config
@@ -432,7 +430,14 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(keys, ["state_cache_block_tokens", "state_cache_salt"]);
+        assert_eq!(
+            keys,
+            [
+                "expert_deferral",
+                "state_cache_block_tokens",
+                "state_cache_salt"
+            ]
+        );
         for key in keys {
             assert!(!obsolete_note(key).is_empty());
         }

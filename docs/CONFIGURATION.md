@@ -130,13 +130,11 @@ the state size. A restore always leaves at least one token to prefill, to produc
 
 ### Streamed mixtures (DeepSeek V4.1)
 
-Both keys apply to a model whose routed experts stream from disk. Both default to `0`, which
-keeps every layer and every output exact. Both change the output. `expert_deferral` is part of
-the state cache's key; `quality_budget` is not.
+`quality_budget` applies to a model whose routed experts stream from disk. It defaults to `0`,
+which keeps every layer and every output exact; above `0` it changes the output.
 
 | Key | Default | What it does |
 |---|---|---|
-| `expert_deferral` | `0` | Share of a decoding token's routed experts, between 0 and 1, whose host compute may finish a layer late, overlapping the next layer's attention. Their output joins the stream after that attention, so the logits drift from the exact ones. |
 | `quality_budget` | `0` | Largest mean divergence from the exact output, in nats of KL, accepted in exchange for speed. Above `0`, the engine runs a bundled text teacher-forced once exactly and once under each candidate way of giving up experts, and applies the candidate that saves the most disk reads within the budget. |
 
 The candidates derive from `K`, the number of experts a token routes to: keep the `K-1` or `K-2`

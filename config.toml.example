@@ -33,8 +33,7 @@ model_id = "qwen3:0.6b"
 # state_cache_dir = "/var/lib/loken/state"
 # state_cache_budget_gb = 0         # 0 = derived from the directory's free space
 
-# Models whose routed experts stream from disk: both default to 0, which keeps every output exact.
-# expert_deferral = 0               # share of a token's host experts that may finish a layer late
+# Models whose routed experts stream from disk: 0 keeps every output exact.
 # quality_budget = 0                # largest mean KL (nats) the engine may give up for speed
 
 # Files, moderation and the URLs handed out.

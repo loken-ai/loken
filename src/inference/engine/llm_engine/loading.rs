@@ -271,7 +271,6 @@ impl LlmEngine {
         // disable_cuda config (empty cuda_devices -> every layer on CPU).
         let disable_cuda = self.config.disable_cuda || crate::gpu::force_cpu();
         let kv_quant = self.config.kv_quant;
-        let expert_deferral = self.config.expert_deferral;
         let quality_budget = self.config.quality_budget;
         let state_cache = self.state_cache.clone();
         let user_context_length = self.config.context_length;
@@ -773,9 +772,8 @@ impl LlmEngine {
                             cfg.hot_experts = prior;
                         }
                     }
-                    let mut model = DeepseekV41Model::load(&source, &cfg)
+                    let model = DeepseekV41Model::load(&source, &cfg)
                         .map_err(|e| anyhow!("deepseek_v41 load failed: {e}"))?;
-                    model.set_expert_deferral(expert_deferral);
                     if quality_budget > 0.0 {
                         let file_len = std::fs::metadata(&model_file).map_or(0, |m| m.len());
                         let name = model_file
@@ -837,7 +835,6 @@ impl LlmEngine {
                                 store,
                                 crate::inference::model::deepseek_v41::snapshot::identity(&[
                                     &files.finish(),
-                                    &expert_deferral.to_le_bytes(),
                                     &(n_layers as u64).to_le_bytes(),
                                 ]),
                                 cfg.state_bytes_per_token(),

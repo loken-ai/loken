@@ -173,9 +173,6 @@ pub struct InferenceConfig {
     /// The origin clients reach this server at, for the URLs it hands out; `None` uses
     /// the request\'s `Host`.
     pub public_url: Option<String>,
-    /// The share of a streamed model's routed experts per token whose host compute may finish a
-    /// layer late; 0 keeps every layer exact.
-    pub expert_deferral: f32,
     /// The divergence from exact output accepted for speed on a streamed model; 0 is exact.
     pub quality_budget: f32,
     /// Progress callback
@@ -239,7 +236,6 @@ impl Default for InferenceConfig {
             files_dir: None,
             moderation_model: None,
             public_url: None,
-            expert_deferral: 0.0,
             quality_budget: 0.0,
             progress_callback: None,
             models_dir: None,
