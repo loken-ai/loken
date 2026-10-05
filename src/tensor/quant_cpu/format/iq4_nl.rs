@@ -82,7 +82,13 @@ impl BlockFormat for BlockIq4Nl {
     }
 
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        Self::dot_scalar(xs, ys)
+        xs.iter()
+            .zip(ys)
+            .map(|(x, y)| {
+                // The activation block stores value `j` and value `j + 16` as two halves.
+                super::iq_read::dot_iq4_run(&x.qs, &y.qs) as f32 * x.d.to_f32() * y.d.to_f32()
+            })
+            .sum()
     }
 
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {

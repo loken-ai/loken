@@ -19,6 +19,109 @@ pub(super) fn dot_by_decoding<B: BlockFormat>(xs: &[B], ys: &[BlockQ8K]) -> f32 
     total
 }
 
+/// A format read as runs of thirty-two integer weights, each under a scale of its own, which is
+/// what lets a dot stay in integers until the end of a run.
+pub(super) trait Runs: BlockFormat<ActivationBlock = BlockQ8K> {
+    /// The scale of run `ib`, block scale included, as the dequantiser applies it.
+    fn run_scale(&self, ib: usize) -> f32;
+    /// The weights of run `ib` before the scale.
+    fn run_values(&self, ib: usize) -> [i8; 32];
+}
+
+/// `sum(x . y)` over blocks of `QK_K` values for a format read in runs: each run's weights against
+/// the same thirty-two codes of the activation, in integers.
+pub(super) fn dot_runs<B: Runs>(xs: &[B], ys: &[BlockQ8K]) -> f32 {
+    let mut total = 0f32;
+    for (x, y) in xs.iter().zip(ys) {
+        let mut block = 0f32;
+        for ib in 0..QK_K / 32 {
+            let w = x.run_values(ib);
+            let a: &[i8] = &y.qs[32 * ib..32 * ib + 32];
+            let dot: i32 = w.iter().zip(a).map(|(&w, &a)| w as i32 * a as i32).sum();
+            block += x.run_scale(ib) * dot as f32;
+        }
+        total += block * y.d;
+    }
+    total
+}
+
+/// Eight i32 sums of a run of thirty-two weights against thirty-two activation codes, the weights
+/// being magnitudes (`mags`, unsigned bytes) under sign bits: byte `i` of the run is negated when bit
+/// `i % 8` of byte `i / 8` of `signs` is set. The sign goes onto the activation, which leaves the
+/// magnitudes unsigned for the byte multiply. Lanes 0 to 3 hold the first sixteen values.
+#[cfg(target_feature = "avx2")]
+#[inline]
+pub(super) unsafe fn grid_run_sums(
+    mags: std::arch::x86_64::__m256i,
+    signs: u32,
+    acts: &[i8],
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let spread = _mm256_shuffle_epi8(
+        _mm256_set1_epi32(signs as i32),
+        _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        ),
+    );
+    let bit = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        1, 2, 4, 8, 16, 32, 64, -128,
+    );
+    // 0xFF where the bit is set, which with a one ORed in is -1, and +1 elsewhere.
+    let negate = _mm256_or_si256(
+        _mm256_cmpeq_epi8(_mm256_and_si256(spread, bit), bit),
+        _mm256_set1_epi8(1),
+    );
+    let a = _mm256_loadu_si256(acts.as_ptr() as *const __m256i);
+    let pairs = _mm256_maddubs_epi16(mags, _mm256_sign_epi8(a, negate));
+    _mm256_madd_epi16(pairs, _mm256_set1_epi16(1))
+}
+
+/// Sum of the eight float lanes.
+#[cfg(target_feature = "avx2")]
+#[inline]
+pub(super) unsafe fn sum_ps(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let pair = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    let quad = _mm_add_ps(pair, _mm_movehl_ps(pair, pair));
+    _mm_cvtss_f32(_mm_add_ss(quad, _mm_shuffle_ps(quad, quad, 1)))
+}
+
+/// The dot of thirty-two codes of the non-linear table, packed as iq4_nl packs them (byte `j` holds
+/// value `j` low and value `j + 16` high), against thirty-two activation codes.
+#[inline]
+pub(super) fn dot_iq4_run(packed: &[u8; 16], acts: &[i8]) -> i32 {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let table = _mm_loadu_si128(super::iq4_nl::LEVELS.as_ptr() as *const __m128i);
+        let bytes = _mm_loadu_si128(packed.as_ptr() as *const __m128i);
+        let mask = _mm_set1_epi8(0x0F);
+        let low = _mm_shuffle_epi8(table, _mm_and_si128(bytes, mask));
+        let high = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(bytes, 4), mask));
+        let w = _mm256_set_m128i(high, low);
+        let a = _mm256_loadu_si256(acts.as_ptr() as *const __m256i);
+        // Unsigned times signed: the weights' magnitudes against the activations carrying their sign.
+        let magnitude = _mm256_sign_epi8(w, w);
+        let signed = _mm256_sign_epi8(a, w);
+        let pairs = _mm256_maddubs_epi16(magnitude, signed);
+        let sums = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
+        let lanes: [i32; 8] = std::mem::transmute(sums);
+        return lanes.iter().sum();
+    }
+    #[allow(unreachable_code)]
+    {
+        let levels = &super::iq4_nl::LEVELS;
+        (0..16)
+            .map(|j| {
+                levels[(packed[j] & 0x0F) as usize] as i32 * acts[j] as i32
+                    + levels[(packed[j] >> 4) as usize] as i32 * acts[j + 16] as i32
+            })
+            .sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The formats loken only reads, against decoders written from the format definitions and
@@ -150,5 +253,43 @@ mod tests {
             KSIGNS_IQ2XS.iter().map(|&v| v as i64).collect(),
         );
         same("KVALUES_IQ4NL", LEVELS.iter().map(|&v| v as i64).collect());
+    }
+
+    /// What each read-only format's dot costs on one thread, in bytes of weight per second. Not a gate.
+    #[test]
+    #[ignore = "a measurement: cargo test --release iq_dot_throughput -- --ignored --nocapture"]
+    fn iq_dot_throughput() {
+        fn run<T: BlockFormat<ActivationBlock = BlockQ8K>>(name: &str) {
+            let blocks = (64 << 20) / std::mem::size_of::<T>();
+            let mut state = 0x9E37_79B9u64;
+            let mut bytes = vec![0u8; blocks * std::mem::size_of::<T>()];
+            for b in bytes.iter_mut() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (state >> 33) as u8;
+            }
+            for chunk in bytes.chunks_exact_mut(std::mem::size_of::<T>()) {
+                chunk[..2].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+            }
+            let weights: &[T] =
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, blocks) };
+            let acts = vec![BlockQ8K::zeros(); blocks];
+            let mut sink = 0f32;
+            let start = std::time::Instant::now();
+            for _ in 0..3 {
+                sink += T::dot(std::hint::black_box(weights), std::hint::black_box(&acts));
+            }
+            let secs = start.elapsed().as_secs_f64() / 3.0;
+            eprintln!(
+                "{name:8} {:6.2} GB/s of weights, {:5.1} ns a block ({sink})",
+                bytes.len() as f64 / secs / 1e9,
+                secs * 1e9 / blocks as f64
+            );
+        }
+        run::<super::iq3_xxs::BlockIq3Xxs>("iq3_xxs");
+        run::<super::iq3_s::BlockIq3S>("iq3_s");
+        run::<super::iq2_s::BlockIq2S>("iq2_s");
+        run::<super::iq4_xs::BlockIq4Xs>("iq4_xs");
     }
 }

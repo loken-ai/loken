@@ -72,11 +72,84 @@ impl BlockFormat for BlockIq3S {
         panic!("iq3_s is read, not written");
     }
 
+    #[allow(unreachable_code)]
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        Self::dot_scalar(xs, ys)
+        #[cfg(target_feature = "avx2")]
+        return unsafe {
+            use std::arch::x86_64::*;
+            let mut total = _mm256_setzero_ps();
+            for (x, y) in xs.iter().zip(ys) {
+                let mut block = _mm256_setzero_ps();
+                for ib in 0..QK_K / 32 {
+                    // Code `c` of a run is its byte with bit `c` of the run's high-bit byte as the
+                    // ninth bit.
+                    let low = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                        x.qs[8 * ib..].as_ptr() as *const __m128i
+                    ));
+                    let high = _mm256_slli_epi32(
+                        _mm256_and_si256(
+                            _mm256_srlv_epi32(
+                                _mm256_set1_epi32(x.qh[ib] as i32),
+                                _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+                            ),
+                            _mm256_set1_epi32(1),
+                        ),
+                        8,
+                    );
+                    let mags = _mm256_i32gather_epi32(
+                        IQ3S_GRID.as_ptr() as *const i32,
+                        _mm256_or_si256(low, high),
+                        4,
+                    );
+                    let signs = u32::from_le_bytes(x.signs[4 * ib..4 * ib + 4].try_into().unwrap());
+                    let sums = super::iq_read::grid_run_sums(mags, signs, &y.qs[32 * ib..]);
+                    let scale = _mm256_set1_ps(super::iq_read::Runs::run_scale(x, ib));
+                    block = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sums), scale, block);
+                }
+                total = _mm256_fmadd_ps(block, _mm256_set1_ps(y.d), total);
+            }
+            super::iq_read::sum_ps(total)
+        };
+        super::iq_read::dot_runs(xs, ys)
     }
 
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
         super::iq_read::dot_by_decoding(xs, ys)
+    }
+}
+
+impl super::iq_read::Runs for BlockIq3S {
+    fn run_scale(&self, ib: usize) -> f32 {
+        let scale = if ib.is_multiple_of(2) {
+            self.scales[ib / 2] & 0x0F
+        } else {
+            self.scales[ib / 2] >> 4
+        };
+        self.d.to_f32() * (1 + 2 * scale as i32) as f32
+    }
+
+    fn run_values(&self, ib: usize) -> [i8; 32] {
+        let qh = self.qh[ib] as u32;
+        let q = &self.qs[8 * ib..8 * ib + 8];
+        let signs = &self.signs[4 * ib..4 * ib + 4];
+        let mut w = [0i8; 32];
+        for l in 0..4 {
+            let i1 = q[2 * l] as usize | (((qh << (8 - 2 * l)) & 256) as usize);
+            let i2 = q[2 * l + 1] as usize | (((qh << (7 - 2 * l)) & 256) as usize);
+            let (g1, g2) = (IQ3S_GRID[i1].to_le_bytes(), IQ3S_GRID[i2].to_le_bytes());
+            for j in 0..4 {
+                w[8 * l + j] = if signs[l] & KMASK_IQ2XS[j] != 0 {
+                    -(g1[j] as i8)
+                } else {
+                    g1[j] as i8
+                };
+                w[8 * l + j + 4] = if signs[l] & KMASK_IQ2XS[j + 4] != 0 {
+                    -(g2[j] as i8)
+                } else {
+                    g2[j] as i8
+                };
+            }
+        }
+        w
     }
 }

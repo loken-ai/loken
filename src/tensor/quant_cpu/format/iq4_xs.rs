@@ -52,10 +52,39 @@ impl BlockFormat for BlockIq4Xs {
     }
 
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        Self::dot_scalar(xs, ys)
+        xs.iter()
+            .zip(ys)
+            .map(|(x, y)| {
+                let mut block = 0f32;
+                for ib in 0..QK_K / 32 {
+                    let packed: &[u8; 16] = x.qs[16 * ib..16 * ib + 16].try_into().unwrap();
+                    let dot = super::iq_read::dot_iq4_run(packed, &y.qs[32 * ib..32 * ib + 32]);
+                    block += super::iq_read::Runs::run_scale(x, ib) * dot as f32;
+                }
+                block * y.d
+            })
+            .sum()
     }
 
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
         super::iq_read::dot_by_decoding(xs, ys)
+    }
+}
+
+impl super::iq_read::Runs for BlockIq4Xs {
+    fn run_scale(&self, ib: usize) -> f32 {
+        let low = (self.scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F;
+        let high = ((self.scales_h >> (2 * ib)) & 3) as u8;
+        self.d.to_f32() * ((low | (high << 4)) as i32 - 32) as f32
+    }
+
+    fn run_values(&self, ib: usize) -> [i8; 32] {
+        let q = &self.qs[16 * ib..16 * ib + 16];
+        let mut w = [0i8; 32];
+        for j in 0..16 {
+            w[j] = LEVELS[(q[j] & 0x0F) as usize];
+            w[j + 16] = LEVELS[(q[j] >> 4) as usize];
+        }
+        w
     }
 }
