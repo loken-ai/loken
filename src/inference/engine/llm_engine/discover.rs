@@ -85,6 +85,14 @@ impl LlmEngine {
             debug!("📍 Found projector blob: {}", blob.display());
             return Some(blob);
         }
+        // A checkpoint that is a speech tower beside the name of its text model: the tower is
+        // read from the checkpoint itself.
+        #[cfg(feature = "audio")]
+        if let Some(dir) = self.find_model_file(model_id) {
+            if dir.is_dir() && crate::inference::model::audio_in::checkpoint_has_tower(&dir) {
+                return Some(dir);
+            }
+        }
         self.find_sibling_projector(model_id)
     }
 
@@ -272,6 +280,22 @@ impl LlmEngine {
         self.find_model_file(model_id)
     }
 
+    /// The directories a hub repository id is looked up in: the configured models directory's
+    /// `huggingface/hub` and itself, then the configured HuggingFace hub root.
+    pub(super) fn hub_roots(&self) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(md) = &self.config.models_dir {
+            roots.push(md.join("huggingface").join("hub"));
+            roots.push(md.clone());
+        }
+        // The configured HuggingFace hub root (from config.toml, OS-default fallback) - never
+        // a hardcoded absolute path.
+        if let Ok(cfg) = crate::config::Config::load_default() {
+            roots.push(hub_root(cfg.get_hf_models_dir()));
+        }
+        roots
+    }
+
     pub(super) fn find_model_file(&self, model_id: &str) -> Option<PathBuf> {
         // AWQ (HF safetensors) checkpoint: the model reference is a
         // directory whose config.json declares quant_method==awq (a direct
@@ -284,18 +308,11 @@ impl LlmEngine {
         {
             // HF repo-id (`org/name`) -> hub dir under the configured models_dir's
             // huggingface/hub cache, plus the configured huggingface_models_dir.
-            let mut roots: Vec<PathBuf> = Vec::new();
+            let roots = self.hub_roots();
             if let Some(md) = &self.config.models_dir {
-                roots.push(md.join("huggingface").join("hub"));
-                roots.push(md.clone());
                 if let Some(dir) = resolve_awq_dir(&md.to_string_lossy()) {
                     return Some(PathBuf::from(dir));
                 }
-            }
-            // The configured HuggingFace hub root (from config.toml, OS-default
-            // fallback) - never a hardcoded absolute path.
-            if let Ok(cfg) = crate::config::Config::load_default() {
-                roots.push(hub_root(cfg.get_hf_models_dir()));
             }
             if let Some(dir) = resolve_awq_repo(model_id, &roots) {
                 return Some(PathBuf::from(dir));
@@ -506,6 +523,42 @@ pub(crate) fn hub_root(hf: PathBuf) -> PathBuf {
     }
 }
 
+/// The text model of a checkpoint that is a speech tower and the name of a text model: its
+/// `config.json` declares an `audio_config` and a `text_model_id`. The directory of that
+/// model in the hub caches `roots` (by its full id, else by its name under any owner), when it
+/// is a checkpoint this build reads.
+pub(crate) fn composite_text_dir(dir: &std::path::Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).ok()?).ok()?;
+    config.get("audio_config")?;
+    let id = config.get("text_model_id")?.as_str()?;
+    if let Some(d) = resolve_awq_repo(id, roots) {
+        return Some(PathBuf::from(d));
+    }
+    let name = id.rsplit('/').next()?.to_lowercase();
+    for root in roots {
+        let mut repos: Vec<PathBuf> = std::fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name().is_some_and(|n| {
+                    let n = n.to_string_lossy().to_lowercase();
+                    n.starts_with("models--") && n.ends_with(&format!("--{name}"))
+                })
+            })
+            .collect();
+        repos.sort();
+        for repo in repos {
+            if let Some(d) = resolve_awq_dir(&repo.to_string_lossy()) {
+                return Some(PathBuf::from(d));
+            }
+        }
+    }
+    None
+}
+
 /// Whether `p` is the `mmproj` of a vision or speech tower: a companion of the model file,
 /// never the model.
 fn is_projector_file(p: &std::path::Path) -> bool {
@@ -669,6 +722,55 @@ mod hub_gguf_tests {
             Some(2)
         );
         assert_eq!(split_part(std::path::Path::new("a-of-b.gguf")), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod composite_tests {
+    use super::*;
+
+    /// A checkpoint that is a speech tower beside the name of a text model resolves to that
+    /// model's directory, by its id or by its name under another owner; one with no such
+    /// model beside it resolves to none.
+    #[test]
+    fn a_tower_finds_the_text_model_it_names() {
+        let root = std::env::temp_dir().join(format!("loken-composite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let text = root
+            .join("models--someone--Text-Model-1B")
+            .join("snapshots")
+            .join("abc");
+        std::fs::create_dir_all(&text).unwrap();
+        std::fs::write(
+            text.join("config.json"),
+            r#"{"architectures": ["LlamaForCausalLM"]}"#,
+        )
+        .unwrap();
+        std::fs::write(text.join("model.safetensors"), b"").unwrap();
+        let tower = root.join("tower");
+        std::fs::create_dir_all(&tower).unwrap();
+        let declare = |id: &str| {
+            std::fs::write(
+                tower.join("config.json"),
+                format!(r#"{{"model_type": "x", "audio_config": {{}}, "text_model_id": "{id}"}}"#),
+            )
+            .unwrap();
+        };
+        let roots = vec![root.clone()];
+        declare("someone/Text-Model-1B");
+        assert_eq!(composite_text_dir(&tower, &roots), Some(text.clone()));
+        declare("other-owner/text-model-1b");
+        assert_eq!(composite_text_dir(&tower, &roots), Some(text.clone()));
+        declare("other-owner/Missing");
+        assert_eq!(composite_text_dir(&tower, &roots), None);
+        // Without an audio_config it is not a composite.
+        std::fs::write(
+            tower.join("config.json"),
+            r#"{"text_model_id": "someone/Text-Model-1B"}"#,
+        )
+        .unwrap();
+        assert_eq!(composite_text_dir(&tower, &roots), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

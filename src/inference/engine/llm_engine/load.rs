@@ -511,6 +511,11 @@ pub(super) fn try_wrap_with_vision(
     // Pixtral ViT, "mlp" the CLIP tower (which checks the file's vision shapes
     // and leaves the model text-only when they differ). Any other type, or a
     // projector without the key, leaves the model text-only.
+    // A directory is a checkpoint carrying the tower; a file is an `mmproj`.
+    #[cfg(feature = "audio")]
+    if blob.is_dir() {
+        return Ok(attach_audio_tower(text, blob, keep));
+    }
     let projector_type = sniff_projector_type(blob).unwrap_or_default();
     #[cfg(feature = "audio")]
     if crate::inference::model_facts::audio_facts(&projector_type).is_some() {
@@ -630,7 +635,12 @@ fn attach_audio_tower(
                 blob.display(),
                 device.location()
             );
-            AudioTower::from_mmproj(blob, &device).map_err(|e| anyhow!("{e}"))
+            if blob.is_dir() {
+                AudioTower::from_checkpoint(blob, &device)
+            } else {
+                AudioTower::from_mmproj(blob, &device)
+            }
+            .map_err(|e| anyhow!("{e}"))
         },
     );
     match placed

@@ -241,8 +241,25 @@ pub fn mmproj_has_tower(path: &Path) -> bool {
         .is_some_and(|g| audio_facts(&g.projector_type).is_some())
 }
 
-/// Bytes the tower of the `mmproj` at `path` holds once loaded: every tensor is F32 then.
+/// Bytes the tower at `path` (an `mmproj` file or a checkpoint directory) holds once loaded:
+/// every tensor is F32 then.
 pub fn resident_bytes(path: &Path) -> u64 {
+    if path.is_dir() {
+        let Ok(shards) = weight_files(path) else {
+            return 0;
+        };
+        let Ok(st) = (unsafe { crate::tensor::safetensors::MmapedSafetensors::multi(&shards) })
+        else {
+            return 0;
+        };
+        return st
+            .names()
+            .iter()
+            .filter(|n| n.starts_with("audio_tower.") || n.starts_with("multi_modal_projector."))
+            .filter_map(|n| st.shape_of(n))
+            .map(|d| d.iter().product::<usize>() as u64 * std::mem::size_of::<f32>() as u64)
+            .sum();
+    }
     gguf_file::open_header(path).map_or(0, |c| {
         c.tensor_infos
             .values()

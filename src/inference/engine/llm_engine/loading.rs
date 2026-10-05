@@ -282,6 +282,10 @@ impl LlmEngine {
                                                // after the LM has loaded as GenericHetero.
         let projector_blob = self.find_projector_blob_for_model(&model_id_clone);
         let generation_defaults = self.generation_defaults_for(&model_id_clone, &model_file);
+        // A speech tower that names its text model: the weights and the tokenizer are the text
+        // model's; the tower is read from the checkpoint the request named (`projector_blob`).
+        let model_file =
+            discover::composite_text_dir(&model_file, &self.hub_roots()).unwrap_or(model_file);
 
         // Load model in blocking thread since GGUF parsing and weight loading are CPU-intensive
         let result = tokio::task::spawn_blocking(move || -> AnyResult<()> {
