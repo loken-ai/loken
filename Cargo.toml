@@ -1,6 +1,6 @@
 [package]
 name = "loken"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A local, multimodal inference server: language, image, audio and video models, in Rust"
 repository = "https://github.com/loken-ai/loken"
