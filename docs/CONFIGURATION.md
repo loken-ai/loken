@@ -130,6 +130,35 @@ disk instead of recomputed, so the gain grows with the covered length and with h
 on the machine and placement in use, and is bounded by the read speed of the cache directory against
 the state size. A restore always leaves at least one token to prefill, to produce the logits.
 
+### Streamed mixtures (DeepSeek V4.1)
+
+Both keys apply to a model whose routed experts stream from disk. Both default to `0`, which
+keeps every layer and every output exact. Both change the output. `expert_deferral` is part of
+the state cache's key; `quality_budget` is not.
+
+| Key | Default | What it does |
+|---|---|---|
+| `expert_deferral` | `0` | Share of a decoding token's routed experts, between 0 and 1, whose host compute may finish a layer late, overlapping the next layer's attention. Their output joins the stream after that attention, so the logits drift from the exact ones. |
+| `quality_budget` | `0` | Largest mean divergence from the exact output, in nats of KL, accepted in exchange for speed. Above `0`, the engine runs a bundled text teacher-forced once exactly and once under each candidate way of giving up experts, and applies the candidate that saves the most disk reads within the budget. |
+
+The candidates derive from `K`, the number of experts a token routes to: keep the `K-1` or `K-2`
+heaviest, or replace a light expert that sits in no card tier when its weight share is under
+`0.5/K`, `0.75/K` or `1/K`. The measured table is cached per model file and plan in
+`quality-calibration.json` under `loken/` in the user cache directory, so a different budget reuses
+it. A file with no tokenizer in its metadata runs exact.
+
+What the offload derives for itself, from measurement, and logs:
+
+| Quantity | Derived from |
+|---|---|
+| Read-ahead depth | A controller that times decode tokens in windows, tries each neighbouring depth for one window, and keeps it only when its mean token time beats the incumbent's by more than the noise, judged against the incumbent's windows on both sides. Bounded by the hardware and the plan. |
+| Reader threads | The smallest count that reaches the device's read rate, from a probe at load. |
+| Sightings before a card takes an expert | The measured upload cost against what a use saves. |
+| Experts kept per layer | What the host memory allows. |
+
+During a prompt's prefill, the experts of the next layer are read from the file into one of two
+page-locked slabs while the dense work of the current layer runs.
+
 ### Files, moderation and URLs
 
 | Key | Default | What it does |
@@ -160,6 +189,15 @@ model; the keys are:
 | `join` | `[]` | Seeds for peers multicast cannot reach. |
 | `gossip_interval_ms` | `1000` | How often peers exchange state. |
 | `min_speedup` | `1.15` | Refuse to hand a request over below this predicted speedup. |
+
+## Command line and environment
+
+| Setting | Default | What it does |
+|---|---|---|
+| `loken pull --stall-factor N` | `8` | A pull stops when no progress frame arrives for `N` times the longest gap between frames seen so far, so the window follows the link's own throughput. `0` never stops it. A pull has no total deadline. |
+| `LOKEN_API_KEY` | unset | Read by `loken launch`: the key handed to the agent when the daemon requires one. |
+| `OLLAMA_MODELS`, `OLLAMA_KEEP_ALIVE` | | The Ollama store, overriding `ollama_models_dir`; the keep-alive of a loaded model. |
+| `HF_TOKEN` | unset | Sent when a pull fetches from Hugging Face. |
 
 ## Build features
 
