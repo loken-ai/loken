@@ -305,6 +305,10 @@ impl LlmEngine {
                 )
             };
 
+            // The rows of a clip are in no token stream a prefix could match.
+            if audio_split.is_some() {
+                state.model.reset_kv_from(0);
+            }
             let cache_session_start =
                 honest_reuse_start(state.model.as_mut(), cache_session_start);
 

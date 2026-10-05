@@ -455,7 +455,9 @@ impl LlmEngine {
                 // tokens (whichever the engine currently holds), but the
                 // sessions table tells us which.
                 let session_start: usize = if audio_split.is_some() {
-                    0 // the rows of a clip are in no token stream a prefix could match
+                    // The rows of a clip are in no token stream a prefix could match.
+                    state.model.reset_kv_from(0);
+                    0
                 } else if is_vision && session_id.is_some() && cur_image_hash.is_some() {
                     // Vision prefix-KV reuse: match by image_hash + common text.
                     let sess_guard = sessions.blocking_lock();
