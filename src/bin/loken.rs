@@ -37,10 +37,6 @@ enum Commands {
         /// Model source: "ollama" or "huggingface" (required)
         #[arg(long, value_parser = ["ollama", "huggingface"])]
         source: Option<String>,
-        /// A pull is stalled when no progress frame arrives for this many times the longest gap
-        /// between frames seen so far; 0 never stops it.
-        #[arg(long, default_value_t = 8)]
-        stall_factor: u32,
     },
 
     /// Load a model into memory, so the next request does not pay for it
@@ -287,23 +283,27 @@ async fn launch(
     }
 }
 
+/// A pull is stalled when no progress frame arrives for this many times the longest gap between
+/// the frames seen so far: the window follows the throughput the job itself shows.
+const STALL_FACTOR: u32 = 8;
+
 /// Print a daemon job's NDJSON progress as it arrives, one line per step of the status or of a
 /// hundredth of its count, and fail on the job's own error.
 async fn follow(
     response: reqwest::Response,
-    stall_factor: u32,
+    stall_guard: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut response = response;
     let (mut pending, mut last_status, mut last_step) = (String::new(), String::new(), usize::MAX);
-    // A job is stalled when no frame arrives for `stall_factor` times the longest gap between
-    // frames seen so far: the window follows the throughput the job itself shows.
+    // With the guard on, a job is stalled when no frame arrives for `STALL_FACTOR` times the
+    // longest gap between frames seen so far.
     let (mut last_frame, mut longest_gap) =
         (std::time::Instant::now(), None::<std::time::Duration>);
     loop {
-        let next = match longest_gap.filter(|_| stall_factor > 0) {
-            Some(gap) => tokio::time::timeout(gap * stall_factor, response.chunk())
+        let next = match longest_gap.filter(|_| stall_guard) {
+            Some(gap) => tokio::time::timeout(gap * STALL_FACTOR, response.chunk())
                 .await
-                .map_err(|_| format!("stalled: no progress for {:?}", gap * stall_factor))?,
+                .map_err(|_| format!("stalled: no progress for {:?}", gap * STALL_FACTOR))?,
             None => response.chunk().await,
         };
         let Some(chunk) = next? else { break };
@@ -383,7 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "model": model, "name": name, "texts": texts,
                 "excerpt": excerpt, "tokens": tokens, "rows": rows,
             });
-            follow(client.post_streaming("/api/calibrate", &body).await?, 0).await?;
+            follow(client.post_streaming("/api/calibrate", &body).await?, false).await?;
         }
         Commands::Convert {
             model,
@@ -402,13 +402,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "gate_up": gate_up, "down": down, "always_read": always_read, "min_rows": min_rows,
                 "damping": damping, "layers": layers,
             });
-            follow(client.post_streaming("/api/convert", &body).await?, 0).await?;
+            follow(client.post_streaming("/api/convert", &body).await?, false).await?;
         }
-        Commands::Pull {
-            model,
-            source,
-            stall_factor,
-        } => {
+        Commands::Pull { model, source } => {
             let source = source.unwrap_or_else(|| {
                 // Auto-detect based on format: contains "/" = huggingface, else = ollama
                 if model.contains('/') {
@@ -424,11 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let body = serde_json::json!({ "name": model, "source": source, "stream": true });
-            follow(
-                client.post_streaming("/api/pull", &body).await?,
-                stall_factor,
-            )
-            .await?;
+            follow(client.post_streaming("/api/pull", &body).await?, true).await?;
         }
 
         Commands::Load { model } => {

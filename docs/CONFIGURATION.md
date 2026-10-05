@@ -203,7 +203,6 @@ model; the keys are:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `loken pull --stall-factor N` | `8` | A pull stops when no progress frame arrives for `N` times the longest gap between frames seen so far, so the window follows the link's own throughput. `0` never stops it. A pull has no total deadline. |
 | `LOKEN_API_KEY` | unset | Read by `loken launch`: the key handed to the agent when the daemon requires one. |
 | `OLLAMA_MODELS`, `OLLAMA_KEEP_ALIVE` | | The Ollama store, overriding `ollama_models_dir`; the keep-alive of a loaded model. |
 | `HF_TOKEN` | unset | Sent when a pull fetches from Hugging Face. |

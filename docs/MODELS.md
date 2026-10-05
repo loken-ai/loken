@@ -42,7 +42,7 @@ configuration files; without a selector every file is pulled. Each file is check
 listed size and its sha256.
 
 A pull follows the daemon's streamed progress and stops when no frame arrives for a multiple of
-the longest gap seen, `--stall-factor` (see [`CONFIGURATION.md`](CONFIGURATION.md)). A repository
+the longest gap seen (eight times). A repository
 holding a model GGUF and its `mmproj` resolves to the model file; the projector is its companion.
 
 A GGUF split into parts by `gguf-split` is read as one model on the generic route: the first
