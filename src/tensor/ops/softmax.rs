@@ -196,7 +196,8 @@ pub fn log_softmax(x: &Tensor, dim: usize) -> Result<Tensor> {
 }
 
 /// Softmax over the last (key) dim with a per-head sink logit added to each row's
-/// denominator, as ggml's `soft_max` with sinks computes it.
+/// denominator: `exp(s - m) / (sum(exp(s - m)) + exp(sink - m))` with `m` the row maximum
+/// taken over the scores and the sink.
 ///
 /// - `scores`: attention logits `[b, n_head, q, kv]`, before `scale`.
 /// - `mask`: additive `[.., q, kv]` mask (0 visible, -inf hidden), or `None`.
