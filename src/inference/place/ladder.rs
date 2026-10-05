@@ -125,8 +125,10 @@ impl Demand {
         layers: &[(u64, u64)],
         cached: bool,
     ) -> Option<HeteroPlan> {
+        // A cache of the experts is wanted when the model does not sit on the cards with the
+        // whole reserve free beside it, which the plan above may have relaxed to avoid the host.
         let spills = first.segments.iter().any(|s| s.kind == DeviceKind::Cpu);
-        if !spills {
+        if !spills && !cached {
             return None;
         }
         HeteroPlan::calculate_host_experts(
@@ -137,6 +139,7 @@ impl Demand {
             self.runtime_reserve,
             cached,
         )
+        .filter(|plan| spills || plan.host_experts_from.is_some())
     }
 
     /// The plan for a component that runs one token through its blocks in order, so the cards

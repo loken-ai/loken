@@ -235,11 +235,13 @@ pub fn mixer_block_rows() -> usize {
 /// buffers live at once; apart from the chunk, the mixers' block temporaries; and the chunk it
 /// runs best at, the one that gives each routed expert a full tile of the grouped matmul on
 /// average, `tile x experts / top-k` tokens, between the ladder's usual top and [`CHUNK_CEILING`].
-/// `experts` is `(count, used)`, `None` for a model without a routed mixture.
+/// `experts` is `(count, used)`, `None` for a model without a routed mixture; its experts run on a
+/// card for a batch of rows, and keep their own activations live per routed pair, `expert_ffn` wide.
 pub fn prefill_footprint(
     streams: usize,
     dim: usize,
     experts: Option<(usize, usize)>,
+    expert_ffn: usize,
 ) -> PrefillFootprint {
     #[cfg(feature = "cuda")]
     let tile = crate::inference::moe_cuda::MMQ_X_MAX;
@@ -250,7 +252,10 @@ pub fn prefill_footprint(
         .unwrap_or(0);
     let f = std::mem::size_of::<f32>();
     PrefillFootprint {
-        bytes_per_token: streams * dim * f * WIDE_LIVE_BUFFERS,
+        bytes_per_token: streams * dim * f * WIDE_LIVE_BUFFERS
+            + experts.map_or(0, |(_, used)| {
+                super::expert_tier::prefill_bytes_per_token(used, dim, expert_ffn)
+            }),
         fixed_bytes: mixer_block_rows() * streams * dim * f * MIXER_LIVE_BUFFERS,
         target_chunk,
     }

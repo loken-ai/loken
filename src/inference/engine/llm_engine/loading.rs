@@ -71,10 +71,13 @@ impl ModelDims {
             let experts = get_gguf_u32(content, &format!("{arch}.expert_count"))
                 .zip(get_gguf_u32(content, &format!("{arch}.expert_used_count")))
                 .map(|(n, k)| (n as usize, k as usize));
+            let expert_ffn = get_gguf_u32(content, &format!("{arch}.expert_feed_forward_length"))
+                .unwrap_or(0) as usize;
             crate::inference::generic_transformer::hyper::prefill_footprint(
                 streams,
                 hidden_size,
                 experts,
+                expert_ffn,
             )
         });
         Self {

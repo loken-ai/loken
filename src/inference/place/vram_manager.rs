@@ -116,6 +116,21 @@ pub fn free_total() -> u64 {
     probe(0).into_iter().map(|(_, free, _)| free).sum()
 }
 
+/// The free memory a model on `cards` (one bit per ordinal) has to work in: the least any of them
+/// has free, since each holds its own layers' activations. With no bits set, every card as one
+/// total, as [`free_total`] has it.
+pub fn free_on_cards(cards: u64) -> u64 {
+    if cards == 0 {
+        return free_total();
+    }
+    probe(0)
+        .into_iter()
+        .filter(|(index, _, _)| cards >> *index & 1 == 1)
+        .map(|(_, free, _)| free)
+        .min()
+        .unwrap_or(0)
+}
+
 /// What the cards hold in total, whatever is currently on them.
 ///
 /// The CAPACITY of the machine, as against `free_total`'s "right now". A statement

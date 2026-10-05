@@ -531,11 +531,28 @@ impl GenericHeteroTransformer {
     /// wants is the one that gives every routed expert a full tile of the grouped matmul (see
     /// `hyper::prefill_footprint`).
     pub fn prefill_shape(&self) -> crate::inference::engine::model_backend::PrefillShape {
-        self.prefill_shape_with(
+        let mut shape = self.prefill_shape_with(
             self.layers
                 .iter()
                 .any(|l| l.moe.as_ref().is_some_and(|m| m.tier.is_some())),
-        )
+        );
+        // A model on cards is sized from the cards it uses, and a model with layers on the host
+        // from every card, as before.
+        if self
+            .layer_devs
+            .iter()
+            .all(|d| matches!(d, LayerDevice::Cuda(_)))
+        {
+            shape.cards = self
+                .layer_devs
+                .iter()
+                .filter_map(|d| match d {
+                    LayerDevice::Cuda(i) => Some(1u64 << (*i).min(63)),
+                    LayerDevice::Cpu => None,
+                })
+                .fold(0, |a, b| a | b);
+        }
+        shape
     }
 
     /// [`Self::prefill_shape`] for a model whose experts do, or do not, run on the card for a wide
@@ -566,29 +583,36 @@ impl GenericHeteroTransformer {
                     h.streams,
                     self.config.embedding_length,
                     experts,
+                    expert_ffn,
                 );
                 PrefillShape {
                     bytes_per_token: fp.bytes_per_token.max(plain.bytes_per_token),
                     fixed_bytes: fp.fixed_bytes,
                     target_chunk: fp.target_chunk,
                     share: 2,
+                    cards: 0,
                 }
             }
         };
         let (true, Some((_, used))) = (tiered, experts) else {
             return base;
         };
-        // A shape that counts every live buffer itself takes the whole of the free memory.
+        // A wide model's already counts its experts' activations.
         PrefillShape {
             bytes_per_token: base.bytes_per_token
-                + super::expert_tier::prefill_bytes_per_token(
-                    used,
-                    self.config.embedding_length,
-                    expert_ffn,
-                ),
+                + if self.config.hyper.is_some() {
+                    0
+                } else {
+                    super::expert_tier::prefill_bytes_per_token(
+                        used,
+                        self.config.embedding_length,
+                        expert_ffn,
+                    )
+                },
             fixed_bytes: base.fixed_bytes,
             target_chunk: super::hyper::CHUNK_CEILING,
-            share: 1,
+            share: 2,
+            cards: 0,
         }
     }
 

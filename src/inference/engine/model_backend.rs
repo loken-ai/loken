@@ -60,6 +60,9 @@ pub struct PrefillShape {
     /// The share of free card memory a chunk may take is one over this: the rest is left for what
     /// else a forward allocates. A shape that counts every live buffer itself takes a larger share.
     pub share: usize,
+    /// The cards the model runs on, one bit per ordinal: the chunk is sized from the least free of
+    /// them, since each holds its own layers' activations. Zero for every card, as one total.
+    pub cards: u64,
 }
 
 impl PrefillShape {
@@ -71,6 +74,7 @@ impl PrefillShape {
             fixed_bytes: 0,
             target_chunk: 0,
             share: 8,
+            cards: 0,
         }
     }
 }
@@ -100,7 +104,7 @@ fn adaptive_prefill_chunk_uncached(shape: PrefillShape) -> usize {
     // not handed the chunk of an empty one and left to discover the difference by running out
     // of memory. A share of the free VRAM, because the activation peak is not the only thing a
     // forward allocates: the attention transients and the KV growth come out of the same pool.
-    let free = crate::inference::place::vram_manager::free_total() as usize;
+    let free = crate::inference::place::vram_manager::free_on_cards(shape.cards) as usize;
     if free == 0 {
         // No CUDA, or nothing to probe: the host path is bounded by RAM, which this is not
         // measuring, so keep the conservative default rather than inventing a number.
@@ -108,7 +112,7 @@ fn adaptive_prefill_chunk_uncached(shape: PrefillShape) -> usize {
     }
     let raw = (free / shape.share.max(1)).saturating_sub(shape.fixed_bytes) / per_token;
     let top = shape.target_chunk.max(2048);
-    tracing::debug!(
+    tracing::info!(
         "prefill chunk: {:.2} GB free, {} B per token + {:.0} MB fixed, ladder top {top}: rows {raw}",
         free as f64 / 1e9,
         per_token,
@@ -246,7 +250,9 @@ pub(crate) trait ModelBackend: Send {
             let sh = self.prefill_shape();
             (sh.bytes_per_token, sh.fixed_bytes)
         };
-        let free_now = crate::inference::place::vram_manager::free_total() as usize;
+        let free_now =
+            crate::inference::place::vram_manager::free_on_cards(self.prefill_shape().cards)
+                as usize;
         let first = if seq_len <= chunk_start {
             seq_len
         } else {

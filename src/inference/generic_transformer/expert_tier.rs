@@ -561,9 +561,17 @@ impl LayerTier {
                 cudarc::driver::sys::cuMemcpyDtoHAsync_v2(dst, src, bytes, stream.cu_stream())
             })?;
         }
+        let prof = crate::inference::offload::stage_prof_enabled();
+        let t_wait = prof.then(std::time::Instant::now);
         stream
             .synchronize()
             .map_err(|e| crate::tensor::Error::msg(format!("choice to host: {e:?}")))?;
+        if let Some(t) = t_wait {
+            crate::inference::offload::prof_record(
+                "tier wait for the choice",
+                t.elapsed().as_nanos() as u64,
+            );
+        }
         let (ids_h, w_h): (Vec<u32>, Vec<f32>) = (h_ids.to_vec(), h_w.to_vec());
         // Partition by what the card holds now, and count the use.
         let mut slot_ids = vec![0u32; k];
@@ -652,6 +660,7 @@ impl LayerTier {
         };
 
         // The host's share: the experts the card does not hold, from the mapping.
+        let t_host = prof.then(std::time::Instant::now);
         let host_out = if miss_ids.is_empty() {
             false
         } else {
@@ -673,6 +682,12 @@ impl LayerTier {
             })?;
             true
         };
+        if let Some(t) = t_host {
+            crate::inference::offload::prof_record(
+                "tier host experts",
+                t.elapsed().as_nanos() as u64,
+            );
+        }
         // Fresh tensors: the buffers on the card are this layer's, written again by the next token.
         let out = match (card_out, host_out) {
             (Some(c), true) => (c.to_dtype(crate::tensor::DType::F32)? + &scratch.product)?,
@@ -1112,7 +1127,8 @@ pub fn stack_dtype(moe: &MoeWeights) -> Option<GgmlDType> {
     moe.gate_exps_sep.as_ref().map(|t| t.dtype())
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
+#[cfg(feature = "cuda")]
 mod tests {
     use super::*;
     use crate::tensor::quantized::QMatMul;

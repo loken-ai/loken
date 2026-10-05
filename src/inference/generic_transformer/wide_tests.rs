@@ -917,16 +917,19 @@ fn a_mixer_blocked_over_its_rows_matches_the_whole() {
 #[cfg(feature = "cuda")]
 #[test]
 fn the_wide_prefill_footprint_follows_the_model() {
-    let a = hyper::prefill_footprint(4, 2560, Some((160, 10)));
-    let b = hyper::prefill_footprint(4, 2560, Some((512, 10)));
+    let a = hyper::prefill_footprint(4, 2560, Some((160, 10)), 640);
+    let b = hyper::prefill_footprint(4, 2560, Some((512, 10)), 640);
     assert!(a.bytes_per_token > 0 && a.fixed_bytes > 0);
     assert!(a.target_chunk >= 2048 && b.target_chunk > a.target_chunk);
     assert!(b.target_chunk <= 8192);
-    assert_eq!(hyper::prefill_footprint(4, 2560, None).target_chunk, 0);
+    let plain = hyper::prefill_footprint(4, 2560, None, 0);
+    assert_eq!(plain.target_chunk, 0);
     assert_eq!(
-        hyper::prefill_footprint(8, 2560, None).bytes_per_token,
-        2 * a.bytes_per_token
+        hyper::prefill_footprint(8, 2560, None, 0).bytes_per_token,
+        2 * plain.bytes_per_token
     );
+    // The routed experts that run on the card add their own activations per routed pair.
+    assert!(a.bytes_per_token > plain.bytes_per_token);
 }
 
 /// A prefill pinned at the whole prompt, at a divisor of its length and at a size that leaves a
