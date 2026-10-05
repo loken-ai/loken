@@ -1,6 +1,6 @@
 # Status
 
-What is measured, what is slower, what has never run. Revised 2026-10-03.
+What is measured, what is slower, what has never run. Revised 2026-10-05.
 
 Every figure comes from one machine: RTX 5070 Ti + RTX 5060 Ti (16 GB each), Linux, CUDA 13.3,
 models on a USB disk reading at 460 MB/s.
@@ -108,6 +108,37 @@ instead, on a Q4 KV cache (a block groups 32 positions of one channel), on slidi
 index stops being the position after a slide), and on the recurrent hybrids, whose state
 holds no positions to shift.
 
+## Large mixtures streamed from disk
+
+DeepSeek V4.1 is served from its own GGUF, which may be split, with the routed experts read
+from the file as routing asks for them. Its rows are in the `deepseek_v41` section of
+[`BENCHMARKS.md`](BENCHMARKS.md); the other engines could not run it.
+
+| Piece | State |
+|---|---|
+| Prefill on the cards | A prompt's attention, residual stream, expert products and routing run on the cards; a layer's experts are read into page-locked slabs ahead and sent on a copy stream. See the benchmark rows of the model |
+| Read-ahead, reader threads, expert tier | Derived from measurement at load and while decoding, see [`CONFIGURATION.md`](CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
+| Decode-state cache | Off unless `state_cache_dir` is set. A stored prefix always pays; a short remainder still reads nearly every expert, which bounds how little it costs |
+| `expert_deferral`, `quality_budget` | Off. They change the output; the budget is chosen against a teacher-forced run of a bundled text, not against a task score |
+| Sharding across nodes | Unmeasured at two nodes, see below |
+
+A transformer with recurrent layers (a convolution, state-space or delta-rule mixer beside
+attention) cannot trim its state back to a shorter prefix and so re-prefills every turn. With
+`state_cache_dir` set it stores the states its prefill passes and restores the longest one a
+prompt extends. No row of the benchmark tables measures that cache.
+
+The quality harness (`src/inference/model/deepseek_v41/quality.rs`) scores a setting against the
+exact run on held-out text: top-1 agreement, divergence over the exact run's top 20, and the
+log-probability given to the exact choice. It runs by hand on a real checkpoint, as ignored tests.
+
+## Audio in
+
+Voxtral and Ultravox towers are read from an `mmproj` GGUF or a checkpoint directory, with every
+dimension taken from the file, and spliced into a chat turn. The mel features and the towers are
+held against the reference implementation at rounding level on toy towers
+(`tests/vectors/audio_in/`). No real-checkpoint transcript or timing is committed, and the
+Ultravox language model must be supplied as a GGUF beside the tower.
+
 ## Costs
 
 - **~870 MiB per load, any model.** CUDA contexts, cuBLAS workspace, preloaded module images.
@@ -125,19 +156,13 @@ holds no positions to shift.
   layer's pages are dropped the moment it lands on a card, because waiting for the end of the
   load was already too late: the cache had reached 44 GB and 12-15 GB of the process had gone
   to zram, and the same cell then decoded anywhere between 1.5 and 2.2 tok/s from one run to
-  the next. Dropped per layer, the cell measures 2.25 three times. What remains: the load
-  still peaks at 49 GB of cache and pushes ~10 GB to zram in one burst, pages touched before
-  the layer build; the token embedding dequantised to F32 on the host (4 GB for a 0.6 GB Q4_K
-  table); the file pages of host layers once their repack exists; and, the largest, the fused
-  weights. A layer's q/k/v and gate/up are concatenated on the host into one tensor each and
-  uploaded, and `QStorage::from_data` keeps an OWNED copy of the concatenated bytes beside the
-  card's - ~320 MB a layer, ~17 GB for the 54 card-resident layers of the 70B, read by no CUDA
-  path. That is the single anonymous block the memory map showed. The loader also uploads
-  every card layer twice: once as it is read, once padded when its matmul is built from the
-  host bytes again, which is why the file is fully cached before the first layer is built. A
-  padded copy taken device-to-device, a concat done on the card, and a host copy kept only
-  where a CPU path will read it would remove the block, the second upload and the cache
-  peak together.
+  the next. Dropped per layer, the cell measures 2.25 three times. Those figures predate two
+  changes: a weight the loader built (fused q/k/v and gate/up, a rebuilt float projection) and
+  now sits on a card keeps no host copy, and the token tables stay as the file stores them
+  instead of widening to F32. The load logs one ledger line with every conversion it made, its
+  bytes before and after, and warns when the cards grow by more than the file. The load still
+  reads the pages of host layers once their repack exists; no figure here measures the peak
+  after the changes.
 - **Load time is your disk.** 24 GB over USB: 52 s reading, 6 s to the cards.
 
 ## The cluster
@@ -181,8 +206,8 @@ one set.
   engine that used to build a plan by hand was removed. Judged over 21 placement and 119 naming
   cases, with two perturbations proving the judge can fail.
 - **Reserve pass** (`src/tensor/dry.rs`) - runs the forward on a device that allocates nothing,
-  to replace the per-model formulas. Called from one site, in Z-Image. Every language-model
-  placement is still budgeted by formula.
+  to replace the per-model formulas. Called by the Z-Image, FLUX and other image loaders. Every
+  language-model placement is still budgeted by formula.
 
 ## Shipped as source, never compiled
 
