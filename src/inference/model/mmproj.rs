@@ -61,3 +61,59 @@ impl MmprojVision {
         self.width / self.heads.max(1)
     }
 }
+
+/// An audio tower's shape, as the `mmproj` states it: a speech encoder and the projector
+/// that maps its frames into the language model's embedding space.
+#[derive(Debug, Clone)]
+pub struct MmprojAudio {
+    /// The `clip.projector_type`: which projector follows the encoder.
+    pub projector_type: String,
+    pub width: usize,
+    pub heads: usize,
+    pub blocks: usize,
+    pub feed_forward: usize,
+    /// Mel bands the encoder's first convolution reads.
+    pub n_mels: usize,
+    /// Consecutive encoder frames the projector stacks into one input row.
+    pub stack: usize,
+    /// Width of the projector's output: the language model's embedding width.
+    pub projection: usize,
+    pub eps: f32,
+}
+
+impl MmprojAudio {
+    pub fn read(content: &Content) -> Result<Self> {
+        let get = |key: &str| -> Result<&Value> {
+            content
+                .metadata
+                .get(key)
+                .ok_or_else(|| Error(format!("mmproj: missing {key}")))
+        };
+        let n = |key: &str| -> Result<usize> { Ok(get(key)?.to_u32()? as usize) };
+        let has_audio = content
+            .metadata
+            .get("clip.has_audio_encoder")
+            .and_then(|v| v.to_bool().ok())
+            .unwrap_or(false);
+        if !has_audio {
+            return Err(Error(
+                "mmproj: the file carries no audio encoder".to_string(),
+            ));
+        }
+        Ok(Self {
+            projector_type: get("clip.projector_type")?.to_string()?.clone(),
+            width: n("clip.audio.embedding_length")?,
+            heads: n("clip.audio.attention.head_count")?,
+            blocks: n("clip.audio.block_count")?,
+            feed_forward: n("clip.audio.feed_forward_length")?,
+            n_mels: n("clip.audio.num_mel_bins")?,
+            stack: n("clip.audio.projector.stack_factor")?,
+            projection: n("clip.audio.projection_dim")?,
+            eps: get("clip.audio.attention.layer_norm_epsilon")?.to_f32()?,
+        })
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.width / self.heads.max(1)
+    }
+}

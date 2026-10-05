@@ -91,7 +91,7 @@ pub mod audio {
     /// the first for the low half and subtracting for the high one. That halving is the whole
     /// saving, and it only applies while the length stays even; an odd length falls back to
     /// summing every term against every frequency.
-    fn transform(frame: &[f32]) -> Vec<f32> {
+    pub(crate) fn transform(frame: &[f32]) -> Vec<f32> {
         let n = frame.len();
         if n == 1 {
             return vec![frame[0], 0.0];

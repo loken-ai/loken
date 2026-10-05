@@ -265,6 +265,69 @@ pub fn rope_pairing(arch: &str) -> Result<bool, String> {
     }
 }
 
+/// How the projector that follows a speech encoder maps its frames to embeddings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioProjector {
+    /// Stack the frames, then `linear - GELU - linear`.
+    GeluMlp,
+    /// Stack the frames, then RMSNorm, `linear`, SwiGLU gated by its second half, RMSNorm,
+    /// `linear`.
+    GatedMlp,
+}
+
+/// What a speech tower's files do not say about how its model is prompted and fed.
+///
+/// An `mmproj` file states the encoder's shape and the projector's type; the feature
+/// extractor and the prompt format live in the model's own code. They are listed here, one
+/// row per `clip.projector_type` (the same word is the `model_type` of a checkpoint
+/// configuration that declares an `audio_config`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioFacts {
+    pub projector: AudioProjector,
+    /// Where in a prompt the embeddings go. It need not be a vocabulary entry: the prompt
+    /// text is split around it and the embeddings take its place.
+    pub placeholder: &'static str,
+    /// What opens the audio in the prompt, written before the placeholder; empty for none.
+    pub begin: &'static str,
+    /// The clip is zero-padded to whole encoder windows before the spectrogram, so every
+    /// window is full and each yields the same number of embeddings. Otherwise only the last
+    /// window is short and yields what its frames give.
+    pub pads_to_window: bool,
+}
+
+const AUDIO: &[(&str, AudioFacts)] = &[
+    // Padded to whole 30 s windows; the audio sits between a begin marker and the question.
+    (
+        "voxtral",
+        AudioFacts {
+            projector: AudioProjector::GeluMlp,
+            placeholder: "[AUDIO]",
+            begin: "[BEGIN_AUDIO]",
+            pads_to_window: true,
+        },
+    ),
+    // Not padded: the last window carries its own length. The placeholder is not a
+    // vocabulary entry.
+    (
+        "ultravox",
+        AudioFacts {
+            projector: AudioProjector::GatedMlp,
+            placeholder: "<|audio|>",
+            begin: "",
+            pads_to_window: false,
+        },
+    ),
+];
+
+/// The audio facts of a projector type (or checkpoint model type), `None` when the table has
+/// no row for it.
+pub fn audio_facts(projector_type: &str) -> Option<&'static AudioFacts> {
+    AUDIO
+        .iter()
+        .find(|(k, _)| *k == projector_type)
+        .map(|(_, f)| f)
+}
+
 /// Period of the layers of `arch` that skip RoPE, `None` when every layer rotates.
 pub fn no_rope_layer_period(arch: &str) -> Option<usize> {
     facts(arch).and_then(|f| f.no_rope_period)
@@ -311,6 +374,13 @@ mod tests {
         assert!(rope_pairing("")
             .unwrap_err()
             .contains("general.architecture"));
+    }
+
+    #[test]
+    fn a_speech_projector_has_one_row() {
+        assert!(audio_facts("voxtral").is_some_and(|f| f.pads_to_window));
+        assert!(audio_facts("ultravox").is_some_and(|f| !f.pads_to_window));
+        assert!(audio_facts("pixtral").is_none());
     }
 
     #[test]

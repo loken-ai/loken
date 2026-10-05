@@ -1,0 +1,14 @@
+{
+ "model_type": "ultravox",
+ "stack_factor": 4,
+ "hidden_size": 48,
+ "projector_ln_mid": true,
+ "audio_config": {
+  "d_model": 32,
+  "encoder_layers": 2,
+  "encoder_attention_heads": 4,
+  "encoder_ffn_dim": 64,
+  "num_mel_bins": 16,
+  "max_source_positions": 1500
+ }
+}

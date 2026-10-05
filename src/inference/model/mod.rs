@@ -10,6 +10,9 @@ pub mod acestep;
 pub mod adaln;
 /// The attention every encoder-decoder in the tree runs.
 pub mod attention;
+/// Audio as a prompt's input: the speech encoder, projector and features.
+#[cfg(feature = "audio")]
+pub mod audio_in;
 pub mod block;
 pub mod boogu;
 pub mod clip;
