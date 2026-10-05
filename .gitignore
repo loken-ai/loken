@@ -76,3 +76,6 @@ scripts/oracle/*.o
 *~
 *.swp
 *.swo
+
+# Release archives from scripts/build-portable.sh.
+/dist/

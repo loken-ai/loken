@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Build: scripts/build-portable.sh packages Linux archives, with or without CUDA.
 - Sparse attention: the indexer selects and attends on the card, decode and prefill.
 - Experts: tensor-core kernels for the IQ formats and q2_0, integer sums on the host.
 

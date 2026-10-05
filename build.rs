@@ -46,66 +46,10 @@ fn main() {
     };
     println!("cargo:rustc-env=LOKEN_VERSION={version}");
 
+    link_cxx_runtime_statically();
+
     println!("cargo:rerun-if-changed=src/inference/sampling_kernels.cu");
     println!("cargo:rerun-if-changed=src/inference/sampling_kernels.h");
-
-    // Add cuDNN library search path
-    #[cfg(feature = "cuda")]
-    {
-        if cfg!(target_os = "windows") {
-            // cuDNN 9.x on Windows installs to a separate directory
-            for version in &["v9.20", "v9.10", "v9.9", "v9.8"] {
-                for cuda_ver in &["13.2", "12.9", "12.6"] {
-                    let cudnn_path = format!(
-                        "C:/Program Files/NVIDIA/CUDNN/{}/lib/{}/x64",
-                        version, cuda_ver
-                    );
-                    if std::path::Path::new(&cudnn_path).is_dir() {
-                        println!("cargo:rustc-link-search=native={}", cudnn_path);
-                    }
-                }
-            }
-        } else {
-            // Linux: probe standard cuDNN locations
-            let cuda_path = std::env::var("CUDA_PATH")
-                .or_else(|_| std::env::var("CUDA_HOME"))
-                .unwrap_or_else(|_| "/usr/local/cuda".to_string());
-
-            // Standard CUDA lib directory
-            let cuda_lib64 = format!("{}/lib64", cuda_path);
-            if std::path::Path::new(&cuda_lib64).is_dir() {
-                println!("cargo:rustc-link-search=native={}", cuda_lib64);
-            }
-
-            // cuDNN standalone installs (e.g. /usr/local/cuda/cudnn-linux-x86_64-9.x.x.x_cudaXX-archive/lib)
-            if let Ok(entries) = std::fs::read_dir(&cuda_path) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if name_str.starts_with("cudnn") && name_str.contains("linux") {
-                        let cudnn_lib = entry.path().join("lib");
-                        if cudnn_lib.is_dir() {
-                            println!("cargo:rustc-link-search=native={}", cudnn_lib.display());
-                        }
-                    }
-                }
-            }
-
-            // System library paths
-            for path in &["/usr/lib/x86_64-linux-gnu", "/usr/lib64"] {
-                if std::path::Path::new(path).is_dir() {
-                    println!("cargo:rustc-link-search=native={}", path);
-                }
-            }
-
-            // CUDNN_LIB env override
-            if let Ok(cudnn_lib) = std::env::var("CUDNN_LIB") {
-                if std::path::Path::new(&cudnn_lib).is_dir() {
-                    println!("cargo:rustc-link-search=native={}", cudnn_lib);
-                }
-            }
-        }
-    }
 
     // WMMA/IMMA tensor-core kernels that NVRTC cannot JIT-compile (they use
     // `mma.sync` + cuda_runtime.h <<<>>> host launchers). These are relocated
@@ -118,6 +62,31 @@ fn main() {
         compile_mmq_kernels();
         compile_marlin_kernels();
         compile_flashdecode_tc_kernels();
+    }
+}
+
+/// With `LOKEN_STATIC_CXX` set, links the C++ runtime into the binary so it needs no
+/// libstdc++ on the machine that runs it. The archive is found through the compiler that will
+/// link it; when that compiler has none, the build keeps the shared library.
+fn link_cxx_runtime_statically() {
+    println!("cargo:rerun-if-env-changed=LOKEN_STATIC_CXX");
+    if std::env::var_os("LOKEN_STATIC_CXX").is_none() {
+        return;
+    }
+    let compiler = std::env::var("CXX").unwrap_or_else(|_| "g++".to_string());
+    let archive = std::process::Command::new(compiler)
+        .arg("-print-file-name=libstdc++.a")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| std::path::PathBuf::from(text.trim()));
+    match archive.as_deref().and_then(std::path::Path::parent) {
+        Some(dir) if archive.as_ref().is_some_and(|a| a.is_file()) => {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=stdc++");
+        }
+        _ => println!("cargo:warning=LOKEN_STATIC_CXX set but libstdc++.a was not found"),
     }
 }
 
