@@ -19,6 +19,22 @@ loaded loads it, and a model stays resident for the keep-alive the daemon was st
 Quantisations are read as the file carries them. On the cards the block formats run through
 their own kernels; on the host they need AVX2 (see [`BUILDING.md`](BUILDING.md)).
 
+| Tensor formats a GGUF may carry | |
+|---|---|
+| Float | `F32`, `F16`, `BF16` |
+| Legacy blocks | `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1` |
+| K-quants | `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K` |
+| Others | `IQ2_XXS`, `MXFP4` |
+
+A file that stores a tensor in another format is refused with the format's id. Token and
+per-layer embedding tables stay as stored and a lookup decodes the rows it needs. A load that
+rebuilds a weight in another representation logs one ledger line with the bytes before and
+after.
+
+A pull follows the daemon's streamed progress and stops when no frame arrives for a multiple of
+the longest gap seen, `--stall-factor` (see [`CONFIGURATION.md`](CONFIGURATION.md)). A repository
+holding a model GGUF and its `mmproj` resolves to the model file; the projector is its companion.
+
 A GGUF split into parts by `gguf-split` is read as one model on the generic route: the first
 part's metadata, the union of the parts' tensor directories, each tensor read from the part
 that holds it. It is named by its first part, and a part whose siblings are missing is refused.
@@ -45,6 +61,13 @@ Mixtures route their experts on the card, and spill experts alone when the model
 the recurrent hybrids (`lfm2moe`, `nemotron_h_moe`, `qwen3next`) carry their state-space blocks
 beside attention. Reasoning models return their thinking apart from the answer on every
 surface; gpt-oss speaks Harmony and is read as such.
+
+DeepSeek V4.1 has a loader of its own, chosen by what the file or the checkpoint directory
+contains (hyper-connection tensors), not by name. Its routed experts stay in the file, which may
+be split, and are read as routing asks for them; the always-read weights and the busiest experts
+sit on the cards. A routing prior the file lacks is borrowed from a companion GGUF beside it,
+found by the metadata it declares. Sharding across machines runs for this model only, see
+[`CLUSTER.md`](CLUSTER.md).
 
 Vision: `moondream`, `pixtral`, the Qwen vision lines (`qwen25` vision, `qwen3vl`). Images travel
 base64 in the request on all three surfaces.
