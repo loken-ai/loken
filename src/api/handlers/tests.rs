@@ -464,6 +464,74 @@ fn vision_is_read_from_the_files() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// A model's speech input is read from its files: a projector beside its GGUF file whose
+/// header declares an audio encoder this build reads, or a checkpoint whose configuration
+/// declares an `audio_config`. A vision projector beside it is not a speech tower.
+#[cfg(feature = "audio")]
+#[test]
+fn audio_input_is_read_from_the_files() {
+    use crate::tensor::gguf_write::write_gguf_with_metadata;
+    use crate::tensor::quantized::gguf_file::Value;
+    let root = std::env::temp_dir().join(format!("loken-audio-{}", std::process::id()));
+    let flat = root.join("flat");
+    let ckpt = root.join("ckpt");
+    std::fs::create_dir_all(&flat).unwrap();
+    std::fs::create_dir_all(&ckpt).unwrap();
+    let model = flat.join("model.gguf");
+    std::fs::write(&model, b"").unwrap();
+    assert!(!files_carry_audio(&model));
+
+    let header = |kind: &str, audio: bool| {
+        vec![
+            (
+                "general.architecture".to_string(),
+                Value::String("clip".to_string()),
+            ),
+            ("clip.has_audio_encoder".to_string(), Value::Bool(audio)),
+            (
+                "clip.projector_type".to_string(),
+                Value::String(kind.to_string()),
+            ),
+        ]
+    };
+    let projector = flat.join("mmproj-model-f16.gguf");
+    write_gguf_with_metadata(&projector, &header("pixtral", false), &[]).unwrap();
+    assert!(files_carry_vision(&model) && !files_carry_audio(&model));
+    // An audio flag with none of the tower's keys is not a tower this build reads.
+    write_gguf_with_metadata(&projector, &header("unheard-of", true), &[]).unwrap();
+    assert!(!files_carry_audio(&model));
+    let mut speech = header("voxtral", true);
+    for key in [
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "num_mel_bins",
+        "projector.stack_factor",
+        "projection_dim",
+    ] {
+        speech.push((format!("clip.audio.{key}"), Value::U32(4)));
+    }
+    speech.push((
+        "clip.audio.attention.layer_norm_epsilon".to_string(),
+        Value::F32(1e-5),
+    ));
+    write_gguf_with_metadata(&projector, &speech, &[]).unwrap();
+    assert!(files_carry_audio(&model));
+    // A repository snapshot is a directory holding both files.
+    assert!(files_carry_audio(&flat));
+
+    std::fs::write(ckpt.join("config.json"), r#"{"model_type": "ultravox"}"#).unwrap();
+    assert!(!files_carry_audio(&ckpt));
+    std::fs::write(
+        ckpt.join("config.json"),
+        r#"{"model_type": "ultravox", "audio_config": {}}"#,
+    )
+    .unwrap();
+    assert!(files_carry_audio(&ckpt));
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn a_declared_text_model_is_offered_for_chat_or_embedding() {
     // What `/api/tags` advertises drives what an SDK will route at a model: a text LLM that

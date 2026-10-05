@@ -506,6 +506,13 @@ pub(crate) fn hub_root(hf: PathBuf) -> PathBuf {
     }
 }
 
+/// Whether `p` is the `mmproj` of a vision or speech tower: a companion of the model file,
+/// never the model.
+fn is_projector_file(p: &std::path::Path) -> bool {
+    p.file_name()
+        .is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with("mmproj"))
+}
+
 /// The GGUF of a hub repository id `org/name[:selector]` inside the cache roots: any snapshot
 /// of the repository, at any depth, since a repository keeps each quantisation in its own
 /// directory. The selector, when given, must appear in the path below the snapshot; a split
@@ -536,7 +543,7 @@ pub(crate) fn resolve_hub_gguf(model_id: &str, roots: &[PathBuf]) -> Option<Path
                 for p in entries.flatten().map(|e| e.path()) {
                     if p.is_dir() {
                         stack.push(p);
-                    } else if p.extension().is_some_and(|e| e == "gguf") {
+                    } else if p.extension().is_some_and(|e| e == "gguf") && !is_projector_file(&p) {
                         let rel = p
                             .strip_prefix(&snap)
                             .unwrap_or(&p)
@@ -633,6 +640,8 @@ mod hub_gguf_tests {
         let root = std::env::temp_dir().join(format!("loken-hub-gguf-{}", std::process::id()));
         let snap = root.join("models--org--one").join("snapshots").join("abc");
         touch(&snap.join("one-q4.gguf"));
+        // The projector beside it is no second candidate.
+        touch(&snap.join("mmproj-one-f16.gguf"));
         let snap2 = root.join("models--org--two").join("snapshots").join("def");
         touch(&snap2.join("Q2_K").join("two-Q2_K-00001-of-00003.gguf"));
         touch(&snap2.join("Q2_K").join("two-Q2_K-00002-of-00003.gguf"));
