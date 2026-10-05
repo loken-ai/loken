@@ -38,6 +38,11 @@ pub struct AwqConfigJson {
     pub awq_bits: usize,
     /// rope_scaling block (yarn) raw fields if present.
     pub yarn: Option<(f32, f32)>, // (factor, original_max_position)
+    /// The frequency-dependent rope scaling of a long-context checkpoint:
+    /// `(factor, low_freq_factor, high_freq_factor, original_max_position)`.
+    pub frequency_scaling: Option<(f32, f32, f32, f32)>,
+    /// Whether the checkpoint carries a `quantization_config`; a dense one does not.
+    pub quantized: bool,
     pub tie_word_embeddings: bool,
 }
 
@@ -48,10 +53,13 @@ pub fn map_hf_arch(hf: &str) -> Result<&'static str> {
     Ok(match hf {
         "Qwen2ForCausalLM" => "qwen2",
         "Qwen3ForCausalLM" => "qwen3",
-        "MistralForCausalLM" | "Mistral3ForCausalLM" | "MistralForConditionalGeneration" => "llama",
+        "LlamaForCausalLM"
+        | "MistralForCausalLM"
+        | "Mistral3ForCausalLM"
+        | "MistralForConditionalGeneration" => "llama",
         other => {
             return Err(anyhow!(
-                "AWQ: unsupported architecture {other} (dense qwen2/qwen3/mistral only)"
+                "unsupported checkpoint architecture {other} (dense qwen2/qwen3/llama/mistral only)"
             ))
         }
     })
@@ -78,9 +86,33 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
     let n_head = u("num_attention_heads").ok_or_else(|| anyhow!("missing num_attention_heads"))?;
     let n_kv_head = u("num_key_value_heads").unwrap_or(n_head);
 
-    let qc = g("quantization_config").ok_or_else(|| anyhow!("missing quantization_config"))?;
-    let group_size = qc.get("group_size").and_then(|x| x.as_u64()).unwrap_or(128) as usize;
-    let awq_bits = qc.get("bits").and_then(|x| x.as_u64()).unwrap_or(4) as usize;
+    // A dense checkpoint carries none; its group size and width are never read.
+    let qc = g("quantization_config");
+    let group_size = qc
+        .and_then(|q| q.get("group_size"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or(128) as usize;
+    let awq_bits = qc
+        .and_then(|q| q.get("bits"))
+        .and_then(|x| x.as_u64())
+        .unwrap_or(4) as usize;
+    let frequency_scaling = g("rope_scaling").and_then(|rs| {
+        let t = rs
+            .get("rope_type")
+            .or_else(|| rs.get("type"))
+            .and_then(|x| x.as_str());
+        // ARCH-NAME-EXEMPT: the `rope_type` a checkpoint's configuration declares.
+        if t != Some("llama3") {
+            return None;
+        }
+        let f = |k: &str| rs.get(k).and_then(|x| x.as_f64()).map(|x| x as f32);
+        Some((
+            f("factor")?,
+            f("low_freq_factor")?,
+            f("high_freq_factor")?,
+            f("original_max_position_embeddings")?,
+        ))
+    });
 
     let yarn = g("rope_scaling").and_then(|rs| {
         let t = rs
@@ -121,6 +153,8 @@ pub fn parse_config_json(dir: &str) -> Result<AwqConfigJson> {
         group_size,
         awq_bits,
         yarn,
+        frequency_scaling,
+        quantized: qc.is_some(),
         tie_word_embeddings: g("tie_word_embeddings")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
@@ -256,4 +290,44 @@ pub fn find_awq_model_dir(candidate: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Per-pair frequency divisors of a long-context rope: pairs whose wavelength is short keep
+/// their frequency, pairs whose wavelength is long are divided by `factor`, and those between
+/// are interpolated. `[head_dim / 2]`.
+pub fn frequency_factors(head_dim: usize, base: f32, scaling: (f32, f32, f32, f32)) -> Vec<f32> {
+    let (factor, low, high, original) = scaling;
+    let (low_wavelength, high_wavelength) = (original / low, original / high);
+    (0..head_dim / 2)
+        .map(|i| {
+            let freq = 1.0 / base.powf(2.0 * i as f32 / head_dim as f32);
+            let wavelength = 2.0 * std::f32::consts::PI / freq;
+            if wavelength < high_wavelength {
+                1.0
+            } else if wavelength > low_wavelength {
+                factor
+            } else {
+                let smooth = (original / wavelength - low) / (high - low);
+                1.0 / ((1.0 - smooth) / factor + smooth)
+            }
+        })
+        .collect()
+}
+
+/// A checkpoint directory of dense floating-point weights this loader reads: no
+/// quantisation, a supported text architecture, and the layers' tensors in its shards.
+pub fn find_dense_model_dir(candidate: &str) -> Option<String> {
+    let dir = std::path::Path::new(candidate);
+    let txt = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    if v.get("quantization_config").is_some() {
+        return None;
+    }
+    let arch = v.get("architectures")?.get(0)?.as_str()?;
+    map_hf_arch(arch).ok()?;
+    let has_shard = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .any(|e| e.path().extension().is_some_and(|x| x == "safetensors"));
+    has_shard.then(|| candidate.to_string())
 }

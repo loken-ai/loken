@@ -69,14 +69,39 @@ impl GenericWeights<'_> {
                 max_kv_seq_len,
                 stem_on_card,
             ),
-            GenericWeights::Awq { dir, shards } => GenericHeteroTransformer::from_awq_safetensors(
-                dir,
-                shards,
-                cuda_devices,
-                plan,
-                kv_quant,
-                max_kv_seq_len,
-            ),
+            GenericWeights::Awq { dir, shards } => {
+                use crate::inference::load::awq_loader as awql;
+                let quantized = awql::parse_config_json(dir)
+                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?
+                    .quantized;
+                if quantized {
+                    return GenericHeteroTransformer::from_awq_safetensors(
+                        dir,
+                        shards,
+                        cuda_devices,
+                        plan,
+                        kv_quant,
+                        max_kv_seq_len,
+                    );
+                }
+                // A dense checkpoint: the header is read as the quantised route reads it, the
+                // tensors are mapped under the names the loader asks for.
+                let cfg = awql::parse_config_json(dir)
+                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+                let (header, _) =
+                    awq_checkpoint(dir).map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+                let ck = crate::inference::generic_transformer::DenseCheckpoint::open(
+                    &header, shards, &cfg,
+                )?;
+                GenericHeteroTransformer::from_dense_checkpoint(
+                    &ck,
+                    cuda_devices,
+                    plan,
+                    kv_quant,
+                    max_kv_seq_len,
+                    stem_on_card,
+                )
+            }
         }
     }
 
@@ -244,11 +269,12 @@ pub(super) fn awq_checkpoint(dir: &str) -> AnyResult<(gguf_file::Content, Vec<St
 }
 
 pub(super) fn resolve_awq_dir(candidate: &str) -> Option<String> {
-    use crate::inference::load::awq_loader::find_awq_model_dir;
+    use crate::inference::load::awq_loader::{find_awq_model_dir, find_dense_model_dir};
+    let is_checkpoint = |dir: &str| find_awq_model_dir(dir).or_else(|| find_dense_model_dir(dir));
     if candidate.is_empty() {
         return None;
     }
-    if find_awq_model_dir(candidate).is_some() {
+    if is_checkpoint(candidate).is_some() {
         return Some(candidate.to_string());
     }
     let snaps = format!("{candidate}/snapshots");
@@ -261,7 +287,7 @@ pub(super) fn resolve_awq_dir(candidate: &str) -> Option<String> {
             .collect();
         dirs.sort();
         for p in dirs {
-            if find_awq_model_dir(&p).is_some() {
+            if is_checkpoint(&p).is_some() {
                 return Some(p);
             }
         }

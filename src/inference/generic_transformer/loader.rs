@@ -164,6 +164,9 @@ struct TensorSource<'a> {
     parts: Vec<TensorPart<'a>>,
     /// Which part holds a tensor. Empty for one file: every tensor is in it.
     owner: HashMap<String, usize>,
+    /// The Q and K rows are in the order the checkpoint's framework wrote them, not the
+    /// order a GGUF converter leaves them in.
+    hf_rows: bool,
 }
 
 struct TensorPart<'a> {
@@ -177,6 +180,7 @@ impl<'a> TensorSource<'a> {
     /// One mapped file: every tensor is in it.
     fn one(content: &'a gguf_file::Content, bytes: &'a [u8]) -> Self {
         Self {
+            hf_rows: false,
             owner: HashMap::new(),
             parts: vec![TensorPart {
                 content,
@@ -203,7 +207,43 @@ impl<'a> TensorSource<'a> {
                 owner: Some(mapped),
             });
         }
-        Self { parts, owner }
+        Self {
+            parts,
+            owner,
+            hf_rows: false,
+        }
+    }
+
+    /// A dense checkpoint's shards, then the tensors computed for it.
+    fn of_dense(ck: &'a super::dense::DenseCheckpoint) -> Self {
+        let mut owner = HashMap::new();
+        let mut parts = Vec::new();
+        for part in &ck.parts {
+            let index = parts.len();
+            for name in part.content.tensor_infos.keys() {
+                owner.insert(name.clone(), index);
+            }
+            let mapped: std::sync::Arc<dyn std::any::Any + Send + Sync> = part.mmap.clone();
+            parts.push(TensorPart {
+                content: &part.content,
+                bytes: &part.mmap[..],
+                owner: Some(mapped),
+            });
+        }
+        let index = parts.len();
+        for name in ck.computed.0.tensor_infos.keys() {
+            owner.insert(name.clone(), index);
+        }
+        parts.push(TensorPart {
+            content: &ck.computed.0,
+            bytes: &ck.computed.1[..],
+            owner: None,
+        });
+        Self {
+            parts,
+            owner,
+            hf_rows: true,
+        }
     }
 
     /// The part a tensor's bytes are in.
@@ -231,6 +271,46 @@ impl<'a> TensorSource<'a> {
         let Some(info) = part.content.tensor_infos.get(name) else {
             return Ok(None);
         };
+        if self.hf_rows
+            && info.shape.dims().len() == 1
+            && info.ggml_dtype != crate::tensor::quantized::GgmlDType::F32
+        {
+            // CONVERSION: a norm scale or a bias is a small vector held F32, whatever the
+            // checkpoint stores; the F16 and BF16 decodes of the host come back in their own
+            // width, which the norms do not read.
+            let stored = info.read_slice_owned(
+                part.bytes,
+                part.content.tensor_data_offset,
+                &Device::Cpu,
+                part.owner.as_ref(),
+            )?;
+            let wide = stored.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?;
+            return Ok(Some(QTensor::quantize_onto(
+                &wide,
+                crate::tensor::quantized::GgmlDType::F32,
+                device,
+            )?));
+        }
+        if self.hf_rows && info.ggml_dtype == crate::tensor::quantized::GgmlDType::BF16 {
+            // CONVERSION: no kernel reads BF16 weights. On a card the narrowest width the kernels
+            // read is F16, the same size; a weight below F16's smallest normal loses precision,
+            // one past its range would overflow (none of a trained model's does). On the host
+            // the kernels read F32 or blocks, so the weight widens to F32, twice its size. Each
+            // weight passes through F32 on the host, one tensor at a time.
+            let stored = info.read_slice_owned(
+                part.bytes,
+                part.content.tensor_data_offset,
+                &Device::Cpu,
+                part.owner.as_ref(),
+            )?;
+            let wide = stored.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?;
+            let width = if device.is_cpu() {
+                crate::tensor::quantized::GgmlDType::F32
+            } else {
+                crate::tensor::quantized::GgmlDType::F16
+            };
+            return Ok(Some(QTensor::quantize_onto(&wide, width, device)?));
+        }
         Ok(Some(info.read_slice_owned(
             part.bytes,
             part.content.tensor_data_offset,
@@ -2134,6 +2214,26 @@ impl GenericHeteroTransformer {
         )
     }
 
+    /// A dense safetensors checkpoint read as one model, its tensors in their stored width.
+    pub fn from_dense_checkpoint(
+        ck: &super::dense::DenseCheckpoint,
+        cuda_devices: &HashMap<usize, Device>,
+        plan: &HeteroPlan,
+        kv_quant: crate::inference::engine::llm_engine::KvQuant,
+        max_kv_seq_len: Option<usize>,
+        stem_on_card: bool,
+    ) -> Result<Self> {
+        Self::from_gguf_source(
+            &ck.content,
+            TensorSource::of_dense(ck),
+            cuda_devices,
+            plan,
+            kv_quant,
+            max_kv_seq_len,
+            stem_on_card,
+        )
+    }
+
     /// The load itself: `content` is the header the model is read from - one file's, or a set's
     /// union - and `source` says where each tensor's bytes are.
     fn from_gguf_source(
@@ -2165,6 +2265,12 @@ impl GenericHeteroTransformer {
 
         let mut cfg = GenericTransformerConfig::from_gguf(content, &arch)?;
         cfg.kv_quant = kv_quant;
+        // The rows of a dense checkpoint pair each rotary lane with the one half a head away;
+        // adjacent pairing belongs to GGUF files, whose converter reorders the rows of the
+        // architectures that use it.
+        if source.hf_rows {
+            cfg.flags.use_rope_i = false;
+        }
         // Cap the per-layer Q8/Q4 KV allocation at the user's configured
         // context_length when supplied - otherwise GGUF's native
         // (often 128K/256K) eagerly allocates gigabytes that may OOM.
@@ -3983,6 +4089,7 @@ mod host_layer_bytes_tests {
                 owner,
             }],
             owner: HashMap::new(),
+            hf_rows: false,
         };
         let (owned, mapped) = part(None).host_layer_bytes(1);
         assert_eq!((owned, mapped), (total, 0));

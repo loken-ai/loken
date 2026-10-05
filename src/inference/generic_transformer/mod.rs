@@ -47,6 +47,7 @@ mod wide_tests;
 mod config;
 #[cfg(test)]
 mod conversion_tests;
+mod dense;
 #[cfg(feature = "cuda")]
 pub mod expert_tier;
 #[cfg(not(feature = "cuda"))]
@@ -71,6 +72,7 @@ mod state_cache_tests;
 mod verify_decode_parity;
 mod wide;
 pub use config::*;
+pub use dense::DenseCheckpoint;
 pub use moe_weights::*;
 
 pub(crate) use rayon::prelude::*;
