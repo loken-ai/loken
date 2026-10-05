@@ -98,8 +98,13 @@ pub(crate) fn with_oom_retry<T>(
             // The call stack, when RUST_LIB_BACKTRACE asks for it, names the allocation
             // that did not fit; without it the stack is not captured.
             let stack = std::backtrace::Backtrace::capture();
+            // PLACEMENT-EXEMPT: read only to say in the warning below how full the card was.
+            let free = dev.context().mem_get_info().map_or_else(
+                |_| String::new(),
+                |(free, total)| format!(" ({} of {} MB free)", free >> 20, total >> 20),
+            );
             tracing::warn!(
-                "cuda OOM in {ctx} on GPU{}; reclaiming pool and retrying once{}",
+                "cuda OOM in {ctx} on GPU{}{free}; reclaiming pool and retrying once{}",
                 dev.ordinal(),
                 match stack.status() {
                     std::backtrace::BacktraceStatus::Captured => format!("\n{stack}"),
