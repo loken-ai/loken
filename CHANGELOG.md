@@ -37,6 +37,12 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Requant: a model into a new tag, on the GPU, as detached work.
 - Loading: a split GGUF as one source; a BPE or Unigram tokenizer from it.
 - Loading: a split GGUF set on the generic route, read as one model part by part.
+- Models: the qwen4exp architecture on the generic route: wide residual, delta-rule and indexed
+  attention layers, a sparsely read n-gram table, 160 to 512 routed experts.
+- Formats: IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S and Q2_0 read, and run on a card for experts.
+- Offload: host experts cached on the cards by use, a wide batch's experts streamed through two
+  buffers, a cache plan for a file with no room to prefill.
+- CLI: `loken pull owner/repo:SELECTOR` fetches one quantisation of a GGUF repository.
 - Tests: a gate requires every conversion of a stored weight to state its reason.
 - CLI: `loken pull --stall-factor`, the multiple of the longest frame gap that stops a pull.
 - Cluster: routing for every surface, handing a model or render to a peer.
@@ -67,6 +73,9 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Loading: a card allocation failure reports how full the card was.
+- Attention: the sparse layer's scores are bounded to a block of rows, its cache held at half
+  width on a card.
 - Placement: the KV cache is priced by the cache the layers build, not a byte per element.
 - Catalogue: a repository holding a model and its projector resolves to the model file.
 - Tests: the demand-ledger tests take turns, so a module's parallelism no longer fails them.
