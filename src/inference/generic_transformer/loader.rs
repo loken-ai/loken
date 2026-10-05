@@ -493,15 +493,17 @@ impl LayerRopes {
             format!("{yarn:?}"),
             len,
         );
-        let mut tables = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(t) = tables.get(&key) {
+        if let Some(t) = self.0.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Ok(t.clone());
         }
+        // Built with no lock held: the build runs on the pool whose workers are the other callers
+        // of this function, and a worker waiting for the lock cannot finish the work its holder
+        // is waiting for.
         let t = crate::inference::generic_transformer::rope::precomput_freqs_cis_yarn(
             dim, base, yarn, len, device,
         )?;
-        tables.insert(key, t.clone());
-        Ok(t)
+        let mut tables = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(tables.entry(key).or_insert(t).clone())
     }
 }
 
