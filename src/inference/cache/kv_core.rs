@@ -189,7 +189,7 @@ impl KvCore {
     pub fn note_kernel_bound(&self, bound: usize) {
         let _ = self
             .kernel_bound_seen
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seen| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |seen| {
                 (seen == 0 || bound < seen).then_some(bound)
             });
     }

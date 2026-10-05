@@ -1412,7 +1412,7 @@ pub fn vram_degrade_reset() {
 
 /// Takes back `rungs` notches one escalation raised, never below zero.
 pub fn vram_degrade_lower(rungs: u64) {
-    let _ = VRAM_DEGRADE.fetch_update(
+    let _ = VRAM_DEGRADE.try_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |level| Some(level.saturating_sub(rungs)),
