@@ -1059,7 +1059,7 @@ impl DeepseekV41Backend {
     }
 
     /// Restore prompt prefixes from, and write finished prompts and turns to, `store`, under
-    /// `identity`: the model files, the numerics and the operator's salt the states belong to.
+    /// `identity`: the model files and the numerics the states belong to.
     pub(crate) fn with_state_cache(
         mut self,
         store: std::sync::Arc<crate::inference::cache::state_disk::StateStore>,

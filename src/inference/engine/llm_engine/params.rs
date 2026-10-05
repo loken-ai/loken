@@ -165,10 +165,6 @@ pub struct InferenceConfig {
     pub state_cache_dir: Option<String>,
     /// Bytes the decode-state cache may hold, in GiB; 0 derives it from the free space.
     pub state_cache_budget_gb: f64,
-    /// Tokens per block of the cache's hash chain; 0 derives it per model.
-    pub state_cache_block_tokens: usize,
-    /// Mixed into the identity of every stored state.
-    pub state_cache_salt: String,
     /// Where `/v1/files` keeps uploads and batch outputs; `None` uses `files/` beside
     /// the model store.
     pub files_dir: Option<String>,
@@ -240,8 +236,6 @@ impl Default for InferenceConfig {
             kv_disk_budget_gb: 0.0,
             state_cache_dir: None,
             state_cache_budget_gb: 0.0,
-            state_cache_block_tokens: 0,
-            state_cache_salt: String::new(),
             files_dir: None,
             moderation_model: None,
             public_url: None,

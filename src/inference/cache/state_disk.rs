@@ -115,7 +115,7 @@ impl Drop for WriteTicket {
 }
 
 /// The identity of a model's numerics from the parts that define them, in order: a part that
-/// changes (a file digest, a numerics setting, the operator's salt) gives another identity.
+/// changes (a file digest, a numerics setting) gives another identity.
 pub fn identity(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"loken state identity");

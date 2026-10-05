@@ -274,7 +274,6 @@ impl LlmEngine {
         let expert_deferral = self.config.expert_deferral;
         let quality_budget = self.config.quality_budget;
         let state_cache = self.state_cache.clone();
-        let state_cache_salt = self.config.state_cache_salt.clone();
         let user_context_length = self.config.context_length;
         let model_state = self.model_state.clone();
         let cached_model_size = self.cached_model_size.clone();
@@ -300,7 +299,7 @@ impl LlmEngine {
                     &model_file,
                     &model_id_clone,
                     user_context_length,
-                    state_cache.clone().map(|store| (store, state_cache_salt.clone())),
+                    state_cache.clone(),
                 )?;
                 state.generation_defaults = generation_defaults.clone();
                 let fsz = state.file_size;
@@ -840,7 +839,6 @@ impl LlmEngine {
                                     &files.finish(),
                                     &expert_deferral.to_le_bytes(),
                                     &(n_layers as u64).to_le_bytes(),
-                                    state_cache_salt.as_bytes(),
                                 ]),
                                 cfg.state_bytes_per_token(),
                             );
@@ -1157,7 +1155,6 @@ impl LlmEngine {
                         let identity = crate::inference::cache::state_disk::identity(&[
                             &files.finish(),
                             format!("{kv_quant:?}").as_bytes(),
-                            state_cache_salt.as_bytes(),
                         ]);
                         if model.attach_state_cache(store, identity) {
                             info!("state cache on for {arch}");

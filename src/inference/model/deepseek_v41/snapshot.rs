@@ -76,7 +76,7 @@ pub struct Snapshot {
 }
 
 /// The identity of a model's numerics from the parts that define them, in order. A part that
-/// changes - a file digest, a numerics setting, the operator's salt - gives another identity.
+/// changes - a file digest, a numerics setting - gives another identity.
 pub fn identity(parts: &[&[u8]]) -> Identity {
     let mut h = Sha256::new();
     h.update(b"loken decode-state identity");

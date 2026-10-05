@@ -83,13 +83,6 @@ pub struct InferenceConfigToml {
     /// of the cache directory's filesystem.
     #[serde(default)]
     pub state_cache_budget_gb: f64,
-    /// Tokens per block of the cache's hash chain; 0 derives one per model from its state size
-    /// and the directory's measured write cost. Changing it orphans the stored states.
-    #[serde(default)]
-    pub state_cache_block_tokens: usize,
-    /// Mixed into every state's identity: states written under another salt are never read.
-    #[serde(default)]
-    pub state_cache_salt: String,
     #[serde(default)]
     pub files_dir: Option<String>,
     #[serde(default)]
@@ -111,6 +104,21 @@ pub struct InferenceConfigToml {
     /// loads; each is reported once at startup.
     #[serde(flatten, skip_serializing)]
     pub obsolete: std::collections::BTreeMap<String, toml::Value>,
+}
+
+/// What to tell an operator whose configuration names a key this version no longer reads.
+pub fn obsolete_note(key: &str) -> String {
+    match key {
+        "state_cache_block_tokens" => {
+            "the block size of the state cache is derived from the model's state size and the \
+             directory's write cost"
+                .to_string()
+        }
+        "state_cache_salt" => "a stored state is identified by the model's files and the plan; \
+             a salt adds nothing"
+            .to_string(),
+        _ => "loken decides it from the model and the machine".to_string(),
+    }
 }
 
 /// Energy-reporting configuration (`[energy]` section). All optional with sane
@@ -270,8 +278,6 @@ impl Config {
             kv_disk_budget_gb: toml_config.kv_disk_budget_gb,
             state_cache_dir: toml_config.state_cache_dir.clone(),
             state_cache_budget_gb: toml_config.state_cache_budget_gb,
-            state_cache_block_tokens: toml_config.state_cache_block_tokens,
-            state_cache_salt: toml_config.state_cache_salt.clone(),
             files_dir: toml_config.files_dir.clone(),
             moderation_model: toml_config.moderation_model.clone(),
             public_url: toml_config.public_url.clone(),
@@ -409,6 +415,28 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(obsolete, ["force_gpu_layers", "temperature"]);
+    }
+
+    #[test]
+    fn a_file_naming_a_derived_key_loads_and_reports_it() {
+        let toml_str = r#"
+            [inference]
+            model_id = "test-model"
+            state_cache_block_tokens = 256
+            state_cache_salt = "mine"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let keys: Vec<&str> = config
+            .inference
+            .obsolete
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["state_cache_block_tokens", "state_cache_salt"]);
+        for key in keys {
+            assert!(!obsolete_note(key).is_empty());
+        }
+        assert!(obsolete_note("state_cache_block_tokens").contains("derived"));
     }
 }
 

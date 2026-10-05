@@ -323,10 +323,7 @@ pub(super) fn load_deepseek_v41_checkpoint(
     dir: &std::path::Path,
     model_id: &str,
     user_context_length: usize,
-    state_cache: Option<(
-        std::sync::Arc<crate::inference::cache::state_disk::StateStore>,
-        String,
-    )>,
+    state_cache: Option<std::sync::Arc<crate::inference::cache::state_disk::StateStore>>,
 ) -> AnyResult<LoadedModelState> {
     use crate::inference::model::deepseek_v41::engram::EngramConfig;
     use crate::inference::model::deepseek_v41::model::DeepseekV41Model;
@@ -391,7 +388,7 @@ pub(super) fn load_deepseek_v41_checkpoint(
     );
     // The states of a prompt are stored under the shards and the configuration they were
     // computed with.
-    if let Some((store, salt)) = state_cache {
+    if let Some(store) = state_cache {
         let mut files = crate::inference::cache::state_disk::FilesDigest::new();
         let mut shards: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
             .flatten()
@@ -409,7 +406,6 @@ pub(super) fn load_deepseek_v41_checkpoint(
                     crate::inference::model::deepseek_v41::snapshot::identity(&[
                         &files.finish(),
                         &(cfg.n_layers as u64).to_le_bytes(),
-                        salt.as_bytes(),
                     ]),
                     cfg.state_bytes_per_token(),
                 );

@@ -93,8 +93,6 @@ could live, and leave the key unset where nothing about an exchange may reach th
 |---|---|---|
 | `state_cache_dir` | none | Directory of the cache. |
 | `state_cache_budget_gb` | derived | Bytes the cache may hold, in GiB. Unset or `0` derives the limit: what the cache holds plus the free space of the directory's filesystem, less room for one more state of the largest size written. Least recently used first; in each family of states sharing a first block the one restored most, the longest among equals, goes last. |
-| `state_cache_block_tokens` | derived | Tokens per block of the hash chain. Unset or `0` derives one per model, a multiple of what the model's state divides into whole groups by, large enough that a block's transfer time covers the directory's measured per-file cost (see below). Fixing it applies to every model and orphans what is stored. |
-| `state_cache_salt` | empty | Mixed into every state's identity; states written under another salt are never read. |
 
 What the cache works out for itself, from what the model, the disk and the engine report, and logs when it changes:
 
@@ -113,17 +111,17 @@ routes to nearly every expert of every layer and so reads about as many expert b
 a remainder of 250 tokens costs a little over half a cold 2000-token prompt. The batch worker and the serial path use the cache; a pipelined model does not, because half of its state is on
 the tail node.
 
-A state is also keyed by the model files (length, modification time and header) and `expert_deferral`,
-so a different file or setting starts from nothing. A damaged, truncated or foreign file is ignored
+A state is also keyed by the model files (length, modification time and header),
+so a different file starts from nothing. A damaged, truncated or foreign file is ignored
 with a log line.
 
 For a recurrent hybrid a stored state is a manifest and blocks. The manifest holds every recurrent
 mixer's state, every windowed layer's resident rows and the global layers' rows past the last whole
 block; its size depends on the model and not on the prompt. Blocks hold the global layers' rows for
-`state_cache_block_tokens` tokens, once per shared prefix, as f16 where every value is exactly an f16
+one block size of tokens (derived, see above), once per shared prefix, as f16 where every value is exactly an f16
 and as f32 otherwise, so a restore returns the stored bits. States are kept at multiples of the
 largest whole number of blocks that fits a prefill chunk, and at the end of every prompt of at least
-one block. A state is keyed by the file, `kv_quant`, the salt, the layer kinds, the row geometry and
+one block. A state is keyed by the file, `kv_quant`, the layer kinds, the row geometry and
 which layers run on a card, so another placement or KV format starts from nothing. What a restore
 removes is the prefill of the covered tokens: the recurrent state and the global KV are read from
 disk instead of recomputed, so the gain grows with the covered length and with how slow a prefill is

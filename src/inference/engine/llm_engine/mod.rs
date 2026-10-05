@@ -1352,7 +1352,7 @@ fn open_state_cache(
     match crate::inference::cache::state_disk::StateStore::open(
         std::path::PathBuf::from(dir),
         budget,
-        config.state_cache_block_tokens,
+        0,
     ) {
         Ok(store) => {
             let (n, bytes) = store.stats();
