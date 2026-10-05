@@ -41,10 +41,12 @@ configure one.
 | Log-probabilities, logit bias, seeds | the chat and completion routes | | Runs |
 | Embeddings and reranking | `/v1/embeddings`, `/api/embed`, `/v1/rerank` | | Runs |
 | Placement across cards and the host | automatic | | Measured, [STATUS](docs/STATUS.md#placement-measured-separately) |
-| Expert spilling for mixtures that do not fit | automatic | | Measured |
+| Expert spilling for mixtures that do not fit, streamed from disk when the file exceeds the host | automatic | | Measured, [STATUS](docs/STATUS.md#large-mixtures-streamed-from-disk) |
 | Continuous batching | automatic, when requests overlap | | Runs, cards only |
 | Speculative decoding | automatic for a model that spills to the host; `/api/draft/attach` | | Measured on one pair, [guide](docs/guides/drafter.md) |
 | KV reuse across conversations, on disk, past the window | automatic | `kv_disk_dir` | Runs, [guide](docs/guides/kv-memory.md) |
+| Decode-state cache for the large mixture and recurrent hybrids | automatic once set | `state_cache_dir` | Runs, off by default, [CONFIG](docs/CONFIGURATION.md#decode-state-cache-deepseek-v41-and-recurrent-hybrids) |
+| Lossy expert routing for speed, within a stated divergence | automatic once set | `quality_budget`, `expert_deferral` | DeepSeek V4.1 only, off by default, [CONFIG](docs/CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
 | Files, batches, message batches | `/v1/files`, `/v1/batches`, `/v1/messages/batches` | `files_dir` | Runs |
 | Moderation with a classifier | `/v1/moderations` | `moderation_model` | Runs, five families |
 | Images, edits, variations, adapters | `/v1/images/*`, `/v1/loras` | `lora_dir` | Judged partially, [STATUS](docs/STATUS.md#judged-partially) |
