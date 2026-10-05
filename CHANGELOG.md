@@ -20,11 +20,25 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - KV: context-shift reuse of the resident cache past the window.
 - KV: snapshots resume a conversation from its cache, in memory or on disk.
 - Offload: a mixture's experts spilled across cards and host.
+- Placement: one ladder over the measured cards places every language model and the image and
+  speech stacks, with a ledger of every conversion a load makes.
+- Offload: a streamed mixture reads the next layer's experts into page-locked memory ahead of
+  its gate; read-ahead depth, reader threads and the sightings that move an expert to a card
+  are derived from measurement.
+- Prefill: a wide mixture's prompt runs its attention, residual stream, expert products and
+  routing on the cards, a layer's experts staged on a copy stream.
+- Cache: decode states stored on disk by prefix for the large mixture and for transformers
+  with recurrent layers; block size, spacing, budget and restore-or-prefill derived.
+- Quality: `quality_budget` picks lossy expert routing from a stated divergence; `expert_deferral`
+  lets a share of host experts finish a layer late. Both default to exact.
+- Quality: a teacher-forced harness scores a setting against the exact run.
 - DeepSeek: V4.1 Flash served from its own GGUF, experts streamed from disk.
 - Tools: DeepSeek DSML calls, and a generic tool-calls block fallback.
 - Requant: a model into a new tag, on the GPU, as detached work.
 - Loading: a split GGUF as one source; a BPE or Unigram tokenizer from it.
 - Loading: a split GGUF set on the generic route, read as one model part by part.
+- Tests: a gate requires every conversion of a stored weight to state its reason.
+- CLI: `loken pull --stall-factor`, the multiple of the longest frame gap that stops a pull.
 - Cluster: routing for every surface, handing a model or render to a peer.
 - Cluster: the model listing shows a loading model and per-layer placement.
 - Cluster: a peers endpoint, and a scrape endpoint behind a feature.
@@ -46,9 +60,15 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Offload: the expert host-tier sizing is logged at load.
 - Build: a commit or checkout no longer recompiles the CUDA kernels.
 - Docs: condensed to lead with the point, detail in tables.
+- Loading: token tables and text-encoder embeddings stay in the stored format; a card weight
+  built by the loader keeps no host copy.
+- Loading: host expert stacks are used in the format the file stores when the host kernels
+  read it.
 
 ### Fixed
 
+- Placement: the KV cache is priced by the cache the layers build, not a byte per element.
+- Catalogue: a repository holding a model and its projector resolves to the model file.
 - Tests: the demand-ledger tests take turns, so a module's parallelism no longer fails them.
 - Catalogue: a GGUF in the Hugging Face store is listed as one, with the model's own parameter
   count, split sets included.
