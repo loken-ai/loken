@@ -245,9 +245,28 @@ impl<'a> TensorSource<'a> {
             .ok_or_else(|| crate::tensor::Error::msg(format!("missing tensor: {name}")))
     }
 
-    /// The bytes the model is stored in, across every part: what a host spill is measured against.
-    fn total_bytes(&self) -> u64 {
-        self.parts.iter().map(|p| p.bytes.len() as u64).sum()
+    /// What layer `layer` holds in host memory of its own once loaded on the host, and what it
+    /// reads from the mapping: a tensor the engine views in place is the page cache's, one it
+    /// has no view for is copied into the process. `(owned, mapped)` in bytes.
+    fn host_layer_bytes(&self, layer: usize) -> (u64, u64) {
+        let prefix = format!("blk.{layer}.");
+        let mut owned = 0u64;
+        let mut mapped = 0u64;
+        for part in &self.parts {
+            let viewed = part.owner.is_some();
+            for (name, info) in part.content.tensor_infos.iter() {
+                if !name.starts_with(&prefix) {
+                    continue;
+                }
+                let bytes = info.size_in_bytes() as u64;
+                if viewed && crate::tensor::quant_view::native_view_supported(info.ggml_dtype) {
+                    mapped += bytes;
+                } else {
+                    owned += bytes;
+                }
+            }
+        }
+        (owned, mapped)
     }
 
     /// Drop layer `layer`'s pages: its weights are on a card now. Per part, since a set's
@@ -2426,11 +2445,15 @@ impl GenericHeteroTransformer {
                 .filter(|(_, k)| matches!(k, DeviceKind::Cpu))
                 .count();
             if cpu_layers > 0 {
-                let placed = source
-                    .total_bytes()
-                    .saturating_sub(super::ngram::demand_paged_bytes(content, &config.arch));
-                let per_layer = placed / (n_layers.max(1) as u64);
-                let want = per_layer.saturating_mul(cpu_layers as u64);
+                // What must be resident is what the process owns; the tensors it views stay in
+                // the page cache, which the kernel reclaims, and are read from the file when
+                // they are not there.
+                let (want, mapped) = layer_devices
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, k))| matches!(k, DeviceKind::Cpu))
+                    .map(|(l, _)| source.host_layer_bytes(l))
+                    .fold((0u64, 0u64), |a, b| (a.0 + b.0, a.1 + b.1));
                 let budget = plan
                     .segments
                     .iter()
@@ -2445,11 +2468,20 @@ impl GenericHeteroTransformer {
                         cpu_layers, want as f64 / 1e9, budget as f64 / 1e9)));
                 }
                 info!(
-                    "🧠 host spill admitted: {} layers, {:.1} GB of {:.1} GB available",
+                    "🧠 host spill admitted: {} layers, {:.1} GB owned of {:.1} GB available, {:.1} GB read from the mapping",
                     cpu_layers,
                     want as f64 / 1e9,
-                    budget as f64 / 1e9
+                    budget as f64 / 1e9,
+                    mapped as f64 / 1e9
                 );
+                if budget > 0 && mapped > budget {
+                    warn!(
+                        "host layers read {:.1} GB from the mapping and the host has {:.1} GB: \
+                         the pages the decode touches are read back from the file",
+                        mapped as f64 / 1e9,
+                        budget as f64 / 1e9
+                    );
+                }
             }
         }
 
@@ -3917,5 +3949,39 @@ mod source_tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, want, "the split set changed the logits");
+    }
+}
+
+#[cfg(test)]
+mod host_layer_bytes_tests {
+    use super::*;
+
+    /// A layer's bytes split into what the process owns and what it reads from the mapping, and
+    /// a source that is not mapped owns all of them.
+    #[test]
+    fn a_layer_is_owned_or_mapped_and_a_copied_source_owns_it_all() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/qwen4exp");
+        let bytes = std::fs::read(dir.join("toy.gguf")).unwrap();
+        let content = gguf_file::Content::read(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let total: u64 = content
+            .tensor_infos
+            .iter()
+            .filter(|(n, _)| n.starts_with("blk.1."))
+            .map(|(_, t)| t.size_in_bytes() as u64)
+            .sum();
+        assert!(total > 0);
+        let part = |owner| TensorSource {
+            parts: vec![TensorPart {
+                content: &content,
+                bytes: &bytes,
+                owner,
+            }],
+            owner: HashMap::new(),
+        };
+        let (owned, mapped) = part(None).host_layer_bytes(1);
+        assert_eq!((owned, mapped), (total, 0));
+        let pinned: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        let (owned, mapped) = part(Some(pinned)).host_layer_bytes(1);
+        assert_eq!(owned + mapped, total);
     }
 }
