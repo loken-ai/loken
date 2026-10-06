@@ -10,7 +10,7 @@ pub fn clear_expert_cache() {}
 
 /// Whether the fused routing kernel serves `n_experts`: whole warps of 32, at most 512.
 pub fn topk_softmax_serves(n_experts: usize) -> bool {
-    n_experts != 0 && n_experts % 32 == 0 && n_experts <= 512
+    n_experts != 0 && n_experts.is_multiple_of(32) && n_experts <= 512
 }
 
 /// Top-k softmax over expert logits -> (weights, expert ids).

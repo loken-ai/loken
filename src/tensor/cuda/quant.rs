@@ -361,8 +361,8 @@ pub fn gpu_fp4_linear(
     if inp == 0
         || nibbles.len() != out * inp / 2
         || scales.is_empty()
-        || scales.len() % out != 0
-        || x.len() % inp != 0
+        || !scales.len().is_multiple_of(out)
+        || !x.len().is_multiple_of(inp)
     {
         return Err(Error(format!(
             "fp4 linear: {} nibble bytes, {} scales, {} inputs for [{out}, {inp}]",
@@ -416,7 +416,7 @@ pub fn gpu_fp8_linear(
     (out, inp, block, row0): (usize, usize, usize, usize),
     x: &[f32],
 ) -> Result<Vec<f32>> {
-    if inp == 0 || block == 0 || bytes.len() != out * inp || x.len() % inp != 0 {
+    if inp == 0 || block == 0 || bytes.len() != out * inp || !x.len().is_multiple_of(inp) {
         return Err(Error(format!(
             "fp8 linear: {} bytes, {} inputs for [{out}, {inp}]",
             bytes.len(),
@@ -713,9 +713,9 @@ pub fn gpu_expert_rows_grouped(
     let mut down_ptrs = Vec::with_capacity(n);
     let mut guards = Vec::with_capacity(3 * n);
     for (g, u, d) in experts {
-        let (gp, gg) = g.device_ptr(&stream);
-        let (up, gu) = u.device_ptr(&stream);
-        let (dp, gd) = d.device_ptr(&stream);
+        let (gp, gg) = g.device_ptr(stream);
+        let (up, gu) = u.device_ptr(stream);
+        let (dp, gd) = d.device_ptr(stream);
         gate_ptrs.push(gp);
         up_ptrs.push(up);
         down_ptrs.push(dp);
@@ -813,9 +813,9 @@ pub fn gpu_expert_rows_grouped_multi(
     let mut down_ptrs = Vec::with_capacity(n);
     let mut guards = Vec::with_capacity(3 * n);
     for (g, u, d) in experts {
-        let (gp, gg) = g.device_ptr(&stream);
-        let (up, gu) = u.device_ptr(&stream);
-        let (dp, gd) = d.device_ptr(&stream);
+        let (gp, gg) = g.device_ptr(stream);
+        let (up, gu) = u.device_ptr(stream);
+        let (dp, gd) = d.device_ptr(stream);
         gate_ptrs.push(gp);
         up_ptrs.push(up);
         down_ptrs.push(dp);
@@ -915,7 +915,7 @@ pub fn gpu_quant_linear_tiled(
     tile_bytes: usize,
 ) -> Result<Vec<f32>> {
     let bs = dtype.block_size();
-    if inp == 0 || inp % bs != 0 || x.len() % inp != 0 {
+    if inp == 0 || inp % bs != 0 || !x.len().is_multiple_of(inp) {
         return gpu_quant_linear_once(dev, dtype, blocks, (out, inp), x);
     }
     let n = x.len() / inp;
@@ -1037,7 +1037,11 @@ fn gpu_quant_linear_once(
 ) -> Result<Vec<f32>> {
     let total = out * inp;
     let want = total / dtype.block_size() * dtype.type_size();
-    if inp == 0 || total % dtype.block_size() != 0 || blocks.len() != want || x.len() % inp != 0 {
+    if inp == 0
+        || total % dtype.block_size() != 0
+        || blocks.len() != want
+        || !x.len().is_multiple_of(inp)
+    {
         return Err(Error(format!(
             "{dtype:?} linear: {} block bytes ({want} wanted), {} inputs for [{out}, {inp}]",
             blocks.len(),
@@ -1247,7 +1251,7 @@ pub fn prestage_weights(spans: Vec<(usize, usize)>, readers: usize) -> bool {
         let mut taken = 0usize;
         let mut chosen: Vec<(usize, usize, usize)> = Vec::new();
         for &(addr, len) in &spans {
-            let at = (taken + 63) / 64 * 64;
+            let at = taken.div_ceil(64) * 64;
             if at + len > budget {
                 break;
             }
@@ -1506,7 +1510,7 @@ pub fn gpu_expert_tokens(
     x: &[f32],
     limit: f32,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    if dim == 0 || x.len() % dim != 0 {
+    if dim == 0 || !x.len().is_multiple_of(dim) {
         return Err(Error(format!(
             "expert tokens: {} inputs for rows of {dim}",
             x.len()
@@ -1515,7 +1519,7 @@ pub fn gpu_expert_tokens(
     let n = x.len() / dim;
     let stream = dev.stream();
     let mut staging = Staging {
-        stream: &stream,
+        stream,
         copy: copy_stream(dev)?,
         held: Vec::new(),
         copied: Vec::new(),
@@ -1677,7 +1681,7 @@ pub fn gpu_expert_into_layer(
     let n = toks.len();
     let stream = dev.stream();
     let mut staging = Staging {
-        stream: &stream,
+        stream,
         copy: copy_stream(dev)?,
         held: Vec::new(),
         copied: Vec::new(),
@@ -1915,7 +1919,7 @@ pub fn gpu_prefill_attention_with(
         || a.idxs.len() != n * topk
         || a.wo_a.inp != p
         || a.wo_b.inp != groups * r
-        || a.kv.len() % hd != 0
+        || !a.kv.len().is_multiple_of(hd)
         || a.sink.len() != h
     {
         return Err(Error(format!(
@@ -1932,7 +1936,7 @@ pub fn gpu_prefill_attention_with(
     }
     let stream = dev.stream();
     let mut staging = Staging {
-        stream: &stream,
+        stream,
         copy: copy_stream(dev)?,
         held: Vec::new(),
         copied: Vec::new(),
@@ -2142,7 +2146,7 @@ impl HcStreamDev {
     /// Upload `x`, which holds `hc` copies of `d` values per token. `hc` is at most the widest the
     /// kernels hold in registers.
     pub fn open(dev: &CudaDevice, x: &[f32], hc: usize, d: usize) -> Result<Self> {
-        if hc == 0 || hc > 8 || d == 0 || x.len() % (hc * d) != 0 {
+        if hc == 0 || hc > 8 || d == 0 || !x.len().is_multiple_of(hc * d) {
             return Err(Error(format!(
                 "hc stream: {} values for {hc} x {d}",
                 x.len()
@@ -2343,7 +2347,7 @@ pub fn gpu_sparse_attn(
         || sink.len() != h
         || idxs.len() != s * topk
         || d == 0
-        || kv.len() % d != 0
+        || !kv.len().is_multiple_of(d)
     {
         return Err(Error(format!(
             "sparse attention: {} queries, {} keys, {} sinks, {} slots for s {s} h {h} d {d} topk {topk}",
@@ -2495,7 +2499,10 @@ pub fn gpu_quantize_q2_k_guided(
     importance: &[f32],
     n_per_row: usize,
 ) -> Result<Vec<u8>> {
-    if f32s.len() % 256 != 0 || n_per_row % 256 != 0 || importance.len() != n_per_row {
+    if !f32s.len().is_multiple_of(256)
+        || !n_per_row.is_multiple_of(256)
+        || importance.len() != n_per_row
+    {
         return Err(Error(format!(
             "q2_K guided quantize: {} values, {} weights, {n_per_row} per row",
             f32s.len(),
@@ -2549,7 +2556,7 @@ pub fn gpu_quantize_iq2_xxs(
     importance: Option<&[f32]>,
     n_per_row: usize,
 ) -> Result<Vec<u8>> {
-    if f32s.len() % 256 != 0 || n_per_row % 256 != 0 {
+    if !f32s.len().is_multiple_of(256) || !n_per_row.is_multiple_of(256) {
         return Err(Error(format!(
             "iq2_xxs quantize: {} values, {n_per_row} per row, not multiples of 256",
             f32s.len()

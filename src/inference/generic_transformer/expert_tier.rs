@@ -99,7 +99,9 @@ impl Scratch {
     }
 
     /// The row the card sends the host, the choice's ids and weights, then what goes back:
-    /// the product, the slots and the weights the card runs.
+    /// the product, the slots and the weights the card runs. The six views are disjoint ranges
+    /// of the pinned buffer, which only the one thread running the layer touches.
+    #[allow(clippy::mut_from_ref)]
     fn parts(
         &self,
     ) -> (
@@ -765,7 +767,7 @@ impl LayerTier {
             let eb = self.expert_bytes[i];
             let data = self.host[i].native_qtensor().data();
             let dst = self.card[i].device_ptr()? as u64 + (slot * eb) as u64;
-            self.upload(i, &data, expert * eb, eb, dst, &self.copy)?;
+            self.upload(i, data, expert * eb, eb, dst, &self.copy)?;
         }
         self.copy
             .synchronize()
@@ -997,7 +999,7 @@ impl LayerTier {
         for i in 0..3 {
             let eb = self.expert_bytes[i];
             let arena = &buffer.arenas[i];
-            let base = arena.device_ptr(arena.stream()).0 as u64;
+            let base = arena.device_ptr(arena.stream()).0;
             let slots = self.card[i].device_ptr()? as u64;
             let data = self.host[i].native_qtensor().data();
             // The kernels read whole blocks past the end of a stack, against activations padded
@@ -1032,7 +1034,7 @@ impl LayerTier {
                 }
                 self.upload(
                     i,
-                    &data,
+                    data,
                     first * eb,
                     (e - first) * eb,
                     base + (first * eb) as u64,

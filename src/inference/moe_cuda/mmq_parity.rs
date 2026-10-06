@@ -466,7 +466,7 @@ fn the_expert_batched_matmul_serves_the_codebook_formats() {
             let decode = gap(&want, &b.decode());
             for tile in [0, 8, 16, 32, 64, 128] {
                 let mmq = gap(&want, &b.mmq(false, tile));
-                if !(mmq <= 1.25 * decode + 0.005) {
+                if mmq.is_nan() || mmq > 1.25 * decode + 0.005 {
                     failures.push(format!(
                         "{dtype:?} tokens={tokens} topk={topk} E={e} tile={tile}: {mmq} from the \
                          float answer, the decode kernels {decode}"

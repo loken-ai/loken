@@ -881,7 +881,7 @@ impl Offload for Card {
         let dev = &self.dev;
         let dims = p.dims();
         let (out, inp) = (dims.first().copied()?, dims.get(1).copied()?);
-        if inp == 0 || xs.len() % inp != 0 {
+        if inp == 0 || !xs.len().is_multiple_of(inp) {
             return None;
         }
         let rows = xs.len() / inp;
@@ -1130,7 +1130,7 @@ impl Offload for Card {
         let m2 = self.kept(&quant(w2)?)?;
         let d1 = w1.dims();
         let (inter, dim) = (d1[0], d1[1]);
-        if dim == 0 || x.len() % dim != 0 {
+        if dim == 0 || !x.len().is_multiple_of(dim) {
             return None;
         }
         let rows = x.len() / dim;

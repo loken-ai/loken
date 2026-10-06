@@ -188,10 +188,10 @@ pub fn quantize_compensated_on_card(
     for b in 0..per_row {
         let a = b * BLOCK;
         {
-            let (w_ptr, _gw) = weights.device_ptr(&stream);
-            let (c_ptr, _gc) = carried.device_ptr(&stream);
-            let (y_ptr, _gy) = factor.y.device_ptr(&stream);
-            let (blk, _gb) = block.device_ptr_mut(&stream);
+            let (w_ptr, _gw) = weights.device_ptr(stream);
+            let (c_ptr, _gc) = carried.device_ptr(stream);
+            let (y_ptr, _gy) = factor.y.device_ptr(stream);
+            let (blk, _gb) = block.device_ptr_mut(stream);
             let (w_ptr, c_ptr, y_ptr, blk) = (
                 w_ptr as *const f32,
                 c_ptr as *const f32,
@@ -262,9 +262,9 @@ pub fn quantize_compensated_on_card(
         }
 
         {
-            let (x_ptr, _gx) = factor.x.device_ptr(&stream);
-            let (y_ptr, _gy) = factor.y.device_ptr(&stream);
-            let (h, _gh) = corner.device_ptr_mut(&stream);
+            let (x_ptr, _gx) = factor.x.device_ptr(stream);
+            let (y_ptr, _gy) = factor.y.device_ptr(stream);
+            let (h, _gh) = corner.device_ptr_mut(stream);
             unsafe {
                 // H = X_B^T Y_B
                 gemm(
@@ -292,12 +292,12 @@ pub fn quantize_compensated_on_card(
             .memcpy_htod(&to_columns(&inv, BLOCK, BLOCK), &mut inverse)
             .map_err(|e| alloc_err("inverse upload", e))?;
         {
-            let (blk, _gb) = block.device_ptr(&stream);
-            let (g, _gg) = got.device_ptr_mut(&stream);
-            let (inv_ptr, _gi) = inverse.device_ptr(&stream);
-            let (l, _gl) = lost.device_ptr_mut(&stream);
-            let (x_ptr, _gx) = factor.x.device_ptr(&stream);
-            let (c, _gc) = carried.device_ptr_mut(&stream);
+            let (blk, _gb) = block.device_ptr(stream);
+            let (g, _gg) = got.device_ptr_mut(stream);
+            let (inv_ptr, _gi) = inverse.device_ptr(stream);
+            let (l, _gl) = lost.device_ptr_mut(stream);
+            let (x_ptr, _gx) = factor.x.device_ptr(stream);
+            let (c, _gc) = carried.device_ptr_mut(stream);
             let len = (rows * BLOCK) as i32;
             let (minus, scale) = (-1.0f32, 1.0f32 / lambda);
             let one = 1.0f32;

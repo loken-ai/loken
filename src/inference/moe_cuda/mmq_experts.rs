@@ -27,7 +27,7 @@ fn scratch<T: cudarc::driver::DeviceRepr>(
         Err(e) if e.0 == CUDA_ERROR_OUT_OF_MEMORY => {
             tracing::warn!(
                 "moe mmq scratch of {} MB on GPU{} failed; reclaiming",
-                n * std::mem::size_of::<T>() >> 20,
+                (n * std::mem::size_of::<T>()) >> 20,
                 dev.native().ordinal()
             );
             crate::tensor::cuda::reclaim_pool(dev.native());
@@ -116,7 +116,7 @@ impl MmqRouting {
         topk: usize,
         n_experts: usize,
     ) -> Result<Self> {
-        if rows % topk != 0 {
+        if !rows.is_multiple_of(topk) {
             crate::tensor::bail!("moe mmq: {rows} routed rows is not a multiple of topk={topk}");
         }
         let dev = device.as_cuda_device()?;
