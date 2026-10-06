@@ -100,6 +100,37 @@ pub struct HeteroPlan {
 }
 
 impl HeteroPlan {
+    /// The layers `[from, to)` the segments place. The whole stack unless the plan is one
+    /// node's share of a stack another node holds the rest of.
+    pub fn range(&self) -> (usize, usize) {
+        let from = self.segments.first().map_or(0, |s| s.layer_start);
+        let to = self.segments.last().map_or(0, |s| s.layer_end);
+        (from, to)
+    }
+
+    /// Whether the plan places the last layer, and so the output head with it.
+    pub fn holds_head(&self) -> bool {
+        self.range().1 == self.total_layers
+    }
+
+    /// This plan, made over the layers `[0, n)` of a share, moved to the layers
+    /// `[from, from + n)` of a stack of `total` layers.
+    pub fn shifted(&self, from: usize, total: usize) -> Self {
+        Self {
+            segments: self
+                .segments
+                .iter()
+                .map(|s| HeteroSegment {
+                    layer_start: s.layer_start + from,
+                    layer_end: s.layer_end + from,
+                    ..s.clone()
+                })
+                .collect(),
+            total_layers: total,
+            host_experts_from: self.host_experts_from.map(|l| l + from),
+        }
+    }
+
     /// Calculate layer assignment across heterogeneous devices.
     ///
     /// Algorithm:

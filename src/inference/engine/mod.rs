@@ -26,6 +26,7 @@ pub mod flux2_engine;
 pub mod image_engine;
 pub mod llm_engine;
 pub(crate) mod model_backend;
+pub(crate) mod pipeline_head;
 pub(crate) mod prompt_cache;
 #[cfg(feature = "image")]
 pub mod qwen_image_engine;

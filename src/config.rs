@@ -268,6 +268,7 @@ impl Config {
             disable_cuda: false,
             force_cuda_only_layers: false, // Not exposed in config.toml, use programmatically for testing
             kv_quant: crate::inference::engine::llm_engine::KvQuant::Off,
+            layer_share: None,
         }
     }
 

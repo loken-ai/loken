@@ -185,7 +185,9 @@ impl Cluster {
     /// The cut planner's inputs for `model_id`: `(nodes, rtt_pairs)`, assembled from what each node
     /// measured about itself and the round-trips this node timed. A node enters only if it has a
     /// measured cost for the model - one that has not run it cannot be planned against. `local` is
-    /// this node's own measured profile; its VRAM and each peer's come from the advertised cards.
+    /// this node's own measured profile; its VRAM is `local.vram` when set, else the cards it
+    /// advertises, and each peer's is what its cards carry of the model when it says, else the
+    /// cards it advertises.
     /// Peer-to-peer RTT is not measured here, so only pairs this node timed are returned; the
     /// planner prices an unlisted pair from its base latency.
     pub fn placement_inputs(
@@ -206,7 +208,11 @@ impl Cluster {
         let mut nodes: Vec<(NodeId, super::cut_plan::NodeProfile)> = vec![(
             self.config.node_id.clone(),
             super::cut_plan::NodeProfile {
-                vram: local_cards,
+                vram: if local.vram > 0 {
+                    local.vram
+                } else {
+                    local_cards
+                },
                 ..local
             },
         )];
@@ -218,7 +224,13 @@ impl Cluster {
             else {
                 continue;
             };
-            let vram: u64 = state.cards.iter().sum();
+            // What the peer's cards carry of this model, as it placed it, when it says; else the
+            // cards it has.
+            let vram: u64 = state
+                .card_bytes_by_model
+                .get(model_id)
+                .copied()
+                .unwrap_or_else(|| state.cards.iter().sum());
             nodes.push((
                 node.clone(),
                 super::cut_plan::NodeProfile {
@@ -625,6 +637,48 @@ pub const FORWARDED_HEADER: &str = "x-loken-forwarded";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_inputs_takes_the_room_a_node_gave_the_model() {
+        let c = Cluster::new(cfg(&["b"]));
+        let state = |gb: u64, carried_gb: Option<u64>| NodeState {
+            cards: vec![gb << 30, gb << 30],
+            card_bytes_by_model: carried_gb
+                .map(|g| std::collections::HashMap::from([("m".to_string(), g << 30)]))
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        c.publish_local(state(16, None));
+        let mut costs = std::collections::HashMap::new();
+        costs.insert("m".to_string(), (1.0, 0.0));
+        c.observe_peer(
+            &"b".into(),
+            "http://b",
+            0,
+            state(8, Some(11)),
+            NodeRates::default(),
+            std::collections::HashMap::new(),
+            costs,
+            0.3,
+        );
+        let local = |vram: u64| super::super::cut_plan::NodeProfile {
+            vram,
+            layer_ms: 1.0,
+            miss_ms: 0.0,
+        };
+        let vram = |nodes: &[(String, super::super::cut_plan::NodeProfile)], id: &str| {
+            nodes.iter().find(|(n, _)| n == id).unwrap().1.vram
+        };
+        let (nodes, _) = c.placement_inputs("m", 0, local(0));
+        assert_eq!(
+            vram(&nodes, "self"),
+            32u64 << 30,
+            "the cards, when none is said"
+        );
+        assert_eq!(vram(&nodes, "b"), 11u64 << 30, "what the peer carried");
+        let (nodes, _) = c.placement_inputs("m", 0, local(14 << 30));
+        assert_eq!(vram(&nodes, "self"), 14u64 << 30, "what this node carried");
+    }
 
     #[test]
     fn placement_inputs_gathers_measured_peers() {

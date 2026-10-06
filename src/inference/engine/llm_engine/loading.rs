@@ -269,6 +269,7 @@ impl LlmEngine {
         // disable_cuda config (empty cuda_devices -> every layer on CPU).
         let disable_cuda = self.config.disable_cuda || crate::gpu::force_cpu();
         let kv_quant = self.config.kv_quant;
+        let layer_share = self.config.layer_share;
         let quality = self.config.quality;
         let state_cache = self.state_cache.clone();
         let user_context_length = self.config.context_length;
@@ -917,11 +918,19 @@ impl LlmEngine {
                     // plan, whole on one card when it fits there, and recovers from running out
                     // of card memory. The cache is part of what has to fit: a placement sized
                     // on the weights alone runs out once the context fills.
+                    if layer_share.is_some() && awq.is_some() {
+                        return Err(anyhow!("a layer share is read from a GGUF file, not a checkpoint directory"));
+                    }
+                    if let Some((from, to)) = layer_share {
+                        if from >= to || to > num_layers {
+                            return Err(anyhow!("layers [{from}, {to}) are not within the {num_layers} of {arch}"));
+                        }
+                    }
                     let (block_bytes, head_bytes) = generic_weights
-                        .block_and_head_bytes(&content)
+                        .block_and_head_bytes(&content, layer_share, num_layers)
                         .unwrap_or((file_size, 0));
                     let demand_at = |ctx: u64| crate::inference::place::ladder::Demand {
-                        layers: num_layers,
+                        layers: layer_share.map_or(num_layers, |(from, to)| to - from),
                         block_bytes,
                         head_bytes,
                         kv_bytes_per_layer: kv_bytes_at(ctx),
@@ -979,6 +988,7 @@ impl LlmEngine {
                         // The tensor-parallel loader reads one mapping, so a split set takes the
                         // ladder.
                         let tp = (awq.is_none()
+                            && layer_share.is_none()
                             && split.is_none()
                             && tensor_parallel_support(&content, &arch)
                                 .inspect_err(|why| info!("{arch} stays off tensor parallelism: {why}"))
@@ -1030,6 +1040,7 @@ impl LlmEngine {
                             let cached_experts = crate::inference::generic_transformer::expert_tier::header_serves(&content);
                             let expert_split = generic_weights
                                 .layer_dense_and_expert_bytes(&content, num_layers)
+                                .filter(|_| layer_share.is_none())
                                 .and_then(|layers| demand.plan_host_experts(&first_plan, &cuda_devices, &layers, cached_experts));
                             if let Some(p) = &expert_split {
                                 info!(
@@ -1101,7 +1112,13 @@ impl LlmEngine {
                                         .iter()
                                         .map(|&i| crate::inference::place::vram_manager::free_on(i))
                                         .collect();
-                                    let m = generic_weights.build(&on_plan, plan, kv, ctx, stem_on_card)?;
+                                    // The plan is over the layers of the share; the model reads
+                                    // them by their place in the stack.
+                                    let placed = match layer_share {
+                                        Some((from, _)) => plan.shifted(from, num_layers),
+                                        None => plan.clone(),
+                                    };
+                                    let m = generic_weights.build(&on_plan, &placed, kv, ctx, stem_on_card)?;
                                     let grown: Option<u64> = cards
                                         .iter()
                                         .zip(&free_before)
@@ -1132,7 +1149,7 @@ impl LlmEngine {
                             .map_err(|e| anyhow!("Failed to load {arch}: {e}"))?;
                             try_wrap_with_vision(
                                 model,
-                                projector_blob.as_deref(),
+                                projector_blob.as_deref().filter(|_| layer_share.is_none()),
                                 demand.whole().saturating_sub(demand.block_bytes + demand.head_bytes),
                             )?
                         }
@@ -1162,8 +1179,9 @@ impl LlmEngine {
                     Err(e) => warn!("state cache off: {e}"),
                 }
             }
+            // The advice names layers by their place in the stack; a share counts its own.
             advise_pages_by_placement(
-                &page_advice,
+                if layer_share.is_some() { &[] } else { &page_advice },
                 &model.device_layer_distribution(),
                 host_experts_from,
             );

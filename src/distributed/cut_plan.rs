@@ -466,6 +466,89 @@ pub fn plan_by_time(
     if attn_per_layer.is_empty() || expert_bytes == 0 || nodes.is_empty() {
         return None;
     }
+    plan_by_segment_cost(
+        attn_per_layer.len(),
+        nodes,
+        costs,
+        None,
+        &is_clean,
+        &|node, k, i| {
+            node_ms(
+                &attn_per_layer[k..i],
+                &node.profile,
+                expert_bytes,
+                working_set,
+                activated,
+            )
+        },
+    )
+}
+
+/// Predicted milliseconds per token for `node` to run the layers `layers` of a dense stack,
+/// `head_bytes` more when they end it. The layers fill the node's cards in order, each at
+/// `layer_ms`; the rest run on the host at `miss_ms`, which a node that ran no layer there
+/// reports as zero and so cannot take.
+fn dense_ms(node: &TimedNode, layers: &[u64], head_bytes: u64) -> f64 {
+    let p = &node.profile;
+    let mut room = p.vram.saturating_sub(head_bytes);
+    let mut on_card = 0usize;
+    if p.layer_ms > 0.0 {
+        for &bytes in layers {
+            if bytes > room {
+                break;
+            }
+            room -= bytes;
+            on_card += 1;
+        }
+    }
+    let on_host = layers.len() - on_card;
+    if on_host > 0 && p.miss_ms <= 0.0 {
+        return f64::INFINITY;
+    }
+    on_card as f64 * p.layer_ms + on_host as f64 * p.miss_ms
+}
+
+/// Place the layers of a dense stack, `layer_bytes` each with its cache, across `nodes` to
+/// minimise predicted per-token time: each used node's layers at its own measured cost, and
+/// each boundary's crossing on the link. `NodeProfile` reads here as the room the node has for
+/// weights (`vram`), the time of one layer on its cards (`layer_ms`) and on its host
+/// (`miss_ms`, zero when none was measured). The stack starts on `nodes[first]`, the node that
+/// holds the request.
+pub fn plan_dense_by_time(
+    layer_bytes: &[u64],
+    head_bytes: u64,
+    nodes: &[TimedNode],
+    first: usize,
+    costs: &CutCosts,
+) -> Option<TimePlan> {
+    if layer_bytes.is_empty() || first >= nodes.len() {
+        return None;
+    }
+    let total = layer_bytes.len();
+    plan_by_segment_cost(
+        total,
+        nodes,
+        costs,
+        Some(first),
+        &|_| true,
+        &|node, k, i| {
+            let head = if i == total { head_bytes } else { 0 };
+            dense_ms(node, &layer_bytes[k..i], head)
+        },
+    )
+}
+
+/// The cheapest arrangement of `l` layers on `nodes`, each used node taking a run priced by
+/// `seg_cost(node, start, end)`, each boundary by `costs`, and every interior boundary
+/// admitted by `is_clean`. With `first`, only the orderings that start on that node.
+fn plan_by_segment_cost(
+    l: usize,
+    nodes: &[TimedNode],
+    costs: &CutCosts,
+    first: Option<usize>,
+    is_clean: &dyn Fn(usize) -> bool,
+    seg_cost: &dyn Fn(&TimedNode, usize, usize) -> f64,
+) -> Option<TimePlan> {
     let orders: Vec<Vec<usize>> = if nodes.len() <= EXACT_ORDER_LIMIT {
         permutations((0..nodes.len()).collect())
     } else {
@@ -478,20 +561,15 @@ pub fn plan_by_time(
                 .layer_ms
                 .total_cmp(&nodes[b].profile.layer_ms)
         });
+        if let Some(f) = first {
+            idx.retain(|&n| n != f);
+            idx.insert(0, f);
+        }
         vec![idx]
     };
     let mut best: Option<TimePlan> = None;
-    for order in &orders {
-        if let Some(p) = plan_time_in_order(
-            attn_per_layer,
-            expert_bytes,
-            working_set,
-            activated,
-            nodes,
-            costs,
-            order,
-            &is_clean,
-        ) {
+    for order in orders.iter().filter(|o| first.is_none_or(|f| o[0] == f)) {
+        if let Some(p) = plan_time_in_order(l, nodes, costs, order, is_clean, seg_cost) {
             if best
                 .as_ref()
                 .map(|b| p.total_ms < b.total_ms)
@@ -507,18 +585,14 @@ pub fn plan_by_time(
 /// Exact DP for one node ordering: `dp[j][i]` is the least predicted time to cover layers `0..i`
 /// with the first `j` nodes of the order, each taking a NON-EMPTY contiguous run. The answer is the
 /// cheapest `dp[j][l]` over `j`, so using fewer nodes - dropping the rest - is one of the options.
-#[allow(clippy::too_many_arguments)]
 fn plan_time_in_order(
-    attn: &[u64],
-    eb: u64,
-    ws: u64,
-    activated: u64,
+    l: usize,
     nodes: &[TimedNode],
     costs: &CutCosts,
     order: &[usize],
-    is_clean: &impl Fn(usize) -> bool,
+    is_clean: &dyn Fn(usize) -> bool,
+    seg_cost: &dyn Fn(&TimedNode, usize, usize) -> f64,
 ) -> Option<TimePlan> {
-    let l = attn.len();
     let m = order.len();
     let inf = f64::INFINITY;
     let mut dp = vec![vec![inf; l + 1]; m + 1];
@@ -544,7 +618,7 @@ fn plan_time_in_order(
                 if !cross.is_finite() {
                     continue;
                 }
-                let seg = node_ms(&attn[k..i], &node.profile, eb, ws, activated);
+                let seg = seg_cost(node, k, i);
                 let total = prev + cross + seg;
                 if total < dp[j][i] {
                     dp[j][i] = total;
@@ -1022,5 +1096,111 @@ mod nnode_tests {
             }
             CutChoice::Whole(_) => assert_eq!(pt.segments.len(), 1),
         }
+    }
+}
+
+#[cfg(test)]
+mod dense_tests {
+    use super::*;
+
+    const GB: u64 = 1 << 30;
+
+    /// A node with `vram_gb` of room for weights, a layer taking `card_ms` on its cards and
+    /// `host_ms` on its host (zero for none measured).
+    fn node(id: &str, vram_gb: u64, card_ms: f64, host_ms: f64) -> TimedNode {
+        TimedNode {
+            id: id.to_string(),
+            profile: NodeProfile {
+                vram: vram_gb * GB,
+                layer_ms: card_ms,
+                miss_ms: host_ms,
+            },
+        }
+    }
+
+    fn link(ms: f64) -> CutCosts {
+        CutCosts::from_rtt_ms(&[("a", "b", ms)])
+    }
+
+    /// A stack the head's cards hold is not cut when the other node is no faster: the link
+    /// would only add its crossing.
+    #[test]
+    fn a_stack_the_head_holds_stays_on_the_head() {
+        let layers = vec![GB; 12];
+        let nodes = [node("a", 16, 1.0, 0.0), node("b", 16, 1.0, 0.0)];
+        let p = plan_dense_by_time(&layers, 0, &nodes, 0, &link(0.2)).unwrap();
+        assert_eq!(p.segments.len(), 1);
+        assert_eq!(p.segments[0].node, "a");
+    }
+
+    /// A faster node takes layers the head could hold, when its time saved beats the crossing.
+    #[test]
+    fn a_faster_node_takes_layers_the_head_could_hold() {
+        let layers = vec![GB; 12];
+        let nodes = [node("a", 16, 1.0, 0.0), node("b", 16, 0.5, 0.0)];
+        let p = plan_dense_by_time(&layers, 0, &nodes, 0, &link(0.2)).unwrap();
+        assert_eq!(p.segments.len(), 2, "{p:?}");
+        let dear = plan_dense_by_time(&layers, 0, &nodes, 0, &link(20.0)).unwrap();
+        assert_eq!(dear.segments.len(), 1);
+    }
+
+    /// A stack larger than the head's cards goes on to the node that holds the rest on its
+    /// own cards, when that beats running the rest on the host.
+    #[test]
+    fn a_stack_beyond_the_head_continues_on_the_other_node() {
+        let layers = vec![GB; 28];
+        let nodes = [node("a", 16, 1.0, 8.0), node("b", 16, 1.0, 8.0)];
+        let p = plan_dense_by_time(&layers, 0, &nodes, 0, &link(0.3)).unwrap();
+        assert_eq!(p.segments.len(), 2, "{p:?}");
+        assert_eq!(p.segments[0].node, "a");
+        assert_eq!(p.segments[1].node, "b");
+        assert_eq!(p.segments[1].end, 28);
+        for s in &p.segments {
+            assert!(s.len() <= 16, "{s:?} does not fit the cards of {}", s.node);
+        }
+        assert!((p.total_ms - 28.3).abs() < 1e-9, "{}", p.total_ms);
+    }
+
+    /// A link dearer than what the host costs for the layers left over keeps them on the host.
+    #[test]
+    fn a_dear_link_keeps_the_stack_on_one_node() {
+        let layers = vec![GB; 18];
+        let nodes = [node("a", 16, 1.0, 2.0), node("b", 16, 1.0, 2.0)];
+        let p = plan_dense_by_time(&layers, 0, &nodes, 0, &link(50.0)).unwrap();
+        assert_eq!(p.segments.len(), 1);
+        assert_eq!(p.segments[0].len(), 18);
+    }
+
+    /// A node that never ran a layer on its host is given no more than its cards hold; with
+    /// nowhere to put the rest there is no plan.
+    #[test]
+    fn a_node_with_no_host_rate_takes_only_what_its_cards_hold() {
+        let layers = vec![GB; 20];
+        let alone = [node("a", 16, 1.0, 0.0)];
+        assert!(plan_dense_by_time(&layers, 0, &alone, 0, &link(0.3)).is_none());
+        let pair = [node("a", 16, 1.0, 0.0), node("b", 16, 1.0, 0.0)];
+        let p = plan_dense_by_time(&layers, 0, &pair, 0, &link(0.3)).unwrap();
+        assert_eq!(p.segments.len(), 2);
+    }
+
+    /// The output head rides with the last layer: it takes room the layers would have had.
+    #[test]
+    fn the_head_takes_room_from_the_last_segment() {
+        let layers = vec![GB; 31];
+        let nodes = [node("a", 16, 1.0, 0.0), node("b", 16, 1.0, 0.0)];
+        // Together the cards hold 32 layers, and 31 with a 2 GB head do not fit.
+        assert!(plan_dense_by_time(&layers, 2 * GB, &nodes, 0, &link(0.3)).is_none());
+        assert!(plan_dense_by_time(&layers, GB, &nodes, 0, &link(0.3)).is_some());
+    }
+
+    /// The stack starts on the node that holds the request, even when the other is faster.
+    #[test]
+    fn the_stack_starts_on_the_named_node() {
+        let layers = vec![GB; 28];
+        let nodes = [node("a", 16, 4.0, 0.0), node("b", 16, 1.0, 0.0)];
+        let p = plan_dense_by_time(&layers, 0, &nodes, 0, &link(0.1)).unwrap();
+        assert_eq!(p.segments[0].node, "a");
+        let q = plan_dense_by_time(&layers, 0, &nodes, 1, &link(0.1)).unwrap();
+        assert_eq!(q.segments[0].node, "b");
     }
 }

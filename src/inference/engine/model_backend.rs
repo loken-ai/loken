@@ -160,6 +160,19 @@ pub(crate) struct Capabilities {
     pub speculative: bool,
 }
 
+/// What a node measured about running a model's layers, for deciding whether to cut the stack
+/// across nodes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SegmentProfile {
+    /// What one layer costs on a card and on the host.
+    pub rates: crate::inference::generic_transformer::LayerRates,
+    /// How the layers' caches are stored, and the elements one layer's holds per token.
+    pub kv_quant: crate::inference::engine::llm_engine::KvQuant,
+    pub kv_elems_per_token: u64,
+    /// The window the model serves, in tokens.
+    pub window: usize,
+}
+
 pub(crate) trait ModelBackend: Send {
     /// The capabilities this backend reports. The default claims none.
     fn capabilities(&self) -> Capabilities {
@@ -192,6 +205,12 @@ pub(crate) trait ModelBackend: Send {
     /// `(attn_bytes_per_layer, expert_bytes, working_set, activated)`. `None` (default) for a model
     /// that does not stream experts, or when a piece is not measurable; a streamed MoE overrides it.
     fn placement_model_inputs(&self) -> Option<(Vec<u64>, u64, u64, u64)> {
+        None
+    }
+
+    /// What this model's layers cost to run on this node, measured now with the cache left
+    /// empty, when the model can be cut into segments. `None` (default) for one that cannot.
+    fn segment_profile(&mut self) -> Option<SegmentProfile> {
         None
     }
 
@@ -1326,6 +1345,24 @@ impl ModelBackend for GenericBackend {
 
     fn kv_capacity(&self) -> Option<usize> {
         Some(self.0.kv_capacity())
+    }
+
+    fn segment_profile(&mut self) -> Option<SegmentProfile> {
+        if self.0.segment_unsupported_reason().is_some() {
+            return None;
+        }
+        match self.0.measure_layer_ms() {
+            Ok(rates) => Some(SegmentProfile {
+                rates,
+                kv_quant: self.0.kv_quant(),
+                kv_elems_per_token: self.0.kv_elems_per_token(),
+                window: self.0.kv_capacity(),
+            }),
+            Err(e) => {
+                tracing::warn!("layer cost not measured: {e}");
+                None
+            }
+        }
     }
 
     fn adapters(&self) -> Vec<String> {

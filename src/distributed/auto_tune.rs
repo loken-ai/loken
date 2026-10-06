@@ -77,6 +77,35 @@ pub fn auto_distribution(
     )
 }
 
+/// The distribution of a dense stack, decided from what the nodes measured about themselves:
+/// the time of a layer on each node's cards and host, the room its cards leave for weights, and
+/// the round-trips the cluster tracks between nodes. `first` is the node that holds the request
+/// and starts the stack. `layer_bytes` is each layer's weights with its cache. Returns which node
+/// runs which layers, or a single node when no split pays.
+pub fn auto_dense_distribution(
+    layer_bytes: &[u64],
+    head_bytes: u64,
+    nodes: &[(String, NodeProfile)],
+    first: usize,
+    rtt_ms: &[(&str, &str, f64)],
+) -> Option<super::cut_plan::TimePlan> {
+    use super::cut_plan::{plan_dense_by_time, CutCosts, TimedNode};
+    let timed: Vec<TimedNode> = nodes
+        .iter()
+        .map(|(id, profile)| TimedNode {
+            id: id.clone(),
+            profile: *profile,
+        })
+        .collect();
+    plan_dense_by_time(
+        layer_bytes,
+        head_bytes,
+        &timed,
+        first,
+        &CutCosts::from_rtt_ms(rtt_ms),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

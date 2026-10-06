@@ -57,6 +57,10 @@ pub struct NodeState {
     /// fraction. Empty means the node never said - an older build - and a hand-over
     /// then cannot tell whether the peer holds a render, which reads as "it may".
     pub cards: Vec<u64>,
+    /// Per model it holds: the bytes of weights and cache its cards carry, as its own placement
+    /// put them. The room it can give the model's layers when asked to hold a share of them.
+    /// Absent for a model it holds without having measured it.
+    pub card_bytes_by_model: HashMap<String, u64>,
 }
 
 impl NodeState {
@@ -390,6 +394,7 @@ mod tests {
             link_gbps: link,
             prefix_blocks: vec![0xABCD, 0x1234],
             cards: vec![16 << 30],
+            card_bytes_by_model: HashMap::from([("gemma4:12b".to_string(), 9 << 30)]),
         };
         m.observe(&"a".to_string(), 0, state.clone());
         assert_eq!(m.state_of(&"a".to_string()), Some(&state));

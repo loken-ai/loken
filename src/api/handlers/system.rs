@@ -101,6 +101,9 @@ pub(crate) struct PipelineTailRequest {
     /// The node running the layers after `to`, as `host:port`; absent for the final segment.
     #[serde(default)]
     pub next: Option<String>,
+    /// The context window the head serves, which the segment must be able to hold.
+    #[serde(default)]
+    pub context: Option<usize>,
 }
 
 #[derive(serde::Serialize)]
@@ -126,7 +129,8 @@ pub(crate) async fn pipeline_tail_start(
         None => None,
     };
     let port = state
-        .become_pipeline_tail(&name, req.from, req.to, next)
+        .become_pipeline_tail(&name, req.from, req.to, next, req.context)
+        .await
         .map_err(ApiError::Internal)?;
     Ok(Json(PipelineTailResponse { port }))
 }

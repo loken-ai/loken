@@ -13,9 +13,11 @@ what it measures, and either serves a request or forwards it whole and relays th
 whole-request forwarding with the response streamed back to the client, node selection priced
 on rates each node measures from its own completed work, and cluster-wide energy reporting.
 
-**Pipeline across nodes (DeepSeek V4.1):** at load, each node measures its profile, the cut
-planner compares a split against local serving, and when a split pays the head forms the
-pipeline over the binary transport, with no operator input.
+**Pipeline across nodes (DeepSeek V4.1 and dense generic transformers):** at load, each node
+measures its profile, the cut planner compares a split against local serving, and when a split
+pays the head forms the pipeline over the binary transport, with no operator input. For a dense
+model the profile is the time of a layer on cards and on host and the bytes the cards carry; the
+tail reloads its layers through its own placement ladder.
 
 **What is written and reached by nothing:** the tiered KV pool, the deterministic resume point,
 the link-cost matrix, the layer scheduler and the per-request evidence record. Each is complete and judged by its own tests,
@@ -23,8 +25,9 @@ and no other module calls it. That list is not a reading of the code:
 `distributed::wiring_gate` records the state of every module in that directory and fails both
 when one is finally reached and when one that was reached falls silent.
 
-**What does not work:** splitting any architecture other than DeepSeek V4.1; the tail node
-needs the GGUF locally.
+**What does not work:** splitting a model whose layers read state outside themselves (per-layer
+inputs, shared KV, recurrent state, host-held experts); verify batches across a pipeline; the tail
+node needs the GGUF locally.
 
 Everything below describes the design, including the half not built: the shape the work is
 taking, not what a node does today.

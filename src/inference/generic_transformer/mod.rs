@@ -65,15 +65,19 @@ pub mod mixer;
 mod moe_weights;
 pub mod ngram;
 pub mod qsa;
+mod segment;
 mod splice;
 #[cfg(test)]
 mod state_cache_tests;
+#[cfg(test)]
+pub(crate) mod tiny_model;
 #[cfg(all(test, feature = "cuda"))]
 mod verify_decode_parity;
 mod wide;
 pub use config::*;
 pub use dense::DenseCheckpoint;
 pub use moe_weights::*;
+pub use segment::LayerRates;
 
 pub(crate) use rayon::prelude::*;
 pub(crate) use tracing::{info, warn};
@@ -399,6 +403,9 @@ pub struct GenericHeteroTransformer {
     config: Arc<GenericTransformerConfig>,
     embeddings: Embedding, // GPU 0 if table < 1 GB, else CPU
     layers: Vec<GenericTransformerLayer>,
+    /// The place in the stack of `layers[0]`: zero unless this model holds one node's share of
+    /// a stack other nodes run the rest of.
+    first_layer: usize,
     /// Adapters attached after the load, in the order they were applied. Empty is the
     /// checkpoint as it was read.
     adapters: Vec<String>,

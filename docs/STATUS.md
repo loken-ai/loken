@@ -234,9 +234,26 @@ at this quantisation.
 **Sharding runs for DeepSeek V4.1, unmeasured at two nodes.** At load, each node measures its
 own profile, the planner compares a split against local serving, and when a split pays the head
 forms a pipeline of any length over the binary data plane. A three-node loopback chain decodes
-bit-identically to one node. Other architectures cannot be a pipeline head. The link-cost
-matrix, the tiered KV, the resume path and the layer scheduler are still reached by nothing:
-`distributed::wiring_gate` records the state of every module in that directory.
+bit-identically to one node.
+
+**Sharding runs for dense generic transformers, measured at two nodes on one machine.** Each
+clustered node times a layer on its cards and on its host and publishes it with the bytes its
+cards carry of the model. The node that loads the model second plans the cut from those and the
+gossip round trip, asks the other node to reload its layers through its own placement ladder,
+reloads its own the same way, and sends the boundary of every prefill chunk and decode step over
+the binary frames; each node keeps the KV cache of its layers. On two loopback servers, one card
+each, DeepSeek R1 32B (19.9 GB, 64 layers, does not fit one 16 GB card): prefill 1170 tok/s and
+decode 26 tok/s at 2k tokens, 1060 and 21 at 6k, against 43 and 3.3 for one card with 21 layers
+on the host, and 711 and 27 for the two cards of one node as tensor-parallel. Greedy output
+matches the one-card node for 64 tokens on two prompts and for a 6k prompt with its
+continuation; the one-card node itself varies between runs past about 25 tokens. A two-way and a
+four-way split are bit-identical to one part on the host in the tests. Refused, with the reason:
+models whose layers take per-layer inputs, share KV, keep a recurrent state, hold experts in
+host memory, or carry an adapter or an image tower; verify batches. The tail node gives up its
+own copy of the model while it serves a segment. The crossing is priced by the gossip round
+trip alone, not by the logits that come back. The link-cost matrix, the tiered KV, the resume
+path and the layer scheduler are still reached by nothing: `distributed::wiring_gate` records
+the state of every module in that directory.
 
 **One defect found, and its fix unverified at two nodes.** A node published a capacity derived
 from one generation's decode rate multiplied by its lane count, while its generations serialise

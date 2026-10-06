@@ -399,6 +399,9 @@ pub struct APIServer {
     /// measured once when the model loads and published in gossip so the cluster can plan a cut
     /// from measured facts rather than an operator's flag. Keyed by model id.
     model_costs: Arc<std::sync::Mutex<std::collections::HashMap<String, (f64, f64)>>>,
+    /// Bytes of weights and cache this node's cards carry of each loaded dense model, as the
+    /// placement put them: the room it can give the model's layers. Published in gossip.
+    model_card_bytes: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     engines: Arc<RwLock<Vec<LoadedModelEntry>>>,
     gpu_manager: Option<Arc<GPUManagerImpl>>,
     stats_monitor: Arc<StatsMonitor>,
@@ -1344,6 +1347,16 @@ impl APIServer {
                 .filter_map(|m| costs.get(m).map(|c| (m.clone(), *c)))
                 .collect()
         };
+        let card_bytes_by_model: std::collections::HashMap<String, u64> = {
+            let held = self
+                .model_card_bytes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            models
+                .iter()
+                .filter_map(|m| held.get(m).map(|b| (m.clone(), *b)))
+                .collect()
+        };
         crate::distributed::cluster_runtime::PeerReport {
             node_id,
             models,
@@ -1401,6 +1414,7 @@ impl APIServer {
                 })
                 .collect(),
             cost_by_model,
+            card_bytes_by_model,
             prefill_tok_per_s: rates.prefill_tok_per_s,
             decode_tok_per_s: rates.decode_tok_per_s,
             model_load_s: rates.model_load_s,
@@ -1483,6 +1497,7 @@ impl APIServer {
             model_manager,
             servable: Arc::new(RwLock::new(None)),
             model_costs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            model_card_bytes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             engines: Arc::new(RwLock::new(Vec::new())),
             gpu_manager: Some(gpu_manager),
             stats_monitor,
@@ -1827,6 +1842,13 @@ impl APIServer {
                 }
             }
         }
+        // A model with no streamed experts is a dense stack: its layers are priced by what a
+        // layer costs on each node's cards and host, and cut across nodes when that pays.
+        let engine = if clustered && engine.expert_cost_shape().await.is_none() {
+            self.split_dense_model(engine, model_id, &config).await?
+        } else {
+            engine
+        };
         let expire_handle = if keep_alive_minutes > 0 {
             Some(self.schedule_expiration(model_id.to_string(), keep_alive_minutes))
         } else {
@@ -2082,12 +2104,13 @@ impl APIServer {
     /// frames until the upstream hangs up. `next` is the node running the layers after `to`, `None`
     /// for the final segment. Returns the port the upstream connects its link to. The model is loaded
     /// inside the thread, so it never crosses a thread boundary.
-    pub(crate) fn become_pipeline_tail(
+    pub(crate) async fn become_pipeline_tail(
         &self,
         model_id: &str,
         from: usize,
         to: usize,
         next: Option<std::net::SocketAddr>,
+        window: Option<usize>,
     ) -> Result<u16, String> {
         let engine = LlmEngine::with_config(self.config_for_model(model_id));
         let gguf = engine
@@ -2101,50 +2124,176 @@ impl APIServer {
             .local_addr()
             .map_err(|e| format!("pipeline tail: addr: {e}"))?
             .port();
-        std::thread::Builder::new()
-            .name(format!("pipeline-tail-{model_id}"))
-            .spawn(move || {
-                if let Err(e) = crate::inference::serve::pipeline_serve::run_tail_local(
-                    &gguf, from, to, next, listener,
-                ) {
-                    tracing::warn!("pipeline tail exited: {e}");
-                }
+        // A model with its own tail mechanism serves it from the file; any other is a generic
+        // transformer whose share is placed by the engine's own ladder and served from there.
+        let claimed = {
+            let gguf = gguf.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::inference::serve::pipeline_serve::claims_tail(&gguf)
             })
-            .map_err(|e| format!("pipeline tail: spawn: {e}"))?;
+            .await
+            .map_err(|e| format!("pipeline tail: {e}"))?
+        };
+        if claimed {
+            std::thread::Builder::new()
+                .name(format!("pipeline-tail-{model_id}"))
+                .spawn(move || {
+                    if let Err(e) = crate::inference::serve::pipeline_serve::run_tail_local(
+                        &gguf, from, to, next, listener,
+                    ) {
+                        tracing::warn!("pipeline tail exited: {e}");
+                    }
+                })
+                .map_err(|e| format!("pipeline tail: spawn: {e}"))?;
+        } else {
+            // Held while the share loads, so no request loads the whole model beside it.
+            let lock = self.loading_lock(model_id).await;
+            let _loading = lock.lock().await;
+            // This node's own copy of the model gives way: the share is placed on the room it
+            // frees, by the same ladder that placed the whole.
+            if let Err(e) = self.unload_model(model_id).await {
+                tracing::warn!("pipeline tail: {model_id} not unloaded: {e:?}");
+            }
+            let mut config = self.config_for_model(model_id);
+            config.layer_share = Some((from, to));
+            let share = LlmEngine::with_config(config);
+            let model = share.load_segment(window).await.map_err(|e| {
+                format!("pipeline tail: load layers [{from}, {to}) of {model_id}: {e}")
+            })?;
+            let name = model_id.to_string();
+            std::thread::Builder::new()
+                .name(format!("pipeline-tail-{model_id}"))
+                .spawn(move || {
+                    let ended = crate::inference::serve::pipeline_segment::serve_segment(
+                        model, next, listener,
+                    );
+                    if let Err(e) = ended {
+                        tracing::warn!("pipeline tail of {name} exited: {e}");
+                    }
+                    crate::inference::place::ladder::release_pools();
+                })
+                .map_err(|e| format!("pipeline tail: spawn: {e}"))?;
+        }
         info!("pipeline tail: serving {model_id} layers [{from}, {to}) on port {port}");
         Ok(port)
     }
 
-    /// Form the cross-node pipeline the auto-tune decided, with this node as the head. The wire
-    /// pipeline is head plus one tail that runs to the end - two segments, this node first - so a
-    /// plan of any other shape stays on one node until multi-node serving is wired. Asks the tail to
-    /// serve its range, then connects this node's model as the head. Returns a line describing what
-    /// happened, whether it formed the pipeline or kept to one node.
-    async fn form_pipeline_head(
+    /// Measure what a layer of the loaded dense model costs on this node, publish it, and with
+    /// peers that have published theirs decide from those rates and the round-trips between the
+    /// nodes whether to cut the stack across them. When a cut pays, this node becomes the head and
+    /// the engine that serves the model from here on is returned; otherwise, or when the pipeline
+    /// cannot be formed, the model stays whole here.
+    async fn split_dense_model(
         &self,
-        engine: &Arc<LlmEngine>,
+        engine: Arc<LlmEngine>,
+        model_id: &str,
+        config: &crate::inference::engine::llm_engine::InferenceConfig,
+    ) -> Result<Arc<LlmEngine>, String> {
+        let Some(cluster) = self.cluster.as_ref() else {
+            return Ok(engine);
+        };
+        let Some(inputs) = engine.segment_inputs().await else {
+            return Ok(engine);
+        };
+        self.model_costs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(model_id.to_string(), (inputs.card_ms, inputs.host_ms));
+        self.model_card_bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(model_id.to_string(), inputs.card_bytes);
+        let local = crate::distributed::cut_plan::NodeProfile {
+            vram: inputs.card_bytes,
+            layer_ms: inputs.card_ms,
+            miss_ms: inputs.host_ms,
+        };
+        let now = crate::distributed::cluster_runtime::now_ms(self.cluster_started());
+        let (nodes, rtt_pairs) = cluster.placement_inputs(model_id, now, local);
+        let rtt_refs: Vec<(&str, &str, f64)> = rtt_pairs
+            .iter()
+            .map(|(a, b, r)| (a.as_str(), b.as_str(), *r))
+            .collect();
+        info!(
+            "cluster auto-tune {model_id}: layer {:.3} ms on cards, {:.3} ms on host; {} node(s) measured",
+            inputs.card_ms,
+            inputs.host_ms,
+            nodes.len()
+        );
+        // This node is first in the nodes: it holds the request and starts the stack.
+        let plan = crate::distributed::auto_tune::auto_dense_distribution(
+            &inputs.layer_bytes,
+            inputs.head_bytes,
+            &nodes,
+            0,
+            &rtt_refs,
+        );
+        let Some(plan) = plan else {
+            info!("cluster auto-tune {model_id}: no arrangement of the measured nodes holds the model");
+            return Ok(engine);
+        };
+        if plan.segments.len() < 2 {
+            info!("cluster auto-tune {model_id}: single node is fastest; not splitting");
+            return Ok(engine);
+        }
+        info!(
+            "cluster auto-tune {model_id}: {:.2} ms per token over {:?}",
+            plan.total_ms, plan.segments
+        );
+        let window = engine.context_window().await;
+        let first = match self.start_tails(cluster, model_id, &plan, window).await {
+            Ok(addr) => addr,
+            Err(e) => {
+                tracing::warn!("cluster auto-tune {model_id}: pipeline not formed ({e}); one node");
+                return Ok(engine);
+            }
+        };
+        // The whole copy gives way to this node's share, placed by the same ladder that
+        // placed the whole.
+        let cut = plan.segments[0].end;
+        if let Err(e) = engine.unload().await {
+            tracing::warn!("cluster auto-tune {model_id}: whole copy not unloaded: {e}");
+        }
+        drop(engine);
+        let mut share = config.clone();
+        share.layer_share = Some((0, cut));
+        let head = Arc::new(LlmEngine::with_config(share));
+        match head.load_head(first, cut).await {
+            Ok(()) => {
+                info!(
+                    "auto-tune {model_id}: pipeline formed across {} nodes, head [0,{cut}) here",
+                    plan.segments.len()
+                );
+                Ok(head)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "cluster auto-tune {model_id}: head not formed ({e}); loading the whole model"
+                );
+                crate::inference::serve::pipeline_segment::release_segment(first);
+                drop(head);
+                let whole = Arc::new(LlmEngine::with_config(config.clone()));
+                whole.load_model().await.map_err(|e| e.to_string())?;
+                Ok(whole)
+            }
+        }
+    }
+
+    /// Ask every node after the first of `plan` to serve its layers, the last segment first so
+    /// each one's downstream already listens when it is told where it is. Returns the address of
+    /// the segment after the head, where the head connects. `window` is the context the head
+    /// serves, which a segment must be able to hold.
+    async fn start_tails(
+        &self,
         cluster: &crate::distributed::cluster::Cluster,
         model_id: &str,
         plan: &crate::distributed::cut_plan::TimePlan,
-    ) -> Result<String, String> {
+        window: Option<usize>,
+    ) -> Result<std::net::SocketAddr, String> {
         use std::net::ToSocketAddrs;
         let segs = &plan.segments;
-        if segs.len() < 2 {
-            return Ok(format!(
-                "auto-tune {model_id}: single node is fastest; one node"
-            ));
-        }
-        if segs[0].node != cluster.config.node_id {
-            return Ok(format!(
-                "auto-tune {model_id}: this node is not the pipeline head ({}); one node",
-                segs[0].node
-            ));
-        }
         let client = reqwest::Client::new();
-        // Set up the tail chain from the last segment back to the first, so each segment's
-        // downstream is already listening before the segment that feeds it is told where it is.
         let mut next_addr: Option<std::net::SocketAddr> = None;
-        let mut first_tail: Option<std::net::SocketAddr> = None;
         for seg in segs[1..].iter().rev() {
             let tail_url = cluster
                 .peer_url(&seg.node)
@@ -2159,6 +2308,7 @@ impl APIServer {
                     "from": seg.start,
                     "to": seg.end,
                     "next": next_addr.map(|a: std::net::SocketAddr| a.to_string()),
+                    "context": window,
                 }))
                 .send()
                 .await
@@ -2183,10 +2333,37 @@ impl APIServer {
                 .next()
                 .ok_or_else(|| format!("no address for {host}:{port}"))?;
             next_addr = Some(addr);
-            first_tail = Some(addr);
         }
+        next_addr.ok_or_else(|| "no tail in plan".to_string())
+    }
+
+    /// Form the cross-node pipeline the auto-tune decided, with this node as the head. The wire
+    /// pipeline is head plus one tail that runs to the end - two segments, this node first - so a
+    /// plan of any other shape stays on one node until multi-node serving is wired. Asks the tail to
+    /// serve its range, then connects this node's model as the head. Returns a line describing what
+    /// happened, whether it formed the pipeline or kept to one node.
+    async fn form_pipeline_head(
+        &self,
+        engine: &Arc<LlmEngine>,
+        cluster: &crate::distributed::cluster::Cluster,
+        model_id: &str,
+        plan: &crate::distributed::cut_plan::TimePlan,
+    ) -> Result<String, String> {
+        let segs = &plan.segments;
+        if segs.len() < 2 {
+            return Ok(format!(
+                "auto-tune {model_id}: single node is fastest; one node"
+            ));
+        }
+        if segs[0].node != cluster.config.node_id {
+            return Ok(format!(
+                "auto-tune {model_id}: this node is not the pipeline head ({}); one node",
+                segs[0].node
+            ));
+        }
+        let window = engine.context_window().await;
+        let first = self.start_tails(cluster, model_id, plan, window).await?;
         let cut = segs[0].end;
-        let first = first_tail.ok_or_else(|| "no tail in plan".to_string())?;
         engine
             .connect_pipeline_tail(first, cut)
             .await

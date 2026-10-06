@@ -146,7 +146,25 @@ impl GenericWeights<'_> {
 
     /// Bytes of the repeating blocks and of the output head, as the cards will hold them.
     /// `None` when the source cannot say, and the file size stands in.
-    pub(super) fn block_and_head_bytes(&self, content: &gguf_file::Content) -> Option<(u64, u64)> {
+    ///
+    /// With `share`, the layers `[from, to)` of a stack of `layers`: the blocks of those layers
+    /// alone, and the head only when the share ends the stack.
+    pub(super) fn block_and_head_bytes(
+        &self,
+        content: &gguf_file::Content,
+        share: Option<(usize, usize)>,
+        layers: usize,
+    ) -> Option<(u64, u64)> {
+        let in_share = |name: &str| -> bool {
+            let Some((from, to)) = share else {
+                return true;
+            };
+            name.strip_prefix("blk.")
+                .and_then(|rest| rest.split_once('.'))
+                .and_then(|(idx, _)| idx.parse::<usize>().ok())
+                .is_some_and(|i| (from..to).contains(&i))
+        };
+        let holds_head = share.is_none_or(|(_, to)| to == layers);
         match self {
             GenericWeights::Gguf { .. } | GenericWeights::GgufSplit { .. } => {
                 let tensor_bytes = |name: &str| {
@@ -158,12 +176,13 @@ impl GenericWeights<'_> {
                 let block_bytes: u64 = content
                     .tensor_infos
                     .iter()
-                    .filter(|(n, _)| n.starts_with("blk."))
+                    .filter(|(n, _)| n.starts_with("blk.") && in_share(n))
                     .map(|(_, t)| t.size_in_bytes() as u64)
                     .sum();
                 // An untied model uploads `output.weight`; a tied one uploads its
                 // embedding table as the projection.
                 let head_bytes = match tensor_bytes("output.weight") {
+                    _ if !holds_head => 0,
                     0 => tensor_bytes("token_embd.weight"),
                     b => b,
                 };

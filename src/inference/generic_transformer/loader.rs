@@ -2577,9 +2577,11 @@ impl GenericHeteroTransformer {
             .iter()
             .flat_map(|seg| (seg.layer_start..seg.layer_end).map(move |i| (i, seg.kind)))
             .collect();
-        assert_eq!(
-            layer_devices.len(),
-            n_layers,
+        // The plan places the whole stack, or one node's share of it: the layers it names are
+        // the only ones read, and the output head is read only by the share that ends the stack.
+        let (share_start, share_end) = plan.range();
+        assert!(
+            share_end <= n_layers && layer_devices.len() == share_end - share_start,
             "plan covers {} layers but model has {}",
             layer_devices.len(),
             n_layers
@@ -3239,13 +3241,17 @@ impl GenericHeteroTransformer {
         // The output projection sits on the last card a layer runs on, in its stored format:
         // the plan counted it there. A card that runs out of memory fails the load, so the
         // ladder places the model again; any other failure leaves the head on the host.
-        let last_cuda_idx = layer_devs.iter().rev().find_map(|d| {
-            if let LayerDevice::Cuda(idx) = d {
-                Some(*idx)
-            } else {
-                None
-            }
-        });
+        let last_cuda_idx = layer_devs
+            .iter()
+            .rev()
+            .find_map(|d| {
+                if let LayerDevice::Cuda(idx) = d {
+                    Some(*idx)
+                } else {
+                    None
+                }
+            })
+            .filter(|_| plan.holds_head());
         let mut output_proj_cuda: Option<Tensor> = None;
         let mut output_norm_cuda_weight: Option<Tensor> = None;
         let mut output_proj_cuda_qmm: Option<crate::tensor::quantized::QMatMul> = None;
@@ -3472,6 +3478,7 @@ impl GenericHeteroTransformer {
             config,
             embeddings,
             layers,
+            first_layer: share_start,
             layer_devs,
             output_norm,
             output_proj,
@@ -3809,6 +3816,7 @@ impl GenericHeteroTransformer {
             config,
             embeddings,
             layers,
+            first_layer: 0,
             layer_devs,
             output_norm,
             output_proj,
@@ -3922,76 +3930,15 @@ mod source_tests {
     use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
     use crate::tensor::quantized::gguf_file::Value;
     use crate::tensor::quantized::gguf_source::SplitGguf;
-    use crate::tensor::quantized::GgmlDType;
 
     const LAYERS: usize = 2;
-    const EMBD: usize = 8;
-    const FFN: usize = 16;
-    const VOCAB: usize = 11;
 
-    /// A tiny dense model: `[out, in]` weights of a deterministic pattern, F32.
     fn entries() -> Vec<GgufEntry> {
-        let mut seed = 7u32;
-        let mut entry = |name: String, dims: Vec<usize>| {
-            let n: usize = dims.iter().product();
-            let data = (0..n)
-                .flat_map(|_| {
-                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                    (((seed >> 16) as f32 / 65536.0 - 0.5) * 0.4).to_le_bytes()
-                })
-                .collect();
-            GgufEntry {
-                name,
-                dims,
-                dtype: GgmlDType::F32,
-                data,
-            }
-        };
-        let mut out = vec![
-            entry("token_embd.weight".into(), vec![VOCAB, EMBD]),
-            entry("output.weight".into(), vec![VOCAB, EMBD]),
-        ];
-        let norm = |name: String| GgufEntry {
-            name,
-            dims: vec![EMBD],
-            dtype: GgmlDType::F32,
-            data: [1.0f32.to_le_bytes(); EMBD].concat(),
-        };
-        out.push(norm("output_norm.weight".into()));
-        for il in 0..LAYERS {
-            out.push(norm(format!("blk.{il}.attn_norm.weight")));
-            out.push(norm(format!("blk.{il}.ffn_norm.weight")));
-            for (n, d) in [
-                ("attn_q", [EMBD, EMBD]),
-                ("attn_k", [EMBD, EMBD]),
-                ("attn_v", [EMBD, EMBD]),
-                ("attn_output", [EMBD, EMBD]),
-                ("ffn_gate", [FFN, EMBD]),
-                ("ffn_up", [FFN, EMBD]),
-                ("ffn_down", [EMBD, FFN]),
-            ] {
-                out.push(entry(format!("blk.{il}.{n}.weight"), d.to_vec()));
-            }
-        }
-        out
+        super::super::tiny_model::entries(LAYERS)
     }
 
     fn metadata() -> Vec<(String, Value)> {
-        let u = |k: &str, v: u32| (format!("llama.{k}"), Value::U32(v));
-        vec![
-            ("general.architecture".into(), Value::String("llama".into())),
-            u("block_count", LAYERS as u32),
-            u("embedding_length", EMBD as u32),
-            u("feed_forward_length", FFN as u32),
-            u("attention.head_count", 2),
-            u("attention.head_count_kv", 2),
-            u("context_length", 64),
-            (
-                "llama.attention.layer_norm_rms_epsilon".into(),
-                Value::F32(1e-5),
-            ),
-            ("llama.rope.freq_base".into(), Value::F32(10000.0)),
-        ]
+        super::super::tiny_model::metadata(LAYERS)
     }
 
     fn logits(mut model: GenericHeteroTransformer) -> Vec<f32> {

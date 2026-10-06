@@ -204,6 +204,10 @@ pub struct InferenceConfig {
     /// `Q8` stores both as Q8_0 blocks (half VRAM, slight quality drift).
     /// Model-load-time only - changing this after load has no effect.
     pub kv_quant: KvQuant,
+    /// The layers `[from, to)` this load holds when it is one segment of a stack that other
+    /// nodes run the rest of; `None` loads the whole stack. Set by the cluster when it places a
+    /// segment here, never read from the configuration.
+    pub layer_share: Option<(usize, usize)>,
 }
 
 /// KV-cache storage mode for per-layer caches.
@@ -257,6 +261,7 @@ impl Default for InferenceConfig {
             disable_cuda: false,
             force_cuda_only_layers: false,
             kv_quant: KvQuant::Off,
+            layer_share: None,
         }
     }
 }

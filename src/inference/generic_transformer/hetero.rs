@@ -1557,6 +1557,18 @@ impl GenericHeteroTransformer {
         all_positions: bool,
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
+        let (hidden, ple_inputs) = self.embed_stage(input_ids, index_pos)?;
+        self.forward_layers_and_output(hidden, ple_inputs, index_pos, seq_len, all_positions)
+    }
+
+    /// The first stage of a forward: the embeddings of `input_ids` as the residual stream
+    /// the layers start from, and the per-layer inputs of a family that has them.
+    pub(super) fn embed_stage(
+        &mut self,
+        input_ids: &Tensor,
+        index_pos: usize,
+    ) -> Result<(Tensor, Option<Vec<Tensor>>)> {
+        let (_, seq_len) = input_ids.dims2()?;
 
         // Small-model CPU prefill: route the activation quantize onto the same
         // logical prefill pool as the matmul, so the physical pool stays parked
@@ -1699,7 +1711,7 @@ impl GenericHeteroTransformer {
             None
         };
 
-        self.forward_layers_and_output(hidden, ple_inputs, index_pos, seq_len, all_positions)
+        Ok((hidden, ple_inputs))
     }
 
     /// Run the per-layer loop + final norm + output projection given a
@@ -1715,26 +1727,53 @@ impl GenericHeteroTransformer {
     /// `seq_len` must equal `hidden.dim(1)`.
     pub(super) fn forward_layers_and_output(
         &mut self,
-        mut hidden: Tensor,
+        hidden: Tensor,
         ple_inputs: Option<Vec<Tensor>>,
         index_pos: usize,
         seq_len: usize,
         all_positions: bool,
     ) -> Result<Tensor> {
+        let (hidden, on_cuda) = self.run_layers(hidden, ple_inputs, index_pos, seq_len)?;
+        self.output_stage(hidden, on_cuda, seq_len, all_positions)
+    }
+
+    /// The layer loop of a forward: `hidden` through every layer, crossing the placement
+    /// segments, returned with whether it ends on a card.
+    pub(super) fn run_layers(
+        &mut self,
+        hidden: Tensor,
+        ple_inputs: Option<Vec<Tensor>>,
+        index_pos: usize,
+        seq_len: usize,
+    ) -> Result<(Tensor, bool)> {
+        let upto = self.layers.len();
+        self.run_layers_in(hidden, ple_inputs, index_pos, seq_len, 0, upto)
+    }
+
+    /// `run_layers` over the layers `[from, upto)` alone.
+    pub(super) fn run_layers_in(
+        &mut self,
+        mut hidden: Tensor,
+        ple_inputs: Option<Vec<Tensor>>,
+        index_pos: usize,
+        seq_len: usize,
+        from: usize,
+        upto: usize,
+    ) -> Result<(Tensor, bool)> {
         let mut on_cuda = !hidden.device().is_cpu();
 
         // -- Layer-by-layer with segment-based transfers -------------------
-        let mut seg_start = 0;
+        let mut seg_start = from;
         let mut current_cuda_idx: Option<usize> =
             if let crate::tensor::DeviceLocation::Cuda { gpu_id } = hidden.device().location() {
                 Some(gpu_id)
             } else {
                 None
             };
-        while seg_start < self.layers.len() {
+        while seg_start < upto {
             let seg_dev = &self.layer_devs[seg_start];
             let mut seg_end = seg_start + 1;
-            while seg_end < self.layers.len() && &self.layer_devs[seg_end] == seg_dev {
+            while seg_end < upto && &self.layer_devs[seg_end] == seg_dev {
                 seg_end += 1;
             }
 
@@ -1999,7 +2038,18 @@ impl GenericHeteroTransformer {
 
             seg_start = seg_end;
         }
+        Ok((hidden, on_cuda))
+    }
 
+    /// The last stage of a forward: the final norm and the output projection of `hidden`,
+    /// every position's logits when `all_positions`, else the last one's.
+    pub(super) fn output_stage(
+        &mut self,
+        mut hidden: Tensor,
+        mut on_cuda: bool,
+        seq_len: usize,
+        all_positions: bool,
+    ) -> Result<Tensor> {
         // -- Final norm + output projection --------------------------
         // The output stage must not read the hidden state while the last layer's GPU is
         // still writing it: the copy would take partially-written data off a running

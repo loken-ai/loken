@@ -6,6 +6,17 @@
 
 use super::*;
 
+/// A model's layers as the cluster's planner sees them; see `LlmEngine::segment_inputs`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentInputs {
+    pub layer_bytes: Vec<u64>,
+    pub head_bytes: u64,
+    pub card_ms: f64,
+    pub host_ms: f64,
+    /// The bytes of those layers, and of the head with them, that this node's cards carry.
+    pub card_bytes: u64,
+}
+
 impl LlmEngine {
     /// Cross-encoder relevance score in [0,1] for one (query, document) pair,
     /// using this engine's causal LLM as a Qwen3-Reranker (P(yes) at the final
@@ -107,6 +118,127 @@ impl LlmEngine {
             .and_then(|s| s.model.placement_model_inputs())
     }
 
+    /// What the cluster's planner needs to place this model's layers on nodes: each layer's
+    /// bytes with its cache, the output head's bytes, and what a layer costs on this node's
+    /// cards and host, zero for a device no layer ran on. `None` when the model cannot be cut
+    /// or its file cannot be read. Runs decode steps, so it is called when the node is idle.
+    pub async fn segment_inputs(&self) -> Option<SegmentInputs> {
+        let file = self.resolve_model_file(&self.config.model_id)?;
+        let model_state = self.model_state.clone();
+        tokio::task::spawn_blocking(move || {
+            let content = crate::tensor::quantized::gguf_source::SplitGguf::open(&file)
+                .ok()?
+                .merged_content();
+            let mut guard = model_state.blocking_lock();
+            let state = guard.as_mut()?;
+            let profile = state.model.segment_profile()?;
+            let placed = state.model.device_layer_distribution();
+            let mut layer_bytes = Vec::new();
+            for (name, info) in &content.tensor_infos {
+                let Some(idx) = name
+                    .strip_prefix("blk.")
+                    .and_then(|r| r.split_once('.'))
+                    .and_then(|(i, _)| i.parse::<usize>().ok())
+                else {
+                    continue;
+                };
+                if layer_bytes.len() <= idx {
+                    layer_bytes.resize(idx + 1, 0);
+                }
+                layer_bytes[idx] += info.size_in_bytes() as u64;
+            }
+            // A quantised cache starts at the working window and grows on demand, and is
+            // placed at that size; an unquantised one is allocated at the whole window.
+            let planned_window = match profile.kv_quant {
+                KvQuant::Off => profile.window,
+                _ => profile
+                    .window
+                    .min(crate::inference::cache::KV_WORKING_WINDOW_TOKENS),
+            };
+            let kv_bytes = super::loading::kv_cache_bytes(
+                profile.kv_quant,
+                std::mem::size_of::<f32>() as u64,
+                profile.kv_elems_per_token * planned_window as u64,
+            );
+            for bytes in &mut layer_bytes {
+                *bytes += kv_bytes;
+            }
+            let tensor_bytes = |n: &str| {
+                content
+                    .tensor_infos
+                    .get(n)
+                    .map_or(0, |t| t.size_in_bytes() as u64)
+            };
+            // An untied model uploads `output.weight`; a tied one its embedding table.
+            let head_bytes = match tensor_bytes("output.weight") {
+                0 => tensor_bytes("token_embd.weight"),
+                b => b,
+            };
+            // The layers a card carries are the ranges the placement reports for a device that is
+            // not the host; the head rides on the cards when any layer does.
+            let on_card: Vec<usize> = placed
+                .iter()
+                .filter(|(device, ..)| device != "CPU")
+                .flat_map(|&(_, _, first, last)| first as usize..=last as usize)
+                .collect();
+            let card_bytes = on_card
+                .iter()
+                .filter_map(|&l| layer_bytes.get(l))
+                .sum::<u64>()
+                + if on_card.is_empty() { 0 } else { head_bytes };
+            Some(SegmentInputs {
+                layer_bytes,
+                head_bytes,
+                card_bytes,
+                card_ms: profile.rates.card_ms.unwrap_or(0.0),
+                host_ms: profile.rates.host_ms.unwrap_or(0.0),
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Load the layers `config.layer_share` names and hand the model out of the engine, which
+    /// then holds nothing: the model belongs to whoever serves the segment. `window` is the
+    /// context the head serves; a segment that cannot hold it is refused, as is a model that
+    /// cannot be cut.
+    pub async fn load_segment(
+        &self,
+        window: Option<usize>,
+    ) -> Result<GenericHeteroTransformer, String> {
+        if self.config.layer_share.is_none() {
+            return Err("no layer share is configured".to_string());
+        }
+        self.load_model_only().await.map_err(|e| e.to_string())?;
+        let state = self.model_state.lock().await.take();
+        let state = state.ok_or_else(|| "no model loaded".to_string())?;
+        let model = state
+            .model
+            .take_generic()
+            .map_err(|_| "this model is not a generic transformer".to_string())?;
+        if let Some(why) = model.segment_unsupported_reason() {
+            return Err(format!("this model cannot be cut: {why}"));
+        }
+        if let Some(window) = window.filter(|&w| w > model.kv_capacity()) {
+            return Err(format!(
+                "the segment holds {} positions and the head serves {window}",
+                model.kv_capacity()
+            ));
+        }
+        Ok(model)
+    }
+
+    /// Load the layers `[0, cut)` named by `config.layer_share` and make them the head of the
+    /// pipeline whose next segment listens at `addr`.
+    pub async fn load_head(&self, addr: std::net::SocketAddr, cut: usize) -> Result<(), String> {
+        if self.config.layer_share != Some((0, cut)) {
+            return Err(format!("the share is not layers [0, {cut})"));
+        }
+        self.load_model_only().await.map_err(|e| e.to_string())?;
+        self.connect_pipeline_tail(addr, cut).await
+    }
+
     /// Make the loaded model the head of a cross-node pipeline, running `[0, cut)` here and handing
     /// `[cut, n)` to the tail at `addr`. Called when the cluster's auto-tune decides a split pays.
     pub async fn connect_pipeline_tail(
@@ -118,9 +250,31 @@ impl LlmEngine {
         let s = state
             .as_mut()
             .ok_or_else(|| "no model loaded".to_string())?;
-        s.model
-            .connect_pipeline_tail(addr, cut)
-            .map_err(|e| e.to_string())
+        // A generic transformer keeps layers `[0, cut)` and the rest leaves with the link; any
+        // other backend forms the pipeline its own way, or declines.
+        let taken: BoxedModelBackend = std::mem::replace(&mut s.model, Box::new(TakenBackend));
+        match taken.take_generic() {
+            Ok(model) => {
+                match crate::inference::engine::pipeline_head::PipelineHeadBackend::connect(
+                    model, addr, cut,
+                ) {
+                    Ok(head) => {
+                        s.model = Box::new(head);
+                        Ok(())
+                    }
+                    Err((model, e)) => {
+                        s.model = Box::new(GenericBackend(*model));
+                        Err(e.to_string())
+                    }
+                }
+            }
+            Err(other) => {
+                s.model = other;
+                s.model
+                    .connect_pipeline_tail(addr, cut)
+                    .map_err(|e| e.to_string())
+            }
+        }
     }
 
     /// Get device name
