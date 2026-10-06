@@ -274,7 +274,19 @@ pub(crate) fn build_prompt(
         ));
     }
     let messages: &[Message] = owned.as_deref().unwrap_or(spec.messages);
-    let thinking_off = spec.thinking == Some("disabled");
+    // An answer a grammar constrains from its first token has no room to think: a prompt that
+    // opens a thinking block would file the whole constrained answer as reasoning.
+    let constrained = spec.output_grammar.is_some()
+        || spec
+            .tools
+            .filter(|_| tools_active)
+            .is_some_and(|_| crate::api::tool_calls::forced_call(spec.tool_choice).is_some());
+    let thinking = if constrained {
+        Some("disabled")
+    } else {
+        spec.thinking
+    };
+    let thinking_off = thinking == Some("disabled");
     let mut prompt = match spec.tools.filter(|_| tools_active) {
         Some(tools) if template_takes_tools(template) => {
             format_chat_prompt_with_tools(messages, template, tools)
@@ -295,7 +307,7 @@ pub(crate) fn build_prompt(
         }
         None => format_chat_prompt_thinking(messages, template, thinking_off),
     };
-    apply_thinking_preference(&mut prompt, spec.thinking, template);
+    apply_thinking_preference(&mut prompt, thinking, template);
     let thinking_opened = crate::api::thinking::prompt_opens_thinking(&prompt);
     let forced = spec
         .tools
@@ -535,6 +547,23 @@ mod tests {
         let p = build_prompt(&s, Some(CHATML), "", false, None);
         assert!(
             p.prompt.ends_with("<|im_start|>assistant\n"),
+            "{}",
+            p.prompt
+        );
+    }
+
+    /// A grammar-constrained answer is the content, whatever the template does by default:
+    /// the prompt closes the thinking block so the constrained text is not read as reasoning.
+    #[test]
+    fn a_grammar_closes_thinking_for_the_answer_it_constrains() {
+        let msgs = [user("hi", None)];
+        let mut s = spec(&msgs, None, None);
+        s.output_grammar = Some("json_object".to_string());
+        let thinking = format!("{{# enable_thinking #}}{CHATML}");
+        let p = build_prompt(&s, Some(&thinking), "", false, None);
+        assert!(!p.thinking_opened, "{}", p.prompt);
+        assert!(
+            p.prompt.ends_with("<think>\n\n</think>\n\n"),
             "{}",
             p.prompt
         );
