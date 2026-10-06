@@ -92,8 +92,14 @@ pub fn rms_norm_row(row: &mut [f32], gamma: &[f32], eps: f32) {
 pub struct IndexerCache {
     raw: Vec<f32>,
     pooled: Vec<f32>,
+    /// The pooled keys again, every complete group of [`LANES`] blocks transposed to
+    /// `[dim][lane]`, which scores a group with one multiply-add per dimension.
+    lanes: Vec<f32>,
     tokens: usize,
 }
+
+/// Blocks scored together.
+const LANES: usize = 8;
 
 impl IndexerCache {
     /// Tokens held.
@@ -138,16 +144,83 @@ impl IndexerCache {
                 rms_norm_row(&mut pooled, k_gamma, eps);
                 rope.apply(&mut pooled, first);
                 self.pooled.extend_from_slice(&pooled);
+                let blocks = self.pooled.len() / hd;
+                if blocks.is_multiple_of(LANES) {
+                    let group = &self.pooled[(blocks - LANES) * hd..];
+                    for d in 0..hd {
+                        self.lanes
+                            .extend((0..LANES).map(|lane| group[lane * hd + d]));
+                    }
+                }
             }
         }
     }
 
     /// The score of each block complete by `pos` for the query heads `q`: the rectified dot
-    /// products summed over the heads, scaled by `1 / sqrt(head_dim)`.
+    /// products summed over the heads, scaled by `1 / sqrt(head_dim)`. Groups of [`LANES`]
+    /// blocks are scored together, each lane summing its dimensions in order as one block
+    /// does alone, so the scores are those of [`Self::block_scores_alone`] to the bit.
     pub fn block_scores(&self, q: &[f32], pos: usize, meta: &IndexerMeta) -> Vec<f32> {
+        let blocks = (pos + 1) / meta.block;
+        let groups = blocks / LANES;
+        let mut scores = Vec::with_capacity(blocks);
+        let scaled = |scores: &mut Vec<f32>| {
+            let scale = 1.0 / (meta.head_dim as f32).sqrt();
+            scores.iter_mut().for_each(|s| *s *= scale);
+        };
+        match meta.heads {
+            1 => self.score_groups::<1>(q, meta.head_dim, groups, &mut scores),
+            2 => self.score_groups::<2>(q, meta.head_dim, groups, &mut scores),
+            3 => self.score_groups::<3>(q, meta.head_dim, groups, &mut scores),
+            4 => self.score_groups::<4>(q, meta.head_dim, groups, &mut scores),
+            5 => self.score_groups::<5>(q, meta.head_dim, groups, &mut scores),
+            6 => self.score_groups::<6>(q, meta.head_dim, groups, &mut scores),
+            7 => self.score_groups::<7>(q, meta.head_dim, groups, &mut scores),
+            8 => self.score_groups::<8>(q, meta.head_dim, groups, &mut scores),
+            _ => {}
+        }
+        scaled(&mut scores);
+        let done = scores.len();
+        scores.extend(self.block_scores_alone(q, done, blocks, meta));
+        scores
+    }
+
+    /// The unscaled scores of the first `groups` groups of blocks for `H` query heads.
+    fn score_groups<const H: usize>(
+        &self,
+        q: &[f32],
+        hd: usize,
+        groups: usize,
+        scores: &mut Vec<f32>,
+    ) {
+        for group in self.lanes.chunks_exact(hd * LANES).take(groups) {
+            let mut dots = [[0f32; LANES]; H];
+            for (d, key) in group.chunks_exact(LANES).enumerate() {
+                let key: [f32; LANES] = key.try_into().expect("a lane group");
+                for (h, dot) in dots.iter_mut().enumerate() {
+                    let x = q[h * hd + d];
+                    for lane in 0..LANES {
+                        dot[lane] += x * key[lane];
+                    }
+                }
+            }
+            for lane in 0..LANES {
+                scores.push(dots.iter().map(|dot| dot[lane].max(0.0)).sum());
+            }
+        }
+    }
+
+    /// The scores of blocks `from..to`, one block at a time.
+    fn block_scores_alone(
+        &self,
+        q: &[f32],
+        from: usize,
+        to: usize,
+        meta: &IndexerMeta,
+    ) -> Vec<f32> {
         let hd = meta.head_dim;
         let scale = 1.0 / (hd as f32).sqrt();
-        (0..(pos + 1) / meta.block)
+        (from..to)
             .map(|b| {
                 let key = &self.pooled[b * hd..(b + 1) * hd];
                 let score: f32 = q
@@ -380,6 +453,70 @@ mod tests {
         let kept = cache.select(&[1.0, 0.5], 14, &m);
         assert_eq!(kept.len(), 2 * 4 + 3);
         assert_eq!(&kept[kept.len() - 3..], &[12, 13, 14]);
+    }
+
+    /// What a decoded token's block scoring costs at a long context, in groups and alone. Not a
+    /// gate.
+    #[test]
+    #[ignore = "a measurement: cargo test --release scoring_cost -- --ignored --nocapture"]
+    fn scoring_cost() {
+        let m = IndexerMeta {
+            heads: 4,
+            head_dim: 128,
+            top_k: 2048,
+            block: 4,
+        };
+        let rope = HostRope::new(128, 10000.0);
+        let mut cache = IndexerCache::default();
+        let tokens = 12_000;
+        let rows: Vec<f32> = (0..tokens * 128)
+            .map(|i| ((i * 7919 % 1009) as f32 / 1009.0 - 0.5) * 2.0)
+            .collect();
+        cache.append(&rows, &m, &[1.0; 128], 1e-6, &rope);
+        let q: Vec<f32> = (0..4 * 128)
+            .map(|i| ((i * 104729 % 997) as f32 / 997.0 - 0.5) * 3.0)
+            .collect();
+        let time = |f: &dyn Fn() -> Vec<f32>| {
+            let start = std::time::Instant::now();
+            let mut sink = 0f32;
+            for _ in 0..50 {
+                sink += std::hint::black_box(f())[0];
+            }
+            (start.elapsed().as_secs_f64() / 50.0 * 1e6, sink)
+        };
+        let blocks = tokens / 4;
+        let (grouped, _) = time(&|| cache.block_scores(&q, tokens - 1, &m));
+        let (alone, _) = time(&|| cache.block_scores_alone(&q, 0, blocks, &m));
+        eprintln!("{blocks} blocks: {grouped:.0} us in groups, {alone:.0} us alone");
+    }
+
+    /// Scoring blocks in groups gives, bit for bit, what scoring each alone gives.
+    #[test]
+    fn scoring_blocks_in_groups_is_scoring_them_alone() {
+        let m = IndexerMeta {
+            heads: 3,
+            head_dim: 16,
+            top_k: 64,
+            block: 4,
+        };
+        let rope = HostRope::new(16, 10000.0);
+        let mut cache = IndexerCache::default();
+        let rows: Vec<f32> = (0..16 * 4 * 21 + 3 * 16)
+            .map(|i| ((i * 7919 % 1009) as f32 / 1009.0 - 0.5) * 2.0)
+            .collect();
+        cache.append(&rows, &m, &[1.0; 16], 1e-6, &rope);
+        let q: Vec<f32> = (0..3 * 16)
+            .map(|i| ((i * 104729 % 997) as f32 / 997.0 - 0.5) * 3.0)
+            .collect();
+        for pos in [3usize, 31, 32, 35, 67, 82, 83, 84] {
+            let grouped = cache.block_scores(&q, pos, &m);
+            let blocks = (pos + 1) / m.block;
+            let alone = cache.block_scores_alone(&q, 0, blocks, &m);
+            assert_eq!(grouped.len(), blocks);
+            for (a, b) in grouped.iter().zip(&alone) {
+                assert_eq!(a.to_bits(), b.to_bits(), "pos {pos}");
+            }
+        }
     }
 
     #[test]

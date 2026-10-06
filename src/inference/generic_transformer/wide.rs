@@ -362,9 +362,35 @@ impl GenericTransformerLayer {
             k = k.to_dtype(DType::F16)?;
             v = v.to_dtype(DType::F16)?;
         }
+        let rep = n_head / n_kv;
+        if let (1, 1, [kept]) = (b, seq, selection) {
+            // One token: only the kept positions are read, gathered from the cache where it
+            // lies, so nothing of the history is copied or widened.
+            self.kv_cache
+                .append_in_place(&k.contiguous()?, &v.contiguous()?)?;
+            let (Some(k_buf), Some(v_buf)) = (self.kv_cache.k_buffer(), self.kv_cache.v_buffer())
+            else {
+                crate::tensor::bail!("selected attention before the cache holds a token");
+            };
+            let at = Tensor::from_vec(kept.clone(), (kept.len(),), &q.device())?;
+            let k_kept = k_buf.index_select(&at, 2)?.to_dtype(DType::F32)?;
+            let v_kept = v_buf.index_select(&at, 2)?.to_dtype(DType::F32)?;
+            let scale = self
+                .attention_scale
+                .unwrap_or_else(|| 1.0 / (hd as f64).sqrt());
+            let q = q
+                .to_dtype(DType::F32)?
+                .contiguous()?
+                .reshape((1, n_kv, rep, hd))?;
+            let scores = (q.matmul(&k_kept.transpose(2, 3)?)? * scale)?;
+            let probs = crate::tensor::ops::softmax_last_dim(&scores)?;
+            let y = probs.matmul(&v_kept)?.reshape((1, n_head, 1, hd))?;
+            let y = y.transpose(1, 2)?.reshape((1, 1, n_head * hd))?;
+            let y = self.gate_attention(x, y)?;
+            return self.attn_output.forward(&y);
+        }
         let (k_all, v_all) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
         let kv_len = k_all.dim(2)?;
-        let rep = n_head / n_kv;
         // The heads of a group read the same keys and values: they stand as extra rows of one
         // product per group, so the cache is read once and never repeated across its heads.
         let (k_all, v_all) = (k_all.to_dtype(DType::F32)?, v_all.to_dtype(DType::F32)?);
