@@ -16,6 +16,23 @@ pub(super) fn get_gguf_string(ct: &gguf_file::Content, key: &str) -> Option<Stri
     }
 }
 
+/// The longest context a model was trained for: the file's own `context_length` when it states one,
+/// else the window its rotary scaling reaches, the scaling factor times the original window; `None`
+/// for a file that states neither, which the caller gives the working window.
+pub(super) fn trained_context(ct: &gguf_file::Content, arch: &str) -> Option<usize> {
+    if let Some(n) = get_gguf_u32(ct, &format!("{arch}.context_length")) {
+        return Some(n as usize);
+    }
+    let original = get_gguf_u32(ct, &format!("{arch}.rope.scaling.original_context_length"))?;
+    let factor = match ct.metadata.get(&format!("{arch}.rope.scaling.factor"))? {
+        gguf_file::Value::F32(f) => *f as f64,
+        gguf_file::Value::F64(f) => *f,
+        _ => return None,
+    };
+    let reached = (original as f64 * factor).round();
+    (reached >= 1.0).then_some(reached as usize)
+}
+
 /// Helper: get u32 value from GGUF metadata
 pub(super) fn get_gguf_u32(ct: &gguf_file::Content, key: &str) -> Option<u32> {
     match ct.metadata.get(key)? {
@@ -1028,5 +1045,46 @@ mod token_lookup_tests {
         assert_eq!(gguf_token_id(&ct, "<turn|>"), Some(3));
         assert_eq!(gguf_token_id(&ct, "<|turn>"), Some(2));
         assert_eq!(gguf_token_id(&ct, "<end_of_turn>"), None);
+    }
+}
+
+#[cfg(test)]
+mod trained_context_tests {
+    use super::*;
+    use crate::tensor::quantized::gguf_file::{Content, Value, VersionedMagic};
+    use std::collections::HashMap;
+
+    fn content(pairs: &[(&str, Value)]) -> Content {
+        Content {
+            magic: VersionedMagic::GgufV3,
+            metadata: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect::<HashMap<_, _>>(),
+            tensor_infos: HashMap::new(),
+            tensor_data_offset: 0,
+            mmap_owner: None,
+        }
+    }
+
+    /// A file that states its window is believed; one that states only a rotary scaling is
+    /// given the window the scaling reaches; one that states neither says nothing, and the
+    /// caller gives it the working window.
+    #[test]
+    fn a_files_trained_window_is_stated_or_reached_by_its_scaling() {
+        let stated = content(&[("a.context_length", Value::U32(8192))]);
+        assert_eq!(trained_context(&stated, "a"), Some(8192));
+        let scaled = content(&[
+            ("a.rope.scaling.original_context_length", Value::U32(65536)),
+            ("a.rope.scaling.factor", Value::F32(16.0)),
+        ]);
+        assert_eq!(trained_context(&scaled, "a"), Some(1_048_576));
+        let both = content(&[
+            ("a.context_length", Value::U32(4096)),
+            ("a.rope.scaling.original_context_length", Value::U32(65536)),
+            ("a.rope.scaling.factor", Value::F32(16.0)),
+        ]);
+        assert_eq!(trained_context(&both, "a"), Some(4096));
+        assert_eq!(trained_context(&content(&[]), "a"), None);
     }
 }

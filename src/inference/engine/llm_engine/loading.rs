@@ -129,10 +129,8 @@ impl ModelDims {
 pub(crate) fn per_card_reserve(path: &std::path::Path) -> Option<u64> {
     let content = gguf_file::open_header(path).ok()?;
     let arch = get_gguf_string(&content, "general.architecture")?;
-    let context_length = get_gguf_u32(&content, &format!("{arch}.context_length"))
-        .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| {
-            c as usize
-        });
+    let context_length = trained_context(&content, &arch)
+        .unwrap_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
     let staging = crate::inference::place::runtime_demand::tensor_load_staging(
         crate::inference::generic_transformer::ngram::largest_placed_tensor(&content, &arch),
     );
@@ -464,8 +462,8 @@ impl LlmEngine {
                         .map(|v| v as u32)
                 })
                 .unwrap_or(32000) as usize;
-            let context_length = get_gguf_u32(&content, &format!("{arch}.context_length"))
-                .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| c as usize);
+            let context_length = trained_context(&content, &arch)
+                .unwrap_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
             // No window asked for: the model's own.
             let window_asked = user_context_length != 0;
             let user_context_length = if user_context_length == 0 {
