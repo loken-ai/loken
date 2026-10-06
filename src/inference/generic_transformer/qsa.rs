@@ -246,9 +246,28 @@ impl SparseAttention {
 
     /// Take in the rows `x` `[1, seq, hidden]` starting at position `index_pos`: their raw
     /// keys join the cache. When the context they reach no longer fits the budget, the
-    /// tokens each row attends to; `None` while attention is dense.
+    /// tokens each row attends to; `None` while attention is dense. The rows are independent
+    /// of one another once the keys are in, so they are selected across the host's cores.
     pub fn observe(&mut self, x: &Tensor, index_pos: usize) -> Result<Option<Vec<Vec<u32>>>> {
-        self.observe_scored(x, index_pos, |_, _| {})
+        use rayon::prelude::*;
+        let Some(mut q) = self.take_in(x, index_pos)? else {
+            return Ok(None);
+        };
+        let m = self.meta;
+        let row = m.heads * m.head_dim;
+        let (cache, rope, gamma, eps) = (&self.cache, &self.rope, &self.q_gamma, self.eps);
+        let out = q
+            .par_chunks_exact_mut(row)
+            .enumerate()
+            .map(|(i, rows)| {
+                for head in rows.chunks_exact_mut(m.head_dim) {
+                    rms_norm_row(head, gamma, eps);
+                    rope.apply(head, index_pos + i);
+                }
+                cache.select(rows, index_pos + i, &m)
+            })
+            .collect();
+        Ok(Some(out))
     }
 
     /// [`Self::observe`], handing each row's block scores to `on_scores` as `(row, scores)`.
@@ -258,6 +277,26 @@ impl SparseAttention {
         index_pos: usize,
         mut on_scores: impl FnMut(usize, &[f32]),
     ) -> Result<Option<Vec<Vec<u32>>>> {
+        let Some(mut q) = self.take_in(x, index_pos)? else {
+            return Ok(None);
+        };
+        let m = self.meta;
+        let row = m.heads * m.head_dim;
+        let mut out = Vec::with_capacity(q.len() / row);
+        for (i, rows) in q.chunks_exact_mut(row).enumerate() {
+            for head in rows.chunks_exact_mut(m.head_dim) {
+                rms_norm_row(head, &self.q_gamma, self.eps);
+                self.rope.apply(head, index_pos + i);
+            }
+            on_scores(i, &self.cache.block_scores(rows, index_pos + i, &m));
+            out.push(self.cache.select(rows, index_pos + i, &m));
+        }
+        Ok(Some(out))
+    }
+
+    /// The rows' keys into the cache; the rows' query heads, unnormalised, when the context
+    /// they reach no longer fits the budget.
+    fn take_in(&mut self, x: &Tensor, index_pos: usize) -> Result<Option<Vec<f32>>> {
         let (_, seq, _) = x.dims3()?;
         // The projections are dense float weights: they read the activation in F32.
         let x = &x.to_dtype(DType::F32)?;
@@ -279,18 +318,7 @@ impl SparseAttention {
         if self.dense_for(index_pos + seq) {
             return Ok(None);
         }
-        let mut q = host(self.q_proj.forward(x)?)?;
-        let row = m.heads * m.head_dim;
-        let mut out = Vec::with_capacity(seq);
-        for (i, rows) in q.chunks_exact_mut(row).enumerate() {
-            for head in rows.chunks_exact_mut(m.head_dim) {
-                rms_norm_row(head, &self.q_gamma, self.eps);
-                self.rope.apply(head, index_pos + i);
-            }
-            on_scores(i, &self.cache.block_scores(rows, index_pos + i, &m));
-            out.push(self.cache.select(rows, index_pos + i, &m));
-        }
-        Ok(Some(out))
+        Ok(Some(host(self.q_proj.forward(x)?)?))
     }
 }
 
@@ -370,5 +398,52 @@ mod tests {
         assert_eq!(IndexerMeta::from_gguf(&content(2050, &[0, 4]), "a"), None);
         assert_eq!(IndexerMeta::from_gguf(&content(2048, &[0, 0]), "a"), None);
         assert_eq!(IndexerMeta::from_gguf(&content(2048, &[0, 1]), "a"), None);
+    }
+
+    /// The rows selected across the cores are the rows selected one at a time.
+    #[test]
+    fn selecting_the_rows_across_cores_matches_selecting_them_in_turn() {
+        use crate::tensor::quantized::{GgmlDType, QTensor};
+        use crate::tensor::Device;
+        let (hidden, heads, head_dim, seq) = (16usize, 2usize, 8usize, 96usize);
+        let dev = Device::Cpu;
+        let weights = |rows: usize, seed: usize| {
+            let v: Vec<f32> = (0..rows * hidden)
+                .map(|i| (((i * 37 + seed * 11) % 101) as f32 - 50.0) * 0.02)
+                .collect();
+            let t = Tensor::from_vec(v, (rows, hidden), &dev).unwrap();
+            QMatMul::from_qtensor(QTensor::quantize_onto(&t, GgmlDType::F32, &dev).unwrap())
+                .unwrap()
+        };
+        let make = || {
+            SparseAttention::new(
+                IndexerMeta {
+                    heads,
+                    head_dim,
+                    top_k: 16,
+                    block: 4,
+                },
+                weights(heads * head_dim, 1),
+                weights(head_dim, 2),
+                vec![1.0; head_dim],
+                vec![1.0; head_dim],
+                1e-6,
+                head_dim,
+                10000.0,
+            )
+        };
+        let xs: Vec<f32> = (0..seq * hidden)
+            .map(|i| (((i * 53 + 7) % 89) as f32 - 44.0) * 0.03)
+            .collect();
+        let x = Tensor::from_vec(xs, (1, seq, hidden), &dev).unwrap();
+        let (mut across, mut in_turn) = (make(), make());
+        let wide = across.observe(&x, 0).unwrap().unwrap();
+        let serial = in_turn.observe_scored(&x, 0, |_, _| {}).unwrap().unwrap();
+        assert_eq!(wide.len(), seq);
+        assert_eq!(wide, serial);
+        assert!(
+            wide.last().unwrap().len() < seq,
+            "the context must be past the budget for the test to select anything"
+        );
     }
 }
