@@ -80,6 +80,12 @@ pub(super) fn staged<R>(
     r
 }
 
+/// The bytes the live scores of one block of rows of selected attention may take: the scores of
+/// every head, the scaled copy, the masked one and the probabilities, at most this at a time.
+const SCORE_BUDGET_BYTES: usize = 128 << 20;
+/// How many copies of a block's scores are live at once in selected attention.
+const SCORE_COPIES: usize = 3;
+
 impl GenericTransformerLayer {
     /// The wide block of this layer, `None` on a model with a plain residual.
     pub(super) fn is_wide(&self) -> bool {
@@ -368,8 +374,12 @@ impl GenericTransformerLayer {
         let q = q.to_dtype(DType::F32)?.contiguous()?;
         let k_t = k_all.transpose(2, 3)?;
         // The scores of a block of rows at a time: all of them at once is `heads x rows x kv_len`
-        // floats, several times over, which a long chunk over a long cache cannot hold.
-        let block = hyper::mixer_block_rows().max(1);
+        // floats, several times over, which a long chunk over a long cache cannot hold. The block
+        // is as many rows as keep the live copies of its scores within `SCORE_BUDGET_BYTES`, up to
+        // the mixers' own block: a long cache takes short blocks, each of which reads the cache
+        // once, which costs little against the product it feeds.
+        let live_scores = SCORE_COPIES * n_head * kv_len * std::mem::size_of::<f32>();
+        let block = (SCORE_BUDGET_BYTES / live_scores.max(1)).clamp(1, hyper::mixer_block_rows());
         let mut parts = Vec::with_capacity(seq.div_ceil(block));
         for (first, kept) in (0..seq).step_by(block).zip(selection.chunks(block)) {
             let rows = kept.len();
