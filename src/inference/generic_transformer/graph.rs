@@ -32,6 +32,76 @@ impl Drop for GraphStep {
     }
 }
 
+/// One operation of a decode step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepOp {
+    /// Layers of card segment `seg`, recorded in one graph; the head follows in it when `head`.
+    Run {
+        seg: usize,
+        layers: std::ops::Range<usize>,
+        head: bool,
+    },
+    /// The head alone, after a last layer that runs eagerly.
+    Head { seg: usize },
+    /// One layer that runs eagerly at every replay.
+    Layer { seg: usize, layer: usize },
+    /// The hidden state crossing from card segment `seg` to the next.
+    Hop { seg: usize },
+}
+
+impl StepOp {
+    /// Whether the op is recorded in a graph; the others run eagerly at every replay.
+    pub fn captured(&self) -> bool {
+        matches!(self, StepOp::Run { .. } | StepOp::Head { .. })
+    }
+}
+
+/// The ops of a decode step over the layer ranges `segs` of its cards, in order, given which
+/// layers are recorded: each run of recorded layers on a card is one op, each other layer an op
+/// of its own, a hop stands between two cards, and the head ends the step, in the last run when
+/// the last layer is recorded and as an op of its own otherwise. Empty for no segment.
+pub(crate) fn plan_step(
+    segs: &[std::ops::Range<usize>],
+    captured: impl Fn(usize) -> bool,
+) -> Vec<StepOp> {
+    let mut ops = Vec::new();
+    for (seg, range) in segs.iter().enumerate() {
+        if seg > 0 {
+            ops.push(StepOp::Hop { seg: seg - 1 });
+        }
+        let mut run: Option<usize> = None;
+        for layer in range.clone() {
+            if captured(layer) {
+                run.get_or_insert(layer);
+                continue;
+            }
+            if let Some(first) = run.take() {
+                ops.push(StepOp::Run {
+                    seg,
+                    layers: first..layer,
+                    head: false,
+                });
+            }
+            ops.push(StepOp::Layer { seg, layer });
+        }
+        if let Some(first) = run {
+            ops.push(StepOp::Run {
+                seg,
+                layers: first..range.end,
+                head: false,
+            });
+        }
+    }
+    match ops.last_mut() {
+        Some(StepOp::Run { head, .. }) => *head = true,
+        Some(_) => ops.push(StepOp::Head {
+            seg: segs.len() - 1,
+        }),
+        None => {}
+    }
+    ops
+}
+
 /// The hidden state of one decode step crossing from one card to the next without peer
 /// access: the source stream copies it into page-locked host memory, the destination stream
 /// copies it from there into a buffer on its card. Both copies are graph nodes; the order
@@ -141,6 +211,43 @@ impl GenericHeteroTransformer {
         self.config.effective_max_context()
     }
 
+    /// Why layer `li` runs eagerly between the captured parts of a decode step, `None` when
+    /// it is captured: its step reads or writes the host between two kernels.
+    pub(super) fn layer_eager_reason(&self, li: usize) -> Option<&'static str> {
+        let l = &self.layers[li];
+        // A recurrent mixer is recorded only where its step advances the state in place: a
+        // recorded step writes the addresses it read.
+        if !l.mixer.decodes_in_place(&l.cos.device()) {
+            return Some("recurrent mixer: its decode step does not advance its state in place");
+        }
+        // The recorded layer runs a mixture that reads the normed hidden alone; one beside a
+        // dense feed-forward, with its own norms, runs only in the eager forward.
+        if l.moe.as_ref().is_some_and(|m| !m.router_prenormed) {
+            return Some(
+                "a mixture beside a dense feed-forward: the captured layer has no such branch",
+            );
+        }
+        if l.sparse.is_some() {
+            return Some("indexed attention selects its tokens on the host");
+        }
+        if l.moe.as_ref().is_some_and(|m| m.decodes_through_host()) {
+            return Some("some routed experts are in host memory");
+        }
+        None
+    }
+
+    /// Whether layer `li` is recorded in the decode step's graphs.
+    pub(super) fn layer_captured(&self, li: usize) -> bool {
+        self.layer_eager_reason(li).is_none()
+    }
+
+    /// The layers the decode step records, in order.
+    fn captured_layers(&self) -> impl Iterator<Item = &GenericTransformerLayer> {
+        (0..self.layers.len())
+            .filter(|&i| self.layer_captured(i))
+            .map(|i| &self.layers[i])
+    }
+
     /// Whether this model's KV-cache state is safe under CUDA graph
     /// capture/replay. The graph_ops branch in `forward_attn` writes K/V
     /// into the F-dtype `kv_cache` (k_buffer / v_buffer) using
@@ -160,7 +267,7 @@ impl GenericHeteroTransformer {
     /// them and blamed an HD=512 F-dtype layer for every refusal - including models whose
     /// head_dim is 128, where it sent a root-cause after a layer that does not exist.
     pub fn kv_state_graph_block(&self) -> Option<&'static str> {
-        self.layers.iter().find_map(|l| {
+        self.captured_layers().find_map(|l| {
             // A layer that does not attend keeps no KV.
             if !l.attends() {
                 return None;
@@ -257,7 +364,7 @@ impl GenericHeteroTransformer {
     /// capture) + `compute_all_from_kv` (inside capture). Currently true
     /// for phi2 (moondream) and gemma4:latest HD=512 Global layers.
     pub fn needs_split_graph_path(&self) -> bool {
-        self.layers.iter().any(|l| {
+        self.captured_layers().any(|l| {
             // Any layer that has no Q4/Q8 KV cache AND is not a
             // dual-populate donor falls back to F-dtype scatter_set,
             // which is the unstable path. A sink layer attends over its
@@ -280,30 +387,10 @@ impl GenericHeteroTransformer {
     /// than logged here so the caller decides where it surfaces; `graph_capture_auto_on`
     /// keeps the boolean contract for existing callers.
     pub fn graph_capture_decision(&self) -> std::result::Result<(), &'static str> {
-        // A recurrent mixer is captured only where its step advances the state in place: a
-        // recorded step writes the addresses it read.
-        if self
-            .layers
-            .iter()
-            .any(|l| !l.mixer.decodes_in_place(&l.cos.device()))
-        {
-            return Err("recurrent mixer: its decode step does not advance its state in place");
-        }
         // A sink layer's step is not captured: its replay, which reads the length on the
         // device, costs more than the eager step, whose attention is GPU-bound.
-        if self.layers.iter().any(|l| l.attn_sinks.is_some()) {
+        if self.captured_layers().any(|l| l.attn_sinks.is_some()) {
             return Err("attention sinks: the replayed step costs more than the eager one");
-        }
-        // The captured layer runs a mixture that reads the normed hidden alone; one beside a
-        // dense feed-forward, with its own norms, runs only in the eager forward.
-        if self
-            .layers
-            .iter()
-            .any(|l| l.moe.as_ref().is_some_and(|m| !m.router_prenormed))
-        {
-            return Err(
-                "a mixture beside a dense feed-forward: the captured layer has no such branch",
-            );
         }
         if let Some(why) = self.kv_state_graph_block() {
             return Err(why);
@@ -409,13 +496,22 @@ impl GenericHeteroTransformer {
         if has_cpu_layer {
             return Err("some layers are on the CPU");
         }
-        // A layer whose routed experts sit in host memory stops the stream for them.
-        if self
-            .layers
-            .iter()
-            .any(|l| l.moe.as_ref().is_some_and(|m| m.experts_on_host()))
-        {
-            return Err("some routed experts are in host memory");
+        // A layer that reads or writes the host between two kernels runs eagerly between the
+        // captured parts of the step, with the layer's own inputs. A model whose layers take
+        // inputs the step does not carry (shared caches, per-layer embeddings) is captured
+        // whole or not at all.
+        let eager: Vec<usize> = (0..self.layers.len())
+            .filter(|&i| !self.layer_captured(i))
+            .collect();
+        if let Some(&first) = eager.first() {
+            if eager.len() == self.layers.len()
+                || self.config.shared_kv_layers > 0
+                || self.ple_dim > 0
+            {
+                return Err(self
+                    .layer_eager_reason(first)
+                    .expect("an eager layer has its reason"));
+            }
         }
         // The captured decode computes the logits on the card of the last layer. An output
         // projection left elsewhere, on another card or on the host because that card had no
@@ -434,13 +530,6 @@ impl GenericHeteroTransformer {
             {
                 return Err("the output projection is not on the card of the last layer");
             }
-        }
-        // The n-gram features and the indexer's selection read the host between tokens.
-        if self.ngram.is_some() {
-            return Err("n-gram features are not captured");
-        }
-        if self.layers.iter().any(|l| l.sparse.is_some()) {
-            return Err("indexed attention is not captured");
         }
         // phi2 (moondream): option-E split path (commits 3c78c9a +
         // 787986a + the engine wiring) moves scatter_set OUTSIDE the
@@ -541,6 +630,9 @@ impl GenericHeteroTransformer {
             let mut leaders: HashMap<(usize, usize), usize> = HashMap::new();
             (0..n_layers)
                 .map(|i| {
+                    if !self.layer_captured(i) {
+                        return i;
+                    }
                     let key = (device_id(i), self.layers[i].kv_cache.max_seq_len_padded());
                     *leaders.entry(key).or_insert(i)
                 })
@@ -550,6 +642,9 @@ impl GenericHeteroTransformer {
             let mut leaders: HashMap<(usize, usize, usize), usize> = HashMap::new();
             (0..n_layers)
                 .map(|i| {
+                    if !self.layer_captured(i) {
+                        return i;
+                    }
                     let l = &self.layers[i];
                     let key = (device_id(i), l.n_kv_head, l.head_dim);
                     *leaders.entry(key).or_insert(i)
@@ -562,6 +657,10 @@ impl GenericHeteroTransformer {
                 let mine = &self.layers[i];
                 let mut leader = i;
                 for &j in leaders.iter() {
+                    // An eager layer shares its buffers with no captured one.
+                    if self.layer_captured(i) != self.layer_captured(j) {
+                        continue;
+                    }
                     let other = &self.layers[j];
                     if mine.cos.shares_storage(&other.cos) && mine.sin.shares_storage(&other.sin) {
                         leader = j;
@@ -615,6 +714,7 @@ impl GenericHeteroTransformer {
             l.graph_x_norm_ffn_buffer = None;
             l.graph_x_norm_attn_buffer = None;
             l.graph_ple_input_buffer = None;
+            l.graph_ngram_rows = None;
             l.graph_attn_mask_added_buffer = None;
             l.graph_attn_softmax_buffer = None;
             l.graph_ffn_gate_out = None;
@@ -627,6 +727,7 @@ impl GenericHeteroTransformer {
         }
         self.graph_logits_buffer = None;
         self.graph_hidden_buffer = None;
+        self.graph_work_buffer = None;
         // ROOT CAUSE FIX: drop model-level captured-region tensor handles
         // so cuMemFree can reclaim their memory now that graph is torn down.
         self.graph_alive_tensors_model.clear();
@@ -646,8 +747,11 @@ impl GenericHeteroTransformer {
     /// which clears it on teardown.
     #[cfg(feature = "cuda")]
     pub fn mark_graph_captured(&mut self) {
-        for l in &mut self.layers {
-            if let Some(c) = l.quant_kv.as_mut() {
+        let captured: Vec<bool> = (0..self.layers.len())
+            .map(|i| self.layer_captured(i))
+            .collect();
+        for (l, captured) in self.layers.iter_mut().zip(captured) {
+            if let (true, Some(c)) = (captured, l.quant_kv.as_mut()) {
                 c.mark_graph_captured();
             }
         }
@@ -680,8 +784,12 @@ impl GenericHeteroTransformer {
         // stride. Once `pos + 1` outgrows it, error out so the engine
         // invalidates the graph - the request then continues on the
         // eager path (or re-captures at the wider state).
+        self.graph_pos = pos;
         #[cfg(feature = "cuda")]
         for (i, l) in self.layers.iter().enumerate() {
+            if !self.layer_captured(i) {
+                continue;
+            }
             let limit = l.quant_kv.as_ref().and_then(|c| c.graph_seq_limit());
             if let Some(limit) = limit {
                 if pos + 1 > limit {
@@ -702,6 +810,15 @@ impl GenericHeteroTransformer {
         // kernels' scratch pointers -> ILLEGAL_ADDRESS on replay.
         #[cfg(feature = "cuda")]
         self.ensure_graph_hops()?;
+        // A recorded n-gram layer reads and writes its convolution's rows where they lie.
+        if let Some(layer) = self.ngram.as_ref().map(|n| n.meta.layer) {
+            if self.layer_captured(layer) {
+                let dev = self.layers[layer].cos.device();
+                if let Some(ple) = self.layers[layer].ngram.as_mut() {
+                    ple.ensure_state(&dev)?;
+                }
+            }
+        }
         if !self.workspace_pre_grown {
             self.workspace_pre_grown = true;
             #[cfg(feature = "cuda")]
@@ -778,7 +895,7 @@ impl GenericHeteroTransformer {
         // and an ~8 KB graph_kv_pos H2D per token. All-or-nothing so a
         // mixed placement (one layer's Q8 alloc failed -> F-dtype) never
         // sees a skipped group leader.
-        let skip_fdtype_state = self.layers.iter().all(|l| {
+        let skip_fdtype_state = self.captured_layers().all(|l| {
             !l.attends() || ((l.has_q8_cache() || l.has_q4_cache()) && !l.populate_dual_kv)
         });
 
@@ -788,6 +905,10 @@ impl GenericHeteroTransformer {
             std::collections::HashMap::new();
         // Second pass: update each leader, then assign Arc-clones to followers.
         for i in 0..n_layers {
+            // An eager layer reads none of the step's buffers.
+            if !self.layer_captured(i) {
+                continue;
+            }
             // A layer's buffers live on the card it runs on.
             let dev = self.layers[i].cos.device().clone();
             if self.layers[i].attn_sinks.is_some() {
@@ -1150,6 +1271,9 @@ impl GenericHeteroTransformer {
         // slice_sets by the leader are visible to all followers and the
         // captured graph reads from one shared device pointer per group.
         for i in 0..n_layers {
+            if !self.layer_captured(i) {
+                continue;
+            }
             if !skip_fdtype_state && mask_group[i] != i {
                 let leader_mask = self.layers[mask_group[i]].padded_mask.clone();
                 self.layers[i].padded_mask = leader_mask;
@@ -1204,7 +1328,39 @@ impl GenericHeteroTransformer {
             .or_else(|| self.cuda_devices.values().next().cloned())
             .ok_or_else(|| crate::tensor::Error::msg("embed_for_graph needs CUDA"))?;
         let hidden_gpu = hidden.to_device(&target_dev)?;
-        let _ = self.ensure_hidden_buffer(&hidden_gpu)?;
+        let input = self.ensure_hidden_buffer(&hidden_gpu)?;
+        if self.graph_work_buffer.is_none() {
+            self.graph_work_buffer = Some(Tensor::zeros_on(
+                input.dims(),
+                input.dtype(),
+                &input.device(),
+            )?);
+        }
+        self.place_ngram_rows(input_ids)?;
+        Ok(())
+    }
+
+    /// The n-gram rows of `input_ids`, the step's token, in the buffer of the layer that adds
+    /// them when that layer is recorded: its replay reads them from there.
+    fn place_ngram_rows(&mut self, input_ids: &Tensor) -> Result<()> {
+        let Some(layer) = self.ngram.as_ref().map(|n| n.meta.layer) else {
+            return Ok(());
+        };
+        self.gather_ngram_rows(input_ids, self.graph_pos)?;
+        if !self.layer_captured(layer) {
+            return Ok(());
+        }
+        let rows = self
+            .ngram
+            .as_ref()
+            .and_then(|n| n.pending.clone())
+            .ok_or_else(|| crate::tensor::Error::msg("the n-gram rows were not gathered"))?;
+        let held = &mut self.layers[layer];
+        let rows = rows.to_device(&held.cos.device())?;
+        match held.graph_ngram_rows.as_ref() {
+            Some(buffer) => buffer.slice_set(&rows, 0, 0)?,
+            None => held.graph_ngram_rows = Some(rows.force_contiguous()?),
+        }
         Ok(())
     }
 
@@ -1315,25 +1471,181 @@ impl GenericHeteroTransformer {
 
     /// Run layers + output projection from graph_hidden_buffer. The buffer
     /// must have been populated by embed_for_graph before calling this.
-    /// This is the body that gets captured into a CUDA graph.
+    /// Every op of the step runs in order, eagerly: what the capture records, one graph per
+    /// captured op, is this same sequence.
     pub fn forward_from_hidden(&mut self) -> Result<Tensor> {
-        let n = self.graph_segments().len().max(1);
-        for seg in 0..n {
-            let out = self.forward_graph_segment(seg)?;
-            if seg + 1 == n {
-                return Ok(out);
-            }
-            // Eagerly, the next card's stream waits on this card's hop, as a replay does.
-            #[cfg(feature = "cuda")]
-            {
-                let streams = self.graph_segment_streams();
-                if let (Some(from), Some(to)) = (streams.get(seg), streams.get(seg + 1)) {
-                    let ev = crate::tensor::cuda_ext::record_event(from)?;
-                    crate::tensor::cuda_ext::wait_event(to, &ev)?;
-                }
+        self.rewind_eager_layers();
+        let n = self.step_plan().len();
+        let mut logits = None;
+        for op in 0..n {
+            if let Some(out) = self.run_step_op(op)? {
+                logits = Some(out);
             }
         }
-        crate::tensor::bail!("forward_from_hidden: no segment ran")
+        logits.ok_or_else(|| crate::tensor::Error::msg("forward_from_hidden: no op ran"))
+    }
+
+    /// The decode step as a sequence of ops: the captured layers of each card in runs, the
+    /// layers that read the host between kernels one by one, the hop where the step crosses
+    /// from one card to the next, and the head. Empty when a layer is on the host.
+    pub fn step_plan(&self) -> Vec<StepOp> {
+        let segs: Vec<std::ops::Range<usize>> =
+            self.graph_segments().into_iter().map(|(r, _)| r).collect();
+        plan_step(&segs, |layer| self.layer_captured(layer))
+    }
+
+    /// For each op of the step: whether it is recorded in a graph, and the stream of the card
+    /// it runs on.
+    #[cfg(feature = "cuda")]
+    pub fn step_streams(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
+        let streams = self.graph_segment_streams();
+        self.step_plan()
+            .iter()
+            .filter_map(|op| {
+                let seg = match op {
+                    StepOp::Hop { seg } => seg + 1,
+                    StepOp::Run { seg, .. } | StepOp::Head { seg } | StepOp::Layer { seg, .. } => {
+                        *seg
+                    }
+                };
+                streams.get(seg).map(|s| (op.captured(), s.clone()))
+            })
+            .collect()
+    }
+
+    /// The hidden state a card segment's ops read and write in place: the first card's working
+    /// copy, the hop's landing buffer for the others.
+    fn step_buffer(&self, seg: usize) -> Result<Tensor> {
+        if seg == 0 {
+            return self.graph_work_buffer.clone().ok_or_else(|| {
+                crate::tensor::Error::msg("forward_from_hidden: call embed_for_graph first")
+            });
+        }
+        #[cfg(feature = "cuda")]
+        {
+            self.graph_hops
+                .get(seg - 1)
+                .map(|hop| hop.dst.clone())
+                .ok_or_else(|| crate::tensor::Error::msg("graph hop not prepared"))
+        }
+        #[cfg(not(feature = "cuda"))]
+        crate::tensor::bail!("a card hop needs CUDA")
+    }
+
+    /// Op `op` of the step. A captured op is what a recording runs, and runs as it is when
+    /// the step is eager; an eager op runs at every replay. The head's op returns the logits.
+    pub fn run_step_op(&mut self, op: usize) -> Result<Option<Tensor>> {
+        let Some(this) = self.step_plan().into_iter().nth(op) else {
+            crate::tensor::bail!("run_step_op: no op {op}");
+        };
+        match this {
+            StepOp::Run { seg, layers, head } => {
+                let _step = GraphStep::enter();
+                let buffer = self.step_buffer(seg)?;
+                let mut hidden = self.step_input(op, seg)?;
+                // See the timer in the eager decode loop: this measures issuing the layer,
+                // which is what tells a dispatching layer from one running on the host.
+                for li in layers {
+                    let _timer = crate::inference::place::layer_perf::LayerTimer::start(li);
+                    hidden = self.layers[li].forward_graph(&hidden)?;
+                }
+                if head {
+                    return self.graph_head(hidden).map(Some);
+                }
+                Self::store_step_hidden(&buffer, hidden)?;
+                Ok(None)
+            }
+            StepOp::Head { seg } => {
+                let _step = GraphStep::enter();
+                let hidden = self.step_input(op, seg)?;
+                self.graph_head(hidden).map(Some)
+            }
+            StepOp::Layer { seg, layer } => {
+                let buffer = self.step_buffer(seg)?;
+                let input = self.step_input(op, seg)?;
+                // The gathered n-gram rows go to the one layer that adds them.
+                let ngram = self.layers[layer]
+                    .ngram
+                    .is_some()
+                    .then(|| self.ngram.as_ref().and_then(|n| n.pending.clone()))
+                    .flatten();
+                let pos = self.graph_pos;
+                let _timer = crate::inference::place::layer_perf::LayerTimer::start(layer);
+                let hidden = self.layers[layer].forward(
+                    &input,
+                    None,
+                    pos,
+                    ngram.as_ref(),
+                    None,
+                    None,
+                    #[cfg(feature = "cuda")]
+                    None,
+                )?;
+                Self::store_step_hidden(&buffer, hidden)?;
+                Ok(None)
+            }
+            StepOp::Hop { seg } => {
+                #[cfg(feature = "cuda")]
+                {
+                    let from = self.step_buffer(seg)?;
+                    let hop = self
+                        .graph_hops
+                        .get(seg)
+                        .ok_or_else(|| crate::tensor::Error::msg("graph hop not prepared"))?;
+                    hop.send(&from)?;
+                    // The next card's stream waits for the copy to the host, then fills its
+                    // own buffer from it.
+                    let streams = self.graph_segment_streams();
+                    if let (Some(a), Some(b)) = (streams.get(seg), streams.get(seg + 1)) {
+                        let ev = crate::tensor::cuda_ext::record_event(a)?;
+                        crate::tensor::cuda_ext::wait_event(b, &ev)?;
+                    }
+                    hop.receive()?;
+                    Ok(None)
+                }
+                #[cfg(not(feature = "cuda"))]
+                crate::tensor::bail!("a card hop needs CUDA")
+            }
+        }
+    }
+
+    /// What op `op` of the step reads: the embedding for the first, else the segment's buffer.
+    fn step_input(&self, op: usize, seg: usize) -> Result<Tensor> {
+        match (op, &self.graph_hidden_buffer) {
+            (0, Some(embedding)) => Ok(embedding.clone()),
+            _ => self.step_buffer(seg),
+        }
+    }
+
+    /// `hidden` into the segment's buffer, which the next op reads.
+    fn store_step_hidden(buffer: &Tensor, hidden: Tensor) -> Result<()> {
+        let hidden = if hidden.dtype() == buffer.dtype() {
+            hidden
+        } else {
+            hidden.to_dtype(buffer.dtype())?
+        };
+        buffer.slice_set(&hidden.contiguous()?, 0, 0)
+    }
+
+    /// Cut the caches of the layers the step runs eagerly back to the step's position: an
+    /// eager step that follows a replayed one runs the layers whose host length the first
+    /// advanced, which a captured layer's device position does not need.
+    fn rewind_eager_layers(&mut self) {
+        let pos = self.graph_pos;
+        if pos == 0 {
+            return;
+        }
+        for li in 0..self.layers.len() {
+            if self.layer_captured(li) {
+                continue;
+            }
+            let layer = &mut self.layers[li];
+            layer.kv_cache.trim_to(pos);
+            #[cfg(feature = "cuda")]
+            if let Some(c) = layer.quant_kv.as_mut() {
+                c.trim_to(pos);
+            }
+        }
     }
 
     /// The graph step's card segments in layer order: each run of layers on one card and
@@ -1371,57 +1683,6 @@ impl GenericHeteroTransformer {
         segs.iter()
             .filter_map(|(_, d)| crate::tensor::cuda_ext::stream_of(d).ok())
             .collect()
-    }
-
-    /// Segment `seg` of the graph's decode step, on its card's stream. It starts from the
-    /// hidden buffer (the first) or the hop from the previous card, and ends with the logits
-    /// (the last) or the hop to the next card, whose hidden state it returns.
-    pub fn forward_graph_segment(&mut self, seg: usize) -> Result<Tensor> {
-        let _step = GraphStep::enter();
-        let segs = self.graph_segments();
-        let n = segs.len().max(1);
-        let range = match segs.get(seg) {
-            Some((r, _)) => r.clone(),
-            None if seg == 0 => 0..self.layers.len(),
-            None => crate::tensor::bail!("forward_graph_segment: no segment {seg}"),
-        };
-        let mut hidden = if seg == 0 {
-            self.graph_hidden_buffer
-                .as_ref()
-                .ok_or_else(|| {
-                    crate::tensor::Error::msg("forward_from_hidden: call embed_for_graph first")
-                })?
-                .clone()
-        } else {
-            #[cfg(feature = "cuda")]
-            {
-                self.graph_hops
-                    .get(seg - 1)
-                    .ok_or_else(|| crate::tensor::Error::msg("graph hop not prepared"))?
-                    .receive()?
-            }
-            #[cfg(not(feature = "cuda"))]
-            crate::tensor::bail!("a card hop needs CUDA")
-        };
-        // See the timer in the eager decode loop: this measures issuing the layer,
-        // which is what tells a dispatching layer from one running on the host.
-        for li in range {
-            let _timer = crate::inference::place::layer_perf::LayerTimer::start(li);
-            hidden = self.layers[li].forward_graph(&hidden)?;
-        }
-        if seg + 1 < n {
-            #[cfg(feature = "cuda")]
-            {
-                self.graph_hops
-                    .get(seg)
-                    .ok_or_else(|| crate::tensor::Error::msg("graph hop not prepared"))?
-                    .send(&hidden)?;
-                return Ok(hidden);
-            }
-            #[cfg(not(feature = "cuda"))]
-            crate::tensor::bail!("a card hop needs CUDA")
-        }
-        self.graph_head(hidden)
     }
 
     /// Allocates the hop buffers between consecutive cards, outside any capture.
@@ -2499,4 +2760,90 @@ fn restore_quantised_layer(
     }
     let _ = (l, s);
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(from: usize, to: usize) -> std::ops::Range<usize> {
+        from..to
+    }
+
+    fn run(seg: usize, layers: std::ops::Range<usize>, head: bool) -> StepOp {
+        StepOp::Run { seg, layers, head }
+    }
+
+    #[test]
+    fn a_step_of_recorded_layers_is_one_run_ending_in_the_head() {
+        let ops = plan_step(&[span(0, 6)], |_| true);
+        assert_eq!(ops, vec![run(0, 0..6, true)]);
+    }
+
+    #[test]
+    fn a_layer_that_is_not_recorded_splits_the_run() {
+        let ops = plan_step(&[span(0, 8)], |l| l != 3 && l != 4);
+        assert_eq!(
+            ops,
+            vec![
+                run(0, 0..3, false),
+                StepOp::Layer { seg: 0, layer: 3 },
+                StepOp::Layer { seg: 0, layer: 4 },
+                run(0, 5..8, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_last_layer_that_is_not_recorded_leaves_the_head_alone() {
+        let ops = plan_step(&[span(0, 4)], |l| l != 3);
+        assert_eq!(
+            ops,
+            vec![
+                run(0, 0..3, false),
+                StepOp::Layer { seg: 0, layer: 3 },
+                StepOp::Head { seg: 0 },
+            ]
+        );
+        assert!(ops.last().is_some_and(StepOp::captured));
+        assert!(!ops[1].captured());
+    }
+
+    #[test]
+    fn a_first_layer_that_is_not_recorded_starts_the_step() {
+        let ops = plan_step(&[span(0, 3)], |l| l != 0);
+        assert_eq!(
+            ops,
+            vec![StepOp::Layer { seg: 0, layer: 0 }, run(0, 1..3, true)]
+        );
+    }
+
+    #[test]
+    fn a_hop_stands_between_two_cards() {
+        let ops = plan_step(&[span(0, 3), span(3, 6)], |l| l != 2 && l != 3);
+        assert_eq!(
+            ops,
+            vec![
+                run(0, 0..2, false),
+                StepOp::Layer { seg: 0, layer: 2 },
+                StepOp::Hop { seg: 0 },
+                StepOp::Layer { seg: 1, layer: 3 },
+                run(1, 4..6, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_step_of_no_recorded_layer_is_every_layer_then_the_head() {
+        let ops = plan_step(&[span(0, 2)], |_| false);
+        assert_eq!(
+            ops,
+            vec![
+                StepOp::Layer { seg: 0, layer: 0 },
+                StepOp::Layer { seg: 0, layer: 1 },
+                StepOp::Head { seg: 0 },
+            ]
+        );
+        assert!(plan_step(&[], |_| true).is_empty());
+    }
 }

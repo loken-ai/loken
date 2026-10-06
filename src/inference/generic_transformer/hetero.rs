@@ -1561,6 +1561,37 @@ impl GenericHeteroTransformer {
         self.forward_layers_and_output(hidden, ple_inputs, index_pos, seq_len, all_positions)
     }
 
+    /// The n-gram table's rows for `input_ids`, which start at `index_pos`, gathered for the
+    /// layer that takes them: the history of the sequence advances past the tokens. Nothing for
+    /// a model with no n-gram layer.
+    pub(super) fn gather_ngram_rows(&mut self, input_ids: &Tensor, index_pos: usize) -> Result<()> {
+        let Some(ng) = self.ngram.as_mut() else {
+            return Ok(());
+        };
+        let ple = self.layers[ng.meta.layer]
+            .ngram
+            .as_mut()
+            .expect("the layer the n-gram file names carries its block");
+        if index_pos == 0 {
+            ple.reset();
+        }
+        if ple.history.seen != index_pos {
+            crate::tensor::bail!(
+                "the n-gram history holds {} tokens but the forward starts at {index_pos}",
+                ple.history.seen
+            );
+        }
+        let ids = input_ids
+            .flatten_all()?
+            .to_dtype(crate::tensor::DType::U32)?
+            .to_vec1::<u32>()?;
+        let rows = ple.history.rows(&ng.meta, &ids);
+        let data = ng.table.gather(&rows)?;
+        let width = ng.meta.heads() * ng.meta.row_dim;
+        ng.pending = Some(Tensor::from_vec(data, (1, ids.len(), width), &Device::Cpu)?);
+        Ok(())
+    }
+
     /// The first stage of a forward: the embeddings of `input_ids` as the residual stream
     /// the layers start from, and the per-layer inputs of a family that has them.
     pub(super) fn embed_stage(
@@ -1605,29 +1636,7 @@ impl GenericHeteroTransformer {
         // rows of the tokens are gathered for the layer that takes them.
         let hidden = match self.config.hyper {
             Some(h) => {
-                if let Some(ng) = self.ngram.as_mut() {
-                    let ple = self.layers[ng.meta.layer]
-                        .ngram
-                        .as_mut()
-                        .expect("the layer the n-gram file names carries its block");
-                    if index_pos == 0 {
-                        ple.reset();
-                    }
-                    if ple.history.seen != index_pos {
-                        crate::tensor::bail!(
-                            "the n-gram history holds {} tokens but the forward starts at {index_pos}",
-                            ple.history.seen
-                        );
-                    }
-                    let ids = input_ids
-                        .flatten_all()?
-                        .to_dtype(crate::tensor::DType::U32)?
-                        .to_vec1::<u32>()?;
-                    let rows = ple.history.rows(&ng.meta, &ids);
-                    let data = ng.table.gather(&rows)?;
-                    let width = ng.meta.heads() * ng.meta.row_dim;
-                    ng.pending = Some(Tensor::from_vec(data, (1, ids.len(), width), &Device::Cpu)?);
-                }
+                self.gather_ngram_rows(input_ids, index_pos)?;
                 super::wide::widen_embedding(&hidden, h.streams)?
             }
             None => hidden,

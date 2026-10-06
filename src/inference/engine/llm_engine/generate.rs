@@ -1070,7 +1070,7 @@ impl LlmEngine {
                         } else {
                             Vec::new()
                         };
-                        match graph.launch() {
+                        match graph.launch(&mut state.model) {
                             Ok(()) => {
                                 // Sync AFTER launch so subsequent gpu_sample
                                 // (which reads logits_ref) waits for the
@@ -1264,7 +1264,7 @@ impl LlmEngine {
                                     // eager forward at the same (token, pos).
                                     let recurrent_cp =
                                         state.model.recurrent_checkpoint().unwrap_or_default();
-                                    match g.launch() {
+                                    match g.launch(&mut state.model) {
                                         Ok(()) => {
                                             let _ = stream.synchronize();
                                             let rep_argmax: Option<u32> = logits

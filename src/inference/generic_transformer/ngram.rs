@@ -327,14 +327,35 @@ impl PleBlock {
         })
     }
 
-    /// Make `state` the carried state; the copy stays reusable.
+    /// Make `state` the carried state; the copy stays reusable. The rows are written where the
+    /// carried ones lie when they have the shape, so a recorded step keeps reading them.
     pub fn restore(&mut self, state: &PleState) -> Result<()> {
-        self.state = state
-            .conv
-            .as_ref()
-            .map(|t| t.affine(1.0, 0.0))
-            .transpose()?;
+        self.state = match (self.state.take(), state.conv.as_ref()) {
+            (Some(held), Some(saved)) if held.dims() == saved.dims() => {
+                held.slice_set(saved, 0, 0)?;
+                Some(held)
+            }
+            (_, Some(saved)) => Some(saved.force_contiguous()?),
+            (_, None) => None,
+        };
         self.history = state.history.clone();
+        Ok(())
+    }
+
+    /// The convolution's rows as they stand.
+    #[cfg(test)]
+    pub(super) fn carried(&self) -> Option<&Tensor> {
+        self.state.as_ref()
+    }
+
+    /// The convolution's rows exist on `device`, empty if the sequence has not made them: a
+    /// recorded step reads and writes them where they lie.
+    pub fn ensure_state(&mut self, device: &Device) -> Result<()> {
+        if self.state.is_none() {
+            let wide = self.streams * self.dim;
+            let hist = (self.taps - 1) * self.dilation;
+            self.state = Some(Tensor::zeros_on((hist, wide), DType::F32, device)?);
+        }
         Ok(())
     }
 
@@ -360,8 +381,8 @@ impl PleBlock {
         let gated = gate.broadcast_mul(&value)?.reshape((b, seq, wide))?;
         let normed = grouped_rms(&gated, &self.norm_conv, s, d, self.eps)?.reshape((seq, wide))?;
         let hist = (self.taps - 1) * self.dilation;
-        let past = match (index_pos, self.state.take()) {
-            (p, Some(st)) if p > 0 => st,
+        let past = match (index_pos, self.state.as_ref()) {
+            (p, Some(st)) if p > 0 => st.clone(),
             _ => Tensor::zeros_on((hist, wide), DType::F32, &r.device())?,
         };
         let padded = Tensor::cat(&[&past, &normed], 0)?;
@@ -375,7 +396,16 @@ impl PleBlock {
                 None => term,
             });
         }
-        self.state = Some(padded.narrow(0, seq, hist)?.contiguous()?);
+        // The new rows go where the old ones lie: a recorded step keeps reading that address.
+        let fresh = padded.narrow(0, seq, hist)?.force_contiguous()?;
+        match self.state.as_ref() {
+            Some(held)
+                if held.dims() == fresh.dims() && held.device().same_device(&fresh.device()) =>
+            {
+                held.slice_set(&fresh, 0, 0)?
+            }
+            _ => self.state = Some(fresh),
+        }
         let conv = crate::tensor::ops::silu(&acc.expect("a convolution has taps"))?
             .reshape((b, seq, wide))?;
         gated + conv

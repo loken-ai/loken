@@ -543,19 +543,23 @@ pub(crate) trait ModelBackend: Send {
         crate::tensor::bail!("forward_from_hidden only for GenericHetero / GenericHeteroVision")
     }
 
-    /// The stream of every card a captured decode step runs on, in layer order: one graph
-    /// is recorded per stream.
+    /// The ops of a captured decode step in order, each with whether it is recorded in a graph
+    /// and the stream of the card it runs on: one graph is recorded per captured op, and the
+    /// others run eagerly at every replay.
     #[cfg(feature = "cuda")]
-    fn graph_segment_streams(&self) -> Vec<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
-        self.model_cuda_stream().into_iter().collect()
+    fn graph_step_ops(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
+        self.model_cuda_stream()
+            .into_iter()
+            .map(|s| (true, s))
+            .collect()
     }
 
-    /// Segment `seg` of the graph's decode step on its card's stream: the logits for the
-    /// last segment, the hidden state handed to the next card otherwise.
-    fn forward_graph_segment(&mut self, seg: usize) -> crate::tensor::Result<Tensor> {
-        match seg {
-            0 => self.forward_from_hidden(),
-            _ => crate::tensor::bail!("this backend's decode step has one segment"),
+    /// Op `op` of the decode step on its card's stream: the logits for the head's op, nothing
+    /// for the others.
+    fn run_graph_op(&mut self, op: usize) -> crate::tensor::Result<Option<Tensor>> {
+        match op {
+            0 => self.forward_from_hidden().map(Some),
+            _ => crate::tensor::bail!("this backend's decode step has one op"),
         }
     }
 
@@ -1622,12 +1626,12 @@ impl ModelBackend for GenericBackend {
     }
 
     #[cfg(feature = "cuda")]
-    fn graph_segment_streams(&self) -> Vec<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
-        self.0.graph_segment_streams()
+    fn graph_step_ops(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
+        self.0.step_streams()
     }
 
-    fn forward_graph_segment(&mut self, seg: usize) -> crate::tensor::Result<Tensor> {
-        self.0.forward_graph_segment(seg)
+    fn run_graph_op(&mut self, op: usize) -> crate::tensor::Result<Option<Tensor>> {
+        self.0.run_step_op(op)
     }
 
     fn needs_split_graph_path(&self) -> bool {
@@ -1824,12 +1828,12 @@ impl ModelBackend for GenericVisionBackend {
     }
 
     #[cfg(feature = "cuda")]
-    fn graph_segment_streams(&self) -> Vec<std::sync::Arc<crate::tensor::cuda_ext::CudaStream>> {
-        self.text.graph_segment_streams()
+    fn graph_step_ops(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
+        self.text.step_streams()
     }
 
-    fn forward_graph_segment(&mut self, seg: usize) -> crate::tensor::Result<Tensor> {
-        self.text.forward_graph_segment(seg)
+    fn run_graph_op(&mut self, op: usize) -> crate::tensor::Result<Option<Tensor>> {
+        self.text.run_step_op(op)
     }
 
     fn needs_split_graph_path(&self) -> bool {

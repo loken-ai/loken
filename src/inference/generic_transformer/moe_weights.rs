@@ -393,6 +393,12 @@ impl MoeWeights {
         !self.down_exps.device().runs_as_card()
     }
 
+    /// Whether a decoded token waits on the host for this layer's experts: they sit in host
+    /// memory and the cache on the card does not hold them all.
+    pub fn decodes_through_host(&self) -> bool {
+        self.experts_on_host() && !self.tier.as_ref().is_some_and(|t| t.is_resident())
+    }
+
     /// The expert stacks this layer's prefill reads on the host, if its prefill goes there.
     ///
     /// The host expert loop reads its weights through a repacked layout it builds on first

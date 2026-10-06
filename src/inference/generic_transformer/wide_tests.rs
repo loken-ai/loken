@@ -241,6 +241,56 @@ fn the_ngram_features_match_the_reference() {
     assert!(max_diff(&got, &f32s(&v, "a.layer1_ple")) < 1e-4);
 }
 
+/// The convolution's rows are rewritten where they lie, by a forward and by a restore: a step
+/// recorded against them reads what a later token leaves.
+#[test]
+fn the_ngram_rows_stay_where_they_lie_through_a_forward_and_a_restore() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let mut model = toy();
+    let tokens = ids(&v, "a.ids");
+    let embs: Vec<Tensor> = tokens
+        .iter()
+        .take(4)
+        .map(|t| {
+            let ng = model.ngram.as_ref().unwrap();
+            let rows = vec![t % 7; ng.meta.heads()];
+            let width = ng.meta.heads() * ng.meta.row_dim;
+            Tensor::from_vec(ng.table.gather(&rows).unwrap(), (1, 1, width), &Device::Cpu).unwrap()
+        })
+        .collect();
+    let residual = |i: usize| {
+        let row: Vec<f32> = (0..256)
+            .map(|c| ((c + 7 * i) % 13) as f32 / 13.0 - 0.5)
+            .collect();
+        Tensor::from_vec(row, (1, 1, 256), &Device::Cpu).unwrap()
+    };
+    let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let ple = model.layers[1].ngram.as_mut().unwrap();
+    for (i, e) in embs.iter().take(3).enumerate() {
+        ple.forward(&residual(i), e, i).unwrap();
+    }
+    let held = ple.carried().unwrap().clone();
+    let saved = ple.snapshot().unwrap();
+    let before = flat(&held);
+    ple.forward(&residual(3), &embs[3], 3).unwrap();
+    assert!(
+        held.shares_storage(ple.carried().unwrap()),
+        "a forward moved the rows"
+    );
+    assert_ne!(
+        flat(ple.carried().unwrap()),
+        before,
+        "the token left no trace"
+    );
+    ple.restore(&saved).unwrap();
+    assert!(
+        held.shares_storage(ple.carried().unwrap()),
+        "a restore moved the rows"
+    );
+    assert_eq!(flat(ple.carried().unwrap()), before);
+}
+
 #[test]
 fn the_indexer_keeps_the_tokens_the_reference_keeps() {
     let bytes = vectors();

@@ -294,6 +294,9 @@ pub struct GenericTransformerLayer {
     /// data through capture). Shape `[1, 1, ple_dim=256]` F32 for
     /// gemma4. None for non-gemma4 / non-PLE layers.
     pub graph_ple_input_buffer: Option<Tensor>,
+    /// The rows of the n-gram table the step's token gathers, `[1, 1, heads * row_dim]` F32 on
+    /// the card, written before each replay: what the layer that adds them reads.
+    pub graph_ngram_rows: Option<Tensor>,
     /// Persistent buffer for `att.broadcast_add(mask)` output in the
     /// GQA fast path of padded_standard_attention (line 2471).
     /// Same shape as graph_attn_qk_buffer: [1, n_kv, n_rep, max_kv] F32.
@@ -451,6 +454,10 @@ pub struct GenericHeteroTransformer {
     ple_dim: usize, // per-layer PLE dimension (e.g. 256)
     /// Pre-allocated hidden state buffer for CUDA graph replay.
     graph_hidden_buffer: Option<Tensor>,
+    /// The first card's working copy of the hidden state: the step's ops read the embedding in
+    /// `graph_hidden_buffer` and hand the state on through this one, so a step run again starts
+    /// from the embedding.
+    graph_work_buffer: Option<Tensor>,
     /// The graph step's hidden-state hops between consecutive cards, one per boundary.
     #[cfg(feature = "cuda")]
     graph_hops: Vec<graph::GraphHop>,
@@ -474,6 +481,9 @@ pub struct GenericHeteroTransformer {
     ///  tracks whether fast_mmvq workspace has been
     /// pre-grown to max model size. Set on first update_graph_state call.
     workspace_pre_grown: bool,
+    /// The position of the token the decode step in flight carries: what an eagerly run layer
+    /// of a captured step reads where a captured one reads the position buffers.
+    graph_pos: usize,
     /// Resident sequences copied aside after a request (`snapshot_kv`), most recently
     /// used last by `tick`; empty unless the configuration asks for them.
     kv_snapshots: Vec<KvSnapshot>,

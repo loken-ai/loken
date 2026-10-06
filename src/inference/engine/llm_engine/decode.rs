@@ -177,11 +177,14 @@ pub(super) fn gpu_sample_returning_tensor(
     Ok((tok, Some(dev_tensor)))
 }
 
-/// Capture one decode-token forward into a CUDA graph (shared by the
+/// Capture one decode-token forward into CUDA graphs (shared by the
 /// non-streaming and streaming decode loops).
 ///
-/// Runs the full gptoss/lfm2 capture recipe: capture on the MODEL's stream,
-/// 0-node defense, node-type histogram, and resource pre-upload. Returns `Some((graph, logits_ref))` on success  -
+/// Runs the full gptoss/lfm2 capture recipe: capture on each card's stream, 0-node defense,
+/// node-type histogram, and resource pre-upload. The step is a sequence of ops: each captured
+/// one is recorded into a graph of its own, each eager one (a layer that reads or writes the
+/// host between kernels, the hop between cards) is kept as a step to run at every replay.
+/// Returns `Some((graphs, logits_ref))` on success -
 /// note a capture only RECORDS: the logits buffer has NOT been written
 /// for this token; the caller must `graph.launch()` once and run
 /// probation validation before sampling.
@@ -199,77 +202,170 @@ pub(super) fn capture_decode_graph(
 ) -> Option<(DecodeGraph, Tensor)> {
     // Drop the transients a previous request's capture left in the model.
     model.clear_graph_transients();
-    // One graph per card the step runs on, each recorded on that card's stream; the split
-    // path records on the model's stream alone.
-    let streams = match needs_split {
-        true => vec![stream.clone()],
-        false => model.graph_segment_streams(),
+    // The split path records on the model's stream alone.
+    let ops = match needs_split {
+        true => vec![(true, stream.clone())],
+        false => model.graph_step_ops(),
     };
-    if streams.is_empty() {
+    if ops.is_empty() {
         warn!("Graph capture found no card stream at pos={pos}; eager decode");
         return None;
     }
-    let mut parts = Vec::with_capacity(streams.len());
+    let mut steps = Vec::with_capacity(ops.len());
     let mut logits = None;
-    let last = streams.len() - 1;
-    for (seg, seg_stream) in streams.iter().enumerate() {
-        let (g, out) = capture_segment(model, seg_stream, seg, seg == last, pos, needs_split)?;
-        parts.push((g, seg_stream.clone()));
-        logits = out;
+    let mut nodes = NodeCounts::default();
+    for (op, (captured, op_stream)) in ops.iter().enumerate() {
+        if !captured {
+            steps.push(DecodeStep::Eager(op));
+            continue;
+        }
+        let (g, out) = capture_op(model, op_stream, op, pos, needs_split)?;
+        nodes.add(&g);
+        steps.push(DecodeStep::Graph(g, op_stream.clone()));
+        if out.is_some() {
+            logits = out;
+        }
     }
-    Some((DecodeGraph { parts }, logits?))
+    // A captured op with no node recorded nothing: the replay would be a no-op and the logits
+    // would stay as they were.
+    if nodes.total == 0 {
+        warn!("CUDA graph captured 0 nodes at pos={pos} - discarding and falling back to eager decode");
+        return None;
+    }
+    let graphs = steps
+        .iter()
+        .filter(|s| matches!(s, DecodeStep::Graph(..)))
+        .count();
+    info!(
+        "CUDA graph captured at pos={pos}: {graphs} graphs, {} eager ops, {} nodes",
+        steps.len() - graphs,
+        nodes.total
+    );
+    info!(
+        "node histogram: kernel={} memcpy={} memset={} empty={} MEM_ALLOC={} MEM_FREE={} other={}",
+        nodes.kernel, nodes.memcpy, nodes.memset, nodes.empty, nodes.alloc, nodes.free, nodes.other
+    );
+    // The eager pass before the capture left its transients cached in the pool; the graphs'
+    // own allocations need that memory when they are uploaded and run.
+    let mut trimmed = Vec::new();
+    for step in &steps {
+        if let DecodeStep::Graph(_, s) = step {
+            let card = s.context().ordinal();
+            if !trimmed.contains(&card) {
+                trimmed.push(card);
+                let _ = s.synchronize();
+                crate::tensor::cuda::trim_pool(card);
+            }
+        }
+    }
+    // Pre-upload graph resources to device memory before first launch - eliminates the lazy
+    // upload window on cuGraphLaunch.
+    for step in &steps {
+        if let DecodeStep::Graph(g, _) = step {
+            if let Err(e) = g.upload() {
+                warn!("Graph upload failed (will fall back to lazy upload): {e}");
+            }
+        }
+    }
+    Some((DecodeGraph { steps }, logits?))
 }
 
-/// The decode step's graphs, one per card in layer order. A launch runs them in order,
-/// each card's stream waiting on the previous one's work; the hidden state hops between
-/// cards through pinned host memory inside the graphs.
+/// One part of a decode step.
 #[cfg(feature = "cuda")]
-pub(super) struct DecodeGraph {
-    parts: Vec<(
+enum DecodeStep {
+    /// A recorded graph and the stream of the card it runs on.
+    Graph(
         crate::tensor::cuda_ext::CapturedGraph,
         std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
-    )>,
+    ),
+    /// An op the model runs eagerly at every replay.
+    Eager(usize),
+}
+
+/// The decode step: its graphs and the eager ops between them, in order.
+#[cfg(feature = "cuda")]
+pub(super) struct DecodeGraph {
+    steps: Vec<DecodeStep>,
 }
 
 #[cfg(feature = "cuda")]
 impl DecodeGraph {
-    /// Launches every part. With more than one card the host waits for the last card, which
-    /// holds the logits: the caller synchronises only the first card's stream.
-    pub(super) fn launch(&self) -> crate::tensor::Result<()> {
+    /// Runs every part in order. The host waits for the last card's stream, which holds the
+    /// logits.
+    pub(super) fn launch(&self, model: &mut BoxedModelBackend) -> crate::tensor::Result<()> {
         let err = |e| crate::tensor::Error::msg(format!("graph launch: {e:?}"));
-        for (i, (g, s)) in self.parts.iter().enumerate() {
-            g.launch().map_err(err)?;
-            if let Some((_, next)) = self.parts.get(i + 1) {
-                let ev = crate::tensor::cuda_ext::record_event(s)?;
-                crate::tensor::cuda_ext::wait_event(next, &ev)?;
+        let mut last = None;
+        for step in &self.steps {
+            match step {
+                DecodeStep::Graph(g, s) => {
+                    g.launch().map_err(err)?;
+                    last = Some(s);
+                }
+                DecodeStep::Eager(op) => {
+                    model.run_graph_op(*op)?;
+                }
             }
         }
-        if self.parts.len() > 1 {
-            if let Some((_, last)) = self.parts.last() {
-                last.synchronize().map_err(err)?;
-            }
+        if let Some(s) = last {
+            s.synchronize().map_err(err)?;
         }
         Ok(())
     }
 
     /// The single-card graph, which the per-token re-capture path updates in place.
     pub(super) fn single_mut(&mut self) -> Option<&mut crate::tensor::cuda_ext::CapturedGraph> {
-        match self.parts.as_mut_slice() {
-            [(g, _)] => Some(g),
+        match self.steps.as_mut_slice() {
+            [DecodeStep::Graph(g, _)] => Some(g),
             _ => None,
         }
     }
 }
 
-/// Records segment `seg` of the decode step on `stream`. Only the last segment's output is
-/// kept: an earlier one reaches the next card through pinned host memory inside the graphs, and
-/// is freed inside its capture so the graph allocates nothing it keeps.
+/// Node counts of the graphs of a step, by type.
 #[cfg(feature = "cuda")]
-fn capture_segment(
+#[derive(Default)]
+struct NodeCounts {
+    total: usize,
+    kernel: usize,
+    memcpy: usize,
+    memset: usize,
+    empty: usize,
+    alloc: usize,
+    free: usize,
+    other: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl NodeCounts {
+    fn add(&mut self, g: &crate::tensor::cuda_ext::CapturedGraph) {
+        use crate::tensor::cuda_ext::CUgraphNodeType;
+        let count = g.num_nodes().unwrap_or(0);
+        self.total += count;
+        let Ok(nodes) = g.nodes(count) else { return };
+        let Ok(types) = g.node_types(&nodes) else {
+            return;
+        };
+        for t in &types {
+            match *t {
+                CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL => self.kernel += 1,
+                CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMCPY => self.memcpy += 1,
+                CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMSET => self.memset += 1,
+                CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY => self.empty += 1,
+                CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC => self.alloc += 1,
+                CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE => self.free += 1,
+                _ => self.other += 1,
+            }
+        }
+    }
+}
+
+/// Records op `op` of the decode step on `stream`. Only the head's output is kept: the
+/// hidden state of the other ops stays in the step's buffers.
+#[cfg(feature = "cuda")]
+fn capture_op(
     model: &mut BoxedModelBackend,
     stream: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
-    seg: usize,
-    last: bool,
+    op: usize,
     pos: usize,
     needs_split: bool,
 ) -> Option<(crate::tensor::cuda_ext::CapturedGraph, Option<Tensor>)> {
@@ -282,18 +378,17 @@ fn capture_segment(
             // Compute-only half is captured. Reads Q from
             // graph_q_buffer + KV from kv_cache (both refreshed by
             // prepare_all_kv, run by the caller before this).
-            model.compute_all_from_kv_captured()?
+            Some(model.compute_all_from_kv_captured()?)
         } else {
-            model.forward_graph_segment(seg)?
+            model.run_graph_op(op)?
         };
-        let kept = last.then_some(logits);
         let g = crate::tensor::cuda_ext::end_capture(stream)?;
-        Ok((g, kept))
+        Ok((g, logits))
     })();
     // A capture records kernels without running them, while the host side of each append
     // still counted its token. The cache holds `pos` tokens, so the eager forward that
-    // follows (probation, or the fallback when the capture is dropped) writes slot `pos`
-    // and attends over the same positions the replay will.
+    // follows (probation, or the fallback when the capture is dropped) writes slot `pos` and
+    // attends over the same positions the replay will.
     model.sync_kv_len_for_graph(pos);
     match cap {
         Err(e) => {
@@ -302,63 +397,13 @@ fn capture_segment(
             // touches the stream.
             let _ = crate::tensor::cuda_ext::end_capture(stream);
             let _ = stream.synchronize();
-            warn!("Graph capture failed at pos={pos} (segment {seg}): {e}; eager decode for rest of request");
+            warn!("Graph capture failed at pos={pos} (op {op}): {e}; eager decode for rest of request");
             None
         }
         Ok((None, _)) => {
             warn!("Graph capture returned no graph at pos={pos}; eager decode");
             None
         }
-        Ok((Some(g), logits)) => {
-            let nc = g.num_nodes().unwrap_or(0);
-            // DEFENSE IN DEPTH: a 0-node graph means the captured
-            // forward recorded NO work (e.g. every layer bailed on an
-            // inconsistent KV state). Storing it would replay a no-op
-            // every token -> frozen logits -> constant-token output.
-            if nc == 0 {
-                warn!("CUDA graph captured 0 nodes at pos={pos} - discarding and falling back to eager decode");
-                drop(g);
-                return None;
-            }
-            info!(
-                "CUDA graph captured at pos={} segment {} ({} nodes)",
-                pos, seg, nc
-            );
-            // Node-type histogram of the capture.
-            if let Ok(nodes) = g.nodes(nc) {
-                if let Ok(types) = g.node_types(&nodes) {
-                    use crate::tensor::cuda_ext::CUgraphNodeType;
-                    let mut kernel = 0;
-                    let mut memcpy = 0;
-                    let mut memset = 0;
-                    let mut empty = 0;
-                    let mut alloc = 0;
-                    let mut free = 0;
-                    let mut other = 0;
-                    for t in &types {
-                        match *t {
-                            CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL => kernel += 1,
-                            CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMCPY => memcpy += 1,
-                            CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMSET => memset += 1,
-                            CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY => empty += 1,
-                            CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC => alloc += 1,
-                            CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_FREE => free += 1,
-                            _ => other += 1,
-                        }
-                    }
-                    info!("node histogram: kernel={kernel} memcpy={memcpy} memset={memset} empty={empty} MEM_ALLOC={alloc} MEM_FREE={free} other={other}");
-                }
-            }
-            // The eager pass before the capture left its transients cached in the pool;
-            // the graph's own allocations need that memory when it is uploaded and run.
-            let _ = stream.synchronize();
-            crate::tensor::cuda::trim_pool(stream.context().ordinal());
-            // Pre-upload graph resources to device memory before first
-            // launch - eliminates the lazy upload window on cuGraphLaunch.
-            if let Err(e) = g.upload() {
-                warn!("Graph upload failed (will fall back to lazy upload): {e}");
-            }
-            Some((g, logits))
-        }
+        Ok((Some(g), logits)) => Some((g, logits)),
     }
 }

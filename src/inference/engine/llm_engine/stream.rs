@@ -1641,7 +1641,7 @@ impl LlmEngine {
                             } else {
                                 Vec::new()
                             };
-                            match graph.launch() {
+                            match graph.launch(&mut state.model) {
                                 Ok(()) => {
                                     let _ = stream.synchronize();
                                     if graph_validations < GRAPH_VALIDATIONS {
@@ -1749,7 +1749,7 @@ impl LlmEngine {
                                     // then probation #1 vs an eager forward.
                                     let recurrent_cp =
                                         state.model.recurrent_checkpoint().unwrap_or_default();
-                                    match g.launch() {
+                                    match g.launch(&mut state.model) {
                                         Ok(()) => {
                                             let _ = stream.synchronize();
                                             let rep_argmax: Option<u32> = logits

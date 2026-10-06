@@ -147,6 +147,18 @@ impl GenericTransformerLayer {
     #[cfg(feature = "cuda")]
     pub(super) fn forward_wide_graph(&mut self, x: &Tensor) -> Result<Tensor> {
         let dev = x.device();
+        // The n-gram features of the step's token, gathered into their buffer before the replay.
+        let joined;
+        let x = match (self.ngram.as_mut(), self.graph_ngram_rows.as_ref()) {
+            (Some(ple), Some(rows)) => {
+                // A decoded token follows others: the convolution reads the rows they left.
+                let add = ple.forward(x, rows, 1)?;
+                joined = (x + add)?;
+                &joined
+            }
+            (Some(_), None) => crate::tensor::bail!("the n-gram rows of the step are not in place"),
+            _ => x,
+        };
         let (s, d) = {
             let h = self.hyper.as_ref().expect("a wide layer has its mixers");
             (h.attn.streams(), h.attn.dim())
