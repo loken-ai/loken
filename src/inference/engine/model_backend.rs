@@ -100,6 +100,10 @@ fn adaptive_prefill_chunk_uncached(shape: PrefillShape) -> usize {
     if per_token == 0 {
         return PREFILL_CHUNK_TOKENS;
     }
+    // What the pools still hold from the last request is free for this one: it is handed back
+    // before the cards are measured, so a request is sized from what the cards have and not
+    // from what the one before left cached.
+    crate::inference::place::ladder::release_pools();
     // Derived from what the card actually has free, not from a constant: a near-full card is
     // not handed the chunk of an empty one and left to discover the difference by running out
     // of memory. A share of the free VRAM, because the activation peak is not the only thing a
