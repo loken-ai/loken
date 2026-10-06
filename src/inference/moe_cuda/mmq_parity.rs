@@ -453,16 +453,25 @@ fn the_expert_batched_matmul_serves_the_codebook_formats() {
         GgmlDType::Iq3S,
         GgmlDType::Iq2S,
     ] {
-        for &(tokens, topk, e) in &[(45usize, 6usize, 16usize), (300, 8, 32)] {
+        // From a handful of tokens, where an expert has a row or two, to hundreds, at the
+        // launcher's own tile width and at every width it can be forced to.
+        for &(tokens, topk, e) in &[
+            (1usize, 2usize, 4usize),
+            (5, 4, 16),
+            (45, 6, 16),
+            (300, 8, 32),
+        ] {
             let b = Block::build_from_blocks(&dev, &mut rng, dtype, tokens, topk, e, 512, 256);
             let want = b.float();
             let decode = gap(&want, &b.decode());
-            let mmq = gap(&want, &b.mmq(false, 0));
-            if mmq > 1.25 * decode + 0.005 {
-                failures.push(format!(
-                    "{dtype:?} tokens={tokens} topk={topk} E={e}: {mmq} from the float answer, \
-                     the decode kernels {decode}"
-                ));
+            for tile in [0, 8, 16, 32, 64, 128] {
+                let mmq = gap(&want, &b.mmq(false, tile));
+                if !(mmq <= 1.25 * decode + 0.005) {
+                    failures.push(format!(
+                        "{dtype:?} tokens={tokens} topk={topk} E={e} tile={tile}: {mmq} from the \
+                         float answer, the decode kernels {decode}"
+                    ));
+                }
             }
         }
     }
