@@ -377,8 +377,9 @@ impl HeteroPlan {
                     let fastest = turn + 1 == order.len();
                     let start = next;
                     let mut used = 0u64;
-                    // Room beside the layers for the copies of a wide batch, as the plan's own reserve.
-                    let room = budget.saturating_sub(gpu_runtime_reserve_bytes);
+                    // A sixteenth of the card stays free beside the layers: their sizes are estimates,
+                    // and a card short of room for every expert of its layers falls back to a cache.
+                    let room = budget.saturating_sub(budget / 16);
                     while next < total_layers
                         && if fastest {
                             used.saturating_add(dense(next)) <= budget

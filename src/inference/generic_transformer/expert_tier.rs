@@ -12,6 +12,9 @@
 //! copied from the host into the card's transit room and run there with the others, or computed
 //! on the host. The two proceed together and the split leaves neither waiting on the other.
 //!
+//! A card with room for every expert of its layers holds them all: the layer is resident, and the
+//! tier is the stacks the kernels read, with no host in the token.
+//!
 //! The counts decay: when `n_experts` tokens have routed through a layer, each count halves, so
 //! the cache follows the routing of the text in hand rather than the routing since the load.
 
@@ -52,6 +55,8 @@ pub struct LayerTier {
     leader: std::sync::atomic::AtomicBool,
     /// What a wide batch of rows reads instead: the whole layer, on the card for the one launch.
     stage: Option<Stage>,
+    /// The cache holds every expert, expert `e` in slot `e`: nothing is ever missing.
+    resident: bool,
     /// The stream this layer's copies into the cache run on.
     copy: Arc<cudarc::driver::CudaStream>,
     /// A copy into the cache is queued or running.
@@ -290,12 +295,19 @@ impl super::GenericHeteroTransformer {
                     widest[i] = widest[i].max(stacks[i].native_qtensor().data().len());
                 }
             }
-            let bytes = expert_bytes(
-                self.layers[first]
-                    .moe
-                    .as_ref()
-                    .expect("a tiered layer has experts"),
-            );
+            // One slot in every one of the card's layers: the layers' formats differ, so what a
+            // slot costs is the sum of what it costs in each.
+            let bytes: usize = tiered
+                .iter()
+                .map(|&l| {
+                    expert_bytes(
+                        self.layers[l]
+                            .moe
+                            .as_ref()
+                            .expect("a tiered layer has experts"),
+                    )
+                })
+                .sum();
             let budget = plan
                 .segments
                 .iter()
@@ -304,6 +316,30 @@ impl super::GenericHeteroTransformer {
                 .max()
                 .unwrap_or(0);
             let before = free_before.get(&ordinal).copied().unwrap_or(0);
+            // Room for every expert of every layer beside the plan's own reserve: the layers
+            // are resident, and need neither a copy room nor a share of the card for one.
+            let widest_mixture = tiered
+                .iter()
+                .filter_map(|&l| self.layers[l].moe.as_ref().map(|m| m.n_experts))
+                .max()
+                .unwrap_or(0);
+            if expert_cache::slots_per_layer(budget, before, expert_cache::free_now(dev), 1, bytes)
+                >= widest_mixture
+            {
+                for &l in &tiered {
+                    let moe = self.layers[l]
+                        .moe
+                        .as_mut()
+                        .expect("a tiered layer has experts");
+                    moe.tier = Some(Arc::new(LayerTier::all_on_card(moe, dev)?));
+                }
+                tracing::info!(
+                    "expert tier on card {ordinal}: {} layers resident, every expert on the card, {:.2} GB",
+                    tiered.len(),
+                    (widest_mixture * bytes) as f64 / 1e9
+                );
+                continue;
+            }
             // What the wide batches the experts now run on the card for keep live: the chunk the
             // prefill is to run at. The plan already leaves a reserve free for the work of a
             // forward, so the cache gives up only what the chunk needs beyond it.
@@ -317,7 +353,7 @@ impl super::GenericHeteroTransformer {
                 budget.saturating_sub(held),
                 before,
                 expert_cache::free_now(dev),
-                tiered.len(),
+                1,
                 bytes,
             );
             if slots == 0 {
@@ -351,7 +387,7 @@ impl super::GenericHeteroTransformer {
                 stager.bandwidth * 1e-3,
                 slots.min(self.layers[first].moe.as_ref().map_or(0, |m| m.n_experts)),
                 self.layers[first].moe.as_ref().map_or(0, |m| m.n_experts),
-                (tiered.len() * slots * bytes) as f64 / 1e9
+                (slots * bytes) as f64 / 1e9
             );
         }
         Ok(())
@@ -497,6 +533,7 @@ impl LayerTier {
             promotions: AtomicU64::new(0),
             leader: std::sync::atomic::AtomicBool::new(false),
             stage: None,
+            resident: false,
             copy: dev
                 .as_cuda_device()?
                 .0
@@ -510,6 +547,23 @@ impl LayerTier {
             host_us: AtomicU64::new(0),
             uploaded: AtomicU64::new(0),
         })
+    }
+
+    /// A layer whose every expert is on the card `dev`: no copy room, no host.
+    pub fn all_on_card(moe: &MoeWeights, dev: &Device) -> Result<Self> {
+        let mut tier = Self::new(moe, dev, moe.n_experts)?;
+        tier.resident = true;
+        Ok(tier)
+    }
+
+    /// Whether every expert is on the card.
+    pub fn is_resident(&self) -> bool {
+        self.resident
+    }
+
+    /// The cached stacks, in expert order when the tier is resident.
+    pub(super) fn card_stacks(&self) -> &[QTensor; 3] {
+        &self.card
     }
 
     /// Wait for the copy in flight, if any, to land.
@@ -842,8 +896,67 @@ impl LayerTier {
         };
         drop(guard);
 
-        self.promote(&miss_ids, &in_use);
+        // An expert that came to the card for this token stays in a slot where it is hotter than
+        // what the slot holds, without a second copy over the link; the host's misses go to the
+        // worker.
+        self.keep_in_transit(transit_ids, &mut in_use, &stream)?;
+        self.promote(host_ids, &in_use);
         Ok(out)
+    }
+
+    /// Move the experts of `experts` that are in the transit room, hottest first, into the slots
+    /// that hold something colder and are not read by this token, as copies on the card behind the
+    /// token's own work: a kernel that reads a slot later is queued after its copy. `in_use` marks
+    /// the slots this token reads, and is extended with the slots filled here.
+    fn keep_in_transit(
+        &self,
+        experts: &[u32],
+        in_use: &mut [bool],
+        stream: &Arc<cudarc::driver::CudaStream>,
+    ) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        let Some(stage) = self.stage.as_ref() else {
+            return Ok(());
+        };
+        let buffer = &stage.stager.buffers[stage.buffer];
+        let mut order: Vec<u32> = experts.to_vec();
+        let mut moves = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            order.sort_by(|&a, &b| st.heat[b as usize].total_cmp(&st.heat[a as usize]));
+            for &e in &order {
+                let victim = (0..st.owner.len())
+                    .filter(|&slot| !in_use[slot] && st.owner[slot] != -2)
+                    .min_by(|&a, &b| slot_heat(&st, a).total_cmp(&slot_heat(&st, b)));
+                let Some(victim) = victim else {
+                    break;
+                };
+                if st.heat[e as usize] <= slot_heat(&st, victim) {
+                    break;
+                }
+                let old = st.owner[victim];
+                if old >= 0 {
+                    st.slot_of[old as usize] = -1;
+                }
+                st.owner[victim] = e as i32;
+                st.slot_of[e as usize] = victim as i32;
+                in_use[victim] = true;
+                moves.push((e as usize, victim));
+            }
+        }
+        for (expert, slot) in moves.iter().copied() {
+            for i in 0..3 {
+                let eb = self.expert_bytes[i];
+                let arena = &buffer.arenas[i];
+                let from = arena.device_ptr(arena.stream()).0 + (expert * eb) as u64;
+                let to = self.card[i].device_ptr()? as u64 + (slot * eb) as u64;
+                driver("transit to slot", unsafe {
+                    cudarc::driver::sys::cuMemcpyDtoDAsync_v2(to, from, eb, stream.cu_stream())
+                })?;
+            }
+            self.promotions.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// How many of `missing` experts are copied into the card's transit room for the token, the
@@ -1554,6 +1667,50 @@ mod tests {
             hits as f64 / routed as f64 > hit_rate_first.unwrap(),
             "the cache did not learn: {hits} of {routed}"
         );
+    }
+
+    /// A layer with every expert on the card runs as a loaded one does: a token and wide batches
+    /// give what the host's loop gives.
+    #[test]
+    fn a_resident_layer_matches_the_host() {
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
+        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
+        let mut resident = layer(&card, experts, used, hidden, ffn);
+        resident.tier = Some(Arc::new(LayerTier::all_on_card(&resident, &card).unwrap()));
+        assert!(resident.tier.as_ref().unwrap().is_resident());
+        for (rows, prefill) in [(1usize, false), (24, true), (700, true)] {
+            let x = values(rows * hidden, 31, 1.0);
+            let on_host = Tensor::from_vec(x.clone(), (1, rows, hidden), &Device::Cpu).unwrap();
+            let on_card = Tensor::from_vec(x, (1, rows, hidden), &card).unwrap();
+            let want = reference
+                .forward(&on_host, &on_host, hidden, 1e-5, prefill)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let got = resident
+                .forward(&on_card, &on_card, hidden, 1e-5, prefill)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 2e-2 * peak,
+                "rows {rows}: max diff {worst} of {peak}"
+            );
+        }
     }
 
     /// A wide batch through the tier gives what the host's loop gives, with the layer's experts

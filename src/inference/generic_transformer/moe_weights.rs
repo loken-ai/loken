@@ -699,6 +699,22 @@ impl MoeWeights {
         }
         let expert_rows = if self.up_relu2 {
             self.forward_up_relu2(&xs, &topk_ids, &topk_weights_scaled, num_tokens)?
+        } else if let Some(tier) = self
+            .tier
+            .as_ref()
+            .filter(|t| t.is_resident() && xs.device().runs_as_card())
+        {
+            // Every expert is on the card: the layer runs as one that was loaded there.
+            self.forward_cuda(
+                &xs,
+                &topk_ids,
+                &topk_weights_scaled,
+                num_tokens,
+                is_prefill,
+                t_route,
+                add_after,
+                Some(tier.card_stacks()),
+            )?
         } else if let (Some(tier), true, 1) =
             (self.tier.as_ref(), xs.device().runs_as_card(), num_tokens)
         {

@@ -25,6 +25,14 @@ impl LayerTier {
         false
     }
 
+    pub fn is_resident(&self) -> bool {
+        false
+    }
+
+    pub(super) fn card_stacks(&self) -> &[crate::tensor::quantized::QTensor; 3] {
+        unreachable!("an expert cache lives on a card")
+    }
+
     pub fn prefetch(&self) -> Result<()> {
         Ok(())
     }
