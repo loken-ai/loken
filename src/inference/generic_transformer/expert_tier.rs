@@ -1098,6 +1098,27 @@ impl LayerTier {
         Ok(&stage.stacks)
     }
 
+    /// Forget the fills and holds of the layers' passes through the buffers. A pass cut short
+    /// leaves a fill queued for a layer that never ran, and layers share two buffers, so the
+    /// next pass would read another layer's experts as its own. The copies already issued
+    /// are waited for first, so nothing writes a buffer after it is handed on.
+    pub(super) fn reset_stage(&self) -> Result<()> {
+        let Some(stage) = self.stage.as_ref() else {
+            return Ok(());
+        };
+        stage
+            .stager
+            .copy
+            .synchronize()
+            .map_err(|e| crate::tensor::Error::msg(format!("copy stream: {e:?}")))?;
+        *stage.ready.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *stage.stager.buffers[stage.buffer]
+            .free
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        Ok(())
+    }
+
     /// The layer's kernels are queued: the buffer is free once they have run.
     pub(super) fn release_stacks(&self) -> Result<()> {
         let stage = self.stage.as_ref().expect("a staged layer");

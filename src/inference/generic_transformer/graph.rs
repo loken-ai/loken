@@ -1978,6 +1978,14 @@ impl GenericHeteroTransformer {
             // nothing is kept.
             if new_len == 0 {
                 layer.state_reset();
+                // Nothing is mid-pass once the cache starts again: the expert transit of a
+                // pass that was cut short is forgotten.
+                #[cfg(feature = "cuda")]
+                if let Some(tier) = layer.moe.as_ref().and_then(|m| m.tier.as_ref()) {
+                    if let Err(e) = tier.reset_stage() {
+                        tracing::warn!("expert transit not reset: {e}");
+                    }
+                }
             }
             layer.kv_cache.trim_to(new_len);
             // Keep the Q8 mirror in sync with the F-dtype cache; otherwise

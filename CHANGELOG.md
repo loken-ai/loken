@@ -15,6 +15,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Build: a CUDA kernel recompiles only when its own sources change.
 - Build: CUDA runs on the published cudarc crate, graph capture handled by loken.
 
+
 ## [0.2.1] - 2026-10-05
 
 ### Fixed
