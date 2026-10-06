@@ -578,6 +578,15 @@ fn parse_generic_tool_calls_block(raw: &str) -> ToolParseResult {
 pub fn parse_tool_calls(format: ToolFormat, raw: &str) -> ToolParseResult {
     let parsed = parse_tool_calls_native(format, raw);
     if !parsed.calls.is_empty() {
+        // A call that reached the client with nothing in its arguments is a parse the text may
+        // not deserve: the text is kept at debug level for whoever has to tell which.
+        if parsed.calls.iter().any(|c| {
+            c.function
+                .as_ref()
+                .is_some_and(|f| f.arguments.as_deref().is_none_or(|a| a == "{}"))
+        }) {
+            tracing::debug!("a tool call with no arguments, read from: {raw:?}");
+        }
         return parsed;
     }
     // The generic wrapper a client's own tool prompt can induce, caught before it leaks as text.
@@ -924,6 +933,18 @@ fn parse_xml_call(fragment: &str) -> Option<ToolCall> {
 
     let start = fragment.find(FN_OPEN)? + FN_OPEN.len();
     let rest = &fragment[start..];
+    // A model that mixes the two syntaxes writes the JSON call where the name goes. The first
+    // `>` is then inside the object or past it, so the object is read as such.
+    if let Some(object) =
+        first_json_object(rest.trim_start()).filter(|_| rest.trim_start().starts_with('{'))
+    {
+        if let Some(call) = serde_json::from_str::<Value>(object)
+            .ok()
+            .and_then(|v| call_from_object(&v))
+        {
+            return Some(call);
+        }
+    }
     let name_end = rest.find('>')?;
     let name = rest[..name_end].trim();
     if name.is_empty() {
@@ -1432,6 +1453,21 @@ mod tests {
         assert_eq!(args["path"], "src/brew.rs");
         assert_eq!(args["start_line"], 2);
         assert_eq!(r.content, "I will read it.");
+    }
+
+    /// A model that writes the JSON call where the XML element puts the name still calls the
+    /// tool: the name and the arguments come out of the object.
+    #[test]
+    fn parse_qwen_xml_with_a_json_call_in_place_of_the_name() {
+        let raw = "<tool_call>\n<function={\"name\": \"bash\", \"parameters\": {\"cmd\": \"ls > out\"}}\n</function>\n</tool_call>";
+        let r = parse_tool_calls(ToolFormat::Hermes, raw);
+        assert_eq!(r.calls.len(), 1);
+        let f = r.calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "bash");
+        let args: serde_json::Value =
+            serde_json::from_str(f.arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["cmd"], "ls > out");
+        assert!(r.content.is_empty());
     }
 
     /// A value that is an object or a list is written back as JSON by the template, so it
