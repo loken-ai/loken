@@ -7,7 +7,8 @@
 
 use super::*;
 use crate::inference::moe_cuda::{
-    address_f32, indexer_append, indexer_select, IndexerShape, StepPos,
+    address_f32, indexer_append, indexer_rows_in, indexer_rows_out, indexer_select, IndexerShape,
+    StepPos,
 };
 use crate::tensor::Device;
 
@@ -15,7 +16,8 @@ use crate::tensor::Device;
 pub struct CardIndexer {
     dev: Device,
     shape: IndexerShape,
-    /// `[blocks, head_dim]` F32: the pooled key of every complete block.
+    /// `[groups, head_dim, 32]` F32: the pooled key of every complete block, 32 blocks to a group
+    /// laid out `[dim][lane]`.
     pooled: Tensor,
     /// `[block, head_dim]` F32: the raw rows of the block being filled.
     tail: Tensor,
@@ -168,9 +170,9 @@ impl SparseAttention {
                 half: self.rope.half(),
                 eps: self.eps,
             },
-            pooled: Tensor::zeros_on((blocks, hd), DType::F32, dev)?,
+            pooled: Tensor::zeros_on((blocks.div_ceil(32), hd, 32), DType::F32, dev)?,
             tail: Tensor::zeros_on((m.block, hd), DType::F32, dev)?,
-            scores: Tensor::zeros_on((blocks,), DType::F32, dev)?,
+            scores: Tensor::zeros_on((blocks.div_ceil(32) * 32,), DType::F32, dev)?,
             sel: Tensor::zeros_on((m.top_k + m.block,), DType::U32, dev)?,
             count: Tensor::zeros_on((1,), DType::U32, dev)?,
             rot: Tensor::zeros_on((4 * self.rope.half(),), DType::F32, dev)?,
@@ -192,15 +194,15 @@ impl SparseAttention {
             return Ok(());
         };
         let blocks = tokens / m.block + 2;
+        let groups = blocks.div_ceil(32);
         let have = card.pooled.dim(0)?;
-        if blocks <= have {
+        if groups <= have {
             return Ok(());
         }
-        let grown = Tensor::zeros_on((blocks, m.head_dim), DType::F32, &card.dev)?;
-        let kept = card.pooled.narrow(0, 0, have)?;
-        grown.slice_set(&kept, 0, 0)?;
+        let grown = Tensor::zeros_on((groups, m.head_dim, 32), DType::F32, &card.dev)?;
+        grown.slice_set(&card.pooled, 0, 0)?;
         card.pooled = grown;
-        card.scores = Tensor::zeros_on((blocks,), DType::F32, &card.dev)?;
+        card.scores = Tensor::zeros_on((groups * 32,), DType::F32, &card.dev)?;
         Ok(())
     }
 
@@ -226,7 +228,7 @@ impl SparseAttention {
                 let rows = self.cache.pooled_from(have, &m);
                 let rows = Tensor::from_slice(rows, (blocks - have, hd), &Device::Cpu)?
                     .to_device(&card.dev)?;
-                card.pooled.slice_set(&rows, 0, have)?;
+                indexer_rows_in(&rows, &card.pooled, have, blocks - have, hd)?;
             }
             let tail = self.cache.tail();
             if !tail.is_empty() {
@@ -363,7 +365,12 @@ impl CardIndexer {
         let have = cache.blocks(meta);
         let blocks = self.tokens / meta.block;
         let pooled = match blocks > have {
-            true => host(self.pooled.narrow(0, have, blocks - have)?)?,
+            true => host(indexer_rows_out(
+                &self.pooled,
+                have,
+                blocks - have,
+                meta.head_dim,
+            )?)?,
             false => Vec::new(),
         };
         let rows = self.tokens % meta.block;

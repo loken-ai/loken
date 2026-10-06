@@ -105,6 +105,8 @@ pub struct SpecKvCache {
     /// their full window (`w >= chunk`). None = unbounded (default; all non-SWA
     /// layers and non-gemma models -> append is bit-identical to before).
     window: Option<usize>,
+    /// The buffers were made whole by [`Self::preallocate`] and stay when the sequence restarts.
+    resident: bool,
     /// Stable device-side `i32` holding `current_seq_len - 1`. Used by
     /// fused_attn_decode_f32_hd512 (and similar dev_pos kernels) so the
     /// captured graph reads the live position from device memory each
@@ -126,6 +128,7 @@ impl Clone for SpecKvCache {
             max_seq_len: self.max_seq_len,
             dim: self.dim,
             window: self.window,
+            resident: self.resident,
             // seq_kv_dev is per-instance device state; clone resets it
             // since the new clone shouldn't share the same captured-graph
             // pointer dependency.
@@ -147,6 +150,7 @@ impl SpecKvCache {
             max_seq_len,
             dim: 2, // Default: 4D tensors, seq at axis 2
             window: None,
+            resident: false,
             #[cfg(feature = "cuda")]
             seq_kv_dev: None,
             #[cfg(feature = "cuda")]
@@ -163,10 +167,31 @@ impl SpecKvCache {
         self.max_seq_len = w + max_chunk;
     }
 
+    /// Make the buffers now, at their full size, `[1, n_kv, capacity, head_dim]` of `dtype` on
+    /// `device`, and keep them when the sequence restarts: a cache whose room the placement has
+    /// counted holds it from the load on, so the memory a prefill is planned against is the
+    /// memory it finds, and the cache never grows into a hole.
+    pub fn preallocate(
+        &mut self,
+        n_kv: usize,
+        head_dim: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<()> {
+        let shape = [1, n_kv, self.max_seq_len, head_dim];
+        self.k = Some(Tensor::zeros_on(&shape[..], dtype, device)?);
+        self.v = Some(Tensor::zeros_on(&shape[..], dtype, device)?);
+        self.dim = 2;
+        self.resident = true;
+        Ok(())
+    }
+
     /// Reset the KV cache (clears all entries).
     pub fn reset(&mut self) {
-        self.k = None;
-        self.v = None;
+        if !self.resident {
+            self.k = None;
+            self.v = None;
+        }
         self.current_seq_len = 0;
         // Don't drop seq_kv_dev - its device address must stay stable
         // for any captured graph that references it. The next update
@@ -627,6 +652,26 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(vals, (0..8).map(|x| x as f32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_preallocated_cache_keeps_its_buffers_when_the_sequence_restarts() {
+        let dev = Device::Cpu;
+        let mut c = SpecKvCache::new(16);
+        c.preallocate(2, 4, DType::F32, &dev).unwrap();
+        let held = c.k_buffer().unwrap();
+        assert_eq!(held.dims(), &[1, 2, 16, 4]);
+        let k = make_4d_pos(&dev, 0, 3);
+        c.append(&k, &k).unwrap();
+        assert_eq!(c.current_seq_len(), 3);
+        c.reset();
+        assert_eq!(c.current_seq_len(), 0);
+        assert!(held.shares_storage(&c.k_buffer().unwrap()));
+        // A cache made lazily gives its buffers back.
+        let mut lazy = SpecKvCache::new(16);
+        lazy.append(&k, &k).unwrap();
+        lazy.reset();
+        assert!(lazy.k_buffer().is_none());
     }
 
     #[test]

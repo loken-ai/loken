@@ -107,12 +107,15 @@ cuda_launchers! {
         eps: f32);
     loken_indexer_select(q: *const f32, qgamma: *const f32, rot: *const f32, pooled: *const f32,
         scores: *mut f32, sel: *mut u32, count: *mut u32, pos_dev: *const i32, pos_host: i32,
-        heads: i32, hd: i32, block: i32, budget: i32, half: i32, eps: f32, scale: f32);
+        heads: i32, hd: i32, block: i32, budget: i32, half: i32, eps: f32, scale: f32,
+        max_blocks: i32);
+    loken_indexer_rows_in(rows: *const f32, pooled: *mut f32, first: i32, n: i32, hd: i32);
+    loken_indexer_rows_out(pooled: *const f32, rows: *mut f32, first: i32, n: i32, hd: i32);
     loken_kv_append_pos(k_new: *const f32, v_new: *const f32, kbuf: *mut c_void,
         vbuf: *mut c_void, pos_dev: *const i32, pos_host: i32, n_kv: i32, cap: i32, hd: i32);
     loken_selected_attn(q: *const f32, kbuf: *const c_void, vbuf: *const c_void,
-        sel: *const u32, count: *const u32, out: *mut f32, n_head: i32, n_kv: i32, cap: i32,
-        hd: i32, ncap: i32, scale: f32);
+        sel: *const u32, count: *const u32, out: *mut f32, part_o: *mut f32, part_ml: *mut f32,
+        n_head: i32, n_kv: i32, cap: i32, hd: i32, ncap: i32, splits: i32, scale: f32);
     loken_hc_norm(r: *const f32, gamma: *const f32, xn: *mut f32, groups: i32, s: i32, d: i32,
         eps: f32);
     loken_hc_low(down: *const f32, low: *mut f32, n: i32, s: i32);

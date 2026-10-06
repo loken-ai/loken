@@ -127,10 +127,54 @@ pub fn indexer_select(
             shape.half as i32,
             shape.eps,
             scale,
+            scores.elem_count() as i32,
             stream,
         );
     }
     Ok(())
+}
+
+/// Rows `[n, hd]` F32 into the pooled keys' groups, from block `first`.
+pub fn indexer_rows_in(
+    rows: &Tensor,
+    pooled: &Tensor,
+    first: usize,
+    n: usize,
+    hd: usize,
+) -> Result<()> {
+    let stream = stream_of_card(rows)?;
+    unsafe {
+        loken_indexer_rows_in(
+            address::<f32>(rows, "rows")? as *const f32,
+            address::<f32>(pooled, "pooled")? as *mut f32,
+            first as i32,
+            n as i32,
+            hd as i32,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// The pooled keys of blocks `first..first + n` as rows `[n, hd]` F32.
+pub fn indexer_rows_out(pooled: &Tensor, first: usize, n: usize, hd: usize) -> Result<Tensor> {
+    let dev = pooled.device().as_cuda_device()?;
+    let stream = stream_of_card(pooled)?;
+    let out = unsafe { dev.alloc::<f32>(n * hd) }?;
+    unsafe {
+        loken_indexer_rows_out(
+            address::<f32>(pooled, "pooled")? as *const f32,
+            out.device_ptr(out.stream()).0 as *mut f32,
+            first as i32,
+            n as i32,
+            hd as i32,
+            stream,
+        );
+    }
+    tensor_from_cuda_storage(
+        CudaStorage::wrap_cuda_slice(out, dev.clone()),
+        crate::tensor::Shape::from((n, hd)),
+    )
 }
 
 /// The key and value rows of a decoded token (`[n_kv, hd]` F32 each) into the F16 cache buffers
@@ -183,7 +227,10 @@ pub fn selected_attention(
     let dev = q.device().as_cuda_device()?;
     let stream = stream_of_card(q)?;
     let ncap = sel.elem_count();
+    let splits = attention_splits(ncap);
     let out = unsafe { dev.alloc::<f32>(n_head * hd) }?;
+    let part_o = unsafe { dev.alloc::<f32>(n_head * splits * hd) }?;
+    let part_ml = unsafe { dev.alloc::<f32>(n_head * splits * 2) }?;
     unsafe {
         loken_selected_attn(
             address::<f32>(q, "q")? as *const f32,
@@ -192,11 +239,14 @@ pub fn selected_attention(
             address::<u32>(sel, "sel")? as *const u32,
             address::<u32>(count, "count")? as *const u32,
             out.device_ptr(out.stream()).0 as *mut f32,
+            part_o.device_ptr(part_o.stream()).0 as *mut f32,
+            part_ml.device_ptr(part_ml.stream()).0 as *mut f32,
             n_head as i32,
             n_kv as i32,
             cap as i32,
             hd as i32,
             ncap as i32,
+            splits as i32,
             scale,
             stream,
         );
@@ -207,9 +257,19 @@ pub fn selected_attention(
     )
 }
 
-/// The shared memory the attention kernel of one head needs, in bytes.
+/// Tokens one block of the attention scores and weighs.
+const ATTENTION_RUN_TOKENS: usize = 128;
+
+/// The runs the kept tokens are cut into, for a room of `ncap` of them: a block takes a run of
+/// [`ATTENTION_RUN_TOKENS`], and no more than thirty-two runs are joined.
+fn attention_splits(ncap: usize) -> usize {
+    ncap.div_ceil(ATTENTION_RUN_TOKENS).clamp(1, 32)
+}
+
+/// The shared memory a block of the attention kernel needs, in bytes.
 pub fn selected_attention_smem(ncap: usize, hd: usize) -> usize {
-    (ncap + hd + 8 * hd) * std::mem::size_of::<f32>()
+    let run = ncap.div_ceil(attention_splits(ncap));
+    (run + hd + 8 * hd) * std::mem::size_of::<f32>()
 }
 
 /// The shared memory the selection kernel needs, in bytes.
