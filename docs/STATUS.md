@@ -150,7 +150,8 @@ quoted here.
 |---|---|
 | Card against host numerics | The card paths agree with the host to a cosine of 0.9997 per layer on the 160-expert file |
 | Low-bit expert formats | Run on the card in decode and prefill, judged against the host decoder |
-| Expert cache | Hot experts held on each layer's card, the rest computed on the host beside it; a wide batch streams a layer's experts through two buffers when that costs less than its rows |
+| Expert cache | Hot experts held on each layer's card; a missing expert is copied into the card's transit room or computed on the host, split by measured rates; a wide batch streams a layer's experts through two buffers when that costs less than its rows. A card with room for all its experts holds them and runs its layers as loaded ones |
+| 256 experts, decode | On a 4.0k token prompt one card decodes 21 to 23 tok/s and two cards 30 to 33; on 14k tokens 20 and 28 to 30. Before the cache plan used the second card: 16 to 17 on 4.0k and 12 on 14k |
 | Decode graph | Captured for files without an n-gram table or indexed attention. The others, and every file under the cache plan, decode eagerly |
 | 160 experts, one card | Measured on 3.2k and 12.9k token prompts |
 | 160 experts, two cards | Measured on a 4.5k token prompt |
@@ -184,8 +185,10 @@ Limits:
 - **The 512-expert file** holds 77 GB of experts against 56 GB of host memory in the scope
   measured, which is untried. Only three quarters of the memory the kernel still has free is
   page-locked; the rest copies through the driver's staging at a lower rate.
-- **Two cards** under the cache plan put every layer on the first card when its dense part
-  fits there, and leave the second unused. The second card's link is x4.
+- **Two cards** under the cache plan cut the layers by link: the card on the slower link (x4 here)
+  holds the layers it can hold whole, the other the rest with a cache. The decode of a card
+  with a cache is bound by the host launching its kernels one by one, since the decode graph
+  is off for these files.
 - **Multi-token prediction** is not implemented.
 - A unit test of the q4 KV decode parity fails now and then when GPU tests run in parallel, and
   passes alone.
