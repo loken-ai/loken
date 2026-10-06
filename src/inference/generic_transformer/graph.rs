@@ -36,17 +36,22 @@ impl Drop for GraphStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOp {
     /// Layers of card segment `seg`, recorded in one graph; the head follows in it when `head`.
+    /// A run that follows a hop starts with the copy that lands the hidden state on its card
+    /// (`recv`), and one that precedes a hop ends with the copy that sends it (`send`).
     Run {
         seg: usize,
         layers: std::ops::Range<usize>,
         head: bool,
+        recv: bool,
+        send: bool,
     },
     /// The head alone, after a last layer that runs eagerly.
     Head { seg: usize },
     /// One layer that runs eagerly at every replay.
     Layer { seg: usize, layer: usize },
-    /// The hidden state crossing from card segment `seg` to the next.
-    Hop { seg: usize },
+    /// The hidden state crossing from card segment `seg` to the next: the next card's stream
+    /// waits for the send, and the copies a neighbouring graph does not hold run here.
+    Hop { seg: usize, send: bool, recv: bool },
 }
 
 impl StepOp {
@@ -67,7 +72,11 @@ pub(crate) fn plan_step(
     let mut ops = Vec::new();
     for (seg, range) in segs.iter().enumerate() {
         if seg > 0 {
-            ops.push(StepOp::Hop { seg: seg - 1 });
+            ops.push(StepOp::Hop {
+                seg: seg - 1,
+                send: true,
+                recv: true,
+            });
         }
         let mut run: Option<usize> = None;
         for layer in range.clone() {
@@ -80,6 +89,8 @@ pub(crate) fn plan_step(
                     seg,
                     layers: first..layer,
                     head: false,
+                    recv: false,
+                    send: false,
                 });
             }
             ops.push(StepOp::Layer { seg, layer });
@@ -89,6 +100,8 @@ pub(crate) fn plan_step(
                 seg,
                 layers: first..range.end,
                 head: false,
+                recv: false,
+                send: false,
             });
         }
     }
@@ -98,6 +111,29 @@ pub(crate) fn plan_step(
             seg: segs.len() - 1,
         }),
         None => {}
+    }
+    // The copies of a hop belong to the graph beside it, where there is one: the hidden state
+    // then crosses between two recordings with no call of the host in between but the event.
+    for at in 0..ops.len() {
+        if !matches!(ops[at], StepOp::Hop { .. }) {
+            continue;
+        }
+        let before_is_run = at > 0 && matches!(ops[at - 1], StepOp::Run { .. });
+        let after_is_run = matches!(ops.get(at + 1), Some(StepOp::Run { .. }));
+        if before_is_run {
+            if let StepOp::Run { send, .. } = &mut ops[at - 1] {
+                *send = true;
+            }
+        }
+        if after_is_run {
+            if let StepOp::Run { recv, .. } = &mut ops[at + 1] {
+                *recv = true;
+            }
+        }
+        if let StepOp::Hop { send, recv, .. } = &mut ops[at] {
+            *send = !before_is_run;
+            *recv = !after_is_run;
+        }
     }
     ops
 }
@@ -1561,7 +1597,7 @@ impl GenericHeteroTransformer {
             .iter()
             .filter_map(|op| {
                 let seg = match op {
-                    StepOp::Hop { seg } => seg + 1,
+                    StepOp::Hop { seg, .. } => seg + 1,
                     StepOp::Run { seg, .. } | StepOp::Head { seg } | StepOp::Layer { seg, .. } => {
                         *seg
                     }
@@ -1597,9 +1633,22 @@ impl GenericHeteroTransformer {
             crate::tensor::bail!("run_step_op: no op {op}");
         };
         match this {
-            StepOp::Run { seg, layers, head } => {
+            StepOp::Run {
+                seg,
+                layers,
+                head,
+                recv,
+                send,
+            } => {
                 let _step = GraphStep::enter();
                 let buffer = self.step_buffer(seg)?;
+                #[cfg(feature = "cuda")]
+                if recv {
+                    self.graph_hops
+                        .get(seg - 1)
+                        .ok_or_else(|| crate::tensor::Error::msg("graph hop not prepared"))?
+                        .receive()?;
+                }
                 let mut hidden = self.step_input(op, seg)?;
                 // See the timer in the eager decode loop: this measures issuing the layer,
                 // which is what tells a dispatching layer from one running on the host.
@@ -1610,6 +1659,15 @@ impl GenericHeteroTransformer {
                 if head {
                     return self.graph_head(hidden).map(Some);
                 }
+                #[cfg(feature = "cuda")]
+                if send {
+                    self.graph_hops
+                        .get(seg)
+                        .ok_or_else(|| crate::tensor::Error::msg("graph hop not prepared"))?
+                        .send(&hidden)?;
+                    return Ok(None);
+                }
+                let _ = (recv, send);
                 Self::store_step_hidden(&buffer, hidden)?;
                 Ok(None)
             }
@@ -1642,15 +1700,16 @@ impl GenericHeteroTransformer {
                 Self::store_step_hidden(&buffer, hidden)?;
                 Ok(None)
             }
-            StepOp::Hop { seg } => {
+            StepOp::Hop { seg, send, recv } => {
                 #[cfg(feature = "cuda")]
                 {
-                    let from = self.step_buffer(seg)?;
                     let hop = self
                         .graph_hops
                         .get(seg)
                         .ok_or_else(|| crate::tensor::Error::msg("graph hop not prepared"))?;
-                    hop.send(&from)?;
+                    if send {
+                        hop.send(&self.step_buffer(seg)?)?;
+                    }
                     // The next card's stream waits for the copy to the host, then fills its
                     // own buffer from it.
                     let streams = self.graph_segment_streams();
@@ -1658,11 +1717,16 @@ impl GenericHeteroTransformer {
                         let ev = crate::tensor::cuda_ext::record_event(a)?;
                         crate::tensor::cuda_ext::wait_event(b, &ev)?;
                     }
-                    hop.receive()?;
+                    if recv {
+                        hop.receive()?;
+                    }
                     Ok(None)
                 }
                 #[cfg(not(feature = "cuda"))]
-                crate::tensor::bail!("a card hop needs CUDA")
+                {
+                    let _ = (seg, send, recv);
+                    crate::tensor::bail!("a card hop needs CUDA")
+                }
             }
         }
     }
@@ -2829,7 +2893,17 @@ mod tests {
     }
 
     fn run(seg: usize, layers: std::ops::Range<usize>, head: bool) -> StepOp {
-        StepOp::Run { seg, layers, head }
+        StepOp::Run {
+            seg,
+            layers,
+            head,
+            recv: false,
+            send: false,
+        }
+    }
+
+    fn hop(seg: usize, send: bool, recv: bool) -> StepOp {
+        StepOp::Hop { seg, send, recv }
     }
 
     #[test]
@@ -2884,11 +2958,52 @@ mod tests {
             vec![
                 run(0, 0..2, false),
                 StepOp::Layer { seg: 0, layer: 2 },
-                StepOp::Hop { seg: 0 },
+                hop(0, true, true),
                 StepOp::Layer { seg: 1, layer: 3 },
                 run(1, 4..6, true),
             ]
         );
+    }
+
+    /// Where a graph sits beside a hop it holds the copy: the hidden state leaves one recording
+    /// and enters the next with only the event between them.
+    #[test]
+    fn a_hop_between_two_runs_is_held_by_their_graphs() {
+        let ops = plan_step(&[span(0, 3), span(3, 6)], |_| true);
+        assert_eq!(
+            ops,
+            vec![
+                StepOp::Run {
+                    seg: 0,
+                    layers: 0..3,
+                    head: false,
+                    recv: false,
+                    send: true
+                },
+                hop(0, false, false),
+                StepOp::Run {
+                    seg: 1,
+                    layers: 3..6,
+                    head: true,
+                    recv: true,
+                    send: false
+                },
+            ]
+        );
+        let ops = plan_step(&[span(0, 3), span(3, 6)], |l| l != 3);
+        assert!(matches!(
+            ops[..],
+            [
+                StepOp::Run { send: true, .. },
+                StepOp::Hop {
+                    send: false,
+                    recv: true,
+                    ..
+                },
+                StepOp::Layer { .. },
+                StepOp::Run { .. },
+            ]
+        ));
     }
 
     #[test]
