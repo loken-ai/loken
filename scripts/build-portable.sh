@@ -4,6 +4,11 @@
 #   scripts/build-portable.sh           # build in a container, package into dist/
 #   scripts/build-portable.sh --host    # build with this machine's toolchain instead
 #
+# Two archives come out. The light one holds the binaries and starts on any machine; the
+# CUDA-libraries one holds lib/ with NVRTC, cuBLAS, cuBLASLt (and NCCL when this machine has it).
+# Unpacked over the light archive it gives a GPU machine that needs only the NVIDIA driver. The
+# binary opens lib/ beside itself before it looks anywhere else.
+#
 # What makes it portable:
 #   - The CUDA libraries (driver, NVRTC, cuBLAS, NCCL) and the OpenCL loader are opened at run
 #     time. A machine without them starts, reports no device, and serves on the CPU.
@@ -22,6 +27,7 @@
 #   MAX_GLIBC        highest glibc symbol version the binaries may need (default 2.34)
 #   FEATURES         cargo features, comma separated (default: the crate's defaults)
 #   CUDA_PATH        CUDA toolkit root
+#   NCCL_LIB         path of libnccl.so.2 to bundle (default: the one ldconfig lists, if any)
 #   CARGO_TARGET_DIR build directory (default: target in the repository)
 #   DIST             output directory (default: dist)
 #   BUILD_CACHE      cargo home shared between container builds (downloads, git sources)
@@ -145,9 +151,45 @@ features:       $features
 glibc needed:   $(objdump -T "$BIN_DIR/lokend" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
 build mode:     $MODE ($BASE_IMAGE)
 runtime libs:   none required. CUDA driver, NVRTC, cuBLAS, NCCL and the OpenCL loader are
-                opened when present; without them the server runs on the CPU.
+                opened when present; without them the server runs on the CPU. The archive
+                named -cuda-libs carries NVRTC, cuBLAS and cuBLASLt in lib/.
 EOF
 
 tar --sort=name --owner=0 --group=0 --numeric-owner -C "$STAGE" -czf "$DIST/$NAME.tar.gz" "$NAME"
 (cd "$DIST" && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" && cat "$NAME.tar.gz.sha256")
 ls -l "$DIST/$NAME.tar.gz"
+
+# The CUDA-libraries archive: each library under its SONAME, which is the name the binary asks for.
+LIBS_NAME="$NAME-cuda-libs"
+LIBS_STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE" "$LIBS_STAGE"' EXIT
+mkdir -p "$LIBS_STAGE/$NAME/lib"
+soname_of() { LC_ALL=C readelf -d "$1" | sed -n 's/.*Library soname: \[\(.*\)\]/\1/p'; }
+bundle() {
+    local real soname
+    real="$(readlink -f "$1")"
+    soname="$(soname_of "$real")"
+    [ -n "$soname" ] || { echo "no SONAME in $1" >&2; exit 1; }
+    cp "$real" "$LIBS_STAGE/$NAME/lib/$soname"
+    echo "$soname"
+}
+bundled=""
+for lib in libnvrtc.so libnvrtc-builtins.so libcublas.so libcublasLt.so; do
+    [ -e "$CUDA_PATH/lib64/$lib" ] || { echo "no $lib under $CUDA_PATH/lib64" >&2; exit 1; }
+    bundled="$bundled $(bundle "$CUDA_PATH/lib64/$lib")"
+done
+nccl="${NCCL_LIB:-$( { /sbin/ldconfig -p 2>/dev/null || ldconfig -p 2>/dev/null || true; } | awk '/libnccl\.so\.2 /{print $NF; exit}')}"
+if [ -n "$nccl" ] && [ -e "$nccl" ]; then
+    bundled="$bundled $(bundle "$nccl")"
+    [ ! -f /usr/share/doc/libnccl2/copyright ] || cp /usr/share/doc/libnccl2/copyright "$LIBS_STAGE/$NAME/LICENSE-NCCL.txt"
+fi
+cp "$CUDA_PATH/EULA.txt" "$LIBS_STAGE/$NAME/LICENSE-CUDA.txt"
+cat > "$LIBS_STAGE/$NAME/lib/README" <<EOF
+CUDA libraries redistributed under the NVIDIA CUDA Toolkit EULA (LICENSE-CUDA.txt) and, for
+NCCL, its own licence (LICENSE-NCCL.txt). Unpack this archive over the loken archive of the same
+version. Needs only the NVIDIA driver.
+files:$bundled
+EOF
+tar --sort=name --owner=0 --group=0 --numeric-owner -C "$LIBS_STAGE" -czf "$DIST/$LIBS_NAME.tar.gz" "$NAME"
+(cd "$DIST" && sha256sum "$LIBS_NAME.tar.gz" > "$LIBS_NAME.tar.gz.sha256" && cat "$LIBS_NAME.tar.gz.sha256")
+ls -l "$DIST/$LIBS_NAME.tar.gz"

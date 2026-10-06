@@ -13,6 +13,13 @@ any crate dependency is the one shipped in its own source tree (resolved in `Car
 |-----------|----------|---------|
 | `cudarc` | [chelsea0x3b/cudarc](https://github.com/chelsea0x3b/cudarc) | MIT OR Apache-2.0 |
 
+## Redistributed binaries
+
+The `-cuda-libs` release archive carries NVIDIA's NVRTC, cuBLAS and cuBLASLt, redistributed under
+the CUDA Toolkit EULA (`LICENSE-CUDA.txt` in the archive, Attachment A lists them), and NCCL
+under its own licence (`LICENSE-NCCL.txt`) when the build machine provides it. The light archive
+carries none of them.
+
 ## Borrowed code, measured
 
 Each row states what a file still shares, verbatim, with the upstream it names. Figures come
