@@ -57,7 +57,7 @@ impl GenericTransformerLayer {
     }
 
     /// Apply RoPE using pre-allocated buffers (for graph mode).
-    fn apply_rotary_emb_from_buffer(&self, x: &Tensor) -> Result<Tensor> {
+    pub(super) fn apply_rotary_emb_from_buffer(&self, x: &Tensor) -> Result<Tensor> {
         if self.no_rope {
             return Ok(x.clone());
         } // SmolLM3 NoPE layer

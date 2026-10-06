@@ -86,10 +86,11 @@ pub fn rms_norm_row(row: &mut [f32], gamma: &[f32], eps: f32) {
     }
 }
 
-/// One attention layer's indexer cache: the raw key row of every token and the pooled key of
-/// every complete block.
+/// One attention layer's indexer cache: the raw key rows of the block being filled and the
+/// pooled key of every complete block.
 #[derive(Debug, Clone, Default)]
 pub struct IndexerCache {
+    /// The raw rows of the incomplete block, oldest first.
     raw: Vec<f32>,
     pooled: Vec<f32>,
     /// The pooled keys again, every complete group of [`LANES`] blocks transposed to
@@ -133,8 +134,8 @@ impl IndexerCache {
             if self.tokens.is_multiple_of(meta.block) {
                 let first = self.tokens - meta.block;
                 let mut pooled = vec![0f32; hd];
-                for t in first..self.tokens {
-                    for (p, v) in pooled.iter_mut().zip(&self.raw[t * hd..(t + 1) * hd]) {
+                for raw in self.raw.chunks_exact(hd) {
+                    for (p, v) in pooled.iter_mut().zip(raw) {
                         *p += v;
                     }
                 }
@@ -143,17 +144,51 @@ impl IndexerCache {
                 }
                 rms_norm_row(&mut pooled, k_gamma, eps);
                 rope.apply(&mut pooled, first);
-                self.pooled.extend_from_slice(&pooled);
-                let blocks = self.pooled.len() / hd;
-                if blocks.is_multiple_of(LANES) {
-                    let group = &self.pooled[(blocks - LANES) * hd..];
-                    for d in 0..hd {
-                        self.lanes
-                            .extend((0..LANES).map(|lane| group[lane * hd + d]));
-                    }
-                }
+                self.raw.clear();
+                self.push_pooled(&pooled, hd);
             }
         }
+    }
+
+    /// A pooled key joins the blocks; each complete group of [`LANES`] is transposed into
+    /// `lanes`.
+    fn push_pooled(&mut self, pooled: &[f32], hd: usize) {
+        self.pooled.extend_from_slice(pooled);
+        let blocks = self.pooled.len() / hd;
+        if blocks.is_multiple_of(LANES) {
+            let group = &self.pooled[(blocks - LANES) * hd..];
+            for d in 0..hd {
+                self.lanes
+                    .extend((0..LANES).map(|lane| group[lane * hd + d]));
+            }
+        }
+    }
+
+    /// Complete blocks held.
+    pub fn blocks(&self, meta: &IndexerMeta) -> usize {
+        self.pooled.len() / meta.head_dim
+    }
+
+    /// The pooled keys of blocks `from..`, row by row.
+    pub fn pooled_from(&self, from: usize, meta: &IndexerMeta) -> &[f32] {
+        &self.pooled[from * meta.head_dim..]
+    }
+
+    /// The raw rows of the block being filled.
+    pub fn tail(&self) -> &[f32] {
+        &self.raw
+    }
+
+    /// Take over what another holder of the same sequence has beyond this cache: the pooled keys
+    /// of the blocks this one lacks (`pooled`, row by row) and the raw rows of the block being
+    /// filled, which bring it to `tokens`.
+    pub fn extend(&mut self, pooled: &[f32], tail: &[f32], tokens: usize, meta: &IndexerMeta) {
+        let hd = meta.head_dim;
+        for row in pooled.chunks_exact(hd) {
+            self.push_pooled(row, hd);
+        }
+        self.raw = tail.to_vec();
+        self.tokens = tokens;
     }
 
     /// The score of each block complete by `pos` for the query heads `q`: the rectified dot
@@ -276,7 +311,15 @@ pub struct SparseAttention {
     eps: f32,
     rope: HostRope,
     pub cache: IndexerCache,
+    /// The cache a recorded decode step keeps on the card.
+    #[cfg(feature = "cuda")]
+    card: Option<CardIndexer>,
 }
+
+#[cfg(feature = "cuda")]
+mod card;
+#[cfg(feature = "cuda")]
+pub use card::CardIndexer;
 
 impl SparseAttention {
     #[allow(clippy::too_many_arguments)]
@@ -300,7 +343,39 @@ impl SparseAttention {
             eps,
             rope,
             cache: IndexerCache::default(),
+            #[cfg(feature = "cuda")]
+            card: None,
         }
+    }
+
+    /// The cache as a snapshot of the sequence reads it: the host's, with what a recorded step
+    /// made on the card.
+    pub fn snapshot_cache(&self) -> Result<IndexerCache> {
+        #[cfg(feature = "cuda")]
+        return self.current_cache();
+        #[cfg(not(feature = "cuda"))]
+        Ok(self.cache.clone())
+    }
+
+    /// Make `cache` the host's. A restore into the buffers a recorded step lives in
+    /// (`in_place`) is of the sequence the card holds, so the card keeps what the cache covers;
+    /// any other is of another sequence, and the card forgets its own.
+    pub fn restore_cache(&mut self, cache: &IndexerCache, in_place: bool) {
+        self.cache = cache.clone();
+        #[cfg(feature = "cuda")]
+        match in_place {
+            true => self.truncate_card(cache.len()),
+            false => self.forget_card(),
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = in_place;
+    }
+
+    /// Forget the sequence.
+    pub fn reset(&mut self) {
+        self.cache.clear();
+        #[cfg(feature = "cuda")]
+        self.forget_card();
     }
 
     /// Tokens held in the cache: every attended token is observed once.
@@ -376,7 +451,12 @@ impl SparseAttention {
         let m = self.meta;
         if index_pos == 0 {
             self.cache.clear();
+            #[cfg(feature = "cuda")]
+            self.forget_card();
         }
+        // Tokens a recorded step made on the card join the host's cache first.
+        #[cfg(feature = "cuda")]
+        self.sync_host_from_card(index_pos)?;
         if self.cache.len() != index_pos {
             return Err(crate::tensor::Error::msg(format!(
                 "indexer holds {} tokens but the forward starts at {index_pos}",
@@ -388,6 +468,9 @@ impl SparseAttention {
         let keys = host(self.k_proj.forward(x)?)?;
         self.cache
             .append(&keys, &m, &self.k_gamma, self.eps, &self.rope);
+        // From here the host holds tokens the card may not.
+        #[cfg(feature = "cuda")]
+        self.truncate_card(index_pos);
         if self.dense_for(index_pos + seq) {
             return Ok(None);
         }

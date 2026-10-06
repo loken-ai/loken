@@ -6,6 +6,8 @@
 use super::hyper::combine_on_card;
 use super::hyper::{combine, WideBlock};
 use super::*;
+#[cfg(feature = "cuda")]
+use crate::inference::moe_cuda::StepPos;
 use crate::tensor::D;
 
 /// A weight as a projection that accepts the activations the wide residual carries: dense
@@ -170,7 +172,10 @@ impl GenericTransformerLayer {
         };
         let out = match self.mixer {
             mixer::Mixer::Attention => {
-                let mut o = self.forward_attn_graph(&mixed)?;
+                let mut o = match self.sparse.is_some() {
+                    true => self.forward_sparse_graph(&mixed)?,
+                    false => self.forward_attn_graph(&mixed)?,
+                };
                 if let Some(b) = &self.attn_output_bias {
                     o = o.broadcast_add(b)?;
                 }
@@ -207,6 +212,100 @@ impl GenericTransformerLayer {
             d,
         )?;
         Ok(r)
+    }
+
+    /// Whether this layer's indexer and attention run on its card: its kernels serve the
+    /// layer's shapes and its one cache is the card's half-width one.
+    #[cfg(feature = "cuda")]
+    pub(super) fn indexed_on_card(&self) -> bool {
+        self.sparse.as_ref().is_some_and(|sparse| {
+            self.cos.device().is_cuda() && self.kv_f16 && sparse.card_serves(self.head_dim)
+        })
+    }
+
+    /// The attention of an indexed layer in the decode step a graph records: the indexer takes
+    /// the token's key into its cache on the card and keeps the tokens the query selects, the
+    /// token's keys and values join the cache at the position the card holds, and one launch
+    /// attends over the kept tokens. Nothing in it reads the host.
+    #[cfg(feature = "cuda")]
+    pub(super) fn forward_sparse_graph(&mut self, x: &Tensor) -> Result<Tensor> {
+        let pos_dev = self
+            .graph_pos_i32
+            .clone()
+            .ok_or_else(|| crate::tensor::Error::msg("the step's position is not on the card"))?;
+        self.attend_on_card(x, StepPos::Card(&pos_dev), None)
+    }
+
+    /// [`Self::forward_sparse_graph`] for a decoded token run now, at `index_pos`, whose
+    /// position the host knows: the same launches, and the host's counters moved by it.
+    #[cfg(feature = "cuda")]
+    fn attend_on_card_eager(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        self.kv_cache.reserve(index_pos + 1)?;
+        let room = self.kv_cache.max_seq_len_padded();
+        let sparse = self
+            .sparse
+            .as_mut()
+            .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?;
+        sparse.card_room_for(room)?;
+        sparse.card_hold(index_pos)?;
+        let out = self.attend_on_card(x, StepPos::Host(index_pos), Some(index_pos))?;
+        self.kv_cache.advance_seq_len(1);
+        Ok(out)
+    }
+
+    /// The launches of an indexed layer's decoded token: indexer, projections, cache write and
+    /// attention. `eager_at` is the position of a token run now, whose rotation is taken from the
+    /// layer's tables; a recorded step takes it from the buffers its replays refresh.
+    #[cfg(feature = "cuda")]
+    fn attend_on_card(
+        &mut self,
+        x: &Tensor,
+        pos: StepPos,
+        eager_at: Option<usize>,
+    ) -> Result<Tensor> {
+        let sparse = self
+            .sparse
+            .as_mut()
+            .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?;
+        sparse.card_step(x, pos)?;
+        let (n_head, n_kv, hd) = (self.n_head, self.n_kv_head, self.head_dim);
+        let (q, k, v) = self.project_heads(x)?;
+        let (q, k) = match eager_at {
+            Some(at) => (
+                self.apply_rotary_emb(&q, at)?,
+                self.apply_rotary_emb(&k, at)?,
+            ),
+            None => (
+                self.apply_rotary_emb_from_buffer(&q)?,
+                self.apply_rotary_emb_from_buffer(&k)?,
+            ),
+        };
+        let flat = |t: &Tensor| t.to_dtype(DType::F32)?.contiguous();
+        let (q, k, v) = (flat(&q)?, flat(&k)?, flat(&v)?);
+        let (Some(k_buf), Some(v_buf)) = (self.kv_cache.k_buffer(), self.kv_cache.v_buffer())
+        else {
+            crate::tensor::bail!("an indexed layer decodes before its cache holds a token");
+        };
+        let cap = self.kv_cache.max_seq_len_padded();
+        if eager_at.is_none() {
+            // The step is recorded against these buffers: it ends, and is recorded again, when
+            // the cache grows.
+            self.graph_kv_cap = Some(cap);
+        }
+        crate::inference::moe_cuda::kv_append_pos(&k, &v, &k_buf, &v_buf, pos, n_kv, cap, hd)?;
+        let sparse = self
+            .sparse
+            .as_ref()
+            .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?;
+        let (sel, count) = sparse.card_selection()?;
+        let scale = self
+            .attention_scale
+            .unwrap_or_else(|| 1.0 / (hd as f64).sqrt()) as f32;
+        let y = crate::inference::moe_cuda::selected_attention(
+            &q, &k_buf, &v_buf, sel, count, n_head, n_kv, cap, hd, scale,
+        )?;
+        let y = self.gate_attention(x, y)?;
+        self.attn_output.forward(&y)
     }
 
     /// The token mixer behind its mixer's output: the delta rule through its output
@@ -309,6 +408,16 @@ impl GenericTransformerLayer {
         mask: Option<&Tensor>,
         index_pos: usize,
     ) -> Result<Tensor> {
+        // A decoded token of a layer whose indexer runs on the card never reaches the host.
+        #[cfg(feature = "cuda")]
+        if self.indexed_on_card()
+            && x.dim(1)? == 1
+            && index_pos > 0
+            && self.kv_cache.k_buffer().is_some()
+            && self.kv_cache.current_seq_len() == index_pos
+        {
+            return self.attend_on_card_eager(x, index_pos);
+        }
         let selection = match self.sparse.as_mut() {
             Some(sp) => sp.observe(x, index_pos)?,
             None => None,
@@ -327,15 +436,10 @@ impl GenericTransformerLayer {
         }
     }
 
-    /// Attention in which row `i` reads only the cached tokens `selection[i]`: the
-    /// projections, norms and rotation of the dense path, then scores masked to the kept
-    /// tokens.
-    pub(super) fn attend_selected(
-        &mut self,
-        x: &Tensor,
-        index_pos: usize,
-        selection: &[Vec<u32>],
-    ) -> Result<Tensor> {
+    /// The projections of `x` `[b, seq, hidden]` split into heads, normalised where the layer
+    /// norms them and not yet rotated: `q` `[b, n_head, seq, hd]`, `k` and `v`
+    /// `[b, n_kv, seq, hd]`.
+    fn project_heads(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, seq, _) = x.dims3()?;
         let (n_head, n_kv, hd) = (self.n_head, self.n_kv_head, self.head_dim);
         let (mut q, mut k, v) = match (self.attn_qkv.as_ref(), self.attn_q.as_ref()) {
@@ -357,7 +461,7 @@ impl GenericTransformerLayer {
         };
         q = q.reshape((b, seq, n_head, hd))?.transpose(1, 2)?;
         k = k.reshape((b, seq, n_kv, hd))?.transpose(1, 2)?;
-        let mut v = v
+        let v = v
             .reshape((b, seq, n_kv, hd))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -365,6 +469,21 @@ impl GenericTransformerLayer {
             q = qn.forward(&q.contiguous()?)?;
             k = kn.forward(&k.contiguous()?)?;
         }
+        Ok((q, k, v))
+    }
+
+    /// Attention in which row `i` reads only the cached tokens `selection[i]`: the
+    /// projections, norms and rotation of the dense path, then scores masked to the kept
+    /// tokens.
+    pub(super) fn attend_selected(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        selection: &[Vec<u32>],
+    ) -> Result<Tensor> {
+        let (b, seq, _) = x.dims3()?;
+        let (n_head, n_kv, hd) = (self.n_head, self.n_kv_head, self.head_dim);
+        let (mut q, mut k, mut v) = self.project_heads(x)?;
         q = self.apply_rotary_emb(&q, index_pos)?;
         k = self.apply_rotary_emb(&k, index_pos)?;
         if index_pos == 0 {
@@ -472,7 +591,11 @@ impl GenericTransformerLayer {
         }
         Ok(Some(mixer::MixerState::Wide(Box::new(mixer::WideState {
             mixer,
-            index: self.sparse.as_ref().map(|s| s.cache.clone()),
+            index: self
+                .sparse
+                .as_ref()
+                .map(|s| s.snapshot_cache())
+                .transpose()?,
             ngram: self.ngram.as_ref().map(ple).transpose()?,
         }))))
     }
@@ -487,7 +610,7 @@ impl GenericTransformerLayer {
                     self.mixer.reset();
                 }
                 if let (Some(sp), Some(c)) = (self.sparse.as_mut(), w.index.as_ref()) {
-                    sp.cache = c.clone();
+                    sp.restore_cache(c, false);
                 }
                 if let (Some(p), Some(st)) = (self.ngram.as_mut(), w.ngram.as_ref()) {
                     p.restore(st)?;
@@ -506,7 +629,7 @@ impl GenericTransformerLayer {
                     self.mixer.restore_in_place(m)?;
                 }
                 if let (Some(sp), Some(c)) = (self.sparse.as_mut(), w.index.as_ref()) {
-                    sp.cache = c.clone();
+                    sp.restore_cache(c, true);
                 }
                 if let (Some(p), Some(st)) = (self.ngram.as_mut(), w.ngram.as_ref()) {
                     p.restore(st)?;
@@ -521,7 +644,7 @@ impl GenericTransformerLayer {
     pub(super) fn state_reset(&mut self) {
         self.mixer.reset();
         if let Some(sp) = self.sparse.as_mut() {
-            sp.cache.clear();
+            sp.reset();
         }
         if let Some(p) = self.ngram.as_mut() {
             p.reset();

@@ -429,8 +429,24 @@ impl SpecKvCache {
         }
 
         // Grow if needed (double the buffer)
-        while self.current_seq_len + n_new > self.max_seq_len {
-            let grow = self.max_seq_len.max(n_new);
+        self.grow_to(self.current_seq_len + n_new, n_new)?;
+
+        // In-place write: copy new tokens into pre-allocated buffer at current_seq_len offset
+        let k_buf = self.k.as_mut().unwrap();
+        let v_buf = self.v.as_mut().unwrap();
+        k_buf.slice_set(k_new, dim, self.current_seq_len)?;
+        v_buf.slice_set(v_new, dim, self.current_seq_len)?;
+
+        self.current_seq_len += n_new;
+        Ok(())
+    }
+
+    /// Grow the buffers by their own size, or by `step` when that is more, until they hold
+    /// `total` positions.
+    fn grow_to(&mut self, total: usize, step: usize) -> Result<()> {
+        let dim = self.dim;
+        while total > self.max_seq_len {
+            let grow = self.max_seq_len.max(step);
             self.max_seq_len += grow;
 
             let k_old = self.k.take().unwrap();
@@ -442,15 +458,18 @@ impl SpecKvCache {
             self.k = Some(Tensor::cat(&[&k_old, &k_ext], dim)?);
             self.v = Some(Tensor::cat(&[&v_old, &v_ext], dim)?);
         }
-
-        // In-place write: copy new tokens into pre-allocated buffer at current_seq_len offset
-        let k_buf = self.k.as_mut().unwrap();
-        let v_buf = self.v.as_mut().unwrap();
-        k_buf.slice_set(k_new, dim, self.current_seq_len)?;
-        v_buf.slice_set(v_new, dim, self.current_seq_len)?;
-
-        self.current_seq_len += n_new;
         Ok(())
+    }
+
+    /// Make the buffers hold `total` positions, which moves them when they grow. A cache that
+    /// has not been written has no buffers to grow.
+    pub fn reserve(&mut self, total: usize) -> Result<()> {
+        if self.k.is_none() {
+            return Err(crate::tensor::Error::msg(
+                "KvCache.reserve: the cache has no buffers yet",
+            ));
+        }
+        self.grow_to(total, 0)
     }
 
     /// Get the full K buffer (for graph mode - fixed pointer).

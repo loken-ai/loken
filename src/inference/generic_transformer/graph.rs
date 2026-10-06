@@ -228,7 +228,15 @@ impl GenericHeteroTransformer {
             );
         }
         if l.sparse.is_some() {
-            return Some("indexed attention selects its tokens on the host");
+            // The indexer and its attention run on the card where its kernels serve the layer's
+            // shapes and its cache is the card's half-width one.
+            #[cfg(feature = "cuda")]
+            let on_card = l.indexed_on_card();
+            #[cfg(not(feature = "cuda"))]
+            let on_card = false;
+            if !on_card {
+                return Some("indexed attention selects its tokens on the host");
+            }
         }
         if l.moe.as_ref().is_some_and(|m| m.decodes_through_host()) {
             return Some("some routed experts are in host memory");
@@ -270,6 +278,11 @@ impl GenericHeteroTransformer {
         self.captured_layers().find_map(|l| {
             // A layer that does not attend keeps no KV.
             if !l.attends() {
+                return None;
+            }
+            // An indexed layer writes its half-width cache by device position, with kernels of
+            // its own.
+            if l.sparse.is_some() {
                 return None;
             }
             // Q4 KV cache: append/flush/attention all run through
@@ -370,6 +383,7 @@ impl GenericHeteroTransformer {
             // which is the unstable path. A sink layer attends over its
             // buffers by the device length and reads no padded mask.
             l.attends()
+                && l.sparse.is_none()
                 && l.attn_sinks.is_none()
                 && !l.has_q4_cache()
                 && !l.has_q8_cache()
@@ -715,6 +729,7 @@ impl GenericHeteroTransformer {
             l.graph_x_norm_attn_buffer = None;
             l.graph_ple_input_buffer = None;
             l.graph_ngram_rows = None;
+            l.graph_kv_cap = None;
             l.graph_attn_mask_added_buffer = None;
             l.graph_attn_softmax_buffer = None;
             l.graph_ffn_gate_out = None;
@@ -767,14 +782,53 @@ impl GenericHeteroTransformer {
     /// garbage). O(n_layers) host-only work.
     #[cfg(feature = "cuda")]
     pub fn sync_kv_len_for_graph(&mut self, len: usize) {
-        for l in &mut self.layers {
+        let captured: Vec<bool> = (0..self.layers.len())
+            .map(|i| self.layer_captured(i))
+            .collect();
+        for (l, captured) in self.layers.iter_mut().zip(captured) {
             match l.quant_kv.as_mut() {
                 Some(c) => c.set_seq_len_for_graph(len),
-                // An F-dtype cache the graph writes by device position (a sink layer's).
-                None if l.attn_sinks.is_some() => l.kv_cache.sync_len(len),
+                // An F-dtype cache the graph writes by device position (a sink layer's, an
+                // indexed layer's, which keeps its indexer on the card as well).
+                None if l.attn_sinks.is_some() || (captured && l.sparse.is_some()) => {
+                    l.kv_cache.sync_len(len);
+                    if let Some(sparse) = l.sparse.as_mut() {
+                        sparse.card_confirm(len);
+                    }
+                }
                 None => {}
             }
         }
+    }
+
+    /// What the recorded step of each indexed layer reads at `pos`: the indexer's cache on the
+    /// card holds the tokens before it, the cache has room for the token and keeps the buffers
+    /// the step was recorded against. A cache that outgrew those ends the step.
+    #[cfg(feature = "cuda")]
+    fn prepare_indexed_layers(&mut self, pos: usize) -> Result<()> {
+        for i in 0..self.layers.len() {
+            if !self.layer_captured(i) || self.layers[i].sparse.is_none() {
+                continue;
+            }
+            let layer = &mut self.layers[i];
+            let cap = layer.kv_cache.max_seq_len_padded();
+            if let Some(recorded) = layer.graph_kv_cap {
+                if recorded != cap || pos >= recorded {
+                    return Err(crate::tensor::Error::msg(format!(
+                        "graph_state: pos {pos} outgrew the cache a recorded step reads, {recorded} \
+                         tokens (layer {i}). Caller should invalidate the captured graph."
+                    )));
+                }
+            } else if pos >= cap {
+                layer.kv_cache.reserve(pos + 1)?;
+            }
+            let room = layer.kv_cache.max_seq_len_padded();
+            if let Some(sparse) = layer.sparse.as_mut() {
+                sparse.card_room_for(room)?;
+                sparse.card_hold(pos)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn update_graph_state(&mut self, pos: usize) -> Result<()> {
@@ -810,6 +864,8 @@ impl GenericHeteroTransformer {
         // kernels' scratch pointers -> ILLEGAL_ADDRESS on replay.
         #[cfg(feature = "cuda")]
         self.ensure_graph_hops()?;
+        #[cfg(feature = "cuda")]
+        self.prepare_indexed_layers(pos)?;
         // A recorded n-gram layer reads and writes its convolution's rows where they lie.
         if let Some(layer) = self.ngram.as_ref().map(|n| n.meta.layer) {
             if self.layer_captured(layer) {
@@ -896,7 +952,9 @@ impl GenericHeteroTransformer {
         // mixed placement (one layer's Q8 alloc failed -> F-dtype) never
         // sees a skipped group leader.
         let skip_fdtype_state = self.captured_layers().all(|l| {
-            !l.attends() || ((l.has_q8_cache() || l.has_q4_cache()) && !l.populate_dual_kv)
+            !l.attends()
+                || l.sparse.is_some()
+                || ((l.has_q8_cache() || l.has_q4_cache()) && !l.populate_dual_kv)
         });
 
         // The step's position for the sink layers' device-length attention: written once
@@ -911,7 +969,7 @@ impl GenericHeteroTransformer {
             }
             // A layer's buffers live on the card it runs on.
             let dev = self.layers[i].cos.device().clone();
-            if self.layers[i].attn_sinks.is_some() {
+            if self.layers[i].attn_sinks.is_some() || self.layers[i].sparse.is_some() {
                 if let crate::tensor::DeviceLocation::Cuda { gpu_id } = dev.location() {
                     let layer = &mut self.layers[i];
                     match (pos_by_card.get(&gpu_id), layer.graph_pos_i32.as_ref()) {

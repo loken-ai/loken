@@ -52,6 +52,7 @@ cuda/moe/gguf.cuh	3.5%	10	candle/candle-kernels/src/quantized.cu
 cuda/moe/gguf_iq.cuh	0.0%	0	-
 cuda/moe/head_rmsnorm.cu	0.0%	0	-
 cuda/moe/hyper_residual.cu	0.0%	0	-
+cuda/moe/indexer.cu	0.0%	0	-
 cuda/moe/iq_tables.cuh	0.0%	0	-
 cuda/moe/kv_residual_scatter.cu	0.0%	0	attention.rs/src/kernels/src/dsa_lightning_indexer.cu
 cuda/moe/l2norm_gqa.cu	0.0%	0	-

@@ -297,6 +297,9 @@ pub struct GenericTransformerLayer {
     /// The rows of the n-gram table the step's token gathers, `[1, 1, heads * row_dim]` F32 on
     /// the card, written before each replay: what the layer that adds them reads.
     pub graph_ngram_rows: Option<Tensor>,
+    /// The capacity of the key and value buffers a recorded indexed layer was last run against:
+    /// the step ends, and is recorded again, when the cache outgrows or replaces them.
+    pub graph_kv_cap: Option<usize>,
     /// Persistent buffer for `att.broadcast_add(mask)` output in the
     /// GQA fast path of padded_standard_attention (line 2471).
     /// Same shape as graph_attn_qk_buffer: [1, n_kv, n_rep, max_kv] F32.

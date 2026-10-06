@@ -20,6 +20,11 @@ fn toy() -> GenericHeteroTransformer {
 
 /// The toy placed on card `ordinal`, or on the host.
 fn toy_on(ordinal: Option<usize>) -> GenericHeteroTransformer {
+    toy_with(ordinal, KvQuant::Off)
+}
+
+/// The toy placed on card `ordinal`, or on the host, with its caches in `kv`.
+fn toy_with(ordinal: Option<usize>, kv: KvQuant) -> GenericHeteroTransformer {
     let file = std::fs::File::open(dir().join("toy.gguf")).unwrap();
     let mmap = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file) }.unwrap());
     let mut content =
@@ -40,7 +45,7 @@ fn toy_on(ordinal: Option<usize>) -> GenericHeteroTransformer {
         &mmap[..],
         &cards,
         &HeteroPlan::forced_gpu(layers, on_card, ordinal.unwrap_or(0)),
-        KvQuant::Off,
+        kv,
         None,
     )
     .unwrap()
@@ -430,6 +435,34 @@ fn the_toy_on_a_card_gives_the_logits_of_the_host() {
     }
 }
 
+/// A card decodes the prompt one token at a time, its indexed layers on the card, and gives the
+/// reference's logits at every position.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn a_card_decoding_one_token_at_a_time_gives_the_logits_of_the_whole_prompt() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let mut model = toy_on(Some(0));
+    let card = model.layers[0].cos.device();
+    let tokens = ids(&v, "b.ids");
+    let want = f32s(&v, "b.logits");
+    let vocab = want.len() / tokens.len();
+    assert!(model.layers[3].indexed_on_card());
+    for (i, t) in tokens.iter().enumerate() {
+        let input = Tensor::from_vec(vec![*t], (1, 1), &card).unwrap();
+        let got = model.forward(&input, i).unwrap();
+        let got = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        within_rounding(
+            &got,
+            &want[i * vocab..(i + 1) * vocab],
+            scale_of(&want),
+            vocab,
+            &format!("position {i}"),
+        );
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs an idle CUDA card"]
@@ -565,4 +598,171 @@ fn a_prefill_at_any_pinned_chunk_gives_the_unchunked_logits() {
             at += len;
         }
     }
+}
+
+/// The host's selected attention of an indexed layer for the decoded token `x` at `pos`: the
+/// indexer's selection on the host, the attention over the kept tokens.
+#[cfg(feature = "cuda")]
+fn host_attention(layer: &mut GenericTransformerLayer, x: &Tensor, pos: usize) -> Tensor {
+    let selection = layer
+        .sparse
+        .as_mut()
+        .unwrap()
+        .observe(x, pos)
+        .unwrap()
+        .expect("past the indexer's budget");
+    layer.attend_selected(x, pos, &selection).unwrap()
+}
+
+/// A decoded token of an indexed layer on a card runs on the card, eagerly: it gives what the host's
+/// selected attention gives at every position, and leaves the host's counters where the host's
+/// own steps would.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn an_indexed_layer_decodes_on_the_card_as_the_host_does() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let tokens = ids(&v, "b.ids");
+    let mixed = f32s(&v, "b.layer3_attn_hc_mixed");
+    let width = mixed.len() / tokens.len();
+    let split = tokens.len() - 6;
+    let mut host = toy_with(Some(0), KvQuant::Q8);
+    let mut card = toy_with(Some(0), KvQuant::Q8);
+    assert!(card.layers[3].indexed_on_card());
+    let dev = host.layers[0].cos.device();
+    let row = |p: usize| {
+        Tensor::from_vec(
+            mixed[p * width..(p + 1) * width].to_vec(),
+            (1, 1, width),
+            &dev,
+        )
+        .unwrap()
+    };
+    let flat = |t: &Tensor| {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let prefill = Tensor::from_vec(tokens[..split].to_vec(), (1, split), &dev).unwrap();
+    host.forward(&prefill, 0).unwrap();
+    card.forward(&prefill, 0).unwrap();
+    for p in split..tokens.len() {
+        let want = flat(&host_attention(&mut host.layers[3], &row(p), p));
+        let got = flat(&card.layers[3].wide_attention(&row(p), None, p).unwrap());
+        let d = max_diff(&got, &want);
+        assert!(
+            d < 1e-2 * scale_of(&want),
+            "position {p}: differs by {d} on a scale of {}",
+            scale_of(&want)
+        );
+        assert_eq!(card.layers[3].kv_cache.current_seq_len(), p + 1);
+    }
+    // The host takes over from the card where the card made the tokens.
+    let next = tokens.len();
+    let x = row(next - 1);
+    let from_host = flat(&host_attention(&mut host.layers[3], &x, next));
+    let sparse = card.layers[3].sparse.as_mut().unwrap();
+    assert!(sparse.observe(&x, next).unwrap().is_some());
+    assert_eq!(sparse.len(), next + 1);
+    assert!(from_host.iter().all(|v| v.is_finite()));
+}
+
+/// The attention of an indexed layer, recorded once against the buffers of its decode step, gives
+/// at every later position what the host's selected attention gives: the indexer on the card
+/// holds the tokens, selects and attends, and the caches the two keep agree afterwards.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn a_recorded_indexed_attention_replays_at_every_position() {
+    use crate::tensor::cuda_ext;
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let tokens = ids(&v, "b.ids");
+    let mixed = f32s(&v, "b.layer3_attn_hc_mixed");
+    let width = mixed.len() / tokens.len();
+    let split = tokens.len() - 6;
+    let mut eager = toy_with(Some(0), KvQuant::Q8);
+    let mut stepped = toy_with(Some(0), KvQuant::Q8);
+    assert!(
+        stepped.layer_captured(3),
+        "{:?}",
+        stepped.layer_eager_reason(3)
+    );
+    let card = eager.layers[0].cos.device();
+    let row = |p: usize| {
+        Tensor::from_vec(
+            mixed[p * width..(p + 1) * width].to_vec(),
+            (1, 1, width),
+            &card,
+        )
+        .unwrap()
+    };
+    let flat = |t: &Tensor| {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let prefill = Tensor::from_vec(tokens[..split].to_vec(), (1, split), &card).unwrap();
+    eager.forward(&prefill, 0).unwrap();
+    stepped.forward(&prefill, 0).unwrap();
+
+    let input = row(split).force_contiguous().unwrap();
+    let out = Tensor::zeros_on((1, 1, width), DType::F32, &card).unwrap();
+    let stream = stepped.cuda_stream().unwrap();
+    let mut graph: Option<cuda_ext::CapturedGraph> = None;
+    for p in split..tokens.len() {
+        let want = flat(&host_attention(&mut eager.layers[3], &row(p), p));
+        stepped.update_graph_state(p).unwrap();
+        input.slice_set(&row(p), 0, 0).unwrap();
+        if graph.is_none() {
+            stream.synchronize().unwrap();
+            cuda_ext::begin_capture(&stream).unwrap();
+            {
+                // What the step makes is freed inside the recording, the answer kept apart.
+                let _step = graph::GraphStep::enter();
+                let y = stepped.layers[3].forward_sparse_graph(&input).unwrap();
+                out.slice_set(&y, 0, 0).unwrap();
+            }
+            graph = Some(cuda_ext::end_capture(&stream).unwrap().unwrap());
+            stream.synchronize().unwrap();
+            crate::tensor::cuda::trim_pool(stream.context().ordinal());
+            graph.as_ref().unwrap().upload().unwrap();
+            stepped.sync_kv_len_for_graph(p);
+        }
+        graph.as_ref().unwrap().launch().unwrap();
+        stream.synchronize().unwrap();
+        stepped.sync_kv_len_for_graph(p + 1);
+        let got = flat(&out);
+        let d = max_diff(&got, &want);
+        assert!(
+            d < 1e-2 * scale_of(&want),
+            "position {p}: differs by {d} on a scale of {}",
+            scale_of(&want)
+        );
+    }
+    let on_card = stepped.layers[3]
+        .sparse
+        .as_ref()
+        .unwrap()
+        .snapshot_cache()
+        .unwrap();
+    let on_host = eager.layers[3]
+        .sparse
+        .as_ref()
+        .unwrap()
+        .snapshot_cache()
+        .unwrap();
+    assert_eq!(on_card.len(), tokens.len());
+    assert_eq!(on_card.len(), on_host.len());
 }

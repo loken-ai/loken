@@ -16,6 +16,8 @@ mod rmsnorm;
 pub use rmsnorm::*;
 mod hyper;
 pub use hyper::*;
+mod indexer;
+pub use indexer::*;
 
 thread_local! {
     static IN_PLACE_STATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

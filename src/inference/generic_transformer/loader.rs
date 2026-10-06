@@ -1773,6 +1773,7 @@ fn build_generic_layer(
         graph_x_norm_attn_buffer: None,
         graph_ple_input_buffer: None,
         graph_ngram_rows: None,
+        graph_kv_cap: None,
         graph_attn_mask_added_buffer: None,
         graph_attn_softmax_buffer: None,
         // Path B schema - 3 NEW buffer fields for gemma4
@@ -1844,6 +1845,12 @@ fn build_generic_layer(
         layer.quant_kv = None;
         // Its one cache is unquantised, and on a card that cache holds half-width values.
         layer.kv_f16 = device.is_cuda();
+        // Where the card's kernels serve it, the indexer keeps its pooled keys on the card too.
+        if layer.indexed_on_card() {
+            if let Some(sparse) = layer.sparse.as_mut() {
+                sparse.attach_card(device, layer.kv_cache.max_seq_len_padded())?;
+            }
+        }
     }
     Ok(layer)
 }
@@ -2141,6 +2148,7 @@ fn build_awq_layer(
         graph_x_norm_attn_buffer: None,
         graph_ple_input_buffer: None,
         graph_ngram_rows: None,
+        graph_kv_cap: None,
         graph_attn_mask_added_buffer: None,
         graph_attn_softmax_buffer: None,
         graph_ffn_gate_out: None,
