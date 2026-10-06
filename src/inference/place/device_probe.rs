@@ -47,6 +47,22 @@ pub struct CudaGpuInfo {
     /// Memory bandwidth in GB/s (bus width x DDR memory clock), 0.0 when NVML
     /// lacks either figure. The hardware term a decode ceiling derives from.
     pub mem_bw_gbs: f64,
+    /// Bytes per second, in GB/s, the card's link to the host carries: the generation the
+    /// platform allows at the width the slot negotiated. 0.0 when NVML lacks either.
+    pub host_link_gbs: f64,
+}
+
+/// GB/s one PCIe lane of generation `generation` carries, after encoding.
+fn pcie_lane_gbs(generation: u32) -> f64 {
+    match generation {
+        1 => 0.25,
+        2 => 0.5,
+        3 => 0.985,
+        4 => 1.969,
+        5 => 3.938,
+        6 => 7.563,
+        _ => 0.0,
+    }
 }
 
 /// Enumerate every visible CUDA GPU via NVML, process-aware, sorted by compute
@@ -237,6 +253,15 @@ pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
                         let available = stable_free;
                         let sm_clock = gpu.max_clock_info(Clock::SM).unwrap_or(0);
                         let mem_bw_gbs = cuda_mem_bw_gbs(i);
+                        let host_link_gbs = match (
+                            gpu.max_pcie_link_gen().ok(),
+                            gpu.current_pcie_link_width().ok(),
+                        ) {
+                            (Some(generation), Some(width)) => {
+                                pcie_lane_gbs(generation) * width as f64
+                            }
+                            _ => 0.0,
+                        };
                         let num_cores = gpu.num_cores().unwrap_or(0);
                         // Throughput proxy: cores x clock. Falls back to clock
                         // alone if the core count is unavailable.
@@ -260,6 +285,7 @@ pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
                             perf_score,
                             total: mem.total,
                             mem_bw_gbs,
+                            host_link_gbs,
                         });
                     } else {
                         warn!("⚠️  NVML memory_info() failed for device {}", i);

@@ -267,6 +267,31 @@ impl HeteroPlan {
         gpu_runtime_reserve_bytes: u64,
         cached: bool,
     ) -> Option<Self> {
+        Self::calculate_host_experts_linked(
+            layers,
+            head_bytes,
+            cuda_devices,
+            kv_bytes_per_layer,
+            gpu_runtime_reserve_bytes,
+            cached,
+            &|_| None,
+        )
+    }
+
+    /// [`Self::calculate_host_experts`] with the speed of each card's link to the host, in GB/s,
+    /// given by `link`. The cards that keep a cache of the experts left on the host are filled
+    /// through that link when a miss is copied to a card: a card on a slower link holds as many
+    /// layers as it can hold whole, every expert cached, so that nothing is copied to it, and
+    /// the card on the fastest link takes the rest.
+    pub fn calculate_host_experts_linked(
+        layers: &[(u64, u64)],
+        head_bytes: u64,
+        cuda_devices: &[(usize, u64)],
+        kv_bytes_per_layer: u64,
+        gpu_runtime_reserve_bytes: u64,
+        cached: bool,
+        link: &dyn Fn(usize) -> Option<f64>,
+    ) -> Option<Self> {
         let total_layers = layers.len();
         if total_layers == 0 || layers.iter().all(|&(_, e)| e == 0) {
             return None;
@@ -318,6 +343,123 @@ impl HeteroPlan {
             }
             (next == total_layers).then_some(segments)
         };
+        // The same layers cut across the cards in proportion to their budgets, so that after the
+        // dense parts every card has the same room per layer for its cache of experts.
+        let spread = |from: usize| -> Option<Vec<HeteroSegment>> {
+            if budgets.len() < 2 {
+                return None;
+            }
+            // Cards on unequal links: the slowest take whole layers they can cache entirely.
+            let links: Option<Vec<f64>> = budgets.iter().map(|b| link(b.0)).collect();
+            if let Some(links) = links.filter(|l| l.iter().any(|&x| (x - l[0]).abs() > 1e-9 * l[0]))
+            {
+                let mut order: Vec<usize> = (0..budgets.len()).collect();
+                order.sort_by(|&a, &b| links[a].total_cmp(&links[b]));
+                let dense = |l: usize| {
+                    let (dense, experts) = layers[l];
+                    let own = if l >= from {
+                        dense
+                    } else {
+                        dense.saturating_add(experts)
+                    };
+                    own.saturating_add(kv_bytes_per_layer)
+                };
+                let whole = |l: usize| {
+                    layers[l]
+                        .0
+                        .saturating_add(layers[l].1)
+                        .saturating_add(kv_bytes_per_layer)
+                };
+                let mut segments = Vec::new();
+                let mut next = 0usize;
+                for (turn, &c) in order.iter().enumerate() {
+                    let (idx, budget) = budgets[c];
+                    let fastest = turn + 1 == order.len();
+                    let start = next;
+                    let mut used = 0u64;
+                    // Room beside the layers for the copies of a wide batch, as the plan's own reserve.
+                    let room = budget.saturating_sub(gpu_runtime_reserve_bytes);
+                    while next < total_layers
+                        && if fastest {
+                            used.saturating_add(dense(next)) <= budget
+                        } else {
+                            used.saturating_add(whole(next)) <= room
+                        }
+                    {
+                        used = used.saturating_add(if fastest { dense(next) } else { whole(next) });
+                        next += 1;
+                    }
+                    if fastest {
+                        // The head joins the card of the last layer.
+                        if next == total_layers && used.saturating_add(head_bytes) > budget {
+                            return None;
+                        }
+                    }
+                    if next > start {
+                        segments.push(HeteroSegment {
+                            kind: DeviceKind::Cuda(idx),
+                            layer_start: start,
+                            layer_end: next,
+                            free_memory_bytes: budget,
+                        });
+                    }
+                }
+                return (next == total_layers).then_some(segments);
+            }
+            let cost = |l: usize| {
+                let (dense, experts) = layers[l];
+                let own = if l >= from {
+                    dense
+                } else {
+                    dense.saturating_add(experts)
+                };
+                own.saturating_add(kv_bytes_per_layer)
+            };
+            let work = (0..total_layers).map(cost).fold(0u64, u64::saturating_add) as f64;
+            // What each card has beside its layers: the output head takes some of the last one.
+            let room = |rank: usize, budget: u64| {
+                let held = if rank + 1 == budgets.len() {
+                    head_bytes
+                } else {
+                    0
+                };
+                budget.saturating_sub(held) as f64
+            };
+            let capacity: f64 = budgets
+                .iter()
+                .enumerate()
+                .map(|(rank, b)| room(rank, b.1))
+                .sum();
+            let mut segments = Vec::new();
+            let (mut next, mut taken, mut offered) = (0usize, 0f64, 0f64);
+            for (rank, &(idx, budget)) in budgets.iter().enumerate() {
+                let last = rank + 1 == budgets.len();
+                offered += room(rank, budget);
+                let share = work * offered / capacity.max(1.0);
+                let start = next;
+                let mut used = 0u64;
+                while next < total_layers
+                    && used.saturating_add(cost(next)) <= budget
+                    && (last || taken + cost(next) as f64 / 2.0 <= share)
+                {
+                    used = used.saturating_add(cost(next));
+                    taken += cost(next) as f64;
+                    next += 1;
+                }
+                if next == total_layers && used.saturating_add(head_bytes) > budget {
+                    return None;
+                }
+                if next > start {
+                    segments.push(HeteroSegment {
+                        kind: DeviceKind::Cuda(idx),
+                        layer_start: start,
+                        layer_end: next,
+                        free_memory_bytes: budget,
+                    });
+                }
+            }
+            (next == total_layers).then_some(segments)
+        };
         let candidates: Vec<usize> = if cached {
             // Every expert on the cards when they fit, else none of them.
             vec![total_layers, 0]
@@ -325,8 +467,13 @@ impl HeteroPlan {
             (0..=total_layers).rev().collect()
         };
         candidates.into_iter().find_map(|from| {
-            // `from` counts down from every expert on the cards to none of them.
-            let segments = fill(from)?;
+            // `from` counts down from every expert on the cards to none of them. A cache of the
+            // experts left on the host is given room on every card.
+            let segments = if cached && from == 0 {
+                spread(from).or_else(|| fill(from))?
+            } else {
+                fill(from)?
+            };
             Some(HeteroPlan {
                 segments,
                 total_layers,
@@ -995,6 +1142,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cached.host_experts_from, Some(0));
+        // Both cards carry layers, each in proportion to its budget, so each has room for a
+        // cache.
+        let counts = |budgets: &[(usize, u64)], head: u64| -> Vec<usize> {
+            HeteroPlan::calculate_host_experts(&layers, head, budgets, 0, 0, true)
+                .unwrap()
+                .segments
+                .iter()
+                .map(|s| s.num_layers())
+                .collect()
+        };
+        assert_eq!(counts(&[(0, 5 * GB), (1, 5 * GB)], 0), vec![4, 4]);
+        assert_eq!(counts(&[(0, 6 * GB), (1, 2 * GB)], 0), vec![6, 2]);
+        // The head the last card holds leaves it room for fewer layers.
+        assert_eq!(counts(&[(0, 5 * GB), (1, 5 * GB)], 3 * GB), vec![6, 2]);
+        // Cards on unequal links: the slower holds as many whole layers as it can cache entirely
+        // and comes first, the faster takes the rest and the head.
+        let linked = HeteroPlan::calculate_host_experts_linked(
+            &layers,
+            GB,
+            &[(0, 5 * GB), (1, 5 * GB)],
+            0,
+            0,
+            true,
+            &|idx| Some(if idx == 0 { 12.0 } else { 3.5 }),
+        )
+        .unwrap();
+        let shape: Vec<(DeviceKind, usize)> = linked
+            .segments
+            .iter()
+            .map(|s| (s.kind, s.num_layers()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(DeviceKind::Cuda(1), 4), (DeviceKind::Cuda(0), 4)]
+        );
+        assert_eq!(linked.host_experts_from, Some(0));
         let fits =
             HeteroPlan::calculate_host_experts(&small, 0, &[(0, 5 * GB)], 0, 0, true).unwrap();
         assert_eq!(fits.host_experts_from, None);

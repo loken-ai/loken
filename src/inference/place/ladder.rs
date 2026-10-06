@@ -131,13 +131,14 @@ impl Demand {
         if !spills && !cached {
             return None;
         }
-        HeteroPlan::calculate_host_experts(
+        HeteroPlan::calculate_host_experts_linked(
             layers,
             self.head_bytes,
             cards,
             self.kv_bytes_per_layer,
             self.runtime_reserve,
             cached,
+            &card_link,
         )
         .filter(|plan| spills || plan.host_experts_from.is_some())
     }
@@ -160,7 +161,11 @@ impl Demand {
         bandwidth: impl Fn(usize) -> Option<f64>,
     ) -> HeteroPlan {
         let used = cards_of(&plan);
-        if used.len() != 2 || plan.segments.iter().any(|s| s.kind == DeviceKind::Cpu) {
+        // The arrangement below places whole layers: experts left on the host stay where they are.
+        if used.len() != 2
+            || plan.host_experts_from.is_some()
+            || plan.segments.iter().any(|s| s.kind == DeviceKind::Cpu)
+        {
             return plan;
         }
         let (Some(bw_a), Some(bw_b)) = (bandwidth(used[0]), bandwidth(used[1])) else {
@@ -330,6 +335,30 @@ fn card_bandwidth(idx: usize) -> Option<f64> {
             super::device_probe::probe_cuda_gpus()
                 .iter()
                 .map(|g| (g.index, g.mem_bw_gbs))
+                .collect()
+        })
+        .iter()
+        .find(|(i, _)| *i == idx)
+        .map(|(_, b)| *b)
+        .filter(|b| *b > 0.0)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = idx;
+        None
+    }
+}
+
+/// A card's link to the host in GB/s, read once: what the copies of experts to it are paced by.
+/// `None` where the driver does not say.
+fn card_link(idx: usize) -> Option<f64> {
+    #[cfg(feature = "cuda")]
+    {
+        static LINK: std::sync::OnceLock<Vec<(usize, f64)>> = std::sync::OnceLock::new();
+        LINK.get_or_init(|| {
+            super::device_probe::probe_cuda_gpus()
+                .iter()
+                .map(|g| (g.index, g.host_link_gbs))
                 .collect()
         })
         .iter()
