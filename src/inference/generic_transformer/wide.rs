@@ -359,17 +359,13 @@ impl GenericTransformerLayer {
         let (k_all, v_all) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
         let kv_len = k_all.dim(2)?;
         let rep = n_head / n_kv;
-        let spread = |t: Tensor| -> Result<Tensor> {
-            t.to_dtype(DType::F32)?
-                .unsqueeze(2)?
-                .broadcast_as((b, n_kv, rep, kv_len, hd))?
-                .reshape((b, n_head, kv_len, hd))
-        };
-        let (k_all, v_all) = (spread(k_all)?, spread(v_all)?);
+        // The heads of a group read the same keys and values: they stand as extra rows of one
+        // product per group, so the cache is read once and never repeated across its heads.
+        let (k_all, v_all) = (k_all.to_dtype(DType::F32)?, v_all.to_dtype(DType::F32)?);
         let scale = self
             .attention_scale
             .unwrap_or_else(|| 1.0 / (hd as f64).sqrt());
-        let q = q.to_dtype(DType::F32)?;
+        let q = q.to_dtype(DType::F32)?.contiguous()?;
         let k_t = k_all.transpose(2, 3)?;
         // The scores of a block of rows at a time: all of them at once is `heads x rows x kv_len`
         // floats, several times over, which a long chunk over a long cache cannot hold.
@@ -383,10 +379,15 @@ impl GenericTransformerLayer {
                     row[*t as usize] = 0.0;
                 }
             }
-            let bias = Tensor::from_vec(bias, (1, 1, rows, kv_len), &q.device())?;
-            let scores = (q.narrow(2, first, rows)?.matmul(&k_t)? * scale)?;
-            let probs = crate::tensor::ops::softmax_last_dim(&scores.broadcast_add(&bias)?)?;
-            parts.push(probs.matmul(&v_all)?);
+            let bias = Tensor::from_vec(bias, (1, 1, 1, rows, kv_len), &q.device())?;
+            let q_rows =
+                q.narrow(2, first, rows)?
+                    .contiguous()?
+                    .reshape((b, n_kv, rep * rows, hd))?;
+            let scores = (q_rows.matmul(&k_t)? * scale)?.reshape((b, n_kv, rep, rows, kv_len))?;
+            let probs = crate::tensor::ops::softmax_last_dim(&scores.broadcast_add(&bias)?)?
+                .reshape((b, n_kv, rep * rows, kv_len))?;
+            parts.push(probs.matmul(&v_all)?.reshape((b, n_head, rows, hd))?);
         }
         let y = if parts.len() == 1 {
             parts.remove(0)
