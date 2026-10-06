@@ -45,13 +45,14 @@ pub(super) fn dot_runs<B: Runs>(xs: &[B], ys: &[BlockQ8K]) -> f32 {
     total
 }
 
-/// Eight i32 sums of a run of thirty-two weights against thirty-two activation codes, the weights
-/// being magnitudes (`mags`, unsigned bytes) under sign bits: byte `i` of the run is negated when bit
-/// `i % 8` of byte `i / 8` of `signs` is set. The sign goes onto the activation, which leaves the
-/// magnitudes unsigned for the byte multiply. Lanes 0 to 3 hold the first sixteen values.
+/// Sixteen i16 sums of a run of thirty-two weights against thirty-two activation codes, each of two
+/// adjacent products, the weights being magnitudes (`mags`, unsigned bytes) under sign bits: byte `i`
+/// of the run is negated when bit `i % 8` of byte `i / 8` of `signs` is set. The sign goes onto the
+/// activation, which leaves the magnitudes unsigned for the byte multiply. A caller widens the sums
+/// under the run's scale with one `madd`, so that a block stays in integers until its end.
 #[cfg(target_feature = "avx2")]
 #[inline]
-pub(super) unsafe fn grid_run_sums(
+pub(super) unsafe fn grid_run_pairs(
     mags: std::arch::x86_64::__m256i,
     signs: u32,
     acts: &[i8],
@@ -74,8 +75,7 @@ pub(super) unsafe fn grid_run_sums(
         _mm256_set1_epi8(1),
     );
     let a = _mm256_loadu_si256(acts.as_ptr() as *const __m256i);
-    let pairs = _mm256_maddubs_epi16(mags, _mm256_sign_epi8(a, negate));
-    _mm256_madd_epi16(pairs, _mm256_set1_epi16(1))
+    _mm256_maddubs_epi16(mags, _mm256_sign_epi8(a, negate))
 }
 
 /// Sum of the eight float lanes.

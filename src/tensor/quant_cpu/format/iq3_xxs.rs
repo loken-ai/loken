@@ -64,10 +64,10 @@ impl BlockFormat for BlockIq3Xxs {
         #[cfg(target_feature = "avx2")]
         return unsafe {
             use std::arch::x86_64::*;
-            // The runs' sums stay in float lanes, scaled as they come, and are added across once.
+            // The runs' sums stay integers under their odd scales until the block ends.
             let mut total = _mm256_setzero_ps();
             for (x, y) in xs.iter().zip(ys) {
-                let mut block = _mm256_setzero_ps();
+                let mut block = _mm256_setzero_si256();
                 for ib in 0..QK_K / 32 {
                     let codes = _mm_loadl_epi64(x.qs[8 * ib..].as_ptr() as *const __m128i);
                     let mags = _mm256_i32gather_epi32(
@@ -80,11 +80,15 @@ impl BlockFormat for BlockIq3Xxs {
                     let signs = (0..4).fold(0u32, |acc, l| {
                         acc | (KSIGNS_IQ2XS[((word >> (7 * l)) & 127) as usize] as u32) << (8 * l)
                     });
-                    let sums = super::iq_read::grid_run_sums(mags, signs, &y.qs[32 * ib..]);
-                    let scale = _mm256_set1_ps(super::iq_read::Runs::run_scale(x, ib));
-                    block = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sums), scale, block);
+                    let pairs = super::iq_read::grid_run_pairs(mags, signs, &y.qs[32 * ib..]);
+                    let scale = _mm256_set1_epi16(2 * (word >> 28) as i16 + 1);
+                    block = _mm256_add_epi32(block, _mm256_madd_epi16(pairs, scale));
                 }
-                total = _mm256_fmadd_ps(block, _mm256_set1_ps(y.d), total);
+                total = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(block),
+                    _mm256_set1_ps(x.d.to_f32() * 0.25 * y.d),
+                    total,
+                );
             }
             super::iq_read::sum_ps(total)
         };

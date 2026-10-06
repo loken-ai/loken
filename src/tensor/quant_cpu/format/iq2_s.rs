@@ -71,8 +71,8 @@ impl BlockFormat for BlockIq2S {
             let mut total = _mm256_setzero_ps();
             for (x, y) in xs.iter().zip(ys) {
                 let signs_all = &x.qs[QK_K / 8..];
-                let d = x.d.to_f32();
-                let mut block = _mm256_setzero_ps();
+                // The runs' sums stay integers under their odd scales until the block ends.
+                let mut block = _mm256_setzero_si256();
                 for ib in 0..QK_K / 32 {
                     // Code `l` is its byte with bits `2l` and `2l + 1` of the run's high byte above it.
                     let low = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(i32::from_le_bytes(
@@ -95,16 +95,20 @@ impl BlockFormat for BlockIq2S {
                     );
                     let signs =
                         u32::from_le_bytes(signs_all[4 * ib..4 * ib + 4].try_into().unwrap());
-                    let sums = super::iq_read::grid_run_sums(mags, signs, &y.qs[32 * ib..]);
-                    // Two scales: the first sixteen values' lanes under one, the rest under the other.
+                    let pairs = super::iq_read::grid_run_pairs(mags, signs, &y.qs[32 * ib..]);
+                    // Two scales: the first sixteen values' pairs under one, the rest under the other.
                     let (lo, hi) = (x.scales[ib] & 0x0F, x.scales[ib] >> 4);
-                    let scale = _mm256_set_m128(
-                        _mm_set1_ps(d * (0.5 + hi as f32) * 0.25),
-                        _mm_set1_ps(d * (0.5 + lo as f32) * 0.25),
+                    let scale = _mm256_set_m128i(
+                        _mm_set1_epi16(2 * hi as i16 + 1),
+                        _mm_set1_epi16(2 * lo as i16 + 1),
                     );
-                    block = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sums), scale, block);
+                    block = _mm256_add_epi32(block, _mm256_madd_epi16(pairs, scale));
                 }
-                total = _mm256_fmadd_ps(block, _mm256_set1_ps(y.d), total);
+                total = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(block),
+                    _mm256_set1_ps(x.d.to_f32() * 0.125 * y.d),
+                    total,
+                );
             }
             super::iq_read::sum_ps(total)
         };
