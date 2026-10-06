@@ -8,6 +8,7 @@
 
 #include "../moe/gguf.cuh"
 #include "../moe/mxfp4_moe.cuh"
+#include "../moe/gguf_iq.cuh"
 
 #include <cstdint>
 #include <cstdio>
@@ -50,6 +51,11 @@
     X(Q5_K, 13,  QK_K,  QR5_K, QI5_K)          \
     X(Q6_K, 14,  QK_K,  QR6_K, QI6_K)          \
     X(Q8_K, 15,  QK_K,  1,     1)              \
+    X(IQ3_XXS, 18, QK_IQ3_XXS, 1, QI_IQ3_XXS)  \
+    X(IQ4_NL,  20, QK4_NL,     2, QI4_NL)      \
+    X(IQ3_S,   21, QK_IQ3_S,   1, QI_IQ3_S)    \
+    X(IQ2_S,   22, QK_IQ2_S,   1, QI_IQ2_S)    \
+    X(IQ4_XS,  23, QK_IQ4_XS,  1, QI_IQ4_XS)   \
     X(MXFP4, 39, QK_MXFP4, QR_MXFP4, QI_MXFP4)
 
 enum ggml_type {

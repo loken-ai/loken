@@ -247,6 +247,16 @@ static constexpr __host__ __device__ mmq_format mmq_format_of(const ggml_type ty
                                      {MMQ_TILE_NE_K*2, 1}, {MMQ_TILE_NE_K/QI5_K,   QI5_K},     {MMQ_TILE_NE_K/8, 8}};
         case GGML_TYPE_Q6_K: return {MMQ_Q8_1_DS_LAYOUT_D4,   MMQ_MMA_TILE_X_K_Q6_K,
                                      {MMQ_TILE_NE_K*2, 1}, {MMQ_TILE_NE_K/QI6_K,   QI6_K},     {MMQ_TILE_NE_K/8, 8}};
+        // The codebook formats. IQ4_NL is a 32-value block and tiles as MXFP4 does; the others
+        // are 256-value blocks that decode to signed bytes under integer sub-scales and a float
+        // per block, which is Q6_K's tile.
+        case GGML_TYPE_IQ4_NL: return {MMQ_Q8_1_DS_LAYOUT_D4, MMQ_MMA_TILE_X_K_Q8_0,
+                                     {MMQ_TILE_NE_K*2, 1}, {MMQ_TILE_NE_K*2/QI8_0, QI8_0/2},   {0, 0}};
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ2_S: return {MMQ_Q8_1_DS_LAYOUT_D4,  MMQ_MMA_TILE_X_K_Q6_K,
+                                     {MMQ_TILE_NE_K*2, 1}, {MMQ_TILE_NE_K/QI6_K,   QI6_K},     {MMQ_TILE_NE_K/8, 8}};
         default:             return {MMQ_Q8_1_DS_LAYOUT_D4,   0, {0, 0}, {0, 0}, {0, 0}};
     }
 }
@@ -583,6 +593,28 @@ struct plane_mxfp4 {
     static __device__ __forceinline__ float scale(const block * b) {
         return e8m0_to_float(b->e) * 0.5f;
     }
+};
+
+// IQ4_NL: a nibble per weight indexing a table of sixteen signed levels, under a half scale. The
+// same lookup as MXFP4's, with its own levels and no doubling to take back out.
+static __device__ const int8_t kvalues_iq4nl_aligned[16] __attribute__((aligned(16))) = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
+struct plane_iq4_nl {
+    using block = block_iq4_nl;
+    using scale_t = float;
+    static constexpr ggml_type type = GGML_TYPE_IQ4_NL;
+    static constexpr int qi = QI4_NL, qr = 2;
+    static constexpr bool dp4a_holds_halves = true;
+    static __device__ __forceinline__ void unpack(const block * b, const int j, int & lo,
+                                                  int & hi, int & raw) {
+        raw = four_bytes_bytewise(b->qs, j);
+        const int2 v = mxfp4_get_int_from_table_16(raw, kvalues_iq4nl_aligned);
+        lo = v.x;
+        hi = v.y;
+    }
+    static __device__ __forceinline__ float scale(const block * b) { return __half2float(b->d); }
 };
 
 template <typename plane, int mmq_y, bool need_check>
@@ -1854,6 +1886,137 @@ static __device__ __forceinline__ void vec_dot_q6_K_q8_1_dp4a(
 
 // -------------------------------------------------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------
+// The codebook formats with 256-value blocks.
+//
+// A weight is a grid magnitude with a sign bit, or a table level, under a scale that is a small
+// integer times a float stated once for the block: so each decodes to signed bytes, integer
+// sub-scales per 16 values and one float, which is exactly what Q6_K's tile holds and its two
+// dot products read. A format states its own sub-scales per 32 values or per 16; a 32-value
+// scale is stated twice.
+//
+// Int `p` of the tile row is the four weights 4p .. 4p+3 of the block, in order.
+
+/// The four bytes of `mags` negated where the matching bit of `signs` is set.
+static __device__ __forceinline__ int signed_quad(const uint32_t mags, const int signs) {
+    const uint32_t mask = ((signs & 1) ? 0x000000FFu : 0u) | ((signs & 2) ? 0x0000FF00u : 0u) |
+                          ((signs & 4) ? 0x00FF0000u : 0u) | ((signs & 8) ? 0xFF000000u : 0u);
+    return (int) __vsub4(mags ^ mask, mask);
+}
+
+static __device__ __forceinline__ uint32_t le_u32(const uint8_t * p) {
+    return (uint32_t) p[0] | ((uint32_t) p[1] << 8) | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+}
+
+struct codebook_iq3_s {
+    using block = block_iq3_s;
+    static __device__ __forceinline__ int quad(const block * b, const int p) {
+        const int run = p >> 3, l = (p & 7) >> 1, h = p & 1;
+        const uint32_t code = b->qs[p] | (((uint32_t) b->qh[run] << (8 - 2*l - h)) & 256u);
+        return signed_quad(IQ3S_GRID[code], (b->signs[4*run + l] >> (4*h)) & 15);
+    }
+    static __device__ __forceinline__ int sub_scale(const block * b, const int s) {
+        const int run = s >> 1;
+        const int n = (run % 2 == 0) ? (b->scales[run / 2] & 0x0F) : (b->scales[run / 2] >> 4);
+        return 1 + 2*n;
+    }
+    static __device__ __forceinline__ float block_scale(const block * b) { return __half2float(b->d); }
+};
+
+struct codebook_iq3_xxs {
+    using block = block_iq3_xxs;
+    static __device__ __forceinline__ int quad(const block * b, const int p) {
+        const int run = p >> 3, l = (p & 7) >> 1, h = p & 1;
+        const uint32_t word = le_u32(b->qs + 64 + 4*run);
+        const int signs = KSIGNS_IQ2XS[(word >> (7*l)) & 127];
+        return signed_quad(IQ3XXS_GRID[b->qs[p]], (signs >> (4*h)) & 15);
+    }
+    static __device__ __forceinline__ int sub_scale(const block * b, const int s) {
+        return 1 + 2 * (int) (le_u32(b->qs + 64 + 4*(s >> 1)) >> 28);
+    }
+    static __device__ __forceinline__ float block_scale(const block * b) {
+        return __half2float(b->d) * 0.25f;
+    }
+};
+
+struct codebook_iq2_s {
+    using block = block_iq2_s;
+    static __device__ __forceinline__ int quad(const block * b, const int p) {
+        const int entry = p >> 1, h = p & 1, run = entry >> 2, l = entry & 3;
+        const uint32_t code = b->qs[entry] | (((uint32_t) b->qh[run] << (8 - 2*l)) & 0x300u);
+        const uint32_t mags = (uint32_t) (IQ2S_GRID[code] >> (32*h));
+        return signed_quad(mags, (b->qs[32 + entry] >> (4*h)) & 15);
+    }
+    static __device__ __forceinline__ int sub_scale(const block * b, const int s) {
+        const int n = (s % 2 == 0) ? (b->scales[s >> 1] & 0x0F) : (b->scales[s >> 1] >> 4);
+        return 1 + 2*n;
+    }
+    static __device__ __forceinline__ float block_scale(const block * b) {
+        return __half2float(b->d) * 0.125f;
+    }
+};
+
+struct codebook_iq4_xs {
+    using block = block_iq4_xs;
+    static __device__ __forceinline__ int quad(const block * b, const int p) {
+        const int run = p >> 3, ip = p & 7;
+        const int2 v = mxfp4_get_int_from_table_16(
+            four_bytes_bytewise(b->qs + 16*run, ip & 3), kvalues_iq4nl_aligned);
+        return ip < 4 ? v.x : v.y;
+    }
+    static __device__ __forceinline__ int sub_scale(const block * b, const int s) {
+        const int run = s >> 1;
+        const int low  = (b->scales_l[run / 2] >> (4 * (run % 2))) & 0x0F;
+        const int high = (b->scales_h >> (2 * run)) & 3;
+        return (low | (high << 4)) - 32;
+    }
+    static __device__ __forceinline__ float block_scale(const block * b) { return __half2float(b->d); }
+};
+
+/// A codebook format into Q6_K's tile: the signed bytes, the block's float, and the sixteen
+/// sub-scales as four words.
+template <typename codebook, ggml_type type, int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_codebook(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max,
+    const int stride) {
+    using block = typename codebook::block;
+    using tile = mmq_tile<type, mmq_y>;
+
+    int * x_qs = tile::qs(x_tile);
+    float * x_df = tile::df(x_tile);
+    int * x_sc = tile::sc(x_tile);
+
+    // A lane writes two ints of the row: the tile row is 64 of them.
+    constexpr int lanes = MMQ_ITER_K / 8;
+    const int txi = threadIdx.x % lanes;
+
+    mmq_fill_rows<block, lanes, mmq_y, need_check>(x, kbx0, stride, i_max,
+        [&] (const int i, const block * bxi) {
+            int * row = x_qs + tile::qs_row(i);
+            row[txi]         = codebook::quad(bxi, txi);
+            row[txi + lanes] = codebook::quad(bxi, txi + lanes);
+        });
+
+    mmq_fill_rows<block, 1, mmq_y, need_check>(x, kbx0, stride, i_max,
+        [&] (const int i, const block * bxi) {
+            x_df[tile::df_row(i)] = codebook::block_scale(bxi);
+        });
+
+    constexpr int scale_words = MMQ_TILE_NE_K/8;
+
+    mmq_fill_rows<block, scale_words, mmq_y, need_check>(x, kbx0, stride, i_max,
+        [&] (const int i, const block * bxi) {
+            const int w = threadIdx.x % scale_words;
+            int word = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                word |= (codebook::sub_scale(bxi, 4*w + j) & 0xFF) << (8*j);
+            }
+            x_sc[tile::sc_row(i) + w] = word;
+        });
+}
+
+
 /// What one weight format contributes: a pass that fills a tile from its bytes, and the two
 /// dot products over that tile - one per multiply a card might have.
 ///
@@ -1942,6 +2105,28 @@ MMQ_FORMAT(GGML_TYPE_Q5_K,
            (vec_dot_q5_K_q8_1_dp4a<mmq_x, mmq_y>))
 MMQ_FORMAT(GGML_TYPE_Q6_K,
            (load_tiles_q6_K<mmq_y, need_check>),
+           (vec_dot_subblock_mma<mmq_subblock_scaled, mmq_x, mmq_y>),
+           (vec_dot_q6_K_q8_1_dp4a<mmq_x, mmq_y>))
+
+// The codebook formats: IQ4_NL as a nibble format, the 256-value ones in Q6_K's tile.
+MMQ_FORMAT(GGML_TYPE_IQ4_NL,
+           (load_tiles_paired<plane_iq4_nl, mmq_y, need_check>),
+           (vec_dot_blocked_mma<mmq_scale_only, mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>),
+           (vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>))
+MMQ_FORMAT(GGML_TYPE_IQ3_S,
+           (load_tiles_codebook<codebook_iq3_s, GGML_TYPE_IQ3_S, mmq_y, need_check>),
+           (vec_dot_subblock_mma<mmq_subblock_scaled, mmq_x, mmq_y>),
+           (vec_dot_q6_K_q8_1_dp4a<mmq_x, mmq_y>))
+MMQ_FORMAT(GGML_TYPE_IQ3_XXS,
+           (load_tiles_codebook<codebook_iq3_xxs, GGML_TYPE_IQ3_XXS, mmq_y, need_check>),
+           (vec_dot_subblock_mma<mmq_subblock_scaled, mmq_x, mmq_y>),
+           (vec_dot_q6_K_q8_1_dp4a<mmq_x, mmq_y>))
+MMQ_FORMAT(GGML_TYPE_IQ2_S,
+           (load_tiles_codebook<codebook_iq2_s, GGML_TYPE_IQ2_S, mmq_y, need_check>),
+           (vec_dot_subblock_mma<mmq_subblock_scaled, mmq_x, mmq_y>),
+           (vec_dot_q6_K_q8_1_dp4a<mmq_x, mmq_y>))
+MMQ_FORMAT(GGML_TYPE_IQ4_XS,
+           (load_tiles_codebook<codebook_iq4_xs, GGML_TYPE_IQ4_XS, mmq_y, need_check>),
            (vec_dot_subblock_mma<mmq_subblock_scaled, mmq_x, mmq_y>),
            (vec_dot_q6_K_q8_1_dp4a<mmq_x, mmq_y>))
 

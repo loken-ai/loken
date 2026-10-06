@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+
+- Experts: tensor-core kernels for the IQ formats and q2_0, integer sums on the host.
+
 ### Changed
 
 - Build: a CUDA kernel recompiles only when its own sources change.

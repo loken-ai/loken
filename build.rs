@@ -404,10 +404,14 @@ fn compile_mmq_kernels() {
         "cuda/mmq_gguf/mmq_instance_q5_k.cu",
         "cuda/mmq_gguf/mmq_instance_q6_k.cu",
         "cuda/mmq_gguf/mmq_instance_mxfp4.cu",
+        "cuda/mmq_gguf/mmq_instance_iq4_nl.cu",
+        "cuda/mmq_gguf/mmq_instance_iq3_s.cu",
+        "cuda/mmq_gguf/mmq_instance_iq3_xxs.cu",
+        "cuda/mmq_gguf/mmq_instance_iq2_s.cu",
+        "cuda/mmq_gguf/mmq_instance_iq4_xs.cu",
     ];
     println!("cargo:rerun-if-changed=cuda/mmq_gguf");
 
-    let src_newest = kernel_src_newest();
     // The instance files are heavy template expansions (~20s each)  -
     // compile them in parallel.
     let handles: Vec<std::thread::JoinHandle<PathBuf>> = sources

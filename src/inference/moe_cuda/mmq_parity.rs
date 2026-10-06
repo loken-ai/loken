@@ -169,6 +169,61 @@ impl Block {
         }
     }
 
+    /// A block whose stacks are random blocks of a format that cannot be quantised from floats:
+    /// the scale is fixed and the codes are random, which every code of these formats allows.
+    #[allow(clippy::too_many_arguments)]
+    fn build_from_blocks(
+        dev: &Device,
+        rng: &mut Lcg,
+        dtype: GgmlDType,
+        tokens: usize,
+        topk: usize,
+        e: usize,
+        hidden: usize,
+        inter: usize,
+    ) -> Self {
+        const SCALE_F16: [u8; 2] = [0x00, 0x24]; // 2^-6
+        let mut stack = |rows: usize, k: usize| -> Arc<QTensor> {
+            let blocks = e * rows * (k / dtype.block_size());
+            let mut data: Vec<u8> = (0..blocks * dtype.type_size())
+                .map(|_| (rng.next() * 256.0) as u8)
+                .collect();
+            for block in data.chunks_exact_mut(dtype.type_size()) {
+                block[..2].copy_from_slice(&SCALE_F16);
+            }
+            Arc::new(QTensor::from_ggml_bytes(dtype, &data, vec![e, rows, k], dev).unwrap())
+        };
+        let gate = stack(inter, hidden);
+        let up = stack(inter, hidden);
+        let down = stack(hidden, inter);
+        let xs = random(rng, tokens * hidden, 1.0);
+        let (slots, experts, weights) = routing(rng, tokens, topk, e);
+        let m = slots.len();
+        Self {
+            gate_up: gate.clone(),
+            gate,
+            up,
+            down,
+            x: Tensor::from_vec(xs.clone(), (tokens, hidden), dev).unwrap(),
+            slots: Tensor::from_vec(slots.clone(), m, dev).unwrap(),
+            experts: Tensor::from_vec(experts.clone(), m, dev).unwrap(),
+            choices: {
+                let mut c = vec![0u32; m];
+                for (&pair, &e) in slots.iter().zip(&experts) {
+                    c[pair as usize] = e;
+                }
+                Tensor::from_vec(c, (tokens, topk), dev).unwrap()
+            },
+            weights: Tensor::from_vec(weights.clone(), m, dev).unwrap(),
+            host: (xs, slots, experts, weights),
+            tokens,
+            topk,
+            e,
+            hidden,
+            inter,
+        }
+    }
+
     fn mmq(&self, fused: bool, tile: i32) -> Vec<f32> {
         let plan = MmqRouting::new(&self.slots, &self.experts, self.topk, self.e)
             .unwrap()
@@ -382,6 +437,38 @@ fn the_expert_batched_swiglu_oai_block_agrees_with_the_decode_kernels() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// The codebook formats through the expert-batched tile kernels, judged as the others are: no
+/// further from the float answer over the dequantised weights than the decode kernels are.
+#[test]
+fn the_expert_batched_matmul_serves_the_codebook_formats() {
+    let Some(dev) = card("the codebook formats are") else {
+        return;
+    };
+    let mut rng = Lcg(23);
+    let mut failures = Vec::new();
+    for dtype in [
+        GgmlDType::Iq4Nl,
+        GgmlDType::Iq4Xs,
+        GgmlDType::Iq3Xxs,
+        GgmlDType::Iq3S,
+        GgmlDType::Iq2S,
+    ] {
+        for &(tokens, topk, e) in &[(45usize, 6usize, 16usize), (300, 8, 32)] {
+            let b = Block::build_from_blocks(&dev, &mut rng, dtype, tokens, topk, e, 512, 256);
+            let want = b.float();
+            let decode = gap(&want, &b.decode());
+            let mmq = gap(&want, &b.mmq(false, 0));
+            if mmq > 1.25 * decode + 0.005 {
+                failures.push(format!(
+                    "{dtype:?} tokens={tokens} topk={topk} E={e}: {mmq} from the float answer, \
+                     the decode kernels {decode}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Kernel times on a qwen3-coder shaped layer (128 experts, 8 per token, 2048 hidden, 768
 /// intermediate), the expert-batched path against the decode kernels, per format and tile
 /// width. Run with `--ignored --nocapture`.
@@ -471,6 +558,85 @@ fn expert_batched_matmul_timings() {
                     "{dtype:?} tokens={tokens:>5} tile={tile:>3}: decode gate_up {dec_gu:8.3} ms \
                      down {dec_dn:8.3} ms | mmq gate_up {mmq_gu:8.3} ms down {mmq_dn:8.3} ms \
                      plan {mmq_plan:6.3} ms"
+                );
+            }
+        }
+    }
+}
+
+/// Kernel times of the expert-batched path on the low-bit formats of a wide mixture (256
+/// experts, ten per token, 2560 hidden, 640 intermediate), per format, token count and tile
+/// width, with the rate the int8 tensor cores would have to sustain. Run with `--ignored
+/// --nocapture`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn low_bit_expert_batched_timings() {
+    let Some(dev) = card("the timings are") else {
+        return;
+    };
+    let cuda = dev.as_cuda_device().unwrap();
+    let (e, topk, hidden, inter) = (256usize, 10usize, 2560usize, 640usize);
+    let mut rng = Lcg(5);
+    let time = |f: &dyn Fn()| -> f64 {
+        f();
+        cuda.synchronize().unwrap();
+        let reps = 3;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            f();
+        }
+        cuda.synchronize().unwrap();
+        t0.elapsed().as_secs_f64() * 1e3 / reps as f64
+    };
+    // Random blocks with a zero scale: the arithmetic and the loads are those of real weights.
+    let stack = |dtype: GgmlDType, rows: usize, k: usize, rng: &mut Lcg| -> QTensor {
+        let bytes = e * rows * (k / dtype.block_size()) * dtype.type_size();
+        let mut data: Vec<u8> = (0..bytes).map(|_| (rng.next() * 256.0) as u8).collect();
+        for block in data.chunks_exact_mut(dtype.type_size()) {
+            block[0] = 0;
+            block[1] = 0;
+        }
+        QTensor::from_ggml_bytes(dtype, &data, vec![e, rows, k], &dev).unwrap()
+    };
+    for dtype in [
+        GgmlDType::Iq2S,
+        GgmlDType::Iq3S,
+        GgmlDType::Iq3Xxs,
+        GgmlDType::Iq4Nl,
+    ] {
+        let gate = stack(dtype, inter, hidden, &mut rng);
+        let up = stack(dtype, inter, hidden, &mut rng);
+        // The intermediate width is not a multiple of a 256-wide block: a down stack is 32-wide.
+        let down = stack(GgmlDType::Iq4Nl, hidden, inter, &mut rng);
+        for tokens in [512usize, 2048] {
+            let x = Tensor::from_vec(
+                random(&mut rng, tokens * hidden, 1.0),
+                (tokens, hidden),
+                &dev,
+            )
+            .unwrap();
+            let (slots, experts, weights) = routing(&mut rng, tokens, topk, e);
+            let m = slots.len();
+            let slots = Tensor::from_vec(slots, m, &dev).unwrap();
+            let experts = Tensor::from_vec(experts, m, &dev).unwrap();
+            let weights = Tensor::from_vec(weights, m, &dev).unwrap();
+            for tile in [0i32, 32, 64, 128] {
+                let plan = MmqRouting::new(&slots, &experts, topk, e)
+                    .unwrap()
+                    .with_tile_width(tile);
+                let h = plan.gate_up_silu(&x, &gate, Some(&up)).unwrap();
+                let gu = time(&|| {
+                    plan.gate_up_silu(&x, &gate, Some(&up)).unwrap();
+                });
+                let dn = time(&|| {
+                    plan.down_fold(&h, &down, &weights, None).unwrap();
+                });
+                let flops = (m * hidden * inter * 2) as f64;
+                println!(
+                    "{dtype:?} tokens={tokens:>5} tile={tile:>3}: gate_up {gu:8.3} ms ({:.1} TOPS over two matmuls) \
+                     down(iq4_nl) {dn:8.3} ms ({:.1} TOPS)",
+                    2.0 * flops / (gu * 1e-3) / 1e12,
+                    flops / (dn * 1e-3) / 1e12
                 );
             }
         }

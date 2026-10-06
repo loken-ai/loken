@@ -258,54 +258,83 @@ mmq_formats! {
     Q6K   => 256, launch_mmq_quantize_q8_1_D4,    launch_mmq_gguf_q6_k,  launch_mmq_moe_gguf_q6_k;
 }
 
+/// The formats only a mixture stores, which have no dense entry point: each is declared once
+/// here, with the expert-batched launcher built for it and the block it quantises its
+/// activation by.
 #[cfg(feature = "cuda")]
-extern "C" {
-    fn launch_mmq_moe_gguf_mxfp4(
-        x: *const std::ffi::c_void,
-        y: *const std::ffi::c_void,
-        dst: *mut std::ffi::c_void,
-        expert_bounds: *const i32,
-        ids_dst: *const i32,
-        stride_expert_x: i64,
-        ncols_x: i64,
-        nrows_x: i64,
-        ncols_y: i64,
-        stride_row_x: i64,
-        stride_col_dst: i64,
-        n_experts: i32,
-        ncols_max: i64,
-        ncols_hint: i64,
-        mmq_x: i32,
-        cc: i32,
-        smpbo: i64,
-        warp_size: i32,
-        stream: *mut std::ffi::c_void,
-    ) -> i32;
+macro_rules! expert_only_formats {
+    ($($dtype:ident => $launcher:ident;)+) => {
+        #[cfg(feature = "cuda")]
+        extern "C" {
+            $(fn $launcher(
+                x: *const std::ffi::c_void,
+                y: *const std::ffi::c_void,
+                dst: *mut std::ffi::c_void,
+                expert_bounds: *const i32,
+                ids_dst: *const i32,
+                stride_expert_x: i64,
+                ncols_x: i64,
+                nrows_x: i64,
+                ncols_y: i64,
+                stride_row_x: i64,
+                stride_col_dst: i64,
+                n_experts: i32,
+                ncols_max: i64,
+                ncols_hint: i64,
+                mmq_x: i32,
+                cc: i32,
+                smpbo: i64,
+                warp_size: i32,
+                stream: *mut std::ffi::c_void,
+            ) -> i32;)+
+        }
+
+        /// The expert-batched launcher of a format only mixtures store.
+        #[cfg(feature = "cuda")]
+        fn expert_only_launcher(dtype: GgmlDType) -> Option<MmqMoeLauncher> {
+            match dtype {
+                $(GgmlDType::$dtype => Some($launcher),)+
+                _ => None,
+            }
+        }
+    };
+}
+
+#[cfg(feature = "cuda")]
+expert_only_formats! {
+    MxFp4  => launch_mmq_moe_gguf_mxfp4;
+    Iq4Nl  => launch_mmq_moe_gguf_iq4_nl;
+    Iq4Xs  => launch_mmq_moe_gguf_iq4_xs;
+    Iq3Xxs => launch_mmq_moe_gguf_iq3_xxs;
+    Iq3S   => launch_mmq_moe_gguf_iq3_s;
+    Iq2S   => launch_mmq_moe_gguf_iq2_s;
 }
 
 /// Whether an expert-batched tile kernel exists for this weight format: every format the
-/// table above serves, and MXFP4, which only mixtures store and so has no dense entry point.
+/// table above serves, and the formats only mixtures store, which have no dense entry point.
 #[cfg(feature = "cuda")]
 pub(crate) fn mmq_moe_supports(dtype: GgmlDType) -> bool {
-    mmq_supports(dtype) || dtype == GgmlDType::MxFp4
+    mmq_supports(dtype) || expert_only_launcher(dtype).is_some()
 }
 
 /// Values per block of an expert stack of `dtype`.
 #[cfg(feature = "cuda")]
 pub(crate) fn mmq_moe_qk(dtype: GgmlDType) -> usize {
-    match dtype {
-        GgmlDType::MxFp4 => dtype.block_size(),
-        other => mmq_qk(other),
+    if expert_only_launcher(dtype).is_some() {
+        dtype.block_size()
+    } else {
+        mmq_qk(dtype)
     }
 }
 
-/// The activation quantiser an expert stack of `dtype` reads: MXFP4 is symmetric, one scale
-/// per 32 values.
+/// The activation quantiser an expert stack of `dtype` reads: the formats only mixtures store
+/// are symmetric, one scale per 32 values.
 #[cfg(feature = "cuda")]
 pub(crate) fn mmq_moe_quantize_launcher(dtype: GgmlDType) -> Result<MmqQuantizeLauncher> {
-    match dtype {
-        GgmlDType::MxFp4 => Ok(launch_mmq_quantize_q8_1_D4),
-        other => mmq_quantize_launcher(other),
+    if expert_only_launcher(dtype).is_some() {
+        Ok(launch_mmq_quantize_q8_1_D4)
+    } else {
+        mmq_quantize_launcher(dtype)
     }
 }
 
@@ -313,8 +342,8 @@ pub(crate) fn mmq_moe_quantize_launcher(dtype: GgmlDType) -> Result<MmqQuantizeL
 /// activation columns in one launch.
 #[cfg(feature = "cuda")]
 pub(crate) fn mmq_moe_launcher(dtype: GgmlDType) -> Result<MmqMoeLauncher> {
-    match dtype {
-        GgmlDType::MxFp4 => Ok(launch_mmq_moe_gguf_mxfp4),
-        other => mmq_moe_launcher_listed(other),
+    match expert_only_launcher(dtype) {
+        Some(launcher) => Ok(launcher),
+        None => mmq_moe_launcher_listed(dtype),
     }
 }
