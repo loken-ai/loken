@@ -61,7 +61,12 @@ impl BlockFormat for BlockQ2_0 {
         }
     }
 
+    /// Each block's integer sum is exact, and the blocks join in order as the scalar loop joins
+    /// them, so the result is the scalar's to the bit.
+    #[allow(unreachable_code)]
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
+        #[cfg(target_feature = "avx2")]
+        return unsafe { dot_blocks(xs, ys) };
         Self::dot_scalar(xs, ys)
     }
 
@@ -78,5 +83,83 @@ impl BlockFormat for BlockQ2_0 {
                 dot as f32 * x.d.to_f32() * y.d
             })
             .sum()
+    }
+}
+
+/// The dot of whole blocks with the four codes of each byte unpacked into the activation's order
+/// and multiplied as unsigned codes by signed bytes; the offset of one level is taken off with
+/// the activation's own sum.
+#[cfg(target_feature = "avx2")]
+unsafe fn dot_blocks(xs: &[BlockQ2_0], ys: &[BlockQ8_64]) -> f32 {
+    use std::arch::x86_64::*;
+    let mask = _mm_set1_epi8(3);
+    let ones8 = _mm_set1_epi8(1);
+    let ones16 = _mm_set1_epi16(1);
+    let mut total = 0f32;
+    for (x, y) in xs.iter().zip(ys) {
+        let bytes = _mm_loadu_si128(x.qs.as_ptr() as *const __m128i);
+        let plane0 = _mm_and_si128(bytes, mask);
+        let plane1 = _mm_and_si128(_mm_srli_epi16(bytes, 2), mask);
+        let plane2 = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+        let plane3 = _mm_and_si128(_mm_srli_epi16(bytes, 6), mask);
+        // Code `4i + k` is plane `k` of byte `i`: interleave the planes back into that order.
+        let low01 = _mm_unpacklo_epi8(plane0, plane1);
+        let high01 = _mm_unpackhi_epi8(plane0, plane1);
+        let low23 = _mm_unpacklo_epi8(plane2, plane3);
+        let high23 = _mm_unpackhi_epi8(plane2, plane3);
+        let codes = [
+            _mm_unpacklo_epi16(low01, low23),
+            _mm_unpackhi_epi16(low01, low23),
+            _mm_unpacklo_epi16(high01, high23),
+            _mm_unpackhi_epi16(high01, high23),
+        ];
+        let acts = y.qs.as_ptr() as *const __m128i;
+        let mut sum = _mm_setzero_si128();
+        let mut act_sum = _mm_setzero_si128();
+        for (i, code) in codes.iter().enumerate() {
+            let a = _mm_loadu_si128(acts.add(i));
+            sum = _mm_add_epi32(sum, _mm_madd_epi16(_mm_maddubs_epi16(*code, a), ones16));
+            act_sum = _mm_add_epi32(act_sum, _mm_madd_epi16(_mm_maddubs_epi16(ones8, a), ones16));
+        }
+        let horizontal = |v: __m128i| {
+            let v = _mm_hadd_epi32(v, v);
+            _mm_cvtsi128_si32(_mm_hadd_epi32(v, v))
+        };
+        let dot = horizontal(sum) - horizontal(act_sum);
+        total += dot as f32 * x.d.to_f32() * y.d;
+    }
+    total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The vector dot gives the scalar dot to the bit, whatever the codes and the activations.
+    #[test]
+    fn the_vector_dot_is_the_scalar_dot() {
+        let mut state = 12345u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) as u8
+        };
+        for blocks in [1usize, 2, 5, 40] {
+            let mut xs = vec![BlockQ2_0::zeros(); blocks];
+            let mut ys = vec![BlockQ8_64::zeros(); blocks];
+            for x in &mut xs {
+                x.d = f16::from_f32(0.01 * (next() as f32 + 1.0));
+                x.qs.iter_mut().for_each(|b| *b = next());
+            }
+            for y in &mut ys {
+                y.d = 0.003 * (next() as f32 + 1.0);
+                y.qs.iter_mut().for_each(|q| *q = next() as i8);
+            }
+            // The extremes of the activation codes, where a saturating add would show.
+            ys[0].qs[0] = -128;
+            ys[0].qs[1] = 127;
+            let want = BlockQ2_0::dot_scalar(&xs, &ys);
+            let got = BlockQ2_0::dot(&xs, &ys);
+            assert_eq!(got.to_bits(), want.to_bits(), "{blocks} blocks");
+        }
     }
 }
