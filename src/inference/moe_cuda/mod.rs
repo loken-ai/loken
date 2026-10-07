@@ -94,6 +94,11 @@ cuda_launchers! {
     loken_fused_conv_silu_f16in(
         qkv: *const c_void, conv_state: *const f32, w: *const f32, out: *mut f32,
         new_conv_state: *mut f32, c: i32, seq: i32, k: i32);
+    loken_gdn_prep(qkv: *const c_void, window: *mut f32, w: *const f32, alpha: *const c_void,
+        beta_in: *const c_void, a_log: *const f32, dt_bias: *const f32, q_out: *mut f32,
+        k_out: *mut f32, v_out: *mut f32, g_out: *mut f32, beta_out: *mut f32,
+        new_window: *mut f32, kg: i32, kd: i32, vg: i32, vd: i32, k: i32, tiled: i32,
+        eps: f32, in_f16: i32);
     loken_deltanet_gate_f16in(
         alpha: *const c_void, beta_in: *const c_void, a_log: *const f32,
         dt_bias: *const f32, g_pre: *mut f32, beta: *mut f32, n: i32, h: i32);
@@ -121,6 +126,10 @@ cuda_launchers! {
     loken_hc_low(down: *const f32, low: *mut f32, n: i32, s: i32);
     loken_hc_mean_gate(xn: *const f32, up: *const f32, mixed: *mut c_void, rows: i32, s: i32,
         d: i32, out_f16: i32);
+    loken_hc_down_inject(xn: *const f32, down: *const f32, inject: *const f32, low: *mut f32,
+        inj: *mut f32, rows: i32, k: i32, r: i32, i: i32, s: i32);
+    loken_hc_up_mean(xn: *const f32, up: *const f32, low: *const f32, mixed: *mut c_void,
+        rows: i32, s: i32, d: i32, r: i32, out_f16: i32);
     loken_hc_combine(r: *const f32, out: *const c_void, inject: *const f32, r_new: *mut f32,
         xn: *mut f32, gamma: *const f32, groups: i32, s: i32, d: i32, eps: f32,
         out_f16: i32);

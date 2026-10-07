@@ -74,6 +74,8 @@ pub struct QuantizedActivation {
     ordinal: usize,
     /// The activation's dimensions before `k`.
     lead: Vec<usize>,
+    /// The type the activation was in, and so the type each product comes back in.
+    dtype: crate::tensor::DType,
 }
 
 /// Quantized matmul over the production kernels: holds the GGML block
@@ -554,17 +556,39 @@ impl QKernelMatMul {
             return Ok(None);
         };
         let rows = x.elem_count() / self.k;
+        let dtype = x.dtype();
         if !self.takes_matvec(qdev, rows)
-            || x.dtype() != crate::tensor::DType::F32
+            || !matches!(
+                dtype,
+                crate::tensor::DType::F32 | crate::tensor::DType::F16 | crate::tensor::DType::BF16
+            )
             || x.dims().last() != Some(&self.k)
         {
             return Ok(None);
         }
-        let (x_slice, dev) = x.cuda_f32_slice()?;
-        if dev.ordinal() != qdev.ordinal() {
-            return Ok(None);
-        }
-        let q81 = crate::tensor::cuda::quantize_q8_1_rows(qdev, x_slice, self.k, rows)?;
+        let q81 = match dtype {
+            crate::tensor::DType::F32 => {
+                let (x_slice, dev) = x.cuda_f32_slice()?;
+                if dev.ordinal() != qdev.ordinal() {
+                    return Ok(None);
+                }
+                crate::tensor::cuda::quantize_q8_1_rows(qdev, x_slice, self.k, rows)?
+            }
+            crate::tensor::DType::F16 => {
+                let (x_slice, dev) = x.cuda_f16_slice()?;
+                if dev.ordinal() != qdev.ordinal() {
+                    return Ok(None);
+                }
+                crate::tensor::cuda::quantize_q8_1_rows_f16(qdev, x_slice, self.k, rows)?
+            }
+            _ => {
+                let (x_slice, dev) = x.cuda_bf16_slice()?;
+                if dev.ordinal() != qdev.ordinal() {
+                    return Ok(None);
+                }
+                crate::tensor::cuda::quantize_q8_1_rows_bf16(qdev, x_slice, self.k, rows)?
+            }
+        };
         let lead = x.dims()[..x.dims().len() - 1].to_vec();
         Ok(Some(QuantizedActivation {
             q81,
@@ -572,6 +596,7 @@ impl QKernelMatMul {
             rows,
             ordinal: qdev.ordinal(),
             lead,
+            dtype,
         }))
     }
 
@@ -596,8 +621,45 @@ impl QKernelMatMul {
         let mut odims = a.lead.clone();
         odims.push(self.n);
         let tag = self.kernel_tag()?;
-        self.mmvq_f32_rows(qdev, blob, tag, &a.q81, a.rows, odims)
-            .map(Some)
+        let decode_order = a.rows > 1 && DecodeOrder::active();
+        let smallk = a.rows == 1 && self.smallk_single(self.k);
+        let (k, n, rows) = (self.k, self.n, a.rows);
+        let (storage, device) = match a.dtype {
+            crate::tensor::DType::F16 => {
+                let y = if decode_order {
+                    crate::tensor::cuda::mmvq_decode_order::<half::f16>(
+                        qdev,
+                        tag,
+                        "f16",
+                        blob,
+                        &a.q81,
+                        k,
+                        n,
+                        rows,
+                        self.smallk_single(k),
+                    )?
+                } else {
+                    crate::tensor::cuda::mmvq_f16(qdev, tag, blob, &a.q81, k, n, rows, smallk)?
+                };
+                (crate::tensor::cuda::CudaStorage::F16(y), qdev.clone())
+            }
+            crate::tensor::DType::BF16 => {
+                let y = if decode_order {
+                    crate::tensor::cuda::mmvq_decode_order::<half::bf16>(
+                        qdev, tag, "bf16", blob, &a.q81, k, n, rows, false,
+                    )?
+                } else {
+                    crate::tensor::cuda::mmvq_bf16(qdev, tag, blob, &a.q81, k, n, rows)?
+                };
+                (crate::tensor::cuda::CudaStorage::BF16(y), qdev.clone())
+            }
+            _ => {
+                return self
+                    .mmvq_f32_rows(qdev, blob, tag, &a.q81, a.rows, odims)
+                    .map(Some)
+            }
+        };
+        crate::tensor::Tensor::from_cuda_storage(storage, device, odims).map(Some)
     }
 
     /// Whether `forward` serves `rows` F32 activation rows with the mat-vec kernels.

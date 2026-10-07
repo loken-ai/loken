@@ -51,6 +51,7 @@ cuda/moe/gated_delta_net.cu	12.8%	5	llama.cpp/ggml/src/ggml-cuda/gated_delta_net
 cuda/moe/gguf.cuh	3.5%	10	candle/candle-kernels/src/quantized.cu
 cuda/moe/gguf_iq.cuh	0.0%	0	-
 cuda/moe/head_rmsnorm.cu	0.0%	0	-
+cuda/moe/gdn_prep.cu	0.0%	0	-
 cuda/moe/hyper_residual.cu	0.0%	0	-
 cuda/moe/indexer.cu	0.0%	0	-
 cuda/moe/iq_tables.cuh	0.0%	0	-

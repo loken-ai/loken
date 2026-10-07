@@ -107,12 +107,35 @@ impl HyperMixer {
     /// [`Self::combine_on_card`] turns into `2 sigmoid(. / streams)`.
     #[cfg(feature = "cuda")]
     pub fn mix_on_card(&self, xn: &Tensor, f16_out: bool) -> Result<(Tensor, Option<Tensor>)> {
-        use crate::inference::moe_cuda::{hc_low, hc_mean_gate};
+        use crate::inference::moe_cuda::{hc_low, hc_mean_gate, hc_mix_fused};
+        if let (Some(down), Some(up)) = (self.down.dense(), self.up.dense()) {
+            let inject = self.inject.as_ref().map(|w| w.dense());
+            if inject.as_ref().is_none_or(|w| w.is_some()) {
+                let inject = inject.flatten();
+                if let Some(done) =
+                    hc_mix_fused(xn, down, up, inject, self.streams, self.dim, f16_out)?
+                {
+                    return Ok(done);
+                }
+            }
+        }
         let low = hc_low(&self.down.forward(xn)?, self.streams)?;
         let up = self.up.forward(&low)?;
         let mixed = hc_mean_gate(xn, &up, self.streams, self.dim, f16_out)?;
         let inject = self.inject.as_ref().map(|w| w.forward(xn)).transpose()?;
         Ok((mixed, inject))
+    }
+
+    /// The `down` weight as a dense tensor, for a test of the fused launches.
+    #[cfg(all(feature = "cuda", test))]
+    pub(super) fn down_dense(&self) -> Option<&Tensor> {
+        self.down.dense()
+    }
+
+    /// The `up` weight as a dense tensor, for a test of the fused launches.
+    #[cfg(all(feature = "cuda", test))]
+    pub(super) fn up_dense(&self) -> Option<&Tensor> {
+        self.up.dense()
     }
 
     /// Streams the mixer mixes.

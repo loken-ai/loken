@@ -156,7 +156,7 @@ impl GenericTransformerLayer {
         ) else {
             return Ok(None);
         };
-        if !x.device().is_cuda() || x.dtype() != crate::tensor::DType::F32 {
+        if !x.device().is_cuda() {
             return Ok(None);
         }
         let Some(a) = wq.quantize_for_matvec(&x.contiguous()?)? else {

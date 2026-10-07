@@ -26,6 +26,15 @@ impl QMatMul {
         }
     }
 
+    /// The weight as a dense tensor, when this projection holds one: what a fused launch reads
+    /// without going through a matrix product.
+    pub fn dense(&self) -> Option<&Tensor> {
+        match self {
+            Self::Tensor(w) => Some(w),
+            _ => None,
+        }
+    }
+
     /// Where the weight lives.
     ///
     /// A caller attaching something alongside a projection - an adapter delta - has

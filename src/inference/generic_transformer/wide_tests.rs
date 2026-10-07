@@ -523,6 +523,82 @@ fn the_fused_card_stages_match_the_tensor_ops() {
     );
 }
 
+/// The mixer of a decode step runs as two launches for one row and for a short batch, and gives
+/// what the tensor ops give; a longer chunk takes the stage-by-stage chain and gives it too.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn the_fused_mixer_matches_the_tensor_ops_for_a_decode_step() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let model = toy_on(Some(0));
+    let card = model.layers[0].cos.device();
+    let n = ids(&v, "b.ids").len();
+    let r = Tensor::from_vec(f32s(&v, "b.layer1_out"), (1, n, 256), &Device::Cpu)
+        .unwrap()
+        .to_device(&card)
+        .unwrap();
+    let hc = model.layers[1].hyper.as_ref().unwrap();
+    let flat = |t: &Tensor| {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    for rows in [1, 3, n] {
+        let r = r.narrow(1, 0, rows).unwrap();
+        let (want, want_inj) = hc.attn.mix(&r).unwrap();
+        let xn = hc.attn.normed_on_card(&r).unwrap();
+        let (got, got_inj) = hc.attn.mix_on_card(&xn, false).unwrap();
+        assert!(
+            max_diff(&flat(&got), &flat(&want)) < 1e-4,
+            "{rows} rows: input"
+        );
+        let s = hc.attn.streams() as f64;
+        let weights =
+            (crate::tensor::ops::sigmoid(&(got_inj.unwrap() / s).unwrap()).unwrap() * 2.0).unwrap();
+        assert!(
+            max_diff(&flat(&weights), &flat(&want_inj.unwrap())) < 1e-5,
+            "{rows} rows: write-back weights"
+        );
+    }
+    let (down, up) = (hc.attn.down_dense().unwrap(), hc.attn.up_dense().unwrap());
+    let xn = hc.attn.normed_on_card(&r.narrow(1, 0, 1).unwrap()).unwrap();
+    let fused = crate::inference::moe_cuda::hc_mix_fused(
+        &xn,
+        down,
+        up,
+        None,
+        hc.attn.streams(),
+        hc.attn.dim(),
+        false,
+    )
+    .unwrap();
+    assert!(
+        fused.is_some_and(|(_, inj)| inj.is_none()),
+        "one row takes the launches"
+    );
+    let long = hc.attn.normed_on_card(&r).unwrap();
+    let past = crate::inference::moe_cuda::hc_mix_fused(
+        &long,
+        down,
+        up,
+        None,
+        hc.attn.streams(),
+        hc.attn.dim(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        past.is_some(),
+        n <= crate::inference::moe_cuda::FUSED_MIX_MAX_ROWS
+    );
+}
+
 /// A mixer handed more rows than its block works on them block by block and gives, row for row,
 /// what it gives when it takes them all at once: every operation of the mixer is per row.
 #[test]

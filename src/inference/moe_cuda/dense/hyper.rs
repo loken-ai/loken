@@ -6,7 +6,7 @@
 use super::*;
 
 /// Device address of an F32 or F16 tensor's first element.
-fn addr<T: crate::tensor::kernel_ffi::CudaDType>(t: &Tensor, what: &str) -> Result<u64> {
+pub(super) fn addr<T: crate::tensor::kernel_ffi::CudaDType>(t: &Tensor, what: &str) -> Result<u64> {
     let (st, layout) = t.storage_and_layout();
     match &*st {
         StorageView::Cuda(c) => {
@@ -118,6 +118,126 @@ pub fn hc_mean_gate(
         }
         tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(out, dev.clone()), shape)
     }
+}
+
+/// Most rows a step may carry for [`hc_mix_fused`]: a decode step or a short verify batch. A
+/// longer chunk reads each weight once for all its rows in a matrix product instead.
+pub const FUSED_MIX_MAX_ROWS: usize = 4;
+
+/// A dense F32 weight `[n, k]` that is contiguous on a card, or `None`.
+fn dense_rows(w: &Tensor, n: Option<usize>, k: usize) -> Option<usize> {
+    let [rows, cols] = w.dims() else { return None };
+    (w.dtype() == DType::F32
+        && w.device().is_cuda()
+        && w.is_contiguous()
+        && *cols == k
+        && n.is_none_or(|n| n == *rows))
+    .then_some(*rows)
+}
+
+/// The mixer of a decode step in two launches: `down` and `inject` together, then `up` with the
+/// gated mean over the streams. Returns the sublayer input `[1, rows, dim]` (F16 when `f16_out`)
+/// and the raw write-back weights `[1, rows, streams]`; `None` when the weights or the step are
+/// not of the shapes the launches take, and the caller runs the stage-by-stage chain.
+pub fn hc_mix_fused(
+    xn: &Tensor,
+    down: &Tensor,
+    up: &Tensor,
+    inject: Option<&Tensor>,
+    streams: usize,
+    dim: usize,
+    f16_out: bool,
+) -> Result<Option<(Tensor, Option<Tensor>)>> {
+    let k = streams * dim;
+    let rows = xn.elem_count() / k.max(1);
+    if rows == 0 || rows > FUSED_MIX_MAX_ROWS || xn.dtype() != DType::F32 || !xn.is_contiguous() {
+        return Ok(None);
+    }
+    let Some(rank) = dense_rows(down, None, k) else {
+        return Ok(None);
+    };
+    if dense_rows(up, Some(k), rank).is_none() {
+        return Ok(None);
+    }
+    let heads = match inject {
+        Some(w) => match dense_rows(w, None, k) {
+            Some(n) => n,
+            None => return Ok(None),
+        },
+        None => 0,
+    };
+    let dev = xn.device().as_cuda_device()?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    let low = unsafe { dev.alloc::<f32>(rows * rank) }?;
+    let inj = unsafe { dev.alloc::<f32>((rows * heads).max(1)) }?;
+    let xn_p = addr::<f32>(xn, "xn")? as *const f32;
+    let down_p = addr::<f32>(down, "down")? as *const f32;
+    let up_p = addr::<f32>(up, "up")? as *const f32;
+    let inj_w = match inject {
+        Some(w) => addr::<f32>(w, "inject")? as *const f32,
+        None => std::ptr::null(),
+    };
+    let low_p = low.device_ptr(low.stream()).0;
+    unsafe {
+        loken_hc_down_inject(
+            xn_p,
+            down_p,
+            inj_w,
+            low_p as *mut f32,
+            inj.device_ptr(inj.stream()).0 as *mut f32,
+            rows as i32,
+            k as i32,
+            rank as i32,
+            heads as i32,
+            streams as i32,
+            stream,
+        );
+    }
+    let shape = crate::tensor::Shape::from((1, rows, dim));
+    let mixed = if f16_out {
+        let out = unsafe { dev.alloc::<half::f16>(rows * dim) }?;
+        unsafe {
+            loken_hc_up_mean(
+                xn_p,
+                up_p,
+                low_p as *const f32,
+                out.device_ptr(out.stream()).0 as *mut c_void,
+                rows as i32,
+                streams as i32,
+                dim as i32,
+                rank as i32,
+                1,
+                stream,
+            );
+        }
+        tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(out, dev.clone()), shape)?
+    } else {
+        let out = unsafe { dev.alloc::<f32>(rows * dim) }?;
+        unsafe {
+            loken_hc_up_mean(
+                xn_p,
+                up_p,
+                low_p as *const f32,
+                out.device_ptr(out.stream()).0 as *mut c_void,
+                rows as i32,
+                streams as i32,
+                dim as i32,
+                rank as i32,
+                0,
+                stream,
+            );
+        }
+        tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(out, dev.clone()), shape)?
+    };
+    let injected = if heads == 0 {
+        None
+    } else {
+        Some(tensor_from_cuda_storage(
+            CudaStorage::wrap_cuda_slice(inj, dev.clone()),
+            crate::tensor::Shape::from((1, rows, heads)),
+        )?)
+    };
+    Ok(Some((mixed, injected)))
 }
 
 /// `r + out (x) 2 sigmoid(inject / streams)` over `r` `[rows, streams * dim]`, with `inject`

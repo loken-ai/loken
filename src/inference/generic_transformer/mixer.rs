@@ -859,16 +859,22 @@ impl GatedDeltaNet {
                 z,
                 alpha,
                 beta,
-            } => Ok((
-                qkv.forward(x)?,
-                z.forward(x)?,
-                alpha.forward(x)?,
-                beta.forward(x)?,
-            )),
+            } => {
+                let mut out = QMatMul::forward_shared(&[qkv, z, alpha, beta], x)?.into_iter();
+                match (out.next(), out.next(), out.next(), out.next()) {
+                    (Some(qkv), Some(z), Some(alpha), Some(beta)) => Ok((qkv, z, alpha, beta)),
+                    _ => crate::tensor::bail!("a delta-net projection returned fewer outputs"),
+                }
+            }
             DeltaProj::Ba { qkv, z, ba } => {
                 // One group per key head, its betas ahead of its alphas.
                 let per = nv / d.k_heads.max(1);
-                let ba = ba.forward(x)?;
+                let mut shared = QMatMul::forward_shared(&[ba, qkv, z], x)?.into_iter();
+                let (Some(ba), Some(qkv_out), Some(z_out)) =
+                    (shared.next(), shared.next(), shared.next())
+                else {
+                    crate::tensor::bail!("a delta-net projection returned fewer outputs")
+                };
                 let mut lead = ba.dims().to_vec();
                 lead.pop();
                 let mut grouped = lead.clone();
@@ -884,7 +890,7 @@ impl GatedDeltaNet {
                     .narrow(D::Minus1, per, per)?
                     .contiguous()?
                     .reshape(flat)?;
-                Ok((qkv.forward(x)?, z.forward(x)?, alpha, beta))
+                Ok((qkv_out, z_out, alpha, beta))
             }
         }
     }
@@ -1055,39 +1061,76 @@ impl GatedDeltaNet {
         if prepping {
             let _ = dev.synchronize();
         }
-        let (c, conv) = match k::fused_conv_silu_f16in(&qkv, &conv, &self.conv_w, d.conv_kernel)? {
-            Some(out) => out,
-            None => k::fused_conv_silu(
-                &qkv.to_dtype(DType::F32)?,
+        let fused = if seq == 1 {
+            k::gdn_prep(
+                &qkv,
                 &conv,
                 &self.conv_w,
-                d.conv_kernel,
-            )?,
-        };
-        let conv = conv.reshape((1, d.conv_dim(), d.conv_kernel - 1))?;
-        let q = c
-            .narrow(D::Minus1, 0, qk)?
-            .reshape((seq, kg, kd))?
-            .contiguous()?;
-        let key = c
-            .narrow(D::Minus1, qk, qk)?
-            .reshape((seq, kg, kd))?
-            .contiguous()?;
-        let v = c
-            .narrow(D::Minus1, 2 * qk, vd * vg)?
-            .reshape((seq, vg, vd))?
-            .contiguous()?;
-        let q = k::l2norm_gqa(&q, kg, kd, rep, d.v_heads_tiled, 1e-6)?;
-        let key = k::l2norm_gqa(&key, kg, kd, rep, d.v_heads_tiled, 1e-6)?;
-        let (alpha, beta) = (alpha.reshape((seq, vg))?, beta.reshape((seq, vg))?);
-        let (g, beta) = match k::deltanet_gate_f16in(&alpha, &beta, &self.a, &self.dt_bias)? {
-            Some(out) => out,
-            None => k::deltanet_gate(
-                &alpha.to_dtype(DType::F32)?,
-                &beta.to_dtype(DType::F32)?,
+                &alpha,
+                &beta,
                 &self.a,
                 &self.dt_bias,
-            )?,
+                k::GdnShape {
+                    k_heads: kg,
+                    k_dim: kd,
+                    v_heads: vg,
+                    v_dim: vd,
+                    taps: d.conv_kernel,
+                    tiled: d.v_heads_tiled,
+                    eps: 1e-6,
+                },
+            )?
+        } else {
+            None
+        };
+        let (q, key, v, g, beta, conv) = match fused {
+            Some(p) => (
+                p.q,
+                p.k,
+                p.v,
+                p.g,
+                p.beta,
+                p.window.reshape((1, d.conv_dim(), d.conv_kernel - 1))?,
+            ),
+            None => {
+                let (c, conv) =
+                    match k::fused_conv_silu_f16in(&qkv, &conv, &self.conv_w, d.conv_kernel)? {
+                        Some(out) => out,
+                        None => k::fused_conv_silu(
+                            &qkv.to_dtype(DType::F32)?,
+                            &conv,
+                            &self.conv_w,
+                            d.conv_kernel,
+                        )?,
+                    };
+                let conv = conv.reshape((1, d.conv_dim(), d.conv_kernel - 1))?;
+                let q = c
+                    .narrow(D::Minus1, 0, qk)?
+                    .reshape((seq, kg, kd))?
+                    .contiguous()?;
+                let key = c
+                    .narrow(D::Minus1, qk, qk)?
+                    .reshape((seq, kg, kd))?
+                    .contiguous()?;
+                let v = c
+                    .narrow(D::Minus1, 2 * qk, vd * vg)?
+                    .reshape((seq, vg, vd))?
+                    .contiguous()?;
+                let q = k::l2norm_gqa(&q, kg, kd, rep, d.v_heads_tiled, 1e-6)?;
+                let key = k::l2norm_gqa(&key, kg, kd, rep, d.v_heads_tiled, 1e-6)?;
+                let (alpha, beta) = (alpha.reshape((seq, vg))?, beta.reshape((seq, vg))?);
+                let (g, beta) = match k::deltanet_gate_f16in(&alpha, &beta, &self.a, &self.dt_bias)?
+                {
+                    Some(out) => out,
+                    None => k::deltanet_gate(
+                        &alpha.to_dtype(DType::F32)?,
+                        &beta.to_dtype(DType::F32)?,
+                        &self.a,
+                        &self.dt_bias,
+                    )?,
+                };
+                (q, key, v, g, beta, conv)
+            }
         };
         let s = s.reshape((vg, vd, kd))?.contiguous()?;
         let scale = (1.0 / (kd as f64).sqrt()) as f32;

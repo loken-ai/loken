@@ -18,6 +18,8 @@ mod hyper;
 pub use hyper::*;
 mod indexer;
 pub use indexer::*;
+mod gdn;
+pub use gdn::*;
 
 thread_local! {
     static IN_PLACE_STATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

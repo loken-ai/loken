@@ -423,6 +423,15 @@ impl QMatMul {
         }
     }
 
+    /// The weight as a dense tensor when it is held as one and carries no adapter: what a fused
+    /// launch reads in place of the projection.
+    pub fn dense(&self) -> Option<&Tensor> {
+        match &self.inner {
+            QMatMulKind::Gguf(inner) if self.lora.is_empty() => inner.dense(),
+            _ => None,
+        }
+    }
+
     pub fn from_qtensor(qtensor: QTensor) -> Result<Self> {
         let inner = crate::tensor::quantized::QMatMul::from_qtensor(qtensor)?;
         Ok(Self {
@@ -706,6 +715,29 @@ impl QMatMul {
             Some(k) => k.quantize_for_matvec(xs),
             None => Ok(None),
         }
+    }
+
+    /// The projections `ws` of one input `xs`, each as its own `forward` gives it, with the
+    /// input quantised once when every weight takes the mat-vec kernels.
+    #[cfg(feature = "cuda")]
+    pub fn forward_shared(ws: &[&QMatMul], xs: &Tensor) -> Result<Vec<Tensor>> {
+        if xs.device().is_cuda() && ws.len() > 1 {
+            if let Some(a) = ws[0].quantize_for_matvec(&xs.contiguous()?)? {
+                let shared: Result<Vec<Option<Tensor>>> =
+                    ws.iter().map(|w| w.forward_quantized(&a)).collect();
+                let shared = shared?;
+                if shared.iter().all(Option::is_some) {
+                    return Ok(shared.into_iter().flatten().collect());
+                }
+            }
+        }
+        ws.iter().map(|w| w.forward(xs)).collect()
+    }
+
+    /// [`Self::forward_shared`] on a build with no cards: each projection on its own.
+    #[cfg(not(feature = "cuda"))]
+    pub fn forward_shared(ws: &[&QMatMul], xs: &Tensor) -> Result<Vec<Tensor>> {
+        ws.iter().map(|w| w.forward(xs)).collect()
     }
 
     /// `forward` over an activation [`Self::quantize_for_matvec`] produced, bit-identical to
@@ -1015,5 +1047,69 @@ mod lora_tests {
             w.cpu_raw().is_none(),
             "the raw weight would omit the adapter"
         );
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod shared_input_tests {
+    use super::*;
+    use crate::tensor::quantized::GgmlDType;
+    use crate::tensor::Device;
+
+    fn weight(n: usize, k: usize, salt: usize, dev: &Device) -> QMatMul {
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| (((i * 2654435761usize + salt * 131) >> 6) % 2001) as f32 / 4000.0 - 0.25)
+            .collect();
+        let w = Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap();
+        QMatMul::from_qtensor(QTensor::quantize_onto(&w, GgmlDType::Q4K, dev).unwrap()).unwrap()
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// Projections of one input over one quantisation of it are bit-identical to each
+    /// projection on its own, in the input's own type.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn projections_over_one_quantisation_match_their_own_forwards() {
+        let dev = Device::new_cuda(0).expect("a card for the card test");
+        let k = 512;
+        let ws = [
+            weight(256, k, 1, &dev),
+            weight(64, k, 2, &dev),
+            weight(32, k, 3, &dev),
+            weight(8, k, 4, &dev),
+        ];
+        let refs: Vec<&QMatMul> = ws.iter().collect();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for rows in [1usize, 3] {
+                let x: Vec<f32> = (0..rows * k)
+                    .map(|i| (((i * 40503usize) >> 3) % 1999) as f32 / 1000.0 - 1.0)
+                    .collect();
+                let x = Tensor::from_vec(x, (1, rows, k), &Device::Cpu)
+                    .unwrap()
+                    .to_device(&dev)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let shared = QMatMul::forward_shared(&refs, &x).unwrap();
+                for (w, got) in ws.iter().zip(&shared) {
+                    let own = w.forward(&x).unwrap();
+                    assert_eq!(got.dtype(), own.dtype(), "{dtype:?} x {rows}: type");
+                    assert_eq!(bits(got), bits(&own), "{dtype:?} x {rows}: values");
+                }
+            }
+        }
     }
 }
