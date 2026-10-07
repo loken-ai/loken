@@ -422,10 +422,14 @@ pub(crate) struct PldCost {
     round: Option<(f64, f64)>,
     /// Plain steps left before a round is tried again after a losing one.
     hold: u32,
+    /// The run of plain steps the next losing round holds the lookup off for.
+    backoff: u32,
 }
 
-/// Plain steps between the trials of a lookup whose rounds were losing.
+/// Plain steps between the trials of a lookup whose rounds were losing, doubled at each trial
+/// that loses again, up to [`PLD_RETRY_MAX`], and restored by a round that wins.
 const PLD_RETRY_STEPS: u32 = 48;
+const PLD_RETRY_MAX: u32 = 1536;
 
 impl PldCost {
     fn blend(old: Option<f64>, new: f64) -> f64 {
@@ -449,8 +453,12 @@ impl PldCost {
             Self::blend(Some(t), tokens as f64),
         ));
         if let (Some(plain), Some((s, t))) = (self.plain, self.round) {
+            let held = self.backoff.max(PLD_RETRY_STEPS);
             if t / s.max(f64::EPSILON) < plain.recip() {
-                self.hold = PLD_RETRY_STEPS;
+                self.hold = held;
+                self.backoff = (held * 2).min(PLD_RETRY_MAX);
+            } else {
+                self.backoff = PLD_RETRY_STEPS;
             }
         }
     }
@@ -542,16 +550,41 @@ mod tests {
         c.plain_step(0.040);
         c.round(0.180, 6);
         assert!(c.worth_trying(), "33 tokens a second against 25");
-        for _ in 0..8 {
-            c.round(0.180, 2);
-        }
-        assert!(!c.worth_trying(), "11 tokens a second against 25");
-        for _ in 0..PLD_RETRY_STEPS - 1 {
-            c.plain_step(0.040);
+        // Rounds that commit 2 tokens in 0.18 s lose: 11 tokens a second against 25. The lookup
+        // is held off for a run of plain steps, and each trial that loses holds it off twice as
+        // long as the last.
+        let mut held = PLD_RETRY_STEPS;
+        for trial in 0..3 {
+            // The first losses have to outweigh the round that won: the cost is smoothed.
+            let rounds = if trial == 0 { 12 } else { 1 };
+            for _ in 0..rounds {
+                if c.worth_trying() {
+                    c.round(0.180, 2);
+                }
+            }
             assert!(!c.worth_trying());
+            for _ in 0..held - 1 {
+                c.plain_step(0.040);
+                assert!(!c.worth_trying());
+            }
+            c.plain_step(0.040);
+            assert!(c.worth_trying(), "tried again after the run of plain steps");
+            held *= 2;
         }
-        c.plain_step(0.040);
-        assert!(c.worth_trying(), "tried again after the run of plain steps");
+        // A round that wins restores the short wait.
+        for _ in 0..12 {
+            c.round(0.100, 8);
+        }
+        for _ in 0..12 {
+            if c.worth_trying() {
+                c.round(0.180, 2);
+            }
+        }
+        assert!(!c.worth_trying());
+        for _ in 0..PLD_RETRY_STEPS {
+            c.plain_step(0.040);
+        }
+        assert!(c.worth_trying(), "the wait is the short one again");
     }
 
     #[test]

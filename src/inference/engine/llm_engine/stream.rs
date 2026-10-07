@@ -2279,6 +2279,19 @@ impl LlmEngine {
                 }
             }
 
+            if let Some((routed, hits)) = model_state
+                .blocking_lock()
+                .as_ref()
+                .and_then(|s| s.model.expert_cache_counters())
+            {
+                if routed > 0 {
+                    info!(
+                        "📊 Expert cache: {:.1}% of {} routed experts were on the card since the load",
+                        100.0 * hits as f64 / routed as f64,
+                        routed
+                    );
+                }
+            }
             if pld_stats_drafted > 0 {
                 let accept_rate = pld_stats_accepted as f64 / pld_stats_drafted as f64;
                 info!(

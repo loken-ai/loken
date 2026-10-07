@@ -1104,6 +1104,49 @@ impl LayerTier {
         Ok(out)
     }
 
+    /// A prompt's routing through this layer, `ids` `[rows, k]`, warms the cache before the first
+    /// token is decoded: the experts the prompt used are ranked into the heat, below what a
+    /// decoded token's use earns, and those of them that are now in the transit room, hottest first,
+    /// take the slots of the colder ones by copies on the card. The layer's whole stack is in the
+    /// room while a wide batch runs through it, so the copies cost no transfer over the link.
+    pub(super) fn keep_hottest_of_prompt(
+        &self,
+        ids: &Tensor,
+        stream: &Arc<cudarc::driver::CudaStream>,
+    ) -> Result<()> {
+        if self.stage.is_none() || self.resident {
+            return Ok(());
+        }
+        let ids_h: Vec<u32> = ids
+            .to_dtype(crate::tensor::DType::U32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let mut count = vec![0f32; self.n_experts];
+        for &e in &ids_h {
+            count[e as usize] += 1.0;
+        }
+        // The prompt ranks the experts but must not outweigh what the decode finds it needs: the
+        // hottest expert of the batch starts at the heat of one use, and a heat the decode has
+        // already earned is kept.
+        let top = count.iter().copied().fold(0f32, f32::max).max(1.0);
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            for (h, c) in st.heat.iter_mut().zip(&count) {
+                *h = h.max(c / top);
+            }
+        }
+        // Only experts the cache lacks can take a slot: one it holds is already in the cache.
+        let present: Vec<u32> = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (0..self.n_experts as u32)
+                .filter(|&e| count[e as usize] > 0.0 && st.slot_of[e as usize] < 0)
+                .collect()
+        };
+        let mut in_use = vec![false; self.slots()];
+        self.keep_in_transit(&present, &mut in_use, stream)
+    }
+
     /// Move the experts of `experts` that are in the transit room, hottest first, into the slots
     /// that hold something colder and are not read by this token, as copies on the card behind the
     /// token's own work: a kernel that reads a slot later is queued after its copy. `in_use` marks
@@ -2044,6 +2087,84 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A wide batch warms the cache with the experts it used: afterwards every slot holds one,
+    /// and a decoded token reads the right blocks from them.
+    #[test]
+    fn a_wide_batch_warms_the_cache_with_the_experts_it_used() {
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
+        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
+        let mut tiered = layer(&card, experts, used, hidden, ffn);
+        let widest = [0, 1, 2].map(|i| {
+            [
+                tiered.gate_exps_sep.as_ref().unwrap(),
+                tiered.up_exps_sep.as_ref().unwrap(),
+                &tiered.down_exps,
+            ][i]
+                .native_qtensor()
+                .data()
+                .len()
+        });
+        let stager = CardStager::new(&card, widest).unwrap();
+        let slots = 6;
+        let tier = LayerTier::new(&tiered, &card, slots)
+            .unwrap()
+            .with_stage(&stager, 0, false)
+            .unwrap();
+        let rows = 1520usize;
+        assert!(tier.stream_pays(rows, used));
+        let before = tier.counters().2;
+        tiered.tier = Some(Arc::new(tier));
+        let tier = tiered.tier.clone().unwrap();
+        let x = values(rows * hidden, 55, 1.0);
+        let on_card = Tensor::from_vec(x, (1, rows, hidden), &card).unwrap();
+        tiered
+            .forward(&on_card, &on_card, hidden, 1e-5, true)
+            .unwrap();
+        tier.settle();
+        let held = (0..experts).filter(|&e| tier.resident(e)).count();
+        assert_eq!(held, slots, "every slot holds an expert");
+        assert!(
+            tier.counters().2 > before,
+            "no expert the batch used took the place of a colder one"
+        );
+        // A token whose experts are in the cache gives what the host gives.
+        for token in 0..8usize {
+            let row = values(hidden, 200 + token as u64, 1.0);
+            let on_host = Tensor::from_vec(row.clone(), (1, 1, hidden), &Device::Cpu).unwrap();
+            let on_card = Tensor::from_vec(row, (1, 1, hidden), &card).unwrap();
+            let want = reference
+                .forward(&on_host, &on_host, hidden, 1e-5, false)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let got = tiered
+                .forward(&on_card, &on_card, hidden, 1e-5, false)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 2e-2 * peak,
+                "token {token}: max diff {worst} of {peak}"
+            );
+        }
+        let (_, hits, _) = tier.counters();
+        assert!(hits > 0, "the warmed cache served no expert");
     }
 
     /// The same, in the formats of a real file and at the row counts where the expert-batched

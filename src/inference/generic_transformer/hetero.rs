@@ -1215,6 +1215,23 @@ impl GenericHeteroTransformer {
         crate::inference::place::Placement { cards, host_layers }
     }
 
+    /// Routed experts looked up in the layers' expert caches since the load, and how many of
+    /// them a card held; `None` when no layer has such a cache.
+    pub fn expert_cache_counters(&self) -> Option<(u64, u64)> {
+        let mut total = (0u64, 0u64);
+        let mut any = false;
+        for tier in self
+            .layers
+            .iter()
+            .filter_map(|l| l.moe.as_ref()?.tier.as_ref())
+        {
+            let (routed, hits, _) = tier.counters();
+            total = (total.0 + routed, total.1 + hits);
+            any = true;
+        }
+        any.then_some(total)
+    }
+
     pub fn kv_len(&self) -> Option<usize> {
         // A recurrent layer keeps no cache: the first attending layer holds the length.
         let l = self

@@ -471,6 +471,12 @@ pub(crate) trait ModelBackend: Send {
         None
     }
 
+    /// Routed experts looked up in the cards' expert caches since the load, and how many of them
+    /// a card held: `None` for a model with no such cache.
+    fn expert_cache_counters(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Where the model's layers run, when the backend can say.
     fn placement(&self) -> Option<crate::inference::place::Placement> {
         None
@@ -1410,6 +1416,10 @@ impl ModelBackend for GenericBackend {
 
     fn kv_len(&self) -> Option<usize> {
         self.0.kv_len()
+    }
+
+    fn expert_cache_counters(&self) -> Option<(u64, u64)> {
+        self.0.expert_cache_counters()
     }
 
     fn placement(&self) -> Option<crate::inference::place::Placement> {

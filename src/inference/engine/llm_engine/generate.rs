@@ -1580,6 +1580,15 @@ impl LlmEngine {
                 );
             }
 
+            if let Some((routed, hits)) = state.model.expert_cache_counters() {
+                if routed > 0 {
+                    info!(
+                        "📊 Expert cache: {:.1}% of {} routed experts were on the card since the load",
+                        100.0 * hits as f64 / routed as f64,
+                        routed
+                    );
+                }
+            }
             // Prompt-lookup speculative decoding stats.
             if pld_stats_drafted > 0 {
                 let accept_rate = pld_stats_accepted as f64 / pld_stats_drafted as f64;

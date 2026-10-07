@@ -31,6 +31,14 @@ impl LayerTier {
         crate::tensor::bail!("an expert cache lives on a card")
     }
 
+    pub(super) fn keep_hottest_of_prompt(&self, _: &Tensor, _: &()) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn counters(&self) -> (u64, u64, u64) {
+        (0, 0, 0)
+    }
+
     pub fn stream_pays(&self, _rows: usize, _used: usize) -> bool {
         false
     }

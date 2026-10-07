@@ -760,6 +760,14 @@ impl MoeWeights {
                     Some(stacks),
                 )
             });
+            // The experts the batch used warm the cache the decode will read.
+            #[cfg(feature = "cuda")]
+            if let Ok(card) = dev.as_cuda_device() {
+                let stream = card.0.stream().clone();
+                if let Err(e) = tier.keep_hottest_of_prompt(&topk_ids, &stream) {
+                    tracing::warn!("the cache is not warmed from the prompt: {e}");
+                }
+            }
             tier.release_stacks()?;
             out?
         } else if let Some(tier) = self
