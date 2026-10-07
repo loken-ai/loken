@@ -31,7 +31,8 @@ pub struct GdnShape {
 }
 
 /// Convolution with SiLU, the window advance, the L2 norms and head copies, and the gates, for
-/// one token: `qkv` `[1, conv_dim]`, `alpha` and `beta_in` `[1, v_heads]`, all F16 or all F32.
+/// `rows` tokens: `qkv` `[rows, conv_dim]`, `alpha` and `beta_in` `[rows, v_heads]`, all F16 or all
+/// F32; several rows need the window advanced in place.
 /// `Ok(None)` when the inputs are not of the types or shapes the launch takes.
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_prep(
@@ -55,6 +56,12 @@ pub fn gdn_prep(
         eps,
     } = shape;
     let conv_dim = 2 * kg * kd + vg * vd;
+    // A row after the first reads the window the row before it left, so the window is
+    // advanced where it lies; the rows then see what the same tokens decoded one at a time do.
+    let rows = qkv.elem_count() / conv_dim.max(1);
+    if rows == 0 {
+        return Ok(None);
+    }
     let f16 = match qkv.dtype() {
         DType::F16 => true,
         DType::F32 => false,
@@ -71,9 +78,10 @@ pub fn gdn_prep(
         || taps > MAX_TAPS
         || kg == 0
         || vg % kg != 0
-        || qkv.elem_count() != conv_dim
-        || alpha.elem_count() != vg
-        || beta_in.elem_count() != vg
+        || qkv.elem_count() != rows * conv_dim
+        || alpha.elem_count() != rows * vg
+        || beta_in.elem_count() != rows * vg
+        || (rows > 1 && !super::in_place_state_on())
         || window.elem_count() != conv_dim * (taps - 1)
         || conv_w.elem_count() != conv_dim * taps
         || !qkv.is_contiguous()
@@ -84,11 +92,11 @@ pub fn gdn_prep(
     }
     let dev = qkv.device().as_cuda_device()?;
     let in_place = super::in_place_state_on();
-    let q = unsafe { dev.alloc::<f32>(vg * kd) }?;
-    let k = unsafe { dev.alloc::<f32>(vg * kd) }?;
-    let v = unsafe { dev.alloc::<f32>(vg * vd) }?;
-    let g = unsafe { dev.alloc::<f32>(vg) }?;
-    let beta = unsafe { dev.alloc::<f32>(vg) }?;
+    let q = unsafe { dev.alloc::<f32>(rows * vg * kd) }?;
+    let k = unsafe { dev.alloc::<f32>(rows * vg * kd) }?;
+    let v = unsafe { dev.alloc::<f32>(rows * vg * vd) }?;
+    let g = unsafe { dev.alloc::<f32>(rows * vg) }?;
+    let beta = unsafe { dev.alloc::<f32>(rows * vg) }?;
     let fresh = if in_place {
         None
     } else {
@@ -109,34 +117,42 @@ pub fn gdn_prep(
         )
     };
     let stream = dev.cuda_stream().cu_stream() as i64;
-    unsafe {
-        loken_gdn_prep(
-            qkv_p as *const c_void,
-            window_p,
-            addr::<f32>(conv_w, "conv_w")? as *const f32,
-            alpha_p as *const c_void,
-            beta_p as *const c_void,
-            addr::<f32>(a_log, "a_log")? as *const f32,
-            addr::<f32>(dt_bias, "dt_bias")? as *const f32,
-            q.device_ptr(q.stream()).0 as *mut f32,
-            k.device_ptr(k.stream()).0 as *mut f32,
-            v.device_ptr(v.stream()).0 as *mut f32,
-            g.device_ptr(g.stream()).0 as *mut f32,
-            beta.device_ptr(beta.stream()).0 as *mut f32,
-            match &fresh {
-                Some(n) => n.device_ptr(n.stream()).0 as *mut f32,
-                None => window_p,
-            },
-            kg as i32,
-            kd as i32,
-            vg as i32,
-            vd as i32,
-            taps as i32,
-            i32::from(tiled),
-            eps,
-            i32::from(f16),
-            stream,
-        );
+    let elem = if f16 { 2 } else { 4 } as u64;
+    let q_p = q.device_ptr(q.stream()).0;
+    let k_p = k.device_ptr(k.stream()).0;
+    let v_p = v.device_ptr(v.stream()).0;
+    let g_p = g.device_ptr(g.stream()).0;
+    let beta_out_p = beta.device_ptr(beta.stream()).0;
+    for r in 0..rows as u64 {
+        unsafe {
+            loken_gdn_prep(
+                (qkv_p + r * conv_dim as u64 * elem) as *const c_void,
+                window_p,
+                addr::<f32>(conv_w, "conv_w")? as *const f32,
+                (alpha_p + r * vg as u64 * elem) as *const c_void,
+                (beta_p + r * vg as u64 * elem) as *const c_void,
+                addr::<f32>(a_log, "a_log")? as *const f32,
+                addr::<f32>(dt_bias, "dt_bias")? as *const f32,
+                (q_p + r * (vg * kd * 4) as u64) as *mut f32,
+                (k_p + r * (vg * kd * 4) as u64) as *mut f32,
+                (v_p + r * (vg * vd * 4) as u64) as *mut f32,
+                (g_p + r * (vg * 4) as u64) as *mut f32,
+                (beta_out_p + r * (vg * 4) as u64) as *mut f32,
+                match &fresh {
+                    Some(n) => n.device_ptr(n.stream()).0 as *mut f32,
+                    None => window_p,
+                },
+                kg as i32,
+                kd as i32,
+                vg as i32,
+                vd as i32,
+                taps as i32,
+                i32::from(tiled),
+                eps,
+                i32::from(f16),
+                stream,
+            );
+        }
     }
     let wrap = |s, dims: (usize, usize)| {
         tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(s, dev.clone()), dims)
@@ -146,11 +162,11 @@ pub fn gdn_prep(
         None => window.clone(),
     };
     Ok(Some(GdnPrep {
-        q: tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(q, dev.clone()), (1, vg, kd))?,
-        k: tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(k, dev.clone()), (1, vg, kd))?,
-        v: tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(v, dev.clone()), (1, vg, vd))?,
-        g: wrap(g, (1, vg))?,
-        beta: wrap(beta, (1, vg))?,
+        q: tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(q, dev.clone()), (rows, vg, kd))?,
+        k: tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(k, dev.clone()), (rows, vg, kd))?,
+        v: tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(v, dev.clone()), (rows, vg, vd))?,
+        g: wrap(g, (rows, vg))?,
+        beta: wrap(beta, (rows, vg))?,
         window,
     }))
 }

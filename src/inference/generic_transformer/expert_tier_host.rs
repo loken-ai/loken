@@ -21,6 +21,16 @@ impl LayerTier {
         crate::tensor::bail!("an expert cache lives on a card")
     }
 
+    pub(super) fn decode_rows(
+        self: &Arc<Self>,
+        _: &MoeWeights,
+        _: &Tensor,
+        _: &Tensor,
+        _: &Tensor,
+    ) -> Result<Tensor> {
+        crate::tensor::bail!("an expert cache lives on a card")
+    }
+
     pub fn stream_pays(&self, _rows: usize, _used: usize) -> bool {
         false
     }

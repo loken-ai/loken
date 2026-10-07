@@ -842,3 +842,168 @@ fn a_recorded_indexed_attention_replays_at_every_position() {
     assert_eq!(on_card.len(), tokens.len());
     assert_eq!(on_card.len(), on_host.len());
 }
+
+/// A verify of drafted rows that keeps only some of them leaves the model where decoding the kept
+/// rows one at a time would: the logits of what follows are the reference's, whether the verify
+/// kept every row, some, or just the first.
+#[test]
+fn a_verify_cut_back_to_the_rows_kept_leaves_the_state_of_decoding_them() {
+    verify_cut_back(None, KvQuant::Off);
+}
+
+/// [`a_verify_cut_back_to_the_rows_kept_leaves_the_state_of_decoding_them`] on a card.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn a_verify_cut_back_on_a_card_leaves_the_state_of_decoding_the_kept_rows() {
+    verify_cut_back(Some(0), KvQuant::Off);
+}
+
+/// The same with the quantised cache a served model gets.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn a_verify_cut_back_on_a_card_with_a_quantised_cache_leaves_the_decoded_state() {
+    verify_cut_back(Some(0), KvQuant::Q8);
+}
+
+/// Several verifies in a row, each keeping a different number of its rows, leave the model where
+/// decoding the kept tokens one at a time would: the cut-back of one round is not undone, or
+/// compounded, by the next.
+#[test]
+fn verifies_that_follow_each_other_keep_the_state_of_decoding() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let tokens = ids(&v, "b.ids");
+    let dev = Device::Cpu;
+    let step = |m: &mut GenericHeteroTransformer, t: u32, at: usize| -> Vec<f32> {
+        let input = Tensor::from_vec(vec![t], (1, 1), &dev).unwrap();
+        m.forward(&input, at)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let mut reference = toy();
+    let want: Vec<Vec<f32>> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| step(&mut reference, *t, i))
+        .collect();
+    let scale = want.iter().map(|r| scale_of(r)).fold(0f32, f32::max);
+    let vocab = want[0].len();
+    let mut m = toy();
+    for (i, t) in tokens[..2].iter().enumerate() {
+        step(&mut m, *t, i);
+    }
+    let mut pos = 2usize;
+    for (rows, kept) in [(3usize, 2usize), (3, 1), (2, 2), (3, 3), (2, 1)] {
+        if pos + rows >= tokens.len() {
+            break;
+        }
+        let batch = Tensor::from_vec(tokens[pos..pos + rows].to_vec(), (1, rows), &dev).unwrap();
+        let got = m.forward_all(&batch, pos).unwrap();
+        let got = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for r in 0..rows {
+            let d = max_diff(&got[r * vocab..(r + 1) * vocab], &want[pos + r]);
+            assert!(d < 1e-3 * scale, "pos {pos}: verify row {r} differs by {d}");
+        }
+        if kept < rows {
+            m.trim_kv(pos + kept);
+        }
+        pos += kept;
+    }
+    assert!(pos > 6, "the chain ran through several rounds");
+}
+
+fn verify_cut_back(ordinal: Option<usize>, kv: KvQuant) {
+    let toy = || toy_with(ordinal, kv);
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let tokens = ids(&v, "b.ids");
+    let dev = toy().layers[0].cos.device();
+    let step = |m: &mut GenericHeteroTransformer, t: u32, at: usize| -> Vec<f32> {
+        let input = Tensor::from_vec(vec![t], (1, 1), &dev).unwrap();
+        m.forward(&input, at)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let mut reference = toy();
+    assert!(reference.is_recurrent(), "the toy has a recurrent layer");
+    let want: Vec<Vec<f32>> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| step(&mut reference, *t, i))
+        .collect();
+    let scale = want.iter().map(|r| scale_of(r)).fold(0f32, f32::max);
+    // A card's rows of a verify come from the batched kernels, so they agree with the decoded
+    // rows to the rounding of the half-width carriers, not to the bit. What is held to the bit
+    // there is the state the cut leaves: it is the one a verify of the kept rows alone makes.
+    let verify_slack = if ordinal.is_some() {
+        QUANTISED_SLACK
+    } else {
+        1e-3
+    };
+    let n = tokens.len();
+    for (prefix, rows, kept) in [(3usize, 4usize, 1usize), (3, 4, 2), (2, 5, 4), (4, 3, 3)] {
+        assert!(prefix + rows + 1 < n, "the toy's prompt is long enough");
+        let mut m = toy();
+        for (i, t) in tokens[..prefix].iter().enumerate() {
+            step(&mut m, *t, i);
+        }
+        let batch =
+            Tensor::from_vec(tokens[prefix..prefix + rows].to_vec(), (1, rows), &dev).unwrap();
+        let got = m.forward_all(&batch, prefix).unwrap();
+        let got = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let vocab = want[0].len();
+        let mut noise = 0f32;
+        for r in 0..rows {
+            let d = max_diff(&got[r * vocab..(r + 1) * vocab], &want[prefix + r]);
+            assert!(d < verify_slack * scale, "verify row {r} differs by {d}");
+            noise = noise.max(d);
+            let top = |row: &[f32]| {
+                row.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i)
+            };
+            assert_eq!(
+                top(&got[r * vocab..(r + 1) * vocab]),
+                top(&want[prefix + r]),
+                "verify row {r} names another token than the decoded row"
+            );
+        }
+        if kept < rows {
+            m.trim_kv(prefix + kept);
+        }
+        // What decoding goes on to give: the decoded rows' own logits on the host, and on a
+        // card those after a verify of the kept rows alone.
+        let follow: Vec<Vec<f32>> = if ordinal.is_some() {
+            let mut alone = toy();
+            for (i, t) in tokens[..prefix].iter().enumerate() {
+                step(&mut alone, *t, i);
+            }
+            let kept_rows =
+                Tensor::from_vec(tokens[prefix..prefix + kept].to_vec(), (1, kept), &dev).unwrap();
+            alone.forward_all(&kept_rows, prefix).unwrap();
+            (prefix + kept..prefix + kept + 2)
+                .map(|i| step(&mut alone, tokens[i], i))
+                .collect()
+        } else {
+            want[prefix + kept..prefix + kept + 2].to_vec()
+        };
+        for (j, i) in (prefix + kept..prefix + kept + 2).enumerate() {
+            let d = max_diff(&step(&mut m, tokens[i], i), &follow[j]);
+            // The kept rows' keys and values came from the batched kernels: the state they leave
+            // is as far from the alone one as the batched rows are from the decoded ones.
+            assert!(
+                d < (1e-3 * scale).max(1.5 * noise),
+                "prefix {prefix}, {rows} rows, {kept} kept: position {i} differs by {d} (noise {noise})"
+            );
+        }
+    }
+}

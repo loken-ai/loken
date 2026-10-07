@@ -904,6 +904,206 @@ impl LayerTier {
         Ok(out)
     }
 
+    /// The expert blocks of several tokens at once, as a draft verify routes them: `xs`
+    /// `[rows, hidden]` and the router's choices `ids`, `weights` `[rows, k]`, all on the card.
+    /// One wait for the choices serves every row; the experts some row misses are copied into
+    /// the transit room once whichever rows use them; the card runs its share of every row in
+    /// one launch pair, the transit room's in another, and the host the rest row by row.
+    /// Returns `[rows, hidden]` on the card.
+    pub(super) fn decode_rows(
+        self: &Arc<Self>,
+        moe: &MoeWeights,
+        xs: &Tensor,
+        ids: &Tensor,
+        weights: &Tensor,
+    ) -> Result<Tensor> {
+        let k = moe.n_experts_used;
+        let host = Device::Cpu;
+        let dev = xs.device().clone();
+        let (rows, hidden) = xs.dims2()?;
+        let cd = dev.as_cuda_device()?;
+        let stream = cd.0.stream().clone();
+        let mut guard = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(Scratch::new(&dev, hidden, k)?);
+        }
+        let scratch = guard.as_ref().expect("made above");
+        let carried = scratch.in_flight.swap(0, Ordering::Relaxed);
+        if carried > 0 {
+            if let Ok(ms) = scratch.upload_start.elapsed_ms(&scratch.upload_end) {
+                blend(&self.upload_us, ms as f64 * 1e3 / carried as f64);
+            }
+        }
+        // The choices of every row come to the host together, behind the work that made them.
+        let ids_h: Vec<u32> = ids
+            .to_dtype(crate::tensor::DType::U32)?
+            .to_device(&host)?
+            .flatten_all()?
+            .to_vec1()?;
+        let w_h: Vec<f32> = weights
+            .to_dtype(crate::tensor::DType::F32)?
+            .to_device(&host)?
+            .flatten_all()?
+            .to_vec1()?;
+        // Partition every routed pair by what the card holds now, and count the use.
+        let mut slot_ids = vec![0u32; rows * k];
+        let mut hit_weights = vec![0f32; rows * k];
+        let mut is_hit = vec![false; rows * k];
+        let mut in_use = vec![false; self.slots()];
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            for (p, (&e, &w)) in ids_h.iter().zip(&w_h).enumerate() {
+                st.heat[e as usize] += 1.0;
+                let s = st.slot_of[e as usize];
+                if s >= 0 {
+                    slot_ids[p] = s as u32;
+                    hit_weights[p] = w;
+                    in_use[s as usize] = true;
+                    is_hit[p] = true;
+                }
+            }
+            st.since_decay += rows;
+            if st.since_decay >= self.n_experts {
+                st.since_decay = 0;
+                st.heat.iter_mut().for_each(|h| *h *= 0.5);
+            }
+        }
+        let pairs = rows * k;
+        let hits = is_hit.iter().filter(|&&h| h).count();
+        self.routed.fetch_add(pairs as u64, Ordering::Relaxed);
+        self.hits.fetch_add(hits as u64, Ordering::Relaxed);
+        // The experts some pair misses, the most used first: the transit room takes as many as
+        // the copy keeps pace with, the host computes the pairs of the others.
+        let mut users: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for p in 0..pairs {
+            if !is_hit[p] {
+                *users.entry(ids_h[p]).or_insert(0) += 1;
+            }
+        }
+        let mut missing: Vec<u32> = users.keys().copied().collect();
+        missing.sort_by(|a, b| users[b].cmp(&users[a]).then(a.cmp(b)));
+        let to_transit = self.transit_share(missing.len());
+        let transit_experts: Vec<u32> = missing[..to_transit].to_vec();
+
+        // The card's share is launched first, and runs while the host does its own.
+        let card_out = if hits > 0 {
+            let filler = (0..pairs)
+                .find(|&p| is_hit[p])
+                .map(|p| slot_ids[p])
+                .unwrap_or(0);
+            for p in 0..pairs {
+                if !is_hit[p] {
+                    slot_ids[p] = filler;
+                }
+            }
+            let choice = Tensor::from_vec(slot_ids, (rows, k), &host)?.to_device(&dev)?;
+            let w = Tensor::from_vec(hit_weights, (rows, k), &host)?.to_device(&dev)?;
+            Some(moe.forward_cuda(xs, &choice, &w, rows, false, None, None, Some(&self.card))?)
+        } else {
+            None
+        };
+
+        // The copies into the transit room start now, and the host's share is computed while
+        // they run.
+        if !transit_experts.is_empty() {
+            self.copy_to_transit(scratch, &transit_experts)?;
+        }
+        let t_host = std::time::Instant::now();
+        // The host computes each expert it was given once, for every row that routes to it, so
+        // the blocks are read from memory once however many rows use them.
+        let host_experts: Vec<u32> = missing[to_transit..].to_vec();
+        let host_out = if host_experts.is_empty() {
+            None
+        } else {
+            let mut product = vec![0f32; rows * hidden];
+            let x_host: Vec<f32> = xs
+                .to_device(&host)?
+                .to_dtype(crate::tensor::DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
+            for &e in &host_experts {
+                let mine: Vec<usize> = (0..pairs)
+                    .filter(|&p| !is_hit[p] && ids_h[p] == e)
+                    .collect();
+                let m = mine.len();
+                let mut x = Vec::with_capacity(m * hidden);
+                for &p in &mine {
+                    let r = p / k;
+                    x.extend_from_slice(&x_host[r * hidden..(r + 1) * hidden]);
+                }
+                let x = Tensor::from_vec(x, (m, hidden), &host)?;
+                let choice = Tensor::from_vec(vec![e; m], (m, 1), &host)?;
+                let routing = ExpertRouting::group(&choice, 1)?;
+                let h = routing.host_gate_up_silu(&x, &self.host[0], &self.host[1])?;
+                let w = Tensor::from_vec(mine.iter().map(|&p| w_h[p]).collect(), (m, 1), &host)?;
+                let out = routing
+                    .host_down_reduce(&h, &self.host[2], &w, m, None)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                for (j, &p) in mine.iter().enumerate() {
+                    let r = p / k;
+                    for (acc, v) in product[r * hidden..(r + 1) * hidden]
+                        .iter_mut()
+                        .zip(&out[j * hidden..(j + 1) * hidden])
+                    {
+                        *acc += v;
+                    }
+                }
+            }
+            blend(
+                &self.host_us,
+                t_host.elapsed().as_secs_f64() * 1e6 / host_experts.len() as f64,
+            );
+            Some(Tensor::from_vec(product, (rows, hidden), &host)?.to_device(&dev)?)
+        };
+
+        // The experts in the transit room run once the copies have landed.
+        let transit_out = if transit_experts.is_empty() {
+            None
+        } else {
+            let stage = self.stage.as_ref().expect("a copy to transit has a stage");
+            stream
+                .wait(&scratch.upload_end)
+                .map_err(|e| crate::tensor::Error::msg(format!("wait: {e:?}")))?;
+            let filler = transit_experts[0];
+            let mut t_ids = vec![filler; pairs];
+            let mut t_w = vec![0f32; pairs];
+            for p in 0..pairs {
+                if !is_hit[p] && transit_experts.contains(&ids_h[p]) {
+                    t_ids[p] = ids_h[p];
+                    t_w[p] = w_h[p];
+                }
+            }
+            let choice = Tensor::from_vec(t_ids, (rows, k), &host)?.to_device(&dev)?;
+            let w = Tensor::from_vec(t_w, (rows, k), &host)?.to_device(&dev)?;
+            Some(moe.forward_cuda(
+                xs,
+                &choice,
+                &w,
+                rows,
+                false,
+                None,
+                None,
+                Some(&stage.stacks),
+            )?)
+        };
+        let mut out: Option<Tensor> = None;
+        for part in [card_out, transit_out, host_out] {
+            out = match (out, part) {
+                (Some(a), Some(b)) => Some(
+                    (a.to_dtype(crate::tensor::DType::F32)?
+                        + b.to_dtype(crate::tensor::DType::F32)?)?,
+                ),
+                (a, b) => a.or(b),
+            };
+        }
+        let out = out.expect("a token routes to at least one expert");
+        drop(guard);
+        self.keep_in_transit(&transit_experts, &mut in_use, &stream)?;
+        self.promote(&host_experts, &in_use);
+        Ok(out)
+    }
+
     /// Move the experts of `experts` that are in the transit room, hottest first, into the slots
     /// that hold something colder and are not read by this token, as copies on the card behind the
     /// token's own work: a kernel that reads a slot later is queued after its copy. `in_use` marks
@@ -1667,6 +1867,82 @@ mod tests {
             hits as f64 / routed as f64 > hit_rate_first.unwrap(),
             "the cache did not learn: {hits} of {routed}"
         );
+    }
+
+    /// The rows of a draft verify through the tier together give what the host's expert loop
+    /// gives them, whatever the cache holds and however the misses are split.
+    #[test]
+    fn the_rows_of_a_verify_through_the_tier_match_the_host() {
+        rows_through_the_tier(false);
+    }
+
+    /// The same with the transit room taking some of the misses.
+    #[test]
+    fn the_rows_of_a_verify_through_the_transit_room_match_the_host() {
+        rows_through_the_tier(true);
+    }
+
+    fn rows_through_the_tier(transit: bool) {
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
+        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
+        let mut tiered = layer(&card, experts, used, hidden, ffn);
+        let slots = 6;
+        let mut built = LayerTier::new(&tiered, &card, slots).unwrap();
+        if transit {
+            let widest = [0, 1, 2].map(|i| {
+                [
+                    tiered.gate_exps_sep.as_ref().unwrap(),
+                    tiered.up_exps_sep.as_ref().unwrap(),
+                    &tiered.down_exps,
+                ][i]
+                    .native_qtensor()
+                    .data()
+                    .len()
+            });
+            let stager = CardStager::new(&card, widest).unwrap();
+            built = built.with_stage(&stager, 0, false).unwrap();
+        }
+        tiered.tier = Some(Arc::new(built));
+        let tier = tiered.tier.clone().unwrap();
+        let _order = crate::tensor::quantized::DecodeOrder::enter();
+        for round in 0..40usize {
+            let rows = 1 + round % 6;
+            let x = values(rows * hidden, 100 + (round % 4) as u64, 1.0);
+            let on_host = Tensor::from_vec(x.clone(), (1, rows, hidden), &Device::Cpu).unwrap();
+            let on_card = Tensor::from_vec(x, (1, rows, hidden), &card).unwrap();
+            let want = reference
+                .forward_rows(&on_host, &on_host, hidden, 1e-5)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let got = tiered
+                .forward_rows(&on_card, &on_card, hidden, 1e-5)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            tier.settle();
+            let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 2e-2 * peak,
+                "round {round}, {rows} rows: max diff {worst} of {peak}"
+            );
+        }
+        let (routed, hits, promoted) = tier.counters();
+        assert!(promoted > 0, "the hot experts were never copied in");
+        assert!(hits > 0 && hits < routed, "{hits} of {routed} on the card");
     }
 
     /// A layer with every expert on the card runs as a loaded one does: a token and wide batches

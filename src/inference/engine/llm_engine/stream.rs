@@ -1068,6 +1068,7 @@ impl LlmEngine {
             let mut pld_window_drafted: u32 = 0;
             let mut pld_window_accepted: u32 = 0;
             let mut pld_cooldown: u32 = 0;
+            let mut pld_cost = crate::inference::engine::decode_step::PldCost::default();
 
             // Prepare stop sequence suffix buffer (eliminates O(N) decode per token)
             let mut stop_tracker = StopTracker::new(&params.stop_sequences);
@@ -1873,8 +1874,10 @@ impl LlmEngine {
                     // ctx the n-gram accept rate collapses so the per-position verify GEMVs
                     // are a net loss on both devices (qwen3/deepcoder 2.5K loss->tie once
                     // gated). (Proper fix = cpu_q8_kv::attention_multi.)
-                    let pld_active =
-                        pld_enabled && pld_cooldown == 0 && pos <= pld_max_ctx_threshold();
+                    let pld_active = pld_enabled
+                        && pld_cooldown == 0
+                        && pld_cost.worth_trying()
+                        && pos <= pld_max_ctx_threshold();
                     pld_cooldown = pld_cooldown.saturating_sub(1);
                     // Spec-decode: draft K from the drafter model when active,
                     // else the n-gram PLD draft. Verify below re-samples every position.
@@ -2034,6 +2037,10 @@ impl LlmEngine {
                                 );
                                 let n_committed = 1 + accepted_drafts;
                                 let new_pos = pos + n_committed;
+                                if !spec_on {
+                                    pld_cost
+                                        .round(cycle_start.elapsed().as_secs_f64(), n_committed);
+                                }
 
                                 if n_committed < k + 1 {
                                     state.model.trim_kv(new_pos);
@@ -2250,6 +2257,7 @@ impl LlmEngine {
                             (tok, pos + 1, dev_next)
                         };
                         let baseline_ms = t_baseline.elapsed().as_secs_f64() * 1000.0;
+                        pld_cost.plain_step(cycle_start.elapsed().as_secs_f64());
                         if time_plain {
                             spec_engine
                                 .draft_length

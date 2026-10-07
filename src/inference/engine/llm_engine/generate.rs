@@ -592,6 +592,7 @@ impl LlmEngine {
             // Helps long-context regressions where the prompt's n-grams
             // stop predicting the model's diverging completion.
             let mut pld_cooldown: u32 = 0;
+            let mut pld_cost = crate::inference::engine::decode_step::PldCost::default();
             let mut pld_window_drafted: u32 = 0;
             let mut pld_window_accepted: u32 = 0;
 
@@ -1413,7 +1414,8 @@ impl LlmEngine {
                     // makes the per-position verify GEMVs a net loss (qwen3/deepcoder 2.5K
                     // loss->tie once gated). (Proper fix = cpu_q8_kv::attention_multi.)
                     let pld_ctx_ok = pos <= pld_max_ctx_threshold();
-                    let pld_active = pld_enabled && pld_cooldown == 0 && pld_ctx_ok;
+                    let pld_active =
+                        pld_enabled && pld_cooldown == 0 && pld_ctx_ok && pld_cost.worth_trying();
                     pld_cooldown = pld_cooldown.saturating_sub(1);
                     // Spec-decode: when a drafter is active, draft K tokens from
                     // it (its KV is at `pos`, in lockstep with the target). Otherwise
@@ -1489,6 +1491,9 @@ impl LlmEngine {
                         // Total committed this step = 1 (S_0) + accepted_drafts
                         let committed = 1 + accepted_drafts;
                         pos += committed;
+                        if !spec_on {
+                            pld_cost.round(cycle_start.elapsed().as_secs_f64(), committed);
+                        }
 
                         // The verification forward wrote k+1 rows into the KV
                         // cache. Only `committed` of them correspond to
@@ -1529,6 +1534,7 @@ impl LlmEngine {
                             &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                             &mut logits_processor,
                         )?;
+                        pld_cost.plain_step(cycle_start.elapsed().as_secs_f64());
                         if time_plain {
                             spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).record(
                                 0, 0, 0.0, cycle_start.elapsed().as_secs_f64(),

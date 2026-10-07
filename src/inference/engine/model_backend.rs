@@ -1582,6 +1582,8 @@ impl ModelBackend for GenericBackend {
         if self.0.is_recurrent() {
             return Capabilities {
                 graph_mode: true,
+                // A verify of drafted rows is recorded and cut back by `trim_kv`.
+                pld: true,
                 ..Capabilities::default()
             };
         }

@@ -120,9 +120,10 @@ pub fn hc_mean_gate(
     }
 }
 
-/// Most rows a step may carry for [`hc_mix_fused`]: a decode step or a short verify batch. A
-/// longer chunk reads each weight once for all its rows in a matrix product instead.
-pub const FUSED_MIX_MAX_ROWS: usize = 4;
+/// Most rows a step may carry for [`hc_mix_fused`]: a decode step or a draft verify, whose rows
+/// then see the arithmetic of the decode steps they stand for. A longer chunk reads each weight
+/// once for all its rows in a matrix product instead.
+pub const FUSED_MIX_MAX_ROWS: usize = crate::inference::engine::decode_step::VERIFY_ROWS;
 
 /// A dense F32 weight `[n, k]` that is contiguous on a card, or `None`.
 fn dense_rows(w: &Tensor, n: Option<usize>, k: usize) -> Option<usize> {

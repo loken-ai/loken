@@ -868,6 +868,7 @@ impl GenericHeteroTransformer {
     }
 
     pub fn update_graph_state(&mut self, pos: usize) -> Result<()> {
+        self.spec_clear();
         // Captured-graph seq ceiling (Q8 path): the live graph was
         // recorded against a frozen buffer capacity and (if the
         // fixed-stride score chain was captured) a frozen max_seq_padded
@@ -1392,6 +1393,7 @@ impl GenericHeteroTransformer {
     /// a stable device pointer. Call OUTSIDE graph capture so the embedding
     /// lookup + H2D copy are not part of the captured graph.
     pub fn embed_for_graph(&mut self, input_ids: &Tensor) -> Result<()> {
+        self.spec_clear();
         let emb_device = self.embeddings.embeddings().device().clone();
         let input_local;
         let input_ids = if input_ids.device().same_device(&emb_device) {
@@ -2356,6 +2358,7 @@ impl GenericHeteroTransformer {
     /// O(num_layers) - each layer's cache only updates its internal
     /// `current_seq_len` counter (see `SpecKvCache::trim_to`).
     pub fn trim_kv(&mut self, new_len: usize) {
+        self.spec_settle(new_len);
         for layer in &mut self.layers {
             // A recurrent state cannot be cut to a shorter length: it is dropped only when
             // nothing is kept.

@@ -107,6 +107,9 @@ impl GenericTransformerLayer {
         let dev = x.device();
         let settle = prefilling(x);
         let mut r = x.to_dtype(DType::F32)?;
+        if self.spec_record {
+            self.spec_begin(&r, ngram, index_pos)?;
+        }
         if let (Some(ple), Some(emb)) = (self.ngram.as_mut(), ngram) {
             let add = staged("ngram", &dev, settle, || ple.forward(&r, emb, index_pos))?;
             r = (r + add)?;
@@ -319,6 +322,9 @@ impl GenericTransformerLayer {
     ) -> Result<Tensor> {
         let settle = prefilling(mixed);
         let attends = matches!(self.mixer, mixer::Mixer::Attention);
+        if self.spec_record {
+            self.spec_input(mixed);
+        }
         staged(
             if attends { "attention" } else { "delta_rule" },
             dev,
@@ -408,6 +414,22 @@ impl GenericTransformerLayer {
         mask: Option<&Tensor>,
         index_pos: usize,
     ) -> Result<Tensor> {
+        // The rows of a draft verify, each through the decoded token's launches on the card.
+        #[cfg(feature = "cuda")]
+        if self.indexed_on_card()
+            && x.dim(1)? > 1
+            && index_pos > 0
+            && crate::tensor::quantized::DecodeOrder::active()
+            && self.kv_cache.k_buffer().is_some()
+            && self.kv_cache.current_seq_len() == index_pos
+        {
+            let rows = (0..x.dim(1)?)
+                .map(|r| {
+                    self.attend_on_card_eager(&x.narrow(1, r, 1)?.contiguous()?, index_pos + r)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1);
+        }
         // A decoded token of a layer whose indexer runs on the card never reaches the host.
         #[cfg(feature = "cuda")]
         if self.indexed_on_card()

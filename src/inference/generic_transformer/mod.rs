@@ -66,6 +66,7 @@ mod moe_weights;
 pub mod ngram;
 pub mod qsa;
 mod segment;
+mod speculate;
 mod splice;
 #[cfg(test)]
 mod state_cache_tests;
@@ -297,6 +298,10 @@ pub struct GenericTransformerLayer {
     /// The rows of the n-gram table the step's token gathers, `[1, 1, heads * row_dim]` F32 on
     /// the card, written before each replay: what the layer that adds them reads.
     pub graph_ngram_rows: Option<Tensor>,
+    /// What a draft verify left of this layer's state, until the rows kept are known.
+    spec: Option<speculate::LayerPending>,
+    /// Whether the forward running now is a verify that records [`Self::spec`].
+    spec_record: bool,
     /// The capacity of the key and value buffers a recorded indexed layer was last run against:
     /// the step ends, and is recorded again, when the cache outgrows or replaces them.
     pub graph_kv_cap: Option<usize>,
@@ -409,6 +414,10 @@ pub struct GenericHeteroTransformer {
     config: Arc<GenericTransformerConfig>,
     embeddings: Embedding, // GPU 0 if table < 1 GB, else CPU
     layers: Vec<GenericTransformerLayer>,
+    /// The rows of the draft verify last recorded, until the model is cut back or moves on.
+    spec_window: Option<speculate::Window>,
+    /// Whether a verify is recording now.
+    spec_recording: bool,
     /// The place in the stack of `layers[0]`: zero unless this model holds one node's share of
     /// a stack other nodes run the rest of.
     first_layer: usize,

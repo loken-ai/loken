@@ -409,6 +409,58 @@ impl DraftLength {
     }
 }
 
+/// What a prompt-lookup verify costs against the plain steps it replaces, measured on this
+/// request: a round is worth running while the tokens it commits per second beat the plain
+/// decode's. Where a verify costs about one step per row, a round that commits fewer tokens than
+/// it has rows loses, whatever share of its drafts was accepted; where a verify costs hardly more
+/// than a step, nearly any acceptance wins.
+#[derive(Debug, Default)]
+pub(crate) struct PldCost {
+    /// Seconds of a plain decode step, smoothed.
+    plain: Option<f64>,
+    /// Seconds and committed tokens of a verify round, smoothed.
+    round: Option<(f64, f64)>,
+    /// Plain steps left before a round is tried again after a losing one.
+    hold: u32,
+}
+
+/// Plain steps between the trials of a lookup whose rounds were losing.
+const PLD_RETRY_STEPS: u32 = 48;
+
+impl PldCost {
+    fn blend(old: Option<f64>, new: f64) -> f64 {
+        match old {
+            Some(o) => o + (new - o) * CYCLE_COST_WEIGHT,
+            None => new,
+        }
+    }
+
+    /// A plain decode step took `secs`.
+    pub(crate) fn plain_step(&mut self, secs: f64) {
+        self.plain = Some(Self::blend(self.plain, secs));
+        self.hold = self.hold.saturating_sub(1);
+    }
+
+    /// A verify round took `secs` and committed `tokens`.
+    pub(crate) fn round(&mut self, secs: f64, tokens: usize) {
+        let (s, t) = self.round.unwrap_or((secs, tokens as f64));
+        self.round = Some((
+            Self::blend(Some(s), secs),
+            Self::blend(Some(t), tokens as f64),
+        ));
+        if let (Some(plain), Some((s, t))) = (self.plain, self.round) {
+            if t / s.max(f64::EPSILON) < plain.recip() {
+                self.hold = PLD_RETRY_STEPS;
+            }
+        }
+    }
+
+    /// Whether the next lookup hit should be verified.
+    pub(crate) fn worth_trying(&self) -> bool {
+        self.hold == 0
+    }
+}
+
 /// PLD acceptance-window cooldown: when recent acceptance drops SIGNIFICANTLY
 /// below break-even, skip PLD for 500 iters. Threshold 0.20 over a 24-draft
 /// window - Q4/Q8 main-path arches have lower natural acceptance (~25-35 %)
@@ -480,6 +532,27 @@ pub(crate) fn record_logprobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lookup is verified while its rounds commit tokens faster than plain steps do, held off
+    /// for a run of plain steps once they do not, and tried again after it.
+    #[test]
+    fn a_lookup_is_verified_only_while_its_rounds_beat_the_plain_steps() {
+        let mut c = PldCost::default();
+        assert!(c.worth_trying(), "nothing measured: try");
+        c.plain_step(0.040);
+        c.round(0.180, 6);
+        assert!(c.worth_trying(), "33 tokens a second against 25");
+        for _ in 0..8 {
+            c.round(0.180, 2);
+        }
+        assert!(!c.worth_trying(), "11 tokens a second against 25");
+        for _ in 0..PLD_RETRY_STEPS - 1 {
+            c.plain_step(0.040);
+            assert!(!c.worth_trying());
+        }
+        c.plain_step(0.040);
+        assert!(c.worth_trying(), "tried again after the run of plain steps");
+    }
 
     #[test]
     fn a_drafter_that_rarely_agrees_gets_short_drafts() {

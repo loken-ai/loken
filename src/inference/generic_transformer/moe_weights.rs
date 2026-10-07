@@ -449,8 +449,19 @@ impl MoeWeights {
         rms_eps: f32,
     ) -> Result<Tensor> {
         let seq = moe_in.dim(1)?;
-        if seq == 1 || !crate::tensor::quantized::DecodeOrder::active() {
-            return self.forward(moe_in, attn_out, n_embd, rms_eps, seq > 1);
+        // A layer whose experts pass through a cache takes the rows together: it routes every
+        // row alone, and its card runs each row's pairs as it would the decoded token's.
+        let cached =
+            moe_in.device().runs_as_card() && self.tier.as_ref().is_some_and(|t| !t.is_resident());
+        if seq == 1 || !crate::tensor::quantized::DecodeOrder::active() || cached {
+            let rows_as_decode = seq > 1 && cached;
+            return self.forward(
+                moe_in,
+                attn_out,
+                n_embd,
+                rms_eps,
+                seq > 1 && !rows_as_decode,
+            );
         }
         // Each row in storage of its own: `forward` reads its input from the start of the
         // storage.
@@ -574,6 +585,11 @@ impl MoeWeights {
             };
             match self.gate_inp_bias.as_ref() {
                 None if self.sigmoid_routing.is_some() => exact_logits()?,
+                // A decoded token and the rows of a verify score in the same GEMV, whatever
+                // the number of rows: a library matrix product picks its arithmetic by shape.
+                None if num_tokens <= crate::inference::engine::decode_step::VERIFY_ROWS => {
+                    exact_logits()?
+                }
                 None => self
                     .gate_inp
                     .forward(&xs)?
@@ -751,19 +767,9 @@ impl MoeWeights {
             .as_ref()
             .filter(|_| xs.device().runs_as_card() && num_tokens > 1)
         {
-            // Too few rows to pay for the layer's experts to come: each goes through the cache as
-            // a decoded token does, in the storage of its own.
-            let rows = (0..num_tokens)
-                .map(|t| {
-                    tier.decode(
-                        self,
-                        &xs.narrow(0, t, 1)?.contiguous()?,
-                        &topk_ids.narrow(0, t, 1)?.contiguous()?,
-                        &topk_weights_scaled.narrow(0, t, 1)?.contiguous()?,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?
+            // Too few rows to pay for the layer's experts to come: the rows go through the cache
+            // together, as the decoded tokens they stand for would one after the other.
+            tier.decode_rows(self, &xs, &topk_ids, &topk_weights_scaled)?
         } else if on_cpu {
             self.forward_cpu(&xs, &topk_ids, &topk_weights_scaled, num_tokens, hidden_dim)?
         } else {
@@ -879,7 +885,7 @@ impl MoeWeights {
     /// Device path: the gate‖up projections and their combine, then the down projection and
     /// the top-k weighted reduction, each as one launch over the routing plan.
     #[cfg(feature = "cuda")]
-    fn forward_cuda(
+    pub(super) fn forward_cuda(
         &self,
         xs: &Tensor,
         topk_ids: &Tensor,

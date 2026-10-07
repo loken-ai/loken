@@ -1536,7 +1536,19 @@ impl GenericHeteroTransformer {
         let (_, seq_len) = input_ids.dims2()?;
         let verify = index_pos > 0 && seq_len <= crate::inference::engine::decode_step::VERIFY_ROWS;
         let _order = verify.then(crate::tensor::quantized::DecodeOrder::enter);
-        self.forward_inner(input_ids, index_pos, /*all_positions=*/ true)
+        let recording = verify && self.is_recurrent();
+        if recording {
+            self.spec_open(input_ids, index_pos)?;
+        }
+        // The verify advances each state where it lies, as a decoded token does, so a step
+        // recorded against those buffers goes on reading them.
+        #[cfg(feature = "cuda")]
+        let _in_place = recording.then(|| crate::inference::moe_cuda::in_place_state(true));
+        let out = self.forward_inner(input_ids, index_pos, /*all_positions=*/ true);
+        if recording {
+            self.spec_close(out.is_ok());
+        }
+        out
     }
 
     /// `forward_all` with the rows batched as a prefill batches them, for the verify
@@ -1557,6 +1569,7 @@ impl GenericHeteroTransformer {
         all_positions: bool,
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
+        self.spec_clear();
         let (hidden, ple_inputs) = self.embed_stage(input_ids, index_pos)?;
         self.forward_layers_and_output(hidden, ple_inputs, index_pos, seq_len, all_positions)
     }

@@ -1061,7 +1061,12 @@ impl GatedDeltaNet {
         if prepping {
             let _ = dev.synchronize();
         }
-        let fused = if seq == 1 {
+        // A decoded token, and the rows of a draft verify, which are prepared one after the
+        // other as the decode steps they stand for.
+        let fused = if seq == 1
+            || (crate::tensor::quantized::DecodeOrder::active()
+                && crate::inference::moe_cuda::in_place_state_on())
+        {
             k::gdn_prep(
                 &qkv,
                 &conv,
