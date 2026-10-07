@@ -27,6 +27,7 @@ impl LlmEngine {
             batching: self.batching.clone(),
             drafter_choice: self.drafter_choice.clone(),
             draft_length: self.draft_length.clone(),
+            pld_cost: self.pld_cost.clone(),
         }
     }
 }

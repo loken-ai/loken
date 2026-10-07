@@ -1068,7 +1068,11 @@ impl LlmEngine {
             let mut pld_window_drafted: u32 = 0;
             let mut pld_window_accepted: u32 = 0;
             let mut pld_cooldown: u32 = 0;
-            let mut pld_cost = crate::inference::engine::decode_step::PldCost::default();
+            let mut pld_cost = spec_engine
+                .pld_cost
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .carried();
 
             // Prepare stop sequence suffix buffer (eliminates O(N) decode per token)
             let mut stop_tracker = StopTracker::new(&params.stop_sequences);
@@ -1186,6 +1190,8 @@ impl LlmEngine {
             // them.
             let ends = |t: u32| t == eos_token_id || eos_extra.contains(&t);
             'stream_loop: while !ends(next_token) && token_count < max_tokens {
+                #[cfg(feature = "cuda")]
+                let step_start = Instant::now();
                 if !logprob_buf.is_empty() {
                     if let Ok(mut q) = logprob_queue.lock() {
                         q.append(&mut logprob_buf);
@@ -1854,6 +1860,7 @@ impl LlmEngine {
                     if let Some((tok, dev_tok)) = graph_step {
                         next_token = tok;
                         next_token_dev = dev_tok;
+                        pld_cost.plain_step(step_start.elapsed().as_secs_f64());
                         continue 'stream_loop;
                     }
                     // The graph's forwards append to the cache on the card without advancing
@@ -2292,6 +2299,10 @@ impl LlmEngine {
                     );
                 }
             }
+            *spec_engine
+                .pld_cost
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = pld_cost.clone();
             if pld_stats_drafted > 0 {
                 let accept_rate = pld_stats_accepted as f64 / pld_stats_drafted as f64;
                 info!(

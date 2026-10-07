@@ -585,10 +585,17 @@ impl MoeWeights {
             };
             match self.gate_inp_bias.as_ref() {
                 None if self.sigmoid_routing.is_some() => exact_logits()?,
-                // A decoded token and the rows of a verify score in the same GEMV, whatever
-                // the number of rows: a library matrix product picks its arithmetic by shape.
-                None if num_tokens <= crate::inference::engine::decode_step::VERIFY_ROWS => {
-                    exact_logits()?
+                // The rows of a verify score one at a time, as a decoded token does: a library
+                // matrix product picks its arithmetic by shape.
+                None if num_tokens > 1 && crate::tensor::quantized::DecodeOrder::active() => {
+                    let rows = (0..num_tokens)
+                        .map(|r| {
+                            self.gate_inp
+                                .forward(&xs.narrow(0, r, 1)?.contiguous()?)?
+                                .to_dtype(crate::tensor::DType::F32)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?
                 }
                 None => self
                     .gate_inp

@@ -39,6 +39,18 @@ enum Commands {
         source: Option<String>,
     },
 
+    /// Fetch the draft head a checkpoint ships beside its layers, as a GGUF to place next to the
+    /// served model as `<model stem>.mtp.gguf`
+    DraftHead {
+        /// The checkpoint's HuggingFace repository (e.g. Qwen/Qwen3.8-Flash-Next)
+        repo: String,
+        /// The GGUF to write
+        out: std::path::PathBuf,
+        /// The repository revision
+        #[arg(long, default_value = "main")]
+        revision: String,
+    },
+
     /// Load a model into memory, so the next request does not pay for it
     Load {
         /// Model ID
@@ -403,6 +415,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "damping": damping, "layers": layers,
             });
             follow(client.post_streaming("/api/convert", &body).await?, false).await?;
+        }
+        Commands::DraftHead {
+            repo,
+            out,
+            revision,
+        } => {
+            info!(
+                "Reading the draft head of {repo} ({revision}) into {}",
+                out.display()
+            );
+            let written = out.clone();
+            tokio::task::spawn_blocking(move || {
+                loken::inference::load::mtp_head::fetch_mtp_head(
+                    "https://huggingface.co",
+                    &repo,
+                    &revision,
+                    &out,
+                )
+            })
+            .await?
+            .map_err(|e| format!("{e}"))?;
+            println!("{}", written.display());
         }
         Commands::Pull { model, source } => {
             let source = source.unwrap_or_else(|| {

@@ -562,8 +562,11 @@ pub(crate) fn composite_text_dir(dir: &std::path::Path, roots: &[PathBuf]) -> Op
 /// Whether `p` is the `mmproj` of a vision or speech tower: a companion of the model file,
 /// never the model.
 fn is_projector_file(p: &std::path::Path) -> bool {
-    p.file_name()
-        .is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with("mmproj"))
+    p.file_name().is_some_and(|n| {
+        let n = n.to_string_lossy().to_lowercase();
+        // A draft head sits beside its model and is read with it, not served on its own.
+        n.starts_with("mmproj") || n.ends_with(".mtp.gguf")
+    })
 }
 
 /// The GGUF of a hub repository id `org/name[:selector]` inside the cache roots: any snapshot

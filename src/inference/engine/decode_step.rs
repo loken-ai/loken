@@ -414,7 +414,7 @@ impl DraftLength {
 /// decode's. Where a verify costs about one step per row, a round that commits fewer tokens than
 /// it has rows loses, whatever share of its drafts was accepted; where a verify costs hardly more
 /// than a step, nearly any acceptance wins.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct PldCost {
     /// Seconds of a plain decode step, smoothed.
     plain: Option<f64>,
@@ -436,6 +436,15 @@ impl PldCost {
         match old {
             Some(o) => o + (new - o) * CYCLE_COST_WEIGHT,
             None => new,
+        }
+    }
+
+    /// What the next request starts from: the costs and the length of the wait that earlier
+    /// requests learned, and a trial at its first lookup hit.
+    pub(crate) fn carried(&self) -> Self {
+        Self {
+            hold: 0,
+            ..self.clone()
         }
     }
 
@@ -540,6 +549,32 @@ pub(crate) fn record_logprobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request starts from what the earlier ones learned: the costs and the longer wait, with a
+    /// trial at its first lookup hit.
+    #[test]
+    fn a_request_starts_from_the_cost_the_earlier_ones_learned() {
+        let mut c = PldCost::default();
+        c.plain_step(0.040);
+        for _ in 0..12 {
+            if c.worth_trying() {
+                c.round(0.180, 2);
+            }
+        }
+        assert!(!c.worth_trying());
+        let next = c.carried();
+        assert!(next.worth_trying(), "a trial at the first hit");
+        let mut next = next;
+        next.round(0.180, 2);
+        assert!(!next.worth_trying());
+        for _ in 0..PLD_RETRY_STEPS {
+            next.plain_step(0.040);
+        }
+        assert!(
+            !next.worth_trying(),
+            "the wait grew: the earlier request lost too"
+        );
+    }
 
     /// A lookup is verified while its rounds commit tokens faster than plain steps do, held off
     /// for a run of plain steps once they do not, and tried again after it.

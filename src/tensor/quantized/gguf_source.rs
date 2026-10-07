@@ -121,6 +121,21 @@ fn split_name(path: &Path) -> Option<(String, usize, usize, usize)> {
     ))
 }
 
+/// The draft head that sits beside the model at `path`, `<stem>.mtp.gguf` with the stem of a
+/// split's parts, if there is one.
+pub fn draft_head_beside(path: &Path) -> Option<PathBuf> {
+    let stem = match split_name(path) {
+        Some((stem, ..)) => stem,
+        None => path
+            .file_name()?
+            .to_str()?
+            .strip_suffix(".gguf")?
+            .to_string(),
+    };
+    let head = path.parent()?.join(format!("{stem}.mtp.gguf"));
+    head.is_file().then_some(head)
+}
+
 fn declared(part: &MappedGguf, key: &str) -> Option<usize> {
     part.content
         .metadata
@@ -192,6 +207,13 @@ impl SplitGguf {
     /// a set of one. The parts are checked against what they declare: the count in the name must
     /// be the `split.count` in the header, and each part must be the number its name says.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open_with(path, &[])
+    }
+
+    /// `open`, then the files of `extra` as parts of their own: tensors the set does not carry,
+    /// read beside it under names it does not use. They are not parts of the split the name and
+    /// header describe, so they declare no number.
+    pub fn open_with<P: AsRef<Path>>(path: P, extra: &[PathBuf]) -> Result<Self> {
         let path = path.as_ref();
         let first = open_mapped_unadvised(path)?;
         let count = declared(&first, "split.count").unwrap_or(1);
@@ -207,6 +229,9 @@ impl SplitGguf {
                     i + 1
                 )));
             }
+        }
+        for file in extra {
+            parts.push(open_mapped_unadvised(file)?);
         }
         let mut owner = HashMap::new();
         for (i, part) in parts.iter().enumerate() {
@@ -300,6 +325,24 @@ impl GgufSource for SplitGguf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_draft_head_is_found_by_the_stem_of_the_model_or_of_its_split() {
+        let dir = std::env::temp_dir().join(format!("draft-head-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let head = dir.join("model-Q4.mtp.gguf");
+        std::fs::write(&head, b"x").unwrap();
+        assert_eq!(
+            draft_head_beside(&dir.join("model-Q4.gguf")),
+            Some(head.clone())
+        );
+        assert_eq!(
+            draft_head_beside(&dir.join("model-Q4-00001-of-00002.gguf")),
+            Some(head)
+        );
+        assert_eq!(draft_head_beside(&dir.join("other.gguf")), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
 
     #[test]

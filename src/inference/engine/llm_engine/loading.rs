@@ -374,12 +374,20 @@ impl LlmEngine {
             let mmap_bytes: &[u8] = &mmap[..];
             // A split set is one model: the union of its parts is the header and each tensor is
             // read from the part that holds it. A part whose siblings are missing is an error.
+            // The draft head the model ships beside its layers is one more part of the set.
+            let draft_head = awq
+                .is_none()
+                .then(|| crate::tensor::quantized::gguf_source::draft_head_beside(std::path::Path::new(&model_file)))
+                .flatten();
             let split = match (
                 awq.is_none(),
-                crate::inference::generic_transformer::is_a_split_part(&content),
+                crate::inference::generic_transformer::is_a_split_part(&content)
+                    || draft_head.is_some(),
             ) {
-                (true, true) => match crate::tensor::quantized::gguf_source::SplitGguf::open(&model_file)
-                {
+                (true, true) => match crate::tensor::quantized::gguf_source::SplitGguf::open_with(
+                    &model_file,
+                    draft_head.as_slice(),
+                ) {
                     Ok(s) => Some(s),
                     Err(e) => {
                         error!("❌ {e}");

@@ -391,6 +391,21 @@ pub(crate) trait ModelBackend: Send {
 
     fn trim_kv(&mut self, _new_len: usize) {}
 
+    /// Whether the model came with a draft head, and the head is now reading the hidden state
+    /// of every forward (`on`) or not.
+    fn draft_head_capture(&mut self, _on: bool) -> bool {
+        false
+    }
+
+    /// Up to `k` tokens the model's draft head guesses follow the sequence; see
+    /// `GenericHeteroTransformer::draft_tokens`.
+    fn draft_head_tokens(&mut self, _tokens: &[u32], _k: usize) -> Vec<u32> {
+        Vec::new()
+    }
+
+    /// The draft head's history starts over.
+    fn draft_head_reset(&mut self) {}
+
     /// Roll every per-layer KV cache back to `keep` valid positions, discarding
     /// any K/V appended beyond it. Used by the OOM-adaptive prefill to drop the
     /// partial KV a failed pass appended before replaying from `keep` with a
@@ -1408,6 +1423,28 @@ impl ModelBackend for GenericBackend {
 
     fn trim_kv(&mut self, new_len: usize) {
         self.0.trim_kv(new_len)
+    }
+
+    fn draft_head_capture(&mut self, on: bool) -> bool {
+        if !self.0.has_draft_head() {
+            return false;
+        }
+        self.0.set_capture_feature(on);
+        true
+    }
+
+    fn draft_head_tokens(&mut self, tokens: &[u32], k: usize) -> Vec<u32> {
+        match self.0.draft_tokens(tokens, k) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("draft head: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    fn draft_head_reset(&mut self) {
+        self.0.draft_reset();
     }
 
     fn reset_kv_from(&mut self, keep: usize) {

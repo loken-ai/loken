@@ -2373,35 +2373,7 @@ impl GenericHeteroTransformer {
                     }
                 }
             }
-            layer.kv_cache.trim_to(new_len);
-            // Keep the Q8 mirror in sync with the F-dtype cache; otherwise
-            // speculative-decoding rollbacks leave Q8 with stale draft
-            // positions and subsequent decode reads garbage.
-            //
-            // The quantised cache moves length, device position and graph state together
-            // (see `KvCore::trim_to`).
-            #[cfg(feature = "cuda")]
-            if let Some(c) = layer.quant_kv.as_mut() {
-                c.trim_to(new_len);
-            }
-            // CPU KV stores (dense Q8 / gemma4 F16). Multi-token verify
-            // (PLD/EAGLE) appends drafts here too; without trimming them the
-            // rejected draft positions accumulate and corrupt later attention
-            // (greedy decode diverges a few tokens in). Mirrors the F-dtype trim.
-            if let Some(c) = layer.cpu_q8_kv.as_mut() {
-                if new_len == 0 {
-                    c.reset();
-                } else {
-                    c.trim_to(new_len);
-                }
-            }
-            if let Some(c) = layer.cpu_f16_kv.as_mut() {
-                if new_len == 0 {
-                    c.reset();
-                } else {
-                    c.trim_to(new_len);
-                }
-            }
+            layer.trim_kv_to(new_len);
         }
     }
 
@@ -2729,6 +2701,41 @@ pub(crate) fn snapshot_slot(
 
 fn common_prefix(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+impl GenericTransformerLayer {
+    /// Cut every cache this layer keeps back to `new_len` positions.
+    pub(super) fn trim_kv_to(&mut self, new_len: usize) {
+        self.kv_cache.trim_to(new_len);
+        // Keep the Q8 mirror in sync with the F-dtype cache; otherwise
+        // speculative-decoding rollbacks leave Q8 with stale draft
+        // positions and subsequent decode reads garbage.
+        //
+        // The quantised cache moves length, device position and graph state together
+        // (see `KvCore::trim_to`).
+        #[cfg(feature = "cuda")]
+        if let Some(c) = self.quant_kv.as_mut() {
+            c.trim_to(new_len);
+        }
+        // CPU KV stores (dense Q8 / gemma4 F16). Multi-token verify
+        // (PLD/EAGLE) appends drafts here too; without trimming them the
+        // rejected draft positions accumulate and corrupt later attention
+        // (greedy decode diverges a few tokens in). Mirrors the F-dtype trim.
+        if let Some(c) = self.cpu_q8_kv.as_mut() {
+            if new_len == 0 {
+                c.reset();
+            } else {
+                c.trim_to(new_len);
+            }
+        }
+        if let Some(c) = self.cpu_f16_kv.as_mut() {
+            if new_len == 0 {
+                c.reset();
+            } else {
+                c.trim_to(new_len);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

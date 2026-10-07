@@ -377,6 +377,12 @@ impl LlmEngine {
 
             // Batched prefill (all prompt tokens in one forward pass)
             let prompt_token_count = prompt_eval_positions(prompt_tokens.len(), cache_session_start, audio_positions);
+            // A model that came with a draft head reads the hidden state of every forward from
+            // the prefill on: the head drafts from the state before the token it is given.
+            let head_capable = state.model.draft_head_capture(true);
+            if head_capable {
+                state.model.draft_head_reset();
+            }
             let prefill_start = std::time::Instant::now();
             // Prefill only the divergent suffix when the global cache reused a
             // prefix (cache_session_start>0, text path). Vision/no-cache -> start=0 ->
@@ -582,6 +588,14 @@ impl LlmEngine {
             let mut spec_on = drafting && spec_engine.draft_prefill(&prompt_tokens);
             let mut time_plain = spec_drafter_on && !drafting;
             if spec_on { info!("🜂 spec-decode active: drafter proposing for '{}'", state.name); }
+            // The model's own draft head drafts when no drafter model does and its cycles are
+            // not known to lose to plain decoding; the tokens it reads next start as the one
+            // the prefill sampled.
+            let mut head_on = head_capable && !spec_on && spec_engine.draft_length() > 0;
+            if head_capable && !head_on {
+                state.model.draft_head_capture(false);
+            }
+            let mut head_tokens: Vec<u32> = vec![next_token];
             let (mut spec_drafted, mut spec_accepted): (u64, u64) = (0, 0);
             let mut pld_stats_drafted: u64 = 0;
             let mut pld_stats_accepted: u64 = 0;
@@ -592,7 +606,11 @@ impl LlmEngine {
             // Helps long-context regressions where the prompt's n-grams
             // stop predicting the model's diverging completion.
             let mut pld_cooldown: u32 = 0;
-            let mut pld_cost = crate::inference::engine::decode_step::PldCost::default();
+            let mut pld_cost = spec_engine
+                .pld_cost
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .carried();
             let mut pld_window_drafted: u32 = 0;
             let mut pld_window_accepted: u32 = 0;
 
@@ -699,6 +717,7 @@ impl LlmEngine {
                 && !state.eos_token_ids_extra.contains(&next_token)
                 && generated.len() < max_tokens
                 && !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let step_start = std::time::Instant::now();
                 generated.push(next_token);
                 recent_tokens.push(next_token);
                 if pld_enabled { pld_cache.push(next_token); }
@@ -1153,6 +1172,7 @@ impl LlmEngine {
                                     &mut logits_processor,
                                 )?;
                                 record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
+                                pld_cost.plain_step(step_start.elapsed().as_secs_f64());
                                 continue;
                             }
                             Err(e) => {
@@ -1424,16 +1444,26 @@ impl LlmEngine {
                     // The draft length is learned across cycles (decode_step::DraftLength).
                     let cycle_start = std::time::Instant::now();
                     let mut draft_secs = 0.0;
-                    let want = if spec_on { spec_engine.draft_length() } else { 0 };
+                    let want = if spec_on || head_on { spec_engine.draft_length() } else { 0 };
                     if spec_on && want == 0 {
                         // Plain decoding pays more; the drafter's cache is left behind for good.
                         spec_on = false;
                         time_plain = true;
                     }
+                    if head_on && want == 0 {
+                        // Plain decoding pays more: the head stops reading the hidden states.
+                        head_on = false;
+                        time_plain = true;
+                        state.model.draft_head_capture(false);
+                    }
                     let draft: Vec<u32> = if spec_on {
                         let d = spec_engine.draft_k(next_token, want, pos, &recent_tokens, repeat_penalty, repeat_last_n);
                         draft_secs = cycle_start.elapsed().as_secs_f64();
                         if d.is_empty() { spec_on = false; } // drafter error -> disable spec
+                        d
+                    } else if head_on {
+                        let d = state.model.draft_head_tokens(&head_tokens, want);
+                        draft_secs = cycle_start.elapsed().as_secs_f64();
                         d
                     } else if pld_active {
                         pld_cache.lookup()
@@ -1491,8 +1521,18 @@ impl LlmEngine {
                         // Total committed this step = 1 (S_0) + accepted_drafts
                         let committed = 1 + accepted_drafts;
                         pos += committed;
-                        if !spec_on {
+                        if !spec_on && !head_on {
                             pld_cost.round(cycle_start.elapsed().as_secs_f64(), committed);
+                        }
+                        if head_on {
+                            head_tokens.clear();
+                            head_tokens.extend_from_slice(&draft[..accepted_drafts]);
+                            head_tokens.push(outcome.next_token);
+                            spec_drafted += k as u64;
+                            spec_accepted += accepted_drafts as u64;
+                            spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).record(
+                                k, accepted_drafts, draft_secs, cycle_start.elapsed().as_secs_f64(),
+                            );
                         }
 
                         // The verification forward wrote k+1 rows into the KV
@@ -1524,17 +1564,28 @@ impl LlmEngine {
                         // headroom in max_tokens - run the regular single-
                         // token forward.
                         let x = Tensor::new(&[next_token], device)?.unsqueeze(0)?;
-                        // stepd: state.forward for moondream graph capture
-                        // (device cloned earlier so this works).
-                        let logits = state.forward(&x, pos)?;
+                        // The draft head needs this step's hidden state, which the captured
+                        // graph does not hand out: the step runs as a one-row verify.
+                        let logits_1d = if head_on {
+                            let at = state.model.kv_len().unwrap_or(pos);
+                            state.model.draft_head_reset();
+                            state.model.forward_all(&x, at)?.squeeze(0)?.squeeze(0)?
+                        } else {
+                            // stepd: state.forward for moondream graph capture
+                            // (device cloned earlier so this works).
+                            state.forward(&x, pos)?.squeeze(0)?
+                        };
                         pos += 1;
-
-                        let logits_1d = logits.squeeze(0)?;
                         next_token = sample_row_sync(
                             &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
                             &mut logits_processor,
                         )?;
-                        pld_cost.plain_step(cycle_start.elapsed().as_secs_f64());
+                        if head_on {
+                            head_tokens.clear();
+                            head_tokens.push(next_token);
+                        } else {
+                            pld_cost.plain_step(cycle_start.elapsed().as_secs_f64());
+                        }
                         if time_plain {
                             spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).record(
                                 0, 0, 0.0, cycle_start.elapsed().as_secs_f64(),
@@ -1589,6 +1640,10 @@ impl LlmEngine {
                     );
                 }
             }
+            *spec_engine
+                .pld_cost
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = pld_cost.clone();
             // Prompt-lookup speculative decoding stats.
             if pld_stats_drafted > 0 {
                 let accept_rate = pld_stats_accepted as f64 / pld_stats_drafted as f64;
@@ -1653,6 +1708,9 @@ impl LlmEngine {
             } else {
                 0.0
             };
+            if head_capable {
+                state.model.draft_head_capture(false);
+            }
             info!("✅ Generated {} tokens ({:.1} tok/s, prefill {:.1}ms)",
                 eval_count, decode_tok_s, prompt_eval_duration as f64 / 1e6,
             );

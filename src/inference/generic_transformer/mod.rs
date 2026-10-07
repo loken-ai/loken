@@ -48,6 +48,7 @@ mod config;
 #[cfg(test)]
 mod conversion_tests;
 mod dense;
+mod draft_head;
 #[cfg(feature = "cuda")]
 pub mod expert_tier;
 #[cfg(not(feature = "cuda"))]
@@ -516,6 +517,8 @@ pub struct GenericHeteroTransformer {
     /// The n-gram embedding table, the tokens it hashes behind, and the rows gathered for
     /// the forward in progress.
     ngram: Option<NgramModel>,
+    /// The draft head the checkpoint shipped beside its layers, if the model came with one.
+    draft: Option<draft_head::DraftHead>,
 }
 
 /// The model-level part of the n-gram embedding; the token history lives with its layer.

@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Draft head: a model's own head drafts, read as released, its verify replayed as a graph.
 - Speculation: a verify runs its rows together, recurrent models included, while it pays.
 - Decode: a step replays as CUDA graphs, indexed attention and n-gram layers included.
 - Experts on the host: every card caches them, a miss runs on the card or the host.

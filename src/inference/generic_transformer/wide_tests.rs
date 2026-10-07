@@ -1007,3 +1007,81 @@ fn verify_cut_back(ordinal: Option<usize>, kv: KvQuant) {
         }
     }
 }
+
+/// The toy with a draft head: its layer the indexed attention layer of a second copy, the
+/// projections fixed smooth matrices, the output mixer the second copy's.
+fn toy_with_head() -> GenericHeteroTransformer {
+    use crate::tensor::layer::RmsNorm;
+    use crate::tensor::quantized::{GgmlDType, QTensor};
+    let mut m = toy();
+    let mut donor = toy();
+    let at = donor
+        .layers
+        .iter()
+        .position(|l| l.sparse.is_some())
+        .unwrap();
+    let layer = donor.layers.remove(at);
+    let layer_dev = donor.layer_devs.remove(at);
+    let mixer = donor.output_hyper.take().unwrap();
+    let (streams, dim) = (mixer.streams(), mixer.dim());
+    let eps = m.config.rms_norm_eps;
+    let dev = Device::Cpu;
+    let proj = |seed: f32| {
+        let w: Vec<f32> = (0..dim * dim)
+            .map(|i| (i as f32 * 0.37 + seed).sin() * 0.2)
+            .collect();
+        let t = Tensor::from_vec(w, (dim, dim), &dev).unwrap();
+        QMatMul::from_qtensor(QTensor::quantize(&t, GgmlDType::F32).unwrap()).unwrap()
+    };
+    m.draft = Some(draft_head::DraftHead {
+        layer,
+        layer_dev,
+        norm_embedding: RmsNorm::from_tensor(Tensor::ones(dim, DType::F32, &dev).unwrap(), eps),
+        hidden_gamma: Tensor::ones(streams * dim, DType::F32, &dev).unwrap(),
+        fc_embedding: proj(1.0),
+        fc_hidden: proj(2.0),
+        mixer,
+        streams,
+        dim,
+        eps,
+        len: 0,
+        committed: 0,
+        carried: None,
+        indexer_mark: None,
+    });
+    m
+}
+
+/// What the head guesses after `pairs` tokens, the pairs given in the calls `calls` cut
+/// (each call is `(first, count)` of `pairs`): the head reads the later calls after the guesses
+/// of the earlier ones were cut off.
+fn head_guesses(calls: &[(usize, usize)], k: usize) -> Vec<u32> {
+    let mut m = toy_with_head();
+    let wide = {
+        let d = m.draft.as_ref().unwrap();
+        d.streams * d.dim
+    };
+    let vocab = m.config.vocab_size as u32;
+    let tokens: Vec<u32> = (0..40u32).map(|i| (i * 5 + 1) % vocab).collect();
+    let feature = |from: usize, n: usize| {
+        let v: Vec<f32> = (from * wide..(from + n) * wide)
+            .map(|i| (i as f32 * 0.011).sin())
+            .collect();
+        Tensor::from_vec(v, (1, n, wide), &Device::Cpu).unwrap()
+    };
+    let mut out = Vec::new();
+    for &(from, n) in calls {
+        m.last_feature = Some(feature(from, n));
+        out = m.draft_tokens(&tokens[from..from + n], k).unwrap();
+    }
+    out
+}
+
+#[test]
+fn the_draft_head_cuts_its_guesses_from_the_indexer_as_from_its_cache() {
+    // 36 pairs read in one call, or in four with guesses made in between (the indexer's
+    // budget drops blocks at 16 tokens, so the later pairs are past it).
+    let whole = head_guesses(&[(0, 36)], 3);
+    let cut = head_guesses(&[(0, 12), (12, 9), (21, 7), (28, 8)], 3);
+    assert_eq!(whole, cut);
+}

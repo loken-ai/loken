@@ -261,6 +261,8 @@ pub struct LlmEngine {
     drafter_choice: Arc<std::sync::Mutex<Option<Option<String>>>>,
     /// What the cycles with the current drafter taught about the best draft length.
     draft_length: Arc<std::sync::Mutex<crate::inference::engine::decode_step::DraftLength>>,
+    /// What the prompt-lookup verifies of earlier requests cost against plain steps.
+    pld_cost: Arc<std::sync::Mutex<crate::inference::engine::decode_step::PldCost>>,
 }
 
 impl InferenceEngine for LlmEngine {
@@ -282,6 +284,7 @@ impl InferenceEngine for LlmEngine {
             batching: Arc::default(),
             drafter_choice: Arc::default(),
             draft_length: Arc::default(),
+            pld_cost: Arc::default(),
         }
     }
 
@@ -325,6 +328,7 @@ impl LlmEngine {
             batching: Arc::default(),
             drafter_choice: Arc::default(),
             draft_length: Arc::default(),
+            pld_cost: Arc::default(),
         }
     }
 

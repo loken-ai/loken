@@ -1255,6 +1255,14 @@ fn build_generic_layer(
         } else {
             None
         };
+        // The layer's own count of experts, which the stack's shape gives: a draft head has more
+        // than the layers it follows.
+        let layer_experts = des
+            .shape()
+            .dims()
+            .first()
+            .copied()
+            .unwrap_or(flags.n_experts);
         let des = coerce_moe_weight(des, device)?;
         // A stack in host memory is read in place by the host expert loop, which decodes only
         // the experts a call routes to. A stack on a card has no host blocks to slice, and the
@@ -1332,7 +1340,7 @@ fn build_generic_layer(
             up_exps_sep: up_sep,
             down_exps_scale,
             decode_slots,
-            n_experts: flags.n_experts,
+            n_experts: layer_experts,
             n_experts_used: flags.n_experts_used,
             expert_ffn_dim: flags.expert_ffn_dim,
             router_prenormed,
@@ -2309,6 +2317,61 @@ impl GenericHeteroTransformer {
 
     /// The load itself: `content` is the header the model is read from - one file's, or a set's
     /// union - and `source` says where each tensor's bytes are.
+    /// The draft head around its built `layer`: the projections that fuse an embedding with a
+    /// hidden state and the mixer that collapses the layer's streams, read from the source.
+    fn load_draft_head(
+        source: &TensorSource<'_>,
+        layer: GenericTransformerLayer,
+        layer_dev: LayerDevice,
+        cuda_devices: &HashMap<usize, Device>,
+        config: &GenericTransformerConfig,
+    ) -> Result<super::draft_head::DraftHead> {
+        let dev = match &layer_dev {
+            LayerDevice::Cuda(i) => cuda_devices.get(i).cloned().unwrap_or(Device::Cpu),
+            LayerDevice::Cpu => Device::Cpu,
+        };
+        let hyper = config.hyper.ok_or_else(|| {
+            crate::tensor::Error::msg("a draft head needs a wide residual".to_string())
+        })?;
+        // CONVERSION: norm scales are small vectors held F32 on the head's device.
+        let dense = |name: &str| -> Result<Tensor> {
+            source
+                .read(name, &Device::Cpu)?
+                .dequantize(&Device::Cpu)?
+                .to_device(&dev)
+        };
+        let matrix =
+            |name: &str| -> Result<QMatMul> { super::wide::load_matrix(source.read(name, &dev)?) };
+        let dim = config.embedding_length;
+        let eps = config.rms_norm_eps;
+        Ok(super::draft_head::DraftHead {
+            layer,
+            layer_dev,
+            norm_embedding: RmsNorm::from_tensor(dense("mtp.pre_fc_norm_embedding.weight")?, eps),
+            // CONVERSION: the scale of the hidden state's norm is held F32, as the wide residual is.
+            hidden_gamma: dense("mtp.pre_fc_norm_hidden.weight")?
+                .to_dtype(crate::tensor::DType::F32)?,
+            fc_embedding: matrix("mtp.fc_embedding.weight")?,
+            fc_hidden: matrix("mtp.fc_hidden.weight")?,
+            mixer: super::hyper::HyperMixer::new(
+                dense("mtp.out_hc_norm.weight")?,
+                matrix("mtp.out_hc_down.weight")?,
+                matrix("mtp.out_hc_up.weight")?,
+                None,
+                hyper.streams,
+                dim,
+                eps,
+            )?,
+            streams: hyper.streams,
+            dim,
+            eps,
+            len: 0,
+            committed: 0,
+            carried: None,
+            indexer_mark: None,
+        })
+    }
+
     fn from_gguf_source(
         content: &gguf_file::Content,
         source: TensorSource<'_>,
@@ -2669,6 +2732,18 @@ impl GenericHeteroTransformer {
                     );
                 }
             }
+        }
+
+        // A draft head the model ships beside its layers stands as one more layer after the last,
+        // on the device the output head runs on. The loops below build it like any other; it is
+        // set apart once built.
+        let draft_kind = (plan.holds_head()
+            && content.tensor_infos.contains_key("mtp.fc_embedding.weight"))
+        .then(|| layer_devices.last().map(|&(_, kind)| kind))
+        .flatten();
+        let mut layer_devices = layer_devices;
+        if let Some(kind) = draft_kind {
+            layer_devices.push((n_layers, kind));
         }
 
         // -- 5. Phase 1: GGUF tensor loading -----------------------------
@@ -3243,8 +3318,16 @@ impl GenericHeteroTransformer {
                 .map(build_one)
                 .collect::<Result<Vec<_>>>()?
         };
-        let (layers, layer_devs): (Vec<GenericTransformerLayer>, Vec<LayerDevice>) =
+        let (mut layers, mut layer_devs): (Vec<GenericTransformerLayer>, Vec<LayerDevice>) =
             built.into_iter().unzip();
+        let draft_built = draft_kind.map(|_| {
+            (
+                layers.pop().expect("the draft head's layer was built"),
+                layer_devs
+                    .pop()
+                    .expect("the draft head's layer has a device"),
+            )
+        });
 
         info!(
             "✅ Phase 2: {} layers built, cuda_devices={}",
@@ -3501,6 +3584,16 @@ impl GenericHeteroTransformer {
             }
             _ => None,
         };
+        let draft = match draft_built {
+            Some((layer, dev)) => Some(Self::load_draft_head(
+                &source,
+                layer,
+                dev,
+                cuda_devices,
+                &config,
+            )?),
+            None => None,
+        };
         let mut model = Self {
             adapters: Vec::new(),
             config,
@@ -3544,6 +3637,7 @@ impl GenericHeteroTransformer {
             host_experts_hot: None,
             output_hyper,
             ngram: ngram_model,
+            draft,
         };
 
         // A SiLU MoE layer on the host runs its experts through a repacked layout derived
@@ -3889,6 +3983,7 @@ impl GenericHeteroTransformer {
             host_experts_hot: None,
             output_hyper: None,
             ngram: None,
+            draft: None,
         })
     }
 }
