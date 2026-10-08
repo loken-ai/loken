@@ -123,6 +123,37 @@ impl CapturedGraph {
         Ok(types)
     }
 
+    /// The name of the kernel each of `nodes` launches, `None` for a node that is not a kernel.
+    pub fn kernel_names(
+        &self,
+        nodes: &[sys::CUgraphNode],
+    ) -> Result<Vec<Option<String>>, DriverError> {
+        self.stream.context().bind_to_thread()?;
+        let mut names = Vec::with_capacity(nodes.len());
+        for &node in nodes {
+            let mut ty = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL;
+            unsafe { sys::cuGraphNodeGetType(node, &mut ty) }.result()?;
+            if ty != sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL {
+                names.push(None);
+                continue;
+            }
+            let mut params = std::mem::MaybeUninit::<sys::CUDA_KERNEL_NODE_PARAMS>::uninit();
+            unsafe { sys::cuGraphKernelNodeGetParams_v2(node, params.as_mut_ptr()) }.result()?;
+            let params = unsafe { params.assume_init() };
+            let mut name: *const std::ffi::c_char = std::ptr::null();
+            let named = unsafe { sys::cuFuncGetName(&mut name, params.func) }.result();
+            names.push(match named {
+                Ok(()) if !name.is_null() => Some(
+                    unsafe { std::ffi::CStr::from_ptr(name) }
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                _ => Some(String::from("?")),
+            });
+        }
+        Ok(names)
+    }
+
     /// End the capture begun on this graph's stream and bring the executable up to date with
     /// it: patched in place when the structure matches, instantiated afresh when it does not.
     pub fn end_capture_or_reinstantiate(&mut self) -> Result<UpdateOutcome, DriverError> {

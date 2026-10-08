@@ -241,6 +241,17 @@ pub(super) fn capture_decode_graph(
         steps.len() - graphs,
         nodes.total
     );
+    {
+        let mut by_count: Vec<_> = nodes.kernels.iter().collect();
+        by_count.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let top: Vec<String> = by_count
+            .iter()
+            .take(40)
+            .map(|(name, n)| format!("{n} {name}"))
+            .collect();
+        info!("kernels in the step's graphs: {}", top.join("; "));
+        tracing::debug!("first kernels of the step: {}", nodes.sequence.join(" | "));
+    }
     info!(
         "node histogram: kernel={} memcpy={} memset={} empty={} MEM_ALLOC={} MEM_FREE={} other={}",
         nodes.kernel, nodes.memcpy, nodes.memset, nodes.empty, nodes.alloc, nodes.free, nodes.other
@@ -294,20 +305,64 @@ impl DecodeGraph {
     /// logits.
     pub(super) fn launch(&self, model: &mut BoxedModelBackend) -> crate::tensor::Result<()> {
         let err = |e| crate::tensor::Error::msg(format!("graph launch: {e:?}"));
+        use crate::inference::offload::{prof_record, stage_prof_enabled};
+        let prof = stage_prof_enabled();
+        let started = prof.then(std::time::Instant::now);
         let mut last = None;
-        for step in &self.steps {
+        let mut timed: Vec<(usize, cudarc::driver::CudaEvent, cudarc::driver::CudaEvent)> =
+            Vec::new();
+        for (at, step) in self.steps.iter().enumerate() {
+            let t = prof.then(std::time::Instant::now);
             match step {
                 DecodeStep::Graph(g, s) => {
+                    let marks = if prof {
+                        let ctx = s.context();
+                        let new = || {
+                            ctx.new_event(Some(
+                                cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT,
+                            ))
+                        };
+                        match (new(), new()) {
+                            (Ok(a), Ok(b)) if a.record(s).is_ok() => Some((a, b)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     g.launch().map_err(err)?;
+                    if let Some((a, b)) = marks {
+                        if b.record(s).is_ok() {
+                            timed.push((at, a, b));
+                        }
+                    }
                     last = Some(s);
+                    if let Some(t) = t {
+                        prof_record("step: graph launch", t.elapsed().as_nanos() as u64);
+                    }
                 }
                 DecodeStep::Eager(op) => {
                     model.run_graph_op(*op)?;
+                    if let Some(t) = t {
+                        prof_record("step: eager op", t.elapsed().as_nanos() as u64);
+                    }
                 }
             }
         }
+        let t = prof.then(std::time::Instant::now);
         if let Some(s) = last {
             s.synchronize().map_err(err)?;
+        }
+        for (_, a, b) in &timed {
+            if let Ok(ms) = a.elapsed_ms(b) {
+                prof_record("step: graph device time", (ms as f64 * 1e6) as u64);
+            }
+        }
+        if let (Some(t), Some(started)) = (t, started) {
+            prof_record(
+                "step: wait for the last card",
+                t.elapsed().as_nanos() as u64,
+            );
+            prof_record("step: total", started.elapsed().as_nanos() as u64);
         }
         Ok(())
     }
@@ -325,6 +380,10 @@ impl DecodeGraph {
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 struct NodeCounts {
+    /// Kernel launches by kernel name.
+    kernels: std::collections::BTreeMap<String, usize>,
+    /// The first kernels of the step, in the order the driver lists the nodes.
+    sequence: Vec<String>,
     total: usize,
     kernel: usize,
     memcpy: usize,
@@ -342,6 +401,14 @@ impl NodeCounts {
         let count = g.num_nodes().unwrap_or(0);
         self.total += count;
         let Ok(nodes) = g.nodes(count) else { return };
+        if let Ok(names) = g.kernel_names(&nodes) {
+            for name in names.into_iter().flatten() {
+                if self.sequence.len() < 700 {
+                    self.sequence.push(name.chars().take(48).collect());
+                }
+                *self.kernels.entry(name).or_insert(0) += 1;
+            }
+        }
         let Ok(types) = g.node_types(&nodes) else {
             return;
         };

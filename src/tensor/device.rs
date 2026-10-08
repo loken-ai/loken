@@ -147,6 +147,13 @@ impl Device {
         match self {
             Self::Cpu => Ok(()),
             Self::Dry(_) => Ok(()),
+            // A wait on a stream being recorded into a graph would end the recording: what asks
+            // for one (a profile timing a stage, a debug check) has nothing to wait for there.
+            #[cfg(feature = "cuda")]
+            Self::Cuda(d) if crate::tensor::cuda_ext::capture_active(self) => {
+                let _ = d;
+                Ok(())
+            }
             #[cfg(feature = "cuda")]
             Self::Cuda(d) => d.synchronize(),
         }

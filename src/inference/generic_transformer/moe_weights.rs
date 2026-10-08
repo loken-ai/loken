@@ -45,6 +45,41 @@ fn sort_by_expert(choices: &Tensor) -> Result<(Tensor, Tensor)> {
 /// `experts[i]` the expert that row is multiplied by. Every expert launch below takes those two
 /// together with the per-token choice count - so they travel together, and the launches hang
 /// off them rather than repeating the triple at each call.
+/// Run `launch`, and with the stage profile on, record the time the card took between its
+/// start and its end, from events on the card's stream (a wait the profile pays for).
+#[cfg(feature = "cuda")]
+fn device_timed<T>(
+    name: &'static str,
+    on: &Tensor,
+    launch: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if !crate::inference::offload::stage_prof_enabled() || !on.device().is_cuda() {
+        return launch();
+    }
+    let Ok(dev) = on.device().as_cuda_device() else {
+        return launch();
+    };
+    if crate::tensor::cuda_ext::capture_active(&on.device()) {
+        return launch();
+    }
+    let stream = dev.0.stream().clone();
+    let ctx = stream.context();
+    let event = || ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT));
+    let (Ok(start), Ok(end)) = (event(), event()) else {
+        return launch();
+    };
+    if start.record(&stream).is_err() {
+        return launch();
+    }
+    let out = launch();
+    if end.record(&stream).is_ok() && end.synchronize().is_ok() {
+        if let Ok(ms) = start.elapsed_ms(&end) {
+            crate::inference::offload::prof_record(name, (ms as f64 * 1e6) as u64);
+        }
+    }
+    out
+}
+
 pub(super) struct ExpertRouting {
     pub(super) slots: Tensor,
     pub(super) experts: Tensor,
@@ -88,14 +123,16 @@ impl ExpertRouting {
     /// The same, against gate and up kept apart, combined by SiLU.
     #[cfg(feature = "cuda")]
     pub(super) fn gate_up_silu(&self, xs: &Tensor, gate: &QTensor, up: &QTensor) -> Result<Tensor> {
-        crate::inference::moe_cuda::moe_gemm_gguf_gate_up_silu_mul(
-            xs,
-            gate,
-            up,
-            &self.slots,
-            &self.experts,
-            self.topk,
-        )
+        device_timed("expert kernels: gate and up on the device", xs, || {
+            crate::inference::moe_cuda::moe_gemm_gguf_gate_up_silu_mul(
+                xs,
+                gate,
+                up,
+                &self.slots,
+                &self.experts,
+                self.topk,
+            )
+        })
     }
 
     /// Gate and up kept apart, each with its per-expert bias, combined by the clamped
@@ -137,31 +174,33 @@ impl ExpertRouting {
         bias: Option<&Tensor>,
         add_after: Option<&Tensor>,
     ) -> Result<Tensor> {
-        if imma && bias.is_none() && add_after.is_none() {
-            crate::inference::moe_cuda::moe_q4k_imma_m8_down_reduce(
-                rows,
-                stack,
-                &self.slots,
-                &self.experts,
-                weights,
-                self.topk,
-                n_tokens,
-                None,
-            )
-        } else {
-            crate::inference::moe_cuda::moe_gemm_gguf_down_reduce(
-                rows,
-                stack,
-                &self.slots,
-                &self.experts,
-                weights,
-                self.topk,
-                n_tokens,
-                None,
-                bias,
-                add_after,
-            )
-        }
+        device_timed("expert kernels: down on the device", rows, || {
+            if imma && bias.is_none() && add_after.is_none() {
+                crate::inference::moe_cuda::moe_q4k_imma_m8_down_reduce(
+                    rows,
+                    stack,
+                    &self.slots,
+                    &self.experts,
+                    weights,
+                    self.topk,
+                    n_tokens,
+                    None,
+                )
+            } else {
+                crate::inference::moe_cuda::moe_gemm_gguf_down_reduce(
+                    rows,
+                    stack,
+                    &self.slots,
+                    &self.experts,
+                    weights,
+                    self.topk,
+                    n_tokens,
+                    None,
+                    bias,
+                    add_after,
+                )
+            }
+        })
     }
 
     /// [`Self::gate_up_silu`] on the host.
