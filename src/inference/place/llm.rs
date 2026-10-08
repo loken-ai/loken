@@ -135,11 +135,11 @@ pub fn context_the_cards_hold(
 }
 
 /// A tensor-parallel placement: every block runs on each of `cards`, the feed-forward rows
-/// split so the first card takes `ffn_share.0 / ffn_share.1` of them.
+/// split so card `r` takes `ffn_shares[r]` parts of their total.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorParallel {
     pub cards: Vec<usize>,
-    pub ffn_share: (usize, usize),
+    pub ffn_shares: Vec<usize>,
 }
 
 /// Tensor parallelism over the first `ranks` cards, when the cards' speeds are read now.
@@ -187,32 +187,35 @@ pub fn tensor_parallel_on(
             .find(|(i, _)| *i == idx)
             .map_or(0, |(_, s)| *s)
     };
-    let first = speed(ranked[0].0);
-    let all: u64 = ranked.iter().map(|(idx, _)| speed(*idx)).sum();
-    let fits = |num: u64, den: u64| {
-        let first_share = weights.saturating_mul(num) / den;
-        let rest = weights.saturating_sub(first_share) / (ranks as u64 - 1);
-        first_share <= room[0] && room[1..].iter().all(|r| rest <= *r)
+    let speeds_of: Vec<u64> = ranked.iter().map(|(idx, _)| speed(*idx)).collect();
+    let fits = |shares: &[u64]| {
+        let total: u64 = shares.iter().sum();
+        shares
+            .iter()
+            .zip(&room)
+            .all(|(s, r)| weights.saturating_mul(*s) / total.max(1) <= *r)
     };
-    let by_speed = (first > 0 && all > first).then(|| reduced(first, all));
-    let even = (1, ranks as u64);
-    let share = by_speed
-        .filter(|&(n, d)| fits(n, d))
-        .or_else(|| fits(even.0, even.1).then_some(even))?;
+    // Shares in proportion to speed, in lowest terms, when every card's speed is known.
+    let by_speed = speeds_of.iter().all(|s| *s > 0).then(|| {
+        let g = speeds_of.iter().fold(0, |g, s| gcd(g, *s)).max(1);
+        speeds_of.iter().map(|s| s / g).collect::<Vec<u64>>()
+    });
+    let even = vec![1u64; ranks];
+    let shares = by_speed
+        .filter(|s| fits(s))
+        .or_else(|| fits(&even).then_some(even))?;
     Some(TensorParallel {
         cards: ranked.iter().map(|(idx, _)| *idx).collect(),
-        ffn_share: (share.0 as usize, share.1 as usize),
+        ffn_shares: shares.into_iter().map(|s| s as usize).collect(),
     })
 }
 
-/// `num / den` in lowest terms.
-fn reduced(num: u64, den: u64) -> (u64, u64) {
-    let (mut a, mut b) = (num, den);
-    while b != 0 {
-        (a, b) = (b, a % b);
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
     }
-    let g = a.max(1);
-    (num / g, den / g)
 }
 
 #[cfg(test)]
@@ -265,14 +268,22 @@ mod tests {
         let cards = [(0, 16 * GB), (1, 16 * GB)];
         let tp = tensor_parallel_on(&demand(10, 20), &cards, &[(0, 2), (1, 1)], 2).unwrap();
         assert_eq!(tp.cards, vec![0, 1]);
-        assert_eq!(tp.ffn_share, (2, 3));
+        assert_eq!(tp.ffn_shares, vec![2, 1]);
+    }
+
+    #[test]
+    fn three_cards_share_the_rows_in_proportion_to_their_speed() {
+        let cards = [(0, 16 * GB), (1, 16 * GB), (2, 16 * GB)];
+        let tp = tensor_parallel_on(&demand(10, 30), &cards, &[(0, 4), (1, 2), (2, 2)], 3).unwrap();
+        assert_eq!(tp.cards, vec![0, 1, 2]);
+        assert_eq!(tp.ffn_shares, vec![2, 1, 1]);
     }
 
     #[test]
     fn a_speed_share_that_does_not_fit_falls_back_to_even_then_to_none() {
         let cards = [(0, 14 * GB), (1, 14 * GB)];
         let tp = tensor_parallel_on(&demand(10, 24), &cards, &[(0, 2), (1, 1)], 2).unwrap();
-        assert_eq!(tp.ffn_share, (1, 2));
+        assert_eq!(tp.ffn_shares, vec![1, 1]);
         assert_eq!(
             tensor_parallel_on(&demand(10, 30), &cards, &[(0, 2), (1, 1)], 2),
             None

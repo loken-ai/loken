@@ -11,9 +11,6 @@ use crate::inference::generic_transformer::GenericTransformerConfig;
 use crate::inference::model_facts::{no_rope_layer_period, rope_pairing};
 use crate::tensor::quantized::gguf_file;
 
-/// Number of GPUs the decoder shards every layer across.
-pub const TP_RANKS: usize = 2;
-
 /// Tensors every file needs outside the layers.
 const MODEL_TENSORS: &[&str] = &["token_embd.weight", "output_norm.weight"];
 
@@ -32,7 +29,11 @@ const LAYER_TENSORS: &[&str] = &[
 
 /// `Ok(())` when the tensor-parallel decoder computes the same model as the file
 /// describes, else the first feature it lacks.
-pub fn tensor_parallel_support(ct: &gguf_file::Content, arch: &str) -> Result<(), String> {
+pub fn tensor_parallel_support(
+    ct: &gguf_file::Content,
+    arch: &str,
+    ranks: usize,
+) -> Result<(), String> {
     rope_pairing(arch)?;
     if no_rope_layer_period(arch).is_some() {
         return Err("some layers skip RoPE".into());
@@ -105,7 +106,7 @@ pub fn tensor_parallel_support(ct: &gguf_file::Content, arch: &str) -> Result<()
             "a value head size unlike the key head size",
         ),
         (
-            cfg.n_head % TP_RANKS != 0 || cfg.n_kv_head % TP_RANKS != 0,
+            cfg.n_head % ranks != 0 || cfg.n_kv_head % ranks != 0,
             "a head count the ranks cannot split evenly",
         ),
     ];
@@ -196,7 +197,7 @@ mod tests {
     }
 
     fn refusal(c: &Content, arch: &str) -> String {
-        tensor_parallel_support(c, arch).expect_err("the decoder must refuse this file")
+        tensor_parallel_support(c, arch, 2).expect_err("the decoder must refuse this file")
     }
 
     #[test]
@@ -205,14 +206,14 @@ mod tests {
         for t in ["attn_q.bias", "attn_k.bias", "attn_v.bias"] {
             per_layer(&mut c, t);
         }
-        assert_eq!(tensor_parallel_support(&c, "qwen2"), Ok(()));
+        assert_eq!(tensor_parallel_support(&c, "qwen2", 2), Ok(()));
     }
 
     #[test]
     fn dense_llama_and_mistral_files_are_admitted() {
         for arch in ["llama", "mistral", "mistral3"] {
             assert_eq!(
-                tensor_parallel_support(&dense(arch), arch),
+                tensor_parallel_support(&dense(arch), arch, 2),
                 Ok(()),
                 "{arch}"
             );
@@ -228,7 +229,7 @@ mod tests {
             "mistral3.rope.dimension_count",
             Value::U32(HIDDEN as u32 / HEADS),
         );
-        assert_eq!(tensor_parallel_support(&c, "mistral3"), Ok(()));
+        assert_eq!(tensor_parallel_support(&c, "mistral3", 2), Ok(()));
     }
 
     #[test]

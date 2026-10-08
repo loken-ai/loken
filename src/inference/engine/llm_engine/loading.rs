@@ -992,20 +992,22 @@ impl LlmEngine {
                     // the ladder below.
                     #[cfg(feature = "cuda")]
                     let tensor_parallel: Option<BoxedModelBackend> = {
-                        use crate::inference::serve::tp_support::{tensor_parallel_support, TP_RANKS};
+                        use crate::inference::serve::tp_support::tensor_parallel_support;
                         // The tensor-parallel loader reads one mapping, so a split set takes the
-                        // ladder.
-                        let tp = (awq.is_none()
-                            && layer_share.is_none()
-                            && split.is_none()
-                            && tensor_parallel_support(&content, &arch)
-                                .inspect_err(|why| info!("{arch} stays off tensor parallelism: {why}"))
-                                .is_ok())
-                        .then(|| crate::inference::place::llm::tensor_parallel(&demand, &cuda_devices, TP_RANKS))
-                        .flatten();
+                        // ladder. The fewest cards that hold the model carry it.
+                        let tp = (awq.is_none() && layer_share.is_none() && split.is_none())
+                            .then(|| {
+                                (2..=cuda_devices.len()).find_map(|ranks| {
+                                    tensor_parallel_support(&content, &arch, ranks)
+                                        .inspect_err(|why| info!("{arch} stays off tensor parallelism on {ranks} cards: {why}"))
+                                        .ok()?;
+                                    crate::inference::place::llm::tensor_parallel(&demand, &cuda_devices, ranks)
+                                })
+                            })
+                            .flatten();
                         tp.and_then(|tp| {
-                            info!("⬇️  Loading {arch} tensor-parallel across GPU {:?}, feed-forward share {}/{}",
-                                tp.cards, tp.ffn_share.0, tp.ffn_share.1);
+                            info!("⬇️  Loading {arch} tensor-parallel across GPU {:?}, feed-forward shares {:?}",
+                                tp.cards, tp.ffn_shares);
                             let built = tp
                                 .cards
                                 .iter()
@@ -1013,7 +1015,7 @@ impl LlmEngine {
                                 .collect::<AnyResult<Vec<Device>>>()
                                 .and_then(|cards| {
                                     crate::inference::serve::tp_model::TpQwen2::from_gguf(
-                                        mmap_bytes, &mmap, &arch, &cards, tp.ffn_share,
+                                        mmap_bytes, &mmap, &arch, &cards, &tp.ffn_shares,
                                     )
                                 });
                             match built {

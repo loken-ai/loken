@@ -1,17 +1,17 @@
-//! Tensor-parallel (TP=2) decoder for dense GQA+SwiGLU models: qwen2 (deepseek-r1 32B, with
+//! Tensor-parallel decoder (any number of ranks) for dense GQA+SwiGLU models: qwen2 (deepseek-r1 32B, with
 //! QKV bias) and the no-bias llama/mistral/mistral3 24B family (devstral-small-2,
 //! mistral-small3.2, magistral-small). QKV bias is read only when present.
 //!
-//! The GenericHetero pipeline runs ONE GPU per decode token (the other idles) - that's why
+//! The GenericHetero pipeline runs ONE GPU per decode token (the others idle) - that's why
 //! vLLM (tensor-parallel) beats us on 2-GPU models (deepseek-r1 26 vs 37 tok/s). This module
-//! runs BOTH GPUs on every layer: q/k/v/gate/up are column-parallel (each rank owns a head /
+//! runs EVERY GPU on every layer: q/k/v/gate/up are column-parallel (each rank owns a head /
 //! intermediate slice), o/down are row-parallel (each rank's partial is summed by a cross-GPU
 //! all-reduce). Built entirely on the validated `tp_decode` primitives (TpColumn/TpRow/
 //! all_reduce_sum) - see `bin/tp_{weight_slice,ffn,attn,layer,gqa}_test`.
 //!
 //! Scope: decode-first; `tp_support::tensor_parallel_support` decides from the file's
 //! tensors and metadata which models this decoder runs. Loader slices each
-//! layer's weights across the 2 GPUs; forward keeps the hidden state replicated and reduces
+//! layer's weights across the ranks; forward keeps the hidden state replicated and reduces
 //! once per attention + once per FFN. Per-rank KV cache holds that rank's kv-head subset.
 
 use crate::tensor::quantized::{gguf_file, QMatMul, QTensor};
@@ -25,7 +25,7 @@ use crate::inference::serve::tp_decode::{
     all_reduce_sum_nccl, all_reduce_sum_nccl_f16, make_comms, TpColumn, TpColumnFused, TpRow,
 };
 
-/// Cross-GPU all-reduce precision for the TP=2 decode reduction.
+/// Cross-GPU all-reduce precision for the tensor-parallel decode reduction.
 ///
 /// f16 halves the PCIe payload of the all-reduce and is fully correct - bit-identical greedy
 /// output and deterministic across runs on deepseek-r1 TP=2.
@@ -92,36 +92,30 @@ impl TpConfig {
     }
 }
 
-/// One transformer layer split across the 2 GPUs.
+/// One transformer layer split across the ranks.
 struct TpLayer {
-    attn_norm0: Tensor, // rmsnorm weight, replicated on g0 / g1
-    attn_norm1: Tensor,
-    ffn_norm0: Tensor,
-    ffn_norm1: Tensor,
+    attn_norm: Vec<Tensor>, // rmsnorm weight, replicated on every rank
+    ffn_norm: Vec<Tensor>,
     qk: TpColumnFused, // fused q|k column-parallel (+bias), one matmul/rank (both Q4_K)
     v: TpColumn,       // separate (v is Q6_K in Q4_K_M mixed quant - can't share the mvq)
     o: TpRow,          // row-parallel
     gate_up: TpColumnFused, // fused gate|up column-parallel, one matmul/rank (both Q4_K)
     down: TpRow,
-    // per-rank KV cache: [nkv_rank, total_seq, hd] on g0 / g1
-    kv0: Option<(Tensor, Tensor)>,
-    kv1: Option<(Tensor, Tensor)>,
+    // per-rank KV cache: [nkv_rank, total_seq, hd] on each rank's device
+    kv: Vec<Option<(Tensor, Tensor)>>,
 }
 
 pub struct TpQwen2 {
     cfg: TpConfig,
-    g0: Device,
-    g1: Device,
+    cards: Vec<Device>,
     embed: crate::tensor::layer::Embedding, // the file's [vocab, hidden] blocks, decoded per lookup
     layers: Vec<TpLayer>,
-    out_norm: Tensor, // on g0
-    lm_head: QMatMul, // on g0
+    out_norm: Tensor, // on cards[0]
+    lm_head: QMatMul, // on cards[0]
     // RoPE tables (interleaved), per device, [max_seq, hd/2]
-    cos0: Tensor,
-    sin0: Tensor,
-    cos1: Tensor,
-    sin1: Tensor,
-    // NCCL comms (rank0=g0, rank1=g1) for the overlapping all-reduce.
+    cos: Vec<Tensor>,
+    sin: Vec<Tensor>,
+    // NCCL comms (rank r = cards[r]) for the overlapping all-reduce.
     comms: Vec<cudarc::nccl::safe::Comm>,
     // Run the cross-GPU all-reduce in f16 (half the PCIe payload) vs f32.
     ar_f16: bool,
@@ -172,36 +166,37 @@ impl TpQwen2 {
         // while the suffix signals the layers are shared, not partitioned.
         (
             n,
-            vec![
-                ("CUDA (TP)".to_string(), gid(&self.g0), 0, last),
-                ("CUDA (TP)".to_string(), gid(&self.g1), 0, last),
-            ],
+            self.cards
+                .iter()
+                .map(|d| ("CUDA (TP)".to_string(), gid(d), 0, last))
+                .collect(),
         )
     }
 
-    /// The decoder over `cards`, one rank each, the first card taking `ffn_share.0 /
-    /// ffn_share.1` of the feed-forward rows: the placement decided both, and the shares
-    /// it chose fit.
+    /// The decoder over `cards`, one rank each, rank `r` taking `ffn_shares[r]` parts of the
+    /// feed-forward rows: the placement decided both, and the shares it chose fit.
     pub fn from_gguf(
         mmap_bytes: &[u8],
         mmap_owner: &std::sync::Arc<memmap2::Mmap>,
         arch: &str,
         cards: &[Device],
-        ffn_share: (usize, usize),
+        ffn_shares: &[usize],
     ) -> Result<Self> {
-        let [g0, g1] = cards else {
+        let ranks = cards.len();
+        if ranks < 2 || ffn_shares.len() != ranks {
             bail!(
-                "the tensor-parallel decoder runs on 2 cards, {} given",
-                cards.len()
+                "the tensor-parallel decoder needs 2 or more cards with a share each, {} cards and {} shares given",
+                ranks,
+                ffn_shares.len()
             );
-        };
-        let (g0, g1) = (g0.clone(), g1.clone());
+        }
+        let cards: Vec<Device> = cards.to_vec();
         // Disable the old substrate's per-op CUDA event tracking on both ranks. It records an event after
         // every op (~1.18M cuEventRecord/run in the nsys profile = 7% of CUDA API time) for
         // cross-stream ordering - but within a device ops are already stream-ordered, and the
         // ONLY cross-GPU dependency (the all-reduce) is handled by NCCL's own stream sync, not
         // the old substrate's to_device. So the events are pure overhead here.
-        for d in [&g0, &g1] {
+        for d in &cards {
             if let Ok(cd) = d.as_cuda_device() {
                 unsafe {
                     cd.disable_event_tracking();
@@ -211,14 +206,17 @@ impl TpQwen2 {
         let mut cur = Cursor::new(mmap_bytes);
         let ct = gguf_file::Content::read_mapped(&mut cur, mmap_owner.clone())?;
         let cfg = TpConfig::from_gguf(&ct, arch)?;
-        if cfg.n_head == 0 || cfg.n_kv_head == 0 || cfg.n_head % 2 != 0 || cfg.n_kv_head % 2 != 0 {
+        if cfg.n_head == 0
+            || cfg.n_kv_head == 0
+            || cfg.n_head % ranks != 0
+            || cfg.n_kv_head % ranks != 0
+        {
             bail!(
-                "TP=2 needs even n_head/n_kv_head, got {}/{}",
+                "TP={ranks} needs n_head/n_kv_head divisible by {ranks}, got {}/{}",
                 cfg.n_head,
                 cfg.n_kv_head
             );
         }
-        let (ffn_num, ffn_den) = ffn_share;
         let cpu = crate::tensor::Device::Cpu;
         let rd = |ct: &gguf_file::Content,
                   _cur: &mut Cursor<&[u8]>,
@@ -237,10 +235,10 @@ impl TpQwen2 {
             let norm = |ct: &gguf_file::Content,
                         cur: &mut Cursor<&[u8]>,
                         n: &str|
-             -> Result<(Tensor, Tensor)> {
+             -> Result<Vec<Tensor>> {
                 // CONVERSION: a norm scale is a small vector held F32 on each card.
                 let w = rd(ct, cur, n)?.dequantize(&cpu)?;
-                Ok((w.to_device(&g0)?, w.to_device(&g1)?))
+                cards.iter().map(|d| Ok(w.to_device(d)?)).collect()
             };
             // QKV bias is present on qwen2 but absent on llama/mistral/mistral3 - read it
             // only when the GGUF actually carries the tensor, else None (no-bias dense arch).
@@ -255,7 +253,7 @@ impl TpQwen2 {
                     Ok(None)
                 }
             };
-            let (attn_norm0, attn_norm1) = norm(&ct, &mut cur, &format!("{p}.attn_norm.weight"))?;
+            let attn_norm = norm(&ct, &mut cur, &format!("{p}.attn_norm.weight"))?;
             let wq = rd(&ct, &mut cur, &format!("{p}.attn_q.weight"))?;
             let bq = bias(&ct, &mut cur, &format!("{p}.attn_q.bias"))?;
             let wk = rd(&ct, &mut cur, &format!("{p}.attn_k.weight"))?;
@@ -263,35 +261,31 @@ impl TpQwen2 {
             let wv = rd(&ct, &mut cur, &format!("{p}.attn_v.weight"))?;
             let bv = bias(&ct, &mut cur, &format!("{p}.attn_v.bias"))?;
             let wo = rd(&ct, &mut cur, &format!("{p}.attn_output.weight"))?;
-            let (ffn_norm0, ffn_norm1) = norm(&ct, &mut cur, &format!("{p}.ffn_norm.weight"))?;
+            let ffn_norm = norm(&ct, &mut cur, &format!("{p}.ffn_norm.weight"))?;
             let wg = rd(&ct, &mut cur, &format!("{p}.ffn_gate.weight"))?;
             let wu = rd(&ct, &mut cur, &format!("{p}.ffn_up.weight"))?;
             let wd = rd(&ct, &mut cur, &format!("{p}.ffn_down.weight"))?;
             layers.push(TpLayer {
-                attn_norm0,
-                attn_norm1,
-                ffn_norm0,
-                ffn_norm1,
+                attn_norm,
+                ffn_norm,
                 qk: TpColumnFused::from_qtensors(
                     &[(&wq, bq.as_ref()), (&wk, bk.as_ref())],
-                    &g0,
-                    &g1,
+                    cfg.head_dim,
+                    &cards,
                 )?,
-                v: TpColumn::from_qtensor_bias(&wv, bv.as_ref(), &g0, &g1)?,
-                o: TpRow::from_qtensor(&wo, &g0, &g1)?,
-                // Asymmetric FFN split: the faster rank takes the larger share of the
-                // intermediate rows so both finish together at the FFN all-reduce. gate/up
-                // rows and down cols split at the SAME, QK_K-aligned point.
-                gate_up: TpColumnFused::from_qtensors_frac(
+                v: TpColumn::from_qtensor_bias(&wv, bv.as_ref(), &cards)?,
+                o: TpRow::from_qtensor(&wo, &cards)?,
+                // Asymmetric FFN split: the faster ranks take the larger shares of the
+                // intermediate rows so all finish together at the FFN all-reduce. gate/up
+                // rows and down cols split at the SAME, QK_K-aligned points.
+                gate_up: TpColumnFused::from_qtensors_shares(
                     &[(&wg, None), (&wu, None)],
-                    ffn_num,
-                    ffn_den,
-                    &g0,
-                    &g1,
+                    ffn_shares,
+                    crate::tensor::quant_cpu::QK_K,
+                    &cards,
                 )?,
-                down: TpRow::from_qtensor_frac(&wd, ffn_num, ffn_den, &g0, &g1)?,
-                kv0: None,
-                kv1: None,
+                down: TpRow::from_qtensor_shares(&wd, ffn_shares, &cards)?,
+                kv: vec![None; ranks],
             });
         }
         // (verified: deepseek-r1:32b qwen2 - layers=64 n_head=40 n_kv=8 hd=128 hidden=5120
@@ -300,28 +294,28 @@ impl TpQwen2 {
         let out_norm = rd(&ct, &mut cur, "output_norm.weight")?
             // CONVERSION: a norm scale is a small vector held F32.
             .dequantize(&cpu)?
-            .to_device(&g0)?;
-        let lm_qt = match ct.tensor(&mut cur, "output.weight", &g0) {
+            .to_device(&cards[0])?;
+        let lm_qt = match ct.tensor(&mut cur, "output.weight", &cards[0]) {
             Ok(qt) => qt,
-            Err(_) => ct.tensor(&mut Cursor::new(mmap_bytes), "token_embd.weight", &g0)?, // tied
+            Err(_) => ct.tensor(&mut Cursor::new(mmap_bytes), "token_embd.weight", &cards[0])?, // tied
         };
         let lm_head = QMatMul::from_arc(Arc::new(lm_qt))?;
-        let (cos0, sin0) = rope_tables(cfg.head_dim, cfg.rope_base, &g0)?;
-        let (cos1, sin1) = rope_tables(cfg.head_dim, cfg.rope_base, &g1)?;
-        let comms = make_comms(&g0, &g1)?;
+        let tables = cards
+            .iter()
+            .map(|d| rope_tables(cfg.head_dim, cfg.rope_base, d))
+            .collect::<Result<Vec<_>>>()?;
+        let (cos, sin): (Vec<Tensor>, Vec<Tensor>) = tables.into_iter().unzip();
+        let comms = make_comms(&cards)?;
         let ar_f16 = ar_f16_enabled();
         Ok(Self {
             cfg,
-            g0,
-            g1,
+            cards,
             embed,
             layers,
             out_norm,
             lm_head,
-            cos0,
-            sin0,
-            cos1,
-            sin1,
+            cos,
+            sin,
             comms,
             ar_f16,
         })
@@ -329,8 +323,7 @@ impl TpQwen2 {
 
     pub fn reset_kv(&mut self) {
         for l in &mut self.layers {
-            l.kv0 = None;
-            l.kv1 = None;
+            l.kv.iter_mut().for_each(|c| *c = None);
         }
     }
 
@@ -357,8 +350,7 @@ impl TpQwen2 {
             }
         };
         for l in &mut self.layers {
-            trim_one(&mut l.kv0);
-            trim_one(&mut l.kv1);
+            l.kv.iter_mut().for_each(trim_one);
         }
     }
 
@@ -479,13 +471,12 @@ impl TpQwen2 {
     fn all_reduce(
         f16: bool,
         comms: &[cudarc::nccl::safe::Comm],
-        p0: &Tensor,
-        p1: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
+        ps: &[Tensor],
+    ) -> Result<Vec<Tensor>> {
         if f16 {
-            all_reduce_sum_nccl_f16(p0, p1, comms)
+            all_reduce_sum_nccl_f16(ps, comms)
         } else {
-            all_reduce_sum_nccl(p0, p1, comms)
+            all_reduce_sum_nccl(ps, comms)
         }
     }
 
@@ -500,57 +491,342 @@ impl TpQwen2 {
         }
         let seq = tokens.len();
         let (nh, nkv, hd) = (self.cfg.n_head, self.cfg.n_kv_head, self.cfg.head_dim);
-        let (nh2, nkv2) = (nh / 2, nkv / 2);
+        let ranks = self.cards.len();
+        let (nh_r, nkv_r) = (nh / ranks, nkv / ranks);
         let eps = self.cfg.eps;
-        // embed -> [seq, hidden] on g0, replicate to g1
+        // embed -> [seq, hidden] on rank 0, replicated to the others
         let ids = Tensor::new(tokens, &Device::Cpu)?;
         let emb = self.embed.forward(&ids)?; // [seq, hidden] CPU
-        let mut x0 = emb
-            .to_device(&self.g0)?
+        let first = emb
+            .to_device(&self.cards[0])?
             .to_dtype(crate::tensor::DType::F32)?;
-        let mut x1 = x0.to_device(&self.g1)?;
+        let mut xs: Vec<Tensor> = Vec::with_capacity(ranks);
+        for card in &self.cards[1..] {
+            xs.push(first.to_device(card)?);
+        }
+        xs.insert(0, first);
 
         let ar_f16 = self.ar_f16;
         let comms = &self.comms;
         for l in self.layers.iter_mut() {
             // -- attention --
-            let h0 = rmsnorm(&x0, &l.attn_norm0, eps)?;
-            let h1 = rmsnorm(&x1, &l.attn_norm1, eps)?;
+            let hs = xs
+                .iter()
+                .zip(&l.attn_norm)
+                .map(|(x, w)| rmsnorm(x, w, eps))
+                .collect::<Result<Vec<_>>>()?;
             // Fused QK: one matmul/rank, then split [q|k] (decode seq=1 narrows are zero-copy);
-            // v stays separate (Q6_K). q/k/v all share input h0/h1.
-            let (qk0, qk1) = l.qk.forward(&h0, &h1)?;
-            let s0 = l.qk.split(&qk0, 0)?;
-            let s1 = l.qk.split(&qk1, 1)?;
-            let (v0, v1) = l.v.forward(&h0, &h1)?;
+            // v stays separate (Q6_K). q/k/v all share each rank's input.
+            let qk = l.qk.forward(&hs)?;
+            let vs = l.v.forward(&hs)?;
             let ri = self.cfg.use_rope_i;
-            let a0 = Self::rank_attn(
-                &s0[0], &s0[1], &v0, &mut l.kv0, nh2, nkv2, hd, pos, &self.cos0, &self.sin0, ri,
-            )?;
-            let a1 = Self::rank_attn(
-                &s1[0], &s1[1], &v1, &mut l.kv1, nh2, nkv2, hd, pos, &self.cos1, &self.sin1, ri,
-            )?;
-            let (p0, p1) = l.o.forward(&a0, &a1)?;
-            let (o0, o1) = Self::all_reduce(ar_f16, comms, &p0, &p1)?;
-            x0 = (&x0 + &o0)?;
-            x1 = (&x1 + &o1)?;
+            let mut attn = Vec::with_capacity(ranks);
+            for r in 0..ranks {
+                let parts = l.qk.split(&qk[r], r)?;
+                attn.push(Self::rank_attn(
+                    &parts[0],
+                    &parts[1],
+                    &vs[r],
+                    &mut l.kv[r],
+                    nh_r,
+                    nkv_r,
+                    hd,
+                    pos,
+                    &self.cos[r],
+                    &self.sin[r],
+                    ri,
+                )?);
+            }
+            let partial = l.o.forward(&attn)?;
+            let reduced = Self::all_reduce(ar_f16, comms, &partial)?;
+            xs = xs
+                .iter()
+                .zip(&reduced)
+                .map(|(x, o)| Ok((x + o)?))
+                .collect::<Result<Vec<_>>>()?;
             // -- FFN --
-            let h0 = rmsnorm(&x0, &l.ffn_norm0, eps)?;
-            let h1 = rmsnorm(&x1, &l.ffn_norm1, eps)?;
+            let hs = xs
+                .iter()
+                .zip(&l.ffn_norm)
+                .map(|(x, w)| rmsnorm(x, w, eps))
+                .collect::<Result<Vec<_>>>()?;
             // Fused gate|up: one matmul/rank, then split + fused SiLU.mul.
-            let (gu0, gu1) = l.gate_up.forward(&h0, &h1)?;
-            let p0 = l.gate_up.split(&gu0, 0)?;
-            let p1 = l.gate_up.split(&gu1, 1)?;
-            let m0 = crate::inference::kernel::fused::fused_silu_mul(&p0[0], &p0[1])?;
-            let m1 = crate::inference::kernel::fused::fused_silu_mul(&p1[0], &p1[1])?;
-            let (dp0, dp1) = l.down.forward(&m0, &m1)?;
-            let (f0, f1) = Self::all_reduce(ar_f16, comms, &dp0, &dp1)?;
-            x0 = (&x0 + &f0)?;
-            x1 = (&x1 + &f1)?;
+            let gu = l.gate_up.forward(&hs)?;
+            let mut acts = Vec::with_capacity(ranks);
+            for r in 0..ranks {
+                let parts = l.gate_up.split(&gu[r], r)?;
+                acts.push(crate::inference::kernel::fused::fused_silu_mul(
+                    &parts[0], &parts[1],
+                )?);
+            }
+            let partial = l.down.forward(&acts)?;
+            let reduced = Self::all_reduce(ar_f16, comms, &partial)?;
+            xs = xs
+                .iter()
+                .zip(&reduced)
+                .map(|(x, f)| Ok((x + f)?))
+                .collect::<Result<Vec<_>>>()?;
         }
         // final norm + lm_head on g0, last token only
-        let last = x0.i(seq - 1)?.unsqueeze(0)?; // [1, hidden]
+        let last = xs[0].i(seq - 1)?.unsqueeze(0)?; // [1, hidden]
         let h = rmsnorm(&last, &self.out_norm, eps)?;
         let logits = self.lm_head.forward(&h)?; // [1, vocab]
         Ok(logits.squeeze(0)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
+    use crate::tensor::quantized::gguf_file::Value;
+    use crate::tensor::quantized::GgmlDType;
+    use crate::tensor::DType;
+
+    const HIDDEN: usize = 512;
+    const HEADS: usize = 4;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 128;
+    const FFN: usize = 1024;
+    const VOCAB: usize = 256;
+    const LAYERS: usize = 2;
+    const EPS: f64 = 1e-5;
+
+    /// A small qwen2-shaped file with random weights: the quantised matrices as the decoder
+    /// slices them, the rest F32. Returns the path and the dequantised weights by tensor name.
+    fn toy_file(
+        dir: &std::path::Path,
+    ) -> (
+        std::path::PathBuf,
+        std::collections::HashMap<String, Tensor>,
+    ) {
+        let cpu = Device::Cpu;
+        let mut entries = Vec::new();
+        let mut dense = std::collections::HashMap::new();
+        let mut put = |name: &str, dims: &[usize], quant: bool, scale: f32| {
+            let w = Tensor::randn(0f32, scale, dims.to_vec(), &cpu).unwrap();
+            let (dtype, data, held) = if quant {
+                let q = QTensor::quantize(&w, GgmlDType::Q4K).unwrap();
+                let held = q.dequantize(&cpu).unwrap();
+                (GgmlDType::Q4K, q.data().unwrap().to_vec(), held)
+            } else {
+                let flat = w.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let bytes = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
+                (GgmlDType::F32, bytes, w)
+            };
+            entries.push(GgufEntry {
+                name: name.to_string(),
+                dims: dims.to_vec(),
+                dtype,
+                data,
+            });
+            dense.insert(name.to_string(), held);
+        };
+        put("token_embd.weight", &[VOCAB, HIDDEN], false, 1.0);
+        put("output_norm.weight", &[HIDDEN], false, 0.1);
+        put("output.weight", &[VOCAB, HIDDEN], true, 0.05);
+        for i in 0..LAYERS {
+            let p = format!("blk.{i}");
+            put(&format!("{p}.attn_norm.weight"), &[HIDDEN], false, 0.1);
+            put(
+                &format!("{p}.attn_q.weight"),
+                &[HEADS * HEAD_DIM, HIDDEN],
+                true,
+                0.05,
+            );
+            put(&format!("{p}.attn_q.bias"), &[HEADS * HEAD_DIM], false, 0.1);
+            put(
+                &format!("{p}.attn_k.weight"),
+                &[KV_HEADS * HEAD_DIM, HIDDEN],
+                true,
+                0.05,
+            );
+            put(
+                &format!("{p}.attn_k.bias"),
+                &[KV_HEADS * HEAD_DIM],
+                false,
+                0.1,
+            );
+            put(
+                &format!("{p}.attn_v.weight"),
+                &[KV_HEADS * HEAD_DIM, HIDDEN],
+                true,
+                0.05,
+            );
+            put(
+                &format!("{p}.attn_v.bias"),
+                &[KV_HEADS * HEAD_DIM],
+                false,
+                0.1,
+            );
+            put(
+                &format!("{p}.attn_output.weight"),
+                &[HIDDEN, HEADS * HEAD_DIM],
+                true,
+                0.05,
+            );
+            put(&format!("{p}.ffn_norm.weight"), &[HIDDEN], false, 0.1);
+            put(&format!("{p}.ffn_gate.weight"), &[FFN, HIDDEN], true, 0.05);
+            put(&format!("{p}.ffn_up.weight"), &[FFN, HIDDEN], true, 0.05);
+            put(&format!("{p}.ffn_down.weight"), &[HIDDEN, FFN], true, 0.05);
+        }
+        let u32v = |v: usize| Value::U32(v as u32);
+        let meta = vec![
+            (
+                "general.architecture".to_string(),
+                Value::String("qwen2".into()),
+            ),
+            ("qwen2.block_count".to_string(), u32v(LAYERS)),
+            ("qwen2.embedding_length".to_string(), u32v(HIDDEN)),
+            ("qwen2.attention.head_count".to_string(), u32v(HEADS)),
+            ("qwen2.attention.head_count_kv".to_string(), u32v(KV_HEADS)),
+            ("qwen2.attention.key_length".to_string(), u32v(HEAD_DIM)),
+            ("qwen2.feed_forward_length".to_string(), u32v(FFN)),
+            ("qwen2.rope.freq_base".to_string(), Value::F32(10000.0)),
+            (
+                "qwen2.attention.layer_norm_rms_epsilon".to_string(),
+                Value::F32(EPS as f32),
+            ),
+        ];
+        let path = dir.join("toy-qwen2.gguf");
+        write_gguf_with_metadata(&path, &meta, &entries).unwrap();
+        (path, dense)
+    }
+
+    /// The same model on one card with dense weights, the last token's logits.
+    fn reference(
+        w: &std::collections::HashMap<String, Tensor>,
+        tokens: &[u32],
+        dev: &Device,
+    ) -> Vec<f32> {
+        let seq = tokens.len();
+        let get = |n: &str| w[n].to_device(dev).unwrap();
+        let lin = |x: &Tensor, n: &str| {
+            x.matmul(&get(n).t().unwrap().contiguous().unwrap())
+                .unwrap()
+        };
+        let ids = Tensor::new(tokens, &Device::Cpu).unwrap();
+        let mut x = get("token_embd.weight")
+            .index_select(&ids.to_device(dev).unwrap(), 0)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let (cos, sin) = rope_tables(HEAD_DIM, 10000.0, dev).unwrap();
+        let heads = |t: &Tensor, n: usize| {
+            t.reshape((seq, n, HEAD_DIM))
+                .unwrap()
+                .transpose(0, 1)
+                .unwrap()
+                .contiguous()
+                .unwrap()
+        };
+        let rope = |t: &Tensor, n: usize| {
+            let h = heads(t, n).unsqueeze(0).unwrap();
+            crate::tensor::ops::rope(
+                &h.contiguous().unwrap(),
+                &cos.narrow(0, 0, seq).unwrap(),
+                &sin.narrow(0, 0, seq).unwrap(),
+            )
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+        };
+        for i in 0..LAYERS {
+            let p = format!("blk.{i}");
+            let h = rmsnorm(&x, &get(&format!("{p}.attn_norm.weight")), EPS).unwrap();
+            let q = lin(&h, &format!("{p}.attn_q.weight"))
+                .broadcast_add(&get(&format!("{p}.attn_q.bias")))
+                .unwrap();
+            let k = lin(&h, &format!("{p}.attn_k.weight"))
+                .broadcast_add(&get(&format!("{p}.attn_k.bias")))
+                .unwrap();
+            let v = lin(&h, &format!("{p}.attn_v.weight"))
+                .broadcast_add(&get(&format!("{p}.attn_v.bias")))
+                .unwrap();
+            let (q, k, v) = (rope(&q, HEADS), rope(&k, KV_HEADS), heads(&v, KV_HEADS));
+            let rep = HEADS / KV_HEADS;
+            let expand = |t: &Tensor| {
+                t.unsqueeze(1)
+                    .unwrap()
+                    .expand((KV_HEADS, rep, seq, HEAD_DIM))
+                    .unwrap()
+                    .reshape((HEADS, seq, HEAD_DIM))
+                    .unwrap()
+            };
+            let scores = (q
+                .matmul(&expand(&k).transpose(1, 2).unwrap().contiguous().unwrap())
+                .unwrap()
+                * (HEAD_DIM as f64).powf(-0.5))
+            .unwrap();
+            let mask: Vec<f32> = (0..seq)
+                .flat_map(|a| (0..seq).map(move |b| if b <= a { 0.0 } else { f32::NEG_INFINITY }))
+                .collect();
+            let scores = scores
+                .broadcast_add(&Tensor::from_vec(mask, (seq, seq), dev).unwrap())
+                .unwrap();
+            let att = crate::tensor::ops::softmax_last_dim(&scores)
+                .unwrap()
+                .matmul(&expand(&v))
+                .unwrap();
+            let att = att
+                .transpose(0, 1)
+                .unwrap()
+                .reshape((seq, HEADS * HEAD_DIM))
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            x = (&x + lin(&att, &format!("{p}.attn_output.weight"))).unwrap();
+            let h = rmsnorm(&x, &get(&format!("{p}.ffn_norm.weight")), EPS).unwrap();
+            let g = lin(&h, &format!("{p}.ffn_gate.weight"));
+            let u = lin(&h, &format!("{p}.ffn_up.weight"));
+            let act = (crate::tensor::ops::silu(&g).unwrap() * u).unwrap();
+            x = (&x + lin(&act, &format!("{p}.ffn_down.weight"))).unwrap();
+        }
+        let last = x.i(seq - 1).unwrap().unsqueeze(0).unwrap();
+        let h = rmsnorm(&last, &get("output_norm.weight"), EPS).unwrap();
+        lin(&h, "output.weight")
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb)
+    }
+
+    /// The decoder over two cards, with an even and with an uneven feed-forward share, gives the
+    /// logits of the same model on one card.
+    #[test]
+    #[ignore = "needs two CUDA cards and NCCL"]
+    fn the_ranks_reproduce_the_single_card_logits() {
+        let (Ok(c0), Ok(c1)) = (Device::new_cuda(0), Device::new_cuda(1)) else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("loken-tp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, weights) = toy_file(&dir);
+        let file = std::fs::File::open(&path).unwrap();
+        let map = Arc::new(unsafe { memmap2::Mmap::map(&file).unwrap() });
+        let tokens = [3u32, 17, 99, 5, 42];
+        let want = reference(&weights, &tokens, &c0);
+        for shares in [vec![1usize, 1], vec![3, 1]] {
+            let mut tp =
+                TpQwen2::from_gguf(&map, &map, "qwen2", &[c0.clone(), c1.clone()], &shares)
+                    .unwrap();
+            let got = tp
+                .forward(&tokens, 0)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let c = cosine(&got, &want);
+            assert!(c > 0.99, "shares {shares:?}: cosine {c}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

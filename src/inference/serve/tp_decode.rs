@@ -1,7 +1,7 @@
-//! Tensor-parallel (TP=2) decode primitives - the reusable core behind the
+//! Tensor-parallel decode primitives - the reusable core behind the
 //! tensor-parallel decode lever (deepseek-r1 +42% vs vLLM).
 //!
-//! The 2-GPU pipeline runs one GPU per decode token (the other idles). TP runs BOTH GPUs on
+//! The multi-GPU pipeline runs one GPU per decode token (the others idle). TP runs EVERY GPU on
 //! every layer: q/k/v and gate/up are **column-parallel** (each rank owns a head/intermediate
 //! subset), o_proj and down are **row-parallel** (each rank's partial output is summed by a
 //! cross-GPU all-reduce). A column->row pair needs no concat - the column output stays split
@@ -62,59 +62,92 @@ pub fn slice_qtensor_cols(
     )?))
 }
 
-/// Column-parallel matmul: a `[out,in]` weight split by output rows across the 2 GPUs.
+/// Boundaries of `shares.len()` ranks over an axis of `dim`: `shares.len() + 1` offsets from 0 to
+/// `dim`, rank `r` owning `[b[r], b[r + 1])`. Each interior boundary is rounded down to a multiple
+/// of `align` (a head, or a QK_K block, so a row-parallel partner's slice stays whole). A rank
+/// the rounding would leave empty sends the split to an even one.
+pub fn split_points(dim: usize, shares: &[usize], align: usize) -> Vec<usize> {
+    let ranks = shares.len();
+    let align = align.max(1);
+    let total: usize = shares.iter().sum::<usize>().max(1);
+    let cut =
+        |num: usize, den: usize, i: usize| (dim * num / den / align) * align * usize::from(i > 0);
+    let mut points = vec![0usize];
+    let mut cum = 0;
+    for (i, share) in shares.iter().enumerate() {
+        cum += share;
+        points.push(if i + 1 == ranks {
+            dim
+        } else {
+            cut(cum, total, 1)
+        });
+    }
+    if points.windows(2).any(|w| w[1] <= w[0]) {
+        points = (0..=ranks)
+            .map(|i| if i == ranks { dim } else { cut(i, ranks, i) })
+            .collect();
+    }
+    points
+}
+
+/// Column-parallel matmul: a `[out,in]` weight split by output rows across the ranks.
 /// `forward` returns each rank's partial output on its own device (stays split for the
 /// following row-parallel op).
 pub struct TpColumn {
-    pub g0: QMatMul, // rows [0, out/2)  on device 0
-    pub g1: QMatMul, // rows [out/2, out) on device 1
-    pub split: usize,
-    // Optional per-rank bias slice (qwen2 q/k/v projections carry a bias).
-    // Column-parallel: bias rows split the same way as the weight rows.
-    pub b0: Option<Tensor>, // bias[0, split)   on d0
-    pub b1: Option<Tensor>, // bias[split, out) on d1
+    /// Rank `r` holds output rows `[points[r], points[r + 1])` on its own device.
+    pub mats: Vec<QMatMul>,
+    pub points: Vec<usize>,
+    /// Optional per-rank bias slice (qwen2 q/k/v projections carry a bias), split like the rows.
+    pub biases: Vec<Option<Tensor>>,
 }
 impl TpColumn {
-    pub fn from_qtensor(qt: &QTensor, d0: &Device, d1: &Device) -> Result<Self> {
-        Self::from_qtensor_bias(qt, None, d0, d1)
+    pub fn from_qtensor(qt: &QTensor, devs: &[Device]) -> Result<Self> {
+        Self::from_qtensor_bias(qt, None, devs)
     }
-    /// Column-parallel build with an optional dequantized bias (F32 `[out]`),
-    /// sliced per rank to match the weight rows.
-    pub fn from_qtensor_bias(
-        qt: &QTensor,
-        bias: Option<&Tensor>,
-        d0: &Device,
-        d1: &Device,
-    ) -> Result<Self> {
+    /// Column-parallel build with an optional dequantized bias (F32 `[out]`), sliced per rank
+    /// to match the weight rows. The rows are split evenly, `align` rows at a time.
+    pub fn from_qtensor_bias(qt: &QTensor, bias: Option<&Tensor>, devs: &[Device]) -> Result<Self> {
         let out = qt.shape().dims()[0];
-        let split = out / 2;
-        let (b0, b1) = match bias {
-            Some(b) => (
-                Some(b.narrow(0, 0, split)?.to_device(d0)?),
-                Some(b.narrow(0, split, out - split)?.to_device(d1)?),
-            ),
-            None => (None, None),
-        };
+        let points = split_points(out, &vec![1; devs.len()], 1);
+        let mut mats = Vec::with_capacity(devs.len());
+        let mut biases = Vec::with_capacity(devs.len());
+        for (r, dev) in devs.iter().enumerate() {
+            let (s, e) = (points[r], points[r + 1]);
+            mats.push(QMatMul::from_arc(slice_qtensor_rows(qt, s, e, dev)?)?);
+            biases.push(match bias {
+                Some(b) => Some(b.narrow(0, s, e - s)?.to_device(dev)?),
+                None => None,
+            });
+        }
         Ok(Self {
-            g0: QMatMul::from_arc(slice_qtensor_rows(qt, 0, split, d0)?)?,
-            g1: QMatMul::from_arc(slice_qtensor_rows(qt, split, out, d1)?)?,
-            split,
-            b0,
-            b1,
+            mats,
+            points,
+            biases,
         })
     }
-    /// x0 on d0, x1 on d1 (replicated input) -> (out0 on d0, out1 on d1).
-    pub fn forward(&self, x0: &Tensor, x1: &Tensor) -> Result<(Tensor, Tensor)> {
-        let mut o0 = self.g0.forward(x0)?;
-        if let Some(b) = &self.b0 {
-            o0 = o0.broadcast_add(b)?;
-        }
-        let mut o1 = self.g1.forward(x1)?;
-        if let Some(b) = &self.b1 {
-            o1 = o1.broadcast_add(b)?;
-        }
-        Ok((o0, o1))
+    /// The replicated input `xs[r]` on rank `r`'s device -> each rank's output on its device.
+    pub fn forward(&self, xs: &[Tensor]) -> Result<Vec<Tensor>> {
+        self.mats
+            .iter()
+            .zip(&self.biases)
+            .zip(xs)
+            .map(|((m, b), x)| {
+                let o = m.forward(x)?;
+                Ok(match b {
+                    Some(b) => o.broadcast_add(b)?,
+                    None => o,
+                })
+            })
+            .collect()
     }
+}
+
+/// `dim`'s offsets for an asymmetric split between the ranks, rounded down to a QK_K(256)
+/// boundary so a row-parallel partner's column slice stays block-aligned. The faster rank takes
+/// the larger share so all finish their matmuls together and none idles at the all-reduce.
+/// Falls back to an even split if rounding would empty a rank.
+pub fn asym_points(dim: usize, shares: &[usize]) -> Vec<usize> {
+    split_points(dim, shares, QK_K)
 }
 
 /// Fused column-parallel projection: several `[out_i, in]` weights sharing the SAME input
@@ -122,54 +155,38 @@ impl TpColumn {
 /// N matmul + N bias-add launches of the unfused path with 1 + 1 - pure launch reduction
 /// (decode is launch-bound), and one larger mvq has better occupancy than N small ones.
 /// All sub-weights must share dtype + input dim (q/k/v and gate/up do in qwen2).
-/// GPU0's share of a `dim`-sized axis for an ASYMMETRIC TP split, rounded DOWN to a QK_K(256)
-/// boundary so a row-parallel partner's column slice stays block-aligned. `num/den` is GPU0's
-/// target fraction - the faster GPU gets more rows so both finish their matmuls together and
-/// neither idles at the all-reduce barrier (nsys: 50/50 made the fast GPU0 spin 656ms/60-tok
-/// waiting for the ~2x slower GPU1). Falls back to `dim/2` if rounding would zero a side.
-pub fn asym_split(dim: usize, num: usize, den: usize) -> usize {
-    let s = (dim * num / den / QK_K) * QK_K;
-    if s == 0 || s >= dim {
-        (dim / 2 / QK_K) * QK_K
-    } else {
-        s
-    }
-}
-
 pub struct TpColumnFused {
-    pub g0: QMatMul,
-    pub g1: QMatMul,
-    pub b0: Option<Tensor>,
-    pub b1: Option<Tensor>,
-    /// per-rank output width of each sub-projection (in concat order). Differ when the split
-    /// is asymmetric (GPU0 gets more rows than GPU1).
-    pub widths0: Vec<usize>,
-    pub widths1: Vec<usize>,
+    pub mats: Vec<QMatMul>,
+    pub biases: Vec<Option<Tensor>>,
+    /// Per-rank output width of each sub-projection (in concat order). They differ when the
+    /// split is asymmetric.
+    pub widths: Vec<Vec<usize>>,
 }
 impl TpColumnFused {
-    /// Symmetric (50/50) build - q/k where the o-proj alignment forbids an asymmetric cut.
+    /// Even build on `align`-row boundaries (a head for q/k, where the o-proj alignment forbids
+    /// an asymmetric cut).
     pub fn from_qtensors(
         items: &[(&QTensor, Option<&Tensor>)],
-        d0: &Device,
-        d1: &Device,
+        align: usize,
+        devs: &[Device],
     ) -> Result<Self> {
-        Self::from_qtensors_frac(items, 1, 2, d0, d1)
+        Self::from_qtensors_shares(items, &vec![1; devs.len()], align, devs)
     }
-    /// Asymmetric build: each weight is column-parallel row-split at `asym_split(out,num,den)`
-    /// (GPU0's share), the per-rank row-slices byte-concatenated into one quantized weight/device.
-    pub fn from_qtensors_frac(
+    /// Asymmetric build: each weight is column-parallel row-split at `split_points(out, shares,
+    /// align)`, the per-rank row-slices byte-concatenated into one quantized weight per device.
+    pub fn from_qtensors_shares(
         items: &[(&QTensor, Option<&Tensor>)],
-        num: usize,
-        den: usize,
-        d0: &Device,
-        d1: &Device,
+        shares: &[usize],
+        align: usize,
+        devs: &[Device],
     ) -> Result<Self> {
+        let ranks = devs.len();
         let dt = items[0].0.dtype();
         let inn = items[0].0.shape().dims()[1];
-        let (mut bytes0, mut bytes1) = (Vec::<u8>::new(), Vec::<u8>::new());
-        let (mut rows0, mut rows1) = (0usize, 0usize);
-        let (mut widths0, mut widths1) = (Vec::new(), Vec::new());
-        let (mut b0p, mut b1p) = (Vec::<Tensor>::new(), Vec::<Tensor>::new());
+        let mut bytes = vec![Vec::<u8>::new(); ranks];
+        let mut rows = vec![0usize; ranks];
+        let mut widths = vec![Vec::new(); ranks];
+        let mut bias_parts: Vec<Vec<Tensor>> = vec![Vec::new(); ranks];
         let has_bias = items[0].1.is_some();
         for (qt, bias) in items {
             let dims = qt.shape().dims();
@@ -180,68 +197,58 @@ impl TpColumnFused {
             if bias.is_some() != has_bias {
                 anyhow::bail!("TpColumnFused: mixed bias / no-bias");
             }
-            let split = asym_split(out, num, den);
+            let points = split_points(out, shares, align);
             let data = qt.data()?;
             let row_bytes = data.len() / out;
-            bytes0.extend_from_slice(&data[0..split * row_bytes]);
-            bytes1.extend_from_slice(&data[split * row_bytes..out * row_bytes]);
-            rows0 += split;
-            rows1 += out - split;
-            widths0.push(split);
-            widths1.push(out - split);
-            if let Some(b) = bias {
-                b0p.push(b.narrow(0, 0, split)?);
-                b1p.push(b.narrow(0, split, out - split)?);
+            for r in 0..ranks {
+                let (s, e) = (points[r], points[r + 1]);
+                bytes[r].extend_from_slice(&data[s * row_bytes..e * row_bytes]);
+                rows[r] += e - s;
+                widths[r].push(e - s);
+                if let Some(b) = bias {
+                    bias_parts[r].push(b.narrow(0, s, e - s)?);
+                }
             }
         }
-        let g0 = QMatMul::from_arc(Arc::new(QTensor::from_ggml_bytes(
-            dt,
-            &bytes0,
-            vec![rows0, inn],
-            d0,
-        )?))?;
-        let g1 = QMatMul::from_arc(Arc::new(QTensor::from_ggml_bytes(
-            dt,
-            &bytes1,
-            vec![rows1, inn],
-            d1,
-        )?))?;
-        let (b0, b1) = if has_bias {
-            (
-                Some(Tensor::cat(&b0p.iter().collect::<Vec<_>>(), 0)?.to_device(d0)?),
-                Some(Tensor::cat(&b1p.iter().collect::<Vec<_>>(), 0)?.to_device(d1)?),
-            )
-        } else {
-            (None, None)
-        };
+        let mut mats = Vec::with_capacity(ranks);
+        let mut biases = Vec::with_capacity(ranks);
+        for (r, dev) in devs.iter().enumerate() {
+            mats.push(QMatMul::from_arc(Arc::new(QTensor::from_ggml_bytes(
+                dt,
+                &bytes[r],
+                vec![rows[r], inn],
+                dev,
+            )?))?);
+            biases.push(if has_bias {
+                Some(Tensor::cat(&bias_parts[r].iter().collect::<Vec<_>>(), 0)?.to_device(dev)?)
+            } else {
+                None
+            });
+        }
         Ok(Self {
-            g0,
-            g1,
-            b0,
-            b1,
-            widths0,
-            widths1,
+            mats,
+            biases,
+            widths,
         })
     }
-    /// One fused matmul per rank (+bias) -> (out0 on d0, out1 on d1).
-    pub fn forward(&self, x0: &Tensor, x1: &Tensor) -> Result<(Tensor, Tensor)> {
-        let mut o0 = self.g0.forward(x0)?;
-        if let Some(b) = &self.b0 {
-            o0 = o0.broadcast_add(b)?;
-        }
-        let mut o1 = self.g1.forward(x1)?;
-        if let Some(b) = &self.b1 {
-            o1 = o1.broadcast_add(b)?;
-        }
-        Ok((o0, o1))
+    /// One fused matmul per rank (+bias): the replicated input `xs[r]` on rank `r` -> its output.
+    pub fn forward(&self, xs: &[Tensor]) -> Result<Vec<Tensor>> {
+        self.mats
+            .iter()
+            .zip(&self.biases)
+            .zip(xs)
+            .map(|((m, b), x)| {
+                let o = m.forward(x)?;
+                Ok(match b {
+                    Some(b) => o.broadcast_add(b)?,
+                    None => o,
+                })
+            })
+            .collect()
     }
-    /// Split rank `r`'s fused output `[seq, sum(widths_r)]` into its contiguous sub-projections.
+    /// Split rank `rank`'s fused output `[seq, sum(widths_r)]` into its contiguous sub-projections.
     pub fn split(&self, o: &Tensor, rank: usize) -> Result<Vec<Tensor>> {
-        let widths = if rank == 0 {
-            &self.widths0
-        } else {
-            &self.widths1
-        };
+        let widths = &self.widths[rank];
         let mut parts = Vec::with_capacity(widths.len());
         let mut off = 0;
         for &w in widths {
@@ -252,41 +259,45 @@ impl TpColumnFused {
     }
 }
 
-/// Row-parallel matmul: a `[out,in]` weight split by input columns across the 2 GPUs.
+/// Row-parallel matmul: a `[out,in]` weight split by input columns across the ranks.
 /// `forward` takes each rank's split input and returns its partial output (to be all-reduced).
 pub struct TpRow {
-    pub g0: QMatMul, // cols [0, in/2)  on device 0
-    pub g1: QMatMul, // cols [in/2, in) on device 1
+    pub mats: Vec<QMatMul>,
 }
 impl TpRow {
-    pub fn from_qtensor(qt: &QTensor, d0: &Device, d1: &Device) -> Result<Self> {
-        Self::from_qtensor_frac(qt, 1, 2, d0, d1)
+    /// Even column split on QK_K blocks.
+    pub fn from_qtensor(qt: &QTensor, devs: &[Device]) -> Result<Self> {
+        Self::from_qtensor_shares(qt, &vec![1; devs.len()], devs)
     }
-    /// Asymmetric col-split at `asym_split(in,num,den)` - must MATCH the row-split of the
+    /// Asymmetric col-split at `asym_points(in, shares)` - must MATCH the row-split of the
     /// column-parallel weight feeding this one (e.g. `down` cols ↔ `gate/up` rows).
-    pub fn from_qtensor_frac(
-        qt: &QTensor,
-        num: usize,
-        den: usize,
-        d0: &Device,
-        d1: &Device,
-    ) -> Result<Self> {
+    pub fn from_qtensor_shares(qt: &QTensor, shares: &[usize], devs: &[Device]) -> Result<Self> {
         let inn = qt.shape().dims()[1];
-        let split = asym_split(inn, num, den);
-        Ok(Self {
-            g0: QMatMul::from_arc(slice_qtensor_cols(qt, 0, split, d0)?)?,
-            g1: QMatMul::from_arc(slice_qtensor_cols(qt, split, inn, d1)?)?,
-        })
+        let points = asym_points(inn, shares);
+        let mut mats = Vec::with_capacity(devs.len());
+        for (r, dev) in devs.iter().enumerate() {
+            mats.push(QMatMul::from_arc(slice_qtensor_cols(
+                qt,
+                points[r],
+                points[r + 1],
+                dev,
+            )?)?);
+        }
+        Ok(Self { mats })
     }
-    /// h0 on d0, h1 on d1 (split input) -> partial outputs (p0 on d0, p1 on d1).
-    pub fn forward(&self, h0: &Tensor, h1: &Tensor) -> Result<(Tensor, Tensor)> {
-        Ok((self.g0.forward(h0)?, self.g1.forward(h1)?))
+    /// Each rank's split input `hs[r]` on its device -> its partial output.
+    pub fn forward(&self, hs: &[Tensor]) -> Result<Vec<Tensor>> {
+        self.mats
+            .iter()
+            .zip(hs)
+            .map(|(m, h)| Ok(m.forward(h)?))
+            .collect()
     }
 }
 
-/// Cross-GPU all-reduce(sum) for TP=2: p0 on d0, p1 on d1 -> the sum, replicated on both.
-/// (Naive P2P via facade `to_device` + add. NCCL is the faster path once `libnccl` is
-/// installed - see the plan.)
+/// Cross-GPU all-reduce(sum): `ps[r]` on rank `r`'s device -> the sum, replicated on every rank.
+/// (Naive peer copies via facade `to_device` + add, through rank 0. NCCL is the faster path
+/// once `libnccl` is installed.)
 ///
 /// SYNCHRONIZATION IS LOAD-BEARING. the reference cross-CUDA `to_device` enqueues a peer copy on
 /// the destination stream without waiting for the SOURCE device's compute stream to finish
@@ -294,22 +305,18 @@ impl TpRow {
 /// reads partial/stale data - making the whole forward NON-DETERMINISTIC (the same layer
 /// gives different values across runs) and incoherent. Each device must be synchronized
 /// before its tensor is read cross-device, and after each peer copy before the result is used.
-pub fn all_reduce_sum(
-    p0: &Tensor,
-    p1: &Tensor,
-    d0: &Device,
-    d1: &Device,
-) -> Result<(Tensor, Tensor)> {
+pub fn all_reduce_sum(ps: &[Tensor], devs: &[Device]) -> Result<Vec<Tensor>> {
     // Correct (deterministic) but serializing fallback: the reference cross-CUDA peer copy does NOT
     // reliably order against the matmul that produced the source tensor, so we host-synchronize
     // the source device before each peer read. This is a full barrier (no GPU overlap). The fast
     // path is `all_reduce_sum_nccl` below.
-    d1.synchronize()?;
-    let p1_d0 = p1.to_device(d0)?;
-    let s0 = (p0 + p1_d0)?;
-    d0.synchronize()?;
-    let s1 = s0.to_device(d1)?;
-    Ok((s0, s1))
+    let mut sum = ps[0].clone();
+    for (p, dev) in ps.iter().zip(devs).skip(1) {
+        dev.synchronize()?;
+        sum = (&sum + p.to_device(&devs[0])?)?;
+    }
+    devs[0].synchronize()?;
+    devs.iter().map(|d| Ok(sum.to_device(d)?)).collect()
 }
 
 /// An NCCL failure as the library words it: the result code and NCCL's last message, which
@@ -330,74 +337,71 @@ fn nccl_failure(what: &str, e: &cudarc::nccl::result::NcclError) -> anyhow::Erro
     anyhow::anyhow!("{what}: {:?}: {detail}", e.0)
 }
 
-/// NCCL all-reduce(sum) for TP=2 - the OVERLAPPING path. Runs `ncclAllReduce` on each rank's
-/// own stream (so the collective is stream-ordered with the matmuls and the two GPUs
-/// run in parallel - no `device.synchronize()` barrier). `comms` are the 2 per-device comms
-/// from `make_comms`. Returns the summed tensor on each device (p0+p1 replicated).
+/// NCCL all-reduce(sum) - the OVERLAPPING path. Runs `ncclAllReduce` on each rank's own stream
+/// (so the collective is stream-ordered with the matmuls and the GPUs run in parallel - no
+/// `device.synchronize()` barrier). `comms` are the per-device comms from `make_comms`.
+/// Returns the summed tensor on each device, replicated.
 #[cfg(feature = "cuda")]
 pub fn all_reduce_sum_nccl(
-    p0: &Tensor,
-    p1: &Tensor,
+    ps: &[Tensor],
     comms: &[cudarc::nccl::safe::Comm],
-) -> Result<(Tensor, Tensor)> {
+) -> Result<Vec<Tensor>> {
     use cudarc::nccl::safe::{group_end, group_start, ReduceOp};
     // Clone each partial's f32 device buffer into an owned, mutable CudaSlice (outside the
     // NCCL group), so we can all-reduce it in place.
-    let (mut c0, dev0, shape0) = clone_cuda_f32(p0)?;
-    let (mut c1, dev1, shape1) = clone_cuda_f32(p1)?;
+    let mut owned = ps.iter().map(clone_cuda_f32).collect::<Result<Vec<_>>>()?;
     group_start().map_err(|e| nccl_failure("nccl group_start", &e))?;
-    comms[0]
-        .all_reduce_in_place(&mut c0, &ReduceOp::Sum)
-        .map_err(|e| nccl_failure("nccl ar0", &e))?;
-    comms[1]
-        .all_reduce_in_place(&mut c1, &ReduceOp::Sum)
-        .map_err(|e| nccl_failure("nccl ar1", &e))?;
+    for (comm, (slice, _, _)) in comms.iter().zip(owned.iter_mut()) {
+        comm.all_reduce_in_place(slice, &ReduceOp::Sum)
+            .map_err(|e| nccl_failure("nccl all-reduce", &e))?;
+    }
     group_end().map_err(|e| nccl_failure("nccl group_end", &e))?;
-    Ok((
-        wrap_cuda_f32(c0, &dev0, shape0)?,
-        wrap_cuda_f32(c1, &dev1, shape1)?,
-    ))
+    owned
+        .into_iter()
+        .map(|(slice, dev, shape)| wrap_cuda_f32(slice, &dev, shape))
+        .collect()
 }
 
-/// F16 NCCL all-reduce(sum) for TP=2 - halves the PCIe payload of the small 1-token decode
-/// reduction (the collective is latency/byte-bound on the PHB pair, not compute-bound, so
-/// fewer bytes ≈ lower latency). Each f32 partial is cast to f16 on its own device (stream-
-/// ordered), all-reduced in f16, then cast back to f32 for the residual add.
+/// F16 NCCL all-reduce(sum) - halves the PCIe payload of the small 1-token decode reduction
+/// (the collective is latency/byte-bound on the PHB pair, not compute-bound, so fewer bytes ≈
+/// lower latency). Each f32 partial is cast to f16 on its own device (stream-ordered),
+/// all-reduced in f16, then cast back to f32 for the residual add.
 ///
-/// PRECISION: the sum runs in f16. For TP=2 a row-parallel partial is one rank's share of the
-/// reduction (~half the contraction width), so the two addends are O(activation) magnitude and
-/// their f16 sum keeps ~3 decimal digits - well inside decode tolerance. Greedy argmax is
-/// unaffected at this scale (validated coherent + deterministic on deepseek-r1 TP=2). The
-/// downstream residual/norm/matmul stay f32; only the cross-GPU transport is f16.
+/// PRECISION: the sum runs in f16. A row-parallel partial is one rank's share of the reduction,
+/// so the addends are O(activation) magnitude and their f16 sum keeps ~3 decimal digits - well
+/// inside decode tolerance. Greedy argmax is unaffected at this scale (validated coherent +
+/// deterministic on deepseek-r1 TP=2). The downstream residual/norm/matmul stay f32; only the
+/// cross-GPU transport is f16.
 #[cfg(feature = "cuda")]
 pub fn all_reduce_sum_nccl_f16(
-    p0: &Tensor,
-    p1: &Tensor,
+    ps: &[Tensor],
     comms: &[cudarc::nccl::safe::Comm],
-) -> Result<(Tensor, Tensor)> {
+) -> Result<Vec<Tensor>> {
     use crate::tensor::DType;
     use cudarc::nccl::safe::{group_end, group_start, ReduceOp};
-    let (shape0, shape1) = (p0.shape().clone(), p1.shape().clone());
-    let (dev0, dev1) = (p0.device().clone(), p1.device().clone());
     // Cast to f16 on each producing device (stream-ordered with the matmul) and clone into an
     // owned, mutable CudaSlice<f16> for the in-place collective.
-    let h0 = p0.to_dtype(DType::F16)?;
-    let h1 = p1.to_dtype(DType::F16)?;
-    let mut c0 = clone_cuda_f16(&h0)?;
-    let mut c1 = clone_cuda_f16(&h1)?;
+    let mut owned = ps
+        .iter()
+        .map(|p| {
+            let h = p.to_dtype(DType::F16)?;
+            Ok((clone_cuda_f16(&h)?, p.shape().clone(), p.device().clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
     group_start().map_err(|e| nccl_failure("nccl group_start", &e))?;
-    comms[0]
-        .all_reduce_in_place(&mut c0, &ReduceOp::Sum)
-        .map_err(|e| nccl_failure("nccl f16 ar0", &e))?;
-    comms[1]
-        .all_reduce_in_place(&mut c1, &ReduceOp::Sum)
-        .map_err(|e| nccl_failure("nccl f16 ar1", &e))?;
+    for (comm, (slice, _, _)) in comms.iter().zip(owned.iter_mut()) {
+        comm.all_reduce_in_place(slice, &ReduceOp::Sum)
+            .map_err(|e| nccl_failure("nccl f16 all-reduce", &e))?;
+    }
     group_end().map_err(|e| nccl_failure("nccl group_end", &e))?;
-    let r0 = crate::tensor::cuda_ext::tensor_from_f16_slice(c0, shape0, &dev0)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let r1 = crate::tensor::cuda_ext::tensor_from_f16_slice(c1, shape1, &dev1)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok((r0.to_dtype(DType::F32)?, r1.to_dtype(DType::F32)?))
+    owned
+        .into_iter()
+        .map(|(slice, shape, dev)| {
+            let r = crate::tensor::cuda_ext::tensor_from_f16_slice(slice, shape, &dev)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(r.to_dtype(DType::F32)?)
+        })
+        .collect()
 }
 
 #[cfg(feature = "cuda")]
@@ -411,23 +415,22 @@ fn clone_cuda_f16(t: &Tensor) -> Result<crate::tensor::cuda_ext::CudaSlice<half:
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// Build the 2 single-process NCCL comms (rank 0 = d0, rank 1 = d1) from the reference per-device
+/// Build the single-process NCCL comms (rank `r` = `devs[r]`) from the reference per-device
 /// streams. Create once and reuse for every layer's all-reduce.
 #[cfg(feature = "cuda")]
-pub fn make_comms(d0: &Device, d1: &Device) -> Result<Vec<cudarc::nccl::safe::Comm>> {
+pub fn make_comms(devs: &[Device]) -> Result<Vec<cudarc::nccl::safe::Comm>> {
     if !crate::tensor::cuda::runtime::nccl_present() {
         return Err(anyhow::anyhow!("NCCL library not found"));
     }
-    let s0 = d0
-        .as_cuda_device()
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .cuda_stream();
-    let s1 = d1
-        .as_cuda_device()
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .cuda_stream();
-    cudarc::nccl::safe::Comm::from_devices(vec![s0, s1])
-        .map_err(|e| nccl_failure("nccl comm init", &e))
+    let streams = devs
+        .iter()
+        .map(|d| {
+            Ok(d.as_cuda_device()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .cuda_stream())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    cudarc::nccl::safe::Comm::from_devices(streams).map_err(|e| nccl_failure("nccl comm init", &e))
 }
 
 #[cfg(feature = "cuda")]
@@ -462,6 +465,91 @@ fn wrap_cuda_f32(
 ) -> Result<Tensor> {
     crate::tensor::cuda_ext::tensor_from_f32_slice(slice, shape, dev)
         .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use super::*;
+    use crate::tensor::quantized::GgmlDType;
+
+    #[test]
+    fn two_ranks_split_where_the_pair_always_did() {
+        for (dim, num, den) in [(10240usize, 2usize, 3usize), (27648, 1, 2), (5120, 3, 5)] {
+            let old = (dim * num / den / QK_K) * QK_K;
+            assert_eq!(asym_points(dim, &[num, den - num]), vec![0, old, dim]);
+        }
+    }
+
+    #[test]
+    fn any_number_of_ranks_cover_the_axis_in_whole_blocks() {
+        for ranks in 2..=6usize {
+            for shares in [vec![1; ranks], (1..=ranks).collect::<Vec<_>>()] {
+                let p = asym_points(17408, &shares);
+                assert_eq!(p.len(), ranks + 1);
+                assert_eq!((p[0], p[ranks]), (0, 17408));
+                assert!(p.windows(2).all(|w| w[1] > w[0]), "{p:?}");
+                assert!(p[1..ranks].iter().all(|b| b % QK_K == 0), "{p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_that_would_empty_a_rank_goes_even() {
+        let p = asym_points(1024, &[1, 100, 1]);
+        assert_eq!(p, vec![0, 256, 512, 1024]);
+    }
+
+    /// Column slices over three host "ranks" give the full projection row by row, and row slices
+    /// give partials that sum to it: the arithmetic of a tensor-parallel layer of any width.
+    #[test]
+    fn three_ranks_reproduce_one_projection() -> Result<()> {
+        let devs = vec![Device::Cpu, Device::Cpu, Device::Cpu];
+        let (out, inn) = (768usize, 1536usize);
+        let w = Tensor::randn(0f32, 1f32, (out, inn), &Device::Cpu)?;
+        let x = Tensor::randn(0f32, 1f32, (1usize, inn), &Device::Cpu)?;
+        let q = |w: &Tensor| QTensor::quantize(w, GgmlDType::Q4K);
+        let full = QMatMul::from_arc(Arc::new(q(&w)?))?.forward(&x)?;
+        let want = full.flatten_all()?.to_vec1::<f32>()?;
+
+        let col = TpColumn::from_qtensor(&q(&w)?, &devs)?;
+        assert_eq!(col.points, vec![0, 256, 512, 768]);
+        let got = col
+            .forward(&vec![x.clone(); 3])?
+            .iter()
+            .map(|t| t.flatten_all()?.to_vec1::<f32>())
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .concat();
+        let gap = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(gap < 1e-3, "column gap {gap}");
+
+        let row = TpRow::from_qtensor_shares(&q(&w)?, &[1, 1, 1], &devs)?;
+        let points = asym_points(inn, &[1, 1, 1]);
+        let parts: Vec<Tensor> = (0..3)
+            .map(|r| {
+                x.narrow(1, points[r], points[r + 1] - points[r])
+                    .unwrap()
+                    .contiguous()
+                    .unwrap()
+            })
+            .collect();
+        let partial = row.forward(&parts)?;
+        let mut sum = partial[0].clone();
+        for p in &partial[1..] {
+            sum = (&sum + p)?;
+        }
+        let got = sum.flatten_all()?.to_vec1::<f32>()?;
+        let gap = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(gap < 5e-2, "row gap {gap}");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
