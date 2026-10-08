@@ -256,6 +256,13 @@ pub(super) fn capture_decode_graph(
         "node histogram: kernel={} memcpy={} memset={} empty={} MEM_ALLOC={} MEM_FREE={} other={}",
         nodes.kernel, nodes.memcpy, nodes.memset, nodes.empty, nodes.alloc, nodes.free, nodes.other
     );
+    if crate::inference::offload::stage_prof_enabled() {
+        for step in &steps {
+            if let DecodeStep::Graph(g, s) = step {
+                report_kernel_costs(g, s);
+            }
+        }
+    }
     // The eager pass before the capture left its transients cached in the pool; the graphs'
     // own allocations need that memory when they are uploaded and run.
     let mut trimmed = Vec::new();
@@ -472,5 +479,73 @@ fn capture_op(
             None
         }
         Ok((Some(g), logits)) => Some((g, logits)),
+    }
+}
+
+/// With the stage profile on, say what each kernel of a graph costs the card: the graph is
+/// launched with every node of one kernel switched off, and the fall in its time is that
+/// kernel's. The launches write into the model's state, so the request is not one to keep.
+#[cfg(feature = "cuda")]
+fn report_kernel_costs(
+    g: &crate::tensor::cuda_ext::CapturedGraph,
+    s: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
+) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let ctx = s.context();
+    let time = |g: &crate::tensor::cuda_ext::CapturedGraph| -> Option<f64> {
+        let flags = cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+        let (a, b) = (
+            ctx.new_event(Some(flags)).ok()?,
+            ctx.new_event(Some(flags)).ok()?,
+        );
+        let mut best = f64::MAX;
+        for _ in 0..4 {
+            a.record(s).ok()?;
+            g.launch().ok()?;
+            b.record(s).ok()?;
+            b.synchronize().ok()?;
+            best = best.min(a.elapsed_ms(&b).ok()? as f64 * 1e3);
+        }
+        Some(best)
+    };
+    let Ok(count) = g.num_nodes() else { return };
+    let Ok(nodes) = g.nodes(count) else { return };
+    let Ok(names) = g.kernel_names(&nodes) else {
+        return;
+    };
+    let Some(whole) = time(g) else { return };
+    let mut by_name: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+    for (at, name) in names.iter().enumerate() {
+        if let Some(name) = name {
+            by_name
+                .entry(name.chars().take(60).collect())
+                .or_default()
+                .push(at);
+        }
+    }
+    let mut costs = Vec::new();
+    for (name, at) in &by_name {
+        for &i in at {
+            let _ = g.set_node_enabled(&nodes, i, false);
+        }
+        let without = time(g);
+        for &i in at {
+            let _ = g.set_node_enabled(&nodes, i, true);
+        }
+        if let Some(without) = without {
+            costs.push((whole - without, at.len(), name.clone()));
+        }
+    }
+    costs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    if !DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let top: Vec<String> = costs
+            .iter()
+            .take(30)
+            .map(|(us, n, name)| format!("{us:.0} us x{n} {name}"))
+            .collect();
+        info!(
+            "graph {whole:.0} us; cost of each kernel: {}",
+            top.join("; ")
+        );
     }
 }

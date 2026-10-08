@@ -123,6 +123,20 @@ impl CapturedGraph {
         Ok(types)
     }
 
+    /// Switch `node` on or off in the executable: a node that is off is skipped at launch.
+    pub fn set_node_enabled(
+        &self,
+        nodes: &[sys::CUgraphNode],
+        at: usize,
+        on: bool,
+    ) -> Result<(), DriverError> {
+        self.stream.context().bind_to_thread()?;
+        let node = *nodes
+            .get(at)
+            .ok_or(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE))?;
+        unsafe { sys::cuGraphNodeSetEnabled(self.cu_graph_exec, node, u32::from(on)) }.result()
+    }
+
     /// The name of the kernel each of `nodes` launches, `None` for a node that is not a kernel.
     pub fn kernel_names(
         &self,
