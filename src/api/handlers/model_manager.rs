@@ -214,6 +214,29 @@ pub(crate) struct LoadedModelEntry {
     /// Used by auto-eviction to pick the LRU model when we need to free
     /// a slot.
     pub(crate) last_used: Arc<AtomicI64>,
+    /// Further copies of the model, each whole on a card of its own, served beside `engine`.
+    pub(crate) replicas: Vec<Arc<LlmEngine>>,
+    /// Admits as many requests at once as the model has copies; `None` for one copy, which
+    /// the server's own gate admits.
+    pub(crate) gate: Option<Arc<crate::api::gate::RequestGate>>,
+    /// When a request was last sent to each copy, `engine` first.
+    sent: std::sync::Mutex<Vec<std::time::Instant>>,
+    /// The copy the last request went to.
+    last: std::sync::atomic::AtomicUsize,
+}
+
+/// How long a copy counts as taken after a request was sent to it, before the request has
+/// been admitted and shows in the copy's own count.
+const PICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The copy to send a request to, given each copy's requests in flight and whether one was
+/// sent to it a moment ago: the least taken, the one that served the last request on a tie,
+/// so a conversation goes on where its cache is while that copy is free.
+pub(crate) fn pick_copy(in_flight: &[usize], just_sent: &[bool], last: usize) -> usize {
+    let taken = |i: usize| in_flight[i] + usize::from(just_sent[i] && in_flight[i] == 0);
+    (0..in_flight.len())
+        .min_by_key(|&i| (taken(i), usize::from(i != last), i))
+        .unwrap_or(0)
 }
 
 impl LoadedModelEntry {
@@ -230,7 +253,52 @@ impl LoadedModelEntry {
             expire_handle: None,
             chat_format: None,
             last_used: Arc::new(AtomicI64::new(now_millis())),
+            replicas: Vec::new(),
+            gate: None,
+            sent: std::sync::Mutex::new(Vec::new()),
+            last: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Serve the model on `replicas` as well as on its own engine.
+    pub(crate) fn with_replicas(mut self, replicas: Vec<Arc<LlmEngine>>) -> Self {
+        if !replicas.is_empty() {
+            self.gate = Some(crate::api::gate::RequestGate::new(1 + replicas.len()));
+            let now = std::time::Instant::now() - PICK_WINDOW;
+            *self.sent.lock().unwrap_or_else(|e| e.into_inner()) = vec![now; 1 + replicas.len()];
+        }
+        self.replicas = replicas;
+        self
+    }
+
+    /// The engine the next request goes to.
+    pub(crate) fn serving(&self) -> Arc<LlmEngine> {
+        if self.replicas.is_empty() {
+            return self.engine.clone();
+        }
+        let copies = || std::iter::once(&self.engine).chain(self.replicas.iter());
+        let in_flight: Vec<usize> = copies().map(|e| e.in_flight()).collect();
+        let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
+        let just_sent: Vec<bool> = sent.iter().map(|t| t.elapsed() < PICK_WINDOW).collect();
+        let last = self.last.load(Ordering::Relaxed);
+        let at = pick_copy(&in_flight, &just_sent, last);
+        sent[at] = std::time::Instant::now();
+        self.last.store(at, Ordering::Relaxed);
+        copies()
+            .nth(at)
+            .cloned()
+            .unwrap_or_else(|| self.engine.clone())
+    }
+
+    /// Unload every copy of the model.
+    pub(crate) async fn unload_all(&self) -> Result<(), String> {
+        let mut first_error = None;
+        for engine in std::iter::once(&self.engine).chain(self.replicas.iter()) {
+            if let Err(e) = engine.unload().await {
+                first_error.get_or_insert(e.to_string());
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Record activity on this entry (for LRU eviction ordering).
@@ -284,7 +352,7 @@ impl APIServer {
             let mut engines_guard = engines.write().await;
             if let Some(pos) = engines_guard.iter().position(|e| e.model_id == model_id) {
                 let entry = engines_guard.remove(pos);
-                if let Err(e) = entry.engine.unload().await {
+                if let Err(e) = entry.unload_all().await {
                     info!("Error unloading model {}: {}", entry.model_id, e);
                 } else {
                     info!("Model {} unloaded after keep_alive expired", entry.model_id);
@@ -362,7 +430,7 @@ impl APIServer {
         if let Some(entry) = engines.iter_mut().find(|e| e.model_id == model_id) {
             entry.touch();
             // Cancel existing timer
-            if let Some(handle) = entry.expire_handle.take() {
+            if let Some(handle) = &entry.expire_handle.take() {
                 handle.abort();
             }
             // Schedule new timer with the entry's keep_alive (or server default)
@@ -396,7 +464,7 @@ impl APIServer {
         {
             let engines = self.engines.read().await;
             if let Some(entry) = engines.iter().find(|e| e.model_id == model_id) {
-                return Ok(entry.engine.clone());
+                return Ok(entry.serving());
             }
         }
 
@@ -660,11 +728,11 @@ impl APIServer {
                 };
                 match victim {
                     Some(entry) => {
-                        if let Some(h) = entry.expire_handle {
+                        if let Some(h) = &entry.expire_handle {
                             h.abort();
                         }
                         let name = entry.model_id.clone();
-                        if entry.engine.unload().await.is_ok() {
+                        if entry.unload_all().await.is_ok() {
                             info!("vram_manager: evicted idle LLM '{name}' under pressure");
                             1
                         } else {
@@ -749,12 +817,11 @@ impl APIServer {
                         None => return Ok(false),
                     }
                 };
-                if let Some(handle) = entry.expire_handle {
+                if let Some(handle) = &entry.expire_handle {
                     handle.abort();
                 }
                 entry
-                    .engine
-                    .unload()
+                    .unload_all()
                     .await
                     .map_err(|e| ApiError::Internal(format!("Failed to unload model: {}", e)))?;
             }
@@ -1004,11 +1071,11 @@ impl APIServer {
         info!("Model swap completed in engines list");
 
         // 4. Clean up old model (cancel expiration timer and unload)
-        if let Some(handle) = old_entry.expire_handle {
+        if let Some(handle) = &old_entry.expire_handle {
             handle.abort();
         }
 
-        if let Err(e) = old_entry.engine.unload().await {
+        if let Err(e) = old_entry.unload_all().await {
             warn!("Failed to unload old model {}: {}", old_entry.model_id, e);
         } else {
             info!("Old model {} unloaded successfully", old_entry.model_id);
@@ -1020,6 +1087,24 @@ impl APIServer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_request_goes_to_the_least_taken_copy_and_a_conversation_stays_put() {
+        use super::pick_copy;
+        // Everything idle: the copy that served the last request.
+        assert_eq!(pick_copy(&[0, 0], &[false, false], 1), 1);
+        assert_eq!(pick_copy(&[0, 0, 0], &[false; 3], 0), 0);
+        // A busy copy gives way, whichever served last.
+        assert_eq!(pick_copy(&[1, 0], &[false, false], 0), 1);
+        assert_eq!(pick_copy(&[2, 1, 3], &[false; 3], 2), 1);
+        // A request sent a moment ago, not yet admitted, counts as taking the copy.
+        assert_eq!(pick_copy(&[0, 0], &[true, false], 0), 1);
+        // Once admitted it shows in the count and the flag adds nothing: a tie.
+        assert_eq!(pick_copy(&[1, 1], &[true, false], 0), 0);
+        // Every copy taken: the one with the fewest, the first on a tie.
+        assert_eq!(pick_copy(&[2, 2], &[false, false], 1), 1);
+        assert_eq!(pick_copy(&[3], &[false], 0), 0);
+    }
+
     use super::*;
 
     /// One row per engine: the name it would answer with while holding something, an id

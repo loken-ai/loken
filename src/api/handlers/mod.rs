@@ -1870,6 +1870,7 @@ impl APIServer {
         } else {
             engine
         };
+        let replicas = self.load_replicas(model_id, &config, &engine).await;
         let expire_handle = if keep_alive_minutes > 0 {
             Some(self.schedule_expiration(model_id.to_string(), keep_alive_minutes))
         } else {
@@ -1884,10 +1885,60 @@ impl APIServer {
             return Ok(());
         }
         let mut entry =
-            LoadedModelEntry::new(model_id.to_string(), engine, Some(keep_alive_minutes));
+            LoadedModelEntry::new(model_id.to_string(), engine, Some(keep_alive_minutes))
+                .with_replicas(replicas);
         entry.expire_handle = expire_handle;
         engines.push(entry);
         Ok(())
+    }
+
+    /// The copies of `primary` the configuration asks for, each whole on a card the others do not
+    /// use. A model that is not whole on one card is served once, and a copy that cannot be
+    /// placed whole on its card is dropped.
+    async fn load_replicas(
+        &self,
+        model_id: &str,
+        config: &InferenceConfig,
+        primary: &Arc<LlmEngine>,
+    ) -> Vec<Arc<LlmEngine>> {
+        let wanted = config.replicas.saturating_sub(1);
+        if wanted == 0 {
+            return Vec::new();
+        }
+        let whole_on = |p: &crate::inference::place::Placement| {
+            (p.cards.len() == 1 && p.host_layers == 0).then(|| p.cards.clone())
+        };
+        let Some(used) = primary.placement().await.as_ref().and_then(whole_on) else {
+            tracing::warn!("{model_id}: not whole on one card, so served once");
+            return Vec::new();
+        };
+        let mut taken = used;
+        let mut copies = Vec::new();
+        let others: Vec<usize> = crate::inference::place::room::card_rooms()
+            .into_iter()
+            .map(|c| c.index)
+            .filter(|i| !taken.contains(i))
+            .collect();
+        for card in others.into_iter().take(wanted) {
+            let mut copy_config = config.clone();
+            copy_config.device_index = Some(card);
+            copy_config.replicas = 1;
+            let engine = Arc::new(LlmEngine::with_config(copy_config));
+            if let Err(e) = engine.load_model().await.map_err(|e| e.to_string()) {
+                tracing::warn!("{model_id}: no copy on card {card}: {e}");
+                continue;
+            }
+            let on_card = std::collections::BTreeSet::from([card]);
+            if engine.placement().await.as_ref().and_then(whole_on) == Some(on_card.clone()) {
+                info!("{model_id}: a copy is serving from card {card}");
+                taken.insert(card);
+                copies.push(engine);
+            } else {
+                tracing::warn!("{model_id}: no room whole on card {card}; no copy there");
+                let _ = engine.unload().await;
+            }
+        }
+        copies
     }
 
     /// Read the chat template blob from an Ollama manifest for a given model.
@@ -3000,8 +3051,15 @@ async fn acquire_gate(
     model: String,
     endpoint: &'static str,
 ) -> Result<crate::api::gate::RequestGuard, ApiError> {
-    state
-        .request_gate
+    // A model with copies on several cards admits as many requests as it has copies.
+    let own = {
+        let engines = state.engines.read().await;
+        engines
+            .iter()
+            .find(|e| e.model_id == model)
+            .and_then(|e| e.gate.clone())
+    };
+    own.unwrap_or_else(|| state.request_gate.clone())
         .acquire_with_info_timeout(priority, model, endpoint, GATE_WAIT)
         .await
         .ok_or_else(|| {

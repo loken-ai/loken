@@ -63,12 +63,21 @@ impl Default for ServerConfig {
     }
 }
 
+fn default_replicas() -> usize {
+    1
+}
+
 /// Inference configuration from TOML file. Only what loken cannot decide itself: the model it
 /// serves by default, where things live, and the features an operator switches on. Sampling,
 /// placement, threads and cache formats are decided from the model and the machine.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub struct InferenceConfigToml {
     pub model_id: String,
+    /// Copies of a model to serve side by side, each whole on a card of its own, so concurrent
+    /// requests run in parallel. One is the model once; a model that does not fit a single
+    /// card is served once whatever this says.
+    #[serde(default = "default_replicas")]
+    pub replicas: usize,
     #[serde(default)]
     pub kv_disk_dir: Option<String>,
     #[serde(default)]
@@ -254,6 +263,7 @@ impl Config {
             context_length: 0,
             dtype: DType::F16, // Default to F16
             device_index: None,
+            replicas: toml_config.replicas.max(1),
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
             kv_disk_budget_gb: toml_config.kv_disk_budget_gb,
             state_cache_dir: toml_config.state_cache_dir.clone(),

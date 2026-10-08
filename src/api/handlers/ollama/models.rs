@@ -801,11 +801,11 @@ pub(crate) async fn ollama_delete_model(
             info!("   Model is loaded, unloading...");
             let entry = engines.remove(pos);
             // Cancel expiration timer
-            if let Some(handle) = entry.expire_handle {
+            if let Some(handle) = &entry.expire_handle {
                 handle.abort();
             }
             // Unload the engine
-            let _ = entry.engine.unload().await;
+            let _ = entry.unload_all().await;
             info!("   Model unloaded from memory");
         } else {
             info!("   Model not currently loaded");

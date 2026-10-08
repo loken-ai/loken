@@ -23,6 +23,10 @@ model_id = "qwen3:0.6b"
 # Sampling comes from the model (its Modelfile or generation_config.json) and the request;
 # placement, threads, memory and the KV cache format from the machine. None is configured.
 
+# Copies of a model served side by side, each whole on a card of its own, so concurrent
+# requests run in parallel. A model that does not fit one card is served once.
+# replicas = 1
+
 # The disk tier keeps conversation snapshots across a restart, within a disk budget.
 # kv_disk_dir = "/var/lib/loken/kv"
 # kv_disk_budget_gb = 0             # 0 = no limit

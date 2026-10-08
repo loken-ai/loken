@@ -2200,10 +2200,10 @@ pub(crate) async fn openai_delete_model(
         let mut engines = state.engines.write().await;
         if let Some(pos) = engines.iter().position(|e| e.model_id == name) {
             let entry = engines.remove(pos);
-            if let Some(handle) = entry.expire_handle {
+            if let Some(handle) = &entry.expire_handle {
                 handle.abort();
             }
-            let _ = entry.engine.unload().await;
+            let _ = entry.unload_all().await;
         }
     }
     state

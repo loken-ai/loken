@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Data parallelism: `replicas` serves a model whole on several cards, requests spread.
 - API: Cohere /v2/rerank and /v2/embed and vLLM /score over the existing models.
 - Completions: best_of samples that many completions and returns the n most probable.
 - Tensor parallelism runs on any number of cards, the fewest that hold the model.

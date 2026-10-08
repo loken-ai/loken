@@ -64,6 +64,12 @@ Nothing below is configured; a key of that name in an older `config.toml` loads 
 | Resident models | As many language models stay loaded as the cards hold; the least recently used is unloaded only when an incoming model would otherwise be pushed off the cards. |
 | Context shift | Once a conversation outgrows the window, the resident tail is kept and re-phased instead of prefilling the whole window, wherever the cache supports it (not Q4 caches, sliding-window layers or recurrent hybrids). |
 
+### Copies of a model
+
+| Key | Default | What it does |
+|---|---|---|
+| `replicas` | `1` | Copies of a model to serve side by side, each whole on a card of its own, so concurrent requests run in parallel. A request goes to the least busy copy, and to the one that served the last request while that one is free, so a conversation keeps its cache. A model that does not fit one card is served once whatever this says, and a copy that cannot be placed whole on its card is dropped. A reload for a wider window or another cache format brings the model back as one copy until its next cold load. |
+
 ### KV reuse across requests
 
 | Key | Default | What it does |
