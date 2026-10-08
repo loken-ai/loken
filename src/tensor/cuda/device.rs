@@ -161,6 +161,8 @@ pub struct CudaDevice {
     /// The quantized module's functions already looked up, by name: a lookup takes the context and
     /// a driver call, and a kernel launched per projection would pay it every time.
     pub(super) quantized_fns: std::sync::Mutex<std::collections::HashMap<String, CudaFunction>>,
+    /// Functions of the elementwise, fused and mmvq modules, looked up in the driver once.
+    pub(super) module_fns: std::sync::Mutex<std::collections::HashMap<String, CudaFunction>>,
     /// Device attributes for the tiled quantized-matmul dispatch.
     pub(super) mmq_info: OnceLock<MmqDeviceInfo>,
     /// Generic NVRTC custom-module cache keyed by module name (compat
@@ -254,6 +256,7 @@ impl CudaDevice {
             mmvq_module: OnceLock::new(),
             quantized_module: OnceLock::new(),
             quantized_fns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            module_fns: std::sync::Mutex::new(std::collections::HashMap::new()),
             mmq_info: OnceLock::new(),
             custom_modules: std::sync::Mutex::new(std::collections::HashMap::new()),
             alt_stream: OnceLock::new(),
@@ -443,6 +446,31 @@ impl CudaDevice {
         Ok(self.blas.get().unwrap())
     }
 
+    /// `name` of `module`, from the cache or the driver: a launch of a kernel the step has
+    /// launched before costs a map lookup, not a driver call.
+    fn cached_fn(
+        &self,
+        kind: &str,
+        module: &std::sync::Arc<cudarc::driver::CudaModule>,
+        name: &str,
+    ) -> std::result::Result<CudaFunction, cudarc::driver::DriverError> {
+        let key = format!("{kind}/{name}");
+        if let Some(f) = self
+            .module_fns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(f.clone());
+        }
+        let f = module.load_function(name)?;
+        self.module_fns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, f.clone());
+        Ok(f)
+    }
+
     /// Load a function from the native elementwise-kernel module.
     pub fn elementwise_fn(&self, name: &str) -> Result<CudaFunction> {
         if self.elementwise_module.get().is_none() {
@@ -459,10 +487,7 @@ impl CudaDevice {
                 .map_err(|e| Error(format!("elementwise module load: {e}")))?;
             let _ = self.elementwise_module.set(module);
         }
-        self.elementwise_module
-            .get()
-            .unwrap()
-            .load_function(name)
+        self.cached_fn("elementwise", self.elementwise_module.get().unwrap(), name)
             .map_err(|e| Error(format!("elementwise fn `{name}`: {e}")))
     }
 
@@ -485,10 +510,7 @@ impl CudaDevice {
                 .map_err(|e| Error(format!("fused module load: {e}")))?;
             let _ = self.fused_module.set(module);
         }
-        self.fused_module
-            .get()
-            .unwrap()
-            .load_function(name)
+        self.cached_fn("fused", self.fused_module.get().unwrap(), name)
             .map_err(|e| Error(format!("fused fn `{name}`: {e}")))
     }
 
@@ -506,10 +528,7 @@ impl CudaDevice {
                 .map_err(|e| Error(format!("mmvq module load: {e}")))?;
             let _ = self.mmvq_module.set(module);
         }
-        self.mmvq_module
-            .get()
-            .unwrap()
-            .load_function(name)
+        self.cached_fn("mmvq", self.mmvq_module.get().unwrap(), name)
             .map_err(|e| Error(format!("mmvq fn `{name}`: {e}")))
     }
 

@@ -667,6 +667,30 @@ extern "C" __global__ void native_reduce_f32(
     }
     y[idx] = acc * scale;
 }
+// The same reduction for few outputs over a long axis: one block per output, its threads striding
+// the axis and meeting in shared memory. The sum order differs from the serial kernel's.
+extern "C" __global__ void native_reduce_block_f32(
+    const float* x, float* y, int outer, int red, int inner, int opcode, float scale) {
+    __shared__ float part[256];
+    int idx = blockIdx.x;
+    int o = idx / inner, i = idx % inner;
+    const float* base = x + ((long)o * red) * inner + i;
+    float acc = (opcode == 1) ? __int_as_float(0xff800000) : 0.0f;
+    for (int r = threadIdx.x; r < red; r += blockDim.x) {
+        float v = base[(long)r * inner];
+        acc = (opcode == 1) ? fmaxf(acc, v) : (acc + v);
+    }
+    part[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            part[threadIdx.x] = (opcode == 1) ? fmaxf(part[threadIdx.x], part[threadIdx.x + s])
+                                              : (part[threadIdx.x] + part[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[idx] = part[0] * scale;
+}
 extern "C" __global__ void native_bdiv_tail_f32(const float* a, const float* b, float* y, int n, int bn) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = a[i] / b[i % bn];

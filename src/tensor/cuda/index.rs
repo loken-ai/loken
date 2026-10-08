@@ -403,6 +403,10 @@ pub fn pow_f32(dev: &CudaDevice, x: &CudaSlice<f32>, e: f32, n: usize) -> Result
     Ok(out)
 }
 
+/// Most outputs of a reduction that gets a block each, and the shortest axis it does so for.
+const REDUCE_BLOCK_OUTPUTS: usize = 64;
+const REDUCE_BLOCK_AXIS: usize = 4096;
+
 /// Reduce F32 storage over the middle axis of a logical [outer, red, inner] view, on-device.
 /// `opcode` 0=sum, 1=max; `scale` post-multiplies each output (1.0 for sum/max, 1/red for mean).
 pub fn reduce_dim_f32(
@@ -414,12 +418,23 @@ pub fn reduce_dim_f32(
     opcode: i32,
     scale: f32,
 ) -> Result<CudaSlice<f32>> {
-    let func = dev.elementwise_fn("native_reduce_f32")?;
-    let stream = dev.stream();
     let n = outer * inner;
+    // Few outputs over a long axis: a block per output, where one thread per output would walk
+    // the whole axis alone.
+    let blocked = n <= REDUCE_BLOCK_OUTPUTS && red >= REDUCE_BLOCK_AXIS;
+    let func = dev.elementwise_fn(if blocked {
+        "native_reduce_block_f32"
+    } else {
+        "native_reduce_f32"
+    })?;
+    let stream = dev.stream();
     let out = with_oom_retry(dev, "reduce", || unsafe { stream.alloc::<f32>(n) })?;
     let cfg = LaunchConfig {
-        grid_dim: (n.div_ceil(256) as u32, 1, 1),
+        grid_dim: if blocked {
+            (n as u32, 1, 1)
+        } else {
+            (n.div_ceil(256) as u32, 1, 1)
+        },
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -434,4 +449,30 @@ pub fn reduce_dim_f32(
     b.arg(&scale);
     unsafe { b.launch(cfg) }.map_err(|er| Error(format!("reduce launch: {er}")))?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod reduce_tests {
+    use crate::tensor::{Device, Tensor};
+
+    /// A long axis reduced by a block per output gives the serial kernel's sum and max.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn a_long_axis_reduces_to_the_same_sum_and_max() {
+        let Ok(card) = crate::tensor::cuda::CudaDevice::new(0).map(Device::Cuda) else {
+            return;
+        };
+        let n = 248_320;
+        let host: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.37).sin()).collect();
+        let x = Tensor::from_vec(host.clone(), (1, n), &card).unwrap();
+        let sum = x.sum_keepdim(1).unwrap().to_vec2::<f32>().unwrap()[0][0];
+        let max = x.max_keepdim(1).unwrap().to_vec2::<f32>().unwrap()[0][0];
+        let want_sum: f64 = host.iter().map(|v| *v as f64).sum();
+        let want_max = host.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            (sum as f64 - want_sum).abs() < 1e-2 * want_sum.abs().max(1.0),
+            "{sum} {want_sum}"
+        );
+        assert_eq!(max, want_max);
+    }
 }
