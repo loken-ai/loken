@@ -1521,6 +1521,12 @@ impl LlmEngine {
                         // Total committed this step = 1 (S_0) + accepted_drafts
                         let committed = 1 + accepted_drafts;
                         pos += committed;
+                        tracing::debug!(
+                            "verify round: {} rows, {} committed, {:.2} ms",
+                            k + 1,
+                            committed,
+                            cycle_start.elapsed().as_secs_f64() * 1e3
+                        );
                         if !spec_on && !head_on {
                             pld_cost.round(cycle_start.elapsed().as_secs_f64(), committed);
                         }

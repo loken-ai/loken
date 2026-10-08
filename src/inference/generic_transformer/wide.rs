@@ -175,12 +175,12 @@ impl GenericTransformerLayer {
             let h = self.hyper.as_ref().expect("a wide layer has its mixers");
             (h.attn.streams(), h.attn.dim())
         };
-        let (mixed, inj) = {
+        let (mixed, inj) = staged("mix_token", &dev, false, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             let xn = hc.attn.normed_on_card(x)?;
-            hc.attn.mix_on_card(&xn, true)?
-        };
-        let out = match self.mixer {
+            hc.attn.mix_on_card(&xn, true)
+        })?;
+        let out = staged("token mixer", &dev, false, || match self.mixer {
             mixer::Mixer::Attention => {
                 let mut o = match self.sparse.is_some() {
                     true => self.forward_sparse_graph(&mixed)?,
@@ -189,14 +189,14 @@ impl GenericTransformerLayer {
                 if let Some(b) = &self.attn_output_bias {
                     o = o.broadcast_add(b)?;
                 }
-                o
+                Ok(o)
             }
             _ => {
                 let m = self.mixer.step_in_place(&mixed)?;
-                self.attn_output.forward(&m)?
+                self.attn_output.forward(&m)
             }
-        };
-        let (r, xn) = {
+        })?;
+        let (r, xn) = staged("combine", &dev, false, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             combine_on_card(
                 x,
@@ -205,22 +205,24 @@ impl GenericTransformerLayer {
                 Some(&hc.ffn),
                 s,
                 d,
-            )?
-        };
-        let (mixed, inj) = {
+            )
+        })?;
+        let (mixed, inj) = staged("mix_ffn", &dev, false, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             hc.ffn
-                .mix_on_card(&xn.expect("the norm was asked for"), true)?
-        };
+                .mix_on_card(&xn.expect("the norm was asked for"), true)
+        })?;
         let out = self.feed_forward(&mixed, &dev)?;
-        let (r, _) = combine_on_card(
-            &r,
-            &out,
-            &inj.expect("the feed-forward's mixer writes back"),
-            None,
-            s,
-            d,
-        )?;
+        let (r, _) = staged("combine", &dev, false, || {
+            combine_on_card(
+                &r,
+                &out,
+                &inj.expect("the feed-forward's mixer writes back"),
+                None,
+                s,
+                d,
+            )
+        })?;
         Ok(r)
     }
 
