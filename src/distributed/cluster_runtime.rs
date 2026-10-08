@@ -62,6 +62,10 @@ pub struct PeerReport {
     /// so a peer that publishes none still parses.
     #[serde(default)]
     pub card_bytes_by_model: HashMap<String, u64>,
+    /// The round trips this node timed to its peers, milliseconds. Defaulted so a peer that
+    /// publishes none still parses.
+    #[serde(default)]
+    pub peer_rtt_ms: HashMap<String, f64>,
 }
 
 impl PeerReport {
@@ -92,6 +96,7 @@ impl PeerReport {
             prefix_blocks: self.prefix_blocks,
             cards: self.cards,
             card_bytes_by_model: self.card_bytes_by_model,
+            peer_rtt_ms: self.peer_rtt_ms,
         };
         (self.node_id, state, rates)
     }
@@ -327,6 +332,7 @@ mod tests {
             rates_by_model: HashMap::new(),
             cost_by_model: HashMap::new(),
             card_bytes_by_model: HashMap::new(),
+            peer_rtt_ms: HashMap::new(),
         };
         let (_, _, rates) = r.split();
         assert!(rates.prefill_tok_per_s > 0.0);
@@ -355,6 +361,7 @@ mod tests {
             rates_by_model: HashMap::new(),
             cost_by_model: HashMap::new(),
             card_bytes_by_model: HashMap::new(),
+            peer_rtt_ms: HashMap::new(),
         };
         let (id, state, rates) = r.split();
         assert_eq!(id, "gpu-b");
@@ -394,6 +401,7 @@ mod tests {
             rates_by_model: HashMap::new(),
             cost_by_model: HashMap::new(),
             card_bytes_by_model: HashMap::new(),
+            peer_rtt_ms: HashMap::new(),
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: PeerReport = serde_json::from_str(&s).unwrap();

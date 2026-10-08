@@ -188,8 +188,8 @@ impl Cluster {
     /// this node's own measured profile; its VRAM is `local.vram` when set, else the cards it
     /// advertises, and each peer's is what its cards carry of the model when it says, else the
     /// cards it advertises.
-    /// Peer-to-peer RTT is not measured here, so only pairs this node timed are returned; the
-    /// planner prices an unlisted pair from its base latency.
+    /// The pairs are the ones this node timed and the ones its peers published of each other;
+    /// the planner prices an unlisted pair from its base latency.
     pub fn placement_inputs(
         &self,
         model_id: &str,
@@ -249,7 +249,30 @@ impl Cluster {
                 pairs.push((self.config.node_id.clone(), node.clone(), r));
             }
         }
+        // The links between two peers, as the peer that timed them published: a chain of three
+        // nodes crosses them, and this node never timed them.
+        for (node, _) in &nodes {
+            if *node == self.config.node_id {
+                continue;
+            }
+            let Some(state) = members.state_of(node) else {
+                continue;
+            };
+            for (other, r) in &state.peer_rtt_ms {
+                if *other != self.config.node_id && nodes.iter().any(|(n, _)| n == other) {
+                    pairs.push((node.clone(), other.clone(), *r));
+                }
+            }
+        }
         (nodes, pairs)
+    }
+
+    /// The round trips this node timed to its peers, for it to publish.
+    pub fn measured_rtts(&self) -> HashMap<NodeId, f64> {
+        self.rtt_ms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Where a peer can be reached, if this node has learned its endpoint. The head uses it to ask
@@ -678,6 +701,49 @@ mod tests {
         assert_eq!(vram(&nodes, "b"), 11u64 << 30, "what the peer carried");
         let (nodes, _) = c.placement_inputs("m", 0, local(14 << 30));
         assert_eq!(vram(&nodes, "self"), 14u64 << 30, "what this node carried");
+    }
+
+    #[test]
+    fn placement_inputs_prices_the_links_between_two_peers_from_what_they_publish() {
+        let c = Cluster::new(cfg(&["b", "c"]));
+        c.publish_local(NodeState::default());
+        let costs = || {
+            let mut m = std::collections::HashMap::new();
+            m.insert("m".to_string(), (2.0, 1.0));
+            m
+        };
+        let published = |to: &str, ms: f64| NodeState {
+            peer_rtt_ms: std::collections::HashMap::from([(to.to_string(), ms)]),
+            ..Default::default()
+        };
+        for (me, other, ms) in [("b", "c", 0.7), ("c", "b", 0.9)] {
+            c.observe_peer(
+                &me.to_string(),
+                "http://x",
+                0,
+                published(other, ms),
+                NodeRates::default(),
+                std::collections::HashMap::new(),
+                costs(),
+                0.3,
+            );
+        }
+        let local = super::super::cut_plan::NodeProfile {
+            vram: 1 << 30,
+            layer_ms: 1.0,
+            miss_ms: 1.0,
+        };
+        let (_, pairs) = c.placement_inputs("m", 0, local);
+        let has =
+            |a: &str, b: &str, ms: f64| pairs.iter().any(|p| p.0 == a && p.1 == b && p.2 == ms);
+        assert!(
+            has("self", "b", 0.3) && has("self", "c", 0.3),
+            "the links this node timed"
+        );
+        assert!(
+            has("b", "c", 0.7) && has("c", "b", 0.9),
+            "the links its peers timed: {pairs:?}"
+        );
     }
 
     #[test]

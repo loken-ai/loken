@@ -184,6 +184,12 @@ pub(crate) trait ModelBackend: Send {
         None
     }
 
+    /// Why this backend can serve nothing more, when it cannot: the nodes it depended on are
+    /// gone. A caller that finds a reason unloads the model so the next request loads it afresh.
+    fn unusable(&self) -> Option<String> {
+        None
+    }
+
     // --- Core forwards --------------------------------------------------
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor>;
 

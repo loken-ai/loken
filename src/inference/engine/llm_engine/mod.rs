@@ -458,6 +458,13 @@ impl LlmEngine {
     /// Makes `drafter` draft for this engine until it is detached or the target reloads,
     /// in place of any drafter it had. The caller has checked that the two share a
     /// vocabulary. The draft length is learned afresh for the new pair.
+    /// Why the loaded model can serve nothing more, if it cannot: a pipeline whose later
+    /// segments are gone. `None` while a request holds the model.
+    pub fn unusable(&self) -> Option<String> {
+        let state = self.model_state.try_lock().ok()?;
+        state.as_ref()?.model.unusable()
+    }
+
     pub async fn attach_drafter(&self, id: String, drafter: Arc<LlmEngine>) {
         let previous = self.draft_engine.lock().await.replace(drafter);
         if let Some(previous) = previous {

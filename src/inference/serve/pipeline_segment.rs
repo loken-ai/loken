@@ -8,7 +8,9 @@
 //!
 //! Frames, by what they carry:
 //!  - boundary: `layer_id` is the position of the first token, the shape is `[1, tokens, hidden]`
-//!    and the dtype is the stream's own; the answer is `[1, vocab]` f32 logits;
+//!    and the dtype is the stream's own; the answer is `[1, vocab]` f32 logits. With the top
+//!    bit of `layer_id` set (a verify) the answer holds the logits of every token,
+//!    `[1, tokens, vocab]`;
 //!  - cut: `layer_id` is the length the KV caches are cut back to, one `Q8` byte carries the
 //!    operation; the answer is an empty `Q8` frame;
 //!  - failure: a non-empty `Q8` answer, whose bytes are the message.
@@ -21,6 +23,9 @@ use std::net::{SocketAddr, TcpListener};
 
 /// The one operation a `Q8` frame asks for: cut the KV caches back.
 const OP_CUT: u8 = 1;
+
+/// The bit of a boundary's `layer_id` that asks for the logits of every token.
+const ALL_ROWS: u32 = 1 << 31;
 
 fn invalid(msg: impl Into<String>) -> crate::tensor::Error {
     crate::tensor::Error::msg(msg.into())
@@ -116,8 +121,31 @@ impl SegmentLink {
     /// Hand `hidden`, the boundary of the tokens that start at `index_pos`, to the next
     /// segment and return the logits of the last token, `[1, vocab]`.
     pub fn boundary(&mut self, hidden: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
+        self.exchange(hidden, index_pos, false)
+    }
+
+    /// [`Self::boundary`] for a verify: the logits of every token of `hidden`, `[1, tokens,
+    /// vocab]`.
+    pub fn boundary_all(
+        &mut self,
+        hidden: &Tensor,
+        index_pos: usize,
+    ) -> crate::tensor::Result<Tensor> {
+        self.exchange(hidden, index_pos, true)
+    }
+
+    fn exchange(
+        &mut self,
+        hidden: &Tensor,
+        index_pos: usize,
+        all_rows: bool,
+    ) -> crate::tensor::Result<Tensor> {
         let (dtype, shape, bytes) = to_frame(hidden)?;
-        let pos = u32::try_from(index_pos).map_err(|_| invalid("position above u32"))?;
+        let pos = u32::try_from(index_pos)
+            .ok()
+            .filter(|p| p & ALL_ROWS == 0)
+            .ok_or_else(|| invalid("position above 2^31"))?;
+        let pos = if all_rows { pos | ALL_ROWS } else { pos };
         let (h, payload) = self
             .link
             .request(pos, dtype, shape, &bytes)
@@ -171,7 +199,8 @@ fn handle(
         }
         return Ok(answer(WireDType::Q8, vec![0], Vec::new()));
     }
-    let index_pos = h.layer_id as usize;
+    let all_rows = h.layer_id & ALL_ROWS != 0;
+    let index_pos = (h.layer_id & !ALL_ROWS) as usize;
     let hidden = from_frame(h, payload)?;
     match down {
         Some(down) => {
@@ -181,9 +210,12 @@ fn handle(
             Ok((rh, rp))
         }
         None => {
-            let logits = model
-                .segment_tail_forward(hidden, index_pos)?
-                .to_dtype(DType::F32)?;
+            let logits = if all_rows {
+                model.segment_tail_forward_all(hidden, index_pos)?
+            } else {
+                model.segment_tail_forward(hidden, index_pos)?
+            }
+            .to_dtype(DType::F32)?;
             let (dtype, shape, bytes) = to_frame(&logits)?;
             Ok(answer(dtype, shape, bytes))
         }
@@ -282,6 +314,16 @@ mod tests {
         run(&mut whole, &mut head, &mut link, &[1, 4, 2, 9, 3, 5], 0);
         run(&mut whole, &mut head, &mut link, &[8], 6);
         run(&mut whole, &mut head, &mut link, &[2], 7);
+        // A verify batch: every token's logits come back through the whole chain.
+        let batch = ids(&[5, 1]);
+        let want = row(&whole.forward_all(&batch, 8).unwrap());
+        let boundary = head.segment_head_forward(&batch, 8).unwrap();
+        let got = row(&link.boundary_all(&boundary, 8).unwrap());
+        assert_eq!(got, want, "verify over cuts {cuts:?}");
+        whole.trim_kv(8);
+        head.trim_kv(8);
+        link.cut(8).unwrap();
+        run(&mut whole, &mut head, &mut link, &[7], 8);
         // A new prompt from position 0 replaces the sequence, a cut resumes inside it.
         run(&mut whole, &mut head, &mut link, &[6, 6, 1], 0);
         whole.trim_kv(1);

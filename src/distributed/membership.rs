@@ -61,6 +61,9 @@ pub struct NodeState {
     /// put them. The room it can give the model's layers when asked to hold a share of them.
     /// Absent for a model it holds without having measured it.
     pub card_bytes_by_model: HashMap<String, u64>,
+    /// The round trips this node timed to the peers it gossips with, milliseconds: the links a
+    /// chain of three nodes or more is priced on, since the head times only its own.
+    pub peer_rtt_ms: HashMap<NodeId, f64>,
 }
 
 impl NodeState {
@@ -395,6 +398,7 @@ mod tests {
             prefix_blocks: vec![0xABCD, 0x1234],
             cards: vec![16 << 30],
             card_bytes_by_model: HashMap::from([("gemma4:12b".to_string(), 9 << 30)]),
+            peer_rtt_ms: HashMap::from([("c".to_string(), 0.8)]),
         };
         m.observe(&"a".to_string(), 0, state.clone());
         assert_eq!(m.state_of(&"a".to_string()), Some(&state));

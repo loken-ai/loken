@@ -109,6 +109,15 @@ impl GenericHeteroTransformer {
         self.output_stage(hidden, on_cuda, seq_len, false)
     }
 
+    /// [`Self::segment_tail_forward`] for a verify: the logits of every token of the boundary,
+    /// `[1, tokens, vocab]`.
+    pub fn segment_tail_forward_all(&mut self, hidden: Tensor, index_pos: usize) -> Result<Tensor> {
+        let seq_len = hidden.dim(1)?;
+        self.mark_prefill(seq_len);
+        let (hidden, on_cuda) = self.run_layers(hidden, None, index_pos, seq_len)?;
+        self.output_stage(hidden, on_cuda, seq_len, true)
+    }
+
     fn mark_prefill(&self, seq_len: usize) {
         crate::tensor::quant_cpu::set_small_model_prefill(
             seq_len > 1 && self.config.embedding_length <= 1024,

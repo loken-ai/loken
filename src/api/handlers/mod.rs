@@ -1415,6 +1415,11 @@ impl APIServer {
                 .collect(),
             cost_by_model,
             card_bytes_by_model,
+            peer_rtt_ms: self
+                .cluster
+                .as_ref()
+                .map(|c| c.measured_rtts())
+                .unwrap_or_default(),
             prefill_tok_per_s: rates.prefill_tok_per_s,
             decode_tok_per_s: rates.decode_tok_per_s,
             model_load_s: rates.model_load_s,
@@ -1628,6 +1633,22 @@ impl APIServer {
     /// the lock, and only then calls engine.load_model() + pushes to
     /// engines. Caller-supplied `keep_alive_minutes` controls the
     /// expiration timer.
+    /// Whether `model_id` is loaded and able to serve. A model that cannot, such as a pipeline
+    /// head whose tail is gone, is unloaded here so the caller loads it afresh, planned over the
+    /// nodes that remain.
+    async fn engine_serves(&self, model_id: &str) -> bool {
+        let Ok(engine) = self.get_engine(model_id).await else {
+            return false;
+        };
+        let Some(why) = engine.unusable() else {
+            return true;
+        };
+        tracing::warn!("{model_id} cannot serve ({why}): unloading it to load it again");
+        drop(engine);
+        let _ = self.unload_model(model_id).await;
+        false
+    }
+
     async fn ensure_loaded(&self, model_id: &str, keep_alive_minutes: i64) -> Result<(), String> {
         self.ensure_loaded_with_window(model_id, keep_alive_minutes, None)
             .await
@@ -1662,15 +1683,15 @@ impl APIServer {
         window: Option<usize>,
         kv_quant: Option<crate::inference::engine::llm_engine::KvQuant>,
     ) -> Result<(), String> {
-        // Fast path: already loaded.
-        if self.get_engine(model_id).await.is_ok() {
+        // Fast path: already loaded, and still able to serve.
+        if self.engine_serves(model_id).await {
             return Ok(());
         }
         let lock = self.loading_lock(model_id).await;
         let _g = lock.lock().await;
         // Re-check under the lock - another concurrent request may have
         // already loaded it.
-        if self.get_engine(model_id).await.is_ok() {
+        if self.engine_serves(model_id).await {
             return Ok(());
         }
         // Announce the load so a client listing models sees it in flight rather than a gap; the

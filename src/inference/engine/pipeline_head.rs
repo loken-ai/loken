@@ -3,9 +3,8 @@
 //!
 //! The head keeps the KV cache of its own layers and sends the boundary of every forward, a
 //! prefill chunk or a decode step alike, to the next segment, which answers with the logits.
-//! Whatever would leave the segments out of step with each other is refused: a verify batch
-//! reads the logits of every position, which the last segment does not return, and a cache
-//! shift moves positions the later segments hold too.
+//! A verify batch asks the last segment for the logits of every position; a cache shift is
+//! refused, since it moves positions the later segments hold too.
 
 use super::model_backend::{BoxedModelBackend, Capabilities, ModelBackend, PrefillShape};
 use crate::inference::generic_transformer::GenericHeteroTransformer;
@@ -90,12 +89,17 @@ impl ModelBackend for PipelineHeadBackend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             trim_kv: true,
+            pld: true,
             ..Capabilities::default()
         }
     }
 
     fn kv_capacity(&self) -> Option<usize> {
         Some(self.model.kv_capacity())
+    }
+
+    fn unusable(&self) -> Option<String> {
+        self.broken.clone()
     }
 
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
@@ -111,10 +115,16 @@ impl ModelBackend for PipelineHeadBackend {
         }
     }
 
-    fn forward_all(&mut self, _x: &Tensor, _index_pos: usize) -> crate::tensor::Result<Tensor> {
-        crate::tensor::bail!(
-            "a pipeline head answers with the logits of the last token only: no verify batch"
-        )
+    fn forward_all(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
+        self.check()?;
+        let hidden = self.model.segment_head_forward(x, index_pos)?;
+        match self.link.boundary_all(&hidden, index_pos) {
+            Ok(logits) => Ok(logits),
+            Err(e) => {
+                self.cut(index_pos);
+                Err(e)
+            }
+        }
     }
 
     fn widest_ffn(&self) -> usize {
@@ -216,7 +226,6 @@ mod tests {
             Err((_, e)) => panic!("{e}"),
         };
         assert!(head.capabilities().trim_kv && !head.capabilities().shift_kv);
-        assert!(head.forward_all(&ids(&[1, 2]), 0).is_err());
 
         // A prompt prefilled in chunks of two, then decode steps.
         let prompt = ids(&[1, 4, 2, 9, 3, 5]);
@@ -229,6 +238,17 @@ mod tests {
             assert_eq!(got, want, "decode step {i}");
         }
         assert_eq!(head.kv_len(), whole.kv_len());
+        // A verify batch: the logits of every token of the batch, as the whole model gives them,
+        // then the cache cut back over its rejected tail.
+        let batch = ids(&[5, 1, 8]);
+        let want = row(&whole.forward_all(&batch, 9).unwrap());
+        let got = row(&head.forward_all(&batch, 9).unwrap());
+        assert_eq!(got, want, "verify batch");
+        whole.trim_kv(10);
+        head.trim_kv(10);
+        let want = row(&whole.forward(&ids(&[3]), 10).unwrap());
+        let got = row(&head.forward(&ids(&[3]), 10).unwrap());
+        assert_eq!(got, want, "after the rejected tail");
         // The cache cut back to the prompt's first four tokens, then resumed.
         whole.trim_kv(4);
         head.trim_kv(4);
@@ -239,6 +259,34 @@ mod tests {
         assert!(head.broken.is_none());
         drop(head);
         server.join().unwrap();
+        tiny_model::remove(&path);
+    }
+
+    /// A tail that goes away leaves the head unusable, with the reason, so the model can be
+    /// loaded again where the nodes still are.
+    #[test]
+    fn a_head_whose_tail_is_gone_says_it_is_unusable() {
+        let path = tiny_model::write("gone", LAYERS);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tail = std::thread::spawn(move || {
+            // Accept the head, then hang up on it.
+            drop(listener.accept().unwrap());
+        });
+        let mut head = match PipelineHeadBackend::connect(tiny_model::load(&path, LAYERS), addr, 2)
+        {
+            Ok(head) => head,
+            Err((_, e)) => panic!("{e}"),
+        };
+        tail.join().unwrap();
+        assert!(head.unusable().is_none());
+        assert!(head.forward(&ids(&[1, 4]), 0).is_err());
+        let why = head.unusable().expect("the lost tail is named");
+        assert!(why.contains("did not reach the next segment"), "{why}");
+        assert!(
+            head.forward(&ids(&[1]), 0).is_err(),
+            "nothing more is served"
+        );
         tiny_model::remove(&path);
     }
 
