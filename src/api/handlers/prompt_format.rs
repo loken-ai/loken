@@ -1981,6 +1981,29 @@ mod go_template_tests {
         assert!(on.ends_with("<|im_start|>assistant\n<think>\n"), "{on}");
     }
 
+    /// The template of the wide-residual family writes its default reasoning instruction into
+    /// a system turn when the caller names no effort, and opens the thinking block.
+    #[test]
+    fn a_template_with_a_default_reasoning_effort_renders_it() {
+        let template = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/vectors/qwen4exp/chat_template.jinja"
+        ));
+        let msgs = [crate::api::types::Message::new(
+            "user".to_string(),
+            "hi".to_string(),
+        )];
+        let p = format_chat_prompt_thinking(&msgs, Some(template), false);
+        assert!(
+            p.starts_with("<|im_start|>system\nReasoning effort is set to xhigh."),
+            "{p}"
+        );
+        assert!(
+            p.ends_with("<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"),
+            "{p}"
+        );
+    }
+
     #[test]
     fn harmony_effort_is_written_into_the_system_turn() {
         let mut p =

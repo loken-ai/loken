@@ -32,6 +32,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Chat: a repository with a folder per quantisation is prompted with its own template.
 - Load: a file with a rotary scaling and no context key takes its scaled window.
 - Chat: a grammar-constrained answer is content, not reasoning.
 - Tools: a call written as JSON inside a function tag is read as a call.

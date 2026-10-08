@@ -78,6 +78,26 @@ fn gguf_chat_format(path: &std::path::Path) -> ChatFormat {
     }
 }
 
+/// The model files of a folder, by name: the GGUF files that are not a vision projector or a
+/// draft head.
+fn model_files_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            p.extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
+                && !name.starts_with("mmproj")
+                && !name.ends_with(".mtp.gguf")
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 fn dir_chat_format(dir: &std::path::Path) -> ChatFormat {
     let read_json = |name: &str| -> Option<serde_json::Value> {
         serde_json::from_str(&std::fs::read_to_string(dir.join(name)).ok()?).ok()
@@ -95,17 +115,23 @@ fn dir_chat_format(dir: &std::path::Path) -> ChatFormat {
         .and_then(|c| declared_template(c.get("chat_template")?))
         .or_else(|| std::fs::read_to_string(dir.join("chat_template.jinja")).ok());
     if template.is_none() && config.is_none() && tokenizer.is_none() && tekken.is_none() {
-        let mut ggufs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
-                    .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
-            })
-            .collect();
-        ggufs.sort();
+        let mut ggufs = model_files_in(dir);
+        if ggufs.is_empty() {
+            // A repository that keeps each quantisation in a folder of its own.
+            let mut folders: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            folders.sort();
+            ggufs = folders
+                .iter()
+                .map(|f| model_files_in(f))
+                .find(|files| !files.is_empty())
+                .unwrap_or_default();
+        }
         if let Some(first) = ggufs.first() {
             return gguf_chat_format(first);
         }
@@ -575,6 +601,34 @@ mod tests {
         assert_eq!(thinking_from_effort(Some("HIGH")), Some("high"));
         assert_eq!(thinking_from_effort(Some("other")), Some("enabled"));
         assert_eq!(thinking_from_effort(None), None);
+    }
+
+    /// A repository that keeps each quantisation in a folder of its own is prompted with the
+    /// template its files carry.
+    #[test]
+    fn a_template_in_a_quantisation_folder_is_found() {
+        use crate::tensor::quantized::gguf_file::Value;
+        let dir = std::env::temp_dir().join(format!("loken-quant-dir-{}", std::process::id()));
+        let folder = dir.join("Q4");
+        std::fs::create_dir_all(&folder).unwrap();
+        let header = [
+            (
+                "general.architecture".to_string(),
+                Value::String("llama".into()),
+            ),
+            (
+                "tokenizer.chat_template".to_string(),
+                Value::String("{{ messages[0].content }}".into()),
+            ),
+        ];
+        crate::tensor::gguf_write::write_gguf_with_metadata(&folder.join("m.gguf"), &header, &[])
+            .unwrap();
+        let format = path_chat_format(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            format.template.as_deref(),
+            Some("{{ messages[0].content }}")
+        );
     }
 
     /// A checkpoint whose only vocabulary file is a tekken file is prompted in the
