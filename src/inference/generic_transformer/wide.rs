@@ -442,7 +442,7 @@ impl GenericTransformerLayer {
         if self.indexed_on_card()
             && x.dim(1)? > 1
             && index_pos > 0
-            && crate::tensor::quantized::DecodeOrder::active()
+            && self.spec_record
             && self.kv_cache.k_buffer().is_some()
             && self.kv_cache.current_seq_len() == index_pos
         {

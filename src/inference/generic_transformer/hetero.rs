@@ -1547,12 +1547,12 @@ impl GenericHeteroTransformer {
     /// (shape `[batch, seq_len, vocab]`). Used by speculative decoding to
     /// verify K drafts in a single batched forward.
     ///
-    /// A draft verify (a few rows continuing a cache) computes every row as the decode step
-    /// it stands for, so drafting never changes what greedy decoding emits.
+    /// A draft verify (a few rows continuing a cache) runs its rows together, so the experts two
+    /// rows share are read once; a row's logits can differ from the decode step's in the last
+    /// bits, as a batched product's do.
     pub fn forward_all(&mut self, input_ids: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
         let verify = index_pos > 0 && seq_len <= crate::inference::engine::decode_step::VERIFY_ROWS;
-        let _order = verify.then(crate::tensor::quantized::DecodeOrder::enter);
         let recording = verify && self.is_recurrent();
         if recording {
             self.spec_open(input_ids, index_pos)?;
