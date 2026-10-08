@@ -323,3 +323,49 @@ mod tests {
         tiny_model::remove(&path);
     }
 }
+
+#[cfg(test)]
+mod layer_major_tests {
+    use crate::inference::generic_transformer::tiny_model;
+    use crate::tensor::{Device, Tensor};
+
+    fn ids(v: &[u32]) -> Tensor {
+        Tensor::from_vec(v.to_vec(), (1usize, v.len()), &Device::Cpu).unwrap()
+    }
+
+    fn row(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// Every chunk through a layer before the next layer, or each chunk through every layer:
+    /// the last token's logits are the same, and so is the state the decode steps that follow
+    /// read.
+    #[test]
+    fn a_prompt_goes_through_the_layers_layer_by_layer_as_chunk_by_chunk() {
+        let path = tiny_model::write("layer-major", 4);
+        let prompt: Vec<u32> = (0..13u32).map(|i| (i * 7 + 3) % 11).collect();
+        for chunk in [2usize, 5, 13] {
+            let mut by_chunk = tiny_model::load(&path, 4);
+            let mut by_layer = tiny_model::load(&path, 4);
+            let mut want = None;
+            let mut off = 0;
+            while off < prompt.len() {
+                let n = chunk.min(prompt.len() - off);
+                want = Some(row(&by_chunk
+                    .forward(&ids(&prompt[off..off + n]), off)
+                    .unwrap()));
+                off += n;
+            }
+            let got = row(&by_layer
+                .forward_prefill_layer_major(&ids(&prompt), 0, chunk)
+                .unwrap());
+            assert_eq!(got, want.unwrap(), "chunk {chunk}");
+            for (i, t) in [4u32, 9, 1].into_iter().enumerate() {
+                let a = row(&by_chunk.forward(&ids(&[t]), 13 + i).unwrap());
+                let b = row(&by_layer.forward(&ids(&[t]), 13 + i).unwrap());
+                assert_eq!(a, b, "chunk {chunk}, decode step {i}");
+            }
+        }
+        tiny_model::remove(&path);
+    }
+}

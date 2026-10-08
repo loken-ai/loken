@@ -1339,6 +1339,30 @@ impl ModelBackend for MoondreamBackend {
 }
 
 impl ModelBackend for GenericBackend {
+    fn forward_prefill_with_chunk(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        seq_len: usize,
+        chunk_tokens: usize,
+    ) -> crate::tensor::Result<Tensor> {
+        if self.0.layer_major_pays(seq_len, chunk_tokens) {
+            return self
+                .0
+                .forward_prefill_layer_major(x, index_pos, chunk_tokens);
+        }
+        let chunk_tokens = chunk_tokens.max(1);
+        let mut off = 0usize;
+        let mut last: Option<Tensor> = None;
+        while off < seq_len {
+            let n = chunk_tokens.min(seq_len - off);
+            let chunk = x.narrow(1, off, n)?;
+            last = Some(self.forward(&chunk, index_pos + off)?);
+            off += n;
+        }
+        last.ok_or_else(|| crate::tensor::Error::msg("empty prefill".to_string()))
+    }
+
     #[cfg(feature = "audio")]
     fn audio_input(&self) -> Option<AudioInput> {
         let tower = self.0.audio_tower()?;

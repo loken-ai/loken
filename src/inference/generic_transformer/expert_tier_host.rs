@@ -55,6 +55,10 @@ impl LayerTier {
         Ok(())
     }
 
+    pub fn hold_stacks(&self, _on: bool) -> Result<()> {
+        Ok(())
+    }
+
     pub(super) fn stacks(&self) -> Result<&[crate::tensor::quantized::QTensor; 3]> {
         crate::tensor::bail!("an expert cache lives on a card")
     }

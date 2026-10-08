@@ -247,6 +247,89 @@ impl GenericHeteroTransformer {
         self.forward_inner(input_ids, index_pos, /*all_positions=*/ false)
     }
 
+    /// Whether a prompt of `seq_len` rows in chunks of `chunk` goes through the layers better
+    /// layer by layer: it takes several chunks, and some layer's experts come from the host in
+    /// full for a batch that wide, which a chunk at a time repeats for every chunk.
+    pub fn layer_major_pays(&self, seq_len: usize, chunk: usize) -> bool {
+        seq_len > chunk.max(1)
+            && self.draft.is_none()
+            && self.config.shared_kv_layers == 0
+            && self.layers.iter().any(|l| {
+                l.moe.as_ref().is_some_and(|m| {
+                    m.tier
+                        .as_ref()
+                        .is_some_and(|t| t.stream_pays(seq_len, m.n_experts_used))
+                })
+            })
+    }
+
+    /// A prompt `ids` `[1, seq_len]` from `index_pos` through the layers one layer at a time:
+    /// every chunk of `chunk` rows goes through a layer before any goes through the next, so a
+    /// layer whose experts live on the host has them brought to the card once for the whole
+    /// prompt, where a chunk at a time brings them once per chunk. The chunks' residuals are
+    /// kept between layers; the logits of the last row come back, as from `forward`.
+    pub fn forward_prefill_layer_major(
+        &mut self,
+        ids: &Tensor,
+        index_pos: usize,
+        chunk: usize,
+    ) -> Result<Tensor> {
+        let (_, seq_len) = ids.dims2()?;
+        let chunk = chunk.max(1);
+        self.spec_clear();
+        // Every chunk's embedding first, in order: the n-gram history follows the tokens.
+        let mut spans = Vec::new();
+        let mut hidden: Vec<Option<Tensor>> = Vec::new();
+        let mut ple: Vec<Option<Vec<Tensor>>> = Vec::new();
+        let mut ngram_rows: Vec<Option<Tensor>> = Vec::new();
+        let mut off = 0;
+        while off < seq_len {
+            let n = chunk.min(seq_len - off);
+            let (h, p) = self.embed_stage(&ids.narrow(1, off, n)?, index_pos + off)?;
+            ngram_rows.push(self.ngram.as_ref().and_then(|g| g.pending.clone()));
+            hidden.push(Some(h));
+            ple.push(p);
+            spans.push((off, n));
+            off += n;
+        }
+        let mut on_cuda = true;
+        for layer in 0..self.layers.len() {
+            let tier = self.layers[layer].moe.as_ref().and_then(|m| m.tier.clone());
+            if let Some(tier) = &tier {
+                tier.hold_stacks(true)?;
+            }
+            let mut outcome = Ok(());
+            for (c, &(off, n)) in spans.iter().enumerate() {
+                if let (Some(ng), Some(rows)) = (self.ngram.as_mut(), ngram_rows[c].clone()) {
+                    ng.pending = Some(rows);
+                }
+                let h = hidden[c]
+                    .take()
+                    .expect("a chunk's residual is held between layers");
+                match self.run_layers_in(h, ple[c].clone(), index_pos + off, n, layer, layer + 1) {
+                    Ok((h, cuda)) => {
+                        hidden[c] = Some(h);
+                        on_cuda = cuda;
+                    }
+                    Err(e) => {
+                        outcome = Err(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(tier) = &tier {
+                tier.hold_stacks(false)?;
+            }
+            outcome?;
+        }
+        let last = hidden
+            .pop()
+            .flatten()
+            .ok_or_else(|| crate::tensor::Error::msg("empty prefill".to_string()))?;
+        let rows = spans.last().map_or(1, |s| s.1);
+        self.output_stage(last, on_cuda, rows, false)
+    }
+
     /// EAGLE: enable/disable stashing the pre-final-norm feature on forward.
     pub fn set_capture_feature(&mut self, on: bool) {
         self.capture_feature = on;

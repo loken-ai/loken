@@ -218,6 +218,10 @@ struct Stage {
     ready: Mutex<Option<cudarc::driver::CudaEvent>>,
     /// Host ranges, per stack, that are page-locked: copies from them are asynchronous.
     pinned: [Option<(usize, usize)>; 3],
+    /// The stacks are kept for several forwards in a row (see `hold_stacks`).
+    held: std::sync::atomic::AtomicBool,
+    /// While held: the fill has landed and the compute stream has waited for it.
+    filled: std::sync::atomic::AtomicBool,
 }
 
 /// The stacks' dims with the expert axis replaced by `n`.
@@ -1507,6 +1511,8 @@ impl Stage {
             stacks: [mk(0), mk(1), mk(2)],
             ready: Mutex::new(None),
             pinned,
+            held: std::sync::atomic::AtomicBool::new(false),
+            filled: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -1664,8 +1670,13 @@ impl LayerTier {
     /// The layer's experts as stacks on the card, once the fill has landed: the compute stream
     /// waits for it. The fill is started here if nothing started it.
     pub(super) fn stacks(&self) -> Result<&[QTensor; 3]> {
-        self.prefetch()?;
         let stage = self.stage.as_ref().expect("a staged layer");
+        // Held and already filled: the compute stream waited for the fill at the first forward,
+        // and the next ones queue behind that wait.
+        if stage.held.load(Ordering::Acquire) && stage.filled.load(Ordering::Acquire) {
+            return Ok(&stage.stacks);
+        }
+        self.prefetch()?;
         let event = stage
             .ready
             .lock()
@@ -1676,7 +1687,29 @@ impl LayerTier {
         cd.0.stream()
             .wait(&event)
             .map_err(|e| crate::tensor::Error::msg(format!("wait: {e:?}")))?;
+        if stage.held.load(Ordering::Acquire) {
+            stage.filled.store(true, Ordering::Release);
+        }
         Ok(&stage.stacks)
+    }
+
+    /// Keep the layer's stacks on the card across the forwards that follow, for a prompt that
+    /// goes through the layer in several chunks: the experts come once, not once per chunk.
+    /// `false` ends the hold and hands the buffer on, as the last forward's release would.
+    pub fn hold_stacks(&self, on: bool) -> Result<()> {
+        let Some(stage) = self.stage.as_ref() else {
+            return Ok(());
+        };
+        if on {
+            stage.filled.store(false, Ordering::Release);
+            stage.held.store(true, Ordering::Release);
+            return Ok(());
+        }
+        stage.held.store(false, Ordering::Release);
+        if stage.filled.swap(false, Ordering::AcqRel) {
+            self.release_stacks()?;
+        }
+        Ok(())
     }
 
     /// Forget the fills and holds of the layers' passes through the buffers. A pass cut short
@@ -1703,6 +1736,9 @@ impl LayerTier {
     /// The layer's kernels are queued: the buffer is free once they have run.
     pub(super) fn release_stacks(&self) -> Result<()> {
         let stage = self.stage.as_ref().expect("a staged layer");
+        if stage.held.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let cd = self.dev.as_cuda_device()?;
         let event =
             cd.0.stream()
