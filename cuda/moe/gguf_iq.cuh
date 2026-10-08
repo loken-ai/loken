@@ -189,15 +189,32 @@ static __device__ __forceinline__ float dot_run_q8_1(const float (&y)[32], const
     return sum * __low2float(q8->ds);
 }
 
-/// iq4_nl: a lane takes `VDR` ints of the sixteen code bytes, from `iqs`.
+/// The iq4_nl levels of the low nibbles of the four bytes of `bytes`, as four signed bytes: the
+/// nibble picks a byte of the sixteen levels, held as four words.
+static __device__ __forceinline__ int levels_iq4_nl(uint32_t nibbles) {
+    constexpr uint32_t T0 = 0xBFAD9881u, T1 = 0xF6EADDCFu, T2 = 0x26190D01u, T3 = 0x71594535u;
+    const uint32_t t = (nibbles | (nibbles >> 4)) & 0x00FF00FFu;
+    const uint32_t select = ((t | (t >> 8)) & 0xFFFFu) & 0x7777u;
+    const uint32_t upper = ((nibbles >> 3) & 0x01010101u) * 0xFFu;
+    const uint32_t low  = __byte_perm(T0, T1, select);
+    const uint32_t high = __byte_perm(T2, T3, select);
+    return (int) ((low & ~upper) | (high & upper));
+}
+
+/// iq4_nl: a lane takes `VDR` ints of the sixteen code bytes, from `iqs`; four bytes at a time,
+/// their low nibbles against the first half of the block's activations and the high nibbles
+/// against the second.
 static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
     const block_iq4_nl * b = (const block_iq4_nl *) vbq;
+    const int * act = (const int *) bq8_1->qs;
+    const uint16_t * halves = (const uint16_t *) b->qs;
     int sum = 0;
 #pragma unroll
-    for (int j = 4 * iqs; j < 4 * (iqs + VDR_IQ4_NL_Q8_1_MMVQ); ++j) {
-        sum += KVALUES_IQ4NL[b->qs[j] & 0x0F] * (int) bq8_1->qs[j] +
-               KVALUES_IQ4NL[b->qs[j] >> 4] * (int) bq8_1->qs[j + 16];
+    for (int i = iqs; i < iqs + VDR_IQ4_NL_Q8_1_MMVQ; ++i) {
+        const uint32_t word = (uint32_t) halves[2 * i] | ((uint32_t) halves[2 * i + 1] << 16);
+        sum = __dp4a(levels_iq4_nl(word & 0x0F0F0F0Fu), act[i], sum);
+        sum = __dp4a(levels_iq4_nl((word >> 4) & 0x0F0F0F0Fu), act[i + 4], sum);
     }
     return __half2float(b->d) * __low2float(bq8_1->ds) * (float) sum;
 }
@@ -210,11 +227,113 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
         run((const block_t *) vbq, iqs, y);                                                \
         return dot_run_q8_1(y, bq8_1 + iqs);                                               \
     }
-VEC_DOT_RUN(iq4_xs,  block_iq4_xs,  iq4_xs_run)
-VEC_DOT_RUN(iq3_xxs, block_iq3_xxs, iq3_xxs_run)
-VEC_DOT_RUN(iq3_s,   block_iq3_s,   iq3_s_run)
-VEC_DOT_RUN(iq2_s,   block_iq2_s,   iq2_s_run)
 #undef VEC_DOT_RUN
+
+/// iq4_xs, run `iqs` against its q8_1 block: sixteen code bytes, their low nibbles against the
+/// first half of the activations and the high nibbles against the second.
+static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    const block_iq4_xs * b = (const block_iq4_xs *) vbq;
+    const block_q8_1 * q8 = bq8_1 + iqs;
+    const int * act = (const int *) q8->qs;
+    const uint32_t * words = (const uint32_t *) (b->qs + 16 * iqs);
+    int sum = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        sum = __dp4a(levels_iq4_nl(words[i] & 0x0F0F0F0Fu), act[i], sum);
+        sum = __dp4a(levels_iq4_nl((words[i] >> 4) & 0x0F0F0F0Fu), act[i + 4], sum);
+    }
+    const int low  = (b->scales_l[iqs / 2] >> (4 * (iqs % 2))) & 0x0F;
+    const int high = (b->scales_h >> (2 * iqs)) & 3;
+    const float dl = __half2float(b->d) * (float) ((low | (high << 4)) - 32);
+    return dl * (float) sum * __low2float(q8->ds);
+}
+
+/// A byte mask per value for the low four bits of `bits`: 0xFF where a bit is set.
+static __device__ __forceinline__ uint32_t sign_masks4(uint32_t bits) {
+    return (((bits & 0xF) * 0x00204081u) & 0x01010101u) * 0xFFu;
+}
+
+/// The four signed bytes of `grid` negated where `masks` is 0xFF.
+static __device__ __forceinline__ int negate_where(uint32_t grid, uint32_t masks) {
+    return (int) __vsub4(grid ^ masks, masks);
+}
+
+/// Four magnitudes of `grid` against the next four activation values, signed by bits `signs`.
+static __device__ __forceinline__ int dot4_signed(
+    uint32_t grid, uint32_t signs, int activation, int acc) {
+    return __dp4a(negate_where(grid, sign_masks4(signs)), activation, acc);
+}
+
+/// iq3_xxs, run `iqs` against its q8_1 block: the magnitudes and signs dotted in integers and
+/// scaled once.
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    const block_iq3_xxs * b = (const block_iq3_xxs *) vbq;
+    const block_q8_1 * q8 = bq8_1 + iqs;
+    const int * act = (const int *) q8->qs;
+    const uint8_t * codes = b->qs + 8 * iqs;
+    const uint8_t * tail  = b->qs + QK_K / 4 + 4 * iqs;
+    const uint32_t word = (uint32_t) tail[0] | ((uint32_t) tail[1] << 8) | ((uint32_t) tail[2] << 16) |
+                          ((uint32_t) tail[3] << 24);
+    int sum = 0;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t signs = KSIGNS_IQ2XS[(word >> (7 * l)) & 127];
+        sum = dot4_signed(IQ3XXS_GRID[codes[2 * l]],     signs,      act[2 * l],     sum);
+        sum = dot4_signed(IQ3XXS_GRID[codes[2 * l + 1]], signs >> 4, act[2 * l + 1], sum);
+    }
+    const float db = __half2float(b->d) * (0.5f + (float) (word >> 28)) * 0.5f;
+    return db * (float) sum * __low2float(q8->ds);
+}
+
+/// iq3_s, run `iqs` against its q8_1 block, in integers like iq3_xxs.
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    const block_iq3_s * b = (const block_iq3_s *) vbq;
+    const block_q8_1 * q8 = bq8_1 + iqs;
+    const int * act = (const int *) q8->qs;
+    const int pair = iqs / 2;
+    const int scale = (iqs % 2 == 0) ? (b->scales[pair] & 0x0F) : (b->scales[pair] >> 4);
+    const uint32_t qh = b->qh[iqs];
+    const uint8_t * q = b->qs + 8 * iqs;
+    const uint8_t * signs = b->signs + 4 * iqs;
+    int sum = 0;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int i1 = q[2 * l]     | (int) ((qh << (8 - 2 * l)) & 256);
+        const int i2 = q[2 * l + 1] | (int) ((qh << (7 - 2 * l)) & 256);
+        const uint32_t sg = signs[l];
+        sum = dot4_signed(IQ3S_GRID[i1], sg,      act[2 * l],     sum);
+        sum = dot4_signed(IQ3S_GRID[i2], sg >> 4, act[2 * l + 1], sum);
+    }
+    return __half2float(b->d) * (float) (1 + 2 * scale) * (float) sum * __low2float(q8->ds);
+}
+
+/// iq2_s, run `iqs` against its q8_1 block: eight magnitudes per code, the two halves of the run
+/// scaled apart.
+static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+    const block_iq2_s * b = (const block_iq2_s *) vbq;
+    const block_q8_1 * q8 = bq8_1 + iqs;
+    const int * act = (const int *) q8->qs;
+    const uint8_t * signs = b->qs + QK_K / 8;
+    const uint32_t qh = b->qh[iqs];
+    int low = 0, high = 0;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int code = b->qs[4 * iqs + l] | (int) ((qh << (8 - 2 * l)) & 0x300);
+        const uint64_t grid = IQ2S_GRID[code];
+        const uint32_t sg = signs[4 * iqs + l];
+        int t = dot4_signed((uint32_t) grid, sg, act[2 * l], 0);
+        t = dot4_signed((uint32_t) (grid >> 32), sg >> 4, act[2 * l + 1], t);
+        if (l < 2) low += t; else high += t;
+    }
+    const float d = __half2float(b->d);
+    const float db0 = d * (0.5f + (float) (b->scales[iqs] & 0x0F)) * 0.25f;
+    const float db1 = d * (0.5f + (float) (b->scales[iqs] >> 4)) * 0.25f;
+    return (db0 * (float) low + db1 * (float) high) * __low2float(q8->ds);
+}
 
 /// q2_0: sixty-four weights, `y = (q - 1) . d`, four codes to a byte lowest first. A lane takes
 /// the four bytes at `iqs` (sixteen weights), which lie in one of the two activation blocks.
