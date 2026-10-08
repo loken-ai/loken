@@ -272,19 +272,24 @@ impl GenericTransformerLayer {
             .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?;
         sparse.card_step(x, pos)?;
         let (n_head, n_kv, hd) = (self.n_head, self.n_kv_head, self.head_dim);
-        let (q, k, v) = self.project_heads(x)?;
-        let (q, k) = match eager_at {
-            Some(at) => (
-                self.apply_rotary_emb(&q, at)?,
-                self.apply_rotary_emb(&k, at)?,
-            ),
-            None => (
-                self.apply_rotary_emb_from_buffer(&q)?,
-                self.apply_rotary_emb_from_buffer(&k)?,
-            ),
+        let (q, k, v) = match self.prepared_heads(x, eager_at)? {
+            Some(rows) => rows,
+            None => {
+                let (q, k, v) = self.project_heads(x)?;
+                let (q, k) = match eager_at {
+                    Some(at) => (
+                        self.apply_rotary_emb(&q, at)?,
+                        self.apply_rotary_emb(&k, at)?,
+                    ),
+                    None => (
+                        self.apply_rotary_emb_from_buffer(&q)?,
+                        self.apply_rotary_emb_from_buffer(&k)?,
+                    ),
+                };
+                let flat = |t: &Tensor| t.to_dtype(DType::F32)?.contiguous();
+                (flat(&q)?, flat(&k)?, flat(&v)?)
+            }
         };
-        let flat = |t: &Tensor| t.to_dtype(DType::F32)?.contiguous();
-        let (q, k, v) = (flat(&q)?, flat(&k)?, flat(&v)?);
         let (Some(k_buf), Some(v_buf)) = (self.kv_cache.k_buffer(), self.kv_cache.v_buffer())
         else {
             crate::tensor::bail!("an indexed layer decodes before its cache holds a token");
@@ -470,23 +475,7 @@ impl GenericTransformerLayer {
     fn project_heads(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, seq, _) = x.dims3()?;
         let (n_head, n_kv, hd) = (self.n_head, self.n_kv_head, self.head_dim);
-        let (mut q, mut k, v) = match (self.attn_qkv.as_ref(), self.attn_q.as_ref()) {
-            (Some(w), _) => {
-                let qkv = w.forward(x)?;
-                let (qd, kd) = (n_head * hd, n_kv * hd);
-                (
-                    qkv.narrow(D::Minus1, 0, qd)?,
-                    qkv.narrow(D::Minus1, qd, kd)?,
-                    qkv.narrow(D::Minus1, qd + kd, kd)?,
-                )
-            }
-            (None, Some(wq)) => (
-                wq.forward(x)?,
-                self.attn_k.as_ref().expect("split k").forward(x)?,
-                self.attn_v.as_ref().expect("split v").forward(x)?,
-            ),
-            _ => crate::tensor::bail!("an attention layer without projections"),
-        };
+        let (mut q, mut k, v) = self.project_rows(x)?;
         q = q.reshape((b, seq, n_head, hd))?.transpose(1, 2)?;
         k = k.reshape((b, seq, n_kv, hd))?.transpose(1, 2)?;
         let v = v
@@ -498,6 +487,84 @@ impl GenericTransformerLayer {
             k = kn.forward(&k.contiguous()?)?;
         }
         Ok((q, k, v))
+    }
+
+    /// The projected rows of `x` `[b, seq, hidden]`: queries, keys and values, as the
+    /// projections give them, before any norm or rotation.
+    fn project_rows(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let (n_head, n_kv, hd) = (self.n_head, self.n_kv_head, self.head_dim);
+        match (self.attn_qkv.as_ref(), self.attn_q.as_ref()) {
+            (Some(w), _) => {
+                let qkv = w.forward(x)?;
+                let (qd, kd) = (n_head * hd, n_kv * hd);
+                Ok((
+                    qkv.narrow(D::Minus1, 0, qd)?,
+                    qkv.narrow(D::Minus1, qd, kd)?,
+                    qkv.narrow(D::Minus1, qd + kd, kd)?,
+                ))
+            }
+            (None, Some(wq)) => Ok((
+                wq.forward(x)?,
+                self.attn_k.as_ref().expect("split k").forward(x)?,
+                self.attn_v.as_ref().expect("split v").forward(x)?,
+            )),
+            _ => crate::tensor::bail!("an attention layer without projections"),
+        }
+    }
+
+    /// The queries, keys and values of the decoded token `x` `[1, 1, hidden]` as F32 rows
+    /// `[1, heads, 1, head_dim]`, normed and rotated by one launch; `None` where the launch does
+    /// not serve this layer. `at` is the position of a token run now, whose rotation is taken
+    /// from the layer's tables; a recorded step takes it from the buffers its replays refresh.
+    #[cfg(feature = "cuda")]
+    fn prepared_heads(
+        &self,
+        x: &Tensor,
+        at: Option<usize>,
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        use crate::inference::moe_cuda::{qk_prep, QkShape};
+        let hd = self.head_dim;
+        if x.dim(1)? != 1 || self.qk_norm_is_full() {
+            return Ok(None);
+        }
+        let rope_dim = match (self.no_rope, self.rope_dim) {
+            (true, _) => 0,
+            (false, d) if d > 0 && d < hd => d,
+            (false, _) => hd,
+        };
+        let (cos, sin) = match at {
+            Some(index_pos) => match &self.rope_rows {
+                Some((cos, sin)) => (cos.to_device(&x.device())?, sin.to_device(&x.device())?),
+                None => self.rope_table().rows(index_pos, 1, &x.device())?,
+            },
+            None => match (&self.graph_rope_cos, &self.graph_rope_sin) {
+                (Some(cos), Some(sin)) => (cos.clone(), sin.clone()),
+                _ => return Ok(None),
+            },
+        };
+        let (q, k, v) = self.project_rows(x)?;
+        let (qn, kn) = match (&self.attn_q_norm, &self.attn_k_norm) {
+            (Some(qn), Some(kn)) => (Some(qn), Some(kn)),
+            (None, None) => (None, None),
+            _ => return Ok(None),
+        };
+        qk_prep(
+            &q,
+            &k,
+            &v,
+            qn.map(|n| n.weight()),
+            kn.map(|n| n.weight()),
+            &cos,
+            &sin,
+            QkShape {
+                n_head: self.n_head,
+                n_kv: self.n_kv_head,
+                head_dim: hd,
+                rope_dim,
+                interleaved: self.flags.use_rope_i,
+                eps: qn.map_or(0.0, |n| n.eps() as f32),
+            },
+        )
     }
 
     /// Attention in which row `i` reads only the cached tokens `selection[i]`: the

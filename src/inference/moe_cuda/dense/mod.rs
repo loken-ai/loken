@@ -20,6 +20,8 @@ mod indexer;
 pub use indexer::*;
 mod gdn;
 pub use gdn::*;
+mod qk_prep;
+pub use qk_prep::*;
 
 thread_local! {
     static IN_PLACE_STATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
