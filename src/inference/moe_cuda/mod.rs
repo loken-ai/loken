@@ -99,6 +99,10 @@ cuda_launchers! {
         k_out: *mut f32, v_out: *mut f32, g_out: *mut f32, beta_out: *mut f32,
         new_window: *mut f32, kg: i32, kd: i32, vg: i32, vd: i32, k: i32, tiled: i32,
         eps: f32, in_f16: i32);
+    loken_shexp_swiglu(gate: *const c_void, up: *const c_void, out: *mut f32, n: i32,
+        gate_f16: i32, up_f16: i32);
+    loken_shexp_tail(routed: *const f32, down: *const c_void, x: *const f32, w: *const f32,
+        out: *mut f32, n: i32, down_f16: i32);
     loken_qk_prep(q: *const c_void, k: *const c_void, v: *const c_void, qw: *const f32,
         kw: *const f32, cos: *const f32, sin: *const f32, qo: *mut f32, ko: *mut f32,
         vo: *mut f32, n_head: i32, n_kv: i32, hd: i32, rope_dim: i32, interleaved: i32, eps: f32,

@@ -329,6 +329,40 @@ pub struct SharedExpert {
 }
 
 impl SharedExpert {
+    /// `routed` `[tokens, hidden]` F32 plus the expert over `xs`. A decoded token on a card
+    /// runs the elementwise stages around the projections as two launches.
+    pub fn forward_added(&self, xs: &Tensor, routed: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let (Some(gate), Some(w)) = (&self.gate, &self.scalar_gate) {
+            if xs.device().is_cuda() && xs.dims().first() == Some(&1) {
+                let up = self.up.forward(xs)?;
+                let g = gate.forward(xs)?;
+                if let Some(h) = crate::inference::moe_cuda::shexp_swiglu(&g, &up)? {
+                    let down = self.down.forward(&h)?;
+                    if let Some(sum) = crate::inference::moe_cuda::shexp_tail(routed, &down, xs, w)?
+                    {
+                        return Ok(sum);
+                    }
+                    return routed + self.finish(xs, down)?;
+                }
+                let up = up.to_dtype(crate::tensor::DType::F32)?;
+                let g = g.to_dtype(crate::tensor::DType::F32)?;
+                let h = (crate::tensor::ops::silu(&g)? * up)?;
+                return routed + self.finish(xs, self.down.forward(&h)?)?;
+            }
+        }
+        routed + self.forward(xs)?
+    }
+
+    /// The down projection's output `out` scaled by the scalar gate, F32.
+    fn finish(&self, xs: &Tensor, out: Tensor) -> Result<Tensor> {
+        let out = out.to_dtype(crate::tensor::DType::F32)?;
+        match &self.scalar_gate {
+            Some(w) => out.broadcast_mul(&crate::tensor::ops::sigmoid(&xs.matmul(w)?)?),
+            None => Ok(out),
+        }
+    }
+
     /// The expert over `xs` `[tokens, hidden]` F32, `[tokens, hidden]` F32.
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let up = self.up.forward(xs)?.to_dtype(crate::tensor::DType::F32)?;
@@ -848,7 +882,7 @@ impl MoeWeights {
         };
         let expert_rows = match &self.shared_expert {
             Some(shared) => {
-                (expert_rows.to_dtype(crate::tensor::DType::F32)? + shared.forward(&xs)?)?
+                shared.forward_added(&xs, &expert_rows.to_dtype(crate::tensor::DType::F32)?)?
             }
             None => expert_rows,
         };

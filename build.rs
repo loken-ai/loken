@@ -484,6 +484,7 @@ fn compile_imma_kernels() {
         "cuda/moe/hyper_residual.cu",
         "cuda/moe/gdn_prep.cu",
         "cuda/moe/qk_prep.cu",
+        "cuda/moe/shared_expert.cu",
         "cuda/moe/indexer.cu",
         "cuda/moe/deltanet_gate.cu",
         "cuda/moe/l2norm_gqa.cu",
