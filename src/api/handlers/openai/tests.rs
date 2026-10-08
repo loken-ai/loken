@@ -212,7 +212,7 @@ async fn runs_merge_into_one_response() {
         .into_response())
     };
     for (sum_prompts, prompt) in [(false, 10), (true, 30)] {
-        let out = merge_runs(3, sum_prompts, |i| {
+        let out = merge_runs(3, sum_prompts, None, |i| {
             let r = answer(&format!("run {i}"));
             async move { r }
         })
@@ -229,4 +229,47 @@ async fn runs_merge_into_one_response() {
         assert_eq!(v["usage"]["completion_tokens"], 6);
         assert_eq!(v["usage"]["total_tokens"], prompt + 6);
     }
+}
+
+/// `best_of` keeps the choices with the highest mean token log-probability, reindexed, and the
+/// usage still counts every run.
+#[tokio::test]
+async fn best_of_keeps_the_most_probable_completions() {
+    let scores = [-2.0, -0.5, -1.0, -0.1];
+    let out = merge_runs(
+        4,
+        false,
+        Some(BestOf {
+            keep: 2,
+            strip_logprobs: true,
+        }),
+        |i| {
+            let answer = Ok(Json(serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "text": format!("run {i}"),
+                    "logprobs": {"token_logprobs": [scores[i], scores[i]]}
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            }))
+            .into_response());
+            async move { answer }
+        },
+    )
+    .await
+    .unwrap();
+    let bytes = axum::body::to_bytes(out.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let texts: Vec<&str> = v["choices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["run 3", "run 1"]);
+    assert_eq!(v["choices"][1]["index"], 1);
+    assert!(v["choices"][0]["logprobs"].is_null());
+    assert_eq!(v["usage"]["completion_tokens"], 8);
 }

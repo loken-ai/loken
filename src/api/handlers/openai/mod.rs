@@ -46,12 +46,39 @@ fn decode_rate_suffix(first_token_at: Option<std::time::Instant>, tokens: u64) -
     )
 }
 
+/// Which of the gathered answers a response keeps: the `keep` with the highest mean token
+/// log-probability, as `best_of` asks, the log-probabilities dropped when the request did not
+/// ask for them.
+#[derive(Clone, Copy)]
+struct BestOf {
+    keep: usize,
+    strip_logprobs: bool,
+}
+
+/// The mean log-probability of a completions choice's tokens; the lowest value for a choice
+/// that carries none.
+fn mean_logprob(choice: &serde_json::Value) -> f64 {
+    let lps: Vec<f64> = choice["logprobs"]["token_logprobs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_f64)
+        .collect();
+    if lps.is_empty() {
+        f64::NEG_INFINITY
+    } else {
+        lps.iter().sum::<f64>() / lps.len() as f64
+    }
+}
+
 /// Whole answers of `runs` generations gathered into one response: the first answer's
 /// fields, every answer's choices indexed in order, and the usage summed - the prompt
-/// once when every run read the same prompt, per run when `sum_prompts`.
+/// once when every run read the same prompt, per run when `sum_prompts`. With `best_of`
+/// only the best choices stay; the usage still counts every generation.
 async fn merge_runs<F, Fut>(
     runs: usize,
     sum_prompts: bool,
+    best_of: Option<BestOf>,
     mut run: F,
 ) -> Result<Response, ApiError>
 where
@@ -83,6 +110,16 @@ where
         }
         completion_tokens += count("completion_tokens");
         merged.get_or_insert(v);
+    }
+    if let Some(best) = best_of {
+        choices.sort_by(|a, b| mean_logprob(b).total_cmp(&mean_logprob(a)));
+        choices.truncate(best.keep);
+        for (i, c) in choices.iter_mut().enumerate() {
+            c["index"] = serde_json::json!(i);
+            if best.strip_logprobs {
+                c["logprobs"] = serde_json::Value::Null;
+            }
+        }
     }
     let mut out = merged.unwrap_or_else(|| serde_json::json!({}));
     out["choices"] = serde_json::Value::Array(choices);
@@ -199,7 +236,7 @@ pub(crate) async fn chat_completion(
                 "`n` > 1 is not supported with `stream`".into(),
             ));
         }
-        return merge_runs(n, false, |i| {
+        return merge_runs(n, false, None, |i| {
             let mut one = request.clone();
             one.n = Some(1);
             one.seed = one.seed.map(|s| s.wrapping_add(i as u64));
@@ -960,7 +997,7 @@ pub(crate) async fn text_completions(
                         .into(),
                 ));
             }
-            return merge_runs(arr.len(), true, |i| {
+            return merge_runs(arr.len(), true, None, |i| {
                 let mut single = body.clone();
                 single["prompt"] = arr[i].clone();
                 Box::pin(text_completions(
@@ -1025,17 +1062,13 @@ pub(crate) async fn text_completions(
     sampling.validate()?;
     let completion_logprobs = sampling.top_logprobs.map(|v| v as usize);
 
-    // Fail-fast for `best_of` (sample N, return top 1) - would
-    // require Nx decode + ranking. Default 1 / null is fine; > 1 is
-    // rejected so clients don't think they're getting best-of-N output
-    // when they're really getting a single sample.
-    if let Some(b) = body.get("best_of").and_then(serde_json::Value::as_u64) {
-        if b > 1 {
-            return Err(ApiError::Validation(format!(
-                "`best_of` = {b} not supported; only the single-sample path is implemented"
-            )));
-        }
-    }
+    // `best_of` samples that many completions and returns the `n` with the highest mean token
+    // log-probability; every sampled completion counts in the usage, as it is billed upstream.
+    let best_of = body
+        .get("best_of")
+        .and_then(serde_json::Value::as_u64)
+        .map(|b| super::sampling::completions_asked(Some(b)))
+        .transpose()?;
     // `echo: true` would prepend the prompt to the response. Reject
     // explicitly rather than silently dropping the prompt-prefix
     // (clients consuming `choices[0].text` would then see the model
@@ -1059,13 +1092,52 @@ pub(crate) async fn text_completions(
     // `n` > 1 is n completions of the same prompt, each with its own seed, gathered into
     // one response as on /v1/chat/completions; a stream carries one completion.
     let n = super::sampling::completions_asked(body.get("n").and_then(serde_json::Value::as_u64))?;
+    if let Some(b) = best_of.filter(|b| *b < n) {
+        return Err(ApiError::Validation(format!(
+            "`best_of` = {b} must be at least `n` = {n}"
+        )));
+    }
+    if let Some(b) = best_of.filter(|b| *b > n) {
+        if stream {
+            return Err(ApiError::Validation(
+                "`best_of` is not supported with `stream`".into(),
+            ));
+        }
+        let asked_logprobs = body.get("logprobs").is_some_and(|v| !v.is_null());
+        return merge_runs(
+            b,
+            false,
+            Some(BestOf {
+                keep: n,
+                strip_logprobs: !asked_logprobs,
+            }),
+            |i| {
+                let mut one = body.clone();
+                one["n"] = serde_json::json!(1);
+                one["best_of"] = serde_json::json!(1);
+                // The ranking reads each token's log-probability.
+                if !asked_logprobs {
+                    one["logprobs"] = serde_json::json!(0);
+                }
+                if let Some(seed) = body.get("seed").and_then(serde_json::Value::as_u64) {
+                    one["seed"] = serde_json::json!(seed.wrapping_add(i as u64));
+                }
+                Box::pin(text_completions(
+                    State(state.clone()),
+                    headers.clone(),
+                    Json(one),
+                ))
+            },
+        )
+        .await;
+    }
     if n > 1 {
         if stream {
             return Err(ApiError::Validation(
                 "`n` > 1 is not supported with `stream`".into(),
             ));
         }
-        return merge_runs(n, false, |i| {
+        return merge_runs(n, false, None, |i| {
             let mut one = body.clone();
             one["n"] = serde_json::json!(1);
             if let Some(seed) = body.get("seed").and_then(serde_json::Value::as_u64) {
