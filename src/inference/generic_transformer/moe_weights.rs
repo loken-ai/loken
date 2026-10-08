@@ -46,7 +46,8 @@ fn sort_by_expert(choices: &Tensor) -> Result<(Tensor, Tensor)> {
 /// together with the per-token choice count - so they travel together, and the launches hang
 /// off them rather than repeating the triple at each call.
 /// Run `launch`, and with the stage profile on, record the time the card took between its
-/// start and its end, from events on the card's stream (a wait the profile pays for).
+/// start and its end, from events on the card's stream (a wait the profile pays for; inside a
+/// graph being recorded, the events are stamped each time the graph runs).
 #[cfg(feature = "cuda")]
 fn device_timed<T>(
     name: &'static str,
@@ -59,10 +60,10 @@ fn device_timed<T>(
     let Ok(dev) = on.device().as_cuda_device() else {
         return launch();
     };
-    if crate::tensor::cuda_ext::capture_active(&on.device()) {
-        return launch();
-    }
     let stream = dev.0.stream().clone();
+    if crate::tensor::cuda_ext::capture_active(&on.device()) {
+        return crate::inference::offload::mark_stage_in_capture(name, &stream, launch);
+    }
     let ctx = stream.context();
     let event = || ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT));
     let (Ok(start), Ok(end)) = (event(), event()) else {

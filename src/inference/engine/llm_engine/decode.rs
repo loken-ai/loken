@@ -221,7 +221,11 @@ pub(super) fn capture_decode_graph(
         }
         let (g, out) = capture_op(model, op_stream, op, pos, needs_split)?;
         nodes.add(&g);
-        steps.push(DecodeStep::Graph(g, op_stream.clone()));
+        steps.push(DecodeStep::Graph(
+            g,
+            op_stream.clone(),
+            crate::inference::offload::take_capture_marks(),
+        ));
         if out.is_some() {
             logits = out;
         }
@@ -258,7 +262,8 @@ pub(super) fn capture_decode_graph(
     );
     if crate::inference::offload::stage_prof_enabled() {
         for step in &steps {
-            if let DecodeStep::Graph(g, s) = step {
+            if let DecodeStep::Graph(g, s, marks) = step {
+                info!("stage marks recorded in the graph: {}", marks.len());
                 report_kernel_costs(g, s);
             }
         }
@@ -267,7 +272,7 @@ pub(super) fn capture_decode_graph(
     // own allocations need that memory when they are uploaded and run.
     let mut trimmed = Vec::new();
     for step in &steps {
-        if let DecodeStep::Graph(_, s) = step {
+        if let DecodeStep::Graph(_, s, _) = step {
             let card = s.context().ordinal();
             if !trimmed.contains(&card) {
                 trimmed.push(card);
@@ -279,7 +284,7 @@ pub(super) fn capture_decode_graph(
     // Pre-upload graph resources to device memory before first launch - eliminates the lazy
     // upload window on cuGraphLaunch.
     for step in &steps {
-        if let DecodeStep::Graph(g, _) = step {
+        if let DecodeStep::Graph(g, _, _) = step {
             if let Err(e) = g.upload() {
                 warn!("Graph upload failed (will fall back to lazy upload): {e}");
             }
@@ -295,6 +300,7 @@ enum DecodeStep {
     Graph(
         crate::tensor::cuda_ext::CapturedGraph,
         std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
+        Vec<crate::inference::offload::StageMark>,
     ),
     /// An op the model runs eagerly at every replay.
     Eager(usize),
@@ -321,7 +327,7 @@ impl DecodeGraph {
         for (at, step) in self.steps.iter().enumerate() {
             let t = prof.then(std::time::Instant::now);
             match step {
-                DecodeStep::Graph(g, s) => {
+                DecodeStep::Graph(g, s, _) => {
                     let marks = if prof {
                         let ctx = s.context();
                         let new = || {
@@ -364,6 +370,13 @@ impl DecodeGraph {
                 prof_record("step: graph device time", (ms as f64 * 1e6) as u64);
             }
         }
+        if prof {
+            for step in &self.steps {
+                if let DecodeStep::Graph(_, _, marks) = step {
+                    crate::inference::offload::record_stage_marks(marks);
+                }
+            }
+        }
         if let (Some(t), Some(started)) = (t, started) {
             prof_record(
                 "step: wait for the last card",
@@ -377,7 +390,7 @@ impl DecodeGraph {
     /// The single-card graph, which the per-token re-capture path updates in place.
     pub(super) fn single_mut(&mut self) -> Option<&mut crate::tensor::cuda_ext::CapturedGraph> {
         match self.steps.as_mut_slice() {
-            [DecodeStep::Graph(g, _)] => Some(g),
+            [DecodeStep::Graph(g, _, _)] => Some(g),
             _ => None,
         }
     }

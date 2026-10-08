@@ -74,6 +74,13 @@ pub(super) fn staged<R>(
         }
         return r;
     }
+    #[cfg(feature = "cuda")]
+    if crate::tensor::cuda_ext::capture_active(dev) {
+        if let Ok(card) = dev.as_cuda_device() {
+            let stream = card.0.stream().clone();
+            return crate::inference::offload::mark_stage_in_capture(name, &stream, f);
+        }
+    }
     let _ = dev.synchronize();
     let started = std::time::Instant::now();
     let r = f();
@@ -387,7 +394,9 @@ impl GenericTransformerLayer {
             let xn = hc.attn.normed_on_card(&r)?;
             hc.attn.mix_on_card(&xn, f16)
         })?;
-        let out = self.token_mixer(&mixed, mask, index_pos, dev)?;
+        let out = staged("token mixer", dev, settle, || {
+            self.token_mixer(&mixed, mask, index_pos, dev)
+        })?;
         let (r, xn) = staged("combine", dev, settle, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             combine_on_card(

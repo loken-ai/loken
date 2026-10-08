@@ -63,6 +63,84 @@ pub fn prof_record(stage: &'static str, ns: u64) {
     }
 }
 
+/// A stage recorded into a graph: the events at its two ends, which the card stamps each time
+/// the graph runs.
+#[cfg(feature = "cuda")]
+pub struct StageMark {
+    name: &'static str,
+    start: cudarc::driver::CudaEvent,
+    end: cudarc::driver::CudaEvent,
+}
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    static CAPTURE_MARKS: std::cell::RefCell<Vec<StageMark>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The name a stage is reported under when it ran inside a graph.
+#[cfg(feature = "cuda")]
+fn in_graph_name(name: &'static str) -> &'static str {
+    static NAMES: Mutex<BTreeMap<&'static str, &'static str>> = Mutex::new(BTreeMap::new());
+    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    names
+        .entry(name)
+        .or_insert_with(|| Box::leak(format!("in graph: {name}").into_boxed_str()))
+}
+
+/// Run `f`, a stage being recorded into a graph on `stream`, between two events when the stage
+/// profile is on. The marks are taken by [`take_capture_marks`] once the capture ends.
+#[cfg(feature = "cuda")]
+pub fn mark_stage_in_capture<R>(
+    name: &'static str,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let ctx = stream.context();
+    let flags = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let (Ok(start), Ok(end)) = (ctx.new_event(flags), ctx.new_event(flags)) else {
+        return f();
+    };
+    // An external record keeps the event a node of the graph that the card stamps at each run.
+    let record = |e: &cudarc::driver::CudaEvent| unsafe {
+        cudarc::driver::sys::cuEventRecordWithFlags(
+            e.cu_event(),
+            stream.cu_stream(),
+            cudarc::driver::sys::CUevent_record_flags::CU_EVENT_RECORD_EXTERNAL as u32,
+        )
+        .result()
+    };
+    if record(&start).is_err() {
+        return f();
+    }
+    let out = f();
+    if record(&end).is_ok() {
+        CAPTURE_MARKS.with(|m| m.borrow_mut().push(StageMark { name, start, end }));
+    }
+    out
+}
+
+/// The marks the capture just ended recorded, in the order they were made.
+#[cfg(feature = "cuda")]
+pub fn take_capture_marks() -> Vec<StageMark> {
+    CAPTURE_MARKS.with(|m| std::mem::take(&mut *m.borrow_mut()))
+}
+
+/// Add what the card stamped on each mark of a graph that has just run to the profile.
+#[cfg(feature = "cuda")]
+pub fn record_stage_marks(marks: &[StageMark]) {
+    for m in marks {
+        match m.start.elapsed_ms(&m.end) {
+            Ok(ms) => prof_record(in_graph_name(m.name), (ms as f64 * 1e6) as u64),
+            Err(e) => {
+                static SAID: AtomicBool = AtomicBool::new(false);
+                if !SAID.swap(true, Ordering::Relaxed) {
+                    tracing::warn!("a stage mark of a graph cannot be read ({}): {e:?}", m.name);
+                }
+            }
+        }
+    }
+}
+
 /// Each stage's total nanoseconds and call count since it was switched on.
 pub fn stage_prof_snapshot() -> Vec<(&'static str, u64, u64)> {
     STAGE_PROF
