@@ -338,11 +338,12 @@ impl GenericTransformerLayer {
                 if attends {
                     self.wide_attention(mixed, mask, index_pos)
                 } else {
-                    // A decoded token advances the state where it lies, as the recorded step
-                    // does, so the two can follow each other on the same buffers.
+                    // A decoded token, or the rows of a verify, advance the state where it
+                    // lies, as the recorded step does, so the two follow each other on the same
+                    // buffers.
                     #[cfg(feature = "cuda")]
                     let _in_place = crate::inference::moe_cuda::in_place_state(
-                        index_pos > 0 && mixed.dim(1).is_ok_and(|n| n == 1),
+                        index_pos > 0 && (self.spec_record || mixed.dim(1).is_ok_and(|n| n == 1)),
                     );
                     let m = self.mixer.forward(mixed, index_pos)?;
                     self.attn_output.forward(&m)
