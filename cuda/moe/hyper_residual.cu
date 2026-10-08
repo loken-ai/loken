@@ -141,7 +141,7 @@ extern "C" void loken_hc_combine(
 //   up_mean      mixed[row, d] = (1/S) * sum_s xn[row, s, d] * sigmoid(up[s * D + d, :] . low[row, :])
 //                one block per tile of UP_TILE columns d, all S streams of the tile
 //
-// The weights are dense F32, row-major `[n, k]`; the activations F32.
+// The weights are dense F32 or F16, row-major `[n, k]`; the activations F32.
 
 namespace {
 
@@ -163,16 +163,46 @@ __device__ __forceinline__ float dot_row(const float * __restrict__ w, const flo
     return acc;
 }
 
+// The same dot product over a row of F16 weights, eight at a time.
+__device__ __forceinline__ float dot_row_h(const __half * __restrict__ w, const float * __restrict__ x,
+        int k, int lane0, int stride) {
+    float acc = 0.f;
+    if ((k & 7) == 0) {
+        const uint4 * w8 = reinterpret_cast<const uint4 *>(w);
+        const float4 * x4 = reinterpret_cast<const float4 *>(x);
+        for (int i = lane0; i < (k >> 3); i += stride) {
+            const uint4 u = w8[i];
+            const __half2 * h = reinterpret_cast<const __half2 *>(&u);
+            const float2 a = __half22float2(h[0]), b = __half22float2(h[1]);
+            const float2 c = __half22float2(h[2]), d = __half22float2(h[3]);
+            const float4 x0 = x4[2 * i], x1 = x4[2 * i + 1];
+            acc += a.x * x0.x + a.y * x0.y + b.x * x0.z + b.y * x0.w;
+            acc += c.x * x1.x + c.y * x1.y + d.x * x1.z + d.y * x1.w;
+        }
+    } else {
+        for (int i = lane0; i < k; i += stride) acc += __half2float(w[i]) * x[i];
+    }
+    return acc;
+}
+
 } // namespace
 
 extern "C" __global__ void loken_hc_down_inject_kernel(
-        const float * __restrict__ xn, const float * __restrict__ down,
-        const float * __restrict__ inject, float * __restrict__ low, float * __restrict__ inj,
-        int K, int R, int I, float inv_streams) {
+        const float * __restrict__ xn, const void * __restrict__ down,
+        const void * __restrict__ inject, float * __restrict__ low, float * __restrict__ inj,
+        int K, int R, int I, float inv_streams, int half_w) {
     const int o = blockIdx.x;
     const size_t row = blockIdx.y;
-    const float * w = (o < R) ? down + (size_t) o * K : inject + (size_t) (o - R) * K;
-    float acc = dot_row(w, xn + row * K, K, threadIdx.x, blockDim.x);
+    float acc;
+    if (half_w) {
+        const __half * w = (o < R) ? (const __half *) down + (size_t) o * K
+                                   : (const __half *) inject + (size_t) (o - R) * K;
+        acc = dot_row_h(w, xn + row * K, K, threadIdx.x, blockDim.x);
+    } else {
+        const float * w = (o < R) ? (const float *) down + (size_t) o * K
+                                  : (const float *) inject + (size_t) (o - R) * K;
+        acc = dot_row(w, xn + row * K, K, threadIdx.x, blockDim.x);
+    }
     acc = block_sum(acc);
     if (threadIdx.x == 0) {
         if (o < R) {
@@ -185,17 +215,17 @@ extern "C" __global__ void loken_hc_down_inject_kernel(
 }
 
 extern "C" void loken_hc_down_inject(
-        const float * xn, const float * down, const float * inject, float * low, float * inj,
-        int rows, int K, int R, int I, int S, cudaStream_t stream) {
+        const float * xn, const void * down, const void * inject, float * low, float * inj,
+        int rows, int K, int R, int I, int S, int half_w, cudaStream_t stream) {
     dim3 grid((unsigned) (R + I), (unsigned) rows);
     loken_hc_down_inject_kernel<<<grid, 256, 0, stream>>>(
-        xn, down, inject, low, inj, K, R, I, 1.f / (float) S);
+        xn, down, inject, low, inj, K, R, I, 1.f / (float) S, half_w);
 }
 
 extern "C" __global__ void loken_hc_up_mean_kernel(
-        const float * __restrict__ xn, const float * __restrict__ up,
+        const float * __restrict__ xn, const void * __restrict__ up,
         const float * __restrict__ low, void * __restrict__ mixed,
-        int S, int D, int R, int out_f16) {
+        int S, int D, int R, int out_f16, int half_w) {
     extern __shared__ float shared[];
     float * low_s = shared;                    // R
     float * gate = shared + R;                 // S * UP_TILE
@@ -207,8 +237,9 @@ extern "C" __global__ void loken_hc_up_mean_kernel(
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
     for (int j = warp; j < S * tile; j += warps) {
         const int s = j / tile, dd = j % tile;
-        const float * w = up + ((size_t) s * D + d0 + dd) * R;
-        float acc = dot_row(w, low_s, R, lane, 32);
+        const size_t at = ((size_t) s * D + d0 + dd) * R;
+        float acc = half_w ? dot_row_h((const __half *) up + at, low_s, R, lane, 32)
+                           : dot_row((const float *) up + at, low_s, R, lane, 32);
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
         if (lane == 0) gate[s * UP_TILE + dd] = sigmoidf_(acc);
     }
@@ -222,9 +253,9 @@ extern "C" __global__ void loken_hc_up_mean_kernel(
 }
 
 extern "C" void loken_hc_up_mean(
-        const float * xn, const float * up, const float * low, void * mixed, int rows, int S,
-        int D, int R, int out_f16, cudaStream_t stream) {
+        const float * xn, const void * up, const float * low, void * mixed, int rows, int S,
+        int D, int R, int out_f16, int half_w, cudaStream_t stream) {
     dim3 grid((unsigned) ((D + UP_TILE - 1) / UP_TILE), (unsigned) rows);
     const size_t shared = ((size_t) R + (size_t) S * UP_TILE) * sizeof(float);
-    loken_hc_up_mean_kernel<<<grid, 256, shared, stream>>>(xn, up, low, mixed, S, D, R, out_f16);
+    loken_hc_up_mean_kernel<<<grid, 256, shared, stream>>>(xn, up, low, mixed, S, D, R, out_f16, half_w);
 }

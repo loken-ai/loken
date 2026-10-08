@@ -43,12 +43,75 @@ impl HyperMeta {
 pub struct HyperMixer {
     /// `[streams * dim]` F32, the gamma of every stream (already `1 + w`).
     gamma: Tensor,
-    down: QMatMul,
-    up: QMatMul,
-    inject: Option<QMatMul>,
+    down: Weight,
+    up: Weight,
+    inject: Option<Weight>,
     streams: usize,
     dim: usize,
     eps: f64,
+}
+
+/// A mixer's weight: a dense one on a card is held F16, half the bytes a decode step reads for
+/// it, and is widened to F32 where a stage wants a matrix product; any other as it is.
+enum Weight {
+    Half(Tensor),
+    Plain(QMatMul),
+}
+
+impl Weight {
+    fn pack(w: QMatMul) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if let Some(t) = w.dense() {
+            if t.dtype() == DType::F32 && t.device().is_cuda() && t.dims().len() == 2 {
+                // CONVERSION: a dense mixer weight is held F16 on a card when that loses
+                // nothing the weight had: a stored BF16 weight is exact in it but for the
+                // values under its smallest normal, which move by less than 1e-7.
+                let half = t.contiguous()?.to_dtype(DType::F16)?;
+                let worst = (t - half.to_dtype(DType::F32)?)?
+                    .abs()?
+                    .flatten_all()?
+                    .max_keepdim(0)?
+                    .to_vec1::<f32>()?[0];
+                if worst <= 1e-7 {
+                    return Ok(Weight::Half(half));
+                }
+            }
+        }
+        Ok(Weight::Plain(w))
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Weight::Plain(w) => w.forward(x),
+            Weight::Half(w) => {
+                let dims = x.dims().to_vec();
+                let k = *dims.last().expect("an activation has a width");
+                let rows = x.elem_count() / k;
+                let y = x
+                    .reshape((rows, k))?
+                    .matmul_t(&w.to_dtype(DType::F32)?)?
+                    .to_dtype(x.dtype())?;
+                let mut out = dims;
+                *out.last_mut().expect("an activation has a width") = w.dims()[0];
+                y.reshape(out)
+            }
+        }
+    }
+
+    /// The weight as the dense tensor a fused launch reads, F16 or F32.
+    fn dense(&self) -> Option<&Tensor> {
+        match self {
+            Weight::Half(w) => Some(w),
+            Weight::Plain(w) => w.dense(),
+        }
+    }
+
+    fn device(&self) -> crate::tensor::Device {
+        match self {
+            Weight::Half(w) => w.device().clone(),
+            Weight::Plain(w) => w.device(),
+        }
+    }
 }
 
 impl HyperMixer {
@@ -64,9 +127,9 @@ impl HyperMixer {
         let gamma = gamma.to_dtype(DType::F32)?.reshape(streams * dim)?;
         Ok(Self {
             gamma,
-            down,
-            up,
-            inject,
+            down: Weight::pack(down)?,
+            up: Weight::pack(up)?,
+            inject: inject.map(Weight::pack).transpose()?,
             streams,
             dim,
             eps,

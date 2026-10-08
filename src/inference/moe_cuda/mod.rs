@@ -130,10 +130,10 @@ cuda_launchers! {
     loken_hc_low(down: *const f32, low: *mut f32, n: i32, s: i32);
     loken_hc_mean_gate(xn: *const f32, up: *const f32, mixed: *mut c_void, rows: i32, s: i32,
         d: i32, out_f16: i32);
-    loken_hc_down_inject(xn: *const f32, down: *const f32, inject: *const f32, low: *mut f32,
-        inj: *mut f32, rows: i32, k: i32, r: i32, i: i32, s: i32);
-    loken_hc_up_mean(xn: *const f32, up: *const f32, low: *const f32, mixed: *mut c_void,
-        rows: i32, s: i32, d: i32, r: i32, out_f16: i32);
+    loken_hc_down_inject(xn: *const f32, down: *const c_void, inject: *const c_void, low: *mut f32,
+        inj: *mut f32, rows: i32, k: i32, r: i32, i: i32, s: i32, half_w: i32);
+    loken_hc_up_mean(xn: *const f32, up: *const c_void, low: *const f32, mixed: *mut c_void,
+        rows: i32, s: i32, d: i32, r: i32, out_f16: i32, half_w: i32);
     loken_hc_combine(r: *const f32, out: *const c_void, inject: *const f32, r_new: *mut f32,
         xn: *mut f32, gamma: *const f32, groups: i32, s: i32, d: i32, eps: f32,
         out_f16: i32);

@@ -126,14 +126,14 @@ pub fn hc_mean_gate(
 pub const FUSED_MIX_MAX_ROWS: usize = crate::inference::engine::decode_step::VERIFY_ROWS;
 
 /// A dense F32 weight `[n, k]` that is contiguous on a card, or `None`.
-fn dense_rows(w: &Tensor, n: Option<usize>, k: usize) -> Option<usize> {
+fn dense_rows(w: &Tensor, n: Option<usize>, k: usize) -> Option<(usize, bool)> {
     let [rows, cols] = w.dims() else { return None };
-    (w.dtype() == DType::F32
+    ((w.dtype() == DType::F32 || w.dtype() == DType::F16)
         && w.device().is_cuda()
         && w.is_contiguous()
         && *cols == k
         && n.is_none_or(|n| n == *rows))
-    .then_some(*rows)
+    .then_some((*rows, w.dtype() == DType::F16))
 }
 
 /// The mixer of a decode step in two launches: `down` and `inject` together, then `up` with the
@@ -154,16 +154,17 @@ pub fn hc_mix_fused(
     if rows == 0 || rows > FUSED_MIX_MAX_ROWS || xn.dtype() != DType::F32 || !xn.is_contiguous() {
         return Ok(None);
     }
-    let Some(rank) = dense_rows(down, None, k) else {
+    let Some((rank, half_w)) = dense_rows(down, None, k) else {
         return Ok(None);
     };
-    if dense_rows(up, Some(k), rank).is_none() {
-        return Ok(None);
+    match dense_rows(up, Some(k), rank) {
+        Some((_, h)) if h == half_w => {}
+        _ => return Ok(None),
     }
     let heads = match inject {
         Some(w) => match dense_rows(w, None, k) {
-            Some(n) => n,
-            None => return Ok(None),
+            Some((n, h)) if h == half_w => n,
+            _ => return Ok(None),
         },
         None => 0,
     };
@@ -172,10 +173,17 @@ pub fn hc_mix_fused(
     let low = unsafe { dev.alloc::<f32>(rows * rank) }?;
     let inj = unsafe { dev.alloc::<f32>((rows * heads).max(1)) }?;
     let xn_p = addr::<f32>(xn, "xn")? as *const f32;
-    let down_p = addr::<f32>(down, "down")? as *const f32;
-    let up_p = addr::<f32>(up, "up")? as *const f32;
+    let weight = |w: &Tensor, name: &str| -> Result<*const c_void> {
+        Ok(if half_w {
+            addr::<half::f16>(w, name)? as *const c_void
+        } else {
+            addr::<f32>(w, name)? as *const c_void
+        })
+    };
+    let down_p = weight(down, "down")?;
+    let up_p = weight(up, "up")?;
     let inj_w = match inject {
-        Some(w) => addr::<f32>(w, "inject")? as *const f32,
+        Some(w) => weight(w, "inject")?,
         None => std::ptr::null(),
     };
     let low_p = low.device_ptr(low.stream()).0;
@@ -191,6 +199,7 @@ pub fn hc_mix_fused(
             rank as i32,
             heads as i32,
             streams as i32,
+            i32::from(half_w),
             stream,
         );
     }
@@ -208,6 +217,7 @@ pub fn hc_mix_fused(
                 dim as i32,
                 rank as i32,
                 1,
+                i32::from(half_w),
                 stream,
             );
         }
@@ -225,6 +235,7 @@ pub fn hc_mix_fused(
                 dim as i32,
                 rank as i32,
                 0,
+                i32::from(half_w),
                 stream,
             );
         }

@@ -599,6 +599,57 @@ fn the_fused_mixer_matches_the_tensor_ops_for_a_decode_step() {
     );
 }
 
+/// The mixer launches read half-precision weights and give what they give on the same weights
+/// held in single precision, when the values are exact in the narrower format.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn the_fused_mixer_reads_half_weights_like_single_ones() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let model = toy_on(Some(0));
+    let card = model.layers[0].cos.device();
+    let n = ids(&v, "b.ids").len();
+    let r = Tensor::from_vec(f32s(&v, "b.layer1_out"), (1, n, 256), &Device::Cpu)
+        .unwrap()
+        .to_device(&card)
+        .unwrap();
+    let hc = model.layers[1].hyper.as_ref().unwrap();
+    let streams = hc.attn.streams();
+    let dim = hc.attn.dim();
+    let round = |t: &Tensor| {
+        let half = t.to_dtype(DType::F16).unwrap();
+        (half.to_dtype(DType::F32).unwrap(), half)
+    };
+    let (down32, down16) = round(hc.attn.down_dense().unwrap());
+    let (up32, up16) = round(hc.attn.up_dense().unwrap());
+    let flat = |t: &Tensor| {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    for rows in [1, 3] {
+        let xn = hc
+            .attn
+            .normed_on_card(&r.narrow(1, 0, rows).unwrap())
+            .unwrap();
+        let mix = |down: &Tensor, up: &Tensor| {
+            crate::inference::moe_cuda::hc_mix_fused(&xn, down, up, None, streams, dim, true)
+                .unwrap()
+                .expect("the launches take these weights")
+                .0
+        };
+        let want = flat(&mix(&down32, &up32));
+        let got = flat(&mix(&down16, &up16));
+        assert!(max_diff(&got, &want) < 1e-3, "{rows} rows");
+    }
+}
+
 /// A mixer handed more rows than its block works on them block by block and gives, row for row,
 /// what it gives when it takes them all at once: every operation of the mixer is per row.
 #[test]
