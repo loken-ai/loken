@@ -39,6 +39,9 @@ Every route but `/health` demands a key when `[server] require_auth` is on, as
 | `POST /v1/responses` | The Responses API, lowered to a chat completion and lifted back into output items. `GET` and `DELETE /v1/responses/{id}` read and drop a stored response; `previous_response_id` continues one. |
 | `POST /v1/embeddings` | Embeddings, loading the model on demand. |
 | `POST /v1/rerank`, `POST /rerank` | Score documents against a query with a cross-encoder. |
+| `POST /v2/rerank` | The same in Cohere's shape: `documents` as strings or `{text}` objects, `top_n`, `return_documents`; answers `{id, results, meta}`. |
+| `POST /v2/embed` | Embeddings in Cohere's shape: `texts`, answered as `embeddings.float`. Only `float` is served. |
+| `POST /score`, `POST /v1/score` | vLLM's pair scoring: `text_1` against `text_2`, one score per pair, `data[].score`. |
 | `GET /v1/models` | The models on this machine, then those the peers hold with the holder as `owned_by`. Answers in the Messages API's shape to a client sending its version header. |
 | `GET /v1/models/{id}`, `DELETE /v1/models/{id}` | One model, ids with slashes included. |
 | `POST /v1/moderations` | Category scores from the configured classifier, with the family's own labels under `hazards`. 501 until `moderation_model` is set. |

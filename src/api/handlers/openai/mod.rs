@@ -3,6 +3,8 @@
 
 use super::*;
 
+pub(crate) mod pooling;
+
 /// The string a request field holds, empty when it is absent or is not a string.
 ///
 /// The endpoints in this module read raw bodies, and to all of them an absent field and a

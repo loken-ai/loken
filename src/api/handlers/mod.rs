@@ -2549,6 +2549,16 @@ impl APIServer {
             .route("/v1/embeddings", axum::routing::post(openai_embeddings))
             .route("/v1/rerank", axum::routing::post(openai_rerank))
             .route("/rerank", axum::routing::post(openai_rerank))
+            .route(
+                "/v2/rerank",
+                axum::routing::post(openai::pooling::cohere_rerank),
+            )
+            .route(
+                "/v2/embed",
+                axum::routing::post(openai::pooling::cohere_embed),
+            )
+            .route("/score", axum::routing::post(openai::pooling::score))
+            .route("/v1/score", axum::routing::post(openai::pooling::score))
             .route("/api/create", axum::routing::post(ollama_create_model))
             .route(
                 "/api/calibrate",
