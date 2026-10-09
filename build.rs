@@ -367,6 +367,7 @@ fn compile_mmq_kernels() {
         "cuda/mmq_gguf/mmq_instance_q5_0.cu",
         "cuda/mmq_gguf/mmq_instance_q5_1.cu",
         "cuda/mmq_gguf/mmq_instance_q8_0.cu",
+        "cuda/mmq_gguf/mmq_instance_q2_0.cu",
         "cuda/mmq_gguf/mmq_instance_q2_k.cu",
         "cuda/mmq_gguf/mmq_instance_q3_k.cu",
         "cuda/mmq_gguf/mmq_instance_q4_k.cu",

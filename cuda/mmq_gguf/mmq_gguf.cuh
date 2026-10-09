@@ -237,6 +237,10 @@ static constexpr __host__ __device__ mmq_format mmq_format_of(const ggml_type ty
                                      {MMQ_TILE_NE_K*2, 1}, {MMQ_TILE_NE_K*2/QI8_1, QI8_1/2},   {0, 0}};
         case GGML_TYPE_Q8_0: return {MMQ_Q8_1_DS_LAYOUT_D4,   MMQ_MMA_TILE_X_K_Q8_0,
                                      {MMQ_TILE_NE_K*2, 1}, {MMQ_TILE_NE_K*2/QI8_0, QI8_0/2},   {0, 0}};
+        // Q2_0 tiles as Q8_0 does: its codes are widened to signed bytes and each half of a block
+        // takes the block's scale.
+        case GGML_TYPE_Q2_0: return {MMQ_Q8_1_DS_LAYOUT_D4,   MMQ_MMA_TILE_X_K_Q8_0,
+                                     {MMQ_TILE_NE_K*2, 1}, {MMQ_TILE_NE_K*2/QI8_0, QI8_0/2},   {0, 0}};
         case GGML_TYPE_Q2_K: return {MMQ_Q8_1_DS_LAYOUT_D2S6, MMQ_MMA_TILE_X_K_Q2_K,
                                      {MMQ_TILE_NE_K*2, 1}, {MMQ_TILE_NE_K,         1},         {0, 0}};
         case GGML_TYPE_Q3_K: return {MMQ_Q8_1_DS_LAYOUT_D4,   MMQ_MMA_TILE_X_K_Q3_K,
@@ -659,6 +663,49 @@ static __device__ __forceinline__ void load_tiles_paired(
     mmq_fill_rows<block, blocks_per_row, mmq_y, need_check>(x, kbx0, stride, i_max,
         [&] (const int i, const block * row_blocks) {
             x_sc[tile::df_row(i) + kbd] = plane::scale(row_blocks + kbd);
+        });
+}
+
+// Q2_0: sixty-four weights, a scale and two-bit codes, four to a byte and the lowest first. A weight
+// is its code less one, so a byte becomes the four signed bytes of one tile int, and the two halves
+// of a block, which share the block's scale, tile as the 32-weight blocks of Q8_0.
+static __device__ __forceinline__ int q2_0_byte_to_int(const uint8_t byte) {
+    const int b = byte;
+    const int spread = (b & 0x03) | ((b & 0x0C) << 6) | ((b & 0x30) << 12) | ((b & 0xC0) << 18);
+    return __vsubss4(spread, 0x01010101);
+}
+
+template <int mmq_y, bool need_check>
+static __device__ __forceinline__ void load_tiles_q2_0(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max,
+    const int stride) {
+    using tile = mmq_tile<GGML_TYPE_Q2_0, mmq_y>;
+
+    int * x_qs = tile::qs(x_tile);
+    float * x_df = tile::df(x_tile);
+
+    // A tile row is two spans of MMQ_TILE_NE_K ints, and a lane owns one int of each. A block is
+    // QK_Q2_0/4 bytes, so QK_Q2_0/4 ints of the tile.
+    constexpr int ints_per_span = MMQ_TILE_NE_K;
+    constexpr int ints_per_block = QK_Q2_0 / 4;
+    const int txi = threadIdx.x % ints_per_span;
+
+    mmq_fill_rows<block_q2_0, ints_per_span, mmq_y, need_check>(x, kbx0, stride, i_max,
+        [&] (const int i, const block_q2_0 * row_blocks) {
+            const block_q2_0 * bxi = row_blocks + txi/ints_per_block;
+            const int j = txi % ints_per_block;
+            x_qs[tile::qs_row(i) + 0             + txi] = q2_0_byte_to_int(bxi[0].qs[j]);
+            x_qs[tile::qs_row(i) + MMQ_TILE_NE_K + txi] =
+                q2_0_byte_to_int(bxi[MMQ_TILE_NE_K/ints_per_block].qs[j]);
+        });
+
+    // One scale per 32 weights, so two to a block.
+    constexpr int halves_per_tile_row = 2*MMQ_TILE_NE_K / QI8_0;
+    const int kbxd = threadIdx.x % halves_per_tile_row;
+
+    mmq_fill_rows<block_q2_0, halves_per_tile_row, mmq_y, need_check>(x, kbx0, stride, i_max,
+        [&] (const int i, const block_q2_0 * row_blocks) {
+            x_df[tile::df_row(i) + kbxd] = __half2float(row_blocks[kbxd/2].d);
         });
 }
 
@@ -2080,6 +2127,11 @@ MMQ_FORMAT(GGML_TYPE_Q5_1,
            (vec_dot_q8_1_q8_1_dp4a<mmq_x, mmq_y>))
 MMQ_FORMAT(GGML_TYPE_Q8_0,
            (load_tiles_q8_0<mmq_y, need_check>),
+           (vec_dot_blocked_mma<mmq_scale_only, mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>),
+           (vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>))
+
+MMQ_FORMAT(GGML_TYPE_Q2_0,
+           (load_tiles_q2_0<mmq_y, need_check>),
            (vec_dot_blocked_mma<mmq_scale_only, mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>),
            (vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>))
 

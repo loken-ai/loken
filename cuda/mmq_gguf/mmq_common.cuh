@@ -56,7 +56,8 @@
     X(IQ3_S,   21, QK_IQ3_S,   1, QI_IQ3_S)    \
     X(IQ2_S,   22, QK_IQ2_S,   1, QI_IQ2_S)    \
     X(IQ4_XS,  23, QK_IQ4_XS,  1, QI_IQ4_XS)   \
-    X(MXFP4, 39, QK_MXFP4, QR_MXFP4, QI_MXFP4)
+    X(MXFP4, 39, QK_MXFP4, QR_MXFP4, QI_MXFP4)  \
+    X(Q2_0,  42, QK_Q2_0,  4,        QI_Q2_0)
 
 enum ggml_type {
 #define GGUF_TYPE_ID(name, id, qk_v, qr_v, qi_v) GGML_TYPE_##name = id,

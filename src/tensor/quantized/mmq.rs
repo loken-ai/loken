@@ -308,6 +308,7 @@ expert_only_formats! {
     Iq3Xxs => launch_mmq_moe_gguf_iq3_xxs;
     Iq3S   => launch_mmq_moe_gguf_iq3_s;
     Iq2S   => launch_mmq_moe_gguf_iq2_s;
+    Q2_0   => launch_mmq_moe_gguf_q2_0;
 }
 
 /// Whether an expert-batched tile kernel exists for this weight format: every format the

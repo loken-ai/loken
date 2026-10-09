@@ -452,6 +452,7 @@ fn the_expert_batched_matmul_serves_the_codebook_formats() {
         GgmlDType::Iq3Xxs,
         GgmlDType::Iq3S,
         GgmlDType::Iq2S,
+        GgmlDType::Q2_0,
     ] {
         // From a handful of tokens, where an expert has a row or two, to hundreds, at the
         // launcher's own tile width and at every width it can be forced to.
