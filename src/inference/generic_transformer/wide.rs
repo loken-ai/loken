@@ -654,7 +654,6 @@ impl GenericTransformerLayer {
             .attention_scale
             .unwrap_or_else(|| 1.0 / (hd as f64).sqrt());
         let q = q.to_dtype(DType::F32)?.contiguous()?;
-        let k_t = k_all.transpose(2, 3)?;
         // The scores of a block of rows at a time: all of them at once is `heads x rows x kv_len`
         // floats, several times over, which a long chunk over a long cache cannot hold. The block
         // is as many rows as keep the live copies of its scores within `SCORE_BUDGET_BYTES`, up to
@@ -663,23 +662,48 @@ impl GenericTransformerLayer {
         let live_scores = SCORE_COPIES * n_head * kv_len * std::mem::size_of::<f32>();
         let block = (SCORE_BUDGET_BYTES / live_scores.max(1)).clamp(1, hyper::mixer_block_rows());
         let mut parts = Vec::with_capacity(seq.div_ceil(block));
+        // The rank of a position in the union of what a block keeps, `u32::MAX` for a position
+        // outside it.
+        let mut rank = vec![u32::MAX; kv_len];
         for (first, kept) in (0..seq).step_by(block).zip(selection.chunks(block)) {
             let rows = kept.len();
-            let mut bias = vec![f32::MIN / 2.0; rows * kv_len];
-            for (row, kept) in bias.chunks_exact_mut(kv_len).zip(kept) {
-                for t in kept {
-                    row[*t as usize] = 0.0;
+            // The rows of a block keep neighbouring parts of the cache: the product reads the
+            // union of what they keep, a fraction of the cache, and each row masks the rest of it.
+            let mut union: Vec<u32> = Vec::new();
+            for row in kept {
+                for &t in row {
+                    if rank[t as usize] == u32::MAX {
+                        rank[t as usize] = 0;
+                        union.push(t);
+                    }
                 }
             }
-            let bias = Tensor::from_vec(bias, (1, 1, 1, rows, kv_len), &q.device())?;
+            union.sort_unstable();
+            for (r, &t) in union.iter().enumerate() {
+                rank[t as usize] = r as u32;
+            }
+            let width = union.len();
+            let mut bias = vec![f32::MIN / 2.0; rows * width];
+            for (row, kept) in bias.chunks_exact_mut(width).zip(kept) {
+                for &t in kept {
+                    row[rank[t as usize] as usize] = 0.0;
+                }
+            }
+            for &t in &union {
+                rank[t as usize] = u32::MAX;
+            }
+            let bias = Tensor::from_vec(bias, (1, 1, 1, rows, width), &q.device())?;
+            let at = Tensor::from_vec(union, (width,), &q.device())?;
+            let k_u = k_all.index_select(&at, 2)?.transpose(2, 3)?;
+            let v_u = v_all.index_select(&at, 2)?;
             let q_rows =
                 q.narrow(2, first, rows)?
                     .contiguous()?
                     .reshape((b, n_kv, rep * rows, hd))?;
-            let scores = (q_rows.matmul(&k_t)? * scale)?.reshape((b, n_kv, rep, rows, kv_len))?;
+            let scores = (q_rows.matmul(&k_u)? * scale)?.reshape((b, n_kv, rep, rows, width))?;
             let probs = crate::tensor::ops::softmax_last_dim(&scores.broadcast_add(&bias)?)?
-                .reshape((b, n_kv, rep * rows, kv_len))?;
-            parts.push(probs.matmul(&v_all)?.reshape((b, n_head, rows, hd))?);
+                .reshape((b, n_kv, rep * rows, width))?;
+            parts.push(probs.matmul(&v_u)?.reshape((b, n_head, rows, hd))?);
         }
         let y = if parts.len() == 1 {
             parts.remove(0)
