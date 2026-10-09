@@ -909,6 +909,11 @@ impl LayerTier {
         // worker.
         self.keep_in_transit(transit_ids, &mut in_use, &stream)?;
         self.promote(host_ids, &in_use);
+        // The experts in the transit room are read by kernels now queued: the room is free for
+        // the next fill once they have run.
+        if !transit_ids.is_empty() {
+            self.release_stacks()?;
+        }
         Ok(out)
     }
 
@@ -1109,6 +1114,9 @@ impl LayerTier {
         drop(guard);
         self.keep_in_transit(&transit_experts, &mut in_use, &stream)?;
         self.promote(&host_experts, &in_use);
+        if !transit_experts.is_empty() {
+            self.release_stacks()?;
+        }
         Ok(out)
     }
 
