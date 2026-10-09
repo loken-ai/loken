@@ -108,7 +108,7 @@ fn adaptive_prefill_chunk_uncached(shape: PrefillShape) -> usize {
     // not handed the chunk of an empty one and left to discover the difference by running out
     // of memory. A share of the free VRAM, because the activation peak is not the only thing a
     // forward allocates: the attention transients and the KV growth come out of the same pool.
-    let free = crate::inference::place::vram_manager::free_on_cards(shape.cards) as usize;
+    let free = crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards) as usize;
     if free == 0 {
         // No CUDA, or nothing to probe: the host path is bounded by RAM, which this is not
         // measuring, so keep the conservative default rather than inventing a number.

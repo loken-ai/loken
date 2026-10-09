@@ -2126,7 +2126,8 @@ impl GenericHeteroTransformer {
 
     /// Keeps the snapshots within a device-memory budget, dropping the least recently
     /// used until they fit. The budget is the free device memory plus what the snapshots
-    /// already hold, less the working window the cache may still grow by.
+    /// already hold, less the working window the cache may still grow by and the memory
+    /// the next prefill chunk works in, for a model that declares its chunk.
     fn enforce_kv_snapshot_budget(&mut self) {
         let held: u64 = self.kv_snapshots.iter().map(KvSnapshot::device_bytes).sum();
         let budget = {
@@ -2137,8 +2138,18 @@ impl GenericHeteroTransformer {
                 * hd
                 * crate::inference::cache::KV_WORKING_WINDOW_TOKENS
                 * crate::tensor::DType::F16.size_in_bytes()) as u64;
+            let shape = self.prefill_shape();
+            let chunk_bytes = if shape.target_chunk > 0 {
+                (shape.bytes_per_token as u64)
+                    .saturating_mul(shape.target_chunk as u64)
+                    .saturating_add(shape.fixed_bytes as u64)
+            } else {
+                0
+            };
             match self.free_device_memory() {
-                Some(free) => (free + held).saturating_sub(window_bytes),
+                Some(free) => (free + held)
+                    .saturating_sub(window_bytes)
+                    .saturating_sub(chunk_bytes),
                 None => return,
             }
         };

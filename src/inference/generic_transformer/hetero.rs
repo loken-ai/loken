@@ -252,7 +252,6 @@ impl GenericHeteroTransformer {
     /// full for a batch that wide, which a chunk at a time repeats for every chunk.
     pub fn layer_major_pays(&self, seq_len: usize, chunk: usize) -> bool {
         seq_len > chunk.max(1)
-            && self.draft.is_none()
             && self.config.shared_kv_layers == 0
             && self.layers.iter().any(|l| {
                 l.moe.as_ref().is_some_and(|m| {
@@ -321,6 +320,20 @@ impl GenericHeteroTransformer {
                 tier.hold_stacks(false)?;
             }
             outcome?;
+        }
+        // The draft head reads the prompt chunk by chunk, in order, from the last layer's rows.
+        if self.capture_feature && self.draft.is_some() {
+            for (c, &(off, n)) in spans.iter().enumerate() {
+                let chunk_ids = ids
+                    .narrow(1, off, n)?
+                    .flatten_all()?
+                    .to_dtype(crate::tensor::DType::U32)?
+                    .to_vec1::<u32>()?;
+                let rows = hidden[c]
+                    .as_ref()
+                    .expect("a chunk's residual is held after the last layer");
+                self.draft_ingest(&chunk_ids, rows, index_pos + off)?;
+            }
         }
         let last = hidden
             .pop()
@@ -693,7 +706,7 @@ impl GenericHeteroTransformer {
                     )
                 },
             fixed_bytes: base.fixed_bytes,
-            target_chunk: super::hyper::CHUNK_CEILING,
+            target_chunk: super::hyper::PLANNED_CHUNK_ROWS,
             share: 2,
             cards: 0,
         }

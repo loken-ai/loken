@@ -296,8 +296,8 @@ pub fn grouped_rms(
     normed.broadcast_mul(&gamma.to_device(&r.device())?)
 }
 
-/// Largest chunk a prompt is cut into, however many experts a model has.
-pub(super) const CHUNK_CEILING: usize = 8192;
+/// Rows of a prefill chunk a card's memory is planned for: the first rung of the chunk ladder.
+pub(super) const PLANNED_CHUNK_ROWS: usize = 2048;
 /// Buffers of `streams x dim` f32 a wide layer keeps live per token of a chunk: the residual, at a
 /// combine the product it adds and the new residual, and the sublayers' own activations counted at
 /// the same width (the mixers' temporaries are bounded apart, by [`mixer_block_rows`]).
@@ -318,24 +318,19 @@ pub fn mixer_block_rows() -> usize {
 }
 
 /// What a wide layer's prefill keeps on a card: per token of a chunk, the `streams x dim` f32
-/// buffers live at once; apart from the chunk, the mixers' block temporaries; and the chunk it
-/// runs best at, the one that gives each routed expert a full tile of the grouped matmul on
-/// average, `tile x experts / top-k` tokens, between the ladder's usual top and [`CHUNK_CEILING`].
-/// `experts` is `(count, used)`, `None` for a model without a routed mixture; its experts run on a
-/// card for a batch of rows, and keep their own activations live per routed pair, `expert_ffn` wide.
+/// buffers live at once; apart from the chunk, the mixers' block temporaries; and the chunk the
+/// card is planned for, [`PLANNED_CHUNK_ROWS`]. A longer prompt runs as several chunks, and a
+/// layer whose experts stream in crosses them once for all of its chunks, so the memory a wider
+/// chunk would take stays with the experts' cache. `experts` is `(count, used)`, `None` for a
+/// model without a routed mixture; its experts run on a card for a batch of rows, and keep their
+/// own activations live per routed pair, `expert_ffn` wide.
 pub fn prefill_footprint(
     streams: usize,
     dim: usize,
     experts: Option<(usize, usize)>,
     expert_ffn: usize,
 ) -> PrefillFootprint {
-    #[cfg(feature = "cuda")]
-    let tile = crate::inference::moe_cuda::MMQ_X_MAX;
-    #[cfg(not(feature = "cuda"))]
-    let tile = 1;
-    let target_chunk = experts
-        .map(|(n, used)| (n * tile / used.max(1)).clamp(2048, CHUNK_CEILING))
-        .unwrap_or(0);
+    let target_chunk = experts.map_or(0, |_| PLANNED_CHUNK_ROWS);
     let f = std::mem::size_of::<f32>();
     PrefillFootprint {
         bytes_per_token: streams * dim * f * WIDE_LIVE_BUFFERS

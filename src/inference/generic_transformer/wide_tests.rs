@@ -669,16 +669,16 @@ fn a_mixer_blocked_over_its_rows_matches_the_whole() {
     assert_eq!(flat(&inj_b.unwrap()), flat(&inj_w.unwrap()));
 }
 
-/// A wide model's prefill footprint grows with the streams and its wanted chunk with the experts,
-/// within the ladder's top and the ceiling; a model without a routed mixture asks for no chunk.
+/// A wide model's prefill footprint grows with the streams and plans the card for the same chunk
+/// whatever the experts; a model without a routed mixture asks for no chunk.
 #[cfg(feature = "cuda")]
 #[test]
 fn the_wide_prefill_footprint_follows_the_model() {
     let a = hyper::prefill_footprint(4, 2560, Some((160, 10)), 640);
     let b = hyper::prefill_footprint(4, 2560, Some((512, 10)), 640);
     assert!(a.bytes_per_token > 0 && a.fixed_bytes > 0);
-    assert!(a.target_chunk >= 2048 && b.target_chunk > a.target_chunk);
-    assert!(b.target_chunk <= 8192);
+    assert_eq!(a.target_chunk, hyper::PLANNED_CHUNK_ROWS);
+    assert_eq!(b.target_chunk, a.target_chunk);
     let plain = hyper::prefill_footprint(4, 2560, None, 0);
     assert_eq!(plain.target_chunk, 0);
     assert_eq!(
@@ -1135,4 +1135,48 @@ fn the_draft_head_cuts_its_guesses_from_the_indexer_as_from_its_cache() {
     let whole = head_guesses(&[(0, 36)], 3);
     let cut = head_guesses(&[(0, 12), (12, 9), (21, 7), (28, 8)], 3);
     assert_eq!(whole, cut);
+}
+
+/// What the head guesses after a prompt read as chunks of `chunk` rows, layer by layer or chunk
+/// by chunk, and one decode step on.
+fn head_guesses_after_prompt(layer_major: bool, chunk: usize) -> (Vec<f32>, Vec<u32>) {
+    let mut m = toy_with_head();
+    m.set_capture_feature(true);
+    let vocab = m.config.vocab_size as u32;
+    let prompt: Vec<u32> = (0..26u32).map(|i| (i * 7 + 2) % vocab).collect();
+    let ids = |v: &[u32]| Tensor::from_vec(v.to_vec(), (1usize, v.len()), &Device::Cpu).unwrap();
+    let logits = if layer_major {
+        m.forward_prefill_layer_major(&ids(&prompt), 0, chunk)
+            .unwrap()
+    } else {
+        let mut last = None;
+        let mut off = 0;
+        while off < prompt.len() {
+            let n = chunk.min(prompt.len() - off);
+            last = Some(m.forward(&ids(&prompt[off..off + n]), off).unwrap());
+            off += n;
+        }
+        last.unwrap()
+    };
+    let row = logits.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let next = (row
+        .iter()
+        .enumerate()
+        .fold(
+            (0, f32::NEG_INFINITY),
+            |b, (i, &v)| if v > b.1 { (i, v) } else { b },
+        )
+        .0) as u32;
+    m.forward(&ids(&[next]), prompt.len()).unwrap();
+    let guesses = m.draft_tokens(&[next], 3).unwrap();
+    (row, guesses)
+}
+
+#[test]
+fn the_draft_head_reads_a_prompt_layer_by_layer_as_chunk_by_chunk() {
+    for chunk in [5usize, 9] {
+        let by_chunk = head_guesses_after_prompt(false, chunk);
+        let by_layer = head_guesses_after_prompt(true, chunk);
+        assert_eq!(by_layer, by_chunk, "chunk {chunk}");
+    }
 }

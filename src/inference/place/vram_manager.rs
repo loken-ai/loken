@@ -131,6 +131,18 @@ pub fn free_on_cards(cards: u64) -> u64 {
         .unwrap_or(0)
 }
 
+/// What the tightest of the cards in `cards` (the bits of their indices) has free; with no bits
+/// set, of every card. A forward holds each card's own layers' activations, so it is the
+/// tightest card that decides how much it can take at once, not the sum.
+pub fn tightest_free_on_cards(cards: u64) -> u64 {
+    probe(0)
+        .into_iter()
+        .filter(|(index, _, _)| cards == 0 || cards >> *index & 1 == 1)
+        .map(|(_, free, _)| free)
+        .min()
+        .unwrap_or(0)
+}
+
 /// What the cards hold in total, whatever is currently on them.
 ///
 /// The CAPACITY of the machine, as against `free_total`'s "right now". A statement
