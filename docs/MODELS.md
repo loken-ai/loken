@@ -52,6 +52,17 @@ A set is placed layer by layer, never tensor-parallel. A family's vision tower r
 first part only; a set whose `v.*` tensors sit in another part is served as text, and the log
 says why.
 
+A checkpoint may ship a draft head that the served file leaves out: the multi-token-prediction
+layer of the wide-residual family. It is read from a companion file, `<stem>.mtp.gguf` beside
+the model, the stem being that of a split's parts. `loken draft-head <repo> <out.gguf>` writes it
+from the checkpoint's `mtp.*` tensors by range requests. This layout is loken's own, and no GGUF
+specification names it: the head's layer is `blk.N.*` with N the model's layer count, the
+projections that fuse the embedding with the hidden state and the head's output mixer are
+`mtp.*`, norm scales are written as the served file holds them (one more than the checkpoint's),
+matrices are Q4_K or Q5_0 by row length, the router gates are F32 and the indexer's projections
+BF16. The file carries `general.architecture` and `general.name` and nothing else. A model
+without the companion decodes without a head.
+
 ## Language models
 
 One generic transformer reads its shape from the checkpoint, so a family is a row in a table
