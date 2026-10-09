@@ -307,6 +307,8 @@ impl LlmEngine {
             let mut logprob_buf: Vec<TokenLogprob> = Vec::new();
             let reused_prompt_tokens: usize;
             let audio_positions: usize;
+            // Whether the model's own draft head reads this request's prompt and decode steps.
+            let head_capable: bool;
             let (
                 mut next_token,
                 mut pos,
@@ -693,6 +695,15 @@ impl LlmEngine {
                     session_start
                 };
                 let prefill_slice = &prompt_tokens[text_start..];
+                // A model that came with a draft head reads the hidden state of every forward from
+                // the prefill on: the head drafts from the state before the token it is given. A
+                // prompt that starts after a cached prefix would leave the head without it.
+                head_capable = text_start == 0 && state.model.draft_head_capture(true);
+                if head_capable {
+                    state.model.draft_head_reset();
+                } else {
+                    state.model.draft_head_capture(false);
+                }
                 let x = match Tensor::new(prefill_slice, &device).and_then(|t| t.unsqueeze(0)) {
                     Ok(t) => t,
                     Err(e) => {
@@ -1060,6 +1071,17 @@ impl LlmEngine {
             let drafting = spec_drafter_on && spec_engine.draft_length() > 0;
             let mut spec_on = drafting && spec_engine.draft_prefill(&prompt_tokens);
             let mut time_plain = spec_drafter_on && !drafting;
+            // The model's own draft head drafts when no drafter model does and its cycles are
+            // not known to lose to plain decoding; the tokens it reads next start as the one
+            // the prefill sampled.
+            let mut head_on = head_capable && !spec_on && spec_engine.draft_length() > 0;
+            if head_capable && !head_on {
+                if let Some(s) = model_state.blocking_lock().as_mut() {
+                    s.model.draft_head_capture(false);
+                }
+            }
+            let mut head_tokens: Vec<u32> = vec![next_token];
+            let (mut spec_drafted, mut spec_accepted): (u64, u64) = (0, 0);
             let mut pld_stats_drafted: u64 = 0;
             let mut pld_stats_accepted: u64 = 0;
             // Adaptive PLD gating: if recent accept rate is too low, disable
@@ -1511,6 +1533,7 @@ impl LlmEngine {
                     let graph_step: Option<(u32, Option<Tensor>)> = 'graph_blk: {
                         // A drafter's step, or an n-gram draft worth verifying, runs eagerly.
                         let verify_step = spec_on
+                            || head_on
                             || (pld_enabled
                                 && pld_cooldown == 0
                                 && pos <= pld_max_ctx_threshold()
@@ -1891,7 +1914,7 @@ impl LlmEngine {
                     // The draft length is learned across cycles (decode_step::DraftLength).
                     let cycle_start = std::time::Instant::now();
                     let mut draft_secs = 0.0;
-                    let want = if spec_on {
+                    let want = if spec_on || head_on {
                         spec_engine.draft_length()
                     } else {
                         0
@@ -1900,6 +1923,14 @@ impl LlmEngine {
                         // Plain decoding pays more; the drafter's cache is left behind for good.
                         spec_on = false;
                         time_plain = true;
+                    }
+                    if head_on && want == 0 {
+                        // Plain decoding pays more: the head stops reading the hidden states.
+                        head_on = false;
+                        time_plain = true;
+                        if let Some(s) = model_state.blocking_lock().as_mut() {
+                            s.model.draft_head_capture(false);
+                        }
                     }
                     let draft: Vec<u32> = if spec_on {
                         let d = spec_engine.draft_k(
@@ -1915,6 +1946,13 @@ impl LlmEngine {
                             spec_on = false;
                         }
                         d
+                    } else if head_on {
+                        let d = match model_state.blocking_lock().as_mut() {
+                            Some(s) => s.model.draft_head_tokens(&head_tokens, want),
+                            None => Vec::new(),
+                        };
+                        draft_secs = cycle_start.elapsed().as_secs_f64();
+                        d
                     } else if pld_active {
                         pld_cache.lookup()
                     } else {
@@ -1922,7 +1960,7 @@ impl LlmEngine {
                     };
 
                     // A drafter's single token is worth a verify; an n-gram match of one is not.
-                    let worth_verifying = if spec_on {
+                    let worth_verifying = if spec_on || head_on {
                         !draft.is_empty()
                     } else {
                         draft.len() >= 2
@@ -2044,9 +2082,26 @@ impl LlmEngine {
                                 );
                                 let n_committed = 1 + accepted_drafts;
                                 let new_pos = pos + n_committed;
-                                if !spec_on {
+                                if !spec_on && !head_on {
                                     pld_cost
                                         .round(cycle_start.elapsed().as_secs_f64(), n_committed);
+                                }
+                                if head_on {
+                                    head_tokens.clear();
+                                    head_tokens.extend_from_slice(&draft[..accepted_drafts]);
+                                    head_tokens.push(outcome.next_token);
+                                    spec_drafted += k as u64;
+                                    spec_accepted += accepted_drafts as u64;
+                                    spec_engine
+                                        .draft_length
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .record(
+                                            k,
+                                            accepted_drafts,
+                                            draft_secs,
+                                            cycle_start.elapsed().as_secs_f64(),
+                                        );
                                 }
 
                                 if n_committed < k + 1 {
@@ -2159,7 +2214,15 @@ impl LlmEngine {
                                     }
                                 },
                             };
-                            let logits = match state.model.forward(&x, pos) {
+                            // The draft head needs this step's hidden state, which the captured
+                            // graph does not hand out: the step runs as a one-row verify.
+                            let stepped = if head_on {
+                                state.model.draft_head_reset();
+                                state.model.forward_all(&x, pos).and_then(|l| l.squeeze(0))
+                            } else {
+                                state.model.forward(&x, pos)
+                            };
+                            let logits = match stepped {
                                 Ok(l) => l,
                                 Err(e) => {
                                     let _ = tx.blocking_send(Err(format!(
@@ -2264,7 +2327,12 @@ impl LlmEngine {
                             (tok, pos + 1, dev_next)
                         };
                         let baseline_ms = t_baseline.elapsed().as_secs_f64() * 1000.0;
-                        pld_cost.plain_step(cycle_start.elapsed().as_secs_f64());
+                        if head_on {
+                            head_tokens.clear();
+                            head_tokens.push(new_next_token);
+                        } else {
+                            pld_cost.plain_step(cycle_start.elapsed().as_secs_f64());
+                        }
                         if time_plain {
                             spec_engine
                                 .draft_length
@@ -2303,6 +2371,20 @@ impl LlmEngine {
                 .pld_cost
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = pld_cost.clone();
+            if head_capable {
+                if let Some(s) = model_state.blocking_lock().as_mut() {
+                    s.model.draft_head_capture(false);
+                }
+                if spec_drafted > 0 {
+                    info!(
+                        "Spec decode done: drafted={} accepted={} ({}%), next draft length {}",
+                        spec_drafted,
+                        spec_accepted,
+                        spec_accepted * 100 / spec_drafted,
+                        spec_engine.draft_length()
+                    );
+                }
+            }
             if pld_stats_drafted > 0 {
                 let accept_rate = pld_stats_accepted as f64 / pld_stats_drafted as f64;
                 info!(

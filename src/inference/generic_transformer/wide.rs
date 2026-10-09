@@ -61,9 +61,10 @@ pub(super) fn dense_router(qt: QTensor) -> Result<crate::tensor::quantized::QMat
 /// the next stage allocates, which a card with little room needs: the next stage is allocated
 /// against the memory the card has, not against what the host has run ahead of. A card with
 /// room for the pass has no need, and the host queues stages while the card runs.
-static PREFILL_SETTLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static PREFILL_SETTLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Set at the start of a prefill pass from the room the cards have for it.
+/// Set at the start of a prefill pass from the room the cards have for it, and off when the pass
+/// ends: the rows of a draft verify are few and queue behind each other without it.
 pub fn set_prefill_settle(on: bool) {
     PREFILL_SETTLE.store(on, std::sync::atomic::Ordering::Relaxed);
 }

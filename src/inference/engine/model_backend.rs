@@ -329,7 +329,9 @@ pub(crate) trait ModelBackend: Send {
                     self.prefill_shape().cards,
                 );
                 crate::inference::generic_transformer::set_prefill_settle(room < pass);
-                self.forward_prefill_with_chunk(x, index_pos, seq_len, chunk)
+                let r = self.forward_prefill_with_chunk(x, index_pos, seq_len, chunk);
+                crate::inference::generic_transformer::set_prefill_settle(false);
+                r
             },
         )?;
         // Remember a chunk that had to shrink, so later requests start at it.

@@ -11,6 +11,9 @@ use super::{GenericHeteroTransformer, GenericTransformerLayer, LayerDevice};
 use crate::tensor::layer::RmsNorm;
 use crate::tensor::{DType, Device, Result, Tensor, D};
 
+/// The odds the head must give a token for it to be drafted.
+const DRAFT_MIN_ODDS: f32 = 0.5;
+
 pub(super) struct DraftHead {
     pub(super) layer: GenericTransformerLayer,
     pub(super) layer_dev: LayerDevice,
@@ -239,6 +242,15 @@ impl GenericHeteroTransformer {
         for step in 0..k {
             let logits = self.draft_logits(&last)?;
             let token = logits.argmax(1)?.to_vec1::<u32>()?[0];
+            // A row of the verify costs a step's worth of the experts it reads: a token the head
+            // is not at least even on is not worth one, nor are the tokens that would follow it.
+            let odds = crate::tensor::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?
+                .max_keepdim(1)?
+                .flatten_all()?
+                .to_vec1::<f32>()?[0];
+            if odds < DRAFT_MIN_ODDS {
+                break;
+            }
             out.push(token);
             if step + 1 == k {
                 break;

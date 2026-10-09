@@ -346,7 +346,17 @@ pub(crate) struct DraftLength {
     cycle: [Option<(f64, f64)>; DRAFT_MAX + 1],
     /// Running drafter seconds per drafted token.
     draft_token: Option<f64>,
+    /// Plain steps since a cycle with a draft last ran.
+    plain_run: u32,
+    /// The run of plain steps the next losing probe holds the drafter off for.
+    backoff: u32,
 }
+
+/// Plain steps between the probes of a drafter whose cycles were losing, doubled at each probe
+/// that loses again, up to [`DRAFT_RETRY_MAX`], and restored by a cycle that wins. Without a probe a
+/// cost measured once, on a cold cache, would keep the drafter off for good.
+const DRAFT_RETRY_STEPS: u32 = 48;
+const DRAFT_RETRY_MAX: u32 = 1536;
 
 impl DraftLength {
     pub(crate) fn next(&self) -> usize {
@@ -359,6 +369,7 @@ impl DraftLength {
                 .map(|(_, j, v)| v * (k + 1) as f64 / (j + 1) as f64)
         };
         let mut best = (0, f64::MIN);
+        let mut best_drafting = (0, f64::MIN);
         let mut reach = 1.0;
         let mut expected = 1.0;
         for k in 0..=DRAFT_MAX {
@@ -379,6 +390,12 @@ impl DraftLength {
             if rate >= best.1 {
                 best = (k, rate);
             }
+            if k > 0 && rate >= best_drafting.1 {
+                best_drafting = (k, rate);
+            }
+        }
+        if best.0 == 0 && self.plain_run >= self.backoff.max(DRAFT_RETRY_STEPS) {
+            return best_drafting.0;
         }
         best.0
     }
@@ -387,6 +404,7 @@ impl DraftLength {
     /// and took `cycle_secs` in all; `k` 0 is a plain decode step.
     pub(crate) fn record(&mut self, k: usize, accepted: usize, draft_secs: f64, cycle_secs: f64) {
         let k = k.min(DRAFT_MAX);
+        let probe = k > 0 && self.plain_run >= self.backoff.max(DRAFT_RETRY_STEPS);
         for i in 0..k.min(accepted + 1) {
             self.reached[i] += 1;
             if i < accepted {
@@ -405,6 +423,17 @@ impl DraftLength {
         ));
         if k > 0 {
             self.draft_token = Some(blend(self.draft_token, draft_secs / k as f64));
+            self.plain_run = 0;
+            if probe {
+                // A probe that now wins restores the short wait; one that loses again doubles it.
+                self.backoff = if self.next() > 0 {
+                    0
+                } else {
+                    (self.backoff.max(DRAFT_RETRY_STEPS) * 2).min(DRAFT_RETRY_MAX)
+                };
+            }
+        } else {
+            self.plain_run = self.plain_run.saturating_add(1);
         }
     }
 }
@@ -646,7 +675,41 @@ mod tests {
             let accepted = (0..k).take_while(|i| (n >> i) & 1 == 1).count();
             d.record(k, accepted, 0.01 * k as f64, 1.0 + 0.01 * k as f64);
         }
-        assert_eq!(d.next(), 0);
+        // It still probes now and then, with a wait that doubles when the probe loses.
+        let mut probes = 0;
+        for _ in 0..400u32 {
+            let k = d.next();
+            if k == 0 {
+                d.record(0, 0, 0.0, 0.2);
+            } else {
+                probes += 1;
+                d.record(k, 0, 0.01 * k as f64, 1.0 + 0.01 * k as f64);
+            }
+        }
+        assert!((1..=4).contains(&probes), "probed {probes} times");
+    }
+
+    #[test]
+    fn a_drafter_whose_cost_was_measured_cold_is_tried_again() {
+        let mut d = DraftLength::default();
+        // Two cold cycles at length 3 cost five plain steps each; then plain steps win.
+        for _ in 0..2 {
+            d.record(3, 1, 0.01, 1.0);
+        }
+        for _ in 0..40 {
+            d.record(0, 0, 0.0, 0.2);
+        }
+        assert_eq!(d.next(), 0, "plain wins for now");
+        for _ in 0..DRAFT_RETRY_STEPS {
+            d.record(0, 0, 0.0, 0.2);
+        }
+        assert!(d.next() > 0, "a probe after the run of plain steps");
+        // A probe that finds the cycle cheap now keeps the drafter on.
+        for _ in 0..12 {
+            let k = d.next().max(1);
+            d.record(k, k, 0.01, 0.25);
+        }
+        assert!(d.next() > 0);
     }
 
     #[test]
