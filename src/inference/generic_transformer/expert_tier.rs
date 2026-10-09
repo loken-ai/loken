@@ -1739,9 +1739,13 @@ impl LayerTier {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if let Some((stream, chunks)) = pending {
+            // Ranking the prompt is a convenience: a pass that failed, or a card out of memory,
+            // must still end the hold and hand the buffer on.
             let refs: Vec<&Tensor> = chunks.iter().collect();
-            let all = Tensor::cat(&refs, 0)?;
-            self.keep_hottest_now(&all, &stream)?;
+            let ranked = Tensor::cat(&refs, 0).and_then(|all| self.keep_hottest_now(&all, &stream));
+            if let Err(e) = ranked {
+                tracing::warn!("the cache is not warmed from the prompt: {e}");
+            }
         }
         stage.held.store(false, Ordering::Release);
         if stage.filled.swap(false, Ordering::AcqRel) {
