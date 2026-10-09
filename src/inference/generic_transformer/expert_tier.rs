@@ -1588,6 +1588,12 @@ impl LayerTier {
         let Some(stage) = self.stage.as_ref() else {
             return Ok(());
         };
+        // A prompt holding the stacks of this layer for its later chunks has them on the card
+        // already: a second fill would carry the layer over the link again into the buffer the
+        // chunks are reading.
+        if stage.held.load(Ordering::Acquire) && stage.filled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let mut ready = stage.ready.lock().unwrap_or_else(|e| e.into_inner());
         if ready.is_some() {
             return Ok(());
