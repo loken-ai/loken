@@ -621,6 +621,18 @@ struct plane_iq4_nl {
     static __device__ __forceinline__ float scale(const block * b) { return __half2float(b->d); }
 };
 
+// A row whose length is not a whole number of passes is read on past its end, into whatever lies
+// next to it, against activations that are zero there. A scale that is not finite in that
+// neighbour would turn those zeros to NaN, so a scale is read as zero unless it is finite; the
+// scales of a row's own blocks always are.
+static __device__ __forceinline__ float scale_or_zero(const float d) {
+    return isfinite(d) ? d : 0.0f;
+}
+static __device__ __forceinline__ half2 scale_or_zero(const half2 d) {
+    const float2 f = __half22float2(d);
+    return isfinite(f.x) && isfinite(f.y) ? d : __float2half2_rn(0.0f);
+}
+
 template <typename plane, int mmq_y, bool need_check>
 static __device__ __forceinline__ void load_tiles_paired(
     const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
@@ -662,7 +674,7 @@ static __device__ __forceinline__ void load_tiles_paired(
 
     mmq_fill_rows<block, blocks_per_row, mmq_y, need_check>(x, kbx0, stride, i_max,
         [&] (const int i, const block * row_blocks) {
-            x_sc[tile::df_row(i) + kbd] = plane::scale(row_blocks + kbd);
+            x_sc[tile::df_row(i) + kbd] = scale_or_zero(plane::scale(row_blocks + kbd));
         });
 }
 
@@ -705,7 +717,7 @@ static __device__ __forceinline__ void load_tiles_q2_0(
 
     mmq_fill_rows<block_q2_0, halves_per_tile_row, mmq_y, need_check>(x, kbx0, stride, i_max,
         [&] (const int i, const block_q2_0 * row_blocks) {
-            x_df[tile::df_row(i) + kbxd] = __half2float(row_blocks[kbxd/2].d);
+            x_df[tile::df_row(i) + kbxd] = scale_or_zero(__half2float(row_blocks[kbxd/2].d));
         });
 }
 
@@ -740,7 +752,7 @@ static __device__ __forceinline__ void load_tiles_q8_0(
 
     mmq_fill_rows<block_q8_0, blocks_per_tile_row, mmq_y, need_check>(x, kbx0, stride, i_max,
         [&] (const int i, const block_q8_0 * row_blocks) {
-            x_df[tile::df_row(i) + kbxd] = row_blocks[kbxd].d;
+            x_df[tile::df_row(i) + kbxd] = scale_or_zero(__half2float(row_blocks[kbxd].d));
         });
 }
 

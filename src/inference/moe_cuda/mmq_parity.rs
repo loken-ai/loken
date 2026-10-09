@@ -182,14 +182,43 @@ impl Block {
         hidden: usize,
         inter: usize,
     ) -> Self {
+        Self::build_blocks(dev, rng, dtype, tokens, topk, e, hidden, inter, false)
+    }
+
+    /// [`Self::build_from_blocks`], with the scale of every expert the routing does not pick set
+    /// to NaN when `poison_unrouted`: what a transit buffer holds of an expert not sent to it.
+    #[allow(clippy::too_many_arguments)]
+    fn build_blocks(
+        dev: &Device,
+        rng: &mut Lcg,
+        dtype: GgmlDType,
+        tokens: usize,
+        topk: usize,
+        e: usize,
+        hidden: usize,
+        inter: usize,
+        poison_unrouted: bool,
+    ) -> Self {
         const SCALE_F16: [u8; 2] = [0x00, 0x24]; // 2^-6
+        const SCALE_NAN: [u8; 2] = [0xFF, 0xFF];
+        let early = poison_unrouted.then(|| routing(rng, tokens, topk, e));
+        let routed: Vec<bool> = match &early {
+            Some((_, picked, _)) => (0..e).map(|x| picked.contains(&(x as u32))).collect(),
+            None => vec![true; e],
+        };
         let mut stack = |rows: usize, k: usize| -> Arc<QTensor> {
-            let blocks = e * rows * (k / dtype.block_size());
+            let per_expert = rows * (k / dtype.block_size());
+            let blocks = e * per_expert;
             let mut data: Vec<u8> = (0..blocks * dtype.type_size())
                 .map(|_| (rng.next() * 256.0) as u8)
                 .collect();
-            for block in data.chunks_exact_mut(dtype.type_size()) {
-                block[..2].copy_from_slice(&SCALE_F16);
+            for (i, block) in data.chunks_exact_mut(dtype.type_size()).enumerate() {
+                let scale = if routed[i / per_expert] {
+                    SCALE_F16
+                } else {
+                    SCALE_NAN
+                };
+                block[..2].copy_from_slice(&scale);
             }
             Arc::new(QTensor::from_ggml_bytes(dtype, &data, vec![e, rows, k], dev).unwrap())
         };
@@ -197,7 +226,7 @@ impl Block {
         let up = stack(inter, hidden);
         let down = stack(hidden, inter);
         let xs = random(rng, tokens * hidden, 1.0);
-        let (slots, experts, weights) = routing(rng, tokens, topk, e);
+        let (slots, experts, weights) = early.unwrap_or_else(|| routing(rng, tokens, topk, e));
         let m = slots.len();
         Self {
             gate_up: gate.clone(),
@@ -473,6 +502,44 @@ fn the_expert_batched_matmul_serves_the_codebook_formats() {
                          float answer, the decode kernels {decode}"
                     ));
                 }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A format whose block is shorter than a pass of the tile kernel, on a row that is not a whole
+/// number of passes: the pass reads past the row's end, into experts the routing does not pick and
+/// whose scales are not finite, and must add nothing.
+#[test]
+fn the_expert_batched_matmul_serves_rows_of_a_partial_pass() {
+    let Some(dev) = card("rows of a partial pass are") else {
+        return;
+    };
+    let mut rng = Lcg(31);
+    let mut failures = Vec::new();
+    let shapes = [
+        (1usize, 2usize, 4usize),
+        (5, 4, 16),
+        (45, 6, 16),
+        (300, 8, 32),
+        (12, 10, 256),
+        (3, 10, 256),
+    ];
+    for (dtype, &(tokens, topk, e)) in [GgmlDType::Q2_0, GgmlDType::Iq4Nl]
+        .into_iter()
+        .flat_map(|d| shapes.iter().map(move |s| (d, s)))
+    {
+        let b = Block::build_blocks(&dev, &mut rng, dtype, tokens, topk, e, 320, 192, true);
+        let want = b.float();
+        let decode = gap(&want, &b.decode());
+        for tile in [0, 8, 16, 32, 64, 128] {
+            let mmq = gap(&want, &b.mmq(false, tile));
+            if mmq.is_nan() || mmq > 1.25 * decode + 0.005 {
+                failures.push(format!(
+                    "{dtype:?} tokens={tokens} topk={topk} E={e} tile={tile}: {mmq} from the \
+                     float answer, the decode kernels {decode}"
+                ));
             }
         }
     }
