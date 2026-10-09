@@ -80,6 +80,7 @@ pub use config::*;
 pub use dense::DenseCheckpoint;
 pub use moe_weights::*;
 pub use segment::LayerRates;
+pub use wide::set_prefill_settle;
 
 pub(crate) use rayon::prelude::*;
 pub(crate) use tracing::{info, warn};

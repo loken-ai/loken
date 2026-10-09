@@ -322,6 +322,13 @@ pub(crate) trait ModelBackend: Send {
                     self.reset_kv_from(index_pos);
                 }
                 replay = true;
+                // A card with room for the pass three times over is not drained behind each stage
+                // of a layer.
+                let pass = ((chunk * per_token.max(1) + fixed) as u64).saturating_mul(3);
+                let room = crate::inference::place::vram_manager::tightest_free_on_cards(
+                    self.prefill_shape().cards,
+                );
+                crate::inference::generic_transformer::set_prefill_settle(room < pass);
                 self.forward_prefill_with_chunk(x, index_pos, seq_len, chunk)
             },
         )?;

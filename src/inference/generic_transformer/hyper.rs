@@ -299,9 +299,12 @@ pub fn grouped_rms(
 /// Rows of a prefill chunk a card's memory is planned for: the first rung of the chunk ladder.
 pub(super) const PLANNED_CHUNK_ROWS: usize = 2048;
 /// Buffers of `streams x dim` f32 a wide layer keeps live per token of a chunk: the residual, at a
-/// combine the product it adds and the new residual, and the sublayers' own activations counted at
-/// the same width (the mixers' temporaries are bounded apart, by [`mixer_block_rows`]).
-const WIDE_LIVE_BUFFERS: usize = 5;
+/// combine the product it adds and the new residual, the casts and copies the sublayers make of
+/// it, and their own activations counted at the same width (the mixers' temporaries are bounded
+/// apart, by [`mixer_block_rows`]). Counted so that the model's bytes per token match the growth
+/// of the card's pool over a prefill pass, which a pass of 354 and one of 668 rows put at 0.85 MB
+/// a row.
+const WIDE_LIVE_BUFFERS: usize = 15;
 /// Buffers of `streams x dim` f32 a mixer holds for the rows of one block: the cast residual, the
 /// squared copy, the normed copy, the scaled copy, the gate, the gated product and the low-rank
 /// activations.

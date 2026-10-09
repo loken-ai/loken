@@ -57,6 +57,9 @@ pub struct LayerTier {
     stage: Option<Stage>,
     /// The cache holds every expert, expert `e` in slot `e`: nothing is ever missing.
     resident: bool,
+    /// While a prompt holds the layer's stacks: the routing of its chunks so far and the stream
+    /// they ran on, ranked into the cache once, when the hold ends.
+    prompt_ids: Mutex<Option<(Arc<cudarc::driver::CudaStream>, Vec<Tensor>)>>,
     /// The stream this layer's copies into the cache run on.
     copy: Arc<cudarc::driver::CudaStream>,
     /// A copy into the cache is queued or running.
@@ -547,6 +550,7 @@ impl LayerTier {
             promoting: std::sync::atomic::AtomicBool::new(false),
             decode_us: AtomicU64::new(0),
             scratch: Mutex::new(None),
+            prompt_ids: Mutex::new(None),
             upload_us: AtomicU64::new(0),
             host_us: AtomicU64::new(0),
             uploaded: AtomicU64::new(0),
@@ -1121,6 +1125,30 @@ impl LayerTier {
         if self.stage.is_none() || self.resident {
             return Ok(());
         }
+        // A prompt that holds the layer's stacks goes through it in several chunks: their routing
+        // is ranked together when the hold ends, one read of the ids back to the host for the
+        // layer where a read for each chunk would drain the card each time.
+        if self
+            .stage
+            .as_ref()
+            .is_some_and(|s| s.held.load(Ordering::Acquire))
+        {
+            let mut pending = self.prompt_ids.lock().unwrap_or_else(|e| e.into_inner());
+            match pending.as_mut() {
+                Some((_, all)) => all.push(ids.clone()),
+                None => *pending = Some((stream.clone(), vec![ids.clone()])),
+            }
+            return Ok(());
+        }
+        self.keep_hottest_now(ids, stream)
+    }
+
+    /// Rank the routing `ids` of a prompt into the cache from the experts now in the transit room.
+    fn keep_hottest_now(
+        &self,
+        ids: &Tensor,
+        stream: &Arc<cudarc::driver::CudaStream>,
+    ) -> Result<()> {
         let ids_h: Vec<u32> = ids
             .to_dtype(crate::tensor::DType::U32)?
             .to_device(&Device::Cpu)?
@@ -1704,6 +1732,16 @@ impl LayerTier {
             stage.filled.store(false, Ordering::Release);
             stage.held.store(true, Ordering::Release);
             return Ok(());
+        }
+        let pending = self
+            .prompt_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((stream, chunks)) = pending {
+            let refs: Vec<&Tensor> = chunks.iter().collect();
+            let all = Tensor::cat(&refs, 0)?;
+            self.keep_hottest_now(&all, &stream)?;
         }
         stage.held.store(false, Ordering::Release);
         if stage.filled.swap(false, Ordering::AcqRel) {

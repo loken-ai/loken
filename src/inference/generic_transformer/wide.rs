@@ -57,6 +57,17 @@ pub(super) fn dense_router(qt: QTensor) -> Result<crate::tensor::quantized::QMat
     }
 }
 
+/// Whether a prefill stage drains the card behind it. The frees a stage queues complete before
+/// the next stage allocates, which a card with little room needs: the next stage is allocated
+/// against the memory the card has, not against what the host has run ahead of. A card with
+/// room for the pass has no need, and the host queues stages while the card runs.
+static PREFILL_SETTLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Set at the start of a prefill pass from the room the cards have for it.
+pub fn set_prefill_settle(on: bool) {
+    PREFILL_SETTLE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Run `f` as the named stage of the wide layer: timed, with the device drained either side so the
 /// time is the stage's own, when the stage profile is on. With `settle` the device is drained after
 /// the stage, so the frees it queued complete before the next stage allocates: a prefill stage is
@@ -69,7 +80,7 @@ pub(super) fn staged<R>(
 ) -> Result<R> {
     if !crate::inference::offload::stage_prof_enabled() {
         let r = f();
-        if settle {
+        if settle && PREFILL_SETTLE.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = dev.synchronize();
         }
         return r;
