@@ -85,8 +85,16 @@ impl GenericHeteroTransformer {
 
     /// Run the head over the pairs `(tokens[i], hidden[i])` that sit at positions `at..`, and
     /// return the wide rows it wrote, `[1, n, streams * dim]`. `hidden` is the model's own
-    /// last-layer state of the position before each token.
-    pub fn draft_rows(&mut self, tokens: &[u32], hidden: &Tensor, at: usize) -> Result<Tensor> {
+    /// last-layer state of the position before each token. With `kv_only` the layer stops after
+    /// its token mixer: the rows leave their keys and values in its caches, and what is returned
+    /// is not the head's output.
+    pub fn draft_rows(
+        &mut self,
+        tokens: &[u32],
+        hidden: &Tensor,
+        at: usize,
+        kv_only: bool,
+    ) -> Result<Tensor> {
         let n = tokens.len();
         let (dev, edev) = {
             let d = self.draft.as_ref().ok_or_else(|| {
@@ -114,11 +122,13 @@ impl GenericHeteroTransformer {
         let first = self.layers.len();
         // The head's layer stands after the model's own for the pass, so the loop that runs the
         // stack - masks, segment hops, the layer's own forward - runs it unchanged.
+        draft.layer.kv_only = kv_only;
         self.layers.push(draft.layer);
         self.layer_devs.push(draft.layer_dev.clone());
         let out = x.and_then(|x| self.run_layers_in(x, None, at, n, first, first + 1));
         let layer_dev = self.layer_devs.pop().expect("pushed above");
         draft.layer = self.layers.pop().expect("pushed above");
+        draft.layer.kv_only = false;
         draft.layer_dev = layer_dev;
         draft.len = draft.len.max(at + n);
         self.draft = Some(draft);
@@ -171,7 +181,7 @@ impl GenericHeteroTransformer {
         };
         let last = hidden.narrow(1, c - 1, 1)?;
         if !tokens.is_empty() {
-            self.draft_rows(&tokens, &rows, committed)?;
+            self.draft_rows(&tokens, &rows, committed, true)?;
         }
         if let Some(d) = self.draft.as_mut() {
             d.committed = committed + tokens.len();
@@ -218,7 +228,7 @@ impl GenericHeteroTransformer {
         } else {
             feature
         };
-        let wide = self.draft_rows(tokens, &feature, committed)?;
+        let wide = self.draft_rows(tokens, &feature, committed, false)?;
         if let Some(d) = self.draft.as_mut() {
             d.committed = committed + n;
             d.mark_indexer();
@@ -233,7 +243,7 @@ impl GenericHeteroTransformer {
             if step + 1 == k {
                 break;
             }
-            last = self.draft_rows(&[token], &last, at)?;
+            last = self.draft_rows(&[token], &last, at, false)?;
             at += 1;
         }
         Ok(out)

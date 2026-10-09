@@ -149,6 +149,9 @@ impl GenericTransformerLayer {
         let out = self.token_mixer(&mixed, mask, index_pos, &dev)?;
         let inj = inj.expect("the token mixer's mixer writes back");
         r = staged("combine", &dev, settle, || combine(&r, &out, &inj))?;
+        if self.kv_only {
+            return Ok(r);
+        }
         let (mixed, inj) = staged("mix_ffn", &dev, settle, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             let (mixed, inj) = hc.ffn.mix(&r)?;
@@ -421,6 +424,9 @@ impl GenericTransformerLayer {
                 d,
             )
         })?;
+        if self.kv_only {
+            return Ok(r);
+        }
         let (mixed, inj) = staged("mix_ffn", dev, settle, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             hc.ffn

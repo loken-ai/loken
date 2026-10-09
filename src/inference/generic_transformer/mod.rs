@@ -304,6 +304,9 @@ pub struct GenericTransformerLayer {
     spec: Option<speculate::LayerPending>,
     /// Whether the forward running now is a verify that records [`Self::spec`].
     spec_record: bool,
+    /// Whether the rows running now are read only for the keys and values they leave in the
+    /// caches: the layer stops after its token mixer, and its output is not used.
+    kv_only: bool,
     /// The capacity of the key and value buffers a recorded indexed layer was last run against:
     /// the step ends, and is recorded again, when the cache outgrows or replaces them.
     pub graph_kv_cap: Option<usize>,
