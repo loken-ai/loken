@@ -51,6 +51,10 @@ pub struct HyperMixer {
     eps: f64,
 }
 
+/// Rows from which a mixer's projection runs as the card's half-precision product: the height of
+/// the tile that product works in.
+const HALF_PRODUCT_ROWS: usize = 64;
+
 /// A mixer's weight: a dense one on a card is held F16, half the bytes a decode step reads for
 /// it, and is widened to F32 where a stage wants a matrix product; any other as it is.
 enum Weight {
@@ -87,10 +91,15 @@ impl Weight {
                 let dims = x.dims().to_vec();
                 let k = *dims.last().expect("an activation has a width");
                 let rows = x.elem_count() / k;
-                let y = x
-                    .reshape((rows, k))?
-                    .matmul_t(&w.to_dtype(DType::F32)?)?
-                    .to_dtype(x.dtype())?;
+                let x2 = x.reshape((rows, k))?;
+                // Rows enough to fill a tile of the card's half-precision product use it: the
+                // activation is rounded to half and the product accumulates in F32. Fewer rows,
+                // a decoded token or the rows of a verify, keep the F32 product they had.
+                let y = if rows >= HALF_PRODUCT_ROWS && x.device().is_cuda() {
+                    x2.to_dtype(DType::F16)?.matmul_t(w)?.to_dtype(x.dtype())?
+                } else {
+                    x2.matmul_t(&w.to_dtype(DType::F32)?)?.to_dtype(x.dtype())?
+                };
                 let mut out = dims;
                 *out.last_mut().expect("an activation has a width") = w.dims()[0];
                 y.reshape(out)
