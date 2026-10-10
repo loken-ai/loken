@@ -1034,33 +1034,33 @@ impl LayerTier {
                 .to_dtype(crate::tensor::DType::F32)?
                 .flatten_all()?
                 .to_vec1()?;
-            for &e in &host_experts {
-                let mine: Vec<usize> = (0..pairs)
-                    .filter(|&p| !is_hit[p] && ids_h[p] == e)
-                    .collect();
-                let m = mine.len();
-                let mut x = Vec::with_capacity(m * hidden);
-                for &p in &mine {
-                    let r = p / k;
-                    x.extend_from_slice(&x_host[r * hidden..(r + 1) * hidden]);
-                }
-                let x = Tensor::from_vec(x, (m, hidden), &host)?;
-                let choice = Tensor::from_vec(vec![e; m], (m, 1), &host)?;
-                let routing = ExpertRouting::group(&choice, 1)?;
-                let h = routing.host_gate_up_silu(&x, &self.host[0], &self.host[1])?;
-                let w = Tensor::from_vec(mine.iter().map(|&p| w_h[p]).collect(), (m, 1), &host)?;
-                let out = routing
-                    .host_down_reduce(&h, &self.host[2], &w, m, None)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()?;
-                for (j, &p) in mine.iter().enumerate() {
-                    let r = p / k;
-                    for (acc, v) in product[r * hidden..(r + 1) * hidden]
-                        .iter_mut()
-                        .zip(&out[j * hidden..(j + 1) * hidden])
-                    {
-                        *acc += v;
-                    }
+            // Every pair the host takes is one row of one grouped call, whatever its expert: the
+            // pool is woken twice however many experts the rows need.
+            let mine: Vec<usize> = (0..pairs)
+                .filter(|&p| !is_hit[p] && host_experts.contains(&ids_h[p]))
+                .collect();
+            let m = mine.len();
+            let mut x = Vec::with_capacity(m * hidden);
+            for &p in &mine {
+                let r = p / k;
+                x.extend_from_slice(&x_host[r * hidden..(r + 1) * hidden]);
+            }
+            let x = Tensor::from_vec(x, (m, hidden), &host)?;
+            let choice = Tensor::from_vec(mine.iter().map(|&p| ids_h[p]).collect(), (m, 1), &host)?;
+            let routing = ExpertRouting::group(&choice, 1)?;
+            let h = routing.host_gate_up_silu(&x, &self.host[0], &self.host[1])?;
+            let w = Tensor::from_vec(mine.iter().map(|&p| w_h[p]).collect(), (m, 1), &host)?;
+            let out = routing
+                .host_down_reduce(&h, &self.host[2], &w, m, None)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            for (j, &p) in mine.iter().enumerate() {
+                let r = p / k;
+                for (acc, v) in product[r * hidden..(r + 1) * hidden]
+                    .iter_mut()
+                    .zip(&out[j * hidden..(j + 1) * hidden])
+                {
+                    *acc += v;
                 }
             }
             blend(
