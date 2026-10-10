@@ -670,7 +670,7 @@ impl GenericHeteroTransformer {
     /// Derived from immutable layer config (device, n_kv_head, head_dim,
     /// max_seq_len_padded, rope tensor storage identity) so the result
     /// can be cached on the model and reused every token.
-    fn compute_graph_state_groups(&self) -> GraphStateGroups {
+    pub(super) fn compute_graph_state_groups(&self) -> GraphStateGroups {
         use std::collections::HashMap;
         let n_layers = self.layers.len();
         let device_id = |i: usize| -> usize {
@@ -782,6 +782,9 @@ impl GenericHeteroTransformer {
         self.graph_logits_buffer = None;
         self.graph_hidden_buffer = None;
         self.graph_work_buffer = None;
+        self.graph_feature = None;
+        #[cfg(feature = "cuda")]
+        self.clear_verify_state();
         // ROOT CAUSE FIX: drop model-level captured-region tensor handles
         // so cuMemFree can reclaim their memory now that graph is torn down.
         self.graph_alive_tensors_model.clear();
@@ -870,6 +873,50 @@ impl GenericHeteroTransformer {
         Ok(())
     }
 
+    /// The workspaces a recorded forward reads, grown once before any capture: a workspace that
+    /// grew inside a capture would move under the kernels recorded against it.
+    pub(super) fn ensure_graph_workspaces(&mut self) {
+        if !self.workspace_pre_grown {
+            self.workspace_pre_grown = true;
+            #[cfg(feature = "cuda")]
+            for cuda_dev in self.cuda_devices.values() {
+                if let Ok(cd) = cuda_dev.as_cuda_device() {
+                    let max_intermediate = self
+                        .layers
+                        .iter()
+                        .map(|l| l.flags.intermediate_size)
+                        .max()
+                        .unwrap_or(self.config.embedding_length);
+                    let max_k = std::cmp::max(self.stream_width(), max_intermediate);
+                    let max_scratch =
+                        crate::tensor::quantized::fast_mmvq::max_scratch_bytes_for_k(max_k);
+                    if let Err(e) = crate::tensor::quantized::fast_mmvq::ensure_workspace_capacity(
+                        &cd,
+                        max_scratch,
+                    ) {
+                        tracing::warn!("fast_mmvq workspace pre-allocation failed: {e}");
+                    } else {
+                        tracing::info!(
+                            "fast_mmvq workspace pre-allocated: {max_scratch} bytes (max_k={max_k})"
+                        );
+                    }
+                }
+                // Pin a dedicated cuBLAS workspace on the MODEL's handle so
+                // cuBLAS stops allocating per-call workspaces - an
+                // in-capture cuBLAS alloc invalidates the graph capture
+                // (same reason gptoss pins before its capture). Once per
+                // model (the workspace leaks by design, see
+                // pin_cublas_workspace). update_graph_state only runs on
+                // the graph path, so non-graph models never pay this.
+                if let Err(e) = crate::tensor::cuda_ext::pin_cublas_workspace(cuda_dev, 64 << 20) {
+                    tracing::warn!(
+                        "graph: cuBLAS workspace pin failed (capture may be invalidated): {e}"
+                    );
+                }
+            }
+        }
+    }
+
     pub fn update_graph_state(&mut self, pos: usize) -> Result<()> {
         self.spec_clear();
         // Captured-graph seq ceiling (Q8 path): the live graph was
@@ -915,45 +962,7 @@ impl GenericHeteroTransformer {
                 }
             }
         }
-        if !self.workspace_pre_grown {
-            self.workspace_pre_grown = true;
-            #[cfg(feature = "cuda")]
-            for cuda_dev in self.cuda_devices.values() {
-                if let Ok(cd) = cuda_dev.as_cuda_device() {
-                    let max_intermediate = self
-                        .layers
-                        .iter()
-                        .map(|l| l.flags.intermediate_size)
-                        .max()
-                        .unwrap_or(self.config.embedding_length);
-                    let max_k = std::cmp::max(self.stream_width(), max_intermediate);
-                    let max_scratch =
-                        crate::tensor::quantized::fast_mmvq::max_scratch_bytes_for_k(max_k);
-                    if let Err(e) = crate::tensor::quantized::fast_mmvq::ensure_workspace_capacity(
-                        &cd,
-                        max_scratch,
-                    ) {
-                        tracing::warn!("fast_mmvq workspace pre-allocation failed: {e}");
-                    } else {
-                        tracing::info!(
-                            "fast_mmvq workspace pre-allocated: {max_scratch} bytes (max_k={max_k})"
-                        );
-                    }
-                }
-                // Pin a dedicated cuBLAS workspace on the MODEL's handle so
-                // cuBLAS stops allocating per-call workspaces - an
-                // in-capture cuBLAS alloc invalidates the graph capture
-                // (same reason gptoss pins before its capture). Once per
-                // model (the workspace leaks by design, see
-                // pin_cublas_workspace). update_graph_state only runs on
-                // the graph path, so non-graph models never pay this.
-                if let Err(e) = crate::tensor::cuda_ext::pin_cublas_workspace(cuda_dev, 64 << 20) {
-                    tracing::warn!(
-                        "graph: cuBLAS workspace pin failed (capture may be invalidated): {e}"
-                    );
-                }
-            }
-        }
+        self.ensure_graph_workspaces();
 
         // Buffer consolidation: under graph capture, ~150 redundant
         // copy2d_f32 ops/token came from per-layer slice_sets in
@@ -1829,9 +1838,28 @@ impl GenericHeteroTransformer {
         Ok(())
     }
 
+    /// Hand the draft head the last layer's row of the step that just ran or replayed.
+    pub fn step_feature(&mut self) {
+        if self.capture_feature {
+            self.last_feature = self.graph_feature.clone();
+        }
+    }
+
     /// Final norm, output projection and logit transforms of the graph's step, copied into
     /// the stable logits buffer.
     fn graph_head(&mut self, hidden: Tensor) -> Result<Tensor> {
+        // The last layer's row, in a buffer of its own: what the draft head reads after a replay.
+        match self.graph_feature.as_ref() {
+            Some(buffer) => buffer.slice_set(&hidden.to_dtype(crate::tensor::DType::F32)?, 0, 0)?,
+            None => {
+                self.graph_feature = Some(
+                    hidden
+                        .to_dtype(crate::tensor::DType::F32)?
+                        .force_contiguous()?,
+                )
+            }
+        }
+        self.step_feature();
         let wide_normed: Option<Tensor> = match self.output_hyper.as_ref() {
             #[cfg(feature = "cuda")]
             Some(oh) => {

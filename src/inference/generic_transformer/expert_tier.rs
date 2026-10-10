@@ -508,7 +508,11 @@ impl super::GenericHeteroTransformer {
                     .expect("a tiered layer has experts");
                 if let Some(t) = &moe.tier {
                     let hidden = t.host[0].shape().dims()[2];
-                    t.enable_graph(hidden, moe.n_experts_used)?;
+                    t.enable_graph(
+                        hidden,
+                        moe.n_experts_used,
+                        crate::inference::engine::decode_step::VERIFY_ROWS,
+                    )?;
                 }
             }
             self.tier_workers.push(TierWorker::start(dev, arcs)?);
@@ -1244,6 +1248,7 @@ impl LayerTier {
                 &self.card[2],
                 more.map(|m| &m[2]),
                 &scratch.weights,
+                1,
             )?)
         } else {
             None
@@ -2768,7 +2773,7 @@ mod tests {
         let built = LayerTier::new(&tiered, &card, slots).unwrap();
         tiered.tier = Some(Arc::new(built));
         let tier = tiered.tier.clone().unwrap();
-        tier.enable_graph(hidden, used).unwrap();
+        tier.enable_graph(hidden, used, 4).unwrap();
         let worker = TierWorker::start(&card, vec![tier.clone()]).unwrap();
         GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
         let inputs: Vec<Vec<f32>> = (0..3).map(|s| values(hidden, 100 + s, 1.0)).collect();

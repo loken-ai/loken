@@ -1,10 +1,11 @@
 // The card's side of a cached layer whose missing experts the host computes, for a decoded token
-// recorded in a graph: nothing here returns to the host between two kernels. The layer hands the
-// host a mailbox in page-locked memory and takes its answer from it.
+// or the rows of a draft verify recorded in a graph: nothing here returns to the host between two
+// kernels. The layer hands the host a mailbox in page-locked memory and takes its answer from it.
 //
-//   plan   reads the router's choice, looks each expert up in the cache's table (an expert's slot,
-//          or a negative number), gives the card's experts their slots and weights, and posts the
-//          choice, the slots and the layer's input in the mailbox before raising the request word.
+//   plan   reads the router's choice of every row, looks each expert up in the cache's table (an
+//          expert's slot, or a negative number), gives the card's experts their slots and weights,
+//          and posts the choice, the slots, the rows and the layer's input in the mailbox before
+//          raising the request word.
 //   wait   stops the stream until the host has raised the reply word to the request's number.
 //   merge  adds the host's product to what the card computed.
 //
@@ -14,27 +15,33 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+// Most routed pairs one launch of the plan looks up: the rows of a verify by the experts each
+// routes to.
+#define TIER_PLAN_PAIRS 256
+
 extern "C" __global__ void loken_tier_plan_kernel(
-        const unsigned int * __restrict__ ids,      // [k] the router's experts
-        const float * __restrict__ weights,         // [k] their weights
-        const float * __restrict__ x,               // [hidden] the layer's input
+        const unsigned int * __restrict__ ids,      // [rows * k] the router's experts
+        const float * __restrict__ weights,         // [rows * k] their weights
+        const float * __restrict__ x,               // [rows * hidden] the layer's input
         const int * table,                          // [experts] slot, or negative: not cached
         unsigned int * __restrict__ counter,        // [0] the layer's request counter, [1] whether a reply is due
-        unsigned int * __restrict__ slot_out,       // [k] the slot each pair reads
-        float * __restrict__ weight_out,            // [k] its weight, zero for a missing expert
+        unsigned int * __restrict__ slot_out,       // [rows * k] the slot each pair reads
+        float * __restrict__ weight_out,            // [rows * k] its weight, zero for a missing expert
         unsigned int * mail_ids,
         float * mail_weights,
-        unsigned int * mail_slots,                  // [k] the slot, or all ones for a missing expert
+        unsigned int * mail_slots,                  // [rows * k] the slot, or all ones for a missing expert
         float * mail_x,
+        unsigned int * mail_rows,
         volatile unsigned int * mail_request,
-        int k, int hidden) {
+        int rows, int k, int hidden) {
     __shared__ unsigned int seq;
     __shared__ unsigned int filler;
-    __shared__ int slot_of[32];
+    __shared__ int slot_of[TIER_PLAN_PAIRS];
     const int t = threadIdx.x;
+    const int pairs = rows * k;
     // The cache's table lives in page-locked memory, a read of it crosses the bus: the experts of
     // the choice are looked up together, one thread each.
-    if (t < k && t < 32) slot_of[t] = ((const volatile int *) table)[ids[t]];
+    if (t < pairs) slot_of[t] = ((const volatile int *) table)[ids[t]];
     __syncthreads();
     if (t == 0) {
         seq = *counter + 1;
@@ -45,7 +52,7 @@ extern "C" __global__ void loken_tier_plan_kernel(
         unsigned int f = 0;
         bool found = false;
         unsigned int missing = 0u;
-        for (int i = 0; i < k; ++i) {
+        for (int i = 0; i < pairs; ++i) {
             if (slot_of[i] >= 0) {
                 if (!found) { f = (unsigned int) slot_of[i]; found = true; }
             } else {
@@ -54,9 +61,10 @@ extern "C" __global__ void loken_tier_plan_kernel(
         }
         filler = f;
         counter[1] = missing;
+        *mail_rows = (unsigned int) rows;
     }
     __syncthreads();
-    if (t < k) {
+    if (t < pairs) {
         const int s = slot_of[t];
         slot_out[t] = s >= 0 ? (unsigned int) s : filler;
         weight_out[t] = s >= 0 ? weights[t] : 0.0f;
@@ -64,7 +72,7 @@ extern "C" __global__ void loken_tier_plan_kernel(
         mail_weights[t] = weights[t];
         mail_slots[t] = s >= 0 ? (unsigned int) s : 0xFFFFFFFFu;
     }
-    for (int i = t; i < hidden; i += blockDim.x) mail_x[i] = x[i];
+    for (int i = t; i < rows * hidden; i += blockDim.x) mail_x[i] = x[i];
     __syncthreads();
     __threadfence_system();
     if (t == 0) *mail_request = seq;
@@ -98,10 +106,11 @@ extern "C" void loken_tier_plan(
         const unsigned int * ids, const float * weights, const float * x, const int * table,
         unsigned int * counter, unsigned int * slot_out, float * weight_out,
         unsigned int * mail_ids, float * mail_weights, unsigned int * mail_slots, float * mail_x,
-        unsigned int * mail_request, int k, int hidden, cudaStream_t stream) {
-    loken_tier_plan_kernel<<<1, 256, 0, stream>>>(
+        unsigned int * mail_rows, unsigned int * mail_request, int rows, int k, int hidden,
+        cudaStream_t stream) {
+    loken_tier_plan_kernel<<<1, TIER_PLAN_PAIRS, 0, stream>>>(
         ids, weights, x, table, counter, slot_out, weight_out, mail_ids, mail_weights,
-        mail_slots, mail_x, mail_request, k, hidden);
+        mail_slots, mail_x, mail_rows, mail_request, rows, k, hidden);
 }
 
 extern "C" void loken_tier_wait(

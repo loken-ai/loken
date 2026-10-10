@@ -441,6 +441,32 @@ pub(crate) trait ModelBackend: Send {
     /// The draft head's history starts over.
     fn draft_head_reset(&mut self) {}
 
+    /// Hand the draft head the hidden state of the recorded step that just replayed.
+    fn step_feature(&mut self) {}
+
+    /// Rows a recorded draft verify can carry through this model at once, `0` when it runs
+    /// none (see `GenericHeteroTransformer::verify_window_rows`).
+    fn verify_window_rows(&self) -> usize {
+        0
+    }
+
+    /// Ready the buffers of a recorded verify of `ids` at `pos`.
+    fn verify_window_prepare(&mut self, _pos: usize, _ids: &[u32]) -> crate::tensor::Result<()> {
+        crate::tensor::bail!("recorded verifies are not supported for this variant")
+    }
+
+    /// The prepared verify's `rows` rows through the model as the kernels of the recorded
+    /// step: logits `[1, rows, vocab]` in a stable buffer.
+    fn forward_verify_window(&mut self, _rows: usize) -> crate::tensor::Result<Tensor> {
+        crate::tensor::bail!("recorded verifies are not supported for this variant")
+    }
+
+    /// The prepared verify has run and its first `kept` rows stay: the caches are cut back
+    /// and every layer returns to the rows kept.
+    fn verify_window_settle(&mut self, _kept: usize) -> crate::tensor::Result<()> {
+        Ok(())
+    }
+
     /// Roll every per-layer KV cache back to `keep` valid positions, discarding
     /// any K/V appended beyond it. Used by the OOM-adaptive prefill to drop the
     /// partial KV a failed pass appended before replaying from `keep` with a
@@ -1642,6 +1668,30 @@ impl ModelBackend for GenericBackend {
 
     fn draft_head_reset(&mut self) {
         self.0.draft_reset();
+    }
+
+    fn step_feature(&mut self) {
+        self.0.step_feature();
+    }
+
+    #[cfg(feature = "cuda")]
+    fn verify_window_rows(&self) -> usize {
+        self.0.verify_window_rows()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn verify_window_prepare(&mut self, pos: usize, ids: &[u32]) -> crate::tensor::Result<()> {
+        self.0.verify_window_prepare(pos, ids)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn forward_verify_window(&mut self, rows: usize) -> crate::tensor::Result<Tensor> {
+        self.0.forward_verify_window(rows)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn verify_window_settle(&mut self, kept: usize) -> crate::tensor::Result<()> {
+        self.0.verify_window_settle(kept)
     }
 
     fn reset_kv_from(&mut self, keep: usize) {

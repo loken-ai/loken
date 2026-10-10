@@ -35,7 +35,7 @@ fn sublayer_dtype(x: &Tensor) -> DType {
     sublayer_dtype_of(&x.device())
 }
 
-fn sublayer_dtype_of(dev: &Device) -> DType {
+pub(super) fn sublayer_dtype_of(dev: &Device) -> DType {
     if dev.is_cpu() {
         DType::F32
     } else {
@@ -106,6 +106,24 @@ pub(super) fn staged<R>(
 const SCORE_BUDGET_BYTES: usize = 128 << 20;
 /// How many copies of a block's scores are live at once in selected attention.
 const SCORE_COPIES: usize = 3;
+
+/// Where the rotation of a token's heads comes from: the layer's tables at a position the host
+/// knows, the step's buffers a replay refreshes, or the rows of a verify's tables.
+#[cfg(feature = "cuda")]
+enum RopeSource {
+    Host(usize),
+    Step,
+    Rows(Tensor, Tensor),
+}
+
+/// The tables one row of a recorded verify rotates with: the heads' cosines and sines, and the
+/// indexer's.
+#[cfg(feature = "cuda")]
+struct RowTables {
+    cos: Tensor,
+    sin: Tensor,
+    rot: Tensor,
+}
 
 impl GenericTransformerLayer {
     /// The wide block of this layer, `None` on a model with a plain residual.
@@ -290,24 +308,74 @@ impl GenericTransformerLayer {
         pos: StepPos,
         eager_at: Option<usize>,
     ) -> Result<Tensor> {
+        self.attend_on_card_with(x, pos, eager_at, None)
+    }
+
+    /// [`Self::attend_on_card`] for one row of a recorded verify: its position buffer, and
+    /// `row`'s rotation tables of the rows prepared for the verify.
+    #[cfg(feature = "cuda")]
+    pub(super) fn attend_row_recorded(
+        &mut self,
+        x: &Tensor,
+        pos: &Tensor,
+        row: usize,
+    ) -> Result<Tensor> {
+        let (cos, sin) = match (&self.verify_rope_cos, &self.verify_rope_sin) {
+            (Some(c), Some(s)) => (c.narrow(0, row, 1)?, s.narrow(0, row, 1)?),
+            _ => crate::tensor::bail!("the rotation tables of the verify's rows are not in place"),
+        };
+        let rot = self
+            .sparse
+            .as_ref()
+            .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?
+            .rot_row(row)?;
+        self.attend_on_card_with(
+            x,
+            StepPos::Card(pos),
+            None,
+            Some(RowTables { cos, sin, rot }),
+        )
+    }
+
+    /// [`Self::attend_on_card`] with the rotation tables of `tables` in place of the step's.
+    #[cfg(feature = "cuda")]
+    fn attend_on_card_with(
+        &mut self,
+        x: &Tensor,
+        pos: StepPos,
+        eager_at: Option<usize>,
+        tables: Option<RowTables>,
+    ) -> Result<Tensor> {
         let sparse = self
             .sparse
             .as_mut()
             .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?;
-        sparse.card_step(x, pos)?;
+        match &tables {
+            Some(t) => sparse.card_step_with(x, pos, &t.rot)?,
+            None => sparse.card_step(x, pos)?,
+        }
         let (n_head, n_kv, hd) = (self.n_head, self.n_kv_head, self.head_dim);
-        let (q, k, v) = match self.prepared_heads(x, eager_at)? {
+        let rope = match (&tables, eager_at) {
+            (Some(t), _) => RopeSource::Rows(t.cos.clone(), t.sin.clone()),
+            (None, Some(at)) => RopeSource::Host(at),
+            (None, None) => RopeSource::Step,
+        };
+        let (q, k, v) = match self.prepared_heads(x, &rope)? {
             Some(rows) => rows,
             None => {
                 let (q, k, v) = self.project_heads(x)?;
-                let (q, k) = match eager_at {
-                    Some(at) => (
-                        self.apply_rotary_emb(&q, at)?,
-                        self.apply_rotary_emb(&k, at)?,
+                let (q, k) = match &rope {
+                    RopeSource::Host(at) => (
+                        self.apply_rotary_emb(&q, *at)?,
+                        self.apply_rotary_emb(&k, *at)?,
                     ),
-                    None => (
+                    RopeSource::Step => (
                         self.apply_rotary_emb_from_buffer(&q)?,
                         self.apply_rotary_emb_from_buffer(&k)?,
+                    ),
+                    RopeSource::Rows(cos, sin) => (
+                        self.apply_rotary_with(&q, cos, sin)?,
+                        self.apply_rotary_with(&k, cos, sin)?,
                     ),
                 };
                 let flat = |t: &Tensor| t.to_dtype(DType::F32)?.contiguous();
@@ -377,7 +445,7 @@ impl GenericTransformerLayer {
     }
 
     /// The routed experts and the shared expert, or the dense feed-forward.
-    fn feed_forward(&mut self, mixed: &Tensor, dev: &Device) -> Result<Tensor> {
+    pub(super) fn feed_forward(&mut self, mixed: &Tensor, dev: &Device) -> Result<Tensor> {
         let settle = prefilling(mixed);
         staged("experts", dev, settle, || match self.moe.as_ref() {
             Some(moe) => moe.forward_rows(
@@ -676,7 +744,7 @@ impl GenericTransformerLayer {
     fn prepared_heads(
         &self,
         x: &Tensor,
-        at: Option<usize>,
+        rope: &RopeSource,
     ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
         use crate::inference::moe_cuda::{qk_prep, QkShape};
         let hd = self.head_dim;
@@ -688,15 +756,16 @@ impl GenericTransformerLayer {
             (false, d) if d > 0 && d < hd => d,
             (false, _) => hd,
         };
-        let (cos, sin) = match at {
-            Some(index_pos) => match &self.rope_rows {
+        let (cos, sin) = match rope {
+            RopeSource::Host(index_pos) => match &self.rope_rows {
                 Some((cos, sin)) => (cos.to_device(&x.device())?, sin.to_device(&x.device())?),
-                None => self.rope_table().rows(index_pos, 1, &x.device())?,
+                None => self.rope_table().rows(*index_pos, 1, &x.device())?,
             },
-            None => match (&self.graph_rope_cos, &self.graph_rope_sin) {
+            RopeSource::Step => match (&self.graph_rope_cos, &self.graph_rope_sin) {
                 (Some(cos), Some(sin)) => (cos.clone(), sin.clone()),
                 _ => return Ok(None),
             },
+            RopeSource::Rows(cos, sin) => (cos.clone(), sin.clone()),
         };
         let (q, k, v) = self.project_rows(x)?;
         let (qn, kn) = match (&self.attn_q_norm, &self.attn_k_norm) {

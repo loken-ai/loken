@@ -231,7 +231,20 @@ impl GenericHeteroTransformer {
         } else {
             feature
         };
+        // Under the stage profile, what the pairs, each guess's layer, its logits and its odds
+        // cost, with the card drained at each mark.
+        let prof = crate::inference::offload::stage_prof_enabled();
+        let mark = |name: &'static str, since: &mut std::time::Instant, dev: &Device| {
+            if prof {
+                let _ = dev.synchronize();
+                crate::inference::offload::prof_record(name, since.elapsed().as_nanos() as u64);
+                *since = std::time::Instant::now();
+            }
+        };
+        let dev = feature.device().clone();
+        let mut since = std::time::Instant::now();
         let wide = self.draft_rows(tokens, &feature, committed, false)?;
+        mark("draft: the pairs", &mut since, &dev);
         if let Some(d) = self.draft.as_mut() {
             d.committed = committed + n;
             d.mark_indexer();
@@ -241,6 +254,7 @@ impl GenericHeteroTransformer {
         let mut out = Vec::with_capacity(k);
         for step in 0..k {
             let logits = self.draft_logits(&last)?;
+            mark("draft: logits", &mut since, &dev);
             let token = logits.argmax(1)?.to_vec1::<u32>()?[0];
             // A row of the verify costs a step's worth of the experts it reads: a token the head
             // is not at least even on is not worth one, nor are the tokens that would follow it.
@@ -248,6 +262,7 @@ impl GenericHeteroTransformer {
                 .max_keepdim(1)?
                 .flatten_all()?
                 .to_vec1::<f32>()?[0];
+            mark("draft: token and odds", &mut since, &dev);
             if odds < DRAFT_MIN_ODDS {
                 break;
             }
@@ -256,6 +271,7 @@ impl GenericHeteroTransformer {
                 break;
             }
             last = self.draft_rows(&[token], &last, at, false)?;
+            mark("draft: a guess's layer", &mut since, &dev);
             at += 1;
         }
         Ok(out)

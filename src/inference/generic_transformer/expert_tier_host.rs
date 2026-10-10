@@ -46,6 +46,20 @@ impl LayerTier {
         false
     }
 
+    pub(crate) fn graph_rows(&self) -> usize {
+        0
+    }
+
+    pub(crate) fn decode_rows_graph(
+        self: &Arc<Self>,
+        _: &MoeWeights,
+        _: &Tensor,
+        _: &Tensor,
+        _: &Tensor,
+    ) -> Result<Tensor> {
+        crate::tensor::bail!("an expert cache lives on a card")
+    }
+
     pub fn counters(&self) -> (u64, u64, u64) {
         (0, 0, 0)
     }

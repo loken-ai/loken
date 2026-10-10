@@ -61,8 +61,22 @@ impl GenericTransformerLayer {
         if self.no_rope {
             return Ok(x.clone());
         } // SmolLM3 NoPE layer
-        let mut cos = self.graph_rope_cos.as_ref().unwrap().clone();
-        let mut sin = self.graph_rope_sin.as_ref().unwrap().clone();
+        let cos = self.graph_rope_cos.as_ref().unwrap().clone();
+        let sin = self.graph_rope_sin.as_ref().unwrap().clone();
+        self.apply_rotary_with(x, &cos, &sin)
+    }
+
+    /// Apply RoPE with the given tables, one row per position of `x`.
+    pub(super) fn apply_rotary_with(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        if self.no_rope {
+            return Ok(x.clone());
+        }
+        let (mut cos, mut sin) = (cos.clone(), sin.clone());
         if !cos.device().same_device(&x.device()) {
             cos = cos.to_device(&x.device())?;
             sin = sin.to_device(&x.device())?;

@@ -1053,6 +1053,9 @@ impl LlmEngine {
             let mut graph_capture_attempted: bool = false;
             #[cfg(feature = "cuda")]
             let mut graph_validations: usize = 0;
+            // The recorded draft verifies, one graph per window size.
+            #[cfg(feature = "cuda")]
+            let mut verify_graphs = super::decode::VerifyGraphs::default();
 
             // -- PLD (Prompt-Lookup Decoding) ---------------------------
             let pld_enabled = pld_capable;
@@ -1081,6 +1084,16 @@ impl LlmEngine {
                 }
             }
             let mut head_tokens: Vec<u32> = vec![next_token];
+            // Whether the head's history has to start over before its next guess (a step it did
+            // not follow ran), and what its cycles came to: verifies, of them recorded, and
+            // steps it had no guess for.
+            let mut head_reset_due = false;
+            let (mut head_cycles, mut head_recorded, mut head_empty, mut head_unsure): (
+                u64,
+                u64,
+                u64,
+                u64,
+            ) = (0, 0, 0, 0);
             let (mut spec_drafted, mut spec_accepted): (u64, u64) = (0, 0);
             let mut pld_stats_drafted: u64 = 0;
             let mut pld_stats_accepted: u64 = 0;
@@ -1529,11 +1542,39 @@ impl LlmEngine {
                     // token; `None` falls through to the PLD/eager path
                     // (any failure also disables graph mode for the rest
                     // of the request, so PLD resumes naturally).
+                    // The head's guesses for this step, from the hidden state the last step left
+                    // it: a step with guesses verifies them, one without replays the plain step.
+                    let head_draft_started = std::time::Instant::now();
+                    let head_draft: Vec<u32> = if head_on {
+                        let want = spec_engine.draft_length();
+                        if want == 0 {
+                            Vec::new()
+                        } else {
+                            match model_state.blocking_lock().as_mut() {
+                                Some(s) => {
+                                    if head_reset_due {
+                                        s.model.draft_head_reset();
+                                    }
+                                    s.model.draft_head_tokens(&head_tokens, want)
+                                }
+                                None => Vec::new(),
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let head_draft_secs = head_draft_started.elapsed().as_secs_f64();
+                    if head_on && head_draft.is_empty() {
+                        head_empty += 1;
+                        if spec_engine.draft_length() > 0 {
+                            head_unsure += 1;
+                        }
+                    }
                     #[cfg(feature = "cuda")]
                     let graph_step: Option<(u32, Option<Tensor>)> = 'graph_blk: {
-                        // A drafter's step, or an n-gram draft worth verifying, runs eagerly.
+                        // A drafter's step, or a draft worth verifying, runs over its rows.
                         let verify_step = spec_on
-                            || head_on
+                            || !head_draft.is_empty()
                             || (pld_enabled
                                 && pld_cooldown == 0
                                 && pos <= pld_max_ctx_threshold()
@@ -1578,10 +1619,12 @@ impl LlmEngine {
                             cuda_graph = None;
                             graph_logits = None;
                             state.model.invalidate_graph_state();
+                            verify_graphs.clear();
                             if let Err(again) = state.model.update_graph_state(pos) {
                                 warn!("update_graph_state failed at pos={pos}: {again}. Disabling graph for rest of request.");
                                 graph_disabled_this_request = true;
                                 state.model.invalidate_graph_state();
+                                verify_graphs.clear();
                                 break 'graph_blk None;
                             }
                             info!("graph replay ended at pos={pos} ({e}); recording a new graph from here");
@@ -1594,6 +1637,7 @@ impl LlmEngine {
                             graph_logits = None;
                             graph_disabled_this_request = true;
                             state.model.invalidate_graph_state();
+                            verify_graphs.clear();
                             break 'graph_blk None;
                         }
 
@@ -1713,6 +1757,7 @@ impl LlmEngine {
                                                     graph_logits = None;
                                                     graph_disabled_this_request = true;
                                                     state.model.invalidate_graph_state();
+                                                    verify_graphs.clear();
                                                     pos += 1;
                                                     // The eager logits are the trusted ones.
                                                     break 'graph_blk Some(sample_graph!(eag));
@@ -1737,6 +1782,7 @@ impl LlmEngine {
                                     graph_logits = None;
                                     graph_disabled_this_request = true;
                                     state.model.invalidate_graph_state();
+                                    verify_graphs.clear();
                                     break 'graph_blk None;
                                 }
                             }
@@ -1754,6 +1800,7 @@ impl LlmEngine {
                                     warn!("graph warmup forward failed at pos={pos}: {e}; eager decode for rest of request");
                                     graph_disabled_this_request = true;
                                     state.model.invalidate_graph_state();
+                                    verify_graphs.clear();
                                     break 'graph_blk None;
                                 }
                             }
@@ -1768,6 +1815,7 @@ impl LlmEngine {
                                 warn!("KV state no longer graph-safe at pos={pos}; skipping graph capture (eager decode for rest of request)");
                                 graph_disabled_this_request = true;
                                 state.model.invalidate_graph_state();
+                                verify_graphs.clear();
                                 break 'graph_blk None;
                             }
                             if let Err(e) = stream.synchronize() {
@@ -1776,6 +1824,7 @@ impl LlmEngine {
                                 );
                                 graph_disabled_this_request = true;
                                 state.model.invalidate_graph_state();
+                                verify_graphs.clear();
                                 break 'graph_blk None;
                             }
                             match capture_decode_graph(
@@ -1828,6 +1877,7 @@ impl LlmEngine {
                                                     drop(g);
                                                     graph_disabled_this_request = true;
                                                     state.model.invalidate_graph_state();
+                                                    verify_graphs.clear();
                                                     pos += 1;
                                                     break 'graph_blk Some(sample_graph!(eag));
                                                 }
@@ -1852,11 +1902,13 @@ impl LlmEngine {
                                                 Ok(l) => {
                                                     pos += 1;
                                                     state.model.invalidate_graph_state();
+                                                    verify_graphs.clear();
                                                     break 'graph_blk Some(sample_graph!(l));
                                                 }
                                                 Err(e2) => {
                                                     warn!("eager forward after failed graph launch also failed: {e2}");
                                                     state.model.invalidate_graph_state();
+                                                    verify_graphs.clear();
                                                     break 'graph_blk None;
                                                 }
                                             }
@@ -1873,11 +1925,13 @@ impl LlmEngine {
                                         Ok(l) => {
                                             pos += 1;
                                             state.model.invalidate_graph_state();
+                                            verify_graphs.clear();
                                             break 'graph_blk Some(sample_graph!(l));
                                         }
                                         Err(e) => {
                                             warn!("eager forward after failed capture also failed: {e}");
                                             state.model.invalidate_graph_state();
+                                            verify_graphs.clear();
                                             break 'graph_blk None;
                                         }
                                     }
@@ -1894,7 +1948,25 @@ impl LlmEngine {
                     if let Some((tok, dev_tok)) = graph_step {
                         next_token = tok;
                         next_token_dev = dev_tok;
-                        pld_cost.plain_step(step_start.elapsed().as_secs_f64());
+                        let plain_secs = step_start.elapsed().as_secs_f64();
+                        pld_cost.plain_step(plain_secs);
+                        // What a plain step costs is what the head's cycles are weighed against;
+                        // the head reads the step's token with the hidden state the step left.
+                        if head_capable {
+                            spec_engine
+                                .draft_length
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .record(0, 0, 0.0, plain_secs);
+                        }
+                        if head_on {
+                            if let Some(s) = model_state.blocking_lock().as_mut() {
+                                s.model.step_feature();
+                            }
+                            head_tokens.clear();
+                            head_tokens.push(tok);
+                            head_reset_due = true;
+                        }
                         continue 'stream_loop;
                     }
                     // The graph's forwards append to the cache on the card without advancing
@@ -1923,7 +1995,7 @@ impl LlmEngine {
                     // Spec-decode: draft K from the drafter model when active,
                     // else the n-gram PLD draft. Verify below re-samples every position.
                     // The draft length is learned across cycles (decode_step::DraftLength).
-                    let cycle_start = std::time::Instant::now();
+                    let cycle_start = head_draft_started;
                     let mut draft_secs = 0.0;
                     let want = if spec_on || head_on {
                         spec_engine.draft_length()
@@ -1958,12 +2030,8 @@ impl LlmEngine {
                         }
                         d
                     } else if head_on {
-                        let d = match model_state.blocking_lock().as_mut() {
-                            Some(s) => s.model.draft_head_tokens(&head_tokens, want),
-                            None => Vec::new(),
-                        };
-                        draft_secs = cycle_start.elapsed().as_secs_f64();
-                        d
+                        draft_secs = head_draft_secs;
+                        head_draft.clone()
                     } else if pld_active {
                         pld_cache.lookup()
                     } else {
@@ -2003,7 +2071,35 @@ impl LlmEngine {
                                     return;
                                 }
                             };
-                            let logits_res = state.model.forward_all(&x, pos);
+                            // A draft the recorded windows serve replays its window; any other
+                            // runs eagerly.
+                            #[cfg(feature = "cuda")]
+                            let recorded = match (
+                                graph_ok && !graph_disabled_this_request,
+                                graph_stream.as_ref(),
+                            ) {
+                                (true, Some(s)) => super::decode::verify_recorded(
+                                    &mut state.model,
+                                    s,
+                                    &mut verify_graphs,
+                                    pos,
+                                    &input,
+                                ),
+                                _ => None,
+                            };
+                            #[cfg(not(feature = "cuda"))]
+                            let recorded: Option<(
+                                Tensor,
+                                Option<f64>,
+                            )> = None;
+                            let recorded_window = recorded.is_some();
+                            // A window recorded for this verify cost its recording too: the
+                            // cycle is charged the replay alone, which is what the next ones cost.
+                            let replay_secs = recorded.as_ref().and_then(|r| r.1);
+                            let logits_res = match recorded {
+                                Some((l, _)) => Ok(l),
+                                None => state.model.forward_all(&x, pos),
+                            };
                             if let Err(ref e) = logits_res {
                                 // Some architectures hit a mask broadcast bug in multi-token
                                 // attention with cached KV. Permanently disable PLD for this
@@ -2093,29 +2189,45 @@ impl LlmEngine {
                                 );
                                 let n_committed = 1 + accepted_drafts;
                                 let new_pos = pos + n_committed;
-                                if !spec_on && !head_on {
-                                    pld_cost
-                                        .round(cycle_start.elapsed().as_secs_f64(), n_committed);
+                                // A cycle whose window was recorded as it ran paid the recording:
+                                // its acceptance counts, its cost does not.
+                                let cycle_secs = cycle_start.elapsed().as_secs_f64();
+                                if !spec_on && !head_on && replay_secs.is_none() {
+                                    pld_cost.round(cycle_secs, n_committed);
                                 }
                                 if head_on {
                                     head_tokens.clear();
                                     head_tokens.extend_from_slice(&draft[..accepted_drafts]);
                                     head_tokens.push(outcome.next_token);
+                                    head_reset_due = false;
+                                    head_cycles += 1;
+                                    if recorded_window {
+                                        head_recorded += 1;
+                                    }
                                     spec_drafted += k as u64;
                                     spec_accepted += accepted_drafts as u64;
-                                    spec_engine
+                                    let mut length = spec_engine
                                         .draft_length
                                         .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .record(
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    match replay_secs {
+                                        Some(_) => length.record_accepted(k, accepted_drafts),
+                                        None => length.record(
                                             k,
                                             accepted_drafts,
                                             draft_secs,
-                                            cycle_start.elapsed().as_secs_f64(),
-                                        );
+                                            cycle_secs,
+                                        ),
+                                    }
                                 }
 
-                                if n_committed < k + 1 {
+                                if recorded_window {
+                                    if let Err(e) = state.model.verify_window_settle(n_committed) {
+                                        let _ =
+                                            tx.blocking_send(Err(format!("verify settle: {e}")));
+                                        return;
+                                    }
+                                } else if n_committed < k + 1 {
                                     state.model.trim_kv(new_pos);
                                 }
                                 // Spec-decode: drafter KV lockstep (shared:
@@ -2341,6 +2453,7 @@ impl LlmEngine {
                         if head_on {
                             head_tokens.clear();
                             head_tokens.push(new_next_token);
+                            head_reset_due = false;
                         } else {
                             pld_cost.plain_step(cycle_start.elapsed().as_secs_f64());
                         }
@@ -2386,13 +2499,14 @@ impl LlmEngine {
                 if let Some(s) = model_state.blocking_lock().as_mut() {
                     s.model.draft_head_capture(false);
                 }
-                if spec_drafted > 0 {
+                if spec_drafted > 0 || head_cycles > 0 || head_empty > 0 {
                     info!(
-                        "Spec decode done: drafted={} accepted={} ({}%), next draft length {}",
+                        "Spec decode done: drafted={} accepted={} ({}%), next draft length {}; head: {head_cycles} verifies ({head_recorded} recorded), {head_empty} steps without a guess ({head_unsure} the head was unsure of); {}",
                         spec_drafted,
                         spec_accepted,
-                        spec_accepted * 100 / spec_drafted,
-                        spec_engine.draft_length()
+                        spec_accepted * 100 / spec_drafted.max(1),
+                        spec_engine.draft_length(),
+                        spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).summary()
                     );
                 }
             }

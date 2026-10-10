@@ -37,15 +37,21 @@ pub struct CardIndexer {
     /// `[4 * half]` F32: the rotation tables at the first position of the block the step's
     /// token completes, then at the step's position.
     rot: Tensor,
+    /// `[rows, 4 * half]` F32: the same for each row of a recorded verify.
+    rot_rows: Tensor,
     q_gamma: Tensor,
     k_gamma: Tensor,
     /// Leading tokens whose state the card holds.
     tokens: usize,
     /// The position the next step runs at.
     step_pos: usize,
-    /// The rotation tables on their way to `rot`.
+    /// The rotation tables on their way to `rot`, and to `rot_rows`.
     staging: Staging,
+    staging_rows: Staging,
 }
+
+/// Rows of a verify the card holds rotation tables for.
+const ROT_ROWS: usize = crate::inference::engine::decode_step::VERIFY_ROWS;
 
 /// A page-locked buffer the host fills for a small copy to the card that does not stop the host:
 /// the copy is queued on the card's stream, and the next fill waits only for that copy to be done.
@@ -184,11 +190,13 @@ impl SparseAttention {
             sel: Tensor::zeros_on((m.top_k + m.block,), DType::U32, dev)?,
             count: Tensor::zeros_on((1,), DType::U32, dev)?,
             rot: Tensor::zeros_on((4 * self.rope.half(),), DType::F32, dev)?,
+            rot_rows: Tensor::zeros_on((ROT_ROWS, 4 * self.rope.half()), DType::F32, dev)?,
             q_gamma: on_card(&self.q_gamma)?,
             k_gamma: on_card(&self.k_gamma)?,
             tokens: 0,
             step_pos: 0,
             staging: Staging::new(4 * self.rope.half())?,
+            staging_rows: Staging::new(ROT_ROWS * 4 * self.rope.half())?,
         });
         Ok(())
     }
@@ -212,6 +220,56 @@ impl SparseAttention {
         card.pooled = grown;
         card.scores = Tensor::zeros_on((groups * 32,), DType::F32, &card.dev)?;
         Ok(())
+    }
+
+    /// The rotation tables of a step at `pos`: those at the first position of the block the
+    /// step's token completes (zeros when it completes none), then those at `pos`.
+    fn step_tables(&self, pos: usize) -> Vec<f32> {
+        let m = self.meta;
+        let half = self.rope.half();
+        let mut tables = if (pos + 1).is_multiple_of(m.block) {
+            self.rope.table(pos + 1 - m.block)
+        } else {
+            vec![0f32; 2 * half]
+        };
+        tables.extend(self.rope.table(pos));
+        tables
+    }
+
+    /// Make the card hold the first `pos` tokens, and the rotation tables of the `rows` steps
+    /// at `pos` onward in its rows of tables.
+    pub fn card_hold_rows(&mut self, pos: usize, rows: usize) -> Result<()> {
+        if rows > ROT_ROWS {
+            crate::tensor::bail!("the card holds tables for {ROT_ROWS} rows, not {rows}");
+        }
+        self.card_hold(pos)?;
+        let half = self.rope.half();
+        let mut tables = Vec::with_capacity(ROT_ROWS * 4 * half);
+        for r in 0..rows {
+            tables.extend(self.step_tables(pos + r));
+        }
+        tables.resize(ROT_ROWS * 4 * half, 0.0);
+        let Some(card) = self.card.as_mut() else {
+            crate::tensor::bail!("the indexer has no cache on a card");
+        };
+        let dev = card.dev.clone();
+        card.staging_rows.send(&tables, &card.rot_rows, &dev)
+    }
+
+    /// The rotation tables of row `row` of a verify, as [`Self::card_hold_rows`] left them.
+    pub fn rot_row(&self, row: usize) -> Result<Tensor> {
+        match self.card.as_ref() {
+            Some(card) => card
+                .rot_rows
+                .narrow(0, row, 1)?
+                .reshape(card.rot_rows.dim(1)?),
+            None => crate::tensor::bail!("the indexer has no cache on a card"),
+        }
+    }
+
+    /// The card holds the first `len` tokens from now on; the host's cache stays as it is.
+    pub fn card_cut(&mut self, len: usize) {
+        self.truncate_card(len);
     }
 
     /// Make the card hold the first `pos` tokens and the rotation tables of the step at `pos`.
@@ -247,13 +305,10 @@ impl SparseAttention {
             card.tokens = pos;
         }
         // The tables of a token that completes a block read the block's first position.
-        let half = self.rope.half();
-        let mut tables = if (pos + 1).is_multiple_of(m.block) {
-            self.rope.table(pos + 1 - m.block)
-        } else {
-            vec![0f32; 2 * half]
+        let tables = self.step_tables(pos);
+        let Some(card) = self.card.as_mut() else {
+            crate::tensor::bail!("the indexer has no cache on a card");
         };
-        tables.extend(self.rope.table(pos));
         let dev = card.dev.clone();
         card.staging.send(&tables, &card.rot, &dev)?;
         card.step_pos = pos;
@@ -263,6 +318,15 @@ impl SparseAttention {
     /// The step's token `x` (the sublayer input) joins the card's cache and its query selects
     /// the tokens to read, at `pos`: `sel` and `count` hold the answer.
     pub fn card_step(&mut self, x: &Tensor, pos: StepPos) -> Result<()> {
+        let rot = match self.card.as_ref() {
+            Some(card) => card.rot.clone(),
+            None => crate::tensor::bail!("the indexer has no cache on a card"),
+        };
+        self.card_step_with(x, pos, &rot)
+    }
+
+    /// [`Self::card_step`] with the rotation tables `rot` of the step's position.
+    pub fn card_step_with(&mut self, x: &Tensor, pos: StepPos, rot: &Tensor) -> Result<()> {
         let x = x.to_dtype(DType::F32)?;
         let key = self.k_proj.forward(&x)?.contiguous()?;
         let q = self.q_proj.forward(&x)?.contiguous()?;
@@ -274,13 +338,11 @@ impl SparseAttention {
             &card.tail,
             &card.pooled,
             &card.k_gamma,
-            &card.rot,
+            rot,
             pos,
             &card.shape,
         )?;
-        let at_pos = card
-            .rot
-            .narrow(0, 2 * card.shape.half, 2 * card.shape.half)?;
+        let at_pos = rot.narrow(0, 2 * card.shape.half, 2 * card.shape.half)?;
         indexer_select(
             &q,
             &card.q_gamma,

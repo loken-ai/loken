@@ -293,6 +293,148 @@ pub(super) fn capture_decode_graph(
     Some((DecodeGraph { steps }, logits?))
 }
 
+/// The recorded draft verifies of a request, one graph per window size, and whether they were
+/// given up on.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub(super) struct VerifyGraphs {
+    by_rows: std::collections::HashMap<usize, (crate::tensor::cuda_ext::CapturedGraph, Tensor)>,
+    disabled: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl VerifyGraphs {
+    /// Forget the graphs: the buffers they read are gone with the step's.
+    pub(super) fn clear(&mut self) {
+        self.by_rows.clear();
+    }
+}
+
+/// A draft verify of `ids` (the token carried forward, then the draft) at `pos` through a
+/// recorded window: its logits `[1, rows, vocab]` and, when the window was recorded for this
+/// verify, the seconds its replay alone took (what a verify costs from now on, which the
+/// recording's own cost would hide); `None` when the verify has to run eagerly, the model's
+/// state as it was. The first verify of each window size runs eagerly first, is recorded,
+/// replayed, and the replay has to name the eager tokens, or recorded verifies are given up on
+/// for the request.
+#[cfg(feature = "cuda")]
+pub(super) fn verify_recorded(
+    model: &mut BoxedModelBackend,
+    stream: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
+    graphs: &mut VerifyGraphs,
+    pos: usize,
+    ids: &[u32],
+) -> Option<(Tensor, Option<f64>)> {
+    let rows = ids.len();
+    if graphs.disabled || rows < 2 || rows > model.verify_window_rows() {
+        return None;
+    }
+    let give_up = |model: &mut BoxedModelBackend, graphs: &mut VerifyGraphs, why: String| {
+        warn!("recorded verify given up at pos={pos}: {why}; eager verifies for the rest of the request");
+        graphs.disabled = true;
+        graphs.clear();
+        if let Err(e) = model.verify_window_settle(0) {
+            warn!("the model did not return to the rows before the verify: {e}");
+        }
+        model.invalidate_graph_state();
+    };
+    if let Err(e) = model.verify_window_prepare(pos, ids) {
+        give_up(model, graphs, format!("prepare: {e}"));
+        return None;
+    }
+    if let Some((g, logits)) = graphs.by_rows.get(&rows) {
+        if let Err(e) = g.launch() {
+            give_up(model, graphs, format!("launch: {e:?}"));
+            return None;
+        }
+        let _ = crate::tensor::cuda_ext::synchronize_yielding(stream);
+        return Some((logits.clone(), None));
+    }
+    // The eager run of the window: what the replay has to reproduce.
+    let eager = match model.forward_verify_window(rows) {
+        Ok(l) => l,
+        Err(e) => {
+            give_up(model, graphs, format!("eager window: {e}"));
+            return None;
+        }
+    };
+    let _ = stream.synchronize();
+    let eager_rows: Option<Vec<Vec<f32>>> = (0..rows)
+        .map(|r| {
+            eager
+                .narrow(1, r, 1)
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+                .ok()
+        })
+        .collect();
+    if let Err(e) = model
+        .verify_window_settle(0)
+        .and_then(|()| model.verify_window_prepare(pos, ids))
+    {
+        give_up(model, graphs, format!("return before the capture: {e}"));
+        return None;
+    }
+    let _ = stream.synchronize();
+    let captured: crate::tensor::Result<Option<crate::tensor::cuda_ext::CapturedGraph>> = (|| {
+        crate::tensor::cuda_ext::begin_capture(stream)?;
+        model.forward_verify_window(rows)?;
+        crate::tensor::cuda_ext::end_capture(stream)
+    })();
+    let g = match captured {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            give_up(model, graphs, "the capture recorded nothing".into());
+            return None;
+        }
+        Err(e) => {
+            let _ = crate::tensor::cuda_ext::end_capture(stream);
+            let _ = stream.synchronize();
+            give_up(model, graphs, format!("capture: {e}"));
+            return None;
+        }
+    };
+    if let Err(e) = g.upload() {
+        warn!("verify graph upload failed (will fall back to lazy upload): {e}");
+    }
+    // The eager run and the recording wrote the same buffer: the replay fills it again.
+    let logits = eager;
+    let replay = std::time::Instant::now();
+    if let Err(e) = g.launch() {
+        give_up(model, graphs, format!("first launch: {e:?}"));
+        return None;
+    }
+    let _ = stream.synchronize();
+    let replay_secs = replay.elapsed().as_secs_f64();
+    let agrees = eager_rows.is_some_and(|want| {
+        (0..rows).all(|r| {
+            logits
+                .narrow(1, r, 1)
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+                .ok()
+                .is_some_and(|got: Vec<f32>| {
+                    crate::inference::engine::decode_step::replay_agrees(&got, &want[r])
+                })
+        })
+    });
+    if !agrees {
+        give_up(
+            model,
+            graphs,
+            "the replay does not name the eager rows' tokens".into(),
+        );
+        return None;
+    }
+    info!(
+        "recorded verify of {rows} rows captured at pos={pos}: {} nodes, replayed in {:.1} ms",
+        g.num_nodes().unwrap_or(0),
+        replay_secs * 1e3
+    );
+    graphs.by_rows.insert(rows, (g, logits.clone()));
+    Some((logits, Some(replay_secs)))
+}
+
 /// One part of a decode step.
 #[cfg(feature = "cuda")]
 enum DecodeStep {

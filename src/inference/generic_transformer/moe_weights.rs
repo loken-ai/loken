@@ -159,8 +159,8 @@ impl ExpertRouting {
         })
     }
 
-    /// One token's down projection and weighted fold over the experts of `stack` and, numbered
-    /// after them, those of `more`, in one launch.
+    /// The down projection and weighted fold of `n_tokens` tokens over the experts of `stack`
+    /// and, numbered after them, those of `more`, in one launch.
     #[cfg(feature = "cuda")]
     pub(super) fn down_reduce_over(
         &self,
@@ -168,6 +168,7 @@ impl ExpertRouting {
         stack: &QTensor,
         more: Option<&QTensor>,
         weights: &Tensor,
+        n_tokens: usize,
     ) -> Result<Tensor> {
         device_timed("expert kernels: down on the device", rows, || {
             crate::inference::moe_cuda::moe_gemm_gguf_down_reduce_over(
@@ -178,7 +179,7 @@ impl ExpertRouting {
                 &self.experts,
                 weights,
                 self.topk,
-                1,
+                n_tokens,
                 None,
                 None,
                 None,
@@ -955,8 +956,13 @@ impl MoeWeights {
             .filter(|_| xs.device().runs_as_card() && num_tokens > 1)
         {
             // Too few rows to pay for the layer's experts to come: the rows go through the cache
-            // together, as the decoded tokens they stand for would one after the other.
-            tier.decode_rows(self, &xs, &topk_ids, &topk_weights_scaled)?
+            // together, as the decoded tokens they stand for would one after the other. The rows
+            // of a recorded verify go through the kernels of the recorded decode.
+            if tier.records(&xs.device()) && num_tokens <= tier.graph_rows() {
+                tier.decode_rows_graph(self, &xs, &topk_ids, &topk_weights_scaled)?
+            } else {
+                tier.decode_rows(self, &xs, &topk_ids, &topk_weights_scaled)?
+            }
         } else if on_cpu {
             self.forward_cpu(&xs, &topk_ids, &topk_weights_scaled, num_tokens, hidden_dim)?
         } else {

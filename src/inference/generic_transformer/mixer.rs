@@ -182,6 +182,21 @@ impl Mixer {
         self.snapshot()
     }
 
+    /// Copies the state as it stands into the buffers of `keep`, a copy taken earlier, without
+    /// moving either: a recorded step can take it, and [`Self::restore_in_place`] put it back.
+    pub fn save_in_place(&self, keep: &MixerState) -> Result<()> {
+        let current = match self {
+            Mixer::Attention | Mixer::Absent => return Ok(()),
+            Mixer::ShortConv(m) => m.state.clone().map(|s| MixerState::ShortConv(Some(s))),
+            Mixer::Ssm(m) => m.state.clone().map(|s| MixerState::Ssm(Some(s))),
+            Mixer::DeltaNet(m) => m.state.clone().map(|s| MixerState::DeltaNet(Some(s))),
+        };
+        match current {
+            Some(cur) => copy_state_in_place(keep, &cur),
+            None => Err(crate::tensor::Error::msg("no recurrent state to keep")),
+        }
+    }
+
     /// Writes `state` back into the buffers the state lives in, without moving them.
     pub fn restore_in_place(&mut self, state: &MixerState) -> Result<()> {
         let current = match self {

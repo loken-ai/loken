@@ -195,8 +195,8 @@ cuda_launchers! {
     loken_tier_plan(
         ids: *const u32, weights: *const f32, x: *const f32, table: *const i32,
         counter: *mut u32, slot_out: *mut u32, weight_out: *mut f32, mail_ids: *mut u32,
-        mail_weights: *mut f32, mail_slots: *mut u32, mail_x: *mut f32, mail_request: *mut u32,
-        k: i32, hidden: i32);
+        mail_weights: *mut f32, mail_slots: *mut u32, mail_x: *mut f32, mail_rows: *mut u32,
+        mail_request: *mut u32, rows: i32, k: i32, hidden: i32);
     loken_tier_wait(counter: *const u32, reply: *mut u32, abort_word: *mut u32);
     loken_tier_merge(card: *const f32, product: *const f32, counter: *const u32, out: *mut f32, n: i32);
 }
@@ -219,7 +219,9 @@ pub(crate) mod tier_graph {
         mail_weights: *mut f32,
         mail_slots: *mut u32,
         mail_x: *mut f32,
+        mail_rows: *mut u32,
         mail_request: *mut u32,
+        rows: i32,
         k: i32,
         hidden: i32,
         stream: i64,
@@ -236,12 +238,16 @@ pub(crate) mod tier_graph {
             mail_weights,
             mail_slots,
             mail_x,
+            mail_rows,
             mail_request,
+            rows,
             k,
             hidden,
             stream,
         );
     }
+    /// Most routed pairs one plan launch serves.
+    pub const PLAN_PAIRS: usize = 256;
     pub unsafe fn wait(counter: *const u32, reply: *mut u32, abort_word: *mut u32, stream: i64) {
         super::loken_tier_wait(counter, reply, abort_word, stream);
     }

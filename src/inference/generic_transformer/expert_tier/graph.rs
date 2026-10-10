@@ -1,10 +1,12 @@
-//! A cached layer's decoded token as kernels alone, so that a graph can record it.
+//! A cached layer's decoded token, or the rows of a draft verify, as kernels alone, so that a
+//! graph can record them.
 //!
 //! The layer's missing experts are computed by a thread of the host. The card hands it a
-//! mailbox in page-locked memory (the router's choice, the slots the cache served, the layer's
-//! input), raises a request word, waits on a reply word with a kernel, and adds the product the
-//! host left in the mailbox. Neither side returns to the code that launched it between two
-//! kernels, which is what a recorded graph needs and what an eager decode pays a round trip for.
+//! mailbox in page-locked memory (the router's choice of each row, the slots the cache served,
+//! the rows' input), raises a request word, waits on a reply word with a kernel, and adds the
+//! product the host left in the mailbox. Neither side returns to the code that launched it
+//! between two kernels, which is what a recorded graph needs and what an eager decode pays a
+//! round trip for.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -84,12 +86,13 @@ impl Drop for SlotTable {
     }
 }
 
-/// What the card posts for a layer's request and the host answers.
+/// What the card posts for a layer's request and the host answers: room for `rows_max` rows.
 pub(super) struct Mailbox {
     host: *mut u8,
     device: u64,
     k: usize,
     hidden: usize,
+    rows_max: usize,
     ids: usize,
     weights: usize,
     slots: usize,
@@ -100,20 +103,22 @@ pub(super) struct Mailbox {
 unsafe impl Send for Mailbox {}
 unsafe impl Sync for Mailbox {}
 
-/// Offsets of the request, reply and abort words, each on a line of its own: the card writes the
-/// first and the host the other two.
+/// Offsets of the request, reply, abort and rows words, each on a line of its own: the card
+/// writes the request and the rows, the host the other two.
 const REQUEST: usize = 0;
 const REPLY: usize = 64;
 const ABORT: usize = 128;
-const BODY: usize = 192;
+const ROWS: usize = 192;
+const BODY: usize = 256;
 
 fn line(bytes: usize) -> usize {
     bytes.div_ceil(64) * 64
 }
 
-/// The request as the host reads it, with the choice it carries.
+/// The request as the host reads it, with the choice of each of its rows.
 pub(super) struct Request {
     pub seq: u32,
+    pub rows: usize,
     pub ids: Vec<u32>,
     pub weights: Vec<f32>,
     /// The slot the cache served each expert from, `u32::MAX` for a missing one.
@@ -122,18 +127,20 @@ pub(super) struct Request {
 }
 
 impl Mailbox {
-    fn new(dev: &Device, k: usize, hidden: usize) -> Result<Self> {
+    fn new(dev: &Device, k: usize, hidden: usize, rows_max: usize) -> Result<Self> {
+        let pairs = rows_max * k;
         let ids = BODY;
-        let weights = ids + line(4 * k);
-        let slots = weights + line(4 * k);
-        let x = slots + line(4 * k);
-        let product = x + line(4 * hidden);
-        let (host, device) = mapped(dev, product + line(4 * hidden))?;
+        let weights = ids + line(4 * pairs);
+        let slots = weights + line(4 * pairs);
+        let x = slots + line(4 * pairs);
+        let product = x + line(4 * hidden * rows_max);
+        let (host, device) = mapped(dev, product + line(4 * hidden * rows_max))?;
         Ok(Self {
             host,
             device,
             k,
             hidden,
+            rows_max,
             ids,
             weights,
             slots,
@@ -160,14 +167,19 @@ impl Mailbox {
         loop {
             let seq = self.request();
             std::sync::atomic::fence(Ordering::Acquire);
+            let rows = (unsafe { std::ptr::read_volatile(self.word(ROWS)) } as usize)
+                .clamp(1, self.rows_max);
+            let pairs = rows * self.k;
             let at = |off: usize| unsafe { self.host.add(off) };
-            let ids = unsafe { std::slice::from_raw_parts(at(self.ids) as *const u32, self.k) };
+            let ids = unsafe { std::slice::from_raw_parts(at(self.ids) as *const u32, pairs) };
             let weights =
-                unsafe { std::slice::from_raw_parts(at(self.weights) as *const f32, self.k) };
-            let slots = unsafe { std::slice::from_raw_parts(at(self.slots) as *const u32, self.k) };
-            let x = unsafe { std::slice::from_raw_parts(at(self.x) as *const f32, self.hidden) };
+                unsafe { std::slice::from_raw_parts(at(self.weights) as *const f32, pairs) };
+            let slots = unsafe { std::slice::from_raw_parts(at(self.slots) as *const u32, pairs) };
+            let x =
+                unsafe { std::slice::from_raw_parts(at(self.x) as *const f32, self.hidden * rows) };
             let read = Request {
                 seq,
+                rows,
                 ids: ids.to_vec(),
                 weights: weights.to_vec(),
                 slots: slots.to_vec(),
@@ -181,14 +193,15 @@ impl Mailbox {
         }
     }
 
-    /// Leave `product` for the card and raise the reply word to `seq`.
+    /// Leave `product`, one row per row of the request, for the card and raise the reply word
+    /// to `seq`.
     pub(super) fn answer(&self, product: &[f32], seq: u32) {
-        debug_assert_eq!(product.len(), self.hidden);
+        debug_assert!(product.len() <= self.hidden * self.rows_max);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 product.as_ptr(),
                 self.host.add(self.product) as *mut f32,
-                self.hidden,
+                product.len(),
             );
         }
         std::sync::atomic::fence(Ordering::Release);
@@ -234,28 +247,35 @@ static WORKER: WorkerStats = WorkerStats {
     product_ns: std::sync::atomic::AtomicU64::new(0),
 };
 
-/// A layer's decoded token between the post of its request and the wait for the answer.
+/// A layer's decoded rows between the post of their request and the wait for the answer.
 pub(crate) struct GraphPending {
     card: Tensor,
+    rows: usize,
     hidden: usize,
     dev: Device,
 }
 
 /// A layer's side of the graph decode: the mailbox, the buffers the kernels write on the card,
-/// and the number of the last request the host answered.
+/// the rows they have room for, and the number of the last request the host answered.
 pub(super) struct GraphSide {
     mail: Mailbox,
     counter: Tensor,
     slots: Tensor,
     weights: Tensor,
+    rows_max: usize,
     done: AtomicU32,
 }
 
 impl LayerTier {
-    /// Let this layer's decoded token run as kernels alone, served by a [`TierWorker`].
-    pub(super) fn enable_graph(&self, hidden: usize, k: usize) -> Result<()> {
-        // The plan kernel looks a choice up with one thread per expert of a warp.
-        if self.graph.get().is_some() || self.resident || k > 32 {
+    /// Let this layer's decoded token, and the rows of a verify up to `rows_max`, run as kernels
+    /// alone, served by a [`TierWorker`].
+    pub(super) fn enable_graph(&self, hidden: usize, k: usize, rows_max: usize) -> Result<()> {
+        // The plan kernel looks the choices up with one thread per routed pair.
+        let rows_max = rows_max.max(1);
+        if self.graph.get().is_some()
+            || self.resident
+            || rows_max * k > crate::inference::moe_cuda::tier_graph::PLAN_PAIRS
+        {
             return Ok(());
         }
         let host = Device::Cpu;
@@ -264,15 +284,22 @@ impl LayerTier {
         let table = Arc::new(SlotTable::new(dev, &st.slot_of)?);
         st.table = Some(table.clone());
         drop(st);
+        let pairs = rows_max * k;
         let side = GraphSide {
-            mail: Mailbox::new(dev, k, hidden)?,
+            mail: Mailbox::new(dev, k, hidden, rows_max)?,
             counter: Tensor::from_vec(vec![0u32; 2], (2,), &host)?.to_device(dev)?,
-            slots: Tensor::from_vec(vec![0u32; k], (k,), &host)?.to_device(dev)?,
-            weights: Tensor::from_vec(vec![0f32; k], (1, k), &host)?.to_device(dev)?,
+            slots: Tensor::from_vec(vec![0u32; pairs], (pairs,), &host)?.to_device(dev)?,
+            weights: Tensor::from_vec(vec![0f32; pairs], (1, pairs), &host)?.to_device(dev)?,
+            rows_max,
             done: AtomicU32::new(0),
         };
         let _ = self.graph.set(side);
         Ok(())
+    }
+
+    /// Rows of a verify a recorded decode can run through this layer at once.
+    pub(crate) fn graph_rows(&self) -> usize {
+        self.graph.get().map_or(0, |g| g.rows_max)
     }
 
     /// Whether a token on `dev` goes through the kernels of a recorded decode: one is being
@@ -291,7 +318,21 @@ impl LayerTier {
     /// One decoded token's expert block as kernels alone: `xs` `[1, hidden]` and the router's
     /// choice `ids`, `weights` `[1, k]`, all on the card. The host's share comes back through the
     /// mailbox. Returns `[1, hidden]` on the card.
-    pub(super) fn decode_graph(
+    pub(crate) fn decode_graph(
+        &self,
+        moe: &MoeWeights,
+        xs: &Tensor,
+        ids: &Tensor,
+        weights: &Tensor,
+    ) -> Result<Tensor> {
+        let pending = self.graph_begin(moe, xs, ids, weights)?;
+        self.graph_end(pending)
+    }
+
+    /// The expert blocks of the rows of a draft verify as kernels alone: `xs` `[rows, hidden]`
+    /// and the router's choices `ids`, `weights` `[rows, k]`, all on the card. Returns
+    /// `[rows, hidden]` on the card.
+    pub(crate) fn decode_rows_graph(
         &self,
         moe: &MoeWeights,
         xs: &Tensor,
@@ -304,7 +345,8 @@ impl LayerTier {
 
     /// The first half of [`Self::decode_graph`]: the request is posted and the card's own experts
     /// run. What the card has to do that does not depend on the host's answer can be queued
-    /// before [`Self::graph_end`] waits for it.
+    /// before [`Self::graph_end`] waits for it. `xs` is `[rows, hidden]`, the choice
+    /// `[rows, k]`.
     pub(crate) fn graph_begin(
         &self,
         moe: &MoeWeights,
@@ -315,11 +357,18 @@ impl LayerTier {
         use crate::inference::moe_cuda;
         let g = self.graph.get().expect("a graph layer is enabled");
         let k = moe.n_experts_used;
-        let hidden = xs.elem_count();
         let dev = xs.device().clone();
         let cd = dev.as_cuda_device()?;
         let stream = cd.0.stream().cu_stream() as i64;
         let x = xs.to_dtype(crate::tensor::DType::F32)?.contiguous()?;
+        let rows = ids.elem_count() / k.max(1);
+        let hidden = x.elem_count() / rows.max(1);
+        if rows == 0 || rows > g.rows_max {
+            crate::tensor::bail!(
+                "a recorded expert block of {rows} rows, with room for {}",
+                g.rows_max
+            );
+        }
         let ids = ids.to_dtype(crate::tensor::DType::U32)?.contiguous()?;
         let w = weights.to_dtype(crate::tensor::DType::F32)?.contiguous()?;
         let table = {
@@ -342,16 +391,27 @@ impl LayerTier {
                 g.mail.dptr(g.mail.weights) as *mut f32,
                 g.mail.dptr(g.mail.slots) as *mut u32,
                 g.mail.dptr(g.mail.x) as *mut f32,
+                g.mail.dptr(ROWS) as *mut u32,
                 g.mail.dptr(REQUEST) as *mut u32,
+                rows as i32,
                 k as i32,
                 hidden as i32,
                 stream,
             );
         }
-        let routing = ExpertRouting {
-            slots: moe.decode_slots.clone().expect("a tier layer is on a card"),
-            experts: g.slots.clone(),
-            topk: k,
+        let pairs = rows * k;
+        let slots = g.slots.narrow(0, 0, pairs)?;
+        let weights = g.weights.narrow(1, 0, pairs)?;
+        // One token's pairs are read as the router listed them; the rows of a verify are
+        // grouped by slot, as the batched kernels read them.
+        let routing = if rows == 1 {
+            ExpertRouting {
+                slots: moe.decode_slots.clone().expect("a tier layer is on a card"),
+                experts: slots,
+                topk: k,
+            }
+        } else {
+            ExpertRouting::group(&slots.reshape((rows, k))?, k)?
         };
         let extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
         let more = extra.as_ref();
@@ -361,19 +421,30 @@ impl LayerTier {
             &self.card[1],
             more.map(|m| (&m[0], &m[1])),
         )?;
-        let card = routing.down_reduce_over(&h, &self.card[2], more.map(|m| &m[2]), &g.weights)?;
+        let card =
+            routing.down_reduce_over(&h, &self.card[2], more.map(|m| &m[2]), &weights, rows)?;
         drop(extra);
-        Ok(GraphPending { card, hidden, dev })
+        Ok(GraphPending {
+            card,
+            rows,
+            hidden,
+            dev,
+        })
     }
 
     /// The second half: wait for the host's answer and add its product to the card's.
     pub(crate) fn graph_end(&self, pending: GraphPending) -> Result<Tensor> {
         use crate::inference::moe_cuda;
         let g = self.graph.get().expect("a graph layer is enabled");
-        let GraphPending { card, hidden, dev } = pending;
+        let GraphPending {
+            card,
+            rows,
+            hidden,
+            dev,
+        } = pending;
         let cd = dev.as_cuda_device()?;
         let stream = cd.0.stream().cu_stream() as i64;
-        let out = unsafe { cd.alloc::<f32>(hidden) }?;
+        let out = unsafe { cd.alloc::<f32>(rows * hidden) }?;
         unsafe {
             moe_cuda::tier_graph::wait(
                 address_of::<u32>(&g.counter)? as *const u32,
@@ -387,24 +458,52 @@ impl LayerTier {
                 g.mail.dptr(g.mail.product) as *const f32,
                 address_of::<u32>(&g.counter)? as *const u32,
                 out.device_ptr(out.stream()).0 as *mut f32,
-                hidden as i32,
+                (rows * hidden) as i32,
                 stream,
             );
         }
-        crate::tensor::cuda_ext::tensor_from_f32_slice(out, (1, hidden), &dev)
+        crate::tensor::cuda_ext::tensor_from_f32_slice(out, (rows, hidden), &dev)
     }
 
-    /// The host's computation of the experts a request found missing: `x` through `ids`, scaled
-    /// by `weights`, as one row.
-    fn host_product(&self, x: &[f32], ids: &[u32], weights: &[f32]) -> Result<Vec<f32>> {
+    /// The host's computation of the experts a request's rows found missing: `pairs` names
+    /// `(row, expert, weight)` for each, `x` holds `rows` rows of `hidden`. One grouped call
+    /// computes every pair; the answer is one row per row of the request.
+    fn host_product(
+        &self,
+        x: &[f32],
+        rows: usize,
+        pairs: &[(usize, u32, f32)],
+    ) -> Result<Vec<f32>> {
         let host = Device::Cpu;
-        let m = ids.len();
-        let x = Tensor::from_vec(x.to_vec(), (1, x.len()), &host)?;
-        let routing = ExpertRouting::group(&Tensor::from_vec(ids.to_vec(), (1, m), &host)?, m)?;
-        let h = routing.host_gate_up_silu(&x, &self.host[0], &self.host[1])?;
-        let w = Tensor::from_vec(weights.to_vec(), (1, m), &host)?;
-        let product = routing.host_down_reduce(&h, &self.host[2], &w, 1, None)?;
-        product.flatten_all()?.to_vec1::<f32>()
+        let hidden = x.len() / rows.max(1);
+        let m = pairs.len();
+        let mut rows_in = Vec::with_capacity(m * hidden);
+        for &(r, _, _) in pairs {
+            rows_in.extend_from_slice(&x[r * hidden..(r + 1) * hidden]);
+        }
+        let xs = Tensor::from_vec(rows_in, (m, hidden), &host)?;
+        let ids: Vec<u32> = pairs.iter().map(|p| p.1).collect();
+        let routing = ExpertRouting::group(&Tensor::from_vec(ids, (m, 1), &host)?, 1)?;
+        let h = routing.host_gate_up_silu(&xs, &self.host[0], &self.host[1])?;
+        let w = Tensor::from_vec(
+            pairs.iter().map(|p| p.2).collect::<Vec<f32>>(),
+            (m, 1),
+            &host,
+        )?;
+        let out = routing
+            .host_down_reduce(&h, &self.host[2], &w, m, None)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut product = vec![0f32; rows * hidden];
+        for (j, &(r, _, _)) in pairs.iter().enumerate() {
+            for (acc, v) in product[r * hidden..(r + 1) * hidden]
+                .iter_mut()
+                .zip(&out[j * hidden..(j + 1) * hidden])
+            {
+                *acc += v;
+            }
+        }
+        Ok(product)
     }
 
     /// Answer the layer's request if the card posted one since the last answer. Whether it did.
@@ -419,21 +518,23 @@ impl LayerTier {
         let mut laps = Laps::new();
         let req = g.mail.read();
         laps.mark("tier worker: read");
-        let k = req.ids.len();
+        let pairs = req.ids.len();
+        let k = pairs / req.rows.max(1);
         // The card read these slots for this request; a missing expert's pair read the first
         // of them at weight zero, so none of them is a victim.
         let mut in_use = vec![false; self.slots()];
-        let mut missing = Vec::new();
-        let (mut miss_ids, mut miss_w) = (Vec::new(), Vec::new());
+        let mut missing: Vec<u32> = Vec::new();
+        let mut miss_pairs: Vec<(usize, u32, f32)> = Vec::new();
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            for i in 0..k {
+            for i in 0..pairs {
                 let e = req.ids[i] as usize;
                 st.heat[e] += 1.0;
                 if req.slots[i] == u32::MAX {
-                    missing.push(req.ids[i]);
-                    miss_ids.push(req.ids[i]);
-                    miss_w.push(req.weights[i]);
+                    if !missing.contains(&req.ids[i]) {
+                        missing.push(req.ids[i]);
+                    }
+                    miss_pairs.push((i / k, req.ids[i], req.weights[i]));
                 } else {
                     in_use[req.slots[i] as usize] = true;
                 }
@@ -443,25 +544,25 @@ impl LayerTier {
             } else if !in_use.is_empty() {
                 in_use[0] = true;
             }
-            st.since_decay += 1;
+            st.since_decay += req.rows;
             if st.since_decay >= self.n_experts {
                 st.since_decay = 0;
                 st.heat.iter_mut().for_each(|h| *h *= 0.5);
             }
         }
-        self.routed.fetch_add(k as u64, Ordering::Relaxed);
+        self.routed.fetch_add(pairs as u64, Ordering::Relaxed);
         self.hits
-            .fetch_add((k - miss_ids.len()) as u64, Ordering::Relaxed);
+            .fetch_add((pairs - miss_pairs.len()) as u64, Ordering::Relaxed);
         laps.mark("tier worker: bookkeeping");
         // The card waits for the product only when an expert was missing.
-        if miss_ids.is_empty() {
+        if miss_pairs.is_empty() {
             g.mail.raise(req.seq);
         } else {
             let t = std::time::Instant::now();
-            let product = self.host_product(&req.x, &miss_ids, &miss_w)?;
+            let product = self.host_product(&req.x, req.rows, &miss_pairs)?;
             blend(
                 &self.host_us,
-                t.elapsed().as_secs_f64() * 1e6 / miss_ids.len() as f64,
+                t.elapsed().as_secs_f64() * 1e6 / missing.len() as f64,
             );
             laps.mark("tier worker: host product");
             WORKER
@@ -469,7 +570,7 @@ impl LayerTier {
                 .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
             WORKER
                 .missing
-                .fetch_add(miss_ids.len() as u64, Ordering::Relaxed);
+                .fetch_add(missing.len() as u64, Ordering::Relaxed);
             g.mail.answer(&product, req.seq);
         }
         g.done.store(req.seq, Ordering::Relaxed);
@@ -480,7 +581,7 @@ impl LayerTier {
         let us = started.elapsed().as_nanos() as u64;
         let n = WORKER.requests.fetch_add(1, Ordering::Relaxed) + 1;
         let total = WORKER.ns.fetch_add(us, Ordering::Relaxed) + us;
-        if !miss_ids.is_empty() {
+        if !miss_pairs.is_empty() {
             WORKER.missed.fetch_add(1, Ordering::Relaxed);
         }
         if self.leader.load(Ordering::Relaxed) && n % 4096 == 0 {

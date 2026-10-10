@@ -348,6 +348,32 @@ impl PleBlock {
         self.state.as_ref()
     }
 
+    /// A buffer of the shape of the carried rows on `device`, zeroed, for
+    /// [`Self::save_rows_into`] to fill.
+    pub fn rows_buffer(&self, device: &Device) -> Result<Tensor> {
+        let hist = (self.taps - 1) * self.dilation;
+        Tensor::zeros_on((hist, self.streams * self.dim), DType::F32, device)
+    }
+
+    /// Copy the carried rows into `dst`, where they lie: a recorded step takes them.
+    pub fn save_rows_into(&self, dst: &Tensor) -> Result<()> {
+        match self.state.as_ref() {
+            Some(held) => dst.slice_set(held, 0, 0),
+            None => dst.slice_set(&dst.zeros_like()?, 0, 0),
+        }
+    }
+
+    /// Make the rows in `src` the carried rows, written where the carried ones lie.
+    pub fn restore_rows_from(&mut self, src: &Tensor) -> Result<()> {
+        match self.state.as_ref() {
+            Some(held) if held.dims() == src.dims() => held.slice_set(src, 0, 0),
+            _ => {
+                self.state = Some(src.force_contiguous()?);
+                Ok(())
+            }
+        }
+    }
+
     /// The convolution's rows exist on `device`, empty if the sequence has not made them: a
     /// recorded step reads and writes them where they lie.
     pub fn ensure_state(&mut self, device: &Device) -> Result<()> {

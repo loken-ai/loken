@@ -1053,6 +1053,115 @@ fn verifies_that_follow_each_other_keep_the_state_of_decoding() {
     assert!(pos > 6, "the chain ran through several rounds");
 }
 
+/// A verify of a few rows through the recorded window gives the logits of decoding them one
+/// by one, eagerly and replayed from a graph, and a cut back to the rows kept leaves the state
+/// of decoding those rows alone.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn a_recorded_verify_window_matches_the_decoded_rows_and_cuts_back() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let tokens = ids(&v, "b.ids");
+    let toy = || toy_on(Some(0));
+    let dev = toy().layers[0].cos.device();
+    let step = |m: &mut GenericHeteroTransformer, t: u32, at: usize| -> Vec<f32> {
+        let input = Tensor::from_vec(vec![t], (1, 1), &dev).unwrap();
+        m.forward(&input, at)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let mut reference = toy();
+    let want: Vec<Vec<f32>> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| step(&mut reference, *t, i))
+        .collect();
+    let scale = want.iter().map(|r| scale_of(r)).fold(0f32, f32::max);
+    let vocab = want[0].len();
+    let top = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+    };
+    let rows_of = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    let stream = crate::tensor::cuda_ext::stream_of(&dev).unwrap();
+    for (prefix, rows, kept) in [(3usize, 4usize, 2usize), (2, 3, 1), (4, 3, 3)] {
+        let mut m = toy();
+        for (i, t) in tokens[..prefix].iter().enumerate() {
+            step(&mut m, *t, i);
+        }
+        if let Some(why) = m.verify_window_block() {
+            eprintln!("skipping: the toy records no verify ({why})");
+            return;
+        }
+        assert!(
+            m.verify_window_rows() >= rows,
+            "the toy on a card records a verify of {rows} rows"
+        );
+        let window = tokens[prefix..prefix + rows].to_vec();
+        // Eagerly: the kernels of the recorded window, run at once.
+        m.verify_window_prepare(prefix, &window).unwrap();
+        let eager = rows_of(&m.forward_verify_window(rows).unwrap());
+        stream.synchronize().unwrap();
+        for r in 0..rows {
+            let row = &eager[r * vocab..(r + 1) * vocab];
+            let d = max_diff(row, &want[prefix + r]);
+            assert!(d < QUANTISED_SLACK * scale, "eager row {r} differs by {d}");
+            assert_eq!(
+                top(row),
+                top(&want[prefix + r]),
+                "eager row {r} names another token"
+            );
+        }
+        // Back to before the rows, recorded, and replayed: the same logits.
+        m.verify_window_settle(0).unwrap();
+        m.verify_window_prepare(prefix, &window).unwrap();
+        stream.synchronize().unwrap();
+        crate::tensor::cuda_ext::begin_capture(&stream).unwrap();
+        let logits = m.forward_verify_window(rows).unwrap();
+        let graph = crate::tensor::cuda_ext::end_capture(&stream)
+            .unwrap()
+            .expect("a window records kernels");
+        graph.launch().unwrap();
+        stream.synchronize().unwrap();
+        let replayed = rows_of(&logits);
+        for r in 0..rows {
+            let d = max_diff(
+                &replayed[r * vocab..(r + 1) * vocab],
+                &eager[r * vocab..(r + 1) * vocab],
+            );
+            assert!(
+                d < 1e-3 * scale,
+                "replayed row {r} differs from the eager one by {d}"
+            );
+        }
+        // Cut back to the rows kept: decoding goes on as if those rows alone had been decoded.
+        m.verify_window_settle(kept).unwrap();
+        let mut alone = toy();
+        for (i, t) in tokens[..prefix + kept].iter().enumerate() {
+            step(&mut alone, *t, i);
+        }
+        for i in prefix + kept..prefix + kept + 2 {
+            let (got, want_alone) = (step(&mut m, tokens[i], i), step(&mut alone, tokens[i], i));
+            let d = max_diff(&got, &want_alone);
+            assert!(
+                d < QUANTISED_SLACK * scale,
+                "prefix {prefix}, {rows} rows, {kept} kept: position {i} differs by {d}"
+            );
+            assert_eq!(
+                top(&got),
+                top(&want_alone),
+                "position {i} names another token"
+            );
+        }
+    }
+}
+
 fn verify_cut_back(ordinal: Option<usize>, kv: KvQuant) {
     let toy = || toy_with(ordinal, kv);
     let bytes = vectors();

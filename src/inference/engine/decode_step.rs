@@ -357,6 +357,9 @@ pub(crate) struct DraftLength {
 /// cost measured once, on a cold cache, would keep the drafter off for good.
 const DRAFT_RETRY_STEPS: u32 = 48;
 const DRAFT_RETRY_MAX: u32 = 1536;
+/// Cycles a drafter is given before its acceptance is trusted against the plain step: the
+/// smoothed survival of its first cycle alone undercounts a drafter that is mostly right.
+const DRAFT_PROBES: u32 = 4;
 
 impl DraftLength {
     pub(crate) fn next(&self) -> usize {
@@ -394,10 +397,49 @@ impl DraftLength {
                 best_drafting = (k, rate);
             }
         }
-        if best.0 == 0 && self.plain_run >= self.backoff.max(DRAFT_RETRY_STEPS) {
+        if best.0 == 0
+            && (self.reached[0] < DRAFT_PROBES
+                || self.plain_run >= self.backoff.max(DRAFT_RETRY_STEPS))
+        {
             return best_drafting.0;
         }
         best.0
+    }
+
+    /// The costs and acceptances the choice rests on, for the request's log line.
+    pub(crate) fn summary(&self) -> String {
+        let cycles: Vec<String> = (0..=DRAFT_MAX)
+            .filter_map(|k| {
+                self.cycle[k].map(|(c, v)| format!("{k}:{:.1}/{:.1}", c * 1e3, v * 1e3))
+            })
+            .collect();
+        let kept: Vec<String> = (0..DRAFT_MAX)
+            .filter(|&i| self.reached[i] > 0)
+            .map(|i| format!("{}/{}", self.kept[i], self.reached[i]))
+            .collect();
+        format!(
+            "cycle ms (cycle/verify) {}; kept {}; draft token {:.1} ms; plain run {}, backoff {}",
+            cycles.join(" "),
+            kept.join(" "),
+            self.draft_token.unwrap_or(0.0) * 1e3,
+            self.plain_run,
+            self.backoff
+        )
+    }
+
+    /// Records what a cycle that drafted `k` tokens accepted, and nothing of what it cost: a
+    /// cycle whose verify was recorded as it ran paid the recording too.
+    pub(crate) fn record_accepted(&mut self, k: usize, accepted: usize) {
+        let k = k.min(DRAFT_MAX);
+        for i in 0..k.min(accepted + 1) {
+            self.reached[i] += 1;
+            if i < accepted {
+                self.kept[i] += 1;
+            }
+        }
+        if k > 0 {
+            self.plain_run = 0;
+        }
     }
 
     /// Records a cycle that drafted `k` tokens in `draft_secs`, accepted `accepted` of them,
@@ -719,8 +761,8 @@ mod tests {
     #[test]
     fn a_drafter_whose_cost_was_measured_cold_is_tried_again() {
         let mut d = DraftLength::default();
-        // Two cold cycles at length 3 cost five plain steps each; then plain steps win.
-        for _ in 0..2 {
+        // The probe cycles at length 3 cost five plain steps each; then plain steps win.
+        for _ in 0..DRAFT_PROBES {
             d.record(3, 1, 0.01, 1.0);
         }
         for _ in 0..40 {
@@ -786,10 +828,9 @@ mod tests {
 }
 
 /// Whether the logits of a replayed graph step agree with the eager step over the same token:
-/// the same top token, or a different one where the eager step has the two within what separates
-/// the two computations everywhere (the host's dot products and the card's differ in their last
-/// bits) and the two logit vectors are the same to within [`REPLAY_RELATIVE_ERROR`] of the eager
-/// norm. A replay that is wrong does not pass the second condition.
+/// the same top token, or two logit vectors the same to within [`REPLAY_RELATIVE_ERROR`] of the
+/// eager norm (an expert computed on the card in one run and on the host in the other differs
+/// in its last bits, which a near tie flips on). A replay that is wrong fails the second.
 pub(crate) fn replay_agrees(graph: &[f32], eager: &[f32]) -> bool {
     if graph.len() != eager.len() || eager.is_empty() {
         return false;
@@ -810,14 +851,13 @@ pub(crate) fn replay_agrees(graph: &[f32], eager: &[f32]) -> bool {
     if a == b {
         return true;
     }
-    let (mut worst, mut diff2, mut norm2) = (0f32, 0f64, 0f64);
+    let (mut diff2, mut norm2) = (0f64, 0f64);
     for (g, e) in graph.iter().zip(eager) {
-        let d = (g - e).abs();
-        worst = worst.max(d);
-        diff2 += (d as f64) * (d as f64);
-        norm2 += (*e as f64) * (*e as f64);
+        let d = f64::from(g - e);
+        diff2 += d * d;
+        norm2 += f64::from(*e) * f64::from(*e);
     }
-    diff2.sqrt() <= REPLAY_RELATIVE_ERROR * norm2.sqrt() && eager[b] - eager[a] <= 2.0 * worst
+    diff2.sqrt() <= REPLAY_RELATIVE_ERROR * norm2.sqrt()
 }
 
 /// The relative distance between a replay's logits and the eager step's, from which a replay is

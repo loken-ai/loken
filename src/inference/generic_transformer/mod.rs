@@ -75,6 +75,7 @@ mod state_cache_tests;
 pub(crate) mod tiny_model;
 #[cfg(all(test, feature = "cuda"))]
 mod verify_decode_parity;
+mod verify_window;
 mod wide;
 pub use config::*;
 pub use dense::DenseCheckpoint;
@@ -310,6 +311,14 @@ pub struct GenericTransformerLayer {
     /// The capacity of the key and value buffers a recorded indexed layer was last run against:
     /// the step ends, and is recorded again, when the cache outgrows or replaces them.
     pub graph_kv_cap: Option<usize>,
+    /// The buffers of a recorded verify's rows: the positions of the rows, their rotation
+    /// tables, the n-gram rows of the layer that adds them, and what the layer keeps to return
+    /// to the rows that were kept.
+    pub verify_pos_i32: Option<Tensor>,
+    pub verify_rope_cos: Option<Tensor>,
+    pub verify_rope_sin: Option<Tensor>,
+    pub verify_ngram_rows: Option<Tensor>,
+    verify_keep: Option<verify_window::VerifyKeep>,
     /// Persistent buffer for `att.broadcast_add(mask)` output in the
     /// GQA fast path of padded_standard_attention (line 2471).
     /// Same shape as graph_attn_qk_buffer: [1, n_kv, n_rep, max_kv] F32.
@@ -504,6 +513,10 @@ pub struct GenericHeteroTransformer {
     /// The position of the token the decode step in flight carries: what an eagerly run layer
     /// of a captured step reads where a captured one reads the position buffers.
     graph_pos: usize,
+    /// The buffers of the recorded draft verifies.
+    verify: verify_window::VerifyBuffers,
+    /// The last layer's row of the recorded step, `[1, 1, wide]`, where its replays leave it.
+    graph_feature: Option<Tensor>,
     /// Resident sequences copied aside after a request (`snapshot_kv`), most recently
     /// used last by `tick`; empty unless the configuration asks for them.
     kv_snapshots: Vec<KvSnapshot>,
