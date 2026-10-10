@@ -319,7 +319,7 @@ pub struct SparseAttention {
 #[cfg(feature = "cuda")]
 mod card;
 #[cfg(feature = "cuda")]
-pub use card::CardIndexer;
+pub use card::{CardIndexer, CardPick};
 
 impl SparseAttention {
     #[allow(clippy::too_many_arguments)]

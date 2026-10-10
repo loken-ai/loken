@@ -481,6 +481,34 @@ impl GenericTransformerLayer {
         {
             return self.attend_on_card_eager(x, index_pos);
         }
+        // A prompt's rows over an F16 cache of a shape the kernels serve are selected on the card
+        // and attended there, their queries never leaving it.
+        #[cfg(feature = "cuda")]
+        if x.dim(1)? > 1
+            && self.kv_f16
+            && self.indexed_on_card()
+            && crate::inference::moe_cuda::selected_attention_rows_serves(
+                self.head_dim,
+                self.n_head,
+                self.n_kv_head,
+            )
+        {
+            let sparse = self.sparse.as_mut().expect("an indexed layer");
+            return match sparse.observe_on_card(x, index_pos)? {
+                super::qsa::CardPick::Kept { sel, count } => {
+                    self.attend_selected_card(x, index_pos, &sel, &count)
+                }
+                super::qsa::CardPick::Dense => self.forward_attn(
+                    x,
+                    mask,
+                    index_pos,
+                    None,
+                    None,
+                    #[cfg(feature = "cuda")]
+                    None,
+                ),
+            };
+        }
         let selection = match self.sparse.as_mut() {
             Some(sp) => sp.observe(x, index_pos)?,
             None => None,
@@ -517,6 +545,104 @@ impl GenericTransformerLayer {
             k = kn.forward(&k.contiguous()?)?;
         }
         Ok((q, k, v))
+    }
+
+    /// The queries, keys and values of the rows `x` `[1, seq, hidden]` of a prompt chunk at
+    /// `index_pos`, as [`Self::attend_selected`] reads them: the queries and keys rotated, the
+    /// cache started over at position 0, the keys and values in the cache's width.
+    #[cfg(feature = "cuda")]
+    fn selected_inputs(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (mut q, mut k, mut v) = self.project_heads(x)?;
+        q = self.apply_rotary_emb(&q, index_pos)?;
+        k = self.apply_rotary_emb(&k, index_pos)?;
+        if index_pos == 0 {
+            self.kv_cache.reset();
+        }
+        if self.kv_f16 {
+            k = k.to_dtype(DType::F16)?;
+            v = v.to_dtype(DType::F16)?;
+        }
+        Ok((q, k, v))
+    }
+
+    /// [`Self::attend_selected`] for a prompt chunk whose kept tokens the card selected:
+    /// `sel` `[rows, room]` and `count` `[rows]` are on it.
+    #[cfg(feature = "cuda")]
+    fn attend_selected_card(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        sel: &Tensor,
+        count: &Tensor,
+    ) -> Result<Tensor> {
+        let (q, k, v) = self.selected_inputs(x, index_pos)?;
+        self.attend_rows_kept(x, &q, &k, &v, sel, count)
+    }
+
+    /// [`Self::attend_selected`] for a prompt chunk's rows, by one launch of the kernel that
+    /// attends each row over its own kept tokens in the F16 cache.
+    #[cfg(feature = "cuda")]
+    fn attend_selected_rows(
+        &mut self,
+        x: &Tensor,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        selection: &[Vec<u32>],
+    ) -> Result<Tensor> {
+        let seq = x.dim(1)?;
+        let ncap = selection.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let mut sel = vec![0u32; seq * ncap];
+        let mut count = Vec::with_capacity(seq);
+        for (r, row) in selection.iter().enumerate() {
+            sel[r * ncap..r * ncap + row.len()].copy_from_slice(row);
+            count.push(row.len() as u32);
+        }
+        let dev = q.device();
+        let sel = Tensor::from_vec(sel, (seq, ncap), &dev)?;
+        let count = Tensor::from_vec(count, (seq,), &dev)?;
+        self.attend_rows_kept(x, q, k, v, &sel, &count)
+    }
+
+    /// The rows' keys and values join the cache, and each row attends over the tokens `sel` and
+    /// `count` give it.
+    #[cfg(feature = "cuda")]
+    fn attend_rows_kept(
+        &mut self,
+        x: &Tensor,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        sel: &Tensor,
+        count: &Tensor,
+    ) -> Result<Tensor> {
+        let (b, seq, _) = x.dims3()?;
+        let (n_head, n_kv, hd) = (self.n_head, self.n_kv_head, self.head_dim);
+        self.kv_cache
+            .append_in_place(&k.contiguous()?, &v.contiguous()?)?;
+        let (Some(k_buf), Some(v_buf)) = (self.kv_cache.k_buffer(), self.kv_cache.v_buffer())
+        else {
+            crate::tensor::bail!("selected attention before the cache holds a token");
+        };
+        let cap = k_buf.dim(2)?;
+        let q = q
+            .to_dtype(DType::F32)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((seq, n_head * hd))?;
+        let scale = self
+            .attention_scale
+            .unwrap_or_else(|| 1.0 / (hd as f64).sqrt()) as f32;
+        let y = crate::inference::moe_cuda::selected_attention_rows(
+            &q, &k_buf, &v_buf, sel, count, n_head, n_kv, cap, hd, scale,
+        )?
+        .reshape((b, seq, n_head * hd))?;
+        let y = self.gate_attention(x, y)?;
+        self.attn_output.forward(&y)
     }
 
     /// The projected rows of `x` `[b, seq, hidden]`: queries, keys and values, as the
@@ -645,11 +771,21 @@ impl GenericTransformerLayer {
             let y = self.gate_attention(x, y)?;
             return self.attn_output.forward(&y);
         }
+        // A prompt's rows over an F16 cache of the shape the kernel serves are attended in one
+        // launch, each over its own kept tokens, with no block of scores in between.
+        #[cfg(feature = "cuda")]
+        if self.kv_f16
+            && b == 1
+            && seq > 1
+            && q.device().is_cuda()
+            && crate::inference::moe_cuda::selected_attention_rows_serves(hd, n_head, n_kv)
+        {
+            return self.attend_selected_rows(x, &q, &k, &v, selection);
+        }
         let (k_all, v_all) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
         let kv_len = k_all.dim(2)?;
         // The heads of a group read the same keys and values: they stand as extra rows of one
         // product per group, so the cache is read once and never repeated across its heads.
-        let (k_all, v_all) = (k_all.to_dtype(DType::F32)?, v_all.to_dtype(DType::F32)?);
         let scale = self
             .attention_scale
             .unwrap_or_else(|| 1.0 / (hd as f64).sqrt());
@@ -662,6 +798,10 @@ impl GenericTransformerLayer {
         let live_scores = SCORE_COPIES * n_head * kv_len * std::mem::size_of::<f32>();
         let block = (SCORE_BUDGET_BYTES / live_scores.max(1)).clamp(1, hyper::mixer_block_rows());
         let mut parts = Vec::with_capacity(seq.div_ceil(block));
+        // The scores and the sums over the cache's F16 keys and values run on the tensor cores:
+        // the operands carry no more than their ten bits, and the sums are F32.
+        #[cfg(feature = "cuda")]
+        let _tf32 = crate::tensor::cuda::Tf32Scope::enter();
         // The rank of a position in the union of what a block keeps, `u32::MAX` for a position
         // outside it.
         let mut rank = vec![u32::MAX; kv_len];
@@ -682,7 +822,9 @@ impl GenericTransformerLayer {
             for (r, &t) in union.iter().enumerate() {
                 rank[t as usize] = r as u32;
             }
-            let width = union.len();
+            // The width is a multiple of eight: the tensor cores take an aligned product, and
+            // the columns added to reach it are masked.
+            let width = union.len().next_multiple_of(8);
             let mut bias = vec![f32::MIN / 2.0; rows * width];
             for (row, kept) in bias.chunks_exact_mut(width).zip(kept) {
                 for &t in kept {
@@ -692,10 +834,14 @@ impl GenericTransformerLayer {
             for &t in &union {
                 rank[t as usize] = u32::MAX;
             }
+            union.resize(width, 0);
             let bias = Tensor::from_vec(bias, (1, 1, 1, rows, width), &q.device())?;
             let at = Tensor::from_vec(union, (width,), &q.device())?;
-            let k_u = k_all.index_select(&at, 2)?.transpose(2, 3)?;
-            let v_u = v_all.index_select(&at, 2)?;
+            let k_u = k_all
+                .index_select(&at, 2)?
+                .to_dtype(DType::F32)?
+                .transpose(2, 3)?;
+            let v_u = v_all.index_select(&at, 2)?.to_dtype(DType::F32)?;
             let q_rows =
                 q.narrow(2, first, rows)?
                     .contiguous()?

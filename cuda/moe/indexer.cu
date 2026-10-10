@@ -105,10 +105,16 @@ extern "C" __global__ void __launch_bounds__(128) loken_indexer_score_kernel(
         const float * __restrict__ q, const float * __restrict__ qgamma,
         const float * __restrict__ rot, const float * __restrict__ pooled,
         float * __restrict__ scores, const int * __restrict__ pos_dev, int pos_host, int heads,
-        int hd, int block, int half, float eps, float scale) {
+        int hd, int block, int half, float eps, float scale, int rot_stride, int scores_stride) {
     extern __shared__ float qn[];                 // heads * hd
     const int t = threadIdx.x;
-    const int pos = pos_dev ? *pos_dev : pos_host;
+    // A launch over the rows of a prompt chunk has one row of blocks of threads per row: the row's
+    // query, rotation tables and scores follow the previous row's, and its position is one more.
+    const int row = blockIdx.y;
+    q += (size_t) row * heads * hd;
+    rot += (size_t) row * rot_stride;
+    scores += (size_t) row * scores_stride;
+    const int pos = (pos_dev ? *pos_dev : pos_host) + row;
     const int complete = (pos + 1) / block;
     if ((int) (blockIdx.x * blockDim.x) >= complete) return;
     // the query heads, normalised and rotated
@@ -141,16 +147,20 @@ extern "C" __global__ void __launch_bounds__(128) loken_indexer_score_kernel(
 }
 
 extern "C" __global__ void __launch_bounds__(1024) loken_indexer_pick_kernel(
-        const float * __restrict__ scores, uint32_t * __restrict__ sel,
-        uint32_t * __restrict__ count, const int * __restrict__ pos_dev, int pos_host, int block,
-        int budget) {
+        const float * __restrict__ scores_in, uint32_t * __restrict__ sel_in,
+        uint32_t * __restrict__ count_in, const int * __restrict__ pos_dev, int pos_host, int block,
+        int budget, int scores_stride, int sel_stride) {
+    const int row = blockIdx.x;
+    const float * __restrict__ scores = scores_in + (size_t) row * scores_stride;
+    uint32_t * __restrict__ sel = sel_in + (size_t) row * sel_stride;
+    uint32_t * __restrict__ count = count_in + row;
     __shared__ uint32_t hist[256];
     __shared__ int scan_a[1024], scan_b[1024];
     __shared__ uint32_t s_prefix, s_mask;
     __shared__ int s_remaining;
     const int nt = blockDim.x;
     const int t = threadIdx.x;
-    const int pos = pos_dev ? *pos_dev : pos_host;
+    const int pos = (pos_dev ? *pos_dev : pos_host) + row;
     const int visible = pos + 1;
     const int complete = visible / block;
     const int take = complete < budget ? complete : budget;
@@ -250,12 +260,13 @@ extern "C" void loken_indexer_select(
         const float * q, const float * qgamma, const float * rot, const float * pooled,
         float * scores, uint32_t * sel, uint32_t * count, const int * pos_dev, int pos_host,
         int heads, int hd, int block, int budget, int half, float eps, float scale,
-        int max_blocks, cudaStream_t stream) {
-    loken_indexer_score_kernel<<<(max_blocks + 127) / 128, 128, heads * hd * sizeof(float),
-                                 stream>>>(
-        q, qgamma, rot, pooled, scores, pos_dev, pos_host, heads, hd, block, half, eps, scale);
-    loken_indexer_pick_kernel<<<1, 1024, 0, stream>>>(
-        scores, sel, count, pos_dev, pos_host, block, budget);
+        int max_blocks, int rows, int rot_stride, int sel_stride, cudaStream_t stream) {
+    loken_indexer_score_kernel<<<dim3((max_blocks + 127) / 128, rows), 128,
+                                 heads * hd * sizeof(float), stream>>>(
+        q, qgamma, rot, pooled, scores, pos_dev, pos_host, heads, hd, block, half, eps, scale,
+        rot_stride, max_blocks);
+    loken_indexer_pick_kernel<<<rows, 1024, 0, stream>>>(
+        scores, sel, count, pos_dev, pos_host, block, budget, max_blocks, sel_stride);
 }
 
 // Rows `[n, hd]` row by row into the pooled keys' groups from block `first`, and back.
@@ -485,4 +496,175 @@ extern "C" void loken_selected_attn(
         cap, hd, chunk_max, splits, scale);
     loken_selected_attn_join_kernel<<<n_head, hd < 1024 ? hd : 1024, 0, stream>>>(
         part_o, part_ml, out, hd, splits);
+}
+
+// Attention of the rows of a prompt chunk, each over its own kept tokens. A block takes one row and
+// one key-value head and serves the whole group of query heads that share it, so the keys and
+// values of the row's kept tokens are read once for the group: thirty-two tokens at a time are
+// gathered into shared memory, scored for every head of the group on the tensor cores, folded into
+// each head's running softmax, and their values summed on the tensor cores too. A query and a
+// probability are each split into a high and a low half, so that the products keep the precision
+// of F32 while the keys and values, F16 already, are exact. `q` is `[rows, n_head, 256]` F32,
+// already rotated; `kbuf` and `vbuf` are `[n_kv, cap, 256]` F16; row `r` keeps
+// `sel[r * ncap .. + count[r]]`; the answer is `[rows, n_head, 256]` F32.
+#include <mma.h>
+
+#define SELROWS_HD 256
+#define SELROWS_CELLS 32
+#define SELROWS_LD (SELROWS_HD + 8)        // halves a shared row of keys, values or queries
+#define SELROWS_PLD 36                     // floats a row of partial scores
+#define SELROWS_PHLD (SELROWS_CELLS + 8)   // halves a row of probabilities
+#define SELROWS_TLD (SELROWS_HD + 4)       // floats a row of the values' weighted sum
+#define SELROWS_GMAX 16
+
+// Bytes of shared memory a block needs.
+#define SELROWS_SMEM (2 * 16 * SELROWS_LD * 2 + 2 * SELROWS_CELLS * SELROWS_LD * 2 \
+                      + 16 * SELROWS_TLD * 4 + 2 * 16 * SELROWS_PHLD * 2 + 3 * 16 * 4)
+
+extern "C" __global__ void __launch_bounds__(256) loken_selected_attn_rows_kernel(
+        const float * __restrict__ q, const __half * __restrict__ kbuf,
+        const __half * __restrict__ vbuf, const uint32_t * __restrict__ sel,
+        const uint32_t * __restrict__ count, float * __restrict__ out, int n_head, int n_kv,
+        int cap, int ncap, float scale) {
+    using namespace nvcuda;
+    extern __shared__ __align__(128) unsigned char raw[];
+    const int g = n_head / n_kv;
+    __half * qh = (__half *) raw;                                   // [16][LD] query, high half
+    __half * ql = qh + 16 * SELROWS_LD;                             // [16][LD] query, low half
+    __half * ks = ql + 16 * SELROWS_LD;                             // [CELLS][LD]
+    __half * vs = ks + SELROWS_CELLS * SELROWS_LD;                  // [CELLS][LD]
+    float * work = (float *) (vs + SELROWS_CELLS * SELROWS_LD);     // partial scores, then the sums
+    __half * ph = (__half *) (work + 16 * SELROWS_TLD);             // [16][PHLD] probabilities
+    __half * pl = ph + 16 * SELROWS_PHLD;
+    float * stats = (float *) (pl + 16 * SELROWS_PHLD);             // m[16], l[16], alpha[16]
+    const int row = blockIdx.x, kvh = blockIdx.y, t = threadIdx.x;
+    const int warp = t >> 5;
+    const int n = (int) count[row];
+    const float * qrow = q + ((size_t) row * n_head + (size_t) kvh * g) * SELROWS_HD;
+    for (int i = t; i < 16 * SELROWS_HD; i += 256) {
+        const int h = i / SELROWS_HD, d = i % SELROWS_HD;
+        float v = h < g ? qrow[(size_t) h * SELROWS_HD + d] * scale : 0.f;
+        const __half hi = __float2half(v);
+        qh[h * SELROWS_LD + d] = hi;
+        ql[h * SELROWS_LD + d] = __float2half(v - __half2float(hi));
+    }
+    for (int i = t; i < 16 * SELROWS_PHLD; i += 256) {
+        ph[i] = __float2half(0.f);
+        pl[i] = __float2half(0.f);
+    }
+    if (t < 16) {
+        stats[t] = __int_as_float(0xff800000);
+        stats[16 + t] = 0.f;
+        stats[32 + t] = 0.f;
+    }
+    float acc[SELROWS_GMAX];
+#pragma unroll
+    for (int h = 0; h < SELROWS_GMAX; ++h) acc[h] = 0.f;
+    const __half * kh = kbuf + (size_t) kvh * cap * SELROWS_HD;
+    const __half * vh = vbuf + (size_t) kvh * cap * SELROWS_HD;
+    const uint32_t * mine = sel + (size_t) row * ncap;
+    for (int base = 0; base < n; base += SELROWS_CELLS) {
+        const int cnt = n - base < SELROWS_CELLS ? n - base : SELROWS_CELLS;
+        __syncthreads();
+        for (int i = t; i < SELROWS_CELLS * 32; i += 256) {
+            const int c = i >> 5, v4 = i & 31;
+            if (c < cnt) {
+                const size_t at = (size_t) mine[base + c] * SELROWS_HD;
+                ((uint4 *) (ks + c * SELROWS_LD))[v4] = ((const uint4 *) (kh + at))[v4];
+                ((uint4 *) (vs + c * SELROWS_LD))[v4] = ((const uint4 *) (vh + at))[v4];
+            } else {
+                // a cell the tile lacks weighs nothing; its values must still be numbers
+                ((uint4 *) (ks + c * SELROWS_LD))[v4] = make_uint4(0, 0, 0, 0);
+                ((uint4 *) (vs + c * SELROWS_LD))[v4] = make_uint4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+        // the scores: warp w takes the cells [16 (w & 1), +16) and the dimensions [64 (w >> 1), +64)
+        {
+            const int nt = warp & 1, kg = warp >> 1;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc;
+            wmma::fill_fragment(fc, 0.f);
+#pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                const int d0 = (kg * 4 + step) * 16;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fb, ks + (nt * 16) * SELROWS_LD + d0, SELROWS_LD);
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                wmma::load_matrix_sync(fa, qh + d0, SELROWS_LD);
+                wmma::mma_sync(fc, fa, fb, fc);
+                wmma::load_matrix_sync(fa, ql + d0, SELROWS_LD);
+                wmma::mma_sync(fc, fa, fb, fc);
+            }
+            wmma::store_matrix_sync(work + kg * 16 * SELROWS_PLD + nt * 16, fc, SELROWS_PLD,
+                                    wmma::mem_row_major);
+        }
+        __syncthreads();
+        if (t < g) {
+            float s[SELROWS_CELLS];
+            float m = stats[t];
+            for (int c = 0; c < cnt; ++c) {
+                s[c] = 0.f;
+                for (int kg = 0; kg < 4; ++kg) s[c] += work[kg * 16 * SELROWS_PLD + t * SELROWS_PLD + c];
+                m = fmaxf(m, s[c]);
+            }
+            const float alpha = expf(stats[t] - m);
+            float l = stats[16 + t] * alpha;
+            for (int c = 0; c < SELROWS_CELLS; ++c) {
+                const float p = c < cnt ? expf(s[c] - m) : 0.f;
+                const __half hi = __float2half(p);
+                ph[t * SELROWS_PHLD + c] = hi;
+                pl[t * SELROWS_PHLD + c] = __float2half(p - __half2float(hi));
+                l += p;
+            }
+            stats[t] = m;
+            stats[16 + t] = l;
+            stats[32 + t] = alpha;
+        }
+        __syncthreads();
+        // the weighted values of the tile: warp w takes the dimensions [32 w, +32)
+        {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> f0, f1;
+            wmma::fill_fragment(f0, 0.f);
+            wmma::fill_fragment(f1, 0.f);
+#pragma unroll
+            for (int step = 0; step < 2; ++step) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fh, fl;
+                wmma::load_matrix_sync(fh, ph + step * 16, SELROWS_PHLD);
+                wmma::load_matrix_sync(fl, pl + step * 16, SELROWS_PHLD);
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fb;
+                wmma::load_matrix_sync(fb, vs + (step * 16) * SELROWS_LD + warp * 32, SELROWS_LD);
+                wmma::mma_sync(f0, fh, fb, f0);
+                wmma::mma_sync(f0, fl, fb, f0);
+                wmma::load_matrix_sync(fb, vs + (step * 16) * SELROWS_LD + warp * 32 + 16, SELROWS_LD);
+                wmma::mma_sync(f1, fh, fb, f1);
+                wmma::mma_sync(f1, fl, fb, f1);
+            }
+            wmma::store_matrix_sync(work + warp * 32, f0, SELROWS_TLD, wmma::mem_row_major);
+            wmma::store_matrix_sync(work + warp * 32 + 16, f1, SELROWS_TLD, wmma::mem_row_major);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < SELROWS_GMAX; ++h)
+            if (h < g) acc[h] = acc[h] * stats[32 + h] + work[h * SELROWS_TLD + t];
+    }
+    __syncthreads();
+    float * orow = out + ((size_t) row * n_head + (size_t) kvh * g) * SELROWS_HD;
+#pragma unroll
+    for (int h = 0; h < SELROWS_GMAX; ++h) {
+        if (h < g) {
+            const float l = stats[16 + h];
+            orow[h * SELROWS_HD + t] = l > 0.f ? acc[h] / l : 0.f;
+        }
+    }
+}
+
+extern "C" void loken_selected_attn_rows(
+        const float * q, const void * kbuf, const void * vbuf, const uint32_t * sel,
+        const uint32_t * count, float * out, int rows, int n_head, int n_kv, int cap, int ncap,
+        float scale, cudaStream_t stream) {
+    cudaFuncSetAttribute(loken_selected_attn_rows_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int) SELROWS_SMEM);
+    loken_selected_attn_rows_kernel<<<dim3(rows, n_kv), 256, SELROWS_SMEM, stream>>>(
+        q, (const __half *) kbuf, (const __half *) vbuf, sel, count, out, n_head, n_kv, cap, ncap,
+        scale);
 }

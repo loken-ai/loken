@@ -6,6 +6,33 @@ use super::*;
 
 pub fn gemm_reduced_precision_f32() -> bool {
     MM_F32_REDUCED.load(std::sync::atomic::Ordering::Relaxed)
+        || TF32_SCOPE.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    static TF32_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, the F32 matmuls of this thread run with TF32 tensor-core math: inputs rounded to
+/// ten mantissa bits, sums in F32. For products whose operands are already that precise, such as
+/// the scores of an attention over an F16 cache, where the global switch would also touch the
+/// projections around them.
+pub struct Tf32Scope {
+    previous: bool,
+}
+
+impl Tf32Scope {
+    pub fn enter() -> Self {
+        Self {
+            previous: TF32_SCOPE.with(|s| s.replace(true)),
+        }
+    }
+}
+
+impl Drop for Tf32Scope {
+    fn drop(&mut self) {
+        TF32_SCOPE.with(|s| s.set(self.previous));
+    }
 }
 /// API-compat: allow fp16 accumulation in f16 GEMMs.
 pub fn set_gemm_reduced_precision_f16(b: bool) {

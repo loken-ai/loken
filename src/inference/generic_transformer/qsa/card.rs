@@ -7,10 +7,18 @@
 
 use super::*;
 use crate::inference::moe_cuda::{
-    address_f32, indexer_append, indexer_rows_in, indexer_rows_out, indexer_select, IndexerShape,
-    StepPos,
+    address_f32, indexer_append, indexer_rows_in, indexer_rows_out, indexer_select,
+    indexer_select_rows, IndexerShape, StepPos,
 };
 use crate::tensor::Device;
+
+/// What the card made of a prompt chunk's rows.
+pub enum CardPick {
+    /// The context still fits the budget: attention is dense.
+    Dense,
+    /// The tokens each row keeps, ascending: `sel` `[rows, room]` and how many, `count` `[rows]`.
+    Kept { sel: Tensor, count: Tensor },
+}
 
 /// The card side of one layer's indexer.
 pub struct CardIndexer {
@@ -292,6 +300,75 @@ impl SparseAttention {
         Ok(())
     }
 
+    /// Take in the rows `x` `[1, seq, hidden]` of a prompt chunk starting at `index_pos`, and
+    /// select on the card the tokens each row attends to. The keys join the host's cache as in
+    /// [`Self::observe`], and the card takes over the blocks they complete; the rows' queries
+    /// never leave the card, which scores each row against the blocks complete by its position
+    /// with the arithmetic of the host's, and keeps the blocks the host keeps.
+    pub fn observe_on_card(&mut self, x: &Tensor, index_pos: usize) -> Result<CardPick> {
+        let (_, seq, _) = x.dims3()?;
+        let m = self.meta;
+        let x = &x.to_dtype(DType::F32)?;
+        if index_pos == 0 {
+            self.cache.clear();
+            self.forget_card();
+        }
+        self.sync_host_from_card(index_pos)?;
+        if self.cache.len() != index_pos {
+            return Err(crate::tensor::Error::msg(format!(
+                "indexer holds {} tokens but the forward starts at {index_pos}",
+                self.cache.len()
+            )));
+        }
+        let keys: Vec<f32> = self
+            .k_proj
+            .forward(x)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        self.cache
+            .append(&keys, &m, &self.k_gamma, self.eps, &self.rope);
+        self.truncate_card(index_pos);
+        if self.dense_for(index_pos + seq) {
+            return Ok(CardPick::Dense);
+        }
+        let dev = x.device().clone();
+        self.attach_card(&dev, index_pos + seq)?;
+        self.card_room_for(index_pos + seq)?;
+        self.card_hold(index_pos + seq)?;
+        let q = self
+            .q_proj
+            .forward(x)?
+            .to_dtype(DType::F32)?
+            .contiguous()?
+            .reshape((seq, m.heads * m.head_dim))?;
+        let mut tables = Vec::with_capacity(seq * 2 * self.rope.half());
+        for i in 0..seq {
+            tables.extend(self.rope.table(index_pos + i));
+        }
+        let rot =
+            Tensor::from_vec(tables, (seq, 2 * self.rope.half()), &Device::Cpu)?.to_device(&dev)?;
+        let Some(card) = self.card.as_ref() else {
+            crate::tensor::bail!("the indexer has no cache on a card");
+        };
+        let max_blocks = card.pooled.dim(0)? * 32;
+        let scores = Tensor::zeros_on((seq * max_blocks,), DType::F32, &dev)?;
+        let sel = Tensor::zeros_on((seq, m.top_k + m.block), DType::U32, &dev)?;
+        let count = Tensor::zeros_on((seq,), DType::U32, &dev)?;
+        indexer_select_rows(
+            &q,
+            &card.q_gamma,
+            &rot,
+            &card.pooled,
+            &scores,
+            &sel,
+            &count,
+            index_pos,
+            &card.shape,
+        )?;
+        Ok(CardPick::Kept { sel, count })
+    }
+
     /// The tokens the last card step kept, and how many.
     pub fn card_selection(&self) -> Result<(&Tensor, &Tensor)> {
         match self.card.as_ref() {
@@ -497,6 +574,65 @@ mod tests {
             block: 4,
         };
         assert_eq!(disagreements(meta, 10000.0, 1000, 700), Vec::<usize>::new());
+    }
+
+    /// A prompt read in chunks keeps on the card the tokens the host keeps, row by row.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn the_card_keeps_the_tokens_of_a_prompt_chunk_the_host_keeps() {
+        let dev = Device::new_cuda(0).expect("a card for the card test");
+        for (meta, base, period) in [
+            (
+                IndexerMeta {
+                    heads: 4,
+                    head_dim: 128,
+                    top_k: 256,
+                    block: 4,
+                },
+                10000.0,
+                1000,
+            ),
+            // Nothing rotates and the row repeats: most scores tie.
+            (
+                IndexerMeta {
+                    heads: 3,
+                    head_dim: 16,
+                    top_k: 16,
+                    block: 4,
+                },
+                1e30,
+                8,
+            ),
+        ] {
+            let mut host = indexer(meta, base, &dev);
+            let mut card = indexer(meta, base, &dev);
+            let (chunk, mut pos) = (37usize, 0usize);
+            while pos < 400 {
+                let rows: Vec<Tensor> = (pos..pos + chunk)
+                    .map(|t| token_row(t, period, &dev))
+                    .collect();
+                let x = Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1).unwrap();
+                match (
+                    host.observe(&x, pos).unwrap(),
+                    card.observe_on_card(&x, pos).unwrap(),
+                ) {
+                    (None, CardPick::Dense) => {}
+                    (Some(want), CardPick::Kept { sel, count }) => {
+                        let sel = sel.to_vec2::<u32>().unwrap();
+                        let count = count.to_vec1::<u32>().unwrap();
+                        for (r, want) in want.iter().enumerate() {
+                            assert_eq!(
+                                &sel[r][..count[r] as usize],
+                                &want[..],
+                                "row {r} of the chunk at {pos}"
+                            );
+                        }
+                    }
+                    _ => panic!("the host and the card disagree on dense attention at {pos}"),
+                }
+                pos += chunk;
+            }
+        }
     }
 
     #[test]

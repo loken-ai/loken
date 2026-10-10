@@ -128,6 +128,55 @@ pub fn indexer_select(
             shape.eps,
             scale,
             scores.elem_count() as i32,
+            1,
+            0,
+            0,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// [`indexer_select`] for the rows of a prompt chunk, the first at position `first`: `q` is
+/// `[rows, heads * hd]` raw, `rot` `[rows, 2 * half]` the tables of each row's position, `scores`
+/// room for `rows` times one score per block, `sel` `[rows, room]` and `count` `[rows]`.
+#[allow(clippy::too_many_arguments)]
+pub fn indexer_select_rows(
+    q: &Tensor,
+    gamma: &Tensor,
+    rot: &Tensor,
+    pooled: &Tensor,
+    scores: &Tensor,
+    sel: &Tensor,
+    count: &Tensor,
+    first: usize,
+    shape: &IndexerShape,
+) -> Result<()> {
+    let stream = stream_of_card(q)?;
+    let rows = q.dim(0)?;
+    let scale = 1.0 / (shape.hd as f32).sqrt();
+    unsafe {
+        loken_indexer_select(
+            address::<f32>(q, "q")? as *const f32,
+            address::<f32>(gamma, "gamma")? as *const f32,
+            address::<f32>(rot, "rot")? as *const f32,
+            address::<f32>(pooled, "pooled")? as *const f32,
+            address::<f32>(scores, "scores")? as *mut f32,
+            address::<u32>(sel, "sel")? as *mut u32,
+            address::<u32>(count, "count")? as *mut u32,
+            std::ptr::null(),
+            first as i32,
+            shape.heads as i32,
+            shape.hd as i32,
+            shape.block as i32,
+            shape.budget as i32,
+            shape.half as i32,
+            shape.eps,
+            scale,
+            (scores.elem_count() / rows.max(1)) as i32,
+            rows as i32,
+            (2 * shape.half) as i32,
+            sel.dim(1)? as i32,
             stream,
         );
     }
@@ -257,6 +306,59 @@ pub fn selected_attention(
     )
 }
 
+/// Whether [`selected_attention_rows`] serves heads of width `hd`, `n_head` query heads over
+/// `n_kv` key-value heads.
+pub fn selected_attention_rows_serves(hd: usize, n_head: usize, n_kv: usize) -> bool {
+    hd == 256 && n_kv > 0 && n_head % n_kv == 0 && n_head / n_kv <= 16
+}
+
+/// Attention of the rows of a prompt chunk, each over its own kept tokens, in one launch: `q` is
+/// `[rows, n_head * hd]` F32, already rotated; the F16 cache buffers are `[n_kv, cap, hd]`; row `r`
+/// keeps `sel[r]` `[rows, ncap]` up to `count[r]`; the answer is `[rows, n_head * hd]` F32.
+#[allow(clippy::too_many_arguments)]
+pub fn selected_attention_rows(
+    q: &Tensor,
+    kbuf: &Tensor,
+    vbuf: &Tensor,
+    sel: &Tensor,
+    count: &Tensor,
+    n_head: usize,
+    n_kv: usize,
+    cap: usize,
+    hd: usize,
+    scale: f32,
+) -> Result<Tensor> {
+    if !selected_attention_rows_serves(hd, n_head, n_kv) {
+        crate::tensor::bail!("selected attention over rows: {n_head} heads of {hd} over {n_kv}");
+    }
+    let dev = q.device().as_cuda_device()?;
+    let stream = stream_of_card(q)?;
+    let rows = q.dim(0)?;
+    let ncap = sel.dim(1)?;
+    let out = unsafe { dev.alloc::<f32>(rows * n_head * hd) }?;
+    unsafe {
+        loken_selected_attn_rows(
+            address::<f32>(q, "q")? as *const f32,
+            address::<half::f16>(kbuf, "kbuf")? as *const c_void,
+            address::<half::f16>(vbuf, "vbuf")? as *const c_void,
+            address::<u32>(sel, "sel")? as *const u32,
+            address::<u32>(count, "count")? as *const u32,
+            out.device_ptr(out.stream()).0 as *mut f32,
+            rows as i32,
+            n_head as i32,
+            n_kv as i32,
+            cap as i32,
+            ncap as i32,
+            scale,
+            stream,
+        );
+    }
+    tensor_from_cuda_storage(
+        CudaStorage::wrap_cuda_slice(out, dev.clone()),
+        crate::tensor::Shape::from((rows, n_head * hd)),
+    )
+}
+
 /// Tokens one block of the attention scores and weighs.
 const ATTENTION_RUN_TOKENS: usize = 128;
 
@@ -374,6 +476,72 @@ mod tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0f32, f32::max);
             assert!(diff < 2e-4, "{n_head} heads, {n} tokens: differs by {diff}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn the_selected_attention_of_rows_matches_a_host_reference_row_by_row() {
+        let dev = Device::new_cuda(0).expect("a card for the card test");
+        let (n_head, n_kv, hd, cap, rows) = (24usize, 2usize, 256usize, 700usize, 37usize);
+        let q: Vec<f32> = (0..rows * n_head * hd).map(|i| pseudo(i, 1)).collect();
+        let kv = |seed: usize| -> Vec<half::f16> {
+            (0..n_kv * cap * hd)
+                .map(|i| half::f16::from_f32(pseudo(i, seed)))
+                .collect()
+        };
+        let (k, v) = (kv(2), kv(3));
+        // Row r keeps a different, unordered run of the cache: from one token to several hundred.
+        let kept: Vec<Vec<u32>> = (0..rows)
+            .map(|r| {
+                let n = 1 + (r * r * 7 + 13 * r) % 300;
+                (0..n as u32)
+                    .map(|j| (j * 5 + r as u32 * 3) % cap as u32)
+                    .collect()
+            })
+            .collect();
+        let ncap = kept.iter().map(Vec::len).max().unwrap();
+        let mut sel = vec![0u32; rows * ncap];
+        for (r, row) in kept.iter().enumerate() {
+            sel[r * ncap..r * ncap + row.len()].copy_from_slice(row);
+        }
+        let count: Vec<u32> = kept.iter().map(|k| k.len() as u32).collect();
+        let on = |t: Tensor| t.to_device(&dev).unwrap();
+        let tq = on(Tensor::from_vec(q.clone(), (rows, n_head * hd), &Device::Cpu).unwrap());
+        let tk = on(Tensor::from_vec(k.clone(), (n_kv, cap, hd), &Device::Cpu).unwrap());
+        let tv = on(Tensor::from_vec(v.clone(), (n_kv, cap, hd), &Device::Cpu).unwrap());
+        let tsel = on(Tensor::from_vec(sel, (rows, ncap), &Device::Cpu).unwrap());
+        let tcount = on(Tensor::from_vec(count, (rows,), &Device::Cpu).unwrap());
+        let scale = 1.0 / (hd as f32).sqrt();
+        let got =
+            selected_attention_rows(&tq, &tk, &tv, &tsel, &tcount, n_head, n_kv, cap, hd, scale)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+        for (r, row) in kept.iter().enumerate() {
+            let want = reference(
+                &q[r * n_head * hd..(r + 1) * n_head * hd],
+                &k,
+                &v,
+                row,
+                n_head,
+                n_kv,
+                cap,
+                hd,
+                scale,
+            );
+            let diff = got[r * n_head * hd..(r + 1) * n_head * hd]
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                diff < 2e-4,
+                "row {r} of {} kept tokens differs by {diff}",
+                row.len()
+            );
         }
     }
 
