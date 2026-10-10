@@ -1044,10 +1044,7 @@ impl LayerTier {
     ) -> Result<Tensor> {
         let started = std::time::Instant::now();
         // A recorded decode takes the layer through the card's kernels alone.
-        if self.graph_ready()
-            && (crate::tensor::cuda_ext::capture_active(&xs.device())
-                || GRAPH_WITHOUT_CAPTURE.load(Ordering::Relaxed))
-        {
+        if self.records(&xs.device()) {
             return self.decode_graph(moe, xs, ids, weights);
         }
         let out = self.decode_token(moe, xs, ids, weights);

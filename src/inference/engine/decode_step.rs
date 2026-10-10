@@ -577,6 +577,33 @@ pub(crate) fn record_logprobs(
 
 #[cfg(test)]
 mod tests {
+    /// A replay that picks the other of two logits the eager step has within the numerical
+    /// noise between them agrees with it; one whose logits are not the eager step's does not.
+    #[test]
+    fn a_replay_agrees_through_a_near_tie_and_not_through_a_fault() {
+        let eager: Vec<f32> = (0..1000).map(|i| (i % 17) as f32 - 8.0).collect();
+        let mut top_two = eager.clone();
+        top_two[3] = 20.0;
+        top_two[4] = 19.999;
+        let mut flipped = top_two.clone();
+        flipped[3] = 19.998;
+        flipped[4] = 20.001;
+        assert!(replay_agrees(&flipped, &top_two));
+        assert!(replay_agrees(&top_two, &top_two));
+        let mut wrong = top_two.clone();
+        wrong[3] = 19.0;
+        wrong[4] = 20.0;
+        wrong.iter_mut().step_by(2).for_each(|v| *v += 5.0);
+        assert!(!replay_agrees(&wrong, &top_two));
+        let mut far = top_two.clone();
+        far[3] = 5.0;
+        far[4] = 20.0;
+        assert!(
+            !replay_agrees(&far, &top_two),
+            "a gap larger than the noise"
+        );
+    }
+
     use super::*;
 
     /// A request starts from what the earlier ones learned: the costs and the longer wait, with a
@@ -757,3 +784,42 @@ mod tests {
         assert_eq!(t.matched(), Some("<|end|>"));
     }
 }
+
+/// Whether the logits of a replayed graph step agree with the eager step over the same token:
+/// the same top token, or a different one where the eager step has the two within what separates
+/// the two computations everywhere (the host's dot products and the card's differ in their last
+/// bits) and the two logit vectors are the same to within [`REPLAY_RELATIVE_ERROR`] of the eager
+/// norm. A replay that is wrong does not pass the second condition.
+pub(crate) fn replay_agrees(graph: &[f32], eager: &[f32]) -> bool {
+    if graph.len() != eager.len() || eager.is_empty() {
+        return false;
+    }
+    let top = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| {
+                if x > b.1 {
+                    (i, x)
+                } else {
+                    b
+                }
+            })
+            .0
+    };
+    let (a, b) = (top(graph), top(eager));
+    if a == b {
+        return true;
+    }
+    let (mut worst, mut diff2, mut norm2) = (0f32, 0f64, 0f64);
+    for (g, e) in graph.iter().zip(eager) {
+        let d = (g - e).abs();
+        worst = worst.max(d);
+        diff2 += (d as f64) * (d as f64);
+        norm2 += (*e as f64) * (*e as f64);
+    }
+    diff2.sqrt() <= REPLAY_RELATIVE_ERROR * norm2.sqrt() && eager[b] - eager[a] <= 2.0 * worst
+}
+
+/// The relative distance between a replay's logits and the eager step's, from which a replay is
+/// not trusted: the tolerance the tier's expert outputs are checked at.
+const REPLAY_RELATIVE_ERROR: f64 = 2e-2;

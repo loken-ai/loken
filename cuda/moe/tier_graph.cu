@@ -30,32 +30,37 @@ extern "C" __global__ void loken_tier_plan_kernel(
         int k, int hidden) {
     __shared__ unsigned int seq;
     __shared__ unsigned int filler;
+    __shared__ int slot_of[32];
     const int t = threadIdx.x;
+    // The cache's table lives in page-locked memory, a read of it crosses the bus: the experts of
+    // the choice are looked up together, one thread each.
+    if (t < k && t < 32) slot_of[t] = ((const volatile int *) table)[ids[t]];
+    __syncthreads();
     if (t == 0) {
         seq = *counter + 1;
         *counter = seq;
         // A missing expert's pair reads a slot the card holds an expert in, at weight zero: the
-        // first of the choice's slots, or the first slot when it has none.
+        // first of the choice's slots, or the first slot when it has none. The host's reply is
+        // waited for only when some expert of the choice is missing.
         unsigned int f = 0;
         bool found = false;
-        for (int i = 0; i < k && !found; ++i) {
-            const int s = ((const volatile int *) table)[ids[i]];
-            if (s >= 0) { f = (unsigned int) s; found = true; }
+        unsigned int missing = 0u;
+        for (int i = 0; i < k; ++i) {
+            if (slot_of[i] >= 0) {
+                if (!found) { f = (unsigned int) slot_of[i]; found = true; }
+            } else {
+                missing = 1u;
+            }
         }
         filler = f;
-        // The host's reply is waited for only when some expert of the choice is missing.
-        counter[1] = 0u;
-        for (int i = 0; i < k; ++i) {
-            if (((const volatile int *) table)[ids[i]] < 0) counter[1] = 1u;
-        }
+        counter[1] = missing;
     }
     __syncthreads();
     if (t < k) {
-        const unsigned int e = ids[t];
-        const int s = ((const volatile int *) table)[e];
+        const int s = slot_of[t];
         slot_out[t] = s >= 0 ? (unsigned int) s : filler;
         weight_out[t] = s >= 0 ? weights[t] : 0.0f;
-        mail_ids[t] = e;
+        mail_ids[t] = ids[t];
         mail_weights[t] = weights[t];
         mail_slots[t] = s >= 0 ? (unsigned int) s : 0xFFFFFFFFu;
     }

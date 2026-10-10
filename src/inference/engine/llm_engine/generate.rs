@@ -1099,7 +1099,7 @@ impl LlmEngine {
                                 // without sync, the next kernel's read may
                                 // race with graph ops or hit freed memory.
                                 if let Some(Some(ref stream)) = cuda_stream {
-                                    let _ = stream.synchronize();
+                                    let _ = crate::tensor::cuda_ext::synchronize_yielding(stream);
                                 }
                                 // Probation self-validation (gptoss-style):
                                 // each of the first GRAPH_VALIDATIONS replays
@@ -1113,6 +1113,9 @@ impl LlmEngine {
                                 // of the request eagerly - a resurrected
                                 // graph path can never emit replay garbage.
                                 if graph_validations < GRAPH_VALIDATIONS {
+                                    let rep_logits: Option<Vec<f32>> = logits_ref
+                                        .flatten_all().ok()
+                                        .and_then(|t| t.to_vec1::<f32>().ok());
                                     let rep_argmax: Option<u32> = logits_ref
                                         .flatten_all().ok()
                                         .and_then(|t| t.argmax(0).ok())
@@ -1130,7 +1133,15 @@ impl LlmEngine {
                                             }
                                             let eag_argmax = eag.flatten_all()?
                                                 .argmax(0)?.to_scalar::<u32>()?;
-                                            if rep_argmax == Some(eag_argmax) {
+                                            let agrees = rep_argmax == Some(eag_argmax)
+                                                || rep_logits.as_ref().is_some_and(|g| {
+                                                    eag.flatten_all()
+                                                        .and_then(|t| t.to_vec1::<f32>())
+                                                        .is_ok_and(|e| {
+                                                            crate::inference::engine::decode_step::replay_agrees(g, &e)
+                                                        })
+                                                });
+                                            if agrees {
                                                 graph_validations += 1;
                                             } else {
                                                 warn!("CUDA graph replay!=eager at pos={pos} (argmax {:?} vs {}); discarding graph, eager decode for rest of request",

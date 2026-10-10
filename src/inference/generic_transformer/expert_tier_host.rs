@@ -42,6 +42,10 @@ impl LayerTier {
         false
     }
 
+    pub(crate) fn records(&self, _: &Device) -> bool {
+        false
+    }
+
     pub fn counters(&self) -> (u64, u64, u64) {
         (0, 0, 0)
     }

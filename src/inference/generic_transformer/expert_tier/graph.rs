@@ -215,6 +215,32 @@ impl Drop for Mailbox {
     }
 }
 
+/// What the requests of every layer cost the host, since the load.
+struct WorkerStats {
+    requests: std::sync::atomic::AtomicU64,
+    ns: std::sync::atomic::AtomicU64,
+    /// Requests with a missing expert, the experts they were missing, and the nanoseconds their
+    /// products took.
+    missed: std::sync::atomic::AtomicU64,
+    missing: std::sync::atomic::AtomicU64,
+    product_ns: std::sync::atomic::AtomicU64,
+}
+
+static WORKER: WorkerStats = WorkerStats {
+    requests: std::sync::atomic::AtomicU64::new(0),
+    ns: std::sync::atomic::AtomicU64::new(0),
+    missed: std::sync::atomic::AtomicU64::new(0),
+    missing: std::sync::atomic::AtomicU64::new(0),
+    product_ns: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// A layer's decoded token between the post of its request and the wait for the answer.
+pub(crate) struct GraphPending {
+    card: Tensor,
+    hidden: usize,
+    dev: Device,
+}
+
 /// A layer's side of the graph decode: the mailbox, the buffers the kernels write on the card,
 /// and the number of the last request the host answered.
 pub(super) struct GraphSide {
@@ -223,16 +249,13 @@ pub(super) struct GraphSide {
     slots: Tensor,
     weights: Tensor,
     done: AtomicU32,
-    /// Requests served, the nanoseconds they took, and how many had a missing expert.
-    requests: std::sync::atomic::AtomicU64,
-    worker_ns: std::sync::atomic::AtomicU64,
-    missed: std::sync::atomic::AtomicU64,
 }
 
 impl LayerTier {
     /// Let this layer's decoded token run as kernels alone, served by a [`TierWorker`].
     pub(super) fn enable_graph(&self, hidden: usize, k: usize) -> Result<()> {
-        if self.graph.get().is_some() || self.resident {
+        // The plan kernel looks a choice up with one thread per expert of a warp.
+        if self.graph.get().is_some() || self.resident || k > 32 {
             return Ok(());
         }
         let host = Device::Cpu;
@@ -247,12 +270,17 @@ impl LayerTier {
             slots: Tensor::from_vec(vec![0u32; k], (k,), &host)?.to_device(dev)?,
             weights: Tensor::from_vec(vec![0f32; k], (1, k), &host)?.to_device(dev)?,
             done: AtomicU32::new(0),
-            requests: Default::default(),
-            worker_ns: Default::default(),
-            missed: Default::default(),
         };
         let _ = self.graph.set(side);
         Ok(())
+    }
+
+    /// Whether a token on `dev` goes through the kernels of a recorded decode: one is being
+    /// recorded, or a test runs them without.
+    pub(crate) fn records(&self, dev: &Device) -> bool {
+        self.graph_ready()
+            && (crate::tensor::cuda_ext::capture_active(dev)
+                || GRAPH_WITHOUT_CAPTURE.load(Ordering::Relaxed))
     }
 
     /// Whether a recorded decode can run this layer.
@@ -270,6 +298,20 @@ impl LayerTier {
         ids: &Tensor,
         weights: &Tensor,
     ) -> Result<Tensor> {
+        let pending = self.graph_begin(moe, xs, ids, weights)?;
+        self.graph_end(pending)
+    }
+
+    /// The first half of [`Self::decode_graph`]: the request is posted and the card's own experts
+    /// run. What the card has to do that does not depend on the host's answer can be queued
+    /// before [`Self::graph_end`] waits for it.
+    pub(crate) fn graph_begin(
+        &self,
+        moe: &MoeWeights,
+        xs: &Tensor,
+        ids: &Tensor,
+        weights: &Tensor,
+    ) -> Result<GraphPending> {
         use crate::inference::moe_cuda;
         let g = self.graph.get().expect("a graph layer is enabled");
         let k = moe.n_experts_used;
@@ -321,6 +363,16 @@ impl LayerTier {
         )?;
         let card = routing.down_reduce_over(&h, &self.card[2], more.map(|m| &m[2]), &g.weights)?;
         drop(extra);
+        Ok(GraphPending { card, hidden, dev })
+    }
+
+    /// The second half: wait for the host's answer and add its product to the card's.
+    pub(crate) fn graph_end(&self, pending: GraphPending) -> Result<Tensor> {
+        use crate::inference::moe_cuda;
+        let g = self.graph.get().expect("a graph layer is enabled");
+        let GraphPending { card, hidden, dev } = pending;
+        let cd = dev.as_cuda_device()?;
+        let stream = cd.0.stream().cu_stream() as i64;
         let out = unsafe { cd.alloc::<f32>(hidden) }?;
         unsafe {
             moe_cuda::tier_graph::wait(
@@ -412,25 +464,35 @@ impl LayerTier {
                 t.elapsed().as_secs_f64() * 1e6 / miss_ids.len() as f64,
             );
             laps.mark("tier worker: host product");
+            WORKER
+                .product_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            WORKER
+                .missing
+                .fetch_add(miss_ids.len() as u64, Ordering::Relaxed);
             g.mail.answer(&product, req.seq);
         }
         g.done.store(req.seq, Ordering::Relaxed);
         laps.mark("tier worker: answer");
-        // The leader says what a request costs the host, once per window of requests.
-        let us = started.elapsed().as_nanos() as u64;
-        let n = g.requests.fetch_add(1, Ordering::Relaxed) + 1;
-        let total = g.worker_ns.fetch_add(us, Ordering::Relaxed) + us;
-        let with_miss = if miss_ids.is_empty() { 0 } else { 1 };
-        g.missed.fetch_add(with_miss, Ordering::Relaxed);
-        if self.leader.load(Ordering::Relaxed) && n % (4 * self.n_experts as u64) == 0 {
-            tracing::info!(
-                "expert tier worker: {} us a request, {:.0}% of requests had a missing expert",
-                total / n / 1000,
-                100.0 * g.missed.load(Ordering::Relaxed) as f64 / n as f64
-            );
-        }
         self.promote(&missing, &in_use);
         laps.mark("tier worker: promote");
+        // The leader says what a request costs the host, once per window of requests.
+        let us = started.elapsed().as_nanos() as u64;
+        let n = WORKER.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        let total = WORKER.ns.fetch_add(us, Ordering::Relaxed) + us;
+        if !miss_ids.is_empty() {
+            WORKER.missed.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.leader.load(Ordering::Relaxed) && n % 4096 == 0 {
+            let missed = WORKER.missed.load(Ordering::Relaxed).max(1);
+            tracing::info!(
+                "expert tier worker: {} us a request, {:.0}% had a missing expert: {:.1} missing, product {} us",
+                total / n / 1000,
+                100.0 * missed as f64 / n as f64,
+                WORKER.missing.load(Ordering::Relaxed) as f64 / missed as f64,
+                WORKER.product_ns.load(Ordering::Relaxed) / missed / 1000,
+            );
+        }
         Ok(true)
     }
 }

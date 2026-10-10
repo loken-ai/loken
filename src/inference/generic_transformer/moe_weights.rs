@@ -381,10 +381,22 @@ pub struct SharedExpert {
 impl SharedExpert {
     /// `routed` `[tokens, hidden]` F32 plus the expert over `xs`. A decoded token on a card
     /// runs the elementwise stages around the projections as two launches.
-    pub fn forward_added(&self, xs: &Tensor, routed: &Tensor) -> Result<Tensor> {
+    pub fn forward_added(
+        &self,
+        xs: &Tensor,
+        routed: &Tensor,
+        projected: Option<Tensor>,
+    ) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if let (Some(gate), Some(w)) = (&self.gate, &self.scalar_gate) {
             if xs.device().is_cuda() && xs.dims().first() == Some(&1) {
+                if let Some(down) = projected {
+                    if let Some(sum) = crate::inference::moe_cuda::shexp_tail(routed, &down, xs, w)?
+                    {
+                        return Ok(sum);
+                    }
+                    return routed + self.finish(xs, down)?;
+                }
                 let up = self.up.forward(xs)?;
                 let g = gate.forward(xs)?;
                 if let Some(h) = crate::inference::moe_cuda::shexp_swiglu(&g, &up)? {
@@ -402,6 +414,31 @@ impl SharedExpert {
             }
         }
         routed + self.forward(xs)?
+    }
+
+    /// The expert's projections for a decoded token on a card, which do not depend on the routed
+    /// experts: the down projection's output, to be joined by [`Self::forward_added`]. `None`
+    /// where that path does not serve the expert.
+    #[cfg(feature = "cuda")]
+    pub fn project(&self, xs: &Tensor) -> Result<Option<Tensor>> {
+        let (Some(gate), Some(_)) = (&self.gate, &self.scalar_gate) else {
+            return Ok(None);
+        };
+        if !xs.device().is_cuda() || xs.dims().first() != Some(&1) {
+            return Ok(None);
+        }
+        let up = self.up.forward(xs)?;
+        let g = gate.forward(xs)?;
+        match crate::inference::moe_cuda::shexp_swiglu(&g, &up)? {
+            Some(h) => Ok(Some(self.down.forward(&h)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// No card, no projections ahead of a wait.
+    #[cfg(not(feature = "cuda"))]
+    pub fn project(&self, _: &Tensor) -> Result<Option<Tensor>> {
+        Ok(None)
     }
 
     /// The down projection's output `out` scaled by the scalar gate, F32.
@@ -850,6 +887,8 @@ impl MoeWeights {
         {
             crate::tensor::bail!("MoeWeights: this layer cannot fold a residual into its fold");
         }
+        // The shared expert's projections, when a recorded decode queued them ahead of the wait.
+        let mut shared_projected: Option<Tensor> = None;
         let expert_rows = if self.up_relu2 {
             self.forward_up_relu2(&xs, &topk_ids, &topk_weights_scaled, num_tokens)?
         } else if let Some(tier) = self
@@ -871,7 +910,16 @@ impl MoeWeights {
         } else if let (Some(tier), true, 1) =
             (self.tier.as_ref(), xs.device().runs_as_card(), num_tokens)
         {
-            tier.decode(self, &xs, &topk_ids, &topk_weights_scaled)?
+            // A recorded decode queues the shared expert's projections while the host answers.
+            if tier.records(&xs.device()) {
+                let pending = tier.graph_begin(self, &xs, &topk_ids, &topk_weights_scaled)?;
+                if let Some(shared) = &self.shared_expert {
+                    shared_projected = shared.project(&xs)?;
+                }
+                tier.graph_end(pending)?
+            } else {
+                tier.decode(self, &xs, &topk_ids, &topk_weights_scaled)?
+            }
         } else if let Some(tier) = self.tier.as_ref().filter(|t| {
             xs.device().runs_as_card() && t.stream_pays(num_tokens, self.n_experts_used)
         }) {
@@ -931,9 +979,11 @@ impl MoeWeights {
             false => expert_rows.to_device(&moe_device)?,
         };
         let expert_rows = match &self.shared_expert {
-            Some(shared) => {
-                shared.forward_added(&xs, &expert_rows.to_dtype(crate::tensor::DType::F32)?)?
-            }
+            Some(shared) => shared.forward_added(
+                &xs,
+                &expert_rows.to_dtype(crate::tensor::DType::F32)?,
+                shared_projected,
+            )?,
             None => expert_rows,
         };
         expert_rows

@@ -157,6 +157,17 @@ mod cuda {
             .unwrap_or(false)
     }
 
+    /// Wait for the work queued on `stream` without keeping a core busy: a graph whose host
+    /// share another thread computes needs every core those threads can have, and the driver's
+    /// own wait spins.
+    pub fn synchronize_yielding(stream: &Arc<CudaStream>) -> Result<()> {
+        let event = stream.record_event(None).map_err(msg("record_event"))?;
+        while !event.is_complete() {
+            std::thread::sleep(std::time::Duration::from_micros(20));
+        }
+        Ok(())
+    }
+
     /// Begin capturing `stream` into a CUDA graph (relaxed mode - the mode
     /// every production capture in loken uses).
     pub fn begin_capture(stream: &Arc<CudaStream>) -> Result<()> {

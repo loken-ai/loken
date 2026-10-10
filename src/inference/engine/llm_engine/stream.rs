@@ -1673,8 +1673,12 @@ impl LlmEngine {
                             };
                             match graph.launch(&mut state.model) {
                                 Ok(()) => {
-                                    let _ = stream.synchronize();
+                                    let _ = crate::tensor::cuda_ext::synchronize_yielding(&stream);
                                     if graph_validations < GRAPH_VALIDATIONS {
+                                        let rep_logits: Option<Vec<f32>> = logits_ref
+                                            .flatten_all()
+                                            .ok()
+                                            .and_then(|t| t.to_vec1::<f32>().ok());
                                         let rep_argmax: Option<u32> = logits_ref
                                             .flatten_all()
                                             .ok()
@@ -1692,8 +1696,15 @@ impl LlmEngine {
                                                     .ok()
                                                     .and_then(|t| t.argmax(0).ok())
                                                     .and_then(|t| t.to_scalar::<u32>().ok());
-                                                if rep_argmax.is_some() && rep_argmax == eag_argmax
-                                                {
+                                                let agrees = rep_argmax.is_some() && rep_argmax == eag_argmax
+                                                    || rep_logits.as_ref().is_some_and(|g| {
+                                                        eag.flatten_all()
+                                                            .and_then(|t| t.to_vec1::<f32>())
+                                                            .is_ok_and(|e| {
+                                                                crate::inference::engine::decode_step::replay_agrees(g, &e)
+                                                            })
+                                                    });
+                                                if agrees {
                                                     graph_validations += 1;
                                                 } else {
                                                     warn!("CUDA graph replay!=eager at pos={pos} (argmax {:?} vs {:?}); discarding graph, eager decode for rest of request",
