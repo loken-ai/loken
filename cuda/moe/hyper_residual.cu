@@ -141,7 +141,9 @@ extern "C" void loken_hc_combine(
 //   up_mean      mixed[row, d] = (1/S) * sum_s xn[row, s, d] * sigmoid(up[s * D + d, :] . low[row, :])
 //                one block per tile of UP_TILE columns d, all S streams of the tile
 //
-// The weights are dense F32 or F16, row-major `[n, k]`; the activations F32.
+// The weights are dense F32 or F16, or int8 with a scale for each group of 64 values of a row,
+// row-major `[n, k]` (the scales `[n, k / 64]`); the activations F32. `half_w` is 0 for F32,
+// 1 for F16 and 2 for int8.
 
 namespace {
 
@@ -185,16 +187,48 @@ __device__ __forceinline__ float dot_row_h(const __half * __restrict__ w, const 
     return acc;
 }
 
+// The same over a row of int8 weights, sixteen at a time, each group of 64 scaled by its entry of
+// the row's `scale`.
+__device__ __forceinline__ float dot_row_q8(const signed char * __restrict__ w,
+        const float * __restrict__ scale, const float * __restrict__ x, int k, int lane0,
+        int stride) {
+    float acc = 0.f;
+    if ((k & 15) == 0) {
+        const int4 * w16 = reinterpret_cast<const int4 *>(w);
+        const float4 * x4 = reinterpret_cast<const float4 *>(x);
+        for (int i = lane0; i < (k >> 4); i += stride) {
+            const int4 u = w16[i];
+            const signed char * b = reinterpret_cast<const signed char *>(&u);
+            const float4 x0 = x4[4 * i], x1 = x4[4 * i + 1], x2 = x4[4 * i + 2], x3 = x4[4 * i + 3];
+            float part = (float) b[0] * x0.x + (float) b[1] * x0.y + (float) b[2] * x0.z + (float) b[3] * x0.w;
+            part += (float) b[4] * x1.x + (float) b[5] * x1.y + (float) b[6] * x1.z + (float) b[7] * x1.w;
+            part += (float) b[8] * x2.x + (float) b[9] * x2.y + (float) b[10] * x2.z + (float) b[11] * x2.w;
+            part += (float) b[12] * x3.x + (float) b[13] * x3.y + (float) b[14] * x3.z + (float) b[15] * x3.w;
+            acc += part * scale[i >> 2];
+        }
+    } else {
+        for (int i = lane0; i < k; i += stride) acc += (float) w[i] * x[i] * scale[i >> 6];
+    }
+    return acc;
+}
+
 } // namespace
 
 extern "C" __global__ void loken_hc_down_inject_kernel(
         const float * __restrict__ xn, const void * __restrict__ down,
         const void * __restrict__ inject, float * __restrict__ low, float * __restrict__ inj,
-        int K, int R, int I, float inv_streams, int half_w) {
+        int K, int R, int I, float inv_streams, int half_w,
+        const float * __restrict__ down_scale, const float * __restrict__ inject_scale) {
     const int o = blockIdx.x;
     const size_t row = blockIdx.y;
     float acc;
-    if (half_w) {
+    if (half_w == 2) {
+        const signed char * w = (o < R) ? (const signed char *) down + (size_t) o * K
+                                        : (const signed char *) inject + (size_t) (o - R) * K;
+        const float * scale = (o < R) ? down_scale + (size_t) o * (K >> 6)
+                                      : inject_scale + (size_t) (o - R) * (K >> 6);
+        acc = dot_row_q8(w, scale, xn + row * K, K, threadIdx.x, blockDim.x);
+    } else if (half_w) {
         const __half * w = (o < R) ? (const __half *) down + (size_t) o * K
                                    : (const __half *) inject + (size_t) (o - R) * K;
         acc = dot_row_h(w, xn + row * K, K, threadIdx.x, blockDim.x);
@@ -216,16 +250,17 @@ extern "C" __global__ void loken_hc_down_inject_kernel(
 
 extern "C" void loken_hc_down_inject(
         const float * xn, const void * down, const void * inject, float * low, float * inj,
-        int rows, int K, int R, int I, int S, int half_w, cudaStream_t stream) {
+        int rows, int K, int R, int I, int S, int half_w, const float * down_scale,
+        const float * inject_scale, cudaStream_t stream) {
     dim3 grid((unsigned) (R + I), (unsigned) rows);
     loken_hc_down_inject_kernel<<<grid, 256, 0, stream>>>(
-        xn, down, inject, low, inj, K, R, I, 1.f / (float) S, half_w);
+        xn, down, inject, low, inj, K, R, I, 1.f / (float) S, half_w, down_scale, inject_scale);
 }
 
 extern "C" __global__ void loken_hc_up_mean_kernel(
         const float * __restrict__ xn, const void * __restrict__ up,
         const float * __restrict__ low, void * __restrict__ mixed,
-        int S, int D, int R, int out_f16, int half_w) {
+        int S, int D, int R, int out_f16, int half_w, const float * __restrict__ up_scale) {
     extern __shared__ float shared[];
     float * low_s = shared;                    // R
     float * gate = shared + R;                 // S * UP_TILE
@@ -238,7 +273,8 @@ extern "C" __global__ void loken_hc_up_mean_kernel(
     for (int j = warp; j < S * tile; j += warps) {
         const int s = j / tile, dd = j % tile;
         const size_t at = ((size_t) s * D + d0 + dd) * R;
-        float acc = half_w ? dot_row_h((const __half *) up + at, low_s, R, lane, 32)
+        float acc = half_w == 2 ? dot_row_q8((const signed char *) up + at, up_scale + ((size_t) s * D + d0 + dd) * (R >> 6), low_s, R, lane, 32)
+                  : half_w ? dot_row_h((const __half *) up + at, low_s, R, lane, 32)
                            : dot_row((const float *) up + at, low_s, R, lane, 32);
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
         if (lane == 0) gate[s * UP_TILE + dd] = sigmoidf_(acc);
@@ -254,8 +290,28 @@ extern "C" __global__ void loken_hc_up_mean_kernel(
 
 extern "C" void loken_hc_up_mean(
         const float * xn, const void * up, const float * low, void * mixed, int rows, int S,
-        int D, int R, int out_f16, int half_w, cudaStream_t stream) {
+        int D, int R, int out_f16, int half_w, const float * up_scale, cudaStream_t stream) {
     dim3 grid((unsigned) ((D + UP_TILE - 1) / UP_TILE), (unsigned) rows);
     const size_t shared = ((size_t) R + (size_t) S * UP_TILE) * sizeof(float);
-    loken_hc_up_mean_kernel<<<grid, 256, shared, stream>>>(xn, up, low, mixed, S, D, R, out_f16, half_w);
+    loken_hc_up_mean_kernel<<<grid, 256, shared, stream>>>(xn, up, low, mixed, S, D, R, out_f16, half_w, up_scale);
+}
+
+// Int8 weights with a scale for each group of 64 values, widened to F16 or F32 for the stages that
+// multiply them as a matrix.
+extern "C" __global__ void loken_hc_dequant_kernel(
+        const signed char * __restrict__ q, const float * __restrict__ scale,
+        void * __restrict__ out, int n, int k, int out_f32) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) n * k) return;
+    const size_t row = i / k, col = i % k;
+    const float v = (float) q[i] * scale[row * (k >> 6) + (col >> 6)];
+    if (out_f32) ((float *) out)[i] = v; else ((__half *) out)[i] = __float2half(v);
+}
+
+extern "C" void loken_hc_dequant(
+        const signed char * q, const float * scale, void * out, int n, int k, int out_f32,
+        cudaStream_t stream) {
+    const size_t total = (size_t) n * k;
+    loken_hc_dequant_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, stream>>>(
+        q, scale, out, n, k, out_f32);
 }

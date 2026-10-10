@@ -55,15 +55,111 @@ pub struct HyperMixer {
 /// the tile that product works in.
 const HALF_PRODUCT_ROWS: usize = 64;
 
-/// A mixer's weight: a dense one on a card is held F16, half the bytes a decode step reads for
-/// it, and is widened to F32 where a stage wants a matrix product; any other as it is.
+/// The relative distance from a mixer weight, from which holding it as int8 rows is not done:
+/// the tolerance the tier's expert outputs are checked at.
+#[cfg(feature = "cuda")]
+const INT8_TOLERANCE: f64 = 2e-2;
+
+/// A mixer's weight: a dense one on a card is held as int8 rows with a scale each when that
+/// stays within [`INT8_TOLERANCE`] of it, else F16, which is exact for a stored BF16 weight;
+/// either reads fewer bytes in a decode step. It is widened where a stage wants a matrix
+/// product; any other weight is kept as it is.
 enum Weight {
     Half(Tensor),
+    /// `[n, k]` bytes that are signed, and the `n` scales.
+    Int8 {
+        q: Tensor,
+        scale: Tensor,
+    },
     Plain(QMatMul),
 }
 
+/// The rows of the dense F32 weight `t` as int8 with a scale for each group of 64 values, on `t`'s
+/// card; `None` when that would move the weight by more than [`INT8_TOLERANCE`], or when a row is
+/// not a whole number of groups.
+#[cfg(feature = "cuda")]
+pub(super) fn int8_rows(t: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
+    let (n, k) = t.dims2()?;
+    let group = crate::inference::moe_cuda::INT8_GROUP;
+    if k % group != 0 {
+        return Ok(None);
+    }
+    let host: Vec<f32> = t
+        .to_device(&crate::tensor::Device::Cpu)?
+        .flatten_all()?
+        .to_vec1()?;
+    let mut q = vec![0u8; n * k];
+    let mut scale = vec![0f32; n * (k / group)];
+    let (mut moved, mut norm) = (0f64, 0f64);
+    for r in 0..n {
+        for g in 0..k / group {
+            let at = r * k + g * group;
+            let values = &host[at..at + group];
+            let peak = values.iter().fold(0f32, |a, &v| a.max(v.abs()));
+            let sc = if peak > 0.0 { peak / 127.0 } else { 1.0 };
+            scale[r * (k / group) + g] = sc;
+            for (i, &v) in values.iter().enumerate() {
+                let code = (v / sc).round().clamp(-127.0, 127.0) as i8;
+                q[at + i] = code as u8;
+                let d = f64::from(v - f32::from(code) * sc);
+                moved += d * d;
+                norm += f64::from(v) * f64::from(v);
+            }
+        }
+    }
+    if moved.sqrt() > INT8_TOLERANCE * norm.sqrt() {
+        return Ok(None);
+    }
+    let host_dev = crate::tensor::Device::Cpu;
+    Ok(Some((
+        Tensor::from_vec(q, (n, k), &host_dev)?.to_device(&t.device())?,
+        Tensor::from_vec(scale, (n, k / group), &host_dev)?.to_device(&t.device())?,
+    )))
+}
+
 impl Weight {
-    fn pack(w: QMatMul) -> Result<Self> {
+    /// The mixer's weights held together: as int8 rows when every one of them can be, since the
+    /// fused launches read the three in one format, else each as [`Self::pack_exact`] has it.
+    fn pack_all(
+        down: QMatMul,
+        up: QMatMul,
+        inject: Option<QMatMul>,
+    ) -> Result<(Self, Self, Option<Self>)> {
+        #[cfg(feature = "cuda")]
+        {
+            let rows = |w: &QMatMul| -> Result<Option<(Tensor, Tensor)>> {
+                match w.dense() {
+                    Some(t)
+                        if t.dtype() == DType::F32
+                            && t.device().is_cuda()
+                            && t.dims().len() == 2 =>
+                    {
+                        int8_rows(t)
+                    }
+                    _ => Ok(None),
+                }
+            };
+            let (d, u) = (rows(&down)?, rows(&up)?);
+            let i = inject.as_ref().map(rows).transpose()?;
+            if let (Some(d), Some(u)) = (d, u) {
+                if i.as_ref().is_none_or(Option::is_some) {
+                    let i = i.map(|i| i.expect("checked above"));
+                    return Ok((
+                        Weight::Int8 { q: d.0, scale: d.1 },
+                        Weight::Int8 { q: u.0, scale: u.1 },
+                        i.map(|(q, scale)| Weight::Int8 { q, scale }),
+                    ));
+                }
+            }
+        }
+        Ok((
+            Self::pack_exact(down)?,
+            Self::pack_exact(up)?,
+            inject.map(Self::pack_exact).transpose()?,
+        ))
+    }
+
+    fn pack_exact(w: QMatMul) -> Result<Self> {
         #[cfg(feature = "cuda")]
         if let Some(t) = w.dense() {
             if t.dtype() == DType::F32 && t.device().is_cuda() && t.dims().len() == 2 {
@@ -87,6 +183,27 @@ impl Weight {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Weight::Plain(w) => w.forward(x),
+            #[cfg(feature = "cuda")]
+            Weight::Int8 { q, scale } => {
+                // Rows enough for the half-precision product widen the weight to F16; fewer,
+                // to the F32 the launches multiply in.
+                let dims = x.dims().to_vec();
+                let k = *dims.last().expect("an activation has a width");
+                let rows = x.elem_count() / k;
+                let x2 = x.reshape((rows, k))?;
+                let half = rows >= HALF_PRODUCT_ROWS && x.device().is_cuda();
+                let w = crate::inference::moe_cuda::hc_dequant(q, scale, !half)?;
+                let y = if half {
+                    x2.to_dtype(DType::F16)?.matmul_t(&w)?.to_dtype(x.dtype())?
+                } else {
+                    x2.matmul_t(&w)?.to_dtype(x.dtype())?
+                };
+                let mut out = dims;
+                *out.last_mut().expect("an activation has a width") = q.dims()[0];
+                y.reshape(out)
+            }
+            #[cfg(not(feature = "cuda"))]
+            Weight::Int8 { .. } => crate::tensor::bail!("int8 mixer weights live on a card"),
             Weight::Half(w) => {
                 let dims = x.dims().to_vec();
                 let k = *dims.last().expect("an activation has a width");
@@ -111,13 +228,36 @@ impl Weight {
     fn dense(&self) -> Option<&Tensor> {
         match self {
             Weight::Half(w) => Some(w),
+            Weight::Int8 { .. } => None,
             Weight::Plain(w) => w.dense(),
+        }
+    }
+
+    /// The weight as a dense tensor, widened from int8 rows where it is held so.
+    #[cfg(all(feature = "cuda", test))]
+    fn widened(&self) -> Option<Tensor> {
+        match self {
+            Weight::Int8 { q, scale } => {
+                crate::inference::moe_cuda::hc_dequant(q, scale, false).ok()
+            }
+            other => other.dense().cloned(),
+        }
+    }
+
+    /// The weight as the fused launches read it: dense or as int8 rows.
+    #[cfg(feature = "cuda")]
+    fn mix(&self) -> Option<crate::inference::moe_cuda::MixWeight<'_>> {
+        use crate::inference::moe_cuda::MixWeight;
+        match self {
+            Weight::Int8 { q, scale } => Some(MixWeight::Int8 { q, scale }),
+            other => other.dense().map(MixWeight::Dense),
         }
     }
 
     fn device(&self) -> crate::tensor::Device {
         match self {
             Weight::Half(w) => w.device().clone(),
+            Weight::Int8 { q, .. } => q.device().clone(),
             Weight::Plain(w) => w.device(),
         }
     }
@@ -134,11 +274,12 @@ impl HyperMixer {
         eps: f64,
     ) -> Result<Self> {
         let gamma = gamma.to_dtype(DType::F32)?.reshape(streams * dim)?;
+        let (down, up, inject) = Weight::pack_all(down, up, inject)?;
         Ok(Self {
             gamma,
-            down: Weight::pack(down)?,
-            up: Weight::pack(up)?,
-            inject: inject.map(Weight::pack).transpose()?,
+            down,
+            up,
+            inject,
             streams,
             dim,
             eps,
@@ -179,13 +320,13 @@ impl HyperMixer {
     /// [`Self::combine_on_card`] turns into `2 sigmoid(. / streams)`.
     #[cfg(feature = "cuda")]
     pub fn mix_on_card(&self, xn: &Tensor, f16_out: bool) -> Result<(Tensor, Option<Tensor>)> {
-        use crate::inference::moe_cuda::{hc_low, hc_mean_gate, hc_mix_fused};
-        if let (Some(down), Some(up)) = (self.down.dense(), self.up.dense()) {
-            let inject = self.inject.as_ref().map(|w| w.dense());
+        use crate::inference::moe_cuda::{hc_low, hc_mean_gate, hc_mix_fused_over};
+        if let (Some(down), Some(up)) = (self.down.mix(), self.up.mix()) {
+            let inject = self.inject.as_ref().map(|w| w.mix());
             if inject.as_ref().is_none_or(|w| w.is_some()) {
                 let inject = inject.flatten();
                 if let Some(done) =
-                    hc_mix_fused(xn, down, up, inject, self.streams, self.dim, f16_out)?
+                    hc_mix_fused_over(xn, down, up, inject, self.streams, self.dim, f16_out)?
                 {
                     return Ok(done);
                 }
@@ -200,14 +341,14 @@ impl HyperMixer {
 
     /// The `down` weight as a dense tensor, for a test of the fused launches.
     #[cfg(all(feature = "cuda", test))]
-    pub(super) fn down_dense(&self) -> Option<&Tensor> {
-        self.down.dense()
+    pub(super) fn down_dense(&self) -> Option<Tensor> {
+        self.down.widened()
     }
 
     /// The `up` weight as a dense tensor, for a test of the fused launches.
     #[cfg(all(feature = "cuda", test))]
-    pub(super) fn up_dense(&self) -> Option<&Tensor> {
-        self.up.dense()
+    pub(super) fn up_dense(&self) -> Option<Tensor> {
+        self.up.widened()
     }
 
     /// Streams the mixer mixes.

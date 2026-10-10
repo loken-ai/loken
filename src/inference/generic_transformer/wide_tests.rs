@@ -567,6 +567,7 @@ fn the_fused_mixer_matches_the_tensor_ops_for_a_decode_step() {
         );
     }
     let (down, up) = (hc.attn.down_dense().unwrap(), hc.attn.up_dense().unwrap());
+    let (down, up) = (&down, &up);
     let xn = hc.attn.normed_on_card(&r.narrow(1, 0, 1).unwrap()).unwrap();
     let fused = crate::inference::moe_cuda::hc_mix_fused(
         &xn,
@@ -621,8 +622,8 @@ fn the_fused_mixer_reads_half_weights_like_single_ones() {
         let half = t.to_dtype(DType::F16).unwrap();
         (half.to_dtype(DType::F32).unwrap(), half)
     };
-    let (down32, down16) = round(hc.attn.down_dense().unwrap());
-    let (up32, up16) = round(hc.attn.up_dense().unwrap());
+    let (down32, down16) = round(&hc.attn.down_dense().unwrap());
+    let (up32, up16) = round(&hc.attn.up_dense().unwrap());
     let flat = |t: &Tensor| {
         t.to_device(&Device::Cpu)
             .unwrap()
@@ -647,6 +648,90 @@ fn the_fused_mixer_reads_half_weights_like_single_ones() {
         let want = flat(&mix(&down32, &up32));
         let got = flat(&mix(&down16, &up16));
         assert!(max_diff(&got, &want) < 1e-3, "{rows} rows");
+    }
+}
+
+/// The mixer launches read int8 rows with a scale for each group of values and give what they
+/// give on the same weights widened to single precision.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an idle CUDA card"]
+fn the_fused_mixer_reads_int8_rows_like_the_widened_weights() {
+    use crate::inference::moe_cuda::{hc_mix_fused_over, MixWeight};
+    let Ok(card) = Device::new_cuda(0) else {
+        return;
+    };
+    let (streams, dim, rank) = (2usize, 64usize, 64usize);
+    let k = streams * dim;
+    // Weights of a mixer's shapes and a spread of magnitudes, from a fixed generator.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+    };
+    let mut matrix = |n: usize, m: usize| {
+        let data: Vec<f32> = (0..n * m)
+            .map(|i| next() * (1.0 + (i % 7) as f32))
+            .collect();
+        Tensor::from_vec(data, (n, m), &Device::Cpu)
+            .unwrap()
+            .to_device(&card)
+            .unwrap()
+    };
+    let (down, up) = (matrix(rank, k), matrix(k, rank));
+    let (qd, sd) = hyper::int8_rows(&down)
+        .unwrap()
+        .expect("within the tolerance");
+    let (qu, su) = hyper::int8_rows(&up)
+        .unwrap()
+        .expect("within the tolerance");
+    // What the rows widen to is what the launches must reproduce.
+    let widen =
+        |q: &Tensor, s: &Tensor| crate::inference::moe_cuda::hc_dequant(q, s, true).unwrap();
+    let (down_w, up_w) = (widen(&qd, &sd), widen(&qu, &su));
+    let flat = |t: &Tensor| {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    for rows in [1usize, 3] {
+        let data: Vec<f32> = (0..rows * k).map(|_| next()).collect();
+        let xn = Tensor::from_vec(data, (rows, k), &Device::Cpu)
+            .unwrap()
+            .to_device(&card)
+            .unwrap();
+        let want = hc_mix_fused_over(
+            &xn,
+            MixWeight::Dense(&down_w),
+            MixWeight::Dense(&up_w),
+            None,
+            streams,
+            dim,
+            false,
+        )
+        .unwrap()
+        .expect("the launches take these weights")
+        .0;
+        let got = hc_mix_fused_over(
+            &xn,
+            MixWeight::Int8 { q: &qd, scale: &sd },
+            MixWeight::Int8 { q: &qu, scale: &su },
+            None,
+            streams,
+            dim,
+            false,
+        )
+        .unwrap()
+        .expect("the launches take int8 rows")
+        .0;
+        assert!(max_diff(&flat(&got), &flat(&want)) < 1e-4, "{rows} rows");
     }
 }
 

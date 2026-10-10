@@ -125,15 +125,55 @@ pub fn hc_mean_gate(
 /// once for all its rows in a matrix product instead.
 pub const FUSED_MIX_MAX_ROWS: usize = crate::inference::engine::decode_step::VERIFY_ROWS;
 
-/// A dense F32 weight `[n, k]` that is contiguous on a card, or `None`.
-fn dense_rows(w: &Tensor, n: Option<usize>, k: usize) -> Option<(usize, bool)> {
-    let [rows, cols] = w.dims() else { return None };
-    ((w.dtype() == DType::F32 || w.dtype() == DType::F16)
-        && w.device().is_cuda()
-        && w.is_contiguous()
-        && *cols == k
-        && n.is_none_or(|n| n == *rows))
-    .then_some((*rows, w.dtype() == DType::F16))
+/// A mixer weight `[n, k]` as a launch reads it: dense F32 or F16, or int8 with a scale for each
+/// row.
+#[derive(Clone, Copy)]
+pub enum MixWeight<'a> {
+    Dense(&'a Tensor),
+    Int8 { q: &'a Tensor, scale: &'a Tensor },
+}
+
+/// The values of an int8 row that share a scale.
+pub const INT8_GROUP: usize = 64;
+
+/// How a launch reads a weight: 0 for F32, 1 for F16, 2 for int8 with row scales.
+const WEIGHT_F32: i32 = 0;
+const WEIGHT_F16: i32 = 1;
+const WEIGHT_INT8: i32 = 2;
+
+/// A weight `[n, k]` that is contiguous on a card: its rows and how a launch reads it, or `None`.
+fn dense_rows(w: MixWeight<'_>, n: Option<usize>, k: usize) -> Option<(usize, i32)> {
+    match w {
+        MixWeight::Dense(w) => {
+            let [rows, cols] = w.dims() else { return None };
+            ((w.dtype() == DType::F32 || w.dtype() == DType::F16)
+                && w.device().is_cuda()
+                && w.is_contiguous()
+                && *cols == k
+                && n.is_none_or(|n| n == *rows))
+            .then_some((
+                *rows,
+                if w.dtype() == DType::F16 {
+                    WEIGHT_F16
+                } else {
+                    WEIGHT_F32
+                },
+            ))
+        }
+        MixWeight::Int8 { q, scale } => {
+            let [rows, cols] = q.dims() else { return None };
+            (q.dtype() == DType::U8
+                && scale.dtype() == DType::F32
+                && q.device().is_cuda()
+                && q.is_contiguous()
+                && scale.is_contiguous()
+                && cols % INT8_GROUP == 0
+                && scale.elem_count() == *rows * (*cols / INT8_GROUP)
+                && *cols == k
+                && n.is_none_or(|n| n == *rows))
+            .then_some((*rows, WEIGHT_INT8))
+        }
+    }
 }
 
 /// The mixer of a decode step in two launches: `down` and `inject` together, then `up` with the
@@ -145,6 +185,27 @@ pub fn hc_mix_fused(
     down: &Tensor,
     up: &Tensor,
     inject: Option<&Tensor>,
+    streams: usize,
+    dim: usize,
+    f16_out: bool,
+) -> Result<Option<(Tensor, Option<Tensor>)>> {
+    hc_mix_fused_over(
+        xn,
+        MixWeight::Dense(down),
+        MixWeight::Dense(up),
+        inject.map(MixWeight::Dense),
+        streams,
+        dim,
+        f16_out,
+    )
+}
+
+/// [`hc_mix_fused`] over weights held dense or as int8 rows.
+pub fn hc_mix_fused_over(
+    xn: &Tensor,
+    down: MixWeight<'_>,
+    up: MixWeight<'_>,
+    inject: Option<MixWeight<'_>>,
     streams: usize,
     dim: usize,
     f16_out: bool,
@@ -173,18 +234,24 @@ pub fn hc_mix_fused(
     let low = unsafe { dev.alloc::<f32>(rows * rank) }?;
     let inj = unsafe { dev.alloc::<f32>((rows * heads).max(1)) }?;
     let xn_p = addr::<f32>(xn, "xn")? as *const f32;
-    let weight = |w: &Tensor, name: &str| -> Result<*const c_void> {
-        Ok(if half_w {
-            addr::<half::f16>(w, name)? as *const c_void
-        } else {
-            addr::<f32>(w, name)? as *const c_void
+    let weight = |w: MixWeight<'_>, name: &str| -> Result<(*const c_void, *const f32)> {
+        Ok(match w {
+            MixWeight::Dense(w) if half_w == WEIGHT_F16 => (
+                addr::<half::f16>(w, name)? as *const c_void,
+                std::ptr::null(),
+            ),
+            MixWeight::Dense(w) => (addr::<f32>(w, name)? as *const c_void, std::ptr::null()),
+            MixWeight::Int8 { q, scale } => (
+                addr::<u8>(q, name)? as *const c_void,
+                addr::<f32>(scale, name)? as *const f32,
+            ),
         })
     };
-    let down_p = weight(down, "down")?;
-    let up_p = weight(up, "up")?;
-    let inj_w = match inject {
+    let (down_p, down_scale) = weight(down, "down")?;
+    let (up_p, up_scale) = weight(up, "up")?;
+    let (inj_w, inj_scale) = match inject {
         Some(w) => weight(w, "inject")?,
-        None => std::ptr::null(),
+        None => (std::ptr::null(), std::ptr::null()),
     };
     let low_p = low.device_ptr(low.stream()).0;
     unsafe {
@@ -199,7 +266,9 @@ pub fn hc_mix_fused(
             rank as i32,
             heads as i32,
             streams as i32,
-            i32::from(half_w),
+            half_w,
+            down_scale,
+            inj_scale,
             stream,
         );
     }
@@ -217,7 +286,8 @@ pub fn hc_mix_fused(
                 dim as i32,
                 rank as i32,
                 1,
-                i32::from(half_w),
+                half_w,
+                up_scale,
                 stream,
             );
         }
@@ -235,7 +305,8 @@ pub fn hc_mix_fused(
                 dim as i32,
                 rank as i32,
                 0,
-                i32::from(half_w),
+                half_w,
+                up_scale,
                 stream,
             );
         }
@@ -317,4 +388,38 @@ pub fn hc_combine(
         .map(|n| tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(n, dev.clone()), shape))
         .transpose()?;
     Ok((new_r, normed))
+}
+
+/// An int8 weight `[n, k]` with a scale for each group of [`INT8_GROUP`] values of a row, widened
+/// to F32 or to F16.
+pub fn hc_dequant(q: &Tensor, scale: &Tensor, f32_out: bool) -> Result<Tensor> {
+    let [n, k] = q.dims() else {
+        crate::tensor::bail!("hc_dequant: the weight is not a matrix");
+    };
+    let (n, k) = (*n, *k);
+    let dev = q.device().as_cuda_device()?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    let shape = crate::tensor::Shape::from((n, k));
+    macro_rules! widen {
+        ($ty:ty, $flag:expr) => {{
+            let out = unsafe { dev.alloc::<$ty>(n * k) }?;
+            unsafe {
+                loken_hc_dequant(
+                    addr::<u8>(q, "q")? as *const c_void,
+                    addr::<f32>(scale, "scale")? as *const f32,
+                    out.device_ptr(out.stream()).0 as *mut c_void,
+                    n as i32,
+                    k as i32,
+                    $flag,
+                    stream,
+                );
+            }
+            tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(out, dev.clone()), shape)
+        }};
+    }
+    if f32_out {
+        widen!(f32, 1)
+    } else {
+        widen!(half::f16, 0)
+    }
 }
