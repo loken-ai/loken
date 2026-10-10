@@ -6,11 +6,30 @@ fn main() {
     // which build is answering. A version number alone cannot tell two builds of one release
     // apart, which is exactly what a benchmark row has to do. Read here rather than at run
     // time: a deployed binary has no checkout beside it.
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+    // The repository's own directory and the one its worktrees share: a worktree's `.git` is a
+    // file naming them. Cargo reruns this script on every build for a watched path that does
+    // not exist, so only paths that do are watched.
+    let (git_dir, common_dir) = std::process::Command::new("git")
+        .args(["rev-parse", "--git-dir", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|text| {
+            let mut lines = text.lines().map(str::to_string);
+            Some((lines.next()?, lines.next()?))
+        })
+        .unwrap_or_else(|| (".git".to_string(), ".git".to_string()));
+    let watch = |path: String| {
+        if std::path::Path::new(&path).exists() {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    };
+    watch(format!("{git_dir}/HEAD"));
+    if let Ok(head) = std::fs::read_to_string(format!("{git_dir}/HEAD")) {
         // A branch moves under a fixed HEAD, so the ref it names is what has to be watched.
         if let Some(reference) = head.strip_prefix("ref: ").map(str::trim) {
-            println!("cargo:rerun-if-changed=.git/{reference}");
+            watch(format!("{common_dir}/{reference}"));
         }
     }
     let commit = std::process::Command::new("git")
@@ -30,8 +49,8 @@ fn main() {
     // release; any other commit is pre-release work on top of it and says so in SemVer form,
     // `<version>-dev+g<commit>`. A source archive without a repository is taken as the release
     // it was cut from.
-    println!("cargo:rerun-if-changed=.git/refs/tags");
-    println!("cargo:rerun-if-changed=.git/packed-refs");
+    watch(format!("{common_dir}/refs/tags"));
+    watch(format!("{common_dir}/packed-refs"));
     let release = env!("CARGO_PKG_VERSION");
     let at_release_tag = std::process::Command::new("git")
         .args(["tag", "--points-at", "HEAD"])
