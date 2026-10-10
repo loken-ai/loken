@@ -3607,6 +3607,7 @@ impl GenericHeteroTransformer {
             output_proj,
             output_bias,
             capture_feature: false,
+            tier_workers: Vec::new(),
             last_feature: None,
             spec_window: None,
             spec_recording: false,
@@ -3953,6 +3954,7 @@ impl GenericHeteroTransformer {
             // would need it read here, exactly as the GGUF path does.
             output_bias: None,
             capture_feature: false,
+            tier_workers: Vec::new(),
             last_feature: None,
             spec_window: None,
             spec_recording: false,

@@ -416,6 +416,9 @@ enum LayerDevice {
 
 /// Full model with layers distributed across CUDA + CPU via `HeteroPlan`.
 pub struct GenericHeteroTransformer {
+    /// The threads that serve the recorded decode of the cached layers; they stop before the
+    /// layers they hold go.
+    tier_workers: Vec<expert_tier::TierWorker>,
     config: Arc<GenericTransformerConfig>,
     embeddings: Embedding, // GPU 0 if table < 1 GB, else CPU
     layers: Vec<GenericTransformerLayer>,

@@ -176,6 +176,12 @@ cuda_launchers! {
         up_weights: *const c_void, sorted_token_ids: *const i32,
         expert_ids: *const i32, outputs: *mut f32, num_experts: i32, topk: i32, size_m: i32,
         size_n: i32, size_k: i32, quant_type: i32);
+    loken_moe_gemm_gguf_gate_up_silu_mul_two(
+        inputs: *const f32, gate_weights: *const c_void,
+        up_weights: *const c_void, alt_gate: *const c_void, alt_up: *const c_void,
+        alt_from: i32, sorted_token_ids: *const i32,
+        expert_ids: *const i32, outputs: *mut f32, num_experts: i32, topk: i32, size_m: i32,
+        size_n: i32, size_k: i32, quant_type: i32);
     loken_moe_gemm_gguf_gate_up_swiglu_oai(
         inputs: *const f32, gate_weights: *const c_void,
         up_weights: *const c_void, sorted_token_ids: *const i32,
@@ -184,8 +190,79 @@ cuda_launchers! {
         alpha: f32, limit: f32);
 }
 cuda_launchers! {
+    loken_tier_plan(
+        ids: *const u32, weights: *const f32, x: *const f32, table: *const i32,
+        counter: *mut u32, slot_out: *mut u32, weight_out: *mut f32, mail_ids: *mut u32,
+        mail_weights: *mut f32, mail_slots: *mut u32, mail_x: *mut f32, mail_request: *mut u32,
+        k: i32, hidden: i32);
+    loken_tier_wait(counter: *const u32, reply: *mut u32, abort_word: *mut u32);
+    loken_tier_merge(card: *const f32, product: *const f32, counter: *const u32, out: *mut f32, n: i32);
+}
+/// The launchers of a cached layer's decode recorded in a graph (see `expert_tier::graph`).
+///
+/// # Safety
+/// Every pointer is a card's address, or a page-locked mapping's, of the extent the kernel reads
+/// and writes; the stream is the card's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) mod tier_graph {
+    pub unsafe fn plan(
+        ids: *const u32,
+        weights: *const f32,
+        x: *const f32,
+        table: *const i32,
+        counter: *mut u32,
+        slot_out: *mut u32,
+        weight_out: *mut f32,
+        mail_ids: *mut u32,
+        mail_weights: *mut f32,
+        mail_slots: *mut u32,
+        mail_x: *mut f32,
+        mail_request: *mut u32,
+        k: i32,
+        hidden: i32,
+        stream: i64,
+    ) {
+        super::loken_tier_plan(
+            ids,
+            weights,
+            x,
+            table,
+            counter,
+            slot_out,
+            weight_out,
+            mail_ids,
+            mail_weights,
+            mail_slots,
+            mail_x,
+            mail_request,
+            k,
+            hidden,
+            stream,
+        );
+    }
+    pub unsafe fn wait(counter: *const u32, reply: *mut u32, abort_word: *mut u32, stream: i64) {
+        super::loken_tier_wait(counter, reply, abort_word, stream);
+    }
+    pub unsafe fn merge(
+        card: *const f32,
+        product: *const f32,
+        counter: *const u32,
+        out: *mut f32,
+        n: i32,
+        stream: i64,
+    ) {
+        super::loken_tier_merge(card, product, counter, out, n, stream);
+    }
+}
+cuda_launchers! {
     loken_cast_init_f32_from_dtype(
         dst: *mut f32, src: *const c_void, n: i32, dtype: i32);
+    loken_moe_gemm_gguf_down_reduce_two(
+        input: *const f32, weights: *const c_void, alt_weights: *const c_void, alt_from: i32,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32, topk_weights: *const f32, output: *mut f32, num_experts: i32,
+        topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32,
+        down_bias: *const f32, add_after: *const f32);
     loken_moe_gemm_gguf_down_reduce(
         input: *const f32, weights: *const c_void, sorted_token_ids: *const i32,
         expert_ids: *const i32, topk_weights: *const f32, output: *mut f32, num_experts: i32,

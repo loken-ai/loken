@@ -282,6 +282,32 @@ pub fn moe_gemm_gguf_gate_up_silu_mul(
     experts_ids: &Tensor,
     topk: usize,
 ) -> Result<Tensor> {
+    moe_gemm_gguf_gate_up_silu_mul_over(
+        input,
+        gate_weights,
+        up_weights,
+        None,
+        sorted_token_ids,
+        experts_ids,
+        topk,
+    )
+}
+
+/// [`moe_gemm_gguf_gate_up_silu_mul`] over the experts of the gate and up stacks and, numbered
+/// after them, those of `more` (its gate and up stacks): one launch serves a cache held in two
+/// allocations.
+pub fn moe_gemm_gguf_gate_up_silu_mul_over(
+    input: &Tensor,
+    gate_weights: &crate::tensor::quantized::QTensor,
+    up_weights: &crate::tensor::quantized::QTensor,
+    more: Option<(
+        &crate::tensor::quantized::QTensor,
+        &crate::tensor::quantized::QTensor,
+    )>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+) -> Result<Tensor> {
     const ENTRY: &str = "gate_up_silu_mul";
     if input.dtype() != DType::F32 {
         crate::tensor::bail!("{ENTRY} only accepts f32 inputs");
@@ -297,21 +323,49 @@ pub fn moe_gemm_gguf_gate_up_silu_mul(
     let output = unsafe { dev.alloc::<f32>(ext.out_elems()) }?;
     let stream = dev.cuda_stream().cu_stream() as i64;
     unsafe {
-        loken_moe_gemm_gguf_gate_up_silu_mul(
-            dev_addr::<f32>(input, "input")? as *const f32,
-            gate_weights.device_ptr()? as *const c_void,
-            up_weights.device_ptr()? as *const c_void,
-            slots,
-            experts,
-            output.device_ptr(output.stream()).0 as *mut f32,
-            ext.experts,
-            ext.topk,
-            ext.m,
-            ext.n,
-            ext.k,
-            gguf_dtype,
-            stream,
-        );
+        if let Some((more_gate, more_up)) = more {
+            if more_gate.dtype() != gate_weights.dtype()
+                || more_up.dtype() != gate_weights.dtype()
+                || more_gate.shape().dims()[1..] != gate_weights.shape().dims()[1..]
+                || more_up.shape().dims() != more_gate.shape().dims()
+            {
+                crate::tensor::bail!("{ENTRY}: the second stacks differ in format or shape");
+            }
+            loken_moe_gemm_gguf_gate_up_silu_mul_two(
+                dev_addr::<f32>(input, "input")? as *const f32,
+                gate_weights.device_ptr()? as *const c_void,
+                up_weights.device_ptr()? as *const c_void,
+                more_gate.device_ptr()? as *const c_void,
+                more_up.device_ptr()? as *const c_void,
+                ext.experts,
+                slots,
+                experts,
+                output.device_ptr(output.stream()).0 as *mut f32,
+                ext.experts + more_gate.shape().dims()[0] as i32,
+                ext.topk,
+                ext.m,
+                ext.n,
+                ext.k,
+                gguf_dtype,
+                stream,
+            );
+        } else {
+            loken_moe_gemm_gguf_gate_up_silu_mul(
+                dev_addr::<f32>(input, "input")? as *const f32,
+                gate_weights.device_ptr()? as *const c_void,
+                up_weights.device_ptr()? as *const c_void,
+                slots,
+                experts,
+                output.device_ptr(output.stream()).0 as *mut f32,
+                ext.experts,
+                ext.topk,
+                ext.m,
+                ext.n,
+                ext.k,
+                gguf_dtype,
+                stream,
+            );
+        }
     }
     tensor_from_f32_slice(output, ext.out_shape(), &input.device())
 }
@@ -417,6 +471,36 @@ pub fn moe_gemm_gguf_gate_up_gelu_mul_concat(
 pub fn moe_gemm_gguf_down_reduce(
     input: &Tensor,
     weights: &crate::tensor::quantized::QTensor,
+    sorted_token_ids: &Tensor,
+    expert_ids: &Tensor,
+    topk_weights: &Tensor,
+    topk: usize,
+    n_real_tokens: usize,
+    residual: Option<&Tensor>,
+    down_bias: Option<&Tensor>,
+    add_after: Option<&Tensor>,
+) -> Result<Tensor> {
+    moe_gemm_gguf_down_reduce_over(
+        input,
+        weights,
+        None,
+        sorted_token_ids,
+        expert_ids,
+        topk_weights,
+        topk,
+        n_real_tokens,
+        residual,
+        down_bias,
+        add_after,
+    )
+}
+
+/// [`moe_gemm_gguf_down_reduce`] over the experts of `weights` and, numbered after them, those of
+/// `more`: one launch serves a cache held in two allocations.
+pub fn moe_gemm_gguf_down_reduce_over(
+    input: &Tensor,
+    weights: &crate::tensor::quantized::QTensor,
+    more: Option<&crate::tensor::quantized::QTensor>,
     sorted_token_ids: &Tensor,
     expert_ids: &Tensor,
     topk_weights: &Tensor,
@@ -537,23 +621,50 @@ pub fn moe_gemm_gguf_down_reduce(
     }
     let (bias_held, down_bias_ptr) = bias_arg(down_bias, "down_bias")?;
     unsafe {
-        loken_moe_gemm_gguf_down_reduce(
-            dev_addr::<f32>(input, "input")? as *const f32,
-            weights.device_ptr()? as *const c_void,
-            slots,
-            experts,
-            dev_addr::<f32>(topk_weights, "topk_weights")? as *const f32,
-            out_alloc.device_ptr(out_alloc.stream()).0 as *mut f32,
-            ext.experts,
-            ext.topk,
-            ext.m,
-            ext.n,
-            ext.k,
-            gguf_dtype,
-            down_bias_ptr,
-            add_addr as *const f32,
-            stream,
-        );
+        if let Some(more) = more {
+            if more.dtype() != weights.dtype()
+                || more.shape().dims()[1..] != weights.shape().dims()[1..]
+            {
+                crate::tensor::bail!("{ENTRY}: the second stack differs in format or shape");
+            }
+            loken_moe_gemm_gguf_down_reduce_two(
+                dev_addr::<f32>(input, "input")? as *const f32,
+                weights.device_ptr()? as *const c_void,
+                more.device_ptr()? as *const c_void,
+                ext.experts,
+                slots,
+                experts,
+                dev_addr::<f32>(topk_weights, "topk_weights")? as *const f32,
+                out_alloc.device_ptr(out_alloc.stream()).0 as *mut f32,
+                ext.experts + more.shape().dims()[0] as i32,
+                ext.topk,
+                ext.m,
+                ext.n,
+                ext.k,
+                gguf_dtype,
+                down_bias_ptr,
+                add_addr as *const f32,
+                stream,
+            );
+        } else {
+            loken_moe_gemm_gguf_down_reduce(
+                dev_addr::<f32>(input, "input")? as *const f32,
+                weights.device_ptr()? as *const c_void,
+                slots,
+                experts,
+                dev_addr::<f32>(topk_weights, "topk_weights")? as *const f32,
+                out_alloc.device_ptr(out_alloc.stream()).0 as *mut f32,
+                ext.experts,
+                ext.topk,
+                ext.m,
+                ext.n,
+                ext.k,
+                gguf_dtype,
+                down_bias_ptr,
+                add_addr as *const f32,
+                stream,
+            );
+        }
     }
     drop(bias_held);
     tensor_from_f32_slice(out_alloc, (n_real_tokens, hidden), &input.device())

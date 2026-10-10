@@ -95,31 +95,16 @@ impl QCudaStorage {
         len: usize,
         dtype: GgmlDType,
     ) -> Result<Self> {
-        use cudarc::driver::sys;
-        let pool = lent_pool(device.0.ordinal())?;
-        let bytes = len + BLOB_TAIL_PAD_BYTES;
-        device
-            .0
-            .context()
-            .bind_to_thread()
-            .map_err(|e| Error::msg(format!("bind context: {e:?}")))?;
-        let stream = device.0.stream();
-        let mut ptr: sys::CUdeviceptr = 0;
-        let check = |what: &str, r: sys::CUresult| -> Result<()> {
-            if r == sys::CUresult::CUDA_SUCCESS {
-                Ok(())
-            } else {
-                Err(Error::msg(format!("{what}: {r:?}")))
-            }
-        };
-        check("lent blob", unsafe {
-            sys::cuMemAllocFromPoolAsync(&mut ptr, bytes, pool, stream.cu_stream())
-        })?;
-        check("lent blob zeroed", unsafe {
-            sys::cuMemsetD8Async(ptr, 0, bytes, stream.cu_stream())
-        })?;
-        let blob = unsafe { stream.upgrade_device_ptr::<u8>(ptr, bytes) };
+        let blob = lent_blob(device, len + BLOB_TAIL_PAD_BYTES)?;
         Self::over(blob, len, dtype, device)
+    }
+
+    /// [`Self::arena`] taken from the memory pool of what is lent.
+    pub(crate) fn arena_in_lent_pool(
+        device: &CudaDevice,
+        len: usize,
+    ) -> Result<Arc<cudarc::driver::CudaSlice<u8>>> {
+        Ok(Arc::new(lent_blob(device, len + BLOB_TAIL_PAD_BYTES)?))
     }
 
     /// This type over an already-allocated blob whose first `len` bytes are the block data.
@@ -312,6 +297,34 @@ fn lent_pool(ordinal: usize) -> Result<cudarc::driver::sys::CUmemoryPool> {
     }
     pools.insert(ordinal, pool as usize);
     Ok(pool)
+}
+
+/// `bytes` zeroed bytes from the memory pool of the card that holds only what is lent.
+#[cfg(feature = "cuda")]
+fn lent_blob(device: &CudaDevice, bytes: usize) -> Result<cudarc::driver::CudaSlice<u8>> {
+    use cudarc::driver::sys;
+    let pool = lent_pool(device.0.ordinal())?;
+    device
+        .0
+        .context()
+        .bind_to_thread()
+        .map_err(|e| Error::msg(format!("bind context: {e:?}")))?;
+    let stream = device.0.stream();
+    let mut ptr: sys::CUdeviceptr = 0;
+    let check = |what: &str, r: sys::CUresult| -> Result<()> {
+        if r == sys::CUresult::CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(Error::msg(format!("{what}: {r:?}")))
+        }
+    };
+    check("lent blob", unsafe {
+        sys::cuMemAllocFromPoolAsync(&mut ptr, bytes, pool, stream.cu_stream())
+    })?;
+    check("lent blob zeroed", unsafe {
+        sys::cuMemsetD8Async(ptr, 0, bytes, stream.cu_stream())
+    })?;
+    Ok(unsafe { stream.upgrade_device_ptr::<u8>(ptr, bytes) })
 }
 
 /// Give the card `ordinal` the memory the lent pool still holds after its blobs were freed.

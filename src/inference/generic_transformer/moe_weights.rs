@@ -136,6 +136,56 @@ impl ExpertRouting {
         })
     }
 
+    /// [`Self::gate_up_silu`] over the experts of the two stacks and, numbered after them, those
+    /// of `more`, in one launch.
+    #[cfg(feature = "cuda")]
+    pub(super) fn gate_up_silu_over(
+        &self,
+        xs: &Tensor,
+        gate: &QTensor,
+        up: &QTensor,
+        more: Option<(&QTensor, &QTensor)>,
+    ) -> Result<Tensor> {
+        device_timed("expert kernels: gate and up on the device", xs, || {
+            crate::inference::moe_cuda::moe_gemm_gguf_gate_up_silu_mul_over(
+                xs,
+                gate,
+                up,
+                more,
+                &self.slots,
+                &self.experts,
+                self.topk,
+            )
+        })
+    }
+
+    /// One token's down projection and weighted fold over the experts of `stack` and, numbered
+    /// after them, those of `more`, in one launch.
+    #[cfg(feature = "cuda")]
+    pub(super) fn down_reduce_over(
+        &self,
+        rows: &Tensor,
+        stack: &QTensor,
+        more: Option<&QTensor>,
+        weights: &Tensor,
+    ) -> Result<Tensor> {
+        device_timed("expert kernels: down on the device", rows, || {
+            crate::inference::moe_cuda::moe_gemm_gguf_down_reduce_over(
+                rows,
+                stack,
+                more,
+                &self.slots,
+                &self.experts,
+                weights,
+                self.topk,
+                1,
+                None,
+                None,
+                None,
+            )
+        })
+    }
+
     /// Gate and up kept apart, each with its per-expert bias, combined by the clamped
     /// SwiGLU: one launch.
     #[cfg(feature = "cuda")]
@@ -838,7 +888,7 @@ impl MoeWeights {
                     true,
                     t_route,
                     None,
-                    Some(stacks),
+                    Some(&*stacks),
                 )
             });
             // The experts the batch used warm the cache the decode will read.

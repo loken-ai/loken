@@ -10,6 +10,9 @@ pub use super::moe_weights::prefill_bytes_per_token;
 /// A layer's cache of its experts on a card: none is ever built here.
 pub struct LayerTier;
 
+/// The thread serving a card's recorded decode: none without a card.
+pub struct TierWorker;
+
 impl LayerTier {
     pub(super) fn decode(
         self: &Arc<Self>,
@@ -33,6 +36,10 @@ impl LayerTier {
 
     pub(super) fn keep_hottest_of_prompt(&self, _: &Tensor, _: &()) -> Result<()> {
         Ok(())
+    }
+
+    pub(super) fn graph_ready(&self) -> bool {
+        false
     }
 
     pub fn counters(&self) -> (u64, u64, u64) {

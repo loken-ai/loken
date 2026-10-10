@@ -274,7 +274,10 @@ impl GenericHeteroTransformer {
                 return Some("indexed attention selects its tokens on the host");
             }
         }
-        if l.moe.as_ref().is_some_and(|m| m.decodes_through_host()) {
+        // A cached layer whose host share is served through a mailbox records like any other.
+        if l.moe.as_ref().is_some_and(|m| {
+            m.decodes_through_host() && !m.tier.as_ref().is_some_and(|t| t.graph_ready())
+        }) {
             return Some("some routed experts are in host memory");
         }
         None

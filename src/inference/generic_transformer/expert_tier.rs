@@ -35,7 +35,26 @@ struct TierState {
     heat: Vec<f32>,
     /// Tokens since the counts last halved.
     since_decay: usize,
+    /// The card's copy of `slot_of`, while a recorded decode reads it.
+    table: Option<Arc<graph::SlotTable>>,
 }
+
+impl TierState {
+    /// Say that `expert` is in `slot`, or in none (`-1`), to the card as well.
+    fn set_slot(&mut self, expert: usize, slot: i32) {
+        self.slot_of[expert] = slot;
+        if let Some(t) = &self.table {
+            t.set(expert, slot);
+        }
+    }
+}
+
+mod graph;
+pub use graph::TierWorker;
+
+/// Set by the tests that run the kernels of a recorded decode without recording them.
+static GRAPH_WITHOUT_CAPTURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The hit rate from which a layer's extra slots are not given back to it after a prefill:
 /// of ten routed experts it misses half of one.
@@ -83,6 +102,8 @@ pub struct LayerTier {
     host_us: AtomicU64,
     /// Missing experts copied to the transit room for the token that wanted them.
     uploaded: AtomicU64,
+    /// The layer's side of a decode recorded in a graph, once enabled.
+    graph: std::sync::OnceLock<graph::GraphSide>,
 }
 
 /// What one decoded token moves between the card and the host, in page-locked memory and in
@@ -93,13 +114,10 @@ struct Scratch {
     /// Floats of the hidden row, and the routed experts per token, that the buffers are sized for.
     hidden: usize,
     k: usize,
-    /// On the card: the slot of each routed pair, its weight if the card runs it, and the
-    /// product the host sends back.
+    /// On the card: the slot of each routed pair (a slot past the base ones is in the extra
+    /// stacks), its weight if the card runs it, and the product the host sends back.
     slots: Tensor,
     weights: Tensor,
-    /// The same for the extra slots, which are in stacks of their own.
-    extra_slots: Tensor,
-    extra_weights: Tensor,
     product: Tensor,
     /// The same for the experts run from the transit room: their ids there and their weights.
     transit_ids: Tensor,
@@ -144,8 +162,6 @@ impl Scratch {
             k,
             slots: Tensor::from_vec(vec![0u32; k], (k,), &host)?.to_device(dev)?,
             weights: Tensor::from_vec(vec![0f32; k], (1, k), &host)?.to_device(dev)?,
-            extra_slots: Tensor::from_vec(vec![0u32; k], (k,), &host)?.to_device(dev)?,
-            extra_weights: Tensor::from_vec(vec![0f32; k], (1, k), &host)?.to_device(dev)?,
             product: Tensor::from_vec(vec![0f32; hidden], (1, hidden), &host)?.to_device(dev)?,
             transit_ids: Tensor::from_vec(vec![0u32; k], (k,), &host)?.to_device(dev)?,
             transit_weights: Tensor::from_vec(vec![0f32; k], (1, k), &host)?.to_device(dev)?,
@@ -208,17 +224,48 @@ fn address_of<T: crate::tensor::kernel_ffi::CudaDType>(t: &Tensor) -> Result<u64
     }
 }
 
+/// Wall time between marks along a call, recorded under the stage profile.
+struct Laps(Option<std::time::Instant>);
+
+impl Laps {
+    fn new() -> Self {
+        Self(crate::inference::offload::stage_prof_enabled().then(std::time::Instant::now))
+    }
+
+    /// The time since the last mark is the stage `name`'s.
+    fn mark(&mut self, name: &'static str) {
+        if let Some(t) = self.0 {
+            crate::inference::offload::prof_record(name, t.elapsed().as_nanos() as u64);
+            self.0 = Some(std::time::Instant::now());
+        }
+    }
+}
+
 /// The card's room for a layer's experts to pass through, and the copies that fill it.
 pub struct CardStager {
     dev: Device,
     /// Bytes per microsecond the host sends to this card, measured when the stager is made.
     bandwidth: f64,
     copy: Arc<cudarc::driver::CudaStream>,
+    /// Bytes of the widest stack of each kind: what the arenas of a wide batch hold.
+    widest: [usize; 3],
+    /// How many experts the transit room holds.
+    transit: usize,
+    /// The transit room: two sets of arenas, each a stack of `transit` experts, that consecutive
+    /// layers take turns over.
     buffers: [StageBuffer; 2],
+    /// The room a wide batch fills with a layer's whole stacks, from the memory the caches lend
+    /// while a prefill runs.
+    full: Mutex<Option<[FullBuffer; 2]>>,
 }
 
 /// One of two sets of arenas, a stack each, that consecutive layers take turns over.
 struct StageBuffer {
+    arenas: [Arc<cudarc::driver::CudaSlice<u8>>; 3],
+}
+
+/// [`StageBuffer`] wide enough for the whole stacks of the widest layer.
+struct FullBuffer {
     arenas: [Arc<cudarc::driver::CudaSlice<u8>>; 3],
     /// Recorded when the layer that read the buffer last has queued all its kernels: the next
     /// fill waits for it.
@@ -230,7 +277,10 @@ struct StageBuffer {
 struct Stage {
     stager: Arc<CardStager>,
     buffer: usize,
-    stacks: [QTensor; 3],
+    /// The transit room as stacks of `transit` experts.
+    compact: [QTensor; 3],
+    /// The whole stacks of the layer in the room of a wide batch, while there is one.
+    full: Mutex<Option<Arc<[QTensor; 3]>>>,
     /// The fill's end, when one has been queued and not yet read.
     ready: Mutex<Option<cudarc::driver::CudaEvent>>,
     /// Host ranges, per stack, that are page-locked: copies from them are asynchronous.
@@ -269,9 +319,8 @@ fn first_experts(host: &Arc<QTensor>, n: usize, dev: &Device) -> Result<QTensor>
     QTensor::from_native(Arc::new(view), dev)
 }
 
-/// [`first_experts`] with the card's copy in the memory pool of what is lent, so that freeing it
-/// returns its memory to the card.
-fn lent_experts(host: &Arc<QTensor>, n: usize, dev: &Device) -> Result<QTensor> {
+/// The first `n` experts of `host` as a view of the host's own bytes, and their size.
+fn first_view(host: &Arc<QTensor>, n: usize) -> Result<(Arc<QHostTensor>, usize)> {
     let inner = host.native_qtensor();
     let bytes = inner.data();
     let per_expert = bytes.len() / host.shape().dims()[0];
@@ -287,10 +336,17 @@ fn lent_experts(host: &Arc<QTensor>, n: usize, dev: &Device) -> Result<QTensor> 
         )
     }
     .map_err(|e| crate::tensor::Error::msg(e.0))?;
+    Ok((Arc::new(view), n * per_expert))
+}
+
+/// [`first_experts`] with the card's copy in the memory pool of what is lent, so that freeing it
+/// returns its memory to the card.
+fn lent_experts(host: &Arc<QTensor>, n: usize, dev: &Device) -> Result<QTensor> {
+    let (view, len) = first_view(host, n)?;
     let cd = dev.as_cuda_device()?;
-    let storage = QCudaStorage::zeroed_in_lent_pool(&cd, n * per_expert, host.dtype())
+    let storage = QCudaStorage::zeroed_in_lent_pool(&cd, len, host.dtype())
         .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-    Ok(QTensor::over_card(Arc::new(view), dev, storage))
+    Ok(QTensor::over_card(view, dev, storage))
 }
 
 impl super::GenericHeteroTransformer {
@@ -392,7 +448,12 @@ impl super::GenericHeteroTransformer {
             let chunk_bytes = (shape.bytes_per_token as u64)
                 .saturating_mul(shape.target_chunk as u64)
                 .saturating_add(shape.fixed_bytes as u64);
-            let held: u64 = 2 * widest.iter().sum::<usize>() as u64
+            // The rooms of the wide batches are lent by the cache while a prefill runs, so the
+            // base slots leave room for the transit room that stays and for the room those
+            // batches fill, which is taken from the lent slots.
+            let stager = CardStager::new(dev, widest, widest_mixture)?;
+            let held: u64 = stager.full_bytes()
+                + stager.transit_bytes()
                 + chunk_bytes.saturating_sub(before.saturating_sub(budget));
             let slots = expert_cache::slots_per_layer(
                 budget.saturating_sub(held),
@@ -409,9 +470,11 @@ impl super::GenericHeteroTransformer {
             // prefill gives back.
             let work_floor = crate::inference::place::runtime_demand::CUBLAS_WORKSPACE_BYTES
                 .saturating_add(shape.fixed_bytes as u64);
-            let lent = before.saturating_sub(budget).saturating_sub(work_floor);
+            let lent = before
+                .saturating_sub(budget)
+                .saturating_sub(work_floor)
+                .saturating_add(stager.full_bytes());
             let extra = (lent / bytes.max(1) as u64) as usize;
-            let stager = CardStager::new(dev, widest)?;
             let mut locked = 0usize;
             for (rank, &l) in tiered.iter().enumerate() {
                 let moe = self.layers[l]
@@ -433,10 +496,27 @@ impl super::GenericHeteroTransformer {
                 }
                 moe.tier = Some(Arc::new(tier));
             }
+            // The layers' decoded tokens run as kernels alone, served by one thread of the host.
+            let arcs: Vec<Arc<LayerTier>> = tiered
+                .iter()
+                .filter_map(|&l| self.layers[l].moe.as_ref().and_then(|m| m.tier.clone()))
+                .collect();
+            for &l in &tiered {
+                let moe = self.layers[l]
+                    .moe
+                    .as_ref()
+                    .expect("a tiered layer has experts");
+                if let Some(t) = &moe.tier {
+                    let hidden = t.host[0].shape().dims()[2];
+                    t.enable_graph(hidden, moe.n_experts_used)?;
+                }
+            }
+            self.tier_workers.push(TierWorker::start(dev, arcs)?);
             tracing::info!(
-                "expert tier on card {ordinal}: {} layers ({locked} with locked host pages, {:.1} GB/s to the card), {} experts each cached of {} ({extra} of them lent to a prefill), {:.2} GB",
+                "expert tier on card {ordinal}: {} layers ({locked} with locked host pages, {:.1} GB/s to the card, {} experts in the transit room), {} experts each cached of {} ({extra} of them lent to a prefill), {:.2} GB",
                 tiered.len(),
                 stager.bandwidth * 1e-3,
+                stager.transit,
                 (slots + extra).min(self.layers[first].moe.as_ref().map_or(0, |m| m.n_experts)),
                 self.layers[first].moe.as_ref().map_or(0, |m| m.n_experts),
                 ((slots + extra) * bytes) as f64 / 1e9
@@ -456,21 +536,52 @@ impl super::GenericHeteroTransformer {
             return 0;
         }
         let rows = tokens.min(shape.target_chunk);
-        let need = ((rows * shape.bytes_per_token + shape.fixed_bytes) as u64)
-            .saturating_mul(shape.share.max(1) as u64);
-        let free = crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards);
-        if free >= need {
-            return 0;
-        }
-        let lent = self
+        // A prompt that routes more pairs than a layer has experts reads nearly all of them: it
+        // fills a room with the layer's whole stacks, which the card has to find.
+        let wide = self
             .layers
             .iter()
-            .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
-            .filter(|t| t.lend_extra())
-            .count();
+            .filter_map(|l| l.moe.as_ref())
+            .any(|m| m.tier.is_some() && tokens * m.n_experts_used >= m.n_experts);
+        let room = if wide {
+            self.layers
+                .iter()
+                .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
+                .filter_map(|t| t.stager())
+                .map(|s| s.full_bytes())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let need = ((rows * shape.bytes_per_token + shape.fixed_bytes) as u64)
+            .saturating_mul(shape.share.max(1) as u64)
+            .saturating_add(room);
+        let free = crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards);
+        let lent = if free >= need {
+            0
+        } else {
+            self.layers
+                .iter()
+                .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
+                .filter(|t| t.lend_extra())
+                .count()
+        };
         if lent > 0 {
             crate::inference::place::ladder::release_pools();
             crate::inference::place::vram_manager::residency_changed();
+        }
+        if wide {
+            for tier in self
+                .layers
+                .iter()
+                .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
+            {
+                if let Err(e) = tier.attach_full() {
+                    tracing::warn!("a wide batch's room did not fit: {e}");
+                    break;
+                }
+            }
         }
         lent
     }
@@ -479,12 +590,34 @@ impl super::GenericHeteroTransformer {
     /// hottest. How many experts were copied.
     pub fn return_expert_cache(&mut self) -> Result<usize> {
         let mut copied = 0;
+        let mut stagers: Vec<Arc<CardStager>> = Vec::new();
         for tier in self
             .layers
             .iter()
             .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
         {
-            copied += tier.restore_extra()?;
+            tier.detach_full();
+            if let Some(s) = tier.stager() {
+                if !stagers.iter().any(|t| Arc::ptr_eq(t, &s)) {
+                    stagers.push(s);
+                }
+            }
+        }
+        for stager in &stagers {
+            stager.drop_full();
+        }
+        // What the prefill left in the pools goes back to the card before the slots take theirs.
+        crate::inference::place::ladder::release_pools();
+        for tier in self
+            .layers
+            .iter()
+            .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
+        {
+            // A layer that cannot take its slots back runs on without them.
+            match tier.restore_extra() {
+                Ok(n) => copied += n,
+                Err(e) => tracing::warn!("expert tier: the extra slots did not come back: {e}"),
+            }
         }
         crate::inference::place::vram_manager::residency_changed();
         Ok(copied)
@@ -501,7 +634,43 @@ impl LayerTier {
         pin: bool,
     ) -> Result<Self> {
         self.stage = Some(Stage::new(stager, buffer, &self.host, pin)?);
+        self.attach_full()?;
         Ok(self)
+    }
+
+    /// The layer's whole stacks over the room of a wide batch, which is made if it is not.
+    pub fn attach_full(&self) -> Result<()> {
+        let Some(stage) = self.stage.as_ref() else {
+            return Ok(());
+        };
+        stage.stager.ensure_full()?;
+        let cd = self.dev.as_cuda_device()?;
+        let full = stage.stager.full.lock().unwrap_or_else(|e| e.into_inner());
+        let arenas = &full.as_ref().expect("the room was made")[stage.buffer].arenas;
+        let mk = |i: usize| {
+            let inner = self.host[i].native_qtensor().clone();
+            let len = inner.data().len();
+            let storage = QCudaStorage::sharing(arenas[i].clone(), len, self.host[i].dtype(), &cd);
+            QTensor::over_card(inner, &self.dev, storage)
+        };
+        *stage.full.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::new([mk(0), mk(1), mk(2)]));
+        Ok(())
+    }
+
+    /// Let go of the layer's view of the room of a wide batch.
+    pub fn detach_full(&self) {
+        if let Some(stage) = self.stage.as_ref() {
+            *stage.full.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *stage.ready.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            stage.filled.store(false, Ordering::Release);
+            stage.held.store(false, Ordering::Release);
+        }
+    }
+
+    /// The rooms of the wide batches, made for the card of every layer that has one.
+    pub fn stager(&self) -> Option<Arc<CardStager>> {
+        self.stage.as_ref().map(|s| s.stager.clone())
     }
 }
 
@@ -626,6 +795,7 @@ impl LayerTier {
                 owner,
                 heat: vec![0.0; moe.n_experts],
                 since_decay: 0,
+                table: None,
             }),
             hits: AtomicU64::new(0),
             routed: AtomicU64::new(0),
@@ -646,6 +816,7 @@ impl LayerTier {
             upload_us: AtomicU64::new(0),
             host_us: AtomicU64::new(0),
             uploaded: AtomicU64::new(0),
+            graph: std::sync::OnceLock::new(),
         })
     }
 
@@ -719,7 +890,7 @@ impl LayerTier {
             for s in self.base_slots..st.owner.len() {
                 if st.owner[s] >= 0 {
                     let e = st.owner[s] as usize;
-                    st.slot_of[e] = -1;
+                    st.set_slot(e, -1);
                 }
                 st.owner[s] = -3;
             }
@@ -732,9 +903,11 @@ impl LayerTier {
         true
     }
 
-    /// Take the extra slots' memory back and fill them with the hottest experts the base slots
-    /// do not hold. How many experts were copied.
-    pub fn restore_extra(&self) -> Result<usize> {
+    /// Take the extra slots' memory back and fill them, from the cache's copier thread, with the
+    /// hottest experts the base slots do not hold: the slots take no expert until its copy has
+    /// landed, and nothing else takes them meanwhile. A card with less room than the slots took
+    /// gets as many of them as fit. How many experts are on their way.
+    pub fn restore_extra(self: &Arc<Self>) -> Result<usize> {
         let n = self.extra_slots();
         // A layer that already finds nearly every expert on the card gains nothing from more
         // slots, and a prefill takes their memory again.
@@ -747,16 +920,46 @@ impl LayerTier {
             if extra.is_some() || n == 0 {
                 return Ok(0);
             }
-            *extra = Some([
-                lent_experts(&self.host[0], n, &self.dev)?,
-                lent_experts(&self.host[1], n, &self.dev)?,
-                lent_experts(&self.host[2], n, &self.dev)?,
-            ]);
+            let mut fit = n;
+            let stacks = loop {
+                let made = (|| -> Result<[QTensor; 3]> {
+                    Ok([
+                        lent_experts(&self.host[0], fit, &self.dev)?,
+                        lent_experts(&self.host[1], fit, &self.dev)?,
+                        lent_experts(&self.host[2], fit, &self.dev)?,
+                    ])
+                })();
+                match made {
+                    Ok(stacks) => break Some(stacks),
+                    Err(e) => {
+                        if let Ok(cd) = self.dev.as_cuda_device() {
+                            let _ = cd.0.stream().synchronize();
+                            crate::tensor::quantized::trim_lent_pool(cd.0.ordinal());
+                        }
+                        if fit <= 1 {
+                            tracing::warn!("expert tier: no room for the extra slots: {e}");
+                            break None;
+                        }
+                        fit /= 2;
+                    }
+                }
+            };
+            let Some(stacks) = stacks else {
+                return Ok(0);
+            };
+            *extra = Some(stacks);
+            drop(extra);
+            return self.fill_extra(fit);
         }
+    }
+
+    /// Fill the first `n` extra slots, now with memory behind them, from the hottest experts the
+    /// base slots do not hold. How many experts are on their way.
+    fn fill_extra(self: &Arc<Self>, n: usize) -> Result<usize> {
         let wanted: Vec<usize> = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            for s in self.base_slots..st.owner.len() {
-                st.owner[s] = -1;
+            for s in self.base_slots..self.base_slots + n {
+                st.owner[s] = -2;
             }
             let mut order: Vec<usize> = (0..self.n_experts)
                 .filter(|&e| st.slot_of[e] < 0 && st.heat[e] > 0.0)
@@ -765,20 +968,39 @@ impl LayerTier {
             order.truncate(n);
             order
         };
-        for (j, &e) in wanted.iter().enumerate() {
-            let slot = self.base_slots + j;
-            self.copy_in_async(e, slot)?;
-        }
-        self.copy
-            .synchronize()
-            .map_err(|e| crate::tensor::Error::msg(format!("slot copy: {e:?}")))?;
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        for (j, &e) in wanted.iter().enumerate() {
-            let slot = self.base_slots + j;
-            st.owner[slot] = e as i32;
-            st.slot_of[e] = slot as i32;
-        }
-        Ok(wanted.len())
+        self.settle();
+        self.promoting.store(true, Ordering::Release);
+        let tier = self.clone();
+        let count = wanted.len();
+        copier(self.dev.as_cuda_device().map_or(0, |d| d.0.ordinal()))
+            .send(Box::new(move || {
+                let landed = (|| -> Result<()> {
+                    for (j, &e) in wanted.iter().enumerate() {
+                        tier.copy_in_async(e, tier.base_slots + j)?;
+                    }
+                    tier.copy
+                        .synchronize()
+                        .map_err(|e| crate::tensor::Error::msg(format!("slot copy: {e:?}")))
+                })();
+                let mut st = tier.state.lock().unwrap_or_else(|e| e.into_inner());
+                for s in tier.base_slots..tier.base_slots + n {
+                    st.owner[s] = -1;
+                }
+                match landed {
+                    Ok(()) => {
+                        for (j, &e) in wanted.iter().enumerate() {
+                            let slot = tier.base_slots + j;
+                            st.owner[slot] = e as i32;
+                            st.set_slot(e, slot as i32);
+                        }
+                    }
+                    Err(e) => tracing::warn!("expert tier: refilling the extra slots: {e}"),
+                }
+                drop(st);
+                tier.promoting.store(false, Ordering::Release);
+            }))
+            .ok();
+        Ok(count)
     }
 
     /// Wait for the copy in flight, if any, to land.
@@ -821,6 +1043,13 @@ impl LayerTier {
         weights: &Tensor,
     ) -> Result<Tensor> {
         let started = std::time::Instant::now();
+        // A recorded decode takes the layer through the card's kernels alone.
+        if self.graph_ready()
+            && (crate::tensor::cuda_ext::capture_active(&xs.device())
+                || GRAPH_WITHOUT_CAPTURE.load(Ordering::Relaxed))
+        {
+            return self.decode_graph(moe, xs, ids, weights);
+        }
         let out = self.decode_token(moe, xs, ids, weights);
         let us = started.elapsed().as_micros() as u64;
         let before = self.decode_us.load(Ordering::Relaxed);
@@ -854,6 +1083,7 @@ impl LayerTier {
             *guard = Some(Scratch::new(&dev, hidden, k)?);
         }
         let scratch = guard.as_ref().expect("made above");
+        let mut laps = Laps::new();
         // The last token's copies into the transit room are done: what they took sets the pace
         // this one's are split by.
         let carried = scratch.in_flight.swap(0, Ordering::Relaxed);
@@ -912,6 +1142,7 @@ impl LayerTier {
                 t.elapsed().as_nanos() as u64,
             );
         }
+        laps.mark("tier token: choice wait");
         let (ids_h, w_h): (Vec<u32>, Vec<f32>) = (h_ids.to_vec(), h_w.to_vec());
         // Partition by what the card holds now, and count the use.
         let mut slot_ids = vec![0u32; k];
@@ -965,10 +1196,11 @@ impl LayerTier {
         let to_transit = self.transit_share(miss_ids.len());
         let (transit_ids, host_ids) = miss_ids.split_at(to_transit);
         let (transit_w, host_w) = miss_weights.split_at(to_transit);
+        laps.mark("tier token: partition");
 
-        // The card's share is launched first, and runs while the host does its own.
+        // The card's share is launched first, and runs while the host does its own. A routed pair
+        // whose expert is missing reads a slot that is in use and weighs zero.
         let card_out = if hits > 0 {
-            // A routed pair whose expert is missing reads a slot that is in use and weighs zero.
             let filler = (0..k)
                 .find(|&i| is_hit[i])
                 .map(|i| slot_ids[i])
@@ -978,133 +1210,48 @@ impl LayerTier {
                     slot_ids[i] = filler;
                 }
             }
-            // The slots past the base ones are in the extra stacks, launched apart. A pair a stack
-            // does not serve reads a slot of that stack which this token reads, and weighs zero.
-            let first_extra = self.base_slots as u32;
-            let hit_slots: Vec<(usize, u32)> = (0..k)
-                .filter(|&i| is_hit[i])
-                .map(|i| (i, slot_ids[i]))
-                .collect();
-            let base_filler = hit_slots.iter().find(|h| h.1 < first_extra).map(|h| h.1);
-            let extra_filler = hit_slots
-                .iter()
-                .find(|h| h.1 >= first_extra)
-                .map(|h| h.1 - first_extra);
-            let (base_hits, extra_hits) = (
-                hit_slots.iter().filter(|h| h.1 < first_extra).count(),
-                hit_slots.iter().filter(|h| h.1 >= first_extra).count(),
-            );
-            slot_ids = vec![base_filler.unwrap_or(0); k];
-            let mut extra_ids = vec![extra_filler.unwrap_or(0); k];
-            let mut extra_w = vec![0f32; k];
-            let mut base_w = vec![0f32; k];
-            for &(i, s) in &hit_slots {
-                if s < first_extra {
-                    slot_ids[i] = s;
-                    base_w[i] = hit_weights[i];
-                } else {
-                    extra_ids[i] = s - first_extra;
-                    extra_w[i] = hit_weights[i];
-                }
-            }
-            hit_weights = base_w;
-            let base_out = if base_hits > 0 {
-                h_slots.copy_from_slice(&slot_ids);
-                h_hw.copy_from_slice(&hit_weights);
-                for (dst, src, bytes) in [
-                    (
-                        address_of::<u32>(&scratch.slots)?,
-                        h_slots.as_ptr() as *const std::ffi::c_void,
-                        4 * k,
-                    ),
-                    (
-                        address_of::<f32>(&scratch.weights)?,
-                        h_hw.as_ptr() as *const std::ffi::c_void,
-                        4 * k,
-                    ),
-                ] {
-                    driver("slots to card", unsafe {
-                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                            dst,
-                            src,
-                            bytes,
-                            stream.cu_stream(),
-                        )
-                    })?;
-                }
-                let routing = ExpertRouting {
-                    slots: moe.decode_slots.clone().expect("a tier layer is on a card"),
-                    experts: scratch.slots.clone(),
-                    topk: k,
-                };
-                let h = routing.gate_up_silu(xs, &self.card[0], &self.card[1])?;
-                Some(routing.down_reduce(
-                    &h,
-                    &self.card[2],
-                    &scratch.weights,
-                    1,
-                    false,
-                    None,
-                    None,
-                )?)
-            } else {
-                None
-            };
-            let extra_out = if extra_hits > 0 {
-                let extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
-                let stacks = extra
-                    .as_ref()
-                    .expect("an extra slot that holds an expert is not lent");
-                for (dst, src, bytes) in [
-                    (
-                        address_of::<u32>(&scratch.extra_slots)?,
-                        extra_ids.as_ptr() as *const std::ffi::c_void,
-                        4 * k,
-                    ),
-                    (
-                        address_of::<f32>(&scratch.extra_weights)?,
-                        extra_w.as_ptr() as *const std::ffi::c_void,
-                        4 * k,
-                    ),
-                ] {
-                    driver("extra slots to card", unsafe {
-                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                            dst,
-                            src,
-                            bytes,
-                            stream.cu_stream(),
-                        )
-                    })?;
-                }
-                let routing = ExpertRouting {
-                    slots: moe.decode_slots.clone().expect("a tier layer is on a card"),
-                    experts: scratch.extra_slots.clone(),
-                    topk: k,
-                };
-                let h = routing.gate_up_silu(xs, &stacks[0], &stacks[1])?;
-                Some(routing.down_reduce(
-                    &h,
-                    &stacks[2],
-                    &scratch.extra_weights,
-                    1,
-                    false,
-                    None,
-                    None,
-                )?)
-            } else {
-                None
-            };
-            match (base_out, extra_out) {
-                (Some(a), Some(b)) => Some(
-                    (a.to_dtype(crate::tensor::DType::F32)?
-                        + b.to_dtype(crate::tensor::DType::F32)?)?,
+            h_slots.copy_from_slice(&slot_ids);
+            h_hw.copy_from_slice(&hit_weights);
+            for (dst, src, bytes) in [
+                (
+                    address_of::<u32>(&scratch.slots)?,
+                    h_slots.as_ptr() as *const std::ffi::c_void,
+                    4 * k,
                 ),
-                (a, b) => a.or(b),
+                (
+                    address_of::<f32>(&scratch.weights)?,
+                    h_hw.as_ptr() as *const std::ffi::c_void,
+                    4 * k,
+                ),
+            ] {
+                driver("slots to card", unsafe {
+                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dst, src, bytes, stream.cu_stream())
+                })?;
             }
+            let routing = ExpertRouting {
+                slots: moe.decode_slots.clone().expect("a tier layer is on a card"),
+                experts: scratch.slots.clone(),
+                topk: k,
+            };
+            // The slots past the base ones are in the extra stacks: one launch reads both.
+            let extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
+            let more = extra.as_ref();
+            let h = routing.gate_up_silu_over(
+                xs,
+                &self.card[0],
+                &self.card[1],
+                more.map(|m| (&m[0], &m[1])),
+            )?;
+            Some(routing.down_reduce_over(
+                &h,
+                &self.card[2],
+                more.map(|m| &m[2]),
+                &scratch.weights,
+            )?)
         } else {
             None
         };
-
+        laps.mark("tier token: card launch");
         // The copies into the transit room start now, and the host's share is computed while they
         // run.
         let transit_landed = if transit_ids.is_empty() {
@@ -1113,6 +1260,7 @@ impl LayerTier {
             self.copy_to_transit(scratch, transit_ids)?;
             true
         };
+        laps.mark("tier token: transit copy");
         let t_host = std::time::Instant::now();
         let host_out = if host_ids.is_empty() {
             false
@@ -1145,12 +1293,14 @@ impl LayerTier {
                 t_host.elapsed().as_nanos() as u64,
             );
         }
+        laps.mark("tier token: host experts");
         // The experts in the transit room run once the copies have landed.
         let transit_out = if transit_landed {
             let stage = self.stage.as_ref().expect("a copy to transit has a stage");
-            let filler = transit_ids[0];
+            // The experts sit in the room in the order they were copied; the pairs left over
+            // read the first with no weight.
             for i in 0..k {
-                h_tids[i] = transit_ids.get(i).copied().unwrap_or(filler);
+                h_tids[i] = if i < transit_ids.len() { i as u32 } else { 0 };
                 h_tw[i] = transit_w.get(i).copied().unwrap_or(0.0);
             }
             for (dst, src, bytes) in [
@@ -1177,10 +1327,10 @@ impl LayerTier {
                 experts: scratch.transit_ids.clone(),
                 topk: k,
             };
-            let h = routing.gate_up_silu(xs, &stage.stacks[0], &stage.stacks[1])?;
+            let h = routing.gate_up_silu(xs, &stage.compact[0], &stage.compact[1])?;
             Some(routing.down_reduce(
                 &h,
-                &stage.stacks[2],
+                &stage.compact[2],
                 &scratch.transit_weights,
                 1,
                 false,
@@ -1190,6 +1340,7 @@ impl LayerTier {
         } else {
             None
         };
+        laps.mark("tier token: transit launch");
         // Fresh tensors: the buffers on the card are this layer's, written again by the next token.
         let mut out: Option<Tensor> = None;
         for part in [card_out, transit_out] {
@@ -1212,13 +1363,9 @@ impl LayerTier {
         // An expert that came to the card for this token stays in a slot where it is hotter than
         // what the slot holds, without a second copy over the link; the host's misses go to the
         // worker.
-        self.keep_in_transit(transit_ids, &mut in_use, &stream)?;
+        self.keep_in_transit(transit_ids, false, &mut in_use, &stream)?;
         self.promote(host_ids, &in_use);
-        // The experts in the transit room are read by kernels now queued: the room is free for
-        // the next fill once they have run.
-        if !transit_ids.is_empty() {
-            self.release_stacks()?;
-        }
+        laps.mark("tier token: finish");
         Ok(out)
     }
 
@@ -1246,6 +1393,7 @@ impl LayerTier {
             *guard = Some(Scratch::new(&dev, hidden, k)?);
         }
         let scratch = guard.as_ref().expect("made above");
+        let mut laps = Laps::new();
         let carried = scratch.in_flight.swap(0, Ordering::Relaxed);
         if carried > 0 {
             if let Ok(ms) = scratch.upload_start.elapsed_ms(&scratch.upload_end) {
@@ -1263,6 +1411,7 @@ impl LayerTier {
             .to_device(&host)?
             .flatten_all()?
             .to_vec1()?;
+        laps.mark("tier rows: choice wait");
         // Partition every routed pair by what the card holds now, and count the use.
         let mut slot_ids = vec![0u32; rows * k];
         let mut hit_weights = vec![0f32; rows * k];
@@ -1302,6 +1451,7 @@ impl LayerTier {
         missing.sort_by(|a, b| users[b].cmp(&users[a]).then(a.cmp(b)));
         let to_transit = self.transit_share(missing.len());
         let transit_experts: Vec<u32> = missing[..to_transit].to_vec();
+        laps.mark("tier rows: partition");
 
         // The card's share is launched first, and runs while the host does its own.
         let card_out = if hits > 0 {
@@ -1382,11 +1532,13 @@ impl LayerTier {
             None
         };
 
+        laps.mark("tier rows: card launch");
         // The copies into the transit room start now, and the host's share is computed while
         // they run.
         if !transit_experts.is_empty() {
             self.copy_to_transit(scratch, &transit_experts)?;
         }
+        laps.mark("tier rows: transit copy");
         let t_host = std::time::Instant::now();
         // The host computes each expert it was given once, for every row that routes to it, so
         // the blocks are read from memory once however many rows use them.
@@ -1435,6 +1587,7 @@ impl LayerTier {
             );
             Some(Tensor::from_vec(product, (rows, hidden), &host)?.to_device(&dev)?)
         };
+        laps.mark("tier rows: host experts");
 
         // The experts in the transit room run once the copies have landed.
         let transit_out = if transit_experts.is_empty() {
@@ -1444,12 +1597,14 @@ impl LayerTier {
             stream
                 .wait(&scratch.upload_end)
                 .map_err(|e| crate::tensor::Error::msg(format!("wait: {e:?}")))?;
-            let filler = transit_experts[0];
-            let mut t_ids = vec![filler; pairs];
+            let mut t_ids = vec![0u32; pairs];
             let mut t_w = vec![0f32; pairs];
             for p in 0..pairs {
-                if !is_hit[p] && transit_experts.contains(&ids_h[p]) {
-                    t_ids[p] = ids_h[p];
+                if is_hit[p] {
+                    continue;
+                }
+                if let Some(at) = transit_experts.iter().position(|&e| e == ids_h[p]) {
+                    t_ids[p] = at as u32;
                     t_w[p] = w_h[p];
                 }
             }
@@ -1463,9 +1618,10 @@ impl LayerTier {
                 false,
                 None,
                 None,
-                Some(&stage.stacks),
+                Some(&stage.compact),
             )?)
         };
+        laps.mark("tier rows: transit launch");
         let mut out: Option<Tensor> = None;
         for part in [card_out, transit_out, host_out] {
             out = match (out, part) {
@@ -1478,11 +1634,9 @@ impl LayerTier {
         }
         let out = out.expect("a token routes to at least one expert");
         drop(guard);
-        self.keep_in_transit(&transit_experts, &mut in_use, &stream)?;
+        self.keep_in_transit(&transit_experts, false, &mut in_use, &stream)?;
         self.promote(&host_experts, &in_use);
-        if !transit_experts.is_empty() {
-            self.release_stacks()?;
-        }
+        laps.mark("tier rows: finish");
         Ok(out)
     }
 
@@ -1550,16 +1704,19 @@ impl LayerTier {
                 .collect()
         };
         let mut in_use = vec![false; self.slots()];
-        self.keep_in_transit(&present, &mut in_use, stream)
+        self.keep_in_transit(&present, true, &mut in_use, stream)
     }
 
     /// Move the experts of `experts` that are in the transit room, hottest first, into the slots
     /// that hold something colder and are not read by this token, as copies on the card behind the
     /// token's own work: a kernel that reads a slot later is queued after its copy. `in_use` marks
-    /// the slots this token reads, and is extended with the slots filled here.
+    /// the slots this token reads, and is extended with the slots filled here. The experts are in
+    /// the order they were copied in the transit room, or each at its own place in the room of a
+    /// wide batch (`by_id`).
     fn keep_in_transit(
         &self,
         experts: &[u32],
+        by_id: bool,
         in_use: &mut [bool],
         stream: &Arc<cudarc::driver::CudaStream>,
     ) -> Result<()> {
@@ -1567,13 +1724,26 @@ impl LayerTier {
         let Some(stage) = self.stage.as_ref() else {
             return Ok(());
         };
-        let buffer = &stage.stager.buffers[stage.buffer];
-        let mut order: Vec<u32> = experts.to_vec();
+        let full;
+        let arenas = if by_id {
+            full = stage.stager.full.lock().unwrap_or_else(|e| e.into_inner());
+            match full.as_ref() {
+                Some(f) => &f[stage.buffer].arenas,
+                None => return Ok(()),
+            }
+        } else {
+            &stage.stager.buffers[stage.buffer].arenas
+        };
+        let mut order: Vec<(u32, usize)> = experts
+            .iter()
+            .enumerate()
+            .map(|(j, &e)| (e, if by_id { e as usize } else { j }))
+            .collect();
         let mut moves = Vec::new();
         {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            order.sort_by(|&a, &b| st.heat[b as usize].total_cmp(&st.heat[a as usize]));
-            for &e in &order {
+            order.sort_by(|a, b| st.heat[b.0 as usize].total_cmp(&st.heat[a.0 as usize]));
+            for &(e, at) in &order {
                 let victim = (0..st.owner.len())
                     .filter(|&slot| !in_use[slot] && st.owner[slot] >= -1)
                     .min_by(|&a, &b| slot_heat(&st, a).total_cmp(&slot_heat(&st, b)));
@@ -1585,19 +1755,19 @@ impl LayerTier {
                 }
                 let old = st.owner[victim];
                 if old >= 0 {
-                    st.slot_of[old as usize] = -1;
+                    st.set_slot(old as usize, -1);
                 }
                 st.owner[victim] = e as i32;
-                st.slot_of[e as usize] = victim as i32;
+                st.set_slot(e as usize, victim as i32);
                 in_use[victim] = true;
-                moves.push((e as usize, victim));
+                moves.push((at, victim));
             }
         }
-        for (expert, slot) in moves.iter().copied() {
+        for (at, slot) in moves.iter().copied() {
             for i in 0..3 {
                 let eb = self.expert_bytes[i];
-                let arena = &buffer.arenas[i];
-                let from = arena.device_ptr(arena.stream()).0 + (expert * eb) as u64;
+                let arena = &arenas[i];
+                let from = arena.device_ptr(arena.stream()).0 + (at * eb) as u64;
                 let to = self.slot_addr(i, slot)?;
                 driver("transit to slot", unsafe {
                     cudarc::driver::sys::cuMemcpyDtoDAsync_v2(to, from, eb, stream.cu_stream())
@@ -1625,17 +1795,18 @@ impl LayerTier {
             }
             copy = self.expert_bytes.iter().sum::<usize>() as f64 / rate;
         }
+        let room = self.stage.as_ref().map_or(0, |s| s.stager.transit);
         if host == 0.0 {
-            return if missing > 1 { missing - 1 } else { missing };
+            return (if missing > 1 { missing - 1 } else { missing }).min(room);
         }
         let finish = |n: usize| (n as f64 * copy).max((missing - n) as f64 * host);
-        (0..=missing)
+        (0..=missing.min(room))
             .min_by(|&a, &b| finish(a).total_cmp(&finish(b)))
             .unwrap_or(0)
     }
 
-    /// Queue the copies of `experts` from the host into the transit room, at their own places in
-    /// it, and the events around them.
+    /// Queue the copies of `experts` from the host into the transit room, one after the other
+    /// from its start, and the events around them.
     fn copy_to_transit(&self, scratch: &Scratch, experts: &[u32]) -> Result<()> {
         use cudarc::driver::DevicePtr;
         let stage = self.stage.as_ref().expect("a copy to transit has a stage");
@@ -1651,20 +1822,9 @@ impl LayerTier {
             let arena = &buffer.arenas[i];
             let base = arena.device_ptr(arena.stream()).0;
             let data = self.host[i].native_qtensor().data();
-            // The kernels read whole blocks past the end of a stack: that tail is zero.
-            if experts.contains(&(self.n_experts as u32 - 1)) {
-                driver("transit tail", unsafe {
-                    cudarc::driver::sys::cuMemsetD8Async(
-                        base + data.len() as u64,
-                        0,
-                        crate::tensor::quantized::BLOB_TAIL_PAD_BYTES,
-                        copy.cu_stream(),
-                    )
-                })?;
-            }
-            for &e in experts {
+            for (at, &e) in experts.iter().enumerate() {
                 let e = e as usize;
-                self.upload(i, data, e * eb, eb, base + (e * eb) as u64, copy)?;
+                self.upload(i, data, e * eb, eb, base + (at * eb) as u64, copy)?;
             }
         }
         scratch
@@ -1697,7 +1857,7 @@ impl LayerTier {
                 (Some(hot), Some(victim)) if st.heat[hot as usize] > slot_heat(&st, victim) => {
                     let old = st.owner[victim];
                     if old >= 0 {
-                        st.slot_of[old as usize] = -1;
+                        st.set_slot(old as usize, -1);
                     }
                     st.owner[victim] = -2;
                     Some((hot as usize, victim))
@@ -1717,7 +1877,7 @@ impl LayerTier {
                 match landed {
                     Ok(()) => {
                         st.owner[slot] = expert as i32;
-                        st.slot_of[expert] = slot as i32;
+                        st.set_slot(expert, slot as i32);
                         tier.promotions.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
@@ -1803,35 +1963,139 @@ fn driver(what: &str, r: cudarc::driver::sys::cudaError_enum) -> Result<()> {
 }
 
 impl CardStager {
-    /// Room on `dev` for a layer's experts to pass through: two sets of arenas, each a stack
-    /// wide enough for the widest of the layers, `widest` bytes per stack.
-    pub fn new(dev: &Device, widest: [usize; 3]) -> Result<Arc<Self>> {
+    /// Room on `dev` for experts to pass through: two sets of arenas for the transit room, each
+    /// holding the experts the link can carry while the host computes the rest of a token's
+    /// misses, of the `experts` a layer has, `widest` bytes per stack for the widest layer. The
+    /// rooms a wide batch fills with whole stacks are made when a prefill runs, see
+    /// [`Self::ensure_full`].
+    pub fn new(dev: &Device, widest: [usize; 3], experts: usize) -> Result<Arc<Self>> {
         let cd = dev.as_cuda_device()?;
         let copy =
             cd.0.context()
                 .new_stream()
                 .map_err(|e| crate::tensor::Error::msg(format!("copy stream: {e:?}")))?;
+        let experts = experts.max(1);
+        let per_expert = widest.map(|w| w.div_ceil(experts));
+        let bandwidth = {
+            let bytes = widest[0].min(1 << 26);
+            let probe = QCudaStorage::arena(&cd, bytes)
+                .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+            measure_upload_bandwidth(dev, &probe, bytes)?
+        };
+        let transit = transit_experts(experts, bandwidth, host_read_bandwidth(widest[0]));
         let buffer = || -> Result<StageBuffer> {
+            let arena = |i: usize| {
+                QCudaStorage::arena(&cd, per_expert[i] * transit)
+                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))
+            };
             Ok(StageBuffer {
-                arenas: [
-                    QCudaStorage::arena(&cd, widest[0])
-                        .map_err(|e| crate::tensor::Error::msg(e.to_string()))?,
-                    QCudaStorage::arena(&cd, widest[1])
-                        .map_err(|e| crate::tensor::Error::msg(e.to_string()))?,
-                    QCudaStorage::arena(&cd, widest[2])
-                        .map_err(|e| crate::tensor::Error::msg(e.to_string()))?,
-                ],
-                free: Mutex::new(None),
+                arenas: [arena(0)?, arena(1)?, arena(2)?],
             })
         };
         let buffers = [buffer()?, buffer()?];
-        let bandwidth = measure_upload_bandwidth(dev, &buffers[0].arenas[0], widest[0])?;
         Ok(Arc::new(Self {
             dev: dev.clone(),
             bandwidth,
             copy,
+            widest,
+            transit,
             buffers,
+            full: Mutex::new(None),
         }))
+    }
+
+    /// Bytes the transit room takes on the card.
+    pub fn transit_bytes(&self) -> u64 {
+        self.buffers
+            .iter()
+            .flat_map(|b| b.arenas.iter())
+            .map(|a| a.len() as u64)
+            .sum()
+    }
+
+    /// Bytes the rooms of a wide batch take on the card.
+    pub fn full_bytes(&self) -> u64 {
+        2 * self.widest.iter().sum::<usize>() as u64
+    }
+
+    /// Make the rooms a wide batch fills with a layer's whole stacks, from the memory the caches
+    /// lend. Nothing is done while they exist.
+    pub fn ensure_full(&self) -> Result<()> {
+        let mut full = self.full.lock().unwrap_or_else(|e| e.into_inner());
+        if full.is_some() {
+            return Ok(());
+        }
+        let cd = self.dev.as_cuda_device()?;
+        let one = || -> Result<FullBuffer> {
+            let arena = |i: usize| {
+                QCudaStorage::arena_in_lent_pool(&cd, self.widest[i])
+                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))
+            };
+            Ok(FullBuffer {
+                arenas: [arena(0)?, arena(1)?, arena(2)?],
+                free: Mutex::new(None),
+            })
+        };
+        *full = Some([one()?, one()?]);
+        // The arenas were zeroed in the order of the compute stream: the copies into them wait
+        // for that.
+        cd.0.stream()
+            .synchronize()
+            .map_err(|e| crate::tensor::Error::msg(format!("compute stream: {e:?}")))?;
+        Ok(())
+    }
+
+    /// Give the card the rooms of a wide batch back, once the copies into them have landed.
+    pub fn drop_full(&self) {
+        let _ = self.copy.synchronize();
+        let dropped = self
+            .full
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .is_some();
+        if dropped {
+            if let Ok(cd) = self.dev.as_cuda_device() {
+                let _ = cd.0.stream().synchronize();
+                crate::tensor::quantized::trim_lent_pool(cd.0.ordinal());
+            }
+        }
+    }
+}
+
+/// How many of a layer's `experts` the transit room holds: a token's misses are split between
+/// the link and the host so that both finish together, which sends the link the share
+/// `link / (link + host)` of them, the two rates being bytes per microsecond.
+fn transit_experts(experts: usize, link: f64, host: f64) -> usize {
+    if link <= 0.0 || host <= 0.0 {
+        return experts;
+    }
+    let share = link / (link + host);
+    ((experts as f64 * share).ceil() as usize).clamp(1, experts)
+}
+
+/// Bytes per microsecond the host's threads read a stack of `bytes` bytes at, as the host
+/// computation of an expert does: the best of a few reads of a block of zeros that is not in any
+/// cache. Zero when it could not be measured.
+fn host_read_bandwidth(bytes: usize) -> f64 {
+    use rayon::prelude::*;
+    let len = bytes.clamp(1 << 20, 1 << 28);
+    let block = vec![1u8; len];
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let t = std::time::Instant::now();
+        let sum: u64 = block
+            .par_chunks(1 << 16)
+            .map(|c| c.iter().map(|&b| b as u64).sum::<u64>())
+            .sum();
+        let us = t.elapsed().as_secs_f64() * 1e6;
+        std::hint::black_box(sum);
+        best = best.min(us);
+    }
+    if best.is_finite() && best > 0.0 {
+        len as f64 / best
+    } else {
+        0.0
     }
 }
 
@@ -1895,16 +2159,15 @@ impl Stage {
         cd.0.context()
             .bind_to_thread()
             .map_err(|e| crate::tensor::Error::msg(format!("bind context: {e:?}")))?;
-        let mk = |i: usize| -> QTensor {
-            let inner = host[i].native_qtensor().clone();
-            let len = inner.data().len();
+        let mk = |i: usize| -> Result<QTensor> {
+            let (inner, len) = first_view(&host[i], stager.transit)?;
             let storage = QCudaStorage::sharing(
                 stager.buffers[buffer].arenas[i].clone(),
                 len,
                 host[i].dtype(),
                 &cd,
             );
-            QTensor::over_card(inner, &stager.dev, storage)
+            Ok(QTensor::over_card(inner, &stager.dev, storage))
         };
         let pinned = [0, 1, 2].map(|i| {
             if !pin {
@@ -1916,7 +2179,8 @@ impl Stage {
         Ok(Self {
             stager: stager.clone(),
             buffer,
-            stacks: [mk(0), mk(1), mk(2)],
+            compact: [mk(0)?, mk(1)?, mk(2)?],
+            full: Mutex::new(None),
             ready: Mutex::new(None),
             pinned,
             held: std::sync::atomic::AtomicBool::new(false),
@@ -1944,7 +2208,13 @@ impl LayerTier {
         let Some(stage) = self.stage.as_ref() else {
             return false;
         };
-        if rows * used < self.n_experts {
+        if rows * used < self.n_experts
+            || stage
+                .full
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        {
             return false;
         }
         let per_token = self.decode_us.load(Ordering::Relaxed) as f64;
@@ -1983,7 +2253,11 @@ impl LayerTier {
             .bind_to_thread()
             .map_err(|e| crate::tensor::Error::msg(format!("bind context: {e:?}")))?;
         let copy = &stage.stager.copy;
-        let buffer = &stage.stager.buffers[stage.buffer];
+        let full = stage.stager.full.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(full) = full.as_ref() else {
+            crate::tensor::bail!("a wide batch's fill has no room");
+        };
+        let buffer = &full[stage.buffer];
         if let Some(free) = buffer.free.lock().unwrap_or_else(|e| e.into_inner()).take() {
             copy.wait(&free)
                 .map_err(|e| crate::tensor::Error::msg(format!("wait: {e:?}")))?;
@@ -2082,12 +2356,15 @@ impl LayerTier {
 
     /// The layer's experts as stacks on the card, once the fill has landed: the compute stream
     /// waits for it. The fill is started here if nothing started it.
-    pub(super) fn stacks(&self) -> Result<&[QTensor; 3]> {
+    pub(super) fn stacks(&self) -> Result<Arc<[QTensor; 3]>> {
         let stage = self.stage.as_ref().expect("a staged layer");
+        let Some(stacks) = stage.full.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            crate::tensor::bail!("a wide batch's fill has no room");
+        };
         // Held and already filled: the compute stream waited for the fill at the first forward,
         // and the next ones queue behind that wait.
         if stage.held.load(Ordering::Acquire) && stage.filled.load(Ordering::Acquire) {
-            return Ok(&stage.stacks);
+            return Ok(stacks);
         }
         self.prefetch()?;
         let event = stage
@@ -2103,7 +2380,7 @@ impl LayerTier {
         if stage.held.load(Ordering::Acquire) {
             stage.filled.store(true, Ordering::Release);
         }
-        Ok(&stage.stacks)
+        Ok(stacks)
     }
 
     /// Keep the layer's stacks on the card across the forwards that follow, for a prompt that
@@ -2153,25 +2430,37 @@ impl LayerTier {
             .synchronize()
             .map_err(|e| crate::tensor::Error::msg(format!("copy stream: {e:?}")))?;
         *stage.ready.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *stage.stager.buffers[stage.buffer]
-            .free
+        if let Some(full) = stage
+            .stager
+            .full
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            *full[stage.buffer]
+                .free
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+        }
         Ok(())
     }
 
-    /// The layer's kernels are queued: the buffer is free once they have run.
+    /// The layer's kernels are queued: the buffer of a wide batch is free once they have run.
     pub(super) fn release_stacks(&self) -> Result<()> {
         let stage = self.stage.as_ref().expect("a staged layer");
         if stage.held.load(Ordering::Acquire) {
             return Ok(());
         }
+        let full = stage.stager.full.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(full) = full.as_ref() else {
+            return Ok(());
+        };
         let cd = self.dev.as_cuda_device()?;
         let event =
             cd.0.stream()
                 .record_event(None)
                 .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))?;
-        *stage.stager.buffers[stage.buffer]
+        *full[stage.buffer]
             .free
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(event);
@@ -2211,6 +2500,10 @@ mod tests {
     }
 
     /// Fill the arenas of `stager` with 0xFF, which read as f16 is not a number.
+    /// The memory pool of what is lent is the card's, shared by the tests of a process: a test that
+    /// measures what lending gives back runs while no other holds a room in it.
+    static LENT_POOL: Mutex<()> = Mutex::new(());
+
     fn poison(stager: &CardStager) {
         use cudarc::driver::DevicePtr;
         let cd = stager.dev.as_cuda_device().unwrap();
@@ -2298,6 +2591,7 @@ mod tests {
     /// hold experts, after they are lent, and after they come back filled.
     #[test]
     fn a_token_through_the_tier_matches_the_host_while_the_extra_slots_are_lent_and_returned() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(card) = Device::new_cuda(0) else {
             eprintln!("skipping: no usable CUDA device");
             return;
@@ -2373,6 +2667,7 @@ mod tests {
         run(30);
         assert!(!tier.lend_extra(), "lending twice");
         let filled = tier.restore_extra().unwrap();
+        tier.settle();
         assert!(filled > 0, "nothing came back");
         assert_eq!(held(&tier), filled);
         run(30);
@@ -2386,6 +2681,7 @@ mod tests {
     }
 
     fn a_token_through_the_tier(transit: bool) {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(card) = Device::new_cuda(0) else {
             eprintln!("skipping: no usable CUDA device");
             return;
@@ -2407,7 +2703,7 @@ mod tests {
                     .data()
                     .len()
             });
-            let stager = CardStager::new(&card, widest).unwrap();
+            let stager = CardStager::new(&card, widest, experts).unwrap();
             poison(&stager);
             built = built.with_stage(&stager, 0, false).unwrap();
         }
@@ -2459,6 +2755,71 @@ mod tests {
         );
     }
 
+    /// A token through the kernels a recorded decode is made of, the host answering from its
+    /// thread, gives what the host's expert loop gives it, and the cache learns as it does.
+    #[test]
+    fn a_token_through_the_recorded_decode_matches_the_host() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
+        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
+        let mut tiered = layer(&card, experts, used, hidden, ffn);
+        let slots = 6;
+        let built = LayerTier::new(&tiered, &card, slots).unwrap();
+        tiered.tier = Some(Arc::new(built));
+        let tier = tiered.tier.clone().unwrap();
+        tier.enable_graph(hidden, used).unwrap();
+        let worker = TierWorker::start(&card, vec![tier.clone()]).unwrap();
+        GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
+        let inputs: Vec<Vec<f32>> = (0..3).map(|s| values(hidden, 100 + s, 1.0)).collect();
+        let mut first = None;
+        for token in 0..60 {
+            let x = &inputs[token % inputs.len()];
+            let on_host = Tensor::from_vec(x.clone(), (1, 1, hidden), &Device::Cpu).unwrap();
+            let on_card = Tensor::from_vec(x.clone(), (1, 1, hidden), &card).unwrap();
+            let want = reference
+                .forward(&on_host, &on_host, hidden, 1e-5, false)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let got = tiered
+                .forward(&on_card, &on_card, hidden, 1e-5, false)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            tier.settle();
+            let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 2e-2 * peak,
+                "token {token}: max diff {worst} of {peak}"
+            );
+            if token == inputs.len() - 1 {
+                let (routed, hits, _) = tier.counters();
+                first = Some(hits as f64 / routed as f64);
+            }
+        }
+        GRAPH_WITHOUT_CAPTURE.store(false, Ordering::Relaxed);
+        let (routed, hits, promoted) = tier.counters();
+        assert!(promoted > 0, "the hot experts were never copied in");
+        assert!(
+            hits as f64 / routed as f64 > first.unwrap(),
+            "the cache did not learn: {hits} of {routed}"
+        );
+        drop(worker);
+    }
+
     /// The rows of a draft verify through the tier together give what the host's expert loop
     /// gives them, whatever the cache holds and however the misses are split.
     #[test]
@@ -2473,6 +2834,7 @@ mod tests {
     }
 
     fn rows_through_the_tier(transit: bool) {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(card) = Device::new_cuda(0) else {
             eprintln!("skipping: no usable CUDA device");
             return;
@@ -2493,7 +2855,7 @@ mod tests {
                     .data()
                     .len()
             });
-            let stager = CardStager::new(&card, widest).unwrap();
+            let stager = CardStager::new(&card, widest, experts).unwrap();
             built = built.with_stage(&stager, 0, false).unwrap();
         }
         tiered.tier = Some(Arc::new(built));
@@ -2583,6 +2945,7 @@ mod tests {
     /// copied to the card from the host and from the cache, and with the host range locked or not.
     #[test]
     fn a_wide_batch_through_the_tier_matches_the_host() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(card) = Device::new_cuda(0) else {
             eprintln!("skipping: no usable CUDA device");
             return;
@@ -2599,7 +2962,7 @@ mod tests {
                 ][i];
                 t.native_qtensor().data().len()
             });
-            let stager = CardStager::new(&card, widest).unwrap();
+            let stager = CardStager::new(&card, widest, experts).unwrap();
             // What an earlier layer left in the arenas: bytes whose f16 scales are not finite.
             poison(&stager);
             // Some experts on the card, the rest to come from the host.
@@ -2640,6 +3003,7 @@ mod tests {
     /// and a decoded token reads the right blocks from them.
     #[test]
     fn a_wide_batch_warms_the_cache_with_the_experts_it_used() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(card) = Device::new_cuda(0) else {
             eprintln!("skipping: no usable CUDA device");
             return;
@@ -2657,7 +3021,7 @@ mod tests {
                 .data()
                 .len()
         });
-        let stager = CardStager::new(&card, widest).unwrap();
+        let stager = CardStager::new(&card, widest, experts).unwrap();
         let slots = 6;
         let tier = LayerTier::new(&tiered, &card, slots)
             .unwrap()
@@ -2718,6 +3082,7 @@ mod tests {
     /// kernels take over from the sorted launches.
     #[test]
     fn a_wide_batch_matches_the_host_in_k_quants_across_the_batching_threshold() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(card) = Device::new_cuda(0) else {
             eprintln!("skipping: no usable CUDA device");
             return;
@@ -2738,7 +3103,7 @@ mod tests {
                 ][i];
                 t.native_qtensor().data().len()
             });
-            let stager = CardStager::new(&card, widest).unwrap();
+            let stager = CardStager::new(&card, widest, experts).unwrap();
             poison(&stager);
             let tier = LayerTier::new(&tiered, &card, 10)
                 .unwrap()
