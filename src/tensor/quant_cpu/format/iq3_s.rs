@@ -83,24 +83,18 @@ impl BlockFormat for BlockIq3S {
                 let mut block = _mm256_setzero_si256();
                 for ib in 0..QK_K / 32 {
                     // Code `c` of a run is its byte with bit `c` of the run's high-bit byte as the
-                    // ninth bit.
-                    let low = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                        x.qs[8 * ib..].as_ptr() as *const __m128i
-                    ));
-                    let high = _mm256_slli_epi32(
-                        _mm256_and_si256(
-                            _mm256_srlv_epi32(
-                                _mm256_set1_epi32(x.qh[ib] as i32),
-                                _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
-                            ),
-                            _mm256_set1_epi32(1),
-                        ),
-                        8,
-                    );
-                    let mags = _mm256_i32gather_epi32(
-                        IQ3S_GRID.as_ptr() as *const i32,
-                        _mm256_or_si256(low, high),
-                        4,
+                    // ninth bit. The magnitudes are read one by one: a gather is slow on a
+                    // processor whose microcode blocks the leak of its data.
+                    let codes = u64::from_le_bytes(x.qs[8 * ib..8 * ib + 8].try_into().unwrap());
+                    let high = x.qh[ib] as u32;
+                    let grid = |l: u32| {
+                        IQ3S_GRID[(((codes >> (8 * l)) as u32 & 0xFF) | (((high >> l) & 1) << 8))
+                            as usize] as i32
+                    };
+                    let pair = |l: u32| (grid(l + 1) as u32 as i64) << 32 | grid(l) as u32 as i64;
+                    let mags = _mm256_set_m128i(
+                        _mm_set_epi64x(pair(6), pair(4)),
+                        _mm_set_epi64x(pair(2), pair(0)),
                     );
                     let signs = u32::from_le_bytes(x.signs[4 * ib..4 * ib + 4].try_into().unwrap());
                     let pairs = super::iq_read::grid_run_pairs(mags, signs, &y.qs[32 * ib..]);

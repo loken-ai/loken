@@ -69,11 +69,14 @@ impl BlockFormat for BlockIq3Xxs {
             for (x, y) in xs.iter().zip(ys) {
                 let mut block = _mm256_setzero_si256();
                 for ib in 0..QK_K / 32 {
-                    let codes = _mm_loadl_epi64(x.qs[8 * ib..].as_ptr() as *const __m128i);
-                    let mags = _mm256_i32gather_epi32(
-                        IQ3XXS_GRID.as_ptr() as *const i32,
-                        _mm256_cvtepu8_epi32(codes),
-                        4,
+                    // The magnitudes are read one by one: a gather is slow on a processor whose
+                    // microcode blocks the leak of its data.
+                    let codes = u64::from_le_bytes(x.qs[8 * ib..8 * ib + 8].try_into().unwrap());
+                    let grid = |l: u32| IQ3XXS_GRID[((codes >> (8 * l)) & 0xFF) as usize] as i32;
+                    let pair = |l: u32| (grid(l + 1) as u32 as i64) << 32 | grid(l) as u32 as i64;
+                    let mags = _mm256_set_m128i(
+                        _mm_set_epi64x(pair(6), pair(4)),
+                        _mm_set_epi64x(pair(2), pair(0)),
                     );
                     let tail = &x.qs[QK_K / 4 + 4 * ib..QK_K / 4 + 4 * ib + 4];
                     let word = u32::from_le_bytes(tail.try_into().unwrap());

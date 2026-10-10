@@ -75,23 +75,17 @@ impl BlockFormat for BlockIq2S {
                 let mut block = _mm256_setzero_si256();
                 for ib in 0..QK_K / 32 {
                     // Code `l` is its byte with bits `2l` and `2l + 1` of the run's high byte above it.
-                    let low = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(i32::from_le_bytes(
-                        x.qs[4 * ib..4 * ib + 4].try_into().unwrap(),
-                    )));
-                    let high = _mm_slli_epi32(
-                        _mm_and_si128(
-                            _mm_srlv_epi32(
-                                _mm_set1_epi32(x.qh[ib] as i32),
-                                _mm_setr_epi32(0, 2, 4, 6),
-                            ),
-                            _mm_set1_epi32(3),
-                        ),
-                        8,
-                    );
-                    let mags = _mm256_i32gather_epi64(
-                        IQ2S_GRID.as_ptr() as *const i64,
-                        _mm_or_si128(low, high),
-                        8,
+                    // The magnitudes are read one by one: a gather is slow on a processor whose
+                    // microcode blocks the leak of its data.
+                    let codes = u32::from_le_bytes(x.qs[4 * ib..4 * ib + 4].try_into().unwrap());
+                    let high = (x.qh[ib] as u32) << 8;
+                    let grid = |l: u32| {
+                        IQ2S_GRID
+                            [(((codes >> (8 * l)) & 0xFF) | ((high >> (2 * l)) & 0x300)) as usize]
+                    };
+                    let mags = _mm256_set_m128i(
+                        _mm_set_epi64x(grid(3) as i64, grid(2) as i64),
+                        _mm_set_epi64x(grid(1) as i64, grid(0) as i64),
                     );
                     let signs =
                         u32::from_le_bytes(signs_all[4 * ib..4 * ib + 4].try_into().unwrap());
