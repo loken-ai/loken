@@ -267,6 +267,26 @@ pub(crate) trait ModelBackend: Send {
         index_pos: usize,
     ) -> crate::tensor::Result<Tensor> {
         let (_, seq_len) = x.dims2()?;
+        self.prepare_prefill(seq_len);
+        let logits = self.forward_prefill_chunks(x, index_pos);
+        self.finish_prefill();
+        logits
+    }
+
+    /// Called before a prefill of `tokens` rows is planned: a backend that lends card memory to
+    /// something else while it is idle takes it back here.
+    fn prepare_prefill(&mut self, _tokens: usize) {}
+
+    /// Called after a prefill, whether it succeeded: what [`Self::prepare_prefill`] took is given
+    /// back.
+    fn finish_prefill(&mut self) {}
+
+    fn forward_prefill_chunks(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+    ) -> crate::tensor::Result<Tensor> {
+        let (_, seq_len) = x.dims2()?;
         let chunk_start = adaptive_prefill_chunk(self.prefill_shape());
         // A prompt that fits one chunk runs as one forward; a longer one starts from the last
         // chunk that fit this model, clamped into [MIN, default]. Each out-of-memory failure
@@ -1347,7 +1367,145 @@ impl ModelBackend for MoondreamBackend {
     take_generic_passthrough!();
 }
 
+impl GenericBackend {
+    /// The snapshot of an earlier prompt this one extends, restored and advanced over the new
+    /// tokens; `None` when there is none.
+    fn restore_prefix_and_advance(
+        &mut self,
+        prompt: &[u32],
+    ) -> crate::tensor::Result<Option<Tensor>> {
+        // A snapshot of an earlier prompt that this one extends - the previous turn of a
+        // conversation - is restored and advanced over the new tokens. With a disk cache the
+        // stored states stand in for the in-memory ones when there is none, and a prompt no
+        // state covers is prefilled here too, so the states it passes are kept.
+        let cache = self.0.state_cache();
+        let (covered, logits) = match self.0.try_restore_prefix(prompt)? {
+            Some((covered, logits)) => (covered, Some(logits)),
+            None => match &cache {
+                Some(cache) if prompt.len() > 1 => {
+                    let covered = cache.restore(&mut self.0, prompt);
+                    if covered == 0 {
+                        self.0.trim_kv(0);
+                    }
+                    (covered, None)
+                }
+                _ => return Ok(None),
+            },
+        };
+        if covered == prompt.len() {
+            return Ok(logits);
+        }
+        // The rest of the prompt is prefilled here: the card's memory lent to the caches is
+        // taken back for it, as for any prefill.
+        self.prepare_prefill(prompt.len() - covered);
+        let chunk = adaptive_prefill_chunk(self.prefill_shape());
+        // A recurrent state that failed part way through the new tokens cannot be rewound, so
+        // a failure ends in the caller prefilling the whole prompt from position 0 instead,
+        // which starts a fresh state; a card running out of memory is answered first by the
+        // smaller chunk the cold prefill would take, from the state restored again.
+        let logits = match &cache {
+            Some(cache) => {
+                use std::sync::atomic::Ordering;
+                let (per_token, fixed) = {
+                    let sh = self.prefill_shape();
+                    (sh.bytes_per_token, sh.fixed_bytes)
+                };
+                let first = match ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed) {
+                    0 => chunk,
+                    remembered => remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk),
+                };
+                let mut replay = false;
+                let grid = std::cell::RefCell::new(Vec::new());
+                let started = std::time::Instant::now();
+                let walked = crate::inference::place::recover::shrink_on_oom(
+                    "state cache prefill",
+                    first,
+                    |c| {
+                        (c > PREFILL_CHUNK_TOKENS_MIN)
+                            .then(|| (c / 2).max(PREFILL_CHUNK_TOKENS_MIN))
+                    },
+                    |c| {
+                        let want = (c * per_token.max(1) + fixed) as u64;
+                        crate::inference::place::vram_manager::ensure_gpu_headroom_blocking(
+                            "llm", want,
+                        )
+                    },
+                    |c| {
+                        if replay {
+                            self.0.trim_kv(0);
+                            if covered > 0 && cache.restore(&mut self.0, prompt) != covered {
+                                return Err(crate::tensor::Error::msg(
+                                    "state cache: the stored state went away during a replay"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                        replay = true;
+                        let stride = cache.stride(c);
+                        let (logits, points) =
+                            self.0
+                                .prefill_with_grid(prompt, covered, c, stride, cache.layout())?;
+                        *grid.borrow_mut() = points;
+                        Ok(logits)
+                    },
+                );
+                match walked {
+                    Ok((logits, used)) => {
+                        if used < chunk && used < prompt.len() - covered {
+                            ADAPTIVE_PREFILL_CHUNK.store(used, Ordering::Relaxed);
+                        }
+                        let secs = started.elapsed().as_secs_f64();
+                        cache.tuning().prefilled(prompt.len() - covered, secs);
+                        self.0.snapshot_prefix(prompt, &logits)?;
+                        cache.save(&self.0, prompt, grid.into_inner(), Some(secs));
+                        return Ok(Some(logits));
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            None => {
+                let rest =
+                    Tensor::new(&prompt[covered..], &crate::tensor::Device::Cpu)?.unsqueeze(0)?;
+                self.forward_prefill_with_chunk(&rest, covered, prompt.len() - covered, chunk)
+            }
+        };
+        let logits = match logits {
+            Ok(logits) => logits,
+            Err(e) => {
+                tracing::warn!("prefix snapshot advance failed ({e}); prefilling the whole prompt");
+                self.0.trim_kv(0);
+                return Ok(None);
+            }
+        };
+        self.0.snapshot_prefix(prompt, &logits)?;
+        Ok(Some(logits))
+    }
+}
+
 impl ModelBackend for GenericBackend {
+    fn prepare_prefill(&mut self, tokens: usize) {
+        let t = std::time::Instant::now();
+        let lent = self.0.lend_expert_cache(tokens);
+        if lent > 0 {
+            tracing::debug!(
+                "prefill of {tokens} rows: {lent} layers lent their extra expert slots in {:?}",
+                t.elapsed()
+            );
+        }
+    }
+
+    fn finish_prefill(&mut self) {
+        let t = std::time::Instant::now();
+        match self.0.return_expert_cache() {
+            Ok(0) => {}
+            Ok(copied) => tracing::debug!(
+                "the extra expert slots are back, {copied} experts copied in {:?}",
+                t.elapsed()
+            ),
+            Err(e) => tracing::warn!("the extra expert slots did not come back: {e}"),
+        }
+    }
+
     fn forward_prefill_with_chunk(
         &mut self,
         x: &Tensor,
@@ -1513,108 +1671,9 @@ impl ModelBackend for GenericBackend {
         self.0.snapshot_prefix(prompt, logits)
     }
     fn try_restore_prefix(&mut self, prompt: &[u32]) -> crate::tensor::Result<Option<Tensor>> {
-        // A snapshot of an earlier prompt that this one extends - the previous turn of a
-        // conversation - is restored and advanced over the new tokens. With a disk cache the
-        // stored states stand in for the in-memory ones when there is none, and a prompt no
-        // state covers is prefilled here too, so the states it passes are kept.
-        let cache = self.0.state_cache();
-        let (covered, logits) = match self.0.try_restore_prefix(prompt)? {
-            Some((covered, logits)) => (covered, Some(logits)),
-            None => match &cache {
-                Some(cache) if prompt.len() > 1 => {
-                    let covered = cache.restore(&mut self.0, prompt);
-                    if covered == 0 {
-                        self.0.trim_kv(0);
-                    }
-                    (covered, None)
-                }
-                _ => return Ok(None),
-            },
-        };
-        if covered == prompt.len() {
-            return Ok(logits);
-        }
-        let chunk = adaptive_prefill_chunk(self.prefill_shape());
-        // A recurrent state that failed part way through the new tokens cannot be rewound, so
-        // a failure ends in the caller prefilling the whole prompt from position 0 instead,
-        // which starts a fresh state; a card running out of memory is answered first by the
-        // smaller chunk the cold prefill would take, from the state restored again.
-        let logits = match &cache {
-            Some(cache) => {
-                use std::sync::atomic::Ordering;
-                let (per_token, fixed) = {
-                    let sh = self.prefill_shape();
-                    (sh.bytes_per_token, sh.fixed_bytes)
-                };
-                let first = match ADAPTIVE_PREFILL_CHUNK.load(Ordering::Relaxed) {
-                    0 => chunk,
-                    remembered => remembered.clamp(PREFILL_CHUNK_TOKENS_MIN, chunk),
-                };
-                let mut replay = false;
-                let grid = std::cell::RefCell::new(Vec::new());
-                let started = std::time::Instant::now();
-                let walked = crate::inference::place::recover::shrink_on_oom(
-                    "state cache prefill",
-                    first,
-                    |c| {
-                        (c > PREFILL_CHUNK_TOKENS_MIN)
-                            .then(|| (c / 2).max(PREFILL_CHUNK_TOKENS_MIN))
-                    },
-                    |c| {
-                        let want = (c * per_token.max(1) + fixed) as u64;
-                        crate::inference::place::vram_manager::ensure_gpu_headroom_blocking(
-                            "llm", want,
-                        )
-                    },
-                    |c| {
-                        if replay {
-                            self.0.trim_kv(0);
-                            if covered > 0 && cache.restore(&mut self.0, prompt) != covered {
-                                return Err(crate::tensor::Error::msg(
-                                    "state cache: the stored state went away during a replay"
-                                        .to_string(),
-                                ));
-                            }
-                        }
-                        replay = true;
-                        let stride = cache.stride(c);
-                        let (logits, points) =
-                            self.0
-                                .prefill_with_grid(prompt, covered, c, stride, cache.layout())?;
-                        *grid.borrow_mut() = points;
-                        Ok(logits)
-                    },
-                );
-                match walked {
-                    Ok((logits, used)) => {
-                        if used < chunk && used < prompt.len() - covered {
-                            ADAPTIVE_PREFILL_CHUNK.store(used, Ordering::Relaxed);
-                        }
-                        let secs = started.elapsed().as_secs_f64();
-                        cache.tuning().prefilled(prompt.len() - covered, secs);
-                        self.0.snapshot_prefix(prompt, &logits)?;
-                        cache.save(&self.0, prompt, grid.into_inner(), Some(secs));
-                        return Ok(Some(logits));
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            None => {
-                let rest =
-                    Tensor::new(&prompt[covered..], &crate::tensor::Device::Cpu)?.unsqueeze(0)?;
-                self.forward_prefill_with_chunk(&rest, covered, prompt.len() - covered, chunk)
-            }
-        };
-        let logits = match logits {
-            Ok(logits) => logits,
-            Err(e) => {
-                tracing::warn!("prefix snapshot advance failed ({e}); prefilling the whole prompt");
-                self.0.trim_kv(0);
-                return Ok(None);
-            }
-        };
-        self.0.snapshot_prefix(prompt, &logits)?;
-        Ok(Some(logits))
+        let restored = self.restore_prefix_and_advance(prompt);
+        self.finish_prefill();
+        restored
     }
     fn attach_state_cache(
         &mut self,

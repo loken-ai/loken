@@ -37,13 +37,22 @@ struct TierState {
     since_decay: usize,
 }
 
+/// The hit rate from which a layer's extra slots are not given back to it after a prefill:
+/// of ten routed experts it misses half of one.
+const REFILL_BELOW_HIT_RATE: f64 = 0.95;
+
 /// One layer's cache.
 pub struct LayerTier {
     dev: Device,
     /// Gate, up and down stacks as the file stores them, `[n_experts, ..]`.
     host: [Arc<QTensor>; 3],
-    /// The same stacks on the card, `[slots, ..]`.
+    /// The same stacks on the card, `[slots, ..]`: the slots that stay.
     card: [QTensor; 3],
+    /// How many slots `card` has. The slots numbered from there on are in `extra`.
+    base_slots: usize,
+    /// The slots a prefill can take the card's memory back from: the stacks that hold them, or
+    /// `None` while they are lent. A lent slot holds nothing (owner `-3`).
+    extra: Mutex<Option<[QTensor; 3]>>,
     /// Bytes of one expert in each stack.
     expert_bytes: [usize; 3],
     n_experts: usize,
@@ -88,6 +97,9 @@ struct Scratch {
     /// product the host sends back.
     slots: Tensor,
     weights: Tensor,
+    /// The same for the extra slots, which are in stacks of their own.
+    extra_slots: Tensor,
+    extra_weights: Tensor,
     product: Tensor,
     /// The same for the experts run from the transit room: their ids there and their weights.
     transit_ids: Tensor,
@@ -132,6 +144,8 @@ impl Scratch {
             k,
             slots: Tensor::from_vec(vec![0u32; k], (k,), &host)?.to_device(dev)?,
             weights: Tensor::from_vec(vec![0f32; k], (1, k), &host)?.to_device(dev)?,
+            extra_slots: Tensor::from_vec(vec![0u32; k], (k,), &host)?.to_device(dev)?,
+            extra_weights: Tensor::from_vec(vec![0f32; k], (1, k), &host)?.to_device(dev)?,
             product: Tensor::from_vec(vec![0f32; hidden], (1, hidden), &host)?.to_device(dev)?,
             transit_ids: Tensor::from_vec(vec![0u32; k], (k,), &host)?.to_device(dev)?,
             transit_weights: Tensor::from_vec(vec![0f32; k], (1, k), &host)?.to_device(dev)?,
@@ -255,6 +269,30 @@ fn first_experts(host: &Arc<QTensor>, n: usize, dev: &Device) -> Result<QTensor>
     QTensor::from_native(Arc::new(view), dev)
 }
 
+/// [`first_experts`] with the card's copy in the memory pool of what is lent, so that freeing it
+/// returns its memory to the card.
+fn lent_experts(host: &Arc<QTensor>, n: usize, dev: &Device) -> Result<QTensor> {
+    let inner = host.native_qtensor();
+    let bytes = inner.data();
+    let per_expert = bytes.len() / host.shape().dims()[0];
+    let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(inner.clone());
+    let view = unsafe {
+        QHostTensor::view(
+            owner,
+            bytes.as_ptr(),
+            0,
+            n * per_expert,
+            host.dtype(),
+            with_experts(host, n),
+        )
+    }
+    .map_err(|e| crate::tensor::Error::msg(e.0))?;
+    let cd = dev.as_cuda_device()?;
+    let storage = QCudaStorage::zeroed_in_lent_pool(&cd, n * per_expert, host.dtype())
+        .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+    Ok(QTensor::over_card(Arc::new(view), dev, storage))
+}
+
 impl super::GenericHeteroTransformer {
     /// Give every layer whose experts the plan left on the host a cache of them on its card:
     /// `slots` takes what each card has left of its budget, `free_before` being what the card
@@ -366,6 +404,13 @@ impl super::GenericHeteroTransformer {
             if slots == 0 {
                 continue;
             }
+            // The room a prefill takes from the card is lent to the cache while it is not
+            // running: the plan's reserve less the work a decode keeps, as more slots that a
+            // prefill gives back.
+            let work_floor = crate::inference::place::runtime_demand::CUBLAS_WORKSPACE_BYTES
+                .saturating_add(shape.fixed_bytes as u64);
+            let lent = before.saturating_sub(budget).saturating_sub(work_floor);
+            let extra = (lent / bytes.max(1) as u64) as usize;
             let stager = CardStager::new(dev, widest)?;
             let mut locked = 0usize;
             for (rank, &l) in tiered.iter().enumerate() {
@@ -373,7 +418,7 @@ impl super::GenericHeteroTransformer {
                     .moe
                     .as_mut()
                     .expect("a tiered layer has experts");
-                let mut tier = LayerTier::new(moe, dev, slots)?;
+                let mut tier = LayerTier::new(moe, dev, slots)?.with_extra(extra)?;
                 let layer_bytes = (tier.expert_bytes.iter().sum::<usize>() * tier.n_experts) as u64;
                 let pin = layer_bytes <= pin_left;
                 pin_left = pin_left.saturating_sub(if pin { layer_bytes } else { 0 });
@@ -389,15 +434,60 @@ impl super::GenericHeteroTransformer {
                 moe.tier = Some(Arc::new(tier));
             }
             tracing::info!(
-                "expert tier on card {ordinal}: {} layers ({locked} with locked host pages, {:.1} GB/s to the card), {} experts each cached of {}, {:.2} GB",
+                "expert tier on card {ordinal}: {} layers ({locked} with locked host pages, {:.1} GB/s to the card), {} experts each cached of {} ({extra} of them lent to a prefill), {:.2} GB",
                 tiered.len(),
                 stager.bandwidth * 1e-3,
-                slots.min(self.layers[first].moe.as_ref().map_or(0, |m| m.n_experts)),
+                (slots + extra).min(self.layers[first].moe.as_ref().map_or(0, |m| m.n_experts)),
                 self.layers[first].moe.as_ref().map_or(0, |m| m.n_experts),
-                (slots * bytes) as f64 / 1e9
+                ((slots + extra) * bytes) as f64 / 1e9
             );
         }
         Ok(())
+    }
+}
+
+impl super::GenericHeteroTransformer {
+    /// Take the memory the caches lent to a prefill of `tokens` rows back to the cards, when the
+    /// prefill needs more than they have free: every layer's extra slots are freed. How many
+    /// layers lent.
+    pub fn lend_expert_cache(&mut self, tokens: usize) -> usize {
+        let shape = self.prefill_shape();
+        if shape.target_chunk == 0 {
+            return 0;
+        }
+        let rows = tokens.min(shape.target_chunk);
+        let need = ((rows * shape.bytes_per_token + shape.fixed_bytes) as u64)
+            .saturating_mul(shape.share.max(1) as u64);
+        let free = crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards);
+        if free >= need {
+            return 0;
+        }
+        let lent = self
+            .layers
+            .iter()
+            .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
+            .filter(|t| t.lend_extra())
+            .count();
+        if lent > 0 {
+            crate::inference::place::ladder::release_pools();
+            crate::inference::place::vram_manager::residency_changed();
+        }
+        lent
+    }
+
+    /// Give the caches their extra slots again, filled with the experts the prefill found
+    /// hottest. How many experts were copied.
+    pub fn return_expert_cache(&mut self) -> Result<usize> {
+        let mut copied = 0;
+        for tier in self
+            .layers
+            .iter()
+            .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
+        {
+            copied += tier.restore_extra()?;
+        }
+        crate::inference::place::vram_manager::residency_changed();
+        Ok(copied)
     }
 }
 
@@ -527,6 +617,8 @@ impl LayerTier {
             dev: dev.clone(),
             host,
             card,
+            base_slots: slots,
+            extra: Mutex::new(None),
             expert_bytes,
             n_experts: moe.n_experts,
             state: Mutex::new(TierState {
@@ -572,6 +664,121 @@ impl LayerTier {
     /// The cached stacks, in expert order when the tier is resident.
     pub(super) fn card_stacks(&self) -> &[QTensor; 3] {
         &self.card
+    }
+
+    /// This tier with `extra` more slots that a prefill can take the card's memory back from.
+    pub fn with_extra(mut self, extra: usize) -> Result<Self> {
+        let n = extra.min(self.n_experts.saturating_sub(self.base_slots));
+        if n == 0 {
+            return Ok(self);
+        }
+        *self.extra.get_mut().unwrap_or_else(|e| e.into_inner()) = Some([
+            lent_experts(&self.host[0], n, &self.dev)?,
+            lent_experts(&self.host[1], n, &self.dev)?,
+            lent_experts(&self.host[2], n, &self.dev)?,
+        ]);
+        let st = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        st.owner.resize(self.base_slots + n, -1);
+        Ok(self)
+    }
+
+    /// How many slots are past the base ones, lent or not.
+    pub fn extra_slots(&self) -> usize {
+        self.slots() - self.base_slots
+    }
+
+    /// The card's address of slot `slot` of stack `i`, in the base stacks or the extra ones.
+    fn slot_addr(&self, i: usize, slot: usize) -> Result<u64> {
+        let eb = self.expert_bytes[i];
+        if slot < self.base_slots {
+            return Ok(self.card[i].device_ptr()? as u64 + (slot * eb) as u64);
+        }
+        let extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
+        match extra.as_ref() {
+            Some(stacks) => {
+                Ok(stacks[i].device_ptr()? as u64 + ((slot - self.base_slots) * eb) as u64)
+            }
+            None => crate::tensor::bail!("slot {slot} is lent"),
+        }
+    }
+
+    /// Give the memory of the extra slots back to the card: the experts they held leave the
+    /// cache and the stacks are freed. Whether there was anything to give.
+    pub fn lend_extra(&self) -> bool {
+        let mut extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
+        if extra.is_none() {
+            return false;
+        }
+        self.settle();
+        if let Ok(cd) = self.dev.as_cuda_device() {
+            let _ = cd.0.stream().synchronize();
+        }
+        let _ = self.copy.synchronize();
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            for s in self.base_slots..st.owner.len() {
+                if st.owner[s] >= 0 {
+                    let e = st.owner[s] as usize;
+                    st.slot_of[e] = -1;
+                }
+                st.owner[s] = -3;
+            }
+        }
+        *extra = None;
+        if let Ok(cd) = self.dev.as_cuda_device() {
+            let _ = cd.0.stream().synchronize();
+            crate::tensor::quantized::trim_lent_pool(cd.0.ordinal());
+        }
+        true
+    }
+
+    /// Take the extra slots' memory back and fill them with the hottest experts the base slots
+    /// do not hold. How many experts were copied.
+    pub fn restore_extra(&self) -> Result<usize> {
+        let n = self.extra_slots();
+        // A layer that already finds nearly every expert on the card gains nothing from more
+        // slots, and a prefill takes their memory again.
+        let (routed, hits, _) = self.counters();
+        if routed > 0 && hits as f64 >= REFILL_BELOW_HIT_RATE * routed as f64 {
+            return Ok(0);
+        }
+        {
+            let mut extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
+            if extra.is_some() || n == 0 {
+                return Ok(0);
+            }
+            *extra = Some([
+                lent_experts(&self.host[0], n, &self.dev)?,
+                lent_experts(&self.host[1], n, &self.dev)?,
+                lent_experts(&self.host[2], n, &self.dev)?,
+            ]);
+        }
+        let wanted: Vec<usize> = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            for s in self.base_slots..st.owner.len() {
+                st.owner[s] = -1;
+            }
+            let mut order: Vec<usize> = (0..self.n_experts)
+                .filter(|&e| st.slot_of[e] < 0 && st.heat[e] > 0.0)
+                .collect();
+            order.sort_by(|&a, &b| st.heat[b].total_cmp(&st.heat[a]));
+            order.truncate(n);
+            order
+        };
+        for (j, &e) in wanted.iter().enumerate() {
+            let slot = self.base_slots + j;
+            self.copy_in_async(e, slot)?;
+        }
+        self.copy
+            .synchronize()
+            .map_err(|e| crate::tensor::Error::msg(format!("slot copy: {e:?}")))?;
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for (j, &e) in wanted.iter().enumerate() {
+            let slot = self.base_slots + j;
+            st.owner[slot] = e as i32;
+            st.slot_of[e] = slot as i32;
+        }
+        Ok(wanted.len())
     }
 
     /// Wait for the copy in flight, if any, to land.
@@ -771,31 +978,129 @@ impl LayerTier {
                     slot_ids[i] = filler;
                 }
             }
-            h_slots.copy_from_slice(&slot_ids);
-            h_hw.copy_from_slice(&hit_weights);
-            for (dst, src, bytes) in [
-                (
-                    address_of::<u32>(&scratch.slots)?,
-                    h_slots.as_ptr() as *const std::ffi::c_void,
-                    4 * k,
-                ),
-                (
-                    address_of::<f32>(&scratch.weights)?,
-                    h_hw.as_ptr() as *const std::ffi::c_void,
-                    4 * k,
-                ),
-            ] {
-                driver("slots to card", unsafe {
-                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dst, src, bytes, stream.cu_stream())
-                })?;
+            // The slots past the base ones are in the extra stacks, launched apart. A pair a stack
+            // does not serve reads a slot of that stack which this token reads, and weighs zero.
+            let first_extra = self.base_slots as u32;
+            let hit_slots: Vec<(usize, u32)> = (0..k)
+                .filter(|&i| is_hit[i])
+                .map(|i| (i, slot_ids[i]))
+                .collect();
+            let base_filler = hit_slots.iter().find(|h| h.1 < first_extra).map(|h| h.1);
+            let extra_filler = hit_slots
+                .iter()
+                .find(|h| h.1 >= first_extra)
+                .map(|h| h.1 - first_extra);
+            let (base_hits, extra_hits) = (
+                hit_slots.iter().filter(|h| h.1 < first_extra).count(),
+                hit_slots.iter().filter(|h| h.1 >= first_extra).count(),
+            );
+            slot_ids = vec![base_filler.unwrap_or(0); k];
+            let mut extra_ids = vec![extra_filler.unwrap_or(0); k];
+            let mut extra_w = vec![0f32; k];
+            let mut base_w = vec![0f32; k];
+            for &(i, s) in &hit_slots {
+                if s < first_extra {
+                    slot_ids[i] = s;
+                    base_w[i] = hit_weights[i];
+                } else {
+                    extra_ids[i] = s - first_extra;
+                    extra_w[i] = hit_weights[i];
+                }
             }
-            let routing = ExpertRouting {
-                slots: moe.decode_slots.clone().expect("a tier layer is on a card"),
-                experts: scratch.slots.clone(),
-                topk: k,
+            hit_weights = base_w;
+            let base_out = if base_hits > 0 {
+                h_slots.copy_from_slice(&slot_ids);
+                h_hw.copy_from_slice(&hit_weights);
+                for (dst, src, bytes) in [
+                    (
+                        address_of::<u32>(&scratch.slots)?,
+                        h_slots.as_ptr() as *const std::ffi::c_void,
+                        4 * k,
+                    ),
+                    (
+                        address_of::<f32>(&scratch.weights)?,
+                        h_hw.as_ptr() as *const std::ffi::c_void,
+                        4 * k,
+                    ),
+                ] {
+                    driver("slots to card", unsafe {
+                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                            dst,
+                            src,
+                            bytes,
+                            stream.cu_stream(),
+                        )
+                    })?;
+                }
+                let routing = ExpertRouting {
+                    slots: moe.decode_slots.clone().expect("a tier layer is on a card"),
+                    experts: scratch.slots.clone(),
+                    topk: k,
+                };
+                let h = routing.gate_up_silu(xs, &self.card[0], &self.card[1])?;
+                Some(routing.down_reduce(
+                    &h,
+                    &self.card[2],
+                    &scratch.weights,
+                    1,
+                    false,
+                    None,
+                    None,
+                )?)
+            } else {
+                None
             };
-            let h = routing.gate_up_silu(xs, &self.card[0], &self.card[1])?;
-            Some(routing.down_reduce(&h, &self.card[2], &scratch.weights, 1, false, None, None)?)
+            let extra_out = if extra_hits > 0 {
+                let extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
+                let stacks = extra
+                    .as_ref()
+                    .expect("an extra slot that holds an expert is not lent");
+                for (dst, src, bytes) in [
+                    (
+                        address_of::<u32>(&scratch.extra_slots)?,
+                        extra_ids.as_ptr() as *const std::ffi::c_void,
+                        4 * k,
+                    ),
+                    (
+                        address_of::<f32>(&scratch.extra_weights)?,
+                        extra_w.as_ptr() as *const std::ffi::c_void,
+                        4 * k,
+                    ),
+                ] {
+                    driver("extra slots to card", unsafe {
+                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                            dst,
+                            src,
+                            bytes,
+                            stream.cu_stream(),
+                        )
+                    })?;
+                }
+                let routing = ExpertRouting {
+                    slots: moe.decode_slots.clone().expect("a tier layer is on a card"),
+                    experts: scratch.extra_slots.clone(),
+                    topk: k,
+                };
+                let h = routing.gate_up_silu(xs, &stacks[0], &stacks[1])?;
+                Some(routing.down_reduce(
+                    &h,
+                    &stacks[2],
+                    &scratch.extra_weights,
+                    1,
+                    false,
+                    None,
+                    None,
+                )?)
+            } else {
+                None
+            };
+            match (base_out, extra_out) {
+                (Some(a), Some(b)) => Some(
+                    (a.to_dtype(crate::tensor::DType::F32)?
+                        + b.to_dtype(crate::tensor::DType::F32)?)?,
+                ),
+                (a, b) => a.or(b),
+            }
         } else {
             None
         };
@@ -1009,9 +1314,70 @@ impl LayerTier {
                     slot_ids[p] = filler;
                 }
             }
-            let choice = Tensor::from_vec(slot_ids, (rows, k), &host)?.to_device(&dev)?;
-            let w = Tensor::from_vec(hit_weights, (rows, k), &host)?.to_device(&dev)?;
-            Some(moe.forward_cuda(xs, &choice, &w, rows, false, None, None, Some(&self.card))?)
+            // The slots past the base ones are in the extra stacks, launched apart. A pair a stack
+            // does not serve reads a slot of that stack which this call reads, and weighs zero.
+            let first_extra = self.base_slots as u32;
+            let hit_slots: Vec<(usize, u32)> = (0..pairs)
+                .filter(|&p| is_hit[p])
+                .map(|p| (p, slot_ids[p]))
+                .collect();
+            let base_filler = hit_slots.iter().find(|h| h.1 < first_extra).map(|h| h.1);
+            let extra_filler = hit_slots
+                .iter()
+                .find(|h| h.1 >= first_extra)
+                .map(|h| h.1 - first_extra);
+            let (base_hits, extra_hits) = (
+                hit_slots.iter().filter(|h| h.1 < first_extra).count(),
+                hit_slots.iter().filter(|h| h.1 >= first_extra).count(),
+            );
+            slot_ids = vec![base_filler.unwrap_or(0); pairs];
+            let mut extra_ids = vec![extra_filler.unwrap_or(0); pairs];
+            let mut extra_w = vec![0f32; pairs];
+            let mut base_w = vec![0f32; pairs];
+            for &(p, s) in &hit_slots {
+                if s < first_extra {
+                    slot_ids[p] = s;
+                    base_w[p] = hit_weights[p];
+                } else {
+                    extra_ids[p] = s - first_extra;
+                    extra_w[p] = hit_weights[p];
+                }
+            }
+            hit_weights = base_w;
+            let base_out = if base_hits > 0 {
+                let choice = Tensor::from_vec(slot_ids, (rows, k), &host)?.to_device(&dev)?;
+                let w = Tensor::from_vec(hit_weights, (rows, k), &host)?.to_device(&dev)?;
+                Some(moe.forward_cuda(
+                    xs,
+                    &choice,
+                    &w,
+                    rows,
+                    false,
+                    None,
+                    None,
+                    Some(&self.card),
+                )?)
+            } else {
+                None
+            };
+            let extra_out = if extra_hits > 0 {
+                let extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
+                let stacks = extra
+                    .as_ref()
+                    .expect("an extra slot that holds an expert is not lent");
+                let choice = Tensor::from_vec(extra_ids, (rows, k), &host)?.to_device(&dev)?;
+                let w = Tensor::from_vec(extra_w, (rows, k), &host)?.to_device(&dev)?;
+                Some(moe.forward_cuda(xs, &choice, &w, rows, false, None, None, Some(stacks))?)
+            } else {
+                None
+            };
+            match (base_out, extra_out) {
+                (Some(a), Some(b)) => Some(
+                    (a.to_dtype(crate::tensor::DType::F32)?
+                        + b.to_dtype(crate::tensor::DType::F32)?)?,
+                ),
+                (a, b) => a.or(b),
+            }
         } else {
             None
         };
@@ -1209,7 +1575,7 @@ impl LayerTier {
             order.sort_by(|&a, &b| st.heat[b as usize].total_cmp(&st.heat[a as usize]));
             for &e in &order {
                 let victim = (0..st.owner.len())
-                    .filter(|&slot| !in_use[slot] && st.owner[slot] != -2)
+                    .filter(|&slot| !in_use[slot] && st.owner[slot] >= -1)
                     .min_by(|&a, &b| slot_heat(&st, a).total_cmp(&slot_heat(&st, b)));
                 let Some(victim) = victim else {
                     break;
@@ -1232,7 +1598,7 @@ impl LayerTier {
                 let eb = self.expert_bytes[i];
                 let arena = &buffer.arenas[i];
                 let from = arena.device_ptr(arena.stream()).0 + (expert * eb) as u64;
-                let to = self.card[i].device_ptr()? as u64 + (slot * eb) as u64;
+                let to = self.slot_addr(i, slot)?;
                 driver("transit to slot", unsafe {
                     cudarc::driver::sys::cuMemcpyDtoDAsync_v2(to, from, eb, stream.cu_stream())
                 })?;
@@ -1325,7 +1691,7 @@ impl LayerTier {
                 .max_by(|&&a, &&b| st.heat[a as usize].total_cmp(&st.heat[b as usize]))
                 .copied();
             let victim = (0..st.owner.len())
-                .filter(|&s| !in_use[s] && st.owner[s] != -2)
+                .filter(|&s| !in_use[s] && st.owner[s] >= -1)
                 .min_by(|&a, &b| slot_heat(&st, a).total_cmp(&slot_heat(&st, b)));
             match (hot, victim) {
                 (Some(hot), Some(victim)) if st.heat[hot as usize] > slot_heat(&st, victim) => {
@@ -1367,6 +1733,14 @@ impl LayerTier {
 
     /// Expert `expert` of the host stacks into slot `slot` of the card's, and the copy done.
     fn copy_in(&self, expert: usize, slot: usize) -> Result<()> {
+        self.copy_in_async(expert, slot)?;
+        self.copy
+            .synchronize()
+            .map_err(|e| crate::tensor::Error::msg(format!("slot copy: {e:?}")))
+    }
+
+    /// [`Self::copy_in`], queued: the caller waits for the copy stream.
+    fn copy_in_async(&self, expert: usize, slot: usize) -> Result<()> {
         let cd = self.dev.as_cuda_device()?;
         cd.0.context()
             .bind_to_thread()
@@ -1374,12 +1748,10 @@ impl LayerTier {
         for i in 0..3 {
             let eb = self.expert_bytes[i];
             let data = self.host[i].native_qtensor().data();
-            let dst = self.card[i].device_ptr()? as u64 + (slot * eb) as u64;
+            let dst = self.slot_addr(i, slot)?;
             self.upload(i, data, expert * eb, eb, dst, &self.copy)?;
         }
-        self.copy
-            .synchronize()
-            .map_err(|e| crate::tensor::Error::msg(format!("slot copy: {e:?}")))
+        Ok(())
     }
 }
 
@@ -1627,7 +1999,6 @@ impl LayerTier {
             let eb = self.expert_bytes[i];
             let arena = &buffer.arenas[i];
             let base = arena.device_ptr(arena.stream()).0;
-            let slots = self.card[i].device_ptr()? as u64;
             let data = self.host[i].native_qtensor().data();
             // The kernels read whole blocks past the end of a stack, against activations padded
             // with zeros: that tail is zero, as every blob's is, and not what the layer before
@@ -1646,7 +2017,7 @@ impl LayerTier {
                     driver("slot to stage", unsafe {
                         cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
                             base + (e * eb) as u64,
-                            slots + (slot_of[e] as usize * eb) as u64,
+                            self.slot_addr(i, slot_of[e] as usize)?,
                             eb,
                             copy.cu_stream(),
                         )
@@ -1921,6 +2292,90 @@ mod tests {
     #[test]
     fn a_token_through_the_tier_matches_the_host_whatever_the_cache_holds() {
         a_token_through_the_tier(false);
+    }
+
+    /// A token through a tier with extra slots gives what the host gives while the extra slots
+    /// hold experts, after they are lent, and after they come back filled.
+    #[test]
+    fn a_token_through_the_tier_matches_the_host_while_the_extra_slots_are_lent_and_returned() {
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 512usize, 512usize);
+        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
+        let mut tiered = layer(&card, experts, used, hidden, ffn);
+        let (base, extra) = (4usize, 8usize);
+        let built = LayerTier::new(&tiered, &card, base)
+            .unwrap()
+            .with_extra(extra)
+            .unwrap();
+        tiered.tier = Some(Arc::new(built));
+        let tier = tiered.tier.clone().unwrap();
+        assert_eq!(tier.slots(), base + extra);
+        let inputs: Vec<Vec<f32>> = (0..3).map(|s| values(hidden, 100 + s, 1.0)).collect();
+        let mut token = 0usize;
+        let mut run = |count: usize| {
+            for _ in 0..count {
+                let x = &inputs[token % inputs.len()];
+                token += 1;
+                let on_host = Tensor::from_vec(x.clone(), (1, 1, hidden), &Device::Cpu).unwrap();
+                let on_card = Tensor::from_vec(x.clone(), (1, 1, hidden), &card).unwrap();
+                let want = reference
+                    .forward(&on_host, &on_host, hidden, 1e-5, false)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let got = tiered
+                    .forward(&on_card, &on_card, hidden, 1e-5, false)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                tier.settle();
+                let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    worst <= 2e-2 * peak,
+                    "token {token}: max diff {worst} of {peak}"
+                );
+            }
+        };
+        run(60);
+        let held = |tier: &LayerTier| {
+            let st = tier.state.lock().unwrap();
+            (tier.base_slots..st.owner.len())
+                .filter(|&s| st.owner[s] >= 0)
+                .count()
+        };
+        assert!(held(&tier) > 0, "no expert reached the extra slots");
+        let free = || {
+            let _ = card.as_cuda_device().unwrap().0.stream().synchronize();
+            crate::inference::place::ladder::release_pools();
+            crate::inference::place::expert_cache::free_now(&card)
+        };
+        let before = free();
+        assert!(tier.lend_extra());
+        let returned = free().saturating_sub(before);
+        let lent_bytes = (extra * tier.expert_bytes.iter().sum::<usize>()) as u64;
+        assert!(
+            returned >= lent_bytes / 2,
+            "lending {lent_bytes} bytes gave the card {returned}"
+        );
+        assert_eq!(held(&tier), 0);
+        run(30);
+        assert!(!tier.lend_extra(), "lending twice");
+        let filled = tier.restore_extra().unwrap();
+        assert!(filled > 0, "nothing came back");
+        assert_eq!(held(&tier), filled);
+        run(30);
     }
 
     /// The same with room for the misses to pass through the card: some run there, the others

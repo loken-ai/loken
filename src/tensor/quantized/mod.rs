@@ -92,6 +92,8 @@ pub fn pad_to(x: usize, q: usize) -> usize {
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) use cuda_storage::trim_lent_pool;
+#[cfg(feature = "cuda")]
 pub use cuda_storage::QCudaStorage;
 pub use dtype::GgmlDType;
 pub use host::{QHostTensor, BLOCK_ALIGN};

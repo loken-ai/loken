@@ -86,6 +86,42 @@ impl QCudaStorage {
         }
     }
 
+    /// Zeroed storage for `len` bytes of blocks plus the over-read tail, taken from the memory
+    /// pool of the card that holds only what is lent: the blobs of the default pool share its
+    /// segments with long-lived buffers, and a segment goes back to the card only when none of
+    /// them is in use, so freeing a blob there seldom gives its memory back. Here it does.
+    pub(crate) fn zeroed_in_lent_pool(
+        device: &CudaDevice,
+        len: usize,
+        dtype: GgmlDType,
+    ) -> Result<Self> {
+        use cudarc::driver::sys;
+        let pool = lent_pool(device.0.ordinal())?;
+        let bytes = len + BLOB_TAIL_PAD_BYTES;
+        device
+            .0
+            .context()
+            .bind_to_thread()
+            .map_err(|e| Error::msg(format!("bind context: {e:?}")))?;
+        let stream = device.0.stream();
+        let mut ptr: sys::CUdeviceptr = 0;
+        let check = |what: &str, r: sys::CUresult| -> Result<()> {
+            if r == sys::CUresult::CUDA_SUCCESS {
+                Ok(())
+            } else {
+                Err(Error::msg(format!("{what}: {r:?}")))
+            }
+        };
+        check("lent blob", unsafe {
+            sys::cuMemAllocFromPoolAsync(&mut ptr, bytes, pool, stream.cu_stream())
+        })?;
+        check("lent blob zeroed", unsafe {
+            sys::cuMemsetD8Async(ptr, 0, bytes, stream.cu_stream())
+        })?;
+        let blob = unsafe { stream.upgrade_device_ptr::<u8>(ptr, bytes) };
+        Self::over(blob, len, dtype, device)
+    }
+
     /// This type over an already-allocated blob whose first `len` bytes are the block data.
     fn over(
         blob: cudarc::driver::CudaSlice<u8>,
@@ -247,4 +283,43 @@ impl QCudaStorage {
 enum QuantizeSrc<'a> {
     F32(cudarc::driver::CudaView<'a, f32>),
     F16(cudarc::driver::CudaView<'a, half::f16>),
+}
+
+/// The memory pool of card `ordinal` that holds the blobs lent to a prefill (made on first use).
+#[cfg(feature = "cuda")]
+fn lent_pool(ordinal: usize) -> Result<cudarc::driver::sys::CUmemoryPool> {
+    use cudarc::driver::sys;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static POOLS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    let mut pools = POOLS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&p) = pools.get(&ordinal) {
+        return Ok(p as sys::CUmemoryPool);
+    }
+    let mut props: sys::CUmemPoolProps = unsafe { std::mem::zeroed() };
+    props.allocType = sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED;
+    props.location.type_ = sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+    props.location.__bindgen_anon_1.id = ordinal as i32;
+    let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+    let r = unsafe { sys::cuMemPoolCreate(&mut pool, &props) };
+    if r != sys::CUresult::CUDA_SUCCESS {
+        return Err(Error::msg(format!(
+            "lent memory pool of card {ordinal}: {r:?}"
+        )));
+    }
+    pools.insert(ordinal, pool as usize);
+    Ok(pool)
+}
+
+/// Give the card `ordinal` the memory the lent pool still holds after its blobs were freed.
+#[cfg(feature = "cuda")]
+pub(crate) fn trim_lent_pool(ordinal: usize) {
+    if let Ok(pool) = lent_pool(ordinal) {
+        unsafe {
+            let _ = cudarc::driver::sys::cuMemPoolTrimTo(pool, 0);
+        }
+    }
 }
