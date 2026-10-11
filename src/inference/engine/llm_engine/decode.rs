@@ -391,6 +391,20 @@ pub(super) fn verify_recorded(
         }
         model.invalidate_graph_state();
     };
+    // The window's first row stands for the plain step of the carried token: before a
+    // recording, that step is run eagerly from a checkpoint of the state, and the state
+    // returned, so that the window's row can be held against it.
+    let plain_row: Option<Vec<f32>> = if graphs.by_rows.contains_key(&rows) {
+        None
+    } else {
+        match model.plain_step_held(ids[0], pos) {
+            Ok(row) => Some(row),
+            Err(e) => {
+                warn!("the plain step the window's first row is held against did not run: {e}");
+                None
+            }
+        }
+    };
     let preparing = std::time::Instant::now();
     let prepared = model.verify_window_prepare(pos, ids);
     graphs.prepare_secs += preparing.elapsed().as_secs_f64();
@@ -410,21 +424,6 @@ pub(super) fn verify_recorded(
         }
         graphs.launch_secs += launching.elapsed().as_secs_f64();
         return Some((logits.clone(), None));
-    }
-    // The window's first row stands for the plain step of the carried token: that step is run
-    // eagerly from a checkpoint of the state, and the state returned, so that the window's row
-    // can be held against it. A window that does not give the plain step's logits is given up.
-    let plain_row: Option<Vec<f32>> = match model.plain_step_held(ids[0], pos) {
-        Ok(row) => Some(row),
-        Err(e) => {
-            warn!("the plain step the window's first row is held against did not run: {e}");
-            None
-        }
-    };
-    let _ = stream.synchronize();
-    if let Err(e) = model.verify_window_prepare(pos, ids) {
-        give_up(model, graphs, format!("prepare after the plain step: {e}"));
-        return None;
     }
     // The eager run of the window: what the replay has to reproduce.
     let eager = match model.forward_verify_window(rows) {

@@ -909,7 +909,10 @@ impl LlmEngine {
                     // The head's guesses for this step, from the hidden state the last step left
                     // it: a step with guesses verifies them, one without replays the plain step.
                     let head_draft_started = std::time::Instant::now();
-                    let head_draft: Vec<u32> = if head_on {
+                    // The head guesses once the step is recorded: a window is held against the
+                    // recorded step's kernels, which an eager step before the recording does not
+                    // run (its indexed attention selects on the host).
+                    let head_draft: Vec<u32> = if head_on && cuda_graph.is_some() {
                         let want = spec_engine.draft_length().min(verify_graphs.draft_cap());
                         if want == 0 {
                             Vec::new()
