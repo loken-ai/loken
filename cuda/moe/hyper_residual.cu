@@ -147,7 +147,7 @@ extern "C" void loken_hc_combine(
 
 namespace {
 
-constexpr int UP_TILE = 8;
+constexpr int UP_TILE = 4;
 
 __device__ __forceinline__ float dot_row(const float * __restrict__ w, const float * __restrict__ x,
         int k, int lane0, int stride) {

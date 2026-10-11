@@ -423,3 +423,122 @@ pub fn hc_dequant(q: &Tensor, scale: &Tensor, f32_out: bool) -> Result<Tensor> {
         widen!(half::f16, 0)
     }
 }
+
+#[cfg(test)]
+mod timing {
+    use super::*;
+    use crate::tensor::Device;
+
+    /// What the mixer's launches cost at the served shapes, int8 rows, one row of input: the
+    /// down and inject launch, the up and mean launch, and the combine with the next norm.
+    #[test]
+    #[ignore = "measurement: run explicitly with --release --ignored --nocapture"]
+    fn what_a_mixer_costs_a_sublayer() {
+        let Ok(card) = crate::tensor::cuda::CudaDevice::new(0).map(Device::Cuda) else {
+            return;
+        };
+        let (streams, dim, rank) = (4usize, 2560usize, 320usize);
+        let k = streams * dim;
+        let bytes = |n: usize, seed: u32| -> Vec<u8> {
+            (0..n)
+                .map(|i| ((i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed) >> 24) as u8)
+                .collect()
+        };
+        let scales =
+            |n: usize| -> Vec<f32> { (0..n).map(|i| 0.01 + (i % 7) as f32 * 1e-3).collect() };
+        let q = |rows: usize, cols: usize, seed: u32| -> (Tensor, Tensor) {
+            (
+                Tensor::from_vec(bytes(rows * cols, seed), (rows, cols), &card).unwrap(),
+                Tensor::from_vec(
+                    scales(rows * cols / INT8_GROUP),
+                    (rows, cols / INT8_GROUP),
+                    &card,
+                )
+                .unwrap(),
+            )
+        };
+        let (down_q, down_s) = q(rank, k, 1);
+        let (up_q, up_s) = q(k, rank, 2);
+        let (inj_q, inj_s) = q(streams, k, 3);
+        let r = Tensor::from_vec(
+            (0..k).map(|i| ((i % 97) as f32) * 0.01 - 0.4).collect(),
+            (1, 1, k),
+            &card,
+        )
+        .unwrap();
+        let gamma = Tensor::from_vec(vec![1.0f32; k], (k,), &card).unwrap();
+        let out = Tensor::from_vec(
+            (0..dim).map(|i| ((i % 31) as f32) * 0.02).collect(),
+            (1, 1, dim),
+            &card,
+        )
+        .unwrap();
+        let cd = card.as_cuda_device().unwrap();
+        let time = |what: &str, f: &dyn Fn()| {
+            for _ in 0..10 {
+                f();
+            }
+            cd.0.stream().synchronize().unwrap();
+            let n = 200;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            cd.0.stream().synchronize().unwrap();
+            eprintln!(
+                "{what}: {:.1} us a launch",
+                t.elapsed().as_secs_f64() * 1e6 / n as f64
+            );
+        };
+        let xn = hc_norm(&r, &gamma, streams, dim, 1e-6).unwrap();
+        time("norm", &|| {
+            hc_norm(&r, &gamma, streams, dim, 1e-6).unwrap();
+        });
+        time("down and inject, up and mean", &|| {
+            hc_mix_fused_over(
+                &xn,
+                MixWeight::Int8 {
+                    q: &down_q,
+                    scale: &down_s,
+                },
+                MixWeight::Int8 {
+                    q: &up_q,
+                    scale: &up_s,
+                },
+                Some(MixWeight::Int8 {
+                    q: &inj_q,
+                    scale: &inj_s,
+                }),
+                streams,
+                dim,
+                true,
+            )
+            .unwrap()
+            .expect("the launches take these");
+        });
+        let (_, inj) = hc_mix_fused_over(
+            &xn,
+            MixWeight::Int8 {
+                q: &down_q,
+                scale: &down_s,
+            },
+            MixWeight::Int8 {
+                q: &up_q,
+                scale: &up_s,
+            },
+            Some(MixWeight::Int8 {
+                q: &inj_q,
+                scale: &inj_s,
+            }),
+            streams,
+            dim,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let inj = inj.unwrap();
+        time("combine with the next norm", &|| {
+            hc_combine(&r, &out, &inj, Some((&gamma, 1e-6)), streams, dim).unwrap();
+        });
+    }
+}
