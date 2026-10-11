@@ -9,6 +9,11 @@ use super::*;
 use crate::inference::engine::decode_step::record_logprobs;
 use crate::inference::place::ladder::is_out_of_memory;
 
+/// The seconds a window just recorded replayed in, when a verify recorded one.
+fn replay_secs_of(recorded: &Option<(Tensor, Option<f64>)>) -> Option<f64> {
+    recorded.as_ref().and_then(|r| r.1)
+}
+
 impl LlmEngine {
     /// Generate stream - returns channel receiver for streaming tokens with real model inference
     /// True if the loaded model is served through the continuous-batch worker
@@ -698,7 +703,9 @@ impl LlmEngine {
                 // A model that came with a draft head reads the hidden state of every forward from
                 // the prefill on: the head drafts from the state before the token it is given. A
                 // prompt that starts after a cached prefix would leave the head without it.
-                head_capable = text_start == 0 && state.model.draft_head_capture(true);
+                head_capable = text_start == 0
+                    && config.recorded_drafts
+                    && state.model.draft_head_capture(true);
                 if head_capable {
                     state.model.draft_head_reset();
                 } else {
@@ -1083,17 +1090,23 @@ impl LlmEngine {
                     s.model.draft_head_capture(false);
                 }
             }
+            let cache_at_start = model_state
+                .blocking_lock()
+                .as_ref()
+                .and_then(|s| s.model.expert_cache_counters());
             let mut head_tokens: Vec<u32> = vec![next_token];
-            // Whether the head's history has to start over before its next guess (a step it did
-            // not follow ran), and what its cycles came to: verifies, of them recorded, and
-            // steps it had no guess for.
-            let mut head_reset_due = false;
+            // What the head's cycles came to: verifies, of them recorded, and steps it had no
+            // guess for.
             let (mut head_cycles, mut head_recorded, mut head_empty, mut head_unsure): (
                 u64,
                 u64,
                 u64,
                 u64,
             ) = (0, 0, 0, 0);
+            // What settling the recorded windows cost, summed, and how many settled; what the
+            // replays and the commits of the verifies cost, summed.
+            let (mut settle_secs, mut settles) = (0f64, 0u64);
+            let (mut replay_sum, mut commit_sum) = (0f64, 0f64);
             let (mut spec_drafted, mut spec_accepted): (u64, u64) = (0, 0);
             let mut pld_stats_drafted: u64 = 0;
             let mut pld_stats_accepted: u64 = 0;
@@ -1546,17 +1559,20 @@ impl LlmEngine {
                     // it: a step with guesses verifies them, one without replays the plain step.
                     let head_draft_started = std::time::Instant::now();
                     let head_draft: Vec<u32> = if head_on {
-                        let want = spec_engine.draft_length();
+                        let want = spec_engine.draft_length().min(verify_graphs.draft_cap());
                         if want == 0 {
                             Vec::new()
                         } else {
                             match model_state.blocking_lock().as_mut() {
-                                Some(s) => {
-                                    if head_reset_due {
-                                        s.model.draft_head_reset();
-                                    }
-                                    s.model.draft_head_tokens(&head_tokens, want)
-                                }
+                                Some(s) => s.model.draft_head_tokens(
+                                    &head_tokens,
+                                    want,
+                                    spec_engine
+                                        .draft_length
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .min_odds(),
+                                ),
                                 None => Vec::new(),
                             }
                         }
@@ -1959,13 +1975,14 @@ impl LlmEngine {
                                 .unwrap_or_else(|e| e.into_inner())
                                 .record(0, 0, 0.0, plain_secs);
                         }
+                        // The head reads the step's token with the row the step left: its next
+                        // guess takes the pair in, so its history goes on.
                         if head_on {
                             if let Some(s) = model_state.blocking_lock().as_mut() {
                                 s.model.step_feature();
                             }
                             head_tokens.clear();
                             head_tokens.push(tok);
-                            head_reset_due = true;
                         }
                         continue 'stream_loop;
                     }
@@ -2008,12 +2025,9 @@ impl LlmEngine {
                         time_plain = true;
                     }
                     if head_on && want == 0 {
-                        // Plain decoding pays more: the head stops reading the hidden states.
-                        head_on = false;
+                        // Plain decoding pays more for now: the head follows the plain steps
+                        // until the policy tries it again.
                         time_plain = true;
-                        if let Some(s) = model_state.blocking_lock().as_mut() {
-                            s.model.draft_head_capture(false);
-                        }
                     }
                     let draft: Vec<u32> = if spec_on {
                         let d = spec_engine.draft_k(
@@ -2073,11 +2087,11 @@ impl LlmEngine {
                             };
                             // A draft the recorded windows serve replays its window; any other
                             // runs eagerly.
+                            let windows_served =
+                                config.recorded_drafts && graph_ok && !graph_disabled_this_request;
                             #[cfg(feature = "cuda")]
-                            let recorded = match (
-                                graph_ok && !graph_disabled_this_request,
-                                graph_stream.as_ref(),
-                            ) {
+                            let replaying = std::time::Instant::now();
+                            let recorded = match (windows_served, graph_stream.as_ref()) {
                                 (true, Some(s)) => super::decode::verify_recorded(
                                     &mut state.model,
                                     s,
@@ -2093,6 +2107,24 @@ impl LlmEngine {
                                 Option<f64>,
                             )> = None;
                             let recorded_window = recorded.is_some();
+                            if recorded_window {
+                                replay_sum += replaying.elapsed().as_secs_f64();
+                            }
+                            // An eager verify costs the head more than the plain steps it stands
+                            // for: once the windows are given up, the head stops guessing.
+                            if head_on
+                                && windows_served
+                                && !recorded_window
+                                && verify_graphs.disabled
+                            {
+                                head_on = false;
+                                state.model.draft_head_capture(false);
+                            }
+                            // A cycle pays its way only when its window replayed: one recorded
+                            // as it ran, or verified eagerly where windows serve, counts its
+                            // acceptance alone.
+                            let charged = replay_secs_of(&recorded).is_none()
+                                && (recorded_window || !windows_served);
                             // A window recorded for this verify cost its recording too: the
                             // cycle is charged the replay alone, which is what the next ones cost.
                             let replay_secs = recorded.as_ref().and_then(|r| r.1);
@@ -2119,6 +2151,7 @@ impl LlmEngine {
                                 // contract as the non-PLD greedy site).
                                 // Temperature>0: host CPU sampler path.
                                 let mut committed: Vec<u32> = Vec::new();
+                                let committing = std::time::Instant::now();
                                 let outcome = pld_verify_commit(
                                     &logits,
                                     &draft,
@@ -2168,6 +2201,9 @@ impl LlmEngine {
                                         }
                                     },
                                 );
+                                if recorded_window {
+                                    commit_sum += committing.elapsed().as_secs_f64();
+                                }
                                 let outcome = match outcome {
                                     Ok(o) => o,
                                     Err(e) => {
@@ -2199,7 +2235,6 @@ impl LlmEngine {
                                     head_tokens.clear();
                                     head_tokens.extend_from_slice(&draft[..accepted_drafts]);
                                     head_tokens.push(outcome.next_token);
-                                    head_reset_due = false;
                                     head_cycles += 1;
                                     if recorded_window {
                                         head_recorded += 1;
@@ -2210,23 +2245,22 @@ impl LlmEngine {
                                         .draft_length
                                         .lock()
                                         .unwrap_or_else(|e| e.into_inner());
-                                    match replay_secs {
-                                        Some(_) => length.record_accepted(k, accepted_drafts),
-                                        None => length.record(
-                                            k,
-                                            accepted_drafts,
-                                            draft_secs,
-                                            cycle_secs,
-                                        ),
+                                    if charged {
+                                        length.record(k, accepted_drafts, draft_secs, cycle_secs);
+                                    } else {
+                                        length.record_accepted(k, accepted_drafts);
                                     }
                                 }
 
                                 if recorded_window {
+                                    let settling = std::time::Instant::now();
                                     if let Err(e) = state.model.verify_window_settle(n_committed) {
                                         let _ =
                                             tx.blocking_send(Err(format!("verify settle: {e}")));
                                         return;
                                     }
+                                    settle_secs += settling.elapsed().as_secs_f64();
+                                    settles += 1;
                                 } else if n_committed < k + 1 {
                                     state.model.trim_kv(new_pos);
                                 }
@@ -2340,7 +2374,6 @@ impl LlmEngine {
                             // The draft head needs this step's hidden state, which the captured
                             // graph does not hand out: the step runs as a one-row verify.
                             let stepped = if head_on {
-                                state.model.draft_head_reset();
                                 state.model.forward_all(&x, pos).and_then(|l| l.squeeze(0))
                             } else {
                                 state.model.forward(&x, pos)
@@ -2453,7 +2486,6 @@ impl LlmEngine {
                         if head_on {
                             head_tokens.clear();
                             head_tokens.push(new_next_token);
-                            head_reset_due = false;
                         } else {
                             pld_cost.plain_step(cycle_start.elapsed().as_secs_f64());
                         }
@@ -2495,17 +2527,33 @@ impl LlmEngine {
                 .pld_cost
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = pld_cost.clone();
+            let cache_at_end = model_state
+                .blocking_lock()
+                .as_ref()
+                .and_then(|s| s.model.expert_cache_counters());
+            if let (Some(a), Some(b)) = (cache_at_start, cache_at_end) {
+                let routed = b.0.saturating_sub(a.0);
+                info!(
+                    "expert cache over the decode: {:.1}% of {routed} routed experts on the card",
+                    100.0 * b.1.saturating_sub(a.1) as f64 / routed.max(1) as f64
+                );
+            }
             if head_capable {
                 if let Some(s) = model_state.blocking_lock().as_mut() {
                     s.model.draft_head_capture(false);
                 }
                 if spec_drafted > 0 || head_cycles > 0 || head_empty > 0 {
                     info!(
-                        "Spec decode done: drafted={} accepted={} ({}%), next draft length {}; head: {head_cycles} verifies ({head_recorded} recorded), {head_empty} steps without a guess ({head_unsure} the head was unsure of); {}",
+                        "Spec decode done: drafted={} accepted={} ({}%), next draft length {}; head: {head_cycles} verifies ({head_recorded} recorded: replayed in {:.1} ms of which {:.1} preparing and {:.1} launching, committed in {:.1} ms, settled in {:.1} ms each), {head_empty} steps without a guess ({head_unsure} the head was unsure of); {}",
                         spec_drafted,
                         spec_accepted,
                         spec_accepted * 100 / spec_drafted.max(1),
                         spec_engine.draft_length(),
+                        replay_sum * 1e3 / head_recorded.max(1) as f64,
+                        verify_graphs.prepare_secs * 1e3 / head_recorded.max(1) as f64,
+                        verify_graphs.launch_secs * 1e3 / head_recorded.max(1) as f64,
+                        commit_sum * 1e3 / head_recorded.max(1) as f64,
+                        settle_secs * 1e3 / settles.max(1) as f64,
                         spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).summary()
                     );
                 }

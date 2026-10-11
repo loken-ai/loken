@@ -434,12 +434,17 @@ pub(crate) trait ModelBackend: Send {
 
     /// Up to `k` tokens the model's draft head guesses follow the sequence; see
     /// `GenericHeteroTransformer::draft_tokens`.
-    fn draft_head_tokens(&mut self, _tokens: &[u32], _k: usize) -> Vec<u32> {
+    fn draft_head_tokens(&mut self, _tokens: &[u32], _k: usize, _min_odds: f32) -> Vec<u32> {
         Vec::new()
     }
 
     /// The draft head's history starts over.
     fn draft_head_reset(&mut self) {}
+
+    /// The expert caches' mailboxes as they stand, for a wait on the card that lasts.
+    fn tier_mailboxes(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Hand the draft head the hidden state of the recorded step that just replayed.
     fn step_feature(&mut self) {}
@@ -465,6 +470,12 @@ pub(crate) trait ModelBackend: Send {
     /// and every layer returns to the rows kept.
     fn verify_window_settle(&mut self, _kept: usize) -> crate::tensor::Result<()> {
         Ok(())
+    }
+
+    /// The logits of the plain step of `token` at `pos`, the model returned to the state
+    /// before it: what a recorded window's first row is held against.
+    fn plain_step_held(&mut self, _token: u32, _pos: usize) -> crate::tensor::Result<Vec<f32>> {
+        crate::tensor::bail!("plain steps are not held for this variant")
     }
 
     /// Roll every per-layer KV cache back to `keep` valid positions, discarding
@@ -1656,8 +1667,8 @@ impl ModelBackend for GenericBackend {
         true
     }
 
-    fn draft_head_tokens(&mut self, tokens: &[u32], k: usize) -> Vec<u32> {
-        match self.0.draft_tokens(tokens, k) {
+    fn draft_head_tokens(&mut self, tokens: &[u32], k: usize, min_odds: f32) -> Vec<u32> {
+        match self.0.draft_tokens(tokens, k, min_odds) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("draft head: {e}");
@@ -1668,6 +1679,10 @@ impl ModelBackend for GenericBackend {
 
     fn draft_head_reset(&mut self) {
         self.0.draft_reset();
+    }
+
+    fn tier_mailboxes(&self) -> Vec<String> {
+        self.0.tier_mailboxes()
     }
 
     fn step_feature(&mut self) {
@@ -1692,6 +1707,10 @@ impl ModelBackend for GenericBackend {
     #[cfg(feature = "cuda")]
     fn verify_window_settle(&mut self, kept: usize) -> crate::tensor::Result<()> {
         self.0.verify_window_settle(kept)
+    }
+
+    fn plain_step_held(&mut self, token: u32, pos: usize) -> crate::tensor::Result<Vec<f32>> {
+        self.0.plain_step_held(token, pos)
     }
 
     fn reset_kv_from(&mut self, keep: usize) {

@@ -1293,6 +1293,8 @@ fn toy_with_head() -> GenericHeteroTransformer {
         committed: 0,
         carried: None,
         indexer_mark: None,
+        #[cfg(feature = "cuda")]
+        step: None,
     });
     m
 }
@@ -1317,7 +1319,7 @@ fn head_guesses(calls: &[(usize, usize)], k: usize) -> Vec<u32> {
     let mut out = Vec::new();
     for &(from, n) in calls {
         m.last_feature = Some(feature(from, n));
-        out = m.draft_tokens(&tokens[from..from + n], k).unwrap();
+        out = m.draft_tokens(&tokens[from..from + n], k, 0.5).unwrap();
     }
     out
 }
@@ -1362,7 +1364,7 @@ fn head_guesses_after_prompt(layer_major: bool, chunk: usize) -> (Vec<f32>, Vec<
         )
         .0) as u32;
     m.forward(&ids(&[next]), prompt.len()).unwrap();
-    let guesses = m.draft_tokens(&[next], 3).unwrap();
+    let guesses = m.draft_tokens(&[next], 3, 0.5).unwrap();
     (row, guesses)
 }
 

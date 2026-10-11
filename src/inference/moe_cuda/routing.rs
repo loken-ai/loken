@@ -76,6 +76,40 @@ pub fn topk_softmax(
     Ok((weights, ids))
 }
 
+/// [`batched_argmax`] writing the ids into `out`, `[n_rows]` U32 on the card: nothing returns
+/// to the host, so a recorded step can take it.
+pub fn batched_argmax_into(logits: &Tensor, out: &Tensor) -> Result<()> {
+    let (n_rows, vocab) = logits.dims2()?;
+    if out.dtype() != DType::U32 || out.elem_count() != n_rows {
+        crate::tensor::bail!("batched_argmax_into: the ids buffer holds {n_rows} u32 ids");
+    }
+    let dev = logits.device().as_cuda_device()?;
+    let logits = logits.to_dtype(DType::F32)?.contiguous()?;
+    let (storage, _) = logits.storage_and_layout();
+    let (out_storage, out_layout) = out.storage_and_layout();
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    let s = match &*storage {
+        StorageView::Cuda(c) => c.as_cuda_slice::<f32>()?,
+        _ => crate::tensor::bail!("batched_argmax_into: cuda only"),
+    };
+    let o = match &*out_storage {
+        StorageView::Cuda(c) => c.as_cuda_slice::<u32>()?,
+        _ => crate::tensor::bail!("batched_argmax_into: cuda only"),
+    };
+    let out_ptr =
+        unsafe { (o.device_ptr(o.stream()).0 as *mut u32).add(out_layout.start_offset()) };
+    unsafe {
+        loken_batched_argmax_f32(
+            s.device_ptr(s.stream()).0 as *const std::ffi::c_void,
+            out_ptr,
+            n_rows as i32,
+            vocab as i32,
+            stream,
+        )
+    };
+    Ok(())
+}
+
 /// Batched argmax over `[n_rows, vocab]` logits -> `n_rows` token ids in ONE custom CUDA
 /// launch (not a slow per-op argmax + per-row host scan). For the continuous-batching
 /// deterministic decode sampler. Ties break to the lowest index (host-argmax parity).

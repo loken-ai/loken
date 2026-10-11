@@ -174,6 +174,7 @@ impl SparseAttention {
         let hd = m.head_dim;
         let blocks = tokens / m.block + 2;
         let on_card = |v: &[f32]| Tensor::from_slice(v, (hd,), &Device::Cpu)?.to_device(dev);
+        self.card_births += 1;
         self.card = Some(CardIndexer {
             dev: dev.clone(),
             shape: IndexerShape {
@@ -219,7 +220,13 @@ impl SparseAttention {
         grown.slice_set(&card.pooled, 0, 0)?;
         card.pooled = grown;
         card.scores = Tensor::zeros_on((groups * 32,), DType::F32, &card.dev)?;
+        self.card_births += 1;
         Ok(())
+    }
+
+    /// How many times the card's buffers were made or grown.
+    pub fn card_births(&self) -> u64 {
+        self.card_births
     }
 
     /// The rotation tables of a step at `pos`: those at the first position of the block the

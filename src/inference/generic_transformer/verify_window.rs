@@ -55,7 +55,7 @@ pub(crate) struct VerifyBuffers {
 #[cfg(feature = "cuda")]
 impl GenericTransformerLayer {
     /// The buffers this layer keeps its state in before the rows of a verify, made once.
-    fn verify_keep_ready(&mut self, dev: &Device) -> Result<()> {
+    pub(super) fn verify_keep_ready(&mut self, dev: &Device) -> Result<()> {
         if self.verify_keep.is_some() {
             return Ok(());
         }
@@ -519,6 +519,29 @@ impl GenericHeteroTransformer {
             }
         }
         Ok(())
+    }
+
+    /// The logits of the plain step of `token` at `pos`, run eagerly, the model returned to the
+    /// state before it: the recurrent states from a checkpoint, the n-gram history as it was;
+    /// the cache row the step wrote is written again by what runs at `pos` next.
+    pub fn plain_step_held(&mut self, token: u32, pos: usize) -> Result<Vec<f32>> {
+        let history = self
+            .ngram
+            .as_ref()
+            .and_then(|ng| self.layers[ng.meta.layer].ngram.as_ref())
+            .map(|ple| ple.history.clone());
+        self.update_graph_state(pos)?;
+        let x = Tensor::new(&[token], &Device::Cpu)?.unsqueeze(0)?;
+        self.embed_for_graph(&x)?;
+        let checkpoint = self.recurrent_checkpoint()?;
+        let logits = self.forward_from_hidden();
+        self.recurrent_restore(&checkpoint)?;
+        if let (Some(history), Some(ng)) = (history, self.ngram.as_ref()) {
+            if let Some(ple) = self.layers[ng.meta.layer].ngram.as_mut() {
+                ple.history = history;
+            }
+        }
+        logits?.flatten_all()?.to_vec1::<f32>()
     }
 
     /// Forget the buffers of the recorded verifies: the graphs that read them are gone.

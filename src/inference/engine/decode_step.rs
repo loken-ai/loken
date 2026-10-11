@@ -357,6 +357,8 @@ pub(crate) struct DraftLength {
 /// cost measured once, on a cold cache, would keep the drafter off for good.
 const DRAFT_RETRY_STEPS: u32 = 48;
 const DRAFT_RETRY_MAX: u32 = 1536;
+/// The odds a drafted token must have while the policy has not measured what a row costs.
+const DRAFT_EVEN_ODDS: f32 = 0.5;
 /// Cycles a drafter is given before its acceptance is trusted against the plain step: the
 /// smoothed survival of its first cycle alone undercounts a drafter that is mostly right.
 const DRAFT_PROBES: u32 = 4;
@@ -365,11 +367,18 @@ impl DraftLength {
     pub(crate) fn next(&self) -> usize {
         let draft_token = self.draft_token.unwrap_or(0.0);
         // A verify covers the carried token plus the draft: `k + 1` rows.
+        // A window costs the plain step plus a share per row: the share comes from the
+        // nearest measured length, and the plain step is the length-zero cycle.
         let scaled_verify = |k: usize| {
-            (0..=DRAFT_MAX)
+            let plain = self.cycle[0].map(|(_, v)| v);
+            (1..=DRAFT_MAX)
                 .filter_map(|j| self.cycle[j].map(|(_, v)| (j.abs_diff(k), j, v)))
                 .min_by(|a, b| a.0.cmp(&b.0))
-                .map(|(_, j, v)| v * (k + 1) as f64 / (j + 1) as f64)
+                .map(|(_, j, v)| match plain {
+                    Some(p) if v > p => p + (v - p) * k as f64 / j as f64,
+                    _ => v * (k + 1) as f64 / (j + 1) as f64,
+                })
+                .or_else(|| plain.map(|p| p * (k + 1) as f64))
         };
         let mut best = (0, f64::MIN);
         let mut best_drafting = (0, f64::MIN);
@@ -406,6 +415,18 @@ impl DraftLength {
         best.0
     }
 
+    /// The odds a drafted token has to be given for its row to pay: a row of the window costs
+    /// its share of a plain step, measured from the length-one cycles against the plain ones;
+    /// even odds until both are measured.
+    pub(crate) fn min_odds(&self) -> f32 {
+        match (self.cycle[0], self.cycle[1]) {
+            (Some((_, plain)), Some((_, two))) if plain > 0.0 && two > plain => {
+                ((two - plain) / plain).clamp(0.1, 0.9) as f32
+            }
+            _ => DRAFT_EVEN_ODDS,
+        }
+    }
+
     /// The costs and acceptances the choice rests on, for the request's log line.
     pub(crate) fn summary(&self) -> String {
         let cycles: Vec<String> = (0..=DRAFT_MAX)
@@ -418,10 +439,11 @@ impl DraftLength {
             .map(|i| format!("{}/{}", self.kept[i], self.reached[i]))
             .collect();
         format!(
-            "cycle ms (cycle/verify) {}; kept {}; draft token {:.1} ms; plain run {}, backoff {}",
+            "cycle ms (cycle/verify) {}; kept {}; draft token {:.1} ms; min odds {:.2}; plain run {}, backoff {}",
             cycles.join(" "),
             kept.join(" "),
             self.draft_token.unwrap_or(0.0) * 1e3,
+            self.min_odds(),
             self.plain_run,
             self.backoff
         )
@@ -847,17 +869,18 @@ pub(crate) fn replay_agrees(graph: &[f32], eager: &[f32]) -> bool {
             })
             .0
     };
-    let (a, b) = (top(graph), top(eager));
-    if a == b {
-        return true;
-    }
+    top(graph) == top(eager) || replay_distance(graph, eager) <= REPLAY_RELATIVE_ERROR
+}
+
+/// The distance between a replay's logits and the eager step's, relative to the eager norm.
+pub(crate) fn replay_distance(graph: &[f32], eager: &[f32]) -> f64 {
     let (mut diff2, mut norm2) = (0f64, 0f64);
     for (g, e) in graph.iter().zip(eager) {
         let d = f64::from(g - e);
         diff2 += d * d;
         norm2 += f64::from(*e) * f64::from(*e);
     }
-    diff2.sqrt() <= REPLAY_RELATIVE_ERROR * norm2.sqrt()
+    diff2.sqrt() / norm2.sqrt().max(f64::EPSILON)
 }
 
 /// The relative distance between a replay's logits and the eager step's, from which a replay is

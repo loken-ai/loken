@@ -174,6 +174,9 @@ pub struct InferenceConfig {
     /// own dtype, shared between sequences by prefix, one manifest per sequence. `None`
     /// keeps snapshots in memory only.
     pub kv_disk_dir: Option<String>,
+    /// Whether drafts are verified in recorded windows, the model's draft head guessing where
+    /// they are.
+    pub recorded_drafts: bool,
     /// Bytes the disk tier may hold, in GiB; 0 for no limit. Least recently used
     /// sequences go first.
     pub kv_disk_budget_gb: f64,
@@ -252,6 +255,7 @@ impl Default for InferenceConfig {
             device_index: None,
             replicas: 1,
             kv_disk_dir: None,
+            recorded_drafts: false,
             kv_disk_budget_gb: 0.0,
             state_cache_dir: None,
             state_cache_budget_gb: 0.0,

@@ -162,6 +162,11 @@ impl Mailbox {
         unsafe { std::ptr::read_volatile(self.word(REQUEST)) }
     }
 
+    /// The request, reply, abort and rows words, as they stand.
+    fn words(&self) -> [u32; 4] {
+        [REQUEST, REPLY, ABORT, ROWS].map(|at| unsafe { std::ptr::read_volatile(self.word(at)) })
+    }
+
     /// The posted request, once its number is read: the card writes the body before the number.
     pub(super) fn read(&self) -> Request {
         loop {
@@ -267,6 +272,36 @@ pub(super) struct GraphSide {
 }
 
 impl LayerTier {
+    /// The mailbox as it stands, for a wait that lasts: the request, reply, abort and rows
+    /// words, what the worker served, and the card's counter read over the copy stream.
+    pub fn mailbox_state(&self) -> Option<String> {
+        let g = self.graph.get()?;
+        let [request, reply, abort, rows] = g.mail.words();
+        let done = g.done.load(Ordering::Relaxed);
+        let counter = (|| -> Result<[u32; 2]> {
+            use cudarc::driver::DevicePtr;
+            let (storage, layout) = g.counter.storage_and_layout();
+            let crate::tensor::StorageView::Cuda(c) = &*storage else {
+                crate::tensor::bail!("the counter is on the card");
+            };
+            let slice = c.as_cuda_slice::<u32>()?;
+            let src = slice.device_ptr(slice.stream()).0 + (layout.start_offset() * 4) as u64;
+            let mut out = [0u32; 2];
+            unsafe {
+                cudarc::driver::result::memcpy_dtoh_async(&mut out, src, self.copy.cu_stream())
+                    .map_err(|e| crate::tensor::Error::msg(format!("counter read: {e:?}")))?;
+            }
+            self.copy
+                .synchronize()
+                .map_err(|e| crate::tensor::Error::msg(format!("counter read: {e:?}")))?;
+            Ok(out)
+        })();
+        Some(format!(
+            "request {request} reply {reply} abort {abort} rows {rows} served {done} counter {:?}",
+            counter.ok()
+        ))
+    }
+
     /// Let this layer's decoded token, and the rows of a verify up to `rows_max`, run as kernels
     /// alone, served by a [`TierWorker`].
     pub(super) fn enable_graph(&self, hidden: usize, k: usize, rows_max: usize) -> Result<()> {
@@ -575,7 +610,7 @@ impl LayerTier {
         }
         g.done.store(req.seq, Ordering::Relaxed);
         laps.mark("tier worker: answer");
-        self.promote(&missing, &in_use);
+        self.promote_up_to(&missing, &in_use, req.rows);
         laps.mark("tier worker: promote");
         // The leader says what a request costs the host, once per window of requests.
         let us = started.elapsed().as_nanos() as u64;

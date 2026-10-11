@@ -56,6 +56,12 @@ pub use graph::TierWorker;
 static GRAPH_WITHOUT_CAPTURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Run the kernels of a recorded decode without recording them while `on`: what a recording
+/// is checked against, and what makes the buffers they keep before the recording.
+pub(crate) fn kernels_of_a_recording(on: bool) {
+    GRAPH_WITHOUT_CAPTURE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The hit rate from which a layer's extra slots are not given back to it after a prefill:
 /// of ten routed experts it misses half of one.
 const REFILL_BELOW_HIT_RATE: f64 = 0.95;
@@ -409,6 +415,16 @@ impl super::GenericHeteroTransformer {
                     )
                 })
                 .sum();
+            // The draft head's layer, when it runs on this card with its experts on the host,
+            // takes a cache of them too: a slot costs its share in that layer as well.
+            let draft_bytes = self
+                .draft
+                .as_ref()
+                .filter(|d| d.layer_dev == LayerDevice::Cuda(ordinal))
+                .and_then(|d| d.layer.moe.as_ref())
+                .filter(|m| m.experts_on_host() && serves(m))
+                .map(expert_bytes);
+            let bytes = bytes + draft_bytes.unwrap_or(0);
             let budget = plan
                 .segments
                 .iter()
@@ -496,10 +512,30 @@ impl super::GenericHeteroTransformer {
                 }
                 moe.tier = Some(Arc::new(tier));
             }
+            // The head's layer reads its experts through the cache a token at a time and the
+            // rows of a draft together; a prompt's rows take the host's grouped path, so the
+            // layer has no transit room.
+            if draft_bytes.is_some() {
+                if let Some(moe) = self.draft.as_mut().and_then(|d| d.layer.moe.as_mut()) {
+                    let tier = LayerTier::new(moe, dev, slots)?;
+                    tier.enable_graph(
+                        tier.host[0].shape().dims()[2],
+                        moe.n_experts_used,
+                        crate::inference::engine::decode_step::VERIFY_ROWS,
+                    )?;
+                    moe.tier = Some(Arc::new(tier));
+                }
+            }
             // The layers' decoded tokens run as kernels alone, served by one thread of the host.
             let arcs: Vec<Arc<LayerTier>> = tiered
                 .iter()
                 .filter_map(|&l| self.layers[l].moe.as_ref().and_then(|m| m.tier.clone()))
+                .chain(
+                    self.draft
+                        .as_ref()
+                        .filter(|d| d.layer_dev == LayerDevice::Cuda(ordinal))
+                        .and_then(|d| d.layer.moe.as_ref().and_then(|m| m.tier.clone())),
+                )
                 .collect();
             for &l in &tiered {
                 let moe = self.layers[l]
@@ -517,8 +553,9 @@ impl super::GenericHeteroTransformer {
             }
             self.tier_workers.push(TierWorker::start(dev, arcs)?);
             tracing::info!(
-                "expert tier on card {ordinal}: {} layers ({locked} with locked host pages, {:.1} GB/s to the card, {} experts in the transit room), {} experts each cached of {} ({extra} of them lent to a prefill), {:.2} GB",
+                "expert tier on card {ordinal}: {} layers{} ({locked} with locked host pages, {:.1} GB/s to the card, {} experts in the transit room), {} experts each cached of {} ({extra} of them lent to a prefill), {:.2} GB",
                 tiered.len(),
+                if draft_bytes.is_some() { " and the draft head" } else { "" },
                 stager.bandwidth * 1e-3,
                 stager.transit,
                 (slots + extra).min(self.layers[first].moe.as_ref().map_or(0, |m| m.n_experts)),
@@ -855,6 +892,13 @@ impl LayerTier {
         let st = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
         st.owner.resize(self.base_slots + n, -1);
         Ok(self)
+    }
+
+    /// Whether `rows` rows read the layer's experts through the cache, as decoded tokens would:
+    /// always for a layer with a transit room, else while they read fewer experts than the
+    /// layer has (a wider batch is served from the host, grouped by expert).
+    pub fn rows_through_cache(&self, rows: usize, used: usize) -> bool {
+        self.stage.is_some() || rows * used < self.n_experts
     }
 
     /// How many slots are past the base ones, lent or not.
@@ -1637,7 +1681,7 @@ impl LayerTier {
         let out = out.expect("a token routes to at least one expert");
         drop(guard);
         self.keep_in_transit(&transit_experts, false, &mut in_use, &stream)?;
-        self.promote(&host_experts, &in_use);
+        self.promote_up_to(&host_experts, &in_use, rows);
         laps.mark("tier rows: finish");
         Ok(out)
     }
@@ -1843,48 +1887,69 @@ impl LayerTier {
     /// this token did not read. The copy runs beside the tokens that follow: the expert is
     /// routed to the card only once it has landed.
     fn promote(self: &Arc<Self>, missing: &[u32], in_use: &[bool]) {
-        if self.promoting.swap(true, Ordering::AcqRel) {
+        self.promote_up_to(missing, in_use, 1);
+    }
+
+    /// [`Self::promote`] for up to `most` experts at once: the hottest missing ones, each hotter
+    /// than the coldest slot left, copied in one job. A request of several rows misses as many
+    /// experts as rows, and the cache learns at that pace.
+    pub(super) fn promote_up_to(self: &Arc<Self>, missing: &[u32], in_use: &[bool], most: usize) {
+        if most == 0 || self.promoting.swap(true, Ordering::AcqRel) {
             return;
         }
-        let chosen = {
+        let chosen: Vec<(usize, usize)> = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let hot = missing
-                .iter()
-                .max_by(|&&a, &&b| st.heat[a as usize].total_cmp(&st.heat[b as usize]))
-                .copied();
-            let victim = (0..st.owner.len())
+            let mut hot: Vec<u32> = missing.to_vec();
+            hot.sort_unstable();
+            hot.dedup();
+            hot.sort_by(|&a, &b| st.heat[b as usize].total_cmp(&st.heat[a as usize]));
+            let mut victims: Vec<usize> = (0..st.owner.len())
                 .filter(|&s| !in_use[s] && st.owner[s] >= -1)
-                .min_by(|&a, &b| slot_heat(&st, a).total_cmp(&slot_heat(&st, b)));
-            match (hot, victim) {
-                (Some(hot), Some(victim)) if st.heat[hot as usize] > slot_heat(&st, victim) => {
-                    let old = st.owner[victim];
-                    if old >= 0 {
-                        st.set_slot(old as usize, -1);
-                    }
-                    st.owner[victim] = -2;
-                    Some((hot as usize, victim))
+                .collect();
+            victims.sort_by(|&a, &b| slot_heat(&st, a).total_cmp(&slot_heat(&st, b)));
+            let mut pairs = Vec::new();
+            for (&expert, &victim) in hot.iter().zip(&victims).take(most) {
+                if st.heat[expert as usize] <= slot_heat(&st, victim) {
+                    break;
                 }
-                _ => None,
+                let old = st.owner[victim];
+                if old >= 0 {
+                    st.set_slot(old as usize, -1);
+                }
+                st.owner[victim] = -2;
+                pairs.push((expert as usize, victim));
             }
+            pairs
         };
-        let Some((expert, slot)) = chosen else {
+        if chosen.is_empty() {
             self.promoting.store(false, Ordering::Release);
             return;
-        };
+        }
         let tier = self.clone();
         copier(self.dev.as_cuda_device().map_or(0, |d| d.0.ordinal()))
             .send(Box::new(move || {
-                let landed = tier.copy_in(expert, slot);
-                let mut st = tier.state.lock().unwrap_or_else(|e| e.into_inner());
-                match landed {
-                    Ok(()) => {
-                        st.owner[slot] = expert as i32;
-                        st.set_slot(expert, slot as i32);
-                        tier.promotions.fetch_add(1, Ordering::Relaxed);
+                let landed = (|| -> Result<()> {
+                    for &(expert, slot) in &chosen {
+                        tier.copy_in_async(expert, slot)?;
                     }
-                    Err(e) => {
-                        tracing::warn!("expert tier: copying expert {expert} to slot {slot}: {e}");
-                        st.owner[slot] = -1;
+                    tier.copy
+                        .synchronize()
+                        .map_err(|e| crate::tensor::Error::msg(format!("slot copy: {e:?}")))
+                })();
+                let mut st = tier.state.lock().unwrap_or_else(|e| e.into_inner());
+                for &(expert, slot) in &chosen {
+                    match &landed {
+                        Ok(()) => {
+                            st.owner[slot] = expert as i32;
+                            st.set_slot(expert, slot as i32);
+                            tier.promotions.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "expert tier: copying expert {expert} to slot {slot}: {e}"
+                            );
+                            st.owner[slot] = -1;
+                        }
                     }
                 }
                 drop(st);
@@ -1893,15 +1958,8 @@ impl LayerTier {
             .ok();
     }
 
-    /// Expert `expert` of the host stacks into slot `slot` of the card's, and the copy done.
-    fn copy_in(&self, expert: usize, slot: usize) -> Result<()> {
-        self.copy_in_async(expert, slot)?;
-        self.copy
-            .synchronize()
-            .map_err(|e| crate::tensor::Error::msg(format!("slot copy: {e:?}")))
-    }
-
-    /// [`Self::copy_in`], queued: the caller waits for the copy stream.
+    /// Expert `expert` of the host stacks into slot `slot` of the card's, queued on the copy
+    /// stream: the caller waits for it.
     fn copy_in_async(&self, expert: usize, slot: usize) -> Result<()> {
         let cd = self.dev.as_cuda_device()?;
         cd.0.context()
@@ -2819,6 +2877,73 @@ mod tests {
             hits as f64 / routed as f64 > first.unwrap(),
             "the cache did not learn: {hits} of {routed}"
         );
+        drop(worker);
+    }
+
+    /// The rows of a draft verify as the kernels of the recorded decode, the host answering
+    /// through the mailbox and the lent slots in play, give what the host's expert loop gives
+    /// each row.
+    #[test]
+    fn the_rows_of_a_verify_through_the_recorded_decode_match_the_host() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
+        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
+        let mut tiered = layer(&card, experts, used, hidden, ffn);
+        let built = LayerTier::new(&tiered, &card, 6)
+            .unwrap()
+            .with_extra(8)
+            .unwrap();
+        tiered.tier = Some(Arc::new(built));
+        let tier = tiered.tier.clone().unwrap();
+        tier.enable_graph(hidden, used, 6).unwrap();
+        let worker = TierWorker::start(&card, vec![tier.clone()]).unwrap();
+        GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
+        let _order = crate::tensor::quantized::DecodeOrder::enter();
+        for round in 0..40usize {
+            let rows = 1 + round % 6;
+            let x = values(rows * hidden, 100 + (round % 4) as u64, 1.0);
+            let on_host = Tensor::from_vec(x.clone(), (1, rows, hidden), &Device::Cpu).unwrap();
+            let on_card = Tensor::from_vec(x, (1, rows, hidden), &card).unwrap();
+            let want = reference
+                .forward_rows(&on_host, &on_host, hidden, 1e-5)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let got = tiered
+                .forward_rows(&on_card, &on_card, hidden, 1e-5)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            tier.settle();
+            for r in 0..rows {
+                let (w, g) = (
+                    &want[r * hidden..(r + 1) * hidden],
+                    &got[r * hidden..(r + 1) * hidden],
+                );
+                let peak = w.iter().map(|v| v.abs()).fold(0f32, f32::max);
+                let worst = g
+                    .iter()
+                    .zip(w)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    worst <= 2e-2 * peak,
+                    "round {round}, row {r} of {rows}: max diff {worst} of {peak}"
+                );
+            }
+        }
+        GRAPH_WITHOUT_CAPTURE.store(false, Ordering::Relaxed);
+        let (routed, hits, promoted) = tier.counters();
+        assert!(promoted > 0, "the hot experts were never copied in");
+        assert!(hits > 0 && hits < routed, "{hits} of {routed} on the card");
         drop(worker);
     }
 

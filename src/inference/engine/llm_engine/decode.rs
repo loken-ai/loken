@@ -296,19 +296,72 @@ pub(super) fn capture_decode_graph(
 /// The recorded draft verifies of a request, one graph per window size, and whether they were
 /// given up on.
 #[cfg(feature = "cuda")]
-#[derive(Default)]
 pub(super) struct VerifyGraphs {
     by_rows: std::collections::HashMap<usize, (crate::tensor::cuda_ext::CapturedGraph, Tensor)>,
-    disabled: bool,
+    pub(super) disabled: bool,
+    /// Rows a window may carry: a window the card had no memory for lowers it.
+    pub(super) rows_cap: usize,
+    /// Seconds spent readying the replays' buffers, and in the replays themselves, summed.
+    pub(super) prepare_secs: f64,
+    pub(super) launch_secs: f64,
 }
 
 #[cfg(feature = "cuda")]
+impl Default for VerifyGraphs {
+    fn default() -> Self {
+        Self {
+            by_rows: std::collections::HashMap::new(),
+            disabled: false,
+            rows_cap: usize::MAX,
+            prepare_secs: 0.0,
+            launch_secs: 0.0,
+        }
+    }
+}
+
 impl VerifyGraphs {
     /// Forget the graphs: the buffers they read are gone with the step's.
     pub(super) fn clear(&mut self) {
         self.by_rows.clear();
     }
+
+    /// Tokens a draft may carry into a recorded window: one row less than the window.
+    pub(super) fn draft_cap(&self) -> usize {
+        self.rows_cap.saturating_sub(1)
+    }
 }
+
+/// Wait for the card without keeping a core busy; a wait that lasts says what every expert
+/// cache's mailbox holds, once, since a step recorded against them waits on the host there.
+#[cfg(feature = "cuda")]
+fn wait_telling(
+    model: &BoxedModelBackend,
+    stream: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
+) -> crate::tensor::Result<()> {
+    let event = stream
+        .record_event(None)
+        .map_err(|e| crate::tensor::Error::msg(format!("record_event: {e:?}")))?;
+    let started = std::time::Instant::now();
+    let mut told = false;
+    // A fault on the card is an error of the query, not a wait that never ends.
+    while !event
+        .try_is_complete()
+        .map_err(|e| crate::tensor::Error::msg(format!("the card's work: {e:?}")))?
+    {
+        std::thread::sleep(std::time::Duration::from_micros(20));
+        if !told && started.elapsed().as_secs_f64() > WAIT_TELLS_AFTER_SECS {
+            told = true;
+            for line in model.tier_mailboxes() {
+                warn!("a recorded verify waits on the card: {line}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Seconds a wait on the card lasts before it says what the mailboxes hold.
+#[cfg(feature = "cuda")]
+const WAIT_TELLS_AFTER_SECS: f64 = 3.0;
 
 /// A draft verify of `ids` (the token carried forward, then the draft) at `pos` through a
 /// recorded window: its logits `[1, rows, vocab]` and, when the window was recorded for this
@@ -326,7 +379,7 @@ pub(super) fn verify_recorded(
     ids: &[u32],
 ) -> Option<(Tensor, Option<f64>)> {
     let rows = ids.len();
-    if graphs.disabled || rows < 2 || rows > model.verify_window_rows() {
+    if graphs.disabled || rows < 2 || rows > model.verify_window_rows() || rows > graphs.rows_cap {
         return None;
     }
     let give_up = |model: &mut BoxedModelBackend, graphs: &mut VerifyGraphs, why: String| {
@@ -338,17 +391,40 @@ pub(super) fn verify_recorded(
         }
         model.invalidate_graph_state();
     };
-    if let Err(e) = model.verify_window_prepare(pos, ids) {
+    let preparing = std::time::Instant::now();
+    let prepared = model.verify_window_prepare(pos, ids);
+    graphs.prepare_secs += preparing.elapsed().as_secs_f64();
+    if let Err(e) = prepared {
         give_up(model, graphs, format!("prepare: {e}"));
         return None;
     }
     if let Some((g, logits)) = graphs.by_rows.get(&rows) {
+        let launching = std::time::Instant::now();
         if let Err(e) = g.launch() {
             give_up(model, graphs, format!("launch: {e:?}"));
             return None;
         }
-        let _ = crate::tensor::cuda_ext::synchronize_yielding(stream);
+        if let Err(e) = wait_telling(model, stream) {
+            give_up(model, graphs, format!("replay: {e}"));
+            return None;
+        }
+        graphs.launch_secs += launching.elapsed().as_secs_f64();
         return Some((logits.clone(), None));
+    }
+    // The window's first row stands for the plain step of the carried token: that step is run
+    // eagerly from a checkpoint of the state, and the state returned, so that the window's row
+    // can be held against it. A window that does not give the plain step's logits is given up.
+    let plain_row: Option<Vec<f32>> = match model.plain_step_held(ids[0], pos) {
+        Ok(row) => Some(row),
+        Err(e) => {
+            warn!("the plain step the window's first row is held against did not run: {e}");
+            None
+        }
+    };
+    let _ = stream.synchronize();
+    if let Err(e) = model.verify_window_prepare(pos, ids) {
+        give_up(model, graphs, format!("prepare after the plain step: {e}"));
+        return None;
     }
     // The eager run of the window: what the replay has to reproduce.
     let eager = match model.forward_verify_window(rows) {
@@ -368,6 +444,73 @@ pub(super) fn verify_recorded(
                 .ok()
         })
         .collect();
+    if let (Some(plain), Some(first)) = (
+        plain_row.as_ref(),
+        eager_rows.as_ref().and_then(|r| r.first()),
+    ) {
+        let distance = crate::inference::engine::decode_step::replay_distance(first, plain);
+        info!("recorded verify of {rows} rows at pos={pos}: the first row is {distance:.4} of the plain step's norm away");
+        if !crate::inference::engine::decode_step::replay_agrees(first, plain) {
+            let _ = model.verify_window_settle(0);
+            give_up(
+                model,
+                graphs,
+                format!(
+                    "the window's first row is not the plain step ({distance:.4} of its norm away)"
+                ),
+            );
+            return None;
+        }
+    }
+    if let Err(e) = model
+        .verify_window_settle(0)
+        .and_then(|()| model.verify_window_prepare(pos, ids))
+    {
+        give_up(model, graphs, format!("return before the capture: {e}"));
+        return None;
+    }
+    let _ = stream.synchronize();
+    // The rows run again from the returned state have to give the same logits: a return that
+    // leaves the state changed would make every replay of the window wrong.
+    let again = match model.forward_verify_window(rows) {
+        Ok(l) => l,
+        Err(e) => {
+            give_up(model, graphs, format!("eager window again: {e}"));
+            return None;
+        }
+    };
+    let _ = stream.synchronize();
+    if let Some(want) = eager_rows.as_ref() {
+        let distances: Vec<String> = (0..rows)
+            .map(|r| {
+                again
+                    .narrow(1, r, 1)
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .map(|got| {
+                        crate::inference::engine::decode_step::replay_distance(&got, &want[r])
+                    })
+                    .map_or("?".to_string(), |d| format!("{d:.4}"))
+            })
+            .collect();
+        let returned = (0..rows).all(|r| {
+            again
+                .narrow(1, r, 1)
+                .and_then(|t| t.flatten_all())
+                .and_then(|t| t.to_vec1::<f32>())
+                .is_ok_and(|got| {
+                    crate::inference::engine::decode_step::replay_agrees(&got, &want[r])
+                })
+        });
+        if !returned {
+            give_up(
+                model,
+                graphs,
+                format!("the rows run again from the returned state differ (relative distance per row: {})", distances.join(" ")),
+            );
+            return None;
+        }
+    }
     if let Err(e) = model
         .verify_window_settle(0)
         .and_then(|()| model.verify_window_prepare(pos, ids))
@@ -401,11 +544,27 @@ pub(super) fn verify_recorded(
     let logits = eager;
     let replay = std::time::Instant::now();
     if let Err(e) = g.launch() {
+        // A window the card has no memory for ends the windows of its size and above, and the
+        // drafts shrink to what fits; any other failure ends them all.
+        if format!("{e:?}").contains("OUT_OF_MEMORY") {
+            let _ = stream.synchronize();
+            graphs.rows_cap = rows - 1;
+            warn!("recorded verify of {rows} rows: no memory for its launch; windows of up to {} rows from now on", rows - 1);
+            if let Err(e) = model.verify_window_settle(0) {
+                warn!("the model did not return to the rows before the verify: {e}");
+            }
+            // The buffers the other windows read go with the state: they are recorded again.
+            model.invalidate_graph_state();
+            graphs.clear();
+            return None;
+        }
         give_up(model, graphs, format!("first launch: {e:?}"));
         return None;
     }
     let _ = stream.synchronize();
     let replay_secs = replay.elapsed().as_secs_f64();
+    // Every row of the replay against the eager row; every row's distance is named when one fails.
+    let mut distances = Vec::with_capacity(rows);
     let agrees = eager_rows.is_some_and(|want| {
         (0..rows).all(|r| {
             logits
@@ -414,6 +573,10 @@ pub(super) fn verify_recorded(
                 .and_then(|t| t.to_vec1::<f32>())
                 .ok()
                 .is_some_and(|got: Vec<f32>| {
+                    distances.push(format!(
+                        "{:.4}",
+                        crate::inference::engine::decode_step::replay_distance(&got, &want[r])
+                    ));
                     crate::inference::engine::decode_step::replay_agrees(&got, &want[r])
                 })
         })
@@ -422,7 +585,10 @@ pub(super) fn verify_recorded(
         give_up(
             model,
             graphs,
-            "the replay does not name the eager rows' tokens".into(),
+            format!(
+                "the replay of {rows} rows does not name the eager rows' tokens (relative distance per row: {})",
+                distances.join(" ")
+            ),
         );
         return None;
     }

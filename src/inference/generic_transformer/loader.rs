@@ -2381,6 +2381,8 @@ impl GenericHeteroTransformer {
             committed: 0,
             carried: None,
             indexer_mark: None,
+            #[cfg(feature = "cuda")]
+            step: None,
         })
     }
 

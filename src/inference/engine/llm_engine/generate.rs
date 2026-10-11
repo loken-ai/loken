@@ -379,7 +379,7 @@ impl LlmEngine {
             let prompt_token_count = prompt_eval_positions(prompt_tokens.len(), cache_session_start, audio_positions);
             // A model that came with a draft head reads the hidden state of every forward from
             // the prefill on: the head drafts from the state before the token it is given.
-            let head_capable = state.model.draft_head_capture(true);
+            let head_capable = config.recorded_drafts && state.model.draft_head_capture(true);
             if head_capable {
                 state.model.draft_head_reset();
             }
@@ -595,13 +595,14 @@ impl LlmEngine {
             if head_capable && !head_on {
                 state.model.draft_head_capture(false);
             }
+            let cache_at_start = state.model.expert_cache_counters();
             let mut head_tokens: Vec<u32> = vec![next_token];
-            // Whether the head's history has to start over before its next guess (a step it did
-            // not follow ran), and what its cycles came to: verifies, of them recorded, and
-            // steps it had no guess for.
-            let mut head_reset_due = false;
+            // What the head's cycles came to: verifies, of them recorded, and steps it had no
+            // guess for.
             let (mut head_cycles, mut head_recorded, mut head_empty, mut head_unsure): (u64, u64, u64, u64) =
                 (0, 0, 0, 0);
+            // What settling the recorded windows cost, summed, and how many settled.
+            let (mut settle_secs, mut settles) = (0f64, 0u64);
             let (mut spec_drafted, mut spec_accepted): (u64, u64) = (0, 0);
             let mut pld_stats_drafted: u64 = 0;
             let mut pld_stats_accepted: u64 = 0;
@@ -909,14 +910,15 @@ impl LlmEngine {
                     // it: a step with guesses verifies them, one without replays the plain step.
                     let head_draft_started = std::time::Instant::now();
                     let head_draft: Vec<u32> = if head_on {
-                        let want = spec_engine.draft_length();
+                        let want = spec_engine.draft_length().min(verify_graphs.draft_cap());
                         if want == 0 {
                             Vec::new()
                         } else {
-                            if head_reset_due {
-                                state.model.draft_head_reset();
-                            }
-                            state.model.draft_head_tokens(&head_tokens, want)
+                            state.model.draft_head_tokens(
+                                &head_tokens,
+                                want,
+                                spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).min_odds(),
+                            )
                         }
                     } else {
                         Vec::new()
@@ -1229,11 +1231,12 @@ impl LlmEngine {
                                 if head_capable {
                                     spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).record(0, 0, 0.0, plain_secs);
                                 }
+                                // The head reads the step's token with the row the step left:
+                                // its next guess takes the pair in, so its history goes on.
                                 if head_on {
                                     state.model.step_feature();
                                     head_tokens.clear();
                                     head_tokens.push(next_token);
-                                    head_reset_due = true;
                                 }
                                 continue;
                             }
@@ -1518,10 +1521,9 @@ impl LlmEngine {
                         time_plain = true;
                     }
                     if head_on && want == 0 {
-                        // Plain decoding pays more: the head stops reading the hidden states.
-                        head_on = false;
+                        // Plain decoding pays more for now: the head follows the plain steps
+                        // until the policy tries it again.
                         time_plain = true;
-                        state.model.draft_head_capture(false);
                     }
                     let draft: Vec<u32> = if spec_on {
                         let d = spec_engine.draft_k(next_token, want, pos, &recent_tokens, repeat_penalty, repeat_last_n);
@@ -1561,11 +1563,13 @@ impl LlmEngine {
                         let verify_pos = state.model.kv_len().unwrap_or(pos);
                         // A draft the recorded windows serve replays its window; any other
                         // runs eagerly.
+                        let windows_served = config.recorded_drafts
+                            && graph_auto_on_cached
+                            && kv_safe_cached
+                            && use_graph_mode
+                            && !graph_disabled_this_request;
                         #[cfg(feature = "cuda")]
-                        let recorded = match (
-                            graph_auto_on_cached && kv_safe_cached && use_graph_mode && !graph_disabled_this_request,
-                            &cuda_stream,
-                        ) {
+                        let recorded = match (windows_served, &cuda_stream) {
                             (true, Some(Some(s))) => super::decode::verify_recorded(
                                 &mut state.model,
                                 s,
@@ -1587,9 +1591,16 @@ impl LlmEngine {
                             graph_capture_attempted = false;
                         }
                         let recorded_window = recorded.is_some();
-                        // A window recorded for this verify cost its recording too: the cycle
-                        // is charged the replay alone, which is what the next ones cost.
                         let replay_secs = recorded.as_ref().and_then(|r| r.1);
+                        // An eager verify costs the head more than the plain steps it stands
+                        // for: once the windows are given up, the head stops guessing.
+                        if head_on && windows_served && !recorded_window && verify_graphs.disabled {
+                            head_on = false;
+                            state.model.draft_head_capture(false);
+                        }
+                        // A cycle pays its way only when its window replayed: one recorded as it
+                        // ran, or verified eagerly where windows serve, counts its acceptance alone.
+                        let charged = replay_secs.is_none() && (recorded_window || !windows_served);
                         let logits = match recorded {
                             Some((l, _)) => l,
                             None => state.model.forward_all(&x, verify_pos)?,
@@ -1634,7 +1645,6 @@ impl LlmEngine {
                             head_tokens.clear();
                             head_tokens.extend_from_slice(&draft[..accepted_drafts]);
                             head_tokens.push(outcome.next_token);
-                            head_reset_due = false;
                             head_cycles += 1;
                             if recorded_window {
                                 head_recorded += 1;
@@ -1644,9 +1654,10 @@ impl LlmEngine {
                             // A cycle whose window was recorded as it ran paid the recording:
                             // its acceptance counts, its cost does not.
                             let mut length = spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner());
-                            match replay_secs {
-                                Some(_) => length.record_accepted(k, accepted_drafts),
-                                None => length.record(k, accepted_drafts, draft_secs, cycle_start.elapsed().as_secs_f64()),
+                            if charged {
+                                length.record(k, accepted_drafts, draft_secs, cycle_start.elapsed().as_secs_f64());
+                            } else {
+                                length.record_accepted(k, accepted_drafts);
                             }
                         }
 
@@ -1654,7 +1665,10 @@ impl LlmEngine {
                         // cache. Only `committed` of them correspond to
                         // accepted input tokens - trim the rest.
                         if recorded_window {
+                            let settling = std::time::Instant::now();
                             state.model.verify_window_settle(committed)?;
+                            settle_secs += settling.elapsed().as_secs_f64();
+                            settles += 1;
                         } else if committed < k + 1 {
                             // The verify wrote k+1 rows from `verify_pos`; keep
                             // the `committed` that were accepted.
@@ -1685,7 +1699,6 @@ impl LlmEngine {
                         // graph does not hand out: the step runs as a one-row verify.
                         let logits_1d = if head_on {
                             let at = state.model.kv_len().unwrap_or(pos);
-                            state.model.draft_head_reset();
                             state.model.forward_all(&x, at)?.squeeze(0)?.squeeze(0)?
                         } else {
                             // stepd: state.forward for moondream graph capture
@@ -1700,7 +1713,6 @@ impl LlmEngine {
                         if head_on {
                             head_tokens.clear();
                             head_tokens.push(next_token);
-                            head_reset_due = false;
                         } else {
                             pld_cost.plain_step(cycle_start.elapsed().as_secs_f64());
                         }
@@ -1849,12 +1861,22 @@ impl LlmEngine {
             // paying for itself. This path was counting it and throwing it away, so a
             // drafter that had stopped helping would have looked exactly like one that
             // was - the streaming path has reported it all along.
-            if spec_drafted > 0 || head_cycles > 0 || head_empty > 0 {
+            if let (Some(a), Some(b)) = (cache_at_start, state.model.expert_cache_counters()) {
+                let routed = b.0.saturating_sub(a.0);
                 info!(
-                    "Spec decode done: drafted={spec_drafted} accepted={spec_accepted} ({}%), next draft length {}; head: {head_cycles} verifies ({head_recorded} recorded), {head_empty} steps without a guess ({head_unsure} the head was unsure of); {}",
+                    "expert cache over the decode: {:.1}% of {routed} routed experts on the card",
+                    100.0 * b.1.saturating_sub(a.1) as f64 / routed.max(1) as f64
+                );
+            }
+            if spec_drafted > 0 || head_cycles > 0 || head_empty > 0 {
+                let (next_length, summary) = {
+                    let length = spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner());
+                    (length.next(), length.summary())
+                };
+                info!(
+                    "Spec decode done: drafted={spec_drafted} accepted={spec_accepted} ({}%), next draft length {next_length}; head: {head_cycles} verifies ({head_recorded} recorded, settled in {:.1} ms each), {head_empty} steps without a guess ({head_unsure} the head was unsure of); {summary}",
                     (spec_accepted * 100) / spec_drafted.max(1),
-                    spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).next(),
-                    spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).summary(),
+                    settle_secs * 1e3 / settles.max(1) as f64,
                 );
             }
 

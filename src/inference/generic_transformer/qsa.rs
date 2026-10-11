@@ -314,6 +314,10 @@ pub struct SparseAttention {
     /// The cache a recorded decode step keeps on the card.
     #[cfg(feature = "cuda")]
     card: Option<CardIndexer>,
+    /// How many times the card's buffers were made or grown: a step recorded against them is
+    /// stale once this moves.
+    #[cfg(feature = "cuda")]
+    card_births: u64,
 }
 
 #[cfg(feature = "cuda")]
@@ -345,6 +349,8 @@ impl SparseAttention {
             cache: IndexerCache::default(),
             #[cfg(feature = "cuda")]
             card: None,
+            #[cfg(feature = "cuda")]
+            card_births: 0,
         }
     }
 

@@ -950,11 +950,11 @@ impl MoeWeights {
             }
             tier.release_stacks()?;
             out?
-        } else if let Some(tier) = self
-            .tier
-            .as_ref()
-            .filter(|_| xs.device().runs_as_card() && num_tokens > 1)
-        {
+        } else if let Some(tier) = self.tier.as_ref().filter(|t| {
+            xs.device().runs_as_card()
+                && num_tokens > 1
+                && t.rows_through_cache(num_tokens, self.n_experts_used)
+        }) {
             // Too few rows to pay for the layer's experts to come: the rows go through the cache
             // together, as the decoded tokens they stand for would one after the other. The rows
             // of a recorded verify go through the kernels of the recorded decode.

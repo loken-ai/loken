@@ -82,6 +82,12 @@ pub struct InferenceConfigToml {
     pub kv_disk_dir: Option<String>,
     #[serde(default)]
     pub kv_disk_budget_gb: f64,
+    /// Whether drafts (a model's own draft head, prompt lookup) are verified in recorded
+    /// windows, the head guessing only where they are. Off unless set: a window is checked
+    /// against the plain step at each recording, and a request whose windows are given up
+    /// decodes plainly.
+    #[serde(default)]
+    pub recorded_drafts: bool,
     /// Directory of the on-disk cache of DeepSeek V4.1 decode states, which lets a prompt that
     /// begins with a prefix seen before skip prefilling it. Off unless set. The files hold
     /// state derived from prompts (KV tensors and hidden rows, no text), so they are as private
@@ -265,6 +271,7 @@ impl Config {
             device_index: None,
             replicas: toml_config.replicas.max(1),
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
+            recorded_drafts: toml_config.recorded_drafts,
             kv_disk_budget_gb: toml_config.kv_disk_budget_gb,
             state_cache_dir: toml_config.state_cache_dir.clone(),
             state_cache_budget_gb: toml_config.state_cache_budget_gb,
