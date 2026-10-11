@@ -342,6 +342,93 @@ mmvq_gguf_q4_k_f32_fused_silu_cuda1(
       ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
+// ---------------------------------------------------------------------------
+// A gate and up pair in two formats, one row a block: each matrix is accumulated
+// in its own block geometry over the one q8_1 activation, the four warps' partials
+// join, and the row's value is the up projection times the gate's silu.
+// ---------------------------------------------------------------------------
+template <int qk, int qi, int vdr, mmvq_dot_t dot_block>
+static __device__ float mmvq_row_partial(const void *__restrict__ vx,
+                                         const block_q8_1 *__restrict__ y,
+                                         const int ncols_x, const int row,
+                                         const int tid) {
+  constexpr int nwarps = mmvq_nwarps_for(1);
+  const int blocks_per_row = ncols_x / qk;
+  constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
+  float acc = 0.0f;
+  for (int block = tid / (qi / vdr); block < blocks_per_row; block += blocks_per_iter) {
+    const int act_block = block * (qk / QK8_1);
+    const int lane_in_block = vdr * (tid % (qi / vdr));
+    acc += dot_block(vx, &y[act_block], row * blocks_per_row + block, lane_in_block);
+  }
+  return acc;
+}
+
+template <int qk_u, int qi_u, int vdr_u, mmvq_dot_t dot_u,
+          int qk_g, int qi_g, int vdr_g, mmvq_dot_t dot_g>
+static __device__ void mmvq_core_pair_silu(const void *__restrict__ vx,
+                                           const void *__restrict__ vgate,
+                                           const block_q8_1 *__restrict__ y,
+                                           float *__restrict__ dst,
+                                           const int ncols_x, const int nrows_x) {
+  constexpr int nwarps = mmvq_nwarps_for(1);
+  const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+  const int row = blockIdx.x;
+  if (row >= nrows_x) {
+    return;
+  }
+  float up = mmvq_row_partial<qk_u, qi_u, vdr_u, dot_u>(vx, y, ncols_x, row, tid);
+  float gate = mmvq_row_partial<qk_g, qi_g, vdr_g, dot_g>(vgate, y, ncols_x, row, tid);
+  __shared__ float partial[2][nwarps][WARP_SIZE];
+  partial[0][threadIdx.y][threadIdx.x] = up;
+  partial[1][threadIdx.y][threadIdx.x] = gate;
+  __syncthreads();
+  if (threadIdx.y > 0) {
+    return;
+  }
+  up = 0.0f;
+  gate = 0.0f;
+#pragma unroll
+  for (int w = 0; w < nwarps; ++w) {
+    up += partial[0][w][threadIdx.x];
+    gate += partial[1][w][threadIdx.x];
+  }
+  up = warp_sum(up);
+  gate = warp_sum(gate);
+  if (threadIdx.x == 0) {
+    dst[row] = (gate / (1.0f + expf(-gate))) * up;
+  }
+}
+
+/// The formats a dense pair is held in: the k-quants and the q8_0 a float weight becomes.
+#define MMVQ_PAIR_FORMATS(X)                                                   \
+  X(q4_k, QK_K, QI4_K, VDR_Q4_K_Q8_1_MMVQ, mmvq_dot_q4_K)                       \
+  X(q5_k, QK_K, QI5_K, VDR_Q5_K_Q8_1_MMVQ, mmvq_dot_q5_K)                       \
+  X(q6_k, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ, mmvq_dot_q6_K)                       \
+  X(q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ, mmvq_dot_q8_0)
+
+#define MMVQ_PAIR_ENTRY(tag_g, qk_g, qi_g, vdr_g, dot_g, tag_u, qk_u, qi_u,    \
+                        vdr_u, dot_u)                                           \
+  extern "C" __global__ void mmvq_gguf_pair_##tag_g##_##tag_u##_silu_cuda1(      \
+      const void *__restrict__ vx, const void *__restrict__ vgate,               \
+      const void *__restrict__ vy, float *__restrict__ dst, const int ncols_x,   \
+      const int nrows_x, const int stride_col_y, const int stride_col_dst) {     \
+    mmvq_core_pair_silu<qk_u, qi_u, vdr_u, dot_u, qk_g, qi_g, vdr_g, dot_g>(     \
+        vx, vgate, (const block_q8_1 *)vy, dst, ncols_x, nrows_x);               \
+  }
+#define MMVQ_PAIR_ROW(tag_g, qk_g, qi_g, vdr_g, dot_g)                          \
+  MMVQ_PAIR_ENTRY(tag_g, qk_g, qi_g, vdr_g, dot_g, q4_k, QK_K, QI4_K,           \
+                  VDR_Q4_K_Q8_1_MMVQ, mmvq_dot_q4_K)                             \
+  MMVQ_PAIR_ENTRY(tag_g, qk_g, qi_g, vdr_g, dot_g, q5_k, QK_K, QI5_K,           \
+                  VDR_Q5_K_Q8_1_MMVQ, mmvq_dot_q5_K)                             \
+  MMVQ_PAIR_ENTRY(tag_g, qk_g, qi_g, vdr_g, dot_g, q6_k, QK_K, QI6_K,           \
+                  VDR_Q6_K_Q8_1_MMVQ, mmvq_dot_q6_K)                             \
+  MMVQ_PAIR_ENTRY(tag_g, qk_g, qi_g, vdr_g, dot_g, q8_0, QK8_0, QI8_0,          \
+                  VDR_Q8_0_Q8_1_MMVQ, mmvq_dot_q8_0)
+MMVQ_PAIR_FORMATS(MMVQ_PAIR_ROW)
+#undef MMVQ_PAIR_ROW
+#undef MMVQ_PAIR_ENTRY
+
 
 
 extern "C" __global__ void

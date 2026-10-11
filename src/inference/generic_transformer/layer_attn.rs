@@ -542,7 +542,12 @@ impl GenericTransformerLayer {
     pub(super) fn gate_attention(&self, x: &Tensor, y: Tensor) -> Result<Tensor> {
         match &self.attn_gate {
             Some(gate) => {
-                let g = crate::tensor::ops::sigmoid(&gate.forward(x)?.to_dtype(DType::F32)?)?;
+                let logit = gate.forward(x)?;
+                #[cfg(feature = "cuda")]
+                if let Some(gated) = crate::inference::kernel::fused::sigmoid_mul_f16(&logit, &y)? {
+                    return Ok(gated);
+                }
+                let g = crate::tensor::ops::sigmoid(&logit.to_dtype(DType::F32)?)?;
                 y.to_dtype(DType::F32)?.mul(&g)?.to_dtype(y.dtype())
             }
             None => Ok(y),

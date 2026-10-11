@@ -686,6 +686,77 @@ impl QMatMul {
         }
     }
 
+    /// `silu(gate . x) * (up . x)` for one row `x` `[1, k]` on a card, in the one launch the
+    /// card has for a k-quant pair after the row's quantisation: `[1, n]` F32. `None` where the
+    /// pair or the row is not what that launch takes; the caller runs the two projections.
+    #[cfg(feature = "cuda")]
+    pub fn fused_silu_pair(gate: &QMatMul, up: &QMatMul, x: &Tensor) -> Result<Option<Tensor>> {
+        use crate::tensor::quantized::{GgmlDType, QStorage};
+        // The first pair declined says why, once.
+        static DECLINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let declined = |why: String| {
+            if !DECLINED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!("fused gate and up pair declined: {why}");
+            }
+        };
+        let (Some(gq), Some(uq)) = (gate.qtensor(), up.qtensor()) else {
+            declined("a projection holds no quantised tensor".into());
+            return Ok(None);
+        };
+        let fused_formats = [
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+            GgmlDType::Q8_0,
+        ];
+        if !fused_formats.contains(&gq.dtype())
+            || !fused_formats.contains(&uq.dtype())
+            || !x.device().is_cuda()
+            || x.dims().last().is_none_or(|&k| x.elem_count() != k)
+            || !gate.lora.is_empty()
+            || !up.lora.is_empty()
+        {
+            declined(format!(
+                "gate {:?} up {:?} x {:?} {:?} on {:?}, adapters {} and {}",
+                gq.dtype(),
+                uq.dtype(),
+                x.dtype(),
+                x.dims(),
+                x.device().location(),
+                gate.lora.len(),
+                up.lora.len()
+            ));
+            return Ok(None);
+        }
+        let (QStorage::Cuda(gcuda), QStorage::Cuda(ucuda)) = (gq.storage(), uq.storage()) else {
+            return Ok(None);
+        };
+        let x = x.contiguous()?;
+        let (storage, layout) = x.storage_and_layout();
+        let crate::tensor::StorageView::Cuda(rhs) = &*storage else {
+            return Ok(None);
+        };
+        let shape = crate::tensor::Shape::from_dims(uq.shape().dims());
+        match crate::tensor::quantized::fast_mmvq::try_fused_silu(
+            ucuda, gcuda, &shape, rhs, layout,
+        )? {
+            Some((out, out_shape)) => Ok(Some(crate::tensor::cuda_ext::tensor_from_cuda_storage(
+                out, out_shape,
+            )?)),
+            None => {
+                declined(format!(
+                    "the launch declined gate {:?} up {:?} {:?} x {:?} {:?}",
+                    gq.dtype(),
+                    uq.dtype(),
+                    uq.shape().dims(),
+                    x.dtype(),
+                    x.dims()
+                ));
+                Ok(None)
+            }
+        }
+    }
+
     /// Borrow the underlying QTensor if this matmul stores its weight as
     /// quantized GGUF data. Returns None for AWQ or dequantized weights.
     pub fn qtensor(&self) -> Option<&std::sync::Arc<crate::tensor::quantized::QTensor>> {
@@ -1109,6 +1180,91 @@ mod shared_input_tests {
                     assert_eq!(got.dtype(), own.dtype(), "{dtype:?} x {rows}: type");
                     assert_eq!(bits(got), bits(&own), "{dtype:?} x {rows}: values");
                 }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod fused_pair_tests {
+    use super::*;
+    use crate::tensor::quantized::{GgmlDType, QTensor};
+    use crate::tensor::{DType, Device};
+
+    /// A gate and up pair in every two of the formats the fused launch serves gives, for one
+    /// row of either width, the two projections activated and multiplied.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn the_fused_pair_is_the_two_projections_activated() {
+        let Ok(card) = crate::tensor::cuda::CudaDevice::new(0).map(Device::Cuda) else {
+            return;
+        };
+        let (n, k) = (64usize, 2560usize);
+        let weight = |seed: u32, scale: f32| -> Tensor {
+            let v: Vec<f32> = (0..n * k)
+                .map(|i| {
+                    let h = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed);
+                    ((h >> 8) as f32 / (1 << 24) as f32 - 0.5) * scale
+                })
+                .collect();
+            Tensor::from_vec_f32(v, vec![n, k]).unwrap()
+        };
+        let x = Tensor::from_vec_f32(
+            (0..k).map(|i| ((i % 53) as f32) * 0.02 - 0.5).collect(),
+            vec![1, 1, k],
+        )
+        .unwrap()
+        .to_device(&card)
+        .unwrap();
+        let formats = [
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+            GgmlDType::Q8_0,
+        ];
+        for (gd, ud) in formats
+            .iter()
+            .flat_map(|g| formats.iter().map(move |u| (*g, *u)))
+        {
+            let dtype = (gd, ud);
+            let gate =
+                QMatMul::from_qtensor(QTensor::quantize_onto(&weight(7, 0.14), gd, &card).unwrap())
+                    .unwrap();
+            let up =
+                QMatMul::from_qtensor(QTensor::quantize_onto(&weight(1, 0.5), ud, &card).unwrap())
+                    .unwrap();
+            for half in [false, true] {
+                let x = if half {
+                    x.to_dtype(DType::F16).unwrap()
+                } else {
+                    x.clone()
+                };
+                let got = QMatMul::fused_silu_pair(&gate, &up, &x)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{dtype:?} half {half}: the fused pair declined"));
+                let g = gate.forward(&x).unwrap().to_dtype(DType::F32).unwrap();
+                let u = up.forward(&x).unwrap().to_dtype(DType::F32).unwrap();
+                let want = (crate::tensor::ops::silu(&g).unwrap() * u).unwrap();
+                let flat = |t: &Tensor| -> Vec<f32> {
+                    t.to_device(&Device::Cpu)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                };
+                let (got, want) = (flat(&got), flat(&want));
+                assert_eq!(got.len(), want.len(), "{dtype:?}");
+                let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+                let gap = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    gap / scale < 2e-2,
+                    "{dtype:?} half {half}: gap {gap} of {scale}"
+                );
             }
         }
     }

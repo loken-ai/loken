@@ -16,6 +16,9 @@ cuda_launchers! {
     loken_silu_mul_f16(
         g: *const c_void, u: *const c_void, out: *mut c_void,
         n: i64);
+    loken_sigmoid_mul_f16(
+        g: *const c_void, y: *const c_void, out: *mut c_void,
+        n: i64);
     loken_fused_shexp_out(
         routed: *const f32, down: *const c_void, gate_logit: *const f32,
         out: *mut f32, n_tokens: i32, hidden: i32);

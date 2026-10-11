@@ -85,11 +85,22 @@ fn try_fused(
     act: Act,
 ) -> Result<Option<(CudaStorage, Shape)>> {
     use super::GgmlDType;
-    if up_storage.dtype() != GgmlDType::Q4K || gate_storage.dtype() != GgmlDType::Q4K {
-        return Ok(None);
-    }
+    // The silu pair is served in any two of the dense formats; gelu and the bf16 output for a
+    // q4_k pair alone.
+    let pair_tag = |d: GgmlDType| match d {
+        GgmlDType::Q4K => Some("q4_k"),
+        GgmlDType::Q5K => Some("q5_k"),
+        GgmlDType::Q6K => Some("q6_k"),
+        GgmlDType::Q8_0 => Some("q8_0"),
+        _ => None,
+    };
+    let silu_kname = match (pair_tag(gate_storage.dtype()), pair_tag(up_storage.dtype())) {
+        (Some(g), Some(u)) => format!("mmvq_gguf_pair_{g}_{u}_silu_cuda1"),
+        _ => return Ok(None),
+    };
+    let q4_pair = up_storage.dtype() == GgmlDType::Q4K && gate_storage.dtype() == GgmlDType::Q4K;
     let rdt = rhs.dtype()?;
-    if rdt != DType::F32 && rdt != DType::BF16 {
+    if rdt != DType::F32 && rdt != DType::BF16 && rdt != DType::F16 {
         return Ok(None);
     }
     if up_storage.device().ordinal() != gate_storage.device().ordinal() {
@@ -113,22 +124,18 @@ fn try_fused(
     // in-tree kernel yet - graceful None (caller runs the unfused
     // chain).
     let (quant_kname, fused_kname, bf16_out) = match (rdt, &act) {
-        (DType::F32, Act::Silu) => (
-            "mmvq_gguf_quantize_q8_1_f32",
-            "mmvq_gguf_q4_k_f32_fused_silu_cuda1",
-            false,
-        ),
-        (DType::F32, Act::Gelu) => (
+        (DType::F32, Act::Silu) => ("mmvq_gguf_quantize_q8_1_f32", silu_kname.as_str(), false),
+        (DType::F32, Act::Gelu) if q4_pair => (
             "mmvq_gguf_quantize_q8_1_f32",
             "mmvq_gguf_q4_k_f32_fused_gelu_cuda1",
             false,
         ),
-        (DType::BF16, Act::Silu) => (
+        (DType::BF16, Act::Silu) if q4_pair => (
             "mmvq_gguf_quantize_q8_1_bf16",
             "mmvq_gguf_q4_k_bf16_fused_silu_cuda1",
             true,
         ),
-        (DType::BF16, Act::Gelu) => return Ok(None),
+        (DType::F16, Act::Silu) => ("mmvq_gguf_quantize_q8_1_f16", silu_kname.as_str(), false),
         _ => return Ok(None),
     };
     let Ok(quant_fn) = dev.mmvq_fn(quant_kname) else {
@@ -160,6 +167,13 @@ fn try_fused(
         }
         DType::BF16 => {
             let x = rhs.as_cuda_slice::<half::bf16>()?.slice(o1..o2);
+            let mut b = stream.launch_builder(&quant_fn);
+            b.arg(&x).arg(scratch.as_ref()).arg(&kx).arg(&kxp);
+            unsafe { b.launch(q_cfg) }
+                .map_err(|e| Error::msg(format!("fast_mmvq quantize: {e}")))?;
+        }
+        DType::F16 => {
+            let x = rhs.as_cuda_slice::<half::f16>()?.slice(o1..o2);
             let mut b = stream.launch_builder(&quant_fn);
             b.arg(&x).arg(scratch.as_ref()).arg(&kx).arg(&kxp);
             unsafe { b.launch(q_cfg) }

@@ -398,9 +398,19 @@ impl SharedExpert {
                     }
                     return routed + self.finish(xs, down)?;
                 }
-                let up = self.up.forward(xs)?;
-                let g = gate.forward(xs)?;
-                if let Some(h) = crate::inference::moe_cuda::shexp_swiglu(&g, &up)? {
+                // The pair in one launch where the card has it, else as two projections
+                // and the launch that joins them.
+                let fused = QMatMul::fused_silu_pair(gate, &self.up, xs)?;
+                let (up, g) = match fused {
+                    Some(_) => (None, None),
+                    None => (Some(self.up.forward(xs)?), Some(gate.forward(xs)?)),
+                };
+                let h = match (fused, &up, &g) {
+                    (Some(h), _, _) => Some(h),
+                    (None, Some(up), Some(g)) => crate::inference::moe_cuda::shexp_swiglu(g, up)?,
+                    _ => None,
+                };
+                if let Some(h) = h {
                     let down = self.down.forward(&h)?;
                     if let Some(sum) = crate::inference::moe_cuda::shexp_tail(routed, &down, xs, w)?
                     {
@@ -408,6 +418,9 @@ impl SharedExpert {
                     }
                     return routed + self.finish(xs, down)?;
                 }
+                let (Some(up), Some(g)) = (up, g) else {
+                    return routed + self.forward(xs)?;
+                };
                 let up = up.to_dtype(crate::tensor::DType::F32)?;
                 let g = g.to_dtype(crate::tensor::DType::F32)?;
                 let h = (crate::tensor::ops::silu(&g)? * up)?;
@@ -427,6 +440,9 @@ impl SharedExpert {
         };
         if !xs.device().is_cuda() || xs.dims().first() != Some(&1) {
             return Ok(None);
+        }
+        if let Some(h) = QMatMul::fused_silu_pair(gate, &self.up, xs)? {
+            return Ok(Some(self.down.forward(&h)?));
         }
         let up = self.up.forward(xs)?;
         let g = gate.forward(xs)?;

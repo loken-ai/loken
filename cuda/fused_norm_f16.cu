@@ -101,6 +101,28 @@ extern "C" void loken_silu_mul_f16(
         (const __half*)g, (const __half*)u, (__half*)out, n);
 }
 
+// out = f32(y) . sigmoid(f32(g)) in one F16 launch: an output gate over a head's rows, the
+// sigmoid in F32 as the tensor ops compute it. n = total elements.
+__global__ void loken_sigmoid_mul_f16_kernel(
+    const __half* __restrict__ g, const __half* __restrict__ y,
+    __half* __restrict__ out, long n
+) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float gf = __half2float(g[i]);
+    const float yf = __half2float(y[i]);
+    out[i] = __float2half(yf * (1.0f / (1.0f + expf(-gf))));
+}
+
+extern "C" void loken_sigmoid_mul_f16(
+    const void* g, const void* y, void* out, long n, cudaStream_t stream
+) {
+    const int block = 256;
+    const long grid = (n + block - 1) / block;
+    loken_sigmoid_mul_f16_kernel<<<grid, block, 0, stream>>>(
+        (const __half*)g, (const __half*)y, (__half*)out, n);
+}
+
 // MoE shared-expert output epilogue: out = routed + f32(down).sigmoid(gate_logit),
 // gate_logit broadcast per token over `hidden`. Collapses sigmoid + f16->f32 cast +
 // broadcast_mul + add (4 tensor-level dispatches) into one launch. All F32 math ->

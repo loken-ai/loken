@@ -240,10 +240,12 @@ impl GenericTransformerLayer {
                 d,
             )
         })?;
+        // The feed-forward's router and experts read F32: the mixer writes it, and the
+        // experts' sum goes back without a cast either way.
         let (mixed, inj) = staged("mix_ffn", &dev, false, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             hc.ffn
-                .mix_on_card(&xn.expect("the norm was asked for"), true)
+                .mix_on_card(&xn.expect("the norm was asked for"), false)
         })?;
         let out = self.feed_forward(&mixed, &dev)?;
         let (r, _) = staged("combine", &dev, false, || {

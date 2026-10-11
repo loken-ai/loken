@@ -224,6 +224,46 @@ pub fn silu_mul_f16(g: &Tensor, u: &Tensor) -> Result<Option<Tensor>> {
     Ok(Some(out))
 }
 
+/// out = f32(y) . sigmoid(f32(g)) in one F16 launch, the sigmoid in F32 as the tensor ops
+/// compute it. g and y: the same shape, F16. `None` unless on a card with both F16; nothing
+/// has run then.
+pub fn sigmoid_mul_f16(g: &Tensor, y: &Tensor) -> Result<Option<Tensor>> {
+    use crate::tensor::cuda_ext::DevicePtr;
+    use crate::tensor::StorageView::Cuda as C;
+    use core::ffi::c_void;
+    if !g.device().is_cuda()
+        || g.dtype() != DType::F16
+        || y.dtype() != DType::F16
+        || g.elem_count() != y.elem_count()
+    {
+        return Ok(None);
+    }
+    let g = g.contiguous()?;
+    let y = y.contiguous()?;
+    let n = g.elem_count() as i64;
+    let out = unsafe { Tensor::empty(y.shape(), DType::F16, &g.device())? };
+    let dev = g.device().as_cuda_device()?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    let (gs, gl) = g.storage_and_layout();
+    let (ys, yl) = y.storage_and_layout();
+    let (os, _) = out.storage_and_layout();
+    if let (C(gc), C(yc), C(oc)) = (&*gs, &*ys, &*os) {
+        let gsl = gc.as_cuda_slice::<half::f16>()?;
+        let ysl = yc.as_cuda_slice::<half::f16>()?;
+        let osl = oc.as_cuda_slice::<half::f16>()?;
+        let gp = (gsl.device_ptr(gsl.stream()).0 + (gl.start_offset() * 2) as u64) as *const c_void;
+        let yp = (ysl.device_ptr(ysl.stream()).0 + (yl.start_offset() * 2) as u64) as *const c_void;
+        let op = osl.device_ptr(osl.stream()).0 as *mut c_void;
+        unsafe {
+            loken_sigmoid_mul_f16(gp, yp, op, n, stream);
+        }
+    }
+    drop(gs);
+    drop(ys);
+    drop(os);
+    Ok(Some(out))
+}
+
 /// Partial NEOX RoPE in one launch (was narrow+contig+rope+cat+contig). x
 /// [b,nh,seq,hd] F16, cos/sin [seq, rope_dim/2] F16. Rotates first `rope_dim`
 /// dims, passes through the rest. Bit-identical to the reference f16 rope. Returns
@@ -396,4 +436,52 @@ pub fn softplus_bias(dt: &Tensor, bias: &Tensor) -> Result<Option<Tensor>> {
     drop(bs);
     drop(os);
     Ok(Some(out))
+}
+
+#[cfg(test)]
+mod sigmoid_mul_tests {
+    use super::*;
+    use crate::tensor::Device;
+
+    /// The one launch gives the gate applied as the tensor ops apply it.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn the_gated_rows_match_the_tensor_ops() {
+        let Ok(card) = crate::tensor::cuda::CudaDevice::new(0).map(Device::Cuda) else {
+            return;
+        };
+        let n = 6144;
+        let wave = |k: f32| -> Vec<f32> { (0..n).map(|i| ((i as f32) * k).sin() * 3.0).collect() };
+        let t = |v: Vec<f32>| {
+            Tensor::from_vec(v, (1, 1, n), &card)
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap()
+        };
+        let (g, y) = (t(wave(0.013)), t(wave(0.029)));
+        let got = sigmoid_mul_f16(&g, &y)
+            .unwrap()
+            .expect("the launch takes these");
+        let want = (crate::tensor::ops::sigmoid(&g.to_dtype(DType::F32).unwrap()).unwrap()
+            * y.to_dtype(DType::F32).unwrap())
+        .unwrap()
+        .to_dtype(DType::F16)
+        .unwrap();
+        let flat = |t: &Tensor| -> Vec<f32> {
+            t.to_device(&Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let gap = flat(&got)
+            .iter()
+            .zip(flat(&want))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(gap < 2e-3, "gap {gap}");
+    }
 }

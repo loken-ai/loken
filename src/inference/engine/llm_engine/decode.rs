@@ -255,6 +255,8 @@ pub(super) fn capture_decode_graph(
             .collect();
         info!("kernels in the step's graphs: {}", top.join("; "));
         tracing::debug!("first kernels of the step: {}", nodes.sequence.join(" | "));
+        // At debug level, the casts and host bounces by call site up to this recording.
+        crate::tensor::bounce::report();
     }
     info!(
         "node histogram: kernel={} memcpy={} memset={} empty={} MEM_ALLOC={} MEM_FREE={} other={}",
