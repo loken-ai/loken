@@ -190,6 +190,14 @@ impl CudaStorage {
     /// every call). The barrier costs microseconds once per host upload and buys back
     /// the only property a seed promises.
     pub fn upload_host_safe(dev: &CudaDevice, cpu: &CpuStorage) -> Result<Self> {
+        // A host upload while the stream records a graph would end the recording and leave the
+        // stream unusable: the caller is named instead, before anything is queued.
+        if crate::tensor::cuda_ext::capture_active_on(dev.stream()) {
+            return Err(Error(format!(
+                "host upload during a graph capture at\n{}",
+                std::backtrace::Backtrace::force_capture()
+            )));
+        }
         let out = Self::upload(dev, cpu)?;
         dev.stream()
             .synchronize()

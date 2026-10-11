@@ -162,10 +162,21 @@ mod cuda {
     /// own wait spins.
     pub fn synchronize_yielding(stream: &Arc<CudaStream>) -> Result<()> {
         let event = stream.record_event(None).map_err(msg("record_event"))?;
-        while !event.is_complete() {
+        // A fault on the card is an error of the query, not a wait that never ends.
+        while !event.try_is_complete().map_err(msg("the card's work"))? {
             std::thread::sleep(std::time::Duration::from_micros(20));
         }
         Ok(())
+    }
+
+    /// Give the card back the memory its recorded graphs reserved and no longer use: a graph
+    /// keeps what its allocation nodes took at their peak until the device is told to trim.
+    pub fn graph_mem_trim(stream: &Arc<CudaStream>) -> Result<()> {
+        let device = cudarc::driver::result::device::get(stream.context().ordinal() as i32)
+            .map_err(msg("graph_mem_trim/device"))?;
+        unsafe { cudarc::driver::sys::cuDeviceGraphMemTrim(device) }
+            .result()
+            .map_err(msg("graph_mem_trim"))
     }
 
     /// Begin capturing `stream` into a CUDA graph (relaxed mode - the mode
