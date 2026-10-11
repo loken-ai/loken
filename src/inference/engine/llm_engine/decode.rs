@@ -598,6 +598,25 @@ pub(super) fn verify_recorded(
         g.num_nodes().unwrap_or(0),
         replay_secs * 1e3
     );
+    {
+        let mut nodes = NodeCounts::default();
+        nodes.add(&g);
+        let mut by_count: Vec<_> = nodes.kernels.iter().collect();
+        by_count.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let top: Vec<String> = by_count
+            .iter()
+            .take(40)
+            .map(|(name, n)| format!("{n} {name}"))
+            .collect();
+        info!(
+            "kernels in the verify's graph of {rows} rows ({} kernels, {} memcpy, {} memset, {} alloc): {}",
+            nodes.kernel,
+            nodes.memcpy,
+            nodes.memset,
+            nodes.alloc,
+            top.join("; ")
+        );
+    }
     graphs.by_rows.insert(rows, (g, logits.clone()));
     Some((logits, Some(replay_secs)))
 }
