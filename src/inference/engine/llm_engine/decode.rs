@@ -301,6 +301,8 @@ pub(super) fn capture_decode_graph(
 pub(super) struct VerifyGraphs {
     by_rows: std::collections::HashMap<usize, (crate::tensor::cuda_ext::CapturedGraph, Tensor)>,
     pub(super) disabled: bool,
+    /// The step's buffers were dropped with a window: the step's graph is recorded again.
+    pub(super) step_stale: bool,
     /// Rows a window may carry: a window the card had no memory for lowers it.
     pub(super) rows_cap: usize,
     /// Seconds spent readying the replays' buffers, and in the replays themselves, summed.
@@ -314,6 +316,7 @@ impl Default for VerifyGraphs {
         Self {
             by_rows: std::collections::HashMap::new(),
             disabled: false,
+            step_stale: false,
             rows_cap: usize::MAX,
             prepare_secs: 0.0,
             launch_secs: 0.0,
@@ -384,6 +387,8 @@ pub(super) fn verify_recorded(
     if graphs.disabled || rows < 2 || rows > model.verify_window_rows() || rows > graphs.rows_cap {
         return None;
     }
+    // The buffers the step's graph reads go with the state, so the step is recorded again:
+    // a graph replayed over dropped buffers reads freed memory.
     let give_up = |model: &mut BoxedModelBackend, graphs: &mut VerifyGraphs, why: String| {
         warn!("recorded verify given up at pos={pos}: {why}; eager verifies for the rest of the request");
         graphs.disabled = true;
@@ -392,6 +397,7 @@ pub(super) fn verify_recorded(
             warn!("the model did not return to the rows before the verify: {e}");
         }
         model.invalidate_graph_state();
+        graphs.step_stale = true;
     };
     // The window's first row stands for the plain step of the carried token: before a
     // recording, that step is run eagerly from a checkpoint of the state, and the state
@@ -554,9 +560,11 @@ pub(super) fn verify_recorded(
             if let Err(e) = model.verify_window_settle(0) {
                 warn!("the model did not return to the rows before the verify: {e}");
             }
-            // The buffers the other windows read go with the state: they are recorded again.
+            // The buffers the other windows read go with the state: they and the step's graph
+            // are recorded again.
             model.invalidate_graph_state();
             graphs.clear();
+            graphs.step_stale = true;
             return None;
         }
         give_up(model, graphs, format!("first launch: {e:?}"));

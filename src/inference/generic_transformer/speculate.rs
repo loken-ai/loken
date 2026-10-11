@@ -28,12 +28,12 @@ pub(super) struct LayerPending {
 
 /// What the model holds from a verify: where it started and the tokens it carried.
 pub(super) struct Window {
-    base: usize,
-    rows: usize,
+    pub(super) base: usize,
+    pub(super) rows: usize,
     /// The n-gram history before the rows: the block's own copy is taken after the model gathered
     /// the rows' table entries, so it already holds them.
-    ngram: Option<ngram::NgramHistory>,
-    ids: Vec<u32>,
+    pub(super) ngram: Option<ngram::NgramHistory>,
+    pub(super) ids: Vec<u32>,
 }
 
 impl GenericTransformerLayer {

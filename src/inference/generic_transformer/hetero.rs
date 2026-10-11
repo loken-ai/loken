@@ -1768,8 +1768,15 @@ impl GenericHeteroTransformer {
             ple.reset();
         }
         if ple.history.seen != index_pos {
+            // What stands between the history and the forward: the verify windows open.
+            let recorded = self.verify.window.as_ref().map_or("none".to_string(), |w| {
+                format!("{} rows at {}", w.rows, w.base)
+            });
+            let eager = self.spec_window.as_ref().map_or("none".to_string(), |w| {
+                format!("{} rows at {}", w.rows, w.base)
+            });
             crate::tensor::bail!(
-                "the n-gram history holds {} tokens but the forward starts at {index_pos}",
+                "the n-gram history holds {} tokens but the forward starts at {index_pos} (recorded window {recorded}, eager window {eager})",
                 ple.history.seen
             );
         }

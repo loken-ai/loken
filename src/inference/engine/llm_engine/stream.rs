@@ -2109,6 +2109,15 @@ impl LlmEngine {
                                 Tensor,
                                 Option<f64>,
                             )> = None;
+                            // A window dropped the step's buffers: the step's graph is recorded
+                            // anew from here rather than replayed over them.
+                            #[cfg(feature = "cuda")]
+                            if std::mem::take(&mut verify_graphs.step_stale) {
+                                cuda_graph = None;
+                                graph_logits = None;
+                                graph_warmed = false;
+                                graph_capture_attempted = false;
+                            }
                             let recorded_window = recorded.is_some();
                             if recorded_window {
                                 replay_sum += replaying.elapsed().as_secs_f64();

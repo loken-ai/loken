@@ -31,8 +31,8 @@ pub(super) struct VerifyKeep {
 
 /// The rows a verify carries, from where, and the n-gram history before them.
 pub(crate) struct VerifyWindow {
-    base: usize,
-    rows: usize,
+    pub(super) base: usize,
+    pub(super) rows: usize,
     ids: Vec<u32>,
     ngram: Option<ngram::NgramHistory>,
 }
@@ -49,7 +49,7 @@ pub(crate) struct VerifyBuffers {
     /// The rows' positions on each card, `[VERIFY_ROWS]` i32.
     pos_by_card: HashMap<usize, Tensor>,
     /// The verify in flight, from its preparation to its settlement.
-    window: Option<VerifyWindow>,
+    pub(super) window: Option<VerifyWindow>,
 }
 
 #[cfg(feature = "cuda")]
