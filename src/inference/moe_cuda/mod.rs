@@ -198,7 +198,7 @@ cuda_launchers! {
         mail_weights: *mut f32, mail_slots: *mut u32, mail_x: *mut f32, mail_rows: *mut u32,
         mail_request: *mut u32, rows: i32, k: i32, hidden: i32);
     loken_tier_wait(counter: *const u32, reply: *mut u32, abort_word: *mut u32);
-    loken_tier_merge(card: *const f32, late: *const f32, product: *const f32, counter: *const u32, out: *mut f32, n: i32);
+    loken_tier_merge(card: *const f32, late: *const f32, product: *const f32, counter: *const u32, out: *mut f32, n: i32, k: i32, hidden: i32);
 }
 /// The launchers of a cached layer's decode recorded in a graph (see `expert_tier::graph`).
 ///
@@ -258,9 +258,11 @@ pub(crate) mod tier_graph {
         counter: *const u32,
         out: *mut f32,
         n: i32,
+        k: i32,
+        hidden: i32,
         stream: i64,
     ) {
-        super::loken_tier_merge(card, late, product, counter, out, n, stream);
+        super::loken_tier_merge(card, late, product, counter, out, n, k, hidden, stream);
     }
 }
 cuda_launchers! {
@@ -272,10 +274,15 @@ cuda_launchers! {
         expert_ids: *const i32, topk_weights: *const f32, output: *mut f32, num_experts: i32,
         topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32,
         down_bias: *const f32, add_after: *const f32);
-    loken_moe_gemm_gguf_down_reduce_live(
+    loken_moe_gemm_gguf_down_pairs_two(
+        input: *const f32, weights: *const c_void, alt_weights: *const c_void, alt_from: i32,
+        sorted_token_ids: *const i32, expert_ids: *const i32, topk_weights: *const f32,
+        pair_rows: *mut f32, num_experts: i32, topk: i32, size_m: i32, size_n: i32,
+        size_k: i32, gguf_dtype: i32);
+    loken_moe_gemm_gguf_down_pairs_live(
         input: *const f32, weights: *const c_void, sorted_token_ids: *const i32,
-        expert_ids: *const i32, topk_weights: *const f32, output: *mut f32, num_experts: i32,
-        topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32,
+        expert_ids: *const i32, topk_weights: *const f32, pair_rows: *mut f32,
+        num_experts: i32, topk: i32, size_m: i32, size_n: i32, size_k: i32, gguf_dtype: i32,
         live: *const u32);
     loken_moe_gemm_gguf_gate_up_silu_mul_live(
         inputs: *const f32, gate_weights: *const c_void, up_weights: *const c_void,

@@ -97,16 +97,26 @@ extern "C" __global__ void loken_tier_wait_kernel(
     __threadfence_system();
 }
 
+// `card` and `late` hold a weighted row per routed pair, `k` pairs a row of `hidden`: a row's
+// value is the sum of its pairs' rows on the card, those run late from the transit room, and
+// the host's product when one is due.
 extern "C" __global__ void loken_tier_merge_kernel(
         const float * __restrict__ card,
         const float * __restrict__ late,
         const volatile float * product,
         const unsigned int * __restrict__ counter,
         float * __restrict__ out,
-        int n) {
+        int n, int k, int hidden) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        const float sum = late != nullptr ? card[i] + late[i] : card[i];
+        const int row = i / hidden, col = i % hidden;
+        float sum = 0.f;
+        for (int j = 0; j < k; ++j) sum += card[(size_t) (row * k + j) * hidden + col];
+        if (late != nullptr) {
+            float extra = 0.f;
+            for (int j = 0; j < k; ++j) extra += late[(size_t) (row * k + j) * hidden + col];
+            sum += extra;
+        }
         out[i] = counter[1] != 0u ? sum + product[i] : sum;
     }
 }
@@ -130,8 +140,8 @@ extern "C" void loken_tier_wait(
 
 extern "C" void loken_tier_merge(
         const float * card, const float * late, const float * product, const unsigned int * counter,
-        float * out, int n, cudaStream_t stream) {
+        float * out, int n, int k, int hidden, cudaStream_t stream) {
     const int threads = 256;
     loken_tier_merge_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
-        card, late, product, counter, out, n);
+        card, late, product, counter, out, n, k, hidden);
 }

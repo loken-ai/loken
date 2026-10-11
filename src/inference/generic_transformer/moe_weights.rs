@@ -162,6 +162,28 @@ impl ExpertRouting {
     /// The down projection and weighted fold of `n_tokens` tokens over the experts of `stack`
     /// and, numbered after them, those of `more`, in one launch.
     #[cfg(feature = "cuda")]
+    /// [`Self::down_reduce_over`] up to the pairs' rows, `[pairs, hidden]`: the caller sums a
+    /// row's pairs with whatever else it adds.
+    pub(super) fn down_pairs_over(
+        &self,
+        rows: &Tensor,
+        stack: &QTensor,
+        more: Option<&QTensor>,
+        weights: &Tensor,
+    ) -> Result<Tensor> {
+        device_timed("expert kernels: down on the device", rows, || {
+            crate::inference::moe_cuda::moe_gemm_gguf_down_pairs_over(
+                rows,
+                stack,
+                more,
+                &self.slots,
+                &self.experts,
+                weights,
+                self.topk,
+            )
+        })
+    }
+
     pub(super) fn down_reduce_over(
         &self,
         rows: &Tensor,

@@ -632,7 +632,7 @@ static void down_reduce_impl(
     const float* down_bias,         // [num_experts, size_n] F32, or nullptr
     const float* add_after,         // [num_real_tokens, N] F32 joined after the fold, or nullptr
     const void* alt_weights, int alt_from,
-    cudaStream_t stream, const unsigned int* live = nullptr
+    cudaStream_t stream, const unsigned int* live = nullptr, float* pair_rows = nullptr
 ) {
     const int kx_padded = pad_to(size_k, MATRIX_ROW_PADDING);
     // Down quantises one activation row per routed pair - no sharing, so one row per entry -
@@ -642,7 +642,9 @@ static void down_reduce_impl(
     const size_t act_bytes = pad_to(
         (int)((size_t)size_m * (kx_padded / QK8_1) * sizeof(block_q8_1)), 256);
     const size_t pair_bytes = (size_t)size_m * size_n * sizeof(float);
-    const y_q8_1_reservation y_q8_1 = get_y_q8_1_scratch(act_bytes + pair_bytes, stream);
+    // The pairs' rows go to the caller's buffer when it gives one, and the sum is the caller's.
+    const y_q8_1_reservation y_q8_1 =
+        get_y_q8_1_scratch(act_bytes + (pair_rows != nullptr ? 0 : pair_bytes), stream);
     {
         const dim3 grid(ceil_div(kx_padded, CUDA_QUANTIZE_BLOCK_SIZE), size_m, 1);
         const dim3 block(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
@@ -650,7 +652,7 @@ static void down_reduce_impl(
     }
     // Every routed row is written by the kernel below, a left-out pair as zeros, so the scratch
     // needs no clearing first.
-    float* pairs = (float*)((char*)(void*)y_q8_1 + act_bytes);
+    float* pairs = pair_rows != nullptr ? pair_rows : (float*)((char*)(void*)y_q8_1 + act_bytes);
     float* reduced = outputs;
     outputs = pairs;
     // A launch that runs the pairs the host hands it leaves the others' rows to the sum: zero.
@@ -672,6 +674,7 @@ static void down_reduce_impl(
 #undef MOE_CASE
         default: break;
     }
+    if (pair_rows != nullptr) return;
     if (add_after) {
         const int threads = 256;
         const int blocks = ceil_div((size_m / topk) * size_n, threads);
@@ -680,6 +683,36 @@ static void down_reduce_impl(
     } else {
         loken_moe_sum_topk(pairs, reduced, size_m / topk, topk, size_n, stream);
     }
+}
+
+/// `loken_moe_gemm_gguf_down_reduce_two` up to the pairs' rows: `pair_rows` `[size_m, size_n]`
+/// takes each routed pair's weighted row, and the caller sums a token's `topk` of them.
+extern "C" void loken_moe_gemm_gguf_down_pairs_two(
+    const float* inputs, const void* weights, const void* alt_weights, int alt_from,
+    const int32_t* sorted_token_ids, const int32_t* expert_ids,
+    const float* topk_weights, float* pair_rows,
+    int num_experts, int topk, int size_m, int size_n, int size_k,
+    int quant_type,
+    cudaStream_t stream
+) {
+    down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, nullptr,
+        num_experts, topk, size_m, size_n, size_k, quant_type, nullptr, nullptr,
+        alt_weights, alt_from, stream, nullptr, pair_rows);
+}
+
+/// `loken_moe_gemm_gguf_down_pairs_two` over the first `*live` pairs, `live` read on the card;
+/// the idle pairs' rows are zero.
+extern "C" void loken_moe_gemm_gguf_down_pairs_live(
+    const float* inputs, const void* weights,
+    const int32_t* sorted_token_ids, const int32_t* expert_ids,
+    const float* topk_weights, float* pair_rows,
+    int num_experts, int topk, int size_m, int size_n, int size_k,
+    int quant_type, const unsigned int* live,
+    cudaStream_t stream
+) {
+    down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, nullptr,
+        num_experts, topk, size_m, size_n, size_k, quant_type, nullptr, nullptr,
+        nullptr, 0, stream, live, pair_rows);
 }
 
 extern "C" void loken_moe_gemm_gguf_down_reduce(
@@ -697,21 +730,6 @@ extern "C" void loken_moe_gemm_gguf_down_reduce(
 
 /// [`loken_moe_gemm_gguf_down_reduce`] over `num_experts` slots, those from `alt_from` on read
 /// from the `alt_weights` tensor (slot `expert - alt_from` of it).
-/// `loken_moe_gemm_gguf_down_reduce` over the first `*live` pairs, `live` read on the card; the
-/// pairs past it add nothing to their tokens' rows.
-extern "C" void loken_moe_gemm_gguf_down_reduce_live(
-    const float* inputs, const void* weights,
-    const int32_t* sorted_token_ids, const int32_t* expert_ids,
-    const float* topk_weights, float* outputs,
-    int num_experts, int topk, int size_m, int size_n, int size_k,
-    int quant_type, const unsigned int* live,
-    cudaStream_t stream
-) {
-    down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, outputs,
-        num_experts, topk, size_m, size_n, size_k, quant_type, nullptr, nullptr,
-        nullptr, 0, stream, live);
-}
-
 extern "C" void loken_moe_gemm_gguf_down_reduce_two(
     const float* inputs, const void* weights, const void* alt_weights, int alt_from,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,

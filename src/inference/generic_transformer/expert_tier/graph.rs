@@ -515,8 +515,9 @@ impl LayerTier {
             &self.card[1],
             more.map(|m| (&m[0], &m[1])),
         )?;
-        let card =
-            routing.down_reduce_over(&h, &self.card[2], more.map(|m| &m[2]), &weights, rows)?;
+        // Each pair's row, at its weight: the merge sums a row's pairs with the late ones and
+        // the host's product.
+        let card = routing.down_pairs_over(&h, &self.card[2], more.map(|m| &m[2]), &weights)?;
         drop(extra);
         Ok(GraphPending {
             card,
@@ -565,7 +566,7 @@ impl LayerTier {
                     rows * k,
                     k,
                 )?;
-                Some(moe_cuda::moe_gemm_gguf_down_reduce_live(
+                Some(moe_cuda::moe_gemm_gguf_down_pairs_live(
                     &h,
                     &stacks[2],
                     g.mail.dptr(g.mail.late_pairs),
@@ -573,7 +574,6 @@ impl LayerTier {
                     g.mail.dptr(g.mail.late_weights),
                     g.mail.dptr(LIVE),
                     k,
-                    rows,
                 )?)
             }
             None => None,
@@ -591,6 +591,8 @@ impl LayerTier {
                 address_of::<u32>(&g.counter)? as *const u32,
                 out.device_ptr(out.stream()).0 as *mut f32,
                 (rows * hidden) as i32,
+                k as i32,
+                hidden as i32,
                 stream,
             );
         }
