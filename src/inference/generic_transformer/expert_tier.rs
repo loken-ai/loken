@@ -2733,7 +2733,40 @@ mod tests {
         [gate_up, down]: [GgmlDType; 2],
     ) -> MoeWeights {
         let host = Device::Cpu;
-        let stack = |seed, rows, cols, dtype| {
+        let stack = |seed: u64, rows: usize, cols: usize, dtype: GgmlDType| {
+            // A format only read from a file takes any bytes with a small, finite scale in
+            // front of each block; the others are quantised from values.
+            if matches!(
+                dtype,
+                GgmlDType::Iq2S
+                    | GgmlDType::Iq3Xxs
+                    | GgmlDType::Iq3S
+                    | GgmlDType::Iq4Xs
+                    | GgmlDType::Iq2Xxs
+                    | GgmlDType::Iq4Nl
+            ) {
+                let n = experts * rows * cols;
+                let block_bytes = dtype.type_size();
+                let blocks = n / dtype.block_size();
+                let mut state = 0x9E37_79B9u32 ^ seed as u32;
+                let bytes: Vec<u8> = (0..blocks * block_bytes)
+                    .map(|i| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        match i % block_bytes {
+                            0 => 0x00,
+                            1 => 0x2C,
+                            _ => (state >> 24) as u8,
+                        }
+                    })
+                    .collect();
+                let qhost = crate::tensor::quantized::QHostTensor::from_bytes(
+                    &bytes,
+                    dtype,
+                    vec![experts, rows, cols],
+                )
+                .unwrap();
+                return QTensor::from_native(Arc::new(qhost), &host).unwrap();
+            }
             let w = Tensor::from_vec(
                 values(experts * rows * cols, seed, 0.5),
                 (experts, rows, cols),
@@ -3259,6 +3292,10 @@ mod tests {
         for formats in [
             [GgmlDType::Q2_0, GgmlDType::Q2_0],
             [GgmlDType::Q8_0, GgmlDType::Q8_0],
+            [GgmlDType::Iq2S, GgmlDType::Iq4Nl],
+            [GgmlDType::Iq3Xxs, GgmlDType::Iq4Nl],
+            [GgmlDType::Iq3S, GgmlDType::Q2_0],
+            [GgmlDType::Iq4Xs, GgmlDType::Q8_0],
         ] {
             let reference = layer_of(&Device::Cpu, experts, used, hidden, ffn, formats);
             let mut resident = layer_of(&card, experts, used, hidden, ffn, formats);
