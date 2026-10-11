@@ -137,8 +137,8 @@ fn sub_block_dot(grid: &[u8; 32], signs: &[i8; 32], act: &[i8]) -> i32 {
     }
 }
 
-/// The dot product of IQ2_XXS weight blocks with q8_K activation blocks.
-pub(crate) fn dot(xs: &[BlockIq2Xxs], ys: &[BlockQ8K]) -> f32 {
+/// The dot product of IQ2_XXS weight blocks with activation blocks of a scale per run.
+pub(crate) fn dot(xs: &[BlockIq2Xxs], ys: &[BlockQ8K32]) -> f32 {
     xs.iter()
         .zip(ys)
         .map(|(x, y)| {
@@ -157,9 +157,9 @@ pub(crate) fn dot(xs: &[BlockIq2Xxs], ys: &[BlockQ8K]) -> f32 {
                     let (grid, signs, _) = sub_block(q);
                     sub_block_dot(&grid, &signs, act)
                 };
-                acc += scale * sum as f32;
+                acc += scale * sum as f32 * y.d[ib32].to_f32();
             }
-            x.d.to_f32() * y.d * acc
+            x.d.to_f32() * acc
         })
         .sum()
 }

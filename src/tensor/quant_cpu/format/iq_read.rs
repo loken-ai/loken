@@ -3,25 +3,28 @@
 
 use super::*;
 
-/// `sum(x . y)` over blocks of `QK_K` values, `x` decoded by the format's own dequantiser.
-pub(super) fn dot_by_decoding<B: BlockFormat>(xs: &[B], ys: &[BlockQ8K]) -> f32 {
+/// `sum(x . y)` over blocks of `QK_K` values, `x` decoded by the format's own dequantiser, the
+/// activation's runs each under their own scale.
+pub(super) fn dot_by_decoding<B: BlockFormat>(xs: &[B], ys: &[BlockQ8K32]) -> f32 {
     let mut values = [0f32; QK_K];
     let mut total = 0f32;
     for (x, y) in xs.iter().zip(ys) {
         B::dequantize(std::slice::from_ref(x), &mut values);
-        let sum: f32 = values
-            .iter()
-            .zip(y.qs.iter())
-            .map(|(w, &q)| w * q as f32)
-            .sum();
-        total += sum * y.d;
+        for ib in 0..QK_K / 32 {
+            let sum: f32 = values[32 * ib..32 * ib + 32]
+                .iter()
+                .zip(&y.qs[32 * ib..32 * ib + 32])
+                .map(|(w, &q)| w * q as f32)
+                .sum();
+            total += sum * y.d[ib].to_f32();
+        }
     }
     total
 }
 
 /// A format read as runs of thirty-two integer weights, each under a scale of its own, which is
 /// what lets a dot stay in integers until the end of a run.
-pub(super) trait Runs: BlockFormat<ActivationBlock = BlockQ8K> {
+pub(super) trait Runs: BlockFormat<ActivationBlock = BlockQ8K32> {
     /// The scale of run `ib`, block scale included, as the dequantiser applies it.
     fn run_scale(&self, ib: usize) -> f32;
     /// The weights of run `ib` before the scale.
@@ -29,18 +32,16 @@ pub(super) trait Runs: BlockFormat<ActivationBlock = BlockQ8K> {
 }
 
 /// `sum(x . y)` over blocks of `QK_K` values for a format read in runs: each run's weights against
-/// the same thirty-two codes of the activation, in integers.
-pub(super) fn dot_runs<B: Runs>(xs: &[B], ys: &[BlockQ8K]) -> f32 {
+/// the same thirty-two codes of the activation, in integers, under the run's two scales.
+pub(super) fn dot_runs<B: Runs>(xs: &[B], ys: &[BlockQ8K32]) -> f32 {
     let mut total = 0f32;
     for (x, y) in xs.iter().zip(ys) {
-        let mut block = 0f32;
         for ib in 0..QK_K / 32 {
             let w = x.run_values(ib);
             let a: &[i8] = &y.qs[32 * ib..32 * ib + 32];
             let dot: i32 = w.iter().zip(a).map(|(&w, &a)| w as i32 * a as i32).sum();
-            block += x.run_scale(ib) * dot as f32;
+            total += x.run_scale(ib) * dot as f32 * y.d[ib].to_f32();
         }
-        total += block * y.d;
     }
     total
 }
@@ -259,7 +260,7 @@ mod tests {
     #[test]
     #[ignore = "a measurement: cargo test --release iq_dot_throughput -- --ignored --nocapture"]
     fn iq_dot_throughput() {
-        fn run<T: BlockFormat<ActivationBlock = BlockQ8K>>(name: &str) {
+        fn run<T: BlockFormat<ActivationBlock = BlockQ8K32>>(name: &str) {
             let blocks = (64 << 20) / std::mem::size_of::<T>();
             let mut state = 0x9E37_79B9u64;
             let mut bytes = vec![0u8; blocks * std::mem::size_of::<T>()];
@@ -274,7 +275,7 @@ mod tests {
             }
             let weights: &[T] =
                 unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, blocks) };
-            let acts = vec![BlockQ8K::zeros(); blocks];
+            let acts = vec![BlockQ8K32::zeros(); blocks];
             let mut sink = 0f32;
             let start = std::time::Instant::now();
             for _ in 0..3 {

@@ -1,6 +1,7 @@
 //! q2_0 - sixty-four values, a scale and two-bit codes: `y = (q - 1) . d` for codes 0 to 3, so the
 //! levels are -1, 0, +1 and +2 times the scale. Four codes share a byte, lowest first.
 
+use super::q8_64::QK8_64_HALF;
 use super::*;
 
 pub const QK2_0: usize = 64;
@@ -70,19 +71,24 @@ impl BlockFormat for BlockQ2_0 {
         Self::dot_scalar(xs, ys)
     }
 
+    /// The two halves of the activation block carry a scale each, as the card's do: each half's
+    /// integer dot is scaled on its own and joins the total in turn.
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        xs.iter()
-            .zip(ys)
-            .map(|(x, y)| {
-                let dot: i32 = (0..QK2_0)
+        let mut total = 0f32;
+        for (x, y) in xs.iter().zip(ys) {
+            let d = x.d.to_f32();
+            for h in 0..2 {
+                let at = h * QK8_64_HALF;
+                let dot: i32 = (at..at + QK8_64_HALF)
                     .map(|j| {
                         let code = ((x.qs[j / 4] >> (2 * (j % 4))) & 3) as i32;
                         (code - 1) * y.qs[j] as i32
                     })
                     .sum();
-                dot as f32 * x.d.to_f32() * y.d
-            })
-            .sum()
+                total += dot as f32 * d * y.d[h].to_f32();
+            }
+        }
+        total
     }
 }
 
@@ -114,19 +120,24 @@ unsafe fn dot_blocks(xs: &[BlockQ2_0], ys: &[BlockQ8_64]) -> f32 {
             _mm_unpackhi_epi16(high01, high23),
         ];
         let acts = y.qs.as_ptr() as *const __m128i;
-        let mut sum = _mm_setzero_si128();
-        let mut act_sum = _mm_setzero_si128();
-        for (i, code) in codes.iter().enumerate() {
-            let a = _mm_loadu_si128(acts.add(i));
-            sum = _mm_add_epi32(sum, _mm_madd_epi16(_mm_maddubs_epi16(*code, a), ones16));
-            act_sum = _mm_add_epi32(act_sum, _mm_madd_epi16(_mm_maddubs_epi16(ones8, a), ones16));
-        }
         let horizontal = |v: __m128i| {
             let v = _mm_hadd_epi32(v, v);
             _mm_cvtsi128_si32(_mm_hadd_epi32(v, v))
         };
-        let dot = horizontal(sum) - horizontal(act_sum);
-        total += dot as f32 * x.d.to_f32() * y.d;
+        // Sixteen codes to a group, two groups to a half: each half's dot takes its own scale.
+        let d = x.d.to_f32();
+        for h in 0..2 {
+            let mut sum = _mm_setzero_si128();
+            let mut act_sum = _mm_setzero_si128();
+            for (i, code) in codes[2 * h..2 * h + 2].iter().enumerate() {
+                let a = _mm_loadu_si128(acts.add(2 * h + i));
+                sum = _mm_add_epi32(sum, _mm_madd_epi16(_mm_maddubs_epi16(*code, a), ones16));
+                act_sum =
+                    _mm_add_epi32(act_sum, _mm_madd_epi16(_mm_maddubs_epi16(ones8, a), ones16));
+            }
+            let dot = horizontal(sum) - horizontal(act_sum);
+            total += dot as f32 * d * y.d[h].to_f32();
+        }
     }
     total
 }
@@ -151,7 +162,10 @@ mod tests {
                 x.qs.iter_mut().for_each(|b| *b = next());
             }
             for y in &mut ys {
-                y.d = 0.003 * (next() as f32 + 1.0);
+                y.d = [
+                    f16::from_f32(0.003 * (next() as f32 + 1.0)),
+                    f16::from_f32(0.003 * (next() as f32 + 1.0)),
+                ];
                 y.qs.iter_mut().for_each(|q| *q = next() as i8);
             }
             // The extremes of the activation codes, where a saturating add would show.

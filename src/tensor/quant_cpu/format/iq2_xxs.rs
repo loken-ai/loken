@@ -19,7 +19,7 @@ const _: () = assert!(std::mem::size_of::<BlockIq2Xxs>() == 66);
 impl BlockFormat for BlockIq2Xxs {
     const DTYPE: GgmlDType = GgmlDType::Iq2Xxs;
     const BLOCK_LEN: usize = QK_K;
-    type ActivationBlock = BlockQ8K;
+    type ActivationBlock = BlockQ8K32;
 
     fn zeros() -> Self {
         Self {
@@ -68,18 +68,10 @@ impl BlockFormat for BlockIq2Xxs {
         super::iq2_xxs_dot::dot(xs, ys)
     }
 
-    /// Dequantise the weight block and dot it with the q8_K activation (`d * qs`): the reference
-    /// the integer path is checked against.
+    /// Dequantise the weight block and dot it with the activation's runs, each under its scale:
+    /// the reference the integer path is checked against.
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        let mut w = [0f32; QK_K];
-        xs.iter()
-            .zip(ys)
-            .map(|(x, y)| {
-                Self::dequantize(std::slice::from_ref(x), &mut w);
-                let s: f32 = w.iter().zip(y.qs.iter()).map(|(&a, &q)| a * q as f32).sum();
-                y.d * s
-            })
-            .sum()
+        super::iq_read::dot_by_decoding(xs, ys)
     }
 }
 

@@ -19,7 +19,7 @@ const _: () = assert!(std::mem::size_of::<BlockIq3S>() == 110);
 impl BlockFormat for BlockIq3S {
     const DTYPE: GgmlDType = GgmlDType::Iq3S;
     const BLOCK_LEN: usize = QK_K;
-    type ActivationBlock = BlockQ8K;
+    type ActivationBlock = BlockQ8K32;
 
     fn zeros() -> Self {
         Self {
@@ -77,10 +77,11 @@ impl BlockFormat for BlockIq3S {
         #[cfg(target_feature = "avx2")]
         return unsafe {
             use std::arch::x86_64::*;
-            // The runs' sums stay integers under their odd scales until the block ends.
+            // A run's sum stays integer under its odd scale until the run ends, and takes the
+            // run's activation scale then.
             let mut total = _mm256_setzero_ps();
             for (x, y) in xs.iter().zip(ys) {
-                let mut block = _mm256_setzero_si256();
+                let d = x.d.to_f32();
                 for ib in 0..QK_K / 32 {
                     // Code `c` of a run is its byte with bit `c` of the run's high-bit byte as the
                     // ninth bit. The magnitudes are read one by one: a gather is slow on a
@@ -104,13 +105,12 @@ impl BlockFormat for BlockIq3S {
                         x.scales[ib / 2] >> 4
                     };
                     let scale = _mm256_set1_epi16(2 * nibble as i16 + 1);
-                    block = _mm256_add_epi32(block, _mm256_madd_epi16(pairs, scale));
+                    total = _mm256_fmadd_ps(
+                        _mm256_cvtepi32_ps(_mm256_madd_epi16(pairs, scale)),
+                        _mm256_set1_ps(d * y.d[ib].to_f32()),
+                        total,
+                    );
                 }
-                total = _mm256_fmadd_ps(
-                    _mm256_cvtepi32_ps(block),
-                    _mm256_set1_ps(x.d.to_f32() * y.d),
-                    total,
-                );
             }
             super::iq_read::sum_ps(total)
         };

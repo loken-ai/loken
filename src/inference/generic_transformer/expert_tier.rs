@@ -3024,6 +3024,60 @@ mod tests {
         assert!(hits > 0 && hits < routed, "{hits} of {routed} on the card");
     }
 
+    /// A token and the rows of a verify through a layer's experts on the card give what the
+    /// host's loop gives, in the format the served models hold their layers' experts in and in
+    /// the one the tests build theirs in: the two paths compute every missing expert of a
+    /// decode, so a difference between them is a difference between two computations of the
+    /// same step.
+    #[test]
+    fn the_card_and_the_host_agree_on_an_expert_in_each_served_format() {
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 256usize, 512usize);
+        for formats in [
+            [GgmlDType::Q2_0, GgmlDType::Q2_0],
+            [GgmlDType::Q8_0, GgmlDType::Q8_0],
+        ] {
+            let reference = layer_of(&Device::Cpu, experts, used, hidden, ffn, formats);
+            let mut resident = layer_of(&card, experts, used, hidden, ffn, formats);
+            resident.tier = Some(Arc::new(LayerTier::all_on_card(&resident, &card).unwrap()));
+            let _order = crate::tensor::quantized::DecodeOrder::enter();
+            for rows in [1usize, 3, 7] {
+                let x = values(rows * hidden, 7 + rows as u64, 1.0);
+                let on_host = Tensor::from_vec(x.clone(), (1, rows, hidden), &Device::Cpu).unwrap();
+                let on_card = Tensor::from_vec(x, (1, rows, hidden), &card).unwrap();
+                let want = reference
+                    .forward_rows(&on_host, &on_host, hidden, 1e-5)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let got = resident
+                    .forward_rows(&on_card, &on_card, hidden, 1e-5)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                for r in 0..rows {
+                    let (w, g) = (
+                        &want[r * hidden..(r + 1) * hidden],
+                        &got[r * hidden..(r + 1) * hidden],
+                    );
+                    let distance = crate::inference::engine::decode_step::replay_distance(g, w);
+                    eprintln!("{formats:?} rows {rows} row {r}: relative distance {distance:.5}");
+                    assert!(
+                        distance <= 1e-2,
+                        "{formats:?}, {rows} rows, row {r}: the card is {distance:.4} of the host's norm away"
+                    );
+                }
+            }
+        }
+    }
+
     /// A layer with every expert on the card runs as a loaded one does: a token and wide batches
     /// give what the host's loop gives.
     #[test]

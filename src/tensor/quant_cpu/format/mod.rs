@@ -30,6 +30,7 @@ pub mod q8_0;
 pub mod q8_1;
 pub mod q8_64;
 pub mod q8_k;
+pub mod q8_k32;
 
 pub use iq2_s::*;
 pub use iq2_xxs::*;
@@ -52,3 +53,4 @@ pub use q8_0::*;
 pub use q8_1::*;
 pub use q8_64::*;
 pub use q8_k::*;
+pub use q8_k32::*;

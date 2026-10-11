@@ -20,7 +20,7 @@ const _: () = assert!(std::mem::size_of::<BlockIq4Xs>() == 136);
 impl BlockFormat for BlockIq4Xs {
     const DTYPE: GgmlDType = GgmlDType::Iq4Xs;
     const BLOCK_LEN: usize = QK_K;
-    type ActivationBlock = BlockQ8K;
+    type ActivationBlock = BlockQ8K32;
 
     fn zeros() -> Self {
         Self {
@@ -59,9 +59,9 @@ impl BlockFormat for BlockIq4Xs {
                 for ib in 0..QK_K / 32 {
                     let packed: &[u8; 16] = x.qs[16 * ib..16 * ib + 16].try_into().unwrap();
                     let dot = super::iq_read::dot_iq4_run(packed, &y.qs[32 * ib..32 * ib + 32]);
-                    block += super::iq_read::Runs::run_scale(x, ib) * dot as f32;
+                    block += super::iq_read::Runs::run_scale(x, ib) * dot as f32 * y.d[ib].to_f32();
                 }
-                block * y.d
+                block
             })
             .sum()
     }
