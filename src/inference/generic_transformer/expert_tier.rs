@@ -1158,6 +1158,9 @@ impl LayerTier {
             }
             moves
         };
+        // The stacks were allocated on the card's stream moments ago: the copy stream writes
+        // them only once that allocation has run.
+        self.dev.as_cuda_device()?.0.synchronize()?;
         for &(e, slot) in &moves {
             self.copy_in_async(e, slot)?;
         }
