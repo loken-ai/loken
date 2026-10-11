@@ -33,6 +33,8 @@ struct TierState {
     owner: Vec<i32>,
     /// Decayed count of the times each expert was routed to.
     heat: Vec<f32>,
+    /// The times each expert was routed to since the load, undecayed: the run's profile.
+    counts: Vec<u32>,
     /// Tokens since the counts last halved.
     since_decay: usize,
     /// The card's copy of `slot_of`, while a recorded decode reads it.
@@ -40,6 +42,15 @@ struct TierState {
 }
 
 impl TierState {
+    /// `rows` more tokens routed: the counts cool every `ADAPT_EVERY_TOKENS` of them.
+    fn tokens_routed(&mut self, rows: usize) {
+        self.since_decay += rows;
+        if self.since_decay >= ADAPT_EVERY_TOKENS {
+            self.since_decay = 0;
+            self.heat.iter_mut().for_each(|h| *h *= ADAPT_DECAY);
+        }
+    }
+
     /// Say that `expert` is in `slot`, or in none (`-1`), to the card as well.
     fn set_slot(&mut self, expert: usize, slot: i32) {
         self.slot_of[expert] = slot;
@@ -65,6 +76,20 @@ pub(crate) fn kernels_of_a_recording(on: bool) {
 /// The hit rate from which a layer's extra slots are not given back to it after a prefill:
 /// of ten routed experts it misses half of one.
 const REFILL_BELOW_HIT_RATE: f64 = 0.95;
+
+/// How the cache follows the routing. An expert's heat counts the tokens that routed to it, and
+/// every `ADAPT_EVERY_TOKENS` tokens the counts are multiplied by `ADAPT_DECAY`. A missing expert
+/// takes a slot only once its heat reaches `ADAPT_MIN_HEAT` and exceeds the coldest slot's by
+/// `ADAPT_MARGIN`, the pairs with the largest gain first, at most `ADAPT_SWAPS_A_REQUEST` for
+/// each request a layer serves: a one-off route never moves an expert the decode keeps using.
+const ADAPT_EVERY_TOKENS: usize = 256;
+const ADAPT_DECAY: f32 = 0.5;
+const ADAPT_MIN_HEAT: f32 = 2.0;
+const ADAPT_MARGIN: f32 = 1.5;
+const ADAPT_SWAPS_A_REQUEST: usize = 2;
+/// Copies into the transit room timed before the share it takes of a request's missing experts
+/// is fixed for the run.
+const TRANSIT_PACE_SAMPLES: u64 = 16;
 
 /// One layer's cache.
 pub struct LayerTier {
@@ -106,6 +131,11 @@ pub struct LayerTier {
     /// transit room takes, and the host's computation of one.
     upload_us: AtomicU64,
     host_us: AtomicU64,
+    /// Samples the two paces were measured over, and the share of the missing experts the
+    /// transit room takes once they are, in eighths: set once, so that a request's split no
+    /// longer follows the clock and a run gives the text it gave.
+    paced: AtomicU64,
+    transit_eighths: AtomicU64,
     /// Missing experts copied to the transit room for the token that wanted them.
     uploaded: AtomicU64,
     /// The layer's side of a decode recorded in a graph, once enabled.
@@ -835,6 +865,7 @@ impl LayerTier {
                 slot_of,
                 owner,
                 heat: vec![0.0; moe.n_experts],
+                counts: vec![0; moe.n_experts],
                 since_decay: 0,
                 table: None,
             }),
@@ -856,6 +887,8 @@ impl LayerTier {
             prompt_ids: Mutex::new(None),
             upload_us: AtomicU64::new(0),
             host_us: AtomicU64::new(0),
+            paced: AtomicU64::new(0),
+            transit_eighths: AtomicU64::new(0),
             uploaded: AtomicU64::new(0),
             graph: std::sync::OnceLock::new(),
         })
@@ -1073,6 +1106,72 @@ impl LayerTier {
     }
 
     /// (routed experts, of which the card held, copies made) since the load.
+    /// The times each expert was routed to since the load.
+    pub fn routing_counts(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .counts
+            .clone()
+    }
+
+    /// Fill the slots with the experts `counts` ranks highest, hottest first, copied from the
+    /// host stacks now, and give each expert the heat its rank earns, so that the decode's
+    /// first routes do not move what the profile placed. How many experts were copied.
+    /// How many experts the layer routes to.
+    pub fn n_experts(&self) -> usize {
+        self.n_experts
+    }
+
+    pub fn prime(&self, counts: &[u32]) -> Result<usize> {
+        if counts.len() != self.n_experts || self.resident {
+            return Ok(0);
+        }
+        let top = counts.iter().copied().max().unwrap_or(0).max(1) as f32;
+        let mut ranked: Vec<usize> = (0..self.n_experts).collect();
+        ranked.sort_by(|&a, &b| counts[b].cmp(&counts[a]).then(a.cmp(&b)));
+        let moves: Vec<(usize, usize)> = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            for (h, &c) in st.heat.iter_mut().zip(counts) {
+                *h = h.max(ADAPT_MIN_HEAT * c as f32 / top);
+            }
+            let slots = st.owner.len();
+            let wanted: Vec<usize> = ranked.into_iter().take(slots).collect();
+            // A wanted expert already in a slot keeps it; the other slots take the rest. A lent
+            // slot (owner -3) holds nothing until it comes back, and takes no expert.
+            let mut moves = Vec::new();
+            let mut free: Vec<usize> = (0..slots)
+                .filter(|&s| st.owner[s] != -3)
+                .filter(|&s| st.owner[s] < 0 || !wanted.contains(&(st.owner[s] as usize)))
+                .collect();
+            for &e in &wanted {
+                if st.slot_of[e] >= 0 {
+                    continue;
+                }
+                let Some(slot) = free.pop() else { break };
+                let old = st.owner[slot];
+                if old >= 0 {
+                    st.set_slot(old as usize, -1);
+                }
+                st.owner[slot] = -2;
+                moves.push((e, slot));
+            }
+            moves
+        };
+        for &(e, slot) in &moves {
+            self.copy_in_async(e, slot)?;
+        }
+        self.copy
+            .synchronize()
+            .map_err(|e| crate::tensor::Error::msg(format!("slot copy: {e:?}")))?;
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for &(e, slot) in &moves {
+            st.owner[slot] = e as i32;
+            st.set_slot(e, slot as i32);
+        }
+        Ok(moves.len())
+    }
+
     pub fn counters(&self) -> (u64, u64, u64) {
         (
             self.routed.load(Ordering::Relaxed),
@@ -1199,6 +1298,7 @@ impl LayerTier {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             for (i, (&e, &w)) in ids_h.iter().zip(&w_h).enumerate() {
                 st.heat[e as usize] += 1.0;
+                st.counts[e as usize] += 1;
                 match st.slot_of[e as usize] {
                     s if s >= 0 => {
                         slot_ids[i] = s as u32;
@@ -1212,11 +1312,7 @@ impl LayerTier {
                     }
                 }
             }
-            st.since_decay += 1;
-            if st.since_decay >= self.n_experts {
-                st.since_decay = 0;
-                st.heat.iter_mut().for_each(|h| *h *= 0.5);
-            }
+            st.tokens_routed(1);
         }
         let hits = k - miss_ids.len();
         let routed = self.routed.fetch_add(k as u64, Ordering::Relaxed) + k as u64;
@@ -1467,6 +1563,7 @@ impl LayerTier {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             for (p, (&e, &w)) in ids_h.iter().zip(&w_h).enumerate() {
                 st.heat[e as usize] += 1.0;
+                st.counts[e as usize] += 1;
                 let s = st.slot_of[e as usize];
                 if s >= 0 {
                     slot_ids[p] = s as u32;
@@ -1475,11 +1572,7 @@ impl LayerTier {
                     is_hit[p] = true;
                 }
             }
-            st.since_decay += rows;
-            if st.since_decay >= self.n_experts {
-                st.since_decay = 0;
-                st.heat.iter_mut().for_each(|h| *h *= 0.5);
-            }
+            st.tokens_routed(rows);
         }
         let pairs = rows * k;
         let hits = is_hit.iter().filter(|&&h| h).count();
@@ -1681,7 +1774,7 @@ impl LayerTier {
         let out = out.expect("a token routes to at least one expert");
         drop(guard);
         self.keep_in_transit(&transit_experts, false, &mut in_use, &stream)?;
-        self.promote_up_to(&host_experts, &in_use, rows);
+        self.promote_up_to(&host_experts, &in_use, rows.max(ADAPT_SWAPS_A_REQUEST));
         laps.mark("tier rows: finish");
         Ok(out)
     }
@@ -1832,6 +1925,11 @@ impl LayerTier {
         if missing == 0 || self.stage.is_none() {
             return 0;
         }
+        let room = self.stage.as_ref().map_or(0, |s| s.stager.transit);
+        let eighths = self.transit_eighths.load(Ordering::Relaxed);
+        if eighths > 0 {
+            return ((missing as u64 * eighths + 4) / 8).min(room as u64) as usize;
+        }
         let host = f64::from_bits(self.host_us.load(Ordering::Relaxed));
         let mut copy = f64::from_bits(self.upload_us.load(Ordering::Relaxed));
         if copy == 0.0 {
@@ -1841,9 +1939,15 @@ impl LayerTier {
             }
             copy = self.expert_bytes.iter().sum::<usize>() as f64 / rate;
         }
-        let room = self.stage.as_ref().map_or(0, |s| s.stager.transit);
         if host == 0.0 {
             return (if missing > 1 { missing - 1 } else { missing }).min(room);
+        }
+        // The paces measured enough, the share is fixed: the copies and the products finish
+        // together when the room takes host / (host + copy) of the experts.
+        if self.paced.load(Ordering::Relaxed) >= TRANSIT_PACE_SAMPLES {
+            let share = (8.0 * host / (host + copy)).round().clamp(1.0, 7.0) as u64;
+            self.transit_eighths.store(share, Ordering::Relaxed);
+            return ((missing as u64 * share + 4) / 8).min(room as u64) as usize;
         }
         let finish = |n: usize| (n as f64 * copy).max((missing - n) as f64 * host);
         (0..=missing.min(room))
@@ -1854,13 +1958,24 @@ impl LayerTier {
     /// Queue the copies of `experts` from the host into the transit room, one after the other
     /// from its start, and the events around them.
     fn copy_to_transit(&self, scratch: &Scratch, experts: &[u32]) -> Result<()> {
+        self.copy_to_transit_between(&scratch.upload_start, &scratch.upload_end, experts)?;
+        scratch.in_flight.store(experts.len(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// [`Self::copy_to_transit`] with the events that bracket the copies.
+    pub(super) fn copy_to_transit_between(
+        &self,
+        start: &cudarc::driver::CudaEvent,
+        end: &cudarc::driver::CudaEvent,
+        experts: &[u32],
+    ) -> Result<()> {
         use cudarc::driver::DevicePtr;
         let stage = self.stage.as_ref().expect("a copy to transit has a stage");
         let copy = &stage.stager.copy;
         let buffer = &stage.stager.buffers[stage.buffer];
         // The choice was waited for, so the layers that read this buffer before are done.
-        scratch
-            .upload_start
+        start
             .record(copy)
             .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))?;
         for i in 0..3 {
@@ -1873,21 +1988,35 @@ impl LayerTier {
                 self.upload(i, data, e * eb, eb, base + (at * eb) as u64, copy)?;
             }
         }
-        scratch
-            .upload_end
-            .record(copy)
+        end.record(copy)
             .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))?;
-        scratch.in_flight.store(experts.len(), Ordering::Relaxed);
         self.uploaded
             .fetch_add(experts.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Hand the worker the hottest missing expert if it is hotter than the coldest slot that
-    /// this token did not read. The copy runs beside the tokens that follow: the expert is
-    /// routed to the card only once it has landed.
+    /// Of `missing` experts, how many the transit room takes for this request, the rest being
+    /// the host's: [`Self::transit_share`] where the layer has a room.
+    pub(super) fn transit_share_of(&self, missing: usize) -> usize {
+        self.transit_share(missing)
+    }
+
+    /// The transit room's stacks, where the layer has one.
+    pub(super) fn transit_stacks(&self) -> Option<&[QTensor; 3]> {
+        self.stage.as_ref().map(|s| &s.compact)
+    }
+
+    /// Note what one copy into the transit room took, in microseconds.
+    pub(super) fn note_upload_us(&self, us: f64) {
+        blend(&self.upload_us, us);
+        self.paced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Hand the worker the hottest missing experts that earn a slot over the coldest slots this
+    /// token did not read. The copy runs beside the tokens that follow: an expert is routed to
+    /// the card only once it has landed.
     fn promote(self: &Arc<Self>, missing: &[u32], in_use: &[bool]) {
-        self.promote_up_to(missing, in_use, 1);
+        self.promote_up_to(missing, in_use, ADAPT_SWAPS_A_REQUEST);
     }
 
     /// [`Self::promote`] for up to `most` experts at once: the hottest missing ones, each hotter
@@ -1899,7 +2028,11 @@ impl LayerTier {
         }
         let chosen: Vec<(usize, usize)> = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let mut hot: Vec<u32> = missing.to_vec();
+            let mut hot: Vec<u32> = missing
+                .iter()
+                .copied()
+                .filter(|&e| st.heat[e as usize] >= ADAPT_MIN_HEAT)
+                .collect();
             hot.sort_unstable();
             hot.dedup();
             hot.sort_by(|&a, &b| st.heat[b as usize].total_cmp(&st.heat[a as usize]));
@@ -1907,9 +2040,11 @@ impl LayerTier {
                 .filter(|&s| !in_use[s] && st.owner[s] >= -1)
                 .collect();
             victims.sort_by(|&a, &b| slot_heat(&st, a).total_cmp(&slot_heat(&st, b)));
+            // The hottest candidate against the coldest slot, then the next pair: the gains only
+            // fall from there, so the first pair short of the margin ends it.
             let mut pairs = Vec::new();
             for (&expert, &victim) in hot.iter().zip(&victims).take(most) {
-                if st.heat[expert as usize] <= slot_heat(&st, victim) {
+                if st.heat[expert as usize] < slot_heat(&st, victim) + ADAPT_MARGIN {
                     break;
                 }
                 let old = st.owner[victim];
@@ -1943,6 +2078,7 @@ impl LayerTier {
                             st.owner[slot] = expert as i32;
                             st.set_slot(expert, slot as i32);
                             tier.promotions.fetch_add(1, Ordering::Relaxed);
+                            graph::note_promotion();
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -2944,6 +3080,87 @@ mod tests {
         let (routed, hits, promoted) = tier.counters();
         assert!(promoted > 0, "the hot experts were never copied in");
         assert!(hits > 0 && hits < routed, "{hits} of {routed} on the card");
+        drop(worker);
+    }
+
+    /// The rows of a draft verify as the kernels of the recorded decode, with a transit room
+    /// taking a share of each request's missing experts and the card running them after its
+    /// wait, give what the host's expert loop gives each row.
+    #[test]
+    fn the_rows_of_a_verify_through_the_recorded_decode_and_the_transit_room_match_the_host() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
+        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
+        let mut tiered = layer(&card, experts, used, hidden, ffn);
+        let widest = [0, 1, 2].map(|i| {
+            [
+                tiered.gate_exps_sep.as_ref().unwrap(),
+                tiered.up_exps_sep.as_ref().unwrap(),
+                &tiered.down_exps,
+            ][i]
+                .native_qtensor()
+                .data()
+                .len()
+        });
+        let stager = CardStager::new(&card, widest, experts).unwrap();
+        let built = LayerTier::new(&tiered, &card, 6)
+            .unwrap()
+            .with_stage(&stager, 0, false)
+            .unwrap();
+        tiered.tier = Some(Arc::new(built));
+        let tier = tiered.tier.clone().unwrap();
+        tier.enable_graph(hidden, used, 6).unwrap();
+        let worker = TierWorker::start(&card, vec![tier.clone()]).unwrap();
+        GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
+        let _order = crate::tensor::quantized::DecodeOrder::enter();
+        for round in 0..48usize {
+            let rows = 1 + round % 6;
+            let x = values(rows * hidden, 100 + (round % 4) as u64, 1.0);
+            let on_host = Tensor::from_vec(x.clone(), (1, rows, hidden), &Device::Cpu).unwrap();
+            let on_card = Tensor::from_vec(x, (1, rows, hidden), &card).unwrap();
+            let want = reference
+                .forward_rows(&on_host, &on_host, hidden, 1e-5)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let got = tiered
+                .forward_rows(&on_card, &on_card, hidden, 1e-5)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            tier.settle();
+            for r in 0..rows {
+                let (w, g) = (
+                    &want[r * hidden..(r + 1) * hidden],
+                    &got[r * hidden..(r + 1) * hidden],
+                );
+                let peak = w.iter().map(|v| v.abs()).fold(0f32, f32::max);
+                let worst = g
+                    .iter()
+                    .zip(w)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    worst <= 2e-2 * peak,
+                    "round {round}, row {r} of {rows}: max diff {worst} of {peak}"
+                );
+            }
+        }
+        GRAPH_WITHOUT_CAPTURE.store(false, Ordering::Relaxed);
+        let (routed, hits, _) = tier.counters();
+        assert!(hits > 0 && hits < routed, "{hits} of {routed} on the card");
+        assert!(
+            tier.uploaded.load(Ordering::Relaxed) > 0,
+            "no missing expert went through the transit room"
+        );
         drop(worker);
     }
 

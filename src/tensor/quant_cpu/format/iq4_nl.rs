@@ -91,6 +91,34 @@ impl BlockFormat for BlockIq4Nl {
             .sum()
     }
 
+    /// [`Self::dot`] over several activations, each block's weights read from the table once.
+    #[allow(unreachable_code)]
+    fn dot_many(xs: &[Self], ys: &[&[Self::ActivationBlock]], out: &mut [f32]) {
+        #[cfg(target_feature = "avx2")]
+        return unsafe {
+            for (ys, out) in ys
+                .chunks(super::iq_read::MANY)
+                .zip(out.chunks_mut(super::iq_read::MANY))
+            {
+                let mut totals = [0f32; super::iq_read::MANY];
+                for (bi, x) in xs.iter().enumerate() {
+                    let (w, magnitude) = super::iq_read::iq4_run_weights(&x.qs);
+                    let d = x.d.to_f32();
+                    for (total, y) in totals.iter_mut().zip(ys) {
+                        let y = &y[bi];
+                        *total += super::iq_read::iq4_run_dot(w, magnitude, &y.qs) as f32
+                            * d
+                            * y.d.to_f32();
+                    }
+                }
+                out.copy_from_slice(&totals[..out.len()]);
+            }
+        };
+        for (o, y) in out.iter_mut().zip(ys) {
+            *o = Self::dot(xs, y);
+        }
+    }
+
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
         const HALF: usize = QK4_NL / 2;
         xs.iter()

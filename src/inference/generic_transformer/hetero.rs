@@ -1311,6 +1311,61 @@ impl GenericHeteroTransformer {
         crate::inference::place::Placement { cards, host_layers }
     }
 
+    /// The routing counts of every layer since the load, zero for a layer without an expert
+    /// cache; `None` when no layer has one.
+    #[cfg(feature = "cuda")]
+    pub fn expert_profile(&self) -> Option<super::expert_profile::ExpertProfile> {
+        let experts = self.layers.iter().find_map(|l| {
+            l.moe
+                .as_ref()?
+                .tier
+                .as_ref()
+                .map(|t| t.routing_counts().len())
+        })?;
+        let mut counts = Vec::with_capacity(self.layers.len() * experts);
+        for layer in &self.layers {
+            match layer.moe.as_ref().and_then(|m| m.tier.as_ref()) {
+                Some(tier) => counts.extend(tier.routing_counts()),
+                None => counts.extend(std::iter::repeat_n(0u32, experts)),
+            }
+        }
+        Some(super::expert_profile::ExpertProfile {
+            layers: self.layers.len(),
+            experts,
+            counts,
+        })
+    }
+
+    /// Fill every layer's expert cache from `profile`: how many experts were copied. A profile
+    /// of another shape is refused, naming both shapes.
+    #[cfg(feature = "cuda")]
+    pub fn prime_expert_caches(
+        &self,
+        profile: &super::expert_profile::ExpertProfile,
+    ) -> crate::tensor::Result<usize> {
+        let experts = self
+            .layers
+            .iter()
+            .find_map(|l| l.moe.as_ref()?.tier.as_ref())
+            .map(|t| t.n_experts());
+        if profile.layers != self.layers.len() || experts.is_some_and(|n| n != profile.experts) {
+            crate::tensor::bail!(
+                "the profile counts {} layers of {} experts, the model has {} layers of {} experts",
+                profile.layers,
+                profile.experts,
+                self.layers.len(),
+                experts.unwrap_or(0)
+            );
+        }
+        let mut copied = 0;
+        for (l, layer) in self.layers.iter().enumerate() {
+            if let Some(tier) = layer.moe.as_ref().and_then(|m| m.tier.as_ref()) {
+                copied += tier.prime(profile.layer(l))?;
+            }
+        }
+        Ok(copied)
+    }
+
     /// Routed experts looked up in the layers' expert caches since the load, and how many of
     /// them a card held; `None` when no layer has such a cache.
     pub fn expert_cache_counters(&self) -> Option<(u64, u64)> {

@@ -71,6 +71,16 @@ impl BlockFormat for BlockQ2_0 {
         Self::dot_scalar(xs, ys)
     }
 
+    /// [`Self::dot`] over several activations, each block's codes unpacked once.
+    #[allow(unreachable_code)]
+    fn dot_many(xs: &[Self], ys: &[&[Self::ActivationBlock]], out: &mut [f32]) {
+        #[cfg(target_feature = "avx2")]
+        return unsafe { dot_blocks_many(xs, ys, out) };
+        for (o, y) in out.iter_mut().zip(ys) {
+            *o = Self::dot(xs, y);
+        }
+    }
+
     /// The two halves of the activation block carry a scale each, as the card's do: each half's
     /// integer dot is scaled on its own and joins the total in turn.
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
@@ -140,6 +150,71 @@ unsafe fn dot_blocks(xs: &[BlockQ2_0], ys: &[BlockQ8_64]) -> f32 {
         }
     }
     total
+}
+
+/// The four planes of a block's codes interleaved back into the activation's order, sixteen codes
+/// to a group.
+#[cfg(target_feature = "avx2")]
+#[inline]
+unsafe fn unpack_codes(x: &BlockQ2_0) -> [std::arch::x86_64::__m128i; 4] {
+    use std::arch::x86_64::*;
+    let mask = _mm_set1_epi8(3);
+    let bytes = _mm_loadu_si128(x.qs.as_ptr() as *const __m128i);
+    let plane0 = _mm_and_si128(bytes, mask);
+    let plane1 = _mm_and_si128(_mm_srli_epi16(bytes, 2), mask);
+    let plane2 = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+    let plane3 = _mm_and_si128(_mm_srli_epi16(bytes, 6), mask);
+    let low01 = _mm_unpacklo_epi8(plane0, plane1);
+    let high01 = _mm_unpackhi_epi8(plane0, plane1);
+    let low23 = _mm_unpacklo_epi8(plane2, plane3);
+    let high23 = _mm_unpackhi_epi8(plane2, plane3);
+    [
+        _mm_unpacklo_epi16(low01, low23),
+        _mm_unpackhi_epi16(low01, low23),
+        _mm_unpacklo_epi16(high01, high23),
+        _mm_unpackhi_epi16(high01, high23),
+    ]
+}
+
+/// [`dot_blocks`] over several activations: each block's codes are unpacked once and dotted
+/// against every activation in the arithmetic of [`dot_blocks`].
+#[cfg(target_feature = "avx2")]
+unsafe fn dot_blocks_many(xs: &[BlockQ2_0], ys: &[&[BlockQ8_64]], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    const MANY: usize = 8;
+    let ones8 = _mm_set1_epi8(1);
+    let ones16 = _mm_set1_epi16(1);
+    let horizontal = |v: __m128i| {
+        let v = _mm_hadd_epi32(v, v);
+        _mm_cvtsi128_si32(_mm_hadd_epi32(v, v))
+    };
+    for (ys, out) in ys.chunks(MANY).zip(out.chunks_mut(MANY)) {
+        let mut totals = [0f32; MANY];
+        for (bi, x) in xs.iter().enumerate() {
+            let codes = unpack_codes(x);
+            let d = x.d.to_f32();
+            for h in 0..2 {
+                for (total, y) in totals.iter_mut().zip(ys) {
+                    let y = &y[bi];
+                    let acts = y.qs.as_ptr() as *const __m128i;
+                    let mut sum = _mm_setzero_si128();
+                    let mut act_sum = _mm_setzero_si128();
+                    for (i, code) in codes[2 * h..2 * h + 2].iter().enumerate() {
+                        let a = _mm_loadu_si128(acts.add(2 * h + i));
+                        sum =
+                            _mm_add_epi32(sum, _mm_madd_epi16(_mm_maddubs_epi16(*code, a), ones16));
+                        act_sum = _mm_add_epi32(
+                            act_sum,
+                            _mm_madd_epi16(_mm_maddubs_epi16(ones8, a), ones16),
+                        );
+                    }
+                    let dot = horizontal(sum) - horizontal(act_sum);
+                    *total += dot as f32 * d * y.d[h].to_f32();
+                }
+            }
+        }
+        out.copy_from_slice(&totals[..out.len()]);
+    }
 }
 
 #[cfg(test)]

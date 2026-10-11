@@ -168,15 +168,21 @@ page-locked slabs while the dense work of the current layer runs.
 
 ### Expert cache of a mixture held in the file's mapping
 
-No key. A mixture too large for the cards keeps its routed experts in the file's mapping, and
-the cache on each layer's card is sized by the load:
+A mixture too large for the cards keeps its routed experts in the file's mapping, and the cache
+on each layer's card is sized by the load. Two keys carry what a run learned to the next one:
+
+| Key | Default | What it does |
+|---|---|---|
+| `expert_profile` | none | A routing profile written by `expert_profile_save`; at the load it fills the slots the prefill does not borrow with the most routed experts, and gives every expert the heat its count earns. |
+| `expert_profile_save` | none | Where the routing counts of the decodes are written after each request. |
+
 
 | Quantity | Derived from |
 |---|---|
 | Experts a layer's cache holds | The budget the plan gave the card, less what the load took of it, the room for copies and the working memory of a chunk, divided by the bytes of one more expert in every layer the card holds. When the budget covers every expert of every layer, they are all on the card and the layers run as loaded ones, with no cache |
 | Which card holds which layers | Cards on equal links are cut in proportion to their room beside the output head. On unequal links, read from the driver as the generation and width of each card's PCIe link, the slower card holds the layers it can hold whole, every expert on the card, and the card on the fastest link takes the rest |
 | Where a missing expert runs | On the card, copied into a transit room and run with the cached ones, or on the host. The split is the one at which both finish together, from the time a copy and a host computation have each taken on the layer. A transited expert hotter than the coldest slot not in use stays in that slot |
-| Which expert a slot holds | Counts of each expert's use, halved every `n_experts` tokens through a layer, so the cache follows the text in hand. A missing expert replaces the coldest slot not in use only when its count is higher |
+| Which expert a slot holds | Counts of each expert's use, scaled down every few tens of tokens through a layer, so the cache follows the text in hand. A missing expert replaces the coldest slot not in use only when its count is higher by a margin |
 | Bytes page-locked for copies to the cards | Three quarters of the memory the kernel still has free, within the cap of the process's control group |
 | A wide batch streams a layer's experts | Only when copying what the card does not hold, at the host-to-card rate measured, takes less than running the rows through the cache at the pace tokens have decoded |
 | Host memory admitted for a spill | The bytes the process owns; pages viewed in place from the mapping are not counted, and the log gives the bytes read from the mapping with a warning when they exceed the host's memory |

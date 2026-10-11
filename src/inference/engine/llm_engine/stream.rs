@@ -2541,6 +2541,17 @@ impl LlmEngine {
                     100.0 * b.1.saturating_sub(a.1) as f64 / routed.max(1) as f64
                 );
             }
+            if let Some(path) = config.expert_profile_save.as_deref() {
+                let profile = model_state
+                    .blocking_lock()
+                    .as_ref()
+                    .and_then(|s| s.model.expert_profile());
+                if let Some(profile) = profile {
+                    if let Err(e) = profile.write(std::path::Path::new(path)) {
+                        warn!("expert profile not saved: {e}");
+                    }
+                }
+            }
             if head_capable {
                 if let Some(s) = model_state.blocking_lock().as_mut() {
                     s.model.draft_head_capture(false);

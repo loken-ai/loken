@@ -117,6 +117,51 @@ impl BlockFormat for BlockIq3S {
         super::iq_read::dot_runs(xs, ys)
     }
 
+    /// [`Self::dot`] over several activations, each run's magnitudes, signs and scale decoded
+    /// once.
+    #[allow(unreachable_code)]
+    fn dot_many(xs: &[Self], ys: &[&[Self::ActivationBlock]], out: &mut [f32]) {
+        #[cfg(target_feature = "avx2")]
+        return unsafe {
+            use std::arch::x86_64::*;
+            super::iq_read::dot_many_runs(
+                xs,
+                ys,
+                out,
+                |x: &Self, ib| {
+                    let codes = u64::from_le_bytes(x.qs[8 * ib..8 * ib + 8].try_into().unwrap());
+                    let high = x.qh[ib] as u32;
+                    let grid = |l: u32| {
+                        IQ3S_GRID[(((codes >> (8 * l)) as u32 & 0xFF) | (((high >> l) & 1) << 8))
+                            as usize] as i32
+                    };
+                    let pair = |l: u32| (grid(l + 1) as u32 as i64) << 32 | grid(l) as u32 as i64;
+                    let mags = _mm256_set_m128i(
+                        _mm_set_epi64x(pair(6), pair(4)),
+                        _mm_set_epi64x(pair(2), pair(0)),
+                    );
+                    let signs = u32::from_le_bytes(x.signs[4 * ib..4 * ib + 4].try_into().unwrap());
+                    let nibble = if ib % 2 == 0 {
+                        x.scales[ib / 2] & 0x0F
+                    } else {
+                        x.scales[ib / 2] >> 4
+                    };
+                    let scale = _mm256_set1_epi16(2 * nibble as i16 + 1);
+                    (
+                        (mags, super::iq_read::run_negate(signs), scale),
+                        x.d.to_f32(),
+                    )
+                },
+                |(mags, negate, scale), acts| {
+                    _mm256_madd_epi16(super::iq_read::run_pairs(mags, negate, acts), scale)
+                },
+            )
+        };
+        for (o, y) in out.iter_mut().zip(ys) {
+            *o = Self::dot(xs, y);
+        }
+    }
+
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
         super::iq_read::dot_by_decoding(xs, ys)
     }

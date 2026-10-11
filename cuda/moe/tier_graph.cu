@@ -72,7 +72,12 @@ extern "C" __global__ void loken_tier_plan_kernel(
         mail_weights[t] = weights[t];
         mail_slots[t] = s >= 0 ? (unsigned int) s : 0xFFFFFFFFu;
     }
-    for (int i = t; i < rows * hidden; i += blockDim.x) mail_x[i] = x[i];
+    // The rows cross the bus to the host's memory: four floats a store, a whole line a warp.
+    const int quads = (rows * hidden) / 4;
+    const float4 * x4 = (const float4 *) x;
+    float4 * mail4 = (float4 *) mail_x;
+    for (int i = t; i < quads; i += blockDim.x) mail4[i] = x4[i];
+    for (int i = 4 * quads + t; i < rows * hidden; i += blockDim.x) mail_x[i] = x[i];
     __syncthreads();
     __threadfence_system();
     if (t == 0) *mail_request = seq;
@@ -94,12 +99,16 @@ extern "C" __global__ void loken_tier_wait_kernel(
 
 extern "C" __global__ void loken_tier_merge_kernel(
         const float * __restrict__ card,
+        const float * __restrict__ late,
         const volatile float * product,
         const unsigned int * __restrict__ counter,
         float * __restrict__ out,
         int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = counter[1] != 0u ? card[i] + product[i] : card[i];
+    if (i < n) {
+        const float sum = late != nullptr ? card[i] + late[i] : card[i];
+        out[i] = counter[1] != 0u ? sum + product[i] : sum;
+    }
 }
 
 extern "C" void loken_tier_plan(
@@ -120,9 +129,9 @@ extern "C" void loken_tier_wait(
 }
 
 extern "C" void loken_tier_merge(
-        const float * card, const float * product, const unsigned int * counter, float * out, int n,
-        cudaStream_t stream) {
+        const float * card, const float * late, const float * product, const unsigned int * counter,
+        float * out, int n, cudaStream_t stream) {
     const int threads = 256;
     loken_tier_merge_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
-        card, product, counter, out, n);
+        card, late, product, counter, out, n);
 }

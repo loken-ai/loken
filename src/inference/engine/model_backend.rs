@@ -564,6 +564,21 @@ pub(crate) trait ModelBackend: Send {
         None
     }
 
+    /// The routing counts of the layers' expert caches since the load, when the model has them.
+    fn expert_profile(
+        &self,
+    ) -> Option<crate::inference::generic_transformer::expert_profile::ExpertProfile> {
+        None
+    }
+
+    /// Fill the expert caches from `profile` before any prompt: how many experts were copied.
+    fn prime_expert_caches(
+        &mut self,
+        _profile: &crate::inference::generic_transformer::expert_profile::ExpertProfile,
+    ) -> crate::tensor::Result<usize> {
+        Ok(0)
+    }
+
     /// Where the model's layers run, when the backend can say.
     fn placement(&self) -> Option<crate::inference::place::Placement> {
         None
@@ -1723,6 +1738,21 @@ impl ModelBackend for GenericBackend {
 
     fn expert_cache_counters(&self) -> Option<(u64, u64)> {
         self.0.expert_cache_counters()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn expert_profile(
+        &self,
+    ) -> Option<crate::inference::generic_transformer::expert_profile::ExpertProfile> {
+        self.0.expert_profile()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn prime_expert_caches(
+        &mut self,
+        profile: &crate::inference::generic_transformer::expert_profile::ExpertProfile,
+    ) -> crate::tensor::Result<usize> {
+        self.0.prime_expert_caches(profile)
     }
 
     fn placement(&self) -> Option<crate::inference::place::Placement> {

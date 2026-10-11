@@ -58,6 +58,27 @@ pub(super) unsafe fn grid_run_pairs(
     signs: u32,
     acts: &[i8],
 ) -> std::arch::x86_64::__m256i {
+    run_pairs(mags, run_negate(signs), acts)
+}
+
+/// [`grid_run_pairs`] with the signs already spread: `negate` holds -1 where a byte of the run
+/// is negated and +1 elsewhere.
+#[cfg(target_feature = "avx2")]
+#[inline]
+pub(super) unsafe fn run_pairs(
+    mags: std::arch::x86_64::__m256i,
+    negate: std::arch::x86_64::__m256i,
+    acts: &[i8],
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let a = _mm256_loadu_si256(acts.as_ptr() as *const __m256i);
+    _mm256_maddubs_epi16(mags, _mm256_sign_epi8(a, negate))
+}
+
+/// The thirty-two sign bits of a run as bytes of -1 (bit set) and +1.
+#[cfg(target_feature = "avx2")]
+#[inline]
+pub(super) unsafe fn run_negate(signs: u32) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::*;
     let spread = _mm256_shuffle_epi8(
         _mm256_set1_epi32(signs as i32),
@@ -71,12 +92,50 @@ pub(super) unsafe fn grid_run_pairs(
         1, 2, 4, 8, 16, 32, 64, -128,
     );
     // 0xFF where the bit is set, which with a one ORed in is -1, and +1 elsewhere.
-    let negate = _mm256_or_si256(
+    _mm256_or_si256(
         _mm256_cmpeq_epi8(_mm256_and_si256(spread, bit), bit),
         _mm256_set1_epi8(1),
-    );
-    let a = _mm256_loadu_si256(acts.as_ptr() as *const __m256i);
-    _mm256_maddubs_epi16(mags, _mm256_sign_epi8(a, negate))
+    )
+}
+
+/// The most activations a run's decoded weights are dotted against at once: what the
+/// accumulators of a window fit in registers.
+pub(super) const MANY: usize = 8;
+
+/// `out[t] = sum(xs . ys[t])` for a format read in runs, each block's runs decoded once by
+/// `decode` into what `dot_run` dots against every activation: `(block index, run) -> run`,
+/// and `(run, activation codes) -> the run's integer pairs` under the run's scale, which the
+/// activation's scale then takes. Each `out[t]` is [`Runs`]'s `dot(xs, ys[t])` to the bit.
+#[cfg(target_feature = "avx2")]
+#[inline]
+pub(super) unsafe fn dot_many_runs<B: BlockFormat<ActivationBlock = BlockQ8K32>, R: Copy>(
+    xs: &[B],
+    ys: &[&[BlockQ8K32]],
+    out: &mut [f32],
+    decode: impl Fn(&B, usize) -> (R, f32),
+    dot_run: impl Fn(R, &[i8]) -> std::arch::x86_64::__m256i,
+) {
+    use std::arch::x86_64::*;
+    for (ys, out) in ys.chunks(MANY).zip(out.chunks_mut(MANY)) {
+        let nt = ys.len();
+        let mut totals = [_mm256_setzero_ps(); MANY];
+        for (bi, x) in xs.iter().enumerate() {
+            for ib in 0..QK_K / 32 {
+                let (run, scale) = decode(x, ib);
+                for (t, y) in ys.iter().enumerate().take(nt) {
+                    let y = &y[bi];
+                    totals[t] = _mm256_fmadd_ps(
+                        _mm256_cvtepi32_ps(dot_run(run, &y.qs[32 * ib..])),
+                        _mm256_set1_ps(scale * y.d[ib].to_f32()),
+                        totals[t],
+                    );
+                }
+            }
+        }
+        for (o, total) in out.iter_mut().zip(totals) {
+            *o = sum_ps(total);
+        }
+    }
 }
 
 /// Sum of the eight float lanes.
@@ -89,27 +148,50 @@ pub(super) unsafe fn sum_ps(v: std::arch::x86_64::__m256) -> f32 {
     _mm_cvtss_f32(_mm_add_ss(quad, _mm_shuffle_ps(quad, quad, 1)))
 }
 
+/// Thirty-two codes of the non-linear table, packed as iq4_nl packs them (byte `j` holds value
+/// `j` low and value `j + 16` high), as the signed weights and their magnitudes.
+#[cfg(target_feature = "avx2")]
+#[inline]
+pub(super) unsafe fn iq4_run_weights(
+    packed: &[u8; 16],
+) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
+    use std::arch::x86_64::*;
+    let table = _mm_loadu_si128(super::iq4_nl::LEVELS.as_ptr() as *const __m128i);
+    let bytes = _mm_loadu_si128(packed.as_ptr() as *const __m128i);
+    let mask = _mm_set1_epi8(0x0F);
+    let low = _mm_shuffle_epi8(table, _mm_and_si128(bytes, mask));
+    let high = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(bytes, 4), mask));
+    let w = _mm256_set_m128i(high, low);
+    (w, _mm256_sign_epi8(w, w))
+}
+
+/// The dot of a run's decoded weights (`w`, with their magnitudes) against thirty-two activation
+/// codes.
+#[cfg(target_feature = "avx2")]
+#[inline]
+pub(super) unsafe fn iq4_run_dot(
+    w: std::arch::x86_64::__m256i,
+    magnitude: std::arch::x86_64::__m256i,
+    acts: &[i8],
+) -> i32 {
+    use std::arch::x86_64::*;
+    let a = _mm256_loadu_si256(acts.as_ptr() as *const __m256i);
+    // Unsigned times signed: the weights' magnitudes against the activations carrying their sign.
+    let signed = _mm256_sign_epi8(a, w);
+    let pairs = _mm256_maddubs_epi16(magnitude, signed);
+    let sums = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
+    let lanes: [i32; 8] = std::mem::transmute(sums);
+    lanes.iter().sum()
+}
+
 /// The dot of thirty-two codes of the non-linear table, packed as iq4_nl packs them (byte `j` holds
 /// value `j` low and value `j + 16` high), against thirty-two activation codes.
 #[inline]
 pub(super) fn dot_iq4_run(packed: &[u8; 16], acts: &[i8]) -> i32 {
     #[cfg(target_feature = "avx2")]
     unsafe {
-        use std::arch::x86_64::*;
-        let table = _mm_loadu_si128(super::iq4_nl::LEVELS.as_ptr() as *const __m128i);
-        let bytes = _mm_loadu_si128(packed.as_ptr() as *const __m128i);
-        let mask = _mm_set1_epi8(0x0F);
-        let low = _mm_shuffle_epi8(table, _mm_and_si128(bytes, mask));
-        let high = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(bytes, 4), mask));
-        let w = _mm256_set_m128i(high, low);
-        let a = _mm256_loadu_si256(acts.as_ptr() as *const __m256i);
-        // Unsigned times signed: the weights' magnitudes against the activations carrying their sign.
-        let magnitude = _mm256_sign_epi8(w, w);
-        let signed = _mm256_sign_epi8(a, w);
-        let pairs = _mm256_maddubs_epi16(magnitude, signed);
-        let sums = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
-        let lanes: [i32; 8] = std::mem::transmute(sums);
-        return lanes.iter().sum();
+        let (w, magnitude) = iq4_run_weights(packed);
+        return iq4_run_dot(w, magnitude, acts);
     }
     #[allow(unreachable_code)]
     {

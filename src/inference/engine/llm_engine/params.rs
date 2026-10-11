@@ -177,6 +177,10 @@ pub struct InferenceConfig {
     /// Whether drafts are verified in recorded windows, the model's draft head guessing where
     /// they are.
     pub recorded_drafts: bool,
+    /// A routing profile that fills the expert caches at the load, before any prompt.
+    pub expert_profile: Option<String>,
+    /// Where the routing counts of the run's decodes are written after each request.
+    pub expert_profile_save: Option<String>,
     /// Bytes the disk tier may hold, in GiB; 0 for no limit. Least recently used
     /// sequences go first.
     pub kv_disk_budget_gb: f64,
@@ -256,6 +260,8 @@ impl Default for InferenceConfig {
             replicas: 1,
             kv_disk_dir: None,
             recorded_drafts: false,
+            expert_profile: None,
+            expert_profile_save: None,
             kv_disk_budget_gb: 0.0,
             state_cache_dir: None,
             state_cache_budget_gb: 0.0,

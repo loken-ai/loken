@@ -98,6 +98,11 @@ pub(super) struct Mailbox {
     slots: usize,
     x: usize,
     product: usize,
+    /// The late pairs: each one's index among the request's pairs, its expert's place in the
+    /// transit room, and its weight.
+    late_pairs: usize,
+    late_experts: usize,
+    late_weights: usize,
 }
 
 unsafe impl Send for Mailbox {}
@@ -109,7 +114,10 @@ const REQUEST: usize = 0;
 const REPLY: usize = 64;
 const ABORT: usize = 128;
 const ROWS: usize = 192;
-const BODY: usize = 256;
+/// The number of late pairs: routed pairs whose expert the host copied into the transit room
+/// for this request, which the card computes from there once the host has answered.
+const LIVE: usize = 256;
+const BODY: usize = 320;
 
 fn line(bytes: usize) -> usize {
     bytes.div_ceil(64) * 64
@@ -134,7 +142,10 @@ impl Mailbox {
         let slots = weights + line(4 * pairs);
         let x = slots + line(4 * pairs);
         let product = x + line(4 * hidden * rows_max);
-        let (host, device) = mapped(dev, product + line(4 * hidden * rows_max))?;
+        let late_pairs = product + line(4 * hidden * rows_max);
+        let late_experts = late_pairs + line(4 * pairs);
+        let late_weights = late_experts + line(4 * pairs);
+        let (host, device) = mapped(dev, late_weights + line(4 * pairs))?;
         Ok(Self {
             host,
             device,
@@ -146,6 +157,9 @@ impl Mailbox {
             slots,
             x,
             product,
+            late_pairs,
+            late_experts,
+            late_weights,
         })
     }
 
@@ -213,6 +227,24 @@ impl Mailbox {
         unsafe { std::ptr::write_volatile(self.word(REPLY), seq) };
     }
 
+    /// The late pairs of the request being answered, before its answer: `(pair, place, weight)`
+    /// each, the place being the expert's in the transit room. The kernels read the pairs and
+    /// their places in the order given, and a pair's weight at the pair's own index.
+    pub(super) fn hand_late(&self, late: &[(u32, u32, f32)]) {
+        debug_assert!(late.len() <= self.rows_max * self.k);
+        unsafe {
+            let pairs = self.host.add(self.late_pairs) as *mut u32;
+            let experts = self.host.add(self.late_experts) as *mut u32;
+            let weights = self.host.add(self.late_weights) as *mut f32;
+            for (i, &(pair, place, weight)) in late.iter().enumerate() {
+                pairs.add(i).write(pair);
+                experts.add(i).write(place);
+                weights.add(pair as usize).write(weight);
+            }
+            std::ptr::write_volatile(self.word(LIVE), late.len() as u32);
+        }
+    }
+
     /// Raise the reply word to `seq`, for a request that needs no product.
     pub(super) fn raise(&self, seq: u32) {
         std::sync::atomic::fence(Ordering::Release);
@@ -247,6 +279,15 @@ struct WorkerStats {
     prep_ns: std::sync::atomic::AtomicU64,
     gate_up_ns: std::sync::atomic::AtomicU64,
     down_ns: std::sync::atomic::AtomicU64,
+    /// Experts copied into a slot.
+    promotions: std::sync::atomic::AtomicU64,
+    /// Missing experts the transit room took.
+    transit: std::sync::atomic::AtomicU64,
+}
+
+/// One more expert landed in a slot of some layer.
+pub(super) fn note_promotion() {
+    WORKER.promotions.fetch_add(1, Ordering::Relaxed);
 }
 
 static WORKER: WorkerStats = WorkerStats {
@@ -258,12 +299,17 @@ static WORKER: WorkerStats = WorkerStats {
     prep_ns: std::sync::atomic::AtomicU64::new(0),
     gate_up_ns: std::sync::atomic::AtomicU64::new(0),
     down_ns: std::sync::atomic::AtomicU64::new(0),
+    promotions: std::sync::atomic::AtomicU64::new(0),
+    transit: std::sync::atomic::AtomicU64::new(0),
 };
 
 /// A layer's decoded rows between the post of their request and the wait for the answer.
 pub(crate) struct GraphPending {
     card: Tensor,
+    /// The rows' input, which the late experts read.
+    x: Tensor,
     rows: usize,
+    k: usize,
     hidden: usize,
     dev: Device,
 }
@@ -277,6 +323,9 @@ pub(super) struct GraphSide {
     weights: Tensor,
     rows_max: usize,
     done: AtomicU32,
+    /// Around the copies of a request's late experts into the transit room.
+    upload_start: cudarc::driver::CudaEvent,
+    upload_end: cudarc::driver::CudaEvent,
 }
 
 impl LayerTier {
@@ -335,6 +384,8 @@ impl LayerTier {
             weights: Tensor::from_vec(vec![0f32; pairs], (1, pairs), &host)?.to_device(dev)?,
             rows_max,
             done: AtomicU32::new(0),
+            upload_start: super::timed_event(dev)?,
+            upload_end: super::timed_event(dev)?,
         };
         let _ = self.graph.set(side);
         Ok(())
@@ -469,7 +520,9 @@ impl LayerTier {
         drop(extra);
         Ok(GraphPending {
             card,
+            x,
             rows,
+            k,
             hidden,
             dev,
         })
@@ -481,7 +534,9 @@ impl LayerTier {
         let g = self.graph.get().expect("a graph layer is enabled");
         let GraphPending {
             card,
+            x,
             rows,
+            k,
             hidden,
             dev,
         } = pending;
@@ -495,9 +550,43 @@ impl LayerTier {
                 g.mail.dptr(ABORT) as *mut u32,
                 stream,
             );
+        }
+        // The late pairs, from the transit room the host filled while the card waited: the
+        // launches run the count the host wrote, nothing when it wrote none.
+        let late = match self.transit_stacks() {
+            Some(stacks) => {
+                let h = moe_cuda::moe_gemm_gguf_gate_up_silu_mul_live(
+                    &x,
+                    &stacks[0],
+                    &stacks[1],
+                    g.mail.dptr(g.mail.late_pairs),
+                    g.mail.dptr(g.mail.late_experts),
+                    g.mail.dptr(LIVE),
+                    rows * k,
+                    k,
+                )?;
+                Some(moe_cuda::moe_gemm_gguf_down_reduce_live(
+                    &h,
+                    &stacks[2],
+                    g.mail.dptr(g.mail.late_pairs),
+                    g.mail.dptr(g.mail.late_experts),
+                    g.mail.dptr(g.mail.late_weights),
+                    g.mail.dptr(LIVE),
+                    k,
+                    rows,
+                )?)
+            }
+            None => None,
+        };
+        unsafe {
             use cudarc::driver::DevicePtr;
+            let late_ptr = match &late {
+                Some(t) => address_of::<f32>(t)? as *const f32,
+                None => std::ptr::null(),
+            };
             moe_cuda::tier_graph::merge(
                 address_of::<f32>(&card)? as *const f32,
+                late_ptr,
                 g.mail.dptr(g.mail.product) as *const f32,
                 address_of::<u32>(&g.counter)? as *const u32,
                 out.device_ptr(out.stream()).0 as *mut f32,
@@ -585,6 +674,7 @@ impl LayerTier {
             for i in 0..pairs {
                 let e = req.ids[i] as usize;
                 st.heat[e] += 1.0;
+                st.counts[e] += 1;
                 if req.slots[i] == u32::MAX {
                     if !missing.contains(&req.ids[i]) {
                         missing.push(req.ids[i]);
@@ -599,26 +689,54 @@ impl LayerTier {
             } else if !in_use.is_empty() {
                 in_use[0] = true;
             }
-            st.since_decay += req.rows;
-            if st.since_decay >= self.n_experts {
-                st.since_decay = 0;
-                st.heat.iter_mut().for_each(|h| *h *= 0.5);
-            }
+            st.tokens_routed(req.rows);
         }
         self.routed.fetch_add(pairs as u64, Ordering::Relaxed);
         self.hits
             .fetch_add((pairs - miss_pairs.len()) as u64, Ordering::Relaxed);
         laps.mark("tier worker: bookkeeping");
-        // The card waits for the product only when an expert was missing.
+        // The card waits for the product only when an expert was missing. Of the missing
+        // experts, a share goes to the transit room by copy while the host computes the rest:
+        // the card runs the copied ones once the answer says they landed.
         if miss_pairs.is_empty() {
+            g.mail.hand_late(&[]);
             g.mail.raise(req.seq);
         } else {
+            let to_transit = self.transit_share_of(missing.len());
+            let (transit, host_experts) = missing.split_at(to_transit);
+            if !transit.is_empty() {
+                self.copy_to_transit_between(&g.upload_start, &g.upload_end, transit)?;
+            }
+            let host_pairs: Vec<(usize, u32, f32)> = miss_pairs
+                .iter()
+                .copied()
+                .filter(|p| host_experts.contains(&p.1))
+                .collect();
+            let late: Vec<(u32, u32, f32)> = miss_pairs
+                .iter()
+                .enumerate()
+                .filter_map(|(_, &(row, e, w))| {
+                    let place = transit.iter().position(|&t| t == e)?;
+                    let pair = req
+                        .ids
+                        .iter()
+                        .enumerate()
+                        .position(|(i, &id)| i / k == row && id == e)?;
+                    Some((pair as u32, place as u32, w))
+                })
+                .collect();
             let t = std::time::Instant::now();
-            let product = self.host_product(&req.x, req.rows, &miss_pairs)?;
-            blend(
-                &self.host_us,
-                t.elapsed().as_secs_f64() * 1e6 / missing.len() as f64,
-            );
+            let product = if host_pairs.is_empty() {
+                vec![0f32; req.rows * req.x.len() / req.rows.max(1)]
+            } else {
+                self.host_product(&req.x, req.rows, &host_pairs)?
+            };
+            if !host_experts.is_empty() {
+                blend(
+                    &self.host_us,
+                    t.elapsed().as_secs_f64() * 1e6 / host_experts.len() as f64,
+                );
+            }
             laps.mark("tier worker: host product");
             WORKER
                 .product_ns
@@ -626,11 +744,24 @@ impl LayerTier {
             WORKER
                 .missing
                 .fetch_add(missing.len() as u64, Ordering::Relaxed);
+            if !transit.is_empty() {
+                g.upload_end
+                    .synchronize()
+                    .map_err(|e| crate::tensor::Error::msg(format!("transit copy: {e:?}")))?;
+                if let Ok(ms) = g.upload_start.elapsed_ms(&g.upload_end) {
+                    self.note_upload_us(ms as f64 * 1e3 / transit.len() as f64);
+                }
+                WORKER
+                    .transit
+                    .fetch_add(transit.len() as u64, Ordering::Relaxed);
+            }
+            laps.mark("tier worker: transit landed");
+            g.mail.hand_late(&late);
             g.mail.answer(&product, req.seq);
         }
         g.done.store(req.seq, Ordering::Relaxed);
         laps.mark("tier worker: answer");
-        self.promote_up_to(&missing, &in_use, req.rows);
+        self.promote_up_to(&missing, &in_use, super::ADAPT_SWAPS_A_REQUEST);
         laps.mark("tier worker: promote");
         // The leader says what a request costs the host, once per window of requests.
         let us = started.elapsed().as_nanos() as u64;
@@ -642,14 +773,16 @@ impl LayerTier {
         if n % 4096 == 0 {
             let missed = WORKER.missed.load(Ordering::Relaxed).max(1);
             tracing::info!(
-                "expert tier worker: {} us a request, {:.0}% had a missing expert: {:.1} missing, product {} us (ready {}, gate and up {}, down {})",
+                "expert tier worker: {} us a request, {:.0}% had a missing expert: {:.1} missing ({:.2} to transit), product {} us (ready {}, gate and up {}, down {}), {:.2} promotions a request",
                 total / n / 1000,
                 100.0 * missed as f64 / n as f64,
                 WORKER.missing.load(Ordering::Relaxed) as f64 / missed as f64,
+                WORKER.transit.load(Ordering::Relaxed) as f64 / missed as f64,
                 WORKER.product_ns.load(Ordering::Relaxed) / missed / 1000,
                 WORKER.prep_ns.load(Ordering::Relaxed) / missed / 1000,
                 WORKER.gate_up_ns.load(Ordering::Relaxed) / missed / 1000,
                 WORKER.down_ns.load(Ordering::Relaxed) / missed / 1000,
+                WORKER.promotions.load(Ordering::Relaxed) as f64 / n as f64,
             );
         }
         Ok(true)

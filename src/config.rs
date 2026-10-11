@@ -88,6 +88,14 @@ pub struct InferenceConfigToml {
     /// decodes plainly.
     #[serde(default)]
     pub recorded_drafts: bool,
+    /// A routing profile (`expert_profile_save` of an earlier run) that fills the expert
+    /// caches at the load, before any prompt has routed.
+    #[serde(default)]
+    pub expert_profile: Option<String>,
+    /// Where the routing counts of the run's decodes are written after each request, for a
+    /// later run's `expert_profile`.
+    #[serde(default)]
+    pub expert_profile_save: Option<String>,
     /// Directory of the on-disk cache of DeepSeek V4.1 decode states, which lets a prompt that
     /// begins with a prefix seen before skip prefilling it. Off unless set. The files hold
     /// state derived from prompts (KV tensors and hidden rows, no text), so they are as private
@@ -272,6 +280,8 @@ impl Config {
             replicas: toml_config.replicas.max(1),
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
             recorded_drafts: toml_config.recorded_drafts,
+            expert_profile: toml_config.expert_profile.clone(),
+            expert_profile_save: toml_config.expert_profile_save.clone(),
             kv_disk_budget_gb: toml_config.kv_disk_budget_gb,
             state_cache_dir: toml_config.state_cache_dir.clone(),
             state_cache_budget_gb: toml_config.state_cache_budget_gb,

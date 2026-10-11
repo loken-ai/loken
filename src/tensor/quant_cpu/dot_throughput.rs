@@ -111,6 +111,173 @@ mod tests {
         );
     }
 
+    /// [`measure_read`] over the cores together: the weights in one shard a thread, each thread
+    /// dotting its shard, for the thread counts a pool is sized to. What the DRAM and the cores
+    /// give the expert products a layer request runs.
+    fn measure_read_together<T: BlockFormat>(name: &str) {
+        let block_bytes = std::mem::size_of::<T>();
+        let blocks = WORKING_SET / block_bytes;
+        let n = blocks * T::BLOCK_LEN;
+        let mut weights = vec![T::zeros(); blocks];
+        let mut state = 0x9E37_79B9u32;
+        let raw = unsafe {
+            std::slice::from_raw_parts_mut(weights.as_mut_ptr() as *mut u8, blocks * block_bytes)
+        };
+        for (i, b) in raw.iter_mut().enumerate() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (state >> 24) as u8;
+            if i % block_bytes < 2 {
+                *b = if i % block_bytes == 0 { 0x00 } else { 0x2C };
+            }
+        }
+        let mut acts = vec![T::ActivationBlock::zeros(); n / T::ActivationBlock::BLOCK_LEN];
+        T::ActivationBlock::quantize(&signal(2, n), &mut acts);
+        let per_block = T::BLOCK_LEN / T::ActivationBlock::BLOCK_LEN;
+        let physical = num_cpus::get_physical().max(1);
+        let logical = num_cpus::get().max(1);
+        for threads in [1usize, 2, 3, 4, 6, 8, physical, logical] {
+            let shard = blocks.div_ceil(threads);
+            const PASSES: usize = 3;
+            let start = Instant::now();
+            let sink: f32 = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let lo = (t * shard).min(blocks);
+                        let hi = ((t + 1) * shard).min(blocks);
+                        let w = &weights[lo..hi];
+                        let a = &acts[lo * per_block..hi * per_block];
+                        scope.spawn(move || {
+                            let mut s = 0f32;
+                            for _ in 0..PASSES {
+                                let w = std::hint::black_box(w);
+                                let a = std::hint::black_box(a);
+                                s += std::hint::black_box(T::dot(w, a));
+                            }
+                            s
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).sum()
+            });
+            let secs = start.elapsed().as_secs_f64();
+            let bytes = (blocks * block_bytes * PASSES) as f64;
+            println!(
+                "{name:>7} x{threads:<2} {:>6.1} GB/s together (checksum {sink:.3e})",
+                bytes / secs / 1e9
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement: run explicitly with --release --ignored --nocapture"]
+    fn what_the_cores_reach_together() {
+        measure_read_together::<BlockIq2S>("iq2_s");
+        measure_read_together::<BlockQ8_0>("q8_0");
+        measure_read_together::<f32>("f32");
+    }
+
+    /// Random blocks of a read-only format and `n` activations quantised from signals.
+    fn read_only_rows<T: BlockFormat>(
+        blocks: usize,
+        acts: usize,
+    ) -> (Vec<T>, Vec<Vec<T::ActivationBlock>>) {
+        let block_bytes = std::mem::size_of::<T>();
+        let n = blocks * T::BLOCK_LEN;
+        let mut weights = vec![T::zeros(); blocks];
+        let mut state = 0x9E37_79B9u32;
+        let raw = unsafe {
+            std::slice::from_raw_parts_mut(weights.as_mut_ptr() as *mut u8, blocks * block_bytes)
+        };
+        for (i, b) in raw.iter_mut().enumerate() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (state >> 24) as u8;
+            if i % block_bytes < 2 {
+                *b = if i % block_bytes == 0 { 0x00 } else { 0x2C };
+            }
+        }
+        let ys = (0..acts)
+            .map(|t| {
+                let mut a = vec![T::ActivationBlock::zeros(); n / T::ActivationBlock::BLOCK_LEN];
+                T::ActivationBlock::quantize(&signal(3 + t as u32, n), &mut a);
+                a
+            })
+            .collect();
+        (weights, ys)
+    }
+
+    fn many_is_each<T: BlockFormat>(name: &str) {
+        for acts in [1usize, 2, 3, 8, 11] {
+            let (weights, ys) = read_only_rows::<T>(10, acts);
+            let refs: Vec<&[T::ActivationBlock]> = ys.iter().map(Vec::as_slice).collect();
+            let mut got = vec![0f32; acts];
+            T::dot_many(&weights, &refs, &mut got);
+            for (t, y) in ys.iter().enumerate() {
+                let want = T::dot(&weights, y);
+                assert_eq!(
+                    got[t].to_bits(),
+                    want.to_bits(),
+                    "{name}: activation {t} of {acts}"
+                );
+            }
+        }
+    }
+
+    /// Several activations over the same rows give, each, the dot of that activation alone,
+    /// to the bit, in every format the host decodes once for them.
+    #[test]
+    fn a_dot_over_several_activations_is_each_dot() {
+        many_is_each::<BlockIq2S>("iq2_s");
+        many_is_each::<BlockIq3Xxs>("iq3_xxs");
+        many_is_each::<BlockIq3S>("iq3_s");
+        many_is_each::<BlockIq4Xs>("iq4_xs");
+        many_is_each::<BlockIq4Nl>("iq4_nl");
+        many_is_each::<BlockQ2_0>("q2_0");
+    }
+
+    fn measure_many<T: BlockFormat>(name: &str) {
+        // An expert's gate rows: 512 rows of 2560 weights.
+        let (rows, width) = (512usize, 2560usize);
+        let per_row = width / T::BLOCK_LEN;
+        let (weights, ys) = read_only_rows::<T>(rows * per_row, 4);
+        for acts in [1usize, 2, 3, 4] {
+            let refs: Vec<&[T::ActivationBlock]> = ys[..acts].iter().map(Vec::as_slice).collect();
+            let time = |f: &dyn Fn(usize, &mut [f32])| -> f64 {
+                let mut out = vec![0f32; acts];
+                let start = Instant::now();
+                for _ in 0..3 {
+                    for r in 0..rows {
+                        f(r, &mut out[..]);
+                        std::hint::black_box(&out);
+                    }
+                }
+                start.elapsed().as_secs_f64() * 1e6 / 3.0
+            };
+            let each = time(&|row: usize, o: &mut [f32]| {
+                let w = &weights[row * per_row..(row + 1) * per_row];
+                for (t, y) in refs.iter().enumerate() {
+                    o[t] = T::dot(w, y);
+                }
+            });
+            let many = time(&|row: usize, o: &mut [f32]| {
+                let w = &weights[row * per_row..(row + 1) * per_row];
+                T::dot_many(w, &refs, o);
+            });
+            println!(
+                "{name:>7} x{acts}: {each:7.0} us each, {many:7.0} us together ({:.2}x)",
+                each / many
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement: run explicitly with --release --ignored --nocapture"]
+    fn what_decoding_once_for_several_activations_saves() {
+        measure_many::<BlockIq2S>("iq2_s");
+        measure_many::<BlockIq3Xxs>("iq3_xxs");
+        measure_many::<BlockIq4Nl>("iq4_nl");
+        measure_many::<BlockQ2_0>("q2_0");
+    }
+
     #[test]
     #[ignore = "measurement: run explicitly with --release --ignored --nocapture"]
     fn what_each_read_only_dot_product_costs() {

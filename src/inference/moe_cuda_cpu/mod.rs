@@ -544,19 +544,43 @@ fn fused_gate_up_silu_t<T: crate::tensor::quant_cpu::BlockFormat>(
             q
         })
         .collect();
+    // One unit of work is an output row over every expert of the routing: an expert's row is
+    // decoded once for all the tokens routed to it.
+    let runs = expert_runs(eid);
     let mut h = vec![0f32; m * n];
-    crate::tensor::quant_cpu::pool_for_each_mut(&mut h, 64, &|i, out| {
-        let (j, r) = (i / n, i % n);
-        let e = eid[j] as usize;
-        let t = (sti[j] as usize) / topk;
-        let row = (e * n + r) * blocks_per_row;
-        let x = &xq[t];
-        let g = T::dot(&gw[row..row + blocks_per_row], x);
-        let u = T::dot(&uw[row..row + blocks_per_row], x);
-        *out = u * (g / (1.0 + (-g).exp()));
+    let out = RowsOut(h.as_mut_ptr());
+    let mut rows = vec![(); n];
+    crate::tensor::quant_cpu::pool_for_each_mut(&mut rows, 8, &|r, _| {
+        let out = &out;
+        let mut acts: Vec<&[T::ActivationBlock]> = Vec::new();
+        let mut g = Vec::new();
+        let mut u = Vec::new();
+        for &(e, j0, j1) in &runs {
+            acts.clear();
+            acts.extend((j0..j1).map(|j| xq[(sti[j] as usize) / topk].as_slice()));
+            g.resize(j1 - j0, 0.0);
+            u.resize(j1 - j0, 0.0);
+            let row = (e * n + r) * blocks_per_row;
+            if j1 - j0 == 1 {
+                g[0] = T::dot(&gw[row..row + blocks_per_row], acts[0]);
+                u[0] = T::dot(&uw[row..row + blocks_per_row], acts[0]);
+            } else {
+                T::dot_many(&gw[row..row + blocks_per_row], &acts, &mut g);
+                T::dot_many(&uw[row..row + blocks_per_row], &acts, &mut u);
+            }
+            for (i, j) in (j0..j1).enumerate() {
+                // SAFETY: unit `r` alone writes column `r` of every row.
+                unsafe { *out.0.add(j * n + r) = u[i] * (g[i] / (1.0 + (-g[i]).exp())) };
+            }
+        }
     });
     Ok(Some(Tensor::from_vec(h, (m, n), &input.device())?))
 }
+
+/// A row-major output the units of a row-wise product write disjoint columns of.
+struct RowsOut(*mut f32);
+unsafe impl Send for RowsOut {}
+unsafe impl Sync for RowsOut {}
 
 /// Send+Sync raw f32 pointer for the disjoint-shard writes in the tiled kernels.
 #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
@@ -1423,7 +1447,6 @@ fn fused_down_reduce_t<T: crate::tensor::quant_cpu::BlockFormat>(
     {
         return Ok(None);
     }
-    let m = sti.len();
     let blocks_per_row = k / T::BLOCK_LEN;
     let wd = weights.data()?;
     let w: &[T] = unsafe {
@@ -1441,13 +1464,7 @@ fn fused_down_reduce_t<T: crate::tensor::quant_cpu::BlockFormat>(
         })
         .collect();
     // token -> its slot indices
-    let mut slots_of: Vec<Vec<usize>> = vec![Vec::with_capacity(topk); n_real_tokens];
-    for j in 0..m {
-        let t = (sti[j] as usize) / topk;
-        if t < n_real_tokens {
-            slots_of[t].push(j);
-        }
-    }
+    let runs = expert_runs(eid);
     let mut out = match residual {
         Some(r) => r
             .reshape((n_real_tokens, hidden))?
@@ -1456,12 +1473,32 @@ fn fused_down_reduce_t<T: crate::tensor::quant_cpu::BlockFormat>(
             .to_vec1::<f32>()?,
         None => vec![0f32; n_real_tokens * hidden],
     };
-    crate::tensor::quant_cpu::pool_for_each_mut(&mut out, 64, &|i, o| {
-        let (t, r) = (i / hidden, i % hidden);
-        for &j in &slots_of[t] {
-            let e = eid[j] as usize;
+    // One unit of work is an output column over every expert of the routing: an expert's row
+    // is decoded once for all the pairs routed to it, and the pairs of a token join its column
+    // in the order of the routing.
+    let sum = RowsOut(out.as_mut_ptr());
+    let mut columns = vec![(); hidden];
+    crate::tensor::quant_cpu::pool_for_each_mut(&mut columns, 16, &|r, _| {
+        let sum = &sum;
+        let mut acts: Vec<&[T::ActivationBlock]> = Vec::new();
+        let mut d = Vec::new();
+        for &(e, j0, j1) in &runs {
+            acts.clear();
+            acts.extend((j0..j1).map(|j| hq[j].as_slice()));
+            d.resize(j1 - j0, 0.0);
             let row = (e * hidden + r) * blocks_per_row;
-            *o += tw[sti[j] as usize] * T::dot(&w[row..row + blocks_per_row], &hq[j]);
+            if j1 - j0 == 1 {
+                d[0] = T::dot(&w[row..row + blocks_per_row], acts[0]);
+            } else {
+                T::dot_many(&w[row..row + blocks_per_row], &acts, &mut d);
+            }
+            for (i, j) in (j0..j1).enumerate() {
+                let t = (sti[j] as usize) / topk;
+                if t < n_real_tokens {
+                    // SAFETY: unit `r` alone writes column `r` of every token's row.
+                    unsafe { *sum.0.add(t * hidden + r) += tw[sti[j] as usize] * d[i] };
+                }
+            }
         }
     });
     Ok(Some(Tensor::from_vec(

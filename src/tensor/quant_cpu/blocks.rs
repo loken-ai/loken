@@ -64,6 +64,15 @@ pub trait BlockFormat: Sized + Clone + Send + Sync {
     /// n is the number of elements to be considered.
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32;
 
+    /// `out[t] = dot(xs, ys[t])` for several activations over the same weights, to the bit,
+    /// the weights decoded once where the format decodes them: what the rows of a window
+    /// routed to one expert cost together.
+    fn dot_many(xs: &[Self], ys: &[&[Self::ActivationBlock]], out: &mut [f32]) {
+        for (o, y) in out.iter_mut().zip(ys) {
+            *o = Self::dot(xs, y);
+        }
+    }
+
     /// Generic implementation of the dot product without simd optimizations.
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32;
 }

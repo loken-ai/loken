@@ -370,6 +370,107 @@ pub fn moe_gemm_gguf_gate_up_silu_mul_over(
     tensor_from_f32_slice(output, ext.out_shape(), &input.device())
 }
 
+/// [`moe_gemm_gguf_gate_up_silu_mul_over`] over the first `*live` of `pairs` routed pairs, the
+/// count and the pairs' rows (`sorted_token_ids`) and experts (`expert_ids`) read from the
+/// card at launch time, so that a recorded launch runs what the host hands it: `[pairs, n]`.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gemm_gguf_gate_up_silu_mul_live(
+    input: &Tensor,
+    gate_weights: &crate::tensor::quantized::QTensor,
+    up_weights: &crate::tensor::quantized::QTensor,
+    sorted_token_ids: u64,
+    expert_ids: u64,
+    live: u64,
+    pairs: usize,
+    topk: usize,
+) -> Result<Tensor> {
+    const ENTRY: &str = "gate_up_silu_mul_live";
+    if input.dtype() != DType::F32 {
+        crate::tensor::bail!("{ENTRY} only accepts f32 inputs");
+    }
+    if up_weights.shape().dims() != gate_weights.shape().dims()
+        || up_weights.dtype() != gate_weights.dtype()
+    {
+        crate::tensor::bail!("{ENTRY}: the gate and up stacks differ in shape or format");
+    }
+    let ext = Extents::read(ENTRY, input, gate_weights.shape().dims(), topk, false)?;
+    if ext.m as usize != pairs {
+        crate::tensor::bail!("{ENTRY}: {pairs} pairs against {} rows of {topk}", ext.m);
+    }
+    ext.require_k_by_eight(ENTRY)?;
+    let gguf_dtype = gguf_quant_code(gate_weights.dtype(), ENTRY)?;
+    let dev = input.device().as_cuda_device()?;
+    let output = unsafe { dev.alloc::<f32>(ext.out_elems()) }?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    unsafe {
+        loken_moe_gemm_gguf_gate_up_silu_mul_live(
+            dev_addr::<f32>(input, "input")? as *const f32,
+            gate_weights.device_ptr()? as *const c_void,
+            up_weights.device_ptr()? as *const c_void,
+            sorted_token_ids as *const i32,
+            expert_ids as *const i32,
+            output.device_ptr(output.stream()).0 as *mut f32,
+            ext.experts,
+            ext.topk,
+            ext.m,
+            ext.n,
+            ext.k,
+            gguf_dtype,
+            live as *const u32,
+            stream,
+        );
+    }
+    tensor_from_f32_slice(output, ext.out_shape(), &input.device())
+}
+
+/// [`moe_gemm_gguf_down_reduce_over`] over the first `*live` routed pairs of `input`
+/// `[pairs, k]`, their rows, experts and weights read from the card at launch time; the pairs
+/// past the count add nothing. `[rows, n]`, zero where no pair joined.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_gemm_gguf_down_reduce_live(
+    input: &Tensor,
+    weights: &crate::tensor::quantized::QTensor,
+    sorted_token_ids: u64,
+    expert_ids: u64,
+    topk_weights: u64,
+    live: u64,
+    topk: usize,
+    rows: usize,
+) -> Result<Tensor> {
+    const ENTRY: &str = "down_reduce_live";
+    if input.dtype() != DType::F32 {
+        crate::tensor::bail!("{ENTRY}: input must be F32");
+    }
+    let ext = Extents::read(ENTRY, input, weights.shape().dims(), topk, true)?;
+    if ext.m as usize != rows * topk {
+        crate::tensor::bail!("{ENTRY}: input M={} != rows={rows} x topk={topk}", ext.m);
+    }
+    let gguf_dtype = gguf_quant_code(weights.dtype(), ENTRY)?;
+    let dev = input.device().as_cuda_device()?;
+    let (_, hidden) = ext.out_shape();
+    let out = dev.alloc_zeros::<f32>(rows * hidden)?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    unsafe {
+        loken_moe_gemm_gguf_down_reduce_live(
+            dev_addr::<f32>(input, "input")? as *const f32,
+            weights.device_ptr()? as *const c_void,
+            sorted_token_ids as *const i32,
+            expert_ids as *const i32,
+            topk_weights as *const f32,
+            out.device_ptr(out.stream()).0 as *mut f32,
+            ext.experts,
+            ext.topk,
+            ext.m,
+            ext.n,
+            ext.k,
+            gguf_dtype,
+            live as *const u32,
+            stream,
+        );
+    }
+    tensor_from_f32_slice(out, (rows, hidden), &input.device())
+}
+
 /// Fused MoE gate GEMM + up GEMM + per-expert bias + OAI clamped-SwiGLU in ONE
 /// launch (gpt-oss). Avoids materializing the [M.topk, N] gate/up intermediates.
 /// `gate_bias`/`up_bias` are [E, N] f32 (or None). Supports MXFP4 experts (case 7).

@@ -269,6 +269,7 @@ impl LlmEngine {
         // disable_cuda config (empty cuda_devices -> every layer on CPU).
         let disable_cuda = self.config.disable_cuda || crate::gpu::force_cpu();
         let kv_quant = self.config.kv_quant;
+        let expert_profile = self.config.expert_profile.clone();
         let layer_share = self.config.layer_share;
         let quality = self.config.quality;
         let state_cache = self.state_cache.clone();
@@ -1211,6 +1212,19 @@ impl LlmEngine {
                 tracker.initialize_with_device(num_layers, actual_gpu_layers, gpu_idx);
                 debug!("📊 Layer tracker: {} layers ({} GPU, {} CPU)",
                     num_layers, actual_gpu_layers, num_layers - actual_gpu_layers);
+            }
+
+            // The expert caches filled from a profile, before any prompt routes.
+            let mut model = model;
+            if let Some(path) = expert_profile.as_deref() {
+                use crate::inference::generic_transformer::expert_profile::ExpertProfile;
+                match ExpertProfile::read(std::path::Path::new(path)) {
+                    Ok(profile) => match model.prime_expert_caches(&profile) {
+                        Ok(n) => info!("expert caches filled from {path}: {n} experts copied"),
+                        Err(e) => warn!("expert caches not filled from {path}: {e}"),
+                    },
+                    Err(e) => warn!("expert profile not read: {e}"),
+                }
             }
 
             // --- 6. Store state ---

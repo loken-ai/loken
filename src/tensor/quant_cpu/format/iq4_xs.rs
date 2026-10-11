@@ -66,6 +66,44 @@ impl BlockFormat for BlockIq4Xs {
             .sum()
     }
 
+    /// [`Self::dot`] over several activations, each run's weights read from the table once.
+    #[allow(unreachable_code)]
+    fn dot_many(xs: &[Self], ys: &[&[Self::ActivationBlock]], out: &mut [f32]) {
+        #[cfg(target_feature = "avx2")]
+        return unsafe {
+            for (ys, out) in ys
+                .chunks(super::iq_read::MANY)
+                .zip(out.chunks_mut(super::iq_read::MANY))
+            {
+                let mut totals = [0f32; super::iq_read::MANY];
+                for (bi, x) in xs.iter().enumerate() {
+                    let mut blocks = [0f32; super::iq_read::MANY];
+                    for ib in 0..QK_K / 32 {
+                        let packed: &[u8; 16] = x.qs[16 * ib..16 * ib + 16].try_into().unwrap();
+                        let (w, magnitude) = super::iq_read::iq4_run_weights(packed);
+                        let scale = super::iq_read::Runs::run_scale(x, ib);
+                        for (block, y) in blocks.iter_mut().zip(ys) {
+                            let y = &y[bi];
+                            let dot = super::iq_read::iq4_run_dot(
+                                w,
+                                magnitude,
+                                &y.qs[32 * ib..32 * ib + 32],
+                            );
+                            *block += scale * dot as f32 * y.d[ib].to_f32();
+                        }
+                    }
+                    for (total, block) in totals.iter_mut().zip(blocks) {
+                        *total += block;
+                    }
+                }
+                out.copy_from_slice(&totals[..out.len()]);
+            }
+        };
+        for (o, y) in out.iter_mut().zip(ys) {
+            *o = Self::dot(xs, y);
+        }
+    }
+
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
         super::iq_read::dot_by_decoding(xs, ys)
     }

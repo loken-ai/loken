@@ -124,6 +124,9 @@ struct moe_dims {
     const void * alt_a;
     const void * alt_b;
     int alt_from;
+    // Pairs to run, read on the card at launch time, or null: all of `pairs`. The host writes
+    // it after the launch was recorded, so a replayed graph runs what the host handed it.
+    const unsigned int * live;
 };
 
 /// How a mat-vec launch is spread over the card: a warp per strip of output rows, a row of
@@ -364,6 +367,7 @@ __global__ void loken_moe_gemm_gguf_kernel(
     if (slot.row0 >= dims.cols || slot.pair >= dims.pairs) {
         return;
     }
+    if (dims.live != nullptr && slot.pair >= (int) *dims.live) return;
 
     const routed_pair routed = read_routing(sorted_token_ids, expert_ids, slot.pair);
     if (routed.expert < 0 || routed.expert >= dims.experts) return;
@@ -443,7 +447,7 @@ extern "C" void loken_moe_gemm_gguf(
     const int nWraps = 4;
     constexpr int ROWS_PER_WARP = 1;
     const moe_launch shape = mat_vec_launch(size_n, size_m, nWraps, ROWS_PER_WARP);
-    const moe_dims dims = { num_experts, topk, size_m, size_n, size_k, kx_padded, nullptr, nullptr, 0 };
+    const moe_dims dims = { num_experts, topk, size_m, size_n, size_k, kx_padded, nullptr, nullptr, 0, nullptr };
 
     switch (quant_type) {
 #define MOE_CASE(id, name, qk, qi, vdr)                            \
@@ -485,6 +489,10 @@ __global__ void loken_moe_gemm_gguf_down_reduce_kernel(
 ) {
     const warp_slot slot = claim_slot<1>();
     if (slot.row0 >= dims.cols || slot.pair >= dims.pairs) return;
+    // A pair past the count the host handed the card adds nothing; the launch zeroed every
+    // row before, and a pair the host handed writes the row of its own index, which an idle
+    // pair's row must not race.
+    if (dims.live != nullptr && slot.pair >= (int) *dims.live) return;
 
     const routed_pair routed = read_routing(sorted_token_ids, expert_ids, slot.pair);
     if (routed.expert < 0 || routed.expert >= dims.experts) {
@@ -624,7 +632,7 @@ static void down_reduce_impl(
     const float* down_bias,         // [num_experts, size_n] F32, or nullptr
     const float* add_after,         // [num_real_tokens, N] F32 joined after the fold, or nullptr
     const void* alt_weights, int alt_from,
-    cudaStream_t stream
+    cudaStream_t stream, const unsigned int* live = nullptr
 ) {
     const int kx_padded = pad_to(size_k, MATRIX_ROW_PADDING);
     // Down quantises one activation row per routed pair - no sharing, so one row per entry -
@@ -645,6 +653,8 @@ static void down_reduce_impl(
     float* pairs = (float*)((char*)(void*)y_q8_1 + act_bytes);
     float* reduced = outputs;
     outputs = pairs;
+    // A launch that runs the pairs the host hands it leaves the others' rows to the sum: zero.
+    if (live != nullptr) cudaMemsetAsync(pairs, 0, pair_bytes, stream);
 
     // Smaller blocks -> more parallelism across SMs (no shared-mem
     // barrier means small blocks are fine). Down has size_n=hidden,
@@ -653,7 +663,7 @@ static void down_reduce_impl(
     // marginally better SM occupancy on small batches.
     const int nWraps = 2;
     const moe_launch shape = mat_vec_launch(size_n, size_m, nWraps, 1);
-    const moe_dims dims = { num_experts, topk, size_m, size_n, size_k, kx_padded, alt_weights, nullptr, alt_from };
+    const moe_dims dims = { num_experts, topk, size_m, size_n, size_k, kx_padded, alt_weights, nullptr, alt_from, live };
 
     switch (quant_type) {
 #define MOE_CASE(id, name, qk, qi, vdr)                            \
@@ -687,6 +697,21 @@ extern "C" void loken_moe_gemm_gguf_down_reduce(
 
 /// [`loken_moe_gemm_gguf_down_reduce`] over `num_experts` slots, those from `alt_from` on read
 /// from the `alt_weights` tensor (slot `expert - alt_from` of it).
+/// `loken_moe_gemm_gguf_down_reduce` over the first `*live` pairs, `live` read on the card; the
+/// pairs past it add nothing to their tokens' rows.
+extern "C" void loken_moe_gemm_gguf_down_reduce_live(
+    const float* inputs, const void* weights,
+    const int32_t* sorted_token_ids, const int32_t* expert_ids,
+    const float* topk_weights, float* outputs,
+    int num_experts, int topk, int size_m, int size_n, int size_k,
+    int quant_type, const unsigned int* live,
+    cudaStream_t stream
+) {
+    down_reduce_impl(inputs, weights, sorted_token_ids, expert_ids, topk_weights, outputs,
+        num_experts, topk, size_m, size_n, size_k, quant_type, nullptr, nullptr,
+        nullptr, 0, stream, live);
+}
+
 extern "C" void loken_moe_gemm_gguf_down_reduce_two(
     const float* inputs, const void* weights, const void* alt_weights, int alt_from,
     const int32_t* sorted_token_ids, const int32_t* expert_ids,
@@ -738,6 +763,7 @@ __global__ void loken_moe_gemm_gguf_gate_up_silu_mul_kernel(
     if (slot.row0 >= dims.cols || slot.pair >= dims.pairs) {
         return;
     }
+    if (dims.live != nullptr && slot.pair >= (int) *dims.live) return;
 
     const routed_pair routed = read_routing(sorted_token_ids, expert_ids, slot.pair);
     if (routed.expert < 0 || routed.expert >= dims.experts) return;
@@ -837,7 +863,7 @@ static void gate_up_silu_mul_impl(
     int num_experts, int topk, int size_m, int size_n, int size_k,
     int quant_type,        // the weight format, numbered as `MOE_GGUF_FORMATS` numbers it
     const void* alt_gate, const void* alt_up, int alt_from,
-    cudaStream_t stream
+    cudaStream_t stream, const unsigned int* live = nullptr
 ) {
     const int kx_padded = pad_to(size_k, MATRIX_ROW_PADDING);
     // The `topk` entries of a token share one activation row, so there are that many fewer.
@@ -852,7 +878,7 @@ static void gate_up_silu_mul_impl(
     const int nWraps = 2;
     constexpr int ROWS_PER_WARP = 1;
     const moe_launch shape = mat_vec_launch(size_n, size_m, nWraps, ROWS_PER_WARP);
-    const moe_dims dims = { num_experts, topk, size_m, size_n, size_k, kx_padded, alt_gate, alt_up, alt_from };
+    const moe_dims dims = { num_experts, topk, size_m, size_n, size_k, kx_padded, alt_gate, alt_up, alt_from, live };
 
     switch (quant_type) {
 #define MOE_CASE(id, name, qk, qi, vdr)                            \
@@ -878,6 +904,20 @@ extern "C" void loken_moe_gemm_gguf_gate_up_silu_mul(
 
 /// [`loken_moe_gemm_gguf_gate_up_silu_mul`] over `num_experts` slots, those from `alt_from` on
 /// read from the `alt_gate` and `alt_up` tensors (slot `expert - alt_from` of them).
+/// `loken_moe_gemm_gguf_gate_up_silu_mul` over the first `*live` pairs, `live` read on the card.
+extern "C" void loken_moe_gemm_gguf_gate_up_silu_mul_live(
+    const float* inputs,
+    const void* gate_weights, const void* up_weights,
+    const int32_t* sorted_token_ids, const int32_t* expert_ids,
+    float* outputs,
+    int num_experts, int topk, int size_m, int size_n, int size_k,
+    int quant_type, const unsigned int* live,
+    cudaStream_t stream
+) {
+    gate_up_silu_mul_impl(inputs, gate_weights, up_weights, sorted_token_ids, expert_ids, outputs,
+        num_experts, topk, size_m, size_n, size_k, quant_type, nullptr, nullptr, 0, stream, live);
+}
+
 extern "C" void loken_moe_gemm_gguf_gate_up_silu_mul_two(
     const float* inputs,
     const void* gate_weights, const void* up_weights,
@@ -919,7 +959,7 @@ extern "C" void loken_moe_gemm_gguf_gate_up_swiglu_oai(
     const int nWraps = 2;
     constexpr int ROWS_PER_WARP = 1;
     const moe_launch shape = mat_vec_launch(size_n, size_m, nWraps, ROWS_PER_WARP);
-    const moe_dims dims = { num_experts, topk, size_m, size_n, size_k, kx_padded, nullptr, nullptr, 0 };
+    const moe_dims dims = { num_experts, topk, size_m, size_n, size_k, kx_padded, nullptr, nullptr, 0, nullptr };
 
     switch (quant_type) {
 #define MOE_CASE(id, name, qk, qi, vdr)                            \
@@ -958,6 +998,7 @@ __global__ void loken_moe_gemm_gguf_gate_up_gelu_mul_concat_kernel(
     if (slot.row0 >= dims.cols || slot.pair >= dims.pairs) {
         return;
     }
+    if (dims.live != nullptr && slot.pair >= (int) *dims.live) return;
 
     const routed_pair routed = read_routing(sorted_token_ids, expert_ids, slot.pair);
     if (routed.expert < 0 || routed.expert >= dims.experts) return;
@@ -1021,7 +1062,7 @@ extern "C" void loken_moe_gemm_gguf_gate_up_gelu_mul_concat(
     const int nWraps = 2;
     constexpr int ROWS_PER_WARP = 1;
     const moe_launch shape = mat_vec_launch(size_n, size_m, nWraps, ROWS_PER_WARP);
-    const moe_dims dims = { num_experts, topk, size_m, size_n, size_k, kx_padded, nullptr, nullptr, 0 };
+    const moe_dims dims = { num_experts, topk, size_m, size_n, size_k, kx_padded, nullptr, nullptr, 0, nullptr };
 
     switch (quant_type) {
 #define MOE_CASE(id, name, qk, qi, vdr)                            \

@@ -49,6 +49,7 @@ mod config;
 mod conversion_tests;
 mod dense;
 mod draft_head;
+pub mod expert_profile;
 #[cfg(feature = "cuda")]
 pub mod expert_tier;
 #[cfg(not(feature = "cuda"))]
