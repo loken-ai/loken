@@ -332,3 +332,47 @@ pub fn deltanet_gate(
         tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(b_slice, dev.clone()), (n, h))?;
     Ok((g, beta))
 }
+
+#[cfg(test)]
+mod timing {
+    use super::*;
+    use crate::tensor::{Device, Tensor};
+
+    /// What one token through the recurrence costs at the served shapes, the state advanced in
+    /// place: the launch alone, timed over many, against what its bytes take at the card's
+    /// bandwidth.
+    #[test]
+    #[ignore]
+    fn a_token_through_the_delta_rule_timed() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        for (h, s_v) in [(32usize, 128usize), (48, 128), (16, 128)] {
+            let q = Tensor::randn(0f32, 1.0, (1, h, s_v), &dev).unwrap();
+            let k = Tensor::randn(0f32, 1.0, (1, h, s_v), &dev).unwrap();
+            let v = Tensor::randn(0f32, 1.0, (1, h, s_v), &dev).unwrap();
+            let g = Tensor::randn(-1f32, 0.1, (1, h), &dev).unwrap();
+            let beta = Tensor::randn(0.5f32, 0.1, (1, h), &dev).unwrap();
+            let state = Tensor::zeros_on((h, s_v, s_v), crate::tensor::DType::F32, &dev).unwrap();
+            let _in_place = super::super::in_place_state(true);
+            for _ in 0..5 {
+                gated_delta_net(&q, &k, &v, &g, &beta, &state, 0.1).unwrap();
+            }
+            let cd = dev.as_cuda_device().unwrap();
+            cd.0.stream().synchronize().unwrap();
+            let n = 200;
+            let started = std::time::Instant::now();
+            for _ in 0..n {
+                gated_delta_net(&q, &k, &v, &g, &beta, &state, 0.1).unwrap();
+            }
+            cd.0.stream().synchronize().unwrap();
+            let us = started.elapsed().as_secs_f64() * 1e6 / n as f64;
+            let bytes = 2.0 * (h * s_v * s_v * 4) as f64;
+            eprintln!(
+                "gdn step h={h} s_v={s_v}: {us:.1} us a launch, {:.0} GB/s over the state read and written",
+                bytes / us * 1e-3
+            );
+        }
+    }
+}

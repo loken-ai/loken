@@ -242,6 +242,11 @@ struct WorkerStats {
     missed: std::sync::atomic::AtomicU64,
     missing: std::sync::atomic::AtomicU64,
     product_ns: std::sync::atomic::AtomicU64,
+    /// Of the products' nanoseconds: readying the rows and the routing, the gate and up
+    /// projections, the down projection and the sum per row.
+    prep_ns: std::sync::atomic::AtomicU64,
+    gate_up_ns: std::sync::atomic::AtomicU64,
+    down_ns: std::sync::atomic::AtomicU64,
 }
 
 static WORKER: WorkerStats = WorkerStats {
@@ -250,6 +255,9 @@ static WORKER: WorkerStats = WorkerStats {
     missed: std::sync::atomic::AtomicU64::new(0),
     missing: std::sync::atomic::AtomicU64::new(0),
     product_ns: std::sync::atomic::AtomicU64::new(0),
+    prep_ns: std::sync::atomic::AtomicU64::new(0),
+    gate_up_ns: std::sync::atomic::AtomicU64::new(0),
+    down_ns: std::sync::atomic::AtomicU64::new(0),
 };
 
 /// A layer's decoded rows between the post of their request and the wait for the answer.
@@ -512,6 +520,7 @@ impl LayerTier {
         let host = Device::Cpu;
         let hidden = x.len() / rows.max(1);
         let m = pairs.len();
+        let t = std::time::Instant::now();
         let mut rows_in = Vec::with_capacity(m * hidden);
         for &(r, _, _) in pairs {
             rows_in.extend_from_slice(&x[r * hidden..(r + 1) * hidden]);
@@ -519,16 +528,27 @@ impl LayerTier {
         let xs = Tensor::from_vec(rows_in, (m, hidden), &host)?;
         let ids: Vec<u32> = pairs.iter().map(|p| p.1).collect();
         let routing = ExpertRouting::group(&Tensor::from_vec(ids, (m, 1), &host)?, 1)?;
-        let h = routing.host_gate_up_silu(&xs, &self.host[0], &self.host[1])?;
         let w = Tensor::from_vec(
             pairs.iter().map(|p| p.2).collect::<Vec<f32>>(),
             (m, 1),
             &host,
         )?;
+        WORKER
+            .prep_ns
+            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let t = std::time::Instant::now();
+        let h = routing.host_gate_up_silu(&xs, &self.host[0], &self.host[1])?;
+        WORKER
+            .gate_up_ns
+            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let t = std::time::Instant::now();
         let out = routing
             .host_down_reduce(&h, &self.host[2], &w, m, None)?
             .flatten_all()?
             .to_vec1::<f32>()?;
+        WORKER
+            .down_ns
+            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let mut product = vec![0f32; rows * hidden];
         for (j, &(r, _, _)) in pairs.iter().enumerate() {
             for (acc, v) in product[r * hidden..(r + 1) * hidden]
@@ -619,14 +639,17 @@ impl LayerTier {
         if !miss_pairs.is_empty() {
             WORKER.missed.fetch_add(1, Ordering::Relaxed);
         }
-        if self.leader.load(Ordering::Relaxed) && n % 4096 == 0 {
+        if n % 4096 == 0 {
             let missed = WORKER.missed.load(Ordering::Relaxed).max(1);
             tracing::info!(
-                "expert tier worker: {} us a request, {:.0}% had a missing expert: {:.1} missing, product {} us",
+                "expert tier worker: {} us a request, {:.0}% had a missing expert: {:.1} missing, product {} us (ready {}, gate and up {}, down {})",
                 total / n / 1000,
                 100.0 * missed as f64 / n as f64,
                 WORKER.missing.load(Ordering::Relaxed) as f64 / missed as f64,
                 WORKER.product_ns.load(Ordering::Relaxed) / missed / 1000,
+                WORKER.prep_ns.load(Ordering::Relaxed) / missed / 1000,
+                WORKER.gate_up_ns.load(Ordering::Relaxed) / missed / 1000,
+                WORKER.down_ns.load(Ordering::Relaxed) / missed / 1000,
             );
         }
         Ok(true)
