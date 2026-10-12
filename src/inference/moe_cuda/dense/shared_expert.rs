@@ -18,11 +18,7 @@ pub fn shexp_swiglu(gate: &Tensor, up: &Tensor) -> Result<Option<Tensor>> {
     let (Some(gate_f16), Some(up_f16)) = (width(gate), width(up)) else {
         return Ok(None);
     };
-    if !gate.device().is_cuda()
-        || gate.dims() != up.dims()
-        || gate.dims().len() != 2
-        || gate.dims()[0] != 1
-    {
+    if !gate.device().is_cuda() || gate.dims() != up.dims() || gate.dims().len() != 2 {
         return Ok(None);
     }
     let (gate, up) = (gate.contiguous()?, up.contiguous()?);
@@ -66,20 +62,24 @@ pub fn shexp_tail(
     let Some(down_f16) = width(down) else {
         return Ok(None);
     };
-    let n = routed.elem_count();
+    let total = routed.elem_count();
     let f32_row = |t: &Tensor| t.dtype() == DType::F32 && t.is_contiguous() && t.device().is_cuda();
     if !(f32_row(routed) && f32_row(x) && f32_row(w))
         || routed.dims().len() != 2
-        || routed.dims()[0] != 1
-        || down.elem_count() != n
-        || x.elem_count() != n
-        || w.elem_count() != n
+        || down.elem_count() != total
+        || x.elem_count() != total
     {
+        return Ok(None);
+    }
+    // The gate's row is read by every row: `n` values a row, one block a row.
+    let rows = routed.dims()[0];
+    let n = routed.dims()[1];
+    if w.elem_count() != n {
         return Ok(None);
     }
     let down = down.contiguous()?;
     let dev = routed.device().as_cuda_device()?;
-    let out = unsafe { dev.alloc::<f32>(n) }?;
+    let out = unsafe { dev.alloc::<f32>(total) }?;
     let down_p = if down_f16 {
         addr::<half::f16>(&down, "down")? as *const c_void
     } else {
@@ -94,6 +94,7 @@ pub fn shexp_tail(
             out.device_ptr(out.stream()).0 as *mut f32,
             n as i32,
             i32::from(down_f16),
+            rows as i32,
             dev.cuda_stream().cu_stream() as i64,
         );
     }
@@ -108,6 +109,45 @@ pub fn shexp_tail(
 mod tests {
     use super::*;
     use crate::tensor::Device;
+
+    /// The tail over a window's rows is the tail of each row: a row's gate from its own
+    /// values and the one gate row.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn the_shared_expert_tail_over_rows_is_the_rows_in_turn() {
+        let Ok(card) = crate::tensor::cuda::CudaDevice::new(0).map(Device::Cuda) else {
+            return;
+        };
+        let (rows, n) = (3usize, 2560usize);
+        let wave =
+            |k: f32, len: usize| -> Vec<f32> { (0..len).map(|i| ((i as f32) * k).sin()).collect() };
+        let flat = |t: &Tensor| {
+            t.to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let routed = Tensor::from_vec(wave(0.05, rows * n), (rows, n), &card).unwrap();
+        let x = Tensor::from_vec(wave(0.011, rows * n), (rows, n), &card).unwrap();
+        let down = Tensor::from_vec(wave(0.021, rows * n), (rows, n), &card).unwrap();
+        let w = Tensor::from_vec(wave(0.007, n), (1, n), &card).unwrap();
+        let together = shexp_tail(&routed, &down, &x, &w)
+            .unwrap()
+            .expect("the launch takes these");
+        for r in 0..rows {
+            let row = |t: &Tensor| t.narrow(0, r, 1).unwrap().contiguous().unwrap();
+            let one = shexp_tail(&row(&routed), &row(&down), &row(&x), &w)
+                .unwrap()
+                .expect("the launch takes these");
+            assert_eq!(
+                flat(&together.narrow(0, r, 1).unwrap()),
+                flat(&one),
+                "row {r}"
+            );
+        }
+    }
 
     #[test]
     #[ignore = "needs an idle CUDA card"]

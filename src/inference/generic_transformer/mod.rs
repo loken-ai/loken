@@ -49,6 +49,7 @@ mod config;
 mod conversion_tests;
 mod dense;
 mod draft_head;
+pub use draft_head::set_probe_dir;
 pub mod expert_profile;
 #[cfg(feature = "cuda")]
 pub mod expert_tier;
@@ -525,6 +526,8 @@ pub struct GenericHeteroTransformer {
     /// used last by `tick`; empty unless the configuration asks for them.
     kv_snapshots: Vec<KvSnapshot>,
     kv_snapshot_tick: u64,
+    /// The most a request's decode took of a card beyond its start, in bytes.
+    decode_reserve: u64,
     /// The disk cache of this model's decode state, when the operator opened a store and the
     /// model carries a recurrent state.
     hybrid_cache: Option<state_cache::HybridStateCache>,

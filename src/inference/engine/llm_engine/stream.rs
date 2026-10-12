@@ -300,6 +300,21 @@ impl LlmEngine {
             let mut compute_ns: u64 = 0;
             #[allow(unused_assignments)]
             let mut iter_compute_start: Option<std::time::Instant> = None;
+            // Where a step's iteration goes besides its cycle: from the loop's top to the
+            // head's draft, and from the cycle's commit to the next loop top.
+            let mut loop_iters = 0u64;
+            let mut loop_before_ns = 0u64;
+            let mut loop_after_ns = 0u64;
+            let mut cycle_end: Option<std::time::Instant> = None;
+            let mut head_attempt_ns = 0u64;
+            // The plain step's parts in the drafting loop: the launch, the wait, the sample.
+            let (mut plain_launch_ns, mut plain_wait_ns, mut plain_sample_ns, mut plain_steps) =
+                (0u64, 0u64, 0u64, 0u64);
+            // A window's iteration besides its replay: before the verify (the draft's rows
+            // staged), and from its commit to the cycle's end.
+            let mut window_before_ns = 0u64;
+            let mut window_tail_ns = 0u64;
+            let mut window_iters = 0u64;
             // Phase 1: Setup + tokenize + batched prefill (with lock)
             #[cfg_attr(feature = "cuda", allow(unused_variables))]
             // The resolved sampling parameters travel as ONE value rather than as five
@@ -311,6 +326,9 @@ impl LlmEngine {
             // session cache already held: both outlive the prefill block.
             let mut logprob_buf: Vec<TokenLogprob> = Vec::new();
             let reused_prompt_tokens: usize;
+            // What the decode takes of a card beyond the request's start: the snapshots
+            // leave that much room at the next request.
+            let decode_free_start: Option<u64>;
             let audio_positions: usize;
             // Whether the model's own draft head reads this request's prompt and decode steps.
             let head_capable: bool;
@@ -690,6 +708,7 @@ impl LlmEngine {
                 // rope values, and a stale quantized-KV `graph_captured` flag
                 // would block KV growth. Cheap; does not touch KV contents.
                 state.model.invalidate_graph_state();
+                decode_free_start = state.model.free_device_memory();
 
                 // Batched prefill - only the suffix beyond session_start.
                 // For vision, session_start = image_prefix_len + text_common;
@@ -1068,8 +1087,14 @@ impl LlmEngine {
 
             // -- PLD (Prompt-Lookup Decoding) ---------------------------
             let pld_enabled = pld_capable;
+            // The buffer holds the prompt and the whole reply: a copy is found anywhere in them.
             let mut pld_cache =
-                crate::inference::serve::prompt_lookup::NgramDraftCache::new_cascade(2, 4, 5, 4096);
+                crate::inference::serve::prompt_lookup::NgramDraftCache::new_cascade(
+                    2,
+                    4,
+                    crate::inference::engine::decode_step::DRAFT_MAX,
+                    prompt_tokens.len() + max_tokens,
+                );
             if pld_enabled {
                 pld_cache.push_many(&prompt_tokens);
                 pld_cache.push(next_token);
@@ -1097,6 +1122,9 @@ impl LlmEngine {
                 .as_ref()
                 .and_then(|s| s.model.expert_cache_counters());
             let mut head_tokens: Vec<u32> = vec![next_token];
+            // Windows drafted by a copy of a span seen before, their tokens and the kept ones.
+            let (mut copy_windows, mut copy_drafted, mut copy_accepted) = (0u64, 0u64, 0u64);
+            let mut window_cap = usize::MAX;
             // What the head's cycles came to: verifies, of them recorded, and steps it had no
             // guess for.
             let (mut head_cycles, mut head_recorded, mut head_empty, mut head_unsure): (
@@ -1242,6 +1270,10 @@ impl LlmEngine {
             'stream_loop: while !ends(next_token) && token_count < max_tokens {
                 #[cfg(feature = "cuda")]
                 let step_start = Instant::now();
+                loop_iters += 1;
+                if let Some(t) = cycle_end.take() {
+                    loop_after_ns += t.elapsed().as_nanos() as u64;
+                }
                 if !logprob_buf.is_empty() {
                     if let Ok(mut q) = logprob_queue.lock() {
                         q.append(&mut logprob_buf);
@@ -1560,24 +1592,57 @@ impl LlmEngine {
                     // The head's guesses for this step, from the hidden state the last step left
                     // it: a step with guesses verifies them, one without replays the plain step.
                     let head_draft_started = std::time::Instant::now();
+                    loop_before_ns += step_start.elapsed().as_nanos() as u64;
+                    // A step proved by an eager run costs what the eager run costs, not a step.
+                    let mut probation_step = false;
                     // The head guesses once the step is recorded: a window is held against the
                     // recorded step's kernels, which an eager step before the recording does not
                     // run (its indexed attention selects on the host).
-                    let head_draft: Vec<u32> = if head_on && cuda_graph.is_some() {
-                        let want = spec_engine.draft_length().min(verify_graphs.draft_cap());
+                    // A copy of a span seen before drafts this window: the head is not asked.
+                    // Copies draft while they are kept at least as often as the head's first
+                    // guess, once both are measured.
+                    let copies_pay = {
+                        let head_rate = spec_engine
+                            .draft_length
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .first_rate();
+                        match head_rate {
+                            Some(r) if copy_drafted >= copy_windows.max(1) * 2 => {
+                                copy_accepted as f64 >= r * copy_drafted as f64
+                            }
+                            _ => true,
+                        }
+                    };
+                    let copy_ready = pld_enabled
+                        && copies_pay
+                        && pld_cooldown == 0
+                        && pld_cost.worth_trying()
+                        && !super::decode::copy_draft(&pld_cache).is_empty();
+                    let head_draft: Vec<u32> = if head_on && cuda_graph.is_some() && !copy_ready {
+                        let want = spec_engine.draft_length();
                         if want == 0 {
                             Vec::new()
                         } else {
                             match model_state.blocking_lock().as_mut() {
-                                Some(s) => s.model.draft_head_tokens(
-                                    &head_tokens,
-                                    want,
-                                    spec_engine
+                                Some(s) => {
+                                    let rows = s.model.verify_window_rows();
+                                    let mut length = spec_engine
                                         .draft_length
                                         .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .min_odds(),
-                                ),
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    let want = match rows {
+                                        0 => want,
+                                        rows => {
+                                            length.cap_rows(rows);
+                                            window_cap = rows - 1;
+                                            want.min(rows - 1)
+                                        }
+                                    };
+                                    let min_odds = length.min_odds();
+                                    drop(length);
+                                    s.model.draft_head_tokens(&head_tokens, want, min_odds)
+                                }
                                 None => Vec::new(),
                             }
                         }
@@ -1585,7 +1650,8 @@ impl LlmEngine {
                         Vec::new()
                     };
                     let head_draft_secs = head_draft_started.elapsed().as_secs_f64();
-                    if head_on && head_draft.is_empty() {
+                    head_attempt_ns += (head_draft_secs * 1e9) as u64;
+                    if head_on && head_draft.is_empty() && !copy_ready {
                         head_empty += 1;
                         if spec_engine.draft_length() > 0 {
                             head_unsure += 1;
@@ -1594,12 +1660,7 @@ impl LlmEngine {
                     #[cfg(feature = "cuda")]
                     let graph_step: Option<(u32, Option<Tensor>)> = 'graph_blk: {
                         // A drafter's step, or a draft worth verifying, runs over its rows.
-                        let verify_step = spec_on
-                            || !head_draft.is_empty()
-                            || (pld_enabled
-                                && pld_cooldown == 0
-                                && pos <= pld_max_ctx_threshold()
-                                && pld_cache.lookup().len() >= 2);
+                        let verify_step = spec_on || !head_draft.is_empty() || copy_ready;
                         if !graph_ok || graph_disabled_this_request || verify_step {
                             break 'graph_blk None;
                         }
@@ -1666,60 +1727,68 @@ impl LlmEngine {
                         // logits tensor (parity with the eager branch below).
                         macro_rules! sample_graph {
                             ($logits:expr) => {{
-                                let logits_1d = match $logits.squeeze(0) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        let _ = tx.blocking_send(Err(format!("Squeeze: {e}")));
-                                        return;
-                                    }
-                                };
-                                if temperature == 0.0 && !logits_processor.needs_host() {
-                                    match gpu_sample_returning_tensor(
-                                        &logits_1d,
-                                        &recent_tokens,
-                                        repeat_penalty,
-                                        repeat_last_n,
-                                    ) {
-                                        Ok((t, dev_t)) => (t, dev_t),
+                                let t_sample = std::time::Instant::now();
+                                let out = {
+                                    let logits_1d = match $logits.squeeze(0) {
+                                        Ok(s) => s,
                                         Err(e) => {
-                                            let _ = tx.blocking_send(Err(format!("Sampling: {e}")));
+                                            let _ = tx.blocking_send(Err(format!("Squeeze: {e}")));
                                             return;
                                         }
-                                    }
-                                } else {
-                                    let logits_cpu = match logits_1d.device() {
-                                        Device::Cpu => logits_1d,
-                                        _ => match logits_1d.to_device(&Device::Cpu) {
+                                    };
+                                    if temperature == 0.0 && !logits_processor.needs_host() {
+                                        match gpu_sample_returning_tensor(
+                                            &logits_1d,
+                                            &recent_tokens,
+                                            repeat_penalty,
+                                            repeat_last_n,
+                                        ) {
+                                            Ok((t, dev_t)) => (t, dev_t),
+                                            Err(e) => {
+                                                let _ =
+                                                    tx.blocking_send(Err(format!("Sampling: {e}")));
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        let logits_cpu = match logits_1d.device() {
+                                            Device::Cpu => logits_1d,
+                                            _ => match logits_1d.to_device(&Device::Cpu) {
+                                                Ok(l) => l,
+                                                Err(e) => {
+                                                    let _ = tx.blocking_send(Err(format!(
+                                                        "Device transfer: {e}"
+                                                    )));
+                                                    return;
+                                                }
+                                            },
+                                        };
+                                        let penalized = match apply_repeat_penalty(
+                                            &logits_cpu,
+                                            &recent_tokens,
+                                            repeat_penalty,
+                                            repeat_last_n,
+                                        ) {
                                             Ok(l) => l,
                                             Err(e) => {
                                                 let _ = tx.blocking_send(Err(format!(
-                                                    "Device transfer: {e}"
+                                                    "Repeat penalty: {e}"
                                                 )));
                                                 return;
                                             }
-                                        },
-                                    };
-                                    let penalized = match apply_repeat_penalty(
-                                        &logits_cpu,
-                                        &recent_tokens,
-                                        repeat_penalty,
-                                        repeat_last_n,
-                                    ) {
-                                        Ok(l) => l,
-                                        Err(e) => {
-                                            let _ = tx
-                                                .blocking_send(Err(format!("Repeat penalty: {e}")));
-                                            return;
-                                        }
-                                    };
-                                    match logits_processor.sample(&penalized) {
-                                        Ok(t) => (t, None),
-                                        Err(e) => {
-                                            let _ = tx.blocking_send(Err(format!("Sampling: {e}")));
-                                            return;
+                                        };
+                                        match logits_processor.sample(&penalized) {
+                                            Ok(t) => (t, None),
+                                            Err(e) => {
+                                                let _ =
+                                                    tx.blocking_send(Err(format!("Sampling: {e}")));
+                                                return;
+                                            }
                                         }
                                     }
-                                }
+                                };
+                                plain_sample_ns += t_sample.elapsed().as_nanos() as u64;
+                                out
                             }};
                         }
 
@@ -1735,9 +1804,15 @@ impl LlmEngine {
                             } else {
                                 Vec::new()
                             };
+                            probation_step = graph_validations < GRAPH_VALIDATIONS;
+                            let t_launch = std::time::Instant::now();
                             match graph.launch(&mut state.model) {
                                 Ok(()) => {
+                                    plain_launch_ns += t_launch.elapsed().as_nanos() as u64;
+                                    let t_wait = std::time::Instant::now();
                                     let _ = crate::tensor::cuda_ext::synchronize_yielding(&stream);
+                                    plain_wait_ns += t_wait.elapsed().as_nanos() as u64;
+                                    plain_steps += 1;
                                     if graph_validations < GRAPH_VALIDATIONS {
                                         let rep_logits: Option<Vec<f32>> = logits_ref
                                             .flatten_all()
@@ -1748,6 +1823,8 @@ impl LlmEngine {
                                             .ok()
                                             .and_then(|t| t.argmax(0).ok())
                                             .and_then(|t| t.to_scalar::<u32>().ok());
+                                        let replay_cp =
+                                            state.model.recurrent_checkpoint().unwrap_or_default();
                                         if let Err(e) = state.model.recurrent_restore(&recurrent_cp)
                                         {
                                             warn!("recurrent state restore before probation failed: {e}");
@@ -1768,7 +1845,25 @@ impl LlmEngine {
                                                                 crate::inference::engine::decode_step::replay_agrees(g, &e)
                                                             })
                                                     });
+                                                // An eager step that is not finite says nothing of the
+                                                // replay: a finite replay is kept and said.
+                                                let eag_finite = eag
+                                                    .flatten_all()
+                                                    .and_then(|t| t.to_vec1::<f32>())
+                                                    .is_ok_and(|v| v.iter().all(|x| x.is_finite()));
+                                                let rep_finite =
+                                                    rep_logits.as_ref().is_some_and(|g| {
+                                                        g.iter().all(|x| x.is_finite())
+                                                    });
                                                 if agrees {
+                                                    graph_validations += 1;
+                                                } else if !eag_finite && rep_finite {
+                                                    warn!("the eager probation step at pos={pos} is not finite; the finite replay is kept (argmax {:?})", rep_argmax);
+                                                    if let Err(e) =
+                                                        state.model.recurrent_restore(&replay_cp)
+                                                    {
+                                                        warn!("recurrent state restore after probation failed: {e}");
+                                                    }
                                                     graph_validations += 1;
                                                 } else {
                                                     warn!("CUDA graph replay!=eager at pos={pos} (argmax {:?} vs {:?}); discarding graph, eager decode for rest of request",
@@ -2009,10 +2104,7 @@ impl LlmEngine {
                     // ctx the n-gram accept rate collapses so the per-position verify GEMVs
                     // are a net loss on both devices (qwen3/deepcoder 2.5K loss->tie once
                     // gated). (Proper fix = cpu_q8_kv::attention_multi.)
-                    let pld_active = pld_enabled
-                        && pld_cooldown == 0
-                        && pld_cost.worth_trying()
-                        && pos <= pld_max_ctx_threshold();
+                    let pld_active = pld_enabled && pld_cooldown == 0 && pld_cost.worth_trying();
                     pld_cooldown = pld_cooldown.saturating_sub(1);
                     // Spec-decode: draft K from the drafter model when active,
                     // else the n-gram PLD draft. Verify below re-samples every position.
@@ -2034,7 +2126,20 @@ impl LlmEngine {
                         // until the policy tries it again.
                         time_plain = true;
                     }
-                    let draft: Vec<u32> = if spec_on {
+                    // A copy of a span already seen drafts before the head: it reaches
+                    // farther and is right more often; the head drafts when there is none.
+                    let copied: Vec<u32> = if head_on && pld_active && copies_pay {
+                        let mut c = super::decode::copy_draft(&pld_cache);
+                        c.truncate(window_cap);
+                        c
+                    } else {
+                        Vec::new()
+                    };
+                    let draft_copied = !copied.is_empty();
+                    let draft: Vec<u32> = if draft_copied {
+                        draft_secs = head_draft_secs;
+                        copied
+                    } else if spec_on {
                         let d = spec_engine.draft_k(
                             next_token,
                             want,
@@ -2096,6 +2201,14 @@ impl LlmEngine {
                                 config.recorded_drafts && graph_ok && !graph_disabled_this_request;
                             #[cfg(feature = "cuda")]
                             let replaying = std::time::Instant::now();
+                            if head_on {
+                                window_iters += 1;
+                                window_before_ns += (cycle_start.elapsed().as_secs_f64()
+                                    - head_draft_secs)
+                                    .max(0.0)
+                                    .mul_add(1e9, 0.0)
+                                    as u64;
+                            }
                             let recorded = match (windows_served, graph_stream.as_ref()) {
                                 (true, Some(s)) => super::decode::verify_recorded(
                                     &mut state.model,
@@ -2245,6 +2358,14 @@ impl LlmEngine {
                                 if !spec_on && !head_on && replay_secs.is_none() {
                                     pld_cost.round(cycle_secs, n_committed);
                                 }
+                                if pld_enabled {
+                                    pld_cache.push_many(&draft[..accepted_drafts]);
+                                }
+                                if draft_copied {
+                                    copy_windows += 1;
+                                    copy_drafted += k as u64;
+                                    copy_accepted += accepted_drafts as u64;
+                                }
                                 if head_on {
                                     head_tokens.clear();
                                     head_tokens.extend_from_slice(&draft[..accepted_drafts]);
@@ -2253,16 +2374,23 @@ impl LlmEngine {
                                     if recorded_window {
                                         head_recorded += 1;
                                     }
-                                    spec_drafted += k as u64;
-                                    spec_accepted += accepted_drafts as u64;
-                                    let mut length = spec_engine
-                                        .draft_length
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner());
-                                    if charged {
-                                        length.record(k, accepted_drafts, draft_secs, cycle_secs);
-                                    } else {
-                                        length.record_accepted(k, accepted_drafts);
+                                    if !draft_copied {
+                                        spec_drafted += k as u64;
+                                        spec_accepted += accepted_drafts as u64;
+                                        let mut length = spec_engine
+                                            .draft_length
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        if charged {
+                                            length.record(
+                                                k,
+                                                accepted_drafts,
+                                                draft_secs,
+                                                cycle_secs,
+                                            );
+                                        } else {
+                                            length.record_accepted(k, accepted_drafts);
+                                        }
                                     }
                                 }
 
@@ -2304,6 +2432,10 @@ impl LlmEngine {
                                 // (temperature=0 path), forward the device-
                                 // resident U32 tensor so the next non-PLD iter
                                 // can skip Tensor::new H->D round-trip.
+                                cycle_end = Some(std::time::Instant::now());
+                                if head_on {
+                                    window_tail_ns += committing.elapsed().as_nanos() as u64;
+                                }
                                 drop(guard); // lock released
                                 Some((
                                     committed,
@@ -2503,7 +2635,7 @@ impl LlmEngine {
                         } else {
                             pld_cost.plain_step(cycle_start.elapsed().as_secs_f64());
                         }
-                        if time_plain {
+                        if time_plain && !probation_step {
                             spec_engine
                                 .draft_length
                                 .lock()
@@ -2569,17 +2701,27 @@ impl LlmEngine {
                 }
                 if spec_drafted > 0 || head_cycles > 0 || head_empty > 0 {
                     info!(
-                        "Spec decode done: drafted={} accepted={} ({}%), next draft length {}; head: {head_cycles} verifies ({head_recorded} recorded: replayed in {:.1} ms of which {:.1} preparing and {:.1} launching, committed in {:.1} ms, settled in {:.1} ms each), {head_empty} steps without a guess ({head_unsure} the head was unsure of); {}",
+                        "Spec decode done: drafted={} accepted={} ({}%), next draft length {}; copies: {copy_windows} windows, {copy_accepted} of {copy_drafted} kept; plain step: {} launch, {} wait, {} sample ms over {plain_steps}; head: {head_cycles} verifies ({head_recorded} recorded: replayed in {:.1} ms of which {:.1} preparing and {:.1} launching, committed in {:.1} ms, settled in {:.1} ms each), {head_empty} steps without a guess ({head_unsure} the head was unsure of); {}; loop {:.1} ms an iteration ({} iterations), before the cycle {:.1} ms, after it {:.1} ms, the head's attempt {:.1} ms; a window's iteration before the verify {:.1} ms, from its commit to the cycle's end {:.1} ms",
                         spec_drafted,
                         spec_accepted,
                         spec_accepted * 100 / spec_drafted.max(1),
                         spec_engine.draft_length(),
+                        plain_launch_ns as f64 / 1e6 / plain_steps.max(1) as f64,
+                        plain_wait_ns as f64 / 1e6 / plain_steps.max(1) as f64,
+                        plain_sample_ns as f64 / 1e6 / plain_steps.max(1) as f64,
                         replay_sum * 1e3 / head_recorded.max(1) as f64,
                         verify_graphs.prepare_secs * 1e3 / head_recorded.max(1) as f64,
                         verify_graphs.launch_secs * 1e3 / head_recorded.max(1) as f64,
                         commit_sum * 1e3 / head_recorded.max(1) as f64,
                         settle_secs * 1e3 / settles.max(1) as f64,
-                        spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).summary()
+                        spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).summary(),
+                        compute_ns as f64 / 1e6 / loop_iters.max(1) as f64,
+                        loop_iters,
+                        loop_before_ns as f64 / 1e6 / loop_iters.max(1) as f64,
+                        loop_after_ns as f64 / 1e6 / loop_iters.max(1) as f64,
+                        head_attempt_ns as f64 / 1e6 / loop_iters.max(1) as f64,
+                        window_before_ns as f64 / 1e6 / window_iters.max(1) as f64,
+                        window_tail_ns as f64 / 1e6 / window_iters.max(1) as f64,
                     );
                 }
             }
@@ -2605,6 +2747,13 @@ impl LlmEngine {
                 }
             }
             info!("🏁 Streaming generation complete: {} tokens", token_count);
+            if let Some(start) = decode_free_start {
+                if let Some(s) = model_state.blocking_lock().as_mut() {
+                    if let Some(end) = s.model.free_device_memory() {
+                        s.model.note_decode_reserve(start.saturating_sub(end));
+                    }
+                }
+            }
             if !generated_token_ids.is_empty() && generated_token_ids.len() <= 50 {
                 debug!("Generated {} token IDs", generated_token_ids.len());
             }

@@ -44,6 +44,7 @@ impl GenericWeights<'_> {
         kv_quant: KvQuant,
         max_kv_seq_len: Option<usize>,
         stem_on_card: bool,
+        draft_resident: bool,
     ) -> crate::tensor::Result<GenericHeteroTransformer> {
         match self {
             GenericWeights::Gguf { mmap_bytes, mmap } => {
@@ -59,6 +60,7 @@ impl GenericWeights<'_> {
                     kv_quant,
                     max_kv_seq_len,
                     stem_on_card,
+                    draft_resident,
                 )
             }
             GenericWeights::GgufSplit { split } => GenericHeteroTransformer::from_split_gguf(
@@ -68,6 +70,7 @@ impl GenericWeights<'_> {
                 kv_quant,
                 max_kv_seq_len,
                 stem_on_card,
+                draft_resident,
             ),
             GenericWeights::Awq { dir, shards } => {
                 use crate::inference::load::awq_loader as awql;
@@ -100,6 +103,7 @@ impl GenericWeights<'_> {
                     kv_quant,
                     max_kv_seq_len,
                     stem_on_card,
+                    draft_resident,
                 )
             }
         }

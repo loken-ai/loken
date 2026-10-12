@@ -913,7 +913,7 @@ impl LlmEngine {
                     // recorded step's kernels, which an eager step before the recording does not
                     // run (its indexed attention selects on the host).
                     let head_draft: Vec<u32> = if head_on && cuda_graph.is_some() {
-                        let want = spec_engine.draft_length().min(verify_graphs.draft_cap());
+                        let want = spec_engine.draft_length();
                         if want == 0 {
                             Vec::new()
                         } else {
@@ -924,6 +924,12 @@ impl LlmEngine {
                             )
                         }
                     } else {
+                        // Before the step is recorded the head drafts nothing, but reads the
+                        // step's pair so that its history follows the sequence.
+                        if head_on && !graph_disabled_this_request && !head_tokens.is_empty() {
+                            let _ = state.model.draft_head_tokens(&head_tokens, 0, 0.0);
+                            head_tokens.clear();
+                        }
                         Vec::new()
                     };
                     let head_draft_secs = head_draft_started.elapsed().as_secs_f64();
@@ -935,10 +941,7 @@ impl LlmEngine {
                     }
                     let verify_step = spec_on
                         || !head_draft.is_empty()
-                        || (pld_enabled
-                            && pld_cooldown == 0
-                            && pos <= pld_max_ctx_threshold()
-                            && pld_cache.lookup().len() >= 2);
+                        || (pld_enabled && pld_cooldown == 0 && pld_cache.lookup().len() >= 2);
                     let graph_enabled = graph_auto_on_cached && kv_safe_cached && !verify_step;
                     // Option-E split path (commit 787986a): F-dtype-only
                     // models route through prepare_all_kv (uncaptured) +
@@ -1204,6 +1207,11 @@ impl LlmEngine {
                                                     &mut logits_processor,
                                                 )?;
                                                 record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
+                                                if head_on {
+                                                    // The eager forward left the step's row to the head.
+                                                    head_tokens.clear();
+                                                    head_tokens.push(next_token);
+                                                }
                                                 continue;
                                             }
                                         }
@@ -1290,6 +1298,11 @@ impl LlmEngine {
                             &mut logits_processor,
                         )?;
                         record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
+                        if head_on {
+                            // The eager forward left the step's row to the head.
+                            head_tokens.clear();
+                            head_tokens.push(next_token);
+                        }
                         continue;
                     }
 
@@ -1387,6 +1400,12 @@ impl LlmEngine {
                                                             &mut logits_processor,
                                                         )?;
                                                         record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
+                                                        if head_on {
+                                                            // The head reads the step's token with the row the step left.
+                                                            state.model.step_feature();
+                                                            head_tokens.clear();
+                                                            head_tokens.push(next_token);
+                                                        }
                                                         graph_logits = Some(logits);
                                                         cuda_graph = Some(g);
                                                         continue;
@@ -1404,7 +1423,12 @@ impl LlmEngine {
                                                     record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
                                                     state.model.invalidate_graph_state();
                                 verify_graphs.clear();
-                                                    continue;
+                                                    if head_on {
+                                                    // The eager forward left the step's row to the head.
+                                                    head_tokens.clear();
+                                                    head_tokens.push(next_token);
+                                                }
+                                                continue;
                                                 }
                                                 Err(e) => {
                                                     warn!("graph probation eager forward failed at pos={pos}: {e}; trusting captured graph");
@@ -1418,7 +1442,13 @@ impl LlmEngine {
                                                         &mut logits_processor,
                                                     )?;
                                                     record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
-                                                    graph_logits = Some(logits);
+                                                    if head_on {
+                                                            // The head reads the step's token with the row the step left.
+                                                            state.model.step_feature();
+                                                            head_tokens.clear();
+                                                            head_tokens.push(next_token);
+                                                        }
+                                                        graph_logits = Some(logits);
                                                     cuda_graph = Some(g);
                                                     continue;
                                                 }
@@ -1506,9 +1536,7 @@ impl LlmEngine {
                     // CPU-only" gate was wrong: on GPU too, PLD's long-ctx accept collapse
                     // makes the per-position verify GEMVs a net loss (qwen3/deepcoder 2.5K
                     // loss->tie once gated). (Proper fix = cpu_q8_kv::attention_multi.)
-                    let pld_ctx_ok = pos <= pld_max_ctx_threshold();
-                    let pld_active =
-                        pld_enabled && pld_cooldown == 0 && pld_ctx_ok && pld_cost.worth_trying();
+                    let pld_active = pld_enabled && pld_cooldown == 0 && pld_cost.worth_trying();
                     pld_cooldown = pld_cooldown.saturating_sub(1);
                     // Spec-decode: when a drafter is active, draft K tokens from
                     // it (its KV is at `pos`, in lockstep with the target). Otherwise

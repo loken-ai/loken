@@ -61,6 +61,7 @@ impl TierState {
 }
 
 mod graph;
+pub(crate) use graph::mapped;
 pub use graph::TierWorker;
 
 /// Set by the tests that run the kernels of a recorded decode without recording them.
@@ -396,6 +397,7 @@ impl super::GenericHeteroTransformer {
         cuda_devices: &std::collections::HashMap<usize, Device>,
         plan: &crate::inference::place::layer_executor::HeteroPlan,
         free_before: &std::collections::HashMap<usize, u64>,
+        draft_resident: bool,
     ) -> Result<()> {
         use super::LayerDevice;
         use crate::inference::place::{expert_cache, layer_executor::DeviceKind};
@@ -447,12 +449,14 @@ impl super::GenericHeteroTransformer {
                     )
                 })
                 .sum();
-            // The draft head's layer, when it runs on this card with its experts on the host,
-            // keeps every one of its experts on the card: a draft that missed one would wait
-            // for the host at each guess. Its stacks come off the budget before the slots.
+            // The draft head's layer, when the drafts run and it runs on this card with its
+            // experts on the host, keeps every one of its experts on the card: a draft that
+            // missed one would wait for the host at each guess. Its stacks come off the budget
+            // before the slots.
             let draft_bytes = self
                 .draft
                 .as_ref()
+                .filter(|_| draft_resident)
                 .filter(|d| d.layer_dev == LayerDevice::Cuda(ordinal))
                 .and_then(|d| d.layer.moe.as_ref())
                 .filter(|m| m.experts_on_host() && serves(m))
@@ -642,6 +646,7 @@ impl super::GenericHeteroTransformer {
                 .count()
         };
         if lent > 0 {
+            self.forget_recorded_drafts();
             crate::inference::place::ladder::release_pools();
             crate::inference::place::vram_manager::residency_changed();
         }
@@ -682,23 +687,49 @@ impl super::GenericHeteroTransformer {
         }
         // What the prefill left in the pools goes back to the card before the slots take theirs.
         crate::inference::place::ladder::release_pools();
+        let mut moved = false;
         for tier in self
             .layers
             .iter()
             .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
         {
+            let had = tier.has_extra();
             // A layer that cannot take its slots back runs on without them.
             match tier.restore_extra() {
                 Ok(n) => copied += n,
                 Err(e) => tracing::warn!("expert tier: the extra slots did not come back: {e}"),
             }
+            moved |= had != tier.has_extra();
+        }
+        if moved {
+            self.forget_recorded_drafts();
         }
         crate::inference::place::vram_manager::residency_changed();
         Ok(copied)
     }
 }
 
+impl super::GenericHeteroTransformer {
+    /// Drops the draft head's recorded guesses: their kernels name the extra slots' memory where
+    /// it was when they were recorded, and the slots were lent or came back elsewhere. The head
+    /// records them again at its next guess.
+    fn forget_recorded_drafts(&mut self) {
+        #[cfg(feature = "cuda")]
+        if let Some(d) = self.draft.as_mut() {
+            d.step = None;
+        }
+    }
+}
+
 impl LayerTier {
+    /// Whether the extra slots hold their memory now, rather than lending it.
+    pub fn has_extra(&self) -> bool {
+        self.extra
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     /// This tier with room to read a wide batch's experts whole: `buffer` of `stager`, the
     /// host stacks page-locked when `pin`.
     pub fn with_stage(
@@ -3135,6 +3166,85 @@ mod tests {
     /// The rows of a draft verify as the kernels of the recorded decode, with a transit room
     /// taking a share of each request's missing experts and the card running them after its
     /// wait, give what the host's expert loop gives each row.
+    /// A request every expert of which is cached is not waited for, so the late pairs the
+    /// host handed for an earlier request must not be read again: the card clears their
+    /// count as it plans.
+    #[test]
+    fn a_cached_request_reads_no_late_pairs_of_the_request_before() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
+        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
+        let mut tiered = layer(&card, experts, used, hidden, ffn);
+        let widest = [0, 1, 2].map(|i| {
+            [
+                tiered.gate_exps_sep.as_ref().unwrap(),
+                tiered.up_exps_sep.as_ref().unwrap(),
+                &tiered.down_exps,
+            ][i]
+                .native_qtensor()
+                .data()
+                .len()
+        });
+        let stager = CardStager::new(&card, widest, experts).unwrap();
+        let built = LayerTier::new(&tiered, &card, 6)
+            .unwrap()
+            .with_stage(&stager, 0, false)
+            .unwrap();
+        tiered.tier = Some(Arc::new(built));
+        let tier = tiered.tier.clone().unwrap();
+        tier.enable_graph(hidden, used, 4).unwrap();
+        let worker = TierWorker::start(&card, vec![tier.clone()]).unwrap();
+        GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
+        let x = values(hidden, 100, 1.0);
+        let on_host = Tensor::from_vec(x.clone(), (1, 1, hidden), &Device::Cpu).unwrap();
+        let on_card = Tensor::from_vec(x, (1, 1, hidden), &card).unwrap();
+        let want = reference
+            .forward(&on_host, &on_host, hidden, 1e-5, false)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // The same token until its experts are all cached, then once more with late pairs
+        // left in the mailbox as a request with misses leaves them.
+        let mut cached = false;
+        for _ in 0..12 {
+            let (routed, hits, _) = tier.counters();
+            let _ = tiered
+                .forward(&on_card, &on_card, hidden, 1e-5, false)
+                .unwrap();
+            tier.settle();
+            let (routed_after, hits_after, _) = tier.counters();
+            if routed_after - routed == hits_after - hits {
+                cached = true;
+                break;
+            }
+        }
+        assert!(cached, "the token's experts never all came to the card");
+        tier.hand_late_for_test(&[(0, 0, 1.0), (1, 0, 1.0)]);
+        let got = tiered
+            .forward(&on_card, &on_card, hidden, 1e-5, false)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        tier.settle();
+        GRAPH_WITHOUT_CAPTURE.store(false, Ordering::Relaxed);
+        let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst <= 2e-2 * peak, "max diff {worst} of {peak}");
+        drop(worker);
+    }
+
     #[test]
     fn the_rows_of_a_verify_through_the_recorded_decode_and_the_transit_room_match_the_host() {
         let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());

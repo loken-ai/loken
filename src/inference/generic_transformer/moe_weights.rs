@@ -426,7 +426,13 @@ impl SharedExpert {
     ) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if let (Some(gate), Some(w)) = (&self.gate, &self.scalar_gate) {
-            if xs.device().is_cuda() && xs.dims().first() == Some(&1) {
+            // A decoded token or a window's rows: the pair of projections (fused for one
+            // row), the gate, the down projection and the gated sum, each over every row.
+            let rows = xs.dims().first().copied().unwrap_or(0);
+            if xs.device().is_cuda()
+                && rows >= 1
+                && rows <= crate::inference::engine::decode_step::VERIFY_ROWS
+            {
                 if let Some(down) = projected {
                     if let Some(sum) = crate::inference::moe_cuda::shexp_tail(routed, &down, xs, w)?
                     {
@@ -461,20 +467,6 @@ impl SharedExpert {
                 let g = g.to_dtype(crate::tensor::DType::F32)?;
                 let h = (crate::tensor::ops::silu(&g)? * up)?;
                 return routed + self.finish(xs, self.down.forward(&h)?)?;
-            }
-            // The rows of a verify each as the decoded token's launches: the pair, the down
-            // projection and the join, three launches a row instead of the generic stages.
-            let rows = xs.dims().first().copied().unwrap_or(0);
-            if xs.device().is_cuda()
-                && rows > 1
-                && rows <= crate::inference::engine::decode_step::VERIFY_ROWS
-            {
-                let parts = (0..rows)
-                    .map(|r| {
-                        self.forward_added(&xs.narrow(0, r, 1)?, &routed.narrow(0, r, 1)?, None)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                return Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0);
             }
         }
         routed + self.forward(xs)?
@@ -666,9 +658,11 @@ impl MoeWeights {
     ///       `y   = down_exps[expert] @ (gelu(g) * u)`
     ///       `y  *= down_exps_scale[expert]`
     ///       `out[token] += topk_p * y`
-    /// [`Self::forward`] over the rows of `moe_in`, each row alone and as a decode step
-    /// while a verify holds `DecodeOrder`, so a verified row routes and sums exactly as
-    /// the step it stands for; the whole batch at once otherwise.
+    /// [`Self::forward`] over the rows of `moe_in`. While a verify holds `DecodeOrder` the rows
+    /// take the decode kernels, so a verified row routes and sums exactly as the step it
+    /// stands for: together through a tier on a card (the kernels work a routed pair at a time,
+    /// and a token's pairs are summed in rank order), one at a time elsewhere. The whole batch
+    /// at once otherwise.
     pub(super) fn forward_rows(
         &self,
         moe_in: &Tensor,
@@ -679,17 +673,15 @@ impl MoeWeights {
         let seq = moe_in.dim(1)?;
         // A layer whose experts pass through a cache takes the rows together: it routes every
         // row alone, and its card runs each row's pairs as it would the decoded token's.
+        let decode_order = crate::tensor::quantized::DecodeOrder::active();
+        // A tier, cached or resident, runs every row's pairs in the decode kernels on the card.
+        let on_card = moe_in.device().runs_as_card() && !self.up_relu2 && self.tier.is_some();
+        // A cached layer's rows go through the cache as decoded tokens, prompt or verify.
         let cached =
             moe_in.device().runs_as_card() && self.tier.as_ref().is_some_and(|t| !t.is_resident());
-        if seq == 1 || !crate::tensor::quantized::DecodeOrder::active() || cached {
-            let rows_as_decode = seq > 1 && cached;
-            return self.forward(
-                moe_in,
-                attn_out,
-                n_embd,
-                rms_eps,
-                seq > 1 && !rows_as_decode,
-            );
+        if seq == 1 || !decode_order || on_card {
+            let as_prefill = seq > 1 && !decode_order && !cached;
+            return self.forward(moe_in, attn_out, n_embd, rms_eps, as_prefill);
         }
         // Each row in storage of its own: `forward` reads its input from the start of the
         // storage.

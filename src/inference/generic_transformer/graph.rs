@@ -202,6 +202,25 @@ impl GraphHop {
     }
 
     /// Copies the host memory into the destination buffer on its card's stream.
+    /// How many values of the first `rows` rows are not finite in the host buffer the card
+    /// sent to, and in the landing the next card received: `(host, landing)`.
+    pub(crate) fn finite_report(&self, rows: usize) -> (usize, usize) {
+        let width = self.dst.dims().last().copied().unwrap_or(0);
+        let n = (rows * width).min(self.bytes / 4);
+        let host = unsafe { std::slice::from_raw_parts(self.host as *const f32, n) }
+            .iter()
+            .filter(|v| !v.is_finite())
+            .count();
+        let landing = self
+            .dst
+            .narrow(1, 0, rows.min(self.dst.dims()[1]))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .map(|v| v.iter().filter(|x| !x.is_finite()).count())
+            .unwrap_or(usize::MAX);
+        (host, landing)
+    }
+
     pub(crate) fn receive(&self) -> Result<Tensor> {
         let stream = crate::tensor::cuda_ext::stream_of(&self.dst.device())?;
         let ptr = f32_device_ptr(&self.dst)?;
@@ -801,6 +820,16 @@ impl GenericHeteroTransformer {
         for l in &mut self.layers {
             if let Some(c) = l.quant_kv.as_mut() {
                 c.clear_graph_captured();
+            }
+        }
+        // The memory the dropped graphs reserved goes back to the card: a request's graphs
+        // are recorded again, and the reserve of every request before would stay otherwise.
+        #[cfg(feature = "cuda")]
+        for dev in self.cuda_devices.values() {
+            if let Err(e) = crate::tensor::cuda_ext::stream_of(dev)
+                .and_then(|s| crate::tensor::cuda_ext::graph_mem_trim(&s))
+            {
+                tracing::warn!("graph memory not trimmed: {e}");
             }
         }
     }
@@ -1478,7 +1507,7 @@ impl GenericHeteroTransformer {
 
     /// The rows of `input_ids` (`[1, n]`) decoded from the table on the card, `[1, n, dim]` F32.
     #[cfg(feature = "cuda")]
-    fn embed_rows_on_card(
+    pub(super) fn embed_rows_on_card(
         &self,
         table: &crate::tensor::quantized::QTensor,
         input_ids: &Tensor,
@@ -1496,7 +1525,7 @@ impl GenericHeteroTransformer {
     }
 
     #[cfg(not(feature = "cuda"))]
-    fn embed_rows_on_card(
+    pub(super) fn embed_rows_on_card(
         &self,
         _table: &crate::tensor::quantized::QTensor,
         input_ids: &Tensor,
@@ -1903,15 +1932,17 @@ impl GenericHeteroTransformer {
     /// the stable logits buffer.
     fn graph_head(&mut self, hidden: Tensor) -> Result<Tensor> {
         // The last layer's row, in a buffer of its own: what the draft head reads after a replay.
-        match self.graph_feature.as_ref() {
-            Some(buffer) => buffer.slice_set(&hidden.to_dtype(crate::tensor::DType::F32)?, 0, 0)?,
-            None => {
-                self.graph_feature = Some(
-                    hidden
-                        .to_dtype(crate::tensor::DType::F32)?
-                        .force_contiguous()?,
-                )
-            }
+        // A row already in F32 is the layer's own buffer, so the copy gets a storage of its own.
+        if self.graph_feature.is_none() {
+            let row = hidden.to_dtype(crate::tensor::DType::F32)?;
+            self.graph_feature = Some(row.zeros_like()?);
+        }
+        if let Some(buffer) = self.graph_feature.as_ref() {
+            buffer.slice_set(
+                &hidden.to_dtype(crate::tensor::DType::F32)?.contiguous()?,
+                0,
+                0,
+            )?;
         }
         self.step_feature();
         let wide_normed: Option<Tensor> = match self.output_hyper.as_ref() {
@@ -2234,7 +2265,8 @@ impl GenericHeteroTransformer {
             match self.free_device_memory() {
                 Some(free) => (free + held)
                     .saturating_sub(window_bytes)
-                    .saturating_sub(chunk_bytes),
+                    .saturating_sub(chunk_bytes)
+                    .saturating_sub(self.decode_reserve),
                 None => return,
             }
         };
@@ -2259,8 +2291,18 @@ impl GenericHeteroTransformer {
     }
 
     /// Free memory on the device holding the first layer, when it is a card.
-    fn free_device_memory(&self) -> Option<u64> {
-        crate::inference::place::room::free_now(&self.layers.first()?.cos.device())
+    /// The least free memory over the model's cards: what every card can still give.
+    pub fn free_device_memory(&self) -> Option<u64> {
+        self.cuda_devices
+            .values()
+            .filter_map(crate::inference::place::room::free_now)
+            .min()
+    }
+
+    /// A request's decode took `bytes` of a card beyond what it had at its start, the
+    /// recorded step, windows and head among them: the snapshots leave that much room.
+    pub fn note_decode_reserve(&mut self, bytes: u64) {
+        self.decode_reserve = self.decode_reserve.max(bytes);
     }
 
     /// The snapshot sharing the longest prefix with `prompt`, as `(index, common)`,

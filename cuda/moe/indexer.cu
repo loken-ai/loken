@@ -85,6 +85,48 @@ extern "C" __global__ void loken_indexer_append_kernel(
     for (int d = threadIdx.x; d < hd; d += blockDim.x) pooled[at + (size_t) d * 32] = row[d];
 }
 
+// The keys of `rows` consecutive positions joined in turn, in one launch: row `r` is at
+// `pos_dev[r]`, its rotation at `rot + r * rot_stride`.
+extern "C" __global__ void loken_indexer_append_rows_kernel(
+        const float * __restrict__ key, float * __restrict__ tail, float * __restrict__ pooled,
+        const float * __restrict__ gamma, const float * __restrict__ rot,
+        const int * __restrict__ pos_dev, int rows, int hd, int block, int half, float eps,
+        int rot_stride) {
+    extern __shared__ float row[];
+    for (int r = 0; r < rows; ++r) {
+        const int pos = pos_dev[r];
+        const int slot = pos % block;
+        const float * k = key + (size_t) r * hd;
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) tail[(size_t) slot * hd + d] = k[d];
+        __syncthreads();
+        if (slot == block - 1) {
+            for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+                float p = 0.f;
+                for (int t = 0; t < block; ++t) p = add(p, tail[(size_t) t * hd + d]);
+                row[d] = __fdiv_rn(p, (float) block);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                rms_norm_row(row, gamma, hd, eps);
+                rotate_row(row, rot + (size_t) r * rot_stride, half);
+            }
+            __syncthreads();
+            const int blk = pos / block;
+            const size_t at = (size_t) (blk / 32) * hd * 32 + (blk % 32);
+            for (int d = threadIdx.x; d < hd; d += blockDim.x) pooled[at + (size_t) d * 32] = row[d];
+            __syncthreads();
+        }
+    }
+}
+
+extern "C" void loken_indexer_append_rows(
+        const float * key, float * tail, float * pooled, const float * gamma, const float * rot,
+        const int * pos_dev, int rows, int hd, int block, int half, float eps, int rot_stride,
+        cudaStream_t stream) {
+    loken_indexer_append_rows_kernel<<<1, 128, hd * sizeof(float), stream>>>(
+        key, tail, pooled, gamma, rot, pos_dev, rows, hd, block, half, eps, rot_stride);
+}
+
 extern "C" void loken_indexer_append(
         const float * key, float * tail, float * pooled, const float * gamma, const float * rot,
         const int * pos_dev, int pos_host, int hd, int block, int half, float eps,
@@ -315,6 +357,30 @@ extern "C" __global__ void loken_kv_append_pos_kernel(
     }
 }
 
+// `rows` rows of keys and values into the cache, row `r` at `pos_dev[r]`.
+extern "C" __global__ void loken_kv_append_pos_rows_kernel(
+        const float * __restrict__ k_new, const float * __restrict__ v_new,
+        __half * __restrict__ kbuf, __half * __restrict__ vbuf, const int * __restrict__ pos_dev,
+        int rows, int n_kv, int cap, int hd) {
+    const int per = n_kv * hd;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < rows * per; i += gridDim.x * blockDim.x) {
+        const int r = i / per, j = i % per;
+        const int h = j / hd, d = j % hd;
+        const int pos = pos_dev[r];
+        const size_t at = ((size_t) h * cap + pos) * hd + d;
+        kbuf[at] = __float2half(k_new[i]);
+        vbuf[at] = __float2half(v_new[i]);
+    }
+}
+
+extern "C" void loken_kv_append_pos_rows(
+        const float * k_new, const float * v_new, void * kbuf, void * vbuf, const int * pos_dev,
+        int rows, int n_kv, int cap, int hd, cudaStream_t stream) {
+    const int n = rows * n_kv * hd;
+    loken_kv_append_pos_rows_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+        k_new, v_new, (__half *) kbuf, (__half *) vbuf, pos_dev, rows, n_kv, cap, hd);
+}
+
 extern "C" void loken_kv_append_pos(
         const float * k_new, const float * v_new, void * kbuf, void * vbuf, const int * pos_dev,
         int pos_host, int n_kv, int cap, int hd, cudaStream_t stream) {
@@ -335,8 +401,17 @@ extern "C" __global__ void loken_selected_attn_split_kernel(
         const __half * __restrict__ vbuf, const uint32_t * __restrict__ sel,
         const uint32_t * __restrict__ count, float * __restrict__ part_o,
         float * __restrict__ part_ml, int n_head, int n_kv, int cap, int hd, int chunk_max,
-        int splits, float scale) {
+        int splits, float scale, int sel_stride) {
     extern __shared__ float smem[];
+    // Row `blockIdx.z` of a launch over several rows: its query, its kept tokens and its runs.
+    {
+        const size_t row = blockIdx.z;
+        q += row * n_head * hd;
+        sel += row * sel_stride;
+        count += row;
+        part_o += row * n_head * splits * hd;
+        part_ml += row * n_head * splits * 2;
+    }
     float * scores = smem;
     float * qs = smem + chunk_max;
     float * part = qs + hd;
@@ -464,8 +539,14 @@ extern "C" __global__ void loken_selected_attn_split_kernel(
 // The runs' answers joined: each run's sums are scaled to the largest maximum among them.
 extern "C" __global__ void loken_selected_attn_join_kernel(
         const float * __restrict__ part_o, const float * __restrict__ part_ml,
-        float * __restrict__ out, int hd, int splits) {
+        float * __restrict__ out, int hd, int splits, int n_head) {
     const int h = blockIdx.x;
+    {
+        const size_t row = blockIdx.y;
+        part_o += row * n_head * splits * hd;
+        part_ml += row * n_head * splits * 2;
+        out += row * n_head * hd;
+    }
     float m = __int_as_float(0xff800000);
     for (int s = 0; s < splits; ++s) m = fmaxf(m, part_ml[((size_t) h * splits + s) * 2]);
     float total = 0.f;
@@ -493,9 +574,27 @@ extern "C" void loken_selected_attn(
     const size_t smem = (size_t) (chunk_max + hd + (threads / 32) * hd) * sizeof(float);
     loken_selected_attn_split_kernel<<<dim3(n_head, splits), threads, smem, stream>>>(
         q, (const __half *) kbuf, (const __half *) vbuf, sel, count, part_o, part_ml, n_head, n_kv,
-        cap, hd, chunk_max, splits, scale);
+        cap, hd, chunk_max, splits, scale, 0);
     loken_selected_attn_join_kernel<<<n_head, hd < 1024 ? hd : 1024, 0, stream>>>(
-        part_o, part_ml, out, hd, splits);
+        part_o, part_ml, out, hd, splits, n_head);
+}
+
+// `loken_selected_attn` over `rows` decode steps at once: row `r` reads its query at
+// `q + r * n_head * hd`, its kept tokens at `sel + r * sel_stride` and `count[r]`, and writes
+// `out + r * n_head * hd`, each row with the splits and sums of a step alone.
+extern "C" void loken_selected_attn_steps(
+        const float * q, const void * kbuf, const void * vbuf, const uint32_t * sel,
+        const uint32_t * count, float * out, float * part_o, float * part_ml, int n_head,
+        int n_kv, int cap, int hd, int ncap, int splits, float scale, int rows, int sel_stride,
+        cudaStream_t stream) {
+    const int threads = 256;
+    const int chunk_max = (ncap + splits - 1) / splits;
+    const size_t smem = (size_t) (chunk_max + hd + (threads / 32) * hd) * sizeof(float);
+    loken_selected_attn_split_kernel<<<dim3(n_head, splits, rows), threads, smem, stream>>>(
+        q, (const __half *) kbuf, (const __half *) vbuf, sel, count, part_o, part_ml, n_head, n_kv,
+        cap, hd, chunk_max, splits, scale, sel_stride);
+    loken_selected_attn_join_kernel<<<dim3(n_head, rows), hd < 1024 ? hd : 1024, 0, stream>>>(
+        part_o, part_ml, out, hd, splits, n_head);
 }
 
 // Attention of the rows of a prompt chunk, each over its own kept tokens. A block takes one row and

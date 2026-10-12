@@ -39,14 +39,14 @@ __device__ __forceinline__ float block_sum(float v) {
 
 } // namespace
 
-extern "C" __global__ void loken_qk_prep_kernel(
+// One head of one row: block `b` names the head among the queries, the keys and the values.
+__device__ __forceinline__ void qk_prep_head(
         const void * __restrict__ q, const void * __restrict__ k, const void * __restrict__ v,
         const float * __restrict__ qw, const float * __restrict__ kw,
         const float * __restrict__ cs, const float * __restrict__ sn,
         float * __restrict__ qo, float * __restrict__ ko, float * __restrict__ vo,
-        int n_head, int n_kv, int hd, int rope_dim, int interleaved, float eps, int in_f16) {
-    extern __shared__ float row[];
-    const int b = blockIdx.x;
+        int n_head, int n_kv, int hd, int rope_dim, int interleaved, float eps, int in_f16,
+        float * row, int b) {
     const void * src;
     const float * w = nullptr;
     float * dst;
@@ -97,6 +97,46 @@ extern "C" __global__ void loken_qk_prep_kernel(
         }
         dst[d] = out;
     }
+}
+
+extern "C" __global__ void loken_qk_prep_kernel(
+        const void * __restrict__ q, const void * __restrict__ k, const void * __restrict__ v,
+        const float * __restrict__ qw, const float * __restrict__ kw,
+        const float * __restrict__ cs, const float * __restrict__ sn,
+        float * __restrict__ qo, float * __restrict__ ko, float * __restrict__ vo,
+        int n_head, int n_kv, int hd, int rope_dim, int interleaved, float eps, int in_f16) {
+    extern __shared__ float row[];
+    qk_prep_head(q, k, v, qw, kw, cs, sn, qo, ko, vo, n_head, n_kv, hd, rope_dim, interleaved, eps,
+                 in_f16, row, blockIdx.x);
+}
+
+// The same over `rows` rows at once: block `(b, r)` is head `b` of row `r`; the rotation
+// tables hold one row of `half` values a row.
+extern "C" __global__ void loken_qk_prep_rows_kernel(
+        const void * __restrict__ q, const void * __restrict__ k, const void * __restrict__ v,
+        const float * __restrict__ qw, const float * __restrict__ kw,
+        const float * __restrict__ cs, const float * __restrict__ sn,
+        float * __restrict__ qo, float * __restrict__ ko, float * __restrict__ vo,
+        int n_head, int n_kv, int hd, int rope_dim, int interleaved, float eps, int in_f16) {
+    extern __shared__ float row[];
+    const size_t r = blockIdx.y;
+    const size_t in_bytes = in_f16 ? 2 : 4;
+    const int half = rope_dim / 2;
+    qk_prep_head((const char *) q + r * n_head * hd * in_bytes,
+                 (const char *) k + r * n_kv * hd * in_bytes,
+                 (const char *) v + r * n_kv * hd * in_bytes, qw, kw, cs + r * half, sn + r * half,
+                 qo + r * n_head * hd, ko + r * n_kv * hd, vo + r * n_kv * hd, n_head, n_kv, hd,
+                 rope_dim, interleaved, eps, in_f16, row, blockIdx.x);
+}
+
+extern "C" void loken_qk_prep_rows(
+        const void * q, const void * k, const void * v, const float * qw, const float * kw,
+        const float * cs, const float * sn, float * qo, float * ko, float * vo, int rows,
+        int n_head, int n_kv, int hd, int rope_dim, int interleaved, float eps, int in_f16,
+        cudaStream_t stream) {
+    const int threads = hd < 256 ? ((hd + 31) / 32) * 32 : 256;
+    loken_qk_prep_rows_kernel<<<dim3(n_head + 2 * n_kv, rows), threads, hd * sizeof(float), stream>>>(
+        q, k, v, qw, kw, cs, sn, qo, ko, vo, n_head, n_kv, hd, rope_dim, interleaved, eps, in_f16);
 }
 
 extern "C" void loken_qk_prep(

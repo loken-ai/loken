@@ -26,7 +26,7 @@ fn check(what: &str, r: CUresult) -> Result<()> {
 }
 
 /// `bytes` of page-locked memory the card addresses, zeroed: the host's pointer and the card's.
-fn mapped(dev: &Device, bytes: usize) -> Result<(*mut u8, u64)> {
+pub(crate) fn mapped(dev: &Device, bytes: usize) -> Result<(*mut u8, u64)> {
     dev.as_cuda_device()?
         .0
         .context()
@@ -214,6 +214,24 @@ impl Mailbox {
 
     /// Leave `product`, one row per row of the request, for the card and raise the reply word
     /// to `seq`.
+    /// How many values of the last request's rows and of the host's product are not finite,
+    /// over the rows the request named: `(rows, x not finite, product not finite)`.
+    pub(super) fn finite_report(&self) -> (usize, usize, usize) {
+        let rows =
+            (unsafe { std::ptr::read_volatile(self.word(ROWS)) } as usize).clamp(1, self.rows_max);
+        let count = |off: usize, n: usize| unsafe {
+            std::slice::from_raw_parts(self.host.add(off) as *const f32, n)
+                .iter()
+                .filter(|v| !v.is_finite())
+                .count()
+        };
+        (
+            rows,
+            count(self.x, self.hidden * rows),
+            count(self.product, self.hidden * rows),
+        )
+    }
+
     pub(super) fn answer(&self, product: &[f32], seq: u32) {
         debug_assert!(product.len() <= self.hidden * self.rows_max);
         unsafe {
@@ -283,6 +301,11 @@ struct WorkerStats {
     promotions: std::sync::atomic::AtomicU64,
     /// Missing experts the transit room took.
     transit: std::sync::atomic::AtomicU64,
+    /// Requests of one row and of several, and those of each that missed.
+    rows_one: std::sync::atomic::AtomicU64,
+    rows_many: std::sync::atomic::AtomicU64,
+    missed_one: std::sync::atomic::AtomicU64,
+    missed_many: std::sync::atomic::AtomicU64,
 }
 
 /// One more expert landed in a slot of some layer.
@@ -301,6 +324,10 @@ static WORKER: WorkerStats = WorkerStats {
     down_ns: std::sync::atomic::AtomicU64::new(0),
     promotions: std::sync::atomic::AtomicU64::new(0),
     transit: std::sync::atomic::AtomicU64::new(0),
+    rows_one: std::sync::atomic::AtomicU64::new(0),
+    rows_many: std::sync::atomic::AtomicU64::new(0),
+    missed_one: std::sync::atomic::AtomicU64::new(0),
+    missed_many: std::sync::atomic::AtomicU64::new(0),
 };
 
 /// A layer's decoded rows between the post of their request and the wait for the answer.
@@ -353,8 +380,9 @@ impl LayerTier {
                 .map_err(|e| crate::tensor::Error::msg(format!("counter read: {e:?}")))?;
             Ok(out)
         })();
+        let (fr, fx, fp) = g.mail.finite_report();
         Some(format!(
-            "request {request} reply {reply} abort {abort} rows {rows} served {done} counter {:?}",
+            "request {request} reply {reply} abort {abort} rows {rows} served {done} counter {:?}, last rows {fr}: x not finite {fx}, product not finite {fp}",
             counter.ok()
         ))
     }
@@ -441,6 +469,15 @@ impl LayerTier {
     /// run. What the card has to do that does not depend on the host's answer can be queued
     /// before [`Self::graph_end`] waits for it. `xs` is `[rows, hidden]`, the choice
     /// `[rows, k]`.
+    /// Hand the mailbox late pairs as the host would, for a test of a request that must
+    /// not read them.
+    #[cfg(test)]
+    pub(super) fn hand_late_for_test(&self, late: &[(u32, u32, f32)]) {
+        if let Some(g) = self.graph.get() {
+            g.mail.hand_late(late);
+        }
+    }
+
     pub(crate) fn graph_begin(
         &self,
         moe: &MoeWeights,
@@ -487,6 +524,7 @@ impl LayerTier {
                 g.mail.dptr(g.mail.x) as *mut f32,
                 g.mail.dptr(ROWS) as *mut u32,
                 g.mail.dptr(REQUEST) as *mut u32,
+                g.mail.dptr(LIVE) as *mut u32,
                 rows as i32,
                 k as i32,
                 hidden as i32,
@@ -769,11 +807,26 @@ impl LayerTier {
         let us = started.elapsed().as_nanos() as u64;
         let n = WORKER.requests.fetch_add(1, Ordering::Relaxed) + 1;
         let total = WORKER.ns.fetch_add(us, Ordering::Relaxed) + us;
+        let (rows_of, missed_of) = if req.rows > 1 {
+            (&WORKER.rows_many, &WORKER.missed_many)
+        } else {
+            (&WORKER.rows_one, &WORKER.missed_one)
+        };
+        rows_of.fetch_add(1, Ordering::Relaxed);
         if !miss_pairs.is_empty() {
             WORKER.missed.fetch_add(1, Ordering::Relaxed);
+            missed_of.fetch_add(1, Ordering::Relaxed);
         }
         if n % 4096 == 0 {
             let missed = WORKER.missed.load(Ordering::Relaxed).max(1);
+            let pct = |m: &std::sync::atomic::AtomicU64, r: &std::sync::atomic::AtomicU64| {
+                100.0 * m.load(Ordering::Relaxed) as f64 / r.load(Ordering::Relaxed).max(1) as f64
+            };
+            tracing::info!(
+                "expert tier worker: {:.0}% of one-row requests and {:.0}% of windows missed",
+                pct(&WORKER.missed_one, &WORKER.rows_one),
+                pct(&WORKER.missed_many, &WORKER.rows_many)
+            );
             tracing::info!(
                 "expert tier worker: {} us a request, {:.0}% had a missing expert: {:.1} missing ({:.2} to transit), product {} us (ready {}, gate and up {}, down {}), {:.2} promotions a request; transit share {}/8 (one row) {}/8 (rows), host {:.0}/{:.0} us an expert, copy {:.0}/{:.0} us",
                 total / n / 1000,

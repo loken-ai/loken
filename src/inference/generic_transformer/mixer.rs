@@ -128,6 +128,71 @@ impl MixerState {
 
 /// `src` written into `dst`'s card buffers where they lie; an error when the two differ in
 /// kind or shape, or live on the host.
+/// The card address of `t`'s first element, `None` off a card.
+#[cfg(feature = "cuda")]
+fn card_address(t: &Tensor) -> Option<u64> {
+    use cudarc::driver::DevicePtr;
+    let (storage, layout) = t.storage_and_layout();
+    match &*storage {
+        crate::tensor::StorageView::Cuda(c) => {
+            let bytes = t.dtype().size_in_bytes();
+            c.as_cuda_slice::<f32>()
+                .ok()
+                .map(|s| s.device_ptr(s.stream()).0 + (layout.start_offset() * bytes) as u64)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn card_address(_t: &Tensor) -> Option<u64> {
+    None
+}
+
+/// Whether `a` and `b` are the same buffer: the same tensor, or the same card address.
+fn same_buffer(a: &Tensor, b: &Tensor) -> bool {
+    a.id() == b.id() || matches!((card_address(a), card_address(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// `fresh` becomes the convolution's state, written into the held buffer when it matches: a
+/// recorded step reads the state where it lies, so the buffer never changes under it.
+fn hold_conv(slot: &mut Option<ConvState>, fresh: Tensor) -> Result<()> {
+    if let Some(ConvState::Card(held)) = slot.as_ref() {
+        if same_buffer(held, &fresh) {
+            return Ok(());
+        }
+        if held.dims() == fresh.dims()
+            && held.dtype() == fresh.dtype()
+            && held.device().same_device(&fresh.device())
+        {
+            return held.slice_set(&fresh, 0, 0);
+        }
+    }
+    *slot = Some(ConvState::Card(fresh));
+    Ok(())
+}
+
+/// `conv` and `h` become the recurrence's state, written into the held buffers when they
+/// match: a recorded step reads the state where it lies, so the buffers never change under it.
+fn hold_ssm(slot: &mut Option<SsmState>, conv: Tensor, h: Tensor) -> Result<()> {
+    if let Some(SsmState::Card { conv: c0, h: h0 }) = slot.as_ref() {
+        let same = |a: &Tensor, b: &Tensor| {
+            a.dims() == b.dims() && a.dtype() == b.dtype() && a.device().same_device(&b.device())
+        };
+        if same(c0, &conv) && same(h0, &h) {
+            if !same_buffer(c0, &conv) {
+                c0.slice_set(&conv, 0, 0)?;
+            }
+            if !same_buffer(h0, &h) {
+                h0.slice_set(&h, 0, 0)?;
+            }
+            return Ok(());
+        }
+    }
+    *slot = Some(SsmState::Card { conv, h });
+    Ok(())
+}
+
 fn copy_state_in_place(dst: &MixerState, src: &MixerState) -> Result<()> {
     let copy = |d: &Tensor, s: &Tensor| -> Result<()> {
         if d.dims() != s.dims() || d.dtype() != s.dtype() {
@@ -159,6 +224,28 @@ impl Mixer {
     /// True for a mixer whose decode step advances its state where it lies, so a step run
     /// again reads and writes the same buffers, and that is worth recording: the delta rule
     /// through its fused recurrence, and the short convolution, on a card.
+    /// The shapes of a window's state snapshots a row, for a mixer that keeps them.
+    pub fn snapshot_shapes(&self) -> Option<((usize, usize, usize), (usize, usize))> {
+        match self {
+            Mixer::DeltaNet(m) => Some(m.snapshot_shapes()),
+            _ => None,
+        }
+    }
+
+    pub fn set_snapshots(&mut self, snaps: Option<(Tensor, Tensor, usize)>) {
+        if let Mixer::DeltaNet(m) = self {
+            m.set_snapshots(snaps);
+        }
+    }
+
+    /// The state after row `at` of the last window copied back: `false` when none holds it.
+    pub fn restore_from_snapshot(&self, at: usize) -> Result<bool> {
+        match self {
+            Mixer::DeltaNet(m) => m.restore_from_snapshot(at),
+            _ => Ok(false),
+        }
+    }
+
     pub fn decodes_in_place(&self, device: &Device) -> bool {
         match self {
             Mixer::DeltaNet(m) => m.steps_in_place(device),
@@ -340,7 +427,7 @@ impl ShortConv {
             let y = self.host_steps(&proj.to_dtype(DType::F32)?, seq)?;
             return Tensor::from_vec(y, (1, seq, self.d_model), &x.device())?.to_dtype(x.dtype());
         }
-        let state = match self.state.take() {
+        let state = match self.state.clone() {
             Some(ConvState::Card(t)) => t,
             _ => Tensor::zeros_on((b, self.d_model, self.l_cache - 1), DType::F32, &x.device())?,
         };
@@ -367,7 +454,7 @@ impl ShortConv {
             state = next;
             rows.push(y.to_dtype(x.dtype())?.unsqueeze(1)?);
         }
-        self.state = Some(ConvState::Card(state));
+        hold_conv(&mut self.state, state)?;
         if rows.len() == 1 {
             return Ok(rows.pop().unwrap());
         }
@@ -581,7 +668,7 @@ impl Mamba2 {
             );
             return Tensor::from_vec(y, (1, seq, dims.d_inner), &x.device())?.to_dtype(x.dtype());
         }
-        let (mut conv, mut h) = match self.state.take() {
+        let (mut conv, mut h) = match self.state.clone() {
             Some(SsmState::Card { conv, h }) => (conv, h),
             _ => (
                 Tensor::zeros_on((b, dims.d_xbc(), dims.d_conv), DType::F32, &x.device())?,
@@ -643,7 +730,7 @@ impl Mamba2 {
             )?;
             rows.push(y.to_dtype(x.dtype())?.unsqueeze(1)?);
         }
-        self.state = Some(SsmState::Card { conv, h });
+        hold_ssm(&mut self.state, conv, h)?;
         if rows.len() == 1 {
             return Ok(rows.pop().unwrap());
         }
@@ -798,9 +885,43 @@ pub struct GatedDeltaNet {
     pub dims: DeltaDims,
     eps: f64,
     pub state: Option<SsmState>,
+    /// Where a window's rows leave the state after each of its first rows: the recurrence's
+    /// `[rows, v_heads, v_dim, k_dim]`, the convolution's `[rows, conv_dim, taps - 1]`, and
+    /// how many rows they hold. Set for the window's forward, cleared after.
+    snaps: Option<(Tensor, Tensor, usize)>,
 }
 
 impl GatedDeltaNet {
+    /// The shapes of one row's snapshots: the recurrence's state and the convolution's window.
+    pub fn snapshot_shapes(&self) -> ((usize, usize, usize), (usize, usize)) {
+        let d = self.dims;
+        (
+            (d.v_heads, d.v_dim, d.k_dim),
+            (d.conv_dim(), d.conv_kernel - 1),
+        )
+    }
+
+    pub fn set_snapshots(&mut self, snaps: Option<(Tensor, Tensor, usize)>) {
+        self.snaps = snaps;
+    }
+
+    /// Copies the snapshot after row `at` into the held state: `false` when no snapshot holds
+    /// that row or no state is held.
+    pub fn restore_from_snapshot(&self, at: usize) -> Result<bool> {
+        let Some((hs, cs, rows)) = self.snaps.as_ref() else {
+            return Ok(false);
+        };
+        let Some(SsmState::Card { conv, h }) = self.state.as_ref() else {
+            return Ok(false);
+        };
+        if at >= *rows {
+            return Ok(false);
+        }
+        h.slice_set(&hs.narrow(0, at, 1)?.reshape(h.dims())?, 0, 0)?;
+        conv.slice_set(&cs.narrow(0, at, 1)?.reshape(conv.dims())?, 0, 0)?;
+        Ok(true)
+    }
+
     /// The mixer over host tensors `conv_w` `[conv_dim, conv_kernel]`, `a`, `dt_bias`
     /// `[v_heads]` and `norm_w` `[v_dim]`, placed on `device`.
     #[allow(clippy::too_many_arguments)]
@@ -844,6 +965,7 @@ impl GatedDeltaNet {
             dims,
             eps,
             state: None,
+            snaps: None,
         })
     }
 
@@ -961,7 +1083,7 @@ impl GatedDeltaNet {
         let (kg, vg, kd, vd) = (d.k_heads, d.v_heads, d.k_dim, d.v_dim);
         let rep = vg / kg;
         let qk = kd * kg;
-        let (mut conv, mut s) = match self.state.take() {
+        let (mut conv, mut s) = match self.state.clone() {
             Some(SsmState::Card { conv, h }) => (conv, h),
             _ => (
                 Tensor::zeros_on(
@@ -1041,7 +1163,7 @@ impl GatedDeltaNet {
             let y = (on * gate)?.reshape((b, vg * vd))?;
             outs.push(y.to_dtype(x.dtype())?.unsqueeze(1)?);
         }
-        self.state = Some(SsmState::Card { conv, h: s });
+        hold_ssm(&mut self.state, conv, s)?;
         Tensor::cat(&outs.iter().collect::<Vec<_>>(), 1)
     }
 
@@ -1053,7 +1175,7 @@ impl GatedDeltaNet {
         let d = self.dims;
         let (kg, vg, kd, vd) = (d.k_heads, d.v_heads, d.k_dim, d.v_dim);
         let (rep, qk) = (vg / kg, kd * kg);
-        let (conv, s) = match self.state.take() {
+        let (conv, s) = match self.state.clone() {
             Some(SsmState::Card { conv, h }) => (conv, h),
             _ => (
                 Tensor::zeros_on(
@@ -1082,7 +1204,7 @@ impl GatedDeltaNet {
             || (crate::tensor::quantized::DecodeOrder::active()
                 && crate::inference::moe_cuda::in_place_state_on())
         {
-            k::gdn_prep(
+            k::gdn_prep_with_snapshots(
                 &qkv,
                 &conv,
                 &self.conv_w,
@@ -1099,6 +1221,7 @@ impl GatedDeltaNet {
                     tiled: d.v_heads_tiled,
                     eps: 1e-6,
                 },
+                self.snaps.as_ref().map(|(_, cs, n)| (cs, *n)),
             )?
         } else {
             None
@@ -1162,12 +1285,18 @@ impl GatedDeltaNet {
             );
         }
         let (o, s) = staged("gdn_scan", &dev, false, || {
-            k::gated_delta_net(&q, &key, &v, &g, &beta, &s, scale)
+            k::gated_delta_net_with_snapshots(
+                &q,
+                &key,
+                &v,
+                &g,
+                &beta,
+                &s,
+                scale,
+                self.snaps.as_ref().map(|(hs, _, n)| (hs, *n)),
+            )
         })?;
-        self.state = Some(SsmState::Card {
-            conv,
-            h: s.reshape((1, vg, vd, kd))?,
-        });
+        hold_ssm(&mut self.state, conv, s.reshape((1, vg, vd, kd))?)?;
         let o = o.reshape((seq * vg, vd))?;
         let z = z.reshape((seq * vg, vd))?;
         let y = match k::zgate_rmsnorm_f16io(&o, &z, &self.norm_w, self.eps as f32, d.gate_sigmoid)?

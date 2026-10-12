@@ -88,6 +88,10 @@ pub struct InferenceConfigToml {
     /// decodes plainly.
     #[serde(default)]
     pub recorded_drafts: bool,
+    /// A directory the model's probes write the tensors of a prompt's first rows to, for a
+    /// comparison against a reference; none unless set.
+    #[serde(default)]
+    pub probe_dump_dir: Option<String>,
     /// A routing profile (`expert_profile_save` of an earlier run) that fills the expert
     /// caches at the load, before any prompt has routed.
     #[serde(default)]
@@ -280,6 +284,7 @@ impl Config {
             replicas: toml_config.replicas.max(1),
             kv_disk_dir: toml_config.kv_disk_dir.clone(),
             recorded_drafts: toml_config.recorded_drafts,
+            probe_dump_dir: toml_config.probe_dump_dir.clone(),
             expert_profile: toml_config.expert_profile.clone(),
             expert_profile_save: toml_config.expert_profile_save.clone(),
             kv_disk_budget_gb: toml_config.kv_disk_budget_gb,

@@ -466,6 +466,19 @@ pub(crate) trait ModelBackend: Send {
         crate::tensor::bail!("recorded verifies are not supported for this variant")
     }
 
+    /// A recorded window was replayed: its keep holds the state before it.
+    fn verify_window_replayed(&mut self) {}
+
+    /// The layers whose state is not finite, for a report.
+    fn verify_states_report(&self) -> String {
+        String::new()
+    }
+
+    /// The verify's hops, what each card sent and the next received, finite or not.
+    fn verify_hops_report(&self, _rows: usize) -> String {
+        String::new()
+    }
+
     /// For each op of a recorded verify: whether it is recorded in a graph, and the stream of
     /// the card it runs on. Empty when the verify is not cut in ops.
     #[cfg(feature = "cuda")]
@@ -734,6 +747,14 @@ pub(crate) trait ModelBackend: Send {
     /// Drop per-layer graph buffers so the next forward takes the non-graph
     /// path (`forward_attn` keys on `graph_rope_cos.is_some()`).
     fn invalidate_graph_state(&mut self) {}
+
+    /// The least free memory over the model's cards, when it runs on cards.
+    fn free_device_memory(&self) -> Option<u64> {
+        None
+    }
+
+    /// A request's decode took `bytes` of a card beyond what it had at its start.
+    fn note_decode_reserve(&mut self, _bytes: u64) {}
 
     /// Every recurrent state, copied: what lets a decode step be run a second time from the
     /// state the first started from, as the probation of a recorded step does. Empty for a
@@ -1733,6 +1754,21 @@ impl ModelBackend for GenericBackend {
     }
 
     #[cfg(feature = "cuda")]
+    fn verify_window_replayed(&mut self) {
+        self.0.verify_window_replayed()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn verify_states_report(&self) -> String {
+        self.0.verify_states_report()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn verify_hops_report(&self, rows: usize) -> String {
+        self.0.verify_hops_report(rows)
+    }
+
+    #[cfg(feature = "cuda")]
     fn verify_step_ops(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
         self.0.verify_step_ops()
     }
@@ -1935,6 +1971,14 @@ impl ModelBackend for GenericBackend {
         self.0.invalidate_graph_state()
     }
 
+    fn free_device_memory(&self) -> Option<u64> {
+        self.0.free_device_memory()
+    }
+
+    fn note_decode_reserve(&mut self, bytes: u64) {
+        self.0.note_decode_reserve(bytes)
+    }
+
     fn recurrent_checkpoint(
         &self,
     ) -> crate::tensor::Result<Vec<Option<crate::inference::generic_transformer::mixer::MixerState>>>
@@ -2135,6 +2179,14 @@ impl ModelBackend for GenericVisionBackend {
 
     fn invalidate_graph_state(&mut self) {
         self.text.invalidate_graph_state()
+    }
+
+    fn free_device_memory(&self) -> Option<u64> {
+        self.text.free_device_memory()
+    }
+
+    fn note_decode_reserve(&mut self, bytes: u64) {
+        self.text.note_decode_reserve(bytes)
     }
 
     fn recurrent_checkpoint(

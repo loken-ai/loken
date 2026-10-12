@@ -35,6 +35,11 @@ fn sublayer_dtype(x: &Tensor) -> DType {
     sublayer_dtype_of(&x.device())
 }
 
+/// Calls of the wide layer at the prompt's start, for the stage probe's names.
+static WIDE_PROBE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Attention layers probed at the prompt's start, in call order.
+static ATTN_PROBE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(super) fn sublayer_dtype_of(dev: &Device) -> DType {
     if dev.is_cpu() {
         DType::F32
@@ -339,19 +344,20 @@ impl GenericTransformerLayer {
         )
     }
 
-    /// The rows of a recorded verify through an indexed layer's attention: the projections of
-    /// every row in one launch each (the rows take the mat-vecs one by one, as the steps they
-    /// stand for), then each row's indexer step, cache write and attention over its own
-    /// selection, then the gate and the output projection over every row. `None` when a row
-    /// cannot take the fused head preparation: the rows then run one by one.
+    /// The rows of a recorded verify through an indexed layer's attention, each stage one launch
+    /// over the rows with the arithmetic of a row's own step: the projections, the heads' norms
+    /// and rotation, every row's indexer key and cache row in order, every row's selection and
+    /// attention over what its step would see, the gate and the output projection. `None` when
+    /// the rows cannot take the fused head preparation: they then run one by one.
     #[cfg(feature = "cuda")]
     pub(super) fn attend_rows_recorded(
         &mut self,
         x: &Tensor,
         pos: &Tensor,
+        row0: usize,
         rows: usize,
     ) -> Result<Option<Tensor>> {
-        use crate::inference::moe_cuda::{qk_prep, QkShape, StepPos};
+        use crate::inference::moe_cuda::QkShape;
         let hd = self.head_dim;
         if self.qk_norm_is_full() {
             return Ok(None);
@@ -385,13 +391,34 @@ impl GenericTransformerLayer {
             .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?
             .card_projections(x)?;
         let (q_all, k_all, v_all) = self.project_rows(x)?;
-        // A row of `[rows, width]` is a view the kernels read at its offset: no copy.
+        // `[rows, width]`, rows packed: a view where the projection gave them so.
         let by_row = |t: Tensor| -> Result<Tensor> {
             let width = t.dim(2)?;
-            t.reshape((rows, width))
+            t.contiguous()?.reshape((rows, width))
         };
         let (key_all, qi_all) = (by_row(key_all)?, by_row(qi_all)?);
         let (q_all, k_all, v_all) = (by_row(q_all)?, by_row(k_all)?, by_row(v_all)?);
+        let Some((q, k, v)) = crate::inference::moe_cuda::qk_prep_rows(
+            &q_all,
+            &k_all,
+            &v_all,
+            qn.map(|n| n.weight()),
+            kn.map(|n| n.weight()),
+            &cos_rows.narrow(0, row0, rows)?,
+            &sin_rows.narrow(0, row0, rows)?,
+            shape,
+            rows,
+        )?
+        else {
+            return Ok(None);
+        };
+        // Every row's indexer key and cache row join first, in order; each row then selects
+        // and attends over what its own step would: tokens up to its position.
+        let (sel, count) = self
+            .sparse
+            .as_mut()
+            .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?
+            .card_steps_projected(&key_all, &qi_all, pos, row0, rows)?;
         let (Some(k_buf), Some(v_buf)) = (self.kv_cache.k_buffer(), self.kv_cache.v_buffer())
         else {
             crate::tensor::bail!("an indexed layer decodes before its cache holds a token");
@@ -400,53 +427,12 @@ impl GenericTransformerLayer {
         let scale = self
             .attention_scale
             .unwrap_or_else(|| 1.0 / (hd as f64).sqrt()) as f32;
-        let mut ys = Vec::with_capacity(rows);
-        for r in 0..rows {
-            let sparse = self
-                .sparse
-                .as_mut()
-                .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?;
-            let rot = sparse.rot_row(r)?;
-            let pos_r = pos.narrow(0, r, 1)?;
-            sparse.card_step_projected(
-                &key_all.narrow(0, r, 1)?,
-                &qi_all.narrow(0, r, 1)?,
-                StepPos::Card(&pos_r),
-                &rot,
-            )?;
-            let Some((q, k, v)) = qk_prep(
-                &q_all.narrow(0, r, 1)?,
-                &k_all.narrow(0, r, 1)?,
-                &v_all.narrow(0, r, 1)?,
-                qn.map(|n| n.weight()),
-                kn.map(|n| n.weight()),
-                &cos_rows.narrow(0, r, 1)?,
-                &sin_rows.narrow(0, r, 1)?,
-                shape,
-            )?
-            else {
-                return Ok(None);
-            };
-            crate::inference::moe_cuda::kv_append_pos(
-                &k,
-                &v,
-                &k_buf,
-                &v_buf,
-                StepPos::Card(&pos_r),
-                n_kv,
-                cap,
-                hd,
-            )?;
-            let (sel, count) = self
-                .sparse
-                .as_ref()
-                .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?
-                .card_selection()?;
-            ys.push(crate::inference::moe_cuda::selected_attention(
-                &q, &k_buf, &v_buf, sel, count, n_head, n_kv, cap, hd, scale,
-            )?);
-        }
-        let y = Tensor::cat(&ys.iter().collect::<Vec<_>>(), 1)?;
+        crate::inference::moe_cuda::kv_append_pos_rows(
+            &k, &v, &k_buf, &v_buf, pos, rows, n_kv, cap, hd,
+        )?;
+        let y = crate::inference::moe_cuda::selected_attention_steps(
+            &q, &k_buf, &v_buf, &sel, &count, rows, n_head, n_kv, cap, hd, scale,
+        )?;
         let y = self.gate_attention(x, y)?;
         self.attn_output.forward(&y).map(Some)
     }
@@ -593,9 +579,24 @@ impl GenericTransformerLayer {
             let xn = hc.attn.normed_on_card(&r)?;
             hc.attn.mix_on_card(&xn, f16)
         })?;
+        // A probe of the first chunk's stages, layer by layer in call order.
+        let probe = if index_pos == 0 {
+            super::draft_head::probe_dir().map(|dir| {
+                let k = WIDE_PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (dir, k)
+            })
+        } else {
+            None
+        };
+        if let Some((dir, k)) = &probe {
+            super::draft_head::dump_rows(dir, &format!("w{k}_a_mixed"), &mixed);
+        }
         let out = staged("token mixer", dev, settle, || {
             self.token_mixer(&mixed, mask, index_pos, dev)
         })?;
+        if let Some((dir, k)) = &probe {
+            super::draft_head::dump_rows(dir, &format!("w{k}_b_mixer"), &out);
+        }
         let (r, xn) = staged("combine", dev, settle, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
             combine_on_card(
@@ -615,7 +616,14 @@ impl GenericTransformerLayer {
             hc.ffn
                 .mix_on_card(&xn.expect("the norm was asked for"), f16)
         })?;
+        if let Some((dir, k)) = &probe {
+            super::draft_head::dump_rows(dir, &format!("w{k}_c_after_mixer"), &r);
+            super::draft_head::dump_rows(dir, &format!("w{k}_d_ffn_in"), &mixed);
+        }
         let out = self.feed_forward(&mixed, dev)?;
+        if let Some((dir, k)) = &probe {
+            super::draft_head::dump_rows(dir, &format!("w{k}_e_ffn_out"), &out);
+        }
         let (r, _) = staged("combine", dev, settle, || {
             combine_on_card(
                 &r,
@@ -739,9 +747,22 @@ impl GenericTransformerLayer {
         index_pos: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let (mut q, mut k, mut v) = self.project_heads(x)?;
+        if index_pos == 0 {
+            if let Some(dir) = super::draft_head::probe_dir() {
+                let k0 = ATTN_PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                super::draft_head::dump_rows(dir, &format!("attn{k0}_q_normed"), &q);
+                super::draft_head::dump_rows(dir, &format!("attn{k0}_k_normed"), &k);
+                super::draft_head::dump_rows(dir, &format!("attn{k0}_v"), &v);
+            }
+        }
         q = self.apply_rotary_emb(&q, index_pos)?;
         k = self.apply_rotary_emb(&k, index_pos)?;
         if index_pos == 0 {
+            if let Some(dir) = super::draft_head::probe_dir() {
+                let k0 = ATTN_PROBE_CALLS.load(std::sync::atomic::Ordering::Relaxed) - 1;
+                super::draft_head::dump_rows(dir, &format!("attn{k0}_q_roped"), &q);
+                super::draft_head::dump_rows(dir, &format!("attn{k0}_k_roped"), &k);
+            }
             self.kv_cache.reset();
         }
         if self.kv_f16 {
@@ -823,6 +844,14 @@ impl GenericTransformerLayer {
             &q, &k_buf, &v_buf, sel, count, n_head, n_kv, cap, hd, scale,
         )?
         .reshape((b, seq, n_head * hd))?;
+        if let Some(dir) = super::draft_head::probe_dir() {
+            if self.kv_cache.current_seq_len() == seq {
+                let k0 = ATTN_PROBE_CALLS
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(1);
+                super::draft_head::dump_rows(dir, &format!("attn{k0}_y"), &y);
+            }
+        }
         let y = self.gate_attention(x, y)?;
         self.attn_output.forward(&y)
     }
@@ -918,8 +947,27 @@ impl GenericTransformerLayer {
         let (b, seq, _) = x.dims3()?;
         let (n_head, n_kv, hd) = (self.n_head, self.n_kv_head, self.head_dim);
         let (mut q, mut k, mut v) = self.project_heads(x)?;
+        let probe = if index_pos == 0 {
+            super::draft_head::probe_dir().map(|dir| {
+                (
+                    dir,
+                    ATTN_PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+        } else {
+            None
+        };
+        if let Some((dir, k0)) = &probe {
+            super::draft_head::dump_rows(dir, &format!("attn{k0}_q_normed"), &q);
+            super::draft_head::dump_rows(dir, &format!("attn{k0}_k_normed"), &k);
+            super::draft_head::dump_rows(dir, &format!("attn{k0}_v"), &v);
+        }
         q = self.apply_rotary_emb(&q, index_pos)?;
         k = self.apply_rotary_emb(&k, index_pos)?;
+        if let Some((dir, k0)) = &probe {
+            super::draft_head::dump_rows(dir, &format!("attn{k0}_q_roped"), &q);
+            super::draft_head::dump_rows(dir, &format!("attn{k0}_k_roped"), &k);
+        }
         if index_pos == 0 {
             self.kv_cache.reset();
         }

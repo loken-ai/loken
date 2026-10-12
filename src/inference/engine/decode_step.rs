@@ -321,8 +321,13 @@ pub(crate) fn pld_verify_commit(
 pub(crate) const DRAFT_MAX: usize = 8;
 /// Rows of a verify forward: the token carried forward, then the draft.
 pub(crate) const VERIFY_ROWS: usize = DRAFT_MAX + 1;
+/// Rows of a window whose state after them is kept as a snapshot: a return to one of them is
+/// a copy, and the drafts reach no further, as each new window size costs a recording.
+pub(crate) const RETURN_SNAPSHOTS: usize = 3;
 /// Weight of the newest cycle in the running cost of a draft length.
 const CYCLE_COST_WEIGHT: f64 = 0.2;
+/// How many times more a stale class's sample weighs than a current one.
+const STALE_COST_WEIGHT: f64 = 2.5;
 
 /// How many tokens to ask the drafter for, learned from the cycles themselves.
 ///
@@ -350,6 +355,14 @@ pub(crate) struct DraftLength {
     plain_run: u32,
     /// The run of plain steps the next losing probe holds the drafter off for.
     backoff: u32,
+    /// Cycles since each class was last measured: a class left unmeasured for a while is
+    /// probed again, so its cost follows the run instead of its first samples.
+    since: [u32; DRAFT_MAX + 1],
+    /// The longest draft the model's windows carry, when the model says.
+    cap: Option<usize>,
+    /// Cycles measured per class: a class's first few samples are averaged, so its cost is
+    /// known after them instead of after a long run of blends.
+    samples: [u32; DRAFT_MAX + 1],
 }
 
 /// Plain steps between the probes of a drafter whose cycles were losing, doubled at each probe
@@ -364,7 +377,13 @@ const DRAFT_EVEN_ODDS: f32 = 0.5;
 const DRAFT_PROBES: u32 = 4;
 
 impl DraftLength {
+    /// Bound the drafts by the rows a window carries.
+    pub(crate) fn cap_rows(&mut self, rows: usize) {
+        self.cap = Some(rows.saturating_sub(1).min(DRAFT_MAX));
+    }
+
     pub(crate) fn next(&self) -> usize {
+        let top = self.cap.unwrap_or(DRAFT_MAX);
         let draft_token = self.draft_token.unwrap_or(0.0);
         // A verify covers the carried token plus the draft: `k + 1` rows.
         // A window costs the plain step plus a share per row: the share comes from the
@@ -384,10 +403,28 @@ impl DraftLength {
         let mut best_drafting = (0, f64::MIN);
         let mut reach = 1.0;
         let mut expected = 1.0;
-        for k in 0..=DRAFT_MAX {
+        // The first position the drafts rarely reached takes the deepest measured rate: the
+        // window can grow one row past what it has tried, as a prior of one half would not
+        // let it; the positions beyond keep the prior.
+        let mut deepest: Option<f64> = None;
+        let mut untried = 0;
+        for k in 0..=top {
             if k > 0 {
                 // Laplace-smoothed survival of position k-1 given the earlier ones survived.
-                reach *= (self.kept[k - 1] as f64 + 1.0) / (self.reached[k - 1] as f64 + 2.0);
+                let i = k - 1;
+                let smoothed = (self.kept[i] as f64 + 1.0) / (self.reached[i] as f64 + 2.0);
+                let rate = if self.reached[i] >= DRAFT_PROBES {
+                    deepest = Some(smoothed);
+                    smoothed
+                } else {
+                    untried += 1;
+                    if untried == 1 {
+                        deepest.unwrap_or(smoothed)
+                    } else {
+                        smoothed
+                    }
+                };
+                reach *= rate;
                 expected += reach;
             }
             let cost = match self.cycle[k] {
@@ -412,12 +449,27 @@ impl DraftLength {
         {
             return best_drafting.0;
         }
+        // The next class up is measured again once its cost is old: a longer draft is judged
+        // on this run's windows, not on the first ones.
+        if best.0 > 0 && best.0 < top && self.stale(best.0 + 1) {
+            return best.0 + 1;
+        }
         best.0
+    }
+
+    /// Whether class `k`'s cost is a measurement left unrefreshed for a while.
+    fn stale(&self, k: usize) -> bool {
+        k > 0 && self.cycle[k].is_some() && self.since[k] >= DRAFT_RETRY_STEPS
     }
 
     /// The odds a drafted token has to be given for its row to pay: a row of the window costs
     /// its share of a plain step, measured from the length-one cycles against the plain ones;
     /// even odds until both are measured.
+    /// The rate the drafts' first position was kept at, once measured.
+    pub(crate) fn first_rate(&self) -> Option<f64> {
+        (self.reached[0] >= DRAFT_PROBES).then(|| self.kept[0] as f64 / self.reached[0] as f64)
+    }
+
     pub(crate) fn min_odds(&self) -> f32 {
         match (self.cycle[0], self.cycle[1]) {
             (Some((_, plain)), Some((_, two))) if plain > 0.0 && two > plain => {
@@ -475,8 +527,20 @@ impl DraftLength {
                 self.kept[i] += 1;
             }
         }
+        // A stale class's sample weighs more: its old mean is of another run.
+        let weight = if self.samples[k] < DRAFT_PROBES {
+            1.0 / f64::from(self.samples[k] + 1)
+        } else if self.stale(k) {
+            CYCLE_COST_WEIGHT * STALE_COST_WEIGHT
+        } else {
+            CYCLE_COST_WEIGHT
+        };
+        self.samples[k] = self.samples[k].saturating_add(1);
+        for (i, since) in self.since.iter_mut().enumerate() {
+            *since = if i == k { 0 } else { since.saturating_add(1) };
+        }
         let blend = |old: Option<f64>, new: f64| match old {
-            Some(o) => o + (new - o) * CYCLE_COST_WEIGHT,
+            Some(o) => o + (new - o) * weight,
             None => new,
         };
         let verify = (cycle_secs - draft_secs).max(0.0);
@@ -801,6 +865,55 @@ mod tests {
             d.record(k, k, 0.01, 0.25);
         }
         assert!(d.next() > 0);
+    }
+
+    #[test]
+    fn a_longer_draft_measured_cold_is_tried_again_and_taken() {
+        let mut d = DraftLength::default();
+        // Two drafts were accepted once at a cost measured on a cold cache; from then on a
+        // cycle of two costs little more than one of one.
+        d.record(2, 2, 0.2, 3.0);
+        let mut chose_two = 0;
+        for n in 0..600 {
+            let k = d.next();
+            match k {
+                0 => d.record(0, 0, 0.0, 1.0),
+                1 => d.record(1, 1, 0.1, 1.1),
+                _ => d.record(k, k, 0.1 * k as f64, 1.3),
+            }
+            if n >= 550 && k >= 2 {
+                chose_two += 1;
+            }
+        }
+        assert!(
+            chose_two > 25,
+            "chose two {chose_two} times of the last fifty"
+        );
+    }
+
+    #[test]
+    fn a_class_costs_what_its_first_probes_measured() {
+        let mut d = DraftLength::default();
+        for _ in 0..40 {
+            d.record(1, 1, 0.1, 1.1);
+        }
+        d.record(2, 2, 0.2, 2.0);
+        d.record(2, 2, 0.2, 3.0);
+        let (cycle, _) = d.cycle[2].expect("measured");
+        assert!((cycle - 2.5).abs() < 1e-9, "{cycle}");
+    }
+
+    #[test]
+    fn the_window_grows_one_row_past_what_it_tried() {
+        let mut d = DraftLength::default();
+        for _ in 0..40 {
+            d.record(1, 1, 0.1, 1.1);
+        }
+        d.record(0, 0, 0.0, 1.0);
+        // One cycle of two, accepted, at a cost a prior of one half on the second position
+        // would not pay for, while the first position's rate does.
+        d.record(2, 2, 0.2, 1.45);
+        assert!(d.next() >= 2, "{}", d.summary());
     }
 
     #[test]

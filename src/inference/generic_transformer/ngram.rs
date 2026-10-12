@@ -363,6 +363,11 @@ impl PleBlock {
         }
     }
 
+    /// The carried rows as they stand, when the sequence has made them.
+    pub fn state_rows(&self) -> Option<&Tensor> {
+        self.state.as_ref()
+    }
+
     /// Make the rows in `src` the carried rows, written where the carried ones lie.
     pub fn restore_rows_from(&mut self, src: &Tensor) -> Result<()> {
         match self.state.as_ref() {

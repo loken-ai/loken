@@ -294,6 +294,7 @@ mod tests {
                 crate::inference::engine::llm_engine::KvQuant::Off,
                 None,
                 false,
+                false,
             )
             .unwrap();
         let vectors = unsafe { MmapedSafetensors::new(root.join("vectors.safetensors")) }.unwrap();

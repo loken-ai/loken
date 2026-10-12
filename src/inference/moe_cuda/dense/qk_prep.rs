@@ -32,6 +32,32 @@ pub fn qk_prep(
     sin: &Tensor,
     shape: QkShape,
 ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+    let hd = shape.head_dim;
+    let Some((q, k, v)) = qk_prep_rows(q, k, v, qw, kw, cos, sin, shape, 1)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        q.reshape((1, shape.n_head, 1, hd))?,
+        k.reshape((1, shape.n_kv, 1, hd))?,
+        v.reshape((1, shape.n_kv, 1, hd))?,
+    )))
+}
+
+/// [`qk_prep`] over `rows` rows in one launch: `q`, `k`, `v` hold `rows` rows each, `cos` and
+/// `sin` one row of tables a row; `[rows, heads * head_dim]` F32 back for each, every row as
+/// the one-row launch gives it.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_prep_rows(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    qw: Option<&Tensor>,
+    kw: Option<&Tensor>,
+    cos: &Tensor,
+    sin: &Tensor,
+    shape: QkShape,
+    rows: usize,
+) -> Result<Option<(Tensor, Tensor, Tensor)>> {
     use core::ffi::c_void;
     let QkShape {
         n_head,
@@ -54,9 +80,10 @@ pub fn qk_prep(
         || v.dtype() != q.dtype()
         || !q.device().is_cuda()
         || !(q.is_contiguous() && k.is_contiguous() && v.is_contiguous())
-        || q.elem_count() != n_head * hd
-        || k.elem_count() != n_kv * hd
-        || v.elem_count() != n_kv * hd
+        || rows == 0
+        || q.elem_count() != rows * n_head * hd
+        || k.elem_count() != rows * n_kv * hd
+        || v.elem_count() != rows * n_kv * hd
         || hd == 0
         || n_head == 0
         || n_kv == 0
@@ -64,14 +91,14 @@ pub fn qk_prep(
         || rope_dim % 2 != 0
         || qw.is_some_and(|w| !floats(w, hd))
         || kw.is_some_and(|w| !floats(w, hd))
-        || (half > 0 && !(floats(cos, half) && floats(sin, half)))
+        || (half > 0 && !(floats(cos, rows * half) && floats(sin, rows * half)))
     {
         return Ok(None);
     }
     let dev = q.device().as_cuda_device()?;
-    let qo = unsafe { dev.alloc::<f32>(n_head * hd) }?;
-    let ko = unsafe { dev.alloc::<f32>(n_kv * hd) }?;
-    let vo = unsafe { dev.alloc::<f32>(n_kv * hd) }?;
+    let qo = unsafe { dev.alloc::<f32>(rows * n_head * hd) }?;
+    let ko = unsafe { dev.alloc::<f32>(rows * n_kv * hd) }?;
+    let vo = unsafe { dev.alloc::<f32>(rows * n_kv * hd) }?;
     let (qp, kp, vp) = if f16 {
         (
             addr::<half::f16>(q, "q")?,
@@ -99,32 +126,58 @@ pub fn qk_prep(
         }
     };
     let stream = dev.cuda_stream().cu_stream() as i64;
-    unsafe {
-        loken_qk_prep(
-            qp as *const c_void,
-            kp as *const c_void,
-            vp as *const c_void,
-            weight(qw)?,
-            weight(kw)?,
-            table(cos)?,
-            table(sin)?,
-            qo.device_ptr(qo.stream()).0 as *mut f32,
-            ko.device_ptr(ko.stream()).0 as *mut f32,
-            vo.device_ptr(vo.stream()).0 as *mut f32,
-            n_head as i32,
-            n_kv as i32,
-            hd as i32,
-            rope_dim as i32,
-            i32::from(interleaved),
-            eps,
-            i32::from(f16),
-            stream,
-        );
+    if rows > 1 {
+        unsafe {
+            loken_qk_prep_rows(
+                qp as *const c_void,
+                kp as *const c_void,
+                vp as *const c_void,
+                weight(qw)?,
+                weight(kw)?,
+                table(cos)?,
+                table(sin)?,
+                qo.device_ptr(qo.stream()).0 as *mut f32,
+                ko.device_ptr(ko.stream()).0 as *mut f32,
+                vo.device_ptr(vo.stream()).0 as *mut f32,
+                rows as i32,
+                n_head as i32,
+                n_kv as i32,
+                hd as i32,
+                rope_dim as i32,
+                i32::from(interleaved),
+                eps,
+                i32::from(f16),
+                stream,
+            );
+        }
+    } else {
+        unsafe {
+            loken_qk_prep(
+                qp as *const c_void,
+                kp as *const c_void,
+                vp as *const c_void,
+                weight(qw)?,
+                weight(kw)?,
+                table(cos)?,
+                table(sin)?,
+                qo.device_ptr(qo.stream()).0 as *mut f32,
+                ko.device_ptr(ko.stream()).0 as *mut f32,
+                vo.device_ptr(vo.stream()).0 as *mut f32,
+                n_head as i32,
+                n_kv as i32,
+                hd as i32,
+                rope_dim as i32,
+                i32::from(interleaved),
+                eps,
+                i32::from(f16),
+                stream,
+            );
+        }
     }
     let wrap = |s, heads: usize| {
         tensor_from_cuda_storage(
             CudaStorage::wrap_cuda_slice(s, dev.clone()),
-            (1, heads, 1, hd),
+            (rows, heads * hd),
         )
     };
     Ok(Some((wrap(qo, n_head)?, wrap(ko, n_kv)?, wrap(vo, n_kv)?)))
@@ -251,6 +304,63 @@ mod tests {
                     let wv = flat(&v.to_dtype(DType::F32).unwrap());
                     assert_eq!(flat(&gv), wv, "v {interleaved} {f16} {normed}");
                 }
+            }
+        }
+    }
+
+    /// Rows at once give each row what the one-row launch gives it, bit for bit, from F16 and
+    /// F32 rows, each row with its own tables.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn rows_at_once_give_each_row_its_own_launch() {
+        let dev = Device::new_cuda(0).expect("a card for the card test");
+        let (n_head, n_kv, hd, rope_dim, rows) = (6usize, 2usize, 64usize, 32usize, 3usize);
+        let on = |v: Vec<f32>, dims: &[usize]| Tensor::from_vec(v, dims.to_vec(), &dev).unwrap();
+        let cos = on(ramp(rows * rope_dim / 2, 5), &[rows, rope_dim / 2]);
+        let sin = on(ramp(rows * rope_dim / 2, 6), &[rows, rope_dim / 2]);
+        let qw = on(ramp(hd, 7), &[hd]);
+        let kw = on(ramp(hd, 8), &[hd]);
+        let host = |t: &Tensor| -> Vec<f32> { t.flatten_all().unwrap().to_vec1().unwrap() };
+        for f16 in [false, true] {
+            let cast = |t: Tensor| {
+                if f16 {
+                    t.to_dtype(DType::F16).unwrap()
+                } else {
+                    t
+                }
+            };
+            let q = cast(on(ramp(rows * n_head * hd, 1), &[rows, n_head * hd]));
+            let k = cast(on(ramp(rows * n_kv * hd, 2), &[rows, n_kv * hd]));
+            let v = cast(on(ramp(rows * n_kv * hd, 3), &[rows, n_kv * hd]));
+            let shape = QkShape {
+                n_head,
+                n_kv,
+                head_dim: hd,
+                rope_dim,
+                interleaved: false,
+                eps: 1e-6,
+            };
+            let (gq, gk, gv) =
+                qk_prep_rows(&q, &k, &v, Some(&qw), Some(&kw), &cos, &sin, shape, rows)
+                    .unwrap()
+                    .expect("the launch takes these rows");
+            for r in 0..rows {
+                let row = |t: &Tensor| t.narrow(0, r, 1).unwrap();
+                let (oq, ok, ov) = qk_prep(
+                    &row(&q),
+                    &row(&k),
+                    &row(&v),
+                    Some(&qw),
+                    Some(&kw),
+                    &row(&cos),
+                    &row(&sin),
+                    shape,
+                )
+                .unwrap()
+                .expect("the launch takes this row");
+                assert_eq!(host(&row(&gq)), host(&oq), "row {r}'s queries, f16 {f16}");
+                assert_eq!(host(&row(&gk)), host(&ok), "row {r}'s keys, f16 {f16}");
+                assert_eq!(host(&row(&gv)), host(&ov), "row {r}'s values, f16 {f16}");
             }
         }
     }

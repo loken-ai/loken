@@ -177,6 +177,8 @@ pub struct InferenceConfig {
     /// Whether drafts are verified in recorded windows, the model's draft head guessing where
     /// they are.
     pub recorded_drafts: bool,
+    /// Where the model's probes write the tensors they dump; none unless configured.
+    pub probe_dump_dir: Option<String>,
     /// A routing profile that fills the expert caches at the load, before any prompt.
     pub expert_profile: Option<String>,
     /// Where the routing counts of the run's decodes are written after each request.
@@ -260,6 +262,7 @@ impl Default for InferenceConfig {
             replicas: 1,
             kv_disk_dir: None,
             recorded_drafts: false,
+            probe_dump_dir: None,
             expert_profile: None,
             expert_profile_save: None,
             kv_disk_budget_gb: 0.0,

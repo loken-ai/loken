@@ -45,6 +45,25 @@ pub fn gdn_prep(
     dt_bias: &Tensor,
     shape: GdnShape,
 ) -> Result<Option<GdnPrep>> {
+    gdn_prep_with_snapshots(
+        qkv, window, conv_w, alpha, beta_in, a_log, dt_bias, shape, None,
+    )
+}
+
+/// [`gdn_prep`] that also writes the window after each of the first `rows` rows into
+/// `window_snaps` (`[rows, conv_dim, taps - 1]` F32, contiguous).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prep_with_snapshots(
+    qkv: &Tensor,
+    window: &Tensor,
+    conv_w: &Tensor,
+    alpha: &Tensor,
+    beta_in: &Tensor,
+    a_log: &Tensor,
+    dt_bias: &Tensor,
+    shape: GdnShape,
+    window_snaps: Option<(&Tensor, usize)>,
+) -> Result<Option<GdnPrep>> {
     use core::ffi::c_void;
     let GdnShape {
         k_heads: kg,
@@ -125,6 +144,15 @@ pub fn gdn_prep(
     let beta_out_p = beta.device_ptr(beta.stream()).0;
     // The rows in one launch, each reading the window the row before it left.
     let _ = elem;
+    let (snap_ptr, snap_rows) = match window_snaps {
+        Some((t, n)) => {
+            if t.elem_count() < n * conv_dim * (taps - 1) || !t.is_contiguous() {
+                crate::tensor::bail!("gdn_prep: the window snapshots hold fewer than {n} rows");
+            }
+            (addr::<f32>(t, "window snapshots")? as *mut f32, n as i32)
+        }
+        None => (std::ptr::null_mut(), 0),
+    };
     unsafe {
         loken_gdn_prep(
             qkv_p as *const c_void,
@@ -152,6 +180,8 @@ pub fn gdn_prep(
             i32::from(tiled),
             eps,
             i32::from(f16),
+            snap_ptr,
+            snap_rows,
             stream,
         );
     }
@@ -234,13 +264,23 @@ mod tests {
         let dt_bias = on(ramp(vg, 7), (1, vg)).flatten_all().unwrap();
         let _in_place = crate::inference::moe_cuda::in_place_state(true);
         let window = on(ramp(conv_dim * (taps - 1), 4), (conv_dim, taps - 1));
-        let together = gdn_prep(
-            &qkv, &window, &conv_w, &alpha, &beta_in, &a_log, &dt_bias, shape,
+        let snaps = Tensor::zeros_on((rows, conv_dim, taps - 1), DType::F32, &dev).unwrap();
+        let together = gdn_prep_with_snapshots(
+            &qkv,
+            &window,
+            &conv_w,
+            &alpha,
+            &beta_in,
+            &a_log,
+            &dt_bias,
+            shape,
+            Some((&snaps, rows)),
         )
         .unwrap()
         .expect("the launch takes this shape");
         let window_turns = on(ramp(conv_dim * (taps - 1), 4), (conv_dim, taps - 1));
         let mut turns = Vec::with_capacity(rows);
+        let mut windows_after = Vec::with_capacity(rows);
         for r in 0..rows {
             let row = |t: &Tensor| t.narrow(0, r, 1).unwrap();
             turns.push(
@@ -256,6 +296,14 @@ mod tests {
                 )
                 .unwrap()
                 .expect("the launch takes this shape"),
+            );
+            windows_after.push(flat(&window_turns));
+        }
+        for (r, after) in windows_after.iter().enumerate() {
+            assert_eq!(
+                &flat(&snaps.narrow(0, r, 1).unwrap()),
+                after,
+                "the window snapshot after row {r}"
             );
         }
         let rows_of = |t: &Tensor| flat(t);

@@ -96,10 +96,14 @@ impl NgramDraftCache {
     /// For a 4K buffer with 2..=4, this is <10 μs on CPU - negligible
     /// compared to a single CUDA kernel launch.
     pub fn lookup(&self) -> Vec<u32> {
-        // Snapshot the buffer once - the cascade does multiple scans.
+        self.lookup_matched().0
+    }
+
+    /// The draft and the length of the n-gram it continues, `0` when there is none.
+    pub fn lookup_matched(&self) -> (Vec<u32>, usize) {
         let len = self.tokens.len();
         if len < self.min_ngram + 1 {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         let slice: &[u32] = self.tokens.as_slices().0;
         let owned;
@@ -112,10 +116,10 @@ impl NgramDraftCache {
 
         for n in (self.min_ngram..=self.max_ngram).rev() {
             if let Some(draft) = Self::lookup_at_n(tokens, n, self.max_draft) {
-                return draft;
+                return (draft, n);
             }
         }
-        Vec::new()
+        (Vec::new(), 0)
     }
 
     /// Single-n lookup over a contiguous slice. Returns `Some(draft)` on a
@@ -146,6 +150,11 @@ impl NgramDraftCache {
     /// Current buffer length.
     pub fn len(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// The longest n-gram a lookup matches.
+    pub fn max_ngram(&self) -> usize {
+        self.max_ngram
     }
 
     /// Whether the buffer has enough content for any lookup to succeed.

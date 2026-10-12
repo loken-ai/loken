@@ -7,8 +7,8 @@
 
 use super::*;
 use crate::inference::moe_cuda::{
-    address_f32, indexer_append, indexer_rows_in, indexer_rows_out, indexer_select,
-    indexer_select_rows, IndexerShape, StepPos,
+    address_f32, indexer_append, indexer_append_rows, indexer_rows_in, indexer_rows_out,
+    indexer_select, indexer_select_rows, indexer_select_steps, IndexerShape, StepPos,
 };
 use crate::tensor::Device;
 
@@ -34,6 +34,11 @@ pub struct CardIndexer {
     /// `[top_k + block]` U32 and `[1]` U32: the tokens the last query kept, and how many.
     sel: Tensor,
     count: Tensor,
+    /// The same for the rows of a recorded verify: `[rows * blocks]` F32 scores,
+    /// `[rows, top_k + block]` U32 kept tokens and `[rows]` U32 counts.
+    scores_rows: Tensor,
+    sel_rows: Tensor,
+    count_rows: Tensor,
     /// `[4 * half]` F32: the rotation tables at the first position of the block the step's
     /// token completes, then at the step's position.
     rot: Tensor,
@@ -190,6 +195,9 @@ impl SparseAttention {
             scores: Tensor::zeros_on((blocks.div_ceil(32) * 32,), DType::F32, dev)?,
             sel: Tensor::zeros_on((m.top_k + m.block,), DType::U32, dev)?,
             count: Tensor::zeros_on((1,), DType::U32, dev)?,
+            scores_rows: Tensor::zeros_on((ROT_ROWS * blocks.div_ceil(32) * 32,), DType::F32, dev)?,
+            sel_rows: Tensor::zeros_on((ROT_ROWS, m.top_k + m.block), DType::U32, dev)?,
+            count_rows: Tensor::zeros_on((ROT_ROWS,), DType::U32, dev)?,
             rot: Tensor::zeros_on((4 * self.rope.half(),), DType::F32, dev)?,
             rot_rows: Tensor::zeros_on((ROT_ROWS, 4 * self.rope.half()), DType::F32, dev)?,
             q_gamma: on_card(&self.q_gamma)?,
@@ -220,6 +228,7 @@ impl SparseAttention {
         grown.slice_set(&card.pooled, 0, 0)?;
         card.pooled = grown;
         card.scores = Tensor::zeros_on((groups * 32,), DType::F32, &card.dev)?;
+        card.scores_rows = Tensor::zeros_on((ROT_ROWS * groups * 32,), DType::F32, &card.dev)?;
         self.card_births += 1;
         Ok(())
     }
@@ -397,6 +406,65 @@ impl SparseAttention {
     /// [`Self::observe`], and the card takes over the blocks they complete; the rows' queries
     /// never leave the card, which scores each row against the blocks complete by its position
     /// with the arithmetic of the host's, and keeps the blocks the host keeps.
+    /// [`Self::card_step_projected`] for the rows `row0 .. row0 + rows` of a recorded verify in
+    /// one launch set: `key` `[rows, key]` and `q` `[rows, heads * head_dim]` projected, `pos`
+    /// `[rows]` the rows' positions on the card. Every row's key joins in order, then every row
+    /// selects over what its own step would see. The rows' kept tokens and counts come back.
+    pub fn card_steps_projected(
+        &mut self,
+        key: &Tensor,
+        q: &Tensor,
+        pos: &Tensor,
+        row0: usize,
+        rows: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let Some(card) = self.card.as_mut() else {
+            crate::tensor::bail!("the indexer has no cache on a card");
+        };
+        if row0 + rows > ROT_ROWS {
+            crate::tensor::bail!(
+                "the card holds tables for {ROT_ROWS} rows, not {}",
+                row0 + rows
+            );
+        }
+        let tables = 2 * card.shape.half;
+        let stride = card.rot_rows.dim(1)?;
+        let rot = card.rot_rows.narrow(0, row0, rows)?;
+        indexer_append_rows(
+            key,
+            &card.tail,
+            &card.pooled,
+            &card.k_gamma,
+            &rot,
+            stride,
+            pos,
+            rows,
+            &card.shape,
+        )?;
+        let max_blocks = card.scores.elem_count();
+        let sel = card.sel_rows.narrow(0, 0, rows)?;
+        let count = card.count_rows.narrow(0, 0, rows)?;
+        indexer_select_steps(
+            q,
+            &card.q_gamma,
+            &rot,
+            tables,
+            stride,
+            &card.pooled,
+            &card.scores_rows,
+            max_blocks,
+            &sel,
+            &count,
+            pos,
+            rows,
+            &card.shape,
+        )?;
+        if !crate::tensor::cuda_ext::capture_active(&card.dev) {
+            card.tokens = card.tokens.max(card.step_pos + 1);
+        }
+        Ok((sel, count))
+    }
+
     pub fn observe_on_card(&mut self, x: &Tensor, index_pos: usize) -> Result<CardPick> {
         let (_, seq, _) = x.dims3()?;
         let m = self.meta;

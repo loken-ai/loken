@@ -2252,6 +2252,7 @@ impl GenericHeteroTransformer {
             kv_quant,
             max_kv_seq_len,
             crate::inference::place::ladder::on_one_card(plan),
+            false,
         )
     }
 
@@ -2268,6 +2269,7 @@ impl GenericHeteroTransformer {
         kv_quant: crate::inference::engine::llm_engine::KvQuant,
         max_kv_seq_len: Option<usize>,
         stem_on_card: bool,
+        draft_resident: bool,
     ) -> Result<Self> {
         // One file: a part of a set is refused rather than built from the blocks this file
         // happens to carry. A set is read as one model through `from_split_gguf`.
@@ -2281,6 +2283,7 @@ impl GenericHeteroTransformer {
             kv_quant,
             max_kv_seq_len,
             stem_on_card,
+            draft_resident,
         )
     }
 
@@ -2293,6 +2296,7 @@ impl GenericHeteroTransformer {
         kv_quant: crate::inference::engine::llm_engine::KvQuant,
         max_kv_seq_len: Option<usize>,
         stem_on_card: bool,
+        draft_resident: bool,
     ) -> Result<Self> {
         let content = split.merged_content();
         let source = TensorSource::of_split(split);
@@ -2304,6 +2308,7 @@ impl GenericHeteroTransformer {
             kv_quant,
             max_kv_seq_len,
             stem_on_card,
+            draft_resident,
         )
     }
 
@@ -2315,6 +2320,7 @@ impl GenericHeteroTransformer {
         kv_quant: crate::inference::engine::llm_engine::KvQuant,
         max_kv_seq_len: Option<usize>,
         stem_on_card: bool,
+        draft_resident: bool,
     ) -> Result<Self> {
         Self::from_gguf_source(
             &ck.content,
@@ -2324,6 +2330,7 @@ impl GenericHeteroTransformer {
             kv_quant,
             max_kv_seq_len,
             stem_on_card,
+            draft_resident,
         )
     }
 
@@ -2380,6 +2387,7 @@ impl GenericHeteroTransformer {
             len: 0,
             committed: 0,
             carried: None,
+            fit: (0, 0),
             indexer_mark: None,
             #[cfg(feature = "cuda")]
             step: None,
@@ -2394,6 +2402,7 @@ impl GenericHeteroTransformer {
         kv_quant: crate::inference::engine::llm_engine::KvQuant,
         max_kv_seq_len: Option<usize>,
         _stem_on_card: bool,
+        draft_resident: bool,
     ) -> Result<Self> {
         let arch = content
             .metadata
@@ -3671,6 +3680,7 @@ impl GenericHeteroTransformer {
             graph_pos: 0,
             kv_snapshots: Vec::new(),
             kv_snapshot_tick: 0,
+            decode_reserve: 0,
             hybrid_cache: None,
             spliced_vision,
             #[cfg(feature = "audio")]
@@ -3706,7 +3716,7 @@ impl GenericHeteroTransformer {
                 }
             }
         }
-        model.attach_expert_tiers(cuda_devices, plan, &free_before)?;
+        model.attach_expert_tiers(cuda_devices, plan, &free_before, draft_resident)?;
         model.host_experts_hot = model
             .layers
             .iter()
@@ -4021,6 +4031,7 @@ impl GenericHeteroTransformer {
             graph_pos: 0,
             kv_snapshots: Vec::new(),
             kv_snapshot_tick: 0,
+            decode_reserve: 0,
             hybrid_cache: None,
             spliced_vision: None,
             #[cfg(feature = "audio")]
@@ -4223,6 +4234,7 @@ mod source_tests {
                 &plan,
                 crate::inference::engine::llm_engine::KvQuant::Off,
                 None,
+                false,
                 false,
             )
             .unwrap(),

@@ -33,6 +33,7 @@ extern "C" __global__ void loken_tier_plan_kernel(
         float * mail_x,
         unsigned int * mail_rows,
         volatile unsigned int * mail_request,
+        volatile unsigned int * mail_live,
         int rows, int k, int hidden) {
     __shared__ unsigned int seq;
     __shared__ unsigned int filler;
@@ -62,6 +63,10 @@ extern "C" __global__ void loken_tier_plan_kernel(
         filler = f;
         counter[1] = missing;
         *mail_rows = (unsigned int) rows;
+        // A request every expert of which is cached is not waited for: the late pairs the
+        // host handed for the request before must not be read again, so their count is
+        // cleared here, before the host gets to it.
+        if (missing == 0u) *mail_live = 0u;
     }
     __syncthreads();
     if (t < pairs) {
@@ -125,11 +130,11 @@ extern "C" void loken_tier_plan(
         const unsigned int * ids, const float * weights, const float * x, const int * table,
         unsigned int * counter, unsigned int * slot_out, float * weight_out,
         unsigned int * mail_ids, float * mail_weights, unsigned int * mail_slots, float * mail_x,
-        unsigned int * mail_rows, unsigned int * mail_request, int rows, int k, int hidden,
-        cudaStream_t stream) {
+        unsigned int * mail_rows, unsigned int * mail_request, unsigned int * mail_live,
+        int rows, int k, int hidden, cudaStream_t stream) {
     loken_tier_plan_kernel<<<1, TIER_PLAN_PAIRS, 0, stream>>>(
         ids, weights, x, table, counter, slot_out, weight_out, mail_ids, mail_weights,
-        mail_slots, mail_x, mail_rows, mail_request, rows, k, hidden);
+        mail_slots, mail_x, mail_rows, mail_request, mail_live, rows, k, hidden);
 }
 
 extern "C" void loken_tier_wait(
@@ -144,4 +149,19 @@ extern "C" void loken_tier_merge(
     const int threads = 256;
     loken_tier_merge_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
         card, late, product, counter, out, n, k, hidden);
+}
+
+/// One more answer told to the host: the counter advanced on the card and its value written
+/// where the host reads it, a page-locked mapping, after the copies queued before it landed.
+extern "C" __global__ void loken_tier_tell_kernel(unsigned int * counter, volatile unsigned int * told) {
+    if (threadIdx.x == 0) {
+        const unsigned int next = counter[0] + 1u;
+        counter[0] = next;
+        __threadfence_system();
+        *told = next;
+    }
+}
+
+extern "C" void loken_tier_tell(unsigned int * counter, unsigned int * told, cudaStream_t stream) {
+    loken_tier_tell_kernel<<<1, 32, 0, stream>>>(counter, told);
 }

@@ -30,6 +30,8 @@ pub(super) struct DraftHead {
     pub(super) committed: usize,
     /// The last row of the prompt chunk before, whose pair waits for the next chunk's first token.
     pub(super) carried: Option<Tensor>,
+    /// Rows of the prompt the head guessed right, and the rows it was asked, this request.
+    pub(super) fit: (u64, u64),
     /// The layer's indexer as it stood with `committed` pairs read: what a cut back to that
     /// length returns it to.
     pub(super) indexer_mark: Option<(usize, super::qsa::IndexerCache)>,
@@ -54,6 +56,12 @@ pub(super) struct DraftStep {
     ids: Tensor,
     /// The softmax mass relative to the top logit, `[1, 1]` F32.
     read: Tensor,
+    /// The round's committed tokens, `[VERIFY_ROWS]` U32, whose rows the card gathers.
+    tok_ids: Tensor,
+    /// Guesses told so far, `[1]` U32 on the card, and what the host last read of it.
+    counter: Tensor,
+    told: Told,
+    seen: u32,
     /// The rows' positions, `[VERIFY_ROWS]` i32.
     pos: Tensor,
     /// The pairs through the layer, by their count, the most recently recorded last: at most
@@ -61,12 +69,16 @@ pub(super) struct DraftStep {
     pairs: Vec<(usize, HeldGraph)>,
     /// The head over the row alone.
     head: Option<HeldGraph>,
-    /// The layer over a token and the row, then the head.
-    layer: Option<HeldGraph>,
+    /// The layer over the named token and the row at row `j` of the round, then the head.
+    steps: Vec<Option<HeldGraph>>,
     /// The buffers the graphs were recorded against: the cache's keys and the indexer's births.
     key: Option<(crate::tensor::ops::traits::TensorId, u64)>,
     /// Replays that failed since the load.
     failures: u32,
+    /// Microseconds a guess's phases took (the preparation, the pairs, the head, the read,
+    /// the steps), and the guesses they count.
+    spent_us: [u64; 5],
+    spent_n: u32,
     /// The recorded guesses are given up on: a capture failed or a replay disagreed.
     blocked: bool,
 }
@@ -74,10 +86,54 @@ pub(super) struct DraftStep {
 /// Replays that may fail before the head's guesses stay eager.
 #[cfg(feature = "cuda")]
 const DRAFT_RECORD_FAILURES: u32 = 3;
+/// Rows of each prompt chunk the head's fit is measured over.
+const DRAFT_FIT_ROWS: usize = 32;
+
+/// Write a tensor's rows as little-endian f32 under `dir`, once per name, for a reference run.
+/// Where the probes write the tensors they are asked for (`probe_dump_dir` in the
+/// configuration), set once at the load; none by default.
+static PROBE_DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Name the directory the probes write to; the first call holds.
+pub fn set_probe_dir(dir: Option<String>) {
+    let _ = PROBE_DIR.set(dir);
+}
+
+/// The directory the probes write to, if the configuration names one.
+pub(super) fn probe_dir() -> Option<&'static str> {
+    PROBE_DIR.get().and_then(|d| d.as_deref())
+}
+
+pub(super) fn dump_rows(dir: &str, name: &str, t: &Tensor) {
+    let path = std::path::Path::new(dir).join(format!("{name}.f32"));
+    if path.exists() {
+        return;
+    }
+    if let Ok(v) = t
+        .to_dtype(DType::F32)
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f32>())
+    {
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let _ = std::fs::write(&path, bytes);
+        let _ = std::fs::write(path.with_extension("shape"), format!("{:?}", t.dims()));
+    }
+}
+
+fn dump_u32(dir: &str, name: &str, v: &[u32]) {
+    let path = std::path::Path::new(dir).join(format!("{name}.u32"));
+    if path.exists() {
+        return;
+    }
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let _ = std::fs::write(&path, bytes);
+}
+/// Guesses between two reports of a guess's phases.
+const DRAFT_REPORT_EVERY: u32 = 64;
 /// Pairs graphs the head keeps at once: a draft's pairs are the tokens the last verify kept
-/// and one more, so a few counts cover nearly every cycle.
+/// and one more, at most a verify's rows, and every count has its graph.
 #[cfg(feature = "cuda")]
-const DRAFT_PAIRS_GRAPHS: usize = 3;
+const DRAFT_PAIRS_GRAPHS: usize = crate::inference::engine::decode_step::VERIFY_ROWS;
 
 /// A recorded graph the model holds: launched only by the thread that holds the model, on the
 /// stream it was captured on, which is what its handles need.
@@ -97,8 +153,69 @@ enum DraftKind {
     Pairs(usize),
     /// The head over the row.
     Head,
-    /// A token with the row through the layer, then the head.
-    Step,
+    /// The token the head named with the row through the layer at row `j` of the round's
+    /// staged positions, then the head.
+    Step(usize),
+}
+
+/// What a guess costs to read: the token named, the softmax mass and the count of guesses
+/// told, written by the card into page-locked memory the host spins on.
+#[cfg(feature = "cuda")]
+struct Told {
+    host: *mut u32,
+    device: u64,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for Told {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for Told {}
+
+#[cfg(feature = "cuda")]
+impl Told {
+    const WORDS: usize = 4;
+    const TOKEN: usize = 0;
+    const MASS: usize = 1;
+    const SEQ: usize = 2;
+
+    fn new(dev: &Device) -> Result<Self> {
+        let (host, device) = super::expert_tier::mapped(dev, Self::WORDS * 4)?;
+        Ok(Self {
+            host: host as *mut u32,
+            device,
+        })
+    }
+
+    fn word(&self, at: usize) -> u32 {
+        // SAFETY: the mapping holds `WORDS` words for as long as this lives; the card writes
+        // them, so each read is a fresh one.
+        unsafe { std::ptr::read_volatile(self.host.add(at)) }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for Told {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `mapped` and freed once here.
+        unsafe {
+            let _ = cudarc::driver::sys::cuMemFreeHost(self.host as *mut std::ffi::c_void);
+        }
+    }
+}
+
+/// The card address of `t`'s first element.
+#[cfg(feature = "cuda")]
+fn card_address<T: crate::tensor::kernel_ffi::CudaDType>(t: &Tensor) -> Result<u64> {
+    use cudarc::driver::DevicePtr;
+    let (storage, layout) = t.storage_and_layout();
+    match &*storage {
+        crate::tensor::StorageView::Cuda(c) => {
+            let slice = c.as_cuda_slice::<T>()?;
+            Ok(slice.device_ptr(slice.stream()).0
+                + (layout.start_offset() * std::mem::size_of::<T>()) as u64)
+        }
+        _ => crate::tensor::bail!("a guess's buffer is on the card"),
+    }
 }
 
 impl DraftHead {
@@ -204,6 +321,11 @@ impl GenericHeteroTransformer {
             .to_device(&dev)?;
         let mut draft = self.draft.take().expect("checked above");
         let x = draft.fuse(&emb, &hidden);
+        if !kv_only {
+            if let (Some(dir), Ok(x)) = (probe_dir(), x.as_ref()) {
+                dump_rows(dir, "x", x);
+            }
+        }
         let first = self.layers.len();
         // The head's layer stands after the model's own for the pass, so the loop that runs the
         // stack - masks, segment hops, the layer's own forward - runs it unchanged.
@@ -217,6 +339,11 @@ impl GenericHeteroTransformer {
         draft.layer_dev = layer_dev;
         draft.len = draft.len.max(at + n);
         self.draft = Some(draft);
+        if !kv_only {
+            if let (Some(dir), Ok((wide, _))) = (probe_dir(), out.as_ref()) {
+                dump_rows(dir, "wide", wide);
+            }
+        }
         out.map(|(wide, _)| wide)
     }
 
@@ -266,7 +393,50 @@ impl GenericHeteroTransformer {
         };
         let last = hidden.narrow(1, c - 1, 1)?;
         if !tokens.is_empty() {
-            self.draft_rows(&tokens, &rows, committed, true)?;
+            // The head's fit to the prompt: the chunk's last rows run whole, their guesses
+            // against the tokens that followed them, a measure of the head apart from the
+            // reply; the rows before them fill the cache alone.
+            let probe = tokens.len().min(DRAFT_FIT_ROWS);
+            let probe = if probe >= 2 { probe } else { 0 };
+            let from = tokens.len() - probe;
+            if let (Some(dir), true) = (probe_dir(), committed == 0) {
+                dump_rows(dir, "rows", &rows);
+                dump_u32(dir, "ids", ids);
+            }
+            if from > 0 {
+                self.draft_rows(&tokens[..from], &rows.narrow(1, 0, from)?, committed, true)?;
+            }
+            if probe >= 2 {
+                let wide = self.draft_rows(
+                    &tokens[from..],
+                    &rows.narrow(1, from, probe)?,
+                    committed + from,
+                    false,
+                )?;
+                let guessed = self
+                    .draft_logits(&wide)?
+                    .to_dtype(DType::F32)?
+                    .argmax_keepdim(1)?
+                    .flatten_all()?
+                    .to_vec1::<u32>()?;
+                if let (Some(dir), true) = (probe_dir(), committed == 0) {
+                    dump_u32(dir, "guessed", &guessed);
+                }
+                let hits = guessed
+                    .iter()
+                    .zip(&tokens[from + 1..])
+                    .filter(|(g, t)| g == t)
+                    .count() as u64;
+                if let Some(d) = self.draft.as_mut() {
+                    d.fit.0 += hits;
+                    d.fit.1 += (probe - 1) as u64;
+                    tracing::info!(
+                        "draft head fit over the prompt: {} of {} rows guessed right",
+                        d.fit.0,
+                        d.fit.1
+                    );
+                }
+            }
         }
         if let Some(d) = self.draft.as_mut() {
             d.committed = committed + tokens.len();
@@ -280,13 +450,15 @@ impl GenericHeteroTransformer {
     pub fn draft_reset(&mut self) {
         self.draft_trim(0);
         if let Some(d) = self.draft.as_mut() {
+            d.fit = (0, 0);
             d.committed = 0;
             d.carried = None;
             d.indexer_mark = None;
         }
     }
 
-    /// Up to `k` tokens that follow the sequence, guessed by the head.
+    /// Up to `k` tokens that follow the sequence, guessed by the head; with `k` zero the head
+    /// reads the pairs alone.
     ///
     /// `tokens` are the tokens the model has been given since the last call plus the one it has
     /// yet to be given, and the rows of `last_feature` the hidden states that went before them:
@@ -303,7 +475,7 @@ impl GenericHeteroTransformer {
         } else {
             1
         };
-        if n == 0 || k == 0 || rows < n {
+        if n == 0 || rows < n {
             return Ok(Vec::new());
         }
         let committed = self.draft.as_ref().map_or(0, |d| d.committed);
@@ -429,7 +601,8 @@ impl GenericHeteroTransformer {
         }
         // The workspaces the kernels keep are made before a recording, never inside one.
         self.ensure_graph_workspaces();
-        let emb = if tokens.is_empty() {
+        let on_card = self.embed_table_on(&dev).is_some();
+        let emb = if tokens.is_empty() || on_card {
             None
         } else {
             let edev = self.embeddings.embeddings().device().clone();
@@ -440,6 +613,10 @@ impl GenericHeteroTransformer {
             }
             Some(e.to_device(&dev)?)
         };
+        let tok_ids = match (tokens.is_empty(), on_card) {
+            (false, true) => Some(Tensor::from_vec(tokens.to_vec(), (tokens.len(),), &dev)?),
+            _ => None,
+        };
         let d = self.draft.as_mut().expect("checked above");
         let (streams, dim) = (d.streams, d.dim);
         if d.step.is_none() {
@@ -449,18 +626,29 @@ impl GenericHeteroTransformer {
                 hidden: Tensor::zeros_on((1, 1, streams * dim), DType::F32, &dev)?,
                 ids: Tensor::zeros_on(1, DType::U32, &dev)?,
                 read: Tensor::zeros_on((1, 1), DType::F32, &dev)?,
+                tok_ids: Tensor::zeros_on(VERIFY_ROWS, DType::U32, &dev)?,
+                counter: Tensor::zeros_on(1, DType::U32, &dev)?,
+                told: Told::new(&dev)?,
+                seen: 0,
                 pos: Tensor::zeros_on(VERIFY_ROWS, DType::I32, &dev)?,
                 pairs: Vec::new(),
                 head: None,
-                layer: None,
+                steps: (0..crate::inference::engine::decode_step::DRAFT_MAX)
+                    .map(|_| None)
+                    .collect(),
                 key: None,
                 failures: 0,
                 blocked: false,
+                spent_us: [0; 5],
+                spent_n: 0,
             });
         }
         let step = d.step.as_mut().expect("made above");
         if let Some(e) = emb {
             step.emb.slice_set(&e, 1, 0)?;
+        }
+        if let Some(t) = tok_ids {
+            step.tok_ids.slice_set(&t, 0, 0)?;
         }
         let positions: Vec<i32> = (0..VERIFY_ROWS).map(|r| (at + r) as i32).collect();
         step.pos
@@ -501,7 +689,7 @@ impl GenericHeteroTransformer {
         if step.key != Some((keys, births)) {
             step.pairs.clear();
             step.head = None;
-            step.layer = None;
+            step.steps.iter_mut().for_each(|g| *g = None);
             step.key = Some((keys, births));
         }
         Ok(true)
@@ -512,11 +700,18 @@ impl GenericHeteroTransformer {
     fn draft_step_forward(&mut self, kind: DraftKind) -> Result<()> {
         let _order = crate::tensor::quantized::DecodeOrder::enter();
         let _in_place = crate::inference::moe_cuda::in_place_state(true);
+        let embed_scale = self.config.embed_scale;
+        let table = self.draft_card().and_then(|dev| {
+            self.embed_cards
+                .iter()
+                .find(|t| t.device().same_device(&dev))
+                .cloned()
+        });
         let d = self
             .draft
             .as_mut()
             .ok_or_else(|| crate::tensor::Error::msg("this model has no draft head".to_string()))?;
-        let (emb, rows_in, hidden, ids, read) = {
+        let (emb, rows_in, hidden, ids, read, tok_ids, counter, told_device) = {
             let s = d
                 .step
                 .as_ref()
@@ -527,18 +722,38 @@ impl GenericHeteroTransformer {
                 s.hidden.clone(),
                 s.ids.clone(),
                 s.read.clone(),
+                s.tok_ids.clone(),
+                s.counter.clone(),
+                s.told.device,
             )
+        };
+        // The rows of the tokens, decoded on the card from its table where it has one.
+        let gather = |ids: &Tensor, into: &Tensor| -> Result<()> {
+            if let Some(table) = table.as_ref() {
+                crate::inference::moe_cuda::embed_rows_iq4_xs(table, ids, into)?;
+                if let Some(scale) = embed_scale {
+                    into.slice_set(&(into.clone() * scale)?, 1, 0)?;
+                }
+            }
+            Ok(())
         };
         match kind {
             DraftKind::Pairs(n) => {
+                gather(&tok_ids.narrow(0, 0, n)?, &emb.narrow(1, 0, n)?)?;
                 let x = d.fuse(&emb.narrow(1, 0, n)?, &rows_in.narrow(1, 0, n)?)?;
                 let out = d.layer.forward_wide_graph_rows(&x, n)?;
                 hidden.slice_set(&out.narrow(1, n - 1, 1)?.to_dtype(DType::F32)?, 1, 0)?;
                 return Ok(());
             }
-            DraftKind::Step => {
-                let x = d.fuse(&emb.narrow(1, 0, 1)?, &hidden)?;
-                let out = d.layer.forward_wide_graph_rows(&x, 1)?;
+            DraftKind::Step(j) => {
+                // The token the head named, from the card's own buffer: no host in between.
+                if table.is_some() {
+                    gather(&ids, &emb.narrow(1, j, 1)?)?;
+                } else {
+                    crate::tensor::bail!("a recorded step needs the embedding table on the card");
+                }
+                let x = d.fuse(&emb.narrow(1, j, 1)?, &hidden)?;
+                let out = d.layer.forward_wide_graph_rows_at(&x, j, 1)?;
                 hidden.slice_set(&out.to_dtype(DType::F32)?, 1, 0)?;
             }
             DraftKind::Head => {}
@@ -556,18 +771,81 @@ impl GenericHeteroTransformer {
         let mass = logits.broadcast_sub(&top)?.exp()?.sum_keepdim(1)?;
         crate::inference::moe_cuda::batched_argmax_into(&logits, &ids)?;
         read.slice_set(&mass, 0, 0)?;
+        // The token and the mass to the host's mapping, then one more guess told: the host
+        // spins on the count and reads the two words behind it.
+        let cd = ids.device().as_cuda_device()?;
+        let stream = cd.0.stream().cu_stream();
+        let host_words = self
+            .draft
+            .as_ref()
+            .and_then(|d| d.step.as_ref())
+            .map(|s| s.told.host)
+            .ok_or_else(|| crate::tensor::Error::msg("the guess was not prepared"))?;
+        let tell_copy = |from: u64, word: usize| -> Result<()> {
+            let r = unsafe {
+                cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                    host_words.add(word) as *mut std::ffi::c_void,
+                    from,
+                    4,
+                    stream,
+                )
+            };
+            if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+                crate::tensor::bail!("the guess was not told to the host: {r:?}");
+            }
+            Ok(())
+        };
+        tell_copy(card_address::<u32>(&ids)?, Told::TOKEN)?;
+        tell_copy(card_address::<f32>(&read)?, Told::MASS)?;
+        unsafe {
+            crate::inference::moe_cuda::tier_graph::tell(
+                card_address::<u32>(&counter)? as *mut u32,
+                (told_device as *mut u32).wrapping_add(Told::SEQ),
+                stream as i64,
+            );
+        }
         Ok(())
     }
 
     /// The token the step named and the head's odds on it.
-    fn draft_step_read(&self) -> Result<(u32, f32)> {
+    fn draft_step_read(&mut self) -> Result<(u32, f32)> {
+        let dev = self.draft_card().expect("prepared");
+        let stream = dev.as_cuda_device()?.0.stream().cu_stream();
         let step = self
             .draft
-            .as_ref()
-            .and_then(|d| d.step.as_ref())
+            .as_mut()
+            .and_then(|d| d.step.as_mut())
             .ok_or_else(|| crate::tensor::Error::msg("the guess was not prepared"))?;
-        let token = step.ids.to_vec1::<u32>()?[0];
-        let mass = step.read.flatten_all()?.to_vec1::<f32>()?[0];
+        // The card tells each guess by its count: spin until the count moves. Once the stream is
+        // idle without it having moved, the words are what they are; a stream in error never
+        // moves it, and its error ends the wait.
+        let mut spins = 0u32;
+        loop {
+            let seq = step.told.word(Told::SEQ);
+            if seq != step.seen {
+                step.seen = seq;
+                break;
+            }
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(1024) {
+                use cudarc::driver::sys::cudaError_enum as E;
+                match unsafe { cudarc::driver::sys::cuStreamQuery(stream) } {
+                    E::CUDA_ERROR_NOT_READY => {}
+                    E::CUDA_SUCCESS => {
+                        step.seen = step.told.word(Told::SEQ);
+                        break;
+                    }
+                    e => {
+                        return Err(crate::tensor::Error::msg(format!(
+                            "the guess's stream failed: {e:?}"
+                        )))
+                    }
+                }
+            }
+            std::hint::spin_loop();
+        }
+        let token = step.told.word(Told::TOKEN);
+        let mass = f32::from_bits(step.told.word(Told::MASS));
         Ok((token, 1.0 / mass.max(1.0)))
     }
 
@@ -592,7 +870,7 @@ impl GenericHeteroTransformer {
             .is_some_and(|s| match kind {
                 DraftKind::Pairs(n) => s.pairs.iter().any(|(m, _)| *m == n),
                 DraftKind::Head => s.head.is_some(),
-                DraftKind::Step => s.layer.is_some(),
+                DraftKind::Step(j) => s.steps.get(j).is_some_and(Option::is_some),
             });
         if have {
             let step = self
@@ -610,7 +888,7 @@ impl GenericHeteroTransformer {
                         .1
                 }
                 DraftKind::Head => step.head.as_ref().expect("checked above"),
-                DraftKind::Step => step.layer.as_ref().expect("checked above"),
+                DraftKind::Step(j) => step.steps[j].as_ref().expect("checked above"),
             };
             if let Err(e) = g.0.launch() {
                 let step = self
@@ -621,14 +899,14 @@ impl GenericHeteroTransformer {
                 step.failures += 1;
                 step.pairs.clear();
                 step.head = None;
-                step.layer = None;
+                step.steps.iter_mut().for_each(|g| *g = None);
                 step.blocked = step.failures >= DRAFT_RECORD_FAILURES;
                 tracing::warn!(
                     "the replay of the draft's {} at pos={at} failed: {e:?}; {}",
                     match kind {
                         DraftKind::Pairs(n) => format!("pairs of {n}"),
                         DraftKind::Head => "head".to_string(),
-                        DraftKind::Step => "step".to_string(),
+                        DraftKind::Step(j) => format!("step {j}"),
                     },
                     if step.blocked {
                         "the guesses stay eager"
@@ -644,6 +922,33 @@ impl GenericHeteroTransformer {
         let stream = dev.as_cuda_device()?.0.stream().clone();
         // The eager run takes the kernels the recording will take, so that what they keep is
         // made before the recording and the two compute alike.
+        // The pairs advance the head's recurrent state in place: the state before the eager
+        // run is put back before the replay that proves the recording, so the replay runs
+        // the rows once, as the eager run did, and leaves the state the eager run left.
+        let state_before = match kind {
+            DraftKind::Pairs(_) => {
+                let d = self.draft.as_mut().expect("prepared");
+                let keep = d.layer.mixer.checkpoint()?;
+                if let Some(keep) = keep.as_ref() {
+                    d.layer.mixer.save_in_place(keep)?;
+                }
+                keep
+            }
+            _ => None,
+        };
+        // A step reads the hidden row and the token the round before left on the card and
+        // writes both: they are put back before the replay that proves the recording.
+        let step_before = match kind {
+            DraftKind::Step(_) => {
+                let s = self
+                    .draft
+                    .as_ref()
+                    .and_then(|d| d.step.as_ref())
+                    .expect("prepared");
+                Some(((&s.hidden * 1.0)?, (&s.ids.to_dtype(DType::F32)? * 1.0)?))
+            }
+            _ => None,
+        };
         super::expert_tier::kernels_of_a_recording(true);
         let eager = self.draft_step_forward(kind);
         super::expert_tier::kernels_of_a_recording(false);
@@ -658,6 +963,22 @@ impl GenericHeteroTransformer {
             _ => None,
         };
         let _ = stream.synchronize();
+        if let Some(keep) = state_before.as_ref() {
+            let d = self.draft.as_mut().expect("prepared");
+            d.layer.mixer.restore_in_place(keep)?;
+            let _ = stream.synchronize();
+        }
+        if let Some((hidden, ids)) = step_before.as_ref() {
+            self.draft_trim(at);
+            let s = self
+                .draft
+                .as_ref()
+                .and_then(|d| d.step.as_ref())
+                .expect("prepared");
+            s.hidden.slice_set(hidden, 1, 0)?;
+            s.ids.slice_set(&ids.to_dtype(DType::U32)?, 0, 0)?;
+            let _ = stream.synchronize();
+        }
         let captured = (|| -> Result<Option<crate::tensor::cuda_ext::CapturedGraph>> {
             crate::tensor::cuda_ext::begin_capture(&stream)?;
             self.draft_step_forward(kind)?;
@@ -671,23 +992,40 @@ impl GenericHeteroTransformer {
                     // twice, as a recording that keeps an allocation of its own cannot be
                     // launched again, and says so here rather than later.
                     let launched = match kind {
-                        DraftKind::Step => g.launch(),
-                        _ => g.launch().and_then(|()| g.launch()),
+                        DraftKind::Step(_) | DraftKind::Pairs(_) => g.launch(),
+                        DraftKind::Head => g.launch().and_then(|()| g.launch()),
                     };
                     match launched {
                         Ok(()) => {
                             let agrees = match (want_token, want_row) {
-                                (Some(t), _) => self.draft_step_read().map(|got| got.0 == t),
-                                (None, Some(row)) => self.draft_step_row().map(|got| {
-                                    crate::inference::engine::decode_step::replay_agrees(&got, &row)
+                                (Some(t), _) => self.draft_step_read().map(|got| {
+                                    (got.0 == t, format!("token {} against {t}", got.0))
                                 }),
-                                _ => Ok(false),
+                                (None, Some(row)) => self.draft_step_row().map(|got| {
+                                    let apart = got
+                                        .iter()
+                                        .zip(&row)
+                                        .map(|(a, b)| (a - b).abs())
+                                        .fold(0f32, f32::max);
+                                    (
+                                        crate::inference::engine::decode_step::replay_agrees(
+                                            &got, &row,
+                                        ),
+                                        format!("rows {apart:.3e} apart at most"),
+                                    )
+                                }),
+                                _ => Ok((false, "nothing to compare".to_string())),
                             };
                             match agrees {
-                                Ok(true) => Ok(g),
-                                Ok(false) => {
-                                    Err("the replay does not agree with the eager run".into())
-                                }
+                                Ok((true, _)) => Ok(g),
+                                Ok((false, what)) => Err(format!(
+                                    "the replay of {} does not agree with the eager run: {what}",
+                                    match kind {
+                                        DraftKind::Pairs(n) => format!("pairs of {n}"),
+                                        DraftKind::Head => "the head".to_string(),
+                                        DraftKind::Step(j) => format!("step {j}"),
+                                    }
+                                )),
                                 Err(e) => Err(format!("{e}")),
                             }
                         }
@@ -741,7 +1079,7 @@ impl GenericHeteroTransformer {
                     match kind {
                         DraftKind::Pairs(n) => format!("pairs of {n}"),
                         DraftKind::Head => "head".to_string(),
-                        DraftKind::Step => "step".to_string(),
+                        DraftKind::Step(j) => format!("step {j}"),
                     },
                     g.num_nodes().unwrap_or(0)
                 );
@@ -754,7 +1092,7 @@ impl GenericHeteroTransformer {
                         step.pairs.push((n, HeldGraph(g)));
                     }
                     DraftKind::Head => step.head = Some(HeldGraph(g)),
-                    DraftKind::Step => step.layer = Some(HeldGraph(g)),
+                    DraftKind::Step(j) => step.steps[j] = Some(HeldGraph(g)),
                 }
                 Ok(true)
             }
@@ -763,7 +1101,7 @@ impl GenericHeteroTransformer {
                 step.blocked = true;
                 step.pairs.clear();
                 step.head = None;
-                step.layer = None;
+                step.steps.iter_mut().for_each(|g| *g = None);
                 Ok(false)
             }
         }
@@ -792,6 +1130,12 @@ impl GenericHeteroTransformer {
         min_odds: f32,
     ) -> Result<Option<Vec<u32>>> {
         let n = tokens.len();
+        let mut spent = [0u64; 5];
+        let mut since = std::time::Instant::now();
+        let mut mark = |phase: usize, since: &mut std::time::Instant| {
+            spent[phase] += since.elapsed().as_micros() as u64;
+            *since = std::time::Instant::now();
+        };
         if !self.draft_step_prepare(tokens, committed)? {
             return Ok(None);
         }
@@ -809,6 +1153,7 @@ impl GenericHeteroTransformer {
                 .expect("prepared");
             step.rows_in.slice_set(&rows, 1, 0)?;
         }
+        mark(0, &mut since);
         if !self.draft_step_run(DraftKind::Pairs(n), committed)? {
             return Ok(None);
         }
@@ -818,26 +1163,33 @@ impl GenericHeteroTransformer {
             d.committed = at;
             d.mark_indexer();
         }
+        mark(1, &mut since);
+        // The steps' positions and rotation rows, staged once for the round: step `j` runs at
+        // row `j` from here, its token taken from the guess before it on the card.
+        let at0 = at;
+        if k > 1 && !self.draft_step_prepare(&[], at0)? {
+            return Ok(None);
+        }
+        mark(0, &mut since);
         let mut out = Vec::with_capacity(k);
         let mut token: Option<u32> = None;
-        for _ in 0..k {
+        for j in 0..k {
             let kind = match token {
                 None => DraftKind::Head,
-                Some(t) => {
-                    if !self.draft_step_prepare(&[t], at)? {
-                        break;
-                    }
-                    DraftKind::Step
-                }
+                Some(_) => DraftKind::Step(j - 1),
             };
             if !self.draft_step_run(kind, at)? {
                 break;
             }
-            if kind == DraftKind::Step {
+            if let DraftKind::Step(_) = kind {
                 at += 1;
                 self.draft_step_settle(at);
+                mark(4, &mut since);
+            } else {
+                mark(2, &mut since);
             }
             let (t, odds) = self.draft_step_read()?;
+            mark(3, &mut since);
             // A row of the verify costs what the policy measured: a token the head gives less
             // than those odds is not worth one, nor are the tokens that would follow it.
             if odds < min_odds {
@@ -847,6 +1199,26 @@ impl GenericHeteroTransformer {
             token = Some(t);
         }
         self.draft_step_settle(at);
+        if let Some(step) = self.draft.as_mut().and_then(|d| d.step.as_mut()) {
+            for (sum, us) in step.spent_us.iter_mut().zip(spent) {
+                *sum += us;
+            }
+            step.spent_n += 1;
+            if step.spent_n == DRAFT_REPORT_EVERY {
+                let n = u64::from(step.spent_n);
+                let t = step.spent_us;
+                tracing::info!(
+                    "the head's guesses, {n}: preparation {} us, pairs {}, head {}, read {}, steps {}",
+                    t[0] / n,
+                    t[1] / n,
+                    t[2] / n,
+                    t[3] / n,
+                    t[4] / n
+                );
+                step.spent_us = [0; 5];
+                step.spent_n = 0;
+            }
+        }
         Ok(Some(out))
     }
 }

@@ -64,6 +64,9 @@ extern "C" __global__ void loken_gdn_prep_kernel(
         const float * __restrict__ a_log, const float * __restrict__ dt_bias,
         float * __restrict__ q_out, float * __restrict__ k_out, float * __restrict__ v_out,
         float * __restrict__ g_out, float * __restrict__ beta_out, float * new_window,
+        // The window after each of the first `snap_rows` rows, `[snap_rows, conv_dim, K - 1]`,
+        // or null.
+        float * __restrict__ window_snaps, int snap_rows,
         int rows, int kg, int kd, int vg, int vd, int K, int tiled, float eps, int in_f16) {
     extern __shared__ float shared[];
     const int qk = kg * kd;
@@ -94,6 +97,13 @@ extern "C" __global__ void loken_gdn_prep_kernel(
             sk[d] = ck;
             ssq += cq * cq;
             ssk += ck * ck;
+            if (window_snaps != nullptr && r < snap_rows) {
+                const int chs[2] = {b * kd + d, qk + b * kd + d};
+                for (int c = 0; c < 2; ++c) {
+                    float * sn = window_snaps + ((size_t) r * conv_dim + chs[c]) * (K - 1);
+                    for (int j = 0; j < K - 1; ++j) sn[j] = new_window[chs[c] * (K - 1) + j];
+                }
+            }
         }
         const float invq = rsqrtf(block_total(ssq) + eps);
         const float invk = rsqrtf(block_total(ssk) + eps);
@@ -109,8 +119,12 @@ extern "C" __global__ void loken_gdn_prep_kernel(
     } else {
         const int vh = b - kg;
         for (int d = threadIdx.x; d < vd; d += blockDim.x) {
-            v_r[(size_t) vh * vd + d] =
-                conv_silu(2 * qk + vh * vd + d, qkv_r, window_r, w, new_window, K, in_f16);
+            const int ch = 2 * qk + vh * vd + d;
+            v_r[(size_t) vh * vd + d] = conv_silu(ch, qkv_r, window_r, w, new_window, K, in_f16);
+            if (window_snaps != nullptr && r < snap_rows) {
+                float * sn = window_snaps + ((size_t) r * conv_dim + ch) * (K - 1);
+                for (int j = 0; j < K - 1; ++j) sn[j] = new_window[ch * (K - 1) + j];
+            }
         }
         if (threadIdx.x == 0) {
             const float x = load_in(alpha_r, vh, in_f16) + dt_bias[vh];
@@ -126,9 +140,9 @@ extern "C" void loken_gdn_prep(
         const void * beta_in, const float * a_log, const float * dt_bias, float * q_out,
         float * k_out, float * v_out, float * g_out, float * beta_out, float * new_window,
         int rows, int kg, int kd, int vg, int vd, int K, int tiled, float eps, int in_f16,
-        cudaStream_t stream) {
+        float * window_snaps, int snap_rows, cudaStream_t stream) {
     const size_t shared = (size_t) 2 * kd * sizeof(float);
     loken_gdn_prep_kernel<<<kg + vg, 128, shared, stream>>>(
         qkv, window, w, alpha, beta_in, a_log, dt_bias, q_out, k_out, v_out, g_out, beta_out,
-        new_window, rows, kg, kd, vg, vd, K, tiled, eps, in_f16);
+        new_window, window_snaps, snap_rows, rows, kg, kd, vg, vd, K, tiled, eps, in_f16);
 }

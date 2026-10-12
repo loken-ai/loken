@@ -10,10 +10,6 @@ use super::*;
 /// verify weight-GEMVs cost more than the drafts save (qwen3/deepcoder GPU 2.5K were
 /// a loss with PLD on, a tie with it gated). PLD is exact spec-decode (verify
 /// re-samples each position) -> gating changes only speed, never the greedy tokens.
-pub(super) fn pld_max_ctx_threshold() -> usize {
-    2048
-}
-
 /// Apply repetition penalty to logits (matching llama.cpp / Ollama behavior).
 /// For each recently-used token, if its logit is positive, divide by penalty;
 /// if negative, multiply by penalty. This reduces the probability of repeating tokens.
@@ -303,8 +299,6 @@ pub(super) struct VerifyGraphs {
     pub(super) disabled: bool,
     /// The step's buffers were dropped with a window: the step's graph is recorded again.
     pub(super) step_stale: bool,
-    /// Rows a window may carry: a window the card had no memory for lowers it.
-    pub(super) rows_cap: usize,
     /// Seconds spent readying the replays' buffers, and in the replays themselves, summed.
     pub(super) prepare_secs: f64,
     pub(super) launch_secs: f64,
@@ -317,7 +311,6 @@ impl Default for VerifyGraphs {
             by_rows: std::collections::HashMap::new(),
             disabled: false,
             step_stale: false,
-            rows_cap: usize::MAX,
             prepare_secs: 0.0,
             launch_secs: 0.0,
         }
@@ -329,16 +322,60 @@ impl VerifyGraphs {
     pub(super) fn clear(&mut self) {
         self.by_rows.clear();
     }
+}
 
-    /// Tokens a draft may carry into a recorded window: one row less than the window.
-    pub(super) fn draft_cap(&self) -> usize {
-        self.rows_cap.saturating_sub(1)
+/// The copy a lookup offers for a window: a match of the longest n-gram the cache keeps
+/// copies as far as it reaches, one n-gram shorter copies two tokens, a shorter one none.
+pub(super) fn copy_draft(
+    cache: &crate::inference::serve::prompt_lookup::NgramDraftCache,
+) -> Vec<u32> {
+    let (mut draft, matched) = cache.lookup_matched();
+    let reach = match matched {
+        0 => 0,
+        n if n >= cache.max_ngram() => draft.len(),
+        n if n + 1 >= cache.max_ngram() => 2,
+        _ => 0,
+    };
+    draft.truncate(reach);
+    if draft.len() >= 2 {
+        draft
+    } else {
+        Vec::new()
     }
 }
 
 /// Wait for the card without keeping a core busy; a wait that lasts says what every expert
 /// cache's mailbox holds, once, since a step recorded against them waits on the host there.
 #[cfg(feature = "cuda")]
+/// Whether every row of `logits` (`[.., rows, vocab]`) is finite: a row's sum is not finite
+/// when any of its values is not.
+#[cfg(feature = "cuda")]
+fn rows_finite(logits: &Tensor) -> crate::tensor::Result<bool> {
+    let sums = logits
+        .sum_keepdim(crate::tensor::D::Minus1)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(sums.iter().all(|v| v.is_finite()))
+}
+
+/// Each row's sum and the token it names, for a report.
+#[cfg(feature = "cuda")]
+fn rows_told(logits: &Tensor) -> crate::tensor::Result<String> {
+    let sums = logits
+        .sum_keepdim(crate::tensor::D::Minus1)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let rows = logits.dim(crate::tensor::D::Minus2)?;
+    let mut out = Vec::with_capacity(rows);
+    for (r, sum) in sums.iter().enumerate() {
+        let row = logits.flatten_to(1)?.narrow(0, r, 1)?.flatten_all()?;
+        let top = row.argmax(0)?.to_scalar::<u32>()?;
+        let peak = row.max_keepdim(0)?.flatten_all()?.to_vec1::<f32>()?[0];
+        out.push(format!("row {r}: sum {sum}, top {top} at {peak}"));
+    }
+    Ok(out.join("; "))
+}
+
 fn wait_telling(
     model: &BoxedModelBackend,
     stream: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
@@ -384,7 +421,7 @@ pub(super) fn verify_recorded(
     ids: &[u32],
 ) -> Option<(Tensor, Option<f64>)> {
     let rows = ids.len();
-    if graphs.disabled || rows < 2 || rows > model.verify_window_rows() || rows > graphs.rows_cap {
+    if graphs.disabled || rows < 2 || rows > model.verify_window_rows() {
         return None;
     }
     // The buffers the step's graph reads go with the state, so the step is recorded again:
@@ -426,11 +463,70 @@ pub(super) fn verify_recorded(
             give_up(model, graphs, format!("launch: {e}"));
             return None;
         }
+        model.verify_window_replayed();
         if let Err(e) = wait_telling(model, stream) {
             give_up(model, graphs, format!("replay: {e}"));
             return None;
         }
         graphs.launch_secs += launching.elapsed().as_secs_f64();
+        // A row that is not finite names token zero and, once committed, leaves the recurrent
+        // state not finite for the rest of the request: the window is given up instead.
+        // A replay that is not finite is run once more from the state before it: the fault
+        // is a transient of the cards, the same graph on the same rows is finite again.
+        let finite = match rows_finite(logits) {
+            Ok(true) => true,
+            Ok(false) => {
+                let told = rows_told(logits).unwrap_or_default();
+                let hops = model.verify_hops_report(rows);
+                warn!("a replay of {rows} rows at pos={pos} is not finite: {hops}");
+                let again = model
+                    .verify_window_settle(0)
+                    .and_then(|()| model.verify_window_prepare(pos, ids))
+                    .and_then(|()| g.launch(model, rows))
+                    .and_then(|()| {
+                        model.verify_window_replayed();
+                        wait_telling(model, stream)
+                    })
+                    .and_then(|()| rows_finite(logits));
+                match again {
+                    Ok(true) => {
+                        warn!("a replay of {rows} rows at pos={pos} was not finite ({told}); the same replay is finite again");
+                        for line in model.tier_mailboxes() {
+                            warn!("tier at the time: {line}");
+                        }
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(e) => {
+                        give_up(model, graphs, format!("the replay run again: {e}"));
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                give_up(
+                    model,
+                    graphs,
+                    format!("the replay's rows were not read: {e}"),
+                );
+                return None;
+            }
+        };
+        if !finite {
+            let told = rows_told(logits).unwrap_or_default();
+            let states = model
+                .verify_window_settle(0)
+                .map(|()| model.verify_states_report())
+                .unwrap_or_else(|e| format!("not settled: {e}"));
+            give_up(
+                model,
+                graphs,
+                format!(
+                    "a row of the replay is not finite twice: {told}; after the return: {states}"
+                ),
+            );
+            return None;
+        }
         return Some((logits.clone(), None));
     }
     // The eager run of the window: what the replay has to reproduce.
@@ -538,22 +634,6 @@ pub(super) fn verify_recorded(
     let logits = eager;
     let replay = std::time::Instant::now();
     if let Err(e) = g.launch(model, rows) {
-        // A window the card has no memory for ends the windows of its size and above, and the
-        // drafts shrink to what fits; any other failure ends them all.
-        if format!("{e}").contains("OUT_OF_MEMORY") {
-            let _ = stream.synchronize();
-            graphs.rows_cap = rows - 1;
-            warn!("recorded verify of {rows} rows: no memory for its launch; windows of up to {} rows from now on", rows - 1);
-            if let Err(e) = model.verify_window_settle(0) {
-                warn!("the model did not return to the rows before the verify: {e}");
-            }
-            // The buffers the other windows read go with the state: they and the step's graph
-            // are recorded again.
-            model.invalidate_graph_state();
-            graphs.clear();
-            graphs.step_stale = true;
-            return None;
-        }
         give_up(model, graphs, format!("first launch: {e}"));
         return None;
     }

@@ -11,6 +11,9 @@ pub(super) enum Projected {
     Split(Tensor, Tensor, Tensor),
 }
 
+/// Attention layers probed at the prompt's start, in call order.
+static ATTN_PROBE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl GenericTransformerLayer {
     /// The QK-norm spans the whole Q and K projections (OLMo2), not one head at a time
     /// (Gemma3, Qwen3): its weight is longer than a head.
@@ -533,6 +536,14 @@ impl GenericTransformerLayer {
         let projected = pre_computed_qkv.map(|t| Projected::Qkv(t.clone()));
         let (y, via_graph_buffer) =
             self.attend(x, mask, index_pos, shared_kv, projected, donor_f16)?;
+        if index_pos == 0 && x.dim(1)? > 1 {
+            if let Some(dir) = super::draft_head::probe_dir() {
+                let k0 = ATTN_PROBE_CALLS
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(1);
+                super::draft_head::dump_rows(dir, &format!("attn{k0}_y"), &y);
+            }
+        }
         let y = self.gate_attention(x, y)?;
         self.attn_output_projection(&y, via_graph_buffer)
     }
@@ -1254,11 +1265,30 @@ impl GenericTransformerLayer {
         // (seq_len > 1), graph_rope_cos may still be set from a prior
         // generation, but we must NOT use the single-row buffers for it.
         let use_graph_ops = self.graph_step() && seq == 1;
+        // A probe of the first chunk's attention, in call order over the layers.
+        let probe = if index_pos == 0 && seq > 1 {
+            super::draft_head::probe_dir().map(|dir| {
+                (
+                    dir,
+                    ATTN_PROBE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+        } else {
+            None
+        };
+        if let Some((dir, k0)) = &probe {
+            super::draft_head::dump_rows(dir, &format!("attn{k0}_q_normed"), &q);
+            super::draft_head::dump_rows(dir, &format!("attn{k0}_k_normed"), &k);
+            super::draft_head::dump_rows(dir, &format!("attn{k0}_v"), &v);
+        }
 
         if use_graph_ops {
             q = self.apply_rotary_emb_from_buffer(&q)?;
         } else {
             q = self.apply_rotary_emb(&q, index_pos)?;
+        }
+        if let Some((dir, k0)) = &probe {
+            super::draft_head::dump_rows(dir, &format!("attn{k0}_q_roped"), &q);
         }
 
         // -- KV: compute or reuse from shared layer ----------------------
@@ -1282,6 +1312,9 @@ impl GenericTransformerLayer {
                 k = self.apply_rotary_emb_from_buffer(&k)?;
             } else {
                 k = self.apply_rotary_emb(&k, index_pos)?;
+            }
+            if let Some((dir, k0)) = &probe {
+                super::draft_head::dump_rows(dir, &format!("attn{k0}_k_roped"), &k);
             }
             if index_pos == 0 {
                 self.kv_cache.reset();

@@ -51,8 +51,8 @@ static std::mutex g_y_q8_1_lock;
 // nothing has been enqueued yet when the lock is dropped; the caller holds the reservation
 // until both launches are on the stream.
 //
-// It also keeps the buffer from moving. A caller that needs more frees this one and allocates a
-// larger one, and `cudaFreeAsync` only orders against work already enqueued.
+// It also keeps the buffer from moving under a caller. A caller that needs more gets a larger
+// one; the smaller one is never freed, since a graph recorded against it still reads it.
 struct y_q8_1_reservation {
     std::unique_lock<std::mutex> held;
     void* ptr;
@@ -82,9 +82,11 @@ static y_q8_1_reservation get_y_q8_1_scratch(size_t needed, cudaStream_t stream)
         slot->bytes = 0;
     }
     if (needed > slot->bytes) {
-        if (slot->ptr) cudaFreeAsync(slot->ptr, stream);
-        cudaMallocAsync(&slot->ptr, needed, stream);
-        slot->bytes = needed;
+        // The old buffer stays allocated: a recorded graph holds its address and replays into
+        // it after a wider call moved on. Doubling bounds how many are left behind.
+        const size_t bytes = needed > 2 * slot->bytes ? needed : 2 * slot->bytes;
+        cudaMallocAsync(&slot->ptr, bytes, stream);
+        slot->bytes = bytes;
     }
     return {std::move(held), slot->ptr};
 }
@@ -370,6 +372,8 @@ __global__ void loken_moe_gemm_gguf_kernel(
     if (dims.live != nullptr && slot.pair >= (int) *dims.live) return;
 
     const routed_pair routed = read_routing(sorted_token_ids, expert_ids, slot.pair);
+    // A handed pair names one of this launch's rows; one past them adds nothing.
+    if (dims.live != nullptr && (routed.token < 0 || routed.token >= dims.pairs)) return;
     if (routed.expert < 0 || routed.expert >= dims.experts) return;
 
     const float scale = (topk_weights) ? topk_weights[routed.token] : 1.0f;
@@ -495,6 +499,8 @@ __global__ void loken_moe_gemm_gguf_down_reduce_kernel(
     if (dims.live != nullptr && slot.pair >= (int) *dims.live) return;
 
     const routed_pair routed = read_routing(sorted_token_ids, expert_ids, slot.pair);
+    // A handed pair names one of this launch's rows; one past them adds nothing.
+    if (dims.live != nullptr && (routed.token < 0 || routed.token >= dims.pairs)) return;
     if (routed.expert < 0 || routed.expert >= dims.experts) {
         // A pair the routing leaves out adds nothing. Its row is written zero, so the
         // reduction never reads what an earlier launch left in the scratch.
@@ -784,6 +790,8 @@ __global__ void loken_moe_gemm_gguf_gate_up_silu_mul_kernel(
     if (dims.live != nullptr && slot.pair >= (int) *dims.live) return;
 
     const routed_pair routed = read_routing(sorted_token_ids, expert_ids, slot.pair);
+    // A handed pair names one of this launch's rows; one past them adds nothing.
+    if (dims.live != nullptr && (routed.token < 0 || routed.token >= dims.pairs)) return;
     if (routed.expert < 0 || routed.expert >= dims.experts) return;
 
     const block_t * __restrict__ wg_expert =
@@ -1019,6 +1027,8 @@ __global__ void loken_moe_gemm_gguf_gate_up_gelu_mul_concat_kernel(
     if (dims.live != nullptr && slot.pair >= (int) *dims.live) return;
 
     const routed_pair routed = read_routing(sorted_token_ids, expert_ids, slot.pair);
+    // A handed pair names one of this launch's rows; one past them adds nothing.
+    if (dims.live != nullptr && (routed.token < 0 || routed.token >= dims.pairs)) return;
     if (routed.expert < 0 || routed.expert >= dims.experts) return;
 
     // An expert's slab is twice as tall in this layout: the gate's rows, then the up's.

@@ -97,6 +97,22 @@ pub fn gated_delta_net(
     state: &Tensor,
     scale: f32,
 ) -> Result<(Tensor, Tensor)> {
+    gated_delta_net_with_snapshots(q, k, v, g, beta, state, scale, None)
+}
+
+/// [`gated_delta_net`] that also writes the state after each of the first `rows` tokens
+/// into `snaps` (`[rows, h, s_v, s_v]` F32, contiguous), what a return to a token copies back.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_net_with_snapshots(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &Tensor,
+    scale: f32,
+    snaps: Option<(&Tensor, usize)>,
+) -> Result<(Tensor, Tensor)> {
     let dev = q.device().as_cuda_device()?;
     let (n_tokens, h, s_v) = q.dims3()?;
     let cuptr = |t: &Tensor| -> Result<*const f32> {
@@ -116,6 +132,17 @@ pub fn gated_delta_net(
     };
     let (qp, kp, vp) = (cuptr(q)?, cuptr(k)?, cuptr(v)?);
     let (gp, bp, sp) = (cuptr(g)?, cuptr(beta)?, cuptr(state)?);
+    let (snap_ptr, snap_rows) = match snaps {
+        Some((t, rows)) => {
+            if t.elem_count() < rows * h * s_v * s_v || !t.is_contiguous() {
+                crate::tensor::bail!(
+                    "gated_delta_net: the snapshots hold fewer than {rows} states"
+                );
+            }
+            (cuptr(t)? as *mut f32, rows as i32)
+        }
+        None => (std::ptr::null_mut(), 0),
+    };
     let in_place = super::in_place_state_on();
     if in_place && !state.is_contiguous() {
         crate::tensor::bail!("gated_delta_net: an in-place state must be contiguous");
@@ -155,6 +182,8 @@ pub fn gated_delta_net(
             sg1,
             sg2,
             scale,
+            snap_ptr,
+            snap_rows,
             stream,
         );
     }
@@ -337,6 +366,48 @@ pub fn deltanet_gate(
 mod timing {
     use super::*;
     use crate::tensor::{Device, Tensor};
+
+    /// The scan over several tokens leaves, after each of them, the state the same tokens
+    /// leave one at a time: a return to a token copies the snapshot.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn the_scan_snapshots_are_the_states_after_each_token() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return;
+        };
+        let (h, s_v, n) = (4usize, 64usize, 3usize);
+        let q = Tensor::randn(0f32, 1.0, (n, h, s_v), &dev).unwrap();
+        let k = Tensor::randn(0f32, 1.0, (n, h, s_v), &dev).unwrap();
+        let v = Tensor::randn(0f32, 1.0, (n, h, s_v), &dev).unwrap();
+        let g = Tensor::randn(-1f32, 0.1, (n, h), &dev).unwrap();
+        let beta = Tensor::randn(0.5f32, 0.1, (n, h), &dev).unwrap();
+        let _in_place = super::super::in_place_state(true);
+        let state = Tensor::zeros_on((h, s_v, s_v), crate::tensor::DType::F32, &dev).unwrap();
+        let snaps = Tensor::zeros_on((n, h, s_v, s_v), crate::tensor::DType::F32, &dev).unwrap();
+        gated_delta_net_with_snapshots(&q, &k, &v, &g, &beta, &state, 0.1, Some((&snaps, n)))
+            .unwrap();
+        let steps = Tensor::zeros_on((h, s_v, s_v), crate::tensor::DType::F32, &dev).unwrap();
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for t in 0..n {
+            let row = |x: &Tensor| x.narrow(0, t, 1).unwrap();
+            gated_delta_net(
+                &row(&q),
+                &row(&k),
+                &row(&v),
+                &row(&g),
+                &row(&beta),
+                &steps,
+                0.1,
+            )
+            .unwrap();
+            assert_eq!(
+                flat(&snaps.narrow(0, t, 1).unwrap()),
+                flat(&steps),
+                "after token {t}"
+            );
+        }
+        assert_eq!(flat(&state), flat(&steps), "the state after every token");
+    }
 
     /// What one token through the recurrence costs at the served shapes, the state advanced in
     /// place: the launch alone, timed over many, against what its bytes take at the card's

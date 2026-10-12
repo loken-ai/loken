@@ -22,8 +22,11 @@ pub(super) struct VerifyKeep {
     ngram: Option<Tensor>,
     /// The residual the layer took, `[1, rows, wide]`, for the n-gram block to read again.
     input: Option<Tensor>,
-    /// The token mixer's input, `[1, rows, hidden]`.
+    /// The token mixer's input, `[1, rows, hidden]`, for a recurrent mixer without
+    /// snapshots to run again over the kept rows.
     mixed: Option<Tensor>,
+    /// The mixer's state after each of the window's first rows, for a return by copies.
+    snaps: Option<(Tensor, Tensor, usize)>,
     /// Whether the buffers hold the state before the verify in flight: a layer the verify
     /// never reached keeps nothing to return to.
     saved: bool,
@@ -36,6 +39,8 @@ pub(crate) struct VerifyWindow {
     ids: Vec<u32>,
     ngram: Option<ngram::NgramHistory>,
 }
+
+use crate::inference::engine::decode_step::RETURN_SNAPSHOTS;
 
 /// The buffers of a recorded verify that belong to the model.
 #[derive(Default)]
@@ -52,7 +57,14 @@ pub(crate) struct VerifyBuffers {
     hops: Vec<super::graph::GraphHop>,
     /// The verify in flight, from its preparation to its settlement.
     pub(super) window: Option<VerifyWindow>,
+    /// Microseconds the preparation's phases took (the layers' positions and rope, the
+    /// n-gram rows, the embeddings, the hops), and the windows they count.
+    prep_us: [u64; 4],
+    prep_n: u32,
 }
+
+/// Windows between two reports of the preparation's phases.
+const PREPARE_REPORT_EVERY: u32 = 64;
 
 /// One op of a recorded verify: the layers of a card's segment, or the rows' hop from a
 /// card to the next.
@@ -85,15 +97,24 @@ impl GenericTransformerLayer {
             true => Some(Tensor::zeros_on((1, VERIFY_ROWS, s * d), DType::F32, dev)?),
             false => None,
         };
-        let mixed = match self.mixer.is_recurrent() {
+        let mixed = match self.mixer.is_recurrent() && self.mixer.snapshot_shapes().is_none() {
             true => Some(Tensor::zeros_on((1, VERIFY_ROWS, d), mixed_dtype, dev)?),
             false => None,
+        };
+        let snaps = match self.mixer.snapshot_shapes() {
+            Some(((vg, vd, kd), (conv_dim, taps))) => Some((
+                Tensor::zeros_on((RETURN_SNAPSHOTS, vg, vd, kd), DType::F32, dev)?,
+                Tensor::zeros_on((RETURN_SNAPSHOTS, conv_dim, taps), DType::F32, dev)?,
+                RETURN_SNAPSHOTS,
+            )),
+            None => None,
         };
         self.verify_keep = Some(VerifyKeep {
             mixer,
             ngram,
             input,
             mixed,
+            snaps,
             saved: false,
         });
         Ok(())
@@ -102,6 +123,18 @@ impl GenericTransformerLayer {
     /// The rows of a recorded verify through this layer: the stages of the recorded decode
     /// step over `rows` rows, the state before them kept first.
     pub(super) fn forward_wide_graph_rows(&mut self, x: &Tensor, rows: usize) -> Result<Tensor> {
+        self.forward_wide_graph_rows_at(x, 0, rows)
+    }
+
+    /// [`Self::forward_wide_graph_rows`] for rows standing at `row0` among the verify's: the
+    /// positions, rotation rows and n-gram rows of the rows from there, the state before them
+    /// kept only for the verify's first rows.
+    pub(super) fn forward_wide_graph_rows_at(
+        &mut self,
+        x: &Tensor,
+        row0: usize,
+        rows: usize,
+    ) -> Result<Tensor> {
         use super::hyper::combine_on_card;
         use super::wide::staged;
         let dev = x.device();
@@ -111,21 +144,23 @@ impl GenericTransformerLayer {
                 .verify_keep
                 .as_mut()
                 .ok_or_else(|| crate::tensor::Error::msg("the verify's rows were not prepared"))?;
-            if let (Some(ple), Some(conv)) = (self.ngram.as_ref(), keep.ngram.as_ref()) {
-                ple.save_rows_into(conv)?;
+            if row0 == 0 {
+                if let (Some(ple), Some(conv)) = (self.ngram.as_ref(), keep.ngram.as_ref()) {
+                    ple.save_rows_into(conv)?;
+                }
+                if let Some(state) = keep.mixer.as_ref() {
+                    self.mixer.save_in_place(state)?;
+                }
+                keep.saved = true;
             }
             if let Some(input) = keep.input.as_ref() {
-                input.slice_set(&x, 1, 0)?;
+                input.slice_set(&x, 1, row0)?;
             }
-            if let Some(state) = keep.mixer.as_ref() {
-                self.mixer.save_in_place(state)?;
-            }
-            keep.saved = true;
         }
         let joined;
         let x = match (self.ngram.as_mut(), self.verify_ngram_rows.as_ref()) {
             (Some(ple), Some(table_rows)) => {
-                let add = ple.forward(&x, &table_rows.narrow(1, 0, rows)?, 1)?;
+                let add = ple.forward(&x, &table_rows.narrow(1, row0, rows)?, 1)?;
                 joined = (&x + add)?;
                 &joined
             }
@@ -144,20 +179,25 @@ impl GenericTransformerLayer {
             hc.attn.mix_on_card(&xn, true)
         })?;
         if let Some(buffer) = self.verify_keep.as_ref().and_then(|k| k.mixed.as_ref()) {
-            buffer.slice_set(&mixed.to_dtype(buffer.dtype())?, 1, 0)?;
+            buffer.slice_set(&mixed.to_dtype(buffer.dtype())?, 1, row0)?;
         }
         let out = staged("token mixer", &dev, false, || match self.mixer {
             mixer::Mixer::Attention => {
                 let pos = self.verify_pos_i32.clone().ok_or_else(|| {
                     crate::tensor::Error::msg("the verify's positions are not on the card")
                 })?;
-                let mut o = match self.attend_rows_recorded(&mixed, &pos, rows)? {
+                let pos = pos.narrow(0, row0, rows)?;
+                let mut o = match self.attend_rows_recorded(&mixed, &pos, row0, rows)? {
                     Some(o) => o,
                     None => {
                         let mut parts = Vec::with_capacity(rows);
                         for r in 0..rows {
                             let row = mixed.narrow(1, r, 1)?.contiguous()?;
-                            parts.push(self.attend_row_recorded(&row, &pos.narrow(0, r, 1)?, r)?);
+                            parts.push(self.attend_row_recorded(
+                                &row,
+                                &pos.narrow(0, r, 1)?,
+                                row0 + r,
+                            )?);
                         }
                         Tensor::cat(&parts.iter().collect::<Vec<_>>(), 1)?
                     }
@@ -168,8 +208,13 @@ impl GenericTransformerLayer {
                 Ok(o)
             }
             _ => {
-                let m = self.mixer.forward(&mixed, 1)?;
-                self.attn_output.forward(&m)
+                if rows > 1 {
+                    let snaps = self.verify_keep.as_ref().and_then(|k| k.snaps.clone());
+                    self.mixer.set_snapshots(snaps);
+                }
+                let m = self.mixer.forward(&mixed, 1);
+                self.mixer.set_snapshots(None);
+                self.attn_output.forward(&m?)
             }
         })?;
         let (r, xn) = staged("combine", &dev, false, || {
@@ -216,8 +261,13 @@ impl GenericTransformerLayer {
             return Ok(());
         }
         let keep = self.verify_keep.as_ref().expect("checked above");
-        if let Some(state) = keep.mixer.as_ref() {
-            self.mixer.restore_in_place(state)?;
+        // The state after the kept rows copied from the window's snapshots when it holds
+        // them; put back from the keep and run again over the kept rows otherwise.
+        let snapped = kept > 0 && self.mixer.restore_from_snapshot(kept - 1)?;
+        if !snapped {
+            if let Some(state) = keep.mixer.as_ref() {
+                self.mixer.restore_in_place(state)?;
+            }
         }
         if let (Some(ple), Some(conv)) = (self.ngram.as_mut(), keep.ngram.as_ref()) {
             ple.restore_rows_from(conv)?;
@@ -233,9 +283,12 @@ impl GenericTransformerLayer {
                 )?;
             }
         }
-        if let (Some(mixed), true, true) =
-            (keep.mixed.as_ref(), self.mixer.is_recurrent(), kept > 0)
-        {
+        if let (Some(mixed), true, true, false) = (
+            keep.mixed.as_ref(),
+            self.mixer.is_recurrent(),
+            kept > 0,
+            snapped,
+        ) {
             self.mixer.forward(&mixed.narrow(1, 0, kept)?, base)?;
         }
         if let Some(sparse) = self.sparse.as_mut() {
@@ -282,12 +335,17 @@ impl GenericHeteroTransformer {
         if self.verify_window_block().is_some() {
             return 0;
         }
+        // A window returns to its kept rows by a snapshot copy: the rows reach one past the
+        // snapshots kept, which also keeps the window's graphs to a few sizes.
         let mut rows = VERIFY_ROWS;
         for l in &self.layers {
             if let Some(m) = l.moe.as_ref() {
                 if let Some(t) = m.tier.as_ref().filter(|t| !t.is_resident()) {
                     rows = rows.min(t.graph_rows());
                 }
+            }
+            if l.mixer.snapshot_shapes().is_some() {
+                rows = rows.min(RETURN_SNAPSHOTS + 1);
             }
         }
         rows
@@ -333,7 +391,14 @@ impl GenericHeteroTransformer {
             .expect("made above")
             .rope
             .clone();
+        let mut prep = [0u64; 4];
+        let mut since = std::time::Instant::now();
+        let mut mark = |phase: usize, since: &mut std::time::Instant| {
+            prep[phase] += since.elapsed().as_micros() as u64;
+            *since = std::time::Instant::now();
+        };
         let mut filled: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut positioned: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for i in 0..self.layers.len() {
             let dev = self.layers[i].cos.device().clone();
             self.layers[i].verify_keep_ready(&dev)?;
@@ -341,9 +406,12 @@ impl GenericHeteroTransformer {
                 crate::tensor::bail!("a recorded verify runs on a card");
             };
             if self.layers[i].sparse.is_some() {
+                // The positions go up once a card; every layer of the card shares them.
                 let shared = match self.verify.pos_by_card.get(&gpu_id) {
                     Some(t) => {
-                        t.slice_set(&Tensor::new(&positions[..], &dev)?, 0, 0)?;
+                        if positioned.insert(gpu_id) {
+                            t.slice_set(&Tensor::new(&positions[..], &dev)?, 0, 0)?;
+                        }
                         t.clone()
                     }
                     None => {
@@ -407,6 +475,7 @@ impl GenericHeteroTransformer {
             }
         }
         // The n-gram rows of the tokens, and the rows' embeddings.
+        mark(0, &mut since);
         let ids_t = Tensor::from_vec(ids.to_vec(), (1, rows), &Device::Cpu)?;
         if let Some(layer) = self.ngram.as_ref().map(|n| n.meta.layer) {
             self.gather_ngram_rows(&ids_t, pos)?;
@@ -428,14 +497,20 @@ impl GenericHeteroTransformer {
                 }
             }
         }
+        mark(1, &mut since);
         let emb_device = self.embeddings.embeddings().device().clone();
-        let mut hidden = self.embeddings.forward(&ids_t.to_device(&emb_device)?)?;
+        // The rows' embeddings gathered on the card when it holds the table.
+        let mut hidden = match self.embed_table_on(&card) {
+            Some(table) => self.embed_rows_on_card(table, &ids_t)?,
+            None => self.embeddings.forward(&ids_t.to_device(&emb_device)?)?,
+        };
         if let Some(scale) = self.config.embed_scale {
             hidden = (hidden * scale)?;
         }
         let streams = self.config.hyper.expect("checked above").streams;
         let hidden = super::wide::widen_embedding(&hidden, streams)?.to_device(&card)?;
         let wide = hidden.dim(2)?;
+        mark(2, &mut since);
         let segs = self.graph_segments();
         match self.verify.hidden.as_ref() {
             Some(buffer) => buffer.slice_set(&hidden, 1, 0)?,
@@ -455,6 +530,24 @@ impl GenericHeteroTransformer {
                 .skip(1)
                 .map(|(_, d)| super::graph::GraphHop::with_rows(wide, VERIFY_ROWS, d))
                 .collect::<Result<_>>()?;
+        }
+        mark(3, &mut since);
+        for (sum, us) in self.verify.prep_us.iter_mut().zip(prep) {
+            *sum += us;
+        }
+        self.verify.prep_n += 1;
+        if self.verify.prep_n == PREPARE_REPORT_EVERY {
+            let n = u64::from(self.verify.prep_n);
+            let p = self.verify.prep_us;
+            tracing::info!(
+                "a window's preparation, {n} windows: positions and rope {} us, n-gram rows {}, embeddings {}, hops {}",
+                p[0] / n,
+                p[1] / n,
+                p[2] / n,
+                p[3] / n
+            );
+            self.verify.prep_us = [0; 4];
+            self.verify.prep_n = 0;
         }
         Ok(())
     }
@@ -607,6 +700,81 @@ impl GenericHeteroTransformer {
 
     /// The verify prepared last has run: the caches hold its rows, of which the first `kept`
     /// stay. Every layer returns to the rows kept, and the draft head is handed the rows.
+    /// A recorded window replayed: the kernels it holds copied every layer's state into its
+    /// keep as the eager run does, so the return after it restores from there.
+    pub fn verify_window_replayed(&mut self) {
+        for l in &mut self.layers {
+            if let Some(keep) = l.verify_keep.as_mut() {
+                keep.saved = true;
+            }
+        }
+    }
+
+    /// The verify's hops: values not finite in what each card sent and in what the next
+    /// received, over the first `rows` rows.
+    pub fn verify_hops_report(&self, rows: usize) -> String {
+        let parts: Vec<String> = self
+            .verify
+            .hops
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let (sent, landed) = h.finite_report(rows);
+                format!("hop {i}: sent {sent} landed {landed}")
+            })
+            .collect();
+        if parts.is_empty() {
+            "no hop".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+
+    /// The layers whose recurrent or n-gram state is not finite, for a report.
+    pub fn verify_states_report(&self) -> String {
+        let mut bad = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let mut tensors: Vec<Tensor> = Vec::new();
+            if let Ok(Some(state)) = layer.mixer.checkpoint() {
+                match state {
+                    super::mixer::MixerState::ShortConv(Some(super::mixer::ConvState::Card(t))) => {
+                        tensors.push(t)
+                    }
+                    super::mixer::MixerState::Ssm(Some(super::mixer::SsmState::Card {
+                        conv,
+                        h,
+                    }))
+                    | super::mixer::MixerState::DeltaNet(Some(super::mixer::SsmState::Card {
+                        conv,
+                        h,
+                    })) => {
+                        tensors.push(conv);
+                        tensors.push(h);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(rows) = layer.ngram.as_ref().and_then(|p| p.state_rows()) {
+                tensors.push(rows.clone());
+            }
+            let finite = tensors.iter().all(|t| {
+                t.to_dtype(DType::F32)
+                    .and_then(|t| t.flatten_all())
+                    .and_then(|t| t.sum_keepdim(0))
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .is_ok_and(|v| v[0].is_finite())
+            });
+            if !finite {
+                bad.push(i.to_string());
+            }
+        }
+        if bad.is_empty() {
+            "every state finite".to_string()
+        } else {
+            format!("states not finite at layers {}", bad.join(" "))
+        }
+    }
+
     pub fn verify_window_settle(&mut self, kept: usize) -> Result<()> {
         let Some(w) = self.verify.window.take() else {
             return Ok(());

@@ -307,6 +307,11 @@ impl GenericHeteroTransformer {
                     .expect("a chunk's residual is held between layers");
                 match self.run_layers_in(h, ple[c].clone(), index_pos + off, n, layer, layer + 1) {
                     Ok((h, cuda)) => {
+                        if index_pos + off == 0 {
+                            if let Some(dir) = super::draft_head::probe_dir() {
+                                super::draft_head::dump_rows(dir, &format!("layer{layer}"), &h);
+                            }
+                        }
                         hidden[c] = Some(h);
                         on_cuda = cuda;
                     }
@@ -323,6 +328,11 @@ impl GenericHeteroTransformer {
         }
         // The draft head reads the prompt chunk by chunk, in order, from the last layer's rows.
         if self.capture_feature && self.draft.is_some() {
+            // The fit probe reads the prompt's first rows whatever the chunking: the chunks
+            // within them are gathered, then read once.
+            let mut probe_rows: Vec<Tensor> = Vec::new();
+            let mut probe_ids: Vec<u32> = Vec::new();
+            let span = PROMPT_FIT_SPAN;
             for (c, &(off, n)) in spans.iter().enumerate() {
                 let chunk_ids = ids
                     .narrow(1, off, n)?
@@ -332,7 +342,19 @@ impl GenericHeteroTransformer {
                 let rows = hidden[c]
                     .as_ref()
                     .expect("a chunk's residual is held after the last layer");
+                if index_pos + off < span {
+                    probe_rows.push(rows.clone());
+                    probe_ids.extend_from_slice(&chunk_ids);
+                }
                 self.draft_ingest(&chunk_ids, rows, index_pos + off)?;
+            }
+            if index_pos == 0 && !probe_rows.is_empty() {
+                let rows = Tensor::cat(&probe_rows.iter().collect::<Vec<_>>(), 1)?;
+                let n = probe_ids.len().min(span);
+                self.prompt_fit_probe(
+                    &probe_ids[..n],
+                    &rows.narrow(1, 0, n.saturating_sub(1).max(1))?,
+                )?;
             }
         }
         let last = hidden
@@ -2668,5 +2690,44 @@ mod swa_mask_tests {
         assert_eq!(at(511, 510), 1);
         assert_eq!(at(511, 511), 0);
         assert_eq!(at(511, 1535), 0);
+    }
+}
+
+/// Prompt positions the fit probe reads: the rows just before this many.
+const PROMPT_FIT_SPAN: usize = 1024;
+
+impl GenericHeteroTransformer {
+    /// The model's fit over the prompt's first rows: its guesses on the last rows before
+    /// `PROMPT_FIT_SPAN` against the tokens that followed them, through the output mixer
+    /// and the head.
+    fn prompt_fit_probe(&self, ids: &[u32], rows: &Tensor) -> Result<()> {
+        const ROWS: usize = 32;
+        let n = ids.len().min(rows.dim(1)?);
+        if n < ROWS + 1 {
+            return Ok(());
+        }
+        let Some(oh) = self.output_hyper.as_ref() else {
+            return Ok(());
+        };
+        let from = n - ROWS - 1;
+        let probe = rows.narrow(1, from, ROWS)?.to_device(&oh.device())?;
+        let (normed, _) = oh.mix(&probe)?;
+        let normed = normed.reshape((ROWS, self.config.embedding_length))?;
+        let logits = match (&self.output_proj_cuda_qmm, &self.output_proj_dev) {
+            (Some(proj), Some(dev)) => proj.forward(&normed.to_device(dev)?)?,
+            _ => self.output_proj.forward(&normed.to_device(&Device::Cpu)?)?,
+        };
+        let guessed = logits
+            .to_dtype(crate::tensor::DType::F32)?
+            .argmax_keepdim(1)?
+            .flatten_all()?
+            .to_vec1::<u32>()?;
+        let hits = guessed
+            .iter()
+            .zip(&ids[from + 1..])
+            .filter(|(g, t)| g == t)
+            .count();
+        tracing::info!("target fit over the prompt: {hits} of {ROWS} rows guessed right");
+        Ok(())
     }
 }

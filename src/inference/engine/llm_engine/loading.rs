@@ -209,6 +209,10 @@ impl LlmEngine {
     /// Loads the configured model alone.
     pub(super) async fn load_model_only(&self) -> Result<(), Box<dyn std::error::Error>> {
         let model_id = self.config.model_id.clone();
+        // The draft head's experts stay on its card only when the drafts run: otherwise
+        // their room serves the layers.
+        let draft_resident = self.config.recorded_drafts;
+        crate::inference::generic_transformer::set_probe_dir(self.config.probe_dump_dir.clone());
         let load_start = std::time::Instant::now();
         crate::inference::place::device_probe::debug_vram_by_card("load-entry");
         info!("🔄 Loading model: {}", model_id);
@@ -1129,7 +1133,14 @@ impl LlmEngine {
                                         Some((from, _)) => plan.shifted(from, num_layers),
                                         None => plan.clone(),
                                     };
-                                    let m = generic_weights.build(&on_plan, &placed, kv, ctx, stem_on_card)?;
+                                    let m = generic_weights.build(
+                                        &on_plan,
+                                        &placed,
+                                        kv,
+                                        ctx,
+                                        stem_on_card,
+                                        draft_resident,
+                                    )?;
                                     let grown: Option<u64> = cards
                                         .iter()
                                         .zip(&free_before)
