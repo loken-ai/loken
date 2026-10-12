@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Build: LOKEN_CUDA_ARCHS builds the kernels for the named architectures only.
 - Prefill: a long prompt crosses each layer once, chunks sized for the tightest card.
 - Data parallelism: `replicas` serves a model whole on several cards, requests spread.
 - API: Cohere /v2/rerank and /v2/embed and vLLM /score over the existing models.

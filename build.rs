@@ -137,6 +137,21 @@ fn link_cxx_runtime_statically() {
 /// nor re-JITs on sm_89, and the failure is a kernel that computes nothing, not an error.
 #[cfg(feature = "cuda")]
 fn portable_gencodes() -> Vec<String> {
+    // A development build for the machine's own cards: `LOKEN_CUDA_ARCHS` names the
+    // architectures to build SASS for, comma separated (`120a`, `89`), and the kernels compile
+    // once instead of once an architecture. A binary built this way does not leave the machine.
+    println!("cargo:rerun-if-env-changed=LOKEN_CUDA_ARCHS");
+    if let Ok(list) = std::env::var("LOKEN_CUDA_ARCHS") {
+        let archs: Vec<String> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(|a| format!("-gencode=arch=compute_{a},code=sm_{a}"))
+            .collect();
+        if !archs.is_empty() {
+            return archs;
+        }
+    }
     [
         // Turing. A GTX 1650 or an RTX 20-series card has no SASS below this line and cannot
         // JIT the PTX either, which only ever moves UPWARD - so leaving sm_75 out is not a
