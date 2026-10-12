@@ -448,15 +448,15 @@ impl super::GenericHeteroTransformer {
                 })
                 .sum();
             // The draft head's layer, when it runs on this card with its experts on the host,
-            // takes a cache of them too: a slot costs its share in that layer as well.
+            // keeps every one of its experts on the card: a draft that missed one would wait
+            // for the host at each guess. Its stacks come off the budget before the slots.
             let draft_bytes = self
                 .draft
                 .as_ref()
                 .filter(|d| d.layer_dev == LayerDevice::Cuda(ordinal))
                 .and_then(|d| d.layer.moe.as_ref())
                 .filter(|m| m.experts_on_host() && serves(m))
-                .map(expert_bytes);
-            let bytes = bytes + draft_bytes.unwrap_or(0);
+                .map(|m| expert_bytes(m) * m.n_experts);
             let budget = plan
                 .segments
                 .iter()
@@ -464,6 +464,9 @@ impl super::GenericHeteroTransformer {
                 .map(|s| s.free_memory_bytes)
                 .max()
                 .unwrap_or(0);
+            // What the slots may take of the budget: the head's stacks are taken off it first.
+            // The room lent by a prefill is counted against the whole budget, as the plan is.
+            let slots_budget = budget.saturating_sub(draft_bytes.unwrap_or(0) as u64);
             let before = free_before.get(&ordinal).copied().unwrap_or(0);
             // Room for every expert of every layer beside the plan's own reserve: the layers
             // are resident, and need neither a copy room nor a share of the card for one.
@@ -472,8 +475,13 @@ impl super::GenericHeteroTransformer {
                 .filter_map(|&l| self.layers[l].moe.as_ref().map(|m| m.n_experts))
                 .max()
                 .unwrap_or(0);
-            if expert_cache::slots_per_layer(budget, before, expert_cache::free_now(dev), 1, bytes)
-                >= widest_mixture
+            if expert_cache::slots_per_layer(
+                slots_budget,
+                before,
+                expert_cache::free_now(dev),
+                1,
+                bytes,
+            ) >= widest_mixture
             {
                 for &l in &tiered {
                     let moe = self.layers[l]
@@ -504,7 +512,7 @@ impl super::GenericHeteroTransformer {
                 + stager.transit_bytes()
                 + chunk_bytes.saturating_sub(before.saturating_sub(budget));
             let slots = expert_cache::slots_per_layer(
-                budget.saturating_sub(held),
+                slots_budget.saturating_sub(held),
                 before,
                 expert_cache::free_now(dev),
                 1,
@@ -544,18 +552,11 @@ impl super::GenericHeteroTransformer {
                 }
                 moe.tier = Some(Arc::new(tier));
             }
-            // The head's layer reads its experts through the cache a token at a time and the
-            // rows of a draft together; a prompt's rows take the host's grouped path, so the
-            // layer has no transit room.
+            // The head's layer runs as one loaded on the card: every expert there, no host
+            // answer to wait for at a guess.
             if draft_bytes.is_some() {
                 if let Some(moe) = self.draft.as_mut().and_then(|d| d.layer.moe.as_mut()) {
-                    let tier = LayerTier::new(moe, dev, slots)?;
-                    tier.enable_graph(
-                        tier.host[0].shape().dims()[2],
-                        moe.n_experts_used,
-                        crate::inference::engine::decode_step::VERIFY_ROWS,
-                    )?;
-                    moe.tier = Some(Arc::new(tier));
+                    moe.tier = Some(Arc::new(LayerTier::all_on_card(moe, dev)?));
                 }
             }
             // The layers' decoded tokens run as kernels alone, served by one thread of the host.

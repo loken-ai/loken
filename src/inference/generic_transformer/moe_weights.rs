@@ -462,6 +462,20 @@ impl SharedExpert {
                 let h = (crate::tensor::ops::silu(&g)? * up)?;
                 return routed + self.finish(xs, self.down.forward(&h)?)?;
             }
+            // The rows of a verify each as the decoded token's launches: the pair, the down
+            // projection and the join, three launches a row instead of the generic stages.
+            let rows = xs.dims().first().copied().unwrap_or(0);
+            if xs.device().is_cuda()
+                && rows > 1
+                && rows <= crate::inference::engine::decode_step::VERIFY_ROWS
+            {
+                let parts = (0..rows)
+                    .map(|r| {
+                        self.forward_added(&xs.narrow(0, r, 1)?, &routed.narrow(0, r, 1)?, None)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                return Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0);
+            }
         }
         routed + self.forward(xs)?
     }

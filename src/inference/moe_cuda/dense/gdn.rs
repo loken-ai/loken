@@ -203,6 +203,78 @@ mod tests {
     }
 
     /// The launch gives what the separate stages give: the convolution with SiLU, the window,
+    /// The rows of a verify through one launch give what the rows launched one after the
+    /// other give, bit for bit, the window advanced in place between them.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn the_rows_of_one_launch_are_the_rows_launched_in_turn() {
+        let dev = Device::new_cuda(0).expect("a card for the card test");
+        let (kg, kd, vg, vd, taps, rows) = (2usize, 64usize, 6usize, 48usize, 4usize, 3usize);
+        let conv_dim = 2 * kg * kd + vg * vd;
+        let on = |v: Vec<f32>, dims: (usize, usize)| {
+            Tensor::from_vec(v, dims, &Device::Cpu)
+                .unwrap()
+                .to_device(&dev)
+                .unwrap()
+        };
+        let shape = GdnShape {
+            k_heads: kg,
+            k_dim: kd,
+            v_heads: vg,
+            v_dim: vd,
+            taps,
+            tiled: true,
+            eps: 1e-6,
+        };
+        let qkv = on(ramp(rows * conv_dim, 1), (rows, conv_dim));
+        let alpha = on(ramp(rows * vg, 2), (rows, vg));
+        let beta_in = on(ramp(rows * vg, 3), (rows, vg));
+        let conv_w = on(ramp(conv_dim * taps, 5), (conv_dim, taps));
+        let a_log = on(ramp(vg, 6), (1, vg)).flatten_all().unwrap();
+        let dt_bias = on(ramp(vg, 7), (1, vg)).flatten_all().unwrap();
+        let _in_place = crate::inference::moe_cuda::in_place_state(true);
+        let window = on(ramp(conv_dim * (taps - 1), 4), (conv_dim, taps - 1));
+        let together = gdn_prep(
+            &qkv, &window, &conv_w, &alpha, &beta_in, &a_log, &dt_bias, shape,
+        )
+        .unwrap()
+        .expect("the launch takes this shape");
+        let window_turns = on(ramp(conv_dim * (taps - 1), 4), (conv_dim, taps - 1));
+        let mut turns = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let row = |t: &Tensor| t.narrow(0, r, 1).unwrap();
+            turns.push(
+                gdn_prep(
+                    &row(&qkv),
+                    &window_turns,
+                    &conv_w,
+                    &row(&alpha),
+                    &row(&beta_in),
+                    &a_log,
+                    &dt_bias,
+                    shape,
+                )
+                .unwrap()
+                .expect("the launch takes this shape"),
+            );
+        }
+        let rows_of = |t: &Tensor| flat(t);
+        for (r, turn) in turns.iter().enumerate() {
+            let per = |t: &Tensor| t.elem_count() / rows;
+            let cut = |t: &Tensor| rows_of(t)[r * per(t)..(r + 1) * per(t)].to_vec();
+            assert_eq!(cut(&together.q), rows_of(&turn.q), "row {r}: q");
+            assert_eq!(cut(&together.k), rows_of(&turn.k), "row {r}: k");
+            assert_eq!(cut(&together.v), rows_of(&turn.v), "row {r}: v");
+            assert_eq!(cut(&together.g), rows_of(&turn.g), "row {r}: g");
+            assert_eq!(cut(&together.beta), rows_of(&turn.beta), "row {r}: beta");
+        }
+        assert_eq!(
+            flat(&together.window),
+            flat(&window_turns),
+            "the window after the rows"
+        );
+    }
+
     /// the normalised heads copied to the value heads in either order, and the gates.
     #[test]
     #[ignore = "needs an idle CUDA card"]
