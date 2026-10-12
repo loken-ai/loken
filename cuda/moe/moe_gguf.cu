@@ -1090,3 +1090,34 @@ extern "C" void loken_moe_gemm_gguf_gate_up_gelu_mul_concat(
         default: break;
     }
 }
+
+// ------------------------------------------------------------
+// The rows of a quantised embedding table gathered on the card.
+// ------------------------------------------------------------
+namespace loken_moe {
+
+/// Row `ids[r]` of an iq4_xs table of `dim` values a row, decoded to `out[r]`: one block a row,
+/// a thread a run of thirty-two values.
+__global__ void loken_embed_rows_iq4_xs_kernel(
+    const void * __restrict__ table, const uint32_t * __restrict__ ids, int n, int dim,
+    float * __restrict__ out) {
+    const int r = blockIdx.x;
+    if (r >= n) return;
+    const int blocks = dim / QK_K;
+    const block_iq4_xs * row = (const block_iq4_xs *) table + (size_t) ids[r] * blocks;
+    for (int run = threadIdx.x; run < blocks * (QK_K / 32); run += blockDim.x) {
+        float y[32];
+        iq4_xs_run(&row[run / (QK_K / 32)], run % (QK_K / 32), y);
+        float * o = out + (size_t) r * dim + (size_t) run * 32;
+        #pragma unroll
+        for (int j = 0; j < 32; ++j) o[j] = y[j];
+    }
+}
+
+} // namespace loken_moe
+
+extern "C" void loken_embed_rows_iq4_xs(
+    const void * table, const uint32_t * ids, int n, int dim, float * out, cudaStream_t stream) {
+    if (n <= 0) return;
+    loken_moe::loken_embed_rows_iq4_xs_kernel<<<n, 128, 0, stream>>>(table, ids, n, dim, out);
+}

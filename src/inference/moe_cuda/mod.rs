@@ -266,6 +266,7 @@ pub(crate) mod tier_graph {
     }
 }
 cuda_launchers! {
+    loken_embed_rows_iq4_xs(table: *const c_void, ids: *const u32, n: i32, dim: i32, out: *mut f32);
     loken_cast_init_f32_from_dtype(
         dst: *mut f32, src: *const c_void, n: i32, dtype: i32);
     loken_moe_gemm_gguf_down_reduce_two(
@@ -359,4 +360,53 @@ cuda_launchers! {
 cuda_launchers! {
     loken_add_rms_norm(a: *const f32, b: *const f32, gamma: *const f32, xs_out: *mut f32,
         normed_out: *mut f32, hidden: i32, eps: f32);
+}
+
+/// The rows `ids` (`[n]` U32 on the card) of the iq4_xs table `table` on the same card, decoded
+/// into `out` (`[.., n, dim]` F32, contiguous): one launch, no host lookup.
+pub fn embed_rows_iq4_xs(
+    table: &crate::tensor::quantized::QTensor,
+    ids: &crate::tensor::Tensor,
+    out: &crate::tensor::Tensor,
+) -> crate::tensor::Result<()> {
+    use crate::tensor::DType;
+    if table.dtype() != crate::tensor::quantized::GgmlDType::Iq4Xs {
+        crate::tensor::bail!("the embedding gather serves iq4_xs tables");
+    }
+    let dims = table.shape().dims();
+    let (vocab, dim) = (dims[0], dims[1]);
+    let n = ids.elem_count();
+    if ids.dtype() != DType::U32 || out.dtype() != DType::F32 || out.elem_count() != n * dim {
+        crate::tensor::bail!("the embedding gather takes U32 ids and an F32 row a token");
+    }
+    let dev = out.device().as_cuda_device()?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    let _ = vocab;
+    unsafe {
+        loken_embed_rows_iq4_xs(
+            table.device_ptr()? as *const c_void,
+            card_address::<u32>(ids)? as *const u32,
+            n as i32,
+            dim as i32,
+            card_address::<f32>(out)? as *mut f32,
+            stream,
+        );
+    }
+    Ok(())
+}
+
+/// The card address of `t`'s first element.
+fn card_address<T: crate::tensor::kernel_ffi::CudaDType>(
+    t: &crate::tensor::Tensor,
+) -> crate::tensor::Result<u64> {
+    use cudarc::driver::DevicePtr;
+    let (storage, layout) = t.storage_and_layout();
+    match &*storage {
+        crate::tensor::StorageView::Cuda(c) => {
+            let slice = c.as_cuda_slice::<T>()?;
+            Ok(slice.device_ptr(slice.stream()).0
+                + (layout.start_offset() * std::mem::size_of::<T>()) as u64)
+        }
+        _ => crate::tensor::bail!("the embedding gather runs on a card"),
+    }
 }

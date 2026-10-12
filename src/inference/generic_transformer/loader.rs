@@ -2447,7 +2447,30 @@ impl GenericHeteroTransformer {
             * emb_qt.dtype().type_size() as u64
             / emb_qt.dtype().block_size() as u64;
         let emb_device = Device::Cpu;
-        let embeddings = Embedding::from_stored(Arc::new(emb_qt))?;
+        // An iq4_xs table also goes to every card of the plan, where a token's row is decoded
+        // by one launch: the lookup of a decoded token and of a draft leaves the host.
+        let emb_qt = Arc::new(emb_qt);
+        let mut embed_cards = Vec::new();
+        if emb_qt.dtype() == crate::tensor::quantized::GgmlDType::Iq4Xs {
+            let mut seen = std::collections::HashSet::new();
+            for seg in &plan.segments {
+                let DeviceKind::Cuda(idx) = seg.kind else {
+                    continue;
+                };
+                let Some(card) = cuda_devices.get(&idx) else {
+                    continue;
+                };
+                if !seen.insert(idx) {
+                    continue;
+                }
+                let host = emb_qt.native_qtensor().clone();
+                match crate::tensor::quantized::QTensor::from_native(host, card) {
+                    Ok(on_card) => embed_cards.push(Arc::new(on_card)),
+                    Err(e) => warn!("the embedding table stays off card {idx}: {e}"),
+                }
+            }
+        }
+        let embeddings = Embedding::from_stored(emb_qt)?;
         info!(
             "✅ Loaded embeddings: vocab={}, dim={} ({} MB stored, decoded per lookup on {:?})",
             config.vocab_size,
@@ -3612,6 +3635,7 @@ impl GenericHeteroTransformer {
             adapters: Vec::new(),
             config,
             embeddings,
+            embed_cards,
             layers,
             first_layer: share_start,
             layer_devs,
@@ -3958,6 +3982,7 @@ impl GenericHeteroTransformer {
             adapters: Vec::new(),
             config,
             embeddings,
+            embed_cards: Vec::new(),
             layers,
             first_layer: 0,
             layer_devs,

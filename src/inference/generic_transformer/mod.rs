@@ -431,6 +431,9 @@ pub struct GenericHeteroTransformer {
     tier_workers: Vec<expert_tier::TierWorker>,
     config: Arc<GenericTransformerConfig>,
     embeddings: Embedding, // GPU 0 if table < 1 GB, else CPU
+    /// The stored embedding table on each card of the plan, when its format is gathered there:
+    /// a token's row is decoded on the card that needs it instead of on the host.
+    embed_cards: Vec<Arc<crate::tensor::quantized::QTensor>>,
     layers: Vec<GenericTransformerLayer>,
     /// The rows of the draft verify last recorded, until the model is cut back or moves on.
     spec_window: Option<speculate::Window>,

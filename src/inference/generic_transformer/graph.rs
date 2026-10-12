@@ -1421,7 +1421,15 @@ impl GenericHeteroTransformer {
             input_local = input_ids.to_device(&emb_device)?;
             &input_local
         };
-        let mut hidden = self.embeddings.forward(input_ids)?;
+        let first_card = self
+            .layers
+            .first()
+            .map(|l| l.cos.device().clone())
+            .filter(|d| d.is_cuda());
+        let mut hidden = match first_card.as_ref().and_then(|d| self.embed_table_on(d)) {
+            Some(table) => self.embed_rows_on_card(table, input_ids)?,
+            None => self.embeddings.forward(input_ids)?,
+        };
         if let Some(scale) = self.config.embed_scale {
             hidden = (hidden * scale)?;
         }
@@ -1457,6 +1465,45 @@ impl GenericHeteroTransformer {
 
     /// The n-gram rows of `input_ids`, the step's token, in the buffer of the layer that adds
     /// them when that layer is recorded: its replay reads them from there.
+    /// The embedding table on `dev`, when the card holds one.
+    pub(super) fn embed_table_on(
+        &self,
+        dev: &Device,
+    ) -> Option<&crate::tensor::quantized::QTensor> {
+        self.embed_cards
+            .iter()
+            .map(|t| t.as_ref())
+            .find(|t| t.device().same_device(dev))
+    }
+
+    /// The rows of `input_ids` (`[1, n]`) decoded from the table on the card, `[1, n, dim]` F32.
+    #[cfg(feature = "cuda")]
+    fn embed_rows_on_card(
+        &self,
+        table: &crate::tensor::quantized::QTensor,
+        input_ids: &Tensor,
+    ) -> Result<Tensor> {
+        let dev = table.device().clone();
+        let n = input_ids.elem_count();
+        let dim = table.shape().dims()[1];
+        let ids = input_ids
+            .flatten_all()?
+            .to_dtype(crate::tensor::DType::U32)?
+            .to_device(&dev)?;
+        let out = Tensor::zeros_on((1, n, dim), crate::tensor::DType::F32, &dev)?;
+        crate::inference::moe_cuda::embed_rows_iq4_xs(table, &ids, &out)?;
+        Ok(out)
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn embed_rows_on_card(
+        &self,
+        _table: &crate::tensor::quantized::QTensor,
+        input_ids: &Tensor,
+    ) -> Result<Tensor> {
+        self.embeddings.forward(input_ids)
+    }
+
     fn place_ngram_rows(&mut self, input_ids: &Tensor) -> Result<()> {
         let Some(layer) = self.ngram.as_ref().map(|n| n.meta.layer) else {
             return Ok(());
