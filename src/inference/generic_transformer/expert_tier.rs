@@ -128,14 +128,16 @@ pub struct LayerTier {
     /// What a decoded token moves, made on the first.
     scratch: Mutex<Option<Scratch>>,
     /// Microseconds (an `f64`'s bits, `0` before a measure) the copy of one missing expert to the
-    /// transit room takes, and the host's computation of one.
-    upload_us: AtomicU64,
-    host_us: AtomicU64,
+    /// transit room takes, and the host's computation of one, for a request of one row and for
+    /// a request of several (`pace_class`): the host's share of a row grows with the rows that
+    /// share an expert, the copy's does not.
+    upload_us: [AtomicU64; 2],
+    host_us: [AtomicU64; 2],
     /// Samples the two paces were measured over, and the share of the missing experts the
-    /// transit room takes once they are, in eighths: set once, so that a request's split no
-    /// longer follows the clock and a run gives the text it gave.
-    paced: AtomicU64,
-    transit_eighths: AtomicU64,
+    /// transit room takes once they are, in eighths, for each class of request: set once, so
+    /// that a request's split no longer follows the clock and a run gives the text it gave.
+    paced: [AtomicU64; 2],
+    transit_eighths: [AtomicU64; 2],
     /// Missing experts copied to the transit room for the token that wanted them.
     uploaded: AtomicU64,
     /// The layer's side of a decode recorded in a graph, once enabled.
@@ -885,10 +887,10 @@ impl LayerTier {
             decode_us: AtomicU64::new(0),
             scratch: Mutex::new(None),
             prompt_ids: Mutex::new(None),
-            upload_us: AtomicU64::new(0),
-            host_us: AtomicU64::new(0),
-            paced: AtomicU64::new(0),
-            transit_eighths: AtomicU64::new(0),
+            upload_us: [AtomicU64::new(0), AtomicU64::new(0)],
+            host_us: [AtomicU64::new(0), AtomicU64::new(0)],
+            paced: [AtomicU64::new(0), AtomicU64::new(0)],
+            transit_eighths: [AtomicU64::new(0), AtomicU64::new(0)],
             uploaded: AtomicU64::new(0),
             graph: std::sync::OnceLock::new(),
         })
@@ -1236,7 +1238,7 @@ impl LayerTier {
         let carried = scratch.in_flight.swap(0, Ordering::Relaxed);
         if carried > 0 {
             if let Ok(ms) = scratch.upload_start.elapsed_ms(&scratch.upload_end) {
-                blend(&self.upload_us, ms as f64 * 1e3 / carried as f64);
+                blend(&self.upload_us[0], ms as f64 * 1e3 / carried as f64);
             }
         }
         let Pinned {
@@ -1331,13 +1333,13 @@ impl LayerTier {
                 routed,
                 p,
                 self.uploaded.load(Ordering::Relaxed),
-                f64::from_bits(self.upload_us.load(Ordering::Relaxed)),
-                f64::from_bits(self.host_us.load(Ordering::Relaxed)),
+                f64::from_bits(self.upload_us[0].load(Ordering::Relaxed)),
+                f64::from_bits(self.host_us[0].load(Ordering::Relaxed)),
                 self.decode_us.load(Ordering::Relaxed),
             );
         }
         // The misses the transit room runs, and those the host does.
-        let to_transit = self.transit_share(miss_ids.len());
+        let to_transit = self.transit_share(miss_ids.len(), 1);
         let (transit_ids, host_ids) = miss_ids.split_at(to_transit);
         let (transit_w, host_w) = miss_weights.split_at(to_transit);
         laps.mark("tier token: partition");
@@ -1427,7 +1429,7 @@ impl LayerTier {
                 )
             })?;
             blend(
-                &self.host_us,
+                &self.host_us[0],
                 t_host.elapsed().as_secs_f64() * 1e6 / m as f64,
             );
             true
@@ -1542,7 +1544,10 @@ impl LayerTier {
         let carried = scratch.in_flight.swap(0, Ordering::Relaxed);
         if carried > 0 {
             if let Ok(ms) = scratch.upload_start.elapsed_ms(&scratch.upload_end) {
-                blend(&self.upload_us, ms as f64 * 1e3 / carried as f64);
+                blend(
+                    &self.upload_us[pace_class(rows)],
+                    ms as f64 * 1e3 / carried as f64,
+                );
             }
         }
         // The choices of every row come to the host together, behind the work that made them.
@@ -1591,7 +1596,7 @@ impl LayerTier {
         }
         let mut missing: Vec<u32> = users.keys().copied().collect();
         missing.sort_by(|a, b| users[b].cmp(&users[a]).then(a.cmp(b)));
-        let to_transit = self.transit_share(missing.len());
+        let to_transit = self.transit_share(missing.len(), rows);
         let transit_experts: Vec<u32> = missing[..to_transit].to_vec();
         laps.mark("tier rows: partition");
 
@@ -1724,7 +1729,7 @@ impl LayerTier {
                 }
             }
             blend(
-                &self.host_us,
+                &self.host_us[pace_class(rows)],
                 t_host.elapsed().as_secs_f64() * 1e6 / host_experts.len() as f64,
             );
             Some(Tensor::from_vec(product, (rows, hidden), &host)?.to_device(&dev)?)
@@ -1924,17 +1929,18 @@ impl LayerTier {
     /// rest being computed on the host: the split at which the two finish together, from the
     /// time a copy and a host computation have taken on this layer. The host does at least one
     /// of several until its time is known.
-    fn transit_share(&self, missing: usize) -> usize {
+    fn transit_share(&self, missing: usize, rows: usize) -> usize {
         if missing == 0 || self.stage.is_none() {
             return 0;
         }
+        let class = pace_class(rows);
         let room = self.stage.as_ref().map_or(0, |s| s.stager.transit);
-        let eighths = self.transit_eighths.load(Ordering::Relaxed);
+        let eighths = self.transit_eighths[class].load(Ordering::Relaxed);
         if eighths > 0 {
             return ((missing as u64 * eighths + 4) / 8).min(room as u64) as usize;
         }
-        let host = f64::from_bits(self.host_us.load(Ordering::Relaxed));
-        let mut copy = f64::from_bits(self.upload_us.load(Ordering::Relaxed));
+        let host = f64::from_bits(self.host_us[class].load(Ordering::Relaxed));
+        let mut copy = f64::from_bits(self.upload_us[class].load(Ordering::Relaxed));
         if copy == 0.0 {
             let rate = self.stage.as_ref().map_or(0.0, |s| s.stager.bandwidth);
             if rate <= 0.0 {
@@ -1947,9 +1953,9 @@ impl LayerTier {
         }
         // The paces measured enough, the share is fixed: the copies and the products finish
         // together when the room takes host / (host + copy) of the experts.
-        if self.paced.load(Ordering::Relaxed) >= TRANSIT_PACE_SAMPLES {
+        if self.paced[class].load(Ordering::Relaxed) >= TRANSIT_PACE_SAMPLES {
             let share = (8.0 * host / (host + copy)).round().clamp(1.0, 7.0) as u64;
-            self.transit_eighths.store(share, Ordering::Relaxed);
+            self.transit_eighths[class].store(share, Ordering::Relaxed);
             return ((missing as u64 * share + 4) / 8).min(room as u64) as usize;
         }
         let finish = |n: usize| (n as f64 * copy).max((missing - n) as f64 * host);
@@ -2000,8 +2006,8 @@ impl LayerTier {
 
     /// Of `missing` experts, how many the transit room takes for this request, the rest being
     /// the host's: [`Self::transit_share`] where the layer has a room.
-    pub(super) fn transit_share_of(&self, missing: usize) -> usize {
-        self.transit_share(missing)
+    pub(super) fn transit_share_of(&self, missing: usize, rows: usize) -> usize {
+        self.transit_share(missing, rows)
     }
 
     /// The transit room's stacks, where the layer has one.
@@ -2009,10 +2015,11 @@ impl LayerTier {
         self.stage.as_ref().map(|s| &s.compact)
     }
 
-    /// Note what one copy into the transit room took, in microseconds.
-    pub(super) fn note_upload_us(&self, us: f64) {
-        blend(&self.upload_us, us);
-        self.paced.fetch_add(1, Ordering::Relaxed);
+    /// Note what one copy into the transit room took, in microseconds, for a request of `rows`.
+    pub(super) fn note_upload_us(&self, us: f64, rows: usize) {
+        let class = pace_class(rows);
+        blend(&self.upload_us[class], us);
+        self.paced[class].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Hand the worker the hottest missing experts that earn a slot over the coldest slots this
@@ -2142,6 +2149,11 @@ fn copier(ordinal: usize) -> std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>> {
 }
 
 /// Fold `sample` into the running figure in `cell` (an `f64`'s bits), which a first sample sets.
+/// Which paces a request of `rows` rows is measured and split by: one row, or several.
+fn pace_class(rows: usize) -> usize {
+    usize::from(rows > 1)
+}
+
 fn blend(cell: &AtomicU64, sample: f64) {
     let old = f64::from_bits(cell.load(Ordering::Relaxed));
     let next = if old == 0.0 {

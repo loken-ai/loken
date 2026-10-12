@@ -704,7 +704,7 @@ impl LayerTier {
             g.mail.hand_late(&[]);
             g.mail.raise(req.seq);
         } else {
-            let to_transit = self.transit_share_of(missing.len());
+            let to_transit = self.transit_share_of(missing.len(), req.rows);
             let (transit, host_experts) = missing.split_at(to_transit);
             if !transit.is_empty() {
                 self.copy_to_transit_between(&g.upload_start, &g.upload_end, transit)?;
@@ -735,7 +735,7 @@ impl LayerTier {
             };
             if !host_experts.is_empty() {
                 blend(
-                    &self.host_us,
+                    &self.host_us[super::pace_class(req.rows)],
                     t.elapsed().as_secs_f64() * 1e6 / host_experts.len() as f64,
                 );
             }
@@ -751,7 +751,7 @@ impl LayerTier {
                     .synchronize()
                     .map_err(|e| crate::tensor::Error::msg(format!("transit copy: {e:?}")))?;
                 if let Ok(ms) = g.upload_start.elapsed_ms(&g.upload_end) {
-                    self.note_upload_us(ms as f64 * 1e3 / transit.len() as f64);
+                    self.note_upload_us(ms as f64 * 1e3 / transit.len() as f64, req.rows);
                 }
                 WORKER
                     .transit
@@ -775,7 +775,7 @@ impl LayerTier {
         if n % 4096 == 0 {
             let missed = WORKER.missed.load(Ordering::Relaxed).max(1);
             tracing::info!(
-                "expert tier worker: {} us a request, {:.0}% had a missing expert: {:.1} missing ({:.2} to transit), product {} us (ready {}, gate and up {}, down {}), {:.2} promotions a request",
+                "expert tier worker: {} us a request, {:.0}% had a missing expert: {:.1} missing ({:.2} to transit), product {} us (ready {}, gate and up {}, down {}), {:.2} promotions a request; transit share {}/8 (one row) {}/8 (rows), host {:.0}/{:.0} us an expert, copy {:.0}/{:.0} us",
                 total / n / 1000,
                 100.0 * missed as f64 / n as f64,
                 WORKER.missing.load(Ordering::Relaxed) as f64 / missed as f64,
@@ -785,6 +785,12 @@ impl LayerTier {
                 WORKER.gate_up_ns.load(Ordering::Relaxed) / missed / 1000,
                 WORKER.down_ns.load(Ordering::Relaxed) / missed / 1000,
                 WORKER.promotions.load(Ordering::Relaxed) as f64 / n as f64,
+                self.transit_eighths[0].load(Ordering::Relaxed),
+                self.transit_eighths[1].load(Ordering::Relaxed),
+                f64::from_bits(self.host_us[0].load(Ordering::Relaxed)),
+                f64::from_bits(self.host_us[1].load(Ordering::Relaxed)),
+                f64::from_bits(self.upload_us[0].load(Ordering::Relaxed)),
+                f64::from_bits(self.upload_us[1].load(Ordering::Relaxed)),
             );
         }
         Ok(true)
