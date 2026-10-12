@@ -48,8 +48,18 @@ pub(crate) struct VerifyBuffers {
     logits: HashMap<usize, Tensor>,
     /// The rows' positions on each card, `[VERIFY_ROWS]` i32.
     pos_by_card: HashMap<usize, Tensor>,
+    /// The rows' hops between consecutive cards, one per boundary.
+    hops: Vec<super::graph::GraphHop>,
     /// The verify in flight, from its preparation to its settlement.
     pub(super) window: Option<VerifyWindow>,
+}
+
+/// One op of a recorded verify: the layers of a card's segment, or the rows' hop from a
+/// card to the next.
+#[derive(Clone, Copy)]
+enum VerifyOp {
+    Run(usize),
+    Hop(usize),
 }
 
 #[cfg(feature = "cuda")]
@@ -141,12 +151,17 @@ impl GenericTransformerLayer {
                 let pos = self.verify_pos_i32.clone().ok_or_else(|| {
                     crate::tensor::Error::msg("the verify's positions are not on the card")
                 })?;
-                let mut parts = Vec::with_capacity(rows);
-                for r in 0..rows {
-                    let row = mixed.narrow(1, r, 1)?.contiguous()?;
-                    parts.push(self.attend_row_recorded(&row, &pos.narrow(0, r, 1)?, r)?);
-                }
-                let mut o = Tensor::cat(&parts.iter().collect::<Vec<_>>(), 1)?;
+                let mut o = match self.attend_rows_recorded(&mixed, &pos, rows)? {
+                    Some(o) => o,
+                    None => {
+                        let mut parts = Vec::with_capacity(rows);
+                        for r in 0..rows {
+                            let row = mixed.narrow(1, r, 1)?.contiguous()?;
+                            parts.push(self.attend_row_recorded(&row, &pos.narrow(0, r, 1)?, r)?);
+                        }
+                        Tensor::cat(&parts.iter().collect::<Vec<_>>(), 1)?
+                    }
+                };
                 if let Some(b) = &self.attn_output_bias {
                     o = o.broadcast_add(b)?;
                 }
@@ -247,8 +262,8 @@ impl GenericHeteroTransformer {
         if self.config.hyper.is_none() {
             return Some("the residual is not wide".into());
         }
-        if self.graph_segments().len() != 1 {
-            return Some("the layers are not all on one card".into());
+        if self.graph_segments().is_empty() {
+            return Some("the layers are not all on cards".into());
         }
         if self.output_hyper.is_none()
             || (self.output_proj_cuda_qmm.is_none() && self.output_proj_cuda.is_none())
@@ -420,38 +435,140 @@ impl GenericHeteroTransformer {
         }
         let streams = self.config.hyper.expect("checked above").streams;
         let hidden = super::wide::widen_embedding(&hidden, streams)?.to_device(&card)?;
+        let wide = hidden.dim(2)?;
+        let segs = self.graph_segments();
         match self.verify.hidden.as_ref() {
             Some(buffer) => buffer.slice_set(&hidden, 1, 0)?,
             None => {
-                let wide = hidden.dim(2)?;
                 let buffer = Tensor::zeros_on((1, VERIFY_ROWS, wide), DType::F32, &card)?;
                 buffer.slice_set(&hidden, 1, 0)?;
                 self.verify.hidden = Some(buffer);
+                // The last layer's rows lie on the last card, where the head reads them.
+                let last = segs.last().map_or(card.clone(), |(_, d)| d.clone());
                 self.verify.out =
-                    Some(Tensor::zeros_on((1, VERIFY_ROWS, wide), DType::F32, &card)?);
+                    Some(Tensor::zeros_on((1, VERIFY_ROWS, wide), DType::F32, &last)?);
             }
         }
+        if self.verify.hops.len() + 1 != segs.len() {
+            self.verify.hops = segs
+                .iter()
+                .skip(1)
+                .map(|(_, d)| super::graph::GraphHop::with_rows(wide, VERIFY_ROWS, d))
+                .collect::<Result<_>>()?;
+        }
         Ok(())
+    }
+
+    /// The ops of a recorded verify, in order: each card's segment of layers, with the rows'
+    /// hop before every segment but the first; the head ends the last segment.
+    fn verify_plan(&self) -> Vec<VerifyOp> {
+        let segs = self.graph_segments().len();
+        (0..segs)
+            .flat_map(|seg| {
+                (seg > 0)
+                    .then_some(VerifyOp::Hop(seg - 1))
+                    .into_iter()
+                    .chain(std::iter::once(VerifyOp::Run(seg)))
+            })
+            .collect()
+    }
+
+    /// For each op of a recorded verify: whether it is recorded in a graph, and the stream
+    /// of the card it runs on.
+    pub fn verify_step_ops(
+        &self,
+    ) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
+        let streams = self.graph_segment_streams();
+        self.verify_plan()
+            .iter()
+            .filter_map(|op| match *op {
+                VerifyOp::Run(seg) => streams.get(seg).map(|s| (true, s.clone())),
+                VerifyOp::Hop(at) => streams.get(at + 1).map(|s| (false, s.clone())),
+            })
+            .collect()
+    }
+
+    /// Op `op` of the prepared verify over its `rows` rows: a segment runs its layers as the
+    /// kernels of the recorded decode step and the last one the head, whose op returns the
+    /// logits `[1, rows, vocab]` in the buffer of this window size; a hop carries the rows to
+    /// the next card.
+    pub fn run_verify_op(&mut self, op: usize, rows: usize) -> Result<Option<Tensor>> {
+        let Some(this) = self.verify_plan().into_iter().nth(op) else {
+            crate::tensor::bail!("run_verify_op: no op {op}");
+        };
+        let segs = self.graph_segments();
+        match this {
+            VerifyOp::Hop(at) => {
+                // The next card's stream waits for the copy to the host, then fills its own
+                // buffer from it.
+                let streams = self.graph_segment_streams();
+                if let (Some(a), Some(b)) = (streams.get(at), streams.get(at + 1)) {
+                    let ev = crate::tensor::cuda_ext::record_event(a)?;
+                    crate::tensor::cuda_ext::wait_event(b, &ev)?;
+                }
+                self.verify
+                    .hops
+                    .get(at)
+                    .ok_or_else(|| crate::tensor::Error::msg("the verify's hop is not prepared"))?
+                    .receive()?;
+                Ok(None)
+            }
+            VerifyOp::Run(seg) => {
+                let input = match seg {
+                    0 => self
+                        .verify
+                        .hidden
+                        .as_ref()
+                        .ok_or_else(|| {
+                            crate::tensor::Error::msg("the verify's rows were not prepared")
+                        })?
+                        .narrow(1, 0, rows)?,
+                    _ => self
+                        .verify
+                        .hops
+                        .get(seg - 1)
+                        .ok_or_else(|| {
+                            crate::tensor::Error::msg("the verify's hop is not prepared")
+                        })?
+                        .landing(rows)?,
+                };
+                // The rows are the decode steps they stand for: the mat-vecs take them one by
+                // one and the recurrent states advance where they lie.
+                let _order = crate::tensor::quantized::DecodeOrder::enter();
+                let _in_place = crate::inference::moe_cuda::in_place_state(true);
+                let mut h = input;
+                for li in segs[seg].0.clone() {
+                    h = self.layers[li].forward_wide_graph_rows(&h, rows)?;
+                }
+                if seg + 1 == segs.len() {
+                    return self.verify_head(h, rows).map(Some);
+                }
+                self.verify
+                    .hops
+                    .get(seg)
+                    .ok_or_else(|| crate::tensor::Error::msg("the verify's hop is not prepared"))?
+                    .send(&h)?;
+                Ok(None)
+            }
+        }
     }
 
     /// The verify's `rows` rows through every layer and the head, as the kernels of the recorded
     /// decode step: what a capture records and a replay runs. The logits, `[1, rows, vocab]`,
     /// are in the buffer of this window size.
     pub fn forward_verify_window(&mut self, rows: usize) -> Result<Tensor> {
-        let hidden = self
-            .verify
-            .hidden
-            .as_ref()
-            .ok_or_else(|| crate::tensor::Error::msg("the verify's rows were not prepared"))?
-            .narrow(1, 0, rows)?;
-        // The rows are the decode steps they stand for: the mat-vecs take them one by one and
-        // the recurrent states advance where they lie.
-        let _order = crate::tensor::quantized::DecodeOrder::enter();
-        let _in_place = crate::inference::moe_cuda::in_place_state(true);
-        let mut h = hidden;
-        for li in 0..self.layers.len() {
-            h = self.layers[li].forward_wide_graph_rows(&h, rows)?;
+        let mut logits = None;
+        for op in 0..self.verify_plan().len() {
+            if let Some(l) = self.run_verify_op(op, rows)? {
+                logits = Some(l);
+            }
         }
+        logits.ok_or_else(|| crate::tensor::Error::msg("the verify's head did not run"))
+    }
+
+    /// The head over the last layer's rows `h`: the logits `[1, rows, vocab]` in the buffer
+    /// of this window size.
+    fn verify_head(&mut self, h: Tensor, rows: usize) -> Result<Tensor> {
         if let Some(out) = self.verify.out.as_ref() {
             out.slice_set(&h.to_dtype(DType::F32)?, 1, 0)?;
         }

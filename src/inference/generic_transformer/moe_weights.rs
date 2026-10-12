@@ -3,6 +3,20 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// The rows of a mixture routed: what the expert products and the block's return need.
+pub(super) struct Routed {
+    xs: Tensor,
+    topk_ids: Tensor,
+    topk_weights_scaled: Tensor,
+    num_tokens: usize,
+    batch: usize,
+    seq_len: usize,
+    hidden_dim: usize,
+    original_dtype: crate::tensor::DType,
+    moe_device: Device,
+    t_route: Option<std::time::Instant>,
+}
+
 // ------------------------------------------------------------
 // Routing plan
 // ------------------------------------------------------------
@@ -737,6 +751,22 @@ impl MoeWeights {
         is_prefill: bool,
         add_after: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let routed = self.route(moe_in_pre_norm_2, attn_out, n_embd, rms_eps)?;
+        // The shared expert's projections, when a recorded decode queued them ahead of the wait.
+        let mut shared_projected: Option<Tensor> = None;
+        let expert_rows = self.experts_of(&routed, is_prefill, add_after, &mut shared_projected)?;
+        self.finish_rows(&routed, expert_rows, shared_projected)
+    }
+
+    /// The rows routed: the rows in F32, the router's choice and its weights, and the shape and
+    /// dtype the block returns in.
+    fn route(
+        &self,
+        moe_in_pre_norm_2: &Tensor,
+        attn_out: &Tensor,
+        n_embd: usize,
+        rms_eps: f32,
+    ) -> Result<Routed> {
         let (batch, seq_len, hidden_dim) = moe_in_pre_norm_2.dims3()?;
         let xs =
             moe_in_pre_norm_2.reshape((moe_in_pre_norm_2.elem_count() / hidden_dim, hidden_dim))?;
@@ -787,15 +817,11 @@ impl MoeWeights {
                 None if self.sigmoid_routing.is_some() => exact_logits()?,
                 // The rows of a verify score one at a time, as a decoded token does: a library
                 // matrix product picks its arithmetic by shape.
+                // The rows of a verify each as the one-row call: the row-wise gate kernel over
+                // the rows at once, or the quantised gate's mat-vecs, which take the rows one by
+                // one under the decode order.
                 None if num_tokens > 1 && crate::tensor::quantized::DecodeOrder::active() => {
-                    let rows = (0..num_tokens)
-                        .map(|r| {
-                            self.gate_inp
-                                .forward(&xs.narrow(0, r, 1)?.contiguous()?)?
-                                .to_dtype(crate::tensor::DType::F32)
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    Tensor::cat(&rows.iter().collect::<Vec<_>>(), 0)?
+                    exact_logits()?
                 }
                 None => self
                     .gate_inp
@@ -911,6 +937,33 @@ impl MoeWeights {
         // (matched CPU <1% at every layer). So run prefill on the CPU expert path
         // (one-time, correct) and decode on GPU (the tok/s bottleneck, fast+exact).
         let moe_device = xs.device().clone();
+        Ok(Routed {
+            xs,
+            topk_ids,
+            topk_weights_scaled,
+            num_tokens,
+            batch,
+            seq_len,
+            hidden_dim,
+            original_dtype,
+            moe_device,
+            t_route,
+        })
+    }
+
+    /// The expert products of the routed rows, `[num_tokens, hidden]`, by whichever path the
+    /// layer's placement takes.
+    fn experts_of(
+        &self,
+        routed: &Routed,
+        is_prefill: bool,
+        add_after: Option<&Tensor>,
+        shared_projected: &mut Option<Tensor>,
+    ) -> Result<Tensor> {
+        let (xs, topk_ids, topk_weights_scaled) =
+            (&routed.xs, &routed.topk_ids, &routed.topk_weights_scaled);
+        let (num_tokens, hidden_dim, t_route) =
+            (routed.num_tokens, routed.hidden_dim, routed.t_route);
         // Which arrangement, not which hardware. True only on the host either way -
         // the two spellings agree on every device - but the question being asked here
         // is the shape of the expert loop, so it is asked in those terms.
@@ -927,7 +980,6 @@ impl MoeWeights {
             crate::tensor::bail!("MoeWeights: this layer cannot fold a residual into its fold");
         }
         // The shared expert's projections, when a recorded decode queued them ahead of the wait.
-        let mut shared_projected: Option<Tensor> = None;
         let expert_rows = if self.up_relu2 {
             self.forward_up_relu2(&xs, &topk_ids, &topk_weights_scaled, num_tokens)?
         } else if let Some(tier) = self
@@ -953,7 +1005,7 @@ impl MoeWeights {
             if tier.records(&xs.device()) {
                 let pending = tier.graph_begin(self, &xs, &topk_ids, &topk_weights_scaled)?;
                 if let Some(shared) = &self.shared_expert {
-                    shared_projected = shared.project(&xs)?;
+                    *shared_projected = shared.project(&xs)?;
                 }
                 tier.graph_end(pending)?
             } else {
@@ -1015,6 +1067,24 @@ impl MoeWeights {
                 None,
             )?
         };
+        Ok(expert_rows)
+    }
+
+    /// The expert products back on the block's device, the shared expert added, in the block's
+    /// width and dtype.
+    fn finish_rows(
+        &self,
+        routed: &Routed,
+        expert_rows: Tensor,
+        shared_projected: Option<Tensor>,
+    ) -> Result<Tensor> {
+        let (xs, moe_device) = (&routed.xs, &routed.moe_device);
+        let (original_dtype, batch, seq_len, hidden_dim) = (
+            routed.original_dtype,
+            routed.batch,
+            routed.seq_len,
+            routed.hidden_dim,
+        );
         // Back to the block's own device, width and dtype. The host expert path answers on
         // the host even for a layer that lives on a card, so that the hybrid prefill above
         // can run there; the caller's residual add expects the layer's device back.

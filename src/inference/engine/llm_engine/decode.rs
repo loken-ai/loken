@@ -299,7 +299,7 @@ pub(super) fn capture_decode_graph(
 /// given up on.
 #[cfg(feature = "cuda")]
 pub(super) struct VerifyGraphs {
-    by_rows: std::collections::HashMap<usize, (crate::tensor::cuda_ext::CapturedGraph, Tensor)>,
+    by_rows: std::collections::HashMap<usize, (VerifyGraph, Tensor)>,
     pub(super) disabled: bool,
     /// The step's buffers were dropped with a window: the step's graph is recorded again.
     pub(super) step_stale: bool,
@@ -422,8 +422,8 @@ pub(super) fn verify_recorded(
     }
     if let Some((g, logits)) = graphs.by_rows.get(&rows) {
         let launching = std::time::Instant::now();
-        if let Err(e) = g.launch() {
-            give_up(model, graphs, format!("launch: {e:?}"));
+        if let Err(e) = g.launch(model, rows) {
+            give_up(model, graphs, format!("launch: {e}"));
             return None;
         }
         if let Err(e) = wait_telling(model, stream) {
@@ -526,34 +526,21 @@ pub(super) fn verify_recorded(
         return None;
     }
     let _ = stream.synchronize();
-    let captured: crate::tensor::Result<Option<crate::tensor::cuda_ext::CapturedGraph>> = (|| {
-        crate::tensor::cuda_ext::begin_capture(stream)?;
-        model.forward_verify_window(rows)?;
-        crate::tensor::cuda_ext::end_capture(stream)
-    })();
-    let g = match captured {
-        Ok(Some(g)) => g,
-        Ok(None) => {
-            give_up(model, graphs, "the capture recorded nothing".into());
-            return None;
-        }
+    let g = match VerifyGraph::capture(model, rows) {
+        Ok(g) => g,
         Err(e) => {
-            let _ = crate::tensor::cuda_ext::end_capture(stream);
             let _ = stream.synchronize();
             give_up(model, graphs, format!("capture: {e}"));
             return None;
         }
     };
-    if let Err(e) = g.upload() {
-        warn!("verify graph upload failed (will fall back to lazy upload): {e}");
-    }
     // The eager run and the recording wrote the same buffer: the replay fills it again.
     let logits = eager;
     let replay = std::time::Instant::now();
-    if let Err(e) = g.launch() {
+    if let Err(e) = g.launch(model, rows) {
         // A window the card has no memory for ends the windows of its size and above, and the
         // drafts shrink to what fits; any other failure ends them all.
-        if format!("{e:?}").contains("OUT_OF_MEMORY") {
+        if format!("{e}").contains("OUT_OF_MEMORY") {
             let _ = stream.synchronize();
             graphs.rows_cap = rows - 1;
             warn!("recorded verify of {rows} rows: no memory for its launch; windows of up to {} rows from now on", rows - 1);
@@ -567,7 +554,7 @@ pub(super) fn verify_recorded(
             graphs.step_stale = true;
             return None;
         }
-        give_up(model, graphs, format!("first launch: {e:?}"));
+        give_up(model, graphs, format!("first launch: {e}"));
         return None;
     }
     let _ = stream.synchronize();
@@ -603,12 +590,11 @@ pub(super) fn verify_recorded(
     }
     info!(
         "recorded verify of {rows} rows captured at pos={pos}: {} nodes, replayed in {:.1} ms",
-        g.num_nodes().unwrap_or(0),
+        g.num_nodes(),
         replay_secs * 1e3
     );
     {
-        let mut nodes = NodeCounts::default();
-        nodes.add(&g);
+        let nodes = g.nodes();
         let mut by_count: Vec<_> = nodes.kernels.iter().collect();
         by_count.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
         let top: Vec<String> = by_count
@@ -627,6 +613,101 @@ pub(super) fn verify_recorded(
     }
     graphs.by_rows.insert(rows, (g, logits.clone()));
     Some((logits, Some(replay_secs)))
+}
+
+/// One part of a recorded verify.
+#[cfg(feature = "cuda")]
+enum VerifyStep {
+    /// A recorded graph and the stream of the card it runs on.
+    Graph(
+        crate::tensor::cuda_ext::CapturedGraph,
+        std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,
+    ),
+    /// An op the model runs eagerly at every replay: the rows' hop between two cards.
+    Eager(usize),
+}
+
+/// A recorded verify of one window size: its graphs and the eager ops between them.
+#[cfg(feature = "cuda")]
+pub(super) struct VerifyGraph {
+    steps: Vec<VerifyStep>,
+}
+
+#[cfg(feature = "cuda")]
+impl VerifyGraph {
+    /// Records the prepared verify of `rows` rows, op by op on its card's stream.
+    fn capture(model: &mut BoxedModelBackend, rows: usize) -> crate::tensor::Result<Self> {
+        let ops = model.verify_step_ops();
+        if ops.is_empty() {
+            crate::tensor::bail!("the verify has no op to record");
+        }
+        let mut steps = Vec::with_capacity(ops.len());
+        for (op, (captured, s)) in ops.iter().enumerate() {
+            if !captured {
+                steps.push(VerifyStep::Eager(op));
+                continue;
+            }
+            crate::tensor::cuda_ext::begin_capture(s)?;
+            let ran = model.run_verify_op(op, rows);
+            // A failed forward can leave the stream capturing: the capture ends before
+            // anything else touches the stream.
+            let ended = crate::tensor::cuda_ext::end_capture(s);
+            ran?;
+            match ended? {
+                Some(g) => {
+                    if let Err(e) = g.upload() {
+                        warn!("verify graph upload failed (will fall back to lazy upload): {e}");
+                    }
+                    steps.push(VerifyStep::Graph(g, s.clone()));
+                }
+                None => crate::tensor::bail!("the capture of op {op} recorded nothing"),
+            }
+        }
+        Ok(Self { steps })
+    }
+
+    /// Runs every part in order and waits for the last card's stream, which holds the logits.
+    fn launch(&self, model: &mut BoxedModelBackend, rows: usize) -> crate::tensor::Result<()> {
+        let err = |e| crate::tensor::Error::msg(format!("graph launch: {e:?}"));
+        let mut last = None;
+        for step in &self.steps {
+            match step {
+                VerifyStep::Graph(g, s) => {
+                    g.launch().map_err(err)?;
+                    last = Some(s);
+                }
+                VerifyStep::Eager(op) => {
+                    model.run_verify_op(*op, rows)?;
+                }
+            }
+        }
+        if let Some(s) = last {
+            s.synchronize().map_err(err)?;
+        }
+        Ok(())
+    }
+
+    /// The nodes of every graph of the verify.
+    fn nodes(&self) -> NodeCounts {
+        let mut nodes = NodeCounts::default();
+        for step in &self.steps {
+            if let VerifyStep::Graph(g, _) = step {
+                nodes.add(g);
+            }
+        }
+        nodes
+    }
+
+    /// Nodes in every graph of the verify.
+    fn num_nodes(&self) -> usize {
+        self.steps
+            .iter()
+            .map(|step| match step {
+                VerifyStep::Graph(g, _) => g.num_nodes().unwrap_or(0),
+                VerifyStep::Eager(_) => 0,
+            })
+            .sum()
+    }
 }
 
 /// One part of a decode step.

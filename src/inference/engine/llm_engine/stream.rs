@@ -1060,6 +1060,8 @@ impl LlmEngine {
             let mut graph_capture_attempted: bool = false;
             #[cfg(feature = "cuda")]
             let mut graph_validations: usize = 0;
+            /// Replays held against an eager step before a replay is trusted.
+            const GRAPH_VALIDATIONS: usize = 3;
             // The recorded draft verifies, one graph per window size.
             #[cfg(feature = "cuda")]
             let mut verify_graphs = super::decode::VerifyGraphs::default();
@@ -1728,7 +1730,6 @@ impl LlmEngine {
                             let _ = stream.synchronize();
                             // A recurrent state advances with the replay, so the probation
                             // below, which runs the same step again, starts from a copy of it.
-                            const GRAPH_VALIDATIONS: usize = 3;
                             let recurrent_cp = if graph_validations < GRAPH_VALIDATIONS {
                                 state.model.recurrent_checkpoint().unwrap_or_default()
                             } else {
@@ -1969,9 +1970,10 @@ impl LlmEngine {
                         next_token_dev = dev_tok;
                         let plain_secs = step_start.elapsed().as_secs_f64();
                         pld_cost.plain_step(plain_secs);
-                        // What a plain step costs is what the head's cycles are weighed against;
-                        // the head reads the step's token with the hidden state the step left.
-                        if head_capable {
+                        // What a plain step costs is what the head's cycles are weighed against:
+                        // a replayed step, not the step that recorded the graph nor one held
+                        // against an eager step, which cost what they cost once.
+                        if head_capable && graph_validations >= GRAPH_VALIDATIONS {
                             spec_engine
                                 .draft_length
                                 .lock()

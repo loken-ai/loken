@@ -339,6 +339,118 @@ impl GenericTransformerLayer {
         )
     }
 
+    /// The rows of a recorded verify through an indexed layer's attention: the projections of
+    /// every row in one launch each (the rows take the mat-vecs one by one, as the steps they
+    /// stand for), then each row's indexer step, cache write and attention over its own
+    /// selection, then the gate and the output projection over every row. `None` when a row
+    /// cannot take the fused head preparation: the rows then run one by one.
+    #[cfg(feature = "cuda")]
+    pub(super) fn attend_rows_recorded(
+        &mut self,
+        x: &Tensor,
+        pos: &Tensor,
+        rows: usize,
+    ) -> Result<Option<Tensor>> {
+        use crate::inference::moe_cuda::{qk_prep, QkShape, StepPos};
+        let hd = self.head_dim;
+        if self.qk_norm_is_full() {
+            return Ok(None);
+        }
+        let (qn, kn) = match (&self.attn_q_norm, &self.attn_k_norm) {
+            (Some(qn), Some(kn)) => (Some(qn), Some(kn)),
+            (None, None) => (None, None),
+            _ => return Ok(None),
+        };
+        let (cos_rows, sin_rows) = match (&self.verify_rope_cos, &self.verify_rope_sin) {
+            (Some(c), Some(s)) => (c.clone(), s.clone()),
+            _ => crate::tensor::bail!("the rotation tables of the verify's rows are not in place"),
+        };
+        let rope_dim = match (self.no_rope, self.rope_dim) {
+            (true, _) => 0,
+            (false, d) if d > 0 && d < hd => d,
+            (false, _) => hd,
+        };
+        let shape = QkShape {
+            n_head: self.n_head,
+            n_kv: self.n_kv_head,
+            head_dim: hd,
+            rope_dim,
+            interleaved: self.flags.use_rope_i,
+            eps: qn.map_or(0.0, |n| n.eps() as f32),
+        };
+        let (n_head, n_kv) = (self.n_head, self.n_kv_head);
+        let (key_all, qi_all) = self
+            .sparse
+            .as_ref()
+            .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?
+            .card_projections(x)?;
+        let (q_all, k_all, v_all) = self.project_rows(x)?;
+        // A row of `[rows, width]` is a view the kernels read at its offset: no copy.
+        let by_row = |t: Tensor| -> Result<Tensor> {
+            let width = t.dim(2)?;
+            t.reshape((rows, width))
+        };
+        let (key_all, qi_all) = (by_row(key_all)?, by_row(qi_all)?);
+        let (q_all, k_all, v_all) = (by_row(q_all)?, by_row(k_all)?, by_row(v_all)?);
+        let (Some(k_buf), Some(v_buf)) = (self.kv_cache.k_buffer(), self.kv_cache.v_buffer())
+        else {
+            crate::tensor::bail!("an indexed layer decodes before its cache holds a token");
+        };
+        let cap = self.kv_cache.max_seq_len_padded();
+        let scale = self
+            .attention_scale
+            .unwrap_or_else(|| 1.0 / (hd as f64).sqrt()) as f32;
+        let mut ys = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let sparse = self
+                .sparse
+                .as_mut()
+                .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?;
+            let rot = sparse.rot_row(r)?;
+            let pos_r = pos.narrow(0, r, 1)?;
+            sparse.card_step_projected(
+                &key_all.narrow(0, r, 1)?,
+                &qi_all.narrow(0, r, 1)?,
+                StepPos::Card(&pos_r),
+                &rot,
+            )?;
+            let Some((q, k, v)) = qk_prep(
+                &q_all.narrow(0, r, 1)?,
+                &k_all.narrow(0, r, 1)?,
+                &v_all.narrow(0, r, 1)?,
+                qn.map(|n| n.weight()),
+                kn.map(|n| n.weight()),
+                &cos_rows.narrow(0, r, 1)?,
+                &sin_rows.narrow(0, r, 1)?,
+                shape,
+            )?
+            else {
+                return Ok(None);
+            };
+            crate::inference::moe_cuda::kv_append_pos(
+                &k,
+                &v,
+                &k_buf,
+                &v_buf,
+                StepPos::Card(&pos_r),
+                n_kv,
+                cap,
+                hd,
+            )?;
+            let (sel, count) = self
+                .sparse
+                .as_ref()
+                .ok_or_else(|| crate::tensor::Error::msg("an indexed layer without its indexer"))?
+                .card_selection()?;
+            ys.push(crate::inference::moe_cuda::selected_attention(
+                &q, &k_buf, &v_buf, sel, count, n_head, n_kv, cap, hd, scale,
+            )?);
+        }
+        let y = Tensor::cat(&ys.iter().collect::<Vec<_>>(), 1)?;
+        let y = self.gate_attention(x, y)?;
+        self.attn_output.forward(&y).map(Some)
+    }
+
     /// [`Self::attend_on_card`] with the rotation tables of `tables` in place of the step's.
     #[cfg(feature = "cuda")]
     fn attend_on_card_with(

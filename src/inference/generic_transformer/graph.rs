@@ -160,18 +160,30 @@ unsafe impl Sync for GraphHop {}
 #[cfg(feature = "cuda")]
 impl GraphHop {
     fn new(width: usize, dst_dev: &Device) -> Result<Self> {
-        let bytes = width * std::mem::size_of::<f32>();
+        Self::with_rows(width, 1, dst_dev)
+    }
+
+    /// A hop of up to `rows` rows of `width`: its landing buffer is `[1, rows, width]`.
+    pub(crate) fn with_rows(width: usize, rows: usize, dst_dev: &Device) -> Result<Self> {
+        let bytes = rows * width * std::mem::size_of::<f32>();
         let host =
             crate::tensor::cuda_ext::malloc_host(bytes).map_err(crate::tensor::Error::msg)?;
-        let dst = Tensor::zeros_on((1, 1, width), crate::tensor::DType::F32, dst_dev)?;
+        let dst = Tensor::zeros_on((1, rows, width), crate::tensor::DType::F32, dst_dev)?;
         Ok(Self { host, bytes, dst })
     }
 
-    /// Copies `hidden` `[1, 1, width]` into host memory on its card's stream.
-    fn send(&self, hidden: &Tensor) -> Result<()> {
+    /// The landing buffer's first `rows` rows, `[1, rows, width]`.
+    pub(crate) fn landing(&self, rows: usize) -> Result<Tensor> {
+        self.dst.narrow(1, 0, rows)
+    }
+
+    /// Copies `hidden`, `[1, rows, width]` up to the hop's rows, into host memory on its
+    /// card's stream.
+    pub(crate) fn send(&self, hidden: &Tensor) -> Result<()> {
         let src = hidden.to_dtype(crate::tensor::DType::F32)?.contiguous()?;
-        if src.elem_count() * std::mem::size_of::<f32>() != self.bytes {
-            crate::tensor::bail!("graph hop: hidden {:?} does not fill the hop", src.dims());
+        let bytes = src.elem_count() * std::mem::size_of::<f32>();
+        if bytes > self.bytes || src.dims().last() != self.dst.dims().last() {
+            crate::tensor::bail!("graph hop: hidden {:?} does not fit the hop", src.dims());
         }
         let stream = crate::tensor::cuda_ext::stream_of(&src.device())?;
         let ptr = f32_device_ptr(&src)?;
@@ -181,12 +193,7 @@ impl GraphHop {
             .bind_to_thread()
             .map_err(|e| crate::tensor::Error::msg(format!("graph hop: bind context: {e:?}")))?;
         let r = unsafe {
-            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                self.host,
-                ptr,
-                self.bytes,
-                stream.cu_stream(),
-            )
+            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(self.host, ptr, bytes, stream.cu_stream())
         };
         if r != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
             crate::tensor::bail!("graph hop: device to host copy failed: {r:?}");
@@ -195,7 +202,7 @@ impl GraphHop {
     }
 
     /// Copies the host memory into the destination buffer on its card's stream.
-    fn receive(&self) -> Result<Tensor> {
+    pub(crate) fn receive(&self) -> Result<Tensor> {
         let stream = crate::tensor::cuda_ext::stream_of(&self.dst.device())?;
         let ptr = f32_device_ptr(&self.dst)?;
         // A raw driver copy runs in the thread's current context: the stream's own.

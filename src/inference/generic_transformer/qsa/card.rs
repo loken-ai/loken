@@ -337,6 +337,29 @@ impl SparseAttention {
         let x = x.to_dtype(DType::F32)?;
         let key = self.k_proj.forward(&x)?.contiguous()?;
         let q = self.q_proj.forward(&x)?.contiguous()?;
+        self.card_step_projected(&key, &q, pos, rot)
+    }
+
+    /// The indexer's key and query projections of the rows `x` `[1, rows, hidden]`, F32,
+    /// `[1, rows, key]` and `[1, rows, heads * head_dim]`, for [`Self::card_step_projected`]
+    /// row by row.
+    pub fn card_projections(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        let x = x.to_dtype(DType::F32)?;
+        Ok((
+            self.k_proj.forward(&x)?.contiguous()?,
+            self.q_proj.forward(&x)?.contiguous()?,
+        ))
+    }
+
+    /// [`Self::card_step_with`] from the step's projected key and query.
+    pub fn card_step_projected(
+        &mut self,
+        key: &Tensor,
+        q: &Tensor,
+        pos: StepPos,
+        rot: &Tensor,
+    ) -> Result<()> {
+        // A row of the projections is a view the kernels read at its offset: no copy.
         let Some(card) = self.card.as_mut() else {
             crate::tensor::bail!("the indexer has no cache on a card");
         };

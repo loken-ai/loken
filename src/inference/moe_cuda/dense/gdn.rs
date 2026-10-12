@@ -123,36 +123,37 @@ pub fn gdn_prep(
     let v_p = v.device_ptr(v.stream()).0;
     let g_p = g.device_ptr(g.stream()).0;
     let beta_out_p = beta.device_ptr(beta.stream()).0;
-    for r in 0..rows as u64 {
-        unsafe {
-            loken_gdn_prep(
-                (qkv_p + r * conv_dim as u64 * elem) as *const c_void,
-                window_p,
-                addr::<f32>(conv_w, "conv_w")? as *const f32,
-                (alpha_p + r * vg as u64 * elem) as *const c_void,
-                (beta_p + r * vg as u64 * elem) as *const c_void,
-                addr::<f32>(a_log, "a_log")? as *const f32,
-                addr::<f32>(dt_bias, "dt_bias")? as *const f32,
-                (q_p + r * (vg * kd * 4) as u64) as *mut f32,
-                (k_p + r * (vg * kd * 4) as u64) as *mut f32,
-                (v_p + r * (vg * vd * 4) as u64) as *mut f32,
-                (g_p + r * (vg * 4) as u64) as *mut f32,
-                (beta_out_p + r * (vg * 4) as u64) as *mut f32,
-                match &fresh {
-                    Some(n) => n.device_ptr(n.stream()).0 as *mut f32,
-                    None => window_p,
-                },
-                kg as i32,
-                kd as i32,
-                vg as i32,
-                vd as i32,
-                taps as i32,
-                i32::from(tiled),
-                eps,
-                i32::from(f16),
-                stream,
-            );
-        }
+    // The rows in one launch, each reading the window the row before it left.
+    let _ = elem;
+    unsafe {
+        loken_gdn_prep(
+            qkv_p as *const c_void,
+            window_p,
+            addr::<f32>(conv_w, "conv_w")? as *const f32,
+            alpha_p as *const c_void,
+            beta_p as *const c_void,
+            addr::<f32>(a_log, "a_log")? as *const f32,
+            addr::<f32>(dt_bias, "dt_bias")? as *const f32,
+            q_p as *mut f32,
+            k_p as *mut f32,
+            v_p as *mut f32,
+            g_p as *mut f32,
+            beta_out_p as *mut f32,
+            match &fresh {
+                Some(n) => n.device_ptr(n.stream()).0 as *mut f32,
+                None => window_p,
+            },
+            rows as i32,
+            kg as i32,
+            kd as i32,
+            vg as i32,
+            vd as i32,
+            taps as i32,
+            i32::from(tiled),
+            eps,
+            i32::from(f16),
+            stream,
+        );
     }
     let wrap = |s, dims: (usize, usize)| {
         tensor_from_cuda_storage(CudaStorage::wrap_cuda_slice(s, dev.clone()), dims)

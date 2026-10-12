@@ -466,6 +466,19 @@ pub(crate) trait ModelBackend: Send {
         crate::tensor::bail!("recorded verifies are not supported for this variant")
     }
 
+    /// For each op of a recorded verify: whether it is recorded in a graph, and the stream of
+    /// the card it runs on. Empty when the verify is not cut in ops.
+    #[cfg(feature = "cuda")]
+    fn verify_step_ops(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
+        Vec::new()
+    }
+
+    /// Op `op` of the prepared verify over `rows` rows; the head's op returns the logits.
+    #[cfg(feature = "cuda")]
+    fn run_verify_op(&mut self, _op: usize, _rows: usize) -> crate::tensor::Result<Option<Tensor>> {
+        crate::tensor::bail!("recorded verifies are not supported for this variant")
+    }
+
     /// The prepared verify has run and its first `kept` rows stay: the caches are cut back
     /// and every layer returns to the rows kept.
     fn verify_window_settle(&mut self, _kept: usize) -> crate::tensor::Result<()> {
@@ -1717,6 +1730,16 @@ impl ModelBackend for GenericBackend {
     #[cfg(feature = "cuda")]
     fn forward_verify_window(&mut self, rows: usize) -> crate::tensor::Result<Tensor> {
         self.0.forward_verify_window(rows)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn verify_step_ops(&self) -> Vec<(bool, std::sync::Arc<crate::tensor::cuda_ext::CudaStream>)> {
+        self.0.verify_step_ops()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_verify_op(&mut self, op: usize, rows: usize) -> crate::tensor::Result<Option<Tensor>> {
+        self.0.run_verify_op(op, rows)
     }
 
     #[cfg(feature = "cuda")]

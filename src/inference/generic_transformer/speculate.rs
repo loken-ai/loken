@@ -97,17 +97,20 @@ impl GenericTransformerLayer {
         };
         let prefix = input.narrow(1, 0, kept)?;
         if let Some(state) = &p.mixer {
-            // Where the state lies on a card, and advanced where it lies: a recorded step reads
-            // it there. A state on the host has no buffers to keep.
+            // Where the state lies on a card, and advanced where it lies, the rows as the
+            // decoded tokens they stand for: a recorded step reads it there. A state on the
+            // host has no buffers to keep.
             if self.mixer.restore_in_place(state).is_err() {
                 self.mixer.restore(state)?;
             }
+            let _order = crate::tensor::quantized::DecodeOrder::enter();
             #[cfg(feature = "cuda")]
             let _in_place = crate::inference::moe_cuda::in_place_state(true);
             self.mixer.forward(&prefix, p.base)?;
         }
         if let (Some(cache), Some(sparse)) = (&p.indexer, self.sparse.as_mut()) {
-            sparse.restore_cache(cache, false);
+            // The cache is of the sequence the card holds: the card keeps what it covers.
+            sparse.restore_cache(cache, true);
             sparse.observe(&prefix, p.base)?;
         }
         Ok(())
