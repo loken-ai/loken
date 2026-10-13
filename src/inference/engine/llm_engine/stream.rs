@@ -1810,7 +1810,7 @@ impl LlmEngine {
                                 Ok(()) => {
                                     plain_launch_ns += t_launch.elapsed().as_nanos() as u64;
                                     let t_wait = std::time::Instant::now();
-                                    let _ = crate::tensor::cuda_ext::synchronize_yielding(&stream);
+                                    let _ = crate::tensor::cuda_ext::synchronize_yielding(stream);
                                     plain_wait_ns += t_wait.elapsed().as_nanos() as u64;
                                     plain_steps += 1;
                                     if graph_validations < GRAPH_VALIDATIONS {

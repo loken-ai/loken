@@ -1064,7 +1064,7 @@ impl LayerTier {
             };
             *extra = Some(stacks);
             drop(extra);
-            return self.fill_extra(fit);
+            self.fill_extra(fit)
         }
     }
 

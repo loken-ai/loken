@@ -373,7 +373,7 @@ impl SparseAttention {
             crate::tensor::bail!("the indexer has no cache on a card");
         };
         indexer_append(
-            &key,
+            key,
             &card.tail,
             &card.pooled,
             &card.k_gamma,
@@ -383,7 +383,7 @@ impl SparseAttention {
         )?;
         let at_pos = rot.narrow(0, 2 * card.shape.half, 2 * card.shape.half)?;
         indexer_select(
-            &q,
+            q,
             &card.q_gamma,
             &at_pos,
             &card.pooled,

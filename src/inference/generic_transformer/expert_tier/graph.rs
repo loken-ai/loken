@@ -754,8 +754,7 @@ impl LayerTier {
                 .collect();
             let late: Vec<(u32, u32, f32)> = miss_pairs
                 .iter()
-                .enumerate()
-                .filter_map(|(_, &(row, e, w))| {
+                .filter_map(|&(row, e, w)| {
                     let place = transit.iter().position(|&t| t == e)?;
                     let pair = req
                         .ids
@@ -817,7 +816,7 @@ impl LayerTier {
             WORKER.missed.fetch_add(1, Ordering::Relaxed);
             missed_of.fetch_add(1, Ordering::Relaxed);
         }
-        if n % 4096 == 0 {
+        if n.is_multiple_of(4096) {
             let missed = WORKER.missed.load(Ordering::Relaxed).max(1);
             let pct = |m: &std::sync::atomic::AtomicU64, r: &std::sync::atomic::AtomicU64| {
                 100.0 * m.load(Ordering::Relaxed) as f64 / r.load(Ordering::Relaxed).max(1) as f64

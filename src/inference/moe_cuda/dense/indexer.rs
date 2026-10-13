@@ -486,7 +486,7 @@ pub fn selected_attention(
 /// Whether [`selected_attention_rows`] serves heads of width `hd`, `n_head` query heads over
 /// `n_kv` key-value heads.
 pub fn selected_attention_rows_serves(hd: usize, n_head: usize, n_kv: usize) -> bool {
-    hd == 256 && n_kv > 0 && n_head % n_kv == 0 && n_head / n_kv <= 16
+    hd == 256 && n_kv > 0 && n_head.is_multiple_of(n_kv) && n_head / n_kv <= 16
 }
 
 /// Attention of the rows of a prompt chunk, each over its own kept tokens, in one launch: `q` is

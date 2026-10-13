@@ -987,7 +987,7 @@ impl MoeWeights {
         }
         // The shared expert's projections, when a recorded decode queued them ahead of the wait.
         let expert_rows = if self.up_relu2 {
-            self.forward_up_relu2(&xs, &topk_ids, &topk_weights_scaled, num_tokens)?
+            self.forward_up_relu2(xs, topk_ids, topk_weights_scaled, num_tokens)?
         } else if let Some(tier) = self
             .tier
             .as_ref()
@@ -995,9 +995,9 @@ impl MoeWeights {
         {
             // Every expert is on the card: the layer runs as one that was loaded there.
             self.forward_cuda(
-                &xs,
-                &topk_ids,
-                &topk_weights_scaled,
+                xs,
+                topk_ids,
+                topk_weights_scaled,
                 num_tokens,
                 is_prefill,
                 t_route,
@@ -1009,13 +1009,13 @@ impl MoeWeights {
         {
             // A recorded decode queues the shared expert's projections while the host answers.
             if tier.records(&xs.device()) {
-                let pending = tier.graph_begin(self, &xs, &topk_ids, &topk_weights_scaled)?;
+                let pending = tier.graph_begin(self, xs, topk_ids, topk_weights_scaled)?;
                 if let Some(shared) = &self.shared_expert {
-                    *shared_projected = shared.project(&xs)?;
+                    *shared_projected = shared.project(xs)?;
                 }
                 tier.graph_end(pending)?
             } else {
-                tier.decode(self, &xs, &topk_ids, &topk_weights_scaled)?
+                tier.decode(self, xs, topk_ids, topk_weights_scaled)?
             }
         } else if let Some(tier) = self.tier.as_ref().filter(|t| {
             xs.device().runs_as_card() && t.stream_pays(num_tokens, self.n_experts_used)
@@ -1026,9 +1026,9 @@ impl MoeWeights {
             let stacks = super::wide::staged("tier fill wait", &dev, false, || tier.stacks())?;
             let out = super::wide::staged("tier experts", &dev, false, || {
                 self.forward_cuda(
-                    &xs,
-                    &topk_ids,
-                    &topk_weights_scaled,
+                    xs,
+                    topk_ids,
+                    topk_weights_scaled,
                     num_tokens,
                     true,
                     t_route,
@@ -1040,7 +1040,7 @@ impl MoeWeights {
             #[cfg(feature = "cuda")]
             if let Ok(card) = dev.as_cuda_device() {
                 let stream = card.0.stream().clone();
-                if let Err(e) = tier.keep_hottest_of_prompt(&topk_ids, &stream) {
+                if let Err(e) = tier.keep_hottest_of_prompt(topk_ids, &stream) {
                     tracing::warn!("the cache is not warmed from the prompt: {e}");
                 }
             }
@@ -1055,17 +1055,17 @@ impl MoeWeights {
             // together, as the decoded tokens they stand for would one after the other. The rows
             // of a recorded verify go through the kernels of the recorded decode.
             if tier.records(&xs.device()) && num_tokens <= tier.graph_rows() {
-                tier.decode_rows_graph(self, &xs, &topk_ids, &topk_weights_scaled)?
+                tier.decode_rows_graph(self, xs, topk_ids, topk_weights_scaled)?
             } else {
-                tier.decode_rows(self, &xs, &topk_ids, &topk_weights_scaled)?
+                tier.decode_rows(self, xs, topk_ids, topk_weights_scaled)?
             }
         } else if on_cpu {
-            self.forward_cpu(&xs, &topk_ids, &topk_weights_scaled, num_tokens, hidden_dim)?
+            self.forward_cpu(xs, topk_ids, topk_weights_scaled, num_tokens, hidden_dim)?
         } else {
             self.forward_cuda(
-                &xs,
-                &topk_ids,
-                &topk_weights_scaled,
+                xs,
+                topk_ids,
+                topk_weights_scaled,
                 num_tokens,
                 is_prefill,
                 t_route,
@@ -1094,13 +1094,13 @@ impl MoeWeights {
         // Back to the block's own device, width and dtype. The host expert path answers on
         // the host even for a layer that lives on a card, so that the hybrid prefill above
         // can run there; the caller's residual add expects the layer's device back.
-        let expert_rows = match expert_rows.device().same_device(&moe_device) {
+        let expert_rows = match expert_rows.device().same_device(moe_device) {
             true => expert_rows,
-            false => expert_rows.to_device(&moe_device)?,
+            false => expert_rows.to_device(moe_device)?,
         };
         let expert_rows = match &self.shared_expert {
             Some(shared) => shared.forward_added(
-                &xs,
+                xs,
                 &expert_rows.to_dtype(crate::tensor::DType::F32)?,
                 shared_projected,
             )?,
