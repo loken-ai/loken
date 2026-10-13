@@ -287,19 +287,6 @@ NATIVE_MAP(native_cast_f32_bf16, float, __nv_bfloat16, __float2bfloat16(v))
 NATIVE_MAP(native_cast_bf16_f32, __nv_bfloat16, float, __bfloat162float(v))
 NATIVE_MAP(native_sin_f32, float, float, sinf(v))
 NATIVE_MAP(native_cos_f32, float, float, cosf(v))
-// narrow over one dim of a contiguous tensor, dtype-agnostic (byte copy):
-// y[r*row_bytes + j] = x[r*src_row_bytes + off_bytes + j]
-extern "C" __global__ void native_slice_u8(
-    const unsigned char* x, unsigned char* y,
-    long long off_bytes, long long src_row_bytes, long long row_bytes,
-    long long n_rows) {
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = n_rows * row_bytes;
-    if (i >= total) return;
-    long long r = i / row_bytes;
-    long long j = i % row_bytes;
-    y[i] = x[r * src_row_bytes + off_bytes + j];
-}
 // im2col for 1-D conv: one (batch,group) slab. col[(ci*k+kk)*l_out+lo]
 // Restricted to output columns [lo_off, lo_off+lo_len) so callers can bound
 // the col-buffer transient (same contract as native_im2col2d_f32 below).
@@ -713,20 +700,6 @@ extern "C" __global__ void native_where_u32_f32(
     const unsigned int* c, const float* t, const float* f, float* y, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = c[i] ? t[i] : f[i];
-}
-// inverse of native_slice_u8: write src rows INTO dst at a byte offset
-// (in-place slice_set - the O(1) KV append / graph-buffer update;
-// dtype-agnostic byte copy)
-extern "C" __global__ void native_slice_set_u8(
-    const unsigned char* x, unsigned char* y,
-    long long off_bytes, long long dst_row_bytes, long long row_bytes,
-    long long n_rows) {
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    long long total = n_rows * row_bytes;
-    if (i >= total) return;
-    long long r = i / row_bytes;
-    long long j = i % row_bytes;
-    y[r * dst_row_bytes + off_bytes + j] = x[i];
 }
 // scatter_set along one dim: dst[(o*dst_d + idx[e])*inner + ii] = src[e]
 // (in-place; idx has src's shape; elem-size-agnostic byte copy)

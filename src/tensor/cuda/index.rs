@@ -15,57 +15,48 @@ pub fn narrow_storage(
     off_bytes: usize,
     row_bytes: usize,
 ) -> Result<CudaStorage> {
-    let func = dev.elementwise_fn("native_slice_u8")?;
     let stream = dev.stream();
     let total = n_rows * row_bytes;
-    let cfg = LaunchConfig {
-        grid_dim: (total.div_ceil(256) as u32, 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let (offb, srb, rb, nr) = (
-        off_bytes as i64,
-        src_row_bytes as i64,
-        row_bytes as i64,
-        n_rows as i64,
-    );
     macro_rules! run {
-        ($slice:expr, $t:ty, $variant:ident) => {{
+        ($t:ty, $variant:ident) => {{
             let elem = std::mem::size_of::<$t>();
             let out = with_oom_retry(dev, "narrow", || unsafe {
                 stream.alloc::<$t>(total / elem)
             })?;
-            // The kernel reads both buffers as byte pointers; passing the
-            // typed slices is fine at the ABI level (a pointer either way).
-            let mut b = stream.launch_builder(&func);
-            b.arg($slice);
-            b.arg(&out);
-            b.arg(&offb);
-            b.arg(&srb);
-            b.arg(&rb);
-            b.arg(&nr);
-            unsafe { b.launch(cfg) }
-                .map_err(|e| Error(format!("narrow launch: {e}{}", super::device::stack_note())))?;
-            Ok(CudaStorage::$variant(out))
+            let out = CudaStorage::$variant(out);
+            copy_rows(
+                dev,
+                &out,
+                src,
+                n_rows,
+                row_bytes,
+                row_bytes,
+                src_row_bytes,
+                0,
+                off_bytes,
+            )
+            .map_err(|e| Error(format!("narrow: {e}{}", super::device::stack_note())))?;
+            Ok(out)
         }};
     }
     match src {
-        CudaStorage::F32(s) => run!(s, f32, F32),
-        CudaStorage::F16(s) => run!(s, half::f16, F16),
-        CudaStorage::BF16(s) => run!(s, half::bf16, BF16),
-        CudaStorage::U32(s) => run!(s, u32, U32),
-        CudaStorage::I16(s) => run!(s, i16, I16),
-        CudaStorage::I32(s) => run!(s, i32, I32),
-        CudaStorage::I64(s) => run!(s, i64, I64),
-        CudaStorage::U8(s) => run!(s, u8, U8),
+        CudaStorage::F32(_) => run!(f32, F32),
+        CudaStorage::F16(_) => run!(half::f16, F16),
+        CudaStorage::BF16(_) => run!(half::bf16, BF16),
+        CudaStorage::U32(_) => run!(u32, U32),
+        CudaStorage::I16(_) => run!(i16, I16),
+        CudaStorage::I32(_) => run!(i32, I32),
+        CudaStorage::I64(_) => run!(i64, I64),
+        CudaStorage::U8(_) => run!(u8, U8),
     }
 }
 
-/// In-place `slice_set`: copy `src` (viewed as `[n_rows, src_row_bytes]`)
-/// into `dst` rows of `dst_row_bytes` at byte offset `off_bytes`
-/// (dtype-agnostic, same-variant storages). The kernel writes through the
-/// dst slice in place - the production fused kernels mutate KV buffers
-/// through shared refs the same way.
+/// In-place `slice_set`: copy `src` (from byte `src_off_bytes`, viewed as
+/// `[n_rows, src_row_bytes]`) into `dst` rows of `dst_row_bytes` at byte offset `off_bytes`
+/// (dtype-agnostic, same-variant storages). The copy writes through the dst slice in place -
+/// the production fused kernels mutate KV buffers through shared refs the same way. The two
+/// ranges do not overlap.
+#[allow(clippy::too_many_arguments)]
 pub fn slice_set_storage(
     dev: &CudaDevice,
     dst: &CudaStorage,
@@ -74,48 +65,91 @@ pub fn slice_set_storage(
     dst_row_bytes: usize,
     src_row_bytes: usize,
     off_bytes: usize,
+    src_off_bytes: usize,
 ) -> Result<()> {
-    let total = n_rows * src_row_bytes;
-    if total == 0 {
+    copy_rows(
+        dev,
+        dst,
+        src,
+        n_rows,
+        src_row_bytes,
+        dst_row_bytes,
+        src_row_bytes,
+        off_bytes,
+        src_off_bytes,
+    )
+}
+
+/// `n_rows` rows of `width` bytes from `src` (rows `src_pitch` apart from byte `src_off`)
+/// into `dst` (rows `dst_pitch` apart from byte `dst_off`), same-variant storages: one
+/// device-to-device copy at the card's bandwidth, recorded as a copy node inside a graph.
+#[allow(clippy::too_many_arguments)]
+fn copy_rows(
+    dev: &CudaDevice,
+    dst: &CudaStorage,
+    src: &CudaStorage,
+    n_rows: usize,
+    width: usize,
+    dst_pitch: usize,
+    src_pitch: usize,
+    dst_off: usize,
+    src_off: usize,
+) -> Result<()> {
+    use cudarc::driver::{sys, DevicePtr};
+    if n_rows == 0 || width == 0 {
         return Ok(());
     }
-    let func = dev.elementwise_fn("native_slice_set_u8")?;
     let stream = dev.stream();
-    let cfg = LaunchConfig {
-        grid_dim: (total.div_ceil(256) as u32, 1, 1),
-        block_dim: (256, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let (offb, drb, srb, nr) = (
-        off_bytes as i64,
-        dst_row_bytes as i64,
-        src_row_bytes as i64,
-        n_rows as i64,
-    );
-    macro_rules! run {
-        ($s:expr, $d:expr) => {{
-            // byte-pointer kernel; typed slices are fine at the ABI level
-            let mut b = stream.launch_builder(&func);
-            b.arg($s);
-            b.arg($d);
-            b.arg(&offb);
-            b.arg(&drb);
-            b.arg(&srb);
-            b.arg(&nr);
-            unsafe { b.launch(cfg) }.map_err(|e| Error(format!("slice_set launch: {e}")))?;
-            Ok(())
+    // The copy is a driver call on this card: its context is the thread's current one.
+    stream
+        .context()
+        .bind_to_thread()
+        .map_err(|e| Error(format!("device copy: {e:?}")))?;
+    macro_rules! ptr {
+        ($s:expr) => {{
+            let (p, _g) = $s.device_ptr(&stream);
+            p
         }};
     }
-    match (src, dst) {
-        (CudaStorage::F32(s), CudaStorage::F32(d)) => run!(s, d),
-        (CudaStorage::F16(s), CudaStorage::F16(d)) => run!(s, d),
-        (CudaStorage::BF16(s), CudaStorage::BF16(d)) => run!(s, d),
-        (CudaStorage::U32(s), CudaStorage::U32(d)) => run!(s, d),
-        (CudaStorage::I32(s), CudaStorage::I32(d)) => run!(s, d),
-        (CudaStorage::I64(s), CudaStorage::I64(d)) => run!(s, d),
-        (CudaStorage::U8(s), CudaStorage::U8(d)) => run!(s, d),
-        _ => Err(Error("slice_set: dtype mismatch".into())),
+    let (sp, dp) = match (src, dst) {
+        (CudaStorage::F32(s), CudaStorage::F32(d)) => (ptr!(s), ptr!(d)),
+        (CudaStorage::F16(s), CudaStorage::F16(d)) => (ptr!(s), ptr!(d)),
+        (CudaStorage::BF16(s), CudaStorage::BF16(d)) => (ptr!(s), ptr!(d)),
+        (CudaStorage::U32(s), CudaStorage::U32(d)) => (ptr!(s), ptr!(d)),
+        (CudaStorage::I16(s), CudaStorage::I16(d)) => (ptr!(s), ptr!(d)),
+        (CudaStorage::I32(s), CudaStorage::I32(d)) => (ptr!(s), ptr!(d)),
+        (CudaStorage::I64(s), CudaStorage::I64(d)) => (ptr!(s), ptr!(d)),
+        (CudaStorage::U8(s), CudaStorage::U8(d)) => (ptr!(s), ptr!(d)),
+        _ => return Err(Error("copy: dtype mismatch".into())),
+    };
+    let (sp, dp) = (sp + src_off as u64, dp + dst_off as u64);
+    let r = if n_rows == 1 || (dst_pitch == width && src_pitch == width) {
+        unsafe { sys::cuMemcpyDtoDAsync_v2(dp, sp, n_rows * width, stream.cu_stream()) }
+    } else {
+        let desc = sys::CUDA_MEMCPY2D_st {
+            srcXInBytes: 0,
+            srcY: 0,
+            srcMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            srcHost: std::ptr::null(),
+            srcDevice: sp,
+            srcArray: std::ptr::null_mut(),
+            srcPitch: src_pitch,
+            dstXInBytes: 0,
+            dstY: 0,
+            dstMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            dstHost: std::ptr::null_mut(),
+            dstDevice: dp,
+            dstArray: std::ptr::null_mut(),
+            dstPitch: dst_pitch,
+            WidthInBytes: width,
+            Height: n_rows,
+        };
+        unsafe { sys::cuMemcpy2DAsync_v2(&desc, stream.cu_stream()) }
+    };
+    if r != sys::cudaError_enum::CUDA_SUCCESS {
+        return Err(Error(format!("device copy: {r:?}")));
     }
+    Ok(())
 }
 
 /// In-place `scatter_set` along one dim: dst/src viewed as
@@ -474,5 +508,60 @@ mod reduce_tests {
             "{sum} {want_sum}"
         );
         assert_eq!(max, want_max);
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use crate::tensor::{DType, Device, Tensor};
+
+    fn host(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1().unwrap()
+    }
+
+    /// A write into rows, a write from a narrowed source, and a narrow of a middle dim give
+    /// what the host's copies give, on either card.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn slice_set_and_narrow_copy_the_rows_they_name() {
+        for ordinal in 0..2 {
+            let Ok(dev) = Device::new_cuda(ordinal) else {
+                continue;
+            };
+            let v: Vec<f32> = (0..2 * 5 * 3).map(|i| i as f32).collect();
+            let dst = Tensor::zeros_on((2, 5, 3), DType::F32, &dev).unwrap();
+            let src = Tensor::from_vec(v[..12].to_vec(), (2, 2, 3), &dev).unwrap();
+            dst.slice_set(&src, 1, 2).unwrap();
+            let got = host(&dst);
+            let mut want = vec![0f32; 30];
+            for o in 0..2 {
+                for j in 0..6 {
+                    want[o * 15 + 6 + j] = v[o * 6 + j];
+                }
+            }
+            assert_eq!(got, want, "rows written at an offset on card {ordinal}");
+            let whole = Tensor::from_vec(v.clone(), (10, 3), &dev).unwrap();
+            let into = Tensor::zeros_on((2, 3), DType::F32, &dev).unwrap();
+            into.slice_set(&whole.narrow(0, 4, 2).unwrap(), 0, 0)
+                .unwrap();
+            assert_eq!(
+                host(&into),
+                v[12..18].to_vec(),
+                "a narrowed source on card {ordinal}"
+            );
+            let mid = Tensor::from_vec(v.clone(), (2, 5, 3), &dev)
+                .unwrap()
+                .narrow(1, 1, 3)
+                .unwrap();
+            let mut want = Vec::new();
+            for o in 0..2 {
+                want.extend_from_slice(&v[o * 15 + 3..o * 15 + 12]);
+            }
+            assert_eq!(
+                host(&mid.contiguous().unwrap()),
+                want,
+                "a middle-dim narrow on card {ordinal}"
+            );
+        }
     }
 }

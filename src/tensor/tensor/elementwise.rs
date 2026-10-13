@@ -460,9 +460,9 @@ impl Tensor {
         if !self.spans_whole() {
             return Err(Error("slice_set: destination is a narrow view".into()));
         }
-        // `src.storage()` below materializes a view src, so overlap is only
-        // possible when both are the same whole allocation.
-        if Arc::ptr_eq(&self.storage_raw, src.storage()) {
+        // A view of the destination's own allocation is read from its packed copy, so the two
+        // ranges never overlap; a view of another allocation is read where it lies.
+        if Arc::ptr_eq(&self.storage_raw, &src.storage_raw) && src.spans_whole() {
             return Err(Error("slice_set: self and src share storage".into()));
         }
         if self.dtype() != src.dtype() {
@@ -509,7 +509,18 @@ impl Tensor {
         let outer: usize = dims[..d].iter().product();
         let inner: usize = dims[d + 1..].iter().product();
         let (dst_d, src_d) = (dims[d], sdims[d]);
-        match (self.storage().as_ref(), src.storage().as_ref()) {
+        // On a card a view is copied from where it lies: views are contiguous ranges.
+        #[cfg(feature = "cuda")]
+        let (src_store, src_off) = match src.storage_raw.as_ref() {
+            Storage::Cuda { .. } if !Arc::ptr_eq(&self.storage_raw, &src.storage_raw) => {
+                (&src.storage_raw, src.offset)
+            }
+            _ => (src.storage(), 0),
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (src_store, src_off) = (src.storage(), 0usize);
+        let _ = src_off;
+        match (self.storage().as_ref(), src_store.as_ref()) {
             #[cfg(feature = "cuda")]
             (
                 Storage::Cuda { data: dd, dev },
@@ -532,6 +543,7 @@ impl Tensor {
                     dst_d * inner * esize,
                     src_d * inner * esize,
                     offset * inner * esize,
+                    src_off * esize,
                 )
             }
             (Storage::Cpu(dc), Storage::Cpu(sc)) => {
