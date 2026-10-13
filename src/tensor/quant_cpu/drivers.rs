@@ -898,8 +898,11 @@ pub(super) fn qscratch_return<T: BlockFormat + 'static>(buf: Vec<T>) {
     })
 }
 
+/// Chunks a worker of [`pool_for_each_mut`] is given on average.
+const CHUNKS_A_WORKER: usize = 4;
+
 /// Parallel `for_each` over a mutable slice via the persistent spin-pool: each
-/// worker grabs a contiguous index range with one atomic `fetch_add`. Use for
+/// worker grabs contiguous index ranges, one atomic `fetch_add` each. Use for
 /// the many tiny per-token MoE reduce regions instead of `rayon par_iter_mut`,
 /// whose recursive fork/join split dominates the microscopic per-region work
 /// (profiled: hundreds of MoE/SSM parallel regions per token spent ~45% of CPU
@@ -916,7 +919,9 @@ pub fn pool_for_each_mut<T: Send + Sync>(
     }
     let pool = gemv_pool::pool();
     let threads = pool.threads.max(1);
-    let chunk = n.div_ceil(threads).max(min_len.max(1));
+    // Several chunks a worker, taken as workers free up: a worker sharing its core with another
+    // busy thread takes fewer of them instead of holding the whole call back.
+    let chunk = n.div_ceil(threads * CHUNKS_A_WORKER).max(min_len.max(1));
     let n_chunks = n.div_ceil(chunk);
     let ptr = SendMutPtr(out.as_mut_ptr());
     pool.run(n_chunks, &|c| {
