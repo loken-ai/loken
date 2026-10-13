@@ -148,6 +148,8 @@ extern "C" void loken_hc_combine(
 namespace {
 
 constexpr int UP_TILE = 4;
+// Most sixteen-byte pieces of int8 rows one block of the up projection loads at once.
+constexpr int UP_PIECES = 512;
 
 __device__ __forceinline__ float dot_row(const float * __restrict__ w, const float * __restrict__ x,
         int k, int lane0, int stride) {
@@ -270,6 +272,29 @@ extern "C" __global__ void loken_hc_up_mean_kernel(
     for (int i = threadIdx.x; i < R; i += blockDim.x) low_s[i] = low[row * R + i];
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, warps = blockDim.x >> 5;
+    // Int8 rows in whole sixteen-byte pieces: every piece of the tile's rows is loaded by a thread
+    // of its own at once, and each row's pieces are then summed in order.
+    if (half_w == 2 && (R & 15) == 0 && S * tile * (R >> 4) <= UP_PIECES) {
+        __shared__ float piece[UP_PIECES];
+        const int per_row = R >> 4, pieces = S * tile * per_row;
+        for (int p = threadIdx.x; p < pieces; p += blockDim.x) {
+            const int j = p / per_row, c = p % per_row;
+            const int s = j / tile, dd = j % tile;
+            const size_t at = ((size_t) s * D + d0 + dd) * R;
+            const int4 u = reinterpret_cast<const int4 *>((const signed char *) up + at)[c];
+            const signed char * b = reinterpret_cast<const signed char *>(&u);
+            const float * x = low_s + 16 * c;
+            float part = 0.f;
+            for (int q = 0; q < 16; ++q) part += (float) b[q] * x[q];
+            piece[p] = part * up_scale[((size_t) s * D + d0 + dd) * (R >> 6) + (c >> 2)];
+        }
+        __syncthreads();
+        for (int j = threadIdx.x; j < S * tile; j += blockDim.x) {
+            float acc = 0.f;
+            for (int c = 0; c < per_row; ++c) acc += piece[j * per_row + c];
+            gate[(j / tile) * UP_TILE + j % tile] = sigmoidf_(acc);
+        }
+    } else
     for (int j = warp; j < S * tile; j += warps) {
         const int s = j / tile, dd = j % tile;
         const size_t at = ((size_t) s * D + d0 + dd) * R;
