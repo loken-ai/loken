@@ -578,11 +578,88 @@ __global__ void loken_moe_sum_topk_add_kernel(
 
 } // namespace loken_moe
 
+namespace loken_moe {
+
+// Lanes that share one output row of the narrow down projection, and rows a warp takes.
+constexpr int SUB_LANES = 8;
+constexpr int SUB_ROWS = WARP_SIZE / SUB_LANES;
+// Passes along k a row may take in the narrow kernel: past them a row is wide enough for a
+// whole warp.
+constexpr int SUB_PASSES_MAX = 8;
+
+// The down projection of `loken_moe_gemm_gguf_down_reduce_kernel` for a row whose k walk is a
+// few passes of eight lanes (a 640-deep row in a 32-value format holds forty lane slots): eight
+// lanes share a row and a warp takes four, so every lane works on every pass where a whole warp
+// would leave most of its second pass idle. The same routed pairs, scale, bias and rows out.
+template <int qk, int qi, typename block_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__global__ void loken_moe_gemm_gguf_down_reduce_sub8_kernel(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const int32_t * __restrict__ sorted_token_ids,
+    const int32_t * __restrict__ expert_ids,
+    const float * __restrict__ topk_weights,
+    float * __restrict__ all_outputs,
+    moe_dims dims,
+    const float * __restrict__ down_bias
+) {
+    const int lane = threadIdx.x, sub = lane / SUB_LANES, l8 = lane % SUB_LANES;
+    const int row = (blockIdx.x * blockDim.y + threadIdx.y) * SUB_ROWS + sub;
+    const int pair = blockIdx.y;
+    // The conditions below hold for the whole warp, so no lane leaves a shuffle.
+    if (pair >= dims.pairs) return;
+    if (dims.live != nullptr && pair >= (int) *dims.live) return;
+    const routed_pair routed = read_routing(sorted_token_ids, expert_ids, pair);
+    if (dims.live != nullptr && (routed.token < 0 || routed.token >= dims.pairs)) return;
+    const bool valid = row < dims.cols;
+    if (routed.expert < 0 || routed.expert >= dims.experts) {
+        if (valid && l8 == 0 && routed.token >= 0 && routed.token < dims.pairs) {
+            output_row(all_outputs, routed.token, dims.cols)[row] = 0.0f;
+        }
+        return;
+    }
+    const float scale = topk_weights[routed.token];
+    const block_t * __restrict__ w_expert =
+        expert_slab_alt<qk, block_t>(all_weights, dims.alt_a, dims, routed.expert, dims.cols, dims.depth);
+    const block_q8_1 * __restrict__ y_ptr =
+        activation_row(all_inputs, routed.token, dims.depth_padded);
+    const int per_row = dims.depth / qk;
+    constexpr int lanes_per_block = qi / vdr;
+    const int slots = per_row * lanes_per_block;
+    const block_t * __restrict__ w_row = w_expert + (size_t) (valid ? row : 0) * per_row;
+    float acc = 0.0f;
+    for (int s = l8; s < slots; s += SUB_LANES) {
+        const int kbx = s / lanes_per_block;
+        acc += vec_dot_q_cuda(&w_row[kbx], paired_activation<qk>(y_ptr, kbx), vdr * (s % lanes_per_block));
+    }
+    #pragma unroll
+    for (int off = SUB_LANES / 2; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    if (valid && l8 == 0) {
+        float v = acc * scale;
+        if (down_bias != nullptr) v += scale * down_bias[(size_t) routed.expert * dims.cols + row];
+        output_row(all_outputs, routed.token, dims.cols)[row] = v;
+    }
+}
+
+} // namespace loken_moe
+
+// A row of `slots` lane slots takes the narrow kernel when eight lanes cover it in a few full
+// passes, the warp-per-row kernel otherwise.
 #define LAUNCH_MOE_GGUF_DOWN_REDUCE(qk, qi, block_t, vdr, vec_dot_q_cuda) \
-    loken_moe::loken_moe_gemm_gguf_down_reduce_kernel<qk, qi, block_t, vdr, vec_dot_q_cuda> \
-        <<<shape.grid, shape.block, 0, stream>>>( \
-            weights, y_q8_1, sorted_token_ids, expert_ids, topk_weights, outputs, \
-            dims, down_bias);
+    { \
+        const int slots = dims.depth / qk * (qi / vdr); \
+        if (slots % loken_moe::SUB_LANES == 0 && slots <= loken_moe::SUB_LANES * loken_moe::SUB_PASSES_MAX) { \
+            const dim3 grid(ceil_div(size_n, nWraps * loken_moe::SUB_ROWS), size_m, 1); \
+            loken_moe::loken_moe_gemm_gguf_down_reduce_sub8_kernel<qk, qi, block_t, vdr, vec_dot_q_cuda> \
+                <<<grid, shape.block, 0, stream>>>( \
+                    weights, y_q8_1, sorted_token_ids, expert_ids, topk_weights, outputs, \
+                    dims, down_bias); \
+        } else { \
+            loken_moe::loken_moe_gemm_gguf_down_reduce_kernel<qk, qi, block_t, vdr, vec_dot_q_cuda> \
+                <<<shape.grid, shape.block, 0, stream>>>( \
+                    weights, y_q8_1, sorted_token_ids, expert_ids, topk_weights, outputs, \
+                    dims, down_bias); \
+        } \
+    }
 
 // Initialize an F32 output buffer from an F16 residual. Used to fuse
 // the post-MLP residual add into the loken_moe_gemm_gguf_down_reduce kernel:
