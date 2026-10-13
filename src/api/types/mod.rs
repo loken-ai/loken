@@ -1135,11 +1135,11 @@ impl ChatCompletionRequest {
 /// OpenAI's `frequency_penalty` and `presence_penalty` (each in [-2, 2], 0 = none) as the
 /// engine's single llama.cpp-style repeat penalty (1 = none). The engine has one
 /// repetition knob, so the two are summed, the sum clamped to the band each penalty is
-/// validated against, and mapped linearly: 0 to 1, +2 to 3, -2 to -1. `None` when the
-/// penalties cancel or are absent.
-pub fn repeat_penalty_from_openai(frequency: Option<f32>, presence: Option<f32>) -> Option<f32> {
+/// validated against, and mapped linearly: 0 to 1, +2 to 3, -2 to -1. A penalty the client
+/// does not name is OpenAI's default, zero: no penalty at all.
+pub fn repeat_penalty_from_openai(frequency: Option<f32>, presence: Option<f32>) -> f32 {
     let pen = (frequency.unwrap_or(0.0) + presence.unwrap_or(0.0)).clamp(-2.0, 2.0);
-    (pen.abs() > f32::EPSILON).then_some(1.0 + pen)
+    1.0 + pen
 }
 
 /// OpenAI's `stop` field accepts either a single string or an array.
@@ -1225,10 +1225,8 @@ impl ChatCompletionRequest {
             };
             opts.insert("stop".to_string(), serde_json::json!(v));
         }
-        if let Some(rp) = repeat_penalty_from_openai(self.frequency_penalty, self.presence_penalty)
-        {
-            opts.insert("repeat_penalty".to_string(), serde_json::json!(rp));
-        }
+        let rp = repeat_penalty_from_openai(self.frequency_penalty, self.presence_penalty);
+        opts.insert("repeat_penalty".to_string(), serde_json::json!(rp));
         if let Some(ref u) = self.user {
             opts.insert("session_id".to_string(), serde_json::json!(u));
         }

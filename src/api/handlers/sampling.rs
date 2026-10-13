@@ -47,6 +47,9 @@ pub(crate) struct FieldNames {
     pub session_id: &'static str,
     /// The smallest completion cap the dialect accepts: Ollama's `-1` means "until EOS".
     pub max_tokens_floor: i64,
+    /// Whether a request that names no penalty asks for none, as OpenAI's and Anthropic's
+    /// APIs define it; otherwise the model's or the server's default applies, as Ollama's does.
+    pub unnamed_penalty_is_none: bool,
 }
 
 pub(crate) const OPENAI_FIELDS: FieldNames = FieldNames {
@@ -55,6 +58,7 @@ pub(crate) const OPENAI_FIELDS: FieldNames = FieldNames {
     stop: "stop",
     session_id: "user",
     max_tokens_floor: 1,
+    unnamed_penalty_is_none: true,
 };
 pub(crate) const OLLAMA_FIELDS: FieldNames = FieldNames {
     prefix: "options.",
@@ -62,6 +66,7 @@ pub(crate) const OLLAMA_FIELDS: FieldNames = FieldNames {
     stop: "stop",
     session_id: "session_id",
     max_tokens_floor: -1,
+    unnamed_penalty_is_none: false,
 };
 pub(crate) const ANTHROPIC_FIELDS: FieldNames = FieldNames {
     prefix: "",
@@ -69,6 +74,7 @@ pub(crate) const ANTHROPIC_FIELDS: FieldNames = FieldNames {
     stop: "stop_sequences",
     session_id: "metadata.user_id",
     max_tokens_floor: 1,
+    unnamed_penalty_is_none: true,
 };
 
 /// The knobs of one request, as the caller sent them.
@@ -307,11 +313,14 @@ impl SamplingRequest {
     /// The engine's parameters. An explicit `repeat_penalty` wins over the OpenAI
     /// penalties folded into one.
     pub(crate) fn into_params(self) -> GenerationParams {
+        let named = self.frequency_penalty.is_some() || self.presence_penalty.is_some();
         let repeat_penalty = self.repeat_penalty.map(|v| v as f32).or_else(|| {
-            crate::api::types::repeat_penalty_from_openai(
-                self.frequency_penalty.map(|v| v as f32),
-                self.presence_penalty.map(|v| v as f32),
-            )
+            (named || self.fields.unnamed_penalty_is_none).then(|| {
+                crate::api::types::repeat_penalty_from_openai(
+                    self.frequency_penalty.map(|v| v as f32),
+                    self.presence_penalty.map(|v| v as f32),
+                )
+            })
         });
         GenerationParams {
             prefix_tokens: None,
@@ -397,7 +406,8 @@ mod tests {
         assert!(err_of(s).contains("top_logprobs"));
     }
 
-    /// The OpenAI penalties become one repeat penalty; an explicit one wins.
+    /// The OpenAI penalties become one repeat penalty, none when the request names none; an
+    /// explicit one wins; an Ollama request naming none keeps the defaults.
     #[test]
     fn penalties_fold_into_the_repeat_penalty() {
         let s = SamplingRequest::from_completions(
@@ -405,7 +415,13 @@ mod tests {
         );
         assert_eq!(s.into_params().repeat_penalty, Some(3.0));
         let s = SamplingRequest::from_completions(&serde_json::json!({}));
+        assert_eq!(s.into_params().repeat_penalty, Some(1.0));
+        let s = SamplingRequest::from_ollama(Some(&serde_json::json!({})), None, None);
         assert_eq!(s.into_params().repeat_penalty, None);
+        let s = SamplingRequest::from_completions(
+            &serde_json::json!({"frequency_penalty": 0.0, "presence_penalty": 0.0}),
+        );
+        assert_eq!(s.into_params().repeat_penalty, Some(1.0));
         let s = SamplingRequest::from_ollama(
             Some(&serde_json::json!({"repeat_penalty": 1.2})),
             None,

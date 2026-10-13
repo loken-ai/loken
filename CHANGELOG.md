@@ -33,6 +33,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- OpenAI and Anthropic APIs: a penalty applies only as the request names it.
 - Chat: a repository with a folder per quantisation is prompted with its own template.
 - Load: a file with a rotary scaling and no context key takes its scaled window.
 - Chat: a grammar-constrained answer is content, not reasoning.
