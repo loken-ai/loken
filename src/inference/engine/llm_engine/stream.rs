@@ -1080,8 +1080,13 @@ impl LlmEngine {
             let mut graph_capture_attempted: bool = false;
             #[cfg(feature = "cuda")]
             let mut graph_validations: usize = 0;
-            /// Replays held against an eager step before a replay is trusted.
-            const GRAPH_VALIDATIONS: usize = 3;
+            // Replays held against an eager step before a replay is trusted: three the first time
+            // the model records its step, the capture's own once the step proved itself.
+            let step_proven = model_state
+                .blocking_lock()
+                .as_ref()
+                .is_some_and(|s| s.model.graph_proven(0));
+            let graph_validations_needed: usize = if step_proven { 1 } else { 3 };
             // The recorded draft verifies, one graph per window size.
             #[cfg(feature = "cuda")]
             let mut verify_graphs = super::decode::VerifyGraphs::default();
@@ -1800,12 +1805,12 @@ impl LlmEngine {
                             let _ = stream.synchronize();
                             // A recurrent state advances with the replay, so the probation
                             // below, which runs the same step again, starts from a copy of it.
-                            let recurrent_cp = if graph_validations < GRAPH_VALIDATIONS {
+                            let recurrent_cp = if graph_validations < graph_validations_needed {
                                 state.model.recurrent_checkpoint().unwrap_or_default()
                             } else {
                                 Vec::new()
                             };
-                            probation_step = graph_validations < GRAPH_VALIDATIONS;
+                            probation_step = graph_validations < graph_validations_needed;
                             let t_launch = std::time::Instant::now();
                             match graph.launch(&mut state.model) {
                                 Ok(()) => {
@@ -1814,7 +1819,7 @@ impl LlmEngine {
                                     let _ = crate::tensor::cuda_ext::synchronize_yielding(stream);
                                     plain_wait_ns += t_wait.elapsed().as_nanos() as u64;
                                     plain_steps += 1;
-                                    if graph_validations < GRAPH_VALIDATIONS {
+                                    if graph_validations < graph_validations_needed {
                                         let rep_logits: Option<Vec<f32>> = logits_ref
                                             .flatten_all()
                                             .ok()
@@ -2069,7 +2074,7 @@ impl LlmEngine {
                         // What a plain step costs is what the head's cycles are weighed against:
                         // a replayed step, not the step that recorded the graph nor one held
                         // against an eager step, which cost what they cost once.
-                        if head_capable && graph_validations >= GRAPH_VALIDATIONS {
+                        if head_capable && graph_validations >= graph_validations_needed {
                             spec_engine
                                 .draft_length
                                 .lock()
@@ -2636,7 +2641,14 @@ impl LlmEngine {
                         } else {
                             pld_cost.plain_step(cycle_start.elapsed().as_secs_f64());
                         }
-                        if time_plain && !probation_step {
+                        // An eager step of a request that decodes through its recorded step
+                        // ran before the recording or instead of a replay: it is not what a
+                        // plain step costs in the run.
+                        #[cfg(feature = "cuda")]
+                        let replays = graph_ok && !graph_disabled_this_request;
+                        #[cfg(not(feature = "cuda"))]
+                        let replays = false;
+                        if time_plain && !probation_step && !replays {
                             spec_engine
                                 .draft_length
                                 .lock()
@@ -2724,6 +2736,16 @@ impl LlmEngine {
                         window_before_ns as f64 / 1e6 / window_iters.max(1) as f64,
                         window_tail_ns as f64 / 1e6 / window_iters.max(1) as f64,
                     );
+                }
+            }
+            // A step that went through every probation proved itself for this model.
+            #[cfg(feature = "cuda")]
+            if !step_proven
+                && graph_validations >= graph_validations_needed
+                && !graph_disabled_this_request
+            {
+                if let Some(s) = model_state.blocking_lock().as_mut() {
+                    s.model.mark_graph_proven(0);
                 }
             }
             if pld_stats_drafted > 0 {

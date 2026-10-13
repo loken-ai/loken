@@ -439,7 +439,9 @@ pub(super) fn verify_recorded(
     // The window's first row stands for the plain step of the carried token: before a
     // recording, that step is run eagerly from a checkpoint of the state, and the state
     // returned, so that the window's row can be held against it.
-    let plain_row: Option<Vec<f32>> = if graphs.by_rows.contains_key(&rows) {
+    // A size that passed every check once with this model is held against its eager run alone.
+    let proven = model.graph_proven(rows);
+    let plain_row: Option<Vec<f32>> = if graphs.by_rows.contains_key(&rows) || proven {
         None
     } else {
         match model.plain_step_held(ids[0], pos) {
@@ -575,53 +577,55 @@ pub(super) fn verify_recorded(
     let _ = stream.synchronize();
     // The rows run again from the returned state have to give the same logits: a return that
     // leaves the state changed would make every replay of the window wrong.
-    let again = match model.forward_verify_window(rows) {
-        Ok(l) => l,
-        Err(e) => {
-            give_up(model, graphs, format!("eager window again: {e}"));
-            return None;
-        }
-    };
-    let _ = stream.synchronize();
-    if let Some(want) = eager_rows.as_ref() {
-        let distances: Vec<String> = (0..rows)
-            .map(|r| {
+    if !proven {
+        let again = match model.forward_verify_window(rows) {
+            Ok(l) => l,
+            Err(e) => {
+                give_up(model, graphs, format!("eager window again: {e}"));
+                return None;
+            }
+        };
+        let _ = stream.synchronize();
+        if let Some(want) = eager_rows.as_ref() {
+            let distances: Vec<String> = (0..rows)
+                .map(|r| {
+                    again
+                        .narrow(1, r, 1)
+                        .and_then(|t| t.flatten_all())
+                        .and_then(|t| t.to_vec1::<f32>())
+                        .map(|got| {
+                            crate::inference::engine::decode_step::replay_distance(&got, &want[r])
+                        })
+                        .map_or("?".to_string(), |d| format!("{d:.4}"))
+                })
+                .collect();
+            let returned = (0..rows).all(|r| {
                 again
                     .narrow(1, r, 1)
                     .and_then(|t| t.flatten_all())
                     .and_then(|t| t.to_vec1::<f32>())
-                    .map(|got| {
-                        crate::inference::engine::decode_step::replay_distance(&got, &want[r])
+                    .is_ok_and(|got| {
+                        crate::inference::engine::decode_step::replay_agrees(&got, &want[r])
                     })
-                    .map_or("?".to_string(), |d| format!("{d:.4}"))
-            })
-            .collect();
-        let returned = (0..rows).all(|r| {
-            again
-                .narrow(1, r, 1)
-                .and_then(|t| t.flatten_all())
-                .and_then(|t| t.to_vec1::<f32>())
-                .is_ok_and(|got| {
-                    crate::inference::engine::decode_step::replay_agrees(&got, &want[r])
-                })
-        });
-        if !returned {
-            give_up(
-                model,
-                graphs,
-                format!("the rows run again from the returned state differ (relative distance per row: {})", distances.join(" ")),
-            );
+            });
+            if !returned {
+                give_up(
+                    model,
+                    graphs,
+                    format!("the rows run again from the returned state differ (relative distance per row: {})", distances.join(" ")),
+                );
+                return None;
+            }
+        }
+        if let Err(e) = model
+            .verify_window_settle(0)
+            .and_then(|()| model.verify_window_prepare(pos, ids))
+        {
+            give_up(model, graphs, format!("return before the capture: {e}"));
             return None;
         }
+        let _ = stream.synchronize();
     }
-    if let Err(e) = model
-        .verify_window_settle(0)
-        .and_then(|()| model.verify_window_prepare(pos, ids))
-    {
-        give_up(model, graphs, format!("return before the capture: {e}"));
-        return None;
-    }
-    let _ = stream.synchronize();
     let g = match VerifyGraph::capture(model, rows) {
         Ok(g) => g,
         Err(e) => {
@@ -692,6 +696,7 @@ pub(super) fn verify_recorded(
         );
     }
     graphs.by_rows.insert(rows, (g, logits.clone()));
+    model.mark_graph_proven(rows);
     Some((logits, Some(replay_secs)))
 }
 

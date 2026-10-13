@@ -759,6 +759,19 @@ impl GenericHeteroTransformer {
     /// observes a stale captured graph (e.g. F-dtype kv_cache outgrew
     /// the captured mask cap) so subsequent decode steps don't crash on
     /// orphaned device pointers.
+    /// Whether the recording `what` (0 the decode step, `r` the verify of `r` rows) passed
+    /// every check once with this model.
+    pub fn graph_proven(&self, what: usize) -> bool {
+        what < 64 && self.graph_proven & (1u64 << what) != 0
+    }
+
+    /// The recording `what` passed every check.
+    pub fn mark_graph_proven(&mut self, what: usize) {
+        if what < 64 {
+            self.graph_proven |= 1u64 << what;
+        }
+    }
+
     pub fn invalidate_graph_state(&mut self) {
         for l in &mut self.layers {
             l.padded_mask = None;

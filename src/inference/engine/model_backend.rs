@@ -458,6 +458,15 @@ pub(crate) trait ModelBackend: Send {
         0
     }
 
+    /// Whether the recording `what` (0 the decode step, `r` the verify of `r` rows) passed
+    /// every check once with this model; `false` for a model that keeps no such record.
+    fn graph_proven(&self, _what: usize) -> bool {
+        false
+    }
+
+    /// The recording `what` passed every check.
+    fn mark_graph_proven(&mut self, _what: usize) {}
+
     /// Ready the buffers of a recorded verify of `ids` at `pos`.
     fn verify_window_prepare(&mut self, _pos: usize, _ids: &[u32]) -> crate::tensor::Result<()> {
         crate::tensor::bail!("recorded verifies are not supported for this variant")
@@ -1750,6 +1759,14 @@ impl ModelBackend for GenericBackend {
     #[cfg(feature = "cuda")]
     fn verify_window_rows(&self) -> usize {
         self.0.verify_window_rows()
+    }
+
+    fn graph_proven(&self, what: usize) -> bool {
+        self.0.graph_proven(what)
+    }
+
+    fn mark_graph_proven(&mut self, what: usize) {
+        self.0.mark_graph_proven(what)
     }
 
     #[cfg(feature = "cuda")]

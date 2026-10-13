@@ -510,6 +510,10 @@ pub struct GenericHeteroTransformer {
     /// crashes with ILLEGAL_ADDRESS on first replay. Cleared by
     /// invalidate_graph_state.
     pub graph_alive_tensors_model: Vec<Tensor>,
+    /// The recordings that passed every check once with this model: bit 0 the decode step,
+    /// bit `r` the verify of `r` rows. A later recording of one of them keeps the check of its
+    /// replay and drops the others.
+    pub(crate) graph_proven: u64,
     /// Cached layer-consolidation groups for `update_graph_state`. Derived
     /// once from immutable layer config - no need to rebuild HashMaps
     /// every token. Indexed by layer; value = leader layer index for
