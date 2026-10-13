@@ -35,6 +35,15 @@ impl QMatMul {
         }
     }
 
+    /// The first `n` rows of a quantised weight on a card, as a view of the same blocks: no
+    /// copy, no memory. `None` for a weight held otherwise.
+    pub fn row_prefix(&self, n: usize) -> Result<Option<Self>> {
+        match self {
+            Self::QTensor(q) => Ok(q.row_prefix(n)?.map(|t| Self::QTensor(Arc::new(t)))),
+            _ => Ok(None),
+        }
+    }
+
     /// Where the weight lives.
     ///
     /// A caller attaching something alongside a projection - an adapter delta - has

@@ -727,6 +727,7 @@ impl LlmEngine {
                     && state.model.draft_head_capture(true);
                 if head_capable {
                     state.model.draft_head_reset();
+                    state.model.draft_head_vocab(&prompt_tokens);
                 } else {
                     state.model.draft_head_capture(false);
                 }

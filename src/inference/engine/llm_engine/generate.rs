@@ -382,6 +382,7 @@ impl LlmEngine {
             let head_capable = config.recorded_drafts && state.model.draft_head_capture(true);
             if head_capable {
                 state.model.draft_head_reset();
+                state.model.draft_head_vocab(&prompt_tokens);
             }
             let prefill_start = std::time::Instant::now();
             // Prefill only the divergent suffix when the global cache reused a

@@ -85,6 +85,42 @@ impl QTensor {
         }
     }
 
+    /// The first `n` rows of this 2-D weight on a card, sharing its blocks on the host and on
+    /// the card: rows are whole blocks, laid out one after the other. `None` off a card or
+    /// for a shape that is not rows of blocks.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn row_prefix(&self, n: usize) -> Result<Option<Self>> {
+        let dims = self.shape.dims();
+        let QStorage::Cuda(card) = &self.storage else {
+            return Ok(None);
+        };
+        if dims.len() != 2 || n == 0 || n > dims[0] {
+            return Ok(None);
+        }
+        let row_bytes = self.inner.data().len() / dims[0];
+        let len = n * row_bytes;
+        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(self.inner.clone());
+        let view = unsafe {
+            QHostTensor::view(
+                owner,
+                self.inner.data().as_ptr(),
+                0,
+                len,
+                self.dtype(),
+                vec![n, dims[1]],
+            )
+        }
+        .map_err(|e| Error::msg(e.0))?;
+        let storage = QCudaStorage::sharing(card.blob.clone(), len, self.dtype(), card.device());
+        Ok(Some(Self::over_card(Arc::new(view), &self.device, storage)))
+    }
+
+    /// [`Self::row_prefix`] on a build with no cards.
+    #[cfg(not(feature = "cuda"))]
+    pub(crate) fn row_prefix(&self, _n: usize) -> Result<Option<Self>> {
+        Ok(None)
+    }
+
     /// What identifies these weights. Stable across `to_device` - the same weights on another
     /// card are the same weights - and never reused, so a cache keyed by it cannot answer a
     /// new tensor with a dropped one's entry.

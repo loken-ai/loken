@@ -2389,6 +2389,7 @@ impl GenericHeteroTransformer {
             carried: None,
             fit: (0, 0),
             indexer_mark: None,
+            vocab: None,
             #[cfg(feature = "cuda")]
             step: None,
         })
@@ -3461,6 +3462,27 @@ impl GenericHeteroTransformer {
             }
         }
 
+        // The output projection's share of the bytes a decoded token reads: every tensor but
+        // the row-gathered embedding tables, the routed experts in the share a token routes to.
+        let head_share = {
+            let (mut head, mut dense, mut experts) = (0u64, 0u64, 0u64);
+            for (name, info) in content.tensor_infos.iter() {
+                let bytes = info.size_in_bytes() as u64;
+                if name == output_weight_name {
+                    head = bytes;
+                }
+                if name.contains("_exps") {
+                    experts += bytes;
+                } else if !name.contains("embd") {
+                    dense += bytes;
+                }
+            }
+            let routed = match config.flags.n_experts {
+                0 => 0.0,
+                n => experts as f64 * config.flags.n_experts_used as f64 / n as f64,
+            };
+            (head as f64 / (dense as f64 + routed).max(1.0)) as f32
+        };
         // Pre-allocate graph_logits_buffer at model load. CRITICAL for the
         // split-path graph mode (phi2/moondream) and a small safety win
         // for working arches: this alloc happens BEFORE the first
@@ -3661,6 +3683,7 @@ impl GenericHeteroTransformer {
             output_proj_cuda,
             output_norm_cuda_weight,
             output_proj_cuda_qmm,
+            head_share,
             output_proj_dev,
             cuda_devices: retained,
             sliding_window,
@@ -4012,6 +4035,7 @@ impl GenericHeteroTransformer {
             output_proj_cuda,
             output_norm_cuda_weight,
             output_proj_cuda_qmm: None,
+            head_share: 0.0,
             output_proj_dev,
             cuda_devices: cuda_devices.clone(),
             sliding_window,

@@ -1294,6 +1294,7 @@ fn toy_with_head() -> GenericHeteroTransformer {
         carried: None,
         fit: (0, 0),
         indexer_mark: None,
+        vocab: None,
         #[cfg(feature = "cuda")]
         step: None,
     });

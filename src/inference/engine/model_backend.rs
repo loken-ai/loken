@@ -441,6 +441,9 @@ pub(crate) trait ModelBackend: Send {
     /// The draft head's history starts over.
     fn draft_head_reset(&mut self) {}
 
+    /// The draft head's vocabulary chosen for a request whose prompt is `prompt`.
+    fn draft_head_vocab(&mut self, _prompt: &[u32]) {}
+
     /// The expert caches' mailboxes as they stand, for a wait on the card that lasts.
     fn tier_mailboxes(&self) -> Vec<String> {
         Vec::new()
@@ -1728,6 +1731,12 @@ impl ModelBackend for GenericBackend {
 
     fn draft_head_reset(&mut self) {
         self.0.draft_reset();
+    }
+
+    fn draft_head_vocab(&mut self, prompt: &[u32]) {
+        if let Err(e) = self.0.draft_vocab_for(prompt) {
+            tracing::warn!("the draft head keeps its whole vocabulary: {e}");
+        }
     }
 
     fn tier_mailboxes(&self) -> Vec<String> {

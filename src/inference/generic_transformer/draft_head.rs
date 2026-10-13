@@ -35,6 +35,10 @@ pub(super) struct DraftHead {
     /// The layer's indexer as it stood with `committed` pairs read: what a cut back to that
     /// length returns it to.
     pub(super) indexer_mark: Option<(usize, super::qsa::IndexerCache)>,
+    /// The vocabulary the head guesses in: the first rows of the output projection, which the
+    /// tokenizer numbers in order of frequency, as a view of the card's projection; `None` for
+    /// the whole of it.
+    pub(super) vocab: Option<(usize, crate::tensor::quantized::QMatMul)>,
     /// The head's guesses as the kernels of a recorded step.
     #[cfg(feature = "cuda")]
     pub(super) step: Option<DraftStep>,
@@ -71,8 +75,9 @@ pub(super) struct DraftStep {
     head: Option<HeldGraph>,
     /// The layer over the named token and the row at row `j` of the round, then the head.
     steps: Vec<Option<HeldGraph>>,
-    /// The buffers the graphs were recorded against: the cache's keys and the indexer's births.
-    key: Option<(crate::tensor::ops::traits::TensorId, u64)>,
+    /// The buffers the graphs were recorded against: the cache's keys, the indexer's births and
+    /// the rows of the vocabulary guessed in.
+    key: Option<(crate::tensor::ops::traits::TensorId, u64, usize)>,
     /// Replays that failed since the load.
     failures: u32,
     /// Microseconds a guess's phases took (the preparation, the pairs, the head, the read,
@@ -102,6 +107,35 @@ pub fn set_probe_dir(dir: Option<String>) {
 /// The directory the probes write to, if the configuration names one.
 pub(super) fn probe_dir() -> Option<&'static str> {
     PROBE_DIR.get().and_then(|d| d.as_deref())
+}
+
+/// The rows `n` of a vocabulary of `rows` the head guesses in for a prompt of `tokens`: the
+/// least of `n / rows * share + (tokens at or past n) / tokens`, over the cuts that keep a
+/// prompt token in.
+fn vocab_cut(tokens: &[u32], rows: usize, share: f32) -> usize {
+    if tokens.is_empty() || share <= 0.0 {
+        return rows;
+    }
+    let mut ids: Vec<usize> = tokens
+        .iter()
+        .map(|&t| t as usize)
+        .filter(|&t| t < rows)
+        .collect();
+    ids.sort_unstable();
+    let total = tokens.len() as f64;
+    let mut best = (f64::from(share), rows);
+    for (i, &id) in ids.iter().enumerate() {
+        if i + 1 < ids.len() && ids[i + 1] == id {
+            continue;
+        }
+        let n = id + 1;
+        let past = (ids.len() - i - 1) as f64 + (tokens.len() - ids.len()) as f64;
+        let cost = n as f64 / rows as f64 * f64::from(share) + past / total;
+        if cost < best.0 {
+            best = (cost, n);
+        }
+    }
+    best.1
 }
 
 pub(super) fn dump_rows(dir: &str, name: &str, t: &Tensor) {
@@ -357,10 +391,46 @@ impl GenericHeteroTransformer {
         let rows = wide.to_device(&draft.mixer.device())?;
         let (normed, _) = draft.mixer.mix(&rows)?;
         let normed = normed.reshape((b * n, draft.dim))?;
-        match (&self.output_proj_cuda_qmm, &self.output_proj_dev) {
+        let proj = draft
+            .vocab
+            .as_ref()
+            .map(|(_, q)| q)
+            .or(self.output_proj_cuda_qmm.as_ref());
+        match (proj, &self.output_proj_dev) {
             (Some(proj), Some(dev)) => proj.forward(&normed.to_device(dev)?),
             _ => self.output_proj.forward(&normed.to_device(&Device::Cpu)?),
         }
+    }
+
+    /// The head guesses in the first `n` tokens of the vocabulary, `n` chosen for the prompt:
+    /// it minimises the share of the projection read, weighted by what the projection costs a
+    /// token, plus the share of the prompt's tokens past `n`, which the head could not guess.
+    pub fn draft_vocab_for(&mut self, prompt: &[u32]) -> Result<()> {
+        let rows = match &self.output_proj_cuda_qmm {
+            Some(crate::tensor::quantized::QMatMul::QTensor(q)) => q.shape().dims()[0],
+            _ => return Ok(()),
+        };
+        let n = vocab_cut(prompt, rows, self.head_share);
+        tracing::info!(
+            "the draft head guesses in the first {n} of {rows} tokens (the projection {:.1} percent of a token's reads)",
+            100.0 * self.head_share
+        );
+        let vocab = if n >= rows {
+            None
+        } else {
+            match self
+                .output_proj_cuda_qmm
+                .as_ref()
+                .and_then(|q| q.row_prefix(n).transpose())
+            {
+                Some(q) => Some((n, q?)),
+                None => None,
+            }
+        };
+        if let Some(d) = self.draft.as_mut() {
+            d.vocab = vocab;
+        }
+        Ok(())
     }
 
     /// Read a prompt chunk `ids` that starts at `index_pos`, whose last-layer rows are `hidden`
@@ -686,11 +756,13 @@ impl GenericHeteroTransformer {
             .k_buffer()
             .ok_or_else(|| crate::tensor::Error::msg("the head's cache holds no token"))?
             .id();
-        if step.key != Some((keys, births)) {
+        let rows_guessed = d.vocab.as_ref().map_or(0, |(n, _)| *n);
+        let step = d.step.as_mut().expect("made above");
+        if step.key != Some((keys, births, rows_guessed)) {
             step.pairs.clear();
             step.head = None;
             step.steps.iter_mut().for_each(|g| *g = None);
-            step.key = Some((keys, births));
+            step.key = Some((keys, births, rows_guessed));
         }
         Ok(true)
     }
@@ -761,7 +833,15 @@ impl GenericHeteroTransformer {
         let xn = d.mixer.normed_on_card(&hidden)?;
         let (mixed, _) = d.mixer.mix_on_card(&xn, false)?;
         let normed = mixed.reshape((1, d.dim))?;
-        let logits = match (&self.output_proj_cuda_qmm, &self.output_proj_cuda) {
+        let prefix = self
+            .draft
+            .as_ref()
+            .and_then(|d| d.vocab.as_ref())
+            .map(|(_, q)| q.clone());
+        let logits = match (
+            prefix.as_ref().or(self.output_proj_cuda_qmm.as_ref()),
+            &self.output_proj_cuda,
+        ) {
             (Some(qmm), _) => qmm.forward(&normed)?,
             (None, Some(proj)) => normed.to_dtype(DType::F16)?.matmul_t(proj)?,
             (None, None) => crate::tensor::bail!("a recorded guess needs the card's head"),
@@ -1220,5 +1300,27 @@ impl GenericHeteroTransformer {
             }
         }
         Ok(Some(out))
+    }
+}
+
+#[cfg(test)]
+mod vocab_tests {
+    use super::vocab_cut;
+
+    /// The cut keeps the prompt's tokens when they are worth the rows they cost, drops a rare
+    /// one far down the vocabulary, and keeps everything when the projection costs nothing.
+    #[test]
+    fn the_cut_weighs_rows_against_the_tokens_past_it() {
+        let rows = 1000;
+        let mut prompt: Vec<u32> = (0..200).map(|i| (i * 7 % 300) as u32).collect();
+        assert_eq!(vocab_cut(&prompt, rows, 0.1), 298);
+        prompt.push(900);
+        assert_eq!(
+            vocab_cut(&prompt, rows, 0.1),
+            298,
+            "one token past is cheaper than 600 rows"
+        );
+        assert_eq!(vocab_cut(&prompt, rows, 0.0), rows);
+        assert_eq!(vocab_cut(&[], rows, 0.1), rows);
     }
 }

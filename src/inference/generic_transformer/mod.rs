@@ -469,6 +469,9 @@ pub struct GenericHeteroTransformer {
     /// skip the F16 cutlass gemm (1.45 ms/tok on qwen3) in favor of the
     /// same `mul_mat_vec_q*_K_q8_1` kernel used by per-layer matmuls.
     output_proj_cuda_qmm: Option<crate::tensor::quantized::QMatMul>,
+    /// The output projection's share of the bytes a decoded token reads: what reading only a
+    /// prefix of its rows saves, against what the tokens past the prefix cost.
+    head_share: f32,
     /// Device the CUDA output projection actually lives on. May differ from the
     /// last layer's GPU: when that GPU is full (e.g. a 24B model + KV leaves no
     /// room for a 131072-vocab lm_head), the projection is placed on another idle
