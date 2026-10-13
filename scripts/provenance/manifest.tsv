@@ -30,6 +30,7 @@ cuda/mmq_gguf/mmq_instance_q3_k.cu	0.0%	0	-
 cuda/mmq_gguf/mmq_instance_q4_0.cu	0.0%	0	-
 cuda/mmq_gguf/mmq_instance_q4_1.cu	0.0%	0	-
 cuda/mmq_gguf/mmq_instance_q4_k.cu	0.0%	0	-
+cuda/mmq_gguf/mmq_instance_q2_0.cu	0.0%	0	-
 cuda/mmq_gguf/mmq_instance_q5_0.cu	0.0%	0	-
 cuda/mmq_gguf/mmq_instance_q5_1.cu	0.0%	0	-
 cuda/mmq_gguf/mmq_instance_q5_k.cu	0.0%	0	-
@@ -56,6 +57,7 @@ cuda/moe/qk_prep.cu	0.0%	0	-
 cuda/moe/shared_expert.cu	0.0%	0	-
 cuda/moe/hyper_residual.cu	0.0%	0	-
 cuda/moe/indexer.cu	0.0%	0	-
+cuda/moe/tier_graph.cu	0.0%	0	-
 cuda/moe/iq_tables.cuh	0.0%	0	-
 cuda/moe/kv_residual_scatter.cu	0.0%	0	attention.rs/src/kernels/src/dsa_lightning_indexer.cu
 cuda/moe/l2norm_gqa.cu	0.0%	0	-
