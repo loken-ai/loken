@@ -65,6 +65,11 @@ enum Commands {
 #[allow(clippy::vec_init_then_push)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Refuse a CPU below the build's baseline before any other code runs.
+    if let Err(why) = loken::cpu::check_baseline() {
+        eprintln!("error: {why}");
+        std::process::exit(1);
+    }
     // Keep freed large scratch buffers resident in the malloc arena instead of
     // munmap'ing them back to the OS. CPU prefill re-allocates big per-layer
     // activation/output buffers (e.g. a 2B model's ~16 MB gate/up output) every

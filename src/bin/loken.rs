@@ -339,6 +339,11 @@ async fn follow(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Refuse a CPU below the build's baseline before any other code runs.
+    if let Err(why) = loken::cpu::check_baseline() {
+        eprintln!("error: {why}");
+        std::process::exit(1);
+    }
     let cli = Cli::parse();
 
     // Initialize tracing

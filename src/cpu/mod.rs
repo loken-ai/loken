@@ -7,7 +7,7 @@ pub mod level;
 pub mod topology;
 
 pub use level::{
-    cpu_level, dispatch_avx2, dispatch_avx512, hardware_has_avx2,
+    check_baseline, cpu_level, dispatch_avx2, dispatch_avx512, hardware_has_avx2,
     hardware_has_avx512, hardware_level, set_level_cap, supported_levels, CpuLevel,
 };
 pub use topology::{

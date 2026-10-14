@@ -4,10 +4,11 @@
 # `jobs` is deliberately unset: cargo defaults to the number of cores present, which is the
 # right answer on a machine we know nothing about.
 
-# `-C target-cpu=native` lets the quantized matmul use whatever SIMD this machine has, which is
-# what you want when you build the engine where it will run - and wrong the moment you copy the
-# binary elsewhere, because the AVX-512 path it enables faults on a host without it. Drop it for
-# a portable build.
+# The baseline is x86-64-v3 (AVX2, FMA, BMI1/2, F16C, LZCNT, MOVBE), not the build host. A CPU
+# without them is refused at start. AVX-512 is not part of the baseline: each AVX-512 kernel is a
+# `#[target_feature]` function chosen at run time by `cpu::cpu_level()`. Build with
+# `RUSTFLAGS="-C target-cpu=native"` to let LLVM use the build host's whole instruction set outside
+# the kernels; that binary does not run on other hosts.
 #
 # mold is deliberately NOT forced. Under the release profile's thin LTO the linker, not the
 # compiler, is the bottleneck of a rebuild, so mold is worth installing and changes nothing about
@@ -17,10 +18,10 @@
 #   RUSTFLAGS="-C link-arg=-fuse-ld=mold" cargo build --release
 
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
 
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
 
 [env]
 # NVCC_CCBIN: set via environment or setup_env.bat on Windows (not here,

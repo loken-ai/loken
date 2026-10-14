@@ -8,6 +8,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 - CPU: the SIMD level is chosen at start and capped by the cpu level setting.
 
+### Changed
+
+- CPU: the build targets x86-64-v3 and refuses an older CPU with a message.
+
 ## [0.2.1] - 2026-10-05
 
 ### Fixed

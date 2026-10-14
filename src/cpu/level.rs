@@ -2,7 +2,8 @@
 //!
 //! The level is detected once at first use and every kernel dispatches on it. `[cpu] level` in
 //! the configuration caps it below what the hardware offers, so each path can be exercised on a
-//! machine that has more.
+//! machine that has more. A host below the build's baseline is refused at start by
+//! [`check_baseline`].
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
@@ -37,6 +38,33 @@ impl CpuLevel {
             _ => None,
         }
     }
+}
+
+/// Fails with a message naming the missing features when the CPU lacks what the build was
+/// compiled for (x86-64-v3). Called first thing in each binary.
+pub fn check_baseline() -> Result<(), String> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let missing: Vec<&str> = [
+            ("avx2", is_x86_feature_detected!("avx2")),
+            ("fma", is_x86_feature_detected!("fma")),
+            ("f16c", is_x86_feature_detected!("f16c")),
+            ("bmi1", is_x86_feature_detected!("bmi1")),
+            ("bmi2", is_x86_feature_detected!("bmi2")),
+            ("lzcnt", is_x86_feature_detected!("lzcnt")),
+            ("movbe", is_x86_feature_detected!("movbe")),
+        ]
+        .into_iter()
+        .filter_map(|(name, present)| (!present).then_some(name))
+        .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "this build needs an x86-64-v3 CPU; this one lacks {}",
+                missing.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Highest level the running CPU supports, ignoring any override.
@@ -140,6 +168,14 @@ pub fn supported_levels() -> Vec<CpuLevel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host that built and runs this test has the baseline it was compiled for, and the check
+    /// agrees with the level detection: AVX2 present means the level is not `generic`.
+    #[test]
+    fn this_host_meets_the_baseline_it_was_built_for() {
+        assert_eq!(check_baseline(), Ok(()));
+        assert!(hardware_level() >= CpuLevel::Avx2);
+    }
 
     #[test]
     fn parse_accepts_every_name_and_rejects_the_rest() {
