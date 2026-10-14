@@ -14,7 +14,7 @@
 // q4_K's statement of it rather than restated here.
 use super::repack_q4k::sub_scales_and_mins_bytes;
 use super::{BlockQ5K, BlockQ8K, QK_K};
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 use half::f16;
 
@@ -125,8 +125,8 @@ pub fn gemv_group_scalar(b: &[BlockQ5Kx8], a: &[BlockQ8K], nb: usize, out: &mut 
 /// weights decode once and meet every row of the tile - the reuse that makes
 /// prefill compute-bound. Integer accumulation is exact, so this matches the
 /// scalar oracle within the float reduction tolerance. `mt <= 8`.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemm_group_avx2(b: &[BlockQ5Kx8], acts: &[&[BlockQ8K]], nb: usize, out: &mut [f32]) {
     let mt = acts.len();
     let m4 = _mm256_set1_epi8(0x0F);
@@ -174,8 +174,8 @@ pub unsafe fn gemm_group_avx2(b: &[BlockQ5Kx8], acts: &[&[BlockQ8K]], nb: usize,
             for (c, svc) in sv.iter_mut().enumerate() {
                 *svc = _mm256_set1_epi16(sm[c] as i16);
             }
-            let dj = blk.d[j].to_f32();
-            let dminj = blk.dmin[j].to_f32();
+            let dj = crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[j]);
+            let dminj = crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[j]);
             // Min contribution per column depends only on the weight (the
             // mins) and the row's bsums; build the per-column mins vector.
             let minv = _mm256_setr_epi16(
@@ -226,7 +226,7 @@ pub unsafe fn gemm_group_avx2(b: &[BlockQ5Kx8], acts: &[&[BlockQ8K]], nb: usize,
 }
 
 /// Reduce an 8-lane i32 register to a scalar sum.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn hsum_i32(v: __m256i) -> i32 {
     let lo = _mm256_castsi256_si128(v);

@@ -10,7 +10,7 @@
 )]
 
 use super::{BlockQ6K, BlockQ8K, QK_K};
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 use half::f16;
 
@@ -118,7 +118,7 @@ pub fn gemv_group_scalar(b: &[BlockQ6Kx8], a: &[BlockQ8K], nb: usize, out: &mut 
 }
 
 /// Reduce an 8-lane i32 register to a scalar sum.
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn hsum_i32_8(v: __m256i) -> i32 {
     let lo = _mm256_castsi256_si128(v);
@@ -136,8 +136,8 @@ unsafe fn hsum_i32_8(v: __m256i) -> i32 {
 /// row - the reuse that makes prefill compute-bound. Writes
 /// `out[r*8 .. r*8+8]` for r in 0..mt. Integer accumulation is exact, so
 /// this matches the scalar oracle within the float reduction tolerance.
-#[cfg(target_feature = "avx2")]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemm_group_avx2(b: &[BlockQ6Kx8], acts: &[&[BlockQ8K]], nb: usize, out: &mut [f32]) {
     let mt = acts.len();
     let m4 = _mm256_set1_epi8(0xF);
@@ -188,7 +188,7 @@ pub unsafe fn gemm_group_avx2(b: &[BlockQ6Kx8], acts: &[&[BlockQ8K]], nb: usize,
             }
             // The 16 signed scales, natural order, for the zero-point term.
             let scales16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(scp as *const __m128i));
-            let dj = blk.d[j].to_f32();
+            let dj = crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[j]);
             for (r, act) in acts.iter().enumerate().take(mt) {
                 let a = &act[l];
                 let q8 = a.qs.as_ptr();

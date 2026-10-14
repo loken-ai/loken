@@ -162,9 +162,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ollama_models_dir: None,
                         huggingface_models_dir: None,
                         energy: None,
+                        cpu: None,
                     }
                 }
             };
+
+            // The kernels dispatch on this, and weights are repacked for it at load.
+            config.apply_cpu_level();
+            info!(
+                "CPU kernels: {} (hardware: {}; SIMD: {})",
+                loken::cpu::cpu_level().name(),
+                loken::cpu::hardware_level().name(),
+                loken::cpu::simd_capabilities().join(" ")
+            );
 
             // Before anything else can touch rayon. Whoever builds the global pool first wins,
             // and until now that was never this call: it sat at the top of the first model

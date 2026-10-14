@@ -63,51 +63,12 @@ impl BlockFormat for BlockIq2S {
 
     /// Runs of thirty-two weights carry two scales, one for each half: each half is its own integer
     /// dot against the activation's codes.
-    #[allow(unreachable_code)]
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        #[cfg(target_feature = "avx2")]
-        return unsafe {
-            use std::arch::x86_64::*;
-            let mut total = _mm256_setzero_ps();
-            for (x, y) in xs.iter().zip(ys) {
-                let signs_all = &x.qs[QK_K / 8..];
-                let d = x.d.to_f32();
-                let mut block = _mm256_setzero_ps();
-                for ib in 0..QK_K / 32 {
-                    // Code `l` is its byte with bits `2l` and `2l + 1` of the run's high byte above it.
-                    let low = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(i32::from_le_bytes(
-                        x.qs[4 * ib..4 * ib + 4].try_into().unwrap(),
-                    )));
-                    let high = _mm_slli_epi32(
-                        _mm_and_si128(
-                            _mm_srlv_epi32(
-                                _mm_set1_epi32(x.qh[ib] as i32),
-                                _mm_setr_epi32(0, 2, 4, 6),
-                            ),
-                            _mm_set1_epi32(3),
-                        ),
-                        8,
-                    );
-                    let mags = _mm256_i32gather_epi64(
-                        IQ2S_GRID.as_ptr() as *const i64,
-                        _mm_or_si128(low, high),
-                        8,
-                    );
-                    let signs =
-                        u32::from_le_bytes(signs_all[4 * ib..4 * ib + 4].try_into().unwrap());
-                    let sums = super::iq_read::grid_run_sums(mags, signs, &y.qs[32 * ib..]);
-                    // Two scales: the first sixteen values' lanes under one, the rest under the other.
-                    let (lo, hi) = (x.scales[ib] & 0x0F, x.scales[ib] >> 4);
-                    let scale = _mm256_set_m128(
-                        _mm_set1_ps(d * (0.5 + hi as f32) * 0.25),
-                        _mm_set1_ps(d * (0.5 + lo as f32) * 0.25),
-                    );
-                    block = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sums), scale, block);
-                }
-                total = _mm256_fmadd_ps(block, _mm256_set1_ps(y.d), total);
-            }
-            super::iq_read::sum_ps(total)
-        };
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_avx2` enables.
+            return unsafe { dot_avx2(xs, ys) };
+        }
         xs.iter()
             .zip(ys)
             .map(|(x, y)| {
@@ -148,5 +109,48 @@ impl BlockFormat for BlockIq2S {
 
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
         super::iq_read::dot_by_decoding(xs, ys)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn dot_avx2(xs: &[BlockIq2S], ys: &[<BlockIq2S as BlockFormat>::ActivationBlock]) -> f32 {
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut total = _mm256_setzero_ps();
+        for (x, y) in xs.iter().zip(ys) {
+            let signs_all = &x.qs[QK_K / 8..];
+            let d = crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
+            let mut block = _mm256_setzero_ps();
+            for ib in 0..QK_K / 32 {
+                // Code `l` is its byte with bits `2l` and `2l + 1` of the run's high byte above it.
+                let low = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(i32::from_le_bytes(
+                    x.qs[4 * ib..4 * ib + 4].try_into().unwrap(),
+                )));
+                let high = _mm_slli_epi32(
+                    _mm_and_si128(
+                        _mm_srlv_epi32(_mm_set1_epi32(x.qh[ib] as i32), _mm_setr_epi32(0, 2, 4, 6)),
+                        _mm_set1_epi32(3),
+                    ),
+                    8,
+                );
+                let mags = _mm256_i32gather_epi64(
+                    IQ2S_GRID.as_ptr() as *const i64,
+                    _mm_or_si128(low, high),
+                    8,
+                );
+                let signs = u32::from_le_bytes(signs_all[4 * ib..4 * ib + 4].try_into().unwrap());
+                let sums = super::iq_read::grid_run_sums(mags, signs, &y.qs[32 * ib..]);
+                // Two scales: the first sixteen values' lanes under one, the rest under the other.
+                let (lo, hi) = (x.scales[ib] & 0x0F, x.scales[ib] >> 4);
+                let scale = _mm256_set_m128(
+                    _mm_set1_ps(d * (0.5 + hi as f32) * 0.25),
+                    _mm_set1_ps(d * (0.5 + lo as f32) * 0.25),
+                );
+                block = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sums), scale, block);
+            }
+            total = _mm256_fmadd_ps(block, _mm256_set1_ps(y.d), total);
+        }
+        super::iq_read::sum_ps(total)
     }
 }

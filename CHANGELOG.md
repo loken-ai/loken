@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+
+- CPU: the SIMD level is chosen at start and capped by the cpu level setting.
+
 ## [0.2.1] - 2026-10-05
 
 ### Fixed

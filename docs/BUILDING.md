@@ -28,8 +28,8 @@ endpoint. The feature table is in [`CONFIGURATION.md`](CONFIGURATION.md#build-fe
 
 `.cargo/config.toml` builds for the host CPU so the quantized kernels use whatever SIMD it has.
 That binary is not portable: drop `target-cpu=native` when building for another machine. The
-host path needs AVX2 either way: a build for a CPU without it compiles, and refuses the
-quantized matmuls at run time.
+quantized kernels are chosen at start from what the CPU has, and the daemon logs the level.
+`[cpu] level` in `config.toml` caps it, and `generic` selects the scalar reference code.
 
 A CUDA build serves without a card too: `lokend serve --cpu` places every layer on the host.
 

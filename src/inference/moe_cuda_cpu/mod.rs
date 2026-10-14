@@ -105,7 +105,7 @@ pub fn clear_expert_cache() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     {
         repack_q4k_cache()
             .lock()
@@ -127,9 +127,9 @@ pub fn clear_expert_cache() {
 // of the parent, so the parent can be dropped and its address handed to the next allocation  -
 // which would then be answered with the previous tensor's repack, silently. The identity only
 // counts up, so a stale entry is a leak until `clear_expert_cache`, never a wrong answer.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 type Q4Kx8 = crate::tensor::quant_cpu::repack_q4k::BlockQ4Kx8;
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 type Q6Kx8 = crate::tensor::quant_cpu::repack_q6k::BlockQ6Kx8;
 
 // One entry per stack, and the entry owns the build. The table's lock guards only the table,
@@ -139,22 +139,22 @@ type Q6Kx8 = crate::tensor::quant_cpu::repack_q6k::BlockQ6Kx8;
 // handed the same result, instead of repacking the stack a second time beside it. The two
 // locks are only ever taken in this order and the build takes no other lock, so there is no
 // cycle to deadlock on.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 type RepackCell<T> = Arc<Mutex<Option<Arc<Vec<T>>>>>;
 
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn repack_q4k_cache() -> &'static Mutex<HashMap<u64, RepackCell<Q4Kx8>>> {
     static C: OnceLock<Mutex<HashMap<u64, RepackCell<Q4Kx8>>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn repack_q6k_cache() -> &'static Mutex<HashMap<u64, RepackCell<Q6Kx8>>> {
     static C: OnceLock<Mutex<HashMap<u64, RepackCell<Q6Kx8>>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Get-or-build the repacked `[E][N/8][bpr]` Q4_K stack for `weights`.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn repacked_q4k(
     weights: &Arc<QTensor>,
     e_count: usize,
@@ -202,7 +202,7 @@ fn repacked_q4k(
 }
 
 /// Get-or-build the repacked `[E][hidden/8][bpr]` Q6_K stack for `weights`.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn repacked_q6k(
     weights: &Arc<QTensor>,
     e_count: usize,
@@ -277,8 +277,8 @@ pub fn read_in_place(weights: &Arc<QTensor>) {
 /// A stack whose shape or format the host path has no repack for is silently nothing to do:
 /// the caller warms every stack it has and does not need to know which ones qualify.
 pub fn prewarm_expert_repack(weights: &Arc<QTensor>) -> Result<()> {
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-    {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
         let dims = weights.shape().dims();
         // [experts, rows, k] - the shape every repack call site reads, and the two
         // divisibilities the repacked layout needs.
@@ -296,7 +296,7 @@ pub fn prewarm_expert_repack(weights: &Arc<QTensor>) -> Result<()> {
             _ => {}
         }
     }
-    #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
+    #[cfg(not(target_arch = "x86_64"))]
     let _ = weights;
     Ok(())
 }
@@ -451,8 +451,8 @@ fn fused_gate_up_silu_cpu(
     // across the routed-token batch) when the batch amortizes the repack (avg
     // tokens/expert >= 4). Bit-identical to the per-column path below; decode and
     // tiny batches stay per-column (the repack would not pay off).
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-    {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
         let runs = expert_runs(eid);
         if dt == GgmlDType::Q4K && !runs.is_empty() {
             if sti.len() / runs.len() >= 4 {
@@ -559,11 +559,11 @@ fn fused_gate_up_silu_t<T: crate::tensor::quant_cpu::BlockFormat>(
 }
 
 /// Send+Sync raw f32 pointer for the disjoint-shard writes in the tiled kernels.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 struct SendF32(*mut f32);
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 unsafe impl Send for SendF32 {}
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 unsafe impl Sync for SendF32 {}
 
 /// Bit-identical tiled prefill for Q4_K gate/up experts. Replaces the per-column
@@ -573,7 +573,7 @@ unsafe impl Sync for SendF32 {}
 /// the reuse the per-column loop misses. Same `xq` (activation quantized once)
 /// and the SAME silu formula, so the result is bit-identical to the per-column
 /// path - greedy tokens unchanged. `Ok(None)` when the shape cannot tile.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn fused_gate_up_silu_q4k_tiled(
     input: &Tensor,
     gate_weights: &Arc<QTensor>,
@@ -664,7 +664,7 @@ fn fused_gate_up_silu_q4k_tiled(
 /// repacked copy per stack instead of two). One SINGLE coarse-chunked pool.run over every
 /// (slot, colgroup) pair (matching the plain path's orchestration - per-expert
 /// pool.run was a measured dead end). Bit-identical to the per-column path.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn fused_gate_up_silu_q4k_gemv_v2(
     input: &Tensor,
     gate_weights: &Arc<QTensor>,
@@ -744,7 +744,7 @@ fn fused_gate_up_silu_q4k_gemv_v2(
 /// [`fused_gate_up_silu_q4k_gemv_v2`] for the FUSED gate/up stack `[E, 2N, K]`
 /// (rows 0..N = gate, N..2N = up per expert): one repacked buffer, the gate row
 /// group for output column-group `cg` is group `cg`, the up group is `N/8 + cg`.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn fused_gate_up_silu_fused_q4k_gemv_v2(
     input: &Tensor,
     gate_up_weights: &Arc<QTensor>,
@@ -838,8 +838,8 @@ fn fused_gate_up_silu_fused_cpu(
     let (n, k) = (dims[1] / 2, dims[2]);
     // Decode / few-tokens-per-expert: interleaved 8x8 GEMV on the fused stack (same ported
     // llama.cpp kernel as the separate-stack path; bit-identical to the dot below).
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-    {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
         let runs = expert_runs(eid);
         if dt == GgmlDType::Q4K && !runs.is_empty() && sti.len() / runs.len() < 4 {
             if let Some(h) =
@@ -1319,8 +1319,8 @@ fn fused_down_reduce_cpu(
     let (hidden, k) = (dims[1], dims[2]);
     // PREFILL: tiled per-expert down GEMM (see gate_up rationale). lfm2moe ships
     // both Q4_K and Q6_K `ffn_down` expert stacks across its layers, so tile both.
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-    {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
         let runs = expert_runs(eid);
         if !runs.is_empty() && sti.len() / runs.len() >= 4 {
             let tiled = match dt {
@@ -1479,7 +1479,7 @@ fn fused_down_reduce_t<T: crate::tensor::quant_cpu::BlockFormat>(
 /// accumulating `tw*dot` straight into `out` lands each token's topk contributions
 /// in ascending-slot (== per-column `slots_of`) order - bit-identical to a separate
 /// reduce, with the `dscaled` (m*hidden f32) round-trip removed. `hq` quantized once.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn fused_down_reduce_q6k_tiled(
     input: &Tensor,
     weights: &Arc<QTensor>,
@@ -1573,7 +1573,7 @@ fn fused_down_reduce_q6k_tiled(
 /// Bit-identical tiled prefill for Q4_K down experts - identical structure to
 /// `fused_down_reduce_q6k_tiled` (some lfm2moe layers ship a Q4_K `ffn_down`
 /// stack rather than Q6_K), using the Q4_K repack + tiled GEMM.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn fused_down_reduce_q4k_tiled(
     input: &Tensor,
     weights: &Arc<QTensor>,
@@ -1665,14 +1665,14 @@ fn fused_down_reduce_q4k_tiled(
 /// Parallelizes over COLGROUPS (not experts) so each worker owns a disjoint set
 /// of output columns and accumulates every expert's tw*dot into them serially -
 /// no cross-expert write race, ONE pool.run. Bit-identical to the per-column path.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 /// Decode down-projection + topk reduce for Q6K expert stacks: the ffn_down
 /// of several MoE arches ships Q6K, which previously fell to the GENERIC
 /// per-output-element path (closure dispatch per element, on rayon - fighting
 /// the gemv pool). Mirrors [`fused_down_reduce_q4k_gemv_v2`]: repacked
 /// 8-column groups on the gemv pool, with the oracle-validated
 /// `repack_q6k::gemm_group_avx2` kernel run as a single-row tile.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn fused_down_reduce_q6k_gemv(
     input: &Tensor,
     weights: &Arc<QTensor>,
@@ -1752,7 +1752,7 @@ fn fused_down_reduce_q6k_gemv(
     )?))
 }
 
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn fused_down_reduce_q4k_gemv_v2(
     input: &Tensor,
     weights: &Arc<QTensor>,
@@ -1981,5 +1981,5 @@ pub fn attn_post_qkv_decode_qf32(
     )
 }
 
-#[cfg(all(test, target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod down_reduce_bit_identity;

@@ -49,8 +49,8 @@ pub(super) fn dot_runs<B: Runs>(xs: &[B], ys: &[BlockQ8K]) -> f32 {
 /// being magnitudes (`mags`, unsigned bytes) under sign bits: byte `i` of the run is negated when bit
 /// `i % 8` of byte `i / 8` of `signs` is set. The sign goes onto the activation, which leaves the
 /// magnitudes unsigned for the byte multiply. Lanes 0 to 3 hold the first sixteen values.
-#[cfg(target_feature = "avx2")]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 pub(super) unsafe fn grid_run_sums(
     mags: std::arch::x86_64::__m256i,
     signs: u32,
@@ -79,8 +79,8 @@ pub(super) unsafe fn grid_run_sums(
 }
 
 /// Sum of the eight float lanes.
-#[cfg(target_feature = "avx2")]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 pub(super) unsafe fn sum_ps(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
     let pair = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
@@ -89,10 +89,13 @@ pub(super) unsafe fn sum_ps(v: std::arch::x86_64::__m256) -> f32 {
 }
 
 /// The dot of thirty-two codes of the non-linear table, packed as iq4_nl packs them (byte `j` holds
-/// value `j` low and value `j + 16` high), against thirty-two activation codes.
+/// value `j` low and value `j + 16` high), against thirty-two activation codes. The vector form,
+/// [`dot_iq4_run_avx2`], is called from kernels that already run with its features enabled, so the
+/// level is decided once per dot and not once per run.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 #[inline]
-pub(super) fn dot_iq4_run(packed: &[u8; 16], acts: &[i8]) -> i32 {
-    #[cfg(target_feature = "avx2")]
+pub(super) unsafe fn dot_iq4_run_avx2(packed: &[u8; 16], acts: &[i8]) -> i32 {
     unsafe {
         use std::arch::x86_64::*;
         let table = _mm_loadu_si128(super::iq4_nl::LEVELS.as_ptr() as *const __m128i);
@@ -108,18 +111,18 @@ pub(super) fn dot_iq4_run(packed: &[u8; 16], acts: &[i8]) -> i32 {
         let pairs = _mm256_maddubs_epi16(magnitude, signed);
         let sums = _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
         let lanes: [i32; 8] = std::mem::transmute(sums);
-        return lanes.iter().sum();
+        lanes.iter().sum()
     }
-    #[allow(unreachable_code)]
-    {
-        let levels = &super::iq4_nl::LEVELS;
-        (0..16)
-            .map(|j| {
-                levels[(packed[j] & 0x0F) as usize] as i32 * acts[j] as i32
-                    + levels[(packed[j] >> 4) as usize] as i32 * acts[j + 16] as i32
-            })
-            .sum()
-    }
+}
+
+pub(super) fn dot_iq4_run_scalar(packed: &[u8; 16], acts: &[i8]) -> i32 {
+    let levels = &super::iq4_nl::LEVELS;
+    (0..16)
+        .map(|j| {
+            levels[(packed[j] & 0x0F) as usize] as i32 * acts[j] as i32
+                + levels[(packed[j] >> 4) as usize] as i32 * acts[j + 16] as i32
+        })
+        .sum()
 }
 
 #[cfg(test)]

@@ -47,6 +47,9 @@ model_id = "qwen3:0.6b"
 # cpu_tdp_w = 0                     # host estimate when RAPL is unreadable, 0 = measured domains only
 # water_l_per_kwh = 1.8
 
+# [cpu]
+# level = "avx512"                  # cap for the CPU kernels: generic (scalar reference), avx2 or avx512; default: the best the CPU has
+
 # Clustering: see docs/CLUSTER.md. Absent, the node runs alone.
 # [cluster]
 # name = "home"

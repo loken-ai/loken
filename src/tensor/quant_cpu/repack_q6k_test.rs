@@ -9,13 +9,13 @@
     clippy::redundant_closure
 )]
 
-// Everything below is behind `target_feature = "avx2"`, so on a build without it
+// Everything below is behind `target_arch = "x86_64"`, so on a build without it
 // there is nothing here to name.
-#[cfg_attr(not(target_feature = "avx2"), allow(unused_imports))]
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_imports))]
 use super::*;
 
 // Feeds the AVX2 kernels below and nothing else.
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 fn prng() -> impl FnMut() -> f32 {
     let mut s = 0x0FED_CBA9_8765_4321u64;
     move || {
@@ -28,9 +28,12 @@ fn prng() -> impl FnMut() -> f32 {
 
 // The repacked Q6_K GEMV oracle must match the production per-column
 // vec_dot_q6k_q8k: same activation, same dequant, only the layout differs.
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn repacked_q6k_gemv_matches_vec_dot() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     let k = 512usize; // 2 superblocks
     let n = 16usize; // 2 column groups of 8
     let nb = k / QK_K;
@@ -72,9 +75,12 @@ fn repacked_q6k_gemv_matches_vec_dot() {
 
 // The tiled AVX2 GEMM must agree with the scalar oracle for every tile
 // height, since production picks the tile size by row count.
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn repacked_q6k_gemm_matches_scalar_oracle() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     let k = 512usize;
     let n = 16usize;
     let nb = k / QK_K;

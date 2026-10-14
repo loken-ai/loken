@@ -231,8 +231,8 @@ impl QKernelMatMul {
         // In-place repack at LOAD: CPU Q4_K weights build their unified interleaved
         // copy up front (off the first token), and every matmul reads it - the
         // canonical bytes stay for correctness paths only.
-        #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-        if matches!(qmm.device, crate::tensor::Device::Cpu) {
+        #[cfg(target_arch = "x86_64")]
+        if matches!(qmm.device, crate::tensor::Device::Cpu) && crate::cpu::dispatch_avx2() {
             let _ = qmm.q4k_x8();
         }
         Ok(qmm)
@@ -292,8 +292,8 @@ impl QKernelMatMul {
             dry: None,
         };
         // In-place repack at LOAD (see the sibling constructor).
-        #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-        if matches!(qmm.device, crate::tensor::Device::Cpu) {
+        #[cfg(target_arch = "x86_64")]
+        if matches!(qmm.device, crate::tensor::Device::Cpu) && crate::cpu::dispatch_avx2() {
             let _ = qmm.q4k_x8();
         }
         Ok(qmm)

@@ -52,13 +52,19 @@ impl BlockFormat for BlockIq4Xs {
     }
 
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_avx2` enables.
+            return unsafe { dot_avx2(xs, ys) };
+        }
         xs.iter()
             .zip(ys)
             .map(|(x, y)| {
                 let mut block = 0f32;
                 for ib in 0..QK_K / 32 {
                     let packed: &[u8; 16] = x.qs[16 * ib..16 * ib + 16].try_into().unwrap();
-                    let dot = super::iq_read::dot_iq4_run(packed, &y.qs[32 * ib..32 * ib + 32]);
+                    let dot =
+                        super::iq_read::dot_iq4_run_scalar(packed, &y.qs[32 * ib..32 * ib + 32]);
                     block += super::iq_read::Runs::run_scale(x, ib) * dot as f32;
                 }
                 block * y.d
@@ -71,11 +77,18 @@ impl BlockFormat for BlockIq4Xs {
     }
 }
 
-impl super::iq_read::Runs for BlockIq4Xs {
-    fn run_scale(&self, ib: usize) -> f32 {
+impl BlockIq4Xs {
+    /// The signed six-bit scale of run `ib`, before the block's `d`.
+    fn run_step(&self, ib: usize) -> i32 {
         let low = (self.scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F;
         let high = ((self.scales_h >> (2 * ib)) & 3) as u8;
-        self.d.to_f32() * ((low | (high << 4)) as i32 - 32) as f32
+        (low | (high << 4)) as i32 - 32
+    }
+}
+
+impl super::iq_read::Runs for BlockIq4Xs {
+    fn run_scale(&self, ib: usize) -> f32 {
+        self.d.to_f32() * self.run_step(ib) as f32
     }
 
     fn run_values(&self, ib: usize) -> [i8; 32] {
@@ -87,4 +100,23 @@ impl super::iq_read::Runs for BlockIq4Xs {
         }
         w
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn dot_avx2(xs: &[BlockIq4Xs], ys: &[<BlockIq4Xs as BlockFormat>::ActivationBlock]) -> f32 {
+    xs.iter()
+        .zip(ys)
+        .map(|(x, y)| {
+            // One conversion per block, not one per run.
+            let d = crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
+            let mut block = 0f32;
+            for ib in 0..QK_K / 32 {
+                let packed: &[u8; 16] = x.qs[16 * ib..16 * ib + 16].try_into().unwrap();
+                let dot = super::iq_read::dot_iq4_run_avx2(packed, &y.qs[32 * ib..32 * ib + 32]);
+                block += d * x.run_step(ib) as f32 * dot as f32;
+            }
+            block * y.d
+        })
+        .sum()
 }

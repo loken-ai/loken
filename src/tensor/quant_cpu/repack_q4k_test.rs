@@ -133,6 +133,9 @@ fn gemv_q4k_decode_shapes() {
 
 #[test]
 fn repacked_q4k_gemm_matches_scalar_oracle() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     let k = 512usize;
     let n = 16usize;
     let nb = k / QK_K;
@@ -161,7 +164,7 @@ fn repacked_q4k_gemm_matches_scalar_oracle() {
             for (t, a) in act_refs.iter().enumerate() {
                 repack_q4k::gemv_group_scalar(bgrp, a, nb, &mut want[t * 8..t * 8 + 8]);
             }
-            #[cfg(target_feature = "avx2")]
+            #[cfg(target_arch = "x86_64")]
             for variant in 0..2 {
                 let mut got = [0f32; 64];
                 unsafe {
@@ -188,9 +191,12 @@ fn repacked_q4k_gemm_matches_scalar_oracle() {
 // The repacked Q4_K GEMV (scalar + AVX2) must match the production
 // per-column vec_dot_q4k_q8k within k_quants tolerance (same Q8_K
 // activation, same dequant math, only the block layout differs).
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn repacked_q4k_gemv_matches_vec_dot() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     let k = 512usize; // 2 superblocks
     let n = 16usize; // 2 column groups of 8
     let nb = k / QK_K;
@@ -223,7 +229,7 @@ fn repacked_q4k_gemv_matches_vec_dot() {
     for g in 0..groups {
         let bgrp = &x8[g * nb..(g + 1) * nb];
         repack_q4k::gemv_group_scalar(bgrp, &aq, nb, &mut out_scalar[g * 8..g * 8 + 8]);
-        #[cfg(target_feature = "avx2")]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             repack_q4k::gemv_group_avx2(bgrp, &aq, nb, &mut out_avx[g * 8..g * 8 + 8]);
         }
@@ -238,7 +244,7 @@ fn repacked_q4k_gemv_matches_vec_dot() {
             "col {col}: scalar {} vs ref {r} rel {ds}",
             out_scalar[col]
         );
-        #[cfg(target_feature = "avx2")]
+        #[cfg(target_arch = "x86_64")]
         {
             let da = (r - out_avx[col]).abs() / scale;
             assert!(
@@ -253,7 +259,7 @@ fn repacked_q4k_gemv_matches_vec_dot() {
     // (reading `repack`'s layout) must be BIT-IDENTICAL to the packed v2 GEMV
     // (reading `repack_v2`'s) - same dot math, only the scale/min register
     // assembly differs, so any deviation is a lane-order bug.
-    #[cfg(target_feature = "avx2")]
+    #[cfg(target_arch = "x86_64")]
     {
         let x8_v2 = repack_q4k::repack_v2(&wq, n, nb);
         for g in 0..groups {

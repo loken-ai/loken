@@ -82,11 +82,18 @@ impl BlockFormat for BlockIq4Nl {
     }
 
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_avx2` enables.
+            return unsafe { dot_avx2(xs, ys) };
+        }
         xs.iter()
             .zip(ys)
             .map(|(x, y)| {
                 // The activation block stores value `j` and value `j + 16` as two halves.
-                super::iq_read::dot_iq4_run(&x.qs, &y.qs) as f32 * x.d.to_f32() * y.d.to_f32()
+                super::iq_read::dot_iq4_run_scalar(&x.qs, &y.qs) as f32
+                    * x.d.to_f32()
+                    * y.d.to_f32()
             })
             .sum()
     }
@@ -163,4 +170,18 @@ mod tests {
             "{want} vs {got}"
         );
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn dot_avx2(xs: &[BlockIq4Nl], ys: &[<BlockIq4Nl as BlockFormat>::ActivationBlock]) -> f32 {
+    xs.iter()
+        .zip(ys)
+        .map(|(x, y)| {
+            // The activation block stores value `j` and value `j + 16` as two halves.
+            super::iq_read::dot_iq4_run_avx2(&x.qs, &y.qs) as f32
+                * crate::tensor::quant_cpu::avx::f16c_to_f32(x.d)
+                * crate::tensor::quant_cpu::avx::f16c_to_f32(y.d)
+        })
+        .sum()
 }

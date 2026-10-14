@@ -1218,8 +1218,9 @@ impl GenericTransformerLayer {
         // Cooperative fast path: norm + gate/up + activation + down + residual in
         // ONE pool region (six pool launches + serial glue otherwise). Same math,
         // same kernels; falls through to the sequential path on any miss.
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        if self.moe.is_none()
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2()
+            && self.moe.is_none()
             && nc.post_ffn_norm_w.is_none()
             && !self.flags.use_gelu
             && self.ple_inp_gate.is_none()

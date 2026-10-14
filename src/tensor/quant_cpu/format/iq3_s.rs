@@ -72,44 +72,12 @@ impl BlockFormat for BlockIq3S {
         panic!("iq3_s is read, not written");
     }
 
-    #[allow(unreachable_code)]
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        #[cfg(target_feature = "avx2")]
-        return unsafe {
-            use std::arch::x86_64::*;
-            let mut total = _mm256_setzero_ps();
-            for (x, y) in xs.iter().zip(ys) {
-                let mut block = _mm256_setzero_ps();
-                for ib in 0..QK_K / 32 {
-                    // Code `c` of a run is its byte with bit `c` of the run's high-bit byte as the
-                    // ninth bit.
-                    let low = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
-                        x.qs[8 * ib..].as_ptr() as *const __m128i
-                    ));
-                    let high = _mm256_slli_epi32(
-                        _mm256_and_si256(
-                            _mm256_srlv_epi32(
-                                _mm256_set1_epi32(x.qh[ib] as i32),
-                                _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
-                            ),
-                            _mm256_set1_epi32(1),
-                        ),
-                        8,
-                    );
-                    let mags = _mm256_i32gather_epi32(
-                        IQ3S_GRID.as_ptr() as *const i32,
-                        _mm256_or_si256(low, high),
-                        4,
-                    );
-                    let signs = u32::from_le_bytes(x.signs[4 * ib..4 * ib + 4].try_into().unwrap());
-                    let sums = super::iq_read::grid_run_sums(mags, signs, &y.qs[32 * ib..]);
-                    let scale = _mm256_set1_ps(super::iq_read::Runs::run_scale(x, ib));
-                    block = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sums), scale, block);
-                }
-                total = _mm256_fmadd_ps(block, _mm256_set1_ps(y.d), total);
-            }
-            super::iq_read::sum_ps(total)
-        };
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_avx2` enables.
+            return unsafe { dot_avx2(xs, ys) };
+        }
         super::iq_read::dot_runs(xs, ys)
     }
 
@@ -151,5 +119,45 @@ impl super::iq_read::Runs for BlockIq3S {
             }
         }
         w
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn dot_avx2(xs: &[BlockIq3S], ys: &[<BlockIq3S as BlockFormat>::ActivationBlock]) -> f32 {
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut total = _mm256_setzero_ps();
+        for (x, y) in xs.iter().zip(ys) {
+            let mut block = _mm256_setzero_ps();
+            for ib in 0..QK_K / 32 {
+                // Code `c` of a run is its byte with bit `c` of the run's high-bit byte as the
+                // ninth bit.
+                let low = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                    x.qs[8 * ib..].as_ptr() as *const __m128i
+                ));
+                let high = _mm256_slli_epi32(
+                    _mm256_and_si256(
+                        _mm256_srlv_epi32(
+                            _mm256_set1_epi32(x.qh[ib] as i32),
+                            _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+                        ),
+                        _mm256_set1_epi32(1),
+                    ),
+                    8,
+                );
+                let mags = _mm256_i32gather_epi32(
+                    IQ3S_GRID.as_ptr() as *const i32,
+                    _mm256_or_si256(low, high),
+                    4,
+                );
+                let signs = u32::from_le_bytes(x.signs[4 * ib..4 * ib + 4].try_into().unwrap());
+                let sums = super::iq_read::grid_run_sums(mags, signs, &y.qs[32 * ib..]);
+                let scale = _mm256_set1_ps(super::iq_read::Runs::run_scale(x, ib));
+                block = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sums), scale, block);
+            }
+            total = _mm256_fmadd_ps(block, _mm256_set1_ps(y.d), total);
+        }
+        super::iq_read::sum_ps(total)
     }
 }

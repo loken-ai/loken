@@ -11,7 +11,7 @@
 
 pub use super::repack_mxfp4_x8::{quantize_act, BlockQ8_0x4};
 use super::BlockQ8_0;
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 use half::f16;
 
@@ -124,7 +124,7 @@ pub fn matmul_scalar(
 /// weights are already i8), blend into the `{0,1,4,5}`/`{2,3,6,7}` arrangement,
 /// apply the sp1/sp2 shuffles, load the 8 f16 column scales. Returns the same
 /// shape `accum_4rows` consumes.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn decode_weights_q8(
     bb: &BlockQ8_0x8,
@@ -175,8 +175,8 @@ unsafe fn decode_weights_q8(
 
 /// AVX2 column-interleaved Q8_0 GEMM: one 4-row x 8-column tile. Reuses the
 /// quant-agnostic `accum_4rows` from `repack_mxfp4_x8`. `out[m*8 + j]`.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemm_group_avx2(
     a: &[BlockQ8_0x4],
     b: &[BlockQ8_0x8],
@@ -199,8 +199,8 @@ pub unsafe fn gemm_group_avx2(
 
 /// 16-row x 8-column tile - decode each weight block ONCE, apply to 4
 /// activation groups. `out[rp*32 + m*8 + j]`.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemm_group16_avx2(
     a0: &[BlockQ8_0x4],
     a1: &[BlockQ8_0x4],
