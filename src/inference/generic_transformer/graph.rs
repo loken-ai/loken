@@ -1760,10 +1760,26 @@ impl GenericHeteroTransformer {
                         .receive()?;
                 }
                 let mut hidden = self.step_input(op, seg)?;
+                // A wide layer followed by another in the run hands it the norm its token mixer
+                // starts from, taken in its last write-back.
+                #[cfg(feature = "cuda")]
+                let mut xn: Option<Tensor> = None;
                 // See the timer in the eager decode loop: this measures issuing the layer,
                 // which is what tells a dispatching layer from one running on the host.
-                for li in layers {
+                for li in layers.clone() {
                     let _timer = crate::inference::place::layer_perf::LayerTimer::start(li);
+                    #[cfg(feature = "cuda")]
+                    if self.layers[li].is_wide() {
+                        let next = (li + 1 < layers.end)
+                            .then(|| self.layers[li + 1].chained_attn_norm())
+                            .flatten()
+                            .filter(|_| self.layers[li + 1].is_wide());
+                        let (h, x) =
+                            self.layers[li].forward_wide_graph_chained(&hidden, xn.take(), next)?;
+                        hidden = h;
+                        xn = x;
+                        continue;
+                    }
                     hidden = self.layers[li].forward_graph(&hidden)?;
                 }
                 if head {

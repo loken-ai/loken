@@ -196,6 +196,32 @@ impl GenericTransformerLayer {
     /// The residual is the F32 `[1, 1, streams * dim]` the graph's hidden buffer holds.
     #[cfg(feature = "cuda")]
     pub(super) fn forward_wide_graph(&mut self, x: &Tensor) -> Result<Tensor> {
+        self.forward_wide_graph_chained(x, None, None)
+            .map(|(r, _)| r)
+    }
+
+    /// The token mixer's norm of this layer, for the layer before it to hand over with its
+    /// residual: the norm's gamma and epsilon, when the layer reads its residual as it comes
+    /// (no n-gram rows added first) and its mixers run on the card.
+    #[cfg(feature = "cuda")]
+    pub(super) fn chained_attn_norm(&self) -> Option<(Tensor, f32)> {
+        let h = self.hyper.as_ref()?;
+        (self.ngram.is_none() && h.attn.on_card() && h.ffn.on_card()).then(|| {
+            let (gamma, eps) = h.attn.norm_params();
+            (gamma.clone(), eps)
+        })
+    }
+
+    /// [`Self::forward_wide_graph`] with the token mixer's norm of `x` given (`xn`, from the
+    /// layer before), and the residual's norm for the next layer taken in the last write-back
+    /// when `next` holds that layer's gamma and epsilon: the residual and that norm.
+    #[cfg(feature = "cuda")]
+    pub(super) fn forward_wide_graph_chained(
+        &mut self,
+        x: &Tensor,
+        xn: Option<Tensor>,
+        next: Option<(Tensor, f32)>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let dev = x.device();
         // The n-gram features of the step's token, gathered into their buffer before the replay.
         let joined;
@@ -213,9 +239,13 @@ impl GenericTransformerLayer {
             let h = self.hyper.as_ref().expect("a wide layer has its mixers");
             (h.attn.streams(), h.attn.dim())
         };
+        let given = xn.filter(|_| self.ngram.is_none());
         let (mixed, inj) = staged("mix_token", &dev, false, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
-            let xn = hc.attn.normed_on_card(x)?;
+            let xn = match given {
+                Some(xn) => xn,
+                None => hc.attn.normed_on_card(x)?,
+            };
             hc.attn.mix_on_card(&xn, true)
         })?;
         let out = staged("token mixer", &dev, false, || match self.mixer {
@@ -253,17 +283,16 @@ impl GenericTransformerLayer {
                 .mix_on_card(&xn.expect("the norm was asked for"), false)
         })?;
         let out = self.feed_forward(&mixed, &dev)?;
-        let (r, _) = staged("combine", &dev, false, || {
-            combine_on_card(
+        staged("combine", &dev, false, || {
+            crate::inference::moe_cuda::hc_combine(
                 &r,
                 &out,
                 &inj.expect("the feed-forward's mixer writes back"),
-                None,
+                next.as_ref().map(|(gamma, eps)| (gamma, *eps)),
                 s,
                 d,
             )
-        })?;
-        Ok(r)
+        })
     }
 
     /// Whether this layer's indexer and attention run on its card: its kernels serve the
