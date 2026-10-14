@@ -21,6 +21,8 @@ use crate::tensor::Result;
 use rayon::prelude::*;
 
 const QK: usize = 32; // q8_0 block size
+/// Tokens quantized per pool task by [`CpuQ8Kv::append_prefill`].
+const APPEND_TOKENS_PER_TASK: usize = 64;
 
 /// PV accumulate for one q8_0 block: `o[i] += scale * qs[i]` (scale = p_t . d_block).
 /// AVX2 sign-extends 8 i8 -> i32 -> f32 and FMAs 8 lanes at a time; the per-key
@@ -232,6 +234,51 @@ impl CpuQ8Kv {
             self.v[h].extend_from_slice(&vb);
         }
         self.seq += 1;
+        Ok(())
+    }
+
+    /// Append `seq` tokens at once. `k` and `v` are `[n_kv_head, seq, head_dim]` f32. The rows are
+    /// quantized in blocks of tokens on the prefill pool; the bytes stored are those of `seq`
+    /// calls to [`Self::append`], since every q8_0 block is quantized on its own.
+    pub fn append_prefill(&mut self, k: &[f32], v: &[f32], seq: usize) -> Result<()> {
+        let (hd, nkv) = (self.head_dim, self.n_kv_head);
+        debug_assert_eq!(k.len(), nkv * seq * hd);
+        debug_assert_eq!(v.len(), nkv * seq * hd);
+        // One task per (K or V, head, run of tokens).
+        let run = APPEND_TOKENS_PER_TASK.min(seq.max(1));
+        let runs = seq.div_ceil(run);
+        let tasks = 2 * nkv * runs;
+        let parts: Vec<std::sync::Mutex<Option<Result<Vec<u8>>>>> =
+            (0..tasks).map(|_| std::sync::Mutex::new(None)).collect();
+        let quantize = |t: usize| {
+            let (which, rest) = (t / (nkv * runs), t % (nkv * runs));
+            let (h, r) = (rest / runs, rest % runs);
+            let src = if which == 0 { k } else { v };
+            let lo = h * seq * hd + r * run * hd;
+            let hi = h * seq * hd + ((r + 1) * run).min(seq) * hd;
+            let bytes = from_float_bytes(GgmlDType::Q8_0, &src[lo..hi]);
+            *parts[t].lock().unwrap_or_else(|e| e.into_inner()) = Some(bytes);
+        };
+        // A single run per head (one decoded token, a short chunk) is not worth waking the pool.
+        if runs == 1 {
+            (0..tasks).for_each(quantize);
+        } else {
+            crate::tensor::quant_cpu::prefill_pool_run(tasks, &quantize);
+        }
+        for (t, part) in parts.into_iter().enumerate() {
+            let bytes = part
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every task stored its bytes")?;
+            let (which, rest) = (t / (nkv * runs), t % (nkv * runs));
+            let h = rest / runs;
+            if which == 0 {
+                self.k[h].extend_from_slice(&bytes);
+            } else {
+                self.v[h].extend_from_slice(&bytes);
+            }
+        }
+        self.seq += seq;
         Ok(())
     }
 
@@ -708,6 +755,52 @@ mod avx512_tests {
                 a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
                 "n={n}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod append_prefill_tests {
+    use super::*;
+
+    fn values(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 6.0
+            })
+            .collect()
+    }
+
+    /// The bulk append stores the bytes of one append per token, for token counts around the
+    /// task size, including a cache that already holds tokens.
+    #[test]
+    fn it_stores_the_bytes_of_token_by_token_appends() {
+        let (nh, nkv, hd) = (4usize, 2usize, 64usize);
+        for seq in [1usize, 2, 63, 64, 65, 130, 200] {
+            let (k, v) = (values(nkv * seq * hd, 1), values(nkv * seq * hd, 2));
+            let mut bulk = CpuQ8Kv::new(nh, nkv, hd);
+            let mut each = CpuQ8Kv::new(nh, nkv, hd);
+            // One token already stored before the bulk call.
+            let (k0, v0) = (values(nkv * hd, 3), values(nkv * hd, 4));
+            bulk.append(&k0, &v0).unwrap();
+            each.append(&k0, &v0).unwrap();
+            bulk.append_prefill(&k, &v, seq).unwrap();
+            for p in 0..seq {
+                let (mut kt, mut vt) = (vec![0f32; nkv * hd], vec![0f32; nkv * hd]);
+                for h in 0..nkv {
+                    let src = h * seq * hd + p * hd;
+                    kt[h * hd..(h + 1) * hd].copy_from_slice(&k[src..src + hd]);
+                    vt[h * hd..(h + 1) * hd].copy_from_slice(&v[src..src + hd]);
+                }
+                each.append(&kt, &vt).unwrap();
+            }
+            assert_eq!(bulk.seq, each.seq, "seq={seq}");
+            assert_eq!(bulk.k, each.k, "K bytes, seq={seq}");
+            assert_eq!(bulk.v, each.v, "V bytes, seq={seq}");
         }
     }
 }

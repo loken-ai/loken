@@ -109,18 +109,8 @@ impl GenericTransformerLayer {
             }
         };
         let cache = self.cpu_q8_kv.as_mut().unwrap();
-        let mut kt = vec![0f32; nkv * hd];
-        let mut vt = vec![0f32; nkv * hd];
-        for p in 0..seq {
-            for h in 0..nkv {
-                let src = h * seq * hd + p * hd;
-                kt[h * hd..(h + 1) * hd].copy_from_slice(&kf[src..src + hd]);
-                vt[h * hd..(h + 1) * hd].copy_from_slice(&vf[src..src + hd]);
-            }
-            if cache.append(&kt, &vt).is_err() {
-                self.cpu_q8_kv = None;
-                return;
-            }
+        if cache.append_prefill(&kf, &vf, seq).is_err() {
+            self.cpu_q8_kv = None;
         }
     }
 

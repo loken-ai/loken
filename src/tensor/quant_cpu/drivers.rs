@@ -1151,6 +1151,11 @@ pub fn pool_par_chunks_mut_prefill(
     });
 }
 
+/// Run `f(0..chunks)` on the prefill pool, one call per chunk index.
+pub fn prefill_pool_run(chunks: usize, f: &(dyn Fn(usize) + Sync)) {
+    gemv_pool::prefill_pool().run(chunks, f);
+}
+
 /// Elements below which a zeroed vector is built in place rather than on the pool.
 const PAR_ZERO_MIN: usize = 1 << 20;
 
