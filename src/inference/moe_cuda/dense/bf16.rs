@@ -138,4 +138,47 @@ mod tests {
         .unwrap();
         assert!(bf16_matvec(&over, &w_card).unwrap().is_none());
     }
+
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn the_library_product_sums_bf16_operands_in_f32() {
+        let dev = Device::new_cuda(0).expect("a card for the card test");
+        let (m, n, k) = (300, 37, 2560);
+        let bf16 = |v: Vec<f32>, rows| {
+            Tensor::from_vec(v, (rows, k), &Device::Cpu)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap()
+        };
+        let (x, w) = (bf16(values(m * k, 4), m), bf16(values(n * k, 5), n));
+        let wide = |t: &Tensor| -> Vec<f32> {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let (xs, ws) = (wide(&x), wide(&w));
+        let y = x
+            .to_device(&dev)
+            .unwrap()
+            .matmul_t_bf16_f32(&w.to_device(&dev).unwrap())
+            .unwrap()
+            .expect("two BF16 matrices on one card");
+        assert_eq!(y.dtype(), DType::F32);
+        assert_eq!(y.dims(), &[m, n]);
+        let y: Vec<f32> = y.flatten_all().unwrap().to_vec1().unwrap();
+        for r in 0..m {
+            for o in 0..n {
+                let want: f64 = (0..k)
+                    .map(|i| f64::from(xs[r * k + i]) * f64::from(ws[o * k + i]))
+                    .sum();
+                assert!(
+                    (f64::from(y[r * n + o]) - want).abs() < 1e-3,
+                    "row {r} output {o}"
+                );
+            }
+        }
+    }
 }

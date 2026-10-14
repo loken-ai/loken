@@ -131,8 +131,9 @@ impl QMatMul {
                 Self::dense_matmul_t(&xf, w, x.dtype())
             }
             Self::Bf16(w) => {
-                // A few rows take the BF16 product summed in F32; more, the library product over
-                // the weight widened to F32 for the call.
+                // A few rows take the BF16 product summed in F32, the decode's and a verify's
+                // rows alike; more, the library's BF16 product with the activation rounded to
+                // BF16, summed in F32.
                 let dims = x.dims().to_vec();
                 let k = *dims
                     .last()
@@ -141,10 +142,20 @@ impl QMatMul {
                 let x2 = x.reshape((rows, k))?;
                 let y = match crate::inference::moe_cuda::bf16_matvec(&x2, w)? {
                     Some(y) => y,
-                    // CONVERSION: a prefill's rows multiply the weight widened for the call only.
-                    None => x2
-                        .to_dtype(crate::tensor::DType::F32)?
-                        .matmul_t(&w.to_dtype(crate::tensor::DType::F32)?)?,
+                    None => {
+                        #[cfg(feature = "cuda")]
+                        let y = x2
+                            .to_dtype(crate::tensor::DType::BF16)?
+                            .matmul_t_bf16_f32(w)?;
+                        #[cfg(not(feature = "cuda"))]
+                        let y: Option<Tensor> = None;
+                        match y {
+                            Some(y) => y,
+                            None => x2
+                                .to_dtype(crate::tensor::DType::F32)?
+                                .matmul_t(&w.to_dtype(crate::tensor::DType::F32)?)?,
+                        }
+                    }
                 };
                 let mut odims = dims;
                 *odims.last_mut().unwrap() = w.dims()[0];

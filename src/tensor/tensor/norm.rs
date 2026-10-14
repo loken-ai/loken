@@ -369,6 +369,53 @@ impl Tensor {
     /// facade makes for `x.matmul(&w.t()?)` (bit-exactness across the flip;
     /// it also skips the transpose materialization). CPU/non-CUDA
     /// falls back to materializing.
+    /// `self @ rhs^T` for two BF16 tensors on one card, `[.., m, k]` by `[.., n, k]`: summed and
+    /// written in F32. `None` where the operands are not that.
+    #[cfg(feature = "cuda")]
+    pub fn matmul_t_bf16_f32(&self, rhs: &Self) -> Result<Option<Self>> {
+        let (ldims, rdims) = (self.dims(), rhs.dims());
+        if self.dtype() != DType::BF16
+            || rhs.dtype() != DType::BF16
+            || ldims.len() != 2
+            || rdims.len() != 2
+        {
+            return Ok(None);
+        }
+        let (m, k) = (ldims[0], ldims[1]);
+        let (n, k2) = (rdims[0], rdims[1]);
+        if k != k2 {
+            return Ok(None);
+        }
+        let (lhs, rhs) = (self.contiguous()?, rhs.contiguous()?);
+        let (
+            Storage::Cuda { data, dev },
+            Storage::Cuda {
+                data: rd,
+                dev: rdev,
+            },
+        ) = (lhs.storage().as_ref(), rhs.storage().as_ref())
+        else {
+            return Ok(None);
+        };
+        if dev.ordinal() != rdev.ordinal() {
+            return Ok(None);
+        }
+        let out = crate::tensor::cuda::matmul_nt_bf16_f32(
+            dev,
+            data.as_bf16_slice()?,
+            rd.as_bf16_slice()?,
+            1,
+            m,
+            k,
+            n,
+        )?;
+        Ok(Some(Self::from_cuda_storage(
+            crate::tensor::cuda::CudaStorage::F32(out),
+            dev.clone(),
+            vec![m, n],
+        )?))
+    }
+
     pub fn matmul_t(&self, rhs: &Self) -> Result<Self> {
         if self.is_dry() || rhs.is_dry() {
             let (ldims, rdims) = (self.dims(), rhs.dims());

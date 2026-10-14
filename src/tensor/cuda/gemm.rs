@@ -213,6 +213,60 @@ macro_rules! matmul_nt_impl {
     };
 }
 
+/// [`matmul_nt_bf16`] summed and written in F32: BF16 operands, F32 accumulation and output.
+pub fn matmul_nt_bf16_f32(
+    dev: &CudaDevice,
+    a: &CudaSlice<half::bf16>,
+    b: &CudaSlice<half::bf16>,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<CudaSlice<f32>> {
+    use cudarc::cublas::sys;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let stream = dev.stream();
+    let mut out = with_oom_retry(dev, "matmul_nt_bf16_f32", || unsafe {
+        stream.alloc::<f32>(batch * m * n)
+    })?;
+    let (alpha, beta) = (1.0f32, 0.0f32);
+    let blas = dev.blas()?;
+    {
+        let (a_ptr, _ga) = a.device_ptr(stream);
+        let (b_ptr, _gb) = b.device_ptr(stream);
+        let (c_ptr, _gc) = out.device_ptr_mut(stream);
+        unsafe {
+            cudarc::cublas::result::gemm_strided_batched_ex(
+                *blas.handle(),
+                sys::cublasOperation_t::CUBLAS_OP_T,
+                sys::cublasOperation_t::CUBLAS_OP_N,
+                n as i32,
+                m as i32,
+                k as i32,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                b_ptr as *const _,
+                sys::cudaDataType_t::CUDA_R_16BF,
+                k as i32,
+                (n * k) as i64,
+                a_ptr as *const _,
+                sys::cudaDataType_t::CUDA_R_16BF,
+                k as i32,
+                (m * k) as i64,
+                &beta as *const f32 as *const std::ffi::c_void,
+                c_ptr as *mut _,
+                sys::cudaDataType_t::CUDA_R_32F,
+                n as i32,
+                (m * n) as i64,
+                batch as i32,
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            )
+        }
+        .map_err(|e| cublas_err("gemm_nt_bf16_f32", e))?;
+    }
+    Ok(out)
+}
+
 matmul_nt_impl!(
     matmul_nt_f32,
     f32,
