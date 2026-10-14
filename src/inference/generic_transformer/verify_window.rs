@@ -267,7 +267,7 @@ impl GenericTransformerLayer {
         };
         let (mixed, inj) = staged("mix_ffn", &dev, false, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
-            hc.ffn.mix_on_card(&xn, true)
+            hc.ffn.mix_on_card(&xn, false)
         })?;
         let out = self.feed_forward(&mixed, &dev)?;
         staged("combine", &dev, false, || {
