@@ -101,6 +101,28 @@ impl GgufSource for MappedGguf {
 pub struct SplitGguf {
     parts: Vec<MappedGguf>,
     owner: HashMap<String, usize>,
+    /// Tensors whose stored values are one less than the values read.
+    plus_one: std::collections::HashSet<String>,
+    /// Tensors held in another format than the one stored, quantised as they are read: the
+    /// format and the stored rows of each leading index the listed rows are taken from.
+    held: HashMap<String, (super::GgmlDType, usize)>,
+}
+
+/// A tensor a part carries under another name: rows of a stored tensor, listed as the reader
+/// asks for it.
+pub struct Relisted {
+    /// The name the reader asks for.
+    pub name: String,
+    /// The stored tensor it is in.
+    pub source: String,
+    /// The row it starts at in each matrix of the stored tensor, and the rows it takes there;
+    /// `None` for all of them. A selection in a stack of matrices is held: its rows are not
+    /// contiguous in the file.
+    pub rows: Option<(usize, usize)>,
+    /// Its stored values are one less than the values read.
+    pub plus_one: bool,
+    /// The format it is held in, when not the stored one.
+    pub held: Option<super::GgmlDType>,
 }
 
 /// `<stem>-NNNNN-of-MMMMM.gguf` taken apart: the stem, this part's number, the count, the digit
@@ -245,7 +267,104 @@ impl SplitGguf {
                 }
             }
         }
-        Ok(Self { parts, owner })
+        Ok(Self {
+            parts,
+            owner,
+            plus_one: Default::default(),
+            held: Default::default(),
+        })
+    }
+
+    /// List the tensors of part `part` under the names of `listing`, each over the bytes of its
+    /// source: the rows it takes of it, the dimensions of one dropped. The part's own names leave
+    /// the set. The bytes stay where they are.
+    pub fn relist(&mut self, part: usize, listing: &[Relisted]) -> Result<()> {
+        let content = &self.parts[part].content;
+        let mut infos = HashMap::new();
+        for r in listing {
+            let src = content.tensor_infos.get(&r.source).ok_or_else(|| {
+                Error::msg(format!(
+                    "{}: no tensor {} to list as {}",
+                    part + 1,
+                    r.source,
+                    r.name
+                ))
+            })?;
+            let mut dims: Vec<usize> = src.shape.dims().to_vec();
+            let mut offset = src.offset;
+            let stored_rows = dims.len().checked_sub(2).map_or(1, |i| dims[i]);
+            if let Some((first, rows)) = r.rows {
+                let cols = *dims.last().unwrap_or(&1);
+                let dtype = src.ggml_dtype;
+                let leading: usize = dims[..dims.len().saturating_sub(2)].iter().product();
+                if dims.len() < 2
+                    || first + rows > stored_rows
+                    || !cols.is_multiple_of(dtype.block_size())
+                    || (leading > 1 && r.held.is_none())
+                {
+                    return Err(Error::msg(format!(
+                        "{}: rows {first}..{} of {:?} as {}",
+                        r.source,
+                        first + rows,
+                        dims,
+                        r.name
+                    )));
+                }
+                offset += (first * cols / dtype.block_size() * dtype.type_size()) as u64;
+                let at = dims.len() - 2;
+                dims[at] = rows;
+            }
+            dims.retain(|&d| d != 1);
+            if dims.is_empty() {
+                dims.push(1);
+            }
+            infos.insert(
+                r.name.clone(),
+                TensorInfo {
+                    ggml_dtype: src.ggml_dtype,
+                    shape: dims.into(),
+                    offset,
+                },
+            );
+            if r.plus_one {
+                self.plus_one.insert(r.name.clone());
+            }
+            if let Some(f) = r.held {
+                self.held.insert(r.name.clone(), (f, stored_rows));
+            }
+        }
+        self.owner.retain(|_, &mut i| i != part);
+        for name in infos.keys() {
+            if let Some(prev) = self.owner.insert(name.clone(), part) {
+                return Err(Error::msg(format!(
+                    "tensor {name} appears in parts {} and {}",
+                    prev + 1,
+                    part + 1
+                )));
+            }
+        }
+        self.parts[part].content.tensor_infos = infos;
+        Ok(())
+    }
+
+    /// Bytes the set holds: every tensor in the format it is held in.
+    pub fn held_bytes(&self) -> u64 {
+        self.merged_content()
+            .tensor_infos
+            .values()
+            .map(|t| t.size_in_bytes() as u64)
+            .sum()
+    }
+
+    /// The format `name` is held in when not the one stored, and the stored rows of each
+    /// leading index its rows are taken from.
+    pub fn held(&self, name: &str) -> Option<(super::GgmlDType, usize)> {
+        self.held.get(name).copied()
+    }
+
+    /// Whether the stored values of `name` are one less than the values read.
+    pub fn stored_one_less(&self, name: &str) -> bool {
+        self.plus_one.contains(name)
     }
 
     pub fn parts(&self) -> &[MappedGguf] {
@@ -266,18 +385,21 @@ impl SplitGguf {
     /// from `part_of`; this is the header a loader asks *about* the model - its architecture,
     /// its shapes, what each block carries - and it answers for the whole set. `mmap_owner` is
     /// left unset: no single mapping backs this directory, so a reader that wants zero-copy
-    /// views takes them from the part it reads.
+    /// views takes them from the part it reads. A tensor held in another format than stored is
+    /// listed in the held one: what the cards will hold.
     pub fn merged_content(&self) -> Content {
         let first = &self.parts[0].content;
         let tensor_infos = self
             .owner
             .iter()
             .filter_map(|(name, &i)| {
-                self.parts[i]
-                    .content
-                    .tensor_infos
-                    .get(name)
-                    .map(|info| (name.clone(), info.clone()))
+                self.parts[i].content.tensor_infos.get(name).map(|info| {
+                    let mut info = info.clone();
+                    if let Some(&(f, _)) = self.held.get(name) {
+                        info.ggml_dtype = f;
+                    }
+                    (name.clone(), info)
+                })
             })
             .collect();
         Content {

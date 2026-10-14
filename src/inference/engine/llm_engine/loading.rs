@@ -392,7 +392,25 @@ impl LlmEngine {
                 (true, true) => match crate::tensor::quantized::gguf_source::SplitGguf::open_with(
                     &model_file,
                     draft_head.as_slice(),
-                ) {
+                )
+                .and_then(|mut s| {
+                    // A head stored under the checkpoint's names is read under the loader's.
+                    if draft_head.is_some() {
+                        let head = s.parts().len() - 1;
+                        let arch = get_gguf_string(&content, "general.architecture").unwrap_or_default();
+                        let listing = get_gguf_u32(&content, &format!("{arch}.block_count")).and_then(|n| {
+                            crate::inference::load::mtp_head::checkpoint_listing(
+                                &s.parts()[head].content,
+                                n as usize,
+                                get_gguf_u32(&content, &format!("{arch}.attention.indexer.key_length"))? as usize,
+                            )
+                        });
+                        if let Some(listing) = listing {
+                            s.relist(head, &listing)?;
+                        }
+                    }
+                    Ok(s)
+                }) {
                     Ok(s) => Some(s),
                     Err(e) => {
                         error!("❌ {e}");
@@ -412,7 +430,8 @@ impl LlmEngine {
                     .iter()
                     .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
                     .sum(),
-                (None, Some(s)) => s.parts().iter().map(|p| p.mmap.len() as u64).sum(),
+                // A tensor held in another format than stored counts as it is held.
+                (None, Some(s)) => s.held_bytes(),
                 (None, None) => file_size,
             };
             // A table read by row is never placed: the cards and the host answer for the rest.

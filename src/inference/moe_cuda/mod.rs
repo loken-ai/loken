@@ -369,6 +369,8 @@ cuda_launchers! {
         logits: *const std::ffi::c_void, out: *mut u32, n_rows: i32, vocab: i32);
     loken_batched_argmax_f32(
         logits: *const std::ffi::c_void, out: *mut u32, n_rows: i32, vocab: i32);
+    loken_top_and_mass_f32(
+        logits: *const std::ffi::c_void, ids: *mut u32, mass: *mut f32, n_rows: i32, vocab: i32);
 }
 cuda_launchers! {
     loken_batched_topk_denom_f16(

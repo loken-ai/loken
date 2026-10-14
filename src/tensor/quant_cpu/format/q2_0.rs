@@ -5,6 +5,10 @@ use super::q8_64::QK8_64_HALF;
 use super::*;
 
 pub const QK2_0: usize = 64;
+/// Candidate scales a block's search tries past the widest one.
+const SCALE_STEPS: usize = 16;
+/// How far below the widest scale the search reaches, as a share of it.
+const SCALE_SPAN: f32 = 0.6;
 
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
@@ -37,27 +41,43 @@ impl BlockFormat for BlockQ2_0 {
         }
     }
 
-    /// The scale puts the extreme on the end of the level range it falls in; each value takes
-    /// the nearest of the four levels.
+    /// The scale of least squared error over the block: each candidate from the one that puts
+    /// the extreme on the end of the level range down to a fraction of it codes every value to
+    /// its nearest level and is refit to those codes by least squares, and the lowest error,
+    /// against the scale as stored, is kept.
     fn quantize(xs: &[f32], ys: &mut [Self]) {
         for (block, x) in blocks_with_input(xs, ys) {
-            let amax = x
+            let (lo, hi) = x
                 .iter()
-                .copied()
-                .fold(0f32, |m, v| if v.abs() > m.abs() { v } else { m });
-            let d = if amax == 0.0 {
-                0.0
-            } else if amax > 0.0 {
-                amax / 2.0
-            } else {
-                -amax
-            };
-            block.d = f16::from_f32(d);
-            let inv = if d != 0.0 { 1.0 / d } else { 0.0 };
+                .fold((0f32, 0f32), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            let widest = (hi / 2.0).max(-lo);
+            let mut best = (f32::INFINITY, 0f32, [0i8; QK2_0]);
+            if widest > 0.0 {
+                for step in 0..=SCALE_STEPS {
+                    let d = widest * (1.0 - SCALE_SPAN * step as f32 / SCALE_STEPS as f32);
+                    let mut codes = [0i8; QK2_0];
+                    for (c, &v) in codes.iter_mut().zip(x) {
+                        *c = (v / d).round().clamp(-1.0, 2.0) as i8;
+                    }
+                    let (num, den) = codes.iter().zip(x).fold((0f32, 0f32), |(n, m), (&c, &v)| {
+                        (n + v * f32::from(c), m + f32::from(c * c))
+                    });
+                    let fit = if den > 0.0 { num / den } else { d };
+                    let stored = f16::from_f32(fit).to_f32();
+                    let err: f32 = codes
+                        .iter()
+                        .zip(x)
+                        .map(|(&c, &v)| (v - f32::from(c) * stored).powi(2))
+                        .sum();
+                    if err < best.0 {
+                        best = (err, fit, codes);
+                    }
+                }
+            }
+            block.d = f16::from_f32(best.1);
             block.qs = [0; QK2_0 / 4];
-            for (j, v) in x.iter().enumerate() {
-                let level = (v * inv).round().clamp(-1.0, 2.0) as i32;
-                block.qs[j / 4] |= ((level + 1) as u8) << (2 * (j % 4));
+            for (j, &c) in best.2.iter().enumerate() {
+                block.qs[j / 4] |= ((c + 1) as u8) << (2 * (j % 4));
             }
         }
     }

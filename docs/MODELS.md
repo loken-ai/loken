@@ -55,13 +55,12 @@ says why.
 A checkpoint may ship a draft head that the served file leaves out: the multi-token-prediction
 layer of the wide-residual family. It is read from a companion file, `<stem>.mtp.gguf` beside
 the model, the stem being that of a split's parts. `loken draft-head <repo> <out.gguf>` writes it
-from the checkpoint's `mtp.*` tensors by range requests. This layout is loken's own, and no GGUF
-specification names it: the head's layer is `blk.N.*` with N the model's layer count, the
-projections that fuse the embedding with the hidden state and the head's output mixer are
-`mtp.*`, norm scales are written as the served file holds them (one more than the checkpoint's),
-matrices are Q4_K or Q5_0 by row length, the router gates are F32 and the indexer's projections
-BF16. The file carries `general.architecture` and `general.name` and nothing else. A model
-without the companion decodes without a head.
+from the checkpoint's `mtp.*` tensors by range requests, as released: the checkpoint's names,
+shapes and bytes. This layout is loken's own, and no GGUF specification names it. The loader
+lists the head under the model's names, its layer `blk.N.*` with N the model's layer count, splits
+the fused indexer projection and expert stacks by rows, reads each norm scale one more than
+stored, and quantises a matrix as it reads it. The file carries `general.architecture` and
+`general.name` and nothing else. A model without the companion decodes without a head.
 
 ## Language models
 

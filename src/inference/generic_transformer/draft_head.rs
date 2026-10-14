@@ -810,8 +810,8 @@ impl GenericHeteroTransformer {
             DraftKind::Pairs(n) => {
                 gather(&tok_ids.narrow(0, 0, n)?, &emb.narrow(1, 0, n)?)?;
                 let x = d.fuse(&emb.narrow(1, 0, n)?, &rows_in.narrow(1, 0, n)?)?;
-                let out = d.layer.forward_wide_graph_rows(&x, n)?;
-                hidden.slice_set(&out.narrow(1, n - 1, 1)?.to_dtype(DType::F32)?, 1, 0)?;
+                let out = d.layer.forward_wide_graph_rows_last(&x, n)?;
+                hidden.slice_set(&out.to_dtype(DType::F32)?, 1, 0)?;
                 return Ok(());
             }
             DraftKind::Step(j) => {
@@ -844,10 +844,7 @@ impl GenericHeteroTransformer {
             (None, None) => crate::tensor::bail!("a recorded guess needs the card's head"),
         }
         .to_dtype(DType::F32)?;
-        let top = logits.max_keepdim(1)?;
-        let mass = logits.broadcast_sub(&top)?.exp()?.sum_keepdim(1)?;
-        crate::inference::moe_cuda::batched_argmax_into(&logits, &ids)?;
-        read.slice_set(&mass, 0, 0)?;
+        crate::inference::moe_cuda::top_and_mass_into(&logits, &ids, &read)?;
         // The token and the mass to the host's mapping, then one more guess told: the host
         // spins on the count and reads the two words behind it.
         let cd = ids.device().as_cuda_device()?;

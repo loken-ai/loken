@@ -78,6 +78,43 @@ pub fn topk_softmax(
 
 /// [`batched_argmax`] writing the ids into `out`, `[n_rows]` U32 on the card: nothing returns
 /// to the host, so a recorded step can take it.
+/// The top of each row of `logits` `[rows, vocab]` into `ids` (u32, ties to the lowest index)
+/// and the softmax mass relative to it, the sum of `exp(l - max)`, into `mass` (F32): one launch.
+pub fn top_and_mass_into(logits: &Tensor, ids: &Tensor, mass: &Tensor) -> Result<()> {
+    let (n_rows, vocab) = logits.dims2()?;
+    if ids.dtype() != DType::U32 || ids.elem_count() != n_rows {
+        crate::tensor::bail!("top_and_mass_into: the ids buffer holds {n_rows} u32 ids");
+    }
+    if mass.dtype() != DType::F32 || mass.elem_count() != n_rows {
+        crate::tensor::bail!("top_and_mass_into: the mass buffer holds {n_rows} F32 values");
+    }
+    let dev = logits.device().as_cuda_device()?;
+    let logits = logits.to_dtype(DType::F32)?.contiguous()?;
+    let (storage, _) = logits.storage_and_layout();
+    let (ids_storage, ids_layout) = ids.storage_and_layout();
+    let (mass_storage, mass_layout) = mass.storage_and_layout();
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    let (s, i, m) = match (&*storage, &*ids_storage, &*mass_storage) {
+        (StorageView::Cuda(s), StorageView::Cuda(i), StorageView::Cuda(m)) => (
+            s.as_cuda_slice::<f32>()?,
+            i.as_cuda_slice::<u32>()?,
+            m.as_cuda_slice::<f32>()?,
+        ),
+        _ => crate::tensor::bail!("top_and_mass_into: cuda only"),
+    };
+    unsafe {
+        loken_top_and_mass_f32(
+            s.device_ptr(s.stream()).0 as *const std::ffi::c_void,
+            (i.device_ptr(i.stream()).0 as *mut u32).add(ids_layout.start_offset()),
+            (m.device_ptr(m.stream()).0 as *mut f32).add(mass_layout.start_offset()),
+            n_rows as i32,
+            vocab as i32,
+            stream,
+        )
+    };
+    Ok(())
+}
+
 pub fn batched_argmax_into(logits: &Tensor, out: &Tensor) -> Result<()> {
     let (n_rows, vocab) = logits.dims2()?;
     if out.dtype() != DType::U32 || out.elem_count() != n_rows {
@@ -420,5 +457,49 @@ mod topk_softmax_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod top_and_mass_tests {
+    use super::*;
+    use crate::tensor::Device;
+
+    /// The top and the softmax mass of each row match a host sum, the lowest index winning a tie.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn the_top_and_mass_of_each_row_match_the_host() {
+        let dev = Device::new_cuda(0).expect("a card for the card test");
+        let (rows, vocab) = (3, 66_055);
+        let mut v: Vec<f32> = (0..rows * vocab)
+            .map(|i| {
+                ((i as u32).wrapping_mul(2_654_435_761) >> 8) as f32 / (1u32 << 24) as f32 * 8.0
+            })
+            .collect();
+        v[vocab + 17] = 20.0;
+        v[vocab + 40_000] = 20.0;
+        let logits = Tensor::from_vec(v.clone(), (rows, vocab), &dev).unwrap();
+        let ids = Tensor::zeros_on((rows,), DType::U32, &dev).unwrap();
+        let mass = Tensor::zeros_on((rows,), DType::F32, &dev).unwrap();
+        top_and_mass_into(&logits, &ids, &mass).unwrap();
+        let ids: Vec<u32> = ids.to_vec1().unwrap();
+        let mass: Vec<f32> = mass.to_vec1().unwrap();
+        for r in 0..rows {
+            let row = &v[r * vocab..(r + 1) * vocab];
+            let (mut top, mut at) = (f32::NEG_INFINITY, 0);
+            for (i, &x) in row.iter().enumerate() {
+                if x > top {
+                    (top, at) = (x, i);
+                }
+            }
+            let want: f64 = row.iter().map(|&x| f64::from(x - top).exp()).sum();
+            assert_eq!(ids[r] as usize, at, "row {r}");
+            assert!(
+                (f64::from(mass[r]) - want).abs() < want * 1e-4,
+                "row {r}: {} against {want}",
+                mass[r]
+            );
+        }
+        assert_eq!(ids[1], 17);
     }
 }

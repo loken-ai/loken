@@ -125,23 +125,22 @@ fn encode(xs: &[f32], ys: &mut [BlockQ5K], imatrix: Option<&[f32]>, n_per_row: u
         let mut scales = [0f32; GROUPS];
         let mut mins = [0f32; GROUPS];
         let mut carried = [0f32; GROUPS];
-        let mut w = [0f32; SUB];
+        let mut w = [0f32; QK_K];
 
-        for (g, (xg, (scale, min))) in x
-            .chunks_exact(SUB)
-            .zip(scales.iter_mut().zip(mins.iter_mut()))
-            .enumerate()
-        {
+        for (g, (xg, wg)) in x.chunks_exact(SUB).zip(w.chunks_exact_mut(SUB)).enumerate() {
             match row {
                 Some(r) => {
-                    for (out, (&iw, &v)) in w.iter_mut().zip(r[SUB * g..].iter().zip(xg)) {
+                    for (out, (&iw, &v)) in wg.iter_mut().zip(r[SUB * g..].iter().zip(xg)) {
                         *out = iw * (sigma2 + v * v).sqrt();
                     }
                 }
-                None => magnitude_weights(xg, &mut w),
+                None => magnitude_weights(xg, wg),
             }
-            carried[g] = w.iter().sum();
-            (*scale, *min) = fit_scale_and_offset(31, xg, &w);
+            carried[g] = wg.iter().sum();
+        }
+        let fitted = fit_scales_and_offsets::<GROUPS>(31, x, &w);
+        for (g, (scale, min)) in fitted.into_iter().enumerate() {
+            (scales[g], mins[g]) = (scale, min);
         }
 
         let (mut ls, mut lm) = ([0u8; GROUPS], [0u8; GROUPS]);

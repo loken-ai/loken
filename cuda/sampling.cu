@@ -53,6 +53,46 @@ extern "C" void loken_batched_argmax_f32(const void* logits, unsigned int* out,
     loken_batched_argmax_kernel<float><<<n_rows, 256, 0, stream>>>((const float*)logits, out, vocab);
 }
 
+// The top of each row of `logits` [n_rows, vocab] F32 and the softmax mass relative to it,
+// sum of exp(l - max), in one pass: each thread keeps a running (max, mass) pair and its first
+// index of the max, the pairs merged by rescaling the smaller side. Ties go to the lowest index.
+#define TOP_MASS_THREADS 1024
+__global__ void loken_top_and_mass_kernel(const float* __restrict__ logits,
+                                          unsigned int* __restrict__ ids,
+                                          float* __restrict__ mass, int vocab) {
+    const float* r = logits + (size_t)blockIdx.x * vocab;
+    float m = -INFINITY, s = 0.f; int idx = 0x7fffffff;
+    for (int k = threadIdx.x; k < vocab; k += blockDim.x) {
+        float v = r[k];
+        if (v > m) { s = s * expf(m - v) + 1.f; m = v; idx = k; }
+        else { s += expf(v - m); }
+    }
+    __shared__ float sm[TOP_MASS_THREADS];
+    __shared__ float ss[TOP_MASS_THREADS];
+    __shared__ int si[TOP_MASS_THREADS];
+    sm[threadIdx.x] = m; ss[threadIdx.x] = s; si[threadIdx.x] = idx;
+    __syncthreads();
+    for (int half = blockDim.x >> 1; half > 0; half >>= 1) {
+        if (threadIdx.x < half) {
+            float m1 = sm[threadIdx.x], m2 = sm[threadIdx.x + half];
+            float s1 = ss[threadIdx.x], s2 = ss[threadIdx.x + half];
+            int i1 = si[threadIdx.x], i2 = si[threadIdx.x + half];
+            float mm = fmaxf(m1, m2);
+            float merged = (m1 == -INFINITY ? 0.f : s1 * expf(m1 - mm))
+                         + (m2 == -INFINITY ? 0.f : s2 * expf(m2 - mm));
+            int ii = (m2 > m1 || (m2 == m1 && i2 < i1)) ? i2 : i1;
+            sm[threadIdx.x] = mm; ss[threadIdx.x] = merged; si[threadIdx.x] = ii;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { ids[blockIdx.x] = (unsigned int)si[0]; mass[blockIdx.x] = ss[0]; }
+}
+extern "C" void loken_top_and_mass_f32(const void* logits, unsigned int* ids, float* mass,
+                                       int n_rows, int vocab, cudaStream_t stream) {
+    loken_top_and_mass_kernel<<<n_rows, TOP_MASS_THREADS, 0, stream>>>(
+        (const float*)logits, ids, mass, vocab);
+}
+
 // -- Batched top-k + softmax-denominator over [n_rows, vocab] (one block per row) --
 // A fused sampler front-end of our own, rather than a full-vocab softmax plus a host select: per row
 // compute rowmax + denom = Σ exp((logit-rowmax)/T), then extract the top-k logits+indices

@@ -8,7 +8,7 @@
 //! Two kinds of search, and one weighting:
 //!
 //!   [`fit_signed_scale`]   signed levels, no offset - q3_K's and q6_K's sub-blocks
-//!   [`fit_scale_and_offset`] unsigned levels with an offset - q2_K, q4_K, q5_K
+//!   [`fit_scales_and_offsets`] unsigned levels with an offset - q2_K, q4_K, q5_K
 //!   [`fit_unsigned_scale`]   the SECOND stage: the scales themselves, quantised in turn
 //!   [`magnitude_weights`] what a value counts for when no importance matrix says
 
@@ -154,6 +154,9 @@ const GRID_MIN: f32 = -0.9;
 const GRID_STEP: f32 = 0.05;
 const GRID_STEPS: usize = 36;
 
+/// The longest sub-block a k-quant fits.
+const MAX_SUB: usize = 32;
+
 /// Fit `x` to levels `0..=nmax` under an affine reconstruction `scale.l + min`, and return
 /// `(scale, -min)` - the caller stores the negated minimum, which is how the k-quant block
 /// formats spell it.
@@ -168,92 +171,135 @@ const GRID_STEPS: usize = 36;
 /// reimplementation honouring both still moved q2_K's importance-matrix ratio from 0.780 to
 /// 0.792, and shipping a degradation that is not understood is worse than keeping the shape
 /// that is measured.
-pub(super) fn fit_scale_and_offset(nmax: i32, x: &[f32], weights: &[f32]) -> (f32, f32) {
-    let n = x.len();
-    let mut levels: [u8; 32] = [0; 32];
-
-    let mut offset = x[0];
-    let mut top = x[0];
-    let mut w_total = weights[0];
-    let mut wx_total = w_total * x[0];
-
-    for i in 1..n {
-        if x[i] < offset {
-            offset = x[i];
-        }
-        if x[i] > top {
-            top = x[i];
-        }
-        let w = weights[i];
-        w_total += w;
-        wx_total += w * x[i];
-    }
-
-    if offset > 0.0 {
-        offset = 0.0;
-    }
-
-    if top <= offset {
-        return (0.0, -offset);
-    }
-
-    let mut per_unit = nmax as f32 / (top - offset);
-    let mut scale = 1.0 / per_unit;
-    let mut best_error = 0.0;
-
-    for i in 0..n {
-        let level = nearest_int(per_unit * (x[i] - offset)).clamp(0, nmax) as u8;
-        let diff = scale * (level as f32) + offset - x[i];
-        let w = weights[i];
-        best_error += w * diff * diff;
-    }
-
-    for step in 0..=GRID_STEPS {
-        per_unit = (GRID_MIN + GRID_STEP * step as f32 + nmax as f32) / (top - offset);
-        let (mut wl, mut wl2, mut wxl) = (0.0, 0.0, 0.0);
-
+///
+/// `G` sub-blocks of `x.len() / G` values are fitted side by side, each to its own `(scale,
+/// -min)`: every sub-block runs exactly the arithmetic a fit of it alone runs, in the same order,
+/// so the result is the same to the bit; the sub-blocks are the lanes the arithmetic is
+/// vectorised over.
+pub(super) fn fit_scales_and_offsets<const G: usize>(
+    nmax: i32,
+    x: &[f32],
+    weights: &[f32],
+) -> [(f32, f32); G] {
+    let n = x.len() / G;
+    assert!(n > 0 && n <= MAX_SUB && x.len() == G * n && weights.len() == x.len());
+    // Value `i` of every sub-block side by side.
+    let mut xt = [[0f32; G]; MAX_SUB];
+    let mut wt = [[0f32; G]; MAX_SUB];
+    for g in 0..G {
         for i in 0..n {
-            let level = nearest_int(per_unit * (x[i] - offset)).clamp(0, nmax) as u8;
-            levels[i] = level;
-            let w = weights[i];
-            wl += w * level as f32;
-            wl2 += w * (level as f32).powi(2);
-            wxl += w * level as f32 * x[i];
+            xt[i][g] = x[g * n + i];
+            wt[i][g] = weights[g * n + i];
         }
+    }
+    let (xt, wt) = (&xt[..n], &wt[..n]);
+    let top_level = nmax as f32;
+    let level = |v: f32| (v.round() as i32).clamp(0, nmax) as f32;
 
-        let denom = w_total * wl2 - wl * wl;
-        if denom > 0.0 {
-            let mut candidate_scale = (w_total * wxl - wx_total * wl) / denom;
-            let mut candidate_offset = (wl2 * wx_total - wl * wxl) / denom;
-
-            if candidate_offset > 0.0 {
-                candidate_offset = 0.0;
-                candidate_scale = wxl / wl2;
+    let mut offset = xt[0];
+    let mut top = xt[0];
+    let mut w_total = wt[0];
+    let mut wx_total = [0f32; G];
+    for g in 0..G {
+        wx_total[g] = w_total[g] * xt[0][g];
+    }
+    for i in 1..n {
+        for g in 0..G {
+            let v = xt[i][g];
+            if v < offset[g] {
+                offset[g] = v;
             }
-
-            let mut error = 0.0;
-            for i in 0..n {
-                let diff = candidate_scale * (levels[i] as f32) + candidate_offset - x[i];
-                let w = weights[i];
-                error += w * diff * diff;
+            if v > top[g] {
+                top[g] = v;
             }
+            w_total[g] += wt[i][g];
+            wx_total[g] += wt[i][g] * v;
+        }
+    }
+    let mut flat = [false; G];
+    for g in 0..G {
+        if offset[g] > 0.0 {
+            offset[g] = 0.0;
+        }
+        flat[g] = top[g] <= offset[g];
+    }
 
-            if error < best_error {
-                best_error = error;
-                scale = candidate_scale;
-                offset = candidate_offset;
+    let mut per_unit = [0f32; G];
+    let mut scale = [0f32; G];
+    let mut best_error = [0f32; G];
+    for g in 0..G {
+        per_unit[g] = top_level / (top[g] - offset[g]);
+        scale[g] = 1.0 / per_unit[g];
+    }
+    for i in 0..n {
+        for g in 0..G {
+            let diff =
+                scale[g] * level(per_unit[g] * (xt[i][g] - offset[g])) + offset[g] - xt[i][g];
+            best_error[g] += wt[i][g] * diff * diff;
+        }
+    }
+
+    let mut levels = [[0f32; G]; MAX_SUB];
+    for step in 0..=GRID_STEPS {
+        for g in 0..G {
+            per_unit[g] = (GRID_MIN + GRID_STEP * step as f32 + top_level) / (top[g] - offset[g]);
+        }
+        let (mut wl, mut wl2, mut wxl) = ([0f32; G], [0f32; G], [0f32; G]);
+        for i in 0..n {
+            for g in 0..G {
+                let l = level(per_unit[g] * (xt[i][g] - offset[g]));
+                levels[i][g] = l;
+                let w = wt[i][g];
+                wl[g] += w * l;
+                wl2[g] += w * l.powi(2);
+                wxl[g] += w * l * xt[i][g];
+            }
+        }
+        let mut candidate_scale = [0f32; G];
+        let mut candidate_offset = [0f32; G];
+        let mut fits = [false; G];
+        for g in 0..G {
+            let denom = w_total[g] * wl2[g] - wl[g] * wl[g];
+            fits[g] = denom > 0.0;
+            candidate_scale[g] = (w_total[g] * wxl[g] - wx_total[g] * wl[g]) / denom;
+            candidate_offset[g] = (wl2[g] * wx_total[g] - wl[g] * wxl[g]) / denom;
+            if candidate_offset[g] > 0.0 {
+                candidate_offset[g] = 0.0;
+                candidate_scale[g] = wxl[g] / wl2[g];
+            }
+        }
+        let mut error = [0f32; G];
+        for i in 0..n {
+            for g in 0..G {
+                let diff = candidate_scale[g] * levels[i][g] + candidate_offset[g] - xt[i][g];
+                error[g] += wt[i][g] * diff * diff;
+            }
+        }
+        for g in 0..G {
+            if fits[g] && !flat[g] && error[g] < best_error[g] {
+                best_error[g] = error[g];
+                scale[g] = candidate_scale[g];
+                offset[g] = candidate_offset[g];
             }
         }
     }
 
-    (scale, -offset)
+    let mut out = [(0f32, 0f32); G];
+    for g in 0..G {
+        out[g] = if flat[g] {
+            (0.0, -offset[g])
+        } else {
+            (scale[g], -offset[g])
+        };
+    }
+    out
 }
 
 /// Fit non-negative `x` to levels `0..=nmax` with no offset, writing the levels into `l` and
 /// returning the scale.
 ///
 /// This is the second stage of a k-quant block: the per-sub-block scales and minimums that
-/// `fit_scale_and_offset` produced are themselves quantised, against `quant_weights` - the weight
+/// `fit_scales_and_offsets` produced are themselves quantised, against `quant_weights` - the weight
 /// each sub-block carries, so a scale that governs many large values is fitted more tightly
 /// than one that governs noise.
 pub(super) fn fit_unsigned_scale(nmax: u8, x: &[f32], l: &mut [u8], quant_weights: &[f32]) -> f32 {

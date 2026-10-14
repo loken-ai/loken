@@ -167,6 +167,8 @@ struct TensorSource<'a> {
     /// The Q and K rows are in the order the checkpoint's framework wrote them, not the
     /// order a GGUF converter leaves them in.
     hf_rows: bool,
+    /// The split set, which says which tensors are stored one less than they are read.
+    split: Option<&'a crate::tensor::quantized::gguf_source::SplitGguf>,
 }
 
 struct TensorPart<'a> {
@@ -176,11 +178,69 @@ struct TensorPart<'a> {
     owner: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
+/// The tensor `info` lists in `part`, quantised to `to` on the host and placed on `device`: its
+/// rows are taken from `stored_rows` rows of each leading index of the stored tensor, from the
+/// row its offset starts at. Each run of rows is quantised on its own worker.
+fn quantised_as_read(
+    part: &TensorPart<'_>,
+    info: &gguf_file::TensorInfo,
+    stored_rows: usize,
+    to: crate::tensor::quantized::GgmlDType,
+    device: &Device,
+) -> crate::tensor::Result<QTensor> {
+    use rayon::prelude::*;
+    let dims = info.shape.dims().to_vec();
+    let cols = dims.last().copied().unwrap_or(1);
+    let rows = dims.len().checked_sub(2).map_or(1, |i| dims[i]);
+    let leading = info.elem_count() / (rows * cols).max(1);
+    let from = info.ggml_dtype;
+    let row_bytes = cols / from.block_size() * from.type_size();
+    let base = part.content.tensor_data_offset as usize + info.offset as usize;
+    // Runs of rows inside one leading index, several for each worker.
+    let per_run = (leading * rows)
+        .div_ceil(rayon::current_num_threads().max(1) * 4)
+        .clamp(1, rows);
+    let runs: Vec<(usize, usize)> = (0..leading)
+        .flat_map(|l| {
+            (0..rows).step_by(per_run).map(move |r| {
+                (
+                    base + (l * stored_rows + r) * row_bytes,
+                    per_run.min(rows - r),
+                )
+            })
+        })
+        .collect();
+    let quantised = runs
+        .par_iter()
+        .map(|&(at, n)| {
+            let stored = part.bytes.get(at..at + n * row_bytes).ok_or_else(|| {
+                crate::tensor::Error::msg(format!("rows past the end of the mapping at {at}"))
+            })?;
+            let mut values = vec![0f32; n * cols];
+            // CONVERSION: a tensor held in another format than stored, quantised as it is read.
+            crate::tensor::quant_cpu::to_float_bytes(from, stored, &mut values)
+                .and_then(|()| crate::tensor::quant_cpu::from_float_bytes(to, &values))
+                .map_err(|e| crate::tensor::Error::msg(e.to_string()))
+        })
+        .collect::<crate::tensor::Result<Vec<Vec<u8>>>>()?
+        .concat();
+    crate::tensor::conversion::record_kept(
+        "held",
+        from.gguf_name(),
+        to.gguf_name(),
+        (info.elem_count() / from.block_size() * from.type_size()) as u64,
+        quantised.len() as u64,
+        "a tensor listed held in another format than stored",
+    );
+    QTensor::from_ggml_bytes(to, &quantised, dims, device)
+}
+
 impl<'a> TensorSource<'a> {
     /// One mapped file: every tensor is in it.
     fn one(content: &'a gguf_file::Content, bytes: &'a [u8]) -> Self {
         Self {
             hf_rows: false,
+            split: None,
             owner: HashMap::new(),
             parts: vec![TensorPart {
                 content,
@@ -211,6 +271,7 @@ impl<'a> TensorSource<'a> {
             parts,
             owner,
             hf_rows: false,
+            split: Some(split),
         }
     }
 
@@ -243,6 +304,7 @@ impl<'a> TensorSource<'a> {
             parts,
             owner,
             hf_rows: true,
+            split: None,
         }
     }
 
@@ -271,6 +333,33 @@ impl<'a> TensorSource<'a> {
         let Some(info) = part.content.tensor_infos.get(name) else {
             return Ok(None);
         };
+        if let Some((to, stored_rows)) = self.split.and_then(|s| s.held(name)) {
+            return Ok(Some(quantised_as_read(
+                part,
+                info,
+                stored_rows,
+                to,
+                device,
+            )?));
+        }
+        if self.split.is_some_and(|s| s.stored_one_less(name)) {
+            // CONVERSION: a norm stored as the checkpoint keeps it is read as the model's own
+            // file holds it, one more, in F32.
+            let stored = info.read_slice_owned(
+                part.bytes,
+                part.content.tensor_data_offset,
+                &Device::Cpu,
+                part.owner.as_ref(),
+            )?;
+            // CONVERSION: widened to F32 on the host, one added (declared above).
+            let read = (stored.dequantize(&Device::Cpu)?.to_dtype(DType::F32)? + 1.0)?;
+            // CONVERSION: held F32 on the reader's device (declared above).
+            return Ok(Some(QTensor::quantize_onto(
+                &read,
+                crate::tensor::quantized::GgmlDType::F32,
+                device,
+            )?));
+        }
         if self.hf_rows
             && info.shape.dims().len() == 1
             && info.ggml_dtype != crate::tensor::quantized::GgmlDType::F32
@@ -4275,6 +4364,99 @@ mod source_tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, want, "the split set changed the logits");
     }
+
+    /// A part listed under other names reads each tensor over the stored one: the rows it
+    /// takes, the dimensions of one dropped, a norm stored one less read one more. The stored
+    /// names leave the set.
+    #[test]
+    fn a_relisted_part_reads_its_tensors_as_listed() {
+        use crate::tensor::quantized::gguf_source::Relisted;
+        use crate::tensor::quantized::GgmlDType;
+        let dir = std::env::temp_dir().join(format!("loken-relist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("m.gguf");
+        write_gguf_with_metadata(&model, &metadata(), &entries()).unwrap();
+        let cols = 32;
+        let values = |n: usize, at: f32| -> Vec<f32> { (0..n).map(|i| at + i as f32).collect() };
+        let f32_entry = |name: &str, dims: Vec<usize>, v: &[f32]| GgufEntry {
+            name: name.to_string(),
+            dims,
+            dtype: GgmlDType::F32,
+            data: v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        };
+        let (w, n, g) = (values(4 * cols, 0.0), values(cols, 0.5), values(cols, 7.0));
+        let stack = values(2 * 4 * cols, -100.0);
+        let head = dir.join("m.mtp.gguf");
+        write_gguf_with_metadata(
+            &head,
+            &[],
+            &[
+                f32_entry("w", vec![4, cols], &w),
+                f32_entry("n", vec![cols], &n),
+                f32_entry("g", vec![1, cols], &g),
+                f32_entry("s", vec![2, 4, cols], &stack),
+            ],
+        )
+        .unwrap();
+        let mut set = SplitGguf::open_with(&model, std::slice::from_ref(&head)).unwrap();
+        let listed = |name: &str, source: &str, rows, plus_one| Relisted {
+            name: name.to_string(),
+            source: source.to_string(),
+            rows,
+            plus_one,
+            held: None,
+        };
+        let q8 = GgmlDType::Q8_0;
+        set.relist(
+            1,
+            &[
+                listed("rows", "w", Some((1, 2)), false),
+                listed("norm", "n", None, true),
+                listed("gate", "g", None, false),
+                Relisted {
+                    held: Some(q8),
+                    ..listed("halves", "s", Some((2, 2)), false)
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(set.merged_content().tensor_infos["halves"].ggml_dtype, q8);
+        let source = TensorSource::of_split(&set);
+        let read = |name: &str| -> (Vec<usize>, Vec<f32>) {
+            let t = source
+                .read(name, &Device::Cpu)
+                .unwrap()
+                .dequantize(&Device::Cpu)
+                .unwrap();
+            (
+                t.dims().to_vec(),
+                t.flatten_all().unwrap().to_vec1().unwrap(),
+            )
+        };
+        assert_eq!(read("rows"), (vec![2, cols], w[cols..3 * cols].to_vec()));
+        let plus: Vec<f32> = n.iter().map(|v| v + 1.0).collect();
+        assert_eq!(read("norm"), (vec![cols], plus));
+        assert_eq!(read("gate"), (vec![cols], g.clone()));
+        assert!(source.read_opt("w", &Device::Cpu).unwrap().is_none());
+        // The last two rows of each matrix of the stack, quantised as they are read.
+        let picked: Vec<f32> = (0..2)
+            .flat_map(|l| stack[(l * 4 + 2) * cols..(l * 4 + 4) * cols].to_vec())
+            .collect();
+        let want = QTensor::quantize(
+            &Tensor::from_vec(picked, (2, 2, cols), &Device::Cpu).unwrap(),
+            q8,
+        )
+        .unwrap()
+        .dequantize(&Device::Cpu)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        assert_eq!(read("halves"), (vec![2, 2, cols], want));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -4303,6 +4485,7 @@ mod host_layer_bytes_tests {
             }],
             owner: HashMap::new(),
             hf_rows: false,
+            split: None,
         };
         let (owned, mapped) = part(None).host_layer_bytes(1);
         assert_eq!((owned, mapped), (total, 0));

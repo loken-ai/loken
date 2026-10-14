@@ -120,33 +120,43 @@ impl GenericTransformerLayer {
         Ok(())
     }
 
-    /// The rows of a recorded verify through this layer: the stages of the recorded decode
-    /// step over `rows` rows, the state before them kept first.
-    pub(super) fn forward_wide_graph_rows(&mut self, x: &Tensor, rows: usize) -> Result<Tensor> {
-        self.forward_wide_graph_rows_at(x, 0, rows)
-    }
-
-    /// [`Self::forward_wide_graph_rows`] for rows standing at `row0` among the verify's: the
-    /// positions, rotation rows and n-gram rows of the rows from there, the state before them
-    /// kept only for the verify's first rows.
+    /// The rows of a recorded verify through this layer, standing at `row0` among the verify's:
+    /// the stages of the recorded decode step over `rows` rows, with the positions, rotation rows
+    /// and n-gram rows of the rows from there, the state before them kept only for the verify's
+    /// first rows.
     pub(super) fn forward_wide_graph_rows_at(
         &mut self,
         x: &Tensor,
         row0: usize,
         rows: usize,
     ) -> Result<Tensor> {
-        self.forward_wide_graph_rows_chained(x, row0, rows, None, None)
+        self.forward_wide_graph_rows_chained(x, row0, rows, 0, None, None)
+            .map(|(r, _)| r)
+    }
+
+    /// [`Self::forward_wide_graph_rows_at`] from the first row where only the last row's output
+    /// is read: every row
+    /// takes its turn in the token mixer, its keys and values in the cache, and the feed-forward
+    /// runs on the last row alone, the rows returned being that one.
+    pub(super) fn forward_wide_graph_rows_last(
+        &mut self,
+        x: &Tensor,
+        rows: usize,
+    ) -> Result<Tensor> {
+        self.forward_wide_graph_rows_chained(x, 0, rows, rows.saturating_sub(1), None, None)
             .map(|(r, _)| r)
     }
 
     /// [`Self::forward_wide_graph_rows_at`] with the token mixer's norm of the rows given (`xn`,
     /// from the layer before), and the rows' norm for the next layer taken in the last
-    /// write-back when `next` holds that layer's gamma and epsilon: the rows and that norm.
+    /// write-back when `next` holds that layer's gamma and epsilon: the rows and that norm. The
+    /// feed-forward runs on the rows from `ffn_from` on, and those are the rows returned.
     pub(super) fn forward_wide_graph_rows_chained(
         &mut self,
         x: &Tensor,
         row0: usize,
         rows: usize,
+        ffn_from: usize,
         xn: Option<Tensor>,
         next: Option<(Tensor, f32)>,
     ) -> Result<(Tensor, Option<Tensor>)> {
@@ -247,10 +257,17 @@ impl GenericTransformerLayer {
                 d,
             )
         })?;
+        let xn = xn.expect("the norm was asked for");
+        let (r, xn) = match ffn_from {
+            0 => (r, xn),
+            from => (
+                r.narrow(1, from, rows - from)?.contiguous()?,
+                xn.narrow(1, from, rows - from)?.contiguous()?,
+            ),
+        };
         let (mixed, inj) = staged("mix_ffn", &dev, false, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
-            hc.ffn
-                .mix_on_card(&xn.expect("the norm was asked for"), true)
+            hc.ffn.mix_on_card(&xn, true)
         })?;
         let out = self.feed_forward(&mixed, &dev)?;
         staged("combine", &dev, false, || {
@@ -660,6 +677,7 @@ impl GenericHeteroTransformer {
                         &h,
                         0,
                         rows,
+                        0,
                         xn.take(),
                         next,
                     )?;
