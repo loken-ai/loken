@@ -414,7 +414,8 @@ impl QMatMul {
             }
             QMatMulKind::Gguf(
                 crate::tensor::quantized::QMatMul::Tensor(t)
-                | crate::tensor::quantized::QMatMul::TensorF16(t),
+                | crate::tensor::quantized::QMatMul::TensorF16(t)
+                | crate::tensor::quantized::QMatMul::Bf16(t),
             ) => (
                 t.dtype().as_str().to_string(),
                 (t.elem_count() * t.dtype().size_in_bytes()) as u64,
@@ -432,10 +433,27 @@ impl QMatMul {
         }
     }
 
+    /// The BF16 weight a card holds, when it carries no adapter.
+    pub fn bf16(&self) -> Option<&Tensor> {
+        match &self.inner {
+            QMatMulKind::Gguf(inner) if self.lora.is_empty() => inner.bf16(),
+            _ => None,
+        }
+    }
+
     pub fn from_qtensor(qtensor: QTensor) -> Result<Self> {
         let inner = crate::tensor::quantized::QMatMul::from_qtensor(qtensor)?;
         Ok(Self {
             inner: QMatMulKind::Gguf(inner),
+            lora: Vec::new(),
+            lora_fused: None,
+        })
+    }
+
+    /// The BF16 weight `qt` held as stored on the card `dev`.
+    pub fn bf16_onto(qt: &QTensor, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            inner: QMatMulKind::Gguf(crate::tensor::quantized::QMatMul::bf16_onto(qt, dev)?),
             lora: Vec::new(),
             lora_fused: None,
         })
@@ -680,7 +698,10 @@ impl QMatMul {
     pub fn device(&self) -> Device {
         match &self.inner {
             QMatMulKind::Gguf(crate::tensor::quantized::QMatMul::QTensor(t)) => t.device().clone(),
-            QMatMulKind::Gguf(crate::tensor::quantized::QMatMul::Tensor(t)) => t.device().clone(),
+            QMatMulKind::Gguf(
+                crate::tensor::quantized::QMatMul::Tensor(t)
+                | crate::tensor::quantized::QMatMul::Bf16(t),
+            ) => t.device().clone(),
             QMatMulKind::Awq(w) => w.qweight.device().clone(),
             _ => Device::Cpu,
         }

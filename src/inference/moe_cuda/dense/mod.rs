@@ -24,6 +24,8 @@ mod qk_prep;
 pub use qk_prep::*;
 mod shared_expert;
 pub use shared_expert::*;
+mod bf16;
+pub use bf16::*;
 
 thread_local! {
     static IN_PLACE_STATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

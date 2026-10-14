@@ -811,6 +811,9 @@ impl MoeWeights {
                     crate::tensor::quantized::QMatMul::Tensor(w) => {
                         crate::inference::moe_cuda::gate_gemv_f32(&xs, w)?
                     }
+                    crate::tensor::quantized::QMatMul::Bf16(w) => {
+                        crate::inference::moe_cuda::bf16_matvec(&xs, w)?
+                    }
                     _ => None,
                 };
                 let logits = match exact {

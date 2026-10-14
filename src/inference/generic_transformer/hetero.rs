@@ -1895,11 +1895,7 @@ impl GenericHeteroTransformer {
                 // hidden to the device the PLE projection lives on (GPU 0 when
                 // available, else CPU); avoids the host round-trip that used
                 // to dominate gemma4 prefill.
-                let proj_dev = match model_proj {
-                    crate::tensor::quantized::QMatMul::QTensor(qt) => qt.device().clone(),
-                    crate::tensor::quantized::QMatMul::Tensor(t) => t.device().clone(),
-                    crate::tensor::quantized::QMatMul::TensorF16(t) => t.device().clone(),
-                };
+                let proj_dev = model_proj.device();
                 let hidden_on_proj = if hidden.device().same_device(&proj_dev) {
                     hidden.clone()
                 } else {

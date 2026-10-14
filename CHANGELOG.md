@@ -24,6 +24,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- BF16 weights stay BF16 on a card instead of widened to F32 at the load.
 - Wide residual: mixers in half precision for a prompt, int8 rows for a step.
 - Decode: norms, rotations, shared experts and mixers run in fewer fused launches.
 - Linux: CUDA and OpenCL load at run time; without them the server runs on the host.

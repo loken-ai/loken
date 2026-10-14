@@ -1531,15 +1531,7 @@ fn build_generic_layer(
             |w: RawMixerWeights, streams: usize| -> Result<super::hyper::HyperMixer> {
                 // CONVERSION: a mixer's norm scale is a small vector held dense on the layer's device, whatever the file stores.
                 let gamma = w.norm.dequantize(&Device::Cpu)?.to_device(device)?;
-                super::hyper::HyperMixer::new(
-                    gamma,
-                    super::wide::load_matrix(w.down)?,
-                    super::wide::load_matrix(w.up)?,
-                    w.inject.map(super::wide::load_matrix).transpose()?,
-                    streams,
-                    dim,
-                    eps,
-                )
+                super::hyper::HyperMixer::new(gamma, w.down, w.up, w.inject, streams, dim, eps)
             };
         let hyper = match (config.hyper, wide.attn_mixer, wide.ffn_mixer) {
             (Some(h), Some(a), Some(f)) => Some(super::hyper::WideBlock {
@@ -1558,8 +1550,8 @@ fn build_generic_layer(
         let sparse = match (config.indexer, wide.indexer) {
             (Some(meta), Some(ix)) => Some(super::qsa::SparseAttention::new(
                 meta,
-                super::wide::load_matrix(ix.q_proj)?,
-                super::wide::load_matrix(ix.k_proj)?,
+                super::wide::load_matrix(ix.q_proj, device)?,
+                super::wide::load_matrix(ix.k_proj, device)?,
                 host(ix.q_norm)?,
                 host(ix.k_norm)?,
                 eps as f32,
@@ -1573,8 +1565,8 @@ fn build_generic_layer(
                 // CONVERSION: the n-gram block's norm vectors are small and held dense, whatever the file stores.
                 let dense = |qt: QTensor| -> Result<Tensor> { qt.dequantize(&Device::Cpu) };
                 Some(super::ngram::PleBlock::new(
-                    super::wide::load_matrix(n.key)?,
-                    super::wide::load_matrix(n.value)?,
+                    super::wide::load_matrix(n.key, device)?,
+                    super::wide::load_matrix(n.value, device)?,
                     dense(n.norm_key)?,
                     dense(n.norm_query)?,
                     dense(n.norm_conv)?,
@@ -2373,8 +2365,9 @@ impl GenericHeteroTransformer {
                 .dequantize(&Device::Cpu)?
                 .to_device(&dev)
         };
-        let matrix =
-            |name: &str| -> Result<QMatMul> { super::wide::load_matrix(source.read(name, &dev)?) };
+        let matrix = |name: &str| -> Result<QMatMul> {
+            super::wide::load_matrix(source.read(name, &Device::Cpu)?, &dev)
+        };
         let dim = config.embedding_length;
         let eps = config.rms_norm_eps;
         Ok(super::draft_head::DraftHead {
@@ -2388,8 +2381,8 @@ impl GenericHeteroTransformer {
             fc_hidden: matrix("mtp.fc_hidden.weight")?,
             mixer: super::hyper::HyperMixer::new(
                 dense("mtp.out_hc_norm.weight")?,
-                matrix("mtp.out_hc_down.weight")?,
-                matrix("mtp.out_hc_up.weight")?,
+                source.read("mtp.out_hc_down.weight", &Device::Cpu)?,
+                source.read("mtp.out_hc_up.weight", &Device::Cpu)?,
                 None,
                 hyper.streams,
                 dim,
@@ -3160,10 +3153,10 @@ impl GenericHeteroTransformer {
                         |stem: &str, inject: bool| -> crate::tensor::Result<RawMixerWeights> {
                             Ok(RawMixerWeights {
                                 norm: req_cpu!(&format!("{prefix}.{stem}_norm.weight"))?,
-                                down: req!(&format!("{prefix}.{stem}_down.weight"))?,
-                                up: req!(&format!("{prefix}.{stem}_up.weight"))?,
+                                down: req_cpu!(&format!("{prefix}.{stem}_down.weight"))?,
+                                up: req_cpu!(&format!("{prefix}.{stem}_up.weight"))?,
                                 inject: if inject {
-                                    Some(req!(&format!("{prefix}.{stem}_inject.weight"))?)
+                                    Some(req_cpu!(&format!("{prefix}.{stem}_inject.weight"))?)
                                 } else {
                                     None
                                 },
@@ -3171,8 +3164,8 @@ impl GenericHeteroTransformer {
                         };
                     let indexer = match (attends, config.indexer) {
                         (true, Some(_)) => Some(RawIndexer {
-                            q_proj: req!(&format!("{prefix}.indexer.q_proj.weight"))?,
-                            k_proj: req!(&format!("{prefix}.indexer.k_proj.weight"))?,
+                            q_proj: req_cpu!(&format!("{prefix}.indexer.q_proj.weight"))?,
+                            k_proj: req_cpu!(&format!("{prefix}.indexer.k_proj.weight"))?,
                             q_norm: req_cpu!(&format!("{prefix}.indexer.q_norm.weight"))?,
                             k_norm: req_cpu!(&format!("{prefix}.indexer.k_norm.weight"))?,
                         }),
@@ -3180,8 +3173,8 @@ impl GenericHeteroTransformer {
                     };
                     let ngram = match &config.ngram {
                         Some(n) if n.layer == idx => Some(RawNgram {
-                            key: req!(&format!("{prefix}.ple_key.weight"))?,
-                            value: req!(&format!("{prefix}.ple_value.weight"))?,
+                            key: req_cpu!(&format!("{prefix}.ple_key.weight"))?,
+                            value: req_cpu!(&format!("{prefix}.ple_value.weight"))?,
                             norm_key: req_cpu!(&format!("{prefix}.ple_norm_key.weight"))?,
                             norm_query: req_cpu!(&format!("{prefix}.ple_norm_query.weight"))?,
                             norm_conv: req_cpu!(&format!("{prefix}.ple_norm_conv.weight"))?,
@@ -3641,12 +3634,12 @@ impl GenericHeteroTransformer {
                     .read("output_hc_norm.weight", &Device::Cpu)?
                     .dequantize(&Device::Cpu)?
                     .to_device(&dev)?;
-                let down = source.read("output_hc_down.weight", &dev)?;
-                let up = source.read("output_hc_up.weight", &dev)?;
+                let down = source.read("output_hc_down.weight", &Device::Cpu)?;
+                let up = source.read("output_hc_up.weight", &Device::Cpu)?;
                 Some(super::hyper::HyperMixer::new(
                     gamma,
-                    super::wide::load_matrix(down)?,
-                    super::wide::load_matrix(up)?,
+                    down,
+                    up,
                     None,
                     h.streams,
                     config.embedding_length,

@@ -10,18 +10,20 @@ use super::*;
 use crate::inference::moe_cuda::StepPos;
 use crate::tensor::D;
 
-/// A weight as a projection that accepts the activations the wide residual carries: dense
-/// float weights are held as F32 whatever their stored width, quantised ones as they are.
-pub(super) fn load_matrix(qt: QTensor) -> Result<QMatMul> {
+/// A weight as a projection on `dev` that accepts the activations the wide residual carries: a
+/// BF16 weight on a card is held as stored, other dense float weights as F32, quantised ones as
+/// they are. The weight is placed on `dev` once, in the form it is held in.
+pub(super) fn load_matrix(qt: QTensor, dev: &Device) -> Result<QMatMul> {
     use crate::tensor::quantized::GgmlDType::{BF16, F16, F32};
     match qt.dtype() {
+        BF16 if dev.is_cuda() => QMatMul::bf16_onto(&qt, dev),
         F16 | BF16 => {
-            let dev = qt.device().clone();
             // CONVERSION: a float weight is held F32 beside the wide residual's F32 activations.
-            let w = qt.dequantize(&dev)?.to_dtype(DType::F32)?;
-            QMatMul::from_qtensor(QTensor::quantize_onto(&w, F32, &dev)?)
+            let w = qt.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?;
+            QMatMul::from_qtensor(QTensor::quantize_onto(&w, F32, dev)?)
         }
-        _ => QMatMul::from_qtensor(qt),
+        _ if qt.device().same_device(dev) => QMatMul::from_qtensor(qt),
+        _ => QMatMul::from_qtensor(qt.to_device(dev)?),
     }
 }
 
@@ -52,6 +54,7 @@ pub(super) fn sublayer_dtype_of(dev: &Device) -> DType {
 pub(super) fn dense_router(qt: QTensor) -> Result<crate::tensor::quantized::QMatMul> {
     use crate::tensor::quantized::GgmlDType::{BF16, F16, F32};
     match qt.dtype() {
+        BF16 if qt.device().is_cuda() => crate::tensor::quantized::QMatMul::from_qtensor(qt),
         F16 | BF16 => {
             let dev = qt.device().clone();
             // CONVERSION: a float router weight is held F32, as the wide residual's projections are.

@@ -319,6 +319,11 @@ fn expert_qmms(weights: &Arc<QTensor>) -> Option<Arc<Vec<QMatMul>>> {
 }
 
 // -- optional fused router/conv helpers: None -> caller uses its portable fallback -
+/// Rows one launch of the BF16 product takes on a card.
+pub const BF16_MATVEC_ROWS: usize = 8;
+pub fn bf16_matvec(_x: &Tensor, _w: &Tensor) -> Result<Option<Tensor>> {
+    Ok(None)
+}
 pub fn gate_gemv_f32(_xs: &Tensor, _gate_w: &Tensor) -> Result<Option<Tensor>> {
     Ok(None)
 }

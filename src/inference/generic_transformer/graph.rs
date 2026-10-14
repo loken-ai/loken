@@ -1628,11 +1628,7 @@ impl GenericHeteroTransformer {
             })?
             .clone();
         let (b, seq_h, _) = hidden.dims3()?;
-        let proj_dev = match model_proj {
-            crate::tensor::quantized::QMatMul::QTensor(qt) => qt.device().clone(),
-            crate::tensor::quantized::QMatMul::Tensor(t) => t.device().clone(),
-            crate::tensor::quantized::QMatMul::TensorF16(t) => t.device().clone(),
-        };
+        let proj_dev = model_proj.device();
         let hidden_on_proj = if hidden.device().same_device(&proj_dev) {
             hidden.clone()
         } else {

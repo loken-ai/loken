@@ -173,6 +173,8 @@ cuda_launchers! {
     loken_head_rmsnorm(x: *const f32, w: *const f32, y: *mut f32, n: i32, d: i32, eps: f32);
     loken_gate_gemv_f32(xs: *const c_void, gate_w: *const c_void,
         logits: *mut c_void, hidden: i32, n_rows: i32, n_experts: i32);
+    loken_bf16_matvec(x: *const c_void, w: *const c_void, y: *mut c_void, k: i32, n: i32,
+        rows: i32);
     loken_gate_topk_softmax(xs: *const c_void, gate_w: *const c_void,
         weights: *mut c_void, ids: *mut c_void, hidden: i32, n_rows: i32,
         n_experts: i32, n_expert_used: i32, with_norm: i32);

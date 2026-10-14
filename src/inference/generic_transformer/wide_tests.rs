@@ -681,10 +681,10 @@ fn the_fused_mixer_reads_int8_rows_like_the_widened_weights() {
             .unwrap()
     };
     let (down, up) = (matrix(rank, k), matrix(k, rank));
-    let (qd, sd) = hyper::int8_rows(&down)
+    let (qd, sd) = hyper::int8_rows(&down, &down.device())
         .unwrap()
         .expect("within the tolerance");
-    let (qu, su) = hyper::int8_rows(&up)
+    let (qu, su) = hyper::int8_rows(&up, &up.device())
         .unwrap()
         .expect("within the tolerance");
     // What the rows widen to is what the launches must reproduce.

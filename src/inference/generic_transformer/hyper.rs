@@ -8,6 +8,8 @@
 use super::config::meta_u32;
 use super::gguf_file;
 use super::{QMatMul, Result, Tensor};
+use crate::tensor::quantized::QTensor;
+use crate::tensor::Device;
 use crate::tensor::{DType, D};
 
 /// The wide residual's dimensions, from the file's `hyper_connection.*` metadata.
@@ -74,11 +76,28 @@ enum Weight {
     Plain(QMatMul),
 }
 
-/// The rows of the dense F32 weight `t` as int8 with a scale for each group of 64 values, on `t`'s
-/// card; `None` when that would move the weight by more than [`INT8_TOLERANCE`], or when a row is
+/// A two-dimensional weight stored in a dense float width, as F32 on the host.
+#[cfg(feature = "cuda")]
+fn host_f32(w: &crate::tensor::quantized::QTensor) -> Result<Option<Tensor>> {
+    use crate::tensor::quantized::GgmlDType::{BF16, F16, F32};
+    if !matches!(w.dtype(), F32 | F16 | BF16) || w.shape().dims().len() != 2 {
+        return Ok(None);
+    }
+    // CONVERSION: widened on the host at load for the int8 rows or the F16 check, then dropped.
+    Ok(Some(
+        w.dequantize(&crate::tensor::Device::Cpu)?
+            .to_dtype(DType::F32)?,
+    ))
+}
+
+/// The rows of the dense F32 weight `t` as int8 with a scale for each group of 64 values, on
+/// `dev`; `None` when that would move the weight by more than [`INT8_TOLERANCE`], or when a row is
 /// not a whole number of groups.
 #[cfg(feature = "cuda")]
-pub(super) fn int8_rows(t: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
+pub(super) fn int8_rows(
+    t: &Tensor,
+    dev: &crate::tensor::Device,
+) -> Result<Option<(Tensor, Tensor)>> {
     let (n, k) = t.dims2()?;
     let group = crate::inference::moe_cuda::INT8_GROUP;
     if k % group != 0 {
@@ -112,31 +131,27 @@ pub(super) fn int8_rows(t: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
     }
     let host_dev = crate::tensor::Device::Cpu;
     Ok(Some((
-        Tensor::from_vec(q, (n, k), &host_dev)?.to_device(&t.device())?,
-        Tensor::from_vec(scale, (n, k / group), &host_dev)?.to_device(&t.device())?,
+        Tensor::from_vec(q, (n, k), &host_dev)?.to_device(dev)?,
+        Tensor::from_vec(scale, (n, k / group), &host_dev)?.to_device(dev)?,
     )))
 }
 
 impl Weight {
-    /// The mixer's weights held together: as int8 rows when every one of them can be, since the
-    /// fused launches read the three in one format, else each as [`Self::pack_exact`] has it.
+    /// The mixer's weights held together on `dev`: as int8 rows when every one of them can be,
+    /// since the fused launches read the three in one format, else each as [`Self::pack_exact`]
+    /// has it. Each is placed on `dev` once, in the form it is held in.
     fn pack_all(
-        down: QMatMul,
-        up: QMatMul,
-        inject: Option<QMatMul>,
+        down: QTensor,
+        up: QTensor,
+        inject: Option<QTensor>,
+        dev: &Device,
     ) -> Result<(Self, Self, Option<Self>)> {
         #[cfg(feature = "cuda")]
-        {
-            let rows = |w: &QMatMul| -> Result<Option<(Tensor, Tensor)>> {
-                match w.dense() {
-                    Some(t)
-                        if t.dtype() == DType::F32
-                            && t.device().is_cuda()
-                            && t.dims().len() == 2 =>
-                    {
-                        int8_rows(t)
-                    }
-                    _ => Ok(None),
+        if dev.is_cuda() {
+            let rows = |w: &QTensor| -> Result<Option<(Tensor, Tensor)>> {
+                match host_f32(w)? {
+                    Some(t) => int8_rows(&t, dev),
+                    None => Ok(None),
                 }
             };
             let (d, u) = (rows(&down)?, rows(&up)?);
@@ -153,31 +168,35 @@ impl Weight {
             }
         }
         Ok((
-            Self::pack_exact(down)?,
-            Self::pack_exact(up)?,
-            inject.map(Self::pack_exact).transpose()?,
+            Self::pack_exact(down, dev)?,
+            Self::pack_exact(up, dev)?,
+            inject.map(|w| Self::pack_exact(w, dev)).transpose()?,
         ))
     }
 
-    fn pack_exact(w: QMatMul) -> Result<Self> {
+    fn pack_exact(w: QTensor, dev: &Device) -> Result<Self> {
         #[cfg(feature = "cuda")]
-        if let Some(t) = w.dense() {
-            if t.dtype() == DType::F32 && t.device().is_cuda() && t.dims().len() == 2 {
-                // CONVERSION: a dense mixer weight is held F16 on a card when that loses
-                // nothing the weight had: a stored BF16 weight is exact in it but for the
-                // values under its smallest normal, which move by less than 1e-7.
-                let half = t.contiguous()?.to_dtype(DType::F16)?;
-                let worst = (t - half.to_dtype(DType::F32)?)?
+        if dev.is_cuda() {
+            if let Some(t) = host_f32(&w)? {
+                // CONVERSION: a dense mixer weight is held F16 on a card when that loses nothing
+                // the weight had: a stored BF16 weight is exact in it but for the values under
+                // its smallest normal, which move by less than 1e-7.
+                let half = t.to_dtype(DType::F16)?;
+                let worst = (&t - half.to_dtype(DType::F32)?)?
                     .abs()?
                     .flatten_all()?
                     .max_keepdim(0)?
                     .to_vec1::<f32>()?[0];
                 if worst <= 1e-7 {
-                    return Ok(Weight::Half(half));
+                    return Ok(Weight::Half(half.to_device(dev)?));
                 }
+                // CONVERSION: the fused launches read a mixer weight F16 or F32.
+                return Ok(Weight::Plain(QMatMul::from_qtensor(
+                    QTensor::quantize_onto(&t, crate::tensor::quantized::GgmlDType::F32, dev)?,
+                )?));
             }
         }
-        Ok(Weight::Plain(w))
+        Ok(Weight::Plain(super::wide::load_matrix(w, dev)?))
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -266,15 +285,16 @@ impl Weight {
 impl HyperMixer {
     pub fn new(
         gamma: Tensor,
-        down: QMatMul,
-        up: QMatMul,
-        inject: Option<QMatMul>,
+        down: QTensor,
+        up: QTensor,
+        inject: Option<QTensor>,
         streams: usize,
         dim: usize,
         eps: f64,
     ) -> Result<Self> {
+        let dev = gamma.device().clone();
         let gamma = gamma.to_dtype(DType::F32)?.reshape(streams * dim)?;
-        let (down, up, inject) = Weight::pack_all(down, up, inject)?;
+        let (down, up, inject) = Weight::pack_all(down, up, inject, &dev)?;
         Ok(Self {
             gamma,
             down,
