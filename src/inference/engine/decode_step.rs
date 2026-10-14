@@ -372,6 +372,10 @@ const DRAFT_RETRY_STEPS: u32 = 48;
 const DRAFT_RETRY_MAX: u32 = 1536;
 /// The odds a drafted token must have while the policy has not measured what a row costs.
 const DRAFT_EVEN_ODDS: f32 = 0.5;
+
+/// The odds the model's own head has to give a guess for it to join a window: a draft runs as
+/// far as the window carries and ends at the first guess below them.
+pub(crate) const HEAD_MIN_ODDS: f32 = DRAFT_EVEN_ODDS;
 /// Cycles a drafter is given before its acceptance is trusted against the plain step: the
 /// smoothed survival of its first cycle alone undercounts a drafter that is mostly right.
 const DRAFT_PROBES: u32 = 4;

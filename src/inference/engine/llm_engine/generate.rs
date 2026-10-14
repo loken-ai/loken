@@ -592,7 +592,7 @@ impl LlmEngine {
             // The model's own draft head drafts when no drafter model does and its cycles are
             // not known to lose to plain decoding; the tokens it reads next start as the one
             // the prefill sampled.
-            let mut head_on = head_capable && !spec_on && spec_engine.draft_length() > 0;
+            let mut head_on = head_capable && !spec_on;
             if head_capable && !head_on {
                 state.model.draft_head_capture(false);
             }
@@ -600,8 +600,7 @@ impl LlmEngine {
             let mut head_tokens: Vec<u32> = vec![next_token];
             // What the head's cycles came to: verifies, of them recorded, and steps it had no
             // guess for.
-            let (mut head_cycles, mut head_recorded, mut head_empty, mut head_unsure): (u64, u64, u64, u64) =
-                (0, 0, 0, 0);
+            let (mut head_cycles, mut head_recorded, mut head_empty): (u64, u64, u64) = (0, 0, 0);
             // What settling the recorded windows cost, summed, and how many settled.
             let (mut settle_secs, mut settles) = (0f64, 0u64);
             let (mut spec_drafted, mut spec_accepted): (u64, u64) = (0, 0);
@@ -914,16 +913,14 @@ impl LlmEngine {
                     // recorded step's kernels, which an eager step before the recording does not
                     // run (its indexed attention selects on the host).
                     let head_draft: Vec<u32> = if head_on && cuda_graph.is_some() {
-                        let want = spec_engine.draft_length();
-                        if want == 0 {
-                            Vec::new()
-                        } else {
-                            state.model.draft_head_tokens(
-                                &head_tokens,
-                                want,
-                                spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).min_odds(),
-                            )
-                        }
+                        // The head drafts as far as the window carries, each guess while it is
+                        // confident enough.
+                        use crate::inference::engine::decode_step::{DRAFT_MAX, HEAD_MIN_ODDS};
+                        let want = match state.model.verify_window_rows() {
+                            0 => DRAFT_MAX,
+                            rows => DRAFT_MAX.min(rows - 1),
+                        };
+                        state.model.draft_head_tokens(&head_tokens, want, HEAD_MIN_ODDS)
                     } else {
                         // Before the step is recorded the head drafts nothing, but reads the
                         // step's pair so that its history follows the sequence.
@@ -936,9 +933,6 @@ impl LlmEngine {
                     let head_draft_secs = head_draft_started.elapsed().as_secs_f64();
                     if head_on && head_draft.is_empty() {
                         head_empty += 1;
-                        if spec_engine.draft_length() > 0 {
-                            head_unsure += 1;
-                        }
                     }
                     let verify_step = spec_on
                         || !head_draft.is_empty()
@@ -1546,7 +1540,13 @@ impl LlmEngine {
                     // The draft length is learned across cycles (decode_step::DraftLength).
                     let cycle_start = head_draft_started;
                     let mut draft_secs = 0.0;
-                    let want = if spec_on || head_on { spec_engine.draft_length() } else { 0 };
+                    let want = if spec_on {
+                        spec_engine.draft_length()
+                    } else if head_on {
+                        crate::inference::engine::decode_step::DRAFT_MAX
+                    } else {
+                        0
+                    };
                     if spec_on && want == 0 {
                         // Plain decoding pays more; the drafter's cache is left behind for good.
                         spec_on = false;
@@ -1913,7 +1913,7 @@ impl LlmEngine {
                     (length.next(), length.summary())
                 };
                 info!(
-                    "Spec decode done: drafted={spec_drafted} accepted={spec_accepted} ({}%), next draft length {next_length}; head: {head_cycles} verifies ({head_recorded} recorded, settled in {:.1} ms each), {head_empty} steps without a guess ({head_unsure} the head was unsure of); {summary}",
+                    "Spec decode done: drafted={spec_drafted} accepted={spec_accepted} ({}%), next draft length {next_length}; head: {head_cycles} verifies ({head_recorded} recorded, settled in {:.1} ms each), {head_empty} steps without a guess; {summary}",
                     (spec_accepted * 100) / spec_drafted.max(1),
                     settle_secs * 1e3 / settles.max(1) as f64,
                 );

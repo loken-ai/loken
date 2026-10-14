@@ -1117,7 +1117,7 @@ impl LlmEngine {
             // The model's own draft head drafts when no drafter model does and its cycles are
             // not known to lose to plain decoding; the tokens it reads next start as the one
             // the prefill sampled.
-            let mut head_on = head_capable && !spec_on && spec_engine.draft_length() > 0;
+            let mut head_on = head_capable && !spec_on;
             if head_capable && !head_on {
                 if let Some(s) = model_state.blocking_lock().as_mut() {
                     s.model.draft_head_capture(false);
@@ -1133,12 +1133,7 @@ impl LlmEngine {
             let mut window_cap = usize::MAX;
             // What the head's cycles came to: verifies, of them recorded, and steps it had no
             // guess for.
-            let (mut head_cycles, mut head_recorded, mut head_empty, mut head_unsure): (
-                u64,
-                u64,
-                u64,
-                u64,
-            ) = (0, 0, 0, 0);
+            let (mut head_cycles, mut head_recorded, mut head_empty): (u64, u64, u64) = (0, 0, 0);
             // What settling the recorded windows cost, summed, and how many settled; what the
             // replays and the commits of the verifies cost, summed.
             let (mut settle_secs, mut settles) = (0f64, 0u64);
@@ -1626,31 +1621,26 @@ impl LlmEngine {
                         && pld_cost.worth_trying()
                         && !super::decode::copy_draft(&pld_cache).is_empty();
                     let head_draft: Vec<u32> = if head_on && cuda_graph.is_some() && !copy_ready {
-                        let want = spec_engine.draft_length();
-                        if want == 0 {
-                            Vec::new()
-                        } else {
-                            match model_state.blocking_lock().as_mut() {
-                                Some(s) => {
-                                    let rows = s.model.verify_window_rows();
-                                    let mut length = spec_engine
-                                        .draft_length
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner());
-                                    let want = match rows {
-                                        0 => want,
-                                        rows => {
-                                            length.cap_rows(rows);
-                                            window_cap = rows - 1;
-                                            want.min(rows - 1)
-                                        }
-                                    };
-                                    let min_odds = length.min_odds();
-                                    drop(length);
-                                    s.model.draft_head_tokens(&head_tokens, want, min_odds)
-                                }
-                                None => Vec::new(),
+                        // The head drafts as far as the window carries, each guess while it is
+                        // confident enough.
+                        use crate::inference::engine::decode_step::{DRAFT_MAX, HEAD_MIN_ODDS};
+                        match model_state.blocking_lock().as_mut() {
+                            Some(s) => {
+                                let want = match s.model.verify_window_rows() {
+                                    0 => DRAFT_MAX,
+                                    rows => {
+                                        spec_engine
+                                            .draft_length
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .cap_rows(rows);
+                                        window_cap = rows - 1;
+                                        DRAFT_MAX.min(rows - 1)
+                                    }
+                                };
+                                s.model.draft_head_tokens(&head_tokens, want, HEAD_MIN_ODDS)
                             }
+                            None => Vec::new(),
                         }
                     } else {
                         Vec::new()
@@ -1659,9 +1649,6 @@ impl LlmEngine {
                     head_attempt_ns += (head_draft_secs * 1e9) as u64;
                     if head_on && head_draft.is_empty() && !copy_ready {
                         head_empty += 1;
-                        if spec_engine.draft_length() > 0 {
-                            head_unsure += 1;
-                        }
                     }
                     #[cfg(feature = "cuda")]
                     let graph_step: Option<(u32, Option<Tensor>)> = 'graph_blk: {
@@ -2117,8 +2104,10 @@ impl LlmEngine {
                     // The draft length is learned across cycles (decode_step::DraftLength).
                     let cycle_start = head_draft_started;
                     let mut draft_secs = 0.0;
-                    let want = if spec_on || head_on {
+                    let want = if spec_on {
                         spec_engine.draft_length()
+                    } else if head_on {
+                        crate::inference::engine::decode_step::DRAFT_MAX
                     } else {
                         0
                     };
@@ -2714,7 +2703,7 @@ impl LlmEngine {
                 }
                 if spec_drafted > 0 || head_cycles > 0 || head_empty > 0 {
                     info!(
-                        "Spec decode done: drafted={} accepted={} ({}%), next draft length {}; copies: {copy_windows} windows, {copy_accepted} of {copy_drafted} kept; plain step: {} launch, {} wait, {} sample ms over {plain_steps}; head: {head_cycles} verifies ({head_recorded} recorded: replayed in {:.1} ms of which {:.1} preparing and {:.1} launching, committed in {:.1} ms, settled in {:.1} ms each), {head_empty} steps without a guess ({head_unsure} the head was unsure of); {}; loop {:.1} ms an iteration ({} iterations), before the cycle {:.1} ms, after it {:.1} ms, the head's attempt {:.1} ms; a window's iteration before the verify {:.1} ms, from its commit to the cycle's end {:.1} ms",
+                        "Spec decode done: drafted={} accepted={} ({}%), next draft length {}; copies: {copy_windows} windows, {copy_accepted} of {copy_drafted} kept; plain step: {} launch, {} wait, {} sample ms over {plain_steps}; head: {head_cycles} verifies ({head_recorded} recorded: replayed in {:.1} ms of which {:.1} preparing and {:.1} launching, committed in {:.1} ms, settled in {:.1} ms each), {head_empty} steps without a guess; {}; loop {:.1} ms an iteration ({} iterations), before the cycle {:.1} ms, after it {:.1} ms, the head's attempt {:.1} ms; a window's iteration before the verify {:.1} ms, from its commit to the cycle's end {:.1} ms",
                         spec_drafted,
                         spec_accepted,
                         spec_accepted * 100 / spec_drafted.max(1),
