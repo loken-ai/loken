@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- CPU: AVX-512 kernels for the quantized GEMMs and dots.
 - CPU: the SIMD level is chosen at start and capped by the cpu level setting.
 - Build: LOKEN_CUDA_ARCHS builds the kernels for the named architectures only.
 - Prefill: a long prompt crosses each layer once, chunks sized for the tightest card.

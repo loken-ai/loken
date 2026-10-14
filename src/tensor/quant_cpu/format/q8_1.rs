@@ -61,8 +61,14 @@ impl BlockFormat for BlockQ8_1 {
     }
 
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        #[cfg(target_feature = "avx2")]
-        return super::super::avx::vec_dot_q8_1_q8_1(xs, ys);
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx512() {
+            return super::super::avx512::block32::vec_dot_q8_1_q8_1(xs, ys);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            return super::super::avx::vec_dot_q8_1_q8_1(xs, ys);
+        }
 
         #[allow(unreachable_code)]
         Self::dot_scalar(xs, ys)

@@ -14,12 +14,8 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[cfg(target_feature = "avx2")]
-mod vectorised {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod vectorised {
     use core::arch::x86_64::*;
     use half::{bf16, f16};
 
@@ -68,21 +64,10 @@ mod vectorised {
         _mm256_loadu_ps(p)
     }
 
-    /// Eight f16. `f16c` decodes them in one instruction; without it, one at a
-    /// time through the same conversion the scalar tail uses.
-    #[cfg(target_feature = "f16c")]
+    /// Eight f16, decoded by `f16c` in one instruction.
     #[inline(always)]
     unsafe fn load_f16(p: *const f16) -> __m256 {
         _mm256_cvtph_ps(_mm_loadu_si128(p as *const __m128i))
-    }
-    #[cfg(not(target_feature = "f16c"))]
-    #[inline(always)]
-    unsafe fn load_f16(p: *const f16) -> __m256 {
-        let mut tmp = [0.0f32; LANES];
-        for (i, out) in tmp.iter_mut().enumerate() {
-            *out = (*p.add(i)).to_f32();
-        }
-        _mm256_loadu_ps(tmp.as_ptr())
     }
 
     /// Eight bf16. A bf16 IS the top half of an f32, so widening is a
@@ -100,8 +85,8 @@ mod vectorised {
     /// remainder scalar, written to `c`.
     macro_rules! carrier {
         ($name:ident, $ty:ty, $load:ident, $fold:ident, $widen:expr) => {
-            #[inline(always)]
-            pub unsafe fn $name(a: *const $ty, b: *const $ty, c: *mut f32, k: usize) {
+            #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+            pub(crate) unsafe fn $name(a: *const $ty, b: *const $ty, c: *mut f32, k: usize) {
                 let whole = k & !(STRIDE - 1);
                 let mut chain = [_mm256_setzero_ps(); CHAINS];
                 for i in (0..whole).step_by(STRIDE) {
@@ -128,19 +113,11 @@ mod vectorised {
         .to_f32());
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[cfg(target_feature = "avx2")]
-pub(super) use vectorised::{vec_dot_bf16, vec_dot_f16, vec_dot_f32};
-
 /// No AVX2: the same contract, one value at a time.
 ///
 /// `*c` is WRITTEN, as above. The f32 arm of this used to `+=` into it without
 /// setting it first - a different function from the one it stands in for, which
 /// survived only because every caller happened to pass a zero.
-#[cfg(not(all(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature = "avx2"
-)))]
 mod scalar_only {
     use half::{bf16, f16};
 
@@ -162,8 +139,24 @@ mod scalar_only {
     carrier!(vec_dot_bf16, bf16, |v: bf16| v.to_f32());
 }
 
-#[cfg(not(all(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature = "avx2"
-)))]
-pub(super) use scalar_only::{vec_dot_bf16, vec_dot_f16, vec_dot_f32};
+/// The carrier's entry point: the vector kernel when the CPU level allows it, else the scalar one.
+macro_rules! dispatch {
+    ($name:ident, $ty:ty) => {
+        pub(super) unsafe fn $name(a: *const $ty, b: *const $ty, c: *mut f32, k: usize) {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if crate::cpu::dispatch_avx512() {
+                    return super::avx512::float::$name(a, b, c, k);
+                }
+                if crate::cpu::dispatch_avx2() {
+                    return vectorised::$name(a, b, c, k);
+                }
+            }
+            scalar_only::$name(a, b, c, k)
+        }
+    };
+}
+
+dispatch!(vec_dot_f32, f32);
+dispatch!(vec_dot_f16, half::f16);
+dispatch!(vec_dot_bf16, half::bf16);

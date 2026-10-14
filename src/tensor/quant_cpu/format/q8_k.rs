@@ -46,33 +46,28 @@ impl BlockFormat for BlockQ8K {
     }
 
     fn quantize(xs: &[f32], ys: &mut [Self]) {
-        for (block, x) in blocks_with_input(xs, ys) {
-            // The extreme keeps its sign and is mapped onto -127, not +127: the codes reach
-            // -128, and starting from the negative end is what keeps the AVX2 unpacking of the
-            // k-quant kernels free of a sign fixup.
-            let extreme = x
-                .iter()
-                .fold(0f32, |m, &v| if v.abs() > m.abs() { v } else { m });
-            if extreme == 0.0 {
-                *block = Self::zeros();
-                continue;
-            }
-            let inv = -Q8_K_MAX / extreme;
-            block.d = 1.0 / inv;
-            for (q, &v) in block.qs.iter_mut().zip(x) {
-                // Only the upper end needs clamping: the extreme lands exactly on -127, but a
-                // value of the opposite sign can round past +127.
-                *q = nearest_int(inv * v).min(Q8_K_MAX as i32) as i8;
-            }
-            for (sum, sub) in block.bsums.iter_mut().zip(block.qs.chunks_exact(16)) {
-                *sum = sub.iter().map(|&q| q as i16).sum();
-            }
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx512() {
+            // SAFETY: dispatch_avx512 implies the CPU has every feature `quantize_avx512` enables.
+            return unsafe { quantize_avx512(xs, ys) };
         }
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `quantize_avx2` enables.
+            return unsafe { quantize_avx2(xs, ys) };
+        }
+        quantize_blocks(xs, ys)
     }
 
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        #[cfg(target_feature = "avx2")]
-        return avx::vec_dot_q8k_q8k(xs, ys);
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx512() {
+            return avx512::vec_dot_q8k_q8k(xs, ys);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            return avx::vec_dot_q8k_q8k(xs, ys);
+        }
 
         #[allow(unreachable_code)]
         Self::dot_scalar(xs, ys)
@@ -92,5 +87,83 @@ impl BlockFormat for BlockQ8K {
                 dot as f32 * x.d * y.d
             })
             .sum()
+    }
+}
+
+/// The activation quantiser. Its loops vectorise to the target features of the function that
+/// inlines it.
+#[inline(always)]
+fn quantize_blocks(xs: &[f32], ys: &mut [BlockQ8K]) {
+    for (block, x) in blocks_with_input(xs, ys) {
+        // The extreme keeps its sign and is mapped onto -127, not +127: the codes reach
+        // -128, and starting from the negative end is what keeps the AVX2 unpacking of the
+        // k-quant kernels free of a sign fixup.
+        let extreme = x
+            .iter()
+            .fold(0f32, |m, &v| if v.abs() > m.abs() { v } else { m });
+        if extreme == 0.0 {
+            *block = BlockQ8K::zeros();
+            continue;
+        }
+        let inv = -Q8_K_MAX / extreme;
+        block.d = 1.0 / inv;
+        for (q, &v) in block.qs.iter_mut().zip(x) {
+            // Only the upper end needs clamping: the extreme lands exactly on -127, but a
+            // value of the opposite sign can round past +127.
+            *q = nearest_int(inv * v).min(Q8_K_MAX as i32) as i8;
+        }
+        for (sum, sub) in block.bsums.iter_mut().zip(block.qs.chunks_exact(16)) {
+            *sum = sub.iter().map(|&q| q as i16).sum();
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn quantize_avx2(xs: &[f32], ys: &mut [BlockQ8K]) {
+    quantize_blocks(xs, ys)
+}
+
+/// The same loops, left to vectorise over 512-bit registers. Every step is per element (the
+/// extreme is a max, which does not depend on order), so the codes are those of the other builds.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn quantize_avx512(xs: &[f32], ys: &mut [BlockQ8K]) {
+    quantize_blocks(xs, ys)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_avx512_quantiser_has_the_codes_of_the_avx2_one() {
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 20.0
+        };
+        for blocks in [1usize, 2, 5, 16] {
+            let mut xs: Vec<f32> = (0..blocks * QK_K).map(|_| next()).collect();
+            // A block of zeros, and one whose extreme is positive and lopsided.
+            xs[..QK_K].fill(0.0);
+            if blocks > 1 {
+                xs[QK_K + 3] = 500.0;
+            }
+            let (mut a, mut b) = (
+                vec![BlockQ8K::zeros(); blocks],
+                vec![BlockQ8K::zeros(); blocks],
+            );
+            unsafe {
+                quantize_avx2(&xs, &mut a);
+                quantize_avx512(&xs, &mut b);
+            }
+            assert_eq!(a, b, "{blocks} blocks");
+        }
     }
 }

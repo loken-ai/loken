@@ -68,16 +68,22 @@ unsafe fn scaled(scales: __m256i, quarter: usize, products: __m256i) -> __m256i 
 /// Two bits per value, sixteen to a sub-block, with a 4-bit scale and a 4-bit
 /// minimum sharing one byte. Both halves of the super-block read the same
 /// 32 bytes of codes at shifts advancing by two.
-#[inline(always)]
 pub(crate) fn vec_dot_q2k_q8k(xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
+    super::require_avx2();
+    // SAFETY: `require_avx2` just confirmed the CPU has every feature the kernel enables.
+    unsafe { vec_dot_q2k_q8k_avx2(xs, ys) }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn vec_dot_q2k_q8k_avx2(xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
     unsafe {
         let two_bits = _mm256_set1_epi8(3);
         let nibble = _mm_set1_epi8(0xF);
         let mut acc = _mm256_setzero_ps();
 
         for (x, y) in xs.iter().zip(ys) {
-            let d = y.d * x.d.to_f32();
-            let dmin = -y.d * x.dmin.to_f32();
+            let d = y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
+            let dmin = -y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.dmin);
             let mut codes = x.qs.as_ptr();
             let mut acts = y.qs.as_ptr();
 
@@ -138,6 +144,31 @@ pub(crate) fn vec_dot_q2k_q8k(xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
     }
 }
 
+/// The sixteen signed scales of a q3_K block as bytes: twelve bytes hold sixteen 6-bit scales the
+/// way q4_K packs its eight, except all sixteen are scales and each is biased by 32.
+#[inline(always)]
+unsafe fn q3k_scale_bytes(packed: &[u8; 12]) -> __m128i {
+    let bias = _mm_set1_epi8(32);
+    let (low, high, spare) = (word(packed, 0), word(packed, 4), word(packed, 8));
+    _mm_sub_epi8(
+        _mm_set_epi32(
+            rejoin((high >> 4) & LOW4, spare >> 6) as i32,
+            rejoin((low >> 4) & LOW4, spare >> 4) as i32,
+            rejoin(high & LOW4, spare >> 2) as i32,
+            rejoin(low & LOW4, spare) as i32,
+        ),
+        bias,
+    )
+}
+
+/// The same scales as an array, for the 512-bit kernel.
+#[inline(always)]
+pub(crate) unsafe fn q3k_scales(packed: &[u8; 12]) -> [i8; 16] {
+    let mut out = [0i8; 16];
+    _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, q3k_scale_bytes(packed));
+    out
+}
+
 /// Three bits per value: two in `qs`, the third in a `hmask` bitplane, and
 /// sixteen signed 6-bit scales biased by 32.
 ///
@@ -146,31 +177,25 @@ pub(crate) fn vec_dot_q2k_q8k(xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
 /// to subtract. Low part and high part go through `maddubs` separately and the
 /// difference is taken in i16, which keeps both operands unsigned where the
 /// instruction requires it.
-#[inline(always)]
 pub(crate) fn vec_dot_q3k_q8k(xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
+    super::require_avx2();
+    // SAFETY: `require_avx2` just confirmed the CPU has every feature the kernel enables.
+    unsafe { vec_dot_q3k_q8k_avx2(xs, ys) }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn vec_dot_q3k_q8k_avx2(xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
     unsafe {
         let two_bits = _mm256_set1_epi8(3);
         let ones = _mm256_set1_epi8(1);
-        let bias = _mm_set1_epi8(32);
         let mut acc = _mm256_setzero_ps();
 
         for (x, y) in xs.iter().zip(ys) {
-            let d = y.d * x.d.to_f32();
+            let d = y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
             let mut codes = x.qs.as_ptr();
             let mut acts = y.qs.as_ptr();
 
-            // Twelve bytes hold sixteen 6-bit scales the way q4_K packs its
-            // eight, except all sixteen are scales and each is biased by 32.
-            let (low, high, spare) = (word(&x.scales, 0), word(&x.scales, 4), word(&x.scales, 8));
-            let scale_bytes = _mm_sub_epi8(
-                _mm_set_epi32(
-                    rejoin((high >> 4) & LOW4, spare >> 6) as i32,
-                    rejoin((low >> 4) & LOW4, spare >> 4) as i32,
-                    rejoin(high & LOW4, spare >> 2) as i32,
-                    rejoin(low & LOW4, spare) as i32,
-                ),
-                bias,
-            );
+            let scale_bytes = q3k_scale_bytes(&x.scales);
             let third_bits = _mm256_loadu_si256(x.hmask.as_ptr() as *const __m256i);
 
             let mut total = _mm256_setzero_si256();
@@ -237,7 +262,7 @@ pub(crate) fn vec_dot_q3k_q8k(xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
 /// The minimum term of q4_K and q5_K: a 32-value sub-block spans two `bsums`
 /// entries, so those are summed pairwise first, after which it is one `madd`.
 #[inline(always)]
-unsafe fn offset_term(scales_and_mins: __m256i, bsums: &[i16; QK_K / 16]) -> __m128i {
+pub(crate) unsafe fn offset_term(scales_and_mins: __m256i, bsums: &[i16; QK_K / 16]) -> __m128i {
     let loaded = _mm256_loadu_si256(bsums.as_ptr() as *const __m256i);
     let per_sub_block = _mm_hadd_epi16(
         _mm256_extracti128_si256(loaded, 0),
@@ -249,7 +274,7 @@ unsafe fn offset_term(scales_and_mins: __m256i, bsums: &[i16; QK_K / 16]) -> __m
 /// The eight scales and eight minimums of q4_K/q5_K, widened to i16 in one
 /// register: scales in the low half, minimums in the high.
 #[inline(always)]
-unsafe fn scales_and_mins(packed: &[u8; 12]) -> __m256i {
+pub(crate) unsafe fn scales_and_mins(packed: &[u8; 12]) -> __m256i {
     let u = crate::tensor::quant_cpu::repack_q4k::sub_scales_and_mins(packed);
     _mm256_cvtepu8_epi16(_mm_set_epi32(
         u[3] as i32,
@@ -261,16 +286,22 @@ unsafe fn scales_and_mins(packed: &[u8; 12]) -> __m256i {
 
 /// Four bits per value, thirty-two to a sub-block, scales and minimums packed
 /// six bits each.
-#[inline(always)]
 pub(crate) fn vec_dot_q4k_q8k(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
+    super::require_avx2();
+    // SAFETY: `require_avx2` just confirmed the CPU has every feature the kernel enables.
+    unsafe { vec_dot_q4k_q8k_avx2(xs, ys) }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn vec_dot_q4k_q8k_avx2(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
     unsafe {
         let nibble = _mm256_set1_epi8(0xF);
         let mut acc = _mm256_setzero_ps();
         let mut acc_min = _mm_setzero_ps();
 
         for (x, y) in xs.iter().zip(ys) {
-            let d = y.d * x.d.to_f32();
-            let dmin = -y.d * x.dmin.to_f32();
+            let d = y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
+            let dmin = -y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.dmin);
             let mut codes = x.qs.as_ptr();
             let mut acts = y.qs.as_ptr();
 
@@ -319,8 +350,14 @@ pub(crate) fn vec_dot_q4k_q8k(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
 
 /// q4_K plus a fifth bit per value, held in a `qh` bitplane consumed one bit at
 /// a time as the loop walks the super-block.
-#[inline(always)]
 pub(crate) fn vec_dot_q5k_q8k(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
+    super::require_avx2();
+    // SAFETY: `require_avx2` just confirmed the CPU has every feature the kernel enables.
+    unsafe { vec_dot_q5k_q8k_avx2(xs, ys) }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn vec_dot_q5k_q8k_avx2(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
     unsafe {
         let nibble = _mm256_set1_epi8(0xF);
         let ones = _mm256_set1_epi8(1);
@@ -329,8 +366,8 @@ pub(crate) fn vec_dot_q5k_q8k(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
         let mut from_mins_total = 0f32;
 
         for (x, y) in xs.iter().zip(ys) {
-            let d = y.d * x.d.to_f32();
-            let dmin = -y.d * x.dmin.to_f32();
+            let d = y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
+            let dmin = -y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.dmin);
             let mut codes = x.qs.as_ptr();
             let mut acts = y.qs.as_ptr();
 
@@ -405,15 +442,21 @@ pub(crate) fn vec_dot_q5k_q8k(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
 /// That zero point is constant, so `Σ -32.a.scale` over a sub-block is
 /// `-32.scale` times one `bsums` entry: one `madd` and a shift by five for the
 /// whole block, instead of a subtract on every product in the loop.
-#[inline(always)]
 pub(crate) fn vec_dot_q6k_q8k(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
+    super::require_avx2();
+    // SAFETY: `require_avx2` just confirmed the CPU has every feature the kernel enables.
+    unsafe { vec_dot_q6k_q8k_avx2(xs, ys) }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn vec_dot_q6k_q8k_avx2(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
     unsafe {
         let nibble = _mm256_set1_epi8(0xF);
         let two_bits = _mm256_set1_epi8(3);
         let mut acc = _mm256_setzero_ps();
 
         for (x, y) in xs.iter().zip(ys) {
-            let d = y.d * x.d.to_f32();
+            let d = y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
             let mut low_ptr = x.ql.as_ptr();
             let mut high_ptr = x.qh.as_ptr();
             let mut acts = y.qs.as_ptr();
@@ -489,8 +532,14 @@ pub(crate) fn vec_dot_q6k_q8k(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
 /// Eight bits per value with one f32 block scale - the activation format
 /// against itself, which is what a matmul reduces to when both sides are
 /// already q8_K.
-#[inline(always)]
 pub(crate) fn vec_dot_q8k_q8k(xs: &[BlockQ8K], ys: &[BlockQ8K]) -> f32 {
+    super::require_avx2();
+    // SAFETY: `require_avx2` just confirmed the CPU has every feature the kernel enables.
+    unsafe { vec_dot_q8k_q8k_avx2(xs, ys) }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn vec_dot_q8k_q8k_avx2(xs: &[BlockQ8K], ys: &[BlockQ8K]) -> f32 {
     unsafe {
         let mut acc = _mm256_setzero_ps();
         for (x, y) in xs.iter().zip(ys) {
