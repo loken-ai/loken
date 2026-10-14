@@ -32,7 +32,28 @@ const QK: usize = 32; // q8_0 block size
 fn q8_pv_axpy(scale: f32, qs: &[i8], o: &mut [f32]) {
     let n = qs.len();
     debug_assert_eq!(o.len(), n);
-    #[cfg(target_feature = "avx2")]
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature the 512-bit kernel enables.
+        return unsafe { q8_pv_axpy_avx512(scale, qs, o) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has every feature `q8_pv_axpy_avx2` enables.
+        return unsafe { q8_pv_axpy_avx2(scale, qs, o) };
+    }
+    {
+        for i in 0..n {
+            o[i] += scale * qs[i] as f32;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn q8_pv_axpy_avx2(scale: f32, qs: &[i8], o: &mut [f32]) {
+    let n = qs.len();
+    debug_assert_eq!(o.len(), n);
     unsafe {
         use std::arch::x86_64::*;
         let vs = _mm256_set1_ps(scale);
@@ -51,10 +72,41 @@ fn q8_pv_axpy(scale: f32, qs: &[i8], o: &mut [f32]) {
             c += 1;
         }
     }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        for i in 0..n {
-            o[i] += scale * qs[i] as f32;
+}
+
+/// [`q8_pv_axpy_avx2`] sixteen lanes at a time (`qs` is a multiple of 32 long), then
+/// its group of eight, then scalar: every element is the same fused multiply-add.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn q8_pv_axpy_avx512(scale: f32, qs: &[i8], o: &mut [f32]) {
+    let n = qs.len();
+    debug_assert_eq!(o.len(), n);
+    unsafe {
+        use std::arch::x86_64::*;
+        let vs = _mm512_set1_ps(scale);
+        let pq = qs.as_ptr();
+        let po = o.as_mut_ptr();
+        let mut c = 0usize;
+        while c + 16 <= n {
+            let f = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(
+                pq.add(c) as *const __m128i
+            )));
+            _mm512_storeu_ps(
+                po.add(c),
+                _mm512_fmadd_ps(f, vs, _mm512_loadu_ps(po.add(c))),
+            );
+            c += 16;
+        }
+        if c + 8 <= n {
+            let i8x8 = _mm_loadl_epi64(pq.add(c) as *const __m128i);
+            let f = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(i8x8));
+            let acc = _mm256_fmadd_ps(f, _mm256_set1_ps(scale), _mm256_loadu_ps(po.add(c)));
+            _mm256_storeu_ps(po.add(c), acc);
+            c += 8;
+        }
+        while c < n {
+            *po.add(c) += scale * (*pq.add(c)) as f32;
+            c += 1;
         }
     }
 }
@@ -631,6 +683,31 @@ mod tests {
             for (x, y) in refout.iter().zip(&out[s * nh * hd..(s + 1) * nh * hd]) {
                 assert!((x - y).abs() < 1e-5, "verify[{s}] mismatch: {x} vs {y}");
             }
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod avx512_tests {
+    use super::*;
+
+    #[test]
+    fn the_512_bit_value_accumulate_has_the_bits_of_the_avx2_one() {
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        for n in [0usize, 1, 7, 8, 15, 16, 17, 24, 31, 32, 33, 64, 128] {
+            let qs: Vec<i8> = (0..n).map(|i| ((i * 37 + 5) % 256) as u8 as i8).collect();
+            let base: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.3).sin()).collect();
+            let (mut a, mut b) = (base.clone(), base);
+            unsafe {
+                q8_pv_axpy_avx2(0.0173, &qs, &mut a);
+                q8_pv_axpy_avx512(0.0173, &qs, &mut b);
+            }
+            assert!(
+                a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+                "n={n}"
+            );
         }
     }
 }

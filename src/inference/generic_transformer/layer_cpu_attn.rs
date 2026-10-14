@@ -328,7 +328,25 @@ impl GenericTransformerLayer {
     #[inline]
     fn faxpy(p: f32, v: &[f32], acc: &mut [f32]) {
         let n = v.len();
-        #[cfg(target_feature = "avx2")]
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx512() {
+            // SAFETY: dispatch_avx512 implies the CPU has every feature `faxpy_avx512` enables.
+            return unsafe { Self::faxpy_avx512(p, v, acc) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `faxpy_avx2` enables.
+            return unsafe { Self::faxpy_avx2(p, v, acc) };
+        }
+        for i in 0..n {
+            acc[i] += p * v[i];
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn faxpy_avx2(p: f32, v: &[f32], acc: &mut [f32]) {
+        let n = v.len();
         unsafe {
             use std::arch::x86_64::*;
             let pv = _mm256_set1_ps(p);
@@ -347,20 +365,98 @@ impl GenericTransformerLayer {
                 c += 1;
             }
         }
-        #[cfg(not(target_feature = "avx2"))]
-        for i in 0..n {
-            acc[i] += p * v[i];
+    }
+
+    /// [`Self::faxpy_avx2`] sixteen lanes at a time. Each element is the same fused multiply-add,
+    /// so the result has the bits of the AVX2 kernel.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+    unsafe fn faxpy_avx512(p: f32, v: &[f32], acc: &mut [f32]) {
+        let n = v.len();
+        unsafe {
+            use std::arch::x86_64::*;
+            let pv = _mm512_set1_ps(p);
+            let mut c = 0;
+            while c + 16 <= n {
+                let a = _mm512_fmadd_ps(
+                    pv,
+                    _mm512_loadu_ps(v.as_ptr().add(c)),
+                    _mm512_loadu_ps(acc.as_ptr().add(c)),
+                );
+                _mm512_storeu_ps(acc.as_mut_ptr().add(c), a);
+                c += 16;
+            }
+            // The AVX2 kernel fuses its last whole group of eight too; the tail past it is not.
+            if c + 8 <= n {
+                let a = _mm256_fmadd_ps(
+                    _mm256_set1_ps(p),
+                    _mm256_loadu_ps(v.as_ptr().add(c)),
+                    _mm256_loadu_ps(acc.as_ptr().add(c)),
+                );
+                _mm256_storeu_ps(acc.as_mut_ptr().add(c), a);
+                c += 8;
+            }
+            while c < n {
+                *acc.get_unchecked_mut(c) += p * *v.get_unchecked(c);
+                c += 1;
+            }
+        }
+    }
+
+    /// [`Self::fdot_avx2`] with its two accumulators held as the two halves of one zmm: every lane
+    /// sees the same fused multiply-adds, and the halves are added at the end as before, so the
+    /// result has the bits of the AVX2 kernel.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+    unsafe fn fdot_avx512(a: &[f32], b: &[f32]) -> f32 {
+        unsafe {
+            use std::arch::x86_64::*;
+            let n = a.len();
+            let (pa, pb) = (a.as_ptr(), b.as_ptr());
+            let mut acc = _mm512_setzero_ps();
+            let mut c = 0;
+            while c + 16 <= n {
+                acc = _mm512_fmadd_ps(_mm512_loadu_ps(pa.add(c)), _mm512_loadu_ps(pb.add(c)), acc);
+                c += 16;
+            }
+            let acc = _mm256_add_ps(
+                _mm512_castps512_ps256(acc),
+                _mm512_extractf32x8_ps::<1>(acc),
+            );
+            let q = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+            let q = _mm_hadd_ps(q, q);
+            let q = _mm_hadd_ps(q, q);
+            let mut sum = _mm_cvtss_f32(q);
+            while c < n {
+                sum += *pa.add(c) * *pb.add(c);
+                c += 1;
+            }
+            sum
         }
     }
 
     fn fdot(a: &[f32], b: &[f32]) -> f32 {
-        // The scalar fallback iterates rather than indexes, so the length is the wide
-        // path's alone.
-        #[cfg(target_feature = "avx2")]
-        let n = a.len();
-        #[cfg(target_feature = "avx2")]
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx512() {
+            // SAFETY: dispatch_avx512 implies the CPU has every feature `fdot_avx512` enables.
+            return unsafe { Self::fdot_avx512(a, b) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `fdot_avx2` enables.
+            return unsafe { Self::fdot_avx2(a, b) };
+        }
+        {
+            a.iter().zip(b).map(|(x, y)| x * y).sum()
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
+    unsafe fn fdot_avx2(a: &[f32], b: &[f32]) -> f32 {
         unsafe {
             use std::arch::x86_64::*;
+            let n = a.len();
             let (pa, pb) = (a.as_ptr(), b.as_ptr());
             let mut acc0 = _mm256_setzero_ps();
             let mut acc1 = _mm256_setzero_ps();
@@ -385,10 +481,6 @@ impl GenericTransformerLayer {
                 c += 1;
             }
             sum
-        }
-        #[cfg(not(target_feature = "avx2"))]
-        {
-            a.iter().zip(b).map(|(x, y)| x * y).sum()
         }
     }
 
@@ -894,6 +986,32 @@ mod sink_attention_tests {
                 ((x >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * amp
             })
             .collect()
+    }
+
+    /// The 512-bit `fdot` and `faxpy` return the bits of the AVX2 ones, at every length around
+    /// the 16-lane step (head sizes 64 and 128 included).
+    #[test]
+    fn avx512_attention_helpers_have_the_bits_of_the_avx2_ones() {
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        for n in [0usize, 1, 7, 8, 15, 16, 17, 31, 32, 33, 64, 100, 128, 129] {
+            let (a, b) = (values(n, 3, 2.0), values(n, 5, 2.0));
+            let (want, got) = unsafe {
+                (
+                    GenericTransformerLayer::fdot_avx2(&a, &b),
+                    GenericTransformerLayer::fdot_avx512(&a, &b),
+                )
+            };
+            assert_eq!(got.to_bits(), want.to_bits(), "fdot, n={n}");
+            let (mut x, mut y) = (values(n, 7, 1.0), values(n, 7, 1.0));
+            unsafe {
+                GenericTransformerLayer::faxpy_avx2(0.37, &a, &mut x);
+                GenericTransformerLayer::faxpy_avx512(0.37, &a, &mut y);
+            }
+            let same = x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits());
+            assert!(same, "faxpy, n={n}");
+        }
     }
 
     /// Scalar attention with sinks: query row `i` at absolute position `base + i` sees the

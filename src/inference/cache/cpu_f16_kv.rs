@@ -22,7 +22,30 @@ use half::f16;
 pub(crate) fn f16_dot(q: &[f32], k: &[f16]) -> f32 {
     let n = q.len();
     debug_assert_eq!(k.len(), n);
-    #[cfg(target_feature = "avx2")]
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature the 512-bit kernel enables.
+        return unsafe { f16_dot_avx512(q, k) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has every feature `f16_dot_avx2` enables.
+        return unsafe { f16_dot_avx2(q, k) };
+    }
+    {
+        let mut s = 0f32;
+        for i in 0..n {
+            s += q[i] * k[i].to_f32();
+        }
+        s
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn f16_dot_avx2(q: &[f32], k: &[f16]) -> f32 {
+    let n = q.len();
+    debug_assert_eq!(k.len(), n);
     unsafe {
         use std::arch::x86_64::*;
         let pq = q.as_ptr();
@@ -62,14 +85,6 @@ pub(crate) fn f16_dot(q: &[f32], k: &[f16]) -> f32 {
         }
         sum
     }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        let mut s = 0f32;
-        for i in 0..n {
-            s += q[i] * k[i].to_f32();
-        }
-        s
-    }
 }
 
 /// `o[i] += p * (f32)v[i]` with F16C: convert 8 packed f16 values -> f32, FMA the
@@ -78,7 +93,28 @@ pub(crate) fn f16_dot(q: &[f32], k: &[f16]) -> f32 {
 pub(crate) fn f16_axpy(p: f32, v: &[f16], o: &mut [f32]) {
     let n = v.len();
     debug_assert_eq!(o.len(), n);
-    #[cfg(target_feature = "avx2")]
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature the 512-bit kernel enables.
+        return unsafe { f16_axpy_avx512(p, v, o) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has every feature `f16_axpy_avx2` enables.
+        return unsafe { f16_axpy_avx2(p, v, o) };
+    }
+    {
+        for i in 0..n {
+            o[i] += p * v[i].to_f32();
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn f16_axpy_avx2(p: f32, v: &[f16], o: &mut [f32]) {
+    let n = v.len();
+    debug_assert_eq!(o.len(), n);
     unsafe {
         use std::arch::x86_64::*;
         let pv = v.as_ptr() as *const __m128i;
@@ -96,12 +132,6 @@ pub(crate) fn f16_axpy(p: f32, v: &[f16], o: &mut [f32]) {
             c += 1;
         }
     }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        for i in 0..n {
-            o[i] += p * v[i].to_f32();
-        }
-    }
 }
 
 /// Convert `src` f32 -> f16 and push onto `dst` with F16C (`_mm256_cvtps_ph`,
@@ -110,7 +140,26 @@ pub(crate) fn f16_axpy(p: f32, v: &[f16], o: &mut [f32]) {
 fn extend_f16(dst: &mut Vec<f16>, src: &[f32]) {
     let n = src.len();
     dst.reserve(n);
-    #[cfg(target_feature = "avx2")]
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature the 512-bit kernel enables.
+        return unsafe { extend_f16_avx512(dst, src) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has every feature `extend_f16_avx2` enables.
+        return unsafe { extend_f16_avx2(dst, src) };
+    }
+    {
+        dst.extend(src.iter().map(|&x| f16::from_f32(x)));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn extend_f16_avx2(dst: &mut Vec<f16>, src: &[f32]) {
+    let n = src.len();
+    dst.reserve(n);
     unsafe {
         use std::arch::x86_64::*;
         let ps = src.as_ptr();
@@ -128,9 +177,109 @@ fn extend_f16(dst: &mut Vec<f16>, src: &[f32]) {
             c += 1;
         }
     }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        dst.extend(src.iter().map(|&x| f16::from_f32(x)));
+}
+
+/// [`f16_dot_avx2`] with its four accumulators held as the halves of two zmm: every lane sees the
+/// same fused multiply-adds and the fold is the twin's, so the result has its bits.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn f16_dot_avx512(q: &[f32], k: &[f16]) -> f32 {
+    let n = q.len();
+    debug_assert_eq!(k.len(), n);
+    unsafe {
+        use std::arch::x86_64::*;
+        let pq = q.as_ptr();
+        let pk = k.as_ptr();
+        // [a0 | a1] and [a2 | a3].
+        let mut a01 = _mm512_setzero_ps();
+        let mut a23 = _mm512_setzero_ps();
+        let mut c = 0usize;
+        while c + 32 <= n {
+            let k01 = _mm512_cvtph_ps(_mm256_loadu_si256(pk.add(c) as *const __m256i));
+            let k23 = _mm512_cvtph_ps(_mm256_loadu_si256(pk.add(c + 16) as *const __m256i));
+            a01 = _mm512_fmadd_ps(_mm512_loadu_ps(pq.add(c)), k01, a01);
+            a23 = _mm512_fmadd_ps(_mm512_loadu_ps(pq.add(c + 16)), k23, a23);
+            c += 32;
+        }
+        let mut a0 = _mm512_castps512_ps256(a01);
+        let a1 = _mm512_extractf32x8_ps::<1>(a01);
+        let a2 = _mm512_castps512_ps256(a23);
+        let a3 = _mm512_extractf32x8_ps::<1>(a23);
+        while c + 8 <= n {
+            let kf = _mm256_cvtph_ps(_mm_loadu_si128(pk.add(c) as *const __m128i));
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(pq.add(c)), kf, a0);
+            c += 8;
+        }
+        let acc = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        let q128 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+        let q128 = _mm_hadd_ps(q128, q128);
+        let q128 = _mm_hadd_ps(q128, q128);
+        let mut sum = _mm_cvtss_f32(q128);
+        while c < n {
+            sum += *pq.add(c) * (*pk.add(c)).to_f32();
+            c += 1;
+        }
+        sum
+    }
+}
+
+/// [`f16_axpy_avx2`] sixteen lanes at a time, then its group of eight, then scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn f16_axpy_avx512(p: f32, v: &[f16], o: &mut [f32]) {
+    let n = v.len();
+    debug_assert_eq!(o.len(), n);
+    unsafe {
+        use std::arch::x86_64::*;
+        let pv = v.as_ptr();
+        let po = o.as_mut_ptr();
+        let vp = _mm512_set1_ps(p);
+        let mut c = 0usize;
+        while c + 16 <= n {
+            let vf = _mm512_cvtph_ps(_mm256_loadu_si256(pv.add(c) as *const __m256i));
+            _mm512_storeu_ps(
+                po.add(c),
+                _mm512_fmadd_ps(vp, vf, _mm512_loadu_ps(po.add(c))),
+            );
+            c += 16;
+        }
+        if c + 8 <= n {
+            let vf = _mm256_cvtph_ps(_mm_loadu_si128(pv.add(c) as *const __m128i));
+            let acc = _mm256_fmadd_ps(_mm256_set1_ps(p), vf, _mm256_loadu_ps(po.add(c)));
+            _mm256_storeu_ps(po.add(c), acc);
+            c += 8;
+        }
+        while c < n {
+            *po.add(c) += p * (*pv.add(c)).to_f32();
+            c += 1;
+        }
+    }
+}
+
+/// [`extend_f16_avx2`] sixteen values at a time; every conversion rounds to nearest, so the
+/// split of the length does not change a bit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn extend_f16_avx512(dst: &mut Vec<f16>, src: &[f32]) {
+    let n = src.len();
+    dst.reserve(n);
+    unsafe {
+        use std::arch::x86_64::*;
+        let ps = src.as_ptr();
+        let base = dst.len();
+        dst.set_len(base + n);
+        let pd = dst.as_mut_ptr().add(base);
+        let mut c = 0usize;
+        while c + 16 <= n {
+            let packed =
+                _mm512_cvtps_ph::<{ _MM_FROUND_TO_NEAREST_INT }>(_mm512_loadu_ps(ps.add(c)));
+            _mm256_storeu_si256(pd.add(c) as *mut __m256i, packed);
+            c += 16;
+        }
+        while c < n {
+            *pd.add(c) = f16::from_f32(src[c]);
+            c += 1;
+        }
     }
 }
 
@@ -537,6 +686,48 @@ mod tests {
                 got[i],
                 want[i]
             );
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod avx512_tests {
+    use super::*;
+
+    fn val(i: usize, k: f32) -> f32 {
+        ((i as f32) * k).sin() * 3.0
+    }
+
+    /// The three 512-bit helpers return the bits of the AVX2 ones at lengths around their steps.
+    #[test]
+    fn the_512_bit_kv_helpers_have_the_bits_of_the_avx2_ones() {
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        for n in [
+            0usize, 1, 7, 8, 15, 16, 17, 24, 31, 32, 33, 40, 64, 100, 128, 256, 257,
+        ] {
+            let q: Vec<f32> = (0..n).map(|i| val(i, 0.37)).collect();
+            let k: Vec<f16> = (0..n).map(|i| f16::from_f32(val(i, 0.21))).collect();
+            let (a, b) = unsafe { (f16_dot_avx2(&q, &k), f16_dot_avx512(&q, &k)) };
+            assert_eq!(a.to_bits(), b.to_bits(), "dot, n={n}");
+
+            let (mut x, mut y) = (q.clone(), q.clone());
+            unsafe {
+                f16_axpy_avx2(0.41, &k, &mut x);
+                f16_axpy_avx512(0.41, &k, &mut y);
+            }
+            assert!(
+                x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits()),
+                "axpy, n={n}"
+            );
+
+            let (mut d1, mut d2) = (vec![f16::ZERO; 3], vec![f16::ZERO; 3]);
+            unsafe {
+                extend_f16_avx2(&mut d1, &q);
+                extend_f16_avx512(&mut d2, &q);
+            }
+            assert_eq!(d1, d2, "extend, n={n}");
         }
     }
 }

@@ -35,9 +35,24 @@ pub fn sigmoid(x: &Tensor) -> Result<Tensor> {
 /// inputs and output a vector at a time removes the per-element function-call
 /// and scalar-convert overhead. The scalar tail keeps the same recip-then-mul
 /// form as the reference so the two agree bit-for-bit off the vector path.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline]
 fn swiglu_chunk(g: &[half::f16], u: &[half::f16], o: &mut [half::f16]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature `swiglu_chunk_avx512` enables.
+        return unsafe { swiglu_chunk_avx512(g, u, o) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has every feature `swiglu_chunk_avx2` enables.
+        return unsafe { swiglu_chunk_avx2(g, u, o) };
+    }
+    swiglu_chunk_scalar(g, u, o)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn swiglu_chunk_avx2(g: &[half::f16], u: &[half::f16], o: &mut [half::f16]) {
     use core::arch::x86_64::*;
     unsafe {
         let one = _mm256_set1_ps(1.0);
@@ -57,17 +72,58 @@ fn swiglu_chunk(g: &[half::f16], u: &[half::f16], o: &mut [half::f16]) {
             i += 8;
         }
         while i < o.len() {
-            let gv = g[i].to_f32();
+            let gv = crate::tensor::quant_cpu::avx::f16c_to_f32(g[i]);
             let s = gv * (1.0 / (1.0 + (-gv).exp()));
-            o[i] = half::f16::from_f32(s * u[i].to_f32());
+            o[i] = half::f16::from_f32(s * crate::tensor::quant_cpu::avx::f16c_to_f32(u[i]));
             i += 1;
         }
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+/// [`swiglu_chunk_avx2`] sixteen lanes at a time, then its group of eight, then scalar: the split
+/// of the length is the twin's, so the bits are too.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn swiglu_chunk_avx512(g: &[half::f16], u: &[half::f16], o: &mut [half::f16]) {
+    use crate::inference::kernel::cpu_decode_exec::{simd::exp8, simd512::exp16};
+    use core::arch::x86_64::*;
+    unsafe {
+        let mut i = 0;
+        while i + 16 <= o.len() {
+            let gv = _mm512_cvtph_ps(_mm256_loadu_si256(g.as_ptr().add(i) as *const __m256i));
+            let uv = _mm512_cvtph_ps(_mm256_loadu_si256(u.as_ptr().add(i) as *const __m256i));
+            let e = exp16(_mm512_sub_ps(_mm512_setzero_ps(), gv));
+            let sig = _mm512_div_ps(_mm512_set1_ps(1.0), _mm512_add_ps(_mm512_set1_ps(1.0), e));
+            let res = _mm512_mul_ps(_mm512_mul_ps(gv, sig), uv);
+            _mm256_storeu_si256(
+                o.as_mut_ptr().add(i) as *mut __m256i,
+                _mm512_cvtps_ph::<0>(res),
+            );
+            i += 16;
+        }
+        if i + 8 <= o.len() {
+            let gv = _mm256_cvtph_ps(_mm_loadu_si128(g.as_ptr().add(i) as *const __m128i));
+            let uv = _mm256_cvtph_ps(_mm_loadu_si128(u.as_ptr().add(i) as *const __m128i));
+            let e = exp8(_mm256_sub_ps(_mm256_setzero_ps(), gv));
+            let sig = _mm256_div_ps(_mm256_set1_ps(1.0), _mm256_add_ps(_mm256_set1_ps(1.0), e));
+            let res = _mm256_mul_ps(_mm256_mul_ps(gv, sig), uv);
+            _mm_storeu_si128(
+                o.as_mut_ptr().add(i) as *mut __m128i,
+                _mm256_cvtps_ph::<0>(res),
+            );
+            i += 8;
+        }
+        while i < o.len() {
+            let gv = crate::tensor::quant_cpu::avx::f16c_to_f32(g[i]);
+            let s = gv * (1.0 / (1.0 + (-gv).exp()));
+            o[i] = half::f16::from_f32(s * crate::tensor::quant_cpu::avx::f16c_to_f32(u[i]));
+            i += 1;
+        }
+    }
+}
+
 #[inline]
-fn swiglu_chunk(g: &[half::f16], u: &[half::f16], o: &mut [half::f16]) {
+fn swiglu_chunk_scalar(g: &[half::f16], u: &[half::f16], o: &mut [half::f16]) {
     for i in 0..o.len() {
         let gv = g[i].to_f32();
         let s = gv * (1.0 / (1.0 + (-gv).exp()));
@@ -123,9 +179,24 @@ pub fn split_silu_mul_f32(up_states: &Tensor) -> Result<Option<Tensor>> {
 /// One row of the gated activation: `out[c] = silu(gate[c]) * up[c]`, where the
 /// row is `[gate(0..i) | up(i..2i)]`. Vectorized with the reciprocal-then-
 /// multiply silu and a vector exp; a scalar tail keeps the same form.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline]
 fn silu_mul_row(row: &[f32], i: usize, o: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature `silu_mul_row_avx512` enables.
+        return unsafe { silu_mul_row_avx512(row, i, o) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has every feature `silu_mul_row_avx2` enables.
+        return unsafe { silu_mul_row_avx2(row, i, o) };
+    }
+    silu_mul_row_scalar(row, i, o)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn silu_mul_row_avx2(row: &[f32], i: usize, o: &mut [f32]) {
     use core::arch::x86_64::*;
     unsafe {
         let one = _mm256_set1_ps(1.0);
@@ -153,9 +224,48 @@ fn silu_mul_row(row: &[f32], i: usize, o: &mut [f32]) {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+/// [`silu_mul_row_avx2`] sixteen lanes at a time, then its group of eight, then scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn silu_mul_row_avx512(row: &[f32], i: usize, o: &mut [f32]) {
+    use crate::inference::kernel::cpu_decode_exec::{simd::exp8, simd512::exp16};
+    use core::arch::x86_64::*;
+    unsafe {
+        let g = row.as_ptr();
+        let u = row.as_ptr().add(i);
+        let mut c = 0;
+        while c + 16 <= i {
+            let gv = _mm512_loadu_ps(g.add(c));
+            let uv = _mm512_loadu_ps(u.add(c));
+            let e = exp16(_mm512_sub_ps(_mm512_setzero_ps(), gv));
+            let sig = _mm512_div_ps(_mm512_set1_ps(1.0), _mm512_add_ps(_mm512_set1_ps(1.0), e));
+            _mm512_storeu_ps(
+                o.as_mut_ptr().add(c),
+                _mm512_mul_ps(_mm512_mul_ps(gv, sig), uv),
+            );
+            c += 16;
+        }
+        if c + 8 <= i {
+            let gv = _mm256_loadu_ps(g.add(c));
+            let uv = _mm256_loadu_ps(u.add(c));
+            let e = exp8(_mm256_sub_ps(_mm256_setzero_ps(), gv));
+            let sig = _mm256_div_ps(_mm256_set1_ps(1.0), _mm256_add_ps(_mm256_set1_ps(1.0), e));
+            _mm256_storeu_ps(
+                o.as_mut_ptr().add(c),
+                _mm256_mul_ps(_mm256_mul_ps(gv, sig), uv),
+            );
+            c += 8;
+        }
+        while c < i {
+            let gv = *g.add(c);
+            o[c] = (gv * (1.0 / (1.0 + (-gv).exp()))) * *u.add(c);
+            c += 1;
+        }
+    }
+}
+
 #[inline]
-fn silu_mul_row(row: &[f32], i: usize, o: &mut [f32]) {
+fn silu_mul_row_scalar(row: &[f32], i: usize, o: &mut [f32]) {
     for c in 0..i {
         let gv = row[c];
         o[c] = (gv * (1.0 / (1.0 + (-gv).exp()))) * row[i + c];
@@ -326,5 +436,42 @@ impl Activation {
 impl crate::tensor::Module for Activation {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         self.apply(xs)
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod avx512_tests {
+    use super::*;
+
+    /// Both 512-bit kernels return the bits of their AVX2 twins at lengths around the 16-lane step.
+    #[test]
+    fn the_512_bit_activations_have_the_bits_of_the_avx2_ones() {
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        let val = |i: usize, k: f32| ((i as f32) * k).sin() * 9.0;
+        for n in [0usize, 1, 7, 8, 15, 16, 17, 24, 31, 33, 100, 257] {
+            let row: Vec<f32> = (0..2 * n).map(|i| val(i, 0.37)).collect();
+            let (mut a, mut b) = (vec![0f32; n], vec![0f32; n]);
+            unsafe {
+                silu_mul_row_avx2(&row, n, &mut a);
+                silu_mul_row_avx512(&row, n, &mut b);
+            }
+            assert!(
+                a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+                "row, n={n}"
+            );
+            let g: Vec<half::f16> = (0..n).map(|i| half::f16::from_f32(val(i, 0.21))).collect();
+            let u: Vec<half::f16> = (0..n).map(|i| half::f16::from_f32(val(i, 0.53))).collect();
+            let (mut a, mut b) = (vec![half::f16::ZERO; n], vec![half::f16::ZERO; n]);
+            unsafe {
+                swiglu_chunk_avx2(&g, &u, &mut a);
+                swiglu_chunk_avx512(&g, &u, &mut b);
+            }
+            assert!(
+                a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+                "swiglu, n={n}"
+            );
+        }
     }
 }

@@ -101,19 +101,19 @@ impl DecodeArena {
 // mistral: ffn 14336 x 40 layers). These use a Cephes-accuracy 8-lane exp
 // (`exp8`, ~1 ulp) so parity vs the scalar reference stays well under 1e-3.
 //
-// Gated on compile-time `target_feature="avx2"` (build uses target-cpu=native).
-// A scalar fallback (`*_scalar`) is kept for non-AVX2 targets and as the
+// Selected at run time by `cpu::dispatch_avx2`.
+// A scalar fallback (`*_scalar`) is kept for non-AVX2 hosts and as the
 // reference the unit tests / micro-bench validate against.
 // ---------------------------------------------------------------------------
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) mod simd {
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
 
     /// 8-lane single-precision exp, Cephes `exp256_ps` polynomial (~1 ulp).
     /// Matches `f32::exp` to a few x1e-7 relative over the finite range.
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     pub unsafe fn exp8(x: __m256) -> __m256 {
         let hi = _mm256_set1_ps(88.376_26);
         let lo = _mm256_set1_ps(-88.376_26);
@@ -148,7 +148,7 @@ pub(crate) mod simd {
     }
 
     /// Horizontal sum of an 8-lane vector.
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     pub unsafe fn hsum(v: __m256) -> f32 {
         let lo = _mm256_castps256_ps128(v);
         let hi = _mm256_extractf128_ps(v, 1);
@@ -164,7 +164,7 @@ pub(crate) mod simd {
     /// AVX2 partial-sum accumulator, horizontal-added once, plus a scalar tail).
     /// This is the attention softmax over the (windowed/full) score vector; at
     /// long ctx it's ~seq exps x n_heads x n_layers per token, the 2.5K cliff.
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     pub unsafe fn exp_sub_max_sum(x: &mut [f32], max: f32) -> f32 {
         let n = x.len();
         let vmax = _mm256_set1_ps(max);
@@ -188,7 +188,7 @@ pub(crate) mod simd {
     }
 
     /// `out[i] = silu(gate[i]) * up[i]`, `silu(z)=z/(1+e^-z)`.
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     pub unsafe fn silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
         let n = gate.len();
         let one = _mm256_set1_ps(1.0);
@@ -217,7 +217,7 @@ pub(crate) mod simd {
     /// # Safety
     /// `gate`/`up` readable and `out` writable for `n` f32; in-place aliasing of
     /// `gate` and `out` is sound (each lane is read before its own store).
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     unsafe fn gelu_core(gate: *const f32, up: *const f32, out: *mut f32, n: usize) {
         let one = _mm256_set1_ps(1.0);
         let neg = _mm256_set1_ps(-1.0);
@@ -244,20 +244,20 @@ pub(crate) mod simd {
     }
 
     /// `out[i] = gelu_tanh(gate[i]) * up[i]` (distinct buffers).
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     pub unsafe fn gelu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
         gelu_core(gate.as_ptr(), up.as_ptr(), out.as_mut_ptr(), gate.len());
     }
 
     /// In-place `g[i] = gelu_tanh(g[i]) * ple[i]`.
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     pub unsafe fn gelu_mul_inplace(g: &mut [f32], ple: &[f32]) {
         let n = g.len();
         gelu_core(g.as_ptr(), ple.as_ptr(), g.as_mut_ptr(), n);
     }
 
     /// `out[i] = x[i] * scale * w[i]`, with `scale = 1/sqrt(mean(x²)+eps)`.
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     pub unsafe fn rms_norm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
         let n = x.len();
         // sum of squares (2 accumulators to hide FMA latency)
@@ -299,7 +299,7 @@ pub(crate) mod simd {
     /// FMA-fused rotation (parity vs scalar < 1e-6). `half >= 8` in practice
     /// (head_dim >= 16), so the 8-wide stores to `[base+i]` and `[base+i+half]`
     /// never overlap.
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     pub unsafe fn rope_neox(
         x: &mut [f32],
         cos: &[f32],
@@ -341,7 +341,7 @@ pub(crate) mod simd {
     /// index achieving that lane's max; the 8-lane horizontal reduce breaks ties
     /// by lowest index; the tail updates only on strictly-greater. NaN never
     /// updates (ordered compare = scalar `>`), so ties/NaNs match exactly.
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     pub unsafe fn argmax(v: &[f32]) -> u32 {
         let n = v.len();
         if n == 0 {
@@ -392,18 +392,250 @@ pub(crate) mod simd {
     }
 }
 
+/// The 512-bit forms of the elementwise vector kernels above. Each lane performs the operations of
+/// its [`simd`] twin, in the same order, and each loop keeps the twin's split of the length (whole
+/// groups, then one group of eight on the AVX2 path, then scalar), so the results have the same
+/// bits: the scalar tail uses libm's `exp`, which is not the polynomial of the vector body.
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod simd512 {
+    use super::simd::{exp8, hsum};
+    use core::arch::x86_64::*;
+
+    /// 16-lane single-precision exp: [`exp8`]'s polynomial, lane for lane.
+    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+    pub unsafe fn exp16(x: __m512) -> __m512 {
+        let hi = _mm512_set1_ps(88.376_26);
+        let lo = _mm512_set1_ps(-88.376_26);
+        let log2ef = _mm512_set1_ps(std::f32::consts::LOG2_E);
+        let half = _mm512_set1_ps(0.5);
+        let one = _mm512_set1_ps(1.0);
+        let c1 = _mm512_set1_ps(0.693_359_4);
+        let c2 = _mm512_set1_ps(-2.121_944_4e-4);
+
+        let mut x = _mm512_min_ps(hi, _mm512_max_ps(lo, x));
+        let fx = _mm512_roundscale_ps::<{ _MM_FROUND_TO_NEG_INF | _MM_FROUND_NO_EXC }>(
+            _mm512_fmadd_ps(x, log2ef, half),
+        );
+        x = _mm512_fnmadd_ps(fx, c1, x);
+        x = _mm512_fnmadd_ps(fx, c2, x);
+        let z = _mm512_mul_ps(x, x);
+        let mut y = _mm512_set1_ps(1.987_569_1e-4);
+        y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(1.398_199_9e-3));
+        y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(8.333_452e-3));
+        y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(4.166_579_6e-2));
+        y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(1.666_666_5e-1));
+        y = _mm512_fmadd_ps(y, x, _mm512_set1_ps(5e-1));
+        y = _mm512_fmadd_ps(y, z, x);
+        y = _mm512_add_ps(y, one);
+        let imm0 = _mm512_slli_epi32::<23>(_mm512_add_epi32(
+            _mm512_cvttps_epi32(fx),
+            _mm512_set1_epi32(0x7f),
+        ));
+        _mm512_mul_ps(y, _mm512_castsi512_ps(imm0))
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+    pub unsafe fn exp_sub_max_sum(x: &mut [f32], max: f32) -> f32 {
+        let n = x.len();
+        let vmax = _mm512_set1_ps(max);
+        let vmax8 = _mm256_set1_ps(max);
+        let mut acc = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 16 <= n {
+            let e = exp16(_mm512_sub_ps(_mm512_loadu_ps(x.as_ptr().add(i)), vmax));
+            _mm512_storeu_ps(x.as_mut_ptr().add(i), e);
+            // The two halves join the AVX2 accumulator one after the other, as two chunks do.
+            acc = _mm256_add_ps(acc, _mm512_castps512_ps256(e));
+            acc = _mm256_add_ps(acc, _mm512_extractf32x8_ps::<1>(e));
+            i += 16;
+        }
+        if i + 8 <= n {
+            let e = exp8(_mm256_sub_ps(_mm256_loadu_ps(x.as_ptr().add(i)), vmax8));
+            _mm256_storeu_ps(x.as_mut_ptr().add(i), e);
+            acc = _mm256_add_ps(acc, e);
+            i += 8;
+        }
+        let mut sum = hsum(acc);
+        while i < n {
+            let e = (x[i] - max).exp();
+            x[i] = e;
+            sum += e;
+            i += 1;
+        }
+        sum
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+    pub unsafe fn silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
+        let n = gate.len();
+        let mut i = 0;
+        while i + 16 <= n {
+            let g = _mm512_loadu_ps(gate.as_ptr().add(i));
+            let u = _mm512_loadu_ps(up.as_ptr().add(i));
+            let e = exp16(_mm512_mul_ps(g, _mm512_set1_ps(-1.0)));
+            let sig = _mm512_div_ps(g, _mm512_add_ps(_mm512_set1_ps(1.0), e));
+            _mm512_storeu_ps(out.as_mut_ptr().add(i), _mm512_mul_ps(sig, u));
+            i += 16;
+        }
+        if i + 8 <= n {
+            let g = _mm256_loadu_ps(gate.as_ptr().add(i));
+            let u = _mm256_loadu_ps(up.as_ptr().add(i));
+            let e = exp8(_mm256_mul_ps(g, _mm256_set1_ps(-1.0)));
+            let sig = _mm256_div_ps(g, _mm256_add_ps(_mm256_set1_ps(1.0), e));
+            _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_mul_ps(sig, u));
+            i += 8;
+        }
+        while i < n {
+            let g = gate[i];
+            out[i] = (g / (1.0 + (-g).exp())) * up[i];
+            i += 1;
+        }
+    }
+
+    /// `gelu_tanh(gate) * up` over raw pointers, `gate == out` allowed.
+    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+    unsafe fn gelu_core(gate: *const f32, up: *const f32, out: *mut f32, n: usize) {
+        let mut i = 0;
+        while i + 16 <= n {
+            let g = _mm512_loadu_ps(gate.add(i));
+            let u = _mm512_loadu_ps(up.add(i));
+            let g2 = _mm512_mul_ps(g, g);
+            let poly = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_set1_ps(0.044715), g2), g, g);
+            let w = _mm512_mul_ps(_mm512_set1_ps(1.595_769), poly);
+            let e = exp16(_mm512_mul_ps(w, _mm512_set1_ps(-1.0)));
+            let s = _mm512_div_ps(_mm512_set1_ps(1.0), _mm512_add_ps(_mm512_set1_ps(1.0), e));
+            _mm512_storeu_ps(out.add(i), _mm512_mul_ps(_mm512_mul_ps(g, s), u));
+            i += 16;
+        }
+        if i + 8 <= n {
+            let g = _mm256_loadu_ps(gate.add(i));
+            let u = _mm256_loadu_ps(up.add(i));
+            let g2 = _mm256_mul_ps(g, g);
+            let poly = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_set1_ps(0.044715), g2), g, g);
+            let w = _mm256_mul_ps(_mm256_set1_ps(1.595_769), poly);
+            let e = exp8(_mm256_mul_ps(w, _mm256_set1_ps(-1.0)));
+            let s = _mm256_div_ps(_mm256_set1_ps(1.0), _mm256_add_ps(_mm256_set1_ps(1.0), e));
+            _mm256_storeu_ps(out.add(i), _mm256_mul_ps(_mm256_mul_ps(g, s), u));
+            i += 8;
+        }
+        while i < n {
+            let g = *gate.add(i);
+            let s = 1.0 / (1.0 + (-(1.595_769 * (g + 0.044715 * g * g * g))).exp());
+            *out.add(i) = g * s * *up.add(i);
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+    pub unsafe fn gelu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
+        gelu_core(gate.as_ptr(), up.as_ptr(), out.as_mut_ptr(), gate.len());
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+    pub unsafe fn gelu_mul_inplace(g: &mut [f32], ple: &[f32]) {
+        let n = g.len();
+        gelu_core(g.as_ptr(), ple.as_ptr(), g.as_mut_ptr(), n);
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+    pub unsafe fn rms_norm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
+        let n = x.len();
+        // The AVX2 kernel's two accumulators are the two halves of this one.
+        let mut acc = _mm512_setzero_ps();
+        let mut i = 0;
+        while i + 16 <= n {
+            let a = _mm512_loadu_ps(x.as_ptr().add(i));
+            acc = _mm512_fmadd_ps(a, a, acc);
+            i += 16;
+        }
+        let mut ss = hsum(_mm256_add_ps(
+            _mm512_castps512_ps256(acc),
+            _mm512_extractf32x8_ps::<1>(acc),
+        ));
+        while i < n {
+            ss += x[i] * x[i];
+            i += 1;
+        }
+        let scale = 1.0 / (ss / n as f32 + eps).sqrt();
+        let vs = _mm512_set1_ps(scale);
+        let mut i = 0;
+        while i + 16 <= n {
+            let xv = _mm512_loadu_ps(x.as_ptr().add(i));
+            let wv = _mm512_loadu_ps(w.as_ptr().add(i));
+            _mm512_storeu_ps(
+                out.as_mut_ptr().add(i),
+                _mm512_mul_ps(_mm512_mul_ps(xv, vs), wv),
+            );
+            i += 16;
+        }
+        while i < n {
+            out[i] = x[i] * scale * w[i];
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+    pub unsafe fn rope_neox(
+        x: &mut [f32],
+        cos: &[f32],
+        sin: &[f32],
+        n_heads: usize,
+        head_dim: usize,
+    ) {
+        let half = head_dim / 2;
+        for h in 0..n_heads {
+            let base = h * head_dim;
+            let mut i = 0;
+            while i + 16 <= half {
+                let a = _mm512_loadu_ps(x.as_ptr().add(base + i));
+                let b = _mm512_loadu_ps(x.as_ptr().add(base + i + half));
+                let c = _mm512_loadu_ps(cos.as_ptr().add(i));
+                let s = _mm512_loadu_ps(sin.as_ptr().add(i));
+                let na = _mm512_fmsub_ps(a, c, _mm512_mul_ps(b, s));
+                let nb = _mm512_fmadd_ps(a, s, _mm512_mul_ps(b, c));
+                _mm512_storeu_ps(x.as_mut_ptr().add(base + i), na);
+                _mm512_storeu_ps(x.as_mut_ptr().add(base + i + half), nb);
+                i += 16;
+            }
+            while i + 8 <= half {
+                let a = _mm256_loadu_ps(x.as_ptr().add(base + i));
+                let b = _mm256_loadu_ps(x.as_ptr().add(base + i + half));
+                let c = _mm256_loadu_ps(cos.as_ptr().add(i));
+                let s = _mm256_loadu_ps(sin.as_ptr().add(i));
+                let na = _mm256_fmsub_ps(a, c, _mm256_mul_ps(b, s));
+                let nb = _mm256_fmadd_ps(a, s, _mm256_mul_ps(b, c));
+                _mm256_storeu_ps(x.as_mut_ptr().add(base + i), na);
+                _mm256_storeu_ps(x.as_mut_ptr().add(base + i + half), nb);
+                i += 8;
+            }
+            while i < half {
+                let (c, s) = (cos[i], sin[i]);
+                let a = x[base + i];
+                let b = x[base + i + half];
+                x[base + i] = a * c - b * s;
+                x[base + i + half] = a * s + b * c;
+                i += 1;
+            }
+        }
+    }
+}
+
 /// RMSNorm: `out[i] = x[i] * rsqrt(mean(x²)+eps) * w[i]`. Matches
 /// `ops::rms_norm` (mean over the row, eps inside the sqrt). Zero-alloc.
 pub fn rms_norm_slice(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
     let n = x.len();
     debug_assert_eq!(w.len(), n);
     debug_assert_eq!(out.len(), n);
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
-    unsafe {
-        simd::rms_norm(x, w, eps, out)
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature the 512-bit kernel enables.
+        return unsafe { simd512::rms_norm(x, w, eps, out) };
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has avx2+fma.
+        return unsafe { simd::rms_norm(x, w, eps, out) };
+    }
     {
         let mut ss = 0f32;
         for &v in x {
@@ -421,12 +653,16 @@ pub fn silu_mul_slice(gate: &[f32], up: &[f32], out: &mut [f32]) {
     let n = gate.len();
     debug_assert_eq!(up.len(), n);
     debug_assert_eq!(out.len(), n);
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
-    unsafe {
-        simd::silu_mul(gate, up, out)
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature the 512-bit kernel enables.
+        return unsafe { simd512::silu_mul(gate, up, out) };
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has avx2+fma.
+        return unsafe { simd::silu_mul(gate, up, out) };
+    }
     for i in 0..n {
         let g = gate[i];
         out[i] = (g / (1.0 + (-g).exp())) * up[i];
@@ -439,12 +675,16 @@ pub fn gelu_mul_slice(gate: &[f32], up: &[f32], out: &mut [f32]) {
     let n = gate.len();
     debug_assert_eq!(up.len(), n);
     debug_assert_eq!(out.len(), n);
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
-    unsafe {
-        simd::gelu_mul(gate, up, out)
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature the 512-bit kernel enables.
+        return unsafe { simd512::gelu_mul(gate, up, out) };
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has avx2+fma.
+        return unsafe { simd::gelu_mul(gate, up, out) };
+    }
     {
         const C: f32 = 0.797_884_56; // sqrt(2/pi)
         for i in 0..n {
@@ -459,12 +699,16 @@ pub fn gelu_mul_slice(gate: &[f32], up: &[f32], out: &mut [f32]) {
 /// Tensor path's `gate.gelu().mul(ple_input)` (`.gelu()` = tanh approx).
 pub fn gelu_mul_inplace(g: &mut [f32], ple: &[f32]) {
     debug_assert_eq!(g.len(), ple.len());
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
-    unsafe {
-        simd::gelu_mul_inplace(g, ple)
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature the 512-bit kernel enables.
+        return unsafe { simd512::gelu_mul_inplace(g, ple) };
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has avx2+fma.
+        return unsafe { simd::gelu_mul_inplace(g, ple) };
+    }
     {
         const C: f32 = 0.797_884_56; // sqrt(2/pi)
         for i in 0..g.len() {
@@ -511,12 +755,16 @@ pub fn residual_add(acc: &mut [f32], add: &[f32]) {
 /// tail + non-AVX2 fallback keep it exact-order-identical to the reference so the
 /// normalized probabilities match to <1e-5. Caller supplies the running max.
 pub fn exp_sub_max_sum(x: &mut [f32], max: f32) -> f32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
-    unsafe {
-        simd::exp_sub_max_sum(x, max)
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature the 512-bit kernel enables.
+        return unsafe { simd512::exp_sub_max_sum(x, max) };
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has avx2+fma.
+        return unsafe { simd::exp_sub_max_sum(x, max) };
+    }
     {
         let mut sum = 0f32;
         for v in x.iter_mut() {
@@ -537,12 +785,16 @@ pub fn rope_neox_slice(x: &mut [f32], cos: &[f32], sin: &[f32], n_heads: usize, 
     let half = head_dim / 2;
     debug_assert_eq!(cos.len(), half);
     debug_assert_eq!(sin.len(), half);
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
-    unsafe {
-        simd::rope_neox(x, cos, sin, n_heads, head_dim)
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx512() {
+        // SAFETY: dispatch_avx512 implies the CPU has every feature the 512-bit kernel enables.
+        return unsafe { simd512::rope_neox(x, cos, sin, n_heads, head_dim) };
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has avx2+fma.
+        return unsafe { simd::rope_neox(x, cos, sin, n_heads, head_dim) };
+    }
     for h in 0..n_heads {
         let base = h * head_dim;
         for i in 0..half {
@@ -561,12 +813,11 @@ pub fn rope_neox_slice(x: &mut [f32], cos: &[f32], sin: &[f32], n_heads: usize, 
 /// decoded token over the full vocab (qwen3 151936, gemma4 262144). NaN never
 /// wins (ordered compare), matching the scalar `>`.
 pub fn argmax_f32(v: &[f32]) -> u32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    // SAFETY: avx2+fma guaranteed present by the target_feature cfg.
-    unsafe {
-        simd::argmax(v)
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // SAFETY: dispatch_avx2 implies the CPU has avx2+fma.
+        return unsafe { simd::argmax(v) };
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     {
         let (mut best, mut bv) = (0usize, f32::NEG_INFINITY);
         for (i, &x) in v.iter().enumerate() {
@@ -804,6 +1055,102 @@ mod tests {
                 .map(|_| ((rng() >> 40) as f32 / 16_777_216.0 - 0.5) * 20.0)
                 .collect();
             assert_eq!(argmax_f32(&data), argmax_scalar_ref(&data), "fuzz n={n}");
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod simd512_tests {
+    use super::{simd, simd512};
+
+    fn values(n: usize, seed: u64, amp: f32) -> Vec<f32> {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * amp
+            })
+            .collect()
+    }
+
+    fn same(what: &str, n: usize, a: &[f32], b: &[f32]) {
+        for (i, (p, q)) in a.iter().zip(b).enumerate() {
+            assert_eq!(
+                p.to_bits(),
+                q.to_bits(),
+                "{what}, n={n}, element {i}: {p} vs {q}"
+            );
+        }
+    }
+
+    /// Lengths around the 16-lane step and the 8-lane group of the AVX2 split, and arguments out to
+    /// the clamp of the exp polynomial.
+    #[test]
+    fn the_512_bit_vector_kernels_have_the_bits_of_the_avx2_ones() {
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        for n in [
+            0usize, 1, 7, 8, 15, 16, 17, 23, 24, 31, 32, 33, 100, 128, 129, 1000,
+        ] {
+            let (g, u) = (values(n, 3, 12.0), values(n, 5, 2.0));
+            let (mut a, mut b) = (vec![0f32; n], vec![0f32; n]);
+            unsafe {
+                simd::silu_mul(&g, &u, &mut a);
+                simd512::silu_mul(&g, &u, &mut b);
+            }
+            same("silu_mul", n, &a, &b);
+            unsafe {
+                simd::gelu_mul(&g, &u, &mut a);
+                simd512::gelu_mul(&g, &u, &mut b);
+            }
+            same("gelu_mul", n, &a, &b);
+            let (mut a, mut b) = (g.clone(), g.clone());
+            unsafe {
+                simd::gelu_mul_inplace(&mut a, &u);
+                simd512::gelu_mul_inplace(&mut b, &u);
+            }
+            same("gelu_mul_inplace", n, &a, &b);
+
+            let wide = values(n, 9, 120.0);
+            let (mut a, mut b) = (wide.clone(), wide.clone());
+            let (sa, sb) = unsafe {
+                (
+                    simd::exp_sub_max_sum(&mut a, 3.5),
+                    simd512::exp_sub_max_sum(&mut b, 3.5),
+                )
+            };
+            same("exp_sub_max_sum", n, &a, &b);
+            assert_eq!(sa.to_bits(), sb.to_bits(), "exp_sub_max_sum sum, n={n}");
+
+            let (w, x) = (values(n, 11, 1.5), values(n, 13, 4.0));
+            let (mut a, mut b) = (vec![0f32; n], vec![0f32; n]);
+            unsafe {
+                simd::rms_norm(&x, &w, 1e-6, &mut a);
+                simd512::rms_norm(&x, &w, 1e-6, &mut b);
+            }
+            same("rms_norm", n, &a, &b);
+        }
+        for (heads, head_dim) in [
+            (1usize, 16usize),
+            (3, 32),
+            (2, 64),
+            (4, 96),
+            (2, 128),
+            (2, 192),
+        ] {
+            let n = heads * head_dim;
+            let (cos, sin) = (values(head_dim / 2, 21, 1.0), values(head_dim / 2, 22, 1.0));
+            let (mut a, mut b) = (values(n, 23, 3.0), values(n, 23, 3.0));
+            unsafe {
+                simd::rope_neox(&mut a, &cos, &sin, heads, head_dim);
+                simd512::rope_neox(&mut b, &cos, &sin, heads, head_dim);
+            }
+            same("rope_neox", n, &a, &b);
         }
     }
 }
