@@ -3744,6 +3744,7 @@ impl GenericHeteroTransformer {
                     table: super::ngram::NgramTable::new(table, meta)?,
                     meta: meta.clone(),
                     pending: None,
+                    before: None,
                 })
             }
             _ => None,

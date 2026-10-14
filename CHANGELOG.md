@@ -34,6 +34,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- N-gram embedding: a forward run again after a failure finds the history where it was.
 - OpenAI and Anthropic APIs: a penalty applies only as the request names it.
 - Chat: a repository with a folder per quantisation is prompted with its own template.
 - Load: a file with a rotary scaling and no context key takes its scaled window.

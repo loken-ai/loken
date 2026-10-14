@@ -561,6 +561,9 @@ pub struct NgramModel {
     pub table: ngram::NgramTable,
     /// The gathered embeddings `[1, seq, heads * row_dim]` of the forward in progress.
     pub pending: Option<Tensor>,
+    /// The history as it stood before the last gather, with the position that gather started
+    /// at: what a forward run again from there, after a failure, starts from.
+    pub before: Option<(usize, ngram::NgramHistory)>,
 }
 
 /// A resident sequence copied aside: its tokens and every layer's KV, taken after a

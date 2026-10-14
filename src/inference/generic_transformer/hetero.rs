@@ -1789,6 +1789,14 @@ impl GenericHeteroTransformer {
         if index_pos == 0 {
             ple.reset();
         }
+        // A forward that failed after its gather runs again from the same position: the
+        // history goes back to where that gather found it.
+        if ple.history.seen != index_pos {
+            if let Some((at, before)) = ng.before.as_ref().filter(|(at, _)| *at == index_pos) {
+                debug_assert_eq!(*at, before.seen);
+                ple.history = before.clone();
+            }
+        }
         if ple.history.seen != index_pos {
             // What stands between the history and the forward: the verify windows open.
             let recorded = self.verify.window.as_ref().map_or("none".to_string(), |w| {
@@ -1806,6 +1814,7 @@ impl GenericHeteroTransformer {
             .flatten_all()?
             .to_dtype(crate::tensor::DType::U32)?
             .to_vec1::<u32>()?;
+        ng.before = Some((index_pos, ple.history.clone()));
         let rows = ple.history.rows(&ng.meta, &ids);
         let data = ng.table.gather(&rows)?;
         let width = ng.meta.heads() * ng.meta.row_dim;

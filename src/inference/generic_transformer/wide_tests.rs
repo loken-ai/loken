@@ -1378,3 +1378,30 @@ fn the_draft_head_reads_a_prompt_layer_by_layer_as_chunk_by_chunk() {
         assert_eq!(by_layer, by_chunk, "chunk {chunk}");
     }
 }
+
+/// A forward that failed after its n-gram rows were gathered runs again from the same position:
+/// the gather finds the history where the first one did and gathers the same rows.
+#[test]
+fn a_forward_run_again_gathers_the_same_ngram_rows() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let mut model = toy();
+    let tokens = ids(&v, "a.ids");
+    let as_ids = |t: &[u32]| Tensor::from_vec(t.to_vec(), (1, t.len()), &Device::Cpu).unwrap();
+    let (head, tail) = tokens.split_at(tokens.len() / 2);
+    let pending = |m: &mut GenericHeteroTransformer| {
+        let p = m.ngram.as_mut().unwrap().pending.take().unwrap();
+        p.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    };
+    model.gather_ngram_rows(&as_ids(head), 0).unwrap();
+    model.gather_ngram_rows(&as_ids(tail), head.len()).unwrap();
+    let first = pending(&mut model);
+    model.gather_ngram_rows(&as_ids(tail), head.len()).unwrap();
+    assert_eq!(pending(&mut model), first);
+    assert!(
+        model
+            .gather_ngram_rows(&as_ids(tail), head.len() + 1)
+            .is_err(),
+        "a position the history never stood at is still refused"
+    );
+}
