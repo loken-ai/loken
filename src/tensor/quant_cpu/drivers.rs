@@ -1151,6 +1151,41 @@ pub fn pool_par_chunks_mut_prefill(
     });
 }
 
+/// Elements below which a zeroed vector is built in place rather than on the pool.
+const PAR_ZERO_MIN: usize = 1 << 20;
+
+/// Write zeros over `len` f32 starting at `base`, split across the prefill pool.
+///
+/// # Safety
+/// `base` must be valid for writes of `len` f32 and nothing else may touch them meanwhile.
+unsafe fn clear_on_pool(base: *mut f32, len: usize) {
+    let pool = gemv_pool::prefill_pool();
+    let chunk = len.div_ceil(pool.threads.max(1) * 4).max(1);
+    let ptr = SendMutPtr(base);
+    pool.run(len.div_ceil(chunk), &|c| {
+        let ptr = &ptr;
+        let lo = c * chunk;
+        let hi = (lo + chunk).min(len);
+        // SAFETY: chunk `c` owns the disjoint range [lo, hi), inside the caller's allocation.
+        unsafe { std::ptr::write_bytes(ptr.0.add(lo), 0, hi - lo) };
+    });
+}
+
+/// `vec![0f32; len]`. A large one is cleared on the prefill pool: a heap block that was freed and
+/// is handed out again is zeroed by whichever single thread asked for it.
+pub fn zeroed_vec_f32(len: usize) -> Vec<f32> {
+    if len < PAR_ZERO_MIN {
+        return vec![0f32; len];
+    }
+    let mut v: Vec<f32> = Vec::with_capacity(len);
+    // SAFETY: the allocation holds `len` f32 and is ours alone.
+    unsafe {
+        clear_on_pool(v.as_mut_ptr(), len);
+        v.set_len(len);
+    }
+    v
+}
+
 /// Generic-element version of [`pool_par_chunks_mut`] - same spin-pool chunking
 /// for any `Send + Sync` element type (e.g. f16/bf16 casts), so those stay off
 /// rayon and on the one active pool. `f(chunk_index, chunk_slice)`.
@@ -2381,6 +2416,43 @@ mod gate_up_silu_tests {
                     "{dtype:?} col {j}: fused {have} vs ref {want}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod zeroed_vec_test {
+    use super::*;
+
+    /// The pool clears memory that held other values, to the last element, for lengths around its
+    /// chunk boundaries.
+    #[test]
+    fn clearing_on_the_pool_overwrites_dirty_memory() {
+        for len in [
+            1usize,
+            1000,
+            PAR_ZERO_MIN,
+            PAR_ZERO_MIN + 7,
+            3 * PAR_ZERO_MIN + 11,
+        ] {
+            let mut dirty = vec![1.5f32; len + 1];
+            dirty[len] = 7.0;
+            // SAFETY: `dirty` holds len + 1 f32.
+            unsafe { clear_on_pool(dirty.as_mut_ptr(), len) };
+            assert!(dirty[..len].iter().all(|&x| x.to_bits() == 0), "len {len}");
+            assert_eq!(
+                dirty[len], 7.0,
+                "the element past the end is left alone, len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zeroed_vector_has_its_length_and_only_zeros() {
+        for len in [0usize, 1, PAR_ZERO_MIN - 1, PAR_ZERO_MIN + 3] {
+            let v = zeroed_vec_f32(len);
+            assert_eq!(v.len(), len);
+            assert!(v.iter().all(|&x| x.to_bits() == 0), "len {len}");
         }
     }
 }

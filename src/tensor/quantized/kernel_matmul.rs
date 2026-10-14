@@ -796,7 +796,7 @@ impl QKernelMatMul {
                     &staged
                 }
             };
-            let mut dst = vec![0f32; rows * self.n];
+            let mut dst = crate::tensor::quant_cpu::zeroed_vec_f32(rows * self.n);
             // CPU Q4_K prefill: the block-interleaved tiled GEMM reuses each
             // loaded weight across 4 activation rows (~5x vs the per-row
             // weight re-stream of `matmul_bytes`). Decode (rows<4) keeps the
