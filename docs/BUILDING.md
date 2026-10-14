@@ -31,6 +31,12 @@ host CPU. A CPU without them is refused at start with a message naming what is m
 quantized kernels are chosen at start from what the CPU has, and the daemon logs the level.
 `[cpu] level` in `config.toml` caps it, and `generic` selects the scalar reference code.
 
+At the `avx512` level (AVX-512 F/BW/VL/DQ/VNNI) the prefill GEMMs of Q4_K, Q5_K, Q6_K, Q4_0, Q5_0,
+Q8_0 and MXFP4, the dots of the k-quants, of the 32-weight formats and of f32, f16 and bf16, the
+bf16 and fp8 row dots and the q8_K quantiser use 512-bit registers. Each returns the bits of its
+AVX2 twin, except the bf16 and fp8 row dots, which sum in another order and agree to the rounding
+of the sum.
+
 To let the compiler use the build host's whole instruction set outside the kernels, build with
 `RUSTFLAGS="-C target-cpu=native"`; that binary does not run on other hosts.
 

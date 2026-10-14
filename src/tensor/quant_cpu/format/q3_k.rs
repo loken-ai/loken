@@ -72,8 +72,14 @@ impl BlockFormat for BlockQ3K {
 
     #[allow(unreachable_code)]
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        #[cfg(target_feature = "avx2")]
-        return avx::vec_dot_q3k_q8k(xs, ys);
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx512() {
+            return avx512::vec_dot_q3k_q8k(xs, ys);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            return avx::vec_dot_q3k_q8k(xs, ys);
+        }
 
         Self::dot_scalar(xs, ys)
     }

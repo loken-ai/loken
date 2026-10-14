@@ -17,8 +17,8 @@ use rayon::prelude::*;
 /// exponent rebiased from 7 to 127, the mantissa shifted up - and, where the exponent is zero,
 /// replaced by the subnormal's value (the mantissa times 2^-9); then fused multiply-adds over
 /// eight lanes.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 #[inline]
 unsafe fn tile_dot_avx2(bytes: *const u8, x: *const f32, len: usize) -> f32 {
     use core::arch::x86_64::*;
@@ -54,11 +54,66 @@ unsafe fn tile_dot_avx2(bytes: *const u8, x: *const f32, len: usize) -> f32 {
     _mm_cvtss_f32(s1)
 }
 
+/// The same dot on 512-bit registers: sixteen bytes widened per step, four accumulators, the tail
+/// under a mask. Each weight is widened exactly as in [`tile_dot_avx2`]; only the order of the sum
+/// differs, so the two agree to the float rounding of the sum.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn tile_dot_avx512(bytes: *const u8, x: *const f32, len: usize) -> f32 {
+    use core::arch::x86_64::*;
+    let sub_scale = _mm512_set1_ps(2f32.powi(-9));
+    let widen = |b: __m512i| {
+        let sign = _mm512_slli_epi32::<24>(_mm512_and_si512(b, _mm512_set1_epi32(0x80)));
+        let exp = _mm512_and_si512(_mm512_srli_epi32::<3>(b), _mm512_set1_epi32(0xF));
+        let mant = _mm512_and_si512(b, _mm512_set1_epi32(7));
+        let normal = _mm512_or_si512(
+            _mm512_or_si512(
+                sign,
+                _mm512_slli_epi32::<23>(_mm512_add_epi32(exp, _mm512_set1_epi32(120))),
+            ),
+            _mm512_slli_epi32::<20>(mant),
+        );
+        let sub = _mm512_or_si512(
+            sign,
+            _mm512_castps_si512(_mm512_mul_ps(_mm512_cvtepi32_ps(mant), sub_scale)),
+        );
+        let is_sub = _mm512_cmpeq_epi32_mask(exp, _mm512_setzero_si512());
+        _mm512_castsi512_ps(_mm512_mask_blend_epi32(is_sub, normal, sub))
+    };
+    let load = |p: *const u8| _mm512_cvtepu8_epi32(_mm_loadu_si128(p as *const __m128i));
+    let mut acc = [_mm512_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 64 <= len {
+        for (j, a) in acc.iter_mut().enumerate() {
+            let at = i + 16 * j;
+            *a = _mm512_fmadd_ps(widen(load(bytes.add(at))), _mm512_loadu_ps(x.add(at)), *a);
+        }
+        i += 64;
+    }
+    while i + 16 <= len {
+        acc[0] = _mm512_fmadd_ps(widen(load(bytes.add(i))), _mm512_loadu_ps(x.add(i)), acc[0]);
+        i += 16;
+    }
+    if i < len {
+        let mask = (1u16 << (len - i)) - 1;
+        let b = _mm512_cvtepu8_epi32(_mm_maskz_loadu_epi8(mask, bytes.add(i) as *const i8));
+        acc[1] = _mm512_fmadd_ps(widen(b), _mm512_maskz_loadu_ps(mask, x.add(i)), acc[1]);
+    }
+    _mm512_reduce_add_ps(_mm512_add_ps(
+        _mm512_add_ps(acc[0], acc[1]),
+        _mm512_add_ps(acc[2], acc[3]),
+    ))
+}
+
 #[inline(always)]
 fn tile_dot(bytes: &[u8], x: &[f32], table: &[f32; 256]) -> f32 {
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        if bytes.len().is_multiple_of(8) {
+        if crate::cpu::dispatch_avx512() {
+            // Safety: both slices hold `len` elements.
+            return unsafe { tile_dot_avx512(bytes.as_ptr(), x.as_ptr(), bytes.len()) };
+        }
+        if bytes.len().is_multiple_of(8) && crate::cpu::dispatch_avx2() {
             // Safety: both slices hold `len` elements, a multiple of eight.
             return unsafe { tile_dot_avx2(bytes.as_ptr(), x.as_ptr(), bytes.len()) };
         }
@@ -209,9 +264,49 @@ mod tests {
 
     /// The vector byte-to-f32 widening agrees with the decoder table on every e4m3 byte that
     /// is a number.
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
+    /// Every length around the 64-wide body, the 16-wide step and the masked tail, over the
+    /// finite byte values, against the f64 sum of the table's weights. Bound: `n * 2^-24 * sum|term|`.
+    #[test]
+    fn avx512_tile_dot_stays_inside_the_summation_bound() {
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        for len in [1usize, 7, 8, 15, 16, 17, 31, 63, 64, 65, 127, 256, 1000] {
+            // 0x7F and 0xFF are e4m3's NaN; a checkpoint holds none, and neither kernel tests for it.
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| match (i * 37 + 11) as u8 {
+                    0x7F => 0x7E,
+                    0xFF => 0xFE,
+                    b => b,
+                })
+                .collect();
+            let x: Vec<f32> = (0..len).map(|i| ((i as f32) * 0.21).cos() - 0.3).collect();
+            let (mut want, mut mag) = (0f64, 0f64);
+            for (&b, &xv) in bytes.iter().zip(&x) {
+                let t = e4m3_to_f32(b) as f64 * xv as f64;
+                if t.is_finite() {
+                    want += t;
+                    mag += t.abs();
+                }
+            }
+            if !want.is_finite() {
+                continue;
+            }
+            let got = unsafe { tile_dot_avx512(bytes.as_ptr(), x.as_ptr(), len) } as f64;
+            let bound = len as f64 * 2f64.powi(-24) * mag + 1e-30;
+            assert!(
+                (got - want).abs() <= bound,
+                "len {len}: {got} vs {want} (bound {bound})"
+            );
+        }
+    }
+
     #[test]
     fn vector_widening_matches_the_table() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         let bytes: Vec<u8> = (0..=255u8).filter(|b| b & 0x7F != 0x7F).collect();
         let n = bytes.len() / 8 * 8;
         for (i, &b) in bytes[..n].iter().enumerate() {
@@ -232,6 +327,9 @@ mod tests {
     /// range of it equals the same rows of that product.
     #[test]
     fn in_place_product_and_row_range_match_dequantised_matmul() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         let (out, inp, block, n) = (96usize, 160usize, 32usize, 3usize);
         // Bytes that avoid the NaN pattern (S1111.111).
         let bytes: Vec<u8> = (0..out * inp)

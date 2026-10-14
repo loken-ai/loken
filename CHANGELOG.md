@@ -7,6 +7,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Added
 
 - CPU: the SIMD level is chosen at start and capped by the cpu level setting.
+- CPU: AVX-512 kernels for the quantized GEMMs and dots.
 
 ### Changed
 

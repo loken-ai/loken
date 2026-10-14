@@ -93,7 +93,7 @@ pub mod repack_q6k;
 /// distance/line tuning that saturates RAM BW vs llama.cpp lives in ONE place
 /// (measured: +2.0-2.4% decode on Q4_0 and Q4_K). Add a new quant's fast GEMV ->
 /// it reuses this, no per-kernel prefetch divergence.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn gemv_prefetch_t0<const LINES: usize>(p: *const i8) {
     use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
@@ -158,9 +158,12 @@ pub use drivers::*;
 
 /// The vectorised dot products. Every format has one - a format left on the
 /// scalar path is a cliff nothing in the logs would explain.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 pub(crate) mod avx;
+/// The 512-bit dot products: the same function names and signatures as [`avx`], reached only when
+/// the CPU level is `avx512`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod avx512;
 mod cpu;
 mod cpu_parity;
 mod dot_throughput;

@@ -20,13 +20,44 @@
 
 use super::*;
 
+/// Whether the AVX-512 kernels run: the CPU level must be `avx512`.
+#[inline]
+fn simd512() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::cpu::dispatch_avx512()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Activation rows per strip of the 512-bit Q4_K GEMM.
+#[cfg(target_arch = "x86_64")]
+const Q4K_512_STRIP: usize = 8;
+
+/// Whether the AVX2 GEMV/GEMM kernels run: they exist only on x86_64, and only when the CPU
+/// level allows them.
+#[inline]
+fn simd() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::cpu::dispatch_avx2()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// The half of [`matmul_q4k_plain`] that runs once the activation is already
 /// quantised. Split out so several weights can be driven from ONE quantisation
 /// of the same activation - at decode `q`, `k` and `v` all read the attention
 /// norm, and `gate` and `up` both read the FFN norm, so quantising inside the
 /// GEMV repeats that work once per projection. Same blocks, same routine, so a
 /// shared quantisation is bit-identical to the per-call one.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub fn matmul_q4k_plain_pre(
     (k, n): (usize, usize),
     aq: &[BlockQ8K],
@@ -109,12 +140,14 @@ pub fn matmul_q4k_repacked(
         let act = &lhs_b[row_idx * nb..(row_idx + 1) * nb];
         let bgrp = &rhs_x8[g * nb..(g + 1) * nb];
         let mut local = [0f32; 8];
-        #[cfg(target_feature = "avx2")]
-        unsafe {
-            repack_q4k::gemv_group_avx2(bgrp, act, nb, &mut local);
+        if simd() {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                repack_q4k::gemv_group_avx2(bgrp, act, nb, &mut local);
+            }
+        } else {
+            repack_q4k::gemv_group_scalar(bgrp, act, nb, &mut local);
         }
-        #[cfg(not(target_feature = "avx2"))]
-        repack_q4k::gemv_group_scalar(bgrp, act, nb, &mut local);
         // SAFETY: each chunk writes a disjoint [row, g*8..g*8+8] slice of dst.
         let out = unsafe { std::slice::from_raw_parts_mut(dst_ptr.0.add(row_idx * n + g * 8), 8) };
         out.copy_from_slice(&local);
@@ -234,12 +267,16 @@ pub fn matmul_q4k_repacked_tiled_prequant(
     // Both keep the same dots, so results are unchanged.
     let dst_ptr = SendMutPtr(dst.as_mut_ptr());
     // Enough row tiles per group to amortize the one-off scale widening.
-    #[cfg(target_feature = "avx2")]
-    let hoist_scales = m >= 32;
+    #[cfg(target_arch = "x86_64")]
+    let use512 = simd512();
+    // The 512-bit kernel widens its scales per sub-block from registers, so it has no use for the
+    // hoisted vectors.
+    #[cfg(target_arch = "x86_64")]
+    let hoist_scales = simd() && !use512 && m >= 32;
     pool.run(groups, &|g| {
         let dst_ptr = &dst_ptr;
         let bgrp = &rhs_x8[g * nb..(g + 1) * nb];
-        #[cfg(target_feature = "avx2")]
+        #[cfg(target_arch = "x86_64")]
         let gs = if hoist_scales {
             unsafe { repack_q4k::prep_group_scales(bgrp, nb) }
         } else {
@@ -249,30 +286,44 @@ pub fn matmul_q4k_repacked_tiled_prequant(
         while r < m {
             let mt = (m - r).min(8);
             let mut local = [0f32; 64];
-            #[cfg(target_feature = "avx2")]
-            {
-                let mut act_refs: [&[BlockQ8K]; 8] = [&lhs_b[0..0]; 8];
-                for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
-                    *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
-                }
-                unsafe {
-                    if hoist_scales {
-                        repack_q4k::gemm_group_avx2_pre_rt::<1>(
-                            bgrp,
-                            &act_refs[..mt],
-                            nb,
-                            &gs,
-                            &mut local,
-                        );
-                    } else {
-                        repack_q4k::gemm_group_avx2_rt::<1>(bgrp, &act_refs[..mt], nb, &mut local);
+            if simd() {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut act_refs: [&[BlockQ8K]; 8] = [&lhs_b[0..0]; 8];
+                    for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
+                        *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    }
+                    unsafe {
+                        if use512 {
+                            avx512::repack_q4k::gemm_group_avx512_rt::<Q4K_512_STRIP>(
+                                bgrp,
+                                &act_refs[..mt],
+                                nb,
+                                &mut local,
+                            );
+                        } else if hoist_scales {
+                            repack_q4k::gemm_group_avx2_pre_rt::<1>(
+                                bgrp,
+                                &act_refs[..mt],
+                                nb,
+                                &gs,
+                                &mut local,
+                            );
+                        } else {
+                            repack_q4k::gemm_group_avx2_rt::<1>(
+                                bgrp,
+                                &act_refs[..mt],
+                                nb,
+                                &mut local,
+                            );
+                        }
                     }
                 }
-            }
-            #[cfg(not(target_feature = "avx2"))]
-            for t in 0..mt {
-                let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
-                repack_q4k::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
+            } else {
+                for t in 0..mt {
+                    let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    repack_q4k::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
+                }
             }
             for t in 0..mt {
                 // SAFETY: disjoint [row, g*8..g*8+8] slices of dst.
@@ -306,6 +357,8 @@ pub fn matmul_q6k_repacked_tiled(
     let lhs_b = lhs_b.as_slice();
 
     let dst_ptr = SendMutPtr(dst.as_mut_ptr());
+    #[cfg(target_arch = "x86_64")]
+    let use512 = simd512();
     kquant_prefill_pool(m, n, k).run(groups, &|g| {
         let dst_ptr = &dst_ptr;
         let bgrp = &rhs_x8[g * nb..(g + 1) * nb];
@@ -313,20 +366,31 @@ pub fn matmul_q6k_repacked_tiled(
         while r < m {
             let mt = (m - r).min(8);
             let mut local = [0f32; 64];
-            #[cfg(target_feature = "avx2")]
-            {
-                let mut act_refs: [&[BlockQ8K]; 8] = [&lhs_b[0..0]; 8];
-                for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
-                    *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+            if simd() {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut act_refs: [&[BlockQ8K]; 8] = [&lhs_b[0..0]; 8];
+                    for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
+                        *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    }
+                    unsafe {
+                        if use512 {
+                            avx512::repack_q6k::gemm_group_avx512(
+                                bgrp,
+                                &act_refs[..mt],
+                                nb,
+                                &mut local,
+                            );
+                        } else {
+                            repack_q6k::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+                        }
+                    }
                 }
-                unsafe {
-                    repack_q6k::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+            } else {
+                for t in 0..mt {
+                    let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    repack_q6k::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
                 }
-            }
-            #[cfg(not(target_feature = "avx2"))]
-            for t in 0..mt {
-                let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
-                repack_q6k::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
             }
             for t in 0..mt {
                 // SAFETY: disjoint [row, g*8..g*8+8] slices of dst.
@@ -357,6 +421,7 @@ pub fn matmul_q5k_repacked_tiled(
     debug_assert_eq!(rhs_x8.len(), groups * nb);
     let lhs_b = quantize_act_q8k(lhs, m, k);
     let lhs_b = lhs_b.as_slice();
+    let use512 = simd512();
 
     let dst_ptr = SendMutPtr(dst.as_mut_ptr());
     kquant_prefill_pool(m, n, k).run(groups, &|g| {
@@ -366,20 +431,31 @@ pub fn matmul_q5k_repacked_tiled(
         while r < m {
             let mt = (m - r).min(8);
             let mut local = [0f32; 64];
-            #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-            {
-                let mut act_refs: [&[BlockQ8K]; 8] = [&lhs_b[0..0]; 8];
-                for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
-                    *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+            if simd() {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut act_refs: [&[BlockQ8K]; 8] = [&lhs_b[0..0]; 8];
+                    for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
+                        *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    }
+                    unsafe {
+                        if use512 {
+                            avx512::repack_q5k::gemm_group_avx512(
+                                bgrp,
+                                &act_refs[..mt],
+                                nb,
+                                &mut local,
+                            );
+                        } else {
+                            repack_q5k::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+                        }
+                    }
                 }
-                unsafe {
-                    repack_q5k::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+            } else {
+                for t in 0..mt {
+                    let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    repack_q5k::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
                 }
-            }
-            #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
-            for t in 0..mt {
-                let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
-                repack_q5k::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
             }
             for t in 0..mt {
                 // SAFETY: disjoint [row, g*8..g*8+8] slices of dst.
@@ -434,12 +510,14 @@ pub fn matmul_q4_0_repacked_gemv(
         for r in 0..m {
             let act = &lhs_b[r * nb..(r + 1) * nb];
             let mut local = [0f32; 8];
-            #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-            unsafe {
-                repack_q4_0::gemv_group_avx2(bgrp, act, nb, &mut local);
+            if simd() {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    repack_q4_0::gemv_group_avx2(bgrp, act, nb, &mut local);
+                }
+            } else {
+                repack_q4_0::gemv_group_scalar(bgrp, act, nb, &mut local);
             }
-            #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
-            repack_q4_0::gemv_group_scalar(bgrp, act, nb, &mut local);
             // SAFETY: disjoint [row, g*8..g*8+8] slices of dst.
             let out = unsafe { std::slice::from_raw_parts_mut(dst_ptr.0.add(r * n + g * 8), 8) };
             out.copy_from_slice(&local);
@@ -479,6 +557,7 @@ pub fn matmul_q4_0_repacked_tiled(
     }
     let lhs_b = lhs_b.as_slice();
 
+    let use512 = simd512();
     let dst_ptr = SendMutPtr(dst.as_mut_ptr());
     pool.run(groups, &|g| {
         let dst_ptr = &dst_ptr;
@@ -487,20 +566,31 @@ pub fn matmul_q4_0_repacked_tiled(
         while r < m {
             let mt = (m - r).min(8);
             let mut local = [0f32; 64];
-            #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-            {
-                let mut act_refs: [&[BlockQ8_0]; 8] = [&lhs_b[0..0]; 8];
-                for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
-                    *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+            if simd() {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut act_refs: [&[BlockQ8_0]; 8] = [&lhs_b[0..0]; 8];
+                    for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
+                        *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    }
+                    unsafe {
+                        if use512 {
+                            avx512::repack_inline::gemm_group_q4_0(
+                                bgrp,
+                                &act_refs[..mt],
+                                nb,
+                                &mut local,
+                            );
+                        } else {
+                            repack_q4_0::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+                        }
+                    }
                 }
-                unsafe {
-                    repack_q4_0::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+            } else {
+                for t in 0..mt {
+                    let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    repack_q4_0::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
                 }
-            }
-            #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
-            for t in 0..mt {
-                let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
-                repack_q4_0::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
             }
             for t in 0..mt {
                 // SAFETY: disjoint [row, g*8..g*8+8] slices of dst.
@@ -553,20 +643,22 @@ pub fn matmul_mxfp4_repacked_tiled(
         while r < m {
             let mt = (m - r).min(8);
             let mut local = [0f32; 64];
-            #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-            {
-                let mut act_refs: [&[BlockQ8_0]; 8] = [&lhs_b[0..0]; 8];
-                for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
-                    *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+            if simd() {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut act_refs: [&[BlockQ8_0]; 8] = [&lhs_b[0..0]; 8];
+                    for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
+                        *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    }
+                    unsafe {
+                        repack_mxfp4::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+                    }
                 }
-                unsafe {
-                    repack_mxfp4::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+            } else {
+                for t in 0..mt {
+                    let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    repack_mxfp4::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
                 }
-            }
-            #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
-            for t in 0..mt {
-                let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
-                repack_mxfp4::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
             }
             for t in 0..mt {
                 // SAFETY: disjoint [row, g*8..g*8+8] slices of dst.
@@ -601,6 +693,7 @@ pub fn matmul_mxfp4_x8_tiled(
     let mgroups = m.div_ceil(4);
     debug_assert_eq!(rhs_x8.len(), groups * nb);
     let pool = gemv_pool::pool();
+    let use512 = simd512();
 
     let ax4 = repack_mxfp4_x8::quantize_act(lhs, m, k);
     let ax4 = ax4.as_slice();
@@ -623,12 +716,32 @@ pub fn matmul_mxfp4_x8_tiled(
         };
         let mut mg = 0;
         // 16-row chunks (4 activation groups) amortize the weight decode 4x.
-        #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-        while mg + 4 <= mgroups {
+        #[cfg(target_arch = "x86_64")]
+        while simd() && mg + 4 <= mgroups {
             let a = |i: usize| &ax4[(mg + i) * nb..(mg + i + 1) * nb];
             let mut local = [0f32; 128];
             unsafe {
-                repack_mxfp4_x8::gemm_group16_avx2(a(0), a(1), a(2), a(3), bgrp, nb, &mut local);
+                if use512 {
+                    avx512::repack_x8::gemm_group16_mxfp4(
+                        a(0),
+                        a(1),
+                        a(2),
+                        a(3),
+                        bgrp,
+                        nb,
+                        &mut local,
+                    );
+                } else {
+                    repack_mxfp4_x8::gemm_group16_avx2(
+                        a(0),
+                        a(1),
+                        a(2),
+                        a(3),
+                        bgrp,
+                        nb,
+                        &mut local,
+                    );
+                }
             }
             for rp in 0..4 {
                 write_tile(mg + rp, &local[rp * 32..rp * 32 + 32]);
@@ -638,12 +751,18 @@ pub fn matmul_mxfp4_x8_tiled(
         while mg < mgroups {
             let agrp = &ax4[mg * nb..(mg + 1) * nb];
             let mut local = [0f32; 32];
-            #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-            unsafe {
-                repack_mxfp4_x8::gemm_group_avx2(agrp, bgrp, nb, &mut local);
+            if simd() {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    if use512 {
+                        avx512::repack_x8::gemm_group_mxfp4(agrp, bgrp, nb, &mut local);
+                    } else {
+                        repack_mxfp4_x8::gemm_group_avx2(agrp, bgrp, nb, &mut local);
+                    }
+                }
+            } else {
+                repack_mxfp4_x8::gemm_scalar(agrp, bgrp, nb, &mut local);
             }
-            #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
-            repack_mxfp4_x8::gemm_scalar(agrp, bgrp, nb, &mut local);
             write_tile(mg, &local);
             mg += 1;
         }
@@ -667,6 +786,7 @@ pub fn matmul_q8_0_x8_tiled(
     let mgroups = m.div_ceil(4);
     debug_assert_eq!(rhs_x8.len(), groups * nb);
     let pool = gemv_pool::pool();
+    let use512 = simd512();
 
     let ax4 = repack_q8_0_x8::quantize_act(lhs, m, k);
     let ax4 = ax4.as_slice();
@@ -688,12 +808,24 @@ pub fn matmul_q8_0_x8_tiled(
             }
         };
         let mut mg = 0;
-        #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-        while mg + 4 <= mgroups {
+        #[cfg(target_arch = "x86_64")]
+        while simd() && mg + 4 <= mgroups {
             let a = |i: usize| &ax4[(mg + i) * nb..(mg + i + 1) * nb];
             let mut local = [0f32; 128];
             unsafe {
-                repack_q8_0_x8::gemm_group16_avx2(a(0), a(1), a(2), a(3), bgrp, nb, &mut local);
+                if use512 {
+                    avx512::repack_x8::gemm_group16_q8_0(
+                        a(0),
+                        a(1),
+                        a(2),
+                        a(3),
+                        bgrp,
+                        nb,
+                        &mut local,
+                    );
+                } else {
+                    repack_q8_0_x8::gemm_group16_avx2(a(0), a(1), a(2), a(3), bgrp, nb, &mut local);
+                }
             }
             for rp in 0..4 {
                 write_tile(mg + rp, &local[rp * 32..rp * 32 + 32]);
@@ -703,12 +835,18 @@ pub fn matmul_q8_0_x8_tiled(
         while mg < mgroups {
             let agrp = &ax4[mg * nb..(mg + 1) * nb];
             let mut local = [0f32; 32];
-            #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-            unsafe {
-                repack_q8_0_x8::gemm_group_avx2(agrp, bgrp, nb, &mut local);
+            if simd() {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    if use512 {
+                        avx512::repack_x8::gemm_group_q8_0(agrp, bgrp, nb, &mut local);
+                    } else {
+                        repack_q8_0_x8::gemm_group_avx2(agrp, bgrp, nb, &mut local);
+                    }
+                }
+            } else {
+                repack_q8_0_x8::gemm_scalar(agrp, bgrp, nb, &mut local);
             }
-            #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
-            repack_q8_0_x8::gemm_scalar(agrp, bgrp, nb, &mut local);
             write_tile(mg, &local);
             mg += 1;
         }
@@ -746,6 +884,7 @@ pub fn matmul_q5_0_repacked_tiled(
     }
     let lhs_b = lhs_b.as_slice();
 
+    let use512 = simd512();
     let dst_ptr = SendMutPtr(dst.as_mut_ptr());
     pool.run(groups, &|g| {
         let dst_ptr = &dst_ptr;
@@ -754,20 +893,31 @@ pub fn matmul_q5_0_repacked_tiled(
         while r < m {
             let mt = (m - r).min(8);
             let mut local = [0f32; 64];
-            #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-            {
-                let mut act_refs: [&[BlockQ8_0]; 8] = [&lhs_b[0..0]; 8];
-                for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
-                    *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+            if simd() {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut act_refs: [&[BlockQ8_0]; 8] = [&lhs_b[0..0]; 8];
+                    for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
+                        *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    }
+                    unsafe {
+                        if use512 {
+                            avx512::repack_inline::gemm_group_q5_0(
+                                bgrp,
+                                &act_refs[..mt],
+                                nb,
+                                &mut local,
+                            );
+                        } else {
+                            repack_q5_0::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+                        }
+                    }
                 }
-                unsafe {
-                    repack_q5_0::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+            } else {
+                for t in 0..mt {
+                    let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    repack_q5_0::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
                 }
-            }
-            #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
-            for t in 0..mt {
-                let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
-                repack_q5_0::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
             }
             for t in 0..mt {
                 // SAFETY: disjoint [row, g*8..g*8+8] slices of dst.
@@ -807,6 +957,7 @@ pub fn matmul_q8_0_repacked_tiled(
     }
     let lhs_b = lhs_b.as_slice();
 
+    let use512 = simd512();
     let dst_ptr = SendMutPtr(dst.as_mut_ptr());
     pool.run(groups, &|g| {
         let dst_ptr = &dst_ptr;
@@ -815,20 +966,31 @@ pub fn matmul_q8_0_repacked_tiled(
         while r < m {
             let mt = (m - r).min(8);
             let mut local = [0f32; 64];
-            #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-            {
-                let mut act_refs: [&[BlockQ8_0]; 8] = [&lhs_b[0..0]; 8];
-                for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
-                    *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+            if simd() {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut act_refs: [&[BlockQ8_0]; 8] = [&lhs_b[0..0]; 8];
+                    for (t, slot) in act_refs.iter_mut().enumerate().take(mt) {
+                        *slot = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    }
+                    unsafe {
+                        if use512 {
+                            avx512::repack_inline::gemm_group_q8_0(
+                                bgrp,
+                                &act_refs[..mt],
+                                nb,
+                                &mut local,
+                            );
+                        } else {
+                            repack_q8_0::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+                        }
+                    }
                 }
-                unsafe {
-                    repack_q8_0::gemm_group_avx2(bgrp, &act_refs[..mt], nb, &mut local);
+            } else {
+                for t in 0..mt {
+                    let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
+                    repack_q8_0::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
                 }
-            }
-            #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
-            for t in 0..mt {
-                let act = &lhs_b[(r + t) * nb..(r + t + 1) * nb];
-                repack_q8_0::gemv_group_scalar(bgrp, act, nb, &mut local[t * 8..t * 8 + 8]);
             }
             for t in 0..mt {
                 // SAFETY: disjoint [row, g*8..g*8+8] slices of dst.
@@ -1178,15 +1340,18 @@ verify_block_sizes!(
 
 #[cfg(test)]
 mod mxfp4_avx_test {
-    // Everything below is behind `target_feature = "avx2"`, so on a build without it
+    // Everything below is behind `target_arch = "x86_64"`, so on a build without it
     // there is nothing here to name.
-    #[cfg_attr(not(target_feature = "avx2"), allow(unused_imports))]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_imports))]
     use super::*;
 
     // The native AVX2 MXFP4xQ8_0 dot must match the scalar dequant-then-dot.
-    #[cfg(target_feature = "avx2")]
+    #[cfg(target_arch = "x86_64")]
     #[test]
     pub(super) fn vec_dot_mxfp4_q8_0_avx_matches_scalar() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         let nb = 16usize;
         let n = nb * QK_MXFP4;
         let mut s = 0x9E37_79B9_7F4A_7C15u64;
@@ -1210,9 +1375,12 @@ mod mxfp4_avx_test {
 
     // Q6_K AVX2 dot (hoisted-bsums -32 offset, ggml-style) must match the
     // scalar reference bit-for-bit-close - guards the offset-fold port.
-    #[cfg(target_feature = "avx2")]
+    #[cfg(target_arch = "x86_64")]
     #[test]
     pub(super) fn vec_dot_q6k_q8k_avx_matches_scalar() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         let nb = 12usize;
         let n = nb * QK_K;
         let mut s = 0xD1B5_4A32_D192_ED03u64;
@@ -1240,19 +1408,22 @@ mod repack_q4k_plain_bench {
     //! The ignored cases here need real weights, a device, or a reference dump on
     //! this machine; nothing about them is automatic. Run one by name with
     //!   cargo test --release -p loken --lib NAME -- --ignored --nocapture
-    // The only case here is behind `target_feature = "avx2"`, so on a build without it
+    // The only case here is behind `target_arch = "x86_64"`, so on a build without it
     // there is nothing here to name.
-    #[cfg_attr(not(target_feature = "avx2"), allow(unused_imports))]
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_imports))]
     use super::*;
 
     /// Single-thread cost of the plain-scales GEMV vs the packed v2 (run with
     /// --release --include-ignored): quantifies the scalar scale-extraction
     /// overhead that the unified in-place layout would pay at M=1.
     // Times two AVX2 kernels against each other; there is nothing to time without them.
-    #[cfg(target_feature = "avx2")]
+    #[cfg(target_arch = "x86_64")]
     #[test]
     #[ignore]
     pub(super) fn bench_plain_vs_v2() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         let (k, n) = (1024usize, 1024usize);
         let nb = k / QK_K;
         let mut sd = 0x9E3779B97F4A7C15u64;
@@ -1279,7 +1450,7 @@ mod repack_q4k_plain_bench {
         let iters = 2000;
         let mut out = [0f32; 8];
         let mut sink = 0f32;
-        #[cfg(target_feature = "avx2")]
+        #[cfg(target_arch = "x86_64")]
         {
             let t0 = std::time::Instant::now();
             for _ in 0..iters {
@@ -2026,6 +2197,9 @@ mod q8_1_dequantize_test {
     /// the scale is dropped and if `s` is mistakenly folded in.
     #[test]
     pub(super) fn round_trip_stays_within_half_a_quantisation_step() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         // A block whose largest value decides the scale, plus a block of one sign, so the
         // sum term is far from zero and would show up if it leaked into the output.
         let mut x = vec![0f32; 4 * QK8_1];
@@ -2072,6 +2246,9 @@ mod matmul_bytes_multi_test {
     // same Q8 activation quantize, only the work scheduling differs.
     #[test]
     pub(super) fn multi_matches_per_expert() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         let mut s = 0x2545_F491_4F6C_DD1Du64;
         let mut next = || {
             s ^= s << 13;
@@ -2116,12 +2293,15 @@ mod matmul_bytes_multi_test {
     }
 }
 
-#[cfg(all(test, target_feature = "avx2"))]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod q5_0_avx_tests {
     use super::*;
 
     #[test]
     pub(super) fn q5_0_avx_dot_matches_unopt() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         // Cover several k (all %32==0): expert width, d_inner, in_proj width,
         // and a couple more - this kernel now runs on EVERY Q5_0 tensor, so
         // the qh-expand identity must hold across widths, not just k=2688.
@@ -2160,6 +2340,9 @@ mod gate_up_silu_tests {
     /// so compare within an f16-ULP tolerance rather than bit-exact.
     #[test]
     pub(super) fn fused_gate_up_silu_matches_reference() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         let mut s = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = || {
             s ^= s << 13;

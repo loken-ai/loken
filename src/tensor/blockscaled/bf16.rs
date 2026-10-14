@@ -10,8 +10,8 @@ use rayon::prelude::*;
 
 /// The dot of `len` bf16 values (as bytes) with `len` f32 activations, `len` a multiple of
 /// eight: each value widened by placing its bits in the high half, then fused multiply-adds.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 #[inline]
 unsafe fn row_dot_avx2(bytes: *const u8, x: *const f32, len: usize) -> f32 {
     use core::arch::x86_64::*;
@@ -31,11 +31,54 @@ unsafe fn row_dot_avx2(bytes: *const u8, x: *const f32, len: usize) -> f32 {
     _mm_cvtss_f32(s1)
 }
 
+/// The same dot on 512-bit registers: four accumulators of sixteen lanes, the tail under a mask.
+/// The sum is formed in another order than [`row_dot_avx2`]'s, so the two agree to the float
+/// rounding of the sum, not bit for bit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2,avx512f,avx512bw,avx512vl,avx512dq,avx512vnni")]
+unsafe fn row_dot_avx512(bytes: *const u8, x: *const f32, len: usize) -> f32 {
+    use core::arch::x86_64::*;
+    let widen = |p: *const u8| {
+        let h = _mm512_cvtepu16_epi32(_mm256_loadu_si256(p as *const __m256i));
+        _mm512_castsi512_ps(_mm512_slli_epi32::<16>(h))
+    };
+    let mut acc = [_mm512_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 64 <= len {
+        for (j, a) in acc.iter_mut().enumerate() {
+            let at = i + 16 * j;
+            *a = _mm512_fmadd_ps(widen(bytes.add(2 * at)), _mm512_loadu_ps(x.add(at)), *a);
+        }
+        i += 64;
+    }
+    while i + 16 <= len {
+        acc[0] = _mm512_fmadd_ps(widen(bytes.add(2 * i)), _mm512_loadu_ps(x.add(i)), acc[0]);
+        i += 16;
+    }
+    if i < len {
+        let mask = (1u16 << (len - i)) - 1;
+        let h = _mm512_cvtepu16_epi32(_mm256_maskz_loadu_epi16(
+            mask,
+            bytes.add(2 * i) as *const i16,
+        ));
+        let w = _mm512_castsi512_ps(_mm512_slli_epi32::<16>(h));
+        acc[1] = _mm512_fmadd_ps(w, _mm512_maskz_loadu_ps(mask, x.add(i)), acc[1]);
+    }
+    _mm512_reduce_add_ps(_mm512_add_ps(
+        _mm512_add_ps(acc[0], acc[1]),
+        _mm512_add_ps(acc[2], acc[3]),
+    ))
+}
+
 #[inline(always)]
 fn row_dot(row: &[u8], x: &[f32]) -> f32 {
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        if x.len().is_multiple_of(8) {
+        if crate::cpu::dispatch_avx512() {
+            // Safety: `row` holds two bytes per activation element.
+            return unsafe { row_dot_avx512(row.as_ptr(), x.as_ptr(), x.len()) };
+        }
+        if x.len().is_multiple_of(8) && crate::cpu::dispatch_avx2() {
             // Safety: `row` holds two bytes per activation element.
             return unsafe { row_dot_avx2(row.as_ptr(), x.as_ptr(), x.len()) };
         }
@@ -104,6 +147,38 @@ impl Bf16Weight {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// Every length around the 64-wide body, the 16-wide step and the masked tail, against the f64
+    /// sum of the same products. A float sum of `n` terms is within `n * 2^-24 * sum|term|` of the
+    /// exact one whatever its order, which bounds both kernels.
+    #[test]
+    fn avx512_row_dot_stays_inside_the_summation_bound() {
+        if !crate::cpu::hardware_has_avx512() {
+            return;
+        }
+        for len in [
+            1usize, 7, 8, 15, 16, 17, 31, 63, 64, 65, 127, 200, 1000, 4097,
+        ] {
+            let w: Vec<f32> = (0..len).map(|i| ((i as f32) * 0.37).sin() * 3.0).collect();
+            let x: Vec<f32> = (0..len).map(|i| ((i as f32) * 0.21).cos() - 0.3).collect();
+            let bytes: Vec<u8> = w
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let (mut want, mut mag) = (0f64, 0f64);
+            for (c, &xv) in bytes.chunks_exact(2).zip(&x) {
+                let wv = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
+                want += wv * xv as f64;
+                mag += (wv * xv as f64).abs();
+            }
+            let got = unsafe { row_dot_avx512(bytes.as_ptr(), x.as_ptr(), len) } as f64;
+            let bound = len as f64 * 2f64.powi(-24) * mag + 1e-30;
+            assert!(
+                (got - want).abs() <= bound,
+                "len {len}: {got} vs {want} (bound {bound})"
+            );
+        }
+    }
 
     /// The in-place product equals the dense matmul over the widened weight.
     #[test]
