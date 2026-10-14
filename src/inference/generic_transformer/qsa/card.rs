@@ -210,6 +210,33 @@ impl SparseAttention {
         Ok(())
     }
 
+    /// Widen the budget to `tokens`, so that a query keeps every block it can see and its
+    /// attention over the cache is dense; the card's buffers, sized by the budget, are made
+    /// again. Nothing when the card's kernels would not serve the wider room.
+    pub fn keep_every_token(&mut self, tokens: usize, head_dim: usize) -> Result<()> {
+        let block = self.meta.block;
+        let wide = tokens.div_ceil(block) * block;
+        if wide <= self.meta.top_k {
+            return Ok(());
+        }
+        let narrow = self.meta.top_k;
+        self.meta.top_k = wide;
+        if !self.card_serves(head_dim) {
+            self.meta.top_k = narrow;
+            return Ok(());
+        }
+        if let Some(card) = self.card.take() {
+            self.attach_card(&card.dev, tokens)?;
+        }
+        self.every_token = true;
+        Ok(())
+    }
+
+    /// Whether the budget covers every token of the cache.
+    pub fn every_token(&self) -> bool {
+        self.every_token
+    }
+
     /// Room on the card for `tokens`: the pooled keys grow with the sequence, and a larger cache
     /// takes over the old one's blocks. The address of the pooled keys moves with it, so a step
     /// recorded against them must end first, which a cache that grew to `tokens` already did.
@@ -418,6 +445,8 @@ impl SparseAttention {
         row0: usize,
         rows: usize,
     ) -> Result<(Tensor, Tensor)> {
+        // An indexer that keeps every token selects nothing: its rows attend up to their positions.
+        let select = !self.every_token;
         let Some(card) = self.card.as_mut() else {
             crate::tensor::bail!("the indexer has no cache on a card");
         };
@@ -444,21 +473,23 @@ impl SparseAttention {
         let max_blocks = card.scores.elem_count();
         let sel = card.sel_rows.narrow(0, 0, rows)?;
         let count = card.count_rows.narrow(0, 0, rows)?;
-        indexer_select_steps(
-            q,
-            &card.q_gamma,
-            &rot,
-            tables,
-            stride,
-            &card.pooled,
-            &card.scores_rows,
-            max_blocks,
-            &sel,
-            &count,
-            pos,
-            rows,
-            &card.shape,
-        )?;
+        if select {
+            indexer_select_steps(
+                q,
+                &card.q_gamma,
+                &rot,
+                tables,
+                stride,
+                &card.pooled,
+                &card.scores_rows,
+                max_blocks,
+                &sel,
+                &count,
+                pos,
+                rows,
+                &card.shape,
+            )?;
+        }
         if !crate::tensor::cuda_ext::capture_active(&card.dev) {
             card.tokens = card.tokens.max(card.step_pos + 1);
         }

@@ -143,6 +143,10 @@ cuda_launchers! {
         sel: *const u32, count: *const u32, out: *mut f32, part_o: *mut f32, part_ml: *mut f32,
         n_head: i32, n_kv: i32, cap: i32, hd: i32, ncap: i32, splits: i32, scale: f32, rows: i32,
         sel_stride: i32);
+    loken_selected_attn_group(q: *const f32, kbuf: *const c_void, vbuf: *const c_void,
+        sel: *const u32, count: *const u32, out: *mut f32, part_o: *mut f32, part_ml: *mut f32,
+        n_head: i32, n_kv: i32, cap: i32, hd: i32, ncap: i32, splits: i32, scale: f32, rows: i32,
+        sel_stride: i32, pos: *const i32);
     loken_selected_attn_rows(q: *const f32, kbuf: *const c_void, vbuf: *const c_void,
         sel: *const u32, count: *const u32, out: *mut f32, rows: i32, n_head: i32, n_kv: i32,
         cap: i32, ncap: i32, scale: f32);

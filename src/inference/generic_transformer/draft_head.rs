@@ -661,11 +661,8 @@ impl GenericHeteroTransformer {
             return Ok(false);
         }
         let rows = tokens.len().max(1);
-        let cap = self
-            .layers
-            .first()
-            .map(|l| l.kv_cache.max_seq_len_padded())
-            .unwrap_or(0);
+        // Every position a request can reach: the context an indexed layer's cache holds whole.
+        let cap = self.config.effective_max_context();
         if rows > VERIFY_ROWS || at + rows > cap {
             return Ok(false);
         }

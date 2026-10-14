@@ -2340,11 +2340,25 @@ impl GenericHeteroTransformer {
     /// hidden state and the mixer that collapses the layer's streams, read from the source.
     fn load_draft_head(
         source: &TensorSource<'_>,
-        layer: GenericTransformerLayer,
+        mut layer: GenericTransformerLayer,
         layer_dev: LayerDevice,
         cuda_devices: &HashMap<usize, Device>,
         config: &GenericTransformerConfig,
     ) -> Result<super::draft_head::DraftHead> {
+        // The head attends to every token of its cache, not to the blocks its indexer would keep:
+        // its guess reads the whole context the model's own layers selected from.
+        #[cfg(feature = "cuda")]
+        {
+            let (tokens, head_dim) = (layer.kv_cache.max_seq_len_padded(), layer.head_dim);
+            let served = crate::inference::moe_cuda::grouped_attention_serves(
+                head_dim,
+                layer.n_head,
+                layer.n_kv_head,
+            );
+            if let Some(sparse) = layer.sparse.as_mut().filter(|_| served) {
+                sparse.keep_every_token(tokens, head_dim)?;
+            }
+        }
         let dev = match &layer_dev {
             LayerDevice::Cuda(i) => cuda_devices.get(i).cloned().unwrap_or(Device::Cpu),
             LayerDevice::Cpu => Device::Cpu,

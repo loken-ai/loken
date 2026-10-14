@@ -314,6 +314,96 @@ pub fn selected_attention_steps(
     )
 }
 
+/// Threads of a block of the grouped attention: the head dimension it serves at most.
+const SELECTED_GROUP_THREADS: usize = 256;
+/// Query heads a key-value head's group may hold in the grouped attention.
+const SELECTED_GROUP_MAX: usize = 16;
+
+/// Whether the grouped attention serves heads of `hd` in groups of `n_head / n_kv`.
+pub fn grouped_attention_serves(hd: usize, n_head: usize, n_kv: usize) -> bool {
+    hd <= SELECTED_GROUP_THREADS
+        && n_kv > 0
+        && n_head.is_multiple_of(n_kv)
+        && n_head / n_kv <= SELECTED_GROUP_MAX
+}
+
+/// The tokens each row of a grouped attention keeps.
+pub enum GroupKept<'a> {
+    /// `sel` `[rows, room]` and their number `count` `[rows]`, as an indexer selected them.
+    Selected { sel: &'a Tensor, count: &'a Tensor },
+    /// Every token up to the row's position, `pos` `[rows]` I32 on the card.
+    UpTo(&'a Tensor),
+}
+
+/// [`selected_attention_steps`] with each key-value head's kept tokens read once for the group of
+/// query heads that share it: for a dense attention over many tokens. `None` where the kernel
+/// does not serve the shapes (a dimension wider than its block, a group past its limit).
+#[allow(clippy::too_many_arguments)]
+pub fn selected_attention_steps_grouped(
+    q: &Tensor,
+    kbuf: &Tensor,
+    vbuf: &Tensor,
+    kept: GroupKept<'_>,
+    rows: usize,
+    n_head: usize,
+    n_kv: usize,
+    cap: usize,
+    hd: usize,
+    scale: f32,
+) -> Result<Option<Tensor>> {
+    if !grouped_attention_serves(hd, n_head, n_kv) {
+        return Ok(None);
+    }
+    let dev = q.device().as_cuda_device()?;
+    let stream = stream_of_card(q)?;
+    let (ncap, sel_p, count_p, pos_p) = match kept {
+        GroupKept::Selected { sel, count } => (
+            sel.dim(1)?,
+            address::<u32>(sel, "sel")? as *const u32,
+            address::<u32>(count, "count")? as *const u32,
+            std::ptr::null(),
+        ),
+        GroupKept::UpTo(pos) => (
+            cap,
+            std::ptr::null(),
+            std::ptr::null(),
+            address::<i32>(pos, "pos")? as *const i32,
+        ),
+    };
+    let splits = attention_splits(ncap);
+    let out = unsafe { dev.alloc::<f32>(rows * n_head * hd) }?;
+    let part_o = unsafe { dev.alloc::<f32>(rows * n_head * splits * hd) }?;
+    let part_ml = unsafe { dev.alloc::<f32>(rows * n_head * splits * 2) }?;
+    unsafe {
+        loken_selected_attn_group(
+            address::<f32>(q, "q")? as *const f32,
+            address::<half::f16>(kbuf, "kbuf")? as *const c_void,
+            address::<half::f16>(vbuf, "vbuf")? as *const c_void,
+            sel_p,
+            count_p,
+            out.device_ptr(out.stream()).0 as *mut f32,
+            part_o.device_ptr(part_o.stream()).0 as *mut f32,
+            part_ml.device_ptr(part_ml.stream()).0 as *mut f32,
+            n_head as i32,
+            n_kv as i32,
+            cap as i32,
+            hd as i32,
+            ncap as i32,
+            splits as i32,
+            scale,
+            rows as i32,
+            ncap as i32,
+            pos_p,
+            stream,
+        );
+    }
+    tensor_from_cuda_storage(
+        CudaStorage::wrap_cuda_slice(out, dev.clone()),
+        crate::tensor::Shape::from((1, rows, n_head * hd)),
+    )
+    .map(Some)
+}
+
 /// [`indexer_select`] for the rows of a prompt chunk, the first at position `first`: `q` is
 /// `[rows, heads * hd]` raw, `rot` `[rows, 2 * half]` the tables of each row's position, `scores`
 /// room for `rows` times one score per block, `sel` `[rows, room]` and `count` `[rows]`.
@@ -540,9 +630,9 @@ pub fn selected_attention_rows(
 const ATTENTION_RUN_TOKENS: usize = 128;
 
 /// The runs the kept tokens are cut into, for a room of `ncap` of them: a block takes a run of
-/// [`ATTENTION_RUN_TOKENS`], and no more than thirty-two runs are joined.
+/// [`ATTENTION_RUN_TOKENS`].
 fn attention_splits(ncap: usize) -> usize {
-    ncap.div_ceil(ATTENTION_RUN_TOKENS).clamp(1, 32)
+    ncap.div_ceil(ATTENTION_RUN_TOKENS).max(1)
 }
 
 /// The shared memory a block of the attention kernel needs, in bytes.
@@ -931,6 +1021,23 @@ mod tests {
             )
             .unwrap(),
         );
+        let out_g = selected_attention_steps_grouped(
+            &q,
+            &kb_b,
+            &vb_b,
+            GroupKept::Selected {
+                sel: &sel_b,
+                count: &count_b,
+            },
+            rows,
+            n_head,
+            n_kv,
+            cap,
+            hd,
+            scale,
+        )
+        .unwrap()
+        .map(|t| host_f(&t));
 
         assert_eq!(host_f(&pooled_a), host_f(&pooled_b), "the pooled keys");
         assert_eq!(host_f(&tail_a), host_f(&tail_b), "the tail");
@@ -951,5 +1058,43 @@ mod tests {
             );
         }
         assert_eq!(out_a, out_b, "the attention");
+        // Every token up to a row's position is the selection of all of them, read alike.
+        {
+            let host_pos = pos.to_vec1::<i32>().unwrap();
+            let mut ident = vec![0u32; rows * cap];
+            let mut counts = vec![0u32; rows];
+            for r in 0..rows {
+                let n = host_pos[r] as usize + 1;
+                for (j, slot) in ident[r * cap..r * cap + n].iter_mut().enumerate() {
+                    *slot = j as u32;
+                }
+                counts[r] = n as u32;
+            }
+            let ident = Tensor::from_vec(ident, (rows, cap), &dev).unwrap();
+            let counts = Tensor::from_vec(counts, (rows,), &dev).unwrap();
+            let run = |kept| {
+                host_f(
+                    &selected_attention_steps_grouped(
+                        &q, &kb_b, &vb_b, kept, rows, n_head, n_kv, cap, hd, scale,
+                    )
+                    .unwrap()
+                    .expect("the grouped attention serves these shapes"),
+                )
+            };
+            let by_sel = run(GroupKept::Selected {
+                sel: &ident,
+                count: &counts,
+            });
+            let up_to = run(GroupKept::UpTo(&pos));
+            assert_eq!(by_sel, up_to, "every token up to the position");
+        }
+        // The grouped reading sums in another order: the same answer within rounding.
+        let out_g = out_g.expect("the grouped attention serves these shapes");
+        for (i, (g, b)) in out_g.iter().zip(&out_b).enumerate() {
+            assert!(
+                (g - b).abs() <= 1e-4 * (1.0 + b.abs()),
+                "value {i}: grouped {g} against {b}"
+            );
+        }
     }
 }

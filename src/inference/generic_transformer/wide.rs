@@ -459,9 +459,36 @@ impl GenericTransformerLayer {
         crate::inference::moe_cuda::kv_append_pos_rows(
             &k, &v, &k_buf, &v_buf, pos, rows, n_kv, cap, hd,
         )?;
-        let y = crate::inference::moe_cuda::selected_attention_steps(
-            &q, &k_buf, &v_buf, &sel, &count, rows, n_head, n_kv, cap, hd, scale,
-        )?;
+        let y = {
+            // A dense attention reads each key-value head's tokens once for its query heads.
+            // A dense one keeps every token up to each row's position.
+            use crate::inference::moe_cuda::{selected_attention_steps_grouped, GroupKept};
+            let every = self.sparse.as_ref().is_some_and(|sp| sp.every_token());
+            let grouped = match every {
+                true => selected_attention_steps_grouped(
+                    &q,
+                    &k_buf,
+                    &v_buf,
+                    GroupKept::UpTo(pos),
+                    rows,
+                    n_head,
+                    n_kv,
+                    cap,
+                    hd,
+                    scale,
+                )?,
+                false => None,
+            };
+            match grouped {
+                Some(y) => y,
+                None if every => {
+                    crate::tensor::bail!("the dense attention's kernel does not serve this layer")
+                }
+                None => crate::inference::moe_cuda::selected_attention_steps(
+                    &q, &k_buf, &v_buf, &sel, &count, rows, n_head, n_kv, cap, hd, scale,
+                )?,
+            }
+        };
         let y = self.gate_attention(x, y)?;
         self.attn_output.forward(&y).map(Some)
     }
@@ -713,7 +740,16 @@ impl GenericTransformerLayer {
             )
         {
             let sparse = self.sparse.as_mut().expect("an indexed layer");
-            return match sparse.observe_on_card(x, index_pos)? {
+            let pick = sparse.observe_on_card(x, index_pos)?;
+            // A layer that only fills its cache takes the rows' keys and values in and attends to
+            // nothing: what it would attend to is not read.
+            if self.kv_only {
+                let (_, k, v) = self.selected_inputs(x, index_pos)?;
+                self.kv_cache
+                    .append_in_place(&k.contiguous()?, &v.contiguous()?)?;
+                return x.zeros_like();
+            }
+            return match pick {
                 super::qsa::CardPick::Kept { sel, count } => {
                     self.attend_selected_card(x, index_pos, &sel, &count)
                 }

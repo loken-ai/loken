@@ -135,6 +135,21 @@ impl GenericTransformerLayer {
         row0: usize,
         rows: usize,
     ) -> Result<Tensor> {
+        self.forward_wide_graph_rows_chained(x, row0, rows, None, None)
+            .map(|(r, _)| r)
+    }
+
+    /// [`Self::forward_wide_graph_rows_at`] with the token mixer's norm of the rows given (`xn`,
+    /// from the layer before), and the rows' norm for the next layer taken in the last
+    /// write-back when `next` holds that layer's gamma and epsilon: the rows and that norm.
+    pub(super) fn forward_wide_graph_rows_chained(
+        &mut self,
+        x: &Tensor,
+        row0: usize,
+        rows: usize,
+        xn: Option<Tensor>,
+        next: Option<(Tensor, f32)>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         use super::hyper::combine_on_card;
         use super::wide::staged;
         let dev = x.device();
@@ -173,9 +188,13 @@ impl GenericTransformerLayer {
             let h = self.hyper.as_ref().expect("a wide layer has its mixers");
             (h.attn.streams(), h.attn.dim())
         };
+        let given = xn.filter(|_| self.ngram.is_none());
         let (mixed, inj) = staged("mix_token", &dev, false, || {
             let hc = self.hyper.as_ref().expect("a wide layer has its mixers");
-            let xn = hc.attn.normed_on_card(x)?;
+            let xn = match given {
+                Some(xn) => xn,
+                None => hc.attn.normed_on_card(x)?,
+            };
             hc.attn.mix_on_card(&xn, true)
         })?;
         if let Some(buffer) = self.verify_keep.as_ref().and_then(|k| k.mixed.as_ref()) {
@@ -234,17 +253,16 @@ impl GenericTransformerLayer {
                 .mix_on_card(&xn.expect("the norm was asked for"), true)
         })?;
         let out = self.feed_forward(&mixed, &dev)?;
-        let (r, _) = staged("combine", &dev, false, || {
-            combine_on_card(
+        staged("combine", &dev, false, || {
+            crate::inference::moe_cuda::hc_combine(
                 &r,
                 &out,
                 &inj.expect("the feed-forward's mixer writes back"),
-                None,
+                next.as_ref().map(|(gamma, eps)| (gamma, *eps)),
                 s,
                 d,
             )
-        })?;
-        Ok(r)
+        })
     }
 
     /// Return to the state before the verify's `rows` rows at `base`, and take in the first
@@ -630,8 +648,23 @@ impl GenericHeteroTransformer {
                 let _order = crate::tensor::quantized::DecodeOrder::enter();
                 let _in_place = crate::inference::moe_cuda::in_place_state(true);
                 let mut h = input;
-                for li in segs[seg].0.clone() {
-                    h = self.layers[li].forward_wide_graph_rows(&h, rows)?;
+                // A layer hands the next in the segment the norm its token mixer starts from,
+                // taken in its last write-back.
+                let mut xn: Option<Tensor> = None;
+                let run = segs[seg].0.clone();
+                for li in run.clone() {
+                    let next = (li + 1 < run.end)
+                        .then(|| self.layers[li + 1].chained_attn_norm())
+                        .flatten();
+                    let (out, x) = self.layers[li].forward_wide_graph_rows_chained(
+                        &h,
+                        0,
+                        rows,
+                        xn.take(),
+                        next,
+                    )?;
+                    h = out;
+                    xn = x;
                 }
                 if seg + 1 == segs.len() {
                     return self.verify_head(h, rows).map(Some);

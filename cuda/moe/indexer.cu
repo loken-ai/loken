@@ -597,6 +597,177 @@ extern "C" void loken_selected_attn_steps(
         part_o, part_ml, out, hd, splits, n_head);
 }
 
+// The attention of `loken_selected_attn_steps` with a block for each key-value head, run and row:
+// the group of query heads that share the head reads each kept key and value once. The run's
+// scores are each head's, its statistics and weighted values too, written as the per-head runs
+// `loken_selected_attn_join_kernel` joins. `hd` is at most the block's threads, the group at most
+// GROUP_MAX.
+#define GROUP_MAX 16
+
+extern "C" __global__ void loken_selected_attn_group_kernel(
+        const float * __restrict__ q, const __half * __restrict__ kbuf,
+        const __half * __restrict__ vbuf, const uint32_t * __restrict__ sel,
+        const uint32_t * __restrict__ count, float * __restrict__ part_o,
+        float * __restrict__ part_ml, int n_head, int n_kv, int cap, int hd, int chunk_max,
+        int splits, float scale, int sel_stride, const int * __restrict__ pos) {
+    extern __shared__ float smem[];
+    // Without a selection (`sel` null) a row keeps every token up to its position `pos`.
+    {
+        const size_t row = blockIdx.z;
+        q += row * n_head * hd;
+        if (sel != nullptr) {
+            sel += row * sel_stride;
+            count += row;
+        } else {
+            pos += row;
+        }
+        part_o += row * n_head * splits * hd;
+        part_ml += row * n_head * splits * 2;
+    }
+    const int g = n_head / n_kv;
+    float * scores = smem;                       // [g][chunk_max]
+    float * qs = scores + (size_t) g * chunk_max; // [g][hd]
+    __shared__ float red[32];
+    __shared__ float stat_m[GROUP_MAX], stat_l[GROUP_MAX];
+    const int kvh = blockIdx.x, s = blockIdx.y;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+    const int n = sel != nullptr ? (int) *count : *pos + 1;
+    const int chunk = (n + splits - 1) / splits;
+    const int lo = s * chunk;
+    const int cnt = n > lo ? (n - lo < chunk ? n - lo : chunk) : 0;
+    const int nvec = hd / 8;
+    const float neg_inf = __int_as_float(0xff800000);
+    for (int i = threadIdx.x; i < g * hd; i += blockDim.x) qs[i] = q[(size_t) (kvh * g) * hd + i];
+    __syncthreads();
+    const __half * kh = kbuf + (size_t) kvh * cap * hd;
+    const __half * vh = vbuf + (size_t) kvh * cap * hd;
+    // the scores: a warp takes four tokens at a time, its lanes the keys' pieces, each head's dot
+    // summed over them
+    for (int base = warp * 4; base < cnt; base += nwarps * 4) {
+        uint32_t ids[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u)
+            ids[u] = base + u < cnt ? (sel != nullptr ? sel[lo + base + u] : (uint32_t) (lo + base + u)) : 0u;
+        float dot[4][GROUP_MAX];
+#pragma unroll
+        for (int u = 0; u < 4; ++u)
+#pragma unroll
+            for (int h = 0; h < GROUP_MAX; ++h) dot[u][h] = 0.f;
+        for (int v = lane; v < nvec; v += 32) {
+            uint4 w[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) w[u] = ((const uint4 *) (kh + (size_t) ids[u] * hd))[v];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const __half2 * hp = (const __half2 *) &w[u];
+                float k8[8];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float2 f = __half22float2(hp[i]);
+                    k8[2 * i] = f.x;
+                    k8[2 * i + 1] = f.y;
+                }
+#pragma unroll
+                for (int h = 0; h < GROUP_MAX; ++h) {
+                    if (h < g) {
+                        const float * qv = qs + h * hd + v * 8;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) dot[u][h] += k8[i] * qv[i];
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+#pragma unroll
+            for (int h = 0; h < GROUP_MAX; ++h) {
+                if (h < g) {
+                    float d = dot[u][h];
+                    for (int off = 16; off > 0; off >>= 1) d += __shfl_xor_sync(0xffffffffu, d, off);
+                    if (lane == 0 && base + u < cnt) scores[h * chunk_max + base + u] = d * scale;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    // each head's statistics over the run
+    for (int h = 0; h < g; ++h) {
+        float * sc = scores + h * chunk_max;
+        float m = neg_inf;
+        for (int j = threadIdx.x; j < cnt; j += blockDim.x) m = fmaxf(m, sc[j]);
+        for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+        if (lane == 0) red[warp] = m;
+        __syncthreads();
+        m = red[0];
+        for (int i = 1; i < nwarps; ++i) m = fmaxf(m, red[i]);
+        __syncthreads();
+        float l = 0.f;
+        for (int j = threadIdx.x; j < cnt; j += blockDim.x) {
+            const float e = expf(sc[j] - m);
+            sc[j] = e;
+            l += e;
+        }
+        for (int off = 16; off > 0; off >>= 1) l += __shfl_xor_sync(0xffffffffu, l, off);
+        if (lane == 0) red[warp] = l;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.f;
+            for (int i = 0; i < nwarps; ++i) t += red[i];
+            stat_m[h] = m;
+            stat_l[h] = t;
+        }
+        __syncthreads();
+    }
+    // the weighted values: a thread takes a dimension, each value read once for the group, eight
+    // tokens' values loaded at a time
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float acc[GROUP_MAX];
+#pragma unroll
+        for (int h = 0; h < GROUP_MAX; ++h) acc[h] = 0.f;
+        for (int j0 = 0; j0 < cnt; j0 += 8) {
+            float vd[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u)
+                vd[u] = j0 + u < cnt
+                            ? __half2float(vh[(size_t) (sel != nullptr ? sel[lo + j0 + u] : (uint32_t) (lo + j0 + u)) * hd + d])
+                            : 0.f;
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                if (j0 + u < cnt) {
+#pragma unroll
+                    for (int h = 0; h < GROUP_MAX; ++h)
+                        if (h < g) acc[h] += scores[h * chunk_max + j0 + u] * vd[u];
+                }
+            }
+        }
+        for (int h = 0; h < g; ++h) {
+            const size_t run = (size_t) (kvh * g + h) * splits + s;
+            part_o[run * hd + d] = acc[h];
+        }
+    }
+    if (threadIdx.x < g) {
+        const size_t run = (size_t) (kvh * g + threadIdx.x) * splits + s;
+        part_ml[run * 2] = cnt > 0 ? stat_m[threadIdx.x] : neg_inf;
+        part_ml[run * 2 + 1] = cnt > 0 ? stat_l[threadIdx.x] : 0.f;
+    }
+}
+
+extern "C" void loken_selected_attn_group(
+        const float * q, const void * kbuf, const void * vbuf, const uint32_t * sel,
+        const uint32_t * count, float * out, float * part_o, float * part_ml, int n_head,
+        int n_kv, int cap, int hd, int ncap, int splits, float scale, int rows, int sel_stride,
+        const int * pos, cudaStream_t stream) {
+    const int threads = 256;
+    const int g = n_head / n_kv;
+    const int chunk_max = (ncap + splits - 1) / splits;
+    const size_t smem = (size_t) (g * chunk_max + g * hd) * sizeof(float);
+    loken_selected_attn_group_kernel<<<dim3(n_kv, splits, rows), threads, smem, stream>>>(
+        q, (const __half *) kbuf, (const __half *) vbuf, sel, count, part_o, part_ml, n_head, n_kv,
+        cap, hd, chunk_max, splits, scale, sel_stride, pos);
+    loken_selected_attn_join_kernel<<<dim3(n_head, rows), hd < 1024 ? hd : 1024, 0, stream>>>(
+        part_o, part_ml, out, hd, splits, n_head);
+}
+
 // Attention of the rows of a prompt chunk, each over its own kept tokens. A block takes one row and
 // one key-value head and serves the whole group of query heads that share it, so the keys and
 // values of the row's kept tokens are read once for the group: thirty-two tokens at a time are

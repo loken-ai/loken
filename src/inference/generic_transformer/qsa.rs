@@ -318,6 +318,10 @@ pub struct SparseAttention {
     /// stale once this moves.
     #[cfg(feature = "cuda")]
     card_births: u64,
+    /// The budget covers every token of the cache: the attention is dense, and its kept tokens
+    /// are many, read once for a group of query heads.
+    #[cfg(feature = "cuda")]
+    every_token: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -351,6 +355,8 @@ impl SparseAttention {
             card: None,
             #[cfg(feature = "cuda")]
             card_births: 0,
+            #[cfg(feature = "cuda")]
+            every_token: false,
         }
     }
 
