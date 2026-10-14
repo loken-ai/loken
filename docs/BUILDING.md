@@ -37,6 +37,10 @@ bf16 and fp8 row dots and the q8_K quantiser use 512-bit registers. Each returns
 AVX2 twin, except the bf16 and fp8 row dots, which sum in another order and agree to the rounding
 of the sum.
 
+The attention dot and axpy, the f16 and q8 KV helpers, the activations, the softmax exp, RMSNorm
+and RoPE use 512-bit registers too, with the AVX2 results. The IQ formats, the fp4 chunk dot, the
+argmax and the decode GEMVs of the repacked layouts stay on their AVX2 form.
+
 To let the compiler use the build host's whole instruction set outside the kernels, build with
 `RUSTFLAGS="-C target-cpu=native"`; that binary does not run on other hosts.
 
