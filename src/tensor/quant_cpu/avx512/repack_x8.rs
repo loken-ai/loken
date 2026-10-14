@@ -197,7 +197,7 @@ mod tests {
                     *q = match next() % 9 {
                         0 => 127,
                         1 => -127,
-                        _ => (next() % 255) as i64 as i8 - 127,
+                        _ => ((next() % 255) as i32 - 127) as i8,
                     };
                 }
                 if i == 0 {
@@ -229,7 +229,7 @@ mod tests {
             .map(|_| {
                 let mut qs = [0i8; 32];
                 for q in qs.iter_mut() {
-                    *q = (next() % 255) as i64 as i8 - 127;
+                    *q = ((next() % 255) as i32 - 127) as i8;
                 }
                 BlockQ8_0 {
                     d: half::f16::from_f32(0.01 + (next() % 100) as f32 * 1e-3),
