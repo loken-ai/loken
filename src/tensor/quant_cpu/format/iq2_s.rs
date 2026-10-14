@@ -63,49 +63,12 @@ impl BlockFormat for BlockIq2S {
 
     /// Runs of thirty-two weights carry two scales, one for each half: each half is its own integer
     /// dot against the activation's codes.
-    #[allow(unreachable_code)]
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        #[cfg(target_feature = "avx2")]
-        return unsafe {
-            use std::arch::x86_64::*;
-            let mut total = _mm256_setzero_ps();
-            for (x, y) in xs.iter().zip(ys) {
-                let signs_all = &x.qs[QK_K / 8..];
-                // A run's sum stays integer under its odd scales until the run ends, and takes
-                // the run's activation scale then.
-                let d = x.d.to_f32() * 0.125;
-                for ib in 0..QK_K / 32 {
-                    // Code `l` is its byte with bits `2l` and `2l + 1` of the run's high byte above it.
-                    // The magnitudes are read one by one: a gather is slow on a processor whose
-                    // microcode blocks the leak of its data.
-                    let codes = u32::from_le_bytes(x.qs[4 * ib..4 * ib + 4].try_into().unwrap());
-                    let high = (x.qh[ib] as u32) << 8;
-                    let grid = |l: u32| {
-                        IQ2S_GRID
-                            [(((codes >> (8 * l)) & 0xFF) | ((high >> (2 * l)) & 0x300)) as usize]
-                    };
-                    let mags = _mm256_set_m128i(
-                        _mm_set_epi64x(grid(3) as i64, grid(2) as i64),
-                        _mm_set_epi64x(grid(1) as i64, grid(0) as i64),
-                    );
-                    let signs =
-                        u32::from_le_bytes(signs_all[4 * ib..4 * ib + 4].try_into().unwrap());
-                    let pairs = super::iq_read::grid_run_pairs(mags, signs, &y.qs[32 * ib..]);
-                    // Two scales: the first sixteen values' pairs under one, the rest under the other.
-                    let (lo, hi) = (x.scales[ib] & 0x0F, x.scales[ib] >> 4);
-                    let scale = _mm256_set_m128i(
-                        _mm_set1_epi16(2 * hi as i16 + 1),
-                        _mm_set1_epi16(2 * lo as i16 + 1),
-                    );
-                    total = _mm256_fmadd_ps(
-                        _mm256_cvtepi32_ps(_mm256_madd_epi16(pairs, scale)),
-                        _mm256_set1_ps(d * y.d[ib].to_f32()),
-                        total,
-                    );
-                }
-            }
-            super::iq_read::sum_ps(total)
-        };
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_avx2` enables.
+            return unsafe { dot_avx2(xs, ys) };
+        }
         xs.iter()
             .zip(ys)
             .map(|(x, y)| {
@@ -147,44 +110,12 @@ impl BlockFormat for BlockIq2S {
 
     /// [`Self::dot`] over several activations, each run's magnitudes, signs and scales decoded
     /// once.
-    #[allow(unreachable_code)]
     fn dot_many(xs: &[Self], ys: &[&[Self::ActivationBlock]], out: &mut [f32]) {
-        #[cfg(target_feature = "avx2")]
-        return unsafe {
-            use std::arch::x86_64::*;
-            super::iq_read::dot_many_runs(
-                xs,
-                ys,
-                out,
-                |x: &Self, ib| {
-                    let codes = u32::from_le_bytes(x.qs[4 * ib..4 * ib + 4].try_into().unwrap());
-                    let high = (x.qh[ib] as u32) << 8;
-                    let grid = |l: u32| {
-                        IQ2S_GRID
-                            [(((codes >> (8 * l)) & 0xFF) | ((high >> (2 * l)) & 0x300)) as usize]
-                    };
-                    let mags = _mm256_set_m128i(
-                        _mm_set_epi64x(grid(3) as i64, grid(2) as i64),
-                        _mm_set_epi64x(grid(1) as i64, grid(0) as i64),
-                    );
-                    let signs_all = &x.qs[QK_K / 8..];
-                    let signs =
-                        u32::from_le_bytes(signs_all[4 * ib..4 * ib + 4].try_into().unwrap());
-                    let (lo, hi) = (x.scales[ib] & 0x0F, x.scales[ib] >> 4);
-                    let scale = _mm256_set_m128i(
-                        _mm_set1_epi16(2 * hi as i16 + 1),
-                        _mm_set1_epi16(2 * lo as i16 + 1),
-                    );
-                    (
-                        (mags, super::iq_read::run_negate(signs), scale),
-                        x.d.to_f32() * 0.125,
-                    )
-                },
-                |(mags, negate, scale), acts| {
-                    _mm256_madd_epi16(super::iq_read::run_pairs(mags, negate, acts), scale)
-                },
-            )
-        };
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_many_avx2` enables.
+            return unsafe { dot_many_avx2(xs, ys, out) };
+        }
         for (o, y) in out.iter_mut().zip(ys) {
             *o = Self::dot(xs, y);
         }
@@ -192,5 +123,90 @@ impl BlockFormat for BlockIq2S {
 
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
         super::iq_read::dot_by_decoding(xs, ys)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn dot_avx2(xs: &[BlockIq2S], ys: &[<BlockIq2S as BlockFormat>::ActivationBlock]) -> f32 {
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut total = _mm256_setzero_ps();
+        for (x, y) in xs.iter().zip(ys) {
+            let signs_all = &x.qs[QK_K / 8..];
+            // A run's sum stays integer under its odd scales until the run ends, and takes
+            // the run's activation scale then.
+            let d = x.d.to_f32() * 0.125;
+            for ib in 0..QK_K / 32 {
+                // Code `l` is its byte with bits `2l` and `2l + 1` of the run's high byte above it.
+                // The magnitudes are read one by one: a gather is slow on a processor whose
+                // microcode blocks the leak of its data.
+                let codes = u32::from_le_bytes(x.qs[4 * ib..4 * ib + 4].try_into().unwrap());
+                let high = (x.qh[ib] as u32) << 8;
+                let grid = |l: u32| {
+                    IQ2S_GRID[(((codes >> (8 * l)) & 0xFF) | ((high >> (2 * l)) & 0x300)) as usize]
+                };
+                let mags = _mm256_set_m128i(
+                    _mm_set_epi64x(grid(3) as i64, grid(2) as i64),
+                    _mm_set_epi64x(grid(1) as i64, grid(0) as i64),
+                );
+                let signs = u32::from_le_bytes(signs_all[4 * ib..4 * ib + 4].try_into().unwrap());
+                let pairs = super::iq_read::grid_run_pairs(mags, signs, &y.qs[32 * ib..]);
+                // Two scales: the first sixteen values' pairs under one, the rest under the other.
+                let (lo, hi) = (x.scales[ib] & 0x0F, x.scales[ib] >> 4);
+                let scale = _mm256_set_m128i(
+                    _mm_set1_epi16(2 * hi as i16 + 1),
+                    _mm_set1_epi16(2 * lo as i16 + 1),
+                );
+                total = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(_mm256_madd_epi16(pairs, scale)),
+                    _mm256_set1_ps(d * y.d[ib].to_f32()),
+                    total,
+                );
+            }
+        }
+        super::iq_read::sum_ps(total)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn dot_many_avx2(
+    xs: &[BlockIq2S],
+    ys: &[&[<BlockIq2S as BlockFormat>::ActivationBlock]],
+    out: &mut [f32],
+) {
+    unsafe {
+        use std::arch::x86_64::*;
+        super::iq_read::dot_many_runs(
+            xs,
+            ys,
+            out,
+            |x: &BlockIq2S, ib| {
+                let codes = u32::from_le_bytes(x.qs[4 * ib..4 * ib + 4].try_into().unwrap());
+                let high = (x.qh[ib] as u32) << 8;
+                let grid = |l: u32| {
+                    IQ2S_GRID[(((codes >> (8 * l)) & 0xFF) | ((high >> (2 * l)) & 0x300)) as usize]
+                };
+                let mags = _mm256_set_m128i(
+                    _mm_set_epi64x(grid(3) as i64, grid(2) as i64),
+                    _mm_set_epi64x(grid(1) as i64, grid(0) as i64),
+                );
+                let signs_all = &x.qs[QK_K / 8..];
+                let signs = u32::from_le_bytes(signs_all[4 * ib..4 * ib + 4].try_into().unwrap());
+                let (lo, hi) = (x.scales[ib] & 0x0F, x.scales[ib] >> 4);
+                let scale = _mm256_set_m128i(
+                    _mm_set1_epi16(2 * hi as i16 + 1),
+                    _mm_set1_epi16(2 * lo as i16 + 1),
+                );
+                (
+                    (mags, super::iq_read::run_negate(signs), scale),
+                    x.d.to_f32() * 0.125,
+                )
+            },
+            |(mags, negate, scale), acts| {
+                _mm256_madd_epi16(super::iq_read::run_pairs(mags, negate, acts), scale)
+            },
+        )
     }
 }

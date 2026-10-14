@@ -28,10 +28,12 @@ impl QKernelMatMul {
                 self.n
             )));
         }
-        #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-        if let Some(x8) = self.q4k_x8() {
-            crate::tensor::quant_cpu::matmul_q4k_plain((1, self.k, self.n), x, x8, out)?;
-            return Ok(true);
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            if let Some(x8) = self.q4k_x8() {
+                crate::tensor::quant_cpu::matmul_q4k_plain((1, self.k, self.n), x, x8, out)?;
+                return Ok(true);
+            }
         }
         crate::tensor::quant_cpu::matmul_bytes(
             self.dtype,
@@ -58,14 +60,14 @@ impl QKernelMatMul {
         mats: &[&QKernelMatMul],
         outs: &mut [&mut [f32]],
     ) -> Result<bool> {
-        #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
+        #[cfg(not(target_arch = "x86_64"))]
         {
             let _ = (x, mats, outs);
             Ok(false)
         }
-        #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         {
-            if mats.len() != outs.len() || mats.is_empty() {
+            if !crate::cpu::dispatch_avx2() || mats.len() != outs.len() || mats.is_empty() {
                 return Ok(false);
             }
             let k = mats[0].k;

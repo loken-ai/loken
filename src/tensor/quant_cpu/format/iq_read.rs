@@ -51,8 +51,8 @@ pub(super) fn dot_runs<B: Runs>(xs: &[B], ys: &[BlockQ8K32]) -> f32 {
 /// of the run is negated when bit `i % 8` of byte `i / 8` of `signs` is set. The sign goes onto the
 /// activation, which leaves the magnitudes unsigned for the byte multiply. A caller widens the sums
 /// under the run's scale with one `madd`, so that a block stays in integers until its end.
-#[cfg(target_feature = "avx2")]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 pub(super) unsafe fn grid_run_pairs(
     mags: std::arch::x86_64::__m256i,
     signs: u32,
@@ -63,8 +63,8 @@ pub(super) unsafe fn grid_run_pairs(
 
 /// [`grid_run_pairs`] with the signs already spread: `negate` holds -1 where a byte of the run
 /// is negated and +1 elsewhere.
-#[cfg(target_feature = "avx2")]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 pub(super) unsafe fn run_pairs(
     mags: std::arch::x86_64::__m256i,
     negate: std::arch::x86_64::__m256i,
@@ -76,8 +76,8 @@ pub(super) unsafe fn run_pairs(
 }
 
 /// The thirty-two sign bits of a run as bytes of -1 (bit set) and +1.
-#[cfg(target_feature = "avx2")]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 pub(super) unsafe fn run_negate(signs: u32) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::*;
     let spread = _mm256_shuffle_epi8(
@@ -106,8 +106,8 @@ pub(super) const MANY: usize = 8;
 /// `decode` into what `dot_run` dots against every activation: `(block index, run) -> run`,
 /// and `(run, activation codes) -> the run's integer pairs` under the run's scale, which the
 /// activation's scale then takes. Each `out[t]` is [`Runs`]'s `dot(xs, ys[t])` to the bit.
-#[cfg(target_feature = "avx2")]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 pub(super) unsafe fn dot_many_runs<B: BlockFormat<ActivationBlock = BlockQ8K32>, R: Copy>(
     xs: &[B],
     ys: &[&[BlockQ8K32]],
@@ -139,8 +139,8 @@ pub(super) unsafe fn dot_many_runs<B: BlockFormat<ActivationBlock = BlockQ8K32>,
 }
 
 /// Sum of the eight float lanes.
-#[cfg(target_feature = "avx2")]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 pub(super) unsafe fn sum_ps(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;
     let pair = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
@@ -150,8 +150,8 @@ pub(super) unsafe fn sum_ps(v: std::arch::x86_64::__m256) -> f32 {
 
 /// Thirty-two codes of the non-linear table, packed as iq4_nl packs them (byte `j` holds value
 /// `j` low and value `j + 16` high), as the signed weights and their magnitudes.
-#[cfg(target_feature = "avx2")]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 pub(super) unsafe fn iq4_run_weights(
     packed: &[u8; 16],
 ) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
@@ -167,8 +167,8 @@ pub(super) unsafe fn iq4_run_weights(
 
 /// The dot of a run's decoded weights (`w`, with their magnitudes) against thirty-two activation
 /// codes.
-#[cfg(target_feature = "avx2")]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 pub(super) unsafe fn iq4_run_dot(
     w: std::arch::x86_64::__m256i,
     magnitude: std::arch::x86_64::__m256i,
@@ -185,24 +185,27 @@ pub(super) unsafe fn iq4_run_dot(
 }
 
 /// The dot of thirty-two codes of the non-linear table, packed as iq4_nl packs them (byte `j` holds
-/// value `j` low and value `j + 16` high), against thirty-two activation codes.
-#[inline]
-pub(super) fn dot_iq4_run(packed: &[u8; 16], acts: &[i8]) -> i32 {
-    #[cfg(target_feature = "avx2")]
+/// value `j` low and value `j + 16` high), against thirty-two activation codes. The vector form,
+/// [`dot_iq4_run_avx2`], is called from kernels that already run with its features enabled, so the
+/// level is decided once per dot and not once per run.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+pub(super) unsafe fn dot_iq4_run_avx2(packed: &[u8; 16], acts: &[i8]) -> i32 {
     unsafe {
         let (w, magnitude) = iq4_run_weights(packed);
-        return iq4_run_dot(w, magnitude, acts);
+        iq4_run_dot(w, magnitude, acts)
     }
-    #[allow(unreachable_code)]
-    {
-        let levels = &super::iq4_nl::LEVELS;
-        (0..16)
-            .map(|j| {
-                levels[(packed[j] & 0x0F) as usize] as i32 * acts[j] as i32
-                    + levels[(packed[j] >> 4) as usize] as i32 * acts[j + 16] as i32
-            })
-            .sum()
-    }
+}
+
+/// [`dot_iq4_run_avx2`] without vectors.
+pub(super) fn dot_iq4_run_scalar(packed: &[u8; 16], acts: &[i8]) -> i32 {
+    let levels = &super::iq4_nl::LEVELS;
+    (0..16)
+        .map(|j| {
+            levels[(packed[j] & 0x0F) as usize] as i32 * acts[j] as i32
+                + levels[(packed[j] >> 4) as usize] as i32 * acts[j + 16] as i32
+        })
+        .sum()
 }
 
 #[cfg(test)]

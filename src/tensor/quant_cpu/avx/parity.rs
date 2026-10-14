@@ -32,7 +32,10 @@ fn signal(seed: u32, n: usize) -> Vec<f32> {
 
 /// The quantised operands of one case: `blocks` blocks of weights and the
 /// matching activations.
-fn operands<T: BlockFormat>(seed: u32, blocks: usize) -> (Vec<T>, Vec<T::ActivationBlock>) {
+pub(crate) fn operands<T: BlockFormat>(
+    seed: u32,
+    blocks: usize,
+) -> (Vec<T>, Vec<T::ActivationBlock>) {
     let n = blocks * T::BLOCK_LEN;
     let mut weights = vec![T::zeros(); blocks];
     T::quantize(&signal(seed, n), &mut weights);
@@ -44,7 +47,7 @@ fn operands<T: BlockFormat>(seed: u32, blocks: usize) -> (Vec<T>, Vec<T::Activat
 
 /// Relative, because the two paths sum in different orders; the point is that
 /// they compute the same function, not the same rounding.
-fn close(name: &str, case: &str, fast: f32, slow: f32) {
+pub(crate) fn close(name: &str, case: &str, fast: f32, slow: f32) {
     let tolerance = 1e-3 * slow.abs().max(1.0);
     assert!(
         (fast - slow).abs() <= tolerance,
@@ -85,7 +88,7 @@ fn dispatch_agrees<T: BlockFormat>(name: &str) {
 }
 
 #[test]
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 fn every_avx2_kernel_agrees_with_its_scalar_definition() {
     kernel_agrees::<BlockQ4_0>("q4_0", vec_dot_q4_0_q8_0);
     kernel_agrees::<BlockQ4_1>("q4_1", vec_dot_q4_1_q8_1);
@@ -104,6 +107,9 @@ fn every_avx2_kernel_agrees_with_its_scalar_definition() {
 
 #[test]
 fn every_dispatch_agrees_with_its_scalar_definition() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     dispatch_agrees::<BlockQ4_0>("q4_0");
     dispatch_agrees::<BlockQ4_1>("q4_1");
     dispatch_agrees::<BlockQ5_0>("q5_0");

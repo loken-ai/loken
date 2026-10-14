@@ -23,7 +23,7 @@ use super::*;
 /// kept unexpanded - the group is only as large as eight raw blocks.
 pub mod repack_q5_0 {
     use super::{BlockQ5_0, BlockQ8_0};
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
     use half::f16;
 
@@ -83,8 +83,8 @@ pub mod repack_q5_0 {
     /// compute-bound. The decode is the dot's: the nibbles, plus the high
     /// plane folded in as the sign of the byte, fed straight to the pairwise
     /// integer dot. Writes `out[r*8 .. r*8+8]` for r in 0..mt. `mt <= 8`.
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2,fma")]
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     pub unsafe fn gemm_group_avx2(
         b: &[BlockQ5_0],
         acts: &[&[BlockQ8_0]],
@@ -103,11 +103,11 @@ pub mod repack_q5_0 {
                     super::avx::split_nibbles(blk.qs.as_ptr()),
                     _mm256_andnot_si256(super::avx::mask_from_bits(&blk.qh), himask),
                 );
-                let dj = blk.d.to_f32();
+                let dj = crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d);
                 for (r, act) in acts.iter().enumerate().take(mt) {
                     let a = &act[l];
                     let by = _mm256_loadu_si256(a.qs.as_ptr() as *const __m256i);
-                    let d = _mm256_set1_ps(dj * a.d.to_f32());
+                    let d = _mm256_set1_ps(dj * crate::tensor::quant_cpu::avx::f16c_to_f32(a.d));
                     acc[r] = _mm256_fmadd_ps(d, super::avx::dot_signed(bx, by), acc[r]);
                 }
             }
@@ -127,7 +127,7 @@ pub mod repack_q5_0 {
 /// directly.
 pub mod repack_q8_0 {
     use super::{BlockQ8_0, QK8_0};
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
     use half::f16;
 
@@ -181,8 +181,8 @@ pub mod repack_q8_0 {
     /// integer i8.i8 dot lands in an f32 vector via one fmadd of `x.d*y.d` per
     /// 32-block, `hsum` at the end), so the result is bit-identical to the
     /// per-column path. Writes `out[r*8 .. r*8+8]` for r in 0..mt. `mt <= 8`.
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2,fma")]
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma,f16c,bmi2")]
     pub unsafe fn gemm_group_avx2(
         b: &[BlockQ8_0],
         acts: &[&[BlockQ8_0]],
@@ -195,11 +195,11 @@ pub mod repack_q8_0 {
             for l in 0..nb {
                 let blk = &b[l * 8 + j];
                 let bx = _mm256_loadu_si256(blk.qs.as_ptr() as *const __m256i);
-                let dj = blk.d.to_f32();
+                let dj = crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d);
                 for (r, act) in acts.iter().enumerate().take(mt) {
                     let a = &act[l];
                     let by = _mm256_loadu_si256(a.qs.as_ptr() as *const __m256i);
-                    let d = _mm256_set1_ps(dj * a.d.to_f32());
+                    let d = _mm256_set1_ps(dj * crate::tensor::quant_cpu::avx::f16c_to_f32(a.d));
                     acc[r] = _mm256_fmadd_ps(d, super::avx::dot_signed(bx, by), acc[r]);
                 }
             }
@@ -213,6 +213,9 @@ pub mod repack_q8_0 {
 #[cfg(test)]
 #[test]
 pub(super) fn repacked_q4_0_gemv_matches_vec_dot() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // Deterministic pseudo-random Q4_0 weights [n=16, nb=4] + Q8_0 activation;
     // the repacked group GEMV must match the per-row dot within fp noise.
     let (n, nb) = (16usize, 4usize);
@@ -259,7 +262,7 @@ pub(super) fn repacked_q4_0_gemv_matches_vec_dot() {
         let mut local = [0f32; 8];
         repack_q4_0::gemv_group_scalar(bgrp, &act, nb, &mut local);
         got_scalar[g * 8..g * 8 + 8].copy_from_slice(&local);
-        #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             repack_q4_0::gemv_group_avx2(bgrp, &act, nb, &mut local);
         }
@@ -283,9 +286,12 @@ pub(super) fn repacked_q4_0_gemv_matches_vec_dot() {
 }
 
 #[cfg(test)]
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn repacked_q5_0_matches_vec_dot_and_oracle() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     let (n, nb) = (16usize, 4usize);
     let mut seed = 0x9E3779B97F4A7C15u64;
     let mut rng = || {
@@ -345,7 +351,7 @@ pub(super) fn repacked_q5_0_matches_vec_dot_and_oracle() {
         }
     }
     // Tiled AVX2 gemm vs oracle for every tile height.
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     for g in 0..n / 8 {
         let bgrp = &packed[g * nb * 8..(g + 1) * nb * 8];
         for mt in 1..=m {
@@ -366,9 +372,12 @@ pub(super) fn repacked_q5_0_matches_vec_dot_and_oracle() {
     }
 }
 
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn q5_0_full_matmul_matches_reference() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // Full driver (matmul_q5_0_repacked_tiled) vs the per-column reference
     // (matmul_bytes -> vec_dot_q5_0_q8_0) at a realistic projection shape. The
     // tiled kernel mirrors the reference's reduction order (per 32-block
@@ -421,9 +430,12 @@ pub(super) fn q5_0_full_matmul_matches_reference() {
 }
 
 #[cfg(test)]
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn repacked_q8_0_matches_vec_dot_and_oracle() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     let (n, nb) = (16usize, 4usize);
     let mut seed = 0x14057B7EF767814Fu64;
     let mut rng = || {
@@ -478,7 +490,7 @@ pub(super) fn repacked_q8_0_matches_vec_dot_and_oracle() {
         }
     }
     // Tiled AVX2 gemm vs oracle for every tile height.
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     for g in 0..n / 8 {
         let bgrp = &packed[g * nb * 8..(g + 1) * nb * 8];
         for mt in 1..=m {
@@ -499,9 +511,12 @@ pub(super) fn repacked_q8_0_matches_vec_dot_and_oracle() {
     }
 }
 
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn q8_0_full_matmul_matches_reference() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // Full driver (matmul_q8_0_repacked_tiled) vs the per-column reference
     // (matmul_bytes -> vec_dot_q8_0_q8_0) at a realistic projection shape. The
     // tiled kernel mirrors the reference's reduction order (per 32-block fmadd

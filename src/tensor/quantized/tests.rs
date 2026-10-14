@@ -12,6 +12,9 @@
 #[cfg(feature = "cuda")]
 #[test]
 fn every_dtype_mmq_claims_to_support_can_actually_be_fed() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use super::GgmlDType::*;
     let all = [
         F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2K, Q3K, Q4K, Q5K, Q6K, Q8K, MxFp4,
@@ -51,6 +54,9 @@ fn every_dtype_mmq_claims_to_support_can_actually_be_fed() {
 /// one that was running a moment earlier.
 #[test]
 fn a_quantized_weight_survives_a_device_move() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use super::{GgmlDType, QTensor};
     use crate::tensor::{Device, Tensor};
     let n = 512usize;
@@ -88,6 +94,9 @@ fn a_quantized_weight_survives_a_device_move() {
 /// difference rather than asserting the call succeeded.
 #[test]
 fn a_lora_applies_over_a_quantised_weight() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use super::super::lora::LoraDelta;
     use super::super::{Device, Tensor};
 
@@ -135,6 +144,9 @@ fn a_lora_applies_over_a_quantised_weight() {
 /// A mismatched adapter is refused rather than applied to the wrong axis.
 #[test]
 fn a_wrongly_shaped_lora_is_refused_on_a_quantised_weight() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use super::super::lora::LoraDelta;
     use super::super::{Device, Tensor};
     let (k, n) = (256usize, 32usize);
@@ -210,6 +222,9 @@ fn find_ggufs() -> Vec<std::path::PathBuf> {
 #[cfg(feature = "cuda")]
 #[test]
 fn qmatmul_matches_oracle() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use crate::tensor::{cuda::CudaDevice, Device, Tensor};
     let Ok(dev) = CudaDevice::new(0) else { return };
     // locate a real 2-D Q4_K weight
@@ -285,6 +300,9 @@ fn qmatmul_matches_oracle() {
 #[cfg(feature = "cuda")]
 #[test]
 fn q8_0_gpu_mmvq_parity_k896() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use crate::tensor::{cuda::CudaDevice, Device, Tensor};
     let Ok(dev) = CudaDevice::new(0) else { return };
     let mut found = None;
@@ -357,6 +375,9 @@ fn q8_0_gpu_mmvq_parity_k896() {
 #[cfg(feature = "cuda")]
 #[test]
 fn q5_0_gpu_mmvq_matches_oracle() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use crate::tensor::{cuda::CudaDevice, Device, Tensor};
     let Ok(dev) = CudaDevice::new(0) else { return };
     let mut found = None;
@@ -428,9 +449,12 @@ fn q5_0_gpu_mmvq_matches_oracle() {
 /// Q4K/Q6K/Q8_0/MxFp4 - and stay inside the quantization-error envelope
 /// of an f64 reference matmul over the dequantized weights. Synthetic
 /// weights, no model store needed.
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn cpu_qmatmul_vec_dot_matches_oracle() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use crate::tensor::{quant_cpu, Device, Tensor};
     let (n, k) = (16usize, 512usize);
     let wf: Vec<f32> = (0..n * k)
@@ -509,6 +533,9 @@ fn cpu_qmatmul_vec_dot_matches_oracle() {
 #[cfg(feature = "cuda")]
 #[test]
 fn every_gpu_mmvq_format_matches_the_weights_it_holds() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use crate::tensor::{cuda::CudaDevice, quant_cpu, Device, Tensor};
     let Ok(dev) = CudaDevice::new(0) else {
         eprintln!("no CUDA device; the GPU mat-vec kernels are NOT covered by this run");
@@ -605,6 +632,9 @@ fn every_gpu_mmvq_format_matches_the_weights_it_holds() {
 /// only the accumulation order, and the two must agree to the carrier's own precision.
 #[test]
 fn every_cpu_repack_gemm_matches_the_gemv_on_the_same_weights() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use crate::tensor::{quant_cpu, DType, Device, Tensor};
 
     let k = 1024usize;
@@ -694,6 +724,9 @@ fn every_cpu_repack_gemm_matches_the_gemv_on_the_same_weights() {
 #[cfg(feature = "cuda")]
 #[test]
 fn the_gpu_tiled_matmul_agrees_with_the_mat_vec_on_the_same_weights() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use crate::tensor::{cuda::CudaDevice, quant_cpu, Device, Tensor};
     let Ok(dev) = CudaDevice::new(0) else {
         eprintln!("no CUDA device; the GPU kernels are NOT covered by this run");
@@ -775,6 +808,9 @@ fn the_gpu_tiled_matmul_agrees_with_the_mat_vec_on_the_same_weights() {
 #[cfg(feature = "cuda")]
 #[test]
 fn every_kernel_name_the_quantised_module_is_asked_for_resolves() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use crate::tensor::cuda::CudaDevice;
     let Ok(dev) = CudaDevice::new(0) else {
         eprintln!("no CUDA device; the quantised module is NOT covered by this run");
@@ -872,6 +908,9 @@ fn regex_lite_prefixes() -> &'static [&'static str] {
 /// derived, and the round trip is only the second half of the test.
 #[test]
 fn gguf_container_bytes_are_what_the_reader_expects() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use crate::tensor::gguf_write::{write_gguf, GgufEntry};
 
     let data: Vec<u8> = (0..24u8).collect(); // 2x3 F32 = 24 bytes
@@ -940,9 +979,12 @@ fn gguf_container_bytes_are_what_the_reader_expects() {
 /// becomes the second description of the forward that this mechanism exists to remove.
 /// Every activation dtype the real path serves is run twice here, once computing and
 /// once counting.
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn a_counted_quantized_matmul_answers_the_shape_the_real_one_does() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use super::{GgmlDType, QKernelMatMul, QTensor};
     use crate::tensor::{DType, Device, Tensor};
     let (n, k) = (64usize, 256usize);
@@ -981,6 +1023,9 @@ fn a_counted_quantized_matmul_answers_the_shape_the_real_one_does() {
 /// blocks are pushed onto the host.
 #[test]
 fn a_counted_quantized_weight_costs_its_padded_blob_from_the_moment_it_is_placed() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use super::{GgmlDType, QKernelMatMul, QTensor, BLOB_TAIL_PAD_BYTES};
     use crate::tensor::{DType, Device, Tensor};
     let (n, k) = (64usize, 256usize);
@@ -1029,6 +1074,9 @@ fn a_counted_quantized_weight_costs_its_padded_blob_from_the_moment_it_is_placed
 /// happen.
 #[test]
 fn a_counted_weight_refuses_a_real_activation() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use super::{GgmlDType, QKernelMatMul, QTensor};
     use crate::tensor::{DType, Device, Tensor};
     let (n, k) = (32usize, 256usize);
@@ -1056,6 +1104,9 @@ fn a_counted_weight_refuses_a_real_activation() {
 /// allocated the very thing it promised not to - on the host, where no ledger sees it.
 #[test]
 fn a_dry_builder_reads_a_dense_entry_as_a_shape() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use super::{GgmlDType, QVarBuilder};
     use crate::tensor::{DType, Device};
     let dims = vec![8usize, 32];
@@ -1120,6 +1171,9 @@ fn ollama_blob(tag: &str) -> Option<std::path::PathBuf> {
 #[test]
 #[ignore]
 fn what_a_gguf_load_and_one_forward_would_cost_a_card() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     use crate::inference::engine::llm_engine::KvQuant;
     use crate::inference::generic_transformer::GenericHeteroTransformer;
     use crate::inference::place::layer_executor::HeteroPlan;
@@ -1292,6 +1346,9 @@ fn a_weight_built_on_a_card_holds_no_host_bytes() {
 
 #[test]
 fn a_card_only_handle_keeps_identity_and_refuses_a_host_read() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     let t = Tensor::from_vec(vec![1.0f32; 64], (2usize, 32usize), &Device::Cpu).unwrap();
     let q = QTensor::quantize_onto(&t, GgmlDType::Q8_0, &Device::Cpu).unwrap();
     let native = q.native_qtensor();
@@ -1309,6 +1366,9 @@ fn a_card_only_handle_keeps_identity_and_refuses_a_host_read() {
 /// the rows asked for to what the dense accessor gives.
 #[test]
 fn a_store_embedding_is_not_widened() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     let (v, d) = (5usize, 64usize);
     let vals: Vec<f32> = (0..v * d)
         .map(|i| ((i * 13 % 29) as f32 - 14.0) / 7.0)

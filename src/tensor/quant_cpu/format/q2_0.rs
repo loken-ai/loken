@@ -84,18 +84,22 @@ impl BlockFormat for BlockQ2_0 {
 
     /// Each block's integer sum is exact, and the blocks join in order as the scalar loop joins
     /// them, so the result is the scalar's to the bit.
-    #[allow(unreachable_code)]
     fn dot(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32 {
-        #[cfg(target_feature = "avx2")]
-        return unsafe { dot_blocks(xs, ys) };
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_blocks` enables.
+            return unsafe { dot_blocks(xs, ys) };
+        }
         Self::dot_scalar(xs, ys)
     }
 
     /// [`Self::dot`] over several activations, each block's codes unpacked once.
-    #[allow(unreachable_code)]
     fn dot_many(xs: &[Self], ys: &[&[Self::ActivationBlock]], out: &mut [f32]) {
-        #[cfg(target_feature = "avx2")]
-        return unsafe { dot_blocks_many(xs, ys, out) };
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_blocks_many` enables.
+            return unsafe { dot_blocks_many(xs, ys, out) };
+        }
         for (o, y) in out.iter_mut().zip(ys) {
             *o = Self::dot(xs, y);
         }
@@ -125,7 +129,8 @@ impl BlockFormat for BlockQ2_0 {
 /// The dot of whole blocks with the four codes of each byte unpacked into the activation's order
 /// and multiplied as unsigned codes by signed bytes; the offset of one level is taken off with
 /// the activation's own sum.
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 unsafe fn dot_blocks(xs: &[BlockQ2_0], ys: &[BlockQ8_64]) -> f32 {
     use std::arch::x86_64::*;
     let mask = _mm_set1_epi8(3);
@@ -174,8 +179,8 @@ unsafe fn dot_blocks(xs: &[BlockQ2_0], ys: &[BlockQ8_64]) -> f32 {
 
 /// The four planes of a block's codes interleaved back into the activation's order, sixteen codes
 /// to a group.
-#[cfg(target_feature = "avx2")]
-#[inline]
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
 unsafe fn unpack_codes(x: &BlockQ2_0) -> [std::arch::x86_64::__m128i; 4] {
     use std::arch::x86_64::*;
     let mask = _mm_set1_epi8(3);
@@ -198,7 +203,8 @@ unsafe fn unpack_codes(x: &BlockQ2_0) -> [std::arch::x86_64::__m128i; 4] {
 
 /// [`dot_blocks`] over several activations: each block's codes are unpacked once and dotted
 /// against every activation in the arithmetic of [`dot_blocks`].
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 unsafe fn dot_blocks_many(xs: &[BlockQ2_0], ys: &[&[BlockQ8_64]], out: &mut [f32]) {
     use std::arch::x86_64::*;
     const MANY: usize = 8;

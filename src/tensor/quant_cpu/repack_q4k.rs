@@ -10,9 +10,7 @@
 )]
 
 use super::{BlockQ4K, BlockQ8K, QK_K};
-#[cfg(all(target_feature = "avx2", target_arch = "x86"))]
-use core::arch::x86::*;
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 use half::f16;
 
@@ -225,8 +223,8 @@ pub fn gemv_group_scalar(b: &[BlockQ4Kx8], a: &[BlockQ8K], nb: usize, out: &mut 
 /// all `mt` rows before the next is read - the weight-reuse that makes
 /// prefill compute-bound instead of re-streaming the matrix per row. Writes
 /// `out[r*8 .. r*8+8]` for r in 0..mt. `mt <= 4`.
-#[cfg(target_feature = "avx2")]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemm_group_avx2(b: &[BlockQ4Kx8], acts: &[&[BlockQ8K]], nb: usize, out: &mut [f32]) {
     let mt = acts.len();
     debug_assert!(mt <= 8);
@@ -318,24 +316,24 @@ pub unsafe fn gemm_group_avx2(b: &[BlockQ4Kx8], acts: &[&[BlockQ8K]], nb: usize,
             }
         }
         let dvec = _mm256_setr_ps(
-            blk.d[0].to_f32(),
-            blk.d[1].to_f32(),
-            blk.d[2].to_f32(),
-            blk.d[3].to_f32(),
-            blk.d[4].to_f32(),
-            blk.d[5].to_f32(),
-            blk.d[6].to_f32(),
-            blk.d[7].to_f32(),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[0]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[1]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[2]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[3]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[4]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[5]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[6]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[7]),
         );
         let dminv = _mm256_setr_ps(
-            blk.dmin[0].to_f32(),
-            blk.dmin[1].to_f32(),
-            blk.dmin[2].to_f32(),
-            blk.dmin[3].to_f32(),
-            blk.dmin[4].to_f32(),
-            blk.dmin[5].to_f32(),
-            blk.dmin[6].to_f32(),
-            blk.dmin[7].to_f32(),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[0]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[1]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[2]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[3]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[4]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[5]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[6]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[7]),
         );
         // The 8-lane min gathers depend only on the weight super-block, not
         // on the activation row, yet sat inside the row loop and were
@@ -391,8 +389,8 @@ pub unsafe fn gemm_group_avx2(b: &[BlockQ4Kx8], acts: &[&[BlockQ8K]], nb: usize,
 /// strip keeps the partials resident and pays instead by re-decoding the
 /// weight nibbles once per strip - a decode is a few ops, a spilled
 /// accumulator is touched on every k-step.
-#[cfg(target_feature = "avx2")]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemm_group_avx2_rt<const RT: usize>(
     b: &[BlockQ4Kx8],
     acts: &[&[BlockQ8K]],
@@ -468,24 +466,24 @@ pub unsafe fn gemm_group_avx2_rt<const RT: usize>(
             }
         }
         let dvec = _mm256_setr_ps(
-            blk.d[0].to_f32(),
-            blk.d[1].to_f32(),
-            blk.d[2].to_f32(),
-            blk.d[3].to_f32(),
-            blk.d[4].to_f32(),
-            blk.d[5].to_f32(),
-            blk.d[6].to_f32(),
-            blk.d[7].to_f32(),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[0]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[1]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[2]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[3]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[4]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[5]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[6]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[7]),
         );
         let dminv = _mm256_setr_ps(
-            blk.dmin[0].to_f32(),
-            blk.dmin[1].to_f32(),
-            blk.dmin[2].to_f32(),
-            blk.dmin[3].to_f32(),
-            blk.dmin[4].to_f32(),
-            blk.dmin[5].to_f32(),
-            blk.dmin[6].to_f32(),
-            blk.dmin[7].to_f32(),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[0]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[1]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[2]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[3]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[4]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[5]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[6]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[7]),
         );
         let mut minf = [_mm256_setzero_ps(); 8];
         for (sb, mv) in minf.iter_mut().enumerate() {
@@ -532,7 +530,7 @@ pub unsafe fn gemm_group_avx2_rt<const RT: usize>(
 /// inserts, so doing it inside the row loop repeats it once per row tile
 /// even though the values never change. Building it once per weight group
 /// hoists that work out of the hot path.
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy)]
 pub struct GroupScales {
     pub(super) lo_a: [__m256i; 4],
@@ -545,8 +543,8 @@ pub struct GroupScales {
 }
 
 /// Precompute `GroupScales` for every super-block of one weight group.
-#[cfg(target_feature = "avx2")]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn prep_group_scales(b: &[BlockQ4Kx8], nb: usize) -> Vec<GroupScales> {
     let mut out = Vec::with_capacity(nb);
     for l in 0..nb {
@@ -580,24 +578,24 @@ pub unsafe fn prep_group_scales(b: &[BlockQ4Kx8], nb: usize) -> Vec<GroupScales>
             ));
         }
         let dvec = _mm256_setr_ps(
-            blk.d[0].to_f32(),
-            blk.d[1].to_f32(),
-            blk.d[2].to_f32(),
-            blk.d[3].to_f32(),
-            blk.d[4].to_f32(),
-            blk.d[5].to_f32(),
-            blk.d[6].to_f32(),
-            blk.d[7].to_f32(),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[0]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[1]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[2]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[3]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[4]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[5]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[6]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[7]),
         );
         let dminv = _mm256_setr_ps(
-            blk.dmin[0].to_f32(),
-            blk.dmin[1].to_f32(),
-            blk.dmin[2].to_f32(),
-            blk.dmin[3].to_f32(),
-            blk.dmin[4].to_f32(),
-            blk.dmin[5].to_f32(),
-            blk.dmin[6].to_f32(),
-            blk.dmin[7].to_f32(),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[0]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[1]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[2]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[3]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[4]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[5]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[6]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[7]),
         );
         out.push(GroupScales {
             lo_a,
@@ -615,8 +613,8 @@ pub unsafe fn prep_group_scales(b: &[BlockQ4Kx8], nb: usize) -> Vec<GroupScales>
 /// Hoisted scale vectors combined with row-strip blocking: removes the
 /// per-row-tile scale rebuild and keeps the hot integer partials inside the
 /// vector register file at the same time.
-#[cfg(target_feature = "avx2")]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemm_group_avx2_pre_rt<const RT: usize>(
     b: &[BlockQ4Kx8],
     acts: &[&[BlockQ8K]],
@@ -708,8 +706,8 @@ pub unsafe fn gemm_group_avx2_pre_rt<const RT: usize>(
     }
 }
 
-#[cfg(target_feature = "avx2")]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemv_group_avx2(b: &[BlockQ4Kx8], a: &[BlockQ8K], nb: usize, out: &mut [f32]) {
     let m4 = _mm256_set1_epi8(0x0F);
     // 8 column accumulators in one __m256 (one f32 lane per column).
@@ -775,14 +773,14 @@ pub unsafe fn gemv_group_avx2(b: &[BlockQ4Kx8], a: &[BlockQ8K], nb: usize, out: 
         }
         // d[j] * act.d per column.
         let dvec = _mm256_setr_ps(
-            blk.d[0].to_f32(),
-            blk.d[1].to_f32(),
-            blk.d[2].to_f32(),
-            blk.d[3].to_f32(),
-            blk.d[4].to_f32(),
-            blk.d[5].to_f32(),
-            blk.d[6].to_f32(),
-            blk.d[7].to_f32(),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[0]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[1]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[2]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[3]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[4]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[5]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[6]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.d[7]),
         );
         let dall = _mm256_mul_ps(dvec, _mm256_set1_ps(act.d));
         acc = _mm256_fmadd_ps(dall, _mm256_cvtepi32_ps(isum), acc);
@@ -809,14 +807,14 @@ pub unsafe fn gemv_group_avx2(b: &[BlockQ4Kx8], a: &[BlockQ8K], nb: usize, out: 
             ));
         }
         let dminv = _mm256_setr_ps(
-            blk.dmin[0].to_f32(),
-            blk.dmin[1].to_f32(),
-            blk.dmin[2].to_f32(),
-            blk.dmin[3].to_f32(),
-            blk.dmin[4].to_f32(),
-            blk.dmin[5].to_f32(),
-            blk.dmin[6].to_f32(),
-            blk.dmin[7].to_f32(),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[0]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[1]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[2]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[3]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[4]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[5]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[6]),
+            crate::tensor::quant_cpu::avx::f16c_to_f32(blk.dmin[7]),
         );
         let dminall = _mm256_mul_ps(dminv, _mm256_set1_ps(act.d));
         acc_min = _mm256_fmadd_ps(dminall, _mm256_castsi256_ps(imin), acc_min);
@@ -831,8 +829,8 @@ pub unsafe fn gemv_group_avx2(b: &[BlockQ4Kx8], a: &[BlockQ8K], nb: usize, out: 
 /// sharing that column's scale, so the scale is replicated across those four
 /// lanes: multiplying by this operand with a pairwise-accumulating madd
 /// scales, widens and reduces in one step, entirely within each lane.
-#[cfg(target_feature = "avx2")]
-#[target_feature(enable = "avx2")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 #[inline]
 unsafe fn scale_lanes_i16(sm: &[[u8; 16]; 8], col0: usize, idx: usize) -> __m256i {
     let s0 = sm[col0][idx] as i16;
@@ -847,8 +845,8 @@ unsafe fn scale_lanes_i16(sm: &[[u8; 16]; 8], col0: usize, idx: usize) -> __m256
 /// Load 8 activation bytes and broadcast the 8-element pattern to all 8
 /// column lanes as i16 (for maddubs). Returns two __m256i (low/high halves
 /// not needed - handled by caller via `madd_cols`).
-#[cfg(target_feature = "avx2")]
-#[target_feature(enable = "avx2")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 #[inline]
 pub(super) unsafe fn load_a8_broadcast(p: *const i8) -> __m256i {
     // 8 signed activation bytes, replicated across the 32-byte register so
@@ -863,8 +861,8 @@ pub(super) unsafe fn load_a8_broadcast(p: *const i8) -> __m256i {
 /// signed int8. Compute per-8-byte-lane dot, scale per column, accumulate
 /// into the i32 column accumulator. Each 32-byte register holds 4 columns
 /// (8 bytes each); two registers (lo01, lo23-pair) cover 8 columns.
-#[cfg(target_feature = "avx2")]
-#[target_feature(enable = "avx2")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 #[inline]
 pub(super) unsafe fn madd_cols(
     acc: __m256i,
@@ -903,8 +901,8 @@ pub(super) unsafe fn madd_cols(
 /// scale reload of `gemv_group_avx2`). llama.cpp REPACK runs this for MoE
 /// decode (overrides MUL_MAT_ID) and it beats plain dot by ~40% at M=1.
 /// Writes 8 column outputs. Bit-identical to `dot` (validated in the bench).
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,f16c")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 /// [`gemv_group_avx2_v2`] reading the PLAIN per-row scales layout written by
 /// [`repack`] (each row's canonical 12-byte Q4_K packing) instead of the
 /// llama-interleaved 6-bit packing of [`repack_v2`]. One storage layout can then
@@ -1152,7 +1150,8 @@ pub unsafe fn gemv_group_avx2_plain(b: &[BlockQ4Kx8], a: &[BlockQ8K], nb: usize,
     _mm256_storeu_ps(out.as_mut_ptr(), _mm256_sub_ps(acc_row, acc_min_rows));
 }
 
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemv_group_avx2_v2(b: &[BlockQ4Kx8], a: &[BlockQ8K], nb: usize, out: &mut [f32]) {
     let m4b = _mm256_set1_epi8(0x0F);
     let deltamask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);

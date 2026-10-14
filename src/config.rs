@@ -143,6 +143,15 @@ pub struct EnergyConfig {
     pub water_l_per_kwh: Option<f64>,
 }
 
+/// CPU configuration (`[cpu]` section).
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct CpuConfig {
+    /// Highest SIMD level the CPU kernels may use: `generic` (the scalar reference code), `avx2` or
+    /// `avx512`. Absent, the best level the CPU has. It never raises the level above what the CPU
+    /// supports.
+    pub level: Option<String>,
+}
+
 /// Root configuration structure
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct Config {
@@ -155,6 +164,8 @@ pub struct Config {
     pub lora_dir: Option<String>,
     #[serde(default)]
     pub energy: Option<EnergyConfig>,
+    #[serde(default)]
+    pub cpu: Option<CpuConfig>,
     /// Clustering policy. Absent = this node runs alone, and every cluster path is skipped.
     #[serde(default)]
     pub cluster: Option<ClusterConfigToml>,
@@ -198,6 +209,26 @@ fn default_min_speedup() -> f64 {
 }
 
 impl Config {
+    /// Apply `[cpu] level` to the kernel dispatch. Call before any model is loaded. An
+    /// unknown name is reported and leaves the level at what the CPU supports.
+    pub fn apply_cpu_level(&self) {
+        let cap = self
+            .cpu
+            .as_ref()
+            .and_then(|c| c.level.as_deref())
+            .and_then(|name| {
+                let level = crate::cpu::CpuLevel::parse(name);
+                if level.is_none() {
+                    tracing::warn!(
+                        level = name,
+                        "[cpu] level is not generic, avx2 or avx512; ignored"
+                    );
+                }
+                level
+            });
+        crate::cpu::set_level_cap(cap);
+    }
+
     /// Resolve the energy-reporting settings (defaults applied).
     pub fn energy_settings(&self) -> crate::energy_report::EnergySettings {
         let e = self.energy.clone().unwrap_or_default();
@@ -385,6 +416,7 @@ impl Config {
             huggingface_models_dir: None,
             lora_dir: None,
             energy: None,
+            cpu: None,
             cluster: None,
         })
     }

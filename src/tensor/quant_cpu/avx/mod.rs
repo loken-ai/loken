@@ -30,7 +30,7 @@ pub(crate) mod block32;
 pub(crate) mod superblock;
 
 #[cfg(test)]
-mod parity;
+pub(crate) mod parity;
 
 pub(crate) use block32::{
     vec_dot_mxfp4_q8_0, vec_dot_q4_0_q8_0, vec_dot_q4_1_q8_1, vec_dot_q5_0_q8_0, vec_dot_q5_1_q8_1,
@@ -45,6 +45,15 @@ pub(crate) use superblock::{
 use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
+
+/// Guard in front of every `#[target_feature]` entry point of this module.
+#[inline]
+pub(crate) fn require_avx2() {
+    assert!(
+        crate::cpu::hardware_has_avx2(),
+        "an AVX2 kernel was called on a CPU without avx2+fma+f16c+bmi2"
+    );
+}
 
 // -- the four steps --
 
@@ -76,6 +85,14 @@ pub(crate) unsafe fn lanes_sum(x: __m256) -> f32 {
     let halves = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
     let pairs = _mm_add_ps(halves, _mm_movehl_ps(halves, halves));
     _mm_cvtss_f32(_mm_add_ss(pairs, _mm_movehdup_ps(pairs)))
+}
+
+/// An f16 scale as f32 through `vcvtph2ps`. `half`'s own conversion tests the CPU at every call
+/// and cannot inline into a kernel when the build baseline lacks F16C; this one is a single
+/// instruction inside any function that enables `f16c`.
+#[inline(always)]
+pub(crate) unsafe fn f16c_to_f32(h: half::f16) -> f32 {
+    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h.to_bits() as i32)))
 }
 
 /// 16 bytes of packed nibbles into 32 codes: the low nibbles land in lane 0 and

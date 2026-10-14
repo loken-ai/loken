@@ -10,7 +10,7 @@
 )]
 
 use super::{BlockMxFp4, BlockQ8_0, KVALUES_MXFP4};
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
 /// Transpose `[n, nb]` row-major `BlockMxFp4` into `[n/8][nb][8]` (group,
@@ -61,8 +61,8 @@ pub fn gemv_group_scalar(b: &[BlockMxFp4], a: &[BlockQ8_0], nb: usize, out: &mut
 /// AVX2 GEMV over one 8-column group: hoists the activation load out of the
 /// 8-row inner loop, 8 independent accumulator chains. Same per-block ops as
 /// `vec_dot_mxfp4_q8_0`.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemv_group_avx2(b: &[BlockMxFp4], a: &[BlockQ8_0], nb: usize, out: &mut [f32]) {
     let lut =
         _mm256_broadcastsi128_si256(_mm_loadu_si128(KVALUES_MXFP4.as_ptr() as *const __m128i));
@@ -73,7 +73,7 @@ pub unsafe fn gemv_group_avx2(b: &[BlockMxFp4], a: &[BlockQ8_0], nb: usize, out:
             super::gemv_prefetch_t0::<2>(b.as_ptr().add((l + PF) * 8) as *const i8);
         }
         let act = &a[l];
-        let dact = act.d.to_f32();
+        let dact = crate::tensor::quant_cpu::avx::f16c_to_f32(act.d);
         let by = _mm256_loadu_si256(act.qs.as_ptr() as *const __m256i);
         for j in 0..8 {
             let blk = &b[l * 8 + j];
@@ -95,8 +95,8 @@ pub unsafe fn gemv_group_avx2(b: &[BlockMxFp4], a: &[BlockQ8_0], nb: usize, out:
 /// of `e8m0_half(e).d_act` per 32-block into an f32 vector -> `hsum` at the
 /// end), so it is bit-identical to the per-column path. Writes
 /// `out[r*8 .. r*8+8]` for r in 0..mt.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemm_group_avx2(b: &[BlockMxFp4], acts: &[&[BlockQ8_0]], nb: usize, out: &mut [f32]) {
     let mt = acts.len();
     let lut =
@@ -110,7 +110,7 @@ pub unsafe fn gemm_group_avx2(b: &[BlockMxFp4], acts: &[&[BlockQ8_0]], nb: usize
             for (r, act) in acts.iter().enumerate().take(mt) {
                 let a = &act[l];
                 let by = _mm256_loadu_si256(a.qs.as_ptr() as *const __m256i);
-                let d = _mm256_set1_ps(dj * a.d.to_f32());
+                let d = _mm256_set1_ps(dj * crate::tensor::quant_cpu::avx::f16c_to_f32(a.d));
                 acc[r] = _mm256_fmadd_ps(d, super::avx::dot_signed(bx, by), acc[r]);
             }
         }

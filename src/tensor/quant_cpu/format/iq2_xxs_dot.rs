@@ -55,8 +55,8 @@ const SIGNS_U64: [u64; 128] = {
 /// tables into the SIMD lanes: `IQ2XXS_GRID` is already eight packed bytes per entry and
 /// `SIGNS_U64` mirrors it, so no `[u8; 32]`/`[i8; 32]` is assembled and copied first. Byte-for-byte
 /// the same product as `sub_block` + `sub_block_dot` on little-endian x86.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 #[inline]
 unsafe fn sub_block_dot_fused_avx2(q: &[u16], act: *const i8) -> i32 {
     use core::arch::x86_64::*;
@@ -100,9 +100,9 @@ fn sub_block(q: &[u16]) -> ([u8; 32], [i8; 32], f32) {
     (grid, signs, (0.5 + (hi >> 28) as f32) * 0.25)
 }
 
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[allow(dead_code)]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 #[inline]
 unsafe fn sub_block_dot_avx2(grid: &[u8; 32], signs: &[i8; 32], act: *const i8) -> i32 {
     use core::arch::x86_64::*;
@@ -122,23 +122,23 @@ unsafe fn sub_block_dot_avx2(grid: &[u8; 32], signs: &[i8; 32], act: *const i8) 
 #[allow(dead_code)]
 #[inline(always)]
 fn sub_block_dot(grid: &[u8; 32], signs: &[i8; 32], act: &[i8]) -> i32 {
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-    {
-        // Safety: `act` holds the sub-block's 32 activations.
-        unsafe { sub_block_dot_avx2(grid, signs, act.as_ptr()) }
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
+        // Safety: `act` holds the sub-block's 32 activations, and dispatch_avx2 implies the CPU
+        // has the feature the kernel enables.
+        return unsafe { sub_block_dot_avx2(grid, signs, act.as_ptr()) };
     }
-    #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
-    {
-        grid.iter()
-            .zip(signs)
-            .zip(act)
-            .map(|((&g, &s), &a)| g as i32 * s as i32 * a as i32)
-            .sum()
-    }
+    grid.iter()
+        .zip(signs)
+        .zip(act)
+        .map(|((&g, &s), &a)| g as i32 * s as i32 * a as i32)
+        .sum()
 }
 
 /// The dot product of IQ2_XXS weight blocks with activation blocks of a scale per run.
 pub(crate) fn dot(xs: &[BlockIq2Xxs], ys: &[BlockQ8K32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    let fused = crate::cpu::dispatch_avx2();
     xs.iter()
         .zip(ys)
         .map(|(x, y)| {
@@ -149,10 +149,16 @@ pub(crate) fn dot(xs: &[BlockIq2Xxs], ys: &[BlockQ8K32]) -> f32 {
                 // The scale rides in the top four bits of the sign half of the sub-block.
                 let hi = q[2] as u32 | ((q[3] as u32) << 16);
                 let scale = (0.5 + (hi >> 28) as f32) * 0.25;
-                #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-                // Safety: `act` is the sub-block's 32 activations.
-                let sum = unsafe { sub_block_dot_fused_avx2(q, act.as_ptr()) };
-                #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
+                #[cfg(target_arch = "x86_64")]
+                let sum = if fused {
+                    // Safety: `act` is the sub-block's 32 activations, and `fused` implies the CPU
+                    // has the feature the kernel enables.
+                    unsafe { sub_block_dot_fused_avx2(q, act.as_ptr()) }
+                } else {
+                    let (grid, signs, _) = sub_block(q);
+                    sub_block_dot(&grid, &signs, act)
+                };
+                #[cfg(not(target_arch = "x86_64"))]
                 let sum = {
                     let (grid, signs, _) = sub_block(q);
                     sub_block_dot(&grid, &signs, act)

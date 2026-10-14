@@ -4,9 +4,12 @@
 
 use super::*;
 
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn repacked_q4_0_gemm_matches_vec_dot_and_oracle() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     let (n, nb) = (16usize, 4usize);
     let mut seed = 0x2545F4914F6CDD1Du64;
     let mut rng = || {
@@ -81,9 +84,12 @@ pub(super) fn repacked_q4_0_gemm_matches_vec_dot_and_oracle() {
     }
 }
 
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn q4_0_full_matmul_matches_reference() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // Full driver (matmul_q4_0_repacked_tiled) vs the per-column reference
     // (matmul_bytes -> vec_dot_q4_0_q8_0) at a realistic projection shape. The
     // tiled kernel mirrors the reference's reduction order (per 32-block fmadd
@@ -137,6 +143,9 @@ pub(super) fn q4_0_full_matmul_matches_reference() {
 #[cfg(test)]
 #[test]
 pub(super) fn mxfp4_full_matmul_matches_reference() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // Full driver (matmul_mxfp4_repacked_tiled) vs the per-column reference
     // (matmul_bytes -> vec_dot_mxfp4_q8_0) at a realistic projection shape. The
     // tiled kernel mirrors the reference's reduction order (code->LUT shuffle,
@@ -191,6 +200,9 @@ pub(super) fn mxfp4_full_matmul_matches_reference() {
 #[cfg(test)]
 #[test]
 pub(super) fn mxfp4_x8_scalar_matches_reference() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // The column-interleaved scalar oracle (repack_mxfp4_x8::matmul_scalar) vs the
     // per-column reference (matmul_bytes -> vec_dot_mxfp4_q8_0). NOT bit-identical
     // (different reduction order + independent Q8_0 activation quantization), so
@@ -245,9 +257,12 @@ pub(super) fn mxfp4_x8_scalar_matches_reference() {
 }
 
 #[cfg(test)]
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn mxfp4_x8_avx2_matches_scalar() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // The AVX2 column-interleaved kernel must be BIT-IDENTICAL to the scalar
     // oracle (same reduction order by construction). One 4-row x 8-col tile.
     use repack_mxfp4_x8::{BlockMxFp4x8, BlockQ8_0x4};
@@ -309,9 +324,12 @@ pub(super) fn mxfp4_x8_avx2_matches_scalar() {
 }
 
 #[cfg(test)]
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn mxfp4_x8_gemm16_matches_scalar() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // The 16-row kernel (decode-once, 4 activation groups) must equal the 4-row
     // kernel applied to each group - same math, so bit-identical to gemm_group_avx2
     // (which is rel<1e-4 vs the scalar oracle). Check vs the scalar oracle per group.
@@ -373,9 +391,12 @@ pub(super) fn mxfp4_x8_gemm16_matches_scalar() {
 }
 
 #[cfg(test)]
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn mxfp4_x8_tiled_driver_matches_reference() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // Full driver (matmul_mxfp4_x8_tiled) vs matmul_bytes. m=20 exercises one
     // 16-row chunk + one 4-row remainder.
     let (m, k, n) = (20usize, 1024usize, 256usize);
@@ -424,6 +445,9 @@ pub(super) fn mxfp4_x8_tiled_driver_matches_reference() {
 #[cfg(test)]
 #[test]
 pub(super) fn q8_0_x8_scalar_matches_reference() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // Column-interleaved Q8_0 scalar oracle vs the per-column reference
     // (matmul_bytes -> vec_dot_q8_0_q8_0). Validates the BlockQ8_0x8 layout +
     // activation packing. rel-close (independent activation quantization).
@@ -465,9 +489,12 @@ pub(super) fn q8_0_x8_scalar_matches_reference() {
 }
 
 #[cfg(test)]
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn q8_0_x8_avx2_matches_scalar() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // Q8_0 AVX2 kernel (4-row and 16-row) vs the scalar oracle - rel<1e-4 (float
     // scale rounding only; the integer dot is order-independent).
     use repack_q8_0_x8::{BlockQ8_0x4, BlockQ8_0x8};
@@ -545,9 +572,12 @@ pub(super) fn q8_0_x8_avx2_matches_scalar() {
 }
 
 #[cfg(test)]
-#[cfg(target_feature = "avx2")]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn repacked_q5k_matches_vec_dot_and_oracle() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     let (n, nb) = (16usize, 4usize);
     let mut seed = 0xC2B2AE3D27D4EB4Fu64;
     let mut rng = || {
@@ -599,7 +629,7 @@ pub(super) fn repacked_q5k_matches_vec_dot_and_oracle() {
     // `q5k_full_matmul_matches_reference` - whereas the oracle folds both into
     // one scalar per super-block, so the two differ only by float summation
     // order; a loose bound still catches any structural (scale/plane/min) bug.
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     for g in 0..n / 8 {
         let bgrp = &x8[g * nb..(g + 1) * nb];
         for mt in 1..=m {
@@ -620,9 +650,12 @@ pub(super) fn repacked_q5k_matches_vec_dot_and_oracle() {
     }
 }
 
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
 pub(super) fn q5k_full_matmul_matches_reference() {
+    if !crate::cpu::hardware_has_avx2() {
+        return;
+    }
     // Full driver (matmul_q5k_repacked_tiled) vs the per-column reference
     // (matmul_bytes -> vec_dot_q5k_q8k) at a realistic projection shape.
     let (m, k, n) = (13usize, 2048usize, 512usize);
@@ -856,29 +889,22 @@ pub fn matmul_q4k_plain(
     rhs_x8: &[repack_q4k::BlockQ4Kx8],
     dst: &mut [f32],
 ) -> Result<()> {
-    #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
-    {
-        let _ = (m, k, n, lhs, rhs_x8, dst);
-        Err(Error("matmul_q4k_plain: avx2 build required".into()))
-    }
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-    {
-        if m >= 2 {
-            return matmul_q4k_repacked_tiled((m, k, n), lhs, rhs_x8, dst);
-        }
+    #[cfg(target_arch = "x86_64")]
+    if m < 2 && crate::cpu::dispatch_avx2() {
         let nb = k / QK_K;
         let mut aq = qscratch_take::<BlockQ8K>(nb);
         BlockQ8K::quantize(lhs, &mut aq[..nb]);
         let r = matmul_q4k_plain_pre((k, n), &aq[..nb], rhs_x8, dst);
         qscratch_return(aq);
-        r
+        return r;
     }
+    matmul_q4k_repacked_tiled((m, k, n), lhs, rhs_x8, dst)
 }
 
 /// Quantise one activation row to Q8_K, for callers that then drive SEVERAL
 /// weights from it via [`matmul_q4k_plain_pre`]. Same routine the GEMV uses
 /// internally, so sharing the result is bit-identical to quantising per call.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub fn quantize_activation_q8k(x: &[f32], nb: usize) -> Vec<BlockQ8K> {
     let mut aq = vec![BlockQ8K::zeros(); nb];
     BlockQ8K::quantize(x, &mut aq);

@@ -195,6 +195,12 @@ on each layer's card is sized by the load. Two keys carry what a run learned to 
 | `moderation_model` | none | The classifier `/v1/moderations` asks, by tag. Recognised by name: Llama Guard, Shieldstral, ShieldGemma, Granite Guardian and gpt-oss Safeguard. Without it the endpoint answers 501. |
 | `public_url` | request `Host` | The origin clients reach this server at, for the URLs it hands out, such as image files answered as `url`. Set it behind a proxy. |
 
+## `[cpu]`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `level` | the best the CPU has | Highest SIMD level the host kernels may use: `generic` (scalar reference code), `avx2` or `avx512`. It only lowers the level, never raises it above what the CPU supports. Used to compare paths and for hosts where a wider one measures slower. |
+
 ## `[energy]`
 
 | Key | Default | What it does |

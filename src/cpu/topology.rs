@@ -267,10 +267,13 @@ pub fn simd_capabilities() -> Vec<&'static str> {
             ("avx", is_x86_feature_detected!("avx")),
             ("avx2", is_x86_feature_detected!("avx2")),
             ("fma", is_x86_feature_detected!("fma")),
+            ("f16c", is_x86_feature_detected!("f16c")),
             ("avx512f", is_x86_feature_detected!("avx512f")),
+            ("avx512bw", is_x86_feature_detected!("avx512bw")),
+            ("avx512vl", is_x86_feature_detected!("avx512vl")),
             ("avx512vnni", is_x86_feature_detected!("avx512vnni")),
+            ("avx512vbmi", is_x86_feature_detected!("avx512vbmi")),
             ("avx512bf16", is_x86_feature_detected!("avx512bf16")),
-            ("avx512_bf16", is_x86_feature_detected!("avx512bf16")),
         ] {
             if present {
                 out.push(name);

@@ -70,7 +70,6 @@ impl Q8Rows {
 
 /// The integer dot of one 16-byte chunk of nibbles with 32 reordered i8 activations: the path
 /// without AVX2, and what the vector path is checked against.
-#[cfg_attr(all(target_feature = "avx2", target_arch = "x86_64"), allow(dead_code))]
 #[inline(always)]
 fn chunk_dot_scalar(bytes: &[u8], x: &[i8]) -> i32 {
     let mut s = 0i32;
@@ -82,8 +81,8 @@ fn chunk_dot_scalar(bytes: &[u8], x: &[i8]) -> i32 {
     s
 }
 
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 #[inline]
 unsafe fn chunk_dot_avx2(bytes: *const u8, x: *const i8) -> i32 {
     use core::arch::x86_64::*;
@@ -110,15 +109,12 @@ unsafe fn chunk_dot_avx2(bytes: *const u8, x: *const i8) -> i32 {
 
 #[inline(always)]
 fn chunk_dot(bytes: &[u8], x: &[i8]) -> i32 {
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-    {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cpu::dispatch_avx2() {
         // Safety: both slices are at least one chunk long, checked by the callers' layout.
-        unsafe { chunk_dot_avx2(bytes.as_ptr(), x.as_ptr()) }
+        return unsafe { chunk_dot_avx2(bytes.as_ptr(), x.as_ptr()) };
     }
-    #[cfg(not(all(target_feature = "avx2", target_arch = "x86_64")))]
-    {
-        chunk_dot_scalar(bytes, x)
-    }
+    chunk_dot_scalar(bytes, x)
 }
 
 impl Fp4Weight {
@@ -244,6 +240,9 @@ mod tests {
     /// activation's 8-bit quantisation.
     #[test]
     fn in_place_product_matches_dequantised_matmul() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         let (out, inp, block, n) = (24usize, 128usize, 32usize, 3usize);
         let (nibbles, scales, x) = fixture(out, inp, block, n);
         let scales_f: Vec<f32> = scales.iter().map(|&s| e8m0_to_f32(s)).collect();
@@ -276,6 +275,9 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn the_card_applies_the_dequantised_weight() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         use crate::tensor::cuda::{gpu_fp4_linear, CudaDevice};
         let Ok(dev) = CudaDevice::new(0) else {
             eprintln!("no CUDA device; the card fp4 product is NOT covered by this run");
@@ -310,6 +312,9 @@ mod tests {
     /// refused.
     #[test]
     fn wider_blocks_and_odd_blocks() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         let (out, inp, block, n) = (8usize, 256usize, 64usize, 2usize);
         let (nibbles, scales, x) = fixture(out, inp, block, n);
         let fw = Fp4Weight::new(mapped(&nibbles), mapped(&scales), out, inp).unwrap();
@@ -328,9 +333,12 @@ mod tests {
     }
 
     /// The vector chunk dot equals the scalar one exactly.
-    #[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn vector_chunk_dot_equals_scalar() {
+        if !crate::cpu::hardware_has_avx2() {
+            return;
+        }
         let bytes: Vec<u8> = (0..16u32).map(|i| ((i * 97 + 3) % 256) as u8).collect();
         let x: Vec<i8> = (0..32i32).map(|i| ((i * 53) % 255 - 127) as i8).collect();
         let want = chunk_dot_scalar(&bytes, &x);

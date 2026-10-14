@@ -10,7 +10,7 @@
 )]
 
 use super::{BlockMxFp4, KVALUES_MXFP4};
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 use half::f16;
 
@@ -177,7 +177,7 @@ pub fn matmul_scalar(
 
 /// `acc + madd(ones, maddubs(|x|, sign(y,x)))` - the int32-accumulating i8
 /// pairwise dot (llama.cpp `mul_sum_i8_pairs_acc_int32x8`, non-VNNI path).
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn madd_acc(acc: __m256i, x: __m256i, y: __m256i) -> __m256i {
     let ax = _mm256_sign_epi8(x, x);
@@ -191,8 +191,8 @@ unsafe fn madd_acc(acc: __m256i, x: __m256i, y: __m256i) -> __m256i {
 /// Faithful port of llama.cpp's `gemm_q4_b32_8x8_q8_0_lut_avx` (AVX2 path,
 /// mxfp4 branch). Writes `out[m*8 + j]` for m in 0..4, j in 0..8. Bit-identical
 /// to `gemm_scalar`.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemm_group_avx2(
     a: &[BlockQ8_0x4],
     b: &[BlockMxFp4x8],
@@ -422,7 +422,7 @@ pub unsafe fn gemm_group_avx2(
 /// 16-row kernel decodes each weight block ONCE and applies it to 4 row-groups
 /// (the weight decode + `col_scale` are the per-block work the 4-row tile
 /// otherwise repeats). `acc` must have length 4.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn accum_4rows(
     w0145_sp1: &[__m256i; 4],
@@ -475,8 +475,11 @@ pub unsafe fn accum_4rows(
         _mm256_shuffle_epi32::<245>(l23[2]),
         _mm256_shuffle_epi32::<245>(l23[3]),
     ];
-    let z = _mm256_setzero_si256();
-    let acc4 = |aa: &[__m256i; 4], ww: &[__m256i; 4]| -> __m256i {
+    // A free function, not a closure: a closure does not inherit the caller's target features,
+    // so out of line its intrinsics would be calls.
+    #[inline(always)]
+    unsafe fn acc4(aa: &[__m256i; 4], ww: &[__m256i; 4]) -> __m256i {
+        let z = _mm256_setzero_si256();
         madd_acc(
             madd_acc(
                 madd_acc(madd_acc(z, aa[3], ww[3]), aa[2], ww[2]),
@@ -486,7 +489,7 @@ pub unsafe fn accum_4rows(
             aa[0],
             ww[0],
         )
-    };
+    }
     let iacc_00 = _mm256_add_epi32(acc4(&a01_1, w0145_sp1), acc4(&a01_2, w0145_sp2));
     let iacc_01 = _mm256_add_epi32(acc4(&a01_1, w2367_sp1), acc4(&a01_2, w2367_sp2));
     let iacc_10 = _mm256_add_epi32(acc4(&a23_1, w0145_sp1), acc4(&a23_2, w0145_sp2));
@@ -520,7 +523,7 @@ pub unsafe fn accum_4rows(
 }
 
 /// Decode one weight block into the 16 shuffle-pattern vectors + `col_scale`.
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn decode_weights(
     bb: &BlockMxFp4x8,
@@ -602,8 +605,8 @@ unsafe fn decode_weights(
 /// the 4 activation groups `a0..a3` (mirror of llama.cpp's main 16-row loop),
 /// amortizing the weight decode + `col_scale` 4x vs the 4-row tile. Writes
 /// `out[rp*32 + m*8 + j]` for rp,m in 0..4, j in 0..8 (16 rows x 8 cols).
-#[cfg(all(target_feature = "avx2", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2,fma")]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub unsafe fn gemm_group16_avx2(
     a0: &[BlockQ8_0x4],
     a1: &[BlockQ8_0x4],
