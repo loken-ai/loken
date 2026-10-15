@@ -69,30 +69,29 @@ impl GenericHeteroTransformer {
         use crate::tensor::Error;
 
         for layer in self.layers.iter_mut() {
-            for p in [
-                layer.attn_q.as_mut(),
-                layer.attn_k.as_mut(),
-                layer.attn_v.as_mut(),
-                layer.attn_qkv.as_mut(),
-                layer.ffn_gate.as_mut(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                p.clear_lora();
+            let mut shards = std::mem::take(&mut layer.tp_shards);
+            for part in std::iter::once(&mut *layer).chain(shards.iter_mut()) {
+                for p in [
+                    part.attn_q.as_mut(),
+                    part.attn_k.as_mut(),
+                    part.attn_v.as_mut(),
+                    part.attn_qkv.as_mut(),
+                    part.ffn_gate.as_mut(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    p.clear_lora();
+                }
+                part.attn_output.clear_lora();
+                part.ffn_up.clear_lora();
+                part.ffn_down.clear_lora();
             }
-            layer.attn_output.clear_lora();
-            layer.ffn_up.clear_lora();
-            layer.ffn_down.clear_lora();
+            layer.tp_shards = shards;
         }
         self.adapters.clear();
         if wanted.is_empty() {
             return Ok(AdapterReport::default());
-        }
-        if self.layers.iter().any(|l| !l.tp_shards.is_empty()) {
-            return Err(Error(
-                "adapters do not apply to a model whose layers are split across cards".into(),
-            ));
         }
 
         // Read on the host, then move each delta to the card its projection sits on: a split
@@ -113,18 +112,20 @@ impl GenericHeteroTransformer {
             let mut hits = 0usize;
             for (i, layer) in self.layers.iter_mut().enumerate() {
                 // Fused QKV is deliberately absent: an adapter names q, k and v separately and
-                // splitting a fused weight to take them is a different piece of work.
-                let sites: [(&str, Option<&mut super::projection::QMatMul>); 7] = [
-                    ("self_attn.q_proj", layer.attn_q.as_mut()),
-                    ("self_attn.k_proj", layer.attn_k.as_mut()),
-                    ("self_attn.v_proj", layer.attn_v.as_mut()),
-                    ("self_attn.o_proj", Some(&mut layer.attn_output)),
-                    ("mlp.gate_proj", layer.ffn_gate.as_mut()),
-                    ("mlp.up_proj", Some(&mut layer.ffn_up)),
-                    ("mlp.down_proj", Some(&mut layer.ffn_down)),
+                // splitting a fused weight to take them is a different piece of work. A
+                // projection cut by rows across a layer's shares takes its slice of the delta's
+                // outputs, one cut by columns its slice of the delta's inputs.
+                const SITES: [(&str, bool); 7] = [
+                    ("self_attn.q_proj", true),
+                    ("self_attn.k_proj", true),
+                    ("self_attn.v_proj", true),
+                    ("self_attn.o_proj", false),
+                    ("mlp.gate_proj", true),
+                    ("mlp.up_proj", true),
+                    ("mlp.down_proj", false),
                 ];
-                for (projection, slot) in sites {
-                    let Some(weight) = slot else { continue };
+                let ranks = 1 + layer.tp_shards.len();
+                for (site, (projection, by_rows)) in SITES.iter().enumerate() {
                     let mut delta = None;
                     for key in transformer_keys(i, projection) {
                         if let Some(d) = file.delta_for_key(&key, *strength)? {
@@ -133,14 +134,47 @@ impl GenericHeteroTransformer {
                         }
                     }
                     let Some(delta) = delta else { continue };
-                    let device = weight.device();
-                    let moved = crate::tensor::lora::LoraDelta {
-                        down: delta.down.to_device(&device)?,
-                        up: delta.up.to_device(&device)?,
-                        scale: delta.scale,
-                    };
-                    weight.add_lora(moved)?;
-                    hits += 1;
+                    let mut shards = std::mem::take(&mut layer.tp_shards);
+                    let parts = std::iter::once(&mut *layer).chain(shards.iter_mut());
+                    let mut applied = false;
+                    for (rank, part) in parts.enumerate() {
+                        let slot = match site {
+                            0 => part.attn_q.as_mut(),
+                            1 => part.attn_k.as_mut(),
+                            2 => part.attn_v.as_mut(),
+                            3 => Some(&mut part.attn_output),
+                            4 => part.ffn_gate.as_mut(),
+                            5 => Some(&mut part.ffn_up),
+                            _ => Some(&mut part.ffn_down),
+                        };
+                        let Some(weight) = slot else { continue };
+                        let (down, up) = match (ranks, by_rows) {
+                            (1, _) => (delta.down.clone(), delta.up.clone()),
+                            (_, true) => {
+                                let per = delta.up.dim(1)? / ranks;
+                                (
+                                    delta.down.clone(),
+                                    delta.up.narrow(1, rank * per, per)?.contiguous()?,
+                                )
+                            }
+                            (_, false) => {
+                                let per = delta.down.dim(0)? / ranks;
+                                (
+                                    delta.down.narrow(0, rank * per, per)?.contiguous()?,
+                                    delta.up.clone(),
+                                )
+                            }
+                        };
+                        let device = weight.device();
+                        weight.add_lora(crate::tensor::lora::LoraDelta {
+                            down: down.to_device(&device)?,
+                            up: up.to_device(&device)?,
+                            scale: delta.scale,
+                        })?;
+                        applied = true;
+                    }
+                    layer.tp_shards = shards;
+                    hits += usize::from(applied);
                 }
             }
             if hits == 0 {

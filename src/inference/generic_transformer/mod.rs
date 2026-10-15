@@ -588,13 +588,7 @@ pub struct KvSnapshot {
 impl KvSnapshot {
     /// Device memory this snapshot holds across its layers (host copies are not counted).
     pub fn device_bytes(&self) -> u64 {
-        self.layers
-            .iter()
-            .map(|l| {
-                l.spec.as_ref().map_or(0, |s| s.device_bytes())
-                    + l.mixer.as_ref().map_or(0, |m| m.device_bytes())
-            })
-            .sum()
+        self.layers.iter().map(LayerKvSnapshot::device_bytes).sum()
     }
 }
 
@@ -603,6 +597,17 @@ pub(crate) struct LayerKvSnapshot {
     pub(crate) cpu_f16: Option<crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
     /// A recurrent mixer's state at the snapshot's length.
     pub(crate) mixer: Option<mixer::MixerState>,
+    /// The snapshots of the layer's tensor-parallel shares, in their order.
+    pub(crate) shards: Vec<LayerKvSnapshot>,
+}
+
+impl LayerKvSnapshot {
+    /// Device memory this layer's snapshot and its shares' hold.
+    fn device_bytes(&self) -> u64 {
+        self.spec.as_ref().map_or(0, |s| s.device_bytes())
+            + self.mixer.as_ref().map_or(0, |m| m.device_bytes())
+            + self.shards.iter().map(Self::device_bytes).sum::<u64>()
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -2069,11 +2069,6 @@ impl GenericHeteroTransformer {
                     "context shift: sliding-window layer".to_string(),
                 ));
             }
-            if !layer.tp_shards.is_empty() {
-                return Err(crate::tensor::Error::msg(
-                    "context shift: a layer split across cards".to_string(),
-                ));
-            }
             #[cfg(feature = "cuda")]
             if layer.q4_kv().is_some() {
                 return Err(crate::tensor::Error::msg(
@@ -2083,23 +2078,14 @@ impl GenericHeteroTransformer {
         }
         let delta = -(discard as i64);
         for layer in &mut self.layers {
-            let table = layer.rope_table();
-            let host = table.delta_host(delta)?;
-            let mut rotate = |k: &crate::tensor::Tensor| table.rotate_keys_by(k, delta);
-            layer.kv_cache.shift_tail(from, discard, &mut rotate)?;
-            #[cfg(feature = "cuda")]
-            if let Some(c) = layer.q8_kv_mut() {
-                c.shift_tail(from, discard, &mut rotate)
-                    .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-            }
-            if let Some(c) = layer.cpu_q8_kv.as_mut() {
-                c.shift_tail(from, discard, host.as_ref())?;
-            }
-            if let Some(c) = layer.cpu_f16_kv.as_mut() {
-                c.shift_tail(from, discard, host.as_ref())?;
-            }
+            layer.shift_kv_tail(from, discard, delta)?;
         }
         Ok(())
+    }
+
+    /// Whether a layer's heads and feed-forward are split across cards.
+    pub fn has_split_layers(&self) -> bool {
+        self.layers.iter().any(|l| !l.tp_shards.is_empty())
     }
 
     /// Snapshots cover the F-dtype device cache and the host f16 cache. A quantised cache
@@ -2109,10 +2095,7 @@ impl GenericHeteroTransformer {
         // restored by re-appending, which stays on the same quant grid. The host q8 cache
         // has no such round-trip and still bars snapshots. A recurrent state cannot be cut
         // to the prefix a KV snapshot is reused at; it is kept by `snapshot_prefix`.
-        self.layers
-            .iter()
-            .all(|l| l.cpu_q8_kv.is_none() && l.tp_shards.is_empty())
-            && !self.is_recurrent()
+        self.layers.iter().all(|l| l.cpu_q8_kv.is_none()) && !self.is_recurrent()
     }
 
     /// Copies the resident KV aside under `tokens`, keeping at most `cap` snapshots: the
@@ -2141,21 +2124,7 @@ impl GenericHeteroTransformer {
 
     /// Every layer's KV, and every recurrent mixer's state, copied aside.
     fn capture_layers(&self) -> crate::tensor::Result<Vec<super::LayerKvSnapshot>> {
-        let mut layers = Vec::with_capacity(self.layers.len());
-        for l in &self.layers {
-            let mixer = l.state_snapshot()?;
-            if let Some(mut snap) = quantised_layer_snapshot(l)? {
-                snap.mixer = mixer;
-                layers.push(snap);
-                continue;
-            }
-            layers.push(super::LayerKvSnapshot {
-                spec: l.kv_cache.snapshot()?,
-                cpu_f16: l.cpu_f16_kv.clone(),
-                mixer,
-            });
-        }
-        Ok(layers)
+        self.layers.iter().map(capture_layer).collect()
     }
 
     /// Enters a snapshot in the table: the one this sequence extends is replaced, and the
@@ -2503,7 +2472,8 @@ impl GenericHeteroTransformer {
             2 => crate::tensor::DType::BF16,
             _ => crate::tensor::DType::F16,
         };
-        if !self.supports_kv_snapshots() {
+        // Rows on disk are a whole layer's: a layer split across cards has no place to put them.
+        if !self.supports_kv_snapshots() || self.has_split_layers() {
             return Ok(());
         }
         let mut layers = Vec::with_capacity(self.layers.len());
@@ -2513,6 +2483,7 @@ impl GenericHeteroTransformer {
                     spec: None,
                     cpu_f16: None,
                     mixer: None,
+                    shards: Vec::new(),
                 });
                 continue;
             };
@@ -2878,6 +2849,35 @@ fn common_prefix(a: &[u32], b: &[u32]) -> usize {
 }
 
 impl GenericTransformerLayer {
+    /// Drop `discard` positions from `from` on in every cache this layer and its shares keep, the
+    /// keys behind them rotated back by `delta` positions.
+    pub(super) fn shift_kv_tail(
+        &mut self,
+        from: usize,
+        discard: usize,
+        delta: i64,
+    ) -> crate::tensor::Result<()> {
+        for shard in &mut self.tp_shards {
+            shard.shift_kv_tail(from, discard, delta)?;
+        }
+        let table = self.rope_table();
+        let host = table.delta_host(delta)?;
+        let mut rotate = |k: &crate::tensor::Tensor| table.rotate_keys_by(k, delta);
+        self.kv_cache.shift_tail(from, discard, &mut rotate)?;
+        #[cfg(feature = "cuda")]
+        if let Some(c) = self.q8_kv_mut() {
+            c.shift_tail(from, discard, &mut rotate)
+                .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
+        }
+        if let Some(c) = self.cpu_q8_kv.as_mut() {
+            c.shift_tail(from, discard, host.as_ref())?;
+        }
+        if let Some(c) = self.cpu_f16_kv.as_mut() {
+            c.shift_tail(from, discard, host.as_ref())?;
+        }
+        Ok(())
+    }
+
     /// Cut every cache this layer keeps back to `new_len` positions.
     pub(super) fn trim_kv_to(&mut self, new_len: usize) {
         for shard in &mut self.tp_shards {
@@ -2963,12 +2963,14 @@ fn quantised_layer_snapshot(
                     spec: Some(spec),
                     cpu_f16: None,
                     mixer: None,
+                    shards: Vec::new(),
                 }));
             }
             return Ok(Some(super::LayerKvSnapshot {
                 spec: None,
                 cpu_f16: None,
                 mixer: None,
+                shards: Vec::new(),
             }));
         }
     }
@@ -3007,6 +3009,7 @@ pub(super) fn layer_snapshot_from_rows(
             spec: Some(spec),
             cpu_f16: None,
             mixer: None,
+            shards: Vec::new(),
         });
     }
     if let Some(c) = &l.cpu_f16_kv {
@@ -3019,6 +3022,7 @@ pub(super) fn layer_snapshot_from_rows(
             spec: None,
             cpu_f16: Some(fresh),
             mixer: None,
+            shards: Vec::new(),
         });
     }
     Err(crate::tensor::Error::msg(
@@ -3033,19 +3037,52 @@ pub(super) fn restore_layers(
     snap: &[super::LayerKvSnapshot],
 ) -> crate::tensor::Result<()> {
     for (l, s) in layers.iter_mut().zip(snap) {
-        match &s.mixer {
-            Some(state) => l.state_restore(state)?,
-            None => l.state_reset(),
-        }
-        if restore_quantised_layer(l, s)? {
-            continue;
-        }
-        match &s.spec {
-            Some(spec) => l.kv_cache.restore(spec)?,
-            None => l.kv_cache.trim_to(0),
-        }
-        l.cpu_f16_kv = s.cpu_f16.clone();
+        restore_layer(l, s)?;
     }
+    Ok(())
+}
+
+/// A layer's caches and state, and its shares', as `l` holds them now.
+fn capture_layer(l: &GenericTransformerLayer) -> crate::tensor::Result<super::LayerKvSnapshot> {
+    let mixer = l.state_snapshot()?;
+    let mut snap = match quantised_layer_snapshot(l)? {
+        Some(snap) => snap,
+        None => super::LayerKvSnapshot {
+            spec: l.kv_cache.snapshot()?,
+            cpu_f16: l.cpu_f16_kv.clone(),
+            mixer: None,
+            shards: Vec::new(),
+        },
+    };
+    snap.mixer = mixer;
+    snap.shards = l
+        .tp_shards
+        .iter()
+        .map(capture_layer)
+        .collect::<crate::tensor::Result<_>>()?;
+    Ok(snap)
+}
+
+/// [`capture_layer`]'s snapshot `s` made the layer's and its shares' caches and state again.
+fn restore_layer(
+    l: &mut GenericTransformerLayer,
+    s: &super::LayerKvSnapshot,
+) -> crate::tensor::Result<()> {
+    for (shard, saved) in l.tp_shards.iter_mut().zip(&s.shards) {
+        restore_layer(shard, saved)?;
+    }
+    match &s.mixer {
+        Some(state) => l.state_restore(state)?,
+        None => l.state_reset(),
+    }
+    if restore_quantised_layer(l, s)? {
+        return Ok(());
+    }
+    match &s.spec {
+        Some(spec) => l.kv_cache.restore(spec)?,
+        None => l.kv_cache.trim_to(0),
+    }
+    l.cpu_f16_kv = s.cpu_f16.clone();
     Ok(())
 }
 

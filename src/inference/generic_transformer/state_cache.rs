@@ -791,11 +791,13 @@ impl GenericHeteroTransformer {
                     spec: None,
                     cpu_f16: None,
                     mixer: None,
+                    shards: Vec::new(),
                 },
                 Held::Mixer(m) => super::LayerKvSnapshot {
                     spec: None,
                     cpu_f16: None,
                     mixer: Some(m.state(&l.cos.device())?),
+                    shards: Vec::new(),
                 },
                 Held::Window(r) => rows_snapshot(l, &r.k, &r.v, r.dtype)?,
                 Held::Global(tail) => {
@@ -877,6 +879,7 @@ fn rows_snapshot(
             spec: None,
             cpu_f16: None,
             mixer: None,
+            shards: Vec::new(),
         });
     }
     let dt = dtype_of(dtype).map_err(|e| crate::tensor::Error::msg(e.to_string()))?;

@@ -82,5 +82,22 @@ fn a_layer_split_across_two_cards_computes_the_whole_layer() {
         m.trim_kv(9);
         m.forward(&ids(&[3]), 9).unwrap()
     });
+    // A snapshot of the sequence, another sequence over it, the snapshot restored and continued:
+    // the shares' caches go aside and come back with the layer's.
+    both("after a snapshot is restored", &|m| {
+        m.snapshot_kv(vec![1, 4, 2, 9, 3, 5, 8, 2, 5, 1, 3], 10)
+            .unwrap();
+        m.forward(&ids(&[7, 7, 6]), 0).unwrap();
+        let (i, _) = m
+            .best_kv_snapshot(&[1, 4, 2, 9, 3, 5, 8, 2, 5, 1, 3, 4])
+            .unwrap();
+        m.restore_kv_snapshot(i).unwrap();
+        m.forward(&ids(&[4]), 10).unwrap()
+    });
+    // A context shift drops positions 2 to 4 and rotates the keys behind them, in every share.
+    both("after a context shift", &|m| {
+        m.shift_kv_tail(5, 3).unwrap();
+        m.forward(&ids(&[6]), 8).unwrap()
+    });
     tiny_model::remove(&path);
 }
