@@ -894,6 +894,10 @@ mod marlin_parity {
             eprintln!("no CUDA device; the Marlin kernels are NOT covered by this run");
             return;
         };
+        // Below Ampere the kernel accumulates in f16: each of the k/16 MMA steps rounds the
+        // running sum by up to half an ulp, 2^-11 of it, so the bound grows with k. From
+        // Ampere on the accumulation is f32 and the f16 carrier alone sets the bound.
+        let f16_accumulation = !dev.has_ampere_tensor_cores();
         let gpu = Device::Cuda(dev);
 
         // Two shapes, because the kernel divides its work differently in each. A narrow
@@ -978,14 +982,19 @@ mod marlin_parity {
 
                 // The row's own largest output is the scale: a column that cancelled to near zero
                 // cannot be held to a relative bound, and the GPU path carries f16.
+                let bound = if f16_accumulation {
+                    ((k / 16) as f64 * 2f64.powi(-11)).max(8e-3)
+                } else {
+                    8e-3
+                };
                 for r in 0..rows {
                     let scale = (0..n).map(|c| want[r * n + c].abs()).fold(0f32, f32::max) as f64;
                     for c in 0..n {
                         let (a, b) = (got[r * n + c] as f64, want[r * n + c] as f64);
                         assert!(
-                        (a - b).abs() <= 8e-3 * scale,
+                        (a - b).abs() <= bound * scale,
                         "rows={rows} r={r} col {c}: gpu {a} against the host's {b} on the same \
-                         packed weights (row scale {scale})"
+                         packed weights (row scale {scale}, bound {bound})"
                     );
                     }
                 }

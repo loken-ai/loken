@@ -429,6 +429,12 @@ fn the_expert_offsets_are_where_the_host_says_they_are() {
         eprintln!("no CUDA device; the expert offsets are NOT covered by this run");
         return;
     };
+    // The builder lives in the Ampere set of kernels: below sm_80 it ships no code and a
+    // launch only reports the card.
+    if !dev.has_ampere_tensor_cores() {
+        eprintln!("no Ampere code on this card; the expert offsets are NOT covered by this run");
+        return;
+    }
 
     extern "C" {
         fn loken_moe_expert_offsets(
