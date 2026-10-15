@@ -31,9 +31,9 @@ struct Cli {
 enum Commands {
     /// Start the HTTP server
     Serve {
-        /// HTTP server port
-        #[arg(short, long, default_value = "11435")]
-        port: u16,
+        /// HTTP server port; without it, the `[server] port` of config.toml
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Ollama model store to serve from (the directory holding `manifests/` and
         /// `blobs/`). Defaults to the platform's usual location.
@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("🖥️  --cpu: GPU disabled, serving on CPU only");
             }
 
-            info!("Starting lokend on port {}", port);
+            info!("Starting lokend");
             info!(
                 "Models directory: {}",
                 models_dir.clone().unwrap_or_else(|| {
@@ -168,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             };
+            let port = port.unwrap_or_else(|| config.server().port);
 
             // The kernels dispatch on this, and weights are repacked for it at load.
             config.apply_cpu_level();
@@ -716,7 +717,7 @@ mod tests {
             keep_alive,
             ..
         } = cli.command;
-        assert_eq!(port, 9000);
+        assert_eq!(port, Some(9000));
         assert_eq!(models_dir.as_deref(), Some("/tmp/models"));
         assert!(verbose);
         assert!(keep_alive.is_none());

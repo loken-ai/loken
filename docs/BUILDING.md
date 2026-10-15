@@ -49,9 +49,10 @@ A CUDA build serves without a card too: `lokend serve --cpu` places every layer 
 ## Running the daemon
 
 ```
-lokend serve [--port 11435] [--models-dir DIR] [--keep-alive DURATION] [--cpu] [--verbose]
+lokend serve [--port PORT] [--models-dir DIR] [--keep-alive DURATION] [--cpu] [--verbose]
 ```
 
+`--port` overrides the `[server] port` of `config.toml` (11435 when neither names one);
 `--models-dir` names the Ollama store; `--keep-alive` is how long a model stays resident after
 its last request, `-1` for ever, also read from `OLLAMA_KEEP_ALIVE`. Everything else comes from
 `config.toml`, found in the working directory, beside the executable, or in the user
