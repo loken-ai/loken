@@ -10,7 +10,12 @@ const LAYERS: usize = 3;
 
 fn load(path: &std::path::Path, cards: &[usize]) -> GenericHeteroTransformer {
     let mut plan = HeteroPlan::forced_gpu(LAYERS, LAYERS, cards[0]);
-    plan.tp_cards = (cards.len() > 1).then(|| cards.to_vec());
+    plan.tp_cards = (cards.len() > 1).then(|| {
+        cards
+            .iter()
+            .map(|&index| crate::inference::place::layer_executor::TpCard { index, weight: 1.0 })
+            .collect()
+    });
     let devices: std::collections::HashMap<usize, Device> = cards
         .iter()
         .map(|&c| (c, Device::new_cuda(c).unwrap()))

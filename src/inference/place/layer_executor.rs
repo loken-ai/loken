@@ -88,13 +88,22 @@ impl HeteroSegment {
     }
 }
 
+/// A card of a tensor-parallel group and the weight of its share: shares are in proportion to
+/// the weights, which are the cards' measured read rates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TpCard {
+    pub index: usize,
+    pub weight: f64,
+}
+
 /// Heterogeneous device plan: assigns layer ranges to devices (CUDA, wgpu, CPU)
 #[derive(Debug, Clone)]
 pub struct HeteroPlan {
     pub segments: Vec<HeteroSegment>,
     /// The cards that split every dense layer's heads and feed-forward between them, the
-    /// layers' own card first; `None` when each layer runs on one device.
-    pub tp_cards: Option<Vec<usize>>,
+    /// layers' own card first, each with the weight its share takes; `None` when each layer
+    /// runs on one device.
+    pub tp_cards: Option<Vec<TpCard>>,
     pub total_layers: usize,
     /// Layers from this index on keep their routed experts in host memory while the rest of
     /// each layer runs on the device its segment names. `None` when every expert sits with

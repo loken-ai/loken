@@ -134,30 +134,37 @@ pub fn context_the_cards_hold(
     chosen
 }
 
-/// The cards that hold `demand` with every block split evenly over the first `ranks` of `cards`:
-/// chosen when the first plan does not hold it on one card and each of them holds its share of
-/// the weights with the runtime reserve and its part of the cache beside it.
+/// The cards that hold `demand` with every block split over the first `ranks` of `cards` in
+/// proportion to `weight` of each card: chosen when the first plan does not hold it on one card
+/// and each of them holds its share of the weights and of the cache with the runtime reserve
+/// beside it.
 pub fn tensor_parallel(
     demand: &Demand,
     cards: &[(usize, u64)],
     ranks: usize,
+    weight: impl Fn(usize) -> f64,
 ) -> Option<Vec<usize>> {
     if ranks < 2 || cards.len() < ranks || on_one_card(&demand.plan(cards)) {
         return None;
     }
     let ranked = &cards[..ranks];
-    let weights = demand.block_bytes.saturating_add(demand.head_bytes) / ranks as u64;
-    let cache = demand
-        .kv_bytes_per_layer
-        .saturating_mul(demand.layers as u64)
-        / ranks as u64;
+    let total: f64 = ranked.iter().map(|(idx, _)| weight(*idx)).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let held = demand
+        .block_bytes
+        .saturating_add(demand.head_bytes)
+        .saturating_add(
+            demand
+                .kv_bytes_per_layer
+                .saturating_mul(demand.layers as u64),
+        );
     ranked
         .iter()
-        .all(|(_, free)| {
-            weights
-                <= free
-                    .saturating_sub(demand.runtime_reserve)
-                    .saturating_sub(cache)
+        .all(|(idx, free)| {
+            let share = (held as f64 * weight(*idx) / total) as u64;
+            share <= free.saturating_sub(demand.runtime_reserve)
         })
         .then(|| ranked.iter().map(|(idx, _)| *idx).collect())
 }
@@ -201,14 +208,14 @@ mod tests {
     #[test]
     fn a_model_one_card_holds_is_not_split_by_rank() {
         let cards = [(0, 20 * GB), (1, 20 * GB)];
-        assert_eq!(tensor_parallel(&demand(10, 8), &cards, 2), None);
+        assert_eq!(tensor_parallel(&demand(10, 8), &cards, 2, |_| 1.0), None);
     }
 
     #[test]
     fn two_cards_split_a_model_each_holds_half_of() {
         let cards = [(0, 16 * GB), (1, 16 * GB)];
         assert_eq!(
-            tensor_parallel(&demand(10, 20), &cards, 2),
+            tensor_parallel(&demand(10, 20), &cards, 2, |_| 1.0),
             Some(vec![0, 1])
         );
     }
@@ -216,7 +223,19 @@ mod tests {
     #[test]
     fn a_split_each_card_cannot_hold_its_half_of_is_refused() {
         let cards = [(0, 16 * GB), (1, 8 * GB)];
-        assert_eq!(tensor_parallel(&demand(10, 20), &cards, 2), None);
-        assert_eq!(tensor_parallel(&demand(10, 20), &cards[..1], 2), None);
+        assert_eq!(tensor_parallel(&demand(10, 20), &cards, 2, |_| 1.0), None);
+        assert_eq!(
+            tensor_parallel(&demand(10, 20), &cards[..1], 2, |_| 1.0),
+            None
+        );
+        // Weighted to the larger card, the smaller one's share fits.
+        assert_eq!(
+            tensor_parallel(&demand(10, 20), &cards, 2, |i| if i == 0 {
+                2.0
+            } else {
+                1.0
+            }),
+            Some(vec![0, 1])
+        );
     }
 }

@@ -9,6 +9,34 @@
 
 use super::expert_parallel::ShardCard;
 
+/// `units` whole units shared in proportion to `weights`, each share at least one unit, the
+/// remainders to the largest fractions; `None` when there are fewer units than weights.
+pub fn shares(weights: &[f64], units: usize) -> Option<Vec<usize>> {
+    let total: f64 = weights.iter().sum();
+    if units < weights.len() || total <= 0.0 {
+        return None;
+    }
+    let exact: Vec<f64> = weights.iter().map(|w| units as f64 * w / total).collect();
+    let mut out: Vec<usize> = exact.iter().map(|e| (e.floor() as usize).max(1)).collect();
+    // Too many after the floor of one: the largest shares give back.
+    while out.iter().sum::<usize>() > units {
+        let i = (0..out.len()).max_by_key(|&i| out[i]).expect("a share");
+        out[i] -= 1;
+    }
+    // Too few: the largest remainders take one more.
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    order.sort_by(|&a, &b| (exact[b] - out[b] as f64).total_cmp(&(exact[a] - out[a] as f64)));
+    let mut left = units - out.iter().sum::<usize>();
+    for i in order.into_iter().cycle() {
+        if left == 0 {
+            break;
+        }
+        out[i] += 1;
+        left -= 1;
+    }
+    Some(out)
+}
+
 /// A dense stack as the split sees it.
 #[derive(Clone, Copy, Debug)]
 pub struct DenseStack {
@@ -20,14 +48,11 @@ pub struct DenseStack {
 }
 
 /// Predicted microseconds of a token through the stack with each layer split over `cards`, the
-/// first being the layers' own card: per layer, the slowest card's read of its share, and two
-/// sublayers each sending `rows` rows out to every other card and the partial outputs back.
+/// first being the layers' own card, in proportion to their read rates: per layer, the cards'
+/// read of their shares, which finish together, and two sublayers each sending `rows` rows out
+/// to every other card and the partial outputs back.
 pub fn split_us(stack: &DenseStack, cards: &[ShardCard], rows: usize) -> f64 {
-    let ranks = cards.len() as f64;
-    let read = cards
-        .iter()
-        .map(|c| stack.layer_bytes as f64 / ranks / c.read_bytes_per_us)
-        .fold(0.0, f64::max);
+    let read = stack.layer_bytes as f64 / cards.iter().map(|c| c.read_bytes_per_us).sum::<f64>();
     let trip = cards
         .iter()
         .skip(1)
@@ -142,7 +167,9 @@ pub fn plan(
             tracing::info!("stays off tensor parallelism on {ranks} cards: {why}");
             return None;
         }
-        let group = super::llm::tensor_parallel(demand, cards, ranks)?;
+        let rates = super::expert_parallel::card_read_rates();
+        let weight = |idx: usize| rates.get(&idx).copied().unwrap_or(0.0);
+        let group = super::llm::tensor_parallel(demand, cards, ranks, weight)?;
         if !pays_over(demand, &demand.plan(cards), &group, row_bytes) {
             tracing::info!(
                 "stays layer by layer on {ranks} cards: the links cost more than the split saves"
@@ -151,7 +178,15 @@ pub fn plan(
         }
         let mut plan =
             super::layer_executor::HeteroPlan::forced_gpu(demand.layers, demand.layers, group[0]);
-        plan.tp_cards = Some(group);
+        plan.tp_cards = Some(
+            group
+                .iter()
+                .map(|&index| super::layer_executor::TpCard {
+                    index,
+                    weight: weight(index),
+                })
+                .collect(),
+        );
         Some(plan)
     })
 }
@@ -197,6 +232,19 @@ mod tests {
         let cards = [card(3350.0, None), card(3350.0, Some((3.0, 450.0)))];
         assert!(split_pays(&stack, &cards, &[32, 32], 1));
         assert!(split_us(&stack, &cards, 1) < 0.7 * layered_us(&stack, &cards, &[32, 32], 1));
+    }
+
+    /// Units go in proportion to the weights, every share at least one unit, summing to all.
+    #[test]
+    fn shares_follow_the_weights() {
+        assert_eq!(shares(&[896.0, 448.0], 4), Some(vec![3, 1]));
+        assert_eq!(shares(&[896.0, 448.0], 108), Some(vec![72, 36]));
+        assert_eq!(
+            shares(&[1.0, 1.0, 1.0], 4).map(|s| s.iter().sum::<usize>()),
+            Some(4)
+        );
+        assert_eq!(shares(&[10.0, 1.0], 2), Some(vec![1, 1]));
+        assert_eq!(shares(&[1.0, 1.0], 1), None);
     }
 
     /// One card is no split.

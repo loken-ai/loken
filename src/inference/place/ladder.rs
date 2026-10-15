@@ -475,7 +475,7 @@ pub fn cards_of(plan: &HeteroPlan) -> Vec<usize> {
         DeviceKind::Cuda(idx) => Some(idx),
         _ => None,
     });
-    for idx in segments.chain(plan.tp_cards.iter().flatten().copied()) {
+    for idx in segments.chain(plan.tp_cards.iter().flatten().map(|c| c.index)) {
         if !out.contains(&idx) {
             out.push(idx);
         }

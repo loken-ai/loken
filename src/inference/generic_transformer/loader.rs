@@ -689,30 +689,87 @@ pub(crate) fn tp_file_refusal(
     if let Some((_, why)) = refused.iter().find(|(part, _)| has(part)) {
         return Some((*why).to_string());
     }
-    let (heads, kv, hd, ffn) = (
-        config.n_head,
-        config.n_kv_head,
-        config.head_dim,
-        config.ffn_dim,
-    );
-    if heads % ranks != 0 || kv % ranks != 0 || ffn % ranks != 0 {
-        return Some(format!(
-            "{heads} heads, {kv} kv heads or {ffn} wide do not divide by {ranks}"
-        ));
-    }
     let block = |name: &str| {
         content
             .tensor_infos
             .get(name)
             .map(|t| t.ggml_dtype.block_size())
     };
-    let fits = |name: &str, cols: usize| block(name).is_some_and(|b| cols.is_multiple_of(b));
-    (0..config.n_layers)
-        .find(|i| {
-            !fits(&format!("blk.{i}.attn_output.weight"), heads / ranks * hd)
-                || !fits(&format!("blk.{i}.ffn_down.weight"), ffn / ranks)
-        })
-        .map(|i| format!("layer {i}: a share's columns do not fall on the weights' blocks"))
+    let even = vec![1.0; ranks];
+    (0..config.n_layers).find_map(|i| {
+        let (Some(o), Some(d)) = (
+            block(&format!("blk.{i}.attn_output.weight")),
+            block(&format!("blk.{i}.ffn_down.weight")),
+        ) else {
+            return Some(format!(
+                "layer {i}: no attention output or feed-forward down"
+            ));
+        };
+        tp_layout(&config, &even, o, d)
+            .err()
+            .map(|why| format!("layer {i}: {why}"))
+    })
+}
+
+/// How many kv heads (each with its query heads) and feed-forward rows each rank of a split
+/// takes, in proportion to `weights`: the heads by units whose attention output columns fall
+/// on its `output_block`-wide blocks, the rows by the `down_block`-wide blocks of the down
+/// projection's columns.
+pub(super) struct TpLayout {
+    pub kv: Vec<usize>,
+    pub ffn: Vec<usize>,
+    pub group: usize,
+}
+
+impl TpLayout {
+    /// The kv heads and feed-forward rows before rank `rank`.
+    fn offsets(&self, rank: usize) -> (usize, usize) {
+        (self.kv[..rank].iter().sum(), self.ffn[..rank].iter().sum())
+    }
+}
+
+fn tp_layout(
+    config: &GenericTransformerConfig,
+    weights: &[f64],
+    output_block: usize,
+    down_block: usize,
+) -> std::result::Result<TpLayout, String> {
+    let (heads, kv, hd, ffn) = (
+        config.n_head,
+        config.n_kv_head,
+        config.head_dim,
+        config.ffn_dim,
+    );
+    if kv == 0 || heads % kv != 0 {
+        return Err(format!("{heads} heads over {kv} kv heads"));
+    }
+    let group = heads / kv;
+    let gcd = |mut a: usize, mut b: usize| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let kv_unit = output_block / gcd(group * hd, output_block);
+    if kv % kv_unit != 0 || ffn % down_block != 0 {
+        return Err(format!(
+            "{kv} kv heads or {ffn} rows do not fall on the weights' blocks"
+        ));
+    }
+    let share = |units: usize, unit: usize| {
+        crate::inference::place::tensor_parallel::shares(weights, units)
+            .map(|s| s.into_iter().map(|n| n * unit).collect::<Vec<_>>())
+    };
+    match (
+        share(kv / kv_unit, kv_unit),
+        share(ffn / down_block, down_block),
+    ) {
+        (Some(kv), Some(ffn)) => Ok(TpLayout { kv, ffn, group }),
+        _ => Err(format!(
+            "{kv} kv heads or {ffn} rows do not give every one of {} cards a share",
+            weights.len()
+        )),
+    }
 }
 
 /// Why the layer `raw` cannot be split into `ranks` tensor-parallel shares, or `None` when it
@@ -747,22 +804,11 @@ fn tp_refusal(
     if let Some((_, why)) = reasons.iter().find(|(refused, _)| *refused) {
         return Some((*why).to_string());
     }
-    let (heads, kv, hd, ffn) = (
-        config.n_head,
-        config.n_kv_head,
-        config.head_dim,
-        config.ffn_dim,
+    let (o, d) = (
+        raw.attn_output.dtype().block_size(),
+        raw.ffn_down.dtype().block_size(),
     );
-    if heads % ranks != 0 || kv % ranks != 0 || ffn % ranks != 0 {
-        return Some(format!(
-            "{heads} heads, {kv} kv heads or {ffn} wide do not divide by {ranks}"
-        ));
-    }
-    let on_blocks = |qt: &QTensor, cols: usize| cols.is_multiple_of(qt.dtype().block_size());
-    if !on_blocks(&raw.attn_output, heads / ranks * hd) || !on_blocks(&raw.ffn_down, ffn / ranks) {
-        return Some("a share's columns do not fall on the weights' blocks".to_string());
-    }
-    None
+    tp_layout(config, &vec![1.0; ranks], o, d).err()
 }
 
 /// The share of rank `rank` of `ranks` of `raw`: q, k, v and the feed-forward's gate and up cut
@@ -771,37 +817,44 @@ fn tp_refusal(
 fn tp_share(
     raw: &RawGenericLayer,
     config: &GenericTransformerConfig,
+    layout: &TpLayout,
     rank: usize,
-    ranks: usize,
 ) -> Result<RawGenericLayer> {
     let host = |qt: &QTensor| QTensor::from_native(qt.native_qtensor().clone(), &Device::Cpu);
     let whole = |qt: &Option<QTensor>| qt.as_ref().map(host).transpose();
-    let rows = |qt: &QTensor, per: usize| -> Result<QTensor> {
-        crate::tensor::quant_view::rows_view(&std::sync::Arc::new(host(qt)?), rank * per, per)
+    let rows = |qt: &QTensor, (from, per): (usize, usize)| -> Result<QTensor> {
+        crate::tensor::quant_view::rows_view(&std::sync::Arc::new(host(qt)?), from, per)
     };
-    let rows_opt = |qt: &Option<QTensor>, per: usize| qt.as_ref().map(|q| rows(q, per)).transpose();
-    let columns =
-        |qt: &QTensor, per: usize| crate::tensor::quant_view::columns_copy(qt, rank * per, per);
-    let vector = |qt: &Option<QTensor>, per: usize| -> Result<Option<QTensor>> {
+    let rows_opt = |qt: &Option<QTensor>, range: (usize, usize)| {
+        qt.as_ref().map(|q| rows(q, range)).transpose()
+    };
+    let columns = |qt: &QTensor, (from, per): (usize, usize)| {
+        crate::tensor::quant_view::columns_copy(qt, from, per)
+    };
+    let vector = |qt: &Option<QTensor>, (from, per): (usize, usize)| -> Result<Option<QTensor>> {
         qt.as_ref()
             .map(|q| {
                 // CONVERSION: a bias is a small vector, read as F32 to take a share's slice of it.
-                let v = q.dequantize(&Device::Cpu)?.narrow(0, rank * per, per)?;
+                let v = q.dequantize(&Device::Cpu)?.narrow(0, from, per)?;
                 QTensor::quantize_onto(&v, crate::tensor::quantized::GgmlDType::F32, &Device::Cpu)
             })
             .transpose()
     };
     let first = |qt: &Option<QTensor>| if rank == 0 { whole(qt) } else { Ok(None) };
-    let (q_per, kv_per) = (
-        config.n_head / ranks * config.head_dim,
-        config.n_kv_head / ranks * config.head_dim,
+    let hd = config.head_dim;
+    let (kv_from, ffn_from) = layout.offsets(rank);
+    let q_rows = (
+        kv_from * layout.group * hd,
+        layout.kv[rank] * layout.group * hd,
     );
-    let ffn_per = config.ffn_dim / ranks;
+    let kv_rows = (kv_from * hd, layout.kv[rank] * hd);
+    let ffn_rows = (ffn_from, layout.ffn[rank]);
+    let (q_per, kv_per, ffn_per) = (q_rows, kv_rows, ffn_rows);
     Ok(RawGenericLayer {
         layer_idx: raw.layer_idx,
         device_kind: raw.device_kind,
-        q_out_dim: raw.q_out_dim.map(|d| d / ranks),
-        k_out_dim: raw.k_out_dim.map(|d| d / ranks),
+        q_out_dim: raw.q_out_dim.map(|_| q_rows.1),
+        k_out_dim: raw.k_out_dim.map(|_| kv_rows.1),
         attn_q: rows_opt(&raw.attn_q, q_per)?,
         attn_k: rows_opt(&raw.attn_k, kv_per)?,
         attn_v: rows_opt(&raw.attn_v, kv_per)?,
@@ -854,12 +907,16 @@ fn tp_share(
     })
 }
 
-/// The configuration a share of `ranks` builds with: its heads and feed-forward width.
-fn tp_share_config(config: &GenericTransformerConfig, ranks: usize) -> GenericTransformerConfig {
+/// The configuration rank `rank`'s share builds with: its heads and feed-forward width.
+fn tp_share_config(
+    config: &GenericTransformerConfig,
+    layout: &TpLayout,
+    rank: usize,
+) -> GenericTransformerConfig {
     let mut share = config.clone();
-    share.n_head /= ranks;
-    share.n_kv_head /= ranks;
-    share.ffn_dim /= ranks;
+    share.n_kv_head = layout.kv[rank];
+    share.n_head = layout.kv[rank] * layout.group;
+    share.ffn_dim = layout.ffn[rank];
     share
 }
 
@@ -2980,7 +3037,7 @@ impl GenericHeteroTransformer {
                 DeviceKind::Cuda(i) => Some(i),
                 _ => None,
             })
-            .chain(plan.tp_cards.iter().flatten().copied())
+            .chain(plan.tp_cards.iter().flatten().map(|c| c.index))
             .collect();
         for (&idx, dev) in cuda_devices.iter() {
             if !planned_cuda.contains(&idx) {
@@ -3618,13 +3675,22 @@ impl GenericHeteroTransformer {
                     Some(why) => tracing::info!("layer {layer_idx} runs whole: {why}"),
                     None => {
                         let ranks = cards.len();
-                        let share_config = tp_share_config(&config, ranks);
-                        let share_flags = Arc::new(GenericLayerFlags {
-                            intermediate_size: flags.intermediate_size / ranks,
-                            ..(*flags).clone()
-                        });
+                        let weights: Vec<f64> = cards.iter().map(|c| c.weight).collect();
+                        let layout = tp_layout(
+                            &config,
+                            &weights,
+                            raw.attn_output.dtype().block_size(),
+                            raw.ffn_down.dtype().block_size(),
+                        )
+                        .map_err(crate::tensor::Error::msg)?;
                         let mut shares = Vec::with_capacity(ranks);
-                        for (rank, &card) in cards.iter().enumerate() {
+                        for (rank, card) in cards.iter().enumerate() {
+                            let card = card.index;
+                            let share_config = tp_share_config(&config, &layout, rank);
+                            let share_flags = Arc::new(GenericLayerFlags {
+                                intermediate_size: layout.ffn[rank],
+                                ..(*flags).clone()
+                            });
                             let dev = cuda_devices.get(&card).ok_or_else(|| {
                                 crate::tensor::Error::msg(format!(
                                     "card {card} of the tensor-parallel group is not open"
@@ -3637,10 +3703,10 @@ impl GenericHeteroTransformer {
                                     ))
                                 })?;
                             shares.push(build_generic_layer(
-                                tp_share(&raw, &config, rank, ranks)?,
+                                tp_share(&raw, &config, &layout, rank)?,
                                 dev,
                                 &share_config,
-                                share_flags.clone(),
+                                share_flags,
                                 cos,
                                 sin,
                                 &layer_ropes,
@@ -3650,7 +3716,7 @@ impl GenericHeteroTransformer {
                         let mut owner = shares.remove(0);
                         owner.tp_shards = shares;
                         source.release_layer_pages(layer_idx);
-                        return Ok((owner, LayerDevice::Cuda(cards[0])));
+                        return Ok((owner, LayerDevice::Cuda(cards[0].index)));
                     }
                 }
             }
