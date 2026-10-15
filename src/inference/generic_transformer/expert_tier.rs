@@ -400,6 +400,165 @@ fn lent_experts(host: &Arc<QTensor>, n: usize, dev: &Device) -> Result<QTensor> 
 }
 
 impl super::GenericHeteroTransformer {
+    /// The room each card has left for experts after the load: the plan's budget for it, less
+    /// what the load took of it since `free_before` and less the draft head's experts when it
+    /// keeps them there.
+    fn expert_room(
+        &self,
+        ordinal: usize,
+        dev: &Device,
+        plan: &crate::inference::place::layer_executor::HeteroPlan,
+        free_before: &std::collections::HashMap<usize, u64>,
+        draft_resident: bool,
+    ) -> u64 {
+        use crate::inference::place::{expert_cache, layer_executor::DeviceKind};
+        let budget = plan
+            .segments
+            .iter()
+            .filter(|s| s.kind == DeviceKind::Cuda(ordinal))
+            .map(|s| s.free_memory_bytes)
+            .max()
+            .unwrap_or(0);
+        let draft = self
+            .draft
+            .as_ref()
+            .filter(|_| draft_resident)
+            .filter(|d| d.layer_dev == super::LayerDevice::Cuda(ordinal))
+            .and_then(|d| d.layer.moe.as_ref())
+            .filter(|m| m.experts_on_host() && serves(m))
+            .map_or(0, |m| (expert_bytes(m) * m.n_experts) as u64);
+        let before = free_before.get(&ordinal).copied().unwrap_or(0);
+        let used = before.saturating_sub(expert_cache::free_now(dev));
+        budget.saturating_sub(draft).saturating_sub(used)
+    }
+
+    /// Before any card caches the experts the plan left on the host: when the cards together
+    /// have room for every one of them, each such layer's experts go to the cards whole, split
+    /// across them where that is predicted faster than its own card alone, else on its own
+    /// card. The layers this does not place are cached as before.
+    fn split_host_experts(
+        &mut self,
+        cuda_devices: &std::collections::HashMap<usize, Device>,
+        plan: &crate::inference::place::layer_executor::HeteroPlan,
+        free_before: &std::collections::HashMap<usize, u64>,
+        draft_resident: bool,
+    ) -> Result<()> {
+        use super::LayerDevice;
+        use crate::inference::generic_transformer::moe_weights::ExpertShard;
+        use crate::inference::place::expert_parallel::{split_experts, ExpertLayer, ShardCard};
+        if cuda_devices.len() < 2 {
+            return Ok(());
+        }
+        let candidates: Vec<(usize, usize)> = (0..self.layers.len())
+            .filter_map(|l| match self.layer_devs[l] {
+                LayerDevice::Cuda(o) => Some((l, o)),
+                _ => None,
+            })
+            .filter(|&(l, _)| {
+                self.layers[l].moe.as_ref().is_some_and(|m| {
+                    m.experts_on_host() && serves(m) && m.shards.is_empty() && m.tier.is_none()
+                })
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let mut ordinals: Vec<usize> = cuda_devices.keys().copied().collect();
+        ordinals.sort_unstable();
+        let mut room: std::collections::HashMap<usize, u64> = ordinals
+            .iter()
+            .map(|&o| {
+                (
+                    o,
+                    self.expert_room(o, &cuda_devices[&o], plan, free_before, draft_resident),
+                )
+            })
+            .collect();
+        let need: u64 = candidates
+            .iter()
+            .filter_map(|&(l, _)| self.layers[l].moe.as_ref())
+            .map(|m| (expert_bytes(m) * m.n_experts) as u64)
+            .sum();
+        if need > room.values().sum::<u64>() {
+            return Ok(());
+        }
+        let read = crate::inference::place::expert_parallel::card_read_rates();
+        for (l, owner) in candidates {
+            let moe = self.layers[l]
+                .moe
+                .as_ref()
+                .expect("a candidate has experts");
+            let layer = ExpertLayer {
+                n_experts: moe.n_experts,
+                used: moe.n_experts_used,
+                expert_bytes: expert_bytes(moe) as u64,
+                row_bytes: (moe.down_exps.shape().dims()[1] * std::mem::size_of::<f32>()) as u64,
+            };
+            let mut cards = vec![ShardCard {
+                index: owner,
+                read_bytes_per_us: read.get(&owner).copied().unwrap_or(0.0),
+                link_us: 0.0,
+                link_bytes_per_us: f64::INFINITY,
+                room: room[&owner],
+            }];
+            for &o in ordinals.iter().filter(|&&o| o != owner) {
+                if let Some((us, rate)) =
+                    crate::inference::place::device_probe::card_pair_link(owner, o)
+                {
+                    cards.push(ShardCard {
+                        index: o,
+                        read_bytes_per_us: read.get(&o).copied().unwrap_or(0.0),
+                        link_us: us,
+                        link_bytes_per_us: rate,
+                        room: room[&o],
+                    });
+                }
+            }
+            if cards.iter().any(|c| c.read_bytes_per_us <= 0.0) {
+                continue;
+            }
+            let all = layer.n_experts as u64 * layer.expert_bytes;
+            match split_experts(&layer, &cards, 1) {
+                Some(counts) => {
+                    let mut shards = Vec::new();
+                    let mut first = 0usize;
+                    for (card, &count) in cards.iter().zip(&counts).filter(|(_, &c)| c > 0) {
+                        shards.push(ExpertShard::from_host(
+                            moe,
+                            first,
+                            count,
+                            &cuda_devices[&card.index],
+                        )?);
+                        *room.get_mut(&card.index).expect("a known card") -=
+                            count as u64 * layer.expert_bytes;
+                        first += count;
+                    }
+                    tracing::info!(
+                        "expert parallel: layer {l} split over cards {:?} as {:?} experts",
+                        cards.iter().map(|c| c.index).collect::<Vec<_>>(),
+                        counts
+                    );
+                    self.layers[l]
+                        .moe
+                        .as_mut()
+                        .expect("a candidate has experts")
+                        .shards = shards;
+                }
+                None if room[&owner] >= all => {
+                    let dev = &cuda_devices[&owner];
+                    let moe = self.layers[l]
+                        .moe
+                        .as_mut()
+                        .expect("a candidate has experts");
+                    moe.tier = Some(Arc::new(LayerTier::all_on_card(moe, dev)?));
+                    *room.get_mut(&owner).expect("a known card") -= all;
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Give every layer whose experts the plan left on the host a cache of them on its card:
     /// `slots` takes what each card has left of its budget, `free_before` being what the card
     /// had free before the load.
@@ -412,6 +571,7 @@ impl super::GenericHeteroTransformer {
     ) -> Result<()> {
         use super::LayerDevice;
         use crate::inference::place::{expert_cache, layer_executor::DeviceKind};
+        self.split_host_experts(cuda_devices, plan, free_before, draft_resident)?;
         // Locked pages cannot be reclaimed: the cards share what the host can give.
         let mut pin_left = expert_cache::host_pin_budget();
         let mut ordinals: Vec<_> = cuda_devices.keys().copied().collect();
@@ -421,10 +581,9 @@ impl super::GenericHeteroTransformer {
             let tiered: Vec<usize> = (0..self.layers.len())
                 .filter(|&l| self.layer_devs[l] == LayerDevice::Cuda(ordinal))
                 .filter(|&l| {
-                    self.layers[l]
-                        .moe
-                        .as_ref()
-                        .is_some_and(|m| m.experts_on_host() && serves(m))
+                    self.layers[l].moe.as_ref().is_some_and(|m| {
+                        m.experts_on_host() && serves(m) && m.shards.is_empty() && m.tier.is_none()
+                    })
                 })
                 .collect();
             let Some(&first) = tiered.first() else {

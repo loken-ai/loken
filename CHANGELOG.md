@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Expert parallelism: a layer's experts split across cards where measured links make it pay.
 - CPU: AVX-512 kernels for attention, the KV cache and elementwise ops.
 - CPU: AVX-512 kernels for the quantized GEMMs and dots.
 - CPU: the SIMD level is chosen at start and capped by the cpu level setting.

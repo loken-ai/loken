@@ -193,6 +193,66 @@ fn primary_ctx_active(_ordinal: usize) -> bool {
     false
 }
 
+/// What a message from card `from` to card `to` costs on the path tensors take between them (a
+/// peer copy, else through host memory): microseconds for a small one and bytes per microsecond
+/// beyond it, measured once a pair. `None` when either card cannot be opened.
+#[cfg(feature = "cuda")]
+pub fn card_pair_link(from: usize, to: usize) -> Option<(f64, f64)> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static LINKS: OnceLock<Mutex<HashMap<(usize, usize), Option<(f64, f64)>>>> = OnceLock::new();
+    let links = LINKS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = links
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(from, to))
+    {
+        return *known;
+    }
+    let measured = (|| -> Option<(f64, f64)> {
+        let (src, dst) = (
+            crate::tensor::Device::new_cuda(from).ok()?,
+            crate::tensor::Device::new_cuda(to).ok()?,
+        );
+        // A row of activations and a block far larger than any latency.
+        let (small, large) = (4096usize, 8usize << 20);
+        let time = |elems: usize, times: usize| -> Option<f64> {
+            let t = crate::tensor::Tensor::from_vec(vec![0f32; elems], elems, &src).ok()?;
+            src.synchronize().ok()?;
+            let mut runs: Vec<f64> = (0..times)
+                .filter_map(|_| {
+                    let start = std::time::Instant::now();
+                    t.to_device(&dst).ok()?;
+                    dst.synchronize().ok()?;
+                    Some(start.elapsed().as_secs_f64() * 1e6)
+                })
+                .collect();
+            runs.sort_by(f64::total_cmp);
+            runs.get(runs.len() / 2).copied()
+        };
+        // The first copy of a pair opens its path; it is not timed.
+        time(small, 1)?;
+        let small_us = time(small, 9)?;
+        let large_us = time(large, 3)?;
+        let bytes = ((large - small) * 4) as f64;
+        Some((
+            small_us,
+            bytes / (large_us - small_us).max(f64::MIN_POSITIVE),
+        ))
+    })();
+    if let Some((us, rate)) = measured {
+        tracing::info!(
+            "card link {from} -> {to}: {us:.1} us a small message, {:.1} GB/s",
+            rate * 1e6 / 1e9
+        );
+    }
+    links
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((from, to), measured);
+    measured
+}
+
 pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
     let mut gpu_info: Vec<CudaGpuInfo> = Vec::new();
     match nvml_wrapper::Nvml::init() {

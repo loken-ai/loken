@@ -8,6 +8,14 @@
 //! together faster than one card reads them all, the activation's trip out and the products'
 //! trip back included. A machine whose links are slow next to its cards' memory gets no split.
 
+/// Bytes per microsecond each card reads its own memory at, by ordinal.
+pub fn card_read_rates() -> std::collections::HashMap<usize, f64> {
+    super::device_probe::probe_cuda_gpus()
+        .iter()
+        .map(|g| (g.index, g.mem_bw_gbs * 1e3))
+        .collect()
+}
+
 /// A card a layer's experts may be split onto, as the layer's own card sees it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShardCard {
