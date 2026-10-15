@@ -105,6 +105,7 @@ can delete models. Turn both on in `config.toml` before it listens on anything b
 - [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) - measurements against other engines and the
   protocol that makes the comparison fair, including the cells where this engine loses
 - [`docs/CLUSTER.md`](docs/CLUSTER.md) - spreading work across more than one machine
+- [`ROADMAP.md`](ROADMAP.md) - what the next releases bring, and the state of each feature
 
 ## Contributing and reporting
 
