@@ -76,6 +76,8 @@ mod state_cache_tests;
 #[cfg(test)]
 pub(crate) mod tiny_model;
 #[cfg(all(test, feature = "cuda"))]
+mod tp_tests;
+#[cfg(all(test, feature = "cuda"))]
 mod verify_decode_parity;
 mod verify_window;
 mod wide;
@@ -152,6 +154,10 @@ pub struct GenericTransformerLayer {
     /// Gemma4-MoE only: every layer has BOTH the dense FFN above AND
     /// an MoE block. When `Some`, run shared dense + MoE and add.
     pub moe: Option<MoeWeights>,
+    /// The shares of this layer's heads and feed-forward on the other cards of a tensor-parallel
+    /// group, each an ordinary layer of its own width; this layer holds the first share and sums
+    /// theirs into its own. Empty when the layer runs whole on its device.
+    pub tp_shards: Vec<GenericTransformerLayer>,
     /// Pre-norm before the MoE block (Gemma4 26B has it as a separate
     /// `pre_ffw_norm_2` tensor on top of the standard `ffn_norm`).
     pub pre_ffw_norm_2: Option<RmsNorm>,
@@ -617,3 +623,12 @@ impl std::fmt::Debug for GenericHeteroTransformer {
 }
 
 unsafe impl Send for GenericHeteroTransformer {}
+
+/// `own` plus every partial output of a tensor-parallel layer's other shares, brought to `own`'s
+/// device once all of them were launched.
+pub(super) fn tp_sum(own: Tensor, parts: Vec<Tensor>) -> crate::tensor::Result<Tensor> {
+    let dev = own.device();
+    parts
+        .into_iter()
+        .try_fold(own, |sum, part| sum + part.to_device(&dev)?)
+}

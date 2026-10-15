@@ -112,6 +112,7 @@ pub fn describe_plan(plan: &HeteroPlan) -> String {
 /// All `total_layers` blocks on one card.
 pub fn whole_on(total_layers: usize, idx: usize, free: u64) -> HeteroPlan {
     HeteroPlan {
+        tp_cards: None,
         segments: vec![HeteroSegment {
             kind: DeviceKind::Cuda(idx),
             layer_start: 0,
@@ -175,6 +176,7 @@ fn segments_from(counts: &[usize], cards: &[(usize, u64)], total_layers: usize) 
         at += count;
     }
     HeteroPlan {
+        tp_cards: None,
         segments,
         total_layers,
         host_experts_from: None,

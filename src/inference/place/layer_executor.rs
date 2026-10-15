@@ -92,6 +92,9 @@ impl HeteroSegment {
 #[derive(Debug, Clone)]
 pub struct HeteroPlan {
     pub segments: Vec<HeteroSegment>,
+    /// The cards that split every dense layer's heads and feed-forward between them, the
+    /// layers' own card first; `None` when each layer runs on one device.
+    pub tp_cards: Option<Vec<usize>>,
     pub total_layers: usize,
     /// Layers from this index on keep their routed experts in host memory while the rest of
     /// each layer runs on the device its segment names. `None` when every expert sits with
@@ -117,6 +120,7 @@ impl HeteroPlan {
     /// `[from, from + n)` of a stack of `total` layers.
     pub fn shifted(&self, from: usize, total: usize) -> Self {
         Self {
+            tp_cards: self.tp_cards.clone(),
             segments: self
                 .segments
                 .iter()
@@ -476,6 +480,7 @@ impl HeteroPlan {
                 fill(from)?
             };
             Some(HeteroPlan {
+                tp_cards: None,
                 segments,
                 total_layers,
                 host_experts_from: (from < total_layers).then_some(from),
@@ -584,6 +589,7 @@ impl HeteroPlan {
                 }];
                 info!("HeteroPlan: 1 segment: {}:0-{}", best_kind, total_layers);
                 return HeteroPlan {
+                    tp_cards: None,
                     segments,
                     total_layers,
                     host_experts_from: None,
@@ -871,6 +877,7 @@ impl HeteroPlan {
         );
 
         HeteroPlan {
+            tp_cards: None,
             segments,
             total_layers,
             host_experts_from: None,
@@ -912,6 +919,7 @@ impl HeteroPlan {
             total_layers - gpu_layers
         );
         HeteroPlan {
+            tp_cards: None,
             segments,
             total_layers,
             host_experts_from: None,
@@ -972,6 +980,7 @@ impl HeteroPlan {
     ) -> Self {
         if cuda_devices.is_empty() || total_layers == 0 {
             return HeteroPlan {
+                tp_cards: None,
                 segments: Vec::new(),
                 total_layers,
                 host_experts_from: None,
@@ -1042,6 +1051,7 @@ impl HeteroPlan {
                 .join(", ")
         );
         HeteroPlan {
+            tp_cards: None,
             segments,
             total_layers,
             host_experts_from: None,

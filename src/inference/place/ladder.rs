@@ -232,6 +232,7 @@ impl Demand {
             return plan;
         }
         HeteroPlan {
+            tp_cards: None,
             segments: vec![
                 HeteroSegment {
                     kind: DeviceKind::Cuda(slow),
@@ -592,6 +593,7 @@ fn beside_host(plan: HeteroPlan, demand: &Demand, accelerators: &[(usize, u64)])
         }));
     }
     HeteroPlan {
+        tp_cards: None,
         segments,
         total_layers: plan.total_layers,
         host_experts_from: plan.host_experts_from,
@@ -1050,6 +1052,7 @@ mod tests {
         };
         let cards = [(0usize, 16 * GB), (1usize, 14 * GB)];
         let even = HeteroPlan {
+            tp_cards: None,
             segments: vec![
                 HeteroSegment {
                     kind: DeviceKind::Cuda(0),

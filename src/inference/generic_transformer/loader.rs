@@ -656,6 +656,154 @@ pub(crate) fn moe_stack_served_as_stored(
     }
 }
 
+/// Why the layer `raw` cannot be split into `ranks` tensor-parallel shares, or `None` when it
+/// can: an attention layer with separate q, k and v, a dense feed-forward, and heads and widths
+/// that divide among the ranks on the blocks of their weights.
+fn tp_refusal(
+    raw: &RawGenericLayer,
+    config: &GenericTransformerConfig,
+    ranks: usize,
+) -> Option<String> {
+    let reasons = [
+        (
+            !matches!(raw.mixer, RawMixer::Attention),
+            "a mixer other than attention",
+        ),
+        (
+            raw.attn_q.is_none() || raw.attn_k.is_none() || raw.attn_v.is_none(),
+            "no separate q, k and v",
+        ),
+        (raw.attn_qkv.is_some(), "a fused q, k and v projection"),
+        (raw.moe_gate_inp.is_some(), "routed experts"),
+        (raw.shexp_up.is_some(), "a shared expert"),
+        (raw.ple_proj.is_some(), "per-layer inputs"),
+        (
+            raw.wide.attn_mixer.is_some() || raw.wide.ffn_mixer.is_some(),
+            "a wide residual",
+        ),
+        (raw.attn_gate.is_some(), "an attention output gate"),
+        (raw.attn_sinks_qt.is_some(), "attention sinks"),
+        (raw.ffn_up_bias_qt.is_some(), "a feed-forward up bias"),
+    ];
+    if let Some((_, why)) = reasons.iter().find(|(refused, _)| *refused) {
+        return Some((*why).to_string());
+    }
+    let (heads, kv, hd, ffn) = (
+        config.n_head,
+        config.n_kv_head,
+        config.head_dim,
+        config.ffn_dim,
+    );
+    if heads % ranks != 0 || kv % ranks != 0 || ffn % ranks != 0 {
+        return Some(format!(
+            "{heads} heads, {kv} kv heads or {ffn} wide do not divide by {ranks}"
+        ));
+    }
+    let on_blocks = |qt: &QTensor, cols: usize| cols.is_multiple_of(qt.dtype().block_size());
+    if !on_blocks(&raw.attn_output, heads / ranks * hd) || !on_blocks(&raw.ffn_down, ffn / ranks) {
+        return Some("a share's columns do not fall on the weights' blocks".to_string());
+    }
+    None
+}
+
+/// The share of rank `rank` of `ranks` of `raw`: q, k, v and the feed-forward's gate and up cut
+/// by rows, the attention output and the feed-forward's down cut by columns, the norms whole, the
+/// output biases on the first rank alone. [`tp_refusal`] said the layer splits.
+fn tp_share(
+    raw: &RawGenericLayer,
+    config: &GenericTransformerConfig,
+    rank: usize,
+    ranks: usize,
+) -> Result<RawGenericLayer> {
+    let host = |qt: &QTensor| QTensor::from_native(qt.native_qtensor().clone(), &Device::Cpu);
+    let whole = |qt: &Option<QTensor>| qt.as_ref().map(host).transpose();
+    let rows = |qt: &QTensor, per: usize| -> Result<QTensor> {
+        crate::tensor::quant_view::rows_view(&std::sync::Arc::new(host(qt)?), rank * per, per)
+    };
+    let rows_opt = |qt: &Option<QTensor>, per: usize| qt.as_ref().map(|q| rows(q, per)).transpose();
+    let columns =
+        |qt: &QTensor, per: usize| crate::tensor::quant_view::columns_copy(qt, rank * per, per);
+    let vector = |qt: &Option<QTensor>, per: usize| -> Result<Option<QTensor>> {
+        qt.as_ref()
+            .map(|q| {
+                // CONVERSION: a bias is a small vector, read as F32 to take a share's slice of it.
+                let v = q.dequantize(&Device::Cpu)?.narrow(0, rank * per, per)?;
+                QTensor::quantize_onto(&v, crate::tensor::quantized::GgmlDType::F32, &Device::Cpu)
+            })
+            .transpose()
+    };
+    let first = |qt: &Option<QTensor>| if rank == 0 { whole(qt) } else { Ok(None) };
+    let (q_per, kv_per) = (
+        config.n_head / ranks * config.head_dim,
+        config.n_kv_head / ranks * config.head_dim,
+    );
+    let ffn_per = config.ffn_dim / ranks;
+    Ok(RawGenericLayer {
+        layer_idx: raw.layer_idx,
+        device_kind: raw.device_kind,
+        q_out_dim: raw.q_out_dim.map(|d| d / ranks),
+        k_out_dim: raw.k_out_dim.map(|d| d / ranks),
+        attn_q: rows_opt(&raw.attn_q, q_per)?,
+        attn_k: rows_opt(&raw.attn_k, kv_per)?,
+        attn_v: rows_opt(&raw.attn_v, kv_per)?,
+        attn_qkv: None,
+        attn_q_bias: vector(&raw.attn_q_bias, q_per)?,
+        attn_k_bias: vector(&raw.attn_k_bias, kv_per)?,
+        attn_v_bias: vector(&raw.attn_v_bias, kv_per)?,
+        attn_q_norm_qt: whole(&raw.attn_q_norm_qt)?,
+        attn_k_norm_qt: whole(&raw.attn_k_norm_qt)?,
+        attn_output: columns(&raw.attn_output, q_per)?,
+        attn_output_bias_qt: first(&raw.attn_output_bias_qt)?,
+        attn_sinks_qt: None,
+        attn_norm_qt: whole(&raw.attn_norm_qt)?,
+        attn_norm_bias_qt: whole(&raw.attn_norm_bias_qt)?,
+        post_attn_norm_qt: whole(&raw.post_attn_norm_qt)?,
+        ffn_norm_qt: whole(&raw.ffn_norm_qt)?,
+        post_ffn_norm_qt: whole(&raw.post_ffn_norm_qt)?,
+        ffn_gate: rows_opt(&raw.ffn_gate, ffn_per)?,
+        ffn_up: rows(&raw.ffn_up, ffn_per)?,
+        ffn_up_bias_qt: None,
+        ffn_down: columns(&raw.ffn_down, ffn_per)?,
+        ffn_down_bias_qt: first(&raw.ffn_down_bias_qt)?,
+        ple_inp_gate: None,
+        ple_proj: None,
+        ple_post_norm_qt: None,
+        ple_output_scale_qt: None,
+        moe_gate_inp: None,
+        moe_gate_inp_scale_qt: None,
+        moe_gate_up_exps: None,
+        moe_down_exps: None,
+        moe_down_exps_scale_qt: None,
+        moe_gate_exps: None,
+        moe_up_exps: None,
+        moe_gate_inp_bias_qt: None,
+        moe_gate_exps_bias_qt: None,
+        moe_up_exps_bias_qt: None,
+        moe_down_exps_bias_qt: None,
+        pre_ffw_norm_2_qt: whole(&raw.pre_ffw_norm_2_qt)?,
+        post_ffw_norm_1_qt: whole(&raw.post_ffw_norm_1_qt)?,
+        post_ffw_norm_2_qt: whole(&raw.post_ffw_norm_2_qt)?,
+        moe_exp_probs_b_qt: None,
+        mixer: RawMixer::Attention,
+        has_ffn: raw.has_ffn,
+        attn_gate: None,
+        shexp_gate: None,
+        shexp_up: None,
+        shexp_down: None,
+        shexp_scalar_gate_qt: None,
+        wide: RawWide::default(),
+    })
+}
+
+/// The configuration a share of `ranks` builds with: its heads and feed-forward width.
+fn tp_share_config(config: &GenericTransformerConfig, ranks: usize) -> GenericTransformerConfig {
+    let mut share = config.clone();
+    share.n_head /= ranks;
+    share.n_kv_head /= ranks;
+    share.ffn_dim /= ranks;
+    share
+}
+
 fn build_generic_layer(
     raw: RawGenericLayer,
     device: &Device,
@@ -1674,6 +1822,7 @@ fn build_generic_layer(
     };
 
     let mut layer = GenericTransformerLayer {
+        tp_shards: Vec::new(),
         mixer,
         has_ffn: raw.has_ffn,
         attn_gate: to_qmatmul(raw.attn_gate)?,
@@ -2166,6 +2315,7 @@ fn build_awq_layer(
     };
 
     Ok(GenericTransformerLayer {
+        tp_shards: Vec::new(),
         mixer: super::mixer::Mixer::Attention,
         has_ffn: true,
         attn_gate: None,
@@ -2771,6 +2921,7 @@ impl GenericHeteroTransformer {
                 DeviceKind::Cuda(i) => Some(i),
                 _ => None,
             })
+            .chain(plan.tp_cards.iter().flatten().copied())
             .collect();
         for (&idx, dev) in cuda_devices.iter() {
             if !planned_cuda.contains(&idx) {
@@ -3401,6 +3552,49 @@ impl GenericHeteroTransformer {
                 .get(&rope_key)
                 .ok_or_else(|| crate::tensor::Error::msg(format!("RoPE cache miss: {rope_key}")))?;
             let layer_idx = raw.layer_idx;
+            // A tensor-parallel plan splits each layer that can be split among its cards, the
+            // first holding the layer; one that cannot runs whole where its segment puts it.
+            if let Some(cards) = plan.tp_cards.as_ref().filter(|c| c.len() > 1) {
+                match tp_refusal(&raw, &config, cards.len()) {
+                    Some(why) => tracing::info!("layer {layer_idx} runs whole: {why}"),
+                    None => {
+                        let ranks = cards.len();
+                        let share_config = tp_share_config(&config, ranks);
+                        let share_flags = Arc::new(GenericLayerFlags {
+                            intermediate_size: flags.intermediate_size / ranks,
+                            ..(*flags).clone()
+                        });
+                        let mut shares = Vec::with_capacity(ranks);
+                        for (rank, &card) in cards.iter().enumerate() {
+                            let dev = cuda_devices.get(&card).ok_or_else(|| {
+                                crate::tensor::Error::msg(format!(
+                                    "card {card} of the tensor-parallel group is not open"
+                                ))
+                            })?;
+                            let (cos, sin) =
+                                rope_cache.get(&format!("cuda_{card}")).ok_or_else(|| {
+                                    crate::tensor::Error::msg(format!(
+                                        "RoPE cache miss: cuda_{card}"
+                                    ))
+                                })?;
+                            shares.push(build_generic_layer(
+                                tp_share(&raw, &config, rank, ranks)?,
+                                dev,
+                                &share_config,
+                                share_flags.clone(),
+                                cos,
+                                sin,
+                                &layer_ropes,
+                                rope_freq_factors.as_ref(),
+                            )?);
+                        }
+                        let mut owner = shares.remove(0);
+                        owner.tp_shards = shares;
+                        source.release_layer_pages(layer_idx);
+                        return Ok((owner, LayerDevice::Cuda(cards[0])));
+                    }
+                }
+            }
             let layer = build_generic_layer(
                 raw,
                 device,

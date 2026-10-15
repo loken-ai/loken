@@ -639,6 +639,7 @@ fn tiny_config() -> Config {
 fn plan_of(spans: &[(usize, usize, usize)], total: usize) -> HeteroPlan {
     use crate::inference::place::layer_executor::HeteroSegment;
     HeteroPlan {
+        tp_cards: None,
         segments: spans
             .iter()
             .map(|(idx, start, end)| HeteroSegment {
@@ -750,6 +751,7 @@ fn a_block_on_the_host_is_weighed_at_the_host_dtype() {
     tiny_checkpoint(&cfg, &path);
     let files = [path.to_str().unwrap()];
     let spilled = HeteroPlan {
+        tp_cards: None,
         segments: vec![
             HeteroSegment {
                 kind: DeviceKind::Cuda(0),

@@ -277,6 +277,9 @@ impl GenericHeteroTransformer {
     /// it is captured: its step reads or writes the host between two kernels.
     pub(super) fn layer_eager_reason(&self, li: usize) -> Option<&'static str> {
         let l = &self.layers[li];
+        if !l.tp_shards.is_empty() {
+            return Some("its heads and feed-forward are split across cards");
+        }
         // A recurrent mixer is recorded only where its step advances the state in place: a
         // recorded step writes the addresses it read.
         if !l.mixer.decodes_in_place(&l.cos.device()) {
@@ -2066,6 +2069,11 @@ impl GenericHeteroTransformer {
                     "context shift: sliding-window layer".to_string(),
                 ));
             }
+            if !layer.tp_shards.is_empty() {
+                return Err(crate::tensor::Error::msg(
+                    "context shift: a layer split across cards".to_string(),
+                ));
+            }
             #[cfg(feature = "cuda")]
             if layer.q4_kv().is_some() {
                 return Err(crate::tensor::Error::msg(
@@ -2101,7 +2109,10 @@ impl GenericHeteroTransformer {
         // restored by re-appending, which stays on the same quant grid. The host q8 cache
         // has no such round-trip and still bars snapshots. A recurrent state cannot be cut
         // to the prefix a KV snapshot is reused at; it is kept by `snapshot_prefix`.
-        self.layers.iter().all(|l| l.cpu_q8_kv.is_none()) && !self.is_recurrent()
+        self.layers
+            .iter()
+            .all(|l| l.cpu_q8_kv.is_none() && l.tp_shards.is_empty())
+            && !self.is_recurrent()
     }
 
     /// Copies the resident KV aside under `tokens`, keeping at most `cap` snapshots: the
@@ -2869,6 +2880,9 @@ fn common_prefix(a: &[u32], b: &[u32]) -> usize {
 impl GenericTransformerLayer {
     /// Cut every cache this layer keeps back to `new_len` positions.
     pub(super) fn trim_kv_to(&mut self, new_len: usize) {
+        for shard in &mut self.tp_shards {
+            shard.trim_kv_to(new_len);
+        }
         self.kv_cache.trim_to(new_len);
         // Keep the Q8 mirror in sync with the F-dtype cache; otherwise
         // speculative-decoding rollbacks leave Q8 with stale draft

@@ -1520,6 +1520,7 @@ impl HeteroFlux {
             segments,
             final_layer,
             plan: HeteroPlan {
+                tp_cards: None,
                 segments: vec![HeteroSegment {
                     kind: match placed {
                         HeteroDevice::Cuda(idx) => DeviceKind::Cuda(idx),

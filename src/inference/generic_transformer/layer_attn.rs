@@ -502,7 +502,28 @@ impl GenericTransformerLayer {
         // safe legacy fallback. Re-enable when validated.
         #[cfg(feature = "cuda")]
         let _ = shared_kv_q8;
-        self.forward_attn_inner(x, mask, index_pos, shared_kv, None, donor_f16)
+        let own = self.forward_attn_inner(x, mask, index_pos, shared_kv, None, donor_f16)?;
+        if self.tp_shards.is_empty() {
+            return Ok(own);
+        }
+        // A tensor-parallel layer: each share attends with its heads and its cache on its card
+        // and projects its heads' slice of the output; the partial outputs sum here.
+        let mut parts = Vec::with_capacity(self.tp_shards.len());
+        for shard in &mut self.tp_shards {
+            let dev = shard.cos.device();
+            let xs = x.to_device(&dev)?;
+            let m = mask.map(|m| m.to_device(&dev)).transpose()?;
+            parts.push(shard.forward_attn(
+                &xs,
+                m.as_ref(),
+                index_pos,
+                None,
+                None,
+                #[cfg(feature = "cuda")]
+                None,
+            )?);
+        }
+        super::tp_sum(own, parts)
     }
 
     /// Variant of forward_attn that takes a pre-computed QKV F32 tensor.
