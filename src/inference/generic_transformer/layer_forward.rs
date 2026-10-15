@@ -574,6 +574,10 @@ impl GenericTransformerLayer {
     /// and extended `padded_mask` before calling this.
     pub fn forward_graph(&mut self, x: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
+        if self.runs_split(x) {
+            return self.forward_split(x, None, None);
+        }
+        #[cfg(feature = "cuda")]
         if self.is_wide() {
             return self.forward_wide_graph(x);
         }
@@ -1444,6 +1448,10 @@ impl GenericTransformerLayer {
         donor_f16: Option<&crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
         #[cfg(feature = "cuda")] shared_kv_q8: Option<&crate::inference::cache::q8_kv::Q8KvCache>,
     ) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if self.runs_split(x) {
+            return self.forward_split(x, mask, Some(index_pos));
+        }
         if self.is_wide() {
             return self.forward_wide(x, mask, index_pos, ple_layer_input);
         }

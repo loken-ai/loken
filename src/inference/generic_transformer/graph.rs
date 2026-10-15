@@ -277,8 +277,8 @@ impl GenericHeteroTransformer {
     /// it is captured: its step reads or writes the host between two kernels.
     pub(super) fn layer_eager_reason(&self, li: usize) -> Option<&'static str> {
         let l = &self.layers[li];
-        if !l.tp_shards.is_empty() {
-            return Some("its heads and feed-forward are split across cards");
+        if !l.tp_shards.is_empty() && l.tp_comms.is_none() {
+            return Some("its shares move their activations through copies to the host");
         }
         // A recurrent mixer is recorded only where its step advances the state in place: a
         // recorded step writes the addresses it read.
@@ -777,49 +777,7 @@ impl GenericHeteroTransformer {
 
     pub fn invalidate_graph_state(&mut self) {
         for l in &mut self.layers {
-            l.padded_mask = None;
-            l.graph_rope_cos = None;
-            l.graph_rope_sin = None;
-            l.graph_kv_pos = None;
-            l.graph_pos_i32 = None;
-            l.graph_attn_qk_buffer = None;
-            l.graph_attn_out_buffer = None;
-            l.graph_attn_proj_buffer = None;
-            l.graph_ffn_up_buffer = None;
-            l.graph_ffn_activated_buffer = None;
-            l.graph_ffn_down_buffer = None;
-            l.graph_phi2_merge_buffer = None;
-            // Reset the FULL set of per-layer stable buffers. A partial
-            // reset left buffers like graph_ffn_gate_out (and the PLE /
-            // norm / scale buffers) pointing at memory that the
-            // graph_alive_tensors.clear() below reclaims, so the next decode
-            // step read a freed pointer through gate = graph_ffn_gate_out
-            // (wild-pointer crash in fused_gelu_mul once the F-dtype KV cache
-            // outgrew the captured mask cap and triggered this teardown).
-            // Clearing every buffer makes the decode path fall back to fresh
-            // tensors after invalidation instead of stale stable buffers.
-            l.graph_q_buffer = None;
-            l.graph_ffn_up_concat_buffer = None;
-            l.graph_post_ffn_norm_buffer = None;
-            l.graph_ple_gate_buffer = None;
-            l.graph_ple_gelu_buffer = None;
-            l.graph_ple_proj_buffer = None;
-            l.graph_ple_final_buffer = None;
-            l.graph_post_attn_norm_buffer = None;
-            l.graph_x_norm_ffn_buffer = None;
-            l.graph_x_norm_attn_buffer = None;
-            l.graph_ple_input_buffer = None;
-            l.graph_ngram_rows = None;
-            l.graph_kv_cap = None;
-            l.graph_attn_mask_added_buffer = None;
-            l.graph_attn_softmax_buffer = None;
-            l.graph_ffn_gate_out = None;
-            l.graph_x_out_scaled = None;
-            l.graph_attn_scaled_buffer = None;
-            // ROOT CAUSE FIX: drop captured-region tensor
-            // lifetime-extension handles so cuMemFree can reclaim
-            // their memory now that the graph is being torn down.
-            l.graph_alive_tensors.clear();
+            clear_layer_graph_state(l);
         }
         self.graph_logits_buffer = None;
         self.graph_hidden_buffer = None;
@@ -834,7 +792,8 @@ impl GenericHeteroTransformer {
         // buffers may grow again and the frozen seq ceiling no longer applies.
         #[cfg(feature = "cuda")]
         for l in &mut self.layers {
-            if let Some(c) = l.quant_kv.as_mut() {
+            let shards = l.tp_shards.iter_mut().filter_map(|s| s.quant_kv.as_mut());
+            for c in l.quant_kv.as_mut().into_iter().chain(shards) {
                 c.clear_graph_captured();
             }
         }
@@ -860,7 +819,13 @@ impl GenericHeteroTransformer {
             .map(|i| self.layer_captured(i))
             .collect();
         for (l, captured) in self.layers.iter_mut().zip(captured) {
-            if let (true, Some(c)) = (captured, l.quant_kv.as_mut()) {
+            if !captured {
+                continue;
+            }
+            if let Some(c) = l.quant_kv.as_mut() {
+                c.mark_graph_captured();
+            }
+            for c in l.tp_shards.iter_mut().filter_map(|s| s.quant_kv.as_mut()) {
                 c.mark_graph_captured();
             }
         }
@@ -880,6 +845,9 @@ impl GenericHeteroTransformer {
             .map(|i| self.layer_captured(i))
             .collect();
         for (l, captured) in self.layers.iter_mut().zip(captured) {
+            for c in l.tp_shards.iter_mut().filter_map(|s| s.quant_kv.as_mut()) {
+                c.set_seq_len_for_graph(len);
+            }
             match l.quant_kv.as_mut() {
                 Some(c) => c.set_seq_len_for_graph(len),
                 // An F-dtype cache the graph writes by device position (a sink layer's, an
@@ -1068,360 +1036,33 @@ impl GenericHeteroTransformer {
             if !self.layer_captured(i) {
                 continue;
             }
-            // A layer's buffers live on the card it runs on.
-            let dev = self.layers[i].cos.device().clone();
-            if self.layers[i].attn_sinks.is_some() || self.layers[i].sparse.is_some() {
-                if let crate::tensor::DeviceLocation::Cuda { gpu_id } = dev.location() {
-                    let layer = &mut self.layers[i];
-                    match (pos_by_card.get(&gpu_id), layer.graph_pos_i32.as_ref()) {
-                        (Some(written), None) => layer.graph_pos_i32 = Some(written.clone()),
-                        (Some(_), Some(_)) => {}
-                        (None, held) => {
-                            let row = Tensor::new(&[pos as i32], &dev)?;
-                            let t = match held {
-                                Some(t) => {
-                                    t.slice_set(&row, 0, 0)?;
-                                    t.clone()
-                                }
-                                None => row.force_contiguous()?,
-                            };
-                            layer.graph_pos_i32 = Some(t.clone());
-                            pos_by_card.insert(gpu_id, t);
-                        }
-                    }
-                }
-            }
-            // RoPE: only update if this layer is the rope-group leader.
-            if rope_group[i] == i {
-                let layer = &mut self.layers[i];
-                layer.update_rope_buffers(pos).map_err(|e| {
-                    crate::tensor::Error::msg(format!("update_rope_buffers layer {i}: {e}"))
-                })?;
-            }
-
-            // Padded mask: only the mask-group leader does alloc/slice_set.
-            if !skip_fdtype_state && mask_group[i] == i {
-                let layer = &mut self.layers[i];
-                let max_kv = layer.kv_cache.max_seq_len_padded();
-                // `pos` writes into mask[..., pos] via slice_set. If the
-                // existing mask is narrower than `pos+1`, slice_set fails.
-                // (kv_cache.max_seq_len_padded() can auto-grow inside
-                // append_padded, but padded_mask doesn't follow - its
-                // captured device pointer is frozen at the original cap.)
-                // Either condition means the captured graph state is
-                // stale; bail so the engine can invalidate the graph and
-                // fall through to the non-graph forward path for the
-                // rest of the request.
-                let mask_width = layer
-                    .padded_mask
-                    .as_ref()
-                    .and_then(|m| m.dim(3).ok())
-                    .unwrap_or(max_kv);
-                // A cache that grew since the mask was made moved its buffers, which a
-                // recorded graph still names.
-                if pos >= mask_width || mask_width != max_kv {
-                    return Err(crate::tensor::Error::msg(format!(
-                        "graph_state: pos {} >= padded_mask width {} (kv_cache cap {}, layer {}). \
-                         Caller should invalidate the captured graph.",
-                        pos, mask_width, max_kv, i
-                    )));
-                }
-                if layer.padded_mask.is_none() {
-                    let mut data = vec![f32::NEG_INFINITY; max_kv];
-                    // First (pos + 1) entries: visible (mask = 0); rest stays -INF.
-                    data[..=pos].fill(0.0);
-                    layer.padded_mask = Some(
-                        Tensor::new(&data[..], &dev)?
-                            .reshape((1, 1, 1, max_kv))?
-                            .force_contiguous()?,
-                    );
-                } else {
-                    let mask = layer.padded_mask.as_ref().unwrap();
-                    let zero =
-                        Tensor::zeros_on((1, 1, 1, 1), crate::tensor::DType::F32, &mask.device())?;
-                    mask.slice_set(&zero, 3, pos).map_err(|e| {
-                        crate::tensor::Error::msg(format!(
-                            "padded_mask slice_set layer {i} pos={pos}: {e}"
-                        ))
-                    })?;
-                }
-            }
-
-            // Graph KV pos: same leader-only pattern.
-            if !skip_fdtype_state && kv_pos_group[i] == i {
-                let layer = &mut self.layers[i];
-                let kv_shape = (1usize, layer.n_kv_head, 1usize, layer.head_dim);
-                let numel = layer.n_kv_head * layer.head_dim;
-                let filled_cpu = Tensor::from_vec(vec![pos as i64; numel], kv_shape, &Device::Cpu)?;
-                if layer.graph_kv_pos.is_none() {
-                    layer.graph_kv_pos = Some(filled_cpu.to_device(&dev)?);
-                } else {
-                    let filled_gpu = filled_cpu.to_device(&dev)?;
-                    layer
-                        .graph_kv_pos
-                        .as_ref()
-                        .unwrap()
-                        .slice_set(&filled_gpu, 0, 0)?;
-                }
-            }
-
-            // Each quantised cache names the slot this replay writes (its own device
-            // position; the copy is skipped when the slot has not changed).
-            #[cfg(feature = "cuda")]
-            if let Some(c) = self.layers[i].quant_kv.as_mut() {
-                c.update_graph_state(pos).map_err(|e| {
-                    crate::tensor::Error::msg(format!(
-                        "KV update_graph_state layer {i} pos={pos}: {e}"
-                    ))
-                })?;
-            }
-
-            // Persistent attention intermediates for the GQA fast path
-            // under graph mode. Allocate once on first call; subsequent
-            // calls leave them in place (slice_set wiring in
-            // padded_standard_attention writes into them).
-            //
-            // Two shape variants:
-            //   1. GQA fast path (n_rep > 1, q[2]==1):
-            //      qk:  [1, n_kv_head, n_rep, max_kv]
-            //      out: [1, n_kv_head, n_rep, head_dim]
-            //   2. Non-GQA fallback (n_rep == 1, q[2]==1):
-            //      qk:  [1, n_head, 1, max_kv]
-            //      out: [1, n_head, 1, head_dim]
-            //
-            // Previously only allocated for variant 1 when HD>256
-            // (gemma4:latest Global). Extended to also
-            // allocate for variant 2 (moondream/phi2-style models with
-            // no GQA) - those were silently allocating fresh per call
-            // and causing CUDA_ERROR_ILLEGAL_ADDRESS at first replay.
-            //
-            // For moondream (n_head=24, n_kv_head=24, HD=64, max_kv=2048):
-            //   qk:  1 x 24 x 1 x 2048 x 4 = 192 KB / layer
-            //   out: 1 x 24 x 1 x 64 x 4   =   6 KB / layer
-            // x 24 layers ≈ 4.8 MB total.
-            let layer_ref = &self.layers[i];
-            let n_rep = layer_ref.n_head / layer_ref.n_kv_head;
-            let needs_attn_buffers = (n_rep > 1 && layer_ref.head_dim > 256) || n_rep == 1;
-            if needs_attn_buffers {
-                let layer = &mut self.layers[i];
-                let max_kv = layer.kv_cache.max_seq_len_padded();
-                let hd = layer.head_dim;
-                let (qk_shape, out_shape) = if n_rep > 1 {
-                    let n_kv = layer.n_kv_head;
-                    ((1, n_kv, n_rep, max_kv), (1, n_kv, n_rep, hd))
-                } else {
-                    // Non-GQA: padded_standard_attention falls into the
-                    // repeat_kv path (which is a no-op at n_rep=1) and
-                    // produces att/out at shape [1, n_head, 1, *].
-                    let n_h = layer.n_head;
-                    ((1, n_h, 1, max_kv), (1, n_h, 1, hd))
-                };
-                if layer.graph_attn_qk_buffer.is_none() {
-                    layer.graph_attn_qk_buffer =
-                        Some(Tensor::zeros_on(qk_shape, crate::tensor::DType::F32, &dev)?);
-                }
-                // Attention-internal wiring: broadcast_add + softmax
-                // outputs same shape as graph_attn_qk_buffer.
-                if layer.graph_attn_mask_added_buffer.is_none() {
-                    layer.graph_attn_mask_added_buffer =
-                        Some(Tensor::zeros_on(qk_shape, crate::tensor::DType::F32, &dev)?);
-                }
-                if layer.graph_attn_softmax_buffer.is_none() {
-                    layer.graph_attn_softmax_buffer =
-                        Some(Tensor::zeros_on(qk_shape, crate::tensor::DType::F32, &dev)?);
-                }
-                if layer.graph_attn_out_buffer.is_none() {
-                    layer.graph_attn_out_buffer = Some(Tensor::zeros_on(
-                        out_shape,
-                        crate::tensor::DType::F32,
-                        &dev,
-                    )?);
-                }
-                // Per-layer post-attention intermediate buffers.
-                // Allocated only for non-GQA F-dtype graph mode (phi2-style)
-                // for now - Q4/Q8 paths bypass these via integrated kernels.
-                // Routed in compute_from_kv parallel_attn branch.
-                // extend buffer allocation to gemma4-class
-                // (GQA n_rep>1 with serial-attn + load-time-concat'd
-                // gate||up). The graph_attn_proj_buffer must use the
-                // ACTUAL attn_output weight row dim (hidden_size), NOT
-                // n_head*head_dim - for gemma4 these differ
-                // (attn_out_dim=4096, hidden_size=2560). Bug bit the
-                // A probe; corrected here.
-                let gemma4_class =
-                    n_rep > 1 && !layer.flags.parallel_attn && layer.ffn_gate.is_none();
-                if n_rep == 1 || gemma4_class {
-                    let hidden = if gemma4_class {
-                        // Use attn_output weight's row dim for the
-                        // projection output shape.
-                        layer
-                            .attn_output
-                            .qtensor()
-                            .map(|qt| qt.shape().dims()[0])
-                            .unwrap_or(layer.n_head * layer.head_dim)
-                    } else {
-                        layer.n_head * layer.head_dim
-                    };
-                    let intermediate = layer.flags.intermediate_size.max(1);
-                    if layer.graph_attn_proj_buffer.is_none() {
-                        layer.graph_attn_proj_buffer = Some(Tensor::zeros_on(
-                            (1, 1, hidden),
-                            crate::tensor::DType::F32,
-                            &dev,
-                        )?);
-                    }
-                    // gemma4-specific concat ffn_up output: [1, 1, 2N]
-                    if gemma4_class && layer.graph_ffn_up_concat_buffer.is_none() {
-                        layer.graph_ffn_up_concat_buffer = Some(Tensor::zeros_on(
-                            (1, 1, 2 * intermediate),
-                            crate::tensor::DType::F32,
-                            &dev,
-                        )?);
-                    }
-                    // gemma4 post_ffn_norm + add output: [1, 1, hidden]
-                    if gemma4_class && layer.graph_post_ffn_norm_buffer.is_none() {
-                        layer.graph_post_ffn_norm_buffer = Some(Tensor::zeros_on(
-                            (1, 1, hidden),
-                            crate::tensor::DType::F32,
-                            &dev,
-                        )?);
-                    }
-                    // gemma4 PLE block buffers - only allocate when the
-                    // PLE block exists for this layer (ple_inp_gate set).
-                    if gemma4_class && layer.ple_inp_gate.is_some() {
-                        // ple_dim from the gate weight's row dim: weight
-                        // shape is [ple_dim, hidden].
-                        let ple_dim = layer
-                            .ple_inp_gate
-                            .as_ref()
-                            .and_then(|m| m.qtensor().map(|qt| qt.shape().dims()[0]))
-                            .unwrap_or(0);
-                        if ple_dim > 0 {
-                            if layer.graph_ple_gate_buffer.is_none() {
-                                layer.graph_ple_gate_buffer = Some(Tensor::zeros_on(
-                                    (1, 1, ple_dim),
-                                    crate::tensor::DType::F32,
-                                    &dev,
-                                )?);
-                            }
-                            if layer.graph_ple_gelu_buffer.is_none() {
-                                layer.graph_ple_gelu_buffer = Some(Tensor::zeros_on(
-                                    (1, 1, ple_dim),
-                                    crate::tensor::DType::F32,
-                                    &dev,
-                                )?);
-                            }
-                            // per-layer PLE input slot for
-                            // graph mode. Engine populates via
-                            // populate_ple_input_buffers(input_ids) BEFORE
-                            // begin_capture; captured graph reads through.
-                            if layer.graph_ple_input_buffer.is_none() {
-                                layer.graph_ple_input_buffer = Some(Tensor::zeros_on(
-                                    (1, 1, ple_dim),
-                                    crate::tensor::DType::F32,
-                                    &dev,
-                                )?);
-                            }
-                        }
-                        if layer.graph_ple_proj_buffer.is_none() {
-                            layer.graph_ple_proj_buffer = Some(Tensor::zeros_on(
-                                (1, 1, hidden),
-                                crate::tensor::DType::F32,
-                                &dev,
-                            )?);
-                        }
-                        if layer.graph_ple_final_buffer.is_none() {
-                            layer.graph_ple_final_buffer = Some(Tensor::zeros_on(
-                                (1, 1, hidden),
-                                crate::tensor::DType::F32,
-                                &dev,
-                            )?);
-                        }
-                    }
-                    // post_attn_norm + ffn_norm + attn_norm buffers
-                    // for gemma4. All same shape [1, 1, hidden].
-                    if gemma4_class {
-                        if layer.graph_post_attn_norm_buffer.is_none() {
-                            layer.graph_post_attn_norm_buffer = Some(Tensor::zeros_on(
-                                (1, 1, hidden),
-                                crate::tensor::DType::F32,
-                                &dev,
-                            )?);
-                        }
-                        if layer.graph_x_norm_ffn_buffer.is_none() {
-                            layer.graph_x_norm_ffn_buffer = Some(Tensor::zeros_on(
-                                (1, 1, hidden),
-                                crate::tensor::DType::F32,
-                                &dev,
-                            )?);
-                        }
-                        if layer.graph_x_norm_attn_buffer.is_none() {
-                            layer.graph_x_norm_attn_buffer = Some(Tensor::zeros_on(
-                                (1, 1, hidden),
-                                crate::tensor::DType::F32,
-                                &dev,
-                            )?);
-                        }
-                    }
-                    if layer.graph_ffn_up_buffer.is_none() {
-                        layer.graph_ffn_up_buffer = Some(Tensor::zeros_on(
-                            (1, 1, intermediate),
-                            crate::tensor::DType::F32,
-                            &dev,
-                        )?);
-                    }
-                    if layer.graph_ffn_activated_buffer.is_none() {
-                        layer.graph_ffn_activated_buffer = Some(Tensor::zeros_on(
-                            (1, 1, intermediate),
-                            crate::tensor::DType::F32,
-                            &dev,
-                        )?);
-                    }
-                    if layer.graph_ffn_down_buffer.is_none() {
-                        layer.graph_ffn_down_buffer = Some(Tensor::zeros_on(
-                            (1, 1, hidden),
-                            crate::tensor::DType::F32,
-                            &dev,
-                        )?);
-                    }
-                    if layer.graph_phi2_merge_buffer.is_none() {
-                        layer.graph_phi2_merge_buffer = Some(Tensor::zeros_on(
-                            (1, 1, hidden),
-                            crate::tensor::DType::F32,
-                            &dev,
-                        )?);
-                    }
-                    // Path B (gemma4 graph-mode unblock):
-                    // 3 additional buffers for compute_from_kv serial path.
-                    if gemma4_class {
-                        if layer.graph_ffn_gate_out.is_none() {
-                            layer.graph_ffn_gate_out = Some(Tensor::zeros_on(
-                                (1, 1, intermediate),
-                                crate::tensor::DType::F32,
-                                &dev,
-                            )?);
-                        }
-                        if layer.graph_x_out_scaled.is_none() {
-                            layer.graph_x_out_scaled = Some(Tensor::zeros_on(
-                                (1, 1, hidden),
-                                crate::tensor::DType::F32,
-                                &dev,
-                            )?);
-                        }
-                        // graph_attn_scaled_buffer only for arches with residual_scale.
-                        // gemma4:latest doesn't have rs but gemma4:26b does. Allocate
-                        // unconditionally for gemma4_class - small (10 KB x 42 layers ≈
-                        // 420 KB) - harmless if unused.
-                        if layer.graph_attn_scaled_buffer.is_none() {
-                            layer.graph_attn_scaled_buffer = Some(Tensor::zeros_on(
-                                (1, 1, hidden),
-                                crate::tensor::DType::F32,
-                                &dev,
-                            )?);
-                        }
-                    }
-                }
-            }
+            let leaders = GraphStateLeaders {
+                rope: rope_group[i] == i,
+                mask: mask_group[i] == i,
+                kv_pos: kv_pos_group[i] == i,
+            };
+            update_layer_graph_state(
+                &mut self.layers[i],
+                i,
+                pos,
+                leaders,
+                skip_fdtype_state,
+                &mut pos_by_card,
+            )?;
+            // The shares of a split layer each read buffers of their own on their card.
+            let mut shards = std::mem::take(&mut self.layers[i].tp_shards);
+            let updated = shards.iter_mut().try_for_each(|shard| {
+                update_layer_graph_state(
+                    shard,
+                    i,
+                    pos,
+                    GraphStateLeaders::OWN,
+                    skip_fdtype_state,
+                    &mut pos_by_card,
+                )
+            });
+            self.layers[i].tp_shards = shards;
+            updated?;
         }
 
         // Third pass: followers Arc-clone the group leader's tensors. This
@@ -1781,6 +1422,7 @@ impl GenericHeteroTransformer {
                     }
                     hidden = self.layers[li].forward_graph(&hidden)?;
                 }
+                self.tp_forget()?;
                 if head {
                     return self.graph_head(hidden).map(Some);
                 }
@@ -1822,6 +1464,7 @@ impl GenericHeteroTransformer {
                     #[cfg(feature = "cuda")]
                     None,
                 )?;
+                self.tp_forget()?;
                 Self::store_step_hidden(&buffer, hidden)?;
                 Ok(None)
             }
@@ -1893,6 +1536,16 @@ impl GenericHeteroTransformer {
                 c.trim_to(pos);
             }
         }
+    }
+
+    /// Drops the copies of the hidden state the split layers kept on their other cards: the
+    /// next pass starts from its own input.
+    pub(super) fn tp_forget(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Some(comms) = self.layers.iter().find_map(|l| l.tp_comms.as_ref()) {
+            comms.forget()?;
+        }
+        Ok(())
     }
 
     /// The graph step's card segments in layer order: each run of layers on one card and
@@ -2550,6 +2203,9 @@ impl GenericHeteroTransformer {
     pub fn clear_graph_transients(&mut self) {
         for l in &mut self.layers {
             l.graph_alive_tensors.clear();
+            for shard in &mut l.tp_shards {
+                shard.graph_alive_tensors.clear();
+            }
         }
         self.graph_alive_tensors_model.clear();
     }
@@ -3106,6 +2762,431 @@ fn restore_quantised_layer(
     }
     let _ = (l, s);
     Ok(false)
+}
+
+/// Drops every per-step buffer a recorded step read from `l` and its shares.
+fn clear_layer_graph_state(l: &mut GenericTransformerLayer) {
+    l.padded_mask = None;
+    l.graph_rope_cos = None;
+    l.graph_rope_sin = None;
+    l.graph_kv_pos = None;
+    l.graph_pos_i32 = None;
+    l.graph_attn_qk_buffer = None;
+    l.graph_attn_out_buffer = None;
+    l.graph_attn_proj_buffer = None;
+    l.graph_ffn_up_buffer = None;
+    l.graph_ffn_activated_buffer = None;
+    l.graph_ffn_down_buffer = None;
+    l.graph_phi2_merge_buffer = None;
+    // Reset the FULL set of per-layer stable buffers. A partial
+    // reset left buffers like graph_ffn_gate_out (and the PLE /
+    // norm / scale buffers) pointing at memory that the
+    // graph_alive_tensors.clear() below reclaims, so the next decode
+    // step read a freed pointer through gate = graph_ffn_gate_out
+    // (wild-pointer crash in fused_gelu_mul once the F-dtype KV cache
+    // outgrew the captured mask cap and triggered this teardown).
+    // Clearing every buffer makes the decode path fall back to fresh
+    // tensors after invalidation instead of stale stable buffers.
+    l.graph_q_buffer = None;
+    l.graph_ffn_up_concat_buffer = None;
+    l.graph_post_ffn_norm_buffer = None;
+    l.graph_ple_gate_buffer = None;
+    l.graph_ple_gelu_buffer = None;
+    l.graph_ple_proj_buffer = None;
+    l.graph_ple_final_buffer = None;
+    l.graph_post_attn_norm_buffer = None;
+    l.graph_x_norm_ffn_buffer = None;
+    l.graph_x_norm_attn_buffer = None;
+    l.graph_ple_input_buffer = None;
+    l.graph_ngram_rows = None;
+    l.graph_kv_cap = None;
+    l.graph_attn_mask_added_buffer = None;
+    l.graph_attn_softmax_buffer = None;
+    l.graph_ffn_gate_out = None;
+    l.graph_x_out_scaled = None;
+    l.graph_attn_scaled_buffer = None;
+    // ROOT CAUSE FIX: drop captured-region tensor
+    // lifetime-extension handles so cuMemFree can reclaim
+    // their memory now that the graph is being torn down.
+    l.graph_alive_tensors.clear();
+    for shard in &mut l.tp_shards {
+        clear_layer_graph_state(shard);
+    }
+}
+
+/// Which of a layer's per-step graph buffers it writes itself rather than sharing a group
+/// leader's.
+#[derive(Clone, Copy)]
+struct GraphStateLeaders {
+    rope: bool,
+    mask: bool,
+    kv_pos: bool,
+}
+
+impl GraphStateLeaders {
+    /// A layer that keeps every buffer of its own.
+    const OWN: Self = Self {
+        rope: true,
+        mask: true,
+        kv_pos: true,
+    };
+}
+
+/// The per-step state layer `i` reads in a recorded step at `pos`: the buffers it leads, its
+/// quantised cache's slot and the attention buffers it fills in place, on its own card. The
+/// card's position for sink and indexed layers is written once into `pos_by_card`.
+fn update_layer_graph_state(
+    layer: &mut GenericTransformerLayer,
+    i: usize,
+    pos: usize,
+    leaders: GraphStateLeaders,
+    skip_fdtype_state: bool,
+    pos_by_card: &mut std::collections::HashMap<usize, Tensor>,
+) -> Result<()> {
+    // A layer's buffers live on the card it runs on.
+    let dev = layer.cos.device().clone();
+    if layer.attn_sinks.is_some() || layer.sparse.is_some() {
+        if let crate::tensor::DeviceLocation::Cuda { gpu_id } = dev.location() {
+            match (pos_by_card.get(&gpu_id), layer.graph_pos_i32.as_ref()) {
+                (Some(written), None) => layer.graph_pos_i32 = Some(written.clone()),
+                (Some(_), Some(_)) => {}
+                (None, held) => {
+                    let row = Tensor::new(&[pos as i32], &dev)?;
+                    let t = match held {
+                        Some(t) => {
+                            t.slice_set(&row, 0, 0)?;
+                            t.clone()
+                        }
+                        None => row.force_contiguous()?,
+                    };
+                    layer.graph_pos_i32 = Some(t.clone());
+                    pos_by_card.insert(gpu_id, t);
+                }
+            }
+        }
+    }
+    // RoPE: only update if this layer is the rope-group leader.
+    if leaders.rope {
+        layer.update_rope_buffers(pos).map_err(|e| {
+            crate::tensor::Error::msg(format!("update_rope_buffers layer {i}: {e}"))
+        })?;
+    }
+
+    // Padded mask: only the mask-group leader does alloc/slice_set.
+    if !skip_fdtype_state && leaders.mask {
+        let max_kv = layer.kv_cache.max_seq_len_padded();
+        // `pos` writes into mask[..., pos] via slice_set. If the
+        // existing mask is narrower than `pos+1`, slice_set fails.
+        // (kv_cache.max_seq_len_padded() can auto-grow inside
+        // append_padded, but padded_mask doesn't follow - its
+        // captured device pointer is frozen at the original cap.)
+        // Either condition means the captured graph state is
+        // stale; bail so the engine can invalidate the graph and
+        // fall through to the non-graph forward path for the
+        // rest of the request.
+        let mask_width = layer
+            .padded_mask
+            .as_ref()
+            .and_then(|m| m.dim(3).ok())
+            .unwrap_or(max_kv);
+        // A cache that grew since the mask was made moved its buffers, which a
+        // recorded graph still names.
+        if pos >= mask_width || mask_width != max_kv {
+            return Err(crate::tensor::Error::msg(format!(
+                "graph_state: pos {} >= padded_mask width {} (kv_cache cap {}, layer {}). \
+                 Caller should invalidate the captured graph.",
+                pos, mask_width, max_kv, i
+            )));
+        }
+        if layer.padded_mask.is_none() {
+            let mut data = vec![f32::NEG_INFINITY; max_kv];
+            // First (pos + 1) entries: visible (mask = 0); rest stays -INF.
+            data[..=pos].fill(0.0);
+            layer.padded_mask = Some(
+                Tensor::new(&data[..], &dev)?
+                    .reshape((1, 1, 1, max_kv))?
+                    .force_contiguous()?,
+            );
+        } else {
+            let mask = layer.padded_mask.as_ref().unwrap();
+            let zero = Tensor::zeros_on((1, 1, 1, 1), crate::tensor::DType::F32, &mask.device())?;
+            mask.slice_set(&zero, 3, pos).map_err(|e| {
+                crate::tensor::Error::msg(format!("padded_mask slice_set layer {i} pos={pos}: {e}"))
+            })?;
+        }
+    }
+
+    // Graph KV pos: same leader-only pattern.
+    if !skip_fdtype_state && leaders.kv_pos {
+        let kv_shape = (1usize, layer.n_kv_head, 1usize, layer.head_dim);
+        let numel = layer.n_kv_head * layer.head_dim;
+        let filled_cpu = Tensor::from_vec(vec![pos as i64; numel], kv_shape, &Device::Cpu)?;
+        if layer.graph_kv_pos.is_none() {
+            layer.graph_kv_pos = Some(filled_cpu.to_device(&dev)?);
+        } else {
+            let filled_gpu = filled_cpu.to_device(&dev)?;
+            layer
+                .graph_kv_pos
+                .as_ref()
+                .unwrap()
+                .slice_set(&filled_gpu, 0, 0)?;
+        }
+    }
+
+    // Each quantised cache names the slot this replay writes (its own device
+    // position; the copy is skipped when the slot has not changed).
+    #[cfg(feature = "cuda")]
+    if let Some(c) = layer.quant_kv.as_mut() {
+        c.update_graph_state(pos).map_err(|e| {
+            crate::tensor::Error::msg(format!("KV update_graph_state layer {i} pos={pos}: {e}"))
+        })?;
+    }
+
+    // Persistent attention intermediates for the GQA fast path
+    // under graph mode. Allocate once on first call; subsequent
+    // calls leave them in place (slice_set wiring in
+    // padded_standard_attention writes into them).
+    //
+    // Two shape variants:
+    //   1. GQA fast path (n_rep > 1, q[2]==1):
+    //      qk:  [1, n_kv_head, n_rep, max_kv]
+    //      out: [1, n_kv_head, n_rep, head_dim]
+    //   2. Non-GQA fallback (n_rep == 1, q[2]==1):
+    //      qk:  [1, n_head, 1, max_kv]
+    //      out: [1, n_head, 1, head_dim]
+    //
+    // Previously only allocated for variant 1 when HD>256
+    // (gemma4:latest Global). Extended to also
+    // allocate for variant 2 (moondream/phi2-style models with
+    // no GQA) - those were silently allocating fresh per call
+    // and causing CUDA_ERROR_ILLEGAL_ADDRESS at first replay.
+    //
+    // For moondream (n_head=24, n_kv_head=24, HD=64, max_kv=2048):
+    //   qk:  1 x 24 x 1 x 2048 x 4 = 192 KB / layer
+    //   out: 1 x 24 x 1 x 64 x 4   =   6 KB / layer
+    // x 24 layers ≈ 4.8 MB total.
+    let layer_ref = &*layer;
+    let n_rep = layer_ref.n_head / layer_ref.n_kv_head;
+    let needs_attn_buffers = (n_rep > 1 && layer_ref.head_dim > 256) || n_rep == 1;
+    if needs_attn_buffers {
+        let max_kv = layer.kv_cache.max_seq_len_padded();
+        let hd = layer.head_dim;
+        let (qk_shape, out_shape) = if n_rep > 1 {
+            let n_kv = layer.n_kv_head;
+            ((1, n_kv, n_rep, max_kv), (1, n_kv, n_rep, hd))
+        } else {
+            // Non-GQA: padded_standard_attention falls into the
+            // repeat_kv path (which is a no-op at n_rep=1) and
+            // produces att/out at shape [1, n_head, 1, *].
+            let n_h = layer.n_head;
+            ((1, n_h, 1, max_kv), (1, n_h, 1, hd))
+        };
+        if layer.graph_attn_qk_buffer.is_none() {
+            layer.graph_attn_qk_buffer =
+                Some(Tensor::zeros_on(qk_shape, crate::tensor::DType::F32, &dev)?);
+        }
+        // Attention-internal wiring: broadcast_add + softmax
+        // outputs same shape as graph_attn_qk_buffer.
+        if layer.graph_attn_mask_added_buffer.is_none() {
+            layer.graph_attn_mask_added_buffer =
+                Some(Tensor::zeros_on(qk_shape, crate::tensor::DType::F32, &dev)?);
+        }
+        if layer.graph_attn_softmax_buffer.is_none() {
+            layer.graph_attn_softmax_buffer =
+                Some(Tensor::zeros_on(qk_shape, crate::tensor::DType::F32, &dev)?);
+        }
+        if layer.graph_attn_out_buffer.is_none() {
+            layer.graph_attn_out_buffer = Some(Tensor::zeros_on(
+                out_shape,
+                crate::tensor::DType::F32,
+                &dev,
+            )?);
+        }
+        // Per-layer post-attention intermediate buffers.
+        // Allocated only for non-GQA F-dtype graph mode (phi2-style)
+        // for now - Q4/Q8 paths bypass these via integrated kernels.
+        // Routed in compute_from_kv parallel_attn branch.
+        // extend buffer allocation to gemma4-class
+        // (GQA n_rep>1 with serial-attn + load-time-concat'd
+        // gate||up). The graph_attn_proj_buffer must use the
+        // ACTUAL attn_output weight row dim (hidden_size), NOT
+        // n_head*head_dim - for gemma4 these differ
+        // (attn_out_dim=4096, hidden_size=2560). Bug bit the
+        // A probe; corrected here.
+        let gemma4_class = n_rep > 1 && !layer.flags.parallel_attn && layer.ffn_gate.is_none();
+        if n_rep == 1 || gemma4_class {
+            let hidden = if gemma4_class {
+                // Use attn_output weight's row dim for the
+                // projection output shape.
+                layer
+                    .attn_output
+                    .qtensor()
+                    .map(|qt| qt.shape().dims()[0])
+                    .unwrap_or(layer.n_head * layer.head_dim)
+            } else {
+                layer.n_head * layer.head_dim
+            };
+            let intermediate = layer.flags.intermediate_size.max(1);
+            if layer.graph_attn_proj_buffer.is_none() {
+                layer.graph_attn_proj_buffer = Some(Tensor::zeros_on(
+                    (1, 1, hidden),
+                    crate::tensor::DType::F32,
+                    &dev,
+                )?);
+            }
+            // gemma4-specific concat ffn_up output: [1, 1, 2N]
+            if gemma4_class && layer.graph_ffn_up_concat_buffer.is_none() {
+                layer.graph_ffn_up_concat_buffer = Some(Tensor::zeros_on(
+                    (1, 1, 2 * intermediate),
+                    crate::tensor::DType::F32,
+                    &dev,
+                )?);
+            }
+            // gemma4 post_ffn_norm + add output: [1, 1, hidden]
+            if gemma4_class && layer.graph_post_ffn_norm_buffer.is_none() {
+                layer.graph_post_ffn_norm_buffer = Some(Tensor::zeros_on(
+                    (1, 1, hidden),
+                    crate::tensor::DType::F32,
+                    &dev,
+                )?);
+            }
+            // gemma4 PLE block buffers - only allocate when the
+            // PLE block exists for this layer (ple_inp_gate set).
+            if gemma4_class && layer.ple_inp_gate.is_some() {
+                // ple_dim from the gate weight's row dim: weight
+                // shape is [ple_dim, hidden].
+                let ple_dim = layer
+                    .ple_inp_gate
+                    .as_ref()
+                    .and_then(|m| m.qtensor().map(|qt| qt.shape().dims()[0]))
+                    .unwrap_or(0);
+                if ple_dim > 0 {
+                    if layer.graph_ple_gate_buffer.is_none() {
+                        layer.graph_ple_gate_buffer = Some(Tensor::zeros_on(
+                            (1, 1, ple_dim),
+                            crate::tensor::DType::F32,
+                            &dev,
+                        )?);
+                    }
+                    if layer.graph_ple_gelu_buffer.is_none() {
+                        layer.graph_ple_gelu_buffer = Some(Tensor::zeros_on(
+                            (1, 1, ple_dim),
+                            crate::tensor::DType::F32,
+                            &dev,
+                        )?);
+                    }
+                    // per-layer PLE input slot for
+                    // graph mode. Engine populates via
+                    // populate_ple_input_buffers(input_ids) BEFORE
+                    // begin_capture; captured graph reads through.
+                    if layer.graph_ple_input_buffer.is_none() {
+                        layer.graph_ple_input_buffer = Some(Tensor::zeros_on(
+                            (1, 1, ple_dim),
+                            crate::tensor::DType::F32,
+                            &dev,
+                        )?);
+                    }
+                }
+                if layer.graph_ple_proj_buffer.is_none() {
+                    layer.graph_ple_proj_buffer = Some(Tensor::zeros_on(
+                        (1, 1, hidden),
+                        crate::tensor::DType::F32,
+                        &dev,
+                    )?);
+                }
+                if layer.graph_ple_final_buffer.is_none() {
+                    layer.graph_ple_final_buffer = Some(Tensor::zeros_on(
+                        (1, 1, hidden),
+                        crate::tensor::DType::F32,
+                        &dev,
+                    )?);
+                }
+            }
+            // post_attn_norm + ffn_norm + attn_norm buffers
+            // for gemma4. All same shape [1, 1, hidden].
+            if gemma4_class {
+                if layer.graph_post_attn_norm_buffer.is_none() {
+                    layer.graph_post_attn_norm_buffer = Some(Tensor::zeros_on(
+                        (1, 1, hidden),
+                        crate::tensor::DType::F32,
+                        &dev,
+                    )?);
+                }
+                if layer.graph_x_norm_ffn_buffer.is_none() {
+                    layer.graph_x_norm_ffn_buffer = Some(Tensor::zeros_on(
+                        (1, 1, hidden),
+                        crate::tensor::DType::F32,
+                        &dev,
+                    )?);
+                }
+                if layer.graph_x_norm_attn_buffer.is_none() {
+                    layer.graph_x_norm_attn_buffer = Some(Tensor::zeros_on(
+                        (1, 1, hidden),
+                        crate::tensor::DType::F32,
+                        &dev,
+                    )?);
+                }
+            }
+            if layer.graph_ffn_up_buffer.is_none() {
+                layer.graph_ffn_up_buffer = Some(Tensor::zeros_on(
+                    (1, 1, intermediate),
+                    crate::tensor::DType::F32,
+                    &dev,
+                )?);
+            }
+            if layer.graph_ffn_activated_buffer.is_none() {
+                layer.graph_ffn_activated_buffer = Some(Tensor::zeros_on(
+                    (1, 1, intermediate),
+                    crate::tensor::DType::F32,
+                    &dev,
+                )?);
+            }
+            if layer.graph_ffn_down_buffer.is_none() {
+                layer.graph_ffn_down_buffer = Some(Tensor::zeros_on(
+                    (1, 1, hidden),
+                    crate::tensor::DType::F32,
+                    &dev,
+                )?);
+            }
+            if layer.graph_phi2_merge_buffer.is_none() {
+                layer.graph_phi2_merge_buffer = Some(Tensor::zeros_on(
+                    (1, 1, hidden),
+                    crate::tensor::DType::F32,
+                    &dev,
+                )?);
+            }
+            // Path B (gemma4 graph-mode unblock):
+            // 3 additional buffers for compute_from_kv serial path.
+            if gemma4_class {
+                if layer.graph_ffn_gate_out.is_none() {
+                    layer.graph_ffn_gate_out = Some(Tensor::zeros_on(
+                        (1, 1, intermediate),
+                        crate::tensor::DType::F32,
+                        &dev,
+                    )?);
+                }
+                if layer.graph_x_out_scaled.is_none() {
+                    layer.graph_x_out_scaled = Some(Tensor::zeros_on(
+                        (1, 1, hidden),
+                        crate::tensor::DType::F32,
+                        &dev,
+                    )?);
+                }
+                // graph_attn_scaled_buffer only for arches with residual_scale.
+                // gemma4:latest doesn't have rs but gemma4:26b does. Allocate
+                // unconditionally for gemma4_class - small (10 KB x 42 layers ≈
+                // 420 KB) - harmless if unused.
+                if layer.graph_attn_scaled_buffer.is_none() {
+                    layer.graph_attn_scaled_buffer = Some(Tensor::zeros_on(
+                        (1, 1, hidden),
+                        crate::tensor::DType::F32,
+                        &dev,
+                    )?);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

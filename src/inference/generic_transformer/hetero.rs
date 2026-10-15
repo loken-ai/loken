@@ -2312,6 +2312,7 @@ impl GenericHeteroTransformer {
 
             seg_start = seg_end;
         }
+        self.tp_forget()?;
         Ok((hidden, on_cuda))
     }
 

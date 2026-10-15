@@ -264,15 +264,16 @@ impl GenericTransformerLayer {
         }
         // A tensor-parallel layer: each share runs its slice of the feed-forward width on its
         // card; the partial outputs sum here.
+        let comms = self.tp_comms.clone();
+        let inputs = super::tp_send_out(x, &self.tp_shards, comms.as_deref())?;
         let mut parts = Vec::with_capacity(self.tp_shards.len());
-        for shard in &mut self.tp_shards {
-            let xs = x.to_device(&shard.cos.device())?;
+        for (shard, xs) in self.tp_shards.iter_mut().zip(inputs) {
             parts.push(shard.forward_ffn(&xs)?);
         }
-        super::tp_sum(own, parts)
+        super::tp_sum(own, parts, comms.as_deref())
     }
 
-    fn forward_ffn_own(&mut self, x: &Tensor) -> Result<Tensor> {
+    pub(super) fn forward_ffn_own(&mut self, x: &Tensor) -> Result<Tensor> {
         // Phi2 simple FFN: y = down(GELU(up(x) + up_bias)) + down_bias.
         // No gate. Uses tanh-approximated GELU (`gelu_new` in HF) - same
         // approximation as phi2's reference implementation.

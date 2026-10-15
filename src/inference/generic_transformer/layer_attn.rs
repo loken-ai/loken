@@ -508,11 +508,11 @@ impl GenericTransformerLayer {
         }
         // A tensor-parallel layer: each share attends with its heads and its cache on its card
         // and projects its heads' slice of the output; the partial outputs sum here.
+        let comms = self.tp_comms.clone();
+        let inputs = super::tp_send_out(x, &self.tp_shards, comms.as_deref())?;
         let mut parts = Vec::with_capacity(self.tp_shards.len());
-        for shard in &mut self.tp_shards {
-            let dev = shard.cos.device();
-            let xs = x.to_device(&dev)?;
-            let m = mask.map(|m| m.to_device(&dev)).transpose()?;
+        for (shard, xs) in self.tp_shards.iter_mut().zip(inputs) {
+            let m = mask.map(|m| m.to_device(&shard.cos.device())).transpose()?;
             parts.push(shard.forward_attn(
                 &xs,
                 m.as_ref(),
@@ -523,7 +523,7 @@ impl GenericTransformerLayer {
                 None,
             )?);
         }
-        super::tp_sum(own, parts)
+        super::tp_sum(own, parts, comms.as_deref())
     }
 
     /// Variant of forward_attn that takes a pre-computed QKV F32 tensor.
@@ -542,7 +542,7 @@ impl GenericTransformerLayer {
         self.forward_attn_inner(x, mask, index_pos, shared_kv, pre_computed_qkv, donor_f16)
     }
 
-    fn forward_attn_inner(
+    pub(super) fn forward_attn_inner(
         &mut self,
         x: &Tensor,
         mask: Option<&Tensor>,
@@ -2037,22 +2037,24 @@ impl GenericTransformerLayer {
     /// fixed-shape attention) is being developed. Once validated, the body
     /// will be replaced with an implementation whose tensor shapes and device
     /// pointers are invariant across CUDA graph replays.
+    /// The positions this layer's cache holds, read from the store its attention writes.
+    pub(super) fn cached_len(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if let Some(c) = self.q4_kv() {
+            return c.current_seq_len();
+        } else if let Some(c) = self.q8_kv() {
+            return c.current_seq_len();
+        }
+        self.kv_cache.current_seq_len()
+    }
+
     pub(super) fn forward_attn_graph(&mut self, x: &Tensor) -> Result<Tensor> {
         // For Q4/Q8-only paths the F-dtype kv_cache is never populated,
         // so its `current_seq_len()` is 0. Passing 0 here would re-enter
         // the `index_pos == 0` reset branch inside `forward_attn` and
         // wipe the populated quantized cache - read seq_len from the
         // actual storage path instead.
-        #[cfg(feature = "cuda")]
-        let pos = if let Some(c) = self.q4_kv() {
-            c.current_seq_len()
-        } else if let Some(c) = self.q8_kv() {
-            c.current_seq_len()
-        } else {
-            self.kv_cache.current_seq_len()
-        };
-        #[cfg(not(feature = "cuda"))]
-        let pos = self.kv_cache.current_seq_len();
+        let pos = self.cached_len();
         self.forward_attn(
             x,
             None,

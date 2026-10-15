@@ -75,6 +75,7 @@ mod splice;
 mod state_cache_tests;
 #[cfg(test)]
 pub(crate) mod tiny_model;
+mod tp_forward;
 #[cfg(all(test, feature = "cuda"))]
 mod tp_tests;
 #[cfg(all(test, feature = "cuda"))]
@@ -159,6 +160,8 @@ pub struct GenericTransformerLayer {
     /// group, each an ordinary layer of its own width; this layer holds the first share and sums
     /// theirs into its own. Empty when the layer runs whole on its device.
     pub tp_shards: Vec<GenericTransformerLayer>,
+    /// The group's communicators when this layer holds shares on other cards and NCCL opens.
+    pub tp_comms: Option<std::sync::Arc<TpComms>>,
     /// Pre-norm before the MoE block (Gemma4 26B has it as a separate
     /// `pre_ffw_norm_2` tensor on top of the standard `ffn_norm`).
     pub pre_ffw_norm_2: Option<RmsNorm>,
@@ -630,9 +633,232 @@ impl std::fmt::Debug for GenericHeteroTransformer {
 
 unsafe impl Send for GenericHeteroTransformer {}
 
-/// `own` plus every partial output of a tensor-parallel layer's other shares, brought to `own`'s
-/// device once all of them were launched.
-pub(super) fn tp_sum(own: Tensor, parts: Vec<Tensor>) -> crate::tensor::Result<Tensor> {
+/// The NCCL communicators of a tensor-parallel group, one per card on that card's compute
+/// stream, rank 0 on the layers' own card. They are used only by the thread that runs the
+/// model's forward, which holds the model mutably.
+pub struct TpComms {
+    #[cfg(feature = "cuda")]
+    comms: Vec<cudarc::nccl::safe::Comm>,
+    /// The hidden state a split layer last returned on rank 0, and its copies on the other
+    /// ranks: the next split layer starts from them instead of sending its input out.
+    #[cfg(feature = "cuda")]
+    replicas: std::sync::Mutex<Option<(Tensor, Vec<Tensor>)>>,
+}
+
+unsafe impl Send for TpComms {}
+unsafe impl Sync for TpComms {}
+
+#[cfg(feature = "cuda")]
+impl TpComms {
+    /// Communicators over `devices`, the layers' own card first; `None` when NCCL does not
+    /// open or refuses the group.
+    pub(crate) fn new(devices: &[Device]) -> Option<Self> {
+        if !crate::tensor::cuda::runtime::nccl_present() {
+            tracing::info!(
+                "tensor parallelism moves its activations through copies: NCCL does not open"
+            );
+            return None;
+        }
+        let streams = devices
+            .iter()
+            .map(|d| d.as_cuda_device().ok().map(|c| c.cuda_stream()))
+            .collect::<Option<Vec<_>>>()?;
+        match cudarc::nccl::safe::Comm::from_devices(streams) {
+            Ok(comms) => Some(Self {
+                comms,
+                replicas: std::sync::Mutex::new(None),
+            }),
+            Err(e) => {
+                tracing::warn!("tensor parallelism moves its activations through copies: NCCL refused the group: {e:?}");
+                None
+            }
+        }
+    }
+
+    /// Whether the group's ranks are `x`'s card and the cards of `ranks - 1` shares, and `x` a
+    /// contiguous F32 tensor the collectives take as it is.
+    fn takes(&self, x: &Tensor, ranks: usize) -> bool {
+        self.comms.len() == ranks && x.dtype() == DType::F32 && x.is_contiguous()
+    }
+
+    /// `x`, on rank 0's card, sent to the cards of `to`, ranks 1 onwards. The other ranks'
+    /// streams wait for rank 0's first, which joins them to a step rank 0 is recording.
+    fn send_out(&self, x: &Tensor, to: &[Device]) -> Result<Vec<Tensor>> {
+        use cudarc::nccl::safe::{group_end, group_start};
+        let nccl =
+            |e: cudarc::nccl::result::NcclError| crate::tensor::Error::msg(format!("nccl: {e:?}"));
+        let ready = crate::tensor::cuda_ext::record_event(&self.comms[0].stream())?;
+        for c in &self.comms[1..] {
+            crate::tensor::cuda_ext::wait_event(&c.stream(), &ready)?;
+        }
+        let src = crate::tensor::cuda_ext::f32_slice_of(x)?;
+        let view = src.view()?;
+        let n = x.elem_count();
+        let mut outs = self.comms[1..]
+            .iter()
+            .map(|c| unsafe { c.stream().alloc::<f32>(n) })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::tensor::Error::msg(format!("{e:?}")))?;
+        group_start().map_err(nccl)?;
+        for (rank, out) in outs.iter_mut().enumerate() {
+            self.comms[0].send(&view, rank as i32 + 1).map_err(nccl)?;
+            self.comms[rank + 1].recv(out, 0).map_err(nccl)?;
+        }
+        group_end().map_err(nccl)?;
+        outs.into_iter()
+            .zip(to)
+            .map(|(out, dev)| {
+                crate::tensor::cuda_ext::tensor_from_f32_slice(out, x.shape().clone(), dev)
+            })
+            .collect()
+    }
+
+    /// Every rank's `parts[rank]` summed onto every rank's card. Each part is a contiguous F32
+    /// tensor on its rank's card.
+    pub(super) fn all_reduce(&self, parts: &[Tensor]) -> Result<Vec<Tensor>> {
+        use cudarc::nccl::safe::{group_end, group_start, ReduceOp};
+        let nccl =
+            |e: cudarc::nccl::result::NcclError| crate::tensor::Error::msg(format!("nccl: {e:?}"));
+        let slices = parts
+            .iter()
+            .map(crate::tensor::cuda_ext::f32_slice_of)
+            .collect::<Result<Vec<_>>>()?;
+        let views = slices
+            .iter()
+            .map(|s| s.view())
+            .collect::<Result<Vec<_>>>()?;
+        let mut outs = self
+            .comms
+            .iter()
+            .zip(parts)
+            .map(|(c, p)| unsafe { c.stream().alloc::<f32>(p.elem_count()) })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::tensor::Error::msg(format!("{e:?}")))?;
+        group_start().map_err(nccl)?;
+        for ((comm, view), out) in self.comms.iter().zip(&views).zip(outs.iter_mut()) {
+            comm.all_reduce(view, out, &ReduceOp::Sum).map_err(nccl)?;
+        }
+        group_end().map_err(nccl)?;
+        outs.into_iter()
+            .zip(parts)
+            .map(|(out, p)| {
+                crate::tensor::cuda_ext::tensor_from_f32_slice(out, p.shape().clone(), &p.device())
+            })
+            .collect()
+    }
+
+    /// `x` on every rank: the copies a split layer kept when `x` is what it returned on rank 0,
+    /// else `x` sent out to the cards of `to`, ranks 1 onwards.
+    pub(super) fn replicas_of(&self, x: &Tensor, to: &[Device]) -> Result<Vec<Tensor>> {
+        let kept = self
+            .replicas
+            .lock()
+            .map_err(|_| crate::tensor::Error::msg("tensor-parallel replicas poisoned"))?;
+        if let Some((own, copies)) = kept.as_ref() {
+            if own.shares_storage(x) && own.dims() == x.dims() {
+                return Ok(std::iter::once(x.clone())
+                    .chain(copies.iter().cloned())
+                    .collect());
+            }
+        }
+        drop(kept);
+        let copies = self.send_out(x, to)?;
+        Ok(std::iter::once(x.clone()).chain(copies).collect())
+    }
+
+    /// Keeps `all`, one hidden state per rank, for the next split layer.
+    pub(super) fn keep(&self, mut all: Vec<Tensor>) -> Result<()> {
+        let mut kept = self
+            .replicas
+            .lock()
+            .map_err(|_| crate::tensor::Error::msg("tensor-parallel replicas poisoned"))?;
+        let own = all.remove(0);
+        *kept = Some((own, all));
+        Ok(())
+    }
+
+    /// Drops the kept copies and has rank 0's stream wait for every other rank's, which ends
+    /// their part of a step rank 0 is recording.
+    pub(super) fn forget(&self) -> Result<()> {
+        if let Ok(mut kept) = self.replicas.lock() {
+            kept.take();
+        }
+        self.join()
+    }
+
+    /// Rank 0's stream waits for the work issued so far on every other rank's.
+    pub(super) fn join(&self) -> Result<()> {
+        for c in &self.comms[1..] {
+            let done = crate::tensor::cuda_ext::record_event(&c.stream())?;
+            crate::tensor::cuda_ext::wait_event(&self.comms[0].stream(), &done)?;
+        }
+        Ok(())
+    }
+
+    /// `own`, on rank 0's card, plus the partials of ranks 1 onwards, summed on rank 0's card.
+    /// Rank 0's stream then waits for the others, which ends their part of a recorded step.
+    fn sum_in(&self, own: &Tensor, parts: &[Tensor]) -> Result<Tensor> {
+        use cudarc::nccl::safe::{group_end, group_start, ReduceOp};
+        let nccl =
+            |e: cudarc::nccl::result::NcclError| crate::tensor::Error::msg(format!("nccl: {e:?}"));
+        let slices = std::iter::once(own)
+            .chain(parts)
+            .map(crate::tensor::cuda_ext::f32_slice_of)
+            .collect::<Result<Vec<_>>>()?;
+        let views = slices
+            .iter()
+            .map(|s| s.view())
+            .collect::<Result<Vec<_>>>()?;
+        let mut out = unsafe { self.comms[0].stream().alloc::<f32>(own.elem_count()) }
+            .map_err(|e| crate::tensor::Error::msg(format!("{e:?}")))?;
+        group_start().map_err(nccl)?;
+        self.comms[0]
+            .reduce(&views[0], Some(&mut out), &ReduceOp::Sum, 0)
+            .map_err(nccl)?;
+        for (comm, view) in self.comms[1..].iter().zip(&views[1..]) {
+            comm.reduce(
+                view,
+                None::<&mut cudarc::driver::CudaSlice<f32>>,
+                &ReduceOp::Sum,
+                0,
+            )
+            .map_err(nccl)?;
+        }
+        group_end().map_err(nccl)?;
+        self.join()?;
+        crate::tensor::cuda_ext::tensor_from_f32_slice(out, own.shape().clone(), &own.device())
+    }
+}
+
+/// `x` on the card of every share in `shards`: sent through the group's communicators when they
+/// take it, copied otherwise.
+pub(super) fn tp_send_out(
+    x: &Tensor,
+    shards: &[GenericTransformerLayer],
+    comms: Option<&TpComms>,
+) -> Result<Vec<Tensor>> {
+    #[cfg(feature = "cuda")]
+    if let Some(c) = comms.filter(|c| c.takes(x, shards.len() + 1)) {
+        let to: Vec<Device> = shards.iter().map(|s| s.cos.device()).collect();
+        return c.send_out(x, &to);
+    }
+    let _ = comms;
+    shards
+        .iter()
+        .map(|s| x.to_device(&s.cos.device()))
+        .collect()
+}
+
+/// `own` plus every partial output of a tensor-parallel layer's other shares, on `own`'s card:
+/// reduced through the group's communicators when they take them, copied and added otherwise.
+pub(super) fn tp_sum(own: Tensor, parts: Vec<Tensor>, comms: Option<&TpComms>) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if let Some(c) = comms.filter(|c| {
+        c.takes(&own, parts.len() + 1) && parts.iter().all(|p| c.takes(p, parts.len() + 1))
+    }) {
+        return c.sum_in(&own, &parts);
+    }
+    let _ = comms;
     let dev = own.device();
     parts
         .into_iter()

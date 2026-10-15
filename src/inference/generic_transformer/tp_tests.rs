@@ -67,6 +67,22 @@ fn a_layer_split_across_two_cards_computes_the_whole_layer() {
         split.layers.iter().all(|l| l.tp_shards.len() == 1),
         "every layer split"
     );
+    // Each share reads its weights on its own card.
+    let card = |i: usize| Device::new_cuda(i).unwrap();
+    for l in &split.layers {
+        assert!(
+            l.ffn_down.device().same_device(&card(0)),
+            "rank 0 on card 0"
+        );
+        assert!(
+            l.tp_shards[0].ffn_down.device().same_device(&card(1)),
+            "rank 1 on card 1"
+        );
+        assert!(
+            l.tp_shards[0].attn_output.device().same_device(&card(1)),
+            "rank 1 on card 1"
+        );
+    }
     let mut both = |what: &str, f: &dyn Fn(&mut GenericHeteroTransformer) -> Tensor| {
         close(&rows(&f(&mut split)), &rows(&f(&mut whole)), what);
     };

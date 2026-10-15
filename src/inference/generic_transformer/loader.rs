@@ -813,23 +813,26 @@ fn tp_refusal(
 
 /// The share of rank `rank` of `ranks` of `raw`: q, k, v and the feed-forward's gate and up cut
 /// by rows, the attention output and the feed-forward's down cut by columns, the norms whole, the
-/// output biases on the first rank alone. [`tp_refusal`] said the layer splits.
+/// output biases on the first rank alone, the projections on `card`. [`tp_refusal`] said the
+/// layer splits.
 fn tp_share(
     raw: &RawGenericLayer,
     config: &GenericTransformerConfig,
     layout: &TpLayout,
     rank: usize,
+    card: &Device,
 ) -> Result<RawGenericLayer> {
     let host = |qt: &QTensor| QTensor::from_native(qt.native_qtensor().clone(), &Device::Cpu);
     let whole = |qt: &Option<QTensor>| qt.as_ref().map(host).transpose();
     let rows = |qt: &QTensor, (from, per): (usize, usize)| -> Result<QTensor> {
-        crate::tensor::quant_view::rows_view(&std::sync::Arc::new(host(qt)?), from, per)
+        crate::tensor::quant_view::rows_view(&std::sync::Arc::new(host(qt)?), from, per)?
+            .to_device(card)
     };
     let rows_opt = |qt: &Option<QTensor>, range: (usize, usize)| {
         qt.as_ref().map(|q| rows(q, range)).transpose()
     };
     let columns = |qt: &QTensor, (from, per): (usize, usize)| {
-        crate::tensor::quant_view::columns_copy(qt, from, per)
+        crate::tensor::quant_view::columns_copy(qt, from, per)?.to_device(card)
     };
     let vector = |qt: &Option<QTensor>, (from, per): (usize, usize)| -> Result<Option<QTensor>> {
         qt.as_ref()
@@ -1939,6 +1942,7 @@ fn build_generic_layer(
 
     let mut layer = GenericTransformerLayer {
         tp_shards: Vec::new(),
+        tp_comms: None,
         mixer,
         has_ffn: raw.has_ffn,
         attn_gate: to_qmatmul(raw.attn_gate)?,
@@ -2432,6 +2436,7 @@ fn build_awq_layer(
 
     Ok(GenericTransformerLayer {
         tp_shards: Vec::new(),
+        tp_comms: None,
         mixer: super::mixer::Mixer::Attention,
         has_ffn: true,
         attn_gate: None,
@@ -3174,10 +3179,18 @@ impl GenericHeteroTransformer {
         let f = &flags;
         let ti = &content.tensor_infos;
 
-        let load_one = |idx: usize, dk: DeviceKind| -> crate::tensor::Result<RawGenericLayer> {
+        // A layer split across cards is read on the host and each share goes to its own card;
+        // the whole layer is never on one card.
+        let split_plan = plan.tp_cards.as_ref().is_some_and(|c| c.len() > 1);
+        let load_layer = |idx: usize,
+                          dk: DeviceKind,
+                          on_host: bool|
+         -> crate::tensor::Result<RawGenericLayer> {
             let prefix = format!("blk.{idx}");
             let weight_dev = match dk {
-                DeviceKind::Cuda(gpu_idx) => cuda_devices.get(&gpu_idx).unwrap_or(&Device::Cpu),
+                DeviceKind::Cuda(gpu_idx) if !on_host => {
+                    cuda_devices.get(&gpu_idx).unwrap_or(&Device::Cpu)
+                }
                 _ => &Device::Cpu,
             };
 
@@ -3620,12 +3633,12 @@ impl GenericHeteroTransformer {
         let raw_layers: Vec<RawGenericLayer> = if distinct_gpus.len() > 1 {
             layer_devices
                 .into_iter()
-                .map(|(idx, dk)| load_one(idx, dk))
+                .map(|(idx, dk)| load_layer(idx, dk, split_plan))
                 .collect::<Result<Vec<_>>>()?
         } else {
             layer_devices
                 .into_par_iter()
-                .map(|(idx, dk)| load_one(idx, dk))
+                .map(|(idx, dk)| load_layer(idx, dk, split_plan))
                 .collect::<Result<Vec<_>>>()?
         };
 
@@ -3652,6 +3665,21 @@ impl GenericHeteroTransformer {
         // was the dominant load cost). For a genuine multi-GPU split (mixed contexts)
         // a rayon worker could stripe across both devices, so build sequentially.
         let layer_ropes = LayerRopes::default();
+        // One set of communicators for the group, shared by every split layer.
+        #[cfg(feature = "cuda")]
+        let tp_comms = plan
+            .tp_cards
+            .as_ref()
+            .filter(|c| c.len() > 1)
+            .and_then(|cards| {
+                let devices = cards
+                    .iter()
+                    .map(|c| cuda_devices.get(&c.index).cloned())
+                    .collect::<Option<Vec<_>>>()?;
+                super::TpComms::new(&devices).map(Arc::new)
+            });
+        #[cfg(not(feature = "cuda"))]
+        let tp_comms: Option<Arc<super::TpComms>> = None;
         let build_one = |raw: RawGenericLayer| -> Result<(GenericTransformerLayer, LayerDevice)> {
             let (device, dev_enum) = match raw.device_kind {
                 DeviceKind::Cuda(idx) => (
@@ -3670,9 +3698,13 @@ impl GenericHeteroTransformer {
             let layer_idx = raw.layer_idx;
             // A tensor-parallel plan splits each layer that can be split among its cards, the
             // first holding the layer; one that cannot runs whole where its segment puts it.
+            let mut raw = raw;
             if let Some(cards) = plan.tp_cards.as_ref().filter(|c| c.len() > 1) {
                 match tp_refusal(&raw, &config, cards.len()) {
-                    Some(why) => tracing::info!("layer {layer_idx} runs whole: {why}"),
+                    Some(why) => {
+                        tracing::info!("layer {layer_idx} runs whole: {why}");
+                        raw = load_layer(layer_idx, raw.device_kind, false)?;
+                    }
                     None => {
                         let ranks = cards.len();
                         let weights: Vec<f64> = cards.iter().map(|c| c.weight).collect();
@@ -3703,7 +3735,7 @@ impl GenericHeteroTransformer {
                                     ))
                                 })?;
                             shares.push(build_generic_layer(
-                                tp_share(&raw, &config, &layout, rank)?,
+                                tp_share(&raw, &config, &layout, rank, dev)?,
                                 dev,
                                 &share_config,
                                 share_flags,
@@ -3715,6 +3747,7 @@ impl GenericHeteroTransformer {
                         }
                         let mut owner = shares.remove(0);
                         owner.tp_shards = shares;
+                        owner.tp_comms = tp_comms.clone();
                         source.release_layer_pages(layer_idx);
                         return Ok((owner, LayerDevice::Cuda(cards[0].index)));
                     }
