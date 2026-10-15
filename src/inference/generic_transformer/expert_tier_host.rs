@@ -10,6 +10,9 @@ pub use super::moe_weights::prefill_bytes_per_token;
 /// A layer's cache of its experts on a card: none is ever built here.
 pub struct LayerTier;
 
+/// A shared expert's projections queued in a recorded decode: none without a card.
+pub(crate) struct GraphPending;
+
 /// The thread serving a card's recorded decode: none without a card.
 pub struct TierWorker;
 
@@ -36,6 +39,28 @@ impl LayerTier {
 
     pub(super) fn keep_hottest_of_prompt(&self, _: &Tensor, _: &()) -> Result<()> {
         Ok(())
+    }
+
+    pub(crate) fn rows_through_cache(&self, _rows: usize, _used: usize) -> bool {
+        false
+    }
+
+    pub(crate) fn graph_begin(
+        &self,
+        _: &MoeWeights,
+        _: &Tensor,
+        _: &Tensor,
+        _: &Tensor,
+    ) -> Result<GraphPending> {
+        crate::tensor::bail!("an expert cache lives on a card")
+    }
+
+    pub(crate) fn graph_end(&self, _: GraphPending) -> Result<Tensor> {
+        crate::tensor::bail!("an expert cache lives on a card")
+    }
+
+    pub fn mailbox_state(&self) -> Option<String> {
+        None
     }
 
     pub(super) fn graph_ready(&self) -> bool {
@@ -105,7 +130,18 @@ impl super::GenericHeteroTransformer {
         _: &std::collections::HashMap<usize, Device>,
         _: &crate::inference::place::layer_executor::HeteroPlan,
         _: &std::collections::HashMap<usize, u64>,
+        _: bool,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// No card holds a cache of the experts: no slots to lend a prefill.
+    pub fn lend_expert_cache(&mut self, _tokens: usize) -> usize {
+        0
+    }
+
+    /// No card holds a cache of the experts: nothing lent to return.
+    pub fn return_expert_cache(&mut self) -> Result<usize> {
+        Ok(0)
     }
 }

@@ -912,7 +912,11 @@ impl LlmEngine {
                     // The head guesses once the step is recorded: a window is held against the
                     // recorded step's kernels, which an eager step before the recording does not
                     // run (its indexed attention selects on the host).
-                    let head_draft: Vec<u32> = if head_on && cuda_graph.is_some() {
+                    #[cfg(feature = "cuda")]
+                    let step_recorded = cuda_graph.is_some();
+                    #[cfg(not(feature = "cuda"))]
+                    let step_recorded = false;
+                    let head_draft: Vec<u32> = if head_on && step_recorded {
                         // The head drafts as far as the window carries, each guess while it is
                         // confident enough.
                         use crate::inference::engine::decode_step::{DRAFT_MAX, HEAD_MIN_ODDS};
@@ -959,6 +963,7 @@ impl LlmEngine {
                                 { cuda_graph = None; }
                                 graph_logits = None;
                                 state.model.invalidate_graph_state();
+                                #[cfg(feature = "cuda")]
                                 verify_graphs.clear();
                                 match state.model.update_graph_state(pos) {
                                     Ok(()) => {
@@ -997,6 +1002,7 @@ impl LlmEngine {
                                 // transients as no-ops) BEFORE freeing the
                                 // capture arena.
                                 state.model.invalidate_graph_state();
+                                #[cfg(feature = "cuda")]
                                 verify_graphs.clear();
                             }
                         }
@@ -1623,10 +1629,14 @@ impl LlmEngine {
                             graph_capture_attempted = false;
                         }
                         let recorded_window = recorded.is_some();
+                        #[cfg(feature = "cuda")]
+                        let windows_given_up = verify_graphs.disabled;
+                        #[cfg(not(feature = "cuda"))]
+                        let windows_given_up = false;
                         let replay_secs = recorded.as_ref().and_then(|r| r.1);
                         // An eager verify costs the head more than the plain steps it stands
                         // for: once the windows are given up, the head stops guessing.
-                        if head_on && windows_served && !recorded_window && verify_graphs.disabled {
+                        if head_on && windows_served && !recorded_window && windows_given_up {
                             head_on = false;
                             state.model.draft_head_capture(false);
                         }

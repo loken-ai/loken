@@ -40,6 +40,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Build: the cpu-only configuration compiles again.
 - Server: the [server] port of config.toml is used when --port is not given.
 - Config: a partial file is read, the settings it leaves out take their defaults.
 - N-gram embedding: a forward run again after a failure finds the history where it was.

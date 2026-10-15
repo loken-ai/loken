@@ -1057,6 +1057,10 @@ impl LlmEngine {
             };
             #[cfg(not(feature = "cuda"))]
             let graph_eligible = false;
+            #[cfg(not(feature = "cuda"))]
+            let graph_ok = false;
+            #[cfg(not(feature = "cuda"))]
+            let graph_disabled_this_request = false;
             let pld_capable = {
                 let guard = model_state.blocking_lock();
                 guard
@@ -1269,7 +1273,6 @@ impl LlmEngine {
             // them.
             let ends = |t: u32| t == eos_token_id || eos_extra.contains(&t);
             'stream_loop: while !ends(next_token) && token_count < max_tokens {
-                #[cfg(feature = "cuda")]
                 let step_start = Instant::now();
                 loop_iters += 1;
                 if let Some(t) = cycle_end.take() {
@@ -1620,7 +1623,11 @@ impl LlmEngine {
                         && pld_cooldown == 0
                         && pld_cost.worth_trying()
                         && !super::decode::copy_draft(&pld_cache).is_empty();
-                    let head_draft: Vec<u32> = if head_on && cuda_graph.is_some() && !copy_ready {
+                    #[cfg(feature = "cuda")]
+                    let step_recorded = cuda_graph.is_some();
+                    #[cfg(not(feature = "cuda"))]
+                    let step_recorded = false;
+                    let head_draft: Vec<u32> = if head_on && step_recorded && !copy_ready {
                         // The head drafts as far as the window carries, each guess while it is
                         // confident enough.
                         use crate::inference::engine::decode_step::{DRAFT_MAX, HEAD_MIN_ODDS};
@@ -2194,7 +2201,6 @@ impl LlmEngine {
                             // runs eagerly.
                             let windows_served =
                                 config.recorded_drafts && graph_ok && !graph_disabled_this_request;
-                            #[cfg(feature = "cuda")]
                             let replaying = std::time::Instant::now();
                             if head_on {
                                 window_iters += 1;
@@ -2204,6 +2210,7 @@ impl LlmEngine {
                                     .mul_add(1e9, 0.0)
                                     as u64;
                             }
+                            #[cfg(feature = "cuda")]
                             let recorded = match (windows_served, graph_stream.as_ref()) {
                                 (true, Some(s)) => super::decode::verify_recorded(
                                     &mut state.model,
@@ -2229,16 +2236,16 @@ impl LlmEngine {
                                 graph_capture_attempted = false;
                             }
                             let recorded_window = recorded.is_some();
+                            #[cfg(feature = "cuda")]
+                            let windows_given_up = verify_graphs.disabled;
+                            #[cfg(not(feature = "cuda"))]
+                            let windows_given_up = false;
                             if recorded_window {
                                 replay_sum += replaying.elapsed().as_secs_f64();
                             }
                             // An eager verify costs the head more than the plain steps it stands
                             // for: once the windows are given up, the head stops guessing.
-                            if head_on
-                                && windows_served
-                                && !recorded_window
-                                && verify_graphs.disabled
-                            {
+                            if head_on && windows_served && !recorded_window && windows_given_up {
                                 head_on = false;
                                 state.model.draft_head_capture(false);
                             }
@@ -2702,6 +2709,11 @@ impl LlmEngine {
                     s.model.draft_head_capture(false);
                 }
                 if spec_drafted > 0 || head_cycles > 0 || head_empty > 0 {
+                    #[cfg(feature = "cuda")]
+                    let (verify_prepare_secs, verify_launch_secs) =
+                        (verify_graphs.prepare_secs, verify_graphs.launch_secs);
+                    #[cfg(not(feature = "cuda"))]
+                    let (verify_prepare_secs, verify_launch_secs) = (0.0_f64, 0.0_f64);
                     info!(
                         "Spec decode done: drafted={} accepted={} ({}%), next draft length {}; copies: {copy_windows} windows, {copy_accepted} of {copy_drafted} kept; plain step: {} launch, {} wait, {} sample ms over {plain_steps}; head: {head_cycles} verifies ({head_recorded} recorded: replayed in {:.1} ms of which {:.1} preparing and {:.1} launching, committed in {:.1} ms, settled in {:.1} ms each), {head_empty} steps without a guess; {}; loop {:.1} ms an iteration ({} iterations), before the cycle {:.1} ms, after it {:.1} ms, the head's attempt {:.1} ms; a window's iteration before the verify {:.1} ms, from its commit to the cycle's end {:.1} ms",
                         spec_drafted,
@@ -2712,8 +2724,8 @@ impl LlmEngine {
                         plain_wait_ns as f64 / 1e6 / plain_steps.max(1) as f64,
                         plain_sample_ns as f64 / 1e6 / plain_steps.max(1) as f64,
                         replay_sum * 1e3 / head_recorded.max(1) as f64,
-                        verify_graphs.prepare_secs * 1e3 / head_recorded.max(1) as f64,
-                        verify_graphs.launch_secs * 1e3 / head_recorded.max(1) as f64,
+                        verify_prepare_secs * 1e3 / head_recorded.max(1) as f64,
+                        verify_launch_secs * 1e3 / head_recorded.max(1) as f64,
                         commit_sum * 1e3 / head_recorded.max(1) as f64,
                         settle_secs * 1e3 / settles.max(1) as f64,
                         spec_engine.draft_length.lock().unwrap_or_else(|e| e.into_inner()).summary(),

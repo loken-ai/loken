@@ -317,6 +317,7 @@ impl Default for VerifyGraphs {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl VerifyGraphs {
     /// Forget the graphs: the buffers they read are gone with the step's.
     pub(super) fn clear(&mut self) {
@@ -344,9 +345,6 @@ pub(super) fn copy_draft(
     }
 }
 
-/// Wait for the card without keeping a core busy; a wait that lasts says what every expert
-/// cache's mailbox holds, once, since a step recorded against them waits on the host there.
-#[cfg(feature = "cuda")]
 /// Whether every row of `logits` (`[.., rows, vocab]`) is finite: a row's sum is not finite
 /// when any of its values is not.
 #[cfg(feature = "cuda")]
@@ -376,6 +374,9 @@ fn rows_told(logits: &Tensor) -> crate::tensor::Result<String> {
     Ok(out.join("; "))
 }
 
+/// Wait for the card without keeping a core busy; a wait that lasts says what every expert
+/// cache's mailbox holds, once, since a step recorded against them waits on the host there.
+#[cfg(feature = "cuda")]
 fn wait_telling(
     model: &BoxedModelBackend,
     stream: &std::sync::Arc<crate::tensor::cuda_ext::CudaStream>,

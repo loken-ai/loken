@@ -54,6 +54,7 @@ pub(crate) struct VerifyBuffers {
     /// The rows' positions on each card, `[VERIFY_ROWS]` i32.
     pos_by_card: HashMap<usize, Tensor>,
     /// The rows' hops between consecutive cards, one per boundary.
+    #[cfg(feature = "cuda")]
     hops: Vec<super::graph::GraphHop>,
     /// The verify in flight, from its preparation to its settlement.
     pub(super) window: Option<VerifyWindow>,

@@ -198,6 +198,7 @@ impl ExpertRouting {
         })
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn down_reduce_over(
         &self,
         rows: &Tensor,

@@ -1809,6 +1809,7 @@ impl ModelBackend for GenericBackend {
         self.0.verify_window_settle(kept)
     }
 
+    #[cfg(feature = "cuda")]
     fn plain_step_held(&mut self, token: u32, pos: usize) -> crate::tensor::Result<Vec<f32>> {
         self.0.plain_step_held(token, pos)
     }
