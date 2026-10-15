@@ -259,6 +259,136 @@ pub fn card_pair_link(_from: usize, _to: usize) -> Option<(f64, f64)> {
     None
 }
 
+/// What summing a message onto every card of `cards` costs through NCCL, the path split layers
+/// take: microseconds for a small one and bytes per microsecond beyond it, measured once a group.
+/// `None` when a card cannot be opened or NCCL does not take the group.
+#[cfg(feature = "cuda")]
+pub fn group_sum(cards: &[usize]) -> Option<(f64, f64)> {
+    use cudarc::nccl::safe::{group_end, group_start, Comm, ReduceOp};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static GROUPS: OnceLock<Mutex<HashMap<Vec<usize>, Option<(f64, f64)>>>> = OnceLock::new();
+    let groups = GROUPS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = groups.lock().unwrap_or_else(|e| e.into_inner()).get(cards) {
+        return *known;
+    }
+    let measured = (|| -> Option<(f64, f64)> {
+        if cards.len() < 2 || !crate::tensor::cuda::runtime::nccl_present() {
+            return None;
+        }
+        let streams = cards
+            .iter()
+            .map(|&c| {
+                let dev = crate::tensor::Device::new_cuda(c).ok()?;
+                dev.as_cuda_device().ok().map(|d| d.cuda_stream())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let comms = Comm::from_devices(streams.clone()).ok()?;
+        // A row of activations and a block far larger than any latency.
+        let (small, large) = (4096usize, 8usize << 20);
+        let time = |elems: usize, times: usize| -> Option<f64> {
+            let mut bufs = streams
+                .iter()
+                .map(|s| s.alloc_zeros::<f32>(elems).ok())
+                .collect::<Option<Vec<_>>>()?;
+            let settled = || streams.iter().all(|s| s.synchronize().is_ok());
+            settled().then_some(())?;
+            let mut runs: Vec<f64> = (0..times)
+                .filter_map(|_| {
+                    let start = std::time::Instant::now();
+                    group_start().ok()?;
+                    for (comm, buf) in comms.iter().zip(bufs.iter_mut()) {
+                        comm.all_reduce_in_place(buf, &ReduceOp::Sum).ok()?;
+                    }
+                    group_end().ok()?;
+                    settled().then_some(())?;
+                    Some(start.elapsed().as_secs_f64() * 1e6)
+                })
+                .collect();
+            runs.sort_by(f64::total_cmp);
+            runs.get(runs.len() / 2).copied()
+        };
+        // The first sum of a group opens its paths; it is not timed.
+        time(small, 1)?;
+        let small_us = time(small, 9)?;
+        let large_us = time(large, 3)?;
+        let bytes = ((large - small) * 4) as f64;
+        Some((
+            small_us,
+            bytes / (large_us - small_us).max(f64::MIN_POSITIVE),
+        ))
+    })();
+    if let Some((us, rate)) = measured {
+        tracing::info!(
+            "cards {cards:?} sum through NCCL: {us:.1} us a small message, {:.1} GB/s",
+            rate * 1e6 / 1e9
+        );
+    }
+    groups
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cards.to_vec(), measured);
+    measured
+}
+
+/// Floating point operations per microsecond card `card` runs a block of prompt rows through a
+/// projection at: a BF16 product as wide as a layer's, measured once a card. `None` when the card
+/// cannot be opened.
+#[cfg(feature = "cuda")]
+pub fn card_matmul_rate(card: usize) -> Option<f64> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static RATES: OnceLock<Mutex<HashMap<usize, Option<f64>>>> = OnceLock::new();
+    let rates = RATES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = rates.lock().unwrap_or_else(|e| e.into_inner()).get(&card) {
+        return *known;
+    }
+    let measured = (|| -> Option<f64> {
+        use crate::tensor::{DType, Tensor};
+        let dev = crate::tensor::Device::new_cuda(card).ok()?;
+        // Rows of a prompt block through a square projection of a mid-sized model.
+        let (rows, width) = (512usize, 4096usize);
+        let x = Tensor::zeros_on((rows, width), DType::BF16, &dev).ok()?;
+        let w = Tensor::zeros_on((width, width), DType::BF16, &dev).ok()?;
+        let time = || -> Option<f64> {
+            dev.synchronize().ok()?;
+            let start = std::time::Instant::now();
+            x.matmul(&w).ok()?;
+            dev.synchronize().ok()?;
+            Some(start.elapsed().as_secs_f64() * 1e6)
+        };
+        // The first product loads the library's kernels; it is not timed.
+        time()?;
+        let mut runs: Vec<f64> = (0..5).filter_map(|_| time()).collect();
+        runs.sort_by(f64::total_cmp);
+        let us = runs.get(runs.len() / 2).copied()?;
+        Some(2.0 * (rows * width * width) as f64 / us.max(f64::MIN_POSITIVE))
+    })();
+    if let Some(rate) = measured {
+        tracing::info!(
+            "card {card} projection rate: {:.1} TFLOP/s",
+            rate * 1e6 / 1e12
+        );
+    }
+    rates
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(card, measured);
+    measured
+}
+
+/// No-CUDA build: no card to measure.
+#[cfg(not(feature = "cuda"))]
+pub fn card_matmul_rate(_card: usize) -> Option<f64> {
+    None
+}
+
+/// No-CUDA build: no cards to sum across.
+#[cfg(not(feature = "cuda"))]
+pub fn group_sum(_cards: &[usize]) -> Option<(f64, f64)> {
+    None
+}
+
 pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
     let mut gpu_info: Vec<CudaGpuInfo> = Vec::new();
     match nvml_wrapper::Nvml::init() {

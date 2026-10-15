@@ -1012,12 +1012,24 @@ impl LlmEngine {
                     // A dense model that does not sit on one card may split every layer across a
                     // group of cards instead of placing them layer by layer: when the file's layers
                     // split, the group holds it, and the measured reads and links predict it faster.
+                    // What a row costs through a layer: a multiply and an add per weight of the
+                    // layers' matrices.
+                    let row_flops = 2.0
+                        * content
+                            .tensor_infos
+                            .iter()
+                            .filter(|(name, t)| name.starts_with("blk.") && t.shape.dims().len() == 2)
+                            .map(|(_, t)| t.shape.elem_count() as f64)
+                            .sum::<f64>()
+                        / num_layers.max(1) as f64;
                     let tp_plan = (awq.is_none() && layer_share.is_none() && split.is_none())
                         .then(|| {
                             crate::inference::place::tensor_parallel::plan(
                                 &demand,
                                 &cuda_devices,
                                 (dims.hidden_size * std::mem::size_of::<f32>()) as u64,
+                                row_flops,
+                                super::PREFILL_CHUNK_TOKENS,
                                 |ranks| crate::inference::generic_transformer::tp_file_refusal(&content, &arch, ranks),
                             )
                         })

@@ -3,9 +3,11 @@
 //!
 //! Whether it pays is predicted from measured quantities only, against the layer by layer split
 //! the planner otherwise makes, where a token crosses the cards in turn and each reads its own
-//! layers whole. Split, a layer's bytes are read by the group together, and each sublayer pays a
-//! trip of the activations to every other card and of its partial output back. A machine whose
-//! links cost more than the reads they save keeps the layer split.
+//! layers whole. Split, a layer's bytes are read by the group together, in proportion to each
+//! card's read rate, and each layer sums its attention and its feed-forward onto every card. The
+//! split is chosen when it is predicted faster both for a decoded token and for a block of prompt
+//! rows: a group whose sums cost more than the reads and the products they save keeps the layers
+//! whole. A card's share of a layer takes the longer of its read and its product of the rows.
 
 use super::expert_parallel::ShardCard;
 
@@ -45,34 +47,72 @@ pub struct DenseStack {
     pub layer_bytes: u64,
     /// Bytes of one row of activations as it crosses a link.
     pub row_bytes: u64,
+    /// Floating point operations one row costs through one layer's projections.
+    pub row_flops: f64,
 }
 
-/// Predicted microseconds of a token through the stack with each layer split over `cards`, the
-/// first being the layers' own card, in proportion to their read rates: per layer, the cards'
-/// read of their shares, which finish together, and two sublayers each sending `rows` rows out
-/// to every other card and the partial outputs back.
-pub fn split_us(stack: &DenseStack, cards: &[ShardCard], rows: usize) -> f64 {
-    let read = stack.layer_bytes as f64 / cards.iter().map(|c| c.read_bytes_per_us).sum::<f64>();
-    let trip = cards
+/// Microseconds a card spends on `fraction` of a layer for `rows` rows: the longer of reading its
+/// part of the weights at `read` bytes and multiplying the rows through it at `flops` operations
+/// per microsecond.
+fn share_us(stack: &DenseStack, fraction: f64, read: f64, flops: f64, rows: usize) -> f64 {
+    let bytes = fraction * stack.layer_bytes as f64 / read;
+    let product = fraction * rows as f64 * stack.row_flops / flops;
+    bytes.max(product)
+}
+
+/// What summing a message onto every card of a group costs: microseconds for a small one and
+/// bytes per microsecond beyond it.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupSum {
+    pub us: f64,
+    pub bytes_per_us: f64,
+}
+
+/// Predicted microseconds of `rows` rows through the stack with each layer run on every card of
+/// `cards` in proportion to their read rates, `flops[i]` the product rate of `cards[i]`: per
+/// layer, the slowest card's share, and two sums of `rows` rows onto every card, each card
+/// sending its part `2 (n - 1) / n` times over.
+pub fn split_us(
+    stack: &DenseStack,
+    cards: &[ShardCard],
+    flops: &[f64],
+    sum: GroupSum,
+    rows: usize,
+) -> f64 {
+    let n = cards.len() as f64;
+    let total_read: f64 = cards.iter().map(|c| c.read_bytes_per_us).sum();
+    let share = cards
         .iter()
-        .skip(1)
-        .map(|c| 2.0 * (c.link_us + rows as f64 * stack.row_bytes as f64 / c.link_bytes_per_us))
+        .zip(flops)
+        .map(|(c, &f)| {
+            share_us(
+                stack,
+                c.read_bytes_per_us / total_read,
+                c.read_bytes_per_us,
+                f,
+                rows,
+            )
+        })
         .fold(0.0, f64::max);
-    stack.layers as f64 * (read + 2.0 * trip)
+    let bytes = rows as f64 * stack.row_bytes as f64 * 2.0 * (n - 1.0) / n;
+    stack.layers as f64 * (share + 2.0 * (sum.us + bytes / sum.bytes_per_us))
 }
 
-/// Predicted microseconds of a token through the stack placed layer by layer: `layers_on[i]`
-/// layers read whole by `cards[i]` in turn, and one trip of `rows` rows at each change of card.
+/// Predicted microseconds of `rows` rows through the stack placed layer by layer: `layers_on[i]`
+/// layers run whole by `cards[i]` in turn, at the product rate `flops[i]`, and one trip of the
+/// rows at each change of card.
 pub fn layered_us(
     stack: &DenseStack,
     cards: &[ShardCard],
+    flops: &[f64],
     layers_on: &[usize],
     rows: usize,
 ) -> f64 {
     let reads: f64 = cards
         .iter()
+        .zip(flops)
         .zip(layers_on)
-        .map(|(c, &n)| n as f64 * stack.layer_bytes as f64 / c.read_bytes_per_us)
+        .map(|((c, &f), &n)| n as f64 * share_us(stack, 1.0, c.read_bytes_per_us, f, rows))
         .sum();
     let hops: f64 = cards
         .iter()
@@ -84,26 +124,35 @@ pub fn layered_us(
     reads + hops
 }
 
-/// Whether splitting every layer over `cards` is predicted faster for `rows` rows than the
-/// layer by layer placement `layers_on`.
+/// Whether splitting every layer over `cards` is predicted faster than the layer by layer
+/// placement `layers_on`, for a decoded token and for `prompt_rows` rows of a prompt.
 pub fn split_pays(
     stack: &DenseStack,
     cards: &[ShardCard],
+    flops: &[f64],
+    sum: GroupSum,
     layers_on: &[usize],
-    rows: usize,
+    prompt_rows: usize,
 ) -> bool {
-    cards.len() > 1 && split_us(stack, cards, rows) < layered_us(stack, cards, layers_on, rows)
+    cards.len() > 1
+        && [1, prompt_rows].iter().all(|&rows| {
+            split_us(stack, cards, flops, sum, rows)
+                < layered_us(stack, cards, flops, layers_on, rows)
+        })
 }
 
 /// Whether `demand`, a dense stack of rows `row_bytes` wide, runs faster split over `cards` (the
-/// first holding the layers) than as the planner places it layer by layer in `layered`, from each
-/// card's measured read rate and the measured links from the first card. A layered plan that
+/// first holding the layers) than as the planner places it layer by layer in `layered`, for a
+/// decoded token and for `prompt_rows` rows of a prompt, from each card's measured read rate, the
+/// measured links from the first card and the measured sum across the group. A layered plan that
 /// leaves layers on the host is beaten by any split that holds them on the cards.
 pub fn pays_over(
     demand: &super::ladder::Demand,
     layered: &super::layer_executor::HeteroPlan,
     cards: &[usize],
     row_bytes: u64,
+    row_flops: f64,
+    prompt_rows: usize,
 ) -> bool {
     use super::layer_executor::DeviceKind;
     let Some(&owner) = cards.first() else {
@@ -145,21 +194,42 @@ pub fn pays_over(
                 .sum()
         })
         .collect();
+    let Some((us, bytes_per_us)) = super::device_probe::group_sum(cards) else {
+        return false;
+    };
+    let Some(flops) = cards
+        .iter()
+        .map(|&c| super::device_probe::card_matmul_rate(c))
+        .collect::<Option<Vec<f64>>>()
+    else {
+        return false;
+    };
     let stack = DenseStack {
         layers: demand.layers,
         layer_bytes: demand.block_bytes / demand.layers.max(1) as u64,
         row_bytes,
+        row_flops,
     };
-    split_pays(&stack, &shard_cards, &layers_on, 1)
+    split_pays(
+        &stack,
+        &shard_cards,
+        &flops,
+        GroupSum { us, bytes_per_us },
+        &layers_on,
+        prompt_rows,
+    )
 }
 
-/// The plan that splits every layer of `demand` over the fewest of `cards` that hold an even
-/// share each, when that is predicted faster than the layer by layer plan; `refusal(ranks)` says
-/// why the model cannot split over that many cards, and `row_bytes` is a row of activations.
+/// The plan that splits every layer of `demand` over the fewest of `cards` that hold their shares,
+/// when that is predicted faster than the layer by layer plan for a decoded token and for
+/// `prompt_rows` rows of a prompt; `refusal(ranks)` says why the model cannot split over that many
+/// cards, `row_bytes` is a row of activations and `row_flops` what a row costs through a layer.
 pub fn plan(
     demand: &super::ladder::Demand,
     cards: &[(usize, u64)],
     row_bytes: u64,
+    row_flops: f64,
+    prompt_rows: usize,
     refusal: impl Fn(usize) -> Option<String>,
 ) -> Option<super::layer_executor::HeteroPlan> {
     (2..=cards.len()).find_map(|ranks| {
@@ -170,21 +240,17 @@ pub fn plan(
         let rates = super::expert_parallel::card_read_rates();
         let weight = |idx: usize| rates.get(&idx).copied().unwrap_or(0.0);
         let group = super::llm::tensor_parallel(demand, cards, ranks, weight)?;
-        if !pays_over(demand, &demand.plan(cards), &group, row_bytes) {
+        if !pays_over(demand, &demand.plan(cards), &group, row_bytes, row_flops, prompt_rows) {
             tracing::info!(
-                "stays layer by layer on {ranks} cards: the links cost more than the split saves"
+                "stays layer by layer on {ranks} cards: the sums cost more than the split saves, for a token or for {prompt_rows} prompt rows"
             );
             return None;
         }
-        let mut plan =
-            super::layer_executor::HeteroPlan::forced_gpu(demand.layers, demand.layers, group[0]);
+        let mut plan = super::layer_executor::HeteroPlan::forced_gpu(demand.layers, demand.layers, group[0]);
         plan.tp_cards = Some(
             group
                 .iter()
-                .map(|&index| super::layer_executor::TpCard {
-                    index,
-                    weight: weight(index),
-                })
+                .map(|&index| super::layer_executor::TpCard { index, weight: weight(index) })
                 .collect(),
         );
         Some(plan)
@@ -207,31 +273,59 @@ mod tests {
         }
     }
 
-    /// A 20 GB stack of 64 layers on two PCIe cards that reach each other through the host: the
-    /// four trips a layer cost more than the half of its read they save.
-    #[test]
-    fn a_slow_link_keeps_the_layers_whole() {
-        let stack = DenseStack {
-            layers: 64,
-            layer_bytes: 310_000_000,
-            row_bytes: 20_480,
-        };
-        let cards = [card(896.0, None), card(448.0, Some((60.0, 12.0)))];
-        assert!(!split_pays(&stack, &cards, &[42, 22], 1));
+    fn sum(us: f64, gbs: f64) -> GroupSum {
+        GroupSum {
+            us,
+            bytes_per_us: gbs * 1e3,
+        }
     }
 
-    /// The same stack on two cards joined by a fast fabric: each reads half of every layer, and
-    /// the four short trips a layer leave it at about two thirds of the whole read.
+    /// A 20 GB stack of 64 layers of 600 million parameters each.
+    const STACK: DenseStack = DenseStack {
+        layers: 64,
+        layer_bytes: 310_000_000,
+        row_bytes: 20_480,
+        row_flops: 1.2e9,
+    };
+
+    /// TFLOP/s as operations per microsecond.
+    fn tflops(t: f64) -> f64 {
+        t * 1e6
+    }
+
+    /// The stack on two PCIe cards whose sums go through host memory: a token is faster split,
+    /// two short sums a layer against half its read, but a block of prompt rows pays two slow sums
+    /// of every row a layer, more than the products it shares out, and keeps the layers whole.
+    #[test]
+    fn sums_through_the_host_keep_a_prompt_layered() {
+        let cards = [card(896.0, None), card(448.0, Some((150.0, 2.0)))];
+        let flops = [tflops(80.0), tflops(40.0)];
+        let host = sum(40.0, 1.7);
+        let on = [42, 22];
+        assert!(
+            split_us(&STACK, &cards, &flops, host, 1) < layered_us(&STACK, &cards, &flops, &on, 1)
+        );
+        assert!(
+            split_us(&STACK, &cards, &flops, host, 512)
+                > layered_us(&STACK, &cards, &flops, &on, 512)
+        );
+        assert!(!split_pays(&STACK, &cards, &flops, host, &on, 512));
+    }
+
+    /// The same stack on two cards joined by a fast fabric: each reads half of every layer and
+    /// runs half of every product, so a token, under three quarters of its layered time, and a
+    /// block of prompt rows are both faster split.
     #[test]
     fn a_fast_fabric_splits_the_layers() {
-        let stack = DenseStack {
-            layers: 64,
-            layer_bytes: 310_000_000,
-            row_bytes: 20_480,
-        };
         let cards = [card(3350.0, None), card(3350.0, Some((3.0, 450.0)))];
-        assert!(split_pays(&stack, &cards, &[32, 32], 1));
-        assert!(split_us(&stack, &cards, 1) < 0.7 * layered_us(&stack, &cards, &[32, 32], 1));
+        let flops = [tflops(700.0), tflops(700.0)];
+        let fabric = sum(10.0, 450.0);
+        let on = [32, 32];
+        assert!(split_pays(&STACK, &cards, &flops, fabric, &on, 512));
+        assert!(
+            split_us(&STACK, &cards, &flops, fabric, 1)
+                < 0.75 * layered_us(&STACK, &cards, &flops, &on, 1)
+        );
     }
 
     /// Units go in proportion to the weights, every share at least one unit, summing to all.
@@ -254,7 +348,15 @@ mod tests {
             layers: 4,
             layer_bytes: 1_000_000,
             row_bytes: 1024,
+            row_flops: 2e6,
         };
-        assert!(!split_pays(&stack, &[card(100.0, None)], &[4], 1));
+        assert!(!split_pays(
+            &stack,
+            &[card(100.0, None)],
+            &[tflops(1.0)],
+            sum(1.0, 1.0),
+            &[4],
+            1
+        ));
     }
 }

@@ -15,7 +15,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Data parallelism: `replicas` serves a model whole on several cards, requests spread.
 - API: Cohere /v2/rerank and /v2/embed and vLLM /score over the existing models.
 - Completions: best_of samples that many completions and returns the n most probable.
-- Tensor parallelism: dense layers split across cards where measured links make it pay.
+- Tensor parallelism: dense layers split across cards when measured sums and products pay.
 - Profile: /api/stage_perf times each graph, stage and kernel on the card.
 - Draft head: a model's own head drafts, read as released, its verify replayed as a graph.
 - Speculation: a verify runs its rows together, recurrent models included, while it pays.
