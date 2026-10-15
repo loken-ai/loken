@@ -9,14 +9,18 @@ use crate::tensor::{Result, Tensor};
 impl GenericTransformerLayer {
     /// Whether this layer runs through [`Self::forward_split`] for `x`: its shares are on other
     /// cards with communicators between them, `x` is F32, and the layer is a pre-norm attention
-    /// and feed-forward block whose every step the split reproduces.
+    /// and feed-forward block whose every step the split reproduces, the feed-forward dense or a
+    /// mixture whose cards each hold a range of the experts and route from the normed input.
     pub(super) fn runs_split(&self, x: &Tensor) -> bool {
         #[cfg(feature = "cuda")]
         {
             !self.tp_shards.is_empty()
                 && self.tp_comms.is_some()
                 && x.dtype() == crate::tensor::DType::F32
-                && self.moe.is_none()
+                && self
+                    .moe
+                    .as_ref()
+                    .is_none_or(|m| m.local.is_some() && m.router_prenormed && m.tier.is_none())
                 && self.ffn_norm.is_some()
                 && !self.flags.parallel_attn
                 && self.ple_inp_gate.is_none()
@@ -93,7 +97,13 @@ fn split_layer(
             a = (a * s)?;
         }
         let (h, hn) = residual_and_norm(layer, &a, x)?;
-        parts.push(layer.forward_ffn_own(&hn)?.contiguous()?);
+        let f = match &layer.moe {
+            Some(moe) => {
+                moe.forward_rows(&hn, &h, layer.embedding_length_for_moe, layer.ffn_norm_eps)?
+            }
+            None => layer.forward_ffn_own(&hn)?,
+        };
+        parts.push(f.to_dtype(crate::tensor::DType::F32)?.contiguous()?);
         hs.push(h);
     }
     let ffn = comms.all_reduce(&parts)?;

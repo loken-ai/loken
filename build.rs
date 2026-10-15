@@ -528,6 +528,7 @@ fn compile_imma_kernels() {
         "cuda/moe/bf16_matvec.cu",
         "cuda/moe/gate_topk.cu",
         "cuda/moe/tier_graph.cu",
+        "cuda/moe/tp_local.cu",
         "cuda/moe/lfm2_shortconv_f16.cu",
     ];
     // These shipped as compute_80 PTX alone. PTX only ever JITs UPWARD, so that was not a

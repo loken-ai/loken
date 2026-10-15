@@ -39,23 +39,48 @@ pub fn shares(weights: &[f64], units: usize) -> Option<Vec<usize>> {
     Some(out)
 }
 
-/// A dense stack as the split sees it.
+/// A layer's routed experts as the split sees them.
+#[derive(Clone, Copy, Debug)]
+pub struct RoutedExperts {
+    /// Bytes of all of a layer's experts.
+    pub bytes: u64,
+    pub experts: usize,
+    /// Experts a row routes to.
+    pub used: usize,
+}
+
+/// A stack of layers as the split sees it.
 #[derive(Clone, Copy, Debug)]
 pub struct DenseStack {
     pub layers: usize,
-    /// Bytes of one layer's weights.
+    /// Bytes of one layer's weights every row reads: all of them, a mixture's experts aside.
     pub layer_bytes: u64,
+    /// A mixture layer's experts, of which `rows` rows read the ones they route to.
+    pub routed: Option<RoutedExperts>,
     /// Bytes of one row of activations as it crosses a link.
     pub row_bytes: u64,
-    /// Floating point operations one row costs through one layer's projections.
+    /// Floating point operations one row costs through one layer's projections, a mixture's
+    /// counted at the experts a row routes to.
     pub row_flops: f64,
+}
+
+impl DenseStack {
+    /// Bytes `rows` rows read of a layer: its shared weights and the experts they route to, at
+    /// most all of them.
+    fn read_bytes(&self, rows: usize) -> f64 {
+        let routed = self.routed.map_or(0.0, |r| {
+            let touched = (rows * r.used) as f64 / r.experts.max(1) as f64;
+            r.bytes as f64 * touched.min(1.0)
+        });
+        self.layer_bytes as f64 + routed
+    }
 }
 
 /// Microseconds a card spends on `fraction` of a layer for `rows` rows: the longer of reading its
 /// part of the weights at `read` bytes and multiplying the rows through it at `flops` operations
 /// per microsecond.
 fn share_us(stack: &DenseStack, fraction: f64, read: f64, flops: f64, rows: usize) -> f64 {
-    let bytes = fraction * stack.layer_bytes as f64 / read;
+    let bytes = fraction * stack.read_bytes(rows) / read;
     let product = fraction * rows as f64 * stack.row_flops / flops;
     bytes.max(product)
 }
@@ -152,6 +177,7 @@ pub fn pays_over(
     cards: &[usize],
     row_bytes: u64,
     row_flops: f64,
+    routed: Option<RoutedExperts>,
     prompt_rows: usize,
 ) -> bool {
     use super::layer_executor::DeviceKind;
@@ -206,7 +232,9 @@ pub fn pays_over(
     };
     let stack = DenseStack {
         layers: demand.layers,
-        layer_bytes: demand.block_bytes / demand.layers.max(1) as u64,
+        layer_bytes: (demand.block_bytes / demand.layers.max(1) as u64)
+            .saturating_sub(routed.map_or(0, |r| r.bytes)),
+        routed,
         row_bytes,
         row_flops,
     };
@@ -223,12 +251,14 @@ pub fn pays_over(
 /// The plan that splits every layer of `demand` over the fewest of `cards` that hold their shares,
 /// when that is predicted faster than the layer by layer plan for a decoded token and for
 /// `prompt_rows` rows of a prompt; `refusal(ranks)` says why the model cannot split over that many
-/// cards, `row_bytes` is a row of activations and `row_flops` what a row costs through a layer.
+/// cards, `row_bytes` is a row of activations, `row_flops` what a row costs through a layer and
+/// `routed` a mixture layer's experts.
 pub fn plan(
     demand: &super::ladder::Demand,
     cards: &[(usize, u64)],
     row_bytes: u64,
     row_flops: f64,
+    routed: Option<RoutedExperts>,
     prompt_rows: usize,
     refusal: impl Fn(usize) -> Option<String>,
 ) -> Option<super::layer_executor::HeteroPlan> {
@@ -240,7 +270,7 @@ pub fn plan(
         let rates = super::expert_parallel::card_read_rates();
         let weight = |idx: usize| rates.get(&idx).copied().unwrap_or(0.0);
         let group = super::llm::tensor_parallel(demand, cards, ranks, weight)?;
-        if !pays_over(demand, &demand.plan(cards), &group, row_bytes, row_flops, prompt_rows) {
+        if !pays_over(demand, &demand.plan(cards), &group, row_bytes, row_flops, routed, prompt_rows) {
             tracing::info!(
                 "stays layer by layer on {ranks} cards: the sums cost more than the split saves, for a token or for {prompt_rows} prompt rows"
             );
@@ -284,6 +314,7 @@ mod tests {
     const STACK: DenseStack = DenseStack {
         layers: 64,
         layer_bytes: 310_000_000,
+        routed: None,
         row_bytes: 20_480,
         row_flops: 1.2e9,
     };
@@ -341,12 +372,31 @@ mod tests {
         assert_eq!(shares(&[1.0, 1.0], 1), None);
     }
 
+    /// A token reads its routed experts alone, a block of prompt rows every expert.
+    #[test]
+    fn rows_read_the_experts_they_route_to() {
+        let stack = DenseStack {
+            layers: 48,
+            layer_bytes: 20_000_000,
+            routed: Some(RoutedExperts {
+                bytes: 1_280_000_000,
+                experts: 128,
+                used: 8,
+            }),
+            row_bytes: 8192,
+            row_flops: 1e9,
+        };
+        assert_eq!(stack.read_bytes(1), 20_000_000.0 + 80_000_000.0);
+        assert_eq!(stack.read_bytes(512), 1_300_000_000.0);
+    }
+
     /// One card is no split.
     #[test]
     fn one_card_does_not_split() {
         let stack = DenseStack {
             layers: 4,
             layer_bytes: 1_000_000,
+            routed: None,
             row_bytes: 1024,
             row_flops: 2e6,
         };

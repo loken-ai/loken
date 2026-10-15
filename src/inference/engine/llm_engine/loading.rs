@@ -1060,14 +1060,39 @@ impl LlmEngine {
                     // split, the group holds it, and the measured reads and links predict it faster.
                     // What a row costs through a layer: a multiply and an add per weight of the
                     // layers' matrices.
+                    // A mixture layer's experts: a row reads and multiplies the ones it routes to.
+                    let blocks = || content.tensor_infos.iter().filter(|(name, _)| name.starts_with("blk."));
+                    let expert_count = get_gguf_u32(&content, &format!("{arch}.expert_count")).unwrap_or(0) as usize;
+                    let expert_used = get_gguf_u32(&content, &format!("{arch}.expert_used_count")).unwrap_or(0) as usize;
+                    let per_layer = |v: f64| v / num_layers.max(1) as f64;
+                    let routed = (expert_count > 0 && expert_used > 0).then(|| {
+                        let bytes: u64 = blocks()
+                            .filter(|(name, _)| name.contains("_exps."))
+                            .map(|(_, t)| {
+                                t.shape.elem_count() as u64 * t.ggml_dtype.type_size() as u64
+                                    / t.ggml_dtype.block_size() as u64
+                            })
+                            .sum();
+                        crate::inference::place::tensor_parallel::RoutedExperts {
+                            bytes: per_layer(bytes as f64) as u64,
+                            experts: expert_count,
+                            used: expert_used,
+                        }
+                    });
+                    let routed_share = routed.map_or(0.0, |r| r.used as f64 / r.experts as f64);
                     let row_flops = 2.0
-                        * content
-                            .tensor_infos
-                            .iter()
-                            .filter(|(name, t)| name.starts_with("blk.") && t.shape.dims().len() == 2)
-                            .map(|(_, t)| t.shape.elem_count() as f64)
-                            .sum::<f64>()
-                        / num_layers.max(1) as f64;
+                        * per_layer(
+                            blocks()
+                                .map(|(name, t)| {
+                                    let n = t.shape.elem_count() as f64;
+                                    match (name.contains("_exps."), t.shape.dims().len()) {
+                                        (true, _) => n * routed_share,
+                                        (false, 2) => n,
+                                        _ => 0.0,
+                                    }
+                                })
+                                .sum::<f64>(),
+                        );
                     let tp_plan = (awq.is_none() && layer_share.is_none() && split.is_none())
                         .then(|| {
                             crate::inference::place::tensor_parallel::plan(
@@ -1075,6 +1100,7 @@ impl LlmEngine {
                                 &cuda_devices,
                                 (dims.hidden_size * std::mem::size_of::<f32>()) as u64,
                                 row_flops,
+                                routed,
                                 super::PREFILL_CHUNK_TOKENS,
                                 |ranks| crate::inference::generic_transformer::tp_file_refusal(&content, &arch, ranks),
                             )

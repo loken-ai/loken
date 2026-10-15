@@ -620,6 +620,13 @@ impl ExpertShard {
     }
 }
 
+/// Where a split layer's card's experts start among the router's, and how many the router has.
+#[derive(Clone, Copy, Debug)]
+pub struct LocalExperts {
+    pub first: usize,
+    pub total: usize,
+}
+
 /// Gemma4-MoE per-layer weights: top-K-of-N expert FFN.
 /// Active per token: K experts x (gate+up+down) - top-8 of 128
 /// for gemma4 26B A4B.
@@ -662,6 +669,9 @@ pub struct MoeWeights {
     /// The routed experts split by id range across cards, the layer's own card among them;
     /// empty when the layer's own stacks hold every expert.
     pub shards: Vec<ExpertShard>,
+    /// On one card of a split layer: the stacks hold the router's experts from this one on, and
+    /// the pairs of the other cards' experts weigh zero here.
+    pub local: Option<LocalExperts>,
     pub n_experts: usize,
     pub n_experts_used: usize,
     pub expert_ffn_dim: usize,
@@ -921,6 +931,13 @@ impl MoeWeights {
                 None if num_tokens > 1 && crate::tensor::quantized::DecodeOrder::active() => {
                     exact_logits()?
                 }
+                // The cards of a split layer each route the same rows: each row's logits are
+                // summed as a one-row call sums them, which no card's kernel choice changes, so
+                // every card picks the same experts.
+                None if self.local.is_some() => {
+                    let _order = crate::tensor::quantized::DecodeOrder::enter();
+                    exact_logits()?
+                }
                 None => self
                     .gate_inp
                     .forward(&xs)?
@@ -1078,7 +1095,17 @@ impl MoeWeights {
             crate::tensor::bail!("MoeWeights: this layer cannot fold a residual into its fold");
         }
         // The shared expert's projections, when a recorded decode queued them ahead of the wait.
-        let expert_rows = if !self.shards.is_empty() && xs.device().runs_as_card() {
+        let expert_rows = if let Some(local) = self.local.filter(|_| xs.device().runs_as_card()) {
+            self.experts_local(
+                xs,
+                topk_ids,
+                topk_weights_scaled,
+                num_tokens,
+                is_prefill,
+                t_route,
+                local,
+            )?
+        } else if !self.shards.is_empty() && xs.device().runs_as_card() {
             self.experts_split(
                 xs,
                 topk_ids,
@@ -1378,6 +1405,75 @@ impl MoeWeights {
         sum.ok_or_else(|| crate::tensor::Error::msg("a split layer has no shard"))
     }
 
+    /// The routed pairs of `topk_ids` this card's experts compute, every other pair at weight
+    /// zero: the card's part of a split layer's sum.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn experts_local(
+        &self,
+        xs: &Tensor,
+        topk_ids: &Tensor,
+        topk_weights: &Tensor,
+        num_tokens: usize,
+        is_prefill: bool,
+        t_route: Option<std::time::Instant>,
+        local: LocalExperts,
+    ) -> Result<Tensor> {
+        use super::expert_tier::address_of;
+        use crate::tensor::DType;
+        let k = self.n_experts_used;
+        if k > crate::inference::moe_cuda::tp_local::MAX_K || self.n_experts < k {
+            crate::tensor::bail!(
+                "a card of a split layer holds fewer experts than a row routes to"
+            );
+        }
+        let dev = xs.device();
+        let ids = topk_ids.to_dtype(DType::U32)?.contiguous()?;
+        let weights = topk_weights.to_dtype(DType::F32)?.contiguous()?;
+        let local_ids = Tensor::zeros_on(ids.shape().clone(), DType::U32, &dev)?;
+        let local_weights = Tensor::zeros_on(weights.shape().clone(), DType::F32, &dev)?;
+        let rows = ids.elem_count() / k;
+        let stream = dev.as_cuda_device()?.cuda_stream().cu_stream() as i64;
+        unsafe {
+            crate::inference::moe_cuda::tp_local::pairs(
+                address_of::<u32>(&ids)? as *const u32,
+                address_of::<f32>(&weights)? as *const f32,
+                address_of::<u32>(&local_ids)? as *mut u32,
+                address_of::<f32>(&local_weights)? as *mut f32,
+                rows as i32,
+                k as i32,
+                local.first as i32,
+                self.n_experts as i32,
+                stream,
+            );
+        }
+        self.experts_cuda(
+            xs,
+            &local_ids.to_dtype(topk_ids.dtype())?,
+            &local_weights.to_dtype(topk_weights.dtype())?,
+            num_tokens,
+            is_prefill,
+            t_route,
+            None,
+            self.own_experts(None),
+        )
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[allow(clippy::too_many_arguments)]
+    fn experts_local(
+        &self,
+        _xs: &Tensor,
+        _topk_ids: &Tensor,
+        _topk_weights: &Tensor,
+        _num_tokens: usize,
+        _is_prefill: bool,
+        _t_route: Option<std::time::Instant>,
+        _local: LocalExperts,
+    ) -> Result<Tensor> {
+        crate::tensor::bail!("a split layer runs on cards")
+    }
+
     #[cfg(not(feature = "cuda"))]
     fn experts_split(
         &self,
@@ -1607,7 +1703,10 @@ impl MoeWeights {
             && gate.dtype() == up.dtype()
             && moe_mmq_serves(gate.dtype(), hidden)
             && moe_mmq_serves(down_stack.dtype(), self.expert_ffn_dim);
-        if !served || !moe_mmq_pays(num_tokens * self.n_experts_used, set.n_experts) {
+        // A card of a split layer chooses as the whole layer would, so that the cards' sum is
+        // the whole layer's.
+        let experts = self.local.map_or(set.n_experts, |l| l.total);
+        if !served || !moe_mmq_pays(num_tokens * self.n_experts_used, experts) {
             return Ok(None);
         }
         let choices = topk_ids.reshape((num_tokens, self.n_experts_used))?;
@@ -1910,6 +2009,7 @@ mod clamped_swiglu_tests {
                 decode_slots: None,
                 n_experts: experts,
                 shards: Vec::new(),
+                local: None,
                 n_experts_used: used,
                 expert_ffn_dim: ffn,
                 router_prenormed: true,
@@ -1973,6 +2073,7 @@ mod clamped_swiglu_tests {
                 decode_slots: None,
                 n_experts: experts,
                 shards: Vec::new(),
+                local: None,
                 n_experts_used: used,
                 expert_ffn_dim: ffn,
                 router_prenormed: true,
@@ -2097,6 +2198,7 @@ mod clamped_swiglu_tests {
             decode_slots: None,
             n_experts: experts,
             shards: Vec::new(),
+            local: None,
             n_experts_used: used,
             expert_ffn_dim: ffn,
             router_prenormed: true,
@@ -2213,6 +2315,7 @@ mod clamped_swiglu_tests {
             decode_slots: None,
             n_experts: experts,
             shards: Vec::new(),
+            local: None,
             n_experts_used: used,
             expert_ffn_dim: ffn,
             router_prenormed: true,

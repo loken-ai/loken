@@ -292,6 +292,43 @@ pub(crate) mod tier_graph {
     }
 }
 cuda_launchers! {
+    loken_tp_local_pairs(
+        ids: *const u32, weights: *const f32, local_ids: *mut u32, local_weights: *mut f32,
+        rows: i32, k: i32, first: i32, count: i32);
+}
+/// The launcher of a split mixture layer's pairs as one card reads them (see `tp_local.cu`).
+///
+/// # Safety
+/// Every pointer is the card's address of `rows * k` elements; the stream is the card's.
+#[allow(clippy::too_many_arguments)]
+pub(crate) mod tp_local {
+    /// Most experts a row routes to.
+    pub const MAX_K: usize = 32;
+    pub unsafe fn pairs(
+        ids: *const u32,
+        weights: *const f32,
+        local_ids: *mut u32,
+        local_weights: *mut f32,
+        rows: i32,
+        k: i32,
+        first: i32,
+        count: i32,
+        stream: i64,
+    ) {
+        super::loken_tp_local_pairs(
+            ids,
+            weights,
+            local_ids,
+            local_weights,
+            rows,
+            k,
+            first,
+            count,
+            stream,
+        );
+    }
+}
+cuda_launchers! {
     loken_tier_tell(counter: *mut u32, told: *mut u32);
     loken_embed_rows_iq4_xs(table: *const c_void, ids: *const u32, n: i32, dim: i32, out: *mut f32);
     loken_cast_init_f32_from_dtype(

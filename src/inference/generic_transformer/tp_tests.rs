@@ -1,5 +1,6 @@
-//! A model whose layers split their heads and feed-forward across two cards computes what the
-//! model whole on one card computes: a prompt, decoded tokens, a verify batch and a cut back.
+//! A model whose layers split their heads and feed-forward, or their experts, across two cards
+//! computes what the model whole on one card computes: a prompt, decoded tokens, a verify batch
+//! and a cut back.
 
 use super::tiny_model;
 use super::GenericHeteroTransformer;
@@ -114,6 +115,55 @@ fn a_layer_split_across_two_cards_computes_the_whole_layer() {
     both("after a context shift", &|m| {
         m.shift_kv_tail(5, 3).unwrap();
         m.forward(&ids(&[6]), 8).unwrap()
+    });
+    tiny_model::remove(&path);
+}
+
+/// A mixture whose cards each hold a range of the experts computes what it computes whole on one
+/// card: a prompt, decoded tokens, a verify batch and a cut back.
+#[test]
+#[ignore = "needs two idle CUDA cards"]
+fn a_mixture_split_across_two_cards_computes_the_whole_layer() {
+    if Device::new_cuda(1).is_err() {
+        eprintln!("skipping: two usable CUDA devices are needed");
+        return;
+    }
+    let path = tiny_model::write_moe("tp-moe", LAYERS);
+    let mut whole = load(&path, &[0]);
+    let mut split = load(&path, &[0, 1]);
+    assert!(
+        split.layers.iter().all(|l| l.tp_shards.len() == 1),
+        "every layer split"
+    );
+    for l in &split.layers {
+        let ranges: Vec<_> = std::iter::once(l)
+            .chain(&l.tp_shards)
+            .map(|p| {
+                p.moe
+                    .as_ref()
+                    .map(|m| (m.local.map(|x| x.first), m.n_experts))
+            })
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![Some((Some(0), 4)), Some((Some(4), 4))],
+            "experts by range"
+        );
+    }
+    let mut both = |what: &str, f: &dyn Fn(&mut GenericHeteroTransformer) -> Tensor| {
+        close(&rows(&f(&mut split)), &rows(&f(&mut whole)), what);
+    };
+    both("prompt", &|m| {
+        m.forward(&ids(&[1, 4, 2, 9, 3, 5]), 0).unwrap()
+    });
+    both("token 6", &|m| m.forward(&ids(&[8]), 6).unwrap());
+    both("token 7", &|m| m.forward(&ids(&[2]), 7).unwrap());
+    both("verify batch", &|m| {
+        m.forward_all(&ids(&[5, 1]), 8).unwrap()
+    });
+    both("after a cut", &|m| {
+        m.trim_kv(9);
+        m.forward(&ids(&[3]), 9).unwrap()
     });
     tiny_model::remove(&path);
 }

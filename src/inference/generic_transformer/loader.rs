@@ -675,11 +675,9 @@ pub(crate) fn tp_file_refusal(
             .any(|n| n.starts_with("blk.") && n.contains(part))
     };
     let refused = [
-        ("ffn_gate_inp", "routed experts"),
         ("attn_qkv", "a fused q, k and v projection"),
         ("ssm_", "a recurrent mixer"),
         ("shortconv", "a recurrent mixer"),
-        ("ffn_up_shexp", "a shared expert"),
         ("attn_gate", "an attention output gate"),
         ("attn_sinks", "attention sinks"),
         ("ffn_up.bias", "a feed-forward up bias"),
@@ -695,36 +693,63 @@ pub(crate) fn tp_file_refusal(
             .get(name)
             .map(|t| t.ggml_dtype.block_size())
     };
+    let holds = |name: String| content.tensor_infos.contains_key(&name);
     let even = vec![1.0; ranks];
     (0..config.n_layers).find_map(|i| {
-        let (Some(o), Some(d)) = (
-            block(&format!("blk.{i}.attn_output.weight")),
-            block(&format!("blk.{i}.ffn_down.weight")),
-        ) else {
-            return Some(format!(
-                "layer {i}: no attention output or feed-forward down"
-            ));
+        let Some(o) = block(&format!("blk.{i}.attn_output.weight")) else {
+            return Some(format!("layer {i}: no attention output"));
         };
-        tp_layout(&config, &even, o, d)
+        let routed = holds(format!("blk.{i}.ffn_gate_inp.weight"));
+        let dense = block(&format!("blk.{i}.ffn_down.weight"));
+        if routed {
+            let separate = holds(format!("blk.{i}.ffn_gate_exps.weight"))
+                && holds(format!("blk.{i}.ffn_up_exps.weight"));
+            if let Some(why) = experts_refusal(&config, separate, dense.is_some()) {
+                return Some(format!("layer {i}: {why}"));
+            }
+        } else if dense.is_none() {
+            return Some(format!("layer {i}: no feed-forward down"));
+        }
+        let experts = routed.then_some((config.flags.n_experts, config.flags.n_experts_used));
+        tp_layout(&config, &even, o, dense.filter(|_| !routed), experts)
             .err()
             .map(|why| format!("layer {i}: {why}"))
     })
 }
 
-/// How many kv heads (each with its query heads) and feed-forward rows each rank of a split
-/// takes, in proportion to `weights`: the heads by units whose attention output columns fall
-/// on its `output_block`-wide blocks, the rows by the `down_block`-wide blocks of the down
-/// projection's columns.
+/// Why a mixture layer's experts cannot be split by range across cards, `None` when they can:
+/// SiLU experts with separate gate and up stacks, no clamp, and no dense feed-forward beside them.
+fn experts_refusal(
+    config: &GenericTransformerConfig,
+    separate: bool,
+    dense: bool,
+) -> Option<&'static str> {
+    [
+        (!separate, "experts with fused gate and up"),
+        (config.flags.use_gelu, "GELU experts"),
+        (config.expert_swiglu_clamp.is_some(), "clamped experts"),
+        (dense, "a mixture beside a dense feed-forward"),
+    ]
+    .into_iter()
+    .find_map(|(refused, why)| refused.then_some(why))
+}
+
+/// How many kv heads (each with its query heads), dense feed-forward rows and routed experts each
+/// rank of a split takes, in proportion to `weights`: the heads by units whose attention output
+/// columns fall on its `output_block`-wide blocks, the rows by the `down_block`-wide blocks of the
+/// down projection's columns, the experts whole, at least as many as a row routes to.
 pub(super) struct TpLayout {
     pub kv: Vec<usize>,
     pub ffn: Vec<usize>,
+    pub experts: Vec<usize>,
     pub group: usize,
 }
 
 impl TpLayout {
-    /// The kv heads and feed-forward rows before rank `rank`.
-    fn offsets(&self, rank: usize) -> (usize, usize) {
-        (self.kv[..rank].iter().sum(), self.ffn[..rank].iter().sum())
+    /// The kv heads, feed-forward rows and experts before rank `rank`.
+    fn offsets(&self, rank: usize) -> (usize, usize, usize) {
+        let before = |v: &Vec<usize>| v.get(..rank).map_or(0, |s| s.iter().sum());
+        (before(&self.kv), before(&self.ffn), before(&self.experts))
     }
 }
 
@@ -732,14 +757,10 @@ fn tp_layout(
     config: &GenericTransformerConfig,
     weights: &[f64],
     output_block: usize,
-    down_block: usize,
+    down_block: Option<usize>,
+    routed: Option<(usize, usize)>,
 ) -> std::result::Result<TpLayout, String> {
-    let (heads, kv, hd, ffn) = (
-        config.n_head,
-        config.n_kv_head,
-        config.head_dim,
-        config.ffn_dim,
-    );
+    let (heads, kv, hd) = (config.n_head, config.n_kv_head, config.head_dim);
     if kv == 0 || heads % kv != 0 {
         return Err(format!("{heads} heads over {kv} kv heads"));
     }
@@ -751,25 +772,47 @@ fn tp_layout(
         a
     };
     let kv_unit = output_block / gcd(group * hd, output_block);
-    if kv % kv_unit != 0 || ffn % down_block != 0 {
+    if kv % kv_unit != 0 {
         return Err(format!(
-            "{kv} kv heads or {ffn} rows do not fall on the weights' blocks"
+            "{kv} kv heads do not fall on the attention output's blocks"
         ));
     }
     let share = |units: usize, unit: usize| {
         crate::inference::place::tensor_parallel::shares(weights, units)
             .map(|s| s.into_iter().map(|n| n * unit).collect::<Vec<_>>())
     };
-    match (
-        share(kv / kv_unit, kv_unit),
-        share(ffn / down_block, down_block),
-    ) {
-        (Some(kv), Some(ffn)) => Ok(TpLayout { kv, ffn, group }),
-        _ => Err(format!(
-            "{kv} kv heads or {ffn} rows do not give every one of {} cards a share",
-            weights.len()
-        )),
-    }
+    let cards = weights.len();
+    let kv = share(kv / kv_unit, kv_unit)
+        .ok_or_else(|| format!("{kv} kv heads do not give every one of {cards} cards a share"))?;
+    let ffn = match down_block {
+        Some(block) => {
+            let rows = config.ffn_dim;
+            if !rows.is_multiple_of(block) {
+                return Err(format!(
+                    "{rows} feed-forward rows do not fall on the down projection's blocks"
+                ));
+            }
+            share(rows / block, block).ok_or_else(|| {
+                format!("{rows} rows do not give every one of {cards} cards a share")
+            })?
+        }
+        None => Vec::new(),
+    };
+    let experts = match routed {
+        Some((n, k)) => {
+            let e = share(n, 1).filter(|e| e.iter().all(|&c| c >= k)).ok_or_else(|| {
+                format!("{n} experts do not give every one of {cards} cards the {k} a row routes to")
+            })?;
+            e
+        }
+        None => Vec::new(),
+    };
+    Ok(TpLayout {
+        kv,
+        ffn,
+        experts,
+        group,
+    })
 }
 
 /// Why the layer `raw` cannot be split into `ranks` tensor-parallel shares, or `None` when it
@@ -790,8 +833,6 @@ fn tp_refusal(
             "no separate q, k and v",
         ),
         (raw.attn_qkv.is_some(), "a fused q, k and v projection"),
-        (raw.moe_gate_inp.is_some(), "routed experts"),
-        (raw.shexp_up.is_some(), "a shared expert"),
         (raw.ple_proj.is_some(), "per-layer inputs"),
         (
             raw.wide.attn_mixer.is_some() || raw.wide.ffn_mixer.is_some(),
@@ -804,11 +845,38 @@ fn tp_refusal(
     if let Some((_, why)) = reasons.iter().find(|(refused, _)| *refused) {
         return Some((*why).to_string());
     }
-    let (o, d) = (
+    tp_layout_of(raw, config, &vec![1.0; ranks]).err()
+}
+
+/// [`tp_layout`] of the layer `raw` at `weights`: its experts by range when it routes, its dense
+/// feed-forward by rows otherwise.
+fn tp_layout_of(
+    raw: &RawGenericLayer,
+    config: &GenericTransformerConfig,
+    weights: &[f64],
+) -> std::result::Result<TpLayout, String> {
+    let routed = raw.moe_gate_inp.is_some();
+    if routed {
+        let separate = raw.moe_gate_exps.is_some()
+            && raw.moe_up_exps.is_some()
+            && raw.moe_gate_up_exps.is_none();
+        if let Some(why) = experts_refusal(config, separate, raw.ffn_gate.is_some()) {
+            return Err(why.to_string());
+        }
+    }
+    let experts = raw
+        .moe_down_exps
+        .as_ref()
+        .and_then(|d| d.shape().dims().first().copied())
+        .filter(|_| routed)
+        .map(|n| (n, config.flags.n_experts_used));
+    tp_layout(
+        config,
+        weights,
         raw.attn_output.dtype().block_size(),
-        raw.ffn_down.dtype().block_size(),
-    );
-    tp_layout(config, &vec![1.0; ranks], o, d).err()
+        (!routed).then(|| raw.ffn_down.dtype().block_size()),
+        experts,
+    )
 }
 
 /// The share of rank `rank` of `ranks` of `raw`: q, k, v and the feed-forward's gate and up cut
@@ -844,14 +912,49 @@ fn tp_share(
             .transpose()
     };
     let first = |qt: &Option<QTensor>| if rank == 0 { whole(qt) } else { Ok(None) };
+    let on_card = |qt: &QTensor| host(qt)?.to_device(card);
+    let on_card_opt = |qt: &Option<QTensor>| qt.as_ref().map(on_card).transpose();
+    let first_on_card = |qt: &Option<QTensor>| if rank == 0 { on_card_opt(qt) } else { Ok(None) };
     let hd = config.head_dim;
-    let (kv_from, ffn_from) = layout.offsets(rank);
+    let (kv_from, ffn_from, experts_from) = layout.offsets(rank);
+    let routed = raw.moe_gate_inp.is_some();
+    let experts = (experts_from, layout.experts.get(rank).copied().unwrap_or(0));
+    let expert_range = |qt: &Option<QTensor>| -> Result<Option<QTensor>> {
+        #[cfg(feature = "cuda")]
+        return qt
+            .as_ref()
+            .map(|q| {
+                super::expert_tier::experts_range(
+                    &std::sync::Arc::new(host(q)?),
+                    experts.0,
+                    experts.1,
+                    card,
+                )
+            })
+            .transpose();
+        #[cfg(not(feature = "cuda"))]
+        match qt {
+            Some(_) => crate::tensor::bail!("a mixture's experts split across cards need CUDA"),
+            None => Ok(None),
+        }
+    };
+    let expert_rows = |qt: &Option<QTensor>| -> Result<Option<QTensor>> {
+        qt.as_ref()
+            .map(|q| {
+                // CONVERSION: an expert bias is a small matrix, read as F32 to take a range of its rows.
+                let v = q
+                    .dequantize(&Device::Cpu)?
+                    .narrow(0, experts.0, experts.1)?;
+                QTensor::quantize_onto(&v, crate::tensor::quantized::GgmlDType::F32, &Device::Cpu)
+            })
+            .transpose()
+    };
     let q_rows = (
         kv_from * layout.group * hd,
         layout.kv[rank] * layout.group * hd,
     );
     let kv_rows = (kv_from * hd, layout.kv[rank] * hd);
-    let ffn_rows = (ffn_from, layout.ffn[rank]);
+    let ffn_rows = (ffn_from, layout.ffn.get(rank).copied().unwrap_or(0));
     let (q_per, kv_per, ffn_per) = (q_rows, kv_rows, ffn_rows);
     Ok(RawGenericLayer {
         layer_idx: raw.layer_idx,
@@ -875,37 +978,52 @@ fn tp_share(
         post_attn_norm_qt: whole(&raw.post_attn_norm_qt)?,
         ffn_norm_qt: whole(&raw.ffn_norm_qt)?,
         post_ffn_norm_qt: whole(&raw.post_ffn_norm_qt)?,
-        ffn_gate: rows_opt(&raw.ffn_gate, ffn_per)?,
-        ffn_up: rows(&raw.ffn_up, ffn_per)?,
+        ffn_gate: if routed {
+            None
+        } else {
+            rows_opt(&raw.ffn_gate, ffn_per)?
+        },
+        // A mixture layer's dense feed-forward is a placeholder its forward never reads.
+        ffn_up: if routed {
+            on_card(&raw.ffn_up)?
+        } else {
+            rows(&raw.ffn_up, ffn_per)?
+        },
         ffn_up_bias_qt: None,
-        ffn_down: columns(&raw.ffn_down, ffn_per)?,
+        ffn_down: if routed {
+            on_card(&raw.ffn_down)?
+        } else {
+            columns(&raw.ffn_down, ffn_per)?
+        },
         ffn_down_bias_qt: first(&raw.ffn_down_bias_qt)?,
         ple_inp_gate: None,
         ple_proj: None,
         ple_post_norm_qt: None,
         ple_output_scale_qt: None,
-        moe_gate_inp: None,
-        moe_gate_inp_scale_qt: None,
+        // The router whole on every card, which routes as the others do; the experts by range.
+        moe_gate_inp: on_card_opt(&raw.moe_gate_inp)?,
+        moe_gate_inp_scale_qt: whole(&raw.moe_gate_inp_scale_qt)?,
         moe_gate_up_exps: None,
-        moe_down_exps: None,
-        moe_down_exps_scale_qt: None,
-        moe_gate_exps: None,
-        moe_up_exps: None,
-        moe_gate_inp_bias_qt: None,
-        moe_gate_exps_bias_qt: None,
-        moe_up_exps_bias_qt: None,
-        moe_down_exps_bias_qt: None,
+        moe_down_exps: expert_range(&raw.moe_down_exps)?,
+        moe_down_exps_scale_qt: whole(&raw.moe_down_exps_scale_qt)?,
+        moe_gate_exps: expert_range(&raw.moe_gate_exps)?,
+        moe_up_exps: expert_range(&raw.moe_up_exps)?,
+        moe_gate_inp_bias_qt: whole(&raw.moe_gate_inp_bias_qt)?,
+        moe_gate_exps_bias_qt: expert_rows(&raw.moe_gate_exps_bias_qt)?,
+        moe_up_exps_bias_qt: expert_rows(&raw.moe_up_exps_bias_qt)?,
+        moe_down_exps_bias_qt: expert_rows(&raw.moe_down_exps_bias_qt)?,
         pre_ffw_norm_2_qt: whole(&raw.pre_ffw_norm_2_qt)?,
         post_ffw_norm_1_qt: whole(&raw.post_ffw_norm_1_qt)?,
         post_ffw_norm_2_qt: whole(&raw.post_ffw_norm_2_qt)?,
-        moe_exp_probs_b_qt: None,
+        moe_exp_probs_b_qt: whole(&raw.moe_exp_probs_b_qt)?,
         mixer: RawMixer::Attention,
         has_ffn: raw.has_ffn,
         attn_gate: None,
-        shexp_gate: None,
-        shexp_up: None,
-        shexp_down: None,
-        shexp_scalar_gate_qt: None,
+        // The shared expert runs on the first card alone, so the sum carries it once.
+        shexp_gate: first_on_card(&raw.shexp_gate)?,
+        shexp_up: first_on_card(&raw.shexp_up)?,
+        shexp_down: first_on_card(&raw.shexp_down)?,
+        shexp_scalar_gate_qt: first(&raw.shexp_scalar_gate_qt)?,
         wide: RawWide::default(),
     })
 }
@@ -919,7 +1037,9 @@ fn tp_share_config(
     let mut share = config.clone();
     share.n_kv_head = layout.kv[rank];
     share.n_head = layout.kv[rank] * layout.group;
-    share.ffn_dim = layout.ffn[rank];
+    if let Some(&rows) = layout.ffn.get(rank) {
+        share.ffn_dim = rows;
+    }
     share
 }
 
@@ -1698,6 +1818,7 @@ fn build_generic_layer(
             decode_slots,
             n_experts: layer_experts,
             shards: Vec::new(),
+            local: None,
             n_experts_used: flags.n_experts_used,
             expert_ffn_dim: flags.expert_ffn_dim,
             router_prenormed,
@@ -3708,19 +3829,18 @@ impl GenericHeteroTransformer {
                     None => {
                         let ranks = cards.len();
                         let weights: Vec<f64> = cards.iter().map(|c| c.weight).collect();
-                        let layout = tp_layout(
-                            &config,
-                            &weights,
-                            raw.attn_output.dtype().block_size(),
-                            raw.ffn_down.dtype().block_size(),
-                        )
-                        .map_err(crate::tensor::Error::msg)?;
+                        let layout = tp_layout_of(&raw, &config, &weights)
+                            .map_err(crate::tensor::Error::msg)?;
                         let mut shares = Vec::with_capacity(ranks);
                         for (rank, card) in cards.iter().enumerate() {
                             let card = card.index;
                             let share_config = tp_share_config(&config, &layout, rank);
                             let share_flags = Arc::new(GenericLayerFlags {
-                                intermediate_size: layout.ffn[rank],
+                                intermediate_size: layout
+                                    .ffn
+                                    .get(rank)
+                                    .copied()
+                                    .unwrap_or(flags.intermediate_size),
                                 ..(*flags).clone()
                             });
                             let dev = cuda_devices.get(&card).ok_or_else(|| {
@@ -3734,6 +3854,7 @@ impl GenericHeteroTransformer {
                                         "RoPE cache miss: cuda_{card}"
                                     ))
                                 })?;
+                            let experts_from = layout.offsets(rank).2;
                             shares.push(build_generic_layer(
                                 tp_share(&raw, &config, &layout, rank, dev)?,
                                 dev,
@@ -3744,6 +3865,12 @@ impl GenericHeteroTransformer {
                                 &layer_ropes,
                                 rope_freq_factors.as_ref(),
                             )?);
+                            if let Some(moe) = shares.last_mut().and_then(|l| l.moe.as_mut()) {
+                                moe.local = Some(super::moe_weights::LocalExperts {
+                                    first: experts_from,
+                                    total: layout.experts.iter().sum(),
+                                });
+                            }
                         }
                         let mut owner = shares.remove(0);
                         owner.tp_shards = shares;

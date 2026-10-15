@@ -250,7 +250,7 @@ impl Drop for Scratch {
 }
 
 /// The card's address of the first element of `t`, which a copy reads or writes.
-fn address_of<T: crate::tensor::kernel_ffi::CudaDType>(t: &Tensor) -> Result<u64> {
+pub(super) fn address_of<T: crate::tensor::kernel_ffi::CudaDType>(t: &Tensor) -> Result<u64> {
     use cudarc::driver::DevicePtr;
     let (storage, layout) = t.storage_and_layout();
     match &*storage {
@@ -3012,6 +3012,7 @@ mod tests {
             }),
             n_experts: experts,
             shards: Vec::new(),
+            local: None,
             n_experts_used: used,
             expert_ffn_dim: ffn,
             router_prenormed: true,
@@ -3064,6 +3065,87 @@ mod tests {
                     .unwrap()
             };
             let (want, got) = (run(&one), run(&two));
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let worst = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 1e-5 * scale,
+                "{rows} rows: off by {worst} of {scale}"
+            );
+        }
+    }
+
+    /// The cards of a split layer, each holding a range of the experts and weighing the other
+    /// cards' pairs zero, sum to the rows of one card holding them all: a decoded token, a few
+    /// rows and a prefill wide enough for the expert-batched kernels.
+    #[test]
+    #[ignore = "needs two idle CUDA cards"]
+    fn the_cards_of_a_split_layer_sum_to_the_rows_of_one_card() {
+        use crate::inference::generic_transformer::moe_weights::{ExpertShard, LocalExperts};
+        let (Ok(first), Ok(second)) = (Device::new_cuda(0), Device::new_cuda(1)) else {
+            eprintln!("skipping: two usable CUDA devices are needed");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (8usize, 2usize, 64usize, 64usize);
+        let mut one = layer(&first, experts, used, hidden, ffn);
+        one.shards = vec![ExpertShard::from_host(&one, 0, experts, &first).unwrap()];
+        let part = |dev: &Device, from: usize, count: usize| {
+            let mut m = layer(dev, experts, used, hidden, ffn);
+            let range = |s: &Arc<QTensor>| Arc::new(experts_range(s, from, count, dev).unwrap());
+            m.gate_exps_sep = m.gate_exps_sep.as_ref().map(range);
+            m.up_exps_sep = m.up_exps_sep.as_ref().map(range);
+            m.down_exps = range(&m.down_exps);
+            m.n_experts = count;
+            m.local = Some(LocalExperts {
+                first: from,
+                total: experts,
+            });
+            m
+        };
+        // Uneven ranges, as cards of different speeds take.
+        let cut = experts * 2 / 3;
+        let parts = [
+            (part(&first, 0, cut), &first),
+            (part(&second, cut, experts - cut), &second),
+        ];
+        for (rows, prefill) in [
+            (1usize, false),
+            (2, false),
+            (5, false),
+            (2, true),
+            (6, true),
+            (160, true),
+        ] {
+            let x = Tensor::from_vec(
+                values(rows * hidden, rows as u64, 1.0),
+                (1, rows, hidden),
+                &first,
+            )
+            .unwrap();
+            let flat = |t: Tensor| -> Vec<f32> {
+                t.to_device(&first)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap()
+            };
+            let want = flat(one.forward(&x, &x, hidden, 1e-5, prefill).unwrap());
+            let mut got = vec![0f32; want.len()];
+            for (moe, dev) in &parts {
+                let x = x.to_device(dev).unwrap();
+                for (g, v) in got
+                    .iter_mut()
+                    .zip(flat(moe.forward(&x, &x, hidden, 1e-5, prefill).unwrap()))
+                {
+                    *g += v;
+                }
+            }
             let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
             let worst = want
                 .iter()
