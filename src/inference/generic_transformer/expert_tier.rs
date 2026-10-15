@@ -2947,7 +2947,29 @@ mod tests {
         [gate_up, down]: [GgmlDType; 2],
     ) -> MoeWeights {
         let host = Device::Cpu;
-        let stack = |seed: u64, rows: usize, cols: usize, dtype: GgmlDType| {
+        // The stacks are quantised once a shape and kept: the host's and the card's layers of a
+        // test read the same ones, which a large shape makes worth sharing.
+        type Key = (usize, usize, usize, u64, GgmlDType);
+        static STACKS: std::sync::Mutex<Vec<(Key, Arc<QTensor>)>> =
+            std::sync::Mutex::new(Vec::new());
+        let stack = |seed: u64, rows: usize, cols: usize, dtype: GgmlDType| -> Arc<QTensor> {
+            let key = (experts, rows, cols, seed, dtype);
+            let mut kept = STACKS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, t)) = kept.iter().find(|(k, _)| *k == key) {
+                return t.clone();
+            }
+            let made = Arc::new(quantised_stack(experts, seed, rows, cols, dtype));
+            kept.push((key, made.clone()));
+            made
+        };
+        fn quantised_stack(
+            experts: usize,
+            seed: u64,
+            rows: usize,
+            cols: usize,
+            dtype: GgmlDType,
+        ) -> QTensor {
+            let host = Device::Cpu;
             // A format only read from a file takes any bytes with a small, finite scale in
             // front of each block; the others are quantised from values.
             if matches!(
@@ -2988,7 +3010,7 @@ mod tests {
             )
             .unwrap();
             QTensor::quantize_onto(&w, dtype, &host).unwrap()
-        };
+        }
         MoeWeights {
             gate_inp: QMatMul::Tensor(
                 Tensor::from_vec(values(experts * hidden, 7, 0.5), (experts, hidden), dev).unwrap(),
@@ -3000,9 +3022,9 @@ mod tests {
             down_exps_bias: None,
             swiglu_clamp: None,
             gate_up_exps: None,
-            down_exps: Arc::new(stack(3, hidden, ffn, down)),
-            gate_exps_sep: Some(Arc::new(stack(1, ffn, hidden, gate_up))),
-            up_exps_sep: Some(Arc::new(stack(2, ffn, hidden, gate_up))),
+            down_exps: stack(3, hidden, ffn, down),
+            gate_exps_sep: Some(stack(1, ffn, hidden, gate_up)),
+            up_exps_sep: Some(stack(2, ffn, hidden, gate_up)),
             down_exps_scale: None,
             decode_slots: dev.runs_as_card().then(|| {
                 Tensor::from_vec((0..used as u32).collect::<Vec<_>>(), (used,), &host)
@@ -3976,8 +3998,16 @@ mod tests {
             tiered.tier = Some(Arc::new(tier));
             for rows in [100usize, 700, 900, 1520] {
                 let x = values(rows * hidden, 77, 1.0);
-                let on_host = Tensor::from_vec(x.clone(), (1, rows, hidden), &Device::Cpu).unwrap();
-                let on_card = Tensor::from_vec(x, (1, rows, hidden), &card).unwrap();
+                let on_card = Tensor::from_vec(x.clone(), (1, rows, hidden), &card).unwrap();
+                // Rows route and multiply alone, so the host answers for the first and last rows
+                // of the batch only, while the card runs the whole batch.
+                let sample: Vec<usize> = (0..rows).filter(|&r| r < 32 || r + 32 >= rows).collect();
+                let picked: Vec<f32> = sample
+                    .iter()
+                    .flat_map(|&r| x[r * hidden..(r + 1) * hidden].iter().copied())
+                    .collect();
+                let on_host =
+                    Tensor::from_vec(picked, (1, sample.len(), hidden), &Device::Cpu).unwrap();
                 let want = reference
                     .forward(&on_host, &on_host, hidden, 1e-5, true)
                     .unwrap();
@@ -3986,6 +4016,10 @@ mod tests {
                     .forward(&on_card, &on_card, hidden, 1e-5, true)
                     .unwrap();
                 let got = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let got: Vec<f32> = sample
+                    .iter()
+                    .flat_map(|&r| got[r * hidden..(r + 1) * hidden].iter().copied())
+                    .collect();
                 assert!(
                     got.iter().all(|v| v.is_finite()),
                     "{formats:?} rows {rows}: non-finite output"

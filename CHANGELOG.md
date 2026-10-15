@@ -28,6 +28,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Changed
 
+- Tests: the gate profile rebuilds a change in place, the suite runs in half the time.
 - CPU: the prompt's KV cache rows are quantized on the thread pool.
 - CPU: large matmul outputs are cleared on the thread pool.
 - CPU: the build targets x86-64-v3 and refuses an older CPU with a message.

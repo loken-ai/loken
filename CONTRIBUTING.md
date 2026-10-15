@@ -19,9 +19,10 @@ CUDA toolkit and OpenCL headers, or `cargo build --release --no-default-features
 for neither. Tested against CUDA 13.3. `cp config.toml.example config.toml` before running the
 daemon.
 
-No CI: the suite needs a CUDA GPU, so it runs where you are. `cargo test --lib --release` before
-opening a PR. Tests marked `#[ignore]` need model weights on disk  - 
-`config.test.toml.example` says how to point them at yours.
+The CI runs the host's suite; the card tests run where you are. `cargo test --lib --profile gate`
+before opening a PR: the release build's code, rebuilt in place, so a change recompiles the units
+that hold it. Tests marked `#[ignore]` need model weights on disk or several cards -
+`config.test.toml.example` says how to point them at your weights.
 
 ## Style
 

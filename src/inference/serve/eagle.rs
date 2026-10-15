@@ -483,13 +483,16 @@ mod tests {
     #[test]
     fn eagle_head_forward_shapes() {
         let dev = Device::Cpu;
-        let cfg = EagleConfig::qwen2(5120, 40, 8, 128, 27648);
+        // A qwen2 head's proportions, five query heads a kv head and a feed-forward 5.4 times as
+        // wide as the hidden state, at a width the host builds at once.
+        let hidden = 640;
+        let cfg = EagleConfig::qwen2(hidden, 10, 2, 64, 3456);
         let head = random_head(cfg, &dev);
         let seq = 5;
-        let feature = Tensor::randn(0f32, 1.0, (seq, 5120), &dev).unwrap();
-        let embed = Tensor::randn(0f32, 1.0, (seq, 5120), &dev).unwrap();
+        let feature = Tensor::randn(0f32, 1.0, (seq, hidden), &dev).unwrap();
+        let embed = Tensor::randn(0f32, 1.0, (seq, hidden), &dev).unwrap();
         let out = head.forward(&feature, &embed, 0).unwrap();
-        assert_eq!(out.dims(), &[seq, 5120]);
+        assert_eq!(out.dims(), &[seq, hidden]);
         let m = out
             .abs()
             .unwrap()

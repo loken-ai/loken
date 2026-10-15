@@ -310,23 +310,37 @@ impl Block {
         let (g, u, d) = (deq(&self.gate), deq(&self.up), deq(&self.down));
         let (xs, slots, experts, weights) = &self.host;
         let (hd, it) = (self.hidden, self.inter);
+        use rayon::prelude::*;
+        // Each pair's product on its own, then summed into its token in the pairs' order.
+        let products: Vec<(usize, Vec<f32>)> = slots
+            .par_iter()
+            .zip(experts.par_iter())
+            .map(|(&pair, &e)| {
+                let (pair, e) = (pair as usize, e as usize);
+                let t = pair / self.topk;
+                let x = &xs[t * hd..(t + 1) * hd];
+                let h: Vec<f32> = (0..it)
+                    .map(|r| {
+                        let row = (e * it + r) * hd;
+                        let gv: f32 = g[row..row + hd].iter().zip(x).map(|(a, b)| a * b).sum();
+                        let uv: f32 = u[row..row + hd].iter().zip(x).map(|(a, b)| a * b).sum();
+                        gv / (1.0 + (-gv).exp()) * uv
+                    })
+                    .collect();
+                let y = (0..hd)
+                    .map(|r| {
+                        let row = (e * hd + r) * it;
+                        let dv: f32 = d[row..row + it].iter().zip(&h).map(|(a, b)| a * b).sum();
+                        weights[pair] * dv
+                    })
+                    .collect();
+                (t, y)
+            })
+            .collect();
         let mut out = vec![0f32; self.tokens * hd];
-        for (&pair, &e) in slots.iter().zip(experts) {
-            let (pair, e) = (pair as usize, e as usize);
-            let t = pair / self.topk;
-            let x = &xs[t * hd..(t + 1) * hd];
-            let h: Vec<f32> = (0..it)
-                .map(|r| {
-                    let row = (e * it + r) * hd;
-                    let gv: f32 = g[row..row + hd].iter().zip(x).map(|(a, b)| a * b).sum();
-                    let uv: f32 = u[row..row + hd].iter().zip(x).map(|(a, b)| a * b).sum();
-                    gv / (1.0 + (-gv).exp()) * uv
-                })
-                .collect();
-            for r in 0..hd {
-                let row = (e * hd + r) * it;
-                let dv: f32 = d[row..row + it].iter().zip(&h).map(|(a, b)| a * b).sum();
-                out[t * hd + r] += weights[pair] * dv;
+        for (t, y) in products {
+            for (o, v) in out[t * hd..(t + 1) * hd].iter_mut().zip(y) {
+                *o += v;
             }
         }
         out

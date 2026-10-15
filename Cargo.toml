@@ -192,3 +192,10 @@ path = "src/bin/loken.rs"
 inherits = "dev"
 opt-level = 1
 debug = "line-tables-only"
+
+# What a change is checked with on a workstation: the release build's code, rebuilt in place, so
+# a change to one file recompiles the units that hold it rather than the whole crate.
+[profile.gate]
+inherits = "release"
+incremental = true
+codegen-units = 256
