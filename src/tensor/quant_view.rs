@@ -176,6 +176,45 @@ pub fn rows_view(
     crate::tensor::quantized::QTensor::from_native(Arc::new(nqt), &crate::tensor::Device::Cpu)
 }
 
+/// The columns `start..start + count` of a 2-D quantised matrix `[R, C]` as a matrix `[R, count]`
+/// of its own: each row's blocks over that range copied, so both bounds fall on block boundaries.
+pub fn columns_copy(
+    parent: &crate::tensor::quantized::QTensor,
+    start: usize,
+    count: usize,
+) -> crate::tensor::Result<crate::tensor::quantized::QTensor> {
+    let native = parent.native_qtensor();
+    let [n_rows, c] = native.dims[..] else {
+        return Err(crate::tensor::Error::msg(format!(
+            "columns_copy: parent must be 2-D [R,C], got {:?}",
+            native.dims
+        )));
+    };
+    let (dtype, block) = (native.dtype, native.dtype.block_size());
+    if count == 0
+        || start + count > c
+        || !start.is_multiple_of(block)
+        || !count.is_multiple_of(block)
+    {
+        return Err(crate::tensor::Error::msg(format!(
+            "columns_copy: columns {start}+{count} of {c} do not fall on {block}-wide blocks"
+        )));
+    }
+    let row_bytes = (c / block) * dtype.type_size();
+    let (from, len) = (
+        (start / block) * dtype.type_size(),
+        (count / block) * dtype.type_size(),
+    );
+    let data = native.data();
+    let mut bytes = Vec::with_capacity(n_rows * len);
+    for row in data.chunks_exact(row_bytes) {
+        bytes.extend_from_slice(&row[from..from + len]);
+    }
+    let nqt = nquant::QHostTensor::from_bytes(&bytes, dtype, vec![n_rows, count])
+        .map_err(|e| crate::tensor::Error::msg(e.0))?;
+    crate::tensor::quantized::QTensor::from_native(Arc::new(nqt), &crate::tensor::Device::Cpu)
+}
+
 /// `native_expert_view` with an explicit owner to pin.
 fn native_expert_view_pinning(
     parent: &Arc<nquant::QHostTensor>,
@@ -241,6 +280,40 @@ mod tests {
             for (j, (g, w)) in got.iter().zip(want).enumerate() {
                 assert_eq!(g.to_bits(), w.to_bits(), "expert {i} idx {j}: {g} vs {w}");
             }
+        }
+    }
+
+    /// A block-aligned column range of a quantised matrix dequantises to the same columns of the
+    /// whole, in each format with its own block width; a range off the blocks is refused.
+    #[test]
+    fn a_column_range_dequantises_to_the_same_columns() {
+        for dtype in [
+            nquant::GgmlDType::Q8_0,
+            nquant::GgmlDType::Q4K,
+            nquant::GgmlDType::Q6K,
+        ] {
+            let block = dtype.block_size();
+            let (r, c) = (5usize, 4 * block);
+            let data: Vec<f32> = (0..r * c).map(|i| (i as f32 * 0.37).sin()).collect();
+            let bytes = quant_cpu::from_float_bytes(dtype, &data).unwrap();
+            let parent = crate::tensor::quantized::QTensor::from_native(
+                Arc::new(nquant::QHostTensor::from_bytes(&bytes, dtype, vec![r, c]).unwrap()),
+                &crate::tensor::Device::Cpu,
+            )
+            .unwrap();
+            let full = parent.native_qtensor().dequantize_f32().unwrap();
+            let (start, count) = (block, 2 * block);
+            let part = columns_copy(&parent, start, count).unwrap();
+            let got = part.native_qtensor().dequantize_f32().unwrap();
+            for row in 0..r {
+                let want = &full[row * c + start..row * c + start + count];
+                assert_eq!(
+                    &got[row * count..(row + 1) * count],
+                    want,
+                    "{dtype:?} row {row}"
+                );
+            }
+            assert!(columns_copy(&parent, block / 2, block).is_err());
         }
     }
 
