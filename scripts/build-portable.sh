@@ -135,7 +135,7 @@ for bin in lokend loken; do
 done
 cp LICENSE-MIT LICENSE-APACHE NOTICE.md "$STAGE/$NAME/"
 
-archs="$(grep -o 'code=sm_[0-9]*a\?' build.rs | sed 's/code=//' | sort -u | tr '\n' ' ')"
+archs="$(grep -o 'code=sm_[0-9][0-9]*a\?' build.rs | sed 's/code=//' | sort -u | tr '\n' ' ')"
 cuda_version="$(sed -n 's/.*"cuda" *: *{[^}]*"version" *: *"\([^"]*\)".*/\1/p' "$CUDA_PATH/version.json" 2>/dev/null | head -1)"
 [ -n "$cuda_version" ] || cuda_version="$("$CUDA_PATH/bin/nvcc" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p')"
 features="${FEATURES:-$(sed -n 's/^default = \[\(.*\)\]/\1/p' Cargo.toml | head -1 | tr -d ' "')}"
