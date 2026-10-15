@@ -656,6 +656,65 @@ pub(crate) fn moe_stack_served_as_stored(
     }
 }
 
+/// Why the file `content` of architecture `arch` cannot run tensor-parallel over `ranks` cards,
+/// or `None` when every one of its layers can: the per-layer reasons of [`tp_refusal`] read from
+/// the file's tensor names and widths before anything is loaded.
+pub(crate) fn tp_file_refusal(
+    content: &gguf_file::Content,
+    arch: &str,
+    ranks: usize,
+) -> Option<String> {
+    let config = match GenericTransformerConfig::from_gguf(content, arch) {
+        Ok(c) => c,
+        Err(e) => return Some(e.to_string()),
+    };
+    let names: Vec<&String> = content.tensor_infos.keys().collect();
+    let has = |part: &str| {
+        names
+            .iter()
+            .any(|n| n.starts_with("blk.") && n.contains(part))
+    };
+    let refused = [
+        ("ffn_gate_inp", "routed experts"),
+        ("attn_qkv", "a fused q, k and v projection"),
+        ("ssm_", "a recurrent mixer"),
+        ("shortconv", "a recurrent mixer"),
+        ("ffn_up_shexp", "a shared expert"),
+        ("attn_gate", "an attention output gate"),
+        ("attn_sinks", "attention sinks"),
+        ("ffn_up.bias", "a feed-forward up bias"),
+        ("inp_gate", "per-layer inputs"),
+        ("hc_", "a wide residual"),
+    ];
+    if let Some((_, why)) = refused.iter().find(|(part, _)| has(part)) {
+        return Some((*why).to_string());
+    }
+    let (heads, kv, hd, ffn) = (
+        config.n_head,
+        config.n_kv_head,
+        config.head_dim,
+        config.ffn_dim,
+    );
+    if heads % ranks != 0 || kv % ranks != 0 || ffn % ranks != 0 {
+        return Some(format!(
+            "{heads} heads, {kv} kv heads or {ffn} wide do not divide by {ranks}"
+        ));
+    }
+    let block = |name: &str| {
+        content
+            .tensor_infos
+            .get(name)
+            .map(|t| t.ggml_dtype.block_size())
+    };
+    let fits = |name: &str, cols: usize| block(name).is_some_and(|b| cols.is_multiple_of(b));
+    (0..config.n_layers)
+        .find(|i| {
+            !fits(&format!("blk.{i}.attn_output.weight"), heads / ranks * hd)
+                || !fits(&format!("blk.{i}.ffn_down.weight"), ffn / ranks)
+        })
+        .map(|i| format!("layer {i}: a share's columns do not fall on the weights' blocks"))
+}
+
 /// Why the layer `raw` cannot be split into `ranks` tensor-parallel shares, or `None` when it
 /// can: an attention layer with separate q, k and v, a dense feed-forward, and heads and widths
 /// that divide among the ranks on the blocks of their weights.

@@ -253,6 +253,12 @@ pub fn card_pair_link(from: usize, to: usize) -> Option<(f64, f64)> {
     measured
 }
 
+/// No-CUDA build: no card, so no link between two.
+#[cfg(not(feature = "cuda"))]
+pub fn card_pair_link(_from: usize, _to: usize) -> Option<(f64, f64)> {
+    None
+}
+
 pub fn probe_cuda_gpus() -> Vec<CudaGpuInfo> {
     let mut gpu_info: Vec<CudaGpuInfo> = Vec::new();
     match nvml_wrapper::Nvml::init() {

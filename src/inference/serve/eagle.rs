@@ -54,7 +54,7 @@ pub struct EagleConfig {
 
 impl EagleConfig {
     /// Config for a deepseek-r1 / deepcoder (Qwen2-distill) target - the first
-    /// EAGLE target (headline TP model; verified geometry in tp_model.rs).
+    /// EAGLE target.
     pub fn qwen2(
         hidden: usize,
         n_head: usize,
@@ -78,7 +78,7 @@ impl EagleConfig {
 
 const MAX_DRAFT_POS: usize = 4096;
 
-/// Precompute RoPE cos/sin tables [MAX_DRAFT_POS, head_dim/2] (mirrors tp_model).
+/// Precompute RoPE cos/sin tables [MAX_DRAFT_POS, head_dim/2].
 fn rope_tables(hd: usize, base: f32, dev: &Device) -> Result<(Tensor, Tensor)> {
     let half = hd / 2;
     let theta: Vec<f32> = crate::inference::model::rope::inverse_frequencies(hd, base);

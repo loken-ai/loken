@@ -471,11 +471,13 @@ pub fn prefer(cards: &[(usize, u64)], card: Option<usize>) -> Vec<(usize, u64)> 
 /// The CUDA cards a plan runs on, in the plan's order.
 pub fn cards_of(plan: &HeteroPlan) -> Vec<usize> {
     let mut out = Vec::new();
-    for s in &plan.segments {
-        if let DeviceKind::Cuda(idx) = s.kind {
-            if !out.contains(&idx) {
-                out.push(idx);
-            }
+    let segments = plan.segments.iter().filter_map(|s| match s.kind {
+        DeviceKind::Cuda(idx) => Some(idx),
+        _ => None,
+    });
+    for idx in segments.chain(plan.tp_cards.iter().flatten().copied()) {
+        if !out.contains(&idx) {
+            out.push(idx);
         }
     }
     out

@@ -17,9 +17,3 @@ pub mod prompt_lookup;
 pub mod scheduler;
 pub mod spec_kv_cache;
 pub mod speculative_config;
-#[cfg(feature = "cuda")]
-pub mod tp_decode;
-#[cfg(feature = "cuda")]
-pub mod tp_model;
-#[cfg(any(feature = "cuda", test))]
-pub mod tp_support;

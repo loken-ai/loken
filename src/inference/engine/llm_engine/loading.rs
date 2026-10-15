@@ -1009,58 +1009,23 @@ impl LlmEngine {
                             .min(ctx_for_planning as usize)
                     };
 
-                    // A model the placement runs tensor-parallel runs every layer on each of its
-                    // cards, joined by an all-reduce, instead of one card per token with the
-                    // others idle. Which files the decoder computes correctly is read from their
-                    // tensors and metadata. A tensor-parallel load that fails leaves the model to
-                    // the ladder below.
-                    #[cfg(feature = "cuda")]
-                    let tensor_parallel: Option<BoxedModelBackend> = {
-                        use crate::inference::serve::tp_support::tensor_parallel_support;
-                        // The tensor-parallel loader reads one mapping, so a split set takes the
-                        // ladder. The fewest cards that hold the model carry it.
-                        let tp = (awq.is_none() && layer_share.is_none() && split.is_none())
-                            .then(|| {
-                                (2..=cuda_devices.len()).find_map(|ranks| {
-                                    tensor_parallel_support(&content, &arch, ranks)
-                                        .inspect_err(|why| info!("{arch} stays off tensor parallelism on {ranks} cards: {why}"))
-                                        .ok()?;
-                                    crate::inference::place::llm::tensor_parallel(&demand, &cuda_devices, ranks)
-                                })
-                            })
-                            .flatten();
-                        tp.and_then(|tp| {
-                            info!("⬇️  Loading {arch} tensor-parallel across GPU {:?}, feed-forward shares {:?}",
-                                tp.cards, tp.ffn_shares);
-                            let built = tp
-                                .cards
-                                .iter()
-                                .map(|&idx| Device::new_cuda(idx).map_err(|e| anyhow!("cuda:{idx}: {e}")))
-                                .collect::<AnyResult<Vec<Device>>>()
-                                .and_then(|cards| {
-                                    crate::inference::serve::tp_model::TpQwen2::from_gguf(
-                                        mmap_bytes, &mmap, &arch, &cards, &tp.ffn_shares,
-                                    )
-                                });
-                            match built {
-                                Ok(m) => {
-                                    info!("✅ {arch} loaded as TpQwen2 (tensor-parallel across {} GPUs)", tp.cards.len());
-                                    Some(Box::new(TpQwen2Backend(m)) as BoxedModelBackend)
-                                }
-                                Err(e) => {
-                                    warn!("{arch}: tensor-parallel load failed ({e}); placing it layer by layer");
-                                    crate::inference::engine::llm_engine::release_cuda_pools();
-                                    None
-                                }
-                            }
+                    // A dense model that does not sit on one card may split every layer across a
+                    // group of cards instead of placing them layer by layer: when the file's layers
+                    // split, the group holds it, and the measured reads and links predict it faster.
+                    let tp_plan = (awq.is_none() && layer_share.is_none() && split.is_none())
+                        .then(|| {
+                            crate::inference::place::tensor_parallel::plan(
+                                &demand,
+                                &cuda_devices,
+                                (dims.hidden_size * std::mem::size_of::<f32>()) as u64,
+                                |ranks| crate::inference::generic_transformer::tp_file_refusal(&content, &arch, ranks),
+                            )
                         })
-                    };
-                    #[cfg(not(feature = "cuda"))]
-                    let tensor_parallel: Option<BoxedModelBackend> = None;
-
-                    match tensor_parallel {
-                        Some(m) => m,
-                        None => {
+                        .flatten();
+                    if let Some(p) = &tp_plan {
+                        info!("⬇️  Loading {arch} with every layer split across GPU {:?}", p.tp_cards);
+                    }
+                    {
                             // The embedding table joins the first layer's card when the plan can
                             // hold it there without moving a layer.
                             let stem_bytes = generic_weights.stem_bytes(&content);
@@ -1097,6 +1062,10 @@ impl LlmEngine {
                                 } else {
                                     (ordered, false)
                                 };
+                            let (first_plan, stem_fits) = match tp_plan {
+                                Some(p) => (p, false),
+                                None => (first_plan, stem_fits),
+                            };
                             // A handle per card a plan uses, made on first use, with per-slice
                             // event tracking off before any tensor loads: a device owns one
                             // working stream, so the events would order a stream against itself,
@@ -1194,7 +1163,7 @@ impl LlmEngine {
                                 demand.whole().saturating_sub(demand.block_bytes + demand.head_bytes),
                             )?
                         }
-                    }
+
                 }
             };
             debug!("✓ Weights loaded from mmap in {:.1}ms", weights_t.elapsed().as_secs_f64() * 1000.0);

@@ -1386,13 +1386,6 @@ impl DeepseekV41Backend {
     }
 }
 
-/// TpQwen2: tensor-parallel (TP=2) decoder across 2 GPUs. Both cards run EVERY layer -
-/// column/row-parallel weights joined by an all-reduce - against the pipeline's one card
-/// per token with the other idle. Covers qwen2 (deepseek-r1, with QKV bias) and the
-/// no-bias llama/mistral family. CUDA-only.
-#[cfg(feature = "cuda")]
-pub(crate) struct TpQwen2Backend(pub crate::inference::serve::tp_model::TpQwen2);
-
 /// Continuous-batch serving: a `cb_eligible` dense model (Qwen2/3) moved into
 /// a background `ContinuousServer` worker that multiplexes concurrent requests
 /// into batched paged decode (the throughput-vs-vLLM path). The serial decode
@@ -1419,8 +1412,6 @@ pub(crate) struct TakenBackend;
 unsafe impl Send for MoondreamBackend {}
 unsafe impl Send for GenericBackend {}
 unsafe impl Send for GenericVisionBackend {}
-#[cfg(feature = "cuda")]
-unsafe impl Send for TpQwen2Backend {}
 unsafe impl Send for ContinuousBackend {}
 unsafe impl Send for BatchedBackend {}
 
@@ -2590,33 +2581,6 @@ impl ModelBackend for DeepseekV41Backend {
     fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
         Err(self)
     }
-}
-
-#[cfg(feature = "cuda")]
-impl ModelBackend for TpQwen2Backend {
-    fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        // The engine passes [1, seq] token ids; TpQwen2 takes a flat slice and returns the
-        // last token's logits [vocab], so wrap them back to [1, vocab].
-        let toks: Vec<u32> = x.flatten_all()?.to_vec1::<u32>()?;
-        self.0
-            .forward(&toks, index_pos)
-            .map_err(crate::tensor::Error::msg)?
-            .unsqueeze(0)
-    }
-
-    fn reset_kv_from(&mut self, keep: usize) {
-        // TP only ever prefills at position 0 and resets there.
-        if keep == 0 {
-            self.0.reset_kv();
-        }
-    }
-
-    fn device_layer_distribution(&self) -> Vec<(String, usize, u32, u32)> {
-        // Tensor-parallel: every layer is on both cards, which is the whole point.
-        self.0.device_layer_distribution().1
-    }
-
-    take_generic_passthrough!();
 }
 
 impl ModelBackend for ContinuousBackend {

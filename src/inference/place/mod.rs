@@ -30,6 +30,7 @@ pub mod plan;
 pub mod recover;
 pub mod room;
 pub mod runtime_demand;
+pub mod tensor_parallel;
 #[cfg(feature = "video")]
 pub mod video_plan;
 pub mod vram_manager;

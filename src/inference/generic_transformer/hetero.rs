@@ -89,6 +89,11 @@ impl GenericHeteroTransformer {
         if wanted.is_empty() {
             return Ok(AdapterReport::default());
         }
+        if self.layers.iter().any(|l| !l.tp_shards.is_empty()) {
+            return Err(Error(
+                "adapters do not apply to a model whose layers are split across cards".into(),
+            ));
+        }
 
         // Read on the host, then move each delta to the card its projection sits on: a split
         // model holds layer 0 and layer 30 on different devices.

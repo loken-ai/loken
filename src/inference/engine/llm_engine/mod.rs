@@ -2,8 +2,6 @@ use crate::inference::engine::decode_step::{
     pld_verify_commit, pld_window_update, resolve_gen_params, sample_row_sync, spec_draft_lockstep,
     ResolvedGenParams, StopTracker, StreamDetokenizer,
 };
-#[cfg(feature = "cuda")]
-use crate::inference::engine::model_backend::TpQwen2Backend;
 use crate::inference::engine::model_backend::{
     BatchedBackend, BoxedModelBackend, ContinuousBackend, GenericBackend, GenericVisionBackend,
     MoondreamBackend, TakenBackend,

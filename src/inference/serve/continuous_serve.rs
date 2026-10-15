@@ -746,7 +746,7 @@ impl ContinuousServer {
             // Disable event tracking: the CB worker is single-stream, so the
             // multi-stream sync events aren't needed - and creating CUDA events
             // during allocations INSIDE a graph capture invalidates the capture
-            // (required for the captured decode graph; mirrors tp_model + test_graph_capture).
+            // (required for the captured decode graph).
             if let Ok(cd) = cdev.as_cuda_device() {
                 unsafe {
                     cd.disable_event_tracking();
