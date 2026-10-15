@@ -535,6 +535,21 @@ impl SharedExpert {
 // Per-layer struct
 // ------------------------------------------------------------
 
+/// The routed experts one launch reads, all on one device: the stacks, the per-expert biases
+/// and the decode slot table, the experts numbered from zero within the set.
+#[derive(Clone, Copy)]
+pub(super) struct ExpertSet<'a> {
+    pub gate: Option<&'a QTensor>,
+    pub up: Option<&'a QTensor>,
+    pub gate_up: Option<&'a QTensor>,
+    pub down: &'a QTensor,
+    pub gate_bias: Option<&'a Tensor>,
+    pub up_bias: Option<&'a Tensor>,
+    pub down_bias: Option<&'a Tensor>,
+    pub decode_slots: Option<&'a Tensor>,
+    pub n_experts: usize,
+}
+
 /// Gemma4-MoE per-layer weights: top-K-of-N expert FFN.
 /// Active per token: K experts x (gate+up+down) - top-8 of 128
 /// for gemma4 26B A4B.
@@ -1195,6 +1210,21 @@ impl MoeWeights {
         Ok((topk_weights, topk_ids))
     }
 
+    /// This layer's own experts, or the stacks `staged` (`[gate, up, down]`) in their place.
+    pub(super) fn own_experts<'a>(&'a self, staged: Option<&'a [QTensor; 3]>) -> ExpertSet<'a> {
+        ExpertSet {
+            gate: staged.map(|s| &s[0]).or(self.gate_exps_sep.as_deref()),
+            up: staged.map(|s| &s[1]).or(self.up_exps_sep.as_deref()),
+            gate_up: self.gate_up_exps.as_deref(),
+            down: staged.map_or(&*self.down_exps, |s| &s[2]),
+            gate_bias: self.gate_exps_bias.as_ref(),
+            up_bias: self.up_exps_bias.as_ref(),
+            down_bias: self.down_exps_bias.as_ref(),
+            decode_slots: self.decode_slots.as_ref(),
+            n_experts: self.n_experts,
+        }
+    }
+
     /// Device path: the gate‖up projections and their combine, then the down projection and
     /// the top-k weighted reduction, each as one launch over the routing plan.
     #[cfg(feature = "cuda")]
@@ -1209,6 +1239,33 @@ impl MoeWeights {
         add_after: Option<&Tensor>,
         staged: Option<&[QTensor; 3]>,
     ) -> Result<Tensor> {
+        self.experts_cuda(
+            xs,
+            topk_ids,
+            topk_weights,
+            num_tokens,
+            is_prefill,
+            t_route,
+            add_after,
+            self.own_experts(staged),
+        )
+    }
+
+    /// [`Self::forward_cuda`] over the experts `set` holds, on the device `xs` lives on: the
+    /// routed ids number the set's experts.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn experts_cuda(
+        &self,
+        xs: &Tensor,
+        topk_ids: &Tensor,
+        topk_weights: &Tensor,
+        num_tokens: usize,
+        is_prefill: bool,
+        t_route: Option<std::time::Instant>,
+        add_after: Option<&Tensor>,
+        set: ExpertSet<'_>,
+    ) -> Result<Tensor> {
         let note_route = || {
             if let Some(t) = t_route {
                 let _ = xs.device().synchronize();
@@ -1218,7 +1275,7 @@ impl MoeWeights {
         // A wide prefill takes the expert-batched tile kernels, grouping the rows on the
         // device; decode and the layers they do not serve take the sorted routing below.
         let batched = match is_prefill {
-            true => self.batched_routing(xs, topk_ids, num_tokens, staged)?,
+            true => self.batched_routing(xs, topk_ids, num_tokens, set)?,
             false => None,
         };
         if let Some(plan) = batched {
@@ -1226,11 +1283,11 @@ impl MoeWeights {
                 crate::tensor::bail!("MoeWeights: the batched path does not fold a residual");
             }
             note_route();
-            return self.batched_experts(xs, &plan, topk_weights, staged);
+            return self.batched_experts(xs, &plan, topk_weights, set);
         }
         // One token: the rows are the routed pairs as the router listed them, and every kernel
         // below treats a pair on its own, so nothing needs grouping by expert.
-        let routing = match (self.decode_slots.as_ref(), num_tokens) {
+        let routing = match (set.decode_slots, num_tokens) {
             (Some(slots), 1) if topk_ids.dtype() == crate::tensor::DType::U32 => ExpertRouting {
                 slots: slots.clone(),
                 experts: topk_ids.flatten_all()?,
@@ -1242,13 +1299,11 @@ impl MoeWeights {
         let routing = &routing;
         // Auto-on: per-pair-tile IMMA M=8 for Q4_K MoE prefill - measured
         // +33% over dp4a on gemma4:26b.
-        let weight_is_q4k = self
-            .gate_up_exps
-            .as_ref()
+        let weight_is_q4k = set
+            .gate_up
             .is_some_and(|w| w.dtype() == crate::tensor::quantized::GgmlDType::Q4K);
-        let k_is_aligned = self
-            .gate_up_exps
-            .as_ref()
+        let k_is_aligned = set
+            .gate_up
             .and_then(|w| w.shape().dims().last().copied())
             .map(|k| k % 256 == 0)
             .unwrap_or(false);
@@ -1288,33 +1343,23 @@ impl MoeWeights {
             // one moe_gemm_gguf each (prefill+decode), then SiLU.mul in Rust. Uses
             // the untouched Q4K experts - no fused Q8 requant (which mangles the 3D
             // stack) and SiLU not the gemma4 kernel's baked GELU.
-            let g: &QTensor = match staged {
-                Some(s) => &s[0],
-                None => self.gate_exps_sep.as_deref().ok_or_else(|| {
-                    crate::tensor::Error::msg("use_silu MoE missing separate gate experts")
-                })?,
-            };
-            let u: &QTensor = match staged {
-                Some(s) => &s[1],
-                None => self.up_exps_sep.as_deref().ok_or_else(|| {
-                    crate::tensor::Error::msg("use_silu MoE missing separate up experts")
-                })?,
-            };
+            let g: &QTensor = set.gate.ok_or_else(|| {
+                crate::tensor::Error::msg("use_silu MoE missing separate gate experts")
+            })?;
+            let u: &QTensor = set.up.ok_or_else(|| {
+                crate::tensor::Error::msg("use_silu MoE missing separate up experts")
+            })?;
             // Decode-only here: the fused
             // single-launch SiLU.mul mmvq kernel (gate GEMM + up GEMM + SiLU.mul in
             // one pass) is exact for M=1 and faster than two separate GEMMs.
             match self.swiglu_clamp {
-                Some(clamp) => routing.gate_up_swiglu_clamped(
-                    xs,
-                    g,
-                    u,
-                    (self.gate_exps_bias.as_ref(), self.up_exps_bias.as_ref()),
-                    clamp,
-                )?,
+                Some(clamp) => {
+                    routing.gate_up_swiglu_clamped(xs, g, u, (set.gate_bias, set.up_bias), clamp)?
+                }
                 None => routing.gate_up_silu(xs, g, u)?,
             }
         } else {
-            let stack = self.gate_up_exps.as_ref().ok_or_else(|| {
+            let stack = set.gate_up.ok_or_else(|| {
                 crate::tensor::Error::msg("MoE layer without a fused gate||up stack")
             })?;
             routing.gate_up_gelu(xs, stack, use_imma_m8_auto)?
@@ -1326,10 +1371,9 @@ impl MoeWeights {
         let t_dn = st.then(std::time::Instant::now);
         // Down + topk-weighted reduce. For Q4_K MoE prefill the IMMA M=8
         // down kernel (same pattern as gate||up) takes over from dp4a.
-        let down_stack: &QTensor = staged.map_or(&*self.down_exps, |s| &s[2]);
+        let down_stack: &QTensor = set.down;
         let down_q4k_aligned = down_stack.dtype() == crate::tensor::quantized::GgmlDType::Q4K
-            && self
-                .down_exps
+            && down_stack
                 .shape()
                 .dims()
                 .last()
@@ -1344,7 +1388,7 @@ impl MoeWeights {
             topk_weights,
             num_tokens,
             down_use_imma_m8,
-            self.down_exps_bias.as_ref(),
+            set.down_bias,
             add_after,
         );
         if let Some(t) = t_dn {
@@ -1366,30 +1410,27 @@ impl MoeWeights {
         xs: &Tensor,
         topk_ids: &Tensor,
         num_tokens: usize,
-        staged: Option<&[QTensor; 3]>,
+        set: ExpertSet<'_>,
     ) -> Result<Option<crate::inference::moe_cuda::MmqRouting>> {
         use crate::inference::moe_cuda::{moe_mmq_pays, moe_mmq_serves, MmqRouting};
-        let (Some(gate), Some(up)) = (
-            staged.map(|s| &s[0]).or(self.gate_exps_sep.as_deref()),
-            staged.map(|s| &s[1]).or(self.up_exps_sep.as_deref()),
-        ) else {
+        let (Some(gate), Some(up)) = (set.gate, set.up) else {
             return Ok(None);
         };
-        let down_stack: &QTensor = staged.map_or(&*self.down_exps, |s| &s[2]);
+        let down_stack: &QTensor = set.down;
         let hidden = xs.dim(crate::tensor::D::Minus1)?;
         // The tile kernels fold gate and up biases into the clamped SwiGLU only.
-        let biases_served = self.swiglu_clamp.is_some()
-            || (self.gate_exps_bias.is_none() && self.up_exps_bias.is_none());
+        let biases_served =
+            self.swiglu_clamp.is_some() || (set.gate_bias.is_none() && set.up_bias.is_none());
         let served = !self.gelu
             && biases_served
             && gate.dtype() == up.dtype()
             && moe_mmq_serves(gate.dtype(), hidden)
             && moe_mmq_serves(down_stack.dtype(), self.expert_ffn_dim);
-        if !served || !moe_mmq_pays(num_tokens * self.n_experts_used, self.n_experts) {
+        if !served || !moe_mmq_pays(num_tokens * self.n_experts_used, set.n_experts) {
             return Ok(None);
         }
         let choices = topk_ids.reshape((num_tokens, self.n_experts_used))?;
-        Ok(Some(MmqRouting::from_choices(&choices, self.n_experts)?))
+        Ok(Some(MmqRouting::from_choices(&choices, set.n_experts)?))
     }
 
     /// The SiLU expert block through the expert-batched tile kernels.
@@ -1399,13 +1440,10 @@ impl MoeWeights {
         xs: &Tensor,
         plan: &crate::inference::moe_cuda::MmqRouting,
         topk_weights: &Tensor,
-        staged: Option<&[QTensor; 3]>,
+        set: ExpertSet<'_>,
     ) -> Result<Tensor> {
         use crate::inference::place::layer_perf::stages;
-        let (Some(gate), Some(up)) = (
-            staged.map(|s| &s[0]).or(self.gate_exps_sep.as_deref()),
-            staged.map(|s| &s[1]).or(self.up_exps_sep.as_deref()),
-        ) else {
+        let (Some(gate), Some(up)) = (set.gate, set.up) else {
             crate::tensor::bail!("MoeWeights: the batched path needs gate and up apart");
         };
         let timing = stages::enabled();
@@ -1415,8 +1453,8 @@ impl MoeWeights {
         });
         let glu = match self.swiglu_clamp {
             Some((alpha, limit)) => crate::inference::moe_cuda::Glu::SwigluOai {
-                gate_bias: self.gate_exps_bias.as_ref(),
-                up_bias: self.up_exps_bias.as_ref(),
+                gate_bias: set.gate_bias,
+                up_bias: set.up_bias,
                 alpha: alpha as f32,
                 limit: limit as f32,
             },
@@ -1428,13 +1466,7 @@ impl MoeWeights {
             stages::add(stages::GATE_UP, t0.elapsed().as_micros() as u64);
             std::time::Instant::now()
         });
-        let out = plan.down_fold_biased(
-            &hs,
-            staged.map_or(&*self.down_exps, |s| &s[2]),
-            topk_weights,
-            None,
-            self.down_exps_bias.as_ref(),
-        )?;
+        let out = plan.down_fold_biased(&hs, set.down, topk_weights, None, set.down_bias)?;
         if let Some(t1) = t1 {
             let _ = xs.device().synchronize();
             stages::add(stages::DOWN, t1.elapsed().as_micros() as u64);
