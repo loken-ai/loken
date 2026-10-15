@@ -30,6 +30,8 @@ pub(crate) struct ModelDims {
     pub(crate) num_heads: usize,
     pub(crate) num_kv_heads: usize,
     pub(crate) head_dim: usize,
+    /// The widest feed-forward of a layer, dense or of one expert; 0 when the header names none.
+    pub(crate) widest_ffn: usize,
     /// For a model whose residual is wide: what its prefill keeps live on a card per token and the
     /// chunk it wants (see `generic_transformer::hyper::prefill_footprint`).
     pub(crate) wide_prefill: Option<crate::inference::generic_transformer::hyper::PrefillFootprint>,
@@ -65,6 +67,11 @@ impl ModelDims {
                     128
                 }
             });
+        let widest_ffn = ["feed_forward_length", "expert_feed_forward_length"]
+            .iter()
+            .filter_map(|key| get_gguf_u32(content, &format!("{arch}.{key}")))
+            .max()
+            .unwrap_or(0) as usize;
         let streams =
             get_gguf_u32(content, &format!("{arch}.hyper_connection.count")).unwrap_or(0) as usize;
         let wide_prefill = (streams > 1).then(|| {
@@ -86,6 +93,7 @@ impl ModelDims {
             num_heads,
             num_kv_heads,
             head_dim,
+            widest_ffn,
             wide_prefill,
         }
     }
@@ -120,6 +128,21 @@ impl ModelDims {
             self.hidden_size.max(self.num_kv_heads * self.head_dim),
             PREFILL_CHUNK_TOKENS,
         )
+    }
+
+    /// What a card keeps free so that the prefill's chunk sizing, measured against the card's
+    /// free memory, runs a whole chunk of `PREFILL_CHUNK_TOKENS`: the cuBLAS workspace and the
+    /// chunk's activations over the share of free memory a chunk may take.
+    pub(crate) fn full_chunk_reserve(&self) -> u64 {
+        if self.wide_prefill.is_some() || self.widest_ffn == 0 {
+            return self.work_reserve();
+        }
+        let shape =
+            crate::inference::engine::model_backend::PrefillShape::from_widest_ffn(self.widest_ffn);
+        let chunk = (shape.share * shape.bytes_per_token * PREFILL_CHUNK_TOKENS) as u64;
+        crate::inference::place::runtime_demand::CUBLAS_WORKSPACE_BYTES
+            .saturating_add(chunk)
+            .max(self.work_reserve())
     }
 }
 
@@ -994,6 +1017,29 @@ impl LlmEngine {
                         )
                     };
                     let demand = demand_at(ctx_for_planning);
+                    // A model the cards hold whole with room for a full prefill chunk beside each
+                    // card's layers keeps that room: its prompts then cross every layer in whole
+                    // chunks. One the room would push onto the host keeps the smaller reserve.
+                    let demand = {
+                        let roomy = crate::inference::place::ladder::Demand {
+                            runtime_reserve: dims.full_chunk_reserve(),
+                            ..demand
+                        };
+                        let on_cards = |d: &crate::inference::place::ladder::Demand| {
+                            let plan = d.plan(&cuda_devices);
+                            !plan.segments.is_empty()
+                                && plan.segments.iter().all(|s| matches!(s.kind, crate::inference::place::layer_executor::DeviceKind::Cuda(_)))
+                        };
+                        if roomy.runtime_reserve > demand.runtime_reserve && on_cards(&roomy) {
+                            info!(
+                                "placement keeps {:.2} GB a card for whole prefill chunks",
+                                roomy.runtime_reserve as f64 / 1e9
+                            );
+                            roomy
+                        } else {
+                            demand
+                        }
+                    };
                     // Cap user_context_length at the model's GGUF context: the model cannot
                     // generate beyond its trained context. The plan chose its context because
                     // the cards can hold it; the cache must be allocated at that size or the
