@@ -58,11 +58,6 @@ enum Commands {
     },
 }
 
-// vec_init_then_push fires inside main() on the #[cfg]-gated feature_flags
-// builder (see ~line 198) - clippy doesn't reason across cfg attributes.
-// Allowing on the #[cfg]-gated push site itself doesn't propagate; the
-// fn-level allow is the documented escape hatch.
-#[allow(clippy::vec_init_then_push)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Refuse a CPU below the build's baseline before any other code runs.
@@ -247,20 +242,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Surface compile-time feature set so operators can see at
-            // a glance whether they're getting the CUDA, OpenCL,
-            // or CPU-only build they expect. Each push is #[cfg]-gated;
-            // the Vec stays empty for a minimal CPU-only build.
-            // (vec_init_then_push allow lives at fn-level: clippy doesn't
-            // reason across cfg gates and the per-statement allow doesn't
-            // attach to the right span here.)
-            let mut feature_flags: Vec<&'static str> = Vec::new();
-            #[cfg(feature = "cuda")]
-            feature_flags.push("cuda");
-            #[cfg(feature = "opencl")]
-            feature_flags.push("opencl");
-            #[cfg(feature = "cpu")]
-            feature_flags.push("cpu");
+            // The compiled feature set, so an operator sees whether this is the CUDA, OpenCL or
+            // CPU-only build; empty for a minimal CPU-only build.
+            let feature_flags: Vec<&'static str> = [
+                ("cuda", cfg!(feature = "cuda")),
+                ("opencl", cfg!(feature = "opencl")),
+                ("cpu", cfg!(feature = "cpu")),
+            ]
+            .into_iter()
+            .filter_map(|(name, on)| on.then_some(name))
+            .collect();
             if feature_flags.is_empty() {
                 info!("🧱 Compiled features: (none - minimal CPU-only build)");
             } else {
