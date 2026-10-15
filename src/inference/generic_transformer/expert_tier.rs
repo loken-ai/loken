@@ -340,6 +340,17 @@ fn with_experts(host: &QTensor, n: usize) -> Vec<usize> {
 /// The first `n` experts of `host` on `dev`: a view of the host's own bytes, so the host holds no
 /// second copy of what the card was filled from.
 fn first_experts(host: &Arc<QTensor>, n: usize, dev: &Device) -> Result<QTensor> {
+    experts_range(host, 0, n, dev)
+}
+
+/// The experts `first..first + n` of `host` on `dev`: a view of the host's own bytes, so the host
+/// holds no copy.
+pub(super) fn experts_range(
+    host: &Arc<QTensor>,
+    first: usize,
+    n: usize,
+    dev: &Device,
+) -> Result<QTensor> {
     let inner = host.native_qtensor();
     let bytes = inner.data();
     let per_expert = bytes.len() / host.shape().dims()[0];
@@ -348,7 +359,7 @@ fn first_experts(host: &Arc<QTensor>, n: usize, dev: &Device) -> Result<QTensor>
         QHostTensor::view(
             owner,
             bytes.as_ptr(),
-            0,
+            first * per_expert,
             n * per_expert,
             host.dtype(),
             with_experts(host, n),
@@ -2841,6 +2852,7 @@ mod tests {
                     .unwrap()
             }),
             n_experts: experts,
+            shards: Vec::new(),
             n_experts_used: used,
             expert_ffn_dim: ffn,
             router_prenormed: true,
@@ -2853,6 +2865,56 @@ mod tests {
             gate_up_exps_f32: None,
             tier: None,
             down_exps_f32: None,
+        }
+    }
+
+    /// Experts split by id range across two cards give the rows of one card holding them all: a
+    /// decoded token, a few rows and a prefill wide enough for the expert-batched kernels.
+    #[test]
+    #[ignore = "needs two idle CUDA cards"]
+    fn experts_split_across_two_cards_give_the_rows_of_one_card() {
+        use crate::inference::generic_transformer::moe_weights::ExpertShard;
+        let (Ok(first), Ok(second)) = (Device::new_cuda(0), Device::new_cuda(1)) else {
+            eprintln!("skipping: two usable CUDA devices are needed");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 512usize, 512usize);
+        let mut one = layer(&first, experts, used, hidden, ffn);
+        one.shards = vec![ExpertShard::from_host(&one, 0, experts, &first).unwrap()];
+        let mut two = layer(&first, experts, used, hidden, ffn);
+        let half = experts / 2;
+        two.shards = vec![
+            ExpertShard::from_host(&two, 0, half, &first).unwrap(),
+            ExpertShard::from_host(&two, half, experts - half, &second).unwrap(),
+        ];
+        for (rows, prefill) in [(1usize, false), (5, false), (160, true)] {
+            let x = Tensor::from_vec(
+                values(rows * hidden, rows as u64, 1.0),
+                (1, rows, hidden),
+                &first,
+            )
+            .unwrap();
+            let run = |moe: &MoeWeights| -> Vec<f32> {
+                moe.forward(&x, &x, hidden, 1e-5, prefill)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap()
+            };
+            let (want, got) = (run(&one), run(&two));
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let worst = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 1e-5 * scale,
+                "{rows} rows: off by {worst} of {scale}"
+            );
         }
     }
 

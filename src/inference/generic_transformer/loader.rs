@@ -1430,6 +1430,7 @@ fn build_generic_layer(
             down_exps_scale,
             decode_slots,
             n_experts: layer_experts,
+            shards: Vec::new(),
             n_experts_used: flags.n_experts_used,
             expert_ffn_dim: flags.expert_ffn_dim,
             router_prenormed,

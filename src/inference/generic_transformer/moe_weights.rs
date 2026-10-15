@@ -550,6 +550,76 @@ pub(super) struct ExpertSet<'a> {
     pub n_experts: usize,
 }
 
+/// Routed experts of a layer held on one card: the experts `first..first + count` with their
+/// per-expert biases, numbered from zero on that card.
+pub struct ExpertShard {
+    pub dev: Device,
+    pub first: usize,
+    pub count: usize,
+    /// `[gate, up, down]`.
+    pub stacks: [QTensor; 3],
+    pub gate_bias: Option<Tensor>,
+    pub up_bias: Option<Tensor>,
+    pub down_bias: Option<Tensor>,
+    pub decode_slots: Tensor,
+}
+
+impl ExpertShard {
+    /// The experts `first..first + count` of `layer`, whose stacks are in host memory, on `dev`.
+    /// The layer reads its gate and up apart.
+    #[cfg(feature = "cuda")]
+    pub fn from_host(layer: &MoeWeights, first: usize, count: usize, dev: &Device) -> Result<Self> {
+        let (Some(gate), Some(up)) = (layer.gate_exps_sep.as_ref(), layer.up_exps_sep.as_ref())
+        else {
+            crate::tensor::bail!("an expert shard reads gate and up apart");
+        };
+        let range = |stack: &std::sync::Arc<QTensor>| {
+            super::expert_tier::experts_range(stack, first, count, dev)
+        };
+        let rows = |t: &Option<Tensor>| -> Result<Option<Tensor>> {
+            t.as_ref()
+                .map(|t| t.narrow(0, first, count)?.to_device(dev))
+                .transpose()
+        };
+        let used = layer.n_experts_used as u32;
+        Ok(Self {
+            dev: dev.clone(),
+            first,
+            count,
+            stacks: [range(gate)?, range(up)?, range(&layer.down_exps)?],
+            gate_bias: rows(&layer.gate_exps_bias)?,
+            up_bias: rows(&layer.up_exps_bias)?,
+            down_bias: rows(&layer.down_exps_bias)?,
+            decode_slots: Tensor::from_vec(
+                (0..used).collect::<Vec<_>>(),
+                (used as usize,),
+                &Device::Cpu,
+            )?
+            .to_device(dev)?,
+        })
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn from_host(_: &MoeWeights, _: usize, _: usize, _: &Device) -> Result<Self> {
+        crate::tensor::bail!("an expert shard lives on a card")
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn set(&self) -> ExpertSet<'_> {
+        ExpertSet {
+            gate: Some(&self.stacks[0]),
+            up: Some(&self.stacks[1]),
+            gate_up: None,
+            down: &self.stacks[2],
+            gate_bias: self.gate_bias.as_ref(),
+            up_bias: self.up_bias.as_ref(),
+            down_bias: self.down_bias.as_ref(),
+            decode_slots: Some(&self.decode_slots),
+            n_experts: self.count,
+        }
+    }
+}
+
 /// Gemma4-MoE per-layer weights: top-K-of-N expert FFN.
 /// Active per token: K experts x (gate+up+down) - top-8 of 128
 /// for gemma4 26B A4B.
@@ -589,6 +659,9 @@ pub struct MoeWeights {
     /// are already the rows in slot order, so this stands in for the sort that would
     /// otherwise name them.
     pub decode_slots: Option<Tensor>,
+    /// The routed experts split by id range across cards, the layer's own card among them;
+    /// empty when the layer's own stacks hold every expert.
+    pub shards: Vec<ExpertShard>,
     pub n_experts: usize,
     pub n_experts_used: usize,
     pub expert_ffn_dim: usize,
@@ -1005,7 +1078,16 @@ impl MoeWeights {
             crate::tensor::bail!("MoeWeights: this layer cannot fold a residual into its fold");
         }
         // The shared expert's projections, when a recorded decode queued them ahead of the wait.
-        let expert_rows = if self.up_relu2 {
+        let expert_rows = if !self.shards.is_empty() && xs.device().runs_as_card() {
+            self.experts_split(
+                xs,
+                topk_ids,
+                topk_weights_scaled,
+                num_tokens,
+                is_prefill,
+                t_route,
+            )?
+        } else if self.up_relu2 {
             self.forward_up_relu2(xs, topk_ids, topk_weights_scaled, num_tokens)?
         } else if let Some(tier) = self
             .tier
@@ -1208,6 +1290,105 @@ impl MoeWeights {
                 topk_weights.broadcast_div(&topk_weights.sum_keepdim(crate::tensor::D::Minus1)?)?;
         }
         Ok((topk_weights, topk_ids))
+    }
+
+    /// The routed pairs of `topk_ids` computed by the shards that hold their experts, every shard
+    /// launched before any is waited on, and summed on the layer's card. A shard reads the ids of
+    /// its own experts and weighs every other pair zero.
+    #[cfg(feature = "cuda")]
+    fn experts_split(
+        &self,
+        xs: &Tensor,
+        topk_ids: &Tensor,
+        topk_weights: &Tensor,
+        num_tokens: usize,
+        is_prefill: bool,
+        t_route: Option<std::time::Instant>,
+    ) -> Result<Tensor> {
+        let dev = &xs.device();
+        let ids: Vec<u32> = topk_ids
+            .to_dtype(crate::tensor::DType::U32)?
+            .flatten_all()?
+            .to_vec1()?;
+        let weights: Vec<f32> = topk_weights
+            .to_dtype(crate::tensor::DType::F32)?
+            .flatten_all()?
+            .to_vec1()?;
+        let mut sum: Option<Tensor> = None;
+        let mut parts = Vec::with_capacity(self.shards.len());
+        let k = self.n_experts_used;
+        for shard in &self.shards {
+            if shard.count < k {
+                crate::tensor::bail!("a shard holds fewer experts than a row routes to");
+            }
+            // A pair of another shard's expert reads an expert of this shard its row does not
+            // route to, at weight zero: the kernels that group a row's pairs by expert take each
+            // expert of a row once.
+            let mut local = vec![0u32; ids.len()];
+            let mut weight = vec![0f32; ids.len()];
+            for (row, (ids, ws)) in ids.chunks(k).zip(weights.chunks(k)).enumerate() {
+                let mine = |e: u32| {
+                    (e as usize)
+                        .checked_sub(shard.first)
+                        .filter(|&l| l < shard.count)
+                };
+                let taken: Vec<usize> = ids.iter().filter_map(|&e| mine(e)).collect();
+                let mut spare = (0..shard.count).filter(|l| !taken.contains(l));
+                for (j, (&e, &w)) in ids.iter().zip(ws).enumerate() {
+                    let at = row * k + j;
+                    match mine(e) {
+                        Some(l) => (local[at], weight[at]) = (l as u32, w),
+                        None => local[at] = spare.next().unwrap_or(0) as u32,
+                    }
+                }
+            }
+            let local = Tensor::from_vec(local, topk_ids.shape().clone(), &Device::Cpu)?
+                .to_dtype(topk_ids.dtype())?
+                .to_device(&shard.dev)?;
+            let weight = Tensor::from_vec(weight, topk_weights.shape().clone(), &Device::Cpu)?
+                .to_dtype(topk_weights.dtype())?
+                .to_device(&shard.dev)?;
+            let rows = if shard.dev.same_device(dev) {
+                xs.clone()
+            } else {
+                xs.to_device(&shard.dev)?
+            };
+            parts.push(self.experts_cuda(
+                &rows,
+                &local,
+                &weight,
+                num_tokens,
+                is_prefill,
+                t_route.filter(|_| shard.dev.same_device(dev)),
+                None,
+                shard.set(),
+            )?);
+        }
+        for part in parts {
+            let part = if part.device().same_device(dev) {
+                part
+            } else {
+                part.to_device(dev)?
+            };
+            sum = Some(match sum {
+                None => part,
+                Some(s) => (s + part)?,
+            });
+        }
+        sum.ok_or_else(|| crate::tensor::Error::msg("a split layer has no shard"))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn experts_split(
+        &self,
+        _xs: &Tensor,
+        _topk_ids: &Tensor,
+        _topk_weights: &Tensor,
+        _num_tokens: usize,
+        _is_prefill: bool,
+        _t_route: Option<std::time::Instant>,
+    ) -> Result<Tensor> {
+        crate::tensor::bail!("a split layer runs on cards")
     }
 
     /// This layer's own experts, or the stacks `staged` (`[gate, up, down]`) in their place.
@@ -1728,6 +1909,7 @@ mod clamped_swiglu_tests {
                 down_exps_scale: None,
                 decode_slots: None,
                 n_experts: experts,
+                shards: Vec::new(),
                 n_experts_used: used,
                 expert_ffn_dim: ffn,
                 router_prenormed: true,
@@ -1790,6 +1972,7 @@ mod clamped_swiglu_tests {
                 down_exps_scale: None,
                 decode_slots: None,
                 n_experts: experts,
+                shards: Vec::new(),
                 n_experts_used: used,
                 expert_ffn_dim: ffn,
                 router_prenormed: true,
@@ -1913,6 +2096,7 @@ mod clamped_swiglu_tests {
             down_exps_scale: None,
             decode_slots: None,
             n_experts: experts,
+            shards: Vec::new(),
             n_experts_used: used,
             expert_ffn_dim: ffn,
             router_prenormed: true,
@@ -2028,6 +2212,7 @@ mod clamped_swiglu_tests {
             down_exps_scale: None,
             decode_slots: None,
             n_experts: experts,
+            shards: Vec::new(),
             n_experts_used: used,
             expert_ffn_dim: ffn,
             router_prenormed: true,
