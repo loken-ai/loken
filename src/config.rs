@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 
 use crate::inference::engine::llm_engine::InferenceConfig;
 
-/// Server configuration
+/// Server configuration: a field the file leaves out takes its [`Default`] value.
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(default)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -67,11 +68,26 @@ fn default_replicas() -> usize {
     1
 }
 
+/// The model served when the configuration names none.
+pub const DEFAULT_MODEL_ID: &str = "ollama:qwen3:0.6b";
+
+fn default_model_id() -> String {
+    DEFAULT_MODEL_ID.to_string()
+}
+
+impl Default for InferenceConfigToml {
+    /// Every field at its serde default, as a configuration without an `[inference]` table reads.
+    fn default() -> Self {
+        toml::from_str("").expect("every field of the inference table has a default")
+    }
+}
+
 /// Inference configuration from TOML file. Only what loken cannot decide itself: the model it
 /// serves by default, where things live, and the features an operator switches on. Sampling,
 /// placement, threads and cache formats are decided from the model and the machine.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct InferenceConfigToml {
+    #[serde(default = "default_model_id")]
     pub model_id: String,
     /// Copies of a model to serve side by side, each whole on a card of its own, so concurrent
     /// requests run in parallel. One is the model once; a model that does not fit a single
@@ -156,6 +172,7 @@ pub struct CpuConfig {
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct Config {
     pub server: Option<ServerConfig>,
+    #[serde(default)]
     pub inference: InferenceConfigToml,
     pub ollama_models_dir: Option<String>,
     pub huggingface_models_dir: Option<String>,
@@ -459,6 +476,22 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(obsolete, ["force_gpu_layers", "temperature"]);
+    }
+
+    #[test]
+    fn a_file_without_an_inference_table_keeps_what_it_sets() {
+        let config: Config = toml::from_str(
+            r#"
+            ollama_models_dir = "/models"
+            [server]
+            port = 11436
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.ollama_models_dir.as_deref(), Some("/models"));
+        assert_eq!(config.server().port, 11436);
+        assert_eq!(config.inference.model_id, DEFAULT_MODEL_ID);
+        assert_eq!(config.inference.replicas, 1);
     }
 
     #[test]

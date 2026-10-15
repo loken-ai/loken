@@ -40,6 +40,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Config: a partial file is read, the settings it leaves out take their defaults.
 - N-gram embedding: a forward run again after a failure finds the history where it was.
 - OpenAI and Anthropic APIs: a penalty applies only as the request names it.
 - Chat: a repository with a folder per quantisation is prompted with its own template.

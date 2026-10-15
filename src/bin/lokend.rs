@@ -160,10 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cluster: None,
                         server: None,
                         lora_dir: None,
-                        inference: loken::config::InferenceConfigToml {
-                            model_id: "ollama:qwen3:0.6b".to_string(),
-                            ..Default::default()
-                        },
+                        inference: Default::default(),
                         ollama_models_dir: None,
                         huggingface_models_dir: None,
                         energy: None,
