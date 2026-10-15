@@ -125,6 +125,7 @@ impl LlmEngine {
     pub async fn segment_inputs(&self) -> Option<SegmentInputs> {
         let file = self.resolve_model_file(&self.config.model_id)?;
         let model_state = self.model_state.clone();
+        let share = self.config.layer_share;
         tokio::task::spawn_blocking(move || {
             let content = crate::tensor::quantized::gguf_source::SplitGguf::open(&file)
                 .ok()?
@@ -133,20 +134,7 @@ impl LlmEngine {
             let state = guard.as_mut()?;
             let profile = state.model.segment_profile()?;
             let placed = state.model.device_layer_distribution();
-            let mut layer_bytes = Vec::new();
-            for (name, info) in &content.tensor_infos {
-                let Some(idx) = name
-                    .strip_prefix("blk.")
-                    .and_then(|r| r.split_once('.'))
-                    .and_then(|(i, _)| i.parse::<usize>().ok())
-                else {
-                    continue;
-                };
-                if layer_bytes.len() <= idx {
-                    layer_bytes.resize(idx + 1, 0);
-                }
-                layer_bytes[idx] += info.size_in_bytes() as u64;
-            }
+            let mut layer_bytes = block_bytes(&content);
             // A quantised cache starts at the working window and grows on demand, and is
             // placed at that size; an unquantised one is allocated at the whole window.
             let planned_window = match profile.kv_quant {
@@ -175,17 +163,23 @@ impl LlmEngine {
                 b => b,
             };
             // The layers a card carries are the ranges the placement reports for a device that is
-            // not the host; the head rides on the cards when any layer does.
+            // not the host; the head rides on the cards when any layer does and the loaded layers
+            // end the stack.
             let on_card: Vec<usize> = placed
                 .iter()
                 .filter(|(device, ..)| device != "CPU")
                 .flat_map(|&(_, _, first, last)| first as usize..=last as usize)
                 .collect();
+            let ends_stack = share.is_none_or(|(_, to)| to >= layer_bytes.len());
             let card_bytes = on_card
                 .iter()
                 .filter_map(|&l| layer_bytes.get(l))
                 .sum::<u64>()
-                + if on_card.is_empty() { 0 } else { head_bytes };
+                + if on_card.is_empty() || !ends_stack {
+                    0
+                } else {
+                    head_bytes
+                };
             Some(SegmentInputs {
                 layer_bytes,
                 head_bytes,
@@ -197,6 +191,46 @@ impl LlmEngine {
         .await
         .ok()
         .flatten()
+    }
+
+    /// The layers `[0, k)` this node measures the model on without loading the whole: as many as
+    /// `card_room` bytes of its cards hold and one more, so that its placement runs layers on the
+    /// cards and on the host and both costs come out of one load. `None` when the file is not
+    /// found or has no layers.
+    pub async fn sample_share(&self, card_room: u64) -> Option<(usize, usize)> {
+        let file = self.resolve_model_file(&self.config.model_id)?;
+        tokio::task::spawn_blocking(move || {
+            let content = crate::tensor::quantized::gguf_source::SplitGguf::open(&file)
+                .ok()?
+                .merged_content();
+            let layers = block_bytes(&content);
+            let mut used = 0u64;
+            let on_cards = layers
+                .iter()
+                .take_while(|&&b| {
+                    used += b;
+                    used <= card_room
+                })
+                .count();
+            (!layers.is_empty()).then(|| (0, (on_cards + 1).min(layers.len())))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Load the layers `config.layer_share` names, measure what a layer costs on the cards and on
+    /// the host, and unload them: the inputs a cut planner weighs this node by.
+    pub async fn measure_share(&self) -> Result<SegmentInputs, String> {
+        if self.config.layer_share.is_none() {
+            return Err("no layer share is configured".to_string());
+        }
+        self.load_model_only().await.map_err(|e| e.to_string())?;
+        let inputs = self.segment_inputs().await;
+        let unloaded = self.unload().await.map_err(|e| e.to_string());
+        let inputs = inputs.ok_or_else(|| "this model cannot be cut into layers".to_string())?;
+        unloaded?;
+        Ok(inputs)
     }
 
     /// Load the layers `config.layer_share` names and hand the model out of the engine, which
@@ -417,4 +451,23 @@ impl LlmEngine {
             (total, distributions)
         })
     }
+}
+
+/// The bytes of each layer `blk.i` of a file, its tensors summed.
+fn block_bytes(content: &crate::tensor::quantized::gguf_file::Content) -> Vec<u64> {
+    let mut layer_bytes = Vec::new();
+    for (name, info) in &content.tensor_infos {
+        let Some(idx) = name
+            .strip_prefix("blk.")
+            .and_then(|r| r.split_once('.'))
+            .and_then(|(i, _)| i.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if layer_bytes.len() <= idx {
+            layer_bytes.resize(idx + 1, 0);
+        }
+        layer_bytes[idx] += info.size_in_bytes() as u64;
+    }
+    layer_bytes
 }

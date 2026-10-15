@@ -1337,26 +1337,19 @@ impl APIServer {
             crate::distributed::rate_meter::Rates::default(),
             |acc, r| if r.samples > acc.samples { r } else { acc },
         );
-        // The placement cost this node measured for each model it holds, for the cluster's cut
-        // planner. Filtered to models actually loaded, so a peer never plans against a cost for a
-        // model this node has since dropped.
-        let cost_by_model: std::collections::HashMap<String, (f64, f64)> = {
-            let costs = self.model_costs.lock().unwrap_or_else(|e| e.into_inner());
-            models
-                .iter()
-                .filter_map(|m| costs.get(m).map(|c| (m.clone(), *c)))
-                .collect()
-        };
-        let card_bytes_by_model: std::collections::HashMap<String, u64> = {
-            let held = self
-                .model_card_bytes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            models
-                .iter()
-                .filter_map(|m| held.get(m).map(|b| (m.clone(), *b)))
-                .collect()
-        };
+        // The placement cost this node measured for each model, for the cluster's cut planner:
+        // what a layer costs here depends on the hardware, not on the model being loaded, and a
+        // node given a share loads it.
+        let cost_by_model: std::collections::HashMap<String, (f64, f64)> = self
+            .model_costs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let card_bytes_by_model: std::collections::HashMap<String, u64> = self
+            .model_card_bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         crate::distributed::cluster_runtime::PeerReport {
             node_id,
             models,
@@ -2250,6 +2243,99 @@ impl APIServer {
         Ok(port)
     }
 
+    /// Ask every live peer that has published no cost for `model_id` to measure it, together, and
+    /// wait for the gossip rounds that carry their answers here. A peer that cannot measure (the
+    /// model is not on it, or it fails) is left out of the plan, as an unmeasured one was.
+    async fn measure_peers(&self, cluster: &crate::distributed::cluster::Cluster, model_id: &str) {
+        let now = crate::distributed::cluster_runtime::now_ms(self.cluster_started());
+        let peers = cluster.unmeasured_peers(model_id, now);
+        if peers.is_empty() {
+            return;
+        }
+        let client = reqwest::Client::new();
+        let asks = peers.iter().map(|(node, url)| {
+            let client = client.clone();
+            async move {
+                let reply = client
+                    .post(format!("{}/api/cluster/measure", url.trim_end_matches('/')))
+                    .json(&serde_json::json!({ "model": model_id }))
+                    .send()
+                    .await
+                    .and_then(|r| r.error_for_status());
+                match reply {
+                    Ok(_) => info!("cluster auto-tune {model_id}: {node} measured its layers"),
+                    Err(e) => {
+                        tracing::warn!("cluster auto-tune {model_id}: {node} not measured: {e}")
+                    }
+                }
+            }
+        });
+        futures::future::join_all(asks).await;
+        // A peer publishes its cost on its next report; two rounds cover the one in flight.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            2 * cluster.config.gossip_interval_ms,
+        ))
+        .await;
+    }
+
+    /// What a layer of `model_id` costs on this node, measured once and kept: `(card ms, host ms,
+    /// card bytes)`. A model not loaded here is measured on a sample of its first layers, as many as
+    /// the cards hold and one on the host, loaded by the ladder and released, so a node that could
+    /// never hold the whole model still says what its share would cost.
+    pub(crate) async fn measure_model(&self, model_id: &str) -> Result<(f64, f64, u64), String> {
+        let known = |s: &Self| {
+            let cost = s
+                .model_costs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(model_id)
+                .copied();
+            let bytes = s
+                .model_card_bytes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(model_id)
+                .copied();
+            cost.zip(bytes)
+                .map(|((card, host), bytes)| (card, host, bytes))
+        };
+        if let Some(k) = known(self) {
+            return Ok(k);
+        }
+        let lock = self.loading_lock(model_id).await;
+        let _loading = lock.lock().await;
+        if let Some(k) = known(self) {
+            return Ok(k);
+        }
+        let mut config = self.config_for_model(model_id);
+        let room: u64 = crate::inference::place::room::card_rooms()
+            .iter()
+            .map(|c| c.available)
+            .sum();
+        let share = LlmEngine::with_config(config.clone())
+            .sample_share(room)
+            .await
+            .ok_or_else(|| format!("{model_id} is not on this node"))?;
+        config.layer_share = Some(share);
+        let measured = LlmEngine::with_config(config).measure_share().await;
+        crate::inference::place::ladder::release_pools();
+        let inputs = measured
+            .map_err(|e| format!("layers [{}, {}) of {model_id}: {e}", share.0, share.1))?;
+        info!(
+            "cluster measure {model_id}: layers [{}, {}) loaded, {:.3} ms a layer on cards, {:.3} ms on host, {} card bytes",
+            share.0, share.1, inputs.card_ms, inputs.host_ms, inputs.card_bytes
+        );
+        self.model_costs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(model_id.to_string(), (inputs.card_ms, inputs.host_ms));
+        self.model_card_bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(model_id.to_string(), inputs.card_bytes);
+        Ok((inputs.card_ms, inputs.host_ms, inputs.card_bytes))
+    }
+
     /// Measure what a layer of the loaded dense model costs on this node, publish it, and with
     /// peers that have published theirs decide from those rates and the round-trips between the
     /// nodes whether to cut the stack across them. When a cut pays, this node becomes the head and
@@ -2280,6 +2366,7 @@ impl APIServer {
             layer_ms: inputs.card_ms,
             miss_ms: inputs.host_ms,
         };
+        self.measure_peers(cluster, model_id).await;
         let now = crate::distributed::cluster_runtime::now_ms(self.cluster_started());
         let (nodes, rtt_pairs) = cluster.placement_inputs(model_id, now, local);
         let rtt_refs: Vec<(&str, &str, f64)> = rtt_pairs
@@ -2409,11 +2496,10 @@ impl APIServer {
         next_addr.ok_or_else(|| "no tail in plan".to_string())
     }
 
-    /// Form the cross-node pipeline the auto-tune decided, with this node as the head. The wire
-    /// pipeline is head plus one tail that runs to the end - two segments, this node first - so a
-    /// plan of any other shape stays on one node until multi-node serving is wired. Asks the tail to
-    /// serve its range, then connects this node's model as the head. Returns a line describing what
-    /// happened, whether it formed the pipeline or kept to one node.
+    /// Form the cross-node pipeline the auto-tune decided, with this node as the head: every later
+    /// segment is asked to serve its range, the last first, each relaying to the next, then this
+    /// node's model connects to the first of them. Returns a line describing what happened, whether
+    /// it formed the pipeline or kept to one node.
     async fn form_pipeline_head(
         &self,
         engine: &Arc<LlmEngine>,
@@ -2584,6 +2670,7 @@ impl APIServer {
                 "/api/pipeline/tail",
                 axum::routing::post(pipeline_tail_start),
             )
+            .route("/api/cluster/measure", axum::routing::post(cluster_measure))
             .route("/api/draft/attach", axum::routing::post(draft_attach))
             .route("/api/draft/detach", axum::routing::post(draft_detach))
             .route("/api/draft/status", axum::routing::get(draft_status))

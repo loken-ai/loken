@@ -311,6 +311,19 @@ impl Cluster {
             .alive(now_ms)
     }
 
+    /// The live peers that have published no layer cost for `model_id`, with the address each
+    /// listens on: the ones a cut planner has to ask before it can weigh them.
+    pub fn unmeasured_peers(&self, model_id: &str, now_ms: u64) -> Vec<(NodeId, String)> {
+        let alive = self.alive(now_ms);
+        let cost = self.cost_by_model.lock().unwrap_or_else(|e| e.into_inner());
+        alive
+            .into_iter()
+            .filter(|n| *n != self.config.node_id)
+            .filter(|n| !cost.get(n).is_some_and(|m| m.contains_key(model_id)))
+            .filter_map(|n| self.peer_url(&n).map(|url| (n, url)))
+            .collect()
+    }
+
     /// Serve here or hand over.
     ///
     /// `already_forwarded` is the loop breaker. A request that arrived from a peer is served
@@ -701,6 +714,39 @@ mod tests {
         assert_eq!(vram(&nodes, "b"), 11u64 << 30, "what the peer carried");
         let (nodes, _) = c.placement_inputs("m", 0, local(14 << 30));
         assert_eq!(vram(&nodes, "self"), 14u64 << 30, "what this node carried");
+    }
+
+    #[test]
+    fn the_peers_to_measure_are_the_live_ones_without_a_cost_for_the_model() {
+        let c = Cluster::new(cfg(&["b", "c"]));
+        c.publish_local(NodeState::default());
+        let observe = |node: &str, costs: std::collections::HashMap<String, (f64, f64)>| {
+            c.observe_peer(
+                &node.into(),
+                &format!("http://{node}"),
+                0,
+                NodeState::default(),
+                NodeRates::default(),
+                std::collections::HashMap::new(),
+                costs,
+                0.3,
+            )
+        };
+        observe(
+            "b",
+            std::collections::HashMap::from([("m".to_string(), (1.0, 2.0))]),
+        );
+        observe(
+            "c",
+            std::collections::HashMap::from([("other".to_string(), (1.0, 2.0))]),
+        );
+        let ask = c.unmeasured_peers("m", 0);
+        assert_eq!(ask, vec![("c".to_string(), "http://c".to_string())]);
+        assert_eq!(
+            c.unmeasured_peers("other", 0).len(),
+            1,
+            "b has no cost for it"
+        );
     }
 
     #[test]

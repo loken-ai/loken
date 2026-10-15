@@ -135,6 +135,38 @@ pub(crate) async fn pipeline_tail_start(
     Ok(Json(PipelineTailResponse { port }))
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct ClusterMeasureRequest {
+    pub model: String,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct ClusterMeasureResponse {
+    pub card_ms: f64,
+    pub host_ms: f64,
+    pub card_bytes: u64,
+}
+
+/// Measure what a layer of a model costs on this node, from a sample of its layers when the model
+/// is not loaded here, and publish it to the cluster. A head asks this of every peer it has no
+/// cost for before it plans a cut. Not an operator endpoint - it is the cluster talking to itself.
+pub(crate) async fn cluster_measure(
+    State(state): State<APIServer>,
+    Json(req): Json<ClusterMeasureRequest>,
+) -> Result<Json<ClusterMeasureResponse>, ApiError> {
+    validate_model_id(&req.model)?;
+    let name = normalize_model_id(&req.model);
+    let (card_ms, host_ms, card_bytes) = state
+        .measure_model(&name)
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(ClusterMeasureResponse {
+        card_ms,
+        host_ms,
+        card_bytes,
+    }))
+}
+
 /// Attach a speculative draft model to a target. Validates that
 /// the tokenizers are byte-identical (same fingerprint, same vocab size)
 /// before the attach succeeds; otherwise the call returns an error and
