@@ -251,9 +251,6 @@ pub struct LlmEngine {
     active: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether requests have been overlapping, which decides serial or batched serving.
     batching: Arc<std::sync::Mutex<batching::BatchingSignal>>,
-    /// Held for reading by every admitted request and for writing by a change of serving
-    /// mode, which so waits for the generations running on the backend it replaces.
-    serving: Arc<tokio::sync::RwLock<()>>,
     /// The drafter chosen for the loaded target (`None` = not decided yet).
     drafter_choice: Arc<std::sync::Mutex<Option<Option<String>>>>,
     /// What the cycles with the current drafter taught about the best draft length.
@@ -278,7 +275,6 @@ impl InferenceEngine for LlmEngine {
             embedding_model: Arc::new(Mutex::new(None)),
             active: Arc::default(),
             batching: Arc::default(),
-            serving: Arc::default(),
             drafter_choice: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),
@@ -322,7 +318,6 @@ impl LlmEngine {
             embedding_model: Arc::new(Mutex::new(None)),
             active: Arc::default(),
             batching: Arc::default(),
-            serving: Arc::default(),
             drafter_choice: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),

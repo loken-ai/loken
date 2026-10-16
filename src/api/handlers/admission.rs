@@ -125,11 +125,19 @@ impl APIServer {
     ) -> Result<Admission, ApiError> {
         let in_flight = crate::distributed::rate_meter::InFlight::enter();
         let active = engine.admit_request().await;
-        let gate = if engine.is_continuous().await {
+        let mut gate = if engine.is_continuous().await {
             None
         } else {
             Some(acquire_gate(self, priority, model_name.to_string(), endpoint).await?)
         };
+        // The move into the batch worker is made under the serial gate, which every serial
+        // generation holds to its end; the gate is not needed past it.
+        if active.wants_batched() && gate.is_some() {
+            engine.serve_batched().await;
+            if engine.is_continuous().await {
+                gate = None;
+            }
+        }
         if images.is_empty() {
             engine.clear_images().await;
         } else {

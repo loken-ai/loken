@@ -23,11 +23,12 @@ impl LlmEngine {
             Some(s) if s.model.batched_server().is_some())
     }
 
-    /// Counts a request as running on this engine until the returned guard drops, and
-    /// moves the model between serial and batched serving as the arrivals call for it (see
-    /// `batching`). A switch waits until no admitted request runs on the backend it replaces:
-    /// a serial generation takes the model lock a step at a time, so the lock alone would let
-    /// the switch land between two of its tokens.
+    /// Counts a request as running on this engine until the returned guard drops, and says
+    /// whether it should move the model into its batch worker (see `batching`). That move is
+    /// [`Self::serve_batched`], made by the request once it holds the serial gate: a serial
+    /// generation takes the model lock a step at a time and holds the gate throughout, so only
+    /// the gate keeps the move off a running answer. The move back is made here: it follows
+    /// an arrival that found no other request admitted.
     pub async fn admit_request(&self) -> super::ActiveRequest {
         let mut request = super::batching::ActiveRequest::enter(&self.active);
         let batched = self.is_continuous().await;
@@ -36,25 +37,9 @@ impl LlmEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .arrive(request.others(), batched);
-        let _switching = match switch {
-            super::batching::Switch::Stay => None,
-            _ => Some(self.serving.clone().write_owned().await),
-        };
         match switch {
             super::batching::Switch::Stay => {}
-            super::batching::Switch::ToBatched => {
-                let mut guard = self.model_state.lock().await;
-                if let Some(state) = guard.as_mut() {
-                    if super::load::promote_to_batched(state) {
-                        info!("{}: requests overlap - serving batched", state.name);
-                    } else {
-                        self.batching
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .mark_cannot_batch();
-                    }
-                }
-            }
+            super::batching::Switch::ToBatched => request.want_batched(),
             super::batching::Switch::ToSerial => {
                 let mut guard = self.model_state.lock().await;
                 if let Some(state) = guard.as_mut() {
@@ -64,9 +49,23 @@ impl LlmEngine {
                 }
             }
         }
-        drop(_switching);
-        request.hold(self.serving.clone().read_owned().await);
         request
+    }
+
+    /// Moves the model into its batch worker. Called by a request that holds the serial gate,
+    /// so no serial generation is running.
+    pub async fn serve_batched(&self) {
+        let mut guard = self.model_state.lock().await;
+        if let Some(state) = guard.as_mut() {
+            if super::load::promote_to_batched(state) {
+                info!("{}: requests overlap - serving batched", state.name);
+            } else {
+                self.batching
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .mark_cannot_batch();
+            }
+        }
     }
 
     /// Stream a request through the continuous-batch worker: tokenize, submit

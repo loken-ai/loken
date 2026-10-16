@@ -61,8 +61,9 @@ impl BatchingSignal {
 pub struct ActiveRequest {
     count: Arc<AtomicUsize>,
     others: usize,
-    /// The serving mode this request runs under, held until it finishes.
-    serving: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    /// The arrivals call for the batch worker, which this request moves the model into once
+    /// it holds the serial gate.
+    batched: bool,
 }
 
 impl ActiveRequest {
@@ -71,13 +72,18 @@ impl ActiveRequest {
         Self {
             count: Arc::clone(count),
             others,
-            serving: None,
+            batched: false,
         }
     }
 
-    /// Holds the serving mode for as long as this request runs.
-    pub fn hold(&mut self, serving: tokio::sync::OwnedRwLockReadGuard<()>) {
-        self.serving = Some(serving);
+    /// Marks this request as the one to move the model into its batch worker.
+    pub fn want_batched(&mut self) {
+        self.batched = true;
+    }
+
+    /// Whether this request moves the model into its batch worker.
+    pub fn wants_batched(&self) -> bool {
+        self.batched
     }
 
     /// Requests that were running when this one was admitted.
@@ -135,19 +141,13 @@ mod tests {
         assert_eq!(ActiveRequest::enter(&n).others(), 1);
     }
 
-    /// A change of serving mode waits for the requests that hold the mode, and takes it the
-    /// moment the last of them ends.
+    /// Only the request the arrivals chose moves the model into its batch worker.
     #[test]
-    fn a_switch_waits_for_the_requests_running_under_the_mode() {
-        let serving = Arc::new(tokio::sync::RwLock::new(()));
+    fn the_request_an_overlap_chose_is_the_one_to_batch() {
         let n = Arc::new(AtomicUsize::new(0));
-        let mut running = ActiveRequest::enter(&n);
-        running.hold(serving.clone().try_read_owned().unwrap());
-        assert!(
-            serving.clone().try_write_owned().is_err(),
-            "a switch landed under a request"
-        );
-        drop(running);
-        assert!(serving.clone().try_write_owned().is_ok());
+        let mut chosen = ActiveRequest::enter(&n);
+        let other = ActiveRequest::enter(&n);
+        chosen.want_batched();
+        assert!(chosen.wants_batched() && !other.wants_batched());
     }
 }
