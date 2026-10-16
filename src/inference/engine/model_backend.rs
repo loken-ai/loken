@@ -2336,6 +2336,16 @@ impl ModelBackend for GenericVisionBackend {
 }
 
 impl ModelBackend for DeepseekV41Backend {
+    /// The prompt in one pass: the prefill runs each layer once over all of it and bounds its own
+    /// memory, and the state cache sees the whole prompt to restore and store against.
+    fn forward_prefill_chunked(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+    ) -> crate::tensor::Result<Tensor> {
+        self.forward(x, index_pos)
+    }
+
     fn expert_cost_shape(
         &self,
     ) -> Option<(
@@ -2403,6 +2413,11 @@ impl ModelBackend for DeepseekV41Backend {
             if let Some(cache) = self.state_cache.clone() {
                 return self.prefill_cached(&cache, &ids);
             }
+            return self.prefill(&ids);
+        }
+        // The rest of a prompt after a kept prefix continues the prefill from the state: one
+        // layer-major pass, each layer's experts read once for all of it.
+        if ids.len() > 1 {
             return self.prefill(&ids);
         }
         // The always-read weights answer a token from the card they were left on: the host reads
