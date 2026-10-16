@@ -38,6 +38,25 @@ fn handover_of(
     tokens: &[u32],
 ) -> AnyResult<Vec<u8>> {
     use crate::distributed::kv_handover::{encode, Handover, Header};
+    if model.handover_carries_state() {
+        // The snapshot's whole cache must be the prompt's own: a recurrent state, and a window
+        // that ends past the prompt, cannot be cut back.
+        let (held, state) = model
+            .export_state_handover(tokens)?
+            .ok_or_else(|| anyhow!("no snapshot holds the prompt"))?;
+        return Ok(encode(&Handover {
+            header: Header {
+                tokens: tokens[..held].to_vec(),
+                kv_len: held,
+                dtype: 0,
+                layout: kv_layout_id(model),
+                layers: 0,
+                state_len: state.len(),
+            },
+            rows: Vec::new(),
+            state,
+        }));
+    }
     let (index, common) = model
         .best_kv_snapshot(tokens)
         .ok_or_else(|| anyhow!("no snapshot holds the prompt"))?;
@@ -63,8 +82,10 @@ fn handover_of(
             dtype: model.kv_snapshot_dtype(index).unwrap_or(0),
             layout: kv_layout_id(model),
             layers: rows.len(),
+            state_len: 0,
         },
         rows,
+        state: Vec::new(),
     }))
 }
 
@@ -79,13 +100,18 @@ pub(super) fn pull_prompt_from_peer(
     peer: &str,
 ) {
     use crate::distributed::kv_handover::decode;
-    if model.kv_layout().is_none() || !model.capabilities().trim_kv {
+    let carries_state = model.handover_carries_state();
+    if !carries_state && (model.kv_layout().is_none() || !model.capabilities().trim_kv) {
         return;
     }
     let chunk = crate::inference::engine::model_backend::adaptive_prefill_chunk(
         crate::inference::engine::model_backend::PrefillShape::from_widest_ffn(model.widest_ffn()),
     );
-    let held = model.best_kv_snapshot(prompt_tokens).map_or(0, |(_, c)| c);
+    let held = if carries_state {
+        model.state_snapshot_len(prompt_tokens).unwrap_or(0)
+    } else {
+        model.best_kv_snapshot(prompt_tokens).map_or(0, |(_, c)| c)
+    };
     if prompt_tokens.len() < held + chunk {
         return;
     }
@@ -130,8 +156,21 @@ pub(super) fn pull_prompt_from_peer(
         );
         return;
     }
+    if carries_state != (header.state_len > 0) {
+        warn!("prefill peer {peer}: it handed over another kind of state; the prompt is read here");
+        return;
+    }
     let (n, dtype, kv_len) = (header.tokens.len(), header.dtype, header.kv_len);
-    match model.import_kv_snapshot(handover.header.tokens, kv_len, handover.rows, dtype) {
+    if kv_len != n {
+        warn!("prefill peer {peer}: its cache covers other positions than its tokens; the prompt is read here");
+        return;
+    }
+    let imported = if carries_state {
+        model.import_state_handover(handover.header.tokens, &handover.state)
+    } else {
+        model.import_kv_snapshot(handover.header.tokens, kv_len, handover.rows, dtype)
+    };
+    match imported {
         Ok(()) => info!(
             "prompt read by {peer}: {n} tokens, {:.1} MB handed over in {:.0} ms",
             bytes.len() as f64 / 1e6,

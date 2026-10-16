@@ -584,6 +584,33 @@ pub(crate) trait ModelBackend: Send {
         Ok(())
     }
 
+    /// Whether the model's decode state is more than rows of KV (a recurrent mixer, a windowed
+    /// layer) and travels between instances as a whole-state buffer.
+    fn handover_carries_state(&self) -> bool {
+        false
+    }
+    /// Positions of `prompt` the longest resident snapshot covers, for a state handover.
+    fn state_snapshot_len(&self, _prompt: &[u32]) -> Option<usize> {
+        None
+    }
+    /// The state after the longest run of `prompt` a snapshot covers, with that run's length.
+    fn export_state_handover(
+        &self,
+        _prompt: &[u32],
+    ) -> crate::tensor::Result<Option<(usize, Vec<u8>)>> {
+        Ok(None)
+    }
+    /// A snapshot of `tokens` rebuilt from the buffer `export_state_handover` made.
+    fn import_state_handover(
+        &mut self,
+        _tokens: Vec<u32>,
+        _state: &[u8],
+    ) -> crate::tensor::Result<()> {
+        Err(crate::tensor::Error::msg(
+            "state handover: unsupported backend".to_string(),
+        ))
+    }
+
     /// Tokens the KV cache actually holds, when the backend can say.
     ///
     /// A caller that needs a POSITION must ask here rather than track one
@@ -1896,6 +1923,34 @@ impl ModelBackend for GenericBackend {
     }
     fn kv_snapshot_dtype(&self, index: usize) -> Option<u8> {
         self.0.kv_snapshot_dtype(index)
+    }
+    fn handover_carries_state(&self) -> bool {
+        self.0.carries_handover_state()
+    }
+    fn state_snapshot_len(&self, prompt: &[u32]) -> Option<usize> {
+        let index = self.0.state_snapshot_covering(prompt)?;
+        self.0.kv_snapshot_ref(index).map(|(_, len)| len)
+    }
+    fn export_state_handover(
+        &self,
+        prompt: &[u32],
+    ) -> crate::tensor::Result<Option<(usize, Vec<u8>)>> {
+        let Some(index) = self.0.state_snapshot_covering(prompt) else {
+            return Ok(None);
+        };
+        let Some((_, len)) = self.0.kv_snapshot_ref(index) else {
+            return Ok(None);
+        };
+        Ok(Some((len, self.0.export_state(index)?)))
+    }
+    fn import_state_handover(
+        &mut self,
+        tokens: Vec<u32>,
+        state: &[u8],
+    ) -> crate::tensor::Result<()> {
+        self.0
+            .import_state(tokens, state)
+            .map_err(|e| crate::tensor::Error::msg(e.to_string()))
     }
 
     fn capabilities(&self) -> Capabilities {

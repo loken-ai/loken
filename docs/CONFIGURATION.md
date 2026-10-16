@@ -83,8 +83,11 @@ An instance with `prefill_peer` set has its long prompts read by that peer, whic
 model: the peer prefills the prompt and answers its KV cache over `/api/cluster/prefill`, and this
 instance imports it as a snapshot and decodes. The prefix reuse restores it in whole prefill
 chunks and reads the rest of the prompt here, so a prompt within a chunk of what the cache holds
-never leaves. A model with recurrent or windowed layers, a split layer, or a peer that cannot
-answer reads the prompt here. The rows travel as f32, about four times the cache's own size.
+never leaves. A model with recurrent or windowed layers hands over its whole decode state instead
+of rows: every recurrent state, the windowed layers' rows, the global layers' rows and the logits
+to resume from, checked against this instance's layer kinds and row geometry before it is read.
+A model with a split layer, a cache cut over the cards, or a peer that cannot answer reads the
+prompt here. The rows travel as f32, about four times the cache's own size.
 
 | Key | Default | What it does |
 |---|---|---|

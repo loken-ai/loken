@@ -585,3 +585,57 @@ fn a_derived_block_size_is_the_same_after_a_restart() {
         );
     }
 }
+
+/// A state handed over as bytes and imported by a second instance resumes with the logits and
+/// every decode step of the instance that read the prompt, the prompt being longer than the
+/// window of the windowed layer.
+#[test]
+fn a_handed_over_state_resumes_like_the_instance_that_read_it() {
+    let fx = Fixture::new("handover");
+    let tokens = prompt(3 * WINDOW + 5);
+    let mut reader = fx.model();
+    assert!(reader.carries_handover_state());
+    let (logits, _) = prefill(&mut reader, &tokens, 0);
+    reader.snapshot_prefix(&tokens, &logits).unwrap();
+    let index = reader.state_snapshot_covering(&tokens).unwrap();
+    let bytes = reader.export_state(index).unwrap();
+
+    let mut decoder = fx.model();
+    decoder.import_state(tokens.clone(), &bytes).unwrap();
+    let (covered, resumed) = decoder.try_restore_prefix(&tokens).unwrap().unwrap();
+    assert_eq!(covered, tokens.len());
+    assert_eq!(
+        bits(&resumed),
+        bits(&logits),
+        "logits of the handed-over state"
+    );
+    assert_eq!(
+        decode(&mut decoder, &resumed, tokens.len(), 8),
+        decode(&mut reader, &logits, tokens.len(), 8),
+        "decode after the handover"
+    );
+}
+
+/// A handover read for other tokens, damaged, or without the logits a recurrent state resumes
+/// from is refused and leaves no snapshot.
+#[test]
+fn a_mismatched_state_handover_is_refused() {
+    let fx = Fixture::new("handover-refused");
+    let tokens = prompt(40);
+    let mut reader = fx.model();
+    let (logits, _) = prefill(&mut reader, &tokens, 0);
+    reader.snapshot_prefix(&tokens, &logits).unwrap();
+    let index = reader.state_snapshot_covering(&tokens).unwrap();
+    let bytes = reader.export_state(index).unwrap();
+
+    let mut decoder = fx.model();
+    assert!(decoder.import_state(tokens[..39].to_vec(), &bytes).is_err());
+    let mut damaged = bytes.clone();
+    damaged[bytes.len() / 2] ^= 1;
+    assert!(decoder.import_state(tokens.clone(), &damaged).is_err());
+    assert!(decoder
+        .import_state(tokens.clone(), &bytes[..bytes.len() - 1])
+        .is_err());
+    assert!(decoder.import_state(Vec::new(), &bytes).is_err());
+    assert!(decoder.try_restore_prefix(&tokens).unwrap().is_none());
+}

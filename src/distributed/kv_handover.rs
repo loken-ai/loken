@@ -8,6 +8,11 @@
 //! Layout on the wire, little-endian: the magic, a header length and the header as JSON, then for
 //! each layer a byte (1 when the layer holds rows), the count of key values and the keys as f32,
 //! the count of value values and the values as f32.
+//!
+//! A model whose decode state is more than rows of KV (a recurrent mixer, a windowed layer) hands
+//! over that whole state instead: the header names its length in `state_len`, `layers` is zero,
+//! and the state's bytes follow the header. They are the state cache's own manifest, checked
+//! against the importer's layer kinds and row geometry before anything is read.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +33,13 @@ pub struct Header {
     /// The cache's shape (layers, kv heads, head width) packed as the importer packs its own.
     pub layout: u64,
     pub layers: usize,
+    /// Bytes of whole-model state that follow the header, zero for a handover of rows.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub state_len: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// A handed-over cache.
@@ -35,6 +47,8 @@ pub struct Header {
 pub struct Handover {
     pub header: Header,
     pub rows: LayerRows,
+    /// The model's whole state when `header.state_len` is not zero.
+    pub state: Vec<u8>,
 }
 
 /// `handover` as the bytes the wire carries.
@@ -46,7 +60,9 @@ pub fn encode(handover: &Handover) -> Vec<u8> {
         .flatten()
         .map(|(k, v)| k.len() + v.len())
         .sum();
-    let mut out = Vec::with_capacity(8 + header.len() + handover.rows.len() * 17 + values * 4);
+    let mut out = Vec::with_capacity(
+        8 + header.len() + handover.rows.len() * 17 + values * 4 + handover.state.len(),
+    );
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&(header.len() as u32).to_le_bytes());
     out.extend_from_slice(&header);
@@ -64,6 +80,7 @@ pub fn encode(handover: &Handover) -> Vec<u8> {
             }
         }
     }
+    out.extend_from_slice(&handover.state);
     out
 }
 
@@ -108,10 +125,15 @@ pub fn decode(bytes: &[u8]) -> Result<Handover, String> {
             flag => return Err(format!("handover layer flag {flag}")),
         }
     }
+    let state = take(header.state_len)?.to_vec();
     if at != bytes.len() {
         return Err("the handover has bytes past its last layer".into());
     }
-    Ok(Handover { header, rows })
+    Ok(Handover {
+        header,
+        rows,
+        state,
+    })
 }
 
 #[cfg(test)]
@@ -126,12 +148,14 @@ mod tests {
                 dtype: 0,
                 layout: (3 << 40) | (2 << 20) | 8,
                 layers: 3,
+                state_len: 0,
             },
             rows: vec![
                 Some((vec![0.5, -1.25, 3.0], vec![2.0, f32::MIN_POSITIVE, -0.0])),
                 None,
                 Some((vec![], vec![7.5])),
             ],
+            state: Vec::new(),
         }
     }
 
@@ -165,5 +189,31 @@ mod tests {
         longer.push(0);
         assert!(decode(&longer).is_err());
         assert!(decode(b"NOPE").is_err());
+    }
+
+    /// A state handover comes back whole, and an attention-only header keeps its bytes.
+    #[test]
+    fn a_state_handover_round_trips() {
+        let state: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let h = Handover {
+            header: Header {
+                tokens: vec![3, 1, 4],
+                kv_len: 3,
+                dtype: 0,
+                layout: 0,
+                layers: 0,
+                state_len: state.len(),
+            },
+            rows: Vec::new(),
+            state,
+        };
+        let bytes = encode(&h);
+        assert_eq!(decode(&bytes).unwrap(), h);
+        assert!(decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(decode(&longer).is_err());
+        let rows = String::from_utf8_lossy(&encode(&sample())).into_owned();
+        assert!(!rows.contains("state_len"));
     }
 }

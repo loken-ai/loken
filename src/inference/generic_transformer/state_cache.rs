@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 
 const MANIFEST_MAGIC: &[u8; 8] = b"LKHYBM01";
 const BLOCK_MAGIC: &[u8; 8] = b"LKHYBB01";
+const HANDOVER_MAGIC: &[u8; 8] = b"LKHYBH01";
 /// Bumped when the layout of a manifest or a block changes.
 pub const FORMAT_VERSION: u32 = 1;
 const SUM_BYTES: usize = 16;
@@ -781,8 +782,12 @@ impl GenericHeteroTransformer {
         Ok(encode_block(&rows))
     }
 
-    /// Makes `point`, with the rows of `blocks` before its tail, the resident state.
-    fn restore_point(&mut self, point: &Point, blocks: &[Vec<(Vec<f32>, Vec<f32>)>]) -> Result<()> {
+    /// The per-layer snapshots of `point` with the rows of `blocks` before its tail.
+    fn point_snapshots(
+        &self,
+        point: &Point,
+        blocks: &[Vec<(Vec<f32>, Vec<f32>)>],
+    ) -> Result<Vec<super::LayerKvSnapshot>> {
         let mut snaps = Vec::with_capacity(self.layers.len());
         let mut global = 0;
         for (l, held) in self.layers.iter().zip(&point.layers) {
@@ -814,6 +819,12 @@ impl GenericHeteroTransformer {
                 }
             });
         }
+        Ok(snaps)
+    }
+
+    /// Makes `point`, with the rows of `blocks` before its tail, the resident state.
+    fn restore_point(&mut self, point: &Point, blocks: &[Vec<(Vec<f32>, Vec<f32>)>]) -> Result<()> {
+        let snaps = self.point_snapshots(point, blocks)?;
         super::graph::restore_layers(&mut self.layers, &snaps)?;
         // A layer attending on the host reads its decode from a store beside the KV cache, built
         // from the same rows as a prefill appends them: built again from the restored rows.
@@ -828,6 +839,126 @@ impl GenericHeteroTransformer {
             }
         }
         self.invalidate_graph_state();
+        Ok(())
+    }
+
+    /// Builds again, from the resident rows, the host stores that the layers attending on the host
+    /// decode from. A snapshot restored in an instance that did not prefill the rows has none.
+    pub(super) fn rebuild_host_stores(&mut self) {
+        for l in &mut self.layers {
+            if !matches!(l.cos.device(), Device::Cpu) || !matches!(l.mixer, Mixer::Attention) {
+                continue;
+            }
+            let n = l.kv_cache.current_seq_len();
+            l.cpu_q8_kv = None;
+            l.cpu_f16_kv = None;
+            if n > 0 {
+                if let Some((k, v)) = l.kv_cache.current_kv() {
+                    l.cpu_q8_append(&k, &v, n, 0, false);
+                }
+            }
+        }
+    }
+
+    /// Whether this model's decode state is more than rows of KV (a recurrent mixer, a windowed
+    /// layer) and can still travel in a state handover: no wide-residual layer, no host q8 cache,
+    /// no layer split over cards or cut over cards.
+    pub(crate) fn carries_handover_state(&self) -> bool {
+        let stateful = self.is_recurrent() || self.layers.iter().any(|l| l.kv_cache.is_windowed());
+        stateful
+            && !self.is_wide()
+            && !self.has_split_layers()
+            && !self.has_context_shards()
+            && self.layers.iter().all(|l| l.cpu_q8_kv.is_none())
+    }
+
+    /// The state of snapshot `index` as one self-contained buffer: a manifest holding every
+    /// layer's whole state (recurrent state, windowed rows, every global layer's rows), then the
+    /// logits the snapshot resumes decoding from, when it has them. The block size is one more
+    /// than the snapshot's length, so no rows go to blocks.
+    pub(crate) fn export_state(&self, index: usize) -> Result<Vec<u8>> {
+        let err = |m: &str| crate::tensor::Error::msg(format!("state handover: {m}"));
+        let snap = self
+            .kv_snapshots
+            .get(index)
+            .ok_or_else(|| err("the snapshot is gone"))?;
+        if snap.layers.iter().any(|s| !s.shards.is_empty()) {
+            return Err(err("a layer is split over cards"));
+        }
+        let pos = snap.kv_len;
+        let layout = self.state_layout(pos + 1);
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for ((l, s), kind) in self.layers.iter().zip(&snap.layers).zip(&layout.kinds) {
+            layers.push(match kind {
+                StateKind::Nothing => Held::Nothing,
+                StateKind::Mixer => {
+                    let state = s
+                        .mixer
+                        .as_ref()
+                        .ok_or_else(|| err("a mixer holds no state"))?;
+                    Held::Mixer(MixerHost::of(state)?)
+                }
+                StateKind::Global => {
+                    let rows = snapshot_rows(l, s)?;
+                    if rows.n != pos {
+                        return Err(err("a global layer does not hold the whole prompt"));
+                    }
+                    Held::Global(rows)
+                }
+                StateKind::Window => Held::Window(snapshot_rows(l, s)?),
+            });
+        }
+        let manifest =
+            encode_manifest(&handover_identity(&layout), &layout, &Point { pos, layers });
+        let mut w = Writer(Vec::with_capacity(manifest.len() + 64));
+        w.0.extend(HANDOVER_MAGIC);
+        w.0.extend(FORMAT_VERSION.to_le_bytes());
+        w.u64(manifest.len());
+        w.0.extend(&manifest);
+        match &snap.logits {
+            Some(t) => {
+                w.u8(1);
+                w.tens(&Tens::of(t)?);
+            }
+            None => w.u8(0),
+        }
+        Ok(w.seal())
+    }
+
+    /// Enters the state `bytes` carry as the snapshot of `tokens`, after the same checks a stored
+    /// state passes: the layer kinds, the row geometry and the length. A recurrent model's state
+    /// without the logits it resumes from is refused.
+    pub(crate) fn import_state(&mut self, tokens: Vec<u32>, bytes: &[u8]) -> AnyResult<()> {
+        let pos = tokens.len();
+        if pos == 0 {
+            bail!("state handover: no tokens");
+        }
+        let layout = self.state_layout(pos + 1);
+        let mut r = Reader::open(bytes)?;
+        if r.take(8)? != HANDOVER_MAGIC {
+            bail!("state handover: not a state handover");
+        }
+        let version = u32::from_le_bytes(r.take(4)?.try_into().unwrap());
+        if version != FORMAT_VERSION {
+            bail!("state handover: format version {version}, this build reads {FORMAT_VERSION}");
+        }
+        let manifest_len = r.u64()?;
+        let point = decode_manifest(r.take(manifest_len)?, &handover_identity(&layout), &layout)?;
+        if point.pos != pos {
+            bail!("state handover: the state is not the tokens' length");
+        }
+        let logits = match r.u8()? {
+            0 => None,
+            _ => Some(r.tens()?.tensor(&Device::Cpu).map_err(|e| anyhow!("{e}"))?),
+        };
+        r.done()?;
+        if logits.is_none() && self.is_recurrent() {
+            bail!("state handover: a recurrent state arrives without its logits");
+        }
+        let layers = self
+            .point_snapshots(&point, &[])
+            .map_err(|e| anyhow!("{e}"))?;
+        self.store_snapshot(tokens, pos, layers, logits);
         Ok(())
     }
 
@@ -866,6 +997,41 @@ impl GenericHeteroTransformer {
         let logits = last.ok_or_else(|| crate::tensor::Error::msg("empty prefill".to_string()))?;
         Ok((logits, grid))
     }
+}
+
+/// What a state handover is checked against besides the manifest's own checks: the layer kinds
+/// and row geometry, hashed so the two instances need no store to agree on them.
+fn handover_identity(layout: &Layout) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"loken state handover");
+    h.update(FORMAT_VERSION.to_le_bytes());
+    for (kind, (n_kv, head_dim)) in layout.kinds.iter().zip(&layout.geometry) {
+        h.update([kind.tag()]);
+        h.update((*n_kv as u64).to_le_bytes());
+        h.update((*head_dim as u64).to_le_bytes());
+    }
+    h.finalize().into()
+}
+
+/// The rows a layer's snapshot holds, as host f32 with the element type they are held in.
+fn snapshot_rows(l: &GenericTransformerLayer, s: &super::LayerKvSnapshot) -> Result<Rows> {
+    let (dtype, n, (k, v)) = match (&s.spec, &s.cpu_f16) {
+        (Some(spec), _) => (
+            dtype_code(spec.dtype())?,
+            spec.len(),
+            spec.host_rows(0, spec.len())?,
+        ),
+        (None, Some(c)) => (0, c.len(), c.host_rows(0, c.len())),
+        (None, None) => (0, 0, (Vec::new(), Vec::new())),
+    };
+    Ok(Rows {
+        dtype,
+        n_kv: l.n_kv_head,
+        head_dim: l.head_dim,
+        n,
+        k,
+        v,
+    })
 }
 
 fn rows_snapshot(

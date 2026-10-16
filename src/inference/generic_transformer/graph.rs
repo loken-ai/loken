@@ -1794,7 +1794,7 @@ impl GenericHeteroTransformer {
 
     /// Enters a snapshot in the table: the one this sequence extends is replaced, and the
     /// table is held to its memory budget.
-    fn store_snapshot(
+    pub(super) fn store_snapshot(
         &mut self,
         tokens: Vec<u32>,
         kv_len: usize,
@@ -1897,7 +1897,8 @@ impl GenericHeteroTransformer {
             ..
         } = self;
         restore_layers(layers, &kv_snapshots[index].layers)?;
-        let snap = &kv_snapshots[index];
+        self.rebuild_host_stores();
+        let snap = &self.kv_snapshots[index];
         let covered = snap.kv_len;
         let logits = snap
             .logits
@@ -2001,10 +2002,27 @@ impl GenericHeteroTransformer {
         let snap = &kv_snapshots[index];
         restore_layers(layers, &snap.layers)?;
         let out = (snap.tokens.clone(), snap.kv_len);
+        self.rebuild_host_stores();
         self.kv_snapshot_tick += 1;
         self.kv_snapshots[index].tick = self.kv_snapshot_tick;
         self.invalidate_graph_state();
         Ok(out)
+    }
+
+    /// The snapshot whose cache covers the longest run of `prompt` from its start: the index of
+    /// the one holding most positions that are all `prompt`'s own tokens, whether or not it
+    /// carries logits.
+    pub fn state_snapshot_covering(&self, prompt: &[u32]) -> Option<usize> {
+        self.kv_snapshots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.kv_len > 0
+                    && s.tokens.len() >= s.kv_len
+                    && prompt.starts_with(&s.tokens[..s.kv_len])
+            })
+            .max_by_key(|(_, s)| s.kv_len)
+            .map(|(i, _)| i)
     }
 
     /// `(layers, n_kv, head_dim)`: what a KV row of this model is made of.

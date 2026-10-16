@@ -12,6 +12,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Benchmarks: archived runs are held in the store and left out of the tables.
 - Benchmarks: a page per hardware and backend, the backend read from the server.
 - Disaggregation: prefill_peer has another instance read long prompts and hand their KV over.
+- Disaggregation: recurrent and windowed models hand over their whole decode state.
 - Expert parallelism: a layer's experts split across cards where measured links make it pay.
 - CPU: AVX-512 kernels for attention, the KV cache and elementwise ops.
 - CPU: AVX-512 kernels for the quantized GEMMs and dots.
