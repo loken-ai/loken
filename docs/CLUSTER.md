@@ -270,6 +270,19 @@ Publishing those hashes through gossip lets the selection maximise shared prefix
 with power-of-two-choices to avoid herding. Plus admission control, circuit breaking on
 failure, and slow-start reentry.
 
+```mermaid
+flowchart TD
+    R["request reaches any node"] --> H{"does this node hold the model?"}
+    H -- no --> F["forward whole, relay the stream back"]
+    H -- yes --> P{"prefix cached on exactly one live node, load within margin?"}
+    P -- yes --> F
+    P -- no --> T{"predicted completion on a peer + RTT lower than here?"}
+    T -- yes --> F
+    T -- no --> S{"does a layer split beat serving locally?"}
+    S -- yes --> L["pipeline: the head cuts layers across nodes"]
+    S -- no --> A["serve locally"]
+```
+
 *Invariants:* a node holding no weights can serve any request the cluster can serve. A request
 whose prefix is cached on exactly one live node routes there, unless that node's load exceeds
 the configured margin.
@@ -300,6 +313,20 @@ StdRng::seed_from_u64(hash(request_seed, position))
 The RNG becomes stateless, recovery is exact at any point, and - a welcome side effect  - 
 sampling becomes reproducible under continuous batching, where a request's position within
 the batch varies run to run.
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant R as router
+    participant A as node A
+    participant B as node B, same digest
+    C->>R: request with its seed
+    R->>A: serve
+    A-->>C: tokens 1..N
+    Note over A: node dies at token N
+    R->>B: prompt + tokens 1..N, same seed
+    B-->>C: tokens N+1 onward, identical to the uninterrupted stream
+```
 
 Replay must land on a node whose weights carry the **same digest**, per "Where the weights
 live" above - a same-named replica holding different bytes would continue the generation

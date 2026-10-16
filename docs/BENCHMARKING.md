@@ -53,6 +53,17 @@ Every run is a record of the assay schema, filed once in the store under the has
 overwritten, and a result file in `results/` is only the campaign's scratch copy. The store sits
 outside the repositories, at `bench_data_dir`.
 
+```mermaid
+flowchart LR
+    D["scripts/bench"] --> A["assay: one record per run"]
+    A -->|"host_id, hardware_id"| S[("store: runs/ by content hash")]
+    O["old report or replay record"] -->|"convert-archive, ingest-benchrec, operator attestation"| S
+    S --> R["scripts/report.py"]
+    R --> P["docs/benchmarks/ one page per hardware"]
+    R --> X["compare.md"]
+    R --> I["BENCHMARKS.md index"]
+```
+
 A record names its machine: `hardware_id` identifies the cards, processor and memory, so a card
 swap is a new hardware and the same machine keeps its `host_id`. `scripts/report.py` groups the
 store by `hardware_id` and writes one page per group, `docs/benchmarks/<hardware>.md`, with the
