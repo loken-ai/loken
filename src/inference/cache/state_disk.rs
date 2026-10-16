@@ -78,6 +78,9 @@ struct Inner {
 
 pub struct StateStore {
     dir: PathBuf,
+    /// The files of a store kept in host memory, by path, none of them on disk; `None` for a
+    /// store in its directory.
+    memory: Option<Mutex<HashMap<PathBuf, Arc<Vec<u8>>>>>,
     /// Bytes the operator allows; 0 derives the limit from the filesystem's free space.
     budget: u64,
     /// Tokens per block the operator fixed for every scope; 0 derives one per scope.
@@ -386,6 +389,7 @@ impl StateStore {
             .unwrap_or_default();
         Ok(Self {
             dir,
+            memory: None,
             budget,
             block_tokens,
             geometry: Mutex::new(geometry),
@@ -399,6 +403,58 @@ impl StateStore {
             pending: Arc::new(AtomicU64::new(0)),
             turn: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// A store in host memory: what a store on disk keeps, held only while the process lives and
+    /// never written. `budget` is in bytes, 0 to derive it from the host memory a component may
+    /// take; `block_tokens` as [`Self::open`] takes it.
+    pub fn in_memory(budget: u64, block_tokens: usize) -> Self {
+        Self {
+            dir: PathBuf::from("state-cache-in-memory"),
+            memory: Some(Mutex::new(HashMap::new())),
+            budget,
+            block_tokens,
+            geometry: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner {
+                entries: HashMap::new(),
+                refs: HashMap::new(),
+                block_bytes: HashMap::new(),
+            }),
+            tmp_seq: AtomicU64::new(0),
+            tuning: Default::default(),
+            pending: Arc::new(AtomicU64::new(0)),
+            turn: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Whether the store is held in host memory rather than in a directory.
+    pub fn is_in_memory(&self) -> bool {
+        self.memory.is_some()
+    }
+
+    /// The bytes of the file at `path`.
+    fn load(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        match &self.memory {
+            Some(files) => files
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(path)
+                .map(|b| b.as_ref().clone())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound)),
+            None => std::fs::read(path),
+        }
+    }
+
+    /// Removes the file at `path`, if there is one.
+    fn unlink(&self, path: &Path) {
+        match &self.memory {
+            Some(files) => {
+                files.lock().unwrap_or_else(|e| e.into_inner()).remove(path);
+            }
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 
     /// The block size the operator fixed, 0 when each scope settles its own.
@@ -468,7 +524,10 @@ impl StateStore {
         if self.budget > 0 {
             return Some(self.budget);
         }
-        let free = super::state_tune::free_space(&self.dir)?;
+        let free = match self.memory {
+            Some(_) => crate::inference::place::layer_executor::host_spill_budget_bytes(),
+            None => super::state_tune::free_space(&self.dir)?,
+        };
         Some(super::state_tune::derived_budget(
             held,
             free,
@@ -554,12 +613,10 @@ impl StateStore {
     /// dropped.
     pub fn read(&self, entry: &Entry) -> Result<Vec<u8>> {
         let path = self.path_of(entry);
-        let bytes = std::fs::read(&path)
-            .map_err(anyhow::Error::from)
-            .and_then(|b| {
-                let (_, start) = read_header(&b).ok_or_else(|| anyhow!("manifest header"))?;
-                Ok(b[start..].to_vec())
-            });
+        let bytes = self.load(&path).map_err(anyhow::Error::from).and_then(|b| {
+            let (_, start) = read_header(&b).ok_or_else(|| anyhow!("manifest header"))?;
+            Ok(b[start..].to_vec())
+        });
         match bytes {
             Ok(bytes) => {
                 {
@@ -583,12 +640,13 @@ impl StateStore {
     /// caller answers by forgetting the snapshot that needs it.
     pub fn read_block(&self, hash: &Key) -> Result<Vec<u8>> {
         let path = self.block_path(hash);
-        std::fs::read(&path).map_err(|e| anyhow!("{}: {e}", path.display()))
+        self.load(&path)
+            .map_err(|e| anyhow!("{}: {e}", path.display()))
     }
 
     /// Remove a snapshot that proved unusable, and the blocks only it referenced.
     pub fn forget(&self, entry: &Entry) {
-        let _ = std::fs::remove_file(self.path_of(entry));
+        self.unlink(&self.path_of(entry));
         self.drop_entry(&entry.key);
         self.save_index();
     }
@@ -614,7 +672,7 @@ impl StateStore {
             freed
         };
         for b in freed {
-            let _ = std::fs::remove_file(self.block_path(&b));
+            self.unlink(&self.block_path(&b));
         }
     }
 
@@ -692,7 +750,7 @@ impl StateStore {
                 }
             }
             for h in freed {
-                let _ = std::fs::remove_file(this.block_path(&h));
+                this.unlink(&this.block_path(&h));
             }
         };
         for (b, h) in hashes.iter().enumerate() {
@@ -746,6 +804,13 @@ impl StateStore {
 
     /// `bytes` in a new file at `path`: written beside it, synced, renamed in.
     fn write_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        if let Some(files) = &self.memory {
+            files
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(path.to_path_buf(), Arc::new(bytes.to_vec()));
+            return Ok(());
+        }
         let tmp = self.dir.join(format!(
             "{TMP_PREFIX}{}-{}",
             std::process::id(),
@@ -819,7 +884,7 @@ impl StateStore {
                 v.len,
                 v.bytes >> 10
             );
-            let _ = std::fs::remove_file(self.path_of(&v));
+            self.unlink(&self.path_of(&v));
             self.drop_entry(&v.key);
         }
     }
@@ -981,6 +1046,34 @@ mod tests {
         let again = StateStore::open(d.clone(), 0, 8).unwrap();
         assert_eq!(again.candidates(&again.keys(&SCOPE, &prompt), 50).len(), 2);
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// A store in host memory finds, reads and forgets states as one in a directory does, and
+    /// writes nothing.
+    #[test]
+    fn a_store_in_memory_keeps_its_states_without_a_file() {
+        let store = StateStore::in_memory(1 << 20, 8);
+        assert!(store.is_in_memory());
+        let t = seq(64, 5);
+        put(&store, &t, 24, b"m1");
+        put(&store, &t, 61, b"m3");
+        assert_eq!(store.stats().0, 2);
+        assert_eq!(store.block_count(), 7);
+        let keys = store.keys(&SCOPE, &t);
+        let found = store.candidates(&keys, 64);
+        assert_eq!(
+            found.iter().map(|e| e.len).collect::<Vec<_>>(),
+            vec![61, 24]
+        );
+        assert_eq!(store.read(&found[0]).unwrap(), b"m3");
+        assert_eq!(
+            store.read_block(&found[0].blocks[6]).unwrap(),
+            vec![1u8; 10]
+        );
+        store.forget(&found[0]);
+        assert_eq!(store.stats().0, 1);
+        assert_eq!(store.block_count(), 3);
+        assert!(!store.dir().exists(), "a store in memory has no directory");
     }
 
     #[test]

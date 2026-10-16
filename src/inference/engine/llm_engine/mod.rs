@@ -1357,8 +1357,15 @@ fn open_kv_disk(
 fn open_state_cache(
     config: &InferenceConfig,
 ) -> Option<Arc<crate::inference::cache::state_disk::StateStore>> {
-    let dir = config.state_cache_dir.as_ref()?;
     let budget = (config.state_cache_budget_gb.max(0.0) * (1u64 << 30) as f64) as u64;
+    // Without a directory the states are kept in host memory, as the KV snapshots are: a prompt
+    // that begins with one seen in this process's life skips prefilling it, and nothing is
+    // written.
+    let Some(dir) = config.state_cache_dir.as_ref() else {
+        return Some(Arc::new(
+            crate::inference::cache::state_disk::StateStore::in_memory(budget, 0),
+        ));
+    };
     match crate::inference::cache::state_disk::StateStore::open(
         std::path::PathBuf::from(dir),
         budget,

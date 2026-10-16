@@ -118,14 +118,14 @@ from the file as routing asks for them. Its rows are in the `deepseek_v41` secti
 |---|---|
 | Prefill on the cards | A prompt's attention, residual stream, expert products and routing run on the cards; a layer's experts are read into page-locked slabs ahead and sent on a copy stream. See the benchmark rows of the model |
 | Read-ahead, reader threads, expert tier | Derived from measurement at load and while decoding, see [`CONFIGURATION.md`](CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
-| Decode-state cache | Off unless `state_cache_dir` is set. A stored prefix always pays; a short remainder still reads nearly every expert, which bounds how little it costs |
+| Decode-state cache | In host memory unless `state_cache_dir` puts it on disk. A stored prefix always pays; a short remainder still reads nearly every expert, which bounds how little it costs |
 | `quality` | `exact`. The other levels change the output; the budget is derived from the model's own noise and chosen against a teacher-forced run of a bundled text, not against a task score |
 | Sharding across nodes | Unmeasured at two nodes, see below |
 
 A transformer with recurrent layers (a convolution, state-space or delta-rule mixer beside
-attention) cannot trim its state back to a shorter prefix and so re-prefills every turn. With
-`state_cache_dir` set it stores the states its prefill passes and restores the longest one a
-prompt extends. No row of the benchmark tables measures that cache.
+attention) cannot trim its state back to a shorter prefix, so the cache stores the states its prefill passes and
+restores the longest one a prompt extends, in host memory or, with `state_cache_dir` set, on
+disk. No row of the benchmark tables measures that cache.
 
 The quality harness (`src/inference/model/deepseek_v41/quality.rs`) scores a setting against the
 exact run on held-out text: top-1 agreement, divergence over the exact run's top 20, and the

@@ -31,9 +31,10 @@ model_id = "qwen3:0.6b"
 # kv_disk_dir = "/var/lib/loken/kv"
 # kv_disk_budget_gb = 0             # 0 = no limit
 
-# DeepSeek V4.1 and models with recurrent layers: keep the decode state of finished prompts and
-# turns on disk, so a prompt that begins with one seen before skips prefilling it. Off unless the
-# directory is set. The files hold state derived from prompts (KV tensors, no text).
+# DeepSeek V4.1 and models with recurrent layers keep the decode state of finished prompts and
+# turns, so a prompt that begins with one seen before skips prefilling it. Without a directory the
+# states stay in host memory for the life of the process; with one they go on disk and survive a
+# restart. The files hold state derived from prompts (KV tensors, no text).
 # state_cache_dir = "/var/lib/loken/state"
 # state_cache_budget_gb = 0         # 0 = derived from the directory's free space
 

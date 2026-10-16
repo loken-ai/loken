@@ -79,9 +79,10 @@ Nothing below is configured; a key of that name in an older `config.toml` loads 
 
 ### Decode-state cache (DeepSeek V4.1 and recurrent hybrids)
 
-Off unless `state_cache_dir` is set. A DeepSeek V4.1 prompt costs one pass over the routed experts,
-read from disk; this cache stores the model's decode state after a prompt and after each finished
-turn, so a later prompt that begins with the same tokens restores it and prefills only the rest.
+In host memory for the life of the process, or on disk when `state_cache_dir` is set. A DeepSeek
+V4.1 prompt costs one pass over the routed experts, read from disk; this cache stores the model's
+decode state after a prompt and after each finished turn, so a later prompt that begins with the
+same tokens restores it and prefills only the rest.
 
 The same keys open the same store for a generic-route model that carries a recurrent state beside
 its KV (a convolution, state-space or delta-rule mixer interleaved with attention). Such a state
@@ -90,15 +91,16 @@ and every turn re-prefills; with the store open, each state the prefill passes i
 prompt restores the longest one it extends. A dense model keeps its disk tier (`kv_disk`) and is
 unchanged.
 
-The files hold state derived from prompts: KV tensors, hidden rows of the filling compression group
+In memory the states are kept as the KV snapshots are: never written, gone with the process. The
+files hold state derived from prompts: KV tensors, hidden rows of the filling compression group
 and compressed token-class ids. They hold no text and no token ids, and names and keys are hashes,
 but the state is as private as the prompt it came from. Keep the directory where the prompts
 could live, and leave the key unset where nothing about an exchange may reach the disk.
 
 | Key | Default | What it does |
 |---|---|---|
-| `state_cache_dir` | none | Directory of the cache. |
-| `state_cache_budget_gb` | derived | Bytes the cache may hold, in GiB. Unset or `0` derives the limit: what the cache holds plus the free space of the directory's filesystem, less room for one more state of the largest size written. Least recently used first; in each family of states sharing a first block the one restored most, the longest among equals, goes last. |
+| `state_cache_dir` | none | Directory of the cache; none keeps it in host memory. |
+| `state_cache_budget_gb` | derived | Bytes the cache may hold, in GiB. Unset or `0` derives the limit: what the cache holds plus the free space of the directory's filesystem, or in memory the host memory a component may take, less room for one more state of the largest size written. Least recently used first; in each family of states sharing a first block the one restored most, the longest among equals, goes last. |
 
 What the cache works out for itself, from what the model, the disk and the engine report, and logs when it changes:
 
